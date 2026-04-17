@@ -1,14 +1,115 @@
+//! A persistent, fsync-durable binary stack backed by a single file.
+//!
+//! # Overview
+//!
+//! [`BStack`] treats a file as a flat byte buffer that grows and shrinks from
+//! the tail.  Every mutating operation — [`push`](BStack::push) and
+//! [`pop`](BStack::pop) — calls [`sync_data`](std::fs::File::sync_data) before
+//! returning, so the data survives a process crash or an unclean system
+//! shutdown.  Read-only operations — [`peek`](BStack::peek) and
+//! [`get`](BStack::get) — never modify the file and hold the write lock only
+//! long enough to seek and read, so they cannot interleave with a concurrent
+//! mutation.
+//!
+//! The crate has **no external dependencies** and uses **no `unsafe` code**.
+//!
+//! # File format
+//!
+//! The file contains raw byte payloads written one after another with no
+//! framing, length prefixes, or checksums.  The caller is responsible for
+//! knowing how many bytes to pop.  This keeps the format trivially auditable
+//! with standard tools (`xxd`, `hexdump`) and avoids any parse overhead on
+//! read.
+//!
+//! ```text
+//! ┌──────────────┬──────────────┬──────────────┐
+//! │  payload 0   │  payload 1   │  payload 2   │  ...
+//! └──────────────┴──────────────┴──────────────┘
+//! ^              ^              ^              ^
+//! offset 0    offset n0      offset n0+n1   EOF (= len)
+//! ```
+//!
+//! # Durability
+//!
+//! | Operation | Syscall sequence |
+//! |-----------|-----------------|
+//! | `push`    | `lseek` → `write` → `fdatasync` |
+//! | `pop`     | `lseek` → `read` → `ftruncate` → `fdatasync` |
+//!
+//! [`sync_data`](std::fs::File::sync_data) (`fdatasync` on Linux/macOS) is
+//! used rather than `sync_all` (`fsync`) because inode metadata — mtime,
+//! ctime, block count — is not required for crash-recovery correctness, and
+//! skipping it halves the number of journal writes on most filesystems.
+//!
+//! If `push` fails after the kernel write but before `fdatasync`, the
+//! implementation makes a best-effort call to `ftruncate` back to the
+//! pre-push length.  If that truncation also fails the error is swallowed;
+//! on the next open the file may contain a partial tail write, which the
+//! caller must handle (e.g. by storing a length sentinel at a known offset).
+//!
+//! # Thread safety
+//!
+//! `BStack` wraps the file in a [`std::sync::RwLock`].  All operations that
+//! need to seek take the **write** lock — including the read-only `peek` and
+//! `get`, because [`Seek`](std::io::Seek) requires `&mut File`.  Only `len`,
+//! which reads file metadata without seeking, takes the **read** lock.
+//!
+//! The practical consequence is that concurrent `peek`/`get` calls serialise
+//! against each other and against `push`/`pop`.  Concurrent `len` calls can
+//! run in parallel but block while any other operation holds the write lock,
+//! so `len` always observes a size at a clean operation boundary.
+//!
+//! # Examples
+//!
+//! ```no_run
+//! use bstack::BStack;
+//!
+//! # fn main() -> std::io::Result<()> {
+//! let stack = BStack::open("log.bin")?;
+//!
+//! // push returns the byte offset where the payload starts.
+//! let off0 = stack.push(b"hello")?;  // 0
+//! let off1 = stack.push(b"world")?;  // 5
+//!
+//! assert_eq!(stack.len()?, 10);
+//!
+//! // peek reads from an offset to the end without removing anything.
+//! assert_eq!(stack.peek(off1)?, b"world");
+//!
+//! // get reads an arbitrary half-open byte range.
+//! assert_eq!(stack.get(3, 8)?, b"lowor");
+//!
+//! // pop removes bytes from the tail and returns them.
+//! assert_eq!(stack.pop(5)?, b"world");
+//! assert_eq!(stack.len()?, 5);
+//! # Ok(())
+//! # }
+//! ```
+
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::RwLock;
 
+/// A persistent, fsync-durable binary stack backed by a single file.
+///
+/// See the [crate-level documentation](crate) for a full description of the
+/// file format, durability guarantees, and thread-safety model.
 pub struct BStack {
     lock: RwLock<File>,
 }
 
 impl BStack {
-    /// Open or create a stack file at the given path.
+    /// Open or create a stack file at `path`.
+    ///
+    /// If the file already exists its existing contents are preserved; the
+    /// next [`push`](Self::push) will append after them.  The file is opened
+    /// with both read and write access.
+    ///
+    /// # Errors
+    ///
+    /// Returns any [`io::Error`] produced by [`OpenOptions::open`], e.g.
+    /// `PermissionDenied` or `NotFound` (if a parent directory is missing).
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
         let file = OpenOptions::new()
             .read(true)
@@ -20,9 +121,22 @@ impl BStack {
         })
     }
 
-    /// Append `data` to the end of the file. Returns the byte offset
-    /// where the data starts. Atomic: either fully written and fsynced,
-    /// or the file is unchanged.
+    /// Append `data` to the end of the file.
+    ///
+    /// Returns the byte offset at which `data` begins — i.e. the file size
+    /// immediately before the write.  An empty slice is a valid argument; it
+    /// writes nothing and returns the current end offset.
+    ///
+    /// # Atomicity
+    ///
+    /// Either the full payload is written and fsynced, or the file is
+    /// unchanged.  On failure after a partial kernel write the implementation
+    /// attempts a best-effort `ftruncate` back to the pre-call length.
+    ///
+    /// # Errors
+    ///
+    /// Returns any [`io::Error`] from `write_all`, `sync_data`, or the
+    /// fallback `set_len`.
     pub fn push(&self, data: &[u8]) -> io::Result<u64> {
         let mut file = self.lock.write().unwrap();
         // Seek to end to get the current offset; we manage position ourselves
@@ -38,9 +152,22 @@ impl BStack {
         }
     }
 
-    /// Read and remove the last `n` bytes. Returns the bytes. Atomic:
-    /// either fully read + truncated + fsynced, or the file is unchanged.
-    /// Returns an error if `n` exceeds the current file size.
+    /// Remove and return the last `n` bytes of the file.
+    ///
+    /// `n = 0` is valid: no bytes are removed and an empty `Vec` is returned.
+    /// `n` may span across multiple previous [`push`](Self::push) boundaries.
+    ///
+    /// # Atomicity
+    ///
+    /// The bytes are read before the file is truncated.  Either the full
+    /// sequence — read → `ftruncate` → `fdatasync` — completes, or the file
+    /// is unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] if `n` exceeds the current
+    /// file size.  Also propagates any I/O error from `read_exact`,
+    /// `set_len`, or `sync_data`.
     pub fn pop(&self, n: u64) -> io::Result<Vec<u8>> {
         let mut file = self.lock.write().unwrap();
         let size = file.seek(SeekFrom::End(0))?;
@@ -59,9 +186,19 @@ impl BStack {
         Ok(buf)
     }
 
-    /// Read all bytes from `offset` to the end of the file without modifying
-    /// it. Atomic: holds the write lock for the duration so no concurrent
-    /// push/pop can interleave. Returns an error if `offset` exceeds the
+    /// Return a copy of every byte from `offset` to the end of the file.
+    ///
+    /// `offset == len()` is valid and returns an empty `Vec`.  The file is
+    /// not modified.
+    ///
+    /// # Atomicity
+    ///
+    /// Holds the write lock for the duration of the seek and read, so no
+    /// concurrent [`push`](Self::push) or [`pop`](Self::pop) can interleave.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] if `offset` exceeds the
     /// current file size.
     pub fn peek(&self, offset: u64) -> io::Result<Vec<u8>> {
         let mut file = self.lock.write().unwrap();
@@ -78,10 +215,20 @@ impl BStack {
         Ok(buf)
     }
 
-    /// Read a copy of the bytes in the half-open range `[start, end)` without
-    /// modifying the file. Atomic: holds the write lock for the duration.
-    /// Returns an error if `end < start` or `end` exceeds the current file
-    /// size.
+    /// Return a copy of the bytes in the half-open range `[start, end)`.
+    ///
+    /// `start == end` is valid and returns an empty `Vec`.  The file is not
+    /// modified.
+    ///
+    /// # Atomicity
+    ///
+    /// Holds the write lock for the duration of the seek and read, so no
+    /// concurrent [`push`](Self::push) or [`pop`](Self::pop) can interleave.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] if `end < start` or if `end`
+    /// exceeds the current file size.
     pub fn get(&self, start: u64, end: u64) -> io::Result<Vec<u8>> {
         if end < start {
             return Err(io::Error::new(
@@ -104,6 +251,15 @@ impl BStack {
     }
 
     /// Return the current size of the file in bytes.
+    ///
+    /// Takes the read lock, so it can run concurrently with other `len`
+    /// calls but blocks while any write-lock operation is in progress.  The
+    /// returned value is always at a clean operation boundary — it is never
+    /// observed mid-write.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any [`io::Error`] from [`File::metadata`].
     pub fn len(&self) -> io::Result<u64> {
         let file = self.lock.read().unwrap();
         Ok(file.metadata()?.len())
