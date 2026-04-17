@@ -116,12 +116,11 @@ mod tests {
     use std::io::ErrorKind;
 
     fn mk_stack() -> (BStack, std::path::PathBuf) {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let name = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .subsec_nanos();
-        let path = std::env::temp_dir().join(format!("bstack_test_{name}.bin"));
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        let path = std::env::temp_dir().join(format!("bstack_test_{pid}_{id}.bin"));
         let stack = BStack::open(&path).unwrap();
         (stack, path)
     }
@@ -299,5 +298,269 @@ mod tests {
         let all = s.pop(7).unwrap();
         assert_eq!(all, b"AAACCCC");
         assert_eq!(s.len().unwrap(), 0);
+    }
+
+    // ---- persistence / reopen ---------------------------------------------------
+
+    #[test]
+    fn reopen_reads_back_correct_data() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+
+        s.push(b"hello").unwrap();
+        s.push(b"world").unwrap();
+        drop(s);
+
+        let s2 = BStack::open(&p).unwrap();
+        assert_eq!(s2.len().unwrap(), 10);
+        assert_eq!(s2.peek(0).unwrap(), b"helloworld");
+    }
+
+    #[test]
+    fn reopen_and_continue_pushing() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+
+        let off0 = s.push(b"first").unwrap();
+        assert_eq!(off0, 0);
+        drop(s);
+
+        let s2 = BStack::open(&p).unwrap();
+        let off1 = s2.push(b"second").unwrap();
+        assert_eq!(off1, 5); // must continue from prior end, not overwrite
+        assert_eq!(s2.len().unwrap(), 11);
+        assert_eq!(s2.peek(0).unwrap(), b"firstsecond");
+    }
+
+    #[test]
+    fn reopen_after_pop_sees_truncated_file() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+
+        s.push(b"hello").unwrap();
+        s.push(b"world").unwrap();
+        s.pop(5).unwrap();
+        drop(s);
+
+        let s2 = BStack::open(&p).unwrap();
+        assert_eq!(s2.len().unwrap(), 5);
+        assert_eq!(s2.peek(0).unwrap(), b"hello");
+    }
+
+    // ---- zero / boundary --------------------------------------------------------
+
+    #[test]
+    fn push_empty_slice() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        let off0 = s.push(b"abc").unwrap();
+        let off1 = s.push(&[]).unwrap(); // empty — no bytes written
+        let off2 = s.push(b"def").unwrap();
+
+        assert_eq!(off0, 0);
+        assert_eq!(off1, 3); // offset == current size
+        assert_eq!(off2, 3); // next real push lands at the same offset
+        assert_eq!(s.len().unwrap(), 6);
+        assert_eq!(s.peek(0).unwrap(), b"abcdef");
+    }
+
+    #[test]
+    fn pop_zero_bytes() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        s.push(b"abc").unwrap();
+        let bytes = s.pop(0).unwrap();
+        assert_eq!(bytes, b"");
+        assert_eq!(s.len().unwrap(), 3);
+        // seek position must be correct for the next push
+        let off = s.push(b"d").unwrap();
+        assert_eq!(off, 3);
+    }
+
+    #[test]
+    fn peek_zero_offset_on_empty_file() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        // offset == size == 0: valid, returns empty slice
+        assert_eq!(s.peek(0).unwrap(), b"");
+    }
+
+    #[test]
+    fn get_zero_range_on_empty_file() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        // [0, 0) on a 0-byte file: valid, returns empty slice
+        assert_eq!(s.get(0, 0).unwrap(), b"");
+    }
+
+    #[test]
+    fn drain_to_zero_then_push_starts_at_offset_zero() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        s.push(b"hello").unwrap();
+        s.pop(5).unwrap();
+        assert_eq!(s.len().unwrap(), 0);
+
+        let off = s.push(b"world").unwrap();
+        assert_eq!(off, 0); // must re-start from the beginning
+        assert_eq!(s.len().unwrap(), 5);
+        assert_eq!(s.peek(0).unwrap(), b"world");
+    }
+
+    // ---- data integrity ---------------------------------------------------------
+
+    #[test]
+    fn peek_does_not_modify_file() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        s.push(b"hello").unwrap();
+        s.push(b"world").unwrap();
+        let _ = s.peek(3).unwrap();
+        assert_eq!(s.len().unwrap(), 10);
+        let off = s.push(b"!").unwrap();
+        assert_eq!(off, 10);
+    }
+
+    #[test]
+    fn binary_roundtrip_all_byte_values() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        // Every byte value 0x00–0xFF, twice to catch any off-by-one at the wrap.
+        let data: Vec<u8> = (0u16..512).map(|i| (i % 256) as u8).collect();
+        s.push(&data).unwrap();
+        let got = s.pop(data.len() as u64).unwrap();
+        assert_eq!(got, data);
+        assert_eq!(s.len().unwrap(), 0);
+    }
+
+    #[test]
+    fn large_payload_roundtrip() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        // 1 MiB with a simple pattern to detect any byte-level corruption.
+        let payload: Vec<u8> = (0..1024 * 1024).map(|i: usize| (i.wrapping_mul(7).wrapping_add(13)) as u8).collect();
+        s.push(&payload).unwrap();
+        let got = s.get(0, payload.len() as u64).unwrap();
+        assert_eq!(got, payload);
+        assert_eq!(s.len().unwrap(), payload.len() as u64);
+    }
+
+    // ---- concurrency ------------------------------------------------------------
+
+    #[test]
+    fn concurrent_pushes_non_overlapping() {
+        use std::collections::HashSet;
+        use std::sync::Arc;
+        use std::thread;
+
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        let s = Arc::new(s);
+
+        const THREADS: usize = 8;
+        const PER_THREAD: usize = 100;
+        const ITEM: usize = 16; // bytes per push
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let s = Arc::clone(&s);
+                thread::spawn(move || {
+                    (0..PER_THREAD)
+                        .map(|i| {
+                            // Encode thread-id and sequence number so we can
+                            // verify content after all threads finish.
+                            let mut data = [0u8; ITEM];
+                            data[0] = t as u8;
+                            data[1..9].copy_from_slice(&(i as u64).to_le_bytes());
+                            let off = s.push(&data).unwrap();
+                            (off, t, i)
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+
+        let results: Vec<_> = handles.into_iter().flat_map(|h| h.join().unwrap()).collect();
+
+        // Every offset must be a multiple of ITEM (each push is exactly ITEM bytes).
+        for &(off, _, _) in &results {
+            assert_eq!(off % ITEM as u64, 0, "offset {off} is not aligned to ITEM");
+        }
+
+        // Every offset must be unique — no two pushes can share a slot.
+        let mut seen: HashSet<u64> = HashSet::new();
+        for &(off, _, _) in &results {
+            assert!(seen.insert(off), "duplicate offset {off}");
+        }
+
+        // Total size must account for every push.
+        assert_eq!(s.len().unwrap(), (THREADS * PER_THREAD * ITEM) as u64);
+
+        // Read each slot back and verify the encoded thread-id and index.
+        for &(off, t, i) in &results {
+            let slot = s.get(off, off + ITEM as u64).unwrap();
+            assert_eq!(slot[0], t as u8, "thread id mismatch at offset {off}");
+            let idx = u64::from_le_bytes(slot[1..9].try_into().unwrap());
+            assert_eq!(idx, i as u64, "item index mismatch at offset {off}");
+        }
+    }
+
+    #[test]
+    fn concurrent_len_is_multiple_of_item_size() {
+        use std::sync::Arc;
+        use std::thread;
+
+        // Push fixed-size items from several threads while another thread reads
+        // len continuously. Because push holds the write lock and len holds the
+        // read lock, len must never observe a partial write — it will always
+        // block until the active push completes, so the size it sees is always
+        // an exact multiple of ITEM.
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        let s = Arc::new(s);
+
+        const ITEM: u64 = 8;
+        const PUSH_THREADS: usize = 4;
+        const PUSHES_PER_THREAD: usize = 200;
+
+        let push_handles: Vec<_> = (0..PUSH_THREADS)
+            .map(|_| {
+                let s = Arc::clone(&s);
+                thread::spawn(move || {
+                    for _ in 0..PUSHES_PER_THREAD {
+                        s.push(&[0xBEu8; ITEM as usize]).unwrap();
+                    }
+                })
+            })
+            .collect();
+
+        let len_handle = {
+            let s = Arc::clone(&s);
+            thread::spawn(move || {
+                // Sample len 2000 times while pushes are in flight.
+                for _ in 0..2000 {
+                    let size = s.len().unwrap();
+                    assert_eq!(size % ITEM, 0, "torn write: size {size} is not a multiple of {ITEM}");
+                }
+            })
+        };
+
+        for h in push_handles {
+            h.join().unwrap();
+        }
+        len_handle.join().unwrap();
+
+        assert_eq!(
+            s.len().unwrap(),
+            (PUSH_THREADS * PUSHES_PER_THREAD) as u64 * ITEM
+        );
     }
 }
