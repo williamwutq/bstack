@@ -2,11 +2,29 @@
 
 A persistent, fsync-durable binary stack backed by a single file.
 
-`push` and `pop` call `fdatasync` before returning, so data survives a process
-crash or unclean shutdown.  The file format is raw bytes with no framing or
-checksums — trivially inspectable with `xxd` or `hexdump`.
+`push` and `pop` perform a *durable sync* before returning, so data survives a
+process crash or unclean shutdown.  On **macOS**, `fcntl(F_FULLFSYNC)` is used
+instead of `fdatasync` to flush the drive's hardware write cache, which plain
+`fdatasync` does not guarantee.
 
-**No external dependencies.  No `unsafe` code.**
+A 16-byte file header stores a **magic number** and a **committed-length
+sentinel**.  On reopen, any mismatch between the header and the actual file
+size is repaired automatically — no user intervention required.
+
+On **Unix**, `open` acquires an **exclusive advisory `flock`**, so two
+processes cannot concurrently corrupt the same stack file.
+
+**Minimal dependencies (`libc` on Unix only).  No `unsafe` beyond required FFI calls.**
+
+> **Warning:** bstack files must only be opened through this crate or a
+> compatible implementation that understands the file format, header protocol,
+> and locking semantics.  Reading or writing the file with raw tools (`dd`,
+> `xxd`, custom `open(2)` calls, etc.) while a `BStack` instance is live, or
+> manually editing the header fields, can silently corrupt the committed-length
+> sentinel or bypass the advisory lock.  **The authors make no guarantees about
+> the behaviour of the crate — including freedom from data loss or logical
+> corruption — when the file has been accessed outside of this crate's
+> controlled interface.**
 
 ---
 
@@ -17,16 +35,16 @@ use bstack::BStack;
 
 let stack = BStack::open("log.bin")?;
 
-// push appends bytes and returns the starting offset.
+// push appends bytes and returns the starting logical offset.
 let off0 = stack.push(b"hello")?;  // 0
 let off1 = stack.push(b"world")?;  // 5
 
 assert_eq!(stack.len()?, 10);
 
-// peek reads from an offset to the end without removing anything.
+// peek reads from a logical offset to the end.
 assert_eq!(stack.peek(off1)?, b"world");
 
-// get reads an arbitrary half-open byte range.
+// get reads an arbitrary half-open logical byte range.
 assert_eq!(stack.get(3, 8)?, b"lowor");
 
 // pop removes bytes from the tail and returns them.
@@ -40,26 +58,28 @@ assert_eq!(stack.len()?, 5);
 
 ```rust
 impl BStack {
-    /// Open or create a stack file at `path`.  Existing data is preserved.
+    /// Open or create a stack file at `path`.
+    /// Acquires an exclusive flock on Unix.
+    /// Validates the header and performs crash recovery on existing files.
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self>;
 
-    /// Append `data` and fdatasync.  Returns the starting byte offset.
+    /// Append `data` and durable-sync.  Returns the starting logical offset.
     /// An empty slice is valid and a no-op on disk.
     pub fn push(&self, data: &[u8]) -> io::Result<u64>;
 
-    /// Remove and return the last `n` bytes, then fdatasync.
-    /// `n = 0` is valid.  Errors if `n` exceeds the current file size.
+    /// Remove and return the last `n` bytes, then durable-sync.
+    /// `n = 0` is valid.  Errors if `n` exceeds the current payload size.
     pub fn pop(&self, n: u64) -> io::Result<Vec<u8>>;
 
-    /// Copy all bytes from `offset` to the end of the file.
+    /// Copy all bytes from `offset` to the end of the payload.
     /// `offset == len()` returns an empty Vec.
     pub fn peek(&self, offset: u64) -> io::Result<Vec<u8>>;
 
-    /// Copy bytes in the half-open range `[start, end)`.
+    /// Copy bytes in the half-open logical range `[start, end)`.
     /// `start == end` returns an empty Vec.
     pub fn get(&self, start: u64, end: u64) -> io::Result<Vec<u8>>;
 
-    /// Current file size in bytes.
+    /// Current payload size in bytes (excludes the 16-byte header).
     pub fn len(&self) -> io::Result<u64>;
 }
 ```
@@ -69,38 +89,67 @@ impl BStack {
 ## File format
 
 ```
-┌──────────────┬──────────────┬──────────────┐
-│  payload 0   │  payload 1   │  payload 2   │  ...
-└──────────────┴──────────────┴──────────────┘
-^              ^              ^              ^
-offset 0    offset n0      offset n0+n1   EOF
+┌────────────────────────┬──────────────┬──────────────┐
+│      header (16 B)     │  payload 0   │  payload 1   │  ...
+│  magic[8] | clen[8 LE] │              │              │
+└────────────────────────┴──────────────┴──────────────┘
+^                        ^              ^              ^
+file offset 0        offset 16       16+n0          EOF
 ```
 
-Payloads are written back-to-back with no length prefixes, checksums, or
-separators.  The caller owns the framing.  One common pattern is to store a
-fixed-size header as the first push and use the returned offsets as an
-application-level index.
+* **`magic`** — `BSTK\x00\x01\x00\x00` (8 bytes).  `open` rejects any file
+  whose first 8 bytes do not match.
+* **`clen`** — little-endian `u64` recording the last successfully committed
+  payload length.  Updated on every `push` and `pop` before the durable sync.
+
+All user-visible offsets (returned by `push`, accepted by `peek`/`get`) are
+**logical** — 0-based from the start of the payload region (file byte 16).
 
 ---
 
 ## Durability
 
-| Operation     | Sequence                                     |
-|---------------|----------------------------------------------|
-| `push`        | `lseek(END)` → `write` → `fdatasync`         |
-| `pop`         | `lseek` → `read` → `ftruncate` → `fdatasync` |
-| `peek`, `get` | `lseek` → `read` (no sync — read-only)       |
+| Operation     | Sequence                                                               |
+|---------------|------------------------------------------------------------------------|
+| `push`        | `lseek(END)` → `write(data)` → `lseek(8)` → `write(clen)` → sync     |
+| `pop`         | `lseek` → `read` → `ftruncate` → `lseek(8)` → `write(clen)` → sync   |
+| `peek`, `get` | `lseek` → `read` (no sync — read-only)                                |
 
-`fdatasync` is used instead of `fsync` because inode metadata (mtime, ctime,
-block count) is not needed for crash-recovery correctness.  On most
-journalling filesystems this halves the number of journal flushes per
-operation.
+**`durable_sync` on macOS** issues `fcntl(F_FULLFSYNC)`.  Unlike `fdatasync`,
+this flushes the drive controller's write cache, providing the same "barrier
+to stable media" guarantee that `fsync` gives on Linux.  Falls back to
+`sync_data` if the device does not support `F_FULLFSYNC`.
 
-**Push rollback:** if `write` succeeds but `fdatasync` fails, a best-effort
-`ftruncate` restores the pre-push length.  If that truncation also fails the
-error is swallowed and the file may contain a partial tail write; the caller
-is responsible for detecting and trimming it on the next open (e.g. via a
-stored length sentinel).
+**`durable_sync` on Linux / other Unix** calls `sync_data` (`fdatasync`).
+
+**Push rollback:** if the write or sync fails, a best-effort `ftruncate` and
+header reset restore the pre-push state.
+
+---
+
+## Crash recovery
+
+The committed-length sentinel in the header ensures automatic recovery on the
+next `open`:
+
+| Condition | Cause | Recovery |
+|-----------|-------|----------|
+| `file_size − 16 > clen` | partial tail write (crashed before header update) | truncate to `16 + clen`, durable-sync |
+| `file_size − 16 < clen` | partial truncation (crashed before header update) | set `clen = file_size − 16`, durable-sync |
+
+No caller action is required; recovery is transparent.
+
+---
+
+## Multi-process safety
+
+On Unix, `open` calls `flock(LOCK_EX | LOCK_NB)` on the file.  If another
+process already holds the lock, `open` returns immediately with
+`io::ErrorKind::WouldBlock`.  The lock is released when the `BStack` is
+dropped.
+
+> `flock` is advisory.  It protects against concurrent `BStack::open` calls
+> across processes, not against raw file access.
 
 ---
 
@@ -113,20 +162,18 @@ stored length sentinel).
 | `push`, `pop`, `peek`, `get` | write lock |
 | `len`                        | read lock  |
 
-`peek` and `get` take the write lock because [`Seek`] requires `&mut File`.
-`len` uses `File::metadata` (no seek) and takes the read lock, so multiple
-`len` calls can proceed concurrently.  All callers block while a write-lock
-operation is in progress, so `len` always observes a size at a clean
-operation boundary.
+All callers block while a write-lock operation is in progress, so `len` always
+observes a size at a clean operation boundary.
 
 ---
 
 ## Known limitations
 
-- **No record framing.** The file stores raw bytes; the caller must track
-  how many bytes each logical record occupies.
+- **No record framing.** The file stores raw bytes; the caller must track how
+  many bytes each logical record occupies.
 - **Push rollback is best-effort.** A failure during rollback is silently
-  swallowed (see *Durability* above).
+  swallowed; crash recovery on the next `open` will repair the state.
 - **No `O_DIRECT`.** Writes go through the page cache; durability relies on
-  `fdatasync`, not cache bypass.
+  `durable_sync`, not cache bypass.
 - **Single file only.** There is no WAL, manifest, or secondary index.
+- **Multi-process lock is Unix-only.** No equivalent is implemented on Windows.

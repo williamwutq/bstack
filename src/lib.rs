@@ -4,60 +4,97 @@
 //!
 //! [`BStack`] treats a file as a flat byte buffer that grows and shrinks from
 //! the tail.  Every mutating operation — [`push`](BStack::push) and
-//! [`pop`](BStack::pop) — calls [`sync_data`](std::fs::File::sync_data) before
-//! returning, so the data survives a process crash or an unclean system
-//! shutdown.  Read-only operations — [`peek`](BStack::peek) and
-//! [`get`](BStack::get) — never modify the file and hold the write lock only
-//! long enough to seek and read, so they cannot interleave with a concurrent
-//! mutation.
+//! [`pop`](BStack::pop) — calls a *durable sync* before returning, so the data
+//! survives a process crash or an unclean system shutdown.  Read-only
+//! operations — [`peek`](BStack::peek) and [`get`](BStack::get) — never modify
+//! the file and hold the write lock only long enough to seek and read.
 //!
-//! The crate has **no external dependencies** and uses **no `unsafe` code**.
+//! The crate has **no external dependencies beyond `libc` on Unix** and uses
+//! **no `unsafe` code beyond the required `libc` FFI calls**.
 //!
 //! # File format
 //!
-//! The file contains raw byte payloads written one after another with no
-//! framing, length prefixes, or checksums.  The caller is responsible for
-//! knowing how many bytes to pop.  This keeps the format trivially auditable
-//! with standard tools (`xxd`, `hexdump`) and avoids any parse overhead on
-//! read.
+//! Every file begins with a fixed 16-byte header:
 //!
 //! ```text
-//! ┌──────────────┬──────────────┬──────────────┐
-//! │  payload 0   │  payload 1   │  payload 2   │  ...
-//! └──────────────┴──────────────┴──────────────┘
-//! ^              ^              ^              ^
-//! offset 0    offset n0      offset n0+n1   EOF (= len)
+//! ┌────────────────────────┬──────────────┬──────────────┐
+//! │      header (16 B)     │  payload 0   │  payload 1   │  ...
+//! │  magic[8] | clen[8 LE] │              │              │
+//! └────────────────────────┴──────────────┴──────────────┘
+//! ^                        ^              ^              ^
+//! file offset 0         offset 16      16+n0          EOF
 //! ```
+//!
+//! * **`magic`** — the 8-byte sequence `BSTK\x00\x01\x00\x00` (crate magic +
+//!   version 0.1).  [`open`](BStack::open) rejects any file whose first 8 bytes
+//!   do not match.
+//! * **`clen`** — little-endian `u64` recording the *committed* payload length.
+//!   It is updated atomically with each [`push`](BStack::push) or
+//!   [`pop`](BStack::pop) and is used for crash recovery on the next
+//!   [`open`](BStack::open).
+//!
+//! All user-visible offsets are **logical** (0-based from the start of the
+//! payload region, i.e. from file byte 16).
+//!
+//! # Crash recovery
+//!
+//! On [`open`](BStack::open), the header's committed length is compared against
+//! the actual file size:
+//!
+//! | Condition | Cause | Recovery |
+//! |-----------|-------|----------|
+//! | `file_size − 16 > clen` | partial tail write (push crashed before header update) | truncate to `16 + clen` |
+//! | `file_size − 16 < clen` | partial truncation (pop crashed before header update) | set `clen = file_size − 16` |
+//!
+//! After recovery a `durable_sync` ensures the repaired state is on stable
+//! storage before any caller can observe or modify the file.
 //!
 //! # Durability
 //!
 //! | Operation | Syscall sequence |
 //! |-----------|-----------------|
-//! | `push`    | `lseek` → `write` → `fdatasync` |
-//! | `pop`     | `lseek` → `read` → `ftruncate` → `fdatasync` |
+//! | `push` | `lseek(END)` → `write(data)` → `lseek(8)` → `write(clen)` → `durable_sync` |
+//! | `pop`  | `lseek` → `read` → `ftruncate` → `lseek(8)` → `write(clen)` → `durable_sync` |
 //!
-//! [`sync_data`](std::fs::File::sync_data) (`fdatasync` on Linux/macOS) is
-//! used rather than `sync_all` (`fsync`) because inode metadata — mtime,
-//! ctime, block count — is not required for crash-recovery correctness, and
-//! skipping it halves the number of journal writes on most filesystems.
+//! **`durable_sync` on macOS** issues `fcntl(F_FULLFSYNC)`, which flushes the
+//! drive's hardware write cache.  Plain `fdatasync` is not sufficient on macOS
+//! because the kernel may acknowledge it before the drive controller has
+//! committed the data.  If `F_FULLFSYNC` is not supported by the device the
+//! implementation falls back to `sync_data` (`fdatasync`).
 //!
-//! If `push` fails after the kernel write but before `fdatasync`, the
-//! implementation makes a best-effort call to `ftruncate` back to the
-//! pre-push length.  If that truncation also fails the error is swallowed;
-//! on the next open the file may contain a partial tail write, which the
-//! caller must handle (e.g. by storing a length sentinel at a known offset).
+//! **`durable_sync` on other Unix** calls `sync_data` (`fdatasync`), which is
+//! sufficient on Linux and BSD.
+//!
+//! # Multi-process safety
+//!
+//! On Unix, [`open`](BStack::open) acquires an **exclusive advisory `flock`**
+//! on the file (`LOCK_EX | LOCK_NB`).  If another process already holds the
+//! lock, `open` returns immediately with [`io::ErrorKind::WouldBlock`] rather
+//! than blocking indefinitely.  The lock is released automatically when the
+//! [`BStack`] is dropped (the underlying file descriptor is closed).
+//!
+//! > **Note:** `flock` is advisory and per-process.  It prevents well-behaved
+//! > concurrent opens across processes but does not protect against processes
+//! > that bypass the lock or against raw writes to the file.
+//!
+//! # Correct usage
+//!
+//! bstack files must only be opened through this crate or a compatible
+//! implementation that understands the file format, the header protocol, and
+//! the locking semantics.  Reading or writing the underlying file with raw
+//! tools or syscalls while a [`BStack`] instance is live — or manually editing
+//! the header fields — can silently corrupt the committed-length sentinel or
+//! bypass the advisory lock.
+//!
+//! **The authors make no guarantees about the behaviour of this crate —
+//! including freedom from data loss or logical corruption — when the file has
+//! been accessed outside of this crate's controlled interface.**
 //!
 //! # Thread safety
 //!
 //! `BStack` wraps the file in a [`std::sync::RwLock`].  All operations that
-//! need to seek take the **write** lock — including the read-only `peek` and
-//! `get`, because [`Seek`](std::io::Seek) requires `&mut File`.  Only `len`,
-//! which reads file metadata without seeking, takes the **read** lock.
-//!
-//! The practical consequence is that concurrent `peek`/`get` calls serialise
-//! against each other and against `push`/`pop`.  Concurrent `len` calls can
-//! run in parallel but block while any other operation holds the write lock,
-//! so `len` always observes a size at a clean operation boundary.
+//! need to seek take the **write** lock.  Only `len`, which reads file metadata
+//! without seeking, takes the **read** lock.
 //!
 //! # Examples
 //!
@@ -67,16 +104,16 @@
 //! # fn main() -> std::io::Result<()> {
 //! let stack = BStack::open("log.bin")?;
 //!
-//! // push returns the byte offset where the payload starts.
+//! // push returns the logical byte offset where the payload starts.
 //! let off0 = stack.push(b"hello")?;  // 0
 //! let off1 = stack.push(b"world")?;  // 5
 //!
 //! assert_eq!(stack.len()?, 10);
 //!
-//! // peek reads from an offset to the end without removing anything.
+//! // peek reads from a logical offset to the end without removing anything.
 //! assert_eq!(stack.peek(off1)?, b"world");
 //!
-//! // get reads an arbitrary half-open byte range.
+//! // get reads an arbitrary half-open logical byte range.
 //! assert_eq!(stack.get(3, 8)?, b"lowor");
 //!
 //! // pop removes bytes from the tail and returns them.
@@ -91,10 +128,79 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::RwLock;
 
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
+
+/// `BSTK` + version 0.1 — rejects files created by incompatible versions.
+const MAGIC: [u8; 8] = *b"BSTK\x00\x01\x00\x00";
+
+/// Bytes occupied by the file header (magic[8] + committed_len[8]).
+const HEADER_SIZE: u64 = 16;
+
+/// Flush all in-flight writes to stable storage.
+///
+/// On macOS this uses `F_FULLFSYNC` to flush the drive's hardware write cache,
+/// which `fdatasync` alone does not guarantee.  Falls back to `sync_data` if
+/// `F_FULLFSYNC` returns an error (e.g. the device doesn't support it).
+/// On all other platforms this delegates to `sync_data` (`fdatasync`).
+fn durable_sync(file: &File) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let ret = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC) };
+        if ret != -1 {
+            return Ok(());
+        }
+        // Device does not support F_FULLFSYNC; fall back to fdatasync.
+    }
+    file.sync_data()
+}
+
+/// Acquire an exclusive, non-blocking advisory flock on `file`.
+///
+/// Returns `Err(WouldBlock)` if another process already holds the lock.
+#[cfg(unix)]
+fn flock_exclusive(file: &File) -> io::Result<()> {
+    let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if ret == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// Write the 16-byte header into a brand-new (empty) file.
+fn init_header(file: &mut File) -> io::Result<()> {
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(&MAGIC)?;
+    file.write_all(&0u64.to_le_bytes())
+}
+
+/// Overwrite the committed-length field at file offset 8.
+fn write_committed_len(file: &mut File, len: u64) -> io::Result<()> {
+    file.seek(SeekFrom::Start(8))?;
+    file.write_all(&len.to_le_bytes())
+}
+
+/// Read and validate the header; return the committed payload length.
+fn read_header(file: &mut File) -> io::Result<u64> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut hdr = [0u8; 16];
+    file.read_exact(&mut hdr)?;
+    if hdr[0..8] != MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "bstack: bad magic number — not a bstack file or wrong version",
+        ));
+    }
+    Ok(u64::from_le_bytes(hdr[8..16].try_into().unwrap()))
+}
+
+// ---------------------------------------------------------------------------
+
 /// A persistent, fsync-durable binary stack backed by a single file.
 ///
-/// See the [crate-level documentation](crate) for a full description of the
-/// file format, durability guarantees, and thread-safety model.
+/// See the [crate-level documentation](crate) for the file format, durability
+/// guarantees, crash recovery, multi-process safety, and thread-safety model.
 pub struct BStack {
     lock: RwLock<File>,
 }
@@ -102,20 +208,61 @@ pub struct BStack {
 impl BStack {
     /// Open or create a stack file at `path`.
     ///
-    /// If the file already exists its existing contents are preserved; the
-    /// next [`push`](Self::push) will append after them.  The file is opened
-    /// with both read and write access.
+    /// On a **new** file the 16-byte header is written and durably synced
+    /// before returning.
+    ///
+    /// On an **existing** file the header is validated and, if a previous crash
+    /// left the file in an inconsistent state, the file is repaired and durably
+    /// synced before returning (see *Crash recovery* in the crate docs).
+    ///
+    /// On Unix an **exclusive advisory `flock`** is acquired; if another
+    /// process already holds the lock this function returns immediately with
+    /// [`io::ErrorKind::WouldBlock`].
     ///
     /// # Errors
     ///
-    /// Returns any [`io::Error`] produced by [`OpenOptions::open`], e.g.
-    /// `PermissionDenied` or `NotFound` (if a parent directory is missing).
+    /// * [`io::ErrorKind::WouldBlock`] — another process holds the exclusive
+    ///   lock (Unix only).
+    /// * [`io::ErrorKind::InvalidData`] — the file exists but its header magic
+    ///   is wrong (not a bstack file, or created by an incompatible version),
+    ///   or the file is too short to contain a valid header.
+    /// * Any [`io::Error`] from [`OpenOptions::open`], `read`, `write`, or
+    ///   `durable_sync`.
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
-        let file = OpenOptions::new()
+        let mut file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .open(path)?;
+
+        #[cfg(unix)]
+        flock_exclusive(&file)?;
+
+        let raw_size = file.metadata()?.len();
+
+        if raw_size == 0 {
+            init_header(&mut file)?;
+            durable_sync(&file)?;
+        } else if raw_size < HEADER_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "bstack: file is {raw_size} bytes — too small to contain the 16-byte header"
+                ),
+            ));
+        } else {
+            let committed_len = read_header(&mut file)?;
+            let actual_data_len = raw_size - HEADER_SIZE;
+            if actual_data_len != committed_len {
+                // Recover: use whichever length is smaller (the committed
+                // value is the last successfully synced boundary).
+                let correct_len = committed_len.min(actual_data_len);
+                file.set_len(HEADER_SIZE + correct_len)?;
+                write_committed_len(&mut file, correct_len)?;
+                durable_sync(&file)?;
+            }
+        }
+
         Ok(BStack {
             lock: RwLock::new(file),
         })
@@ -123,33 +270,43 @@ impl BStack {
 
     /// Append `data` to the end of the file.
     ///
-    /// Returns the byte offset at which `data` begins — i.e. the file size
-    /// immediately before the write.  An empty slice is a valid argument; it
+    /// Returns the **logical** byte offset at which `data` begins — i.e. the
+    /// payload size immediately before the write.  An empty slice is valid; it
     /// writes nothing and returns the current end offset.
     ///
     /// # Atomicity
     ///
-    /// Either the full payload is written and fsynced, or the file is
-    /// unchanged.  On failure after a partial kernel write the implementation
-    /// attempts a best-effort `ftruncate` back to the pre-call length.
+    /// Either the full payload is written, the header committed-length is
+    /// updated, and the whole thing is durably synced, or the file is
+    /// left unchanged (best-effort rollback via `ftruncate` + header reset).
     ///
     /// # Errors
     ///
-    /// Returns any [`io::Error`] from `write_all`, `sync_data`, or the
+    /// Returns any [`io::Error`] from `write_all`, `durable_sync`, or the
     /// fallback `set_len`.
     pub fn push(&self, data: &[u8]) -> io::Result<u64> {
         let mut file = self.lock.write().unwrap();
-        // Seek to end to get the current offset; we manage position ourselves
-        // rather than relying on O_APPEND so the returned offset is accurate.
-        let offset = file.seek(SeekFrom::End(0))?;
-        match file.write_all(data).and_then(|_| file.sync_data()) {
-            Ok(()) => Ok(offset),
-            Err(e) => {
-                // Attempt to roll back by truncating to the pre-write length.
-                let _ = file.set_len(offset);
-                Err(e)
-            }
+        let file_end = file.seek(SeekFrom::End(0))?;
+        let logical_offset = file_end - HEADER_SIZE;
+
+        if data.is_empty() {
+            return Ok(logical_offset);
         }
+
+        if let Err(e) = file.write_all(data) {
+            let _ = file.set_len(file_end);
+            return Err(e);
+        }
+
+        let new_len = logical_offset + data.len() as u64;
+        if let Err(e) = write_committed_len(&mut file, new_len).and_then(|_| durable_sync(&*file)) {
+            // Roll back: truncate data and reset header.
+            let _ = file.set_len(file_end);
+            let _ = write_committed_len(&mut file, logical_offset);
+            return Err(e);
+        }
+
+        Ok(logical_offset)
     }
 
     /// Remove and return the last `n` bytes of the file.
@@ -159,76 +316,70 @@ impl BStack {
     ///
     /// # Atomicity
     ///
-    /// The bytes are read before the file is truncated.  Either the full
-    /// sequence — read → `ftruncate` → `fdatasync` — completes, or the file
-    /// is unchanged.
+    /// The bytes are read before the file is truncated.  The committed-length
+    /// in the header is updated and durably synced after the truncation.
     ///
     /// # Errors
     ///
     /// Returns [`io::ErrorKind::InvalidInput`] if `n` exceeds the current
-    /// file size.  Also propagates any I/O error from `read_exact`,
-    /// `set_len`, or `sync_data`.
+    /// payload size.  Also propagates any I/O error from `read_exact`,
+    /// `set_len`, `write_all`, or `durable_sync`.
     pub fn pop(&self, n: u64) -> io::Result<Vec<u8>> {
         let mut file = self.lock.write().unwrap();
-        let size = file.seek(SeekFrom::End(0))?;
-        if n > size {
+        let raw_size = file.seek(SeekFrom::End(0))?;
+        let data_size = raw_size - HEADER_SIZE;
+        if n > data_size {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("pop({n}) exceeds file size ({size})"),
+                format!("pop({n}) exceeds payload size ({data_size})"),
             ));
         }
-        let new_len = size - n;
-        file.seek(SeekFrom::Start(new_len))?;
+        let new_data_len = data_size - n;
+        file.seek(SeekFrom::Start(HEADER_SIZE + new_data_len))?;
         let mut buf = vec![0u8; n as usize];
         file.read_exact(&mut buf)?;
-        file.set_len(new_len)?;
-        file.sync_data()?;
+        file.set_len(HEADER_SIZE + new_data_len)?;
+        write_committed_len(&mut file, new_data_len)?;
+        durable_sync(&*file)?;
         Ok(buf)
     }
 
-    /// Return a copy of every byte from `offset` to the end of the file.
+    /// Return a copy of every payload byte from `offset` to the end of the
+    /// file.
     ///
-    /// `offset == len()` is valid and returns an empty `Vec`.  The file is
-    /// not modified.
-    ///
-    /// # Atomicity
-    ///
-    /// Holds the write lock for the duration of the seek and read, so no
-    /// concurrent [`push`](Self::push) or [`pop`](Self::pop) can interleave.
+    /// `offset` is a **logical** offset (as returned by [`push`](Self::push)).
+    /// `offset == len()` is valid and returns an empty `Vec`.  The file is not
+    /// modified.
     ///
     /// # Errors
     ///
-    /// Returns [`io::ErrorKind::InvalidInput`] if `offset` exceeds the
-    /// current file size.
+    /// Returns [`io::ErrorKind::InvalidInput`] if `offset` exceeds the current
+    /// payload size.
     pub fn peek(&self, offset: u64) -> io::Result<Vec<u8>> {
         let mut file = self.lock.write().unwrap();
-        let size = file.seek(SeekFrom::End(0))?;
-        if offset > size {
+        let raw_size = file.seek(SeekFrom::End(0))?;
+        let data_size = raw_size - HEADER_SIZE;
+        if offset > data_size {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("peek offset ({offset}) exceeds file size ({size})"),
+                format!("peek offset ({offset}) exceeds payload size ({data_size})"),
             ));
         }
-        file.seek(SeekFrom::Start(offset))?;
-        let mut buf = vec![0u8; (size - offset) as usize];
+        file.seek(SeekFrom::Start(HEADER_SIZE + offset))?;
+        let mut buf = vec![0u8; (data_size - offset) as usize];
         file.read_exact(&mut buf)?;
         Ok(buf)
     }
 
-    /// Return a copy of the bytes in the half-open range `[start, end)`.
+    /// Return a copy of the bytes in the half-open logical range `[start, end)`.
     ///
     /// `start == end` is valid and returns an empty `Vec`.  The file is not
     /// modified.
     ///
-    /// # Atomicity
-    ///
-    /// Holds the write lock for the duration of the seek and read, so no
-    /// concurrent [`push`](Self::push) or [`pop`](Self::pop) can interleave.
-    ///
     /// # Errors
     ///
     /// Returns [`io::ErrorKind::InvalidInput`] if `end < start` or if `end`
-    /// exceeds the current file size.
+    /// exceeds the current payload size.
     pub fn get(&self, start: u64, end: u64) -> io::Result<Vec<u8>> {
         if end < start {
             return Err(io::Error::new(
@@ -237,34 +388,37 @@ impl BStack {
             ));
         }
         let mut file = self.lock.write().unwrap();
-        let size = file.seek(SeekFrom::End(0))?;
-        if end > size {
+        let raw_size = file.seek(SeekFrom::End(0))?;
+        let data_size = raw_size - HEADER_SIZE;
+        if end > data_size {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("get: end ({end}) exceeds file size ({size})"),
+                format!("get: end ({end}) exceeds payload size ({data_size})"),
             ));
         }
-        file.seek(SeekFrom::Start(start))?;
+        file.seek(SeekFrom::Start(HEADER_SIZE + start))?;
         let mut buf = vec![0u8; (end - start) as usize];
         file.read_exact(&mut buf)?;
         Ok(buf)
     }
 
-    /// Return the current size of the file in bytes.
+    /// Return the current **logical** payload size in bytes (excludes the
+    /// 16-byte header).
     ///
-    /// Takes the read lock, so it can run concurrently with other `len`
-    /// calls but blocks while any write-lock operation is in progress.  The
-    /// returned value is always at a clean operation boundary — it is never
-    /// observed mid-write.
+    /// Takes the read lock, so it can run concurrently with other `len` calls
+    /// but blocks while any write-lock operation is in progress.  The returned
+    /// value always reflects a clean operation boundary.
     ///
     /// # Errors
     ///
     /// Propagates any [`io::Error`] from [`File::metadata`].
     pub fn len(&self) -> io::Result<u64> {
         let file = self.lock.read().unwrap();
-        Ok(file.metadata()?.len())
+        Ok(file.metadata()?.len().saturating_sub(HEADER_SIZE))
     }
 }
+
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -288,6 +442,8 @@ mod tests {
         }
     }
 
+    // -------------------------------------------------------------------------
+    // Original functional tests (unchanged behaviour)
     // -------------------------------------------------------------------------
 
     #[test]
@@ -331,7 +487,6 @@ mod tests {
         s.push(b"12345").unwrap();
         s.push(b"67890").unwrap();
 
-        // pop 7 bytes — spans both pushes
         let bytes = s.pop(7).unwrap();
         assert_eq!(bytes, b"4567890");
         assert_eq!(s.len().unwrap(), 3);
@@ -354,7 +509,6 @@ mod tests {
         s.push(b"abc").unwrap();
         let err = s.pop(10).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
-        // File must be unchanged
         assert_eq!(s.len().unwrap(), 3);
     }
 
@@ -369,7 +523,7 @@ mod tests {
         assert_eq!(s.peek(0).unwrap(), b"helloworld");
         assert_eq!(s.peek(5).unwrap(), b"world");
         assert_eq!(s.peek(7).unwrap(), b"rld");
-        assert_eq!(s.peek(10).unwrap(), b""); // offset == size: empty slice
+        assert_eq!(s.peek(10).unwrap(), b"");
     }
 
     #[test]
@@ -380,7 +534,6 @@ mod tests {
         s.push(b"abc").unwrap();
         let err = s.peek(10).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
-        // file unchanged
         assert_eq!(s.len().unwrap(), 3);
     }
 
@@ -394,8 +547,8 @@ mod tests {
 
         assert_eq!(s.get(0, 5).unwrap(), b"hello");
         assert_eq!(s.get(5, 10).unwrap(), b"world");
-        assert_eq!(s.get(3, 8).unwrap(), b"lowor"); // spans push boundary
-        assert_eq!(s.get(4, 4).unwrap(), b"");      // empty range
+        assert_eq!(s.get(3, 8).unwrap(), b"lowor");
+        assert_eq!(s.get(4, 4).unwrap(), b"");
     }
 
     #[test]
@@ -427,7 +580,6 @@ mod tests {
         s.push(b"world").unwrap();
         let _ = s.get(2, 8).unwrap();
         assert_eq!(s.len().unwrap(), 10);
-        // subsequent push must still land at the right offset
         let off = s.push(b"!").unwrap();
         assert_eq!(off, 10);
     }
@@ -437,26 +589,21 @@ mod tests {
         let (s, p) = mk_stack();
         let _g = Guard(p);
 
-        let o0 = s.push(b"AAA").unwrap(); // [AAA]
+        let o0 = s.push(b"AAA").unwrap();
         assert_eq!(o0, 0);
-
-        let o1 = s.push(b"BB").unwrap(); // [AAABB]
+        let o1 = s.push(b"BB").unwrap();
         assert_eq!(o1, 3);
-
-        let popped = s.pop(2).unwrap(); // [AAA]
+        let popped = s.pop(2).unwrap();
         assert_eq!(popped, b"BB");
-
-        let o2 = s.push(b"CCCC").unwrap(); // [AAACCCC]
+        let o2 = s.push(b"CCCC").unwrap();
         assert_eq!(o2, 3);
-
         assert_eq!(s.len().unwrap(), 7);
-
         let all = s.pop(7).unwrap();
         assert_eq!(all, b"AAACCCC");
         assert_eq!(s.len().unwrap(), 0);
     }
 
-    // ---- persistence / reopen ---------------------------------------------------
+    // ---- persistence / reopen -----------------------------------------------
 
     #[test]
     fn reopen_reads_back_correct_data() {
@@ -483,7 +630,7 @@ mod tests {
 
         let s2 = BStack::open(&p).unwrap();
         let off1 = s2.push(b"second").unwrap();
-        assert_eq!(off1, 5); // must continue from prior end, not overwrite
+        assert_eq!(off1, 5);
         assert_eq!(s2.len().unwrap(), 11);
         assert_eq!(s2.peek(0).unwrap(), b"firstsecond");
     }
@@ -503,7 +650,7 @@ mod tests {
         assert_eq!(s2.peek(0).unwrap(), b"hello");
     }
 
-    // ---- zero / boundary --------------------------------------------------------
+    // ---- zero / boundary ----------------------------------------------------
 
     #[test]
     fn push_empty_slice() {
@@ -511,12 +658,12 @@ mod tests {
         let _g = Guard(p);
 
         let off0 = s.push(b"abc").unwrap();
-        let off1 = s.push(&[]).unwrap(); // empty — no bytes written
+        let off1 = s.push(&[]).unwrap();
         let off2 = s.push(b"def").unwrap();
 
         assert_eq!(off0, 0);
-        assert_eq!(off1, 3); // offset == current size
-        assert_eq!(off2, 3); // next real push lands at the same offset
+        assert_eq!(off1, 3);
+        assert_eq!(off2, 3);
         assert_eq!(s.len().unwrap(), 6);
         assert_eq!(s.peek(0).unwrap(), b"abcdef");
     }
@@ -530,7 +677,6 @@ mod tests {
         let bytes = s.pop(0).unwrap();
         assert_eq!(bytes, b"");
         assert_eq!(s.len().unwrap(), 3);
-        // seek position must be correct for the next push
         let off = s.push(b"d").unwrap();
         assert_eq!(off, 3);
     }
@@ -540,7 +686,6 @@ mod tests {
         let (s, p) = mk_stack();
         let _g = Guard(p);
 
-        // offset == size == 0: valid, returns empty slice
         assert_eq!(s.peek(0).unwrap(), b"");
     }
 
@@ -549,7 +694,6 @@ mod tests {
         let (s, p) = mk_stack();
         let _g = Guard(p);
 
-        // [0, 0) on a 0-byte file: valid, returns empty slice
         assert_eq!(s.get(0, 0).unwrap(), b"");
     }
 
@@ -563,12 +707,12 @@ mod tests {
         assert_eq!(s.len().unwrap(), 0);
 
         let off = s.push(b"world").unwrap();
-        assert_eq!(off, 0); // must re-start from the beginning
+        assert_eq!(off, 0);
         assert_eq!(s.len().unwrap(), 5);
         assert_eq!(s.peek(0).unwrap(), b"world");
     }
 
-    // ---- data integrity ---------------------------------------------------------
+    // ---- data integrity -----------------------------------------------------
 
     #[test]
     fn peek_does_not_modify_file() {
@@ -588,7 +732,6 @@ mod tests {
         let (s, p) = mk_stack();
         let _g = Guard(p);
 
-        // Every byte value 0x00–0xFF, twice to catch any off-by-one at the wrap.
         let data: Vec<u8> = (0u16..512).map(|i| (i % 256) as u8).collect();
         s.push(&data).unwrap();
         let got = s.pop(data.len() as u64).unwrap();
@@ -601,15 +744,169 @@ mod tests {
         let (s, p) = mk_stack();
         let _g = Guard(p);
 
-        // 1 MiB with a simple pattern to detect any byte-level corruption.
-        let payload: Vec<u8> = (0..1024 * 1024).map(|i: usize| (i.wrapping_mul(7).wrapping_add(13)) as u8).collect();
+        let payload: Vec<u8> = (0..1024 * 1024)
+            .map(|i: usize| (i.wrapping_mul(7).wrapping_add(13)) as u8)
+            .collect();
         s.push(&payload).unwrap();
         let got = s.get(0, payload.len() as u64).unwrap();
         assert_eq!(got, payload);
         assert_eq!(s.len().unwrap(), payload.len() as u64);
     }
 
-    // ---- concurrency ------------------------------------------------------------
+    // ---- header / magic / format --------------------------------------------
+
+    #[test]
+    fn new_file_has_valid_header() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+        drop(s); // close BStack so we can read the raw file
+
+        let raw = std::fs::read(&p).unwrap();
+        assert_eq!(raw.len(), HEADER_SIZE as usize, "new file should be exactly 16 bytes");
+        assert_eq!(&raw[0..8], &MAGIC, "magic mismatch");
+        let clen = u64::from_le_bytes(raw[8..16].try_into().unwrap());
+        assert_eq!(clen, 0, "committed length should be 0 for empty stack");
+    }
+
+    #[test]
+    fn header_committed_len_matches_after_pushes() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+
+        s.push(b"hello").unwrap(); // 5 bytes
+        s.push(b"world").unwrap(); // 5 bytes
+        drop(s);
+
+        let raw = std::fs::read(&p).unwrap();
+        let clen = u64::from_le_bytes(raw[8..16].try_into().unwrap());
+        assert_eq!(clen, 10);
+        assert_eq!(raw.len() as u64, HEADER_SIZE + 10);
+    }
+
+    #[test]
+    fn header_committed_len_matches_after_pop() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+
+        s.push(b"hello").unwrap();
+        s.push(b"world").unwrap();
+        s.pop(5).unwrap();
+        drop(s);
+
+        let raw = std::fs::read(&p).unwrap();
+        let clen = u64::from_le_bytes(raw[8..16].try_into().unwrap());
+        assert_eq!(clen, 5);
+        assert_eq!(raw.len() as u64, HEADER_SIZE + 5);
+    }
+
+    #[test]
+    fn open_rejects_bad_magic() {
+        let path = {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static C: AtomicU64 = AtomicU64::new(0);
+            let id = C.fetch_add(1, Ordering::Relaxed);
+            std::env::temp_dir().join(format!("bstack_badmagic_{}.bin", id))
+        };
+        let _g = Guard(path.clone());
+
+        // Write 16 bytes with wrong magic.
+        let mut bad: Vec<u8> = b"WRONGHDR".to_vec();
+        bad.extend_from_slice(&0u64.to_le_bytes());
+        std::fs::write(&path, &bad).unwrap();
+
+        let err = BStack::open(&path).err().unwrap();
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        assert!(err.to_string().contains("magic"));
+    }
+
+    #[test]
+    fn open_rejects_truncated_header() {
+        let path = {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static C: AtomicU64 = AtomicU64::new(0);
+            let id = C.fetch_add(1, Ordering::Relaxed);
+            std::env::temp_dir().join(format!("bstack_smallfile_{}.bin", id))
+        };
+        let _g = Guard(path.clone());
+
+        // Only 8 bytes — too short for a valid header.
+        std::fs::write(&path, b"tooshort").unwrap();
+
+        let err = BStack::open(&path).err().unwrap();
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn recovery_truncates_partial_push() {
+        // Simulate a push that wrote data but crashed before updating clen.
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+
+        s.push(b"committed").unwrap(); // 9 bytes, clen = 9
+        drop(s);
+
+        // Directly append 5 "phantom" bytes to the file (clen still says 9).
+        {
+            use std::io::Write;
+            let mut f = OpenOptions::new().append(true).open(&p).unwrap();
+            f.write_all(b"ghost").unwrap();
+            // Do NOT update the header — simulating a crash after write but
+            // before the header update + fsync.
+        }
+
+        // Verify the raw file has 16 + 9 + 5 = 30 bytes but clen = 9.
+        let raw = std::fs::read(&p).unwrap();
+        assert_eq!(raw.len(), (HEADER_SIZE + 9 + 5) as usize);
+        let clen_before = u64::from_le_bytes(raw[8..16].try_into().unwrap());
+        assert_eq!(clen_before, 9);
+
+        // Reopen: recovery should truncate the phantom 5 bytes.
+        let s2 = BStack::open(&p).unwrap();
+        assert_eq!(s2.len().unwrap(), 9);
+        assert_eq!(s2.peek(0).unwrap(), b"committed");
+        drop(s2);
+
+        // Raw file should now be exactly 16 + 9 = 25 bytes.
+        let raw2 = std::fs::read(&p).unwrap();
+        assert_eq!(raw2.len(), (HEADER_SIZE + 9) as usize);
+    }
+
+    #[test]
+    fn recovery_repairs_header_after_partial_pop() {
+        // Simulate a pop that truncated the file but crashed before updating clen.
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+
+        s.push(b"hello").unwrap(); // 5 bytes
+        s.push(b"world").unwrap(); // 5 bytes
+        drop(s);
+
+        // Manually truncate the file to remove "world" (back to 16 + 5 = 21),
+        // but leave clen at 10 — simulating a crash after ftruncate but before
+        // the header write + fsync.
+        {
+            let f = OpenOptions::new().write(true).open(&p).unwrap();
+            f.set_len(HEADER_SIZE + 5).unwrap();
+            // Header still says clen = 10.
+        }
+
+        let raw = std::fs::read(&p).unwrap();
+        assert_eq!(raw.len(), (HEADER_SIZE + 5) as usize);
+        let clen_before = u64::from_le_bytes(raw[8..16].try_into().unwrap());
+        assert_eq!(clen_before, 10, "header should still claim 10 before recovery");
+
+        // Reopen: recovery should set clen = 5 to match actual file size.
+        let s2 = BStack::open(&p).unwrap();
+        assert_eq!(s2.len().unwrap(), 5);
+        assert_eq!(s2.peek(0).unwrap(), b"hello");
+        drop(s2);
+
+        let raw2 = std::fs::read(&p).unwrap();
+        let clen_after = u64::from_le_bytes(raw2[8..16].try_into().unwrap());
+        assert_eq!(clen_after, 5, "clen should be repaired to 5 after recovery");
+    }
+
+    // ---- concurrency --------------------------------------------------------
 
     #[test]
     fn concurrent_pushes_non_overlapping() {
@@ -623,7 +920,7 @@ mod tests {
 
         const THREADS: usize = 8;
         const PER_THREAD: usize = 100;
-        const ITEM: usize = 16; // bytes per push
+        const ITEM: usize = 16;
 
         let handles: Vec<_> = (0..THREADS)
             .map(|t| {
@@ -631,8 +928,6 @@ mod tests {
                 thread::spawn(move || {
                     (0..PER_THREAD)
                         .map(|i| {
-                            // Encode thread-id and sequence number so we can
-                            // verify content after all threads finish.
                             let mut data = [0u8; ITEM];
                             data[0] = t as u8;
                             data[1..9].copy_from_slice(&(i as u64).to_le_bytes());
@@ -646,21 +941,17 @@ mod tests {
 
         let results: Vec<_> = handles.into_iter().flat_map(|h| h.join().unwrap()).collect();
 
-        // Every offset must be a multiple of ITEM (each push is exactly ITEM bytes).
         for &(off, _, _) in &results {
             assert_eq!(off % ITEM as u64, 0, "offset {off} is not aligned to ITEM");
         }
 
-        // Every offset must be unique — no two pushes can share a slot.
         let mut seen: HashSet<u64> = HashSet::new();
         for &(off, _, _) in &results {
             assert!(seen.insert(off), "duplicate offset {off}");
         }
 
-        // Total size must account for every push.
         assert_eq!(s.len().unwrap(), (THREADS * PER_THREAD * ITEM) as u64);
 
-        // Read each slot back and verify the encoded thread-id and index.
         for &(off, t, i) in &results {
             let slot = s.get(off, off + ITEM as u64).unwrap();
             assert_eq!(slot[0], t as u8, "thread id mismatch at offset {off}");
@@ -674,11 +965,6 @@ mod tests {
         use std::sync::Arc;
         use std::thread;
 
-        // Push fixed-size items from several threads while another thread reads
-        // len continuously. Because push holds the write lock and len holds the
-        // read lock, len must never observe a partial write — it will always
-        // block until the active push completes, so the size it sees is always
-        // an exact multiple of ITEM.
         let (s, p) = mk_stack();
         let _g = Guard(p);
         let s = Arc::new(s);
@@ -701,10 +987,13 @@ mod tests {
         let len_handle = {
             let s = Arc::clone(&s);
             thread::spawn(move || {
-                // Sample len 2000 times while pushes are in flight.
                 for _ in 0..2000 {
                     let size = s.len().unwrap();
-                    assert_eq!(size % ITEM, 0, "torn write: size {size} is not a multiple of {ITEM}");
+                    assert_eq!(
+                        size % ITEM,
+                        0,
+                        "torn write: size {size} is not a multiple of {ITEM}"
+                    );
                 }
             })
         };
