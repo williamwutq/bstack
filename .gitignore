@@ -13,3 +13,6 @@ test_*
 # MacOS
 .DS_Store
 ._*
+
+# Build
+/build

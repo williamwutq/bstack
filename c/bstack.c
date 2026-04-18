@@ -1,10 +1,12 @@
-/* Expose BSD extensions (flock, F_FULLFSYNC) alongside POSIX APIs. */
-#ifdef __APPLE__
-#  define _DARWIN_C_SOURCE
-#else
-#  define _DEFAULT_SOURCE
-#  define _POSIX_C_SOURCE 200809L
-#endif
+/* Expose POSIX + BSD extensions on all supported platforms.
+ * _DARWIN_C_SOURCE is defined unconditionally: on real macOS it overrides
+ * _POSIX_C_SOURCE restrictions to keep fdatasync/flock visible; on Linux/glibc
+ * it is ignored.  This also handles clang cross-compilation that falls back to
+ * macOS SDK headers when no Linux sysroot is available. */
+#define _DARWIN_C_SOURCE
+#define _DEFAULT_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#define _XOPEN_SOURCE 700
 
 #include "bstack.h"
 

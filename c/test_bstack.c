@@ -1,11 +1,9 @@
 /* Mirror of the Rust bstack test suite, adapted for the C API. */
 
-#ifdef __APPLE__
-#  define _DARWIN_C_SOURCE
-#else
-#  define _DEFAULT_SOURCE
-#  define _POSIX_C_SOURCE 200809L
-#endif
+#define _DARWIN_C_SOURCE
+#define _DEFAULT_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#define _XOPEN_SOURCE 700
 
 #include "bstack.h"
 
