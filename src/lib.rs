@@ -280,6 +280,7 @@ impl BStack {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(path)?;
 
         #[cfg(unix)]
@@ -346,7 +347,7 @@ impl BStack {
         }
 
         let new_len = logical_offset + data.len() as u64;
-        if let Err(e) = write_committed_len(&mut file, new_len).and_then(|_| durable_sync(&*file)) {
+        if let Err(e) = write_committed_len(&mut file, new_len).and_then(|_| durable_sync(&file)) {
             // Roll back: truncate data and reset header.
             let _ = file.set_len(file_end);
             let _ = write_committed_len(&mut file, logical_offset);
@@ -387,7 +388,7 @@ impl BStack {
         file.read_exact(&mut buf)?;
         file.set_len(HEADER_SIZE + new_data_len)?;
         write_committed_len(&mut file, new_data_len)?;
-        durable_sync(&*file)?;
+        durable_sync(&file)?;
         Ok(buf)
     }
 
@@ -422,7 +423,7 @@ impl BStack {
                     format!("peek offset ({offset}) exceeds payload size ({data_size})"),
                 ));
             }
-            return pread_exact(&*file, HEADER_SIZE + offset, (data_size - offset) as usize);
+            pread_exact(&file, HEADER_SIZE + offset, (data_size - offset) as usize)
         }
         #[cfg(not(unix))]
         {
@@ -474,7 +475,7 @@ impl BStack {
                     format!("get: end ({end}) exceeds payload size ({data_size})"),
                 ));
             }
-            return pread_exact(&*file, HEADER_SIZE + start, (end - start) as usize);
+            pread_exact(&file, HEADER_SIZE + start, (end - start) as usize)
         }
         #[cfg(not(unix))]
         {
@@ -532,7 +533,7 @@ impl BStack {
         }
         file.seek(SeekFrom::Start(HEADER_SIZE + offset))?;
         file.write_all(data)?;
-        durable_sync(&*file)
+        durable_sync(&file)
     }
 
     /// Return the current **logical** payload size in bytes (excludes the
@@ -548,6 +549,15 @@ impl BStack {
     pub fn len(&self) -> io::Result<u64> {
         let file = self.lock.read().unwrap();
         Ok(file.metadata()?.len().saturating_sub(HEADER_SIZE))
+    }
+
+    /// Return `true` if the stack contains no payload bytes.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any [`io::Error`] from [`File::metadata`].
+    pub fn is_empty(&self) -> io::Result<bool> {
+        Ok(self.len()? == 0)
     }
 }
 
