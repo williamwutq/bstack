@@ -1,1 +1,14 @@
+# Rust
 /target
+
+# C
+/obj
+*.o
+*.so
+*.dylib
+*.dll
+*.a
+
+# MacOS
+.DS_Store
+._*
