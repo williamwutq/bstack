@@ -3,11 +3,12 @@
 //! # Overview
 //!
 //! [`BStack`] treats a file as a flat byte buffer that grows and shrinks from
-//! the tail.  Every mutating operation — [`push`](BStack::push) and
-//! [`pop`](BStack::pop) — calls a *durable sync* before returning, so the data
-//! survives a process crash or an unclean system shutdown.  Read-only
-//! operations — [`peek`](BStack::peek) and [`get`](BStack::get) — never modify
-//! the file and on Unix can run concurrently with each other.
+//! the tail.  Every mutating operation — [`push`](BStack::push),
+//! [`pop`](BStack::pop), and (with the `set` feature) [`set`](BStack::set) —
+//! calls a *durable sync* before returning, so the data survives a process
+//! crash or an unclean system shutdown.  Read-only operations —
+//! [`peek`](BStack::peek) and [`get`](BStack::get) — never modify the file
+//! and on Unix can run concurrently with each other.
 //!
 //! The crate has **no external dependencies beyond `libc` on Unix** and uses
 //! **no `unsafe` code beyond the required `libc` FFI calls**.
@@ -56,6 +57,8 @@
 //! |-----------|-----------------|
 //! | `push` | `lseek(END)` → `write(data)` → `lseek(8)` → `write(clen)` → `durable_sync` |
 //! | `pop`  | `lseek` → `read` → `ftruncate` → `lseek(8)` → `write(clen)` → `durable_sync` |
+//! | `set` *(feature)* | `lseek(offset)` → `write(data)` → `durable_sync` |
+//! | `peek`, `get` | `pread(2)` on Unix; `lseek` → `read` elsewhere (no sync — read-only) |
 //!
 //! **`durable_sync` on macOS** issues `fcntl(F_FULLFSYNC)`, which flushes the
 //! drive's hardware write cache.  Plain `fdatasync` is not sufficient on macOS
@@ -98,6 +101,7 @@
 //! | Operation | Lock (Unix) | Lock (non-Unix) |
 //! |-----------|-------------|-----------------|
 //! | `push`, `pop` | write | write |
+//! | `set` *(feature)* | write | write |
 //! | `peek`, `get` | **read** | write |
 //! | `len` | read | read |
 //!
@@ -108,6 +112,19 @@
 //!
 //! On non-Unix platforms a seek is required, so `peek` and `get` fall back to
 //! the write lock and all reads serialise.
+//!
+//! # Feature flags
+//!
+//! | Feature | Description |
+//! |---------|-------------|
+//! | `set`   | Enables [`BStack::set`] — in-place overwrite of existing payload bytes without changing the file size. |
+//!
+//! Enable with:
+//!
+//! ```toml
+//! [dependencies]
+//! bstack = { version = "0.1", features = ["set"] }
+//! ```
 //!
 //! # Examples
 //!
@@ -475,6 +492,47 @@ impl BStack {
             file.read_exact(&mut buf)?;
             Ok(buf)
         }
+    }
+
+    /// Overwrite `data` bytes in place starting at logical `offset`.
+    ///
+    /// The file size is never changed: if `offset + data.len()` would exceed
+    /// the current payload size the call is rejected.  An empty slice is a
+    /// valid no-op.
+    ///
+    /// # Feature flag
+    ///
+    /// Only available when the `set` Cargo feature is enabled.
+    ///
+    /// # Durability
+    ///
+    /// Equivalent to `push`/`pop`: the overwritten bytes are durably synced
+    /// before the call returns.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] if `offset + data.len()`
+    /// exceeds the current payload size, or if the addition overflows `u64`.
+    /// Propagates any I/O error from `write_all` or `durable_sync`.
+    #[cfg(feature = "set")]
+    pub fn set(&self, offset: u64, data: &[u8]) -> io::Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        let end = offset
+            .checked_add(data.len() as u64)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "set: offset + len overflows u64"))?;
+        let mut file = self.lock.write().unwrap();
+        let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
+        if end > data_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("set: write end ({end}) exceeds payload size ({data_size})"),
+            ));
+        }
+        file.seek(SeekFrom::Start(HEADER_SIZE + offset))?;
+        file.write_all(data)?;
+        durable_sync(&*file)
     }
 
     /// Return the current **logical** payload size in bytes (excludes the
@@ -979,6 +1037,104 @@ mod tests {
         let raw2 = std::fs::read(&p).unwrap();
         let clen_after = u64::from_le_bytes(raw2[8..16].try_into().unwrap());
         assert_eq!(clen_after, 5, "clen should be repaired to 5 after recovery");
+    }
+
+    // ---- set (feature-gated) ------------------------------------------------
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn set_overwrites_middle_bytes() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        s.push(b"helloworld").unwrap();
+        s.set(5, b"WORLD").unwrap();
+        assert_eq!(s.peek(0).unwrap(), b"helloWORLD");
+        assert_eq!(s.len().unwrap(), 10);
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn set_at_start() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        s.push(b"helloworld").unwrap();
+        s.set(0, b"HELLO").unwrap();
+        assert_eq!(s.peek(0).unwrap(), b"HELLOworld");
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn set_at_exact_end_boundary() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        s.push(b"hello").unwrap();
+        s.set(3, b"LO").unwrap();
+        assert_eq!(s.peek(0).unwrap(), b"helLO");
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn set_empty_slice_is_noop() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        s.push(b"hello").unwrap();
+        s.set(2, b"").unwrap();
+        assert_eq!(s.peek(0).unwrap(), b"hello");
+        assert_eq!(s.len().unwrap(), 5);
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn set_does_not_change_file_size() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        s.push(b"abcde").unwrap();
+        s.set(1, b"XYZ").unwrap();
+        assert_eq!(s.len().unwrap(), 5);
+        assert_eq!(s.peek(0).unwrap(), b"aXYZe");
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn set_rejects_write_past_end() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        s.push(b"hello").unwrap();
+        let err = s.set(3, b"TOOLONG").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        // File must be unchanged.
+        assert_eq!(s.peek(0).unwrap(), b"hello");
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn set_rejects_offset_past_end() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        s.push(b"hello").unwrap();
+        let err = s.set(10, b"x").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn set_persists_across_reopen() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+
+        s.push(b"helloworld").unwrap();
+        s.set(5, b"WORLD").unwrap();
+        drop(s);
+
+        let s2 = BStack::open(&p).unwrap();
+        assert_eq!(s2.peek(0).unwrap(), b"helloWORLD");
     }
 
     // ---- concurrency --------------------------------------------------------

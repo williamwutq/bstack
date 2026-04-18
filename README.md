@@ -71,6 +71,12 @@ impl BStack {
     /// `n = 0` is valid.  Errors if `n` exceeds the current payload size.
     pub fn pop(&self, n: u64) -> io::Result<Vec<u8>>;
 
+    /// Overwrite `data` bytes in place starting at logical `offset`.
+    /// Never changes the file size; errors if the write would exceed the
+    /// current payload.  Requires the `set` feature.
+    #[cfg(feature = "set")]
+    pub fn set(&self, offset: u64, data: &[u8]) -> io::Result<()>;
+
     /// Copy all bytes from `offset` to the end of the payload.
     /// `offset == len()` returns an empty Vec.
     pub fn peek(&self, offset: u64) -> io::Result<Vec<u8>>;
@@ -82,6 +88,20 @@ impl BStack {
     /// Current payload size in bytes (excludes the 16-byte header).
     pub fn len(&self) -> io::Result<u64>;
 }
+```
+
+---
+
+## Feature flags
+
+### `set`
+
+`BStack::set(offset, data)` — in-place overwrite of existing payload bytes
+without changing the file size or the committed-length header.
+
+```toml
+[dependencies]
+bstack = { version = "0.1", features = ["set"] }
 ```
 
 ---
@@ -111,11 +131,12 @@ All user-visible offsets (returned by `push`, accepted by `peek`/`get`) are
 
 ## Durability
 
-| Operation     | Sequence                                                               |
-|---------------|------------------------------------------------------------------------|
-| `push`        | `lseek(END)` → `write(data)` → `lseek(8)` → `write(clen)` → sync     |
-| `pop`         | `lseek` → `read` → `ftruncate` → `lseek(8)` → `write(clen)` → sync   |
-| `peek`, `get` | `lseek` → `read` (no sync — read-only)                                |
+| Operation           | Sequence                                                             |
+|---------------------|----------------------------------------------------------------------|
+| `push`              | `lseek(END)` → `write(data)` → `lseek(8)` → `write(clen)` → sync     |
+| `pop`               | `lseek` → `read` → `ftruncate` → `lseek(8)` → `write(clen)` → sync   |
+| `set` *(feature)*   | `lseek(offset)` → `write(data)` → sync                               |
+| `peek`, `get`       | `pread(2)` on Unix; `lseek` → `read` elsewhere (no sync — read-only) |
 
 **`durable_sync` on macOS** issues `fcntl(F_FULLFSYNC)`.  Unlike `fdatasync`,
 this flushes the drive controller's write cache, providing the same "barrier
@@ -159,11 +180,12 @@ dropped.
 
 `BStack` wraps the file in a `RwLock<File>`.
 
-| Operation       | Lock (Unix)    | Lock (non-Unix) |
-|-----------------|----------------|-----------------|
-| `push`, `pop`   | write          | write           |
-| `peek`, `get`   | **read**       | write           |
-| `len`           | read           | read            |
+| Operation             | Lock (Unix)    | Lock (non-Unix) |
+|-----------------------|----------------|-----------------|
+| `push`, `pop`         | write          | write           |
+| `set` *(feature)*     | write          | write           |
+| `peek`, `get`         | **read**       | write           |
+| `len`                 | read           | read            |
 
 On Unix, `peek` and `get` use `pread(2)` (`read_exact_at` from
 `std::os::unix::fs::FileExt`), which reads at an absolute file offset without
