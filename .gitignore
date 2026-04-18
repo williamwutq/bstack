@@ -8,6 +8,7 @@
 *.dylib
 *.dll
 *.a
+test_*
 
 # MacOS
 .DS_Store
