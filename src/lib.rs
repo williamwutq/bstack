@@ -159,9 +159,9 @@ use std::path::Path;
 use std::sync::RwLock;
 
 #[cfg(unix)]
-use std::os::unix::io::AsRawFd;
-#[cfg(unix)]
 use std::os::unix::fs::FileExt;
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
 
 /// Full magic for files written by this version (`BSTK` + major 0 + minor 1 + patch 1 + 0).
 const MAGIC: [u8; 8] = *b"BSTK\x00\x01\x01\x00";
@@ -520,9 +520,12 @@ impl BStack {
         if data.is_empty() {
             return Ok(());
         }
-        let end = offset
-            .checked_add(data.len() as u64)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "set: offset + len overflows u64"))?;
+        let end = offset.checked_add(data.len() as u64).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "set: offset + len overflows u64",
+            )
+        })?;
         let mut file = self.lock.write().unwrap();
         let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
         if end > data_size {
@@ -905,7 +908,11 @@ mod tests {
         drop(s); // close BStack so we can read the raw file
 
         let raw = std::fs::read(&p).unwrap();
-        assert_eq!(raw.len(), HEADER_SIZE as usize, "new file should be exactly 16 bytes");
+        assert_eq!(
+            raw.len(),
+            HEADER_SIZE as usize,
+            "new file should be exactly 16 bytes"
+        );
         assert_eq!(&raw[0..8], &MAGIC, "magic mismatch");
         let clen = u64::from_le_bytes(raw[8..16].try_into().unwrap());
         assert_eq!(clen, 0, "committed length should be 0 for empty stack");
@@ -1036,7 +1043,10 @@ mod tests {
         let raw = std::fs::read(&p).unwrap();
         assert_eq!(raw.len(), (HEADER_SIZE + 5) as usize);
         let clen_before = u64::from_le_bytes(raw[8..16].try_into().unwrap());
-        assert_eq!(clen_before, 10, "header should still claim 10 before recovery");
+        assert_eq!(
+            clen_before, 10,
+            "header should still claim 10 before recovery"
+        );
 
         // Reopen: recovery should set clen = 5 to match actual file size.
         let s2 = BStack::open(&p).unwrap();
@@ -1228,7 +1238,10 @@ mod tests {
             })
             .collect();
 
-        let results: Vec<_> = handles.into_iter().flat_map(|h| h.join().unwrap()).collect();
+        let results: Vec<_> = handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect();
 
         for &(off, _, _) in &results {
             assert_eq!(off % ITEM as u64, 0, "offset {off} is not aligned to ITEM");
