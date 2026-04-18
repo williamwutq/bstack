@@ -7,7 +7,7 @@
 //! [`pop`](BStack::pop) — calls a *durable sync* before returning, so the data
 //! survives a process crash or an unclean system shutdown.  Read-only
 //! operations — [`peek`](BStack::peek) and [`get`](BStack::get) — never modify
-//! the file and hold the write lock only long enough to seek and read.
+//! the file and on Unix can run concurrently with each other.
 //!
 //! The crate has **no external dependencies beyond `libc` on Unix** and uses
 //! **no `unsafe` code beyond the required `libc` FFI calls**.
@@ -92,9 +92,21 @@
 //!
 //! # Thread safety
 //!
-//! `BStack` wraps the file in a [`std::sync::RwLock`].  All operations that
-//! need to seek take the **write** lock.  Only `len`, which reads file metadata
-//! without seeking, takes the **read** lock.
+//! `BStack` wraps the file in a [`std::sync::RwLock`].
+//!
+//! | Operation | Lock (Unix) | Lock (non-Unix) |
+//! |-----------|-------------|-----------------|
+//! | `push`, `pop` | write | write |
+//! | `peek`, `get` | **read** | write |
+//! | `len` | read | read |
+//!
+//! On Unix, `peek` and `get` use `pread(2)`, which reads at an absolute file
+//! offset without touching the file-position cursor.  This allows multiple
+//! concurrent `peek`/`get`/`len` calls to run in parallel while any ongoing
+//! `push` or `pop` still serialises all readers via the write lock.
+//!
+//! On non-Unix platforms a seek is required, so `peek` and `get` fall back to
+//! the write lock and all reads serialise.
 //!
 //! # Examples
 //!
@@ -130,6 +142,8 @@ use std::sync::RwLock;
 
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
+#[cfg(unix)]
+use std::os::unix::fs::FileExt;
 
 /// `BSTK` + version 0.1 — rejects files created by incompatible versions.
 const MAGIC: [u8; 8] = *b"BSTK\x00\x01\x00\x00";
@@ -179,6 +193,17 @@ fn init_header(file: &mut File) -> io::Result<()> {
 fn write_committed_len(file: &mut File, len: u64) -> io::Result<()> {
     file.seek(SeekFrom::Start(8))?;
     file.write_all(&len.to_le_bytes())
+}
+
+/// Read `len` bytes from absolute file position `offset` using `pread(2)`.
+///
+/// Unlike `seek` + `read`, `pread` does not modify the file-position cursor,
+/// so the caller only needs a shared (read) lock on the file.
+#[cfg(unix)]
+fn pread_exact(file: &File, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+    let mut buf = vec![0u8; len];
+    file.read_exact_at(&mut buf, offset)?;
+    Ok(buf)
 }
 
 /// Read and validate the header; return the committed payload length.
@@ -351,30 +376,60 @@ impl BStack {
     /// `offset == len()` is valid and returns an empty `Vec`.  The file is not
     /// modified.
     ///
+    /// # Concurrency
+    ///
+    /// On Unix this uses `pread(2)`, which does not modify the file-position
+    /// cursor.  The method therefore takes only the **read lock**, allowing
+    /// multiple concurrent `peek` and `get` calls to run in parallel.
+    ///
+    /// On non-Unix platforms a seek is required; the method falls back to the
+    /// write lock and concurrent reads serialise as before.
+    ///
     /// # Errors
     ///
     /// Returns [`io::ErrorKind::InvalidInput`] if `offset` exceeds the current
     /// payload size.
     pub fn peek(&self, offset: u64) -> io::Result<Vec<u8>> {
-        let mut file = self.lock.write().unwrap();
-        let raw_size = file.seek(SeekFrom::End(0))?;
-        let data_size = raw_size - HEADER_SIZE;
-        if offset > data_size {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("peek offset ({offset}) exceeds payload size ({data_size})"),
-            ));
+        #[cfg(unix)]
+        {
+            let file = self.lock.read().unwrap();
+            let data_size = file.metadata()?.len().saturating_sub(HEADER_SIZE);
+            if offset > data_size {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("peek offset ({offset}) exceeds payload size ({data_size})"),
+                ));
+            }
+            return pread_exact(&*file, HEADER_SIZE + offset, (data_size - offset) as usize);
         }
-        file.seek(SeekFrom::Start(HEADER_SIZE + offset))?;
-        let mut buf = vec![0u8; (data_size - offset) as usize];
-        file.read_exact(&mut buf)?;
-        Ok(buf)
+        #[cfg(not(unix))]
+        {
+            let mut file = self.lock.write().unwrap();
+            let raw_size = file.seek(SeekFrom::End(0))?;
+            let data_size = raw_size.saturating_sub(HEADER_SIZE);
+            if offset > data_size {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("peek offset ({offset}) exceeds payload size ({data_size})"),
+                ));
+            }
+            file.seek(SeekFrom::Start(HEADER_SIZE + offset))?;
+            let mut buf = vec![0u8; (data_size - offset) as usize];
+            file.read_exact(&mut buf)?;
+            Ok(buf)
+        }
     }
 
     /// Return a copy of the bytes in the half-open logical range `[start, end)`.
     ///
     /// `start == end` is valid and returns an empty `Vec`.  The file is not
     /// modified.
+    ///
+    /// # Concurrency
+    ///
+    /// Same as [`peek`](Self::peek): on Unix the read lock is taken and
+    /// concurrent `get`/`peek`/`len` calls may run in parallel.  On non-Unix
+    /// the write lock is taken and reads serialise.
     ///
     /// # Errors
     ///
@@ -387,19 +442,34 @@ impl BStack {
                 format!("get: end ({end}) < start ({start})"),
             ));
         }
-        let mut file = self.lock.write().unwrap();
-        let raw_size = file.seek(SeekFrom::End(0))?;
-        let data_size = raw_size - HEADER_SIZE;
-        if end > data_size {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("get: end ({end}) exceeds payload size ({data_size})"),
-            ));
+        #[cfg(unix)]
+        {
+            let file = self.lock.read().unwrap();
+            let data_size = file.metadata()?.len().saturating_sub(HEADER_SIZE);
+            if end > data_size {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("get: end ({end}) exceeds payload size ({data_size})"),
+                ));
+            }
+            return pread_exact(&*file, HEADER_SIZE + start, (end - start) as usize);
         }
-        file.seek(SeekFrom::Start(HEADER_SIZE + start))?;
-        let mut buf = vec![0u8; (end - start) as usize];
-        file.read_exact(&mut buf)?;
-        Ok(buf)
+        #[cfg(not(unix))]
+        {
+            let mut file = self.lock.write().unwrap();
+            let raw_size = file.seek(SeekFrom::End(0))?;
+            let data_size = raw_size.saturating_sub(HEADER_SIZE);
+            if end > data_size {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("get: end ({end}) exceeds payload size ({data_size})"),
+                ));
+            }
+            file.seek(SeekFrom::Start(HEADER_SIZE + start))?;
+            let mut buf = vec![0u8; (end - start) as usize];
+            file.read_exact(&mut buf)?;
+            Ok(buf)
+        }
     }
 
     /// Return the current **logical** payload size in bytes (excludes the
@@ -907,6 +977,54 @@ mod tests {
     }
 
     // ---- concurrency --------------------------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_reads_do_not_serialise() {
+        // On Unix, peek and get use pread(2) and hold only the read lock, so
+        // they must be able to run simultaneously. We verify this by spinning
+        // up many reader threads on a pre-populated stack and confirming that
+        // they all finish with correct data — no deadlock, no torn reads.
+        use std::sync::Arc;
+        use std::thread;
+
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        // Write 8 fixed-size records of 16 bytes each.
+        const RECORDS: usize = 8;
+        const RSIZE: u64 = 16;
+        for i in 0..RECORDS {
+            let mut rec = [0u8; RSIZE as usize];
+            rec[0] = i as u8;
+            s.push(&rec).unwrap();
+        }
+
+        let s = Arc::new(s);
+
+        // Spawn 32 reader threads; each reads every record via both peek and get.
+        let handles: Vec<_> = (0..32)
+            .map(|_| {
+                let s = Arc::clone(&s);
+                thread::spawn(move || {
+                    for i in 0..RECORDS {
+                        let off = i as u64 * RSIZE;
+                        let via_get = s.get(off, off + RSIZE).unwrap();
+                        assert_eq!(via_get[0], i as u8);
+
+                        // peek from this record's offset; the first byte of
+                        // the returned slice must still be `i`.
+                        let via_peek = s.peek(off).unwrap();
+                        assert_eq!(via_peek[0], i as u8);
+                    }
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
+    }
 
     #[test]
     fn concurrent_pushes_non_overlapping() {

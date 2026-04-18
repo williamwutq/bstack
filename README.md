@@ -157,13 +157,21 @@ dropped.
 
 `BStack` wraps the file in a `RwLock<File>`.
 
-| Operation                    | Lock       |
-|------------------------------|------------|
-| `push`, `pop`, `peek`, `get` | write lock |
-| `len`                        | read lock  |
+| Operation       | Lock (Unix)    | Lock (non-Unix) |
+|-----------------|----------------|-----------------|
+| `push`, `pop`   | write          | write           |
+| `peek`, `get`   | **read**       | write           |
+| `len`           | read           | read            |
 
-All callers block while a write-lock operation is in progress, so `len` always
-observes a size at a clean operation boundary.
+On Unix, `peek` and `get` use `pread(2)` (`read_exact_at` from
+`std::os::unix::fs::FileExt`), which reads at an absolute file offset without
+touching the shared file-position cursor.  Multiple concurrent `peek`, `get`,
+and `len` calls can therefore run in parallel.  Any in-progress `push` or
+`pop` still blocks all readers via the write lock, so readers always observe a
+consistent, committed state.
+
+On non-Unix platforms a seek is required; `peek` and `get` fall back to the
+write lock and reads serialise.
 
 ---
 
