@@ -8,10 +8,11 @@
 //! calls a *durable sync* before returning, so the data survives a process
 //! crash or an unclean system shutdown.  Read-only operations —
 //! [`peek`](BStack::peek) and [`get`](BStack::get) — never modify the file
-//! and on Unix can run concurrently with each other.
+//! and on Unix and Windows can run concurrently with each other.
 //!
-//! The crate has **no external dependencies beyond `libc` on Unix** and uses
-//! **no `unsafe` code beyond the required `libc` FFI calls**.
+//! The crate depends on **`libc`** (Unix) and **`windows-sys`** (Windows) for
+//! platform-specific syscalls, and uses **no `unsafe` code beyond the required
+//! FFI calls**.
 //!
 //! # File format
 //!
@@ -58,7 +59,7 @@
 //! | `push` | `lseek(END)` → `write(data)` → `lseek(8)` → `write(clen)` → `durable_sync` |
 //! | `pop`  | `lseek` → `read` → `ftruncate` → `lseek(8)` → `write(clen)` → `durable_sync` |
 //! | `set` *(feature)* | `lseek(offset)` → `write(data)` → `durable_sync` |
-//! | `peek`, `get` | `pread(2)` on Unix; `lseek` → `read` elsewhere (no sync — read-only) |
+//! | `peek`, `get` | `pread(2)` on Unix; `ReadFile`+`OVERLAPPED` on Windows; `lseek` → `read` elsewhere (no sync — read-only) |
 //!
 //! **`durable_sync` on macOS** issues `fcntl(F_FULLFSYNC)`, which flushes the
 //! drive's hardware write cache.  Plain `fdatasync` is not sufficient on macOS
@@ -69,6 +70,10 @@
 //! **`durable_sync` on other Unix** calls `sync_data` (`fdatasync`), which is
 //! sufficient on Linux and BSD.
 //!
+//! **`durable_sync` on Windows** calls `sync_data`, which maps to
+//! `FlushFileBuffers`.  This flushes the kernel write-back cache and waits for
+//! the drive to acknowledge, providing equivalent durability to `fdatasync`.
+//!
 //! # Multi-process safety
 //!
 //! On Unix, [`open`](BStack::open) acquires an **exclusive advisory `flock`**
@@ -77,9 +82,17 @@
 //! than blocking indefinitely.  The lock is released automatically when the
 //! [`BStack`] is dropped (the underlying file descriptor is closed).
 //!
-//! > **Note:** `flock` is advisory and per-process.  It prevents well-behaved
-//! > concurrent opens across processes but does not protect against processes
-//! > that bypass the lock or against raw writes to the file.
+//! On Windows, [`open`](BStack::open) acquires an **exclusive `LockFileEx`**
+//! lock (`LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY`) covering the
+//! entire file range.  If another process already holds the lock, `open`
+//! returns immediately with [`io::ErrorKind::WouldBlock`]
+//! (`ERROR_LOCK_VIOLATION`).  The lock is released when the [`BStack`] is
+//! dropped (the underlying file handle is closed).
+//!
+//! > **Note:** Both `flock` (Unix) and `LockFileEx` (Windows) are advisory
+//! > and per-process.  They prevent well-behaved concurrent opens across
+//! > processes but do not protect against processes that bypass the lock or
+//! > against raw writes to the file.
 //!
 //! # Correct usage
 //!
@@ -98,19 +111,20 @@
 //!
 //! `BStack` wraps the file in a [`std::sync::RwLock`].
 //!
-//! | Operation | Lock (Unix) | Lock (non-Unix) |
-//! |-----------|-------------|-----------------|
+//! | Operation | Lock (Unix / Windows) | Lock (other) |
+//! |-----------|-----------------------|--------------|
 //! | `push`, `pop` | write | write |
 //! | `set` *(feature)* | write | write |
 //! | `peek`, `get` | **read** | write |
 //! | `len` | read | read |
 //!
-//! On Unix, `peek` and `get` use `pread(2)`, which reads at an absolute file
-//! offset without touching the file-position cursor.  This allows multiple
-//! concurrent `peek`/`get`/`len` calls to run in parallel while any ongoing
-//! `push` or `pop` still serialises all readers via the write lock.
+//! On Unix and Windows, `peek` and `get` use a cursor-safe positional read
+//! (`pread(2)` on Unix; `ReadFile` with `OVERLAPPED` on Windows) that does
+//! not modify the file-position cursor.  This allows multiple concurrent
+//! `peek`/`get`/`len` calls to run in parallel while any ongoing `push` or
+//! `pop` still serialises all writers via the write lock.
 //!
-//! On non-Unix platforms a seek is required, so `peek` and `get` fall back to
+//! On other platforms a seek is required, so `peek` and `get` fall back to
 //! the write lock and all reads serialise.
 //!
 //! # Feature flags
@@ -163,6 +177,17 @@ use std::os::unix::fs::FileExt;
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 
+#[cfg(windows)]
+use std::os::windows::fs::FileExt as WindowsFileExt;
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::{
+    LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
+};
+#[cfg(windows)]
+use windows_sys::Win32::System::IO::OVERLAPPED;
+
 /// Full magic for files written by this version (`BSTK` + major 0 + minor 1 + patch 1 + 0).
 const MAGIC: [u8; 8] = *b"BSTK\x00\x01\x01\x00";
 
@@ -204,6 +229,34 @@ fn flock_exclusive(file: &File) -> io::Result<()> {
     }
 }
 
+/// Acquire an exclusive, non-blocking `LockFileEx` lock on `file`.
+///
+/// Locks the entire file range (offset 0, length `u64::MAX`).
+/// Returns `Err(WouldBlock)` if another process already holds the lock
+/// (`ERROR_LOCK_VIOLATION` maps to `io::ErrorKind::WouldBlock` in Rust).
+#[cfg(windows)]
+fn lock_file_exclusive(file: &File) -> io::Result<()> {
+    let handle = file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+    // OVERLAPPED is required by LockFileEx even for synchronous handles.
+    // Offset fields (0, 0) anchor the lock at byte 0 of the file.
+    let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+    let ret = unsafe {
+        LockFileEx(
+            handle,
+            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+            0,        // reserved, must be zero
+            u32::MAX, // nNumberOfBytesToLockLow  ─┐ lock entire
+            u32::MAX, // nNumberOfBytesToLockHigh ─┘ file space
+            &mut overlapped,
+        )
+    };
+    if ret != 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 /// Write the 16-byte header into a brand-new (empty) file.
 fn init_header(file: &mut File) -> io::Result<()> {
     file.seek(SeekFrom::Start(0))?;
@@ -217,14 +270,34 @@ fn write_committed_len(file: &mut File, len: u64) -> io::Result<()> {
     file.write_all(&len.to_le_bytes())
 }
 
-/// Read `len` bytes from absolute file position `offset` using `pread(2)`.
+/// Read `len` bytes from absolute file position `offset` without modifying
+/// the file-position cursor, so the caller only needs a shared (read) lock.
 ///
-/// Unlike `seek` + `read`, `pread` does not modify the file-position cursor,
-/// so the caller only needs a shared (read) lock on the file.
+/// On Unix this uses `pread(2)` via `read_exact_at`.
+/// On Windows this uses `ReadFile` with an `OVERLAPPED` offset (via
+/// `seek_read`), which is also cursor-safe on synchronous handles.
 #[cfg(unix)]
 fn pread_exact(file: &File, offset: u64, len: usize) -> io::Result<Vec<u8>> {
     let mut buf = vec![0u8; len];
     file.read_exact_at(&mut buf, offset)?;
+    Ok(buf)
+}
+
+/// Windows counterpart of `pread_exact` — see the shared doc comment above.
+#[cfg(windows)]
+fn pread_exact(file: &File, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+    let mut buf = vec![0u8; len];
+    let mut filled = 0usize;
+    while filled < len {
+        let n = file.seek_read(&mut buf[filled..], offset + filled as u64)?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "pread_exact: unexpected EOF",
+            ));
+        }
+        filled += n;
+    }
     Ok(buf)
 }
 
@@ -285,6 +358,9 @@ impl BStack {
 
         #[cfg(unix)]
         flock_exclusive(&file)?;
+
+        #[cfg(windows)]
+        lock_file_exclusive(&file)?;
 
         let raw_size = file.metadata()?.len();
 
@@ -413,7 +489,7 @@ impl BStack {
     /// Returns [`io::ErrorKind::InvalidInput`] if `offset` exceeds the current
     /// payload size.
     pub fn peek(&self, offset: u64) -> io::Result<Vec<u8>> {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             let file = self.lock.read().unwrap();
             let data_size = file.metadata()?.len().saturating_sub(HEADER_SIZE);
@@ -425,7 +501,7 @@ impl BStack {
             }
             pread_exact(&file, HEADER_SIZE + offset, (data_size - offset) as usize)
         }
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         {
             let mut file = self.lock.write().unwrap();
             let raw_size = file.seek(SeekFrom::End(0))?;
@@ -465,7 +541,7 @@ impl BStack {
                 format!("get: end ({end}) < start ({start})"),
             ));
         }
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             let file = self.lock.read().unwrap();
             let data_size = file.metadata()?.len().saturating_sub(HEADER_SIZE);
@@ -477,7 +553,7 @@ impl BStack {
             }
             pread_exact(&file, HEADER_SIZE + start, (end - start) as usize)
         }
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         {
             let mut file = self.lock.write().unwrap();
             let raw_size = file.seek(SeekFrom::End(0))?;
