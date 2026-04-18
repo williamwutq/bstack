@@ -2,6 +2,13 @@
 name = "bstack"
 version = "0.1.0"
 edition = "2024"
+authors = ["William Wu <williamwutq@gmail.com>", "Claude <claude@anthropic.com>"]
+license = "MIT"
+description = "A persistent, fsync-durable binary stack backed by a single file"
+readme = "README.md"
+repository = "https://github.com/williamwutq/bstack"
+documentation = "https://docs.rs/bstack"
+keywords = ["stack", "persistent", "file-backed", "database", "binary"]
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
