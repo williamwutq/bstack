@@ -25,9 +25,10 @@
 //! file offset 0         offset 16      16+n0          EOF
 //! ```
 //!
-//! * **`magic`** — the 8-byte sequence `BSTK\x00\x01\x00\x00` (crate magic +
-//!   version 0.1).  [`open`](BStack::open) rejects any file whose first 8 bytes
-//!   do not match.
+//! * **`magic`** — 8 bytes: `BSTK` + major(1 B) + minor(1 B) + patch(1 B) + reserved(1 B).
+//!   This version writes `BSTK\x00\x01\x01\x00` (0.1.1).  [`open`](BStack::open)
+//!   accepts any file whose first 6 bytes match `BSTK\x00\x01` (any 0.1.x) and
+//!   rejects anything with a different major or minor.
 //! * **`clen`** — little-endian `u64` recording the *committed* payload length.
 //!   It is updated atomically with each [`push`](BStack::push) or
 //!   [`pop`](BStack::pop) and is used for crash recovery on the next
@@ -145,8 +146,12 @@ use std::os::unix::io::AsRawFd;
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
 
-/// `BSTK` + version 0.1 — rejects files created by incompatible versions.
-const MAGIC: [u8; 8] = *b"BSTK\x00\x01\x00\x00";
+/// Full magic for files written by this version (`BSTK` + major 0 + minor 1 + patch 1 + 0).
+const MAGIC: [u8; 8] = *b"BSTK\x00\x01\x01\x00";
+
+/// Compatibility prefix checked on open: `BSTK` + major 0 + minor 1.
+/// Any file whose first 6 bytes match is considered a compatible 0.1.x file.
+const MAGIC_PREFIX: [u8; 6] = *b"BSTK\x00\x01";
 
 /// Bytes occupied by the file header (magic[8] + committed_len[8]).
 const HEADER_SIZE: u64 = 16;
@@ -211,10 +216,10 @@ fn read_header(file: &mut File) -> io::Result<u64> {
     file.seek(SeekFrom::Start(0))?;
     let mut hdr = [0u8; 16];
     file.read_exact(&mut hdr)?;
-    if hdr[0..8] != MAGIC {
+    if hdr[0..6] != MAGIC_PREFIX {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "bstack: bad magic number — not a bstack file or wrong version",
+            "bstack: bad magic number — not a bstack file or incompatible version",
         ));
     }
     Ok(u64::from_le_bytes(hdr[8..16].try_into().unwrap()))
