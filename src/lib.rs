@@ -477,12 +477,13 @@ impl BStack {
     ///
     /// # Concurrency
     ///
-    /// On Unix this uses `pread(2)`, which does not modify the file-position
-    /// cursor.  The method therefore takes only the **read lock**, allowing
-    /// multiple concurrent `peek` and `get` calls to run in parallel.
+    /// On Unix and Windows this uses a cursor-safe positional read (`pread(2)`
+    /// on Unix; `ReadFile`+`OVERLAPPED` on Windows), so the method takes only
+    /// the **read lock**, allowing multiple concurrent `peek` and `get` calls
+    /// to run in parallel.
     ///
-    /// On non-Unix platforms a seek is required; the method falls back to the
-    /// write lock and concurrent reads serialise as before.
+    /// On other platforms a seek is required; the method falls back to the
+    /// write lock and concurrent reads serialise.
     ///
     /// # Errors
     ///
@@ -526,9 +527,9 @@ impl BStack {
     ///
     /// # Concurrency
     ///
-    /// Same as [`peek`](Self::peek): on Unix the read lock is taken and
-    /// concurrent `get`/`peek`/`len` calls may run in parallel.  On non-Unix
-    /// the write lock is taken and reads serialise.
+    /// Same as [`peek`](Self::peek): on Unix and Windows the read lock is
+    /// taken and concurrent `get`/`peek`/`len` calls may run in parallel.  On
+    /// other platforms the write lock is taken and reads serialise.
     ///
     /// # Errors
     ///
@@ -1235,13 +1236,15 @@ mod tests {
 
     // ---- concurrency --------------------------------------------------------
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn concurrent_reads_do_not_serialise() {
-        // On Unix, peek and get use pread(2) and hold only the read lock, so
-        // they must be able to run simultaneously. We verify this by spinning
-        // up many reader threads on a pre-populated stack and confirming that
-        // they all finish with correct data — no deadlock, no torn reads.
+        // On Unix and Windows, peek and get use a cursor-safe positional read
+        // (pread(2) on Unix; ReadFile+OVERLAPPED on Windows) and hold only the
+        // read lock, so they must be able to run simultaneously. We verify this
+        // by spinning up many reader threads on a pre-populated stack and
+        // confirming that they all finish with correct data — no deadlock, no
+        // torn reads.
         use std::sync::Arc;
         use std::thread;
 

@@ -11,10 +11,11 @@ A 16-byte file header stores a **magic number** and a **committed-length
 sentinel**.  On reopen, any mismatch between the header and the actual file
 size is repaired automatically — no user intervention required.
 
-On **Unix**, `open` acquires an **exclusive advisory `flock`**, so two
-processes cannot concurrently corrupt the same stack file.
+On **Unix**, `open` acquires an **exclusive advisory `flock`**; on
+**Windows**, `LockFileEx` is used instead.  Both prevent two processes from
+concurrently corrupting the same stack file.
 
-**Minimal dependencies (`libc` on Unix only).  No `unsafe` beyond required FFI calls.**
+**Minimal dependencies (`libc` on Unix, `windows-sys` on Windows).  No `unsafe` beyond required FFI calls.**
 
 > **Warning:** bstack files must only be opened through this crate or a
 > compatible implementation that understands the file format, header protocol,
@@ -59,7 +60,7 @@ assert_eq!(stack.len()?, 5);
 ```rust
 impl BStack {
     /// Open or create a stack file at `path`.
-    /// Acquires an exclusive flock on Unix.
+    /// Acquires an exclusive flock on Unix, or LockFileEx on Windows.
     /// Validates the header and performs crash recovery on existing files.
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self>;
 
@@ -136,7 +137,7 @@ All user-visible offsets (returned by `push`, accepted by `peek`/`get`) are
 | `push`              | `lseek(END)` → `write(data)` → `lseek(8)` → `write(clen)` → sync     |
 | `pop`               | `lseek` → `read` → `ftruncate` → `lseek(8)` → `write(clen)` → sync   |
 | `set` *(feature)*   | `lseek(offset)` → `write(data)` → sync                               |
-| `peek`, `get`       | `pread(2)` on Unix; `lseek` → `read` elsewhere (no sync — read-only) |
+| `peek`, `get`       | `pread(2)` on Unix; `ReadFile`+`OVERLAPPED` on Windows; `lseek` → `read` elsewhere (no sync — read-only) |
 
 **`durable_sync` on macOS** issues `fcntl(F_FULLFSYNC)`.  Unlike `fdatasync`,
 this flushes the drive controller's write cache, providing the same "barrier
@@ -144,6 +145,10 @@ to stable media" guarantee that `fsync` gives on Linux.  Falls back to
 `sync_data` if the device does not support `F_FULLFSYNC`.
 
 **`durable_sync` on Linux / other Unix** calls `sync_data` (`fdatasync`).
+
+**`durable_sync` on Windows** calls `sync_data`, which maps to
+`FlushFileBuffers`.  This flushes the kernel write-back cache and waits for
+the drive to acknowledge, providing equivalent durability to `fdatasync`.
 
 **Push rollback:** if the write or sync fails, a best-effort `ftruncate` and
 header reset restore the pre-push state.
@@ -166,13 +171,20 @@ No caller action is required; recovery is transparent.
 
 ## Multi-process safety
 
-On Unix, `open` calls `flock(LOCK_EX | LOCK_NB)` on the file.  If another
+On **Unix**, `open` calls `flock(LOCK_EX | LOCK_NB)` on the file.  If another
 process already holds the lock, `open` returns immediately with
 `io::ErrorKind::WouldBlock`.  The lock is released when the `BStack` is
 dropped.
 
-> `flock` is advisory.  It protects against concurrent `BStack::open` calls
-> across processes, not against raw file access.
+On **Windows**, `open` calls `LockFileEx` with
+`LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY` covering the entire
+file range.  The same `WouldBlock` semantics apply (`ERROR_LOCK_VIOLATION`
+maps to `io::ErrorKind::WouldBlock` in Rust).  The lock is released when the
+`BStack` is dropped.
+
+> Both `flock` (Unix) and `LockFileEx` (Windows) are advisory and per-process.
+> They protect against concurrent `BStack::open` calls across well-behaved
+> processes, not against raw file access.
 
 ---
 
@@ -180,21 +192,21 @@ dropped.
 
 `BStack` wraps the file in a `RwLock<File>`.
 
-| Operation             | Lock (Unix)    | Lock (non-Unix) |
-|-----------------------|----------------|-----------------|
-| `push`, `pop`         | write          | write           |
-| `set` *(feature)*     | write          | write           |
-| `peek`, `get`         | **read**       | write           |
-| `len`                 | read           | read            |
+| Operation             | Lock (Unix / Windows) | Lock (other) |
+|-----------------------|-----------------------|--------------|
+| `push`, `pop`         | write                 | write        |
+| `set` *(feature)*     | write                 | write        |
+| `peek`, `get`         | **read**              | write        |
+| `len`                 | read                  | read         |
 
-On Unix, `peek` and `get` use `pread(2)` (`read_exact_at` from
-`std::os::unix::fs::FileExt`), which reads at an absolute file offset without
-touching the shared file-position cursor.  Multiple concurrent `peek`, `get`,
-and `len` calls can therefore run in parallel.  Any in-progress `push` or
-`pop` still blocks all readers via the write lock, so readers always observe a
-consistent, committed state.
+On Unix and Windows, `peek` and `get` use a cursor-safe positional read
+(`pread(2)` / `read_exact_at` on Unix; `ReadFile` with `OVERLAPPED` via
+`seek_read` on Windows) that does not modify the shared file-position cursor.
+Multiple concurrent `peek`, `get`, and `len` calls can therefore run in
+parallel.  Any in-progress `push` or `pop` still blocks all readers via the
+write lock, so readers always observe a consistent, committed state.
 
-On non-Unix platforms a seek is required; `peek` and `get` fall back to the
+On other platforms a seek is required; `peek` and `get` fall back to the
 write lock and reads serialise.
 
 ---
@@ -208,4 +220,4 @@ write lock and reads serialise.
 - **No `O_DIRECT`.** Writes go through the page cache; durability relies on
   `durable_sync`, not cache bypass.
 - **Single file only.** There is no WAL, manifest, or secondary index.
-- **Multi-process lock is Unix-only.** No equivalent is implemented on Windows.
+- **Multi-process lock is advisory.** `flock` (Unix) and `LockFileEx` (Windows) protect well-behaved processes but not raw file access.
