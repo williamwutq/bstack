@@ -116,6 +116,10 @@ static int file_size(int fd, uint64_t *out)
     return 0;
 }
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* -------------------------------------------------------------------------
  * bstack_open
  * ---------------------------------------------------------------------- */
@@ -467,4 +471,9 @@ fail_unlock:
     }
     return -1;
 }
+
 #endif /* BSTACK_FEATURE_SET */
+
+#ifdef __cplusplus
+}
+#endif

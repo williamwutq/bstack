@@ -39,6 +39,10 @@
 
 typedef struct bstack bstack_t;
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* Open or create a stack file at path.  Returns NULL on failure (errno set). */
 bstack_t *bstack_open(const char *path);
 
@@ -99,5 +103,9 @@ int bstack_len(bstack_t *bs, uint64_t *out_len);
 int bstack_set(bstack_t *bs, uint64_t offset,
                const uint8_t *data, size_t len);
 #endif /* BSTACK_FEATURE_SET */
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* BSTACK_H */
