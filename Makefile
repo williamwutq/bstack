@@ -77,7 +77,7 @@ CLANG_aarch64_unknown_linux_gnu  := aarch64-linux-gnu
 CLANG_x86_64_unknown_linux_musl  := x86_64-linux-musl
 CLANG_aarch64_unknown_linux_musl := aarch64-linux-musl
 CLANG_x86_64_pc_windows_gnu      := x86_64-w64-windows-gnu
-CLANG_aarch64_pc_windows_gnu     := aarch64-w64-windows-gnu
+CLANG_aarch64_pc_windows_gnullvm := aarch64-w64-windows-gnullvm
 clang_triple = $(CLANG_$(subst -,_,$(1)))
 
 # zig cc: -target <triple>
@@ -88,7 +88,7 @@ ZIG_aarch64_unknown_linux_gnu  := aarch64-linux-gnu
 ZIG_x86_64_unknown_linux_musl  := x86_64-linux-musl
 ZIG_aarch64_unknown_linux_musl := aarch64-linux-musl
 ZIG_x86_64_pc_windows_gnu      := x86_64-windows-gnu
-ZIG_aarch64_pc_windows_gnu     := aarch64-windows-gnu
+ZIG_aarch64_pc_windows_gnullmv := aarch64-windows-gnullvm
 zig_triple = $(ZIG_$(subst -,_,$(1)))
 
 # gcc: cross-compiler prefix (e.g. x86_64-linux-gnu → x86_64-linux-gnu-gcc)
@@ -100,7 +100,7 @@ GCCPFX_aarch64_unknown_linux_gnu  := aarch64-linux-gnu
 GCCPFX_x86_64_unknown_linux_musl  := x86_64-linux-musl
 GCCPFX_aarch64_unknown_linux_musl := aarch64-linux-musl
 GCCPFX_x86_64_pc_windows_gnu      := x86_64-w64-mingw32
-GCCPFX_aarch64_pc_windows_gnu     := aarch64-w64-mingw32
+GCCPFX_aarch64_pc_windows_gnullvv := aarch64-w64-mingw32
 gcc_prefix = $(GCCPFX_$(subst -,_,$(1)))
 
 # ── Per-target compiler and archiver commands ─────────────────────────────────
@@ -124,16 +124,9 @@ RUST_TARGETS := \
     x86_64-unknown-linux-gnu \
     aarch64-unknown-linux-gnu \
     x86_64-unknown-linux-musl \
-    aarch64-unknown-linux-musl
-
-# Add Windows targets if on Windows
-ifneq ($(findstring MINGW,$(HOST_OS)),)
-  RUST_TARGETS += x86_64-pc-windows-gnu aarch64-pc-windows-gnu
-else ifneq ($(findstring CYGWIN,$(HOST_OS)),)
-  RUST_TARGETS += x86_64-pc-windows-gnu aarch64-pc-windows-gnu
-else ifneq ($(findstring Windows,$(HOST_OS)),)
-  RUST_TARGETS += x86_64-pc-windows-gnu aarch64-pc-windows-gnu
-endif
+    aarch64-unknown-linux-musl \
+	x86_64-pc-windows-gnu \
+	aarch64-pc-windows-gnullvm
 
 RUST_PHONY := $(addprefix rust-,$(RUST_TARGETS))
 C_PHONY    := $(addprefix c-,$(RUST_TARGETS))
@@ -149,8 +142,8 @@ rust: $(RUST_PHONY)
 c: $(C_PHONY)
 
 # ── Rust — cargo zigbuild ─────────────────────────────────────────────────────
-# Output: target/<target>/rust/libbstack.rlib
-#         target/<target>/rust/libbstack-set.rlib
+# Output: $(BUILD)/<target>/rust/libbstack.rlib
+#         $(BUILD)/<target>/rust/libbstack-set.rlib
 define rust_rule
 rust-$(1):
 	@echo "==> rust $(1)"
@@ -164,9 +157,9 @@ endef
 $(foreach t,$(RUST_TARGETS),$(eval $(call rust_rule,$(t))))
 
 # ── C — cross-compilation ─────────────────────────────────────────────────────
-# Output: target/<target>/c/libbstack.a
-#         target/<target>/c/libbstack-set.a
-#         target/<target>/c/bstack.h
+# Output: $(BUILD)/<target>/c/libbstack.a
+#         $(BUILD)/<target>/c/libbstack-set.a
+#         $(BUILD)/<target>/c/bstack.h
 define c_rule
 c-$(1):
 	@echo "==> c $(1)  [$(_CC_FAMILY): $(call cc_for,$(1))]"
@@ -193,14 +186,21 @@ test:
 
 # ── Clean ─────────────────────────────────────────────────────────────────────
 clean:
-	rm -rf $(BUILD) target $(BUILD)/*.tar.gz
+	rm -rf $(BUILD) target $(BUILD)/*.tar.gz $(BUILD)/*.zip
 	$(MAKE) -C c clean
+
+clean-zip:
+	rm -rf $(BUILD)/*.tar.gz $(BUILD)/*.zip
 
 # ── Zip ───────────────────────────────────────────────────────────────────────
 zip: $(BUILD)
 	@for target in $(RUST_TARGETS); do \
 		if [ -d $(BUILD)/$$target ]; then \
 			echo "==> zipping $$target"; \
-			tar -czf $(BUILD)/$$target.tar.gz -C $(BUILD) $$target; \
+			if [[ $$target == *"windows"* ]]; then \
+				zip -r $(BUILD)/$$target.zip $(BUILD)/$$target; \
+			else \
+				tar -czf $(BUILD)/$$target.tar.gz -C $(BUILD) $$target; \
+			fi; \
 		fi; \
 	done
