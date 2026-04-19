@@ -6,6 +6,7 @@ authors = ["William Wu <williamwutq@gmail.com>", "Claude <claude@anthropic.com>"
 license = "MIT"
 description = "A persistent, fsync-durable binary stack backed by a single file"
 readme = "README.md"
+changelog = "CHANGELOG.md"
 repository = "https://github.com/williamwutq/bstack"
 documentation = "https://docs.rs/bstack"
 keywords = ["stack", "persistent", "file-backed", "database", "binary"]
