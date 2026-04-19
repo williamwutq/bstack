@@ -749,7 +749,7 @@ mod tests {
     // ---- io::Write ----------------------------------------------------------
 
     #[test]
-    fn write_trait_appends_and_is_durable() {
+    fn write_appends_and_survives_reopen() {
         use std::io::Write;
 
         let (mut s, p) = mk_stack();
@@ -760,24 +760,35 @@ mod tests {
         assert_eq!(s.len().unwrap(), 10);
         assert_eq!(s.peek(0).unwrap(), b"helloworld");
 
-        // Verify durability: data survives a reopen.
         drop(s);
         let s2 = BStack::open(&p).unwrap();
         assert_eq!(s2.peek(0).unwrap(), b"helloworld");
     }
 
     #[test]
-    fn write_trait_shared_ref() {
+    fn write_returns_exact_byte_count() {
         use std::io::Write;
 
-        let (s, p) = mk_stack();
+        let (mut s, p) = mk_stack();
         let _g = Guard(p);
 
-        // &BStack also implements Write.
-        let mut r: &BStack = &s;
-        r.write_all(b"abc").unwrap();
-        r.write_all(b"def").unwrap();
-        assert_eq!(s.peek(0).unwrap(), b"abcdef");
+        assert_eq!(s.write(b"abcde").unwrap(), 5);
+        assert_eq!(s.write(b"").unwrap(), 0);
+        assert_eq!(s.write(b"x").unwrap(), 1);
+        assert_eq!(s.len().unwrap(), 6);
+    }
+
+    #[test]
+    fn write_empty_slice_is_noop() {
+        use std::io::Write;
+
+        let (mut s, p) = mk_stack();
+        let _g = Guard(p);
+
+        s.write_all(b"abc").unwrap();
+        s.write_all(b"").unwrap();
+        assert_eq!(s.len().unwrap(), 3);
+        assert_eq!(s.peek(0).unwrap(), b"abc");
     }
 
     #[test]
@@ -788,14 +799,69 @@ mod tests {
         let _g = Guard(p);
 
         s.push(b"data").unwrap();
-        s.flush().unwrap(); // must not error
+        s.flush().unwrap();
         assert_eq!(s.len().unwrap(), 4);
+    }
+
+    #[test]
+    fn write_shared_ref() {
+        use std::io::Write;
+
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        let mut r: &BStack = &s;
+        r.write_all(b"abc").unwrap();
+        r.write_all(b"def").unwrap();
+        assert_eq!(s.peek(0).unwrap(), b"abcdef");
+    }
+
+    #[test]
+    fn write_shared_ref_returns_exact_byte_count() {
+        use std::io::Write;
+
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        let mut r: &BStack = &s;
+        assert_eq!(r.write(b"hello").unwrap(), 5);
+        assert_eq!(r.write(b"").unwrap(), 0);
+    }
+
+    #[test]
+    fn write_via_io_copy() {
+        use std::io::{Cursor, copy};
+
+        let (mut s, p) = mk_stack();
+        let _g = Guard(p);
+
+        let mut src = Cursor::new(b"copied data");
+        copy(&mut src, &mut s).unwrap();
+        assert_eq!(s.peek(0).unwrap(), b"copied data");
+    }
+
+    #[test]
+    fn write_via_bufwriter() {
+        use std::io::{BufWriter, Write};
+
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        // BufWriter<&BStack> batches writes internally; the final flush
+        // pushes everything to the stack as one atomic append.
+        let mut bw = BufWriter::new(&s);
+        bw.write_all(b"buf").unwrap();
+        bw.write_all(b"fered").unwrap();
+        bw.flush().unwrap();
+        drop(bw);
+
+        assert_eq!(s.peek(0).unwrap(), b"buffered");
     }
 
     // ---- BStackReader / io::Read --------------------------------------------
 
     #[test]
-    fn reader_reads_all_bytes_sequentially() {
+    fn reader_reads_bytes_sequentially() {
         use std::io::Read;
 
         let (s, p) = mk_stack();
@@ -826,8 +892,49 @@ mod tests {
         assert_eq!(n, 2);
         assert_eq!(&buf[..2], b"hi");
 
-        let n = reader.read(&mut buf).unwrap();
-        assert_eq!(n, 0);
+        assert_eq!(reader.read(&mut buf).unwrap(), 0);
+        assert_eq!(reader.read(&mut buf).unwrap(), 0); // stable after EOF
+    }
+
+    #[test]
+    fn reader_empty_buf_returns_zero_without_advancing() {
+        use std::io::Read;
+
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        s.push(b"hello").unwrap();
+        let mut reader = s.reader();
+
+        assert_eq!(reader.read(&mut []).unwrap(), 0);
+        assert_eq!(reader.position(), 0); // cursor unchanged
+    }
+
+    #[test]
+    fn reader_read_from_empty_stack() {
+        use std::io::Read;
+
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        let mut reader = s.reader();
+        let mut buf = [0u8; 4];
+        assert_eq!(reader.read(&mut buf).unwrap(), 0);
+    }
+
+    #[test]
+    fn reader_read_exact_fails_at_eof() {
+        use std::io::Read;
+
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        s.push(b"hi").unwrap();
+        let mut reader = s.reader();
+        let mut buf = [0u8; 10]; // larger than payload
+
+        let err = reader.read_exact(&mut buf).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::UnexpectedEof);
     }
 
     #[test]
@@ -848,6 +955,23 @@ mod tests {
         reader.read_exact(&mut buf).unwrap();
         assert_eq!(&buf, b"def");
         assert_eq!(reader.position(), 6);
+    }
+
+    #[test]
+    fn reader_read_to_end() {
+        use std::io::Read;
+
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        s.push(b"hello").unwrap();
+        s.push(b"world").unwrap();
+
+        let mut reader = s.reader_at(3);
+        let mut out = Vec::new();
+        reader.read_to_end(&mut out).unwrap();
+        assert_eq!(out, b"loworld");
+        assert_eq!(reader.position(), 10);
     }
 
     #[test]
@@ -880,6 +1004,20 @@ mod tests {
         assert_eq!(&buf, b"test");
     }
 
+    #[test]
+    fn reader_via_bufreader() {
+        use std::io::{BufRead, BufReader};
+
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        s.push(b"line one\nline two\n").unwrap();
+
+        let reader = BufReader::new(s.reader());
+        let lines: Vec<String> = reader.lines().map(|l| l.unwrap()).collect();
+        assert_eq!(lines, ["line one", "line two"]);
+    }
+
     // ---- BStackReader / io::Seek --------------------------------------------
 
     #[test]
@@ -892,8 +1030,7 @@ mod tests {
         s.push(b"helloworld").unwrap();
         let mut reader = s.reader();
 
-        let pos = reader.seek(SeekFrom::Start(5)).unwrap();
-        assert_eq!(pos, 5);
+        assert_eq!(reader.seek(SeekFrom::Start(5)).unwrap(), 5);
         assert_eq!(reader.position(), 5);
 
         let mut buf = [0u8; 5];
@@ -911,12 +1048,25 @@ mod tests {
         s.push(b"helloworld").unwrap();
         let mut reader = s.reader();
 
-        let pos = reader.seek(SeekFrom::End(-5)).unwrap();
-        assert_eq!(pos, 5);
+        assert_eq!(reader.seek(SeekFrom::End(-5)).unwrap(), 5);
 
         let mut buf = [0u8; 5];
         reader.read_exact(&mut buf).unwrap();
         assert_eq!(&buf, b"world");
+    }
+
+    #[test]
+    fn reader_seek_from_end_zero_returns_len() {
+        use std::io::{Seek, SeekFrom};
+
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        s.push(b"helloworld").unwrap();
+        let mut reader = s.reader();
+
+        let pos = reader.seek(SeekFrom::End(0)).unwrap();
+        assert_eq!(pos, s.len().unwrap());
     }
 
     #[test]
@@ -930,12 +1080,52 @@ mod tests {
         let mut reader = s.reader();
 
         reader.seek(SeekFrom::Current(3)).unwrap();
-        reader.seek(SeekFrom::Current(2)).unwrap();
+        assert_eq!(reader.seek(SeekFrom::Current(2)).unwrap(), 5);
         assert_eq!(reader.position(), 5);
 
         let mut buf = [0u8; 5];
         reader.read_exact(&mut buf).unwrap();
         assert_eq!(&buf, b"world");
+    }
+
+    #[test]
+    fn reader_seek_rewind_and_reread() {
+        use std::io::{Read, Seek, SeekFrom};
+
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        s.push(b"abcde").unwrap();
+        let mut reader = s.reader();
+
+        let mut buf = [0u8; 5];
+        reader.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"abcde");
+
+        reader.seek(SeekFrom::Start(0)).unwrap();
+        assert_eq!(reader.position(), 0);
+        reader.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"abcde");
+    }
+
+    #[test]
+    fn reader_seek_read_seek_read() {
+        use std::io::{Read, Seek, SeekFrom};
+
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        s.push(b"ABCDEFGHIJ").unwrap();
+        let mut reader = s.reader();
+        let mut buf = [0u8; 3];
+
+        reader.seek(SeekFrom::Start(7)).unwrap();
+        reader.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"HIJ");
+
+        reader.seek(SeekFrom::Start(2)).unwrap();
+        reader.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"CDE");
     }
 
     #[test]
@@ -948,11 +1138,14 @@ mod tests {
         s.push(b"hello").unwrap();
         let mut reader = s.reader();
 
-        let err = reader.seek(SeekFrom::End(-10)).unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::InvalidInput);
-
-        let err = reader.seek(SeekFrom::Current(-1)).unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(
+            reader.seek(SeekFrom::End(-10)).unwrap_err().kind(),
+            ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            reader.seek(SeekFrom::Current(-1)).unwrap_err().kind(),
+            ErrorKind::InvalidInput
+        );
     }
 
     #[test]
@@ -967,8 +1160,40 @@ mod tests {
 
         reader.seek(SeekFrom::Start(100)).unwrap();
         let mut buf = [0u8; 4];
-        let n = reader.read(&mut buf).unwrap();
-        assert_eq!(n, 0);
+        assert_eq!(reader.read(&mut buf).unwrap(), 0);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn concurrent_readers_do_not_block_each_other() {
+        use std::io::Read;
+        use std::sync::Arc;
+        use std::thread;
+
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        let payload: Vec<u8> = (0u8..=255).cycle().take(1024).collect();
+        s.push(&payload).unwrap();
+
+        let s = Arc::new(s);
+
+        let handles: Vec<_> = (0..16)
+            .map(|i| {
+                let s = Arc::clone(&s);
+                let expected = payload.clone();
+                thread::spawn(move || {
+                    let mut reader = s.reader_at(i * 4);
+                    let mut out = Vec::new();
+                    reader.read_to_end(&mut out).unwrap();
+                    assert_eq!(out, &expected[i as usize * 4..]);
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
     }
 
     // ---- concurrency --------------------------------------------------------

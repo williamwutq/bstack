@@ -103,8 +103,100 @@ impl BStack {
 
     /// Current payload size in bytes (excludes the 16-byte header).
     pub fn len(&self) -> io::Result<u64>;
+
+    /// Create a `BStackReader` positioned at the start of the payload.
+    pub fn reader(&self) -> BStackReader<'_>;
+
+    /// Create a `BStackReader` positioned at `offset` bytes into the payload.
+    pub fn reader_at(&self, offset: u64) -> BStackReader<'_>;
 }
+
+// BStack and &BStack both implement std::io::Write (each write = one push + durable_sync).
+// BStackReader implements std::io::Read + std::io::Seek + From<&BStack>.
 ```
+
+---
+
+## Standard I/O adapters
+
+### Writing — `impl Write for BStack` / `impl Write for &BStack`
+
+`BStack` implements [`std::io::Write`].  Each call to `write` is forwarded to
+`push`, so every write is atomically appended and durably synced before
+returning.  `flush` is a no-op.
+
+`&BStack` also implements `Write` (mirroring `impl Write for &File`), which
+lets you pass a shared reference wherever a writer is expected.
+
+```rust
+use std::io::Write;
+use bstack::BStack;
+
+let mut stack = BStack::open("log.bin")?;
+
+// write / write_all forward to push.
+stack.write_all(b"hello")?;
+stack.write_all(b"world")?;
+assert_eq!(stack.len()?, 10);
+
+// io::copy works out of the box.
+let mut src = std::io::Cursor::new(b"more data");
+std::io::copy(&mut src, &mut stack)?;
+```
+
+Wrapping in `BufWriter` batches small writes into fewer `push` calls (and
+fewer `durable_sync` calls):
+
+```rust
+use std::io::{BufWriter, Write};
+use bstack::BStack;
+
+let stack = BStack::open("log.bin")?;
+let mut bw = BufWriter::new(&stack);
+for chunk in chunks {
+    bw.write_all(chunk)?;
+}
+bw.flush()?; // one push + one durable_sync for the whole batch
+```
+
+> **Note:** Each raw `write` call issues one `durable_sync`.  If you call
+> `write` or `write_all` in a tight loop, prefer `push` directly or use
+> `BufWriter` to batch.
+
+### Reading — `BStackReader`
+
+[`BStackReader`] wraps a `&BStack` with a cursor and implements
+[`std::io::Read`] and [`std::io::Seek`].
+
+```rust
+use std::io::{Read, Seek, SeekFrom};
+use bstack::{BStack, BStackReader};
+
+let stack = BStack::open("log.bin")?;
+stack.push(b"hello world")?;
+
+// From the beginning:
+let mut reader = stack.reader();
+
+// From an arbitrary offset:
+let mut mid = stack.reader_at(6);
+
+// From<&BStack> is also implemented:
+let mut r = BStackReader::from(&stack);
+
+let mut buf = [0u8; 5];
+reader.read_exact(&mut buf)?;  // b"hello"
+
+reader.seek(SeekFrom::Start(6))?;
+reader.read_exact(&mut buf)?;  // b"world"
+
+// read_to_end, BufReader, etc. all work.
+let mut out = Vec::new();
+stack.reader().read_to_end(&mut out)?;
+```
+
+`BStackReader` borrows the stack immutably, so multiple readers can coexist
+and run concurrently with each other and with `peek`/`get` calls.
 
 ---
 

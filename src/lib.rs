@@ -954,7 +954,10 @@ pub struct BStackReader<'a> {
 impl BStack {
     /// Create a [`BStackReader`] positioned at the start of the payload.
     pub fn reader(&self) -> BStackReader<'_> {
-        BStackReader { stack: self, offset: 0 }
+        BStackReader {
+            stack: self,
+            offset: 0,
+        }
     }
 
     /// Create a [`BStackReader`] positioned at `offset` bytes into the payload.
@@ -962,7 +965,10 @@ impl BStack {
     /// Seeking past the current end is allowed; [`read`](io::Read::read) will
     /// return `Ok(0)` until new data is pushed past that point.
     pub fn reader_at(&self, offset: u64) -> BStackReader<'_> {
-        BStackReader { stack: self, offset }
+        BStackReader {
+            stack: self,
+            offset,
+        }
     }
 }
 
