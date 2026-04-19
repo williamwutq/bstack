@@ -24,6 +24,7 @@ TEST_OBJ = test_bstack.o
 
 all: $(LIB)
 
+
 $(LIB): $(OBJ)
 	ar rcs $@ $^
 

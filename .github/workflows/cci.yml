@@ -33,3 +33,5 @@ jobs:
       run: echo "CC=cl" >> $GITHUB_ENV
     - name: Build and test
       run: cd c && make test
+    - name: Build and test with features
+      run: cd c && make DEFINES=-DBSTACK_FEATURE_SET test
