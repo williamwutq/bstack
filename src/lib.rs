@@ -639,7 +639,9 @@ impl BStack {
             if end > data_size {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    format!("peek_into: range [{offset}, {end}) exceeds payload size ({data_size})"),
+                    format!(
+                        "peek_into: range [{offset}, {end}) exceeds payload size ({data_size})"
+                    ),
                 ));
             }
             pread_exact_into(&file, HEADER_SIZE + offset, buf)
@@ -651,7 +653,9 @@ impl BStack {
             if end > data_size {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    format!("peek_into: range [{offset}, {end}) exceeds payload size ({data_size})"),
+                    format!(
+                        "peek_into: range [{offset}, {end}) exceeds payload size ({data_size})"
+                    ),
                 ));
             }
             file.seek(SeekFrom::Start(HEADER_SIZE + offset))?;
