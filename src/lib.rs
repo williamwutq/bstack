@@ -131,6 +131,50 @@
 //! On other platforms a seek is required, so `peek`, `peek_into`, `get`, and
 //! `get_into` fall back to the write lock and all reads serialise.
 //!
+//! # Standard I/O adapters
+//!
+//! ## Writing
+//!
+//! `BStack` implements [`std::io::Write`] (and so does `&BStack`, mirroring
+//! [`std::io::Write` for `&File`]).  Each call to `write` is forwarded to
+//! [`push`](BStack::push), so every write is atomically appended and durably
+//! synced before returning.  `flush` is a no-op.
+//!
+//! ```no_run
+//! use std::io::Write;
+//! use bstack::BStack;
+//!
+//! # fn main() -> std::io::Result<()> {
+//! let mut stack = BStack::open("log.bin")?;
+//! stack.write_all(b"hello")?;
+//! stack.write_all(b"world")?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ## Reading
+//!
+//! [`BStackReader`] wraps a `&BStack` with a cursor and implements
+//! [`std::io::Read`] and [`std::io::Seek`].  Use [`BStack::reader`] or
+//! [`BStack::reader_at`] to construct one.
+//!
+//! ```no_run
+//! use std::io::{Read, Seek, SeekFrom};
+//! use bstack::BStack;
+//!
+//! # fn main() -> std::io::Result<()> {
+//! let stack = BStack::open("log.bin")?;
+//! stack.push(b"hello world")?;
+//!
+//! let mut reader = stack.reader();
+//! let mut buf = [0u8; 5];
+//! reader.read_exact(&mut buf)?;  // b"hello"
+//! reader.seek(SeekFrom::Start(6))?;
+//! reader.read_exact(&mut buf)?;  // b"world"
+//! # Ok(())
+//! # }
+//! ```
+//!
 //! # Feature flags
 //!
 //! | Feature | Description |
@@ -823,5 +867,161 @@ impl BStack {
     /// Propagates any [`io::Error`] from [`File::metadata`].
     pub fn is_empty(&self) -> io::Result<bool> {
         Ok(self.len()? == 0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// io::Write
+
+/// Appends bytes to the stack.
+///
+/// Each call to [`write`](io::Write::write) is equivalent to [`push`](BStack::push):
+/// all bytes are written atomically and durably synced before returning.
+/// Calling `write_all` or chaining multiple `write` calls therefore issues
+/// one `durable_sync` per call — callers that need to batch many small writes
+/// without per-write syncs should accumulate data and call `push` directly.
+///
+/// [`flush`](io::Write::flush) is a no-op because every `write` is already
+/// durable.
+impl io::Write for BStack {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.push(buf)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Shared-reference counterpart of `impl Write for BStack`.
+///
+/// Because [`push`](BStack::push) takes `&self` (interior mutability via
+/// `RwLock`), the `Write` implementation is also available on `&BStack`,
+/// mirroring the standard library's `impl Write for &File`.
+impl io::Write for &BStack {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.push(buf)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BStackReader
+
+/// A cursor-based reader over a [`BStack`] payload.
+///
+/// `BStackReader` implements [`io::Read`] and [`io::Seek`], allowing the
+/// stack's payload to be consumed through any interface that expects a
+/// readable, seekable byte stream.
+///
+/// # Construction
+///
+/// ```no_run
+/// use bstack::BStack;
+///
+/// # fn main() -> std::io::Result<()> {
+/// let stack = BStack::open("log.bin")?;
+/// stack.push(b"hello world")?;
+///
+/// // Start reading from the beginning.
+/// let mut reader = stack.reader();
+///
+/// // Or start from an arbitrary offset.
+/// let mut mid = stack.reader_at(6);
+/// # Ok(())
+/// # }
+/// ```
+///
+/// # Concurrency
+///
+/// `BStackReader` borrows the stack immutably, so multiple readers can coexist
+/// and run concurrently with each other and with [`peek`](BStack::peek) /
+/// [`get`](BStack::get) calls.  Concurrent [`push`](BStack::push) or
+/// [`pop`](BStack::pop) operations are not blocked by an active reader, but
+/// reading interleaved with writes may observe different snapshots of the
+/// payload across calls — callers are responsible for synchronisation when
+/// that matters.
+pub struct BStackReader<'a> {
+    stack: &'a BStack,
+    offset: u64,
+}
+
+impl BStack {
+    /// Create a [`BStackReader`] positioned at the start of the payload.
+    pub fn reader(&self) -> BStackReader<'_> {
+        BStackReader { stack: self, offset: 0 }
+    }
+
+    /// Create a [`BStackReader`] positioned at `offset` bytes into the payload.
+    ///
+    /// Seeking past the current end is allowed; [`read`](io::Read::read) will
+    /// return `Ok(0)` until new data is pushed past that point.
+    pub fn reader_at(&self, offset: u64) -> BStackReader<'_> {
+        BStackReader { stack: self, offset }
+    }
+}
+
+impl<'a> BStackReader<'a> {
+    /// Return the current logical read offset within the payload.
+    pub fn position(&self) -> u64 {
+        self.offset
+    }
+}
+
+impl<'a> From<&'a BStack> for BStackReader<'a> {
+    fn from(stack: &'a BStack) -> Self {
+        stack.reader()
+    }
+}
+
+impl<'a> io::Read for BStackReader<'a> {
+    /// Read bytes from the current position into `buf`.
+    ///
+    /// Returns the number of bytes read, which may be less than `buf.len()` if
+    /// the end of the payload is reached.  Returns `Ok(0)` at EOF.
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let data_size = self.stack.len()?;
+        if self.offset >= data_size {
+            return Ok(0);
+        }
+        let available = (data_size - self.offset) as usize;
+        let n = buf.len().min(available);
+        self.stack.get_into(self.offset, &mut buf[..n])?;
+        self.offset += n as u64;
+        Ok(n)
+    }
+}
+
+impl<'a> io::Seek for BStackReader<'a> {
+    /// Move the read cursor.
+    ///
+    /// [`SeekFrom::Start`] and [`SeekFrom::Current`] with a non-negative delta
+    /// may advance the cursor past the current end of the payload; subsequent
+    /// [`read`](io::Read::read) calls will return `Ok(0)` until the payload
+    /// grows past that point.  Seeking before the start of the payload returns
+    /// [`io::ErrorKind::InvalidInput`].
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        let data_size = self.stack.len()? as i128;
+        let new_offset = match pos {
+            SeekFrom::Start(n) => n as i128,
+            SeekFrom::End(n) => data_size + n as i128,
+            SeekFrom::Current(n) => self.offset as i128 + n as i128,
+        };
+        if new_offset < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "seek before beginning of payload",
+            ));
+        }
+        self.offset = new_offset as u64;
+        Ok(self.offset)
     }
 }

@@ -746,6 +746,231 @@ mod tests {
         assert_eq!(s2.peek(0).unwrap(), b"helloWORLD");
     }
 
+    // ---- io::Write ----------------------------------------------------------
+
+    #[test]
+    fn write_trait_appends_and_is_durable() {
+        use std::io::Write;
+
+        let (mut s, p) = mk_stack();
+        let _g = Guard(p.clone());
+
+        s.write_all(b"hello").unwrap();
+        s.write_all(b"world").unwrap();
+        assert_eq!(s.len().unwrap(), 10);
+        assert_eq!(s.peek(0).unwrap(), b"helloworld");
+
+        // Verify durability: data survives a reopen.
+        drop(s);
+        let s2 = BStack::open(&p).unwrap();
+        assert_eq!(s2.peek(0).unwrap(), b"helloworld");
+    }
+
+    #[test]
+    fn write_trait_shared_ref() {
+        use std::io::Write;
+
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        // &BStack also implements Write.
+        let mut r: &BStack = &s;
+        r.write_all(b"abc").unwrap();
+        r.write_all(b"def").unwrap();
+        assert_eq!(s.peek(0).unwrap(), b"abcdef");
+    }
+
+    #[test]
+    fn write_flush_is_noop() {
+        use std::io::Write;
+
+        let (mut s, p) = mk_stack();
+        let _g = Guard(p);
+
+        s.push(b"data").unwrap();
+        s.flush().unwrap(); // must not error
+        assert_eq!(s.len().unwrap(), 4);
+    }
+
+    // ---- BStackReader / io::Read --------------------------------------------
+
+    #[test]
+    fn reader_reads_all_bytes_sequentially() {
+        use std::io::Read;
+
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        s.push(b"hello").unwrap();
+        s.push(b"world").unwrap();
+
+        let mut reader = s.reader();
+        let mut buf = [0u8; 5];
+        reader.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"hello");
+        reader.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"world");
+    }
+
+    #[test]
+    fn reader_returns_zero_at_eof() {
+        use std::io::Read;
+
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        s.push(b"hi").unwrap();
+        let mut reader = s.reader();
+        let mut buf = [0u8; 10];
+        let n = reader.read(&mut buf).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(&buf[..2], b"hi");
+
+        let n = reader.read(&mut buf).unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn reader_partial_reads_advance_cursor() {
+        use std::io::Read;
+
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        s.push(b"abcdefghij").unwrap();
+        let mut reader = s.reader();
+
+        let mut buf = [0u8; 3];
+        reader.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"abc");
+        assert_eq!(reader.position(), 3);
+
+        reader.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"def");
+        assert_eq!(reader.position(), 6);
+    }
+
+    #[test]
+    fn reader_at_starts_at_given_offset() {
+        use std::io::Read;
+
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        s.push(b"helloworld").unwrap();
+
+        let mut reader = s.reader_at(5);
+        let mut buf = [0u8; 5];
+        reader.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"world");
+    }
+
+    #[test]
+    fn reader_from_trait() {
+        use std::io::Read;
+
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        s.push(b"test").unwrap();
+
+        let mut reader = crate::BStackReader::from(&s);
+        let mut buf = [0u8; 4];
+        reader.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"test");
+    }
+
+    // ---- BStackReader / io::Seek --------------------------------------------
+
+    #[test]
+    fn reader_seek_from_start() {
+        use std::io::{Read, Seek, SeekFrom};
+
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        s.push(b"helloworld").unwrap();
+        let mut reader = s.reader();
+
+        let pos = reader.seek(SeekFrom::Start(5)).unwrap();
+        assert_eq!(pos, 5);
+        assert_eq!(reader.position(), 5);
+
+        let mut buf = [0u8; 5];
+        reader.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"world");
+    }
+
+    #[test]
+    fn reader_seek_from_end() {
+        use std::io::{Read, Seek, SeekFrom};
+
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        s.push(b"helloworld").unwrap();
+        let mut reader = s.reader();
+
+        let pos = reader.seek(SeekFrom::End(-5)).unwrap();
+        assert_eq!(pos, 5);
+
+        let mut buf = [0u8; 5];
+        reader.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"world");
+    }
+
+    #[test]
+    fn reader_seek_from_current() {
+        use std::io::{Read, Seek, SeekFrom};
+
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        s.push(b"helloworld").unwrap();
+        let mut reader = s.reader();
+
+        reader.seek(SeekFrom::Current(3)).unwrap();
+        reader.seek(SeekFrom::Current(2)).unwrap();
+        assert_eq!(reader.position(), 5);
+
+        let mut buf = [0u8; 5];
+        reader.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"world");
+    }
+
+    #[test]
+    fn reader_seek_before_start_returns_error() {
+        use std::io::{Seek, SeekFrom};
+
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        s.push(b"hello").unwrap();
+        let mut reader = s.reader();
+
+        let err = reader.seek(SeekFrom::End(-10)).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+
+        let err = reader.seek(SeekFrom::Current(-1)).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn reader_seek_past_end_then_read_returns_zero() {
+        use std::io::{Read, Seek, SeekFrom};
+
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        s.push(b"hi").unwrap();
+        let mut reader = s.reader();
+
+        reader.seek(SeekFrom::Start(100)).unwrap();
+        let mut buf = [0u8; 4];
+        let n = reader.read(&mut buf).unwrap();
+        assert_eq!(n, 0);
+    }
+
     // ---- concurrency --------------------------------------------------------
 
     #[cfg(any(unix, windows))]
