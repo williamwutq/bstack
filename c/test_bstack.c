@@ -1,9 +1,11 @@
 /* Mirror of the Rust bstack test suite, adapted for the C API. */
 
-#define _DARWIN_C_SOURCE
-#define _DEFAULT_SOURCE
-#define _POSIX_C_SOURCE 200809L
-#define _XOPEN_SOURCE 700
+#ifndef _WIN32
+#  define _DARWIN_C_SOURCE
+#  define _DEFAULT_SOURCE
+#  define _POSIX_C_SOURCE 200809L
+#  define _XOPEN_SOURCE 700
+#endif
 
 #include "bstack.h"
 
@@ -16,6 +18,11 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+#ifdef _WIN32
+#  define WIN32_LEAN_AND_MEAN
+#  include <windows.h>
+#endif
 
 /* =========================================================================
  * Harness
@@ -52,12 +59,24 @@ static void run(const char *name, test_fn fn)
 
 /* Create a unique temp path and remove any pre-existing file at it so
  * bstack_open starts with a fresh empty file. */
+#ifdef _WIN32
+static void make_tmp(char *buf, size_t n)
+{
+    /* Use short relative names so paths fit in the char[64] test buffers. */
+    static volatile LONG seq = 0;
+    LONG s = InterlockedIncrement(&seq);
+    snprintf(buf, n, "bst_%lu_%ld.tmp",
+             (unsigned long)GetCurrentProcessId(), (long)s);
+    DeleteFileA(buf); /* ensure clean start */
+}
+#else
 static void make_tmp(char *buf, size_t n)
 {
     snprintf(buf, n, "/tmp/bstack_test_XXXXXX");
     int fd = mkstemp(buf);
     if (fd >= 0) { close(fd); unlink(buf); }
 }
+#endif
 
 /* Read 8-byte little-endian value from absolute file offset (raw fd). */
 static uint64_t raw_read_le64(int fd, off_t offset)
@@ -559,7 +578,7 @@ static int test_large_payload_roundtrip(void)
  * Header / magic
  * ====================================================================== */
 
-static const uint8_t MAGIC[8]        = {'B','S','T','K', 0, 1, 1, 0};
+static const uint8_t MAGIC[8]        = {'B','S','T','K', 0, 1, 2, 0};
 static const uint8_t MAGIC_PREFIX[6] = {'B','S','T','K', 0, 1};
 
 static int test_new_file_has_valid_header(void)

@@ -8,7 +8,7 @@
  * bstack — persistent, fsync-durable binary stack backed by a single file.
  *
  * File format (16-byte header followed by payload):
- *   [0..8)  magic: "BSTK" + major(1) + minor(1) + patch(1) + reserved(1)
+ *   [0..8)  magic: "BSTK" + major(1) + minor(1) + patch(2) + reserved(1)
  *   [8..16) committed payload length, little-endian uint64
  *   [16..)  payload bytes
  *
@@ -23,14 +23,17 @@
  *
  * Thread safety
  * -------------
- * A pthread_rwlock protects each handle.  bstack_push / bstack_pop /
- * bstack_set hold a write lock; bstack_peek / bstack_get / bstack_len hold
- * a read lock and may run concurrently with each other.
+ * On Unix a pthread_rwlock protects each handle; on Windows an SRWLOCK is
+ * used.  bstack_push / bstack_pop / bstack_set hold a write lock;
+ * bstack_peek / bstack_get / bstack_len hold a read lock and may run
+ * concurrently with each other on both platforms.
  *
  * Multi-process safety
  * --------------------
- * bstack_open acquires an exclusive advisory flock(LOCK_EX|LOCK_NB).
- * The lock is released when bstack_close is called (fd is closed).
+ * bstack_open acquires an exclusive advisory lock on the file:
+ *   Unix    — flock(LOCK_EX|LOCK_NB)
+ *   Windows — LockFileEx(LOCKFILE_EXCLUSIVE_LOCK|LOCKFILE_FAIL_IMMEDIATELY)
+ * The lock is released when bstack_close is called (fd / HANDLE is closed).
  *
  * Feature flags
  * -------------
