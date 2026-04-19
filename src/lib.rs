@@ -303,6 +303,32 @@ fn pread_exact(file: &File, offset: u64, len: usize) -> io::Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// Fill `buf` from absolute file position `offset` without modifying the
+/// file-position cursor.  Unix uses `pread(2)` via `read_exact_at`;
+/// Windows uses `ReadFile` with an `OVERLAPPED` offset via `seek_read`.
+#[cfg(unix)]
+fn pread_exact_into(file: &File, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+    file.read_exact_at(buf, offset)
+}
+
+/// Windows counterpart of `pread_exact_into`.
+#[cfg(windows)]
+fn pread_exact_into(file: &File, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+    let len = buf.len();
+    let mut filled = 0usize;
+    while filled < len {
+        let n = file.seek_read(&mut buf[filled..], offset + filled as u64)?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "pread_exact_into: unexpected EOF",
+            ));
+        }
+        filled += n;
+    }
+    Ok(())
+}
+
 /// Read and validate the header; return the committed payload length.
 fn read_header(file: &mut File) -> io::Result<u64> {
     file.seek(SeekFrom::Start(0))?;
@@ -572,6 +598,155 @@ impl BStack {
             file.read_exact(&mut buf)?;
             Ok(buf)
         }
+    }
+
+    /// Fill `buf` with bytes from logical `offset` to `offset + buf.len()`.
+    ///
+    /// Reads exactly `buf.len()` bytes from `offset` into the caller-supplied
+    /// buffer.  An empty buffer is a valid no-op.  The file is not modified.
+    ///
+    /// Use this instead of [`peek`](Self::peek) when the destination buffer is
+    /// already allocated and you want to avoid the extra heap allocation.
+    ///
+    /// # Concurrency
+    ///
+    /// Same as [`peek`](Self::peek): on Unix and Windows only the read lock is
+    /// taken; on other platforms the write lock serialises all reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] if `offset + buf.len()` overflows
+    /// `u64` or exceeds the current payload size.
+    pub fn peek_into(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        if buf.is_empty() {
+            return Ok(());
+        }
+        let len = buf.len() as u64;
+        let end = offset.checked_add(len).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "peek_into: offset + len overflows u64",
+            )
+        })?;
+        #[cfg(any(unix, windows))]
+        {
+            let file = self.lock.read().unwrap();
+            let data_size = file.metadata()?.len().saturating_sub(HEADER_SIZE);
+            if end > data_size {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("peek_into: range [{offset}, {end}) exceeds payload size ({data_size})"),
+                ));
+            }
+            pread_exact_into(&file, HEADER_SIZE + offset, buf)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let mut file = self.lock.write().unwrap();
+            let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
+            if end > data_size {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("peek_into: range [{offset}, {end}) exceeds payload size ({data_size})"),
+                ));
+            }
+            file.seek(SeekFrom::Start(HEADER_SIZE + offset))?;
+            file.read_exact(buf)
+        }
+    }
+
+    /// Fill `buf` with bytes from the half-open logical range
+    /// `[start, start + buf.len())`.
+    ///
+    /// An empty buffer is a valid no-op.  The file is not modified.
+    ///
+    /// Use this instead of [`get`](Self::get) when the destination buffer is
+    /// already allocated and you want to avoid the extra heap allocation.
+    ///
+    /// # Concurrency
+    ///
+    /// Same as [`get`](Self::get): on Unix and Windows only the read lock is
+    /// taken; on other platforms the write lock serialises all reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] if `start + buf.len()` overflows
+    /// `u64` or exceeds the current payload size.
+    pub fn get_into(&self, start: u64, buf: &mut [u8]) -> io::Result<()> {
+        if buf.is_empty() {
+            return Ok(());
+        }
+        let len = buf.len() as u64;
+        let end = start.checked_add(len).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "get_into: start + len overflows u64",
+            )
+        })?;
+        #[cfg(any(unix, windows))]
+        {
+            let file = self.lock.read().unwrap();
+            let data_size = file.metadata()?.len().saturating_sub(HEADER_SIZE);
+            if end > data_size {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("get_into: end ({end}) exceeds payload size ({data_size})"),
+                ));
+            }
+            pread_exact_into(&file, HEADER_SIZE + start, buf)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let mut file = self.lock.write().unwrap();
+            let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
+            if end > data_size {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("get_into: end ({end}) exceeds payload size ({data_size})"),
+                ));
+            }
+            file.seek(SeekFrom::Start(HEADER_SIZE + start))?;
+            file.read_exact(buf)
+        }
+    }
+
+    /// Remove the last `buf.len()` bytes from the file and write them into `buf`.
+    ///
+    /// An empty buffer is a valid no-op: no bytes are removed.
+    ///
+    /// Use this instead of [`pop`](Self::pop) when the destination buffer is
+    /// already allocated and you want to avoid the extra heap allocation.
+    ///
+    /// # Atomicity
+    ///
+    /// Same guarantees as [`pop`](Self::pop).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] if `buf.len()` exceeds the
+    /// current payload size.  Also propagates any I/O error from `read_exact`,
+    /// `set_len`, `write_all`, or `durable_sync`.
+    pub fn pop_into(&self, buf: &mut [u8]) -> io::Result<()> {
+        if buf.is_empty() {
+            return Ok(());
+        }
+        let n = buf.len() as u64;
+        let mut file = self.lock.write().unwrap();
+        let raw_size = file.seek(SeekFrom::End(0))?;
+        let data_size = raw_size - HEADER_SIZE;
+        if n > data_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("pop_into({n}) exceeds payload size ({data_size})"),
+            ));
+        }
+        let new_data_len = data_size - n;
+        file.seek(SeekFrom::Start(HEADER_SIZE + new_data_len))?;
+        file.read_exact(buf)?;
+        file.set_len(HEADER_SIZE + new_data_len)?;
+        write_committed_len(&mut file, new_data_len)?;
+        durable_sync(&file)?;
+        Ok(())
     }
 
     /// Overwrite `data` bytes in place starting at logical `offset`.

@@ -492,6 +492,162 @@ mod tests {
         assert_eq!(clen_after, 5, "clen should be repaired to 5 after recovery");
     }
 
+    // ---- peek_into ----------------------------------------------------------
+
+    #[test]
+    fn peek_into_fills_buffer() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        s.push(b"hello").unwrap();
+        s.push(b"world").unwrap();
+
+        let mut buf = [0u8; 5];
+        s.peek_into(5, &mut buf).unwrap();
+        assert_eq!(&buf, b"world");
+
+        let mut buf2 = [0u8; 10];
+        s.peek_into(0, &mut buf2).unwrap();
+        assert_eq!(&buf2, b"helloworld");
+    }
+
+    #[test]
+    fn peek_into_empty_buf_is_noop() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        s.peek_into(0, &mut []).unwrap();
+    }
+
+    #[test]
+    fn peek_into_range_exceeds_size_returns_error() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        s.push(b"abc").unwrap();
+        let mut buf = [0u8; 5];
+        let err = s.peek_into(0, &mut buf).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn peek_into_matches_peek() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        s.push(b"helloworld").unwrap();
+        let expected = s.peek(3).unwrap();
+        let mut buf = vec![0u8; expected.len()];
+        s.peek_into(3, &mut buf).unwrap();
+        assert_eq!(buf, expected);
+    }
+
+    // ---- get_into -----------------------------------------------------------
+
+    #[test]
+    fn get_into_fills_buffer() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        s.push(b"hello").unwrap();
+        s.push(b"world").unwrap();
+
+        let mut buf = [0u8; 5];
+        s.get_into(3, &mut buf).unwrap();
+        assert_eq!(&buf, b"lowor");
+    }
+
+    #[test]
+    fn get_into_empty_buf_is_noop() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        s.push(b"abc").unwrap();
+        s.get_into(1, &mut []).unwrap();
+    }
+
+    #[test]
+    fn get_into_end_exceeds_size_returns_error() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        s.push(b"abc").unwrap();
+        let mut buf = [0u8; 5];
+        let err = s.get_into(0, &mut buf).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn get_into_matches_get() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        s.push(b"helloworld").unwrap();
+        let expected = s.get(2, 8).unwrap();
+        let mut buf = vec![0u8; 6];
+        s.get_into(2, &mut buf).unwrap();
+        assert_eq!(buf, expected);
+    }
+
+    // ---- pop_into -----------------------------------------------------------
+
+    #[test]
+    fn pop_into_fills_buffer_and_shrinks() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        s.push(b"abcde").unwrap();
+        s.push(b"fghij").unwrap();
+
+        let mut buf = [0u8; 5];
+        s.pop_into(&mut buf).unwrap();
+        assert_eq!(&buf, b"fghij");
+        assert_eq!(s.len().unwrap(), 5);
+
+        s.pop_into(&mut buf).unwrap();
+        assert_eq!(&buf, b"abcde");
+        assert_eq!(s.len().unwrap(), 0);
+    }
+
+    #[test]
+    fn pop_into_empty_buf_is_noop() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        s.push(b"abc").unwrap();
+        s.pop_into(&mut []).unwrap();
+        assert_eq!(s.len().unwrap(), 3);
+    }
+
+    #[test]
+    fn pop_into_exceeds_size_returns_error() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        s.push(b"abc").unwrap();
+        let mut buf = [0u8; 10];
+        let err = s.pop_into(&mut buf).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(s.len().unwrap(), 3);
+    }
+
+    #[test]
+    fn pop_into_matches_pop() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        s.push(b"helloworld").unwrap();
+        let expected = s.pop(5).unwrap();
+
+        let (s2, p2) = mk_stack();
+        let _g2 = Guard(p2);
+        s2.push(b"helloworld").unwrap();
+        let mut buf = vec![0u8; 5];
+        s2.pop_into(&mut buf).unwrap();
+        assert_eq!(buf, expected);
+        assert_eq!(s2.len().unwrap(), 5);
+    }
+
     // ---- set (feature-gated) ------------------------------------------------
 
     #[cfg(feature = "set")]
