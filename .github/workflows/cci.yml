@@ -1,0 +1,35 @@
+name: CCI
+
+on:
+  push:
+    branches: [ master ]
+    paths: [c/**]
+  pull_request:
+    branches: [ master ]
+    paths: [c/**]
+
+permissions:
+  contents: read
+
+jobs:
+  test-c:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up compiler (Linux)
+      if: runner.os == 'Linux'
+      run: echo "CC=gcc" >> $GITHUB_ENV
+    - name: Set up compiler (macOS)
+      if: runner.os == 'macOS'
+      run: echo "CC=clang" >> $GITHUB_ENV
+    - name: Set up MSVC (Windows)
+      if: runner.os == 'Windows'
+      uses: ilammy/msvc-dev-cmd@v1
+    - name: Set up compiler (Windows)
+      if: runner.os == 'Windows'
+      run: echo "CC=cl" >> $GITHUB_ENV
+    - name: Build and test
+      run: cd c && make test
