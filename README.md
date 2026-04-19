@@ -72,6 +72,11 @@ impl BStack {
     /// `n = 0` is valid.  Errors if `n` exceeds the current payload size.
     pub fn pop(&self, n: u64) -> io::Result<Vec<u8>>;
 
+    /// Remove the last `buf.len()` bytes and write them into `buf`, then durable-sync.
+    /// An empty buffer is a valid no-op.  Errors if `buf.len()` exceeds the current payload size.
+    /// Prefer this over `pop` when a buffer is already available to avoid an extra allocation.
+    pub fn pop_into(&self, buf: &mut [u8]) -> io::Result<()>;
+
     /// Overwrite `data` bytes in place starting at logical `offset`.
     /// Never changes the file size; errors if the write would exceed the
     /// current payload.  Requires the `set` feature.
@@ -82,9 +87,19 @@ impl BStack {
     /// `offset == len()` returns an empty Vec.
     pub fn peek(&self, offset: u64) -> io::Result<Vec<u8>>;
 
+    /// Fill `buf` with exactly `buf.len()` bytes starting at logical `offset`.
+    /// An empty buffer is a valid no-op.
+    /// Prefer this over `peek` when a buffer is already available to avoid an extra allocation.
+    pub fn peek_into(&self, offset: u64, buf: &mut [u8]) -> io::Result<()>;
+
     /// Copy bytes in the half-open logical range `[start, end)`.
     /// `start == end` returns an empty Vec.
     pub fn get(&self, start: u64, end: u64) -> io::Result<Vec<u8>>;
+
+    /// Fill `buf` with bytes from the half-open logical range `[start, start + buf.len())`.
+    /// An empty buffer is a valid no-op.
+    /// Prefer this over `get` when a buffer is already available to avoid an extra allocation.
+    pub fn get_into(&self, start: u64, buf: &mut [u8]) -> io::Result<()>;
 
     /// Current payload size in bytes (excludes the 16-byte header).
     pub fn len(&self) -> io::Result<u64>;
@@ -132,12 +147,12 @@ All user-visible offsets (returned by `push`, accepted by `peek`/`get`) are
 
 ## Durability
 
-| Operation           | Sequence                                                             |
-|---------------------|----------------------------------------------------------------------|
-| `push`              | `lseek(END)` → `write(data)` → `lseek(8)` → `write(clen)` → sync     |
-| `pop`               | `lseek` → `read` → `ftruncate` → `lseek(8)` → `write(clen)` → sync   |
-| `set` *(feature)*   | `lseek(offset)` → `write(data)` → sync                               |
-| `peek`, `get`       | `pread(2)` on Unix; `ReadFile`+`OVERLAPPED` on Windows; `lseek` → `read` elsewhere (no sync — read-only) |
+| Operation                              | Sequence                                                                           |
+|----------------------------------------|------------------------------------------------------------------------------------|
+| `push`                                 | `lseek(END)` → `write(data)` → `lseek(8)` → `write(clen)` → sync                   |
+| `pop`, `pop_into`                      | `lseek` → `read` → `ftruncate` → `lseek(8)` → `write(clen)` → sync                 |
+| `set` *(feature)*                      | `lseek(offset)` → `write(data)` → sync                                             |
+| `peek`, `peek_into`, `get`, `get_into` | `pread(2)` on Unix; `ReadFile`+`OVERLAPPED` on Windows; `lseek` → `read` elsewhere |
 
 **`durable_sync` on macOS** issues `fcntl(F_FULLFSYNC)`.  Unlike `fdatasync`,
 this flushes the drive controller's write cache, providing the same "barrier
@@ -160,9 +175,9 @@ header reset restore the pre-push state.
 The committed-length sentinel in the header ensures automatic recovery on the
 next `open`:
 
-| Condition | Cause | Recovery |
-|-----------|-------|----------|
-| `file_size − 16 > clen` | partial tail write (crashed before header update) | truncate to `16 + clen`, durable-sync |
+| Condition               | Cause                                             | Recovery                                  |
+|-------------------------|---------------------------------------------------|-------------------------------------------|
+| `file_size − 16 > clen` | partial tail write (crashed before header update) | truncate to `16 + clen`, durable-sync     |
 | `file_size − 16 < clen` | partial truncation (crashed before header update) | set `clen = file_size − 16`, durable-sync |
 
 No caller action is required; recovery is transparent.
@@ -192,22 +207,23 @@ maps to `io::ErrorKind::WouldBlock` in Rust).  The lock is released when the
 
 `BStack` wraps the file in a `RwLock<File>`.
 
-| Operation             | Lock (Unix / Windows) | Lock (other) |
-|-----------------------|-----------------------|--------------|
-| `push`, `pop`         | write                 | write        |
-| `set` *(feature)*     | write                 | write        |
-| `peek`, `get`         | **read**              | write        |
-| `len`                 | read                  | read         |
+| Operation                              | Lock (Unix / Windows) | Lock (other) |
+|----------------------------------------|-----------------------|--------------|
+| `push`, `pop`, `pop_into`              | write                 | write        |
+| `set` *(feature)*                      | write                 | write        |
+| `peek`, `peek_into`, `get`, `get_into` | **read**              | write        |
+| `len`                                  | read                  | read         |
 
-On Unix and Windows, `peek` and `get` use a cursor-safe positional read
-(`pread(2)` / `read_exact_at` on Unix; `ReadFile` with `OVERLAPPED` via
-`seek_read` on Windows) that does not modify the shared file-position cursor.
-Multiple concurrent `peek`, `get`, and `len` calls can therefore run in
-parallel.  Any in-progress `push` or `pop` still blocks all readers via the
-write lock, so readers always observe a consistent, committed state.
+On Unix and Windows, `peek`, `peek_into`, `get`, and `get_into` use a
+cursor-safe positional read (`pread(2)` / `read_exact_at` on Unix; `ReadFile`
+with `OVERLAPPED` via `seek_read` on Windows) that does not modify the shared
+file-position cursor.  Multiple concurrent calls to any of these methods can
+therefore run in parallel.  Any in-progress `push`, `pop`, or `pop_into` still
+blocks all readers via the write lock, so readers always observe a consistent,
+committed state.
 
-On other platforms a seek is required; `peek` and `get` fall back to the
-write lock and reads serialise.
+On other platforms a seek is required; `peek`, `peek_into`, `get`, and
+`get_into` fall back to the write lock and reads serialise.
 
 ---
 

@@ -7,8 +7,11 @@
 //! [`pop`](BStack::pop), and (with the `set` feature) [`set`](BStack::set) —
 //! calls a *durable sync* before returning, so the data survives a process
 //! crash or an unclean system shutdown.  Read-only operations —
-//! [`peek`](BStack::peek) and [`get`](BStack::get) — never modify the file
-//! and on Unix and Windows can run concurrently with each other.
+//! [`peek`](BStack::peek), [`peek_into`](BStack::peek_into),
+//! [`get`](BStack::get), and [`get_into`](BStack::get_into) — never modify
+//! the file and on Unix and Windows can run concurrently with each other.
+//! [`pop_into`](BStack::pop_into) is the buffer-passing counterpart of `pop`,
+//! carrying the same durability and atomicity guarantees.
 //!
 //! The crate depends on **`libc`** (Unix) and **`windows-sys`** (Windows) for
 //! platform-specific syscalls, and uses **no `unsafe` code beyond the required
@@ -57,9 +60,9 @@
 //! | Operation | Syscall sequence |
 //! |-----------|-----------------|
 //! | `push` | `lseek(END)` → `write(data)` → `lseek(8)` → `write(clen)` → `durable_sync` |
-//! | `pop`  | `lseek` → `read` → `ftruncate` → `lseek(8)` → `write(clen)` → `durable_sync` |
+//! | `pop`, `pop_into` | `lseek` → `read` → `ftruncate` → `lseek(8)` → `write(clen)` → `durable_sync` |
 //! | `set` *(feature)* | `lseek(offset)` → `write(data)` → `durable_sync` |
-//! | `peek`, `get` | `pread(2)` on Unix; `ReadFile`+`OVERLAPPED` on Windows; `lseek` → `read` elsewhere (no sync — read-only) |
+//! | `peek`, `peek_into`, `get`, `get_into` | `pread(2)` on Unix; `ReadFile`+`OVERLAPPED` on Windows; `lseek` → `read` elsewhere (no sync — read-only) |
 //!
 //! **`durable_sync` on macOS** issues `fcntl(F_FULLFSYNC)`, which flushes the
 //! drive's hardware write cache.  Plain `fdatasync` is not sufficient on macOS
@@ -113,19 +116,20 @@
 //!
 //! | Operation | Lock (Unix / Windows) | Lock (other) |
 //! |-----------|-----------------------|--------------|
-//! | `push`, `pop` | write | write |
+//! | `push`, `pop`, `pop_into` | write | write |
 //! | `set` *(feature)* | write | write |
-//! | `peek`, `get` | **read** | write |
+//! | `peek`, `peek_into`, `get`, `get_into` | **read** | write |
 //! | `len` | read | read |
 //!
-//! On Unix and Windows, `peek` and `get` use a cursor-safe positional read
-//! (`pread(2)` on Unix; `ReadFile` with `OVERLAPPED` on Windows) that does
-//! not modify the file-position cursor.  This allows multiple concurrent
-//! `peek`/`get`/`len` calls to run in parallel while any ongoing `push` or
-//! `pop` still serialises all writers via the write lock.
+//! On Unix and Windows, `peek`, `peek_into`, `get`, and `get_into` use a
+//! cursor-safe positional read (`pread(2)` on Unix; `ReadFile` with
+//! `OVERLAPPED` on Windows) that does not modify the file-position cursor.
+//! This allows multiple concurrent calls to any of these methods to run in
+//! parallel while any ongoing `push`, `pop`, or `pop_into` still serialises
+//! all writers via the write lock.
 //!
-//! On other platforms a seek is required, so `peek` and `get` fall back to
-//! the write lock and all reads serialise.
+//! On other platforms a seek is required, so `peek`, `peek_into`, `get`, and
+//! `get_into` fall back to the write lock and all reads serialise.
 //!
 //! # Feature flags
 //!
