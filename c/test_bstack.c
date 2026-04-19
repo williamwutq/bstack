@@ -78,6 +78,17 @@ static void make_tmp(char *buf, size_t n)
 }
 #endif
 
+#ifdef _WIN32
+static ssize_t pread(int fd, void *buf, size_t count, off_t offset) {
+    off_t saved = lseek(fd, 0, SEEK_CUR);
+    if (saved == -1) return -1;
+    if (lseek(fd, offset, SEEK_SET) == -1) return -1;
+    ssize_t result = read(fd, buf, count);
+    lseek(fd, saved, SEEK_SET);
+    return result;
+}
+#endif
+
 /* Read 8-byte little-endian value from absolute file offset (raw fd). */
 static uint64_t raw_read_le64(int fd, off_t offset)
 {
