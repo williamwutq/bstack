@@ -1,0 +1,6 @@
+# Ensure C files are recognized
+*.c linguist-detectable=true
+*.h linguist-detectable=true
+
+# Ensure Rust files are recognized
+*.rs linguist-detectable=true
