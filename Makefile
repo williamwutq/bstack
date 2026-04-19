@@ -25,7 +25,7 @@
 #   make test                             run local test suites
 #   make clean                            remove build/ and target/
 
-BUILD   := target
+BUILD   := build
 C_SRC   := c/bstack.c
 C_INC   := c
 C_FLAGS := -std=c11 -O2
