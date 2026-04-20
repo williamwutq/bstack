@@ -7,6 +7,10 @@ process crash or unclean shutdown.  On **macOS**, `fcntl(F_FULLFSYNC)` is used
 instead of `fdatasync` to flush the drive's hardware write cache, which plain
 `fdatasync` does not guarantee.
 
+[![Crates.io](https://img.shields.io/crates/v/bstack)](https://crates.io/crates/bstack)
+[![Docs.rs](https://img.shields.io/docsrs/bstack)](https://docs.rs/bstack)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+
 A 16-byte file header stores a **magic number** and a **committed-length
 sentinel**.  On reopen, any mismatch between the header and the actual file
 size is repaired automatically — no user intervention required.
