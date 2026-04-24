@@ -333,3 +333,65 @@ On other platforms a seek is required; `peek`, `peek_into`, `get`, and
   `durable_sync`, not cache bypass.
 - **Single file only.** There is no WAL, manifest, or secondary index.
 - **Multi-process lock is advisory.** `flock` (Unix) and `LockFileEx` (Windows) protect well-behaved processes but not raw file access.
+
+---
+
+## Why async (Tokio) integration is not planned
+
+`bstack` is deliberately synchronous, and async support would add real cost for
+no meaningful gain.  The reasons below are structural, not incidental.
+
+### 1. Durability is an inherently blocking syscall
+
+The entire value proposition of `bstack` is that `push` and `pop` do not return
+until the data is on stable storage.  That contract is fulfilled by
+`fcntl(F_FULLFSYNC)` on macOS, `fdatasync` on other Unix, and
+`FlushFileBuffers` on Windows.  All three are blocking syscalls that park the
+calling thread until the drive acknowledges the write.
+
+In an async runtime, blocking syscalls must be offloaded to a thread pool via
+`spawn_blocking`.  So an "async `push`" would simply be:
+
+```rust
+tokio::task::spawn_blocking(|| stack.push(data)).await
+```
+
+That is not necessary to be added as an async method on `BStack` itself, since the blocking nature of the operation is already clear from the API and documentation. The above pattern is idiomatic for using blocking operations in a Tokio application.
+
+### 2. No I/O concurrency to exploit
+
+Async I/O improves throughput when multiple independent operations can be
+in-flight simultaneously.  `bstack` cannot do this:
+
+- **Writes are ordered.** Each `push` extends the file at the tail and updates
+  the committed-length header.  Reordering or interleaving writes would corrupt
+  the header or produce a torn committed length.
+- **Every write ends with a barrier.** `durable_sync` must complete before the
+  next operation starts; there is nothing to pipeline.
+- **Operations are serialised by a `RwLock`.** Concurrent writes already block
+  on each other.  Wrapping that in `async` would only add overhead.
+
+### 3. The file lock is blocking and must not run on an async thread
+
+`open` calls `flock(LOCK_EX | LOCK_NB)` on Unix or `LockFileEx` on Windows.
+Blocking on a mutex inside an async executor stalls the thread and starves
+other tasks on the same worker.  Moving the lock acquisition to
+`spawn_blocking` is again just synchronous I/O on a thread pool.
+
+### 4. Tokio would break the minimal-dependencies guarantee
+
+`bstack` currently depends only on `libc` (Unix) and `windows-sys` (Windows).
+Pulling in `tokio` — even as an optional dependency — would introduce a large
+transitive dependency tree that affects every user of the crate, including the
+many users who do not use an async runtime at all.
+
+### What to do in async code
+
+If you are using `bstack` from inside a Tokio application, the idiomatic
+approach is:
+
+```rust
+let result = tokio::task::spawn_blocking(move || {
+    stack.push(&data)
+}).await?;
+```
