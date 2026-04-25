@@ -183,7 +183,7 @@ impl<'a, A: BStackAllocator> BStackSlice<'a, A> {
     }
 
     /// Return the underlying stack.
-    /// 
+    ///
     /// Note: `Bstack` does not require mutability for any of its operations,
     /// and directly mutating the stack without the knowledge of the allocator
     /// risks violating invariants.  Therefore, use this method with caution

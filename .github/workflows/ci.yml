@@ -34,7 +34,15 @@ jobs:
       run: cargo test
     - name: Test Release
       run: cargo test --release
-    - name: Test with features
+    - name: Test with set
       run: cargo test --features set
-    - name: Test Release with features
+    - name: Test Release with set
       run: cargo test --release --features set
+    - name: Test with alloc
+      run: cargo test --features alloc
+    - name: Test Release with alloc
+      run: cargo test --release --features alloc
+    - name: Test with set and alloc
+      run: cargo test --features "set alloc"
+    - name: Test Release with set and alloc
+      run: cargo test --release --features "set alloc"
