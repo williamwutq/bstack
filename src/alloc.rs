@@ -5,17 +5,35 @@
 //! This module provides two public items:
 //!
 //! * [`BStackSlice`] — a lifetime-coupled handle to a contiguous region of a
-//!   [`BStack`] payload.  It is a lightweight value type (one reference plus two
-//!   `u64`s) that exposes [`read`](BStackSlice::read),
+//!   [`BStack`] payload.  It is a lightweight `Copy` value (one reference plus
+//!   two `u64`s) that exposes [`read`](BStackSlice::read),
 //!   [`read_into`](BStackSlice::read_into), and (with the `set` feature)
 //!   [`write`](BStackSlice::write) and [`zero`](BStackSlice::zero).
 //!
 //! * [`BStackAllocator`] — a trait for types that own a [`BStack`] and manage
 //!   regions within it.  It standardises [`alloc`](BStackAllocator::alloc),
-//!   [`realloc`](BStackAllocator::realloc), and [`dealloc`](BStackAllocator::dealloc).
+//!   [`realloc`](BStackAllocator::realloc), [`dealloc`](BStackAllocator::dealloc),
+//!   and [`into_stack`](BStackAllocator::into_stack).
 //!
 //! [`LinearBStackAllocator`] is the reference implementation: a simple bump
 //! allocator that always appends to the tail.
+//!
+//! # Lifetime model
+//!
+//! `BStackSlice<'a, A>` borrows the **allocator** `A` for `'a`, not the
+//! underlying [`BStack`] directly.  Tying the lifetime to the allocator has
+//! two important consequences:
+//!
+//! 1. **`into_stack` is statically gated.** [`BStackAllocator::into_stack`]
+//!    consumes the allocator by value.  Because outstanding slices borrow
+//!    `&'a A`, the borrow checker prevents moving the allocator out while any
+//!    slice is still in scope.
+//!
+//! 2. **The dependency is honest.** A slice's validity depends on the
+//!    allocator — not just on the file being open.  Tying `'a` to `&'a BStack`
+//!    only prevents the file from closing; the stack could still be freely
+//!    resized through interior mutability, silently invalidating the handle.
+//!    Tying `'a` to the allocator makes the dependency explicit.
 //!
 //! # Feature flags
 //!
@@ -78,22 +96,25 @@
 //! written yet — but callers that need write-then-allocate atomicity must
 //! arrange it themselves.
 
+#![cfg(feature = "alloc")]
+
 use crate::BStack;
 use std::fmt;
 use std::io;
 
 /// A lifetime-coupled handle to a contiguous region of a [`BStack`] payload.
 ///
-/// `BStackSlice<'a>` is a lightweight `Copy` value that records a shared
-/// reference to a [`BStack`] together with a logical `offset` and `len`.  It
-/// is the primary handle type produced by [`BStackAllocator::alloc`] and
+/// `BStackSlice<'a, A>` is a lightweight `Copy` value that holds a shared
+/// reference to the allocator `A` together with a logical `offset` and `len`.
+/// It is the primary handle type produced by [`BStackAllocator::alloc`] and
 /// consumed by [`BStackAllocator::realloc`] and [`BStackAllocator::dealloc`].
 ///
 /// # Lifetime
 ///
-/// `'a` is tied to the [`BStack`] borrow (not to any particular allocator
-/// type).  Because the allocator owns the [`BStack`], slice lifetimes are
-/// implicitly bounded by the allocator's lifetime.
+/// `'a` is tied to the **allocator** borrow, not to the [`BStack`] directly.
+/// This means the borrow checker prevents calling
+/// [`into_stack`](BStackAllocator::into_stack) — which consumes the allocator
+/// by value — while any slice is still alive.
 ///
 /// # After `dealloc`
 ///
@@ -101,17 +122,25 @@ use std::io;
 /// must not be used for further I/O.  The type system enforces this when the
 /// slice is consumed by value, but callers who `Copy` the handle before
 /// deallocating must uphold this invariant themselves.
-#[derive(Clone, Copy)]
-pub struct BStackSlice<'a> {
-    /// Shared reference to the backing store.
-    pub stack: &'a BStack,
+pub struct BStackSlice<'a, A: BStackAllocator> {
+    /// Shared reference to the allocator that owns the backing store.
+    pub allocator: &'a A,
     /// Logical start offset within the [`BStack`] payload (inclusive).
     pub offset: u64,
     /// Number of bytes in this slice.
     pub len: u64,
 }
 
-impl<'a> fmt::Debug for BStackSlice<'a> {
+// Manual impls so that `A: Copy` / `A: Clone` are not required —
+// `&'a A` is always `Copy` regardless of whether `A` is.
+impl<'a, A: BStackAllocator> Clone for BStackSlice<'a, A> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<'a, A: BStackAllocator> Copy for BStackSlice<'a, A> {}
+
+impl<'a, A: BStackAllocator> fmt::Debug for BStackSlice<'a, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BStackSlice")
             .field("offset", &self.offset)
@@ -120,14 +149,18 @@ impl<'a> fmt::Debug for BStackSlice<'a> {
     }
 }
 
-impl<'a> BStackSlice<'a> {
+impl<'a, A: BStackAllocator> BStackSlice<'a, A> {
     /// Create a new `BStackSlice`.
     ///
     /// Does not validate that `offset + len <= stack.len()`.  Invalid slices
-    /// produce [`io::ErrorKind::InvalidInput`] errors on the first I/O call.
+    /// produce errors on the first I/O call.
     #[inline]
-    pub fn new(stack: &'a BStack, offset: u64, len: u64) -> Self {
-        Self { stack, offset, len }
+    pub fn new(allocator: &'a A, offset: u64, len: u64) -> Self {
+        Self {
+            allocator,
+            offset,
+            len,
+        }
     }
 
     /// The exclusive end offset of this slice within the payload
@@ -143,6 +176,24 @@ impl<'a> BStackSlice<'a> {
         self.len == 0
     }
 
+    /// Return the underlying allocator.
+    #[inline]
+    pub fn allocator(&self) -> &'a A {
+        self.allocator
+    }
+
+    /// Return the underlying stack.
+    /// 
+    /// Note: `Bstack` does not require mutability for any of its operations,
+    /// and directly mutating the stack without the knowledge of the allocator
+    /// risks violating invariants.  Therefore, use this method with caution
+    /// and prefer methods on [`BStackSlice`] such as [`read`](BStackSlice::read) and
+    /// [`write`](BStackSlice::write) that delegate to the stack internally.
+    #[inline]
+    pub fn stack(&self) -> &BStack {
+        self.allocator.stack()
+    }
+
     /// Read the entire slice into a newly allocated `Vec<u8>`.
     ///
     /// Delegates to [`BStack::get`].
@@ -151,7 +202,7 @@ impl<'a> BStackSlice<'a> {
     ///
     /// Returns an error if the range exceeds the current payload size.
     pub fn read(&self) -> io::Result<Vec<u8>> {
-        self.stack.get(self.offset, self.end())
+        self.stack().get(self.offset, self.end())
     }
 
     /// Read bytes from this slice into the caller-supplied `buf`.
@@ -162,7 +213,7 @@ impl<'a> BStackSlice<'a> {
     /// are filled and the remainder of `buf` is left untouched.
     pub fn read_into(&self, buf: &mut [u8]) -> io::Result<()> {
         let n = (buf.len() as u64).min(self.len) as usize;
-        self.stack.get_into(self.offset, &mut buf[..n])
+        self.stack().get_into(self.offset, &mut buf[..n])
     }
 
     /// Read a sub-range `[start, start + buf.len())` relative to this slice
@@ -185,7 +236,7 @@ impl<'a> BStackSlice<'a> {
                 ),
             ));
         }
-        self.stack.get_into(self.offset + start, buf)
+        self.stack().get_into(self.offset + start, buf)
     }
 
     /// Overwrite the beginning of this slice in place with `data`.
@@ -199,7 +250,7 @@ impl<'a> BStackSlice<'a> {
     #[cfg(feature = "set")]
     pub fn write(&self, data: &[u8]) -> io::Result<()> {
         let n = (data.len() as u64).min(self.len) as usize;
-        self.stack.set(self.offset, &data[..n])
+        self.stack().set(self.offset, &data[..n])
     }
 
     /// Overwrite a sub-range `[start, start + data.len())` within this slice
@@ -225,7 +276,7 @@ impl<'a> BStackSlice<'a> {
                 ),
             ));
         }
-        self.stack.set(self.offset + start, data)
+        self.stack().set(self.offset + start, data)
     }
 
     /// Zero out the entire slice in place.
@@ -233,7 +284,7 @@ impl<'a> BStackSlice<'a> {
     /// Requires the `set` feature.
     #[cfg(feature = "set")]
     pub fn zero(&self) -> io::Result<()> {
-        self.stack.zero(self.offset, self.len)
+        self.stack().zero(self.offset, self.len)
     }
 
     /// Zero a sub-range `[start, start + n)` within this slice in place.
@@ -258,14 +309,14 @@ impl<'a> BStackSlice<'a> {
                 ),
             ));
         }
-        self.stack.zero(self.offset + start, n)
+        self.stack().zero(self.offset + start, n)
     }
 
     /// Create a cursor-based reader positioned at the start of this slice.
     ///
     /// The reader implements [`io::Read`] and [`io::Seek`] in the coordinate
     /// space `[0, self.len)`.
-    pub fn reader(&self) -> BStackSliceReader<'a> {
+    pub fn reader(&self) -> BStackSliceReader<'a, A> {
         BStackSliceReader {
             slice: *self,
             cursor: 0,
@@ -276,7 +327,7 @@ impl<'a> BStackSlice<'a> {
     ///
     /// `offset` is relative to `self.offset`.  Seeking past `self.len` is
     /// allowed; subsequent reads return `Ok(0)`.
-    pub fn reader_at(&self, offset: u64) -> BStackSliceReader<'a> {
+    pub fn reader_at(&self, offset: u64) -> BStackSliceReader<'a, A> {
         BStackSliceReader {
             slice: *self,
             cursor: offset,
@@ -291,13 +342,21 @@ impl<'a> BStackSlice<'a> {
 /// the reader cannot read past `slice.offset + slice.len`.
 ///
 /// Constructed via [`BStackSlice::reader`] or [`BStackSlice::reader_at`].
-#[derive(Clone)]
-pub struct BStackSliceReader<'a> {
-    slice: BStackSlice<'a>,
+pub struct BStackSliceReader<'a, A: BStackAllocator> {
+    slice: BStackSlice<'a, A>,
     cursor: u64,
 }
 
-impl<'a> fmt::Debug for BStackSliceReader<'a> {
+impl<'a, A: BStackAllocator> Clone for BStackSliceReader<'a, A> {
+    fn clone(&self) -> Self {
+        Self {
+            slice: self.slice,
+            cursor: self.cursor,
+        }
+    }
+}
+
+impl<'a, A: BStackAllocator> fmt::Debug for BStackSliceReader<'a, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BStackSliceReader")
             .field("offset", &self.slice.offset)
@@ -307,7 +366,7 @@ impl<'a> fmt::Debug for BStackSliceReader<'a> {
     }
 }
 
-impl<'a> BStackSliceReader<'a> {
+impl<'a, A: BStackAllocator> BStackSliceReader<'a, A> {
     /// Return the current cursor position within the slice (not the payload).
     #[inline]
     pub fn position(&self) -> u64 {
@@ -316,12 +375,12 @@ impl<'a> BStackSliceReader<'a> {
 
     /// Return the underlying [`BStackSlice`].
     #[inline]
-    pub fn slice(&self) -> BStackSlice<'a> {
+    pub fn slice(&self) -> BStackSlice<'a, A> {
         self.slice
     }
 }
 
-impl<'a> io::Read for BStackSliceReader<'a> {
+impl<'a, A: BStackAllocator> io::Read for BStackSliceReader<'a, A> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if buf.is_empty() || self.cursor >= self.slice.len {
             return Ok(0);
@@ -329,13 +388,13 @@ impl<'a> io::Read for BStackSliceReader<'a> {
         let available = (self.slice.len - self.cursor) as usize;
         let n = buf.len().min(available);
         let abs_start = self.slice.offset + self.cursor;
-        self.slice.stack.get_into(abs_start, &mut buf[..n])?;
+        self.slice.stack().get_into(abs_start, &mut buf[..n])?;
         self.cursor += n as u64;
         Ok(n)
     }
 }
 
-impl<'a> io::Seek for BStackSliceReader<'a> {
+impl<'a, A: BStackAllocator> io::Seek for BStackSliceReader<'a, A> {
     /// Move the cursor within the slice's coordinate space.
     ///
     /// [`io::SeekFrom::End`] is relative to `self.slice.len`.  Seeking past
@@ -365,18 +424,20 @@ impl<'a> io::Seek for BStackSliceReader<'a> {
 /// # Ownership model
 ///
 /// An implementor takes ownership of a [`BStack`].  [`BStackSlice`] handles
-/// produced by [`alloc`](Self::alloc) borrow the underlying [`BStack`] for
-/// lifetime `'_`, which is bounded by the allocator's borrow lifetime.  The
-/// canonical pattern:
+/// produced by [`alloc`](Self::alloc) borrow the allocator for lifetime `'_`,
+/// which prevents the allocator from being consumed by
+/// [`into_stack`](Self::into_stack) while any slice is alive.  The canonical
+/// pattern:
 ///
 /// ```rust,ignore
 /// struct MyAllocator { stack: BStack }
 ///
 /// impl BStackAllocator for MyAllocator {
 ///     fn stack(&self) -> &BStack { &self.stack }
-///     fn alloc(&self, len: u64) -> io::Result<BStackSlice<'_>> { ... }
-///     fn realloc<'a>(&'a self, slice: BStackSlice<'a>, new_len: u64)
-///         -> io::Result<BStackSlice<'a>> { ... }
+///     fn alloc(&self, len: u64) -> io::Result<BStackSlice<'_, Self>> { ... }
+///     fn realloc<'a>(&'a self, slice: BStackSlice<'a, Self>, new_len: u64)
+///         -> io::Result<BStackSlice<'a, Self>> { ... }
+///     fn into_stack(self) -> BStack { self.stack }
 /// }
 /// ```
 ///
@@ -392,9 +453,21 @@ impl<'a> io::Seek for BStackSliceReader<'a> {
 /// As a rule of thumb: if every method maps to a single [`BStack`] call it
 /// is crash-safe by inheritance; if any method issues two or more calls it
 /// requires an explicit recovery design.
-pub trait BStackAllocator {
+pub trait BStackAllocator: Sized {
     /// Return a shared reference to the underlying [`BStack`].
+    ///
+    /// Note: `Bstack` does not require mutability for any of its operations,
+    /// and directly mutating the stack without the knowledge of the allocator
+    /// risks violating invariants.  Therefore, use this method with caution
+    /// and prefer methods on [`BStackSlice`] that delegate to the stack internally.
     fn stack(&self) -> &BStack;
+
+    /// Consume the allocator and return the underlying [`BStack`].
+    ///
+    /// This method takes `self` by value, so it can only be called once all
+    /// [`BStackSlice`] handles have been dropped — the borrow checker enforces
+    /// this because slices borrow `&'a Self`.
+    fn into_stack(self) -> BStack;
 
     /// Allocate `len` zero-initialised bytes at the tail of the stack.
     ///
@@ -403,46 +476,33 @@ pub trait BStackAllocator {
     ///
     /// # Errors
     ///
-    /// Propagates any [`io::Error`] from [`BStack::extend`].
-    fn alloc(&self, len: u64) -> io::Result<BStackSlice<'_>>;
+    /// Propagates any [`io::Error`] from underlying operations.
+    fn alloc(&self, len: u64) -> io::Result<BStackSlice<'_, Self>>;
 
     /// Resize `slice` to `new_len` bytes.
     ///
     /// Returns a (possibly different) [`BStackSlice`] for the resized region.
-    ///
-    /// If `slice` is the tail allocation, this is O(1):
-    /// - grow: tail is extended via [`BStack::extend`].
-    /// - shrink: tail is truncated via [`BStack::discard`].
-    /// - equal: no-op, returns `slice` unchanged.
-    ///
-    /// If `slice` is **not** the tail allocation, the behaviour is
-    /// implementation-defined.  Simple bump allocators (e.g.
-    /// [`LinearBStackAllocator`]) return
-    /// `Err(io::ErrorKind::Unsupported)`.
-    ///
     /// The lifetime `'a` ties the returned slice to the same borrow as the
     /// input slice and the allocator.
-    ///
-    /// # Errors
-    ///
-    /// * [`io::ErrorKind::Unsupported`] — non-tail realloc on a simple allocator.
-    /// * Any [`io::Error`] from [`BStack::extend`] or [`BStack::discard`].
-    fn realloc<'a>(&'a self, slice: BStackSlice<'a>, new_len: u64) -> io::Result<BStackSlice<'a>>;
+    fn realloc<'a>(
+        &'a self,
+        slice: BStackSlice<'a, Self>,
+        new_len: u64,
+    ) -> io::Result<BStackSlice<'a, Self>>;
 
     /// Release the region described by `slice`.
     ///
     /// The default implementation is a **no-op**.  Simple bump allocators
     /// accept this default; allocators with free-list tracking should override
-    /// it.  If `slice` is the tail allocation, an override may reclaim the
-    /// space via [`BStack::discard`].
+    /// it.
     ///
     /// After calling `dealloc`, `slice` must not be used for further I/O.
     ///
     /// # Errors
     ///
     /// The default never errors.  Overriding implementations may propagate
-    /// errors from [`BStack::discard`] or other bookkeeping operations.
-    fn dealloc(&self, _slice: BStackSlice<'_>) -> io::Result<()> {
+    /// errors from underlying operations.
+    fn dealloc(&self, _slice: BStackSlice<'_, Self>) -> io::Result<()> {
         Ok(())
     }
 
@@ -498,6 +558,7 @@ pub trait BStackAllocator {
 /// let slice = alloc.alloc(128)?;
 /// let data = slice.read()?;
 /// alloc.dealloc(slice)?;
+/// let stack = alloc.into_stack();
 /// # Ok(())
 /// # }
 /// ```
@@ -510,11 +571,6 @@ impl LinearBStackAllocator {
     pub fn new(stack: BStack) -> Self {
         Self { stack }
     }
-
-    /// Consume the allocator and return the underlying [`BStack`].
-    pub fn into_stack(self) -> BStack {
-        self.stack
-    }
 }
 
 impl BStackAllocator for LinearBStackAllocator {
@@ -522,12 +578,20 @@ impl BStackAllocator for LinearBStackAllocator {
         &self.stack
     }
 
-    fn alloc(&self, len: u64) -> io::Result<BStackSlice<'_>> {
-        let offset = self.stack.extend(len)?;
-        Ok(BStackSlice::new(&self.stack, offset, len))
+    fn into_stack(self) -> BStack {
+        self.stack
     }
 
-    fn realloc<'a>(&'a self, slice: BStackSlice<'a>, new_len: u64) -> io::Result<BStackSlice<'a>> {
+    fn alloc(&self, len: u64) -> io::Result<BStackSlice<'_, Self>> {
+        let offset = self.stack.extend(len)?;
+        Ok(BStackSlice::new(self, offset, len))
+    }
+
+    fn realloc<'a>(
+        &'a self,
+        slice: BStackSlice<'a, Self>,
+        new_len: u64,
+    ) -> io::Result<BStackSlice<'a, Self>> {
         let current_tail = self.stack.len()?;
         if slice.end() != current_tail {
             return Err(io::Error::new(
@@ -539,16 +603,16 @@ impl BStackAllocator for LinearBStackAllocator {
             std::cmp::Ordering::Equal => Ok(slice),
             std::cmp::Ordering::Greater => {
                 self.stack.extend(new_len - slice.len)?;
-                Ok(BStackSlice::new(&self.stack, slice.offset, new_len))
+                Ok(BStackSlice::new(self, slice.offset, new_len))
             }
             std::cmp::Ordering::Less => {
                 self.stack.discard(slice.len - new_len)?;
-                Ok(BStackSlice::new(&self.stack, slice.offset, new_len))
+                Ok(BStackSlice::new(self, slice.offset, new_len))
             }
         }
     }
 
-    fn dealloc(&self, slice: BStackSlice<'_>) -> io::Result<()> {
+    fn dealloc(&self, slice: BStackSlice<'_, Self>) -> io::Result<()> {
         let current_tail = self.stack.len()?;
         if slice.end() == current_tail {
             self.stack.discard(slice.len)?;

@@ -1679,7 +1679,7 @@ mod alloc_tests {
         let (alloc, path) = mk_alloc();
         let _g = Guard(path);
         let _ = alloc.alloc(8).unwrap(); // offset 0..8, all zeros
-        let s = BStackSlice::new(alloc.stack(), 0, 8);
+        let s = BStackSlice::new(&alloc, 0, 8);
         let mut buf = [0u8; 3];
         s.read_range_into(2, &mut buf).unwrap(); // reads bytes at relative offsets 2, 3, 4
         assert_eq!(buf, [0u8; 3]);
