@@ -1598,8 +1598,8 @@ mod alloc_tests {
         let (alloc, path) = mk_alloc();
         let _g = Guard(path);
         let s = alloc.alloc(32).unwrap();
-        assert_eq!(s.offset, 0);
-        assert_eq!(s.len, 32);
+        assert_eq!(s.start(), 0);
+        assert_eq!(s.len(), 32);
         assert!(!s.is_empty());
         assert_eq!(s.end(), 32);
     }
@@ -1610,7 +1610,7 @@ mod alloc_tests {
         let (alloc, path) = mk_alloc();
         let _g = Guard(path);
         let s = alloc.alloc(0).unwrap();
-        assert_eq!(s.len, 0);
+        assert_eq!(s.len(), 0);
         assert!(s.is_empty());
         assert_eq!(alloc.len().unwrap(), 0);
     }
@@ -1622,10 +1622,10 @@ mod alloc_tests {
         let _g = Guard(path);
         let a = alloc.alloc(8).unwrap();
         let b = alloc.alloc(16).unwrap();
-        assert_eq!(a.offset, 0);
-        assert_eq!(a.len, 8);
-        assert_eq!(b.offset, 8);
-        assert_eq!(b.len, 16);
+        assert_eq!(a.start(), 0);
+        assert_eq!(a.len(), 8);
+        assert_eq!(b.start(), 8);
+        assert_eq!(b.len(), 16);
         assert_eq!(alloc.len().unwrap(), 24);
     }
 
@@ -1703,8 +1703,8 @@ mod alloc_tests {
         let _g = Guard(path);
         let s = alloc.alloc(8).unwrap();
         let s2 = alloc.realloc(s, 16).unwrap();
-        assert_eq!(s2.offset, 0);
-        assert_eq!(s2.len, 16);
+        assert_eq!(s2.start(), 0);
+        assert_eq!(s2.len(), 16);
         assert_eq!(alloc.len().unwrap(), 16);
     }
 
@@ -1715,8 +1715,8 @@ mod alloc_tests {
         let _g = Guard(path);
         let s = alloc.alloc(16).unwrap();
         let s2 = alloc.realloc(s, 8).unwrap();
-        assert_eq!(s2.offset, 0);
-        assert_eq!(s2.len, 8);
+        assert_eq!(s2.start(), 0);
+        assert_eq!(s2.len(), 8);
         assert_eq!(alloc.len().unwrap(), 8);
     }
 
@@ -1727,8 +1727,8 @@ mod alloc_tests {
         let _g = Guard(path);
         let s = alloc.alloc(8).unwrap();
         let s2 = alloc.realloc(s, 8).unwrap();
-        assert_eq!(s2.offset, 0);
-        assert_eq!(s2.len, 8);
+        assert_eq!(s2.start(), 0);
+        assert_eq!(s2.len(), 8);
         assert_eq!(alloc.len().unwrap(), 8);
     }
 
@@ -1918,5 +1918,72 @@ mod alloc_tests {
         let s = alloc.alloc(4).unwrap();
         let err = s.zero_range(3, 2).unwrap_err(); // 3+2 > 4
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    // 20. subslice creates correct sub-slice
+    #[test]
+    fn subslice_correct() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(10).unwrap();
+        let sub = s.subslice(2..8);
+        assert_eq!(sub.start(), 2);
+        assert_eq!(sub.len(), 6);
+        assert_eq!(sub.start(), 2);
+        assert_eq!(sub.range(), 2..8);
+    }
+
+    // 21. subslice with empty range
+    #[test]
+    fn subslice_empty() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(10).unwrap();
+        let sub = s.subslice(5..5);
+        assert_eq!(sub.start(), 5);
+        assert_eq!(sub.len(), 0);
+        assert!(sub.is_empty());
+    }
+
+    // 22. subslice panics on invalid range
+    #[test]
+    #[should_panic(expected = "range start must be <= end")]
+    fn subslice_invalid_range_start_greater() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(10).unwrap();
+        let _ = s.subslice(8..5); // start > end
+    }
+
+    // 23. subslice panics on out of bounds
+    #[test]
+    #[should_panic(expected = "range end must be <= slice length")]
+    fn subslice_out_of_bounds() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(10).unwrap();
+        let _ = s.subslice(5..15); // end > len
+    }
+
+    // 24. start returns offset
+    #[test]
+    fn start_returns_offset() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(10).unwrap();
+        assert_eq!(s.start(), 0);
+        let sub = s.subslice(3..7);
+        assert_eq!(sub.start(), 3);
+    }
+
+    // 25. range returns correct range
+    #[test]
+    fn range_returns_correct() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(10).unwrap();
+        assert_eq!(s.range(), 0..10);
+        let sub = s.subslice(2..8);
+        assert_eq!(sub.range(), 2..8);
     }
 }

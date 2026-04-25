@@ -101,6 +101,7 @@
 use crate::BStack;
 use std::fmt;
 use std::io;
+use std::ops::Range;
 
 /// A lifetime-coupled handle to a contiguous region of a [`BStack`] payload.
 ///
@@ -124,11 +125,11 @@ use std::io;
 /// deallocating must uphold this invariant themselves.
 pub struct BStackSlice<'a, A: BStackAllocator> {
     /// Shared reference to the allocator that owns the backing store.
-    pub allocator: &'a A,
+    allocator: &'a A,
     /// Logical start offset within the [`BStack`] payload (inclusive).
-    pub offset: u64,
+    offset: u64,
     /// Number of bytes in this slice.
-    pub len: u64,
+    len: u64,
 }
 
 // Manual impls so that `A: Copy` / `A: Clone` are not required —
@@ -143,8 +144,9 @@ impl<'a, A: BStackAllocator> Copy for BStackSlice<'a, A> {}
 impl<'a, A: BStackAllocator> fmt::Debug for BStackSlice<'a, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BStackSlice")
-            .field("offset", &self.offset)
-            .field("len", &self.len)
+            .field("start", &self.start())
+            .field("end", &self.end())
+            .field("len", &self.len())
             .finish_non_exhaustive()
     }
 }
@@ -163,11 +165,29 @@ impl<'a, A: BStackAllocator> BStackSlice<'a, A> {
         }
     }
 
+    /// Returns the start offset of this slice within the payload.
+    #[inline]
+    pub fn start(&self) -> u64 {
+        self.offset
+    }
+
     /// The exclusive end offset of this slice within the payload
-    /// (`self.offset + self.len`).
+    /// (`self.start() + self.len()`).
     #[inline]
     pub fn end(&self) -> u64 {
         self.offset + self.len
+    }
+
+    /// Returns the range of this slice as `start..end` within the payload.
+    #[inline]
+    pub fn range(&self) -> Range<u64> {
+        self.start()..self.end()
+    }
+
+    /// Returns the length of this slice in bytes.
+    #[inline]
+    pub fn len(&self) -> u64 {
+        self.len
     }
 
     /// Returns `true` if this slice spans zero bytes.
@@ -194,6 +214,37 @@ impl<'a, A: BStackAllocator> BStackSlice<'a, A> {
         self.allocator.stack()
     }
 
+    /// Create a subslice of this slice.
+    ///
+    /// Returns a new `BStackSlice` that refers to the subrange `[start, end)` within
+    /// this slice. The `start` and `end` parameters are relative to this slice's start.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `start > end` or `end > self.len()`.
+    #[inline]
+    pub fn subslice(&self, start: u64, end: u64) -> BStackSlice<'a, A> {
+        self.subslice_range(start..end)
+    }
+
+    /// Create a subslice of this slice.
+    ///
+    /// Returns a new `BStackSlice` that refers to the subrange `range` within
+    /// this slice. The `range` is relative to this slice's start.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `range.start > range.end` or `range.end > self.len()`.
+    pub fn subslice_range(&self, range: Range<u64>) -> BStackSlice<'a, A> {
+        assert!(range.start <= range.end, "range start must be <= end");
+        assert!(range.end <= self.len, "range end must be <= slice length");
+        BStackSlice {
+            allocator: self.allocator,
+            offset: self.offset + range.start,
+            len: range.end - range.start,
+        }
+    }
+
     /// Read the entire slice into a newly allocated `Vec<u8>`.
     ///
     /// Delegates to [`BStack::get`].
@@ -202,81 +253,81 @@ impl<'a, A: BStackAllocator> BStackSlice<'a, A> {
     ///
     /// Returns an error if the range exceeds the current payload size.
     pub fn read(&self) -> io::Result<Vec<u8>> {
-        self.stack().get(self.offset, self.end())
+        self.stack().get(self.start(), self.end())
     }
 
     /// Read bytes from this slice into the caller-supplied `buf`.
     ///
-    /// Reads `min(buf.len(), self.len as usize)` bytes starting at
-    /// `self.offset`.  If `buf` is shorter than the slice, only the first
-    /// `buf.len()` bytes are read.  If `buf` is longer, only `self.len` bytes
+    /// Reads `min(buf.len(), self.len() as usize)` bytes starting at
+    /// `self.start()`.  If `buf` is shorter than the slice, only the first
+    /// `buf.len()` bytes are read.  If `buf` is longer, only `self.len()` bytes
     /// are filled and the remainder of `buf` is left untouched.
     pub fn read_into(&self, buf: &mut [u8]) -> io::Result<()> {
-        let n = (buf.len() as u64).min(self.len) as usize;
-        self.stack().get_into(self.offset, &mut buf[..n])
+        let n = (buf.len() as u64).min(self.len()) as usize;
+        self.stack().get_into(self.start(), &mut buf[..n])
     }
 
     /// Read a sub-range `[start, start + buf.len())` relative to this slice
     /// into the caller-supplied buffer.
     ///
-    /// `start` is relative to `self.offset`, not the payload start.
+    /// `start` is relative to `self.start()`, not the payload start.
     ///
     /// # Errors
     ///
     /// Returns [`io::ErrorKind::InvalidInput`] if `start + buf.len()` exceeds
-    /// `self.len`.
+    /// `self.len()`.
     pub fn read_range_into(&self, start: u64, buf: &mut [u8]) -> io::Result<()> {
         let end_rel = start + buf.len() as u64;
-        if end_rel > self.len {
+        if end_rel > self.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
                     "range [{start}, {end_rel}) exceeds slice length {}",
-                    self.len
+                    self.len()
                 ),
             ));
         }
-        self.stack().get_into(self.offset + start, buf)
+        self.stack().get_into(self.start() + start, buf)
     }
 
     /// Overwrite the beginning of this slice in place with `data`.
     ///
-    /// Writes `min(data.len(), self.len as usize)` bytes starting at
-    /// `self.offset`.  If `data` is shorter than the slice, the remainder of
-    /// the slice is left untouched.  If `data` is longer, only `self.len`
+    /// Writes `min(data.len(), self.len() as usize)` bytes starting at
+    /// `self.start()`.  If `data` is shorter than the slice, the remainder of
+    /// the slice is left untouched.  If `data` is longer, only `self.len()`
     /// bytes are written.
     ///
     /// Requires the `set` feature.
     #[cfg(feature = "set")]
     pub fn write(&self, data: &[u8]) -> io::Result<()> {
-        let n = (data.len() as u64).min(self.len) as usize;
-        self.stack().set(self.offset, &data[..n])
+        let n = (data.len() as u64).min(self.len()) as usize;
+        self.stack().set(self.start(), &data[..n])
     }
 
     /// Overwrite a sub-range `[start, start + data.len())` within this slice
     /// in place.
     ///
-    /// `start` is relative to `self.offset`.
+    /// `start` is relative to `self.start()`.
     ///
     /// Requires the `set` feature.
     ///
     /// # Errors
     ///
     /// Returns [`io::ErrorKind::InvalidInput`] if `start + data.len()` exceeds
-    /// `self.len`.
+    /// `self.len()`.
     #[cfg(feature = "set")]
     pub fn write_range(&self, start: u64, data: &[u8]) -> io::Result<()> {
         let end_rel = start + data.len() as u64;
-        if end_rel > self.len {
+        if end_rel > self.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
                     "range [{start}, {end_rel}) exceeds slice length {}",
-                    self.len
+                    self.len()
                 ),
             ));
         }
-        self.stack().set(self.offset + start, data)
+        self.stack().set(self.start() + start, data)
     }
 
     /// Zero out the entire slice in place.
@@ -284,38 +335,38 @@ impl<'a, A: BStackAllocator> BStackSlice<'a, A> {
     /// Requires the `set` feature.
     #[cfg(feature = "set")]
     pub fn zero(&self) -> io::Result<()> {
-        self.stack().zero(self.offset, self.len)
+        self.stack().zero(self.start(), self.len())
     }
 
     /// Zero a sub-range `[start, start + n)` within this slice in place.
     ///
-    /// `start` is relative to `self.offset`.
+    /// `start` is relative to `self.start()`.
     ///
     /// Requires the `set` feature.
     ///
     /// # Errors
     ///
     /// Returns [`io::ErrorKind::InvalidInput`] if `start + n` exceeds
-    /// `self.len`.
+    /// `self.len()`.
     #[cfg(feature = "set")]
     pub fn zero_range(&self, start: u64, n: u64) -> io::Result<()> {
         let end_rel = start + n;
-        if end_rel > self.len {
+        if end_rel > self.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
                     "range [{start}, {end_rel}) exceeds slice length {}",
-                    self.len
+                    self.len()
                 ),
             ));
         }
-        self.stack().zero(self.offset + start, n)
+        self.stack().zero(self.start() + start, n)
     }
 
     /// Create a cursor-based reader positioned at the start of this slice.
     ///
     /// The reader implements [`io::Read`] and [`io::Seek`] in the coordinate
-    /// space `[0, self.len)`.
+    /// space `[0, self.len())`.
     pub fn reader(&self) -> BStackSliceReader<'a, A> {
         BStackSliceReader {
             slice: *self,
@@ -325,7 +376,7 @@ impl<'a, A: BStackAllocator> BStackSlice<'a, A> {
 
     /// Create a cursor-based reader positioned at `offset` bytes into this slice.
     ///
-    /// `offset` is relative to `self.offset`.  Seeking past `self.len` is
+    /// `offset` is relative to `self.start()`.  Seeking past `self.len()` is
     /// allowed; subsequent reads return `Ok(0)`.
     pub fn reader_at(&self, offset: u64) -> BStackSliceReader<'a, A> {
         BStackSliceReader {
@@ -599,15 +650,15 @@ impl BStackAllocator for LinearBStackAllocator {
                 "LinearBStackAllocator::realloc: non-tail slice cannot be resized in place",
             ));
         }
-        match new_len.cmp(&slice.len) {
+        match new_len.cmp(&slice.len()) {
             std::cmp::Ordering::Equal => Ok(slice),
             std::cmp::Ordering::Greater => {
-                self.stack.extend(new_len - slice.len)?;
-                Ok(BStackSlice::new(self, slice.offset, new_len))
+                self.stack.extend(new_len - slice.len())?;
+                Ok(BStackSlice::new(self, slice.start(), new_len))
             }
             std::cmp::Ordering::Less => {
-                self.stack.discard(slice.len - new_len)?;
-                Ok(BStackSlice::new(self, slice.offset, new_len))
+                self.stack.discard(slice.len() - new_len)?;
+                Ok(BStackSlice::new(self, slice.start(), new_len))
             }
         }
     }
@@ -615,7 +666,7 @@ impl BStackAllocator for LinearBStackAllocator {
     fn dealloc(&self, slice: BStackSlice<'_, Self>) -> io::Result<()> {
         let current_tail = self.stack.len()?;
         if slice.end() == current_tail {
-            self.stack.discard(slice.len)?;
+            self.stack.discard(slice.len())?;
         }
         Ok(())
     }
