@@ -1283,6 +1283,218 @@ static int test_set_persists_across_reopen(void)
 #endif /* BSTACK_FEATURE_SET */
 
 /* =========================================================================
+ * bstack_extend
+ * ====================================================================== */
+
+static int test_extend_appends_zeros(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"abc", 3, NULL) == 0);
+    uint64_t off;
+    CHECK(bstack_extend(bs, 3, &off) == 0);
+    CHECK(off == 3);
+
+    uint64_t len;
+    CHECK(bstack_len(bs, &len) == 0);
+    CHECK(len == 6);
+
+    uint8_t buf[6]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(w == 6);
+    CHECK(memcmp(buf, "abc\x00\x00\x00", 6) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_extend_zero_is_noop(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"hello", 5, NULL) == 0);
+    uint64_t off;
+    CHECK(bstack_extend(bs, 0, &off) == 0);
+    CHECK(off == 5);
+
+    uint64_t len;
+    CHECK(bstack_len(bs, &len) == 0);
+    CHECK(len == 5);
+
+    uint8_t buf[5]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(memcmp(buf, "hello", 5) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_extend_persists_across_reopen(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+
+    {
+        bstack_t *bs = bstack_open(tmp);
+        CHECK(bs != NULL);
+        CHECK(bstack_push(bs, (uint8_t *)"hi", 2, NULL) == 0);
+        CHECK(bstack_extend(bs, 2, NULL) == 0);
+        bstack_close(bs);
+    }
+
+    {
+        bstack_t *bs = bstack_open(tmp);
+        CHECK(bs != NULL);
+        uint8_t buf[4]; size_t w;
+        CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+        CHECK(memcmp(buf, "hi\x00\x00", 4) == 0);
+        bstack_close(bs);
+    }
+
+    unlink(tmp);
+    return 0;
+}
+
+#ifdef BSTACK_FEATURE_SET
+
+/* =========================================================================
+ * bstack_zero  (compiled only with -DBSTACK_FEATURE_SET)
+ * ====================================================================== */
+
+static int test_zero_overwrites_with_zeros(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"helloworld", 10, NULL) == 0);
+    CHECK(bstack_zero(bs, 5, 5) == 0);
+
+    uint8_t buf[10]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(w == 10);
+    CHECK(memcmp(buf, "hello\x00\x00\x00\x00\x00", 10) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_zero_at_start(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"helloworld", 10, NULL) == 0);
+    CHECK(bstack_zero(bs, 0, 5) == 0);
+
+    uint8_t buf[10]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(memcmp(buf, "\x00\x00\x00\x00\x00world", 10) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_zero_at_exact_end_boundary(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"hello", 5, NULL) == 0);
+    /* Write 2 bytes ending exactly at the last byte. */
+    CHECK(bstack_zero(bs, 3, 2) == 0);
+
+    uint8_t buf[5]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(memcmp(buf, "hel\x00\x00", 5) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_zero_zero_is_noop(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"hello", 5, NULL) == 0);
+    CHECK(bstack_zero(bs, 2, 0) == 0);
+
+    uint8_t buf[5]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(memcmp(buf, "hello", 5) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_zero_does_not_change_file_size(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"hello", 5, NULL) == 0);
+    CHECK(bstack_zero(bs, 1, 3) == 0);
+
+    uint64_t len;
+    CHECK(bstack_len(bs, &len) == 0);
+    CHECK(len == 5);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_zero_rejects_write_past_end(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"hello", 5, NULL) == 0);
+
+    int r = bstack_zero(bs, 3, 3); /* 3+3=6 > 5 */
+    CHECK(r == -1);
+    CHECK(errno == EINVAL);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_zero_persists_across_reopen(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+
+    {
+        bstack_t *bs = bstack_open(tmp);
+        CHECK(bs != NULL);
+        CHECK(bstack_push(bs, (uint8_t *)"hello", 5, NULL) == 0);
+        CHECK(bstack_zero(bs, 0, 5) == 0);
+        bstack_close(bs);
+    }
+
+    {
+        bstack_t *bs = bstack_open(tmp);
+        CHECK(bs != NULL);
+        uint8_t buf[5]; size_t w;
+        CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+        CHECK(memcmp(buf, "\x00\x00\x00\x00\x00", 5) == 0);
+        bstack_close(bs);
+    }
+
+    unlink(tmp);
+    return 0;
+}
+
+#endif /* BSTACK_FEATURE_SET */
+
+/* =========================================================================
  * main
  * ====================================================================== */
 
@@ -1347,6 +1559,11 @@ int main(void)
     T(test_discard_leaves_correct_tail);
     T(test_discard_persists_across_reopen);
 
+    /* bstack_extend */
+    T(test_extend_appends_zeros);
+    T(test_extend_zero_is_noop);
+    T(test_extend_persists_across_reopen);
+
 #ifdef BSTACK_FEATURE_SET
     /* bstack_set */
     T(test_set_overwrites_middle_bytes);
@@ -1356,6 +1573,15 @@ int main(void)
     T(test_set_does_not_change_file_size);
     T(test_set_rejects_write_past_end);
     T(test_set_persists_across_reopen);
+
+    /* bstack_zero */
+    T(test_zero_overwrites_with_zeros);
+    T(test_zero_at_start);
+    T(test_zero_at_exact_end_boundary);
+    T(test_zero_zero_is_noop);
+    T(test_zero_does_not_change_file_size);
+    T(test_zero_rejects_write_past_end);
+    T(test_zero_persists_across_reopen);
 #endif
 
     printf("\n%d/%d passed\n", g_passed, g_total);

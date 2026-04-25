@@ -4,8 +4,8 @@
 //!
 //! [`BStack`] treats a file as a flat byte buffer that grows and shrinks from
 //! the tail.  Every mutating operation — [`push`](BStack::push),
-//! [`pop`](BStack::pop), [`discard`](BStack::discard), and (with the `set`
-//! feature) [`set`](BStack::set) — calls a *durable sync* before returning,
+//! [`extend`](BStack::extend), [`pop`](BStack::pop), [`discard`](BStack::discard), and (with the `set`
+//! feature) [`set`](BStack::set) and [`zero`](BStack::zero) — calls a *durable sync* before returning,
 //! so the data survives a process crash or an unclean system shutdown.
 //! Read-only operations — [`peek`](BStack::peek),
 //! [`peek_into`](BStack::peek_into), [`get`](BStack::get), and
@@ -513,6 +513,45 @@ impl BStack {
         Ok(logical_offset)
     }
 
+    /// Append `n` zero bytes to the end of the file.
+    ///
+    /// Returns the **logical** byte offset at which the zeros begin — i.e. the
+    /// payload size immediately before the write.  `n = 0` is valid; it writes
+    /// nothing and returns the current end offset.
+    ///
+    /// # Atomicity
+    ///
+    /// Either the file is extended, the header committed-length is updated,
+    /// and the whole thing is durably synced, or the file is left unchanged
+    /// (best-effort rollback via `ftruncate` + header reset).
+    ///
+    /// # Errors
+    ///
+    /// Returns any [`io::Error`] from `set_len`, `durable_sync`, or the
+    /// fallback `set_len`.
+    pub fn extend(&self, n: u64) -> io::Result<u64> {
+        let mut file = self.lock.write().unwrap();
+        let file_end = file.seek(SeekFrom::End(0))?;
+        let logical_offset = file_end - HEADER_SIZE;
+
+        if n == 0 {
+            return Ok(logical_offset);
+        }
+
+        let new_file_end = file_end + n;
+        file.set_len(new_file_end)?;
+
+        let new_len = logical_offset + n;
+        if let Err(e) = write_committed_len(&mut file, new_len).and_then(|_| durable_sync(&file)) {
+            // Roll back: truncate and reset header.
+            let _ = file.set_len(file_end);
+            let _ = write_committed_len(&mut file, logical_offset);
+            return Err(e);
+        }
+
+        Ok(logical_offset)
+    }
+
     /// Remove and return the last `n` bytes of the file.
     ///
     /// `n = 0` is valid: no bytes are removed and an empty `Vec` is returned.
@@ -880,6 +919,51 @@ impl BStack {
         }
         file.seek(SeekFrom::Start(HEADER_SIZE + offset))?;
         file.write_all(data)?;
+        durable_sync(&file)
+    }
+
+    /// Overwrite `n` bytes with zeros in place starting at logical `offset`.
+    ///
+    /// The file size is never changed: if `offset + n` would exceed
+    /// the current payload size the call is rejected.  `n = 0` is a
+    /// valid no-op.
+    ///
+    /// # Feature flag
+    ///
+    /// Only available when the `set` Cargo feature is enabled.
+    ///
+    /// # Durability
+    ///
+    /// Equivalent to `push`/`pop`: the overwritten bytes are durably synced
+    /// before the call returns.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] if `offset + n`
+    /// exceeds the current payload size, or if the addition overflows `u64`.
+    /// Propagates any I/O error from `write_all` or `durable_sync`.
+    #[cfg(feature = "set")]
+    pub fn zero(&self, offset: u64, n: u64) -> io::Result<()> {
+        if n == 0 {
+            return Ok(());
+        }
+        let end = offset.checked_add(n).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "zero: offset + n overflows u64",
+            )
+        })?;
+        let mut file = self.lock.write().unwrap();
+        let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
+        if end > data_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("zero: write end ({end}) exceeds payload size ({data_size})"),
+            ));
+        }
+        file.seek(SeekFrom::Start(HEADER_SIZE + offset))?;
+        let zeros = vec![0u8; n as usize];
+        file.write_all(&zeros)?;
         durable_sync(&file)
     }
 

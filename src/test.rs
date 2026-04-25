@@ -822,6 +822,143 @@ mod tests {
         assert_eq!(s2.peek(0).unwrap(), b"helloWORLD");
     }
 
+    // ---- extend -------------------------------------------------------------
+
+    #[test]
+    fn extend_appends_zeros() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        s.push(b"abc").unwrap();
+        let off = s.extend(3).unwrap();
+        assert_eq!(off, 3);
+        assert_eq!(s.len().unwrap(), 6);
+        assert_eq!(s.peek(0).unwrap(), b"abc\x00\x00\x00");
+    }
+
+    #[test]
+    fn extend_zero_is_noop() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        s.push(b"hello").unwrap();
+        let off = s.extend(0).unwrap();
+        assert_eq!(off, 5);
+        assert_eq!(s.len().unwrap(), 5);
+        assert_eq!(s.peek(0).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn extend_persists_across_reopen() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+
+        s.push(b"hi").unwrap();
+        s.extend(2).unwrap();
+        drop(s);
+
+        let s2 = BStack::open(&p).unwrap();
+        assert_eq!(s2.peek(0).unwrap(), b"hi\x00\x00");
+    }
+
+    // ---- zero (feature-gated) -----------------------------------------------
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn zero_overwrites_with_zeros() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        s.push(b"helloworld").unwrap();
+        s.zero(5, 5).unwrap();
+        assert_eq!(s.peek(0).unwrap(), b"hello\x00\x00\x00\x00\x00");
+        assert_eq!(s.len().unwrap(), 10);
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn zero_at_start() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        s.push(b"helloworld").unwrap();
+        s.zero(0, 5).unwrap();
+        assert_eq!(s.peek(0).unwrap(), b"\x00\x00\x00\x00\x00world");
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn zero_at_exact_end_boundary() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        s.push(b"hello").unwrap();
+        s.zero(3, 2).unwrap();
+        assert_eq!(s.peek(0).unwrap(), b"hel\x00\x00");
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn zero_zero_is_noop() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        s.push(b"hello").unwrap();
+        s.zero(2, 0).unwrap();
+        assert_eq!(s.peek(0).unwrap(), b"hello");
+        assert_eq!(s.len().unwrap(), 5);
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn zero_does_not_change_file_size() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        s.push(b"abcde").unwrap();
+        s.zero(1, 3).unwrap();
+        assert_eq!(s.len().unwrap(), 5);
+        assert_eq!(s.peek(0).unwrap(), b"a\x00\x00\x00e");
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn zero_rejects_write_past_end() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        s.push(b"hello").unwrap();
+        let err = s.zero(3, 3).unwrap_err(); // 3+3=6 > 5
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        // File must be unchanged.
+        assert_eq!(s.peek(0).unwrap(), b"hello");
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn zero_rejects_offset_past_end() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        s.push(b"hello").unwrap();
+        let err = s.zero(10, 1).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn zero_persists_across_reopen() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+
+        s.push(b"helloworld").unwrap();
+        s.zero(5, 5).unwrap();
+        drop(s);
+
+        let s2 = BStack::open(&p).unwrap();
+        assert_eq!(s2.peek(0).unwrap(), b"hello\x00\x00\x00\x00\x00");
+    }
+
     // ---- io::Write ----------------------------------------------------------
 
     #[test]

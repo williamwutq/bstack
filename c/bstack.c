@@ -462,6 +462,56 @@ fail_unlock:
 }
 
 /* -------------------------------------------------------------------------
+ * bstack_extend
+ * ---------------------------------------------------------------------- */
+
+int bstack_extend(bstack_t *bs, size_t n, uint64_t *out_offset)
+{
+    BS_WRLOCK(bs);
+
+    uint64_t raw_size;
+    if (file_size(bs->fd, &raw_size) != 0)
+        goto fail_unlock;
+
+    uint64_t logical_offset = raw_size - HEADER_SIZE;
+
+    if (n == 0) {
+        BS_WRUNLOCK(bs);
+        if (out_offset)
+            *out_offset = logical_offset;
+        return 0;
+    }
+
+    /* Extend the file; the OS will zero-fill the new space. */
+    uint64_t new_raw_size = raw_size + (uint64_t)n;
+    if (plat_ftruncate(bs->fd, new_raw_size) != 0)
+        goto fail_unlock;
+
+    uint64_t new_len = logical_offset + (uint64_t)n;
+    if (write_committed_len(bs->fd, new_len) != 0 ||
+        plat_durable_sync(bs->fd) != 0)
+    {
+        /* Rollback: truncate and reset committed length. */
+        plat_ftruncate(bs->fd, raw_size);
+        write_committed_len(bs->fd, logical_offset);
+        goto fail_unlock;
+    }
+
+    BS_WRUNLOCK(bs);
+    if (out_offset)
+        *out_offset = logical_offset;
+    return 0;
+
+fail_unlock:
+    {
+        int saved = errno;
+        BS_WRUNLOCK(bs);
+        errno = saved;
+    }
+    return -1;
+}
+
+/* -------------------------------------------------------------------------
  * bstack_pop
  * ---------------------------------------------------------------------- */
 
@@ -687,6 +737,61 @@ int bstack_set(bstack_t *bs, uint64_t offset,
 
     if (plat_pwrite(bs->fd, data, len, HEADER_SIZE + offset) != 0)
         goto fail_unlock;
+
+    if (plat_durable_sync(bs->fd) != 0)
+        goto fail_unlock;
+
+    BS_WRUNLOCK(bs);
+    return 0;
+
+fail_unlock:
+    {
+        int saved = errno;
+        BS_WRUNLOCK(bs);
+        errno = saved;
+    }
+    return -1;
+}
+
+int bstack_zero(bstack_t *bs, uint64_t offset, size_t n)
+{
+    if (n == 0)
+        return 0;
+
+    /* Guard against offset + n wrapping around. */
+    if ((uint64_t)n > UINT64_MAX - offset) {
+        errno = EINVAL;
+        return -1;
+    }
+    uint64_t end = offset + (uint64_t)n;
+
+    BS_WRLOCK(bs);
+
+    uint64_t raw_size;
+    if (file_size(bs->fd, &raw_size) != 0)
+        goto fail_unlock;
+
+    uint64_t data_size = raw_size - HEADER_SIZE;
+    if (end > data_size) {
+        BS_WRUNLOCK(bs);
+        errno = EINVAL;
+        return -1;
+    }
+
+    /* Allocate a buffer of zeros and write it. */
+    uint8_t *zeros = calloc(n, 1);
+    if (!zeros) {
+        BS_WRUNLOCK(bs);
+        errno = ENOMEM;
+        return -1;
+    }
+
+    if (plat_pwrite(bs->fd, zeros, n, HEADER_SIZE + offset) != 0) {
+        free(zeros);
+        goto fail_unlock;
+    }
+
+    free(zeros);
 
     if (plat_durable_sync(bs->fd) != 0)
         goto fail_unlock;

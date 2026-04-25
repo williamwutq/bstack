@@ -62,6 +62,14 @@ int bstack_push(bstack_t *bs, const uint8_t *data, size_t len,
                 uint64_t *out_offset);
 
 /*
+ * Append n zero bytes to the stack.
+ * If out_offset is non-NULL it receives the logical byte offset where the
+ * zeros begin (i.e. the payload size before the write).
+ * n = 0 is valid and returns the current end offset.
+ */
+int bstack_extend(bstack_t *bs, size_t n, uint64_t *out_offset);
+
+/*
  * Remove and copy the last n bytes of the stack into buf.
  * The caller must ensure buf has room for n bytes; no overflow check is done.
  * If written is non-NULL it receives n on success.
@@ -112,6 +120,16 @@ int bstack_len(bstack_t *bs, uint64_t *out_len);
  */
 int bstack_set(bstack_t *bs, uint64_t offset,
                const uint8_t *data, size_t len);
+
+/*
+ * Overwrite n bytes with zeros in place starting at logical offset.
+ * The file size is never changed.  n = 0 is a valid no-op.
+ * Returns EINVAL if offset + n would exceed the payload size or overflow
+ * uint64_t.
+ *
+ * Only available when compiled with -DBSTACK_FEATURE_SET.
+ */
+int bstack_zero(bstack_t *bs, uint64_t offset, size_t n);
 #endif /* BSTACK_FEATURE_SET */
 
 #ifdef __cplusplus
