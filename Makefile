@@ -192,6 +192,9 @@ clean:
 clean-zip:
 	rm -rf $(BUILD)/*.tar.gz $(BUILD)/*.zip
 
+clean-data:
+	rm -rf **/*.bstack
+
 # ── Zip ───────────────────────────────────────────────────────────────────────
 zip: $(BUILD)
 	@for target in $(RUST_TARGETS); do \
