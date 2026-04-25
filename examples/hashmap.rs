@@ -86,7 +86,10 @@ impl PersistentHashMap {
         // Read from offset to EOF; we only need up to the second null byte.
         let data = self.strings.peek(offset)?;
         let key_end = data.iter().position(|&b| b == 0).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "corrupt entry: missing key null")
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "corrupt entry: missing key null",
+            )
         })?;
         if &data[..key_end] != key.as_bytes() {
             return Ok(None); // same slot, different key
@@ -115,8 +118,15 @@ fn main() -> io::Result<()> {
         println!("{:?} => {:?}", key, map.get(key)?);
     }
 
-    println!("\nindex size:   {} bytes ({} slots x 8)", map.index.len()?, SLOTS);
-    println!("strings size: {} bytes (append-only pool)", map.strings.len()?);
+    println!(
+        "\nindex size:   {} bytes ({} slots x 8)",
+        map.index.len()?,
+        SLOTS
+    );
+    println!(
+        "strings size: {} bytes (append-only pool)",
+        map.strings.len()?
+    );
 
     Ok(())
 }
