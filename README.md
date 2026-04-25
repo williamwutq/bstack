@@ -81,6 +81,11 @@ impl BStack {
     /// Prefer this over `pop` when a buffer is already available to avoid an extra allocation.
     pub fn pop_into(&self, buf: &mut [u8]) -> io::Result<()>;
 
+    /// Discard the last `n` bytes without reading or returning them, then durable-sync.
+    /// `n = 0` is valid and is a no-op.  Errors if `n` exceeds the current payload size.
+    /// Prefer this over `pop` when the removed bytes are not needed, to avoid any allocation or copy.
+    pub fn discard(&self, n: u64) -> io::Result<()>;
+
     /// Overwrite `data` bytes in place starting at logical `offset`.
     /// Never changes the file size; errors if the write would exceed the
     /// current payload.  Requires the `set` feature.
@@ -247,6 +252,7 @@ All user-visible offsets (returned by `push`, accepted by `peek`/`get`) are
 |----------------------------------------|------------------------------------------------------------------------------------|
 | `push`                                 | `lseek(END)` → `write(data)` → `lseek(8)` → `write(clen)` → sync                   |
 | `pop`, `pop_into`                      | `lseek` → `read` → `ftruncate` → `lseek(8)` → `write(clen)` → sync                 |
+| `discard`                              | `ftruncate` → `lseek(8)` → `write(clen)` → sync                                    |
 | `set` *(feature)*                      | `lseek(offset)` → `write(data)` → sync                                             |
 | `peek`, `peek_into`, `get`, `get_into` | `pread(2)` on Unix; `ReadFile`+`OVERLAPPED` on Windows; `lseek` → `read` elsewhere |
 
@@ -305,7 +311,7 @@ maps to `io::ErrorKind::WouldBlock` in Rust).  The lock is released when the
 
 | Operation                              | Lock (Unix / Windows) | Lock (other) |
 |----------------------------------------|-----------------------|--------------|
-| `push`, `pop`, `pop_into`              | write                 | write        |
+| `push`, `pop`, `pop_into`, `discard`   | write                 | write        |
 | `set` *(feature)*                      | write                 | write        |
 | `peek`, `peek_into`, `get`, `get_into` | **read**              | write        |
 | `len`                                  | read                  | read         |

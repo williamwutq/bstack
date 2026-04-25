@@ -24,8 +24,8 @@
  * Thread safety
  * -------------
  * On Unix a pthread_rwlock protects each handle; on Windows an SRWLOCK is
- * used.  bstack_push / bstack_pop / bstack_set hold a write lock;
- * bstack_peek / bstack_get / bstack_len hold a read lock and may run
+ * used.  bstack_push / bstack_pop / bstack_discard / bstack_set hold a write
+ * lock; bstack_peek / bstack_get / bstack_len hold a read lock and may run
  * concurrently with each other on both platforms.
  *
  * Multi-process safety
