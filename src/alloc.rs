@@ -49,16 +49,13 @@
 //! bstack = { version = "0.1", features = ["alloc", "set"] }
 //! ```
 //!
-//! # Realloc contract for non-tail slices
+//! # Realloc contract for slices
 //!
 //! [`BStack`] only grows and shrinks at the tail.  Resizing the **last**
 //! (tail) allocation is O(1).  Resizing a **non-tail** allocation cannot be
-//! done in place.  Implementors of [`BStackAllocator`] must adopt one of:
-//!
-//! a. **Return `Unsupported`** — return `Err(io::ErrorKind::Unsupported)`.
-//!    [`LinearBStackAllocator`] uses this strategy.
-//! b. **Copy-and-move** — read old data, push a new region, mark the old
-//!    region free, and return a new [`BStackSlice`] at the new offset.
+//! done in place.  Implementors of [`BStackAllocator`], if supported, must
+//! copy the data to a new allocation and update the metadata accordingly,
+//! and must return an error if they do not support this operation.
 //!
 //! # Crash consistency
 //!
@@ -76,9 +73,8 @@
 //! their operations falls into:
 //!
 //! **Single-call (crash-safe by inheritance):** Any operation that maps
-//! directly to one [`BStack`] call — such as `alloc` → `extend`, tail
-//! `realloc` → `extend`/`discard`, or tail `dealloc` → `discard` — inherits
-//! the crash safety of that underlying call.
+//! directly to one [`BStack`] call inherits the crash safety of that underlying
+//! call.
 //!
 //! **Multi-call (requires explicit recovery design):** Operations that issue
 //! two or more [`BStack`] calls — such as a copy-and-move `realloc` that
@@ -492,10 +488,6 @@ impl<'a, A: BStackAllocator> io::Seek for BStackSliceReader<'a, A> {
 /// }
 /// ```
 ///
-/// # Realloc semantics for non-tail slices
-///
-/// See the [module-level documentation](self) for the mandatory contract.
-///
 /// # Crash consistency
 ///
 /// Implementors **must** document the crash-consistency class of each
@@ -520,7 +512,7 @@ pub trait BStackAllocator: Sized {
     /// this because slices borrow `&'a Self`.
     fn into_stack(self) -> BStack;
 
-    /// Allocate `len` zero-initialised bytes at the tail of the stack.
+    /// Allocate `len` zero-initialised bytes.
     ///
     /// Returns a [`BStackSlice`] handle covering the newly allocated region.
     /// The region is durably synced before returning.  `len = 0` is valid.
@@ -535,6 +527,11 @@ pub trait BStackAllocator: Sized {
     /// Returns a (possibly different) [`BStackSlice`] for the resized region.
     /// The lifetime `'a` ties the returned slice to the same borrow as the
     /// input slice and the allocator.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any [`io::Error`] from underlying operations, including
+    /// `Unsupported` if the implementation does not support reallocation.
     fn realloc<'a>(
         &'a self,
         slice: BStackSlice<'a, Self>,
