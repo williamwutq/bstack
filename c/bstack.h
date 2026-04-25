@@ -89,6 +89,13 @@ int bstack_get(bstack_t *bs, uint64_t start, uint64_t end,
                uint8_t *buf);
 
 /*
+ * Discard the last n bytes from the stack without copying them into a buffer.
+ * Equivalent to bstack_pop but skips the read; n = 0 is a no-op.
+ * Returns EINVAL if n exceeds the current payload size.
+ */
+int bstack_discard(bstack_t *bs, size_t n);
+
+/*
  * Write the current logical payload size (excluding the 16-byte header)
  * into *out_len.  Takes the read lock; concurrent calls are allowed.
  */

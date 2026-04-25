@@ -1011,6 +1011,142 @@ static int test_interleaved_push_pop_correct_state(void)
 }
 
 /* =========================================================================
+ * bstack_discard
+ * ====================================================================== */
+
+static int test_discard_removes_bytes_from_tail(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"abcde", 5, NULL) == 0);
+    CHECK(bstack_push(bs, (uint8_t *)"fghij", 5, NULL) == 0);
+
+    CHECK(bstack_discard(bs, 5) == 0);
+
+    uint64_t len;
+    CHECK(bstack_len(bs, &len) == 0);
+    CHECK(len == 5);
+
+    uint8_t buf[5]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(w == 5);
+    CHECK(memcmp(buf, "abcde", 5) == 0);
+
+    CHECK(bstack_discard(bs, 5) == 0);
+    CHECK(bstack_len(bs, &len) == 0);
+    CHECK(len == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_discard_zero_is_noop(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"abc", 3, NULL) == 0);
+    CHECK(bstack_discard(bs, 0) == 0);
+
+    uint64_t len;
+    CHECK(bstack_len(bs, &len) == 0);
+    CHECK(len == 3);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_discard_exceeds_size_returns_error(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"abc", 3, NULL) == 0);
+
+    int r = bstack_discard(bs, 10);
+    CHECK(r == -1);
+    CHECK(errno == EINVAL);
+
+    uint64_t len;
+    CHECK(bstack_len(bs, &len) == 0);
+    CHECK(len == 3);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_discard_on_empty_returns_error(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    int r = bstack_discard(bs, 1);
+    CHECK(r == -1);
+    CHECK(errno == EINVAL);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_discard_leaves_correct_tail(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"helloworld", 10, NULL) == 0);
+    CHECK(bstack_discard(bs, 5) == 0);
+
+    uint64_t len;
+    CHECK(bstack_len(bs, &len) == 0);
+    CHECK(len == 5);
+
+    uint8_t buf[5]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(memcmp(buf, "hello", 5) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_discard_persists_across_reopen(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+
+    {
+        bstack_t *bs = bstack_open(tmp);
+        CHECK(bs != NULL);
+        CHECK(bstack_push(bs, (uint8_t *)"hello", 5, NULL) == 0);
+        CHECK(bstack_push(bs, (uint8_t *)"world", 5, NULL) == 0);
+        CHECK(bstack_discard(bs, 5) == 0);
+        bstack_close(bs);
+    }
+
+    {
+        bstack_t *bs = bstack_open(tmp);
+        CHECK(bs != NULL);
+
+        uint64_t len;
+        CHECK(bstack_len(bs, &len) == 0);
+        CHECK(len == 5);
+
+        uint8_t buf[5]; size_t w;
+        CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+        CHECK(memcmp(buf, "hello", 5) == 0);
+
+        bstack_close(bs);
+    }
+
+    unlink(tmp);
+    return 0;
+}
+
+/* =========================================================================
  * bstack_set  (compiled only with -DBSTACK_FEATURE_SET)
  * ====================================================================== */
 
@@ -1202,6 +1338,14 @@ int main(void)
 
     /* Interleaved */
     T(test_interleaved_push_pop_correct_state);
+
+    /* bstack_discard */
+    T(test_discard_removes_bytes_from_tail);
+    T(test_discard_zero_is_noop);
+    T(test_discard_exceeds_size_returns_error);
+    T(test_discard_on_empty_returns_error);
+    T(test_discard_leaves_correct_tail);
+    T(test_discard_persists_across_reopen);
 
 #ifdef BSTACK_FEATURE_SET
     /* bstack_set */

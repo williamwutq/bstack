@@ -648,6 +648,82 @@ mod tests {
         assert_eq!(s2.len().unwrap(), 5);
     }
 
+    // ---- discard ------------------------------------------------------------
+
+    #[test]
+    fn discard_removes_bytes_from_tail() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        s.push(b"abcde").unwrap();
+        s.push(b"fghij").unwrap();
+        assert_eq!(s.len().unwrap(), 10);
+
+        s.discard(5).unwrap();
+        assert_eq!(s.len().unwrap(), 5);
+        assert_eq!(s.peek(0).unwrap(), b"abcde");
+
+        s.discard(5).unwrap();
+        assert_eq!(s.len().unwrap(), 0);
+    }
+
+    #[test]
+    fn discard_zero_is_noop() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        s.push(b"abc").unwrap();
+        s.discard(0).unwrap();
+        assert_eq!(s.len().unwrap(), 3);
+        assert_eq!(s.peek(0).unwrap(), b"abc");
+    }
+
+    #[test]
+    fn discard_exceeds_size_returns_error() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        s.push(b"abc").unwrap();
+        let err = s.discard(10).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(s.len().unwrap(), 3);
+    }
+
+    #[test]
+    fn discard_on_empty_returns_error() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        let err = s.discard(1).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn discard_leaves_correct_tail() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        s.push(b"helloworld").unwrap();
+        s.discard(5).unwrap();
+        assert_eq!(s.len().unwrap(), 5);
+        assert_eq!(s.peek(0).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn discard_persists_across_reopen() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+
+        s.push(b"hello").unwrap();
+        s.push(b"world").unwrap();
+        s.discard(5).unwrap();
+        drop(s);
+
+        let s2 = BStack::open(&p).unwrap();
+        assert_eq!(s2.len().unwrap(), 5);
+        assert_eq!(s2.peek(0).unwrap(), b"hello");
+    }
+
     // ---- set (feature-gated) ------------------------------------------------
 
     #[cfg(feature = "set")]

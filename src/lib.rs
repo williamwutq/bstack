@@ -801,6 +801,40 @@ impl BStack {
         Ok(())
     }
 
+    /// Remove (discard) the last `n` bytes from the file without returning them.
+    ///
+    /// Equivalent to [`pop`](Self::pop) but avoids allocating a buffer for the
+    /// removed bytes.  `n = 0` is valid and is a no-op.
+    ///
+    /// # Atomicity
+    ///
+    /// Same guarantees as [`pop`](Self::pop).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] if `n` exceeds the current
+    /// payload size.  Also propagates any I/O error from `set_len`,
+    /// `write_all`, or `durable_sync`.
+    pub fn discard(&self, n: u64) -> io::Result<()> {
+        if n == 0 {
+            return Ok(());
+        }
+        let mut file = self.lock.write().unwrap();
+        let raw_size = file.seek(SeekFrom::End(0))?;
+        let data_size = raw_size - HEADER_SIZE;
+        if n > data_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("discard({n}) exceeds payload size ({data_size})"),
+            ));
+        }
+        let new_data_len = data_size - n;
+        file.set_len(HEADER_SIZE + new_data_len)?;
+        write_committed_len(&mut file, new_data_len)?;
+        durable_sync(&file)?;
+        Ok(())
+    }
+
     /// Overwrite `data` bytes in place starting at logical `offset`.
     ///
     /// The file size is never changed: if `offset + data.len()` would exceed

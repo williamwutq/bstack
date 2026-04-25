@@ -593,6 +593,47 @@ fail_unlock:
 }
 
 /* -------------------------------------------------------------------------
+ * bstack_discard
+ * ---------------------------------------------------------------------- */
+
+int bstack_discard(bstack_t *bs, size_t n)
+{
+    if (n == 0)
+        return 0;
+
+    BS_WRLOCK(bs);
+
+    uint64_t raw_size;
+    if (file_size(bs->fd, &raw_size) != 0)
+        goto fail_unlock;
+
+    uint64_t data_size = raw_size - HEADER_SIZE;
+    if ((uint64_t)n > data_size) {
+        BS_WRUNLOCK(bs);
+        errno = EINVAL;
+        return -1;
+    }
+
+    uint64_t new_len = data_size - (uint64_t)n;
+
+    if (plat_ftruncate(bs->fd, HEADER_SIZE + new_len) != 0 ||
+        write_committed_len(bs->fd, new_len) != 0 ||
+        plat_durable_sync(bs->fd) != 0)
+        goto fail_unlock;
+
+    BS_WRUNLOCK(bs);
+    return 0;
+
+fail_unlock:
+    {
+        int saved = errno;
+        BS_WRUNLOCK(bs);
+        errno = saved;
+    }
+    return -1;
+}
+
+/* -------------------------------------------------------------------------
  * bstack_len
  * ---------------------------------------------------------------------- */
 
