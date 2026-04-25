@@ -491,11 +491,9 @@ impl<'a, A: BStackAllocator> io::Seek for BStackSliceReader<'a, A> {
 /// # Crash consistency
 ///
 /// Implementors **must** document the crash-consistency class of each
-/// operation they provide.  The two classes are defined in the
-/// [module-level crash consistency section](self#crash-consistency).
-/// As a rule of thumb: if every method maps to a single [`BStack`] call it
-/// is crash-safe by inheritance; if any method issues two or more calls it
-/// requires an explicit recovery design.
+/// operation they provide. As a rule of thumb: if every method maps to a
+/// single [`BStack`] call it is crash-safe by inheritance; if any method
+/// issues two or more calls it requires an explicit recovery design.
 pub trait BStackAllocator: Sized {
     /// Return a shared reference to the underlying [`BStack`].
     ///

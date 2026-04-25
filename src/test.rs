@@ -1926,7 +1926,7 @@ mod alloc_tests {
         let (alloc, path) = mk_alloc();
         let _g = Guard(path);
         let s = alloc.alloc(10).unwrap();
-        let sub = s.subslice(2..8);
+        let sub = s.subslice(2, 8);
         assert_eq!(sub.start(), 2);
         assert_eq!(sub.len(), 6);
         assert_eq!(sub.start(), 2);
@@ -1939,7 +1939,7 @@ mod alloc_tests {
         let (alloc, path) = mk_alloc();
         let _g = Guard(path);
         let s = alloc.alloc(10).unwrap();
-        let sub = s.subslice(5..5);
+        let sub = s.subslice(5, 5);
         assert_eq!(sub.start(), 5);
         assert_eq!(sub.len(), 0);
         assert!(sub.is_empty());
@@ -1952,7 +1952,7 @@ mod alloc_tests {
         let (alloc, path) = mk_alloc();
         let _g = Guard(path);
         let s = alloc.alloc(10).unwrap();
-        let _ = s.subslice(8..5); // start > end
+        let _ = s.subslice(8, 5); // start > end
     }
 
     // 23. subslice panics on out of bounds
@@ -1962,7 +1962,7 @@ mod alloc_tests {
         let (alloc, path) = mk_alloc();
         let _g = Guard(path);
         let s = alloc.alloc(10).unwrap();
-        let _ = s.subslice(5..15); // end > len
+        let _ = s.subslice(5, 15); // end > len
     }
 
     // 24. start returns offset
@@ -1972,7 +1972,7 @@ mod alloc_tests {
         let _g = Guard(path);
         let s = alloc.alloc(10).unwrap();
         assert_eq!(s.start(), 0);
-        let sub = s.subslice(3..7);
+        let sub = s.subslice(3, 7);
         assert_eq!(sub.start(), 3);
     }
 
@@ -1983,7 +1983,7 @@ mod alloc_tests {
         let _g = Guard(path);
         let s = alloc.alloc(10).unwrap();
         assert_eq!(s.range(), 0..10);
-        let sub = s.subslice(2..8);
+        let sub = s.subslice(2, 8);
         assert_eq!(sub.range(), 2..8);
     }
 }
