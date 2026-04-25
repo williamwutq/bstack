@@ -1565,3 +1565,358 @@ mod tests {
         );
     }
 }
+
+// -------------------------------------------------------------------------
+// Allocator tests
+
+#[cfg(all(test, feature = "alloc"))]
+mod alloc_tests {
+    use crate::BStack;
+    use crate::alloc::{BStackAllocator, BStackSlice, LinearBStackAllocator};
+    use std::io::{Read, Seek, SeekFrom};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn mk_alloc() -> (LinearBStackAllocator, std::path::PathBuf) {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        let path = std::env::temp_dir().join(format!("bstack_alloc_test_{pid}_{id}.bin"));
+        let stack = BStack::open(&path).unwrap();
+        (LinearBStackAllocator::new(stack), path)
+    }
+
+    struct Guard(std::path::PathBuf);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    // 1. alloc returns correct offset and len
+    #[test]
+    fn alloc_offset_and_len() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(32).unwrap();
+        assert_eq!(s.offset, 0);
+        assert_eq!(s.len, 32);
+        assert!(!s.is_empty());
+        assert_eq!(s.end(), 32);
+    }
+
+    // 2. alloc(0) is a valid no-op
+    #[test]
+    fn alloc_zero_len() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(0).unwrap();
+        assert_eq!(s.len, 0);
+        assert!(s.is_empty());
+        assert_eq!(alloc.len().unwrap(), 0);
+    }
+
+    // 3. successive allocs produce non-overlapping regions
+    #[test]
+    fn alloc_sequential_offsets() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let a = alloc.alloc(8).unwrap();
+        let b = alloc.alloc(16).unwrap();
+        assert_eq!(a.offset, 0);
+        assert_eq!(a.len, 8);
+        assert_eq!(b.offset, 8);
+        assert_eq!(b.len, 16);
+        assert_eq!(alloc.len().unwrap(), 24);
+    }
+
+    // 4. read returns zero bytes from a freshly allocated region
+    #[test]
+    fn alloc_read_zeros() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(4).unwrap();
+        let data = s.read().unwrap();
+        assert_eq!(data, vec![0u8; 4]);
+    }
+
+    // 5. read_into with exact-size buffer succeeds
+    #[test]
+    fn read_into_exact_size() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(4).unwrap();
+        let mut buf = [0u8; 4];
+        s.read_into(&mut buf).unwrap();
+        assert_eq!(buf, [0u8; 4]);
+    }
+
+    // 6. read_into with a shorter buffer reads only what fits
+    #[test]
+    fn read_into_shorter_buffer() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(4).unwrap();
+        let mut buf = [0xffu8; 3];
+        s.read_into(&mut buf).unwrap(); // reads 3 of the 4 slice bytes
+        assert_eq!(buf, [0u8; 3]);
+    }
+
+    // 6b. read_into with a longer buffer fills only self.len bytes, leaves rest untouched
+    #[test]
+    fn read_into_longer_buffer() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(4).unwrap();
+        let mut buf = [0xffu8; 6];
+        s.read_into(&mut buf).unwrap();
+        assert_eq!(&buf[..4], [0u8; 4]);
+        assert_eq!(&buf[4..], [0xffu8; 2]); // untouched
+    }
+
+    // 7. read_range_into reads the correct sub-range
+    #[test]
+    fn read_range_into_correct() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let _ = alloc.alloc(8).unwrap(); // offset 0..8, all zeros
+        let s = BStackSlice::new(alloc.stack(), 0, 8);
+        let mut buf = [0u8; 3];
+        s.read_range_into(2, &mut buf).unwrap(); // reads bytes at relative offsets 2, 3, 4
+        assert_eq!(buf, [0u8; 3]);
+    }
+
+    // 8. read_range_into out of bounds → InvalidInput
+    #[test]
+    fn read_range_into_out_of_bounds() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(4).unwrap();
+        let mut buf = [0u8; 3];
+        let err = s.read_range_into(2, &mut buf).unwrap_err(); // 2+3 > 4
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    // 9. realloc tail-grow increases len
+    #[test]
+    fn realloc_tail_grow() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(8).unwrap();
+        let s2 = alloc.realloc(s, 16).unwrap();
+        assert_eq!(s2.offset, 0);
+        assert_eq!(s2.len, 16);
+        assert_eq!(alloc.len().unwrap(), 16);
+    }
+
+    // 10. realloc tail-shrink decreases len
+    #[test]
+    fn realloc_tail_shrink() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(16).unwrap();
+        let s2 = alloc.realloc(s, 8).unwrap();
+        assert_eq!(s2.offset, 0);
+        assert_eq!(s2.len, 8);
+        assert_eq!(alloc.len().unwrap(), 8);
+    }
+
+    // 11. realloc with same len is a no-op
+    #[test]
+    fn realloc_same_len() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(8).unwrap();
+        let s2 = alloc.realloc(s, 8).unwrap();
+        assert_eq!(s2.offset, 0);
+        assert_eq!(s2.len, 8);
+        assert_eq!(alloc.len().unwrap(), 8);
+    }
+
+    // 12. realloc non-tail → Unsupported
+    #[test]
+    fn realloc_non_tail_unsupported() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(8).unwrap();
+        let _ = alloc.alloc(4).unwrap(); // push another on top
+        let err = alloc.realloc(s, 16).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+    }
+
+    // 13. dealloc tail reclaims space
+    #[test]
+    fn dealloc_tail_reclaims() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(16).unwrap();
+        assert_eq!(alloc.len().unwrap(), 16);
+        alloc.dealloc(s).unwrap();
+        assert_eq!(alloc.len().unwrap(), 0);
+    }
+
+    // 14. dealloc non-tail is no-op
+    #[test]
+    fn dealloc_non_tail_noop() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(8).unwrap();
+        let _ = alloc.alloc(4).unwrap(); // push another on top
+        alloc.dealloc(s).unwrap(); // non-tail: no-op
+        assert_eq!(alloc.len().unwrap(), 12); // nothing reclaimed
+    }
+
+    // 15. BStackSliceReader sequential read
+    #[test]
+    fn slice_reader_sequential() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(8).unwrap();
+        let mut reader = s.reader();
+        assert_eq!(reader.position(), 0);
+        let mut buf = [0u8; 4];
+        let n = reader.read(&mut buf).unwrap();
+        assert_eq!(n, 4);
+        assert_eq!(reader.position(), 4);
+        let n = reader.read(&mut buf).unwrap();
+        assert_eq!(n, 4);
+        assert_eq!(reader.position(), 8);
+        // EOF
+        let n = reader.read(&mut buf).unwrap();
+        assert_eq!(n, 0);
+    }
+
+    // 16. BStackSliceReader seek
+    #[test]
+    fn slice_reader_seek() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(8).unwrap();
+        let mut reader = s.reader();
+        let pos = reader.seek(SeekFrom::End(0)).unwrap();
+        assert_eq!(pos, 8);
+        let pos = reader.seek(SeekFrom::Current(-4)).unwrap();
+        assert_eq!(pos, 4);
+        let pos = reader.seek(SeekFrom::Start(2)).unwrap();
+        assert_eq!(pos, 2);
+    }
+
+    // 17. seek before start → InvalidInput
+    #[test]
+    fn slice_reader_seek_before_start() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(8).unwrap();
+        let mut reader = s.reader();
+        let err = reader.seek(SeekFrom::Current(-1)).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    // 18. reader_at positions correctly
+    #[test]
+    fn slice_reader_at() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(8).unwrap();
+        let reader = s.reader_at(5);
+        assert_eq!(reader.position(), 5);
+    }
+
+    // 19. into_stack recovers the BStack
+    #[test]
+    fn into_stack_recovers() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let _ = alloc.alloc(4).unwrap();
+        let stack = alloc.into_stack();
+        assert_eq!(stack.len().unwrap(), 4);
+    }
+
+    // -------------------------------------------------------------------------
+    // write/zero tests (require `set` feature)
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn write_read_roundtrip() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(5).unwrap();
+        s.write(b"hello").unwrap();
+        assert_eq!(s.read().unwrap(), b"hello");
+    }
+
+    // write with shorter data writes only what's provided, leaves rest untouched
+    #[cfg(feature = "set")]
+    #[test]
+    fn write_shorter_data() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(5).unwrap();
+        s.write(b"hi").unwrap(); // writes 2 of the 5 slice bytes
+        let data = s.read().unwrap();
+        assert_eq!(data, b"hi\x00\x00\x00");
+    }
+
+    // write with longer data writes only self.len bytes
+    #[cfg(feature = "set")]
+    #[test]
+    fn write_longer_data() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(3).unwrap();
+        s.write(b"hello").unwrap(); // writes only 3 bytes
+        assert_eq!(s.read().unwrap(), b"hel");
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn write_range_partial() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(5).unwrap();
+        s.write_range(1, b"abc").unwrap();
+        let data = s.read().unwrap();
+        assert_eq!(data, b"\x00abc\x00");
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn write_range_out_of_bounds() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(5).unwrap();
+        let err = s.write_range(3, b"abc").unwrap_err(); // 3+3 > 5
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn zero_clears_slice() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(4).unwrap();
+        s.write(b"abcd").unwrap();
+        s.zero().unwrap();
+        assert_eq!(s.read().unwrap(), vec![0u8; 4]);
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn zero_range_partial() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(4).unwrap();
+        s.write(b"abcd").unwrap();
+        s.zero_range(1, 2).unwrap();
+        assert_eq!(s.read().unwrap(), b"a\x00\x00d");
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn zero_range_out_of_bounds() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(4).unwrap();
+        let err = s.zero_range(3, 2).unwrap_err(); // 3+2 > 4
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+}

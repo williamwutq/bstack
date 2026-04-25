@@ -223,6 +223,11 @@
 
 mod test;
 
+#[cfg(feature = "alloc")]
+mod alloc;
+#[cfg(feature = "alloc")]
+pub use alloc::{BStackAllocator, BStackSlice, BStackSliceReader, LinearBStackAllocator};
+
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
