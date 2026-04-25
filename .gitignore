@@ -16,3 +16,6 @@ test_*
 
 # Build
 /build
+
+# Generated example data files
+*.bstack
