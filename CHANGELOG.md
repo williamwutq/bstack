@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`extend` method (Rust) / `bstack_extend` (C)**: Append `n` zero bytes to the tail and durable-sync. Returns the starting logical offset. `n = 0` is a no-op. Useful for reserving space in the payload without a caller-supplied buffer.
+- **`zero` method (Rust, `set` feature) / `bstack_zero` (C, `BSTACK_FEATURE_SET`)**: Overwrite `n` bytes with zeros in place at a logical offset and durable-sync, without changing the file size. `n = 0` is a no-op; errors if `offset + n` exceeds the payload size.
 - **`discard` method (Rust) / `bstack_discard` (C)**: Remove the last `n` bytes from the tail and durable-sync, without reading or returning the removed bytes. Equivalent to `pop`/`bstack_pop` but skips the buffer read, avoiding any allocation or copy. `n = 0` is a no-op; exceeding the payload size returns an error.
 
 ## [0.1.3] - 2026-04-20

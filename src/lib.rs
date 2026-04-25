@@ -63,9 +63,11 @@
 //! | Operation | Syscall sequence |
 //! |-----------|-----------------|
 //! | `push` | `lseek(END)` → `write(data)` → `lseek(8)` → `write(clen)` → `durable_sync` |
+//! | `extend` | `lseek(END)` → `set_len(new_end)` → `lseek(8)` → `write(clen)` → `durable_sync` |
 //! | `pop`, `pop_into` | `lseek` → `read` → `ftruncate` → `lseek(8)` → `write(clen)` → `durable_sync` |
 //! | `discard` | `ftruncate` → `lseek(8)` → `write(clen)` → `durable_sync` |
 //! | `set` *(feature)* | `lseek(offset)` → `write(data)` → `durable_sync` |
+//! | `zero` *(feature)* | `lseek(offset)` → `write(zeros)` → `durable_sync` |
 //! | `peek`, `peek_into`, `get`, `get_into` | `pread(2)` on Unix; `ReadFile`+`OVERLAPPED` on Windows; `lseek` → `read` elsewhere (no sync — read-only) |
 //!
 //! **`durable_sync` on macOS** issues `fcntl(F_FULLFSYNC)`, which flushes the
@@ -120,8 +122,8 @@
 //!
 //! | Operation | Lock (Unix / Windows) | Lock (other) |
 //! |-----------|-----------------------|--------------|
-//! | `push`, `pop`, `pop_into`, `discard` | write | write |
-//! | `set` *(feature)* | write | write |
+//! | `push`, `extend`, `pop`, `pop_into`, `discard` | write | write |
+//! | `set`, `zero` *(feature)* | write | write |
 //! | `peek`, `peek_into`, `get`, `get_into` | **read** | write |
 //! | `len` | read | read |
 //!
@@ -183,7 +185,7 @@
 //!
 //! | Feature | Description |
 //! |---------|-------------|
-//! | `set`   | Enables [`BStack::set`] — in-place overwrite of existing payload bytes without changing the file size. |
+//! | `set`   | Enables [`BStack::set`] and [`BStack::zero`] — in-place overwrite of existing payload bytes (or with zeros) without changing the file size. |
 //!
 //! Enable with:
 //!

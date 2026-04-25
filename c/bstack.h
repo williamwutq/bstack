@@ -24,9 +24,10 @@
  * Thread safety
  * -------------
  * On Unix a pthread_rwlock protects each handle; on Windows an SRWLOCK is
- * used.  bstack_push / bstack_pop / bstack_discard / bstack_set hold a write
- * lock; bstack_peek / bstack_get / bstack_len hold a read lock and may run
- * concurrently with each other on both platforms.
+ * used.  bstack_push / bstack_extend / bstack_pop / bstack_discard /
+ * bstack_set / bstack_zero hold a write lock; bstack_peek / bstack_get /
+ * bstack_len hold a read lock and may run concurrently with each other on
+ * both platforms.
  *
  * Multi-process safety
  * --------------------
@@ -37,7 +38,7 @@
  *
  * Feature flags
  * -------------
- * Compile with -DBSTACK_FEATURE_SET to enable bstack_set.
+ * Compile with -DBSTACK_FEATURE_SET to enable bstack_set and bstack_zero.
  */
 
 typedef struct bstack bstack_t;

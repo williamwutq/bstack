@@ -72,6 +72,10 @@ impl BStack {
     /// An empty slice is valid and a no-op on disk.
     pub fn push(&self, data: &[u8]) -> io::Result<u64>;
 
+    /// Append `n` zero bytes and durable-sync.  Returns the starting logical offset.
+    /// `n = 0` is valid and a no-op on disk.
+    pub fn extend(&self, n: u64) -> io::Result<u64>;
+
     /// Remove and return the last `n` bytes, then durable-sync.
     /// `n = 0` is valid.  Errors if `n` exceeds the current payload size.
     pub fn pop(&self, n: u64) -> io::Result<Vec<u8>>;
@@ -91,6 +95,12 @@ impl BStack {
     /// current payload.  Requires the `set` feature.
     #[cfg(feature = "set")]
     pub fn set(&self, offset: u64, data: &[u8]) -> io::Result<()>;
+
+    /// Overwrite `n` bytes with zeros in place starting at logical `offset`.
+    /// Never changes the file size; errors if the write would exceed the
+    /// current payload.  `n = 0` is a no-op.  Requires the `set` feature.
+    #[cfg(feature = "set")]
+    pub fn zero(&self, offset: u64, n: u64) -> io::Result<()>;
 
     /// Copy all bytes from `offset` to the end of the payload.
     /// `offset == len()` returns an empty Vec.
@@ -216,6 +226,10 @@ and run concurrently with each other and with `peek`/`get` calls.
 `BStack::set(offset, data)` — in-place overwrite of existing payload bytes
 without changing the file size or the committed-length header.
 
+`BStack::zero(offset, n)` — in-place overwrite of `n` bytes with zeros,
+without changing the file size or the committed-length header.  Equivalent to
+`set` with a zero-filled buffer but avoids a caller-supplied allocation.
+
 ```toml
 [dependencies]
 bstack = { version = "0.1", features = ["set"] }
@@ -235,7 +249,7 @@ file offset 0        offset 16       16+n0          EOF
 ```
 
 * **`magic`** — 8 bytes: `BSTK` + major(1 B) + minor(1 B) + patch(1 B) + reserved(1 B).
-  This version writes `BSTK\x00\x01\x02\x00` (0.1.2).  `open` accepts any
+  This version writes `BSTK\x00\x01\x03\x00` (0.1.3).  `open` accepts any
   0.1.x file (first 6 bytes `BSTK\x00\x01`) and rejects a different major or
   minor as incompatible.
 * **`clen`** — little-endian `u64` recording the last successfully committed
@@ -251,9 +265,11 @@ All user-visible offsets (returned by `push`, accepted by `peek`/`get`) are
 | Operation                              | Sequence                                                                           |
 |----------------------------------------|------------------------------------------------------------------------------------|
 | `push`                                 | `lseek(END)` → `write(data)` → `lseek(8)` → `write(clen)` → sync                   |
+| `extend`                               | `lseek(END)` → `set_len(new_end)` → `lseek(8)` → `write(clen)` → sync              |
 | `pop`, `pop_into`                      | `lseek` → `read` → `ftruncate` → `lseek(8)` → `write(clen)` → sync                 |
 | `discard`                              | `ftruncate` → `lseek(8)` → `write(clen)` → sync                                    |
 | `set` *(feature)*                      | `lseek(offset)` → `write(data)` → sync                                             |
+| `zero` *(feature)*                     | `lseek(offset)` → `write(zeros)` → sync                                            |
 | `peek`, `peek_into`, `get`, `get_into` | `pread(2)` on Unix; `ReadFile`+`OVERLAPPED` on Windows; `lseek` → `read` elsewhere |
 
 **`durable_sync` on macOS** issues `fcntl(F_FULLFSYNC)`.  Unlike `fdatasync`,
@@ -309,12 +325,12 @@ maps to `io::ErrorKind::WouldBlock` in Rust).  The lock is released when the
 
 `BStack` wraps the file in a `RwLock<File>`.
 
-| Operation                              | Lock (Unix / Windows) | Lock (other) |
-|----------------------------------------|-----------------------|--------------|
-| `push`, `pop`, `pop_into`, `discard`   | write                 | write        |
-| `set` *(feature)*                      | write                 | write        |
-| `peek`, `peek_into`, `get`, `get_into` | **read**              | write        |
-| `len`                                  | read                  | read         |
+| Operation                                      | Lock (Unix / Windows) | Lock (other) |
+|------------------------------------------------|-----------------------|--------------|
+| `push`, `extend`, `pop`, `pop_into`, `discard` | write                 | write        |
+| `set`, `zero` *(feature)*                      | write                 | write        |
+| `peek`, `peek_into`, `get`, `get_into`         | **read**              | write        |
+| `len`                                          | read                  | read         |
 
 On Unix and Windows, `peek`, `peek_into`, `get`, and `get_into` use a
 cursor-safe positional read (`pread(2)` / `read_exact_at` on Unix; `ReadFile`
