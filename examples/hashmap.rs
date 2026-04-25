@@ -22,23 +22,29 @@
 //!
 //! The `set` feature is required for in-place slot updates in `index.bstack`.
 
-#[cfg(not(feature = "set"))]
-compile_error!("the `hashmap` example requires `--features set`");
-
+#[cfg(feature = "set")]
 use bstack::BStack;
+#[cfg(feature = "set")]
 use std::io;
+#[cfg(feature = "set")]
 use std::path::Path;
 
+#[cfg(feature = "set")]
 const SLOTS: u64 = 256;
+#[cfg(feature = "set")]
 const SLOT_SIZE: u64 = 8; // one u64 per slot
+#[cfg(feature = "set")]
 const TABLE_BYTES: usize = (SLOTS * SLOT_SIZE) as usize; // 2 048
+#[cfg(feature = "set")]
 const EMPTY: u64 = u64::MAX; // 0xFF…FF — initial table fill
 
+#[cfg(feature = "set")]
 struct PersistentHashMap {
     strings: BStack,
     index: BStack,
 }
 
+#[cfg(feature = "set")]
 impl PersistentHashMap {
     fn open(strings_path: impl AsRef<Path>, index_path: impl AsRef<Path>) -> io::Result<Self> {
         let strings = BStack::open(strings_path)?;
