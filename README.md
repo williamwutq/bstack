@@ -283,19 +283,19 @@ Produced by `BStackAllocator::alloc`; consumed by `realloc` and `dealloc`.
 
 Key methods:
 
-| Method | Description |
-|--------|-------------|
-| `read()` | Read the entire region into a new `Vec<u8>` |
-| `read_into(buf)` | Read into a caller-supplied buffer |
-| `read_range_into(start, buf)` | Read a sub-range into a caller-supplied buffer |
-| `subslice(start, end)` | Narrow to a sub-range (relative offsets) |
-| `subslice_range(range)` | Narrow to a sub-range using a `Range<u64>` |
-| `reader()` | Cursor-based `BStackSliceReader` at position 0 |
-| `reader_at(offset)` | Cursor-based `BStackSliceReader` at `offset` |
-| `write(data)` *(feature `set`)* | Overwrite the beginning of the region in place |
-| `write_range(start, data)` *(feature `set`)* | Overwrite a sub-range in place |
-| `zero()` *(feature `set`)* | Zero the entire region in place |
-| `zero_range(start, n)` *(feature `set`)* | Zero a sub-range in place |
+| Method                                       | Description                                    |
+|----------------------------------------------|------------------------------------------------|
+| `read()`                                     | Read the entire region into a new `Vec<u8>`    |
+| `read_into(buf)`                             | Read into a caller-supplied buffer             |
+| `read_range_into(start, buf)`                | Read a sub-range into a caller-supplied buffer |
+| `subslice(start, end)`                       | Narrow to a sub-range (relative offsets)       |
+| `subslice_range(range)`                      | Narrow to a sub-range using a `Range<u64>`     |
+| `reader()`                                   | Cursor-based `BStackSliceReader` at position 0 |
+| `reader_at(offset)`                          | Cursor-based `BStackSliceReader` at `offset`   |
+| `write(data)` *(feature `set`)*              | Overwrite the beginning of the region in place |
+| `write_range(start, data)` *(feature `set`)* | Overwrite a sub-range in place                 |
+| `zero()` *(feature `set`)*                   | Zero the entire region in place                |
+| `zero_range(start, n)` *(feature `set`)*     | Zero a sub-range in place                      |
 
 ### `BStackSliceReader<'a, A>`
 
@@ -307,13 +307,13 @@ Constructed via `BStackSlice::reader()` or `BStackSlice::reader_at(offset)`.
 
 The reference bump allocator.  Regions are appended sequentially to the tail.
 
-| Operation | Underlying call | Crash-safe |
-|-----------|-----------------|-----------|
-| `alloc` | `BStack::extend` | yes |
-| `realloc` grow | `BStack::extend` | yes |
-| `realloc` shrink | `BStack::discard` | yes |
-| `dealloc` (tail) | `BStack::discard` | yes |
-| `dealloc` (non-tail) | no-op | yes |
+| Operation            | Underlying call   | Crash-safe |
+|----------------------|-------------------|------------|
+| `alloc`              | `BStack::extend`  | yes        |
+| `realloc` grow       | `BStack::extend`  | yes        |
+| `realloc` shrink     | `BStack::discard` | yes        |
+| `dealloc` (tail)     | `BStack::discard` | yes        |
+| `dealloc` (non-tail) | no-op             | yes        |
 
 `realloc` returns `io::ErrorKind::Unsupported` for non-tail slices.
 
