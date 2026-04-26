@@ -20,6 +20,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **Cross-type comparisons**: `PartialEq` and `PartialOrd` are defined between `BStackSliceReader` and `BStackSliceWriter` using the same `(abs_pos, len)` key (requires `set`). Both cursor types also implement `PartialEq<BStackSlice>` (cursor position ignored).
   - **`From` conversions**: `BStackSlice` ↔ `BStackSliceReader`, `BStackSlice` ↔ `BStackSliceWriter`, `BStackSliceReader` ↔ `BStackSliceWriter`.
   - **`LinearBStackAllocator`**: Reference bump allocator that appends regions sequentially. `realloc` is O(1) for the tail allocation and returns `Unsupported` for non-tail slices. `dealloc` reclaims the tail via `BStack::discard`; non-tail deallocations are a no-op. Every operation maps to exactly one `BStack` call and is crash-safe by inheritance.
+  - **`FirstFitBStackAllocator`** (requires `alloc` + `set`): Persistent first-fit free-list allocator. Freed regions are tracked on disk in a doubly-linked intrusive free list and reused for future allocations so the file does not grow without bound.
+    - **On-disk layout**: the first 48 payload bytes are an allocator header (`ALFF` magic + flags + `free_head`); the arena follows immediately. Each block is `[BlockHeader 16 B | payload | BlockFooter 8 B]`; free blocks store `next_free`/`prev_free` in the first 16 bytes of their payload. Minimum payload size is 16 bytes; all sizes are 8-byte aligned.
+    - **Allocation**: first-fit walk of the free list; splits found blocks from the back when the remainder would be ≥ 16 bytes; extends the stack when no free block fits.
+    - **Coalescing**: `dealloc` merges adjacent free neighbours (right then left). Merged blocks that reach the stack tail are discarded. A cascade check removes any further free blocks newly exposed at the tail, maintaining the invariant that the tail block is always allocated.
+    - **Crash consistency**: multi-step operations bracket free-list mutations with a `recovery_needed` flag. On `new`, if `recovery_needed` is set, a linear O(n) scan rebuilds the free list from `is_free` header flags (stored pointers are not trusted) and truncates any partial tail block.
+    - **`realloc`**: O(1) in-place grow/shrink for the tail block; copy-and-move for non-tail blocks using an existing free block or a new stack extension; same-block optimisation when the existing block already fits.
 
 ## [0.1.4] - 2026-04-25
 
