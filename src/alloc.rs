@@ -1914,7 +1914,7 @@ impl BStackAllocator for FirstFitBStackAllocator {
             // no-split uses the found block in full from the front.
             // Must mirror unlink_block's split threshold exactly.
             let payload = if block_found.1
-                > aligned_len + Self::BLOCK_FOOTER_SIZE + Self::MIN_BLOCK_PAYLOAD_SIZE
+                >= aligned_len + Self::BLOCK_OVERHEAD_SIZE + Self::MIN_BLOCK_PAYLOAD_SIZE
             {
                 block_found.0 + block_found.1 - aligned_len
             } else {
@@ -2192,8 +2192,11 @@ impl BStackAllocator for FirstFitBStackAllocator {
                 aligned_new_len,
                 data_buf.as_mut_slice(),
             )?;
+            // Must mirror unlink_block's split threshold exactly.  The split puts the
+            // allocated block at the back of the found block; without a split, the found
+            // block is used in full from the front.
             let new_payload = if block_found.1
-                > aligned_new_len + Self::BLOCK_FOOTER_SIZE + Self::MIN_BLOCK_PAYLOAD_SIZE
+                >= aligned_new_len + Self::BLOCK_OVERHEAD_SIZE + Self::MIN_BLOCK_PAYLOAD_SIZE
             {
                 block_found.0 + block_found.1 - aligned_new_len
             } else {
