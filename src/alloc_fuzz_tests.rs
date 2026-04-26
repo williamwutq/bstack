@@ -105,6 +105,7 @@ mod alloc_fuzz_tests {
                     let new_size = rng.random_range(MIN_PAYLOAD..=1024);
                     // Read the old block contents for verification after realloc.
                     let buf = block.read().unwrap();
+                    let old_len = buf.len() as u64;
 
                     if let Some(new_block) = alloc.realloc(block, new_size).ok() {
                         // Verify the old contents are intact after realloc.
@@ -115,6 +116,28 @@ mod alloc_fuzz_tests {
                             assert_eq!(
                                 *chunk.1, expected_byte,
                                 "Data corruption detected during realloc of block ID {id} at index {idx}"
+                            );
+                        }
+
+                        // Verify that the new block, up to size of the old block, still contains the correct data.
+                        let new_buf = new_block.read().unwrap();
+                        let verify_len = old_len.min(new_size) as usize;
+                        for chunk in new_buf.iter().take(verify_len).enumerate() {
+                            let idx = chunk.0 as u64;
+                            let byte_idx = idx % 8;
+                            let expected_byte = ((id >> (byte_idx * 8)) & 0xFF) as u8;
+                            assert_eq!(
+                                *chunk.1, expected_byte,
+                                "Data corruption detected in new block after realloc of block ID {id} at index {idx}"
+                            );
+                        }
+
+                        // Veryify that the new block, beyond the old block size, is zero-initialised.
+                        for chunk in new_buf.iter().enumerate().skip(verify_len) {
+                            let idx = chunk.0 as u64;
+                            assert_eq!(
+                                *chunk.1, 0,
+                                "New block not zero-initialised after realloc of block ID {id} at index {idx}"
                             );
                         }
 
@@ -183,8 +206,7 @@ mod alloc_fuzz_tests {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
         let pid = std::process::id();
-        let path = std::env::temp_dir()
-            .join(format!("bstack_ff_fuzz_reopen_{pid}_{id}.bin"));
+        let path = std::env::temp_dir().join(format!("bstack_ff_fuzz_reopen_{pid}_{id}.bin"));
         let _guard = Guard(path.clone());
 
         // Create the file.
@@ -202,8 +224,7 @@ mod alloc_fuzz_tests {
 
         for session in 0..SESSIONS {
             // Open allocator for this session.
-            let alloc =
-                FirstFitBStackAllocator::new(BStack::open(&path).unwrap()).unwrap();
+            let alloc = FirstFitBStackAllocator::new(BStack::open(&path).unwrap()).unwrap();
 
             // Reconstruct handles and verify data for every live allocation.
             for (idx, rec) in live.iter().enumerate() {
@@ -230,7 +251,11 @@ mod alloc_fuzz_tests {
                             let mut buf = vec![0u8; len as usize];
                             fill(&mut buf, pat);
                             s.write(&buf).unwrap();
-                            live.push(Rec { start: s.start(), len, pattern: pat });
+                            live.push(Rec {
+                                start: s.start(),
+                                len,
+                                pattern: pat,
+                            });
                         }
                     }
                     // Realloc a random live block.
@@ -250,7 +275,11 @@ mod alloc_fuzz_tests {
                             let mut new_buf = vec![0u8; new_len as usize];
                             fill(&mut new_buf, pat);
                             s2.write(&new_buf).unwrap();
-                            live[idx] = Rec { start: s2.start(), len: new_len, pattern: pat };
+                            live[idx] = Rec {
+                                start: s2.start(),
+                                len: new_len,
+                                pattern: pat,
+                            };
                         }
                     }
                     // Deallocate a random live block.
