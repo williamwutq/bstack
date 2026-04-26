@@ -278,13 +278,16 @@ bstack = { version = "0.1", features = ["set"] }
 
 ### `alloc`
 
-Enables `BStackAllocator`, `BStackSlice`, `BStackSliceReader`, and
-`LinearBStackAllocator` — a region-management layer on top of `BStack`.
+Enables the region-management layer on top of `BStack`:
+`BStackAllocator`, `BStackSlice`, `BStackSliceReader`, and
+`LinearBStackAllocator`.
 
 ```toml
 [dependencies]
 bstack = { version = "0.1", features = ["alloc"] }
-# In-place slice writes also need `set`:
+# In-place slice writes (BStackSliceWriter) also need `set`:
+bstack = { version = "0.1", features = ["alloc", "set"] }
+# FirstFitBStackAllocator requires both alloc and set:
 bstack = { version = "0.1", features = ["alloc", "set"] }
 ```
 
@@ -357,6 +360,88 @@ The reference bump allocator.  Regions are appended sequentially to the tail.
 | `dealloc` (non-tail) | no-op             | yes        |
 
 `realloc` returns `io::ErrorKind::Unsupported` for non-tail slices.
+
+### `FirstFitBStackAllocator` (`alloc + set` features)
+
+A persistent first-fit free-list allocator.  Freed regions are tracked on disk
+in a doubly-linked intrusive free list and reused for future allocations, so
+the file does not grow without bound.
+
+```toml
+[dependencies]
+bstack = { version = "0.1", features = ["alloc", "set"] }
+```
+
+#### On-disk layout
+
+The allocator occupies the entire `BStack` payload.  The first 48 payload
+bytes are a header region, followed immediately by the block arena:
+
+```
+┌──────────────────────┬──────────────────────────────────────────────────┐
+│  reserved (16 B)     │ allocator header (32 B)                           │
+│  (custom use)        │ magic[8] | flags[4] | _reserved[4] | free_head[8] │
+└──────────────────────┴──────────────────────────────────────────────────┘
+^                      ^                                                   ^
+payload offset 0       offset 16                                       offset 48
+                                                                     (arena start)
+```
+
+Every allocation in the arena is:
+
+```
+[ BlockHeader 16 B | payload (size bytes) | BlockFooter 8 B ]
+```
+
+* **BlockHeader** — `size: u64`, `flags: u32` (bit 0 = `is_free`), `_reserved: u32`.
+* **BlockFooter** — `size: u64` (mirrors the header, used for leftward coalescing).
+* **Free blocks** additionally store `next_free: u64` and `prev_free: u64` in the
+  first 16 bytes of their payload, forming an intrusive doubly-linked list.
+
+The minimum allocation size is 16 bytes; all sizes are rounded up to a multiple of 8.
+
+#### Allocation policy
+
+`alloc` walks the free list from the head and takes the first block whose size
+≥ the aligned request (**first-fit**).  If the found block is large enough to
+yield a remainder of at least 16 bytes after splitting, the remainder is left
+as a new free block; the allocated portion is carved from the back.  When no
+free block fits, the arena is extended by pushing a new block onto the stack.
+
+#### Coalescing
+
+`dealloc` merges the freed block with adjacent free neighbours (right then
+left).  If the merged block reaches the stack tail it is discarded immediately.
+A cascade check removes any further free blocks newly exposed at the tail,
+maintaining the invariant that the tail block is always allocated.
+
+#### Crash consistency
+
+Multi-step operations set a `recovery_needed` flag in the allocator header
+before mutating the free list and clear it after all writes complete.  On the
+next `FirstFitBStackAllocator::new`, if `recovery_needed` is set, a single
+linear scan of the arena rebuilds the free list from the `is_free` flags in
+block headers — stored pointer values are not trusted.  Any partial tail block
+is also truncated.
+
+#### Example
+
+```rust
+use bstack::{BStack, BStackAllocator, FirstFitBStackAllocator};
+
+let alloc = FirstFitBStackAllocator::new(BStack::open("data.bstack")?)?;
+
+let a = alloc.alloc(64)?;
+let b = alloc.alloc(64)?;
+a.write(b"hello world")?;
+
+alloc.dealloc(a)?;        // freed; slot available for reuse
+
+let c = alloc.alloc(64)?; // reuses a's slot
+assert_eq!(c.start(), a.start());
+
+let stack = alloc.into_stack();
+```
 
 ### Lifetime model
 

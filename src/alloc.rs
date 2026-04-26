@@ -2,7 +2,7 @@
 //!
 //! # Overview
 //!
-//! This module provides two public items:
+//! This module provides the following public items:
 //!
 //! * [`BStackSlice`] — a lifetime-coupled handle to a contiguous region of a
 //!   [`BStack`] payload.  It is a lightweight `Copy` value (one reference plus
@@ -15,8 +15,17 @@
 //!   [`realloc`](BStackAllocator::realloc), [`dealloc`](BStackAllocator::dealloc),
 //!   and [`into_stack`](BStackAllocator::into_stack).
 //!
-//! [`LinearBStackAllocator`] is the reference implementation: a simple bump
-//! allocator that always appends to the tail.
+//! * [`LinearBStackAllocator`] — the reference bump allocator that always
+//!   appends to the tail.  Every operation maps to a single [`BStack`] call
+//!   and is crash-safe by inheritance.  `dealloc` of a non-tail slice is a
+//!   no-op; space is only reclaimed when the tail slice is freed.
+//!
+//! * [`FirstFitBStackAllocator`] — a persistent first-fit free-list allocator
+//!   (requires both `alloc` **and** `set` features).  Freed regions are tracked
+//!   on disk in a doubly-linked intrusive free list and reused for future
+//!   allocations, so on-disk size does not grow without bound.  Adjacent free
+//!   blocks are coalesced automatically on `dealloc`.  A `recovery_needed` flag
+//!   enables automatic free-list reconstruction after a crash.
 //!
 //! # Lifetime model
 //!
@@ -37,13 +46,21 @@
 //!
 //! # Feature flags
 //!
-//! This entire module requires the `alloc` Cargo feature:
+//! The `alloc` Cargo feature enables this entire module, including
+//! [`BStackAllocator`], [`BStackSlice`], [`BStackSliceReader`], and
+//! [`LinearBStackAllocator`]:
 //!
 //! ```toml
 //! bstack = { version = "0.1", features = ["alloc"] }
 //! ```
 //!
-//! In-place slice writes additionally require the `set` feature:
+//! In-place slice writes ([`BStackSliceWriter`]) additionally require `set`:
+//!
+//! ```toml
+//! bstack = { version = "0.1", features = ["alloc", "set"] }
+//! ```
+//!
+//! [`FirstFitBStackAllocator`] requires **both** `alloc` and `set`:
 //!
 //! ```toml
 //! bstack = { version = "0.1", features = ["alloc", "set"] }
@@ -1148,6 +1165,108 @@ const ALFF_MAGIC: [u8; 8] = *b"ALFF\x00\x01\x00\x00";
 #[cfg(feature = "set")]
 const ALFF_MAGIC_PREFIX: [u8; 6] = *b"ALFF\x00\x01";
 
+/// A persistent first-fit free-list allocator implementing [`BStackAllocator`]
+/// on top of a [`BStack`].
+///
+/// Unlike [`LinearBStackAllocator`], freed regions are tracked on disk in a
+/// doubly-linked intrusive free list and reused for future allocations, so the
+/// file does not grow without bound.
+///
+/// # On-disk layout
+///
+/// The allocator occupies the entire `BStack` payload.  The first 48 payload
+/// bytes are the header region, followed immediately by the block arena:
+///
+/// ```text
+/// ┌─────────────────────┬──────────────────────────────────────────────────┐
+/// │  reserved (16 B)    │ allocator header (32 B)                          │
+/// │  (custom use)       │ magic[8] | flags[4] | _reserved[4] | free_head[8]│
+/// └─────────────────────┴──────────────────────────────────────────────────┘
+///                        ^                                                 ^
+///                   payload offset 16                               offset 48 (arena start)
+/// ```
+///
+/// Every block in the arena is laid out as:
+///
+/// ```text
+/// [ BlockHeader 16 B | payload (size bytes) | BlockFooter 8 B ]
+/// ```
+///
+/// **BlockHeader** (16 bytes) — `size: u64`, `flags: u32` (bit 0 = `is_free`), `_reserved: u32`.
+/// **BlockFooter** (8 bytes) — `size: u64` (mirrors the header, used for leftward coalescing).
+/// **Free blocks** additionally store `next_free: u64` and `prev_free: u64` in the first
+/// 16 bytes of their payload, forming an intrusive doubly-linked list.
+///
+/// # Minimum allocation size
+///
+/// Allocations smaller than 16 bytes are rounded up to 16.  All sizes are also
+/// rounded up to a multiple of 8, so the first 16 bytes of every free block's
+/// payload are always available for the free-list pointers.
+///
+/// # Free-list policy
+///
+/// The free list is sorted by insertion order (newest-first / LIFO prepend).
+/// `alloc` walks the list from the head and takes the **first block whose size
+/// ≥ the aligned request** (first-fit).  If the found block is large enough to
+/// split — remaining payload would be ≥ 16 bytes after accounting for the
+/// 24-byte per-block overhead — the remainder is kept as a new free block in
+/// place; the allocated portion is carved from the back.
+///
+/// # Coalescing
+///
+/// [`dealloc`](BStackAllocator::dealloc) merges the freed block with its
+/// immediate right and left neighbours if they are free.  If the resulting
+/// merged block extends to the stack tail it is discarded immediately.  A
+/// cascade check (`cascade_discard_free_tail`) then removes any further free
+/// blocks newly exposed at the tail, maintaining the invariant that the tail
+/// block is always allocated (or the arena is empty).  This invariant makes
+/// tail reclamation inside coalesce unnecessary.
+///
+/// # Crash consistency
+///
+/// Any operation that issues more than one [`BStack`] call sets the
+/// `recovery_needed` flag in the allocator header before mutating the free
+/// list and clears it after all writes complete.  On the next
+/// [`FirstFitBStackAllocator::new`] call, if `recovery_needed` is set, a
+/// single linear scan of the arena rebuilds the free list from the `is_free`
+/// flags in block headers — no stored pointer values are trusted.  Any
+/// partial block at the tail is also truncated.  Recovery is O(n) in arena
+/// size and runs at most once per crash event.
+///
+/// # Thread safety
+///
+/// `FirstFitBStackAllocator` is **neither `Send` nor `Sync`**.  Each instance
+/// must be confined to one thread.
+///
+/// # Feature flags
+///
+/// Requires both the `alloc` and `set` Cargo features:
+///
+/// ```toml
+/// bstack = { version = "0.1", features = ["alloc", "set"] }
+/// ```
+///
+/// # Example
+///
+/// ```no_run
+/// use bstack::{BStack, BStackAllocator, FirstFitBStackAllocator};
+///
+/// # fn main() -> std::io::Result<()> {
+/// let alloc = FirstFitBStackAllocator::new(BStack::open("data.bstack")?)?;
+///
+/// let a = alloc.alloc(64)?;
+/// let b = alloc.alloc(64)?;
+/// a.write(b"hello world")?;
+///
+/// alloc.dealloc(a)?;           // freed; coalesced if adjacent to another free block
+///
+/// let c = alloc.alloc(64)?;    // reuses a's slot
+/// assert_eq!(c.start(), a.start());
+///
+/// let stack = alloc.into_stack();
+/// # Ok(())
+/// # }
+/// ```
 #[cfg(feature = "set")]
 pub struct FirstFitBStackAllocator {
     stack: BStack,
@@ -1165,6 +1284,23 @@ impl FirstFitBStackAllocator {
     // OFFSET_SIZE(16) + magic(8) + flags(4) + _reserved(4) = 32
     const FREE_HEAD_OFFSET: u64 = Self::OFFSET_SIZE + 16;
 
+    /// Open or initialise a `FirstFitBStackAllocator` over `stack`.
+    ///
+    /// * **Empty stack** — writes the 48-byte allocator header (16 reserved
+    ///   bytes followed by the 32-byte header containing the magic, flags, and
+    ///   `free_head = 0`) and returns a ready allocator.
+    /// * **Non-empty stack** — validates the `ALFF 0.1.x` magic prefix.  If
+    ///   the `recovery_needed` flag is set (a crash occurred during a previous
+    ///   multi-step operation), runs recovery before returning: the arena is
+    ///   scanned linearly, any partial tail block is truncated, and the free
+    ///   list is rebuilt from the `is_free` flags in block headers.
+    ///
+    /// # Errors
+    ///
+    /// * [`io::ErrorKind::InvalidData`] — the existing payload does not start
+    ///   with a valid `ALFF 0.1.x` magic prefix (wrong file or wrong allocator
+    ///   type).
+    /// * Any [`io::Error`] propagated from the underlying [`BStack`] operations.
     pub fn new(stack: BStack) -> Result<Self, io::Error> {
         // Initialize empty stack with allocator header
         if stack.is_empty()? {
