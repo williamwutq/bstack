@@ -1785,30 +1785,32 @@ impl FirstFitBStackAllocator {
                 self.stack
                     .get_into(pos + Self::BLOCK_HEADER_SIZE + size, &mut outer_footer_buf)?;
                 let f = u64::from_le_bytes(outer_footer_buf);
-                if f != size && f >= Self::MIN_BLOCK_PAYLOAD_SIZE && f % 8 == 0
+                if f != size
+                    && f >= Self::MIN_BLOCK_PAYLOAD_SIZE
+                    && f % 8 == 0
                     && let Some(r) = size
                         .checked_sub(f)
                         .and_then(|d| d.checked_sub(Self::BLOCK_OVERHEAD_SIZE))
                         .filter(|&r| r >= Self::MIN_BLOCK_PAYLOAD_SIZE && r % 8 == 0)
-                    {
-                        let inner_footer_pos = pos + Self::BLOCK_HEADER_SIZE + r;
-                        let second_hdr_pos = inner_footer_pos + Self::BLOCK_FOOTER_SIZE;
-                        if second_hdr_pos + Self::BLOCK_HEADER_SIZE <= stack_len {
-                            let mut inner_footer_buf = [0u8; 8];
-                            let mut second_size_buf = [0u8; 8];
-                            self.stack
-                                .get_into(inner_footer_pos, &mut inner_footer_buf)?;
-                            self.stack.get_into(second_hdr_pos, &mut second_size_buf)?;
-                            if u64::from_le_bytes(inner_footer_buf) == r
-                                && u64::from_le_bytes(second_size_buf) == f
-                            {
-                                // Confirmed partial split: update the header to the correct size.
-                                self.stack.set(pos, r.to_le_bytes().as_slice())?;
-                                size = r;
-                                block_total = r + Self::BLOCK_OVERHEAD_SIZE;
-                            }
+                {
+                    let inner_footer_pos = pos + Self::BLOCK_HEADER_SIZE + r;
+                    let second_hdr_pos = inner_footer_pos + Self::BLOCK_FOOTER_SIZE;
+                    if second_hdr_pos + Self::BLOCK_HEADER_SIZE <= stack_len {
+                        let mut inner_footer_buf = [0u8; 8];
+                        let mut second_size_buf = [0u8; 8];
+                        self.stack
+                            .get_into(inner_footer_pos, &mut inner_footer_buf)?;
+                        self.stack.get_into(second_hdr_pos, &mut second_size_buf)?;
+                        if u64::from_le_bytes(inner_footer_buf) == r
+                            && u64::from_le_bytes(second_size_buf) == f
+                        {
+                            // Confirmed partial split: update the header to the correct size.
+                            self.stack.set(pos, r.to_le_bytes().as_slice())?;
+                            size = r;
+                            block_total = r + Self::BLOCK_OVERHEAD_SIZE;
                         }
                     }
+                }
             }
 
             if is_free {
