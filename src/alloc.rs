@@ -66,7 +66,26 @@
 //! bstack = { version = "0.1", features = ["alloc", "set"] }
 //! ```
 //!
-//! # Realloc contract for slices
+//! # Realloc and dealloc: slice origin requirement
+//!
+//! [`BStackAllocator::realloc`] and [`BStackAllocator::dealloc`] are only
+//! guaranteed to work correctly when the supplied [`BStackSlice`] was returned
+//! directly by [`BStackAllocator::alloc`] or by a previous call to
+//! [`BStackAllocator::realloc`] on the **same allocator instance**.
+//!
+//! Passing an *arbitrary* sub-slice — obtained through
+//! [`BStackSlice::subslice`], [`BStackSlice::subslice_range`], or a manually
+//! constructed [`BStackSlice::new`] — is **not supported** and may silently
+//! corrupt the allocator's internal state (e.g. corrupting block headers,
+//! writing free-list pointers into live data, or double-freeing memory).
+//!
+//! If you need to store a slice handle across a session boundary (e.g. after
+//! closing and reopening the file), serialise the `(start, len)` fields as raw
+//! `u64` values and reconstruct the full slice via [`BStackSlice::new`] only
+//! for I/O calls such as [`BStackSlice::read`] or [`BStackSlice::write`] — not
+//! for passing back to `realloc` or `dealloc`.  Only the original handle
+//! returned by the allocator carries the correct block-level metadata implied
+//! by its offset and length.
 //!
 //! [`BStack`] only grows and shrinks at the tail.  Resizing the **last**
 //! (tail) allocation is O(1).  Resizing a **non-tail** allocation cannot be
@@ -996,6 +1015,15 @@ pub trait BStackAllocator: Sized {
     /// The lifetime `'a` ties the returned slice to the same borrow as the
     /// input slice and the allocator.
     ///
+    /// # Slice origin requirement
+    ///
+    /// `slice` **must** be a handle that was returned directly by [`alloc`](Self::alloc)
+    /// or by a prior call to [`realloc`](Self::realloc) on this same allocator
+    /// instance.  Passing an arbitrary sub-slice obtained via
+    /// [`BStackSlice::subslice`], [`BStackSlice::subslice_range`], or a
+    /// manually constructed [`BStackSlice::new`] is not supported and may
+    /// corrupt the allocator's internal state.
+    ///
     /// # Errors
     ///
     /// Propagates any [`io::Error`] from underlying operations, including
@@ -1013,6 +1041,15 @@ pub trait BStackAllocator: Sized {
     /// it.
     ///
     /// After calling `dealloc`, `slice` must not be used for further I/O.
+    ///
+    /// # Slice origin requirement
+    ///
+    /// `slice` **must** be a handle that was returned directly by [`alloc`](Self::alloc)
+    /// or by [`realloc`](Self::realloc) on this same allocator instance.
+    /// Passing an arbitrary sub-slice obtained via [`BStackSlice::subslice`],
+    /// [`BStackSlice::subslice_range`], or a manually constructed
+    /// [`BStackSlice::new`] is not supported and may corrupt the allocator's
+    /// internal state.
     ///
     /// # Errors
     ///

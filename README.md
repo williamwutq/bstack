@@ -325,6 +325,16 @@ A lightweight `Copy` handle — one `&'a A` reference plus two `u64` fields
 (`offset`, `len`) — to a contiguous region of the allocator's `BStack`.
 Produced by `BStackAllocator::alloc`; consumed by `realloc` and `dealloc`.
 
+> **Slice origin requirement.** `realloc` and `dealloc` are only guaranteed to
+> work correctly with a slice that was returned directly by `alloc` or by a
+> prior call to `realloc` on the **same allocator instance**.  Passing an
+> arbitrary sub-slice obtained via `subslice`, `subslice_range`, or a manually
+> constructed `BStackSlice::new` is not supported and may silently corrupt the
+> allocator's internal state.  If you need to preserve a slice handle across a
+> file reopen, serialise the raw `(start, len)` fields and reconstruct the
+> slice via `BStackSlice::new` only for read/write I/O — never pass a
+> reconstructed slice back to `realloc` or `dealloc`.
+
 Key methods:
 
 | Method                                       | Description                                    |
