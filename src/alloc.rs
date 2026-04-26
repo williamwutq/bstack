@@ -1254,48 +1254,132 @@ impl FirstFitBStackAllocator {
         len.max(Self::MIN_BLOCK_PAYLOAD_SIZE).next_multiple_of(8)
     }
 
+    /// Remove a free block from the free list by updating its neighbours' pointers.
+    /// Does not touch the block's own header or payload.
+    fn unlink_from_free_list(&self, payload_start: u64) -> io::Result<()> {
+        let mut ptrs = [0u8; 16];
+        self.stack.get_into(payload_start, &mut ptrs)?;
+        let next = u64::from_le_bytes(ptrs[0..8].try_into().unwrap());
+        let prev = u64::from_le_bytes(ptrs[8..16].try_into().unwrap());
+        if prev != 0 {
+            self.stack.set(prev, &next.to_le_bytes())?;
+        } else {
+            self.stack
+                .set(Self::FREE_HEAD_OFFSET, &next.to_le_bytes())?;
+        }
+        if next != 0 {
+            self.stack.set(next + 8, &prev.to_le_bytes())?;
+        }
+        Ok(())
+    }
+
     fn add_to_free_list(&self, block_start: u64) -> io::Result<()> {
-        // Add the block at block_start to the head of the free list.
-        // This involves updating the block's header to mark it as free and point to the current head,
-        // and updating the current head's prev pointer (if it exists) to point back to the new block.
-        // Finally, update the free list head in the allocator header to point to the new block.
+        // Add the block at block_start to the head of the free list, coalescing adjacent free
+        // neighbours first. This involves:
+        //   1. Marking the block as free (crash before coalescing: recovery finds it as free).
+        //   2. Absorbing the right neighbour if it is free (right coalesce).
+        //   3. Merging into the left neighbour if it is free (left coalesce).
+        //   4. Tail reclamation: if the merged block ends at the stack tail, discard it entirely.
+        //   5. Otherwise, prepend the merged block to the free list.
 
         // Current free list:
         // free_head --------------> next -> ...
         // free_head <-------------- next <- ...
 
-        // Read current free_head — becomes the new block's next_free
+        let stack_len = self.stack.len()?;
+        let arena_start = Self::OFFSET_SIZE + Self::HEADER_SIZE;
+        let block_header_start = block_start - Self::BLOCK_HEADER_SIZE;
+
+        // Read the current block's payload size from its header
+        let mut size_buf = [0u8; 8];
+        self.stack.get_into(block_header_start, &mut size_buf)?;
+        let mut size = u64::from_le_bytes(size_buf);
+        let mut result_header_start = block_header_start;
+
+        // Mark block as free early so recovery can find it even if we crash mid-coalesce
+        self.stack
+            .set(block_header_start + 8, &1u32.to_le_bytes())?;
+
+        // Coalesce right: absorb the immediately following block if it is free
+        let next_header = block_header_start + Self::BLOCK_OVERHEAD_SIZE + size;
+        if next_header + Self::BLOCK_HEADER_SIZE <= stack_len {
+            let mut next_hdr = [0u8; 16];
+            self.stack.get_into(next_header, &mut next_hdr)?;
+            let next_size = u64::from_le_bytes(next_hdr[0..8].try_into().unwrap());
+            if next_hdr[8] & 1 != 0
+                && next_size >= Self::MIN_BLOCK_PAYLOAD_SIZE
+                && next_size % 8 == 0
+                && next_header + Self::BLOCK_OVERHEAD_SIZE + next_size <= stack_len
+            {
+                self.unlink_from_free_list(next_header + Self::BLOCK_HEADER_SIZE)?;
+                size += next_size + Self::BLOCK_OVERHEAD_SIZE;
+            }
+        }
+
+        // Coalesce left: merge into the immediately preceding block if it is free.
+        // Use its footer (8 bytes before our header) to locate its header, then cross-check.
+        if block_header_start > arena_start {
+            let mut prev_footer_buf = [0u8; 8];
+            self.stack.get_into(
+                block_header_start - Self::BLOCK_FOOTER_SIZE,
+                &mut prev_footer_buf,
+            )?;
+            let prev_size = u64::from_le_bytes(prev_footer_buf);
+            if prev_size >= Self::MIN_BLOCK_PAYLOAD_SIZE
+                && prev_size % 8 == 0
+                && let Some(prev_header) = block_header_start
+                    .checked_sub(prev_size + Self::BLOCK_OVERHEAD_SIZE)
+                    .filter(|&h| h >= arena_start)
+            {
+                let mut prev_hdr = [0u8; 16];
+                self.stack.get_into(prev_header, &mut prev_hdr)?;
+                let prev_hdr_size = u64::from_le_bytes(prev_hdr[0..8].try_into().unwrap());
+                // Cross-check: header size must match footer size
+                if prev_hdr[8] & 1 != 0 && prev_hdr_size == prev_size {
+                    self.unlink_from_free_list(prev_header + Self::BLOCK_HEADER_SIZE)?;
+                    size += prev_size + Self::BLOCK_OVERHEAD_SIZE;
+                    result_header_start = prev_header;
+                }
+            }
+        }
+
+        let result_start = result_header_start + Self::BLOCK_HEADER_SIZE;
+
+        // Write the merged block's size into its header and footer
+        self.stack.set(result_header_start, &size.to_le_bytes())?;
+        self.stack.set(result_start + size, &size.to_le_bytes())?;
+
+        // Mark result block as free and write next_free = old_head, prev_free = 0 in one call.
+        // Writes flags(4) + reserved(4) + next_free(8) + prev_free(8) starting at result_start - 8.
+        // free_head <- result_block -> next
+        // free_head --------------------> next -> ...
+        // free_head <------------------- next <- ...
         let mut head_buf = [0u8; 8];
         self.stack.get_into(Self::FREE_HEAD_OFFSET, &mut head_buf)?;
         let next_block = u64::from_le_bytes(head_buf);
-
-        // Mark block as free and write next_free = old_head, prev_free = 0 in one call.
-        // Writes flags(4) + reserved(4) + next_free(8) + prev_free(8) starting at block_start - 8.
-        // free_head <- new_block -> next
-        // free_head --------------> next -> ...
-        // free_head <-------------- next <- ...
         let mut update_buf = [0u8; 24];
         update_buf[0..4].copy_from_slice(&1u32.to_le_bytes()); // is_free = 1
         update_buf[8..16].copy_from_slice(&next_block.to_le_bytes()); // next_free = old head
         // update_buf[4..8] = reserved = 0, update_buf[16..24] = prev_free = 0
         self.stack
-            .set(block_start - Self::BLOCK_HEADER_SIZE + 8, &update_buf)?;
+            .set(result_start - Self::BLOCK_HEADER_SIZE + 8, &update_buf)?;
 
-        // Update free_head to point to the new block.
-        // free_head <- new_block
-        // free_head -> new_block -> next -> ...
-        // free_head <-------------- next <- ...
-        // If this step fails, the free list is still consistent but the new block is orphaned
+        // Update free_head to point to the result block.
+        // free_head <- result_block
+        // free_head -> result_block -> next -> ...
+        // free_head <------------------ next <- ...
+        // If this step fails, the free list is still consistent but the result block is orphaned
         self.stack
-            .set(Self::FREE_HEAD_OFFSET, &block_start.to_le_bytes())?;
+            .set(Self::FREE_HEAD_OFFSET, &result_start.to_le_bytes())?;
 
-        // After adding new block:
-        // free_head -> new_block -> next -> ...
-        // free_head <- new_block <- next <- ...
-        // If this step fails, the forward links are still consistent but the backward link from next to new_block
+        // After adding result block:
+        // free_head -> result_block -> next -> ...
+        // free_head <- result_block <- next <- ...
+        // If this step fails, the forward links are still consistent but the backward link from next to result_block
         // is missing, which can be detected and fixed in recovery. This is similar to the unlink case in unlink_block
         if next_block != 0 {
-            self.stack.set(next_block + 8, &block_start.to_le_bytes())?;
+            self.stack
+                .set(next_block + 8, &result_start.to_le_bytes())?;
         }
 
         Ok(())
@@ -1454,6 +1538,54 @@ impl FirstFitBStackAllocator {
         }
     }
 
+    /// After discarding the tail block, cascade-discard any free blocks that are now the new tail.
+    ///
+    /// This maintains the invariant that no free block ever sits at the stack tail, which in turn
+    /// makes tail reclamation inside `add_to_free_list` impossible (and therefore omitted).
+    ///
+    /// Sets `recovery_needed` only if at least one cascade discard is required, and clears it
+    /// once after all iterations so the cost is one set + one clear regardless of cascade depth.
+    fn cascade_discard_free_tail(&self) -> io::Result<()> {
+        let arena_start = Self::OFFSET_SIZE + Self::HEADER_SIZE;
+        let mut needs_clear = false;
+        loop {
+            let tail = self.stack.len()?;
+            if tail <= arena_start {
+                break;
+            }
+            // Read the footer of the last block to get its size
+            let mut footer_buf = [0u8; 8];
+            self.stack
+                .get_into(tail - Self::BLOCK_FOOTER_SIZE, &mut footer_buf)?;
+            let sz = u64::from_le_bytes(footer_buf);
+            // Validate: size must be at least minimum, 8-aligned, and fit within the arena
+            let Some(hdr) = tail
+                .checked_sub(sz + Self::BLOCK_OVERHEAD_SIZE)
+                .filter(|&h| h >= arena_start && sz >= Self::MIN_BLOCK_PAYLOAD_SIZE && sz % 8 == 0)
+            else {
+                break;
+            };
+            // Cross-check: header size must match footer size and block must be free
+            let mut hdr_buf = [0u8; 16];
+            self.stack.get_into(hdr, &mut hdr_buf)?;
+            let hdr_size = u64::from_le_bytes(hdr_buf[0..8].try_into().unwrap());
+            if hdr_buf[8] & 1 == 0 || hdr_size != sz {
+                break;
+            }
+            // New tail is a free block; unlink it and discard it
+            if !needs_clear {
+                self.set_recovery_needed()?;
+                needs_clear = true;
+            }
+            self.unlink_from_free_list(hdr + Self::BLOCK_HEADER_SIZE)?;
+            self.stack.discard(sz + Self::BLOCK_OVERHEAD_SIZE)?;
+        }
+        if needs_clear {
+            self.clear_recovery_needed()?;
+        }
+        Ok(())
+    }
+
     fn recovery(&self) -> io::Result<()> {
         // Walk the stack and rebuild the free list in memory, then write it back to disk.
         // This is needed when the allocator detects corruption or an unclean shutdown.
@@ -1581,6 +1713,7 @@ impl BStackAllocator for FirstFitBStackAllocator {
         if slice.end().next_multiple_of(8) == current_tail - Self::BLOCK_FOOTER_SIZE {
             self.stack
                 .discard(slice.len().next_multiple_of(8) + Self::BLOCK_OVERHEAD_SIZE)?;
+            self.cascade_discard_free_tail()?;
             return Ok(());
         }
         self.set_recovery_needed()?;
