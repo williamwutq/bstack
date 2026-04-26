@@ -1959,6 +1959,51 @@ impl BStackAllocator for FirstFitBStackAllocator {
             return Ok(BStackSlice::new(self, slice.start(), new_len));
         }
 
+        // Special case: next block is free and can be merged in place to accommodate the new size.
+        // This avoids copying data.
+        let next_block = slice.start() + block_size + Self::BLOCK_OVERHEAD_SIZE;
+        if next_block <= self.stack.len()? - Self::BLOCK_FOOTER_SIZE - Self::MIN_BLOCK_PAYLOAD_SIZE
+        {
+            let mut next_hdr_buf = [0u8; 16];
+            self.stack
+                .get_into(next_block - Self::BLOCK_HEADER_SIZE, &mut next_hdr_buf)?;
+            let next_block_size = u64::from_le_bytes(next_hdr_buf[0..8].try_into().unwrap());
+            let next_block_is_free = next_hdr_buf[8] & 1 != 0;
+
+            // Validate: next_block_size must be ≥ minimum, 8-aligned, and large enough to hold
+            // the new size when merged with the current block, and free
+            if next_block_is_free
+                && next_block_size >= Self::MIN_BLOCK_PAYLOAD_SIZE
+                && next_block_size % 8 == 0
+                && block_size + Self::BLOCK_OVERHEAD_SIZE + next_block_size >= aligned_new_len
+            {
+                // Unlink the next block from the free list, then merge it into the current block
+                // by updating the current block's header and the merged block's footer.
+                self.set_recovery_needed()?;
+                self.unlink_from_free_list(next_block)?;
+                let merged_size = block_size + next_block_size;
+                self.stack.set(
+                    slice.start() - Self::BLOCK_HEADER_SIZE,
+                    &merged_size.to_le_bytes(),
+                )?;
+                // Zero and set the footer of the merged block in a single call
+                let mut zero_buff = vec![
+                    0u8;
+                    (next_block_size + Self::BLOCK_OVERHEAD_SIZE + Self::BLOCK_FOOTER_SIZE)
+                        as usize
+                ];
+                zero_buff[(next_block_size + Self::BLOCK_OVERHEAD_SIZE) as usize..]
+                    .copy_from_slice(&merged_size.to_le_bytes());
+                self.stack.set(slice.start() + block_size, &zero_buff)?;
+                self.clear_recovery_needed()?;
+
+                // TODO: if the merged block is now big enough to split, we can split it and add
+                // the remainder back to the free list,
+
+                return Ok(BStackSlice::new(self, slice.start(), new_len));
+            }
+        }
+
         // For non-tail blocks, we need to find a new block for the new size, copy the data, and free the old block.
         let block_found = self.find_large_enough_block(aligned_new_len)?;
         if block_found.0 != 0 {
