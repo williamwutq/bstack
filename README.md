@@ -378,10 +378,10 @@ The allocator occupies the entire `BStack` payload.  The first 48 payload
 bytes are a header region, followed immediately by the block arena:
 
 ```
-┌──────────────────────┬──────────────────────────────────────────────────┐
+┌──────────────────────┬───────────────────────────────────────────────────┐
 │  reserved (16 B)     │ allocator header (32 B)                           │
 │  (custom use)        │ magic[8] | flags[4] | _reserved[4] | free_head[8] │
-└──────────────────────┴──────────────────────────────────────────────────┘
+└──────────────────────┴───────────────────────────────────────────────────┘
 ^                      ^                                                   ^
 payload offset 0       offset 16                                       offset 48
                                                                      (arena start)
