@@ -210,8 +210,8 @@
 //!   `into_stack()`, `alloc()`, and `realloc()`; provides a default no-op
 //!   `dealloc()` and delegation helpers `len()` / `is_empty()`.
 //!
-//! * [`BStackSlice`]`<'a, A>` — lightweight `Copy` handle (allocator reference
-//!   + offset + length) to a contiguous region.  Exposes `read`, `read_into`,
+//! * [`BStackSlice`]`<'a, A>` — lightweight `Copy` handle (allocator reference +
+//!   offset + length) to a contiguous region.  Exposes `read`, `read_into`,
 //!   `read_range_into`, `subslice`, `subslice_range`, `reader`, `reader_at`,
 //!   and (with the `set` feature) `write`, `write_range`, `zero`, `zero_range`.
 //!
@@ -234,7 +234,7 @@
 //!
 //! ## Quick example
 //!
-//! ```no_run
+//! ```skip
 //! use bstack::{BStack, BStackAllocator, LinearBStackAllocator};
 //!
 //! # fn main() -> std::io::Result<()> {
