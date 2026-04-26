@@ -1975,9 +1975,14 @@ impl BStackAllocator for FirstFitBStackAllocator {
         let aligned_current_len = slice.len().next_multiple_of(8);
 
         // If the new length.next_multiple_of(8) is the same as the old length.next_multiple_of(8)
-        // just return the same slice since the block size is the same.
-        // This also covers the exact same length case, so we don't need a separate check for that.
+        // the block stays put.  When growing the user-visible len within the same alignment
+        // bucket (e.g. 17 → 20, both align to 24), bytes [slice.len(), new_len) may still
+        // hold stale data from a previous larger slice, so zero them in a single atomic write.
         if aligned_new_len == aligned_current_len {
+            if new_len > slice.len() {
+                self.stack
+                    .zero(slice.start() + slice.len(), new_len - slice.len())?;
+            }
             return Ok(BStackSlice::new(self, slice.start(), new_len));
         }
 
@@ -1993,9 +1998,14 @@ impl BStackAllocator for FirstFitBStackAllocator {
                 std::cmp::Ordering::Greater => {
                     // Extend payload by the delta; footer moves forward
                     self.stack.extend(aligned_new_len - aligned_current_len)?;
-                    // Zero the old footer bytes now absorbed into the payload
-                    self.stack
-                        .zero(slice.start() + aligned_current_len, Self::BLOCK_FOOTER_SIZE)?;
+                    // Zero from slice.len() through the old footer area.  The old footer
+                    // (8 bytes at aligned_current_len) is now absorbed into the new payload,
+                    // and bytes [slice.len(), aligned_current_len) may hold stale data from
+                    // a prior larger slice — both must be cleared in one atomic write.
+                    self.stack.zero(
+                        slice.start() + slice.len(),
+                        aligned_current_len + Self::BLOCK_FOOTER_SIZE - slice.len(),
+                    )?;
                     self.stack.set(
                         slice.start() - Self::BLOCK_HEADER_SIZE,
                         &aligned_new_len.to_le_bytes(),
@@ -2030,14 +2040,14 @@ impl BStackAllocator for FirstFitBStackAllocator {
         )?;
         let block_size = u64::from_le_bytes(block_size_buf.try_into().unwrap());
         if block_size >= aligned_new_len {
-            // The block is already big enough to hold the new size, but we need to zero
-            // betweem aligned_current_len and aligned_new_len if new_len is smaller than current_len
-            if aligned_new_len > aligned_current_len {
-                let zero_buf = vec![0u8; (aligned_new_len - aligned_current_len) as usize];
+            // The block is already big enough.  When growing past the previous user-visible
+            // len, zero bytes [slice.len(), new_len) in one atomic write — this covers both
+            // the gap [slice.len(), aligned_current_len) (potentially stale) and the
+            // newly-exposed range [aligned_current_len, new_len).
+            if new_len > slice.len() {
                 self.stack
-                    .set(slice.start() + aligned_current_len, &zero_buf)?;
+                    .zero(slice.start() + slice.len(), new_len - slice.len())?;
             }
-
             return Ok(BStackSlice::new(self, slice.start(), new_len));
         }
 
@@ -2059,6 +2069,18 @@ impl BStackAllocator for FirstFitBStackAllocator {
                 && next_block_size % 8 == 0
                 && block_size + Self::BLOCK_OVERHEAD_SIZE + next_block_size >= aligned_new_len
             {
+                // Pre-zero the stale bytes between the user-visible len and the existing
+                // block's payload end.  After the merge, those bytes become part of the
+                // larger user-visible slice and must be zero.  Done before set_recovery_needed
+                // because it is an idempotent single-write that doesn't change user-visible
+                // state (the bytes are not part of the input slice's len), so a crash here
+                // leaves the file in a fully consistent allocator state with no recovery
+                // needed.
+                if slice.len() < block_size {
+                    self.stack
+                        .zero(slice.start() + slice.len(), block_size - slice.len())?;
+                }
+
                 // Unlink the next block from the free list, then merge it into the current block.
                 self.set_recovery_needed()?;
                 self.unlink_from_free_list(next_block)?;
@@ -2152,8 +2174,11 @@ impl BStackAllocator for FirstFitBStackAllocator {
             // Found a big enough block at offset block_found. Remove it from the free list and return it.
             // If the block is much bigger than needed, split it and add the remainder back to the free list.
 
-            // Read old data into a buffer sized for the new block (extra bytes stay zero)
-            let copy_len = aligned_current_len.min(aligned_new_len);
+            // Copy only the user-visible bytes from the old block into the new block's
+            // buffer; bytes beyond `slice.len()` in the buffer stay at the zero-init from
+            // `vec!`, so the new block's payload past `slice.len()` is zero — matching
+            // extend/calloc semantics for newly-exposed bytes after realloc.
+            let copy_len = slice.len().min(aligned_new_len);
             let mut data_buf = vec![0u8; (Self::BLOCK_OVERHEAD_SIZE + aligned_new_len) as usize];
             self.stack.get_into(
                 slice.start(),
@@ -2174,19 +2199,13 @@ impl BStackAllocator for FirstFitBStackAllocator {
             } else {
                 block_found.0
             };
-            // Explicitly zero any extra bytes in the new block beyond the copied data
-            if aligned_new_len > aligned_current_len {
-                self.stack.zero(
-                    new_payload + aligned_current_len,
-                    aligned_new_len - aligned_current_len,
-                )?;
-            }
             self.add_to_free_list(slice.start())?;
             self.clear_recovery_needed()?;
             Ok(BStackSlice::new(self, new_payload, new_len))
         } else {
             // No free block fits; push the full new block in one call, then free the old one.
-            let copy_len = aligned_current_len.min(aligned_new_len) as usize;
+            // Copy only the user-visible bytes; the rest of `block_buf` stays zeroed.
+            let copy_len = (slice.len().min(aligned_new_len)) as usize;
             let mut block_buf = vec![0u8; (aligned_new_len + Self::BLOCK_OVERHEAD_SIZE) as usize];
             block_buf[..8].copy_from_slice(&aligned_new_len.to_le_bytes());
             self.stack.get_into(
