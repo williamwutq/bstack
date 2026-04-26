@@ -1598,7 +1598,7 @@ impl FirstFitBStackAllocator {
         // Where from Self::BLOCK_HEADER_SIZE to end - Self::BLOCK_FOOTER_SIZE is the content
         content_buffer: &mut [u8],
     ) -> io::Result<()> {
-        if found_size > requested_size + Self::BLOCK_OVERHEAD_SIZE + Self::MIN_BLOCK_PAYLOAD_SIZE {
+        if found_size >= requested_size + Self::BLOCK_OVERHEAD_SIZE + Self::MIN_BLOCK_PAYLOAD_SIZE {
             // The found block is big enough to split. Split it into an allocated block of the requested size
             // and a smaller free block for the remainder, and add the new free block back to the free list.
             // There is no need to change the pointers but only update block size
@@ -1756,11 +1756,11 @@ impl FirstFitBStackAllocator {
             // Read block header: size(8) + flags(4) + reserved(4)
             let mut hdr_buf = [0u8; 16];
             self.stack.get_into(pos, &mut hdr_buf)?;
-            let size = u64::from_le_bytes(hdr_buf[0..8].try_into().unwrap());
+            let mut size = u64::from_le_bytes(hdr_buf[0..8].try_into().unwrap());
             let is_free = hdr_buf[8] & 1 != 0;
 
             // Validate: size must be ≥ minimum, 8-aligned, and the full block must fit in the stack.
-            let block_total = match size.checked_add(Self::BLOCK_OVERHEAD_SIZE).filter(|&t| {
+            let mut block_total = match size.checked_add(Self::BLOCK_OVERHEAD_SIZE).filter(|&t| {
                 size >= Self::MIN_BLOCK_PAYLOAD_SIZE && size % 8 == 0 && pos + t <= stack_len
             }) {
                 Some(t) => t,
@@ -1770,6 +1770,46 @@ impl FirstFitBStackAllocator {
                     break;
                 }
             };
+
+            // Detect a partially-completed split: the header size H may still point past
+            // the inner footer to the outer footer of the second sub-block (value F < H).
+            // Validate the three-point pattern:
+            //   • footer at pos+HEADER+H        says F  (second sub-block's footer)
+            //   • footer at pos+HEADER+R        says R  (first sub-block's inner footer)
+            //   • header at pos+HEADER+R+FOOTER says F  (second sub-block's header size)
+            // where R = H − F − OVERHEAD.  If all match, the header was never shrunk;
+            // fix it to R so the scan navigates into the two sub-blocks correctly.
+            {
+                let mut outer_footer_buf = [0u8; 8];
+                // footer_pos = pos + HEADER + H; within bounds because block_total was valid
+                self.stack
+                    .get_into(pos + Self::BLOCK_HEADER_SIZE + size, &mut outer_footer_buf)?;
+                let f = u64::from_le_bytes(outer_footer_buf);
+                if f != size && f >= Self::MIN_BLOCK_PAYLOAD_SIZE && f % 8 == 0 {
+                    if let Some(r) = size
+                        .checked_sub(f)
+                        .and_then(|d| d.checked_sub(Self::BLOCK_OVERHEAD_SIZE))
+                        .filter(|&r| r >= Self::MIN_BLOCK_PAYLOAD_SIZE && r % 8 == 0)
+                    {
+                        let inner_footer_pos = pos + Self::BLOCK_HEADER_SIZE + r;
+                        let second_hdr_pos = inner_footer_pos + Self::BLOCK_FOOTER_SIZE;
+                        if second_hdr_pos + Self::BLOCK_HEADER_SIZE <= stack_len {
+                            let mut inner_footer_buf = [0u8; 8];
+                            let mut second_size_buf = [0u8; 8];
+                            self.stack.get_into(inner_footer_pos, &mut inner_footer_buf)?;
+                            self.stack.get_into(second_hdr_pos, &mut second_size_buf)?;
+                            if u64::from_le_bytes(inner_footer_buf) == r
+                                && u64::from_le_bytes(second_size_buf) == f
+                            {
+                                // Confirmed partial split: update the header to the correct size.
+                                self.stack.set(pos, r.to_le_bytes().as_slice())?;
+                                size = r;
+                                block_total = r + Self::BLOCK_OVERHEAD_SIZE;
+                            }
+                        }
+                    }
+                }
+            }
 
             if is_free {
                 free_blocks.push(pos + Self::BLOCK_HEADER_SIZE);
@@ -1995,7 +2035,7 @@ impl BStackAllocator for FirstFitBStackAllocator {
                 ];
 
                 if merged_size
-                    > aligned_new_len + Self::BLOCK_FOOTER_SIZE + Self::MIN_BLOCK_PAYLOAD_SIZE
+                    >= aligned_new_len + Self::BLOCK_OVERHEAD_SIZE + Self::MIN_BLOCK_PAYLOAD_SIZE
                 {
                     // The merged block is much larger than needed — split it.
                     // Pack the allocated-block footer, free-block header (size + is_free flag),
@@ -2028,13 +2068,18 @@ impl BStackAllocator for FirstFitBStackAllocator {
                     zero_buff[free_footer_off..free_footer_off + 8]
                         .copy_from_slice(&remainder_size.to_le_bytes());
 
+                    // Set the header to merged_size first so that if we crash after the
+                    // big write but before the aligned_new_len update, recovery sees a
+                    // header/footer mismatch (merged_size vs. remainder_size) and can
+                    // detect and repair the partial split.
+                    self.stack.set(
+                        slice.start() - Self::BLOCK_HEADER_SIZE,
+                        &merged_size.to_le_bytes(),
+                    )?;
                     // Single write: zeroes the inter-block overhead, writes the allocated
                     // block's new footer, the complete free block, and the free block's footer.
                     self.stack.set(slice.start() + block_size, &zero_buff)?;
                     // Shrink the allocated block's header to the used size.
-                    // If this write fails the free block is orphaned but the header (still
-                    // merged_size) navigates past it cleanly, so recovery can replay.
-                    // Failure cause: header corruption
                     self.stack.set(
                         slice.start() - Self::BLOCK_HEADER_SIZE,
                         &aligned_new_len.to_le_bytes(),

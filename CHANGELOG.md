@@ -5,7 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.1.5] - 2026-04-26
+## [Unreleased]
+
+### Added
+
+- **`FirstFitBStackAllocator::realloc` — in-place grow by merging the next free block**: when the block immediately following the current allocation is free and large enough, `realloc` now absorbs it without copying any data. The merged region is then split if the result is significantly larger than the requested size, with the surplus returned to the free list as a new free block. This avoids the copy-and-move path for the common case of growing an allocation that has adjacent free space.
+- **Recovery: partial-split detection and repair**: after a crash between the block-data write and the header-size update of a split operation, the recovered header still reports the pre-split (oversized) length while the inner footer and the second sub-block's header form a consistent signature. Recovery now detects this three-point mismatch — outer footer value `F`, inner footer at `H − F − OVERHEAD` equal to `H − F − OVERHEAD`, second sub-block header equal to `F` — and rewrites the corrupted header to its correct value so both sub-blocks are visible and navigated correctly.
+
+### Fixed
+
+- **`FirstFitBStackAllocator::realloc` — incorrect merged block size**: the in-place merge computed `merged_size = block_size + next_block_size`, omitting the 24-byte `BLOCK_OVERHEAD_SIZE` that sits between the two original blocks. This caused the header to advertise a smaller extent than where the footer was actually written, making any subsequent free-and-coalesce operation navigate to the wrong position. Fixed to `block_size + BLOCK_OVERHEAD_SIZE + next_block_size`.
+- **`FirstFitBStackAllocator::realloc` — split threshold too loose**: the split condition used `merged_size > aligned_new_len + BLOCK_FOOTER_SIZE + MIN_BLOCK_PAYLOAD_SIZE` (strict `>`). Because `BLOCK_FOOTER_SIZE + MIN_BLOCK_PAYLOAD_SIZE = BLOCK_OVERHEAD_SIZE = 24` and all sizes are multiples of 8, the minimum triggering case was `merged_size = aligned_new_len + 32`, producing a remainder of 8 bytes — below `MIN_BLOCK_PAYLOAD_SIZE` (16) and too small to hold the free block's `next_free`/`prev_free` pointers. Fixed to `merged_size >= aligned_new_len + BLOCK_OVERHEAD_SIZE + MIN_BLOCK_PAYLOAD_SIZE`, guaranteeing remainder ≥ 16 bytes.
+
+## [0.1.5] - 2026-04-26 [YANKED]
+
+* Yanked due to critical bugs in the new `FirstFitBStackAllocator` implementation. See fixes in [0.1.6].
 
 ### Added
 
