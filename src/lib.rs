@@ -298,10 +298,10 @@ mod test;
 
 #[cfg(feature = "alloc")]
 mod alloc;
-#[cfg(all(feature = "alloc", feature = "set"))]
-pub use alloc::BStackSliceWriter;
 #[cfg(feature = "alloc")]
 pub use alloc::{BStackAllocator, BStackSlice, BStackSliceReader, LinearBStackAllocator};
+#[cfg(all(feature = "alloc", feature = "set"))]
+pub use alloc::{BStackSliceWriter, FirstFitBStackAllocator};
 
 use std::fmt;
 use std::fs::{File, OpenOptions};

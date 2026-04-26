@@ -809,7 +809,7 @@ impl<'a, A: BStackAllocator> From<BStackSliceWriter<'a, A>> for BStackSlice<'a, 
 
 /// Convert a reader into a writer at the same position.
 ///
-//// The reader and writer share the same underlying slice and cursor position.
+/// The reader and writer share the same underlying slice and cursor position.
 #[cfg(feature = "set")]
 impl<'a, A: BStackAllocator> From<BStackSliceReader<'a, A>> for BStackSliceWriter<'a, A> {
     fn from(reader: BStackSliceReader<'a, A>) -> Self {
@@ -1136,5 +1136,533 @@ impl BStackAllocator for LinearBStackAllocator {
             self.stack.discard(slice.len())?;
         }
         Ok(())
+    }
+}
+
+/// Full magic for FirstFitBStackAllocator
+#[cfg(feature = "set")]
+const ALFF_MAGIC: [u8; 8] = *b"ALFF\x00\x01\x00\x00";
+
+/// Compatibility prefix checked on open: `ALFF` + major 0 + minor 1.
+/// Any file whose first 6 bytes match is considered a compatible 0.1.x file.
+#[cfg(feature = "set")]
+const ALFF_MAGIC_PREFIX: [u8; 6] = *b"ALFF\x00\x01";
+
+#[cfg(feature = "set")]
+pub struct FirstFitBStackAllocator {
+    stack: BStack,
+}
+
+#[cfg(feature = "set")]
+impl FirstFitBStackAllocator {
+    const OFFSET_SIZE: u64 = 16;
+    const HEADER_SIZE: u64 = 32;
+    const BLOCK_HEADER_SIZE: u64 = 16;
+    const BLOCK_FOOTER_SIZE: u64 = 8;
+    const BLOCK_OVERHEAD_SIZE: u64 = Self::BLOCK_HEADER_SIZE + Self::BLOCK_FOOTER_SIZE;
+    const MIN_BLOCK_PAYLOAD_SIZE: u64 = 16;
+    // Absolute payload offset of the free_head field in the allocator header:
+    // OFFSET_SIZE(16) + magic(8) + flags(4) + _reserved(4) = 32
+    const FREE_HEAD_OFFSET: u64 = Self::OFFSET_SIZE + 16;
+
+    pub fn new(stack: BStack) -> Result<Self, io::Error> {
+        // Initialize empty stack with allocator header
+        if stack.is_empty()? {
+            let mut hdr = [0u8; (Self::OFFSET_SIZE + Self::HEADER_SIZE) as usize];
+            hdr[Self::OFFSET_SIZE as usize..Self::OFFSET_SIZE as usize + ALFF_MAGIC.len()]
+                .copy_from_slice(&ALFF_MAGIC);
+            // flags, _reserved, free_head remain zero
+            stack.push(&hdr)?;
+            return Ok(Self { stack });
+        }
+        // Validate header
+        let header = stack.get(Self::OFFSET_SIZE, Self::OFFSET_SIZE + Self::HEADER_SIZE)?;
+        // Check magic prefix for compatibility with 0.1.x files.
+        if header[..ALFF_MAGIC_PREFIX.len()] != ALFF_MAGIC_PREFIX {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid magic prefix: expected ALFF\\x00\\x01",
+            ));
+        }
+        // Only bit 0 of flags is recovery_needed; ignore reserved flag bits
+        let mut recovery_needed = header[ALFF_MAGIC.len()] & 1 != 0;
+        let free_head = u64::from_le_bytes(
+            header[ALFF_MAGIC.len() + 8..ALFF_MAGIC.len() + 16]
+                .try_into()
+                .unwrap(),
+        );
+        // Check that the free list head is valid (either 0 or a valid payload offset within the stack).
+        if free_head != 0 {
+            let stack_len = stack.len()?;
+            if free_head < Self::OFFSET_SIZE + Self::HEADER_SIZE + Self::BLOCK_HEADER_SIZE
+                || free_head >= stack_len
+            {
+                recovery_needed = true;
+            }
+        }
+        let alloc = Self { stack };
+        if recovery_needed {
+            alloc.recovery()?;
+        }
+        Ok(alloc)
+    }
+
+    #[inline]
+    fn set_recovery_needed(&self) -> io::Result<()> {
+        self.stack
+            .set(Self::OFFSET_SIZE + 8, 1u32.to_le_bytes().as_slice())
+    }
+
+    #[inline]
+    fn clear_recovery_needed(&self) -> io::Result<()> {
+        self.stack.set(Self::OFFSET_SIZE + 8, [0u8; 4].as_slice())
+    }
+
+    /// Check if a block size is impossible given the allocator's invariants and the stack length.
+    ///
+    /// Includes the multiple of 8 alignment invariant
+    #[inline]
+    fn is_impossible_block_size(&self, size: u64) -> bool {
+        size < Self::MIN_BLOCK_PAYLOAD_SIZE || size > self.len().unwrap_or(u64::MAX)
+    }
+
+    /// Check if a block start is impossible given the allocator's invariants and the stack length.
+    ///
+    /// Includes the multiple of 8 alignment invariant
+    #[inline]
+    fn is_impossible_block_start(&self, start: u64) -> bool {
+        !start.is_multiple_of(8)
+            || start < Self::OFFSET_SIZE + Self::HEADER_SIZE + Self::BLOCK_HEADER_SIZE
+            || start >= self.len().unwrap_or(u64::MAX)
+    }
+
+    /// Check if a block end offset is impossible given the allocator's invariants and the stack length.
+    ///
+    /// Does not include multiple of 8 alignment
+    #[inline]
+    fn is_impossible_block_end(&self, end: u64) -> bool {
+        end < Self::OFFSET_SIZE
+            + Self::HEADER_SIZE
+            + Self::BLOCK_OVERHEAD_SIZE
+            + Self::MIN_BLOCK_PAYLOAD_SIZE
+            || end > self.len().unwrap_or(u64::MAX) - Self::BLOCK_FOOTER_SIZE
+    }
+
+    /// Align a requested payload length to the allocator's block size and alignment requirements.
+    #[inline]
+    fn align_len(&self, len: u64) -> u64 {
+        len.max(Self::MIN_BLOCK_PAYLOAD_SIZE).next_multiple_of(8)
+    }
+
+    fn add_to_free_list(&self, block_start: u64) -> io::Result<()> {
+        // Add the block at block_start to the head of the free list.
+        // This involves updating the block's header to mark it as free and point to the current head,
+        // and updating the current head's prev pointer (if it exists) to point back to the new block.
+        // Finally, update the free list head in the allocator header to point to the new block.
+
+        // Current free list:
+        // free_head --------------> next -> ...
+        // free_head <-------------- next <- ...
+
+        // Read current free_head — becomes the new block's next_free
+        let mut head_buf = [0u8; 8];
+        self.stack.get_into(Self::FREE_HEAD_OFFSET, &mut head_buf)?;
+        let next_block = u64::from_le_bytes(head_buf);
+
+        // Mark block as free and write next_free = old_head, prev_free = 0 in one call.
+        // Writes flags(4) + reserved(4) + next_free(8) + prev_free(8) starting at block_start - 8.
+        // free_head <- new_block -> next
+        // free_head --------------> next -> ...
+        // free_head <-------------- next <- ...
+        let mut update_buf = [0u8; 24];
+        update_buf[0..4].copy_from_slice(&1u32.to_le_bytes()); // is_free = 1
+        update_buf[8..16].copy_from_slice(&next_block.to_le_bytes()); // next_free = old head
+        // update_buf[4..8] = reserved = 0, update_buf[16..24] = prev_free = 0
+        self.stack
+            .set(block_start - Self::BLOCK_HEADER_SIZE + 8, &update_buf)?;
+
+        // Update free_head to point to the new block.
+        // free_head <- new_block
+        // free_head -> new_block -> next -> ...
+        // free_head <-------------- next <- ...
+        // If this step fails, the free list is still consistent but the new block is orphaned
+        self.stack
+            .set(Self::FREE_HEAD_OFFSET, &block_start.to_le_bytes())?;
+
+        // After adding new block:
+        // free_head -> new_block -> next -> ...
+        // free_head <- new_block <- next <- ...
+        // If this step fails, the forward links are still consistent but the backward link from next to new_block
+        // is missing, which can be detected and fixed in recovery. This is similar to the unlink case in unlink_block
+        if next_block != 0 {
+            self.stack.set(next_block + 8, &block_start.to_le_bytes())?;
+        }
+
+        Ok(())
+    }
+
+    /// Find the first free block that is large enough to hold `size` bytes of payload.
+    ///
+    /// Walk the free list starting from the head, checking each block's size until a suitable block
+    /// is found or the end of the list is reached.
+    ///
+    /// Returns the offset of the block's payload if a suitable block is found, or 0 if no such block exists.
+    fn find_large_enough_block(&self, size: u64) -> io::Result<(u64, u64)> {
+        // Walk the free-list from free_head. For each block, check if block.size >= len
+        let mut block_found = 0u64;
+        let mut found_size = 0u64;
+        let mut head = u64::from_le_bytes(
+            self.stack
+                .get(Self::FREE_HEAD_OFFSET, Self::FREE_HEAD_OFFSET + 8)?
+                .try_into()
+                .unwrap(),
+        );
+        while head != 0 {
+            let size_flags_and_ptr_buf = &mut [0u8; Self::BLOCK_HEADER_SIZE as usize + 8];
+            self.stack
+                .get_into(head - Self::BLOCK_HEADER_SIZE, size_flags_and_ptr_buf)?;
+            let block_size = u64::from_le_bytes(size_flags_and_ptr_buf[0..8].try_into().unwrap());
+            let is_free = size_flags_and_ptr_buf[8] & 1 != 0;
+            debug_assert!(
+                is_free,
+                "corrupted free list: block at offset {head} is not marked free"
+            );
+            if !is_free {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("corrupted free list: block at offset {head} is not marked free"),
+                ));
+            } else if self.is_impossible_block_size(block_size) || block_size % 8 != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "corrupted free list: block at offset {head} has invalid size {block_size}"
+                    ),
+                ));
+            }
+            if block_size >= size {
+                block_found = head;
+                found_size = block_size;
+                break;
+            }
+            head = u64::from_le_bytes(
+                size_flags_and_ptr_buf
+                    [Self::BLOCK_HEADER_SIZE as usize..(Self::BLOCK_HEADER_SIZE as usize + 8)]
+                    .try_into()
+                    .unwrap(),
+            );
+            if self.is_impossible_block_start(head) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("corrupted free list: next block offset {head} is invalid"),
+                ));
+            }
+        }
+
+        Ok((block_found, found_size))
+    }
+
+    fn unlink_block(
+        &self,
+        found_start: u64,
+        found_size: u64,
+        requested_size: u64,
+        // Need to be Self::BLOCK_OVERHEAD_SIZE + data size
+        // Where from Self::BLOCK_HEADER_SIZE to end - Self::BLOCK_FOOTER_SIZE is the content
+        content_buffer: &mut [u8],
+    ) -> io::Result<()> {
+        if found_size > requested_size + Self::BLOCK_FOOTER_SIZE + Self::MIN_BLOCK_PAYLOAD_SIZE {
+            // The found block is big enough to split. Split it into an allocated block of the requested size
+            // and a smaller free block for the remainder, and add the new free block back to the free list.
+            // There is no need to change the pointers but only update block size
+
+            // Structure of the block after split:
+            // [ old block header  | ----------------------------------- old block content ----------------------------------- | -- old block footer -- ]
+            // [ free block header | free block content | free block footer | allocated block header | allocated block content | allocated block footer ]
+            //                     ^ found_start
+            //                     | < ------------------------------------- found_size -------------------------------------> |
+            // | BLOCK_HEADER_SIZE | < remaining_size > | BLOCK_FOOTER_SIZE | BLOCK_HEADER_SIZE      | <-- requested_size ---> | BLOCK_FOOTER_SIZE      |
+            //                                                              | <--------------------------- content_buffer ----------------------------> |
+            //
+            // | < update 3 > |    |                    | <--------------- update 1 ---------------> | <------------------ update 2 ------------------> |
+
+            let remaining_size = found_size - requested_size - Self::BLOCK_OVERHEAD_SIZE;
+
+            // Write the footer of the allocated block to content buffer
+            content_buffer[(requested_size + Self::BLOCK_HEADER_SIZE) as usize
+                ..(requested_size + Self::BLOCK_OVERHEAD_SIZE) as usize]
+                .copy_from_slice(&requested_size.to_le_bytes());
+
+            // Update 1
+            // Update the footer of the free block and write the header of the allocated block together
+            // Flag and reserved bytes are already 0, so the new block is marked as allocated.
+            let update_buf = &mut [0u8; Self::BLOCK_OVERHEAD_SIZE as usize];
+            update_buf[..8].copy_from_slice(&remaining_size.to_le_bytes());
+            update_buf[8..16].copy_from_slice(&requested_size.to_le_bytes());
+            self.stack.set(found_start + remaining_size, update_buf)?;
+
+            // Update 2
+            // Update the footer of the allocated block and zero out
+            // If this step fails and middle is already updated, nothing bad happens since
+            // the middle of a free block is just garbage data
+            self.stack.set(
+                found_start + remaining_size + Self::BLOCK_OVERHEAD_SIZE,
+                &content_buffer[Self::BLOCK_HEADER_SIZE as usize..],
+            )?;
+
+            // Update the size of the free block in the header.
+            // If this steps fails, the footer is corrupted and should be repaired in recovery
+            self.stack.set(
+                found_start - Self::BLOCK_HEADER_SIZE,
+                remaining_size.to_le_bytes().as_slice(),
+            )?;
+            Ok(())
+        } else {
+            // The found block is not big enough to split, so just remove it from the free list and return it.
+            // Read both pointers
+            let mut pointers_buf = [0u8; 16];
+            self.stack.get_into(found_start, &mut pointers_buf)?;
+            let next = u64::from_le_bytes(pointers_buf[0..8].try_into().unwrap());
+            let prev = u64::from_le_bytes(pointers_buf[8..16].try_into().unwrap());
+
+            // Commit backward pointer first
+            // If fails here, the free list looks like this:
+            // free_head -> ... -> prev -> found_block -> next -> ...
+            //              ... <- prev <---------------- next <- ...
+            // So the forward link is still there
+            if prev != 0 {
+                self.stack.set(prev, &next.to_le_bytes())?;
+            } else {
+                self.stack
+                    .set(Self::FREE_HEAD_OFFSET, &next.to_le_bytes())?;
+            }
+
+            // Then commit forward pointer
+            // If fails here, the block is orphaned but still marked as free, which should be repaired in recovery
+            if next != 0 {
+                self.stack.set(next + 8, &prev.to_le_bytes())?;
+            }
+
+            // Clear is_free flag + reserved and write user data in one call by modifying content_buffer
+            content_buffer[8..16].copy_from_slice(&[0u8; 8]);
+            self.stack.set(
+                found_start - Self::BLOCK_HEADER_SIZE + 8,
+                &content_buffer[8..Self::BLOCK_HEADER_SIZE as usize + requested_size as usize],
+            )?;
+
+            Ok(())
+        }
+    }
+
+    fn recovery(&self) -> io::Result<()> {
+        // First ensure the the length is a multiple of 8.
+        // Walk the stack and rebuild the free list in memory, then write it back to disk.
+        // This is needed when the allocator detects corruption or an unclean shutdown.
+        // The free list is reconstructed by scanning through all blocks and treating any block
+        // with an invalid size or missing free flag as allocated, while valid free blocks are
+        // added to the free list.  This allows recovery from various forms of corruption,
+        // including torn writes that partially update a block header or footer.
+        todo!("ALFF recovery not implemented yet");
+    }
+}
+
+#[cfg(feature = "set")]
+impl BStackAllocator for FirstFitBStackAllocator {
+    fn stack(&self) -> &BStack {
+        &self.stack
+    }
+
+    fn into_stack(self) -> BStack {
+        self.stack
+    }
+
+    fn alloc(&self, len: u64) -> io::Result<BStackSlice<'_, Self>> {
+        // Make len aligned to 8 bytes and at least 16
+        let aligned_len = self.align_len(len);
+
+        let block_found = self.find_large_enough_block(aligned_len)?;
+        if block_found.0 != 0 {
+            // Found a big enough block at offset block_found. Remove it from the free list and return it.
+            // If the block is much bigger than needed, split it and add the remainder back to the free list.
+
+            // Heap allocate zero buffer
+            let mut zero_buf = vec![0u8; (Self::BLOCK_OVERHEAD_SIZE + aligned_len) as usize];
+
+            // Set recovery needed before modifying the free list and clear it after,
+            // so that if a crash happens in the middle, the allocator can detect it and recover the free list in the next run.
+            self.set_recovery_needed()?;
+            self.unlink_block(
+                block_found.0,
+                block_found.1,
+                aligned_len,
+                zero_buf.as_mut_slice(),
+            )?;
+            self.clear_recovery_needed()?;
+            Ok(BStackSlice::new(self, block_found.0, len))
+        } else {
+            // No free block fits; push the full block (header + zero payload + footer) in one call.
+            let mut block_buf = vec![0u8; (aligned_len + Self::BLOCK_OVERHEAD_SIZE) as usize];
+            block_buf[..8].copy_from_slice(&aligned_len.to_le_bytes());
+            block_buf[(aligned_len + Self::BLOCK_HEADER_SIZE) as usize..]
+                .copy_from_slice(&aligned_len.to_le_bytes());
+            let ptr = self.stack.push(&block_buf)? + Self::BLOCK_HEADER_SIZE;
+            Ok(BStackSlice::new(self, ptr, len))
+        }
+    }
+
+    fn dealloc(&self, slice: BStackSlice<'_, Self>) -> io::Result<()> {
+        if self.is_impossible_block_start(slice.start())
+            || self.is_impossible_block_end(slice.end())
+            || self.is_impossible_block_size(slice.len())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid slice: start or end offset is impossible",
+            ));
+        }
+        // Special case for dealloc of the tail block:
+        // if slice.end() == self.len() - Self::BLOCK_FOOTER_SIZE, just discard it from the stack.
+        let current_tail = self.stack.len()?;
+        if slice.end().next_multiple_of(8) == current_tail - Self::BLOCK_FOOTER_SIZE {
+            self.stack
+                .discard(slice.len().next_multiple_of(8) + Self::BLOCK_OVERHEAD_SIZE)?;
+            return Ok(());
+        }
+        self.set_recovery_needed()?;
+        self.add_to_free_list(slice.start())?;
+        self.clear_recovery_needed()
+    }
+
+    fn realloc<'a>(
+        &'a self,
+        slice: BStackSlice<'a, Self>,
+        new_len: u64,
+    ) -> io::Result<BStackSlice<'a, Self>> {
+        if self.is_impossible_block_start(slice.start())
+            || self.is_impossible_block_end(slice.end())
+            || self.is_impossible_block_size(slice.len())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid slice: start or end offset is impossible",
+            ));
+        }
+
+        let aligned_new_len = self.align_len(new_len);
+        let aligned_current_len = slice.len().next_multiple_of(8);
+
+        // If the new length.next_multiple_of(8) is the same as the old length.next_multiple_of(8)
+        // just return the same slice since the block size is the same.
+        // This also covers the exact same length case, so we don't need a separate check for that.
+        if aligned_new_len == aligned_current_len {
+            return Ok(BStackSlice::new(self, slice.start(), new_len));
+        }
+
+        // Special case for realloc of the tail block:
+        // The tail block cannot be shrink beyound Self::MIN_BLOCK_PAYLOAD_SIZE. This is enforced
+        // by the align_len function, so if new_len is smaller than that, aligned_new_len will be the same as
+        // aligned_current_len and we will just return the same slice without shrinking.
+        // if slice.end() == self.len() - Self::BLOCK_FOOTER_SIZE, just extend or discard from the stack as needed.
+        let current_tail = self.stack.len()?;
+        if slice.end().next_multiple_of(8) == current_tail - Self::BLOCK_FOOTER_SIZE {
+            match aligned_new_len.cmp(&aligned_current_len) {
+                std::cmp::Ordering::Equal => return Ok(slice), // Included but this should never happen
+                std::cmp::Ordering::Greater => {
+                    // Extend payload by the delta; footer moves forward
+                    self.stack.extend(aligned_new_len - aligned_current_len)?;
+                    self.stack.set(
+                        slice.start() - Self::BLOCK_HEADER_SIZE,
+                        &aligned_new_len.to_le_bytes(),
+                    )?;
+                    self.stack.set(
+                        slice.start() + aligned_new_len,
+                        &aligned_new_len.to_le_bytes(),
+                    )?;
+                    return Ok(BStackSlice::new(self, slice.start(), new_len));
+                }
+                std::cmp::Ordering::Less => {
+                    // Write new footer before discarding so it lands at the right position
+                    self.stack.set(
+                        slice.start() + aligned_new_len,
+                        &aligned_new_len.to_le_bytes(),
+                    )?;
+                    self.stack.set(
+                        slice.start() - Self::BLOCK_HEADER_SIZE,
+                        &aligned_new_len.to_le_bytes(),
+                    )?;
+                    self.stack.discard(aligned_current_len - aligned_new_len)?;
+                    return Ok(BStackSlice::new(self, slice.start(), new_len));
+                }
+            }
+        }
+
+        // Special case: same block optimizations
+        // Read the block size
+        let block_size_buf = self.stack.get(
+            slice.start() - Self::BLOCK_HEADER_SIZE,
+            slice.start() - Self::BLOCK_HEADER_SIZE + 8,
+        )?;
+        let block_size = u64::from_le_bytes(block_size_buf.try_into().unwrap());
+        if block_size >= aligned_new_len {
+            // The block is already big enough to hold the new size, but we need to zero
+            // betweem aligned_current_len and aligned_new_len if new_len is smaller than current_len
+            if aligned_new_len > aligned_current_len {
+                let zero_buf = vec![0u8; (aligned_new_len - aligned_current_len) as usize];
+                self.stack
+                    .set(slice.start() + aligned_current_len, &zero_buf)?;
+            }
+
+            return Ok(BStackSlice::new(self, slice.start(), new_len));
+        }
+
+        // For non-tail blocks, we need to find a new block for the new size, copy the data, and free the old block.
+        let block_found = self.find_large_enough_block(aligned_new_len)?;
+        if block_found.0 != 0 {
+            // Found a big enough block at offset block_found. Remove it from the free list and return it.
+            // If the block is much bigger than needed, split it and add the remainder back to the free list.
+
+            // Read old data into a buffer sized for the new block (extra bytes stay zero)
+            let copy_len = aligned_current_len.min(aligned_new_len);
+            let mut data_buf = vec![0u8; (Self::BLOCK_OVERHEAD_SIZE + aligned_new_len) as usize];
+            self.stack.get_into(
+                slice.start(),
+                &mut data_buf[Self::BLOCK_HEADER_SIZE as usize
+                    ..(copy_len + Self::BLOCK_HEADER_SIZE) as usize],
+            )?;
+            self.set_recovery_needed()?;
+            self.unlink_block(
+                block_found.0,
+                block_found.1,
+                aligned_new_len,
+                data_buf.as_mut_slice(),
+            )?;
+            // If growing, explicitly zero the extra bytes in the new block beyond the copied data
+            if aligned_new_len > aligned_current_len {
+                self.stack.zero(
+                    block_found.0 + aligned_current_len,
+                    aligned_new_len - aligned_current_len,
+                )?;
+            }
+            self.add_to_free_list(slice.start())?;
+            self.clear_recovery_needed()?;
+            Ok(BStackSlice::new(self, block_found.0, new_len))
+        } else {
+            // No free block fits; push the full new block in one call, then free the old one.
+            let copy_len = aligned_current_len.min(aligned_new_len) as usize;
+            let mut block_buf = vec![0u8; (aligned_new_len + Self::BLOCK_OVERHEAD_SIZE) as usize];
+            block_buf[..8].copy_from_slice(&aligned_new_len.to_le_bytes());
+            self.stack.get_into(
+                slice.start(),
+                &mut block_buf
+                    [Self::BLOCK_HEADER_SIZE as usize..Self::BLOCK_HEADER_SIZE as usize + copy_len],
+            )?;
+            block_buf[(aligned_new_len + Self::BLOCK_HEADER_SIZE) as usize..]
+                .copy_from_slice(&aligned_new_len.to_le_bytes());
+            self.set_recovery_needed()?;
+            let ptr = self.stack.push(&block_buf)? + Self::BLOCK_HEADER_SIZE;
+            self.add_to_free_list(slice.start())?;
+            self.clear_recovery_needed()?;
+            Ok(BStackSlice::new(self, ptr, new_len))
+        }
     }
 }
