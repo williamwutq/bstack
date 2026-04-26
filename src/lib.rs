@@ -243,6 +243,10 @@
 //!   [`BStack::discard`]; non-tail deallocations are a no-op.  Every operation
 //!   maps to exactly one [`BStack`] call and is crash-safe by inheritance.
 //!
+//! * [`FirstFitBStackAllocator`] — Experimental: a persistent first-fit free-list allocator
+//!   that reuses freed regions to prevent unbounded file growth.  Requires both
+//!   `alloc` and `set` features.
+//!
 //! ## Lifetime model
 //!
 //! `BStackSlice<'a, A>` borrows the **allocator** for `'a`, not the

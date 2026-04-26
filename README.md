@@ -287,7 +287,7 @@ Enables the region-management layer on top of `BStack`:
 bstack = { version = "0.1", features = ["alloc"] }
 # In-place slice writes (BStackSliceWriter) also need `set`:
 bstack = { version = "0.1", features = ["alloc", "set"] }
-# FirstFitBStackAllocator requires both alloc and set:
+# Experimental FirstFitBStackAllocator requires both alloc and set:
 bstack = { version = "0.1", features = ["alloc", "set"] }
 ```
 
@@ -371,9 +371,9 @@ The reference bump allocator.  Regions are appended sequentially to the tail.
 
 `realloc` returns `io::ErrorKind::Unsupported` for non-tail slices.
 
-### `FirstFitBStackAllocator` (`alloc + set` features)
+### Experimental `FirstFitBStackAllocator` (`alloc + set` features)
 
-A persistent first-fit free-list allocator.  Freed regions are tracked on disk
+Experimental: A persistent first-fit free-list allocator.  Freed regions are tracked on disk
 in a doubly-linked intrusive free list and reused for future allocations, so
 the file does not grow without bound.
 
