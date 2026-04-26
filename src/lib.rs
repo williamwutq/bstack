@@ -181,6 +181,24 @@
 //! # }
 //! ```
 //!
+//! # Trait implementations
+//!
+//! ## `BStack`
+//!
+//! | Trait | Semantics |
+//! |-------|-----------|
+//! | `Debug` | Shows `version` (semver string from the magic header, e.g. `"0.1.4"`) and `len` (`Option<u64>`, `None` on I/O failure). |
+//! | `PartialEq` / `Eq` | **Pointer identity.** Two values are equal iff they are the same instance. No two distinct `BStack` values in one process can refer to the same file. |
+//! | `Hash` | Hashes the instance address — consistent with pointer-identity `PartialEq`. |
+//!
+//! ## `BStackReader`
+//!
+//! | Trait | Semantics |
+//! |-------|-----------|
+//! | `PartialEq` / `Eq` | Equal when both the `BStack` pointer (identity) and the cursor `offset` match. |
+//! | `Hash` | Hashes `(BStack pointer, offset)` — consistent with `PartialEq`. |
+//! | `PartialOrd` / `Ord` | Ordered by `BStack` instance address, then by cursor `offset`. Groups all readers over the same stack and within that group orders by position. |
+//!
 //! # Feature flags
 //!
 //! | Feature | Description |
@@ -1209,6 +1227,8 @@ impl<'a> From<BStackReader<'a>> for &'a BStack {
     }
 }
 
+/// Two readers are equal when they point to the **same `BStack` instance**
+/// (pointer identity) and share the same cursor `offset`.
 impl<'a> PartialEq for BStackReader<'a> {
     fn eq(&self, other: &Self) -> bool {
         self.stack == other.stack && self.offset == other.offset
@@ -1217,10 +1237,32 @@ impl<'a> PartialEq for BStackReader<'a> {
 
 impl<'a> Eq for BStackReader<'a> {}
 
+/// Hashes `(BStack pointer, offset)`, consistent with [`PartialEq`].
 impl<'a> Hash for BStackReader<'a> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.stack.hash(state);
         self.offset.hash(state);
+    }
+}
+
+impl<'a> PartialOrd for BStackReader<'a> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Ordered by `BStack` instance address, then by cursor `offset`.
+///
+/// The address component groups all readers over the same stack together,
+/// and within that group the natural read order (smaller offset first) applies.
+/// This ordering is consistent with the pointer-identity [`PartialEq`].
+impl<'a> Ord for BStackReader<'a> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        let self_ptr = self.stack as *const BStack as usize;
+        let other_ptr = other.stack as *const BStack as usize;
+        self_ptr
+            .cmp(&other_ptr)
+            .then(self.offset.cmp(&other.offset))
     }
 }
 

@@ -219,6 +219,47 @@ and run concurrently with each other and with `peek`/`get` calls.
 
 ---
 
+## Trait implementations
+
+### `BStack`
+
+| Trait              | Semantics                                                                                                                                             |
+|--------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `PartialEq` / `Eq` | **Pointer identity.** Two values are equal iff they are the same instance. No two distinct `BStack` values in one process can refer to the same file. |
+| `Hash`             | Hashes the instance address — consistent with pointer-identity equality.                                                                              |
+
+### `BStackReader`
+
+| Trait | Semantics |
+|-------|-----------|
+| `PartialEq` / `Eq` | Equal when both the `BStack` pointer and the cursor offset match. |
+| `Hash` | Hashes `(BStack pointer, offset)`. |
+| `PartialOrd` / `Ord` | Ordered by `BStack` instance address, then by cursor offset. |
+
+### `BStackSlice` (`alloc` feature)
+
+| Trait                            | Semantics                                                                                               |
+|----------------------------------|---------------------------------------------------------------------------------------------------------|
+| `PartialEq` / `Eq`               | Compares `(offset, len)`. The allocator reference is **not** compared.                                  |
+| `Hash`                           | Hashes `(offset, len)`.                                                                                 |
+| `PartialOrd` / `Ord`             | Ordered by `offset`, then `len`.                                                                        |
+| `From<BStackSlice> for [u8; 16]` | Serialises to `[offset_le8 ‖ len_le8]` for on-disk storage. Reconstruct with `BStackSlice::from_bytes`. |
+
+### `BStackSliceReader` and `BStackSliceWriter` (`alloc` / `alloc + set` features)
+
+| Trait                | Semantics                                                                            |
+|----------------------|--------------------------------------------------------------------------------------|
+| `PartialEq` / `Eq`   | Equal when the underlying slice (`offset` + `len`) and cursor position both match.   |
+| `Hash`               | Hashes `(slice, cursor)`.                                                            |
+| `PartialOrd` / `Ord` | Ordered by absolute payload position (`slice.start() + cursor`), then `slice.len()`. |
+
+Reader and writer are also **cross-comparable**: `PartialEq` and `PartialOrd` are defined between
+`BStackSliceReader` and `BStackSliceWriter` using the same `(abs_pos, len)` key, so the two cursor
+types can be mixed in sorted collections. Both also implement `PartialEq<BStackSlice>` (cursor
+position is ignored for that comparison).
+
+---
+
 ## Feature flags
 
 ### `set`

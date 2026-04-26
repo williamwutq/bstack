@@ -8,10 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- **`alloc` feature**: Adds region-based allocation over a [`BStack`] payload behind the `alloc` Cargo feature flag.
-  - **`BStackAllocator` trait**: Standard interface for types that own a `BStack` and manage contiguous byte regions within its payload. Requires `stack()`, `into_stack()`, `alloc()`, and `realloc()`; provides a default no-op `dealloc()`, and delegation helpers `len()` / `is_empty()`.
-  - **`BStackSlice<'a, A>`**: Lightweight `Copy` handle (allocator reference + `offset` + `len`) to a contiguous region. Exposes `read`, `read_into`, `read_range_into`, `subslice`, `subslice_range`, `reader`, `reader_at`; and (with the `set` feature) `write`, `write_range`, `zero`, `zero_range`.
-  - **`BStackSliceReader<'a, A>`**: Cursor-based reader over a `BStackSlice`, implementing `io::Read` and `io::Seek` in the slice's coordinate space.
+
+- **`BStack::Debug`**: Shows `version` (semver string derived from the magic header, e.g. `"0.1.x"`) and `len` (current payload size as `Option<u64>`, `None` on I/O failure).
+- **`BStack` equality and hashing**: `PartialEq`/`Eq` use pointer identity — two distinct instances are never equal. Because `open` holds an exclusive advisory lock, no two `BStack` values in one process can refer to the same file simultaneously, making pointer identity the only meaningful equality. `Hash` hashes the instance address, consistent with `PartialEq`.
+- **`BStackReader` equality, hashing, and ordering**: `PartialEq`/`Eq` compare `(BStack pointer, offset)`; `Hash` is consistent; `PartialOrd`/`Ord` order by `BStack` instance address then by cursor offset.
+- **`alloc` feature**: Adds region-based allocation over a `BStack` payload.
+  - **`BStackAllocator` trait**: Standard interface for types that own a `BStack` and manage contiguous byte regions within its payload. Requires `stack()`, `into_stack()`, `alloc()`, and `realloc()`; provides a default no-op `dealloc()`, and delegation helpers `len()` / `is_empty()`. Includes `Debug`, `From<BStack>`, and `From<LinearBStackAllocator> for BStack` on `LinearBStackAllocator`.
+  - **`BStackSlice<'a, A>`**: Lightweight `Copy` handle (allocator reference + `offset` + `len`) to a contiguous region. Exposes `read`, `read_into`, `read_range_into`, `subslice`, `subslice_range`, `reader`, `reader_at`, `to_bytes`, `from_bytes`; and (with `set`) `write`, `write_range`, `zero`, `zero_range`, `writer`, `writer_at`. Trait impls: `PartialEq`/`Eq`/`Hash` by `(offset, len)`; `PartialOrd`/`Ord` by `(offset, len)`; `From<BStackSlice> for [u8; 16]`.
+  - **`BStackSliceReader<'a, A>`**: Cursor-based reader over a `BStackSlice`, implementing `io::Read` and `io::Seek` in the slice's coordinate space. Trait impls: `PartialEq`/`Eq`/`Hash` by `(slice, cursor)`; `PartialOrd`/`Ord` by absolute payload position `slice.start() + cursor`, then `slice.len()`.
+  - **`BStackSliceWriter<'a, A>`** (requires `alloc` + `set`): Cursor-based writer over a `BStackSlice`, implementing `io::Write` and `io::Seek`. Every `write` call delegates to `BStack::set` and is durably synced. Same trait impls as `BStackSliceReader`.
+  - **Cross-type comparisons**: `PartialEq` and `PartialOrd` are defined between `BStackSliceReader` and `BStackSliceWriter` using the same `(abs_pos, len)` key (requires `set`). Both cursor types also implement `PartialEq<BStackSlice>` (cursor position ignored).
+  - **`From` conversions**: `BStackSlice` ↔ `BStackSliceReader`, `BStackSlice` ↔ `BStackSliceWriter`, `BStackSliceReader` ↔ `BStackSliceWriter`.
   - **`LinearBStackAllocator`**: Reference bump allocator that appends regions sequentially. `realloc` is O(1) for the tail allocation and returns `Unsupported` for non-tail slices. `dealloc` reclaims the tail via `BStack::discard`; non-tail deallocations are a no-op. Every operation maps to exactly one `BStack` call and is crash-safe by inheritance.
 
 ## [0.1.4] - 2026-04-25

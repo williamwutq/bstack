@@ -91,6 +91,33 @@
 //! [`BStack::extend`]).  This is typically fine — the data simply hasn't been
 //! written yet — but callers that need write-then-allocate atomicity must
 //! arrange it themselves.
+//!
+//! # Trait implementations
+//!
+//! ## `BStackSlice`
+//!
+//! | Trait | Semantics |
+//! |-------|-----------|
+//! | `PartialEq` / `Eq` | Compares `(offset, len)`. The allocator reference is **not** compared — callers that need allocator identity must check it separately. |
+//! | `Hash` | Hashes `(offset, len)`, consistent with `PartialEq`. |
+//! | `PartialOrd` / `Ord` | Ordered by `offset`, then by `len`. Reflects document order within a payload. |
+//! | `From<BStackSlice> for [u8; 16]` | Serialises to `[offset_le8 ‖ len_le8]`. Reconstruct with [`BStackSlice::from_bytes`]. |
+//!
+//! ## `BStackSliceReader` and `BStackSliceWriter`
+//!
+//! | Trait | Semantics |
+//! |-------|-----------|
+//! | `PartialEq` / `Eq` | Equal when both the underlying slice (`offset` + `len`) and the cursor position match. |
+//! | `Hash` | Hashes `(slice, cursor)`, consistent with `PartialEq`. |
+//! | `PartialOrd` / `Ord` | Ordered by **absolute payload position** `slice.start() + cursor`, then by `slice.len()`. |
+//!
+//! Reader and writer are also **cross-comparable**: `PartialEq` and `PartialOrd` are defined between
+//! `BStackSliceReader` and `BStackSliceWriter` using the same `(abs_pos, len)` key (requires the `set`
+//! feature), so the two cursor types can be mixed freely in sorted collections.
+//!
+//! Additionally, both reader and writer implement `PartialEq` against a bare `BStackSlice`, returning
+//! `true` when the cursor's underlying slice equals the slice (cursor position is ignored for this
+//! comparison).
 
 #![cfg(feature = "alloc")]
 
@@ -449,6 +476,7 @@ impl<'a, A: BStackAllocator> PartialEq for BStackSlice<'a, A> {
 
 impl<'a, A: BStackAllocator> Eq for BStackSlice<'a, A> {}
 
+/// Hashes `(offset, len)`, consistent with [`PartialEq`].
 impl<'a, A: BStackAllocator> Hash for BStackSlice<'a, A> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.offset.hash(state);
@@ -829,6 +857,19 @@ impl<'a, A: BStackAllocator> PartialEq<BStackSlice<'a, A>> for BStackSliceReader
 impl<'a, A: BStackAllocator> PartialEq<BStackSlice<'a, A>> for BStackSliceWriter<'a, A> {
     fn eq(&self, other: &BStackSlice<'a, A>) -> bool {
         &self.slice == other
+    }
+}
+
+impl<'a, A: BStackAllocator> PartialOrd<BStackSliceReader<'a, A>> for BStackSlice<'a, A> {
+    fn partial_cmp(&self, other: &BStackSliceReader<'a, A>) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other.slice()))
+    }
+}
+
+#[cfg(feature = "set")]
+impl<'a, A: BStackAllocator> PartialOrd<BStackSlice<'a, A>> for BStackSliceWriter<'a, A> {
+    fn partial_cmp(&self, other: &BStackSlice<'a, A>) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other.slice()))
     }
 }
 
