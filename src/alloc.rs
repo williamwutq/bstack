@@ -1312,6 +1312,13 @@ impl FirstFitBStackAllocator {
             return Ok(Self { stack });
         }
         // Validate header
+        let stack_len = stack.len()?;
+        if stack_len < Self::OFFSET_SIZE + Self::HEADER_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "stack too short to contain allocator header",
+            ));
+        }
         let header = stack.get(Self::OFFSET_SIZE, Self::OFFSET_SIZE + Self::HEADER_SIZE)?;
         // Check magic prefix for compatibility with 0.1.x files.
         if header[..ALFF_MAGIC_PREFIX.len()] != ALFF_MAGIC_PREFIX {
