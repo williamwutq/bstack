@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.1.6] - 2026-04-26
 
 ### Added
 
@@ -16,6 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`FirstFitBStackAllocator::realloc` — incorrect merged block size**: the in-place merge computed `merged_size = block_size + next_block_size`, omitting the 24-byte `BLOCK_OVERHEAD_SIZE` that sits between the two original blocks. This caused the header to advertise a smaller extent than where the footer was actually written, making any subsequent free-and-coalesce operation navigate to the wrong position. Fixed to `block_size + BLOCK_OVERHEAD_SIZE + next_block_size`.
 - **`FirstFitBStackAllocator::realloc` — split threshold too loose**: the split condition used `merged_size > aligned_new_len + BLOCK_FOOTER_SIZE + MIN_BLOCK_PAYLOAD_SIZE` (strict `>`). Because `BLOCK_FOOTER_SIZE + MIN_BLOCK_PAYLOAD_SIZE = BLOCK_OVERHEAD_SIZE = 24` and all sizes are multiples of 8, the minimum triggering case was `merged_size = aligned_new_len + 32`, producing a remainder of 8 bytes — below `MIN_BLOCK_PAYLOAD_SIZE` (16) and too small to hold the free block's `next_free`/`prev_free` pointers. Fixed to `merged_size >= aligned_new_len + BLOCK_OVERHEAD_SIZE + MIN_BLOCK_PAYLOAD_SIZE`, guaranteeing remainder ≥ 16 bytes.
+- **`FirstFitBStackAllocator::alloc` and `realloc` — split/no-split detection inconsistent with `unlink_block`**: `alloc` and `realloc` computed the new payload location using `found_size > aligned_len + BLOCK_FOOTER_SIZE + MIN_BLOCK_PAYLOAD_SIZE` to decide whether `unlink_block` would split, but `unlink_block` itself uses `found_size >= aligned_len + BLOCK_OVERHEAD_SIZE + MIN_BLOCK_PAYLOAD_SIZE`. When `found_size` fell in the gap between those two thresholds (i.e., `aligned_len + 32 ≤ found_size < aligned_len + 40`), the caller assumed a split occurred and returned a slice pointing to the back of the found block, while `unlink_block` had in fact written the user data to the front. Every read and write via the returned slice then accessed the wrong memory region, silently corrupting or discarding user data. Fixed by aligning both conditions to `>= aligned_len + BLOCK_OVERHEAD_SIZE + MIN_BLOCK_PAYLOAD_SIZE`.
+- **`FirstFitBStackAllocator::realloc` — stale bytes exposed on in-place grow**: when `realloc` grew a slice without moving it (block already large enough, tail-extend, or in-place merge), bytes between the old `slice.len()` and the new `len` could contain stale data from a previous larger allocation. The affected paths now zero exactly `[slice.len(), new_len)` before returning, matching the zero-initialisation contract of `alloc` and `LinearBStackAllocator::realloc`. The copy-and-move paths are fixed by limiting the copy to `slice.len()` bytes (not `aligned_current_len`), leaving the rest of the destination buffer zero-initialised.
 
 ## [0.1.5] - 2026-04-26 [YANKED]
 

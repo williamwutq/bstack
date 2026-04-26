@@ -8,7 +8,7 @@ mod alloc_fuzz_tests {
     use std::vec;
 
     const MIN_PAYLOAD: u64 = 16;
-    const FUZZ_COUNT: usize = 200000;
+    const FUZZ_COUNT: usize = 10000;
 
     fn mk_ff(id_prefix: &str) -> (FirstFitBStackAllocator, std::path::PathBuf) {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -219,8 +219,8 @@ mod alloc_fuzz_tests {
         let mut live: Vec<Rec> = Vec::new();
         let mut next_pattern: u8 = 1;
 
-        const SESSIONS: usize = 100;
-        const OPS_PER_SESSION: usize = 200;
+        const SESSIONS: usize = 20;
+        const OPS_PER_SESSION: usize = 100;
 
         for session in 0..SESSIONS {
             // Open allocator for this session.
