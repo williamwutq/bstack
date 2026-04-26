@@ -24,11 +24,17 @@ TEST_OBJ = test_bstack.o
 LIB_SET  = libbstack-set.a
 OBJ_SET  = bstack-set.o
 
+# Alloc layer (bstack_alloc.h / bstack_alloc.c).
+LIB_ALLOC     = libbstack-alloc.a
+OBJ_ALLOC     = bstack_alloc.o
+LIB_ALLOC_SET = libbstack-alloc-set.a
+OBJ_ALLOC_SET = bstack_alloc-set.o
+
 EXAMPLE_NAMES = basic buffer_reuse journal reading vec_store
 EXAMPLE_BINS  = $(addprefix ../examples/,$(addsuffix $(EXE_EXT),$(EXAMPLE_NAMES)))
 HASHMAP_BIN   = ../examples/hashmap$(EXE_EXT)
 
-.PHONY: all test leaks clean \
+.PHONY: all test leaks clean alloc \
         example example-basic example-buffer_reuse example-journal \
         example-reading example-vec_store example-hashmap
 
@@ -46,6 +52,20 @@ $(OBJ_SET): bstack.c bstack.h
 
 $(LIB_SET): $(OBJ_SET)
 	ar rcs $@ $^
+
+$(OBJ_ALLOC): bstack_alloc.c bstack_alloc.h bstack.h
+	$(CC) $(CFLAGS) $(DEFINES) -c -o $@ $<
+
+$(OBJ_ALLOC_SET): bstack_alloc.c bstack_alloc.h bstack.h
+	$(CC) $(CFLAGS) -DBSTACK_FEATURE_SET -c -o $@ $<
+
+$(LIB_ALLOC): $(OBJ) $(OBJ_ALLOC)
+	ar rcs $@ $^
+
+$(LIB_ALLOC_SET): $(OBJ_SET) $(OBJ_ALLOC_SET)
+	ar rcs $@ $^
+
+alloc: $(LIB_ALLOC)
 
 $(TEST_OBJ): test_bstack.c bstack.h
 	$(CC) $(CFLAGS) $(DEFINES) -c -o $@ $<
@@ -119,4 +139,5 @@ example: $(EXAMPLE_BINS) $(HASHMAP_BIN)
 
 clean:
 	rm -f $(OBJ) $(TEST_OBJ) $(OBJ_SET) $(LIB) $(LIB_SET) $(TEST_BIN) \
+	      $(OBJ_ALLOC) $(OBJ_ALLOC_SET) $(LIB_ALLOC) $(LIB_ALLOC_SET) \
 	      $(EXAMPLE_BINS) $(HASHMAP_BIN)
