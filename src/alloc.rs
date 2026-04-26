@@ -1455,14 +1455,69 @@ impl FirstFitBStackAllocator {
     }
 
     fn recovery(&self) -> io::Result<()> {
-        // First ensure the the length is a multiple of 8.
         // Walk the stack and rebuild the free list in memory, then write it back to disk.
         // This is needed when the allocator detects corruption or an unclean shutdown.
         // The free list is reconstructed by scanning through all blocks and treating any block
         // with an invalid size or missing free flag as allocated, while valid free blocks are
         // added to the free list.  This allows recovery from various forms of corruption,
         // including torn writes that partially update a block header or footer.
-        todo!("ALFF recovery not implemented yet");
+        let arena_start = Self::OFFSET_SIZE + Self::HEADER_SIZE;
+        let stack_len = self.stack.len()?;
+        let mut pos = arena_start;
+        let mut free_blocks: Vec<u64> = Vec::new();
+
+        while pos < stack_len {
+            let remaining = stack_len - pos;
+
+            // If fewer than BLOCK_OVERHEAD_SIZE bytes remain, a partial block was written; truncate.
+            if remaining < Self::BLOCK_OVERHEAD_SIZE {
+                self.stack.discard(remaining)?;
+                break;
+            }
+
+            // Read block header: size(8) + flags(4) + reserved(4)
+            let mut hdr_buf = [0u8; 16];
+            self.stack.get_into(pos, &mut hdr_buf)?;
+            let size = u64::from_le_bytes(hdr_buf[0..8].try_into().unwrap());
+            let is_free = hdr_buf[8] & 1 != 0;
+
+            // Validate: size must be ≥ minimum, 8-aligned, and the full block must fit in the stack.
+            let block_total = match size.checked_add(Self::BLOCK_OVERHEAD_SIZE).filter(|&t| {
+                size >= Self::MIN_BLOCK_PAYLOAD_SIZE && size % 8 == 0 && pos + t <= stack_len
+            }) {
+                Some(t) => t,
+                None => {
+                    // Corrupt or partial block at the tail; truncate everything from here.
+                    self.stack.discard(stack_len - pos)?;
+                    break;
+                }
+            };
+
+            if is_free {
+                free_blocks.push(pos + Self::BLOCK_HEADER_SIZE);
+            }
+            pos += block_total;
+        }
+
+        // Rebuild the free list: rewrite next_free/prev_free for each free block in encounter order,
+        // ignoring all stored pointer values.
+        let count = free_blocks.len();
+        for i in 0..count {
+            let curr = free_blocks[i];
+            let next = if i + 1 < count { free_blocks[i + 1] } else { 0 };
+            let prev = if i > 0 { free_blocks[i - 1] } else { 0 };
+            let mut ptr_buf = [0u8; 16];
+            ptr_buf[0..8].copy_from_slice(&next.to_le_bytes());
+            ptr_buf[8..16].copy_from_slice(&prev.to_le_bytes());
+            self.stack.set(curr, &ptr_buf)?;
+        }
+
+        // Update free_head to the first free block found, or 0 if none.
+        let new_free_head = free_blocks.first().copied().unwrap_or(0);
+        self.stack
+            .set(Self::FREE_HEAD_OFFSET, &new_free_head.to_le_bytes())?;
+
+        self.clear_recovery_needed()
     }
 }
 
