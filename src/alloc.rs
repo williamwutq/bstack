@@ -853,6 +853,12 @@ impl<'a, A: BStackAllocator> PartialEq<BStackSlice<'a, A>> for BStackSliceReader
     }
 }
 
+impl<'a, A: BStackAllocator> PartialEq<BStackSliceReader<'a, A>> for BStackSlice<'a, A> {
+    fn eq(&self, other: &BStackSliceReader<'a, A>) -> bool {
+        self == &other.slice
+    }
+}
+
 #[cfg(feature = "set")]
 impl<'a, A: BStackAllocator> PartialEq<BStackSlice<'a, A>> for BStackSliceWriter<'a, A> {
     fn eq(&self, other: &BStackSlice<'a, A>) -> bool {
@@ -860,16 +866,36 @@ impl<'a, A: BStackAllocator> PartialEq<BStackSlice<'a, A>> for BStackSliceWriter
     }
 }
 
+#[cfg(feature = "set")]
+impl<'a, A: BStackAllocator> PartialEq<BStackSliceWriter<'a, A>> for BStackSlice<'a, A> {
+    fn eq(&self, other: &BStackSliceWriter<'a, A>) -> bool {
+        self == &other.slice
+    }
+}
+
 impl<'a, A: BStackAllocator> PartialOrd<BStackSliceReader<'a, A>> for BStackSlice<'a, A> {
     fn partial_cmp(&self, other: &BStackSliceReader<'a, A>) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other.slice()))
+        Some(self.cmp(&other.slice()))
+    }
+}
+
+impl<'a, A: BStackAllocator> PartialOrd<BStackSlice<'a, A>> for BStackSliceReader<'a, A> {
+    fn partial_cmp(&self, other: &BStackSlice<'a, A>) -> Option<std::cmp::Ordering> {
+        Some(self.slice().cmp(other))
+    }
+}
+
+#[cfg(feature = "set")]
+impl<'a, A: BStackAllocator> PartialOrd<BStackSliceReader<'a, A>> for BStackSlice<'a, A> {
+    fn partial_cmp(&self, other: &BStackSliceReader<'a, A>) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(&other.slice()))
     }
 }
 
 #[cfg(feature = "set")]
 impl<'a, A: BStackAllocator> PartialOrd<BStackSlice<'a, A>> for BStackSliceWriter<'a, A> {
     fn partial_cmp(&self, other: &BStackSlice<'a, A>) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other.slice()))
+        Some(self.cmp(&other.slice()))
     }
 }
 

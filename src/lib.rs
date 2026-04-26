@@ -34,7 +34,7 @@
 //! ```
 //!
 //! * **`magic`** — 8 bytes: `BSTK` + major(1 B) + minor(1 B) + patch(1 B) + reserved(1 B).
-//!   This version writes `BSTK\x00\x01\x04\x00` (0.1.4).  [`open`](BStack::open)
+//!   This version writes `BSTK\x00\x01\x05\x00` (0.1.5).  [`open`](BStack::open)
 //!   accepts any file whose first 6 bytes match `BSTK\x00\x01` (any 0.1.x) and
 //!   rejects anything with a different major or minor.
 //! * **`clen`** — little-endian `u64` recording the *committed* payload length.
@@ -187,7 +187,7 @@
 //!
 //! | Trait | Semantics |
 //! |-------|-----------|
-//! | `Debug` | Shows `version` (semver string from the magic header, e.g. `"0.1.4"`) and `len` (`Option<u64>`, `None` on I/O failure). |
+//! | `Debug` | Shows `version` (semver string from the magic header, e.g. `"0.1.5"`) and `len` (`Option<u64>`, `None` on I/O failure). |
 //! | `PartialEq` / `Eq` | **Pointer identity.** Two values are equal iff they are the same instance. No two distinct `BStack` values in one process can refer to the same file. |
 //! | `Hash` | Hashes the instance address — consistent with pointer-identity `PartialEq`. |
 //!
@@ -326,8 +326,8 @@ use windows_sys::Win32::Storage::FileSystem::{
 #[cfg(windows)]
 use windows_sys::Win32::System::IO::OVERLAPPED;
 
-/// Full magic for files written by this version (`BSTK` + major 0 + minor 1 + patch 4 + 0).
-const MAGIC: [u8; 8] = *b"BSTK\x00\x01\x04\x00";
+/// Full magic for files written by this version (`BSTK` + major 0 + minor 1 + patch 5 + 0).
+const MAGIC: [u8; 8] = *b"BSTK\x00\x01\x05\x00";
 
 /// Compatibility prefix checked on open: `BSTK` + major 0 + minor 1.
 /// Any file whose first 6 bytes match is considered a compatible 0.1.x file.
