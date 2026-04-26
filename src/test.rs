@@ -2574,6 +2574,195 @@ mod first_fit_tests {
     }
 
     // -----------------------------------------------------------------------
+    // Realloc: in-place merge with adjacent free block
+
+    #[test]
+    fn realloc_inplace_merge_no_split() {
+        // A(16) | B(16=free) | C(sentinel)
+        // merged_size = 16+24+16 = 56; grow A to 56 → exact fit, no split.
+        let (alloc, path) = mk_ff("merge_nosplit");
+        let _g = Guard(path);
+        let a = alloc.alloc(16).unwrap();
+        let b = alloc.alloc(16).unwrap();
+        let _c = alloc.alloc(16).unwrap();
+        let a_start = a.start();
+        alloc.dealloc(b).unwrap();
+        let a2 = alloc.realloc(a, 56).unwrap();
+        assert_eq!(a2.start(), a_start);
+        assert_eq!(a2.len(), 56);
+    }
+
+    #[test]
+    fn realloc_inplace_merge_with_split() {
+        // A(16) | B(80=free) | C(sentinel)
+        // merged = 16+24+80 = 120; grow A to 32 → remainder = 120-32-24 = 64.
+        let (alloc, path) = mk_ff("merge_split");
+        let _g = Guard(path);
+        let a = alloc.alloc(16).unwrap();
+        let b = alloc.alloc(80).unwrap();
+        let _c = alloc.alloc(16).unwrap();
+        let a_start = a.start();
+        alloc.dealloc(b).unwrap();
+        let a2 = alloc.realloc(a, 32).unwrap();
+        assert_eq!(a2.start(), a_start);
+        assert_eq!(a2.len(), 32);
+        // The 64-byte remainder should be back in the free list.
+        let rem = alloc.alloc(64).unwrap();
+        assert_eq!(rem.start(), a_start + 32 + BLOCK_OVERHEAD);
+    }
+
+    #[test]
+    fn realloc_inplace_merge_preserves_data_and_zeroes_new_area() {
+        // Grow in-place via merge; existing bytes survive, new bytes are zero.
+        let (alloc, path) = mk_ff("merge_data");
+        let _g = Guard(path);
+        let a = alloc.alloc(16).unwrap();
+        let b = alloc.alloc(64).unwrap();
+        let _c = alloc.alloc(16).unwrap();
+        a.write(b"0123456789ABCDEF").unwrap();
+        alloc.dealloc(b).unwrap();
+        // merged = 16+24+64 = 104; grow to 40 → remainder = 104-40-24 = 40
+        let a2 = alloc.realloc(a, 40).unwrap();
+        let data = a2.read().unwrap();
+        assert_eq!(&data[..16], b"0123456789ABCDEF");
+        assert_eq!(&data[16..], vec![0u8; 24]);
+    }
+
+    #[test]
+    fn realloc_inplace_merge_split_remainder_is_zero_initialised() {
+        // The split remainder is fresh free space; next alloc into it should be zeroed.
+        let (alloc, path) = mk_ff("merge_rem_zero");
+        let _g = Guard(path);
+        let a = alloc.alloc(16).unwrap();
+        let b = alloc.alloc(80).unwrap();
+        let _c = alloc.alloc(16).unwrap();
+        // Write garbage into B so the overlap area is dirty before freeing.
+        b.write(&vec![0xFFu8; 80]).unwrap();
+        alloc.dealloc(b).unwrap();
+        let _a2 = alloc.realloc(a, 32).unwrap(); // merge + split
+        let rem = alloc.alloc(64).unwrap();
+        assert_eq!(rem.read().unwrap(), vec![0u8; 64]);
+    }
+
+    #[test]
+    fn realloc_inplace_merge_threshold_boundary() {
+        // merged_size = aligned_new_len + BLOCK_OVERHEAD + MIN_PAYLOAD exactly → split happens,
+        // remainder == MIN_PAYLOAD (= 16 bytes, the smallest valid free block).
+        // A(16) | B(56=free) | C(sentinel)
+        // merged = 16+24+56 = 96; grow A to 16+BLOCK_OVERHEAD+MIN_PAYLOAD subtracted away:
+        // aligned_new_len = 96 - 24 - 16 = 56; but that leaves remainder=16. Use aligned_new_len=56.
+        // split condition: 96 >= 56 + 24 + 16 = 96 ✓ (>=, not >)
+        let (alloc, path) = mk_ff("merge_boundary");
+        let _g = Guard(path);
+        let a = alloc.alloc(16).unwrap();
+        let b = alloc.alloc(56).unwrap();
+        let _c = alloc.alloc(16).unwrap();
+        let a_start = a.start();
+        alloc.dealloc(b).unwrap();
+        let a2 = alloc.realloc(a, 56).unwrap();
+        assert_eq!(a2.start(), a_start);
+        assert_eq!(a2.len(), 56);
+        // Remainder of exactly 16 bytes should be in the free list.
+        let rem = alloc.alloc(16).unwrap();
+        assert_eq!(rem.start(), a_start + 56 + BLOCK_OVERHEAD);
+    }
+
+    #[test]
+    fn realloc_inplace_merge_below_threshold_no_split() {
+        // merged_size = aligned_new_len + BLOCK_OVERHEAD + MIN_PAYLOAD - 8 → no split.
+        // A(16) | B(48=free) | C(sentinel)
+        // merged = 16+24+48 = 88; aligned_new_len = 88 - 24 - 16 + 8 = 56.
+        // split condition: 88 >= 56 + 40 = 96? No → no split.
+        let (alloc, path) = mk_ff("merge_nosplit_thresh");
+        let _g = Guard(path);
+        let a = alloc.alloc(16).unwrap();
+        let b = alloc.alloc(48).unwrap();
+        let _c = alloc.alloc(16).unwrap();
+        let a_start = a.start();
+        alloc.dealloc(b).unwrap();
+        let a2 = alloc.realloc(a, 56).unwrap();
+        assert_eq!(a2.start(), a_start);
+        assert_eq!(a2.len(), 56);
+        // No remainder in free list — next alloc must extend the stack.
+        let before = alloc.len().unwrap();
+        let _x = alloc.alloc(16).unwrap();
+        assert!(alloc.len().unwrap() > before);
+    }
+
+    // -----------------------------------------------------------------------
+    // Recovery: partial-split header repair
+
+    #[test]
+    fn recovery_partial_split_repairs_header() {
+        // Manually construct the on-disk state left by a crash between the
+        // zero_buff write (which wrote the inner footer and second sub-block)
+        // and the header-shrink write.  After reopening, recovery must detect
+        // the three-point signature and fix the header.
+        //
+        // Logical layout (post-crash):
+        //   [48..64)  block-A header : size=80(H), flags=0
+        //   [64..96)  block-A payload (first 32 bytes = valid user data)
+        //   [96..104) inner footer   : 32(R)
+        //   [104..120) second sub-block header : size=24(F), is_free=1
+        //   [120..144) second sub-block payload : zeros
+        //   [144..152) outer footer  : 24(F)
+        //   [152..168) sentinel header : size=16, flags=0
+        //   [168..184) sentinel payload
+        //   [184..192) sentinel footer : 16
+        //
+        // Recovery: detects H=80, F=24 → R=32; validates inner footer and
+        // second header; repairs block-A header to 32; adds free block at 120.
+        static C: AtomicU64 = AtomicU64::new(0);
+        let id = C.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "bstack_ff_partial_split_{}_{}.bin",
+            std::process::id(),
+            id
+        ));
+        let _g = Guard(path.clone());
+
+        {
+            let stack = BStack::open(&path).unwrap();
+            // ALFF header: 16 zero bytes + magic + recovery_needed=1 + rest zeros
+            let mut alff = [0u8; 48];
+            alff[16..24].copy_from_slice(b"ALFF\x00\x01\x00\x00");
+            alff[24..28].copy_from_slice(&1u32.to_le_bytes()); // recovery_needed
+            stack.push(&alff).unwrap();
+
+            // Block A header: size=80, flags=0 (allocated, but header not yet shrunk)
+            let mut a_hdr = [0u8; 16];
+            a_hdr[..8].copy_from_slice(&80u64.to_le_bytes());
+            stack.push(&a_hdr).unwrap();
+
+            // Block A payload (80 bytes): inner footer + second sub-block embedded
+            let mut a_pay = [0u8; 80];
+            // [32..40): inner footer = R=32
+            a_pay[32..40].copy_from_slice(&32u64.to_le_bytes());
+            // [40..48): second sub-block size = F=24
+            a_pay[40..48].copy_from_slice(&24u64.to_le_bytes());
+            // [48..52): is_free = 1
+            a_pay[48..52].copy_from_slice(&1u32.to_le_bytes());
+            // [52..80): zeros (reserved + second sub-block payload)
+            stack.push(&a_pay).unwrap();
+
+            // Outer footer: F=24
+            stack.push(&24u64.to_le_bytes()).unwrap();
+
+            // Sentinel block: header(size=16,flags=0) + payload(16 zeros) + footer(16)
+            let mut sent = [0u8; 40];
+            sent[..8].copy_from_slice(&16u64.to_le_bytes());
+            sent[32..40].copy_from_slice(&16u64.to_le_bytes());
+            stack.push(&sent).unwrap();
+        }
+
+        let alloc = FirstFitBStackAllocator::new(BStack::open(&path).unwrap()).unwrap();
+        // After recovery: block-A header fixed to 32, free block at 120 (size=24).
+        // alloc(24) must return the repaired free block.
+        let s = alloc.alloc(24).unwrap();
+        assert_eq!(s.start(), 120); // ALFF_HDR_OFFSET(48) + block_hdr(16) + R(32) + footer(8) + hdr(16) = 120
+    }
+
+    // -----------------------------------------------------------------------
     // Persistence
 
     #[test]
