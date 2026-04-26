@@ -26,3 +26,6 @@ windows-sys = { version = "0.52", features = [
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
 ] }
+
+[dev-dependencies]
+rand = "0.10.1"
