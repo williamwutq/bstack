@@ -280,10 +280,14 @@ mod test;
 
 #[cfg(feature = "alloc")]
 mod alloc;
+#[cfg(all(feature = "alloc", feature = "set"))]
+pub use alloc::BStackSliceWriter;
 #[cfg(feature = "alloc")]
 pub use alloc::{BStackAllocator, BStackSlice, BStackSliceReader, LinearBStackAllocator};
 
+use std::fmt;
 use std::fs::{File, OpenOptions};
+use std::hash::{Hash, Hasher};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::RwLock;
@@ -1094,8 +1098,38 @@ impl io::Write for &BStack {
     }
 }
 
-// ---------------------------------------------------------------------------
-// BStackReader
+impl fmt::Debug for BStack {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BStack")
+            .field(
+                "version",
+                &format!("{}.{}.{}", MAGIC[4], MAGIC[5], MAGIC[6]),
+            )
+            .field("len", &self.len().ok())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Eq for BStack {}
+
+/// Two `BStack` instances are equal iff they are the **same instance** in memory.
+///
+/// Because [`BStack::open`] acquires an exclusive advisory lock, no two
+/// `BStack` values within one process can refer to the same file at the same
+/// time.  Pointer identity is therefore the only meaningful equality: a stack
+/// is equal to itself and to nothing else.
+impl PartialEq for BStack {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self, other)
+    }
+}
+
+/// Hashes the instance address, consistent with the pointer-identity [`PartialEq`].
+impl Hash for BStack {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        (self as *const BStack).hash(state);
+    }
+}
 
 /// A cursor-based reader over a [`BStack`] payload.
 ///
@@ -1166,6 +1200,27 @@ impl<'a> BStackReader<'a> {
 impl<'a> From<&'a BStack> for BStackReader<'a> {
     fn from(stack: &'a BStack) -> Self {
         stack.reader()
+    }
+}
+
+impl<'a> From<BStackReader<'a>> for &'a BStack {
+    fn from(val: BStackReader<'a>) -> Self {
+        val.stack
+    }
+}
+
+impl<'a> PartialEq for BStackReader<'a> {
+    fn eq(&self, other: &Self) -> bool {
+        self.stack == other.stack && self.offset == other.offset
+    }
+}
+
+impl<'a> Eq for BStackReader<'a> {}
+
+impl<'a> Hash for BStackReader<'a> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.stack.hash(state);
+        self.offset.hash(state);
     }
 }
 

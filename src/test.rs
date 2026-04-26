@@ -1986,4 +1986,143 @@ mod alloc_tests {
         let sub = s.subslice(2, 8);
         assert_eq!(sub.range(), 2..8);
     }
+
+    // ---- Debug --------------------------------------------------------------
+
+    #[test]
+    fn bstack_debug_contains_version_and_len() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let dbg = format!("{:?}", alloc.stack());
+        assert!(dbg.contains("BStack"), "{dbg}");
+        assert!(dbg.contains("version"), "{dbg}");
+        assert!(dbg.contains("len"), "{dbg}");
+        // Version must be a recognisable semver string.
+        assert!(dbg.contains("0.1"), "{dbg}");
+    }
+
+    #[test]
+    fn slice_reader_debug_uses_public_fields() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(10).unwrap();
+        let reader = s.reader_at(3);
+        let dbg = format!("{:?}", reader);
+        assert!(dbg.contains("BStackSliceReader"), "{dbg}");
+        assert!(dbg.contains("start"), "{dbg}");
+        assert!(dbg.contains("end"), "{dbg}");
+        assert!(dbg.contains("len"), "{dbg}");
+        assert!(dbg.contains("cursor"), "{dbg}");
+        // Raw struct field "offset" must not appear in output.
+        assert!(!dbg.contains("\"offset\""), "raw field in debug: {dbg}");
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn slice_writer_debug_uses_public_fields() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(10).unwrap();
+        let writer = s.writer_at(3);
+        let dbg = format!("{:?}", writer);
+        assert!(dbg.contains("BStackSliceWriter"), "{dbg}");
+        assert!(dbg.contains("start"), "{dbg}");
+        assert!(dbg.contains("end"), "{dbg}");
+        assert!(dbg.contains("len"), "{dbg}");
+        assert!(dbg.contains("cursor"), "{dbg}");
+        assert!(!dbg.contains("\"offset\""), "raw field in debug: {dbg}");
+    }
+
+    // ---- Ord for BStackSliceReader ------------------------------------------
+
+    #[test]
+    fn reader_ord_by_absolute_position() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(10).unwrap();
+        let r0 = s.reader_at(0);
+        let r5 = s.reader_at(5);
+        let r10 = s.reader_at(10);
+        assert!(r0 < r5);
+        assert!(r5 < r10);
+        assert!(r0 < r10);
+        assert_eq!(r5.cmp(&s.reader_at(5)), std::cmp::Ordering::Equal);
+    }
+
+    #[test]
+    fn reader_ord_earlier_slice_before_later() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let a = alloc.alloc(8).unwrap(); // offset 0..8
+        let b = alloc.alloc(8).unwrap(); // offset 8..16
+        assert!(a.reader() < b.reader());
+    }
+
+    #[test]
+    fn reader_ord_same_abs_position_shorter_len_less() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(10).unwrap();
+        let short = s.subslice(0, 3).reader();
+        let long_ = s.subslice(0, 8).reader();
+        // Both cursors are at absolute position 0; shorter slice is less.
+        assert!(short < long_);
+    }
+
+    // ---- Ord for BStackSliceWriter ------------------------------------------
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn writer_ord_by_absolute_position() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(10).unwrap();
+        let w0 = s.writer_at(0);
+        let w5 = s.writer_at(5);
+        assert!(w0 < w5);
+        assert_eq!(w5.cmp(&s.writer_at(5)), std::cmp::Ordering::Equal);
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn writer_ord_earlier_slice_before_later() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let a = alloc.alloc(8).unwrap(); // offset 0..8
+        let b = alloc.alloc(8).unwrap(); // offset 8..16
+        assert!(a.writer() < b.writer());
+    }
+
+    // ---- Cross-type PartialOrd (reader ↔ writer) ----------------------------
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn reader_writer_cross_partial_ord() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(10).unwrap();
+        let r3 = s.reader_at(3);
+        let w5 = s.writer_at(5);
+        let w3 = s.writer_at(3);
+        let r5 = s.reader_at(5);
+        assert!(r3 < w5);
+        assert!(w3 < r5);
+        assert_eq!(r3.partial_cmp(&w3), Some(std::cmp::Ordering::Equal));
+        assert_eq!(w5.partial_cmp(&r5), Some(std::cmp::Ordering::Equal));
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn reader_writer_cross_ord_transitivity() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(20).unwrap();
+        // r2 < w8 < r15: check transitivity across types
+        let r2 = s.reader_at(2);
+        let w8 = s.writer_at(8);
+        let r15 = s.reader_at(15);
+        assert!(r2 < w8);
+        assert!(w8 < r15);
+        assert!(r2 < r15);
+    }
 }

@@ -96,6 +96,7 @@
 
 use crate::BStack;
 use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::io;
 use std::ops::Range;
 
@@ -154,6 +155,34 @@ impl<'a, A: BStackAllocator> BStackSlice<'a, A> {
     /// produce errors on the first I/O call.
     #[inline]
     pub fn new(allocator: &'a A, offset: u64, len: u64) -> Self {
+        Self {
+            allocator,
+            offset,
+            len,
+        }
+    }
+
+    /// Serialize this slice to a 16-byte array for on-disk storage.
+    ///
+    /// Layout: `offset` as 8 bytes little-endian, then `len` as 8 bytes
+    /// little-endian.  Reconstruct with [`BStackSlice::from_bytes`].
+    #[inline]
+    pub fn to_bytes(&self) -> [u8; 16] {
+        let mut out = [0u8; 16];
+        out[..8].copy_from_slice(&self.offset.to_le_bytes());
+        out[8..].copy_from_slice(&self.len.to_le_bytes());
+        out
+    }
+
+    /// Reconstruct a `BStackSlice` from a 16-byte array produced by
+    /// [`BStackSlice::to_bytes`].
+    ///
+    /// Does not validate that the encoded range lies within the payload.
+    /// Invalid slices produce errors on the first I/O call.
+    #[inline]
+    pub fn from_bytes(allocator: &'a A, bytes: [u8; 16]) -> Self {
+        let offset = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+        let len = u64::from_le_bytes(bytes[8..].try_into().unwrap());
         Self {
             allocator,
             offset,
@@ -380,6 +409,84 @@ impl<'a, A: BStackAllocator> BStackSlice<'a, A> {
             cursor: offset,
         }
     }
+
+    /// Create a cursor-based writer positioned at the start of this slice.
+    ///
+    /// Requires the `set` feature.
+    #[cfg(feature = "set")]
+    pub fn writer(&self) -> BStackSliceWriter<'a, A> {
+        BStackSliceWriter {
+            slice: *self,
+            cursor: 0,
+        }
+    }
+
+    /// Create a cursor-based writer positioned at `offset` bytes into this slice.
+    ///
+    /// `offset` is relative to `self.start()`.  Writing past `self.len()`
+    /// returns `Ok(0)`.
+    ///
+    /// Requires the `set` feature.
+    #[cfg(feature = "set")]
+    pub fn writer_at(&self, offset: u64) -> BStackSliceWriter<'a, A> {
+        BStackSliceWriter {
+            slice: *self,
+            cursor: offset,
+        }
+    }
+}
+
+/// Two slices are equal when their `offset` and `len` match.
+///
+/// The allocator is not compared — callers working across allocators should
+/// compare [`start`](BStackSlice::start) and [`len`](BStackSlice::len)
+/// explicitly if allocator identity matters.
+impl<'a, A: BStackAllocator> PartialEq for BStackSlice<'a, A> {
+    fn eq(&self, other: &Self) -> bool {
+        self.offset == other.offset && self.len == other.len
+    }
+}
+
+impl<'a, A: BStackAllocator> Eq for BStackSlice<'a, A> {}
+
+impl<'a, A: BStackAllocator> Hash for BStackSlice<'a, A> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.offset.hash(state);
+        self.len.hash(state);
+    }
+}
+
+impl<'a, A: BStackAllocator> PartialOrd for BStackSlice<'a, A> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Slices are ordered by start offset, then by length — consistent with [`Eq`].
+impl<'a, A: BStackAllocator> Ord for BStackSlice<'a, A> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.offset
+            .cmp(&other.offset)
+            .then(self.len.cmp(&other.len))
+    }
+}
+
+/// Serialize the slice to its 16-byte on-disk representation.
+///
+/// Equivalent to [`BStackSlice::to_bytes`].
+impl<'a, A: BStackAllocator> From<BStackSlice<'a, A>> for [u8; 16] {
+    fn from(slice: BStackSlice<'a, A>) -> Self {
+        slice.to_bytes()
+    }
+}
+
+/// Convert a slice into a reader positioned at the start.
+///
+/// Equivalent to [`BStackSlice::reader`].
+impl<'a, A: BStackAllocator> From<BStackSlice<'a, A>> for BStackSliceReader<'a, A> {
+    fn from(slice: BStackSlice<'a, A>) -> Self {
+        slice.reader()
+    }
 }
 
 /// A cursor-based reader over a [`BStackSlice`].
@@ -406,8 +513,9 @@ impl<'a, A: BStackAllocator> Clone for BStackSliceReader<'a, A> {
 impl<'a, A: BStackAllocator> fmt::Debug for BStackSliceReader<'a, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BStackSliceReader")
-            .field("offset", &self.slice.offset)
-            .field("len", &self.slice.len)
+            .field("start", &self.slice.start())
+            .field("end", &self.slice.end())
+            .field("len", &self.slice.len())
             .field("cursor", &self.cursor)
             .finish_non_exhaustive()
     }
@@ -462,6 +570,291 @@ impl<'a, A: BStackAllocator> io::Seek for BStackSliceReader<'a, A> {
         }
         self.cursor = new_pos as u64;
         Ok(self.cursor)
+    }
+}
+
+/// Two readers are equal when they wrap equal slices and share the same cursor.
+impl<'a, A: BStackAllocator> PartialEq for BStackSliceReader<'a, A> {
+    fn eq(&self, other: &Self) -> bool {
+        self.slice == other.slice && self.cursor == other.cursor
+    }
+}
+
+impl<'a, A: BStackAllocator> Eq for BStackSliceReader<'a, A> {}
+
+impl<'a, A: BStackAllocator> Hash for BStackSliceReader<'a, A> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.slice.hash(state);
+        self.cursor.hash(state);
+    }
+}
+
+impl<'a, A: BStackAllocator> PartialOrd for BStackSliceReader<'a, A> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Readers are ordered by absolute payload position (`slice.start() + cursor`),
+/// then by slice length.
+impl<'a, A: BStackAllocator> Ord for BStackSliceReader<'a, A> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        let self_pos = self.slice.start() + self.cursor;
+        let other_pos = other.slice.start() + other.cursor;
+        self_pos
+            .cmp(&other_pos)
+            .then(self.slice.len().cmp(&other.slice.len()))
+    }
+}
+
+/// Convert a reader back into its underlying slice, discarding the cursor.
+///
+/// Equivalent to [`BStackSliceReader::slice`].
+impl<'a, A: BStackAllocator> From<BStackSliceReader<'a, A>> for BStackSlice<'a, A> {
+    fn from(reader: BStackSliceReader<'a, A>) -> Self {
+        reader.slice()
+    }
+}
+
+/// A cursor-based writer over a [`BStackSlice`].
+///
+/// Implements [`io::Write`] and [`io::Seek`] within the coordinate space of
+/// the slice — position 0 maps to `slice.offset` in the underlying payload,
+/// and writes cannot exceed `slice.offset + slice.len`.
+///
+/// Every call to [`write`](io::Write::write) delegates to [`BStack::set`] and
+/// is durably synced before returning.
+///
+/// Constructed via [`BStackSlice::writer`] or [`BStackSlice::writer_at`].
+///
+/// Requires the `set` feature.
+#[cfg(feature = "set")]
+pub struct BStackSliceWriter<'a, A: BStackAllocator> {
+    slice: BStackSlice<'a, A>,
+    cursor: u64,
+}
+
+#[cfg(feature = "set")]
+impl<'a, A: BStackAllocator> Clone for BStackSliceWriter<'a, A> {
+    fn clone(&self) -> Self {
+        Self {
+            slice: self.slice,
+            cursor: self.cursor,
+        }
+    }
+}
+
+#[cfg(feature = "set")]
+impl<'a, A: BStackAllocator> fmt::Debug for BStackSliceWriter<'a, A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BStackSliceWriter")
+            .field("start", &self.slice.start())
+            .field("end", &self.slice.end())
+            .field("len", &self.slice.len())
+            .field("cursor", &self.cursor)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "set")]
+impl<'a, A: BStackAllocator> BStackSliceWriter<'a, A> {
+    /// Return the current cursor position within the slice (not the payload).
+    #[inline]
+    pub fn position(&self) -> u64 {
+        self.cursor
+    }
+
+    /// Return the underlying [`BStackSlice`].
+    #[inline]
+    pub fn slice(&self) -> BStackSlice<'a, A> {
+        self.slice
+    }
+}
+
+#[cfg(feature = "set")]
+impl<'a, A: BStackAllocator> io::Write for BStackSliceWriter<'a, A> {
+    /// Write bytes at the current cursor position, then advance the cursor.
+    ///
+    /// Writes `min(buf.len(), remaining)` bytes where `remaining` is
+    /// `self.slice.len() - self.cursor`.  Returns `Ok(0)` when the cursor is
+    /// at or past the end of the slice.  Every call issues a durable sync.
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if buf.is_empty() || self.cursor >= self.slice.len {
+            return Ok(0);
+        }
+        let available = (self.slice.len - self.cursor) as usize;
+        let n = buf.len().min(available);
+        let abs_start = self.slice.offset + self.cursor;
+        self.slice.stack().set(abs_start, &buf[..n])?;
+        self.cursor += n as u64;
+        Ok(n)
+    }
+
+    /// No-op: every [`write`](io::Write::write) is already durably synced.
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(feature = "set")]
+impl<'a, A: BStackAllocator> io::Seek for BStackSliceWriter<'a, A> {
+    /// Move the cursor within the slice's coordinate space.
+    ///
+    /// [`io::SeekFrom::End`] is relative to `self.slice.len`.  Seeking past
+    /// the end is allowed; subsequent writes return `Ok(0)`.  Seeking before
+    /// position 0 returns [`io::ErrorKind::InvalidInput`].
+    fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
+        let len = self.slice.len as i128;
+        let new_pos = match pos {
+            io::SeekFrom::Start(n) => n as i128,
+            io::SeekFrom::End(n) => len + n as i128,
+            io::SeekFrom::Current(n) => self.cursor as i128 + n as i128,
+        };
+        if new_pos < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "seek before beginning of slice",
+            ));
+        }
+        self.cursor = new_pos as u64;
+        Ok(self.cursor)
+    }
+}
+
+#[cfg(feature = "set")]
+impl<'a, A: BStackAllocator> PartialEq for BStackSliceWriter<'a, A> {
+    fn eq(&self, other: &Self) -> bool {
+        self.slice == other.slice && self.cursor == other.cursor
+    }
+}
+
+#[cfg(feature = "set")]
+impl<'a, A: BStackAllocator> Eq for BStackSliceWriter<'a, A> {}
+
+#[cfg(feature = "set")]
+impl<'a, A: BStackAllocator> Hash for BStackSliceWriter<'a, A> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.slice.hash(state);
+        self.cursor.hash(state);
+    }
+}
+
+#[cfg(feature = "set")]
+impl<'a, A: BStackAllocator> PartialOrd for BStackSliceWriter<'a, A> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Writers are ordered by absolute payload position (`slice.start() + cursor`),
+/// then by slice length.
+#[cfg(feature = "set")]
+impl<'a, A: BStackAllocator> Ord for BStackSliceWriter<'a, A> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        let self_pos = self.slice.start() + self.cursor;
+        let other_pos = other.slice.start() + other.cursor;
+        self_pos
+            .cmp(&other_pos)
+            .then(self.slice.len().cmp(&other.slice.len()))
+    }
+}
+
+/// Convert a slice into a writer positioned at the start.
+///
+/// Equivalent to [`BStackSlice::writer`].
+#[cfg(feature = "set")]
+impl<'a, A: BStackAllocator> From<BStackSlice<'a, A>> for BStackSliceWriter<'a, A> {
+    fn from(slice: BStackSlice<'a, A>) -> Self {
+        slice.writer()
+    }
+}
+
+/// Convert a writer back into its underlying slice, discarding the cursor.
+///
+/// Equivalent to [`BStackSliceWriter::slice`].
+#[cfg(feature = "set")]
+impl<'a, A: BStackAllocator> From<BStackSliceWriter<'a, A>> for BStackSlice<'a, A> {
+    fn from(writer: BStackSliceWriter<'a, A>) -> Self {
+        writer.slice()
+    }
+}
+
+/// Convert a reader into a writer at the same position.
+///
+//// The reader and writer share the same underlying slice and cursor position.
+#[cfg(feature = "set")]
+impl<'a, A: BStackAllocator> From<BStackSliceReader<'a, A>> for BStackSliceWriter<'a, A> {
+    fn from(reader: BStackSliceReader<'a, A>) -> Self {
+        BStackSliceWriter {
+            slice: reader.slice,
+            cursor: reader.cursor,
+        }
+    }
+}
+
+/// Convert a writer into a reader at the same position.
+///
+/// The reader and writer share the same underlying slice and cursor position.
+#[cfg(feature = "set")]
+impl<'a, A: BStackAllocator> From<BStackSliceWriter<'a, A>> for BStackSliceReader<'a, A> {
+    fn from(writer: BStackSliceWriter<'a, A>) -> Self {
+        BStackSliceReader {
+            slice: writer.slice,
+            cursor: writer.cursor,
+        }
+    }
+}
+
+#[cfg(feature = "set")]
+impl<'a, A: BStackAllocator> PartialEq<BStackSliceWriter<'a, A>> for BStackSliceReader<'a, A> {
+    fn eq(&self, other: &BStackSliceWriter<'a, A>) -> bool {
+        self.slice == other.slice && self.cursor == other.cursor
+    }
+}
+
+#[cfg(feature = "set")]
+impl<'a, A: BStackAllocator> PartialEq<BStackSliceReader<'a, A>> for BStackSliceWriter<'a, A> {
+    fn eq(&self, other: &BStackSliceReader<'a, A>) -> bool {
+        self.slice == other.slice && self.cursor == other.cursor
+    }
+}
+
+impl<'a, A: BStackAllocator> PartialEq<BStackSlice<'a, A>> for BStackSliceReader<'a, A> {
+    fn eq(&self, other: &BStackSlice<'a, A>) -> bool {
+        &self.slice == other
+    }
+}
+
+#[cfg(feature = "set")]
+impl<'a, A: BStackAllocator> PartialEq<BStackSlice<'a, A>> for BStackSliceWriter<'a, A> {
+    fn eq(&self, other: &BStackSlice<'a, A>) -> bool {
+        &self.slice == other
+    }
+}
+
+#[cfg(feature = "set")]
+impl<'a, A: BStackAllocator> PartialOrd<BStackSliceWriter<'a, A>> for BStackSliceReader<'a, A> {
+    fn partial_cmp(&self, other: &BStackSliceWriter<'a, A>) -> Option<std::cmp::Ordering> {
+        let self_pos = self.slice.start() + self.cursor;
+        let other_pos = other.slice().start() + other.position();
+        Some(
+            self_pos
+                .cmp(&other_pos)
+                .then(self.slice.len().cmp(&other.slice().len())),
+        )
+    }
+}
+
+#[cfg(feature = "set")]
+impl<'a, A: BStackAllocator> PartialOrd<BStackSliceReader<'a, A>> for BStackSliceWriter<'a, A> {
+    fn partial_cmp(&self, other: &BStackSliceReader<'a, A>) -> Option<std::cmp::Ordering> {
+        let self_pos = self.slice.start() + self.cursor;
+        let other_pos = other.slice().start() + other.position();
+        Some(
+            self_pos
+                .cmp(&other_pos)
+                .then(self.slice.len().cmp(&other.slice().len())),
+        )
     }
 }
 
@@ -616,6 +1009,25 @@ impl LinearBStackAllocator {
     /// Create a new `LinearBStackAllocator` that takes ownership of `stack`.
     pub fn new(stack: BStack) -> Self {
         Self { stack }
+    }
+}
+
+impl fmt::Debug for LinearBStackAllocator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LinearBStackAllocator")
+            .finish_non_exhaustive()
+    }
+}
+
+impl From<BStack> for LinearBStackAllocator {
+    fn from(stack: BStack) -> Self {
+        Self::new(stack)
+    }
+}
+
+impl From<LinearBStackAllocator> for BStack {
+    fn from(alloc: LinearBStackAllocator) -> Self {
+        alloc.into_stack()
     }
 }
 
