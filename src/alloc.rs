@@ -1785,8 +1785,8 @@ impl FirstFitBStackAllocator {
                 self.stack
                     .get_into(pos + Self::BLOCK_HEADER_SIZE + size, &mut outer_footer_buf)?;
                 let f = u64::from_le_bytes(outer_footer_buf);
-                if f != size && f >= Self::MIN_BLOCK_PAYLOAD_SIZE && f % 8 == 0 {
-                    if let Some(r) = size
+                if f != size && f >= Self::MIN_BLOCK_PAYLOAD_SIZE && f % 8 == 0
+                    && let Some(r) = size
                         .checked_sub(f)
                         .and_then(|d| d.checked_sub(Self::BLOCK_OVERHEAD_SIZE))
                         .filter(|&r| r >= Self::MIN_BLOCK_PAYLOAD_SIZE && r % 8 == 0)
@@ -1796,7 +1796,8 @@ impl FirstFitBStackAllocator {
                         if second_hdr_pos + Self::BLOCK_HEADER_SIZE <= stack_len {
                             let mut inner_footer_buf = [0u8; 8];
                             let mut second_size_buf = [0u8; 8];
-                            self.stack.get_into(inner_footer_pos, &mut inner_footer_buf)?;
+                            self.stack
+                                .get_into(inner_footer_pos, &mut inner_footer_buf)?;
                             self.stack.get_into(second_hdr_pos, &mut second_size_buf)?;
                             if u64::from_le_bytes(inner_footer_buf) == r
                                 && u64::from_le_bytes(second_size_buf) == f
@@ -1808,7 +1809,6 @@ impl FirstFitBStackAllocator {
                             }
                         }
                     }
-                }
             }
 
             if is_free {
@@ -2041,8 +2041,7 @@ impl BStackAllocator for FirstFitBStackAllocator {
                     // Pack the allocated-block footer, free-block header (size + is_free flag),
                     // free-list next/prev pointers, and free-block footer into zero_buff so
                     // they all land in one write.
-                    let remainder_size =
-                        merged_size - aligned_new_len - Self::BLOCK_OVERHEAD_SIZE;
+                    let remainder_size = merged_size - aligned_new_len - Self::BLOCK_OVERHEAD_SIZE;
                     let new_free_start =
                         slice.start() + aligned_new_len + Self::BLOCK_OVERHEAD_SIZE;
                     let mut head_buf = [0u8; 8];
@@ -2053,8 +2052,7 @@ impl BStackAllocator for FirstFitBStackAllocator {
                     let alloc_footer_off = (aligned_new_len - block_size) as usize;
                     let free_hdr_off = alloc_footer_off + Self::BLOCK_FOOTER_SIZE as usize;
                     let free_payload_off = alloc_footer_off + Self::BLOCK_OVERHEAD_SIZE as usize;
-                    let free_footer_off =
-                        (next_block_size + Self::BLOCK_OVERHEAD_SIZE) as usize;
+                    let free_footer_off = (next_block_size + Self::BLOCK_OVERHEAD_SIZE) as usize;
 
                     zero_buff[alloc_footer_off..alloc_footer_off + 8]
                         .copy_from_slice(&aligned_new_len.to_le_bytes());
@@ -2091,7 +2089,8 @@ impl BStackAllocator for FirstFitBStackAllocator {
                     // Link backward: old head's prev_free → new free block
                     // Failure cause: orphaned block with stale forward link from old head (detectable in recovery) but no backward link
                     if old_head != 0 {
-                        self.stack.set(old_head + 8, &new_free_start.to_le_bytes())?;
+                        self.stack
+                            .set(old_head + 8, &new_free_start.to_le_bytes())?;
                     }
                 } else {
                     // No split: write the merged block's header and footer.
