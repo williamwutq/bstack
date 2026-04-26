@@ -19,3 +19,6 @@ test_*
 
 # Generated example data files
 *.bstack
+
+# VSCode
+.vscode/
