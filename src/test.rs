@@ -2126,3 +2126,579 @@ mod alloc_tests {
         assert!(r2 < r15);
     }
 }
+
+// -------------------------------------------------------------------------
+// FirstFitBStackAllocator tests
+
+#[cfg(all(test, feature = "alloc", feature = "set"))]
+mod first_fit_tests {
+    use crate::BStack;
+    use crate::alloc::{BStackAllocator, FirstFitBStackAllocator};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    // Layout constants mirrored from the allocator (kept local to tests).
+    const ALFF_HDR_OFFSET: u64 = 48; // arena start = OFFSET_SIZE(16) + HEADER_SIZE(32)
+    const BLOCK_OVERHEAD: u64 = 24; // BLOCK_HEADER_SIZE(16) + BLOCK_FOOTER_SIZE(8)
+    const MIN_PAYLOAD: u64 = 16;
+    const FREE_HEAD_OFFSET: u64 = 32; // absolute payload offset of free_head field
+
+    fn mk_ff(id_prefix: &str) -> (FirstFitBStackAllocator, std::path::PathBuf) {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        let path = std::env::temp_dir().join(format!("bstack_ff_test_{id_prefix}_{pid}_{id}.bin"));
+        let stack = BStack::open(&path).unwrap();
+        (FirstFitBStackAllocator::new(stack).unwrap(), path)
+    }
+
+    struct Guard(std::path::PathBuf);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Initialisation
+
+    #[test]
+    fn new_empty_stack_initialises_header() {
+        let (alloc, path) = mk_ff("init");
+        let _g = Guard(path);
+        // Stack should contain exactly the 48-byte header region
+        assert_eq!(alloc.len().unwrap(), ALFF_HDR_OFFSET);
+    }
+
+    #[test]
+    fn new_rejects_bad_magic() {
+        static C: AtomicU64 = AtomicU64::new(0);
+        let id = C.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "bstack_ff_badmagic_{}_{}.bin",
+            std::process::id(),
+            id
+        ));
+        let _g = Guard(path.clone());
+        {
+            let stack = BStack::open(&path).unwrap();
+            // Push 48 bytes with wrong magic
+            let mut hdr = [0u8; 48];
+            hdr[16..24].copy_from_slice(b"WRONGHDR");
+            stack.push(&hdr).unwrap();
+        }
+        let stack = BStack::open(&path).unwrap();
+        assert!(FirstFitBStackAllocator::new(stack).is_err());
+    }
+
+    #[test]
+    fn new_reopens_existing_file() {
+        let (alloc, path) = mk_ff("reopen");
+        let _g = Guard(path.clone());
+        let s = alloc.alloc(32).unwrap();
+        s.write(b"hello world reopen test!!!!!!!!! ").unwrap();
+        let s_start = s.start();
+        let _ = s;
+        drop(alloc.into_stack());
+
+        let stack2 = BStack::open(&path).unwrap();
+        let alloc2 = FirstFitBStackAllocator::new(stack2).unwrap();
+        let mut buf = [0u8; 11];
+        alloc2.stack().get_into(s_start, &mut buf).unwrap();
+        assert_eq!(&buf, b"hello world");
+    }
+
+    // -----------------------------------------------------------------------
+    // Alloc: offsets, alignment, and zero-init
+
+    #[test]
+    fn alloc_first_block_payload_starts_after_header() {
+        let (alloc, path) = mk_ff("first_off");
+        let _g = Guard(path);
+        let s = alloc.alloc(16).unwrap();
+        assert_eq!(s.start(), ALFF_HDR_OFFSET + 16); // payload after block header
+    }
+
+    #[test]
+    fn alloc_returns_len_as_requested() {
+        let (alloc, path) = mk_ff("req_len");
+        let _g = Guard(path);
+        let s = alloc.alloc(17).unwrap(); // not a multiple of 8 or 16
+        assert_eq!(s.len(), 17);
+    }
+
+    #[test]
+    fn alloc_zero_initialises_payload() {
+        let (alloc, path) = mk_ff("zero_init");
+        let _g = Guard(path);
+        let s = alloc.alloc(64).unwrap();
+        assert_eq!(s.read().unwrap(), vec![0u8; 64]);
+    }
+
+    #[test]
+    fn alloc_rounds_up_to_min_16_bytes() {
+        let (alloc, path) = mk_ff("min16");
+        let _g = Guard(path);
+        let s1 = alloc.alloc(4).unwrap();
+        let s2 = alloc.alloc(4).unwrap();
+        // Second alloc must start 40 bytes after first (min 16 payload + 24 overhead)
+        assert_eq!(s2.start() - s1.start(), MIN_PAYLOAD + BLOCK_OVERHEAD);
+    }
+
+    #[test]
+    fn alloc_rounds_up_to_multiple_of_8() {
+        let (alloc, path) = mk_ff("align8");
+        let _g = Guard(path);
+        let s1 = alloc.alloc(17).unwrap(); // rounds to 24
+        let s2 = alloc.alloc(16).unwrap();
+        assert_eq!(s2.start() - s1.start(), 24 + BLOCK_OVERHEAD);
+    }
+
+    #[test]
+    fn alloc_sequential_non_overlapping() {
+        let (alloc, path) = mk_ff("seq");
+        let _g = Guard(path);
+        let a = alloc.alloc(16).unwrap();
+        let b = alloc.alloc(32).unwrap();
+        let c = alloc.alloc(64).unwrap();
+        assert!(a.end() <= b.start());
+        assert!(b.end() <= c.start());
+        assert_eq!(b.start(), a.start() + 16 + BLOCK_OVERHEAD);
+        assert_eq!(c.start(), b.start() + 32 + BLOCK_OVERHEAD);
+    }
+
+    // -----------------------------------------------------------------------
+    // Dealloc: tail discard
+
+    #[test]
+    fn dealloc_tail_shrinks_stack() {
+        let (alloc, path) = mk_ff("dealloc_tail");
+        let _g = Guard(path);
+        let s = alloc.alloc(16).unwrap();
+        let before = alloc.len().unwrap();
+        alloc.dealloc(s).unwrap();
+        assert_eq!(alloc.len().unwrap(), before - 16 - BLOCK_OVERHEAD);
+        assert_eq!(alloc.len().unwrap(), ALFF_HDR_OFFSET);
+    }
+
+    #[test]
+    fn dealloc_non_tail_preserves_stack_len() {
+        let (alloc, path) = mk_ff("dealloc_nontail");
+        let _g = Guard(path);
+        let a = alloc.alloc(16).unwrap();
+        let _b = alloc.alloc(16).unwrap();
+        let before = alloc.len().unwrap();
+        alloc.dealloc(a).unwrap(); // non-tail
+        assert_eq!(alloc.len().unwrap(), before); // stack stays the same size
+    }
+
+    #[test]
+    fn dealloc_cascade_removes_free_tail() {
+        // Scenario: alloc A, B. dealloc A (goes to free list). dealloc B (tail discard).
+        // cascade_discard_free_tail should then discard A too.
+        let (alloc, path) = mk_ff("cascade");
+        let _g = Guard(path);
+        let a = alloc.alloc(16).unwrap();
+        let b = alloc.alloc(16).unwrap();
+        alloc.dealloc(a).unwrap(); // non-tail: A goes to free list
+        alloc.dealloc(b).unwrap(); // tail: B discarded, then A becomes tail → cascaded
+        // After cascade, stack should be back to just the allocator header
+        assert_eq!(alloc.len().unwrap(), ALFF_HDR_OFFSET);
+    }
+
+    #[test]
+    fn dealloc_cascade_multi_level() {
+        // A, B, C all allocated. dealloc A, B (both non-tail). dealloc C (tail).
+        // Cascade should remove B, then A.
+        let (alloc, path) = mk_ff("cascade_multi");
+        let _g = Guard(path);
+        let a = alloc.alloc(16).unwrap();
+        let b = alloc.alloc(16).unwrap();
+        let c = alloc.alloc(16).unwrap();
+        alloc.dealloc(a).unwrap();
+        alloc.dealloc(b).unwrap();
+        alloc.dealloc(c).unwrap(); // cascade removes B then A
+        assert_eq!(alloc.len().unwrap(), ALFF_HDR_OFFSET);
+    }
+
+    // -----------------------------------------------------------------------
+    // Free-list reuse
+
+    #[test]
+    fn alloc_reuses_freed_block() {
+        let (alloc, path) = mk_ff("reuse");
+        let _g = Guard(path);
+        let a = alloc.alloc(16).unwrap();
+        let _b = alloc.alloc(16).unwrap(); // keep tail allocated so A isn't cascade-discarded
+        let a_start = a.start();
+        alloc.dealloc(a).unwrap();
+        let c = alloc.alloc(16).unwrap(); // should reuse A's slot
+        assert_eq!(c.start(), a_start);
+    }
+
+    #[test]
+    fn reused_block_is_zero_initialised() {
+        let (alloc, path) = mk_ff("reuse_zero");
+        let _g = Guard(path);
+        let a = alloc.alloc(32).unwrap();
+        let _b = alloc.alloc(16).unwrap();
+        a.write(b"dirty data from previous use!!!!").unwrap();
+        alloc.dealloc(a).unwrap();
+        let c = alloc.alloc(32).unwrap();
+        assert_eq!(c.read().unwrap(), vec![0u8; 32]);
+    }
+
+    #[test]
+    fn free_list_respects_first_fit_order() {
+        let (alloc, path) = mk_ff("first_fit");
+        let _g = Guard(path);
+        // Interleave with allocated separators so adjacent free blocks can't coalesce.
+        let a = alloc.alloc(16).unwrap();
+        let _sep1 = alloc.alloc(16).unwrap(); // separator: stays allocated
+        let b = alloc.alloc(16).unwrap();
+        let _sep2 = alloc.alloc(16).unwrap(); // keeps b non-tail
+        let a_start = a.start();
+        let b_start = b.start();
+        // Free list after both deallocs (prepend): head → b → a
+        alloc.dealloc(a).unwrap();
+        alloc.dealloc(b).unwrap();
+        // First fit returns b (head); no-split (exact 16-byte match)
+        let x = alloc.alloc(16).unwrap();
+        assert_eq!(x.start(), b_start);
+        // Second alloc returns a
+        let y = alloc.alloc(16).unwrap();
+        assert_eq!(y.start(), a_start);
+    }
+
+    // -----------------------------------------------------------------------
+    // Block splitting
+
+    #[test]
+    fn alloc_splits_large_free_block() {
+        let (alloc, path) = mk_ff("split");
+        let _g = Guard(path);
+        // Alloc a 64-byte block, then a sentinel, then free the 64-byte block.
+        let big = alloc.alloc(64).unwrap();
+        let _sentinel = alloc.alloc(16).unwrap();
+        let big_start = big.start();
+        alloc.dealloc(big).unwrap();
+
+        // Split puts the 16-byte allocation at the BACK of the 64-byte block.
+        // remaining = 64 - 16 - 24 = 24; allocated payload = big_start + 24 + 24 = big_start + 48
+        let small = alloc.alloc(16).unwrap();
+        assert_eq!(small.start(), big_start + 48);
+        assert_eq!(small.len(), 16);
+
+        // The 24-byte free remainder occupies the front (big_start)
+        let remainder = alloc.alloc(24).unwrap();
+        assert_eq!(remainder.start(), big_start);
+    }
+
+    #[test]
+    fn alloc_takes_whole_block_when_split_would_be_too_small() {
+        let (alloc, path) = mk_ff("nosplit");
+        let _g = Guard(path);
+        // A 32-byte free block: 32 - 24 - 1 = 7 < MIN_PAYLOAD(16), so no split for a 17-byte request
+        // (rounds to 24, and 32 - 24 - 24 = -16 → no split)
+        let block = alloc.alloc(32).unwrap();
+        let _sentinel = alloc.alloc(16).unwrap();
+        let block_start = block.start();
+        alloc.dealloc(block).unwrap();
+        let reused = alloc.alloc(24).unwrap(); // 32 - 24 - 24 < 0 → no split
+        assert_eq!(reused.start(), block_start);
+        assert_eq!(reused.len(), 24); // len is what was requested
+    }
+
+    // -----------------------------------------------------------------------
+    // Coalescing
+
+    #[test]
+    fn coalesce_right_merges_with_next_free_block() {
+        let (alloc, path) = mk_ff("coal_right");
+        let _g = Guard(path);
+        let a = alloc.alloc(16).unwrap();
+        let b = alloc.alloc(16).unwrap();
+        let _sentinel = alloc.alloc(16).unwrap();
+        let a_start = a.start();
+        alloc.dealloc(b).unwrap(); // B goes to free list first
+        alloc.dealloc(a).unwrap(); // A coalesces right with B → merged = 16+16+24 = 56 bytes
+
+        // Should get back the merged block (a_start) for a 48-byte request
+        let merged = alloc.alloc(48).unwrap();
+        assert_eq!(merged.start(), a_start);
+    }
+
+    #[test]
+    fn coalesce_left_merges_into_prev_free_block() {
+        let (alloc, path) = mk_ff("coal_left");
+        let _g = Guard(path);
+        let a = alloc.alloc(16).unwrap();
+        let b = alloc.alloc(16).unwrap();
+        let _sentinel = alloc.alloc(16).unwrap();
+        let a_start = a.start();
+        alloc.dealloc(a).unwrap(); // A goes to free list
+        alloc.dealloc(b).unwrap(); // B coalesces left into A → merged block starts at a_start
+
+        let merged = alloc.alloc(48).unwrap();
+        assert_eq!(merged.start(), a_start);
+    }
+
+    #[test]
+    fn coalesce_both_sides() {
+        let (alloc, path) = mk_ff("coal_both");
+        let _g = Guard(path);
+        let a = alloc.alloc(16).unwrap();
+        let b = alloc.alloc(16).unwrap();
+        let c = alloc.alloc(16).unwrap();
+        let _sentinel = alloc.alloc(16).unwrap();
+        let a_start = a.start();
+        alloc.dealloc(a).unwrap();
+        alloc.dealloc(c).unwrap();
+        alloc.dealloc(b).unwrap(); // B coalesces with both A and C → 16+16+16+24+24 = 96 bytes
+
+        let merged = alloc.alloc(88).unwrap(); // 3×16 + 2×24 - overhead = 88 bytes of payload
+        assert_eq!(merged.start(), a_start);
+    }
+
+    #[test]
+    fn coalesce_data_is_zeroed_in_reused_merged_block() {
+        let (alloc, path) = mk_ff("coal_zero");
+        let _g = Guard(path);
+        let a = alloc.alloc(16).unwrap();
+        let b = alloc.alloc(16).unwrap();
+        let _sentinel = alloc.alloc(16).unwrap();
+        a.write(b"AAAAAAAAAAAAAAAA").unwrap();
+        b.write(b"BBBBBBBBBBBBBBBB").unwrap();
+        alloc.dealloc(b).unwrap();
+        alloc.dealloc(a).unwrap(); // right-coalesce
+        let merged = alloc.alloc(48).unwrap();
+        assert_eq!(merged.read().unwrap(), vec![0u8; 48]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Realloc
+
+    #[test]
+    fn realloc_tail_grow() {
+        let (alloc, path) = mk_ff("realloc_tail_grow");
+        let _g = Guard(path);
+        let s = alloc.alloc(16).unwrap();
+        let s2 = alloc.realloc(s, 32).unwrap();
+        assert_eq!(s2.start(), s.start());
+        assert_eq!(s2.len(), 32);
+        assert_eq!(alloc.len().unwrap(), ALFF_HDR_OFFSET + 32 + BLOCK_OVERHEAD);
+    }
+
+    #[test]
+    fn realloc_tail_shrink() {
+        let (alloc, path) = mk_ff("realloc_tail_shrink");
+        let _g = Guard(path);
+        let s = alloc.alloc(32).unwrap();
+        let s2 = alloc.realloc(s, 16).unwrap();
+        assert_eq!(s2.start(), s.start());
+        assert_eq!(s2.len(), 16);
+        assert_eq!(alloc.len().unwrap(), ALFF_HDR_OFFSET + 16 + BLOCK_OVERHEAD);
+    }
+
+    #[test]
+    fn realloc_tail_preserves_data() {
+        let (alloc, path) = mk_ff("realloc_tail_data");
+        let _g = Guard(path);
+        let s = alloc.alloc(16).unwrap();
+        s.write(b"hello world!!!!").unwrap();
+        let s2 = alloc.realloc(s, 32).unwrap();
+        let data = s2.read().unwrap();
+        assert_eq!(&data[..15], b"hello world!!!!");
+        assert_eq!(&data[16..], vec![0u8; 16]);
+    }
+
+    #[test]
+    fn realloc_same_aligned_len_is_noop() {
+        let (alloc, path) = mk_ff("realloc_same");
+        let _g = Guard(path);
+        let s = alloc.alloc(16).unwrap();
+        let before_len = alloc.len().unwrap();
+        let s2 = alloc.realloc(s, 16).unwrap();
+        assert_eq!(s2.start(), s.start());
+        assert_eq!(alloc.len().unwrap(), before_len);
+    }
+
+    #[test]
+    fn realloc_nontail_moves_to_new_block() {
+        let (alloc, path) = mk_ff("realloc_move");
+        let _g = Guard(path);
+        let a = alloc.alloc(16).unwrap();
+        let _b = alloc.alloc(16).unwrap(); // keeps a non-tail
+        let a_start = a.start();
+        let a2 = alloc.realloc(a, 64).unwrap(); // no free block of size 64 → extends
+        assert!(a2.start() != a_start); // moved
+        assert_eq!(a2.len(), 64);
+    }
+
+    #[test]
+    fn realloc_nontail_preserves_data() {
+        let (alloc, path) = mk_ff("realloc_move_data");
+        let _g = Guard(path);
+        let a = alloc.alloc(16).unwrap();
+        let _b = alloc.alloc(16).unwrap();
+        a.write(b"preserved!!!!!!!").unwrap();
+        let a2 = alloc.realloc(a, 32).unwrap();
+        let data = a2.read().unwrap();
+        assert_eq!(&data[..16], b"preserved!!!!!!!");
+        assert_eq!(&data[16..], vec![0u8; 16]);
+    }
+
+    #[test]
+    fn realloc_nontail_frees_old_block_for_reuse() {
+        let (alloc, path) = mk_ff("realloc_old_free");
+        let _g = Guard(path);
+        let a = alloc.alloc(16).unwrap();
+        let _b = alloc.alloc(16).unwrap();
+        let a_start = a.start();
+        let _a2 = alloc.realloc(a, 64).unwrap();
+        // Old A slot (16 bytes) should now be in the free list
+        let reused = alloc.alloc(16).unwrap();
+        assert_eq!(reused.start(), a_start);
+    }
+
+    #[test]
+    fn realloc_nontail_same_block_when_fits() {
+        let (alloc, path) = mk_ff("realloc_inplace");
+        let _g = Guard(path);
+        // alloc 64, then make it non-tail, then realloc to 32 — block is big enough, no move
+        let a = alloc.alloc(64).unwrap();
+        let _b = alloc.alloc(16).unwrap();
+        let a_start = a.start();
+        let a2 = alloc.realloc(a, 32).unwrap();
+        assert_eq!(a2.start(), a_start); // stayed in place
+        assert_eq!(a2.len(), 32);
+    }
+
+    // -----------------------------------------------------------------------
+    // Persistence
+
+    #[test]
+    fn alloc_persists_across_reopen() {
+        let (alloc, path) = mk_ff("persist");
+        let _g = Guard(path.clone());
+        let s = alloc.alloc(8).unwrap();
+        s.write(b"durably!").unwrap();
+        let start = s.start();
+        drop(alloc.into_stack());
+
+        let stack2 = BStack::open(&path).unwrap();
+        let alloc2 = FirstFitBStackAllocator::new(stack2).unwrap();
+        let mut buf = [0u8; 8];
+        alloc2.stack().get_into(start, &mut buf).unwrap();
+        assert_eq!(&buf, b"durably!");
+    }
+
+    #[test]
+    fn free_list_persists_across_reopen() {
+        let (alloc, path) = mk_ff("persist_free");
+        let _g = Guard(path.clone());
+        let a = alloc.alloc(16).unwrap();
+        let _b = alloc.alloc(16).unwrap();
+        let a_start = a.start();
+        alloc.dealloc(a).unwrap();
+        drop(alloc.into_stack());
+
+        let stack2 = BStack::open(&path).unwrap();
+        let alloc2 = FirstFitBStackAllocator::new(stack2).unwrap();
+        let reused = alloc2.alloc(16).unwrap();
+        assert_eq!(reused.start(), a_start);
+    }
+
+    // -----------------------------------------------------------------------
+    // Recovery
+
+    #[test]
+    fn recovery_rebuilds_free_list_after_corruption() {
+        let (alloc, path) = mk_ff("recovery");
+        let _g = Guard(path.clone());
+        let a = alloc.alloc(16).unwrap();
+        let b = alloc.alloc(16).unwrap();
+        let _c = alloc.alloc(16).unwrap();
+        let a_start = a.start();
+        let _b_start = b.start();
+        alloc.dealloc(a).unwrap();
+        alloc.dealloc(b).unwrap();
+        let stack = alloc.into_stack();
+
+        // Corrupt: set recovery_needed=1 and scramble free_head to garbage
+        stack.set(24, &1u32.to_le_bytes()).unwrap(); // flags byte → recovery_needed=1
+        stack
+            .set(FREE_HEAD_OFFSET, &0xDEADBEEFu64.to_le_bytes())
+            .unwrap();
+        drop(stack);
+
+        // Re-open: recovery should run and rebuild the free list from is_free flags
+        let stack2 = BStack::open(&path).unwrap();
+        let alloc2 = FirstFitBStackAllocator::new(stack2).unwrap();
+
+        // The merged A+B block (size=56) is recovered. alloc(16) splits it:
+        // remaining=16 stays at a_start, allocated(16) goes to a_start+16+24=a_start+40.
+        // Then alloc(16) takes the 16-byte remainder at a_start (no split).
+        let r1 = alloc2.alloc(16).unwrap();
+        let r2 = alloc2.alloc(16).unwrap();
+        let mut starts = [r1.start(), r2.start()];
+        starts.sort();
+        // a_start + 40 and a_start (the split back-allocates, remainder is front)
+        let mut expected = [a_start, a_start + 40];
+        expected.sort();
+        assert_eq!(starts, expected);
+    }
+
+    #[test]
+    fn recovery_truncates_partial_tail_block() {
+        use std::io::Write;
+        let (alloc, path) = mk_ff("recovery_trunc");
+        let _g = Guard(path.clone());
+        let _a = alloc.alloc(16).unwrap();
+        let stack = alloc.into_stack();
+        let before_len = stack.len().unwrap();
+        drop(stack);
+
+        // Append partial block bytes (less than BLOCK_OVERHEAD=24) directly to the file
+        {
+            use std::fs::OpenOptions;
+            let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+            f.write_all(&[0u8; 12]).unwrap(); // 12 < 24 = partial block
+        }
+
+        // Set recovery_needed via raw write to flags offset (payload offset 24)
+        {
+            use std::fs::OpenOptions;
+            use std::io::{Seek, SeekFrom};
+            let mut f = OpenOptions::new().write(true).open(&path).unwrap();
+            f.seek(SeekFrom::Start(16 + 24)).unwrap(); // file_header(16) + payload_offset(24)
+            f.write_all(&1u32.to_le_bytes()).unwrap();
+        }
+
+        let stack2 = BStack::open(&path).unwrap();
+        let alloc2 = FirstFitBStackAllocator::new(stack2).unwrap();
+        // After recovery, partial bytes should be discarded
+        assert_eq!(alloc2.len().unwrap(), before_len);
+    }
+
+    // -----------------------------------------------------------------------
+    // into_stack / stack() accessors
+
+    #[test]
+    fn into_stack_returns_underlying_bstack() {
+        let (alloc, path) = mk_ff("into_stack");
+        let _g = Guard(path);
+        let _ = alloc.alloc(16).unwrap();
+        let stack = alloc.into_stack();
+        assert!(stack.len().unwrap() > ALFF_HDR_OFFSET);
+    }
+
+    #[test]
+    fn stack_accessor_exposes_raw_reads() {
+        let (alloc, path) = mk_ff("stack_acc");
+        let _g = Guard(path);
+        let s = alloc.alloc(8).unwrap();
+        s.write(b"testdata").unwrap();
+        let raw = alloc.stack().get(s.start(), s.start() + 8).unwrap();
+        assert_eq!(raw, b"testdata");
+    }
+}

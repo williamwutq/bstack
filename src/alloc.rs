@@ -1144,7 +1144,7 @@ impl BStackAllocator for LinearBStackAllocator {
 const ALFF_MAGIC: [u8; 8] = *b"ALFF\x00\x01\x00\x00";
 
 /// Compatibility prefix checked on open: `ALFF` + major 0 + minor 1.
-/// Any file whose first 6 bytes match is considered a compatible 0.1.x file.
+/// Any file whose first 6 bytes match is considered compatible.
 #[cfg(feature = "set")]
 const ALFF_MAGIC_PREFIX: [u8; 6] = *b"ALFF\x00\x01";
 
@@ -1243,7 +1243,7 @@ impl FirstFitBStackAllocator {
     fn is_impossible_block_end(&self, end: u64) -> bool {
         end < Self::OFFSET_SIZE
             + Self::HEADER_SIZE
-            + Self::BLOCK_OVERHEAD_SIZE
+            + Self::BLOCK_HEADER_SIZE
             + Self::MIN_BLOCK_PAYLOAD_SIZE
             || end > self.len().unwrap_or(u64::MAX) - Self::BLOCK_FOOTER_SIZE
     }
@@ -1685,7 +1685,17 @@ impl BStackAllocator for FirstFitBStackAllocator {
                 zero_buf.as_mut_slice(),
             )?;
             self.clear_recovery_needed()?;
-            Ok(BStackSlice::new(self, block_found.0, len))
+            // Split puts the allocated block at the back of the found block;
+            // no-split uses the found block in full from the front.
+            // Must mirror unlink_block's split threshold exactly.
+            let payload = if block_found.1
+                > aligned_len + Self::BLOCK_FOOTER_SIZE + Self::MIN_BLOCK_PAYLOAD_SIZE
+            {
+                block_found.0 + block_found.1 - aligned_len
+            } else {
+                block_found.0
+            };
+            Ok(BStackSlice::new(self, payload, len))
         } else {
             // No free block fits; push the full block (header + zero payload + footer) in one call.
             let mut block_buf = vec![0u8; (aligned_len + Self::BLOCK_OVERHEAD_SIZE) as usize];
@@ -1758,6 +1768,9 @@ impl BStackAllocator for FirstFitBStackAllocator {
                 std::cmp::Ordering::Greater => {
                     // Extend payload by the delta; footer moves forward
                     self.stack.extend(aligned_new_len - aligned_current_len)?;
+                    // Zero the old footer bytes now absorbed into the payload
+                    self.stack
+                        .zero(slice.start() + aligned_current_len, Self::BLOCK_FOOTER_SIZE)?;
                     self.stack.set(
                         slice.start() - Self::BLOCK_HEADER_SIZE,
                         &aligned_new_len.to_le_bytes(),
@@ -1824,16 +1837,23 @@ impl BStackAllocator for FirstFitBStackAllocator {
                 aligned_new_len,
                 data_buf.as_mut_slice(),
             )?;
-            // If growing, explicitly zero the extra bytes in the new block beyond the copied data
+            let new_payload = if block_found.1
+                > aligned_new_len + Self::BLOCK_FOOTER_SIZE + Self::MIN_BLOCK_PAYLOAD_SIZE
+            {
+                block_found.0 + block_found.1 - aligned_new_len
+            } else {
+                block_found.0
+            };
+            // Explicitly zero any extra bytes in the new block beyond the copied data
             if aligned_new_len > aligned_current_len {
                 self.stack.zero(
-                    block_found.0 + aligned_current_len,
+                    new_payload + aligned_current_len,
                     aligned_new_len - aligned_current_len,
                 )?;
             }
             self.add_to_free_list(slice.start())?;
             self.clear_recovery_needed()?;
-            Ok(BStackSlice::new(self, block_found.0, new_len))
+            Ok(BStackSlice::new(self, new_payload, new_len))
         } else {
             // No free block fits; push the full new block in one call, then free the old one.
             let copy_len = aligned_current_len.min(aligned_new_len) as usize;
