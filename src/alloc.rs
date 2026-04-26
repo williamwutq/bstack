@@ -886,16 +886,9 @@ impl<'a, A: BStackAllocator> PartialOrd<BStackSlice<'a, A>> for BStackSliceReade
 }
 
 #[cfg(feature = "set")]
-impl<'a, A: BStackAllocator> PartialOrd<BStackSliceReader<'a, A>> for BStackSlice<'a, A> {
-    fn partial_cmp(&self, other: &BStackSliceReader<'a, A>) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(&other.slice()))
-    }
-}
-
-#[cfg(feature = "set")]
 impl<'a, A: BStackAllocator> PartialOrd<BStackSlice<'a, A>> for BStackSliceWriter<'a, A> {
     fn partial_cmp(&self, other: &BStackSlice<'a, A>) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(&other.slice()))
+        Some(self.slice().cmp(other))
     }
 }
 
