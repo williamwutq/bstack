@@ -235,6 +235,108 @@ without changing the file size or the committed-length header.  Equivalent to
 bstack = { version = "0.1", features = ["set"] }
 ```
 
+### `alloc`
+
+Enables `BStackAllocator`, `BStackSlice`, `BStackSliceReader`, and
+`LinearBStackAllocator` — a region-management layer on top of `BStack`.
+
+```toml
+[dependencies]
+bstack = { version = "0.1", features = ["alloc"] }
+# In-place slice writes also need `set`:
+bstack = { version = "0.1", features = ["alloc", "set"] }
+```
+
+---
+
+## Allocator (`alloc` feature)
+
+The `alloc` feature adds typed region management over a `BStack` payload.
+
+### `BStackAllocator` trait
+
+A trait for types that own a `BStack` and manage contiguous byte regions
+within its payload.  Implementors must provide:
+
+```rust
+pub trait BStackAllocator: Sized {
+    fn stack(&self) -> &BStack;
+    fn into_stack(self) -> BStack;
+    fn alloc(&self, len: u64) -> io::Result<BStackSlice<'_, Self>>;
+    fn realloc<'a>(&'a self, slice: BStackSlice<'a, Self>, new_len: u64)
+        -> io::Result<BStackSlice<'a, Self>>;
+
+    // Default no-op; override for free-list allocators:
+    fn dealloc(&self, slice: BStackSlice<'_, Self>) -> io::Result<()> { Ok(()) }
+
+    // Delegation helpers:
+    fn len(&self) -> io::Result<u64>;
+    fn is_empty(&self) -> io::Result<bool>;
+}
+```
+
+### `BStackSlice<'a, A>`
+
+A lightweight `Copy` handle — one `&'a A` reference plus two `u64` fields
+(`offset`, `len`) — to a contiguous region of the allocator's `BStack`.
+Produced by `BStackAllocator::alloc`; consumed by `realloc` and `dealloc`.
+
+Key methods:
+
+| Method | Description |
+|--------|-------------|
+| `read()` | Read the entire region into a new `Vec<u8>` |
+| `read_into(buf)` | Read into a caller-supplied buffer |
+| `read_range_into(start, buf)` | Read a sub-range into a caller-supplied buffer |
+| `subslice(start, end)` | Narrow to a sub-range (relative offsets) |
+| `subslice_range(range)` | Narrow to a sub-range using a `Range<u64>` |
+| `reader()` | Cursor-based `BStackSliceReader` at position 0 |
+| `reader_at(offset)` | Cursor-based `BStackSliceReader` at `offset` |
+| `write(data)` *(feature `set`)* | Overwrite the beginning of the region in place |
+| `write_range(start, data)` *(feature `set`)* | Overwrite a sub-range in place |
+| `zero()` *(feature `set`)* | Zero the entire region in place |
+| `zero_range(start, n)` *(feature `set`)* | Zero a sub-range in place |
+
+### `BStackSliceReader<'a, A>`
+
+A cursor-based reader over a `BStackSlice`.  Implements `io::Read` and
+`io::Seek` within the slice's coordinate space (position 0 = `slice.start()`).
+Constructed via `BStackSlice::reader()` or `BStackSlice::reader_at(offset)`.
+
+### `LinearBStackAllocator`
+
+The reference bump allocator.  Regions are appended sequentially to the tail.
+
+| Operation | Underlying call | Crash-safe |
+|-----------|-----------------|-----------|
+| `alloc` | `BStack::extend` | yes |
+| `realloc` grow | `BStack::extend` | yes |
+| `realloc` shrink | `BStack::discard` | yes |
+| `dealloc` (tail) | `BStack::discard` | yes |
+| `dealloc` (non-tail) | no-op | yes |
+
+`realloc` returns `io::ErrorKind::Unsupported` for non-tail slices.
+
+### Lifetime model
+
+`BStackSlice<'a, A>` borrows the **allocator** for `'a`, not the `BStack`
+directly.  This lets the borrow checker statically prevent calling
+`into_stack()` — which consumes the allocator — while any slice is still alive.
+
+### Example
+
+```rust
+use bstack::{BStack, BStackAllocator, LinearBStackAllocator};
+
+let alloc = LinearBStackAllocator::new(BStack::open("data.bstack")?);
+
+let slice = alloc.alloc(128)?;     // reserve 128 zero bytes
+let data  = slice.read()?;         // read them back
+alloc.dealloc(slice)?;             // release (tail → O(1) discard)
+
+let stack = alloc.into_stack();    // reclaim the BStack
+```
+
 ---
 
 ## File format

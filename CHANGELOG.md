@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **`alloc` feature**: Adds region-based allocation over a [`BStack`] payload behind the `alloc` Cargo feature flag.
+  - **`BStackAllocator` trait**: Standard interface for types that own a `BStack` and manage contiguous byte regions within its payload. Requires `stack()`, `into_stack()`, `alloc()`, and `realloc()`; provides a default no-op `dealloc()`, and delegation helpers `len()` / `is_empty()`.
+  - **`BStackSlice<'a, A>`**: Lightweight `Copy` handle (allocator reference + `offset` + `len`) to a contiguous region. Exposes `read`, `read_into`, `read_range_into`, `subslice`, `subslice_range`, `reader`, `reader_at`; and (with the `set` feature) `write`, `write_range`, `zero`, `zero_range`.
+  - **`BStackSliceReader<'a, A>`**: Cursor-based reader over a `BStackSlice`, implementing `io::Read` and `io::Seek` in the slice's coordinate space.
+  - **`LinearBStackAllocator`**: Reference bump allocator that appends regions sequentially. `realloc` is O(1) for the tail allocation and returns `Unsupported` for non-tail slices. `dealloc` reclaims the tail via `BStack::discard`; non-tail deallocations are a no-op. Every operation maps to exactly one `BStack` call and is crash-safe by inheritance.
+
 ## [0.1.4] - 2026-04-25
 
 ### Added

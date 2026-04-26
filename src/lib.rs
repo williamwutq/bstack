@@ -186,12 +186,67 @@
 //! | Feature | Description |
 //! |---------|-------------|
 //! | `set`   | Enables [`BStack::set`] and [`BStack::zero`] — in-place overwrite of existing payload bytes (or with zeros) without changing the file size. |
+//! | `alloc` | Enables [`BStackAllocator`], [`BStackSlice`], [`BStackSliceReader`], and [`LinearBStackAllocator`] — region-based allocation over a `BStack` payload. |
 //!
 //! Enable with:
 //!
 //! ```toml
 //! [dependencies]
 //! bstack = { version = "0.1", features = ["set"] }
+//! # or
+//! bstack = { version = "0.1", features = ["alloc"] }
+//! # or both
+//! bstack = { version = "0.1", features = ["alloc", "set"] }
+//! ```
+//!
+//! # Allocator (`alloc` feature)
+//!
+//! The `alloc` feature adds a region-management layer on top of [`BStack`].
+//!
+//! ## Key types
+//!
+//! * [`BStackAllocator`] — trait for types that own a [`BStack`] and manage
+//!   contiguous byte regions within its payload.  Requires `stack()`,
+//!   `into_stack()`, `alloc()`, and `realloc()`; provides a default no-op
+//!   `dealloc()` and delegation helpers `len()` / `is_empty()`.
+//!
+//! * [`BStackSlice`]`<'a, A>` — lightweight `Copy` handle (allocator reference
+//!   + offset + length) to a contiguous region.  Exposes `read`, `read_into`,
+//!   `read_range_into`, `subslice`, `subslice_range`, `reader`, `reader_at`,
+//!   and (with the `set` feature) `write`, `write_range`, `zero`, `zero_range`.
+//!
+//! * [`BStackSliceReader`]`<'a, A>` — cursor-based reader over a
+//!   [`BStackSlice`], implementing [`io::Read`] and [`io::Seek`] in the
+//!   slice's coordinate space.
+//!
+//! * [`LinearBStackAllocator`] — reference bump allocator that appends regions
+//!   sequentially.  `realloc` is O(1) for the tail allocation and returns
+//!   `Unsupported` for non-tail slices.  `dealloc` reclaims the tail via
+//!   [`BStack::discard`]; non-tail deallocations are a no-op.  Every operation
+//!   maps to exactly one [`BStack`] call and is crash-safe by inheritance.
+//!
+//! ## Lifetime model
+//!
+//! `BStackSlice<'a, A>` borrows the **allocator** for `'a`, not the
+//! [`BStack`] directly.  As a result the borrow checker statically prevents
+//! calling [`BStackAllocator::into_stack`] — which consumes the allocator by
+//! value — while any slice is still in scope.
+//!
+//! ## Quick example
+//!
+//! ```no_run
+//! use bstack::{BStack, BStackAllocator, LinearBStackAllocator};
+//!
+//! # fn main() -> std::io::Result<()> {
+//! let alloc = LinearBStackAllocator::new(BStack::open("data.bstack")?);
+//!
+//! let slice = alloc.alloc(128)?;          // reserve 128 zero bytes
+//! let data  = slice.read()?;              // read them back
+//! alloc.dealloc(slice)?;                  // release (tail, so O(1))
+//!
+//! let stack = alloc.into_stack();         // reclaim the BStack
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! # Examples
