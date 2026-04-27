@@ -24,20 +24,26 @@
 //! cargo run --example alloc_typed --features alloc,set
 //! ```
 
+#[cfg(all(feature = "alloc", feature = "set"))]
 use bstack::{BStack, BStackAllocator, BStackSlice, FirstFitBStackAllocator};
+#[cfg(all(feature = "alloc", feature = "set"))]
 use std::io;
 
 // -----------------------------------------------------------------------
 // Record layout: 8-byte key + 56-byte value, total 64 bytes.
 // -----------------------------------------------------------------------
+#[cfg(all(feature = "alloc", feature = "set"))]
 const RECORD_SIZE: u64 = 64;
+#[cfg(all(feature = "alloc", feature = "set"))]
 const VALUE_SIZE: usize = 56;
 
+#[cfg(all(feature = "alloc", feature = "set"))]
 struct Record {
     key: u64,
     value: [u8; VALUE_SIZE],
 }
 
+#[cfg(all(feature = "alloc", feature = "set"))]
 impl Record {
     fn to_bytes(&self) -> [u8; RECORD_SIZE as usize] {
         let mut buf = [0u8; RECORD_SIZE as usize];
@@ -59,16 +65,15 @@ impl Record {
 // -----------------------------------------------------------------------
 
 /// Write `record` into a fresh allocation and return the 16-byte token.
-fn insert(
-    alloc: &FirstFitBStackAllocator,
-    record: &Record,
-) -> io::Result<[u8; 16]> {
+#[cfg(all(feature = "alloc", feature = "set"))]
+fn insert(alloc: &FirstFitBStackAllocator, record: &Record) -> io::Result<[u8; 16]> {
     let slice = alloc.alloc(RECORD_SIZE)?;
     slice.write(&record.to_bytes())?;
     Ok(<[u8; 16]>::from(slice))
 }
 
 /// Read the record pointed to by `token`.
+#[cfg(all(feature = "alloc", feature = "set"))]
 fn read(alloc: &FirstFitBStackAllocator, token: &[u8; 16]) -> io::Result<Record> {
     let slice = BStackSlice::from_bytes(alloc, *token);
     let buf = slice.read()?;
@@ -76,16 +81,14 @@ fn read(alloc: &FirstFitBStackAllocator, token: &[u8; 16]) -> io::Result<Record>
 }
 
 /// Overwrite the record pointed to by `token` with new data.
-fn update(
-    alloc: &FirstFitBStackAllocator,
-    token: &[u8; 16],
-    record: &Record,
-) -> io::Result<()> {
+#[cfg(all(feature = "alloc", feature = "set"))]
+fn update(alloc: &FirstFitBStackAllocator, token: &[u8; 16], record: &Record) -> io::Result<()> {
     let slice = BStackSlice::from_bytes(alloc, *token);
     slice.write(&record.to_bytes())
 }
 
 /// Free the record pointed to by `token`.
+#[cfg(all(feature = "alloc", feature = "set"))]
 fn delete(alloc: &FirstFitBStackAllocator, token: &[u8; 16]) -> io::Result<()> {
     let slice = BStackSlice::from_bytes(alloc, *token);
     alloc.dealloc(slice)
@@ -94,7 +97,7 @@ fn delete(alloc: &FirstFitBStackAllocator, token: &[u8; 16]) -> io::Result<()> {
 // -----------------------------------------------------------------------
 // Main
 // -----------------------------------------------------------------------
-
+#[cfg(all(feature = "alloc", feature = "set"))]
 fn main() -> io::Result<()> {
     let path = "alloc_typed_example.bstack";
 
@@ -137,7 +140,14 @@ fn main() -> io::Result<()> {
         // Update record 1.
         let mut new_value = [0u8; VALUE_SIZE];
         new_value[..7].copy_from_slice(b"updated");
-        update(&alloc, &tokens[1], &Record { key: 1, value: new_value })?;
+        update(
+            &alloc,
+            &tokens[1],
+            &Record {
+                key: 1,
+                value: new_value,
+            },
+        )?;
         println!("\nupdated key=1");
 
         // Delete record 0.
@@ -165,4 +175,9 @@ fn main() -> io::Result<()> {
     // Clean up.
     std::fs::remove_file(path).ok();
     Ok(())
+}
+
+#[cfg(not(all(feature = "alloc", feature = "set")))]
+fn main() {
+    println!("This example requires the 'alloc' and 'set' features.");
 }

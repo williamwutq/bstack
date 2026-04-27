@@ -12,9 +12,12 @@
 //! cargo run --example alloc_basic --features alloc,set
 //! ```
 
+#[cfg(all(feature = "alloc", feature = "set"))]
 use bstack::{BStack, BStackAllocator, FirstFitBStackAllocator};
+#[cfg(all(feature = "alloc", feature = "set"))]
 use std::io;
 
+#[cfg(all(feature = "alloc", feature = "set"))]
 fn main() -> io::Result<()> {
     let path = "alloc_basic_example.bstack";
 
@@ -84,4 +87,9 @@ fn main() -> io::Result<()> {
     // Clean up.
     std::fs::remove_file(path).ok();
     Ok(())
+}
+
+#[cfg(not(all(feature = "alloc", feature = "set")))]
+fn main() {
+    println!("This example requires the 'alloc' and 'set' features.");
 }
