@@ -16,6 +16,9 @@ keywords = ["stack", "persistent", "file-backed", "database", "binary"]
 set = []
 # Enables BStackAllocator trait and BStackSlice for region management.
 alloc = []
+# Enables atomic compound operations: atrunc, splice, splice_into, try_extend, try_discard,
+# and (with set) swap, swap_into, cas.
+atomic = []
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

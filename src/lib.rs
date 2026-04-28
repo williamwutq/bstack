@@ -68,6 +68,13 @@
 //! | `discard` | `ftruncate` → `lseek(8)` → `write(clen)` → `durable_sync` |
 //! | `set` *(feature)* | `lseek(offset)` → `write(data)` → `durable_sync` |
 //! | `zero` *(feature)* | `lseek(offset)` → `write(zeros)` → `durable_sync` |
+//! | `atrunc` *(feature: atomic, net extension)* | `set_len(new_end)` → `lseek(tail)` → `write(buf)` → `durable_sync` → `lseek(8)` → `write(clen)` |
+//! | `atrunc` *(feature: atomic, net truncation)* | `lseek(tail)` → `write(buf)` → `set_len(new_end)` → `durable_sync` → `lseek(8)` → `write(clen)` |
+//! | `splice`, `splice_into` *(feature: atomic)* | `lseek(tail)` → `read(n)` → *(then as `atrunc`)* |
+//! | `try_extend` *(feature: atomic)* | `lseek(END)` — conditional `push` sequence if size matches |
+//! | `try_discard` *(feature: atomic)* | `lseek(END)` — conditional `discard` sequence if size matches |
+//! | `swap`, `swap_into` *(features: set+atomic)* | `lseek(offset)` → `read` → `lseek(offset)` → `write(buf)` → `durable_sync` |
+//! | `cas` *(features: set+atomic)* | `lseek(offset)` → `read` → compare — conditional `lseek(offset)` → `write(new)` → `durable_sync` |
 //! | `peek`, `peek_into`, `get`, `get_into` | `pread(2)` on Unix; `ReadFile`+`OVERLAPPED` on Windows; `lseek` → `read` elsewhere (no sync — read-only) |
 //!
 //! **`durable_sync` on macOS** issues `fcntl(F_FULLFSYNC)`, which flushes the
@@ -124,6 +131,10 @@
 //! |-----------|-----------------------|--------------|
 //! | `push`, `extend`, `pop`, `pop_into`, `discard` | write | write |
 //! | `set`, `zero` *(feature)* | write | write |
+//! | `atrunc`, `splice`, `splice_into`, `try_extend` *(feature: atomic)* | write | write |
+//! | `try_discard(s, n > 0)` *(feature: atomic)* | write | write |
+//! | `try_discard(s, 0)` *(feature: atomic)* | **read** | **read** |
+//! | `swap`, `swap_into`, `cas` *(features: set+atomic)* | write | write |
 //! | `peek`, `peek_into`, `get`, `get_into` | **read** | write |
 //! | `len` | read | read |
 //!
@@ -205,6 +216,7 @@
 //! |---------|-------------|
 //! | `set`   | Enables [`BStack::set`] and [`BStack::zero`] — in-place overwrite of existing payload bytes (or with zeros) without changing the file size. |
 //! | `alloc` | Enables [`BStackAllocator`], [`BStackSlice`], [`BStackSliceReader`], and [`LinearBStackAllocator`] — region-based allocation over a `BStack` payload. |
+//! | `atomic` | Enables [`BStack::atrunc`], [`BStack::splice`], [`BStack::splice_into`], [`BStack::try_extend`], and [`BStack::try_discard`] — compound read-modify-write operations that hold the write lock across what would otherwise be separate calls. Combined with `set`, also enables [`BStack::swap`], [`BStack::swap_into`], and [`BStack::cas`]. |
 //!
 //! Enable with:
 //!
@@ -1056,7 +1068,454 @@ impl BStack {
         file.write_all(&zeros)?;
         durable_sync(&file)
     }
+}
 
+// ---------------------------------------------------------------------------
+// Atomic compound operations
+
+#[cfg(feature = "atomic")]
+impl BStack {
+    /// Cut `n` bytes off the tail then append `buf` as a single atomic operation.
+    ///
+    /// The operation ordering is chosen based on the net size change to maximise
+    /// crash-recovery safety (see *Durability* in the crate docs):
+    ///
+    /// * **Net extension** (`buf.len() > n`): the file is extended first, `buf`
+    ///   is written into the freed tail region plus the new space, then a
+    ///   `durable_sync` commits the data before the header committed-length is
+    ///   updated.  On crash before the header update, recovery truncates back to
+    ///   the original committed length — a clean rollback.
+    ///
+    /// * **Net truncation or same size** (`buf.len() ≤ n`): `buf` is written
+    ///   into the tail first, then the file is truncated, then `durable_sync`
+    ///   commits the result before the header is updated.  On crash after
+    ///   truncation, recovery sets the committed length to the (smaller) file
+    ///   size, committing the final state.
+    ///
+    /// `n = 0` with an empty `buf` is a valid no-op.
+    ///
+    /// # Feature flag
+    ///
+    /// Only available when the `atomic` Cargo feature is enabled.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] if `n` exceeds the current
+    /// payload size.  Propagates any I/O error from `set_len`, `write_all`,
+    /// or `durable_sync`.
+    #[cfg(feature = "atomic")]
+    pub fn atrunc(&self, n: u64, buf: &[u8]) -> io::Result<()> {
+        let buf_len = buf.len() as u64;
+        if n == 0 && buf_len == 0 {
+            return Ok(());
+        }
+        let mut file = self.lock.write().unwrap();
+        let file_end = file.seek(SeekFrom::End(0))?;
+        let data_size = file_end - HEADER_SIZE;
+        if n > data_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("atrunc: n ({n}) exceeds payload size ({data_size})"),
+            ));
+        }
+        let tail_offset = HEADER_SIZE + data_size - n;
+        let final_data_len = data_size - n + buf_len;
+
+        if buf_len > n {
+            // Net extension: extend first so data is never lost, then write buf,
+            // sync the data, then commit the new length.
+            let new_file_end = HEADER_SIZE + final_data_len;
+            file.set_len(new_file_end)?;
+            file.seek(SeekFrom::Start(tail_offset))?;
+            if let Err(e) = file.write_all(buf) {
+                let _ = file.set_len(file_end);
+                return Err(e);
+            }
+            if let Err(e) = durable_sync(&file) {
+                let _ = file.set_len(file_end);
+                return Err(e);
+            }
+            write_committed_len(&mut file, final_data_len)?;
+        } else {
+            // Net truncation or same size: write buf into the old tail first,
+            // truncate, sync, then commit the new length.
+            if !buf.is_empty() {
+                file.seek(SeekFrom::Start(tail_offset))?;
+                file.write_all(buf)?;
+            }
+            file.set_len(HEADER_SIZE + final_data_len)?;
+            durable_sync(&file)?;
+            write_committed_len(&mut file, final_data_len)?;
+        }
+        Ok(())
+    }
+
+    /// Pop `n` bytes off the tail then append `buf`, returning the removed bytes.
+    ///
+    /// The bytes are read before any mutation, so they are always available in
+    /// the returned `Vec` even if the subsequent write fails.  The same
+    /// ordering strategy as [`atrunc`](Self::atrunc) is used.
+    ///
+    /// `n = 0` with an empty `buf` is a valid no-op and returns an empty `Vec`.
+    ///
+    /// # Feature flag
+    ///
+    /// Only available when the `atomic` Cargo feature is enabled.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] if `n` exceeds the current
+    /// payload size.  Propagates any I/O error from `read_exact`, `set_len`,
+    /// `write_all`, or `durable_sync`.
+    #[cfg(feature = "atomic")]
+    pub fn splice(&self, n: u64, buf: &[u8]) -> io::Result<Vec<u8>> {
+        let buf_len = buf.len() as u64;
+        if n == 0 && buf_len == 0 {
+            return Ok(Vec::new());
+        }
+        let mut file = self.lock.write().unwrap();
+        let file_end = file.seek(SeekFrom::End(0))?;
+        let data_size = file_end - HEADER_SIZE;
+        if n > data_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("splice: n ({n}) exceeds payload size ({data_size})"),
+            ));
+        }
+        let tail_offset = HEADER_SIZE + data_size - n;
+        let final_data_len = data_size - n + buf_len;
+
+        // Read the bytes to remove before any mutation.
+        file.seek(SeekFrom::Start(tail_offset))?;
+        let mut removed = vec![0u8; n as usize];
+        file.read_exact(&mut removed)?;
+
+        if buf_len > n {
+            // Net extension: extend first, write buf, sync, commit.
+            let new_file_end = HEADER_SIZE + final_data_len;
+            file.set_len(new_file_end)?;
+            file.seek(SeekFrom::Start(tail_offset))?;
+            if let Err(e) = file.write_all(buf) {
+                let _ = file.set_len(file_end);
+                return Err(e);
+            }
+            if let Err(e) = durable_sync(&file) {
+                let _ = file.set_len(file_end);
+                return Err(e);
+            }
+            write_committed_len(&mut file, final_data_len)?;
+        } else {
+            // Net truncation or same size: write buf, truncate, sync, commit.
+            if !buf.is_empty() {
+                file.seek(SeekFrom::Start(tail_offset))?;
+                file.write_all(buf)?;
+            }
+            file.set_len(HEADER_SIZE + final_data_len)?;
+            durable_sync(&file)?;
+            write_committed_len(&mut file, final_data_len)?;
+        }
+
+        Ok(removed)
+    }
+
+    /// Pop `old.len()` bytes off the tail into `old`, then append `new`.
+    ///
+    /// Buffer-reuse counterpart of [`splice`](Self::splice): avoids allocating
+    /// a `Vec` for the removed bytes by writing them into the caller-supplied
+    /// `old` slice.  The same ordering strategy as [`atrunc`](Self::atrunc) is
+    /// used for the write/truncation side.
+    ///
+    /// An empty `old` with an empty `new` is a valid no-op.
+    ///
+    /// # Feature flag
+    ///
+    /// Only available when the `atomic` Cargo feature is enabled.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] if `old.len()` exceeds the
+    /// current payload size.  Propagates any I/O error from `read_exact`,
+    /// `set_len`, `write_all`, or `durable_sync`.
+    #[cfg(feature = "atomic")]
+    pub fn splice_into(&self, old: &mut [u8], new: &[u8]) -> io::Result<()> {
+        let n = old.len() as u64;
+        let new_len = new.len() as u64;
+        if n == 0 && new_len == 0 {
+            return Ok(());
+        }
+        let mut file = self.lock.write().unwrap();
+        let file_end = file.seek(SeekFrom::End(0))?;
+        let data_size = file_end - HEADER_SIZE;
+        if n > data_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("splice_into: n ({n}) exceeds payload size ({data_size})"),
+            ));
+        }
+        let tail_offset = HEADER_SIZE + data_size - n;
+        let final_data_len = data_size - n + new_len;
+
+        // Read the bytes to remove before any mutation.
+        file.seek(SeekFrom::Start(tail_offset))?;
+        file.read_exact(old)?;
+
+        if new_len > n {
+            // Net extension: extend first, write new, sync, commit.
+            let new_file_end = HEADER_SIZE + final_data_len;
+            file.set_len(new_file_end)?;
+            file.seek(SeekFrom::Start(tail_offset))?;
+            if let Err(e) = file.write_all(new) {
+                let _ = file.set_len(file_end);
+                return Err(e);
+            }
+            if let Err(e) = durable_sync(&file) {
+                let _ = file.set_len(file_end);
+                return Err(e);
+            }
+            write_committed_len(&mut file, final_data_len)?;
+        } else {
+            // Net truncation or same size: write new, truncate, sync, commit.
+            if !new.is_empty() {
+                file.seek(SeekFrom::Start(tail_offset))?;
+                file.write_all(new)?;
+            }
+            file.set_len(HEADER_SIZE + final_data_len)?;
+            durable_sync(&file)?;
+            write_committed_len(&mut file, final_data_len)?;
+        }
+        Ok(())
+    }
+
+    /// Append `buf` only if the current logical payload size equals `s`.
+    ///
+    /// Returns `Ok(true)` if the size matched and `buf` was appended (or `buf`
+    /// is empty and no I/O was needed).  Returns `Ok(false)` without modifying
+    /// the file if the size does not match.
+    ///
+    /// # Feature flag
+    ///
+    /// Only available when the `atomic` Cargo feature is enabled.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any I/O error from `write_all`, `write_committed_len`, or
+    /// `durable_sync`.
+    #[cfg(feature = "atomic")]
+    pub fn try_extend(&self, s: u64, buf: &[u8]) -> io::Result<bool> {
+        let mut file = self.lock.write().unwrap();
+        let file_end = file.seek(SeekFrom::End(0))?;
+        let data_size = file_end - HEADER_SIZE;
+        if data_size != s {
+            return Ok(false);
+        }
+        if buf.is_empty() {
+            return Ok(true);
+        }
+        if let Err(e) = file.write_all(buf) {
+            let _ = file.set_len(file_end);
+            return Err(e);
+        }
+        let new_len = data_size + buf.len() as u64;
+        if let Err(e) = write_committed_len(&mut file, new_len).and_then(|_| durable_sync(&file)) {
+            let _ = file.set_len(file_end);
+            let _ = write_committed_len(&mut file, data_size);
+            return Err(e);
+        }
+        Ok(true)
+    }
+
+    /// Discard `n` bytes only if the current logical payload size equals `s`.
+    ///
+    /// Returns `Ok(true)` if the size matched and `n` bytes were removed (or
+    /// `n = 0` and the size check passed without I/O).  Returns `Ok(false)`
+    /// without modifying the file if the size does not match.
+    ///
+    /// When `n = 0` only the read lock is taken (no file mutation occurs).
+    ///
+    /// # Feature flag
+    ///
+    /// Only available when the `atomic` Cargo feature is enabled.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] if `n` exceeds the current
+    /// payload size.  Propagates any I/O error from `set_len`,
+    /// `write_committed_len`, or `durable_sync`.
+    #[cfg(feature = "atomic")]
+    pub fn try_discard(&self, s: u64, n: u64) -> io::Result<bool> {
+        if n == 0 {
+            let file = self.lock.read().unwrap();
+            let data_size = file.metadata()?.len().saturating_sub(HEADER_SIZE);
+            return Ok(data_size == s);
+        }
+        let mut file = self.lock.write().unwrap();
+        let raw_size = file.seek(SeekFrom::End(0))?;
+        let data_size = raw_size - HEADER_SIZE;
+        if data_size != s {
+            return Ok(false);
+        }
+        if n > data_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("try_discard: n ({n}) exceeds payload size ({data_size})"),
+            ));
+        }
+        let new_data_len = data_size - n;
+        file.set_len(HEADER_SIZE + new_data_len)?;
+        write_committed_len(&mut file, new_data_len)?;
+        durable_sync(&file)?;
+        Ok(true)
+    }
+}
+
+#[cfg(all(feature = "set", feature = "atomic"))]
+impl BStack {
+    /// Atomically read `buf.len()` bytes at `offset` and overwrite them with
+    /// `buf`, returning the old contents.
+    ///
+    /// Both the read and the write happen under the same write lock, so no
+    /// other thread can observe either the pre-swap or mid-swap state.  The
+    /// file size is never changed.
+    ///
+    /// An empty `buf` is a valid no-op and returns an empty `Vec`.
+    ///
+    /// # Feature flags
+    ///
+    /// Only available when both the `set` and `atomic` Cargo features are
+    /// enabled.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] if `offset + buf.len()`
+    /// overflows `u64` or exceeds the current payload size.  Propagates any
+    /// I/O error from `read_exact`, `write_all`, or `durable_sync`.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    pub fn swap(&self, offset: u64, buf: &[u8]) -> io::Result<Vec<u8>> {
+        if buf.is_empty() {
+            return Ok(Vec::new());
+        }
+        let end = offset.checked_add(buf.len() as u64).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "swap: offset + len overflows u64")
+        })?;
+        let mut file = self.lock.write().unwrap();
+        let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
+        if end > data_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("swap: range [{offset}, {end}) exceeds payload size ({data_size})"),
+            ));
+        }
+        file.seek(SeekFrom::Start(HEADER_SIZE + offset))?;
+        let mut old = vec![0u8; buf.len()];
+        file.read_exact(&mut old)?;
+        file.seek(SeekFrom::Start(HEADER_SIZE + offset))?;
+        file.write_all(buf)?;
+        durable_sync(&file)?;
+        Ok(old)
+    }
+
+    /// Atomically read `buf.len()` bytes at `offset` into `buf` while writing
+    /// the original contents of `buf` into that position.
+    ///
+    /// On return, `buf` contains the bytes that were previously at `offset`,
+    /// and the file contains what `buf` held on entry.  Buffer-reuse
+    /// counterpart of [`swap`](Self::swap).
+    ///
+    /// An empty `buf` is a valid no-op.
+    ///
+    /// # Feature flags
+    ///
+    /// Only available when both the `set` and `atomic` Cargo features are
+    /// enabled.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] if `offset + buf.len()`
+    /// overflows `u64` or exceeds the current payload size.  Propagates any
+    /// I/O error from `read_exact`, `write_all`, or `durable_sync`.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    pub fn swap_into(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        if buf.is_empty() {
+            return Ok(());
+        }
+        let end = offset.checked_add(buf.len() as u64).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "swap_into: offset + len overflows u64",
+            )
+        })?;
+        let mut file = self.lock.write().unwrap();
+        let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
+        if end > data_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("swap_into: range [{offset}, {end}) exceeds payload size ({data_size})"),
+            ));
+        }
+        file.seek(SeekFrom::Start(HEADER_SIZE + offset))?;
+        let mut tmp = vec![0u8; buf.len()];
+        file.read_exact(&mut tmp)?;
+        file.seek(SeekFrom::Start(HEADER_SIZE + offset))?;
+        file.write_all(buf)?;
+        durable_sync(&file)?;
+        buf.copy_from_slice(&tmp);
+        Ok(())
+    }
+
+    /// Compare-and-exchange: read `old.len()` bytes at `offset` and, if they
+    /// equal `old`, overwrite them with `new`.
+    ///
+    /// Returns `Ok(true)` if the comparison succeeded and the exchange was
+    /// performed.  Returns `Ok(false)` without modifying the file if
+    /// `old.len() != new.len()` or if the current bytes do not match `old`.
+    ///
+    /// Both the compare and the exchange happen under the same write lock.
+    ///
+    /// # Feature flags
+    ///
+    /// Only available when both the `set` and `atomic` Cargo features are
+    /// enabled.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] if `offset + old.len()`
+    /// overflows `u64` or exceeds the current payload size.  Propagates any
+    /// I/O error from `read_exact`, `write_all`, or `durable_sync`.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    pub fn cas(&self, offset: u64, old: &[u8], new: &[u8]) -> io::Result<bool> {
+        if old.len() != new.len() {
+            return Ok(false);
+        }
+        if old.is_empty() {
+            return Ok(true);
+        }
+        let end = offset.checked_add(old.len() as u64).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "cas: offset + len overflows u64")
+        })?;
+        let mut file = self.lock.write().unwrap();
+        let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
+        if end > data_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("cas: range [{offset}, {end}) exceeds payload size ({data_size})"),
+            ));
+        }
+        file.seek(SeekFrom::Start(HEADER_SIZE + offset))?;
+        let mut current = vec![0u8; old.len()];
+        file.read_exact(&mut current)?;
+        if current != old {
+            return Ok(false);
+        }
+        file.seek(SeekFrom::Start(HEADER_SIZE + offset))?;
+        file.write_all(new)?;
+        durable_sync(&file)?;
+        Ok(true)
+    }
+}
+
+// ---------------------------------------------------------------------------
+
+impl BStack {
     /// Return the current **logical** payload size in bytes (excludes the
     /// 16-byte header).
     ///

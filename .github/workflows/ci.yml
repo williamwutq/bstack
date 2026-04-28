@@ -46,3 +46,11 @@ jobs:
       run: cargo test --features "set alloc"
     - name: Test Release with set and alloc
       run: cargo test --release --features "set alloc"
+    - name: Test with atomic
+      run: cargo test --features atomic
+    - name: Test Release with atomic
+      run: cargo test --release --features atomic
+    - name: Test with set and atomic
+      run: cargo test --features "set atomic"
+    - name: Test Release with set and atomic
+      run: cargo test --release --features "set atomic"
