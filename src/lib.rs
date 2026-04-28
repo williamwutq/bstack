@@ -1395,7 +1395,10 @@ impl BStack {
             return Ok(Vec::new());
         }
         let end = offset.checked_add(buf.len() as u64).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "swap: offset + len overflows u64")
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "swap: offset + len overflows u64",
+            )
         })?;
         let mut file = self.lock.write().unwrap();
         let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
@@ -1490,7 +1493,10 @@ impl BStack {
             return Ok(true);
         }
         let end = offset.checked_add(old.len() as u64).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "cas: offset + len overflows u64")
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cas: offset + len overflows u64",
+            )
         })?;
         let mut file = self.lock.write().unwrap();
         let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);

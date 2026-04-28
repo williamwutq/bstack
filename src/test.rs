@@ -2891,3 +2891,630 @@ mod first_fit_tests {
         assert_eq!(raw, b"testdata");
     }
 }
+
+// -------------------------------------------------------------------------
+// Atomic compound-operation tests
+
+#[cfg(all(test, feature = "atomic"))]
+mod atomic_tests {
+    use crate::BStack;
+    use std::io::ErrorKind;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn mk_stack() -> (BStack, std::path::PathBuf) {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        let path = std::env::temp_dir().join(format!("bstack_atomic_test_{pid}_{id}.bin"));
+        let stack = BStack::open(&path).unwrap();
+        (stack, path)
+    }
+
+    struct Guard(std::path::PathBuf);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // atrunc
+
+    #[test]
+    fn atrunc_net_truncation() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        s.atrunc(7, b"XY").unwrap();
+        assert_eq!(s.len().unwrap(), 5);
+        assert_eq!(s.peek(0).unwrap(), b"helXY");
+    }
+
+    #[test]
+    fn atrunc_net_extension() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        s.atrunc(2, b"WORLD").unwrap();
+        assert_eq!(s.len().unwrap(), 8);
+        assert_eq!(s.peek(0).unwrap(), b"helWORLD");
+    }
+
+    #[test]
+    fn atrunc_same_size() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        s.atrunc(5, b"WORLD").unwrap();
+        assert_eq!(s.len().unwrap(), 10);
+        assert_eq!(s.peek(0).unwrap(), b"helloWORLD");
+    }
+
+    #[test]
+    fn atrunc_n_zero_pure_append() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        s.atrunc(0, b"!!").unwrap();
+        assert_eq!(s.len().unwrap(), 7);
+        assert_eq!(s.peek(0).unwrap(), b"hello!!");
+    }
+
+    #[test]
+    fn atrunc_buf_empty_pure_discard() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        s.atrunc(4, b"").unwrap();
+        assert_eq!(s.len().unwrap(), 6);
+        assert_eq!(s.peek(0).unwrap(), b"hellow");
+    }
+
+    #[test]
+    fn atrunc_noop() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        s.atrunc(0, b"").unwrap();
+        assert_eq!(s.len().unwrap(), 5);
+        assert_eq!(s.peek(0).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn atrunc_to_empty_then_fill() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        s.atrunc(5, b"new").unwrap();
+        assert_eq!(s.len().unwrap(), 3);
+        assert_eq!(s.peek(0).unwrap(), b"new");
+    }
+
+    #[test]
+    fn atrunc_exceeds_size_returns_error() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        let err = s.atrunc(10, b"x").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(s.len().unwrap(), 5);
+        assert_eq!(s.peek(0).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn atrunc_persists_across_reopen() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+        s.push(b"helloworld").unwrap();
+        s.atrunc(5, b"AB").unwrap();
+        drop(s);
+        let s2 = BStack::open(&p).unwrap();
+        assert_eq!(s2.len().unwrap(), 7);
+        assert_eq!(s2.peek(0).unwrap(), b"helloAB");
+    }
+
+    // -----------------------------------------------------------------------
+    // splice
+
+    #[test]
+    fn splice_returns_popped_bytes() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        let removed = s.splice(5, b"XYZ").unwrap();
+        assert_eq!(removed, b"world");
+    }
+
+    #[test]
+    fn splice_net_extension_updates_size() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        let removed = s.splice(2, b"LONG!!").unwrap();
+        assert_eq!(removed, b"lo");
+        assert_eq!(s.len().unwrap(), 9);
+        assert_eq!(s.peek(0).unwrap(), b"helLONG!!");
+    }
+
+    #[test]
+    fn splice_net_truncation_correct_bytes() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"abcdefghij").unwrap(); // 10 bytes
+        let removed = s.splice(6, b"XX").unwrap(); // pop last 6, push XX
+        assert_eq!(removed, b"efghij"); // last 6 bytes
+        assert_eq!(s.len().unwrap(), 6); // 4 remaining + 2 appended
+        assert_eq!(s.peek(0).unwrap(), b"abcdXX");
+    }
+
+    #[test]
+    fn splice_same_size() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        let removed = s.splice(5, b"WORLD").unwrap();
+        assert_eq!(removed, b"world");
+        assert_eq!(s.len().unwrap(), 10);
+        assert_eq!(s.peek(0).unwrap(), b"helloWORLD");
+    }
+
+    #[test]
+    fn splice_n_zero_returns_empty_appends_buf() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        let removed = s.splice(0, b"!!").unwrap();
+        assert_eq!(removed, b"");
+        assert_eq!(s.len().unwrap(), 7);
+        assert_eq!(s.peek(0).unwrap(), b"hello!!");
+    }
+
+    #[test]
+    fn splice_buf_empty_acts_like_pop() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        let removed = s.splice(5, b"").unwrap();
+        assert_eq!(removed, b"world");
+        assert_eq!(s.len().unwrap(), 5);
+        assert_eq!(s.peek(0).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn splice_noop_returns_empty() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        let removed = s.splice(0, b"").unwrap();
+        assert_eq!(removed, b"");
+        assert_eq!(s.len().unwrap(), 5);
+    }
+
+    #[test]
+    fn splice_exceeds_size_returns_error() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"abc").unwrap();
+        let err = s.splice(10, b"x").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(s.len().unwrap(), 3);
+    }
+
+    #[test]
+    fn splice_persists_across_reopen() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+        s.push(b"helloworld").unwrap();
+        let removed = s.splice(5, b"XYZ").unwrap();
+        assert_eq!(removed, b"world");
+        drop(s);
+        let s2 = BStack::open(&p).unwrap();
+        assert_eq!(s2.len().unwrap(), 8);
+        assert_eq!(s2.peek(0).unwrap(), b"helloXYZ");
+    }
+
+    // -----------------------------------------------------------------------
+    // splice_into
+
+    #[test]
+    fn splice_into_fills_old_appends_new() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        let mut old = [0u8; 5];
+        s.splice_into(&mut old, b"XYZ").unwrap();
+        assert_eq!(&old, b"world");
+        assert_eq!(s.len().unwrap(), 8);
+        assert_eq!(s.peek(0).unwrap(), b"helloXYZ");
+    }
+
+    #[test]
+    fn splice_into_net_extension() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        let mut old = [0u8; 2];
+        s.splice_into(&mut old, b"EXTENDED").unwrap();
+        assert_eq!(&old, b"lo");
+        assert_eq!(s.len().unwrap(), 11);
+        assert_eq!(s.peek(0).unwrap(), b"helEXTENDED");
+    }
+
+    #[test]
+    fn splice_into_net_truncation() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"abcdefghij").unwrap();
+        let mut old = [0u8; 7];
+        s.splice_into(&mut old, b"XY").unwrap();
+        assert_eq!(&old, b"defghij");
+        assert_eq!(s.len().unwrap(), 5);
+        assert_eq!(s.peek(0).unwrap(), b"abcXY");
+    }
+
+    #[test]
+    fn splice_into_matches_splice() {
+        let (s1, p1) = mk_stack();
+        let _g1 = Guard(p1);
+        let (s2, p2) = mk_stack();
+        let _g2 = Guard(p2);
+
+        s1.push(b"helloworld").unwrap();
+        s2.push(b"helloworld").unwrap();
+
+        let vec_removed = s1.splice(4, b"ABCD").unwrap();
+        let mut buf_removed = [0u8; 4];
+        s2.splice_into(&mut buf_removed, b"ABCD").unwrap();
+
+        assert_eq!(vec_removed.as_slice(), &buf_removed);
+        assert_eq!(s1.len().unwrap(), s2.len().unwrap());
+        assert_eq!(s1.peek(0).unwrap(), s2.peek(0).unwrap());
+    }
+
+    #[test]
+    fn splice_into_exceeds_size_returns_error() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"abc").unwrap();
+        let mut old = [0u8; 10];
+        let err = s.splice_into(&mut old, b"x").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(s.len().unwrap(), 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // try_extend
+
+    #[test]
+    fn try_extend_matching_size_appends_returns_true() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        let ok = s.try_extend(5, b"world").unwrap();
+        assert!(ok);
+        assert_eq!(s.len().unwrap(), 10);
+        assert_eq!(s.peek(0).unwrap(), b"helloworld");
+    }
+
+    #[test]
+    fn try_extend_mismatching_size_returns_false() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        let ok = s.try_extend(3, b"world").unwrap();
+        assert!(!ok);
+        assert_eq!(s.len().unwrap(), 5);
+        assert_eq!(s.peek(0).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn try_extend_empty_buf_matching_returns_true() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        let ok = s.try_extend(5, b"").unwrap();
+        assert!(ok);
+        assert_eq!(s.len().unwrap(), 5);
+    }
+
+    #[test]
+    fn try_extend_empty_buf_mismatching_returns_false() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        let ok = s.try_extend(0, b"").unwrap();
+        assert!(!ok);
+        assert_eq!(s.len().unwrap(), 5);
+    }
+
+    #[test]
+    fn try_extend_persists_across_reopen() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+        s.push(b"hello").unwrap();
+        s.try_extend(5, b"world").unwrap();
+        drop(s);
+        let s2 = BStack::open(&p).unwrap();
+        assert_eq!(s2.peek(0).unwrap(), b"helloworld");
+    }
+
+    // -----------------------------------------------------------------------
+    // try_discard
+
+    #[test]
+    fn try_discard_matching_size_discards_returns_true() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        let ok = s.try_discard(10, 5).unwrap();
+        assert!(ok);
+        assert_eq!(s.len().unwrap(), 5);
+        assert_eq!(s.peek(0).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn try_discard_mismatching_size_returns_false() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        let ok = s.try_discard(7, 5).unwrap();
+        assert!(!ok);
+        assert_eq!(s.len().unwrap(), 10);
+    }
+
+    #[test]
+    fn try_discard_n_zero_matching_returns_true() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        let ok = s.try_discard(5, 0).unwrap();
+        assert!(ok);
+        assert_eq!(s.len().unwrap(), 5);
+    }
+
+    #[test]
+    fn try_discard_n_zero_mismatching_returns_false() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        let ok = s.try_discard(3, 0).unwrap();
+        assert!(!ok);
+        assert_eq!(s.len().unwrap(), 5);
+    }
+
+    #[test]
+    fn try_discard_n_exceeds_size_when_matching_returns_error() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        let err = s.try_discard(5, 10).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(s.len().unwrap(), 5);
+    }
+
+    #[test]
+    fn try_discard_persists_across_reopen() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+        s.push(b"helloworld").unwrap();
+        s.try_discard(10, 5).unwrap();
+        drop(s);
+        let s2 = BStack::open(&p).unwrap();
+        assert_eq!(s2.len().unwrap(), 5);
+        assert_eq!(s2.peek(0).unwrap(), b"hello");
+    }
+
+    // -----------------------------------------------------------------------
+    // swap / swap_into / cas  (require set + atomic)
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn swap_returns_old_stores_new() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        let old = s.swap(5, b"WORLD").unwrap();
+        assert_eq!(old, b"world");
+        assert_eq!(s.peek(0).unwrap(), b"helloWORLD");
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn swap_empty_buf_returns_empty_noop() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        let old = s.swap(0, b"").unwrap();
+        assert_eq!(old, b"");
+        assert_eq!(s.len().unwrap(), 5);
+        assert_eq!(s.peek(0).unwrap(), b"hello");
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn swap_at_start_offset() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        let old = s.swap(0, b"HELLO").unwrap();
+        assert_eq!(old, b"hello");
+        assert_eq!(s.peek(0).unwrap(), b"HELLOworld");
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn swap_does_not_change_file_size() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"abcde").unwrap();
+        s.swap(1, b"XYZ").unwrap();
+        assert_eq!(s.len().unwrap(), 5);
+        assert_eq!(s.peek(0).unwrap(), b"aXYZe");
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn swap_exceeds_size_returns_error() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        let err = s.swap(3, b"TOOLONG").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(s.peek(0).unwrap(), b"hello");
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn swap_persists_across_reopen() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+        s.push(b"helloworld").unwrap();
+        s.swap(5, b"WORLD").unwrap();
+        drop(s);
+        let s2 = BStack::open(&p).unwrap();
+        assert_eq!(s2.peek(0).unwrap(), b"helloWORLD");
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn swap_into_fills_buf_with_old_stores_new() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        let mut buf = *b"WORLD";
+        s.swap_into(5, &mut buf).unwrap();
+        assert_eq!(&buf, b"world");
+        assert_eq!(s.peek(0).unwrap(), b"helloWORLD");
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn swap_into_empty_buf_is_noop() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        s.swap_into(0, &mut []).unwrap();
+        assert_eq!(s.len().unwrap(), 5);
+        assert_eq!(s.peek(0).unwrap(), b"hello");
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn swap_into_matches_swap() {
+        let (s1, p1) = mk_stack();
+        let _g1 = Guard(p1);
+        let (s2, p2) = mk_stack();
+        let _g2 = Guard(p2);
+        s1.push(b"helloworld").unwrap();
+        s2.push(b"helloworld").unwrap();
+
+        let vec_old = s1.swap(3, b"XYZ").unwrap();
+        let mut buf = *b"XYZ";
+        s2.swap_into(3, &mut buf).unwrap();
+
+        assert_eq!(vec_old.as_slice(), &buf);
+        assert_eq!(s1.peek(0).unwrap(), s2.peek(0).unwrap());
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn swap_into_does_not_change_file_size() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"abcde").unwrap();
+        let mut buf = *b"XYZ";
+        s.swap_into(1, &mut buf).unwrap();
+        assert_eq!(s.len().unwrap(), 5);
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn swap_into_exceeds_size_returns_error() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        let mut buf = [0u8; 10];
+        let err = s.swap_into(0, &mut buf).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(s.peek(0).unwrap(), b"hello");
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn cas_matching_performs_exchange() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        let ok = s.cas(5, b"world", b"WORLD").unwrap();
+        assert!(ok);
+        assert_eq!(s.peek(0).unwrap(), b"helloWORLD");
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn cas_mismatch_returns_false_no_change() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        let ok = s.cas(5, b"xxxxx", b"WORLD").unwrap();
+        assert!(!ok);
+        assert_eq!(s.peek(0).unwrap(), b"helloworld");
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn cas_length_mismatch_returns_false() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        let ok = s.cas(0, b"hel", b"HELLO").unwrap();
+        assert!(!ok);
+        assert_eq!(s.peek(0).unwrap(), b"hello");
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn cas_empty_slices_returns_true_noop() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        let ok = s.cas(0, b"", b"").unwrap();
+        assert!(ok);
+        assert_eq!(s.len().unwrap(), 5);
+        assert_eq!(s.peek(0).unwrap(), b"hello");
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn cas_exceeds_size_returns_error() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        let err = s.cas(3, b"TOOLONG", b"TOOLONG").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(s.peek(0).unwrap(), b"hello");
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn cas_does_not_change_file_size() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"abcde").unwrap();
+        s.cas(1, b"bcd", b"XYZ").unwrap();
+        assert_eq!(s.len().unwrap(), 5);
+        assert_eq!(s.peek(0).unwrap(), b"aXYZe");
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn cas_persists_across_reopen() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+        s.push(b"helloworld").unwrap();
+        s.cas(5, b"world", b"WORLD").unwrap();
+        drop(s);
+        let s2 = BStack::open(&p).unwrap();
+        assert_eq!(s2.peek(0).unwrap(), b"helloWORLD");
+    }
+}

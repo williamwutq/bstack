@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.7] - 2026-04-27
+
+### Added
+
+- **`atomic` feature**: Enables compound read-modify-write operations that hold the write lock across what would otherwise be separate calls, providing thread-level atomicity and crash-safe sequencing.
+  - **`BStack::atrunc(n, buf)`**: Cut `n` bytes off the tail then append `buf` as a single locked operation. Operation ordering is chosen based on the net file-size change: for a net extension the file is extended before the write (so a crash before the committed-length update cleanly rolls back to the original state); for a net truncation the new bytes are written first then the file is truncated (so a crash after truncation is correctly committed by recovery).
+  - **`BStack::splice(n, buf) -> Vec<u8>`**: Pop `n` bytes from the tail (returning them) then append `buf`. The removed bytes are read before any mutation. Uses the same two-path ordering strategy as `atrunc`.
+  - **`BStack::splice_into(old, new)`**: Buffer-reuse counterpart of `splice`: reads the removed bytes into the caller-supplied `old` slice (`n = old.len()`) then appends `new`, avoiding a heap allocation.
+  - **`BStack::try_extend(s, buf) -> bool`**: Append `buf` only if the current logical payload size equals `s`; returns `true` if the append was performed, `false` (no-op) otherwise. Enables optimistic check-then-append patterns.
+  - **`BStack::try_discard(s, n) -> bool`**: Discard `n` bytes only if the current logical payload size equals `s`; returns `true` if the discard was performed. When `n = 0` only the read lock is taken.
+  - **`BStack::swap(offset, buf) -> Vec<u8>`** *(requires `set` + `atomic`)*: Atomically read `buf.len()` bytes at `offset` and overwrite them with `buf`; returns the old contents. File size is never changed.
+  - **`BStack::swap_into(offset, buf)`** *(requires `set` + `atomic`)*: Same atomic swap but exchanges in-place through a caller-supplied buffer: on entry `buf` holds the new bytes; on return `buf` holds the old bytes.
+  - **`BStack::cas(offset, old, new) -> bool`** *(requires `set` + `atomic`)*: Compare-and-exchange. Reads `old.len()` bytes at `offset`, compares them to `old`, and if equal writes `new` in their place. Returns `true` if the exchange was performed. Returns `false` (no-op) if the byte comparison fails or if `old.len() != new.len()`.
+
 ## [0.1.6] - 2026-04-26
 
 ### Added

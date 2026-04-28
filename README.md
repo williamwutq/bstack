@@ -102,6 +102,46 @@ impl BStack {
     #[cfg(feature = "set")]
     pub fn zero(&self, offset: u64, n: u64) -> io::Result<()>;
 
+    /// Atomically cut `n` bytes off the tail then append `buf`.
+    /// Combines discard + push under a single write lock.  Requires the `atomic` feature.
+    #[cfg(feature = "atomic")]
+    pub fn atrunc(&self, n: u64, buf: &[u8]) -> io::Result<()>;
+
+    /// Pop `n` bytes off the tail then append `buf`; returns the removed bytes.
+    /// Requires the `atomic` feature.
+    #[cfg(feature = "atomic")]
+    pub fn splice(&self, n: u64, buf: &[u8]) -> io::Result<Vec<u8>>;
+
+    /// Pop `old.len()` bytes into `old` then append `new`.
+    /// Buffer-reuse variant of `splice`.  Requires the `atomic` feature.
+    #[cfg(feature = "atomic")]
+    pub fn splice_into(&self, old: &mut [u8], new: &[u8]) -> io::Result<()>;
+
+    /// Append `buf` only if the current payload size equals `s`; returns whether it did.
+    /// Requires the `atomic` feature.
+    #[cfg(feature = "atomic")]
+    pub fn try_extend(&self, s: u64, buf: &[u8]) -> io::Result<bool>;
+
+    /// Discard `n` bytes only if the current payload size equals `s`; returns whether it did.
+    /// Requires the `atomic` feature.
+    #[cfg(feature = "atomic")]
+    pub fn try_discard(&self, s: u64, n: u64) -> io::Result<bool>;
+
+    /// Atomically read `buf.len()` bytes at `offset` and overwrite them with `buf`;
+    /// returns the old contents.  Requires the `set` and `atomic` features.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    pub fn swap(&self, offset: u64, buf: &[u8]) -> io::Result<Vec<u8>>;
+
+    /// Atomic swap via a caller-supplied buffer: on return `buf` holds the old bytes.
+    /// Requires the `set` and `atomic` features.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    pub fn swap_into(&self, offset: u64, buf: &mut [u8]) -> io::Result<()>;
+
+    /// Compare-and-exchange: if the bytes at `offset` match `old`, overwrite with `new`.
+    /// Returns `true` if the exchange was performed.  Requires the `set` and `atomic` features.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    pub fn cas(&self, offset: u64, old: &[u8], new: &[u8]) -> io::Result<bool>;
+
     /// Copy all bytes from `offset` to the end of the payload.
     /// `offset == len()` returns an empty Vec.
     pub fn peek(&self, offset: u64) -> io::Result<Vec<u8>>;
@@ -261,6 +301,121 @@ position is ignored for that comparison).
 ---
 
 ## Feature flags
+
+### `atomic`
+
+Enables compound read-modify-write operations that hold the write lock across
+what would otherwise be separate calls, providing thread-level atomicity and
+crash-safe ordering.
+
+```toml
+[dependencies]
+bstack = { version = "0.1", features = ["atomic"] }
+# Combined set + atomic unlocks swap, swap_into, and cas:
+bstack = { version = "0.1", features = ["set", "atomic"] }
+```
+
+#### `atrunc(n, buf)` — truncate then append
+
+Cut `n` bytes off the tail then append `buf` in one locked operation.  
+Equivalent to `discard(n)` + `push(buf)` but with no intermediate visible state.
+
+```rust
+stack.push(b"hello world")?;
+stack.atrunc(6, b"Rust")?; // remove " world", append "Rust"
+assert_eq!(stack.peek(0)?, b"helloRust");
+```
+
+#### `splice(n, buf) -> Vec<u8>` — pop then append, returning removed bytes
+
+Remove and return the last `n` bytes, then append `buf`.  
+Equivalent to `pop(n)` + `push(buf)` but atomically.
+
+```rust
+stack.push(b"hello world")?;
+let removed = stack.splice(5, b"Rust")?;
+assert_eq!(removed, b"world");
+assert_eq!(stack.peek(0)?, b"hello Rust");
+```
+
+#### `splice_into(old, new)` — pop into buffer then append
+
+Same as `splice` but reads the removed bytes into a caller-supplied `old`
+slice instead of allocating a `Vec`, where `n = old.len()`.
+
+```rust
+stack.push(b"hello world")?;
+let mut buf = [0u8; 5];
+stack.splice_into(&mut buf, b"Rust")?;
+assert_eq!(&buf, b"world");
+```
+
+#### `try_extend(s, buf) -> bool` — conditional append
+
+Append `buf` only if the current logical payload size equals `s`.  Returns
+`true` on success, `false` if the size did not match (no-op).  Useful for
+optimistic, lock-free–style append protocols.
+
+```rust
+let len = stack.len()?;
+if stack.try_extend(len, b"new entry\n")? {
+    // appended
+} else {
+    // someone else wrote first; retry
+}
+```
+
+#### `try_discard(s, n) -> bool` — conditional discard
+
+Discard `n` bytes only if the current logical payload size equals `s`.  Returns
+`true` on success, `false` if the size did not match.
+
+```rust
+let len = stack.len()?;
+if stack.try_discard(len, 4)? {
+    // last 4 bytes removed
+}
+```
+
+---
+
+#### `swap(offset, buf) -> Vec<u8>` — atomic read-then-overwrite *(requires `set`)*
+
+Read `buf.len()` bytes at `offset`, overwrite them with `buf`, and return the
+old contents.  The file size never changes.
+
+```rust
+stack.push(b"helloworld")?;
+let old = stack.swap(5, b"WORLD")?;
+assert_eq!(old, b"world");
+assert_eq!(stack.peek(0)?, b"helloWORLD");
+```
+
+#### `swap_into(offset, buf)` — atomic read-then-overwrite into buffer *(requires `set`)*
+
+Same as `swap` but exchanges in-place through a caller-supplied buffer: on
+entry `buf` holds the new bytes; on return `buf` holds the old bytes.
+
+```rust
+let mut buf = *b"WORLD";
+stack.swap_into(5, &mut buf)?;
+// buf now holds the old bytes at offset 5
+```
+
+#### `cas(offset, old, new) -> bool` — compare-and-exchange *(requires `set`)*
+
+Read `old.len()` bytes at `offset` and, if they match `old`, overwrite them
+with `new`.  Returns `true` if the exchange was performed, `false` if the
+comparison failed or the lengths differ.  The file size never changes.
+
+```rust
+stack.push(b"helloworld")?;
+let swapped = stack.cas(5, b"world", b"WORLD")?;
+assert!(swapped);
+assert_eq!(stack.peek(0)?, b"helloWORLD");
+```
+
+---
 
 ### `set`
 
@@ -508,6 +663,13 @@ All user-visible offsets (returned by `push`, accepted by `peek`/`get`) are
 | `discard`                              | `ftruncate` → `lseek(8)` → `write(clen)` → sync                                    |
 | `set` *(feature)*                      | `lseek(offset)` → `write(data)` → sync                                             |
 | `zero` *(feature)*                     | `lseek(offset)` → `write(zeros)` → sync                                            |
+| `atrunc` *(atomic, net extension)*     | `set_len(new_end)` → `lseek(tail)` → `write(buf)` → sync → `write(clen)`           |
+| `atrunc` *(atomic, net truncation)*    | `lseek(tail)` → `write(buf)` → `set_len(new_end)` → sync → `write(clen)`           |
+| `splice`, `splice_into` *(atomic)*     | `lseek(tail)` → `read(n)` → *(then as `atrunc`)*                                   |
+| `try_extend` *(atomic)*                | size check → conditional `push` sequence                                           |
+| `try_discard` *(atomic)*               | size check → conditional `discard` sequence                                        |
+| `swap`, `swap_into` *(set+atomic)*     | `lseek(offset)` → `read` → `lseek(offset)` → `write(buf)` → sync                  |
+| `cas` *(set+atomic)*                   | `lseek(offset)` → `read` → compare → conditional `write(new)` → sync              |
 | `peek`, `peek_into`, `get`, `get_into` | `pread(2)` on Unix; `ReadFile`+`OVERLAPPED` on Windows; `lseek` → `read` elsewhere |
 
 **`durable_sync` on macOS** issues `fcntl(F_FULLFSYNC)`.  Unlike `fdatasync`,
@@ -563,12 +725,16 @@ maps to `io::ErrorKind::WouldBlock` in Rust).  The lock is released when the
 
 `BStack` wraps the file in a `RwLock<File>`.
 
-| Operation                                      | Lock (Unix / Windows) | Lock (other) |
-|------------------------------------------------|-----------------------|--------------|
-| `push`, `extend`, `pop`, `pop_into`, `discard` | write                 | write        |
-| `set`, `zero` *(feature)*                      | write                 | write        |
-| `peek`, `peek_into`, `get`, `get_into`         | **read**              | write        |
-| `len`                                          | read                  | read         |
+| Operation                                                    | Lock (Unix / Windows) | Lock (other) |
+|--------------------------------------------------------------|-----------------------|--------------|
+| `push`, `extend`, `pop`, `pop_into`, `discard`               | write                 | write        |
+| `set`, `zero` *(feature)*                                    | write                 | write        |
+| `atrunc`, `splice`, `splice_into`, `try_extend` *(atomic)*   | write                 | write        |
+| `try_discard(s, n > 0)` *(atomic)*                           | write                 | write        |
+| `try_discard(s, 0)` *(atomic)*                               | **read**              | **read**     |
+| `swap`, `swap_into`, `cas` *(set+atomic)*                    | write                 | write        |
+| `peek`, `peek_into`, `get`, `get_into`                       | **read**              | write        |
+| `len`                                                        | read                  | read         |
 
 On Unix and Windows, `peek`, `peek_into`, `get`, and `get_into` use a
 cursor-safe positional read (`pread(2)` / `read_exact_at` on Unix; `ReadFile`
