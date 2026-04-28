@@ -9,6 +9,7 @@
 
 #include "bstack.h"
 
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
@@ -1987,6 +1988,215 @@ static int test_try_discard_persists_across_reopen(void)
     return 0;
 }
 
+/* -----------------------------------------------------------------------
+ * bstack_replace — callbacks and tests
+ * -------------------------------------------------------------------- */
+
+/* Uppercases all bytes; always same-length result. */
+static int cb_replace_toupper(const uint8_t *old, size_t old_len,
+                               uint8_t **new_buf, size_t *new_len, void *ctx)
+{
+    (void)ctx;
+    *new_len = old_len;
+    if (old_len == 0) { *new_buf = NULL; return 0; }
+    *new_buf = (uint8_t *)malloc(old_len);
+    if (!*new_buf) return -1;
+    for (size_t i = 0; i < old_len; i++)
+        (*new_buf)[i] = (uint8_t)toupper((unsigned char)old[i]);
+    return 0;
+}
+
+/* Returns a fixed caller-supplied buffer. */
+struct replace_fixed_ctx { const uint8_t *data; size_t len; };
+static int cb_replace_fixed(const uint8_t *old, size_t old_len,
+                             uint8_t **new_buf, size_t *new_len, void *ctx)
+{
+    (void)old; (void)old_len;
+    const struct replace_fixed_ctx *c = (const struct replace_fixed_ctx *)ctx;
+    *new_len = c->len;
+    if (c->len == 0) { *new_buf = NULL; return 0; }
+    *new_buf = (uint8_t *)malloc(c->len);
+    if (!*new_buf) return -1;
+    memcpy(*new_buf, c->data, c->len);
+    return 0;
+}
+
+/* Captures input into ctx->buf then echoes it back unchanged. */
+struct replace_capture_ctx { uint8_t buf[64]; size_t len; };
+static int cb_replace_capture_echo(const uint8_t *old, size_t old_len,
+                                    uint8_t **new_buf, size_t *new_len,
+                                    void *ctx)
+{
+    struct replace_capture_ctx *c = (struct replace_capture_ctx *)ctx;
+    c->len = old_len < sizeof(c->buf) ? old_len : sizeof(c->buf) - 1;
+    if (old_len > 0) memcpy(c->buf, old, c->len);
+    *new_len = old_len;
+    if (old_len == 0) { *new_buf = NULL; return 0; }
+    *new_buf = (uint8_t *)malloc(old_len);
+    if (!*new_buf) return -1;
+    memcpy(*new_buf, old, old_len);
+    return 0;
+}
+
+static int test_replace_same_size(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"hello world", 11, NULL) == 0);
+    CHECK(bstack_replace(bs, 5, cb_replace_toupper, NULL) == 0);
+
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 11);
+    uint8_t buf[11]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(memcmp(buf, "hello WORLD", 11) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_replace_net_extension(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"hello", 5, NULL) == 0);
+    struct replace_fixed_ctx ctx = { (uint8_t *)"WORLD", 5 };
+    CHECK(bstack_replace(bs, 2, cb_replace_fixed, &ctx) == 0);
+
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 8);
+    uint8_t buf[8]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(memcmp(buf, "helWORLD", 8) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_replace_net_truncation(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"helloworld", 10, NULL) == 0);
+    struct replace_fixed_ctx ctx = { (uint8_t *)"XY", 2 };
+    CHECK(bstack_replace(bs, 7, cb_replace_fixed, &ctx) == 0);
+
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 5);
+    uint8_t buf[5]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(memcmp(buf, "helXY", 5) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_replace_n_zero_acts_as_append(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"hello", 5, NULL) == 0);
+    struct replace_fixed_ctx ctx = { (uint8_t *)"!!", 2 };
+    CHECK(bstack_replace(bs, 0, cb_replace_fixed, &ctx) == 0);
+
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 7);
+    uint8_t buf[7]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(memcmp(buf, "hello!!", 7) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_replace_empty_result_acts_as_discard(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"helloworld", 10, NULL) == 0);
+    struct replace_fixed_ctx ctx = { NULL, 0 };
+    CHECK(bstack_replace(bs, 4, cb_replace_fixed, &ctx) == 0);
+
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 6);
+    uint8_t buf[6]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(memcmp(buf, "hellow", 6) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_replace_callback_receives_correct_bytes(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"helloworld", 10, NULL) == 0);
+    struct replace_capture_ctx ctx = {{0}, 0};
+    CHECK(bstack_replace(bs, 5, cb_replace_capture_echo, &ctx) == 0);
+    CHECK(ctx.len == 5);
+    CHECK(memcmp(ctx.buf, "world", 5) == 0);
+    /* File unchanged — callback echoed input back. */
+    uint8_t buf[10]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(memcmp(buf, "helloworld", 10) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_replace_exceeds_size_returns_error(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"hello", 5, NULL) == 0);
+    struct replace_fixed_ctx ctx = { NULL, 0 };
+    int r = bstack_replace(bs, 10, cb_replace_fixed, &ctx);
+    CHECK(r == -1);
+    CHECK(errno == EINVAL);
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 5);
+    uint8_t buf[5]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(memcmp(buf, "hello", 5) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_replace_persists_across_reopen(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+
+    {
+        bstack_t *bs = bstack_open(tmp);
+        CHECK(bs != NULL);
+        CHECK(bstack_push(bs, (uint8_t *)"helloworld", 10, NULL) == 0);
+        CHECK(bstack_replace(bs, 5, cb_replace_toupper, NULL) == 0);
+        bstack_close(bs);
+    }
+    {
+        bstack_t *bs = bstack_open(tmp);
+        CHECK(bs != NULL);
+        uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 10);
+        uint8_t buf[10]; size_t w;
+        CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+        CHECK(memcmp(buf, "helloWORLD", 10) == 0);
+        bstack_close(bs);
+    }
+
+    unlink(tmp);
+    return 0;
+}
+
 #endif /* BSTACK_FEATURE_ATOMIC */
 
 /* =========================================================================
@@ -2221,6 +2431,193 @@ static int test_cas_persists_across_reopen(void)
     return 0;
 }
 
+/* -----------------------------------------------------------------------
+ * bstack_process — callbacks and tests
+ * -------------------------------------------------------------------- */
+
+/* Uppercases all bytes in place. */
+static int cb_proc_toupper(uint8_t *buf, size_t len, void *ctx)
+{
+    (void)ctx;
+    for (size_t i = 0; i < len; i++)
+        buf[i] = (uint8_t)toupper((unsigned char)buf[i]);
+    return 0;
+}
+
+/* Fills buffer with 'X'. */
+static int cb_proc_fill_x(uint8_t *buf, size_t len, void *ctx)
+{
+    (void)ctx;
+    memset(buf, 'X', len);
+    return 0;
+}
+
+/* Captures bytes into ctx->buf without modifying them. */
+struct proc_capture_ctx { uint8_t buf[64]; size_t len; };
+static int cb_proc_capture_noop(uint8_t *buf, size_t len, void *ctx)
+{
+    struct proc_capture_ctx *c = (struct proc_capture_ctx *)ctx;
+    c->len = len < sizeof(c->buf) ? len : sizeof(c->buf) - 1;
+    memcpy(c->buf, buf, c->len);
+    return 0; /* leave buf unmodified */
+}
+
+/* No-op callback that records whether it was called. */
+static int cb_proc_was_called(uint8_t *buf, size_t len, void *ctx)
+{
+    (void)buf; (void)len;
+    *(int *)ctx = 1;
+    return 0;
+}
+
+static int test_process_mutates_range(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"hello world", 11, NULL) == 0);
+    CHECK(bstack_process(bs, 6, 11, cb_proc_toupper, NULL) == 0);
+
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 11);
+    uint8_t buf[11]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(memcmp(buf, "hello WORLD", 11) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_process_middle_range(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"abcdefgh", 8, NULL) == 0);
+    CHECK(bstack_process(bs, 2, 5, cb_proc_fill_x, NULL) == 0);
+
+    uint8_t buf[8]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(memcmp(buf, "abXXXfgh", 8) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_process_callback_receives_correct_bytes(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"helloworld", 10, NULL) == 0);
+    struct proc_capture_ctx ctx = {{0}, 0};
+    CHECK(bstack_process(bs, 5, 10, cb_proc_capture_noop, &ctx) == 0);
+    CHECK(ctx.len == 5);
+    CHECK(memcmp(ctx.buf, "world", 5) == 0);
+    /* File unchanged — callback did not modify buffer. */
+    uint8_t buf[10]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(memcmp(buf, "helloworld", 10) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_process_start_end_equal_is_noop(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"hello", 5, NULL) == 0);
+    int called = 0;
+    CHECK(bstack_process(bs, 3, 3, cb_proc_was_called, &called) == 0);
+    CHECK(called == 1);
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 5);
+    uint8_t buf[5]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(memcmp(buf, "hello", 5) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_process_does_not_change_file_size(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"abcde", 5, NULL) == 0);
+    CHECK(bstack_process(bs, 1, 4, cb_proc_fill_x, NULL) == 0);
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 5);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_process_end_less_than_start_returns_error(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"hello", 5, NULL) == 0);
+    int r = bstack_process(bs, 3, 2, cb_proc_toupper, NULL);
+    CHECK(r == -1);
+    CHECK(errno == EINVAL);
+    uint8_t buf[5]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(memcmp(buf, "hello", 5) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_process_end_exceeds_size_returns_error(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"hello", 5, NULL) == 0);
+    int r = bstack_process(bs, 2, 10, cb_proc_toupper, NULL);
+    CHECK(r == -1);
+    CHECK(errno == EINVAL);
+    uint8_t buf[5]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(memcmp(buf, "hello", 5) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_process_persists_across_reopen(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+
+    {
+        bstack_t *bs = bstack_open(tmp);
+        CHECK(bs != NULL);
+        CHECK(bstack_push(bs, (uint8_t *)"helloworld", 10, NULL) == 0);
+        CHECK(bstack_process(bs, 5, 10, cb_proc_toupper, NULL) == 0);
+        bstack_close(bs);
+    }
+    {
+        bstack_t *bs = bstack_open(tmp);
+        CHECK(bs != NULL);
+        uint8_t buf[10]; size_t w;
+        CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+        CHECK(memcmp(buf, "helloWORLD", 10) == 0);
+        bstack_close(bs);
+    }
+
+    unlink(tmp);
+    return 0;
+}
+
 #endif /* BSTACK_FEATURE_ATOMIC && BSTACK_FEATURE_SET */
 
 /* =========================================================================
@@ -2347,6 +2744,16 @@ int main(void)
     T(test_try_discard_n_zero_mismatching);
     T(test_try_discard_n_exceeds_size_returns_error);
     T(test_try_discard_persists_across_reopen);
+
+    /* bstack_replace */
+    T(test_replace_same_size);
+    T(test_replace_net_extension);
+    T(test_replace_net_truncation);
+    T(test_replace_n_zero_acts_as_append);
+    T(test_replace_empty_result_acts_as_discard);
+    T(test_replace_callback_receives_correct_bytes);
+    T(test_replace_exceeds_size_returns_error);
+    T(test_replace_persists_across_reopen);
 #endif
 
 #if defined(BSTACK_FEATURE_ATOMIC) && defined(BSTACK_FEATURE_SET)
@@ -2365,6 +2772,16 @@ int main(void)
     T(test_cas_does_not_change_file_size);
     T(test_cas_exceeds_size_returns_error);
     T(test_cas_persists_across_reopen);
+
+    /* bstack_process */
+    T(test_process_mutates_range);
+    T(test_process_middle_range);
+    T(test_process_callback_receives_correct_bytes);
+    T(test_process_start_end_equal_is_noop);
+    T(test_process_does_not_change_file_size);
+    T(test_process_end_less_than_start_returns_error);
+    T(test_process_end_exceeds_size_returns_error);
+    T(test_process_persists_across_reopen);
 #endif
 
     printf("\n%d/%d passed\n", g_passed, g_total);
