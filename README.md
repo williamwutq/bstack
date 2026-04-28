@@ -142,6 +142,19 @@ impl BStack {
     #[cfg(all(feature = "set", feature = "atomic"))]
     pub fn cas(&self, offset: u64, old: &[u8], new: &[u8]) -> io::Result<bool>;
 
+    /// Read the tail `n` bytes, pass them to `f`, write back whatever `f` returns as the new tail.
+    /// The file may grow or shrink.  `n = 0` is valid.  Requires the `atomic` feature.
+    #[cfg(feature = "atomic")]
+    pub fn replace<F>(&self, n: u64, f: F) -> io::Result<()>
+    where F: FnOnce(&[u8]) -> Vec<u8>;
+
+    /// Read `[start, end)`, pass the bytes to `f` for in-place mutation, write them back.
+    /// File size never changes.  `start == end` is a valid no-op.
+    /// Requires the `set` and `atomic` features.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    pub fn process<F>(&self, start: u64, end: u64, f: F) -> io::Result<()>
+    where F: FnOnce(&mut [u8]);
+
     /// Copy all bytes from `offset` to the end of the payload.
     /// `offset == len()` returns an empty Vec.
     pub fn peek(&self, offset: u64) -> io::Result<Vec<u8>>;
@@ -377,6 +390,21 @@ if stack.try_discard(len, 4)? {
 }
 ```
 
+#### `replace(n, f)` — read tail, transform, write new tail
+
+Pop `n` bytes off the tail, pass them read-only to a callback, then write
+whatever the callback returns as the new tail.  The file grows or shrinks
+according to the returned `Vec` length, using the same crash-safe two-path
+ordering as `atrunc`.
+
+```rust
+stack.push(b"hello world")?;
+stack.replace(5, |tail| {
+    tail.iter().map(|b| b.to_ascii_uppercase()).collect()
+})?;
+assert_eq!(stack.peek(0)?, b"hello WORLD");
+```
+
 ---
 
 #### `swap(offset, buf) -> Vec<u8>` — atomic read-then-overwrite *(requires `set`)*
@@ -413,6 +441,20 @@ stack.push(b"helloworld")?;
 let swapped = stack.cas(5, b"world", b"WORLD")?;
 assert!(swapped);
 assert_eq!(stack.peek(0)?, b"helloWORLD");
+```
+
+#### `process(start, end, f)` — read range, mutate in place, write back *(requires `set`)*
+
+Read bytes in `[start, end)`, pass them to a callback as a `&mut [u8]` for
+in-place mutation, then write the modified bytes back.  The file size is never
+changed.  `start == end` is a valid no-op.
+
+```rust
+stack.push(b"hello world")?;
+stack.process(6, 11, |buf| {
+    buf.make_ascii_uppercase();
+})?;
+assert_eq!(stack.peek(0)?, b"hello WORLD");
 ```
 
 ---
@@ -655,22 +697,24 @@ All user-visible offsets (returned by `push`, accepted by `peek`/`get`) are
 
 ## Durability
 
-| Operation                              | Sequence                                                                           |
-|----------------------------------------|------------------------------------------------------------------------------------|
-| `push`                                 | `lseek(END)` → `write(data)` → `lseek(8)` → `write(clen)` → sync                   |
-| `extend`                               | `lseek(END)` → `set_len(new_end)` → `lseek(8)` → `write(clen)` → sync              |
-| `pop`, `pop_into`                      | `lseek` → `read` → `ftruncate` → `lseek(8)` → `write(clen)` → sync                 |
-| `discard`                              | `ftruncate` → `lseek(8)` → `write(clen)` → sync                                    |
-| `set` *(feature)*                      | `lseek(offset)` → `write(data)` → sync                                             |
-| `zero` *(feature)*                     | `lseek(offset)` → `write(zeros)` → sync                                            |
-| `atrunc` *(atomic, net extension)*     | `set_len(new_end)` → `lseek(tail)` → `write(buf)` → sync → `write(clen)`           |
-| `atrunc` *(atomic, net truncation)*    | `lseek(tail)` → `write(buf)` → `set_len(new_end)` → sync → `write(clen)`           |
-| `splice`, `splice_into` *(atomic)*     | `lseek(tail)` → `read(n)` → *(then as `atrunc`)*                                   |
-| `try_extend` *(atomic)*                | size check → conditional `push` sequence                                           |
-| `try_discard` *(atomic)*               | size check → conditional `discard` sequence                                        |
-| `swap`, `swap_into` *(set+atomic)*     | `lseek(offset)` → `read` → `lseek(offset)` → `write(buf)` → sync                  |
-| `cas` *(set+atomic)*                   | `lseek(offset)` → `read` → compare → conditional `write(new)` → sync              |
-| `peek`, `peek_into`, `get`, `get_into` | `pread(2)` on Unix; `ReadFile`+`OVERLAPPED` on Windows; `lseek` → `read` elsewhere |
+| Operation                              | Sequence                                                                                  |
+|----------------------------------------|-------------------------------------------------------------------------------------------|
+| `push`                                 | `lseek(END)` → `write(data)` → `lseek(8)` → `write(clen)` → sync                          |
+| `extend`                               | `lseek(END)` → `set_len(new_end)` → `lseek(8)` → `write(clen)` → sync                     |
+| `pop`, `pop_into`                      | `lseek` → `read` → `ftruncate` → `lseek(8)` → `write(clen)` → sync                        |
+| `discard`                              | `ftruncate` → `lseek(8)` → `write(clen)` → sync                                           |
+| `set` *(feature)*                      | `lseek(offset)` → `write(data)` → sync                                                    |
+| `zero` *(feature)*                     | `lseek(offset)` → `write(zeros)` → sync                                                   |
+| `atrunc` *(atomic, net extension)*     | `set_len(new_end)` → `lseek(tail)` → `write(buf)` → sync → `write(clen)`                  |
+| `atrunc` *(atomic, net truncation)*    | `lseek(tail)` → `write(buf)` → `set_len(new_end)` → sync → `write(clen)`                  |
+| `splice`, `splice_into` *(atomic)*     | `lseek(tail)` → `read(n)` → *(then as `atrunc`)*                                          |
+| `try_extend` *(atomic)*                | size check → conditional `push` sequence                                                  |
+| `try_discard` *(atomic)*               | size check → conditional `discard` sequence                                               |
+| `swap`, `swap_into` *(set+atomic)*     | `lseek(offset)` → `read` → `lseek(offset)` → `write(buf)` → sync                          |
+| `cas` *(set+atomic)*                   | `lseek(offset)` → `read` → compare → conditional `write(new)` → sync                      |
+| `process` *(set+atomic)*               | `lseek(start)` → `read(end−start)` → *(callback)* → `lseek(start)` → `write(buf)` → sync  |
+| `replace` *(atomic)*                   | `lseek(tail)` → `read(n)` → *(callback)* → *(then as `atrunc`)*                           |
+| `peek`, `peek_into`, `get`, `get_into` | `pread(2)` on Unix; `ReadFile`+`OVERLAPPED` on Windows; `lseek` → `read` elsewhere        |
 
 **`durable_sync` on macOS** issues `fcntl(F_FULLFSYNC)`.  Unlike `fdatasync`,
 this flushes the drive controller's write cache, providing the same "barrier
@@ -733,6 +777,8 @@ maps to `io::ErrorKind::WouldBlock` in Rust).  The lock is released when the
 | `try_discard(s, n > 0)` *(atomic)*                           | write                 | write        |
 | `try_discard(s, 0)` *(atomic)*                               | **read**              | **read**     |
 | `swap`, `swap_into`, `cas` *(set+atomic)*                    | write                 | write        |
+| `process` *(set+atomic)*                                     | write                 | write        |
+| `replace` *(atomic)*                                         | write                 | write        |
 | `peek`, `peek_into`, `get`, `get_into`                       | **read**              | write        |
 | `len`                                                        | read                  | read         |
 
