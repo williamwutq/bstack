@@ -41,10 +41,11 @@ OBJ_ALLOC_SET = bstack_alloc-set.o
 EXAMPLE_NAMES = basic buffer_reuse journal reading vec_store
 EXAMPLE_BINS  = $(addprefix ../examples/,$(addsuffix $(EXE_EXT),$(EXAMPLE_NAMES)))
 HASHMAP_BIN   = ../examples/hashmap$(EXE_EXT)
+ATOMIC_BIN    = ../examples/atomic_ops$(EXE_EXT)
 
 .PHONY: all test test-atomic test-set-atomic leaks clean alloc \
         example example-basic example-buffer_reuse example-journal \
-        example-reading example-vec_store example-hashmap
+        example-reading example-vec_store example-hashmap example-atomic_ops
 
 all: $(LIB)
 
@@ -143,6 +144,9 @@ endif
 ../examples/hashmap$(EXE_EXT): ../examples/hashmap.c $(LIB_SET)
 	$(CC) $(CFLAGS) -DBSTACK_FEATURE_SET -I. -o $@ $< -L. -lbstack-set -lpthread
 
+../examples/atomic_ops$(EXE_EXT): ../examples/atomic_ops.c $(LIB_SET_ATOMIC)
+	$(CC) $(CFLAGS) -DBSTACK_FEATURE_SET -DBSTACK_FEATURE_ATOMIC -I. -o $@ $< -L. -lbstack-set-atomic -lpthread
+
 example-basic: ../examples/basic$(EXE_EXT)
 	(cd ../examples && $(RUN)basic$(EXE_EXT))
 
@@ -161,16 +165,20 @@ example-vec_store: ../examples/vec_store$(EXE_EXT)
 example-hashmap: ../examples/hashmap$(EXE_EXT)
 	(cd ../examples && $(RUN)hashmap$(EXE_EXT))
 
-example: $(EXAMPLE_BINS) $(HASHMAP_BIN)
+example-atomic_ops: ../examples/atomic_ops$(EXE_EXT)
+	(cd ../examples && $(RUN)atomic_ops$(EXE_EXT))
+
+example: $(EXAMPLE_BINS) $(HASHMAP_BIN) $(ATOMIC_BIN)
 	@echo "==> basic"        && (cd ../examples && $(RUN)basic$(EXE_EXT))
 	@echo "==> buffer_reuse" && (cd ../examples && $(RUN)buffer_reuse$(EXE_EXT))
 	@echo "==> journal"      && (cd ../examples && $(RUN)journal$(EXE_EXT))
 	@echo "==> reading"      && (cd ../examples && $(RUN)reading$(EXE_EXT))
 	@echo "==> vec_store"    && (cd ../examples && $(RUN)vec_store$(EXE_EXT))
 	@echo "==> hashmap"      && (cd ../examples && $(RUN)hashmap$(EXE_EXT))
+	@echo "==> atomic_ops"   && (cd ../examples && $(RUN)atomic_ops$(EXE_EXT))
 
 clean:
 	rm -f $(OBJ) $(TEST_OBJ) $(OBJ_SET) $(LIB) $(LIB_SET) $(TEST_BIN) \
 	      $(OBJ_ATOMIC) $(LIB_ATOMIC) $(OBJ_SET_ATOMIC) $(LIB_SET_ATOMIC) \
 	      $(OBJ_ALLOC) $(OBJ_ALLOC_SET) $(LIB_ALLOC) $(LIB_ALLOC_SET) \
-	      $(EXAMPLE_BINS) $(HASHMAP_BIN)
+	      $(EXAMPLE_BINS) $(HASHMAP_BIN) $(ATOMIC_BIN)
