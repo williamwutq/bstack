@@ -590,7 +590,7 @@ static int test_large_payload_roundtrip(void)
  * Header / magic
  * ====================================================================== */
 
-static const uint8_t MAGIC[8]        = {'B','S','T','K', 0, 1, 4, 0};
+static const uint8_t MAGIC[8]        = {'B','S','T','K', 0, 1, 7, 0};
 static const uint8_t MAGIC_PREFIX[6] = {'B','S','T','K', 0, 1};
 
 static int test_new_file_has_valid_header(void)
