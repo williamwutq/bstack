@@ -3517,4 +3517,192 @@ mod atomic_tests {
         let s2 = BStack::open(&p).unwrap();
         assert_eq!(s2.peek(0).unwrap(), b"helloWORLD");
     }
+
+    // -----------------------------------------------------------------------
+    // replace
+
+    #[test]
+    fn replace_same_size() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello world").unwrap();
+        s.replace(5, |tail| tail.iter().map(|b| b.to_ascii_uppercase()).collect())
+            .unwrap();
+        assert_eq!(s.len().unwrap(), 11);
+        assert_eq!(s.peek(0).unwrap(), b"hello WORLD");
+    }
+
+    #[test]
+    fn replace_net_extension() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        s.replace(2, |_| b"WORLD".to_vec()).unwrap();
+        assert_eq!(s.len().unwrap(), 8);
+        assert_eq!(s.peek(0).unwrap(), b"helWORLD");
+    }
+
+    #[test]
+    fn replace_net_truncation() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        s.replace(7, |_| b"XY".to_vec()).unwrap();
+        assert_eq!(s.len().unwrap(), 5);
+        assert_eq!(s.peek(0).unwrap(), b"helXY");
+    }
+
+    #[test]
+    fn replace_n_zero_acts_as_append() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        s.replace(0, |_| b"!!".to_vec()).unwrap();
+        assert_eq!(s.len().unwrap(), 7);
+        assert_eq!(s.peek(0).unwrap(), b"hello!!");
+    }
+
+    #[test]
+    fn replace_empty_result_acts_as_discard() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        s.replace(4, |_| vec![]).unwrap();
+        assert_eq!(s.len().unwrap(), 6);
+        assert_eq!(s.peek(0).unwrap(), b"hellow");
+    }
+
+    #[test]
+    fn replace_callback_receives_correct_bytes() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        let mut captured = Vec::new();
+        s.replace(5, |tail| {
+            captured = tail.to_vec();
+            tail.to_vec()
+        })
+        .unwrap();
+        assert_eq!(captured, b"world");
+        assert_eq!(s.peek(0).unwrap(), b"helloworld");
+    }
+
+    #[test]
+    fn replace_exceeds_size_returns_error() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        let err = s.replace(10, |_| vec![]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(s.len().unwrap(), 5);
+        assert_eq!(s.peek(0).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn replace_persists_across_reopen() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+        s.push(b"helloworld").unwrap();
+        s.replace(5, |tail| tail.iter().map(|b| b.to_ascii_uppercase()).collect())
+            .unwrap();
+        drop(s);
+        let s2 = BStack::open(&p).unwrap();
+        assert_eq!(s2.len().unwrap(), 10);
+        assert_eq!(s2.peek(0).unwrap(), b"helloWORLD");
+    }
+
+    // -----------------------------------------------------------------------
+    // process
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn process_mutates_range() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello world").unwrap();
+        s.process(6, 11, |buf| buf.make_ascii_uppercase()).unwrap();
+        assert_eq!(s.len().unwrap(), 11);
+        assert_eq!(s.peek(0).unwrap(), b"hello WORLD");
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn process_middle_range() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"abcdefgh").unwrap();
+        s.process(2, 5, |buf| buf.iter_mut().for_each(|b| *b = b'X'))
+            .unwrap();
+        assert_eq!(s.peek(0).unwrap(), b"abXXXfgh");
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn process_callback_receives_correct_bytes() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        let mut captured = Vec::new();
+        s.process(5, 10, |buf| captured = buf.to_vec()).unwrap();
+        assert_eq!(captured, b"world");
+        assert_eq!(s.peek(0).unwrap(), b"helloworld");
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn process_start_end_equal_is_noop() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        let mut called = false;
+        s.process(3, 3, |_| called = true).unwrap();
+        assert!(called);
+        assert_eq!(s.len().unwrap(), 5);
+        assert_eq!(s.peek(0).unwrap(), b"hello");
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn process_does_not_change_file_size() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"abcde").unwrap();
+        s.process(1, 4, |buf| buf.iter_mut().for_each(|b| *b = 0))
+            .unwrap();
+        assert_eq!(s.len().unwrap(), 5);
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn process_end_less_than_start_returns_error() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        let err = s.process(3, 2, |_| {}).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(s.peek(0).unwrap(), b"hello");
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn process_end_exceeds_size_returns_error() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        let err = s.process(2, 10, |_| {}).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(s.peek(0).unwrap(), b"hello");
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn process_persists_across_reopen() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+        s.push(b"helloworld").unwrap();
+        s.process(5, 10, |buf| buf.make_ascii_uppercase()).unwrap();
+        drop(s);
+        let s2 = BStack::open(&p).unwrap();
+        assert_eq!(s2.peek(0).unwrap(), b"helloWORLD");
+    }
 }
