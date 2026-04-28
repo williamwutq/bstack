@@ -25,9 +25,11 @@
  * -------------
  * On Unix a pthread_rwlock protects each handle; on Windows an SRWLOCK is
  * used.  bstack_push / bstack_extend / bstack_pop / bstack_discard /
- * bstack_set / bstack_zero hold a write lock; bstack_peek / bstack_get /
- * bstack_len hold a read lock and may run concurrently with each other on
- * both platforms.
+ * bstack_set / bstack_zero / bstack_atrunc / bstack_splice /
+ * bstack_try_extend / bstack_try_discard(s, n>0) / bstack_swap / bstack_cas
+ * hold a write lock.  bstack_try_discard(s, 0) holds a read lock.
+ * bstack_peek / bstack_get / bstack_len hold a read lock and may run
+ * concurrently with each other on both platforms.
  *
  * Multi-process safety
  * --------------------
@@ -38,7 +40,10 @@
  *
  * Feature flags
  * -------------
- * Compile with -DBSTACK_FEATURE_SET to enable bstack_set and bstack_zero.
+ * Compile with -DBSTACK_FEATURE_SET    to enable bstack_set and bstack_zero.
+ * Compile with -DBSTACK_FEATURE_ATOMIC to enable bstack_atrunc, bstack_splice,
+ *   bstack_try_extend, and bstack_try_discard.  Both flags together also enable
+ *   bstack_swap and bstack_cas.
  */
 
 typedef struct bstack bstack_t;
@@ -132,6 +137,102 @@ int bstack_set(bstack_t *bs, uint64_t offset,
  */
 int bstack_zero(bstack_t *bs, uint64_t offset, size_t n);
 #endif /* BSTACK_FEATURE_SET */
+
+#ifdef BSTACK_FEATURE_ATOMIC
+/*
+ * Atomically cut n bytes off the tail then append buf_len bytes from buf.
+ *
+ * The write ordering is chosen for crash safety: when buf_len > n (net
+ * extension) the file is extended before writing buf so a crash before the
+ * committed-length update cleanly rolls back to the original state; when
+ * buf_len <= n (net truncation or same size) buf is written first, then the
+ * file is truncated, so a crash after truncation is committed by recovery.
+ *
+ * n = 0 with buf_len = 0 is a valid no-op.
+ * Returns EINVAL if n exceeds the current payload size.
+ *
+ * Only available when compiled with -DBSTACK_FEATURE_ATOMIC.
+ */
+int bstack_atrunc(bstack_t *bs, size_t n,
+                  const uint8_t *buf, size_t buf_len);
+
+/*
+ * Atomically pop n bytes from the tail into removed, then append new_len
+ * bytes from new_buf.
+ *
+ * removed must point to at least n bytes of caller-allocated storage;
+ * it may be NULL when n == 0.  Uses the same two-path ordering strategy as
+ * bstack_atrunc.
+ *
+ * Returns EINVAL if n exceeds the current payload size.
+ *
+ * Only available when compiled with -DBSTACK_FEATURE_ATOMIC.
+ */
+int bstack_splice(bstack_t *bs,
+                  uint8_t *removed, size_t n,
+                  const uint8_t *new_buf, size_t new_len);
+
+/*
+ * Append buf_len bytes from buf only if the current logical payload size
+ * equals s.
+ *
+ * *ok (if non-NULL) is set to 1 when the condition matched and the append was
+ * performed, or 0 when the size did not match (no-op).
+ * Returns 0 on success (condition-matched or not), -1 on I/O error.
+ *
+ * Only available when compiled with -DBSTACK_FEATURE_ATOMIC.
+ */
+int bstack_try_extend(bstack_t *bs, uint64_t s,
+                      const uint8_t *buf, size_t buf_len, int *ok);
+
+/*
+ * Discard n bytes only if the current logical payload size equals s.
+ *
+ * *ok (if non-NULL) is set to 1 when the condition matched and n bytes were
+ * removed, or 0 when the size did not match (no-op).
+ * When n == 0 only the read lock is taken; the file is not modified.
+ * Returns EINVAL if n exceeds the current payload size (only checked when
+ * the size condition matches).
+ *
+ * Only available when compiled with -DBSTACK_FEATURE_ATOMIC.
+ */
+int bstack_try_discard(bstack_t *bs, uint64_t s, size_t n, int *ok);
+#endif /* BSTACK_FEATURE_ATOMIC */
+
+#if defined(BSTACK_FEATURE_ATOMIC) && defined(BSTACK_FEATURE_SET)
+/*
+ * Atomically read len bytes at logical offset into old_buf and overwrite
+ * them with new_buf.  The file size is never changed.
+ *
+ * old_buf and new_buf must each point to at least len bytes; they may overlap
+ * only if old_buf == new_buf (a no-op swap).
+ * len == 0 is a valid no-op.
+ * Returns EINVAL if offset + len would exceed the payload size or overflow
+ * uint64_t.
+ *
+ * Only available when compiled with both -DBSTACK_FEATURE_SET and
+ * -DBSTACK_FEATURE_ATOMIC.
+ */
+int bstack_swap(bstack_t *bs, uint64_t offset,
+                uint8_t *old_buf, const uint8_t *new_buf, size_t len);
+
+/*
+ * Compare-and-exchange: read len bytes at logical offset and, if they equal
+ * old_buf, overwrite them with new_buf.
+ *
+ * *ok (if non-NULL) is set to 1 if the exchange was performed, 0 if the
+ * bytes at offset differed from old_buf (no write is performed).
+ * len == 0 always succeeds with *ok = 1.
+ * Returns EINVAL if offset + len would exceed the payload size or overflow
+ * uint64_t.
+ *
+ * Only available when compiled with both -DBSTACK_FEATURE_SET and
+ * -DBSTACK_FEATURE_ATOMIC.
+ */
+int bstack_cas(bstack_t *bs, uint64_t offset,
+               const uint8_t *old_buf, const uint8_t *new_buf,
+               size_t len, int *ok);
+#endif /* BSTACK_FEATURE_ATOMIC && BSTACK_FEATURE_SET */
 
 #ifdef __cplusplus
 }
