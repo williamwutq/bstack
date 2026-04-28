@@ -3526,8 +3526,10 @@ mod atomic_tests {
         let (s, p) = mk_stack();
         let _g = Guard(p);
         s.push(b"hello world").unwrap();
-        s.replace(5, |tail| tail.iter().map(|b| b.to_ascii_uppercase()).collect())
-            .unwrap();
+        s.replace(5, |tail| {
+            tail.iter().map(|b| b.to_ascii_uppercase()).collect()
+        })
+        .unwrap();
         assert_eq!(s.len().unwrap(), 11);
         assert_eq!(s.peek(0).unwrap(), b"hello WORLD");
     }
@@ -3603,8 +3605,10 @@ mod atomic_tests {
         let (s, p) = mk_stack();
         let _g = Guard(p.clone());
         s.push(b"helloworld").unwrap();
-        s.replace(5, |tail| tail.iter().map(|b| b.to_ascii_uppercase()).collect())
-            .unwrap();
+        s.replace(5, |tail| {
+            tail.iter().map(|b| b.to_ascii_uppercase()).collect()
+        })
+        .unwrap();
         drop(s);
         let s2 = BStack::open(&p).unwrap();
         assert_eq!(s2.len().unwrap(), 10);
