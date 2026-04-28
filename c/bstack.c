@@ -1024,6 +1024,71 @@ fail_unlock:
     return -1;
 }
 
+int bstack_replace(bstack_t *bs, size_t n,
+                   int (*cb)(const uint8_t *old, size_t old_len,
+                              uint8_t **new_buf, size_t *new_len,
+                              void *ctx),
+                   void *ctx)
+{
+    BS_WRLOCK(bs);
+
+    uint64_t raw_size;
+    if (file_size(bs->fd, &raw_size) != 0)
+        goto fail_unlock;
+
+    uint64_t data_size = raw_size - HEADER_SIZE;
+    if ((uint64_t)n > data_size) {
+        BS_WRUNLOCK(bs);
+        errno = EINVAL;
+        return -1;
+    }
+
+    uint64_t tail_offset = HEADER_SIZE + data_size - (uint64_t)n;
+
+    /* Read old tail bytes (NULL when n == 0 — callback must check old_len). */
+    uint8_t *old_tail = NULL;
+    if (n > 0) {
+        old_tail = (uint8_t *)malloc(n);
+        if (old_tail == NULL)
+            goto fail_unlock;
+        if (plat_pread(bs->fd, old_tail, n, tail_offset) != 0) {
+            free(old_tail);
+            goto fail_unlock;
+        }
+    }
+
+    /* Invoke callback to produce new tail. */
+    uint8_t *new_buf = NULL;
+    size_t   new_len = 0;
+    int cb_ret = cb(old_tail, n, &new_buf, &new_len, ctx);
+    free(old_tail);
+
+    if (cb_ret != 0)
+        goto fail_unlock;
+
+    /* Skip all I/O when both sides are empty. */
+    if (n == 0 && new_len == 0) {
+        BS_WRUNLOCK(bs);
+        return 0;
+    }
+
+    uint64_t final_data_len = data_size - (uint64_t)n + (uint64_t)new_len;
+
+    if (atomic_write_tail(bs->fd, raw_size, tail_offset,
+                          final_data_len, new_buf, new_len, n) != 0) {
+        free(new_buf);
+        goto fail_unlock;
+    }
+    free(new_buf);
+
+    BS_WRUNLOCK(bs);
+    return 0;
+
+fail_unlock:
+    { int s = errno; BS_WRUNLOCK(bs); errno = s; }
+    return -1;
+}
+
 #endif /* BSTACK_FEATURE_ATOMIC */
 
 /* -------------------------------------------------------------------------
@@ -1125,6 +1190,65 @@ int bstack_cas(bstack_t *bs, uint64_t offset,
 
     BS_WRUNLOCK(bs);
     if (ok) *ok = 1;
+    return 0;
+
+fail_unlock:
+    { int s = errno; BS_WRUNLOCK(bs); errno = s; }
+    return -1;
+}
+
+int bstack_process(bstack_t *bs, uint64_t start, uint64_t end,
+                   int (*cb)(uint8_t *buf, size_t len, void *ctx),
+                   void *ctx)
+{
+    if (end < start) {
+        errno = EINVAL;
+        return -1;
+    }
+    uint64_t n = end - start;
+
+    BS_WRLOCK(bs);
+
+    uint64_t raw_size;
+    if (file_size(bs->fd, &raw_size) != 0)
+        goto fail_unlock;
+
+    uint64_t data_size = raw_size - HEADER_SIZE;
+    if (end > data_size) {
+        BS_WRUNLOCK(bs);
+        errno = EINVAL;
+        return -1;
+    }
+
+    uint8_t *buf = NULL;
+    if (n > 0) {
+        buf = (uint8_t *)malloc((size_t)n);
+        if (buf == NULL)
+            goto fail_unlock;
+        if (plat_pread(bs->fd, buf, (size_t)n, HEADER_SIZE + start) != 0) {
+            free(buf);
+            goto fail_unlock;
+        }
+    }
+
+    if (cb(buf, (size_t)n, ctx) != 0) {
+        free(buf);
+        goto fail_unlock;
+    }
+
+    if (n > 0) {
+        if (plat_pwrite(bs->fd, buf, (size_t)n, HEADER_SIZE + start) != 0) {
+            free(buf);
+            goto fail_unlock;
+        }
+        if (plat_durable_sync(bs->fd) != 0) {
+            free(buf);
+            goto fail_unlock;
+        }
+        free(buf);
+    }
+
+    BS_WRUNLOCK(bs);
     return 0;
 
 fail_unlock:

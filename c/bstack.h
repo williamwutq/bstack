@@ -26,7 +26,8 @@
  * On Unix a pthread_rwlock protects each handle; on Windows an SRWLOCK is
  * used.  bstack_push / bstack_extend / bstack_pop / bstack_discard /
  * bstack_set / bstack_zero / bstack_atrunc / bstack_splice /
- * bstack_try_extend / bstack_try_discard(s, n>0) / bstack_swap / bstack_cas
+ * bstack_try_extend / bstack_try_discard(s, n>0) / bstack_swap / bstack_cas /
+ * bstack_replace / bstack_process
  * hold a write lock.  bstack_try_discard(s, 0) holds a read lock.
  * bstack_peek / bstack_get / bstack_len hold a read lock and may run
  * concurrently with each other on both platforms.
@@ -42,8 +43,8 @@
  * -------------
  * Compile with -DBSTACK_FEATURE_SET    to enable bstack_set and bstack_zero.
  * Compile with -DBSTACK_FEATURE_ATOMIC to enable bstack_atrunc, bstack_splice,
- *   bstack_try_extend, and bstack_try_discard.  Both flags together also enable
- *   bstack_swap and bstack_cas.
+ *   bstack_try_extend, bstack_try_discard, and bstack_replace.  Both flags
+ *   together also enable bstack_swap, bstack_cas, and bstack_process.
  */
 
 typedef struct bstack bstack_t;
@@ -197,6 +198,32 @@ int bstack_try_extend(bstack_t *bs, uint64_t s,
  * Only available when compiled with -DBSTACK_FEATURE_ATOMIC.
  */
 int bstack_try_discard(bstack_t *bs, uint64_t s, size_t n, int *ok);
+
+/*
+ * Pop n bytes from the tail, pass them read-only to the callback, then write
+ * whatever the callback produces as the new tail.
+ *
+ * The callback signature is:
+ *   int cb(const uint8_t *old, size_t old_len,
+ *          uint8_t **new_buf, size_t *new_len, void *ctx)
+ *
+ * The callback must set *new_buf to a malloc'd buffer (or NULL when
+ * *new_len == 0) and *new_len to its byte length, then return 0 on success.
+ * bstack calls free(*new_buf) after writing; the caller must not free it.
+ * If the callback returns -1 the operation is aborted (errno set by the
+ * callback); *new_buf is not freed by bstack in that case.
+ *
+ * The file may grow or shrink according to *new_len; the same two-path
+ * crash-safe ordering as bstack_atrunc is used.  n = 0 is valid (old is
+ * NULL and old_len is 0).  Returns EINVAL if n exceeds the payload size.
+ *
+ * Only available when compiled with -DBSTACK_FEATURE_ATOMIC.
+ */
+int bstack_replace(bstack_t *bs, size_t n,
+                   int (*cb)(const uint8_t *old, size_t old_len,
+                              uint8_t **new_buf, size_t *new_len,
+                              void *ctx),
+                   void *ctx);
 #endif /* BSTACK_FEATURE_ATOMIC */
 
 #if defined(BSTACK_FEATURE_ATOMIC) && defined(BSTACK_FEATURE_SET)
@@ -232,6 +259,26 @@ int bstack_swap(bstack_t *bs, uint64_t offset,
 int bstack_cas(bstack_t *bs, uint64_t offset,
                const uint8_t *old_buf, const uint8_t *new_buf,
                size_t len, int *ok);
+
+/*
+ * Read bytes in the half-open logical range [start, end), pass the mutable
+ * buffer to the callback for in-place modification, then write it back.
+ *
+ * The callback signature is:
+ *   int cb(uint8_t *buf, size_t len, void *ctx)
+ *
+ * The callback receives a writable buffer of length (end - start), mutates
+ * it in place, and returns 0 on success or -1 on failure.  The file size is
+ * never changed.  start == end is a valid no-op (callback invoked with
+ * buf == NULL and len == 0).  Returns EINVAL if end < start or end exceeds
+ * the payload size.
+ *
+ * Only available when compiled with both -DBSTACK_FEATURE_SET and
+ * -DBSTACK_FEATURE_ATOMIC.
+ */
+int bstack_process(bstack_t *bs, uint64_t start, uint64_t end,
+                   int (*cb)(uint8_t *buf, size_t len, void *ctx),
+                   void *ctx);
 #endif /* BSTACK_FEATURE_ATOMIC && BSTACK_FEATURE_SET */
 
 #ifdef __cplusplus
