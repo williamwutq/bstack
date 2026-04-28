@@ -4,8 +4,10 @@
 //!
 //! [`BStack`] treats a file as a flat byte buffer that grows and shrinks from
 //! the tail.  Every mutating operation — [`push`](BStack::push),
-//! [`extend`](BStack::extend), [`pop`](BStack::pop), [`discard`](BStack::discard), and (with the `set`
-//! feature) [`set`](BStack::set) and [`zero`](BStack::zero) — calls a *durable sync* before returning,
+//! [`extend`](BStack::extend), [`pop`](BStack::pop), [`discard`](BStack::discard), (with the `set`
+//! feature) [`set`](BStack::set) and [`zero`](BStack::zero), (with the `atomic` feature)
+//! [`replace`](BStack::replace), and (with both `set` and `atomic`)
+//! [`process`](BStack::process) — calls a *durable sync* before returning,
 //! so the data survives a process crash or an unclean system shutdown.
 //! Read-only operations — [`peek`](BStack::peek),
 //! [`peek_into`](BStack::peek_into), [`get`](BStack::get), and
@@ -75,6 +77,8 @@
 //! | `try_discard` *(feature: atomic)* | `lseek(END)` — conditional `discard` sequence if size matches |
 //! | `swap`, `swap_into` *(features: set+atomic)* | `lseek(offset)` → `read` → `lseek(offset)` → `write(buf)` → `durable_sync` |
 //! | `cas` *(features: set+atomic)* | `lseek(offset)` → `read` → compare — conditional `lseek(offset)` → `write(new)` → `durable_sync` |
+//! | `process` *(features: set+atomic)* | `lseek(start)` → `read(end−start)` → *(callback)* → `lseek(start)` → `write(buf)` → `durable_sync` |
+//! | `replace` *(feature: atomic)* | `lseek(tail)` → `read(n)` → *(callback)* → *(then as `atrunc`)* |
 //! | `peek`, `peek_into`, `get`, `get_into` | `pread(2)` on Unix; `ReadFile`+`OVERLAPPED` on Windows; `lseek` → `read` elsewhere (no sync — read-only) |
 //!
 //! **`durable_sync` on macOS** issues `fcntl(F_FULLFSYNC)`, which flushes the
@@ -135,6 +139,8 @@
 //! | `try_discard(s, n > 0)` *(feature: atomic)* | write | write |
 //! | `try_discard(s, 0)` *(feature: atomic)* | **read** | **read** |
 //! | `swap`, `swap_into`, `cas` *(features: set+atomic)* | write | write |
+//! | `process` *(features: set+atomic)* | write | write |
+//! | `replace` *(feature: atomic)* | write | write |
 //! | `peek`, `peek_into`, `get`, `get_into` | **read** | write |
 //! | `len` | read | read |
 //!
@@ -216,7 +222,7 @@
 //! |---------|-------------|
 //! | `set`   | Enables [`BStack::set`] and [`BStack::zero`] — in-place overwrite of existing payload bytes (or with zeros) without changing the file size. |
 //! | `alloc` | Enables [`BStackAllocator`], [`BStackSlice`], [`BStackSliceReader`], and [`LinearBStackAllocator`] — region-based allocation over a `BStack` payload. |
-//! | `atomic` | Enables [`BStack::atrunc`], [`BStack::splice`], [`BStack::splice_into`], [`BStack::try_extend`], and [`BStack::try_discard`] — compound read-modify-write operations that hold the write lock across what would otherwise be separate calls. Combined with `set`, also enables [`BStack::swap`], [`BStack::swap_into`], and [`BStack::cas`]. |
+//! | `atomic` | Enables [`BStack::atrunc`], [`BStack::splice`], [`BStack::splice_into`], [`BStack::try_extend`], [`BStack::try_discard`], and [`BStack::replace`] — compound read-modify-write operations that hold the write lock across what would otherwise be separate calls. Combined with `set`, also enables [`BStack::swap`], [`BStack::swap_into`], [`BStack::cas`], and [`BStack::process`]. |
 //!
 //! Enable with:
 //!
@@ -1366,6 +1372,76 @@ impl BStack {
         durable_sync(&file)?;
         Ok(true)
     }
+
+    /// Pop `n` bytes off the tail, pass them read-only to a callback that
+    /// returns the new tail bytes, then write the new tail.
+    ///
+    /// The read, callback invocation, and write all happen under the same write
+    /// lock, so no other thread can observe the state between the pop and the
+    /// push.  The callback may return a [`Vec<u8>`] of any length — the file
+    /// will grow or shrink accordingly using the same crash-safe ordering
+    /// strategy as [`atrunc`](Self::atrunc).
+    ///
+    /// `n = 0` is valid: the callback receives an empty slice and whatever it
+    /// returns is appended.
+    ///
+    /// # Feature flag
+    ///
+    /// Only available when the `atomic` Cargo feature is enabled.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] if `n` exceeds the current
+    /// payload size.  Propagates any I/O error from `read_exact`, `set_len`,
+    /// `write_all`, or `durable_sync`.
+    #[cfg(feature = "atomic")]
+    pub fn replace<F>(&self, n: u64, f: F) -> io::Result<()>
+    where
+        F: FnOnce(&[u8]) -> Vec<u8>,
+    {
+        let mut file = self.lock.write().unwrap();
+        let file_end = file.seek(SeekFrom::End(0))?;
+        let data_size = file_end - HEADER_SIZE;
+        if n > data_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("replace: n ({n}) exceeds payload size ({data_size})"),
+            ));
+        }
+        let tail_offset = HEADER_SIZE + data_size - n;
+        file.seek(SeekFrom::Start(tail_offset))?;
+        let mut old_tail = vec![0u8; n as usize];
+        file.read_exact(&mut old_tail)?;
+        let new_tail = f(&old_tail);
+        let new_tail_len = new_tail.len() as u64;
+        let final_data_len = data_size - n + new_tail_len;
+
+        if new_tail_len > n {
+            // Net extension: extend first, write new tail, sync, commit.
+            let new_file_end = HEADER_SIZE + final_data_len;
+            file.set_len(new_file_end)?;
+            file.seek(SeekFrom::Start(tail_offset))?;
+            if let Err(e) = file.write_all(&new_tail) {
+                let _ = file.set_len(file_end);
+                return Err(e);
+            }
+            if let Err(e) = durable_sync(&file) {
+                let _ = file.set_len(file_end);
+                return Err(e);
+            }
+            write_committed_len(&mut file, final_data_len)?;
+        } else {
+            // Net truncation or same size: write new tail, truncate, sync, commit.
+            if !new_tail.is_empty() {
+                file.seek(SeekFrom::Start(tail_offset))?;
+                file.write_all(&new_tail)?;
+            }
+            file.set_len(HEADER_SIZE + final_data_len)?;
+            durable_sync(&file)?;
+            write_committed_len(&mut file, final_data_len)?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(all(feature = "set", feature = "atomic"))]
@@ -1516,6 +1592,61 @@ impl BStack {
         file.write_all(new)?;
         durable_sync(&file)?;
         Ok(true)
+    }
+
+    /// Read bytes in the half-open logical range `[start, end)`, pass them to
+    /// a callback that may mutate them in place, then write the modified bytes
+    /// back.
+    ///
+    /// The read, callback invocation, and write all happen under the same write
+    /// lock, so no other thread can observe an intermediate state.  The file
+    /// size is never changed.
+    ///
+    /// `start == end` is a valid no-op: `f` is called with an empty slice and
+    /// no I/O is performed beyond the initial size check.
+    ///
+    /// # Feature flags
+    ///
+    /// Only available when both the `set` and `atomic` Cargo features are
+    /// enabled.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] if `end < start` or if `end`
+    /// exceeds the current payload size.  Propagates any I/O error from
+    /// `read_exact`, `write_all`, or `durable_sync`.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    pub fn process<F>(&self, start: u64, end: u64, f: F) -> io::Result<()>
+    where
+        F: FnOnce(&mut [u8]),
+    {
+        if end < start {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("process: end ({end}) < start ({start})"),
+            ));
+        }
+        let n = end - start;
+        let mut file = self.lock.write().unwrap();
+        let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
+        if end > data_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("process: end ({end}) exceeds payload size ({data_size})"),
+            ));
+        }
+        let mut buf = vec![0u8; n as usize];
+        if n > 0 {
+            file.seek(SeekFrom::Start(HEADER_SIZE + start))?;
+            file.read_exact(&mut buf)?;
+        }
+        f(&mut buf);
+        if n > 0 {
+            file.seek(SeekFrom::Start(HEADER_SIZE + start))?;
+            file.write_all(&buf)?;
+            durable_sync(&file)?;
+        }
+        Ok(())
     }
 }
 
