@@ -1495,6 +1495,735 @@ static int test_zero_persists_across_reopen(void)
 #endif /* BSTACK_FEATURE_SET */
 
 /* =========================================================================
+ * bstack_atrunc / bstack_splice / bstack_try_extend / bstack_try_discard
+ * (compiled only with -DBSTACK_FEATURE_ATOMIC)
+ * ====================================================================== */
+
+#ifdef BSTACK_FEATURE_ATOMIC
+
+static int test_atrunc_net_truncation(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"helloworld", 10, NULL) == 0);
+    CHECK(bstack_atrunc(bs, 7, (uint8_t *)"XY", 2) == 0);
+
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 5);
+    uint8_t buf[5]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(memcmp(buf, "helXY", 5) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_atrunc_net_extension(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"hello", 5, NULL) == 0);
+    CHECK(bstack_atrunc(bs, 2, (uint8_t *)"WORLD", 5) == 0);
+
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 8);
+    uint8_t buf[8]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(memcmp(buf, "helWORLD", 8) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_atrunc_same_size(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"helloworld", 10, NULL) == 0);
+    CHECK(bstack_atrunc(bs, 5, (uint8_t *)"WORLD", 5) == 0);
+
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 10);
+    uint8_t buf[10]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(memcmp(buf, "helloWORLD", 10) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_atrunc_n_zero_pure_append(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"hello", 5, NULL) == 0);
+    CHECK(bstack_atrunc(bs, 0, (uint8_t *)"!!", 2) == 0);
+
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 7);
+    uint8_t buf[7]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(memcmp(buf, "hello!!", 7) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_atrunc_buf_empty_pure_discard(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"helloworld", 10, NULL) == 0);
+    CHECK(bstack_atrunc(bs, 4, NULL, 0) == 0);
+
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 6);
+    uint8_t buf[6]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(memcmp(buf, "hellow", 6) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_atrunc_noop(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"hello", 5, NULL) == 0);
+    CHECK(bstack_atrunc(bs, 0, NULL, 0) == 0);
+
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 5);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_atrunc_exceeds_size_returns_error(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"hello", 5, NULL) == 0);
+    int r = bstack_atrunc(bs, 10, (uint8_t *)"x", 1);
+    CHECK(r == -1);
+    CHECK(errno == EINVAL);
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 5);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_atrunc_persists_across_reopen(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+
+    {
+        bstack_t *bs = bstack_open(tmp);
+        CHECK(bs != NULL);
+        CHECK(bstack_push(bs, (uint8_t *)"helloworld", 10, NULL) == 0);
+        CHECK(bstack_atrunc(bs, 5, (uint8_t *)"AB", 2) == 0);
+        bstack_close(bs);
+    }
+    {
+        bstack_t *bs = bstack_open(tmp);
+        CHECK(bs != NULL);
+        uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 7);
+        uint8_t buf[7]; size_t w;
+        CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+        CHECK(memcmp(buf, "helloAB", 7) == 0);
+        bstack_close(bs);
+    }
+
+    unlink(tmp);
+    return 0;
+}
+
+/* ---- bstack_splice -------------------------------------------------------- */
+
+static int test_splice_returns_popped_bytes(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"helloworld", 10, NULL) == 0);
+
+    uint8_t removed[5];
+    CHECK(bstack_splice(bs, removed, 5, (uint8_t *)"XYZ", 3) == 0);
+    CHECK(memcmp(removed, "world", 5) == 0);
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 8);
+    uint8_t buf[8]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(memcmp(buf, "helloXYZ", 8) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_splice_net_extension(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"hello", 5, NULL) == 0);
+    uint8_t removed[2];
+    CHECK(bstack_splice(bs, removed, 2, (uint8_t *)"LONG!!", 6) == 0);
+    CHECK(memcmp(removed, "lo", 2) == 0);
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 9);
+    uint8_t buf[9]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(memcmp(buf, "helLONG!!", 9) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_splice_net_truncation(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"abcdefghij", 10, NULL) == 0);
+    uint8_t removed[6];
+    CHECK(bstack_splice(bs, removed, 6, (uint8_t *)"XX", 2) == 0);
+    CHECK(memcmp(removed, "efghij", 6) == 0);
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 6);
+    uint8_t buf[6]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(memcmp(buf, "abcdXX", 6) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_splice_same_size(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"helloworld", 10, NULL) == 0);
+    uint8_t removed[5];
+    CHECK(bstack_splice(bs, removed, 5, (uint8_t *)"WORLD", 5) == 0);
+    CHECK(memcmp(removed, "world", 5) == 0);
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 10);
+    uint8_t buf[10]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(memcmp(buf, "helloWORLD", 10) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_splice_n_zero_pure_append(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"hello", 5, NULL) == 0);
+    CHECK(bstack_splice(bs, NULL, 0, (uint8_t *)"!!", 2) == 0);
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 7);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_splice_buf_empty_acts_like_pop(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"helloworld", 10, NULL) == 0);
+    uint8_t removed[5];
+    CHECK(bstack_splice(bs, removed, 5, NULL, 0) == 0);
+    CHECK(memcmp(removed, "world", 5) == 0);
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 5);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_splice_exceeds_size_returns_error(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"abc", 3, NULL) == 0);
+    uint8_t removed[10];
+    int r = bstack_splice(bs, removed, 10, (uint8_t *)"x", 1);
+    CHECK(r == -1);
+    CHECK(errno == EINVAL);
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 3);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_splice_persists_across_reopen(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+
+    {
+        bstack_t *bs = bstack_open(tmp);
+        CHECK(bs != NULL);
+        CHECK(bstack_push(bs, (uint8_t *)"helloworld", 10, NULL) == 0);
+        uint8_t removed[5];
+        CHECK(bstack_splice(bs, removed, 5, (uint8_t *)"XYZ", 3) == 0);
+        CHECK(memcmp(removed, "world", 5) == 0);
+        bstack_close(bs);
+    }
+    {
+        bstack_t *bs = bstack_open(tmp);
+        CHECK(bs != NULL);
+        uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 8);
+        uint8_t buf[8]; size_t w;
+        CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+        CHECK(memcmp(buf, "helloXYZ", 8) == 0);
+        bstack_close(bs);
+    }
+
+    unlink(tmp);
+    return 0;
+}
+
+/* ---- bstack_try_extend ---------------------------------------------------- */
+
+static int test_try_extend_matching_returns_true(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"hello", 5, NULL) == 0);
+    int ok = -1;
+    CHECK(bstack_try_extend(bs, 5, (uint8_t *)"world", 5, &ok) == 0);
+    CHECK(ok == 1);
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 10);
+    uint8_t buf[10]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(memcmp(buf, "helloworld", 10) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_try_extend_mismatching_returns_false(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"hello", 5, NULL) == 0);
+    int ok = -1;
+    CHECK(bstack_try_extend(bs, 3, (uint8_t *)"world", 5, &ok) == 0);
+    CHECK(ok == 0);
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 5);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_try_extend_empty_buf_matching(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"hello", 5, NULL) == 0);
+    int ok = -1;
+    CHECK(bstack_try_extend(bs, 5, NULL, 0, &ok) == 0);
+    CHECK(ok == 1);
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 5);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_try_extend_persists_across_reopen(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+
+    {
+        bstack_t *bs = bstack_open(tmp);
+        CHECK(bs != NULL);
+        CHECK(bstack_push(bs, (uint8_t *)"hello", 5, NULL) == 0);
+        CHECK(bstack_try_extend(bs, 5, (uint8_t *)"world", 5, NULL) == 0);
+        bstack_close(bs);
+    }
+    {
+        bstack_t *bs = bstack_open(tmp);
+        CHECK(bs != NULL);
+        uint8_t buf[10]; size_t w;
+        CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+        CHECK(memcmp(buf, "helloworld", 10) == 0);
+        bstack_close(bs);
+    }
+
+    unlink(tmp);
+    return 0;
+}
+
+/* ---- bstack_try_discard --------------------------------------------------- */
+
+static int test_try_discard_matching_returns_true(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"helloworld", 10, NULL) == 0);
+    int ok = -1;
+    CHECK(bstack_try_discard(bs, 10, 5, &ok) == 0);
+    CHECK(ok == 1);
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 5);
+    uint8_t buf[5]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(memcmp(buf, "hello", 5) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_try_discard_mismatching_returns_false(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"helloworld", 10, NULL) == 0);
+    int ok = -1;
+    CHECK(bstack_try_discard(bs, 7, 5, &ok) == 0);
+    CHECK(ok == 0);
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 10);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_try_discard_n_zero_matching(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"hello", 5, NULL) == 0);
+    int ok = -1;
+    CHECK(bstack_try_discard(bs, 5, 0, &ok) == 0);
+    CHECK(ok == 1);
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 5);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_try_discard_n_zero_mismatching(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"hello", 5, NULL) == 0);
+    int ok = -1;
+    CHECK(bstack_try_discard(bs, 3, 0, &ok) == 0);
+    CHECK(ok == 0);
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 5);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_try_discard_n_exceeds_size_returns_error(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"hello", 5, NULL) == 0);
+    int r = bstack_try_discard(bs, 5, 10, NULL);
+    CHECK(r == -1);
+    CHECK(errno == EINVAL);
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 5);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_try_discard_persists_across_reopen(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+
+    {
+        bstack_t *bs = bstack_open(tmp);
+        CHECK(bs != NULL);
+        CHECK(bstack_push(bs, (uint8_t *)"helloworld", 10, NULL) == 0);
+        CHECK(bstack_try_discard(bs, 10, 5, NULL) == 0);
+        bstack_close(bs);
+    }
+    {
+        bstack_t *bs = bstack_open(tmp);
+        CHECK(bs != NULL);
+        uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 5);
+        uint8_t buf[5]; size_t w;
+        CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+        CHECK(memcmp(buf, "hello", 5) == 0);
+        bstack_close(bs);
+    }
+
+    unlink(tmp);
+    return 0;
+}
+
+#endif /* BSTACK_FEATURE_ATOMIC */
+
+/* =========================================================================
+ * bstack_swap / bstack_cas
+ * (compiled only with -DBSTACK_FEATURE_ATOMIC and -DBSTACK_FEATURE_SET)
+ * ====================================================================== */
+
+#if defined(BSTACK_FEATURE_ATOMIC) && defined(BSTACK_FEATURE_SET)
+
+static int test_swap_returns_old_stores_new(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"helloworld", 10, NULL) == 0);
+    uint8_t old[5];
+    CHECK(bstack_swap(bs, 5, old, (uint8_t *)"WORLD", 5) == 0);
+    CHECK(memcmp(old, "world", 5) == 0);
+    uint8_t buf[10]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(memcmp(buf, "helloWORLD", 10) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_swap_len_zero_is_noop(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"hello", 5, NULL) == 0);
+    CHECK(bstack_swap(bs, 0, NULL, NULL, 0) == 0);
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 5);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_swap_at_start(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"helloworld", 10, NULL) == 0);
+    uint8_t old[5];
+    CHECK(bstack_swap(bs, 0, old, (uint8_t *)"HELLO", 5) == 0);
+    CHECK(memcmp(old, "hello", 5) == 0);
+    uint8_t buf[10]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(memcmp(buf, "HELLOworld", 10) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_swap_does_not_change_file_size(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"abcde", 5, NULL) == 0);
+    uint8_t old[3];
+    CHECK(bstack_swap(bs, 1, old, (uint8_t *)"XYZ", 3) == 0);
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 5);
+    uint8_t buf[5]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(memcmp(buf, "aXYZe", 5) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_swap_exceeds_size_returns_error(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"hello", 5, NULL) == 0);
+    uint8_t old[7];
+    int r = bstack_swap(bs, 3, old, (uint8_t *)"TOOLONG", 7);
+    CHECK(r == -1);
+    CHECK(errno == EINVAL);
+    uint8_t buf[5]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(memcmp(buf, "hello", 5) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_swap_persists_across_reopen(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+
+    {
+        bstack_t *bs = bstack_open(tmp);
+        CHECK(bs != NULL);
+        CHECK(bstack_push(bs, (uint8_t *)"helloworld", 10, NULL) == 0);
+        uint8_t old[5];
+        CHECK(bstack_swap(bs, 5, old, (uint8_t *)"WORLD", 5) == 0);
+        bstack_close(bs);
+    }
+    {
+        bstack_t *bs = bstack_open(tmp);
+        CHECK(bs != NULL);
+        uint8_t buf[10]; size_t w;
+        CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+        CHECK(memcmp(buf, "helloWORLD", 10) == 0);
+        bstack_close(bs);
+    }
+
+    unlink(tmp);
+    return 0;
+}
+
+/* ---- bstack_cas ----------------------------------------------------------- */
+
+static int test_cas_matching_performs_exchange(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"helloworld", 10, NULL) == 0);
+    int ok = -1;
+    CHECK(bstack_cas(bs, 5, (uint8_t *)"world", (uint8_t *)"WORLD", 5, &ok) == 0);
+    CHECK(ok == 1);
+    uint8_t buf[10]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(memcmp(buf, "helloWORLD", 10) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_cas_mismatch_returns_false_no_change(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"helloworld", 10, NULL) == 0);
+    int ok = -1;
+    CHECK(bstack_cas(bs, 5, (uint8_t *)"xxxxx", (uint8_t *)"WORLD", 5, &ok) == 0);
+    CHECK(ok == 0);
+    uint8_t buf[10]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(memcmp(buf, "helloworld", 10) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_cas_len_zero_returns_true(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"hello", 5, NULL) == 0);
+    int ok = -1;
+    CHECK(bstack_cas(bs, 0, NULL, NULL, 0, &ok) == 0);
+    CHECK(ok == 1);
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 5);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_cas_does_not_change_file_size(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"abcde", 5, NULL) == 0);
+    CHECK(bstack_cas(bs, 1, (uint8_t *)"bcd", (uint8_t *)"XYZ", 3, NULL) == 0);
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 5);
+    uint8_t buf[5]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(memcmp(buf, "aXYZe", 5) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_cas_exceeds_size_returns_error(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"hello", 5, NULL) == 0);
+    int r = bstack_cas(bs, 3, (uint8_t *)"TOOLONG", (uint8_t *)"TOOLONG", 7, NULL);
+    CHECK(r == -1);
+    CHECK(errno == EINVAL);
+    uint8_t buf[5]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(memcmp(buf, "hello", 5) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_cas_persists_across_reopen(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+
+    {
+        bstack_t *bs = bstack_open(tmp);
+        CHECK(bs != NULL);
+        CHECK(bstack_push(bs, (uint8_t *)"helloworld", 10, NULL) == 0);
+        CHECK(bstack_cas(bs, 5, (uint8_t *)"world", (uint8_t *)"WORLD", 5, NULL) == 0);
+        bstack_close(bs);
+    }
+    {
+        bstack_t *bs = bstack_open(tmp);
+        CHECK(bs != NULL);
+        uint8_t buf[10]; size_t w;
+        CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+        CHECK(memcmp(buf, "helloWORLD", 10) == 0);
+        bstack_close(bs);
+    }
+
+    unlink(tmp);
+    return 0;
+}
+
+#endif /* BSTACK_FEATURE_ATOMIC && BSTACK_FEATURE_SET */
+
+/* =========================================================================
  * main
  * ====================================================================== */
 
@@ -1582,6 +2311,60 @@ int main(void)
     T(test_zero_does_not_change_file_size);
     T(test_zero_rejects_write_past_end);
     T(test_zero_persists_across_reopen);
+#endif
+
+#ifdef BSTACK_FEATURE_ATOMIC
+    /* bstack_atrunc */
+    T(test_atrunc_net_truncation);
+    T(test_atrunc_net_extension);
+    T(test_atrunc_same_size);
+    T(test_atrunc_n_zero_pure_append);
+    T(test_atrunc_buf_empty_pure_discard);
+    T(test_atrunc_noop);
+    T(test_atrunc_exceeds_size_returns_error);
+    T(test_atrunc_persists_across_reopen);
+
+    /* bstack_splice */
+    T(test_splice_returns_popped_bytes);
+    T(test_splice_net_extension);
+    T(test_splice_net_truncation);
+    T(test_splice_same_size);
+    T(test_splice_n_zero_pure_append);
+    T(test_splice_buf_empty_acts_like_pop);
+    T(test_splice_exceeds_size_returns_error);
+    T(test_splice_persists_across_reopen);
+
+    /* bstack_try_extend */
+    T(test_try_extend_matching_returns_true);
+    T(test_try_extend_mismatching_returns_false);
+    T(test_try_extend_empty_buf_matching);
+    T(test_try_extend_persists_across_reopen);
+
+    /* bstack_try_discard */
+    T(test_try_discard_matching_returns_true);
+    T(test_try_discard_mismatching_returns_false);
+    T(test_try_discard_n_zero_matching);
+    T(test_try_discard_n_zero_mismatching);
+    T(test_try_discard_n_exceeds_size_returns_error);
+    T(test_try_discard_persists_across_reopen);
+#endif
+
+#if defined(BSTACK_FEATURE_ATOMIC) && defined(BSTACK_FEATURE_SET)
+    /* bstack_swap */
+    T(test_swap_returns_old_stores_new);
+    T(test_swap_len_zero_is_noop);
+    T(test_swap_at_start);
+    T(test_swap_does_not_change_file_size);
+    T(test_swap_exceeds_size_returns_error);
+    T(test_swap_persists_across_reopen);
+
+    /* bstack_cas */
+    T(test_cas_matching_performs_exchange);
+    T(test_cas_mismatch_returns_false_no_change);
+    T(test_cas_len_zero_returns_true);
+    T(test_cas_does_not_change_file_size);
+    T(test_cas_exceeds_size_returns_error);
+    T(test_cas_persists_across_reopen);
 #endif
 
     printf("\n%d/%d passed\n", g_passed, g_total);

@@ -24,6 +24,14 @@ TEST_OBJ = test_bstack.o
 LIB_SET  = libbstack-set.a
 OBJ_SET  = bstack-set.o
 
+# Atomic-enabled library.
+LIB_ATOMIC  = libbstack-atomic.a
+OBJ_ATOMIC  = bstack-atomic.o
+
+# Set + Atomic library.
+LIB_SET_ATOMIC  = libbstack-set-atomic.a
+OBJ_SET_ATOMIC  = bstack-set-atomic.o
+
 # Alloc layer (bstack_alloc.h / bstack_alloc.c).
 LIB_ALLOC     = libbstack-alloc.a
 OBJ_ALLOC     = bstack_alloc.o
@@ -34,7 +42,7 @@ EXAMPLE_NAMES = basic buffer_reuse journal reading vec_store
 EXAMPLE_BINS  = $(addprefix ../examples/,$(addsuffix $(EXE_EXT),$(EXAMPLE_NAMES)))
 HASHMAP_BIN   = ../examples/hashmap$(EXE_EXT)
 
-.PHONY: all test leaks clean alloc \
+.PHONY: all test test-atomic test-set-atomic leaks clean alloc \
         example example-basic example-buffer_reuse example-journal \
         example-reading example-vec_store example-hashmap
 
@@ -51,6 +59,18 @@ $(OBJ_SET): bstack.c bstack.h
 	$(CC) $(CFLAGS) -DBSTACK_FEATURE_SET -c -o $@ $<
 
 $(LIB_SET): $(OBJ_SET)
+	ar rcs $@ $^
+
+$(OBJ_ATOMIC): bstack.c bstack.h
+	$(CC) $(CFLAGS) -DBSTACK_FEATURE_ATOMIC -c -o $@ $<
+
+$(LIB_ATOMIC): $(OBJ_ATOMIC)
+	ar rcs $@ $^
+
+$(OBJ_SET_ATOMIC): bstack.c bstack.h
+	$(CC) $(CFLAGS) -DBSTACK_FEATURE_SET -DBSTACK_FEATURE_ATOMIC -c -o $@ $<
+
+$(LIB_SET_ATOMIC): $(OBJ_SET_ATOMIC)
 	ar rcs $@ $^
 
 $(OBJ_ALLOC): bstack_alloc.c bstack_alloc.h bstack.h
@@ -74,6 +94,18 @@ $(TEST_BIN): $(TEST_OBJ) $(LIB)
 	$(CC) $(CFLAGS) $(DEFINES) -o $@ $< -L. -lbstack -lpthread
 
 test: $(TEST_BIN)
+	$(RUN)$(TEST_BIN)
+
+# Run tests with the atomic feature enabled.
+test-atomic: $(LIB_ATOMIC)
+	$(CC) $(CFLAGS) -DBSTACK_FEATURE_ATOMIC -c -o $(TEST_OBJ) test_bstack.c
+	$(CC) $(CFLAGS) -DBSTACK_FEATURE_ATOMIC -o $(TEST_BIN) $(TEST_OBJ) -L. -lbstack-atomic -lpthread
+	$(RUN)$(TEST_BIN)
+
+# Run tests with both set and atomic features enabled.
+test-set-atomic: $(LIB_SET_ATOMIC)
+	$(CC) $(CFLAGS) -DBSTACK_FEATURE_SET -DBSTACK_FEATURE_ATOMIC -c -o $(TEST_OBJ) test_bstack.c
+	$(CC) $(CFLAGS) -DBSTACK_FEATURE_SET -DBSTACK_FEATURE_ATOMIC -o $(TEST_BIN) $(TEST_OBJ) -L. -lbstack-set-atomic -lpthread
 	$(RUN)$(TEST_BIN)
 
 # Leak detection — macOS requires Xcode developer tools; Linux uses Valgrind.
@@ -139,5 +171,6 @@ example: $(EXAMPLE_BINS) $(HASHMAP_BIN)
 
 clean:
 	rm -f $(OBJ) $(TEST_OBJ) $(OBJ_SET) $(LIB) $(LIB_SET) $(TEST_BIN) \
+	      $(OBJ_ATOMIC) $(LIB_ATOMIC) $(OBJ_SET_ATOMIC) $(LIB_SET_ATOMIC) \
 	      $(OBJ_ALLOC) $(OBJ_ALLOC_SET) $(LIB_ALLOC) $(LIB_ALLOC_SET) \
 	      $(EXAMPLE_BINS) $(HASHMAP_BIN)
