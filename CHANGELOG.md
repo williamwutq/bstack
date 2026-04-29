@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **`FirstFitBStackAllocator::dealloc` and `realloc` — validation rejected valid slices with user-visible length < 16**: both methods validated the input slice using the raw user-visible `slice.len()`, passing it directly to `is_impossible_block_size` and `is_impossible_block_end`. Because `align_len` guarantees the underlying block is always at least 16 bytes, a slice allocated with `len < 16` (e.g. `alloc(5)`) is perfectly valid, but the check `5 < MIN_BLOCK_PAYLOAD_SIZE` returned "impossible" and the call returned `InvalidInput`. Fixed by computing `aligned_len = align_len(slice.len())` first and using that for all size and end-offset checks.
+- **`FirstFitBStackAllocator::dealloc` and `realloc` — wrong block boundary for small slices**: the tail-block detection condition used `slice.end().next_multiple_of(8)`, where `slice.end() = slice.start() + slice.len()`. For a 5-byte slice the rounded end (8) does not equal the actual block boundary (`slice.start() + 16`), so the fast tail-discard path was never taken and the block was incorrectly routed through `add_to_free_list` instead. The `discard` call on that path also used `slice.len().next_multiple_of(8)` (8 bytes) instead of `align_len(slice.len())` (16 bytes), leaving 8 bytes of garbage at the stack tail. Fixed to use `slice.start() + aligned_len` for both the condition and the discard amount.
+- **`FirstFitBStackAllocator::find_large_enough_block` — end-of-list treated as corrupt pointer**: after advancing `head = next_free`, the function immediately called `is_impossible_block_start(head)` before the `while head != 0` loop guard could re-check. A `next_free` value of `0` (normal end-of-list sentinel) was therefore flagged as an invalid offset and the function returned `InvalidData`, causing any allocation attempt to fail when the free list contained at least one block that was too small. Fixed by guarding the check with `if head != 0 && is_impossible_block_start(head)`.
+
 ## [0.1.7] - 2026-04-28
 
 ### Added
