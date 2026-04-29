@@ -25,10 +25,11 @@
 #   make test                             run local test suites
 #   make clean                            remove build/ and target/
 
-BUILD   := build
-C_SRC   := c/bstack.c
-C_INC   := c
-C_FLAGS := -std=c11 -O2
+BUILD        := build
+C_SRC        := c/bstack.c
+C_ALLOC_SRC  := c/bstack_alloc.c
+C_INC        := c
+C_FLAGS      := -std=c11 -O2
 
 # ── Platform detection ───────────────────────────────────────────────────────
 HOST_OS := $(shell uname -s)
@@ -131,7 +132,40 @@ RUST_TARGETS := \
 RUST_PHONY := $(addprefix rust-,$(RUST_TARGETS))
 C_PHONY    := $(addprefix c-,$(RUST_TARGETS))
 
-.PHONY: all release rust c test clean zip $(RUST_PHONY) $(C_PHONY)
+.PHONY: all release rust c test clean zip help $(RUST_PHONY) $(C_PHONY)
+
+help:
+	@echo 'Usage:'
+	@echo '  make release                           build all Rust + C targets (default)'
+	@echo '  make release CC="zig cc"               use zig cc for C cross-compilation'
+	@echo '  make release CC=clang                  use clang for C cross-compilation'
+	@echo ''
+	@echo 'Selective build:'
+	@echo '  make rust                              all Rust targets'
+	@echo '  make c                                 all C targets'
+	@echo '  make rust-<target>                     single Rust target, e.g.:'
+	@echo '                                           rust-aarch64-apple-darwin'
+	@echo '                                           rust-x86_64-unknown-linux-musl'
+	@echo '  make c-<target>                        single C target (same triples as above)'
+	@echo ''
+	@echo 'Testing (native only):'
+	@echo '  make test                              Rust + all C feature variants'
+	@echo ''
+	@echo 'Packaging:'
+	@echo '  make zip                               archive build/ outputs'
+	@echo ''
+	@echo 'Cleanup:'
+	@echo '  make clean                             remove build/ and Rust target/'
+	@echo '  make clean-zip                         remove archives only'
+	@echo '  make clean-data                        remove *.bstack data files'
+	@echo ''
+	@echo 'C feature variants built per target:'
+	@echo '  libbstack.a            base'
+	@echo '  libbstack-set.a        -DBSTACK_FEATURE_SET'
+	@echo '  libbstack-atomic.a     -DBSTACK_FEATURE_ATOMIC'
+	@echo '  libbstack-set-atomic.a -DBSTACK_FEATURE_SET -DBSTACK_FEATURE_ATOMIC'
+	@echo '  libbstack-alloc.a      base + alloc layer'
+	@echo '  libbstack-alloc-set.a  -DBSTACK_FEATURE_SET + alloc layer'
 
 all: release zip
 
@@ -144,6 +178,10 @@ c: $(C_PHONY)
 # ── Rust — cargo zigbuild ─────────────────────────────────────────────────────
 # Output: $(BUILD)/<target>/rust/libbstack.rlib
 #         $(BUILD)/<target>/rust/libbstack-set.rlib
+#         $(BUILD)/<target>/rust/libbstack-alloc.rlib
+#         $(BUILD)/<target>/rust/libbstack-alloc-set.rlib
+#         $(BUILD)/<target>/rust/libbstack-atomic.rlib
+#         $(BUILD)/<target>/rust/libbstack-set-atomic.rlib
 define rust_rule
 rust-$(1):
 	@echo "==> rust $(1)"
@@ -152,6 +190,14 @@ rust-$(1):
 	cp target/$(1)/release/libbstack.rlib $(BUILD)/$(1)/rust/libbstack.rlib
 	cargo zigbuild --target $(1) --release --features set
 	cp target/$(1)/release/libbstack.rlib $(BUILD)/$(1)/rust/libbstack-set.rlib
+	cargo zigbuild --target $(1) --release --features alloc
+	cp target/$(1)/release/libbstack.rlib $(BUILD)/$(1)/rust/libbstack-alloc.rlib
+	cargo zigbuild --target $(1) --release --features "alloc,set"
+	cp target/$(1)/release/libbstack.rlib $(BUILD)/$(1)/rust/libbstack-alloc-set.rlib
+	cargo zigbuild --target $(1) --release --features atomic
+	cp target/$(1)/release/libbstack.rlib $(BUILD)/$(1)/rust/libbstack-atomic.rlib
+	cargo zigbuild --target $(1) --release --features "set,atomic"
+	cp target/$(1)/release/libbstack.rlib $(BUILD)/$(1)/rust/libbstack-set-atomic.rlib
 endef
 
 $(foreach t,$(RUST_TARGETS),$(eval $(call rust_rule,$(t))))
@@ -159,18 +205,42 @@ $(foreach t,$(RUST_TARGETS),$(eval $(call rust_rule,$(t))))
 # ── C — cross-compilation ─────────────────────────────────────────────────────
 # Output: $(BUILD)/<target>/c/libbstack.a
 #         $(BUILD)/<target>/c/libbstack-set.a
+#         $(BUILD)/<target>/c/libbstack-atomic.a
+#         $(BUILD)/<target>/c/libbstack-set-atomic.a
+#         $(BUILD)/<target>/c/libbstack-alloc.a
+#         $(BUILD)/<target>/c/libbstack-alloc-set.a
 #         $(BUILD)/<target>/c/bstack.h
+#         $(BUILD)/<target>/c/bstack_alloc.h
 define c_rule
 c-$(1):
 	@echo "==> c $(1)  [$(_CC_FAMILY): $(call cc_for,$(1))]"
 	@mkdir -p $(BUILD)/$(1)/c
-	cp $(C_INC)/bstack.h $(BUILD)/$(1)/c/bstack.h
+	cp $(C_INC)/bstack.h       $(BUILD)/$(1)/c/bstack.h
+	cp $(C_INC)/bstack_alloc.h $(BUILD)/$(1)/c/bstack_alloc.h
 	$(call cc_for,$(1)) $(C_FLAGS) \
 	    -I $(C_INC) -c -o $(BUILD)/$(1)/c/bstack.o $(C_SRC)
-	$(call ar_for,$(1)) rcs $(BUILD)/$(1)/c/libbstack.a $(BUILD)/$(1)/c/bstack.o
+	$(call ar_for,$(1)) rcs $(BUILD)/$(1)/c/libbstack.a \
+	    $(BUILD)/$(1)/c/bstack.o
 	$(call cc_for,$(1)) $(C_FLAGS) -DBSTACK_FEATURE_SET \
 	    -I $(C_INC) -c -o $(BUILD)/$(1)/c/bstack-set.o $(C_SRC)
-	$(call ar_for,$(1)) rcs $(BUILD)/$(1)/c/libbstack-set.a $(BUILD)/$(1)/c/bstack-set.o
+	$(call ar_for,$(1)) rcs $(BUILD)/$(1)/c/libbstack-set.a \
+	    $(BUILD)/$(1)/c/bstack-set.o
+	$(call cc_for,$(1)) $(C_FLAGS) -DBSTACK_FEATURE_ATOMIC \
+	    -I $(C_INC) -c -o $(BUILD)/$(1)/c/bstack-atomic.o $(C_SRC)
+	$(call ar_for,$(1)) rcs $(BUILD)/$(1)/c/libbstack-atomic.a \
+	    $(BUILD)/$(1)/c/bstack-atomic.o
+	$(call cc_for,$(1)) $(C_FLAGS) -DBSTACK_FEATURE_SET -DBSTACK_FEATURE_ATOMIC \
+	    -I $(C_INC) -c -o $(BUILD)/$(1)/c/bstack-set-atomic.o $(C_SRC)
+	$(call ar_for,$(1)) rcs $(BUILD)/$(1)/c/libbstack-set-atomic.a \
+	    $(BUILD)/$(1)/c/bstack-set-atomic.o
+	$(call cc_for,$(1)) $(C_FLAGS) \
+	    -I $(C_INC) -c -o $(BUILD)/$(1)/c/bstack_alloc.o $(C_ALLOC_SRC)
+	$(call ar_for,$(1)) rcs $(BUILD)/$(1)/c/libbstack-alloc.a \
+	    $(BUILD)/$(1)/c/bstack.o $(BUILD)/$(1)/c/bstack_alloc.o
+	$(call cc_for,$(1)) $(C_FLAGS) -DBSTACK_FEATURE_SET \
+	    -I $(C_INC) -c -o $(BUILD)/$(1)/c/bstack_alloc-set.o $(C_ALLOC_SRC)
+	$(call ar_for,$(1)) rcs $(BUILD)/$(1)/c/libbstack-alloc-set.a \
+	    $(BUILD)/$(1)/c/bstack-set.o $(BUILD)/$(1)/c/bstack_alloc-set.o
 endef
 
 $(foreach t,$(RUST_TARGETS),$(eval $(call c_rule,$(t))))
@@ -178,10 +248,14 @@ $(foreach t,$(RUST_TARGETS),$(eval $(call c_rule,$(t))))
 # ── Local tests (native only) ─────────────────────────────────────────────────
 test:
 	cargo test
+	cargo test --features set
+	cargo test --features "alloc,set"
 	$(MAKE) -C c clean
 	$(MAKE) -C c test
-	$(MAKE) -C c clean
-	$(MAKE) -C c test DEFINES=-DBSTACK_FEATURE_SET
+	$(MAKE) -C c test-set
+	$(MAKE) -C c test-atomic
+	$(MAKE) -C c test-set-atomic
+	$(MAKE) -C c test-first-fit
 	$(MAKE) -C c clean
 
 # ── Clean ─────────────────────────────────────────────────────────────────────
