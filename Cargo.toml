@@ -33,3 +33,6 @@ windows-sys = { version = "0.52", features = [
 
 [dev-dependencies]
 rand = "0.10.1"
+
+[package.metadata.docs.rs]
+all-features = true
