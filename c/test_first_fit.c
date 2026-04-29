@@ -18,10 +18,13 @@
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
 #  include <windows.h>
-#  define ff_unlink(p) DeleteFileA(p)
+#  include <process.h>
+#  define ff_unlink(p)  DeleteFileA(p)
+#  define ff_getpid()   ((unsigned long)_getpid())
 #else
 #  include <unistd.h>
-#  define ff_unlink(p) unlink(p)
+#  define ff_unlink(p)  unlink(p)
+#  define ff_getpid()   ((unsigned long)getpid())
 #endif
 
 /* =========================================================================
@@ -360,7 +363,7 @@ static int test_fuzz_alloc_dealloc(void)
 {
     char tmp[64]; make_tmp(tmp, sizeof tmp);
     uint64_t seed = (uint64_t)(unsigned long)time(NULL)
-                  ^ (uint64_t)(unsigned long)getpid();
+                  ^ (uint64_t)(unsigned long)ff_getpid();
     rng_seed(seed);
 
     bstack_t *bs = bstack_open(tmp); CHECK(bs);
@@ -422,7 +425,7 @@ static int test_fuzz_alloc_realloc_dealloc(void)
 {
     char tmp[64]; make_tmp(tmp, sizeof tmp);
     uint64_t seed = (uint64_t)(unsigned long)time(NULL)
-                  ^ (uint64_t)(unsigned long)getpid()
+                  ^ (uint64_t)(unsigned long)ff_getpid()
                   ^ UINT64_C(0xdeadbeef);
     rng_seed(seed);
 
@@ -536,7 +539,7 @@ static int test_fuzz_reopen(void)
 {
     char tmp[64]; make_tmp(tmp, sizeof tmp);
     uint64_t seed = (uint64_t)(unsigned long)time(NULL)
-                  ^ (uint64_t)(unsigned long)getpid()
+                  ^ (uint64_t)(unsigned long)ff_getpid()
                   ^ UINT64_C(0xcafef00d);
     rng_seed(seed);
 
