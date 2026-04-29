@@ -34,8 +34,12 @@ jobs:
     - name: Build and test
       run: cd c && make test
     - name: Build and test with set
-      run: cd c && make DEFINES=-DBSTACK_FEATURE_SET test
+      run: cd c && make test-set
     - name: Build and test with atomic
-      run: cd c && make DEFINES=-DBSTACK_FEATURE_ATOMIC test
+      run: cd c && make test-atomic
     - name: Build and test with set and atomic
-      run: cd c && make DEFINES="-DBSTACK_FEATURE_SET -DBSTACK_FEATURE_ATOMIC" test
+      run: cd c && make test-set-atomic
+    - name: Build and test first-fit allocator
+      run: cd c && make test-first-fit
+    - name: Build alloc libraries (all feature variants)
+      run: cd c && make libbstack-alloc.a libbstack-alloc-set.a

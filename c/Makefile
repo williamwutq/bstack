@@ -38,12 +38,16 @@ OBJ_ALLOC     = bstack_alloc.o
 LIB_ALLOC_SET = libbstack-alloc-set.a
 OBJ_ALLOC_SET = bstack_alloc-set.o
 
+# First-fit allocator test (requires BSTACK_FEATURE_SET).
+TEST_FF_BIN = test_first_fit$(EXE_EXT)
+TEST_FF_OBJ = test_first_fit.o
+
 EXAMPLE_NAMES = basic buffer_reuse journal reading vec_store
 EXAMPLE_BINS  = $(addprefix ../examples/,$(addsuffix $(EXE_EXT),$(EXAMPLE_NAMES)))
 HASHMAP_BIN   = ../examples/hashmap$(EXE_EXT)
 ATOMIC_BIN    = ../examples/atomic_ops$(EXE_EXT)
 
-.PHONY: all test test-atomic test-set-atomic leaks clean alloc \
+.PHONY: all test test-set test-atomic test-set-atomic test-first-fit leaks clean alloc \
         example example-basic example-buffer_reuse example-journal \
         example-reading example-vec_store example-hashmap example-atomic_ops
 
@@ -95,6 +99,21 @@ $(TEST_BIN): $(TEST_OBJ) $(LIB)
 	$(CC) $(CFLAGS) $(DEFINES) -o $@ $< -L. -lbstack -lpthread
 
 test: $(TEST_BIN)
+	$(RUN)$(TEST_BIN)
+
+$(TEST_FF_OBJ): test_first_fit.c bstack_alloc.h bstack.h
+	$(CC) $(CFLAGS) -DBSTACK_FEATURE_SET -c -o $@ $<
+
+$(TEST_FF_BIN): $(TEST_FF_OBJ) $(LIB_ALLOC_SET)
+	$(CC) $(CFLAGS) -DBSTACK_FEATURE_SET -o $@ $< -L. -lbstack-alloc-set -lpthread
+
+test-first-fit: $(TEST_FF_BIN)
+	$(RUN)$(TEST_FF_BIN)
+
+# Run tests with the set feature enabled.
+test-set: $(LIB_SET)
+	$(CC) $(CFLAGS) -DBSTACK_FEATURE_SET -c -o $(TEST_OBJ) test_bstack.c
+	$(CC) $(CFLAGS) -DBSTACK_FEATURE_SET -o $(TEST_BIN) $(TEST_OBJ) -L. -lbstack-set -lpthread
 	$(RUN)$(TEST_BIN)
 
 # Run tests with the atomic feature enabled.
@@ -181,4 +200,5 @@ clean:
 	rm -f $(OBJ) $(TEST_OBJ) $(OBJ_SET) $(LIB) $(LIB_SET) $(TEST_BIN) \
 	      $(OBJ_ATOMIC) $(LIB_ATOMIC) $(OBJ_SET_ATOMIC) $(LIB_SET_ATOMIC) \
 	      $(OBJ_ALLOC) $(OBJ_ALLOC_SET) $(LIB_ALLOC) $(LIB_ALLOC_SET) \
+	      $(TEST_FF_OBJ) $(TEST_FF_BIN) \
 	      $(EXAMPLE_BINS) $(HASHMAP_BIN) $(ATOMIC_BIN)

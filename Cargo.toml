@@ -10,6 +10,7 @@ changelog = "CHANGELOG.md"
 repository = "https://github.com/williamwutq/bstack"
 documentation = "https://docs.rs/bstack"
 keywords = ["stack", "persistent", "file-backed", "database", "binary"]
+include = ["src/**/*", "Cargo.toml", "README.md", "CHANGELOG.md", "LICENSE", "examples/**/*", ".gitignore"]
 
 [features]
 # Enables BStack::set — in-place mutation of existing payload bytes.
