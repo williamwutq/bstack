@@ -1615,7 +1615,7 @@ impl FirstFitBStackAllocator {
                     .try_into()
                     .unwrap(),
             );
-            if self.is_impossible_block_start(head) {
+            if head != 0 && self.is_impossible_block_start(head) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("corrupted free list: next block offset {head} is invalid"),
@@ -1933,9 +1933,12 @@ impl BStackAllocator for FirstFitBStackAllocator {
     }
 
     fn dealloc(&self, slice: BStackSlice<'_, Self>) -> io::Result<()> {
+        // Use the aligned block size for validation: the user-visible len may be smaller than
+        // MIN_BLOCK_PAYLOAD_SIZE (e.g. alloc(5) returns a 5-byte slice backed by a 16-byte block).
+        let aligned_len = self.align_len(slice.len());
         if self.is_impossible_block_start(slice.start())
-            || self.is_impossible_block_end(slice.end())
-            || self.is_impossible_block_size(slice.len())
+            || self.is_impossible_block_end(slice.start() + aligned_len)
+            || self.is_impossible_block_size(aligned_len)
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -1943,11 +1946,11 @@ impl BStackAllocator for FirstFitBStackAllocator {
             ));
         }
         // Special case for dealloc of the tail block:
-        // if slice.end() == self.len() - Self::BLOCK_FOOTER_SIZE, just discard it from the stack.
+        // if slice.start() + aligned_len == self.len() - Self::BLOCK_FOOTER_SIZE, just discard it.
         let current_tail = self.stack.len()?;
-        if slice.end().next_multiple_of(8) == current_tail - Self::BLOCK_FOOTER_SIZE {
+        if slice.start() + aligned_len == current_tail - Self::BLOCK_FOOTER_SIZE {
             self.stack
-                .discard(slice.len().next_multiple_of(8) + Self::BLOCK_OVERHEAD_SIZE)?;
+                .discard(aligned_len + Self::BLOCK_OVERHEAD_SIZE)?;
             self.cascade_discard_free_tail()?;
             return Ok(());
         }
@@ -1961,9 +1964,11 @@ impl BStackAllocator for FirstFitBStackAllocator {
         slice: BStackSlice<'a, Self>,
         new_len: u64,
     ) -> io::Result<BStackSlice<'a, Self>> {
+        // Use the aligned block size for validation (same reason as dealloc).
+        let aligned_current_len = self.align_len(slice.len());
         if self.is_impossible_block_start(slice.start())
-            || self.is_impossible_block_end(slice.end())
-            || self.is_impossible_block_size(slice.len())
+            || self.is_impossible_block_end(slice.start() + aligned_current_len)
+            || self.is_impossible_block_size(aligned_current_len)
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -1972,7 +1977,6 @@ impl BStackAllocator for FirstFitBStackAllocator {
         }
 
         let aligned_new_len = self.align_len(new_len);
-        let aligned_current_len = slice.len().next_multiple_of(8);
 
         // If the new length.next_multiple_of(8) is the same as the old length.next_multiple_of(8)
         // the block stays put.  When growing the user-visible len within the same alignment
@@ -1987,12 +1991,12 @@ impl BStackAllocator for FirstFitBStackAllocator {
         }
 
         // Special case for realloc of the tail block:
-        // The tail block cannot be shrink beyound Self::MIN_BLOCK_PAYLOAD_SIZE. This is enforced
+        // The tail block cannot be shrunk below Self::MIN_BLOCK_PAYLOAD_SIZE. This is enforced
         // by the align_len function, so if new_len is smaller than that, aligned_new_len will be the same as
         // aligned_current_len and we will just return the same slice without shrinking.
-        // if slice.end() == self.len() - Self::BLOCK_FOOTER_SIZE, just extend or discard from the stack as needed.
+        // if slice.start() + aligned_current_len == self.len() - Self::BLOCK_FOOTER_SIZE, just extend or discard.
         let current_tail = self.stack.len()?;
-        if slice.end().next_multiple_of(8) == current_tail - Self::BLOCK_FOOTER_SIZE {
+        if slice.start() + aligned_current_len == current_tail - Self::BLOCK_FOOTER_SIZE {
             match aligned_new_len.cmp(&aligned_current_len) {
                 std::cmp::Ordering::Equal => return Ok(slice), // Included but this should never happen
                 std::cmp::Ordering::Greater => {
