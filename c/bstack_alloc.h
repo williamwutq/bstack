@@ -326,6 +326,62 @@ void linear_bstack_allocator_free(linear_bstack_allocator_t *alloc);
  */
 bstack_t *linear_bstack_allocator_into_stack(linear_bstack_allocator_t *alloc);
 
+#ifdef BSTACK_FEATURE_SET
+/* =========================================================================
+ * first_fit_bstack_allocator_t — first-fit free-list allocator
+ *
+ * Manages a persistent heap inside a bstack using a doubly-linked free list
+ * with immediate coalescing.  Requires -DBSTACK_FEATURE_SET.
+ *
+ * On-disk layout (all within the bstack payload):
+ *   [0..16)  — reserved (OFFSET_SIZE)
+ *   [16..48) — allocator header: magic[8] | flags[4] | reserved[4] | free_head[8]
+ *              magic  = "ALFF\x00\x01\x00\x00"
+ *              flags  = bit 0: recovery_needed (crash detected)
+ *              free_head = payload offset of first free block's payload, or 0
+ *   [48..)   — block arena
+ *
+ * Each block: [header:16B | payload:size | footer:8B]
+ *   header: size(u64 LE) | flags(u32 LE) | reserved(u32 LE), bit 0 of flags = is_free
+ *   footer: size(u64 LE) — mirrors header size (used for left-coalescing)
+ *   free block payload starts with: next_free(u64 LE) | prev_free(u64 LE)
+ *
+ * Crash safety: recovery_needed is set before any multi-step modification and
+ * cleared after.  On open, if recovery_needed is set, the arena is scanned
+ * linearly and the free list is rebuilt from is_free flags alone.
+ * ====================================================================== */
+
+typedef struct {
+    bstack_allocator_t base; /* must be first — safe cast to bstack_allocator_t * */
+    bstack_t          *bs;
+} first_fit_bstack_allocator_t;
+
+/*
+ * Open or initialise a first_fit_bstack_allocator_t over bs.
+ *
+ * - Empty stack: writes the 48-byte allocator header and returns ready.
+ * - Non-empty stack: validates the ALFF 0.1.x magic prefix; if the
+ *   recovery_needed flag is set (crash during prior operation), scans the
+ *   arena linearly and rebuilds the free list before returning.
+ *
+ * Returns NULL on failure (errno = EINVAL for bad magic/header, ENOMEM on
+ * allocation failure, or the errno from any failing bstack operation).
+ * Cast the result to bstack_allocator_t * to use the generic interface.
+ */
+first_fit_bstack_allocator_t *first_fit_bstack_allocator_new(bstack_t *bs);
+
+/*
+ * Free the allocator wrapper without closing the underlying bstack.
+ */
+void first_fit_bstack_allocator_free(first_fit_bstack_allocator_t *alloc);
+
+/*
+ * Consume the allocator: free the wrapper and return the underlying bstack.
+ * The returned bstack_t * must eventually be passed to bstack_close.
+ */
+bstack_t *first_fit_bstack_allocator_into_stack(first_fit_bstack_allocator_t *alloc);
+#endif /* BSTACK_FEATURE_SET */
+
 #ifdef __cplusplus
 }
 #endif
