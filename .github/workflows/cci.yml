@@ -33,5 +33,9 @@ jobs:
       run: echo "CC=cl" >> $GITHUB_ENV
     - name: Build and test
       run: cd c && make test
-    - name: Build and test with features
+    - name: Build and test with set
       run: cd c && make DEFINES=-DBSTACK_FEATURE_SET test
+    - name: Build and test with atomic
+      run: cd c && make DEFINES=-DBSTACK_FEATURE_ATOMIC test
+    - name: Build and test with set and atomic
+      run: cd c && make DEFINES="-DBSTACK_FEATURE_SET -DBSTACK_FEATURE_ATOMIC" test
