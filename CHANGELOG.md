@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Immutable buffer parameters widened from `&[u8]` to `impl AsRef<[u8]>`**: `push`, `set`, `atrunc`, `splice`, `try_extend`, `swap`, and `cas` (`old` and `new`) now accept any type that implements `AsRef<[u8]>` — including `Vec<u8>`, `Box<[u8]>`, `[u8; N]`, and `String` — without requiring an explicit `as_slice()` or `&buf[..]` conversion. The `new` parameter of `splice_into` is also widened. All existing callers passing `&[u8]` or byte-string literals continue to compile unchanged.
+
 ### Fixed
 
 - **`FirstFitBStackAllocator::dealloc` and `realloc` — validation rejected valid slices with user-visible length < 16**: both methods validated the input slice using the raw user-visible `slice.len()`, passing it directly to `is_impossible_block_size` and `is_impossible_block_end`. Because `align_len` guarantees the underlying block is always at least 16 bytes, a slice allocated with `len < 16` (e.g. `alloc(5)`) is perfectly valid, but the check `5 < MIN_BLOCK_PAYLOAD_SIZE` returned "impossible" and the call returned `InvalidInput`. Fixed by computing `aligned_len = align_len(slice.len())` first and using that for all size and end-offset checks.

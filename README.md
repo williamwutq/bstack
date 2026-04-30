@@ -70,7 +70,7 @@ impl BStack {
 
     /// Append `data` and durable-sync.  Returns the starting logical offset.
     /// An empty slice is valid and a no-op on disk.
-    pub fn push(&self, data: &[u8]) -> io::Result<u64>;
+    pub fn push(&self, data: impl AsRef<[u8]>) -> io::Result<u64>;
 
     /// Append `n` zero bytes and durable-sync.  Returns the starting logical offset.
     /// `n = 0` is valid and a no-op on disk.
@@ -94,7 +94,7 @@ impl BStack {
     /// Never changes the file size; errors if the write would exceed the
     /// current payload.  Requires the `set` feature.
     #[cfg(feature = "set")]
-    pub fn set(&self, offset: u64, data: &[u8]) -> io::Result<()>;
+    pub fn set(&self, offset: u64, data: impl AsRef<[u8]>) -> io::Result<()>;
 
     /// Overwrite `n` bytes with zeros in place starting at logical `offset`.
     /// Never changes the file size; errors if the write would exceed the
@@ -105,22 +105,22 @@ impl BStack {
     /// Atomically cut `n` bytes off the tail then append `buf`.
     /// Combines discard + push under a single write lock.  Requires the `atomic` feature.
     #[cfg(feature = "atomic")]
-    pub fn atrunc(&self, n: u64, buf: &[u8]) -> io::Result<()>;
+    pub fn atrunc(&self, n: u64, buf: impl AsRef<[u8]>) -> io::Result<()>;
 
     /// Pop `n` bytes off the tail then append `buf`; returns the removed bytes.
     /// Requires the `atomic` feature.
     #[cfg(feature = "atomic")]
-    pub fn splice(&self, n: u64, buf: &[u8]) -> io::Result<Vec<u8>>;
+    pub fn splice(&self, n: u64, buf: impl AsRef<[u8]>) -> io::Result<Vec<u8>>;
 
     /// Pop `old.len()` bytes into `old` then append `new`.
     /// Buffer-reuse variant of `splice`.  Requires the `atomic` feature.
     #[cfg(feature = "atomic")]
-    pub fn splice_into(&self, old: &mut [u8], new: &[u8]) -> io::Result<()>;
+    pub fn splice_into(&self, old: &mut [u8], new: impl AsRef<[u8]>) -> io::Result<()>;
 
     /// Append `buf` only if the current payload size equals `s`; returns whether it did.
     /// Requires the `atomic` feature.
     #[cfg(feature = "atomic")]
-    pub fn try_extend(&self, s: u64, buf: &[u8]) -> io::Result<bool>;
+    pub fn try_extend(&self, s: u64, buf: impl AsRef<[u8]>) -> io::Result<bool>;
 
     /// Discard `n` bytes only if the current payload size equals `s`; returns whether it did.
     /// Requires the `atomic` feature.
@@ -130,7 +130,7 @@ impl BStack {
     /// Atomically read `buf.len()` bytes at `offset` and overwrite them with `buf`;
     /// returns the old contents.  Requires the `set` and `atomic` features.
     #[cfg(all(feature = "set", feature = "atomic"))]
-    pub fn swap(&self, offset: u64, buf: &[u8]) -> io::Result<Vec<u8>>;
+    pub fn swap(&self, offset: u64, buf: impl AsRef<[u8]>) -> io::Result<Vec<u8>>;
 
     /// Atomic swap via a caller-supplied buffer: on return `buf` holds the old bytes.
     /// Requires the `set` and `atomic` features.
@@ -140,7 +140,7 @@ impl BStack {
     /// Compare-and-exchange: if the bytes at `offset` match `old`, overwrite with `new`.
     /// Returns `true` if the exchange was performed.  Requires the `set` and `atomic` features.
     #[cfg(all(feature = "set", feature = "atomic"))]
-    pub fn cas(&self, offset: u64, old: &[u8], new: &[u8]) -> io::Result<bool>;
+    pub fn cas(&self, offset: u64, old: impl AsRef<[u8]>, new: impl AsRef<[u8]>) -> io::Result<bool>;
 
     /// Read the tail `n` bytes, pass them to `f`, write back whatever `f` returns as the new tail.
     /// The file may grow or shrink.  `n = 0` is valid.  Requires the `atomic` feature.

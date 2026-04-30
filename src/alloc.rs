@@ -1345,7 +1345,7 @@ impl FirstFitBStackAllocator {
             hdr[Self::OFFSET_SIZE as usize..Self::OFFSET_SIZE as usize + ALFF_MAGIC.len()]
                 .copy_from_slice(&ALFF_MAGIC);
             // flags, _reserved, free_head remain zero
-            stack.push(&hdr)?;
+            stack.push(hdr)?;
             return Ok(Self { stack });
         }
         // Validate header
@@ -1442,13 +1442,13 @@ impl FirstFitBStackAllocator {
         let next = u64::from_le_bytes(ptrs[0..8].try_into().unwrap());
         let prev = u64::from_le_bytes(ptrs[8..16].try_into().unwrap());
         if prev != 0 {
-            self.stack.set(prev, &next.to_le_bytes())?;
+            self.stack.set(prev, next.to_le_bytes())?;
         } else {
             self.stack
-                .set(Self::FREE_HEAD_OFFSET, &next.to_le_bytes())?;
+                .set(Self::FREE_HEAD_OFFSET, next.to_le_bytes())?;
         }
         if next != 0 {
-            self.stack.set(next + 8, &prev.to_le_bytes())?;
+            self.stack.set(next + 8, prev.to_le_bytes())?;
         }
         Ok(())
     }
@@ -1478,7 +1478,7 @@ impl FirstFitBStackAllocator {
 
         // Mark block as free early so recovery can find it even if we crash mid-coalesce
         self.stack
-            .set(block_header_start + 8, &1u32.to_le_bytes())?;
+            .set(block_header_start + 8, 1u32.to_le_bytes())?;
 
         // Coalesce right: absorb the immediately following block if it is free
         let next_header = block_header_start + Self::BLOCK_OVERHEAD_SIZE + size;
@@ -1526,8 +1526,8 @@ impl FirstFitBStackAllocator {
         let result_start = result_header_start + Self::BLOCK_HEADER_SIZE;
 
         // Write the merged block's size into its header and footer
-        self.stack.set(result_header_start, &size.to_le_bytes())?;
-        self.stack.set(result_start + size, &size.to_le_bytes())?;
+        self.stack.set(result_header_start, size.to_le_bytes())?;
+        self.stack.set(result_start + size, size.to_le_bytes())?;
 
         // Mark result block as free and write next_free = old_head, prev_free = 0 in one call.
         // Writes flags(4) + reserved(4) + next_free(8) + prev_free(8) starting at result_start - 8.
@@ -1542,7 +1542,7 @@ impl FirstFitBStackAllocator {
         update_buf[8..16].copy_from_slice(&next_block.to_le_bytes()); // next_free = old head
         // update_buf[4..8] = reserved = 0, update_buf[16..24] = prev_free = 0
         self.stack
-            .set(result_start - Self::BLOCK_HEADER_SIZE + 8, &update_buf)?;
+            .set(result_start - Self::BLOCK_HEADER_SIZE + 8, update_buf)?;
 
         // Update free_head to point to the result block.
         // free_head <- result_block
@@ -1550,7 +1550,7 @@ impl FirstFitBStackAllocator {
         // free_head <------------------ next <- ...
         // If this step fails, the free list is still consistent but the result block is orphaned
         self.stack
-            .set(Self::FREE_HEAD_OFFSET, &result_start.to_le_bytes())?;
+            .set(Self::FREE_HEAD_OFFSET, result_start.to_le_bytes())?;
 
         // After adding result block:
         // free_head -> result_block -> next -> ...
@@ -1559,7 +1559,7 @@ impl FirstFitBStackAllocator {
         // is missing, which can be detected and fixed in recovery. This is similar to the unlink case in unlink_block
         if next_block != 0 {
             self.stack
-                .set(next_block + 8, &result_start.to_le_bytes())?;
+                .set(next_block + 8, result_start.to_le_bytes())?;
         }
 
         Ok(())
@@ -1696,17 +1696,17 @@ impl FirstFitBStackAllocator {
             //              ... <- prev <---------------- next <- ...
             // So the forward link is still there
             if prev != 0 {
-                self.stack.set(prev, &next.to_le_bytes())?;
+                self.stack.set(prev, next.to_le_bytes())?;
             } else {
                 self.stack
-                    .set(Self::FREE_HEAD_OFFSET, &next.to_le_bytes())?;
+                    .set(Self::FREE_HEAD_OFFSET, next.to_le_bytes())?;
             }
 
             // Then commit forward pointer
             // If fails here, the block is orphaned but still marked as free, which should be repaired in recovery
             // Failure cause: orphaned block with stale forward link from old head (detectable in recovery) but no backward link
             if next != 0 {
-                self.stack.set(next + 8, &prev.to_le_bytes())?;
+                self.stack.set(next + 8, prev.to_le_bytes())?;
             }
 
             // Clear is_free flag + reserved and write user data in one call by modifying content_buffer
@@ -1866,13 +1866,13 @@ impl FirstFitBStackAllocator {
             let mut ptr_buf = [0u8; 16];
             ptr_buf[0..8].copy_from_slice(&next.to_le_bytes());
             ptr_buf[8..16].copy_from_slice(&prev.to_le_bytes());
-            self.stack.set(curr, &ptr_buf)?;
+            self.stack.set(curr, ptr_buf)?;
         }
 
         // Update free_head to the first free block found, or 0 if none.
         let new_free_head = free_blocks.first().copied().unwrap_or(0);
         self.stack
-            .set(Self::FREE_HEAD_OFFSET, &new_free_head.to_le_bytes())?;
+            .set(Self::FREE_HEAD_OFFSET, new_free_head.to_le_bytes())?;
 
         self.clear_recovery_needed()
     }
@@ -2012,11 +2012,11 @@ impl BStackAllocator for FirstFitBStackAllocator {
                     )?;
                     self.stack.set(
                         slice.start() - Self::BLOCK_HEADER_SIZE,
-                        &aligned_new_len.to_le_bytes(),
+                        aligned_new_len.to_le_bytes(),
                     )?;
                     self.stack.set(
                         slice.start() + aligned_new_len,
-                        &aligned_new_len.to_le_bytes(),
+                        aligned_new_len.to_le_bytes(),
                     )?;
                     return Ok(BStackSlice::new(self, slice.start(), new_len));
                 }
@@ -2024,11 +2024,11 @@ impl BStackAllocator for FirstFitBStackAllocator {
                     // Write new footer before discarding so it lands at the right position
                     self.stack.set(
                         slice.start() + aligned_new_len,
-                        &aligned_new_len.to_le_bytes(),
+                        aligned_new_len.to_le_bytes(),
                     )?;
                     self.stack.set(
                         slice.start() - Self::BLOCK_HEADER_SIZE,
-                        &aligned_new_len.to_le_bytes(),
+                        aligned_new_len.to_le_bytes(),
                     )?;
                     self.stack.discard(aligned_current_len - aligned_new_len)?;
                     return Ok(BStackSlice::new(self, slice.start(), new_len));
@@ -2137,7 +2137,7 @@ impl BStackAllocator for FirstFitBStackAllocator {
                     // detect and repair the partial split.
                     self.stack.set(
                         slice.start() - Self::BLOCK_HEADER_SIZE,
-                        &merged_size.to_le_bytes(),
+                        merged_size.to_le_bytes(),
                     )?;
                     // Single write: zeroes the inter-block overhead, writes the allocated
                     // block's new footer, the complete free block, and the free block's footer.
@@ -2145,23 +2145,23 @@ impl BStackAllocator for FirstFitBStackAllocator {
                     // Shrink the allocated block's header to the used size.
                     self.stack.set(
                         slice.start() - Self::BLOCK_HEADER_SIZE,
-                        &aligned_new_len.to_le_bytes(),
+                        aligned_new_len.to_le_bytes(),
                     )?;
                     // Link forward: free_head → new free block
                     // Failure cause: orphaned block
                     self.stack
-                        .set(Self::FREE_HEAD_OFFSET, &new_free_start.to_le_bytes())?;
+                        .set(Self::FREE_HEAD_OFFSET, new_free_start.to_le_bytes())?;
                     // Link backward: old head's prev_free → new free block
                     // Failure cause: orphaned block with stale forward link from old head (detectable in recovery) but no backward link
                     if old_head != 0 {
                         self.stack
-                            .set(old_head + 8, &new_free_start.to_le_bytes())?;
+                            .set(old_head + 8, new_free_start.to_le_bytes())?;
                     }
                 } else {
                     // No split: write the merged block's header and footer.
                     self.stack.set(
                         slice.start() - Self::BLOCK_HEADER_SIZE,
-                        &merged_size.to_le_bytes(),
+                        merged_size.to_le_bytes(),
                     )?;
                     zero_buff[(next_block_size + Self::BLOCK_OVERHEAD_SIZE) as usize..]
                         .copy_from_slice(&merged_size.to_le_bytes());

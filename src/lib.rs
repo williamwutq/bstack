@@ -596,7 +596,8 @@ impl BStack {
     ///
     /// Returns any [`io::Error`] from `write_all`, `durable_sync`, or the
     /// fallback `set_len`.
-    pub fn push(&self, data: &[u8]) -> io::Result<u64> {
+    pub fn push(&self, data: impl AsRef<[u8]>) -> io::Result<u64> {
+        let data = data.as_ref();
         let mut file = self.lock.write().unwrap();
         let file_end = file.seek(SeekFrom::End(0))?;
         let logical_offset = file_end - HEADER_SIZE;
@@ -1007,7 +1008,8 @@ impl BStack {
     /// exceeds the current payload size, or if the addition overflows `u64`.
     /// Propagates any I/O error from `write_all` or `durable_sync`.
     #[cfg(feature = "set")]
-    pub fn set(&self, offset: u64, data: &[u8]) -> io::Result<()> {
+    pub fn set(&self, offset: u64, data: impl AsRef<[u8]>) -> io::Result<()> {
+        let data = data.as_ref();
         if data.is_empty() {
             return Ok(());
         }
@@ -1110,7 +1112,8 @@ impl BStack {
     /// payload size.  Propagates any I/O error from `set_len`, `write_all`,
     /// or `durable_sync`.
     #[cfg(feature = "atomic")]
-    pub fn atrunc(&self, n: u64, buf: &[u8]) -> io::Result<()> {
+    pub fn atrunc(&self, n: u64, buf: impl AsRef<[u8]>) -> io::Result<()> {
+        let buf = buf.as_ref();
         let buf_len = buf.len() as u64;
         if n == 0 && buf_len == 0 {
             return Ok(());
@@ -1174,7 +1177,8 @@ impl BStack {
     /// payload size.  Propagates any I/O error from `read_exact`, `set_len`,
     /// `write_all`, or `durable_sync`.
     #[cfg(feature = "atomic")]
-    pub fn splice(&self, n: u64, buf: &[u8]) -> io::Result<Vec<u8>> {
+    pub fn splice(&self, n: u64, buf: impl AsRef<[u8]>) -> io::Result<Vec<u8>> {
+        let buf = buf.as_ref();
         let buf_len = buf.len() as u64;
         if n == 0 && buf_len == 0 {
             return Ok(Vec::new());
@@ -1243,7 +1247,8 @@ impl BStack {
     /// current payload size.  Propagates any I/O error from `read_exact`,
     /// `set_len`, `write_all`, or `durable_sync`.
     #[cfg(feature = "atomic")]
-    pub fn splice_into(&self, old: &mut [u8], new: &[u8]) -> io::Result<()> {
+    pub fn splice_into(&self, old: &mut [u8], new: impl AsRef<[u8]>) -> io::Result<()> {
+        let new = new.as_ref();
         let n = old.len() as u64;
         let new_len = new.len() as u64;
         if n == 0 && new_len == 0 {
@@ -1307,7 +1312,8 @@ impl BStack {
     /// Propagates any I/O error from `write_all`, `write_committed_len`, or
     /// `durable_sync`.
     #[cfg(feature = "atomic")]
-    pub fn try_extend(&self, s: u64, buf: &[u8]) -> io::Result<bool> {
+    pub fn try_extend(&self, s: u64, buf: impl AsRef<[u8]>) -> io::Result<bool> {
+        let buf = buf.as_ref();
         let mut file = self.lock.write().unwrap();
         let file_end = file.seek(SeekFrom::End(0))?;
         let data_size = file_end - HEADER_SIZE;
@@ -1466,7 +1472,8 @@ impl BStack {
     /// overflows `u64` or exceeds the current payload size.  Propagates any
     /// I/O error from `read_exact`, `write_all`, or `durable_sync`.
     #[cfg(all(feature = "set", feature = "atomic"))]
-    pub fn swap(&self, offset: u64, buf: &[u8]) -> io::Result<Vec<u8>> {
+    pub fn swap(&self, offset: u64, buf: impl AsRef<[u8]>) -> io::Result<Vec<u8>> {
+        let buf = buf.as_ref();
         if buf.is_empty() {
             return Ok(Vec::new());
         }
@@ -1561,7 +1568,14 @@ impl BStack {
     /// overflows `u64` or exceeds the current payload size.  Propagates any
     /// I/O error from `read_exact`, `write_all`, or `durable_sync`.
     #[cfg(all(feature = "set", feature = "atomic"))]
-    pub fn cas(&self, offset: u64, old: &[u8], new: &[u8]) -> io::Result<bool> {
+    pub fn cas(
+        &self,
+        offset: u64,
+        old: impl AsRef<[u8]>,
+        new: impl AsRef<[u8]>,
+    ) -> io::Result<bool> {
+        let old = old.as_ref();
+        let new = new.as_ref();
         if old.len() != new.len() {
             return Ok(false);
         }
