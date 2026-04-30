@@ -387,7 +387,8 @@ impl<'a, A: BStackAllocator> BStackSlice<'a, A> {
     ///
     /// Requires the `set` feature.
     #[cfg(feature = "set")]
-    pub fn write(&self, data: &[u8]) -> io::Result<()> {
+    pub fn write(&self, data: impl AsRef<[u8]>) -> io::Result<()> {
+        let data = data.as_ref();
         let n = (data.len() as u64).min(self.len()) as usize;
         self.stack().set(self.start(), &data[..n])
     }
@@ -404,7 +405,8 @@ impl<'a, A: BStackAllocator> BStackSlice<'a, A> {
     /// Returns [`io::ErrorKind::InvalidInput`] if `start + data.len()` exceeds
     /// `self.len()`.
     #[cfg(feature = "set")]
-    pub fn write_range(&self, start: u64, data: &[u8]) -> io::Result<()> {
+    pub fn write_range(&self, start: u64, data: impl AsRef<[u8]>) -> io::Result<()> {
+        let data = data.as_ref();
         let end_rel = start + data.len() as u64;
         if end_rel > self.len() {
             return Err(io::Error::new(
@@ -1444,8 +1446,7 @@ impl FirstFitBStackAllocator {
         if prev != 0 {
             self.stack.set(prev, next.to_le_bytes())?;
         } else {
-            self.stack
-                .set(Self::FREE_HEAD_OFFSET, next.to_le_bytes())?;
+            self.stack.set(Self::FREE_HEAD_OFFSET, next.to_le_bytes())?;
         }
         if next != 0 {
             self.stack.set(next + 8, prev.to_le_bytes())?;
@@ -1477,8 +1478,7 @@ impl FirstFitBStackAllocator {
         let mut result_header_start = block_header_start;
 
         // Mark block as free early so recovery can find it even if we crash mid-coalesce
-        self.stack
-            .set(block_header_start + 8, 1u32.to_le_bytes())?;
+        self.stack.set(block_header_start + 8, 1u32.to_le_bytes())?;
 
         // Coalesce right: absorb the immediately following block if it is free
         let next_header = block_header_start + Self::BLOCK_OVERHEAD_SIZE + size;
@@ -1558,8 +1558,7 @@ impl FirstFitBStackAllocator {
         // If this step fails, the forward links are still consistent but the backward link from next to result_block
         // is missing, which can be detected and fixed in recovery. This is similar to the unlink case in unlink_block
         if next_block != 0 {
-            self.stack
-                .set(next_block + 8, result_start.to_le_bytes())?;
+            self.stack.set(next_block + 8, result_start.to_le_bytes())?;
         }
 
         Ok(())
@@ -1698,8 +1697,7 @@ impl FirstFitBStackAllocator {
             if prev != 0 {
                 self.stack.set(prev, next.to_le_bytes())?;
             } else {
-                self.stack
-                    .set(Self::FREE_HEAD_OFFSET, next.to_le_bytes())?;
+                self.stack.set(Self::FREE_HEAD_OFFSET, next.to_le_bytes())?;
             }
 
             // Then commit forward pointer
@@ -2154,8 +2152,7 @@ impl BStackAllocator for FirstFitBStackAllocator {
                     // Link backward: old head's prev_free → new free block
                     // Failure cause: orphaned block with stale forward link from old head (detectable in recovery) but no backward link
                     if old_head != 0 {
-                        self.stack
-                            .set(old_head + 8, new_free_start.to_le_bytes())?;
+                        self.stack.set(old_head + 8, new_free_start.to_le_bytes())?;
                     }
                 } else {
                     // No split: write the merged block's header and footer.

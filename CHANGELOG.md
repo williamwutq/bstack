@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **Immutable buffer parameters widened from `&[u8]` to `impl AsRef<[u8]>`**: `push`, `set`, `atrunc`, `splice`, `try_extend`, `swap`, and `cas` (`old` and `new`) now accept any type that implements `AsRef<[u8]>` — including `Vec<u8>`, `Box<[u8]>`, `[u8; N]`, and `String` — without requiring an explicit `as_slice()` or `&buf[..]` conversion. The `new` parameter of `splice_into` is also widened. All existing callers passing `&[u8]` or byte-string literals continue to compile unchanged.
+- **`BStackSlice::write` and `BStackSlice::write_range` widened from `&[u8]` to `impl AsRef<[u8]>`** (`alloc + set` features): same widening applied to the slice write methods for consistency.
 
 ### Fixed
 
