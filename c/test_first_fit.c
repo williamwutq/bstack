@@ -577,7 +577,6 @@ static int test_fuzz_reopen(void)
                 if (bstack_slice_read(s, buf) != 0 ||
                     pat_verify(buf, (size_t)rec.len,
                                rec.pattern, "after-reopen") != 0) {
-                    free(buf);
                     fprintf(stderr, "  session=%d slot=%zu seed=%llu\n",
                             session, i, (unsigned long long)seed);
                     ret = -1;
