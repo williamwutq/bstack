@@ -19,7 +19,19 @@ jobs:
       with:
         toolchain: stable
         components: clippy, rustfmt
-    - name: Clippy
-      run: cargo clippy -- -D warnings
+    - name: Clippy (all features)
+      run: cargo clippy --all-features -- -D warnings
+    - name: Clippy (no features)
+      run: cargo clippy --no-default-features -- -D warnings
+    - name: Clippy (set features)
+      run: cargo clippy --features set -- -D warnings
+    - name: Clippy (atomic features)
+      run: cargo clippy --features atomic -- -D warnings
+    - name: Clippy (set and atomic features)
+      run: cargo clippy --features "set atomic" -- -D warnings
+    - name: Clippy (alloc features)
+      run: cargo clippy --features alloc -- -D warnings
+    - name: Clippy (set and alloc features)
+      run: cargo clippy --features "set alloc" -- -D warnings
     - name: Format
       run: cargo fmt --check
