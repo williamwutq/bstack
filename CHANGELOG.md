@@ -7,10 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.8] - 2026-05-01
+
 ### Changed
 
 - **Immutable buffer parameters widened from `&[u8]` to `impl AsRef<[u8]>`**: `push`, `set`, `atrunc`, `splice`, `try_extend`, `swap`, and `cas` (`old` and `new`) now accept any type that implements `AsRef<[u8]>` — including `Vec<u8>`, `Box<[u8]>`, `[u8; N]`, and `String` — without requiring an explicit `as_slice()` or `&buf[..]` conversion. The `new` parameter of `splice_into` is also widened. All existing callers passing `&[u8]` or byte-string literals continue to compile unchanged.
 - **`BStackSlice::write` and `BStackSlice::write_range` widened from `&[u8]` to `impl AsRef<[u8]>`** (`alloc + set` features): same widening applied to the slice write methods for consistency.
+- **FirstFitBStackAllocator version bumped to 0.1.1**: Updated magic number from `ALFF\x00\x01\x00\x00` to `ALFF\x00\x01\x01\x00`. This is still compatible with the previous version, so existing files can be read and written by both versions, but the new magic allows the allocator to detect whether the fixes in 0.1.6 are present.
 
 ### Fixed
 

@@ -2725,7 +2725,7 @@ mod first_fit_tests {
             let stack = BStack::open(&path).unwrap();
             // ALFF header: 16 zero bytes + magic + recovery_needed=1 + rest zeros
             let mut alff = [0u8; 48];
-            alff[16..24].copy_from_slice(b"ALFF\x00\x01\x00\x00");
+            alff[16..24].copy_from_slice(b"ALFF\x00\x01\x01\x00");
             alff[24..28].copy_from_slice(&1u32.to_le_bytes()); // recovery_needed
             stack.push(&alff).unwrap();
 

@@ -336,7 +336,7 @@ bstack_t *linear_bstack_allocator_into_stack(linear_bstack_allocator_t *alloc);
  * On-disk layout (all within the bstack payload):
  *   [0..16)  — reserved (OFFSET_SIZE)
  *   [16..48) — allocator header: magic[8] | flags[4] | reserved[4] | free_head[8]
- *              magic  = "ALFF\x00\x01\x00\x00"
+ *              magic  = "ALFF\x00\x01\x01\x00"
  *              flags  = bit 0: recovery_needed (crash detected)
  *              free_head = payload offset of first free block's payload, or 0
  *   [48..)   — block arena
