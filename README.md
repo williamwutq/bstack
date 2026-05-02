@@ -476,7 +476,7 @@ bstack = { version = "0.1", features = ["set"] }
 ### `alloc`
 
 Enables the region-management layer on top of `BStack`:
-`BStackAllocator`, `BStackSlice`, `BStackSliceReader`, and
+`BStackAllocator`, `BStackBulkAllocator`, `BStackSlice`, `BStackSliceReader`, and
 `LinearBStackAllocator`.
 
 ```toml
@@ -513,6 +513,31 @@ pub trait BStackAllocator: Sized {
     // Delegation helpers:
     fn len(&self) -> io::Result<u64>;
     fn is_empty(&self) -> io::Result<bool>;
+}
+```
+
+For batch allocation and deallocation, see [`BStackBulkAllocator`](#bstackbulkallocator-trait).
+
+### `BStackBulkAllocator` trait
+
+An extension trait for `BStackAllocator` that adds two required, atomic bulk
+methods.  "Atomic" here means: either the operation succeeds completely, or the
+backing store is left entirely unchanged — no partial allocation or deallocation.
+Crash safety wise, the durable state of the allocator after a crash is always
+consistent or recovery is guaranteed to succeed, even if the crash occurs in the
+middle of an operation. The atomicity guarantee does not need to apply completely
+to a crash, but it must apply to the state of the allocator as observed by the next
+successful operation after a crash.
+
+```rust
+pub trait BStackBulkAllocator: BStackAllocator {
+    /// Allocate one slice per entry in `lengths` in a single atomic operation.
+    fn alloc_bulk(&self, lengths: impl AsRef<[u64]>)
+        -> io::Result<Vec<BStackSlice<'_, Self>>>;
+
+    /// Deallocate all supplied slices in a single atomic operation.
+    fn dealloc_bulk<'a>(&'a self, slices: impl AsRef<[BStackSlice<'a, Self>]>)
+        -> io::Result<()>;
 }
 ```
 
@@ -558,13 +583,15 @@ Constructed via `BStackSlice::reader()` or `BStackSlice::reader_at(offset)`.
 
 The reference bump allocator.  Regions are appended sequentially to the tail.
 
-| Operation            | Underlying call   | Crash-safe |
-|----------------------|-------------------|------------|
-| `alloc`              | `BStack::extend`  | yes        |
-| `realloc` grow       | `BStack::extend`  | yes        |
-| `realloc` shrink     | `BStack::discard` | yes        |
-| `dealloc` (tail)     | `BStack::discard` | yes        |
-| `dealloc` (non-tail) | no-op             | yes        |
+| Operation              | Underlying call   | Crash-safe |
+|------------------------|-------------------|------------|
+| `alloc`                | `BStack::extend`  | yes        |
+| `alloc_bulk`           | `BStack::extend`  | yes        |
+| `realloc` grow         | `BStack::extend`  | yes        |
+| `realloc` shrink       | `BStack::discard` | yes        |
+| `dealloc` (tail)       | `BStack::discard` | yes        |
+| `dealloc` (non-tail)   | no-op             | yes        |
+| `dealloc_bulk` (tail)  | `BStack::discard` | yes        |
 
 `realloc` returns `io::ErrorKind::Unsupported` for non-tail slices.
 
