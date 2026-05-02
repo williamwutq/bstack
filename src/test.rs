@@ -1572,7 +1572,7 @@ mod tests {
 #[cfg(all(test, feature = "alloc"))]
 mod alloc_tests {
     use crate::BStack;
-    use crate::alloc::{BStackAllocator, BStackSlice, LinearBStackAllocator};
+    use crate::alloc::{BStackAllocator, BStackBulkAllocator, BStackSlice, LinearBStackAllocator};
     use std::io::{Read, Seek, SeekFrom};
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -2124,6 +2124,228 @@ mod alloc_tests {
         assert!(r2 < w8);
         assert!(w8 < r15);
         assert!(r2 < r15);
+    }
+
+    // ---- BStackBulkAllocator: alloc_bulk ------------------------------------
+
+    // 1. Empty lengths → empty Vec, stack unchanged.
+    #[test]
+    fn bulk_alloc_empty() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let slices = alloc.alloc_bulk([]).unwrap();
+        assert!(slices.is_empty());
+        assert_eq!(alloc.len().unwrap(), 0);
+    }
+
+    // 2. Correct offsets and lengths for a multi-element batch.
+    #[test]
+    fn bulk_alloc_offsets_and_lens() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let slices = alloc.alloc_bulk([8_u64, 16, 32]).unwrap();
+        assert_eq!(slices.len(), 3);
+        assert_eq!(slices[0].start(), 0);
+        assert_eq!(slices[0].len(), 8);
+        assert_eq!(slices[1].start(), 8);
+        assert_eq!(slices[1].len(), 16);
+        assert_eq!(slices[2].start(), 24);
+        assert_eq!(slices[2].len(), 32);
+    }
+
+    // 3. Stack length after bulk alloc equals sum of all lengths.
+    #[test]
+    fn bulk_alloc_stack_len() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        alloc.alloc_bulk([10_u64, 20, 30]).unwrap();
+        assert_eq!(alloc.len().unwrap(), 60);
+    }
+
+    // 4. Single-element bulk is equivalent to a single alloc.
+    #[test]
+    fn bulk_alloc_single_element() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let slices = alloc.alloc_bulk([64_u64]).unwrap();
+        assert_eq!(slices.len(), 1);
+        assert_eq!(slices[0].start(), 0);
+        assert_eq!(slices[0].len(), 64);
+        assert_eq!(alloc.len().unwrap(), 64);
+    }
+
+    // 5. Zero-length entries produce valid empty slices without changing the
+    //    file layout (position is preserved relative to non-zero neighbours).
+    #[test]
+    fn bulk_alloc_zero_len_entries() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let slices = alloc.alloc_bulk([0_u64, 8, 0]).unwrap();
+        assert_eq!(slices.len(), 3);
+        assert!(slices[0].is_empty());
+        assert_eq!(slices[1].start(), 0);
+        assert_eq!(slices[1].len(), 8);
+        assert!(slices[2].is_empty());
+        assert_eq!(alloc.len().unwrap(), 8);
+    }
+
+    // 6. All freshly allocated bulk regions are zero-initialised.
+    #[test]
+    fn bulk_alloc_reads_zeros() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let slices = alloc.alloc_bulk([4_u64, 8, 4]).unwrap();
+        for s in &slices {
+            assert_eq!(s.read().unwrap(), vec![0u8; s.len() as usize]);
+        }
+    }
+
+    // 7. Slices from alloc_bulk are non-overlapping and contiguous.
+    #[test]
+    fn bulk_alloc_non_overlapping_contiguous() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let slices = alloc.alloc_bulk([5_u64, 10, 15, 20]).unwrap();
+        for i in 0..slices.len() - 1 {
+            assert_eq!(slices[i].end(), slices[i + 1].start());
+        }
+    }
+
+    // 8. alloc_bulk followed by individual alloc places the next alloc after
+    //    the bulk region (i.e. the bulk consumed exactly the right amount).
+    #[test]
+    fn bulk_alloc_then_individual() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        alloc.alloc_bulk([8_u64, 16]).unwrap();
+        let s = alloc.alloc(4).unwrap();
+        assert_eq!(s.start(), 24);
+    }
+
+    // 9. Lengths that sum to >u64::MAX return InvalidInput without touching
+    //    the file.
+    #[test]
+    fn bulk_alloc_overflow_is_error() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let err = alloc.alloc_bulk([u64::MAX, 1]).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(alloc.len().unwrap(), 0);
+    }
+
+    // ---- BStackBulkAllocator: dealloc_bulk ---------------------------------
+
+    // 10. Empty slice list is a no-op.
+    #[test]
+    fn bulk_dealloc_empty() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        alloc.alloc(32).unwrap();
+        alloc.dealloc_bulk([]).unwrap();
+        assert_eq!(alloc.len().unwrap(), 32);
+    }
+
+    // 11. All slices form a contiguous tail → everything reclaimed, stack empty.
+    #[test]
+    fn bulk_dealloc_all_tail_reclaimed() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let slices = alloc.alloc_bulk([8_u64, 16, 32]).unwrap();
+        alloc.dealloc_bulk(slices).unwrap();
+        assert_eq!(alloc.len().unwrap(), 0);
+    }
+
+    // 12. Only the contiguous tail region is reclaimed; slices not touching
+    //     the tail (or separated from it by a gap) are ignored.
+    #[test]
+    fn bulk_dealloc_non_tail_slice_ignored() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let a = alloc.alloc(8).unwrap(); // 0..8  (not tail after b is allocated)
+        let b = alloc.alloc(16).unwrap(); // 8..24 (tail)
+        // dealloc_bulk only sees `a`; `b` is alive but not passed in.
+        // Since `a` does not reach the tail the call is a no-op.
+        alloc.dealloc_bulk([a]).unwrap();
+        assert_eq!(alloc.len().unwrap(), 24);
+        // Now dealloc b (the tail) normally to clean up.
+        alloc.dealloc(b).unwrap();
+    }
+
+    // 13. Slices supplied in reverse order produce the same result.
+    #[test]
+    fn bulk_dealloc_reverse_order_same_result() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let slices = alloc.alloc_bulk([8_u64, 16, 32]).unwrap();
+        // Reverse the Vec before passing it; all three still cover the tail.
+        let mut rev = slices;
+        rev.reverse();
+        alloc.dealloc_bulk(rev).unwrap();
+        assert_eq!(alloc.len().unwrap(), 0);
+    }
+
+    // 14. Gap between supplied slices limits how far back reclamation reaches.
+    #[test]
+    fn bulk_dealloc_gap_limits_reclamation() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let a = alloc.alloc(8).unwrap(); // 0..8
+        let _b = alloc.alloc(8).unwrap(); // 8..16  ← not included in dealloc_bulk
+        let c = alloc.alloc(8).unwrap(); // 16..24 (tail)
+        // dealloc_bulk([a, c]): c touches the tail, a does not reach c,
+        // so only c is reclaimed.
+        alloc.dealloc_bulk([a, c]).unwrap();
+        assert_eq!(alloc.len().unwrap(), 16);
+    }
+
+    // 15. Single tail slice → equivalent to single dealloc.
+    #[test]
+    fn bulk_dealloc_single_tail() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        alloc.alloc(8).unwrap();
+        let tail = alloc.alloc(16).unwrap();
+        alloc.dealloc_bulk([tail]).unwrap();
+        assert_eq!(alloc.len().unwrap(), 8);
+    }
+
+    // 16. Single non-tail slice → no-op.
+    #[test]
+    fn bulk_dealloc_single_nontail_noop() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let head = alloc.alloc(8).unwrap();
+        alloc.alloc(16).unwrap(); // keeps head non-tail
+        alloc.dealloc_bulk([head]).unwrap();
+        assert_eq!(alloc.len().unwrap(), 24);
+    }
+
+    // 17. alloc_bulk then dealloc_bulk round-trip leaves the stack empty.
+    #[test]
+    fn bulk_roundtrip_empty() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let slices = alloc.alloc_bulk([4_u64, 8, 12, 16]).unwrap();
+        alloc.dealloc_bulk(slices).unwrap();
+        assert!(alloc.is_empty().unwrap());
+    }
+
+    // 18. Partial dealloc_bulk reclaims only the tail suffix; a subsequent
+    //     alloc_bulk reuses the freed space.
+    #[test]
+    fn bulk_dealloc_partial_then_realloc() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let slices = alloc.alloc_bulk([8_u64, 16, 32]).unwrap();
+        let (head, tail) = slices.split_at(1);
+        // Reclaim only the last two slices (tail suffix).
+        alloc.dealloc_bulk(tail.to_vec()).unwrap();
+        assert_eq!(alloc.len().unwrap(), 8);
+        // head[0] (0..8) is still live; a new bulk alloc goes right after it.
+        let new = alloc.alloc_bulk([4_u64, 4]).unwrap();
+        assert_eq!(new[0].start(), 8);
+        assert_eq!(new[1].start(), 12);
+        let _ = head; // keep the borrow alive
     }
 }
 
