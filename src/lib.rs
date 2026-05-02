@@ -221,7 +221,7 @@
 //! | Feature | Description |
 //! |---------|-------------|
 //! | `set`   | Enables [`BStack::set`] and [`BStack::zero`] — in-place overwrite of existing payload bytes (or with zeros) without changing the file size. |
-//! | `alloc` | Enables [`BStackAllocator`], [`BStackSlice`], [`BStackSliceReader`], and [`LinearBStackAllocator`] — region-based allocation over a `BStack` payload. |
+//! | `alloc` | Enables [`BStackAllocator`], [`BStackBulkAllocator`], [`BStackSlice`], [`BStackSliceReader`], and [`LinearBStackAllocator`] — region-based allocation over a `BStack` payload. |
 //! | `atomic` | Enables [`BStack::atrunc`], [`BStack::splice`], [`BStack::splice_into`], [`BStack::try_extend`], [`BStack::try_discard`], and [`BStack::replace`] — compound read-modify-write operations that hold the write lock across what would otherwise be separate calls. Combined with `set`, also enables [`BStack::swap`], [`BStack::swap_into`], [`BStack::cas`], and [`BStack::process`]. |
 //!
 //! Enable with:
@@ -246,6 +246,10 @@
 //!   `into_stack()`, `alloc()`, and `realloc()`; provides a default no-op
 //!   `dealloc()` and delegation helpers `len()` / `is_empty()`.
 //!
+//! * [`BStackBulkAllocator`] — extension trait for [`BStackAllocator`] that
+//!   adds atomic bulk operations.  Both methods are required with no default; on error
+//!   the backing store is left unchanged unless a crash occur.
+//!
 //! * [`BStackSlice`]`<'a, A>` — lightweight `Copy` handle (allocator reference +
 //!   offset + length) to a contiguous region.  Exposes `read`, `read_into`,
 //!   `read_range_into`, `subslice`, `subslice_range`, `reader`, `reader_at`,
@@ -260,6 +264,7 @@
 //!   `Unsupported` for non-tail slices.  `dealloc` reclaims the tail via
 //!   [`BStack::discard`]; non-tail deallocations are a no-op.  Every operation
 //!   maps to exactly one [`BStack`] call and is crash-safe by inheritance.
+//!   Implements [`BStackAllocator`] and [`BStackBulkAllocator`].
 //!
 //! * [`FirstFitBStackAllocator`] — Experimental: a persistent first-fit free-list allocator
 //!   that reuses freed regions to prevent unbounded file growth.  Requires both
@@ -323,7 +328,9 @@ mod test;
 #[cfg(feature = "alloc")]
 mod alloc;
 #[cfg(feature = "alloc")]
-pub use alloc::{BStackAllocator, BStackSlice, BStackSliceReader, LinearBStackAllocator};
+pub use alloc::{
+    BStackAllocator, BStackBulkAllocator, BStackSlice, BStackSliceReader, LinearBStackAllocator,
+};
 #[cfg(all(feature = "alloc", feature = "set"))]
 pub use alloc::{BStackSliceWriter, FirstFitBStackAllocator};
 

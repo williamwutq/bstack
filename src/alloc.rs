@@ -15,6 +15,13 @@
 //!   [`realloc`](BStackAllocator::realloc), [`dealloc`](BStackAllocator::dealloc),
 //!   and [`into_stack`](BStackAllocator::into_stack).
 //!
+//! * [`BStackBulkAllocator`] — extension trait for [`BStackAllocator`] that
+//!   adds atomic bulk [`alloc_bulk`](BStackBulkAllocator::alloc_bulk) and
+//!   [`dealloc_bulk`](BStackBulkAllocator::dealloc_bulk) methods.  Both are
+//!   required with no default implementation: on error the backing store must
+//!   be left completely unchanged.  [`LinearBStackAllocator`] implements this
+//!   trait.
+//!
 //! * [`LinearBStackAllocator`] — the reference bump allocator that always
 //!   appends to the tail.  Every operation maps to a single [`BStack`] call
 //!   and is crash-safe by inheritance.  `dealloc` of a non-tail slice is a
@@ -47,8 +54,8 @@
 //! # Feature flags
 //!
 //! The `alloc` Cargo feature enables this entire module, including
-//! [`BStackAllocator`], [`BStackSlice`], [`BStackSliceReader`], and
-//! [`LinearBStackAllocator`]:
+//! [`BStackAllocator`], [`BStackBulkAllocator`], [`BStackSlice`],
+//! [`BStackSliceReader`], and [`LinearBStackAllocator`]:
 //!
 //! ```toml
 //! bstack = { version = "0.1", features = ["alloc"] }
@@ -985,6 +992,13 @@ impl<'a, A: BStackAllocator> PartialOrd<BStackSliceReader<'a, A>> for BStackSlic
 /// operation they provide. As a rule of thumb: if every method maps to a
 /// single [`BStack`] call it is crash-safe by inheritance; if any method
 /// issues two or more calls it requires an explicit recovery design.
+///
+/// # See also
+///
+/// [`BStackBulkAllocator`] — extension trait that adds atomic bulk
+/// [`alloc_bulk`](BStackBulkAllocator::alloc_bulk) and
+/// [`dealloc_bulk`](BStackBulkAllocator::dealloc_bulk) methods for
+/// allocators that can batch multiple operations into a single I/O call.
 pub trait BStackAllocator: Sized {
     /// Return a shared reference to the underlying [`BStack`].
     ///
@@ -1074,6 +1088,60 @@ pub trait BStackAllocator: Sized {
     fn is_empty(&self) -> io::Result<bool> {
         self.stack().is_empty()
     }
+}
+
+/// Extension trait for allocators that support batching multiple allocations
+/// and deallocations in a single operation.
+///
+/// Both methods must be **atomic**: on success every requested item is
+/// allocated or deallocated; on failure the backing store is left unchanged —
+/// no partial allocation or deallocation is permitted, unless a crash occurs in
+/// the middle of the underlying operation, in which case the backing store may be
+/// partially updated but must remain internally consistent and recoverable by the
+/// allocator's crash recovery procedure. Implementors should also reduce I/O
+/// overhead relative to repeated single-item calls, for example by issuing a reduced
+/// [`BStack::extend`] or [`BStack::discard`] call.
+///
+/// Implementations should not simply loop over single-item `alloc` or `dealloc` calls,
+/// as this would not provide the intended atomicity guarantees. Even if protected
+/// under some crash safety and rollback mechanism, such an implementation is still not
+/// recommended due to its misleading semantics and potential performance pitfalls.
+pub trait BStackBulkAllocator: BStackAllocator {
+    /// Allocate slices with the given lengths in a single atomic operation.
+    ///
+    /// Returns a `Vec` whose `i`-th entry covers exactly `lengths[i]` bytes.
+    /// The order of slices in the result matches the order of `lengths`.  An
+    /// empty `lengths` slice is a valid no-op and returns an empty `Vec`.
+    ///
+    /// # Atomicity
+    ///
+    /// Either all slices are allocated and returned, or the backing store is
+    /// left completely unchanged and an error is returned. During a crash in
+    /// the middle of the underlying operation, the backing store may be partially
+    /// updated but must remain internally consistent and recoverable by the
+    /// allocator's crash recovery procedure.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any [`io::Error`] from the underlying operation.
+    fn alloc_bulk(&self, lengths: impl AsRef<[u64]>) -> io::Result<Vec<BStackSlice<'_, Self>>>;
+
+    /// Deallocate multiple slices in a single atomic operation.
+    ///
+    /// Slices may be supplied in any order.  An empty slice is a valid no-op.
+    ///
+    /// # Atomicity
+    ///
+    /// Either all eligible slices are reclaimed and the backing store is
+    /// updated, or the backing store is left completely unchanged and an error
+    /// is returned. During a crash in the middle of the underlying operation,
+    /// the backing store may be partially updated but must remain internally
+    /// consistent and recoverable by the allocator's crash recovery procedure.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any [`io::Error`] from the underlying operation.
+    fn dealloc_bulk<'a>(&'a self, slices: impl AsRef<[BStackSlice<'a, Self>]>) -> io::Result<()>;
 }
 
 /// A simple bump allocator that owns a [`BStack`] and allocates regions
@@ -1190,6 +1258,67 @@ impl BStackAllocator for LinearBStackAllocator {
         let current_tail = self.stack.len()?;
         if slice.end() == current_tail {
             self.stack.discard(slice.len())?;
+        }
+        Ok(())
+    }
+}
+
+impl BStackBulkAllocator for LinearBStackAllocator {
+    /// Allocate all slices with a single [`BStack::extend`] call.
+    ///
+    /// The total byte count is computed first; if it overflows `u64` the call
+    /// returns [`io::ErrorKind::InvalidInput`] without modifying the file.
+    /// Otherwise one `extend` (and one durable sync) covers all allocations.
+    fn alloc_bulk(&self, lengths: impl AsRef<[u64]>) -> io::Result<Vec<BStackSlice<'_, Self>>> {
+        let lengths = lengths.as_ref();
+        if lengths.is_empty() {
+            return Ok(Vec::new());
+        }
+        let total = lengths
+            .iter()
+            .try_fold(0u64, |acc, &len| acc.checked_add(len))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "alloc_bulk: total length overflows u64",
+                )
+            })?;
+        let base = self.stack.extend(total)?;
+        let mut result = Vec::with_capacity(lengths.len());
+        let mut offset = base;
+        for &len in lengths {
+            result.push(BStackSlice::new(self, offset, len));
+            offset += len;
+        }
+        Ok(result)
+    }
+
+    /// Reclaim the largest contiguous region at the tail with a single
+    /// [`BStack::discard`] call.
+    ///
+    /// Slices that form a contiguous sequence ending at the current tail are
+    /// all removed in one operation.  Slices that do not touch the tail (or
+    /// that are separated from the tail by slices not included in `slices`)
+    /// are silently ignored, matching the single-item
+    /// [`dealloc`](BStackAllocator::dealloc) semantics.
+    fn dealloc_bulk<'a>(&'a self, slices: impl AsRef<[BStackSlice<'a, Self>]>) -> io::Result<()> {
+        let slices = slices.as_ref();
+        if slices.is_empty() {
+            return Ok(());
+        }
+        let current_tail = self.stack.len()?;
+        // Walk from the tail backwards, collecting contiguous covered bytes.
+        let mut sorted: Vec<BStackSlice<'_, Self>> = slices.to_vec();
+        sorted.sort_by_key(|s| std::cmp::Reverse(s.end()));
+        let mut discard_start = current_tail;
+        for slice in &sorted {
+            if slice.end() == discard_start {
+                discard_start = slice.start();
+            }
+        }
+        let to_discard = current_tail - discard_start;
+        if to_discard > 0 {
+            self.stack.discard(to_discard)?;
         }
         Ok(())
     }
