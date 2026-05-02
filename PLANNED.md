@@ -144,3 +144,53 @@ The hooks can run either inside or outside the `RwLock` that guards the underlyi
 - *Outside the lock* — a TOCTOU gap exists between a hook decision (e.g., an access-control check in `pre_read`) and the actual I/O.
 
 The correct choice depends on the intended hook semantics and must be documented as an explicit guarantee, not left ambiguous.
+
+---
+
+## `BStackBulkAllocator` — bulk allocation and deallocation
+
+**Breaking change:** No
+
+### Motivation
+
+For applications that need to allocate or deallocate many items at once, individual calls to `alloc` and `dealloc` can be inefficient due to repeated I/O operations or metadata updates. A bulk allocator provides methods to handle multiple allocations and deallocations in a single operation, reducing overhead and improving performance for batch operations.
+
+### Design
+
+Extend the `BStackAllocator` trait with bulk methods, using `BStackSlice` for now (until the `Allocated` associated type is stabilized):
+
+```rust
+pub trait BStackBulkAllocator: BStackAllocator {
+    /// Allocate multiple slices of the given lengths in a single operation.
+    /// Returns a vector of allocated slices.
+    fn alloc_bulk(&self, lengths: impl AsRef<[u64]>) -> io::Result<Vec<BStackSlice<'_, Self>>>;
+
+    /// Deallocate multiple slices in a single operation.
+    fn dealloc_bulk(&self, slices: impl AsRef<[BStackSlice<'_, Self>]>) -> io::Result<()>;
+}
+```
+
+Implementations can optimize these methods to batch I/O operations, update metadata once, or use more efficient algorithms for bulk operations.
+
+### Open questions
+
+- Error handling: should partial failures be allowed, or should the entire bulk operation fail if any single allocation/deallocation fails?
+
+---
+
+## Optimizing `FirstFitBStackAllocator` with atomic feature
+
+**Feature flag:** `atomic`
+**Breaking change:** No (if added as optional)
+
+### Motivation
+
+The `FirstFitBStackAllocator` could benefit from atomic operations to improve performance and thread-safety in concurrent environments. Atomic operations can reduce contention and allow for lock-free or reduced-lock implementations in certain scenarios. It also allows for better crash resilience by ensuring that metadata updates are atomic, reducing the risk of corruption in the event of a crash.
+
+### Design
+
+[To be determined — implementation details would involve using atomic primitives for metadata updates and allocation tracking.]
+
+### Open questions
+
+- Should this optimization be added as an optional feature flag, or required for all users? If added, we end up maintaining two implementations of `FirstFitBStackAllocator`; if required, all users need the atomic flag.
