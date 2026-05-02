@@ -147,37 +147,6 @@ The correct choice depends on the intended hook semantics and must be documented
 
 ---
 
-## `BStackBulkAllocator` — bulk allocation and deallocation
-
-**Breaking change:** No
-
-### Motivation
-
-For applications that need to allocate or deallocate many items at once, individual calls to `alloc` and `dealloc` can be inefficient due to repeated I/O operations or metadata updates. A bulk allocator provides methods to handle multiple allocations and deallocations in a single operation, reducing overhead and improving performance for batch operations.
-
-### Design
-
-Extend the `BStackAllocator` trait with bulk methods, using `BStackSlice` for now (until the `Allocated` associated type is stabilized):
-
-```rust
-pub trait BStackBulkAllocator: BStackAllocator {
-    /// Allocate multiple slices of the given lengths in a single operation.
-    /// Returns a vector of allocated slices.
-    fn alloc_bulk(&self, lengths: impl AsRef<[u64]>) -> io::Result<Vec<BStackSlice<'_, Self>>>;
-
-    /// Deallocate multiple slices in a single operation.
-    fn dealloc_bulk(&self, slices: impl AsRef<[BStackSlice<'_, Self>]>) -> io::Result<()>;
-}
-```
-
-Implementations can optimize these methods to batch I/O operations, update metadata once, or use more efficient algorithms for bulk operations.
-
-### Open questions
-
-- Error handling: should partial failures be allowed, or should the entire bulk operation fail if any single allocation/deallocation fails?
-
----
-
 ## Optimizing `FirstFitBStackAllocator` with atomic feature
 
 **Feature flag:** `atomic`
