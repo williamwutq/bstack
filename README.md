@@ -697,6 +697,65 @@ alloc.dealloc(slice)?;             // release (tail → O(1) discard)
 let stack = alloc.into_stack();    // reclaim the BStack
 ```
 
+### `GhostTreeBstackAllocator` (`alloc` feature)
+
+A pure-AVL general-purpose allocator built on top of a [`BStack`]. Free blocks
+store their AVL node inline at offset 0 within the block — live allocations
+carry **zero** overhead (no headers, no footers). The tree is keyed on
+`(size, address)` for a strict total order. All memory is kept zeroed: the
+BStack zeroes on extension, and the allocator zeroes on free.
+
+```toml
+[dependencies]
+bstack = { version = "0.1", features = ["alloc"] }
+```
+
+#### On-disk layout
+
+```
+┌─────────────────────────────┐  payload offset 0
+│   User-reserved (32 bytes)  │
+├─────────────────────────────┤  offset 32
+│   Magic number (8 bytes)    │  "ALGT\x00\x01\x00\x00"
+├─────────────────────────────┤  offset 40
+│   AVL root pointer (8 B)    │  absolute payload offset of the root node
+├─────────────────────────────┤  offset 48  ← arena start (32-byte aligned)
+│   ... heap grows upward ... │
+└─────────────────────────────┘
+```
+
+#### Allocation policy
+
+`alloc` searches the AVL tree for the smallest free block that can satisfy the
+request (best-fit). If no suitable block exists, the arena is extended. Freed
+blocks are inserted into the tree and may be coalesced with adjacent free
+blocks during the next `alloc` or `dealloc`.
+
+#### Crash consistency
+
+No write-ahead log, no checksums. A crash during `dealloc` before the AVL
+insert permanently loses that block. A crash during rotation leaves the tree
+imbalanced — corrected on the next `mount`. See [`GhostTreeBstackAllocator::mount`].
+
+#### Example
+
+```rust
+use bstack::{BStack, BStackAllocator, GhostTreeBstackAllocator};
+
+let alloc = GhostTreeBstackAllocator::new(BStack::open("data.bstack")?)?;
+
+let a = alloc.alloc(64)?;
+let b = alloc.alloc(64)?;
+a.write(b"hello world")?;
+
+alloc.dealloc(a)?;        // freed; slot available for reuse
+
+let c = alloc.alloc(64)?; // may reuse a's slot
+assert_eq!(c.read()?, b"hello world"); // data preserved until overwritten
+
+let stack = alloc.into_stack();
+```
+
 ---
 
 ## File format

@@ -34,6 +34,13 @@
 //!   blocks are coalesced automatically on `dealloc`.  A `recovery_needed` flag
 //!   enables automatic free-list reconstruction after a crash.
 //!
+//! * [`GhostTreeBstackAllocator`] — a pure-AVL general-purpose allocator
+//!   (requires `alloc` feature).  Free blocks store their AVL node inline at
+//!   offset 0 within the block — live allocations carry **zero** overhead
+//!   (no headers, no footers).  The tree is keyed on `(size, address)` for a
+//!   strict total order.  All memory is kept zeroed: the BStack zeroes on
+//!   extension, and the allocator zeroes on free.
+//!
 //! # Lifetime model
 //!
 //! `BStackSlice<'a, A>` borrows the **allocator** `A` for `'a`, not the
@@ -55,7 +62,7 @@
 //!
 //! The `alloc` Cargo feature enables this entire module, including
 //! [`BStackAllocator`], [`BStackBulkAllocator`], [`BStackSlice`],
-//! [`BStackSliceReader`], and [`LinearBStackAllocator`]:
+//! [`BStackSliceReader`], [`LinearBStackAllocator`], and [`GhostTreeBstackAllocator`]:
 //!
 //! ```toml
 //! bstack = { version = "0.1", features = ["alloc"] }
