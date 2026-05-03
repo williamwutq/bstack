@@ -621,11 +621,13 @@ impl BStackAllocator for GhostTreeBstackAllocator {
         }
 
         if aligned_new < aligned_old {
-            // Shrink.  Both aligned sizes are multiples of 32, so freed_tail
-            // is always a multiple of 32 and always splittable.
+            // Shrink.  Zero [new_len..aligned_old] in one call: this covers
+            // both the gap [new_len..aligned_new] (stale user data that must
+            // be cleared so future same-block grows see zeroed bytes) and the
+            // freed tail [aligned_new..aligned_old].  Then insert the tail.
             let freed_tail = aligned_old - aligned_new;
             let tail_ptr = slice.start() + aligned_new;
-            self.stack.zero(tail_ptr, freed_tail)?;
+            self.stack.zero(slice.start() + new_len, aligned_old - new_len)?;
             self.avl_insert(tail_ptr, freed_tail)?;
             return Ok(BStackSlice::new(self, slice.start(), new_len));
         }
