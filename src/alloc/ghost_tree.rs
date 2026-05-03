@@ -283,9 +283,13 @@ impl GhostTreeBstackAllocator {
 
     /// Fix imbalance at `node` after an insert or remove, then return the
     /// (possibly new) subtree root.  Children must already be balanced.
+    ///
+    /// Uses `< -1` / `> 1` rather than `== -2` / `== 2` so that a node whose
+    /// balance factor exceeds ±2 (possible after crash recovery) still gets
+    /// corrected instead of silently passed over.
     fn avl_rebalance(&self, node: u64) -> io::Result<u64> {
         let bf = self.avl_update_bf(node)?;
-        if bf == -2 {
+        if bf < -1 {
             let (_, _, _, left, _) = self.read_node(node)?;
             let (_, left_bf, _, _, _) = self.read_node(left)?;
             if left_bf > 0 {
@@ -295,7 +299,7 @@ impl GhostTreeBstackAllocator {
                 self.avl_write_and_update(node, node_sz, new_left, node_r)?;
             }
             self.avl_rotate_right(node)
-        } else if bf == 2 {
+        } else if bf > 1 {
             let (_, _, _, _, right) = self.read_node(node)?;
             let (_, right_bf, _, _, _) = self.read_node(right)?;
             if right_bf < 0 {
