@@ -329,7 +329,8 @@ mod test;
 mod alloc;
 #[cfg(feature = "alloc")]
 pub use alloc::{
-    BStackAllocator, BStackBulkAllocator, BStackSlice, BStackSliceReader, LinearBStackAllocator, GhostTreeBstackAllocator,
+    BStackAllocator, BStackBulkAllocator, BStackSlice, BStackSliceReader, GhostTreeBstackAllocator,
+    LinearBStackAllocator,
 };
 #[cfg(all(feature = "alloc", feature = "set"))]
 pub use alloc::{BStackSliceWriter, FirstFitBStackAllocator};

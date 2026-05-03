@@ -2,7 +2,9 @@
 
 mod alloc_fuzz_tests {
     use crate::BStack;
-    use crate::alloc::{BStackAllocator, BStackSlice, FirstFitBStackAllocator, GhostTreeBstackAllocator};
+    use crate::alloc::{
+        BStackAllocator, BStackSlice, FirstFitBStackAllocator, GhostTreeBstackAllocator,
+    };
     use rand::RngExt;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -14,7 +16,9 @@ mod alloc_fuzz_tests {
 
     struct Guard(std::path::PathBuf);
     impl Drop for Guard {
-        fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); }
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
     }
 
     fn temp_path(prefix: &str) -> std::path::PathBuf {
@@ -35,7 +39,8 @@ mod alloc_fuzz_tests {
     fn check(buf: &[u8], id: u64, ctx: &str) {
         for (i, &b) in buf.iter().enumerate() {
             assert_eq!(
-                b, ((id >> ((i % 8) * 8)) & 0xFF) as u8,
+                b,
+                ((id >> ((i % 8) * 8)) & 0xFF) as u8,
                 "{ctx}: corruption at [{i}]"
             );
         }
@@ -130,7 +135,11 @@ mod alloc_fuzz_tests {
         F: Fn(BStack) -> std::io::Result<A>,
     {
         #[derive(Clone, Copy)]
-        struct Rec { start: u64, len: u64, id: u64 }
+        struct Rec {
+            start: u64,
+            len: u64,
+            id: u64,
+        }
 
         let path = temp_path("reopen");
         let _guard = Guard(path.clone());
@@ -145,19 +154,31 @@ mod alloc_fuzz_tests {
 
             for (i, &rec) in live.iter().enumerate() {
                 let s = BStackSlice::new(&alloc, rec.start, rec.len);
-                check(&s.read().unwrap()[..rec.len as usize], rec.id,
-                      &format!("s{session} rec{i}"));
+                check(
+                    &s.read().unwrap()[..rec.len as usize],
+                    rec.id,
+                    &format!("s{session} rec{i}"),
+                );
             }
 
             for _ in 0..OPS_PER_SESSION {
-                let choice = if live.is_empty() { 0 } else { rng.random_range(0u32..4) };
+                let choice = if live.is_empty() {
+                    0
+                } else {
+                    rng.random_range(0u32..4)
+                };
                 match choice {
                     0 => {
                         let len = rng.random_range(0..=512);
                         if let Ok(s) = alloc.alloc(len) {
-                            let id = next_id; next_id += 1;
+                            let id = next_id;
+                            next_id += 1;
                             write_id(&s, id);
-                            live.push(Rec { start: s.start(), len, id });
+                            live.push(Rec {
+                                start: s.start(),
+                                len,
+                                id,
+                            });
                         }
                     }
                     1 => {
@@ -167,27 +188,41 @@ mod alloc_fuzz_tests {
                         let s = BStackSlice::new(&alloc, rec.start, rec.len);
                         if let Ok(s2) = alloc.realloc(s, new_len) {
                             let overlap = rec.len.min(new_len) as usize;
-                            check(&s2.read().unwrap()[..overlap], rec.id,
-                                  &format!("s{session} realloc{i}"));
-                            let id = next_id; next_id += 1;
+                            check(
+                                &s2.read().unwrap()[..overlap],
+                                rec.id,
+                                &format!("s{session} realloc{i}"),
+                            );
+                            let id = next_id;
+                            next_id += 1;
                             write_id(&s2, id);
-                            live[i] = Rec { start: s2.start(), len: new_len, id };
+                            live[i] = Rec {
+                                start: s2.start(),
+                                len: new_len,
+                                id,
+                            };
                         }
                     }
                     2 => {
                         let i = rng.random_range(0..live.len());
                         let rec = live.swap_remove(i);
                         let s = BStackSlice::new(&alloc, rec.start, rec.len);
-                        check(&s.read().unwrap()[..rec.len as usize], rec.id,
-                              &format!("s{session} dealloc{i}"));
+                        check(
+                            &s.read().unwrap()[..rec.len as usize],
+                            rec.id,
+                            &format!("s{session} dealloc{i}"),
+                        );
                         alloc.dealloc(s).unwrap();
                     }
                     _ => {
                         let i = rng.random_range(0..live.len());
                         let rec = live[i];
                         let s = BStackSlice::new(&alloc, rec.start, rec.len);
-                        check(&s.read().unwrap()[..rec.len as usize], rec.id,
-                              &format!("s{session} verify{i}"));
+                        check(
+                            &s.read().unwrap()[..rec.len as usize],
+                            rec.id,
+                            &format!("s{session} verify{i}"),
+                        );
                     }
                 }
             }
@@ -203,11 +238,17 @@ mod alloc_fuzz_tests {
             mod $mod_name {
                 use super::*;
                 #[test]
-                fn alloc_dealloc() { super::run_alloc_dealloc($make); }
+                fn alloc_dealloc() {
+                    super::run_alloc_dealloc($make);
+                }
                 #[test]
-                fn alloc_realloc_dealloc() { super::run_alloc_realloc_dealloc($make); }
+                fn alloc_realloc_dealloc() {
+                    super::run_alloc_realloc_dealloc($make);
+                }
                 #[test]
-                fn reopen() { super::run_reopen($make); }
+                fn reopen() {
+                    super::run_reopen($make);
+                }
             }
         };
     }

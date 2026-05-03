@@ -20,31 +20,27 @@ const NULL_PTR: u64 = 0;
 
 // ── AVL node field offsets within a free block ────────────────────────────────
 const NODE_SIZE_OFF: u64 = 0;
-const NODE_BF_OFF: u64 = 8;     // i8 balance factor
+const NODE_BF_OFF: u64 = 8; // i8 balance factor
 const NODE_HEIGHT_OFF: u64 = 9; // u8 height (max ~59 for balanced; slightly more tolerated)
 const NODE_LEFT_OFF: u64 = 16;
 const NODE_RIGHT_OFF: u64 = 24;
 
 // Read a value of type `$ty` from `$buf` at offset `$off`.
 macro_rules! read_buf {
-    ($buf:expr, $off:expr => $ty:ty) => {
-        {
-            let start = $off as usize;
-            let end = start + std::mem::size_of::<$ty>();
-            $buf[start..end].try_into().unwrap()
-        }
-    };
+    ($buf:expr, $off:expr => $ty:ty) => {{
+        let start = $off as usize;
+        let end = start + std::mem::size_of::<$ty>();
+        $buf[start..end].try_into().unwrap()
+    }};
 }
 
 macro_rules! write_buf {
-    ($val:expr => $buf:expr, $off:expr) => {
-        {
-            let bytes = $val.to_le_bytes();
-            let start = $off as usize;
-            let end = start + bytes.len();
-            $buf[start..end].copy_from_slice(&bytes);
-        }
-    };
+    ($val:expr => $buf:expr, $off:expr) => {{
+        let bytes = $val.to_le_bytes();
+        let start = $off as usize;
+        let end = start + bytes.len();
+        $buf[start..end].copy_from_slice(&bytes);
+    }};
 }
 
 // Read a little-endian value of type `$ty` from `$buf` at offset `$off`.
@@ -113,7 +109,7 @@ impl GhostTreeBstackAllocator {
 
         if size == 0 {
             stack.extend(ARENA_START)?;
-            stack.set(MAGIC_OFFSET, &ALGT_MAGIC)?;
+            stack.set(MAGIC_OFFSET, ALGT_MAGIC)?;
             // ROOT_OFFSET is zeroed by extend — null root pointer.
             return Ok(Self { stack });
         }
@@ -167,7 +163,7 @@ impl GhostTreeBstackAllocator {
     fn write_root(&self, ptr: u64) -> io::Result<()> {
         let mut buf = [0u8; 8];
         write_buf!(ptr => buf, 0);
-        self.stack.set(ROOT_OFFSET, &buf)?;
+        self.stack.set(ROOT_OFFSET, buf)?;
         Ok(())
     }
 
@@ -175,23 +171,31 @@ impl GhostTreeBstackAllocator {
     fn read_node(&self, ptr: u64) -> io::Result<(u64, i8, u8, u64, u64)> {
         let buf = &mut [0u8; 32];
         self.stack.get_into(ptr, buf)?;
-        let size   = read_buf_le!(buf, NODE_SIZE_OFF   => u64);
-        let bf      = read_buf_le!(buf, NODE_BF_OFF     => i8);
-        let height  = read_buf_le!(buf, NODE_HEIGHT_OFF => u8);
-        let left   = read_buf_le!(buf, NODE_LEFT_OFF   => u64);
-        let right  = read_buf_le!(buf, NODE_RIGHT_OFF  => u64);
+        let size = read_buf_le!(buf, NODE_SIZE_OFF   => u64);
+        let bf = read_buf_le!(buf, NODE_BF_OFF     => i8);
+        let height = read_buf_le!(buf, NODE_HEIGHT_OFF => u8);
+        let left = read_buf_le!(buf, NODE_LEFT_OFF   => u64);
+        let right = read_buf_le!(buf, NODE_RIGHT_OFF  => u64);
         Ok((size, bf, height, left, right))
     }
 
     /// Write a complete AVL node at `ptr`.
-    fn write_node(&self, ptr: u64, size: u64, bf: i8, height: u8, left: u64, right: u64) -> io::Result<()> {
+    fn write_node(
+        &self,
+        ptr: u64,
+        size: u64,
+        bf: i8,
+        height: u8,
+        left: u64,
+        right: u64,
+    ) -> io::Result<()> {
         let mut buf = [0u8; 32];
         write_buf!(size   => buf, NODE_SIZE_OFF);
         write_buf!(bf     => buf, NODE_BF_OFF);
         write_buf!(height => buf, NODE_HEIGHT_OFF);
         write_buf!(left   => buf, NODE_LEFT_OFF);
         write_buf!(right  => buf, NODE_RIGHT_OFF);
-        self.stack.set(ptr, &buf)?;
+        self.stack.set(ptr, buf)?;
         Ok(())
     }
 
@@ -379,17 +383,6 @@ impl GhostTreeBstackAllocator {
         self.avl_rebalance(succ)
     }
 
-    /// Remove the node at `ptr` from the AVL tree and rebalance.
-    ///
-    /// Reads `size` from the node before searching so the block must still be
-    /// in the tree with a valid size field.
-    fn avl_remove(&self, ptr: u64) -> io::Result<()> {
-        let (size, _, _, _, _) = self.read_node(ptr)?;
-        let root = self.read_root()?;
-        let new_root = self.avl_remove_rec(root, ptr, size)?;
-        self.write_root(new_root)
-    }
-
     /// Find and remove the best-fit block (smallest block ≥ `min_size`) from
     /// the subtree at `root` in a single O(log n) pass.
     ///
@@ -467,14 +460,66 @@ impl GhostTreeBstackAllocator {
 
     // ── Startup coalescing ────────────────────────────────────────────────────
 
-    /// Walk the current AVL tree (tolerating imbalance), merge adjacent free
-    /// blocks, then rebalance.  Called by [`Self::new`] on startup to coalesce any
-    /// adjacent free blocks that may have accumulated due to crashes.
+    /// Collect all free blocks, merge adjacent ones, and rebuild a balanced AVL
+    /// tree.  Called by [`Self::new`] on every open to recover from crashes.
+    ///
+    /// Free block data beyond their 32-byte headers is already zeroed by
+    /// invariant.  When two blocks A and B are merged (A.end == B.ptr), B's
+    /// 32-byte header becomes interior bytes of the merged block and must be
+    /// zeroed before the tree is rebuilt.
     fn coalesce_and_rebalance(&self) -> io::Result<()> {
-        todo!(
-            "collect all free blocks by address, merge adjacent pairs, \
-             rebuild a balanced AVL tree from sorted list"
-        )
+        // Step 1: collect all free blocks in key order
+        let root = self.read_root()?;
+        let mut blocks: Vec<(u64, u64)> = Vec::new(); // (ptr, size)
+        self.avl_walk_inorder(root, &mut |ptr, size| {
+            blocks.push((ptr, size));
+            Ok(())
+        })?;
+
+        if blocks.is_empty() {
+            return Ok(());
+        }
+
+        // Step 2: sort by address
+        blocks.sort_by_key(|&(ptr, _)| ptr);
+
+        // Step 3: coalesce adjacent pairs
+        // `seams` holds the ptr of every absorbed sub-block whose 32-byte AVL
+        // header must be zeroed before the tree is rebuilt.
+        let mut coalesced: Vec<(u64, u64)> = Vec::new();
+        let mut seams: Vec<u64> = Vec::new();
+        for (ptr, size) in blocks {
+            if let Some(last) = coalesced.last_mut()
+                && last.0 + last.1 == ptr {
+                    seams.push(ptr);
+                    last.1 += size;
+                    continue;
+                }
+            coalesced.push((ptr, size));
+        }
+
+        // Zero the absorbed headers so the invariant holds inside merged blocks.
+        for seam in seams {
+            self.stack.zero(seam, MIN_ALLOC)?;
+        }
+
+        // ── Step 4: rebuild a balanced AVL tree ───────────────────────────────
+        // Recursive helper: build an optimally balanced BST from a sorted slice,
+        // writing each node and returning the root ptr.
+        fn build(this: &GhostTreeBstackAllocator, blocks: &[(u64, u64)]) -> io::Result<u64> {
+            if blocks.is_empty() {
+                return Ok(NULL_PTR);
+            }
+            let mid = blocks.len() / 2;
+            let (ptr, size) = blocks[mid];
+            let left = build(this, &blocks[..mid])?;
+            let right = build(this, &blocks[mid + 1..])?;
+            this.avl_write_and_update(ptr, size, left, right)?;
+            Ok(ptr)
+        }
+
+        let new_root = build(self, &coalesced)?;
+        self.write_root(new_root)
     }
 }
 
@@ -548,9 +593,7 @@ impl BStackAllocator for GhostTreeBstackAllocator {
         if slice.is_empty() {
             return self.alloc(new_len);
         }
-        if slice.start() < ARENA_START
-            || slice.start() != Self::align_up_ptr(slice.start())
-        {
+        if slice.start() < ARENA_START || slice.start() != Self::align_up_ptr(slice.start()) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "realloc: slice origin is not a valid allocator address",
@@ -609,9 +652,7 @@ impl BStackAllocator for GhostTreeBstackAllocator {
         if slice.is_empty() {
             return Ok(());
         }
-        if slice.start() < ARENA_START
-            || slice.start() != Self::align_up_ptr(slice.start())
-        {
+        if slice.start() < ARENA_START || slice.start() != Self::align_up_ptr(slice.start()) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "dealloc: slice origin is not a valid allocator address",
