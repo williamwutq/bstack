@@ -93,17 +93,61 @@ pub struct GhostTreeBstackAllocator {
 // ── Lifecycle ─────────────────────────────────────────────────────────────────
 
 impl GhostTreeBstackAllocator {
-    /// Initialise a fresh allocator on `stack` or open an existing one, then
-    /// perform startup coalescing and recovery.
+    /// Open or initialise a `GhostTreeBstackAllocator` on `stack`.
     ///
-    /// Writes the magic number and a null root pointer, then returns the
-    /// allocator.  The 32 user-reserved bytes at offset 0 are left untouched.
+    /// | BStack payload size        | Action                                             |
+    /// |----------------------------|----------------------------------------------------|
+    /// | 0                          | Fresh init: extend to `ARENA_START`, write magic   |
+    /// | 1 … `ARENA_START` − 1     | **Error** — partial header, unrecoverable          |
+    /// | ≥ `ARENA_START`, misaligned | Pad with zeroes to the next 32-byte arena boundary |
+    /// | ≥ `ARENA_START`, aligned   | Verify magic, then coalesce and rebalance          |
+    ///
+    /// The 32 user-reserved bytes at payload offset 0 are never touched.
     ///
     /// # Errors
     ///
-    /// Propagates I/O errors from the underlying BStack.
+    /// Returns [`io::ErrorKind::InvalidData`] if the payload size falls in the
+    /// unrecoverable range, or if the magic prefix does not match `ALGT`.
     pub fn new(stack: BStack) -> io::Result<Self> {
-        todo!("write ALGT_MAGIC at MAGIC_OFFSET and NULL_PTR at ROOT_OFFSET or read and verify ALGT_MAGIC_PREFIX at MAGIC_OFFSET and then run coalesce_and_rebalance()")
+        let size = stack.len()?;
+
+        if size == 0 {
+            stack.extend(ARENA_START)?;
+            stack.set(MAGIC_OFFSET, &ALGT_MAGIC)?;
+            // ROOT_OFFSET is zeroed by extend — null root pointer.
+            return Ok(Self { stack });
+        }
+
+        if size < ARENA_START {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "GhostTreeBstackAllocator: payload is {size} B, \
+                     too small for the {ARENA_START}-byte header"
+                ),
+            ));
+        }
+
+        // Verify magic prefix.
+        let mut magic_buf = [0u8; 6];
+        stack.get_into(MAGIC_OFFSET, &mut magic_buf)?;
+        if magic_buf != ALGT_MAGIC_PREFIX {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "GhostTreeBstackAllocator: magic number mismatch",
+            ));
+        }
+
+        // Pad to the next 32-byte arena boundary if the tail is misaligned.
+        let arena_used = size - ARENA_START;
+        let remainder = arena_used % 32;
+        if remainder != 0 {
+            stack.extend(32 - remainder)?;
+        }
+
+        let this = Self { stack };
+        this.coalesce_and_rebalance()?;
+        Ok(this)
     }
 }
 
@@ -453,6 +497,9 @@ impl BStackAllocator for GhostTreeBstackAllocator {
     /// loses the remainder fragment; a crash between AVL remove and return
     /// loses the entire block.
     fn alloc(&self, len: u64) -> io::Result<BStackSlice<'_, Self>> {
+        if len == 0 {
+            return Ok(BStackSlice::new(self, 0, 0));
+        }
         let aligned = Self::align_up_len(len);
         if let Some((ptr, block_size)) = self.avl_find_best_fit_and_remove(aligned)? {
             let remainder = block_size - aligned;
@@ -494,6 +541,21 @@ impl BStackAllocator for GhostTreeBstackAllocator {
         slice: BStackSlice<'a, Self>,
         new_len: u64,
     ) -> io::Result<BStackSlice<'a, Self>> {
+        if slice.is_empty() {
+            return self.alloc(new_len);
+        }
+        if slice.start() < ARENA_START
+            || slice.start() != Self::align_up_ptr(slice.start())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "realloc: slice origin is not a valid allocator address",
+            ));
+        }
+        if new_len == 0 {
+            self.dealloc(slice)?;
+            return Ok(BStackSlice::new(self, 0, 0));
+        }
         let old_len = slice.len();
         // Re-align to recover the true underlying block sizes.
         let aligned_old = Self::align_up_len(old_len);
@@ -540,6 +602,17 @@ impl BStackAllocator for GhostTreeBstackAllocator {
     /// Multi-call: a crash after the zero but before the AVL insert permanently
     /// loses the block.
     fn dealloc(&self, slice: BStackSlice<'_, Self>) -> io::Result<()> {
+        if slice.is_empty() {
+            return Ok(());
+        }
+        if slice.start() < ARENA_START
+            || slice.start() != Self::align_up_ptr(slice.start())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "dealloc: slice origin is not a valid allocator address",
+            ));
+        }
         let ptr = slice.start();
         // Re-align to recover the true block size that alloc carved out.
         // Any bytes beyond the requested length (< 32) are absorbed here.
