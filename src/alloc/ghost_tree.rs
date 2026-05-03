@@ -1,4 +1,4 @@
-use super::{BStackAllocator, BStackSlice};
+use super::{BStackAllocator, BStackBulkAllocator, BStackSlice};
 use crate::BStack;
 use std::io;
 
@@ -57,6 +57,23 @@ macro_rules! read_buf_le {
 /// is keyed on `(size, address)` for a strict total order.  All memory is kept
 /// zeroed: the BStack zeroes on extension, and the allocator zeroes on free.
 ///
+/// Implements both [`BStackAllocator`] and [`BStackBulkAllocator`].
+///
+/// # Operation summary
+///
+/// | Operation               | Strategy                                          | Crash-safe |
+/// |-------------------------|---------------------------------------------------|------------|
+/// | `alloc`                 | best-fit from AVL tree, or `extend`               | multi-call |
+/// | `alloc_bulk`            | one block for the combined size, then split       | single-call|
+/// | `realloc` same block    | in-place length update; zero gap on shrink        | multi-call |
+/// | `realloc` shrink (tail) | zero gap, `discard` freed tail                    | multi-call |
+/// | `realloc` shrink        | zero gap + freed tail, AVL insert                 | multi-call |
+/// | `realloc` grow (tail)   | `extend` in-place — no copy                       | single-call|
+/// | `realloc` grow          | alloc new, copy, dealloc old                      | multi-call |
+/// | `dealloc` (tail)        | `discard` — O(1), no AVL insert                   | single-call|
+/// | `dealloc`               | zero block, AVL insert                            | multi-call |
+/// | `dealloc_bulk`          | merge adjacent slices, then tail-truncate/insert  | multi-call |
+///
 /// # On-disk layout
 ///
 /// ```text
@@ -77,11 +94,20 @@ macro_rules! read_buf_le {
 /// 48, which maps to a 32-byte-aligned disk address because the BStack header
 /// is 16 bytes (`16 + 48 = 64 = 2 × 32`).
 ///
+/// # Bulk allocation
+///
+/// [`BStackBulkAllocator`] is implemented with a single-block strategy: each
+/// requested length is rounded up to 32 bytes individually, the sum is
+/// allocated as one contiguous block (one AVL remove or one `extend`), and
+/// the block is sliced into per-request regions.  When all slices are returned
+/// together to `dealloc_bulk`, adjacent slices are merged and freed as a
+/// single operation — typically one `discard` if the slices are at the tail.
+///
 /// # Crash safety
 ///
 /// No write-ahead log, no checksums.  A crash during `dealloc` before the AVL
 /// insert permanently loses that block.  A crash during rotation leaves the tree
-/// imbalanced — corrected on the next `mount`.  See [`GhostTreeBstackAllocator::mount`].
+/// imbalanced — corrected on the next [`GhostTreeBstackAllocator::new`].
 pub struct GhostTreeBstackAllocator {
     stack: BStack,
 }
@@ -695,5 +721,123 @@ impl BStackAllocator for GhostTreeBstackAllocator {
         }
         self.stack.zero(ptr, true_len)?;
         self.avl_insert(ptr, true_len)
+    }
+}
+
+impl BStackBulkAllocator for GhostTreeBstackAllocator {
+    /// Allocate all slices in a single contiguous block.
+    ///
+    /// Each requested length is rounded up to 32-byte alignment individually;
+    /// the sum of those aligned sizes is allocated as one block (either from
+    /// the free tree or via a single `BStack::extend`).  The block is then
+    /// sliced into per-request regions, each carrying the original requested
+    /// length.  Zero-length requests produce null `(0, 0)` slices without
+    /// contributing to the block.
+    ///
+    /// # Atomicity
+    ///
+    /// One block allocation (one AVL remove or one `extend`) — crash-safe by
+    /// construction.
+    fn alloc_bulk(&self, lengths: impl AsRef<[u64]>) -> io::Result<Vec<BStackSlice<'_, Self>>> {
+        let lengths = lengths.as_ref();
+        if lengths.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let aligned: Vec<u64> = lengths
+            .iter()
+            .map(|&l| if l == 0 { 0 } else { Self::align_up_len(l) })
+            .collect();
+
+        let total = aligned
+            .iter()
+            .copied()
+            .try_fold(0u64, |acc, a| acc.checked_add(a))
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "alloc_bulk: total size overflows u64")
+            })?;
+
+        // All zero-length: return null slices without touching the BStack.
+        if total == 0 {
+            return Ok(lengths.iter().map(|_| BStackSlice::new(self, 0, 0)).collect());
+        }
+
+        // Allocate one contiguous block.  `total` is already a sum of multiples
+        // of MIN_ALLOC so no further rounding is needed.
+        let block_ptr = if let Some((ptr, _)) = self.avl_find_best_fit_and_remove(total)? {
+            // Zero the stale AVL node header; the rest is already zeroed by invariant.
+            self.stack.zero(ptr, MIN_ALLOC)?;
+            ptr
+        } else {
+            self.stack.extend(total)?
+        };
+
+        // Build per-request slices from the contiguous block.
+        let mut result = Vec::with_capacity(lengths.len());
+        let mut offset = 0u64;
+        for (&len, &al) in lengths.iter().zip(aligned.iter()) {
+            if len == 0 {
+                result.push(BStackSlice::new(self, 0, 0));
+            } else {
+                result.push(BStackSlice::new(self, block_ptr + offset, len));
+                offset += al;
+            }
+        }
+        Ok(result)
+    }
+
+    /// Deallocate multiple slices, merging contiguous ones before freeing.
+    ///
+    /// Slices are sorted by address and adjacent slices (whose aligned extents
+    /// are immediately contiguous) are merged into a single free block.  This
+    /// means a set of slices returned by [`alloc_bulk`](Self::alloc_bulk) is
+    /// freed in a single operation when given back together.
+    fn dealloc_bulk<'a>(&'a self, slices: impl AsRef<[BStackSlice<'a, Self>]>) -> io::Result<()> {
+        let slices = slices.as_ref();
+
+        // Collect, validate, and convert to (ptr, aligned_size) pairs.
+        let mut entries: Vec<(u64, u64)> = Vec::new();
+        for s in slices {
+            if s.is_empty() {
+                continue;
+            }
+            if s.start() < ARENA_START || s.start() != Self::align_up_ptr(s.start()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "dealloc_bulk: invalid slice origin",
+                ));
+            }
+            entries.push((s.start(), Self::align_up_len(s.len())));
+        }
+
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        // Sort by address so adjacent slices are neighbours.
+        entries.sort_by_key(|&(ptr, _)| ptr);
+
+        // Merge contiguous (ptr, size) pairs into combined blocks.
+        let mut merged: Vec<(u64, u64)> = Vec::new();
+        for (ptr, size) in entries {
+            if let Some(last) = merged.last_mut()
+                && last.0 + last.1 == ptr
+            {
+                last.1 += size;
+            } else {
+                merged.push((ptr, size));
+            }
+        }
+
+        // Free each merged block: tail-truncate when possible, otherwise zero + insert.
+        for (ptr, size) in merged {
+            if ptr + size == self.stack.len()? {
+                self.stack.discard(size)?;
+            } else {
+                self.stack.zero(ptr, size)?;
+                self.avl_insert(ptr, size)?;
+            }
+        }
+        Ok(())
     }
 }

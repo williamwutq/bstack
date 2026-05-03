@@ -705,10 +705,25 @@ carry **zero** overhead (no headers, no footers). The tree is keyed on
 `(size, address)` for a strict total order. All memory is kept zeroed: the
 BStack zeroes on extension, and the allocator zeroes on free.
 
+Implements both `BStackAllocator` and `BStackBulkAllocator`.
+
 ```toml
 [dependencies]
 bstack = { version = "0.1", features = ["alloc"] }
 ```
+
+| Operation               | Strategy                                         | Crash-safe  |
+|-------------------------|--------------------------------------------------|-------------|
+| `alloc`                 | best-fit from AVL tree, or `extend`              | multi-call  |
+| `alloc_bulk`            | one block for the combined size, then split      | single-call |
+| `realloc` same block    | in-place length update; zero gap on shrink       | multi-call  |
+| `realloc` shrink (tail) | zero gap, `discard` freed tail                   | multi-call  |
+| `realloc` shrink        | zero gap + freed tail, AVL insert                | multi-call  |
+| `realloc` grow (tail)   | `extend` in-place — no copy                      | single-call |
+| `realloc` grow          | alloc new, copy, dealloc old                     | multi-call  |
+| `dealloc` (tail)        | `discard` — O(1), no AVL insert                  | single-call |
+| `dealloc`               | zero block, AVL insert                           | multi-call  |
+| `dealloc_bulk`          | merge adjacent slices, then tail-truncate/insert | multi-call  |
 
 #### On-disk layout
 
@@ -727,20 +742,24 @@ bstack = { version = "0.1", features = ["alloc"] }
 #### Allocation policy
 
 `alloc` searches the AVL tree for the smallest free block that can satisfy the
-request (best-fit). If no suitable block exists, the arena is extended. Freed
-blocks are inserted into the tree and may be coalesced with adjacent free
-blocks during the next `alloc` or `dealloc`.
+request (best-fit). If no suitable block exists, the arena is extended.
+
+`alloc_bulk` rounds each requested length up to 32 bytes individually, sums
+them, and allocates one contiguous block (one AVL remove or one `extend`). The
+block is sliced into per-request regions. When all slices are returned together
+to `dealloc_bulk`, adjacent slices are merged and freed as a single operation
+— typically one `discard` if they are at the tail.
 
 #### Crash consistency
 
 No write-ahead log, no checksums. A crash during `dealloc` before the AVL
 insert permanently loses that block. A crash during rotation leaves the tree
-imbalanced — corrected on the next `mount`. See [`GhostTreeBstackAllocator::mount`].
+imbalanced — corrected on the next `GhostTreeBstackAllocator::new`.
 
 #### Example
 
 ```rust
-use bstack::{BStack, BStackAllocator, GhostTreeBstackAllocator};
+use bstack::{BStack, BStackAllocator, BStackBulkAllocator, GhostTreeBstackAllocator};
 
 let alloc = GhostTreeBstackAllocator::new(BStack::open("data.bstack")?)?;
 
@@ -751,7 +770,10 @@ a.write(b"hello world")?;
 alloc.dealloc(a)?;        // freed; slot available for reuse
 
 let c = alloc.alloc(64)?; // may reuse a's slot
-assert_eq!(c.read()?, b"hello world"); // data preserved until overwritten
+
+// Bulk: one block allocation, one block free when returned together.
+let slices = alloc.alloc_bulk(&[32, 64, 128])?;
+alloc.dealloc_bulk(&slices)?;
 
 let stack = alloc.into_stack();
 ```

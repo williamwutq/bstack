@@ -19,8 +19,7 @@
 //!   adds atomic bulk [`alloc_bulk`](BStackBulkAllocator::alloc_bulk) and
 //!   [`dealloc_bulk`](BStackBulkAllocator::dealloc_bulk) methods.  Both are
 //!   required with no default implementation: on error the backing store must
-//!   be left completely unchanged.  [`LinearBStackAllocator`] implements this
-//!   trait.
+//!   be left completely unchanged.
 //!
 //! * [`LinearBStackAllocator`] — the reference bump allocator that always
 //!   appends to the tail.  Every operation maps to a single [`BStack`] call
