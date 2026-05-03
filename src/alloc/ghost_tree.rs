@@ -754,12 +754,18 @@ impl BStackBulkAllocator for GhostTreeBstackAllocator {
             .copied()
             .try_fold(0u64, |acc, a| acc.checked_add(a))
             .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "alloc_bulk: total size overflows u64")
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "alloc_bulk: total size overflows u64",
+                )
             })?;
 
         // All zero-length: return null slices without touching the BStack.
         if total == 0 {
-            return Ok(lengths.iter().map(|_| BStackSlice::new(self, 0, 0)).collect());
+            return Ok(lengths
+                .iter()
+                .map(|_| BStackSlice::new(self, 0, 0))
+                .collect());
         }
 
         // Allocate one contiguous block.  `total` is already a sum of multiples
