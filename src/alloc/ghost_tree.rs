@@ -18,7 +18,7 @@ const MIN_ALLOC: u64 = 32;
 /// Null / absent pointer sentinel stored in AVL node child fields.
 const NULL_PTR: u64 = 0;
 
-// ── AVL node field offsets within a free block ────────────────────────────────
+// Node offsets within a free block (AVL node header fields).
 const NODE_SIZE_OFF: u64 = 0;
 const NODE_BF_OFF: u64 = 8; // i8 balance factor
 const NODE_HEIGHT_OFF: u64 = 9; // u8 height (max ~59 for balanced; slightly more tolerated)
@@ -86,8 +86,6 @@ pub struct GhostTreeBstackAllocator {
     stack: BStack,
 }
 
-// ── Lifecycle ─────────────────────────────────────────────────────────────────
-
 impl GhostTreeBstackAllocator {
     /// Open or initialise a `GhostTreeBstackAllocator` on `stack`.
     ///
@@ -146,8 +144,6 @@ impl GhostTreeBstackAllocator {
         Ok(this)
     }
 }
-
-// ── Internal helpers ──────────────────────────────────────────────────────────
 
 impl GhostTreeBstackAllocator {
     /// Read the AVL root pointer from the header.
@@ -210,8 +206,6 @@ impl GhostTreeBstackAllocator {
     fn align_up_len(len: u64) -> u64 {
         ((len + 31) & !31).max(MIN_ALLOC)
     }
-
-    // ── AVL tree operations ───────────────────────────────────────────────────
 
     /// Return the stored height of the subtree rooted at `ptr` (0 for [`NULL_PTR`]).
     ///
@@ -468,8 +462,6 @@ impl GhostTreeBstackAllocator {
         self.avl_walk_inorder(right, f)
     }
 
-    // ── Startup coalescing ────────────────────────────────────────────────────
-
     /// Collect all free blocks, merge adjacent ones, and rebuild a balanced AVL
     /// tree.  Called by [`Self::new`] on every open to recover from crashes.
     ///
@@ -514,7 +506,7 @@ impl GhostTreeBstackAllocator {
             self.stack.zero(seam, MIN_ALLOC)?;
         }
 
-        // ── Step 4: rebuild a balanced AVL tree ───────────────────────────────
+        // Step 4: rebuild a balanced AVL tree
         // Coalescing sorted by address; now re-sort by the tree's key (size, ptr)
         // so `build` produces a valid BST.  Without this, insert/remove would
         // navigate by (size, ptr) into an address-ordered tree and miss nodes.
@@ -538,8 +530,6 @@ impl GhostTreeBstackAllocator {
         self.write_root(new_root)
     }
 }
-
-// ── BStackAllocator impl ──────────────────────────────────────────────────────
 
 impl BStackAllocator for GhostTreeBstackAllocator {
     fn stack(&self) -> &BStack {
@@ -636,20 +626,37 @@ impl BStackAllocator for GhostTreeBstackAllocator {
             return Ok(BStackSlice::new(self, slice.start(), new_len));
         }
 
+        let is_tail = slice.start() + aligned_old == self.stack.len()?;
+
         if aligned_new < aligned_old {
-            // Shrink.  Zero [new_len..aligned_old] in one call: this covers
-            // both the gap [new_len..aligned_new] (stale user data that must
-            // be cleared so future same-block grows see zeroed bytes) and the
-            // freed tail [aligned_new..aligned_old].  Then insert the tail.
+            // Shrink.
             let freed_tail = aligned_old - aligned_new;
             let tail_ptr = slice.start() + aligned_new;
-            self.stack
-                .zero(slice.start() + new_len, aligned_old - new_len)?;
-            self.avl_insert(tail_ptr, freed_tail)?;
+            if is_tail {
+                // Zero the gap [new_len..aligned_new] only; then truncate
+                // the BStack rather than recycling the freed tail.
+                if new_len < aligned_new {
+                    self.stack
+                        .zero(slice.start() + new_len, aligned_new - new_len)?;
+                }
+                self.stack.discard(freed_tail)?;
+            } else {
+                // Zero [new_len..aligned_old] in one call (gap + freed tail),
+                // then insert the freed tail into the AVL tree.
+                self.stack
+                    .zero(slice.start() + new_len, aligned_old - new_len)?;
+                self.avl_insert(tail_ptr, freed_tail)?;
+            }
             return Ok(BStackSlice::new(self, slice.start(), new_len));
         }
 
-        // Grow: allocate new region, copy old data, free old region.
+        if is_tail {
+            // Grow at the tail: extend the BStack directly, no copy needed.
+            self.stack.extend(aligned_new - aligned_old)?;
+            return Ok(BStackSlice::new(self, slice.start(), new_len));
+        }
+
+        // Grow (non-tail): allocate new region, copy old data, free old region.
         let new_slice = self.alloc(new_len)?;
         let data = self.stack.get(slice.start(), slice.start() + old_len)?;
         self.stack.set(new_slice.start(), &data)?;
@@ -681,6 +688,11 @@ impl BStackAllocator for GhostTreeBstackAllocator {
         // Re-align to recover the true block size that alloc carved out.
         // Any bytes beyond the requested length (< 32) are absorbed here.
         let true_len = Self::align_up_len(slice.len());
+        // Tail optimisation: if this block sits at the end of the BStack,
+        // truncate instead of recycling through the AVL tree.
+        if ptr + true_len == self.stack.len()? {
+            return self.stack.discard(true_len);
+        }
         self.stack.zero(ptr, true_len)?;
         self.avl_insert(ptr, true_len)
     }
