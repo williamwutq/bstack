@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Restructured allocators into multiple files**: `alloc` now contain three files — `mod.rs` for the public API, `linear.rs` for `LinearBStackAllocator`, and `first_fit.rs` for `FirstFitBStackAllocator` — to improve organization and readability as the allocator codebase grows. The main `lib.rs` re-exports the public API from `alloc/mod.rs` when the `alloc` feature is enabled, so no API changes are required for users of the allocators.
+
 ### Added
 
 - **`BStackBulkAllocator` trait** (`alloc` feature): Extension trait for [`BStackAllocator`] that adds two required, atomic bulk methods — alloc_bulk` and `dealloc_bulk`.  Both methods must either succeed completely or leave the backing store unchanged; partial state is never permitted. 
