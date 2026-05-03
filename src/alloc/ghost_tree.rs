@@ -412,23 +412,33 @@ impl GhostTreeBstackAllocator {
                 return Ok((new_root, Some(candidate)));
             }
             // No smaller fit in the left subtree — remove root itself.
-            let new_root = if left == NULL_PTR {
+            // Use `new_left` (not the stale `left`): even though no node was
+            // removed, the recursive call may have rebalanced the left subtree,
+            // changing its root pointer.
+            let new_root = if new_left == NULL_PTR {
                 right
             } else if right == NULL_PTR {
-                left
+                new_left
             } else {
                 let (succ, succ_sz) = self.avl_min(right)?;
                 let new_right = self.avl_remove_rec(right, succ, succ_sz)?;
-                self.avl_write_and_update(succ, succ_sz, left, new_right)?;
+                self.avl_write_and_update(succ, succ_sz, new_left, new_right)?;
                 self.avl_rebalance(succ)?
             };
             Ok((new_root, Some((root, root_sz))))
         } else {
             // Too small — only right subtree can have a fit.
             let (new_right, found) = self.avl_find_best_fit_and_remove_rec(right, min_size)?;
-            self.avl_write_and_update(root, root_sz, left, new_right)?;
-            let new_root = self.avl_rebalance(root)?;
-            Ok((new_root, found))
+            // Only update the tree structure if a node was actually removed.
+            // Updating unconditionally would corrupt child pointers on a no-fit
+            // path (the recursive call may have rebalanced without removing).
+            if found.is_some() {
+                self.avl_write_and_update(root, root_sz, left, new_right)?;
+                let new_root = self.avl_rebalance(root)?;
+                Ok((new_root, found))
+            } else {
+                Ok((root, None))
+            }
         }
     }
 
@@ -490,11 +500,12 @@ impl GhostTreeBstackAllocator {
         let mut seams: Vec<u64> = Vec::new();
         for (ptr, size) in blocks {
             if let Some(last) = coalesced.last_mut()
-                && last.0 + last.1 == ptr {
-                    seams.push(ptr);
-                    last.1 += size;
-                    continue;
-                }
+                && last.0 + last.1 == ptr
+            {
+                seams.push(ptr);
+                last.1 += size;
+                continue;
+            }
             coalesced.push((ptr, size));
         }
 
@@ -504,6 +515,11 @@ impl GhostTreeBstackAllocator {
         }
 
         // ── Step 4: rebuild a balanced AVL tree ───────────────────────────────
+        // Coalescing sorted by address; now re-sort by the tree's key (size, ptr)
+        // so `build` produces a valid BST.  Without this, insert/remove would
+        // navigate by (size, ptr) into an address-ordered tree and miss nodes.
+        coalesced.sort_by_key(|&(ptr, size)| (size, ptr));
+
         // Recursive helper: build an optimally balanced BST from a sorted slice,
         // writing each node and returning the root ptr.
         fn build(this: &GhostTreeBstackAllocator, blocks: &[(u64, u64)]) -> io::Result<u64> {
@@ -627,7 +643,8 @@ impl BStackAllocator for GhostTreeBstackAllocator {
             // freed tail [aligned_new..aligned_old].  Then insert the tail.
             let freed_tail = aligned_old - aligned_new;
             let tail_ptr = slice.start() + aligned_new;
-            self.stack.zero(slice.start() + new_len, aligned_old - new_len)?;
+            self.stack
+                .zero(slice.start() + new_len, aligned_old - new_len)?;
             self.avl_insert(tail_ptr, freed_tail)?;
             return Ok(BStackSlice::new(self, slice.start(), new_len));
         }
