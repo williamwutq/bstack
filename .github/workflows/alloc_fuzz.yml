@@ -1,0 +1,24 @@
+name: Alloc Fuzz
+
+on:
+  push:
+    branches: [ master ]
+    paths: [ src/alloc/**, src/alloc_fuzz_tests.rs ]
+  pull_request:
+    branches: [ master ]
+    paths: [ src/alloc/**, src/alloc_fuzz_tests.rs ]
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+    - name: Fuzz tests
+      run: cargo test --features "set alloc" -- alloc_fuzz_tests
+    - name: Fuzz tests (release)
+      run: cargo test --release --features "set alloc" -- alloc_fuzz_tests

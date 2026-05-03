@@ -2,309 +2,216 @@
 
 mod alloc_fuzz_tests {
     use crate::BStack;
-    use crate::alloc::{BStackAllocator, FirstFitBStackAllocator};
+    use crate::alloc::{BStackAllocator, BStackSlice, FirstFitBStackAllocator, GhostTreeBstackAllocator};
     use rand::RngExt;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::vec;
 
-    const MIN_PAYLOAD: u64 = 16;
     const FUZZ_COUNT: usize = 10000;
+    const SESSIONS: usize = 20;
+    const OPS_PER_SESSION: usize = 100;
 
-    fn mk_ff(id_prefix: &str) -> (FirstFitBStackAllocator, std::path::PathBuf) {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let pid = std::process::id();
-        let path = std::env::temp_dir().join(format!("bstack_ff_fuzz_{id_prefix}_{pid}_{id}.bin"));
-        let stack = BStack::open(&path).unwrap();
-        (FirstFitBStackAllocator::new(stack).unwrap(), path)
-    }
+    // ── shared helpers ────────────────────────────────────────────────────────
 
     struct Guard(std::path::PathBuf);
     impl Drop for Guard {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
-        }
+        fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); }
     }
 
-    #[test]
-    fn fuzz_alloc_dealloc() {
-        let (alloc, path) = mk_ff("alloc_dealloc");
-        let _guard = Guard(path);
-
-        let mut rng = rand::rng();
-        let mut allocated = Vec::new();
-
-        for _ in 0..FUZZ_COUNT {
-            if rng.random_bool(0.7) || allocated.is_empty() {
-                // Allocate a new block of random size.
-                let size = rng.random_range(MIN_PAYLOAD..=1024);
-                if let Some(block) = alloc.alloc(size).ok() {
-                    // Write the block ID into the payload for later verification.
-                    let id = allocated.len() as u64;
-                    let mut filled_vec = vec![0u8; size as usize];
-                    // Fill vec with block ID for later verification.
-                    for i in 0..size {
-                        let byte_idx = (i % 8) as u64;
-                        filled_vec[i as usize] = ((id >> (byte_idx * 8)) & 0xFF) as u8;
-                    }
-
-                    block.write(&filled_vec).unwrap();
-                    allocated.push((block, id));
-                }
-            } else {
-                // Deallocate a random block from the allocated list.
-                let idx = rng.random_range(0..allocated.len());
-                let (block, id) = allocated.swap_remove(idx);
-                // Verify the block contents before deallocating.
-                let buf = block.read().unwrap();
-                for chunk in buf.iter().enumerate() {
-                    let idx = chunk.0 as u64;
-                    let byte_idx = idx % 8;
-                    let expected_byte = ((id >> (byte_idx * 8)) & 0xFF) as u8;
-                    assert_eq!(
-                        *chunk.1, expected_byte,
-                        "Data corruption detected in block ID {id} at index {idx}"
-                    );
-                }
-                alloc.dealloc(block).unwrap();
-            }
-        }
-    }
-
-    #[test]
-    fn fuzz_alloc_realloc_dealloc() {
-        let (alloc, path) = mk_ff("alloc_realloc_dealloc");
-        let _guard = Guard(path);
-
-        let mut rng = rand::rng();
-        let mut allocated = Vec::new();
-
-        for _ in 0..FUZZ_COUNT {
-            if rng.random_bool(0.6) || allocated.is_empty() {
-                // Allocate a new block of random size.
-                let size = rng.random_range(MIN_PAYLOAD..=1024);
-                if let Some(block) = alloc.alloc(size).ok() {
-                    // Write the block ID into the payload for later verification.
-                    let id = allocated.len() as u64;
-                    let mut filled_vec = vec![0u8; size as usize];
-                    for i in 0..size {
-                        let byte_idx = (i % 8) as u64;
-                        filled_vec[i as usize] = ((id >> (byte_idx * 8)) & 0xFF) as u8;
-                    }
-
-                    block.write(&filled_vec).unwrap();
-                    allocated.push((block, id));
-                }
-            } else {
-                // Reallocate a random block to a new size or deallocate it.
-                let idx = rng.random_range(0..allocated.len());
-                let (block, id) = allocated.swap_remove(idx);
-
-                if rng.random_bool(0.8) {
-                    // Reallocate to a new size.
-                    let new_size = rng.random_range(MIN_PAYLOAD..=1024);
-                    // Read the old block contents for verification after realloc.
-                    let buf = block.read().unwrap();
-                    let old_len = buf.len() as u64;
-
-                    if let Some(new_block) = alloc.realloc(block, new_size).ok() {
-                        // Verify the old contents are intact after realloc.
-                        for chunk in buf.iter().enumerate() {
-                            let idx = chunk.0 as u64;
-                            let byte_idx = idx % 8;
-                            let expected_byte = ((id >> (byte_idx * 8)) & 0xFF) as u8;
-                            assert_eq!(
-                                *chunk.1, expected_byte,
-                                "Data corruption detected during realloc of block ID {id} at index {idx}"
-                            );
-                        }
-
-                        // Verify that the new block, up to size of the old block, still contains the correct data.
-                        let new_buf = new_block.read().unwrap();
-                        let verify_len = old_len.min(new_size) as usize;
-                        for chunk in new_buf.iter().take(verify_len).enumerate() {
-                            let idx = chunk.0 as u64;
-                            let byte_idx = idx % 8;
-                            let expected_byte = ((id >> (byte_idx * 8)) & 0xFF) as u8;
-                            assert_eq!(
-                                *chunk.1, expected_byte,
-                                "Data corruption detected in new block after realloc of block ID {id} at index {idx}"
-                            );
-                        }
-
-                        // Veryify that the new block, beyond the old block size, is zero-initialised.
-                        for chunk in new_buf.iter().enumerate().skip(verify_len) {
-                            let idx = chunk.0 as u64;
-                            assert_eq!(
-                                *chunk.1, 0,
-                                "New block not zero-initialised after realloc of block ID {id} at index {idx}"
-                            );
-                        }
-
-                        // Write new data with the same ID for verification.
-                        let mut filled_vec = vec![0u8; new_size as usize];
-                        for i in 0..new_size {
-                            let byte_idx = (i % 8) as u64;
-                            filled_vec[i as usize] = ((id >> (byte_idx * 8)) & 0xFF) as u8;
-                        }
-                        new_block.write(&filled_vec).unwrap();
-                        allocated.push((new_block, id));
-                    }
-                } else {
-                    // Deallocate the block.
-                    let buf = block.read().unwrap();
-                    for chunk in buf.iter().enumerate() {
-                        let idx = chunk.0 as u64;
-                        let byte_idx = idx % 8;
-                        let expected_byte = ((id >> (byte_idx * 8)) & 0xFF) as u8;
-                        assert_eq!(
-                            *chunk.1, expected_byte,
-                            "Data corruption detected before deallocation of block ID {id} at index {idx}"
-                        );
-                    }
-                    alloc.dealloc(block).unwrap();
-                }
-            }
-        }
-    }
-
-    /// Fuzz across repeated file reopens.
-    ///
-    /// Each "session" reopens the file, reconstructs slice handles from the
-    /// serialised (start, len) table, verifies data integrity, then performs
-    /// random alloc / realloc / dealloc operations before closing again.
-    /// Data written to any live allocation must survive every reopen.
-    #[test]
-    fn fuzz_reopen() {
-        // A serialised record of a live allocation.
-        // `pattern` is the byte value written across the full payload so we
-        // can verify each byte independently without storing the whole buffer.
-        #[derive(Clone, Copy)]
-        struct Rec {
-            start: u64,
-            len: u64,
-            pattern: u8,
-        }
-
-        fn fill(buf: &mut [u8], pattern: u8) {
-            for (i, b) in buf.iter_mut().enumerate() {
-                *b = pattern.wrapping_add(i as u8);
-            }
-        }
-
-        fn verify(buf: &[u8], pattern: u8, index: usize, session: usize) {
-            for (i, &b) in buf.iter().enumerate() {
-                assert_eq!(
-                    b,
-                    pattern.wrapping_add(i as u8),
-                    "[{session}-{index}] data corruption at index {i}: expected {}, got {b}",
-                    pattern.wrapping_add(i as u8)
-                );
-            }
-        }
-
+    fn temp_path(prefix: &str) -> std::path::PathBuf {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
         let pid = std::process::id();
-        let path = std::env::temp_dir().join(format!("bstack_ff_fuzz_reopen_{pid}_{id}.bin"));
-        let _guard = Guard(path.clone());
+        std::env::temp_dir().join(format!("bstack_fuzz_{prefix}_{pid}_{id}.bin"))
+    }
 
-        // Create the file.
-        {
-            let stack = BStack::open(&path).unwrap();
-            FirstFitBStackAllocator::new(stack).unwrap();
+    /// Fill `buf` with a deterministic pattern derived from `id`.
+    fn fill(buf: &mut [u8], id: u64) {
+        for (i, b) in buf.iter_mut().enumerate() {
+            *b = ((id >> ((i % 8) * 8)) & 0xFF) as u8;
         }
+    }
+
+    /// Assert that `buf` matches the pattern for `id`.
+    fn check(buf: &[u8], id: u64, ctx: &str) {
+        for (i, &b) in buf.iter().enumerate() {
+            assert_eq!(
+                b, ((id >> ((i % 8) * 8)) & 0xFF) as u8,
+                "{ctx}: corruption at [{i}]"
+            );
+        }
+    }
+
+    fn write_id<A: BStackAllocator>(s: &BStackSlice<'_, A>, id: u64) {
+        let mut buf = vec![0u8; s.len() as usize];
+        fill(&mut buf, id);
+        s.write(&buf).unwrap();
+    }
+
+    fn verify_id<A: BStackAllocator>(s: &BStackSlice<'_, A>, id: u64, ctx: &str) {
+        check(&s.read().unwrap(), id, ctx);
+    }
+
+    // ── generic fuzz runners ──────────────────────────────────────────────────
+
+    fn run_alloc_dealloc<A, F>(make: F)
+    where
+        A: BStackAllocator,
+        F: Fn(BStack) -> std::io::Result<A>,
+    {
+        let path = temp_path("ad");
+        let _guard = Guard(path.clone());
+        let alloc = make(BStack::open(&path).unwrap()).unwrap();
+        let mut rng = rand::rng();
+        let mut live = Vec::new();
+
+        for _ in 0..FUZZ_COUNT {
+            if rng.random_bool(0.7) || live.is_empty() {
+                let size = rng.random_range(0..=1024);
+                if let Ok(s) = alloc.alloc(size) {
+                    let id = live.len() as u64;
+                    write_id(&s, id);
+                    live.push((s, id));
+                }
+            } else {
+                let i = rng.random_range(0..live.len());
+                let (s, id) = live.swap_remove(i);
+                verify_id(&s, id, &format!("dealloc {id}"));
+                alloc.dealloc(s).unwrap();
+            }
+        }
+    }
+
+    fn run_alloc_realloc_dealloc<A, F>(make: F)
+    where
+        A: BStackAllocator,
+        F: Fn(BStack) -> std::io::Result<A>,
+    {
+        let path = temp_path("ard");
+        let _guard = Guard(path.clone());
+        let alloc = make(BStack::open(&path).unwrap()).unwrap();
+        let mut rng = rand::rng();
+        let mut live = Vec::new();
+
+        for _ in 0..FUZZ_COUNT {
+            if rng.random_bool(0.6) || live.is_empty() {
+                let size = rng.random_range(0..=1024);
+                if let Ok(s) = alloc.alloc(size) {
+                    let id = live.len() as u64;
+                    write_id(&s, id);
+                    live.push((s, id));
+                }
+            } else {
+                let i = rng.random_range(0..live.len());
+                let (s, id) = live.swap_remove(i);
+                if rng.random_bool(0.8) {
+                    let new_size = rng.random_range(0..=1024);
+                    let old_len = s.len();
+                    if let Ok(s2) = alloc.realloc(s, new_size) {
+                        let buf = s2.read().unwrap();
+                        let overlap = old_len.min(new_size) as usize;
+                        check(&buf[..overlap], id, &format!("realloc {id} overlap"));
+                        for (j, &b) in buf.iter().enumerate().skip(overlap) {
+                            assert_eq!(b, 0, "realloc {id}: non-zero at new byte [{j}]");
+                        }
+                        write_id(&s2, id);
+                        live.push((s2, id));
+                    }
+                } else {
+                    verify_id(&s, id, &format!("dealloc {id}"));
+                    alloc.dealloc(s).unwrap();
+                }
+            }
+        }
+    }
+
+    fn run_reopen<A, F>(make: F)
+    where
+        A: BStackAllocator,
+        F: Fn(BStack) -> std::io::Result<A>,
+    {
+        #[derive(Clone, Copy)]
+        struct Rec { start: u64, len: u64, id: u64 }
+
+        let path = temp_path("reopen");
+        let _guard = Guard(path.clone());
+        drop(make(BStack::open(&path).unwrap()).unwrap());
 
         let mut rng = rand::rng();
         let mut live: Vec<Rec> = Vec::new();
-        let mut next_pattern: u8 = 1;
-
-        const SESSIONS: usize = 20;
-        const OPS_PER_SESSION: usize = 100;
+        let mut next_id: u64 = 1;
 
         for session in 0..SESSIONS {
-            // Open allocator for this session.
-            let alloc = FirstFitBStackAllocator::new(BStack::open(&path).unwrap()).unwrap();
+            let alloc = make(BStack::open(&path).unwrap()).unwrap();
 
-            // Reconstruct handles and verify data for every live allocation.
-            for (idx, rec) in live.iter().enumerate() {
-                let s = crate::alloc::BStackSlice::new(&alloc, rec.start, rec.len);
-                let buf = s.read().unwrap();
-                verify(&buf[..rec.len as usize], rec.pattern, idx, session);
+            for (i, &rec) in live.iter().enumerate() {
+                let s = BStackSlice::new(&alloc, rec.start, rec.len);
+                check(&s.read().unwrap()[..rec.len as usize], rec.id,
+                      &format!("s{session} rec{i}"));
             }
 
-            // Perform random operations.
             for _ in 0..OPS_PER_SESSION {
-                let choice = if live.is_empty() {
-                    0
-                } else {
-                    rng.random_range(0u32..4)
-                };
-
+                let choice = if live.is_empty() { 0 } else { rng.random_range(0u32..4) };
                 match choice {
-                    // Allocate a new block.
                     0 => {
-                        let len = rng.random_range(MIN_PAYLOAD..=512);
+                        let len = rng.random_range(0..=512);
                         if let Ok(s) = alloc.alloc(len) {
-                            let pat = next_pattern;
-                            next_pattern = next_pattern.wrapping_add(1).max(1);
-                            let mut buf = vec![0u8; len as usize];
-                            fill(&mut buf, pat);
-                            s.write(&buf).unwrap();
-                            live.push(Rec {
-                                start: s.start(),
-                                len,
-                                pattern: pat,
-                            });
+                            let id = next_id; next_id += 1;
+                            write_id(&s, id);
+                            live.push(Rec { start: s.start(), len, id });
                         }
                     }
-                    // Realloc a random live block.
                     1 => {
-                        let idx = rng.random_range(0..live.len());
-                        let rec = live[idx];
-                        let new_len = rng.random_range(MIN_PAYLOAD..=512);
-                        let s = crate::alloc::BStackSlice::new(&alloc, rec.start, rec.len);
+                        let i = rng.random_range(0..live.len());
+                        let rec = live[i];
+                        let new_len = rng.random_range(0..=512);
+                        let s = BStackSlice::new(&alloc, rec.start, rec.len);
                         if let Ok(s2) = alloc.realloc(s, new_len) {
-                            // Verify the overlapping prefix survived.
                             let overlap = rec.len.min(new_len) as usize;
-                            let buf = s2.read().unwrap();
-                            verify(&buf[..overlap], rec.pattern, idx, session);
-                            // Write fresh pattern into the reallocated block.
-                            let pat = next_pattern;
-                            next_pattern = next_pattern.wrapping_add(1).max(1);
-                            let mut new_buf = vec![0u8; new_len as usize];
-                            fill(&mut new_buf, pat);
-                            s2.write(&new_buf).unwrap();
-                            live[idx] = Rec {
-                                start: s2.start(),
-                                len: new_len,
-                                pattern: pat,
-                            };
+                            check(&s2.read().unwrap()[..overlap], rec.id,
+                                  &format!("s{session} realloc{i}"));
+                            let id = next_id; next_id += 1;
+                            write_id(&s2, id);
+                            live[i] = Rec { start: s2.start(), len: new_len, id };
                         }
                     }
-                    // Deallocate a random live block.
                     2 => {
-                        let idx = rng.random_range(0..live.len());
-                        let rec = live.swap_remove(idx);
-                        let s = crate::alloc::BStackSlice::new(&alloc, rec.start, rec.len);
-                        // Verify before freeing.
-                        let buf = s.read().unwrap();
-                        verify(&buf[..rec.len as usize], rec.pattern, idx, session);
+                        let i = rng.random_range(0..live.len());
+                        let rec = live.swap_remove(i);
+                        let s = BStackSlice::new(&alloc, rec.start, rec.len);
+                        check(&s.read().unwrap()[..rec.len as usize], rec.id,
+                              &format!("s{session} dealloc{i}"));
                         alloc.dealloc(s).unwrap();
                     }
-                    // Verify a random live block without mutating.
                     _ => {
-                        let idx = rng.random_range(0..live.len());
-                        let rec = live[idx];
-                        let s = crate::alloc::BStackSlice::new(&alloc, rec.start, rec.len);
-                        let buf = s.read().unwrap();
-                        verify(&buf[..rec.len as usize], rec.pattern, idx, session);
+                        let i = rng.random_range(0..live.len());
+                        let rec = live[i];
+                        let s = BStackSlice::new(&alloc, rec.start, rec.len);
+                        check(&s.read().unwrap()[..rec.len as usize], rec.id,
+                              &format!("s{session} verify{i}"));
                     }
                 }
             }
 
-            // Drop the allocator (closes the file) before the next session.
             drop(alloc.into_stack());
         }
     }
+
+    // ── test suite macro ──────────────────────────────────────────────────────
+
+    macro_rules! fuzz_suite {
+        ($mod_name:ident, $make:expr) => {
+            mod $mod_name {
+                use super::*;
+                #[test]
+                fn alloc_dealloc() { super::run_alloc_dealloc($make); }
+                #[test]
+                fn alloc_realloc_dealloc() { super::run_alloc_realloc_dealloc($make); }
+                #[test]
+                fn reopen() { super::run_reopen($make); }
+            }
+        };
+    }
+
+    fuzz_suite!(first_fit, FirstFitBStackAllocator::new);
+    fuzz_suite!(ghost_tree, GhostTreeBstackAllocator::new);
 }
