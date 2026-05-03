@@ -4,6 +4,24 @@ This document outlines upcoming features planned for the `bstack` crate. These e
 
 ---
 
+## Make from_bytes of `BStackSlice` unsafe
+
+**Breaking change:** Yes — mechanical (one line per existing call to `BStackSlice::from_bytes`)
+
+### Motivation
+
+`BStackSlice::from_bytes` currently takes a byte array and decodes it into a slice. This operation is inherently unsafe because the byte array may not represent a valid slice (e.g., it could have an offset and length that point outside the bounds of the underlying data). Making this method `unsafe` signals to users that they must ensure the validity of the input bytes, and it encourages safer usage patterns.
+
+### Design
+
+Change the signature of `from_bytes` to:
+
+```rust
+pub unsafe fn from_bytes(allocator: &'a A, bytes: [u8; 16]) -> Self
+```
+
+---
+
 ## `type Allocated` — allocator-native handle type
 
 **Breaking change:** Yes — mechanical (one line per existing `impl BStackAllocator`)
