@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Implement `BStackBulkAllocator` for `LinearBStackAllocator`**. `alloc_bulk` reduces all allocations to a single `BStack::extend` call (one durable
   sync for the whole batch) and `dealloc_bulk` reclaims the largest contiguous tail region covered by the supplied slices with a single `BStack::discard` call.
 - **`BStackGuardedSlice` trait** (`guarded` feature): Lifecycle-hook slice abstraction for transparent I/O interception. Provides four hook methods (`pre_read`, `post_read`, `pre_write`, `post_write`) to intercept and transform read/write operations. Includes support for narrowed subviews and atomic marker traits (`BStackAtomicGuardedSlice`, `BStackAtomicGuardedSliceSubview`) with crash-safety guarantees.
+- **`GhostTreeBstackAllocator`** (`alloc` feature): A pure-AVL general-purpose allocator with zero-overhead live allocations. Free blocks store their AVL node inline, and the tree is keyed on `(size, address)` for best-fit allocation. Provides O(log n) allocation and deallocation with crash recovery through tree rebalancing on mount.
 
 ## [0.1.8] - 2026-05-01
 
