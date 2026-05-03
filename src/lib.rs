@@ -329,11 +329,10 @@ mod test;
 mod alloc;
 #[cfg(feature = "alloc")]
 pub use alloc::{
-    BStackAllocator, BStackBulkAllocator, BStackSlice, BStackSliceReader, GhostTreeBstackAllocator,
-    LinearBStackAllocator,
+    BStackAllocator, BStackBulkAllocator, BStackSlice, BStackSliceReader, LinearBStackAllocator,
 };
 #[cfg(all(feature = "alloc", feature = "set"))]
-pub use alloc::{BStackSliceWriter, FirstFitBStackAllocator};
+pub use alloc::{BStackSliceWriter, FirstFitBStackAllocator, GhostTreeBstackAllocator};
 
 #[cfg(feature = "guarded")]
 mod slices;
