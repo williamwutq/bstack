@@ -22,6 +22,31 @@ pub unsafe fn from_bytes(allocator: &'a A, bytes: [u8; 16]) -> Self
 
 ---
 
+## `type Error` — associated error type for `BStackAllocator`
+
+**Breaking change:** Yes — mechanical (one line per existing `impl BStackAllocator`)
+
+This is a breaking but insignificant change to the `BStackAllocator` API, adding an associated error type for the `io::Result` returned by `alloc`, `realloc`, and `dealloc`.
+
+### Motivation
+
+Currently, `BStackAllocator` methods return `io::Result`, which is a generic error type that may not provide sufficient context for allocator-specific errors. By introducing an associated error type, we can allow allocators to define their own error types that carry more specific information about allocation failures, such as out-of-memory conditions or fragmentation issues.
+
+### Design
+
+Add an associated type to `BStackAllocator`:
+
+```rust
+pub trait BStackAllocator: Sized {
+    type Error;
+}
+
+```
+
+Then, change the return types of `alloc`, `realloc`, and `dealloc` to use this associated error type.
+
+---
+
 ## `type Allocated` — allocator-native handle type
 
 **Breaking change:** Yes — mechanical (one line per existing `impl BStackAllocator`)
