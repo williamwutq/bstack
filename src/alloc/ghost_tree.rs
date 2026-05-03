@@ -157,10 +157,10 @@ impl GhostTreeBstackAllocator {
         ((ptr + 15) & !31) + 16
     }
 
-    /// Round `len` up to the next multiple of 32 (minimum 32).
+    /// Round `len` up to the next multiple of 32, with a floor of [`MIN_ALLOC`].
     #[inline]
     fn align_up_len(len: u64) -> u64 {
-        (len + 31) & !31
+        ((len + 31) & !31).max(MIN_ALLOC)
     }
 
     // ── AVL tree operations ───────────────────────────────────────────────────
@@ -441,50 +441,110 @@ impl BStackAllocator for GhostTreeBstackAllocator {
         self.stack
     }
 
-    /// Allocate `len` zeroed bytes (best-fit from the AVL tree).
+    /// Allocate `len` zeroed bytes using best-fit from the AVL tree.
     ///
-    /// 1. Round `len` up to 32-byte alignment (minimum 32).
-    /// 2. Search the AVL tree for the smallest free block ≥ aligned size.
-    /// 3. If none, extend the BStack.
-    /// 4. Split if the remainder ≥ 32 bytes; insert remainder into tree.
-    /// 5. Return the **tail** portion of the chosen block (already zeroed).
+    /// The returned slice length is `align_up_len(len)` (≥ 32) in the split
+    /// case, or the full reclaimed block size when the remainder is too small
+    /// to split (< 32 bytes, transparently absorbed into the caller's slice).
     ///
     /// # Crash safety
     ///
-    /// Multi-call: crash after AVL remove but before return loses the block.
+    /// Multi-call.  A crash between AVL remove and the split-insert permanently
+    /// loses the remainder fragment; a crash between AVL remove and return
+    /// loses the entire block.
     fn alloc(&self, len: u64) -> io::Result<BStackSlice<'_, Self>> {
-        todo!()
+        let aligned = Self::align_up_len(len);
+        if let Some((ptr, block_size)) = self.avl_find_best_fit_and_remove(aligned)? {
+            let remainder = block_size - aligned;
+            if remainder >= MIN_ALLOC {
+                // Split: the leading `remainder` bytes become a new free block.
+                // The AVL node is written into those bytes by avl_insert.
+                // The tail `aligned` bytes are already zeroed by invariant.
+                self.avl_insert(ptr, remainder)?;
+                Ok(BStackSlice::new(self, ptr + remainder, len))
+            } else {
+                // No split: give the whole block.  The stale AVL node in the
+                // first 32 bytes must be zeroed; the rest is already zeroed.
+                // Any bytes beyond `len` (up to `block_size`) are internal
+                // padding and will be recovered on dealloc by re-aligning.
+                self.stack.zero(ptr, MIN_ALLOC)?;
+                Ok(BStackSlice::new(self, ptr, len))
+            }
+        } else {
+            // No free block fits: grow the BStack (returns zeroed bytes).
+            let start = self.stack.extend(aligned)?;
+            Ok(BStackSlice::new(self, start, len))
+        }
     }
 
     /// Resize `slice` to `new_len` bytes.
     ///
-    /// **Shrink:** if freed tail ≥ 32, split and insert remainder into tree.
-    /// **Grow:** alloc new, copy, dealloc old.
+    /// **Shrink:** if the freed tail ≥ 32 bytes, zero it and insert it into the
+    /// tree.  If the tail < 32, it is absorbed into the returned slice — the
+    /// allocation cannot be shrunk below the next 32-byte boundary.
+    ///
+    /// **Grow:** allocate a new block, copy contents, free the old block.
     ///
     /// # Crash safety
     ///
-    /// Multi-call on grow path.  Shrink releasing a ≥32-byte tail is also
-    /// multi-call (zero + insert).
+    /// Shrink with a splittable tail: multi-call (zero + AVL insert).
+    /// Grow: multi-call (alloc + copy + dealloc).
     fn realloc<'a>(
         &'a self,
         slice: BStackSlice<'a, Self>,
         new_len: u64,
     ) -> io::Result<BStackSlice<'a, Self>> {
-        todo!()
+        let old_len = slice.len();
+        // Re-align to recover the true underlying block sizes.
+        let aligned_old = Self::align_up_len(old_len);
+        let aligned_new = Self::align_up_len(new_len);
+
+        if aligned_new == aligned_old {
+            // Same underlying block — just update the visible length.
+            // If it is a shrink, we need to zero the tail to uphold the invariant
+            // but we can do that in-place without touching the AVL tree since the block size doesn't change.
+            if new_len < old_len {
+                let tail_ptr = slice.start() + new_len;
+                let tail_len = old_len - new_len;
+                self.stack.zero(tail_ptr, tail_len)?;
+            }
+            return Ok(BStackSlice::new(self, slice.start(), new_len));
+        }
+
+        if aligned_new < aligned_old {
+            // Shrink.  Both aligned sizes are multiples of 32, so freed_tail
+            // is always a multiple of 32 and always splittable.
+            let freed_tail = aligned_old - aligned_new;
+            let tail_ptr = slice.start() + aligned_new;
+            self.stack.zero(tail_ptr, freed_tail)?;
+            self.avl_insert(tail_ptr, freed_tail)?;
+            return Ok(BStackSlice::new(self, slice.start(), new_len));
+        }
+
+        // Grow: allocate new region, copy old data, free old region.
+        let new_slice = self.alloc(new_len)?;
+        let data = self.stack.get(slice.start(), slice.start() + old_len)?;
+        self.stack.set(new_slice.start(), &data)?;
+        self.dealloc(slice)?;
+        Ok(new_slice)
     }
 
     /// Release `slice` back to the free pool.
     ///
-    /// 1. Zero the entire region.
-    /// 2. Write an AVL node at the start of the region.
-    /// 3. Insert into the AVL tree by `(len, ptr)`.
-    ///
-    /// No coalescing is done here; that is deferred to [`mount`](Self::mount).
+    /// Zeros the entire region (upholding the zeroed-memory invariant), then
+    /// inserts it into the AVL tree.  No coalescing is performed; adjacent free
+    /// blocks accumulate until the next [`GhostTreeBstackAllocator::new`] call.
     ///
     /// # Crash safety
     ///
-    /// Multi-call: crash before AVL insert permanently loses the block.
+    /// Multi-call: a crash after the zero but before the AVL insert permanently
+    /// loses the block.
     fn dealloc(&self, slice: BStackSlice<'_, Self>) -> io::Result<()> {
-        todo!()
+        let ptr = slice.start();
+        // Re-align to recover the true block size that alloc carved out.
+        // Any bytes beyond the requested length (< 32) are absorbed here.
+        let true_len = Self::align_up_len(slice.len());
+        self.stack.zero(ptr, true_len)?;
+        self.avl_insert(ptr, true_len)
     }
 }
