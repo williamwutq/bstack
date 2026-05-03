@@ -162,8 +162,6 @@
 //! `true` when the cursor's underlying slice equals the slice (cursor position is ignored for this
 //! comparison).
 
-#![cfg(feature = "alloc")]
-
 use crate::BStack;
 use std::fmt;
 use std::hash::{Hash, Hasher};
