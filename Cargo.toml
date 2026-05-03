@@ -20,6 +20,8 @@ alloc = []
 # Enables atomic compound operations: atrunc, splice, splice_into, try_extend, try_discard,
 # and (with set) swap, swap_into, cas.
 atomic = []
+# Enables BStackGuardedSlice and related hook-based slice abstractions.
+guarded = ["alloc"]
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
