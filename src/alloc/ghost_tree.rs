@@ -1,0 +1,490 @@
+use super::{BStackAllocator, BStackSlice};
+use crate::BStack;
+use std::io;
+
+const ALGT_MAGIC: [u8; 8] = *b"ALGT\x00\x01\x00\x00";
+const ALGT_MAGIC_PREFIX: [u8; 6] = *b"ALGT\x00\x01";
+
+/// Payload offset of the magic number.
+const MAGIC_OFFSET: u64 = 32;
+/// Payload offset of the AVL root pointer.
+const ROOT_OFFSET: u64 = 40;
+/// First payload offset managed by the allocator (32-byte aligned on disk).
+const ARENA_START: u64 = 48;
+
+/// Minimum allocation size — exactly the size of one AVL node.
+const MIN_ALLOC: u64 = 32;
+
+/// Null / absent pointer sentinel stored in AVL node child fields.
+const NULL_PTR: u64 = 0;
+
+// ── AVL node field offsets within a free block ────────────────────────────────
+const NODE_SIZE_OFF: u64 = 0;
+const NODE_BF_OFF: u64 = 8;     // i8 balance factor
+const NODE_HEIGHT_OFF: u64 = 9; // u8 height (max ~59 for balanced; slightly more tolerated)
+const NODE_LEFT_OFF: u64 = 16;
+const NODE_RIGHT_OFF: u64 = 24;
+
+// Read a value of type `$ty` from `$buf` at offset `$off`.
+macro_rules! read_buf {
+    ($buf:expr, $off:expr => $ty:ty) => {
+        {
+            let start = $off as usize;
+            let end = start + std::mem::size_of::<$ty>();
+            $buf[start..end].try_into().unwrap()
+        }
+    };
+}
+
+macro_rules! write_buf {
+    ($val:expr => $buf:expr, $off:expr) => {
+        {
+            let bytes = $val.to_le_bytes();
+            let start = $off as usize;
+            let end = start + bytes.len();
+            $buf[start..end].copy_from_slice(&bytes);
+        }
+    };
+}
+
+// Read a little-endian value of type `$ty` from `$buf` at offset `$off`.
+macro_rules! read_buf_le {
+    ($buf:expr, $off:expr => $ty:ty) => {
+        <$ty>::from_le_bytes(read_buf!($buf, $off => $ty))
+    };
+}
+
+/// A pure-AVL general-purpose allocator built on top of a [`BStack`].
+///
+/// Free blocks store their AVL node inline at offset 0 within the block —
+/// live allocations carry **zero** overhead (no headers, no footers).  The tree
+/// is keyed on `(size, address)` for a strict total order.  All memory is kept
+/// zeroed: the BStack zeroes on extension, and the allocator zeroes on free.
+///
+/// # On-disk layout
+///
+/// ```text
+/// ┌─────────────────────────────┐  payload offset 0
+/// │   User-reserved (32 bytes)  │
+/// ├─────────────────────────────┤  offset 32
+/// │   Magic number (8 bytes)    │  "ALGT\x00\x01\x00\x00"
+/// ├─────────────────────────────┤  offset 40
+/// │   AVL root pointer (8 B)    │  absolute payload offset of the root node
+/// ├─────────────────────────────┤  offset 48  ← arena start (32-byte aligned)
+/// │   ... heap grows upward ... │
+/// └─────────────────────────────┘
+/// ```
+///
+/// # Alignment
+///
+/// All allocations are aligned to 32 bytes.  The arena starts at payload offset
+/// 48, which maps to a 32-byte-aligned disk address because the BStack header
+/// is 16 bytes (`16 + 48 = 64 = 2 × 32`).
+///
+/// # Crash safety
+///
+/// No write-ahead log, no checksums.  A crash during `dealloc` before the AVL
+/// insert permanently loses that block.  A crash during rotation leaves the tree
+/// imbalanced — corrected on the next `mount`.  See [`GhostTreeBstackAllocator::mount`].
+pub struct GhostTreeBstackAllocator {
+    stack: BStack,
+}
+
+// ── Lifecycle ─────────────────────────────────────────────────────────────────
+
+impl GhostTreeBstackAllocator {
+    /// Initialise a fresh allocator on `stack` or open an existing one, then
+    /// perform startup coalescing and recovery.
+    ///
+    /// Writes the magic number and a null root pointer, then returns the
+    /// allocator.  The 32 user-reserved bytes at offset 0 are left untouched.
+    ///
+    /// # Errors
+    ///
+    /// Propagates I/O errors from the underlying BStack.
+    pub fn new(stack: BStack) -> io::Result<Self> {
+        todo!("write ALGT_MAGIC at MAGIC_OFFSET and NULL_PTR at ROOT_OFFSET or read and verify ALGT_MAGIC_PREFIX at MAGIC_OFFSET and then run coalesce_and_rebalance()")
+    }
+}
+
+// ── Internal helpers ──────────────────────────────────────────────────────────
+
+impl GhostTreeBstackAllocator {
+    /// Read the AVL root pointer from the header.
+    #[inline]
+    fn read_root(&self) -> io::Result<u64> {
+        let buf = &mut [0u8; 8];
+        self.stack.get_into(ROOT_OFFSET, buf)?;
+        Ok(read_buf_le!(buf, 0 => u64))
+    }
+
+    /// Write the AVL root pointer to the header.
+    #[inline]
+    fn write_root(&self, ptr: u64) -> io::Result<()> {
+        let mut buf = [0u8; 8];
+        write_buf!(ptr => buf, 0);
+        self.stack.set(ROOT_OFFSET, &buf)?;
+        Ok(())
+    }
+
+    /// Read the entire AVL node at `ptr` and return `(size, bf, height, left, right)`.
+    fn read_node(&self, ptr: u64) -> io::Result<(u64, i8, u8, u64, u64)> {
+        let buf = &mut [0u8; 32];
+        self.stack.get_into(ptr, buf)?;
+        let size   = read_buf_le!(buf, NODE_SIZE_OFF   => u64);
+        let bf      = read_buf_le!(buf, NODE_BF_OFF     => i8);
+        let height  = read_buf_le!(buf, NODE_HEIGHT_OFF => u8);
+        let left   = read_buf_le!(buf, NODE_LEFT_OFF   => u64);
+        let right  = read_buf_le!(buf, NODE_RIGHT_OFF  => u64);
+        Ok((size, bf, height, left, right))
+    }
+
+    /// Write a complete AVL node at `ptr`.
+    fn write_node(&self, ptr: u64, size: u64, bf: i8, height: u8, left: u64, right: u64) -> io::Result<()> {
+        let mut buf = [0u8; 32];
+        write_buf!(size   => buf, NODE_SIZE_OFF);
+        write_buf!(bf     => buf, NODE_BF_OFF);
+        write_buf!(height => buf, NODE_HEIGHT_OFF);
+        write_buf!(left   => buf, NODE_LEFT_OFF);
+        write_buf!(right  => buf, NODE_RIGHT_OFF);
+        self.stack.set(ptr, &buf)?;
+        Ok(())
+    }
+
+    /// Round `ptr` up to the next 32-byte boundary (minimum 32).
+    #[inline]
+    fn align_up_ptr(ptr: u64) -> u64 {
+        ((ptr + 15) & !31) + 16
+    }
+
+    /// Round `len` up to the next multiple of 32 (minimum 32).
+    #[inline]
+    fn align_up_len(len: u64) -> u64 {
+        (len + 31) & !31
+    }
+
+    // ── AVL tree operations ───────────────────────────────────────────────────
+
+    /// Return the stored height of the subtree rooted at `ptr` (0 for [`NULL_PTR`]).
+    ///
+    /// O(1) — reads the `height` field from the node header.
+    #[inline]
+    fn avl_height(&self, ptr: u64) -> io::Result<u8> {
+        if ptr == NULL_PTR {
+            return Ok(0);
+        }
+        let (_, _, height, _, _) = self.read_node(ptr)?;
+        Ok(height)
+    }
+
+    /// Write `(size, left, right)` to `ptr`, computing bf and height from the
+    /// children's stored heights in one pass.  Returns the balance factor.
+    ///
+    /// Replaces the `write_node(…, 0, 0, …) + avl_update_bf` pair: instead of
+    /// writing stale zeros and reading back, we read the two child heights once,
+    /// compute both fields, and write the node exactly once.
+    #[inline]
+    fn avl_write_and_update(&self, ptr: u64, size: u64, left: u64, right: u64) -> io::Result<i8> {
+        let lh = self.avl_height(left)? as i16;
+        let rh = self.avl_height(right)? as i16;
+        let bf = (rh - lh) as i8;
+        let height = (1 + lh.max(rh)) as u8;
+        self.write_node(ptr, size, bf, height, left, right)?;
+        Ok(bf)
+    }
+
+    /// Recompute bf and height for `node` from its children's stored heights,
+    /// write both back, and return the balance factor.
+    ///
+    /// O(1) — delegates to [`avl_write_and_update`](Self::avl_write_and_update).
+    #[inline]
+    fn avl_update_bf(&self, node: u64) -> io::Result<i8> {
+        let (size, _, _, left, right) = self.read_node(node)?;
+        self.avl_write_and_update(node, size, left, right)
+    }
+
+    /// Right-rotate around `node`; return the new subtree root.
+    ///
+    /// ```text
+    ///     node           pivot
+    ///    /    \    →    /     \
+    /// pivot    R       L      node
+    ///  / \                   /    \
+    /// L   M                 M      R
+    /// ```
+    fn avl_rotate_right(&self, node: u64) -> io::Result<u64> {
+        let (node_sz, _, _, pivot, node_r) = self.read_node(node)?;
+        let (pivot_sz, _, _, pivot_l, pivot_r) = self.read_node(pivot)?;
+        self.avl_write_and_update(node, node_sz, pivot_r, node_r)?;
+        self.avl_write_and_update(pivot, pivot_sz, pivot_l, node)?;
+        Ok(pivot)
+    }
+
+    /// Left-rotate around `node`; return the new subtree root.
+    ///
+    /// ```text
+    ///  node              pivot
+    ///  /  \      →      /     \
+    /// L   pivot       node     R
+    ///     /  \        /  \
+    ///    M    R      L    M
+    /// ```
+    fn avl_rotate_left(&self, node: u64) -> io::Result<u64> {
+        let (node_sz, _, _, node_l, pivot) = self.read_node(node)?;
+        let (pivot_sz, _, _, pivot_l, pivot_r) = self.read_node(pivot)?;
+        self.avl_write_and_update(node, node_sz, node_l, pivot_l)?;
+        self.avl_write_and_update(pivot, pivot_sz, node, pivot_r)?;
+        Ok(pivot)
+    }
+
+    /// Fix imbalance at `node` after an insert or remove, then return the
+    /// (possibly new) subtree root.  Children must already be balanced.
+    fn avl_rebalance(&self, node: u64) -> io::Result<u64> {
+        let bf = self.avl_update_bf(node)?;
+        if bf == -2 {
+            let (_, _, _, left, _) = self.read_node(node)?;
+            let (_, left_bf, _, _, _) = self.read_node(left)?;
+            if left_bf > 0 {
+                // Left-right case: rotate left child left first.
+                let new_left = self.avl_rotate_left(left)?;
+                let (node_sz, _, _, _, node_r) = self.read_node(node)?;
+                self.avl_write_and_update(node, node_sz, new_left, node_r)?;
+            }
+            self.avl_rotate_right(node)
+        } else if bf == 2 {
+            let (_, _, _, _, right) = self.read_node(node)?;
+            let (_, right_bf, _, _, _) = self.read_node(right)?;
+            if right_bf < 0 {
+                // Right-left case: rotate right child right first.
+                let new_right = self.avl_rotate_right(right)?;
+                let (node_sz, _, _, node_l, _) = self.read_node(node)?;
+                self.avl_write_and_update(node, node_sz, node_l, new_right)?;
+            }
+            self.avl_rotate_left(node)
+        } else {
+            Ok(node)
+        }
+    }
+
+    /// Recursive insert into subtree at `root`; return new subtree root.
+    fn avl_insert_rec(&self, root: u64, ptr: u64, size: u64) -> io::Result<u64> {
+        if root == NULL_PTR {
+            self.write_node(ptr, size, 0, 1, NULL_PTR, NULL_PTR)?;
+            return Ok(ptr);
+        }
+        let (root_sz, _, _, left, right) = self.read_node(root)?;
+        if (size, ptr) < (root_sz, root) {
+            let new_left = self.avl_insert_rec(left, ptr, size)?;
+            self.avl_write_and_update(root, root_sz, new_left, right)?;
+        } else {
+            let new_right = self.avl_insert_rec(right, ptr, size)?;
+            self.avl_write_and_update(root, root_sz, left, new_right)?;
+        }
+        self.avl_rebalance(root)
+    }
+
+    /// Insert a free block at `ptr` with `size` bytes into the AVL tree.
+    fn avl_insert(&self, ptr: u64, size: u64) -> io::Result<()> {
+        let root = self.read_root()?;
+        let new_root = self.avl_insert_rec(root, ptr, size)?;
+        self.write_root(new_root)
+    }
+
+    /// Return `(ptr, size)` of the leftmost (minimum-key) node in `subtree`.
+    fn avl_min(&self, subtree: u64) -> io::Result<(u64, u64)> {
+        let (size, _, _, left, _) = self.read_node(subtree)?;
+        if left == NULL_PTR {
+            Ok((subtree, size))
+        } else {
+            self.avl_min(left)
+        }
+    }
+
+    /// Recursive remove of `(size, ptr)` from subtree at `root`; return new root.
+    fn avl_remove_rec(&self, root: u64, ptr: u64, size: u64) -> io::Result<u64> {
+        if root == NULL_PTR {
+            return Ok(NULL_PTR);
+        }
+        let (root_sz, _, _, left, right) = self.read_node(root)?;
+        if (size, ptr) < (root_sz, root) {
+            let new_left = self.avl_remove_rec(left, ptr, size)?;
+            self.avl_write_and_update(root, root_sz, new_left, right)?;
+            return self.avl_rebalance(root);
+        }
+        if (size, ptr) > (root_sz, root) {
+            let new_right = self.avl_remove_rec(right, ptr, size)?;
+            self.avl_write_and_update(root, root_sz, left, new_right)?;
+            return self.avl_rebalance(root);
+        }
+        // Found the node to remove.
+        if left == NULL_PTR {
+            return Ok(right);
+        }
+        if right == NULL_PTR {
+            return Ok(left);
+        }
+        // Two children: replace with the in-order successor (leftmost of right
+        // subtree), then delete the successor from the right subtree.
+        let (succ, succ_sz) = self.avl_min(right)?;
+        let new_right = self.avl_remove_rec(right, succ, succ_sz)?;
+        self.avl_write_and_update(succ, succ_sz, left, new_right)?;
+        self.avl_rebalance(succ)
+    }
+
+    /// Remove the node at `ptr` from the AVL tree and rebalance.
+    ///
+    /// Reads `size` from the node before searching so the block must still be
+    /// in the tree with a valid size field.
+    fn avl_remove(&self, ptr: u64) -> io::Result<()> {
+        let (size, _, _, _, _) = self.read_node(ptr)?;
+        let root = self.read_root()?;
+        let new_root = self.avl_remove_rec(root, ptr, size)?;
+        self.write_root(new_root)
+    }
+
+    /// Find and remove the best-fit block (smallest block ≥ `min_size`) from
+    /// the subtree at `root` in a single O(log n) pass.
+    ///
+    /// Returns `(new_subtree_root, Option<(found_ptr, found_size)>)`.
+    ///
+    /// Strategy: when the current node fits, recurse left to try to find a
+    /// smaller fit.  If the left subtree yields a candidate, wire the updated
+    /// left child back and rebalance — the current node stays in the tree.  If
+    /// not, the current node *is* the best fit and is removed using the standard
+    /// two-child replacement (in-order successor).
+    fn avl_find_best_fit_and_remove_rec(
+        &self,
+        root: u64,
+        min_size: u64,
+    ) -> io::Result<(u64, Option<(u64, u64)>)> {
+        if root == NULL_PTR {
+            return Ok((NULL_PTR, None));
+        }
+        let (root_sz, _, _, left, right) = self.read_node(root)?;
+        if root_sz >= min_size {
+            // This node fits — try left for something smaller.
+            let (new_left, found) = self.avl_find_best_fit_and_remove_rec(left, min_size)?;
+            if let Some(candidate) = found {
+                // A smaller fit was found; keep root, update its left child.
+                self.avl_write_and_update(root, root_sz, new_left, right)?;
+                let new_root = self.avl_rebalance(root)?;
+                return Ok((new_root, Some(candidate)));
+            }
+            // No smaller fit in the left subtree — remove root itself.
+            let new_root = if left == NULL_PTR {
+                right
+            } else if right == NULL_PTR {
+                left
+            } else {
+                let (succ, succ_sz) = self.avl_min(right)?;
+                let new_right = self.avl_remove_rec(right, succ, succ_sz)?;
+                self.avl_write_and_update(succ, succ_sz, left, new_right)?;
+                self.avl_rebalance(succ)?
+            };
+            Ok((new_root, Some((root, root_sz))))
+        } else {
+            // Too small — only right subtree can have a fit.
+            let (new_right, found) = self.avl_find_best_fit_and_remove_rec(right, min_size)?;
+            self.avl_write_and_update(root, root_sz, left, new_right)?;
+            let new_root = self.avl_rebalance(root)?;
+            Ok((new_root, found))
+        }
+    }
+
+    /// Find and remove the best-fit block (smallest block ≥ `min_size`).
+    ///
+    /// Returns `(ptr, size)`, or `None` if no block fits.
+    fn avl_find_best_fit_and_remove(&self, min_size: u64) -> io::Result<Option<(u64, u64)>> {
+        let root = self.read_root()?;
+        let (new_root, found) = self.avl_find_best_fit_and_remove_rec(root, min_size)?;
+        self.write_root(new_root)?;
+        Ok(found)
+    }
+
+    /// In-order walk of the subtree at `root`, calling `f(ptr, size)` per node.
+    /// Tolerates imbalance — visits every reachable node.
+    fn avl_walk_inorder(
+        &self,
+        root: u64,
+        f: &mut dyn FnMut(u64, u64) -> io::Result<()>,
+    ) -> io::Result<()> {
+        if root == NULL_PTR {
+            return Ok(());
+        }
+        let (size, _, _, left, right) = self.read_node(root)?;
+        self.avl_walk_inorder(left, f)?;
+        f(root, size)?;
+        self.avl_walk_inorder(right, f)
+    }
+
+    // ── Startup coalescing ────────────────────────────────────────────────────
+
+    /// Walk the current AVL tree (tolerating imbalance), merge adjacent free
+    /// blocks, then rebalance.  Called by [`Self::new`] on startup to coalesce any
+    /// adjacent free blocks that may have accumulated due to crashes.
+    fn coalesce_and_rebalance(&self) -> io::Result<()> {
+        todo!(
+            "collect all free blocks by address, merge adjacent pairs, \
+             rebuild a balanced AVL tree from sorted list"
+        )
+    }
+}
+
+// ── BStackAllocator impl ──────────────────────────────────────────────────────
+
+impl BStackAllocator for GhostTreeBstackAllocator {
+    fn stack(&self) -> &BStack {
+        &self.stack
+    }
+
+    fn into_stack(self) -> BStack {
+        self.stack
+    }
+
+    /// Allocate `len` zeroed bytes (best-fit from the AVL tree).
+    ///
+    /// 1. Round `len` up to 32-byte alignment (minimum 32).
+    /// 2. Search the AVL tree for the smallest free block ≥ aligned size.
+    /// 3. If none, extend the BStack.
+    /// 4. Split if the remainder ≥ 32 bytes; insert remainder into tree.
+    /// 5. Return the **tail** portion of the chosen block (already zeroed).
+    ///
+    /// # Crash safety
+    ///
+    /// Multi-call: crash after AVL remove but before return loses the block.
+    fn alloc(&self, len: u64) -> io::Result<BStackSlice<'_, Self>> {
+        todo!()
+    }
+
+    /// Resize `slice` to `new_len` bytes.
+    ///
+    /// **Shrink:** if freed tail ≥ 32, split and insert remainder into tree.
+    /// **Grow:** alloc new, copy, dealloc old.
+    ///
+    /// # Crash safety
+    ///
+    /// Multi-call on grow path.  Shrink releasing a ≥32-byte tail is also
+    /// multi-call (zero + insert).
+    fn realloc<'a>(
+        &'a self,
+        slice: BStackSlice<'a, Self>,
+        new_len: u64,
+    ) -> io::Result<BStackSlice<'a, Self>> {
+        todo!()
+    }
+
+    /// Release `slice` back to the free pool.
+    ///
+    /// 1. Zero the entire region.
+    /// 2. Write an AVL node at the start of the region.
+    /// 3. Insert into the AVL tree by `(len, ptr)`.
+    ///
+    /// No coalescing is done here; that is deferred to [`mount`](Self::mount).
+    ///
+    /// # Crash safety
+    ///
+    /// Multi-call: crash before AVL insert permanently loses the block.
+    fn dealloc(&self, slice: BStackSlice<'_, Self>) -> io::Result<()> {
+        todo!()
+    }
+}

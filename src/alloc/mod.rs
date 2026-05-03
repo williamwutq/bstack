@@ -1144,8 +1144,12 @@ pub trait BStackBulkAllocator: BStackAllocator {
 
 #[cfg(feature = "set")]
 pub mod first_fit;
+#[cfg(feature = "set")]
+pub mod ghost_tree;
 pub mod linear;
 
 #[cfg(feature = "set")]
 pub use first_fit::FirstFitBStackAllocator;
+#[cfg(feature = "set")]
+pub use ghost_tree::GhostTreeBstackAllocator;
 pub use linear::LinearBStackAllocator;
