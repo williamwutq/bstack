@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **Restructured allocators into multiple files**: `alloc` now contain three files — `mod.rs` for the public API, `linear.rs` for `LinearBStackAllocator`, and `first_fit.rs` for `FirstFitBStackAllocator` — to improve organization and readability as the allocator codebase grows. The main `lib.rs` re-exports the public API from `alloc/mod.rs` when the `alloc` feature is enabled, so no API changes are required for users of the allocators.
+- **`FirstFitBStackAllocator` allocation methods now optimize for zero-length slices**: `alloc(0)` returns a valid zero-length slice at offset 0; `realloc` can grow or shrink to/from zero length; `dealloc` of a zero-length slice is a no-op. This allows users to treat zero-length allocations as normal slices without actually allocating any space in the file, which is a common pattern for representing empty values or optional data. The change is backward-compatible.
 
 ### Added
 

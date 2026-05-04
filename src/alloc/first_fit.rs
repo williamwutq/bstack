@@ -694,6 +694,10 @@ impl BStackAllocator for FirstFitBStackAllocator {
     }
 
     fn alloc(&self, len: u64) -> io::Result<BStackSlice<'_, Self>> {
+        if len == 0 {
+            return Ok(BStackSlice::new(self, 0, 0));
+        }
+
         // Make len aligned to 8 bytes and at least 16
         let aligned_len = self.align_len(len);
 
@@ -738,6 +742,10 @@ impl BStackAllocator for FirstFitBStackAllocator {
     }
 
     fn dealloc(&self, slice: BStackSlice<'_, Self>) -> io::Result<()> {
+        if slice.is_empty() && slice.start() == 0 {
+            return Ok(());
+        }
+
         // Use the aligned block size for validation: the user-visible len may be smaller than
         // MIN_BLOCK_PAYLOAD_SIZE (e.g. alloc(5) returns a 5-byte slice backed by a 16-byte block).
         let aligned_len = self.align_len(slice.len());
@@ -769,6 +777,14 @@ impl BStackAllocator for FirstFitBStackAllocator {
         slice: BStackSlice<'a, Self>,
         new_len: u64,
     ) -> io::Result<BStackSlice<'a, Self>> {
+        if slice.is_empty() && slice.start() == 0 {
+            return self.alloc(new_len);
+        }
+        if new_len == 0 {
+            self.dealloc(slice)?;
+            return Ok(BStackSlice::new(self, 0, 0));
+        }
+
         // Use the aligned block size for validation (same reason as dealloc).
         let aligned_current_len = self.align_len(slice.len());
         if self.is_impossible_block_start(slice.start())
