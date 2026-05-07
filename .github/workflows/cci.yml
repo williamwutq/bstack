@@ -3,10 +3,10 @@ name: CCI
 on:
   push:
     branches: [ master ]
-    paths: [c/**]
+    paths: [c/**, .github/workflows/cci.yml]
   pull_request:
     branches: [ master ]
-    paths: [c/**]
+    paths: [c/**, .github/workflows/cci.yml]
 
 permissions:
   contents: read
@@ -41,5 +41,7 @@ jobs:
       run: cd c && make test-set-atomic
     - name: Build and test first-fit allocator
       run: cd c && make test-first-fit
+    - name: Build and test ghost-tree allocator
+      run: cd c && make test-ghost-tree
     - name: Build alloc libraries (all feature variants)
       run: cd c && make libbstack-alloc.a libbstack-alloc-set.a
