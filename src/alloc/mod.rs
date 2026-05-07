@@ -7,7 +7,9 @@
 //! * [`BStackSlice`] — a lifetime-coupled handle to a contiguous region of a
 //!   [`BStack`] payload.  It is a lightweight `Copy` value (one reference plus
 //!   two `u64`s) that exposes [`read`](BStackSlice::read),
-//!   [`read_into`](BStackSlice::read_into), and (with the `set` feature)
+//!   [`read_into`](BStackSlice::read_into),
+//!   [`read_range`](BStackSlice::read_range),
+//!   [`read_range_into`](BStackSlice::read_range_into), and (with the `set` feature)
 //!   [`write`](BStackSlice::write) and [`zero`](BStackSlice::zero).
 //!
 //! * [`BStackAllocator`] — a trait for types that own a [`BStack`] and manage
@@ -364,6 +366,27 @@ impl<'a, A: BStackAllocator> BStackSlice<'a, A> {
     pub fn read_into(&self, buf: &mut [u8]) -> io::Result<()> {
         let n = (buf.len() as u64).min(self.len()) as usize;
         self.stack().get_into(self.start(), &mut buf[..n])
+    }
+
+    /// Read a sub-range `[start, end)` relative to this slice into a newly
+    /// allocated `Vec<u8>`.
+    /// 
+    /// `start` and `end` are relative to `self.start()`, not the payload start.
+    /// 
+    /// # Errors
+    /// 
+    /// Returns an error if `start > end` or if `end` exceeds `self.len()`.
+    pub fn read_range(&self, start: u64, end: u64) -> io::Result<Vec<u8>> {
+        if end > self.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "range [{start}, {end}) exceeds slice length {}",
+                    self.len()
+                ),
+            ));
+        }
+        self.stack().get(self.start() + start, self.start() + end)
     }
 
     /// Read a sub-range `[start, start + buf.len())` relative to this slice
