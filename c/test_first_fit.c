@@ -345,6 +345,43 @@ static int test_realloc_small(void)
     ff_unlink(tmp); return 0;
 }
 
+static int test_slice_read_range(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    first_fit_bstack_allocator_t *a = first_fit_bstack_allocator_new(bs);
+    CHECK(a);
+
+    bstack_slice_t s;
+    CHECK(bstack_allocator_alloc((bstack_allocator_t *)a, 16, &s) == 0);
+    uint8_t wbuf[16], rbuf[16];
+    int i;
+    for (i = 0; i < 16; i++) wbuf[i] = (uint8_t)(i * 3);
+    CHECK(bstack_slice_write(s, wbuf, 16) == 0);
+
+    /* Full range */
+    memset(rbuf, 0, sizeof rbuf);
+    CHECK(bstack_slice_read_range(s, 0, 16, rbuf) == 0);
+    CHECK(memcmp(rbuf, wbuf, 16) == 0);
+
+    /* Sub-range [4, 12) */
+    memset(rbuf, 0, sizeof rbuf);
+    CHECK(bstack_slice_read_range(s, 4, 12, rbuf) == 0);
+    CHECK(memcmp(rbuf, wbuf + 4, 8) == 0);
+
+    /* Empty range is a no-op */
+    CHECK(bstack_slice_read_range(s, 7, 7, rbuf) == 0);
+
+    /* start > end => error */
+    CHECK(bstack_slice_read_range(s, 10, 4, rbuf) == -1);
+
+    /* end > s.len => error */
+    CHECK(bstack_slice_read_range(s, 0, 17, rbuf) == -1);
+
+    bstack_close(first_fit_bstack_allocator_into_stack(a));
+    ff_unlink(tmp); return 0;
+}
+
 /* =========================================================================
  * Fuzz tests
  *
@@ -716,6 +753,7 @@ int main(void)
     T(test_slot_reuse);
     T(test_persist_reopen);
     T(test_realloc_small);
+    T(test_slice_read_range);
 
     /* Fuzz */
     T(test_fuzz_alloc_dealloc);

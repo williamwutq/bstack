@@ -87,6 +87,14 @@ int bstack_slice_read_range_into(bstack_slice_t s, uint64_t start,
                                   uint8_t *buf, size_t buf_len);
 
 /*
+ * Read the half-open slice-relative byte range [start, end) into buf.
+ * buf must have room for (end - start) bytes; no overflow check is done.
+ * Returns -1 with errno = EINVAL if start > end or end exceeds s.len.
+ */
+int bstack_slice_read_range(bstack_slice_t s, uint64_t start, uint64_t end,
+                             uint8_t *buf);
+
+/*
  * Produce the sub-range [start, end) relative to this slice into *out.
  * start and end are 0-based within the slice (not the payload).
  * Returns -1 with errno = EINVAL if start > end or end > s.len.

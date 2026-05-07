@@ -96,6 +96,21 @@ int bstack_slice_read_range_into(bstack_slice_t s, uint64_t start,
                       buf);
 }
 
+int bstack_slice_read_range(bstack_slice_t s, uint64_t start, uint64_t end,
+                            uint8_t *buf)
+{
+    if (start > end || end > s.len) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (start == end)
+        return 0;
+    return bstack_get(slice_stack(s),
+                      s.offset + start,
+                      s.offset + end,
+                      buf);
+}
+
 int bstack_slice_subslice(bstack_slice_t s, uint64_t start, uint64_t end,
                            bstack_slice_t *out)
 {
