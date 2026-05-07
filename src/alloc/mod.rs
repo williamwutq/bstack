@@ -370,20 +370,17 @@ impl<'a, A: BStackAllocator> BStackSlice<'a, A> {
 
     /// Read a sub-range `[start, end)` relative to this slice into a newly
     /// allocated `Vec<u8>`.
-    /// 
+    ///
     /// `start` and `end` are relative to `self.start()`, not the payload start.
-    /// 
+    ///
     /// # Errors
-    /// 
+    ///
     /// Returns an error if `start > end` or if `end` exceeds `self.len()`.
     pub fn read_range(&self, start: u64, end: u64) -> io::Result<Vec<u8>> {
         if end > self.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!(
-                    "range [{start}, {end}) exceeds slice length {}",
-                    self.len()
-                ),
+                format!("range [{start}, {end}) exceeds slice length {}", self.len()),
             ));
         }
         self.stack().get(self.start() + start, self.start() + end)
