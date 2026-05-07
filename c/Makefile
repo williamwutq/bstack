@@ -42,12 +42,16 @@ OBJ_ALLOC_SET = bstack_alloc-set.o
 TEST_FF_BIN = test_first_fit$(EXE_EXT)
 TEST_FF_OBJ = test_first_fit.o
 
+# Ghost-tree allocator test (requires BSTACK_FEATURE_SET).
+TEST_GT_BIN = test_ghost_tree$(EXE_EXT)
+TEST_GT_OBJ = test_ghost_tree.o
+
 EXAMPLE_NAMES = basic buffer_reuse journal reading vec_store
 EXAMPLE_BINS  = $(addprefix ../examples/,$(addsuffix $(EXE_EXT),$(EXAMPLE_NAMES)))
 HASHMAP_BIN   = ../examples/hashmap$(EXE_EXT)
 ATOMIC_BIN    = ../examples/atomic_ops$(EXE_EXT)
 
-.PHONY: all test test-set test-atomic test-set-atomic test-first-fit leaks clean alloc \
+.PHONY: all test test-set test-atomic test-set-atomic test-first-fit test-ghost-tree leaks clean alloc \
         example example-basic example-buffer_reuse example-journal \
         example-reading example-vec_store example-hashmap example-atomic_ops
 
@@ -109,6 +113,15 @@ $(TEST_FF_BIN): $(TEST_FF_OBJ) $(LIB_ALLOC_SET)
 
 test-first-fit: $(TEST_FF_BIN)
 	$(RUN)$(TEST_FF_BIN)
+
+$(TEST_GT_OBJ): test_ghost_tree.c bstack_alloc.h bstack.h
+	$(CC) $(CFLAGS) -DBSTACK_FEATURE_SET -c -o $@ $<
+
+$(TEST_GT_BIN): $(TEST_GT_OBJ) $(LIB_ALLOC_SET)
+	$(CC) $(CFLAGS) -DBSTACK_FEATURE_SET -o $@ $< -L. -lbstack-alloc-set -lpthread
+
+test-ghost-tree: $(TEST_GT_BIN)
+	$(RUN)$(TEST_GT_BIN)
 
 # Run tests with the set feature enabled.
 test-set: $(LIB_SET)
@@ -201,4 +214,5 @@ clean:
 	      $(OBJ_ATOMIC) $(LIB_ATOMIC) $(OBJ_SET_ATOMIC) $(LIB_SET_ATOMIC) \
 	      $(OBJ_ALLOC) $(OBJ_ALLOC_SET) $(LIB_ALLOC) $(LIB_ALLOC_SET) \
 	      $(TEST_FF_OBJ) $(TEST_FF_BIN) \
+	      $(TEST_GT_OBJ) $(TEST_GT_BIN) \
 	      $(EXAMPLE_BINS) $(HASHMAP_BIN) $(ATOMIC_BIN)

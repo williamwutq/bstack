@@ -388,6 +388,53 @@ void first_fit_bstack_allocator_free(first_fit_bstack_allocator_t *alloc);
  * The returned bstack_t * must eventually be passed to bstack_close.
  */
 bstack_t *first_fit_bstack_allocator_into_stack(first_fit_bstack_allocator_t *alloc);
+
+/* =========================================================================
+ * ghost_tree_bstack_allocator_t — best-fit AVL tree allocator
+ *
+ * Manages a persistent heap using an AVL tree of free blocks keyed on
+ * (size, address).  Free blocks store a 32-byte AVL node inline at offset 0;
+ * live allocations carry zero overhead.  All memory is kept zeroed.
+ *
+ * On-disk layout (all within the bstack payload):
+ *   [0..32)  — reserved (user area)
+ *   [32..40) — magic: "ALGT\x00\x01\x00\x00"
+ *   [40..48) — AVL root pointer (8 B LE) — absolute payload offset of root
+ *   [48..)   — block arena (32-byte aligned)
+ *
+ * All allocations are aligned to 32 bytes; minimum block size is 32 bytes.
+ * No crash-recovery log: on open, adjacent free blocks are coalesced and the
+ * tree is rebuilt optimally balanced.
+ * ====================================================================== */
+
+typedef struct {
+    bstack_allocator_t base; /* must be first — safe cast to bstack_allocator_t * */
+    bstack_t          *bs;
+} ghost_tree_bstack_allocator_t;
+
+/*
+ * Open or initialise a ghost_tree_bstack_allocator_t over bs.
+ *
+ * - Empty stack: writes the 48-byte allocator header and returns ready.
+ * - Payload < 48 bytes: returns NULL (errno = EINVAL).
+ * - Non-empty, misaligned tail: pads to the next 32-byte boundary.
+ * - Non-empty: validates the ALGT magic prefix, then coalesces adjacent free
+ *   blocks and rebuilds a balanced AVL tree before returning.
+ *
+ * Returns NULL on failure (errno set).
+ */
+ghost_tree_bstack_allocator_t *ghost_tree_bstack_allocator_new(bstack_t *bs);
+
+/*
+ * Free the allocator wrapper without closing the underlying bstack.
+ */
+void ghost_tree_bstack_allocator_free(ghost_tree_bstack_allocator_t *alloc);
+
+/*
+ * Consume the allocator: free the wrapper and return the underlying bstack.
+ * The returned bstack_t * must eventually be passed to bstack_close.
+ */
+bstack_t *ghost_tree_bstack_allocator_into_stack(ghost_tree_bstack_allocator_t *alloc);
 #endif /* BSTACK_FEATURE_SET */
 
 #ifdef __cplusplus
