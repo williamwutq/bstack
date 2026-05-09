@@ -1184,7 +1184,10 @@ pub trait BStackBulkAllocator: BStackAllocator {
     /// # Errors
     ///
     /// Propagates any [`io::Error`] from the underlying operation.
-    fn alloc_bulk(&self, lengths: impl AsRef<[u64]>) -> Result<Vec<Self::Allocated<'_>>, Self::Error>;
+    fn alloc_bulk(
+        &self,
+        lengths: impl AsRef<[u64]>,
+    ) -> Result<Vec<Self::Allocated<'_>>, Self::Error>;
 
     /// Deallocate multiple handles in a single atomic operation.
     ///
@@ -1201,7 +1204,10 @@ pub trait BStackBulkAllocator: BStackAllocator {
     /// # Errors
     ///
     /// Returns `Self::Error` on failure.
-    fn dealloc_bulk<'a>(&'a self, handles: impl AsRef<[Self::Allocated<'a>]>) -> Result<(), Self::Error>;
+    fn dealloc_bulk<'a>(
+        &'a self,
+        handles: impl AsRef<[Self::Allocated<'a>]>,
+    ) -> Result<(), Self::Error>;
 }
 
 #[cfg(feature = "set")]

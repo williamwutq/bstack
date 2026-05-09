@@ -130,7 +130,10 @@ impl BStackBulkAllocator for LinearBStackAllocator {
     /// The total byte count is computed first; if it overflows `u64` the call
     /// returns [`io::ErrorKind::InvalidInput`] without modifying the file.
     /// Otherwise one `extend` (and one durable sync) covers all allocations.
-    fn alloc_bulk(&self, lengths: impl AsRef<[u64]>) -> Result<Vec<Self::Allocated<'_>>, Self::Error> {
+    fn alloc_bulk(
+        &self,
+        lengths: impl AsRef<[u64]>,
+    ) -> Result<Vec<Self::Allocated<'_>>, Self::Error> {
         let lengths = lengths.as_ref();
         if lengths.is_empty() {
             return Ok(Vec::new());
@@ -162,7 +165,10 @@ impl BStackBulkAllocator for LinearBStackAllocator {
     /// that are separated from the tail by slices not included in `slices`)
     /// are silently ignored, matching the single-item
     /// [`dealloc`](BStackAllocator::dealloc) semantics.
-    fn dealloc_bulk<'a>(&'a self, slices: impl AsRef<[Self::Allocated<'a>]>) -> Result<(), Self::Error> {
+    fn dealloc_bulk<'a>(
+        &'a self,
+        slices: impl AsRef<[Self::Allocated<'a>]>,
+    ) -> Result<(), Self::Error> {
         let slices = slices.as_ref();
         if slices.is_empty() {
             return Ok(());

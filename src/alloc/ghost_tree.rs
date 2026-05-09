@@ -741,7 +741,10 @@ impl BStackBulkAllocator for GhostTreeBstackAllocator {
     ///
     /// One block allocation (one AVL remove or one `extend`) — crash-safe by
     /// construction.
-    fn alloc_bulk(&self, lengths: impl AsRef<[u64]>) -> Result<Vec<Self::Allocated<'_>>, Self::Error> {
+    fn alloc_bulk(
+        &self,
+        lengths: impl AsRef<[u64]>,
+    ) -> Result<Vec<Self::Allocated<'_>>, Self::Error> {
         let lengths = lengths.as_ref();
         if lengths.is_empty() {
             return Ok(Vec::new());
@@ -801,7 +804,10 @@ impl BStackBulkAllocator for GhostTreeBstackAllocator {
     /// are immediately contiguous) are merged into a single free block.  This
     /// means a set of slices returned by [`alloc_bulk`](Self::alloc_bulk) is
     /// freed in a single operation when given back together.
-    fn dealloc_bulk<'a>(&'a self, slices: impl AsRef<[Self::Allocated<'a>]>) -> Result<(), Self::Error> {
+    fn dealloc_bulk<'a>(
+        &'a self,
+        slices: impl AsRef<[Self::Allocated<'a>]>,
+    ) -> Result<(), Self::Error> {
         let slices = slices.as_ref();
 
         // Collect, validate, and convert to (ptr, aligned_size) pairs.
