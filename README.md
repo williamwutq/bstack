@@ -502,7 +502,7 @@ within its payload.  Implementors must provide:
 ```rust
 pub trait BStackAllocator: Sized {
     // All allocators in this library set Error = io::Error.
-    type Error;
+    type Error: fmt::Debug + fmt::Display;
 
     fn stack(&self) -> &BStack;
     fn into_stack(self) -> BStack;

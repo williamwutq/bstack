@@ -1028,19 +1028,25 @@ impl<'a, A: BStackAllocator> PartialOrd<BStackSliceReader<'a, A>> for BStackSlic
 /// allocators that can batch multiple operations into a single I/O call.
 pub trait BStackAllocator: Sized {
     /// The error type returned by [`alloc`](Self::alloc),
-    /// [`realloc`](Self::realloc), and [`dealloc`](Self::dealloc).
+    /// [`realloc`](Self::realloc), [`dealloc`](Self::dealloc),
+    /// [`alloc_bulk`](BStackBulkAllocator::alloc_bulk), and
+    /// [`dealloc_bulk`](BStackBulkAllocator::dealloc_bulk).
+    ///
+    /// Must implement [`fmt::Debug`] and [`fmt::Display`] so that errors can be
+    /// printed and propagated with `?`.
     ///
     /// All allocators provided by this library set `Error = `[`io::Error`].
     /// Third-party implementations may use a richer type, but are encouraged
     /// to follow the same convention for interoperability.
-    type Error;
+    type Error: fmt::Debug + fmt::Display;
 
     /// The handle type returned by [`alloc`](Self::alloc) and
     /// [`realloc`](Self::realloc), and accepted by [`realloc`](Self::realloc)
     /// and [`dealloc`](Self::dealloc).
     ///
     /// Must be `Copy` (cheap to pass by value) and convertible to
-    /// [`BStackSlice`] via [`TryInto`] for generic I/O use.
+    /// [`BStackSlice`] via [`TryInto`] for generic I/O use.  The conversion
+    /// error must implement [`fmt::Debug`] and [`fmt::Display`].
     ///
     /// Simple allocators set `type Allocated<'a> = BStackSlice<'a, Self>`.
     /// Richer allocators may embed additional metadata in a newtype whose
@@ -1050,7 +1056,7 @@ pub trait BStackAllocator: Sized {
     /// which have blanket implementations by rust since `impl<T, U> TryInto<U>
     /// for T where T: Into<U>` and `impl<T, U> Into<U> for T` are provided
     /// by the standard library.
-    type Allocated<'a>: Copy + TryInto<BStackSlice<'a, Self>>
+    type Allocated<'a>: Copy + TryInto<BStackSlice<'a, Self>, Error: fmt::Debug + fmt::Display>
     where
         Self: 'a;
 
