@@ -3,10 +3,9 @@
 mod alloc_fuzz_tests {
     use crate::BStack;
     use crate::alloc::{
-        BStackAllocator, BStackSlice, FirstFitBStackAllocator, GhostTreeBstackAllocator,
+        BStackSlice, BStackSliceAllocator, FirstFitBStackAllocator, GhostTreeBstackAllocator,
     };
     use rand::RngExt;
-    use std::io;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     const FUZZ_COUNT: usize = 10000;
@@ -47,13 +46,13 @@ mod alloc_fuzz_tests {
         }
     }
 
-    fn write_id<A: BStackAllocator>(s: &BStackSlice<'_, A>, id: u64) {
+    fn write_id<A: BStackSliceAllocator>(s: &BStackSlice<'_, A>, id: u64) {
         let mut buf = vec![0u8; s.len() as usize];
         fill(&mut buf, id);
         s.write(&buf).unwrap();
     }
 
-    fn verify_id<A: BStackAllocator>(s: &BStackSlice<'_, A>, id: u64, ctx: &str) {
+    fn verify_id<A: BStackSliceAllocator>(s: &BStackSlice<'_, A>, id: u64, ctx: &str) {
         check(&s.read().unwrap(), id, ctx);
     }
 
@@ -61,8 +60,7 @@ mod alloc_fuzz_tests {
 
     fn run_alloc_dealloc<A, F>(make: F)
     where
-        A: BStackAllocator<Error = io::Error>,
-        for<'a> A: BStackAllocator<Allocated<'a> = BStackSlice<'a, A>>,
+        A: BStackSliceAllocator,
         F: Fn(BStack) -> std::io::Result<A>,
     {
         let path = temp_path("ad");
@@ -90,8 +88,7 @@ mod alloc_fuzz_tests {
 
     fn run_alloc_realloc_dealloc<A, F>(make: F)
     where
-        A: BStackAllocator<Error = io::Error>,
-        for<'a> A: BStackAllocator<Allocated<'a> = BStackSlice<'a, A>>,
+        A: BStackSliceAllocator,
         F: Fn(BStack) -> std::io::Result<A>,
     {
         let path = temp_path("ard");
@@ -134,8 +131,7 @@ mod alloc_fuzz_tests {
 
     fn run_reopen<A, F>(make: F)
     where
-        A: BStackAllocator<Error = io::Error>,
-        for<'a> A: BStackAllocator<Allocated<'a> = BStackSlice<'a, A>>,
+        A: BStackSliceAllocator,
         F: Fn(BStack) -> std::io::Result<A>,
     {
         #[derive(Clone, Copy)]

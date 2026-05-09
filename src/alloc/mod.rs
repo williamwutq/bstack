@@ -1210,6 +1210,39 @@ pub trait BStackBulkAllocator: BStackAllocator {
     ) -> Result<(), Self::Error>;
 }
 
+/// Convenience supertrait for the common case of a [`BStackAllocator`] whose
+/// handle type is [`BStackSlice`] and whose error type is [`io::Error`].
+///
+/// Requires `'static` because the `for<'a>` higher-ranked bound implies the
+/// allocator must outlive any borrow of its own slices (equivalent to
+/// `Self: 'static`).  All allocators provided by this library own their data
+/// and satisfy this bound automatically.
+///
+/// Generic code that does not need custom handle or error types can use
+/// `A: BStackSliceAllocator` as a compact replacement for the three-part bound:
+///
+/// ```rust,ignore
+/// // Verbose form:
+/// A: 'static + BStackAllocator<Error = io::Error>,
+/// for<'a> A: BStackAllocator<Allocated<'a> = BStackSlice<'a, A>>,
+///
+/// // Compact form:
+/// A: BStackSliceAllocator,
+/// ```
+pub trait BStackSliceAllocator:
+    'static
+    + BStackAllocator<Error = io::Error>
+    + for<'a> BStackAllocator<Allocated<'a> = BStackSlice<'a, Self>>
+{
+}
+
+impl<A: 'static> BStackSliceAllocator for A
+where
+    A: BStackAllocator<Error = io::Error>,
+    for<'a> A: BStackAllocator<Allocated<'a> = BStackSlice<'a, A>>,
+{
+}
+
 #[cfg(feature = "set")]
 pub mod first_fit;
 #[cfg(feature = "set")]
