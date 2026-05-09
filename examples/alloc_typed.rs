@@ -75,7 +75,7 @@ fn insert(alloc: &FirstFitBStackAllocator, record: &Record) -> io::Result<[u8; 1
 /// Read the record pointed to by `token`.
 #[cfg(all(feature = "alloc", feature = "set"))]
 fn read(alloc: &FirstFitBStackAllocator, token: &[u8; 16]) -> io::Result<Record> {
-    let slice = BStackSlice::from_bytes(alloc, *token);
+    let slice = unsafe { BStackSlice::from_bytes(alloc, *token) };
     let buf = slice.read()?;
     Ok(Record::from_bytes(&buf))
 }
@@ -83,14 +83,14 @@ fn read(alloc: &FirstFitBStackAllocator, token: &[u8; 16]) -> io::Result<Record>
 /// Overwrite the record pointed to by `token` with new data.
 #[cfg(all(feature = "alloc", feature = "set"))]
 fn update(alloc: &FirstFitBStackAllocator, token: &[u8; 16], record: &Record) -> io::Result<()> {
-    let slice = BStackSlice::from_bytes(alloc, *token);
+    let slice = unsafe { BStackSlice::from_bytes(alloc, *token) };
     slice.write(&record.to_bytes())
 }
 
 /// Free the record pointed to by `token`.
 #[cfg(all(feature = "alloc", feature = "set"))]
 fn delete(alloc: &FirstFitBStackAllocator, token: &[u8; 16]) -> io::Result<()> {
-    let slice = BStackSlice::from_bytes(alloc, *token);
+    let slice = unsafe { BStackSlice::from_bytes(alloc, *token) };
     alloc.dealloc(slice)
 }
 
@@ -165,7 +165,7 @@ fn main() -> io::Result<()> {
         println!(
             "new alloc at offset {} (deleted key=0 was at offset {})",
             new_slot.start(),
-            BStackSlice::from_bytes(&alloc, tokens[0]).start(),
+            unsafe { BStackSlice::from_bytes(&alloc, tokens[0]) }.start(),
         );
 
         let _ = new_slot;

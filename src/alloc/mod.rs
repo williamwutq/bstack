@@ -253,10 +253,13 @@ impl<'a, A: BStackAllocator> BStackSlice<'a, A> {
     /// Reconstruct a `BStackSlice` from a 16-byte array produced by
     /// [`BStackSlice::to_bytes`].
     ///
-    /// Does not validate that the encoded range lies within the payload.
-    /// Invalid slices produce errors on the first I/O call.
+    /// # Safety
+    ///
+    /// The caller must ensure that `bytes` encodes a valid offset and length
+    /// that lie within the bounds of the underlying allocator's payload.
+    /// Passing an arbitrary or corrupted byte array is undefined behaviour.
     #[inline]
-    pub fn from_bytes(allocator: &'a A, bytes: [u8; 16]) -> Self {
+    pub unsafe fn from_bytes(allocator: &'a A, bytes: [u8; 16]) -> Self {
         let offset = u64::from_le_bytes(bytes[..8].try_into().unwrap());
         let len = u64::from_le_bytes(bytes[8..].try_into().unwrap());
         Self {
