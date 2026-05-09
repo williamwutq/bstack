@@ -296,7 +296,7 @@ and run concurrently with each other and with `peek`/`get` calls.
 | `PartialEq` / `Eq`               | Compares `(offset, len)`. The allocator reference is **not** compared.                                  |
 | `Hash`                           | Hashes `(offset, len)`.                                                                                 |
 | `PartialOrd` / `Ord`             | Ordered by `offset`, then `len`.                                                                        |
-| `From<BStackSlice> for [u8; 16]` | Serialises to `[offset_le8 ‖ len_le8]` for on-disk storage. Reconstruct with `BStackSlice::from_bytes`. |
+| `From<BStackSlice> for [u8; 16]` | Serialises to `[offset_le8 ‖ len_le8]` for on-disk storage. Reconstruct with `unsafe { BStackSlice::from_bytes(...) }` — caller must ensure the bytes encode a valid range within the payload. |
 
 ### `BStackSliceReader` and `BStackSliceWriter` (`alloc` / `alloc + set` features)
 
@@ -501,14 +501,17 @@ within its payload.  Implementors must provide:
 
 ```rust
 pub trait BStackAllocator: Sized {
+    // All allocators in this library set Error = io::Error.
+    type Error;
+
     fn stack(&self) -> &BStack;
     fn into_stack(self) -> BStack;
-    fn alloc(&self, len: u64) -> io::Result<BStackSlice<'_, Self>>;
+    fn alloc(&self, len: u64) -> Result<BStackSlice<'_, Self>, Self::Error>;
     fn realloc<'a>(&'a self, slice: BStackSlice<'a, Self>, new_len: u64)
-        -> io::Result<BStackSlice<'a, Self>>;
+        -> Result<BStackSlice<'a, Self>, Self::Error>;
 
     // Default no-op; override for free-list allocators:
-    fn dealloc(&self, slice: BStackSlice<'_, Self>) -> io::Result<()> { Ok(()) }
+    fn dealloc(&self, slice: BStackSlice<'_, Self>) -> Result<(), Self::Error> { Ok(()) }
 
     // Delegation helpers:
     fn len(&self) -> io::Result<u64>;
