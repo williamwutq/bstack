@@ -61,6 +61,7 @@ mod alloc_fuzz_tests {
     fn run_alloc_dealloc<A, F>(make: F)
     where
         A: BStackAllocator,
+        A::Error: std::fmt::Debug,
         F: Fn(BStack) -> std::io::Result<A>,
     {
         let path = temp_path("ad");
@@ -89,6 +90,7 @@ mod alloc_fuzz_tests {
     fn run_alloc_realloc_dealloc<A, F>(make: F)
     where
         A: BStackAllocator,
+        A::Error: std::fmt::Debug,
         F: Fn(BStack) -> std::io::Result<A>,
     {
         let path = temp_path("ard");
@@ -132,6 +134,7 @@ mod alloc_fuzz_tests {
     fn run_reopen<A, F>(make: F)
     where
         A: BStackAllocator,
+        A::Error: std::fmt::Debug,
         F: Fn(BStack) -> std::io::Result<A>,
     {
         #[derive(Clone, Copy)]

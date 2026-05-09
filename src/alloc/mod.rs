@@ -1027,6 +1027,14 @@ impl<'a, A: BStackAllocator> PartialOrd<BStackSliceReader<'a, A>> for BStackSlic
 /// [`dealloc_bulk`](BStackBulkAllocator::dealloc_bulk) methods for
 /// allocators that can batch multiple operations into a single I/O call.
 pub trait BStackAllocator: Sized {
+    /// The error type returned by [`alloc`](Self::alloc),
+    /// [`realloc`](Self::realloc), and [`dealloc`](Self::dealloc).
+    ///
+    /// All allocators provided by this library set `Error = `[`io::Error`].
+    /// Third-party implementations may use a richer type, but are encouraged
+    /// to follow the same convention for interoperability.
+    type Error;
+
     /// Return a shared reference to the underlying [`BStack`].
     ///
     /// Note: `Bstack` does not require mutability for any of its operations,
@@ -1049,8 +1057,8 @@ pub trait BStackAllocator: Sized {
     ///
     /// # Errors
     ///
-    /// Propagates any [`io::Error`] from underlying operations.
-    fn alloc(&self, len: u64) -> io::Result<BStackSlice<'_, Self>>;
+    /// Returns `Self::Error` on failure.
+    fn alloc(&self, len: u64) -> Result<BStackSlice<'_, Self>, Self::Error>;
 
     /// Resize `slice` to `new_len` bytes.
     ///
@@ -1069,13 +1077,13 @@ pub trait BStackAllocator: Sized {
     ///
     /// # Errors
     ///
-    /// Propagates any [`io::Error`] from underlying operations, including
-    /// `Unsupported` if the implementation does not support reallocation.
+    /// Returns `Self::Error` on failure, including when the implementation does
+    /// not support reallocation.
     fn realloc<'a>(
         &'a self,
         slice: BStackSlice<'a, Self>,
         new_len: u64,
-    ) -> io::Result<BStackSlice<'a, Self>>;
+    ) -> Result<BStackSlice<'a, Self>, Self::Error>;
 
     /// Release the region described by `slice`.
     ///
@@ -1096,9 +1104,9 @@ pub trait BStackAllocator: Sized {
     ///
     /// # Errors
     ///
-    /// The default never errors.  Overriding implementations may propagate
-    /// errors from underlying operations.
-    fn dealloc(&self, _slice: BStackSlice<'_, Self>) -> io::Result<()> {
+    /// The default never errors.  Overriding implementations may return
+    /// `Self::Error` from underlying operations.
+    fn dealloc(&self, _slice: BStackSlice<'_, Self>) -> Result<(), Self::Error> {
         Ok(())
     }
 

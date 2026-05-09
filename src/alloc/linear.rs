@@ -74,6 +74,8 @@ impl From<LinearBStackAllocator> for BStack {
 }
 
 impl BStackAllocator for LinearBStackAllocator {
+    type Error = io::Error;
+
     fn stack(&self) -> &BStack {
         &self.stack
     }

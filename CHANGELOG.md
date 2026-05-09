@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **`BStackSlice::from_bytes` is now `unsafe`** (`alloc` feature): The method signature has changed to `pub unsafe fn from_bytes(allocator: &'a A, bytes: [u8; 16]) -> Self`. Callers must ensure the encoded offset and length lie within the bounds of the underlying allocator's payload. Each existing call site must be wrapped in an `unsafe` block.
+- **`BStackAllocator` gains an associated error type** (`alloc` feature): The trait now requires `type Error;`, and `alloc`, `realloc`, and `dealloc` return `Result<_, Self::Error>` instead of `io::Result<_>`. All allocators provided by this library (`LinearBStackAllocator`, `FirstFitBStackAllocator`, `GhostTreeBstackAllocator`) set `type Error = io::Error`, preserving existing behaviour. Third-party `impl BStackAllocator` blocks must add `type Error = io::Error;` (or a custom error type) to compile.
 
 ## [0.1.9] - 2026-05-07
 

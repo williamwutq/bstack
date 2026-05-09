@@ -558,6 +558,8 @@ impl GhostTreeBstackAllocator {
 }
 
 impl BStackAllocator for GhostTreeBstackAllocator {
+    type Error = io::Error;
+
     fn stack(&self) -> &BStack {
         &self.stack
     }
