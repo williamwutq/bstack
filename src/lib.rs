@@ -340,12 +340,10 @@ pub use alloc::{
 #[cfg(all(feature = "alloc", feature = "set"))]
 pub use alloc::{BStackSliceWriter, FirstFitBStackAllocator, GhostTreeBstackAllocator};
 
-#[cfg(feature = "guarded")]
-mod slices;
 #[cfg(all(feature = "guarded", feature = "atomic"))]
-pub use slices::{BStackAtomicGuardedSlice, BStackAtomicGuardedSliceSubview};
+pub use alloc::{BStackAtomicGuardedSlice, BStackAtomicGuardedSliceSubview};
 #[cfg(feature = "guarded")]
-pub use slices::{BStackGuardedSlice, BStackGuardedSliceSubview};
+pub use alloc::{BStackGuardedSlice, BStackGuardedSliceSubview};
 
 use std::fmt;
 use std::fs::{File, OpenOptions};

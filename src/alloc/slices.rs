@@ -16,7 +16,7 @@
 //! [`as_slice`]: BStackGuardedSlice::as_slice
 //! [`raw_block`]: BStackGuardedSlice::raw_block
 
-use crate::{BStackAllocator, BStackSlice};
+use super::{BStackAllocator, BStackSlice};
 use std::{borrow::Cow, io};
 
 /// A [`BStackSlice`] abstraction with lifecycle hooks for transparent I/O
