@@ -1178,15 +1178,15 @@ pub trait BStackBulkAllocator: BStackAllocator {
     /// # Errors
     ///
     /// Propagates any [`io::Error`] from the underlying operation.
-    fn alloc_bulk(&self, lengths: impl AsRef<[u64]>) -> io::Result<Vec<BStackSlice<'_, Self>>>;
+    fn alloc_bulk(&self, lengths: impl AsRef<[u64]>) -> Result<Vec<Self::Allocated<'_>>, Self::Error>;
 
-    /// Deallocate multiple slices in a single atomic operation.
+    /// Deallocate multiple handles in a single atomic operation.
     ///
-    /// Slices may be supplied in any order.  An empty slice is a valid no-op.
+    /// Handles may be supplied in any order.  An empty slice is a valid no-op.
     ///
     /// # Atomicity
     ///
-    /// Either all eligible slices are reclaimed and the backing store is
+    /// Either all eligible handles are reclaimed and the backing store is
     /// updated, or the backing store is left completely unchanged and an error
     /// is returned. During a crash in the middle of the underlying operation,
     /// the backing store may be partially updated but must remain internally
@@ -1194,8 +1194,8 @@ pub trait BStackBulkAllocator: BStackAllocator {
     ///
     /// # Errors
     ///
-    /// Propagates any [`io::Error`] from the underlying operation.
-    fn dealloc_bulk<'a>(&'a self, slices: impl AsRef<[BStackSlice<'a, Self>]>) -> io::Result<()>;
+    /// Returns `Self::Error` on failure.
+    fn dealloc_bulk<'a>(&'a self, handles: impl AsRef<[Self::Allocated<'a>]>) -> Result<(), Self::Error>;
 }
 
 #[cfg(feature = "set")]
