@@ -1035,6 +1035,25 @@ pub trait BStackAllocator: Sized {
     /// to follow the same convention for interoperability.
     type Error;
 
+    /// The handle type returned by [`alloc`](Self::alloc) and
+    /// [`realloc`](Self::realloc), and accepted by [`realloc`](Self::realloc)
+    /// and [`dealloc`](Self::dealloc).
+    ///
+    /// Must be `Copy` (cheap to pass by value) and convertible to
+    /// [`BStackSlice`] via [`TryInto`] for generic I/O use.
+    ///
+    /// Simple allocators set `type Allocated<'a> = BStackSlice<'a, Self>`.
+    /// Richer allocators may embed additional metadata in a newtype whose
+    /// [`TryInto`] implementation is always infallible.
+    ///
+    /// All allocators provided by this library set `type Allocated<'a> = BStackSlice<'a, Self>`,
+    /// which have blanket implementations by rust since `impl<T, U> TryInto<U>
+    /// for T where T: Into<U>` and `impl<T, U> Into<U> for T` are provided
+    /// by the standard library.
+    type Allocated<'a>: Copy + TryInto<BStackSlice<'a, Self>>
+    where
+        Self: 'a;
+
     /// Return a shared reference to the underlying [`BStack`].
     ///
     /// Note: `Bstack` does not require mutability for any of its operations,
@@ -1058,17 +1077,17 @@ pub trait BStackAllocator: Sized {
     /// # Errors
     ///
     /// Returns `Self::Error` on failure.
-    fn alloc(&self, len: u64) -> Result<BStackSlice<'_, Self>, Self::Error>;
+    fn alloc(&self, len: u64) -> Result<Self::Allocated<'_>, Self::Error>;
 
-    /// Resize `slice` to `new_len` bytes.
+    /// Resize the region described by `handle` to `new_len` bytes.
     ///
-    /// Returns a (possibly different) [`BStackSlice`] for the resized region.
-    /// The lifetime `'a` ties the returned slice to the same borrow as the
-    /// input slice and the allocator.
+    /// Returns a (possibly different) handle covering the resized region.
+    /// The lifetime `'a` ties the returned handle to the same borrow as the
+    /// input handle and the allocator.
     ///
     /// # Slice origin requirement
     ///
-    /// `slice` **must** be a handle that was returned directly by [`alloc`](Self::alloc)
+    /// `handle` **must** have been returned directly by [`alloc`](Self::alloc)
     /// or by a prior call to [`realloc`](Self::realloc) on this same allocator
     /// instance.  Passing an arbitrary sub-slice obtained via
     /// [`BStackSlice::subslice`], [`BStackSlice::subslice_range`], or a
@@ -1081,21 +1100,21 @@ pub trait BStackAllocator: Sized {
     /// not support reallocation.
     fn realloc<'a>(
         &'a self,
-        slice: BStackSlice<'a, Self>,
+        handle: Self::Allocated<'a>,
         new_len: u64,
-    ) -> Result<BStackSlice<'a, Self>, Self::Error>;
+    ) -> Result<Self::Allocated<'a>, Self::Error>;
 
-    /// Release the region described by `slice`.
+    /// Release the region described by `handle`.
     ///
     /// The default implementation is a **no-op**.  Simple bump allocators
     /// accept this default; allocators with free-list tracking should override
     /// it.
     ///
-    /// After calling `dealloc`, `slice` must not be used for further I/O.
+    /// After calling `dealloc`, `handle` must not be used for further I/O.
     ///
     /// # Slice origin requirement
     ///
-    /// `slice` **must** be a handle that was returned directly by [`alloc`](Self::alloc)
+    /// `handle` **must** have been returned directly by [`alloc`](Self::alloc)
     /// or by [`realloc`](Self::realloc) on this same allocator instance.
     /// Passing an arbitrary sub-slice obtained via [`BStackSlice::subslice`],
     /// [`BStackSlice::subslice_range`], or a manually constructed
@@ -1106,7 +1125,7 @@ pub trait BStackAllocator: Sized {
     ///
     /// The default never errors.  Overriding implementations may return
     /// `Self::Error` from underlying operations.
-    fn dealloc(&self, _slice: BStackSlice<'_, Self>) -> Result<(), Self::Error> {
+    fn dealloc(&self, _handle: Self::Allocated<'_>) -> Result<(), Self::Error> {
         Ok(())
     }
 

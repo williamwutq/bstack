@@ -686,6 +686,7 @@ impl FirstFitBStackAllocator {
 #[cfg(feature = "set")]
 impl BStackAllocator for FirstFitBStackAllocator {
     type Error = io::Error;
+    type Allocated<'a> = BStackSlice<'a, Self>;
 
     fn stack(&self) -> &BStack {
         &self.stack
