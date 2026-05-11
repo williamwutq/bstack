@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`ManualAllocator`** (`alloc` feature): A singleton allocator with no backing [`BStack`]. `alloc` and `realloc` always return `Err(Unsupported)`; `dealloc` is a no-op. Intended for code that wants the `BStackSlice` type as a typed `(offset, len)` coordinate — serialised, compared, stored — while managing positions on the [`BStack`] directly rather than through an allocator. Obtain via `ManualAllocator::get()` (direct construction is prevented). Calling `stack()` or `into_stack()` panics; calling `read`/`write` on slices backed by this allocator will also panic. Implements `BStackSliceAllocator` and benefits from the same migration path.
 - **`BStackSliceAllocator` convenience supertrait** (`alloc` feature): A supertrait that bundles `BStackAllocator<Error = io::Error>` and `for<'a> BStackAllocator<Allocated<'a> = BStackSlice<'a, Self>>` into a single bound, covering the common case where no custom handle or error type is needed. All allocators provided by this library implement it automatically via a blanket `impl`. Requires `'static` (implied by the `for<'a>` HRTB) — all provided allocators satisfy this. **Migration:** replacing `A: BStackAllocator` with `A: BStackSliceAllocator` in generic bounds is sufficient to satisfy all of the breaking `BStackAllocator` changes above in one step.
 
 ## [0.1.9] - 2026-05-07
