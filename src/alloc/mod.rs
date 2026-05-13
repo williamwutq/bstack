@@ -275,8 +275,7 @@ impl<'a, A: BStackAllocator> BStackSlice<'a, A> {
     ///   instance**.  Passing an arbitrary offset or a sub-slice derived via
     ///   [`subslice`](BStackSlice::subslice) /
     ///   [`subslice_range`](BStackSlice::subslice_range) may silently corrupt
-    ///   the allocator's persistent metadata (free-list pointers, AVL node
-    ///   fields, block headers/footers) in a way that is difficult or
+    ///   the allocator's persistent metadata in a way that is difficult or
     ///   impossible to recover from.
     #[inline]
     pub unsafe fn from_raw_parts(allocator: &'a A, offset: u64, len: u64) -> Self {

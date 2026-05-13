@@ -153,7 +153,7 @@ mod alloc_fuzz_tests {
             let alloc = make(BStack::open(&path).unwrap()).unwrap();
 
             for (i, &rec) in live.iter().enumerate() {
-                let s = BStackSlice::new(&alloc, rec.start, rec.len);
+                let s = unsafe { BStackSlice::from_raw_parts(&alloc, rec.start, rec.len) };
                 check(
                     &s.read().unwrap()[..rec.len as usize],
                     rec.id,
@@ -185,7 +185,7 @@ mod alloc_fuzz_tests {
                         let i = rng.random_range(0..live.len());
                         let rec = live[i];
                         let new_len = rng.random_range(0..=512);
-                        let s = BStackSlice::new(&alloc, rec.start, rec.len);
+                        let s = unsafe { BStackSlice::from_raw_parts(&alloc, rec.start, rec.len) };
                         if let Ok(s2) = alloc.realloc(s, new_len) {
                             let overlap = rec.len.min(new_len) as usize;
                             check(
@@ -206,7 +206,7 @@ mod alloc_fuzz_tests {
                     2 => {
                         let i = rng.random_range(0..live.len());
                         let rec = live.swap_remove(i);
-                        let s = BStackSlice::new(&alloc, rec.start, rec.len);
+                        let s = unsafe { BStackSlice::from_raw_parts(&alloc, rec.start, rec.len) };
                         check(
                             &s.read().unwrap()[..rec.len as usize],
                             rec.id,
@@ -217,7 +217,7 @@ mod alloc_fuzz_tests {
                     _ => {
                         let i = rng.random_range(0..live.len());
                         let rec = live[i];
-                        let s = BStackSlice::new(&alloc, rec.start, rec.len);
+                        let s = unsafe { BStackSlice::from_raw_parts(&alloc, rec.start, rec.len) };
                         check(
                             &s.read().unwrap()[..rec.len as usize],
                             rec.id,

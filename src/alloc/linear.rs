@@ -87,7 +87,8 @@ impl BStackAllocator for LinearBStackAllocator {
 
     fn alloc(&self, len: u64) -> io::Result<BStackSlice<'_, Self>> {
         let offset = self.stack.extend(len)?;
-        Ok(BStackSlice::new(self, offset, len))
+        // SAFETY: offset and len come from a fresh allocation via self.stack.extend(len)
+        Ok(unsafe { BStackSlice::from_raw_parts(self, offset, len) })
     }
 
     fn realloc<'a>(
@@ -106,11 +107,13 @@ impl BStackAllocator for LinearBStackAllocator {
             std::cmp::Ordering::Equal => Ok(slice),
             std::cmp::Ordering::Greater => {
                 self.stack.extend(new_len - slice.len())?;
-                Ok(BStackSlice::new(self, slice.start(), new_len))
+                // SAFETY: slice was previously allocated and we're extending it in place at the tail
+                Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) })
             }
             std::cmp::Ordering::Less => {
                 self.stack.discard(slice.len() - new_len)?;
-                Ok(BStackSlice::new(self, slice.start(), new_len))
+                // SAFETY: slice was previously allocated and we're shrinking it in place
+                Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) })
             }
         }
     }
@@ -151,7 +154,8 @@ impl BStackBulkAllocator for LinearBStackAllocator {
         let mut result = Vec::with_capacity(lengths.len());
         let mut offset = base;
         for &len in lengths {
-            result.push(BStackSlice::new(self, offset, len));
+            // SAFETY: offset and len are within the bulk allocation starting at base
+            result.push(unsafe { BStackSlice::from_raw_parts(self, offset, len) });
             offset += len;
         }
         Ok(result)

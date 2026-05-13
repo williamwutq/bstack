@@ -698,7 +698,8 @@ impl BStackAllocator for FirstFitBStackAllocator {
 
     fn alloc(&self, len: u64) -> io::Result<BStackSlice<'_, Self>> {
         if len == 0 {
-            return Ok(BStackSlice::new(self, 0, 0));
+            // SAFETY: zero-length slice at offset 0 is safe
+            return Ok(unsafe { BStackSlice::from_raw_parts(self, 0, 0) });
         }
 
         // Make len aligned to 8 bytes and at least 16
@@ -732,7 +733,7 @@ impl BStackAllocator for FirstFitBStackAllocator {
             } else {
                 block_found.0
             };
-            Ok(BStackSlice::new(self, payload, len))
+            Ok(unsafe { BStackSlice::from_raw_parts(self, payload, len) })
         } else {
             // No free block fits; push the full block (header + zero payload + footer) in one call.
             let mut block_buf = vec![0u8; (aligned_len + Self::BLOCK_OVERHEAD_SIZE) as usize];
@@ -740,7 +741,8 @@ impl BStackAllocator for FirstFitBStackAllocator {
             block_buf[(aligned_len + Self::BLOCK_HEADER_SIZE) as usize..]
                 .copy_from_slice(&aligned_len.to_le_bytes());
             let ptr = self.stack.push(&block_buf)? + Self::BLOCK_HEADER_SIZE;
-            Ok(BStackSlice::new(self, ptr, len))
+            // SAFETY: ptr and len from fresh allocation via self.stack.push
+            Ok(unsafe { BStackSlice::from_raw_parts(self, ptr, len) })
         }
     }
 
@@ -785,7 +787,8 @@ impl BStackAllocator for FirstFitBStackAllocator {
         }
         if new_len == 0 {
             self.dealloc(slice)?;
-            return Ok(BStackSlice::new(self, 0, 0));
+            // SAFETY: zero-length slice at offset 0 is safe
+            return Ok(unsafe { BStackSlice::from_raw_parts(self, 0, 0) });
         }
 
         // Use the aligned block size for validation (same reason as dealloc).
@@ -811,7 +814,8 @@ impl BStackAllocator for FirstFitBStackAllocator {
                 self.stack
                     .zero(slice.start() + slice.len(), new_len - slice.len())?;
             }
-            return Ok(BStackSlice::new(self, slice.start(), new_len));
+            // SAFETY: same offset, new_len within the existing allocated block
+            return Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) });
         }
 
         // Special case for realloc of the tail block:
@@ -842,7 +846,10 @@ impl BStackAllocator for FirstFitBStackAllocator {
                         slice.start() + aligned_new_len,
                         aligned_new_len.to_le_bytes(),
                     )?;
-                    return Ok(BStackSlice::new(self, slice.start(), new_len));
+                    // SAFETY: slice extended in place at tail
+                    return Ok(unsafe {
+                        BStackSlice::from_raw_parts(self, slice.start(), new_len)
+                    });
                 }
                 std::cmp::Ordering::Less => {
                     // Write new footer before discarding so it lands at the right position
@@ -855,7 +862,10 @@ impl BStackAllocator for FirstFitBStackAllocator {
                         aligned_new_len.to_le_bytes(),
                     )?;
                     self.stack.discard(aligned_current_len - aligned_new_len)?;
-                    return Ok(BStackSlice::new(self, slice.start(), new_len));
+                    // SAFETY: slice shrunk in place at tail
+                    return Ok(unsafe {
+                        BStackSlice::from_raw_parts(self, slice.start(), new_len)
+                    });
                 }
             }
         }
@@ -876,7 +886,8 @@ impl BStackAllocator for FirstFitBStackAllocator {
                 self.stack
                     .zero(slice.start() + slice.len(), new_len - slice.len())?;
             }
-            return Ok(BStackSlice::new(self, slice.start(), new_len));
+            // SAFETY: new_len fits within existing block size
+            return Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) });
         }
 
         // Special case: next block is free and can be merged in place to accommodate the new size.
@@ -991,7 +1002,8 @@ impl BStackAllocator for FirstFitBStackAllocator {
                     self.stack.set(slice.start() + block_size, &zero_buff)?;
                 }
                 self.clear_recovery_needed()?;
-                return Ok(BStackSlice::new(self, slice.start(), new_len));
+                // SAFETY: slice resized by merging with adjacent free block
+                return Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) });
             }
         }
 
@@ -1031,7 +1043,8 @@ impl BStackAllocator for FirstFitBStackAllocator {
             };
             self.add_to_free_list(slice.start())?;
             self.clear_recovery_needed()?;
-            Ok(BStackSlice::new(self, new_payload, new_len))
+            // SAFETY: new_payload from allocated block via unlink_block
+            Ok(unsafe { BStackSlice::from_raw_parts(self, new_payload, new_len) })
         } else {
             // No free block fits; push the full new block in one call, then free the old one.
             // Copy only the user-visible bytes; the rest of `block_buf` stays zeroed.
@@ -1049,7 +1062,8 @@ impl BStackAllocator for FirstFitBStackAllocator {
             let ptr = self.stack.push(&block_buf)? + Self::BLOCK_HEADER_SIZE;
             self.add_to_free_list(slice.start())?;
             self.clear_recovery_needed()?;
-            Ok(BStackSlice::new(self, ptr, new_len))
+            // SAFETY: ptr from fresh allocation via self.stack.push
+            Ok(unsafe { BStackSlice::from_raw_parts(self, ptr, new_len) })
         }
     }
 }
