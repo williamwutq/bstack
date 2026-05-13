@@ -641,7 +641,7 @@ fn pread_exact_raw_handle(handle: isize, offset: u64, buf: &mut [u8]) -> io::Res
         let ret = unsafe {
             ReadFile(
                 handle,
-                buf[filled..].as_mut_ptr() as *mut core::ffi::c_void,
+                buf[filled..].as_mut_ptr(),
                 (len - filled) as u32,
                 &mut bytes_read,
                 &mut overlapped,
