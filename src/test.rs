@@ -3931,4 +3931,273 @@ mod atomic_tests {
         let s2 = BStack::open(&p).unwrap();
         assert_eq!(s2.peek(0).unwrap(), b"helloWORLD");
     }
+
+    // ---- lock_up_to / locked_len / open_locked_up_to -----------------------
+
+    #[test]
+    fn locked_len_is_zero_by_default() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        assert_eq!(s.locked_len(), 0);
+    }
+
+    #[test]
+    fn lock_up_to_sets_boundary() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        s.lock_up_to(5).unwrap();
+        assert_eq!(s.locked_len(), 5);
+    }
+
+    #[test]
+    fn lock_up_to_monotonic_can_grow() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"0123456789").unwrap();
+        s.lock_up_to(3).unwrap();
+        s.lock_up_to(7).unwrap();
+        assert_eq!(s.locked_len(), 7);
+    }
+
+    #[test]
+    fn lock_up_to_monotonic_cannot_shrink() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        s.lock_up_to(5).unwrap();
+        let err = s.lock_up_to(3).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(s.locked_len(), 5); // unchanged
+    }
+
+    #[test]
+    fn lock_up_to_n_equal_locked_is_idempotent() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        s.lock_up_to(5).unwrap();
+        s.lock_up_to(5).unwrap(); // same value — no error
+        assert_eq!(s.locked_len(), 5);
+    }
+
+    #[test]
+    fn lock_up_to_n_exceeds_len_returns_error() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        let err = s.lock_up_to(10).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(s.locked_len(), 0); // unchanged
+    }
+
+    #[test]
+    fn lock_up_to_zero_is_noop() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        s.lock_up_to(0).unwrap();
+        assert_eq!(s.locked_len(), 0);
+    }
+
+    #[test]
+    fn locked_region_resets_on_reopen() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+        s.push(b"helloworld").unwrap();
+        s.lock_up_to(5).unwrap();
+        assert_eq!(s.locked_len(), 5);
+        drop(s);
+
+        // On reopen the locked partition returns to 0.
+        let s2 = BStack::open(&p).unwrap();
+        assert_eq!(s2.locked_len(), 0);
+    }
+
+    #[test]
+    fn reads_in_locked_region_succeed() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        s.lock_up_to(5).unwrap();
+
+        // get
+        assert_eq!(s.get(0, 5).unwrap(), b"hello");
+        assert_eq!(s.get(1, 4).unwrap(), b"ell");
+
+        // get_into
+        let mut buf = [0u8; 5];
+        s.get_into(0, &mut buf).unwrap();
+        assert_eq!(&buf, b"hello");
+
+        // peek_into
+        let mut buf2 = [0u8; 3];
+        s.peek_into(2, &mut buf2).unwrap();
+        assert_eq!(&buf2, b"llo");
+
+        // peek (crosses the locked boundary — still works via rwlock path)
+        assert_eq!(s.peek(0).unwrap(), b"helloworld");
+    }
+
+    #[test]
+    fn pop_below_locked_returns_error() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        s.lock_up_to(5).unwrap();
+        // Popping 6 bytes would leave len=4 < locked=5.
+        let err = s.pop(6).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(s.len().unwrap(), 10); // unchanged
+    }
+
+    #[test]
+    fn pop_exactly_to_locked_boundary_is_allowed() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        s.lock_up_to(5).unwrap();
+        // Popping 5 bytes leaves len=5 == locked=5 — allowed.
+        let bytes = s.pop(5).unwrap();
+        assert_eq!(bytes, b"world");
+        assert_eq!(s.len().unwrap(), 5);
+    }
+
+    #[test]
+    fn pop_into_below_locked_returns_error() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        s.lock_up_to(5).unwrap();
+        let mut buf = [0u8; 6];
+        let err = s.pop_into(&mut buf).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn discard_below_locked_returns_error() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        s.lock_up_to(5).unwrap();
+        let err = s.discard(6).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(s.len().unwrap(), 10);
+    }
+
+    #[test]
+    fn push_after_lock_appends_past_locked_region() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        s.lock_up_to(5).unwrap();
+        let off = s.push(b"world").unwrap();
+        assert_eq!(off, 5);
+        assert_eq!(s.len().unwrap(), 10);
+        assert_eq!(s.get(0, 5).unwrap(), b"hello");
+        assert_eq!(s.get(5, 10).unwrap(), b"world");
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn set_in_locked_region_returns_error() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        s.lock_up_to(5).unwrap();
+        let err = s.set(0, b"HELLO").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        // Data unchanged
+        assert_eq!(s.get(0, 5).unwrap(), b"hello");
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn zero_in_locked_region_returns_error() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        s.lock_up_to(5).unwrap();
+        let err = s.zero(0, 3).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(s.get(0, 3).unwrap(), b"hel");
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn set_past_locked_region_succeeds() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        s.lock_up_to(5).unwrap();
+        s.set(5, b"WORLD").unwrap();
+        assert_eq!(s.get(5, 10).unwrap(), b"WORLD");
+        assert_eq!(s.get(0, 5).unwrap(), b"hello"); // locked bytes unchanged
+    }
+
+    #[test]
+    fn open_locked_up_to_opens_and_locks() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+        s.push(b"helloworld").unwrap();
+        drop(s);
+
+        let s2 = BStack::open_locked_up_to(&p, 5).unwrap();
+        assert_eq!(s2.locked_len(), 5);
+        assert_eq!(s2.len().unwrap(), 10);
+        assert_eq!(s2.get(0, 5).unwrap(), b"hello");
+        // Write into locked region is rejected.
+        assert_eq!(
+            s2.pop(6).unwrap_err().kind(),
+            ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn open_locked_up_to_n_exceeds_len_returns_error() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+        s.push(b"hello").unwrap();
+        drop(s);
+
+        let err = BStack::open_locked_up_to(&p, 10).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn atrunc_into_locked_region_returns_error() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        s.lock_up_to(5).unwrap();
+        // Removing 6 bytes would start the new tail at byte 4, inside locked.
+        let err = s.atrunc(6, b"X").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(s.len().unwrap(), 10);
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn splice_into_locked_region_returns_error() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        s.lock_up_to(5).unwrap();
+        let err = s.splice(6, b"Y").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(s.len().unwrap(), 10);
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn try_discard_below_locked_returns_error() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        s.lock_up_to(5).unwrap();
+        let err = s.try_discard(10, 6).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(s.len().unwrap(), 10);
+    }
 }
