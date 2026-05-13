@@ -30,6 +30,27 @@
 #  include <unistd.h>
 #endif
 
+/* C11 stdatomic.h or fallback to compiler intrinsics */
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L && !defined(__STDC_NO_ATOMICS__)
+#  include <stdatomic.h>
+#  define ATOMIC_UINT64_T atomic_uint_fast64_t
+#  define ATOMIC_LOAD_ACQUIRE(ptr) atomic_load_explicit((ptr), memory_order_acquire)
+#  define ATOMIC_STORE_RELEASE(ptr, val) atomic_store_explicit((ptr), (val), memory_order_release)
+#  define ATOMIC_INIT(val) ATOMIC_VAR_INIT(val)
+#elif defined(_WIN32)
+#  define ATOMIC_UINT64_T volatile LONGLONG
+#  define ATOMIC_LOAD_ACQUIRE(ptr) (uint64_t)InterlockedCompareExchange64((ptr), 0, 0)
+#  define ATOMIC_STORE_RELEASE(ptr, val) InterlockedExchange64((ptr), (LONGLONG)(val))
+#  define ATOMIC_INIT(val) (val)
+#elif defined(__GNUC__) || defined(__clang__)
+#  define ATOMIC_UINT64_T volatile uint64_t
+#  define ATOMIC_LOAD_ACQUIRE(ptr) __atomic_load_n((ptr), __ATOMIC_ACQUIRE)
+#  define ATOMIC_STORE_RELEASE(ptr, val) __atomic_store_n((ptr), (val), __ATOMIC_RELEASE)
+#  define ATOMIC_INIT(val) (val)
+#else
+#  error "No atomic support available"
+#endif
+
 /* -------------------------------------------------------------------------
  * Constants
  * ---------------------------------------------------------------------- */
@@ -59,6 +80,10 @@ struct bstack {
 #else
     pthread_rwlock_t lock;
 #endif
+    /* Monotonically growing partition boundary. Bytes in [0, locked) are
+     * immutable and can be read without the rwlock on supported platforms.
+     * Not persisted — resets to 0 on every open. */
+    ATOMIC_UINT64_T locked;
 };
 
 /* =========================================================================
@@ -380,6 +405,7 @@ bstack_t *bstack_open(const char *path)
         return NULL;
     }
     bs->fd = fd;
+    bs->locked = ATOMIC_INIT(0);
 #ifdef _WIN32
     InitializeSRWLock(&bs->lock);
 #else
@@ -532,6 +558,15 @@ int bstack_pop(bstack_t *bs, size_t n,
     }
 
     uint64_t new_len = data_size - (uint64_t)n;
+    
+    /* Check if this would shrink below the locked length. */
+    uint64_t locked = ATOMIC_LOAD_ACQUIRE(&bs->locked);
+    if (new_len < locked) {
+        BS_WRUNLOCK(bs);
+        errno = EINVAL;
+        return -1;
+    }
+    
     uint64_t read_offset = HEADER_SIZE + new_len;
 
     /* Read the bytes to be removed before truncating. */
@@ -611,6 +646,18 @@ int bstack_get(bstack_t *bs, uint64_t start, uint64_t end,
         return -1;
     }
 
+    /* Fast-path: if the range lies entirely within the locked region,
+     * skip the rwlock — locked bytes are immutable so no lock is needed. */
+    uint64_t locked = ATOMIC_LOAD_ACQUIRE(&bs->locked);
+    if (end <= locked) {
+        size_t to_read = (size_t)(end - start);
+        if (to_read > 0) {
+            if (plat_pread(bs->fd, buf, to_read, HEADER_SIZE + start) != 0)
+                return -1;
+        }
+        return 0;
+    }
+
     BS_RDLOCK(bs);
 
     uint64_t raw_size;
@@ -665,6 +712,14 @@ int bstack_discard(bstack_t *bs, size_t n)
     }
 
     uint64_t new_len = data_size - (uint64_t)n;
+    
+    /* Check if this would shrink below the locked length. */
+    uint64_t locked = ATOMIC_LOAD_ACQUIRE(&bs->locked);
+    if (new_len < locked) {
+        BS_WRUNLOCK(bs);
+        errno = EINVAL;
+        return -1;
+    }
 
     if (plat_ftruncate(bs->fd, HEADER_SIZE + new_len) != 0 ||
         write_committed_len(bs->fd, new_len) != 0 ||
@@ -705,6 +760,62 @@ int bstack_len(bstack_t *bs, uint64_t *out_len)
 }
 
 /* -------------------------------------------------------------------------
+ * bstack_locked_len / bstack_lock_up_to / bstack_open_locked_up_to
+ * ---------------------------------------------------------------------- */
+
+uint64_t bstack_locked_len(bstack_t *bs)
+{
+    return ATOMIC_LOAD_ACQUIRE(&bs->locked);
+}
+
+int bstack_lock_up_to(bstack_t *bs, uint64_t n)
+{
+    /* Acquire the write lock to serialize against any in-flight writers. */
+    BS_WRLOCK(bs);
+
+    uint64_t raw_size;
+    if (file_size(bs->fd, &raw_size) != 0) {
+        int saved = errno;
+        BS_WRUNLOCK(bs);
+        errno = saved;
+        return -1;
+    }
+    uint64_t data_size = raw_size - HEADER_SIZE;
+
+    uint64_t current_locked = ATOMIC_LOAD_ACQUIRE(&bs->locked);
+    if (n < current_locked) {
+        BS_WRUNLOCK(bs);
+        errno = EINVAL;
+        return -1;
+    }
+    if (n > data_size) {
+        BS_WRUNLOCK(bs);
+        errno = EINVAL;
+        return -1;
+    }
+
+    /* Release store: all writes completed under the write lock above are
+     * visible to any thread that subsequently loads locked with Acquire. */
+    ATOMIC_STORE_RELEASE(&bs->locked, n);
+    BS_WRUNLOCK(bs);
+    return 0;
+}
+
+bstack_t *bstack_open_locked_up_to(const char *path, uint64_t n)
+{
+    bstack_t *bs = bstack_open(path);
+    if (!bs)
+        return NULL;
+    if (bstack_lock_up_to(bs, n) != 0) {
+        int saved = errno;
+        bstack_close(bs);
+        errno = saved;
+        return NULL;
+    }
+    return bs;
+}
+
+/* -------------------------------------------------------------------------
  * bstack_set  (only compiled with -DBSTACK_FEATURE_SET)
  * ---------------------------------------------------------------------- */
 
@@ -723,6 +834,16 @@ int bstack_set(bstack_t *bs, uint64_t offset,
     uint64_t end = offset + (uint64_t)len;
 
     BS_WRLOCK(bs);
+    
+    /* Load locked under the write lock — otherwise a concurrent
+     * lock_up_to could extend the locked region between our check and
+     * our write, letting us mutate a now-immutable byte. */
+    uint64_t locked = ATOMIC_LOAD_ACQUIRE(&bs->locked);
+    if (offset < locked) {
+        BS_WRUNLOCK(bs);
+        errno = EINVAL;
+        return -1;
+    }
 
     uint64_t raw_size;
     if (file_size(bs->fd, &raw_size) != 0)
@@ -766,6 +887,14 @@ int bstack_zero(bstack_t *bs, uint64_t offset, size_t n)
     uint64_t end = offset + (uint64_t)n;
 
     BS_WRLOCK(bs);
+    
+    /* Load locked under the write lock (see bstack_set for rationale). */
+    uint64_t locked = ATOMIC_LOAD_ACQUIRE(&bs->locked);
+    if (offset < locked) {
+        BS_WRUNLOCK(bs);
+        errno = EINVAL;
+        return -1;
+    }
 
     uint64_t raw_size;
     if (file_size(bs->fd, &raw_size) != 0)
@@ -874,9 +1003,17 @@ int bstack_atrunc(bstack_t *bs, size_t n,
         errno = EINVAL;
         return -1;
     }
+    
+    uint64_t locked = ATOMIC_LOAD_ACQUIRE(&bs->locked);
+    uint64_t new_tail_start = data_size - (uint64_t)n;
+    if (new_tail_start < locked) {
+        BS_WRUNLOCK(bs);
+        errno = EINVAL;
+        return -1;
+    }
 
-    uint64_t tail_offset    = HEADER_SIZE + data_size - (uint64_t)n;
-    uint64_t final_data_len = data_size  - (uint64_t)n + (uint64_t)buf_len;
+    uint64_t tail_offset    = HEADER_SIZE + new_tail_start;
+    uint64_t final_data_len = new_tail_start + (uint64_t)buf_len;
 
     if (atomic_write_tail(bs->fd, raw_size, tail_offset,
                           final_data_len, buf, buf_len, n) != 0)
@@ -909,9 +1046,17 @@ int bstack_splice(bstack_t *bs,
         errno = EINVAL;
         return -1;
     }
+    
+    uint64_t locked = ATOMIC_LOAD_ACQUIRE(&bs->locked);
+    uint64_t new_tail_start = data_size - (uint64_t)n;
+    if (new_tail_start < locked) {
+        BS_WRUNLOCK(bs);
+        errno = EINVAL;
+        return -1;
+    }
 
-    uint64_t tail_offset    = HEADER_SIZE + data_size - (uint64_t)n;
-    uint64_t final_data_len = data_size  - (uint64_t)n + (uint64_t)new_len;
+    uint64_t tail_offset    = HEADER_SIZE + new_tail_start;
+    uint64_t final_data_len = new_tail_start + (uint64_t)new_len;
 
     /* Read removed bytes before any mutation. */
     if (n > 0 && removed != NULL) {
@@ -1010,6 +1155,15 @@ int bstack_try_discard(bstack_t *bs, uint64_t s, size_t n, int *ok)
     }
 
     uint64_t new_len = data_size - (uint64_t)n;
+    
+    /* Check if this would shrink below the locked length. */
+    uint64_t locked = ATOMIC_LOAD_ACQUIRE(&bs->locked);
+    if (new_len < locked) {
+        BS_WRUNLOCK(bs);
+        errno = EINVAL;
+        return -1;
+    }
+    
     if (plat_ftruncate(bs->fd, HEADER_SIZE + new_len) != 0 ||
         write_committed_len(bs->fd, new_len) != 0 ||
         plat_durable_sync(bs->fd) != 0)
@@ -1042,8 +1196,16 @@ int bstack_replace(bstack_t *bs, size_t n,
         errno = EINVAL;
         return -1;
     }
+    
+    uint64_t locked = ATOMIC_LOAD_ACQUIRE(&bs->locked);
+    uint64_t new_tail_start = data_size - (uint64_t)n;
+    if (new_tail_start < locked) {
+        BS_WRUNLOCK(bs);
+        errno = EINVAL;
+        return -1;
+    }
 
-    uint64_t tail_offset = HEADER_SIZE + data_size - (uint64_t)n;
+    uint64_t tail_offset = HEADER_SIZE + new_tail_start;
 
     /* Read old tail bytes (NULL when n == 0 — callback must check old_len). */
     uint8_t *old_tail = NULL;
@@ -1072,7 +1234,7 @@ int bstack_replace(bstack_t *bs, size_t n,
         return 0;
     }
 
-    uint64_t final_data_len = data_size - (uint64_t)n + (uint64_t)new_len;
+    uint64_t final_data_len = new_tail_start + (uint64_t)new_len;
 
     if (atomic_write_tail(bs->fd, raw_size, tail_offset,
                           final_data_len, new_buf, new_len, n) != 0) {
@@ -1109,6 +1271,14 @@ int bstack_swap(bstack_t *bs, uint64_t offset,
     uint64_t end = offset + (uint64_t)len;
 
     BS_WRLOCK(bs);
+    
+    /* Load locked under the write lock (see bstack_set for rationale). */
+    uint64_t locked = ATOMIC_LOAD_ACQUIRE(&bs->locked);
+    if (offset < locked) {
+        BS_WRUNLOCK(bs);
+        errno = EINVAL;
+        return -1;
+    }
 
     uint64_t raw_size;
     if (file_size(bs->fd, &raw_size) != 0)
@@ -1151,6 +1321,14 @@ int bstack_cas(bstack_t *bs, uint64_t offset,
     uint64_t end = offset + (uint64_t)len;
 
     BS_WRLOCK(bs);
+    
+    /* Load locked under the write lock (see bstack_set for rationale). */
+    uint64_t locked = ATOMIC_LOAD_ACQUIRE(&bs->locked);
+    if (offset < locked) {
+        BS_WRUNLOCK(bs);
+        errno = EINVAL;
+        return -1;
+    }
 
     uint64_t raw_size;
     if (file_size(bs->fd, &raw_size) != 0)
@@ -1208,6 +1386,14 @@ int bstack_process(bstack_t *bs, uint64_t start, uint64_t end,
     uint64_t n = end - start;
 
     BS_WRLOCK(bs);
+    
+    /* Load locked under the write lock (see bstack_set for rationale). */
+    uint64_t locked = ATOMIC_LOAD_ACQUIRE(&bs->locked);
+    if (start < locked) {
+        BS_WRUNLOCK(bs);
+        errno = EINVAL;
+        return -1;
+    }
 
     uint64_t raw_size;
     if (file_size(bs->fd, &raw_size) != 0)

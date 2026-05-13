@@ -116,6 +116,38 @@ int bstack_discard(bstack_t *bs, size_t n);
  */
 int bstack_len(bstack_t *bs, uint64_t *out_len);
 
+/*
+ * Return the current locked length.  0 means no bytes are locked.
+ * The locked region is [0, locked_len).  All bytes within this range are
+ * permanently immutable: writes and shrink operations that would touch them
+ * return EINVAL, and reads to ranges entirely within it skip the rwlock on
+ * Unix and Windows.
+ */
+uint64_t bstack_locked_len(bstack_t *bs);
+
+/*
+ * Extend the locked region to cover [0, n).
+ * n must be ≥ the current locked length and ≤ the current payload length.
+ * After this call, reads to [0, n) are lock-free on Unix and Windows, and
+ * all write and shrink operations that would touch [0, n) return EINVAL.
+ * Acquires the exclusive write lock to ensure all in-flight writes to
+ * [0, n) have completed before the region is declared immutable.
+ * Returns EINVAL if n is less than the current locked length (partition can
+ * only grow) or if n exceeds the current payload length.
+ */
+int bstack_lock_up_to(bstack_t *bs, uint64_t n);
+
+/*
+ * Open a bstack and immediately lock the first n bytes.
+ * Equivalent to bstack_open followed by bstack_lock_up_to, but expressed
+ * as a single call for the common pattern where the locked region is known
+ * ahead of time (e.g. a fixed-size metadata block whose size is a
+ * compile-time or configuration constant).
+ * Returns NULL on failure (errno set); EINVAL if n exceeds the payload
+ * length of the opened file.
+ */
+bstack_t *bstack_open_locked_up_to(const char *path, uint64_t n);
+
 #ifdef BSTACK_FEATURE_SET
 /*
  * Overwrite len bytes in place starting at logical offset.
