@@ -620,16 +620,11 @@ pub struct BStack {
     handle: isize,
 }
 
-// SAFETY: `BStack` is Send + Sync because:
-//  - `RwLock<File>` is Send + Sync (File is Send + Sync).
-//  - `AtomicU64` is Send + Sync.
-//  - The raw `fd`/`handle` copy is only used for cursor-independent positional
-//    reads (pread / ReadFile+OVERLAPPED) which are safe across threads, and
-//    its validity is guaranteed by `BStack` owning the `File`.
-#[cfg(windows)]
-unsafe impl Send for BStack {}
-#[cfg(windows)]
-unsafe impl Sync for BStack {}
+// `BStack` is auto-`Send + Sync` on every platform: all fields
+// (`RwLock<File>`, `AtomicU64`, and the `RawFd` / `isize` handle) already
+// implement both traits.  The lock-free `pread` / `ReadFile`+`OVERLAPPED`
+// paths are cursor-independent and safe to call from any thread, and the raw
+// fd / handle remains valid for as long as `BStack` owns the `File`.
 
 impl BStack {
     /// Open or create a stack file at `path`.
@@ -1218,6 +1213,10 @@ impl BStack {
                 "set: offset + len overflows u64",
             )
         })?;
+        let mut file = self.lock.write().unwrap();
+        // Load `locked` under the write lock — otherwise a concurrent
+        // `lock_up_to` could extend the locked region between our check and
+        // our write, letting us mutate a now-immutable byte.
         let locked = self.locked.load(Ordering::Acquire);
         if offset < locked {
             return Err(io::Error::new(
@@ -1225,7 +1224,6 @@ impl BStack {
                 format!("set: range [{offset}, {end}) overlaps locked region [0, {locked})"),
             ));
         }
-        let mut file = self.lock.write().unwrap();
         let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
         if end > data_size {
             return Err(io::Error::new(
@@ -1269,6 +1267,8 @@ impl BStack {
                 "zero: offset + n overflows u64",
             )
         })?;
+        let mut file = self.lock.write().unwrap();
+        // Load `locked` under the write lock (see `set` for rationale).
         let locked = self.locked.load(Ordering::Acquire);
         if offset < locked {
             return Err(io::Error::new(
@@ -1276,7 +1276,6 @@ impl BStack {
                 format!("zero: range [{offset}, {end}) overlaps locked region [0, {locked})"),
             ));
         }
-        let mut file = self.lock.write().unwrap();
         let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
         if end > data_size {
             return Err(io::Error::new(
@@ -1735,6 +1734,8 @@ impl BStack {
                 "swap: offset + len overflows u64",
             )
         })?;
+        let mut file = self.lock.write().unwrap();
+        // Load `locked` under the write lock (see `set` for rationale).
         let locked = self.locked.load(Ordering::Acquire);
         if offset < locked {
             return Err(io::Error::new(
@@ -1742,7 +1743,6 @@ impl BStack {
                 format!("swap: range [{offset}, {end}) overlaps locked region [0, {locked})"),
             ));
         }
-        let mut file = self.lock.write().unwrap();
         let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
         if end > data_size {
             return Err(io::Error::new(
@@ -1789,6 +1789,8 @@ impl BStack {
                 "swap_into: offset + len overflows u64",
             )
         })?;
+        let mut file = self.lock.write().unwrap();
+        // Load `locked` under the write lock (see `set` for rationale).
         let locked = self.locked.load(Ordering::Acquire);
         if offset < locked {
             return Err(io::Error::new(
@@ -1796,7 +1798,6 @@ impl BStack {
                 format!("swap_into: range [{offset}, {end}) overlaps locked region [0, {locked})"),
             ));
         }
-        let mut file = self.lock.write().unwrap();
         let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
         if end > data_size {
             return Err(io::Error::new(
@@ -1854,6 +1855,8 @@ impl BStack {
                 "cas: offset + len overflows u64",
             )
         })?;
+        let mut file = self.lock.write().unwrap();
+        // Load `locked` under the write lock (see `set` for rationale).
         let locked = self.locked.load(Ordering::Acquire);
         if offset < locked {
             return Err(io::Error::new(
@@ -1861,7 +1864,6 @@ impl BStack {
                 format!("cas: range [{offset}, {end}) overlaps locked region [0, {locked})"),
             ));
         }
-        let mut file = self.lock.write().unwrap();
         let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
         if end > data_size {
             return Err(io::Error::new(
