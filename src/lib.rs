@@ -141,7 +141,7 @@
 //! | `swap`, `swap_into`, `cas` *(features: set+atomic)* | write | write |
 //! | `process` *(features: set+atomic)* | write | write |
 //! | `replace` *(feature: atomic)* | write | write |
-//! | `peek`, `peek_into`, `get`, `get_into` | **read** | write |
+//! | `peek`, `peek_into`, `get`, `get_into` | **read** (or **none** for ranges entirely within the locked region) | write |
 //! | `len` | read | read |
 //!
 //! On Unix and Windows, `peek`, `peek_into`, `get`, and `get_into` use a
@@ -149,10 +149,88 @@
 //! `OVERLAPPED` on Windows) that does not modify the file-position cursor.
 //! This allows multiple concurrent calls to any of these methods to run in
 //! parallel while any ongoing `push`, `pop`, or `pop_into` still serialises
-//! all writers via the write lock.
+//! all writers via the write lock.  When a read range lies entirely within
+//! the [locked region](#locked-region-lock_up_to), the rwlock is bypassed
+//! altogether — see that section for the concurrency model.
 //!
 //! On other platforms a seek is required, so `peek`, `peek_into`, `get`, and
 //! `get_into` fall back to the write lock and all reads serialise.
+//!
+//! # Locked region (`lock_up_to`)
+//!
+//! [`BStack`] maintains an in-memory **monotonically growing partition
+//! boundary** named the *locked region*.  Bytes in `[0, locked_len())` are
+//! declared permanently immutable for the lifetime of the open file.
+//!
+//! The locked length starts at `0` on every [`open`](BStack::open) and is
+//! **not persisted to disk** — the file format is unchanged.  Callers extend
+//! the boundary by calling [`lock_up_to`](BStack::lock_up_to) (or open and
+//! lock in one step with [`open_locked_up_to`](BStack::open_locked_up_to)).
+//! It can only grow; attempts to shrink it return
+//! [`io::ErrorKind::InvalidInput`].
+//!
+//! ## Effects
+//!
+//! * **Lock-free reads on Unix and Windows.**  When [`get`](BStack::get),
+//!   [`get_into`](BStack::get_into), or [`peek_into`](BStack::peek_into) are
+//!   called with a range that lies entirely within the locked region, the
+//!   rwlock is bypassed and the read is served directly by `pread(2)`
+//!   (Unix) or `ReadFile` + `OVERLAPPED` (Windows).  The `fstat` size check
+//!   is skipped too — the locked length is a sufficient upper bound.
+//!
+//! * **Write protection.**  [`set`](BStack::set), [`zero`](BStack::zero),
+//!   [`swap`](BStack::swap), [`swap_into`](BStack::swap_into),
+//!   [`cas`](BStack::cas), and [`process`](BStack::process) return
+//!   [`io::ErrorKind::InvalidInput`] when their target range overlaps the
+//!   locked region.  [`atrunc`](BStack::atrunc), [`splice`](BStack::splice),
+//!   [`splice_into`](BStack::splice_into), and [`replace`](BStack::replace)
+//!   return the same error when the operation would modify bytes inside it.
+//!
+//! * **Shrink protection.**  [`pop`](BStack::pop),
+//!   [`pop_into`](BStack::pop_into), [`discard`](BStack::discard), and
+//!   [`try_discard`](BStack::try_discard) return
+//!   [`io::ErrorKind::InvalidInput`] when they would shrink the payload
+//!   below the locked length.
+//!
+//! Callers that never invoke `lock_up_to` see no behavioural change — every
+//! read and write path adds only a single uncontended `AtomicU64::load` and
+//! a comparison.
+//!
+//! ## Concurrency model
+//!
+//! `lock_up_to(n)` acquires the exclusive write lock before publishing the
+//! new boundary with a `Release` store.  Lock-free readers `Acquire`-load
+//! `locked` before each call.  Two consequences follow:
+//!
+//! * A stale load is always safe.  If a reader sees an older (smaller)
+//!   `locked` value, it falls through to the rwlock path; if it sees a
+//!   newer value, the entire range it now reads is by definition immutable.
+//!
+//! * Locked-region checks on writers are evaluated **under the write lock**,
+//!   so they cannot race against a concurrent `lock_up_to` extending the
+//!   boundary across the write target.
+//!
+//! ## Typical use
+//!
+//! ```no_run
+//! use bstack::BStack;
+//!
+//! # fn main() -> std::io::Result<()> {
+//! // A fixed 64-byte metadata block at the head of the file, read by many
+//! // threads but never modified after first write.
+//! let stack = BStack::open_locked_up_to("meta.bin", 64)?;
+//! assert_eq!(stack.locked_len(), 64);
+//!
+//! // Reads of the metadata bypass the rwlock on Unix and Windows.
+//! let header = stack.get(0, 64)?;
+//! # let _ = header;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! On platforms other than Unix and Windows the boundary still enforces
+//! immutability through the rwlock path; only the lock-free read fast path
+//! is platform-gated.
 //!
 //! # Standard I/O adapters
 //!
