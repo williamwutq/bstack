@@ -352,19 +352,24 @@ use std::hash::{Hash, Hasher};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
+#[cfg(unix)]
+use std::os::unix::io::RawFd;
 
 #[cfg(windows)]
 use std::os::windows::fs::FileExt as WindowsFileExt;
 #[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
 #[cfg(windows)]
+use windows_sys::Win32::Foundation::HANDLE;
+#[cfg(windows)]
 use windows_sys::Win32::Storage::FileSystem::{
-    LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
+    LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx, ReadFile,
 };
 #[cfg(windows)]
 use windows_sys::Win32::System::IO::OVERLAPPED;
@@ -508,6 +513,76 @@ fn pread_exact_into(file: &File, offset: u64, buf: &mut [u8]) -> io::Result<()> 
     Ok(())
 }
 
+/// Lock-free positional read using a raw file descriptor (Unix).
+///
+/// Calls `pread(2)` directly, bypassing the `RwLock<File>`.  Safe only when
+/// the target range is within the immutable locked region, ensuring no
+/// concurrent writer can touch those bytes.
+#[cfg(unix)]
+fn pread_exact_raw(fd: RawFd, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        let n = unsafe {
+            libc::pread(
+                fd,
+                buf[filled..].as_mut_ptr() as *mut libc::c_void,
+                buf.len() - filled,
+                (offset + filled as u64) as libc::off_t,
+            )
+        };
+        if n < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "locked pread: unexpected EOF",
+            ));
+        }
+        filled += n as usize;
+    }
+    Ok(())
+}
+
+/// Lock-free positional read using a raw Windows HANDLE.
+///
+/// Calls `ReadFile` with an `OVERLAPPED` offset, bypassing the `RwLock<File>`.
+/// Safe under the same invariant as `pread_exact_raw`.
+#[cfg(windows)]
+fn pread_exact_raw_handle(handle: isize, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+    let handle = handle as HANDLE;
+    let mut filled = 0usize;
+    let len = buf.len();
+    while filled < len {
+        let current_offset = offset + filled as u64;
+        let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+        // SAFETY: the Anonymous/Anonymous path exists in the windows-sys OVERLAPPED layout.
+        overlapped.Anonymous.Anonymous.Offset = current_offset as u32;
+        overlapped.Anonymous.Anonymous.OffsetHigh = (current_offset >> 32) as u32;
+        let mut bytes_read: u32 = 0;
+        let ret = unsafe {
+            ReadFile(
+                handle,
+                buf[filled..].as_mut_ptr() as *mut core::ffi::c_void,
+                (len - filled) as u32,
+                &mut bytes_read,
+                &mut overlapped,
+            )
+        };
+        if ret == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if bytes_read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "locked ReadFile: unexpected EOF",
+            ));
+        }
+        filled += bytes_read as usize;
+    }
+    Ok(())
+}
+
 /// Read and validate the header; return the committed payload length.
 fn read_header(file: &mut File) -> io::Result<u64> {
     file.seek(SeekFrom::Start(0))?;
@@ -530,7 +605,31 @@ fn read_header(file: &mut File) -> io::Result<u64> {
 /// guarantees, crash recovery, multi-process safety, and thread-safety model.
 pub struct BStack {
     lock: RwLock<File>,
+    /// Monotonically growing partition boundary.  Bytes in `[0, locked)` are
+    /// immutable and can be read without the rwlock on supported platforms.
+    /// Not persisted — resets to 0 on every open.
+    locked: AtomicU64,
+    /// Copy of the raw file descriptor used for lock-free positional reads
+    /// on the locked region.  The `File` inside `lock` retains ownership and
+    /// will close the descriptor when `BStack` is dropped.
+    #[cfg(unix)]
+    fd: RawFd,
+    /// Copy of the Windows HANDLE stored as `isize` so the field is
+    /// `Send + Sync`.  Same lifetime guarantee as `fd` above.
+    #[cfg(windows)]
+    handle: isize,
 }
+
+// SAFETY: `BStack` is Send + Sync because:
+//  - `RwLock<File>` is Send + Sync (File is Send + Sync).
+//  - `AtomicU64` is Send + Sync.
+//  - The raw `fd`/`handle` copy is only used for cursor-independent positional
+//    reads (pread / ReadFile+OVERLAPPED) which are safe across threads, and
+//    its validity is guaranteed by `BStack` owning the `File`.
+#[cfg(windows)]
+unsafe impl Send for BStack {}
+#[cfg(windows)]
+unsafe impl Sync for BStack {}
 
 impl BStack {
     /// Open or create a stack file at `path`.
@@ -594,8 +693,18 @@ impl BStack {
             }
         }
 
+        #[cfg(unix)]
+        let fd = file.as_raw_fd();
+        #[cfg(windows)]
+        let handle = file.as_raw_handle() as isize;
+
         Ok(BStack {
+            #[cfg(unix)]
+            fd,
+            #[cfg(windows)]
+            handle,
             lock: RwLock::new(file),
+            locked: AtomicU64::new(0),
         })
     }
 
@@ -706,6 +815,13 @@ impl BStack {
             ));
         }
         let new_data_len = data_size - n;
+        let locked = self.locked.load(Ordering::Acquire);
+        if new_data_len < locked {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("pop({n}) would shrink payload below locked length ({locked})"),
+            ));
+        }
         file.seek(SeekFrom::Start(HEADER_SIZE + new_data_len))?;
         let mut buf = vec![0u8; n as usize];
         file.read_exact(&mut buf)?;
@@ -789,6 +905,26 @@ impl BStack {
                 format!("get: end ({end}) < start ({start})"),
             ));
         }
+        // Fast-path: if the range lies entirely within the locked region,
+        // skip the rwlock — locked bytes are immutable so no lock is needed.
+        #[cfg(unix)]
+        {
+            let locked = self.locked.load(Ordering::Acquire);
+            if end <= locked {
+                let mut buf = vec![0u8; (end - start) as usize];
+                pread_exact_raw(self.fd, HEADER_SIZE + start, &mut buf)?;
+                return Ok(buf);
+            }
+        }
+        #[cfg(windows)]
+        {
+            let locked = self.locked.load(Ordering::Acquire);
+            if end <= locked {
+                let mut buf = vec![0u8; (end - start) as usize];
+                pread_exact_raw_handle(self.handle, HEADER_SIZE + start, &mut buf)?;
+                return Ok(buf);
+            }
+        }
         #[cfg(any(unix, windows))]
         {
             let file = self.lock.read().unwrap();
@@ -847,6 +983,21 @@ impl BStack {
                 "peek_into: offset + len overflows u64",
             )
         })?;
+        // Fast-path: locked region is immutable, skip the rwlock.
+        #[cfg(unix)]
+        {
+            let locked = self.locked.load(Ordering::Acquire);
+            if end <= locked {
+                return pread_exact_raw(self.fd, HEADER_SIZE + offset, buf);
+            }
+        }
+        #[cfg(windows)]
+        {
+            let locked = self.locked.load(Ordering::Acquire);
+            if end <= locked {
+                return pread_exact_raw_handle(self.handle, HEADER_SIZE + offset, buf);
+            }
+        }
         #[cfg(any(unix, windows))]
         {
             let file = self.lock.read().unwrap();
@@ -906,6 +1057,21 @@ impl BStack {
                 "get_into: start + len overflows u64",
             )
         })?;
+        // Fast-path: locked region is immutable, skip the rwlock.
+        #[cfg(unix)]
+        {
+            let locked = self.locked.load(Ordering::Acquire);
+            if end <= locked {
+                return pread_exact_raw(self.fd, HEADER_SIZE + start, buf);
+            }
+        }
+        #[cfg(windows)]
+        {
+            let locked = self.locked.load(Ordering::Acquire);
+            if end <= locked {
+                return pread_exact_raw_handle(self.handle, HEADER_SIZE + start, buf);
+            }
+        }
         #[cfg(any(unix, windows))]
         {
             let file = self.lock.read().unwrap();
@@ -964,6 +1130,13 @@ impl BStack {
             ));
         }
         let new_data_len = data_size - n;
+        let locked = self.locked.load(Ordering::Acquire);
+        if new_data_len < locked {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("pop_into({n}) would shrink payload below locked length ({locked})"),
+            ));
+        }
         file.seek(SeekFrom::Start(HEADER_SIZE + new_data_len))?;
         file.read_exact(buf)?;
         file.set_len(HEADER_SIZE + new_data_len)?;
@@ -1000,6 +1173,13 @@ impl BStack {
             ));
         }
         let new_data_len = data_size - n;
+        let locked = self.locked.load(Ordering::Acquire);
+        if new_data_len < locked {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("discard({n}) would shrink payload below locked length ({locked})"),
+            ));
+        }
         file.set_len(HEADER_SIZE + new_data_len)?;
         write_committed_len(&mut file, new_data_len)?;
         durable_sync(&file)?;
@@ -1038,6 +1218,13 @@ impl BStack {
                 "set: offset + len overflows u64",
             )
         })?;
+        let locked = self.locked.load(Ordering::Acquire);
+        if offset < locked {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("set: range [{offset}, {end}) overlaps locked region [0, {locked})"),
+            ));
+        }
         let mut file = self.lock.write().unwrap();
         let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
         if end > data_size {
@@ -1082,6 +1269,13 @@ impl BStack {
                 "zero: offset + n overflows u64",
             )
         })?;
+        let locked = self.locked.load(Ordering::Acquire);
+        if offset < locked {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("zero: range [{offset}, {end}) overlaps locked region [0, {locked})"),
+            ));
+        }
         let mut file = self.lock.write().unwrap();
         let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
         if end > data_size {
@@ -1146,8 +1340,16 @@ impl BStack {
                 format!("atrunc: n ({n}) exceeds payload size ({data_size})"),
             ));
         }
-        let tail_offset = HEADER_SIZE + data_size - n;
-        let final_data_len = data_size - n + buf_len;
+        let locked = self.locked.load(Ordering::Acquire);
+        let new_tail_start = data_size - n;
+        if new_tail_start < locked {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("atrunc: operation would modify locked region [0, {locked})"),
+            ));
+        }
+        let tail_offset = HEADER_SIZE + new_tail_start;
+        let final_data_len = new_tail_start + buf_len;
 
         if buf_len > n {
             // Net extension: extend first so data is never lost, then write buf,
@@ -1211,8 +1413,16 @@ impl BStack {
                 format!("splice: n ({n}) exceeds payload size ({data_size})"),
             ));
         }
-        let tail_offset = HEADER_SIZE + data_size - n;
-        let final_data_len = data_size - n + buf_len;
+        let locked = self.locked.load(Ordering::Acquire);
+        let new_tail_start = data_size - n;
+        if new_tail_start < locked {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("splice: operation would modify locked region [0, {locked})"),
+            ));
+        }
+        let tail_offset = HEADER_SIZE + new_tail_start;
+        let final_data_len = new_tail_start + buf_len;
 
         // Read the bytes to remove before any mutation.
         file.seek(SeekFrom::Start(tail_offset))?;
@@ -1282,8 +1492,16 @@ impl BStack {
                 format!("splice_into: n ({n}) exceeds payload size ({data_size})"),
             ));
         }
-        let tail_offset = HEADER_SIZE + data_size - n;
-        let final_data_len = data_size - n + new_len;
+        let locked = self.locked.load(Ordering::Acquire);
+        let new_tail_start = data_size - n;
+        if new_tail_start < locked {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("splice_into: operation would modify locked region [0, {locked})"),
+            ));
+        }
+        let tail_offset = HEADER_SIZE + new_tail_start;
+        let final_data_len = new_tail_start + new_len;
 
         // Read the bytes to remove before any mutation.
         file.seek(SeekFrom::Start(tail_offset))?;
@@ -1392,6 +1610,13 @@ impl BStack {
             ));
         }
         let new_data_len = data_size - n;
+        let locked = self.locked.load(Ordering::Acquire);
+        if new_data_len < locked {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("try_discard: would shrink payload below locked length ({locked})"),
+            ));
+        }
         file.set_len(HEADER_SIZE + new_data_len)?;
         write_committed_len(&mut file, new_data_len)?;
         durable_sync(&file)?;
@@ -1433,13 +1658,21 @@ impl BStack {
                 format!("replace: n ({n}) exceeds payload size ({data_size})"),
             ));
         }
-        let tail_offset = HEADER_SIZE + data_size - n;
+        let locked = self.locked.load(Ordering::Acquire);
+        let new_tail_start = data_size - n;
+        if new_tail_start < locked {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("replace: operation would modify locked region [0, {locked})"),
+            ));
+        }
+        let tail_offset = HEADER_SIZE + new_tail_start;
         file.seek(SeekFrom::Start(tail_offset))?;
         let mut old_tail = vec![0u8; n as usize];
         file.read_exact(&mut old_tail)?;
         let new_tail = f(&old_tail);
         let new_tail_len = new_tail.len() as u64;
-        let final_data_len = data_size - n + new_tail_len;
+        let final_data_len = new_tail_start + new_tail_len;
 
         if new_tail_len > n {
             // Net extension: extend first, write new tail, sync, commit.
@@ -1502,6 +1735,13 @@ impl BStack {
                 "swap: offset + len overflows u64",
             )
         })?;
+        let locked = self.locked.load(Ordering::Acquire);
+        if offset < locked {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("swap: range [{offset}, {end}) overlaps locked region [0, {locked})"),
+            ));
+        }
         let mut file = self.lock.write().unwrap();
         let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
         if end > data_size {
@@ -1549,6 +1789,13 @@ impl BStack {
                 "swap_into: offset + len overflows u64",
             )
         })?;
+        let locked = self.locked.load(Ordering::Acquire);
+        if offset < locked {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("swap_into: range [{offset}, {end}) overlaps locked region [0, {locked})"),
+            ));
+        }
         let mut file = self.lock.write().unwrap();
         let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
         if end > data_size {
@@ -1607,6 +1854,13 @@ impl BStack {
                 "cas: offset + len overflows u64",
             )
         })?;
+        let locked = self.locked.load(Ordering::Acquire);
+        if offset < locked {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("cas: range [{offset}, {end}) overlaps locked region [0, {locked})"),
+            ));
+        }
         let mut file = self.lock.write().unwrap();
         let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
         if end > data_size {
@@ -1668,6 +1922,13 @@ impl BStack {
                 format!("process: end ({end}) exceeds payload size ({data_size})"),
             ));
         }
+        let locked = self.locked.load(Ordering::Acquire);
+        if start < locked {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("process: range [{start}, {end}) overlaps locked region [0, {locked})"),
+            ));
+        }
         let mut buf = vec![0u8; n as usize];
         if n > 0 {
             file.seek(SeekFrom::Start(HEADER_SIZE + start))?;
@@ -1708,6 +1969,75 @@ impl BStack {
     /// Propagates any [`io::Error`] from [`File::metadata`].
     pub fn is_empty(&self) -> io::Result<bool> {
         Ok(self.len()? == 0)
+    }
+
+    /// Returns the current locked length.  `0` means no bytes are locked.
+    ///
+    /// The locked region is `[0, locked_len())`.  All bytes within this range
+    /// are permanently immutable: writes and shrink operations that would
+    /// touch them return [`io::ErrorKind::InvalidInput`], and reads to ranges
+    /// entirely within it skip the rwlock on Unix and Windows.
+    pub fn locked_len(&self) -> u64 {
+        self.locked.load(Ordering::Acquire)
+    }
+
+    /// Extend the locked region to cover `[0, n)`.
+    ///
+    /// `n` must be ≥ the current locked length and ≤ the current payload
+    /// length.  After this call, reads to `[0, n)` are lock-free on Unix and
+    /// Windows, and all write and shrink operations that would touch `[0, n)`
+    /// return [`io::ErrorKind::InvalidInput`].
+    ///
+    /// Acquires the exclusive write lock to ensure all in-flight writes to
+    /// `[0, n)` have completed before the region is declared immutable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] if `n` is less than the current
+    /// locked length (partition can only grow) or if `n` exceeds the current
+    /// payload length.
+    pub fn lock_up_to(&self, n: u64) -> io::Result<()> {
+        // Acquire the write lock to serialise against any in-flight writers.
+        let file = self.lock.write().unwrap();
+        let data_size = file.metadata()?.len().saturating_sub(HEADER_SIZE);
+        let current_locked = self.locked.load(Ordering::Relaxed);
+        if n < current_locked {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "lock_up_to: n ({n}) is less than the current locked length ({current_locked})"
+                ),
+            ));
+        }
+        if n > data_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("lock_up_to: n ({n}) exceeds payload size ({data_size})"),
+            ));
+        }
+        // Release store: all writes completed under the write lock above are
+        // visible to any thread that subsequently loads `locked` with Acquire.
+        self.locked.store(n, Ordering::Release);
+        drop(file);
+        Ok(())
+    }
+
+    /// Open a `BStack` and immediately lock the first `n` bytes.
+    ///
+    /// Equivalent to [`BStack::open`] followed by [`lock_up_to`](Self::lock_up_to),
+    /// but expressed as a single call for the common pattern where the locked
+    /// region is known ahead of time (e.g. a fixed-size metadata block whose
+    /// size is a compile-time or configuration constant).
+    ///
+    /// # Errors
+    ///
+    /// Propagates all errors from [`open`](Self::open).  Returns
+    /// [`io::ErrorKind::InvalidInput`] if `n` exceeds the payload length of
+    /// the opened file.
+    pub fn open_locked_up_to(path: impl AsRef<Path>, n: u64) -> io::Result<Self> {
+        let stack = Self::open(path)?;
+        stack.lock_up_to(n)?;
+        Ok(stack)
     }
 }
 
