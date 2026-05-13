@@ -2621,6 +2621,379 @@ static int test_process_persists_across_reopen(void)
 #endif /* BSTACK_FEATURE_ATOMIC && BSTACK_FEATURE_SET */
 
 /* =========================================================================
+ * lock_up_to / locked_len / open_locked_up_to tests
+ * ====================================================================== */
+
+static int test_locked_len_is_zero_by_default(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    CHECK(bstack_locked_len(bs) == 0);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_lock_up_to_sets_boundary(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    CHECK(bstack_push(bs, (uint8_t *)"helloworld", 10, NULL) == 0);
+    CHECK(bstack_lock_up_to(bs, 5) == 0);
+    CHECK(bstack_locked_len(bs) == 5);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_lock_up_to_monotonic_can_grow(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    CHECK(bstack_push(bs, (uint8_t *)"0123456789", 10, NULL) == 0);
+    CHECK(bstack_lock_up_to(bs, 3) == 0);
+    CHECK(bstack_lock_up_to(bs, 7) == 0);
+    CHECK(bstack_locked_len(bs) == 7);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_lock_up_to_monotonic_cannot_shrink(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    CHECK(bstack_push(bs, (uint8_t *)"helloworld", 10, NULL) == 0);
+    CHECK(bstack_lock_up_to(bs, 5) == 0);
+    CHECK(bstack_lock_up_to(bs, 3) == -1);
+    CHECK(errno == EINVAL);
+    CHECK(bstack_locked_len(bs) == 5); /* unchanged */
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_lock_up_to_n_equal_locked_is_idempotent(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    CHECK(bstack_push(bs, (uint8_t *)"helloworld", 10, NULL) == 0);
+    CHECK(bstack_lock_up_to(bs, 5) == 0);
+    CHECK(bstack_lock_up_to(bs, 5) == 0); /* same value — no error */
+    CHECK(bstack_locked_len(bs) == 5);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_lock_up_to_n_exceeds_len_returns_error(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    CHECK(bstack_push(bs, (uint8_t *)"hello", 5, NULL) == 0);
+    CHECK(bstack_lock_up_to(bs, 10) == -1);
+    CHECK(errno == EINVAL);
+    CHECK(bstack_locked_len(bs) == 0); /* unchanged */
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_open_locked_up_to_sets_boundary(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    /* Create a file with data first. */
+    {
+        bstack_t *bs = bstack_open(tmp);
+        CHECK(bs != NULL);
+        CHECK(bstack_push(bs, (uint8_t *)"0123456789abcdefghij", 20, NULL) == 0);
+        bstack_close(bs);
+    }
+    bstack_t *bs = bstack_open_locked_up_to(tmp, 10);
+    CHECK(bs != NULL);
+    CHECK(bstack_locked_len(bs) == 10);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_open_locked_up_to_n_exceeds_len_returns_null(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    {
+        bstack_t *bs = bstack_open(tmp);
+        CHECK(bs != NULL);
+        CHECK(bstack_push(bs, (uint8_t *)"hello", 5, NULL) == 0);
+        bstack_close(bs);
+    }
+    bstack_t *bs = bstack_open_locked_up_to(tmp, 100);
+    CHECK(bs == NULL);
+    CHECK(errno == EINVAL);
+    unlink(tmp);
+    return 0;
+}
+
+static int test_pop_respects_locked_region(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    CHECK(bstack_push(bs, (uint8_t *)"helloworld", 10, NULL) == 0);
+    CHECK(bstack_lock_up_to(bs, 5) == 0);
+    /* Pop that would shrink below locked length must fail. */
+    uint8_t buf[7];
+    CHECK(bstack_pop(bs, 7, buf, NULL) == -1);
+    CHECK(errno == EINVAL);
+    /* Pop that stays at or above locked length must succeed. */
+    CHECK(bstack_pop(bs, 3, buf, NULL) == 0);
+    uint64_t len;
+    CHECK(bstack_len(bs, &len) == 0);
+    CHECK(len == 7);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_discard_respects_locked_region(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    CHECK(bstack_push(bs, (uint8_t *)"0123456789", 10, NULL) == 0);
+    CHECK(bstack_lock_up_to(bs, 6) == 0);
+    /* Discard that would shrink below locked length must fail. */
+    CHECK(bstack_discard(bs, 8) == -1);
+    CHECK(errno == EINVAL);
+    /* Discard that stays at or above locked length must succeed. */
+    CHECK(bstack_discard(bs, 2) == 0);
+    uint64_t len;
+    CHECK(bstack_len(bs, &len) == 0);
+    CHECK(len == 8);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_get_reads_locked_region_lock_free(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    CHECK(bstack_push(bs, (uint8_t *)"helloworld", 10, NULL) == 0);
+    CHECK(bstack_lock_up_to(bs, 5) == 0);
+    /* Read entirely within locked region (lock-free fast-path). */
+    uint8_t buf[5];
+    CHECK(bstack_get(bs, 0, 5, buf) == 0);
+    CHECK(memcmp(buf, "hello", 5) == 0);
+    /* Read crossing the boundary still works via normal path. */
+    uint8_t buf2[10];
+    CHECK(bstack_get(bs, 0, 10, buf2) == 0);
+    CHECK(memcmp(buf2, "helloworld", 10) == 0);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+#ifdef BSTACK_FEATURE_SET
+
+static int test_set_respects_locked_region(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    CHECK(bstack_push(bs, (uint8_t *)"helloworld", 10, NULL) == 0);
+    CHECK(bstack_lock_up_to(bs, 5) == 0);
+    /* Write into locked region must fail. */
+    CHECK(bstack_set(bs, 0, (uint8_t *)"HELLO", 5) == -1);
+    CHECK(errno == EINVAL);
+    /* Write outside locked region must succeed. */
+    CHECK(bstack_set(bs, 5, (uint8_t *)"WORLD", 5) == 0);
+    uint8_t buf[10];
+    CHECK(bstack_get(bs, 0, 10, buf) == 0);
+    CHECK(memcmp(buf, "helloWORLD", 10) == 0);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_zero_respects_locked_region(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    CHECK(bstack_push(bs, (uint8_t *)"helloworld", 10, NULL) == 0);
+    CHECK(bstack_lock_up_to(bs, 5) == 0);
+    /* Zero into locked region must fail. */
+    CHECK(bstack_zero(bs, 2, 3) == -1);
+    CHECK(errno == EINVAL);
+    /* Zero outside locked region must succeed. */
+    CHECK(bstack_zero(bs, 5, 5) == 0);
+    uint8_t buf[10];
+    CHECK(bstack_get(bs, 0, 10, buf) == 0);
+    CHECK(memcmp(buf, "hello\0\0\0\0\0", 10) == 0);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+#endif /* BSTACK_FEATURE_SET */
+
+#ifdef BSTACK_FEATURE_ATOMIC
+
+static int test_atrunc_respects_locked_region(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    CHECK(bstack_push(bs, (uint8_t *)"helloworld", 10, NULL) == 0);
+    CHECK(bstack_lock_up_to(bs, 5) == 0);
+    /* atrunc that would touch locked region must fail. */
+    CHECK(bstack_atrunc(bs, 7, (uint8_t *)"!", 1) == -1);
+    CHECK(errno == EINVAL);
+    /* atrunc that stays above locked boundary must succeed. */
+    CHECK(bstack_atrunc(bs, 3, (uint8_t *)"!", 1) == 0);
+    uint64_t len;
+    CHECK(bstack_len(bs, &len) == 0);
+    CHECK(len == 8);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_splice_respects_locked_region(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    CHECK(bstack_push(bs, (uint8_t *)"0123456789", 10, NULL) == 0);
+    CHECK(bstack_lock_up_to(bs, 6) == 0);
+    /* splice that would touch locked region must fail. */
+    uint8_t removed[8];
+    CHECK(bstack_splice(bs, removed, 8, (uint8_t *)"!!", 2) == -1);
+    CHECK(errno == EINVAL);
+    /* splice that stays above locked boundary must succeed. */
+    CHECK(bstack_splice(bs, removed, 2, (uint8_t *)"!!", 2) == 0);
+    uint64_t len;
+    CHECK(bstack_len(bs, &len) == 0);
+    CHECK(len == 10);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_try_discard_respects_locked_region(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    CHECK(bstack_push(bs, (uint8_t *)"0123456789", 10, NULL) == 0);
+    CHECK(bstack_lock_up_to(bs, 6) == 0);
+    int ok = 0;
+    /* try_discard that would shrink below locked length must fail. */
+    CHECK(bstack_try_discard(bs, 10, 8, &ok) == -1);
+    CHECK(errno == EINVAL);
+    /* try_discard that stays at or above locked length must succeed. */
+    CHECK(bstack_try_discard(bs, 10, 2, &ok) == 0);
+    CHECK(ok == 1);
+    uint64_t len;
+    CHECK(bstack_len(bs, &len) == 0);
+    CHECK(len == 8);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int cb_replace_x(const uint8_t *old, size_t old_len,
+                        uint8_t **new_buf, size_t *new_len, void *ctx)
+{
+    (void)old; (void)ctx;
+    *new_buf = malloc(old_len);
+    if (!*new_buf) return -1;
+    memset(*new_buf, 'X', old_len);
+    *new_len = old_len;
+    return 0;
+}
+
+static int test_replace_respects_locked_region(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    CHECK(bstack_push(bs, (uint8_t *)"helloworld", 10, NULL) == 0);
+    CHECK(bstack_lock_up_to(bs, 5) == 0);
+    /* replace that would touch locked region must fail. */
+    CHECK(bstack_replace(bs, 7, cb_replace_x, NULL) == -1);
+    CHECK(errno == EINVAL);
+    /* replace that stays above locked boundary must succeed. */
+    CHECK(bstack_replace(bs, 3, cb_replace_x, NULL) == 0); /* replaces last 3 bytes: "rld" → "XXX" */
+    uint8_t buf[10];
+    CHECK(bstack_get(bs, 0, 10, buf) == 0);
+    CHECK(memcmp(buf, "hellowoXXX", 10) == 0);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+#endif /* BSTACK_FEATURE_ATOMIC */
+
+#if defined(BSTACK_FEATURE_ATOMIC) && defined(BSTACK_FEATURE_SET)
+
+static int test_swap_respects_locked_region(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    CHECK(bstack_push(bs, (uint8_t *)"helloworld", 10, NULL) == 0);
+    CHECK(bstack_lock_up_to(bs, 5) == 0);
+    /* swap into locked region must fail. */
+    uint8_t old_buf[5];
+    CHECK(bstack_swap(bs, 0, old_buf, (uint8_t *)"HELLO", 5) == -1);
+    CHECK(errno == EINVAL);
+    /* swap outside locked region must succeed. */
+    CHECK(bstack_swap(bs, 5, old_buf, (uint8_t *)"WORLD", 5) == 0);
+    CHECK(memcmp(old_buf, "world", 5) == 0);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_cas_respects_locked_region(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    CHECK(bstack_push(bs, (uint8_t *)"helloworld", 10, NULL) == 0);
+    CHECK(bstack_lock_up_to(bs, 5) == 0);
+    int ok = 0;
+    /* CAS into locked region must fail. */
+    CHECK(bstack_cas(bs, 0, (uint8_t *)"hello", (uint8_t *)"HELLO", 5, &ok) == -1);
+    CHECK(errno == EINVAL);
+    /* CAS outside locked region must succeed. */
+    CHECK(bstack_cas(bs, 5, (uint8_t *)"world", (uint8_t *)"WORLD", 5, &ok) == 0);
+    CHECK(ok == 1);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int cb_proc_upper_lock(uint8_t *buf, size_t len, void *ctx)
+{
+    (void)ctx;
+    for (size_t i = 0; i < len; i++)
+        buf[i] = (uint8_t)toupper(buf[i]);
+    return 0;
+}
+
+static int test_process_respects_locked_region(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    CHECK(bstack_push(bs, (uint8_t *)"helloworld", 10, NULL) == 0);
+    CHECK(bstack_lock_up_to(bs, 5) == 0);
+    /* process on locked region must fail. */
+    CHECK(bstack_process(bs, 0, 5, cb_proc_upper_lock, NULL) == -1);
+    CHECK(errno == EINVAL);
+    /* process outside locked region must succeed. */
+    CHECK(bstack_process(bs, 5, 10, cb_proc_upper_lock, NULL) == 0);
+    uint8_t buf[10];
+    CHECK(bstack_get(bs, 0, 10, buf) == 0);
+    CHECK(memcmp(buf, "helloWORLD", 10) == 0);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+#endif /* BSTACK_FEATURE_ATOMIC && BSTACK_FEATURE_SET (lock tests) */
+
+/* =========================================================================
  * main
  * ====================================================================== */
 
@@ -2690,6 +3063,19 @@ int main(void)
     T(test_extend_zero_is_noop);
     T(test_extend_persists_across_reopen);
 
+    /* bstack_lock_up_to / bstack_locked_len / bstack_open_locked_up_to */
+    T(test_locked_len_is_zero_by_default);
+    T(test_lock_up_to_sets_boundary);
+    T(test_lock_up_to_monotonic_can_grow);
+    T(test_lock_up_to_monotonic_cannot_shrink);
+    T(test_lock_up_to_n_equal_locked_is_idempotent);
+    T(test_lock_up_to_n_exceeds_len_returns_error);
+    T(test_open_locked_up_to_sets_boundary);
+    T(test_open_locked_up_to_n_exceeds_len_returns_null);
+    T(test_pop_respects_locked_region);
+    T(test_discard_respects_locked_region);
+    T(test_get_reads_locked_region_lock_free);
+
 #ifdef BSTACK_FEATURE_SET
     /* bstack_set */
     T(test_set_overwrites_middle_bytes);
@@ -2708,6 +3094,10 @@ int main(void)
     T(test_zero_does_not_change_file_size);
     T(test_zero_rejects_write_past_end);
     T(test_zero_persists_across_reopen);
+
+    /* bstack_set / bstack_zero — locked-region protection */
+    T(test_set_respects_locked_region);
+    T(test_zero_respects_locked_region);
 #endif
 
 #ifdef BSTACK_FEATURE_ATOMIC
@@ -2754,6 +3144,13 @@ int main(void)
     T(test_replace_callback_receives_correct_bytes);
     T(test_replace_exceeds_size_returns_error);
     T(test_replace_persists_across_reopen);
+
+    /* bstack_atrunc / bstack_splice / bstack_try_discard / bstack_replace —
+     * locked-region protection */
+    T(test_atrunc_respects_locked_region);
+    T(test_splice_respects_locked_region);
+    T(test_try_discard_respects_locked_region);
+    T(test_replace_respects_locked_region);
 #endif
 
 #if defined(BSTACK_FEATURE_ATOMIC) && defined(BSTACK_FEATURE_SET)
@@ -2782,6 +3179,11 @@ int main(void)
     T(test_process_end_less_than_start_returns_error);
     T(test_process_end_exceeds_size_returns_error);
     T(test_process_persists_across_reopen);
+
+    /* bstack_swap / bstack_cas / bstack_process — locked-region protection */
+    T(test_swap_respects_locked_region);
+    T(test_cas_respects_locked_region);
+    T(test_process_respects_locked_region);
 #endif
 
     printf("\n%d/%d passed\n", g_passed, g_total);
