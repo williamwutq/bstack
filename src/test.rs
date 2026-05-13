@@ -4147,10 +4147,7 @@ mod atomic_tests {
         assert_eq!(s2.len().unwrap(), 10);
         assert_eq!(s2.get(0, 5).unwrap(), b"hello");
         // Write into locked region is rejected.
-        assert_eq!(
-            s2.pop(6).unwrap_err().kind(),
-            ErrorKind::InvalidInput
-        );
+        assert_eq!(s2.pop(6).unwrap_err().kind(), ErrorKind::InvalidInput);
     }
 
     #[test]
