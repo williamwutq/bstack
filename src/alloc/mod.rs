@@ -229,8 +229,57 @@ impl<'a, A: BStackAllocator> BStackSlice<'a, A> {
     ///
     /// Does not validate that `offset + len <= stack.len()`.  Invalid slices
     /// produce errors on the first I/O call.
+    ///
+    /// # Deprecation
+    ///
+    /// This constructor is deprecated in favour of the explicitly-unsafe
+    /// [`BStackSlice::from_raw_parts`], which makes the caller's
+    /// responsibility visible at the call site.  Replace any call
+    /// `BStackSlice::new(allocator, offset, len)` with
+    /// `unsafe { BStackSlice::from_raw_parts(allocator, offset, len) }` and
+    /// ensure the `# Safety` contract of `from_raw_parts` is upheld.
+    #[deprecated(
+        since = "0.1.10",
+        note = "Use `unsafe { BStackSlice::from_raw_parts(allocator, offset, len) }` instead; \
+                see `BStackSlice::from_raw_parts` for the required safety contract."
+    )]
     #[inline]
     pub fn new(allocator: &'a A, offset: u64, len: u64) -> Self {
+        Self {
+            allocator,
+            offset,
+            len,
+        }
+    }
+
+    /// Construct a `BStackSlice` from raw parts.
+    ///
+    /// This is the explicitly-unsafe replacement for the deprecated
+    /// [`BStackSlice::new`].  The name reflects that an arbitrary
+    /// `(offset, len)` pair can bypass invariants that allocators rely on.
+    ///
+    /// # Safety
+    ///
+    /// The caller must uphold **all** of the following:
+    ///
+    /// * `offset + len` must not overflow `u64`.
+    /// * For I/O calls (`read`, `write`, `read_range`, etc.) the range
+    ///   `[offset, offset + len)` should lie within the current payload of
+    ///   the backing stack.  Out-of-bounds accesses produce `io::Error`
+    ///   rather than unsound behaviour, so this is a correctness requirement,
+    ///   not a soundness one.
+    /// * **If the slice will be passed to [`BStackAllocator::realloc`] or
+    ///   [`BStackAllocator::dealloc`]**, `(offset, len)` must describe an
+    ///   allocation that was directly returned by [`BStackAllocator::alloc`]
+    ///   or by a prior [`BStackAllocator::realloc`] on the **same allocator
+    ///   instance**.  Passing an arbitrary offset or a sub-slice derived via
+    ///   [`subslice`](BStackSlice::subslice) /
+    ///   [`subslice_range`](BStackSlice::subslice_range) may silently corrupt
+    ///   the allocator's persistent metadata (free-list pointers, AVL node
+    ///   fields, block headers/footers) in a way that is difficult or
+    ///   impossible to recover from.
+    #[inline]
+    pub unsafe fn from_raw_parts(allocator: &'a A, offset: u64, len: u64) -> Self {
         Self {
             allocator,
             offset,

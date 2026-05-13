@@ -31,10 +31,10 @@ use std::io;
 ///
 /// # Creating slices
 ///
-/// Use [`BStackSlice::new`] to create a slice at a known position:
+/// Use [`BStackSlice::from_raw_parts`] to create a slice at a known position:
 ///
 /// ```rust,ignore
-/// let slice = BStackSlice::new(ManualAllocator::get(), offset, len);
+/// let slice = unsafe { BStackSlice::from_raw_parts(ManualAllocator::get(), offset, len) };
 /// ```
 ///
 /// Or reconstruct one from a serialised token:
@@ -85,11 +85,11 @@ impl BStackAllocator for ManualAllocator {
 
     /// Always returns `Err(Unsupported)`.
     ///
-    /// Construct slices manually with [`BStackSlice::new`] instead.
+    /// Construct slices manually with [`BStackSlice::from_raw_parts`] instead.
     fn alloc(&self, _len: u64) -> io::Result<BStackSlice<'_, Self>> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "ManualAllocator does not allocate; construct slices with BStackSlice::new",
+            "ManualAllocator does not allocate; construct slices with BStackSlice::from_raw_parts",
         ))
     }
 
