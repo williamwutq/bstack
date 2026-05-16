@@ -760,6 +760,27 @@ int bstack_len(bstack_t *bs, uint64_t *out_len)
 }
 
 /* -------------------------------------------------------------------------
+ * bstack_is_empty
+ * ---------------------------------------------------------------------- */
+
+int bstack_is_empty(bstack_t *bs, int *out_empty)
+{
+    BS_RDLOCK(bs);
+
+    uint64_t raw_size;
+    if (file_size(bs->fd, &raw_size) != 0) {
+        int saved = errno;
+        BS_RDUNLOCK(bs);
+        errno = saved;
+        return -1;
+    }
+
+    BS_RDUNLOCK(bs);
+    *out_empty = (raw_size == HEADER_SIZE) ? 1 : 0;
+    return 0;
+}
+
+/* -------------------------------------------------------------------------
  * bstack_locked_len / bstack_lock_up_to / bstack_open_locked_up_to
  * ---------------------------------------------------------------------- */
 

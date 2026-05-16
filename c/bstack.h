@@ -117,6 +117,12 @@ int bstack_discard(bstack_t *bs, size_t n);
 int bstack_len(bstack_t *bs, uint64_t *out_len);
 
 /*
+ * Write 1 into *out_empty if the payload is empty (len == 0), else 0.
+ * Takes the read lock; concurrent calls are allowed.
+ */
+int bstack_is_empty(bstack_t *bs, int *out_empty);
+
+/*
  * Return the current locked length.  0 means no bytes are locked.
  * The locked region is [0, locked_len).  All bytes within this range are
  * permanently immutable: writes and shrink operations that would touch them
