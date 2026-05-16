@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **`BStackSliceReader` and `BStackSliceWriter` now implement `Copy`** (`alloc` feature): Both cursor types can now be copied by value without an explicit `.clone()` call, making them more ergonomic to use in iterator-like patterns and when passing to functions that don't need to move the original cursor.
+- **`BStackReader`, `BStackSliceReader`, and `BStackSliceWriter` now implement `Copy`**: All cursor types can now be copied by value without an explicit `.clone()` call, making them more ergonomic to use in iterator-like patterns and when passing to functions that don't need to move the original cursor. (`BStackSliceReader` and `BStackSliceWriter` require the `alloc` feature.)
 
 ## [0.2.0] - 2026-05-15
 

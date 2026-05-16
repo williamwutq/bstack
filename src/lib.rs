@@ -2227,6 +2227,7 @@ impl Hash for BStack {
 /// reading interleaved with writes may observe different snapshots of the
 /// payload across calls — callers are responsible for synchronisation when
 /// that matters.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BStackReader<'a> {
     stack: &'a BStack,
     offset: u64,
@@ -2269,24 +2270,6 @@ impl<'a> From<&'a BStack> for BStackReader<'a> {
 impl<'a> From<BStackReader<'a>> for &'a BStack {
     fn from(val: BStackReader<'a>) -> Self {
         val.stack
-    }
-}
-
-/// Two readers are equal when they point to the **same `BStack` instance**
-/// (pointer identity) and share the same cursor `offset`.
-impl<'a> PartialEq for BStackReader<'a> {
-    fn eq(&self, other: &Self) -> bool {
-        self.stack == other.stack && self.offset == other.offset
-    }
-}
-
-impl<'a> Eq for BStackReader<'a> {}
-
-/// Hashes `(BStack pointer, offset)`, consistent with [`PartialEq`].
-impl<'a> Hash for BStackReader<'a> {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.stack.hash(state);
-        self.offset.hash(state);
     }
 }
 
