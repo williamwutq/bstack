@@ -125,30 +125,9 @@ where
         Self { alloc, inner }
     }
 
-    /// Get the starting offset of this handle's region.
-    pub fn start(&self) -> u64 {
-        let slice: BStackSlice<'_, A> = self
-            .inner
-            .try_into()
-            .expect("Failed to convert inner handle to BStackSlice"); // TODO: Better error handling
-        slice.start()
-    }
-
-    /// Get the length of this handle's region.
-    pub fn len(&self) -> u64 {
-        let slice: BStackSlice<'_, A> = self
-            .inner
-            .try_into()
-            .expect("Failed to convert inner handle to BStackSlice"); // TODO: Better error handling
-        slice.len()
-    }
-
-    /// Check if this handle represents an empty region.
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    /// Get a reference to the inner allocator's handle.
+    /// Return the inner allocator's handle.
+    ///
+    /// To inspect the region (offset, length), convert it with `.try_into::<BStackSlice<_>>()`.
     pub fn inner(&self) -> &A::Allocated<'a> {
         &self.inner
     }
@@ -163,14 +142,26 @@ where
     fn try_into(self) -> Result<BStackSlice<'a, DebugCheckingAllocator<A>>, Self::Error> {
         // Convert inner handle to BStackSlice to get offset and length
         let slice: BStackSlice<'_, A> = self.inner.try_into().map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                format!("Failed to convert inner handle to BStackSlice: {:?}", e),
-            )
+            io::Error::other(format!(
+                "Failed to convert inner handle to BStackSlice: {:?}",
+                e
+            ))
         })?;
         // SAFETY: The handle was created by the allocator with valid offset and length
         Ok(unsafe { BStackSlice::from_raw_parts(self.alloc, slice.start(), slice.len()) })
     }
+}
+
+/// Shared state protected by a single mutex inside [`DebugCheckingAllocator`].
+///
+/// Using one lock for both sets ensures a consistent acquisition order and prevents
+/// deadlocks that would arise from the two-mutex ABBA pattern (alloc acquires
+/// `allocated` then `freed`; dealloc would acquire them in the opposite order).
+struct DebugState {
+    /// Set of currently allocated regions that haven't been freed yet.
+    allocated: HashSet<Region>,
+    /// Set of regions that have been freed (may persist across sessions).
+    freed: HashSet<Region>,
 }
 
 /// Debug-only allocator wrapper that validates allocations and deallocations.
@@ -203,10 +194,7 @@ where
     A: BStackAllocator<Error = io::Error>,
 {
     inner: A,
-    /// Set of currently allocated regions that haven't been freed yet.
-    allocated: Mutex<HashSet<Region>>,
-    /// Set of regions that have been freed (may persist across sessions).
-    freed: Mutex<HashSet<Region>>,
+    state: Mutex<DebugState>,
 }
 
 impl<A> DebugCheckingAllocator<A>
@@ -221,8 +209,10 @@ where
     pub fn new(inner: A) -> Self {
         Self {
             inner,
-            allocated: Mutex::new(HashSet::new()),
-            freed: Mutex::new(HashSet::new()),
+            state: Mutex::new(DebugState {
+                allocated: HashSet::new(),
+                freed: HashSet::new(),
+            }),
         }
     }
 
@@ -253,10 +243,10 @@ where
     /// while [a, d) is freed, the freed set will be updated to contain [a, b) and [c, d).
     fn record_allocation(&self, offset: u64, len: u64) {
         let region = Region::new(offset, len);
-        let mut allocated = self.allocated.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
 
         // Check for overlaps with existing allocations
-        if let Some(overlap) = Self::check_overlap(&region, &*allocated) {
+        if let Some(overlap) = Self::check_overlap(&region, &state.allocated) {
             panic!(
                 "DebugCheckingAllocator: Newly allocated region [{}, {}) overlaps with \
                  existing allocated region [{}, {}). This indicates a bug in the underlying \
@@ -269,36 +259,35 @@ where
         }
 
         // Handle overlaps with freed regions by splitting them
-        let mut freed = self.freed.lock().unwrap();
-        let overlapping_freed: Vec<Region> = freed
+        let overlapping_freed: Vec<Region> = state
+            .freed
             .iter()
             .filter(|r| region.overlaps(r))
             .copied()
             .collect();
 
         for freed_region in overlapping_freed {
-            freed.remove(&freed_region);
+            state.freed.remove(&freed_region);
 
-            // Split the freed region around the newly allocated region
+            // Split the freed region around the newly allocated region:
             // If freed_region is [a, d) and region is [b, c):
             // - If a < b, add [a, b) to freed
             // - If c < d, add [c, d) to freed
-
             if freed_region.offset < region.offset {
-                // Add the portion before the allocated region
                 let before_len = region.offset - freed_region.offset;
-                freed.insert(Region::new(freed_region.offset, before_len));
+                state
+                    .freed
+                    .insert(Region::new(freed_region.offset, before_len));
             }
 
             if region.end() < freed_region.end() {
-                // Add the portion after the allocated region
                 let after_offset = region.end();
                 let after_len = freed_region.end() - after_offset;
-                freed.insert(Region::new(after_offset, after_len));
+                state.freed.insert(Region::new(after_offset, after_len));
             }
         }
 
-        allocated.insert(region);
+        state.allocated.insert(region);
     }
 
     /// Record a deallocation after validation.
@@ -308,10 +297,10 @@ where
     /// spans multiple recorded allocations, as those indicate real bugs.
     fn record_deallocation(&self, offset: u64, len: u64) {
         let region = Region::new(offset, len);
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
 
         // Check for overlaps with previously freed regions BEFORE calling inner dealloc
-        let mut freed = self.freed.lock().unwrap();
-        if let Some(overlap) = Self::check_overlap(&region, &*freed) {
+        if let Some(overlap) = Self::check_overlap(&region, &state.freed) {
             panic!(
                 "DebugCheckingAllocator: Attempting to free region [{}, {}) which overlaps \
                  with already freed region [{}, {}). This indicates a double-free bug.",
@@ -323,8 +312,8 @@ where
         }
 
         // Validate the freed region matches exactly one allocated region
-        let mut allocated = self.allocated.lock().unwrap();
-        let overlapping_allocated: Vec<Region> = allocated
+        let overlapping_allocated: Vec<Region> = state
+            .allocated
             .iter()
             .filter(|r| region.overlaps(r))
             .copied()
@@ -336,7 +325,7 @@ where
                 // only tracks allocations made through itself.
             }
             [exact] if *exact == region => {
-                allocated.remove(exact);
+                state.allocated.remove(exact);
             }
             [single] => panic!(
                 "DebugCheckingAllocator: Attempting to partially free region [{}, {}) \
@@ -355,8 +344,7 @@ where
             ),
         }
 
-        // Add to freed set
-        freed.insert(region);
+        state.freed.insert(region);
     }
 }
 
@@ -379,21 +367,20 @@ where
     }
 
     fn alloc(&self, len: u64) -> io::Result<Self::Allocated<'_>> {
-        // Call inner allocator
         let handle = self.inner.alloc(len)?;
 
-        // Convert to BStackSlice for validation (Copy allows us to keep the original)
+        // Convert to BStackSlice for validation (Copy keeps the original handle live)
         let slice: BStackSlice<'_, A> = handle.try_into().map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                format!("Failed to convert allocated handle: {:?}", e),
-            )
+            // The inner allocator succeeded but we can't inspect the handle — free it
+            // to avoid leaking the allocation, then surface the error.
+            let _ = self.inner.dealloc(handle);
+            io::Error::other(format!(
+                "allocated handle is not convertible to BStackSlice: {e}"
+            ))
         })?;
 
-        // Validate and record
         self.record_allocation(slice.start(), slice.len());
 
-        // Return our debug handle wrapping the inner handle (we still have it due to Copy)
         Ok(DebugHandle::new(self, handle))
     }
 
@@ -402,38 +389,31 @@ where
         handle: Self::Allocated<'a>,
         new_len: u64,
     ) -> io::Result<Self::Allocated<'a>> {
-        // Extract offset and length from the handle (Copy allows us to keep the original)
+        // Extract old region info before handing the inner handle to the inner realloc
         let old_slice: BStackSlice<'_, A> = handle.inner.try_into().map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                format!("Failed to convert handle: {:?}", e),
-            )
+            io::Error::other(format!(
+                "handle is not convertible to BStackSlice before realloc: {e}"
+            ))
         })?;
-        let old_offset = old_slice.start();
-        let old_len = old_slice.len();
+        let old_region = Region::new(old_slice.start(), old_slice.len());
 
-        // Allocate new region through inner allocator
         let new_inner_handle = self.inner.realloc(handle.inner, new_len)?;
 
-        // Convert result to BStackSlice for validation (Copy allows us to keep the original)
+        // Convert result; free on failure to avoid leaking the new allocation
         let new_slice: BStackSlice<'_, A> = new_inner_handle.try_into().map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                format!("Failed to convert reallocated handle: {:?}", e),
-            )
+            let _ = self.inner.dealloc(new_inner_handle);
+            io::Error::other(format!(
+                "reallocated handle is not convertible to BStackSlice: {e}"
+            ))
         })?;
-
-        // Update tracking
-        let old_region = Region::new(old_offset, old_len);
         let new_region = Region::new(new_slice.start(), new_slice.len());
 
-        let mut allocated = self.allocated.lock().unwrap();
-        allocated.remove(&old_region);
+        // Atomically swap old for new in the tracking state
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.allocated.remove(&old_region);
 
-        // Check for overlaps with remaining allocations
-        if let Some(overlap) = Self::check_overlap(&new_region, &allocated) {
-            // Restore old region since realloc failed validation
-            allocated.insert(old_region);
+        if let Some(overlap) = Self::check_overlap(&new_region, &state.allocated) {
+            state.allocated.insert(old_region);
             panic!(
                 "DebugCheckingAllocator: Reallocated region [{}, {}) overlaps with \
                  existing allocated region [{}, {}). This indicates a bug in the underlying \
@@ -445,21 +425,18 @@ where
             );
         }
 
-        allocated.insert(new_region);
-        drop(allocated);
+        state.allocated.insert(new_region);
+        drop(state);
 
-        // Return new debug handle wrapping the inner handle (we still have it due to Copy)
         Ok(DebugHandle::new(self, new_inner_handle))
     }
 
     fn dealloc(&self, handle: Self::Allocated<'_>) -> io::Result<()> {
         // Extract offset and length from the handle
-        let slice: BStackSlice<'_, A> = handle.inner.try_into().map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                format!("Failed to convert handle: {:?}", e),
-            )
-        })?;
+        let slice: BStackSlice<'_, A> = handle
+            .inner
+            .try_into()
+            .map_err(|e| io::Error::other(format!("Failed to convert handle: {:?}", e)))?;
         let offset = slice.start();
         let len = slice.len();
 
@@ -476,25 +453,30 @@ where
     A: BStackBulkAllocator<Error = io::Error>,
 {
     fn alloc_bulk(&self, lengths: impl AsRef<[u64]>) -> io::Result<Vec<Self::Allocated<'_>>> {
-        // Call inner allocator
         let inner_handles = self.inner.alloc_bulk(lengths)?;
 
-        // Convert and validate all handles
+        // Validate all handles before recording any of them so that a conversion
+        // failure never leaves the tracking state partially updated.
+        let mut slices: Vec<BStackSlice<'_, A>> = Vec::with_capacity(inner_handles.len());
+        for (i, &h) in inner_handles.iter().enumerate() {
+            match h.try_into() {
+                Ok(slice) => slices.push(slice),
+                Err(e) => {
+                    // Free every handle the inner allocator gave us to avoid leaking them
+                    for &h in &inner_handles {
+                        let _ = self.inner.dealloc(h);
+                    }
+                    return Err(io::Error::other(format!(
+                        "bulk-allocated handle {i} is not convertible to BStackSlice: {e}"
+                    )));
+                }
+            }
+        }
+
         let mut result = Vec::with_capacity(inner_handles.len());
-        for inner_handle in inner_handles {
-            // Convert to BStackSlice for validation (Copy allows us to keep the original)
-            let slice: BStackSlice<'_, A> = inner_handle.try_into().map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("Failed to convert bulk allocated handle: {:?}", e),
-                )
-            })?;
-
-            // Validate and record
+        for (&h, slice) in inner_handles.iter().zip(slices) {
             self.record_allocation(slice.start(), slice.len());
-
-            // Create debug handle wrapping the inner handle (we still have it due to Copy)
-            result.push(DebugHandle::new(self, inner_handle));
+            result.push(DebugHandle::new(self, h));
         }
 
         Ok(result)
@@ -503,16 +485,20 @@ where
     fn dealloc_bulk<'a>(&'a self, handles: impl AsRef<[Self::Allocated<'a>]>) -> io::Result<()> {
         let handles = handles.as_ref();
 
-        // Validate ALL handles BEFORE deallocating
+        // Validate ALL handles before touching the inner allocator so that a
+        // double-free or partial-free panic fires before any state is mutated.
         for handle in handles {
             let slice: BStackSlice<'_, A> = handle.inner.try_into().map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("Failed to convert handle: {:?}", e),
-                )
+                io::Error::other(format!(
+                    "handle is not convertible to BStackSlice during bulk dealloc: {e}"
+                ))
             })?;
             self.record_deallocation(slice.start(), slice.len());
         }
+
+        // Delegate to the inner allocator with the unwrapped handles
+        let inner_handles: Vec<A::Allocated<'a>> = handles.iter().map(|h| h.inner).collect();
+        self.inner.dealloc_bulk(inner_handles)?;
 
         Ok(())
     }
@@ -583,8 +569,8 @@ mod tests {
 
         // Simulate: freed region [0, 100)
         {
-            let mut freed = checker.freed.lock().unwrap();
-            freed.insert(Region::new(0, 100));
+            let mut state = checker.state.lock().unwrap();
+            state.freed.insert(Region::new(0, 100));
         }
 
         // Record allocation of [20, 50) - should split freed into [0, 20) and [50, 100)
