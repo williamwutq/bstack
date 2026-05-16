@@ -103,13 +103,20 @@ impl BStackAllocator for SequenceBumpAllocator {
         }
         let old_len = handle.slice.len();
         match new_len.cmp(&old_len) {
-            std::cmp::Ordering::Greater => { self.stack.extend(new_len - old_len)?; }
-            std::cmp::Ordering::Less => { self.stack.discard(old_len - new_len)?; }
+            std::cmp::Ordering::Greater => {
+                self.stack.extend(new_len - old_len)?;
+            }
+            std::cmp::Ordering::Less => {
+                self.stack.discard(old_len - new_len)?;
+            }
             std::cmp::Ordering::Equal => {}
         }
         // SAFETY: start unchanged; tail adjusted to new_len.
         let slice = unsafe { BStackSlice::from_raw_parts(self, handle.slice.start(), new_len) };
-        Ok(StampedSlice { slice, seq: handle.seq })
+        Ok(StampedSlice {
+            slice,
+            seq: handle.seq,
+        })
     }
 
     fn dealloc(&self, handle: StampedSlice<'_>) -> Result<(), BumpError> {
@@ -155,9 +162,19 @@ fn main() -> io::Result<()> {
         let alloc = SequenceBumpAllocator::new(BStack::open(path)?);
 
         let a = alloc.alloc(16).unwrap();
-        println!("alloc  seq={} offset={} len={}", a.seq, a.slice.start(), a.slice.len());
+        println!(
+            "alloc  seq={} offset={} len={}",
+            a.seq,
+            a.slice.start(),
+            a.slice.len()
+        );
         let b = alloc.alloc(8).unwrap();
-        println!("alloc  seq={} offset={} len={}", b.seq, b.slice.start(), b.slice.len());
+        println!(
+            "alloc  seq={} offset={} len={}",
+            b.seq,
+            b.slice.start(),
+            b.slice.len()
+        );
 
         // Non-tail realloc returns the custom NotTail variant.
         match alloc.realloc(a, 32).unwrap_err() {
@@ -172,7 +189,10 @@ fn main() -> io::Result<()> {
         // TryInto converts the custom handle to a plain BStackSlice for I/O.
         let plain: BStackSlice<'_, SequenceBumpAllocator> = b.try_into().unwrap();
         plain.write(b"custom handle")?;
-        println!("write+read → {:?}", String::from_utf8_lossy(&plain.read()?[..13]));
+        println!(
+            "write+read → {:?}",
+            String::from_utf8_lossy(&plain.read()?[..13])
+        );
 
         // alloc_read_back uses the raw BStackAllocator bound with TryInto.
         let zeros = alloc_read_back(&alloc, 4).unwrap();
@@ -181,7 +201,11 @@ fn main() -> io::Result<()> {
         let len_before = alloc.len().unwrap();
         let c = alloc.alloc(8).unwrap();
         alloc.dealloc(c).unwrap();
-        println!("dealloc tail: {} → {} bytes", len_before, alloc.len().unwrap());
+        println!(
+            "dealloc tail: {} → {} bytes",
+            len_before,
+            alloc.len().unwrap()
+        );
 
         drop(alloc.into_stack());
     }

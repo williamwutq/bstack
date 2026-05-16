@@ -39,7 +39,10 @@ fn main() -> io::Result<()> {
         println!("locked_len = {}", stack.locked_len());
 
         // Cannot shrink.
-        assert_eq!(stack.lock_up_to(HEADER_SIZE - 1).unwrap_err().kind(), ErrorKind::InvalidInput);
+        assert_eq!(
+            stack.lock_up_to(HEADER_SIZE - 1).unwrap_err().kind(),
+            ErrorKind::InvalidInput
+        );
         println!("lock_up_to(less) → InvalidInput");
 
         // Idempotent.
@@ -69,7 +72,10 @@ fn main() -> io::Result<()> {
         // Write protection.
         #[cfg(feature = "set")]
         {
-            assert_eq!(stack.set(0, b"XXXX").unwrap_err().kind(), ErrorKind::InvalidInput);
+            assert_eq!(
+                stack.set(0, b"XXXX").unwrap_err().kind(),
+                ErrorKind::InvalidInput
+            );
             println!("set in locked region → InvalidInput");
         }
 
@@ -79,7 +85,10 @@ fn main() -> io::Result<()> {
 
         // Shrink protection: cannot discard below locked_len.
         assert_eq!(
-            stack.discard(stack.len()? - HEADER_SIZE + 1).unwrap_err().kind(),
+            stack
+                .discard(stack.len()? - HEADER_SIZE + 1)
+                .unwrap_err()
+                .kind(),
             ErrorKind::InvalidInput
         );
         println!("discard past lock → InvalidInput");
@@ -114,11 +123,20 @@ fn main() -> io::Result<()> {
         for (id, h) in handles.into_iter().enumerate() {
             match h.join().unwrap() {
                 Ok(magic) if &magic == b"DEMO" => {}
-                Ok(magic) => { eprintln!("thread {id}: wrong magic {:?}", magic); all_ok = false; }
-                Err(e)    => { eprintln!("thread {id}: {e}"); all_ok = false; }
+                Ok(magic) => {
+                    eprintln!("thread {id}: wrong magic {:?}", magic);
+                    all_ok = false;
+                }
+                Err(e) => {
+                    eprintln!("thread {id}: {e}");
+                    all_ok = false;
+                }
             }
         }
-        println!("{READERS} concurrent reads — {}", if all_ok { "ok" } else { "FAIL" });
+        println!(
+            "{READERS} concurrent reads — {}",
+            if all_ok { "ok" } else { "FAIL" }
+        );
     }
 
     // 4. open_locked_up_to.
@@ -128,7 +146,10 @@ fn main() -> io::Result<()> {
         println!("locked_len = {}", stack.locked_len());
 
         let len = stack.len()?;
-        assert_eq!(BStack::open_locked_up_to(path, len + 1).unwrap_err().kind(), ErrorKind::InvalidInput);
+        assert_eq!(
+            BStack::open_locked_up_to(path, len + 1).unwrap_err().kind(),
+            ErrorKind::InvalidInput
+        );
         println!("open_locked_up_to(len+1) → InvalidInput");
     }
 
