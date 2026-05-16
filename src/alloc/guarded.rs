@@ -96,8 +96,8 @@ where
     /// hooks operate on a coarser granularity than the slice — for example, a
     /// block cipher that must process aligned 16-byte blocks.
     ///
-    /// Used by [`FullBlockSubview`] to issue reads against the full block rather
-    /// than the narrowed sub-range.
+    /// Can be used by custom subview implementations to issue reads against the full block
+    /// rather than the narrowed sub-range.
     ///
     /// ## Safety
     ///
@@ -121,16 +121,14 @@ where
 
     /// Called with the raw bytes just read from the underlying store.
     ///
-    /// Calling this method directly is not recommended. Use `read` instead,
+    /// Calling this method directly is not recommended. Use [`read`](BStackGuardedSlice::read) instead,
     /// which automatically fires the hooks and handles the necessary allocations.
     ///
     /// Return `Cow::Borrowed` to pass through without allocation; return
     /// `Cow::Owned` for decryption, decompression, or other transformations.
     ///
-    /// Callers that expect a fixed output size (e.g., [`read_into`]) will return
-    /// `InvalidData` if the returned slice has a different length than `data`.
-    ///
-    /// [`read_into`]: BStackGuardedSlice::read_into
+    /// Callers that need a fixed output size should check the returned slice length
+    /// and return `InvalidData` if it differs from the expected length.
     fn post_read<'d>(&self, data: &'d [u8]) -> io::Result<Cow<'d, [u8]>> {
         Ok(Cow::Borrowed(data))
     }

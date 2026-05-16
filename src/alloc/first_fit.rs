@@ -14,7 +14,7 @@ const ALFF_MAGIC_PREFIX: [u8; 6] = *b"ALFF\x00\x01";
 /// A persistent first-fit free-list allocator implementing [`BStackAllocator`]
 /// on top of a [`BStack`].
 ///
-/// Unlike [`LinearBStackAllocator`], freed regions are tracked on disk in a
+/// Unlike [`crate::LinearBStackAllocator`], freed regions are tracked on disk in a
 /// doubly-linked intrusive free list and reused for future allocations, so the
 /// file does not grow without bound.
 ///
