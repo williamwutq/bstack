@@ -480,12 +480,11 @@ pub struct BStackSliceReader<'a, A: BStackAllocator> {
 
 impl<'a, A: BStackAllocator> Clone for BStackSliceReader<'a, A> {
     fn clone(&self) -> Self {
-        Self {
-            slice: self.slice,
-            cursor: self.cursor,
-        }
+        *self
     }
 }
+
+impl<'a, A: BStackAllocator> Copy for BStackSliceReader<'a, A> {}
 
 impl<'a, A: BStackAllocator> fmt::Debug for BStackSliceReader<'a, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -614,12 +613,12 @@ pub struct BStackSliceWriter<'a, A: BStackAllocator> {
 #[cfg(feature = "set")]
 impl<'a, A: BStackAllocator> Clone for BStackSliceWriter<'a, A> {
     fn clone(&self) -> Self {
-        Self {
-            slice: self.slice,
-            cursor: self.cursor,
-        }
+        *self
     }
 }
+
+#[cfg(feature = "set")]
+impl<'a, A: BStackAllocator> Copy for BStackSliceWriter<'a, A> {}
 
 #[cfg(feature = "set")]
 impl<'a, A: BStackAllocator> fmt::Debug for BStackSliceWriter<'a, A> {
