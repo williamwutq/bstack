@@ -133,4 +133,85 @@ This prevents accidental writes while still allowing inspection of the underlyin
 - Is restricting to read-only access sufficient, or do some guard implementations need to hide even read access to the raw slice?
 - Would the migration burden outweigh the safety benefits?
 
+---
+
+## Adding `bstack_bulk_allocator_vtbl_t` to the C allocator API
+
+**Feature flag:** `BSTACK_FEATURE_ATOMIC`
+**Breaking change:** No (additive extension to `bstack_alloc.h`)
+
+### Motivation
+
+The Rust allocator layer exposes `BStackBulkAllocator` — an extension trait that adds `alloc_bulk` and `dealloc_bulk` for atomically allocating or freeing multiple regions in a single operation. The C allocator API (`bstack_allocator_vtbl_t`) has no equivalent; callers must issue individual alloc/dealloc calls, which is neither atomic nor efficient when managing several related regions.
+
+This matters most for structured records that span multiple slices (e.g., a key slice + a value slice in a hash-map entry): allocating them one at a time creates a window where a crash leaves one slice allocated and the other not, complicating recovery.
+
+### Design
+
+Add a second vtable struct `bstack_bulk_allocator_vtbl_t` (available only with `-DBSTACK_FEATURE_ATOMIC`) alongside the existing vtable:
+
+```c
+typedef struct {
+    /* Allocate n slices of the given lengths atomically.
+     * out_slices must hold room for n bstack_slice_t values.
+     * Returns 0 on success, -1 on failure (errno set). */
+    int (*alloc_bulk)(void *self, const size_t *lens, size_t n,
+                      bstack_slice_t *out_slices);
+
+    /* Free n slices atomically.
+     * slices must all originate from the same allocator instance.
+     * Returns 0 on success, -1 on failure (errno set). */
+    int (*dealloc_bulk)(void *self, const bstack_slice_t *slices, size_t n);
+} bstack_bulk_allocator_vtbl_t;
+```
+
+Each concrete allocator (`linear_bstack_allocator_t`, `first_fit_bstack_allocator_t`, `ghost_tree_bstack_allocator_t`) would optionally implement this vtable; callers query via a `bstack_allocator_bulk_vtbl(bstack_allocator_t *)` accessor that returns NULL when the allocator does not support bulk operations.
+
+### Open questions
+
+- Should bulk operations be a separate vtable pointer hanging off `bstack_allocator_t`, or a distinct handle type (analogous to the Rust trait extension pattern)?
+- Should `linear_bstack_allocator_t` support `dealloc_bulk`? Linear allocation inherently does not support dealloc of individual slices, so bulk dealloc is equally unsupported — it would return `ENOTSUP`.
+
+---
+
+## Adding a guard/intercept layer to the C allocator API
+
+**Feature flag:** `BSTACK_FEATURE_SET` (for write hooks)
+**Breaking change:** No (additive; new types and functions only)
+
+### Motivation
+
+The Rust allocator layer has `BStackGuardedSlice` and `BStackGuardedSliceSubview` — traits that let callers attach lifecycle hooks (`pre_read`, `post_read`, `pre_write`, `post_write`) to a slice, enabling transparent I/O transforms such as encryption, compression, or integrity checks. The C allocator has no equivalent; transforms must be wired by hand at every call site.
+
+Without a guard layer, patterns like "all reads from this region must be decrypted and all writes must be re-encrypted" require every caller to remember to apply the transform, which is error-prone and couples application logic to storage details.
+
+### Design
+
+Add a `bstack_guarded_slice_t` wrapper type and a vtable for hooks:
+
+```c
+typedef struct {
+    int (*pre_read) (void *ctx, bstack_slice_t s);
+    int (*post_read)(void *ctx, bstack_slice_t s, uint8_t *buf, size_t len);
+    int (*pre_write)(void *ctx, bstack_slice_t s,
+                     const uint8_t **buf, size_t *len);
+    int (*post_write)(void *ctx, bstack_slice_t s);
+} bstack_guard_vtbl_t;
+
+typedef struct {
+    bstack_slice_t           slice;
+    const bstack_guard_vtbl_t *vtbl;
+    void                    *ctx;
+} bstack_guarded_slice_t;
+```
+
+Provide `bstack_guarded_slice_read`, `bstack_guarded_slice_write`, and `bstack_guarded_slice_subview` functions that delegate to the underlying slice while invoking the hooks at the appropriate points.
+
+The subview analogue (`BStackGuardedSliceSubview`) would be expressed as a flag or second vtable on `bstack_guarded_slice_t` that additionally intercepts `subslice` calls, allowing a guard to restrict or transform the visible range.
+
+### Open questions
+
+- Should `pre_write` be allowed to replace the buffer pointer (e.g., to encrypt into a separate scratch buffer), or should it always mutate in place? Replacing the pointer is more flexible but requires the hook to manage scratch memory lifetime.
+- How should hook errors interact with the C error-reporting convention (`errno`)? The hook returning -1 should propagate as a read/write failure, but the hook may also want to set a custom errno value.
+- Should `bstack_guarded_slice_t` be opaque (allocated on the heap) or transparent (stack-allocatable struct)? Transparency is simpler but leaks the vtable layout.
 
