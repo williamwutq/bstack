@@ -85,3 +85,52 @@ The `FirstFitBStackAllocator` could benefit from atomic operations to improve pe
 
 - Should this optimization be added as an optional feature flag, or required for all users? If added, we end up maintaining two implementations of `FirstFitBStackAllocator`; if required, all users need the atomic flag.
 
+---
+
+## Deprecating `BStackGuardedSlice::as_slice` in favor of read-only access
+
+**Feature flag:** `guarded`
+**Breaking change:** Yes — callers using `as_slice` would need to migrate to alternative APIs
+
+### Motivation
+
+The `as_slice()` method on `BStackGuardedSlice` returns a `Result<BStackSlice<'a, A>, io::Error>`, exposing the underlying slice directly. This creates a potential hazard: callers can use the returned slice to bypass the guard's hook system entirely, writing directly to the underlying `BStack` and potentially corrupting data that the guard was meant to protect (e.g., encrypted data written as plaintext, compressed data written uncompressed).
+
+While such misuse does not compromise allocator structure or create memory-safety issues (hence `as_slice` is not `unsafe`), it can lead to logical data corruption that violates the guard's invariants. For example:
+
+- An encryption guard expects all writes to go through `pre_write` to encrypt data
+- A caller obtains the slice via `as_slice()` and writes directly, bypassing encryption
+- The underlying data is now partially plaintext, violating the encryption guarantee
+
+### Design options
+
+#### Option: Deprecate and replace with reader-only access
+
+Deprecate `as_slice()` and introduce a new method that returns a read-only cursor or reader type:
+
+```rust
+fn as_reader(&self) -> BStackSliceReader<'a, A>;
+```
+
+This prevents accidental writes while still allowing inspection of the underlying slice for debugging or metadata purposes.
+
+### Arguments in favor of deprecation
+
+1. **Safety by design** — Making it harder to accidentally bypass hooks aligns with Rust's principle of making the safe path the easy path
+2. **Clear intent** — If a caller truly needs to bypass hooks, they can still use `unsafe { raw_block() }`, making the intent explicit
+3. **Consistency** — The recommended API (subslicing, `read()`, `write()`) already doesn't use `as_slice()`
+
+### Arguments against deprecation
+
+1. **Not actually unsafe** — Data corruption through misuse doesn't violate memory safety or compromise allocator structure, so marking it unsafe would be misleading per Rust conventions
+2. **Breaking change burden** — This would break existing code, and callers who correctly use `as_slice()` for read-only purposes would need to migrate
+3. **Already addressed** — Documentation and API design already encourage using `read()` and `write()`. Callers using `as_slice()` are expected to understand the implications
+4. **`raw_block()` exists** — The unsafe `raw_block()` method already exists for cases where hook bypass is needed, and its safety contract documents that hooks must be manually called. Making `as_slice()` also unsafe would be redundant
+5. **Read-only restriction insufficient** — Even read-only access might be problematic for some guards (e.g., exposing ciphertext when only plaintext should be visible)
+
+### Open questions
+
+- Is restricting to read-only access sufficient, or do some guard implementations need to hide even read access to the raw slice?
+- Would the migration burden outweigh the safety benefits?
+
+
