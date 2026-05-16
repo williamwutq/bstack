@@ -2994,6 +2994,98 @@ static int test_process_respects_locked_region(void)
 #endif /* BSTACK_FEATURE_ATOMIC && BSTACK_FEATURE_SET (lock tests) */
 
 /* =========================================================================
+ * bstack_is_empty tests
+ * ====================================================================== */
+
+static int test_is_empty_on_new_file(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    int empty = 99;
+    CHECK(bstack_is_empty(bs, &empty) == 0);
+    CHECK(empty == 1);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_is_empty_after_push(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"hi", 2, NULL) == 0);
+
+    int empty = 99;
+    CHECK(bstack_is_empty(bs, &empty) == 0);
+    CHECK(empty == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_is_empty_after_pop_to_zero(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"hi", 2, NULL) == 0);
+
+    uint8_t buf[2];
+    CHECK(bstack_pop(bs, 2, buf, NULL) == 0);
+
+    int empty = 99;
+    CHECK(bstack_is_empty(bs, &empty) == 0);
+    CHECK(empty == 1);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_is_empty_after_discard_to_zero(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"abc", 3, NULL) == 0);
+    CHECK(bstack_discard(bs, 3) == 0);
+
+    int empty = 99;
+    CHECK(bstack_is_empty(bs, &empty) == 0);
+    CHECK(empty == 1);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_is_empty_consistent_with_len(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    /* Empty: both agree. */
+    uint64_t len; int empty;
+    CHECK(bstack_len(bs, &len) == 0);
+    CHECK(bstack_is_empty(bs, &empty) == 0);
+    CHECK((len == 0) == (empty == 1));
+
+    /* Non-empty: both agree. */
+    CHECK(bstack_push(bs, (uint8_t *)"x", 1, NULL) == 0);
+    CHECK(bstack_len(bs, &len) == 0);
+    CHECK(bstack_is_empty(bs, &empty) == 0);
+    CHECK((len == 0) == (empty == 1));
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+/* =========================================================================
  * main
  * ====================================================================== */
 
@@ -3025,6 +3117,13 @@ int main(void)
     T(test_peek_at_end_offset_on_empty_file);
     T(test_get_zero_range_on_empty_file);
     T(test_drain_to_zero_then_push_starts_at_offset_zero);
+
+    /* bstack_is_empty */
+    T(test_is_empty_on_new_file);
+    T(test_is_empty_after_push);
+    T(test_is_empty_after_pop_to_zero);
+    T(test_is_empty_after_discard_to_zero);
+    T(test_is_empty_consistent_with_len);
 
     /* Data integrity */
     T(test_peek_does_not_modify_file);
