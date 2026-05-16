@@ -28,13 +28,18 @@
 //!
 //! # Persistence
 //!
-//! Because allocators operate on persistent files that survive across process restarts,
-//! the `DebugCheckingAllocator` tracks allocated and freed regions **separately**:
+//! The tracking state (which regions are allocated or freed) is **in-memory only** and
+//! is lost when the process exits. The underlying allocator's data, however, is persistent.
 //!
-//! - A region can be both allocated and freed (allocated in a previous session, freed in
-//!   the current session)
-//! - This allows detection of freed-freed overlaps even when the allocations happened
-//!   across different sessions
+//! Because of this asymmetry, allocated and freed regions are tracked **separately**:
+//!
+//! - A region can appear in both sets (allocated in a previous session, freed in the
+//!   current one).
+//! - This allows double-free detection within a single session even when the original
+//!   allocation happened in a prior run.
+//!
+//! If you need cross-session validation, reconstruct the tracking sets from your
+//! application's own metadata after reopening the file.
 //!
 //! # Example
 //!
@@ -105,13 +110,25 @@ where
     inner: A::Allocated<'a>,
 }
 
-// Manual Clone and Copy implementations since the derive macro is too conservative
+// Manual Clone, Copy, and Debug implementations since the derive macro is too conservative
 impl<'a, A> Clone for DebugHandle<'a, A>
 where
     A: BStackAllocator<Error = io::Error>,
 {
     fn clone(&self) -> Self {
         *self
+    }
+}
+
+impl<'a, A> std::fmt::Debug for DebugHandle<'a, A>
+where
+    A: BStackAllocator<Error = io::Error>,
+    A::Allocated<'a>: std::fmt::Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DebugHandle")
+            .field("inner", &self.inner)
+            .finish()
     }
 }
 
@@ -140,14 +157,19 @@ where
     type Error = io::Error;
 
     fn try_into(self) -> Result<BStackSlice<'a, DebugCheckingAllocator<A>>, Self::Error> {
-        // Convert inner handle to BStackSlice to get offset and length
         let slice: BStackSlice<'_, A> = self.inner.try_into().map_err(|e| {
             io::Error::other(format!(
-                "Failed to convert inner handle to BStackSlice: {:?}",
-                e
+                "inner handle is not convertible to BStackSlice: {e}"
             ))
         })?;
-        // SAFETY: The handle was created by the allocator with valid offset and length
+        // SAFETY:
+        // 1. `offset + len` cannot overflow: the slice was returned by the inner allocator,
+        //    which is responsible for never producing an overflowing region.
+        // 2. `[offset, offset + len)` lies within the backing stack's payload for the same
+        //    reason — the inner allocator only returns in-bounds regions.
+        // 3. This slice is for I/O only. `DebugCheckingAllocator::realloc` and `::dealloc`
+        //    accept `DebugHandle`, not `BStackSlice`, so this slice is never passed to
+        //    either, satisfying the realloc/dealloc ownership invariant.
         Ok(unsafe { BStackSlice::from_raw_parts(self.alloc, slice.start(), slice.len()) })
     }
 }
@@ -181,6 +203,7 @@ struct DebugState {
 ///
 /// Panics if:
 /// - A newly allocated region overlaps with an existing allocated region
+/// - A reallocated region overlaps with an existing allocated region
 /// - A region being freed overlaps with a previously freed region
 ///
 /// These panics indicate bugs in the underlying allocator implementation.
@@ -195,6 +218,20 @@ where
 {
     inner: A,
     state: Mutex<DebugState>,
+}
+
+impl<A> std::fmt::Debug for DebugCheckingAllocator<A>
+where
+    A: BStackAllocator<Error = io::Error> + std::fmt::Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        f.debug_struct("DebugCheckingAllocator")
+            .field("inner", &self.inner)
+            .field("allocated_count", &state.allocated.len())
+            .field("freed_count", &state.freed.len())
+            .finish()
+    }
 }
 
 impl<A> DebugCheckingAllocator<A>
@@ -348,6 +385,15 @@ where
     }
 }
 
+/// | Method    | Atomic | Notes                                                         |
+/// |-----------|--------|---------------------------------------------------------------|
+/// | `alloc`   | No     | Inner alloc then tracking update are two separate steps       |
+/// | `realloc` | No     | Inner realloc then tracking swap are two separate steps       |
+/// | `dealloc` | No     | Tracking validation then inner dealloc are two separate steps |
+///
+/// A crash between the inner operation and the tracking update leaves the in-memory
+/// state inconsistent, but because tracking state is not persistent this only matters
+/// within a single process run.
 impl<A> BStackAllocator for DebugCheckingAllocator<A>
 where
     A: BStackAllocator<Error = io::Error>,
@@ -432,11 +478,9 @@ where
     }
 
     fn dealloc(&self, handle: Self::Allocated<'_>) -> io::Result<()> {
-        // Extract offset and length from the handle
-        let slice: BStackSlice<'_, A> = handle
-            .inner
-            .try_into()
-            .map_err(|e| io::Error::other(format!("Failed to convert handle: {:?}", e)))?;
+        let slice: BStackSlice<'_, A> = handle.inner.try_into().map_err(|e| {
+            io::Error::other(format!("handle is not convertible to BStackSlice: {e}"))
+        })?;
         let offset = slice.start();
         let len = slice.len();
 
@@ -573,10 +617,8 @@ mod tests {
             state.freed.insert(Region::new(0, 100));
         }
 
-        // Record allocation of [20, 50) - should split freed into [0, 20) and [50, 100)
-        // Note: Region [20, 50) means offset=20, len=30, so end=50
-        // We can't call record_allocation directly because it needs both locks
-        // So this test just verifies the Region logic works
+        // Verify the split arithmetic that record_allocation uses.
+        // Region [20, 50) means offset=20, len=30, end=50.
         let freed_region = Region::new(0, 100);
         let alloc_region = Region::new(20, 30); // offset=20, len=30, end=50
 
