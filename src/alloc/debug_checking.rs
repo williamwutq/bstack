@@ -552,6 +552,38 @@ where
 mod tests {
     use super::*;
 
+    // Minimal allocator stub used throughout. All methods panic if called;
+    // the behavioral tests drive the checker directly via record_allocation /
+    // record_deallocation rather than going through the full alloc/dealloc path.
+    struct MockAllocator;
+
+    impl crate::alloc::BStackAllocator for MockAllocator {
+        type Error = io::Error;
+        type Allocated<'a> = crate::alloc::BStackSlice<'a, Self>;
+
+        fn stack(&self) -> &crate::BStack {
+            unimplemented!()
+        }
+        fn into_stack(self) -> crate::BStack {
+            unimplemented!()
+        }
+        fn alloc(&self, _len: u64) -> io::Result<Self::Allocated<'_>> {
+            unimplemented!()
+        }
+        fn realloc<'a>(
+            &'a self,
+            _: Self::Allocated<'a>,
+            _: u64,
+        ) -> io::Result<Self::Allocated<'a>> {
+            unimplemented!()
+        }
+        fn dealloc(&self, _: Self::Allocated<'_>) -> io::Result<()> {
+            unimplemented!()
+        }
+    }
+
+    // --- Region unit tests ---
+
     #[test]
     fn test_region_overlap() {
         let r1 = Region::new(0, 10);
@@ -577,64 +609,137 @@ mod tests {
         assert!(!r1.overlaps(&r3)); // Two zero-length regions don't overlap
     }
 
+    // --- Behavioral tests ---
+
+    fn checker() -> DebugCheckingAllocator<MockAllocator> {
+        DebugCheckingAllocator::new(MockAllocator)
+    }
+
     #[test]
-    fn test_region_splitting_logic() {
-        // Test the splitting logic directly without file I/O
-        use crate::BStack;
+    fn test_alloc_dealloc_basic() {
+        let c = checker();
+        c.record_allocation(0, 100);
+        c.record_deallocation(0, 100);
+    }
 
-        // Create a mock allocator for testing region splitting
-        struct MockAllocator;
-        impl crate::alloc::BStackAllocator for MockAllocator {
-            type Error = io::Error;
-            type Allocated<'a> = crate::alloc::BStackSlice<'a, Self>;
+    #[test]
+    fn test_adjacent_allocs_do_not_overlap() {
+        let c = checker();
+        c.record_allocation(0, 50);
+        c.record_allocation(50, 50); // exactly adjacent — must not panic
+    }
 
-            fn stack(&self) -> &BStack {
-                unimplemented!()
-            }
-            fn into_stack(self) -> BStack {
-                unimplemented!()
-            }
-            fn alloc(&self, _len: u64) -> io::Result<Self::Allocated<'_>> {
-                unimplemented!()
-            }
-            fn realloc<'a>(
-                &'a self,
-                _: Self::Allocated<'a>,
-                _: u64,
-            ) -> io::Result<Self::Allocated<'a>> {
-                unimplemented!()
-            }
-            fn dealloc(&self, _: Self::Allocated<'_>) -> io::Result<()> {
-                unimplemented!()
-            }
-        }
+    #[test]
+    fn test_dealloc_untracked_region_is_allowed() {
+        // A region allocated in a previous session is unknown to this checker;
+        // freeing it should succeed without panic.
+        let c = checker();
+        c.record_deallocation(0, 100);
+    }
 
-        let checker = DebugCheckingAllocator::new(MockAllocator);
+    #[test]
+    #[should_panic(expected = "double-free")]
+    fn test_double_free_panics() {
+        let c = checker();
+        c.record_allocation(0, 100);
+        c.record_deallocation(0, 100);
+        c.record_deallocation(0, 100); // second free of same region
+    }
 
-        // Simulate: freed region [0, 100)
-        {
-            let mut state = checker.state.lock().unwrap();
-            state.freed.insert(Region::new(0, 100));
-        }
+    #[test]
+    #[should_panic(expected = "overlaps with existing allocated region")]
+    fn test_overlapping_alloc_panics() {
+        let c = checker();
+        c.record_allocation(0, 100);
+        c.record_allocation(50, 100); // [50, 150) overlaps [0, 100)
+    }
 
-        // Verify the split arithmetic that record_allocation uses.
-        // Region [20, 50) means offset=20, len=30, end=50.
-        let freed_region = Region::new(0, 100);
-        let alloc_region = Region::new(20, 30); // offset=20, len=30, end=50
+    #[test]
+    #[should_panic(expected = "Partial deallocations are not allowed")]
+    fn test_partial_free_panics() {
+        let c = checker();
+        c.record_allocation(0, 100);
+        c.record_deallocation(0, 50); // only first half of [0, 100)
+    }
 
-        assert_eq!(alloc_region.end(), 50);
-        assert!(freed_region.overlaps(&alloc_region));
+    #[test]
+    #[should_panic(expected = "Partial deallocations are not allowed")]
+    fn test_superset_free_panics() {
+        let c = checker();
+        c.record_allocation(20, 50);
+        c.record_deallocation(0, 100); // [0, 100) is a strict superset of [20, 70)
+    }
 
-        // Verify split calculation
-        assert!(freed_region.offset < alloc_region.offset); // [0, 20) exists
-        assert!(alloc_region.end() < freed_region.end()); // [50, 100) exists
+    #[test]
+    #[should_panic(expected = "spans multiple allocated regions")]
+    fn test_spanning_free_panics() {
+        let c = checker();
+        c.record_allocation(0, 50);
+        c.record_allocation(50, 50);
+        c.record_deallocation(0, 100); // covers both [0, 50) and [50, 100)
+    }
 
-        let before_len = alloc_region.offset - freed_region.offset;
-        assert_eq!(before_len, 20);
+    #[test]
+    fn test_freed_region_split_on_reallocation() {
+        let c = checker();
 
-        let after_offset = alloc_region.end();
-        let after_len = freed_region.end() - after_offset;
-        assert_eq!(after_offset, 50);
-        assert_eq!(after_len, 50);
+        // Free a large region, then re-allocate a slice out of the middle of it.
+        // The freed region [0, 100) should be split into [0, 20) and [50, 100).
+        c.record_allocation(0, 100);
+        c.record_deallocation(0, 100);
+        c.record_allocation(20, 30); // [20, 50)
+
+        let state = c.state.lock().unwrap();
+        assert!(state.freed.contains(&Region::new(0, 20)));
+        assert!(state.freed.contains(&Region::new(50, 50)));
+        assert!(!state.freed.contains(&Region::new(0, 100)));
+        assert!(state.allocated.contains(&Region::new(20, 30)));
+    }
+
+    #[test]
+    fn test_freed_region_split_left_edge() {
+        let c = checker();
+
+        // Re-allocate from the very start of a freed region — only the right
+        // remainder should appear in the freed set.
+        c.record_allocation(0, 100);
+        c.record_deallocation(0, 100);
+        c.record_allocation(0, 30); // [0, 30) — consumes the left edge
+
+        let state = c.state.lock().unwrap();
+        assert!(!state.freed.contains(&Region::new(0, 100)));
+        assert!(!state.freed.iter().any(|r| r.offset < 30));
+        assert!(state.freed.contains(&Region::new(30, 70)));
+    }
+
+    #[test]
+    fn test_freed_region_split_right_edge() {
+        let c = checker();
+
+        // Re-allocate from the very end of a freed region — only the left
+        // remainder should appear in the freed set.
+        c.record_allocation(0, 100);
+        c.record_deallocation(0, 100);
+        c.record_allocation(70, 30); // [70, 100) — consumes the right edge
+
+        let state = c.state.lock().unwrap();
+        assert!(!state.freed.contains(&Region::new(0, 100)));
+        assert!(state.freed.contains(&Region::new(0, 70)));
+        assert!(!state.freed.iter().any(|r| r.end() > 70));
+    }
+
+    #[test]
+    fn test_freed_region_exact_reuse_removes_entry() {
+        let c = checker();
+
+        // Re-allocating a region that exactly matches a freed region should
+        // leave nothing for that region in the freed set.
+        c.record_allocation(0, 100);
+        c.record_deallocation(0, 100);
+        c.record_allocation(0, 100);
+
+        let state = c.state.lock().unwrap();
+        assert!(state.freed.is_empty());
+        assert!(state.allocated.contains(&Region::new(0, 100)));
     }
 }

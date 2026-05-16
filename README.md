@@ -712,6 +712,22 @@ alloc.dealloc_bulk(&slices)?;
 let stack = alloc.into_stack();
 ```
 
+### `DebugCheckingAllocator` (`alloc` feature)
+
+A debug/test wrapper around any `BStackAllocator`.  It tracks allocated and freed
+regions in memory and panics immediately if it detects:
+
+- **Overlapping allocations** — the inner allocator returned a region that overlaps
+  an existing live allocation.
+- **Double-frees** — a region is freed twice within the same session.
+- **Partial or spanning frees** — a deallocation does not exactly match one recorded
+  allocation.
+
+The tracking state is **in-memory only** and is reset on process restart, so it
+complements but does not replace the allocator's own crash-safety guarantees.
+
+> **Warning:** Not for production use. The in-memory tracking state adds significant overhead, so this wrapper is intended only for debugging and testing. You should not rely on it to detect double-frees or overlapping allocations in production.
+
 ---
 
 ## File format
