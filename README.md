@@ -333,15 +333,7 @@ assert!(stack.pop(stack.len()? - 60).is_err()); // would shrink below locked
 
 ### Concurrency
 
-`lock_up_to(n)` takes the exclusive write lock before publishing the new
-boundary with a `Release` store.  Lock-free readers `Acquire`-load the
-boundary on each call: a stale load always falls through to the rwlock
-path, and a fresh load can only see a strictly larger (and therefore still
-safe) immutable range.  Writers re-check the boundary under the write lock,
-so they cannot race against an in-flight `lock_up_to`.
-
-On platforms other than Unix and Windows the boundary still enforces
-immutability; only the lock-free read fast path is platform-gated.
+`lock_up_to(n)` takes the write lock and publishes the new boundary with a `Release` store. Lock-free readers `Acquire`-load the boundary; a stale load safely falls through to the rwlock path. Writers re-check under the write lock and cannot race against an in-flight `lock_up_to`. On other platforms the boundary still enforces immutability; only the lock-free read path is platform-gated.
 
 ---
 
@@ -396,169 +388,42 @@ crash-safe ordering.
 
 ```toml
 [dependencies]
-bstack = { version = "0.1", features = ["atomic"] }
+bstack = { version = "0.2", features = ["atomic"] }
 # Combined set + atomic unlocks swap, swap_into, and cas:
-bstack = { version = "0.1", features = ["set", "atomic"] }
+bstack = { version = "0.2", features = ["set", "atomic"] }
 ```
 
-#### `atrunc(n, buf)` — truncate then append
-
-Cut `n` bytes off the tail then append `buf` in one locked operation.  
-Equivalent to `discard(n)` + `push(buf)` but with no intermediate visible state.
-
-```rust
-stack.push(b"hello world")?;
-stack.atrunc(6, b"Rust")?; // remove " world", append "Rust"
-assert_eq!(stack.peek(0)?, b"helloRust");
-```
-
-#### `splice(n, buf) -> Vec<u8>` — pop then append, returning removed bytes
-
-Remove and return the last `n` bytes, then append `buf`.  
-Equivalent to `pop(n)` + `push(buf)` but atomically.
-
-```rust
-stack.push(b"hello world")?;
-let removed = stack.splice(5, b"Rust")?;
-assert_eq!(removed, b"world");
-assert_eq!(stack.peek(0)?, b"hello Rust");
-```
-
-#### `splice_into(old, new)` — pop into buffer then append
-
-Same as `splice` but reads the removed bytes into a caller-supplied `old`
-slice instead of allocating a `Vec`, where `n = old.len()`.
-
-```rust
-stack.push(b"hello world")?;
-let mut buf = [0u8; 5];
-stack.splice_into(&mut buf, b"Rust")?;
-assert_eq!(&buf, b"world");
-```
-
-#### `try_extend(s, buf) -> bool` — conditional append
-
-Append `buf` only if the current logical payload size equals `s`.  Returns
-`true` on success, `false` if the size did not match (no-op).  Useful for
-optimistic, lock-free–style append protocols.
-
-```rust
-let len = stack.len()?;
-if stack.try_extend(len, b"new entry\n")? {
-    // appended
-} else {
-    // someone else wrote first; retry
-}
-```
-
-#### `try_discard(s, n) -> bool` — conditional discard
-
-Discard `n` bytes only if the current logical payload size equals `s`.  Returns
-`true` on success, `false` if the size did not match.
-
-```rust
-let len = stack.len()?;
-if stack.try_discard(len, 4)? {
-    // last 4 bytes removed
-}
-```
-
-#### `replace(n, f)` — read tail, transform, write new tail
-
-Pop `n` bytes off the tail, pass them read-only to a callback, then write
-whatever the callback returns as the new tail.  The file grows or shrinks
-according to the returned `Vec` length, using the same crash-safe two-path
-ordering as `atrunc`.
-
-```rust
-stack.push(b"hello world")?;
-stack.replace(5, |tail| {
-    tail.iter().map(|b| b.to_ascii_uppercase()).collect()
-})?;
-assert_eq!(stack.peek(0)?, b"hello WORLD");
-```
-
----
-
-#### `swap(offset, buf) -> Vec<u8>` — atomic read-then-overwrite *(requires `set`)*
-
-Read `buf.len()` bytes at `offset`, overwrite them with `buf`, and return the
-old contents.  The file size never changes.
-
-```rust
-stack.push(b"helloworld")?;
-let old = stack.swap(5, b"WORLD")?;
-assert_eq!(old, b"world");
-assert_eq!(stack.peek(0)?, b"helloWORLD");
-```
-
-#### `swap_into(offset, buf)` — atomic read-then-overwrite into buffer *(requires `set`)*
-
-Same as `swap` but exchanges in-place through a caller-supplied buffer: on
-entry `buf` holds the new bytes; on return `buf` holds the old bytes.
-
-```rust
-let mut buf = *b"WORLD";
-stack.swap_into(5, &mut buf)?;
-// buf now holds the old bytes at offset 5
-```
-
-#### `cas(offset, old, new) -> bool` — compare-and-exchange *(requires `set`)*
-
-Read `old.len()` bytes at `offset` and, if they match `old`, overwrite them
-with `new`.  Returns `true` if the exchange was performed, `false` if the
-comparison failed or the lengths differ.  The file size never changes.
-
-```rust
-stack.push(b"helloworld")?;
-let swapped = stack.cas(5, b"world", b"WORLD")?;
-assert!(swapped);
-assert_eq!(stack.peek(0)?, b"helloWORLD");
-```
-
-#### `process(start, end, f)` — read range, mutate in place, write back *(requires `set`)*
-
-Read bytes in `[start, end)`, pass them to a callback as a `&mut [u8]` for
-in-place mutation, then write the modified bytes back.  The file size is never
-changed.  `start == end` is a valid no-op.
-
-```rust
-stack.push(b"hello world")?;
-stack.process(6, 11, |buf| {
-    buf.make_ascii_uppercase();
-})?;
-assert_eq!(stack.peek(0)?, b"hello WORLD");
-```
+- **`atrunc(n, buf)`** — Cut `n` bytes off the tail, then append `buf`. Equivalent to `discard(n)` + `push(buf)` with no intermediate visible state.
+- **`splice(n, buf)`** — Remove and return the last `n` bytes, then append `buf`. Equivalent to `pop(n)` + `push(buf)` but atomically.
+- **`splice_into(old, new)`** — Like `splice` but reads removed bytes into a caller-supplied buffer instead of allocating a `Vec` (`n = old.len()`).
+- **`try_extend(s, buf)`** — Append `buf` only if the current payload size equals `s`. Returns `true` on success. Useful for optimistic-append protocols.
+- **`try_discard(s, n)`** — Discard `n` bytes only if the current payload size equals `s`. Returns `true` on success.
+- **`replace(n, f)`** — Pop `n` bytes, pass them read-only to callback `f`, write back the returned `Vec` as the new tail. File may grow or shrink.
+- **`swap(offset, buf)`** *(requires `set`)* — Read `buf.len()` bytes at `offset`, overwrite with `buf`, return old bytes. File size never changes.
+- **`swap_into(offset, buf)`** *(requires `set`)* — Like `swap` but exchanges in-place: on entry `buf` holds new bytes, on return holds old bytes.
+- **`cas(offset, old, new)`** *(requires `set`)* — Overwrite bytes at `offset` with `new` only if they currently equal `old`. Returns `true` if exchanged. File size never changes.
+- **`process(start, end, f)`** *(requires `set`)* — Read `[start, end)`, pass to `f` as `&mut [u8]` for in-place mutation, write back. File size never changes. `start == end` is a no-op.
 
 ---
 
 ### `set`
 
-`BStack::set(offset, data)` — in-place overwrite of existing payload bytes
-without changing the file size or the committed-length header.
-
-`BStack::zero(offset, n)` — in-place overwrite of `n` bytes with zeros,
-without changing the file size or the committed-length header.  Equivalent to
-`set` with a zero-filled buffer but avoids a caller-supplied allocation.
+Enables `BStack::set(offset, data)` (in-place overwrite) and `BStack::zero(offset, n)` (zero-fill in place). Neither changes the file size or the committed-length header.
 
 ```toml
 [dependencies]
-bstack = { version = "0.1", features = ["set"] }
+bstack = { version = "0.2", features = ["set"] }
 ```
 
 ### `alloc`
 
-Enables the region-management layer on top of `BStack`:
-`BStackAllocator`, `BStackBulkAllocator`, `BStackSlice`, `BStackSliceReader`, and
-`LinearBStackAllocator`.
+Enables the region-management layer on top of `BStack`: `BStackAllocator`, `BStackBulkAllocator`, `BStackSlice`, `BStackSliceReader`, `LinearBStackAllocator`, `FirstFitBStackAllocator`, `GhostTreeBstackAllocator`, `ManualAllocator`, and the `BStackSliceAllocator` supertrait.
 
 ```toml
 [dependencies]
-bstack = { version = "0.1", features = ["alloc"] }
+bstack = { version = "0.2", features = ["alloc"] }
 # In-place slice writes (BStackSliceWriter) also need `set`:
-bstack = { version = "0.1", features = ["alloc", "set"] }
-# Experimental FirstFitBStackAllocator requires both alloc and set:
-bstack = { version = "0.1", features = ["alloc", "set"] }
+bstack = { version = "0.2", features = ["alloc", "set"] }
 ```
 
 ---
@@ -596,23 +461,16 @@ For batch allocation and deallocation, see [`BStackBulkAllocator`](#bstackbulkal
 
 ### `BStackBulkAllocator` trait
 
-An extension trait for `BStackAllocator` that adds two required, atomic bulk
-methods.  "Atomic" here means: either the operation succeeds completely, or the
-backing store is left entirely unchanged — no partial allocation or deallocation.
-Crash safety wise, the durable state of the allocator after a crash is always
-consistent or recovery is guaranteed to succeed, even if the crash occurs in the
-middle of an operation. The atomicity guarantee does not need to apply completely
-to a crash, but it must apply to the state of the allocator as observed by the next
-successful operation after a crash.
+An extension trait for `BStackAllocator` that adds two atomic bulk methods. "Atomic" means either the operation succeeds completely or the backing store is left entirely unchanged. After a crash, the on-disk state is always consistent or recovery succeeds before the next user operation.
 
 ```rust
 pub trait BStackBulkAllocator: BStackAllocator {
     /// Allocate one slice per entry in `lengths` in a single atomic operation.
     fn alloc_bulk(&self, lengths: impl AsRef<[u64]>)
-        -> io::Result<Vec<BStackSlice<'_, Self>>>;
+        -> io::Result<Vec<Self::Allocated<'_>>>;
 
     /// Deallocate all supplied slices in a single atomic operation.
-    fn dealloc_bulk<'a>(&'a self, slices: impl AsRef<[BStackSlice<'a, Self>]>)
+    fn dealloc_bulk<'a>(&'a self, slices: impl AsRef<[Self::Allocated<'a>]>)
         -> io::Result<()>;
 }
 ```
@@ -624,14 +482,13 @@ A lightweight `Copy` handle — one `&'a A` reference plus two `u64` fields
 Produced by `BStackAllocator::alloc`; consumed by `realloc` and `dealloc`.
 
 > **Slice origin requirement.** `realloc` and `dealloc` are only guaranteed to
-> work correctly with a slice that was returned directly by `alloc` or by a
-> prior call to `realloc` on the **same allocator instance**.  Passing an
-> arbitrary sub-slice obtained via `subslice`, `subslice_range`, or a manually
-> constructed `BStackSlice::new` is not supported and may silently corrupt the
-> allocator's internal state.  If you need to preserve a slice handle across a
-> file reopen, serialise the raw `(start, len)` fields and reconstruct the
-> slice via `BStackSlice::new` only for read/write I/O — never pass a
-> reconstructed slice back to `realloc` or `dealloc`.
+> work correctly with a slice returned directly by `alloc` or a prior `realloc`
+> on the **same allocator instance**.  Passing a sub-slice (`subslice`,
+> `subslice_range`) or a manually reconstructed slice may silently corrupt
+> allocator metadata.  To preserve a handle across a file reopen, serialise the
+> raw `(start, len)` fields and reconstruct via
+> `unsafe { BStackSlice::from_raw_parts(...) }` for read/write I/O only —
+> never pass a reconstructed slice to `realloc` or `dealloc`.
 
 Key methods:
 
@@ -639,6 +496,7 @@ Key methods:
 |----------------------------------------------|------------------------------------------------|
 | `read()`                                     | Read the entire region into a new `Vec<u8>`    |
 | `read_into(buf)`                             | Read into a caller-supplied buffer             |
+| `read_range(start, end)`                     | Read a sub-range into a new `Vec<u8>`          |
 | `read_range_into(start, buf)`                | Read a sub-range into a caller-supplied buffer |
 | `subslice(start, end)`                       | Narrow to a sub-range (relative offsets)       |
 | `subslice_range(range)`                      | Narrow to a sub-range using a `Range<u64>`     |
@@ -679,7 +537,7 @@ the file does not grow without bound.
 
 ```toml
 [dependencies]
-bstack = { version = "0.1", features = ["alloc", "set"] }
+bstack = { version = "0.2", features = ["alloc", "set"] }
 ```
 
 #### On-disk layout
@@ -785,7 +643,7 @@ Implements both `BStackAllocator` and `BStackBulkAllocator`.
 
 ```toml
 [dependencies]
-bstack = { version = "0.1", features = ["alloc"] }
+bstack = { version = "0.2", features = ["alloc"] }
 ```
 
 | Operation               | Strategy                                         | Crash-safe  |
@@ -992,59 +850,9 @@ On other platforms a seek is required; `peek`, `peek_into`, `get`, and
 
 ---
 
-## Why async (Tokio) integration is not planned
+## Why async is not planned
 
-`bstack` is deliberately synchronous, and async support would add real cost for
-no meaningful gain.  The reasons below are structural, not incidental.
-
-### 1. Durability is an inherently blocking syscall
-
-The entire value proposition of `bstack` is that `push` and `pop` do not return
-until the data is on stable storage.  That contract is fulfilled by
-`fcntl(F_FULLFSYNC)` on macOS, `fdatasync` on other Unix, and
-`FlushFileBuffers` on Windows.  All three are blocking syscalls that park the
-calling thread until the drive acknowledges the write.
-
-In an async runtime, blocking syscalls must be offloaded to a thread pool via
-`spawn_blocking`.  So an "async `push`" would simply be:
-
-```rust
-tokio::task::spawn_blocking(|| stack.push(data)).await
-```
-
-That is not necessary to be added as an async method on `BStack` itself, since the blocking nature of the operation is already clear from the API and documentation. The above pattern is idiomatic for using blocking operations in a Tokio application.
-
-### 2. No I/O concurrency to exploit
-
-Async I/O improves throughput when multiple independent operations can be
-in-flight simultaneously.  `bstack` cannot do this:
-
-- **Writes are ordered.** Each `push` extends the file at the tail and updates
-  the committed-length header.  Reordering or interleaving writes would corrupt
-  the header or produce a torn committed length.
-- **Every write ends with a barrier.** `durable_sync` must complete before the
-  next operation starts; there is nothing to pipeline.
-- **Operations are serialised by a `RwLock`.** Concurrent writes already block
-  on each other.  Wrapping that in `async` would only add overhead.
-
-### 3. The file lock is blocking and must not run on an async thread
-
-`open` calls `flock(LOCK_EX | LOCK_NB)` on Unix or `LockFileEx` on Windows.
-Blocking on a mutex inside an async executor stalls the thread and starves
-other tasks on the same worker.  Moving the lock acquisition to
-`spawn_blocking` is again just synchronous I/O on a thread pool.
-
-### 4. Tokio would break the minimal-dependencies guarantee
-
-`bstack` currently depends only on `libc` (Unix) and `windows-sys` (Windows).
-Pulling in `tokio` — even as an optional dependency — would introduce a large
-transitive dependency tree that affects every user of the crate, including the
-many users who do not use an async runtime at all.
-
-### What to do in async code
-
-If you are using `bstack` from inside a Tokio application, the idiomatic
-approach is:
+Durability requires `fcntl(F_FULLFSYNC)` (macOS), `fdatasync` (Linux), or `FlushFileBuffers` (Windows) — all blocking syscalls that must complete before returning. All writes are tail-ordered with a mandatory `durable_sync` barrier; there is nothing to pipeline, and a `RwLock` serialises concurrent writers regardless. Adding Tokio even as an optional dependency would break the minimal-dependency guarantee. The idiomatic approach from async code is:
 
 ```rust
 let result = tokio::task::spawn_blocking(move || {
