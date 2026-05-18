@@ -2,6 +2,7 @@
 #define BSTACK_ALLOC_H
 
 #include "bstack.h"
+#include <errno.h>
 
 /*
  * bstack_alloc — region-management layer on top of bstack.
@@ -14,6 +15,10 @@
  *                             regions within it.  Vtable methods: stack, alloc,
  *                             realloc, dealloc.  Convenience helpers (inline):
  *                             bstack_allocator_len, bstack_allocator_is_empty.
+ *                             Also carries a bulk_vtbl pointer (NULL when not
+ *                             supported) and helpers:
+ *                             bstack_allocator_alloc_bulk,
+ *                             bstack_allocator_dealloc_bulk.
  * bstack_slice_reader_t     — cursor-based reader over a bstack_slice_t.
  * linear_bstack_allocator_t — bump allocator; every operation maps to one call.
  *
@@ -231,8 +236,39 @@ typedef struct {
     int (*dealloc)(bstack_allocator_t *self, bstack_slice_t slice);
 } bstack_allocator_vtbl_t;
 
+/*
+ * bstack_bulk_allocator_vtbl_t — optional bulk extension vtable.
+ *
+ * The struct embeds bstack_allocator_vtbl_t as its first member so a pointer
+ * to it may be safely cast to bstack_allocator_vtbl_t *.  Concrete allocators
+ * that support bulk operations set base.vtbl = &bulk_vtbl->base and
+ * base.bulk_vtbl = bulk_vtbl.
+ */
+typedef struct {
+    bstack_allocator_vtbl_t base; /* must be first */
+
+    /*
+     * Allocate n zero-initialised regions.
+     * lens[i] is the size in bytes for out_slices[i]; out_slices must hold
+     * room for n bstack_slice_t values.  On failure, any slices already
+     * allocated are rolled back and out_slices is left unmodified.
+     * Returns 0 on success, -1 on failure (errno set).
+     */
+    int (*alloc_bulk)(bstack_allocator_t *self, const uint64_t *lens, size_t n,
+                      bstack_slice_t *out_slices);
+
+    /*
+     * Free n slices.
+     * All slices must originate from the same allocator instance.
+     * Returns 0 on success, -1 on failure (errno set).
+     */
+    int (*dealloc_bulk)(bstack_allocator_t *self, const bstack_slice_t *slices,
+                        size_t n);
+} bstack_bulk_allocator_vtbl_t;
+
 struct bstack_allocator {
-    const bstack_allocator_vtbl_t *vtbl;
+    const bstack_allocator_vtbl_t      *vtbl;
+    const bstack_bulk_allocator_vtbl_t *bulk_vtbl; /* NULL if not supported */
 };
 
 /* -------------------------------------------------------------------------
@@ -292,6 +328,37 @@ bstack_allocator_is_empty(bstack_allocator_t *a, int *out_empty)
     if (r == 0)
         *out_empty = (len == 0);
     return r;
+}
+
+/* Return the bulk vtable for this allocator, or NULL if not supported. */
+static inline const bstack_bulk_allocator_vtbl_t *
+bstack_allocator_bulk_vtbl(bstack_allocator_t *a)
+{
+    return a->bulk_vtbl;
+}
+
+/*
+ * Allocate n slices in bulk.  Returns -1 with errno = ENOTSUP when the
+ * allocator has no bulk vtable.
+ */
+static inline int
+bstack_allocator_alloc_bulk(bstack_allocator_t *a, const uint64_t *lens,
+                             size_t n, bstack_slice_t *out_slices)
+{
+    if (!a->bulk_vtbl) { errno = ENOTSUP; return -1; }
+    return a->bulk_vtbl->alloc_bulk(a, lens, n, out_slices);
+}
+
+/*
+ * Free n slices in bulk.  Returns -1 with errno = ENOTSUP when the allocator
+ * has no bulk vtable.
+ */
+static inline int
+bstack_allocator_dealloc_bulk(bstack_allocator_t *a,
+                               const bstack_slice_t *slices, size_t n)
+{
+    if (!a->bulk_vtbl) { errno = ENOTSUP; return -1; }
+    return a->bulk_vtbl->dealloc_bulk(a, slices, n);
 }
 
 /* =========================================================================

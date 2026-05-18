@@ -355,11 +355,40 @@ static int linear_vt_dealloc(bstack_allocator_t *self, bstack_slice_t slice)
     return 0; /* non-tail slice: no-op */
 }
 
-static const bstack_allocator_vtbl_t linear_vtbl = {
-    linear_vt_stack,
-    linear_vt_alloc,
-    linear_vt_realloc,
-    linear_vt_dealloc
+static int
+linear_vt_alloc_bulk(bstack_allocator_t *self, const uint64_t *lens, size_t n,
+                     bstack_slice_t *out_slices)
+{
+    size_t i;
+    for (i = 0; i < n; i++) {
+        if (linear_vt_alloc(self, lens[i], &out_slices[i]) != 0) {
+            /* roll back in reverse — each is the current tail */
+            while (i > 0) {
+                i--;
+                linear_vt_dealloc(self, out_slices[i]);
+            }
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int
+linear_vt_dealloc_bulk(bstack_allocator_t *self, const bstack_slice_t *slices,
+                       size_t n)
+{
+    size_t i;
+    for (i = 0; i < n; i++) {
+        if (linear_vt_dealloc(self, slices[i]) != 0)
+            return -1;
+    }
+    return 0;
+}
+
+static const bstack_bulk_allocator_vtbl_t linear_bulk_vtbl = {
+    { linear_vt_stack, linear_vt_alloc, linear_vt_realloc, linear_vt_dealloc },
+    linear_vt_alloc_bulk,
+    linear_vt_dealloc_bulk
 };
 
 /* =========================================================================
@@ -373,8 +402,9 @@ linear_bstack_allocator_t *linear_bstack_allocator_new(bstack_t *bs)
         errno = ENOMEM;
         return NULL;
     }
-    a->base.vtbl = &linear_vtbl;
-    a->bs        = bs;
+    a->base.vtbl      = &linear_bulk_vtbl.base;
+    a->base.bulk_vtbl = &linear_bulk_vtbl;
+    a->bs             = bs;
     return a;
 }
 
@@ -1373,11 +1403,39 @@ static int ff_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
     }
 }
 
-static const bstack_allocator_vtbl_t ff_vtbl = {
-    ff_vt_stack,
-    ff_vt_alloc,
-    ff_vt_realloc,
-    ff_vt_dealloc
+static int
+ff_vt_alloc_bulk(bstack_allocator_t *self, const uint64_t *lens, size_t n,
+                 bstack_slice_t *out_slices)
+{
+    size_t i;
+    for (i = 0; i < n; i++) {
+        if (ff_vt_alloc(self, lens[i], &out_slices[i]) != 0) {
+            while (i > 0) {
+                i--;
+                ff_vt_dealloc(self, out_slices[i]);
+            }
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int
+ff_vt_dealloc_bulk(bstack_allocator_t *self, const bstack_slice_t *slices,
+                   size_t n)
+{
+    size_t i;
+    for (i = 0; i < n; i++) {
+        if (ff_vt_dealloc(self, slices[i]) != 0)
+            return -1;
+    }
+    return 0;
+}
+
+static const bstack_bulk_allocator_vtbl_t ff_bulk_vtbl = {
+    { ff_vt_stack, ff_vt_alloc, ff_vt_realloc, ff_vt_dealloc },
+    ff_vt_alloc_bulk,
+    ff_vt_dealloc_bulk
 };
 
 /* =========================================================================
@@ -1392,8 +1450,9 @@ first_fit_bstack_allocator_t *first_fit_bstack_allocator_new(bstack_t *bs)
 
     a = malloc(sizeof *a);
     if (!a) { errno = ENOMEM; return NULL; }
-    a->base.vtbl = &ff_vtbl;
-    a->bs        = bs;
+    a->base.vtbl      = &ff_bulk_vtbl.base;
+    a->base.bulk_vtbl = &ff_bulk_vtbl;
+    a->bs             = bs;
 
     if (bstack_len(bs, &stack_len) != 0) { free(a); return NULL; }
 
@@ -2151,11 +2210,39 @@ static int gt_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
     }
 }
 
-static const bstack_allocator_vtbl_t gt_vtbl = {
-    gt_vt_stack,
-    gt_vt_alloc,
-    gt_vt_realloc,
-    gt_vt_dealloc
+static int
+gt_vt_alloc_bulk(bstack_allocator_t *self, const uint64_t *lens, size_t n,
+                 bstack_slice_t *out_slices)
+{
+    size_t i;
+    for (i = 0; i < n; i++) {
+        if (gt_vt_alloc(self, lens[i], &out_slices[i]) != 0) {
+            while (i > 0) {
+                i--;
+                gt_vt_dealloc(self, out_slices[i]);
+            }
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int
+gt_vt_dealloc_bulk(bstack_allocator_t *self, const bstack_slice_t *slices,
+                   size_t n)
+{
+    size_t i;
+    for (i = 0; i < n; i++) {
+        if (gt_vt_dealloc(self, slices[i]) != 0)
+            return -1;
+    }
+    return 0;
+}
+
+static const bstack_bulk_allocator_vtbl_t gt_bulk_vtbl = {
+    { gt_vt_stack, gt_vt_alloc, gt_vt_realloc, gt_vt_dealloc },
+    gt_vt_alloc_bulk,
+    gt_vt_dealloc_bulk
 };
 
 /* =========================================================================
@@ -2169,8 +2256,9 @@ ghost_tree_bstack_allocator_t *ghost_tree_bstack_allocator_new(bstack_t *bs)
 
     a = malloc(sizeof *a);
     if (!a) { errno = ENOMEM; return NULL; }
-    a->base.vtbl = &gt_vtbl;
-    a->bs        = bs;
+    a->base.vtbl      = &gt_bulk_vtbl.base;
+    a->base.bulk_vtbl = &gt_bulk_vtbl;
+    a->bs             = bs;
 
     if (bstack_len(bs, &stack_len) != 0) { free(a); return NULL; }
 

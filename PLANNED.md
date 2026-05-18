@@ -170,7 +170,6 @@ Each concrete allocator (`linear_bstack_allocator_t`, `first_fit_bstack_allocato
 ### Open questions
 
 - Should bulk operations be a separate vtable pointer hanging off `bstack_allocator_t`, or a distinct handle type (analogous to the Rust trait extension pattern)?
-- Should `linear_bstack_allocator_t` support `dealloc_bulk`? Linear allocation inherently does not support dealloc of individual slices, so bulk dealloc is equally unsupported — it would return `ENOTSUP`.
 
 ---
 
