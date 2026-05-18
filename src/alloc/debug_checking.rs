@@ -168,15 +168,16 @@ struct DebugState {
 
 /// Debug-only allocator wrapper that validates allocations and deallocations.
 ///
-/// Wraps any [`BStackAllocator`] with `Error = io::Error` and
-/// `Allocated<'a> = BStackSlice<'a, Self>` and maintains sets of allocated
-/// and freed regions to detect overlaps.
+/// Wraps any [`BStackAllocator`] with `Error = io::Error`. This wrapper's
+/// allocated handle type is [`DebugHandle`], which preserves the inner
+/// allocator's handle while enabling conversion to [`BStackSlice`]. It also
+/// maintains sets of allocated and freed regions to detect overlaps.
 ///
 /// # Constraints
 ///
 /// This wrapper works with any allocator whose `Allocated` handles can convert
-/// to and from `BStackSlice`, which includes all allocators provided by this library
-/// ([`crate::LinearBStackAllocator`], [`crate::FirstFitBStackAllocator`],
+/// to and from [`BStackSlice`], which includes all allocators provided by this
+/// library ([`crate::LinearBStackAllocator`], [`crate::FirstFitBStackAllocator`],
 /// [`crate::GhostTreeBstackAllocator`], [`crate::ManualAllocator`]).
 ///
 /// # Panics
