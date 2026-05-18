@@ -457,11 +457,40 @@ where
         })?;
         let offset = slice.start();
         let len = slice.len();
+        let region = offset..offset + len;
 
-        // Validate BEFORE calling inner dealloc
-        self.record_deallocation(offset, len);
+        // Validate first without mutating tracking state.
+        {
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+
+            if state.freed.contains(&region) {
+                panic!(
+                    "DebugCheckingAllocator: Double free detected for region [{}, {}).",
+                    region.start, region.end
+                );
+            }
+
+            if !state.allocated.contains(&region) {
+                panic!(
+                    "DebugCheckingAllocator: Attempt to free unallocated region [{}, {}).",
+                    region.start, region.end
+                );
+            }
+        }
 
         self.inner.dealloc(handle.inner)?;
+
+        // Commit tracking state only after the inner deallocation succeeds.
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let removed = state.allocated.remove(&region);
+        debug_assert!(
+            removed,
+            "validated region [{}, {}) must still be present in allocated set",
+            region.start,
+            region.end
+        );
+        state.freed.insert(region);
+
         Ok(())
     }
 }
