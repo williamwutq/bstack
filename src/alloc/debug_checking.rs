@@ -78,6 +78,57 @@ fn check_overlap(region: &Range<u64>, set: &HashSet<Range<u64>>) -> Option<Range
     set.iter().find(|r| overlaps(region, r)).cloned()
 }
 
+/// Record an allocated region in `state`, splitting any overlapping freed regions.
+fn record_allocated_region(
+    state: &mut DebugState,
+    region: Range<u64>,
+    operation: &str,
+    allocator_context: &str,
+) {
+    if let Some(overlap) = check_overlap(&region, &state.allocated) {
+        panic!(
+            "DebugCheckingAllocator: {operation} [{}, {}) overlaps with \
+             existing allocated region [{}, {}). This indicates a bug in the underlying \
+             allocator{allocator_context}.",
+            region.start, region.end, overlap.start, overlap.end
+        );
+    }
+
+    let overlapping_freed: Vec<Range<u64>> = state
+        .freed
+        .iter()
+        .filter(|r| overlaps(&region, r))
+        .cloned()
+        .collect();
+
+    for freed_region in overlapping_freed {
+        state.freed.remove(&freed_region);
+
+        if freed_region.start < region.start {
+            state.freed.insert(freed_region.start..region.start);
+        }
+
+        if region.end < freed_region.end {
+            state.freed.insert(region.end..freed_region.end);
+        }
+    }
+
+    state.allocated.insert(region);
+}
+
+/// Record a freed region in `state`.
+fn record_freed_region(state: &mut DebugState, region: Range<u64>) {
+    if let Some(overlap) = check_overlap(&region, &state.freed) {
+        panic!(
+            "DebugCheckingAllocator: Attempting to free region [{}, {}) which overlaps \
+             with already freed region [{}, {}). This indicates a double-free bug.",
+            region.start, region.end, overlap.start, overlap.end
+        );
+    }
+
+    state.freed.insert(region);
+}
+
 /// Handle type for [`DebugCheckingAllocator`].
 ///
 /// Wraps the inner allocator's handle along with a reference to the debug allocator,
@@ -273,42 +324,7 @@ where
     fn record_allocation(&self, offset: u64, len: u64) {
         let region = offset..offset + len;
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-
-        // Check for overlaps with existing allocations
-        if let Some(overlap) = check_overlap(&region, &state.allocated) {
-            panic!(
-                "DebugCheckingAllocator: Newly allocated region [{}, {}) overlaps with \
-                 existing allocated region [{}, {}). This indicates a bug in the underlying \
-                 allocator.",
-                region.start, region.end, overlap.start, overlap.end
-            );
-        }
-
-        // Handle overlaps with freed regions by splitting them
-        let overlapping_freed: Vec<Range<u64>> = state
-            .freed
-            .iter()
-            .filter(|r| overlaps(&region, r))
-            .cloned()
-            .collect();
-
-        for freed_region in overlapping_freed {
-            state.freed.remove(&freed_region);
-
-            // Split the freed region around the newly allocated region:
-            // If freed_region is [a, d) and region is [b, c):
-            // - If a < b, add [a, b) to freed
-            // - If c < d, add [c, d) to freed
-            if freed_region.start < region.start {
-                state.freed.insert(freed_region.start..region.start);
-            }
-
-            if region.end < freed_region.end {
-                state.freed.insert(region.end..freed_region.end);
-            }
-        }
-
-        state.allocated.insert(region);
+        record_allocated_region(&mut state, region, "Newly allocated region", "");
     }
 
     /// Record a deallocation after validation.
@@ -321,13 +337,8 @@ where
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
 
         // Check for overlaps with previously freed regions BEFORE calling inner dealloc
-        if let Some(overlap) = check_overlap(&region, &state.freed) {
-            panic!(
-                "DebugCheckingAllocator: Attempting to free region [{}, {}) which overlaps \
-                 with already freed region [{}, {}). This indicates a double-free bug.",
-                region.start, region.end, overlap.start, overlap.end
-            );
-        }
+        record_freed_region(&mut state, region.clone());
+        state.freed.remove(&region);
 
         // Validate the freed region matches exactly one allocated region
         let overlapping_allocated: Vec<Range<u64>> = state
@@ -358,7 +369,7 @@ where
             ),
         }
 
-        state.freed.insert(region);
+        record_freed_region(&mut state, region);
     }
 }
 
@@ -431,12 +442,13 @@ where
         })?;
         let new_region = new_slice.start()..new_slice.start() + new_slice.len();
 
-        // Atomically swap old for new in the tracking state
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.allocated.remove(&old_region);
-
-        if let Some(overlap) = check_overlap(&new_region, &state.allocated) {
-            state.allocated.insert(old_region);
+        let overlapping_allocation = state
+            .allocated
+            .iter()
+            .find(|region| **region != old_region && overlaps(&new_region, region))
+            .cloned();
+        if let Some(overlap) = overlapping_allocation {
             panic!(
                 "DebugCheckingAllocator: Reallocated region [{}, {}) overlaps with \
                  existing allocated region [{}, {}). This indicates a bug in the underlying \
@@ -445,8 +457,9 @@ where
             );
         }
 
-        state.allocated.insert(new_region);
-        drop(state);
+        state.allocated.remove(&old_region);
+        record_freed_region(&mut state, old_region);
+        record_allocated_region(&mut state, new_region, "Reallocated region", "'s realloc");
 
         Ok(DebugHandle::new(self, new_inner_handle))
     }
@@ -463,10 +476,11 @@ where
         {
             let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
 
-            if state.freed.contains(&region) {
+            if let Some(overlap) = check_overlap(&region, &state.freed) {
                 panic!(
-                    "DebugCheckingAllocator: Double free detected for region [{}, {}).",
-                    region.start, region.end
+                    "DebugCheckingAllocator: Attempting to free region [{}, {}) which overlaps \
+                     with already freed region [{}, {}). This indicates a double-free bug.",
+                    region.start, region.end, overlap.start, overlap.end
                 );
             }
 
@@ -755,6 +769,8 @@ mod tests {
         fail_dealloc_bulk: bool,
         /// If true, `realloc` returns an error instead of succeeding.
         fail_realloc: bool,
+        /// If true, `realloc` keeps the same offset and only changes the length.
+        realloc_in_place: bool,
     }
 
     /// Handle returned by [`ControllableMockAllocator`].
@@ -832,16 +848,27 @@ mod tests {
             handle: Self::Allocated<'a>,
             new_len: u64,
         ) -> io::Result<Self::Allocated<'a>> {
-            if self.config.borrow().fail_realloc {
+            let config = self.config.borrow();
+            if config.fail_realloc {
                 return Err(io::Error::other("mock realloc failure"));
             }
+            let realloc_in_place = config.realloc_in_place;
+            drop(config);
 
             let old_region = handle.offset..handle.offset + handle.len;
             self.allocated.borrow_mut().remove(&old_region);
 
-            // Simulate realloc by allocating a new region
-            let new_offset = self.next_offset.get();
-            self.next_offset.set(new_offset + new_len);
+            let new_offset = if realloc_in_place {
+                let new_end = handle.offset + new_len;
+                if self.next_offset.get() < new_end {
+                    self.next_offset.set(new_end);
+                }
+                handle.offset
+            } else {
+                let new_offset = self.next_offset.get();
+                self.next_offset.set(new_offset + new_len);
+                new_offset
+            };
             let new_region = new_offset..new_offset + new_len;
             self.allocated.borrow_mut().insert(new_region);
 
@@ -959,6 +986,76 @@ mod tests {
 
         alloc.dealloc(new_handle)?;
         Ok(())
+    }
+
+    #[test]
+    fn test_realloc_into_freed_region_updates_freed_tracking() -> io::Result<()> {
+        let (stack, path) = create_test_stack()?;
+        let _guard = TestGuard(path);
+        let config = Rc::new(RefCell::new(MockAllocatorConfig::default()));
+        let inner = ControllableMockAllocator::new(stack, config.clone());
+        let alloc = DebugCheckingAllocator::with_state(inner, [], [150..300]);
+
+        let handle = alloc.alloc(100)?;
+        alloc.inner().next_offset.set(150);
+
+        let new_handle = alloc.realloc(handle, 100)?;
+
+        {
+            let state = alloc.state.lock().unwrap();
+            assert!(state.allocated.contains(&(150..250)));
+            assert!(!state.allocated.contains(&(0..100)));
+            assert!(state.freed.contains(&(0..100)));
+            assert!(state.freed.contains(&(250..300)));
+            assert!(!state.freed.contains(&(150..300)));
+        }
+
+        alloc.dealloc(new_handle)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_realloc_in_place_shrink_marks_released_tail_as_freed() -> io::Result<()> {
+        let (stack, path) = create_test_stack()?;
+        let _guard = TestGuard(path);
+        let config = Rc::new(RefCell::new(MockAllocatorConfig {
+            realloc_in_place: true,
+            ..Default::default()
+        }));
+        let inner = ControllableMockAllocator::new(stack, config);
+        let alloc = DebugCheckingAllocator::new(inner);
+
+        let handle = alloc.alloc(100)?;
+        let new_handle = alloc.realloc(handle, 60)?;
+
+        {
+            let state = alloc.state.lock().unwrap();
+            assert!(state.allocated.contains(&(0..60)));
+            assert!(!state.allocated.contains(&(0..100)));
+            assert!(state.freed.contains(&(60..100)));
+        }
+
+        alloc.dealloc(new_handle)?;
+        Ok(())
+    }
+
+    #[test]
+    #[should_panic(expected = "overlaps with already freed region")]
+    fn test_realloc_stale_handle_after_shrink_panics() {
+        let (stack, path) = create_test_stack().unwrap();
+        let _guard = TestGuard(path);
+        let config = Rc::new(RefCell::new(MockAllocatorConfig {
+            realloc_in_place: true,
+            ..Default::default()
+        }));
+        let inner = ControllableMockAllocator::new(stack, config);
+        let alloc = DebugCheckingAllocator::new(inner);
+
+        let handle = alloc.alloc(100).unwrap();
+        let stale_handle = handle;
+        let _new_handle = alloc.realloc(handle, 60).unwrap();
+
+        alloc.dealloc(stale_handle).unwrap();
     }
 
     #[test]
