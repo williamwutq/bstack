@@ -337,8 +337,13 @@ where
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
 
         // Check for overlaps with previously freed regions BEFORE calling inner dealloc
-        record_freed_region(&mut state, region.clone());
-        state.freed.remove(&region);
+        if let Some(overlap) = check_overlap(&region, &state.freed) {
+            panic!(
+                "DebugCheckingAllocator: Attempting to free region [{}, {}) which overlaps \
+                 with already freed region [{}, {}). This indicates a double-free bug.",
+                region.start, region.end, overlap.start, overlap.end
+            );
+        }
 
         // Validate the freed region matches exactly one allocated region
         let overlapping_allocated: Vec<Range<u64>> = state
@@ -1052,7 +1057,7 @@ mod tests {
         let alloc = DebugCheckingAllocator::new(inner);
 
         let handle = alloc.alloc(100).unwrap();
-        let stale_handle = handle;
+        let stale_handle = handle.clone();
         let _new_handle = alloc.realloc(handle, 60).unwrap();
 
         alloc.dealloc(stale_handle).unwrap();
