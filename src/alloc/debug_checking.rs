@@ -33,8 +33,8 @@
 //!
 //! Because of this asymmetry, allocated and freed regions are tracked **separately**:
 //!
-//! - A region can appear in both sets (allocated in a previous session, freed in the
-//!   current one).
+//! - A freed region may have no corresponding entry in the allocated set — it may have
+//!   been originally allocated in a prior session that this instance never observed.
 //! - This allows double-free detection within a single session even when the original
 //!   allocation happened in a prior run.
 //!
@@ -65,37 +65,17 @@ use super::{BStackAllocator, BStackBulkAllocator, BStackSlice};
 use crate::BStack;
 use std::collections::HashSet;
 use std::io;
+use std::ops::Range;
 use std::sync::Mutex;
 
-/// A region of bytes defined by `[offset, offset + len)`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct Region {
-    offset: u64,
-    len: u64,
+/// Returns `true` if two half-open byte ranges overlap.
+fn overlaps(a: &Range<u64>, b: &Range<u64>) -> bool {
+    !a.is_empty() && !b.is_empty() && a.start.max(b.start) < a.end.min(b.end)
 }
 
-impl Region {
-    fn new(offset: u64, len: u64) -> Self {
-        Self { offset, len }
-    }
-
-    fn end(&self) -> u64 {
-        self.offset.saturating_add(self.len)
-    }
-
-    /// Check if this region overlaps with another region.
-    ///
-    /// Two regions [a, a+len_a) and [b, b+len_b) overlap if:
-    /// max(a, b) < min(a+len_a, b+len_b)
-    fn overlaps(&self, other: &Region) -> bool {
-        if self.len == 0 || other.len == 0 {
-            // Zero-length regions don't overlap with anything
-            return false;
-        }
-        let max_start = self.offset.max(other.offset);
-        let min_end = self.end().min(other.end());
-        max_start < min_end
-    }
+/// Returns the first range in `set` that overlaps `region`, or `None`.
+fn check_overlap(region: &Range<u64>, set: &HashSet<Range<u64>>) -> Option<Range<u64>> {
+    set.iter().find(|r| overlaps(region, r)).cloned()
 }
 
 /// Handle type for [`DebugCheckingAllocator`].
@@ -181,9 +161,9 @@ where
 /// `allocated` then `freed`; dealloc would acquire them in the opposite order).
 struct DebugState {
     /// Set of currently allocated regions that haven't been freed yet.
-    allocated: HashSet<Region>,
+    allocated: HashSet<Range<u64>>,
     /// Set of regions that have been freed (may persist across sessions).
-    freed: HashSet<Region>,
+    freed: HashSet<Range<u64>>,
 }
 
 /// Debug-only allocator wrapper that validates allocations and deallocations.
@@ -206,7 +186,8 @@ struct DebugState {
 /// - A reallocated region overlaps with an existing allocated region
 /// - A region being freed overlaps with a previously freed region
 ///
-/// These panics indicate bugs in the underlying allocator implementation.
+/// These panics indicate bugs in the underlying allocator implementation or a double
+/// free in the calling code.
 ///
 /// # Thread Safety
 ///
@@ -253,6 +234,24 @@ where
         }
     }
 
+    /// Create a new `DebugCheckingAllocator` wrapping `inner`, with pre-populated tracking sets.
+    ///
+    /// Use this when reopening a file from a previous session and you have metadata
+    /// to reconstruct which regions were allocated or freed.
+    pub fn with_state(
+        inner: A,
+        allocated: impl IntoIterator<Item = Range<u64>>,
+        freed: impl IntoIterator<Item = Range<u64>>,
+    ) -> Self {
+        Self {
+            inner,
+            state: Mutex::new(DebugState {
+                allocated: allocated.into_iter().collect(),
+                freed: freed.into_iter().collect(),
+            }),
+        }
+    }
+
     /// Return a reference to the inner allocator.
     pub fn inner(&self) -> &A {
         &self.inner
@@ -263,44 +262,31 @@ where
         self.inner
     }
 
-    /// Check if a region overlaps with any region in the set.
-    fn check_overlap(region: &Region, set: &HashSet<Region>) -> Option<Region> {
-        for existing in set {
-            if region.overlaps(existing) {
-                return Some(*existing);
-            }
-        }
-        None
-    }
-
     /// Record a newly allocated region after validation.
     ///
     /// If the allocated region overlaps with freed regions, those freed regions are
     /// removed and split around the new allocation. For example, if allocating [b, c)
     /// while [a, d) is freed, the freed set will be updated to contain [a, b) and [c, d).
     fn record_allocation(&self, offset: u64, len: u64) {
-        let region = Region::new(offset, len);
+        let region = offset..offset + len;
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
 
         // Check for overlaps with existing allocations
-        if let Some(overlap) = Self::check_overlap(&region, &state.allocated) {
+        if let Some(overlap) = check_overlap(&region, &state.allocated) {
             panic!(
                 "DebugCheckingAllocator: Newly allocated region [{}, {}) overlaps with \
                  existing allocated region [{}, {}). This indicates a bug in the underlying \
                  allocator.",
-                region.offset,
-                region.end(),
-                overlap.offset,
-                overlap.end()
+                region.start, region.end, overlap.start, overlap.end
             );
         }
 
         // Handle overlaps with freed regions by splitting them
-        let overlapping_freed: Vec<Region> = state
+        let overlapping_freed: Vec<Range<u64>> = state
             .freed
             .iter()
-            .filter(|r| region.overlaps(r))
-            .copied()
+            .filter(|r| overlaps(&region, r))
+            .cloned()
             .collect();
 
         for freed_region in overlapping_freed {
@@ -310,17 +296,12 @@ where
             // If freed_region is [a, d) and region is [b, c):
             // - If a < b, add [a, b) to freed
             // - If c < d, add [c, d) to freed
-            if freed_region.offset < region.offset {
-                let before_len = region.offset - freed_region.offset;
-                state
-                    .freed
-                    .insert(Region::new(freed_region.offset, before_len));
+            if freed_region.start < region.start {
+                state.freed.insert(freed_region.start..region.start);
             }
 
-            if region.end() < freed_region.end() {
-                let after_offset = region.end();
-                let after_len = freed_region.end() - after_offset;
-                state.freed.insert(Region::new(after_offset, after_len));
+            if region.end < freed_region.end {
+                state.freed.insert(region.end..freed_region.end);
             }
         }
 
@@ -333,27 +314,24 @@ where
     /// allocations made through itself). Panics if the freed region partially overlaps or
     /// spans multiple recorded allocations, as those indicate real bugs.
     fn record_deallocation(&self, offset: u64, len: u64) {
-        let region = Region::new(offset, len);
+        let region = offset..offset + len;
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
 
         // Check for overlaps with previously freed regions BEFORE calling inner dealloc
-        if let Some(overlap) = Self::check_overlap(&region, &state.freed) {
+        if let Some(overlap) = check_overlap(&region, &state.freed) {
             panic!(
                 "DebugCheckingAllocator: Attempting to free region [{}, {}) which overlaps \
                  with already freed region [{}, {}). This indicates a double-free bug.",
-                region.offset,
-                region.end(),
-                overlap.offset,
-                overlap.end()
+                region.start, region.end, overlap.start, overlap.end
             );
         }
 
         // Validate the freed region matches exactly one allocated region
-        let overlapping_allocated: Vec<Region> = state
+        let overlapping_allocated: Vec<Range<u64>> = state
             .allocated
             .iter()
-            .filter(|r| region.overlaps(r))
-            .copied()
+            .filter(|r| overlaps(&region, r))
+            .cloned()
             .collect();
 
         match overlapping_allocated.as_slice() {
@@ -368,16 +346,12 @@ where
                 "DebugCheckingAllocator: Attempting to partially free region [{}, {}) \
                  which is a subset or overlap of allocated region [{}, {}). \
                  Partial deallocations are not allowed.",
-                region.offset,
-                region.end(),
-                single.offset,
-                single.end(),
+                region.start, region.end, single.start, single.end,
             ),
             _ => panic!(
                 "DebugCheckingAllocator: Attempting to free region [{}, {}) which spans \
                  multiple allocated regions. This is not a valid deallocation.",
-                region.offset,
-                region.end(),
+                region.start, region.end,
             ),
         }
 
@@ -441,7 +415,7 @@ where
                 "handle is not convertible to BStackSlice before realloc: {e}"
             ))
         })?;
-        let old_region = Region::new(old_slice.start(), old_slice.len());
+        let old_region = old_slice.start()..old_slice.start() + old_slice.len();
 
         let new_inner_handle = self.inner.realloc(handle.inner, new_len)?;
 
@@ -452,22 +426,19 @@ where
                 "reallocated handle is not convertible to BStackSlice: {e}"
             ))
         })?;
-        let new_region = Region::new(new_slice.start(), new_slice.len());
+        let new_region = new_slice.start()..new_slice.start() + new_slice.len();
 
         // Atomically swap old for new in the tracking state
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.allocated.remove(&old_region);
 
-        if let Some(overlap) = Self::check_overlap(&new_region, &state.allocated) {
+        if let Some(overlap) = check_overlap(&new_region, &state.allocated) {
             state.allocated.insert(old_region);
             panic!(
                 "DebugCheckingAllocator: Reallocated region [{}, {}) overlaps with \
                  existing allocated region [{}, {}). This indicates a bug in the underlying \
                  allocator's realloc.",
-                new_region.offset,
-                new_region.end(),
-                overlap.offset,
-                overlap.end()
+                new_region.start, new_region.end, overlap.start, overlap.end
             );
         }
 
@@ -582,31 +553,22 @@ mod tests {
         }
     }
 
-    // --- Region unit tests ---
+    // --- overlaps unit tests ---
 
     #[test]
     fn test_region_overlap() {
-        let r1 = Region::new(0, 10);
-        let r2 = Region::new(5, 10);
-        let r3 = Region::new(10, 10);
-        let r4 = Region::new(20, 10);
-
-        assert!(r1.overlaps(&r2)); // [0, 10) and [5, 15) overlap
-        assert!(r2.overlaps(&r1)); // symmetric
-        assert!(!r1.overlaps(&r3)); // [0, 10) and [10, 20) don't overlap (adjacent)
-        assert!(!r1.overlaps(&r4)); // [0, 10) and [20, 30) don't overlap
-        assert!(r2.overlaps(&r3)); // [5, 15) and [10, 20) overlap
+        assert!(overlaps(&(0..10), &(5..15))); // [0, 10) and [5, 15) overlap
+        assert!(overlaps(&(5..15), &(0..10))); // symmetric
+        assert!(!overlaps(&(0..10), &(10..20))); // adjacent — no overlap
+        assert!(!overlaps(&(0..10), &(20..30))); // disjoint
+        assert!(overlaps(&(5..15), &(10..20))); // [5, 15) and [10, 20) overlap
     }
 
     #[test]
     fn test_zero_length_regions() {
-        let r1 = Region::new(0, 0);
-        let r2 = Region::new(0, 10);
-        let r3 = Region::new(5, 0);
-
-        assert!(!r1.overlaps(&r2)); // Zero-length doesn't overlap
-        assert!(!r2.overlaps(&r1)); // symmetric
-        assert!(!r1.overlaps(&r3)); // Two zero-length regions don't overlap
+        assert!(!overlaps(&(0..0), &(0..10))); // zero-length doesn't overlap
+        assert!(!overlaps(&(0..10), &(0..0))); // symmetric
+        assert!(!overlaps(&(0..0), &(5..5))); // two zero-length regions don't overlap
     }
 
     // --- Behavioral tests ---
@@ -690,10 +652,10 @@ mod tests {
         c.record_allocation(20, 30); // [20, 50)
 
         let state = c.state.lock().unwrap();
-        assert!(state.freed.contains(&Region::new(0, 20)));
-        assert!(state.freed.contains(&Region::new(50, 50)));
-        assert!(!state.freed.contains(&Region::new(0, 100)));
-        assert!(state.allocated.contains(&Region::new(20, 30)));
+        assert!(state.freed.contains(&(0..20)));
+        assert!(state.freed.contains(&(50..100)));
+        assert!(!state.freed.contains(&(0..100)));
+        assert!(state.allocated.contains(&(20..50)));
     }
 
     #[test]
@@ -707,9 +669,9 @@ mod tests {
         c.record_allocation(0, 30); // [0, 30) — consumes the left edge
 
         let state = c.state.lock().unwrap();
-        assert!(!state.freed.contains(&Region::new(0, 100)));
-        assert!(!state.freed.iter().any(|r| r.offset < 30));
-        assert!(state.freed.contains(&Region::new(30, 70)));
+        assert!(!state.freed.contains(&(0..100)));
+        assert!(!state.freed.iter().any(|r| r.start < 30));
+        assert!(state.freed.contains(&(30..100)));
     }
 
     #[test]
@@ -723,9 +685,9 @@ mod tests {
         c.record_allocation(70, 30); // [70, 100) — consumes the right edge
 
         let state = c.state.lock().unwrap();
-        assert!(!state.freed.contains(&Region::new(0, 100)));
-        assert!(state.freed.contains(&Region::new(0, 70)));
-        assert!(!state.freed.iter().any(|r| r.end() > 70));
+        assert!(!state.freed.contains(&(0..100)));
+        assert!(state.freed.contains(&(0..70)));
+        assert!(!state.freed.iter().any(|r| r.end > 70));
     }
 
     #[test]
@@ -740,6 +702,6 @@ mod tests {
 
         let state = c.state.lock().unwrap();
         assert!(state.freed.is_empty());
-        assert!(state.allocated.contains(&Region::new(0, 100)));
+        assert!(state.allocated.contains(&(0..100)));
     }
 }
