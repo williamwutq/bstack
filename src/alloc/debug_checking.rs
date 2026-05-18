@@ -192,8 +192,10 @@ struct DebugState {
 ///
 /// # Thread Safety
 ///
-/// The internal tracking sets are protected by a `Mutex`, so the allocator is `Send + Sync`
-/// if the inner allocator is.
+/// The internal tracking sets are protected by a `Mutex` for internal bookkeeping, but
+/// allocation operations and tracking updates must not be assumed to be an atomic,
+/// cross-thread synchronization boundary. Concurrent use of this debug wrapper is therefore
+/// not supported unless the caller provides external synchronization.
 pub struct DebugCheckingAllocator<A>
 where
     A: BStackAllocator<Error = io::Error>,
