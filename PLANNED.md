@@ -176,3 +176,360 @@ The subview analogue (`BStackGuardedSliceSubview`) would be expressed as a flag 
 - How should hook errors interact with the C error-reporting convention (`errno`)? The hook returning -1 should propagate as a read/write failure, but the hook may also want to set a custom errno value.
 - Should `bstack_guarded_slice_t` be opaque (allocated on the heap) or transparent (stack-allocatable struct)? Transparency is simpler but leaks the vtable layout.
 
+---
+
+## Fix Audit Findings in FirstFitBStackAllocator
+
+**Feature flag:** alloc
+**Breaking change:** No
+
+### Motivation
+
+`FirstFitBStackAllocator` is the most defensively engineered of the three. It
+uses a `recovery_needed` flag plus a careful three-point "partial split"
+detector that lets a linear arena scan reconstruct the free list from the
+on-disk `is_free` bits in block headers, with no trust in stored pointers.
+Within the protected window the design holds up: every multi-call mutation I
+traced has a recovery path that produces a consistent free list. The
+remaining issues are at the edges of that protection — the tail-dealloc fast
+path slips past the recovery flag, double-free corrupts the free list in a way
+that is *not* detected on reopen, and one over-aggressive recovery action
+truncates the entire arena tail when it encounters a single corrupted block.
+Documentation is broadly accurate but does not call out the double-free hazard
+or the tail-cascade invariant window.
+
+### Issues
+
+#### [High] Double-free corrupts the free list with no recovery on reopen
+**Severity:** High
+**Category:** Invariant
+**Location:** [src/alloc/first_fit.rs:264-372](src/alloc/first_fit.rs#L264-L372) (`add_to_free_list`), [src/alloc/first_fit.rs:749-778](src/alloc/first_fit.rs#L749-L778) (`dealloc`)
+**Description:** `dealloc` does *not* check whether the block being freed is
+already marked free. If a caller passes the same handle twice (or two
+distinct `BStackSlice::new` reconstructions of the same offset) and the block
+is non-tail and has no free neighbours, `add_to_free_list` prepends the block
+to the free list a second time. Both `next_free` and `prev_free` of the block
+end up pointing at the block itself (self-loop). `clear_recovery_needed` then
+fires, so on reopen `recovery_needed` is *false* and recovery does not run —
+the corruption is permanent.
+**Scenario:**
+1. `let h = alloc.alloc(64)?;` → returns a non-tail block with no free
+   neighbours.
+2. `alloc.dealloc(h)?;` succeeds normally.
+3. `alloc.dealloc(h)?;` (programmer error, double-free).
+4. After step 3, free list head points at the block; the block's `next_free`
+   and `prev_free` both point at itself.
+5. Next `alloc(small)` calls `find_large_enough_block` → reads the (now
+   `is_free=1` because still flagged free) block → matches → calls
+   `unlink_block` no-split path → writes self-references and clears
+   `is_free=0`.
+6. But `free_head` was never updated (because `prev != 0` branch ran, writing
+   into the block's own pointer field instead of the header).
+7. Now `free_head` points at an allocated (`is_free=0`) block. Every future
+   `alloc` returns `InvalidData: corrupted free list: block at offset … is not
+   marked free`.
+**Impact:** Single programmer error renders the allocator unusable until the
+file is manually repaired. The corruption survives close/reopen because the
+free-head pointer is still in-bounds and `recovery_needed` is clear.
+**Recommendation:** In `dealloc`, read the block header first and return an
+error (or simply no-op) when `is_free=1`. The cost is one `get_into` per
+dealloc, which is cheap relative to the rest of the operation.
+
+#### [Medium] Tail-dealloc fast path can leave a free block at the tail on crash
+**Severity:** Medium
+**Category:** Invariant
+**Location:** [src/alloc/first_fit.rs:766-774](src/alloc/first_fit.rs#L766-L774), [src/alloc/first_fit.rs:536-575](src/alloc/first_fit.rs#L536-L575) (`cascade_discard_free_tail`)
+**Description:** The tail-dealloc branch calls `self.stack.discard(...)`
+directly and then `cascade_discard_free_tail()`. It does *not* set
+`recovery_needed` before the discard. If the previous-to-tail block is free
+and the process crashes between the `discard` and the cascade entering its
+loop, the file is left in a state that violates the documented invariant "the
+tail block is always allocated (or the arena is empty)" ([src/alloc/first_fit.rs:67-69](src/alloc/first_fit.rs#L67-L69)).
+On reopen, `recovery_needed` is clear and `free_head` is still in-bounds, so
+recovery does *not* run and the invariant violation persists.
+**Scenario:**
+1. Layout: `[allocated A][free B][allocated C (tail)]`.
+2. `dealloc(C)` enters the tail fast path; `discard` runs (now tail = B-end).
+3. **Crash** before `cascade_discard_free_tail` reads the new tail.
+4. On reopen: `B` is now a free block at the tail. The invariant is violated.
+**Impact:** Wasted space at the tail (the file is larger than the live data
+would require). Functionally harmless — the block is still in the free list
+and reusable — but breaks the documented invariant that downstream logic
+relies on. In particular, `add_to_free_list` and the realloc-merge path
+assume no free tail when sizing right-coalesce.
+**Recommendation:** Set `recovery_needed` *before* the discard in the
+tail-dealloc fast path; the cascade already clears it. Cost is one extra
+`set` per tail-dealloc — likely worth the simplicity.
+
+#### [Medium] Over-aggressive recovery truncates from the first corrupted block
+**Severity:** Medium
+**Category:** Invariant
+**Location:** [src/alloc/first_fit.rs:605-614](src/alloc/first_fit.rs#L605-L614)
+**Description:** If the recovery scan encounters a block header that fails
+basic validation (size below minimum, not 8-aligned, or extending past
+`stack_len`), it discards everything from that position to the tail.
+```rust
+None => {
+    self.stack.discard(stack_len - pos)?;
+    break;
+}
+```
+This is a sensible response to a *single* torn write at the tail — the
+intended case. But if any non-tail block ever ends up with an invalid
+header (single-bit disk corruption, accidental external edit, future-version
+artefact), the recovery throws away every live and free block that follows
+it.
+**Scenario:** A 100 MB file with one corrupted block at offset 1 MB and 99 MB
+of valid blocks after it. On the next `new()` call, recovery_needed is set
+(or becomes set due to free-head validation), recovery scans, hits the
+corrupted block, and discards 99 MB.
+**Impact:** Catastrophic data loss from a single transient corruption.
+Probability is low under normal operation (BStack guarantees per-call atomicity),
+but the *blast radius* is the whole arena tail.
+**Recommendation:** When the scan encounters an invalid mid-arena header,
+skip a bounded amount (a minimum-aligned block step) and try to resync
+instead of truncating wholesale. Alternatively, error out of recovery
+rather than auto-discarding when the bad block is not at the immediate tail
+— forcing the user to acknowledge data loss rather than performing it
+silently.
+
+#### [Low] No detection of free-list cycles introduced by external corruption
+**Severity:** Low
+**Category:** Invariant
+**Location:** [src/alloc/first_fit.rs:380-433](src/alloc/first_fit.rs#L380-L433) (`find_large_enough_block`)
+**Description:** The walk loop tests `is_impossible_block_start(head)` on
+each step but does not detect cycles. A self-loop introduced by the
+double-free above, or by external corruption, causes the loop to spin
+forever if every block in the cycle is smaller than the requested size.
+**Scenario:** Free list with a self-loop, all blocks smaller than the
+requested size. `find_large_enough_block` never terminates.
+**Impact:** Single allocation hangs indefinitely on a corrupted file.
+**Recommendation:** Cap the walk at, say, `arena_size / MIN_BLOCK` iterations
+and return `InvalidData` if exceeded.
+
+---
+
+## Fix Audit Findings in GhostTreeBstackAllocator
+
+### Motivation
+
+`GhostTreeBstackAllocator` is documented as a multi-call allocator with **no
+write-ahead log and no checksums** ([src/alloc/ghost_tree.rs:106-110](src/alloc/ghost_tree.rs#L106-L110)).
+The implementation honours that statement faithfully — but the consequences are
+more severe than the doc table suggests. Almost every state-changing path
+(`alloc` split, `dealloc`, every shrink, every AVL rotation) is multi-call, and
+a crash in any of them either silently leaks a free block or orphans a whole
+subtree. The only recovery mechanism is `coalesce_and_rebalance`, which walks
+the tree from `read_root()` *trusting* child pointers, so any subtree that
+becomes unreachable (the common outcome of a torn rotation) is permanently
+lost. A separate correctness bug in `alloc_bulk` discards the `(_, size)` of
+the found block and unconditionally uses `total`, leaking the remainder when
+best-fit returns a strictly larger block. Documentation is unusually candid
+about most of these limitations, but the doc table marks shrink-tail and grow
+non-tail as "multi-call" without explaining that on the multi-call paths the
+recovery is `None`, not "rebuilt on next open."
+
+### Issues
+
+#### [Critical] Torn AVL rotation orphans an entire subtree
+**Severity:** Critical
+**Category:** Crash safety
+**Location:** [src/alloc/ghost_tree.rs:283-306](src/alloc/ghost_tree.rs#L283-L306) (`avl_rotate_right` / `avl_rotate_left`)
+**Description:** Rotations write the two affected nodes back-to-back with no
+ordering guarantee that preserves reachability. `avl_rotate_right` first
+rewrites `node`'s children to `(pivot_r, node_r)` — at that instant, `pivot` is
+no longer reachable from `node`, but `pivot` itself has not yet been rewritten
+to point at `(pivot_l, node)`. If the process crashes between the two
+`write_node` calls, the entire subtree rooted at `pivot` (including `pivot_l`
+and everything below it) is dropped from the tree.
+**Scenario:**
+1. Tree state: `parent -> node -> {pivot, node_r}`, `pivot -> {pivot_l, pivot_r}`.
+2. Insert or remove triggers `avl_rotate_right(node)`.
+3. `avl_write_and_update(node, …, pivot_r, node_r)` returns successfully (durable).
+4. **Crash before** `avl_write_and_update(pivot, …, pivot_l, node)`.
+5. On reopen, `coalesce_and_rebalance` walks `parent -> node -> {pivot_r, node_r}`.
+   `pivot` and `pivot_l` (and any descendants of either) are never visited.
+**Impact:** Permanent loss of every free block in the orphaned subtree. The
+on-disk arena bytes for those blocks remain "live" forever. Repeated rotation
+crashes are cumulative.
+**Recommendation:** Either (a) introduce a write-ahead step that durably
+records the rotation intent so `coalesce_and_rebalance` can also walk a
+"pending rotation" list, or (b) walk the entire arena in linear order on every
+open (similar to FirstFit's recovery) so unreachable free blocks can be
+rediscovered. Option (b) is the simpler retrofit because free blocks already
+have a self-describing AVL header (size at offset 0).
+
+#### [Medium] `dealloc` permanently loses the block on crash between zero and AVL insert
+**Severity:** Medium
+**Category:** Crash safety
+**Location:** [src/alloc/ghost_tree.rs:714-735](src/alloc/ghost_tree.rs#L714-L735)
+**Description:** Non-tail `dealloc` does `self.stack.zero(ptr, true_len)` then
+`self.avl_insert(ptr, true_len)`. The two operations are not journaled. A
+crash in between zeroes the block but does not record it in the free tree.
+The block becomes free space that the allocator believes is "live" and will
+never reissue.
+**Scenario:**
+1. User calls `alloc.dealloc(handle)` on a 1 KiB non-tail allocation.
+2. `self.stack.zero(ptr, 1024)` returns.
+3. **Crash** before `avl_insert`.
+4. On reopen, `coalesce_and_rebalance` walks the tree — the freed block is not
+   in the tree, so it stays "allocated" forever.
+**Impact:** Per-dealloc permanent space leak proportional to the freed block
+size. Crash-tolerant workloads that call `dealloc` aggressively will see
+unbounded on-disk growth that no later operation can recover.
+**Recommendation:** Re-order to write-ahead: insert into the AVL tree *first*
+(the AVL node already lives at offset 0 of the block, so writing the node
+implicitly "consumes" the prior live data), then it is acceptable for any
+following step to be unnecessary because the block is already reclaimable.
+Even simpler: detach the user payload by writing the AVL node header in one
+`set` call, which both zeroes the leading 32 bytes and records the size — the
+rest of the block is "junk that need not be zero" so long as the invariant is
+relaxed to allow non-zero free-block payloads on crash. Alternatively,
+document the per-dealloc leak rate and provide a manual repair API.
+
+#### [Medium] Multi-call `realloc` grow (non-tail) leaks new block on crash
+**Severity:** Medium
+**Category:** Crash safety
+**Location:** [src/alloc/ghost_tree.rs:696-702](src/alloc/ghost_tree.rs#L696-L702)
+**Description:** Non-tail grow is `alloc(new) + copy + dealloc(old)`. There is
+no recovery linking the new and old blocks. A crash after `alloc` but before
+`dealloc` leaves the new block "allocated" (removed from the AVL tree) without
+any caller-visible handle, **and** the old block also "allocated". Both are
+permanent leaks.
+**Scenario:**
+1. `realloc(handle, larger)` on a non-tail slice.
+2. `self.alloc(new_len)` succeeds — new block removed from AVL.
+3. **Crash** before the copy completes / before `dealloc(slice)`.
+4. On reopen: the new block has no handle and is not in the tree (lost). The
+   old block is also not in the tree (still "allocated"); the caller may or
+   may not have persisted the old handle, but the new one is unrecoverable.
+**Impact:** Same as the `dealloc` case but doubled: up to the new allocation
+size is leaked per crashed realloc.
+**Recommendation:** Until a journal is introduced, document the leak per
+realloc explicitly in the doc table (currently the row says "multi-call" but
+does not call out the leak). Long term, the cleanest fix is a single-slot
+"pending realloc" header field that records `(old_ptr, new_ptr)` before
+`alloc`; on reopen, if the field is set, free whichever block looks live and
+clear the field.
+
+#### [Medium] `alloc` split leaks the remainder on crash between AVL remove and AVL insert
+**Severity:** Medium
+**Category:** Crash safety
+**Location:** [src/alloc/ghost_tree.rs:589-606](src/alloc/ghost_tree.rs#L589-L606)
+**Description:** The split path does `avl_find_best_fit_and_remove` (which
+removes the full block from the tree) then `avl_insert(ptr, remainder)` for
+the leading fragment. A crash between the two leaves the full original block
+*outside* the tree. The fragment is permanently lost. The same hazard applies
+to the no-split path (zero+return) but in that case the entire block is the
+intended allocation, so only a partial-handle problem.
+**Scenario:**
+1. `alloc(64)` finds a 256-byte free block, removes it.
+2. **Crash** before `avl_insert(ptr, 192)` records the 192-byte remainder.
+3. On reopen, the 192-byte fragment is unreachable.
+**Impact:** Per-crashed-split leak up to `block_size - aligned_request - MIN_ALLOC`
+bytes.
+**Recommendation:** Reverse the order — insert the remainder *first* using a
+known-safe pattern (the AVL node bytes overlay the original block's AVL
+header, so writing the smaller node both shrinks the block in-tree and frees
+the tail as the user's allocation), then return. This also reduces the
+critical window of `alloc` to zero AVL writes.
+
+#### [Medium] `alloc_bulk` discards the found-block size — silently leaks remainder
+**Severity:** Medium
+**Category:** Invariant
+**Location:** [src/alloc/ghost_tree.rs:786-794](src/alloc/ghost_tree.rs#L786-L794)
+**Description:**
+```rust
+let block_ptr = if let Some((ptr, _)) = self.avl_find_best_fit_and_remove(total)? {
+    self.stack.zero(ptr, MIN_ALLOC)?;
+    ptr
+} else {
+    self.stack.extend(total)?
+};
+```
+The block's actual size is bound to `_` and discarded. If best-fit returns a
+block strictly larger than `total` (always possible, since the tree is keyed
+on `(size, address)` and the search returns the smallest `>= total`), the
+remainder (a multiple of 32, possibly very large) is consumed silently. No
+split, no re-insert.
+**Scenario:**
+1. Free tree contains one 4096-byte block; arena otherwise empty.
+2. `alloc_bulk([128, 128])` → `total = 256`.
+3. `avl_find_best_fit_and_remove(256)` returns `(ptr, 4096)`.
+4. The 4096-byte block is removed; only 256 bytes are used; the trailing 3840
+   bytes are silently leaked.
+**Impact:** Bulk allocations can consume arbitrarily more bytes than
+requested. The leak is permanent until manual recovery. Live size on disk
+diverges from accounting.
+**Recommendation:** Mirror the single `alloc` split logic — if
+`block_size - total >= MIN_ALLOC`, `avl_insert(ptr, block_size - total)` for
+the leading fragment and use `ptr + (block_size - total)` for the bulk
+allocation. Then the implementation table line "single-call (crash-safe by
+construction)" is no longer accurate; either reorder (insert first) or
+downgrade the row.
+
+#### [Medium] `coalesce_and_rebalance` mishandles duplicate visits from a corrupted tree
+**Severity:** Medium
+**Category:** Crash safety
+**Location:** [src/alloc/ghost_tree.rs:498-557](src/alloc/ghost_tree.rs#L498-L557)
+**Description:** If a previous rotation crashed in a way that left a node
+reachable from two parents (e.g. step-1-of-2 in a rotation leaves `pivot_r` as
+both `node.left` and `pivot.right`), the in-order walk visits the duplicated
+node twice. Both visits push `(ptr, size)` into `blocks`. The coalesce step
+only merges when `last.0 + last.1 == ptr`, which is *false* for duplicates
+(`ptr + size != ptr`), so both entries survive into the rebuild. `build` then
+writes an AVL node at the duplicated `ptr` twice; the second write clobbers
+the first node's child pointers, and the subtree the first write described is
+lost.
+**Scenario:** Crash during the first write of a left-right rotation; reopen.
+Tree walk reaches the shared node from both sides; rebuild loses one of the
+duplicate's subtrees.
+**Impact:** Compounds with the rotation-crash leak above — recovery itself can
+delete additional reachable free blocks.
+**Recommendation:** Deduplicate the `blocks` vector before coalescing
+(`blocks.sort(); blocks.dedup()` after the in-order walk), or detect duplicate
+visits during the walk by maintaining a "seen" set keyed on `ptr` and erroring
+out so the user is informed of corruption rather than silently widening it.
+
+#### [Medium] AVL walk uses unbounded recursion
+**Severity:** Medium
+**Category:** Invariant
+**Location:** [src/alloc/ghost_tree.rs:477-489](src/alloc/ghost_tree.rs#L477-L489), [src/alloc/ghost_tree.rs:342-356](src/alloc/ghost_tree.rs#L342-L356), [src/alloc/ghost_tree.rs:376-404](src/alloc/ghost_tree.rs#L376-L404)
+**Description:** `avl_walk_inorder`, `avl_insert_rec`, `avl_remove_rec`, and
+`avl_find_best_fit_and_remove_rec` are all naturally recursive. On a balanced
+tree this is fine (depth ≤ ~60 for any realistic arena). On a *corrupted*
+tree (rotation crash creating a cycle via stale pointers) the recursion has
+no cycle guard and will stack-overflow.
+**Scenario:** A torn rotation leaves a cycle in the tree (e.g. node `A`'s
+right pointer became `B`, and `B`'s right pointer still points back to `A`).
+Any subsequent operation that walks through `A` recurses until the stack
+overflows the OS thread limit.
+**Impact:** Recovery cannot run — the process aborts on `coalesce_and_rebalance`
+inside `new()`, making the file unopenable until manual repair.
+**Recommendation:** Bound the recursion: pass a `remaining_depth` parameter
+(start at, say, 128) and return an error when it reaches zero. Or convert the
+walk to an explicit stack-based loop with a visited-set guard.
+
+#### [Low] Doc table claim "single-call" is not accurate for `alloc_bulk`
+**Severity:** Low
+**Category:** Documentation
+**Location:** [src/alloc/ghost_tree.rs:65](src/alloc/ghost_tree.rs#L65), [src/alloc/ghost_tree.rs:749-752](src/alloc/ghost_tree.rs#L749-L752)
+**Description:** The summary table row reads `| alloc_bulk | one block for the
+combined size, then split | single-call|`. The actual implementation does
+`avl_find_best_fit_and_remove` (multiple writes for the AVL rotation/rebalance
+cascade) + `self.stack.zero(ptr, MIN_ALLOC)` — at least two `BStack` calls,
+typically many more on a non-trivial tree.
+**Recommendation:** Re-label the row as multi-call and describe the recovery
+path (or lack thereof).
+
+#### [Low] `realloc` shrink non-tail leaks freed tail on crash
+**Severity:** Low
+**Category:** Crash safety
+**Location:** [src/alloc/ghost_tree.rs:678-684](src/alloc/ghost_tree.rs#L678-L684)
+**Description:** Non-tail shrink does `self.stack.zero(...)` then
+`self.avl_insert(tail_ptr, freed_tail)`. A crash between the two leaks
+`freed_tail` bytes. Severity is lower than the dealloc case because shrink is
+rarer.
+**Recommendation:** Same write-ahead reorder as the `dealloc` fix; or
+document explicitly that shrink-non-tail leaks on crash.
+
