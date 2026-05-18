@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`LinearBStackAllocator::realloc` error message clarified** (`alloc` feature): The `Unsupported` error returned for non-tail slice reallocation now explicitly states that deallocating the old slice is also a no-op and will leak the region, so callers understand both steps of the copy-and-dealloc workaround are their own responsibility.
+- **`LinearBStackAllocator::alloc_bulk` documents zero-length entry aliasing** (`alloc` feature): Zero-length entries produce slices with the same offset as the immediately following non-zero slice (adding zero to the running offset leaves it unchanged). Multiple consecutive zero-length entries therefore compare equal by `(offset, len)`. This was always true; it is now documented so callers are not surprised.
+- **`LinearBStackAllocator::dealloc_bulk` documents duplicate/overlap coalescing** (`alloc` feature): Duplicate or overlapping slice handles are silently coalesced rather than causing an error — only the bytes collectively covered are discarded once. This matches single-item `dealloc` semantics and is now documented explicitly.
+
 - **`BStackReader`, `BStackSliceReader`, and `BStackSliceWriter` now implement `Copy`**: All cursor types can now be copied by value without an explicit `.clone()` call, making them more ergonomic to use in iterator-like patterns and when passing to functions that don't need to move the original cursor. (`BStackSliceReader` and `BStackSliceWriter` require the `alloc` feature.)
 
 ## [0.2.0] - 2026-05-15

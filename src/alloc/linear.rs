@@ -100,7 +100,9 @@ impl BStackAllocator for LinearBStackAllocator {
         if slice.end() != current_tail {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "LinearBStackAllocator::realloc: non-tail slice cannot be resized in place",
+                "LinearBStackAllocator does not support reallocation of non-tail slices; \
+                 callers must alloc a new region and copy manually. \
+                 Note: dealloc of the old (non-tail) slice is also a no-op and leaks the region.",
             ));
         }
         match new_len.cmp(&slice.len()) {
@@ -133,6 +135,16 @@ impl BStackBulkAllocator for LinearBStackAllocator {
     /// The total byte count is computed first; if it overflows `u64` the call
     /// returns [`io::ErrorKind::InvalidInput`] without modifying the file.
     /// Otherwise one `extend` (and one durable sync) covers all allocations.
+    ///
+    /// # Zero-length entries
+    ///
+    /// Zero-length requests are permitted and produce zero-length slices. Their
+    /// offset is the same as the immediately following non-zero slice because
+    /// adding zero to the running offset leaves it unchanged. Multiple
+    /// consecutive zero-length entries therefore produce slices that compare
+    /// equal by `(offset, len)`. This is harmless for I/O but callers that use
+    /// slice identity to distinguish allocations should avoid zero-length entries
+    /// or filter them out.
     fn alloc_bulk(
         &self,
         lengths: impl AsRef<[u64]>,
@@ -169,6 +181,15 @@ impl BStackBulkAllocator for LinearBStackAllocator {
     /// that are separated from the tail by slices not included in `slices`)
     /// are silently ignored, matching the single-item
     /// [`dealloc`](BStackAllocator::dealloc) semantics.
+    ///
+    /// # Duplicates and overlapping slices
+    ///
+    /// Duplicate or overlapping slices are silently coalesced — no error is
+    /// returned, and only the bytes they collectively cover are discarded once.
+    /// Callers that pass the same handle twice or supply overlapping sub-slices
+    /// will not observe data corruption, but the silent swallowing of the
+    /// programmer error may mask bugs. Add a debug assertion at the call site
+    /// if uniqueness must be enforced.
     fn dealloc_bulk<'a>(
         &'a self,
         slices: impl AsRef<[Self::Allocated<'a>]>,
