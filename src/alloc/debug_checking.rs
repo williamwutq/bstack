@@ -527,13 +527,16 @@ where
             match h.try_into() {
                 Ok(slice) => slices.push(slice),
                 Err(e) => {
-                    // Free every handle the inner allocator gave us to avoid leaking them
-                    for &h in &inner_handles {
-                        let _ = self.inner.dealloc(h);
-                    }
-                    return Err(io::Error::other(format!(
-                        "bulk-allocated handle {i} is not convertible to BStackSlice: {e}"
-                    )));
+                    // Roll back the whole bulk allocation atomically; if rollback fails,
+                    // propagate that failure instead of pretending nothing changed.
+                    return match self.inner.dealloc_bulk(&inner_handles) {
+                        Ok(()) => Err(io::Error::other(format!(
+                            "bulk-allocated handle {i} is not convertible to BStackSlice: {e}"
+                        ))),
+                        Err(rollback_err) => Err(io::Error::other(format!(
+                            "bulk-allocated handle {i} is not convertible to BStackSlice: {e}; rollback via dealloc_bulk failed: {rollback_err}"
+                        ))),
+                    };
                 }
             }
         }
