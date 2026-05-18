@@ -135,44 +135,6 @@ This prevents accidental writes while still allowing inspection of the underlyin
 
 ---
 
-## Adding `bstack_bulk_allocator_vtbl_t` to the C allocator API
-
-**Feature flag:** `BSTACK_FEATURE_ATOMIC`
-**Breaking change:** No (additive extension to `bstack_alloc.h`)
-
-### Motivation
-
-The Rust allocator layer exposes `BStackBulkAllocator` — an extension trait that adds `alloc_bulk` and `dealloc_bulk` for atomically allocating or freeing multiple regions in a single operation. The C allocator API (`bstack_allocator_vtbl_t`) has no equivalent; callers must issue individual alloc/dealloc calls, which is neither atomic nor efficient when managing several related regions.
-
-This matters most for structured records that span multiple slices (e.g., a key slice + a value slice in a hash-map entry): allocating them one at a time creates a window where a crash leaves one slice allocated and the other not, complicating recovery.
-
-### Design
-
-Add a second vtable struct `bstack_bulk_allocator_vtbl_t` (available only with `-DBSTACK_FEATURE_ATOMIC`) alongside the existing vtable:
-
-```c
-typedef struct {
-    /* Allocate n slices of the given lengths atomically.
-     * out_slices must hold room for n bstack_slice_t values.
-     * Returns 0 on success, -1 on failure (errno set). */
-    int (*alloc_bulk)(void *self, const size_t *lens, size_t n,
-                      bstack_slice_t *out_slices);
-
-    /* Free n slices atomically.
-     * slices must all originate from the same allocator instance.
-     * Returns 0 on success, -1 on failure (errno set). */
-    int (*dealloc_bulk)(void *self, const bstack_slice_t *slices, size_t n);
-} bstack_bulk_allocator_vtbl_t;
-```
-
-Each concrete allocator (`linear_bstack_allocator_t`, `first_fit_bstack_allocator_t`, `ghost_tree_bstack_allocator_t`) would optionally implement this vtable; callers query via a `bstack_allocator_bulk_vtbl(bstack_allocator_t *)` accessor that returns NULL when the allocator does not support bulk operations.
-
-### Open questions
-
-- Should bulk operations be a separate vtable pointer hanging off `bstack_allocator_t`, or a distinct handle type (analogous to the Rust trait extension pattern)?
-
----
-
 ## Adding a guard/intercept layer to the C allocator API
 
 **Feature flag:** `BSTACK_FEATURE_SET` (for write hooks)
