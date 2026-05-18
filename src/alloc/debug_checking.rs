@@ -38,8 +38,8 @@
 //! - This allows double-free detection within a single session even when the original
 //!   allocation happened in a prior run.
 //!
-//! If you need cross-session validation, reconstruct the tracking sets from your
-//! application's own metadata after reopening the file.
+//! If you need cross-session validation, use [`DebugCheckingAllocator::with_state`]
+//! to pre-populate the tracking sets from your application's own metadata.
 //!
 //! # Example
 //!
@@ -223,8 +223,8 @@ where
     /// Create a new `DebugCheckingAllocator` wrapping `inner`.
     ///
     /// The allocator starts with empty tracking sets. If you're reopening
-    /// a file from a previous session, you may want to reconstruct the
-    /// allocated/freed sets based on your application's metadata.
+    /// a file from a previous session and want to pre-populate those sets,
+    /// use [`Self::with_state`] instead.
     pub fn new(inner: A) -> Self {
         Self {
             inner,
