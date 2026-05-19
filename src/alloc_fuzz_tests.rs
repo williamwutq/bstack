@@ -348,14 +348,21 @@ mod alloc_fuzz_tests {
                 fn free_zero_slices() {
                     super::run_free_zero_slices($make);
                 }
-                #[test]
-                fn double_free_error() {
-                    super::run_double_free_error($make);
-                }
             }
         };
     }
 
     fuzz_suite!(first_fit, FirstFitBStackAllocator::new);
     fuzz_suite!(ghost_tree, GhostTreeBstackAllocator::new);
+
+    // double_free_error is FirstFit-only: GhostTree carries no per-block is_free
+    // flag, so reliable double-free detection would require false-positives on
+    // ordinary user data that happens to match the AVL size field value.
+    mod first_fit_only {
+        use super::*;
+        #[test]
+        fn double_free_error() {
+            super::run_double_free_error(FirstFitBStackAllocator::new);
+        }
+    }
 }

@@ -789,24 +789,14 @@ impl BStackAllocator for GhostTreeBstackAllocator {
         let ptr = slice.start();
         let true_len = Self::align_up_len(slice.len());
 
-        // Tail optimisation first — a tail block may already have been discarded,
-        // in which case reading its first bytes would go out of bounds.
+        // Tail optimisation: truncate instead of recycling through the AVL tree.
         if ptr + true_len == self.stack.len()? {
             return self.stack.discard(true_len);
         }
 
-        // Double-free detection: a free block's first 8 bytes hold the AVL node
-        // size field, which equals `true_len` (always ≥ MIN_ALLOC = 32).  An
-        // allocated block's first bytes are user data — the probability of a
-        // false match is low and the cost of the check is one `get_into`.
-        let mut size_buf = [0u8; 8];
-        self.stack.get_into(ptr, &mut size_buf)?;
-        if u64::from_le_bytes(size_buf) == true_len {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "dealloc: block is already free (double-free detected)",
-            ));
-        }
+        // Note: GhostTree carries no per-block is_free flag and stores no block
+        // headers for live allocations, so reliable double-free detection is not
+        // possible without false-positives on ordinary user data.
 
         self.stack.zero(ptr, true_len)?;
         self.avl_insert(ptr, true_len)
