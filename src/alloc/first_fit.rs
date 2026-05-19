@@ -381,6 +381,13 @@ impl FirstFitBStackAllocator {
         // Walk the free-list from free_head. For each block, check if block.size >= len
         let mut block_found = 0u64;
         let mut found_size = 0u64;
+        let stack_len = self.stack.len()?;
+        let arena_start = Self::OFFSET_SIZE + Self::HEADER_SIZE;
+        // Upper bound on the number of free blocks; used to detect cycles.
+        let max_walk = stack_len.saturating_sub(arena_start)
+            / (Self::MIN_BLOCK_PAYLOAD_SIZE + Self::BLOCK_OVERHEAD_SIZE)
+            + 1;
+        let mut walk_count = 0u64;
         let mut head = u64::from_le_bytes(
             self.stack
                 .get(Self::FREE_HEAD_OFFSET, Self::FREE_HEAD_OFFSET + 8)?
@@ -388,6 +395,13 @@ impl FirstFitBStackAllocator {
                 .unwrap(),
         );
         while head != 0 {
+            walk_count += 1;
+            if walk_count > max_walk {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "corrupted free list: cycle detected (walk exceeded maximum block count)",
+                ));
+            }
             let size_flags_and_ptr_buf = &mut [0u8; Self::BLOCK_HEADER_SIZE as usize + 8];
             self.stack
                 .get_into(head - Self::BLOCK_HEADER_SIZE, size_flags_and_ptr_buf)?;
@@ -607,7 +621,21 @@ impl FirstFitBStackAllocator {
             }) {
                 Some(t) => t,
                 None => {
-                    // Corrupt or partial block at the tail; truncate everything from here.
+                    if size < Self::MIN_BLOCK_PAYLOAD_SIZE
+                        || size % 8 != 0
+                        || size.checked_add(Self::BLOCK_OVERHEAD_SIZE).is_none()
+                    {
+                        // Invalid size: this is mid-arena corruption, not a partial tail write.
+                        // Refuse to silently discard all data that follows.
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "recovery: corrupted block header at offset {pos}: \
+                                 invalid size {size}; manual repair required"
+                            ),
+                        ));
+                    }
+                    // Size is valid but the block extends past the stack end: partial tail write.
                     self.stack.discard(stack_len - pos)?;
                     break;
                 }
@@ -763,13 +791,29 @@ impl BStackAllocator for FirstFitBStackAllocator {
                 "invalid slice: start or end offset is impossible",
             ));
         }
+        // Double-free detection: the block must not already be marked free.
+        let mut flags_buf = [0u8; 4];
+        self.stack
+            .get_into(slice.start() - Self::BLOCK_HEADER_SIZE + 8, &mut flags_buf)?;
+        if flags_buf[0] & 1 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "double-free: block is already free",
+            ));
+        }
+
         // Special case for dealloc of the tail block:
         // if slice.start() + aligned_len == self.len() - Self::BLOCK_FOOTER_SIZE, just discard it.
         let current_tail = self.stack.len()?;
         if slice.start() + aligned_len == current_tail - Self::BLOCK_FOOTER_SIZE {
+            // Set recovery_needed before the discard so that a crash between discard and
+            // cascade_discard_free_tail (which could leave a free block at the new tail)
+            // is detected on reopen and repaired by recovery.
+            self.set_recovery_needed()?;
             self.stack
                 .discard(aligned_len + Self::BLOCK_OVERHEAD_SIZE)?;
             self.cascade_discard_free_tail()?;
+            self.clear_recovery_needed()?;
             return Ok(());
         }
         self.set_recovery_needed()?;

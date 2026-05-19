@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`FirstFitBStackAllocator::dealloc` — double-free** (`alloc` + `set` features): `dealloc` now returns `InvalidInput` if the block header's `is_free` flag is already set. Previously a double-free wrote a self-referential free-list entry; because `recovery_needed` was cleared normally, the corruption survived reopen and made every subsequent allocation fail.
+- **`FirstFitBStackAllocator::dealloc` — tail fast path missing `recovery_needed` guard** (`alloc` + `set` features): `dealloc` now sets `recovery_needed` before `BStack::discard` in the tail-block path and clears it after `cascade_discard_free_tail`. A crash between the two steps could leave a free block at the new tail, violating the invariant that the tail is always allocated, with no recovery triggered on reopen.
+- **`FirstFitBStackAllocator` recovery — mid-arena corrupt block truncated all following data** (`alloc` + `set` features): Recovery now returns `InvalidData` when a block header contains an invalid size (below minimum or not 8-aligned), instead of discarding everything from that offset to the tail. Truncation is still performed for a valid-size block that merely extends past the stack end (the intended partial-tail-write case).
+- **`FirstFitBStackAllocator::find_large_enough_block` — free-list cycle hangs indefinitely** (`alloc` + `set` features): The walk now returns `InvalidData` if iteration count exceeds `arena_size / min_block_size + 1`, bounding the loop against self-referential entries introduced by corruption.
+
 ### Changed
 
 - **`LinearBStackAllocator::realloc` error message clarified** (`alloc` feature): The `Unsupported` error returned for non-tail slice reallocation now explicitly states that deallocating the old slice is also a no-op and will leak the region, so callers understand both steps of the copy-and-dealloc workaround are their own responsibility.
