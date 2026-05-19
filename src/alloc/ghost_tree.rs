@@ -18,6 +18,12 @@ const MIN_ALLOC: u64 = 32;
 /// Null / absent pointer sentinel stored in AVL node child fields.
 const NULL_PTR: u64 = 0;
 
+/// Maximum recursion depth for AVL tree operations.  A balanced AVL tree never
+/// exceeds ~60 levels for any realistic arena size, so 128 gives ample headroom
+/// for slightly-imbalanced-but-valid trees while reliably catching cycles left
+/// by a partial rotation crash.
+const MAX_AVL_DEPTH: u32 = 128;
+
 // Node offsets within a free block (AVL node header fields).
 const NODE_SIZE_OFF: u64 = 0;
 const NODE_BF_OFF: u64 = 8; // i8 balance factor
@@ -64,7 +70,7 @@ macro_rules! read_buf_le {
 /// | Operation               | Strategy                                          | Crash-safe |
 /// |-------------------------|---------------------------------------------------|------------|
 /// | `alloc`                 | best-fit from AVL tree, or `extend`               | multi-call |
-/// | `alloc_bulk`            | one block for the combined size, then split       | single-call|
+/// | `alloc_bulk`            | one block for the combined size, then split       | multi-call |
 /// | `realloc` same block    | in-place length update; zero gap on shrink        | multi-call |
 /// | `realloc` shrink (tail) | zero gap, `discard` freed tail                    | multi-call |
 /// | `realloc` shrink        | zero gap + freed tail, AVL insert                 | multi-call |
@@ -105,9 +111,28 @@ macro_rules! read_buf_le {
 ///
 /// # Crash safety
 ///
-/// No write-ahead log, no checksums.  A crash during `dealloc` before the AVL
-/// insert permanently loses that block.  A crash during rotation leaves the tree
-/// imbalanced — corrected on the next [`GhostTreeBstackAllocator::new`].
+/// No write-ahead log, no checksums.  All multi-call paths can produce space
+/// leaks on crash; **user data in live allocations is never lost**.  Specific
+/// known leak windows:
+///
+/// * **`dealloc` (non-tail):** a crash after `zero` but before the AVL insert
+///   permanently discards that free block.  The bytes are zeroed but the tree
+///   has no entry for them.
+/// * **`realloc` grow (non-tail):** a crash after `alloc(new)` but before
+///   `dealloc(old)` leaves both the new and old blocks unreachable.  The caller's
+///   original data is still intact in `old`, but neither handle is recoverable.
+/// * **`realloc` shrink (non-tail):** a crash after `zero` but before the AVL
+///   insert for the freed tail fragment leaks that fragment.
+/// * **`alloc` split:** a crash after `avl_find_best_fit_and_remove` but before
+///   `avl_insert(remainder)` leaks the entire found block.
+/// * **Torn AVL rotation:** if the process crashes between the two `write_node`
+///   calls of a rotation, the subtree rooted at `pivot` becomes unreachable from
+///   the tree root.  `coalesce_and_rebalance` (run on every open) only walks
+///   reachable nodes, so the orphaned subtree is a **permanent space leak**.
+///   Since the orphaned nodes are free blocks (no live user data), no user data
+///   is lost — only allocatable space.  A linear arena scan would recover them
+///   but GhostTree carries no per-block `is_free` flag, making such a scan
+///   unreliable; the leak is therefore accepted by design.
 pub struct GhostTreeBstackAllocator {
     stack: BStack,
 }
@@ -339,17 +364,23 @@ impl GhostTreeBstackAllocator {
     }
 
     /// Recursive insert into subtree at `root`; return new subtree root.
-    fn avl_insert_rec(&self, root: u64, ptr: u64, size: u64) -> io::Result<u64> {
+    fn avl_insert_rec(&self, root: u64, ptr: u64, size: u64, depth: u32) -> io::Result<u64> {
         if root == NULL_PTR {
             self.write_node(ptr, size, 0, 1, NULL_PTR, NULL_PTR)?;
             return Ok(ptr);
         }
+        if depth == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "AVL insert exceeded maximum depth: corrupted tree (possible cycle)",
+            ));
+        }
         let (root_sz, _, _, left, right) = self.read_node(root)?;
         if (size, ptr) < (root_sz, root) {
-            let new_left = self.avl_insert_rec(left, ptr, size)?;
+            let new_left = self.avl_insert_rec(left, ptr, size, depth - 1)?;
             self.avl_write_and_update(root, root_sz, new_left, right)?;
         } else {
-            let new_right = self.avl_insert_rec(right, ptr, size)?;
+            let new_right = self.avl_insert_rec(right, ptr, size, depth - 1)?;
             self.avl_write_and_update(root, root_sz, left, new_right)?;
         }
         self.avl_rebalance(root)
@@ -358,33 +389,45 @@ impl GhostTreeBstackAllocator {
     /// Insert a free block at `ptr` with `size` bytes into the AVL tree.
     fn avl_insert(&self, ptr: u64, size: u64) -> io::Result<()> {
         let root = self.read_root()?;
-        let new_root = self.avl_insert_rec(root, ptr, size)?;
+        let new_root = self.avl_insert_rec(root, ptr, size, MAX_AVL_DEPTH)?;
         self.write_root(new_root)
     }
 
     /// Return `(ptr, size)` of the leftmost (minimum-key) node in `subtree`.
-    fn avl_min(&self, subtree: u64) -> io::Result<(u64, u64)> {
+    fn avl_min(&self, subtree: u64, depth: u32) -> io::Result<(u64, u64)> {
         let (size, _, _, left, _) = self.read_node(subtree)?;
         if left == NULL_PTR {
             Ok((subtree, size))
         } else {
-            self.avl_min(left)
+            if depth == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "AVL min exceeded maximum depth: corrupted tree (possible cycle)",
+                ));
+            }
+            self.avl_min(left, depth - 1)
         }
     }
 
     /// Recursive remove of `(size, ptr)` from subtree at `root`; return new root.
-    fn avl_remove_rec(&self, root: u64, ptr: u64, size: u64) -> io::Result<u64> {
+    fn avl_remove_rec(&self, root: u64, ptr: u64, size: u64, depth: u32) -> io::Result<u64> {
         if root == NULL_PTR {
             return Ok(NULL_PTR);
         }
+        if depth == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "AVL remove exceeded maximum depth: corrupted tree (possible cycle)",
+            ));
+        }
         let (root_sz, _, _, left, right) = self.read_node(root)?;
         if (size, ptr) < (root_sz, root) {
-            let new_left = self.avl_remove_rec(left, ptr, size)?;
+            let new_left = self.avl_remove_rec(left, ptr, size, depth - 1)?;
             self.avl_write_and_update(root, root_sz, new_left, right)?;
             return self.avl_rebalance(root);
         }
         if (size, ptr) > (root_sz, root) {
-            let new_right = self.avl_remove_rec(right, ptr, size)?;
+            let new_right = self.avl_remove_rec(right, ptr, size, depth - 1)?;
             self.avl_write_and_update(root, root_sz, left, new_right)?;
             return self.avl_rebalance(root);
         }
@@ -397,8 +440,8 @@ impl GhostTreeBstackAllocator {
         }
         // Two children: replace with the in-order successor (leftmost of right
         // subtree), then delete the successor from the right subtree.
-        let (succ, succ_sz) = self.avl_min(right)?;
-        let new_right = self.avl_remove_rec(right, succ, succ_sz)?;
+        let (succ, succ_sz) = self.avl_min(right, depth - 1)?;
+        let new_right = self.avl_remove_rec(right, succ, succ_sz, depth - 1)?;
         self.avl_write_and_update(succ, succ_sz, left, new_right)?;
         self.avl_rebalance(succ)
     }
@@ -417,14 +460,22 @@ impl GhostTreeBstackAllocator {
         &self,
         root: u64,
         min_size: u64,
+        depth: u32,
     ) -> io::Result<(u64, Option<(u64, u64)>)> {
         if root == NULL_PTR {
             return Ok((NULL_PTR, None));
         }
+        if depth == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "AVL find exceeded maximum depth: corrupted tree (possible cycle)",
+            ));
+        }
         let (root_sz, _, _, left, right) = self.read_node(root)?;
         if root_sz >= min_size {
             // This node fits — try left for something smaller.
-            let (new_left, found) = self.avl_find_best_fit_and_remove_rec(left, min_size)?;
+            let (new_left, found) =
+                self.avl_find_best_fit_and_remove_rec(left, min_size, depth - 1)?;
             if let Some(candidate) = found {
                 // A smaller fit was found; keep root, update its left child.
                 self.avl_write_and_update(root, root_sz, new_left, right)?;
@@ -440,15 +491,16 @@ impl GhostTreeBstackAllocator {
             } else if right == NULL_PTR {
                 new_left
             } else {
-                let (succ, succ_sz) = self.avl_min(right)?;
-                let new_right = self.avl_remove_rec(right, succ, succ_sz)?;
+                let (succ, succ_sz) = self.avl_min(right, depth - 1)?;
+                let new_right = self.avl_remove_rec(right, succ, succ_sz, depth - 1)?;
                 self.avl_write_and_update(succ, succ_sz, new_left, new_right)?;
                 self.avl_rebalance(succ)?
             };
             Ok((new_root, Some((root, root_sz))))
         } else {
             // Too small — only right subtree can have a fit.
-            let (new_right, found) = self.avl_find_best_fit_and_remove_rec(right, min_size)?;
+            let (new_right, found) =
+                self.avl_find_best_fit_and_remove_rec(right, min_size, depth - 1)?;
             // Only update the tree structure if a node was actually removed.
             // Updating unconditionally would corrupt child pointers on a no-fit
             // path (the recursive call may have rebalanced without removing).
@@ -467,25 +519,34 @@ impl GhostTreeBstackAllocator {
     /// Returns `(ptr, size)`, or `None` if no block fits.
     fn avl_find_best_fit_and_remove(&self, min_size: u64) -> io::Result<Option<(u64, u64)>> {
         let root = self.read_root()?;
-        let (new_root, found) = self.avl_find_best_fit_and_remove_rec(root, min_size)?;
+        let (new_root, found) =
+            self.avl_find_best_fit_and_remove_rec(root, min_size, MAX_AVL_DEPTH)?;
         self.write_root(new_root)?;
         Ok(found)
     }
 
     /// In-order walk of the subtree at `root`, calling `f(ptr, size)` per node.
-    /// Tolerates imbalance — visits every reachable node.
+    /// Tolerates imbalance — visits every reachable node.  Returns `InvalidData`
+    /// if `depth` reaches zero (cycle guard against corrupted trees).
     fn avl_walk_inorder(
         &self,
         root: u64,
+        depth: u32,
         f: &mut dyn FnMut(u64, u64) -> io::Result<()>,
     ) -> io::Result<()> {
         if root == NULL_PTR {
             return Ok(());
         }
+        if depth == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "AVL walk exceeded maximum depth: corrupted tree (possible cycle)",
+            ));
+        }
         let (size, _, _, left, right) = self.read_node(root)?;
-        self.avl_walk_inorder(left, f)?;
+        self.avl_walk_inorder(left, depth - 1, f)?;
         f(root, size)?;
-        self.avl_walk_inorder(right, f)
+        self.avl_walk_inorder(right, depth - 1, f)
     }
 
     /// Collect all free blocks, merge adjacent ones, and rebuild a balanced AVL
@@ -499,7 +560,7 @@ impl GhostTreeBstackAllocator {
         // Step 1: collect all free blocks in key order
         let root = self.read_root()?;
         let mut blocks: Vec<(u64, u64)> = Vec::new(); // (ptr, size)
-        self.avl_walk_inorder(root, &mut |ptr, size| {
+        self.avl_walk_inorder(root, MAX_AVL_DEPTH, &mut |ptr, size| {
             blocks.push((ptr, size));
             Ok(())
         })?;
@@ -508,8 +569,12 @@ impl GhostTreeBstackAllocator {
             return Ok(());
         }
 
-        // Step 2: sort by address
+        // Step 2: sort by address and deduplicate by ptr.  A partial rotation
+        // crash can leave a node reachable from two parents; the in-order walk
+        // would visit it twice.  Without dedup the rebuild would write the same
+        // AVL node twice, clobbering child pointers written by the first pass.
         blocks.sort_by_key(|&(ptr, _)| ptr);
+        blocks.dedup_by_key(|b| b.0);
 
         // Step 3: coalesce adjacent pairs
         // `seams` holds the ptr of every absorbed sub-block whose 32-byte AVL
@@ -722,14 +787,27 @@ impl BStackAllocator for GhostTreeBstackAllocator {
             ));
         }
         let ptr = slice.start();
-        // Re-align to recover the true block size that alloc carved out.
-        // Any bytes beyond the requested length (< 32) are absorbed here.
         let true_len = Self::align_up_len(slice.len());
-        // Tail optimisation: if this block sits at the end of the BStack,
-        // truncate instead of recycling through the AVL tree.
+
+        // Tail optimisation first — a tail block may already have been discarded,
+        // in which case reading its first bytes would go out of bounds.
         if ptr + true_len == self.stack.len()? {
             return self.stack.discard(true_len);
         }
+
+        // Double-free detection: a free block's first 8 bytes hold the AVL node
+        // size field, which equals `true_len` (always ≥ MIN_ALLOC = 32).  An
+        // allocated block's first bytes are user data — the probability of a
+        // false match is low and the cost of the check is one `get_into`.
+        let mut size_buf = [0u8; 8];
+        self.stack.get_into(ptr, &mut size_buf)?;
+        if u64::from_le_bytes(size_buf) == true_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "dealloc: block is already free (double-free detected)",
+            ));
+        }
+
         self.stack.zero(ptr, true_len)?;
         self.avl_insert(ptr, true_len)
     }
@@ -785,10 +863,18 @@ impl BStackBulkAllocator for GhostTreeBstackAllocator {
 
         // Allocate one contiguous block.  `total` is already a sum of multiples
         // of MIN_ALLOC so no further rounding is needed.
-        let block_ptr = if let Some((ptr, _)) = self.avl_find_best_fit_and_remove(total)? {
-            // Zero the stale AVL node header; the rest is already zeroed by invariant.
-            self.stack.zero(ptr, MIN_ALLOC)?;
-            ptr
+        let block_ptr = if let Some((ptr, block_size)) = self.avl_find_best_fit_and_remove(total)? {
+            let remainder = block_size - total;
+            if remainder >= MIN_ALLOC {
+                // Split: recycle the leading remainder as a new free block,
+                // use the trailing `total` bytes for the allocation.
+                self.avl_insert(ptr, remainder)?;
+                ptr + remainder
+            } else {
+                // No split: zero the stale AVL node header; rest already zeroed.
+                self.stack.zero(ptr, MIN_ALLOC)?;
+                ptr
+            }
         } else {
             self.stack.extend(total)?
         };
