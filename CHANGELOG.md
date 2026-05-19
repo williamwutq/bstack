@@ -20,6 +20,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`FirstFitBStackAllocator` version bumped to 0.1.2** (`alloc` + `set` features): Magic number updated from `ALFF\x00\x01\x01\x00` to `ALFF\x00\x01\x02\x00`. This is to reflect the bug fixes in 0.1.6, which are critical for data integrity. Existing 0.1.x files remain fully compatible (only the first 6 bytes are checked on open).
+- **`GhostTreeBstackAllocator` version bumped to 0.1.1** (`alloc` feature): Magic number updated from `ALGT\x00\x01\x00\x00` to `ALGT\x00\x01\x01\x00`. This is to reflect the bug fixes in 0.1.6, which are critical for data integrity. Existing 0.1.x files remain fully compatible.
+
 - **`LinearBStackAllocator::realloc` error message clarified** (`alloc` feature): The `Unsupported` error returned for non-tail slice reallocation now explicitly states that deallocating the old slice is also a no-op and will leak the region, so callers understand both steps of the copy-and-dealloc workaround are their own responsibility.
 - **`LinearBStackAllocator::alloc_bulk` documents zero-length entry aliasing** (`alloc` feature): Zero-length entries produce slices with the same offset as the immediately following non-zero slice (adding zero to the running offset leaves it unchanged). Multiple consecutive zero-length entries therefore compare equal by `(offset, len)`. This was always true; it is now documented so callers are not surprised.
 - **`LinearBStackAllocator::dealloc_bulk` documents duplicate/overlap coalescing** (`alloc` feature): Duplicate or overlapping slice handles are silently coalesced rather than causing an error — only the bytes collectively covered are discarded once. This matches single-item `dealloc` semantics and is now documented explicitly.

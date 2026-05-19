@@ -2,7 +2,7 @@ use super::{BStackAllocator, BStackBulkAllocator, BStackSlice};
 use crate::BStack;
 use std::io;
 
-const ALGT_MAGIC: [u8; 8] = *b"ALGT\x00\x01\x00\x00";
+const ALGT_MAGIC: [u8; 8] = *b"ALGT\x00\x01\x01\x00";
 const ALGT_MAGIC_PREFIX: [u8; 6] = *b"ALGT\x00\x01";
 
 /// Payload offset of the magic number.
@@ -86,7 +86,7 @@ macro_rules! read_buf_le {
 /// ┌─────────────────────────────┐  payload offset 0
 /// │   User-reserved (32 bytes)  │
 /// ├─────────────────────────────┤  offset 32
-/// │   Magic number (8 bytes)    │  "ALGT\x00\x01\x00\x00"
+/// │   Magic number (8 bytes)    │  "ALGT\x00\x01\x01\x00"
 /// ├─────────────────────────────┤  offset 40
 /// │   AVL root pointer (8 B)    │  absolute payload offset of the root node
 /// ├─────────────────────────────┤  offset 48  ← arena start (32-byte aligned)
