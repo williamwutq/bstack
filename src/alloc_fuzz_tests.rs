@@ -231,6 +231,97 @@ mod alloc_fuzz_tests {
         }
     }
 
+    // Note: This is not required by the API, but it is a common edge case that zero-size allocations
+    // should be handled gracefully and not cause panics or corruption. We test this explicitly to
+    // ensure that all allocators provided by the crate itself handle zero-size allocs correctly.
+    fn run_zero_size_alloc<A, F>(make: F)
+    where
+        A: BStackSliceAllocator,
+        F: Fn(BStack) -> std::io::Result<A>,
+    {
+        let path = temp_path("zalloc");
+        let _guard = Guard(path.clone());
+        let alloc = make(BStack::open(&path).unwrap()).unwrap();
+
+        let mut slices = Vec::new();
+        for _ in 0..FUZZ_COUNT {
+            let s = alloc.alloc(0).unwrap();
+            assert_eq!(s.len(), 0, "zero alloc must have len 0");
+            assert_eq!(s.start(), 0, "zero alloc must have start 0");
+            slices.push(s);
+        }
+        // All zero slices are identical by (start, len); dealloc each is a no-op.
+        for s in slices {
+            alloc.dealloc(s).unwrap();
+        }
+    }
+
+    // Similar to the above, this tests that interleaving zero-size alloc/dealloc pairs with real
+    // allocations does not cause any corruption or panics.
+    fn run_free_zero_slices<A, F>(make: F)
+    where
+        A: BStackSliceAllocator,
+        F: Fn(BStack) -> std::io::Result<A>,
+    {
+        let path = temp_path("fzero");
+        let _guard = Guard(path.clone());
+        let alloc = make(BStack::open(&path).unwrap()).unwrap();
+        let mut rng = rand::rng();
+
+        // Interleave real allocations with zero-length alloc/dealloc pairs to
+        // verify that zero slices never disturb the allocator state.
+        let mut live = Vec::new();
+        for i in 0..FUZZ_COUNT {
+            let zero = alloc.alloc(0).unwrap();
+            alloc.dealloc(zero).unwrap();
+
+            if rng.random_bool(0.5) || live.is_empty() {
+                let s = alloc.alloc(rng.random_range(16..=256)).unwrap();
+                write_id(&s, i as u64);
+                live.push((s, i as u64));
+            } else {
+                let idx = rng.random_range(0..live.len());
+                let (s, id) = live.swap_remove(idx);
+                verify_id(&s, id, "free_zero_slices");
+                alloc.dealloc(s).unwrap();
+            }
+        }
+    }
+
+    // This tests that attempting to free the same slice twice results in an error rather than panicking
+    // or corrupting the allocator state. We test this by allocating three adjacent slices, freeing the
+    // middle one, then reconstructing a handle to the same region and freeing it again.
+    //
+    // This is not strictly required by the API, since the slice-origin requirement already makes it UB
+    // to construct a handle to the same region. However, it is beneficial for allocators provided by
+    // this crate to handle this case gracefully and return an error rather than panic or corrupt state,
+    // so we test it explicitly.
+    fn run_double_free_error<A, F>(make: F)
+    where
+        A: BStackSliceAllocator,
+        F: Fn(BStack) -> std::io::Result<A>,
+    {
+        let path = temp_path("dfree");
+        let _guard = Guard(path.clone());
+        let alloc = make(BStack::open(&path).unwrap()).unwrap();
+
+        // Allocate a non-tail block by sandwiching it between two others.
+        let before = alloc.alloc(64).unwrap();
+        let target = alloc.alloc(64).unwrap();
+        let after = alloc.alloc(64).unwrap();
+
+        let (start, len) = (target.start(), target.len());
+        alloc.dealloc(target).unwrap();
+
+        // Reconstruct a handle to the same region and free it a second time.
+        let again = unsafe { BStackSlice::from_raw_parts(&alloc, start, len) };
+        let result = alloc.dealloc(again);
+        assert!(result.is_err(), "double-free must return an error");
+
+        alloc.dealloc(before).unwrap();
+        alloc.dealloc(after).unwrap();
+    }
+
     // ── test suite macro ──────────────────────────────────────────────────────
 
     macro_rules! fuzz_suite {
@@ -248,6 +339,18 @@ mod alloc_fuzz_tests {
                 #[test]
                 fn reopen() {
                     super::run_reopen($make);
+                }
+                #[test]
+                fn zero_size_alloc() {
+                    super::run_zero_size_alloc($make);
+                }
+                #[test]
+                fn free_zero_slices() {
+                    super::run_free_zero_slices($make);
+                }
+                #[test]
+                fn double_free_error() {
+                    super::run_double_free_error($make);
                 }
             }
         };
