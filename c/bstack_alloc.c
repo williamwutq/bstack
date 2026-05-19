@@ -444,7 +444,7 @@ bstack_t *linear_bstack_allocator_into_stack(linear_bstack_allocator_t *alloc)
 #define ALFF_MIN_BLOCK_START  UINT64_C(64)  /* ARENA_START + BLOCK_HDR_SIZE */
 #define ALFF_MIN_BLOCK_END    UINT64_C(80)  /* ARENA_START + BLOCK_HDR_SIZE + MIN_PAYLOAD */
 
-static const uint8_t alff_magic[8]        = {'A','L','F','F',0,1,0,0};
+static const uint8_t alff_magic[8]        = {'A','L','F','F',0,1,2,0};
 static const uint8_t alff_magic_prefix[6] = {'A','L','F','F',0,1};
 
 /* ---- LE codec helpers -------------------------------------------------- */
@@ -1575,7 +1575,7 @@ bstack_t *first_fit_bstack_allocator_into_stack(first_fit_bstack_allocator_t *al
  * reliably detecting cycles created by a partial rotation crash. */
 #define ALGT_MAX_AVL_DEPTH   128u
 
-static const uint8_t algt_magic[8]        = {'A','L','G','T',0,1,0,0};
+static const uint8_t algt_magic[8]        = {'A','L','G','T',0,1,1,0};
 static const uint8_t algt_magic_prefix[6] = {'A','L','G','T',0,1};
 
 /* ---- alignment helpers ------------------------------------------------- */
