@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`BStackVec<'a, T: Copy, A: BStackSliceAllocator>`** (`alloc` + `set` features): A typed, growable vector backed by a `BStack` allocation, mirroring the core `Vec<T>` API. The 16-byte block header stores `len` and `capacity` as little-endian `u64` values; elements follow immediately. The header is re-read from disk on every call, so the metadata is recoverable after a crash by reconstructing the handle via `BStackVec::from_raw_block`. Key design points:
+  - **Growth**: when `push` would exceed capacity, the block is reallocated to `max(cap * 2, 4)` elements via the allocator's `realloc`. New element space is zero-initialised by `BStack::extend`.
+  - **Zeroing on pop**: `pop` zeros the vacated slot before decrementing `len`; `truncate` zeros all removed slots in a single `BStackSlice::zero_range` call. Deallocation zeroing is delegated to the allocator.
+  - **API**: `new`, `with_capacity`, `from_slice`, `unsafe from_raw_block`, `len`, `capacity`, `is_empty`, `get`, `as_slice`, `push`, `pop`, `truncate`, `clear`, `reserve`, `resize`, `iter`, `raw_block`, `into_raw_block`.
+  - **Iterator**: `BStackVecIter<'b, 'a, T, A>` borrows the vec immutably for its lifetime (preventing concurrent mutation), snapshots `len` at construction, and yields `io::Result<T>` per element read from disk on demand.
+
 ### Fixed
 
 - **`FirstFitBStackAllocator::dealloc` — double-free** (`alloc` + `set` features): `dealloc` now returns `InvalidInput` if the block header's `is_free` flag is already set. Previously a double-free wrote a self-referential free-list entry; because `recovery_needed` was cleared normally, the corruption survived reopen and made every subsequent allocation fail.
