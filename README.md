@@ -742,7 +742,7 @@ file offset 0        offset 16       16+n0          EOF
 ```
 
 * **`magic`** — 8 bytes: `BSTK` + major(1 B) + minor(1 B) + patch(1 B) + reserved(1 B).
-  This version writes `BSTK\x00\x01\x0a\x00` (0.1.10).  `open` accepts any
+  This version writes `BSTK\x00\x01\x0b\x00` (0.1.11).  `open` accepts any
   0.1.x file (first 6 bytes `BSTK\x00\x01`) and rejects a different major or
   minor as incompatible.
 * **`clen`** — little-endian `u64` recording the last successfully committed
