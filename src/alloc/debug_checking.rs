@@ -386,46 +386,11 @@ where
     fn record_deallocation(&self, offset: u64, len: u64) {
         let region = offset..offset + len;
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-
-        // Check for overlaps with previously freed regions BEFORE calling inner dealloc
-        if let Some(overlap) = check_overlap(&region, &state.freed) {
-            panic!(
-                "DebugCheckingAllocator: Attempting to free region [{}, {}) which overlaps \
-                 with already freed region [{}, {}). This indicates a double-free bug.",
-                region.start, region.end, overlap.start, overlap.end
-            );
+        let was_in_allocated = check_deallocation(&region, &state, &HashSet::new());
+        if was_in_allocated {
+            state.allocated.remove(&region);
         }
-
-        // Validate the freed region matches exactly one allocated region
-        let overlapping_allocated: Vec<Range<u64>> = state
-            .allocated
-            .iter()
-            .filter(|r| overlaps(&region, r))
-            .cloned()
-            .collect();
-
-        match overlapping_allocated.as_slice() {
-            [] => {
-                // Region was not recorded as allocated; allowed since the debug checker
-                // only tracks allocations made through itself.
-            }
-            [exact] if *exact == region => {
-                state.allocated.remove(exact);
-            }
-            [single] => panic!(
-                "DebugCheckingAllocator: Attempting to partially free region [{}, {}) \
-                 which is a subset or overlap of allocated region [{}, {}). \
-                 Partial deallocations are not allowed.",
-                region.start, region.end, single.start, single.end,
-            ),
-            _ => panic!(
-                "DebugCheckingAllocator: Attempting to free region [{}, {}) which spans \
-                 multiple allocated regions. This is not a valid deallocation.",
-                region.start, region.end,
-            ),
-        }
-
-        record_freed_region(&mut state, region);
+        state.freed.insert(region);
     }
 }
 
@@ -524,29 +489,18 @@ where
         let slice: BStackSlice<'_, A> = handle.inner.try_into().map_err(|e| {
             io::Error::other(format!("handle is not convertible to BStackSlice: {e}"))
         })?;
-        let region = slice.start()..slice.start() + slice.len();
+        let (offset, len) = (slice.start(), slice.len());
 
-        // Validate without mutating tracking state. Untracked regions are allowed
+        // Validate before touching the inner allocator. Untracked regions are allowed
         // (may have been allocated in a prior session).
-        let was_in_allocated = {
+        {
             let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            check_deallocation(&region, &state, &HashSet::new())
-        };
+            check_deallocation(&(offset..offset + len), &state, &HashSet::new());
+        }
 
         self.inner.dealloc(handle.inner)?;
 
-        // Commit tracking state only after the inner deallocation succeeds.
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if was_in_allocated {
-            let removed = state.allocated.remove(&region);
-            debug_assert!(
-                removed,
-                "validated region [{}, {}) must still be present in allocated set",
-                region.start, region.end
-            );
-        }
-        state.freed.insert(region);
-
+        self.record_deallocation(offset, len);
         Ok(())
     }
 }
@@ -595,7 +549,6 @@ where
         // `pending_freed` accumulates regions already cleared in this batch so
         // intra-batch double-frees are caught before any state is touched.
         let mut slices: Vec<BStackSlice<'_, A>> = Vec::with_capacity(handles.len());
-        let mut in_allocated: Vec<bool> = Vec::with_capacity(handles.len());
         let mut pending_freed: HashSet<Range<u64>> = HashSet::with_capacity(handles.len());
         {
             let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -606,7 +559,7 @@ where
                     ))
                 })?;
                 let region = slice.start()..slice.start() + slice.len();
-                in_allocated.push(check_deallocation(&region, &state, &pending_freed));
+                check_deallocation(&region, &state, &pending_freed);
                 pending_freed.insert(region);
                 slices.push(slice);
             }
@@ -616,19 +569,9 @@ where
         let inner_handles: Vec<A::Allocated<'a>> = handles.iter().map(|h| h.inner).collect();
         self.inner.dealloc_bulk(inner_handles)?;
 
-        // Pass 2: commit tracking state only after the inner dealloc succeeds.
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        for (slice, was_in_alloc) in slices.iter().zip(in_allocated.iter()) {
-            let region = slice.start()..slice.start() + slice.len();
-            if *was_in_alloc {
-                let removed = state.allocated.remove(&region);
-                debug_assert!(
-                    removed,
-                    "validated region [{}, {}) must still be present in allocated set",
-                    region.start, region.end
-                );
-            }
-            state.freed.insert(region);
+        // Pass 2: commit each region via record_deallocation.
+        for slice in &slices {
+            self.record_deallocation(slice.start(), slice.len());
         }
 
         Ok(())
@@ -1251,7 +1194,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dealloc_untracked_region_is_allowed() -> io::Result<()> {
+    fn test_dealloc_untracked_region_via_public_api_is_allowed() -> io::Result<()> {
         let (stack, path) = create_test_stack()?;
         let _guard = TestGuard(path);
         let config = Rc::new(RefCell::new(MockAllocatorConfig::default()));
