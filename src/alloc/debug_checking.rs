@@ -651,6 +651,17 @@ mod tests {
     }
 
     #[test]
+    fn test_untracked_disjoint_alloc_is_allowed() {
+        let c = DebugCheckingAllocator::with_state(MockAllocator, [0..100], [200..300]);
+        c.record_allocation(120, 50);
+
+        let state = c.state.lock().unwrap();
+        assert!(state.allocated.contains(&(0..100)));
+        assert!(state.allocated.contains(&(120..170)));
+        assert!(state.freed.contains(&(200..300)));
+    }
+
+    #[test]
     fn test_dealloc_untracked_region_is_allowed() {
         // A region allocated in a previous session is unknown to this checker;
         // freeing it should succeed without panic.
@@ -665,6 +676,14 @@ mod tests {
         c.record_allocation(0, 100);
         c.record_deallocation(0, 100);
         c.record_deallocation(0, 100); // second free of same region
+    }
+
+    #[test]
+    #[should_panic(expected = "double-free")]
+    fn test_partial_overlap_with_freed_region_panics() {
+        let c = checker();
+        c.record_deallocation(0, 100);
+        c.record_deallocation(50, 25);
     }
 
     #[test]
