@@ -443,6 +443,7 @@ where
 {
 }
 
+pub mod debug_checking;
 #[cfg(feature = "set")]
 pub mod first_fit;
 #[cfg(feature = "set")]
@@ -454,6 +455,7 @@ pub mod manual;
 #[cfg(feature = "set")]
 pub mod vec;
 
+pub use debug_checking::{DebugCheckingAllocator, DebugHandle};
 #[cfg(feature = "set")]
 pub use first_fit::FirstFitBStackAllocator;
 #[cfg(feature = "set")]

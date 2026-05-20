@@ -140,6 +140,166 @@ int bstack_slice_zero_range(bstack_slice_t s, uint64_t start, uint64_t n);
 #endif /* BSTACK_FEATURE_SET */
 
 /* =========================================================================
+ * bstack_guard_vtbl_t / bstack_guarded_slice_t
+ *
+ * Transparent wrapper around bstack_slice_t that intercepts reads, writes,
+ * and subview operations via a vtable of optional hook and override functions.
+ * Any member of the vtable may be NULL to leave that behaviour unmodified.
+ *
+ * Hook invocation order for read:
+ *   pre_read  → (read override or bstack_slice_read)  → post_read
+ * Hook invocation order for write:
+ *   pre_write → (write override or bstack_slice_write) → post_write
+ * Subview:
+ *   subview override or bstack_slice_subslice (inherits vtbl/ctx)
+ *
+ * Any hook that returns -1 aborts the operation; errno should be set by the
+ * hook before returning.
+ * ====================================================================== */
+
+typedef struct {
+    /* --- lifecycle hooks ------------------------------------------------ */
+    /* Called before the read; may abort by returning -1. */
+    int (*pre_read) (void *ctx, bstack_slice_t s);
+    /*
+     * Called after a successful read.  buf points to the bytes just read;
+     * len is the byte count.  May abort by returning -1.
+     */
+    int (*post_read)(void *ctx, bstack_slice_t s, uint8_t *buf, size_t len);
+    /*
+     * Called before the write.  *buf and *len are initialised to the caller's
+     * buffer and byte count; the hook may redirect *buf (e.g. to an encrypted
+     * scratch buffer) and/or shrink *len.  For zero operations *buf is NULL on
+     * entry; leaving it NULL preserves zero semantics.  May abort by returning
+     * -1.  After the call the implementation clips *len to the available slice
+     * capacity.
+     */
+    int (*pre_write)(void *ctx, bstack_slice_t s,
+                     const uint8_t **buf, size_t *len);
+    /* Called after a successful write; may abort by returning -1. */
+    int (*post_write)(void *ctx, bstack_slice_t s);
+
+    /* --- IO overrides (NULL = use bstack_slice_* default) --------------- */
+    /*
+     * Replace the underlying read.  offset is slice-relative (0 = first byte
+     * of slice).  Invoked between pre_read and post_read when non-NULL.
+     */
+    int (*read)   (void *ctx, bstack_slice_t s, uint64_t offset,
+                   uint8_t *buf, size_t len);
+    /*
+     * Replace the underlying write.  offset is slice-relative.  buf == NULL
+     * signals a zero-write (write len zeroed bytes starting at offset).
+     * Invoked between pre_write and post_write when non-NULL.
+     */
+    int (*write)  (void *ctx, bstack_slice_t s, uint64_t offset,
+                   const uint8_t *buf, size_t len);
+    /*
+     * Replace bstack_slice_subslice.  The resulting slice is wrapped with the
+     * same vtbl/ctx as the parent guarded slice.
+     */
+    int (*subview)(void *ctx, bstack_slice_t s, uint64_t start, uint64_t end,
+                   bstack_slice_t *out);
+} bstack_guard_vtbl_t;
+
+typedef struct {
+    bstack_slice_t             slice;
+    const bstack_guard_vtbl_t *vtbl;  /* NULL = unguarded pass-through */
+    void                      *ctx;
+} bstack_guarded_slice_t;
+
+/*
+ * Accessor macros — delegate to the underlying slice.
+ */
+#define bstack_guarded_slice_start(g)    bstack_slice_start((g).slice)
+#define bstack_guarded_slice_end(g)      bstack_slice_end((g).slice)
+#define bstack_guarded_slice_len(g)      bstack_slice_len((g).slice)
+#define bstack_guarded_slice_is_empty(g) bstack_slice_is_empty((g).slice)
+
+/* Construct a guarded slice.  vtbl may be NULL (no-op pass-through). */
+static inline bstack_guarded_slice_t
+bstack_guarded_slice(bstack_slice_t slice,
+                     const bstack_guard_vtbl_t *vtbl, void *ctx)
+{
+    bstack_guarded_slice_t gs;
+    gs.slice = slice;
+    gs.vtbl  = vtbl;
+    gs.ctx   = ctx;
+    return gs;
+}
+
+/*
+ * Read the entire slice into buf via the guard.
+ * buf must have room for at least gs.slice.len bytes.
+ * Returns 0 on success, -1 on failure (errno set).
+ */
+int bstack_guarded_slice_read(bstack_guarded_slice_t gs, uint8_t *buf);
+
+/*
+ * Read min(buf_len, gs.slice.len) bytes from the start of the slice.
+ * Returns 0 on success, -1 on failure (errno set).
+ */
+int bstack_guarded_slice_read_into(bstack_guarded_slice_t gs,
+                                    uint8_t *buf, size_t buf_len);
+
+/*
+ * Read buf_len bytes starting at slice-relative offset start into buf.
+ * Returns -1 with errno = EINVAL if start + buf_len exceeds gs.slice.len.
+ */
+int bstack_guarded_slice_read_range_into(bstack_guarded_slice_t gs,
+                                          uint64_t start,
+                                          uint8_t *buf, size_t buf_len);
+
+/*
+ * Read the half-open slice-relative byte range [start, end) into buf.
+ * buf must have room for (end - start) bytes.
+ * Returns -1 with errno = EINVAL if start > end or end > gs.slice.len.
+ */
+int bstack_guarded_slice_read_range(bstack_guarded_slice_t gs,
+                                     uint64_t start, uint64_t end,
+                                     uint8_t *buf);
+
+/*
+ * Produce the sub-range [start, end) as a new guarded slice inheriting the
+ * same vtbl/ctx.  start and end are 0-based within the slice.
+ * Returns -1 with errno = EINVAL if start > end or end > gs.slice.len.
+ */
+int bstack_guarded_slice_subslice(bstack_guarded_slice_t gs,
+                                   uint64_t start, uint64_t end,
+                                   bstack_guarded_slice_t *out);
+
+#ifdef BSTACK_FEATURE_SET
+/*
+ * Write min(data_len, gs.slice.len) bytes into the slice via the guard.
+ * Requires -DBSTACK_FEATURE_SET.
+ */
+int bstack_guarded_slice_write(bstack_guarded_slice_t gs,
+                                const uint8_t *data, size_t data_len);
+
+/*
+ * Write data_len bytes at slice-relative offset start via the guard.
+ * Returns -1 with errno = EINVAL if start + data_len exceeds gs.slice.len.
+ * Requires -DBSTACK_FEATURE_SET.
+ */
+int bstack_guarded_slice_write_range(bstack_guarded_slice_t gs,
+                                      uint64_t start,
+                                      const uint8_t *data, size_t data_len);
+
+/*
+ * Zero the entire slice via the guard.
+ * Requires -DBSTACK_FEATURE_SET.
+ */
+int bstack_guarded_slice_zero(bstack_guarded_slice_t gs);
+
+/*
+ * Zero [start, start+n) within the slice via the guard.
+ * Returns -1 with errno = EINVAL if start + n exceeds gs.slice.len.
+ * Requires -DBSTACK_FEATURE_SET.
+ */
+int bstack_guarded_slice_zero_range(bstack_guarded_slice_t gs,
+                                     uint64_t start, uint64_t n);
+#endif /* BSTACK_FEATURE_SET */
+
+/* =========================================================================
  * bstack_slice_reader_t
  *
  * Cursor-based reader over a bstack_slice_t.

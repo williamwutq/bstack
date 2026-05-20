@@ -184,6 +184,268 @@ int bstack_slice_zero_range(bstack_slice_t s, uint64_t start, uint64_t n)
 #endif /* BSTACK_FEATURE_SET */
 
 /* =========================================================================
+ * bstack_guarded_slice_t — I/O
+ * ====================================================================== */
+
+int bstack_guarded_slice_read(bstack_guarded_slice_t gs, uint8_t *buf)
+{
+    const bstack_guard_vtbl_t *v = gs.vtbl;
+    if (v && v->pre_read && v->pre_read(gs.ctx, gs.slice) != 0)
+        return -1;
+    if (v && v->read) {
+        if (v->read(gs.ctx, gs.slice, 0, buf, (size_t)gs.slice.len) != 0)
+            return -1;
+    } else {
+        if (bstack_slice_read(gs.slice, buf) != 0)
+            return -1;
+    }
+    if (v && v->post_read
+            && v->post_read(gs.ctx, gs.slice, buf, (size_t)gs.slice.len) != 0)
+        return -1;
+    return 0;
+}
+
+int bstack_guarded_slice_read_into(bstack_guarded_slice_t gs,
+                                    uint8_t *buf, size_t buf_len)
+{
+    const bstack_guard_vtbl_t *v = gs.vtbl;
+    size_t n;
+    if (buf_len == 0 || gs.slice.len == 0)
+        return 0;
+    n = ((uint64_t)buf_len < gs.slice.len) ? buf_len : (size_t)gs.slice.len;
+    if (v && v->pre_read && v->pre_read(gs.ctx, gs.slice) != 0)
+        return -1;
+    if (v && v->read) {
+        if (v->read(gs.ctx, gs.slice, 0, buf, n) != 0)
+            return -1;
+    } else {
+        if (bstack_slice_read_into(gs.slice, buf, buf_len) != 0)
+            return -1;
+    }
+    if (v && v->post_read && v->post_read(gs.ctx, gs.slice, buf, n) != 0)
+        return -1;
+    return 0;
+}
+
+int bstack_guarded_slice_read_range_into(bstack_guarded_slice_t gs,
+                                          uint64_t start,
+                                          uint8_t *buf, size_t buf_len)
+{
+    const bstack_guard_vtbl_t *v = gs.vtbl;
+    if (buf_len == 0)
+        return 0;
+    if (start > gs.slice.len || (uint64_t)buf_len > gs.slice.len - start) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (v && v->pre_read && v->pre_read(gs.ctx, gs.slice) != 0)
+        return -1;
+    if (v && v->read) {
+        if (v->read(gs.ctx, gs.slice, start, buf, buf_len) != 0)
+            return -1;
+    } else {
+        if (bstack_slice_read_range_into(gs.slice, start, buf, buf_len) != 0)
+            return -1;
+    }
+    if (v && v->post_read && v->post_read(gs.ctx, gs.slice, buf, buf_len) != 0)
+        return -1;
+    return 0;
+}
+
+int bstack_guarded_slice_read_range(bstack_guarded_slice_t gs,
+                                     uint64_t start, uint64_t end,
+                                     uint8_t *buf)
+{
+    const bstack_guard_vtbl_t *v = gs.vtbl;
+    size_t len;
+    if (start > end || end > gs.slice.len) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (start == end)
+        return 0;
+    len = (size_t)(end - start);
+    if (v && v->pre_read && v->pre_read(gs.ctx, gs.slice) != 0)
+        return -1;
+    if (v && v->read) {
+        if (v->read(gs.ctx, gs.slice, start, buf, len) != 0)
+            return -1;
+    } else {
+        if (bstack_slice_read_range(gs.slice, start, end, buf) != 0)
+            return -1;
+    }
+    if (v && v->post_read && v->post_read(gs.ctx, gs.slice, buf, len) != 0)
+        return -1;
+    return 0;
+}
+
+int bstack_guarded_slice_subslice(bstack_guarded_slice_t gs,
+                                   uint64_t start, uint64_t end,
+                                   bstack_guarded_slice_t *out)
+{
+    const bstack_guard_vtbl_t *v = gs.vtbl;
+    int r;
+    if (v && v->subview)
+        r = v->subview(gs.ctx, gs.slice, start, end, &out->slice);
+    else
+        r = bstack_slice_subslice(gs.slice, start, end, &out->slice);
+    if (r != 0)
+        return -1;
+    out->vtbl = gs.vtbl;
+    out->ctx  = gs.ctx;
+    return 0;
+}
+
+#ifdef BSTACK_FEATURE_SET
+
+/* Clip n to cap after a pre_write hook may have changed it. */
+static size_t guard_clip(size_t n, uint64_t cap)
+{
+    if (cap > (uint64_t)SIZE_MAX)
+        cap = (uint64_t)SIZE_MAX;
+    return (n > (size_t)cap) ? (size_t)cap : n;
+}
+
+int bstack_guarded_slice_write(bstack_guarded_slice_t gs,
+                                const uint8_t *data, size_t data_len)
+{
+    const bstack_guard_vtbl_t *v = gs.vtbl;
+    const uint8_t *buf = data;
+    size_t n;
+    if (data_len == 0 || gs.slice.len == 0)
+        return 0;
+    n = ((uint64_t)data_len < gs.slice.len) ? data_len : (size_t)gs.slice.len;
+    if (v && v->pre_write) {
+        if (v->pre_write(gs.ctx, gs.slice, &buf, &n) != 0)
+            return -1;
+        n = guard_clip(n, gs.slice.len);
+    }
+    if (n == 0)
+        return 0;
+    if (v && v->write) {
+        if (v->write(gs.ctx, gs.slice, 0, buf, n) != 0)
+            return -1;
+    } else {
+        if (bstack_set(slice_stack(gs.slice), gs.slice.offset, buf, n) != 0)
+            return -1;
+    }
+    if (v && v->post_write && v->post_write(gs.ctx, gs.slice) != 0)
+        return -1;
+    return 0;
+}
+
+int bstack_guarded_slice_write_range(bstack_guarded_slice_t gs,
+                                      uint64_t start,
+                                      const uint8_t *data, size_t data_len)
+{
+    const bstack_guard_vtbl_t *v = gs.vtbl;
+    const uint8_t *buf = data;
+    size_t n = data_len;
+    if (data_len == 0)
+        return 0;
+    if (start > gs.slice.len || (uint64_t)data_len > gs.slice.len - start) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (v && v->pre_write) {
+        if (v->pre_write(gs.ctx, gs.slice, &buf, &n) != 0)
+            return -1;
+        n = guard_clip(n, gs.slice.len - start);
+    }
+    if (n == 0)
+        return 0;
+    if (v && v->write) {
+        if (v->write(gs.ctx, gs.slice, start, buf, n) != 0)
+            return -1;
+    } else {
+        if (bstack_set(slice_stack(gs.slice), gs.slice.offset + start, buf, n) != 0)
+            return -1;
+    }
+    if (v && v->post_write && v->post_write(gs.ctx, gs.slice) != 0)
+        return -1;
+    return 0;
+}
+
+int bstack_guarded_slice_zero(bstack_guarded_slice_t gs)
+{
+    const bstack_guard_vtbl_t *v = gs.vtbl;
+    const uint8_t *buf = NULL;
+    size_t n;
+    if (gs.slice.len == 0)
+        return 0;
+#if UINT64_MAX > SIZE_MAX
+    if (gs.slice.len > (uint64_t)SIZE_MAX) {
+        errno = EINVAL;
+        return -1;
+    }
+#endif
+    n = (size_t)gs.slice.len;
+    if (v && v->pre_write) {
+        if (v->pre_write(gs.ctx, gs.slice, &buf, &n) != 0)
+            return -1;
+        n = guard_clip(n, gs.slice.len);
+    }
+    if (n == 0)
+        return 0;
+    if (v && v->write) {
+        if (v->write(gs.ctx, gs.slice, 0, buf, n) != 0)
+            return -1;
+    } else if (buf != NULL) {
+        if (bstack_set(slice_stack(gs.slice), gs.slice.offset, buf, n) != 0)
+            return -1;
+    } else {
+        if (bstack_zero(slice_stack(gs.slice), gs.slice.offset, n) != 0)
+            return -1;
+    }
+    if (v && v->post_write && v->post_write(gs.ctx, gs.slice) != 0)
+        return -1;
+    return 0;
+}
+
+int bstack_guarded_slice_zero_range(bstack_guarded_slice_t gs,
+                                     uint64_t start, uint64_t n_bytes)
+{
+    const bstack_guard_vtbl_t *v = gs.vtbl;
+    const uint8_t *buf = NULL;
+    size_t n;
+    if (n_bytes == 0)
+        return 0;
+    if (start > gs.slice.len || n_bytes > gs.slice.len - start) {
+        errno = EINVAL;
+        return -1;
+    }
+#if UINT64_MAX > SIZE_MAX
+    if (n_bytes > (uint64_t)SIZE_MAX) {
+        errno = EINVAL;
+        return -1;
+    }
+#endif
+    n = (size_t)n_bytes;
+    if (v && v->pre_write) {
+        if (v->pre_write(gs.ctx, gs.slice, &buf, &n) != 0)
+            return -1;
+        n = guard_clip(n, gs.slice.len - start);
+    }
+    if (n == 0)
+        return 0;
+    if (v && v->write) {
+        if (v->write(gs.ctx, gs.slice, start, buf, n) != 0)
+            return -1;
+    } else if (buf != NULL) {
+        if (bstack_set(slice_stack(gs.slice), gs.slice.offset + start, buf, n) != 0)
+            return -1;
+    } else {
+        if (bstack_zero(slice_stack(gs.slice), gs.slice.offset + start, n) != 0)
+            return -1;
+    }
+    if (v && v->post_write && v->post_write(gs.ctx, gs.slice) != 0)
+        return -1;
+    return 0;
+}
+
+#endif /* BSTACK_FEATURE_SET */
+
+/* =========================================================================
  * bstack_slice_reader_t
  * ====================================================================== */
 
