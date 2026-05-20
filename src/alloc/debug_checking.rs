@@ -136,6 +136,9 @@ fn record_allocated_region(
     operation: &str,
     allocator_context: &str,
 ) {
+    if region.is_empty() {
+        return;
+    }
     if let Some(overlap) = check_overlap(&region, &state.allocated) {
         panic!(
             "DebugCheckingAllocator: {operation} [{}, {}) overlaps with \
@@ -169,6 +172,9 @@ fn record_allocated_region(
 
 /// Record a freed region in `state`.
 fn record_freed_region(state: &mut DebugState, region: Range<u64>) {
+    if region.is_empty() {
+        return;
+    }
     if let Some(overlap) = check_overlap(&region, &state.freed) {
         panic!(
             "DebugCheckingAllocator: Attempting to free region [{}, {}) which overlaps \
@@ -384,6 +390,9 @@ where
     /// allocations made through itself). Panics if the freed region partially overlaps or
     /// spans multiple recorded allocations, as those indicate real bugs.
     fn record_deallocation(&self, offset: u64, len: u64) {
+        if len == 0 {
+            return;
+        }
         let region = offset..offset + len;
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let was_in_allocated = check_deallocation(&region, &state, &HashSet::new());
