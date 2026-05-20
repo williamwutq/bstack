@@ -417,7 +417,7 @@ bstack = { version = "0.2", features = ["set"] }
 
 ### `alloc`
 
-Enables the region-management layer on top of `BStack`: `BStackAllocator`, `BStackBulkAllocator`, `BStackSlice`, `BStackSliceReader`, `LinearBStackAllocator`, `FirstFitBStackAllocator`, `GhostTreeBstackAllocator`, `ManualAllocator`, and the `BStackSliceAllocator` supertrait.
+Enables the region-management layer on top of `BStack`: `BStackAllocator`, `BStackBulkAllocator`, `BStackSlice`, `BStackSliceReader`, `LinearBStackAllocator`, `FirstFitBStackAllocator`, `GhostTreeBstackAllocator`, `ManualAllocator`, and the `BStackSliceAllocator` supertrait.  Combined with `set`, also enables `BStackSliceWriter`, `BStackVec`, and `BStackVecIter`.
 
 ```toml
 [dependencies]
@@ -610,6 +610,59 @@ assert_eq!(c.start(), a.start());
 
 let stack = alloc.into_stack();
 ```
+
+### `BStackVec<'a, T, A>` (`alloc + set` features)
+
+A typed, growable vector backed by a `BStack` allocation, mirroring the core `Vec<T>` API.
+
+```toml
+[dependencies]
+bstack = { version = "0.2", features = ["alloc", "set"] }
+```
+
+#### Memory layout
+
+```
+┌──────────────────────┬──────────────────────┬────────────────────────┐
+│   len  (8 B, LE u64) │   cap  (8 B, LE u64) │   elements: [T; cap]  │
+└──────────────────────┴──────────────────────┴────────────────────────┘
+  byte 0                 byte 8                  byte 16
+```
+
+The header is re-read from disk on every call, so the `(len, cap)` metadata is
+recoverable after a crash by reconstructing the handle from the raw block via
+`BStackVec::from_raw_block`.
+
+#### Key behaviour
+
+- **Growth**: `push` reallocates to `max(cap × 2, 4)` elements when `len == cap`. New element space is zero-initialised by `BStack::extend`.
+- **Zeroing on pop**: `pop` zeros the vacated slot before decrementing `len`. `truncate` zeros all removed slots in a single `BStackSlice::zero_range` call. Deallocation zeroing is delegated to the allocator.
+- **Iterator**: `BStackVecIter` borrows the vec immutably for its lifetime (preventing concurrent mutation) and yields `io::Result<T>` per element, reading from disk on demand.
+
+#### Example
+
+```rust
+use bstack::{BStack, BStackVec, LinearBStackAllocator};
+
+let alloc = LinearBStackAllocator::new(BStack::open("vec.bstack")?);
+
+let mut v: BStackVec<u64, _> = BStackVec::new(&alloc)?;
+v.push(1)?;
+v.push(2)?;
+v.push(3)?;
+
+assert_eq!(v.len()?, 3);
+assert_eq!(v.get(1)?, Some(2));
+assert_eq!(v.pop()?, Some(3));
+
+for item in v.iter()? {
+    println!("{}", item?);
+}
+
+alloc.dealloc(v.into_raw_block())?;
+```
+
+---
 
 ### Lifetime model
 

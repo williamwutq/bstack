@@ -180,7 +180,7 @@ The subview analogue (`BStackGuardedSliceSubview`) would be expressed as a flag 
 
 ## Adding `BStackVec<T>` for typed vector storage
 
-**Feature flag:** `set`
+**Feature flag:** `set` and `alloc`
 **Breaking change:** No (additive; new type only)
 
 ### Motivation
@@ -213,7 +213,7 @@ impl<'a, T: Copy, A: BStackAllocator> BStackVec<'a, T, A> {
     // Accessors
     pub fn len(&self) -> Result<u64, A::Error>;
     pub fn capacity(&self) -> Result<u64, A::Error>;
-    pub fn is_empty(&self) -> Result<u64, A::Error>;
+    pub fn is_empty(&self) -> Result<bool, A::Error>;
     
     // Element access
     pub fn get(&self, index: u64) -> Result<Option<T>, A::Error>;
@@ -229,7 +229,6 @@ impl<'a, T: Copy, A: BStackAllocator> BStackVec<'a, T, A> {
     
     // Iteration
     pub fn iter(&self) -> Result<BStackVecIter<'a, T, A>, A::Error>;
-    pub fn iter_mut(&mut self) -> Result<BStackVecIterMut<'a, T, A>, A::Error>;
 }
 ```
 

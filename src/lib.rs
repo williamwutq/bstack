@@ -299,7 +299,7 @@
 //! | Feature | Description |
 //! |---------|-------------|
 //! | `set`   | Enables [`BStack::set`] and [`BStack::zero`] — in-place overwrite of existing payload bytes (or with zeros) without changing the file size. |
-//! | `alloc` | Enables [`BStackAllocator`], [`BStackBulkAllocator`], [`BStackSlice`], [`BStackSliceReader`], and [`LinearBStackAllocator`] — region-based allocation over a `BStack` payload. |
+//! | `alloc` | Enables [`BStackAllocator`], [`BStackBulkAllocator`], [`BStackSlice`], [`BStackSliceReader`], and [`LinearBStackAllocator`] — region-based allocation over a `BStack` payload. Combined with `set`, also enables [`BStackSliceWriter`], [`FirstFitBStackAllocator`], [`GhostTreeBstackAllocator`], and [`BStackVec`]. |
 //! | `atomic` | Enables [`BStack::atrunc`], [`BStack::splice`], [`BStack::splice_into`], [`BStack::try_extend`], [`BStack::try_discard`], and [`BStack::replace`] — compound read-modify-write operations that hold the write lock across what would otherwise be separate calls. Combined with `set`, also enables [`BStack::swap`], [`BStack::swap_into`], [`BStack::cas`], and [`BStack::process`]. |
 //!
 //! Enable with:
@@ -353,6 +353,15 @@
 //!   and the tree is keyed on `(size, address)` for best-fit allocation.
 //!   Provides O(log n) allocation and deallocation with crash recovery through
 //!   tree rebalancing on mount.
+//!
+//! * [`BStackVec`]`<'a, T: Copy, A>` — a typed, growable vector backed by a
+//!   [`BStack`] allocation (requires `alloc` + `set`).  Mirrors the core
+//!   [`Vec<T>`] API: `new`, `with_capacity`, `from_slice`, `push`, `pop`,
+//!   `get`, `as_slice`, `truncate`, `clear`, `reserve`, `resize`, and `iter`.
+//!   The block stores a 16-byte header (`len`, `cap`) followed by the element
+//!   data; the header is re-read on every call for crash recoverability.  `push`
+//!   doubles capacity (minimum 4); `pop` zeros the vacated slot; `truncate`
+//!   zeros all removed slots in a single call.
 //!
 //! ## Lifetime model
 //!
