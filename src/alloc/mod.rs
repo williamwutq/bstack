@@ -85,12 +85,6 @@
 //! bstack = { version = "0.1", features = ["alloc", "set"] }
 //! ```
 //!
-//! [`FirstFitBStackAllocator`] requires **both** `alloc` and `set`:
-//!
-//! ```toml
-//! bstack = { version = "0.1", features = ["alloc", "set"] }
-//! ```
-//!
 //! # Realloc and dealloc: slice origin requirement
 //!
 //! [`BStackAllocator::realloc`] and [`BStackAllocator::dealloc`] are only

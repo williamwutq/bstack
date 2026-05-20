@@ -51,6 +51,40 @@ const HEADER_LEN: u64 = 16;
 /// [`BStackSlice::zero_range`] call.  Deallocation zeroing is delegated to the
 /// allocator.
 ///
+/// ## Thread safety
+///
+/// `BStackVec` is `Send` when `T: Send` and `A: Sync`, and `Sync` when
+/// `T: Sync` and `A: Sync` (both conditions hold for all allocators in this
+/// library).  The underlying [`crate::BStack`] serialises concurrent writers
+/// through an internal `RwLock`, so multiple threads may call `&self` methods
+/// concurrently.  Methods that take `&mut self` (`push`, `pop`, `truncate`,
+/// `clear`, `reserve`, `resize`) require exclusive access and may not be called
+/// from multiple threads simultaneously.
+///
+/// ## Crash consistency and atomicity
+///
+/// Every individual [`crate::BStack`] call (`set`, `zero`, `extend`, `discard`)
+/// is durably synced before returning and is crash-safe in isolation.  However,
+/// all multi-step `BStackVec` methods issue **two or more** such calls in
+/// sequence and are **not atomic** with respect to process crashes.
+///
+/// The crash-recovery state for each mutating method is:
+///
+/// | Method | Step order | Crash-recovery state |
+/// |--------|-----------|----------------------|
+/// | `push` (no realloc) | write element → increment `len` | Crash after element write: element on disk but `len` not updated; slot is effectively invisible. Re-running `push` with the same value recovers correctly. |
+/// | `push` (with realloc) | `realloc` → write `cap` → write element → increment `len` | Crash at any point: header re-read on next open reflects the committed state; worst case is a leaked block (with `LinearBStackAllocator`) or a stale cap value. |
+/// | `pop` | read element → zero slot → decrement `len` | Crash after zero but before `len` decrement: element is zeroed on disk but `len` still counts it; `get(len-1)` returns a zero-bit `T`. Decrementing `len` on the next `pop` call removes it cleanly. |
+/// | `truncate` | zero removed slots → write `len` | Crash after zeroing but before `len` write: logically removed elements are on disk as zeros; `len` still points past them. Calling `truncate` again to the same target is idempotent. |
+/// | `resize` (grow) | `reserve` → write elements → write `len` | Same as `push` repeated; elements between the old and new `len` may be partially written. |
+/// | `clear` | (delegates to `truncate(0)`) | See `truncate`. |
+/// | `reserve` | `realloc` → write `cap` | Crash between the two: cap field may reflect the old value; the block is larger than cap indicates. Harmless — the next `push` re-checks and may realloc again unnecessarily. |
+///
+/// In all cases the header is re-read from disk on the next call, so the
+/// on-disk `(len, cap)` always reflects the last fully committed step.  The
+/// [`from_raw_block`](BStackVec::from_raw_block) constructor can be used to
+/// reconstruct the handle after a reopen without any additional recovery logic.
+///
 /// ## Feature flags
 ///
 /// Requires both the `alloc` and `set` Cargo features.
@@ -91,6 +125,8 @@ impl<'a, T: Copy, A: BStackSliceAllocator> BStackVec<'a, T, A> {
     /// Re-read `(len, capacity)` from the block header on disk.
     fn read_header(&self) -> io::Result<(u64, u64)> {
         let hdr = self.slice.read_range(0, 16)?;
+        // `read_range(0, 16)` returns exactly 16 bytes on success; the slices
+        // are 8 bytes each so try_into() is always Ok — these cannot panic.
         let len = u64::from_le_bytes(hdr[0..8].try_into().unwrap());
         let cap = u64::from_le_bytes(hdr[8..16].try_into().unwrap());
         Ok((len, cap))
@@ -402,7 +438,10 @@ impl<'b, 'a: 'b, T: Copy, A: BStackSliceAllocator> Iterator for BStackVecIter<'b
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let remaining = (self.len - self.index) as usize;
+        // `self.index <= self.len` is invariant; subtraction cannot underflow.
+        // On 32-bit platforms the cast saturates to usize::MAX, which is a
+        // valid (conservative) hint per the Iterator contract.
+        let remaining = (self.len - self.index).min(usize::MAX as u64) as usize;
         (remaining, Some(remaining))
     }
 }
