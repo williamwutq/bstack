@@ -11,10 +11,10 @@ use std::mem::size_of;
 /// Byte offset of the first element within the block (past the 16-byte header).
 const HEADER_LEN: u64 = 16;
 
-/// A typed, growable vector backed by a [`BStack`] allocation.
+/// A typed, growable vector backed by a [`crate::BStack`] allocation.
 ///
 /// `BStackVec<'a, T, A>` mirrors the core API of [`Vec<T>`] but stores its
-/// elements inside a [`BStack`] allocation managed by allocator `A`.  Every
+/// elements inside a [`crate::BStack`] allocation managed by allocator `A`.  Every
 /// mutation issues a durable sync through the allocator so the contents survive
 /// a process crash.
 ///
@@ -34,7 +34,7 @@ const HEADER_LEN: u64 = 16;
 /// ## Element type
 ///
 /// `T` must be `Copy`.  Elements are written as raw bytes and read back with
-/// [`ptr::read_unaligned`].  All slots `0..len` always hold byte patterns that
+/// [`std::ptr::read_unaligned`].  All slots `0..len` always hold byte patterns that
 /// were explicitly written by a `BStackVec` method, so reads are never issued
 /// against uninitialised memory.
 ///
@@ -42,7 +42,7 @@ const HEADER_LEN: u64 = 16;
 ///
 /// When [`push`](BStackVec::push) would exceed the current capacity, the block
 /// is reallocated to `max(cap * 2, 4)` elements.  New element space is
-/// zero-initialised by [`BStack::extend`].
+/// zero-initialised by [`crate::BStack::extend`].
 ///
 /// ## Zeroing
 ///
@@ -97,18 +97,18 @@ impl<'a, T: Copy, A: BStackSliceAllocator> BStackVec<'a, T, A> {
     }
 
     fn write_len_field(&self, len: u64) -> io::Result<()> {
-        self.slice.write_range(0, &len.to_le_bytes())
+        self.slice.write_range(0, len.to_le_bytes())
     }
 
     fn write_cap_field(&self, cap: u64) -> io::Result<()> {
-        self.slice.write_range(8, &cap.to_le_bytes())
+        self.slice.write_range(8, cap.to_le_bytes())
     }
 
     fn write_header(&self, len: u64, cap: u64) -> io::Result<()> {
         let mut hdr = [0u8; 16];
         hdr[0..8].copy_from_slice(&len.to_le_bytes());
         hdr[8..16].copy_from_slice(&cap.to_le_bytes());
-        self.slice.write_range(0, &hdr)
+        self.slice.write_range(0, hdr)
     }
 
     fn read_elem_at(&self, index: u64) -> io::Result<T> {
@@ -124,13 +124,13 @@ impl<'a, T: Copy, A: BStackSliceAllocator> BStackVec<'a, T, A> {
         let size = size_of::<T>();
         let start = Self::elem_offset(index);
         // SAFETY: `value` is a valid, initialized `T`; we borrow its bytes.
-        let bytes =
-            unsafe { std::slice::from_raw_parts(&value as *const T as *const u8, size) };
+        let bytes = unsafe { std::slice::from_raw_parts(&value as *const T as *const u8, size) };
         self.slice.write_range(start, bytes)
     }
 
     fn zero_elem_at(&self, index: u64) -> io::Result<()> {
-        self.slice.zero_range(Self::elem_offset(index), Self::elem_size())
+        self.slice
+            .zero_range(Self::elem_offset(index), Self::elem_size())
     }
 
     /// Reallocate the block to hold `new_cap` elements, updating `self.slice`.
@@ -353,7 +353,7 @@ impl<'a, T: Copy, A: BStackSliceAllocator> BStackVec<'a, T, A> {
     /// Return the underlying block slice (header + all allocated element space).
     ///
     /// This is the original allocation handle and may be passed to
-    /// [`BStackAllocator::realloc`] or [`BStackAllocator::dealloc`].
+    /// [`crate::BStackAllocator::realloc`] or [`crate::BStackAllocator::dealloc`].
     pub fn raw_block(&self) -> BStackSlice<'a, A> {
         self.slice
     }

@@ -458,11 +458,11 @@ pub mod vec;
 pub use first_fit::FirstFitBStackAllocator;
 #[cfg(feature = "set")]
 pub use ghost_tree::GhostTreeBstackAllocator;
-#[cfg(feature = "set")]
-pub use vec::{BStackVec, BStackVecIter};
 #[cfg(all(feature = "guarded", feature = "atomic"))]
 pub use guarded::{BStackAtomicGuardedSlice, BStackAtomicGuardedSliceSubview};
 #[cfg(feature = "guarded")]
 pub use guarded::{BStackGuardedSlice, BStackGuardedSliceSubview};
 pub use linear::LinearBStackAllocator;
 pub use manual::ManualAllocator;
+#[cfg(feature = "set")]
+pub use vec::{BStackVec, BStackVecIter};
