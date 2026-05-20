@@ -1,0 +1,408 @@
+//! Typed, growable vector backed by a [`BStack`] allocation.
+//!
+//! Requires features `alloc` and `set`.
+
+use super::{BStackSlice, BStackSliceAllocator};
+use std::fmt;
+use std::io;
+use std::marker::PhantomData;
+use std::mem::size_of;
+
+/// Byte offset of the first element within the block (past the 16-byte header).
+const HEADER_LEN: u64 = 16;
+
+/// A typed, growable vector backed by a [`BStack`] allocation.
+///
+/// `BStackVec<'a, T, A>` mirrors the core API of [`Vec<T>`] but stores its
+/// elements inside a [`BStack`] allocation managed by allocator `A`.  Every
+/// mutation issues a durable sync through the allocator so the contents survive
+/// a process crash.
+///
+/// ## Memory layout
+///
+/// ```text
+/// ┌──────────────────────┬──────────────────────┬────────────────────────────┐
+/// │   len  (8 B, LE u64) │   cap  (8 B, LE u64) │   elements: [T; cap]      │
+/// └──────────────────────┴──────────────────────┴────────────────────────────┘
+///   byte 0                 byte 8                  byte 16
+/// ```
+///
+/// Both `len` and `cap` are re-read from the block header on every call, so the
+/// metadata is recoverable after a crash even if the `BStackVec` handle is
+/// reconstructed from the raw block via [`BStackVec::from_raw_block`].
+///
+/// ## Element type
+///
+/// `T` must be `Copy`.  Elements are written as raw bytes and read back with
+/// [`ptr::read_unaligned`].  All slots `0..len` always hold byte patterns that
+/// were explicitly written by a `BStackVec` method, so reads are never issued
+/// against uninitialised memory.
+///
+/// ## Growth strategy
+///
+/// When [`push`](BStackVec::push) would exceed the current capacity, the block
+/// is reallocated to `max(cap * 2, 4)` elements.  New element space is
+/// zero-initialised by [`BStack::extend`].
+///
+/// ## Zeroing
+///
+/// [`pop`](BStackVec::pop) zeros the vacated element slot before decrementing
+/// `len`.  [`truncate`](BStackVec::truncate) zeros all removed slots in a single
+/// [`BStackSlice::zero_range`] call.  Deallocation zeroing is delegated to the
+/// allocator.
+///
+/// ## Feature flags
+///
+/// Requires both the `alloc` and `set` Cargo features.
+pub struct BStackVec<'a, T: Copy, A: BStackSliceAllocator> {
+    /// The full block: header (16 B) followed by element data.
+    slice: BStackSlice<'a, A>,
+    _phantom: PhantomData<T>,
+}
+
+impl<'a, T: Copy, A: BStackSliceAllocator> fmt::Debug for BStackVec<'a, T, A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.read_header() {
+            Ok((len, cap)) => f
+                .debug_struct("BStackVec")
+                .field("len", &len)
+                .field("capacity", &cap)
+                .finish_non_exhaustive(),
+            Err(e) => write!(f, "BStackVec(error reading header: {e})"),
+        }
+    }
+}
+
+// ── private helpers ──────────────────────────────────────────────────────────
+
+impl<'a, T: Copy, A: BStackSliceAllocator> BStackVec<'a, T, A> {
+    fn elem_size() -> u64 {
+        size_of::<T>() as u64
+    }
+
+    fn block_size(capacity: u64) -> u64 {
+        HEADER_LEN + capacity * Self::elem_size()
+    }
+
+    fn elem_offset(index: u64) -> u64 {
+        HEADER_LEN + index * Self::elem_size()
+    }
+
+    /// Re-read `(len, capacity)` from the block header on disk.
+    fn read_header(&self) -> io::Result<(u64, u64)> {
+        let hdr = self.slice.read_range(0, 16)?;
+        let len = u64::from_le_bytes(hdr[0..8].try_into().unwrap());
+        let cap = u64::from_le_bytes(hdr[8..16].try_into().unwrap());
+        Ok((len, cap))
+    }
+
+    fn write_len_field(&self, len: u64) -> io::Result<()> {
+        self.slice.write_range(0, &len.to_le_bytes())
+    }
+
+    fn write_cap_field(&self, cap: u64) -> io::Result<()> {
+        self.slice.write_range(8, &cap.to_le_bytes())
+    }
+
+    fn write_header(&self, len: u64, cap: u64) -> io::Result<()> {
+        let mut hdr = [0u8; 16];
+        hdr[0..8].copy_from_slice(&len.to_le_bytes());
+        hdr[8..16].copy_from_slice(&cap.to_le_bytes());
+        self.slice.write_range(0, &hdr)
+    }
+
+    fn read_elem_at(&self, index: u64) -> io::Result<T> {
+        let size = size_of::<T>();
+        let start = Self::elem_offset(index);
+        let bytes = self.slice.read_range(start, start + size as u64)?;
+        // SAFETY: `bytes` has exactly `size_of::<T>()` bytes.  Every slot
+        // `0..len` was written with a valid `T` value before this read.
+        Ok(unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const T) })
+    }
+
+    fn write_elem_at(&self, index: u64, value: T) -> io::Result<()> {
+        let size = size_of::<T>();
+        let start = Self::elem_offset(index);
+        // SAFETY: `value` is a valid, initialized `T`; we borrow its bytes.
+        let bytes =
+            unsafe { std::slice::from_raw_parts(&value as *const T as *const u8, size) };
+        self.slice.write_range(start, bytes)
+    }
+
+    fn zero_elem_at(&self, index: u64) -> io::Result<()> {
+        self.slice.zero_range(Self::elem_offset(index), Self::elem_size())
+    }
+
+    /// Reallocate the block to hold `new_cap` elements, updating `self.slice`.
+    fn grow_to(&mut self, new_cap: u64) -> io::Result<()> {
+        let new_size = Self::block_size(new_cap);
+        let new_slice = self.slice.allocator().realloc(self.slice, new_size)?;
+        self.slice = new_slice;
+        Ok(())
+    }
+}
+
+// ── public API ────────────────────────────────────────────────────────────────
+
+impl<'a, T: Copy, A: BStackSliceAllocator> BStackVec<'a, T, A> {
+    /// Create an empty `BStackVec` with zero capacity.
+    ///
+    /// Allocates a 16-byte block for the header only.  The first
+    /// [`push`](Self::push) will trigger a reallocation to 4 elements.
+    pub fn new(alloc: &'a A) -> io::Result<Self> {
+        let slice = alloc.alloc(HEADER_LEN)?;
+        // Header is zero-initialised by the allocator: len=0, cap=0.
+        Ok(Self {
+            slice,
+            _phantom: PhantomData,
+        })
+    }
+
+    /// Create an empty `BStackVec` pre-sized for at least `capacity` elements.
+    pub fn with_capacity(capacity: u64, alloc: &'a A) -> io::Result<Self> {
+        let slice = alloc.alloc(Self::block_size(capacity))?;
+        let vec = Self {
+            slice,
+            _phantom: PhantomData,
+        };
+        // len is already 0 (zeroed by alloc); write the non-zero cap field.
+        vec.write_cap_field(capacity)?;
+        Ok(vec)
+    }
+
+    /// Allocate a `BStackVec` and populate it from a Rust slice.
+    ///
+    /// The resulting vec has `len == capacity == data.len()`.
+    pub fn from_slice(data: &[T], alloc: &'a A) -> io::Result<Self> {
+        let len = data.len() as u64;
+        let slice = alloc.alloc(Self::block_size(len))?;
+        let vec = Self {
+            slice,
+            _phantom: PhantomData,
+        };
+        if len > 0 {
+            // Write len and cap; elements are written individually below.
+            vec.write_header(len, len)?;
+            for (i, &item) in data.iter().enumerate() {
+                vec.write_elem_at(i as u64, item)?;
+            }
+        }
+        Ok(vec)
+    }
+
+    /// Reconstruct a `BStackVec` from a raw block slice.
+    ///
+    /// # Safety
+    ///
+    /// `slice` must be the original allocation handle (not a sub-slice) returned
+    /// by one of the `BStackVec` constructors on the same allocator, and the
+    /// block header must have been written by a `BStackVec<T, A>`.  Passing an
+    /// unrelated slice or one with a mismatched element type is undefined
+    /// behaviour.
+    pub unsafe fn from_raw_block(slice: BStackSlice<'a, A>) -> Self {
+        Self {
+            slice,
+            _phantom: PhantomData,
+        }
+    }
+
+    /// Return the number of elements currently stored.
+    ///
+    /// Re-reads `len` from the block header on every call.
+    pub fn len(&self) -> io::Result<u64> {
+        Ok(self.read_header()?.0)
+    }
+
+    /// Return the number of elements the current allocation can hold without
+    /// reallocation.
+    ///
+    /// Re-reads `cap` from the block header on every call.
+    pub fn capacity(&self) -> io::Result<u64> {
+        Ok(self.read_header()?.1)
+    }
+
+    /// Return `true` if the vec contains no elements.
+    pub fn is_empty(&self) -> io::Result<bool> {
+        Ok(self.len()? == 0)
+    }
+
+    /// Return the element at `index`, or `None` if `index >= len`.
+    pub fn get(&self, index: u64) -> io::Result<Option<T>> {
+        let (len, _) = self.read_header()?;
+        if index >= len {
+            return Ok(None);
+        }
+        Ok(Some(self.read_elem_at(index)?))
+    }
+
+    /// Return a [`BStackSlice`] spanning only the populated element bytes.
+    ///
+    /// The slice covers `[16, 16 + len * size_of::<T>())` within the block.
+    /// It is a sub-slice and must **not** be passed to `realloc` or `dealloc`;
+    /// use [`raw_block`](Self::raw_block) for that.
+    pub fn as_slice(&self) -> io::Result<BStackSlice<'a, A>> {
+        let (len, _) = self.read_header()?;
+        Ok(self
+            .slice
+            .subslice(HEADER_LEN, HEADER_LEN + len * Self::elem_size()))
+    }
+
+    /// Append `value` to the end of the vec.
+    ///
+    /// If `len == capacity`, reallocates to `max(cap * 2, 4)` elements before
+    /// writing.
+    pub fn push(&mut self, value: T) -> io::Result<()> {
+        let (len, cap) = self.read_header()?;
+        if len == cap {
+            let new_cap = cap.saturating_mul(2).max(4);
+            self.grow_to(new_cap)?;
+            self.write_cap_field(new_cap)?;
+        }
+        self.write_elem_at(len, value)?;
+        self.write_len_field(len + 1)
+    }
+
+    /// Remove and return the last element, or `None` if empty.
+    ///
+    /// The vacated slot is zeroed before `len` is decremented.
+    pub fn pop(&mut self) -> io::Result<Option<T>> {
+        let (len, _) = self.read_header()?;
+        if len == 0 {
+            return Ok(None);
+        }
+        let value = self.read_elem_at(len - 1)?;
+        self.zero_elem_at(len - 1)?;
+        self.write_len_field(len - 1)?;
+        Ok(Some(value))
+    }
+
+    /// Shorten the vec to `new_len` elements.
+    ///
+    /// No-op when `new_len >= len`.  Removed slots are zeroed in a single
+    /// [`BStackSlice::zero_range`] call; capacity is unchanged.
+    pub fn truncate(&mut self, new_len: u64) -> io::Result<()> {
+        let (len, _) = self.read_header()?;
+        if new_len >= len {
+            return Ok(());
+        }
+        let start = Self::elem_offset(new_len);
+        let removed_bytes = (len - new_len) * Self::elem_size();
+        self.slice.zero_range(start, removed_bytes)?;
+        self.write_len_field(new_len)
+    }
+
+    /// Remove all elements without releasing the allocation.
+    ///
+    /// Equivalent to `truncate(0)`.
+    pub fn clear(&mut self) -> io::Result<()> {
+        self.truncate(0)
+    }
+
+    /// Reserve capacity for at least `additional` more elements.
+    ///
+    /// After this call `capacity() >= len() + additional`.  Does nothing if
+    /// the current capacity is already sufficient.
+    pub fn reserve(&mut self, additional: u64) -> io::Result<()> {
+        let (len, cap) = self.read_header()?;
+        let needed = len.checked_add(additional).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "BStackVec::reserve: capacity overflow",
+            )
+        })?;
+        if needed <= cap {
+            return Ok(());
+        }
+        let new_cap = needed.max(cap.saturating_mul(2));
+        self.grow_to(new_cap)?;
+        self.write_cap_field(new_cap)?;
+        Ok(())
+    }
+
+    /// Set the length to `new_len`, filling any new slots with `value`.
+    ///
+    /// If `new_len <= len`, equivalent to [`truncate`](Self::truncate) and
+    /// `value` is ignored.
+    pub fn resize(&mut self, new_len: u64, value: T) -> io::Result<()> {
+        let (len, _) = self.read_header()?;
+        if new_len <= len {
+            return self.truncate(new_len);
+        }
+        self.reserve(new_len - len)?;
+        for i in len..new_len {
+            self.write_elem_at(i, value)?;
+        }
+        self.write_len_field(new_len)
+    }
+
+    /// Return an iterator over the elements.
+    ///
+    /// `len` is snapshotted at construction time.  The vec is borrowed
+    /// immutably for the iterator's lifetime, preventing concurrent mutation.
+    /// Each element is read from disk on demand; errors surface as
+    /// `io::Result::Err` items.
+    pub fn iter(&self) -> io::Result<BStackVecIter<'_, 'a, T, A>> {
+        let (len, _) = self.read_header()?;
+        Ok(BStackVecIter {
+            vec: self,
+            index: 0,
+            len,
+        })
+    }
+
+    /// Return the underlying block slice (header + all allocated element space).
+    ///
+    /// This is the original allocation handle and may be passed to
+    /// [`BStackAllocator::realloc`] or [`BStackAllocator::dealloc`].
+    pub fn raw_block(&self) -> BStackSlice<'a, A> {
+        self.slice
+    }
+
+    /// Consume the vec and return the underlying block slice.
+    ///
+    /// The caller takes responsibility for the allocation.  Reconstruct with
+    /// [`BStackVec::from_raw_block`].
+    pub fn into_raw_block(self) -> BStackSlice<'a, A> {
+        self.slice
+    }
+}
+
+// ── iterator ──────────────────────────────────────────────────────────────────
+
+/// An iterator over the elements of a [`BStackVec`].
+///
+/// Constructed by [`BStackVec::iter`].  `len` is snapshotted at construction;
+/// elements pushed after construction are not visible.  Each element is read
+/// from disk on demand; I/O errors surface as `Err` items.
+pub struct BStackVecIter<'b, 'a: 'b, T: Copy, A: BStackSliceAllocator> {
+    vec: &'b BStackVec<'a, T, A>,
+    index: u64,
+    len: u64,
+}
+
+impl<'b, 'a: 'b, T: Copy, A: BStackSliceAllocator> fmt::Debug for BStackVecIter<'b, 'a, T, A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BStackVecIter")
+            .field("index", &self.index)
+            .field("len", &self.len)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'b, 'a: 'b, T: Copy, A: BStackSliceAllocator> Iterator for BStackVecIter<'b, 'a, T, A> {
+    type Item = io::Result<T>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index >= self.len {
+            return None;
+        }
+        let result = self.vec.read_elem_at(self.index);
+        self.index += 1;
+        Some(result)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = (self.len - self.index) as usize;
+        (remaining, Some(remaining))
+    }
+}

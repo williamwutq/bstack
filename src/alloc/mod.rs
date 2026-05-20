@@ -441,11 +441,15 @@ pub mod ghost_tree;
 pub mod guarded;
 pub mod linear;
 pub mod manual;
+#[cfg(feature = "set")]
+pub mod vec;
 
 #[cfg(feature = "set")]
 pub use first_fit::FirstFitBStackAllocator;
 #[cfg(feature = "set")]
 pub use ghost_tree::GhostTreeBstackAllocator;
+#[cfg(feature = "set")]
+pub use vec::{BStackVec, BStackVecIter};
 #[cfg(all(feature = "guarded", feature = "atomic"))]
 pub use guarded::{BStackAtomicGuardedSlice, BStackAtomicGuardedSliceSubview};
 #[cfg(feature = "guarded")]
