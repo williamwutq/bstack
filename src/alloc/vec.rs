@@ -445,3 +445,415 @@ impl<'b, 'a: 'b, T: Copy, A: BStackSliceAllocator> Iterator for BStackVecIter<'b
         (remaining, Some(remaining))
     }
 }
+
+// ── tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::BStack;
+    use crate::alloc::LinearBStackAllocator;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    // ── helpers ───────────────────────────────────────────────────────────────
+
+    fn temp_path() -> std::path::PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        std::env::temp_dir().join(format!("bstack_vec_test_{pid}_{id}.bin"))
+    }
+
+    struct Guard(std::path::PathBuf);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn make_alloc() -> (LinearBStackAllocator, std::path::PathBuf) {
+        let path = temp_path();
+        let alloc = LinearBStackAllocator::new(BStack::open(&path).unwrap());
+        (alloc, path)
+    }
+
+    // ── constructors and header recovery ─────────────────────────────────────
+
+    #[test]
+    fn new_is_empty_with_zero_cap() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let v: BStackVec<u64, _> = BStackVec::new(&alloc).unwrap();
+        assert_eq!(v.len().unwrap(), 0);
+        assert_eq!(v.capacity().unwrap(), 0);
+        assert!(v.is_empty().unwrap());
+    }
+
+    #[test]
+    fn with_capacity_has_zero_len_and_correct_cap() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let v: BStackVec<u32, _> = BStackVec::with_capacity(8, &alloc).unwrap();
+        assert_eq!(v.len().unwrap(), 0);
+        assert_eq!(v.capacity().unwrap(), 8);
+        assert!(v.is_empty().unwrap());
+    }
+
+    #[test]
+    fn from_slice_roundtrip() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let src = [10u64, 20, 30, 40, 50];
+        let v = BStackVec::from_slice(&src, &alloc).unwrap();
+        assert_eq!(v.len().unwrap(), 5);
+        assert_eq!(v.capacity().unwrap(), 5);
+        for (i, &expected) in src.iter().enumerate() {
+            assert_eq!(v.get(i as u64).unwrap(), Some(expected));
+        }
+        assert_eq!(v.get(5).unwrap(), None);
+    }
+
+    #[test]
+    fn from_slice_empty() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let v: BStackVec<u8, _> = BStackVec::from_slice(&[], &alloc).unwrap();
+        assert_eq!(v.len().unwrap(), 0);
+        assert_eq!(v.capacity().unwrap(), 0);
+    }
+
+    #[test]
+    fn raw_block_roundtrip() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+
+        let mut v: BStackVec<i32, _> = BStackVec::new(&alloc).unwrap();
+        v.push(1).unwrap();
+        v.push(2).unwrap();
+        v.push(3).unwrap();
+
+        let block = v.into_raw_block();
+        // Reconstruct from raw block and verify header and elements survive.
+        let v2: BStackVec<i32, _> = unsafe { BStackVec::from_raw_block(block) };
+        assert_eq!(v2.len().unwrap(), 3);
+        assert_eq!(v2.get(0).unwrap(), Some(1));
+        assert_eq!(v2.get(1).unwrap(), Some(2));
+        assert_eq!(v2.get(2).unwrap(), Some(3));
+    }
+
+    #[test]
+    fn reopen_header_recovery() {
+        // Verify that (len, cap) survive a drop-and-reopen via from_raw_block.
+        let path = temp_path();
+        let _g = Guard(path.clone());
+
+        let block_bytes = {
+            let alloc = LinearBStackAllocator::new(BStack::open(&path).unwrap());
+            let mut v: BStackVec<u64, _> = BStackVec::new(&alloc).unwrap();
+            v.push(111).unwrap();
+            v.push(222).unwrap();
+            v.push(333).unwrap();
+            // Serialise the raw block handle for later reconstruction.
+            let bytes: [u8; 16] = v.into_raw_block().into();
+            bytes
+            // `alloc` (and the BStack file) are closed here.
+        };
+
+        // Reopen and reconstruct.
+        let alloc = LinearBStackAllocator::new(BStack::open(&path).unwrap());
+        let block = unsafe { crate::alloc::BStackSlice::from_bytes(&alloc, block_bytes) };
+        let v: BStackVec<u64, _> = unsafe { BStackVec::from_raw_block(block) };
+        assert_eq!(v.len().unwrap(), 3);
+        assert_eq!(v.get(0).unwrap(), Some(111));
+        assert_eq!(v.get(1).unwrap(), Some(222));
+        assert_eq!(v.get(2).unwrap(), Some(333));
+    }
+
+    // ── push / pop / get ─────────────────────────────────────────────────────
+
+    #[test]
+    fn push_pop_lifo() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let mut v: BStackVec<u64, _> = BStackVec::new(&alloc).unwrap();
+        for i in 0..10u64 {
+            v.push(i * 11).unwrap();
+        }
+        assert_eq!(v.len().unwrap(), 10);
+        for i in (0..10u64).rev() {
+            assert_eq!(v.pop().unwrap(), Some(i * 11));
+        }
+        assert_eq!(v.pop().unwrap(), None);
+        assert!(v.is_empty().unwrap());
+    }
+
+    #[test]
+    fn pop_zeros_vacated_slot() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let mut v: BStackVec<u64, _> = BStackVec::new(&alloc).unwrap();
+        v.push(0xDEAD_BEEF_CAFE_BABEu64).unwrap();
+
+        let block = v.raw_block();
+        v.pop().unwrap();
+
+        // Slot 0's bytes (at block offset 16) should now be zeroed.
+        let slot_bytes = block.read_range(16, 24).unwrap();
+        assert_eq!(
+            slot_bytes, [0u8; 8],
+            "vacated slot must be zeroed after pop"
+        );
+    }
+
+    #[test]
+    fn get_out_of_bounds_returns_none() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let mut v: BStackVec<u32, _> = BStackVec::new(&alloc).unwrap();
+        v.push(42).unwrap();
+        assert_eq!(v.get(0).unwrap(), Some(42u32));
+        assert_eq!(v.get(1).unwrap(), None);
+        assert_eq!(v.get(u64::MAX).unwrap(), None);
+    }
+
+    // ── growth ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn push_triggers_growth_from_zero() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let mut v: BStackVec<u32, _> = BStackVec::new(&alloc).unwrap();
+        // First push must grow from cap=0 to cap=4.
+        v.push(1).unwrap();
+        assert!(v.capacity().unwrap() >= 4);
+        assert_eq!(v.len().unwrap(), 1);
+    }
+
+    #[test]
+    fn push_doubles_capacity_on_overflow() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let mut v: BStackVec<u32, _> = BStackVec::with_capacity(2, &alloc).unwrap();
+        v.push(1).unwrap();
+        v.push(2).unwrap();
+        let cap_before = v.capacity().unwrap();
+        assert_eq!(cap_before, 2);
+        v.push(3).unwrap(); // triggers doubling
+        assert!(v.capacity().unwrap() >= 4);
+        assert_eq!(v.len().unwrap(), 3);
+    }
+
+    // ── truncate / clear ──────────────────────────────────────────────────────
+
+    #[test]
+    fn truncate_shortens_and_zeros_slots() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let mut v: BStackVec<u64, _> = BStackVec::new(&alloc).unwrap();
+        v.push(0xAAAA_AAAA_AAAA_AAAAu64).unwrap();
+        v.push(0xBBBB_BBBB_BBBB_BBBBu64).unwrap();
+        v.push(0xCCCC_CCCC_CCCC_CCCCu64).unwrap();
+
+        let block = v.raw_block();
+        v.truncate(1).unwrap();
+
+        assert_eq!(v.len().unwrap(), 1);
+        assert_eq!(v.capacity().unwrap(), 4); // cap unchanged
+
+        // Slots 1 and 2 (offsets 24..40) must be zeroed.
+        let removed = block.read_range(24, 40).unwrap();
+        assert_eq!(removed, [0u8; 16], "truncated slots must be zeroed");
+    }
+
+    #[test]
+    fn truncate_noop_when_new_len_ge_len() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let mut v: BStackVec<u32, _> = BStackVec::new(&alloc).unwrap();
+        v.push(7).unwrap();
+        v.truncate(5).unwrap(); // no-op
+        assert_eq!(v.len().unwrap(), 1);
+        assert_eq!(v.get(0).unwrap(), Some(7u32));
+    }
+
+    #[test]
+    fn clear_zeros_all_element_slots() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let mut v: BStackVec<u64, _> = BStackVec::new(&alloc).unwrap();
+        v.push(1).unwrap();
+        v.push(2).unwrap();
+        v.push(3).unwrap();
+
+        let block = v.raw_block();
+        v.clear().unwrap();
+
+        assert_eq!(v.len().unwrap(), 0);
+        // All three element slots must be zeroed (offsets 16..40).
+        let elems = block.read_range(16, 16 + 3 * 8).unwrap();
+        assert_eq!(elems, vec![0u8; 24]);
+    }
+
+    // ── reserve / resize overflow ─────────────────────────────────────────────
+
+    #[test]
+    fn reserve_noop_when_capacity_sufficient() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let mut v: BStackVec<u32, _> = BStackVec::with_capacity(10, &alloc).unwrap();
+        v.push(1).unwrap();
+        v.reserve(5).unwrap(); // len=1, cap=10 => sufficient
+        assert_eq!(v.capacity().unwrap(), 10);
+    }
+
+    #[test]
+    fn reserve_grows_when_needed() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let mut v: BStackVec<u32, _> = BStackVec::new(&alloc).unwrap();
+        v.push(1).unwrap();
+        // len=1, cap>=4; reserve(100) must grow to at least 101.
+        v.reserve(100).unwrap();
+        assert!(v.capacity().unwrap() >= 101);
+    }
+
+    #[test]
+    fn reserve_overflow_returns_error() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let mut v: BStackVec<u32, _> = BStackVec::new(&alloc).unwrap();
+        v.push(1).unwrap(); // len=1
+        // Requesting u64::MAX additional would overflow len+additional.
+        let err = v.reserve(u64::MAX).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn resize_grow_fills_with_value() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let mut v: BStackVec<u32, _> = BStackVec::new(&alloc).unwrap();
+        v.push(1).unwrap();
+        v.resize(5, 99u32).unwrap();
+        assert_eq!(v.len().unwrap(), 5);
+        assert_eq!(v.get(0).unwrap(), Some(1u32));
+        for i in 1..5 {
+            assert_eq!(v.get(i).unwrap(), Some(99u32));
+        }
+    }
+
+    #[test]
+    fn resize_shrink_truncates() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let mut v: BStackVec<u32, _> = BStackVec::from_slice(&[1, 2, 3, 4, 5], &alloc).unwrap();
+        v.resize(2, 0).unwrap();
+        assert_eq!(v.len().unwrap(), 2);
+        assert_eq!(v.get(0).unwrap(), Some(1u32));
+        assert_eq!(v.get(1).unwrap(), Some(2u32));
+        assert_eq!(v.get(2).unwrap(), None);
+    }
+
+    // ── as_slice ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn as_slice_covers_populated_elements_only() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let v = BStackVec::from_slice(&[10u32, 20, 30], &alloc).unwrap();
+        let s = v.as_slice().unwrap();
+        assert_eq!(s.len(), 3 * size_of::<u32>() as u64);
+        let bytes = s.read().unwrap();
+        let mut expected = [0u8; 12];
+        expected[0..4].copy_from_slice(&10u32.to_le_bytes());
+        expected[4..8].copy_from_slice(&20u32.to_le_bytes());
+        expected[8..12].copy_from_slice(&30u32.to_le_bytes());
+        assert_eq!(bytes, expected);
+    }
+
+    // ── iterator snapshot semantics ───────────────────────────────────────────
+
+    #[test]
+    fn iter_yields_all_elements_in_order() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let src = [3u64, 1, 4, 1, 5, 9, 2, 6];
+        let v = BStackVec::from_slice(&src, &alloc).unwrap();
+        let collected: Vec<u64> = v.iter().unwrap().map(|r| r.unwrap()).collect();
+        assert_eq!(collected, src);
+    }
+
+    #[test]
+    fn iter_size_hint_tracks_remaining() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let v = BStackVec::from_slice(&[1u32, 2, 3, 4, 5], &alloc).unwrap();
+        let mut it = v.iter().unwrap();
+        assert_eq!(it.size_hint(), (5, Some(5)));
+        it.next().unwrap();
+        assert_eq!(it.size_hint(), (4, Some(4)));
+        it.next().unwrap();
+        it.next().unwrap();
+        assert_eq!(it.size_hint(), (2, Some(2)));
+    }
+
+    #[test]
+    fn iter_stops_at_len_snapshot() {
+        // Build a vec, take an iter (which snapshots len), then verify the iter
+        // sees exactly that many elements.  The borrow checker prevents mutation
+        // while the iter is live, so we verify the element count indirectly.
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let v = BStackVec::from_slice(&[10u64, 20, 30], &alloc).unwrap();
+        let count = v.iter().unwrap().count();
+        assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn iter_on_empty_vec_yields_nothing() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let v: BStackVec<u64, _> = BStackVec::new(&alloc).unwrap();
+        let count = v.iter().unwrap().count();
+        assert_eq!(count, 0);
+    }
+
+    // ── zero-sized T ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn zst_push_pop_tracks_len() {
+        // `size_of::<()>() == 0`; the block never grows beyond the 16-byte header.
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let mut v: BStackVec<(), _> = BStackVec::new(&alloc).unwrap();
+        assert_eq!(v.len().unwrap(), 0);
+        v.push(()).unwrap();
+        v.push(()).unwrap();
+        v.push(()).unwrap();
+        assert_eq!(v.len().unwrap(), 3);
+        assert_eq!(v.get(2).unwrap(), Some(()));
+        assert_eq!(v.pop().unwrap(), Some(()));
+        assert_eq!(v.len().unwrap(), 2);
+    }
+
+    #[test]
+    fn zst_iter_yields_correct_count() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let v = BStackVec::from_slice(&[(), (), (), ()], &alloc).unwrap();
+        let count = v.iter().unwrap().count();
+        assert_eq!(count, 4);
+    }
+
+    #[test]
+    fn zst_block_size_is_always_header_only() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let mut v: BStackVec<(), _> = BStackVec::new(&alloc).unwrap();
+        // Push many ZSTs; the raw block should stay at 16 bytes.
+        for _ in 0..100 {
+            v.push(()).unwrap();
+        }
+        assert_eq!(v.raw_block().len(), 16);
+    }
+}
