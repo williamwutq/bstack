@@ -46,7 +46,7 @@ Tracks implementation status for features in the `bstack` crate. All items in ea
     - [ ] CodeQL passes without warnings.
 6. Documentation
     - [ ] All public items document their purpose, parameters, return values, and any panics or side effects.
-    - [ ] `cargo doc` builds without warnings.
+    - [ ] `cargo doc --all-features` builds without warnings except unused manifest key.
     - [ ] Doc tests pass.
     - [ ] New feature flags have meaningful documentation.
     - [ ] Changelog entry added.
