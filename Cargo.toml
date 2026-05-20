@@ -51,7 +51,7 @@ required-features = ["alloc", "set"]
 
 [[example]]
 name = "hashmap"
-required-features = ["alloc", "set"]
+required-features = ["set"]
 
 [[example]]
 name = "atomic_ops"
