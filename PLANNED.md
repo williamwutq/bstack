@@ -180,7 +180,7 @@ The subview analogue (`BStackGuardedSliceSubview`) would be expressed as a flag 
 
 ## Adding `BStackVec<T>` for typed vector storage
 
-**Feature flag:** `BSTACK_FEATURE_SET`
+**Feature flag:** `set`
 **Breaking change:** No (additive; new type only)
 
 ### Motivation
@@ -247,6 +247,7 @@ When capacity is exceeded, `BStackVec` would use the `BStack`'s `realloc` to gro
 
 ### Open questions
 
+- **Initial capacity:** Should `new()` create an empty vector with zero capacity, or should it allocate a small default capacity (e.g., 4 or 8 elements) to avoid immediate reallocations on first push?
 - **Generic bounds on `T`:** Should `T` be required to implement `Copy`, or should a `Drop` implementation be provided for types with destructors? A `Drop` impl would be complex, as it must be called on remaining elements when the vec is deallocated.
 - **Error handling:** Should methods return `Result` for all operations, or should some (e.g., `len()`, `capacity()`) be infallible? Returning `Result` allows for better error propagation but may be more verbose for simple accessors.
 - **Initialization of new elements:** When growing the vector, should new elements be zero-initialized, left uninitialized (i.e. `MaybeUninit`), or should we require `T` to be `Default` and call `default()`? Zero-initialization is safer and guranteed for newly allocated space, but may be unnecessary overhead for some types.
