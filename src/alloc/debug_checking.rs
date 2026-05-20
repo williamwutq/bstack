@@ -78,6 +78,57 @@ fn check_overlap(region: &Range<u64>, set: &HashSet<Range<u64>>) -> Option<Range
     set.iter().find(|r| overlaps(region, r)).cloned()
 }
 
+/// Validates that `region` can be freed given the current `state` and a set of regions
+/// already queued in the same bulk operation (`pending_freed`).
+///
+/// Returns `true` if `region` is tracked in `state.allocated` (caller must remove it on
+/// commit), or `false` if untracked (allowed — may have been allocated in a prior session).
+///
+/// Panics on double-free (overlap with `state.freed` or `pending_freed`), partial-free,
+/// or multi-span violations.
+fn check_deallocation(
+    region: &Range<u64>,
+    state: &DebugState,
+    pending_freed: &HashSet<Range<u64>>,
+) -> bool {
+    if let Some(overlap) = check_overlap(region, &state.freed) {
+        panic!(
+            "DebugCheckingAllocator: Attempting to free region [{}, {}) which overlaps \
+             with already freed region [{}, {}). This indicates a double-free bug.",
+            region.start, region.end, overlap.start, overlap.end
+        );
+    }
+    if let Some(overlap) = check_overlap(region, pending_freed) {
+        panic!(
+            "DebugCheckingAllocator: Attempting to free region [{}, {}) which overlaps \
+             with region [{}, {}) already queued in the same bulk deallocation. \
+             This indicates a double-free bug.",
+            region.start, region.end, overlap.start, overlap.end
+        );
+    }
+    let overlapping_allocated: Vec<Range<u64>> = state
+        .allocated
+        .iter()
+        .filter(|r| overlaps(region, r))
+        .cloned()
+        .collect();
+    match overlapping_allocated.as_slice() {
+        [] => false,
+        [exact] if *exact == *region => true,
+        [single] => panic!(
+            "DebugCheckingAllocator: Attempting to partially free region [{}, {}) \
+             which is a subset or overlap of allocated region [{}, {}). \
+             Partial deallocations are not allowed.",
+            region.start, region.end, single.start, single.end,
+        ),
+        _ => panic!(
+            "DebugCheckingAllocator: Attempting to free region [{}, {}) which spans \
+             multiple allocated regions. This is not a valid deallocation.",
+            region.start, region.end,
+        ),
+    }
+}
+
 /// Record an allocated region in `state`, splitting any overlapping freed regions.
 fn record_allocated_region(
     state: &mut DebugState,
@@ -473,40 +524,27 @@ where
         let slice: BStackSlice<'_, A> = handle.inner.try_into().map_err(|e| {
             io::Error::other(format!("handle is not convertible to BStackSlice: {e}"))
         })?;
-        let offset = slice.start();
-        let len = slice.len();
-        let region = offset..offset + len;
+        let region = slice.start()..slice.start() + slice.len();
 
-        // Validate first without mutating tracking state.
-        {
+        // Validate without mutating tracking state. Untracked regions are allowed
+        // (may have been allocated in a prior session).
+        let was_in_allocated = {
             let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-
-            if let Some(overlap) = check_overlap(&region, &state.freed) {
-                panic!(
-                    "DebugCheckingAllocator: Attempting to free region [{}, {}) which overlaps \
-                     with already freed region [{}, {}). This indicates a double-free bug.",
-                    region.start, region.end, overlap.start, overlap.end
-                );
-            }
-
-            if !state.allocated.contains(&region) {
-                panic!(
-                    "DebugCheckingAllocator: Attempt to free unallocated region [{}, {}).",
-                    region.start, region.end
-                );
-            }
-        }
+            check_deallocation(&region, &state, &HashSet::new())
+        };
 
         self.inner.dealloc(handle.inner)?;
 
         // Commit tracking state only after the inner deallocation succeeds.
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let removed = state.allocated.remove(&region);
-        debug_assert!(
-            removed,
-            "validated region [{}, {}) must still be present in allocated set",
-            region.start, region.end
-        );
+        if was_in_allocated {
+            let removed = state.allocated.remove(&region);
+            debug_assert!(
+                removed,
+                "validated region [{}, {}) must still be present in allocated set",
+                region.start, region.end
+            );
+        }
         state.freed.insert(region);
 
         Ok(())
@@ -553,20 +591,45 @@ where
     fn dealloc_bulk<'a>(&'a self, handles: impl AsRef<[Self::Allocated<'a>]>) -> io::Result<()> {
         let handles = handles.as_ref();
 
-        // Validate ALL handles before touching the inner allocator so that a
-        // double-free or partial-free panic fires before any state is mutated.
-        for handle in handles {
-            let slice: BStackSlice<'_, A> = handle.inner.try_into().map_err(|e| {
-                io::Error::other(format!(
-                    "handle is not convertible to BStackSlice during bulk dealloc: {e}"
-                ))
-            })?;
-            self.record_deallocation(slice.start(), slice.len());
+        // Pass 1: convert and validate all handles without mutating tracking state.
+        // `pending_freed` accumulates regions already cleared in this batch so
+        // intra-batch double-frees are caught before any state is touched.
+        let mut slices: Vec<BStackSlice<'_, A>> = Vec::with_capacity(handles.len());
+        let mut in_allocated: Vec<bool> = Vec::with_capacity(handles.len());
+        let mut pending_freed: HashSet<Range<u64>> = HashSet::with_capacity(handles.len());
+        {
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            for handle in handles {
+                let slice: BStackSlice<'_, A> = handle.inner.try_into().map_err(|e| {
+                    io::Error::other(format!(
+                        "handle is not convertible to BStackSlice during bulk dealloc: {e}"
+                    ))
+                })?;
+                let region = slice.start()..slice.start() + slice.len();
+                in_allocated.push(check_deallocation(&region, &state, &pending_freed));
+                pending_freed.insert(region);
+                slices.push(slice);
+            }
         }
 
-        // Delegate to the inner allocator with the unwrapped handles
+        // Delegate to the inner allocator.
         let inner_handles: Vec<A::Allocated<'a>> = handles.iter().map(|h| h.inner).collect();
         self.inner.dealloc_bulk(inner_handles)?;
+
+        // Pass 2: commit tracking state only after the inner dealloc succeeds.
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        for (slice, was_in_alloc) in slices.iter().zip(in_allocated.iter()) {
+            let region = slice.start()..slice.start() + slice.len();
+            if *was_in_alloc {
+                let removed = state.allocated.remove(&region);
+                debug_assert!(
+                    removed,
+                    "validated region [{}, {}) must still be present in allocated set",
+                    region.start, region.end
+                );
+            }
+            state.freed.insert(region);
+        }
 
         Ok(())
     }
@@ -1188,18 +1251,22 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Attempt to free unallocated region")]
-    fn test_dealloc_untracked_region_panics() {
-        let (stack, path) = create_test_stack().unwrap();
+    fn test_dealloc_untracked_region_is_allowed() -> io::Result<()> {
+        let (stack, path) = create_test_stack()?;
         let _guard = TestGuard(path);
         let config = Rc::new(RefCell::new(MockAllocatorConfig::default()));
         let inner = ControllableMockAllocator::new(stack, config);
         let alloc = DebugCheckingAllocator::new(inner);
 
-        // Try to dealloc a handle we never allocated via the public API
+        // Freeing a region never seen by this checker instance should succeed —
+        // it may have been allocated in a prior session.
         let fake_inner_handle = MockHandle::new(alloc.inner(), 500, 100);
         let fake_handle = DebugHandle::new(&alloc, fake_inner_handle);
-        alloc.dealloc(fake_handle).unwrap();
+        alloc.dealloc(fake_handle)?;
+
+        let state = alloc.state.lock().unwrap();
+        assert!(state.freed.contains(&(500..600)));
+        Ok(())
     }
 
     // --- Tests for alloc_bulk() error paths ---
@@ -1271,17 +1338,19 @@ mod tests {
         let result = alloc.dealloc_bulk(&handles);
         assert!(result.is_err());
 
-        // Verify tracking state was NOT modified
-        // Note: record_deallocation is called for validation before the inner
-        // dealloc_bulk, so the freed set will be updated even though the inner
-        // call failed. This is a quirk of the current implementation.
-        //
-        // The important invariant is that no handle can be used after dealloc_bulk
-        // is called, regardless of whether it succeeded or failed.
+        // Verify tracking state was NOT modified — the two-pass design only commits
+        // allocated→freed transitions after the inner call succeeds.
         {
             let state = alloc.state.lock().unwrap();
-            // All regions should be marked as freed (validation succeeded)
-            assert_eq!(state.freed.len(), 3);
+            assert_eq!(
+                state.allocated.len(),
+                3,
+                "all regions should still be allocated"
+            );
+            assert!(
+                state.freed.is_empty(),
+                "no regions should be freed after inner failure"
+            );
         }
 
         Ok(())
