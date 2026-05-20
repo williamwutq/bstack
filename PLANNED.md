@@ -135,49 +135,6 @@ This prevents accidental writes while still allowing inspection of the underlyin
 
 ---
 
-## Adding a guard/intercept layer to the C allocator API
-
-**Feature flag:** `BSTACK_FEATURE_SET` (for write hooks)
-**Breaking change:** No (additive; new types and functions only)
-
-### Motivation
-
-The Rust allocator layer has `BStackGuardedSlice` and `BStackGuardedSliceSubview` — traits that let callers attach lifecycle hooks (`pre_read`, `post_read`, `pre_write`, `post_write`) to a slice, enabling transparent I/O transforms such as encryption, compression, or integrity checks. The C allocator has no equivalent; transforms must be wired by hand at every call site.
-
-Without a guard layer, patterns like "all reads from this region must be decrypted and all writes must be re-encrypted" require every caller to remember to apply the transform, which is error-prone and couples application logic to storage details.
-
-### Design
-
-Add a `bstack_guarded_slice_t` wrapper type and a vtable for hooks:
-
-```c
-typedef struct {
-    int (*pre_read) (void *ctx, bstack_slice_t s);
-    int (*post_read)(void *ctx, bstack_slice_t s, uint8_t *buf, size_t len);
-    int (*pre_write)(void *ctx, bstack_slice_t s,
-                     const uint8_t **buf, size_t *len);
-    int (*post_write)(void *ctx, bstack_slice_t s);
-} bstack_guard_vtbl_t;
-
-typedef struct {
-    bstack_slice_t           slice;
-    const bstack_guard_vtbl_t *vtbl;
-    void                    *ctx;
-} bstack_guarded_slice_t;
-```
-
-Provide `bstack_guarded_slice_read`, `bstack_guarded_slice_write`, and `bstack_guarded_slice_subview` functions that delegate to the underlying slice while invoking the hooks at the appropriate points.
-
-The subview analogue (`BStackGuardedSliceSubview`) would be expressed as a flag or second vtable on `bstack_guarded_slice_t` that additionally intercepts `subslice` calls, allowing a guard to restrict or transform the visible range.
-
-### Open questions
-
-- Should `pre_write` be allowed to replace the buffer pointer (e.g., to encrypt into a separate scratch buffer), or should it always mutate in place? Replacing the pointer is more flexible but requires the hook to manage scratch memory lifetime.
-- How should hook errors interact with the C error-reporting convention (`errno`)? The hook returning -1 should propagate as a read/write failure, but the hook may also want to set a custom errno value.
-- Should `bstack_guarded_slice_t` be opaque (allocated on the heap) or transparent (stack-allocatable struct)? Transparency is simpler but leaks the vtable layout.
-
----
-
 ## Adding `BStackVec<T>` for typed vector storage
 
 **Feature flag:** `BSTACK_FEATURE_SET`
