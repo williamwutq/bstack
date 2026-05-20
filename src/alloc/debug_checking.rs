@@ -425,14 +425,21 @@ where
         let handle = self.inner.alloc(len)?;
 
         // Convert to BStackSlice for validation (Copy keeps the original handle live)
-        let slice: BStackSlice<'_, A> = handle.try_into().map_err(|e| {
-            // The inner allocator succeeded but we can't inspect the handle — free it
-            // to avoid leaking the allocation, then surface the error.
-            let _ = self.inner.dealloc(handle);
-            io::Error::other(format!(
-                "allocated handle is not convertible to BStackSlice: {e}"
-            ))
-        })?;
+        let slice: BStackSlice<'_, A> = match handle.try_into() {
+            Ok(slice) => slice,
+            Err(e) => {
+                // The inner allocator succeeded but we can't inspect the handle — free it
+                // to avoid leaking the allocation, then surface the error.
+                return match self.inner.dealloc(handle) {
+                    Ok(()) => Err(io::Error::other(format!(
+                        "allocated handle is not convertible to BStackSlice: {e}"
+                    ))),
+                    Err(rollback_err) => Err(io::Error::other(format!(
+                        "allocated handle is not convertible to BStackSlice: {e}; rollback via dealloc failed: {rollback_err}"
+                    ))),
+                };
+            }
+        };
 
         self.record_allocation(slice.start(), slice.len());
 
@@ -455,12 +462,19 @@ where
         let new_inner_handle = self.inner.realloc(handle.inner, new_len)?;
 
         // Convert result; free on failure to avoid leaking the new allocation
-        let new_slice: BStackSlice<'_, A> = new_inner_handle.try_into().map_err(|e| {
-            let _ = self.inner.dealloc(new_inner_handle);
-            io::Error::other(format!(
-                "reallocated handle is not convertible to BStackSlice: {e}"
-            ))
-        })?;
+        let new_slice: BStackSlice<'_, A> = match new_inner_handle.try_into() {
+            Ok(slice) => slice,
+            Err(e) => {
+                return match self.inner.dealloc(new_inner_handle) {
+                    Ok(()) => Err(io::Error::other(format!(
+                        "reallocated handle is not convertible to BStackSlice: {e}"
+                    ))),
+                    Err(rollback_err) => Err(io::Error::other(format!(
+                        "reallocated handle is not convertible to BStackSlice: {e}; rollback via dealloc failed: {rollback_err}"
+                    ))),
+                };
+            }
+        };
         let new_region = new_slice.start()..new_slice.start() + new_slice.len();
 
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -486,9 +500,21 @@ where
     }
 
     fn dealloc(&self, handle: Self::Allocated<'_>) -> io::Result<()> {
-        let slice: BStackSlice<'_, A> = handle.inner.try_into().map_err(|e| {
-            io::Error::other(format!("handle is not convertible to BStackSlice: {e}"))
-        })?;
+        let slice: BStackSlice<'_, A> = match handle.inner.try_into() {
+            Ok(slice) => slice,
+            Err(e) => {
+                // Can't identify the region, but still attempt to free the inner
+                // handle to avoid a leak; compose errors if dealloc also fails.
+                return match self.inner.dealloc(handle.inner) {
+                    Ok(()) => Err(io::Error::other(format!(
+                        "handle is not convertible to BStackSlice: {e}"
+                    ))),
+                    Err(dealloc_err) => Err(io::Error::other(format!(
+                        "handle is not convertible to BStackSlice: {e}; dealloc also failed: {dealloc_err}"
+                    ))),
+                };
+            }
+        };
         let (offset, len) = (slice.start(), slice.len());
 
         // Validate before touching the inner allocator. Untracked regions are allowed
