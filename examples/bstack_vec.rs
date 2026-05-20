@@ -169,7 +169,7 @@ fn main() -> io::Result<()> {
         print_orders(&orders)?;
 
         // Clean up via dealloc.
-        alloc.dealloc(orders.into_raw_block())?;
+        orders.dealloc()?;
     }
 
     // Remove the example file.

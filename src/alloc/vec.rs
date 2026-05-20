@@ -124,11 +124,12 @@ impl<'a, T: Copy, A: BStackSliceAllocator> BStackVec<'a, T, A> {
 
     /// Re-read `(len, capacity)` from the block header on disk.
     fn read_header(&self) -> io::Result<(u64, u64)> {
-        let hdr = self.slice.read_range(0, 16)?;
+        let mut hdr = [0u8; 16];
+        self.slice.read_range_into(0, &mut hdr)?;
         // `read_range(0, 16)` returns exactly 16 bytes on success; the slices
         // are 8 bytes each so try_into() is always Ok — these cannot panic.
-        let len = u64::from_le_bytes(hdr[0..8].try_into().unwrap());
-        let cap = u64::from_le_bytes(hdr[8..16].try_into().unwrap());
+        let len = u64::from_le_bytes(hdr[..8].try_into().unwrap());
+        let cap = u64::from_le_bytes(hdr[8..].try_into().unwrap());
         Ok((len, cap))
     }
 
@@ -150,6 +151,7 @@ impl<'a, T: Copy, A: BStackSliceAllocator> BStackVec<'a, T, A> {
     fn read_elem_at(&self, index: u64) -> io::Result<T> {
         let size = size_of::<T>();
         let start = Self::elem_offset(index);
+        // This has to be allocating since we need to copy to memory from disk
         let bytes = self.slice.read_range(start, start + size as u64)?;
         // SAFETY: `bytes` has exactly `size_of::<T>()` bytes.  Every slot
         // `0..len` was written with a valid `T` value before this read.
@@ -172,6 +174,8 @@ impl<'a, T: Copy, A: BStackSliceAllocator> BStackVec<'a, T, A> {
     /// Reallocate the block to hold `new_cap` elements, updating `self.slice`.
     fn grow_to(&mut self, new_cap: u64) -> io::Result<()> {
         let new_size = Self::block_size(new_cap);
+        // SAFETY: Slice origin requirement is upheld because `self.slice` is the original allocation handle
+        // returned by the constructor, and `realloc` returns a new slice for the same block.
         let new_slice = self.slice.allocator().realloc(self.slice, new_size)?;
         self.slice = new_slice;
         Ok(())
@@ -400,6 +404,13 @@ impl<'a, T: Copy, A: BStackSliceAllocator> BStackVec<'a, T, A> {
     /// [`BStackVec::from_raw_block`].
     pub fn into_raw_block(self) -> BStackSlice<'a, A> {
         self.slice
+    }
+
+    /// Deallocate the underlying block and consume the vec.
+    pub fn dealloc(self) -> io::Result<()> {
+        // Slice origin requirement is upheld because `self.slice` is the original allocation handle
+        // returned by the constructor, and `dealloc` is only called on `self.slice`.
+        self.slice.allocator().dealloc(self.slice)
     }
 }
 
