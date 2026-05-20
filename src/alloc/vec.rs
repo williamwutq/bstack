@@ -183,6 +183,16 @@ impl<'a, T: Copy, A: BStackSliceAllocator> BStackVec<'a, T, A> {
         self.slice.write_range(start, bytes)
     }
 
+    fn write_elems_at(&self, start_index: u64, values: &[T]) -> io::Result<()> {
+        let _size = size_of::<T>();
+        let start = Self::elem_offset(start_index);
+        // SAFETY: `values` is a valid slice of initialized `T`s; we borrow its bytes.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(values.as_ptr() as *const u8, std::mem::size_of_val(values))
+        };
+        self.slice.write_range(start, bytes)
+    }
+
     fn zero_elem_at(&self, index: u64) -> io::Result<()> {
         self.slice
             .zero_range(Self::elem_offset(index), Self::elem_size())
@@ -240,9 +250,8 @@ impl<'a, T: Copy, A: BStackSliceAllocator> BStackVec<'a, T, A> {
         if len > 0 {
             // Write len and cap; elements are written individually below.
             vec.write_header(len, len)?;
-            for (i, &item) in data.iter().enumerate() {
-                vec.write_elem_at(i as u64, item)?;
-            }
+            // writes all elements in one call; see write_elems_at() for safety comments
+            vec.write_elems_at(0, data)?;
         }
         Ok(vec)
     }
@@ -392,9 +401,12 @@ impl<'a, T: Copy, A: BStackSliceAllocator> BStackVec<'a, T, A> {
             return self.truncate(new_len);
         }
         self.reserve(new_len - len)?;
-        for i in len..new_len {
-            self.write_elem_at(i, value)?;
-        }
+        self.write_elems_at(
+            len,
+            std::iter::repeat_n(value, (new_len - len) as usize)
+                .collect::<Vec<_>>()
+                .as_slice(),
+        )?;
         self.write_len_field(new_len)
     }
 
