@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **`FirstFitBStackAllocator` internal reads converted from `get` to `get_into` with stack-allocated buffers** (`alloc` + `set` features): Three internal reads — the 32-byte allocator header on `new`, the 8-byte `free_head` field at the start of `find_large_enough_block`, and the 8-byte block size during `realloc`'s same-block fast path — now use fixed-size stack arrays and `get_into` instead of `get`. This eliminates three small heap allocations per call to those paths, with no change to observable behaviour.
+
 ## [0.2.1] - 2026-05-20
 
 ### Fixed

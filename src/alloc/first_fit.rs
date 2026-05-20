@@ -165,7 +165,8 @@ impl FirstFitBStackAllocator {
                 "stack too short to contain allocator header",
             ));
         }
-        let header = stack.get(Self::OFFSET_SIZE, Self::OFFSET_SIZE + Self::HEADER_SIZE)?;
+        let mut header = [0u8; Self::HEADER_SIZE as usize];
+        stack.get_into(Self::OFFSET_SIZE, &mut header)?;
         // Check magic prefix for compatibility with 0.1.x files.
         if header[..ALFF_MAGIC_PREFIX.len()] != ALFF_MAGIC_PREFIX {
             return Err(io::Error::new(
@@ -388,12 +389,10 @@ impl FirstFitBStackAllocator {
             / (Self::MIN_BLOCK_PAYLOAD_SIZE + Self::BLOCK_OVERHEAD_SIZE)
             + 1;
         let mut walk_count = 0u64;
-        let mut head = u64::from_le_bytes(
-            self.stack
-                .get(Self::FREE_HEAD_OFFSET, Self::FREE_HEAD_OFFSET + 8)?
-                .try_into()
-                .unwrap(),
-        );
+        let mut free_head_buf = [0u8; 8];
+        self.stack
+            .get_into(Self::FREE_HEAD_OFFSET, &mut free_head_buf)?;
+        let mut head = u64::from_le_bytes(free_head_buf);
         while head != 0 {
             walk_count += 1;
             if walk_count > max_walk {
@@ -916,11 +915,10 @@ impl BStackAllocator for FirstFitBStackAllocator {
 
         // Special case: same block optimizations
         // Read the block size
-        let block_size_buf = self.stack.get(
-            slice.start() - Self::BLOCK_HEADER_SIZE,
-            slice.start() - Self::BLOCK_HEADER_SIZE + 8,
-        )?;
-        let block_size = u64::from_le_bytes(block_size_buf.try_into().unwrap());
+        let mut block_size_buf = [0u8; 8];
+        self.stack
+            .get_into(slice.start() - Self::BLOCK_HEADER_SIZE, &mut block_size_buf)?;
+        let block_size = u64::from_le_bytes(block_size_buf);
         if block_size >= aligned_new_len {
             // The block is already big enough.  When growing past the previous user-visible
             // len, zero bytes [slice.len(), new_len) in one atomic write — this covers both
