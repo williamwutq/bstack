@@ -29,6 +29,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`BStackReader`, `BStackSliceReader`, and `BStackSliceWriter` now implement `Copy`**: All cursor types can now be copied by value without an explicit `.clone()` call, making them more ergonomic to use in iterator-like patterns and when passing to functions that don't need to move the original cursor. (`BStackSliceReader` and `BStackSliceWriter` require the `alloc` feature.)
 
+### Added
+
+- **`DebugCheckingAllocator`** (`alloc` feature): A wrapper allocator that tracks allocated regions in memory and validates all operations against them, providing strong guarantees that all allocations and deallocations are well-formed and correctly paired. Intended for testing and debugging; the tracking data structure is not optimised for performance or memory usage. See `debug_checking.rs` for details.
+
 ## [0.2.0] - 2026-05-15
 
 ### Changed

@@ -354,6 +354,11 @@
 //!   Provides O(log n) allocation and deallocation with crash recovery through
 //!   tree rebalancing on mount.
 //!
+//! * [`DebugCheckingAllocator`] — Debug/test wrapper around any
+//!   [`BStackAllocator`].  Tracks allocated and freed regions in memory and
+//!   panics on overlapping allocations, double-frees, or partial frees.
+//!   Not for production use.
+//!
 //! ## Lifetime model
 //!
 //! `BStackSlice<'a, A>` borrows the **allocator** for `'a`, not the
@@ -414,7 +419,7 @@ mod alloc;
 #[cfg(feature = "alloc")]
 pub use alloc::{
     BStackAllocator, BStackBulkAllocator, BStackSlice, BStackSliceAllocator, BStackSliceReader,
-    LinearBStackAllocator, ManualAllocator,
+    DebugCheckingAllocator, DebugHandle, LinearBStackAllocator, ManualAllocator,
 };
 #[cfg(all(feature = "alloc", feature = "set"))]
 pub use alloc::{BStackSliceWriter, FirstFitBStackAllocator, GhostTreeBstackAllocator};
