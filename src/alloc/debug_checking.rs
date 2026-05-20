@@ -186,6 +186,63 @@ fn record_freed_region(state: &mut DebugState, region: Range<u64>) {
     state.freed.insert(region);
 }
 
+/// Validate the initial state for `with_state`, ensuring no overlaps and filtering empty ranges.
+///
+/// Panics if:
+/// - Any two ranges within `allocated` overlap
+/// - Any two ranges within `freed` overlap
+/// - Any range in `allocated` overlaps with any range in `freed`
+fn validate_initial_state(allocated: &mut HashSet<Range<u64>>, freed: &mut HashSet<Range<u64>>) {
+    // Filter out empty ranges
+    allocated.retain(|r| !r.is_empty());
+    freed.retain(|r| !r.is_empty());
+
+    // Check for overlaps within allocated set
+    let allocated_vec: Vec<_> = allocated.iter().cloned().collect();
+    for i in 0..allocated_vec.len() {
+        for j in (i + 1)..allocated_vec.len() {
+            if overlaps(&allocated_vec[i], &allocated_vec[j]) {
+                panic!(
+                    "DebugCheckingAllocator::with_state: Initial allocated set contains \
+                     overlapping ranges [{}, {}) and [{}, {}). The initial state must be \
+                     consistent.",
+                    allocated_vec[i].start,
+                    allocated_vec[i].end,
+                    allocated_vec[j].start,
+                    allocated_vec[j].end
+                );
+            }
+        }
+    }
+
+    // Check for overlaps within freed set
+    let freed_vec: Vec<_> = freed.iter().cloned().collect();
+    for i in 0..freed_vec.len() {
+        for j in (i + 1)..freed_vec.len() {
+            if overlaps(&freed_vec[i], &freed_vec[j]) {
+                panic!(
+                    "DebugCheckingAllocator::with_state: Initial freed set contains \
+                     overlapping ranges [{}, {}) and [{}, {}). The initial state must be \
+                     consistent.",
+                    freed_vec[i].start, freed_vec[i].end, freed_vec[j].start, freed_vec[j].end
+                );
+            }
+        }
+    }
+
+    // Check for overlaps between allocated and freed sets
+    for alloc_range in allocated.iter() {
+        if let Some(freed_range) = check_overlap(alloc_range, freed) {
+            panic!(
+                "DebugCheckingAllocator::with_state: Initial state has allocated range \
+                 [{}, {}) overlapping with freed range [{}, {}). The initial state must be \
+                 consistent.",
+                alloc_range.start, alloc_range.end, freed_range.start, freed_range.end
+            );
+        }
+    }
+}
+
 /// Handle type for [`DebugCheckingAllocator`].
 ///
 /// Wraps the inner allocator's handle along with a reference to the debug allocator,
@@ -349,16 +406,26 @@ where
     ///
     /// Use this when reopening a file from a previous session and you have metadata
     /// to reconstruct which regions were allocated or freed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the initial state is inconsistent:
+    /// - Any two ranges within `allocated` overlap
+    /// - Any two ranges within `freed` overlap
+    /// - Any range in `allocated` overlaps with any range in `freed`
     pub fn with_state(
         inner: A,
         allocated: impl IntoIterator<Item = Range<u64>>,
         freed: impl IntoIterator<Item = Range<u64>>,
     ) -> Self {
+        let mut allocated_set = allocated.into_iter().collect::<HashSet<_>>();
+        let mut freed_set = freed.into_iter().collect::<HashSet<_>>();
+        validate_initial_state(&mut allocated_set, &mut freed_set);
         Self {
             inner,
             state: Mutex::new(DebugState {
-                allocated: allocated.into_iter().collect(),
-                freed: freed.into_iter().collect(),
+                allocated: allocated_set,
+                freed: freed_set,
             }),
         }
     }
@@ -1366,5 +1433,72 @@ mod tests {
         alloc.dealloc_bulk(&handles).unwrap();
         // Second dealloc_bulk with same regions should panic during validation
         alloc.record_deallocation(0, 100);
+    }
+
+    // --- Tests for with_state() validation ---
+
+    #[test]
+    fn test_with_state_valid_disjoint_ranges() {
+        let c = DebugCheckingAllocator::with_state(MockAllocator, [0..100, 200..300], [400..500]);
+        let state = c.state.lock().unwrap();
+        assert_eq!(state.allocated.len(), 2);
+        assert_eq!(state.freed.len(), 1);
+    }
+
+    #[test]
+    fn test_with_state_filters_empty_ranges() {
+        let c = DebugCheckingAllocator::with_state(
+            MockAllocator,
+            [0..100, 100..100, 200..300],
+            [400..400, 500..600],
+        );
+        let state = c.state.lock().unwrap();
+        assert_eq!(state.allocated.len(), 2);
+        assert_eq!(state.freed.len(), 1);
+        assert!(!state.allocated.contains(&(100..100)));
+        assert!(!state.freed.contains(&(400..400)));
+    }
+
+    #[test]
+    #[should_panic(expected = "Initial allocated set contains overlapping ranges")]
+    fn test_with_state_panics_on_overlapping_allocated() {
+        DebugCheckingAllocator::with_state(
+            MockAllocator,
+            [0..100, 50..150], // overlapping
+            [],
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "Initial freed set contains overlapping ranges")]
+    fn test_with_state_panics_on_overlapping_freed() {
+        DebugCheckingAllocator::with_state(
+            MockAllocator,
+            [],
+            [0..100, 50..150], // overlapping
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "allocated range")]
+    fn test_with_state_panics_on_allocated_freed_overlap() {
+        DebugCheckingAllocator::with_state(
+            MockAllocator,
+            [0..100, 200..300],
+            [50..150, 400..500], // [50, 150) overlaps [0, 100)
+        );
+    }
+
+    #[test]
+    fn test_with_state_valid_adjacent_ranges() {
+        // Adjacent ranges (not overlapping) should be allowed
+        let c = DebugCheckingAllocator::with_state(
+            MockAllocator,
+            [0..100, 100..200],
+            [200..300, 300..400],
+        );
+        let state = c.state.lock().unwrap();
+        assert_eq!(state.allocated.len(), 2);
+        assert_eq!(state.freed.len(), 2);
     }
 }
