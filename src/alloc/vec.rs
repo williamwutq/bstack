@@ -114,11 +114,28 @@ impl<'a, T: Copy, A: BStackSliceAllocator> BStackVec<'a, T, A> {
         size_of::<T>() as u64
     }
 
-    fn block_size(capacity: u64) -> u64 {
-        HEADER_LEN + capacity * Self::elem_size()
+    /// Compute the total block size in bytes for `capacity` elements.
+    ///
+    /// Returns `Err(InvalidInput)` if the arithmetic overflows `u64` — this
+    /// prevents passing a wrapped-around value to the allocator and accidentally
+    /// obtaining a block that is too small to hold the requested elements.
+    fn block_size(capacity: u64) -> io::Result<u64> {
+        capacity
+            .checked_mul(Self::elem_size())
+            .and_then(|elem_bytes| elem_bytes.checked_add(HEADER_LEN))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "BStackVec: block size overflows u64",
+                )
+            })
     }
 
     fn elem_offset(index: u64) -> u64 {
+        // `index` is always < `len` which was read from a header we wrote, so
+        // this multiplication cannot overflow in well-formed data.  A corrupt
+        // on-disk `len` could cause overflow and a debug-mode panic; that is
+        // acceptable — corruption is not a recoverable condition here.
         HEADER_LEN + index * Self::elem_size()
     }
 
@@ -173,7 +190,7 @@ impl<'a, T: Copy, A: BStackSliceAllocator> BStackVec<'a, T, A> {
 
     /// Reallocate the block to hold `new_cap` elements, updating `self.slice`.
     fn grow_to(&mut self, new_cap: u64) -> io::Result<()> {
-        let new_size = Self::block_size(new_cap);
+        let new_size = Self::block_size(new_cap)?;
         // SAFETY: Slice origin requirement is upheld because `self.slice` is the original allocation handle
         // returned by the constructor, and `realloc` returns a new slice for the same block.
         let new_slice = self.slice.allocator().realloc(self.slice, new_size)?;
@@ -200,7 +217,7 @@ impl<'a, T: Copy, A: BStackSliceAllocator> BStackVec<'a, T, A> {
 
     /// Create an empty `BStackVec` pre-sized for at least `capacity` elements.
     pub fn with_capacity(capacity: u64, alloc: &'a A) -> io::Result<Self> {
-        let slice = alloc.alloc(Self::block_size(capacity))?;
+        let slice = alloc.alloc(Self::block_size(capacity)?)?;
         let vec = Self {
             slice,
             _phantom: PhantomData,
@@ -215,7 +232,7 @@ impl<'a, T: Copy, A: BStackSliceAllocator> BStackVec<'a, T, A> {
     /// The resulting vec has `len == capacity == data.len()`.
     pub fn from_slice(data: &[T], alloc: &'a A) -> io::Result<Self> {
         let len = data.len() as u64;
-        let slice = alloc.alloc(Self::block_size(len))?;
+        let slice = alloc.alloc(Self::block_size(len)?)?;
         let vec = Self {
             slice,
             _phantom: PhantomData,
@@ -280,6 +297,12 @@ impl<'a, T: Copy, A: BStackSliceAllocator> BStackVec<'a, T, A> {
     /// The slice covers `[16, 16 + len * size_of::<T>())` within the block.
     /// It is a sub-slice and must **not** be passed to `realloc` or `dealloc`;
     /// use [`raw_block`](Self::raw_block) for that.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the `len` read from the block header is corrupt (larger than
+    /// the block can hold), causing the computed end offset to exceed the
+    /// block's length.  Corruption is not a recoverable condition here.
     pub fn as_slice(&self) -> io::Result<BStackSlice<'a, A>> {
         let (len, _) = self.read_header()?;
         Ok(self
@@ -407,9 +430,16 @@ impl<'a, T: Copy, A: BStackSliceAllocator> BStackVec<'a, T, A> {
     }
 
     /// Deallocate the underlying block and consume the vec.
+    ///
+    /// Preferred over `alloc.dealloc(v.into_raw_block())` as it keeps the
+    /// dealloc call co-located with the type.  The slice origin requirement is
+    /// upheld because `self.slice` is always the original allocation handle
+    /// returned by the constructor (or a subsequent `realloc`).
+    ///
+    /// After this call the backing storage is released; no further I/O on any
+    /// handle derived from this vec (e.g. a prior [`raw_block`](Self::raw_block)
+    /// copy) is valid.
     pub fn dealloc(self) -> io::Result<()> {
-        // Slice origin requirement is upheld because `self.slice` is the original allocation handle
-        // returned by the constructor, and `dealloc` is only called on `self.slice`.
         self.slice.allocator().dealloc(self.slice)
     }
 }
@@ -463,7 +493,7 @@ impl<'b, 'a: 'b, T: Copy, A: BStackSliceAllocator> Iterator for BStackVecIter<'b
 mod tests {
     use super::*;
     use crate::BStack;
-    use crate::alloc::LinearBStackAllocator;
+    use crate::alloc::{BStackAllocator, LinearBStackAllocator};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     // ── helpers ───────────────────────────────────────────────────────────────
@@ -866,5 +896,126 @@ mod tests {
             v.push(()).unwrap();
         }
         assert_eq!(v.raw_block().len(), 16);
+    }
+
+    // ── integration: block_size overflow ─────────────────────────────────────
+
+    #[test]
+    fn with_capacity_overflow_returns_error() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        // u64::MAX elements of u64 = u64::MAX * 8, which overflows u64.
+        let err = BStackVec::<u64, _>::with_capacity(u64::MAX, &alloc).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn with_capacity_overflow_zst_is_fine() {
+        // ZST elem_size = 0 so u64::MAX * 0 = 0; no overflow.
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let v = BStackVec::<(), _>::with_capacity(u64::MAX, &alloc).unwrap();
+        assert_eq!(v.capacity().unwrap(), u64::MAX);
+        assert_eq!(v.raw_block().len(), 16);
+    }
+
+    #[test]
+    fn reserve_overflow_through_grow_returns_error() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        // Start with a vec near the edge of what block_size can represent.
+        // After one push (cap grows to 4), request enough additional that
+        // len + additional overflows u64.
+        let mut v: BStackVec<u64, _> = BStackVec::new(&alloc).unwrap();
+        v.push(1).unwrap();
+        let err = v.reserve(u64::MAX).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    // ── integration: interop with BStackSliceReader ───────────────────────────
+
+    #[test]
+    fn as_slice_readable_via_slice_reader() {
+        use std::io::Read;
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let v = BStackVec::from_slice(&[0x0A0Bu16, 0x0C0D, 0x0E0F], &alloc).unwrap();
+
+        let s = v.as_slice().unwrap();
+        let mut reader = s.reader();
+        let mut buf = [0u8; 6];
+        reader.read_exact(&mut buf).unwrap();
+
+        // Elements are stored in the native repr of u16 (little-endian on all
+        // supported platforms), laid out consecutively starting at byte 0 of
+        // the element region.
+        let expected: Vec<u8> = [0x0A0Bu16, 0x0C0D, 0x0E0F]
+            .iter()
+            .flat_map(|x| x.to_ne_bytes())
+            .collect();
+        assert_eq!(&buf, expected.as_slice());
+    }
+
+    // ── integration: dealloc reclaims tail ───────────────────────────────────
+
+    #[test]
+    fn dealloc_reclaims_tail_from_linear_allocator() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+
+        let size_before = alloc.stack().len().unwrap();
+        let mut v: BStackVec<u64, _> = BStackVec::new(&alloc).unwrap();
+        v.push(1).unwrap();
+        v.push(2).unwrap();
+        let size_after_push = alloc.stack().len().unwrap();
+        assert!(size_after_push > size_before);
+
+        v.dealloc().unwrap();
+        // LinearBStackAllocator::dealloc on the tail slice calls BStack::discard,
+        // so the stack should shrink back to its pre-allocation size.
+        assert_eq!(alloc.stack().len().unwrap(), size_before);
+    }
+
+    // ── integration: two vecs on the same allocator ───────────────────────────
+
+    #[test]
+    fn two_vecs_on_same_allocator_do_not_interfere() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+
+        // Pre-size both vecs so neither triggers a realloc: LinearBStackAllocator
+        // can only grow the tail allocation, so interleaved pushes would fail
+        // if the blocks needed to move.
+        let mut a: BStackVec<u32, _> = BStackVec::with_capacity(4, &alloc).unwrap();
+        let mut b: BStackVec<u32, _> = BStackVec::with_capacity(4, &alloc).unwrap();
+
+        a.push(10).unwrap();
+        b.push(20).unwrap();
+        a.push(11).unwrap();
+        b.push(21).unwrap();
+
+        assert_eq!(a.len().unwrap(), 2);
+        assert_eq!(b.len().unwrap(), 2);
+        assert_eq!(a.get(0).unwrap(), Some(10u32));
+        assert_eq!(a.get(1).unwrap(), Some(11u32));
+        assert_eq!(b.get(0).unwrap(), Some(20u32));
+        assert_eq!(b.get(1).unwrap(), Some(21u32));
+    }
+
+    // ── integration: as_slice length after mutation ───────────────────────────
+
+    #[test]
+    fn as_slice_len_tracks_vec_len() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let mut v: BStackVec<u64, _> = BStackVec::new(&alloc).unwrap();
+
+        assert_eq!(v.as_slice().unwrap().len(), 0);
+        v.push(1).unwrap();
+        assert_eq!(v.as_slice().unwrap().len(), size_of::<u64>() as u64);
+        v.push(2).unwrap();
+        assert_eq!(v.as_slice().unwrap().len(), 2 * size_of::<u64>() as u64);
+        v.pop().unwrap();
+        assert_eq!(v.as_slice().unwrap().len(), size_of::<u64>() as u64);
     }
 }
