@@ -790,10 +790,10 @@ mod tests {
         let v = BStackVec::from_slice(&[1u32, 2, 3, 4, 5], &alloc).unwrap();
         let mut it = v.iter().unwrap();
         assert_eq!(it.size_hint(), (5, Some(5)));
-        it.next().unwrap();
+        it.next().unwrap().unwrap();
         assert_eq!(it.size_hint(), (4, Some(4)));
-        it.next().unwrap();
-        it.next().unwrap();
+        it.next().unwrap().unwrap();
+        it.next().unwrap().unwrap();
         assert_eq!(it.size_hint(), (2, Some(2)));
     }
 
