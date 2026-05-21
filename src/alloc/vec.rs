@@ -73,9 +73,9 @@ const HEADER_LEN: u64 = 16;
 /// | Method | Step order | Crash-recovery state |
 /// |--------|-----------|----------------------|
 /// | `push` (no realloc) | write element → increment `len` | Crash after element write: element on disk but `len` not updated; slot is effectively invisible. Re-running `push` with the same value recovers correctly. |
-/// | `push` (with realloc) | `realloc` → write `cap` → write element → increment `len` | Crash at any point: header re-read on next open reflects the committed state; worst case is a leaked block (with `LinearBStackAllocator`) or a stale cap value. |
-/// | `pop` | read element → zero slot → decrement `len` | Crash after zero but before `len` decrement: element is zeroed on disk but `len` still counts it; `get(len-1)` returns a zero-bit `T`. Decrementing `len` on the next `pop` call removes it cleanly. |
-/// | `truncate` | zero removed slots → write `len` | Crash after zeroing but before `len` write: logically removed elements are on disk as zeros; `len` still points past them. Calling `truncate` again to the same target is idempotent. |
+/// | `push` (with realloc) | `realloc` → write `cap` → write element → increment `len` | Crash at any point: header re-read on next open reflects the committed state; worst case is allocator-specific intermediate metadata or a stale cap value. |
+/// | `pop` | read element → decrement `len` → zero slot | Crash after `len` decrement but before zero: stale bytes may remain in the now out-of-range slot, but reads never deserialize them because they are beyond `len`. |
+/// | `truncate` | write `len` → zero removed slots | Crash after `len` write but before zero: stale bytes may remain in now out-of-range slots, but reads never deserialize them because they are beyond `len`. |
 /// | `resize` (grow) | `reserve` → write elements → write `len` | Same as `push` repeated; elements between the old and new `len` may be partially written. |
 /// | `clear` | (delegates to `truncate(0)`) | See `truncate`. |
 /// | `reserve` | `realloc` → write `cap` | Crash between the two: cap field may reflect the old value; the block is larger than cap indicates. Harmless — the next `push` re-checks and may realloc again unnecessarily. |
@@ -301,6 +301,26 @@ impl<'a, T: Copy, A: BStackSliceAllocator> BStackVec<'a, T, A> {
         Ok(Some(self.read_elem_at(index)?))
     }
 
+    /// Read all logical elements and return them as a Rust [`Vec<T>`].
+    ///
+    /// Equivalent to collecting [`iter`](Self::iter), but returns a single
+    /// `io::Result<Vec<T>>`.
+    pub fn read_vec(&self) -> io::Result<Vec<T>> {
+        let (len, _) = self.read_header()?;
+        let len_usize = usize::try_from(len).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "BStackVec::read_vec: len does not fit usize",
+            )
+        })?;
+
+        let mut out = Vec::with_capacity(len_usize);
+        for i in 0..len {
+            out.push(self.read_elem_at(i)?);
+        }
+        Ok(out)
+    }
+
     /// Return a [`BStackSlice`] spanning only the populated element bytes.
     ///
     /// The slice covers `[16, 16 + len * size_of::<T>())` within the block.
@@ -336,22 +356,23 @@ impl<'a, T: Copy, A: BStackSliceAllocator> BStackVec<'a, T, A> {
 
     /// Remove and return the last element, or `None` if empty.
     ///
-    /// The vacated slot is zeroed before `len` is decremented.
+    /// `len` is decremented before the vacated slot is zeroed.
     pub fn pop(&mut self) -> io::Result<Option<T>> {
         let (len, _) = self.read_header()?;
         if len == 0 {
             return Ok(None);
         }
         let value = self.read_elem_at(len - 1)?;
-        self.zero_elem_at(len - 1)?;
         self.write_len_field(len - 1)?;
+        self.zero_elem_at(len - 1)?;
         Ok(Some(value))
     }
 
     /// Shorten the vec to `new_len` elements.
     ///
-    /// No-op when `new_len >= len`.  Removed slots are zeroed in a single
-    /// [`BStackSlice::zero_range`] call; capacity is unchanged.
+    /// No-op when `new_len >= len`. `len` is updated first, then removed slots
+    /// are zeroed in a single [`BStackSlice::zero_range`] call; capacity is
+    /// unchanged.
     pub fn truncate(&mut self, new_len: u64) -> io::Result<()> {
         let (len, _) = self.read_header()?;
         if new_len >= len {
@@ -359,8 +380,8 @@ impl<'a, T: Copy, A: BStackSliceAllocator> BStackVec<'a, T, A> {
         }
         let start = Self::elem_offset(new_len);
         let removed_bytes = (len - new_len) * Self::elem_size();
-        self.slice.zero_range(start, removed_bytes)?;
-        self.write_len_field(new_len)
+        self.write_len_field(new_len)?;
+        self.slice.zero_range(start, removed_bytes)
     }
 
     /// Remove all elements without releasing the allocation.
@@ -429,6 +450,12 @@ impl<'a, T: Copy, A: BStackSliceAllocator> BStackVec<'a, T, A> {
     ///
     /// This is the original allocation handle and may be passed to
     /// [`crate::BStackAllocator::realloc`] or [`crate::BStackAllocator::dealloc`].
+    ///
+    /// # Invalidation
+    ///
+    /// Any call that may reallocate (`push`, `reserve`, `resize`) can invalidate
+    /// previously returned handles. Re-fetch with `raw_block()` after such
+    /// mutations.
     pub fn raw_block(&self) -> BStackSlice<'a, A> {
         self.slice
     }
@@ -667,6 +694,15 @@ mod tests {
         assert_eq!(v.get(0).unwrap(), Some(42u32));
         assert_eq!(v.get(1).unwrap(), None);
         assert_eq!(v.get(u64::MAX).unwrap(), None);
+    }
+
+    #[test]
+    fn read_vec_returns_all_elements() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let src = [7u64, 11, 13, 17];
+        let v = BStackVec::from_slice(&src, &alloc).unwrap();
+        assert_eq!(v.read_vec().unwrap(), src);
     }
 
     // ── growth ───────────────────────────────────────────────────────────────

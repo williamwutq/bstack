@@ -362,7 +362,8 @@
 //! * [`BStackVec`]`<'a, T: Copy, A>` — a typed, growable vector backed by a
 //!   [`BStack`] allocation (requires `alloc` + `set`).  Mirrors the core
 //!   [`Vec<T>`] API: `new`, `with_capacity`, `from_slice`, `push`, `pop`,
-//!   `get`, `as_slice`, `truncate`, `clear`, `reserve`, `resize`, and `iter`.
+//!   `get`, `read_vec`, `as_slice`, `truncate`, `clear`, `reserve`, `resize`,
+//!   and `iter`.
 //!   The block stores a 16-byte header (`len`, `cap`) followed by the element
 //!   data; the header is re-read on every call for crash recoverability.  `push`
 //!   doubles capacity (minimum 4); `pop` zeros the vacated slot; `truncate`

@@ -11,8 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`BStackVec<'a, T: Copy, A: BStackSliceAllocator>`** (`alloc` + `set` features): A typed, growable vector backed by a `BStack` allocation, mirroring the core `Vec<T>` API. The 16-byte block header stores `len` and `capacity` as little-endian `u64` values; elements follow immediately. The header is re-read from disk on every call, so the metadata is recoverable after a crash by reconstructing the handle via `BStackVec::from_raw_block`. Key design points:
   - **Growth**: when `push` would exceed capacity, the block is reallocated to `max(cap * 2, 4)` elements via the allocator's `realloc`. New element space is zero-initialised by `BStack::extend`.
-  - **Zeroing on pop**: `pop` zeros the vacated slot before decrementing `len`; `truncate` zeros all removed slots in a single `BStackSlice::zero_range` call. Deallocation zeroing is delegated to the allocator.
-  - **API**: `new`, `with_capacity`, `from_slice`, `unsafe from_raw_block`, `len`, `capacity`, `is_empty`, `get`, `as_slice`, `push`, `pop`, `truncate`, `clear`, `reserve`, `resize`, `iter`, `raw_block`, `into_raw_block`.
+  - **Zeroing on removal**: `pop` decrements `len` before zeroing the vacated slot; `truncate` writes the new `len` before zeroing removed slots in a single `BStackSlice::zero_range` call. Deallocation zeroing is delegated to the allocator.
+  - **API**: `new`, `with_capacity`, `from_slice`, `unsafe from_raw_block`, `len`, `capacity`, `is_empty`, `get`, `read_vec`, `as_slice`, `push`, `pop`, `truncate`, `clear`, `reserve`, `resize`, `iter`, `raw_block`, `into_raw_block`.
   - **Iterator**: `BStackVecIter<'b, 'a, T, A>` borrows the vec immutably for its lifetime (preventing concurrent mutation), snapshots `len` at construction, and yields `io::Result<T>` per element read from disk on demand.
 
 ### Changed

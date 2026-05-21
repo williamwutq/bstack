@@ -636,7 +636,8 @@ recoverable after a crash by reconstructing the handle from the raw block via
 #### Key behaviour
 
 - **Growth**: `push` reallocates to `max(cap × 2, 4)` elements when `len == cap`. New element space is zero-initialised by `BStack::extend`.
-- **Zeroing on pop**: `pop` zeros the vacated slot before decrementing `len`. `truncate` zeros all removed slots in a single `BStackSlice::zero_range` call. Deallocation zeroing is delegated to the allocator.
+- **Readback helper**: `read_vec` loads all logical elements into a Rust `Vec<T>`.
+- **Zeroing on removal**: `pop` decrements `len` before zeroing the vacated slot; `truncate` writes the new `len` before zeroing removed slots in a single `BStackSlice::zero_range` call. Deallocation zeroing is delegated to the allocator.
 - **Iterator**: `BStackVecIter` borrows the vec immutably for its lifetime (preventing concurrent mutation) and yields `io::Result<T>` per element, reading from disk on demand.
 
 #### Example
