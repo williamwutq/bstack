@@ -15,6 +15,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **API**: `new`, `with_capacity`, `from_slice`, `unsafe from_raw_block`, `len`, `capacity`, `is_empty`, `get`, `as_slice`, `push`, `pop`, `truncate`, `clear`, `reserve`, `resize`, `iter`, `raw_block`, `into_raw_block`.
   - **Iterator**: `BStackVecIter<'b, 'a, T, A>` borrows the vec immutably for its lifetime (preventing concurrent mutation), snapshots `len` at construction, and yields `io::Result<T>` per element read from disk on demand.
 
+### Changed
+
+- **`FirstFitBStackAllocator` internal reads converted from `get` to `get_into` with stack-allocated buffers** (`alloc` + `set` features): Three internal reads — the 32-byte allocator header on `new`, the 8-byte `free_head` field at the start of `find_large_enough_block`, and the 8-byte block size during `realloc`'s same-block fast path — now use fixed-size stack arrays and `get_into` instead of `get`. This eliminates three small heap allocations per call to those paths, with no change to observable behaviour.
+
+## [0.2.1] - 2026-05-20
+
 ### Fixed
 
 - **`FirstFitBStackAllocator::dealloc` — double-free** (`alloc` + `set` features): `dealloc` now returns `InvalidInput` if the block header's `is_free` flag is already set. Previously a double-free wrote a self-referential free-list entry; because `recovery_needed` was cleared normally, the corruption survived reopen and made every subsequent allocation fail.
