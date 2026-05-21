@@ -422,7 +422,9 @@ pub use alloc::{
     DebugCheckingAllocator, DebugHandle, LinearBStackAllocator, ManualAllocator,
 };
 #[cfg(all(feature = "alloc", feature = "set"))]
-pub use alloc::{BStackSliceWriter, FirstFitBStackAllocator, GhostTreeBstackAllocator};
+pub use alloc::{
+    BStackSliceWriter, FirstFitBStackAllocator, GhostTreeBstackAllocator, SlabBStackAllocator,
+};
 
 #[cfg(all(feature = "guarded", feature = "atomic"))]
 pub use alloc::{BStackAtomicGuardedSlice, BStackAtomicGuardedSliceSubview};
