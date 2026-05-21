@@ -417,7 +417,7 @@ bstack = { version = "0.2", features = ["set"] }
 
 ### `alloc`
 
-Enables the region-management layer on top of `BStack`: `BStackAllocator`, `BStackBulkAllocator`, `BStackSlice`, `BStackSliceReader`, `LinearBStackAllocator`, `FirstFitBStackAllocator`, `GhostTreeBstackAllocator`, `ManualAllocator`, and the `BStackSliceAllocator` supertrait.
+Enables the region-management layer on top of `BStack`: `BStackAllocator`, `BStackBulkAllocator`, `BStackSlice`, `BStackSliceReader`, `LinearBStackAllocator`, `FirstFitBStackAllocator`, `GhostTreeBstackAllocator`, `ManualAllocator`, and the `BStackSliceAllocator` supertrait.  Combined with `set`, also enables `BStackSliceWriter`, `BStackByteVec`, and `BStackByteVecIter`.
 
 ```toml
 [dependencies]
@@ -610,6 +610,61 @@ assert_eq!(c.start(), a.start());
 
 let stack = alloc.into_stack();
 ```
+
+### `BStackByteVec<'a, A>` (`alloc + set` features)
+
+A growable byte (`u8`) vector backed by a `BStack` allocation, mirroring the core `Vec<u8>` API.
+
+For a general typed vector over arbitrary `Copy` types, see `PLANNED.md` — the general case requires a sound POD/byte-castable bound and is planned for a future release.
+
+```toml
+[dependencies]
+bstack = { version = "0.2", features = ["alloc", "set"] }
+```
+
+#### Memory layout
+
+```
+┌──────────────────────┬──────────────────────┬────────────────────────┐
+│   len  (8 B, LE u64) │   cap  (8 B, LE u64) │   elements: [u8; cap]  │
+└──────────────────────┴──────────────────────┴────────────────────────┘
+  byte 0                 byte 8                  byte 16
+```
+
+The header is re-read from disk on every call, so the `(len, cap)` metadata is
+recoverable after a crash by reconstructing the handle from the raw block via
+`BStackByteVec::from_raw_block`.
+
+#### Key behaviour
+
+- **Growth**: `push` reallocates to `max(cap × 2, 4)` bytes when `len == cap`. New space is zero-initialised by `BStack::extend`.
+- **Readback helper**: `read_bytes` loads all logical bytes into a Rust `Vec<u8>`.
+- **Zeroing on removal**: `pop` decrements `len` before zeroing the vacated slot; `truncate` writes the new `len` before zeroing removed slots in a single `BStackSlice::zero_range` call. Deallocation zeroing is delegated to the allocator.
+- **Iterator**: `BStackByteVecIter` borrows the vec immutably for its lifetime (preventing concurrent mutation) and yields `io::Result<u8>` per byte, reading from disk on demand.
+
+#### Example
+
+```rust
+use bstack::{BStack, BStackByteVec, LinearBStackAllocator};
+
+let alloc = LinearBStackAllocator::new(BStack::open("buf.bstack")?);
+
+let mut v: BStackByteVec<_> = BStackByteVec::new(&alloc)?;
+v.push(b'A')?;
+v.push(b'B')?;
+v.push(b'C')?;
+
+assert_eq!(v.len()?, 3);
+assert_eq!(v.get(1)?, Some(b'B'));
+assert_eq!(v.pop()?, Some(b'C'));
+
+let all = v.read_bytes()?;
+println!("{}", String::from_utf8_lossy(&all));
+
+alloc.dealloc(v.into_raw_block())?;
+```
+
+---
 
 ### Lifetime model
 
