@@ -433,7 +433,8 @@ pub use alloc::{
 };
 #[cfg(all(feature = "alloc", feature = "set"))]
 pub use alloc::{
-    BStackSliceWriter, BStackByteVec, BStackByteVecIter, FirstFitBStackAllocator, GhostTreeBstackAllocator,
+    BStackByteVec, BStackByteVecIter, BStackSliceWriter, FirstFitBStackAllocator,
+    GhostTreeBstackAllocator,
 };
 
 #[cfg(all(feature = "guarded", feature = "atomic"))]

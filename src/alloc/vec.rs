@@ -376,7 +376,7 @@ impl<'a, A: BStackSliceAllocator> BStackByteVec<'a, A> {
         }
         let count = (new_len - len) as usize;
         self.reserve(new_len - len)?;
-        let fill: Vec<u8> = std::iter::repeat(value).take(count).collect();
+        let fill: Vec<u8> = std::iter::repeat_n(value, count).collect();
         self.write_bytes_at(len, &fill)?;
         self.write_len_field(new_len)
     }
@@ -633,7 +633,10 @@ mod tests {
 
         // Slot 0's byte (at block offset 16) should now be zeroed.
         let slot_bytes = block.read_range(16, 17).unwrap();
-        assert_eq!(slot_bytes, [0u8; 1], "vacated slot must be zeroed after pop");
+        assert_eq!(
+            slot_bytes, [0u8; 1],
+            "vacated slot must be zeroed after pop"
+        );
     }
 
     #[test]
