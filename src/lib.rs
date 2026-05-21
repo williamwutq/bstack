@@ -1026,8 +1026,11 @@ impl BStack {
             let locked = self.locked.load(Ordering::Acquire);
             if end <= locked {
                 if self.cache_enabled {
+                    let len = (end - start) as usize;
+                    let mut buf = vec![0u8; len];
                     let cache = self.cache.lock().unwrap();
-                    return Ok(cache[start as usize..end as usize].to_vec());
+                    buf.copy_from_slice(&cache[start as usize..end as usize]);
+                    return Ok(buf);
                 }
                 #[cfg(unix)]
                 {
