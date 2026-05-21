@@ -47,11 +47,8 @@ jobs:
     - name: Run benchmarks — single-threaded stack ops (${{ matrix.lock.name }})
       run: >
         cargo bench --bench rwlock_comparison ${{ matrix.lock.features }}
-        -- --sample-size 10 push_single_threaded pop_single_threaded
-        discard_single_threaded extend_single_threaded peek_single_threaded
-        get_single_threaded len_single_threaded push_large_payload_single_threaded
-        mixed_single_threaded
+        -- --sample-size 10 single_threaded
     - name: Run benchmarks — multi-threaded stack ops (${{ matrix.lock.name }})
       run: >
         cargo bench --bench rwlock_comparison ${{ matrix.lock.features }}
-        -- --sample-size 10 push_multi_threaded mixed_multi_threaded
+        -- --sample-size 10 multi_threaded

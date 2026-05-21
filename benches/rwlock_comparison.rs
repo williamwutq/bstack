@@ -268,7 +268,7 @@ fn bstack_pop_st(c: &mut Criterion) {
     use bstack::BStack;
 
     const OPS: u64 = 512;
-    let item = PAYLOAD_SMALL.len() as u64;
+    let _item = PAYLOAD_SMALL.len() as u64;
     let mut group = c.benchmark_group("pop_single_threaded");
     group.throughput(Throughput::Elements(OPS));
     group.measurement_time(Duration::from_secs(10));
