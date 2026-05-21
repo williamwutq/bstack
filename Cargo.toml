@@ -34,7 +34,7 @@ windows-sys = { version = "0.52", features = [
 ] }
 
 [[example]]
-name = "bstack_vec"
+name = "bstack_bytevec"
 required-features = ["alloc", "set"]
 
 [[example]]
