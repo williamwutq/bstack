@@ -4311,7 +4311,7 @@ mod cache_tests {
     }
 
     #[test]
-    fn sequential_lock_up_to_within_capacity() {
+    fn sequential_lock_up_to_exceeding_capacity_reallocates() {
         // Lock to 4 (capacity = next_power_of_two(4) = 4), then extend to 6.
         // 6 > capacity 4, so the second call reallocates the cache buffer.
         let (s, p) = mk_cached();
