@@ -444,10 +444,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 // `parking_lot` takes priority if both are enabled simultaneously.
 #[cfg(feature = "parking_lot")]
 use parking_lot::RwLock;
-#[cfg(all(feature = "usync", not(feature = "parking_lot")))]
-use usync::RwLock;
 #[cfg(not(any(feature = "parking_lot", feature = "usync")))]
 use std::sync::RwLock;
+#[cfg(all(feature = "usync", not(feature = "parking_lot")))]
+use usync::RwLock;
 
 // Normalise lock-acquisition across the three backends.
 //

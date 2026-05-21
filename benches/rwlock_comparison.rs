@@ -57,7 +57,12 @@ const LOCK: &str = "std";
 
 fn temp_path(tag: &str) -> std::path::PathBuf {
     let mut p = std::env::temp_dir();
-    p.push(format!("bstack_bench_{}_{}_{}.bin", LOCK, tag, std::process::id()));
+    p.push(format!(
+        "bstack_bench_{}_{}_{}.bin",
+        LOCK,
+        tag,
+        std::process::id()
+    ));
     p
 }
 
@@ -164,31 +169,39 @@ fn lock_micro_contended(c: &mut Criterion) {
                     }));
                 }
                 barrier.wait();
-                for h in handles { h.join().unwrap(); }
+                for h in handles {
+                    h.join().unwrap();
+                }
             });
         });
 
         // parking_lot
-        group.bench_with_input(BenchmarkId::new("parking_lot", n_threads), &n_threads, |b, &n| {
-            let lock = Arc::new(parking_lot::RwLock::new(0u64));
-            b.iter(|| {
-                let barrier = Arc::new(Barrier::new(n + 1));
-                let mut handles = Vec::with_capacity(n);
-                for _ in 0..n {
-                    let l = Arc::clone(&lock);
-                    let bar = Arc::clone(&barrier);
-                    handles.push(thread::spawn(move || {
-                        bar.wait();
-                        for _ in 0..OPS_PER_THREAD {
-                            let mut g = l.write();
-                            *g = g.wrapping_add(1);
-                        }
-                    }));
-                }
-                barrier.wait();
-                for h in handles { h.join().unwrap(); }
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::new("parking_lot", n_threads),
+            &n_threads,
+            |b, &n| {
+                let lock = Arc::new(parking_lot::RwLock::new(0u64));
+                b.iter(|| {
+                    let barrier = Arc::new(Barrier::new(n + 1));
+                    let mut handles = Vec::with_capacity(n);
+                    for _ in 0..n {
+                        let l = Arc::clone(&lock);
+                        let bar = Arc::clone(&barrier);
+                        handles.push(thread::spawn(move || {
+                            bar.wait();
+                            for _ in 0..OPS_PER_THREAD {
+                                let mut g = l.write();
+                                *g = g.wrapping_add(1);
+                            }
+                        }));
+                    }
+                    barrier.wait();
+                    for h in handles {
+                        h.join().unwrap();
+                    }
+                });
+            },
+        );
 
         // usync
         group.bench_with_input(BenchmarkId::new("usync", n_threads), &n_threads, |b, &n| {
@@ -208,7 +221,9 @@ fn lock_micro_contended(c: &mut Criterion) {
                     }));
                 }
                 barrier.wait();
-                for h in handles { h.join().unwrap(); }
+                for h in handles {
+                    h.join().unwrap();
+                }
             });
         });
     }
@@ -422,18 +437,21 @@ fn bstack_push_large_st(c: &mut Criterion) {
     group.throughput(Throughput::Bytes(OPS * PAYLOAD_LARGE.len() as u64));
     group.measurement_time(Duration::from_secs(10));
 
-    group.bench_function(BenchmarkId::new(LOCK, format!("{OPS}_x_{}B", PAYLOAD_LARGE.len())), |b| {
-        let path = temp_path("push_large_st");
-        remove(&path);
-        let stack = BStack::open(&path).unwrap();
-        b.iter(|| {
-            for _ in 0..OPS {
-                stack.push(PAYLOAD_LARGE).unwrap();
-            }
-            stack.discard(OPS * PAYLOAD_LARGE.len() as u64).unwrap();
-        });
-        remove(&path);
-    });
+    group.bench_function(
+        BenchmarkId::new(LOCK, format!("{OPS}_x_{}B", PAYLOAD_LARGE.len())),
+        |b| {
+            let path = temp_path("push_large_st");
+            remove(&path);
+            let stack = BStack::open(&path).unwrap();
+            b.iter(|| {
+                for _ in 0..OPS {
+                    stack.push(PAYLOAD_LARGE).unwrap();
+                }
+                stack.discard(OPS * PAYLOAD_LARGE.len() as u64).unwrap();
+            });
+            remove(&path);
+        },
+    );
 
     group.finish();
 }
@@ -492,33 +510,31 @@ fn bstack_push_mt(c: &mut Criterion) {
         let total = (OPS_PER_THREAD * n_threads) as u64;
         group.throughput(Throughput::Elements(total));
 
-        group.bench_with_input(
-            BenchmarkId::new(LOCK, n_threads),
-            &n_threads,
-            |b, &n| {
-                let path = temp_path(&format!("push_mt_{n}"));
-                remove(&path);
-                let stack = Arc::new(BStack::open(&path).unwrap());
-                b.iter(|| {
-                    let barrier = Arc::new(Barrier::new(n + 1));
-                    let mut handles = Vec::with_capacity(n);
-                    for _ in 0..n {
-                        let s = Arc::clone(&stack);
-                        let bar = Arc::clone(&barrier);
-                        handles.push(thread::spawn(move || {
-                            bar.wait();
-                            for _ in 0..OPS_PER_THREAD {
-                                s.push(PAYLOAD_SMALL).unwrap();
-                            }
-                        }));
-                    }
-                    barrier.wait();
-                    for h in handles { h.join().unwrap(); }
-                    stack.discard(total * PAYLOAD_SMALL.len() as u64).unwrap();
-                });
-                remove(&path);
-            },
-        );
+        group.bench_with_input(BenchmarkId::new(LOCK, n_threads), &n_threads, |b, &n| {
+            let path = temp_path(&format!("push_mt_{n}"));
+            remove(&path);
+            let stack = Arc::new(BStack::open(&path).unwrap());
+            b.iter(|| {
+                let barrier = Arc::new(Barrier::new(n + 1));
+                let mut handles = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let s = Arc::clone(&stack);
+                    let bar = Arc::clone(&barrier);
+                    handles.push(thread::spawn(move || {
+                        bar.wait();
+                        for _ in 0..OPS_PER_THREAD {
+                            s.push(PAYLOAD_SMALL).unwrap();
+                        }
+                    }));
+                }
+                barrier.wait();
+                for h in handles {
+                    h.join().unwrap();
+                }
+                stack.discard(total * PAYLOAD_SMALL.len() as u64).unwrap();
+            });
+            remove(&path);
+        });
     }
 
     group.finish();
@@ -536,47 +552,45 @@ fn bstack_mixed_mt(c: &mut Criterion) {
     for &n_threads in &[2usize, 4] {
         group.throughput(Throughput::Elements((OPS_PER_THREAD * n_threads) as u64));
 
-        group.bench_with_input(
-            BenchmarkId::new(LOCK, n_threads),
-            &n_threads,
-            |b, &n| {
-                let path = temp_path(&format!("mixed_mt_{n}"));
-                remove(&path);
-                let stack = Arc::new(BStack::open(&path).unwrap());
-                // Pre-fill so pop threads don't underflow immediately.
-                for _ in 0..n * OPS_PER_THREAD {
-                    stack.push(PAYLOAD_SMALL).unwrap();
-                }
-                b.iter(|| {
-                    let barrier = Arc::new(Barrier::new(n + 1));
-                    let mut handles = Vec::with_capacity(n);
-                    for thread_idx in 0..n {
-                        let s = Arc::clone(&stack);
-                        let bar = Arc::clone(&barrier);
-                        handles.push(thread::spawn(move || {
-                            bar.wait();
-                            let mut buf = [0u8; 32];
-                            for i in 0..OPS_PER_THREAD {
-                                // Even threads push; odd threads pop.
-                                if (thread_idx + i) % 2 == 0 {
-                                    let _ = s.push(PAYLOAD_SMALL);
-                                } else {
-                                    let _ = s.pop_into(&mut buf);
-                                }
+        group.bench_with_input(BenchmarkId::new(LOCK, n_threads), &n_threads, |b, &n| {
+            let path = temp_path(&format!("mixed_mt_{n}"));
+            remove(&path);
+            let stack = Arc::new(BStack::open(&path).unwrap());
+            // Pre-fill so pop threads don't underflow immediately.
+            for _ in 0..n * OPS_PER_THREAD {
+                stack.push(PAYLOAD_SMALL).unwrap();
+            }
+            b.iter(|| {
+                let barrier = Arc::new(Barrier::new(n + 1));
+                let mut handles = Vec::with_capacity(n);
+                for thread_idx in 0..n {
+                    let s = Arc::clone(&stack);
+                    let bar = Arc::clone(&barrier);
+                    handles.push(thread::spawn(move || {
+                        bar.wait();
+                        let mut buf = [0u8; 32];
+                        for i in 0..OPS_PER_THREAD {
+                            // Even threads push; odd threads pop.
+                            if (thread_idx + i) % 2 == 0 {
+                                let _ = s.push(PAYLOAD_SMALL);
+                            } else {
+                                let _ = s.pop_into(&mut buf);
                             }
-                        }));
-                    }
-                    barrier.wait();
-                    for h in handles { h.join().unwrap(); }
-                });
-                // Drain remainder.
-                let remaining = stack.len().unwrap();
-                if remaining > 0 {
-                    stack.discard(remaining).unwrap();
+                        }
+                    }));
                 }
-                remove(&path);
-            },
-        );
+                barrier.wait();
+                for h in handles {
+                    h.join().unwrap();
+                }
+            });
+            // Drain remainder.
+            let remaining = stack.len().unwrap();
+            if remaining > 0 {
+                stack.discard(remaining).unwrap();
+            }
+            remove(&path);
+        });
     }
 
     group.finish();
@@ -586,11 +600,7 @@ fn bstack_mixed_mt(c: &mut Criterion) {
 // Criterion groups
 // ─────────────────────────────────────────────────────────────────────────────
 
-criterion_group!(
-    lock_micro,
-    lock_micro_uncontested,
-    lock_micro_contended,
-);
+criterion_group!(lock_micro, lock_micro_uncontested, lock_micro_contended,);
 criterion_group!(
     bstack_single_threaded,
     bstack_push_st,
@@ -603,10 +613,6 @@ criterion_group!(
     bstack_push_large_st,
     bstack_mixed_st,
 );
-criterion_group!(
-    bstack_multi_threaded,
-    bstack_push_mt,
-    bstack_mixed_mt,
-);
+criterion_group!(bstack_multi_threaded, bstack_push_mt, bstack_mixed_mt,);
 
 criterion_main!(lock_micro, bstack_single_threaded, bstack_multi_threaded);

@@ -70,10 +70,10 @@ use std::ops::Range;
 // Select the Mutex implementation to match the RwLock backend chosen for BStack.
 #[cfg(feature = "parking_lot")]
 use parking_lot::Mutex;
-#[cfg(all(feature = "usync", not(feature = "parking_lot")))]
-use usync::Mutex;
 #[cfg(not(any(feature = "parking_lot", feature = "usync")))]
 use std::sync::Mutex;
+#[cfg(all(feature = "usync", not(feature = "parking_lot")))]
+use usync::Mutex;
 
 // Normalise Mutex acquisition across the three backends.
 // `std::sync::Mutex::lock()` returns `LockResult<Guard>`; `parking_lot` and
