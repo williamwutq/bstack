@@ -403,11 +403,12 @@ impl<'a, A: BStackSliceAllocator> BStackByteVec<'a, A> {
     ///
     /// # Safety
     ///
-    /// The returned handle is only valid as long as no reallocation occurs.
-    /// Any call that may reallocate (`push`, `reserve`, `resize`) invalidates
-    /// previously returned handles: using a stale handle with `realloc` or
-    /// `dealloc` can corrupt allocator state or lose data.  Re-fetch with
-    /// `raw_block()` after any mutation that may reallocate.
+    /// The caller must ensure that the returned handle is not used after any
+    /// reallocation of this vec occurs.  Any call that may reallocate (`push`,
+    /// `reserve`, `resize`) invalidates previously returned handles: using a
+    /// stale handle with `realloc` or `dealloc` can corrupt allocator state or
+    /// lose data.  Re-fetch with `raw_block()` after any mutation that may
+    /// reallocate.
     pub unsafe fn raw_block(&self) -> BStackSlice<'a, A> {
         self.slice
     }
@@ -584,7 +585,7 @@ mod tests {
             let mut v = BStackByteVec::new(&alloc).unwrap();
             v.push(111).unwrap();
             v.push(222).unwrap();
-            v.push(33).unwrap();
+            v.push(33).unwrap(); // distinct value to verify each slot independently
             // Serialise the raw block handle for later reconstruction.
             let bytes: [u8; 16] = v.into_raw_block().into();
             bytes
