@@ -8,10 +8,27 @@ const READ_SIZES: &[usize] = &[8, 64, 512, 4096];
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
+fn remove_tmp(path: &std::path::Path) {
+    let temp_dir = std::env::temp_dir();
+    let temp_dir = temp_dir.canonicalize().unwrap_or(temp_dir);
+    let parent = match path.parent() {
+        Some(p) => p,
+        None => return,
+    };
+    let parent = parent.canonicalize().unwrap_or_else(|_| parent.to_path_buf());
+    if parent.starts_with(&temp_dir) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 fn tmp_path(prefix: &str) -> std::path::PathBuf {
     let id = COUNTER.fetch_add(1, Ordering::Relaxed);
     let pid = std::process::id();
-    std::env::temp_dir().join(format!("bstack_bench_{prefix}_{pid}_{id}.bin"))
+    let safe: String = prefix
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    std::env::temp_dir().join(format!("bstack_bench_{safe}_{pid}_{id}.bin"))
 }
 
 fn setup_stack(cached: bool) -> (Arc<BStack>, std::path::PathBuf) {
@@ -41,14 +58,14 @@ fn bench_get(c: &mut Criterion) {
             b.iter(|| black_box(s.get(0, n as u64).unwrap()))
         });
         drop(s);
-        let _ = std::fs::remove_file(&path);
+        remove_tmp(&path);
 
         let (s, path) = setup_stack(true);
         group.bench_with_input(BenchmarkId::new("cache", read_size), &read_size, |b, &n| {
             b.iter(|| black_box(s.get(0, n as u64).unwrap()))
         });
         drop(s);
-        let _ = std::fs::remove_file(&path);
+        remove_tmp(&path);
     }
 
     group.finish();
@@ -68,7 +85,7 @@ fn bench_get_into(c: &mut Criterion) {
             })
         });
         drop(s);
-        let _ = std::fs::remove_file(&path);
+        remove_tmp(&path);
 
         let (s, path) = setup_stack(true);
         group.bench_with_input(BenchmarkId::new("cache", read_size), &read_size, |b, &n| {
@@ -78,7 +95,7 @@ fn bench_get_into(c: &mut Criterion) {
             })
         });
         drop(s);
-        let _ = std::fs::remove_file(&path);
+        remove_tmp(&path);
     }
 
     group.finish();
@@ -121,7 +138,7 @@ fn bench_get_concurrent(c: &mut Criterion, num_threads: usize) {
             });
         });
         drop(s);
-        let _ = std::fs::remove_file(&path);
+        remove_tmp(&path);
 
         let (s, path) = setup_stack(true);
         group.bench_with_input(BenchmarkId::new("cache", read_size), &read_size, |b, &n| {
@@ -149,7 +166,7 @@ fn bench_get_concurrent(c: &mut Criterion, num_threads: usize) {
             });
         });
         drop(s);
-        let _ = std::fs::remove_file(&path);
+        remove_tmp(&path);
     }
 
     group.finish();
