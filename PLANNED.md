@@ -40,21 +40,37 @@ Furthermore, `alloc`, `realloc`, and `dealloc` in the `BStackAllocator` trait do
 
 The default allocators in this crate (e.g., `FirstFitBStackAllocator`) currently use `BStackSlice` as their raw handle type. Because `BStackSlice` exposes safe `subslice` and `subslice_range` methods, it is possible to produce a slice with an origin that does not correspond to any allocator-returned allocation and then pass it to `realloc` or `dealloc`, violating the origin requirement without any `unsafe` block at the call site. A dedicated newtype handle, constructible only by the allocator, closes this gap at the type level: it can be cheaply dereferenced to `BStackSlice` for reads and writes, but `BStackSlice` cannot be converted back into it, so sub-slices are statically prevented from being used as allocator handles.
 
+A fuller redesign — described below — also reconsiders the roles of `BStackSlice` and the allocated handle type more broadly. The two types serve different purposes and should have different capabilities and ownership semantics to reflect that.
+
 ### Design
 
-Introduce a newtype (e.g., `BStackAllocatedSlice`) in each default allocator, wrapping `BStackSlice`. `BStackAllocatedSlice` would:
+#### Allocated handle type
 
-- Implement `Deref<Target = BStackSlice>` or `AsRef<BStackSlice>` for transparent access to slice operations.
-- Implement `Into<BStackSlice>` for explicit, cheap conversion when a raw slice is needed.
-- Not implement `From<BStackSlice>` — only the allocator internally constructs a `BStackAllocatedSlice`, ensuring origin is always valid.
-- Be the associated handle type returned by `alloc` and accepted by `realloc` and `dealloc`.
+Introduce an allocated handle type (name TBD — see Open questions) as the associated handle type returned by `alloc` and accepted by `realloc` and `dealloc`. This type represents ownership of a specific allocation and has the following properties:
 
-This is a breaking change for any code that holds the allocator's associated handle type explicitly or passes a `BStackSlice` directly to `realloc` or `dealloc`. Code that only reads or writes through a handle without storing it by concrete type is largely unaffected. Custom allocator implementations built outside this crate are not affected, as the trait itself does not mandate a specific handle type.
+- **Not `Copy`.** The handle represents a unique allocation. Allowing it to be copied would make it possible to call `dealloc` on one copy while the other remains in use, or to pass two copies to `realloc` independently, both corrupting allocator metadata. Non-`Copy` ensures the handle is consumed when the allocation is released or resized.
+- **No subslicing.** The handle does not expose `subslice` or `subslice_range`. A sub-range derived from an allocation is not itself an allocation, and preventing this at the type level closes the origin-requirement gap entirely without relying on documentation or convention.
+- **Lifetime tied to the allocation, not the allocator.** The handle's lifetime parameter expresses that the underlying region is valid for reads and writes, not that the allocator is borrowed. In practice, this means the handle holds `&'a A` where `'a` is the allocator borrow, but the semantic intent is that the region is live for `'a` — which is guaranteed as long as the allocator (and thus the backing `BStack`) is alive.
+- **Convertible to `BStackSlice` for I/O.** The handle can produce a `BStackSlice` for reading and writing the allocated region. This conversion is cheap (no allocation) and explicit.
+- **Unsafe construction from `(allocator, BStackSlice)`.** For advanced use cases — such as reconstructing a handle from a serialized offset/length pair — an `unsafe` constructor takes an allocator reference and a `BStackSlice` and produces a handle. The caller must ensure the slice describes a valid, allocator-owned region.
+
+#### `BStackSlice` without allocator pointer
+
+`BStackSlice` currently carries a generic allocator reference `&'a A`. Since `BStackSlice` cannot directly call `realloc` or `dealloc` (those require the allocated handle type), it does not need to know the allocator's type. It only needs access to the backing `BStack` for I/O — and it should continue to carry a `&'a BStack` reference for exactly that purpose. Replacing `&'a A` with `&'a BStack` directly would:
+
+- Simplify the type signature from `BStackSlice<'a, A>` to `BStackSlice<'a>`, removing the allocator type parameter entirely.
+- Allow `BStackSlice` to be used across allocators or outside any allocator context, since the `&'a BStack` reference is sufficient for all read and write operations the slice needs to perform.
+- Make the role of `BStackSlice` clearer: it is a view, not a handle. Like `&[u8]`, it is `Copy`, has no ownership, and carries no allocation identity.
+
+The lifetime of a `BStackSlice` should tie to the stack (or the allocation it was derived from), but this is enforced by the context — the allocator or the allocated handle — rather than by `BStackSlice` itself. This is a known limitation: the crate cannot statically enforce that a `BStackSlice` does not outlive its allocation, since allocations have no RAII drop and the file is not memory. The allocated handle type is the mechanism for expressing allocation identity; `BStackSlice` is not.
+
+This is a larger breaking change than the handle type alone, as it touches every existing use of `BStackSlice<'a, A>`.
 
 ### Open questions
 
-- Should the new handle type be named `BStackAllocatedSlice`, or something more concise like `BStackHandle`? The former emphasizes the slice nature, while the latter is more general and concise. However, we also need to consider that there will be custom allocators that may want to define their own handle types, so a more generic name like `BStackHandle` might be too generic and could cause confusion if multiple handle types are in scope. 
-- Should the new handle type have a unsafe method that allows backwards conversion to `BStackSlice` for advanced use cases, or should it be strictly one-way? Allowing an unsafe conversion could provide flexibility for advanced users who understand the risks, but it also introduces potential for misuse. If we choose to allow it, we would need to clearly document the safety contract and ensure that it is only used in scenarios where the caller can guarantee that the resulting `BStackSlice` is not misused as a sub-slice.
+- **Handle type name.** The name should clearly distinguish the handle from `BStackSlice` and signal that it represents an allocation, not just a region. Candidates include `BStackAlloc`, `BStackBlock`, or `BStackRegion`. The name should not suggest it is a slice (to avoid confusion with subslicing) and should not be so generic that it clashes with custom allocator handle types.
+- **Whether to remove the allocator pointer from `BStackSlice`.** This is the more invasive part of the redesign. It may be worth doing as a separate change or deferring until the allocated handle type is stable. If deferred, `BStackSlice` retains `&'a A` temporarily, with a planned migration.
+- **Unsafe back-conversion.** Should the allocated handle expose an `unsafe` method to recover a `BStackSlice` with no allocator type attached? This would be useful for serialization and low-level introspection, but requires the caller to uphold the origin invariant manually.
 
 ---
 
