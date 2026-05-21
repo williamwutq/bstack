@@ -404,17 +404,25 @@ impl<'a, A: BStackSliceAllocator> BStackByteVec<'a, A> {
 
     /// Return the underlying block slice (header + all allocated byte space).
     ///
-    /// This is the original allocation handle and may be passed to
-    /// [`crate::BStackAllocator::realloc`] or [`crate::BStackAllocator::dealloc`].
+    /// This is the current allocation handle. If you need to take ownership of
+    /// that allocation in order to pass it to
+    /// [`crate::BStackAllocator::realloc`] or [`crate::BStackAllocator::dealloc`],
+    /// first consume the vec with [`BStackByteVec::into_raw_block`].
     ///
     /// # Safety
     ///
-    /// The caller must ensure that the returned handle is not used after any
-    /// reallocation of this vec occurs.  Any call that may reallocate (`push`,
-    /// `reserve`, `resize`) invalidates previously returned handles: using a
-    /// stale handle with `realloc` or `dealloc` can corrupt allocator state or
-    /// lose data.  Re-fetch with `raw_block()` after any mutation that may
-    /// reallocate.
+    /// The caller must ensure that the allocation remains owned by this
+    /// `BStackByteVec` for as long as the vec may still be used. In particular,
+    /// the returned handle must not be passed to `dealloc`, `realloc`, or used
+    /// in any other way that invalidates or transfers ownership of the
+    /// allocation while this vec is still alive and accessible.
+    ///
+    /// The caller must also ensure that the returned handle is not used after
+    /// any reallocation of this vec occurs. Any call that may reallocate
+    /// (`push`, `reserve`, `resize`) invalidates previously returned handles:
+    /// using a stale handle with `realloc` or `dealloc` can corrupt allocator
+    /// state or lose data. Re-fetch with `raw_block()` after any mutation that
+    /// may reallocate.
     pub unsafe fn raw_block(&self) -> BStackSlice<'a, A> {
         self.slice
     }
