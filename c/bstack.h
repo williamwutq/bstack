@@ -138,6 +138,8 @@ uint64_t bstack_locked_len(bstack_t *bs);
  * all write and shrink operations that would touch [0, n) return EINVAL.
  * Acquires the exclusive write lock to ensure all in-flight writes to
  * [0, n) have completed before the region is declared immutable.
+ * Note: on stacks opened with bstack_open_cached, this call also fills the
+ * in-memory cache and is therefore significantly more expensive.
  * Returns EINVAL if n is less than the current locked length (partition can
  * only grow) or if n exceeds the current payload length.
  */

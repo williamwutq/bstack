@@ -141,7 +141,7 @@
 //! | `swap`, `swap_into`, `cas` *(features: set+atomic)* | write | write |
 //! | `process` *(features: set+atomic)* | write | write |
 //! | `replace` *(feature: atomic)* | write | write |
-//! | `peek`, `peek_into`, `get`, `get_into` | **read** (or **none** for ranges entirely within the locked region) | write |
+//! | `peek`, `peek_into`, `get`, `get_into` | **read** | write |
 //! | `len` | read | read |
 //!
 //! On Unix and Windows, `peek`, `peek_into`, `get`, and `get_into` use a
@@ -149,9 +149,10 @@
 //! `OVERLAPPED` on Windows) that does not modify the file-position cursor.
 //! This allows multiple concurrent calls to any of these methods to run in
 //! parallel while any ongoing `push`, `pop`, or `pop_into` still serialises
-//! all writers via the write lock.  When a read range lies entirely within
-//! the [locked region](#locked-region-lock_up_to), the rwlock is bypassed
-//! altogether — see that section for the concurrency model.
+//! all writers via the write lock.  For [`get`](BStack::get) and
+//! [`get_into`](BStack::get_into), reads that lie entirely within the
+//! [locked region](#locked-region-lock_up_to) bypass the rwlock — see that
+//! section for the concurrency model.
 //!
 //! On other platforms a seek is required, so `peek`, `peek_into`, `get`, and
 //! `get_into` fall back to the write lock and all reads serialise.
@@ -177,14 +178,15 @@
 //!
 //! ## Effects
 //!
-//! * **RwLock-free reads.**  When [`get`](BStack::get),
-//!   [`get_into`](BStack::get_into), or [`peek_into`](BStack::peek_into) are
-//!   called with a range that lies entirely within the locked region, the
-//!   internal `RwLock` is bypassed.  On cached stacks the read is served from
-//!   the in-memory buffer (under a `Mutex`); on non-cached stacks it falls
-//!   through to `pread(2)` (Unix) or `ReadFile` + `OVERLAPPED` (Windows)
-//!   without holding the `RwLock`.  The `fstat` size check is skipped too —
-//!   the locked length is a sufficient upper bound.
+//! * **`get`/`get_into` fast-path reads.**  When [`get`](BStack::get) or
+//!   [`get_into`](BStack::get_into) are called with a range that lies entirely
+//!   within the locked region, the internal `RwLock` is bypassed.
+//!   - On **non-cached** stacks (Unix/Windows), reads are lock-free and use
+//!     `pread(2)` (Unix) or `ReadFile` + `OVERLAPPED` (Windows).
+//!   - On **cached** stacks (all platforms), reads are served from the
+//!     in-memory buffer under a `Mutex` (so RwLock-free, but not lock-free).
+//!   The `fstat` size check is skipped on this path — the locked length is a
+//!   sufficient upper bound.
 //!
 //! * **Write protection.**  [`set`](BStack::set), [`zero`](BStack::zero),
 //!   [`swap`](BStack::swap), [`swap_into`](BStack::swap_into),
@@ -207,8 +209,8 @@
 //! ## Concurrency model
 //!
 //! `lock_up_to(n)` acquires the exclusive write lock before publishing the
-//! new boundary with a `Release` store.  Lock-free readers `Acquire`-load
-//! `locked` before each call.  Two consequences follow:
+//! new boundary with a `Release` store.  Locked-region fast-path readers
+//! `Acquire`-load `locked` before each call.  Two consequences follow:
 //!
 //! * A stale load is always safe.  If a reader sees an older (smaller)
 //!   `locked` value, it falls through to the rwlock path; if it sees a
@@ -241,9 +243,8 @@
 //! # }
 //! ```
 //!
-//! On platforms other than Unix and Windows the boundary still enforces
-//! immutability through the rwlock path; only the lock-free read fast path
-//! is platform-gated.
+//! On cached stacks this locked-region fast path is available on all
+//! platforms (served from the cache under a `Mutex`).
 //!
 //! # Standard I/O adapters
 //!
@@ -1109,22 +1110,6 @@ impl BStack {
                 "peek_into: offset + len overflows u64",
             )
         })?;
-        // Fast-path: locked region is immutable — serve from cache or pread.
-        #[cfg(any(unix, windows))]
-        {
-            let locked = self.locked.load(Ordering::Acquire);
-            if end <= locked {
-                if self.cache_enabled {
-                    let cache = self.cache.lock().unwrap();
-                    buf.copy_from_slice(&cache[offset as usize..end as usize]);
-                    return Ok(());
-                }
-                #[cfg(unix)]
-                return pread_exact_raw(self.fd, HEADER_SIZE + offset, buf);
-                #[cfg(windows)]
-                return pread_exact_raw_handle(self.handle, HEADER_SIZE + offset, buf);
-            }
-        }
         #[cfg(any(unix, windows))]
         {
             let file = self.lock.read().unwrap();
@@ -1141,12 +1126,6 @@ impl BStack {
         }
         #[cfg(not(any(unix, windows)))]
         {
-            let locked = self.locked.load(Ordering::Acquire);
-            if end <= locked && self.cache_enabled {
-                let cache = self.cache.lock().unwrap();
-                buf.copy_from_slice(&cache[offset as usize..end as usize]);
-                return Ok(());
-            }
             let mut file = self.lock.write().unwrap();
             let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
             if end > data_size {
@@ -2122,8 +2101,9 @@ impl BStack {
     ///
     /// The locked region is `[0, locked_len())`.  All bytes within this range
     /// are permanently immutable: writes and shrink operations that would
-    /// touch them return [`io::ErrorKind::InvalidInput`], and reads to ranges
-    /// entirely within it skip the rwlock on Unix and Windows.
+    /// touch them return [`io::ErrorKind::InvalidInput`]. For
+    /// [`get`](Self::get) and [`get_into`](Self::get_into), reads to ranges
+    /// entirely within it skip the rwlock.
     pub fn locked_len(&self) -> u64 {
         self.locked.load(Ordering::Acquire)
     }
@@ -2131,9 +2111,11 @@ impl BStack {
     /// Extend the locked region to cover `[0, n)`.
     ///
     /// `n` must be ≥ the current locked length and ≤ the current payload
-    /// length.  After this call, reads to `[0, n)` are lock-free on Unix and
-    /// Windows, and all write and shrink operations that would touch `[0, n)`
-    /// return [`io::ErrorKind::InvalidInput`].
+    /// length. After this call, [`get`](Self::get) and
+    /// [`get_into`](Self::get_into) reads to `[0, n)` skip the rwlock
+    /// (lock-free on non-cached Unix/Windows stacks; cache-backed under a
+    /// `Mutex` on cached stacks), and all write and shrink operations that
+    /// would touch `[0, n)` return [`io::ErrorKind::InvalidInput`].
     ///
     /// Acquires the exclusive write lock to ensure all in-flight writes to
     /// `[0, n)` have completed before the region is declared immutable.

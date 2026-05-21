@@ -4212,6 +4212,14 @@ mod cache_tests {
         (BStack::open_cached(&path).unwrap(), path)
     }
 
+    fn mk_uncached() -> (BStack, std::path::PathBuf) {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        let path = std::env::temp_dir().join(format!("bstack_cache_test_uncached_{pid}_{id}.bin"));
+        (BStack::open(&path).unwrap(), path)
+    }
+
     struct Guard(std::path::PathBuf);
     impl Drop for Guard {
         fn drop(&mut self) {
@@ -4280,12 +4288,8 @@ mod cache_tests {
         cached.push(&data).unwrap();
         cached.lock_up_to(data.len() as u64).unwrap();
 
-        let path2 = std::env::temp_dir().join(format!(
-            "bstack_cache_test_uncached_{}.bin",
-            std::process::id()
-        ));
-        let uncached = BStack::open(&path2).unwrap();
-        let _gu = Guard(path2);
+        let (uncached, up) = mk_uncached();
+        let _gu = Guard(up);
         uncached.push(&data).unwrap();
         uncached.lock_up_to(data.len() as u64).unwrap();
 

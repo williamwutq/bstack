@@ -307,13 +307,14 @@ cached stacks (it must read up to `n` bytes from disk before returning).
 
 ### What changes when bytes are locked
 
-* **RwLock-free reads.**  `get`, `get_into`, and `peek_into` calls whose
-  range lies entirely within the locked region bypass the internal `RwLock`.
-  On cached stacks the read is served from the in-memory buffer (under a
-  `Mutex`); on non-cached stacks it falls through to `pread(2)` (Unix) or
-  `ReadFile` + `OVERLAPPED` (Windows) without holding the `RwLock`.  The
-  `fstat` size check is skipped too — the locked length is a sufficient
-  upper bound.
+* **`get`/`get_into` fast-path reads.**  Calls whose range lies entirely
+  within the locked region bypass the internal `RwLock`.
+  - On **non-cached** stacks (Unix/Windows), the read is lock-free and uses
+    `pread(2)` (Unix) or `ReadFile` + `OVERLAPPED` (Windows).
+  - On **cached** stacks (all platforms), the read is served from the
+    in-memory buffer under a `Mutex` (so RwLock-free, but not lock-free).
+  The locked length remains a sufficient upper bound, so no extra payload-size
+  check is needed on this path.
 * **Write protection.**  `set`, `zero`, `swap`, `swap_into`, `cas`,
   `process`, `atrunc`, `splice`, `splice_into`, and `replace` return
   `InvalidInput` if their target overlaps the locked region.
@@ -342,7 +343,7 @@ assert!(stack.pop(stack.len()? - 60).is_err()); // would shrink below locked
 
 ### Concurrency
 
-`lock_up_to(n)` takes the write lock and publishes the new boundary with a `Release` store. Lock-free readers `Acquire`-load the boundary; a stale load safely falls through to the rwlock path. Writers re-check under the write lock and cannot race against an in-flight `lock_up_to`. On other platforms the boundary still enforces immutability; only the lock-free read path is platform-gated.
+`lock_up_to(n)` takes the write lock and publishes the new boundary with a `Release` store. Locked-region fast-path readers `Acquire`-load the boundary; a stale load safely falls through to the rwlock path. Writers re-check under the write lock and cannot race against an in-flight `lock_up_to`. On cached stacks this fast path is available on all platforms via the cache `Mutex`; on non-cached stacks the lock-free path is Unix/Windows-only.
 
 ---
 
