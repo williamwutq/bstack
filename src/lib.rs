@@ -2177,8 +2177,24 @@ impl BStack {
         // boundary.  `locked` is only advanced after the cache is consistent,
         // so readers always see a coherent view.
         if self.cache_enabled && n > current_locked {
-            let ol = current_locked as usize;
-            let nl = n as usize;
+            // On 32-bit targets usize < u64, so very large regions cannot be
+            // cached.  Validate before casting to avoid silent truncation or a
+            // panic inside next_power_of_two.
+            if n > usize::MAX as u64 {
+                return Err(io::Error::new(
+                    io::ErrorKind::OutOfMemory,
+                    "lock_up_to: locked region too large to cache on this platform",
+                ));
+            }
+            let ol = current_locked as usize; // safe: <= n, which was just validated
+            let nl = n as usize; // safe: checked above
+            // next_power_of_two overflows when nl > 1 << (usize::BITS - 1).
+            if nl > 1usize << (usize::BITS - 1) {
+                return Err(io::Error::new(
+                    io::ErrorKind::OutOfMemory,
+                    "lock_up_to: locked region too large to cache on this platform",
+                ));
+            }
             let mut cache = self.cache.lock().unwrap();
 
             if nl > cache.capacity() {

@@ -265,7 +265,10 @@ static void close_fd(bstack_fd_t fd)
  * Cache helpers
  * ---------------------------------------------------------------------- */
 
-/* Round n up to the next power of two (returns 1 for n == 0). */
+/* Round n up to the next power of two.
+ * Returns 1 for n == 0.
+ * Returns 0 on overflow (input > 2^63; next power of two would be 2^64).
+ * Callers must treat a 0 return as an error (ENOMEM / EINVAL). */
 static uint64_t next_pow2_u64(uint64_t n)
 {
     if (n == 0) return 1;
@@ -276,6 +279,8 @@ static uint64_t next_pow2_u64(uint64_t n)
     n |= n >> 8;
     n |= n >> 16;
     n |= n >> 32;
+    /* If all bits are set the true next power of two is 2^64, which overflows. */
+    if (n == UINT64_MAX) return 0;
     return n + 1;
 }
 
@@ -886,6 +891,12 @@ int bstack_lock_up_to(bstack_t *bs, uint64_t n)
              * locked is unchanged and old cache remains valid for [0..ol]. */
             uint64_t new_cap = next_pow2_u64(nl);
             uint8_t *new_buf;
+            if (new_cap == 0) { /* overflow: nl > 2^63 */
+                CACHE_UNLOCK(bs);
+                BS_WRUNLOCK(bs);
+                errno = ENOMEM;
+                return -1;
+            }
 #if UINT64_MAX > SIZE_MAX
             if (new_cap > (uint64_t)SIZE_MAX) {
                 CACHE_UNLOCK(bs);
