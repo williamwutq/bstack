@@ -12,6 +12,16 @@ Reasons:
 
 `BStackGuardedSlice::as_slice` is not actually unsafe as data corruption through misuse doesn't violate memory safety or compromise allocator structure, so marking it unsafe would be misleading per Rust conventions. Documentation and API design already encourage using `read()` and `write()`. Callers using `as_slice()` are expected to understand the implications. In addition, the unsafe `raw_block()` method already exists for cases where hook bypass is needed, and its safety contract documents that hooks must be manually called. If this function is deprecated, it would break existing code, and callers who correctly use `as_slice()` for read-only purposes would need to migrate. Therefore, `as_slice()` as a safe function that returns a `BStackSlice` is sufficient, and the safety contract can be clearly documented without making it `unsafe fn`.
 
+### Replacing `std::sync::RwLock` with `parking_lot::RwLock` or `usync::RwLock`
+
+Reasons:
+
+There are insufficient evidences that changing the implementation of RwLock will bring sufficient performance improvements to `BStack`. `std::sync::RwLock` remains the default. On Linux, `std` wins 10/14 benchmarks, often by 20–30% on write-heavy operations which dominate real workloads. The wins for `parking_lot` and `usync` are limited to fast read-path operations (`peek`, `get`, `len`) which are not the bottleneck.
+
+For context, accepted optimizations like caching and locked region have demonstrated **~2-10× improvements**. The gains shown here do not meet that bar and introduce an additional dependency without a compelling cross-platform case.
+
+Reference: https://github.com/williamwutq/bstack/pull/3
+
 ### Making `BStackAllocator::realloc` and `dealloc` `unsafe fn`
 
 Reasons:
@@ -212,57 +222,4 @@ When capacity is exceeded, `BStackVec` would use the `BStack`'s `realloc` to gro
 - **Error handling:** Should methods return `Result` for all operations, or should some (e.g., `len()`, `capacity()`) be infallible? Returning `Result` allows for better error propagation but may be more verbose for simple accessors.
 - **Initialization of new elements:** When growing the vector, should new elements be zero-initialized, left uninitialized (i.e. `MaybeUninit`), or should we require `T` to be `Default` and call `default()`? Zero-initialization is safer and guranteed for newly allocated space, but may be unnecessary overhead for some types.
 - **Zeroing on deallocation:** Should empty parts of the vector be zeroed on deallocation for security, or should this be left to the caller? Zeroing adds overhead but can prevent data leakage.
-
----
-
-## Replacing `std::sync::RwLock` with `parking_lot::RwLock` or `usync::RwLock`
-
-**Feature flag:** `parking_lot` (opt-in) or hard dependency (TBD — see Open questions)
-**Breaking change:** No (the lock is a private field; the public API is unchanged)
-
-### Motivation
-
-`BStack` uses `std::sync::RwLock<File>` as its central concurrency primitive. There are over 30 call sites of the form `self.lock.write().unwrap()` and `self.lock.read().unwrap()` across `src/lib.rs`. Three issues motivate replacing it:
-
-1. **Platform-dependent fairness.** The standard library's `RwLock` delegates to the OS. On Linux (pthreads) it is writer-biased; on macOS (also pthreads but with different defaults) behavior may differ. Because `BStack` is write-heavy — nearly every mutation takes an exclusive write lock — an unexpected fairness policy can cause reader starvation or writer convoy effects that are hard to reproduce across platforms.
-
-2. **Panic poisoning overhead.** `std::sync::RwLock` poisons itself when a thread panics while holding a lock, which is why every acquisition ends in `.unwrap()`. In practice `BStack` never panics while holding the lock, so this check is pure overhead at every call site and adds noise to the error-handling story. Both `parking_lot` and `usync` drop poisoning entirely: acquiring the lock returns a guard directly, not a `LockResult`.
-
-3. **Raw lock performance.** In high-contention workloads, `parking_lot`'s queue-based algorithm and `usync`'s word-lock implementation outperform the OS primitive measurably on microbenchmarks. Because the locked-region fast path already bypasses the `RwLock` for immutable reads, the `RwLock` is exercised primarily on the write path, where latency per acquisition matters more than throughput.
-
-Both candidate crates implement [`lock_api`](https://crates.io/crates/lock_api), so their `RwLock` types expose an identical API to the call sites. The migration is a search-and-replace of the `use` import and the `lock` field type; no logic changes are needed.
-
-### Migration plan
-
-1. Add the chosen crate as a dependency in `Cargo.toml`. If introduced as an optional feature, gate it behind e.g. `parking_lot = ["dep:parking_lot"]` and use `#[cfg(feature = "parking_lot")]` to conditionally select the lock type.
-2. Replace `use std::sync::RwLock;` with `use parking_lot::RwLock;` (or `use usync::RwLock;`).
-3. Replace every `self.lock.write().unwrap()` with `self.lock.write()` and every `self.lock.read().unwrap()` with `self.lock.read()`, since neither crate returns a `LockResult`.
-4. Update the crate-level doc comment that references `std::sync::RwLock` (`src/lib.rs:132`).
-5. Update `src/alloc/debug_checking.rs` to replace `std::sync::Mutex` with `parking_lot::Mutex` (or `usync::Mutex`) for consistency, if the chosen crate is made a hard dependency.
-6. Verify that `BStack: Send + Sync` still holds — both crates' lock types implement `Send + Sync` when `T: Send`, so no manual unsafe impl is needed.
-
-### Benchmarking requirements
-
-This change must be validated with **extensive performance benchmarking** before it is merged. Replacing the lock is not free: adding a new dependency, changing fairness semantics, and altering the spin/park tradeoff all have real effects that vary by workload, thread count, and platform. Benchmarks must cover the following axes:
-
-**What to benchmark:**
-
-- **Lock microbenchmarks:** uncontested and contended lock acquisition in isolation, and single- vs. multi-threaded push throughput at varying thread counts. These establish the baseline cost of the lock swap independent of any higher-level behavior.
-- **Stack operations (`set` disabled):** `BStack` as a pure append-only stack, where the lock is acquired and released on every operation. This is the simplest and most direct signal of per-acquisition overhead.
-- **Atomic compound operations (`atomic` feature):** operations such as `atrunc`, `splice`, and `try_extend`/`try_discard` hold the write lock for longer than a single push. The lock replacement has a proportionally larger effect here and the fairness policy matters more under contention.
-- **Allocator workloads (`alloc` feature):** `FirstFitBStackAllocator` alloc/realloc/dealloc cycles, single- and multi-threaded. Each allocator operation translates into multiple underlying `BStack` calls, compounding the per-acquisition cost.
-
-**Platforms:** Linux (x86-64), macOS (Apple Silicon), and Windows (x86-64). All three are required. `std::sync::RwLock` is backed by SRW locks on Windows rather than pthreads, so its baseline characteristics differ fundamentally from Unix; the relative gain from the replacement crates may not match the Unix results and must be verified independently.
-
-**Comparison baseline:** all three lock implementations — `std::sync::RwLock`, `parking_lot::RwLock`, and `usync::RwLock` — must be compared in the same benchmark run using Criterion's statistical analysis. Raw numbers without significance testing are not sufficient to justify the dependency addition.
-
-**Acceptance criterion:** the chosen replacement must show no regression on the single-threaded baseline and a measurable improvement on at least the low-concurrency mixed-workload scenario on all three platforms before the change is merged.
-
-### Open questions
-
-- **Hard dependency vs feature flag.** Making `parking_lot` or `usync` a hard dependency keeps the code uniform (no `#[cfg]` clutter) but adds a transitive dependency for all users of the crate. A feature flag is opt-in but means the `unwrap()` calls remain on the default path. Given that `BStack` already has platform-specific `libc` / `windows-sys` dependencies and the chosen lock crate would be small and stable, a hard dependency may be acceptable.
-- **Which crate to adopt.** This should be decided by the benchmark results, not by prior assumption. If one consistently outperforms the other on the access patterns described above, it is the better choice.
-- **Should lock implementation be conditional on platform?** If one crate performs better on Unix and the other on Windows, should we conditionally compile different locks per platform, or choose the best overall performer for simplicity?
-- **Mutex in `DebugCheckingBStackAllocator`.** The `Mutex` in `src/alloc/debug_checking.rs` is used only in debug/test builds. It may be worth replacing it for consistency, but it has no performance impact. Decide whether to include it in the same PR or defer.
-- **`deadlock_detection` in CI.** `parking_lot` offers a `deadlock_detection` feature that can be enabled in debug builds to detect lock-order violations. If `parking_lot` is chosen, consider enabling this in CI to catch future deadlocks early.
 
