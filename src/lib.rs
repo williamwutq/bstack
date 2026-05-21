@@ -434,8 +434,8 @@ use std::fs::{File, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
-use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, RwLock};
 
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
@@ -701,6 +701,13 @@ pub struct BStack {
     /// `Send + Sync`.  Same lifetime guarantee as `fd` above.
     #[cfg(windows)]
     handle: isize,
+    /// Whether in-memory caching of the locked region is enabled.
+    /// Set once at construction; never mutated afterwards.
+    cache_enabled: bool,
+    /// In-memory mirror of `[0, locked)`.  Empty until the first `lock_up_to`
+    /// call on a cached stack.  Capacity follows a power-of-two growth rule;
+    /// `self.locked` is the count of valid bytes within the buffer.
+    cache: Mutex<Vec<u8>>,
 }
 
 // `BStack` is auto-`Send + Sync` on every platform: all fields
@@ -783,6 +790,8 @@ impl BStack {
             handle,
             lock: RwLock::new(file),
             locked: AtomicU64::new(0),
+            cache_enabled: false,
+            cache: Mutex::new(Vec::new()),
         })
     }
 
@@ -984,23 +993,28 @@ impl BStack {
             ));
         }
         // Fast-path: if the range lies entirely within the locked region,
-        // skip the rwlock — locked bytes are immutable so no lock is needed.
-        #[cfg(unix)]
+        // serve from the in-memory cache (if enabled) or fall back to a
+        // lock-free pread — locked bytes are immutable so no rwlock needed.
+        #[cfg(any(unix, windows))]
         {
             let locked = self.locked.load(Ordering::Acquire);
             if end <= locked {
-                let mut buf = vec![0u8; (end - start) as usize];
-                pread_exact_raw(self.fd, HEADER_SIZE + start, &mut buf)?;
-                return Ok(buf);
-            }
-        }
-        #[cfg(windows)]
-        {
-            let locked = self.locked.load(Ordering::Acquire);
-            if end <= locked {
-                let mut buf = vec![0u8; (end - start) as usize];
-                pread_exact_raw_handle(self.handle, HEADER_SIZE + start, &mut buf)?;
-                return Ok(buf);
+                if self.cache_enabled {
+                    let cache = self.cache.lock().unwrap();
+                    return Ok(cache[start as usize..end as usize].to_vec());
+                }
+                #[cfg(unix)]
+                {
+                    let mut buf = vec![0u8; (end - start) as usize];
+                    pread_exact_raw(self.fd, HEADER_SIZE + start, &mut buf)?;
+                    return Ok(buf);
+                }
+                #[cfg(windows)]
+                {
+                    let mut buf = vec![0u8; (end - start) as usize];
+                    pread_exact_raw_handle(self.handle, HEADER_SIZE + start, &mut buf)?;
+                    return Ok(buf);
+                }
             }
         }
         #[cfg(any(unix, windows))]
@@ -1061,18 +1075,19 @@ impl BStack {
                 "peek_into: offset + len overflows u64",
             )
         })?;
-        // Fast-path: locked region is immutable, skip the rwlock.
-        #[cfg(unix)]
+        // Fast-path: locked region is immutable — serve from cache or pread.
+        #[cfg(any(unix, windows))]
         {
             let locked = self.locked.load(Ordering::Acquire);
             if end <= locked {
+                if self.cache_enabled {
+                    let cache = self.cache.lock().unwrap();
+                    buf.copy_from_slice(&cache[offset as usize..end as usize]);
+                    return Ok(());
+                }
+                #[cfg(unix)]
                 return pread_exact_raw(self.fd, HEADER_SIZE + offset, buf);
-            }
-        }
-        #[cfg(windows)]
-        {
-            let locked = self.locked.load(Ordering::Acquire);
-            if end <= locked {
+                #[cfg(windows)]
                 return pread_exact_raw_handle(self.handle, HEADER_SIZE + offset, buf);
             }
         }
@@ -1135,18 +1150,19 @@ impl BStack {
                 "get_into: start + len overflows u64",
             )
         })?;
-        // Fast-path: locked region is immutable, skip the rwlock.
-        #[cfg(unix)]
+        // Fast-path: locked region is immutable — serve from cache or pread.
+        #[cfg(any(unix, windows))]
         {
             let locked = self.locked.load(Ordering::Acquire);
             if end <= locked {
+                if self.cache_enabled {
+                    let cache = self.cache.lock().unwrap();
+                    buf.copy_from_slice(&cache[start as usize..end as usize]);
+                    return Ok(());
+                }
+                #[cfg(unix)]
                 return pread_exact_raw(self.fd, HEADER_SIZE + start, buf);
-            }
-        }
-        #[cfg(windows)]
-        {
-            let locked = self.locked.load(Ordering::Acquire);
-            if end <= locked {
+                #[cfg(windows)]
                 return pread_exact_raw_handle(self.handle, HEADER_SIZE + start, buf);
             }
         }
@@ -2100,6 +2116,53 @@ impl BStack {
                 format!("lock_up_to: n ({n}) exceeds payload size ({data_size})"),
             ));
         }
+        // Populate or extend the in-memory cache before publishing the new
+        // boundary.  `locked` is only advanced after the cache is consistent,
+        // so readers always see a coherent view.
+        if self.cache_enabled && n > current_locked {
+            let ol = current_locked as usize;
+            let nl = n as usize;
+            let mut cache = self.cache.lock().unwrap();
+
+            if nl > cache.capacity() {
+                // Reallocating: build a fresh Vec with power-of-2 capacity,
+                // copy the existing valid bytes, read the new portion from disk.
+                // On read failure new_cache is dropped; self.locked is unchanged
+                // and the old cache remains valid for [0..ol].
+                let new_cap = nl.next_power_of_two();
+                let mut new_cache = Vec::with_capacity(new_cap);
+                new_cache.extend_from_slice(&cache[..ol]);
+                new_cache.resize(nl, 0u8);
+                #[cfg(unix)]
+                pread_exact_raw(self.fd, HEADER_SIZE + ol as u64, &mut new_cache[ol..nl])?;
+                #[cfg(windows)]
+                pread_exact_raw_handle(
+                    self.handle,
+                    HEADER_SIZE + ol as u64,
+                    &mut new_cache[ol..nl],
+                )?;
+                *cache = new_cache;
+            } else {
+                // Non-reallocating: extend the Vec in-place and read the new
+                // portion.  On read failure, truncate back to the old length.
+                cache.resize(nl, 0u8);
+                #[cfg(unix)]
+                if let Err(e) =
+                    pread_exact_raw(self.fd, HEADER_SIZE + ol as u64, &mut cache[ol..nl])
+                {
+                    cache.truncate(ol);
+                    return Err(e);
+                }
+                #[cfg(windows)]
+                if let Err(e) =
+                    pread_exact_raw_handle(self.handle, HEADER_SIZE + ol as u64, &mut cache[ol..nl])
+                {
+                    cache.truncate(ol);
+                    return Err(e);
+                }
+            }
+        }
+
         // Release store: all writes completed under the write lock above are
         // visible to any thread that subsequently loads `locked` with Acquire.
         self.locked.store(n, Ordering::Release);
@@ -2121,6 +2184,40 @@ impl BStack {
     /// the opened file.
     pub fn open_locked_up_to(path: impl AsRef<Path>, n: u64) -> io::Result<Self> {
         let stack = Self::open(path)?;
+        stack.lock_up_to(n)?;
+        Ok(stack)
+    }
+
+    /// Open or create a stack file at `path` with the in-memory locked-region
+    /// cache enabled.
+    ///
+    /// Behaves identically to [`open`](Self::open) in all other respects.
+    /// Once the cache is enabled, each subsequent [`lock_up_to`](Self::lock_up_to)
+    /// call reads the newly locked bytes from disk into a heap buffer so that
+    /// future reads whose range falls entirely within the locked region are
+    /// served by copying from that buffer with no syscall.
+    ///
+    /// # Errors
+    ///
+    /// Propagates all errors from [`open`](Self::open).
+    pub fn open_cached(path: impl AsRef<Path>) -> io::Result<Self> {
+        let mut stack = Self::open(path)?;
+        stack.cache_enabled = true;
+        Ok(stack)
+    }
+
+    /// Open a cached `BStack` and immediately lock the first `n` bytes.
+    ///
+    /// Equivalent to [`open_cached`](Self::open_cached) followed by
+    /// [`lock_up_to`](Self::lock_up_to), but expressed as a single call.
+    ///
+    /// # Errors
+    ///
+    /// Propagates all errors from [`open_cached`](Self::open_cached).
+    /// Returns [`io::ErrorKind::InvalidInput`] if `n` exceeds the payload
+    /// length of the opened file.
+    pub fn open_locked_up_to_cached(path: impl AsRef<Path>, n: u64) -> io::Result<Self> {
+        let stack = Self::open_cached(path)?;
         stack.lock_up_to(n)?;
         Ok(stack)
     }

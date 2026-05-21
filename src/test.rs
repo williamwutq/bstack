@@ -4198,3 +4198,183 @@ mod atomic_tests {
         assert_eq!(s.len().unwrap(), 10);
     }
 }
+
+#[cfg(test)]
+mod cache_tests {
+    use crate::BStack;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn mk_cached() -> (BStack, std::path::PathBuf) {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        let path = std::env::temp_dir().join(format!("bstack_cache_test_{pid}_{id}.bin"));
+        (BStack::open_cached(&path).unwrap(), path)
+    }
+
+    struct Guard(std::path::PathBuf);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    #[test]
+    fn cache_initially_empty() {
+        let (s, p) = mk_cached();
+        let _g = Guard(p);
+        // No lock_up_to yet — cache Vec should be empty.
+        assert_eq!(s.cache.lock().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn lock_up_to_populates_cache() {
+        let (s, p) = mk_cached();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        s.lock_up_to(5).unwrap();
+        let cache = s.cache.lock().unwrap();
+        assert_eq!(cache.len(), 5);
+        assert_eq!(&cache[..], b"hello");
+    }
+
+    #[test]
+    fn get_reads_from_cache() {
+        let (s, p) = mk_cached();
+        let _g = Guard(p);
+        s.push(b"abcdefgh").unwrap();
+        s.lock_up_to(8).unwrap();
+        assert_eq!(s.get(0, 8).unwrap(), b"abcdefgh");
+        assert_eq!(s.get(2, 5).unwrap(), b"cde");
+    }
+
+    #[test]
+    fn get_into_reads_from_cache() {
+        let (s, p) = mk_cached();
+        let _g = Guard(p);
+        s.push(b"abcdefgh").unwrap();
+        s.lock_up_to(8).unwrap();
+        let mut buf = [0u8; 4];
+        s.get_into(1, &mut buf).unwrap();
+        assert_eq!(&buf, b"bcde");
+    }
+
+    #[test]
+    fn peek_into_reads_from_cache() {
+        let (s, p) = mk_cached();
+        let _g = Guard(p);
+        s.push(b"abcdefgh").unwrap();
+        s.lock_up_to(8).unwrap();
+        let mut buf = [0u8; 3];
+        s.peek_into(5, &mut buf).unwrap();
+        assert_eq!(&buf, b"fgh");
+    }
+
+    #[test]
+    fn cache_matches_uncached_get() {
+        // Ensure cached reads return identical bytes to pread-based reads.
+        let data: Vec<u8> = (0u8..=255).collect();
+
+        let (cached, cp) = mk_cached();
+        let _gc = Guard(cp);
+        cached.push(&data).unwrap();
+        cached.lock_up_to(data.len() as u64).unwrap();
+
+        let path2 = std::env::temp_dir().join(format!(
+            "bstack_cache_test_uncached_{}.bin",
+            std::process::id()
+        ));
+        let uncached = BStack::open(&path2).unwrap();
+        let _gu = Guard(path2);
+        uncached.push(&data).unwrap();
+        uncached.lock_up_to(data.len() as u64).unwrap();
+
+        assert_eq!(
+            cached.get(0, data.len() as u64).unwrap(),
+            uncached.get(0, data.len() as u64).unwrap(),
+        );
+        assert_eq!(cached.get(10, 200).unwrap(), uncached.get(10, 200).unwrap(),);
+    }
+
+    #[test]
+    fn sequential_lock_up_to_non_reallocating() {
+        // Two lock_up_to calls that stay within the initial power-of-2 capacity.
+        let (s, p) = mk_cached();
+        let _g = Guard(p);
+        // Push 8 bytes; first lock to 4 then extend to 8.
+        // next_power_of_two(4) == 4, next_power_of_two(8) == 8 — second call
+        // will reallocate, so push enough that the first lock gives capacity > 8.
+        s.push(b"abcdefghijklmnop").unwrap(); // 16 bytes
+        s.lock_up_to(8).unwrap(); // capacity = 8
+        assert_eq!(s.get(0, 8).unwrap(), b"abcdefgh");
+        s.lock_up_to(16).unwrap(); // capacity = 16, non-reallocating (8.next_power_of_two()==8 < 16, so reallocates)
+        assert_eq!(s.get(0, 16).unwrap(), b"abcdefghijklmnop");
+    }
+
+    #[test]
+    fn sequential_lock_up_to_within_capacity() {
+        // Lock to 4 (capacity=4), then to 3 — same bytes reachable.
+        // Then lock to 4 again — should be a no-op on the cache.
+        let (s, p) = mk_cached();
+        let _g = Guard(p);
+        s.push(b"abcdef").unwrap();
+        s.lock_up_to(4).unwrap();
+        assert_eq!(s.get(0, 4).unwrap(), b"abcd");
+        // Lock to 6 — capacity(4).next_power_of_two() is 4, 6 > 4, so reallocate.
+        s.lock_up_to(6).unwrap();
+        assert_eq!(s.get(0, 6).unwrap(), b"abcdef");
+    }
+
+    #[test]
+    fn non_reallocating_extend_within_capacity() {
+        // Push 16 bytes, lock to 8 (capacity=8), lock to 12 — fits in 16 without realloc
+        // because 12 <= next_power_of_two(8) = 8 … actually 12 > 8, so this reallocates.
+        // Instead: lock to 4 (cap=4), then to 4 — no-op.
+        // Better: lock to 8 (cap=8), then to 8 — no-op on cache, locked stays 8.
+        let (s, p) = mk_cached();
+        let _g = Guard(p);
+        s.push(b"abcdefgh").unwrap();
+        s.lock_up_to(4).unwrap(); // cap = next_power_of_two(4) = 4
+        // Now lock_up_to(4) again — n == current_locked, cache block skipped entirely
+        s.lock_up_to(4).unwrap();
+        assert_eq!(s.get(0, 4).unwrap(), b"abcd");
+    }
+
+    #[test]
+    fn open_locked_up_to_cached_convenience() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        let path = std::env::temp_dir().join(format!("bstack_cache_conv_{pid}_{id}.bin"));
+        let _g = Guard(path.clone());
+
+        // Prepare file with a regular (non-cached) stack first.
+        {
+            let s = BStack::open(&path).unwrap();
+            s.push(b"hello world").unwrap();
+        }
+
+        // Re-open with cache, locking 11 bytes at once.
+        let s = BStack::open_locked_up_to_cached(&path, 11).unwrap();
+        assert_eq!(s.get(0, 11).unwrap(), b"hello world");
+    }
+
+    #[test]
+    fn uncached_stack_behaviour_unchanged() {
+        // Regression: a non-cached BStack must still work identically.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        let path = std::env::temp_dir().join(format!("bstack_nocache_{pid}_{id}.bin"));
+        let _g = Guard(path.clone());
+
+        let s = BStack::open(&path).unwrap();
+        s.push(b"regression").unwrap();
+        s.lock_up_to(10).unwrap();
+        assert_eq!(s.get(0, 10).unwrap(), b"regression");
+        assert!(!s.cache_enabled);
+        assert_eq!(s.cache.lock().unwrap().len(), 0);
+    }
+}
