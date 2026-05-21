@@ -223,3 +223,27 @@ When capacity is exceeded, `BStackVec` would use the `BStack`'s `realloc` to gro
 - **Initialization of new elements:** When growing the vector, should new elements be zero-initialized, left uninitialized (i.e. `MaybeUninit`), or should we require `T` to be `Default` and call `default()`? Zero-initialization is safer and guranteed for newly allocated space, but may be unnecessary overhead for some types.
 - **Zeroing on deallocation:** Should empty parts of the vector be zeroed on deallocation for security, or should this be left to the caller? Zeroing adds overhead but can prevent data leakage.
 
+---
+
+## Requiring `&mut BStackSlice` for mutation
+
+**Feature flag:** `set`
+**Breaking change:** Yes
+
+### Motivation
+
+All write methods on `BStackSlice` — `write`, `write_range`, `zero`, `zero_range`, `writer`, and `writer_at` — currently take `&self`. This is because `BStack` uses interior mutability (`RwLock<File>`), so no exclusive reference to the slice is needed at the Rust level to perform the underlying I/O. However, this means a shared, copied, or aliased `BStackSlice` can silently mutate the same region of the file from multiple places, with no indication at the call site that mutation is occurring. This is surprising and contrary to Rust conventions.
+
+Requiring `&mut self` for write methods makes mutation visible and explicit. It does not provide exclusive access to the underlying file region — `BStackSlice` is `Copy` and the file is shared — but it signals intent and prevents accidental mutation through a shared reference. It also lays the groundwork for future read-only slice types and borrow-checked slice access, where `&BStackSlice` and `&mut BStackSlice` could eventually carry stronger semantic guarantees.
+
+### Design
+
+Change the receiver of `write`, `write_range`, `zero`, `zero_range`, `writer`, and `writer_at` from `&self` to `&mut self`. Since `BStackSlice` is `Copy`, callers can always bind a local `mut` copy if needed — the change imposes no semantic restriction, only a mutability annotation.
+
+The same change applies to the corresponding methods on `BStackGuardedSlice`, and to any future slice types such as `BStackVec`.
+
+### Open questions
+
+- Should `writer` and `writer_at` also require `&mut self`, given that they return a `BStackSliceWriter` rather than performing any mutation themselves? Requiring `&mut self` here is consistent with the general principle but may feel overly strict for a constructor that merely captures the slice.
+- `BStackSliceWriter` is currently `Copy`. If `writer` requires `&mut self`, obtaining multiple writers from the same slice would require copying the slice first. Should `BStackSliceWriter` remain `Copy`, or should it be non-`Copy` to better reflect exclusive-write intent?
+
