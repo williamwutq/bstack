@@ -374,8 +374,14 @@ impl<'a, A: BStackSliceAllocator> BStackByteVec<'a, A> {
         if new_len <= len {
             return self.truncate(new_len);
         }
-        let count = (new_len - len) as usize;
-        self.reserve(new_len - len)?;
+        let additional = new_len - len;
+        self.reserve(additional)?;
+        let count = usize::try_from(additional).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "BStackByteVec::resize: growth exceeds usize",
+            )
+        })?;
         let fill: Vec<u8> = std::iter::repeat_n(value, count).collect();
         self.write_bytes_at(len, &fill)?;
         self.write_len_field(new_len)
