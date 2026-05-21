@@ -4297,17 +4297,16 @@ mod cache_tests {
     }
 
     #[test]
-    fn sequential_lock_up_to_non_reallocating() {
-        // Two lock_up_to calls that stay within the initial power-of-2 capacity.
+    fn sequential_lock_up_to_reallocating_growth() {
+        // Two lock_up_to calls where the second grows the cache capacity.
         let (s, p) = mk_cached();
         let _g = Guard(p);
-        // Push 8 bytes; first lock to 4 then extend to 8.
-        // next_power_of_two(4) == 4, next_power_of_two(8) == 8 — second call
-        // will reallocate, so push enough that the first lock gives capacity > 8.
+        // Push 16 bytes, lock to 8, then extend to 16.
+        // next_power_of_two(8) == 8, so locking up to 16 requires reallocation.
         s.push(b"abcdefghijklmnop").unwrap(); // 16 bytes
         s.lock_up_to(8).unwrap(); // capacity = 8
         assert_eq!(s.get(0, 8).unwrap(), b"abcdefgh");
-        s.lock_up_to(16).unwrap(); // capacity = 16, non-reallocating (8.next_power_of_two()==8 < 16, so reallocates)
+        s.lock_up_to(16).unwrap(); // capacity grows from 8 to 16, so this reallocates
         assert_eq!(s.get(0, 16).unwrap(), b"abcdefghijklmnop");
     }
 
