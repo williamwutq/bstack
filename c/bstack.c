@@ -77,13 +77,23 @@ struct bstack {
     bstack_fd_t fd;
 #ifdef _WIN32
     SRWLOCK          lock;
+    CRITICAL_SECTION cache_mutex;
 #else
     pthread_rwlock_t lock;
+    pthread_mutex_t  cache_mutex;
 #endif
     /* Monotonically growing partition boundary. Bytes in [0, locked) are
      * immutable and can be read without the rwlock on supported platforms.
      * Not persisted — resets to 0 on every open. */
     ATOMIC_UINT64_T locked;
+    /* In-memory mirror of [0, locked).  Only active when cache_enabled != 0.
+     * cache_buf is a malloc'd buffer of cache_cap bytes; the count of valid
+     * bytes equals bstack_locked_len().  Protected by cache_mutex.
+     * cache_buf/cache_cap are populated before locked is advanced so readers
+     * that Acquire-load locked always see a consistent buffer. */
+    int      cache_enabled;
+    uint8_t *cache_buf;
+    uint64_t cache_cap;
 };
 
 /* =========================================================================
@@ -240,12 +250,34 @@ static void close_fd(bstack_fd_t fd)
 #  define BS_WRLOCK(bs)    AcquireSRWLockExclusive(&(bs)->lock)
 #  define BS_RDUNLOCK(bs)  ReleaseSRWLockShared(&(bs)->lock)
 #  define BS_WRUNLOCK(bs)  ReleaseSRWLockExclusive(&(bs)->lock)
+#  define CACHE_LOCK(bs)   EnterCriticalSection(&(bs)->cache_mutex)
+#  define CACHE_UNLOCK(bs) LeaveCriticalSection(&(bs)->cache_mutex)
 #else
 #  define BS_RDLOCK(bs)    pthread_rwlock_rdlock(&(bs)->lock)
 #  define BS_WRLOCK(bs)    pthread_rwlock_wrlock(&(bs)->lock)
 #  define BS_RDUNLOCK(bs)  pthread_rwlock_unlock(&(bs)->lock)
 #  define BS_WRUNLOCK(bs)  pthread_rwlock_unlock(&(bs)->lock)
+#  define CACHE_LOCK(bs)   pthread_mutex_lock(&(bs)->cache_mutex)
+#  define CACHE_UNLOCK(bs) pthread_mutex_unlock(&(bs)->cache_mutex)
 #endif
+
+/* -------------------------------------------------------------------------
+ * Cache helpers
+ * ---------------------------------------------------------------------- */
+
+/* Round n up to the next power of two (returns 1 for n == 0). */
+static uint64_t next_pow2_u64(uint64_t n)
+{
+    if (n == 0) return 1;
+    n--;
+    n |= n >> 1;
+    n |= n >> 2;
+    n |= n >> 4;
+    n |= n >> 8;
+    n |= n >> 16;
+    n |= n >> 32;
+    return n + 1;
+}
 
 /* -------------------------------------------------------------------------
  * Little-endian helpers (positional — no cursor side-effects)
@@ -404,12 +436,23 @@ bstack_t *bstack_open(const char *path)
         close_fd(fd);
         return NULL;
     }
-    bs->fd = fd;
-    bs->locked = ATOMIC_INIT(0);
+    bs->fd            = fd;
+    bs->locked        = ATOMIC_INIT(0);
+    bs->cache_enabled = 0;
+    bs->cache_buf     = NULL;
+    bs->cache_cap     = 0;
 #ifdef _WIN32
     InitializeSRWLock(&bs->lock);
+    InitializeCriticalSection(&bs->cache_mutex);
 #else
     if (pthread_rwlock_init(&bs->lock, NULL) != 0) {
+        free(bs);
+        close(fd);
+        errno = ENOMEM;
+        return NULL;
+    }
+    if (pthread_mutex_init(&bs->cache_mutex, NULL) != 0) {
+        pthread_rwlock_destroy(&bs->lock);
         free(bs);
         close(fd);
         errno = ENOMEM;
@@ -427,7 +470,11 @@ void bstack_close(bstack_t *bs)
 {
     if (!bs)
         return;
-#ifndef _WIN32
+    free(bs->cache_buf);
+#ifdef _WIN32
+    DeleteCriticalSection(&bs->cache_mutex);
+#else
+    pthread_mutex_destroy(&bs->cache_mutex);
     pthread_rwlock_destroy(&bs->lock);
 #endif
     close_fd(bs->fd); /* also releases the advisory lock */
@@ -646,11 +693,20 @@ int bstack_get(bstack_t *bs, uint64_t start, uint64_t end,
         return -1;
     }
 
-    /* Fast-path: if the range lies entirely within the locked region,
-     * skip the rwlock — locked bytes are immutable so no lock is needed. */
+    /* Fast-path: range lies entirely within the locked region — skip the
+     * rwlock.  On cached stacks serve from the in-memory buffer (under
+     * cache_mutex); otherwise fall through to a lock-free pread. */
     uint64_t locked = ATOMIC_LOAD_ACQUIRE(&bs->locked);
     if (end <= locked) {
         size_t to_read = (size_t)(end - start);
+        if (bs->cache_enabled) {
+            if (to_read > 0) {
+                CACHE_LOCK(bs);
+                memcpy(buf, bs->cache_buf + start, to_read);
+                CACHE_UNLOCK(bs);
+            }
+            return 0;
+        }
         if (to_read > 0) {
             if (plat_pread(bs->fd, buf, to_read, HEADER_SIZE + start) != 0)
                 return -1;
@@ -815,6 +871,69 @@ int bstack_lock_up_to(bstack_t *bs, uint64_t n)
         return -1;
     }
 
+    /* Populate or extend the in-memory cache before publishing the new
+     * boundary.  locked is only advanced after the cache is consistent,
+     * so readers always see a coherent view. */
+    if (bs->cache_enabled && n > current_locked) {
+        uint64_t ol = current_locked;
+        uint64_t nl = n;
+
+        CACHE_LOCK(bs);
+
+        if (nl > bs->cache_cap) {
+            /* Reallocating: new power-of-2 buffer, copy existing valid bytes,
+             * read the new portion from disk.  On failure new_buf is freed;
+             * locked is unchanged and old cache remains valid for [0..ol]. */
+            uint64_t new_cap = next_pow2_u64(nl);
+            uint8_t *new_buf;
+#if UINT64_MAX > SIZE_MAX
+            if (new_cap > (uint64_t)SIZE_MAX) {
+                CACHE_UNLOCK(bs);
+                BS_WRUNLOCK(bs);
+                errno = ENOMEM;
+                return -1;
+            }
+#endif
+            new_buf = (uint8_t *)malloc((size_t)new_cap);
+            if (!new_buf) {
+                int saved = errno;
+                CACHE_UNLOCK(bs);
+                BS_WRUNLOCK(bs);
+                errno = saved ? saved : ENOMEM;
+                return -1;
+            }
+            if (ol > 0)
+                memcpy(new_buf, bs->cache_buf, (size_t)ol);
+            if (plat_pread(bs->fd, new_buf + ol,
+                           (size_t)(nl - ol),
+                           HEADER_SIZE + ol) != 0) {
+                int saved = errno;
+                free(new_buf);
+                CACHE_UNLOCK(bs);
+                BS_WRUNLOCK(bs);
+                errno = saved;
+                return -1;
+            }
+            free(bs->cache_buf);
+            bs->cache_buf = new_buf;
+            bs->cache_cap = new_cap;
+        } else {
+            /* In-place extend: cache_cap >= nl — read new bytes directly.
+             * On failure the buffer still holds valid [0..ol] data. */
+            if (plat_pread(bs->fd, bs->cache_buf + ol,
+                           (size_t)(nl - ol),
+                           HEADER_SIZE + ol) != 0) {
+                int saved = errno;
+                CACHE_UNLOCK(bs);
+                BS_WRUNLOCK(bs);
+                errno = saved;
+                return -1;
+            }
+        }
+
+        CACHE_UNLOCK(bs);
+    }
+
     /* Release store: all writes completed under the write lock above are
      * visible to any thread that subsequently loads locked with Acquire. */
     ATOMIC_STORE_RELEASE(&bs->locked, n);
@@ -825,6 +944,29 @@ int bstack_lock_up_to(bstack_t *bs, uint64_t n)
 bstack_t *bstack_open_locked_up_to(const char *path, uint64_t n)
 {
     bstack_t *bs = bstack_open(path);
+    if (!bs)
+        return NULL;
+    if (bstack_lock_up_to(bs, n) != 0) {
+        int saved = errno;
+        bstack_close(bs);
+        errno = saved;
+        return NULL;
+    }
+    return bs;
+}
+
+bstack_t *bstack_open_cached(const char *path)
+{
+    bstack_t *bs = bstack_open(path);
+    if (!bs)
+        return NULL;
+    bs->cache_enabled = 1;
+    return bs;
+}
+
+bstack_t *bstack_open_locked_up_to_cached(const char *path, uint64_t n)
+{
+    bstack_t *bs = bstack_open_cached(path);
     if (!bs)
         return NULL;
     if (bstack_lock_up_to(bs, n) != 0) {

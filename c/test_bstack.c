@@ -2732,6 +2732,130 @@ static int test_open_locked_up_to_n_exceeds_len_returns_null(void)
     return 0;
 }
 
+/* =========================================================================
+ * bstack_open_cached / bstack_open_locked_up_to_cached
+ * ====================================================================== */
+
+static int test_cache_get_reads_from_cache(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open_cached(tmp);
+    CHECK(bs != NULL);
+    CHECK(bstack_push(bs, (uint8_t *)"abcdefgh", 8, NULL) == 0);
+    CHECK(bstack_lock_up_to(bs, 8) == 0);
+    uint8_t buf[8];
+    CHECK(bstack_get(bs, 0, 8, buf) == 0);
+    CHECK(memcmp(buf, "abcdefgh", 8) == 0);
+    CHECK(bstack_get(bs, 2, 5, buf) == 0);
+    CHECK(memcmp(buf, "cde", 3) == 0);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_cache_matches_uncached_get(void)
+{
+    /* Cached and non-cached reads must return identical bytes. */
+    char tmp_c[64]; make_tmp(tmp_c, sizeof tmp_c);
+    char tmp_u[64]; make_tmp(tmp_u, sizeof tmp_u);
+    uint8_t data[256];
+    int i;
+    for (i = 0; i < 256; i++) data[i] = (uint8_t)i;
+
+    bstack_t *cached = bstack_open_cached(tmp_c);
+    CHECK(cached != NULL);
+    CHECK(bstack_push(cached, data, 256, NULL) == 0);
+    CHECK(bstack_lock_up_to(cached, 256) == 0);
+
+    bstack_t *uncached = bstack_open(tmp_u);
+    CHECK(uncached != NULL);
+    CHECK(bstack_push(uncached, data, 256, NULL) == 0);
+    CHECK(bstack_lock_up_to(uncached, 256) == 0);
+
+    uint8_t bc[256], bu[256];
+    CHECK(bstack_get(cached,  0, 256, bc) == 0);
+    CHECK(bstack_get(uncached, 0, 256, bu) == 0);
+    CHECK(memcmp(bc, bu, 256) == 0);
+
+    CHECK(bstack_get(cached,  10, 210, bc) == 0);
+    CHECK(bstack_get(uncached, 10, 210, bu) == 0);
+    CHECK(memcmp(bc, bu, 200) == 0);
+
+    bstack_close(cached);  unlink(tmp_c);
+    bstack_close(uncached); unlink(tmp_u);
+    return 0;
+}
+
+static int test_cache_sequential_lock_up_to(void)
+{
+    /* Two sequential lock_up_to calls — first allocates, second extends. */
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open_cached(tmp);
+    CHECK(bs != NULL);
+    CHECK(bstack_push(bs, (uint8_t *)"abcdefghijklmnop", 16, NULL) == 0);
+    CHECK(bstack_lock_up_to(bs, 8) == 0);
+    uint8_t buf[16];
+    CHECK(bstack_get(bs, 0, 8, buf) == 0);
+    CHECK(memcmp(buf, "abcdefgh", 8) == 0);
+    CHECK(bstack_lock_up_to(bs, 16) == 0);
+    CHECK(bstack_get(bs, 0, 16, buf) == 0);
+    CHECK(memcmp(buf, "abcdefghijklmnop", 16) == 0);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_cache_in_place_extend(void)
+{
+    /* lock_up_to(5) allocates capacity 8; lock_up_to(7) fits in-place. */
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open_cached(tmp);
+    CHECK(bs != NULL);
+    CHECK(bstack_push(bs, (uint8_t *)"abcdefghij", 10, NULL) == 0);
+    CHECK(bstack_lock_up_to(bs, 5) == 0);
+    uint8_t buf[10];
+    CHECK(bstack_get(bs, 0, 5, buf) == 0);
+    CHECK(memcmp(buf, "abcde", 5) == 0);
+    CHECK(bstack_lock_up_to(bs, 7) == 0);
+    CHECK(bstack_get(bs, 0, 7, buf) == 0);
+    CHECK(memcmp(buf, "abcdefg", 7) == 0);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_open_locked_up_to_cached_convenience(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    {
+        bstack_t *bs = bstack_open(tmp);
+        CHECK(bs != NULL);
+        CHECK(bstack_push(bs, (uint8_t *)"hello world", 11, NULL) == 0);
+        bstack_close(bs);
+    }
+    bstack_t *bs = bstack_open_locked_up_to_cached(tmp, 11);
+    CHECK(bs != NULL);
+    CHECK(bstack_locked_len(bs) == 11);
+    uint8_t buf[11];
+    CHECK(bstack_get(bs, 0, 11, buf) == 0);
+    CHECK(memcmp(buf, "hello world", 11) == 0);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_uncached_stack_behaviour_unchanged(void)
+{
+    /* Non-cached stacks must still work identically after cache feature add. */
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    CHECK(bstack_push(bs, (uint8_t *)"regression", 10, NULL) == 0);
+    CHECK(bstack_lock_up_to(bs, 10) == 0);
+    uint8_t buf[10];
+    CHECK(bstack_get(bs, 0, 10, buf) == 0);
+    CHECK(memcmp(buf, "regression", 10) == 0);
+    CHECK(bstack_locked_len(bs) == 10);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
 static int test_pop_respects_locked_region(void)
 {
     char tmp[64]; make_tmp(tmp, sizeof tmp);
@@ -3171,6 +3295,15 @@ int main(void)
     T(test_lock_up_to_n_exceeds_len_returns_error);
     T(test_open_locked_up_to_sets_boundary);
     T(test_open_locked_up_to_n_exceeds_len_returns_null);
+
+    /* bstack_open_cached / bstack_open_locked_up_to_cached */
+    T(test_cache_get_reads_from_cache);
+    T(test_cache_matches_uncached_get);
+    T(test_cache_sequential_lock_up_to);
+    T(test_cache_in_place_extend);
+    T(test_open_locked_up_to_cached_convenience);
+    T(test_uncached_stack_behaviour_unchanged);
+
     T(test_pop_respects_locked_region);
     T(test_discard_respects_locked_region);
     T(test_get_reads_locked_region_lock_free);
