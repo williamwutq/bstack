@@ -138,6 +138,8 @@ uint64_t bstack_locked_len(bstack_t *bs);
  * all write and shrink operations that would touch [0, n) return EINVAL.
  * Acquires the exclusive write lock to ensure all in-flight writes to
  * [0, n) have completed before the region is declared immutable.
+ * Note: on stacks opened with bstack_open_cached, this call also fills the
+ * in-memory cache and is therefore significantly more expensive.
  * Returns EINVAL if n is less than the current locked length (partition can
  * only grow) or if n exceeds the current payload length.
  */
@@ -153,6 +155,30 @@ int bstack_lock_up_to(bstack_t *bs, uint64_t n);
  * length of the opened file.
  */
 bstack_t *bstack_open_locked_up_to(const char *path, uint64_t n);
+
+/*
+ * Open or create a stack file at path with the in-memory locked-region
+ * cache enabled.  Behaves identically to bstack_open in all other respects.
+ *
+ * Once the cache is enabled, each subsequent bstack_lock_up_to(bs, n) call
+ * reads the newly locked bytes from disk into a heap buffer so that future
+ * bstack_get calls whose range falls entirely within the locked region are
+ * served by copying from that buffer with no syscall.
+ *
+ * Performance: bstack_lock_up_to is significantly more expensive on cached
+ * stacks because it must read up to n bytes from disk before returning.
+ *
+ * Returns NULL on failure (errno set).
+ */
+bstack_t *bstack_open_cached(const char *path);
+
+/*
+ * Open a cached bstack and immediately lock the first n bytes.
+ * Equivalent to bstack_open_cached followed by bstack_lock_up_to.
+ * Returns NULL on failure (errno set); EINVAL if n exceeds the payload
+ * length of the opened file.
+ */
+bstack_t *bstack_open_locked_up_to_cached(const char *path, uint64_t n);
 
 #ifdef BSTACK_FEATURE_SET
 /*
