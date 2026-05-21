@@ -70,6 +70,15 @@ where
     /// underlying data.
     ///
     /// The returned slice should have length equal to called `len()`.
+    ///
+    /// ## Mutability and safety
+    ///
+    /// The returned slice is read-only. Mutating the returned slice may cause
+    /// data corruption or violate allocator invariants, unless the implementation
+    /// explicitly allows it and documents the safety contract. If the implementation
+    /// allows mutation, it must ensure that all hooks are properly fired on
+    /// subsequent reads and writes, and that any necessary synchronization is
+    /// performed to prevent data races or undefined behavior.
     fn as_slice(&self) -> Result<BStackSlice<'a, A>, io::Error> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
