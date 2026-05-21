@@ -434,8 +434,8 @@ use std::fs::{File, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
-use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, RwLock};
 
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
@@ -707,7 +707,7 @@ pub struct BStack {
     /// In-memory mirror of `[0, locked)`.  Empty until the first `lock_up_to`
     /// call on a cached stack.  Capacity follows a power-of-two growth rule;
     /// `self.locked` is the count of valid bytes within the buffer.
-    cache: RwLock<Vec<u8>>,
+    cache: Mutex<Vec<u8>>,
 }
 
 // `BStack` is auto-`Send + Sync` on every platform: all fields
@@ -791,7 +791,7 @@ impl BStack {
             lock: RwLock::new(file),
             locked: AtomicU64::new(0),
             cache_enabled: false,
-            cache: RwLock::new(Vec::new()),
+            cache: Mutex::new(Vec::new()),
         })
     }
 
@@ -1000,7 +1000,7 @@ impl BStack {
             let locked = self.locked.load(Ordering::Acquire);
             if end <= locked {
                 if self.cache_enabled {
-                    let cache = self.cache.read().unwrap();
+                    let cache = self.cache.lock().unwrap();
                     return Ok(cache[start as usize..end as usize].to_vec());
                 }
                 #[cfg(unix)]
@@ -1081,7 +1081,7 @@ impl BStack {
             let locked = self.locked.load(Ordering::Acquire);
             if end <= locked {
                 if self.cache_enabled {
-                    let cache = self.cache.read().unwrap();
+                    let cache = self.cache.lock().unwrap();
                     buf.copy_from_slice(&cache[offset as usize..end as usize]);
                     return Ok(());
                 }
@@ -1156,7 +1156,7 @@ impl BStack {
             let locked = self.locked.load(Ordering::Acquire);
             if end <= locked {
                 if self.cache_enabled {
-                    let cache = self.cache.read().unwrap();
+                    let cache = self.cache.lock().unwrap();
                     buf.copy_from_slice(&cache[start as usize..end as usize]);
                     return Ok(());
                 }
@@ -2122,7 +2122,7 @@ impl BStack {
         if self.cache_enabled && n > current_locked {
             let ol = current_locked as usize;
             let nl = n as usize;
-            let mut cache = self.cache.write().unwrap();
+            let mut cache = self.cache.lock().unwrap();
 
             if nl > cache.capacity() {
                 // Reallocating: build a fresh Vec with power-of-2 capacity,

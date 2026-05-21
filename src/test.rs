@@ -4224,7 +4224,7 @@ mod cache_tests {
         let (s, p) = mk_cached();
         let _g = Guard(p);
         // No lock_up_to yet — cache Vec should be empty.
-        assert_eq!(s.cache.read().unwrap().len(), 0);
+        assert_eq!(s.cache.lock().unwrap().len(), 0);
     }
 
     #[test]
@@ -4233,7 +4233,7 @@ mod cache_tests {
         let _g = Guard(p);
         s.push(b"hello").unwrap();
         s.lock_up_to(5).unwrap();
-        let cache = s.cache.read().unwrap();
+        let cache = s.cache.lock().unwrap();
         assert_eq!(cache.len(), 5);
         assert_eq!(&cache[..], b"hello");
     }
@@ -4375,6 +4375,6 @@ mod cache_tests {
         s.lock_up_to(10).unwrap();
         assert_eq!(s.get(0, 10).unwrap(), b"regression");
         assert!(!s.cache_enabled);
-        assert_eq!(s.cache.read().unwrap().len(), 0);
+        assert_eq!(s.cache.lock().unwrap().len(), 0);
     }
 }
