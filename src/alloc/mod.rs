@@ -42,13 +42,13 @@
 //!   strict total order.  All memory is kept zeroed: the BStack zeroes on
 //!   extension, and the allocator zeroes on free.
 //!
-//! * [`BStackVec<T>`](BStackVec) — a typed, growable vector backed by a
+//! * [`BStackByteVec`] — a growable byte (`u8`) vector backed by a
 //!   [`BStack`] allocation (requires both `alloc` **and** `set`).  Mirrors the
-//!   core [`Vec<T>`] API: `push`, `pop`, `get`, `truncate`, `reserve`,
-//!   `resize`, `iter`, and more.  The 16-byte block header stores `len` and
-//!   `capacity` as little-endian `u64`s so the state is recoverable after a
-//!   crash.  `push` reallocates at `max(cap × 2, 4)`; `pop` zeros the vacated
-//!   slot; `truncate` zeros removed slots in a single
+//!   core [`Vec<u8>`] API: `push`, `pop`, `get`, `read_bytes`, `as_slice`,
+//!   `truncate`, `reserve`, `resize`, `iter`, and more.  The 16-byte block
+//!   header stores `len` and `capacity` as little-endian `u64`s so the state
+//!   is recoverable after a crash.  `push` reallocates at `max(cap × 2, 4)`;
+//!   `pop` zeros the vacated slot; `truncate` zeros removed slots in a single
 //!   [`zero_range`](BStackSlice::zero_range) call.
 //!
 //! # Lifetime model
@@ -79,7 +79,7 @@
 //! ```
 //!
 //! In-place slice writes ([`BStackSliceWriter`]), [`FirstFitBStackAllocator`],
-//! and [`BStackVec`] additionally require `set`:
+//! and [`BStackByteVec`] additionally require `set`:
 //!
 //! ```toml
 //! bstack = { version = "0.1", features = ["alloc", "set"] }
@@ -461,4 +461,4 @@ pub use guarded::{BStackGuardedSlice, BStackGuardedSliceSubview};
 pub use linear::LinearBStackAllocator;
 pub use manual::ManualAllocator;
 #[cfg(feature = "set")]
-pub use vec::{BStackVec, BStackVecIter};
+pub use vec::{BStackByteVec, BStackByteVecIter};

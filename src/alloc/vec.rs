@@ -1,72 +1,69 @@
-//! Typed, growable vector backed by a [`BStack`] allocation.
+//! Growable byte vector backed by a [`BStack`] allocation.
 //!
 //! Requires features `alloc` and `set`.
 
 use super::{BStackSlice, BStackSliceAllocator};
 use std::fmt;
 use std::io;
-use std::marker::PhantomData;
-use std::mem::size_of;
 
 /// Byte offset of the first element within the block (past the 16-byte header).
 const HEADER_LEN: u64 = 16;
 
-/// A typed, growable vector backed by a [`crate::BStack`] allocation.
+/// A growable byte vector backed by a [`crate::BStack`] allocation.
 ///
-/// `BStackVec<'a, T, A>` mirrors the core API of [`Vec<T>`] but stores its
-/// elements inside a [`crate::BStack`] allocation managed by allocator `A`.  Every
-/// mutation issues a durable sync through the allocator so the contents survive
-/// a process crash.
+/// `BStackByteVec<'a, A>` stores `u8` elements inside a [`crate::BStack`]
+/// allocation managed by allocator `A`.  Every mutation issues a durable sync
+/// through the allocator so the contents survive a process crash.
+///
+/// For a general typed vector (e.g. over `u32`, structs, etc.), see the
+/// `BStackVec<T>` entry in `PLANNED.md`.  A general type parameter requires a
+/// sound POD/byte-castable bound that would add an external dependency; this
+/// type covers the common byte-buffer use case without any additional
+/// requirements on element validity.
 ///
 /// ## Memory layout
 ///
 /// ```text
 /// ┌──────────────────────┬──────────────────────┬────────────────────────────┐
-/// │   len  (8 B, LE u64) │   cap  (8 B, LE u64) │   elements: [T; cap]       │
+/// │   len  (8 B, LE u64) │   cap  (8 B, LE u64) │   elements: [u8; cap]      │
 /// └──────────────────────┴──────────────────────┴────────────────────────────┘
 ///   byte 0                 byte 8                  byte 16
 /// ```
 ///
 /// Both `len` and `cap` are re-read from the block header on every call, so the
-/// metadata is recoverable after a crash even if the `BStackVec` handle is
-/// reconstructed from the raw block via [`BStackVec::from_raw_block`].
-///
-/// ## Element type
-///
-/// `T` must be `Copy`.  Elements are written as raw bytes and read back with
-/// [`std::ptr::read_unaligned`].  All slots `0..len` always hold byte patterns that
-/// were explicitly written by a `BStackVec` method, so reads are never issued
-/// against uninitialised memory.
+/// metadata is recoverable after a crash even if the `BStackByteVec` handle is
+/// reconstructed from the raw block via [`BStackByteVec::from_raw_block`].
 ///
 /// ## Growth strategy
 ///
-/// When [`push`](BStackVec::push) would exceed the current capacity, the block
-/// is reallocated to `max(cap * 2, 4)` elements.  New element space is
+/// When [`push`](BStackByteVec::push) would exceed the current capacity, the
+/// block is reallocated to `max(cap * 2, 4)` bytes.  New element space is
 /// zero-initialised by [`crate::BStack::extend`].
 ///
 /// ## Zeroing
 ///
-/// [`pop`](BStackVec::pop) zeros the vacated element slot before decrementing
-/// `len`.  [`truncate`](BStackVec::truncate) zeros all removed slots in a single
-/// [`BStackSlice::zero_range`] call.  Deallocation zeroing is delegated to the
-/// allocator.
+/// [`pop`](BStackByteVec::pop) decrements `len` first, then zeros the vacated
+/// slot.  [`truncate`](BStackByteVec::truncate) writes the new `len` first,
+/// then zeros all removed slots in a single [`BStackSlice::zero_range`] call.
+/// Deallocation zeroing is delegated to the allocator.
 ///
 /// ## Thread safety
 ///
-/// `BStackVec` is `Send` when `T: Send` and `A: Sync`, and `Sync` when
-/// `T: Sync` and `A: Sync` (both conditions hold for all allocators in this
-/// library).  The underlying [`crate::BStack`] serialises concurrent writers
-/// through an internal `RwLock`, so multiple threads may call `&self` methods
-/// concurrently.  Methods that take `&mut self` (`push`, `pop`, `truncate`,
-/// `clear`, `reserve`, `resize`) require exclusive access and may not be called
-/// from multiple threads simultaneously.
+/// `BStackByteVec` is `Send` when `A: Sync` and `Sync` when `A: Sync` (both
+/// conditions hold for all allocators in this library).  The underlying
+/// [`crate::BStack`] serialises concurrent writers through an internal
+/// `RwLock`, so multiple threads may call `&self` methods concurrently.
+/// Methods that take `&mut self` (`push`, `pop`, `truncate`, `clear`,
+/// `reserve`, `resize`) require exclusive access and may not be called from
+/// multiple threads simultaneously.
 ///
 /// ## Crash consistency and atomicity
 ///
-/// Every individual [`crate::BStack`] call (`set`, `zero`, `extend`, `discard`)
-/// is durably synced before returning and is crash-safe in isolation.  However,
-/// all multi-step `BStackVec` methods issue **two or more** such calls in
-/// sequence and are **not atomic** with respect to process crashes.
+/// Every individual [`crate::BStack`] call (`set`, `zero`, `extend`,
+/// `discard`) is durably synced before returning and is crash-safe in
+/// isolation.  However, all multi-step `BStackByteVec` methods issue **two or
+/// more** such calls in sequence and are **not atomic** with respect to
+/// process crashes.
 ///
 /// The crash-recovery state for each mutating method is:
 ///
@@ -74,76 +71,69 @@ const HEADER_LEN: u64 = 16;
 /// |--------|-----------|----------------------|
 /// | `push` (no realloc) | write element → increment `len` | Crash after element write: element on disk but `len` not updated; slot is effectively invisible. Re-running `push` with the same value recovers correctly. |
 /// | `push` (with realloc) | `realloc` → write `cap` → write element → increment `len` | Crash at any point: header re-read on next open reflects the committed state; worst case is allocator-specific intermediate metadata or a stale cap value. |
-/// | `pop` | read element → decrement `len` → zero slot | Crash after `len` decrement but before zero: stale bytes may remain in the now out-of-range slot, but reads never deserialize them because they are beyond `len`. |
-/// | `truncate` | write `len` → zero removed slots | Crash after `len` write but before zero: stale bytes may remain in now out-of-range slots, but reads never deserialize them because they are beyond `len`. |
-/// | `resize` (grow) | `reserve` → write elements → write `len` | Same as `push` repeated; elements between the old and new `len` may be partially written. |
+/// | `pop` | read element → decrement `len` → zero slot | Crash after `len` decrement but before zero: stale byte may remain in the now out-of-range slot, but reads never include it because it is beyond `len`. |
+/// | `truncate` | write `len` → zero removed slots | Crash after `len` write but before zero: stale bytes may remain in now out-of-range slots, but reads never include them because they are beyond `len`. |
+/// | `resize` (grow) | `reserve` → write elements → write `len` | Elements between the old and new `len` may be partially written. |
 /// | `clear` | (delegates to `truncate(0)`) | See `truncate`. |
 /// | `reserve` | `realloc` → write `cap` | Crash between the two: cap field may reflect the old value; the block is larger than cap indicates. Harmless — the next `push` re-checks and may realloc again unnecessarily. |
 ///
 /// In all cases the header is re-read from disk on the next call, so the
 /// on-disk `(len, cap)` always reflects the last fully committed step.  The
-/// [`from_raw_block`](BStackVec::from_raw_block) constructor can be used to
-/// reconstruct the handle after a reopen without any additional recovery logic.
+/// [`from_raw_block`](BStackByteVec::from_raw_block) constructor can be used
+/// to reconstruct the handle after a reopen without any additional recovery
+/// logic.
 ///
 /// ## Feature flags
 ///
 /// Requires both the `alloc` and `set` Cargo features.
-pub struct BStackVec<'a, T: Copy, A: BStackSliceAllocator> {
-    /// The full block: header (16 B) followed by element data.
+pub struct BStackByteVec<'a, A: BStackSliceAllocator> {
+    /// The full block: header (16 B) followed by byte data.
     slice: BStackSlice<'a, A>,
-    _phantom: PhantomData<T>,
 }
 
-impl<'a, T: Copy, A: BStackSliceAllocator> fmt::Debug for BStackVec<'a, T, A> {
+impl<'a, A: BStackSliceAllocator> fmt::Debug for BStackByteVec<'a, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.read_header() {
             Ok((len, cap)) => f
-                .debug_struct("BStackVec")
+                .debug_struct("BStackByteVec")
                 .field("len", &len)
                 .field("capacity", &cap)
                 .finish_non_exhaustive(),
-            Err(e) => write!(f, "BStackVec(error reading header: {e})"),
+            Err(e) => write!(f, "BStackByteVec(error reading header: {e})"),
         }
     }
 }
 
 // ── private helpers ──────────────────────────────────────────────────────────
 
-impl<'a, T: Copy, A: BStackSliceAllocator> BStackVec<'a, T, A> {
-    fn elem_size() -> u64 {
-        size_of::<T>() as u64
-    }
-
-    /// Compute the total block size in bytes for `capacity` elements.
+impl<'a, A: BStackSliceAllocator> BStackByteVec<'a, A> {
+    /// Compute the total block size in bytes for `capacity` bytes of data.
     ///
     /// Returns `Err(InvalidInput)` if the arithmetic overflows `u64` — this
     /// prevents passing a wrapped-around value to the allocator and accidentally
-    /// obtaining a block that is too small to hold the requested elements.
+    /// obtaining a block that is too small.
     fn block_size(capacity: u64) -> io::Result<u64> {
-        capacity
-            .checked_mul(Self::elem_size())
-            .and_then(|elem_bytes| elem_bytes.checked_add(HEADER_LEN))
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "BStackVec: block size overflows u64",
-                )
-            })
+        capacity.checked_add(HEADER_LEN).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "BStackByteVec: block size overflows u64",
+            )
+        })
     }
 
-    fn elem_offset(index: u64) -> u64 {
+    fn byte_offset(index: u64) -> u64 {
         // `index` is always < `len` which was read from a header we wrote, so
-        // this multiplication cannot overflow in well-formed data.  A corrupt
+        // this addition cannot overflow in well-formed data.  A corrupt
         // on-disk `len` could cause overflow and a debug-mode panic; that is
         // acceptable — corruption is not a recoverable condition here.
-        HEADER_LEN + index * Self::elem_size()
+        HEADER_LEN + index
     }
 
     /// Re-read `(len, capacity)` from the block header on disk.
     fn read_header(&self) -> io::Result<(u64, u64)> {
         let mut hdr = [0u8; 16];
         self.slice.read_range_into(0, &mut hdr)?;
-        // `read_range(0, 16)` returns exactly 16 bytes on success; the slices
+        // `read_range_into` fills exactly 16 bytes on success; the slices
         // are 8 bytes each so try_into() is always Ok — these cannot panic.
         let len = u64::from_le_bytes(hdr[..8].try_into().unwrap());
         let cap = u64::from_le_bytes(hdr[8..].try_into().unwrap());
@@ -165,44 +155,32 @@ impl<'a, T: Copy, A: BStackSliceAllocator> BStackVec<'a, T, A> {
         self.slice.write_range(0, hdr)
     }
 
-    fn read_elem_at(&self, index: u64) -> io::Result<T> {
-        let size = size_of::<T>();
-        let start = Self::elem_offset(index);
-        // This has to be allocating since we need to copy to memory from disk
-        let bytes = self.slice.read_range(start, start + size as u64)?;
-        // SAFETY: `bytes` has exactly `size_of::<T>()` bytes.  Every slot
-        // `0..len` was written with a valid `T` value before this read.
-        Ok(unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const T) })
+    fn read_byte_at(&self, index: u64) -> io::Result<u8> {
+        let start = Self::byte_offset(index);
+        let bytes = self.slice.read_range(start, start + 1)?;
+        Ok(bytes[0])
     }
 
-    fn write_elem_at(&self, index: u64, value: T) -> io::Result<()> {
-        let size = size_of::<T>();
-        let start = Self::elem_offset(index);
-        // SAFETY: `value` is a valid, initialized `T`; we borrow its bytes.
-        let bytes = unsafe { std::slice::from_raw_parts(&value as *const T as *const u8, size) };
-        self.slice.write_range(start, bytes)
+    fn write_byte_at(&self, index: u64, value: u8) -> io::Result<()> {
+        let start = Self::byte_offset(index);
+        self.slice.write_range(start, [value])
     }
 
-    fn write_elems_at(&self, start_index: u64, values: &[T]) -> io::Result<()> {
-        let _size = size_of::<T>();
-        let start = Self::elem_offset(start_index);
-        // SAFETY: `values` is a valid slice of initialized `T`s; we borrow its bytes.
-        let bytes = unsafe {
-            std::slice::from_raw_parts(values.as_ptr() as *const u8, std::mem::size_of_val(values))
-        };
-        self.slice.write_range(start, bytes)
+    fn write_bytes_at(&self, start_index: u64, values: &[u8]) -> io::Result<()> {
+        let start = Self::byte_offset(start_index);
+        self.slice.write_range(start, values)
     }
 
-    fn zero_elem_at(&self, index: u64) -> io::Result<()> {
-        self.slice
-            .zero_range(Self::elem_offset(index), Self::elem_size())
+    fn zero_byte_at(&self, index: u64) -> io::Result<()> {
+        self.slice.zero_range(Self::byte_offset(index), 1)
     }
 
-    /// Reallocate the block to hold `new_cap` elements, updating `self.slice`.
+    /// Reallocate the block to hold `new_cap` bytes, updating `self.slice`.
     fn grow_to(&mut self, new_cap: u64) -> io::Result<()> {
         let new_size = Self::block_size(new_cap)?;
-        // SAFETY: Slice origin requirement is upheld because `self.slice` is the original allocation handle
-        // returned by the constructor, and `realloc` returns a new slice for the same block.
+        // SAFETY: Slice origin requirement is upheld because `self.slice` is
+        // the original allocation handle returned by the constructor, and
+        // `realloc` returns a new slice for the same block.
         let new_slice = self.slice.allocator().realloc(self.slice, new_size)?;
         self.slice = new_slice;
         Ok(())
@@ -211,75 +189,60 @@ impl<'a, T: Copy, A: BStackSliceAllocator> BStackVec<'a, T, A> {
 
 // ── public API ────────────────────────────────────────────────────────────────
 
-impl<'a, T: Copy, A: BStackSliceAllocator> BStackVec<'a, T, A> {
-    /// Create an empty `BStackVec` with zero capacity.
+impl<'a, A: BStackSliceAllocator> BStackByteVec<'a, A> {
+    /// Create an empty `BStackByteVec` with zero capacity.
     ///
     /// Allocates a 16-byte block for the header only.  The first
-    /// [`push`](Self::push) will trigger a reallocation to 4 elements.
+    /// [`push`](Self::push) will trigger a reallocation to 4 bytes.
     pub fn new(alloc: &'a A) -> io::Result<Self> {
         let slice = alloc.alloc(HEADER_LEN)?;
         // Header is zero-initialised by the allocator: len=0, cap=0.
-        Ok(Self {
-            slice,
-            _phantom: PhantomData,
-        })
+        Ok(Self { slice })
     }
 
-    /// Create an empty `BStackVec` pre-sized for at least `capacity` elements.
+    /// Create an empty `BStackByteVec` pre-sized for at least `capacity` bytes.
     pub fn with_capacity(capacity: u64, alloc: &'a A) -> io::Result<Self> {
         let slice = alloc.alloc(Self::block_size(capacity)?)?;
-        let vec = Self {
-            slice,
-            _phantom: PhantomData,
-        };
+        let vec = Self { slice };
         // len is already 0 (zeroed by alloc); write the non-zero cap field.
         vec.write_cap_field(capacity)?;
         Ok(vec)
     }
 
-    /// Allocate a `BStackVec` and populate it from a Rust slice.
+    /// Allocate a `BStackByteVec` and populate it from a byte slice.
     ///
     /// The resulting vec has `len == capacity == data.len()`.
-    pub fn from_slice(data: &[T], alloc: &'a A) -> io::Result<Self> {
+    pub fn from_slice(data: &[u8], alloc: &'a A) -> io::Result<Self> {
         let len = data.len() as u64;
         let slice = alloc.alloc(Self::block_size(len)?)?;
-        let vec = Self {
-            slice,
-            _phantom: PhantomData,
-        };
+        let vec = Self { slice };
         if len > 0 {
-            // Write len and cap; elements are written individually below.
             vec.write_header(len, len)?;
-            // writes all elements in one call; see write_elems_at() for safety comments
-            vec.write_elems_at(0, data)?;
+            vec.write_bytes_at(0, data)?;
         }
         Ok(vec)
     }
 
-    /// Reconstruct a `BStackVec` from a raw block slice.
+    /// Reconstruct a `BStackByteVec` from a raw block slice.
     ///
     /// # Safety
     ///
     /// `slice` must be the original allocation handle (not a sub-slice) returned
-    /// by one of the `BStackVec` constructors on the same allocator, and the
-    /// block header must have been written by a `BStackVec<T, A>`.  Passing an
-    /// unrelated slice or one with a mismatched element type is undefined
-    /// behaviour.
+    /// by one of the `BStackByteVec` constructors on the same allocator, and the
+    /// block header must have been written by a `BStackByteVec<A>`.  Passing an
+    /// unrelated slice is undefined behaviour.
     pub unsafe fn from_raw_block(slice: BStackSlice<'a, A>) -> Self {
-        Self {
-            slice,
-            _phantom: PhantomData,
-        }
+        Self { slice }
     }
 
-    /// Return the number of elements currently stored.
+    /// Return the number of bytes currently stored.
     ///
     /// Re-reads `len` from the block header on every call.
     pub fn len(&self) -> io::Result<u64> {
         Ok(self.read_header()?.0)
     }
 
-    /// Return the number of elements the current allocation can hold without
+    /// Return the number of bytes the current allocation can hold without
     /// reallocation.
     ///
     /// Re-reads `cap` from the block header on every call.
@@ -287,43 +250,35 @@ impl<'a, T: Copy, A: BStackSliceAllocator> BStackVec<'a, T, A> {
         Ok(self.read_header()?.1)
     }
 
-    /// Return `true` if the vec contains no elements.
+    /// Return `true` if the vec contains no bytes.
     pub fn is_empty(&self) -> io::Result<bool> {
         Ok(self.len()? == 0)
     }
 
-    /// Return the element at `index`, or `None` if `index >= len`.
-    pub fn get(&self, index: u64) -> io::Result<Option<T>> {
+    /// Return the byte at `index`, or `None` if `index >= len`.
+    pub fn get(&self, index: u64) -> io::Result<Option<u8>> {
         let (len, _) = self.read_header()?;
         if index >= len {
             return Ok(None);
         }
-        Ok(Some(self.read_elem_at(index)?))
+        Ok(Some(self.read_byte_at(index)?))
     }
 
-    /// Read all logical elements and return them as a Rust [`Vec<T>`].
+    /// Read all logical bytes and return them as a [`Vec<u8>`].
     ///
     /// Equivalent to collecting [`iter`](Self::iter), but returns a single
-    /// `io::Result<Vec<T>>`.
-    pub fn read_vec(&self) -> io::Result<Vec<T>> {
+    /// `io::Result<Vec<u8>>`.
+    pub fn read_bytes(&self) -> io::Result<Vec<u8>> {
         let (len, _) = self.read_header()?;
-        let len_usize = usize::try_from(len).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "BStackVec::read_vec: len does not fit usize",
-            )
-        })?;
-
-        let mut out = Vec::with_capacity(len_usize);
-        for i in 0..len {
-            out.push(self.read_elem_at(i)?);
+        if len == 0 {
+            return Ok(Vec::new());
         }
-        Ok(out)
+        self.slice.read_range(HEADER_LEN, HEADER_LEN + len)
     }
 
-    /// Return a [`BStackSlice`] spanning only the populated element bytes.
+    /// Return a [`BStackSlice`] spanning only the populated byte region.
     ///
-    /// The slice covers `[16, 16 + len * size_of::<T>())` within the block.
+    /// The slice covers `[16, 16 + len)` within the block.
     /// It is a sub-slice and must **not** be passed to `realloc` or `dealloc`;
     /// use [`raw_block`](Self::raw_block) for that.
     ///
@@ -334,41 +289,39 @@ impl<'a, T: Copy, A: BStackSliceAllocator> BStackVec<'a, T, A> {
     /// block's length.  Corruption is not a recoverable condition here.
     pub fn as_slice(&self) -> io::Result<BStackSlice<'a, A>> {
         let (len, _) = self.read_header()?;
-        Ok(self
-            .slice
-            .subslice(HEADER_LEN, HEADER_LEN + len * Self::elem_size()))
+        Ok(self.slice.subslice(HEADER_LEN, HEADER_LEN + len))
     }
 
     /// Append `value` to the end of the vec.
     ///
-    /// If `len == capacity`, reallocates to `max(cap * 2, 4)` elements before
+    /// If `len == capacity`, reallocates to `max(cap * 2, 4)` bytes before
     /// writing.
-    pub fn push(&mut self, value: T) -> io::Result<()> {
+    pub fn push(&mut self, value: u8) -> io::Result<()> {
         let (len, cap) = self.read_header()?;
         if len == cap {
             let new_cap = cap.saturating_mul(2).max(4);
             self.grow_to(new_cap)?;
             self.write_cap_field(new_cap)?;
         }
-        self.write_elem_at(len, value)?;
+        self.write_byte_at(len, value)?;
         self.write_len_field(len + 1)
     }
 
-    /// Remove and return the last element, or `None` if empty.
+    /// Remove and return the last byte, or `None` if empty.
     ///
     /// `len` is decremented before the vacated slot is zeroed.
-    pub fn pop(&mut self) -> io::Result<Option<T>> {
+    pub fn pop(&mut self) -> io::Result<Option<u8>> {
         let (len, _) = self.read_header()?;
         if len == 0 {
             return Ok(None);
         }
-        let value = self.read_elem_at(len - 1)?;
+        let value = self.read_byte_at(len - 1)?;
         self.write_len_field(len - 1)?;
-        self.zero_elem_at(len - 1)?;
+        self.zero_byte_at(len - 1)?;
         Ok(Some(value))
     }
 
-    /// Shorten the vec to `new_len` elements.
+    /// Shorten the vec to `new_len` bytes.
     ///
     /// No-op when `new_len >= len`. `len` is updated first, then removed slots
     /// are zeroed in a single [`BStackSlice::zero_range`] call; capacity is
@@ -378,20 +331,20 @@ impl<'a, T: Copy, A: BStackSliceAllocator> BStackVec<'a, T, A> {
         if new_len >= len {
             return Ok(());
         }
-        let start = Self::elem_offset(new_len);
-        let removed_bytes = (len - new_len) * Self::elem_size();
+        let start = Self::byte_offset(new_len);
+        let removed = len - new_len;
         self.write_len_field(new_len)?;
-        self.slice.zero_range(start, removed_bytes)
+        self.slice.zero_range(start, removed)
     }
 
-    /// Remove all elements without releasing the allocation.
+    /// Remove all bytes without releasing the allocation.
     ///
     /// Equivalent to `truncate(0)`.
     pub fn clear(&mut self) -> io::Result<()> {
         self.truncate(0)
     }
 
-    /// Reserve capacity for at least `additional` more elements.
+    /// Reserve capacity for at least `additional` more bytes.
     ///
     /// After this call `capacity() >= len() + additional`.  Does nothing if
     /// the current capacity is already sufficient.
@@ -400,7 +353,7 @@ impl<'a, T: Copy, A: BStackSliceAllocator> BStackVec<'a, T, A> {
         let needed = len.checked_add(additional).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "BStackVec::reserve: capacity overflow",
+                "BStackByteVec::reserve: capacity overflow",
             )
         })?;
         if needed <= cap {
@@ -416,54 +369,53 @@ impl<'a, T: Copy, A: BStackSliceAllocator> BStackVec<'a, T, A> {
     ///
     /// If `new_len <= len`, equivalent to [`truncate`](Self::truncate) and
     /// `value` is ignored.
-    pub fn resize(&mut self, new_len: u64, value: T) -> io::Result<()> {
+    pub fn resize(&mut self, new_len: u64, value: u8) -> io::Result<()> {
         let (len, _) = self.read_header()?;
         if new_len <= len {
             return self.truncate(new_len);
         }
+        let count = (new_len - len) as usize;
         self.reserve(new_len - len)?;
-        self.write_elems_at(
-            len,
-            std::iter::repeat_n(value, (new_len - len) as usize)
-                .collect::<Vec<_>>()
-                .as_slice(),
-        )?;
+        let fill: Vec<u8> = std::iter::repeat(value).take(count).collect();
+        self.write_bytes_at(len, &fill)?;
         self.write_len_field(new_len)
     }
 
-    /// Return an iterator over the elements.
+    /// Return an iterator over the bytes.
     ///
     /// `len` is snapshotted at construction time.  The vec is borrowed
     /// immutably for the iterator's lifetime, preventing concurrent mutation.
-    /// Each element is read from disk on demand; errors surface as
+    /// Each byte is read from disk on demand; errors surface as
     /// `io::Result::Err` items.
-    pub fn iter(&self) -> io::Result<BStackVecIter<'_, 'a, T, A>> {
+    pub fn iter(&self) -> io::Result<BStackByteVecIter<'_, 'a, A>> {
         let (len, _) = self.read_header()?;
-        Ok(BStackVecIter {
+        Ok(BStackByteVecIter {
             vec: self,
             index: 0,
             len,
         })
     }
 
-    /// Return the underlying block slice (header + all allocated element space).
+    /// Return the underlying block slice (header + all allocated byte space).
     ///
     /// This is the original allocation handle and may be passed to
     /// [`crate::BStackAllocator::realloc`] or [`crate::BStackAllocator::dealloc`].
     ///
-    /// # Invalidation
+    /// # Safety
     ///
-    /// Any call that may reallocate (`push`, `reserve`, `resize`) can invalidate
-    /// previously returned handles. Re-fetch with `raw_block()` after such
-    /// mutations.
-    pub fn raw_block(&self) -> BStackSlice<'a, A> {
+    /// The returned handle is only valid as long as no reallocation occurs.
+    /// Any call that may reallocate (`push`, `reserve`, `resize`) invalidates
+    /// previously returned handles: using a stale handle with `realloc` or
+    /// `dealloc` can corrupt allocator state or lose data.  Re-fetch with
+    /// `raw_block()` after any mutation that may reallocate.
+    pub unsafe fn raw_block(&self) -> BStackSlice<'a, A> {
         self.slice
     }
 
     /// Consume the vec and return the underlying block slice.
     ///
     /// The caller takes responsibility for the allocation.  Reconstruct with
-    /// [`BStackVec::from_raw_block`].
+    /// [`BStackByteVec::from_raw_block`].
     pub fn into_raw_block(self) -> BStackSlice<'a, A> {
         self.slice
     }
@@ -485,34 +437,34 @@ impl<'a, T: Copy, A: BStackSliceAllocator> BStackVec<'a, T, A> {
 
 // ── iterator ──────────────────────────────────────────────────────────────────
 
-/// An iterator over the elements of a [`BStackVec`].
+/// An iterator over the bytes of a [`BStackByteVec`].
 ///
-/// Constructed by [`BStackVec::iter`].  `len` is snapshotted at construction;
-/// elements pushed after construction are not visible.  Each element is read
-/// from disk on demand; I/O errors surface as `Err` items.
-pub struct BStackVecIter<'b, 'a: 'b, T: Copy, A: BStackSliceAllocator> {
-    vec: &'b BStackVec<'a, T, A>,
+/// Constructed by [`BStackByteVec::iter`].  `len` is snapshotted at
+/// construction; bytes pushed after construction are not visible.  Each byte
+/// is read from disk on demand; I/O errors surface as `Err` items.
+pub struct BStackByteVecIter<'b, 'a: 'b, A: BStackSliceAllocator> {
+    vec: &'b BStackByteVec<'a, A>,
     index: u64,
     len: u64,
 }
 
-impl<'b, 'a: 'b, T: Copy, A: BStackSliceAllocator> fmt::Debug for BStackVecIter<'b, 'a, T, A> {
+impl<'b, 'a: 'b, A: BStackSliceAllocator> fmt::Debug for BStackByteVecIter<'b, 'a, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("BStackVecIter")
+        f.debug_struct("BStackByteVecIter")
             .field("index", &self.index)
             .field("len", &self.len)
             .finish_non_exhaustive()
     }
 }
 
-impl<'b, 'a: 'b, T: Copy, A: BStackSliceAllocator> Iterator for BStackVecIter<'b, 'a, T, A> {
-    type Item = io::Result<T>;
+impl<'b, 'a: 'b, A: BStackSliceAllocator> Iterator for BStackByteVecIter<'b, 'a, A> {
+    type Item = io::Result<u8>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.index >= self.len {
             return None;
         }
-        let result = self.vec.read_elem_at(self.index);
+        let result = self.vec.read_byte_at(self.index);
         self.index += 1;
         Some(result)
     }
@@ -541,7 +493,7 @@ mod tests {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
         let pid = std::process::id();
-        std::env::temp_dir().join(format!("bstack_vec_test_{pid}_{id}.bin"))
+        std::env::temp_dir().join(format!("bstack_bytevec_test_{pid}_{id}.bin"))
     }
 
     struct Guard(std::path::PathBuf);
@@ -563,7 +515,7 @@ mod tests {
     fn new_is_empty_with_zero_cap() {
         let (alloc, path) = make_alloc();
         let _g = Guard(path);
-        let v: BStackVec<u64, _> = BStackVec::new(&alloc).unwrap();
+        let v = BStackByteVec::new(&alloc).unwrap();
         assert_eq!(v.len().unwrap(), 0);
         assert_eq!(v.capacity().unwrap(), 0);
         assert!(v.is_empty().unwrap());
@@ -573,7 +525,7 @@ mod tests {
     fn with_capacity_has_zero_len_and_correct_cap() {
         let (alloc, path) = make_alloc();
         let _g = Guard(path);
-        let v: BStackVec<u32, _> = BStackVec::with_capacity(8, &alloc).unwrap();
+        let v = BStackByteVec::with_capacity(8, &alloc).unwrap();
         assert_eq!(v.len().unwrap(), 0);
         assert_eq!(v.capacity().unwrap(), 8);
         assert!(v.is_empty().unwrap());
@@ -583,8 +535,8 @@ mod tests {
     fn from_slice_roundtrip() {
         let (alloc, path) = make_alloc();
         let _g = Guard(path);
-        let src = [10u64, 20, 30, 40, 50];
-        let v = BStackVec::from_slice(&src, &alloc).unwrap();
+        let src = [10u8, 20, 30, 40, 50];
+        let v = BStackByteVec::from_slice(&src, &alloc).unwrap();
         assert_eq!(v.len().unwrap(), 5);
         assert_eq!(v.capacity().unwrap(), 5);
         for (i, &expected) in src.iter().enumerate() {
@@ -597,7 +549,7 @@ mod tests {
     fn from_slice_empty() {
         let (alloc, path) = make_alloc();
         let _g = Guard(path);
-        let v: BStackVec<u8, _> = BStackVec::from_slice(&[], &alloc).unwrap();
+        let v = BStackByteVec::from_slice(&[], &alloc).unwrap();
         assert_eq!(v.len().unwrap(), 0);
         assert_eq!(v.capacity().unwrap(), 0);
     }
@@ -607,18 +559,18 @@ mod tests {
         let (alloc, path) = make_alloc();
         let _g = Guard(path);
 
-        let mut v: BStackVec<i32, _> = BStackVec::new(&alloc).unwrap();
+        let mut v = BStackByteVec::new(&alloc).unwrap();
         v.push(1).unwrap();
         v.push(2).unwrap();
         v.push(3).unwrap();
 
         let block = v.into_raw_block();
         // Reconstruct from raw block and verify header and elements survive.
-        let v2: BStackVec<i32, _> = unsafe { BStackVec::from_raw_block(block) };
+        let v2 = unsafe { BStackByteVec::from_raw_block(block) };
         assert_eq!(v2.len().unwrap(), 3);
-        assert_eq!(v2.get(0).unwrap(), Some(1));
-        assert_eq!(v2.get(1).unwrap(), Some(2));
-        assert_eq!(v2.get(2).unwrap(), Some(3));
+        assert_eq!(v2.get(0).unwrap(), Some(1u8));
+        assert_eq!(v2.get(1).unwrap(), Some(2u8));
+        assert_eq!(v2.get(2).unwrap(), Some(3u8));
     }
 
     #[test]
@@ -629,10 +581,10 @@ mod tests {
 
         let block_bytes = {
             let alloc = LinearBStackAllocator::new(BStack::open(&path).unwrap());
-            let mut v: BStackVec<u64, _> = BStackVec::new(&alloc).unwrap();
+            let mut v = BStackByteVec::new(&alloc).unwrap();
             v.push(111).unwrap();
             v.push(222).unwrap();
-            v.push(333).unwrap();
+            v.push(33).unwrap();
             // Serialise the raw block handle for later reconstruction.
             let bytes: [u8; 16] = v.into_raw_block().into();
             bytes
@@ -642,11 +594,11 @@ mod tests {
         // Reopen and reconstruct.
         let alloc = LinearBStackAllocator::new(BStack::open(&path).unwrap());
         let block = unsafe { crate::alloc::BStackSlice::from_bytes(&alloc, block_bytes) };
-        let v: BStackVec<u64, _> = unsafe { BStackVec::from_raw_block(block) };
+        let v = unsafe { BStackByteVec::from_raw_block(block) };
         assert_eq!(v.len().unwrap(), 3);
-        assert_eq!(v.get(0).unwrap(), Some(111));
-        assert_eq!(v.get(1).unwrap(), Some(222));
-        assert_eq!(v.get(2).unwrap(), Some(333));
+        assert_eq!(v.get(0).unwrap(), Some(111u8));
+        assert_eq!(v.get(1).unwrap(), Some(222u8));
+        assert_eq!(v.get(2).unwrap(), Some(33u8));
     }
 
     // ── push / pop / get ─────────────────────────────────────────────────────
@@ -655,12 +607,12 @@ mod tests {
     fn push_pop_lifo() {
         let (alloc, path) = make_alloc();
         let _g = Guard(path);
-        let mut v: BStackVec<u64, _> = BStackVec::new(&alloc).unwrap();
-        for i in 0..10u64 {
+        let mut v = BStackByteVec::new(&alloc).unwrap();
+        for i in 0..10u8 {
             v.push(i * 11).unwrap();
         }
         assert_eq!(v.len().unwrap(), 10);
-        for i in (0..10u64).rev() {
+        for i in (0..10u8).rev() {
             assert_eq!(v.pop().unwrap(), Some(i * 11));
         }
         assert_eq!(v.pop().unwrap(), None);
@@ -671,38 +623,36 @@ mod tests {
     fn pop_zeros_vacated_slot() {
         let (alloc, path) = make_alloc();
         let _g = Guard(path);
-        let mut v: BStackVec<u64, _> = BStackVec::new(&alloc).unwrap();
-        v.push(0xDEAD_BEEF_CAFE_BABEu64).unwrap();
+        let mut v = BStackByteVec::new(&alloc).unwrap();
+        v.push(0xABu8).unwrap();
 
-        let block = v.raw_block();
+        // SAFETY: We do not call any reallocation method while holding `block`.
+        let block = unsafe { v.raw_block() };
         v.pop().unwrap();
 
-        // Slot 0's bytes (at block offset 16) should now be zeroed.
-        let slot_bytes = block.read_range(16, 24).unwrap();
-        assert_eq!(
-            slot_bytes, [0u8; 8],
-            "vacated slot must be zeroed after pop"
-        );
+        // Slot 0's byte (at block offset 16) should now be zeroed.
+        let slot_bytes = block.read_range(16, 17).unwrap();
+        assert_eq!(slot_bytes, [0u8; 1], "vacated slot must be zeroed after pop");
     }
 
     #[test]
     fn get_out_of_bounds_returns_none() {
         let (alloc, path) = make_alloc();
         let _g = Guard(path);
-        let mut v: BStackVec<u32, _> = BStackVec::new(&alloc).unwrap();
+        let mut v = BStackByteVec::new(&alloc).unwrap();
         v.push(42).unwrap();
-        assert_eq!(v.get(0).unwrap(), Some(42u32));
+        assert_eq!(v.get(0).unwrap(), Some(42u8));
         assert_eq!(v.get(1).unwrap(), None);
         assert_eq!(v.get(u64::MAX).unwrap(), None);
     }
 
     #[test]
-    fn read_vec_returns_all_elements() {
+    fn read_bytes_returns_all_elements() {
         let (alloc, path) = make_alloc();
         let _g = Guard(path);
-        let src = [7u64, 11, 13, 17];
-        let v = BStackVec::from_slice(&src, &alloc).unwrap();
-        assert_eq!(v.read_vec().unwrap(), src);
+        let src = [7u8, 11, 13, 17];
+        let v = BStackByteVec::from_slice(&src, &alloc).unwrap();
+        assert_eq!(v.read_bytes().unwrap(), src);
     }
 
     // ── growth ───────────────────────────────────────────────────────────────
@@ -711,7 +661,7 @@ mod tests {
     fn push_triggers_growth_from_zero() {
         let (alloc, path) = make_alloc();
         let _g = Guard(path);
-        let mut v: BStackVec<u32, _> = BStackVec::new(&alloc).unwrap();
+        let mut v = BStackByteVec::new(&alloc).unwrap();
         // First push must grow from cap=0 to cap=4.
         v.push(1).unwrap();
         assert!(v.capacity().unwrap() >= 4);
@@ -722,7 +672,7 @@ mod tests {
     fn push_doubles_capacity_on_overflow() {
         let (alloc, path) = make_alloc();
         let _g = Guard(path);
-        let mut v: BStackVec<u32, _> = BStackVec::with_capacity(2, &alloc).unwrap();
+        let mut v = BStackByteVec::with_capacity(2, &alloc).unwrap();
         v.push(1).unwrap();
         v.push(2).unwrap();
         let cap_before = v.capacity().unwrap();
@@ -738,49 +688,51 @@ mod tests {
     fn truncate_shortens_and_zeros_slots() {
         let (alloc, path) = make_alloc();
         let _g = Guard(path);
-        let mut v: BStackVec<u64, _> = BStackVec::new(&alloc).unwrap();
-        v.push(0xAAAA_AAAA_AAAA_AAAAu64).unwrap();
-        v.push(0xBBBB_BBBB_BBBB_BBBBu64).unwrap();
-        v.push(0xCCCC_CCCC_CCCC_CCCCu64).unwrap();
+        let mut v = BStackByteVec::new(&alloc).unwrap();
+        v.push(0xAAu8).unwrap();
+        v.push(0xBBu8).unwrap();
+        v.push(0xCCu8).unwrap();
 
-        let block = v.raw_block();
+        // SAFETY: We do not call any reallocation method while holding `block`.
+        let block = unsafe { v.raw_block() };
         v.truncate(1).unwrap();
 
         assert_eq!(v.len().unwrap(), 1);
         assert_eq!(v.capacity().unwrap(), 4); // cap unchanged
 
-        // Slots 1 and 2 (offsets 24..40) must be zeroed.
-        let removed = block.read_range(24, 40).unwrap();
-        assert_eq!(removed, [0u8; 16], "truncated slots must be zeroed");
+        // Slots 1 and 2 (offsets 17..19) must be zeroed.
+        let removed = block.read_range(17, 19).unwrap();
+        assert_eq!(removed, [0u8; 2], "truncated slots must be zeroed");
     }
 
     #[test]
     fn truncate_noop_when_new_len_ge_len() {
         let (alloc, path) = make_alloc();
         let _g = Guard(path);
-        let mut v: BStackVec<u32, _> = BStackVec::new(&alloc).unwrap();
+        let mut v = BStackByteVec::new(&alloc).unwrap();
         v.push(7).unwrap();
         v.truncate(5).unwrap(); // no-op
         assert_eq!(v.len().unwrap(), 1);
-        assert_eq!(v.get(0).unwrap(), Some(7u32));
+        assert_eq!(v.get(0).unwrap(), Some(7u8));
     }
 
     #[test]
-    fn clear_zeros_all_element_slots() {
+    fn clear_zeros_all_byte_slots() {
         let (alloc, path) = make_alloc();
         let _g = Guard(path);
-        let mut v: BStackVec<u64, _> = BStackVec::new(&alloc).unwrap();
+        let mut v = BStackByteVec::new(&alloc).unwrap();
         v.push(1).unwrap();
         v.push(2).unwrap();
         v.push(3).unwrap();
 
-        let block = v.raw_block();
+        // SAFETY: We do not call any reallocation method while holding `block`.
+        let block = unsafe { v.raw_block() };
         v.clear().unwrap();
 
         assert_eq!(v.len().unwrap(), 0);
-        // All three element slots must be zeroed (offsets 16..40).
-        let elems = block.read_range(16, 16 + 3 * 8).unwrap();
-        assert_eq!(elems, vec![0u8; 24]);
+        // All three byte slots must be zeroed (offsets 16..19).
+        let elems = block.read_range(16, 19).unwrap();
+        assert_eq!(elems, vec![0u8; 3]);
     }
 
     // ── reserve / resize overflow ─────────────────────────────────────────────
@@ -789,7 +741,7 @@ mod tests {
     fn reserve_noop_when_capacity_sufficient() {
         let (alloc, path) = make_alloc();
         let _g = Guard(path);
-        let mut v: BStackVec<u32, _> = BStackVec::with_capacity(10, &alloc).unwrap();
+        let mut v = BStackByteVec::with_capacity(10, &alloc).unwrap();
         v.push(1).unwrap();
         v.reserve(5).unwrap(); // len=1, cap=10 => sufficient
         assert_eq!(v.capacity().unwrap(), 10);
@@ -799,7 +751,7 @@ mod tests {
     fn reserve_grows_when_needed() {
         let (alloc, path) = make_alloc();
         let _g = Guard(path);
-        let mut v: BStackVec<u32, _> = BStackVec::new(&alloc).unwrap();
+        let mut v = BStackByteVec::new(&alloc).unwrap();
         v.push(1).unwrap();
         // len=1, cap>=4; reserve(100) must grow to at least 101.
         v.reserve(100).unwrap();
@@ -810,7 +762,7 @@ mod tests {
     fn reserve_overflow_returns_error() {
         let (alloc, path) = make_alloc();
         let _g = Guard(path);
-        let mut v: BStackVec<u32, _> = BStackVec::new(&alloc).unwrap();
+        let mut v = BStackByteVec::new(&alloc).unwrap();
         v.push(1).unwrap(); // len=1
         // Requesting u64::MAX additional would overflow len+additional.
         let err = v.reserve(u64::MAX).unwrap_err();
@@ -821,13 +773,13 @@ mod tests {
     fn resize_grow_fills_with_value() {
         let (alloc, path) = make_alloc();
         let _g = Guard(path);
-        let mut v: BStackVec<u32, _> = BStackVec::new(&alloc).unwrap();
+        let mut v = BStackByteVec::new(&alloc).unwrap();
         v.push(1).unwrap();
-        v.resize(5, 99u32).unwrap();
+        v.resize(5, 99u8).unwrap();
         assert_eq!(v.len().unwrap(), 5);
-        assert_eq!(v.get(0).unwrap(), Some(1u32));
+        assert_eq!(v.get(0).unwrap(), Some(1u8));
         for i in 1..5 {
-            assert_eq!(v.get(i).unwrap(), Some(99u32));
+            assert_eq!(v.get(i).unwrap(), Some(99u8));
         }
     }
 
@@ -835,40 +787,36 @@ mod tests {
     fn resize_shrink_truncates() {
         let (alloc, path) = make_alloc();
         let _g = Guard(path);
-        let mut v: BStackVec<u32, _> = BStackVec::from_slice(&[1, 2, 3, 4, 5], &alloc).unwrap();
+        let mut v = BStackByteVec::from_slice(&[1, 2, 3, 4, 5], &alloc).unwrap();
         v.resize(2, 0).unwrap();
         assert_eq!(v.len().unwrap(), 2);
-        assert_eq!(v.get(0).unwrap(), Some(1u32));
-        assert_eq!(v.get(1).unwrap(), Some(2u32));
+        assert_eq!(v.get(0).unwrap(), Some(1u8));
+        assert_eq!(v.get(1).unwrap(), Some(2u8));
         assert_eq!(v.get(2).unwrap(), None);
     }
 
     // ── as_slice ──────────────────────────────────────────────────────────────
 
     #[test]
-    fn as_slice_covers_populated_elements_only() {
+    fn as_slice_covers_populated_bytes_only() {
         let (alloc, path) = make_alloc();
         let _g = Guard(path);
-        let v = BStackVec::from_slice(&[10u32, 20, 30], &alloc).unwrap();
+        let v = BStackByteVec::from_slice(&[10u8, 20, 30], &alloc).unwrap();
         let s = v.as_slice().unwrap();
-        assert_eq!(s.len(), 3 * size_of::<u32>() as u64);
+        assert_eq!(s.len(), 3);
         let bytes = s.read().unwrap();
-        let mut expected = [0u8; 12];
-        expected[0..4].copy_from_slice(&10u32.to_le_bytes());
-        expected[4..8].copy_from_slice(&20u32.to_le_bytes());
-        expected[8..12].copy_from_slice(&30u32.to_le_bytes());
-        assert_eq!(bytes, expected);
+        assert_eq!(bytes, [10u8, 20, 30]);
     }
 
     // ── iterator snapshot semantics ───────────────────────────────────────────
 
     #[test]
-    fn iter_yields_all_elements_in_order() {
+    fn iter_yields_all_bytes_in_order() {
         let (alloc, path) = make_alloc();
         let _g = Guard(path);
-        let src = [3u64, 1, 4, 1, 5, 9, 2, 6];
-        let v = BStackVec::from_slice(&src, &alloc).unwrap();
-        let collected: Vec<u64> = v.iter().unwrap().map(|r| r.unwrap()).collect();
+        let src = [3u8, 1, 4, 1, 5, 9, 2, 6];
+        let v = BStackByteVec::from_slice(&src, &alloc).unwrap();
+        let collected: Vec<u8> = v.iter().unwrap().map(|r| r.unwrap()).collect();
         assert_eq!(collected, src);
     }
 
@@ -876,7 +824,7 @@ mod tests {
     fn iter_size_hint_tracks_remaining() {
         let (alloc, path) = make_alloc();
         let _g = Guard(path);
-        let v = BStackVec::from_slice(&[1u32, 2, 3, 4, 5], &alloc).unwrap();
+        let v = BStackByteVec::from_slice(&[1u8, 2, 3, 4, 5], &alloc).unwrap();
         let mut it = v.iter().unwrap();
         assert_eq!(it.size_hint(), (5, Some(5)));
         it.next().unwrap().unwrap();
@@ -888,12 +836,9 @@ mod tests {
 
     #[test]
     fn iter_stops_at_len_snapshot() {
-        // Build a vec, take an iter (which snapshots len), then verify the iter
-        // sees exactly that many elements.  The borrow checker prevents mutation
-        // while the iter is live, so we verify the element count indirectly.
         let (alloc, path) = make_alloc();
         let _g = Guard(path);
-        let v = BStackVec::from_slice(&[10u64, 20, 30], &alloc).unwrap();
+        let v = BStackByteVec::from_slice(&[10u8, 20, 30], &alloc).unwrap();
         let count = v.iter().unwrap().count();
         assert_eq!(count, 3);
     }
@@ -902,48 +847,9 @@ mod tests {
     fn iter_on_empty_vec_yields_nothing() {
         let (alloc, path) = make_alloc();
         let _g = Guard(path);
-        let v: BStackVec<u64, _> = BStackVec::new(&alloc).unwrap();
+        let v = BStackByteVec::new(&alloc).unwrap();
         let count = v.iter().unwrap().count();
         assert_eq!(count, 0);
-    }
-
-    // ── zero-sized T ─────────────────────────────────────────────────────────
-
-    #[test]
-    fn zst_push_pop_tracks_len() {
-        // `size_of::<()>() == 0`; the block never grows beyond the 16-byte header.
-        let (alloc, path) = make_alloc();
-        let _g = Guard(path);
-        let mut v: BStackVec<(), _> = BStackVec::new(&alloc).unwrap();
-        assert_eq!(v.len().unwrap(), 0);
-        v.push(()).unwrap();
-        v.push(()).unwrap();
-        v.push(()).unwrap();
-        assert_eq!(v.len().unwrap(), 3);
-        assert_eq!(v.get(2).unwrap(), Some(()));
-        assert_eq!(v.pop().unwrap(), Some(()));
-        assert_eq!(v.len().unwrap(), 2);
-    }
-
-    #[test]
-    fn zst_iter_yields_correct_count() {
-        let (alloc, path) = make_alloc();
-        let _g = Guard(path);
-        let v = BStackVec::from_slice(&[(), (), (), ()], &alloc).unwrap();
-        let count = v.iter().unwrap().count();
-        assert_eq!(count, 4);
-    }
-
-    #[test]
-    fn zst_block_size_is_always_header_only() {
-        let (alloc, path) = make_alloc();
-        let _g = Guard(path);
-        let mut v: BStackVec<(), _> = BStackVec::new(&alloc).unwrap();
-        // Push many ZSTs; the raw block should stay at 16 bytes.
-        for _ in 0..100 {
-            v.push(()).unwrap();
-        }
-        assert_eq!(v.raw_block().len(), 16);
     }
 
     // ── integration: block_size overflow ─────────────────────────────────────
@@ -952,29 +858,16 @@ mod tests {
     fn with_capacity_overflow_returns_error() {
         let (alloc, path) = make_alloc();
         let _g = Guard(path);
-        // u64::MAX elements of u64 = u64::MAX * 8, which overflows u64.
-        let err = BStackVec::<u64, _>::with_capacity(u64::MAX, &alloc).unwrap_err();
+        // u64::MAX + 16 overflows u64.
+        let err = BStackByteVec::with_capacity(u64::MAX, &alloc).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
-    }
-
-    #[test]
-    fn with_capacity_overflow_zst_is_fine() {
-        // ZST elem_size = 0 so u64::MAX * 0 = 0; no overflow.
-        let (alloc, path) = make_alloc();
-        let _g = Guard(path);
-        let v = BStackVec::<(), _>::with_capacity(u64::MAX, &alloc).unwrap();
-        assert_eq!(v.capacity().unwrap(), u64::MAX);
-        assert_eq!(v.raw_block().len(), 16);
     }
 
     #[test]
     fn reserve_overflow_through_grow_returns_error() {
         let (alloc, path) = make_alloc();
         let _g = Guard(path);
-        // Start with a vec near the edge of what block_size can represent.
-        // After one push (cap grows to 4), request enough additional that
-        // len + additional overflows u64.
-        let mut v: BStackVec<u64, _> = BStackVec::new(&alloc).unwrap();
+        let mut v = BStackByteVec::new(&alloc).unwrap();
         v.push(1).unwrap();
         let err = v.reserve(u64::MAX).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
@@ -987,21 +880,13 @@ mod tests {
         use std::io::Read;
         let (alloc, path) = make_alloc();
         let _g = Guard(path);
-        let v = BStackVec::from_slice(&[0x0A0Bu16, 0x0C0D, 0x0E0F], &alloc).unwrap();
+        let v = BStackByteVec::from_slice(&[0x0Au8, 0x0B, 0x0C], &alloc).unwrap();
 
         let s = v.as_slice().unwrap();
         let mut reader = s.reader();
-        let mut buf = [0u8; 6];
+        let mut buf = [0u8; 3];
         reader.read_exact(&mut buf).unwrap();
-
-        // Elements are stored in the native repr of u16 (little-endian on all
-        // supported platforms), laid out consecutively starting at byte 0 of
-        // the element region.
-        let expected: Vec<u8> = [0x0A0Bu16, 0x0C0D, 0x0E0F]
-            .iter()
-            .flat_map(|x| x.to_ne_bytes())
-            .collect();
-        assert_eq!(&buf, expected.as_slice());
+        assert_eq!(&buf, &[0x0Au8, 0x0B, 0x0C]);
     }
 
     // ── integration: dealloc reclaims tail ───────────────────────────────────
@@ -1012,7 +897,7 @@ mod tests {
         let _g = Guard(path);
 
         let size_before = alloc.stack().len().unwrap();
-        let mut v: BStackVec<u64, _> = BStackVec::new(&alloc).unwrap();
+        let mut v = BStackByteVec::new(&alloc).unwrap();
         v.push(1).unwrap();
         v.push(2).unwrap();
         let size_after_push = alloc.stack().len().unwrap();
@@ -1034,8 +919,8 @@ mod tests {
         // Pre-size both vecs so neither triggers a realloc: LinearBStackAllocator
         // can only grow the tail allocation, so interleaved pushes would fail
         // if the blocks needed to move.
-        let mut a: BStackVec<u32, _> = BStackVec::with_capacity(4, &alloc).unwrap();
-        let mut b: BStackVec<u32, _> = BStackVec::with_capacity(4, &alloc).unwrap();
+        let mut a = BStackByteVec::with_capacity(4, &alloc).unwrap();
+        let mut b = BStackByteVec::with_capacity(4, &alloc).unwrap();
 
         a.push(10).unwrap();
         b.push(20).unwrap();
@@ -1044,10 +929,10 @@ mod tests {
 
         assert_eq!(a.len().unwrap(), 2);
         assert_eq!(b.len().unwrap(), 2);
-        assert_eq!(a.get(0).unwrap(), Some(10u32));
-        assert_eq!(a.get(1).unwrap(), Some(11u32));
-        assert_eq!(b.get(0).unwrap(), Some(20u32));
-        assert_eq!(b.get(1).unwrap(), Some(21u32));
+        assert_eq!(a.get(0).unwrap(), Some(10u8));
+        assert_eq!(a.get(1).unwrap(), Some(11u8));
+        assert_eq!(b.get(0).unwrap(), Some(20u8));
+        assert_eq!(b.get(1).unwrap(), Some(21u8));
     }
 
     // ── integration: as_slice length after mutation ───────────────────────────
@@ -1056,14 +941,14 @@ mod tests {
     fn as_slice_len_tracks_vec_len() {
         let (alloc, path) = make_alloc();
         let _g = Guard(path);
-        let mut v: BStackVec<u64, _> = BStackVec::new(&alloc).unwrap();
+        let mut v = BStackByteVec::new(&alloc).unwrap();
 
         assert_eq!(v.as_slice().unwrap().len(), 0);
         v.push(1).unwrap();
-        assert_eq!(v.as_slice().unwrap().len(), size_of::<u64>() as u64);
+        assert_eq!(v.as_slice().unwrap().len(), 1);
         v.push(2).unwrap();
-        assert_eq!(v.as_slice().unwrap().len(), 2 * size_of::<u64>() as u64);
+        assert_eq!(v.as_slice().unwrap().len(), 2);
         v.pop().unwrap();
-        assert_eq!(v.as_slice().unwrap().len(), size_of::<u64>() as u64);
+        assert_eq!(v.as_slice().unwrap().len(), 1);
     }
 }
