@@ -4,6 +4,7 @@ mod alloc_fuzz_tests {
     use crate::BStack;
     use crate::alloc::{
         BStackSlice, BStackSliceAllocator, FirstFitBStackAllocator, GhostTreeBstackAllocator,
+        SlabBStackAllocator,
     };
     use rand::RngExt;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -354,6 +355,9 @@ mod alloc_fuzz_tests {
 
     fuzz_suite!(first_fit, FirstFitBStackAllocator::new);
     fuzz_suite!(ghost_tree, GhostTreeBstackAllocator::new);
+    fuzz_suite!(slab_8, |bs| SlabBStackAllocator::new(bs, 8));
+    fuzz_suite!(slab_16, |bs| SlabBStackAllocator::new(bs, 16));
+    fuzz_suite!(slab_64, |bs| SlabBStackAllocator::new(bs, 64));
 
     // double_free_error is FirstFit-only: GhostTree carries no per-block is_free
     // flag, so reliable double-free detection would require false-positives on

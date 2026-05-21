@@ -322,7 +322,11 @@ impl BStackAllocator for SlabBStackAllocator {
         let new_n = self.blocks_needed(new_len);
 
         if old_n == new_n {
-            // Same backing blocks: only the user-visible length changes.
+            // Same backing blocks: zero newly-exposed bytes then adjust visible length.
+            if new_len > slice.len() {
+                self.stack
+                    .zero(slice.start() + slice.len(), new_len - slice.len())?;
+            }
             // SAFETY: new_len still fits within the same block_size-aligned region
             return Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) });
         }
@@ -337,6 +341,10 @@ impl BStackAllocator for SlabBStackAllocator {
                 self.stack.extend(new_backing - old_backing)?;
             } else {
                 self.stack.discard(old_backing - new_backing)?;
+            }
+            if new_len > slice.len() {
+                self.stack
+                    .zero(slice.start() + slice.len(), new_len - slice.len())?;
             }
             // SAFETY: slice extended or shrunk in place at the tail
             return Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) });
