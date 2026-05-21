@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **In-memory caching of the locked region (`open_cached`, `open_locked_up_to_cached`)**: Opening a `BStack` with [`open_cached`](BStack::open_cached) enables an opt-in in-memory mirror of the locked region. Each subsequent `lock_up_to(n)` call reads the newly locked bytes from disk into a heap-allocated `Vec<u8>` with power-of-two capacity growth. Reads whose range falls entirely within the locked region are then served by copying from the buffer with no syscall. The trade-off is that `lock_up_to` becomes significantly more expensive on cached stacks (it must read up to `n` bytes from disk before returning). [`open_locked_up_to_cached`](BStack::open_locked_up_to_cached) combines `open_cached` and `lock_up_to` into a single call for the common pattern of locking a known prefix at open time. Stacks opened with [`open`](BStack::open) or [`open_locked_up_to`](BStack::open_locked_up_to) are unaffected.
+
 ### Changed
 
 - **`FirstFitBStackAllocator` internal reads converted from `get` to `get_into` with stack-allocated buffers** (`alloc` + `set` features): Three internal reads — the 32-byte allocator header on `new`, the 8-byte `free_head` field at the start of `find_large_enough_block`, and the 8-byte block size during `realloc`'s same-block fast path — now use fixed-size stack arrays and `get_into` instead of `get`. This eliminates three small heap allocations per call to those paths, with no change to observable behaviour.
