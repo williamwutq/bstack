@@ -2261,7 +2261,8 @@ impl BStack {
     ///
     /// # Errors
     ///
-    /// Propagates all errors from [`open_cached`](Self::open_cached).
+    /// Propagates all errors from [`open_cached`](Self::open_cached) and
+    /// [`lock_up_to`](Self::lock_up_to).
     /// Returns [`io::ErrorKind::InvalidInput`] if `n` exceeds the payload
     /// length of the opened file.
     pub fn open_locked_up_to_cached(path: impl AsRef<Path>, n: u64) -> io::Result<Self> {
