@@ -417,7 +417,7 @@ bstack = { version = "0.2", features = ["set"] }
 
 ### `alloc`
 
-Enables the region-management layer on top of `BStack`: `BStackAllocator`, `BStackBulkAllocator`, `BStackSlice`, `BStackSliceReader`, `LinearBStackAllocator`, `FirstFitBStackAllocator`, `GhostTreeBstackAllocator`, `ManualAllocator`, and the `BStackSliceAllocator` supertrait.
+Enables the region-management layer on top of `BStack`: `BStackAllocator`, `BStackBulkAllocator`, `BStackSlice`, `BStackSliceReader`, `LinearBStackAllocator`, `FirstFitBStackAllocator`, `GhostTreeBstackAllocator`, `SlabBStackAllocator`, `ManualAllocator`, and the `BStackSliceAllocator` supertrait.
 
 ```toml
 [dependencies]
@@ -708,6 +708,74 @@ let c = alloc.alloc(64)?; // may reuse a's slot
 // Bulk: one block allocation, one block free when returned together.
 let slices = alloc.alloc_bulk(&[32, 64, 128])?;
 alloc.dealloc_bulk(&slices)?;
+
+let stack = alloc.into_stack();
+```
+
+### `SlabBStackAllocator` (`alloc + set` features)
+
+A fixed-block slab allocator.  All blocks in the arena are exactly `block_size`
+bytes (must be ≥ 8) with **no** per-block header or footer.  Freed blocks form
+an intrusive singly-linked free list stored in the first 8 bytes of each free
+block; live allocations carry zero metadata overhead.
+
+```toml
+[dependencies]
+bstack = { version = "0.2", features = ["alloc", "set"] }
+```
+
+#### On-disk layout
+
+```
+[ reserved(24) | magic[8] | block_size[8] | free_head[8] | arena ... ]
+  ^               ^
+  offset 0        offset 24 (allocator header start)
+  user data       offset 48 (arena start)
+```
+
+* **`magic`** — `"ALSL\x00\x01\x00\x00"` (version 0.1).
+* **`block_size`** — fixed size of every arena block, little-endian `u64`.
+* **`free_head`** — payload offset of the first free block's first byte, or `0` (sentinel).
+* **Free block** — first 8 bytes hold the payload offset of the next free block (`u64` LE, `0` = end of list); remaining bytes belong to the caller when live.
+
+#### Allocation policy
+
+| Request | Strategy |
+|---------|----------|
+| `len == 0` | Null handle (offset 0, len 0) |
+| `len ≤ block_size` | Pop from free list; extend tail by `block_size` if empty |
+| `len > block_size` | Extend tail by `⌈len / block_size⌉ × block_size` |
+
+The returned slice covers exactly `len` bytes; backing blocks have no visible overhead.
+
+#### Deallocation policy
+
+| Case | Strategy |
+|------|----------|
+| Oversized block at tail | `BStack::discard` (single call; crash-safe) |
+| All other blocks | Segment into `block_size` chunks; prepend each to free list |
+
+Slab blocks at the tail are added to the free list (not discarded) so they can be reused without searching.
+
+#### Crash consistency
+
+Each free-list mutation is two `BStack` calls: write the next-pointer into the block, then update `free_head` in the header.  A crash between the two calls leaks the block being added or removed but leaves the rest of the free list intact.  No recovery scan is required on reopen.
+
+#### Example
+
+```rust
+use bstack::{BStack, BStackAllocator, SlabBStackAllocator};
+
+let alloc = SlabBStackAllocator::new(BStack::open("data.bstack")?, 64)?;
+
+let a = alloc.alloc(48)?;
+let b = alloc.alloc(48)?;
+a.write(b"hello")?;
+
+alloc.dealloc(a)?;        // returned to free list
+
+let c = alloc.alloc(32)?; // reuses a's slot
+assert_eq!(c.start(), a.start());
 
 let stack = alloc.into_stack();
 ```
