@@ -66,3 +66,151 @@ The `FirstFitBStackAllocator` could benefit from atomic operations to improve pe
 - Should this optimization be added as an optional feature flag, or required for all users? If added, we end up maintaining two implementations of `FirstFitBStackAllocator`; if required, all users need the atomic flag.
 
 ---
+
+=======
+
+## Adding `SlabBStackAllocator` for fixed-block slab allocation
+
+**Feature flag:** `alloc` + `set`
+**Breaking change:** No (additive; new type only)
+
+### Motivation
+
+Workloads that repeatedly allocate and free regions of a similar small size benefit from a slab allocator that eliminates fragmentation by keeping all blocks the same size. Blocks carry **no metadata**. The free list pointers are stored inside freed blocks.
+
+### Design
+
+Introduce `SlabBStackAllocator` in `src/alloc/slab.rs`, implementing `BStackSliceAllocator` like all existing default allocators.
+
+```rust
+pub struct SlabBStackAllocator {
+    stack: BStack,
+    block_size: u64, // cached from header; must be ≥ 8; never changes after init
+}
+```
+
+The payload begins with an allocator header followed by the block arena:
+
+```text
+[ reserved(24) | magic[8] | block_size[8] | free_head[8] | arena ... ]
+  ^               ^
+  offset 0        offset 24 (allocator header start)
+  user data       offset 48 (arena start)
+```
+
+The magic number (e.g. `ALSL\x00\x01\x00\x00`) identifies the format and version. `block_size` and `free_head` are written back to the header on every mutation, making them durable. All blocks in the arena are exactly `block_size` bytes with **no header or footer**. When a block is free, its first 8 bytes hold the offset of the next free block (little-endian `u64`, sentinel `u64::MAX`); when live, those bytes belong to the caller — there is no per-block metadata at any time.
+
+**`alloc(len)`:** If `len ≤ block_size`, pop from the free list (zero the next-pointer, update header) or extend the tail by `block_size`. If `len > block_size`, always extend the tail to a multiple of `block_size`. The returned slice covers exactly `len` bytes.
+
+**`dealloc(slice)`:** If `len > block_size` and the slice is the tail, `discard`. For slab blocks, segment the backing region into `block_size` chunks, prepend each to the free list, and write the new `free_head` to the header. For oversized non-tail blocks, if the block size is N * `block_size`, segment it into N blocks, prepend all to the free list, and write the new `free_head` to the header. This allows oversized non-tail blocks to be reused without leaking.
+
+**`realloc`:** If the block is oversized and the new size is ≤ `block_size`, the excess portion can be segmented into a new block and added to the free list. If the block is oversized and the new size is > `block_size`, it can be reallocated in place if it's the tail or if the next block(s) are free and can be coalesced. Otherwise, a new block can be allocated, data copied, and the old block deallocated.
+
+### Open questions
+
+- Should `block_size < 8` be a `Result` error or a panic?
+
+---
+
+## In-memory caching of the locked region
+
+**Feature flag:** None
+**Breaking change:** No (additive; opt-in)
+
+### Motivation
+
+Reads to the locked region already bypass the `RwLock`, but they still issue a `pread(2)` syscall per call. For workloads that read the locked region on every allocation or lookup — e.g., an allocator header or a hot metadata block — the syscall overhead dominates. Caching the locked region in memory would reduce reads to a plain slice copy with no kernel involvement.
+
+### Design
+
+When `lock_up_to(n)` is called (on a `BStack` opened with caching enabled), after publishing the new locked boundary the implementation reads the entire `[0, n)` region into a `Vec<u8>` and stores it in an `Option<Box<[u8]>>` field on `BStack`. Subsequent reads whose range falls entirely within the cached region are served by copying from that slice, with no syscall.
+
+The cache is populated once per `lock_up_to` call. Because the locked region is immutable by definition, the cache never needs to be invalidated or written back.
+
+`lock_up_to` is therefore significantly slower than today: it must read up to `n` bytes from disk into memory before returning. This is the central trade-off.
+
+Consult the open questions below for design decisions that need to be made. Considering benchmarking the performance to determine whether this optimization is worthwhile, and if so, what the best design choices are.
+
+### Open questions
+
+- Should caching be opt-in at `open` time (e.g., `BStack::open_cached`) or toggled per `lock_up_to` call? This means it should be a constructor option, as the cache is tied to the locked region and cannot be easily enabled or disabled on the fly without significant complexity in managing cache state and consistency.
+- Should the cache be a single contiguous `Box<[u8]>` (simplest) or a memory-mapped region (avoids the extra copy and lets the OS manage eviction)?
+- How should extensions to the locked region (subsequent `lock_up_to` calls) update the cache — reallocate and copy, or maintain a growable `Vec<u8>`?
+- Should the cached bytes be aligned to a cache line or page boundary for SIMD or `mmap` compatibility?
+- Is the memory overhead acceptable for large locked regions? Should a size cap be enforced?
+
+---
+
+## Adding `BStackVec<T>` for typed vector storage
+
+**Feature flag:** `BSTACK_FEATURE_SET`
+**Breaking change:** No (additive; new type only)
+
+### Motivation
+
+While `BStackSlice` provides a flexible byte-oriented view of allocated blocks, many applications would benefit from a typed vector abstraction that manages element layout, length tracking, and safe access patterns. A `BStackVec<T>` type would provide a convenient API for storing and manipulating sequences of typed data on a `BStack`, while still leveraging the underlying durability and crash-safety guarantees.
+
+### Design
+
+`BStackVec<T>` mirrors Rust's standard `Vec<T>` API, but backed by a `BStack` allocation. It would manage its own length and capacity metadata, stored in the block header or a reserved prefix.
+
+#### Memory layout
+
+The allocation layout would consist of:
+- **Header** (16 bytes): length (u64) + capacity (u64)
+- **Elements**: inline typed data, stored as `[T; capacity]`
+
+The header occupies the first 16 bytes of the block, with element data following. This ensures that the metadata is always present and can be recovered even if the `BStackVec` handle is lost.
+
+#### API surface
+
+Core methods mirroring `Vec<T>`:
+
+```rust
+impl<'a, T: Copy, A: BStackAllocator> BStackVec<'a, T, A> {
+    // Creation and destruction
+    pub fn new(alloc: &'a A) -> Result<Self, A::Error>;
+    pub fn with_capacity(capacity: u64, alloc: &'a A) -> Result<Self, A::Error>;
+    pub fn from_slice(slice: &[T], alloc: &'a A) -> Result<Self, A::Error>;
+    
+    // Accessors
+    pub fn len(&self) -> Result<u64, A::Error>;
+    pub fn capacity(&self) -> Result<u64, A::Error>;
+    pub fn is_empty(&self) -> Result<u64, A::Error>;
+    
+    // Element access
+    pub fn get(&self, index: u64) -> Result<Option<T>, A::Error>;
+    pub fn as_slice(&self) -> Result<BStackSlice<'a, A>, A::Error>;
+    
+    // Modification
+    pub fn push(&mut self, value: T) -> Result<(), A::Error>;
+    pub fn pop(&mut self) -> Result<Option<T>, A::Error>;
+    pub fn truncate(&mut self, len: u64) -> Result<(), A::Error>;
+    pub fn clear(&mut self) -> Result<(), A::Error>;
+    pub fn reserve(&mut self, additional: u64) -> Result<(), A::Error>;
+    pub fn resize(&mut self, new_len: u64, value: T) -> Result<(), A::Error>;
+    
+    // Iteration
+    pub fn iter(&self) -> Result<BStackVecIter<'a, T, A>, A::Error>;
+    pub fn iter_mut(&mut self) -> Result<BStackVecIterMut<'a, T, A>, A::Error>;
+}
+```
+
+#### Growth strategy
+
+When capacity is exceeded, `BStackVec` would use the `BStack`'s `realloc` to grow the block, similar to `Vec`'s doubling strategy (or a configurable policy). The metadata prefix would be preserved and updated with new capacity.
+
+#### Guarding support
+
+`BStackVec<T, A>` should integrate with `BStackGuardedSlice` by providing a `as_guarded_slice()` method that wraps the underlying slice with a guard, enabling transparent transforms across the entire vector.
+
+#### Serialization considerations
+
+`BStackVec` should be serializable to persistent storage by writing only the populated portion (length, not capacity) and reconstructable on load by reading back the metadata from the block header.
+
+### Open questions
+
+- **Generic bounds on `T`:** Should `T` be required to implement `Copy`, or should a `Drop` implementation be provided for types with destructors? A `Drop` impl would be complex, as it must be called on remaining elements when the vec is deallocated.
+- **Error handling:** Should methods return `Result` for all operations, or should some (e.g., `len()`, `capacity()`) be infallible? Returning `Result` allows for better error propagation but may be more verbose for simple accessors.
+- **Initialization of new elements:** When growing the vector, should new elements be zero-initialized, left uninitialized (i.e. `MaybeUninit`), or should we require `T` to be `Default` and call `default()`? Zero-initialization is safer and guranteed for newly allocated space, but may be unnecessary overhead for some types.
+- **Zeroing on deallocation:** Should empty parts of the vector be zeroed on deallocation for security, or should this be left to the caller? Zeroing adds overhead but can prevent data leakage.
