@@ -2134,7 +2134,9 @@ impl BStack {
     /// payload length.
     pub fn lock_up_to(&self, n: u64) -> io::Result<()> {
         // Acquire the write lock to serialise against any in-flight writers.
-        let file = self.lock.write().unwrap();
+        #[allow(unused_mut)]
+        // `mut` is not needed on Unix and Windows, but other platforms may need it for the file handle.
+        let mut file = self.lock.write().unwrap();
         let data_size = file.metadata()?.len().saturating_sub(HEADER_SIZE);
         let current_locked = self.locked.load(Ordering::Relaxed);
         if n < current_locked {
