@@ -185,8 +185,8 @@
 //!     `pread(2)` (Unix) or `ReadFile` + `OVERLAPPED` (Windows).
 //!   - On **cached** stacks (all platforms), reads are served from the
 //!     in-memory buffer under a `Mutex` (so RwLock-free, but not lock-free).
-//!   The `fstat` size check is skipped on this path — the locked length is a
-//!   sufficient upper bound.
+//!     The `fstat` size check is skipped on this path — the locked length is a
+//!     sufficient upper bound.
 //!
 //! * **Write protection.**  [`set`](BStack::set), [`zero`](BStack::zero),
 //!   [`swap`](BStack::swap), [`swap_into`](BStack::swap_into),
