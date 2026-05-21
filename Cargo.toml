@@ -35,6 +35,11 @@ windows-sys = { version = "0.52", features = [
 
 [dev-dependencies]
 rand = "0.10.1"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "locked_region"
+harness = false
 
 [package.metadata.docs.rs]
 all-features = true
