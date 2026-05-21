@@ -136,35 +136,6 @@ The magic number (e.g. `ALSL\x00\x01\x00\x00`) identifies the format and version
 
 ---
 
-## In-memory caching of the locked region
-
-**Feature flag:** None
-**Breaking change:** No (additive; opt-in)
-
-### Motivation
-
-Reads to the locked region already bypass the `RwLock`, but they still issue a `pread(2)` syscall per call. For workloads that read the locked region on every allocation or lookup — e.g., an allocator header or a hot metadata block — the syscall overhead dominates. Caching the locked region in memory would reduce reads to a plain slice copy with no kernel involvement.
-
-### Design
-
-When `lock_up_to(n)` is called (on a `BStack` opened with caching enabled), after publishing the new locked boundary the implementation reads the entire `[0, n)` region into a `Vec<u8>` and stores it in an `Option<Box<[u8]>>` field on `BStack`. Subsequent reads whose range falls entirely within the cached region are served by copying from that slice, with no syscall.
-
-The cache is populated once per `lock_up_to` call. Because the locked region is immutable by definition, the cache never needs to be invalidated or written back.
-
-`lock_up_to` is therefore significantly slower than today: it must read up to `n` bytes from disk into memory before returning. This is the central trade-off.
-
-Consult the open questions below for design decisions that need to be made. Considering benchmarking the performance to determine whether this optimization is worthwhile, and if so, what the best design choices are.
-
-### Open questions
-
-- Should caching be opt-in at `open` time (e.g., `BStack::open_cached`) or toggled per `lock_up_to` call? This means it should be a constructor option, as the cache is tied to the locked region and cannot be easily enabled or disabled on the fly without significant complexity in managing cache state and consistency.
-- Should the cache be a single contiguous `Box<[u8]>` (simplest) or a memory-mapped region (avoids the extra copy and lets the OS manage eviction)?
-- How should extensions to the locked region (subsequent `lock_up_to` calls) update the cache — reallocate and copy, or maintain a growable `Vec<u8>`?
-- Should the cached bytes be aligned to a cache line or page boundary for SIMD or `mmap` compatibility?
-- Is the memory overhead acceptable for large locked regions? Should a size cap be enforced?
-
----
-
 ## Adding `BStackVec<T>` for typed vector storage
 
 **Feature flag:** `alloc` + `set`
