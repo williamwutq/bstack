@@ -62,6 +62,15 @@ bstack_slice_t bstack_slice_from_bytes(bstack_allocator_t *a,
     return s;
 }
 
+bstack_slice_t bstack_slice_empty(bstack_allocator_t *a)
+{
+    bstack_slice_t s;
+    s.allocator = a;
+    s.offset    = 0;
+    s.len       = 0;
+    return s;
+}
+
 /* =========================================================================
  * bstack_slice_t — I/O
  * ====================================================================== */

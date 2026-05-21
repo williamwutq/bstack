@@ -311,7 +311,7 @@
 //! | Feature | Description |
 //! |---------|-------------|
 //! | `set`   | Enables [`BStack::set`] and [`BStack::zero`] — in-place overwrite of existing payload bytes (or with zeros) without changing the file size. |
-//! | `alloc` | Enables [`BStackAllocator`], [`BStackBulkAllocator`], [`BStackSlice`], [`BStackSliceReader`], and [`LinearBStackAllocator`] — region-based allocation over a `BStack` payload. |
+//! | `alloc` | Enables [`BStackAllocator`], [`BStackBulkAllocator`], [`BStackSlice`], [`BStackSliceReader`], and [`LinearBStackAllocator`] — region-based allocation over a `BStack` payload. Combined with `set`, also enables [`BStackSliceWriter`], [`FirstFitBStackAllocator`], [`GhostTreeBstackAllocator`], and [`BStackByteVec`]. |
 //! | `atomic` | Enables [`BStack::atrunc`], [`BStack::splice`], [`BStack::splice_into`], [`BStack::try_extend`], [`BStack::try_discard`], and [`BStack::replace`] — compound read-modify-write operations that hold the write lock across what would otherwise be separate calls. Combined with `set`, also enables [`BStack::swap`], [`BStack::swap_into`], [`BStack::cas`], and [`BStack::process`]. |
 //!
 //! Enable with:
@@ -370,6 +370,16 @@
 //!   [`BStackAllocator`].  Tracks allocated and freed regions in memory and
 //!   panics on overlapping allocations, double-frees, or partial frees.
 //!   Not for production use.
+//!
+//! * [`BStackByteVec`]`<'a, A>` — a growable byte (`u8`) vector backed by a
+//!   [`BStack`] allocation (requires `alloc` + `set`).  Mirrors the core
+//!   [`Vec<u8>`] API: `new`, `with_capacity`, `from_slice`, `push`, `pop`,
+//!   `get`, `read_bytes`, `as_slice`, `truncate`, `clear`, `reserve`,
+//!   `resize`, and `iter`.
+//!   The block stores a 16-byte header (`len`, `cap`) followed by the byte
+//!   data; the header is re-read on every call for crash recoverability.
+//!   `push` doubles capacity (minimum 4); `pop` decrements `len` then zeros
+//!   the vacated slot; `truncate` writes `len` then zeros all removed slots.
 //!
 //! ## Lifetime model
 //!
@@ -434,7 +444,10 @@ pub use alloc::{
     DebugCheckingAllocator, DebugHandle, LinearBStackAllocator, ManualAllocator,
 };
 #[cfg(all(feature = "alloc", feature = "set"))]
-pub use alloc::{BStackSliceWriter, FirstFitBStackAllocator, GhostTreeBstackAllocator};
+pub use alloc::{
+    BStackByteVec, BStackByteVecIter, BStackSliceWriter, FirstFitBStackAllocator,
+    GhostTreeBstackAllocator,
+};
 
 #[cfg(all(feature = "guarded", feature = "atomic"))]
 pub use alloc::{BStackAtomicGuardedSlice, BStackAtomicGuardedSliceSubview};

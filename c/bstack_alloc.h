@@ -71,6 +71,13 @@ bstack_slice_t bstack_slice_from_bytes(bstack_allocator_t *a,
                                         const uint8_t bytes[16]);
 
 /*
+ * Construct a zero-length slice anchored at offset 0.
+ * All I/O operations on the returned slice are no-ops or return empty results.
+ * Useful as a sentinel or default value before a real allocation is available.
+ */
+bstack_slice_t bstack_slice_empty(bstack_allocator_t *a);
+
+/*
  * Read the entire slice into buf.
  * buf must have room for at least s.len bytes; no overflow check is done.
  * Returns 0 on success, -1 on failure (errno set).

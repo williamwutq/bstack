@@ -33,6 +33,34 @@ windows-sys = { version = "0.52", features = [
     "Win32_System_IO",
 ] }
 
+[[example]]
+name = "bstack_bytevec"
+required-features = ["alloc", "set"]
+
+[[example]]
+name = "alloc_basic"
+required-features = ["alloc", "set"]
+
+[[example]]
+name = "alloc_typed"
+required-features = ["alloc", "set"]
+
+[[example]]
+name = "custom_alloc"
+required-features = ["alloc", "set"]
+
+[[example]]
+name = "hashmap"
+required-features = ["set"]
+
+[[example]]
+name = "atomic_ops"
+required-features = ["atomic"]
+
+[[example]]
+name = "atomic_race"
+required-features = ["atomic"]
+
 [dev-dependencies]
 rand = "0.10.1"
 criterion = { version = "0.5", features = ["html_reports"] }
