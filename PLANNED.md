@@ -12,69 +12,39 @@ Reasons:
 
 `BStackGuardedSlice::as_slice` is not actually unsafe as data corruption through misuse doesn't violate memory safety or compromise allocator structure, so marking it unsafe would be misleading per Rust conventions. Documentation and API design already encourage using `read()` and `write()`. Callers using `as_slice()` are expected to understand the implications. In addition, the unsafe `raw_block()` method already exists for cases where hook bypass is needed, and its safety contract documents that hooks must be manually called. If this function is deprecated, it would break existing code, and callers who correctly use `as_slice()` for read-only purposes would need to migrate. Therefore, `as_slice()` as a safe function that returns a `BStackSlice` is sufficient, and the safety contract can be clearly documented without making it `unsafe fn`.
 
+### Making `BStackAllocator::realloc` and `dealloc` `unsafe fn`
+
+Reasons:
+
+While `realloc` and `dealloc` have a slice-origin requirement, the hazard window is now significantly narrowed because constructing a bad handle already requires `unsafe` (via `BStackSlice::from_raw_parts`). A well-reviewed `unsafe` block that constructs a `BStackSlice::from_raw_parts` can be expected to read the safety contract and comply with the origin requirement. The remaining concern is sub-slices: `subslice` and `subslice_range` are *safe* functions that produce slices with an origin different from any allocator-returned handle. However, marking `realloc` and `dealloc` as `unsafe fn` would force all call sites into an `unsafe` block, which may be unnecessarily burdensome given the already narrow hazard window. The best conventions use `unsafe` for operations that can cause undefined behavior and overuse of `unsafe` can lead to desensitization and misuse. As of `BStack` 0.2, the allocator interfaces are already mature and breaking changes should be avoided. Since the origin requirement is a safety contract that can be documented and enforced through careful API design, it may be sufficient to keep `realloc` and `dealloc` as safe functions while clearly documenting the requirements and risks.
+
+Furthermore, `alloc`, `realloc`, and `dealloc` in the `BStackAllocator` trait do not need to operate on `BStackSlice` directly — they operate on an associated handle type. Custom allocator implementations can define handle types that do not support sub-slicing at all, eliminating the origin problem at the type level for those allocators. The sub-slice concern is therefore a consequence of a specific design choice (using `BStackSlice` itself as the raw handle) rather than an inherent flaw in the trait. The recommended approach is for allocators to use a handle type distinct from `BStackSlice`, where converting from handle to `BStackSlice` is straightforward but the reverse is not possible — making the origin requirement a type-level guarantee. The default allocators in this crate currently do not follow this recommendation, but that is a separate concern addressed in the planned features below.
+
 ---
 
-## Making `BStackAllocator::realloc` and `dealloc` `unsafe fn`
+## Introducing a newtype handle for default allocators
 
-**Feature flag:** N/A (core trait)
-**Breaking change:** Yes — all callers and all `impl BStackAllocator` blocks must change
+**Breaking change:** Yes
 
 ### Motivation
 
-Both `realloc` and `dealloc` carry a *slice-origin requirement* that the
-type system cannot enforce: the supplied handle must have been returned by
-`alloc` or a prior `realloc` on the **same allocator instance**.  Passing an
-arbitrary slice — constructed via `BStackSlice::from_raw_parts` or derived
-via `subslice` / `subslice_range` — may silently corrupt the allocator's
-persistent on-disk metadata (free-list pointers, AVL node fields, block
-headers/footers) in a way that is difficult or impossible to recover from.
-
-This is structurally identical to why `std::alloc::GlobalAlloc::dealloc` and
-`realloc` are `unsafe fn`: the contract cannot be expressed as a type
-invariant and violation causes severe, irreversible state corruption.
+The default allocators in this crate (e.g., `FirstFitBStackAllocator`) currently use `BStackSlice` as their raw handle type. Because `BStackSlice` exposes safe `subslice` and `subslice_range` methods, it is possible to produce a slice with an origin that does not correspond to any allocator-returned allocation and then pass it to `realloc` or `dealloc`, violating the origin requirement without any `unsafe` block at the call site. A dedicated newtype handle, constructible only by the allocator, closes this gap at the type level: it can be cheaply dereferenced to `BStackSlice` for reads and writes, but `BStackSlice` cannot be converted back into it, so sub-slices are statically prevented from being used as allocator handles.
 
 ### Design
 
-Change the trait signatures:
+Introduce a newtype (e.g., `BStackAllocatedSlice`) in each default allocator, wrapping `BStackSlice`. `BStackAllocatedSlice` would:
 
-```rust
-// Before
-fn realloc<'a>(&'a self, handle: Self::Allocated<'a>, new_len: u64)
-    -> Result<Self::Allocated<'a>, Self::Error>;
-fn dealloc(&self, handle: Self::Allocated<'_>) -> Result<(), Self::Error>;
+- Implement `Deref<Target = BStackSlice>` or `AsRef<BStackSlice>` for transparent access to slice operations.
+- Implement `Into<BStackSlice>` for explicit, cheap conversion when a raw slice is needed.
+- Not implement `From<BStackSlice>` — only the allocator internally constructs a `BStackAllocatedSlice`, ensuring origin is always valid.
+- Be the associated handle type returned by `alloc` and accepted by `realloc` and `dealloc`.
 
-// After
-unsafe fn realloc<'a>(&'a self, handle: Self::Allocated<'a>, new_len: u64)
-    -> Result<Self::Allocated<'a>, Self::Error>;
-unsafe fn dealloc(&self, handle: Self::Allocated<'_>) -> Result<(), Self::Error>;
-```
-
-All internal implementations (`LinearBStackAllocator`, `FirstFitBStackAllocator`,
-`GhostTreeBstackAllocator`) would be updated to `unsafe fn` as well.
+This is a breaking change for any code that holds the allocator's associated handle type explicitly or passes a `BStackSlice` directly to `realloc` or `dealloc`. Code that only reads or writes through a handle without storing it by concrete type is largely unaffected. Custom allocator implementations built outside this crate are not affected, as the trait itself does not mandate a specific handle type.
 
 ### Open questions
 
-**Is this change actually necessary given `BStackSlice::from_raw_parts` is
-already `unsafe`?**
-
-Since `BStackSlice::new` is now deprecated and `from_raw_parts` is `unsafe`,
-a caller cannot construct an allocator-corrupting slice *without already being
-in an `unsafe` block*.  A well-reviewed `unsafe` block that constructs a
-`BStackSlice::from_raw_parts` can be expected to read the safety contract and
-comply with the origin requirement.
-
-The remaining concern is sub-slices: `subslice` and `subslice_range` are *safe*
-functions that produce slices with an origin different from any allocator-returned
-handle.  A caller could accidentally (or intentionally) pass such a sub-slice to
-`dealloc` without any `unsafe` at the call site.  Making `dealloc` / `realloc`
-`unsafe fn` would force that call site into an `unsafe` block and require the
-caller to explicitly reason about validity.
-
-Counter-argument: the pain of a breaking change across every `impl BStackAllocator`
-and every call site is high, and the hazard window is now significantly narrowed
-because constructing a bad handle already requires `unsafe`.  A simpler alternative
-is to mark `subslice` and `subslice_range` with a prominent warning that the
-returned slices must not be passed to `realloc` or `dealloc`.
+- Should the new handle type be named `BStackAllocatedSlice`, or something more concise like `BStackHandle`? The former emphasizes the slice nature, while the latter is more general and concise. However, we also need to consider that there will be custom allocators that may want to define their own handle types, so a more generic name like `BStackHandle` might be too generic and could cause confusion if multiple handle types are in scope. 
+- Should the new handle type have a unsafe method that allows backwards conversion to `BStackSlice` for advanced use cases, or should it be strictly one-way? Allowing an unsafe conversion could provide flexibility for advanced users who understand the risks, but it also introduces potential for misuse. If we choose to allow it, we would need to clearly document the safety contract and ensure that it is only used in scenarios where the caller can guarantee that the resulting `BStackSlice` is not misused as a sub-slice.
 
 ---
 
