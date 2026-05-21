@@ -169,12 +169,19 @@
 //! It can only grow; attempts to shrink it return
 //! [`io::ErrorKind::InvalidInput`].
 //!
+//! Opening with [`open_cached`](BStack::open_cached) (or
+//! [`open_locked_up_to_cached`](BStack::open_locked_up_to_cached)) enables
+//! an in-memory mirror of the locked region: each `lock_up_to` call reads the
+//! newly locked bytes from disk into a heap buffer, and subsequent reads whose
+//! range falls entirely within the cached region are served with no syscall.
+//!
 //! ## Effects
 //!
 //! * **Lock-free reads on Unix and Windows.**  When [`get`](BStack::get),
 //!   [`get_into`](BStack::get_into), or [`peek_into`](BStack::peek_into) are
 //!   called with a range that lies entirely within the locked region, the
-//!   rwlock is bypassed and the read is served directly by `pread(2)`
+//!   rwlock is bypassed.  On cached stacks the read is served from the
+//!   in-memory buffer; on non-cached stacks it falls through to `pread(2)`
 //!   (Unix) or `ReadFile` + `OVERLAPPED` (Windows).  The `fstat` size check
 //!   is skipped too — the locked length is a sufficient upper bound.
 //!
@@ -209,6 +216,11 @@
 //! * Locked-region checks on writers are evaluated **under the write lock**,
 //!   so they cannot race against a concurrent `lock_up_to` extending the
 //!   boundary across the write target.
+//!
+//! On cached stacks the cache `Mutex` is acquired and fully populated
+//! *before* `locked` is advanced with the `Release` store.  A reader that
+//! `Acquire`-loads `locked` and then locks the cache `Mutex` therefore always
+//! sees a buffer whose valid range covers at least `[0, locked)`.
 //!
 //! ## Typical use
 //!
@@ -2091,6 +2103,13 @@ impl BStack {
     ///
     /// Acquires the exclusive write lock to ensure all in-flight writes to
     /// `[0, n)` have completed before the region is declared immutable.
+    ///
+    /// # Performance
+    ///
+    /// On stacks opened with [`open_cached`](Self::open_cached) this call
+    /// reads the newly locked bytes — up to `n` bytes — from disk into the
+    /// in-memory cache before returning.  This makes `lock_up_to`
+    /// significantly more expensive on cached stacks than on non-cached ones.
     ///
     /// # Errors
     ///

@@ -298,11 +298,19 @@ calling `lock_up_to` (or open and lock in one step with
 `open_locked_up_to`).  It can only grow; attempts to shrink it return
 `InvalidInput`.
 
+Opening with `open_cached` (or `open_locked_up_to_cached`) enables an
+in-memory mirror of the locked region: each `lock_up_to` call reads the
+newly locked bytes from disk into a heap buffer, and subsequent reads whose
+range falls entirely within the cached region are served with no syscall.
+The trade-off is that `lock_up_to` becomes significantly more expensive on
+cached stacks (it must read up to `n` bytes from disk before returning).
+
 ### What changes when bytes are locked
 
 * **Lock-free reads on Unix and Windows.**  `get`, `get_into`, and
   `peek_into` calls whose range lies entirely within the locked region
-  bypass the internal `RwLock` and serve the read directly with `pread(2)`
+  bypass the internal `RwLock`.  On cached stacks the read is served from
+  the in-memory buffer; on non-cached stacks it falls through to `pread(2)`
   (Unix) or `ReadFile` + `OVERLAPPED` (Windows).  The `fstat` size check is
   skipped too — the locked length is a sufficient upper bound.
 * **Write protection.**  `set`, `zero`, `swap`, `swap_into`, `cas`,

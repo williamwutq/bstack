@@ -15,7 +15,9 @@ fn remove_tmp(path: &std::path::Path) {
         Some(p) => p,
         None => return,
     };
-    let parent = parent.canonicalize().unwrap_or_else(|_| parent.to_path_buf());
+    let parent = parent
+        .canonicalize()
+        .unwrap_or_else(|_| parent.to_path_buf());
     if parent.starts_with(&temp_dir) {
         let _ = std::fs::remove_file(path);
     }

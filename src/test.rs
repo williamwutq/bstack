@@ -4341,6 +4341,22 @@ mod cache_tests {
     }
 
     #[test]
+    fn non_reallocating_in_place_extend() {
+        // lock_up_to(5) allocates capacity = next_power_of_two(5) = 8.
+        // lock_up_to(7): nl=7 <= capacity=8, so the cache Vec is extended in-place
+        // without reallocation (the `else` branch in lock_up_to).
+        let (s, p) = mk_cached();
+        let _g = Guard(p);
+        s.push(b"abcdefghij").unwrap();
+        s.lock_up_to(5).unwrap();
+        assert_eq!(s.cache.lock().unwrap().capacity(), 8);
+        assert_eq!(s.get(0, 5).unwrap(), b"abcde");
+        s.lock_up_to(7).unwrap();
+        assert_eq!(s.cache.lock().unwrap().capacity(), 8); // no realloc
+        assert_eq!(s.get(0, 7).unwrap(), b"abcdefg");
+    }
+
+    #[test]
     fn open_locked_up_to_cached_convenience() {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
