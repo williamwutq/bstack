@@ -4312,15 +4312,14 @@ mod cache_tests {
 
     #[test]
     fn sequential_lock_up_to_within_capacity() {
-        // Lock to 4 (capacity=4), then to 3 — same bytes reachable.
-        // Then lock to 4 again — should be a no-op on the cache.
+        // Lock to 4 (capacity = next_power_of_two(4) = 4), then extend to 6.
+        // 6 > capacity 4, so the second call reallocates the cache buffer.
         let (s, p) = mk_cached();
         let _g = Guard(p);
         s.push(b"abcdef").unwrap();
         s.lock_up_to(4).unwrap();
         assert_eq!(s.get(0, 4).unwrap(), b"abcd");
-        // Lock to 6 — capacity(4).next_power_of_two() is 4, 6 > 4, so reallocate.
-        s.lock_up_to(6).unwrap();
+        s.lock_up_to(6).unwrap(); // 6 > capacity(4) — reallocates
         assert_eq!(s.get(0, 6).unwrap(), b"abcdef");
     }
 

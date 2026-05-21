@@ -307,12 +307,13 @@ cached stacks (it must read up to `n` bytes from disk before returning).
 
 ### What changes when bytes are locked
 
-* **Lock-free reads on Unix and Windows.**  `get`, `get_into`, and
-  `peek_into` calls whose range lies entirely within the locked region
-  bypass the internal `RwLock`.  On cached stacks the read is served from
-  the in-memory buffer; on non-cached stacks it falls through to `pread(2)`
-  (Unix) or `ReadFile` + `OVERLAPPED` (Windows).  The `fstat` size check is
-  skipped too — the locked length is a sufficient upper bound.
+* **RwLock-free reads.**  `get`, `get_into`, and `peek_into` calls whose
+  range lies entirely within the locked region bypass the internal `RwLock`.
+  On cached stacks the read is served from the in-memory buffer (under a
+  `Mutex`); on non-cached stacks it falls through to `pread(2)` (Unix) or
+  `ReadFile` + `OVERLAPPED` (Windows) without holding the `RwLock`.  The
+  `fstat` size check is skipped too — the locked length is a sufficient
+  upper bound.
 * **Write protection.**  `set`, `zero`, `swap`, `swap_into`, `cas`,
   `process`, `atrunc`, `splice`, `splice_into`, and `replace` return
   `InvalidInput` if their target overlaps the locked region.
