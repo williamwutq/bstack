@@ -1,0 +1,57 @@
+name: Bench
+
+on:
+  push:
+    branches: [ master ]
+    paths: [src/**, benches/**, Cargo.toml]
+  pull_request:
+    branches: [ master ]
+    paths: [src/**, benches/**, Cargo.toml]
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    # Benchmarks are inherently noisy on shared CI runners; we run them to
+    # verify that they compile and execute without error, and to catch obvious
+    # performance regressions.  Statistical significance should be evaluated
+    # locally on dedicated hardware.
+    name: Benchmark (${{ matrix.lock }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        lock:
+          - name: std
+            features: ""
+          - name: parking_lot
+            features: "--features parking_lot"
+          - name: usync
+            features: "--features usync"
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install Rust (stable)
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: stable
+    - name: Build benchmarks (${{ matrix.lock.name }})
+      run: cargo build --release --bench rwlock_comparison ${{ matrix.lock.features }}
+    - name: Run benchmarks — lock microbenchmarks (${{ matrix.lock.name }})
+      # Run for a short time (--sample-size 10) to keep CI fast while still
+      # confirming correctness.  Full comparisons should be run locally.
+      run: >
+        cargo bench --bench rwlock_comparison ${{ matrix.lock.features }}
+        -- --sample-size 10 lock_micro
+    - name: Run benchmarks — single-threaded stack ops (${{ matrix.lock.name }})
+      run: >
+        cargo bench --bench rwlock_comparison ${{ matrix.lock.features }}
+        -- --sample-size 10 push_single_threaded pop_single_threaded
+        discard_single_threaded extend_single_threaded peek_single_threaded
+        get_single_threaded len_single_threaded push_large_payload_single_threaded
+        mixed_single_threaded
+    - name: Run benchmarks — multi-threaded stack ops (${{ matrix.lock.name }})
+      run: >
+        cargo bench --bench rwlock_comparison ${{ matrix.lock.features }}
+        -- --sample-size 10 push_multi_threaded mixed_multi_threaded

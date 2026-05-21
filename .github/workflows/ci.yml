@@ -54,3 +54,15 @@ jobs:
       run: cargo test --features "set atomic"
     - name: Test Release with set and atomic
       run: cargo test --release --features "set atomic"
+    - name: Test with parking_lot
+      run: cargo test --features parking_lot
+    - name: Test Release with parking_lot
+      run: cargo test --release --features parking_lot
+    - name: Test with parking_lot and alloc
+      run: cargo test --features "parking_lot alloc"
+    - name: Test with usync
+      run: cargo test --features usync
+    - name: Test Release with usync
+      run: cargo test --release --features usync
+    - name: Test with usync and alloc
+      run: cargo test --features "usync alloc"

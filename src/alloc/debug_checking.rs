@@ -66,7 +66,31 @@ use crate::BStack;
 use std::collections::HashSet;
 use std::io;
 use std::ops::Range;
+
+// Select the Mutex implementation to match the RwLock backend chosen for BStack.
+#[cfg(feature = "parking_lot")]
+use parking_lot::Mutex;
+#[cfg(all(feature = "usync", not(feature = "parking_lot")))]
+use usync::Mutex;
+#[cfg(not(any(feature = "parking_lot", feature = "usync")))]
 use std::sync::Mutex;
+
+// Normalise Mutex acquisition across the three backends.
+// `std::sync::Mutex::lock()` returns `LockResult<Guard>`; `parking_lot` and
+// `usync` return the guard directly.  The `unwrap_or_else` variant is used for
+// std to recover from a poisoned lock rather than panic.
+#[cfg(not(any(feature = "parking_lot", feature = "usync")))]
+macro_rules! mutex_lock {
+    ($e:expr) => {
+        $e.lock().unwrap_or_else(|e| e.into_inner())
+    };
+}
+#[cfg(any(feature = "parking_lot", feature = "usync"))]
+macro_rules! mutex_lock {
+    ($e:expr) => {
+        $e.lock()
+    };
+}
 
 /// Returns `true` if two half-open byte ranges overlap.
 fn overlaps(a: &Range<u64>, b: &Range<u64>) -> bool {
@@ -374,7 +398,7 @@ where
     A: BStackAllocator<Error = io::Error> + std::fmt::Debug,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let state = mutex_lock!(self.state);
         f.debug_struct("DebugCheckingAllocator")
             .field("inner", &self.inner)
             .field("allocated_count", &state.allocated.len())
@@ -447,7 +471,7 @@ where
     /// while [a, d) is freed, the freed set will be updated to contain [a, b) and [c, d).
     fn record_allocation(&self, offset: u64, len: u64) {
         let region = offset..offset + len;
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = mutex_lock!(self.state);
         record_allocated_region(&mut state, region, "Newly allocated region", "");
     }
 
@@ -461,7 +485,7 @@ where
             return;
         }
         let region = offset..offset + len;
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = mutex_lock!(self.state);
         let was_in_allocated = check_deallocation(&region, &state, &HashSet::new());
         if was_in_allocated {
             state.allocated.remove(&region);
@@ -553,7 +577,7 @@ where
         };
         let new_region = new_slice.start()..new_slice.start() + new_slice.len();
 
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = mutex_lock!(self.state);
         let overlapping_allocation = state
             .allocated
             .iter()
@@ -596,7 +620,7 @@ where
         // Validate before touching the inner allocator. Untracked regions are allowed
         // (may have been allocated in a prior session).
         {
-            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let state = mutex_lock!(self.state);
             check_deallocation(&(offset..offset + len), &state, &HashSet::new());
         }
 
@@ -653,7 +677,7 @@ where
         let mut slices: Vec<BStackSlice<'_, A>> = Vec::with_capacity(handles.len());
         let mut pending_freed: HashSet<Range<u64>> = HashSet::with_capacity(handles.len());
         {
-            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let state = mutex_lock!(self.state);
             for handle in handles {
                 let slice: BStackSlice<'_, A> = handle.inner.try_into().map_err(|e| {
                     io::Error::other(format!(
@@ -757,7 +781,7 @@ mod tests {
         let c = DebugCheckingAllocator::with_state(MockAllocator, [0..100], [200..300]);
         c.record_allocation(120, 50);
 
-        let state = c.state.lock().unwrap();
+        let state = mutex_lock!(c.state);
         assert!(state.allocated.contains(&(0..100)));
         assert!(state.allocated.contains(&(120..170)));
         assert!(state.freed.contains(&(200..300)));
@@ -831,7 +855,7 @@ mod tests {
         c.record_deallocation(0, 100);
         c.record_allocation(20, 30); // [20, 50)
 
-        let state = c.state.lock().unwrap();
+        let state = mutex_lock!(c.state);
         assert!(state.freed.contains(&(0..20)));
         assert!(state.freed.contains(&(50..100)));
         assert!(!state.freed.contains(&(0..100)));
@@ -848,7 +872,7 @@ mod tests {
         c.record_deallocation(0, 100);
         c.record_allocation(0, 30); // [0, 30) — consumes the left edge
 
-        let state = c.state.lock().unwrap();
+        let state = mutex_lock!(c.state);
         assert!(!state.freed.contains(&(0..100)));
         assert!(!state.freed.iter().any(|r| r.start < 30));
         assert!(state.freed.contains(&(30..100)));
@@ -864,7 +888,7 @@ mod tests {
         c.record_deallocation(0, 100);
         c.record_allocation(70, 30); // [70, 100) — consumes the right edge
 
-        let state = c.state.lock().unwrap();
+        let state = mutex_lock!(c.state);
         assert!(!state.freed.contains(&(0..100)));
         assert!(state.freed.contains(&(0..70)));
         assert!(!state.freed.iter().any(|r| r.end > 70));
@@ -880,7 +904,7 @@ mod tests {
         c.record_deallocation(0, 100);
         c.record_allocation(0, 100);
 
-        let state = c.state.lock().unwrap();
+        let state = mutex_lock!(c.state);
         assert!(state.freed.is_empty());
         assert!(state.allocated.contains(&(0..100)));
     }
@@ -1079,7 +1103,7 @@ mod tests {
         let handle2 = alloc.alloc(200)?;
 
         // Verify tracking state
-        let state = alloc.state.lock().unwrap();
+        let state = mutex_lock!(alloc.state);
         assert_eq!(state.allocated.len(), 2);
         assert!(state.allocated.contains(&(0..100)));
         assert!(state.allocated.contains(&(100..300)));
@@ -1106,7 +1130,7 @@ mod tests {
 
         // Verify initial state
         {
-            let state = alloc.state.lock().unwrap();
+            let state = mutex_lock!(alloc.state);
             assert!(state.allocated.contains(&(0..100)));
         }
 
@@ -1114,7 +1138,7 @@ mod tests {
 
         // Verify tracking was updated: old region removed, new region added
         {
-            let state = alloc.state.lock().unwrap();
+            let state = mutex_lock!(alloc.state);
             assert!(!state.allocated.contains(&(0..100)));
             assert!(state.allocated.contains(&(100..300)));
         }
@@ -1137,7 +1161,7 @@ mod tests {
         let new_handle = alloc.realloc(handle, 100)?;
 
         {
-            let state = alloc.state.lock().unwrap();
+            let state = mutex_lock!(alloc.state);
             assert!(state.allocated.contains(&(150..250)));
             assert!(!state.allocated.contains(&(0..100)));
             assert!(state.freed.contains(&(0..100)));
@@ -1164,7 +1188,7 @@ mod tests {
         let new_handle = alloc.realloc(handle, 60)?;
 
         {
-            let state = alloc.state.lock().unwrap();
+            let state = mutex_lock!(alloc.state);
             assert!(state.allocated.contains(&(0..60)));
             assert!(!state.allocated.contains(&(0..100)));
             assert!(state.freed.contains(&(60..100)));
@@ -1205,7 +1229,7 @@ mod tests {
 
         // Verify initial state
         {
-            let state = alloc.state.lock().unwrap();
+            let state = mutex_lock!(alloc.state);
             assert!(state.allocated.contains(&(0..100)));
         }
 
@@ -1217,7 +1241,7 @@ mod tests {
 
         // Verify tracking state was NOT modified (rollback succeeded)
         {
-            let state = alloc.state.lock().unwrap();
+            let state = mutex_lock!(alloc.state);
             assert!(
                 state.allocated.contains(&(0..100)),
                 "Original allocation should still be tracked after realloc failure"
@@ -1244,7 +1268,7 @@ mod tests {
 
         // Verify initial state
         {
-            let state = alloc.state.lock().unwrap();
+            let state = mutex_lock!(alloc.state);
             assert!(state.allocated.contains(&(0..100)));
             assert!(!state.freed.contains(&(0..100)));
         }
@@ -1253,7 +1277,7 @@ mod tests {
 
         // Verify tracking was updated
         {
-            let state = alloc.state.lock().unwrap();
+            let state = mutex_lock!(alloc.state);
             assert!(!state.allocated.contains(&(0..100)));
             assert!(state.freed.contains(&(0..100)));
         }
@@ -1285,7 +1309,7 @@ mod tests {
 
         // Verify tracking state was NOT modified (the region should still be allocated)
         {
-            let state = alloc.state.lock().unwrap();
+            let state = mutex_lock!(alloc.state);
             assert!(
                 state.allocated.contains(&(0..100)),
                 "Allocation should still be tracked after dealloc failure"
@@ -1328,7 +1352,7 @@ mod tests {
         let fake_handle = DebugHandle::new(&alloc, fake_inner_handle);
         alloc.dealloc(fake_handle)?;
 
-        let state = alloc.state.lock().unwrap();
+        let state = mutex_lock!(alloc.state);
         assert!(state.freed.contains(&(500..600)));
         Ok(())
     }
@@ -1348,7 +1372,7 @@ mod tests {
 
         // Verify all were tracked
         {
-            let state = alloc.state.lock().unwrap();
+            let state = mutex_lock!(alloc.state);
             assert_eq!(state.allocated.len(), 3);
             assert!(state.allocated.contains(&(0..100)));
             assert!(state.allocated.contains(&(100..300)));
@@ -1375,7 +1399,7 @@ mod tests {
 
         // Verify all were moved from allocated to freed
         {
-            let state = alloc.state.lock().unwrap();
+            let state = mutex_lock!(alloc.state);
             assert!(state.allocated.is_empty());
             assert_eq!(state.freed.len(), 3);
             assert!(state.freed.contains(&(0..100)));
@@ -1405,7 +1429,7 @@ mod tests {
         // Verify tracking state was NOT modified — the two-pass design only commits
         // allocated→freed transitions after the inner call succeeds.
         {
-            let state = alloc.state.lock().unwrap();
+            let state = mutex_lock!(alloc.state);
             assert_eq!(
                 state.allocated.len(),
                 3,
@@ -1440,7 +1464,7 @@ mod tests {
     #[test]
     fn test_with_state_valid_disjoint_ranges() {
         let c = DebugCheckingAllocator::with_state(MockAllocator, [0..100, 200..300], [400..500]);
-        let state = c.state.lock().unwrap();
+        let state = mutex_lock!(c.state);
         assert_eq!(state.allocated.len(), 2);
         assert_eq!(state.freed.len(), 1);
     }
@@ -1452,7 +1476,7 @@ mod tests {
             [0..100, 100..100, 200..300],
             [400..400, 500..600],
         );
-        let state = c.state.lock().unwrap();
+        let state = mutex_lock!(c.state);
         assert_eq!(state.allocated.len(), 2);
         assert_eq!(state.freed.len(), 1);
         assert!(!state.allocated.contains(&(100..100)));
@@ -1497,7 +1521,7 @@ mod tests {
             [0..100, 100..200],
             [200..300, 300..400],
         );
-        let state = c.state.lock().unwrap();
+        let state = mutex_lock!(c.state);
         assert_eq!(state.allocated.len(), 2);
         assert_eq!(state.freed.len(), 2);
     }

@@ -129,7 +129,11 @@
 //!
 //! # Thread safety
 //!
-//! `BStack` wraps the file in a [`std::sync::RwLock`].
+//! `BStack` wraps the file in an [`RwLock`].  By default this is
+//! [`std::sync::RwLock`]; enable the `parking_lot` feature to use
+//! [`parking_lot::RwLock`], or the `usync` feature to use [`usync::RwLock`].
+//! Both alternative implementations skip panic-poisoning entirely, so every
+//! lock acquisition becomes a direct guard return instead of a `LockResult`.
 //!
 //! | Operation | Lock (Unix / Windows) | Lock (other) |
 //! |-----------|-----------------------|--------------|
@@ -434,8 +438,47 @@ use std::fs::{File, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
-use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+// Select the RwLock implementation based on optional feature flags.
+// `parking_lot` takes priority if both are enabled simultaneously.
+#[cfg(feature = "parking_lot")]
+use parking_lot::RwLock;
+#[cfg(all(feature = "usync", not(feature = "parking_lot")))]
+use usync::RwLock;
+#[cfg(not(any(feature = "parking_lot", feature = "usync")))]
+use std::sync::RwLock;
+
+// Normalise lock-acquisition across the three backends.
+//
+// `std::sync::RwLock::{write,read}` return a `LockResult<Guard>` that must be
+// `.unwrap()`-ed; `parking_lot` and `usync` return the guard directly (no
+// poisoning semantics) so no unwrap is needed.
+#[cfg(not(any(feature = "parking_lot", feature = "usync")))]
+macro_rules! lock_write {
+    ($e:expr) => {
+        $e.write().unwrap()
+    };
+}
+#[cfg(any(feature = "parking_lot", feature = "usync"))]
+macro_rules! lock_write {
+    ($e:expr) => {
+        $e.write()
+    };
+}
+
+#[cfg(not(any(feature = "parking_lot", feature = "usync")))]
+macro_rules! lock_read {
+    ($e:expr) => {
+        $e.read().unwrap()
+    };
+}
+#[cfg(any(feature = "parking_lot", feature = "usync"))]
+macro_rules! lock_read {
+    ($e:expr) => {
+        $e.read()
+    };
+}
 
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
@@ -804,7 +847,7 @@ impl BStack {
     /// fallback `set_len`.
     pub fn push(&self, data: impl AsRef<[u8]>) -> io::Result<u64> {
         let data = data.as_ref();
-        let mut file = self.lock.write().unwrap();
+        let mut file = lock_write!(self.lock);
         let file_end = file.seek(SeekFrom::End(0))?;
         let logical_offset = file_end - HEADER_SIZE;
 
@@ -845,7 +888,7 @@ impl BStack {
     /// Returns any [`io::Error`] from `set_len`, `durable_sync`, or the
     /// fallback `set_len`.
     pub fn extend(&self, n: u64) -> io::Result<u64> {
-        let mut file = self.lock.write().unwrap();
+        let mut file = lock_write!(self.lock);
         let file_end = file.seek(SeekFrom::End(0))?;
         let logical_offset = file_end - HEADER_SIZE;
 
@@ -883,7 +926,7 @@ impl BStack {
     /// payload size.  Also propagates any I/O error from `read_exact`,
     /// `set_len`, `write_all`, or `durable_sync`.
     pub fn pop(&self, n: u64) -> io::Result<Vec<u8>> {
-        let mut file = self.lock.write().unwrap();
+        let mut file = lock_write!(self.lock);
         let raw_size = file.seek(SeekFrom::End(0))?;
         let data_size = raw_size - HEADER_SIZE;
         if n > data_size {
@@ -933,7 +976,7 @@ impl BStack {
     pub fn peek(&self, offset: u64) -> io::Result<Vec<u8>> {
         #[cfg(any(unix, windows))]
         {
-            let file = self.lock.read().unwrap();
+            let file = lock_read!(self.lock);
             let data_size = file.metadata()?.len().saturating_sub(HEADER_SIZE);
             if offset > data_size {
                 return Err(io::Error::new(
@@ -945,7 +988,7 @@ impl BStack {
         }
         #[cfg(not(any(unix, windows)))]
         {
-            let mut file = self.lock.write().unwrap();
+            let mut file = lock_write!(self.lock);
             let raw_size = file.seek(SeekFrom::End(0))?;
             let data_size = raw_size.saturating_sub(HEADER_SIZE);
             if offset > data_size {
@@ -1005,7 +1048,7 @@ impl BStack {
         }
         #[cfg(any(unix, windows))]
         {
-            let file = self.lock.read().unwrap();
+            let file = lock_read!(self.lock);
             let data_size = file.metadata()?.len().saturating_sub(HEADER_SIZE);
             if end > data_size {
                 return Err(io::Error::new(
@@ -1017,7 +1060,7 @@ impl BStack {
         }
         #[cfg(not(any(unix, windows)))]
         {
-            let mut file = self.lock.write().unwrap();
+            let mut file = lock_write!(self.lock);
             let raw_size = file.seek(SeekFrom::End(0))?;
             let data_size = raw_size.saturating_sub(HEADER_SIZE);
             if end > data_size {
@@ -1078,7 +1121,7 @@ impl BStack {
         }
         #[cfg(any(unix, windows))]
         {
-            let file = self.lock.read().unwrap();
+            let file = lock_read!(self.lock);
             let data_size = file.metadata()?.len().saturating_sub(HEADER_SIZE);
             if end > data_size {
                 return Err(io::Error::new(
@@ -1092,7 +1135,7 @@ impl BStack {
         }
         #[cfg(not(any(unix, windows)))]
         {
-            let mut file = self.lock.write().unwrap();
+            let mut file = lock_write!(self.lock);
             let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
             if end > data_size {
                 return Err(io::Error::new(
@@ -1152,7 +1195,7 @@ impl BStack {
         }
         #[cfg(any(unix, windows))]
         {
-            let file = self.lock.read().unwrap();
+            let file = lock_read!(self.lock);
             let data_size = file.metadata()?.len().saturating_sub(HEADER_SIZE);
             if end > data_size {
                 return Err(io::Error::new(
@@ -1164,7 +1207,7 @@ impl BStack {
         }
         #[cfg(not(any(unix, windows)))]
         {
-            let mut file = self.lock.write().unwrap();
+            let mut file = lock_write!(self.lock);
             let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
             if end > data_size {
                 return Err(io::Error::new(
@@ -1198,7 +1241,7 @@ impl BStack {
             return Ok(());
         }
         let n = buf.len() as u64;
-        let mut file = self.lock.write().unwrap();
+        let mut file = lock_write!(self.lock);
         let raw_size = file.seek(SeekFrom::End(0))?;
         let data_size = raw_size - HEADER_SIZE;
         if n > data_size {
@@ -1241,7 +1284,7 @@ impl BStack {
         if n == 0 {
             return Ok(());
         }
-        let mut file = self.lock.write().unwrap();
+        let mut file = lock_write!(self.lock);
         let raw_size = file.seek(SeekFrom::End(0))?;
         let data_size = raw_size - HEADER_SIZE;
         if n > data_size {
@@ -1296,7 +1339,7 @@ impl BStack {
                 "set: offset + len overflows u64",
             )
         })?;
-        let mut file = self.lock.write().unwrap();
+        let mut file = lock_write!(self.lock);
         // Load `locked` under the write lock — otherwise a concurrent
         // `lock_up_to` could extend the locked region between our check and
         // our write, letting us mutate a now-immutable byte.
@@ -1350,7 +1393,7 @@ impl BStack {
                 "zero: offset + n overflows u64",
             )
         })?;
-        let mut file = self.lock.write().unwrap();
+        let mut file = lock_write!(self.lock);
         // Load `locked` under the write lock (see `set` for rationale).
         let locked = self.locked.load(Ordering::Acquire);
         if offset < locked {
@@ -1413,7 +1456,7 @@ impl BStack {
         if n == 0 && buf_len == 0 {
             return Ok(());
         }
-        let mut file = self.lock.write().unwrap();
+        let mut file = lock_write!(self.lock);
         let file_end = file.seek(SeekFrom::End(0))?;
         let data_size = file_end - HEADER_SIZE;
         if n > data_size {
@@ -1486,7 +1529,7 @@ impl BStack {
         if n == 0 && buf_len == 0 {
             return Ok(Vec::new());
         }
-        let mut file = self.lock.write().unwrap();
+        let mut file = lock_write!(self.lock);
         let file_end = file.seek(SeekFrom::End(0))?;
         let data_size = file_end - HEADER_SIZE;
         if n > data_size {
@@ -1565,7 +1608,7 @@ impl BStack {
         if n == 0 && new_len == 0 {
             return Ok(());
         }
-        let mut file = self.lock.write().unwrap();
+        let mut file = lock_write!(self.lock);
         let file_end = file.seek(SeekFrom::End(0))?;
         let data_size = file_end - HEADER_SIZE;
         if n > data_size {
@@ -1633,7 +1676,7 @@ impl BStack {
     #[cfg(feature = "atomic")]
     pub fn try_extend(&self, s: u64, buf: impl AsRef<[u8]>) -> io::Result<bool> {
         let buf = buf.as_ref();
-        let mut file = self.lock.write().unwrap();
+        let mut file = lock_write!(self.lock);
         let file_end = file.seek(SeekFrom::End(0))?;
         let data_size = file_end - HEADER_SIZE;
         if data_size != s {
@@ -1675,11 +1718,11 @@ impl BStack {
     #[cfg(feature = "atomic")]
     pub fn try_discard(&self, s: u64, n: u64) -> io::Result<bool> {
         if n == 0 {
-            let file = self.lock.read().unwrap();
+            let file = lock_read!(self.lock);
             let data_size = file.metadata()?.len().saturating_sub(HEADER_SIZE);
             return Ok(data_size == s);
         }
-        let mut file = self.lock.write().unwrap();
+        let mut file = lock_write!(self.lock);
         let raw_size = file.seek(SeekFrom::End(0))?;
         let data_size = raw_size - HEADER_SIZE;
         if data_size != s {
@@ -1731,7 +1774,7 @@ impl BStack {
     where
         F: FnOnce(&[u8]) -> Vec<u8>,
     {
-        let mut file = self.lock.write().unwrap();
+        let mut file = lock_write!(self.lock);
         let file_end = file.seek(SeekFrom::End(0))?;
         let data_size = file_end - HEADER_SIZE;
         if n > data_size {
@@ -1817,7 +1860,7 @@ impl BStack {
                 "swap: offset + len overflows u64",
             )
         })?;
-        let mut file = self.lock.write().unwrap();
+        let mut file = lock_write!(self.lock);
         // Load `locked` under the write lock (see `set` for rationale).
         let locked = self.locked.load(Ordering::Acquire);
         if offset < locked {
@@ -1872,7 +1915,7 @@ impl BStack {
                 "swap_into: offset + len overflows u64",
             )
         })?;
-        let mut file = self.lock.write().unwrap();
+        let mut file = lock_write!(self.lock);
         // Load `locked` under the write lock (see `set` for rationale).
         let locked = self.locked.load(Ordering::Acquire);
         if offset < locked {
@@ -1938,7 +1981,7 @@ impl BStack {
                 "cas: offset + len overflows u64",
             )
         })?;
-        let mut file = self.lock.write().unwrap();
+        let mut file = lock_write!(self.lock);
         // Load `locked` under the write lock (see `set` for rationale).
         let locked = self.locked.load(Ordering::Acquire);
         if offset < locked {
@@ -1999,7 +2042,7 @@ impl BStack {
             ));
         }
         let n = end - start;
-        let mut file = self.lock.write().unwrap();
+        let mut file = lock_write!(self.lock);
         let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
         if end > data_size {
             return Err(io::Error::new(
@@ -2043,7 +2086,7 @@ impl BStack {
     ///
     /// Propagates any [`io::Error`] from [`File::metadata`].
     pub fn len(&self) -> io::Result<u64> {
-        let file = self.lock.read().unwrap();
+        let file = lock_read!(self.lock);
         Ok(file.metadata()?.len().saturating_sub(HEADER_SIZE))
     }
 
@@ -2083,7 +2126,7 @@ impl BStack {
     /// payload length.
     pub fn lock_up_to(&self, n: u64) -> io::Result<()> {
         // Acquire the write lock to serialise against any in-flight writers.
-        let file = self.lock.write().unwrap();
+        let file = lock_write!(self.lock);
         let data_size = file.metadata()?.len().saturating_sub(HEADER_SIZE);
         let current_locked = self.locked.load(Ordering::Relaxed);
         if n < current_locked {

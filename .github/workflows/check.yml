@@ -33,5 +33,9 @@ jobs:
       run: cargo clippy --features alloc -- -D warnings
     - name: Clippy (set and alloc features)
       run: cargo clippy --features "set alloc" -- -D warnings
+    - name: Clippy (parking_lot feature)
+      run: cargo clippy --features parking_lot -- -D warnings
+    - name: Clippy (usync feature)
+      run: cargo clippy --features usync -- -D warnings
     - name: Format
       run: cargo fmt --check
