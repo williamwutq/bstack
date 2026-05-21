@@ -115,6 +115,24 @@ impl<'a, A: BStackAllocator> BStackSlice<'a, A> {
         }
     }
 
+    /// Construct a zero-length `BStackSlice` anchored at offset 0.
+    ///
+    /// The resulting slice spans no bytes and all I/O methods on it are
+    /// no-ops or return empty results.  It is safe to construct because an
+    /// empty slice cannot produce out-of-bounds reads or writes and carries
+    /// no allocator-origin requirement.
+    ///
+    /// Useful as a sentinel or default value when a slice field must be
+    /// initialized before a real allocation is available.
+    #[inline]
+    pub fn empty(allocator: &'a A) -> Self {
+        Self {
+            allocator,
+            offset: 0,
+            len: 0,
+        }
+    }
+
     /// Serialize this slice to a 16-byte array for on-disk storage.
     ///
     /// Layout: `offset` as 8 bytes little-endian, then `len` as 8 bytes
