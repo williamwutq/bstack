@@ -177,13 +177,14 @@
 //!
 //! ## Effects
 //!
-//! * **Lock-free reads on Unix and Windows.**  When [`get`](BStack::get),
+//! * **RwLock-free reads.**  When [`get`](BStack::get),
 //!   [`get_into`](BStack::get_into), or [`peek_into`](BStack::peek_into) are
 //!   called with a range that lies entirely within the locked region, the
-//!   rwlock is bypassed.  On cached stacks the read is served from the
-//!   in-memory buffer; on non-cached stacks it falls through to `pread(2)`
-//!   (Unix) or `ReadFile` + `OVERLAPPED` (Windows).  The `fstat` size check
-//!   is skipped too — the locked length is a sufficient upper bound.
+//!   internal `RwLock` is bypassed.  On cached stacks the read is served from
+//!   the in-memory buffer (under a `Mutex`); on non-cached stacks it falls
+//!   through to `pread(2)` (Unix) or `ReadFile` + `OVERLAPPED` (Windows)
+//!   without holding the `RwLock`.  The `fstat` size check is skipped too —
+//!   the locked length is a sufficient upper bound.
 //!
 //! * **Write protection.**  [`set`](BStack::set), [`zero`](BStack::zero),
 //!   [`swap`](BStack::swap), [`swap_into`](BStack::swap_into),
@@ -2175,6 +2176,11 @@ impl BStack {
                     HEADER_SIZE + ol as u64,
                     &mut new_cache[ol..nl],
                 )?;
+                #[cfg(not(any(unix, windows)))]
+                {
+                    file.seek(SeekFrom::Start(HEADER_SIZE + ol as u64))?;
+                    file.read_exact(&mut new_cache[ol..nl])?;
+                }
                 *cache = new_cache;
             } else {
                 // Non-reallocating: extend the Vec in-place and read the new
@@ -2190,6 +2196,14 @@ impl BStack {
                 #[cfg(windows)]
                 if let Err(e) =
                     pread_exact_raw_handle(self.handle, HEADER_SIZE + ol as u64, &mut cache[ol..nl])
+                {
+                    cache.truncate(ol);
+                    return Err(e);
+                }
+                #[cfg(not(any(unix, windows)))]
+                if let Err(e) = file
+                    .seek(SeekFrom::Start(HEADER_SIZE + ol as u64))
+                    .and_then(|_| file.read_exact(&mut cache[ol..nl]))
                 {
                     cache.truncate(ol);
                     return Err(e);
