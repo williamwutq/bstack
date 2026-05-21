@@ -37,6 +37,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`SlabBStackAllocator`** (`alloc` + `set` features): New fixed-block slab allocator. All blocks in the arena are exactly `block_size` bytes (≥ 8) with no per-block header or footer. Freed blocks form an intrusive singly-linked free list; live bytes carry zero metadata overhead. Allocation is O(1) — either a free-list pop or a single tail extension. Deallocation of an oversized tail block shrinks the stack; all other blocks are returned to the free list in O(n_blocks). Reallocation within the same block count is O(1) with no I/O; tail resize is O(1); non-tail shrink recycles excess blocks; non-tail grow allocates and copies. Crash consistency: each free-list update is two `BStack` calls (write next-pointer, then update `free_head`); a crash between them leaks the affected block but leaves the rest of the list intact. `block_size < 8` returns `InvalidInput`.
+
 - **`DebugCheckingAllocator`** (`alloc` feature): A wrapper allocator that tracks allocated regions in memory and validates all operations against them, providing strong guarantees that all allocations and deallocations are well-formed and correctly paired. Intended for testing and debugging; the tracking data structure is not optimised for performance or memory usage. See `debug_checking.rs` for details.
 
 ## [0.2.0] - 2026-05-15

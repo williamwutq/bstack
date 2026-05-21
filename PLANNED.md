@@ -130,9 +130,12 @@ The magic number (e.g. `ALSL\x00\x01\x00\x00`) identifies the format and version
 
 **`realloc`:** If the block is oversized and the new size is ≤ `block_size`, the excess portion can be segmented into a new block and added to the free list. If the block is oversized and the new size is > `block_size`, it can be reallocated in place if it's the tail or if the next block(s) are free and can be coalesced. Otherwise, a new block can be allocated, data copied, and the old block deallocated.
 
-### Open questions
+### Future optimisations
 
-- Should `block_size < 8` be a `Result` error or a panic?
+- **`BStackBulkAllocator` for `SlabBStackAllocator`**: `alloc_bulk` could extend
+  the tail once for all requested slab blocks and return slices in sequence;
+  `dealloc_bulk` could batch free-list prepends. Both would reduce the number of
+  `BStack` calls from O(n) to O(1) extension + O(n) in-place writes.
 
 ---
 

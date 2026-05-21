@@ -1,3 +1,9 @@
+//! Fixed-block slab allocator for [`BStack`]-backed storage.
+//!
+//! Provides [`SlabBStackAllocator`], which implements [`BStackAllocator`] with
+//! O(1) alloc and dealloc by keeping all blocks the same size and tracking
+//! freed blocks in an intrusive singly-linked free list.
+
 use super::{BStackAllocator, BStackSlice};
 use crate::BStack;
 use std::{fmt, io};
@@ -49,6 +55,14 @@ const ALSL_MAGIC_PREFIX: [u8; 6] = *b"ALSL\x00\x01";
 /// block being operated on; the rest of the free list remains consistent and
 /// the file can be used without recovery.
 ///
+/// # Thread safety
+///
+/// `SlabBStackAllocator` is **neither `Send` nor `Sync`**.  Although [`BStack`]
+/// itself is `Send + Sync`, free-list operations require two separate `BStack`
+/// calls that are not atomic with respect to each other.  Concurrent
+/// `alloc`/`dealloc` calls from multiple threads would race on `free_head` and
+/// corrupt the free list.  Confine each instance to one thread.
+///
 /// # Feature flags
 ///
 /// Requires both the `alloc` and `set` Cargo features:
@@ -92,7 +106,9 @@ impl SlabBStackAllocator {
     ///
     /// # Errors
     ///
-    /// * [`io::ErrorKind::InvalidInput`] — `block_size < 8` on a new stack.
+    /// * [`io::ErrorKind::InvalidInput`] — `block_size < 8` on a new stack
+    ///   (returns an error rather than panicking so callers can recover or
+    ///   report the constraint programmatically).
     /// * [`io::ErrorKind::InvalidData`] — wrong magic, invalid stored
     ///   `block_size`, or mismatch between the stored and provided value.
     /// * Any [`io::Error`] propagated from the underlying [`BStack`] operations.
