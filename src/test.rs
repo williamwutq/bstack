@@ -4326,16 +4326,13 @@ mod cache_tests {
     }
 
     #[test]
-    fn non_reallocating_extend_within_capacity() {
-        // Push 16 bytes, lock to 8 (capacity=8), lock to 12 — fits in 16 without realloc
-        // because 12 <= next_power_of_two(8) = 8 … actually 12 > 8, so this reallocates.
-        // Instead: lock to 4 (cap=4), then to 4 — no-op.
-        // Better: lock to 8 (cap=8), then to 8 — no-op on cache, locked stays 8.
+    fn repeated_lock_up_to_same_length_is_no_op() {
+        // Repeating lock_up_to with the current locked length should be a no-op:
+        // the cached prefix remains unchanged and the same bytes stay reachable.
         let (s, p) = mk_cached();
         let _g = Guard(p);
         s.push(b"abcdefgh").unwrap();
         s.lock_up_to(4).unwrap(); // cap = next_power_of_two(4) = 4
-        // Now lock_up_to(4) again — n == current_locked, cache block skipped entirely
         s.lock_up_to(4).unwrap();
         assert_eq!(s.get(0, 4).unwrap(), b"abcd");
     }
