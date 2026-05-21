@@ -124,73 +124,63 @@ Consult the open questions below for design decisions that need to be made. Cons
 
 ## Adding `BStackVec<T>` for typed vector storage
 
-**Feature flag:** `BSTACK_FEATURE_SET`
+**Feature flag:** `alloc` + `set`
 **Breaking change:** No (additive; new type only)
 
 ### Motivation
 
-While `BStackSlice` provides a flexible byte-oriented view of allocated blocks, many applications would benefit from a typed vector abstraction that manages element layout, length tracking, and safe access patterns. A `BStackVec<T>` type would provide a convenient API for storing and manipulating sequences of typed data on a `BStack`, while still leveraging the underlying durability and crash-safety guarantees.
+`BStackByteVec` covers the common byte-buffer use case, but many applications store sequences of fixed-width typed values (e.g. `u32`, `u64`, or a small `repr(C)` struct). A general `BStackVec<T>` would extend the same API to arbitrary element types. The reason this is deferred rather than shipped today is soundness: reading back elements via raw bytes requires that every byte pattern is a valid `T`, and writing elements requires that no uninitialized padding bytes leak into the block. The `Copy` bound alone is not sufficient — types such as `bool`, `char`, `NonZero*`, enums, or structs with padding fields violate one or both requirements. Shipping an unsound API in a 1.0-ready crate is unacceptable, so the general case is deferred until a clean solution is in place.
 
 ### Design
 
-`BStackVec<T>` mirrors Rust's standard `Vec<T>` API, but backed by a `BStack` allocation. It would manage its own length and capacity metadata, stored in the block header or a reserved prefix.
+`BStackVec<T>` mirrors `BStackByteVec` exactly, but parameterised by `T`. The on-disk memory layout is the same 16-byte header followed by `[T; cap]` elements, using the same little-endian `u64` encoding for `len` and `cap`.
 
-#### Memory layout
+#### Sound element bound
 
-The allocation layout would consist of:
-- **Header** (16 bytes): length (u64) + capacity (u64)
-- **Elements**: inline typed data, stored as `[T; capacity]`
+The key design decision is the trait bound on `T`. Options in increasing order of complexity:
 
-The header occupies the first 16 bytes of the block, with element data following. This ensures that the metadata is always present and can be recovered even if the `BStackVec` handle is lost.
+1. **`bytemuck::Pod`** (external dependency): `bytemuck::Pod` guarantees no padding and any-bit-pattern validity. This is the most ergonomic approach but adds a dependency that may not be acceptable for all users.
+2. **`zerocopy::FromBytes + zerocopy::IntoBytes`** (external dependency): similar guarantees via the `zerocopy` crate.
+3. **A crate-local sealed `BStackPod` marker trait**: implementors manually assert the POD invariants. No external dependency, but requires users to `unsafe impl` the trait for their types, and adds maintenance burden.
+4. **Make all typed element operations `unsafe`**: put the soundness obligation on the caller at each call site. Consistent with how `std::slice::from_raw_parts` works.
+
+Option 1 (`bytemuck::Pod`) is the recommended approach if a dependency is acceptable; otherwise option 4 (unsafe element ops) is the fallback.
 
 #### API surface
 
-Core methods mirroring `Vec<T>`:
+The API mirrors `BStackByteVec` with `u8` replaced by `T`:
 
 ```rust
-impl<'a, T: Copy, A: BStackAllocator> BStackVec<'a, T, A> {
-    // Creation and destruction
-    pub fn new(alloc: &'a A) -> Result<Self, A::Error>;
-    pub fn with_capacity(capacity: u64, alloc: &'a A) -> Result<Self, A::Error>;
-    pub fn from_slice(slice: &[T], alloc: &'a A) -> Result<Self, A::Error>;
-    
-    // Accessors
-    pub fn len(&self) -> Result<u64, A::Error>;
-    pub fn capacity(&self) -> Result<u64, A::Error>;
-    pub fn is_empty(&self) -> Result<u64, A::Error>;
-    
-    // Element access
-    pub fn get(&self, index: u64) -> Result<Option<T>, A::Error>;
-    pub fn as_slice(&self) -> Result<BStackSlice<'a, A>, A::Error>;
-    
-    // Modification
-    pub fn push(&mut self, value: T) -> Result<(), A::Error>;
-    pub fn pop(&mut self) -> Result<Option<T>, A::Error>;
-    pub fn truncate(&mut self, len: u64) -> Result<(), A::Error>;
-    pub fn clear(&mut self) -> Result<(), A::Error>;
-    pub fn reserve(&mut self, additional: u64) -> Result<(), A::Error>;
-    pub fn resize(&mut self, new_len: u64, value: T) -> Result<(), A::Error>;
-    
-    // Iteration
-    pub fn iter(&self) -> Result<BStackVecIter<'a, T, A>, A::Error>;
-    pub fn iter_mut(&mut self) -> Result<BStackVecIterMut<'a, T, A>, A::Error>;
+impl<'a, T: bytemuck::Pod, A: BStackSliceAllocator> BStackVec<'a, T, A> {
+    pub fn new(alloc: &'a A) -> io::Result<Self>;
+    pub fn with_capacity(capacity: u64, alloc: &'a A) -> io::Result<Self>;
+    pub fn from_slice(data: &[T], alloc: &'a A) -> io::Result<Self>;
+    pub unsafe fn from_raw_block(slice: BStackSlice<'a, A>) -> Self;
+    pub fn len(&self) -> io::Result<u64>;
+    pub fn capacity(&self) -> io::Result<u64>;
+    pub fn is_empty(&self) -> io::Result<bool>;
+    pub fn get(&self, index: u64) -> io::Result<Option<T>>;
+    pub fn read_vec(&self) -> io::Result<Vec<T>>;
+    pub fn as_slice(&self) -> io::Result<BStackSlice<'a, A>>;
+    pub fn push(&mut self, value: T) -> io::Result<()>;
+    pub fn pop(&mut self) -> io::Result<Option<T>>;
+    pub fn truncate(&mut self, new_len: u64) -> io::Result<()>;
+    pub fn clear(&mut self) -> io::Result<()>;
+    pub fn reserve(&mut self, additional: u64) -> io::Result<()>;
+    pub fn resize(&mut self, new_len: u64, value: T) -> io::Result<()>;
+    pub fn iter(&self) -> io::Result<BStackVecIter<'_, 'a, T, A>>;
+    pub unsafe fn raw_block(&self) -> BStackSlice<'a, A>;
+    pub fn into_raw_block(self) -> BStackSlice<'a, A>;
+    pub fn dealloc(self) -> io::Result<()>;
 }
 ```
 
-#### Growth strategy
-
-When capacity is exceeded, `BStackVec` would use the `BStack`'s `realloc` to grow the block, similar to `Vec`'s doubling strategy (or a configurable policy). The metadata prefix would be preserved and updated with new capacity.
-
-#### Guarding support
-
-`BStackVec<T, A>` should integrate with `BStackGuardedSlice` by providing a `as_guarded_slice()` method that wraps the underlying slice with a guard, enabling transparent transforms across the entire vector.
-
-#### Serialization considerations
-
-`BStackVec` should be serializable to persistent storage by writing only the populated portion (length, not capacity) and reconstructable on load by reading back the metadata from the block header.
-
 ### Open questions
 
+- **Dependency policy:** Is adding `bytemuck` or `zerocopy` acceptable? If so, should it be an optional feature flag (e.g. `alloc + set + pod`) or always-on with `alloc + set`?
+- **Sealed marker trait:** If no external dependency is acceptable, define a local `unsafe trait BStackPod` sealed within the crate. Decide whether to provide blanket impls for all primitive integer and float types.
+- **ZST policy:** `size_of::<T>() == 0` makes `elem_offset` a no-op and `block_size` equal to `HEADER_LEN` regardless of capacity. Document clearly and decide whether ZST vecs are supported or rejected at construction time.
+- **Padding detection:** If using the sealed-trait approach, consider adding a compile-time assertion (`assert_eq!(size_of::<T>(), /* expected */)`-style) or a `#[repr(C)]` requirement to help implementors avoid accidental padding.
 - **Generic bounds on `T`:** Should `T` be required to implement `Copy`, or should a `Drop` implementation be provided for types with destructors? A `Drop` impl would be complex, as it must be called on remaining elements when the vec is deallocated.
 - **Error handling:** Should methods return `Result` for all operations, or should some (e.g., `len()`, `capacity()`) be infallible? Returning `Result` allows for better error propagation but may be more verbose for simple accessors.
 - **Initialization of new elements:** When growing the vector, should new elements be zero-initialized, left uninitialized (i.e. `MaybeUninit`), or should we require `T` to be `Default` and call `default()`? Zero-initialization is safer and guranteed for newly allocated space, but may be unnecessary overhead for some types.
@@ -219,4 +209,3 @@ The same change applies to the corresponding methods on `BStackGuardedSlice`, an
 
 - Should `writer` and `writer_at` also require `&mut self`, given that they return a `BStackSliceWriter` rather than performing any mutation themselves? Requiring `&mut self` here is consistent with the general principle but may feel overly strict for a constructor that merely captures the slice.
 - `BStackSliceWriter` is currently `Copy`. If `writer` requires `&mut self`, obtaining multiple writers from the same slice would require copying the slice first. Should `BStackSliceWriter` remain `Copy`, or should it be non-`Copy` to better reflect exclusive-write intent?
-
