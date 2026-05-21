@@ -1060,6 +1060,11 @@ impl BStack {
         }
         #[cfg(not(any(unix, windows)))]
         {
+            let locked = self.locked.load(Ordering::Acquire);
+            if end <= locked && self.cache_enabled {
+                let cache = self.cache.lock().unwrap();
+                return Ok(cache[start as usize..end as usize].to_vec());
+            }
             let mut file = self.lock.write().unwrap();
             let raw_size = file.seek(SeekFrom::End(0))?;
             let data_size = raw_size.saturating_sub(HEADER_SIZE);
@@ -1136,6 +1141,12 @@ impl BStack {
         }
         #[cfg(not(any(unix, windows)))]
         {
+            let locked = self.locked.load(Ordering::Acquire);
+            if end <= locked && self.cache_enabled {
+                let cache = self.cache.lock().unwrap();
+                buf.copy_from_slice(&cache[offset as usize..end as usize]);
+                return Ok(());
+            }
             let mut file = self.lock.write().unwrap();
             let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
             if end > data_size {
@@ -1209,6 +1220,12 @@ impl BStack {
         }
         #[cfg(not(any(unix, windows)))]
         {
+            let locked = self.locked.load(Ordering::Acquire);
+            if end <= locked && self.cache_enabled {
+                let cache = self.cache.lock().unwrap();
+                buf.copy_from_slice(&cache[start as usize..end as usize]);
+                return Ok(());
+            }
             let mut file = self.lock.write().unwrap();
             let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
             if end > data_size {
