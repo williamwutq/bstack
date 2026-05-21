@@ -157,8 +157,9 @@ impl<'a, A: BStackSliceAllocator> BStackByteVec<'a, A> {
 
     fn read_byte_at(&self, index: u64) -> io::Result<u8> {
         let start = Self::byte_offset(index);
-        let bytes = self.slice.read_range(start, start + 1)?;
-        Ok(bytes[0])
+        let mut byte = [0u8; 1];
+        self.slice.read_range_into(start, &mut byte)?;
+        Ok(byte[0])
     }
 
     fn write_byte_at(&self, index: u64, value: u8) -> io::Result<()> {
