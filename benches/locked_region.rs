@@ -115,6 +115,7 @@ fn bench_get_concurrent(c: &mut Criterion, num_threads: usize) {
         group.bench_with_input(BenchmarkId::new("pread", read_size), &read_size, |b, &n| {
             b.iter_custom(|iters| {
                 let per_thread = (iters / num_threads as u64).max(1);
+                let total_ops = per_thread * num_threads as u64;
                 let barrier = Arc::new(Barrier::new(num_threads + 1));
                 let handles: Vec<_> = (0..num_threads)
                     .map(|_| {
@@ -133,10 +134,10 @@ fn bench_get_concurrent(c: &mut Criterion, num_threads: usize) {
                 for h in handles {
                     h.join().unwrap();
                 }
-                // Report elapsed as if we did `iters` total operations so
-                // Criterion's time/iter reflects per-op wall latency under
-                // contention.
-                start.elapsed()
+                // Scale so Criterion's division by `iters` yields the correct
+                // time/iter: total_ops may differ from iters due to truncation
+                // or the .max(1) guard when iters < num_threads.
+                start.elapsed().mul_f64(iters as f64 / total_ops as f64)
             });
         });
         drop(s);
@@ -146,6 +147,7 @@ fn bench_get_concurrent(c: &mut Criterion, num_threads: usize) {
         group.bench_with_input(BenchmarkId::new("cache", read_size), &read_size, |b, &n| {
             b.iter_custom(|iters| {
                 let per_thread = (iters / num_threads as u64).max(1);
+                let total_ops = per_thread * num_threads as u64;
                 let barrier = Arc::new(Barrier::new(num_threads + 1));
                 let handles: Vec<_> = (0..num_threads)
                     .map(|_| {
@@ -164,7 +166,7 @@ fn bench_get_concurrent(c: &mut Criterion, num_threads: usize) {
                 for h in handles {
                     h.join().unwrap();
                 }
-                start.elapsed()
+                start.elapsed().mul_f64(iters as f64 / total_ops as f64)
             });
         });
         drop(s);
