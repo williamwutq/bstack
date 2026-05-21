@@ -2120,9 +2120,11 @@ impl BStack {
     /// # Performance
     ///
     /// On stacks opened with [`open_cached`](Self::open_cached) this call
-    /// reads the newly locked bytes — up to `n` bytes — from disk into the
-    /// in-memory cache before returning.  This makes `lock_up_to`
-    /// significantly more expensive on cached stacks than on non-cached ones.
+    /// reads only the newly added portion of the locked region, that is,
+    /// `n - current_locked_len` bytes, from disk into the in-memory cache
+    /// before returning. In the worst case this is `n` bytes, but only when
+    /// locking from `0`. This makes `lock_up_to` significantly more expensive
+    /// on cached stacks than on non-cached ones.
     ///
     /// # Errors
     ///
