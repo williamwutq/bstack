@@ -93,8 +93,6 @@ The `FirstFitBStackAllocator` could benefit from atomic operations to improve pe
 
 ---
 
-=======
-
 ## Adding `SlabBStackAllocator` for fixed-block slab allocation
 
 **Feature flag:** `alloc` + `set`
