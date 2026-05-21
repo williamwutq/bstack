@@ -2188,8 +2188,9 @@ impl BStack {
             }
             let ol = current_locked as usize; // safe: <= n, which was just validated
             let nl = n as usize; // safe: checked above
-            // next_power_of_two overflows when nl > 1 << (usize::BITS - 1).
-            if nl > 1usize << (usize::BITS - 1) {
+            // isize::MAX is the maximum valid allocation size; values above it
+            // would also cause next_power_of_two to overflow.
+            if nl > isize::MAX as usize {
                 return Err(io::Error::new(
                     io::ErrorKind::OutOfMemory,
                     "lock_up_to: locked region too large to cache on this platform",
