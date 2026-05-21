@@ -67,6 +67,49 @@ The `FirstFitBStackAllocator` could benefit from atomic operations to improve pe
 
 ---
 
+## Adding `SlabBStackAllocator` for fixed-block slab allocation
+
+**Feature flag:** `alloc` + `set`
+**Breaking change:** No (additive; new type only)
+
+### Motivation
+
+Workloads that repeatedly allocate and free regions of a similar small size benefit from a slab allocator that eliminates fragmentation by keeping all blocks the same size. Blocks carry **no metadata**. The free list pointers are stored inside freed blocks.
+
+### Design
+
+Introduce `SlabBStackAllocator` in `src/alloc/slab.rs`, implementing `BStackSliceAllocator` like all existing default allocators.
+
+```rust
+pub struct SlabBStackAllocator {
+    stack: BStack,
+    block_size: u64, // cached from header; must be ≥ 8; never changes after init
+}
+```
+
+The payload begins with an allocator header followed by the block arena:
+
+```text
+[ reserved(24) | magic[8] | block_size[8] | free_head[8] | arena ... ]
+  ^               ^
+  offset 0        offset 24 (allocator header start)
+  user data       offset 48 (arena start)
+```
+
+The magic number (e.g. `ALSL\x00\x01\x00\x00`) identifies the format and version. `block_size` and `free_head` are written back to the header on every mutation, making them durable. All blocks in the arena are exactly `block_size` bytes with **no header or footer**. When a block is free, its first 8 bytes hold the offset of the next free block (little-endian `u64`, sentinel `u64::MAX`); when live, those bytes belong to the caller — there is no per-block metadata at any time.
+
+**`alloc(len)`:** If `len ≤ block_size`, pop from the free list (zero the next-pointer, update header) or extend the tail by `block_size`. If `len > block_size`, always extend the tail to a multiple of `block_size`. The returned slice covers exactly `len` bytes.
+
+**`dealloc(slice)`:** If `len > block_size` and the slice is the tail, `discard`. For slab blocks, segment the backing region into `block_size` chunks, prepend each to the free list, and write the new `free_head` to the header. For oversized non-tail blocks, if the block size is N * `block_size`, segment it into N blocks, prepend all to the free list, and write the new `free_head` to the header. This allows oversized non-tail blocks to be reused without leaking.
+
+**`realloc`:** If the block is oversized and the new size is ≤ `block_size`, the excess portion can be segmented into a new block and added to the free list. If the block is oversized and the new size is > `block_size`, it can be reallocated in place if it's the tail or if the next block(s) are free and can be coalesced. Otherwise, a new block can be allocated, data copied, and the old block deallocated.
+
+### Open questions
+
+- Should `block_size < 8` be a `Result` error or a panic?
+
+---
+
 ## Adding `BStackVec<T>` for typed vector storage
 
 **Feature flag:** `BSTACK_FEATURE_SET`
