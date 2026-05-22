@@ -159,6 +159,70 @@ impl<'a, T: bytemuck::Pod, A: BStackSliceAllocator> BStackVec<'a, T, A> {
 
 ---
 
+## Truly crash-atomic `set` via write-in-progress journaling (0.4.0)
+
+**Breaking change:** Yes (on-disk format / ABI)
+
+### Motivation
+
+`set` is not crash-atomic today. The visible stack `[0..clen]` is updated in place under a single `clen` field, so a crash mid-write can leave the stack with a region of partially-old, partially-new bytes. The 16 B header (`magic[8] | clen[8]`) is enough to validate length but carries no record that a write is in progress, so recovery on open cannot detect or undo a torn in-place write.
+
+For `set` to be truly atomic — either the old value or the new value, never an interleaving — the header must encode an in-progress write region, and the bytes on disk must be laid out so that recovery can deterministically finish or roll back whatever was in flight.
+
+### Design
+
+#### Header layout
+
+The header grows from 16 B to 32 B:
+
+```
+[ magic[8] | clen[8 LE] | wip_ptr[8 LE] | wip_aux[8 LE] ]
+```
+
+Magic bumps to a new 0.4.0 value so old binaries fail loudly on a new file rather than misinterpret the longer header as payload. `wip_ptr == 0` is the steady state ("no write in progress"); a non-zero `wip_ptr` names the start of the in-progress write slice. The slice length is **not** stored — it is reconstructed at recovery time as `file_size − clen`, which is exact by construction (see algorithm below).
+
+`wip_aux` is reserved: in 0.4.0 it is always zero. A zero value signals "this is the same-length atomic-`set` case, recover by the inferred-length rule". A non-zero value is reserved for future splice (different-length `set`) operations, where it will encode whatever extra metadata splice needs — at minimum a direction flag, possibly a packed direction + target-clen tuple. Because `wip_aux` is already present in the 0.4.0 header, splice can be added later without another ABI bump.
+
+Only `set` (and, eventually, splice) ever arms `wip` — `push` and `pop` remain crash-atomic under a single `clen` write and leave `wip_ptr == 0` throughout. The at-rest invariant is `file_size == clen`; during a `set` the file grows to `clen + n` to hold a tail backup of the new bytes.
+
+#### `set` for the same-length case
+
+Replacing `[a .. a+n]` with new bytes `dn`:
+
+1. **Stage.** Extend the file to `clen + n`, write `dn` into the tail `[clen .. clen + n]`. Sync.
+2. **Arm.** Write `wip_ptr = a`. Sync.
+3. **Commit in place.** Copy `[clen .. clen + n]` into `[a .. a+n]`. Sync.
+4. **Disarm.** Write `wip_ptr = 0`. Sync.
+5. **Clean up.** Truncate file back to `clen`.
+
+`wip_aux` stays zero throughout; the slice length is implied by `file_size − clen`. Arming is therefore a single 8 B header write, with no ordering subtlety between two fields — `wip_ptr` is the only armed bit.
+
+#### Recovery on open
+
+Recovery runs once during construction, while the write lock is held, before the `BStack` is exposed. It reads only the header and the file size:
+
+- **`wip_ptr == 0`** — no active operation. Truncate to `clen` (drops any stale tail from a crashed step 1). Done.
+- **`wip_ptr != 0`** and **`wip_aux == 0`** — a same-length `set` was in progress. The staged tail is at `[clen .. file_size)`, length `n = file_size − clen`. Copy it into `[wip_ptr .. wip_ptr + n)`, truncate to `clen`, clear `wip_ptr`. The new value is committed.
+- **`wip_ptr != 0`** and **`wip_aux != 0`** — a splice operation. Handling is deferred; see open questions.
+
+Every intermediate on-disk state of the algorithm is recoverable to either the old or the new value, never an interleaving. Crashes in step 1 leave `wip_ptr == 0` (rollback by truncate). Crashes in step 2 are either `wip_ptr == 0` (rollback) or `wip_ptr == a` (roll forward via the staged tail). Crashes in step 3 roll forward; the recovery copy is idempotent over any partial in-place write. Crashes in step 4 are either roll forward (one more idempotent copy) or `wip_ptr == 0` (the new value is already in place; just truncate).
+
+Recovery must run to completion **before** the locked-region cache (#4) is populated, otherwise the cache could snapshot mid-rollback bytes. Any `set` that touches the locked region must also invalidate or refresh the cache atomically with the disk-level commit. This is a hard requirement of the journaling protocol, not an open question.
+
+#### Migration from 0.1.0 files
+
+Open old-magic files in a compatibility mode that rewrites them to the 0.4.0 layout: write the new header and payload into a sibling file, then `rename` into place (atomic within a filesystem on POSIX). One-shot per file; cost is proportional to file size. Document this in the changelog so users with large files aren't surprised.
+
+#### Durability barriers
+
+Crash-safety depends on three real barriers, in order: stage→arm, arm→in-place, in-place→disarm. Without any of these, recovery can observe a header that disagrees with on-disk content. Each "sync" step above is the existing `durable_sync` primitive (already `F_FULLFSYNC` on macOS with fdatasync fallback, `fsync` elsewhere); no new platform handling is introduced — the journaling protocol only adds barriers at the three transitions above.
+
+### Open questions
+
+- **Splice (different-length `set`) is deferred.** Replacing `[a..t]` of length `n_old` with bytes of length `n_new ≠ n_old` changes both slice contents and stack length. The current recovery rule in this document (length implied by `file_size − clen`) cannot distinguish the shrink and grow cases — the bytes immediately after the wip range carry opposite meanings (old content to discard vs new content to keep). Splice will use `wip_aux` to encode the metadata needed to disambiguate: at minimum a direction bit, possibly a packed direction + target-`clen` tuple. No header growth, no further ABI bump. The exact encoding inside `wip_aux`, the staging sequence for each direction should be considered before this is actually implemented.
+
+---
+
 ## Requiring `&mut BStackSlice` for mutation
 
 **Feature flag:** `set`
