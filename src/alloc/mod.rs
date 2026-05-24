@@ -448,6 +448,7 @@ pub mod linear;
 pub mod manual;
 #[cfg(feature = "set")]
 pub mod slab;
+#[cfg(feature = "set")]
 pub mod vec;
 
 pub use debug_checking::{DebugCheckingAllocator, DebugHandle};
@@ -463,4 +464,5 @@ pub use linear::LinearBStackAllocator;
 pub use manual::ManualAllocator;
 #[cfg(feature = "set")]
 pub use slab::SlabBStackAllocator;
+#[cfg(feature = "set")]
 pub use vec::{BStackByteVec, BStackByteVecIter};
