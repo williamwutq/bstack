@@ -1,5 +1,7 @@
 use super::{BStackAllocator, BStackBulkAllocator, BStackSlice};
 use crate::BStack;
+use std::cell::Cell;
+use std::marker::PhantomData;
 use std::{fmt, io};
 
 /// A simple bump allocator that owns a [`BStack`] and allocates regions
@@ -12,22 +14,48 @@ use std::{fmt, io};
 ///
 /// # Dealloc policy
 ///
-/// `dealloc` reclaims the tail allocation via [`BStack::discard`].  For
-/// non-tail allocations it is a no-op — the bytes remain on disk but are
-/// logically unreachable through this allocator.
+/// `dealloc` reclaims the tail allocation via [`BStack::discard`] (or
+/// [`BStack::try_discard`] with the `atomic` feature).  For non-tail
+/// allocations it is a no-op — the bytes remain on disk but are logically
+/// unreachable through this allocator.
 ///
 /// # Crash consistency
 ///
 /// Every operation maps to exactly one [`BStack`] call and is therefore
 /// crash-safe by inheritance:
 ///
-/// | Operation            | Underlying call     |
-/// |----------------------|---------------------|
-/// | `alloc`              | [`BStack::extend`]  |
-/// | `realloc` grow       | [`BStack::extend`]  |
-/// | `realloc` shrink     | [`BStack::discard`] |
-/// | `dealloc` (tail)     | [`BStack::discard`] |
-/// | `dealloc` (non-tail) | no-op               |
+/// | Operation            | Without `atomic`    | With `atomic`           |
+/// |----------------------|---------------------|-------------------------|
+/// | `alloc`              | [`BStack::extend`]  | [`BStack::extend`]      |
+/// | `realloc` grow       | [`BStack::extend`]  | [`BStack::try_extend`]  |
+/// | `realloc` shrink     | [`BStack::discard`] | [`BStack::try_discard`] |
+/// | `dealloc` (tail)     | [`BStack::discard`] | [`BStack::try_discard`] |
+/// | `dealloc` (non-tail) | no-op               | no-op                   |
+///
+/// # Thread safety
+///
+/// Without the `atomic` feature, `LinearBStackAllocator` is **`Send`** but
+/// **not `Sync`**: `realloc` and `dealloc` read the tail length and then
+/// modify it in two separate steps, so concurrent `&self` calls would race.
+///
+/// With the `atomic` feature, `LinearBStackAllocator` is **`Send + Sync`**.
+/// The tail-modifying operations are replaced with their `try_*` counterparts,
+/// which check-and-modify the tail in a single locked step:
+///
+/// * **`alloc`** / **`alloc_bulk`**: a single [`BStack::extend`] returns a
+///   distinct region to every caller regardless of concurrency.
+/// * **`realloc`**: uses [`BStack::try_extend`] / [`BStack::try_discard`]
+///   with `slice.end()` as the sentinel.  If the tail has moved (another
+///   thread raced), the call returns [`io::ErrorKind::Unsupported`] — the
+///   same error as a non-tail realloc on a single thread.
+/// * **`dealloc`** / **`dealloc_bulk`**: uses [`BStack::try_discard`]; if the
+///   tail has moved the discard is silently skipped, matching the existing
+///   non-tail no-op semantics.
+///
+/// ```
+/// fn assert_send<T: Send>() {}
+/// assert_send::<bstack::LinearBStackAllocator>();
+/// ```
 ///
 /// # Example
 ///
@@ -45,12 +73,26 @@ use std::{fmt, io};
 /// ```
 pub struct LinearBStackAllocator {
     stack: BStack,
+    _not_sync: PhantomData<Cell<()>>,
 }
+
+// SAFETY: With the `atomic` feature all tail-modifying `&self` operations
+// (`realloc`, `dealloc`, `dealloc_bulk`) use `try_extend`/`try_discard`,
+// which check-and-modify the tail in a single write-locked step inside
+// `BStack`.  Concurrent callers that lose the race receive `Ok(false)` and
+// behave as if their slice is non-tail — no data is corrupted.  `alloc` and
+// `alloc_bulk` use plain `extend`, which is already serialized by the write
+// lock and returns a distinct region to each caller.
+#[cfg(feature = "atomic")]
+unsafe impl Sync for LinearBStackAllocator {}
 
 impl LinearBStackAllocator {
     /// Create a new `LinearBStackAllocator` that takes ownership of `stack`.
     pub fn new(stack: BStack) -> Self {
-        Self { stack }
+        Self {
+            stack,
+            _not_sync: PhantomData,
+        }
     }
 }
 
@@ -91,6 +133,7 @@ impl BStackAllocator for LinearBStackAllocator {
         Ok(unsafe { BStackSlice::from_raw_parts(self, offset, len) })
     }
 
+    #[cfg(not(feature = "atomic"))]
     fn realloc<'a>(
         &'a self,
         slice: BStackSlice<'a, Self>,
@@ -120,11 +163,61 @@ impl BStackAllocator for LinearBStackAllocator {
         }
     }
 
+    // With the `atomic` feature the tail check and the modification are a
+    // single locked step (`try_extend`/`try_discard`), eliminating the TOCTOU
+    // race that exists in the non-atomic version.  A `false` return means
+    // another thread moved the tail first; we surface this as `Unsupported`,
+    // the same error returned for a non-tail slice on a single thread.
+    #[cfg(feature = "atomic")]
+    fn realloc<'a>(
+        &'a self,
+        slice: BStackSlice<'a, Self>,
+        new_len: u64,
+    ) -> io::Result<BStackSlice<'a, Self>> {
+        match new_len.cmp(&slice.len()) {
+            std::cmp::Ordering::Equal => Ok(slice),
+            std::cmp::Ordering::Greater => {
+                let delta = new_len - slice.len();
+                let zeros = vec![0u8; delta as usize];
+                if !self.stack.try_extend(slice.end(), zeros)? {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "LinearBStackAllocator does not support reallocation of non-tail slices; \
+                         callers must alloc a new region and copy manually. \
+                         Note: dealloc of the old (non-tail) slice is also a no-op and leaks the region.",
+                    ));
+                }
+                // SAFETY: slice was previously allocated and we atomically extended it in place
+                Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) })
+            }
+            std::cmp::Ordering::Less => {
+                if !self.stack.try_discard(slice.end(), slice.len() - new_len)? {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "LinearBStackAllocator does not support reallocation of non-tail slices; \
+                         callers must alloc a new region and copy manually. \
+                         Note: dealloc of the old (non-tail) slice is also a no-op and leaks the region.",
+                    ));
+                }
+                // SAFETY: slice was previously allocated and we atomically shrunk it in place
+                Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) })
+            }
+        }
+    }
+
+    #[cfg(not(feature = "atomic"))]
     fn dealloc(&self, slice: BStackSlice<'_, Self>) -> io::Result<()> {
         let current_tail = self.stack.len()?;
         if slice.end() == current_tail {
             self.stack.discard(slice.len())?;
         }
+        Ok(())
+    }
+
+    #[cfg(feature = "atomic")]
+    fn dealloc(&self, slice: BStackSlice<'_, Self>) -> io::Result<()> {
+        // try_discard is a no-op when the tail has moved, matching non-tail dealloc semantics.
+        self.stack.try_discard(slice.end(), slice.len())?;
         Ok(())
     }
 }
@@ -190,6 +283,7 @@ impl BStackBulkAllocator for LinearBStackAllocator {
     /// will not observe data corruption, but the silent swallowing of the
     /// programmer error may mask bugs. Add a debug assertion at the call site
     /// if uniqueness must be enforced.
+    #[cfg(not(feature = "atomic"))]
     fn dealloc_bulk<'a>(
         &'a self,
         slices: impl AsRef<[Self::Allocated<'a>]>,
@@ -213,5 +307,53 @@ impl BStackBulkAllocator for LinearBStackAllocator {
             self.stack.discard(to_discard)?;
         }
         Ok(())
+    }
+
+    // With `atomic`, we snapshot the tail once to determine what to discard,
+    // then use `try_discard` to make the actual removal atomic.  If another
+    // thread has moved the tail since the snapshot, `try_discard` returns
+    // `false` and the discard is silently skipped — same semantics as
+    // non-tail `dealloc` on a single thread.
+    #[cfg(feature = "atomic")]
+    fn dealloc_bulk<'a>(
+        &'a self,
+        slices: impl AsRef<[Self::Allocated<'a>]>,
+    ) -> Result<(), Self::Error> {
+        let slices = slices.as_ref();
+        if slices.is_empty() {
+            return Ok(());
+        }
+        let current_tail = self.stack.len()?;
+        let mut sorted: Vec<BStackSlice<'_, Self>> = slices.to_vec();
+        sorted.sort_by_key(|s| std::cmp::Reverse(s.end()));
+        let mut discard_start = current_tail;
+        for slice in &sorted {
+            if slice.end() == discard_start {
+                discard_start = slice.start();
+            }
+        }
+        let to_discard = current_tail - discard_start;
+        if to_discard > 0 {
+            self.stack.try_discard(current_tail, to_discard)?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod _assertions {
+    use super::LinearBStackAllocator;
+    // LinearBStackAllocator is always Send.
+    fn _send()
+    where
+        LinearBStackAllocator: Send,
+    {
+    }
+    // LinearBStackAllocator is Sync only when the `atomic` feature is enabled.
+    #[cfg(feature = "atomic")]
+    fn _sync()
+    where
+        LinearBStackAllocator: Sync,
+    {
     }
 }

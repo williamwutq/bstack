@@ -527,17 +527,32 @@ Constructed via `BStackSlice::reader()` or `BStackSlice::reader_at(offset)`.
 
 The reference bump allocator.  Regions are appended sequentially to the tail.
 
-| Operation              | Underlying call   | Crash-safe |
-|------------------------|-------------------|------------|
-| `alloc`                | `BStack::extend`  | yes        |
-| `alloc_bulk`           | `BStack::extend`  | yes        |
-| `realloc` grow         | `BStack::extend`  | yes        |
-| `realloc` shrink       | `BStack::discard` | yes        |
-| `dealloc` (tail)       | `BStack::discard` | yes        |
-| `dealloc` (non-tail)   | no-op             | yes        |
-| `dealloc_bulk` (tail)  | `BStack::discard` | yes        |
+| Operation              | Without `atomic`  | With `atomic`          | Crash-safe |
+|------------------------|-------------------|------------------------|------------|
+| `alloc`                | `BStack::extend`  | `BStack::extend`       | yes        |
+| `alloc_bulk`           | `BStack::extend`  | `BStack::extend`       | yes        |
+| `realloc` grow         | `BStack::extend`  | `BStack::try_extend`   | yes        |
+| `realloc` shrink       | `BStack::discard` | `BStack::try_discard`  | yes        |
+| `dealloc` (tail)       | `BStack::discard` | `BStack::try_discard`  | yes        |
+| `dealloc` (non-tail)   | no-op             | no-op                  | yes        |
+| `dealloc_bulk` (tail)  | `BStack::discard` | `BStack::try_discard`  | yes        |
 
-`realloc` returns `io::ErrorKind::Unsupported` for non-tail slices.
+`realloc` returns `io::ErrorKind::Unsupported` for non-tail slices.  With the
+`atomic` feature, `realloc` also returns `Unsupported` when another thread
+races to move the tail first — identical semantics to the non-tail case.
+
+#### Thread safety
+
+Without the `atomic` feature, `LinearBStackAllocator` is **`Send`** but **not
+`Sync`**: `realloc` and `dealloc` read the tail length and modify it in two
+separate steps, creating a TOCTOU race under concurrent `&self` access.
+
+With the `atomic` feature, `LinearBStackAllocator` is **`Send + Sync`**.
+`alloc` and `alloc_bulk` use `extend`, which is serialized by `BStack`'s write
+lock and returns a distinct region to each caller.  `realloc` uses
+`try_extend`/`try_discard` and `dealloc`/`dealloc_bulk` use `try_discard`:
+each fuses the tail-length check and the modification into a single locked
+step, so concurrent calls cannot corrupt each other.
 
 ### Experimental `FirstFitBStackAllocator` (`alloc + set` features)
 

@@ -26,7 +26,8 @@
 //! * [`LinearBStackAllocator`] — the reference bump allocator that always
 //!   appends to the tail.  Every operation maps to a single [`BStack`] call
 //!   and is crash-safe by inheritance.  `dealloc` of a non-tail slice is a
-//!   no-op; space is only reclaimed when the tail slice is freed.
+//!   no-op; space is only reclaimed when the tail slice is freed.  `Send`
+//!   without the `atomic` feature (not `Sync`); `Send + Sync` with `atomic`.
 //!
 //! * [`FirstFitBStackAllocator`] — a persistent first-fit free-list allocator
 //!   (requires both `alloc` **and** `set` features).  Freed regions are tracked
