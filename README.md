@@ -554,9 +554,9 @@ lock and returns a distinct region to each caller.  `realloc` uses
 each fuses the tail-length check and the modification into a single locked
 step, so concurrent calls cannot corrupt each other.
 
-### Experimental `FirstFitBStackAllocator` (`alloc + set` features)
+### `FirstFitBStackAllocator` (`alloc + set` features)
 
-Experimental: A persistent first-fit free-list allocator.  Freed regions are tracked on disk
+A persistent first-fit free-list allocator.  Freed regions are tracked on disk
 in a doubly-linked intrusive free list and reused for future allocations, so
 the file does not grow without bound.
 

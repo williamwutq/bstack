@@ -360,7 +360,7 @@
 //!   also `Sync` with the `atomic` feature.  Implements [`BStackAllocator`]
 //!   and [`BStackBulkAllocator`].
 //!
-//! * [`FirstFitBStackAllocator`] — Experimental: a persistent first-fit free-list allocator
+//! * [`FirstFitBStackAllocator`] — A persistent first-fit free-list allocator
 //!   that reuses freed regions to prevent unbounded file growth.  Requires both
 //!   `alloc` and `set` features.  `Send` but not `Sync`.
 //!
