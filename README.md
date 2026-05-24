@@ -602,6 +602,13 @@ linear scan of the arena rebuilds the free list from the `is_free` flags in
 block headers — stored pointer values are not trusted.  Any partial tail block
 is also truncated.
 
+#### Thread safety
+
+`FirstFitBStackAllocator` is **`Send`** but **not `Sync`**.  Ownership can be
+transferred to another thread, but concurrent `&self` access from multiple
+threads would race on the on-disk free list without any allocator-level lock.
+Each instance must be used from at most one thread at a time.
+
 #### Example
 
 ```rust
@@ -754,6 +761,13 @@ to `dealloc_bulk`, adjacent slices are merged and freed as a single operation
 No write-ahead log, no checksums. A crash during `dealloc` before the AVL
 insert permanently loses that block. A crash during rotation leaves the tree
 imbalanced — corrected on the next `GhostTreeBstackAllocator::new`.
+
+#### Thread safety
+
+`GhostTreeBstackAllocator` is **`Send`** but **not `Sync`**.  Ownership can be
+transferred to another thread, but concurrent `&self` access from multiple
+threads would race on the on-disk AVL tree without any allocator-level lock.
+Each instance must be used from at most one thread at a time.
 
 #### Example
 

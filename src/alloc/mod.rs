@@ -33,14 +33,16 @@
 //!   on disk in a doubly-linked intrusive free list and reused for future
 //!   allocations, so on-disk size does not grow without bound.  Adjacent free
 //!   blocks are coalesced automatically on `dealloc`.  A `recovery_needed` flag
-//!   enables automatic free-list reconstruction after a crash.
+//!   enables automatic free-list reconstruction after a crash.  `Send` but not
+//!   `Sync` — each instance must be used from at most one thread at a time.
 //!
 //! * [`GhostTreeBstackAllocator`] — a pure-AVL general-purpose allocator
 //!   (requires `alloc` feature).  Free blocks store their AVL node inline at
 //!   offset 0 within the block — live allocations carry **zero** overhead
 //!   (no headers, no footers).  The tree is keyed on `(size, address)` for a
 //!   strict total order.  All memory is kept zeroed: the BStack zeroes on
-//!   extension, and the allocator zeroes on free.
+//!   extension, and the allocator zeroes on free.  `Send` but not `Sync` —
+//!   each instance must be used from at most one thread at a time.
 //!
 //! * [`BStackByteVec`] — a growable byte (`u8`) vector backed by a
 //!   [`BStack`] allocation (requires both `alloc` **and** `set`).  Mirrors the

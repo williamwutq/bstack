@@ -360,13 +360,13 @@
 //!
 //! * [`FirstFitBStackAllocator`] — Experimental: a persistent first-fit free-list allocator
 //!   that reuses freed regions to prevent unbounded file growth.  Requires both
-//!   `alloc` and `set` features.
+//!   `alloc` and `set` features.  `Send` but not `Sync`.
 //!
 //! * [`GhostTreeBstackAllocator`] — A pure-AVL general-purpose allocator with
 //!   zero-overhead live allocations.  Free blocks store their AVL node inline,
 //!   and the tree is keyed on `(size, address)` for best-fit allocation.
 //!   Provides O(log n) allocation and deallocation with crash recovery through
-//!   tree rebalancing on mount.
+//!   tree rebalancing on mount.  `Send` but not `Sync`.
 //!
 //! * [`DebugCheckingAllocator`] — Debug/test wrapper around any
 //!   [`BStackAllocator`].  Tracks allocated and freed regions in memory and
