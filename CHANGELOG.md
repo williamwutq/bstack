@@ -19,6 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`BStackSlice::empty(allocator)` / `bstack_slice_empty`** (`alloc` feature): Constructs a zero-length slice anchored at offset 0.
 
+- **`SlabBStackAllocator`** (`alloc` + `set` features): New fixed-block slab allocator. All blocks in the arena are exactly `block_size` bytes (≥ 8) with no per-block header or footer. Freed blocks form an intrusive singly-linked free list; live bytes carry zero metadata overhead. Allocation is O(1) — either a free-list pop or a single tail extension. Deallocation of an oversized tail block shrinks the stack; all other blocks are returned to the free list in O(n_blocks). Reallocation within the same block count is O(1) with no I/O; tail resize is O(1); non-tail shrink recycles excess blocks; non-tail grow allocates and copies. Crash consistency: each free-list update is two `BStack` calls (write next-pointer, then update `free_head`); a crash between them leaks the affected block but leaves the rest of the list intact. `block_size < 8` returns `InvalidInput`.
+
 ### Changed
 
 - **`FirstFitBStackAllocator` internal reads converted from `get` to `get_into` with stack-allocated buffers** (`alloc` + `set` features): Three internal reads — the 32-byte allocator header on `new`, the 8-byte `free_head` field at the start of `find_large_enough_block`, and the 8-byte block size during `realloc`'s same-block fast path — now use fixed-size stack arrays and `get_into` instead of `get`. This eliminates three small heap allocations per call to those paths, with no change to observable behaviour.
@@ -48,8 +50,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`BStackReader`, `BStackSliceReader`, and `BStackSliceWriter` now implement `Copy`**: All cursor types can now be copied by value without an explicit `.clone()` call, making them more ergonomic to use in iterator-like patterns and when passing to functions that don't need to move the original cursor. (`BStackSliceReader` and `BStackSliceWriter` require the `alloc` feature.)
 
 ### Added
-
-- **`SlabBStackAllocator`** (`alloc` + `set` features): New fixed-block slab allocator. All blocks in the arena are exactly `block_size` bytes (≥ 8) with no per-block header or footer. Freed blocks form an intrusive singly-linked free list; live bytes carry zero metadata overhead. Allocation is O(1) — either a free-list pop or a single tail extension. Deallocation of an oversized tail block shrinks the stack; all other blocks are returned to the free list in O(n_blocks). Reallocation within the same block count is O(1) with no I/O; tail resize is O(1); non-tail shrink recycles excess blocks; non-tail grow allocates and copies. Crash consistency: each free-list update is two `BStack` calls (write next-pointer, then update `free_head`); a crash between them leaks the affected block but leaves the rest of the list intact. `block_size < 8` returns `InvalidInput`.
 
 - **`DebugCheckingAllocator`** (`alloc` feature): A wrapper allocator that tracks allocated regions in memory and validates all operations against them, providing strong guarantees that all allocations and deallocations are well-formed and correctly paired. Intended for testing and debugging; the tracking data structure is not optimised for performance or memory usage. See `debug_checking.rs` for details.
 
