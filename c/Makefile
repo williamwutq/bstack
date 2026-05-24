@@ -49,6 +49,7 @@ TEST_GT_OBJ = test_ghost_tree.o
 # Slab allocator test (requires BSTACK_FEATURE_SET).
 TEST_SL_BIN = test_slab$(EXE_EXT)
 TEST_SL_OBJ = test_slab.o
+
 # ByteVec — requires BSTACK_FEATURE_SET.
 OBJ_BYTEVEC     = bstack_bytevec.o
 LIB_BYTEVEC_SET = libbstack-bytevec-set.a
@@ -140,6 +141,7 @@ $(TEST_SL_BIN): $(TEST_SL_OBJ) $(LIB_ALLOC_SET)
 
 test-slab: $(TEST_SL_BIN)
 	$(RUN)$(TEST_SL_BIN)
+
 $(OBJ_BYTEVEC): bstack_bytevec.c bstack_bytevec.h bstack_alloc.h bstack.h
 	$(CC) $(CFLAGS) -DBSTACK_FEATURE_SET -c -o $@ $<
 
