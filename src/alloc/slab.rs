@@ -6,6 +6,7 @@
 
 use super::{BStackAllocator, BStackSlice};
 use crate::BStack;
+use core::{cell::Cell, marker::PhantomData, num::NonZeroU64};
 use std::{fmt, io};
 
 #[cfg(feature = "set")]
@@ -57,11 +58,10 @@ const ALSL_MAGIC_PREFIX: [u8; 6] = *b"ALSL\x00\x01";
 ///
 /// # Thread safety
 ///
-/// `SlabBStackAllocator` is **neither `Send` nor `Sync`**.  Although [`BStack`]
-/// itself is `Send + Sync`, free-list operations require two separate `BStack`
-/// calls that are not atomic with respect to each other.  Concurrent
-/// `alloc`/`dealloc` calls from multiple threads would race on `free_head` and
-/// corrupt the free list.  Confine each instance to one thread.
+/// `SlabBStackAllocator` is only `Send` but not `Sync`: concurrent access to
+/// the same allocator must be externally synchronized. This is because the
+/// free list head is cached in memory and updated non-atomically, so concurrent
+/// modifications could lead to lost updates and list corruption.
 ///
 /// # Feature flags
 ///
@@ -75,6 +75,8 @@ pub struct SlabBStackAllocator {
     stack: BStack,
     /// Cached from the on-disk header; fixed for the lifetime of the allocator.
     block_size: u64,
+    // Mark as !Sync to prevent concurrent access to the free list.
+    _not_sync: PhantomData<Cell<()>>,
 }
 
 #[cfg(feature = "set")]
@@ -126,7 +128,11 @@ impl SlabBStackAllocator {
             hdr[off + 8..off + 16].copy_from_slice(&block_size.to_le_bytes());
             // free_head at off+16 remains 0 (SENTINEL)
             stack.push(hdr)?;
-            return Ok(Self { stack, block_size });
+            return Ok(Self {
+                stack,
+                block_size,
+                _not_sync: PhantomData,
+            });
         }
 
         let stack_len = stack.len()?;
@@ -164,6 +170,7 @@ impl SlabBStackAllocator {
         Ok(Self {
             stack,
             block_size: stored_block_size,
+            _not_sync: PhantomData,
         })
     }
 
@@ -173,18 +180,20 @@ impl SlabBStackAllocator {
     }
 
     /// Pop the head block from the free list. Returns its payload offset, or `None`.
-    fn pop_free_block(&self) -> io::Result<Option<u64>> {
+    fn pop_free_block(&self) -> io::Result<Option<NonZeroU64>> {
         let head = u64::from_le_bytes(read_bstack!(self.stack, Self::FREE_HEAD_OFFSET => u64));
         if head == Self::SENTINEL {
             return Ok(None);
         }
-        // Read next-pointer before updating free_head: a crash between these
-        // two calls leaves the block still at the head of the list.
         self.stack.set(
             Self::FREE_HEAD_OFFSET,
             read_bstack!(self.stack, head => u64),
         )?;
-        Ok(Some(head))
+        // Zeroing. If this fail, the free list is still consistent and the popped block is leaked
+        // but not corrupted, so we can ignore the error.
+        let _ = self.stack.zero(head, self.block_size);
+        // SAFETY: head is not zero since we checked for the SENTINEL case above, so it is a valid NonZeroU64
+        Ok(Some(head.try_into().unwrap()))
     }
 
     /// Prepend the block at `block_start` to the free list.
@@ -252,7 +261,7 @@ impl BStackAllocator for SlabBStackAllocator {
         if len <= self.block_size {
             if let Some(block) = self.pop_free_block()? {
                 // SAFETY: block is a valid block_size region from pop_free_block
-                return Ok(unsafe { BStackSlice::from_raw_parts(self, block, len) });
+                return Ok(unsafe { BStackSlice::from_raw_parts(self, block.into(), len) });
             }
             let offset = self.stack.extend(self.block_size)?;
             // SAFETY: offset from a fresh tail extension of block_size bytes
@@ -316,8 +325,7 @@ impl BStackAllocator for SlabBStackAllocator {
         }
         if new_len == 0 {
             self.dealloc(slice)?;
-            // SAFETY: zero-length slice at offset 0 is the canonical null handle
-            return Ok(unsafe { BStackSlice::from_raw_parts(self, 0, 0) });
+            return Ok(BStackSlice::empty(self));
         }
         if new_len == slice.len() {
             return Ok(slice);
@@ -328,9 +336,10 @@ impl BStackAllocator for SlabBStackAllocator {
 
         if old_n == new_n {
             // Same backing blocks: zero newly-exposed bytes then adjust visible length.
+            // Interget safety: old and new slice length are both valid u64 values and they could not differ
+            // by more than block_size by bytes, so new_len - slice.len() will not overflow.
             if new_len > slice.len() {
-                self.stack
-                    .zero(slice.start() + slice.len(), new_len - slice.len())?;
+                self.stack.zero(slice.end(), new_len - slice.len())?;
             }
             // SAFETY: new_len still fits within the same block_size-aligned region
             return Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) });
@@ -348,8 +357,7 @@ impl BStackAllocator for SlabBStackAllocator {
                 self.stack.discard(old_backing - new_backing)?;
             }
             if new_len > slice.len() {
-                self.stack
-                    .zero(slice.start() + slice.len(), new_len - slice.len())?;
+                self.stack.zero(slice.end(), new_len - slice.len())?;
             }
             // SAFETY: slice extended or shrunk in place at the tail
             return Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) });
@@ -358,6 +366,8 @@ impl BStackAllocator for SlabBStackAllocator {
         if new_n < old_n {
             // Shrink non-tail: recycle excess blocks into the free list.
             for i in new_n..old_n {
+                // TODO: batch this to reduce the number of IO calls and instead only write free head once
+                // Since the block is contiguous, we can just write pointers once and then write free head once
                 self.push_free_block(slice.start() + i * self.block_size)?;
             }
             // SAFETY: new_len fits within the first new_n retained blocks
@@ -365,6 +375,8 @@ impl BStackAllocator for SlabBStackAllocator {
         }
 
         // Grow non-tail: allocate a new region, copy data, release old.
+        // TODO: since block is too big, we definitely need a tail grow and there is no need to call
+        // alloc since we can just extend the tail directly.
         let new_slice = self.alloc(new_len)?;
         let new_start = new_slice.start();
         if !slice.is_empty() {
