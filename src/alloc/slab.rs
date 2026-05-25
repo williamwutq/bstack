@@ -85,9 +85,6 @@ impl SlabBStackAllocator {
     const HEADER_SIZE: u64 = 24;
     /// Payload offset of the first arena block.
     const ARENA_START: u64 = Self::OFFSET_SIZE + Self::HEADER_SIZE;
-    /// Payload offset of the `block_size` field inside the header.
-    #[allow(dead_code)]
-    const BLOCK_SIZE_FIELD_OFFSET: u64 = Self::OFFSET_SIZE + 8;
     /// Payload offset of the `free_head` field inside the header.
     const FREE_HEAD_OFFSET: u64 = Self::OFFSET_SIZE + 16;
     /// Minimum legal `block_size`: must fit at least one free-list pointer.
@@ -175,39 +172,32 @@ impl SlabBStackAllocator {
         self.block_size
     }
 
-    fn read_free_head(&self) -> io::Result<u64> {
-        let mut buf = [0u8; 8];
-        self.stack.get_into(Self::FREE_HEAD_OFFSET, &mut buf)?;
-        Ok(u64::from_le_bytes(buf))
-    }
-
-    fn write_free_head(&self, head: u64) -> io::Result<()> {
-        self.stack.set(Self::FREE_HEAD_OFFSET, head.to_le_bytes())
-    }
-
     /// Pop the head block from the free list. Returns its payload offset, or `None`.
     fn pop_free_block(&self) -> io::Result<Option<u64>> {
-        let head = self.read_free_head()?;
+        let head = u64::from_le_bytes(read_bstack!(self.stack, Self::FREE_HEAD_OFFSET => u64));
         if head == Self::SENTINEL {
             return Ok(None);
         }
         // Read next-pointer before updating free_head: a crash between these
         // two calls leaves the block still at the head of the list.
-        let mut next_buf = [0u8; 8];
-        self.stack.get_into(head, &mut next_buf)?;
-        let next = u64::from_le_bytes(next_buf);
-        self.write_free_head(next)?;
+        self.stack.set(
+            Self::FREE_HEAD_OFFSET,
+            read_bstack!(self.stack, head => u64),
+        )?;
         Ok(Some(head))
     }
 
     /// Prepend the block at `block_start` to the free list.
     fn push_free_block(&self, block_start: u64) -> io::Result<()> {
-        let head = self.read_free_head()?;
         // Write the next-pointer into the block before updating free_head: a
         // crash after this write but before the header update leaks the block
         // rather than corrupting the list.
-        self.stack.set(block_start, head.to_le_bytes())?;
-        self.write_free_head(block_start)
+        self.stack.set(
+            block_start,
+            read_bstack!(self.stack, Self::FREE_HEAD_OFFSET => u64),
+        )?;
+        self.stack
+            .set(Self::FREE_HEAD_OFFSET, block_start.to_le_bytes())
     }
 
     /// Number of `block_size` blocks required to back `len` bytes.
@@ -256,8 +246,7 @@ impl BStackAllocator for SlabBStackAllocator {
     /// | oversized | 1 (`extend`) | crash-safe by inheritance |
     fn alloc(&self, len: u64) -> io::Result<BStackSlice<'_, Self>> {
         if len == 0 {
-            // SAFETY: zero-length slice at offset 0 is the canonical null handle
-            return Ok(unsafe { BStackSlice::from_raw_parts(self, 0, 0) });
+            return Ok(BStackSlice::empty(self));
         }
 
         if len <= self.block_size {

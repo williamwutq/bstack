@@ -437,6 +437,50 @@ where
 {
 }
 
+// Macros
+
+macro_rules! read_buf {
+    ($buf:expr, $off:expr => $ty:ty) => {{
+        let start = $off as usize;
+        let end = start + core::mem::size_of::<$ty>();
+        $buf[start..end].try_into().unwrap()
+    }};
+    ($buf:expr, $off:expr => $num:literal) => {{
+        let start = $off as usize;
+        let end = start + $num;
+        $buf[start..end].try_into().unwrap()
+    }};
+}
+
+macro_rules! write_buf {
+    ($val:expr => $buf:expr, $off:expr) => {{
+        let bytes = $val.to_le_bytes();
+        let start = $off as usize;
+        let end = start + bytes.len();
+        $buf[start..end].copy_from_slice(&bytes);
+    }};
+}
+
+// Read a little-endian value of type `$ty` from `$buf` at offset `$off`.
+macro_rules! read_buf_le {
+    ($buf:expr, $off:expr => $ty:ty) => {
+        <$ty>::from_le_bytes(read_buf!($buf, $off => $ty))
+    };
+}
+
+macro_rules! read_bstack {
+    ($stack:expr, $off:expr => $ty:ty) => {{
+        let mut buf = [0u8; core::mem::size_of::<$ty>()];
+        $stack.get_into($off, &mut buf)?;
+        buf
+    }};
+    ($stack:expr, $off:expr => $num:literal) => {{
+        let mut buf = [0u8; $num];
+        $stack.get_into($off, &mut buf)?;
+        buf
+    }};
+}
+
 pub mod debug_checking;
 #[cfg(feature = "set")]
 pub mod first_fit;
