@@ -1867,6 +1867,72 @@ impl BStack {
         }
     }
 
+    /// Read multiple logical ranges into caller-provided buffers in a single lock acquisition.
+    ///
+    /// Takes any iterator whose items are `(u64, &mut [u8])` — a start offset
+    /// and a mutable buffer to fill.  The number of bytes read for each entry
+    /// equals `buf.len()`.  An empty iterator returns immediately.
+    ///
+    /// All reads happen under the same shared lock, so no write can interleave
+    /// between them.  On Unix and Windows the shared read lock is taken once
+    /// for all reads; on other platforms the write lock serialises all reads.
+    ///
+    /// # Feature flag
+    ///
+    /// Only available when the `atomic` Cargo feature is enabled.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] if any read would extend beyond
+    /// the current payload size.
+    #[cfg(feature = "atomic")]
+    pub fn get_batched_into<'a, I>(&self, bufs: I) -> io::Result<()>
+    where
+        I: IntoIterator<Item = (u64, &'a mut [u8])>,
+    {
+        let bufs: Vec<(u64, &'a mut [u8])> = bufs.into_iter().collect();
+        if bufs.is_empty() {
+            return Ok(());
+        }
+        #[cfg(any(unix, windows))]
+        {
+            let file = self.lock.read().unwrap();
+            let data_size = file.metadata()?.len().saturating_sub(HEADER_SIZE);
+            for (ptr, buf) in bufs {
+                let end = ptr + buf.len() as u64;
+                if end > data_size {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "get_batched_into: end ({end}) exceeds payload size ({data_size})",
+                        ),
+                    ));
+                }
+                pread_exact_into(&file, HEADER_SIZE + ptr, buf)?;
+            }
+            Ok(())
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let mut file = self.lock.write().unwrap();
+            let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
+            for (ptr, buf) in bufs {
+                let end = ptr + buf.len() as u64;
+                if end > data_size {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "get_batched_into: end ({end}) exceeds payload size ({data_size})",
+                        ),
+                    ));
+                }
+                file.seek(SeekFrom::Start(HEADER_SIZE + ptr))?;
+                file.read_exact(buf)?;
+            }
+            Ok(())
+        }
+    }
+
     /// Read a dependent chain of logical ranges in a single lock acquisition.
     ///
     /// `gen` is called once per read step.  The first call receives an empty
