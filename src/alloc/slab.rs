@@ -209,6 +209,39 @@ impl SlabBStackAllocator {
             .set(Self::FREE_HEAD_OFFSET, block_start.to_le_bytes())
     }
 
+    /// Prepend `count` contiguous blocks starting at `first_block` to the free list.
+    ///
+    /// Uses exactly 3 IO calls regardless of `count`: one read of `free_head`,
+    /// one bulk write of all next-pointers into the freed region, and one write
+    /// of the new `free_head`. Crash behaviour matches `push_free_block`: a
+    /// crash after the bulk write but before the `free_head` update leaks the
+    /// entire batch rather than corrupting the list.
+    ///
+    /// Requires that count * block_size does not overflow u64 and
+    /// first_block + count * block_size does not overflow u64 and is a valid offset
+    /// on the stack by the caller.
+    fn push_free_blocks(&self, first_block: u64, count: u64) -> io::Result<()> {
+        if count == 0 {
+            return Ok(());
+        }
+        if count == 1 {
+            return self.push_free_block(first_block);
+        }
+        let old_head = read_bstack!(self.stack, Self::FREE_HEAD_OFFSET => u64);
+        let buf_size = (count * self.block_size) as usize;
+        let mut buf = vec![0u8; buf_size];
+        for i in 0..count - 1 {
+            let next = first_block + (i + 1) * self.block_size;
+            let off = (i * self.block_size) as usize;
+            buf[off..off + 8].copy_from_slice(&next.to_le_bytes());
+        }
+        let last_off = ((count - 1) * self.block_size) as usize;
+        buf[last_off..last_off + 8].copy_from_slice(&old_head);
+        self.stack.set(first_block, buf)?;
+        self.stack
+            .set(Self::FREE_HEAD_OFFSET, first_block.to_le_bytes())
+    }
+
     /// Number of `block_size` blocks required to back `len` bytes.
     fn blocks_needed(&self, len: u64) -> u64 {
         if len == 0 {
@@ -299,10 +332,7 @@ impl BStackAllocator for SlabBStackAllocator {
             return self.stack.discard(backing_size);
         }
 
-        for i in 0..n_blocks {
-            self.push_free_block(slice.start() + i * self.block_size)?;
-        }
-        Ok(())
+        self.push_free_blocks(slice.start(), n_blocks)
     }
 
     /// Resize the region described by `slice` to `new_len` bytes.
@@ -365,11 +395,7 @@ impl BStackAllocator for SlabBStackAllocator {
 
         if new_n < old_n {
             // Shrink non-tail: recycle excess blocks into the free list.
-            for i in new_n..old_n {
-                // TODO: batch this to reduce the number of IO calls and instead only write free head once
-                // Since the block is contiguous, we can just write pointers once and then write free head once
-                self.push_free_block(slice.start() + i * self.block_size)?;
-            }
+            self.push_free_blocks(slice.start() + new_n * self.block_size, old_n - new_n)?;
             // SAFETY: new_len fits within the first new_n retained blocks
             return Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) });
         }

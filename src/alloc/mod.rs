@@ -438,7 +438,7 @@ where
 }
 
 // Macros
-
+#[allow(unused)]
 macro_rules! read_buf {
     ($buf:expr, $off:expr => $ty:ty) => {{
         let start = $off as usize;
@@ -452,6 +452,7 @@ macro_rules! read_buf {
     }};
 }
 
+#[allow(unused)]
 macro_rules! write_buf {
     ($val:expr => $buf:expr, $off:expr) => {{
         let bytes = $val.to_le_bytes();
@@ -462,12 +463,14 @@ macro_rules! write_buf {
 }
 
 // Read a little-endian value of type `$ty` from `$buf` at offset `$off`.
+#[allow(unused)]
 macro_rules! read_buf_le {
     ($buf:expr, $off:expr => $ty:ty) => {
         <$ty>::from_le_bytes(read_buf!($buf, $off => $ty))
     };
 }
 
+#[allow(unused)]
 macro_rules! read_bstack {
     ($stack:expr, $off:expr => $ty:ty) => {{
         let mut buf = [0u8; core::mem::size_of::<$ty>()];
