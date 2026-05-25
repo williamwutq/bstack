@@ -1698,6 +1698,41 @@ impl BStack {
         Ok(true)
     }
 
+    /// Append `n` zero bytes only if the current logical payload size equals `s`.
+    ///
+    /// Returns `Ok(true)` if the size matched and `n` zero bytes were appended
+    /// (or `n = 0` and no I/O was needed).  Returns `Ok(false)` without
+    /// modifying the file if the size does not match.
+    ///
+    /// # Feature flag
+    ///
+    /// Only available when the `atomic` Cargo feature is enabled.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any I/O error from `set_len`, `write_committed_len`, or
+    /// `durable_sync`.
+    #[cfg(feature = "atomic")]
+    pub fn try_extend_zeros(&self, s: u64, n: u64) -> io::Result<bool> {
+        let mut file = self.lock.write().unwrap();
+        let file_end = file.seek(SeekFrom::End(0))?;
+        let data_size = file_end - HEADER_SIZE;
+        if data_size != s {
+            return Ok(false);
+        }
+        if n == 0 {
+            return Ok(true);
+        }
+        let new_len = data_size + n;
+        file.set_len(HEADER_SIZE + new_len)?;
+        if let Err(e) = write_committed_len(&mut file, new_len).and_then(|_| durable_sync(&file)) {
+            let _ = file.set_len(file_end);
+            let _ = write_committed_len(&mut file, data_size);
+            return Err(e);
+        }
+        Ok(true)
+    }
+
     /// Discard `n` bytes only if the current logical payload size equals `s`.
     ///
     /// Returns `Ok(true)` if the size matched and `n` bytes were removed (or
