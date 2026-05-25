@@ -1783,6 +1783,194 @@ impl BStack {
         Ok(true)
     }
 
+    /// Read multiple logical ranges in a single lock acquisition.
+    ///
+    /// Takes any iterator whose items are [`Range<u64>`](std::ops::Range) and
+    /// returns a [`Vec`] of owned byte buffers, one per input range, in the
+    /// same order.  An empty iterator returns an empty `Vec`.  An empty range
+    /// (`start == end`) produces an empty inner `Vec`.
+    ///
+    /// All reads happen under the same shared lock, so no write can interleave
+    /// between them.  On Unix and Windows the shared read lock is taken once
+    /// for all non-locked ranges; on other platforms the write lock serialises
+    /// all reads.
+    ///
+    /// # Feature flag
+    ///
+    /// Only available when the `atomic` Cargo feature is enabled.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] if any range has `end < start`
+    /// or if any `end` exceeds the current payload size.
+    #[cfg(feature = "atomic")]
+    pub fn get_batched<I>(&self, ranges: I) -> io::Result<Vec<Vec<u8>>>
+    where
+        I: IntoIterator<Item = std::ops::Range<u64>>,
+    {
+        let ranges: Vec<std::ops::Range<u64>> = ranges.into_iter().collect();
+        if ranges.is_empty() {
+            return Ok(Vec::new());
+        }
+        for r in &ranges {
+            if r.end < r.start {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("get_batched: end ({}) < start ({})", r.end, r.start),
+                ));
+            }
+        }
+        #[cfg(any(unix, windows))]
+        {
+            let file = self.lock.read().unwrap();
+            let data_size = file.metadata()?.len().saturating_sub(HEADER_SIZE);
+            let mut results = Vec::with_capacity(ranges.len());
+            for r in &ranges {
+                if r.end > data_size {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "get_batched: end ({}) exceeds payload size ({data_size})",
+                            r.end
+                        ),
+                    ));
+                }
+                results.push(pread_exact(
+                    &file,
+                    HEADER_SIZE + r.start,
+                    (r.end - r.start) as usize,
+                )?);
+            }
+            Ok(results)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let mut file = self.lock.write().unwrap();
+            let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
+            let mut results = Vec::with_capacity(ranges.len());
+            for r in &ranges {
+                if r.end > data_size {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "get_batched: end ({}) exceeds payload size ({data_size})",
+                            r.end
+                        ),
+                    ));
+                }
+                file.seek(SeekFrom::Start(HEADER_SIZE + r.start))?;
+                let mut buf = vec![0u8; (r.end - r.start) as usize];
+                file.read_exact(&mut buf)?;
+                results.push(buf);
+            }
+            Ok(results)
+        }
+    }
+
+    /// Read a dependent chain of logical ranges in a single lock acquisition.
+    ///
+    /// `gen` is called once per read step.  The first call receives an empty
+    /// slice (`&[]`).  Each subsequent call receives the bytes returned by the
+    /// previous read.  The generator returns `Some(range)` to request the next
+    /// read, or `None` to stop.  Returns a [`Vec`] of all read results in
+    /// order.
+    ///
+    /// All reads happen under the same shared lock (Unix/Windows: read lock;
+    /// other platforms: write lock), so no write can interleave between steps.
+    ///
+    /// # Feature flag
+    ///
+    /// Only available when the `atomic` Cargo feature is enabled.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] if any yielded range has
+    /// `end < start` or if `end` exceeds the current payload size.
+    #[cfg(feature = "atomic")]
+    pub fn get_batched_gen<F>(&self, mut f: F) -> io::Result<Vec<Vec<u8>>>
+    where
+        F: FnMut(&[u8]) -> Option<std::ops::Range<u64>>,
+    {
+        #[cfg(any(unix, windows))]
+        {
+            let file = self.lock.read().unwrap();
+            let data_size = file.metadata()?.len().saturating_sub(HEADER_SIZE);
+            let mut results: Vec<Vec<u8>> = Vec::new();
+            loop {
+                let range = {
+                    let last = results.last().map(Vec::as_slice).unwrap_or(&[]);
+                    match f(last) {
+                        Some(r) => r,
+                        None => break,
+                    }
+                };
+                if range.end < range.start {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "get_batched_gen: end ({}) < start ({})",
+                            range.end, range.start
+                        ),
+                    ));
+                }
+                if range.end > data_size {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "get_batched_gen: end ({}) exceeds payload size ({data_size})",
+                            range.end
+                        ),
+                    ));
+                }
+                let buf = pread_exact(
+                    &file,
+                    HEADER_SIZE + range.start,
+                    (range.end - range.start) as usize,
+                )?;
+                results.push(buf);
+            }
+            Ok(results)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let mut file = self.lock.write().unwrap();
+            let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
+            let mut results: Vec<Vec<u8>> = Vec::new();
+            loop {
+                let range = {
+                    let last = results.last().map(Vec::as_slice).unwrap_or(&[]);
+                    match f(last) {
+                        Some(r) => r,
+                        None => break,
+                    }
+                };
+                if range.end < range.start {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "get_batched_gen: end ({}) < start ({})",
+                            range.end, range.start
+                        ),
+                    ));
+                }
+                if range.end > data_size {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "get_batched_gen: end ({}) exceeds payload size ({data_size})",
+                            range.end
+                        ),
+                    ));
+                }
+                file.seek(SeekFrom::Start(HEADER_SIZE + range.start))?;
+                let mut buf = vec![0u8; (range.end - range.start) as usize];
+                file.read_exact(&mut buf)?;
+                results.push(buf);
+            }
+            Ok(results)
+        }
+    }
+
     /// Pop `n` bytes off the tail, pass them read-only to a callback that
     /// returns the new tail bytes, then write the new tail.
     ///
@@ -2044,6 +2232,101 @@ impl BStack {
         Ok(true)
     }
 
+    /// Atomically swap two equal-size, non-overlapping regions within the file.
+    ///
+    /// Bytes at `[a, a + n)` and `[b, b + n)` are exchanged under a single
+    /// write lock, so no other thread can observe an intermediate state.
+    /// The file size is never changed.  `n = 0` is a valid no-op (bounds are
+    /// still checked).
+    ///
+    /// # Feature flags
+    ///
+    /// Only available when both the `set` and `atomic` Cargo features are
+    /// enabled.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] if either `a + n` or `b + n`
+    /// overflows `u64`, if the regions overlap, if either region exceeds the
+    /// current payload size, or if either region overlaps the locked prefix.
+    /// Propagates any I/O error from `read_exact`, `write_all`, or
+    /// `durable_sync`.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    pub fn cross_exchange(&self, a: u64, b: u64, n: u64) -> io::Result<()> {
+        let a_end = a.checked_add(n).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cross_exchange: a + n overflows u64",
+            )
+        })?;
+        let b_end = b.checked_add(n).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cross_exchange: b + n overflows u64",
+            )
+        })?;
+        if n > 0 {
+            let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+            if lo + n > hi {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "cross_exchange: regions [{a}, {a_end}) and [{b}, {b_end}) overlap"
+                    ),
+                ));
+            }
+        }
+        let mut file = self.lock.write().unwrap();
+        let locked = self.locked.load(Ordering::Acquire);
+        if a < locked {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "cross_exchange: region [{a}, {a_end}) overlaps locked region [0, {locked})"
+                ),
+            ));
+        }
+        if b < locked {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "cross_exchange: region [{b}, {b_end}) overlaps locked region [0, {locked})"
+                ),
+            ));
+        }
+        let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
+        if a_end > data_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "cross_exchange: region [{a}, {a_end}) exceeds payload size ({data_size})"
+                ),
+            ));
+        }
+        if b_end > data_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "cross_exchange: region [{b}, {b_end}) exceeds payload size ({data_size})"
+                ),
+            ));
+        }
+        if n == 0 {
+            return Ok(());
+        }
+        file.seek(SeekFrom::Start(HEADER_SIZE + a))?;
+        let mut buf_a = vec![0u8; n as usize];
+        file.read_exact(&mut buf_a)?;
+        file.seek(SeekFrom::Start(HEADER_SIZE + b))?;
+        let mut buf_b = vec![0u8; n as usize];
+        file.read_exact(&mut buf_b)?;
+        file.seek(SeekFrom::Start(HEADER_SIZE + a))?;
+        file.write_all(&buf_b)?;
+        file.seek(SeekFrom::Start(HEADER_SIZE + b))?;
+        file.write_all(&buf_a)?;
+        durable_sync(&file)
+    }
+
     /// Read bytes in the half-open logical range `[start, end)`, pass them to
     /// a callback that may mutate them in place, then write the modified bytes
     /// back.
@@ -2104,6 +2387,374 @@ impl BStack {
             durable_sync(&file)?;
         }
         Ok(())
+    }
+
+    /// Cross-Region Dependent Swap — equal condition.
+    ///
+    /// Reads `a_expected.len()` bytes from logical offset `a_offset` and
+    /// compares them to `a_expected`.  If they are **equal**, atomically swaps
+    /// region B: reads `b_buf.len()` bytes from `b_offset`, writes the current
+    /// contents of `b_buf` there, and returns the old region-B bytes as
+    /// `Ok(Some(Vec<u8>))`.  If the comparison fails, returns `Ok(None)`
+    /// without modifying the file.
+    ///
+    /// The read of region A, the comparison, the read of region B, and the
+    /// write to region B all happen under the same write lock, so no other
+    /// thread can observe an intermediate state.  The file size is never
+    /// changed.
+    ///
+    /// An empty `a_expected` trivially compares equal (zero bytes match zero
+    /// bytes).  An empty `b_buf` skips the B swap and returns
+    /// `Ok(Some(Vec::new()))` when the condition passes.
+    ///
+    /// # Feature flags
+    ///
+    /// Only available when both the `set` and `atomic` Cargo features are
+    /// enabled.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] if either `a_offset + a_len` or
+    /// `b_offset + b_len` overflows `u64`, exceeds the current payload size,
+    /// or if region B overlaps the locked prefix.  Propagates any I/O error
+    /// from `read_exact`, `write_all`, or `durable_sync`.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    pub fn eq_crds(
+        &self,
+        a_offset: u64,
+        a_expected: impl AsRef<[u8]>,
+        b_offset: u64,
+        b_buf: impl AsRef<[u8]>,
+    ) -> io::Result<Option<Vec<u8>>> {
+        let a_expected = a_expected.as_ref();
+        let b_buf = b_buf.as_ref();
+        let a_len = a_expected.len() as u64;
+        let b_len = b_buf.len() as u64;
+        let a_end = a_offset.checked_add(a_len).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "eq_crds: a_offset + a_len overflows u64",
+            )
+        })?;
+        let b_end = b_offset.checked_add(b_len).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "eq_crds: b_offset + b_len overflows u64",
+            )
+        })?;
+        let mut file = self.lock.write().unwrap();
+        let locked = self.locked.load(Ordering::Acquire);
+        if !b_buf.is_empty() && b_offset < locked {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("eq_crds: B range [{b_offset}, {b_end}) overlaps locked region [0, {locked})"),
+            ));
+        }
+        let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
+        if !a_expected.is_empty() && a_end > data_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("eq_crds: A range [{a_offset}, {a_end}) exceeds payload size ({data_size})"),
+            ));
+        }
+        if !b_buf.is_empty() && b_end > data_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("eq_crds: B range [{b_offset}, {b_end}) exceeds payload size ({data_size})"),
+            ));
+        }
+        let mut a_current = vec![0u8; a_expected.len()];
+        if !a_expected.is_empty() {
+            file.seek(SeekFrom::Start(HEADER_SIZE + a_offset))?;
+            file.read_exact(&mut a_current)?;
+        }
+        if a_current != a_expected {
+            return Ok(None);
+        }
+        if b_buf.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        file.seek(SeekFrom::Start(HEADER_SIZE + b_offset))?;
+        let mut old_b = vec![0u8; b_buf.len()];
+        file.read_exact(&mut old_b)?;
+        file.seek(SeekFrom::Start(HEADER_SIZE + b_offset))?;
+        file.write_all(b_buf)?;
+        durable_sync(&file)?;
+        Ok(Some(old_b))
+    }
+
+    /// Cross-Region Dependent Swap — not-equal condition.
+    ///
+    /// Like [`eq_crds`](Self::eq_crds) but performs the region-B swap only
+    /// when the `a_expected.len()` bytes at `a_offset` are **not equal** to
+    /// `a_expected`.  Returns `Ok(None)` if the bytes compare equal (swap
+    /// suppressed).
+    ///
+    /// # Feature flags
+    ///
+    /// Only available when both the `set` and `atomic` Cargo features are
+    /// enabled.
+    ///
+    /// # Errors
+    ///
+    /// Same conditions as [`eq_crds`](Self::eq_crds).
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    pub fn ne_crds(
+        &self,
+        a_offset: u64,
+        a_expected: impl AsRef<[u8]>,
+        b_offset: u64,
+        b_buf: &mut [u8],
+    ) -> io::Result<Option<Vec<u8>>> {
+        let a_expected = a_expected.as_ref();
+        let a_len = a_expected.len() as u64;
+        let b_len = b_buf.len() as u64;
+        let a_end = a_offset.checked_add(a_len).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "ne_crds: a_offset + a_len overflows u64",
+            )
+        })?;
+        let b_end = b_offset.checked_add(b_len).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "ne_crds: b_offset + b_len overflows u64",
+            )
+        })?;
+        let mut file = self.lock.write().unwrap();
+        let locked = self.locked.load(Ordering::Acquire);
+        if !b_buf.is_empty() && b_offset < locked {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("ne_crds: B range [{b_offset}, {b_end}) overlaps locked region [0, {locked})"),
+            ));
+        }
+        let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
+        if !a_expected.is_empty() && a_end > data_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("ne_crds: A range [{a_offset}, {a_end}) exceeds payload size ({data_size})"),
+            ));
+        }
+        if !b_buf.is_empty() && b_end > data_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("ne_crds: B range [{b_offset}, {b_end}) exceeds payload size ({data_size})"),
+            ));
+        }
+        let mut a_current = vec![0u8; a_expected.len()];
+        if !a_expected.is_empty() {
+            file.seek(SeekFrom::Start(HEADER_SIZE + a_offset))?;
+            file.read_exact(&mut a_current)?;
+        }
+        if a_current == a_expected {
+            return Ok(None);
+        }
+        if b_buf.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        file.seek(SeekFrom::Start(HEADER_SIZE + b_offset))?;
+        let mut old_b = vec![0u8; b_buf.len()];
+        file.read_exact(&mut old_b)?;
+        file.seek(SeekFrom::Start(HEADER_SIZE + b_offset))?;
+        file.write_all(b_buf)?;
+        durable_sync(&file)?;
+        Ok(Some(old_b))
+    }
+
+    /// Cross-Region Dependent Swap — masked-equal condition.
+    ///
+    /// Like [`eq_crds`](Self::eq_crds) but the comparison applies a bitwise
+    /// AND mask before comparing: for each byte `i`, the condition is
+    /// `(A[i] & mask[i]) == a_expected[i]`.  `mask` and `a_expected` must
+    /// have the same length, which determines how many bytes are read from
+    /// region A.
+    ///
+    /// # Feature flags
+    ///
+    /// Only available when both the `set` and `atomic` Cargo features are
+    /// enabled.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] if `mask.len() != a_expected.len()`.
+    /// Same additional conditions as [`eq_crds`](Self::eq_crds).
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    pub fn masked_eq_crds(
+        &self,
+        a_offset: u64,
+        mask: impl AsRef<[u8]>,
+        a_expected: impl AsRef<[u8]>,
+        b_offset: u64,
+        b_buf: &mut [u8],
+    ) -> io::Result<Option<Vec<u8>>> {
+        let mask = mask.as_ref();
+        let a_expected = a_expected.as_ref();
+        if mask.len() != a_expected.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "masked_eq_crds: mask length ({}) != a_expected length ({})",
+                    mask.len(),
+                    a_expected.len()
+                ),
+            ));
+        }
+        let a_len = a_expected.len() as u64;
+        let b_len = b_buf.len() as u64;
+        let a_end = a_offset.checked_add(a_len).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "masked_eq_crds: a_offset + a_len overflows u64",
+            )
+        })?;
+        let b_end = b_offset.checked_add(b_len).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "masked_eq_crds: b_offset + b_len overflows u64",
+            )
+        })?;
+        let mut file = self.lock.write().unwrap();
+        let locked = self.locked.load(Ordering::Acquire);
+        if !b_buf.is_empty() && b_offset < locked {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("masked_eq_crds: B range [{b_offset}, {b_end}) overlaps locked region [0, {locked})"),
+            ));
+        }
+        let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
+        if !a_expected.is_empty() && a_end > data_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("masked_eq_crds: A range [{a_offset}, {a_end}) exceeds payload size ({data_size})"),
+            ));
+        }
+        if !b_buf.is_empty() && b_end > data_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("masked_eq_crds: B range [{b_offset}, {b_end}) exceeds payload size ({data_size})"),
+            ));
+        }
+        let mut a_current = vec![0u8; a_expected.len()];
+        if !a_expected.is_empty() {
+            file.seek(SeekFrom::Start(HEADER_SIZE + a_offset))?;
+            file.read_exact(&mut a_current)?;
+        }
+        let masked_match = a_current
+            .iter()
+            .zip(mask.iter())
+            .zip(a_expected.iter())
+            .all(|((&a, &m), &e)| (a & m) == e);
+        if !masked_match {
+            return Ok(None);
+        }
+        if b_buf.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        file.seek(SeekFrom::Start(HEADER_SIZE + b_offset))?;
+        let mut old_b = vec![0u8; b_buf.len()];
+        file.read_exact(&mut old_b)?;
+        file.seek(SeekFrom::Start(HEADER_SIZE + b_offset))?;
+        file.write_all(b_buf)?;
+        durable_sync(&file)?;
+        Ok(Some(old_b))
+    }
+
+    /// Cross-Region Dependent Swap — masked-not-equal condition.
+    ///
+    /// Like [`masked_eq_crds`](Self::masked_eq_crds) but performs the
+    /// region-B swap only when **any** masked byte differs:
+    /// `(A[i] & mask[i]) != a_expected[i]` for at least one `i`.
+    /// Returns `Ok(None)` if all masked bytes compare equal (swap suppressed).
+    ///
+    /// # Feature flags
+    ///
+    /// Only available when both the `set` and `atomic` Cargo features are
+    /// enabled.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] if `mask.len() != a_expected.len()`.
+    /// Same additional conditions as [`eq_crds`](Self::eq_crds).
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    pub fn masked_ne_crds(
+        &self,
+        a_offset: u64,
+        mask: impl AsRef<[u8]>,
+        a_expected: impl AsRef<[u8]>,
+        b_offset: u64,
+        b_buf: &mut [u8],
+    ) -> io::Result<Option<Vec<u8>>> {
+        let mask = mask.as_ref();
+        let a_expected = a_expected.as_ref();
+        if mask.len() != a_expected.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "masked_ne_crds: mask length ({}) != a_expected length ({})",
+                    mask.len(),
+                    a_expected.len()
+                ),
+            ));
+        }
+        let a_len = a_expected.len() as u64;
+        let b_len = b_buf.len() as u64;
+        let a_end = a_offset.checked_add(a_len).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "masked_ne_crds: a_offset + a_len overflows u64",
+            )
+        })?;
+        let b_end = b_offset.checked_add(b_len).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "masked_ne_crds: b_offset + b_len overflows u64",
+            )
+        })?;
+        let mut file = self.lock.write().unwrap();
+        let locked = self.locked.load(Ordering::Acquire);
+        if !b_buf.is_empty() && b_offset < locked {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("masked_ne_crds: B range [{b_offset}, {b_end}) overlaps locked region [0, {locked})"),
+            ));
+        }
+        let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
+        if !a_expected.is_empty() && a_end > data_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("masked_ne_crds: A range [{a_offset}, {a_end}) exceeds payload size ({data_size})"),
+            ));
+        }
+        if !b_buf.is_empty() && b_end > data_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("masked_ne_crds: B range [{b_offset}, {b_end}) exceeds payload size ({data_size})"),
+            ));
+        }
+        let mut a_current = vec![0u8; a_expected.len()];
+        if !a_expected.is_empty() {
+            file.seek(SeekFrom::Start(HEADER_SIZE + a_offset))?;
+            file.read_exact(&mut a_current)?;
+        }
+        let masked_match = a_current
+            .iter()
+            .zip(mask.iter())
+            .zip(a_expected.iter())
+            .all(|((&a, &m), &e)| (a & m) == e);
+        if masked_match {
+            return Ok(None);
+        }
+        if b_buf.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        file.seek(SeekFrom::Start(HEADER_SIZE + b_offset))?;
+        let mut old_b = vec![0u8; b_buf.len()];
+        file.read_exact(&mut old_b)?;
+        file.seek(SeekFrom::Start(HEADER_SIZE + b_offset))?;
+        file.write_all(b_buf)?;
+        durable_sync(&file)?;
+        Ok(Some(old_b))
     }
 }
 
