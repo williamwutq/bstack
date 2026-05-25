@@ -400,17 +400,13 @@ impl BStackAllocator for SlabBStackAllocator {
             return Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) });
         }
 
-        // Grow non-tail: allocate a new region, copy data, release old.
-        // TODO: since block is too big, we definitely need a tail grow and there is no need to call
-        // alloc since we can just extend the tail directly.
-        let new_slice = self.alloc(new_len)?;
-        let new_start = new_slice.start();
-        if !slice.is_empty() {
-            let data = self.stack.get(slice.start(), slice.start() + slice.len())?;
-            self.stack.set(new_start, &data)?;
-        }
-        self.dealloc(slice)?;
-        // SAFETY: new_start from a fresh allocation covering new_len bytes
-        Ok(unsafe { BStackSlice::from_raw_parts(self, new_start, new_len) })
+        // Grow non-tail: copy data, allocate a new region, release old.
+        let mut data_buf = vec![0u8; new_backing as usize];
+        self.stack
+            .get_into(slice.start(), &mut data_buf[..slice.len() as usize])?;
+        let new_ptr = self.stack.push(data_buf)?;
+        self.push_free_blocks(slice.start(), old_n)?;
+        // SAFETY: new_len fits within the new_n blocks of the newly pushed region
+        Ok(unsafe { BStackSlice::from_raw_parts(self, new_ptr, new_len) })
     }
 }
