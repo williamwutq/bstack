@@ -2393,6 +2393,72 @@ impl BStack {
         durable_sync(&file)
     }
 
+    /// Copy `n` bytes from `from..from+n` to `to..to+n` under a single write lock.
+    ///
+    /// The source is read into a temporary buffer before writing, so overlapping
+    /// regions are handled correctly.  `n = 0` is a valid no-op (bounds are
+    /// still checked).  The file size is never changed.
+    ///
+    /// # Feature flags
+    ///
+    /// Only available when both the `set` and `atomic` Cargo features are
+    /// enabled.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] if either `from + n` or `to + n`
+    /// overflows `u64`, if either region exceeds the current payload size, or
+    /// if the destination region overlaps the locked prefix.
+    /// Propagates any I/O error from `read_exact`, `write_all`, or
+    /// `durable_sync`.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    pub fn copy(&self, from: u64, to: u64, n: u64) -> io::Result<()> {
+        let from_end = from.checked_add(n).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "copy: from + n overflows u64",
+            )
+        })?;
+        let to_end = to.checked_add(n).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "copy: to + n overflows u64",
+            )
+        })?;
+        let mut file = self.lock.write().unwrap();
+        let locked = self.locked.load(Ordering::Acquire);
+        if to < locked {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("copy: destination [{to}, {to_end}) overlaps locked region [0, {locked})"),
+            ));
+        }
+        let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
+        if from_end > data_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("copy: source [{from}, {from_end}) exceeds payload size ({data_size})"),
+            ));
+        }
+        if to_end > data_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "copy: destination [{to}, {to_end}) exceeds payload size ({data_size})"
+                ),
+            ));
+        }
+        if n == 0 {
+            return Ok(());
+        }
+        file.seek(SeekFrom::Start(HEADER_SIZE + from))?;
+        let mut buf = vec![0u8; n as usize];
+        file.read_exact(&mut buf)?;
+        file.seek(SeekFrom::Start(HEADER_SIZE + to))?;
+        file.write_all(&buf)?;
+        durable_sync(&file)
+    }
+
     /// Read bytes in the half-open logical range `[start, end)`, pass them to
     /// a callback that may mutate them in place, then write the modified bytes
     /// back.
