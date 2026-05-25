@@ -94,45 +94,64 @@ impl SlabBStackAllocator {
     /// Free-list sentinel meaning "no next block".
     const SENTINEL: u64 = 0;
 
-    /// Open or initialise a `SlabBStackAllocator` over `stack`.
+    /// Initialise a new `SlabBStackAllocator` over an empty `stack`.
     ///
-    /// * **Empty stack** — writes the 48-byte allocator header (24 reserved
-    ///   bytes, magic, `block_size`, and `free_head = 0`) using a single
-    ///   `BStack::push` and returns a ready allocator. `block_size` must be
-    ///   `>= 8`.
-    /// * **Non-empty stack** — validates the `ALSL 0.1.x` magic prefix and
-    ///   checks that the stored `block_size` matches the provided value.
+    /// Writes the 48-byte allocator header (24 reserved bytes, magic,
+    /// `block_size`, and `free_head = 0`) using a single `BStack::push`
+    /// and returns a ready allocator.
     ///
     /// # Errors
     ///
-    /// * [`io::ErrorKind::InvalidInput`] — `block_size < 8` on a new stack
-    ///   (returns an error rather than panicking so callers can recover or
-    ///   report the constraint programmatically).
+    /// * [`io::ErrorKind::InvalidInput`] — `block_size < 8`, or `stack` is not
+    ///   empty (use [`SlabBStackAllocator::open`] to reopen an existing file).
+    /// * Any [`io::Error`] propagated from the underlying [`BStack`] operations.
+    pub fn new(stack: BStack, block_size: u64) -> io::Result<Self> {
+        if !stack.is_empty()? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "stack is not empty; use SlabBStackAllocator::open to reopen an existing allocator",
+            ));
+        }
+        if block_size < Self::MIN_BLOCK_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "block_size ({block_size}) must be >= {}",
+                    Self::MIN_BLOCK_SIZE
+                ),
+            ));
+        }
+        let mut hdr = [0u8; Self::ARENA_START as usize];
+        let off = Self::OFFSET_SIZE as usize;
+        hdr[off..off + 8].copy_from_slice(&ALSL_MAGIC);
+        hdr[off + 8..off + 16].copy_from_slice(&block_size.to_le_bytes());
+        // free_head at off+16 remains 0 (SENTINEL)
+        stack.push(hdr)?;
+        Ok(Self {
+            stack,
+            block_size,
+            _not_sync: PhantomData,
+        })
+    }
+
+    /// Open an existing `SlabBStackAllocator` from a non-empty `stack`.
+    ///
+    /// Validates the `ALSL 0.1.x` magic prefix and checks that the stored
+    /// `block_size` matches the provided value.
+    ///
+    /// # Errors
+    ///
+    /// * [`io::ErrorKind::InvalidInput`] — `stack` is empty (use
+    ///   [`SlabBStackAllocator::new`] to create a new allocator).
     /// * [`io::ErrorKind::InvalidData`] — wrong magic, invalid stored
     ///   `block_size`, or mismatch between the stored and provided value.
     /// * Any [`io::Error`] propagated from the underlying [`BStack`] operations.
-    pub fn new(stack: BStack, block_size: u64) -> io::Result<Self> {
+    pub fn open(stack: BStack, block_size: u64) -> io::Result<Self> {
         if stack.is_empty()? {
-            if block_size < Self::MIN_BLOCK_SIZE {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "block_size ({block_size}) must be >= {}",
-                        Self::MIN_BLOCK_SIZE
-                    ),
-                ));
-            }
-            let mut hdr = [0u8; Self::ARENA_START as usize];
-            let off = Self::OFFSET_SIZE as usize;
-            hdr[off..off + 8].copy_from_slice(&ALSL_MAGIC);
-            hdr[off + 8..off + 16].copy_from_slice(&block_size.to_le_bytes());
-            // free_head at off+16 remains 0 (SENTINEL)
-            stack.push(hdr)?;
-            return Ok(Self {
-                stack,
-                block_size,
-                _not_sync: PhantomData,
-            });
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "stack is empty; use SlabBStackAllocator::new to create a new allocator",
+            ));
         }
 
         let stack_len = stack.len()?;
@@ -251,6 +270,218 @@ impl SlabBStackAllocator {
         } else {
             len.div_ceil(self.block_size)
         }
+    }
+}
+
+#[cfg(all(test, feature = "set"))]
+mod tests {
+    use super::SlabBStackAllocator;
+    use crate::BStack;
+    use crate::alloc::BStackAllocator;
+    use std::io::ErrorKind;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct Guard(std::path::PathBuf);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn temp_path() -> std::path::PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        std::env::temp_dir().join(format!("bstack_slab_{pid}_{id}.bin"))
+    }
+
+    fn empty_stack() -> (BStack, std::path::PathBuf) {
+        let path = temp_path();
+        (BStack::open(&path).unwrap(), path)
+    }
+
+    // ── new() ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn new_initialises_header_and_reports_block_size() {
+        let (stack, path) = empty_stack();
+        let _g = Guard(path);
+        let alloc = SlabBStackAllocator::new(stack, 16).unwrap();
+        assert_eq!(alloc.block_size(), 16);
+        // ARENA_START = OFFSET_SIZE(24) + HEADER_SIZE(24) = 48
+        assert_eq!(alloc.stack().len().unwrap(), 48);
+    }
+
+    #[test]
+    fn new_rejects_block_size_below_minimum() {
+        let (stack, path) = empty_stack();
+        let _g = Guard(path);
+        let err = SlabBStackAllocator::new(stack, 7).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn new_rejects_nonempty_stack() {
+        let (stack, path) = empty_stack();
+        let _g = Guard(path);
+        stack.push(b"data").unwrap();
+        let err = SlabBStackAllocator::new(stack, 8).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    // ── open() ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn open_rejects_empty_stack() {
+        let (stack, path) = empty_stack();
+        let _g = Guard(path);
+        let err = SlabBStackAllocator::open(stack, 8).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn open_rejects_stack_too_short() {
+        let (stack, path) = empty_stack();
+        let _g = Guard(path.clone());
+        stack.push([0u8; 24]).unwrap(); // only 24 bytes, need >= 48
+        drop(stack);
+        let err = SlabBStackAllocator::open(BStack::open(&path).unwrap(), 8).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn open_rejects_bad_magic() {
+        let (stack, path) = empty_stack();
+        let _g = Guard(path.clone());
+        stack.push([0u8; 48]).unwrap(); // 48 bytes of zeros — no ALSL magic
+        drop(stack);
+        let err = SlabBStackAllocator::open(BStack::open(&path).unwrap(), 8).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn open_rejects_invalid_stored_block_size() {
+        let (stack, path) = empty_stack();
+        let _g = Guard(path.clone());
+        // Craft a header with valid magic but block_size = 1 (< MIN_BLOCK_SIZE = 8).
+        let mut hdr = [0u8; 48];
+        hdr[24..32].copy_from_slice(b"ALSL\x00\x01\x00\x00");
+        hdr[32..40].copy_from_slice(&1u64.to_le_bytes());
+        stack.push(hdr).unwrap();
+        drop(stack);
+        let err = SlabBStackAllocator::open(BStack::open(&path).unwrap(), 1).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn open_rejects_block_size_mismatch() {
+        let (stack, path) = empty_stack();
+        let _g = Guard(path.clone());
+        SlabBStackAllocator::new(stack, 8).unwrap();
+        let err = SlabBStackAllocator::open(BStack::open(&path).unwrap(), 16).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn open_succeeds_and_restores_block_size() {
+        let (stack, path) = empty_stack();
+        let _g = Guard(path.clone());
+        SlabBStackAllocator::new(stack, 32).unwrap();
+        let alloc = SlabBStackAllocator::open(BStack::open(&path).unwrap(), 32).unwrap();
+        assert_eq!(alloc.block_size(), 32);
+    }
+
+    // ── allocation behaviour ──────────────────────────────────────────────────
+
+    #[test]
+    fn zero_alloc_returns_empty_slice() {
+        let (stack, path) = empty_stack();
+        let _g = Guard(path);
+        let alloc = SlabBStackAllocator::new(stack, 8).unwrap();
+        let s = alloc.alloc(0).unwrap();
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn dealloc_pushes_to_free_list_and_next_alloc_reuses_block() {
+        let (stack, path) = empty_stack();
+        let _g = Guard(path);
+        let alloc = SlabBStackAllocator::new(stack, 8).unwrap();
+
+        let s1 = alloc.alloc(8).unwrap();
+        let offset1 = s1.start();
+        alloc.dealloc(s1).unwrap();
+
+        let s2 = alloc.alloc(8).unwrap();
+        assert_eq!(s2.start(), offset1);
+    }
+
+    #[test]
+    fn free_list_recycles_all_dealloc_d_blocks() {
+        let (stack, path) = empty_stack();
+        let _g = Guard(path);
+        let alloc = SlabBStackAllocator::new(stack, 8).unwrap();
+
+        let a = alloc.alloc(8).unwrap();
+        let b = alloc.alloc(8).unwrap();
+        let c = alloc.alloc(8).unwrap();
+        let mut original = [a.start(), b.start(), c.start()];
+        alloc.dealloc(a).unwrap();
+        alloc.dealloc(b).unwrap();
+        alloc.dealloc(c).unwrap();
+
+        let r1 = alloc.alloc(8).unwrap();
+        let r2 = alloc.alloc(8).unwrap();
+        let r3 = alloc.alloc(8).unwrap();
+        let mut reused = [r1.start(), r2.start(), r3.start()];
+
+        original.sort();
+        reused.sort();
+        assert_eq!(reused, original);
+    }
+
+    #[test]
+    fn oversized_tail_dealloc_shrinks_stack() {
+        let (stack, path) = empty_stack();
+        let _g = Guard(path);
+        let alloc = SlabBStackAllocator::new(stack, 8).unwrap();
+
+        // 17 bytes needs 3 blocks (3 × 8 = 24 bytes backing).
+        let s = alloc.alloc(17).unwrap();
+        let tail_before = alloc.stack().len().unwrap();
+        assert_eq!(
+            s.start() + 24,
+            tail_before,
+            "allocation must be at the tail"
+        );
+
+        alloc.dealloc(s).unwrap();
+        assert_eq!(alloc.stack().len().unwrap(), tail_before - 24);
+    }
+
+    #[test]
+    fn write_and_read_round_trip() {
+        let (stack, path) = empty_stack();
+        let _g = Guard(path);
+        let alloc = SlabBStackAllocator::new(stack, 16).unwrap();
+        let s = alloc.alloc(12).unwrap();
+        s.write(b"hello world!").unwrap();
+        assert_eq!(s.read().unwrap(), b"hello world!");
+    }
+
+    #[test]
+    fn data_survives_reopen() {
+        let (stack, path) = empty_stack();
+        let _g = Guard(path.clone());
+        let alloc = SlabBStackAllocator::new(stack, 16).unwrap();
+        let s = alloc.alloc(5).unwrap();
+        let offset = s.start();
+        s.write(b"hello").unwrap();
+        drop(alloc);
+
+        let alloc2 = SlabBStackAllocator::open(BStack::open(&path).unwrap(), 16).unwrap();
+        let s2 = unsafe { crate::alloc::BStackSlice::from_raw_parts(&alloc2, offset, 5) };
+        assert_eq!(s2.read().unwrap(), b"hello");
     }
 }
 

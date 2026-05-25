@@ -355,9 +355,27 @@ mod alloc_fuzz_tests {
 
     fuzz_suite!(first_fit, FirstFitBStackAllocator::new);
     fuzz_suite!(ghost_tree, GhostTreeBstackAllocator::new);
-    fuzz_suite!(slab_8, |bs| SlabBStackAllocator::new(bs, 8));
-    fuzz_suite!(slab_16, |bs| SlabBStackAllocator::new(bs, 16));
-    fuzz_suite!(slab_64, |bs| SlabBStackAllocator::new(bs, 64));
+    fuzz_suite!(slab_8, |bs: BStack| {
+        if bs.is_empty().unwrap() {
+            SlabBStackAllocator::new(bs, 8)
+        } else {
+            SlabBStackAllocator::open(bs, 8)
+        }
+    });
+    fuzz_suite!(slab_16, |bs: BStack| {
+        if bs.is_empty().unwrap() {
+            SlabBStackAllocator::new(bs, 16)
+        } else {
+            SlabBStackAllocator::open(bs, 16)
+        }
+    });
+    fuzz_suite!(slab_64, |bs: BStack| {
+        if bs.is_empty().unwrap() {
+            SlabBStackAllocator::new(bs, 64)
+        } else {
+            SlabBStackAllocator::open(bs, 64)
+        }
+    });
 
     // double_free_error is FirstFit-only: GhostTree carries no per-block is_free
     // flag, so reliable double-free detection would require false-positives on
