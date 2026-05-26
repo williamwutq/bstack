@@ -36,7 +36,7 @@
 //! ```
 //!
 //! * **`magic`** — 8 bytes: `BSTK` + major(1 B) + minor(1 B) + patch(1 B) + reserved(1 B).
-//!   This version writes `BSTK\x00\x01\x0b\x00` (0.1.11).  [`open`](BStack::open)
+//!   This version writes `BSTK\x00\x01\x0c\x00` (0.1.12).  [`open`](BStack::open)
 //!   accepts any file whose first 6 bytes match `BSTK\x00\x01` (any 0.1.x) and
 //!   rejects anything with a different major or minor.
 //! * **`clen`** — little-endian `u64` recording the *committed* payload length.
@@ -370,6 +370,14 @@
 //!   Provides O(log n) allocation and deallocation with crash recovery through
 //!   tree rebalancing on mount.  `Send` but not `Sync`.
 //!
+//! * [`SlabBStackAllocator`] — **Experimental.** Fixed-block slab allocator.  All blocks are
+//!   exactly `block_size` bytes with no per-block header or footer; freed
+//!   blocks are tracked via an intrusive singly-linked free list stored in
+//!   the first 8 bytes of each free block.  O(1) alloc and dealloc.
+//!   Use [`SlabBStackAllocator::new`] to initialise an empty stack and
+//!   [`SlabBStackAllocator::open`] to reopen an existing one.
+//!   Requires both `alloc` and `set` features.
+//!
 //! * [`DebugCheckingAllocator`] — Debug/test wrapper around any
 //!   [`BStackAllocator`].  Tracks allocated and freed regions in memory and
 //!   panics on overlapping allocations, double-frees, or partial frees.
@@ -450,7 +458,7 @@ pub use alloc::{
 #[cfg(all(feature = "alloc", feature = "set"))]
 pub use alloc::{
     BStackByteVec, BStackByteVecIter, BStackSliceWriter, FirstFitBStackAllocator,
-    GhostTreeBstackAllocator,
+    GhostTreeBstackAllocator, SlabBStackAllocator,
 };
 
 #[cfg(all(feature = "guarded", feature = "atomic"))]
@@ -486,8 +494,8 @@ use windows_sys::Win32::Storage::FileSystem::{
 #[cfg(windows)]
 use windows_sys::Win32::System::IO::OVERLAPPED;
 
-/// Full magic for files written by this version (`BSTK` + major 0 + minor 1 + patch 11 + 0).
-const MAGIC: [u8; 8] = *b"BSTK\x00\x01\x0b\x00";
+/// Full magic for files written by this version (`BSTK` + major 0 + minor 1 + patch 12 + 0).
+const MAGIC: [u8; 8] = *b"BSTK\x00\x01\x0c\x00";
 
 /// Compatibility prefix checked on open: `BSTK` + major 0 + minor 1.
 /// Any file whose first 6 bytes match is considered a compatible 0.1.x file.

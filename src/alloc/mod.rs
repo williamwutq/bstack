@@ -440,6 +440,53 @@ where
 {
 }
 
+// Macros
+#[allow(unused)]
+macro_rules! read_buf {
+    ($buf:expr, $off:expr => $ty:ty) => {{
+        let start = $off as usize;
+        let end = start + core::mem::size_of::<$ty>();
+        $buf[start..end].try_into().unwrap()
+    }};
+    ($buf:expr, $off:expr => $num:literal) => {{
+        let start = $off as usize;
+        let end = start + $num;
+        $buf[start..end].try_into().unwrap()
+    }};
+}
+
+#[allow(unused)]
+macro_rules! write_buf {
+    ($val:expr => $buf:expr, $off:expr) => {{
+        let bytes = $val.to_le_bytes();
+        let start = $off as usize;
+        let end = start + bytes.len();
+        $buf[start..end].copy_from_slice(&bytes);
+    }};
+}
+
+// Read a little-endian value of type `$ty` from `$buf` at offset `$off`.
+#[allow(unused)]
+macro_rules! read_buf_le {
+    ($buf:expr, $off:expr => $ty:ty) => {
+        <$ty>::from_le_bytes(read_buf!($buf, $off => $ty))
+    };
+}
+
+#[allow(unused)]
+macro_rules! read_bstack {
+    ($stack:expr, $off:expr => $ty:ty) => {{
+        let mut buf = [0u8; core::mem::size_of::<$ty>()];
+        $stack.get_into($off, &mut buf)?;
+        buf
+    }};
+    ($stack:expr, $off:expr => $num:literal) => {{
+        let mut buf = [0u8; $num];
+        $stack.get_into($off, &mut buf)?;
+        buf
+    }};
+}
+
 pub mod debug_checking;
 #[cfg(feature = "set")]
 pub mod first_fit;
@@ -449,6 +496,8 @@ pub mod ghost_tree;
 pub mod guarded;
 pub mod linear;
 pub mod manual;
+#[cfg(feature = "set")]
+pub mod slab;
 #[cfg(feature = "set")]
 pub mod vec;
 
@@ -463,5 +512,7 @@ pub use guarded::{BStackAtomicGuardedSlice, BStackAtomicGuardedSliceSubview};
 pub use guarded::{BStackGuardedSlice, BStackGuardedSliceSubview};
 pub use linear::LinearBStackAllocator;
 pub use manual::ManualAllocator;
+#[cfg(feature = "set")]
+pub use slab::SlabBStackAllocator;
 #[cfg(feature = "set")]
 pub use vec::{BStackByteVec, BStackByteVecIter};

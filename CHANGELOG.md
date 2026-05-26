@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.2] - 2026-05-26
 
 ### Added
 
@@ -18,6 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **Iterator**: `BStackByteVecIter<'b, 'a, A>` borrows the vec immutably for its lifetime (preventing concurrent mutation), snapshots `len` at construction, and yields `io::Result<u8>` per byte read from disk on demand.
 
 - **`BStackSlice::empty(allocator)` / `bstack_slice_empty`** (`alloc` feature): Constructs a zero-length slice anchored at offset 0.
+
+- **`SlabBStackAllocator`** (`alloc` + `set` features) *(Experimental)*: New fixed-block slab allocator. All blocks in the arena are exactly `block_size` bytes (≥ 8) with no per-block header or footer. Freed blocks form an intrusive singly-linked free list; live bytes carry zero metadata overhead. Allocation is O(1) — either a free-list pop or a single tail extension. Deallocation of an oversized tail block shrinks the stack; all other blocks are returned to the free list in O(n_blocks). Reallocation within the same block count is O(1) with no I/O; tail resize is O(1); non-tail shrink recycles excess blocks; non-tail grow allocates and copies. Crash consistency: each free-list update is two `BStack` calls (write next-pointer, then update `free_head`); a crash between them leaks the affected block but leaves the rest of the list intact. `block_size < 8` returns `InvalidInput`.
+
+- **`Debug` impl for `GhostTreeBstackAllocator` and `FirstFitBStackAllocator`** (`alloc` / `alloc` + `set` features): Both allocator types now implement `fmt::Debug`.
 
 ### Changed
 

@@ -9,7 +9,7 @@
 *.dll
 *.a
 test_*
-!c/test_bstack_bytevec.c
+!c/test_*.c
 
 # MacOS
 .DS_Store

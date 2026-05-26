@@ -46,6 +46,10 @@ TEST_FF_OBJ = test_first_fit.o
 TEST_GT_BIN = test_ghost_tree$(EXE_EXT)
 TEST_GT_OBJ = test_ghost_tree.o
 
+# Slab allocator test (requires BSTACK_FEATURE_SET).
+TEST_SL_BIN = test_slab$(EXE_EXT)
+TEST_SL_OBJ = test_slab.o
+
 # ByteVec — requires BSTACK_FEATURE_SET.
 OBJ_BYTEVEC     = bstack_bytevec.o
 LIB_BYTEVEC_SET = libbstack-bytevec-set.a
@@ -57,7 +61,7 @@ EXAMPLE_BINS  = $(addprefix ../examples/,$(addsuffix $(EXE_EXT),$(EXAMPLE_NAMES)
 HASHMAP_BIN   = ../examples/hashmap$(EXE_EXT)
 ATOMIC_BIN    = ../examples/atomic_ops$(EXE_EXT)
 
-.PHONY: all test test-set test-atomic test-set-atomic test-first-fit test-ghost-tree test-bytevec leaks clean alloc \
+.PHONY: all test test-set test-atomic test-set-atomic test-first-fit test-ghost-tree test-slab test-bytevec leaks clean alloc \
         example example-basic example-buffer_reuse example-journal \
         example-reading example-vec_store example-hashmap example-atomic_ops
 
@@ -128,6 +132,15 @@ $(TEST_GT_BIN): $(TEST_GT_OBJ) $(LIB_ALLOC_SET)
 
 test-ghost-tree: $(TEST_GT_BIN)
 	$(RUN)$(TEST_GT_BIN)
+
+$(TEST_SL_OBJ): test_slab.c bstack_alloc.h bstack.h
+	$(CC) $(CFLAGS) -DBSTACK_FEATURE_SET -c -o $@ $<
+
+$(TEST_SL_BIN): $(TEST_SL_OBJ) $(LIB_ALLOC_SET)
+	$(CC) $(CFLAGS) -DBSTACK_FEATURE_SET -o $@ $< -L. -lbstack-alloc-set -lpthread
+
+test-slab: $(TEST_SL_BIN)
+	$(RUN)$(TEST_SL_BIN)
 
 $(OBJ_BYTEVEC): bstack_bytevec.c bstack_bytevec.h bstack_alloc.h bstack.h
 	$(CC) $(CFLAGS) -DBSTACK_FEATURE_SET -c -o $@ $<
@@ -236,5 +249,6 @@ clean:
 	      $(OBJ_ALLOC) $(OBJ_ALLOC_SET) $(LIB_ALLOC) $(LIB_ALLOC_SET) \
 	      $(TEST_FF_OBJ) $(TEST_FF_BIN) \
 	      $(TEST_GT_OBJ) $(TEST_GT_BIN) \
+	      $(TEST_SL_OBJ) $(TEST_SL_BIN) \
 	      $(OBJ_BYTEVEC) $(LIB_BYTEVEC_SET) $(TEST_BV_OBJ) $(TEST_BV_BIN) \
 	      $(EXAMPLE_BINS) $(HASHMAP_BIN) $(ATOMIC_BIN)

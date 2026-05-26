@@ -523,6 +523,26 @@ A cursor-based reader over a `BStackSlice`.  Implements `io::Read` and
 `io::Seek` within the slice's coordinate space (position 0 = `slice.start()`).
 Constructed via `BStackSlice::reader()` or `BStackSlice::reader_at(offset)`.
 
+### Lifetime model
+
+`BStackSlice<'a, A>` borrows the **allocator** for `'a`, not the `BStack`
+directly.  This lets the borrow checker statically prevent calling
+`into_stack()` — which consumes the allocator — while any slice is still alive.
+
+### Example
+
+```rust
+use bstack::{BStack, BStackAllocator, LinearBStackAllocator};
+
+let alloc = LinearBStackAllocator::new(BStack::open("data.bstack")?);
+
+let slice = alloc.alloc(128)?;     // reserve 128 zero bytes
+let data  = slice.read()?;         // read them back
+alloc.dealloc(slice)?;             // release (tail → O(1) discard)
+
+let stack = alloc.into_stack();    // reclaim the BStack
+```
+
 ### `LinearBStackAllocator`
 
 The reference bump allocator.  Regions are appended sequentially to the tail.
@@ -696,28 +716,6 @@ println!("{}", String::from_utf8_lossy(&all));
 alloc.dealloc(v.into_raw_block())?;
 ```
 
----
-
-### Lifetime model
-
-`BStackSlice<'a, A>` borrows the **allocator** for `'a`, not the `BStack`
-directly.  This lets the borrow checker statically prevent calling
-`into_stack()` — which consumes the allocator — while any slice is still alive.
-
-### Example
-
-```rust
-use bstack::{BStack, BStackAllocator, LinearBStackAllocator};
-
-let alloc = LinearBStackAllocator::new(BStack::open("data.bstack")?);
-
-let slice = alloc.alloc(128)?;     // reserve 128 zero bytes
-let data  = slice.read()?;         // read them back
-alloc.dealloc(slice)?;             // release (tail → O(1) discard)
-
-let stack = alloc.into_stack();    // reclaim the BStack
-```
-
 ### `GhostTreeBstackAllocator` (`alloc` feature)
 
 A pure-AVL general-purpose allocator built on top of a [`BStack`]. Free blocks
@@ -806,6 +804,87 @@ alloc.dealloc_bulk(&slices)?;
 let stack = alloc.into_stack();
 ```
 
+### `SlabBStackAllocator` (`alloc + set` features) *(Experimental)*
+
+A fixed-block slab allocator.  All blocks in the arena are exactly `block_size`
+bytes (must be ≥ 8) with **no** per-block header or footer.  Freed blocks form
+an intrusive singly-linked free list stored in the first 8 bytes of each free
+block; live allocations carry zero metadata overhead.
+
+```toml
+[dependencies]
+bstack = { version = "0.2", features = ["alloc", "set"] }
+```
+
+#### On-disk layout
+
+```
+[ reserved(24) | magic[8] | block_size[8] | free_head[8] | arena ... ]
+  ^               ^
+  offset 0        offset 24 (allocator header start)
+  user data       offset 48 (arena start)
+```
+
+* **`magic`** — `"ALSL\x00\x01\x00\x00"` (version 0.1).
+* **`block_size`** — fixed size of every arena block, little-endian `u64`.
+* **`free_head`** — payload offset of the first free block's first byte, or `0` (sentinel).
+* **Free block** — first 8 bytes hold the payload offset of the next free block (`u64` LE, `0` = end of list); remaining bytes belong to the caller when live.
+
+#### Allocation policy
+
+| Request | Strategy |
+|---------|----------|
+| `len == 0` | Null handle (offset 0, len 0) |
+| `len ≤ block_size` | Pop from free list; extend tail by `block_size` if empty |
+| `len > block_size` | Extend tail by `⌈len / block_size⌉ × block_size` |
+
+The returned slice covers exactly `len` bytes; backing blocks have no visible overhead.
+
+#### Deallocation policy
+
+| Case | Strategy |
+|------|----------|
+| Oversized block at tail | `BStack::discard` (single call; crash-safe) |
+| All other blocks | Segment into `block_size` chunks; prepend each to free list |
+
+Slab blocks at the tail are added to the free list (not discarded) so they can be reused without searching.
+
+#### Crash consistency
+
+Each free-list mutation is two `BStack` calls: write the next-pointer into the block, then update `free_head` in the header.  A crash between the two calls leaks the block being added or removed but leaves the rest of the free list intact.  No recovery scan is required on reopen.
+
+#### Constructors
+
+| Constructor                                    | Stack         | Effect                                                                                                          |
+|------------------------------------------------|---------------|-----------------------------------------------------------------------------------------------------------------|
+| `SlabBStackAllocator::new(stack, block_size)`  | **empty**     | Writes the 48-byte allocator header; fails with `InvalidInput` if the stack already has data.                   |
+| `SlabBStackAllocator::open(stack, block_size)` | **non-empty** | Reads and validates the stored header; fails with `InvalidInput` if the stack is empty or information mismatch. |
+
+#### Example
+
+```rust
+use bstack::{BStack, BStackAllocator, SlabBStackAllocator};
+
+// First run: initialise a fresh empty stack.
+let stack = BStack::open("data.bstack")?;
+let alloc = SlabBStackAllocator::new(stack, 64)?;
+
+let a = alloc.alloc(48)?;
+let b = alloc.alloc(48)?;
+a.write(b"hello")?;
+
+alloc.dealloc(a)?;        // returned to free list
+
+let c = alloc.alloc(32)?; // reuses a's slot
+assert_eq!(c.start(), a.start());
+
+let _ = alloc.into_stack();
+
+// Subsequent runs: reopen the existing stack.
+let stack = BStack::open("data.bstack")?;
+let alloc = SlabBStackAllocator::open(stack, 64)?;
+```
+
 ### `DebugCheckingAllocator` (`alloc` feature)
 
 A debug/test wrapper around any `BStackAllocator`.  It tracks allocated and freed
@@ -836,7 +915,7 @@ file offset 0        offset 16       16+n0          EOF
 ```
 
 * **`magic`** — 8 bytes: `BSTK` + major(1 B) + minor(1 B) + patch(1 B) + reserved(1 B).
-  This version writes `BSTK\x00\x01\x0b\x00` (0.1.11).  `open` accepts any
+  This version writes `BSTK\x00\x01\x0c\x00` (0.1.12).  `open` accepts any
   0.1.x file (first 6 bytes `BSTK\x00\x01`) and rejects a different major or
   minor as incompatible.
 * **`clen`** — little-endian `u64` recording the last successfully committed

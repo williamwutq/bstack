@@ -578,7 +578,7 @@ bstack_t *linear_bstack_allocator_into_stack(linear_bstack_allocator_t *alloc);
  * On-disk layout (all within the bstack payload):
  *   [0..16)  — reserved (OFFSET_SIZE)
  *   [16..48) — allocator header: magic[8] | flags[4] | reserved[4] | free_head[8]
- *              magic  = "ALFF\x00\x01\x01\x00"
+ *              magic  = "ALFF\x00\x01\x02\x00"
  *              flags  = bit 0: recovery_needed (crash detected)
  *              free_head = payload offset of first free block's payload, or 0
  *   [48..)   — block arena
@@ -632,7 +632,7 @@ bstack_t *first_fit_bstack_allocator_into_stack(first_fit_bstack_allocator_t *al
  *
  * On-disk layout (all within the bstack payload):
  *   [0..32)  — reserved (user area)
- *   [32..40) — magic: "ALGT\x00\x01\x00\x00"
+ *   [32..40) — magic: "ALGT\x00\x01\x01\x00"
  *   [40..48) — AVL root pointer (8 B LE) — absolute payload offset of root
  *   [48..)   — block arena (32-byte aligned)
  *
@@ -669,6 +669,88 @@ void ghost_tree_bstack_allocator_free(ghost_tree_bstack_allocator_t *alloc);
  * The returned bstack_t * must eventually be passed to bstack_close.
  */
 bstack_t *ghost_tree_bstack_allocator_into_stack(ghost_tree_bstack_allocator_t *alloc);
+
+/* =========================================================================
+ * slab_bstack_allocator_t — fixed-block slab allocator
+ *
+ * All blocks in the arena are exactly block_size bytes with no per-block
+ * header or footer.  When a block is free its first 8 bytes hold the payload
+ * offset of the next free block (little-endian uint64_t, sentinel 0); when
+ * live those bytes belong entirely to the caller.
+ *
+ * On-disk layout (all within the bstack payload):
+ *   [0..24)  — reserved (OFFSET_SIZE; available for caller use)
+ *   [24..32) — magic: "ALSL\x00\x01\x00\x00"
+ *   [32..40) — block_size (8 B LE)
+ *   [40..48) — free_head  (8 B LE) — payload offset of first free block, or 0
+ *   [48..)   — block arena
+ *
+ * Allocation:
+ *   len == 0         → null handle (offset = 0, len = 0)
+ *   len <= block_size → pop from free list, or extend tail by block_size
+ *   len > block_size  → extend tail by len.div_ceil(block_size) * block_size
+ *
+ * Deallocation:
+ *   oversized block at tail → bstack_discard (single call; crash-safe)
+ *   all other cases         → each block_size chunk prepended to free list
+ *
+ * Reallocation growing: newly-exposed bytes are always zero-initialised.
+ *
+ * Crash consistency: each free-list update is two bstack calls (write
+ * next-pointer then update free_head).  A crash between the two leaks the
+ * block being added or removed but leaves the rest of the list intact.
+ *
+ * Requires -DBSTACK_FEATURE_SET.
+ * ====================================================================== */
+
+typedef struct {
+    bstack_allocator_t base; /* must be first — safe cast to bstack_allocator_t * */
+    bstack_t          *bs;
+    uint64_t           block_size;
+} slab_bstack_allocator_t;
+
+/*
+ * Initialise a new slab_bstack_allocator_t over an empty bs.
+ *
+ * Writes the 48-byte allocator header (24 reserved bytes, magic, block_size,
+ * and free_head = 0) and returns a ready allocator. block_size must be >= 8.
+ *
+ * Returns NULL on failure (errno = EINVAL if bs is non-empty or block_size < 8,
+ * ENOMEM on allocation failure, or the errno from any failing bstack operation).
+ * Cast the result to bstack_allocator_t * to use the generic interface.
+ */
+slab_bstack_allocator_t *slab_bstack_allocator_new(bstack_t *bs,
+                                                    uint64_t block_size);
+
+/*
+ * Open an existing slab_bstack_allocator_t from a non-empty bs.
+ *
+ * Validates the ALSL 0.1.x magic prefix and reads block_size from the stored
+ * header.
+ *
+ * Returns NULL on failure (errno = EINVAL if bs is empty, the stack is too
+ * short, magic is wrong, or the stored block_size is invalid; ENOMEM on
+ * allocation failure; or the errno from any failing bstack operation).
+ * Cast the result to bstack_allocator_t * to use the generic interface.
+ */
+slab_bstack_allocator_t *slab_bstack_allocator_open(bstack_t *bs);
+
+/*
+ * Free the allocator wrapper without closing the underlying bstack.
+ */
+void slab_bstack_allocator_free(slab_bstack_allocator_t *alloc);
+
+/*
+ * Consume the allocator: free the wrapper and return the underlying bstack.
+ * The returned bstack_t * must eventually be passed to bstack_close.
+ */
+bstack_t *slab_bstack_allocator_into_stack(slab_bstack_allocator_t *alloc);
+
+/*
+ * Return the block_size this allocator was created with.
+ */
+uint64_t slab_bstack_allocator_block_size(const slab_bstack_allocator_t *alloc);
+
 #endif /* BSTACK_FEATURE_SET */
 
 #ifdef __cplusplus
