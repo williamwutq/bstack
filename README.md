@@ -523,6 +523,26 @@ A cursor-based reader over a `BStackSlice`.  Implements `io::Read` and
 `io::Seek` within the slice's coordinate space (position 0 = `slice.start()`).
 Constructed via `BStackSlice::reader()` or `BStackSlice::reader_at(offset)`.
 
+### Lifetime model
+
+`BStackSlice<'a, A>` borrows the **allocator** for `'a`, not the `BStack`
+directly.  This lets the borrow checker statically prevent calling
+`into_stack()` — which consumes the allocator — while any slice is still alive.
+
+### Example
+
+```rust
+use bstack::{BStack, BStackAllocator, LinearBStackAllocator};
+
+let alloc = LinearBStackAllocator::new(BStack::open("data.bstack")?);
+
+let slice = alloc.alloc(128)?;     // reserve 128 zero bytes
+let data  = slice.read()?;         // read them back
+alloc.dealloc(slice)?;             // release (tail → O(1) discard)
+
+let stack = alloc.into_stack();    // reclaim the BStack
+```
+
 ### `LinearBStackAllocator`
 
 The reference bump allocator.  Regions are appended sequentially to the tail.
@@ -694,28 +714,6 @@ let all = v.read_bytes()?;
 println!("{}", String::from_utf8_lossy(&all));
 
 alloc.dealloc(v.into_raw_block())?;
-```
-
----
-
-### Lifetime model
-
-`BStackSlice<'a, A>` borrows the **allocator** for `'a`, not the `BStack`
-directly.  This lets the borrow checker statically prevent calling
-`into_stack()` — which consumes the allocator — while any slice is still alive.
-
-### Example
-
-```rust
-use bstack::{BStack, BStackAllocator, LinearBStackAllocator};
-
-let alloc = LinearBStackAllocator::new(BStack::open("data.bstack")?);
-
-let slice = alloc.alloc(128)?;     // reserve 128 zero bytes
-let data  = slice.read()?;         // read them back
-alloc.dealloc(slice)?;             // release (tail → O(1) discard)
-
-let stack = alloc.into_stack();    // reclaim the BStack
 ```
 
 ### `GhostTreeBstackAllocator` (`alloc` feature)
