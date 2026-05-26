@@ -710,20 +710,31 @@ typedef struct {
 } slab_bstack_allocator_t;
 
 /*
- * Open or initialise a slab_bstack_allocator_t over bs.
+ * Initialise a new slab_bstack_allocator_t over an empty bs.
  *
- * - Empty stack: writes the 48-byte allocator header and returns ready.
- *   block_size must be >= 8.
- * - Non-empty stack: validates the ALSL 0.1.x magic prefix and checks that
- *   the stored block_size matches the provided value.
+ * Writes the 48-byte allocator header (24 reserved bytes, magic, block_size,
+ * and free_head = 0) and returns a ready allocator. block_size must be >= 8.
  *
- * Returns NULL on failure (errno = EINVAL for bad magic/mismatch/small
- * block_size, ENOMEM on allocation failure, or the errno from any failing
- * bstack operation).
+ * Returns NULL on failure (errno = EINVAL if bs is non-empty or block_size < 8,
+ * ENOMEM on allocation failure, or the errno from any failing bstack operation).
  * Cast the result to bstack_allocator_t * to use the generic interface.
  */
 slab_bstack_allocator_t *slab_bstack_allocator_new(bstack_t *bs,
                                                     uint64_t block_size);
+
+/*
+ * Open an existing slab_bstack_allocator_t from a non-empty bs.
+ *
+ * Validates the ALSL 0.1.x magic prefix and checks that the stored block_size
+ * matches the provided value.
+ *
+ * Returns NULL on failure (errno = EINVAL if bs is empty, the stack is too
+ * short, magic is wrong, or block_size mismatches; ENOMEM on allocation
+ * failure; or the errno from any failing bstack operation).
+ * Cast the result to bstack_allocator_t * to use the generic interface.
+ */
+slab_bstack_allocator_t *slab_bstack_allocator_open(bstack_t *bs,
+                                                     uint64_t block_size);
 
 /*
  * Free the allocator wrapper without closing the underlying bstack.

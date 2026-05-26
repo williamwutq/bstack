@@ -2774,8 +2774,11 @@ static int slab_write_free_head(bstack_t *bs, uint64_t val)
 /*
  * Pop the head block from the free list.
  * Sets *out_block to the block's payload offset, or SLAB_SENTINEL if empty.
+ * Zeros the block after popping (best-effort; list is consistent even if
+ * zeroing fails — ignored so the popped block can still be returned).
  */
-static int slab_pop_free_block(bstack_t *bs, uint64_t *out_block)
+static int slab_pop_free_block(bstack_t *bs, uint64_t block_size,
+                                uint64_t *out_block)
 {
     uint8_t buf[8];
     uint64_t head, next;
@@ -2788,6 +2791,13 @@ static int slab_pop_free_block(bstack_t *bs, uint64_t *out_block)
     if (bstack_get(bs, head, head + 8, buf) != 0) return -1;
     next = read_le64(buf);
     if (slab_write_free_head(bs, next) != 0) return -1;
+
+    /* Zero the block (best-effort; list remains consistent if this fails). */
+#if UINT64_MAX > SIZE_MAX
+    if (block_size <= (uint64_t)SIZE_MAX)
+#endif
+        (void)bstack_zero(bs, head, (size_t)block_size);
+
     *out_block = head;
     return 0;
 }
@@ -2809,6 +2819,47 @@ static int slab_push_free_block(bstack_t *bs, uint64_t block_start)
     return slab_write_free_head(bs, block_start);
 }
 
+/*
+ * Prepend `count` contiguous blocks starting at `first_block` to the free list.
+ * Uses exactly 3 IO calls regardless of count: one read of free_head, one bulk
+ * write of all next-pointers into the freed region, and one write of free_head.
+ * Crash behaviour matches slab_push_free_block: a crash after the bulk write
+ * but before free_head update leaks the entire batch rather than corrupting
+ * the list.
+ */
+static int slab_push_free_blocks(bstack_t *bs, uint64_t first_block,
+                                  uint64_t count, uint64_t block_size)
+{
+    uint64_t old_head, i, buf_size;
+    uint8_t *buf;
+
+    if (count == 0) return 0;
+    if (count == 1) return slab_push_free_block(bs, first_block);
+
+    if (slab_read_free_head(bs, &old_head) != 0) return -1;
+
+    if (count > UINT64_MAX / block_size) { errno = EINVAL; return -1; }
+    buf_size = count * block_size;
+#if UINT64_MAX > SIZE_MAX
+    if (buf_size > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
+#endif
+    buf = calloc(1, (size_t)buf_size);
+    if (!buf) return -1;
+
+    for (i = 0; i < count - 1; i++) {
+        uint64_t next = first_block + (i + 1) * block_size;
+        write_le64(buf + (size_t)(i * block_size), next);
+    }
+    write_le64(buf + (size_t)((count - 1) * block_size), old_head);
+
+    if (bstack_set(bs, first_block, buf, (size_t)buf_size) != 0) {
+        free(buf); return -1;
+    }
+    free(buf);
+
+    return slab_write_free_head(bs, first_block);
+}
+
 /* ---- vtable ------------------------------------------------------------ */
 
 static bstack_t *slab_vtbl_stack(bstack_allocator_t *base)
@@ -2828,7 +2879,7 @@ static int slab_vtbl_alloc(bstack_allocator_t *base, uint64_t len,
     }
 
     if (len <= a->block_size) {
-        if (slab_pop_free_block(a->bs, &block) != 0) return -1;
+        if (slab_pop_free_block(a->bs, a->block_size, &block) != 0) return -1;
         if (block != SLAB_SENTINEL) {
             out->allocator = base; out->offset = block; out->len = len;
             return 0;
@@ -2856,7 +2907,7 @@ static int slab_vtbl_alloc(bstack_allocator_t *base, uint64_t len,
 static int slab_vtbl_dealloc(bstack_allocator_t *base, bstack_slice_t s)
 {
     slab_bstack_allocator_t *a = (slab_bstack_allocator_t *)base;
-    uint64_t n_blocks, backing_size, tail, i;
+    uint64_t n_blocks, backing_size, tail;
 
     if (s.len == 0 && s.offset == SLAB_SENTINEL) return 0;
 
@@ -2872,18 +2923,14 @@ static int slab_vtbl_dealloc(bstack_allocator_t *base, bstack_slice_t s)
         return bstack_discard(a->bs, (size_t)backing_size);
     }
 
-    for (i = 0; i < n_blocks; i++) {
-        if (slab_push_free_block(a->bs, s.offset + i * a->block_size) != 0)
-            return -1;
-    }
-    return 0;
+    return slab_push_free_blocks(a->bs, s.offset, n_blocks, a->block_size);
 }
 
 static int slab_vtbl_realloc(bstack_allocator_t *base, bstack_slice_t s,
                               uint64_t new_len, bstack_slice_t *out)
 {
     slab_bstack_allocator_t *a = (slab_bstack_allocator_t *)base;
-    uint64_t old_n, new_n, old_backing, new_backing, tail, i;
+    uint64_t old_n, new_n, old_backing, new_backing, tail;
     int is_tail;
 
     if (s.len == 0 && s.offset == SLAB_SENTINEL)
@@ -2946,44 +2993,42 @@ static int slab_vtbl_realloc(bstack_allocator_t *base, bstack_slice_t s,
 
     if (new_n < old_n) {
         /* Shrink non-tail: return excess blocks to free list. */
-        for (i = new_n; i < old_n; i++) {
-            if (slab_push_free_block(a->bs,
-                                     s.offset + i * a->block_size) != 0)
-                return -1;
-        }
+        if (slab_push_free_blocks(a->bs, s.offset + new_n * a->block_size,
+                                  old_n - new_n, a->block_size) != 0)
+            return -1;
         out->allocator = base; out->offset = s.offset; out->len = new_len;
         return 0;
     }
 
-    /* Grow non-tail: allocate new, copy old data, free old. */
+    /* Grow non-tail: read old data into a zeroed new_backing-sized buffer,
+     * push it as a single atomic write, then free the old blocks. */
     {
-        bstack_slice_t new_s;
-        uint8_t       *buf;
+        uint8_t  *buf;
+        uint64_t  push_offset;
 
-        if (slab_vtbl_alloc(base, new_len, &new_s) != 0) return -1;
+#if UINT64_MAX > SIZE_MAX
+        if (new_backing > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
+#endif
+        buf = calloc(1, (size_t)new_backing);
+        if (!buf) return -1;
 
         if (s.len > 0) {
-#if UINT64_MAX > SIZE_MAX
-            if (s.len > (uint64_t)SIZE_MAX) {
-                slab_vtbl_dealloc(base, new_s);
-                errno = EINVAL; return -1;
+            if (bstack_get(a->bs, s.offset, s.offset + s.len, buf) != 0) {
+                free(buf); return -1;
             }
-#endif
-            buf = malloc((size_t)s.len);
-            if (!buf) { slab_vtbl_dealloc(base, new_s); return -1; }
-            if (bstack_get(a->bs, s.offset, s.offset + s.len, buf) != 0 ||
-                bstack_set(a->bs, new_s.offset, buf, (size_t)s.len) != 0) {
-                free(buf);
-                slab_vtbl_dealloc(base, new_s);
-                return -1;
-            }
-            free(buf);
         }
-        /* New bytes [s.len, new_len) come from bstack_extend and are already
-         * zero; no explicit zeroing needed. */
 
-        if (slab_vtbl_dealloc(base, s) != 0) return -1;
-        *out = new_s;
+        if (bstack_push(a->bs, buf, (size_t)new_backing, &push_offset) != 0) {
+            free(buf); return -1;
+        }
+        free(buf);
+
+        if (slab_push_free_blocks(a->bs, s.offset, old_n, a->block_size) != 0)
+            return -1;
+
+        out->allocator = base;
+        out->offset    = push_offset;
+        out->len       = new_len;
         return 0;
     }
 }
@@ -3002,41 +3047,19 @@ slab_bstack_allocator_t *slab_bstack_allocator_new(bstack_t *bs,
 {
     slab_bstack_allocator_t *a;
     int is_empty;
+    uint8_t hdr[48]; /* SLAB_ARENA_START */
 
     if (bstack_is_empty(bs, &is_empty) != 0) return NULL;
+    if (!is_empty) { errno = EINVAL; return NULL; }
 
-    if (is_empty) {
-        uint8_t hdr[48]; /* SLAB_ARENA_START */
+    if (block_size < SLAB_MIN_BLOCK_SIZE) { errno = EINVAL; return NULL; }
 
-        if (block_size < SLAB_MIN_BLOCK_SIZE) { errno = EINVAL; return NULL; }
+    memset(hdr, 0, sizeof hdr);
+    memcpy(hdr + (size_t)SLAB_OFFSET_SIZE, alsl_magic, 8);
+    write_le64(hdr + (size_t)SLAB_BLOCK_SIZE_OFFSET, block_size);
+    /* free_head at SLAB_FREE_HEAD_OFFSET stays 0 (SLAB_SENTINEL) */
 
-        memset(hdr, 0, sizeof hdr);
-        memcpy(hdr + (size_t)SLAB_OFFSET_SIZE, alsl_magic, 8);
-        write_le64(hdr + (size_t)SLAB_BLOCK_SIZE_OFFSET, block_size);
-        /* free_head at SLAB_FREE_HEAD_OFFSET stays 0 (SLAB_SENTINEL) */
-
-        if (bstack_push(bs, hdr, sizeof hdr, NULL) != 0) return NULL;
-    } else {
-        uint8_t header[24]; /* SLAB_HEADER_SIZE */
-        uint64_t stored_block_size, stack_len;
-
-        if (bstack_len(bs, &stack_len) != 0) return NULL;
-        if (stack_len < SLAB_ARENA_START) { errno = EINVAL; return NULL; }
-
-        if (bstack_get(bs, SLAB_OFFSET_SIZE,
-                       SLAB_OFFSET_SIZE + SLAB_HEADER_SIZE, header) != 0)
-            return NULL;
-
-        if (memcmp(header, alsl_magic_prefix, sizeof alsl_magic_prefix) != 0) {
-            errno = EINVAL; return NULL;
-        }
-
-        stored_block_size = read_le64(header + 8);
-        if (stored_block_size < SLAB_MIN_BLOCK_SIZE) {
-            errno = EINVAL; return NULL;
-        }
-        if (block_size != stored_block_size) { errno = EINVAL; return NULL; }
-    }
+    if (bstack_push(bs, hdr, sizeof hdr, NULL) != 0) return NULL;
 
     a = malloc(sizeof *a);
     if (!a) return NULL;
@@ -3045,6 +3068,42 @@ slab_bstack_allocator_t *slab_bstack_allocator_new(bstack_t *bs,
     a->base.bulk_vtbl = NULL;
     a->bs             = bs;
     a->block_size     = block_size;
+    return a;
+}
+
+slab_bstack_allocator_t *slab_bstack_allocator_open(bstack_t *bs,
+                                                     uint64_t block_size)
+{
+    slab_bstack_allocator_t *a;
+    int is_empty;
+    uint8_t header[24]; /* SLAB_HEADER_SIZE */
+    uint64_t stored_block_size, stack_len;
+
+    if (bstack_is_empty(bs, &is_empty) != 0) return NULL;
+    if (is_empty) { errno = EINVAL; return NULL; }
+
+    if (bstack_len(bs, &stack_len) != 0) return NULL;
+    if (stack_len < SLAB_ARENA_START) { errno = EINVAL; return NULL; }
+
+    if (bstack_get(bs, SLAB_OFFSET_SIZE,
+                   SLAB_OFFSET_SIZE + SLAB_HEADER_SIZE, header) != 0)
+        return NULL;
+
+    if (memcmp(header, alsl_magic_prefix, sizeof alsl_magic_prefix) != 0) {
+        errno = EINVAL; return NULL;
+    }
+
+    stored_block_size = read_le64(header + 8);
+    if (stored_block_size < SLAB_MIN_BLOCK_SIZE) { errno = EINVAL; return NULL; }
+    if (block_size != stored_block_size) { errno = EINVAL; return NULL; }
+
+    a = malloc(sizeof *a);
+    if (!a) return NULL;
+
+    a->base.vtbl      = &slab_allocator_vtbl;
+    a->base.bulk_vtbl = NULL;
+    a->bs             = bs;
+    a->block_size     = stored_block_size;
     return a;
 }
 
