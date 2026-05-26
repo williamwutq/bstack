@@ -34,31 +34,6 @@ const NODE_HEIGHT_OFF: u64 = 9; // u8 height (max ~59 for balanced; slightly mor
 const NODE_LEFT_OFF: u64 = 16;
 const NODE_RIGHT_OFF: u64 = 24;
 
-// Read a value of type `$ty` from `$buf` at offset `$off`.
-macro_rules! read_buf {
-    ($buf:expr, $off:expr => $ty:ty) => {{
-        let start = $off as usize;
-        let end = start + std::mem::size_of::<$ty>();
-        $buf[start..end].try_into().unwrap()
-    }};
-}
-
-macro_rules! write_buf {
-    ($val:expr => $buf:expr, $off:expr) => {{
-        let bytes = $val.to_le_bytes();
-        let start = $off as usize;
-        let end = start + bytes.len();
-        $buf[start..end].copy_from_slice(&bytes);
-    }};
-}
-
-// Read a little-endian value of type `$ty` from `$buf` at offset `$off`.
-macro_rules! read_buf_le {
-    ($buf:expr, $off:expr => $ty:ty) => {
-        <$ty>::from_le_bytes(read_buf!($buf, $off => $ty))
-    };
-}
-
 /// A pure-AVL general-purpose allocator built on top of a [`BStack`].
 ///
 /// Free blocks store their AVL node inline at offset 0 within the block —
