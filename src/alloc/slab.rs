@@ -56,6 +56,31 @@ const ALSL_MAGIC_PREFIX: [u8; 6] = *b"ALSL\x00\x01";
 /// block being operated on; the rest of the free list remains consistent and
 /// the file can be used without recovery.
 ///
+/// # Method safety
+///
+/// | Method                               | Atomicity       | `BStack` op      | Crash effect.             |
+/// |--------------------------------------|-----------------|------------------|---------------------------|
+/// | `new`                                | Atomic          | Yes (`push`)     | —                         |
+/// | `open`                               | N/A (read-only) | Yes (`get_into`) | —                         |
+/// | `block_size`                         | N/A (no I/O)    | —                | —                         |
+/// | `into_stack`                         | N/A (no I/O)    | —                | —                         |
+/// | `alloc(0)`                           | N/A (no I/O)    | —                | —                         |
+/// | `alloc(≤ block_size)`, free list hit | Partial         | No (2–3)         | Popped block leaked       |
+/// | `alloc(≤ block_size)`, tail extend   | Atomic          | Yes (`extend`)   | —                         |
+/// | `alloc(> block_size)`                | Atomic          | Yes (`extend`)   | —                         |
+/// | `dealloc(null)`                      | N/A (no I/O)    | —                | —                         |
+/// | `dealloc`, oversized tail            | Atomic          | Yes (`discard`)  | —                         |
+/// | `dealloc`, other blocks              | Partial         | No (3)           | Entire freed batch leaked |
+/// | `realloc`, same block count          | Atomic          | No (0–1)         | —                         |
+/// | `realloc`, tail grow                 | Atomic          | Yes (`extend`)   | —                         |
+/// | `realloc`, tail shrink               | Atomic          | Yes (`discard`)  | —                         |
+/// | `realloc`, shrink non-tail           | Partial         | No (3)           | Freed blocks leaked       |
+/// | `realloc`, grow non-tail             | Partial         | No (4–5)         | Old blocks leaked         |
+///
+/// **Atomicity key:** *Atomic* — crash leaves the file fully consistent (no partial writes visible);
+/// *Partial* — crash keeps the free list consistent but may leak ≤ 1 block or batch;
+/// *N/A* — operation performs no I/O.
+///
 /// # Thread safety
 ///
 /// `SlabBStackAllocator` is only `Send` but not `Sync`: concurrent access to
