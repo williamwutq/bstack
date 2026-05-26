@@ -298,6 +298,163 @@ impl SlabBStackAllocator {
     }
 }
 
+#[cfg(feature = "set")]
+impl fmt::Debug for SlabBStackAllocator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SlabBStackAllocator")
+            .field("block_size", &self.block_size)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "set")]
+impl BStackAllocator for SlabBStackAllocator {
+    type Error = io::Error;
+    type Allocated<'a> = BStackSlice<'a, Self>;
+
+    fn stack(&self) -> &BStack {
+        &self.stack
+    }
+
+    fn into_stack(self) -> BStack {
+        self.stack
+    }
+
+    /// Allocate `len` bytes.
+    ///
+    /// # Crash consistency
+    ///
+    /// | Path | Calls | Safety |
+    /// |------|-------|--------|
+    /// | `len == 0` | 0 | trivially safe |
+    /// | slab, free list hit | 2 (`get_into` + `set`) | crash leaves block at list head |
+    /// | slab, tail extend | 1 (`extend`) | crash-safe by inheritance |
+    /// | oversized | 1 (`extend`) | crash-safe by inheritance |
+    fn alloc(&self, len: u64) -> io::Result<BStackSlice<'_, Self>> {
+        if len == 0 {
+            return Ok(BStackSlice::empty(self));
+        }
+
+        if len <= self.block_size {
+            if let Some(block) = self.pop_free_block()? {
+                // SAFETY: block is a valid block_size region from pop_free_block
+                return Ok(unsafe { BStackSlice::from_raw_parts(self, block.into(), len) });
+            }
+            let offset = self.stack.extend(self.block_size)?;
+            // SAFETY: offset from a fresh tail extension of block_size bytes
+            return Ok(unsafe { BStackSlice::from_raw_parts(self, offset, len) });
+        }
+
+        let n = len.div_ceil(self.block_size);
+        let total = n.checked_mul(self.block_size).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "allocation size overflows u64")
+        })?;
+        let offset = self.stack.extend(total)?;
+        // SAFETY: offset from a fresh tail extension of n * block_size bytes
+        Ok(unsafe { BStackSlice::from_raw_parts(self, offset, len) })
+    }
+
+    /// Release the region described by `slice`.
+    ///
+    /// # Crash consistency
+    ///
+    /// | Path | Calls | Safety |
+    /// |------|-------|--------|
+    /// | null slice | 0 | trivially safe |
+    /// | oversized tail | 1 (`discard`) | crash-safe by inheritance |
+    /// | slab / oversized non-tail | 2 per block (`set` + `set`) | crash leaks the block being added |
+    fn dealloc(&self, slice: BStackSlice<'_, Self>) -> io::Result<()> {
+        if slice.is_empty() && slice.start() == Self::SENTINEL {
+            return Ok(());
+        }
+
+        let n_blocks = self.blocks_needed(slice.len());
+        let backing_size = n_blocks * self.block_size;
+        let current_tail = self.stack.len()?;
+
+        if slice.len() > self.block_size && slice.start() + backing_size == current_tail {
+            return self.stack.discard(backing_size);
+        }
+
+        self.push_free_blocks(slice.start(), n_blocks)
+    }
+
+    /// Resize the region described by `slice` to `new_len` bytes.
+    ///
+    /// # Resize strategies
+    ///
+    /// | Case | Strategy |
+    /// |------|----------|
+    /// | Same block count | Adjust visible length only (no I/O) |
+    /// | Slice at tail | Extend or discard tail (single `BStack` call) |
+    /// | Shrink, non-tail | Recycle excess blocks into the free list |
+    /// | Grow, non-tail | Allocate fresh region, copy, release old |
+    fn realloc<'a>(
+        &'a self,
+        slice: BStackSlice<'a, Self>,
+        new_len: u64,
+    ) -> io::Result<BStackSlice<'a, Self>> {
+        if slice.is_empty() && slice.start() == Self::SENTINEL {
+            return self.alloc(new_len);
+        }
+        if new_len == 0 {
+            self.dealloc(slice)?;
+            return Ok(BStackSlice::empty(self));
+        }
+        if new_len == slice.len() {
+            return Ok(slice);
+        }
+
+        let old_n = self.blocks_needed(slice.len());
+        let new_n = self.blocks_needed(new_len);
+
+        if old_n == new_n {
+            // Same backing blocks: zero newly-exposed bytes then adjust visible length.
+            // Interget safety: old and new slice length are both valid u64 values and they could not differ
+            // by more than block_size by bytes, so new_len - slice.len() will not overflow.
+            if new_len > slice.len() {
+                self.stack.zero(slice.end(), new_len - slice.len())?;
+            }
+            // SAFETY: new_len still fits within the same block_size-aligned region
+            return Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) });
+        }
+
+        let old_backing = old_n * self.block_size;
+        let new_backing = new_n * self.block_size;
+        let current_tail = self.stack.len()?;
+        let is_tail = slice.start() + old_backing == current_tail;
+
+        if is_tail {
+            if new_n > old_n {
+                self.stack.extend(new_backing - old_backing)?;
+            } else {
+                self.stack.discard(old_backing - new_backing)?;
+            }
+            if new_len > slice.len() {
+                self.stack.zero(slice.end(), new_len - slice.len())?;
+            }
+            // SAFETY: slice extended or shrunk in place at the tail
+            return Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) });
+        }
+
+        if new_n < old_n {
+            // Shrink non-tail: recycle excess blocks into the free list.
+            self.push_free_blocks(slice.start() + new_n * self.block_size, old_n - new_n)?;
+            // SAFETY: new_len fits within the first new_n retained blocks
+            return Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) });
+        }
+
+        // Grow non-tail: copy data, allocate a new region, release old.
+        let mut data_buf = vec![0u8; new_backing as usize];
+        self.stack
+            .get_into(slice.start(), &mut data_buf[..slice.len() as usize])?;
+        let new_ptr = self.stack.push(data_buf)?;
+        self.push_free_blocks(slice.start(), old_n)?;
+        // SAFETY: new_len fits within the new_n blocks of the newly pushed region
+        Ok(unsafe { BStackSlice::from_raw_parts(self, new_ptr, new_len) })
+    }
+}
+
 #[cfg(all(test, feature = "set"))]
 mod tests {
     use super::SlabBStackAllocator;
@@ -507,162 +664,5 @@ mod tests {
         let alloc2 = SlabBStackAllocator::open(BStack::open(&path).unwrap(), 16).unwrap();
         let s2 = unsafe { crate::alloc::BStackSlice::from_raw_parts(&alloc2, offset, 5) };
         assert_eq!(s2.read().unwrap(), b"hello");
-    }
-}
-
-#[cfg(feature = "set")]
-impl fmt::Debug for SlabBStackAllocator {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SlabBStackAllocator")
-            .field("block_size", &self.block_size)
-            .finish_non_exhaustive()
-    }
-}
-
-#[cfg(feature = "set")]
-impl BStackAllocator for SlabBStackAllocator {
-    type Error = io::Error;
-    type Allocated<'a> = BStackSlice<'a, Self>;
-
-    fn stack(&self) -> &BStack {
-        &self.stack
-    }
-
-    fn into_stack(self) -> BStack {
-        self.stack
-    }
-
-    /// Allocate `len` bytes.
-    ///
-    /// # Crash consistency
-    ///
-    /// | Path | Calls | Safety |
-    /// |------|-------|--------|
-    /// | `len == 0` | 0 | trivially safe |
-    /// | slab, free list hit | 2 (`get_into` + `set`) | crash leaves block at list head |
-    /// | slab, tail extend | 1 (`extend`) | crash-safe by inheritance |
-    /// | oversized | 1 (`extend`) | crash-safe by inheritance |
-    fn alloc(&self, len: u64) -> io::Result<BStackSlice<'_, Self>> {
-        if len == 0 {
-            return Ok(BStackSlice::empty(self));
-        }
-
-        if len <= self.block_size {
-            if let Some(block) = self.pop_free_block()? {
-                // SAFETY: block is a valid block_size region from pop_free_block
-                return Ok(unsafe { BStackSlice::from_raw_parts(self, block.into(), len) });
-            }
-            let offset = self.stack.extend(self.block_size)?;
-            // SAFETY: offset from a fresh tail extension of block_size bytes
-            return Ok(unsafe { BStackSlice::from_raw_parts(self, offset, len) });
-        }
-
-        let n = len.div_ceil(self.block_size);
-        let total = n.checked_mul(self.block_size).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "allocation size overflows u64")
-        })?;
-        let offset = self.stack.extend(total)?;
-        // SAFETY: offset from a fresh tail extension of n * block_size bytes
-        Ok(unsafe { BStackSlice::from_raw_parts(self, offset, len) })
-    }
-
-    /// Release the region described by `slice`.
-    ///
-    /// # Crash consistency
-    ///
-    /// | Path | Calls | Safety |
-    /// |------|-------|--------|
-    /// | null slice | 0 | trivially safe |
-    /// | oversized tail | 1 (`discard`) | crash-safe by inheritance |
-    /// | slab / oversized non-tail | 2 per block (`set` + `set`) | crash leaks the block being added |
-    fn dealloc(&self, slice: BStackSlice<'_, Self>) -> io::Result<()> {
-        if slice.is_empty() && slice.start() == Self::SENTINEL {
-            return Ok(());
-        }
-
-        let n_blocks = self.blocks_needed(slice.len());
-        let backing_size = n_blocks * self.block_size;
-        let current_tail = self.stack.len()?;
-
-        if slice.len() > self.block_size && slice.start() + backing_size == current_tail {
-            return self.stack.discard(backing_size);
-        }
-
-        self.push_free_blocks(slice.start(), n_blocks)
-    }
-
-    /// Resize the region described by `slice` to `new_len` bytes.
-    ///
-    /// # Resize strategies
-    ///
-    /// | Case | Strategy |
-    /// |------|----------|
-    /// | Same block count | Adjust visible length only (no I/O) |
-    /// | Slice at tail | Extend or discard tail (single `BStack` call) |
-    /// | Shrink, non-tail | Recycle excess blocks into the free list |
-    /// | Grow, non-tail | Allocate fresh region, copy, release old |
-    fn realloc<'a>(
-        &'a self,
-        slice: BStackSlice<'a, Self>,
-        new_len: u64,
-    ) -> io::Result<BStackSlice<'a, Self>> {
-        if slice.is_empty() && slice.start() == Self::SENTINEL {
-            return self.alloc(new_len);
-        }
-        if new_len == 0 {
-            self.dealloc(slice)?;
-            return Ok(BStackSlice::empty(self));
-        }
-        if new_len == slice.len() {
-            return Ok(slice);
-        }
-
-        let old_n = self.blocks_needed(slice.len());
-        let new_n = self.blocks_needed(new_len);
-
-        if old_n == new_n {
-            // Same backing blocks: zero newly-exposed bytes then adjust visible length.
-            // Interget safety: old and new slice length are both valid u64 values and they could not differ
-            // by more than block_size by bytes, so new_len - slice.len() will not overflow.
-            if new_len > slice.len() {
-                self.stack.zero(slice.end(), new_len - slice.len())?;
-            }
-            // SAFETY: new_len still fits within the same block_size-aligned region
-            return Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) });
-        }
-
-        let old_backing = old_n * self.block_size;
-        let new_backing = new_n * self.block_size;
-        let current_tail = self.stack.len()?;
-        let is_tail = slice.start() + old_backing == current_tail;
-
-        if is_tail {
-            if new_n > old_n {
-                self.stack.extend(new_backing - old_backing)?;
-            } else {
-                self.stack.discard(old_backing - new_backing)?;
-            }
-            if new_len > slice.len() {
-                self.stack.zero(slice.end(), new_len - slice.len())?;
-            }
-            // SAFETY: slice extended or shrunk in place at the tail
-            return Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) });
-        }
-
-        if new_n < old_n {
-            // Shrink non-tail: recycle excess blocks into the free list.
-            self.push_free_blocks(slice.start() + new_n * self.block_size, old_n - new_n)?;
-            // SAFETY: new_len fits within the first new_n retained blocks
-            return Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) });
-        }
-
-        // Grow non-tail: copy data, allocate a new region, release old.
-        let mut data_buf = vec![0u8; new_backing as usize];
-        self.stack
-            .get_into(slice.start(), &mut data_buf[..slice.len() as usize])?;
-        let new_ptr = self.stack.push(data_buf)?;
-        self.push_free_blocks(slice.start(), old_n)?;
-        // SAFETY: new_len fits within the new_n blocks of the newly pushed region
-        Ok(unsafe { BStackSlice::from_raw_parts(self, new_ptr, new_len) })
     }
 }
