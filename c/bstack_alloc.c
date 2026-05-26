@@ -2774,8 +2774,8 @@ static int slab_write_free_head(bstack_t *bs, uint64_t val)
 /*
  * Pop the head block from the free list.
  * Sets *out_block to the block's payload offset, or SLAB_SENTINEL if empty.
- * Zeros the block after popping (best-effort; list is consistent even if
- * zeroing fails — ignored so the popped block can still be returned).
+ * Zeros the block after popping; failure is propagated to preserve the
+ * allocator contract that returned bytes are zero-initialized.
  */
 static int slab_pop_free_block(bstack_t *bs, uint64_t block_size,
                                 uint64_t *out_block)
@@ -2792,11 +2792,12 @@ static int slab_pop_free_block(bstack_t *bs, uint64_t block_size,
     next = read_le64(buf);
     if (slab_write_free_head(bs, next) != 0) return -1;
 
-    /* Zero the block (best-effort; list remains consistent if this fails). */
+    /* Zero the block after popping; on failure the popped block is leaked but
+     * not returned to callers in a non-zero state. */
 #if UINT64_MAX > SIZE_MAX
-    if (block_size <= (uint64_t)SIZE_MAX)
+    if (block_size > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
 #endif
-        (void)bstack_zero(bs, head, (size_t)block_size);
+    if (bstack_zero(bs, head, (size_t)block_size) != 0) return -1;
 
     *out_block = head;
     return 0;
@@ -3105,6 +3106,10 @@ slab_bstack_allocator_t *slab_bstack_allocator_open(bstack_t *bs,
                 || stored_free_head >= stack_len) {
                 errno = EINVAL; return NULL;
             }
+        }
+        if (stack_len < SLAB_ARENA_START) { errno = EINVAL; return NULL; }
+        if ((stack_len - SLAB_ARENA_START) % stored_block_size != 0) {
+            errno = EINVAL; return NULL;
         }
     }
 

@@ -65,7 +65,7 @@ const ALSL_MAGIC_PREFIX: [u8; 6] = *b"ALSL\x00\x01";
 /// | `block_size`                         | N/A (no I/O)    | —                | —                         |
 /// | `into_stack`                         | N/A (no I/O)    | —                | —                         |
 /// | `alloc(0)`                           | N/A (no I/O)    | —                | —                         |
-/// | `alloc(≤ block_size)`, free list hit | Partial         | No (2–3)         | Popped block leaked       |
+/// | `alloc(≤ block_size)`, free list hit | Partial         | No (4)           | Popped block leaked       |
 /// | `alloc(≤ block_size)`, tail extend   | Atomic          | Yes (`extend`)   | —                         |
 /// | `alloc(> block_size)`                | Atomic          | Yes (`extend`)   | —                         |
 /// | `dealloc(null)`                      | N/A (no I/O)    | —                | —                         |
@@ -94,7 +94,7 @@ const ALSL_MAGIC_PREFIX: [u8; 6] = *b"ALSL\x00\x01";
 /// Requires both the `alloc` and `set` Cargo features:
 ///
 /// ```toml
-/// bstack = { version = "0.1", features = ["alloc", "set"] }
+/// bstack = { version = "0.2", features = ["alloc", "set"] }
 /// ```
 #[cfg(feature = "set")]
 pub struct SlabBStackAllocator {
@@ -145,6 +145,12 @@ impl SlabBStackAllocator {
                     "block_size ({block_size}) must be >= {}",
                     Self::MIN_BLOCK_SIZE
                 ),
+            ));
+        }
+        if usize::try_from(block_size).is_err() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "block_size is too large for this platform",
             ));
         }
         let mut hdr = [0u8; Self::ARENA_START as usize];
@@ -205,6 +211,12 @@ impl SlabBStackAllocator {
                 format!("stored block_size ({stored_block_size}) is invalid"),
             ));
         }
+        if usize::try_from(stored_block_size).is_err() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "stored block_size is too large for this platform",
+            ));
+        }
         if block_size != stored_block_size {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -221,6 +233,18 @@ impl SlabBStackAllocator {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("stored free_head ({stored_free_head}) is not a valid block offset"),
+            ));
+        }
+        let arena_bytes = stack_len.checked_sub(Self::ARENA_START).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "stack too short to contain allocator header",
+            )
+        })?;
+        if arena_bytes % stored_block_size != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "stack tail is not aligned to block_size",
             ));
         }
 
@@ -246,9 +270,7 @@ impl SlabBStackAllocator {
             Self::FREE_HEAD_OFFSET,
             read_bstack!(self.stack, head => u64),
         )?;
-        // Zeroing. If this fail, the free list is still consistent and the popped block is leaked
-        // but not corrupted, so we can ignore the error.
-        let _ = self.stack.zero(head, self.block_size);
+        self.stack.zero(head, self.block_size)?;
         // SAFETY: head is not zero since we checked for the SENTINEL case above, so it is a valid NonZeroU64
         Ok(Some(head.try_into().unwrap()))
     }
@@ -285,7 +307,19 @@ impl SlabBStackAllocator {
             return self.push_free_block(first_block);
         }
         let old_head = read_bstack!(self.stack, Self::FREE_HEAD_OFFSET => u64);
-        let buf_size = usize::try_from(count * self.block_size).map_err(|_| {
+        let total_bytes = count.checked_mul(self.block_size).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "freed region size overflows u64",
+            )
+        })?;
+        first_block.checked_add(total_bytes).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "freed region end offset overflows u64",
+            )
+        })?;
+        let buf_size = usize::try_from(total_bytes).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "freed region exceeds platform pointer size",
@@ -293,11 +327,33 @@ impl SlabBStackAllocator {
         })?;
         let mut buf = vec![0u8; buf_size];
         for i in 0..count - 1 {
-            let next = first_block + (i + 1) * self.block_size;
-            let off = (i * self.block_size) as usize;
+            let next = first_block
+                .checked_add((i + 1).checked_mul(self.block_size).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "next block index multiplication overflows u64",
+                    )
+                })?)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "next block offset overflows u64")
+                })?;
+            let off = usize::try_from(i.checked_mul(self.block_size).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "free-list offset overflows u64")
+            })?)
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "free-list offset overflows usize")
+            })?;
             buf[off..off + 8].copy_from_slice(&next.to_le_bytes());
         }
-        let last_off = ((count - 1) * self.block_size) as usize;
+        let last_off = usize::try_from((count - 1).checked_mul(self.block_size).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "last free-list offset overflows u64")
+        })?)
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "last free-list offset overflows usize",
+            )
+        })?;
         buf[last_off..last_off + 8].copy_from_slice(&old_head);
         self.stack.set(first_block, buf)?;
         self.stack
@@ -345,7 +401,7 @@ impl BStackAllocator for SlabBStackAllocator {
     /// | Path | Calls | Safety |
     /// |------|-------|--------|
     /// | `len == 0` | 0 | trivially safe |
-    /// | slab, free list hit | 3 (2× `get_into` + `set`) | crash leaves block at list head |
+    /// | slab, free list hit | 4 (2× `get_into` + `set` + `zero`) | crash may leak popped block |
     /// | slab, tail extend | 1 (`extend`) | crash-safe by inheritance |
     /// | oversized | 1 (`extend`) | crash-safe by inheritance |
     fn alloc(&self, len: u64) -> io::Result<BStackSlice<'_, Self>> {
@@ -389,10 +445,15 @@ impl BStackAllocator for SlabBStackAllocator {
         }
 
         let n_blocks = self.blocks_needed(slice.len());
-        let backing_size = n_blocks * self.block_size;
+        let backing_size = n_blocks.checked_mul(self.block_size).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "deallocation size overflows u64")
+        })?;
         let current_tail = self.stack.len()?;
+        let slice_end = slice.start().checked_add(backing_size).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "deallocation end offset overflows u64")
+        })?;
 
-        if slice.len() > self.block_size && slice.start() + backing_size == current_tail {
+        if slice.len() > self.block_size && slice_end == current_tail {
             return self.stack.discard(backing_size);
         }
 
@@ -439,10 +500,18 @@ impl BStackAllocator for SlabBStackAllocator {
             return Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) });
         }
 
-        let old_backing = old_n * self.block_size;
-        let new_backing = new_n * self.block_size;
+        let old_backing = old_n.checked_mul(self.block_size).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "old allocation size overflows u64")
+        })?;
+        let new_backing = new_n.checked_mul(self.block_size).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "new allocation size overflows u64")
+        })?;
         let current_tail = self.stack.len()?;
-        let is_tail = slice.start() + old_backing == current_tail;
+        let is_tail = slice
+            .start()
+            .checked_add(old_backing)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "tail check overflows u64"))?
+            == current_tail;
 
         if is_tail {
             if new_n > old_n {
@@ -459,7 +528,18 @@ impl BStackAllocator for SlabBStackAllocator {
 
         if new_n < old_n {
             // Shrink non-tail: recycle excess blocks into the free list.
-            self.push_free_blocks(slice.start() + new_n * self.block_size, old_n - new_n)?;
+            let free_start = slice
+                .start()
+                .checked_add(new_n.checked_mul(self.block_size).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "free start multiplication overflows u64",
+                    )
+                })?)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "free start overflows u64")
+                })?;
+            self.push_free_blocks(free_start, old_n - new_n)?;
             // SAFETY: new_len fits within the first new_n retained blocks
             return Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) });
         }
@@ -472,8 +552,14 @@ impl BStackAllocator for SlabBStackAllocator {
             )
         })?;
         let mut data_buf = vec![0u8; buf_len];
+        let old_visible_len = usize::try_from(slice.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "existing allocation too large for this platform",
+            )
+        })?;
         self.stack
-            .get_into(slice.start(), &mut data_buf[..slice.len() as usize])?;
+            .get_into(slice.start(), &mut data_buf[..old_visible_len])?;
         let new_ptr = self.stack.push(data_buf)?;
         self.push_free_blocks(slice.start(), old_n)?;
         // SAFETY: new_len fits within the new_n blocks of the newly pushed region
@@ -587,6 +673,18 @@ mod tests {
         let _g = Guard(path.clone());
         SlabBStackAllocator::new(stack, 8).unwrap();
         let err = SlabBStackAllocator::open(BStack::open(&path).unwrap(), 16).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn open_rejects_misaligned_tail() {
+        let (stack, path) = empty_stack();
+        let _g = Guard(path.clone());
+        SlabBStackAllocator::new(stack, 8).unwrap();
+        let reopen = BStack::open(&path).unwrap();
+        reopen.extend(1).unwrap();
+        drop(reopen);
+        let err = SlabBStackAllocator::open(BStack::open(&path).unwrap(), 8).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidData);
     }
 
