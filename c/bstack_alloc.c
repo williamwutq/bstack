@@ -2750,9 +2750,11 @@ static const uint8_t alsl_magic_prefix[6] = {'A','L','S','L',0,1};
 
 static uint64_t slab_blocks_needed(uint64_t len, uint64_t block_size)
 {
-    if (len == 0)            return 0;
-    if (len <= block_size)   return 1;
-    return (len + block_size - 1) / block_size;
+    if (len == 0) return 0;
+    /* (len - 1) / block_size + 1 avoids the (len + block_size - 1) overflow.
+     * Safe because block_size >= SLAB_MIN_BLOCK_SIZE (8), so the result fits
+     * in uint64_t: max is (UINT64_MAX-1)/8 + 1 = 2305843009213693952. */
+    return (len - 1) / block_size + 1;
 }
 
 static int slab_read_free_head(bstack_t *bs, uint64_t *out)
@@ -2894,7 +2896,7 @@ static int slab_vtbl_alloc(bstack_allocator_t *base, uint64_t len,
     }
 
     /* Oversized: extend by the smallest multiple of block_size that fits len. */
-    n = (len + a->block_size - 1) / a->block_size;
+    n = slab_blocks_needed(len, a->block_size);
     if (n > UINT64_MAX / a->block_size) { errno = EINVAL; return -1; }
     total = n * a->block_size;
 #if UINT64_MAX > SIZE_MAX
@@ -2912,16 +2914,20 @@ static int slab_vtbl_dealloc(bstack_allocator_t *base, bstack_slice_t s)
 
     if (s.len == 0 && s.offset == SLAB_SENTINEL) return 0;
 
-    n_blocks     = slab_blocks_needed(s.len, a->block_size);
+    n_blocks = slab_blocks_needed(s.len, a->block_size);
+    if (n_blocks > UINT64_MAX / a->block_size) { errno = EINVAL; return -1; }
     backing_size = n_blocks * a->block_size;
 
     if (bstack_len(a->bs, &tail) != 0) return -1;
 
-    if (s.len > a->block_size && s.offset + backing_size == tail) {
+    if (s.len > a->block_size) {
+        if (s.offset > UINT64_MAX - backing_size) { errno = EINVAL; return -1; }
+        if (s.offset + backing_size == tail) {
 #if UINT64_MAX > SIZE_MAX
-        if (backing_size > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
+            if (backing_size > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
 #endif
-        return bstack_discard(a->bs, (size_t)backing_size);
+            return bstack_discard(a->bs, (size_t)backing_size);
+        }
     }
 
     return slab_push_free_blocks(a->bs, s.offset, n_blocks, a->block_size);
@@ -2961,9 +2967,12 @@ static int slab_vtbl_realloc(bstack_allocator_t *base, bstack_slice_t s,
         return 0;
     }
 
+    if (old_n > UINT64_MAX / a->block_size) { errno = EINVAL; return -1; }
     old_backing = old_n * a->block_size;
+    if (new_n > UINT64_MAX / a->block_size) { errno = EINVAL; return -1; }
     new_backing = new_n * a->block_size;
     if (bstack_len(a->bs, &tail) != 0) return -1;
+    if (s.offset > UINT64_MAX - old_backing) { errno = EINVAL; return -1; }
     is_tail = (s.offset + old_backing == tail);
 
     if (is_tail) {
@@ -3054,16 +3063,19 @@ slab_bstack_allocator_t *slab_bstack_allocator_new(bstack_t *bs,
     if (!is_empty) { errno = EINVAL; return NULL; }
 
     if (block_size < SLAB_MIN_BLOCK_SIZE) { errno = EINVAL; return NULL; }
+#if UINT64_MAX > SIZE_MAX
+    if (block_size > (uint64_t)SIZE_MAX) { errno = EINVAL; return NULL; }
+#endif
+
+    a = malloc(sizeof *a);
+    if (!a) { errno = ENOMEM; return NULL; }
 
     memset(hdr, 0, sizeof hdr);
     memcpy(hdr + (size_t)SLAB_OFFSET_SIZE, alsl_magic, 8);
     write_le64(hdr + (size_t)SLAB_BLOCK_SIZE_OFFSET, block_size);
     /* free_head at SLAB_FREE_HEAD_OFFSET stays 0 (SLAB_SENTINEL) */
 
-    if (bstack_push(bs, hdr, sizeof hdr, NULL) != 0) return NULL;
-
-    a = malloc(sizeof *a);
-    if (!a) return NULL;
+    if (bstack_push(bs, hdr, sizeof hdr, NULL) != 0) { free(a); return NULL; }
 
     a->base.vtbl      = &slab_allocator_vtbl;
     a->base.bulk_vtbl = NULL;
