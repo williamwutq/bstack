@@ -84,9 +84,10 @@ const ALSL_MAGIC_PREFIX: [u8; 6] = *b"ALSL\x00\x01";
 /// # Thread safety
 ///
 /// `SlabBStackAllocator` is only `Send` but not `Sync`: concurrent access to
-/// the same allocator must be externally synchronized. This is because the
-/// free list head is cached in memory and updated non-atomically, so concurrent
-/// modifications could lead to lost updates and list corruption.
+/// the same allocator must be externally synchronized. Free-list mutations
+/// require a read then a write of `free_head` as separate `BStack` calls — a
+/// TOCTOU race under concurrent `&self` access that can result in two callers
+/// receiving the same block.
 ///
 /// # Feature flags
 ///
@@ -169,7 +170,7 @@ impl SlabBStackAllocator {
     /// * [`io::ErrorKind::InvalidInput`] — `stack` is empty (use
     ///   [`SlabBStackAllocator::new`] to create a new allocator).
     /// * [`io::ErrorKind::InvalidData`] — wrong magic, invalid stored
-    ///   `block_size`, or mismatch between the stored and provided value.
+    ///   `block_size`, `block_size` mismatch, or invalid `free_head`.
     /// * Any [`io::Error`] propagated from the underlying [`BStack`] operations.
     pub fn open(stack: BStack, block_size: u64) -> io::Result<Self> {
         if stack.is_empty()? {
@@ -208,6 +209,18 @@ impl SlabBStackAllocator {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("block_size mismatch: stored {stored_block_size}, provided {block_size}"),
+            ));
+        }
+
+        let stored_free_head = u64::from_le_bytes(header[16..24].try_into().unwrap());
+        if stored_free_head != Self::SENTINEL
+            && (stored_free_head < Self::ARENA_START
+                || (stored_free_head - Self::ARENA_START) % stored_block_size != 0
+                || stored_free_head >= stack_len)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("stored free_head ({stored_free_head}) is not a valid block offset"),
             ));
         }
 
@@ -272,7 +285,12 @@ impl SlabBStackAllocator {
             return self.push_free_block(first_block);
         }
         let old_head = read_bstack!(self.stack, Self::FREE_HEAD_OFFSET => u64);
-        let buf_size = (count * self.block_size) as usize;
+        let buf_size = usize::try_from(count * self.block_size).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "freed region exceeds platform pointer size",
+            )
+        })?;
         let mut buf = vec![0u8; buf_size];
         for i in 0..count - 1 {
             let next = first_block + (i + 1) * self.block_size;
@@ -327,7 +345,7 @@ impl BStackAllocator for SlabBStackAllocator {
     /// | Path | Calls | Safety |
     /// |------|-------|--------|
     /// | `len == 0` | 0 | trivially safe |
-    /// | slab, free list hit | 2 (`get_into` + `set`) | crash leaves block at list head |
+    /// | slab, free list hit | 3 (2× `get_into` + `set`) | crash leaves block at list head |
     /// | slab, tail extend | 1 (`extend`) | crash-safe by inheritance |
     /// | oversized | 1 (`extend`) | crash-safe by inheritance |
     fn alloc(&self, len: u64) -> io::Result<BStackSlice<'_, Self>> {
@@ -362,7 +380,9 @@ impl BStackAllocator for SlabBStackAllocator {
     /// |------|-------|--------|
     /// | null slice | 0 | trivially safe |
     /// | oversized tail | 1 (`discard`) | crash-safe by inheritance |
-    /// | slab / oversized non-tail | 2 per block (`set` + `set`) | crash leaks the block being added |
+    /// | slab / oversized non-tail | 3 total (`get_into` + bulk `set` + `set`) | crash leaks entire freed batch |
+    ///
+    /// Double-freeing a slice corrupts the free list; this allocator does not guard against it.
     fn dealloc(&self, slice: BStackSlice<'_, Self>) -> io::Result<()> {
         if slice.is_empty() && slice.start() == Self::SENTINEL {
             return Ok(());
@@ -410,7 +430,7 @@ impl BStackAllocator for SlabBStackAllocator {
 
         if old_n == new_n {
             // Same backing blocks: zero newly-exposed bytes then adjust visible length.
-            // Interget safety: old and new slice length are both valid u64 values and they could not differ
+            // Integer safety: old and new slice length are both valid u64 values and they could not differ
             // by more than block_size by bytes, so new_len - slice.len() will not overflow.
             if new_len > slice.len() {
                 self.stack.zero(slice.end(), new_len - slice.len())?;
@@ -427,11 +447,11 @@ impl BStackAllocator for SlabBStackAllocator {
         if is_tail {
             if new_n > old_n {
                 self.stack.extend(new_backing - old_backing)?;
+                if new_len > slice.len() {
+                    self.stack.zero(slice.end(), new_len - slice.len())?;
+                }
             } else {
                 self.stack.discard(old_backing - new_backing)?;
-            }
-            if new_len > slice.len() {
-                self.stack.zero(slice.end(), new_len - slice.len())?;
             }
             // SAFETY: slice extended or shrunk in place at the tail
             return Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) });
@@ -445,7 +465,13 @@ impl BStackAllocator for SlabBStackAllocator {
         }
 
         // Grow non-tail: copy data, allocate a new region, release old.
-        let mut data_buf = vec![0u8; new_backing as usize];
+        let buf_len = usize::try_from(new_backing).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "reallocation too large for this platform",
+            )
+        })?;
+        let mut data_buf = vec![0u8; buf_len];
         self.stack
             .get_into(slice.start(), &mut data_buf[..slice.len() as usize])?;
         let new_ptr = self.stack.push(data_buf)?;

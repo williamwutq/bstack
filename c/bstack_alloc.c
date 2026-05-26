@@ -2972,20 +2972,20 @@ static int slab_vtbl_realloc(bstack_allocator_t *base, bstack_slice_t s,
             if (to_extend > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
 #endif
             if (bstack_extend(a->bs, (size_t)to_extend, NULL) != 0) return -1;
+            if (new_len > s.len) {
+                uint64_t to_zero = new_len - s.len;
+#if UINT64_MAX > SIZE_MAX
+                if (to_zero > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
+#endif
+                if (bstack_zero(a->bs, s.offset + s.len, (size_t)to_zero) != 0)
+                    return -1;
+            }
         } else {
             uint64_t to_discard = old_backing - new_backing;
 #if UINT64_MAX > SIZE_MAX
             if (to_discard > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
 #endif
             if (bstack_discard(a->bs, (size_t)to_discard) != 0) return -1;
-        }
-        if (new_len > s.len) {
-            uint64_t to_zero = new_len - s.len;
-#if UINT64_MAX > SIZE_MAX
-            if (to_zero > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
-#endif
-            if (bstack_zero(a->bs, s.offset + s.len, (size_t)to_zero) != 0)
-                return -1;
         }
         out->allocator = base; out->offset = s.offset; out->len = new_len;
         return 0;
@@ -3096,6 +3096,17 @@ slab_bstack_allocator_t *slab_bstack_allocator_open(bstack_t *bs,
     stored_block_size = read_le64(header + 8);
     if (stored_block_size < SLAB_MIN_BLOCK_SIZE) { errno = EINVAL; return NULL; }
     if (block_size != stored_block_size) { errno = EINVAL; return NULL; }
+
+    {
+        uint64_t stored_free_head = read_le64(header + 16);
+        if (stored_free_head != SLAB_SENTINEL) {
+            if (stored_free_head < SLAB_ARENA_START
+                || (stored_free_head - SLAB_ARENA_START) % stored_block_size != 0
+                || stored_free_head >= stack_len) {
+                errno = EINVAL; return NULL;
+            }
+        }
+    }
 
     a = malloc(sizeof *a);
     if (!a) return NULL;
