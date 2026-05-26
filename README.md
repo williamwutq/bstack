@@ -826,12 +826,21 @@ Slab blocks at the tail are added to the free list (not discarded) so they can b
 
 Each free-list mutation is two `BStack` calls: write the next-pointer into the block, then update `free_head` in the header.  A crash between the two calls leaks the block being added or removed but leaves the rest of the free list intact.  No recovery scan is required on reopen.
 
+#### Constructors
+
+| Constructor                                    | Stack         | Effect                                                                                                          |
+|------------------------------------------------|---------------|-----------------------------------------------------------------------------------------------------------------|
+| `SlabBStackAllocator::new(stack, block_size)`  | **empty**     | Writes the 48-byte allocator header; fails with `InvalidInput` if the stack already has data.                   |
+| `SlabBStackAllocator::open(stack, block_size)` | **non-empty** | Reads and validates the stored header; fails with `InvalidInput` if the stack is empty or information mismatch. |
+
 #### Example
 
 ```rust
 use bstack::{BStack, BStackAllocator, SlabBStackAllocator};
 
-let alloc = SlabBStackAllocator::new(BStack::open("data.bstack")?, 64)?;
+// First run: initialise a fresh empty stack.
+let stack = BStack::open("data.bstack")?;
+let alloc = SlabBStackAllocator::new(stack, 64)?;
 
 let a = alloc.alloc(48)?;
 let b = alloc.alloc(48)?;
@@ -842,7 +851,11 @@ alloc.dealloc(a)?;        // returned to free list
 let c = alloc.alloc(32)?; // reuses a's slot
 assert_eq!(c.start(), a.start());
 
-let stack = alloc.into_stack();
+let _ = alloc.into_stack();
+
+// Subsequent runs: reopen the existing stack.
+let stack = BStack::open("data.bstack")?;
+let alloc = SlabBStackAllocator::open(stack, 64)?;
 ```
 
 ### `DebugCheckingAllocator` (`alloc` feature)

@@ -372,6 +372,8 @@
 //!   exactly `block_size` bytes with no per-block header or footer; freed
 //!   blocks are tracked via an intrusive singly-linked free list stored in
 //!   the first 8 bytes of each free block.  O(1) alloc and dealloc.
+//!   Use [`SlabBStackAllocator::new`] to initialise an empty stack and
+//!   [`SlabBStackAllocator::open`] to reopen an existing one.
 //!   Requires both `alloc` and `set` features.
 //!
 //! * [`DebugCheckingAllocator`] — Debug/test wrapper around any
