@@ -777,7 +777,7 @@ alloc.dealloc_bulk(&slices)?;
 let stack = alloc.into_stack();
 ```
 
-### `SlabBStackAllocator` (`alloc + set` features)
+### `SlabBStackAllocator` (`alloc + set` features) *(Experimental)*
 
 A fixed-block slab allocator.  All blocks in the arena are exactly `block_size`
 bytes (must be ≥ 8) with **no** per-block header or footer.  Freed blocks form
