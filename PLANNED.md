@@ -244,3 +244,50 @@ The same change applies to the corresponding methods on `BStackGuardedSlice`, an
 
 - Should `writer` and `writer_at` also require `&mut self`, given that they return a `BStackSliceWriter` rather than performing any mutation themselves? Requiring `&mut self` here is consistent with the general principle but may feel overly strict for a constructor that merely captures the slice.
 - `BStackSliceWriter` is currently `Copy`. If `writer` requires `&mut self`, obtaining multiple writers from the same slice would require copying the slice first. Should `BStackSliceWriter` remain `Copy`, or should it be non-`Copy` to better reflect exclusive-write intent?
+
+---
+
+## Adding `CheckedSlabBStackAllocator` for crash-recoverable slab allocation
+
+**Feature flag:** `alloc` + `set`
+**Breaking change:** No (additive; new type only)
+
+### Motivation
+
+`SlabBStackAllocator` carries **no per-block metadata**, which means a crash leaves no way to distinguish live blocks from freed ones and offers no defence against double-free. `CheckedSlabBStackAllocator` adds an 8-byte overhead field to every block: zero when freed, non-zero when in use. This makes leaked blocks on crash recoverable by a linear scan and catches double-free at runtime before any list corruption occurs.
+
+### Design
+
+Introduce `CheckedSlabBStackAllocator` in `src/alloc/checked_slab.rs`, implementing `BStackSliceAllocator`.
+
+```rust
+pub struct CheckedSlabBStackAllocator {
+    stack: BStack,
+    block_size: u64, // must be ≥ 16 (8 overhead + 8 minimum usable); never changes after init
+}
+```
+
+The on-disk layout mirrors `SlabBStackAllocator` (same header structure, different magic, e.g. `ALCK\x00\x01\x00\x00`). Every block in the arena has an 8-byte overhead prefix:
+
+```text
+[ overhead(8) | data ... ]
+```
+
+The overhead field encodes block state:
+
+| Value | Meaning |
+|---|---|
+| `0x0000_0000_0000_0000` | Block is free. `data[0..8]` holds the next-free offset (little-endian `u64`, sentinel `u64::MAX`).      |
+| `0x8NNN_NNNN_NNNN_NNNN` | Block is in use; `NNN_NNNN_NNNN_NNNN` is the allocation size in number of blocks; high bit is always 1. |
+
+Note: due to the fact that the minimum block size is 16 bytes, the maximum allocation size in number of blocks is 2^63 / 16 = 2^59 blocks, which means the 2nd-5th hex digits of the overhead are always zero. They may be used in the future for additional metadata if needed.
+
+`block_size` covers the full block including the 8-byte overhead. The slice returned to the caller covers `data` only, i.e. `block_size − 8` bytes per slab block.
+
+**`alloc(len)`:** Compute the number of blocks needed as `ceil((len + 8) / block_size)`. Pop the required count from the free list (verifying each overhead is zero; return an error on mismatch), write the overhead as `(num_blocks | 0x8000_0000_0000_0000)`, zero `data[0..8]`, and update the header. Fall back to tail extension if the free list is insufficient.
+
+**`dealloc(slice)`:** Read the overhead. If the high bit is clear (overhead is zero), the block is already free — return a double-free error without modifying the list. Otherwise do similar processing as `dealloc` of `SlabBStackAllocator`.
+
+**`realloc`:** Same policy as `SlabBStackAllocator` with overhead updated on size changes.
+
+**Crash recovery:** On open, scan the arena linearly. Any block whose overhead is non-zero and whose high bit is set is live; any block whose overhead is zero is free. A scan can reconstruct a valid free list from scratch if needed.
