@@ -335,25 +335,38 @@ impl SlabBStackAllocator {
                     )
                 })?)
                 .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "next block offset overflows u64")
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "next block offset overflows u64",
+                    )
                 })?;
             let off = usize::try_from(i.checked_mul(self.block_size).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "free-list offset overflows u64")
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "free-list offset overflows u64",
+                )
             })?)
             .map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidInput, "free-list offset overflows usize")
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "free-list offset overflows usize",
+                )
             })?;
             buf[off..off + 8].copy_from_slice(&next.to_le_bytes());
         }
-        let last_off = usize::try_from((count - 1).checked_mul(self.block_size).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "last free-list offset overflows u64")
-        })?)
-        .map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "last free-list offset overflows usize",
-            )
-        })?;
+        let last_off =
+            usize::try_from((count - 1).checked_mul(self.block_size).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "last free-list offset overflows u64",
+                )
+            })?)
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "last free-list offset overflows usize",
+                )
+            })?;
         buf[last_off..last_off + 8].copy_from_slice(&old_head);
         self.stack.set(first_block, buf)?;
         self.stack
@@ -446,11 +459,17 @@ impl BStackAllocator for SlabBStackAllocator {
 
         let n_blocks = self.blocks_needed(slice.len());
         let backing_size = n_blocks.checked_mul(self.block_size).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "deallocation size overflows u64")
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "deallocation size overflows u64",
+            )
         })?;
         let current_tail = self.stack.len()?;
         let slice_end = slice.start().checked_add(backing_size).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "deallocation end offset overflows u64")
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "deallocation end offset overflows u64",
+            )
         })?;
 
         if slice.len() > self.block_size && slice_end == current_tail {
@@ -501,17 +520,21 @@ impl BStackAllocator for SlabBStackAllocator {
         }
 
         let old_backing = old_n.checked_mul(self.block_size).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "old allocation size overflows u64")
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "old allocation size overflows u64",
+            )
         })?;
         let new_backing = new_n.checked_mul(self.block_size).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "new allocation size overflows u64")
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "new allocation size overflows u64",
+            )
         })?;
         let current_tail = self.stack.len()?;
-        let is_tail = slice
-            .start()
-            .checked_add(old_backing)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "tail check overflows u64"))?
-            == current_tail;
+        let is_tail = slice.start().checked_add(old_backing).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "tail check overflows u64")
+        })? == current_tail;
 
         if is_tail {
             if new_n > old_n {
