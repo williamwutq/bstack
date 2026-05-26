@@ -1,6 +1,9 @@
 use super::{BStackAllocator, BStackBulkAllocator, BStackSlice};
 use crate::BStack;
+use std::cell::Cell;
+use std::fmt;
 use std::io;
+use std::marker::PhantomData;
 
 const ALGT_MAGIC: [u8; 8] = *b"ALGT\x00\x01\x01\x00";
 const ALGT_MAGIC_PREFIX: [u8; 6] = *b"ALGT\x00\x01";
@@ -108,8 +111,35 @@ const NODE_RIGHT_OFF: u64 = 24;
 ///   is lost — only allocatable space.  A linear arena scan would recover them
 ///   but GhostTree carries no per-block `is_free` flag, making such a scan
 ///   unreliable; the leak is therefore accepted by design.
+///
+/// # Thread safety
+///
+/// `GhostTreeBstackAllocator` is **`Send`** — ownership can be transferred to
+/// another thread — but **not `Sync`**.  All allocator operations take `&self`
+/// and mutate the on-disk AVL tree through `BStack`; concurrent shared access
+/// from multiple threads would race on that state.  Each instance must be used
+/// from at most one thread at a time.
+///
+/// ```
+/// fn assert_send<T: Send>() {}
+/// assert_send::<bstack::GhostTreeBstackAllocator>();
+/// ```
+///
+/// ```compile_fail
+/// fn assert_sync<T: Sync>() {}
+/// assert_sync::<bstack::GhostTreeBstackAllocator>();
+/// ```
 pub struct GhostTreeBstackAllocator {
     stack: BStack,
+    _not_sync: PhantomData<Cell<()>>,
+}
+
+impl fmt::Debug for GhostTreeBstackAllocator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GhostTreeBstackAllocator")
+            .field("stack", &self.stack)
+            .finish_non_exhaustive()
+    }
 }
 
 impl GhostTreeBstackAllocator {
@@ -135,7 +165,10 @@ impl GhostTreeBstackAllocator {
             stack.extend(ARENA_START)?;
             stack.set(MAGIC_OFFSET, ALGT_MAGIC)?;
             // ROOT_OFFSET is zeroed by extend — null root pointer.
-            return Ok(Self { stack });
+            return Ok(Self {
+                stack,
+                _not_sync: PhantomData,
+            });
         }
 
         if size < ARENA_START {
@@ -165,7 +198,10 @@ impl GhostTreeBstackAllocator {
             stack.extend(32 - remainder)?;
         }
 
-        let this = Self { stack };
+        let this = Self {
+            stack,
+            _not_sync: PhantomData,
+        };
         this.coalesce_and_rebalance()?;
         Ok(this)
     }

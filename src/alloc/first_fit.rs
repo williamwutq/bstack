@@ -1,6 +1,9 @@
 use super::{BStackAllocator, BStackSlice};
 use crate::BStack;
+use std::cell::Cell;
+use std::fmt;
 use std::io;
+use std::marker::PhantomData;
 
 /// Full magic for FirstFitBStackAllocator
 #[cfg(feature = "set")]
@@ -81,8 +84,21 @@ const ALFF_MAGIC_PREFIX: [u8; 6] = *b"ALFF\x00\x01";
 ///
 /// # Thread safety
 ///
-/// `FirstFitBStackAllocator` is **neither `Send` nor `Sync`**.  Each instance
-/// must be confined to one thread.
+/// `FirstFitBStackAllocator` is **`Send`** — ownership can be transferred to
+/// another thread — but **not `Sync`**.  All allocator operations take `&self`
+/// and mutate the on-disk free list through `BStack`; concurrent shared access
+/// from multiple threads would race on that state.  Each instance must be used
+/// from at most one thread at a time.
+///
+/// ```
+/// fn assert_send<T: Send>() {}
+/// assert_send::<bstack::FirstFitBStackAllocator>();
+/// ```
+///
+/// ```compile_fail
+/// fn assert_sync<T: Sync>() {}
+/// assert_sync::<bstack::FirstFitBStackAllocator>();
+/// ```
 ///
 /// # Feature flags
 ///
@@ -116,6 +132,16 @@ const ALFF_MAGIC_PREFIX: [u8; 6] = *b"ALFF\x00\x01";
 #[cfg(feature = "set")]
 pub struct FirstFitBStackAllocator {
     stack: BStack,
+    _not_sync: PhantomData<Cell<()>>,
+}
+
+#[cfg(feature = "set")]
+impl fmt::Debug for FirstFitBStackAllocator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FirstFitBStackAllocator")
+            .field("stack", &self.stack)
+            .finish_non_exhaustive()
+    }
 }
 
 #[cfg(feature = "set")]
@@ -155,7 +181,10 @@ impl FirstFitBStackAllocator {
                 .copy_from_slice(&ALFF_MAGIC);
             // flags, _reserved, free_head remain zero
             stack.push(hdr)?;
-            return Ok(Self { stack });
+            return Ok(Self {
+                stack,
+                _not_sync: PhantomData,
+            });
         }
         // Validate header
         let stack_len = stack.len()?;
@@ -190,7 +219,10 @@ impl FirstFitBStackAllocator {
                 recovery_needed = true;
             }
         }
-        let alloc = Self { stack };
+        let alloc = Self {
+            stack,
+            _not_sync: PhantomData,
+        };
         if recovery_needed {
             alloc.recovery()?;
         }

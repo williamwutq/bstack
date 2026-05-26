@@ -354,19 +354,21 @@
 //! * [`LinearBStackAllocator`] — reference bump allocator that appends regions
 //!   sequentially.  `realloc` is O(1) for the tail allocation and returns
 //!   `Unsupported` for non-tail slices.  `dealloc` reclaims the tail via
-//!   [`BStack::discard`]; non-tail deallocations are a no-op.  Every operation
-//!   maps to exactly one [`BStack`] call and is crash-safe by inheritance.
-//!   Implements [`BStackAllocator`] and [`BStackBulkAllocator`].
+//!   [`BStack::discard`] (or [`BStack::try_discard`] with `atomic`); non-tail
+//!   deallocations are a no-op.  Every operation maps to exactly one [`BStack`]
+//!   call and is crash-safe by inheritance.  `Send` in all configurations;
+//!   also `Sync` with the `atomic` feature.  Implements [`BStackAllocator`]
+//!   and [`BStackBulkAllocator`].
 //!
-//! * [`FirstFitBStackAllocator`] — Experimental: a persistent first-fit free-list allocator
+//! * [`FirstFitBStackAllocator`] — A persistent first-fit free-list allocator
 //!   that reuses freed regions to prevent unbounded file growth.  Requires both
-//!   `alloc` and `set` features.
+//!   `alloc` and `set` features.  `Send` but not `Sync`.
 //!
 //! * [`GhostTreeBstackAllocator`] — A pure-AVL general-purpose allocator with
 //!   zero-overhead live allocations.  Free blocks store their AVL node inline,
 //!   and the tree is keyed on `(size, address)` for best-fit allocation.
 //!   Provides O(log n) allocation and deallocation with crash recovery through
-//!   tree rebalancing on mount.
+//!   tree rebalancing on mount.  `Send` but not `Sync`.
 //!
 //! * [`SlabBStackAllocator`] — **Experimental.** Fixed-block slab allocator.  All blocks are
 //!   exactly `block_size` bytes with no per-block header or footer; freed

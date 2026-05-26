@@ -527,21 +527,36 @@ Constructed via `BStackSlice::reader()` or `BStackSlice::reader_at(offset)`.
 
 The reference bump allocator.  Regions are appended sequentially to the tail.
 
-| Operation              | Underlying call   | Crash-safe |
-|------------------------|-------------------|------------|
-| `alloc`                | `BStack::extend`  | yes        |
-| `alloc_bulk`           | `BStack::extend`  | yes        |
-| `realloc` grow         | `BStack::extend`  | yes        |
-| `realloc` shrink       | `BStack::discard` | yes        |
-| `dealloc` (tail)       | `BStack::discard` | yes        |
-| `dealloc` (non-tail)   | no-op             | yes        |
-| `dealloc_bulk` (tail)  | `BStack::discard` | yes        |
+| Operation              | Without `atomic`  | With `atomic`          | Crash-safe |
+|------------------------|-------------------|------------------------|------------|
+| `alloc`                | `BStack::extend`  | `BStack::extend`       | yes        |
+| `alloc_bulk`           | `BStack::extend`  | `BStack::extend`       | yes        |
+| `realloc` grow         | `BStack::extend`  | `BStack::try_extend`   | yes        |
+| `realloc` shrink       | `BStack::discard` | `BStack::try_discard`  | yes        |
+| `dealloc` (tail)       | `BStack::discard` | `BStack::try_discard`  | yes        |
+| `dealloc` (non-tail)   | no-op             | no-op                  | yes        |
+| `dealloc_bulk` (tail)  | `BStack::discard` | `BStack::try_discard`  | yes        |
 
-`realloc` returns `io::ErrorKind::Unsupported` for non-tail slices.
+`realloc` returns `io::ErrorKind::Unsupported` for non-tail slices.  With the
+`atomic` feature, `realloc` also returns `Unsupported` when another thread
+races to move the tail first — identical semantics to the non-tail case.
 
-### Experimental `FirstFitBStackAllocator` (`alloc + set` features)
+#### Thread safety
 
-Experimental: A persistent first-fit free-list allocator.  Freed regions are tracked on disk
+Without the `atomic` feature, `LinearBStackAllocator` is **`Send`** but **not
+`Sync`**: `realloc` and `dealloc` read the tail length and modify it in two
+separate steps, creating a TOCTOU race under concurrent `&self` access.
+
+With the `atomic` feature, `LinearBStackAllocator` is **`Send + Sync`**.
+`alloc` and `alloc_bulk` use `extend`, which is serialized by `BStack`'s write
+lock and returns a distinct region to each caller.  `realloc` uses
+`try_extend`/`try_discard` and `dealloc`/`dealloc_bulk` use `try_discard`:
+each fuses the tail-length check and the modification into a single locked
+step, so concurrent calls cannot corrupt each other.
+
+### `FirstFitBStackAllocator` (`alloc + set` features)
+
+A persistent first-fit free-list allocator.  Freed regions are tracked on disk
 in a doubly-linked intrusive free list and reused for future allocations, so
 the file does not grow without bound.
 
@@ -601,6 +616,13 @@ next `FirstFitBStackAllocator::new`, if `recovery_needed` is set, a single
 linear scan of the arena rebuilds the free list from the `is_free` flags in
 block headers — stored pointer values are not trusted.  Any partial tail block
 is also truncated.
+
+#### Thread safety
+
+`FirstFitBStackAllocator` is **`Send`** but **not `Sync`**.  Ownership can be
+transferred to another thread, but concurrent `&self` access from multiple
+threads would race on the on-disk free list without any allocator-level lock.
+Each instance must be used from at most one thread at a time.
 
 #### Example
 
@@ -754,6 +776,13 @@ to `dealloc_bulk`, adjacent slices are merged and freed as a single operation
 No write-ahead log, no checksums. A crash during `dealloc` before the AVL
 insert permanently loses that block. A crash during rotation leaves the tree
 imbalanced — corrected on the next `GhostTreeBstackAllocator::new`.
+
+#### Thread safety
+
+`GhostTreeBstackAllocator` is **`Send`** but **not `Sync`**.  Ownership can be
+transferred to another thread, but concurrent `&self` access from multiple
+threads would race on the on-disk AVL tree without any allocator-level lock.
+Each instance must be used from at most one thread at a time.
 
 #### Example
 
