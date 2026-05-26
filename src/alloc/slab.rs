@@ -168,17 +168,17 @@ impl SlabBStackAllocator {
 
     /// Open an existing `SlabBStackAllocator` from a non-empty `stack`.
     ///
-    /// Validates the `ALSL 0.1.x` magic prefix and checks that the stored
-    /// `block_size` matches the provided value.
+    /// Validates the `ALSL 0.1.x` magic prefix and reads `block_size` from
+    /// the stored header.
     ///
     /// # Errors
     ///
     /// * [`io::ErrorKind::InvalidInput`] — `stack` is empty (use
     ///   [`SlabBStackAllocator::new`] to create a new allocator).
     /// * [`io::ErrorKind::InvalidData`] — wrong magic, invalid stored
-    ///   `block_size`, `block_size` mismatch, or invalid `free_head`.
+    ///   `block_size`, or invalid `free_head`.
     /// * Any [`io::Error`] propagated from the underlying [`BStack`] operations.
-    pub fn open(stack: BStack, block_size: u64) -> io::Result<Self> {
+    pub fn open(stack: BStack) -> io::Result<Self> {
         if stack.is_empty()? {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -217,13 +217,6 @@ impl SlabBStackAllocator {
                 "stored block_size is too large for this platform",
             ));
         }
-        if block_size != stored_block_size {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("block_size mismatch: stored {stored_block_size}, provided {block_size}"),
-            ));
-        }
-
         let stored_free_head = u64::from_le_bytes(header[16..24].try_into().unwrap());
         if stored_free_head != Self::SENTINEL
             && (stored_free_head < Self::ARENA_START
@@ -652,7 +645,7 @@ mod tests {
     fn open_rejects_empty_stack() {
         let (stack, path) = empty_stack();
         let _g = Guard(path);
-        let err = SlabBStackAllocator::open(stack, 8).unwrap_err();
+        let err = SlabBStackAllocator::open(stack).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
     }
 
@@ -662,7 +655,7 @@ mod tests {
         let _g = Guard(path.clone());
         stack.push([0u8; 24]).unwrap(); // only 24 bytes, need >= 48
         drop(stack);
-        let err = SlabBStackAllocator::open(BStack::open(&path).unwrap(), 8).unwrap_err();
+        let err = SlabBStackAllocator::open(BStack::open(&path).unwrap()).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidData);
     }
 
@@ -672,7 +665,7 @@ mod tests {
         let _g = Guard(path.clone());
         stack.push([0u8; 48]).unwrap(); // 48 bytes of zeros — no ALSL magic
         drop(stack);
-        let err = SlabBStackAllocator::open(BStack::open(&path).unwrap(), 8).unwrap_err();
+        let err = SlabBStackAllocator::open(BStack::open(&path).unwrap()).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidData);
     }
 
@@ -686,16 +679,7 @@ mod tests {
         hdr[32..40].copy_from_slice(&1u64.to_le_bytes());
         stack.push(hdr).unwrap();
         drop(stack);
-        let err = SlabBStackAllocator::open(BStack::open(&path).unwrap(), 1).unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::InvalidData);
-    }
-
-    #[test]
-    fn open_rejects_block_size_mismatch() {
-        let (stack, path) = empty_stack();
-        let _g = Guard(path.clone());
-        SlabBStackAllocator::new(stack, 8).unwrap();
-        let err = SlabBStackAllocator::open(BStack::open(&path).unwrap(), 16).unwrap_err();
+        let err = SlabBStackAllocator::open(BStack::open(&path).unwrap()).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidData);
     }
 
@@ -707,7 +691,7 @@ mod tests {
         let reopen = BStack::open(&path).unwrap();
         reopen.extend(1).unwrap();
         drop(reopen);
-        let err = SlabBStackAllocator::open(BStack::open(&path).unwrap(), 8).unwrap_err();
+        let err = SlabBStackAllocator::open(BStack::open(&path).unwrap()).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidData);
     }
 
@@ -716,7 +700,7 @@ mod tests {
         let (stack, path) = empty_stack();
         let _g = Guard(path.clone());
         SlabBStackAllocator::new(stack, 32).unwrap();
-        let alloc = SlabBStackAllocator::open(BStack::open(&path).unwrap(), 32).unwrap();
+        let alloc = SlabBStackAllocator::open(BStack::open(&path).unwrap()).unwrap();
         assert_eq!(alloc.block_size(), 32);
     }
 
@@ -808,7 +792,7 @@ mod tests {
         s.write(b"hello").unwrap();
         drop(alloc);
 
-        let alloc2 = SlabBStackAllocator::open(BStack::open(&path).unwrap(), 16).unwrap();
+        let alloc2 = SlabBStackAllocator::open(BStack::open(&path).unwrap()).unwrap();
         let s2 = unsafe { crate::alloc::BStackSlice::from_raw_parts(&alloc2, offset, 5) };
         assert_eq!(s2.read().unwrap(), b"hello");
     }

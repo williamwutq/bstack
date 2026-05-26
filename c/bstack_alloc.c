@@ -3084,8 +3084,7 @@ slab_bstack_allocator_t *slab_bstack_allocator_new(bstack_t *bs,
     return a;
 }
 
-slab_bstack_allocator_t *slab_bstack_allocator_open(bstack_t *bs,
-                                                     uint64_t block_size)
+slab_bstack_allocator_t *slab_bstack_allocator_open(bstack_t *bs)
 {
     slab_bstack_allocator_t *a;
     int is_empty;
@@ -3108,7 +3107,6 @@ slab_bstack_allocator_t *slab_bstack_allocator_open(bstack_t *bs,
 
     stored_block_size = read_le64(header + 8);
     if (stored_block_size < SLAB_MIN_BLOCK_SIZE) { errno = EINVAL; return NULL; }
-    if (block_size != stored_block_size) { errno = EINVAL; return NULL; }
 
     {
         uint64_t stored_free_head = read_le64(header + 16);

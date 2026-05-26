@@ -359,21 +359,21 @@ mod alloc_fuzz_tests {
         if bs.is_empty().unwrap() {
             SlabBStackAllocator::new(bs, 8)
         } else {
-            SlabBStackAllocator::open(bs, 8)
+            SlabBStackAllocator::open(bs)
         }
     });
     fuzz_suite!(slab_16, |bs: BStack| {
         if bs.is_empty().unwrap() {
             SlabBStackAllocator::new(bs, 16)
         } else {
-            SlabBStackAllocator::open(bs, 16)
+            SlabBStackAllocator::open(bs)
         }
     });
     fuzz_suite!(slab_64, |bs: BStack| {
         if bs.is_empty().unwrap() {
             SlabBStackAllocator::new(bs, 64)
         } else {
-            SlabBStackAllocator::open(bs, 64)
+            SlabBStackAllocator::open(bs)
         }
     });
 

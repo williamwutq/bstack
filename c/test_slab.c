@@ -319,7 +319,7 @@ static int test_persist_reopen(void)
     }
     {
         bstack_t *bs = bstack_open(tmp); CHECK(bs);
-        slab_bstack_allocator_t *a = slab_bstack_allocator_open(bs, 16);
+        slab_bstack_allocator_t *a = slab_bstack_allocator_open(bs);
         CHECK(a);
         uint8_t rbuf[12];
         CHECK(bstack_get(bstack_allocator_stack((bstack_allocator_t *)a),
@@ -358,12 +358,6 @@ static int test_block_size_mismatch(void)
         slab_bstack_allocator_t *a = slab_bstack_allocator_new(bs, 32);
         CHECK(a);
         bstack_close(slab_bstack_allocator_into_stack(a));
-    }
-    {
-        bstack_t *bs = bstack_open(tmp); CHECK(bs);
-        slab_bstack_allocator_t *a = slab_bstack_allocator_open(bs, 16);
-        CHECK(a == NULL); /* mismatch must fail */
-        bstack_close(bs);
     }
     sl_unlink(tmp); return 0;
 }
@@ -577,7 +571,7 @@ static int fuzz_reopen(uint64_t block_size)
     for (session = 0; session < FUZZ_SESSIONS && ret == 0; session++) {
         bstack_t *bs = bstack_open(tmp);
         if (!bs) { ret = -1; break; }
-        slab_bstack_allocator_t *a = slab_bstack_allocator_open(bs, block_size);
+        slab_bstack_allocator_t *a = slab_bstack_allocator_open(bs);
         if (!a) { bstack_close(bs); ret = -1; break; }
         bstack_allocator_t *al = (bstack_allocator_t *)a;
 

@@ -725,16 +725,15 @@ slab_bstack_allocator_t *slab_bstack_allocator_new(bstack_t *bs,
 /*
  * Open an existing slab_bstack_allocator_t from a non-empty bs.
  *
- * Validates the ALSL 0.1.x magic prefix and checks that the stored block_size
- * matches the provided value.
+ * Validates the ALSL 0.1.x magic prefix and reads block_size from the stored
+ * header.
  *
  * Returns NULL on failure (errno = EINVAL if bs is empty, the stack is too
- * short, magic is wrong, or block_size mismatches; ENOMEM on allocation
- * failure; or the errno from any failing bstack operation).
+ * short, magic is wrong, or the stored block_size is invalid; ENOMEM on
+ * allocation failure; or the errno from any failing bstack operation).
  * Cast the result to bstack_allocator_t * to use the generic interface.
  */
-slab_bstack_allocator_t *slab_bstack_allocator_open(bstack_t *bs,
-                                                     uint64_t block_size);
+slab_bstack_allocator_t *slab_bstack_allocator_open(bstack_t *bs);
 
 /*
  * Free the allocator wrapper without closing the underlying bstack.
