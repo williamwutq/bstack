@@ -3114,7 +3114,10 @@ slab_bstack_allocator_t *slab_bstack_allocator_open(bstack_t *bs,
     }
 
     a = malloc(sizeof *a);
-    if (!a) return NULL;
+    if (!a) {
+        errno = ENOMEM;
+        return NULL;
+    }
 
     a->base.vtbl      = &slab_allocator_vtbl;
     a->base.bulk_vtbl = NULL;
