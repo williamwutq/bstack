@@ -19,6 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`BStackSlice::empty(allocator)` / `bstack_slice_empty`** (`alloc` feature): Constructs a zero-length slice anchored at offset 0.
 
+- **`Debug` impl for `GhostTreeBstackAllocator` and `FirstFitBStackAllocator`** (`alloc` / `alloc` + `set` features): Both allocator types now implement `fmt::Debug`.
+
 ### Changed
 
 - **`LinearBStackAllocator` is `Send + Sync` with the `atomic` feature** (`alloc` feature): Without `atomic`, `LinearBStackAllocator` is `Send` but not `Sync` — `realloc` and `dealloc` read the tail length and modify it in two separate steps, which is a TOCTOU race under concurrent `&self` access.  With the `atomic` feature, `LinearBStackAllocator` gains `Sync`: `realloc` is reimplemented with `BStack::try_extend`/`try_discard` (fusing the check and the modify into one locked step), `dealloc` and `dealloc_bulk` use `BStack::try_discard` (a `false` return silently skips the discard, matching existing non-tail no-op semantics).  `alloc` and `alloc_bulk` are unchanged — a single `extend` is already serialized by `BStack`'s write lock.  The `PhantomData<Cell<()>>` field opts out of `Sync` structurally; `#[cfg(feature = "atomic")] unsafe impl Sync` re-enables it when the atomic implementations are in effect.  Documentation updated across type-level docs, module overview, crate overview, and README.

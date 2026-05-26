@@ -1,6 +1,7 @@
 use super::{BStackAllocator, BStackBulkAllocator, BStackSlice};
 use crate::BStack;
 use std::cell::Cell;
+use std::fmt;
 use std::io;
 use std::marker::PhantomData;
 
@@ -156,6 +157,14 @@ macro_rules! read_buf_le {
 pub struct GhostTreeBstackAllocator {
     stack: BStack,
     _not_sync: PhantomData<Cell<()>>,
+}
+
+impl fmt::Debug for GhostTreeBstackAllocator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GhostTreeBstackAllocator")
+            .field("stack", &self.stack)
+            .finish_non_exhaustive()
+    }
 }
 
 impl GhostTreeBstackAllocator {

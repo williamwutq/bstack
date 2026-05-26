@@ -1,6 +1,7 @@
 use super::{BStackAllocator, BStackSlice};
 use crate::BStack;
 use std::cell::Cell;
+use std::fmt;
 use std::io;
 use std::marker::PhantomData;
 
@@ -132,6 +133,15 @@ const ALFF_MAGIC_PREFIX: [u8; 6] = *b"ALFF\x00\x01";
 pub struct FirstFitBStackAllocator {
     stack: BStack,
     _not_sync: PhantomData<Cell<()>>,
+}
+
+#[cfg(feature = "set")]
+impl fmt::Debug for FirstFitBStackAllocator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FirstFitBStackAllocator")
+            .field("stack", &self.stack)
+            .finish_non_exhaustive()
+    }
 }
 
 #[cfg(feature = "set")]
