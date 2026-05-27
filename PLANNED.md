@@ -32,7 +32,7 @@ Furthermore, `alloc`, `realloc`, and `dealloc` in the `BStackAllocator` trait do
 
 ---
 
-## Introducing a newtype handle for default allocators
+## Introducing a newtype handle for default allocators (0.4.0)
 
 **Breaking change:** Yes
 
@@ -74,7 +74,7 @@ This is a larger breaking change than the handle type alone, as it touches every
 
 ---
 
-## Optimizing `FirstFitBStackAllocator` with atomic feature
+## Optimizing `FirstFitBStackAllocator` with atomic feature (0.4.0)
 
 **Feature flag:** `atomic`
 **Breaking change:** No (if added as optional)
@@ -223,7 +223,7 @@ Crash-safety depends on three real barriers, in order: stage→arm, arm→in-pla
 
 ---
 
-## Requiring `&mut BStackSlice` for mutation
+## Requiring `&mut BStackSlice` for mutation (0.4.0)
 
 **Feature flag:** `set`
 **Breaking change:** Yes
