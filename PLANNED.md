@@ -22,6 +22,12 @@ For context, accepted optimizations like caching and locked region have demonstr
 
 Reference: https://github.com/williamwutq/bstack/pull/3
 
+### Adding a singly-linked `BStackSList<T>`
+
+Reasons:
+
+A singly-linked variant saves 8 bytes per node by omitting `prev_ptr`, but any workload that reaches for a disk-backed linked list is already paying the cost of allocator round-trips and random-access I/O per element. An 8-byte savings per node is negligible against those overheads, and the restriction to forward-only traversal eliminates `push_front`-with-O(1)-`pop_back`, bidirectional cursors, and `split_off` without a full scan. `BStackList<T>` covers all singly-linked use cases with no meaningful extra cost, so a separate singly-linked type adds complexity without benefit.
+
 ### Making `BStackAllocator::realloc` and `dealloc` `unsafe fn`
 
 Reasons:
@@ -156,6 +162,116 @@ impl<'a, T: bytemuck::Pod, A: BStackSliceAllocator> BStackVec<'a, T, A> {
 - **Error handling:** Should methods return `Result` for all operations, or should some (e.g., `len()`, `capacity()`) be infallible? Returning `Result` allows for better error propagation but may be more verbose for simple accessors.
 - **Initialization of new elements:** When growing the vector, should new elements be zero-initialized, left uninitialized (i.e. `MaybeUninit`), or should we require `T` to be `Default` and call `default()`? Zero-initialization is safer and guranteed for newly allocated space, but may be unnecessary overhead for some types.
 - **Zeroing on deallocation:** Should empty parts of the vector be zeroed on deallocation for security, or should this be left to the caller? Zeroing adds overhead but can prevent data leakage.
+
+---
+
+## Adding `BStackList<T>` for typed doubly-linked list storage
+
+**Feature flag:** `alloc` + `set`
+**Breaking change:** No (additive; new type only)
+
+### Motivation
+
+`BStackVec<T>` provides contiguous storage with O(1) random access, but is ill-suited for workloads that require frequent insertion or removal at both ends or at arbitrary cursor positions without shifting elements. `BStackList<T>` provides a doubly-linked list backed by the allocator, mirroring the API of `std::collections::LinkedList<T>`. Because each node is a separate allocation, insertions and removals at any cursor position are O(1) with no element copying; the trade-off is O(n) forward traversal for indexing and higher per-element overhead compared to contiguous storage.
+
+### Design
+
+`BStackList<T>` stores a 32-byte header block and allocates one block per node through the backing `BStackSliceAllocator`.
+
+#### Header layout
+
+The list header is a single allocated block:
+
+```text
+[ magic[8] | len[8 LE] | head_ptr[8 LE] | tail_ptr[8 LE] ]
+```
+
+- `magic` identifies the block as a `BStackList` header (e.g. `BSLT\x00\x01\x00\x00`).
+- `len` is the number of elements currently in the list, stored as a little-endian `u64`.
+- `head_ptr` is the allocator offset of the first node, or `u64::MAX` when the list is empty.
+- `tail_ptr` is the allocator offset of the last node, or `u64::MAX` when the list is empty.
+
+#### Node layout
+
+Each node is a separate allocation:
+
+```text
+[ prev_ptr[8 LE] | next_ptr[8 LE] | data[size_of::<T>()] ]
+```
+
+- `prev_ptr` is the allocator offset of the previous node, or `u64::MAX` for the head.
+- `next_ptr` is the allocator offset of the next node, or `u64::MAX` for the tail.
+- `data` holds the element bytes. The same soundness requirements as `BStackVec<T>` apply: `T` must satisfy the chosen POD bound (see the `BStackVec<T>` section above).
+
+The minimum node allocation size is `16 + size_of::<T>()` bytes.
+
+#### Sound element bound
+
+Identical to `BStackVec<T>`: `T: bytemuck::Pod` is the recommended bound; the sealed-trait or unsafe-ops fallback applies if no external dependency is acceptable. If both `BStackVec<T>` and `BStackList<T>` are present under the same feature flag, the dependency is paid once.
+
+#### API surface
+
+The API mirrors `std::collections::LinkedList<T>` adapted for disk I/O:
+
+```rust
+impl<'a, T: bytemuck::Pod, A: BStackSliceAllocator> BStackList<'a, T, A> {
+    pub fn new(alloc: &'a A) -> io::Result<Self>;
+    pub unsafe fn from_raw_header_block(slice: BStackSlice<'a, A>) -> Self;
+
+    pub fn len(&self) -> io::Result<u64>;
+    pub fn is_empty(&self) -> io::Result<bool>;
+
+    pub fn front(&self) -> io::Result<Option<T>>;
+    pub fn back(&self) -> io::Result<Option<T>>;
+
+    pub fn push_front(&mut self, value: T) -> io::Result<()>;
+    pub fn push_back(&mut self, value: T) -> io::Result<()>;
+    pub fn pop_front(&mut self) -> io::Result<Option<T>>;
+    pub fn pop_back(&mut self) -> io::Result<Option<T>>;
+
+    pub fn clear(&mut self) -> io::Result<()>;
+    pub fn contains(&self, value: &T) -> io::Result<bool> where T: PartialEq;
+
+    pub fn append(&mut self, other: &mut Self) -> io::Result<()>;
+    pub fn split_off(&mut self, at: u64) -> io::Result<Self>;
+
+    pub fn iter(&self) -> io::Result<BStackListIter<'_, 'a, T, A>>;
+
+    pub fn cursor_front(&mut self) -> io::Result<BStackListCursor<'_, 'a, T, A>>;
+    pub fn cursor_back(&mut self) -> io::Result<BStackListCursor<'_, 'a, T, A>>;
+
+    pub unsafe fn raw_header_block(&self) -> BStackSlice<'a, A>;
+    pub fn dealloc(self) -> io::Result<()>;
+}
+```
+
+`BStackListCursor` mirrors the nightly `std::collections::linked_list::Cursor` API, giving O(1) insertion and removal at the cursor position:
+
+```rust
+impl<'list, 'a, T: bytemuck::Pod, A: BStackSliceAllocator> BStackListCursor<'list, 'a, T, A> {
+    pub fn index(&self) -> io::Result<Option<u64>>;
+    pub fn current(&self) -> io::Result<Option<T>>;
+    pub fn peek_next(&self) -> io::Result<Option<T>>;
+    pub fn peek_prev(&self) -> io::Result<Option<T>>;
+    pub fn move_next(&mut self) -> io::Result<()>;
+    pub fn move_prev(&mut self) -> io::Result<()>;
+    pub fn insert_before(&mut self, value: T) -> io::Result<()>;
+    pub fn insert_after(&mut self, value: T) -> io::Result<()>;
+    pub fn remove_current(&mut self) -> io::Result<Option<T>>;
+    pub fn replace_current(&mut self, value: T) -> io::Result<Option<T>>;
+    pub fn splice_before(&mut self, list: BStackList<'a, T, A>) -> io::Result<()>;
+    pub fn splice_after(&mut self, list: BStackList<'a, T, A>) -> io::Result<()>;
+}
+```
+
+### Open questions
+
+- **Dependency policy:** Should the Pod bound share the same optional feature flag as `BStackVec<T>` (e.g. a `pod` sub-flag)? If both types live under the same flag, the external dependency is paid once and both types are available together.
+- **Cursor stability:** `std::collections::LinkedList` cursors are only invalidated by structural mutations that pass through the cursor itself; in-memory Rust enforces this via the borrow checker. For disk-backed storage, external mutations (another process, or a second `BStackList` instance pointing to the same allocator) could silently invalidate a cursor's stored node offset. Document the contract clearly: cursors are only valid while no external structural mutation occurs, analogous to iterator invalidation rules in C++.
+- **`split_off` atomicity:** `split_off` must update the tail of the prefix list, the head of the suffix list, and the `len` of both — at least three block writes. Under the current pre-journaling model this is not crash-atomic. Consider deferring `split_off` until the journal from the crash-atomic `set` design is in place, or documenting the non-atomicity explicitly.
+- **`append` atomicity:** Similar concern — `append` rewires the tail of `self` to the head of `other`, zeros `other`'s header, and updates `len` of `self`. Three writes, not crash-atomic without journaling.
+- **`dealloc` behavior:** Should `dealloc` traverse and free all nodes before freeing the header, or only free the header, leaving orphaned node blocks? Traversing all nodes is O(n) but correct. Leaving orphans is a resource leak; a `CheckedSlabBStackAllocator` crash-recovery scan would eventually reclaim them, but `FirstFitBStackAllocator` would not. Require full traversal by default and document the cost.
+- **ZST policy:** `size_of::<T>() == 0` gives a zero-byte `data` field; each node is still a 16-byte allocation (two pointer fields). ZST lists function as linked counters. Decide whether to support or reject ZSTs at construction time, consistent with the policy chosen for `BStackVec<T>`.
 
 ---
 
