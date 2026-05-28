@@ -1,8 +1,10 @@
 use super::{BStackAllocator, BStackSlice};
 use crate::BStack;
+#[cfg(not(feature = "atomic"))]
 use std::cell::Cell;
 use std::fmt;
 use std::io;
+#[cfg(not(feature = "atomic"))]
 use std::marker::PhantomData;
 
 /// Full magic for FirstFitBStackAllocator
@@ -132,6 +134,7 @@ const ALFF_MAGIC_PREFIX: [u8; 6] = *b"ALFF\x00\x01";
 #[cfg(feature = "set")]
 pub struct FirstFitBStackAllocator {
     stack: BStack,
+    #[cfg(not(feature = "atomic"))]
     _not_sync: PhantomData<Cell<()>>,
 }
 
@@ -183,6 +186,7 @@ impl FirstFitBStackAllocator {
             stack.push(hdr)?;
             return Ok(Self {
                 stack,
+                #[cfg(not(feature = "atomic"))]
                 _not_sync: PhantomData,
             });
         }
@@ -221,6 +225,7 @@ impl FirstFitBStackAllocator {
         }
         let alloc = Self {
             stack,
+            #[cfg(not(feature = "atomic"))]
             _not_sync: PhantomData,
         };
         if recovery_needed {
