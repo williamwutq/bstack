@@ -639,10 +639,27 @@ is also truncated.
 
 #### Thread safety
 
-`FirstFitBStackAllocator` is **`Send`** but **not `Sync`**.  Ownership can be
-transferred to another thread, but concurrent `&self` access from multiple
-threads would race on the on-disk free list without any allocator-level lock.
-Each instance must be used from at most one thread at a time.
+`FirstFitBStackAllocator` is always **`Send`** — ownership can be transferred to
+another thread.
+
+Without the `atomic` feature it is **not `Sync`**: operations take `&self` and
+mutate the on-disk free list in several steps, so concurrent `&self` access from
+multiple threads would race on that state.  Use one instance from at most one
+thread at a time.
+
+With the `atomic` feature it is **`Send + Sync`**.  An internal
+`std::sync::Mutex` serializes the two compound operations that `BStack`'s own
+per-call write lock does not already make atomic: mutating the free list and
+extending/discarding the stack tail.  Operations that touch only caller-owned
+bytes inside an already-allocated block — growing in place within the existing
+block, or zeroing within the same alignment bucket — run without the lock.  The
+`recovery_needed` flag is updated with a compare-and-swap (no extra cost over the
+disk write it must perform anyway) and additionally rejects operating on a stack
+left in a needs-recovery state.
+
+Unlike `LinearBStackAllocator`, which uses optimistic `try_extend`/`try_discard`
+and reports a lost tail race as `Unsupported`, a contended `FirstFit` operation
+*blocks* on the mutex and proceeds once the lock is free.
 
 #### Example
 

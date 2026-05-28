@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **`FirstFitBStackAllocator` is `Send + Sync` with the `atomic` feature** (`alloc` + `set` features): Without `atomic`, `FirstFitBStackAllocator` remains `Send` but not `Sync` — operations mutate the on-disk free list in several steps, a data race under concurrent `&self` access. With the `atomic` feature it gains `Sync`: an internal `std::sync::Mutex` serializes the two compound operations not already made atomic by `BStack`'s per-call write lock — free-list mutation and stack extension/discard — while in-place writes within an already-allocated block (in-bucket grow, same-block zeroing) stay lock-free. The `recovery_needed` flag is now updated with a compare-and-swap (no extra cost over the disk write it performs regardless), which also rejects operating on a stack left in a needs-recovery state. Unlike `LinearBStackAllocator`'s optimistic `try_extend`/`try_discard` (which reports a lost tail race as `Unsupported`), a contended `FirstFit` operation blocks on the mutex. Structurally, the `#[cfg(not(feature = "atomic"))] PhantomData<Cell<()>>` field opts out of `Sync`; under `atomic` that field is replaced by the `Mutex`, which makes the type `Sync` without an `unsafe impl`. Documentation updated across type-level docs, module overview, crate overview, and README.
+
 ## [0.2.2] - 2026-05-26
 
 ### Added
