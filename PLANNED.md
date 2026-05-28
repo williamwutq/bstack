@@ -92,7 +92,7 @@ This is a larger breaking change than the handle type alone, as it touches every
 
 ---
 
-## Optimizing `FirstFitBStackAllocator` with atomic feature (0.4.0)
+## Optimizing `FirstFitBStackAllocator` with atomic feature
 
 **Feature flag:** `atomic`
 **Breaking change:** No (if added as optional)
