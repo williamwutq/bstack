@@ -33,10 +33,12 @@ LIB_SET_ATOMIC  = libbstack-set-atomic.a
 OBJ_SET_ATOMIC  = bstack-set-atomic.o
 
 # Alloc layer (bstack_alloc.h / bstack_alloc.c).
-LIB_ALLOC     = libbstack-alloc.a
-OBJ_ALLOC     = bstack_alloc.o
-LIB_ALLOC_SET = libbstack-alloc-set.a
-OBJ_ALLOC_SET = bstack_alloc-set.o
+LIB_ALLOC            = libbstack-alloc.a
+OBJ_ALLOC            = bstack_alloc.o
+LIB_ALLOC_SET        = libbstack-alloc-set.a
+OBJ_ALLOC_SET        = bstack_alloc-set.o
+LIB_ALLOC_SET_ATOMIC = libbstack-alloc-set-atomic.a
+OBJ_ALLOC_SET_ATOMIC = bstack_alloc-set-atomic.o
 
 # First-fit allocator test (requires BSTACK_FEATURE_SET).
 TEST_FF_BIN = test_first_fit$(EXE_EXT)
@@ -61,7 +63,7 @@ EXAMPLE_BINS  = $(addprefix ../examples/,$(addsuffix $(EXE_EXT),$(EXAMPLE_NAMES)
 HASHMAP_BIN   = ../examples/hashmap$(EXE_EXT)
 ATOMIC_BIN    = ../examples/atomic_ops$(EXE_EXT)
 
-.PHONY: all test test-set test-atomic test-set-atomic test-first-fit test-ghost-tree test-slab test-bytevec leaks clean alloc \
+.PHONY: all test test-set test-atomic test-set-atomic test-first-fit test-first-fit-atomic test-ghost-tree test-slab test-bytevec leaks clean alloc \
         example example-basic example-buffer_reuse example-journal \
         example-reading example-vec_store example-hashmap example-atomic_ops
 
@@ -98,10 +100,16 @@ $(OBJ_ALLOC): bstack_alloc.c bstack_alloc.h bstack.h
 $(OBJ_ALLOC_SET): bstack_alloc.c bstack_alloc.h bstack.h
 	$(CC) $(CFLAGS) -DBSTACK_FEATURE_SET -c -o $@ $<
 
+$(OBJ_ALLOC_SET_ATOMIC): bstack_alloc.c bstack_alloc.h bstack.h
+	$(CC) $(CFLAGS) -DBSTACK_FEATURE_SET -DBSTACK_FEATURE_ATOMIC -c -o $@ $<
+
 $(LIB_ALLOC): $(OBJ) $(OBJ_ALLOC)
 	ar rcs $@ $^
 
 $(LIB_ALLOC_SET): $(OBJ_SET) $(OBJ_ALLOC_SET)
+	ar rcs $@ $^
+
+$(LIB_ALLOC_SET_ATOMIC): $(OBJ_SET_ATOMIC) $(OBJ_ALLOC_SET_ATOMIC)
 	ar rcs $@ $^
 
 alloc: $(LIB_ALLOC)
@@ -123,6 +131,13 @@ $(TEST_FF_BIN): $(TEST_FF_OBJ) $(LIB_ALLOC_SET)
 
 test-first-fit: $(TEST_FF_BIN)
 	$(RUN)$(TEST_FF_BIN)
+
+# Same first-fit test compiled against the SET+ATOMIC alloc lib, exercising the
+# in-memory mutex and the bstack_cas path for recovery_needed.
+test-first-fit-atomic: $(LIB_ALLOC_SET_ATOMIC)
+	$(CC) $(CFLAGS) -DBSTACK_FEATURE_SET -DBSTACK_FEATURE_ATOMIC -c -o test_first_fit-atomic.o test_first_fit.c
+	$(CC) $(CFLAGS) -DBSTACK_FEATURE_SET -DBSTACK_FEATURE_ATOMIC -o test_first_fit-atomic$(EXE_EXT) test_first_fit-atomic.o -L. -lbstack-alloc-set-atomic -lpthread
+	$(RUN)test_first_fit-atomic$(EXE_EXT)
 
 $(TEST_GT_OBJ): test_ghost_tree.c bstack_alloc.h bstack.h
 	$(CC) $(CFLAGS) -DBSTACK_FEATURE_SET -c -o $@ $<
@@ -246,8 +261,10 @@ example: $(EXAMPLE_BINS) $(HASHMAP_BIN) $(ATOMIC_BIN)
 clean:
 	rm -f $(OBJ) $(TEST_OBJ) $(OBJ_SET) $(LIB) $(LIB_SET) $(TEST_BIN) \
 	      $(OBJ_ATOMIC) $(LIB_ATOMIC) $(OBJ_SET_ATOMIC) $(LIB_SET_ATOMIC) \
-	      $(OBJ_ALLOC) $(OBJ_ALLOC_SET) $(LIB_ALLOC) $(LIB_ALLOC_SET) \
+	      $(OBJ_ALLOC) $(OBJ_ALLOC_SET) $(OBJ_ALLOC_SET_ATOMIC) \
+	      $(LIB_ALLOC) $(LIB_ALLOC_SET) $(LIB_ALLOC_SET_ATOMIC) \
 	      $(TEST_FF_OBJ) $(TEST_FF_BIN) \
+	      test_first_fit-atomic.o test_first_fit-atomic$(EXE_EXT) \
 	      $(TEST_GT_OBJ) $(TEST_GT_BIN) \
 	      $(TEST_SL_OBJ) $(TEST_SL_BIN) \
 	      $(OBJ_BYTEVEC) $(LIB_BYTEVEC_SET) $(TEST_BV_OBJ) $(TEST_BV_BIN) \
