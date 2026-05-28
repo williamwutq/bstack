@@ -21,6 +21,25 @@
 #  endif
 #endif
 
+/* In-memory mutex for first_fit_bstack_allocator_t under -DBSTACK_FEATURE_ATOMIC.
+ * Serializes free-list mutation and stack extension/discard so a single handle
+ * may be shared across threads.  FF_LOCK/FF_UNLOCK compile to no-ops when the
+ * atomic feature is off, leaving the single-threaded code path unchanged. */
+#ifdef BSTACK_FEATURE_ATOMIC
+#  ifdef _WIN32
+#    include <windows.h>
+#    define FF_LOCK(a)   EnterCriticalSection((CRITICAL_SECTION *)(a)->lock)
+#    define FF_UNLOCK(a) LeaveCriticalSection((CRITICAL_SECTION *)(a)->lock)
+#  else
+#    include <pthread.h>
+#    define FF_LOCK(a)   ((void)pthread_mutex_lock((pthread_mutex_t *)(a)->lock))
+#    define FF_UNLOCK(a) ((void)pthread_mutex_unlock((pthread_mutex_t *)(a)->lock))
+#  endif
+#else
+#  define FF_LOCK(a)   ((void)0)
+#  define FF_UNLOCK(a) ((void)0)
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -773,15 +792,43 @@ static inline int alff_is_impossible_block_end(uint64_t stack_len, uint64_t end)
 
 static int alff_set_recovery_needed(bstack_t *bs)
 {
+#ifdef BSTACK_FEATURE_ATOMIC
+    /* CAS 0 -> 1.  Mutual exclusion is provided by the allocator's in-memory
+     * mutex; this CAS is a no-cost check over the disk write we must perform
+     * anyway.  A failure means the flag was already set by a prior operation
+     * that crashed or failed mid-mutation, so the stack needs recovery (reopen)
+     * before it is safe to mutate — surface that rather than proceeding. */
+    static const uint8_t zero[4] = {0, 0, 0, 0};
+    uint8_t one[4];
+    int ok = 0;
+    write_le32(one, 1);
+    if (bstack_cas(bs, ALFF_FLAGS_OFFSET, zero, one, 4, &ok) != 0) return -1;
+    if (!ok) { errno = EIO; return -1; }
+    return 0;
+#else
     uint8_t flag[4];
     write_le32(flag, 1);
     return bstack_set(bs, ALFF_FLAGS_OFFSET, flag, 4);
+#endif
 }
 
 static int alff_clear_recovery_needed(bstack_t *bs)
 {
+#ifdef BSTACK_FEATURE_ATOMIC
+    /* CAS 1 -> 0, the inverse of alff_set_recovery_needed.  A failure means the
+     * flag was not set when we expected it, indicating the paired set was lost
+     * or the flag was disturbed out of band. */
+    static const uint8_t zero[4] = {0, 0, 0, 0};
+    uint8_t one[4];
+    int ok = 0;
+    write_le32(one, 1);
+    if (bstack_cas(bs, ALFF_FLAGS_OFFSET, one, zero, 4, &ok) != 0) return -1;
+    if (!ok) { errno = EIO; return -1; }
+    return 0;
+#else
     uint8_t flag[4] = {0, 0, 0, 0};
     return bstack_set(bs, ALFF_FLAGS_OFFSET, flag, 4);
+#endif
 }
 
 /* ---- free-list helpers ------------------------------------------------- */
@@ -1090,10 +1137,14 @@ static int alff_unlink_block(bstack_t *bs,
  * now the new tail.  Maintains the invariant: the stack tail is always an
  * allocated block (or the arena is empty).
  */
+/*
+ * Caller (ff_vt_dealloc tail path) must set recovery_needed before calling and
+ * clear it after; this function does not touch the flag itself.  Holds no
+ * locks: the only caller acquires the allocator mutex (under
+ * BSTACK_FEATURE_ATOMIC) across the discard + cascade sequence.
+ */
 static int alff_cascade_discard_free_tail(bstack_t *bs)
 {
-    int needs_clear = 0;
-
     for (;;) {
         uint64_t tail, sz, hdr;
         uint8_t footer_buf[8], hdr_buf[16];
@@ -1115,17 +1166,11 @@ static int alff_cascade_discard_free_tail(bstack_t *bs)
         hdr_size = read_le64(hdr_buf);
         if ((hdr_buf[8] & 1) == 0 || hdr_size != sz) break;
 
-        if (!needs_clear) {
-            if (alff_set_recovery_needed(bs) != 0) return -1;
-            needs_clear = 1;
-        }
         if (alff_unlink_from_free_list(bs, hdr + ALFF_BLOCK_HDR_SIZE) != 0) return -1;
         discard_n = (size_t)(sz + ALFF_BLOCK_OVERHEAD);
         if (bstack_discard(bs, discard_n) != 0) return -1;
     }
 
-    if (needs_clear)
-        return alff_clear_recovery_needed(bs);
     return 0;
 }
 
@@ -1251,7 +1296,13 @@ static int alff_recovery(bstack_t *bs)
         }
     }
 
-    ret = alff_clear_recovery_needed(bs);
+    /* Authoritative reset: recovery may have been triggered with the on-disk
+     * flag already clear (e.g. an out-of-range free_head), so write 0 directly
+     * rather than via the CAS clear, which would fail when the flag is not 1. */
+    {
+        uint8_t z[4] = {0, 0, 0, 0};
+        ret = bstack_set(bs, ALFF_FLAGS_OFFSET, z, 4);
+    }
 
 done:
     free(free_blks);
@@ -1274,9 +1325,17 @@ static int ff_vt_alloc(bstack_allocator_t *self, uint64_t len, bstack_slice_t *o
     uint64_t found_start = 0, found_size = 0;
     uint64_t payload;
 
+    /* Hold the lock across the free-list search and the mutation/extension that
+     * follows, so the read-modify-write of the free list (and any tail push) is
+     * atomic w.r.t. other threads.  recovery_needed is set only around the
+     * actual free-list mutation below. */
+    FF_LOCK(a);
+
     if (alff_find_large_enough_block(a->bs, aligned_len,
-                                      &found_start, &found_size) != 0)
+                                      &found_start, &found_size) != 0) {
+        FF_UNLOCK(a);
         return -1;
+    }
 
     if (found_start != 0) {
         /* Reuse a free block (split if large enough, otherwise take whole) */
@@ -1285,19 +1344,21 @@ static int ff_vt_alloc(bstack_allocator_t *self, uint64_t len, bstack_slice_t *o
 
 #if UINT64_MAX > SIZE_MAX
         if (ALFF_BLOCK_OVERHEAD + aligned_len > (uint64_t)SIZE_MAX) {
+            FF_UNLOCK(a);
             errno = EINVAL;
             return -1;
         }
 #endif
         buf_sz = (size_t)(ALFF_BLOCK_OVERHEAD + aligned_len);
         content_buf = calloc(1, buf_sz);
-        if (!content_buf) return -1;
+        if (!content_buf) { FF_UNLOCK(a); return -1; }
 
         if (alff_set_recovery_needed(a->bs) != 0
             || alff_unlink_block(a->bs, found_start, found_size,
                                   aligned_len, content_buf) != 0
             || alff_clear_recovery_needed(a->bs) != 0) {
             free(content_buf);
+            FF_UNLOCK(a);
             return -1;
         }
         free(content_buf);
@@ -1315,20 +1376,24 @@ static int ff_vt_alloc(bstack_allocator_t *self, uint64_t len, bstack_slice_t *o
 
 #if UINT64_MAX > SIZE_MAX
         if (aligned_len + ALFF_BLOCK_OVERHEAD > (uint64_t)SIZE_MAX) {
+            FF_UNLOCK(a);
             errno = EINVAL;
             return -1;
         }
 #endif
         block_sz  = (size_t)(aligned_len + ALFF_BLOCK_OVERHEAD);
         block_buf = calloc(1, block_sz);
-        if (!block_buf) return -1;
+        if (!block_buf) { FF_UNLOCK(a); return -1; }
 
         write_le64(size_le, aligned_len);
         memcpy(block_buf, size_le, 8);
         memcpy(block_buf + ALFF_BLOCK_HDR_SIZE + aligned_len, size_le, 8);
 
+        /* push is a single atomic bstack call; the lock above already excludes
+         * concurrent tail modification, so no recovery_needed marking here. */
         if (bstack_push(a->bs, block_buf, block_sz, &push_offset) != 0) {
             free(block_buf);
+            FF_UNLOCK(a);
             return -1;
         }
         free(block_buf);
@@ -1338,6 +1403,7 @@ static int ff_vt_alloc(bstack_allocator_t *self, uint64_t len, bstack_slice_t *o
     out->allocator = self;
     out->offset    = payload;
     out->len       = len;
+    FF_UNLOCK(a);
     return 0;
 }
 
@@ -1346,12 +1412,20 @@ static int ff_vt_dealloc(bstack_allocator_t *self, bstack_slice_t slice)
     first_fit_bstack_allocator_t *a = (first_fit_bstack_allocator_t *)self;
     uint64_t aligned_len = alff_align_len(slice.len);
     uint64_t stack_len;
+    int      r;
 
-    if (bstack_len(a->bs, &stack_len) != 0) return -1;
+    /* Hold the lock across the tail check and the free-list mutation / tail
+     * discard, so the read of the tail and the write that follows are atomic
+     * w.r.t. other threads.  The validation reads below are harmless to do
+     * under the lock and avoid a second bstack_len call. */
+    FF_LOCK(a);
+
+    if (bstack_len(a->bs, &stack_len) != 0) { FF_UNLOCK(a); return -1; }
 
     if (alff_is_impossible_block_start(stack_len, slice.offset)
         || alff_is_impossible_block_end(stack_len, slice.offset + aligned_len)
         || alff_is_impossible_block_size(stack_len, aligned_len)) {
+        FF_UNLOCK(a);
         errno = EINVAL;
         return -1;
     }
@@ -1362,35 +1436,45 @@ static int ff_vt_dealloc(bstack_allocator_t *self, bstack_slice_t slice)
         if (bstack_get(a->bs,
                        slice.offset - ALFF_BLOCK_HDR_SIZE + 8,
                        slice.offset - ALFF_BLOCK_HDR_SIZE + 12,
-                       flags_buf) != 0)
+                       flags_buf) != 0) {
+            FF_UNLOCK(a);
             return -1;
+        }
         if (flags_buf[0] & 1) {
+            FF_UNLOCK(a);
             errno = EINVAL;
             return -1;
         }
     }
 
     /* Tail block fast path: discard the block bytes, then cascade-discard any
-     * free blocks now at the tail.  Set recovery_needed before the discard so
-     * a crash between discard and cascade is detected on reopen. */
+     * free blocks now at the tail.  recovery_needed is set before the discard
+     * (0.2.1 fix) so a crash anywhere in the discard + cascade sequence is
+     * detected on reopen.  This function is the sole manager of the flag for
+     * the tail path; cascade does not touch it. */
     if (slice.offset + aligned_len == stack_len - ALFF_BLOCK_FTR_SIZE) {
         size_t discard_n;
 #if UINT64_MAX > SIZE_MAX
         if (aligned_len + ALFF_BLOCK_OVERHEAD > (uint64_t)SIZE_MAX) {
+            FF_UNLOCK(a);
             errno = EINVAL;
             return -1;
         }
 #endif
         discard_n = (size_t)(aligned_len + ALFF_BLOCK_OVERHEAD);
-        if (alff_set_recovery_needed(a->bs) != 0) return -1;
-        if (bstack_discard(a->bs, discard_n) != 0) return -1;
-        if (alff_cascade_discard_free_tail(a->bs) != 0) return -1;
-        return alff_clear_recovery_needed(a->bs);
+        if (alff_set_recovery_needed(a->bs) != 0) { FF_UNLOCK(a); return -1; }
+        if (bstack_discard(a->bs, discard_n) != 0) { FF_UNLOCK(a); return -1; }
+        if (alff_cascade_discard_free_tail(a->bs) != 0) { FF_UNLOCK(a); return -1; }
+        r = alff_clear_recovery_needed(a->bs);
+        FF_UNLOCK(a);
+        return r;
     }
 
-    if (alff_set_recovery_needed(a->bs) != 0) return -1;
-    if (alff_add_to_free_list(a->bs, slice.offset) != 0) return -1;
-    return alff_clear_recovery_needed(a->bs);
+    if (alff_set_recovery_needed(a->bs) != 0) { FF_UNLOCK(a); return -1; }
+    if (alff_add_to_free_list(a->bs, slice.offset) != 0) { FF_UNLOCK(a); return -1; }
+    r = alff_clear_recovery_needed(a->bs);
+    FF_UNLOCK(a);
+    return r;
 }
 
 static int ff_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
@@ -1401,6 +1485,8 @@ static int ff_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
     uint64_t aligned_new_len;
     uint64_t stack_len;
 
+    /* Validation reads stack_len once.  No lock yet — only caller-owned bytes
+     * are touched by the lock-free fast paths (cases 1 and 3). */
     if (bstack_len(a->bs, &stack_len) != 0) return -1;
 
     if (alff_is_impossible_block_start(stack_len, slice.offset)
@@ -1413,7 +1499,8 @@ static int ff_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
 
     aligned_new_len = alff_align_len(new_len);
 
-    /* Case 1: same aligned bucket — no block resize needed */
+    /* Case 1: same aligned bucket — no block resize needed.  Lock-free: the
+     * zero-fill touches only caller-owned bytes within an allocated block. */
     if (aligned_new_len == aligned_current_len) {
         if (new_len > slice.len) {
             size_t zero_n = (size_t)(new_len - slice.len);
@@ -1425,10 +1512,13 @@ static int ff_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
         return 0;
     }
 
-    /* Refresh stack_len for tail check */
-    if (bstack_len(a->bs, &stack_len) != 0) return -1;
-
-    /* Case 2: tail block — extend or shrink in place */
+    /* Case 2: tail block — extend or shrink in place.
+     * Hold the lock for the whole tail check + resize: reading the tail and
+     * then extending/discarding it must be atomic w.r.t. other threads' pushes.
+     * If this is not the tail block the lock is released before the lock-free
+     * in-place paths below run. */
+    FF_LOCK(a);
+    if (bstack_len(a->bs, &stack_len) != 0) { FF_UNLOCK(a); return -1; }
     if (slice.offset + aligned_current_len == stack_len - ALFF_BLOCK_FTR_SIZE) {
         uint8_t size_le[8];
         if (aligned_new_len > aligned_current_len) {
@@ -1436,36 +1526,49 @@ static int ff_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
             uint64_t zero_n = aligned_current_len + ALFF_BLOCK_FTR_SIZE - slice.len;
 #if UINT64_MAX > SIZE_MAX
             if (delta > (uint64_t)SIZE_MAX || zero_n > (uint64_t)SIZE_MAX) {
+                FF_UNLOCK(a);
                 errno = EINVAL;
                 return -1;
             }
 #endif
-            if (bstack_extend(a->bs, (size_t)delta, NULL) != 0) return -1;
-            if (bstack_zero(a->bs, slice.offset + slice.len, (size_t)zero_n) != 0) return -1;
+            /* Tail-grow is multi-step (extend + zero + header + footer); without
+             * the recovery flag a crash after extend but before the header write
+             * leaves an unrecoverable mid-arena layout (for delta >= 24 bytes
+             * recovery would error on the zero "header" past the old block). */
+            if (alff_set_recovery_needed(a->bs) != 0) { FF_UNLOCK(a); return -1; }
+            if (bstack_extend(a->bs, (size_t)delta, NULL) != 0) { FF_UNLOCK(a); return -1; }
+            if (bstack_zero(a->bs, slice.offset + slice.len, (size_t)zero_n) != 0) { FF_UNLOCK(a); return -1; }
             write_le64(size_le, aligned_new_len);
             if (bstack_set(a->bs, slice.offset - ALFF_BLOCK_HDR_SIZE,
-                           size_le, 8) != 0) return -1;
+                           size_le, 8) != 0) { FF_UNLOCK(a); return -1; }
             if (bstack_set(a->bs, slice.offset + aligned_new_len,
-                           size_le, 8) != 0) return -1;
+                           size_le, 8) != 0) { FF_UNLOCK(a); return -1; }
+            if (alff_clear_recovery_needed(a->bs) != 0) { FF_UNLOCK(a); return -1; }
         } else {
             uint64_t delta = aligned_current_len - aligned_new_len;
 #if UINT64_MAX > SIZE_MAX
-            if (delta > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
+            if (delta > (uint64_t)SIZE_MAX) { FF_UNLOCK(a); errno = EINVAL; return -1; }
 #endif
+            /* Tail-shrink touches only this block's header/footer and the tail.
+             * The lock above excludes concurrent tail modification; within that,
+             * the discard is a single atomic bstack call, so no recovery flag. */
             write_le64(size_le, aligned_new_len);
             if (bstack_set(a->bs, slice.offset + aligned_new_len,
-                           size_le, 8) != 0) return -1;
+                           size_le, 8) != 0) { FF_UNLOCK(a); return -1; }
             if (bstack_set(a->bs, slice.offset - ALFF_BLOCK_HDR_SIZE,
-                           size_le, 8) != 0) return -1;
-            if (bstack_discard(a->bs, (size_t)delta) != 0) return -1;
+                           size_le, 8) != 0) { FF_UNLOCK(a); return -1; }
+            if (bstack_discard(a->bs, (size_t)delta) != 0) { FF_UNLOCK(a); return -1; }
         }
         out->allocator = self;
         out->offset    = slice.offset;
         out->len       = new_len;
+        FF_UNLOCK(a);
         return 0;
     }
+    FF_UNLOCK(a);  /* not the tail block; release before lock-free in-place paths */
 
-    /* Read actual block size from header */
+    /* Read actual block size from header.  Lock-free: this is the allocated
+     * block's own header, owned by the caller and stable. */
     {
         uint8_t block_size_buf[8];
         uint64_t block_size;
@@ -1474,7 +1577,8 @@ static int ff_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
                        block_size_buf) != 0) return -1;
         block_size = read_le64(block_size_buf);
 
-        /* Case 3: block already large enough for the new size */
+        /* Case 3: block already large enough for the new size.  Lock-free: the
+         * zero-fill stays within the caller's allocated block. */
         if (block_size >= aligned_new_len) {
             if (new_len > slice.len) {
                 size_t zero_n = (size_t)(new_len - slice.len);
@@ -1486,16 +1590,21 @@ static int ff_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
             return 0;
         }
 
+        /* From here on we either merge with the adjacent free block or allocate
+         * a fresh one: both walk/mutate the free list (and the new-block path
+         * pushes), so hold the lock for the rest of the function. */
+        FF_LOCK(a);
+
         /* Case 4: try to merge with the free right neighbour in place */
         {
             uint64_t next_block = slice.offset + block_size + ALFF_BLOCK_OVERHEAD;
-            if (bstack_len(a->bs, &stack_len) != 0) return -1;
+            if (bstack_len(a->bs, &stack_len) != 0) { FF_UNLOCK(a); return -1; }
             if (next_block <= stack_len - ALFF_BLOCK_FTR_SIZE - ALFF_MIN_PAYLOAD) {
                 uint8_t next_hdr[16];
                 uint64_t next_size;
                 if (bstack_get(a->bs, next_block - ALFF_BLOCK_HDR_SIZE,
                                next_block - ALFF_BLOCK_HDR_SIZE + 16,
-                               next_hdr) != 0) return -1;
+                               next_hdr) != 0) { FF_UNLOCK(a); return -1; }
                 next_size = read_le64(next_hdr);
 
                 if ((next_hdr[8] & 1) != 0
@@ -1507,18 +1616,18 @@ static int ff_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
                     if (slice.len < block_size) {
                         size_t zero_n = (size_t)(block_size - slice.len);
                         if (bstack_zero(a->bs, slice.offset + slice.len,
-                                        zero_n) != 0) return -1;
+                                        zero_n) != 0) { FF_UNLOCK(a); return -1; }
                     }
 
-                    if (alff_set_recovery_needed(a->bs) != 0) return -1;
-                    if (alff_unlink_from_free_list(a->bs, next_block) != 0) return -1;
+                    if (alff_set_recovery_needed(a->bs) != 0) { FF_UNLOCK(a); return -1; }
+                    if (alff_unlink_from_free_list(a->bs, next_block) != 0) { FF_UNLOCK(a); return -1; }
 
                     {
                         uint64_t merged_size = block_size + ALFF_BLOCK_OVERHEAD + next_size;
                         size_t   zero_buf_sz =
                             (size_t)(next_size + ALFF_BLOCK_OVERHEAD + ALFF_BLOCK_FTR_SIZE);
                         uint8_t *zero_buff = calloc(1, zero_buf_sz);
-                        if (!zero_buff) return -1;
+                        if (!zero_buff) { FF_UNLOCK(a); return -1; }
 
                         if (merged_size >=
                             aligned_new_len + ALFF_BLOCK_OVERHEAD + ALFF_MIN_PAYLOAD) {
@@ -1541,7 +1650,7 @@ static int ff_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
 
                             if (bstack_get(a->bs, ALFF_FREE_HEAD_OFFSET,
                                            ALFF_FREE_HEAD_OFFSET + 8, head_buf) != 0) {
-                                free(zero_buff); return -1;
+                                free(zero_buff); FF_UNLOCK(a); return -1;
                             }
                             old_head = read_le64(head_buf);
 
@@ -1555,28 +1664,28 @@ static int ff_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
                             write_le64(size_le, merged_size);
                             if (bstack_set(a->bs, slice.offset - ALFF_BLOCK_HDR_SIZE,
                                            size_le, 8) != 0) {
-                                free(zero_buff); return -1;
+                                free(zero_buff); FF_UNLOCK(a); return -1;
                             }
                             if (bstack_set(a->bs, slice.offset + block_size,
                                            zero_buff, zero_buf_sz) != 0) {
-                                free(zero_buff); return -1;
+                                free(zero_buff); FF_UNLOCK(a); return -1;
                             }
                             free(zero_buff);
 
                             /* Shrink allocated block header */
                             write_le64(size_le, aligned_new_len);
                             if (bstack_set(a->bs, slice.offset - ALFF_BLOCK_HDR_SIZE,
-                                           size_le, 8) != 0) return -1;
+                                           size_le, 8) != 0) { FF_UNLOCK(a); return -1; }
 
                             /* Forward link: free_head → new free block */
                             {
                                 uint8_t nfs_le[8];
                                 write_le64(nfs_le, new_free_start);
                                 if (bstack_set(a->bs, ALFF_FREE_HEAD_OFFSET,
-                                               nfs_le, 8) != 0) return -1;
+                                               nfs_le, 8) != 0) { FF_UNLOCK(a); return -1; }
                                 if (old_head != 0) {
                                     if (bstack_set(a->bs, old_head + 8,
-                                                   nfs_le, 8) != 0) return -1;
+                                                   nfs_le, 8) != 0) { FF_UNLOCK(a); return -1; }
                                 }
                             }
                         } else {
@@ -1587,20 +1696,21 @@ static int ff_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
                             write_le64(size_le, merged_size);
                             if (bstack_set(a->bs, slice.offset - ALFF_BLOCK_HDR_SIZE,
                                            size_le, 8) != 0) {
-                                free(zero_buff); return -1;
+                                free(zero_buff); FF_UNLOCK(a); return -1;
                             }
                             if (bstack_set(a->bs, slice.offset + block_size,
                                            zero_buff, zero_buf_sz) != 0) {
-                                free(zero_buff); return -1;
+                                free(zero_buff); FF_UNLOCK(a); return -1;
                             }
                             free(zero_buff);
                         }
                     }
 
-                    if (alff_clear_recovery_needed(a->bs) != 0) return -1;
+                    if (alff_clear_recovery_needed(a->bs) != 0) { FF_UNLOCK(a); return -1; }
                     out->allocator = self;
                     out->offset    = slice.offset;
                     out->len       = new_len;
+                    FF_UNLOCK(a);
                     return 0;
                 }
             }
@@ -1610,7 +1720,7 @@ static int ff_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
         {
             uint64_t found_start = 0, found_size = 0;
             if (alff_find_large_enough_block(a->bs, aligned_new_len,
-                                              &found_start, &found_size) != 0) return -1;
+                                              &found_start, &found_size) != 0) { FF_UNLOCK(a); return -1; }
 
             if (found_start != 0) {
                 size_t   buf_sz;
@@ -1619,26 +1729,27 @@ static int ff_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
 
 #if UINT64_MAX > SIZE_MAX
                 if (ALFF_BLOCK_OVERHEAD + aligned_new_len > (uint64_t)SIZE_MAX) {
+                    FF_UNLOCK(a);
                     errno = EINVAL;
                     return -1;
                 }
 #endif
                 buf_sz   = (size_t)(ALFF_BLOCK_OVERHEAD + aligned_new_len);
                 data_buf = calloc(1, buf_sz);
-                if (!data_buf) return -1;
+                if (!data_buf) { FF_UNLOCK(a); return -1; }
 
                 copy_len = slice.len < aligned_new_len ? slice.len : aligned_new_len;
                 if (copy_len > 0) {
                     if (bstack_get(a->bs, slice.offset, slice.offset + copy_len,
                                    data_buf + ALFF_BLOCK_HDR_SIZE) != 0) {
-                        free(data_buf); return -1;
+                        free(data_buf); FF_UNLOCK(a); return -1;
                     }
                 }
 
-                if (alff_set_recovery_needed(a->bs) != 0) { free(data_buf); return -1; }
+                if (alff_set_recovery_needed(a->bs) != 0) { free(data_buf); FF_UNLOCK(a); return -1; }
                 if (alff_unlink_block(a->bs, found_start, found_size,
                                       aligned_new_len, data_buf) != 0) {
-                    free(data_buf); return -1;
+                    free(data_buf); FF_UNLOCK(a); return -1;
                 }
                 free(data_buf);
 
@@ -1647,16 +1758,17 @@ static int ff_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
                     ? found_start + found_size - aligned_new_len
                     : found_start;
 
-                if (alff_add_to_free_list(a->bs, slice.offset) != 0) return -1;
-                if (alff_clear_recovery_needed(a->bs) != 0) return -1;
+                if (alff_add_to_free_list(a->bs, slice.offset) != 0) { FF_UNLOCK(a); return -1; }
+                if (alff_clear_recovery_needed(a->bs) != 0) { FF_UNLOCK(a); return -1; }
 
                 out->allocator = self;
                 out->offset    = new_payload;
                 out->len       = new_len;
+                FF_UNLOCK(a);
                 return 0;
             }
         }
-    } /* end block_size scope */
+    } /* end block_size scope — lock still held for case 6 */
 
     /* Case 6: no free block fits — push a new tail block and free the old one */
     {
@@ -1667,13 +1779,14 @@ static int ff_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
 
 #if UINT64_MAX > SIZE_MAX
         if (aligned_new_len + ALFF_BLOCK_OVERHEAD > (uint64_t)SIZE_MAX) {
+            FF_UNLOCK(a);
             errno = EINVAL;
             return -1;
         }
 #endif
         block_sz  = (size_t)(aligned_new_len + ALFF_BLOCK_OVERHEAD);
         block_buf = calloc(1, block_sz);
-        if (!block_buf) return -1;
+        if (!block_buf) { FF_UNLOCK(a); return -1; }
 
         write_le64(size_le, aligned_new_len);
         memcpy(block_buf, size_le, 8);
@@ -1684,7 +1797,7 @@ static int ff_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
             uint64_t bsz;
             if (bstack_get(a->bs, slice.offset - ALFF_BLOCK_HDR_SIZE,
                            slice.offset - ALFF_BLOCK_HDR_SIZE + 8,
-                           bsz_buf) != 0) { free(block_buf); return -1; }
+                           bsz_buf) != 0) { free(block_buf); FF_UNLOCK(a); return -1; }
             bsz = read_le64(bsz_buf);
             copy_len = slice.len < aligned_new_len ? slice.len : aligned_new_len;
             (void)bsz;
@@ -1693,24 +1806,25 @@ static int ff_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
         if (copy_len > 0) {
             if (bstack_get(a->bs, slice.offset, slice.offset + copy_len,
                            block_buf + ALFF_BLOCK_HDR_SIZE) != 0) {
-                free(block_buf); return -1;
+                free(block_buf); FF_UNLOCK(a); return -1;
             }
         }
         memcpy(block_buf + ALFF_BLOCK_HDR_SIZE + aligned_new_len, size_le, 8);
 
-        if (alff_set_recovery_needed(a->bs) != 0) { free(block_buf); return -1; }
+        if (alff_set_recovery_needed(a->bs) != 0) { free(block_buf); FF_UNLOCK(a); return -1; }
         if (bstack_push(a->bs, block_buf, block_sz, &push_offset) != 0) {
-            free(block_buf); return -1;
+            free(block_buf); FF_UNLOCK(a); return -1;
         }
         free(block_buf);
         new_ptr = push_offset + ALFF_BLOCK_HDR_SIZE;
 
-        if (alff_add_to_free_list(a->bs, slice.offset) != 0) return -1;
-        if (alff_clear_recovery_needed(a->bs) != 0) return -1;
+        if (alff_add_to_free_list(a->bs, slice.offset) != 0) { FF_UNLOCK(a); return -1; }
+        if (alff_clear_recovery_needed(a->bs) != 0) { FF_UNLOCK(a); return -1; }
 
         out->allocator = self;
         out->offset    = new_ptr;
         out->len       = new_len;
+        FF_UNLOCK(a);
         return 0;
     }
 }
@@ -1754,6 +1868,25 @@ static const bstack_bulk_allocator_vtbl_t ff_bulk_vtbl = {
  * first_fit_bstack_allocator_t — public API
  * ====================================================================== */
 
+/* Destroy and free the allocator's in-memory mutex under BSTACK_FEATURE_ATOMIC.
+ * No-op when the feature is off (the lock field doesn't exist). */
+static void ff_destroy_lock(first_fit_bstack_allocator_t *a)
+{
+#ifdef BSTACK_FEATURE_ATOMIC
+    if (a->lock) {
+#  ifdef _WIN32
+        DeleteCriticalSection((CRITICAL_SECTION *)a->lock);
+#  else
+        pthread_mutex_destroy((pthread_mutex_t *)a->lock);
+#  endif
+        free(a->lock);
+        a->lock = NULL;
+    }
+#else
+    (void)a;
+#endif
+}
+
 first_fit_bstack_allocator_t *first_fit_bstack_allocator_new(bstack_t *bs)
 {
     first_fit_bstack_allocator_t *a;
@@ -1766,7 +1899,31 @@ first_fit_bstack_allocator_t *first_fit_bstack_allocator_new(bstack_t *bs)
     a->base.bulk_vtbl = &ff_bulk_vtbl;
     a->bs             = bs;
 
-    if (bstack_len(bs, &stack_len) != 0) { free(a); return NULL; }
+#ifdef BSTACK_FEATURE_ATOMIC
+    /* Allocate and initialise the in-memory mutex.  Kept opaque in the header
+     * (void *) so <pthread.h> / <windows.h> need not be exposed there. */
+#  ifdef _WIN32
+    {
+        CRITICAL_SECTION *cs = malloc(sizeof *cs);
+        if (!cs) { free(a); errno = ENOMEM; return NULL; }
+        InitializeCriticalSection(cs);
+        a->lock = cs;
+    }
+#  else
+    {
+        pthread_mutex_t *m = malloc(sizeof *m);
+        if (!m) { free(a); errno = ENOMEM; return NULL; }
+        if (pthread_mutex_init(m, NULL) != 0) {
+            free(m); free(a);
+            errno = EINVAL;
+            return NULL;
+        }
+        a->lock = m;
+    }
+#  endif
+#endif
+
+    if (bstack_len(bs, &stack_len) != 0) { ff_destroy_lock(a); free(a); return NULL; }
 
     if (stack_len == 0) {
         /* Empty stack: write the 48-byte allocator header */
@@ -1774,13 +1931,15 @@ first_fit_bstack_allocator_t *first_fit_bstack_allocator_new(bstack_t *bs)
         memset(hdr, 0, 48);
         memcpy(hdr + 16, alff_magic, 8); /* magic at OFFSET_SIZE offset */
         /* flags, reserved, free_head stay zero */
-        if (bstack_push(bs, hdr, 48, NULL) != 0) { free(a); return NULL; }
+        if (bstack_push(bs, hdr, 48, NULL) != 0) {
+            ff_destroy_lock(a); free(a); return NULL;
+        }
         return a;
     }
 
     /* Non-empty: must have room for the full allocator header */
     if (stack_len < 48) {
-        free(a);
+        ff_destroy_lock(a); free(a);
         errno = EINVAL;
         return NULL;
     }
@@ -1790,10 +1949,12 @@ first_fit_bstack_allocator_t *first_fit_bstack_allocator_new(bstack_t *bs)
         uint64_t free_head;
 
         /* Read the 32-byte allocator header at payload offset 16 */
-        if (bstack_get(bs, 16, 48, header) != 0) { free(a); return NULL; }
+        if (bstack_get(bs, 16, 48, header) != 0) {
+            ff_destroy_lock(a); free(a); return NULL;
+        }
 
         if (memcmp(header, alff_magic_prefix, 6) != 0) {
-            free(a);
+            ff_destroy_lock(a); free(a);
             errno = EINVAL;
             return NULL;
         }
@@ -1811,7 +1972,9 @@ first_fit_bstack_allocator_t *first_fit_bstack_allocator_new(bstack_t *bs)
     }
 
     if (recovery_needed) {
-        if (alff_recovery(bs) != 0) { free(a); return NULL; }
+        if (alff_recovery(bs) != 0) {
+            ff_destroy_lock(a); free(a); return NULL;
+        }
     }
 
     return a;
@@ -1819,12 +1982,15 @@ first_fit_bstack_allocator_t *first_fit_bstack_allocator_new(bstack_t *bs)
 
 void first_fit_bstack_allocator_free(first_fit_bstack_allocator_t *alloc)
 {
+    if (!alloc) return;
+    ff_destroy_lock(alloc);
     free(alloc);
 }
 
 bstack_t *first_fit_bstack_allocator_into_stack(first_fit_bstack_allocator_t *alloc)
 {
     bstack_t *bs = alloc->bs;
+    ff_destroy_lock(alloc);
     free(alloc);
     return bs;
 }

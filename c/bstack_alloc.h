@@ -591,11 +591,27 @@ bstack_t *linear_bstack_allocator_into_stack(linear_bstack_allocator_t *alloc);
  * Crash safety: recovery_needed is set before any multi-step modification and
  * cleared after.  On open, if recovery_needed is set, the arena is scanned
  * linearly and the free list is rebuilt from is_free flags alone.
+ *
+ * Thread safety: without -DBSTACK_FEATURE_ATOMIC, an allocator handle must be
+ * used from one thread at a time — its operations mutate the on-disk free list
+ * in several steps and would race under concurrent calls.  With
+ * -DBSTACK_FEATURE_ATOMIC the handle owns an in-memory mutex (lock) that
+ * serializes the two compound operations not already made atomic by bstack's
+ * own per-call lock — free-list mutation and stack extension/discard — so a
+ * single handle may then be shared across threads.  recovery_needed is updated
+ * with bstack_cas (no extra cost over the disk write it performs regardless),
+ * which also rejects operating on a stack left in a needs-recovery state.
  * ====================================================================== */
 
 typedef struct {
     bstack_allocator_t base; /* must be first — safe cast to bstack_allocator_t * */
     bstack_t          *bs;
+#ifdef BSTACK_FEATURE_ATOMIC
+    /* Opaque pointer to a platform mutex (pthread_mutex_t / CRITICAL_SECTION),
+     * allocated in first_fit_bstack_allocator_new and released on free.  Kept
+     * opaque so this header need not pull in <pthread.h> / <windows.h>. */
+    void              *lock;
+#endif
 } first_fit_bstack_allocator_t;
 
 /*
