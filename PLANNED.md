@@ -92,25 +92,6 @@ This is a larger breaking change than the handle type alone, as it touches every
 
 ---
 
-## Optimizing `FirstFitBStackAllocator` with atomic feature
-
-**Feature flag:** `atomic`
-**Breaking change:** No (if added as optional)
-
-### Motivation
-
-The `FirstFitBStackAllocator` could benefit from atomic operations to improve performance and thread-safety in concurrent environments. Atomic operations can reduce contention and allow for lock-free or reduced-lock implementations in certain scenarios. It also allows for better crash resilience by ensuring that metadata updates are atomic, reducing the risk of corruption in the event of a crash.
-
-### Design
-
-[To be determined — implementation details would involve using atomic primitives for metadata updates and allocation tracking.]
-
-### Open questions
-
-- Should this optimization be added as an optional feature flag, or required for all users? If added, we end up maintaining two implementations of `FirstFitBStackAllocator`; if required, all users need the atomic flag.
-
----
-
 ## Truly crash-atomic `set` via write-in-progress journaling (0.4.0)
 
 **Breaking change:** Yes (on-disk format / ABI)
