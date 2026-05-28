@@ -734,7 +734,7 @@ bstack_t *linear_bstack_allocator_into_stack(linear_bstack_allocator_t *alloc)
 #define ALFF_MIN_BLOCK_START  UINT64_C(64)  /* ARENA_START + BLOCK_HDR_SIZE */
 #define ALFF_MIN_BLOCK_END    UINT64_C(80)  /* ARENA_START + BLOCK_HDR_SIZE + MIN_PAYLOAD */
 
-static const uint8_t alff_magic[8]        = {'A','L','F','F',0,1,2,0};
+static const uint8_t alff_magic[8]        = {'A','L','F','F',0,1,3,0};
 static const uint8_t alff_magic_prefix[6] = {'A','L','F','F',0,1};
 
 /* ---- LE codec helpers -------------------------------------------------- */
