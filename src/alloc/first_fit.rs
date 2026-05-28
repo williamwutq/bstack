@@ -844,7 +844,7 @@ impl BStackAllocator for FirstFitBStackAllocator {
             buf[(aligned_len + Self::BLOCK_HEADER_SIZE) as usize..]
                 .copy_from_slice(&aligned_len.to_le_bytes());
             let ptr = self.stack.push(&buf)? + Self::BLOCK_HEADER_SIZE;
-            
+
             // We need to clean up the flag if atomic feature is enabled
             #[cfg(feature = "atomic")]
             self.clear_recovery_needed()?;
@@ -960,9 +960,13 @@ impl BStackAllocator for FirstFitBStackAllocator {
             match aligned_new_len.cmp(&aligned_current_len) {
                 std::cmp::Ordering::Equal => return Ok(slice), // Included but this should never happen
                 std::cmp::Ordering::Greater => {
+                    #[cfg(feature = "atomic")]
+                    {
+                        self.set_recovery_needed()?;
+                    }
+
                     // Extend payload by the delta; footer moves forward
                     self.stack.extend(aligned_new_len - aligned_current_len)?;
-                    // TODO: check atomic impl of this part
                     // Zero from slice.len() through the old footer area.  The old footer
                     // (8 bytes at aligned_current_len) is now absorbed into the new payload,
                     // and bytes [slice.len(), aligned_current_len) may hold stale data from
@@ -979,6 +983,11 @@ impl BStackAllocator for FirstFitBStackAllocator {
                         slice.start() + aligned_new_len,
                         aligned_new_len.to_le_bytes(),
                     )?;
+
+                    #[cfg(feature = "atomic")]
+                    {
+                        self.clear_recovery_needed()?;
+                    }
                     // SAFETY: slice extended in place at tail
                     return Ok(unsafe {
                         BStackSlice::from_raw_parts(self, slice.start(), new_len)
@@ -1027,9 +1036,13 @@ impl BStackAllocator for FirstFitBStackAllocator {
             return Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) });
         }
 
+        // TODO: maybe optimize atomic impl
+        #[cfg(feature = "atomic")]
+        self.set_recovery_needed()?;
+
         // Special case: next block is free and can be merged in place to accommodate the new size.
         // This avoids copying data.
-        // TODO: atomic impl 
+
         let next_block = slice.start() + block_size + Self::BLOCK_OVERHEAD_SIZE;
         if next_block <= self.stack.len()? - Self::BLOCK_FOOTER_SIZE - Self::MIN_BLOCK_PAYLOAD_SIZE
         {
@@ -1059,6 +1072,7 @@ impl BStackAllocator for FirstFitBStackAllocator {
                 }
 
                 // Unlink the next block from the free list, then merge it into the current block.
+                #[cfg(not(feature = "atomic"))]
                 self.set_recovery_needed()?;
                 self.unlink_from_free_list(next_block)?;
                 // merged_size includes the overhead bytes absorbed from between the two blocks
@@ -1147,6 +1161,9 @@ impl BStackAllocator for FirstFitBStackAllocator {
 
         // For non-tail blocks, we need to find a new block for the new size, copy the data, and free the old block.
         let block_found = self.find_large_enough_block(aligned_new_len)?;
+        // Both branches build a full block buffer (overhead + payload) of the same size,
+        // so allocate it once up front.
+        let mut block_buf = vec![0u8; (aligned_new_len + Self::BLOCK_OVERHEAD_SIZE) as usize];
         if block_found.0 != 0 {
             // Found a big enough block at offset block_found. Remove it from the free list and return it.
             // If the block is much bigger than needed, split it and add the remainder back to the free list.
@@ -1156,18 +1173,18 @@ impl BStackAllocator for FirstFitBStackAllocator {
             // `vec!`, so the new block's payload past `slice.len()` is zero — matching
             // extend/calloc semantics for newly-exposed bytes after realloc.
             let copy_len = slice.len().min(aligned_new_len);
-            let mut data_buf = vec![0u8; (Self::BLOCK_OVERHEAD_SIZE + aligned_new_len) as usize];
             self.stack.get_into(
                 slice.start(),
-                &mut data_buf[Self::BLOCK_HEADER_SIZE as usize
+                &mut block_buf[Self::BLOCK_HEADER_SIZE as usize
                     ..(copy_len + Self::BLOCK_HEADER_SIZE) as usize],
             )?;
+            #[cfg(not(feature = "atomic"))]
             self.set_recovery_needed()?;
             self.unlink_block(
                 block_found.0,
                 block_found.1,
                 aligned_new_len,
-                data_buf.as_mut_slice(),
+                block_buf.as_mut_slice(),
             )?;
             // Must mirror unlink_block's split threshold exactly.  The split puts the
             // allocated block at the back of the found block; without a split, the found
@@ -1187,7 +1204,6 @@ impl BStackAllocator for FirstFitBStackAllocator {
             // No free block fits; push the full new block in one call, then free the old one.
             // Copy only the user-visible bytes; the rest of `block_buf` stays zeroed.
             let copy_len = (slice.len().min(aligned_new_len)) as usize;
-            let mut block_buf = vec![0u8; (aligned_new_len + Self::BLOCK_OVERHEAD_SIZE) as usize];
             block_buf[..8].copy_from_slice(&aligned_new_len.to_le_bytes());
             self.stack.get_into(
                 slice.start(),
@@ -1196,6 +1212,7 @@ impl BStackAllocator for FirstFitBStackAllocator {
             )?;
             block_buf[(aligned_new_len + Self::BLOCK_HEADER_SIZE) as usize..]
                 .copy_from_slice(&aligned_new_len.to_le_bytes());
+            #[cfg(not(feature = "atomic"))]
             self.set_recovery_needed()?;
             let ptr = self.stack.push(&block_buf)? + Self::BLOCK_HEADER_SIZE;
             self.add_to_free_list(slice.start())?;
