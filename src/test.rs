@@ -3112,6 +3112,225 @@ mod first_fit_tests {
         let raw = alloc.stack().get(s.start(), s.start() + 8).unwrap();
         assert_eq!(raw, b"testdata");
     }
+
+    // -----------------------------------------------------------------------
+    // Concurrency (requires the `atomic` feature, which makes the allocator
+    // `Sync` via the internal `Mutex` around free-list mutation and tail
+    // extension/discard).
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn concurrent_alloc_dealloc_data_integrity() {
+        // N threads each repeatedly alloc → write a thread-tagged pattern →
+        // read it back → dealloc.  If the Mutex did not serialise the
+        // free-list mutation correctly, two threads could be handed the same
+        // block (or overlapping blocks), and the read-back would observe a
+        // different thread's pattern.
+        use std::sync::Arc;
+        use std::thread;
+
+        let (alloc, path) = mk_ff("concurrent_data");
+        let _g = Guard(path);
+        let alloc = Arc::new(alloc);
+
+        const THREADS: u64 = 8;
+        const ITERS: u64 = 200;
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|tid| {
+                let alloc = Arc::clone(&alloc);
+                thread::spawn(move || {
+                    let sizes = [16u64, 24, 40, 64, 96, 128];
+                    for i in 0..ITERS {
+                        let len = sizes[(i as usize) % sizes.len()];
+                        let slice = alloc.alloc(len).unwrap();
+                        let pat = (tid as u8).wrapping_add(i as u8);
+                        let buf = vec![pat; len as usize];
+                        slice.write(&buf).unwrap();
+                        let got = slice.read().unwrap();
+                        assert_eq!(
+                            got, buf,
+                            "thread {tid} iter {i}: read-back mismatch \
+                             (overlapping allocation?)"
+                        );
+                        alloc.dealloc(slice).unwrap();
+                    }
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // After every alloc has been paired with a dealloc, the arena should
+        // be empty: the tail-coalesce path eventually discards everything
+        // back to the 48-byte header.
+        assert_eq!(alloc.len().unwrap(), ALFF_HDR_OFFSET);
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn concurrent_realloc_grow_shrink_data_integrity() {
+        // Hammer realloc — tail-grow, tail-shrink, in-place merge, and
+        // copy-and-move paths all share the same Mutex.  Each thread tracks
+        // its own slice across reallocs and verifies the prefix it wrote
+        // earlier is preserved across every grow.
+        use std::sync::Arc;
+        use std::thread;
+
+        let (alloc, path) = mk_ff("concurrent_realloc");
+        let _g = Guard(path.clone());
+        let alloc = Arc::new(alloc);
+
+        const THREADS: u64 = 6;
+        const ITERS: u64 = 120;
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|tid| {
+                let alloc = Arc::clone(&alloc);
+                thread::spawn(move || {
+                    let pat = (tid as u8).wrapping_add(0x40);
+                    let mut slice = alloc.alloc(16).unwrap();
+                    slice.write(&vec![pat; 16]).unwrap();
+                    let mut prev_len = 16u64;
+
+                    // Sizes oscillate up and down to exercise both branches.
+                    let sizes = [32u64, 64, 24, 96, 16, 128, 48];
+                    for i in 0..ITERS {
+                        let new_len = sizes[(i as usize) % sizes.len()];
+                        slice = alloc.realloc(slice, new_len).unwrap();
+
+                        // The bytes the *current* thread previously wrote
+                        // (up to min(prev_len, new_len)) must still be intact.
+                        let keep = prev_len.min(new_len) as usize;
+                        let got = slice.read().unwrap();
+                        for (j, &b) in got.iter().take(keep).enumerate() {
+                            assert_eq!(
+                                b, pat,
+                                "thread {tid} iter {i}: byte {j} clobbered \
+                                 by another thread's realloc"
+                            );
+                        }
+
+                        // Re-stamp the full new length so the next iteration
+                        // can re-verify against `pat`.
+                        slice.write(&vec![pat; new_len as usize]).unwrap();
+                        prev_len = new_len;
+                    }
+
+                    alloc.dealloc(slice).unwrap();
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Final length is not asserted: non-adjacent mid-arena dealloc calls
+        // can leave coalesced free blocks in the list rather than discarding
+        // to the tail.  What matters is that no operation errored mid-run
+        // and the allocator survives a reopen with the free list intact.
+        drop(alloc);
+        let reopened = FirstFitBStackAllocator::new(BStack::open(&path).unwrap()).unwrap();
+        let _ = reopened.alloc(16).unwrap();
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn concurrent_tail_thrash() {
+        // Hammer the tail paths — alloc → tail-grow → tail-shrink → dealloc —
+        // from many threads on one allocator.  Whether each individual op
+        // actually lands on the tail depends on the interleaving (another
+        // thread's allocation can sit above this one), so this is about
+        // exercising the `recovery_needed` CAS, the tail-grow extend, the
+        // in-bucket realloc shrink, and the dealloc/cascade paths under
+        // contention — not about asserting a specific final stack size.
+        use std::sync::Arc;
+        use std::thread;
+
+        let (alloc, path) = mk_ff("tail_thrash");
+        let _g = Guard(path.clone());
+        let alloc = Arc::new(alloc);
+
+        const THREADS: u64 = 6;
+        const ITERS: u64 = 80;
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let alloc = Arc::clone(&alloc);
+                thread::spawn(move || {
+                    for _ in 0..ITERS {
+                        let s = alloc.alloc(32).unwrap();
+                        // Tail-grow path (extend underlying stack).
+                        let s = alloc.realloc(s, 64).unwrap();
+                        // Tail-shrink path (in-bucket — same block).
+                        let s = alloc.realloc(s, 16).unwrap();
+                        alloc.dealloc(s).unwrap();
+                    }
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Final stack length is not asserted: a non-tail-resident realloc
+        // 64→16 stays in-bucket (block stays 64 B) and its subsequent
+        // dealloc misses the tail-discard fast path, so the cascade only
+        // catches the blocks that happen to be tail-resident at join time.
+        // What we *can* assert is that no operation errored mid-run and the
+        // allocator is openable from disk with a usable free list.
+        drop(alloc);
+        let reopened = FirstFitBStackAllocator::new(BStack::open(&path).unwrap()).unwrap();
+        let _ = reopened.alloc(16).unwrap();
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn recovery_needed_already_set_rejects_mutation() {
+        // Manually set the on-disk `recovery_needed` flag to 1 (simulating a
+        // prior crash mid-mutation) and verify the next free-list-touching
+        // operation surfaces the CAS failure as an error instead of silently
+        // proceeding on top of possibly-inconsistent state.
+        use crate::BStack;
+
+        let (alloc, path) = mk_ff("recovery_cas");
+        let _g = Guard(path.clone());
+
+        // Build a populated free list: alloc two blocks, free the first so
+        // the next alloc must walk and unlink — which is what calls
+        // `set_recovery_needed`.
+        let a = alloc.alloc(64).unwrap();
+        let _b = alloc.alloc(64).unwrap();
+        alloc.dealloc(a).unwrap();
+
+        // Manually poke the recovery_needed flag.  Layout: payload offset 24
+        // = OFFSET_SIZE(16) + magic(8); the flag occupies the next 4 bytes.
+        alloc
+            .stack()
+            .set(24u64, 1u32.to_le_bytes().as_slice())
+            .unwrap();
+
+        // Any operation that goes through `set_recovery_needed` should now
+        // fail with the recovery-needed CAS error.  `alloc(64)` reuses the
+        // freed slot, so it walks the free list and calls `unlink_block`.
+        let err = alloc.alloc(64).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("recovery"),
+            "expected recovery_needed error, got: {msg}"
+        );
+
+        // Reopening must now run recovery (because the flag is set on disk)
+        // and succeed without error, leaving the stack usable again.
+        drop(alloc);
+        let reopened = FirstFitBStackAllocator::new(BStack::open(&path).unwrap()).unwrap();
+        // The recovered allocator should still be able to satisfy an alloc.
+        let _ = reopened.alloc(16).unwrap();
+    }
 }
 
 // -------------------------------------------------------------------------

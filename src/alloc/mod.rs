@@ -34,8 +34,9 @@
 //!   on disk in a doubly-linked intrusive free list and reused for future
 //!   allocations, so on-disk size does not grow without bound.  Adjacent free
 //!   blocks are coalesced automatically on `dealloc`.  A `recovery_needed` flag
-//!   enables automatic free-list reconstruction after a crash.  `Send` but not
-//!   `Sync` — each instance must be used from at most one thread at a time.
+//!   enables automatic free-list reconstruction after a crash.  `Send` without
+//!   the `atomic` feature (not `Sync`); `Send + Sync` with `atomic`, where an
+//!   internal `Mutex` serializes free-list mutation and stack extension.
 //!
 //! * [`GhostTreeBstackAllocator`] — a pure-AVL general-purpose allocator
 //!   (requires `alloc` feature).  Free blocks store their AVL node inline at

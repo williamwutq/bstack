@@ -362,7 +362,9 @@
 //!
 //! * [`FirstFitBStackAllocator`] — A persistent first-fit free-list allocator
 //!   that reuses freed regions to prevent unbounded file growth.  Requires both
-//!   `alloc` and `set` features.  `Send` but not `Sync`.
+//!   `alloc` and `set` features.  `Send` in all configurations; also `Sync`
+//!   with the `atomic` feature, where an internal `Mutex` serializes free-list
+//!   mutation and stack extension.
 //!
 //! * [`GhostTreeBstackAllocator`] — A pure-AVL general-purpose allocator with
 //!   zero-overhead live allocations.  Free blocks store their AVL node inline,

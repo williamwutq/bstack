@@ -10,6 +10,8 @@
 
 #include "bstack_alloc.h"
 
+#include <errno.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -741,6 +743,278 @@ static int test_fuzz_reopen(void)
 }
 
 /* =========================================================================
+ * Concurrency tests — only meaningful when the allocator owns an internal
+ * mutex, which it does under BSTACK_FEATURE_ATOMIC.  Without the feature,
+ * sharing one allocator across threads is undefined and these tests would
+ * race on the on-disk free list with no protection.
+ * ====================================================================== */
+
+#ifdef BSTACK_FEATURE_ATOMIC
+
+/* ALFF header layout — mirrored from bstack_alloc.c for the flag poke. */
+#define ALFF_FLAGS_OFFSET   24  /* OFFSET_SIZE(16) + magic(8) */
+
+/* --- concurrent alloc / dealloc data integrity ------------------------ */
+
+#define FF_THREADS        8
+#define FF_ITERS          200
+
+typedef struct {
+    bstack_allocator_t *a;
+    int                 tid;
+    int                 ok;
+} ff_worker_arg_t;
+
+static void *ff_alloc_dealloc_worker(void *raw)
+{
+    ff_worker_arg_t *w = raw;
+    static const uint64_t sizes[] = {16, 24, 40, 64, 96, 128};
+    w->ok = 1;
+
+    for (int i = 0; i < FF_ITERS; i++) {
+        uint64_t len = sizes[i % (int)(sizeof sizes / sizeof sizes[0])];
+        bstack_slice_t s;
+        if (bstack_allocator_alloc(w->a, len, &s) != 0) { w->ok = 0; return NULL; }
+
+        uint8_t pat = (uint8_t)(w->tid + i);
+        uint8_t *wbuf = malloc((size_t)len);
+        uint8_t *rbuf = malloc((size_t)len);
+        if (!wbuf || !rbuf) { free(wbuf); free(rbuf); w->ok = 0; return NULL; }
+        memset(wbuf, pat, (size_t)len);
+
+        if (bstack_slice_write(s, wbuf, (size_t)len) != 0 ||
+            bstack_slice_read(s, rbuf) != 0 ||
+            memcmp(wbuf, rbuf, (size_t)len) != 0) {
+            free(wbuf); free(rbuf); w->ok = 0; return NULL;
+        }
+        free(wbuf); free(rbuf);
+
+        if (bstack_allocator_dealloc(w->a, s) != 0) { w->ok = 0; return NULL; }
+    }
+    return NULL;
+}
+
+static int test_concurrent_alloc_dealloc_data_integrity(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    first_fit_bstack_allocator_t *a = first_fit_bstack_allocator_new(bs);
+    CHECK(a);
+
+    pthread_t       threads[FF_THREADS];
+    ff_worker_arg_t args[FF_THREADS];
+    for (int i = 0; i < FF_THREADS; i++) {
+        args[i].a   = (bstack_allocator_t *)a;
+        args[i].tid = i;
+        args[i].ok  = 1;
+        pthread_create(&threads[i], NULL, ff_alloc_dealloc_worker, &args[i]);
+    }
+    for (int i = 0; i < FF_THREADS; i++) pthread_join(threads[i], NULL);
+    for (int i = 0; i < FF_THREADS; i++) CHECK(args[i].ok);
+
+    bstack_close(first_fit_bstack_allocator_into_stack(a));
+    ff_unlink(tmp); return 0;
+}
+
+/* --- concurrent realloc grow/shrink data integrity --------------------- */
+
+#define FF_REALLOC_THREADS  6
+#define FF_REALLOC_ITERS    120
+
+typedef struct {
+    bstack_allocator_t *a;
+    int                 tid;
+    int                 ok;
+} ff_realloc_arg_t;
+
+static void *ff_realloc_worker(void *raw)
+{
+    ff_realloc_arg_t *w = raw;
+    static const uint64_t sizes[] = {32, 64, 24, 96, 16, 128, 48};
+    uint8_t pat = (uint8_t)(w->tid + 0x40);
+    w->ok = 1;
+
+    bstack_slice_t s;
+    if (bstack_allocator_alloc(w->a, 16, &s) != 0) { w->ok = 0; return NULL; }
+    uint8_t init_buf[16]; memset(init_buf, pat, 16);
+    if (bstack_slice_write(s, init_buf, 16) != 0) { w->ok = 0; return NULL; }
+    uint64_t prev_len = 16;
+
+    for (int i = 0; i < FF_REALLOC_ITERS; i++) {
+        uint64_t new_len = sizes[i % (int)(sizeof sizes / sizeof sizes[0])];
+        bstack_slice_t s2;
+        if (bstack_allocator_realloc(w->a, s, new_len, &s2) != 0) {
+            w->ok = 0; return NULL;
+        }
+        s = s2;
+
+        size_t keep = (prev_len < new_len) ? (size_t)prev_len : (size_t)new_len;
+        uint8_t *rbuf = malloc((size_t)new_len);
+        if (!rbuf) { w->ok = 0; return NULL; }
+        if (bstack_slice_read(s, rbuf) != 0) { free(rbuf); w->ok = 0; return NULL; }
+        for (size_t j = 0; j < keep; j++) {
+            if (rbuf[j] != pat) {
+                fprintf(stderr,
+                    "  thread %d iter %d: byte %zu clobbered "
+                    "(got 0x%02x, want 0x%02x)\n",
+                    w->tid, i, j, rbuf[j], pat);
+                free(rbuf); w->ok = 0; return NULL;
+            }
+        }
+        free(rbuf);
+
+        uint8_t *wbuf = malloc((size_t)new_len);
+        if (!wbuf) { w->ok = 0; return NULL; }
+        memset(wbuf, pat, (size_t)new_len);
+        if (bstack_slice_write(s, wbuf, (size_t)new_len) != 0) {
+            free(wbuf); w->ok = 0; return NULL;
+        }
+        free(wbuf);
+        prev_len = new_len;
+    }
+
+    if (bstack_allocator_dealloc(w->a, s) != 0) { w->ok = 0; return NULL; }
+    return NULL;
+}
+
+static int test_concurrent_realloc_grow_shrink_data_integrity(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    first_fit_bstack_allocator_t *a = first_fit_bstack_allocator_new(bs);
+    CHECK(a);
+
+    pthread_t        threads[FF_REALLOC_THREADS];
+    ff_realloc_arg_t args[FF_REALLOC_THREADS];
+    for (int i = 0; i < FF_REALLOC_THREADS; i++) {
+        args[i].a   = (bstack_allocator_t *)a;
+        args[i].tid = i;
+        args[i].ok  = 1;
+        pthread_create(&threads[i], NULL, ff_realloc_worker, &args[i]);
+    }
+    for (int i = 0; i < FF_REALLOC_THREADS; i++) pthread_join(threads[i], NULL);
+    for (int i = 0; i < FF_REALLOC_THREADS; i++) CHECK(args[i].ok);
+
+    /* Final length is not asserted: non-adjacent mid-arena dealloc calls
+     * can leave coalesced free blocks in the list rather than discarding
+     * to the tail.  Reopen to confirm the free list survived intact. */
+    bstack_close(first_fit_bstack_allocator_into_stack(a));
+    bstack_t *bs2 = bstack_open(tmp); CHECK(bs2);
+    first_fit_bstack_allocator_t *a2 = first_fit_bstack_allocator_new(bs2);
+    CHECK(a2);
+    bstack_slice_t probe;
+    CHECK(bstack_allocator_alloc((bstack_allocator_t *)a2, 16, &probe) == 0);
+    bstack_close(first_fit_bstack_allocator_into_stack(a2));
+
+    ff_unlink(tmp); return 0;
+}
+
+/* --- concurrent tail thrash ------------------------------------------- */
+
+#define FF_TAIL_THREADS  6
+#define FF_TAIL_ITERS    80
+
+static void *ff_tail_worker(void *raw)
+{
+    bstack_allocator_t *a = raw;
+    for (int i = 0; i < FF_TAIL_ITERS; i++) {
+        bstack_slice_t s, s2, s3;
+        if (bstack_allocator_alloc(a, 32, &s) != 0) return (void *)(intptr_t)-1;
+        if (bstack_allocator_realloc(a, s, 64, &s2) != 0)
+            return (void *)(intptr_t)-1;
+        if (bstack_allocator_realloc(a, s2, 16, &s3) != 0)
+            return (void *)(intptr_t)-1;
+        if (bstack_allocator_dealloc(a, s3) != 0)
+            return (void *)(intptr_t)-1;
+    }
+    return NULL;
+}
+
+static int test_concurrent_tail_thrash(void)
+{
+    /* Hammer the tail paths from many threads.  Whether each individual op
+     * actually lands on the tail depends on the interleaving (another
+     * thread's allocation can sit above this one), so this is about
+     * exercising the recovery_needed CAS, the tail-grow extend, the
+     * in-bucket realloc shrink, and the dealloc/cascade paths under
+     * contention — not about asserting a specific final stack size. */
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    first_fit_bstack_allocator_t *a = first_fit_bstack_allocator_new(bs);
+    CHECK(a);
+
+    pthread_t threads[FF_TAIL_THREADS];
+    for (int i = 0; i < FF_TAIL_THREADS; i++)
+        pthread_create(&threads[i], NULL, ff_tail_worker,
+                       (bstack_allocator_t *)a);
+    for (int i = 0; i < FF_TAIL_THREADS; i++) {
+        void *ret = NULL;
+        pthread_join(threads[i], &ret);
+        CHECK(ret == NULL);
+    }
+
+    /* Final stack length is not asserted: a non-tail-resident realloc
+     * 64→16 stays in-bucket (block stays 64 B) and its subsequent dealloc
+     * misses the tail-discard fast path, so the cascade only catches the
+     * blocks that happen to be tail-resident at join time.  Reopen instead
+     * to confirm the free list survived intact. */
+    bstack_close(first_fit_bstack_allocator_into_stack(a));
+    bstack_t *bs2 = bstack_open(tmp); CHECK(bs2);
+    first_fit_bstack_allocator_t *a2 = first_fit_bstack_allocator_new(bs2);
+    CHECK(a2);
+    bstack_slice_t probe;
+    CHECK(bstack_allocator_alloc((bstack_allocator_t *)a2, 16, &probe) == 0);
+    bstack_close(first_fit_bstack_allocator_into_stack(a2));
+
+    ff_unlink(tmp); return 0;
+}
+
+/* --- recovery_needed CAS error propagation ---------------------------- */
+
+static int test_recovery_needed_already_set_rejects_mutation(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    first_fit_bstack_allocator_t *a = first_fit_bstack_allocator_new(bs);
+    CHECK(a);
+
+    /* Populate the free list so the next alloc must walk and unlink — that
+     * is the path that calls set_recovery_needed.  alloc on an empty free
+     * list just pushes the tail and bypasses the flag. */
+    bstack_slice_t sa, sb;
+    CHECK(bstack_allocator_alloc((bstack_allocator_t *)a, 64, &sa) == 0);
+    CHECK(bstack_allocator_alloc((bstack_allocator_t *)a, 64, &sb) == 0);
+    CHECK(bstack_allocator_dealloc((bstack_allocator_t *)a, sa) == 0);
+
+    /* Manually poke recovery_needed = 1 on disk. */
+    bstack_t *stack = bstack_allocator_stack((bstack_allocator_t *)a);
+    uint8_t one[4] = {1, 0, 0, 0};
+    CHECK(bstack_set(stack, ALFF_FLAGS_OFFSET, one, 4) == 0);
+
+    /* Reusing the freed slot now walks the free list, which calls
+     * set_recovery_needed and must fail because the flag is already 1. */
+    bstack_slice_t sc;
+    errno = 0;
+    int rc = bstack_allocator_alloc((bstack_allocator_t *)a, 64, &sc);
+    CHECK(rc == -1);
+    CHECK(errno == EINVAL);
+
+    /* Reopen: the on-disk flag is still set, so first_fit_bstack_allocator_new
+     * must run recovery and return a usable allocator. */
+    bstack_close(first_fit_bstack_allocator_into_stack(a));
+    bstack_t *bs2 = bstack_open(tmp); CHECK(bs2);
+    first_fit_bstack_allocator_t *a2 = first_fit_bstack_allocator_new(bs2);
+    CHECK(a2);
+    bstack_slice_t probe;
+    CHECK(bstack_allocator_alloc((bstack_allocator_t *)a2, 16, &probe) == 0);
+    bstack_close(first_fit_bstack_allocator_into_stack(a2));
+
+    ff_unlink(tmp); return 0;
+}
+
+#endif /* BSTACK_FEATURE_ATOMIC */
+
+/* =========================================================================
  * main
  * ====================================================================== */
 
@@ -759,6 +1033,16 @@ int main(void)
     T(test_fuzz_alloc_dealloc);
     T(test_fuzz_alloc_realloc_dealloc);
     T(test_fuzz_reopen);
+
+#ifdef BSTACK_FEATURE_ATOMIC
+    /* Concurrency — only meaningful when the allocator owns an internal
+     * mutex (BSTACK_FEATURE_ATOMIC).  Without it, sharing one handle
+     * across threads is undefined. */
+    T(test_concurrent_alloc_dealloc_data_integrity);
+    T(test_concurrent_realloc_grow_shrink_data_integrity);
+    T(test_concurrent_tail_thrash);
+    T(test_recovery_needed_already_set_rejects_mutation);
+#endif
 
     printf("\n%d/%d passed\n", g_passed, g_total);
     return (g_passed == g_total) ? 0 : 1;
