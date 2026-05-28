@@ -1007,6 +1007,7 @@ impl BStackAllocator for FirstFitBStackAllocator {
                 match aligned_new_len.cmp(&aligned_current_len) {
                     std::cmp::Ordering::Equal => return Ok(slice), // Included but this should never happen
                     std::cmp::Ordering::Greater => {
+                        self.set_recovery_needed()?;
                         // Extend payload by the delta; footer moves forward
                         self.stack.extend(aligned_new_len - aligned_current_len)?;
                         // Zero from slice.len() through the old footer area.  The old footer
@@ -1025,6 +1026,7 @@ impl BStackAllocator for FirstFitBStackAllocator {
                             slice.start() + aligned_new_len,
                             aligned_new_len.to_le_bytes(),
                         )?;
+                        self.clear_recovery_needed()?;
                         // SAFETY: slice extended in place at tail
                         return Ok(unsafe {
                             BStackSlice::from_raw_parts(self, slice.start(), new_len)
