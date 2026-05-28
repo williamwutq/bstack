@@ -246,6 +246,7 @@ impl FirstFitBStackAllocator {
     fn set_recovery_needed(&self) -> io::Result<()> {
         // Set recovery_needed = 1 if it is not already set, and return an error if it is already set.
         // This detects concurrent multi-step operations, which are not supported.
+        // Recovery-needed serves as a non-reentrant mutex for mutating the free list or resizing the stack.
         if !self.stack.cas(
             Self::OFFSET_SIZE + 8,
             [0u8; 4].as_slice(),
@@ -271,6 +272,7 @@ impl FirstFitBStackAllocator {
     fn clear_recovery_needed(&self) -> io::Result<()> {
         // Clear recovery_needed = 0 if it is currently set, and return an error if it is not set.
         // This detects concurrent multi-step operations, which are not supported.
+        // In theory, this should not happen because of the prevention of set_recovery_needed
         if !self.stack.cas(
             Self::OFFSET_SIZE + 8,
             1u32.to_le_bytes().as_slice(),
@@ -652,6 +654,7 @@ impl FirstFitBStackAllocator {
             }
             // New tail is a free block; unlink it and discard it
             if !needs_clear {
+                #[cfg(not(feature = "atomic"))]
                 self.set_recovery_needed()?;
                 needs_clear = true;
             }
@@ -659,6 +662,7 @@ impl FirstFitBStackAllocator {
             self.stack.discard(sz + Self::BLOCK_OVERHEAD_SIZE)?;
         }
         if needs_clear {
+            #[cfg(not(feature = "atomic"))]
             self.clear_recovery_needed()?;
         }
         Ok(())
@@ -897,11 +901,12 @@ impl BStackAllocator for FirstFitBStackAllocator {
             // Set recovery_needed before the discard so that a crash between discard and
             // cascade_discard_free_tail (which could leave a free block at the new tail)
             // is detected on reopen and repaired by recovery.
-            #[cfg(not(feature = "atomic"))]
-            self.set_recovery_needed()?;
             self.stack
                 .discard(aligned_len + Self::BLOCK_OVERHEAD_SIZE)?;
+            // When not atomic, cascade_discard_free_tail handles set and clearing recovery_needed,
+            // so we only call it when atomic is enabled.
             self.cascade_discard_free_tail()?;
+            #[cfg(feature = "atomic")]
             self.clear_recovery_needed()?;
             return Ok(());
         }
