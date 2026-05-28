@@ -658,14 +658,14 @@ impl FirstFitBStackAllocator {
     /// This maintains the invariant that no free block ever sits at the stack tail, which in turn
     /// makes tail reclamation inside `add_to_free_list` impossible (and therefore omitted).
     ///
-    /// Sets `recovery_needed` only if at least one cascade discard is required, and clears it
-    /// once after all iterations so the cost is one set + one clear regardless of cascade depth.
+    /// Recovery management: the caller (`dealloc` tail path) is the sole manager of
+    /// `recovery_needed` and must set it before invoking this function and clear it after.
+    /// This avoids a double-set under the CAS-based atomic helpers and matches the C port.
     ///
     /// With the `atomic` feature the caller (`dealloc`) holds `self.lock` for the duration,
     /// so the free-list unlinks and tail discards here are serialised against other threads.
     fn cascade_discard_free_tail(&self) -> io::Result<()> {
         let arena_start = Self::OFFSET_SIZE + Self::HEADER_SIZE;
-        let mut needs_clear = false;
         loop {
             let tail = self.stack.len()?;
             if tail <= arena_start {
@@ -691,15 +691,8 @@ impl FirstFitBStackAllocator {
                 break;
             }
             // New tail is a free block; unlink it and discard it
-            if !needs_clear {
-                self.set_recovery_needed()?;
-                needs_clear = true;
-            }
             self.unlink_from_free_list(hdr + Self::BLOCK_HEADER_SIZE)?;
             self.stack.discard(sz + Self::BLOCK_OVERHEAD_SIZE)?;
-        }
-        if needs_clear {
-            self.clear_recovery_needed()?;
         }
         Ok(())
     }
@@ -823,7 +816,10 @@ impl FirstFitBStackAllocator {
         self.stack
             .set(Self::FREE_HEAD_OFFSET, new_free_head.to_le_bytes())?;
 
-        self.clear_recovery_needed()
+        // Authoritative reset: recovery may have been triggered with the on-disk flag already
+        // clear (e.g. an out-of-range free_head in `new`), so write 0 directly rather than via
+        // the CAS clear, which under the `atomic` feature would fail when the flag is not 1.
+        self.stack.set(Self::OFFSET_SIZE + 8, [0u8; 4].as_slice())
     }
 }
 
@@ -933,13 +929,17 @@ impl BStackAllocator for FirstFitBStackAllocator {
         // if slice.start() + aligned_len == self.len() - Self::BLOCK_FOOTER_SIZE, just discard it.
         let current_tail = self.stack.len()?;
         if slice.start() + aligned_len == current_tail - Self::BLOCK_FOOTER_SIZE {
-            // The discard is a single atomic BStack call. cascade_discard_free_tail sets and
-            // clears recovery_needed itself, and only when it actually has to cascade, so the
-            // multi-step part (the cascade) is the only window that carries the flag.
+            // Set recovery_needed before the bare discard (0.2.1 fix) so a crash anywhere
+            // in the discard + cascade sequence is detected on reopen — without it, a crash
+            // between the discard and cascade's first unlink could leave a free block at the
+            // new tail with the flag clear, violating the "tail is always allocated" invariant
+            // silently.  This function is the sole manager of the flag for the tail path;
+            // cascade_discard_free_tail does not touch it.
+            self.set_recovery_needed()?;
             self.stack
                 .discard(aligned_len + Self::BLOCK_OVERHEAD_SIZE)?;
             self.cascade_discard_free_tail()?;
-            return Ok(());
+            return self.clear_recovery_needed();
         }
         self.set_recovery_needed()?;
         self.add_to_free_list(slice.start())?;
