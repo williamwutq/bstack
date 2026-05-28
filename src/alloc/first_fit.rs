@@ -6,6 +6,8 @@ use std::fmt;
 use std::io;
 #[cfg(not(feature = "atomic"))]
 use std::marker::PhantomData;
+#[cfg(feature = "atomic")]
+use std::sync::Mutex;
 
 /// Full magic for FirstFitBStackAllocator
 #[cfg(feature = "set")]
@@ -76,8 +78,8 @@ const ALFF_MAGIC_PREFIX: [u8; 6] = *b"ALFF\x00\x01";
 /// # Crash consistency
 ///
 /// Any operation that issues more than one [`BStack`] call sets the
-/// `recovery_needed` flag in the allocator header before mutating the free
-/// list and clears it after all writes complete.  On the next
+/// `recovery_needed` flag in the allocator header immediately before the
+/// free-list mutation and clears it once all writes complete.  On the next
 /// [`FirstFitBStackAllocator::new`] call, if `recovery_needed` is set, a
 /// single linear scan of the arena rebuilds the free list from the `is_free`
 /// flags in block headers — no stored pointer values are trusted.  Any
@@ -86,18 +88,34 @@ const ALFF_MAGIC_PREFIX: [u8; 6] = *b"ALFF\x00\x01";
 ///
 /// # Thread safety
 ///
-/// `FirstFitBStackAllocator` is **`Send`** — ownership can be transferred to
-/// another thread — but **not `Sync`**.  All allocator operations take `&self`
-/// and mutate the on-disk free list through `BStack`; concurrent shared access
-/// from multiple threads would race on that state.  Each instance must be used
-/// from at most one thread at a time.
+/// `FirstFitBStackAllocator` is always **`Send`** — ownership can be
+/// transferred to another thread.
+///
+/// Without the `atomic` feature it is **not `Sync`**: operations take `&self`
+/// and mutate the on-disk free list through `BStack`, so concurrent shared
+/// access from multiple threads would race on that state.  Each instance must
+/// be used from at most one thread at a time.
+///
+/// With the `atomic` feature it **is `Sync`**.  An internal [`Mutex`] serialises
+/// the two operations that are not already serialised by `BStack`'s own
+/// locking: mutating the free list and extending/discarding the stack tail.
+/// The `recovery_needed` flag — updated with a compare-and-swap, which costs
+/// nothing over the disk write it has to perform anyway — additionally guards
+/// against operating on a stack left in a needs-recovery state.  Read-only
+/// access within an already-allocated block (e.g. growing in place inside the
+/// existing block) is not serialised, as such bytes are owned by the caller
+/// and never touched by another thread's free-list walk.
 ///
 /// ```
 /// fn assert_send<T: Send>() {}
 /// assert_send::<bstack::FirstFitBStackAllocator>();
 /// ```
 ///
-/// ```compile_fail
+/// Without `atomic` the type is `!Sync` (this fails to compile); with `atomic`
+/// the internal `Mutex` makes it `Sync` (this compiles):
+///
+#[cfg_attr(not(feature = "atomic"), doc = "```compile_fail")]
+#[cfg_attr(feature = "atomic", doc = "```")]
 /// fn assert_sync<T: Sync>() {}
 /// assert_sync::<bstack::FirstFitBStackAllocator>();
 /// ```
@@ -134,6 +152,13 @@ const ALFF_MAGIC_PREFIX: [u8; 6] = *b"ALFF\x00\x01";
 #[cfg(feature = "set")]
 pub struct FirstFitBStackAllocator {
     stack: BStack,
+    /// Serialises the operations that span multiple [`BStack`] calls and are
+    /// therefore not made atomic by `BStack`'s own locking: free-list mutation
+    /// and stack extension/discard.  It is **not** taken for general writes
+    /// within an already-allocated block, which are owned by the caller and
+    /// safe to perform without it.
+    #[cfg(feature = "atomic")]
+    lock: Mutex<()>,
     #[cfg(not(feature = "atomic"))]
     _not_sync: PhantomData<Cell<()>>,
 }
@@ -186,6 +211,8 @@ impl FirstFitBStackAllocator {
             stack.push(hdr)?;
             return Ok(Self {
                 stack,
+                #[cfg(feature = "atomic")]
+                lock: Mutex::new(()),
                 #[cfg(not(feature = "atomic"))]
                 _not_sync: PhantomData,
             });
@@ -225,6 +252,8 @@ impl FirstFitBStackAllocator {
         }
         let alloc = Self {
             stack,
+            #[cfg(feature = "atomic")]
+            lock: Mutex::new(()),
             #[cfg(not(feature = "atomic"))]
             _not_sync: PhantomData,
         };
@@ -244,17 +273,21 @@ impl FirstFitBStackAllocator {
     #[cfg(feature = "atomic")]
     #[inline]
     fn set_recovery_needed(&self) -> io::Result<()> {
-        // Set recovery_needed = 1 if it is not already set, and return an error if it is already set.
-        // This detects concurrent multi-step operations, which are not supported.
-        // Recovery-needed serves as a non-reentrant mutex for mutating the free list or resizing the stack.
+        // Set recovery_needed = 1 via CAS, expecting it to currently be 0.
+        // Mutual exclusion is provided by `self.lock`; this CAS is a no-cost
+        // consistency check layered on the disk write we must do anyway: a
+        // failure means the flag was left set by a previously crashed or failed
+        // operation, so the stack needs recovery (reopen) before it is safe to
+        // mutate, and we surface that as an error rather than proceeding.
         if !self.stack.cas(
             Self::OFFSET_SIZE + 8,
             [0u8; 4].as_slice(),
             1u32.to_le_bytes().as_slice(),
         )? {
-            // If the CAS fails, it means recovery_needed was already set, which might indicate a concurrent access
+            // CAS failed: recovery_needed was already set, so a prior operation
+            // crashed or failed mid-mutation and the stack must be recovered.
             Err(io::Error::other(
-                "concurrent access detected: recovery already needed",
+                "stack needs recovery: recovery_needed already set",
             ))
         } else {
             Ok(())
@@ -270,17 +303,19 @@ impl FirstFitBStackAllocator {
     #[cfg(feature = "atomic")]
     #[inline]
     fn clear_recovery_needed(&self) -> io::Result<()> {
-        // Clear recovery_needed = 0 if it is currently set, and return an error if it is not set.
-        // This detects concurrent multi-step operations, which are not supported.
-        // In theory, this should not happen because of the prevention of set_recovery_needed
+        // Clear recovery_needed = 0 via CAS, expecting it to currently be 1.
+        // As with `set_recovery_needed`, mutual exclusion comes from `self.lock`;
+        // this CAS is a no-cost check over the disk write. A failure means the
+        // flag was not set when we expected it to be, indicating the paired set
+        // was lost or the flag was disturbed out of band.
         if !self.stack.cas(
             Self::OFFSET_SIZE + 8,
             1u32.to_le_bytes().as_slice(),
             [0u8; 4].as_slice(),
         )? {
-            // If the CAS fails, it means recovery_needed was already cleared, which might indicate a concurrent access
+            // CAS failed: recovery_needed was not set when we expected it to be.
             Err(io::Error::other(
-                "concurrent access detected: recovery already cleared",
+                "recovery_needed was not set when clearing",
             ))
         } else {
             Ok(())
@@ -625,6 +660,9 @@ impl FirstFitBStackAllocator {
     ///
     /// Sets `recovery_needed` only if at least one cascade discard is required, and clears it
     /// once after all iterations so the cost is one set + one clear regardless of cascade depth.
+    ///
+    /// With the `atomic` feature the caller (`dealloc`) holds `self.lock` for the duration,
+    /// so the free-list unlinks and tail discards here are serialised against other threads.
     fn cascade_discard_free_tail(&self) -> io::Result<()> {
         let arena_start = Self::OFFSET_SIZE + Self::HEADER_SIZE;
         let mut needs_clear = false;
@@ -654,7 +692,6 @@ impl FirstFitBStackAllocator {
             }
             // New tail is a free block; unlink it and discard it
             if !needs_clear {
-                #[cfg(not(feature = "atomic"))]
                 self.set_recovery_needed()?;
                 needs_clear = true;
             }
@@ -662,7 +699,6 @@ impl FirstFitBStackAllocator {
             self.stack.discard(sz + Self::BLOCK_OVERHEAD_SIZE)?;
         }
         if needs_clear {
-            #[cfg(not(feature = "atomic"))]
             self.clear_recovery_needed()?;
         }
         Ok(())
@@ -815,10 +851,11 @@ impl BStackAllocator for FirstFitBStackAllocator {
         // Heap allocate zero buffer; both branches below need a buffer of this exact size.
         let mut buf = vec![0u8; (Self::BLOCK_OVERHEAD_SIZE + aligned_len) as usize];
 
-        // If the atomic feature is enabled, we use recovery_needed as a lock to prevent concurrent
-        // modifications to the free list, which is not thread-safe.
+        // Hold the lock across the free-list search and the mutation/extension that follows,
+        // so the read-modify-write of the free list (and any tail push) is atomic w.r.t. other
+        // threads. recovery_needed is set only around the actual mutation below.
         #[cfg(feature = "atomic")]
-        self.set_recovery_needed()?;
+        let _guard = self.lock.lock().unwrap();
 
         let block_found = self.find_large_enough_block(aligned_len)?;
         if block_found.0 != 0 {
@@ -827,7 +864,6 @@ impl BStackAllocator for FirstFitBStackAllocator {
 
             // Set recovery needed before modifying the free list and clear it after,
             // so that if a crash happens in the middle, the allocator can detect it and recover the free list in the next run.
-            #[cfg(not(feature = "atomic"))]
             self.set_recovery_needed()?;
             self.unlink_block(
                 block_found.0,
@@ -852,11 +888,9 @@ impl BStackAllocator for FirstFitBStackAllocator {
             buf[..8].copy_from_slice(&aligned_len.to_le_bytes());
             buf[(aligned_len + Self::BLOCK_HEADER_SIZE) as usize..]
                 .copy_from_slice(&aligned_len.to_le_bytes());
+            // push is a single atomic BStack call, so no recovery_needed marking is required;
+            // the lock above already excludes concurrent tail modification.
             let ptr = self.stack.push(&buf)? + Self::BLOCK_HEADER_SIZE;
-
-            // We need to clean up the flag if atomic feature is enabled
-            #[cfg(feature = "atomic")]
-            self.clear_recovery_needed()?;
             // SAFETY: ptr and len from fresh allocation via self.stack.push
             Ok(unsafe { BStackSlice::from_raw_parts(self, ptr, len) })
         }
@@ -890,27 +924,23 @@ impl BStackAllocator for FirstFitBStackAllocator {
             ));
         }
 
-        // Set recovery_needed before modifying the free list if atomic ops are enabled
+        // Hold the lock across the tail check and the free-list mutation / tail discard, so
+        // both the read of the tail and the write that follows are atomic w.r.t. other threads.
         #[cfg(feature = "atomic")]
-        self.set_recovery_needed()?;
+        let _guard = self.lock.lock().unwrap();
 
         // Special case for dealloc of the tail block:
         // if slice.start() + aligned_len == self.len() - Self::BLOCK_FOOTER_SIZE, just discard it.
         let current_tail = self.stack.len()?;
         if slice.start() + aligned_len == current_tail - Self::BLOCK_FOOTER_SIZE {
-            // Set recovery_needed before the discard so that a crash between discard and
-            // cascade_discard_free_tail (which could leave a free block at the new tail)
-            // is detected on reopen and repaired by recovery.
+            // The discard is a single atomic BStack call. cascade_discard_free_tail sets and
+            // clears recovery_needed itself, and only when it actually has to cascade, so the
+            // multi-step part (the cascade) is the only window that carries the flag.
             self.stack
                 .discard(aligned_len + Self::BLOCK_OVERHEAD_SIZE)?;
-            // When not atomic, cascade_discard_free_tail handles set and clearing recovery_needed,
-            // so we only call it when atomic is enabled.
             self.cascade_discard_free_tail()?;
-            #[cfg(feature = "atomic")]
-            self.clear_recovery_needed()?;
             return Ok(());
         }
-        #[cfg(not(feature = "atomic"))]
         self.set_recovery_needed()?;
         self.add_to_free_list(slice.start())?;
         self.clear_recovery_needed()
@@ -965,63 +995,61 @@ impl BStackAllocator for FirstFitBStackAllocator {
         // by the align_len function, so if new_len is smaller than that, aligned_new_len will be the same as
         // aligned_current_len and we will just return the same slice without shrinking.
         // if slice.start() + aligned_current_len == self.len() - Self::BLOCK_FOOTER_SIZE, just extend or discard.
-        let current_tail = self.stack.len()?;
-        if slice.start() + aligned_current_len == current_tail - Self::BLOCK_FOOTER_SIZE {
-            match aligned_new_len.cmp(&aligned_current_len) {
-                std::cmp::Ordering::Equal => return Ok(slice), // Included but this should never happen
-                std::cmp::Ordering::Greater => {
-                    #[cfg(feature = "atomic")]
-                    {
-                        self.set_recovery_needed()?;
+        //
+        // Hold the lock for the whole tail check + resize: reading the tail and then
+        // extending/discarding it must be atomic w.r.t. other threads' pushes. If this is not
+        // the tail block the guard is dropped and the lock-free in-place paths below run.
+        {
+            #[cfg(feature = "atomic")]
+            let _guard = self.lock.lock().unwrap();
+            let current_tail = self.stack.len()?;
+            if slice.start() + aligned_current_len == current_tail - Self::BLOCK_FOOTER_SIZE {
+                match aligned_new_len.cmp(&aligned_current_len) {
+                    std::cmp::Ordering::Equal => return Ok(slice), // Included but this should never happen
+                    std::cmp::Ordering::Greater => {
+                        // Extend payload by the delta; footer moves forward
+                        self.stack.extend(aligned_new_len - aligned_current_len)?;
+                        // Zero from slice.len() through the old footer area.  The old footer
+                        // (8 bytes at aligned_current_len) is now absorbed into the new payload,
+                        // and bytes [slice.len(), aligned_current_len) may hold stale data from
+                        // a prior larger slice — both must be cleared in one atomic write.
+                        self.stack.zero(
+                            slice.start() + slice.len(),
+                            aligned_current_len + Self::BLOCK_FOOTER_SIZE - slice.len(),
+                        )?;
+                        self.stack.set(
+                            slice.start() - Self::BLOCK_HEADER_SIZE,
+                            aligned_new_len.to_le_bytes(),
+                        )?;
+                        self.stack.set(
+                            slice.start() + aligned_new_len,
+                            aligned_new_len.to_le_bytes(),
+                        )?;
+                        // SAFETY: slice extended in place at tail
+                        return Ok(unsafe {
+                            BStackSlice::from_raw_parts(self, slice.start(), new_len)
+                        });
                     }
-
-                    // Extend payload by the delta; footer moves forward
-                    self.stack.extend(aligned_new_len - aligned_current_len)?;
-                    // Zero from slice.len() through the old footer area.  The old footer
-                    // (8 bytes at aligned_current_len) is now absorbed into the new payload,
-                    // and bytes [slice.len(), aligned_current_len) may hold stale data from
-                    // a prior larger slice — both must be cleared in one atomic write.
-                    self.stack.zero(
-                        slice.start() + slice.len(),
-                        aligned_current_len + Self::BLOCK_FOOTER_SIZE - slice.len(),
-                    )?;
-                    self.stack.set(
-                        slice.start() - Self::BLOCK_HEADER_SIZE,
-                        aligned_new_len.to_le_bytes(),
-                    )?;
-                    self.stack.set(
-                        slice.start() + aligned_new_len,
-                        aligned_new_len.to_le_bytes(),
-                    )?;
-
-                    #[cfg(feature = "atomic")]
-                    {
-                        self.clear_recovery_needed()?;
+                    std::cmp::Ordering::Less => {
+                        // No recovery_needed: the header/footer writes and the discard touch
+                        // only this tail block, not the free list. The lock held above excludes
+                        // concurrent tail modification; within that, the discard is a single
+                        // atomic BStack call.
+                        // Write new footer before discarding so it lands at the right position
+                        self.stack.set(
+                            slice.start() + aligned_new_len,
+                            aligned_new_len.to_le_bytes(),
+                        )?;
+                        self.stack.set(
+                            slice.start() - Self::BLOCK_HEADER_SIZE,
+                            aligned_new_len.to_le_bytes(),
+                        )?;
+                        self.stack.discard(aligned_current_len - aligned_new_len)?;
+                        // SAFETY: slice shrunk in place at tail
+                        return Ok(unsafe {
+                            BStackSlice::from_raw_parts(self, slice.start(), new_len)
+                        });
                     }
-                    // SAFETY: slice extended in place at tail
-                    return Ok(unsafe {
-                        BStackSlice::from_raw_parts(self, slice.start(), new_len)
-                    });
-                }
-                std::cmp::Ordering::Less => {
-                    // Atomic safety: we do not need to set recovery_needed here because we are modifying
-                    // The tail block that is only accessible by this thread and do not actually access the
-                    // free list, so concurrent modifications by other threads that run this allocator should
-                    // not be possible.
-                    // Write new footer before discarding so it lands at the right position
-                    self.stack.set(
-                        slice.start() + aligned_new_len,
-                        aligned_new_len.to_le_bytes(),
-                    )?;
-                    self.stack.set(
-                        slice.start() - Self::BLOCK_HEADER_SIZE,
-                        aligned_new_len.to_le_bytes(),
-                    )?;
-                    self.stack.discard(aligned_current_len - aligned_new_len)?;
-                    // SAFETY: slice shrunk in place at tail
-                    return Ok(unsafe {
-                        BStackSlice::from_raw_parts(self, slice.start(), new_len)
-                    });
                 }
             }
         }
@@ -1046,9 +1074,11 @@ impl BStackAllocator for FirstFitBStackAllocator {
             return Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) });
         }
 
-        // TODO: maybe optimize atomic impl
+        // From here on we either merge with an adjacent free block or allocate a fresh one:
+        // both walk/mutate the free list (and the new-block path may push), so hold the lock
+        // for the remainder of the function. recovery_needed is set only around each mutation.
         #[cfg(feature = "atomic")]
-        self.set_recovery_needed()?;
+        let _guard = self.lock.lock().unwrap();
 
         // Special case: next block is free and can be merged in place to accommodate the new size.
         // This avoids copying data.
@@ -1082,7 +1112,6 @@ impl BStackAllocator for FirstFitBStackAllocator {
                 }
 
                 // Unlink the next block from the free list, then merge it into the current block.
-                #[cfg(not(feature = "atomic"))]
                 self.set_recovery_needed()?;
                 self.unlink_from_free_list(next_block)?;
                 // merged_size includes the overhead bytes absorbed from between the two blocks
@@ -1188,7 +1217,6 @@ impl BStackAllocator for FirstFitBStackAllocator {
                 &mut block_buf[Self::BLOCK_HEADER_SIZE as usize
                     ..(copy_len + Self::BLOCK_HEADER_SIZE) as usize],
             )?;
-            #[cfg(not(feature = "atomic"))]
             self.set_recovery_needed()?;
             self.unlink_block(
                 block_found.0,
@@ -1222,7 +1250,6 @@ impl BStackAllocator for FirstFitBStackAllocator {
             )?;
             block_buf[(aligned_new_len + Self::BLOCK_HEADER_SIZE) as usize..]
                 .copy_from_slice(&aligned_new_len.to_le_bytes());
-            #[cfg(not(feature = "atomic"))]
             self.set_recovery_needed()?;
             let ptr = self.stack.push(&block_buf)? + Self::BLOCK_HEADER_SIZE;
             self.add_to_free_list(slice.start())?;
