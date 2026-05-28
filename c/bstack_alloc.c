@@ -803,7 +803,10 @@ static int alff_set_recovery_needed(bstack_t *bs)
     int ok = 0;
     write_le32(one, 1);
     if (bstack_cas(bs, ALFF_FLAGS_OFFSET, zero, one, 4, &ok) != 0) return -1;
-    if (!ok) { errno = EIO; return -1; }
+    /* errno = EINVAL: the on-disk recovery_needed flag is not in a valid state
+     * for this operation (it was already 1, meaning a prior op crashed mid-
+     * mutation and the stack must be reopened to run recovery). */
+    if (!ok) { errno = EINVAL; return -1; }
     return 0;
 #else
     uint8_t flag[4];
@@ -823,7 +826,10 @@ static int alff_clear_recovery_needed(bstack_t *bs)
     int ok = 0;
     write_le32(one, 1);
     if (bstack_cas(bs, ALFF_FLAGS_OFFSET, one, zero, 4, &ok) != 0) return -1;
-    if (!ok) { errno = EIO; return -1; }
+    /* errno = EINVAL: the on-disk flag was not in the expected state (it was
+     * already 0, meaning the paired set was lost or the flag was disturbed
+     * out of band). */
+    if (!ok) { errno = EINVAL; return -1; }
     return 0;
 #else
     uint8_t flag[4] = {0, 0, 0, 0};

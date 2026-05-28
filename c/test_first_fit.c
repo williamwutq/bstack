@@ -986,7 +986,7 @@ static int test_recovery_needed_already_set_rejects_mutation(void)
     errno = 0;
     int rc = bstack_allocator_alloc((bstack_allocator_t *)a, 64, &sc);
     CHECK(rc == -1);
-    CHECK(errno == EIO);
+    CHECK(errno == EINVAL);
 
     /* Reopen: the on-disk flag is still set, so first_fit_bstack_allocator_new
      * must run recovery and return a usable allocator. */

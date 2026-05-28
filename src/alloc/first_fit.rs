@@ -286,7 +286,8 @@ impl FirstFitBStackAllocator {
         )? {
             // CAS failed: recovery_needed was already set, so a prior operation
             // crashed or failed mid-mutation and the stack must be recovered.
-            Err(io::Error::other(
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
                 "stack needs recovery: recovery_needed already set",
             ))
         } else {
@@ -314,7 +315,8 @@ impl FirstFitBStackAllocator {
             [0u8; 4].as_slice(),
         )? {
             // CAS failed: recovery_needed was not set when we expected it to be.
-            Err(io::Error::other(
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
                 "recovery_needed was not set when clearing",
             ))
         } else {
