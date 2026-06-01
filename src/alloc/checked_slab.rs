@@ -241,7 +241,13 @@ impl CheckedSlabBStackAllocator {
     ///
     /// Validates the `ALCK 0.1.x` magic prefix, reads `block_size`, and checks
     /// that `free_head` is either the sentinel or points to a block-aligned
-    /// offset whose overhead is zero (free).
+    /// offset whose overhead is zero (free). On success, [`recover`](Self::recover)
+    /// is called automatically to reclaim any blocks leaked by a previous unclean
+    /// shutdown and to discard any orphaned tail left by a failed `realloc`
+    /// truncation; this may rewrite free-list entries and truncate the backing
+    /// stack before the allocator is returned.
+    ///
+    /// Returns a ready `CheckedSlabBStackAllocator` backed by `stack`.
     ///
     /// # Errors
     ///
@@ -300,12 +306,7 @@ impl CheckedSlabBStackAllocator {
                 format!("stored free_head ({stored_free_head}) is not a valid block offset"),
             ));
         }
-        let arena_bytes = stack_len.checked_sub(Self::ARENA_START).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "stack too short to contain allocator header",
-            )
-        })?;
+        let arena_bytes = stack_len - Self::ARENA_START; // stack_len >= ARENA_START guaranteed above
         if arena_bytes % stored_block_size != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -379,6 +380,11 @@ impl CheckedSlabBStackAllocator {
     /// hits corruption, reclaim and tail-discard are both suppressed for that
     /// run and the uncertain blocks are merely counted — an unreliable free list
     /// never authorises relinking or truncation.
+    ///
+    /// # Errors
+    ///
+    /// * Any [`io::Error`] propagated from the underlying [`BStack`] operations
+    ///   during the arena scan or while applying reclaim / tail-discard steps.
     pub fn recover(&self) -> io::Result<u64> {
         let stack_len = self.stack.len()?;
         if stack_len <= Self::ARENA_START {
@@ -456,7 +462,6 @@ impl CheckedSlabBStackAllocator {
     fn scan_free_list(&self, stack_len: u64) -> io::Result<(Vec<u64>, bool)> {
         let mut free = Vec::new();
         let mut seen: HashSet<u64> = HashSet::new();
-        let arena_blocks = (stack_len - Self::ARENA_START) / self.block_size;
         let mut head = u64::from_le_bytes(read_bstack!(self.stack, Self::FREE_HEAD_OFFSET => u64));
         let mut corrupt = false;
         while head != Self::SENTINEL {
@@ -464,7 +469,6 @@ impl CheckedSlabBStackAllocator {
                 || (head - Self::ARENA_START) % self.block_size != 0
                 || head >= stack_len
                 || !seen.insert(head)
-                || seen.len() as u64 > arena_blocks
             {
                 corrupt = true;
                 break;
@@ -516,7 +520,10 @@ impl CheckedSlabBStackAllocator {
         if end > stack_len {
             return None;
         }
-        // Engulf check: the first free block past `p` must not fall inside `end`.
+        // Engulf check: the first free block strictly after `p` must not fall
+        // inside `[p, end)`. A Suspicious block has non-zero overhead so it
+        // cannot also be in `free` (scan_free_list rejects non-zero overhead),
+        // which means `p` itself is never found by partition_point here.
         if let Some(&f) = free.get(free.partition_point(|&x| x <= p))
             && f < end
         {
@@ -553,6 +560,8 @@ impl CheckedSlabBStackAllocator {
                 false
             };
         }
+        // j=0 is excluded: reach[0]=true would mean the block at `p` is itself
+        // valid, contradicting the Suspicious classification that called us.
         if let Some(j) = (1..m).find(|&j| reach[j]) {
             return Ok(ResyncOutcome::Resync(p + (j as u64) * bs));
         }
@@ -789,6 +798,25 @@ impl BStackAllocator for CheckedSlabBStackAllocator {
     /// is reclaimed with a single [`BStack::discard`]; otherwise every block is
     /// prepended to the free list.
     ///
+    /// Passing the null/empty sentinel slice (`start == 0, len == 0`) is a
+    /// no-op that returns `Ok(())`.
+    ///
+    /// # Slice origin requirement
+    ///
+    /// `slice` **must** have been returned directly by [`alloc`](Self::alloc)
+    /// or by a prior call to [`realloc`](Self::realloc) on this same allocator
+    /// instance. Passing an arbitrary sub-slice or a manually constructed
+    /// [`BStackSlice`] may corrupt the allocator's internal state.
+    ///
+    /// # Errors
+    ///
+    /// * [`io::ErrorKind::InvalidInput`] — `slice.start()` is below the
+    ///   overhead prefix offset, or the block's overhead high bit is clear
+    ///   (double-free detected).
+    /// * [`io::ErrorKind::InvalidData`] — the in-use overhead records a zero
+    ///   block count (metadata corrupt).
+    /// * Any [`io::Error`] propagated from the underlying [`BStack`] operations.
+    ///
     /// # Crash consistency
     ///
     /// | Path | Calls | Safety |
@@ -845,6 +873,20 @@ impl BStackAllocator for CheckedSlabBStackAllocator {
 
     /// Resize the region described by `slice` to `new_len` bytes.
     ///
+    /// Returns a (possibly different) slice covering the resized region. If
+    /// `slice` is the null/empty sentinel (`start == 0, len == 0`), delegates
+    /// to [`alloc`](Self::alloc). If `new_len == 0`, deallocates `slice` and
+    /// returns the null sentinel.
+    ///
+    /// # Slice origin requirement
+    ///
+    /// `slice` **must** have been returned directly by [`alloc`](Self::alloc)
+    /// or by a prior call to [`realloc`](Self::realloc) on this same allocator
+    /// instance. Passing an arbitrary sub-slice obtained via
+    /// [`BStackSlice::subslice`], [`BStackSlice::subslice_range`], or a
+    /// manually constructed [`BStackSlice::new`] is not supported and may
+    /// corrupt the allocator's internal state.
+    ///
     /// # Resize strategies
     ///
     /// | Case | Strategy |
@@ -853,6 +895,13 @@ impl BStackAllocator for CheckedSlabBStackAllocator {
     /// | Slice at tail | Extend or discard the tail and update the overhead count |
     /// | Shrink, non-tail | Recycle excess blocks into the free list, then shrink the overhead |
     /// | Grow, non-tail | Allocate a fresh region, copy, release the old |
+    ///
+    /// # Errors
+    ///
+    /// * [`io::ErrorKind::InvalidInput`] — `slice.start()` is below the
+    ///   overhead prefix offset, or the block's overhead high bit is clear
+    ///   (realloc of a freed or invalid block).
+    /// * Any [`io::Error`] propagated from the underlying [`BStack`] operations.
     ///
     /// # Crash consistency
     ///
@@ -893,6 +942,12 @@ impl BStackAllocator for CheckedSlabBStackAllocator {
             ));
         }
         let old_n = overhead & Self::BLOCKS_MASK;
+        if old_n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "in-use block records a zero block count; metadata corrupt",
+            ));
+        }
         let new_n = self.blocks_needed(new_len)?;
 
         if old_n == new_n {
