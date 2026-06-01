@@ -94,6 +94,29 @@ const ALCK_MAGIC_PREFIX: [u8; 6] = *b"ALCK\x00\x01";
 /// synchronized, because free-list mutation reads then writes `free_head` as
 /// separate [`BStack`] calls.
 ///
+/// # Method safety
+///
+/// | Method | Atomicity | `BStack` op | Crash effect |
+/// |--------|-----------|-------------|-------------|
+/// | `new` | Atomic | Yes (`push`) | — |
+/// | `open` | N/A (read-only + `recover`) | No | see `recover` |
+/// | `recover` | Partial | No (multiple) | remaining leaks re-found on next `open` |
+/// | `alloc(0)` | N/A (no I/O) | — | — |
+/// | `alloc`, free-list hit | Partial | No (2) | popped block leaked |
+/// | `alloc`, tail extend | Partial | No (2) | extended block leaked |
+/// | `dealloc(null)` | N/A (no I/O) | — | — |
+/// | `dealloc`, tail | Atomic | Yes (`discard`) | — |
+/// | `dealloc`, free list | Partial | No (2) | freed blocks leaked |
+/// | `realloc`, same block count | Partial | No (0–1) | — |
+/// | `realloc`, tail grow | Partial | No (2) | capacity extension leaked |
+/// | `realloc`, tail shrink | Partial | No (2) | orphaned tail left |
+/// | `realloc`, shrink non-tail | Partial | No (3) | excess blocks leaked |
+/// | `realloc`, grow non-tail | Partial | No (4–5) | old block leaked |
+///
+/// **Atomicity key:** *Atomic* — crash leaves the file fully consistent;
+/// *Partial* — crash keeps the free list consistent but may leak ≤ 1 block or batch;
+/// *N/A* — operation performs no I/O.
+///
 /// # Feature flags
 ///
 /// Requires both the `alloc` and `set` Cargo features:
@@ -494,10 +517,10 @@ impl CheckedSlabBStackAllocator {
             return None;
         }
         // Engulf check: the first free block past `p` must not fall inside `end`.
-        if let Some(&f) = free.get(free.partition_point(|&x| x <= p)) {
-            if f < end {
-                return None;
-            }
+        if let Some(&f) = free.get(free.partition_point(|&x| x <= p))
+            && f < end
+        {
+            return None;
         }
         Some(n)
     }
@@ -530,10 +553,8 @@ impl CheckedSlabBStackAllocator {
                 false
             };
         }
-        for j in 1..m {
-            if reach[j] {
-                return Ok(ResyncOutcome::Resync(p + (j as u64) * bs));
-            }
+        if let Some(j) = (1..m).find(|&j| reach[j]) {
+            return Ok(ResyncOutcome::Resync(p + (j as u64) * bs));
         }
         Ok(ResyncOutcome::DiscardTail)
     }
@@ -699,6 +720,15 @@ impl BStackAllocator for CheckedSlabBStackAllocator {
     /// prefix is written transparently. `len == 0` yields the empty sentinel
     /// slice. Single-block requests reuse a free-list block when available and
     /// otherwise extend the tail; multi-block requests always extend the tail.
+    ///
+    /// # Crash consistency
+    ///
+    /// | Path | Calls | Safety |
+    /// |------|-------|--------|
+    /// | `len == 0` | 0 | trivially safe |
+    /// | free-list hit | 2 (`set` + `set`) | crash may leak popped block |
+    /// | tail extend, single block | 2 (`extend` + `set`) | crash may leak extended block |
+    /// | tail extend, multi-block | 2 (`extend` + `set`) | crash may leak extended blocks |
     fn alloc(&self, len: u64) -> io::Result<BStackSlice<'_, Self>> {
         if len == 0 {
             return Ok(BStackSlice::empty(self));
@@ -707,14 +737,29 @@ impl BStackAllocator for CheckedSlabBStackAllocator {
         let num_blocks = self.blocks_needed(len)?;
         if num_blocks == 1 {
             if let Some(block_start) = self.pop_and_claim_block(1)? {
-                // SAFETY: block_start is a valid block_size region; data begins after the overhead.
+                // SAFETY:
+                // 1. No overflow: `block_start` is a valid in-bounds arena offset;
+                //    `block_start + OVERHEAD + len ≤ block_start + block_size ≤ stack_len ≤ u64::MAX`
+                //    because `blocks_needed(len) == 1` implies `len ≤ data_size = block_size − OVERHEAD`.
+                // 2. In bounds: the block was just popped from the free list and
+                //    marked in-use by `pop_and_claim_block`; the full `block_size`
+                //    region is part of the arena and present in the stack payload.
+                // 3. Alloc origin: the slice spans exactly the data region of this
+                //    allocation and may safely be passed to `dealloc`/`realloc`.
                 return Ok(unsafe {
                     BStackSlice::from_raw_parts(self, block_start + Self::OVERHEAD, len)
                 });
             }
             let block_start = self.stack.extend(self.block_size)?;
             self.write_overhead(block_start, Self::IN_USE_BIT | 1)?;
-            // SAFETY: block_start from a fresh, zeroed tail extension of block_size bytes.
+            // SAFETY:
+            // 1. No overflow: `extend` returns the previous tail, so
+            //    `block_start + OVERHEAD + len ≤ block_start + block_size ≤ new stack_len ≤ u64::MAX`
+            //    because `blocks_needed(len) == 1` implies `len ≤ data_size = block_size − OVERHEAD`.
+            // 2. In bounds: `stack.extend` just appended exactly `block_size` zeroed
+            //    bytes, so the full range is within the stack payload.
+            // 3. Alloc origin: the slice covers the data region of this fresh
+            //    allocation and may safely be passed to `dealloc`/`realloc`.
             return Ok(unsafe {
                 BStackSlice::from_raw_parts(self, block_start + Self::OVERHEAD, len)
             });
@@ -725,7 +770,14 @@ impl BStackAllocator for CheckedSlabBStackAllocator {
         })?;
         let block_start = self.stack.extend(total)?;
         self.write_overhead(block_start, Self::IN_USE_BIT | num_blocks)?;
-        // SAFETY: block_start from a fresh, zeroed tail extension of num_blocks * block_size bytes.
+        // SAFETY:
+        // 1. No overflow: `block_start + OVERHEAD + len ≤ block_start + total ≤ new stack_len ≤ u64::MAX`
+        //    because `total = num_blocks * block_size` and `OVERHEAD + len ≤ num_blocks * block_size`
+        //    by the definition of `blocks_needed`.
+        // 2. In bounds: `stack.extend` just appended exactly `total` zeroed bytes;
+        //    the full range is within the stack payload.
+        // 3. Alloc origin: the slice covers the data region of this fresh
+        //    allocation and may safely be passed to `dealloc`/`realloc`.
         Ok(unsafe { BStackSlice::from_raw_parts(self, block_start + Self::OVERHEAD, len) })
     }
 
@@ -736,6 +788,14 @@ impl BStackAllocator for CheckedSlabBStackAllocator {
     /// returned without touching any list. A multi-block allocation at the tail
     /// is reclaimed with a single [`BStack::discard`]; otherwise every block is
     /// prepended to the free list.
+    ///
+    /// # Crash consistency
+    ///
+    /// | Path | Calls | Safety |
+    /// |------|-------|--------|
+    /// | null slice | 0 | trivially safe |
+    /// | tail (any block count) | 1 (`discard`) | crash-safe by inheritance |
+    /// | free list | 2 (`set` + `set`) | crash leaks freed blocks; double-free guard unaffected |
     fn dealloc(&self, slice: BStackSlice<'_, Self>) -> io::Result<()> {
         if slice.is_empty() && slice.start() == 0 {
             return Ok(());
@@ -793,6 +853,16 @@ impl BStackAllocator for CheckedSlabBStackAllocator {
     /// | Slice at tail | Extend or discard the tail and update the overhead count |
     /// | Shrink, non-tail | Recycle excess blocks into the free list, then shrink the overhead |
     /// | Grow, non-tail | Allocate a fresh region, copy, release the old |
+    ///
+    /// # Crash consistency
+    ///
+    /// | Case | Calls | Safety |
+    /// |------|-------|--------|
+    /// | same block count | 0–1 (`zero`) | trivially safe |
+    /// | tail shrink | 2 (`set` + `discard`) | crash before `discard` leaves orphaned tail; reclaimed by `recover` |
+    /// | tail grow | 2 (`extend` + `set`) | crash leaks capacity extension; original data intact |
+    /// | shrink non-tail | 3 (`set` + `set` + `set`) | crash leaks excess blocks; no live allocation corrupted |
+    /// | grow non-tail | 4–5 (`alloc` + copy + `dealloc`) | crash leaks old block; new allocation is consistent |
     fn realloc<'a>(
         &'a self,
         slice: BStackSlice<'a, Self>,
@@ -830,7 +900,12 @@ impl BStackAllocator for CheckedSlabBStackAllocator {
             if new_len > slice.len() {
                 self.stack.zero(slice.end(), new_len - slice.len())?;
             }
-            // SAFETY: new_len still fits within the same block-aligned region.
+            // SAFETY:
+            // 1. No overflow: `slice.start() + new_len ≤ slice.start() + old_n * block_size − OVERHEAD ≤ u64::MAX`
+            //    because `old_n == new_n` and `new_len ≤ new_n * block_size − OVERHEAD` by `blocks_needed`.
+            // 2. In bounds: same backing blocks are retained; the range is within the payload.
+            // 3. Alloc origin: `slice.start()` is the original allocation data offset;
+            //    the slice may safely be passed to `dealloc`/`realloc`.
             return Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) });
         }
 
@@ -865,7 +940,13 @@ impl BStackAllocator for CheckedSlabBStackAllocator {
                 self.write_overhead(block_start, Self::IN_USE_BIT | new_n)?;
                 self.stack.discard(old_backing - new_backing)?;
             }
-            // SAFETY: slice extended or shrunk in place at the tail.
+            // SAFETY:
+            // 1. No overflow: `slice.start() + new_len ≤ block_start + OVERHEAD + new_n * block_size − OVERHEAD ≤ u64::MAX`
+            //    because `new_n * block_size ≤ new_backing ≤ stack_len`.
+            // 2. In bounds: the tail was just extended (grow) or discarded down to `new_backing`
+            //    (shrink); the data region `[slice.start(), slice.start() + new_len)` is within payload.
+            // 3. Alloc origin: `slice.start()` is unchanged; the overhead now records `new_n`;
+            //    the slice may safely be passed to `dealloc`/`realloc`.
             return Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) });
         }
 
@@ -897,7 +978,12 @@ impl BStackAllocator for CheckedSlabBStackAllocator {
             self.write_free_run(excess_start, old_n - new_n)?;
             self.stack
                 .set(Self::FREE_HEAD_OFFSET, excess_start.to_le_bytes())?;
-            // SAFETY: new_len fits within the first new_n retained blocks.
+            // SAFETY:
+            // 1. No overflow: `slice.start() + new_len ≤ block_start + OVERHEAD + new_n * block_size − OVERHEAD ≤ u64::MAX`
+            //    because `new_n * block_size ≤ old_backing ≤ stack_len`.
+            // 2. In bounds: the first `new_n` blocks are still live in the stack payload.
+            // 3. Alloc origin: `slice.start()` is unchanged; the overhead now records `new_n`;
+            //    the slice may safely be passed to `dealloc`/`realloc`.
             return Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) });
         }
 
