@@ -26,11 +26,15 @@
  * On Unix a pthread_rwlock protects each handle; on Windows an SRWLOCK is
  * used.  bstack_push / bstack_extend / bstack_pop / bstack_discard /
  * bstack_set / bstack_zero / bstack_atrunc / bstack_splice /
- * bstack_try_extend / bstack_try_discard(s, n>0) / bstack_swap / bstack_cas /
- * bstack_replace / bstack_process
+ * bstack_try_extend / bstack_try_extend_zeros / bstack_try_discard(s, n>0) /
+ * bstack_swap / bstack_cas / bstack_replace / bstack_process /
+ * bstack_cross_exchange / bstack_copy /
+ * bstack_eq_crds / bstack_ne_crds /
+ * bstack_masked_eq_crds / bstack_masked_ne_crds
  * hold a write lock.  bstack_try_discard(s, 0) holds a read lock.
- * bstack_peek / bstack_get / bstack_len hold a read lock and may run
- * concurrently with each other on both platforms.
+ * bstack_peek / bstack_get / bstack_get_batched / bstack_get_batched_gen /
+ * bstack_len hold a read lock and may run concurrently with each other on
+ * both platforms.
  *
  * Multi-process safety
  * --------------------
@@ -43,8 +47,11 @@
  * -------------
  * Compile with -DBSTACK_FEATURE_SET    to enable bstack_set and bstack_zero.
  * Compile with -DBSTACK_FEATURE_ATOMIC to enable bstack_atrunc, bstack_splice,
- *   bstack_try_extend, bstack_try_discard, and bstack_replace.  Both flags
- *   together also enable bstack_swap, bstack_cas, and bstack_process.
+ *   bstack_try_extend, bstack_try_extend_zeros, bstack_try_discard,
+ *   bstack_replace, bstack_get_batched, and bstack_get_batched_gen.  Both
+ *   flags together also enable bstack_swap, bstack_cas, bstack_process,
+ *   bstack_cross_exchange, bstack_copy, bstack_eq_crds, bstack_ne_crds,
+ *   bstack_masked_eq_crds, and bstack_masked_ne_crds.
  */
 
 typedef struct bstack bstack_t;
@@ -203,6 +210,16 @@ int bstack_set(bstack_t *bs, uint64_t offset,
 int bstack_zero(bstack_t *bs, uint64_t offset, size_t n);
 #endif /* BSTACK_FEATURE_SET */
 
+/*
+ * Descriptor for one entry in a batched read: logical byte offset, destination
+ * buffer pointer, and number of bytes to read.
+ */
+typedef struct {
+    uint64_t offset;
+    uint8_t *buf;
+    size_t   len;
+} bstack_iovec_t;
+
 #ifdef BSTACK_FEATURE_ATOMIC
 /*
  * Atomically cut n bytes off the tail then append buf_len bytes from buf.
@@ -288,6 +305,62 @@ int bstack_replace(bstack_t *bs, size_t n,
                               uint8_t **new_buf, size_t *new_len,
                               void *ctx),
                    void *ctx);
+
+/*
+ * Append n zero bytes only if the current logical payload size equals s.
+ *
+ * *ok (if non-NULL) is set to 1 when the condition matched and n zero bytes
+ * were appended, or 0 when the size did not match (no-op).
+ * n = 0 with the size condition matching sets *ok = 1 without I/O.
+ * Returns 0 on success (condition-matched or not), -1 on I/O error.
+ *
+ * Only available when compiled with -DBSTACK_FEATURE_ATOMIC.
+ */
+int bstack_try_extend_zeros(bstack_t *bs, uint64_t s, size_t n, int *ok);
+
+/*
+ * Read multiple logical ranges into caller-provided buffers in a single
+ * lock acquisition.
+ *
+ * entries is an array of n_entries bstack_iovec_t descriptors.  For each
+ * entry, entries[i].len bytes are read from logical offset entries[i].offset
+ * into entries[i].buf.  n_entries == 0 is a valid no-op.
+ *
+ * All reads happen under the same shared read lock, so no write can
+ * interleave between them.
+ *
+ * Returns EINVAL if any entry has offset + len overflowing uint64_t or
+ * exceeding the current payload size.
+ *
+ * Only available when compiled with -DBSTACK_FEATURE_ATOMIC.
+ */
+int bstack_get_batched(bstack_t *bs,
+                       const bstack_iovec_t *entries, size_t n_entries);
+
+/*
+ * Read a dependent chain of logical ranges in a single lock acquisition.
+ *
+ * gen is called repeatedly.  Each call should populate *out_offset,
+ * *out_buf, and *out_len to request the next read, then return 1.  When
+ * gen is called, the buffer supplied by the previous call (if any) has
+ * already been filled with its data.  To stop the chain, gen returns 0.
+ * gen may return -1 on error (errno must be set); the operation aborts.
+ *
+ * The generator callback signature:
+ *   int gen(uint64_t *out_offset, uint8_t **out_buf, size_t *out_len,
+ *           void *ctx)
+ *
+ * All reads happen under the same shared read lock.
+ *
+ * Returns EINVAL if any yielded offset + len overflows uint64_t or exceeds
+ * the current payload size.  Returns -1 (errno set) if gen returns -1.
+ *
+ * Only available when compiled with -DBSTACK_FEATURE_ATOMIC.
+ */
+int bstack_get_batched_gen(bstack_t *bs,
+                           int (*gen)(uint64_t *out_offset, uint8_t **out_buf,
+                                      size_t *out_len, void *ctx),
+                           void *ctx);
 #endif /* BSTACK_FEATURE_ATOMIC */
 
 #if defined(BSTACK_FEATURE_ATOMIC) && defined(BSTACK_FEATURE_SET)
@@ -343,6 +416,112 @@ int bstack_cas(bstack_t *bs, uint64_t offset,
 int bstack_process(bstack_t *bs, uint64_t start, uint64_t end,
                    int (*cb)(uint8_t *buf, size_t len, void *ctx),
                    void *ctx);
+
+/*
+ * Atomically swap two equal-size, non-overlapping regions within the file.
+ *
+ * Bytes at [a, a+n) and [b, b+n) are exchanged under a single write lock.
+ * The file size is never changed.  n = 0 is a valid no-op (bounds are still
+ * checked).
+ *
+ * Returns EINVAL if either a+n or b+n overflows uint64_t, if the regions
+ * overlap, if either region exceeds the payload size, or if either region
+ * start lies within the locked prefix.
+ *
+ * Only available when compiled with both -DBSTACK_FEATURE_SET and
+ * -DBSTACK_FEATURE_ATOMIC.
+ */
+int bstack_cross_exchange(bstack_t *bs, uint64_t a, uint64_t b, uint64_t n);
+
+/*
+ * Copy n bytes from [from, from+n) to [to, to+n) under a single write lock.
+ *
+ * Overlapping regions are handled correctly (source is read into a temporary
+ * buffer before writing).  The file size is never changed.  n = 0 is a valid
+ * no-op (bounds are still checked).
+ *
+ * Returns EINVAL if either from+n or to+n overflows uint64_t, if either
+ * region exceeds the payload size, or if to lies within the locked prefix.
+ *
+ * Only available when compiled with both -DBSTACK_FEATURE_SET and
+ * -DBSTACK_FEATURE_ATOMIC.
+ */
+int bstack_copy(bstack_t *bs, uint64_t from, uint64_t to, uint64_t n);
+
+/*
+ * Cross-Region Dependent Swap — equal condition.
+ *
+ * Reads a_len bytes from a_offset and compares them to a_expected.  If they
+ * are equal, reads b_len bytes from b_offset into b_old_buf and writes
+ * b_new_buf there.  *ok (if non-NULL) is set to 1 when the swap was
+ * performed or 0 when the comparison failed.
+ *
+ * All operations happen under one write lock.  a_len == 0 trivially matches.
+ * b_len == 0 skips the B swap when the condition passes (*ok = 1, no I/O).
+ *
+ * Returns EINVAL if either range overflows uint64_t, exceeds the payload
+ * size, or if b_offset lies within the locked prefix (when b_len > 0).
+ *
+ * Only available when compiled with both -DBSTACK_FEATURE_SET and
+ * -DBSTACK_FEATURE_ATOMIC.
+ */
+int bstack_eq_crds(bstack_t *bs,
+                   uint64_t a_offset, const uint8_t *a_expected, size_t a_len,
+                   uint64_t b_offset, uint8_t *b_old_buf,
+                   const uint8_t *b_new_buf, size_t b_len,
+                   int *ok);
+
+/*
+ * Cross-Region Dependent Swap — not-equal condition.
+ *
+ * Like bstack_eq_crds but performs the B swap only when the a_len bytes at
+ * a_offset are NOT equal to a_expected.  *ok = 0 if the bytes compare equal
+ * (swap suppressed).
+ *
+ * Only available when compiled with both -DBSTACK_FEATURE_SET and
+ * -DBSTACK_FEATURE_ATOMIC.
+ */
+int bstack_ne_crds(bstack_t *bs,
+                   uint64_t a_offset, const uint8_t *a_expected, size_t a_len,
+                   uint64_t b_offset, uint8_t *b_old_buf,
+                   const uint8_t *b_new_buf, size_t b_len,
+                   int *ok);
+
+/*
+ * Cross-Region Dependent Swap — masked-equal condition.
+ *
+ * Like bstack_eq_crds but compares (A[i] & mask[i]) == (a_expected[i] &
+ * mask[i]) for every byte i.  mask and a_expected must both have length
+ * a_len.
+ *
+ * Returns EINVAL if mask is NULL when a_len > 0.
+ *
+ * Only available when compiled with both -DBSTACK_FEATURE_SET and
+ * -DBSTACK_FEATURE_ATOMIC.
+ */
+int bstack_masked_eq_crds(bstack_t *bs,
+                          uint64_t a_offset, const uint8_t *mask,
+                          const uint8_t *a_expected, size_t a_len,
+                          uint64_t b_offset, uint8_t *b_old_buf,
+                          const uint8_t *b_new_buf, size_t b_len,
+                          int *ok);
+
+/*
+ * Cross-Region Dependent Swap — masked-not-equal condition.
+ *
+ * Like bstack_masked_eq_crds but performs the B swap only when at least one
+ * masked byte differs: (A[i] & mask[i]) != (a_expected[i] & mask[i]).
+ * *ok = 0 if all masked bytes compare equal (swap suppressed).
+ *
+ * Only available when compiled with both -DBSTACK_FEATURE_SET and
+ * -DBSTACK_FEATURE_ATOMIC.
+ */
+int bstack_masked_ne_crds(bstack_t *bs,
+                          uint64_t a_offset, const uint8_t *mask,
+                          const uint8_t *a_expected, size_t a_len,
+                          uint64_t b_offset, uint8_t *b_old_buf,
+                          const uint8_t *b_new_buf, size_t b_len,
+                          int *ok);
 #endif /* BSTACK_FEATURE_ATOMIC && BSTACK_FEATURE_SET */
 
 #ifdef __cplusplus

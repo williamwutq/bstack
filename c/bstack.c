@@ -1425,6 +1425,134 @@ fail_unlock:
     return -1;
 }
 
+int bstack_try_extend_zeros(bstack_t *bs, uint64_t s, size_t n, int *ok)
+{
+    BS_WRLOCK(bs);
+
+    uint64_t raw_size;
+    if (file_size(bs->fd, &raw_size) != 0)
+        goto fail_unlock;
+
+    uint64_t data_size = raw_size - HEADER_SIZE;
+    if (data_size != s) {
+        BS_WRUNLOCK(bs);
+        if (ok) *ok = 0;
+        return 0;
+    }
+    if (n == 0) {
+        BS_WRUNLOCK(bs);
+        if (ok) *ok = 1;
+        return 0;
+    }
+
+    uint64_t new_len = data_size + (uint64_t)n;
+    if (plat_ftruncate(bs->fd, HEADER_SIZE + new_len) != 0 ||
+        write_committed_len(bs->fd, new_len) != 0 ||
+        plat_durable_sync(bs->fd) != 0)
+    {
+        /* Best-effort rollback. */
+        plat_ftruncate(bs->fd, raw_size);
+        write_committed_len(bs->fd, data_size);
+        goto fail_unlock;
+    }
+
+    BS_WRUNLOCK(bs);
+    if (ok) *ok = 1;
+    return 0;
+
+fail_unlock:
+    { int sv = errno; BS_WRUNLOCK(bs); errno = sv; }
+    return -1;
+}
+
+int bstack_get_batched(bstack_t *bs,
+                       const bstack_iovec_t *entries, size_t n_entries)
+{
+    if (n_entries == 0)
+        return 0;
+
+    BS_RDLOCK(bs);
+
+    uint64_t raw_size;
+    if (file_size(bs->fd, &raw_size) != 0)
+        goto fail_unlock;
+
+    uint64_t data_size = raw_size - HEADER_SIZE;
+
+    for (size_t i = 0; i < n_entries; i++) {
+        if ((uint64_t)entries[i].len > UINT64_MAX - entries[i].offset) {
+            BS_RDUNLOCK(bs);
+            errno = EINVAL;
+            return -1;
+        }
+        uint64_t end = entries[i].offset + (uint64_t)entries[i].len;
+        if (end > data_size) {
+            BS_RDUNLOCK(bs);
+            errno = EINVAL;
+            return -1;
+        }
+        if (entries[i].len > 0) {
+            if (plat_pread(bs->fd, entries[i].buf, entries[i].len,
+                           HEADER_SIZE + entries[i].offset) != 0)
+                goto fail_unlock;
+        }
+    }
+
+    BS_RDUNLOCK(bs);
+    return 0;
+
+fail_unlock:
+    { int sv = errno; BS_RDUNLOCK(bs); errno = sv; }
+    return -1;
+}
+
+int bstack_get_batched_gen(bstack_t *bs,
+                           int (*gen)(uint64_t *out_offset, uint8_t **out_buf,
+                                      size_t *out_len, void *ctx),
+                           void *ctx)
+{
+    BS_RDLOCK(bs);
+
+    uint64_t raw_size;
+    if (file_size(bs->fd, &raw_size) != 0)
+        goto fail_unlock;
+
+    uint64_t data_size = raw_size - HEADER_SIZE;
+
+    for (;;) {
+        uint64_t  offset = 0;
+        uint8_t  *buf    = NULL;
+        size_t    len    = 0;
+        int r = gen(&offset, &buf, &len, ctx);
+        if (r == 0)
+            break;
+        if (r < 0)
+            goto fail_unlock;
+        if ((uint64_t)len > UINT64_MAX - offset) {
+            BS_RDUNLOCK(bs);
+            errno = EINVAL;
+            return -1;
+        }
+        uint64_t end = offset + (uint64_t)len;
+        if (end > data_size) {
+            BS_RDUNLOCK(bs);
+            errno = EINVAL;
+            return -1;
+        }
+        if (len > 0) {
+            if (plat_pread(bs->fd, buf, len, HEADER_SIZE + offset) != 0)
+                goto fail_unlock;
+        }
+    }
+
+    BS_RDUNLOCK(bs);
+    return 0;
+
+fail_unlock:
+    { int sv = errno; BS_RDUNLOCK(bs); errno = sv; }
+    return -1;
+}
+
 #endif /* BSTACK_FEATURE_ATOMIC */
 
 /* -------------------------------------------------------------------------
@@ -1613,6 +1741,355 @@ int bstack_process(bstack_t *bs, uint64_t start, uint64_t end,
 
 fail_unlock:
     { int s = errno; BS_WRUNLOCK(bs); errno = s; }
+    return -1;
+}
+
+int bstack_cross_exchange(bstack_t *bs, uint64_t a, uint64_t b, uint64_t n)
+{
+    if (n > UINT64_MAX - a) { errno = EINVAL; return -1; }
+    if (n > UINT64_MAX - b) { errno = EINVAL; return -1; }
+    uint64_t a_end = a + n;
+    uint64_t b_end = b + n;
+
+    /* Overlap check (only meaningful when n > 0). */
+    if (n > 0) {
+        uint64_t lo = a < b ? a : b;
+        uint64_t hi = a < b ? b : a;
+        if (lo + n > hi) {
+            errno = EINVAL;
+            return -1;
+        }
+    }
+
+    BS_WRLOCK(bs);
+
+    uint64_t locked = ATOMIC_LOAD_ACQUIRE(&bs->locked);
+    if (a < locked) { BS_WRUNLOCK(bs); errno = EINVAL; return -1; }
+    if (b < locked) { BS_WRUNLOCK(bs); errno = EINVAL; return -1; }
+
+    uint64_t raw_size;
+    if (file_size(bs->fd, &raw_size) != 0)
+        goto fail_unlock;
+
+    uint64_t data_size = raw_size - HEADER_SIZE;
+    if (a_end > data_size) { BS_WRUNLOCK(bs); errno = EINVAL; return -1; }
+    if (b_end > data_size) { BS_WRUNLOCK(bs); errno = EINVAL; return -1; }
+
+    if (n == 0) {
+        BS_WRUNLOCK(bs);
+        return 0;
+    }
+
+#if UINT64_MAX > SIZE_MAX
+    if (n > (uint64_t)SIZE_MAX) { BS_WRUNLOCK(bs); errno = EINVAL; return -1; }
+#endif
+    uint8_t *buf_a = (uint8_t *)malloc((size_t)n);
+    if (!buf_a) goto fail_unlock;
+    uint8_t *buf_b = (uint8_t *)malloc((size_t)n);
+    if (!buf_b) { free(buf_a); goto fail_unlock; }
+
+    if (plat_pread(bs->fd,  buf_a, (size_t)n, HEADER_SIZE + a) != 0 ||
+        plat_pread(bs->fd,  buf_b, (size_t)n, HEADER_SIZE + b) != 0 ||
+        plat_pwrite(bs->fd, buf_b, (size_t)n, HEADER_SIZE + a) != 0 ||
+        plat_pwrite(bs->fd, buf_a, (size_t)n, HEADER_SIZE + b) != 0 ||
+        plat_durable_sync(bs->fd) != 0)
+    {
+        free(buf_a);
+        free(buf_b);
+        goto fail_unlock;
+    }
+    free(buf_a);
+    free(buf_b);
+
+    BS_WRUNLOCK(bs);
+    return 0;
+
+fail_unlock:
+    { int sv = errno; BS_WRUNLOCK(bs); errno = sv; }
+    return -1;
+}
+
+int bstack_copy(bstack_t *bs, uint64_t from, uint64_t to, uint64_t n)
+{
+    if (n > UINT64_MAX - from) { errno = EINVAL; return -1; }
+    if (n > UINT64_MAX - to)   { errno = EINVAL; return -1; }
+    uint64_t from_end = from + n;
+    uint64_t to_end   = to   + n;
+
+    BS_WRLOCK(bs);
+
+    uint64_t locked = ATOMIC_LOAD_ACQUIRE(&bs->locked);
+    if (to < locked) { BS_WRUNLOCK(bs); errno = EINVAL; return -1; }
+
+    uint64_t raw_size;
+    if (file_size(bs->fd, &raw_size) != 0)
+        goto fail_unlock;
+
+    uint64_t data_size = raw_size - HEADER_SIZE;
+    if (from_end > data_size) { BS_WRUNLOCK(bs); errno = EINVAL; return -1; }
+    if (to_end   > data_size) { BS_WRUNLOCK(bs); errno = EINVAL; return -1; }
+
+    if (n == 0) {
+        BS_WRUNLOCK(bs);
+        return 0;
+    }
+
+#if UINT64_MAX > SIZE_MAX
+    if (n > (uint64_t)SIZE_MAX) { BS_WRUNLOCK(bs); errno = EINVAL; return -1; }
+#endif
+    uint8_t *buf = (uint8_t *)malloc((size_t)n);
+    if (!buf) goto fail_unlock;
+
+    if (plat_pread(bs->fd,  buf, (size_t)n, HEADER_SIZE + from) != 0 ||
+        plat_pwrite(bs->fd, buf, (size_t)n, HEADER_SIZE + to)   != 0 ||
+        plat_durable_sync(bs->fd) != 0)
+    {
+        free(buf);
+        goto fail_unlock;
+    }
+    free(buf);
+
+    BS_WRUNLOCK(bs);
+    return 0;
+
+fail_unlock:
+    { int sv = errno; BS_WRUNLOCK(bs); errno = sv; }
+    return -1;
+}
+
+/* Shared helper: compare a_len bytes at a_offset against a_expected using a
+ * 256-byte stack buffer.  Returns 1 if all bytes match, 0 if any differ, -1
+ * on I/O error (errno set).  Caller holds the write lock. */
+static int crds_compare_a(bstack_fd_t fd,
+                           uint64_t a_offset, const uint8_t *a_expected,
+                           size_t a_len)
+{
+    if (a_len == 0)
+        return 1;
+    uint8_t chunk[256];
+    size_t remaining = a_len;
+    uint64_t file_off = HEADER_SIZE + a_offset;
+    const uint8_t *exp = a_expected;
+    while (remaining > 0) {
+        size_t batch = remaining < sizeof chunk ? remaining : sizeof chunk;
+        if (plat_pread(fd, chunk, batch, file_off) != 0)
+            return -1;
+        if (memcmp(chunk, exp, batch) != 0)
+            return 0;
+        exp      += batch;
+        file_off += batch;
+        remaining -= batch;
+    }
+    return 1;
+}
+
+/* Shared helper: like crds_compare_a but applies a bitwise mask to both sides
+ * before comparing: (A[i] & mask[i]) == (expected[i] & mask[i]).
+ * Returns 1 if all masked bytes match, 0 if any differ, -1 on I/O error. */
+static int crds_compare_a_masked(bstack_fd_t fd,
+                                  uint64_t a_offset, const uint8_t *mask,
+                                  const uint8_t *a_expected, size_t a_len)
+{
+    if (a_len == 0)
+        return 1;
+    uint8_t chunk[256];
+    size_t remaining = a_len;
+    uint64_t file_off = HEADER_SIZE + a_offset;
+    const uint8_t *exp = a_expected;
+    const uint8_t *msk = mask;
+    while (remaining > 0) {
+        size_t batch = remaining < sizeof chunk ? remaining : sizeof chunk;
+        if (plat_pread(fd, chunk, batch, file_off) != 0)
+            return -1;
+        for (size_t j = 0; j < batch; j++) {
+            if ((chunk[j] & msk[j]) != (exp[j] & msk[j]))
+                return 0;
+        }
+        exp      += batch;
+        msk      += batch;
+        file_off += batch;
+        remaining -= batch;
+    }
+    return 1;
+}
+
+/* Shared body for CRDS functions after the comparison result is known.
+ * When matched == 1, reads b_len bytes at b_offset into b_old_buf, writes
+ * b_new_buf, and syncs.  Caller holds the write lock.
+ * Returns 0 on success, -1 on I/O error. */
+static int crds_do_swap(bstack_fd_t fd,
+                        uint64_t b_offset, uint8_t *b_old_buf,
+                        const uint8_t *b_new_buf, size_t b_len)
+{
+    if (b_len == 0)
+        return 0;
+    if (plat_pread(fd,  b_old_buf, b_len, HEADER_SIZE + b_offset) != 0)
+        return -1;
+    if (plat_pwrite(fd, b_new_buf, b_len, HEADER_SIZE + b_offset) != 0)
+        return -1;
+    return plat_durable_sync(fd);
+}
+
+/* Common setup for all CRDS operations: validates bounds and locked region,
+ * computes a_end / b_end, and acquires the write lock.
+ * Returns -1 (errno set) on validation failure; lock is NOT held on -1.
+ * On success the write lock is held and data_size is filled. */
+static int crds_setup(bstack_t *bs,
+                      uint64_t a_offset, size_t a_len,
+                      uint64_t b_offset, size_t b_len,
+                      uint64_t *out_a_end, uint64_t *out_b_end,
+                      uint64_t *out_data_size)
+{
+    if ((uint64_t)a_len > UINT64_MAX - a_offset ||
+        (uint64_t)b_len > UINT64_MAX - b_offset) {
+        errno = EINVAL;
+        return -1;
+    }
+    *out_a_end = a_offset + (uint64_t)a_len;
+    *out_b_end = b_offset + (uint64_t)b_len;
+
+    BS_WRLOCK(bs);
+
+    uint64_t locked = ATOMIC_LOAD_ACQUIRE(&bs->locked);
+    if (b_len > 0 && b_offset < locked) {
+        BS_WRUNLOCK(bs);
+        errno = EINVAL;
+        return -1;
+    }
+
+    uint64_t raw_size;
+    if (file_size(bs->fd, &raw_size) != 0) {
+        int sv = errno;
+        BS_WRUNLOCK(bs);
+        errno = sv;
+        return -1;
+    }
+    *out_data_size = raw_size - HEADER_SIZE;
+
+    if (a_len > 0 && *out_a_end > *out_data_size) {
+        BS_WRUNLOCK(bs);
+        errno = EINVAL;
+        return -1;
+    }
+    if (b_len > 0 && *out_b_end > *out_data_size) {
+        BS_WRUNLOCK(bs);
+        errno = EINVAL;
+        return -1;
+    }
+    return 0;
+}
+
+int bstack_eq_crds(bstack_t *bs,
+                   uint64_t a_offset, const uint8_t *a_expected, size_t a_len,
+                   uint64_t b_offset, uint8_t *b_old_buf,
+                   const uint8_t *b_new_buf, size_t b_len,
+                   int *ok)
+{
+    uint64_t a_end, b_end, data_size;
+    if (crds_setup(bs, a_offset, a_len, b_offset, b_len,
+                   &a_end, &b_end, &data_size) != 0)
+        return -1;
+    (void)a_end; (void)b_end; (void)data_size;
+
+    int cmp = crds_compare_a(bs->fd, a_offset, a_expected, a_len);
+    if (cmp < 0)  goto fail_unlock;
+    if (cmp == 0) { BS_WRUNLOCK(bs); if (ok) *ok = 0; return 0; }
+
+    if (crds_do_swap(bs->fd, b_offset, b_old_buf, b_new_buf, b_len) != 0)
+        goto fail_unlock;
+
+    BS_WRUNLOCK(bs);
+    if (ok) *ok = 1;
+    return 0;
+
+fail_unlock:
+    { int sv = errno; BS_WRUNLOCK(bs); errno = sv; }
+    return -1;
+}
+
+int bstack_ne_crds(bstack_t *bs,
+                   uint64_t a_offset, const uint8_t *a_expected, size_t a_len,
+                   uint64_t b_offset, uint8_t *b_old_buf,
+                   const uint8_t *b_new_buf, size_t b_len,
+                   int *ok)
+{
+    uint64_t a_end, b_end, data_size;
+    if (crds_setup(bs, a_offset, a_len, b_offset, b_len,
+                   &a_end, &b_end, &data_size) != 0)
+        return -1;
+    (void)a_end; (void)b_end; (void)data_size;
+
+    int cmp = crds_compare_a(bs->fd, a_offset, a_expected, a_len);
+    if (cmp < 0)  goto fail_unlock;
+    if (cmp == 1) { BS_WRUNLOCK(bs); if (ok) *ok = 0; return 0; }
+
+    if (crds_do_swap(bs->fd, b_offset, b_old_buf, b_new_buf, b_len) != 0)
+        goto fail_unlock;
+
+    BS_WRUNLOCK(bs);
+    if (ok) *ok = 1;
+    return 0;
+
+fail_unlock:
+    { int sv = errno; BS_WRUNLOCK(bs); errno = sv; }
+    return -1;
+}
+
+int bstack_masked_eq_crds(bstack_t *bs,
+                          uint64_t a_offset, const uint8_t *mask,
+                          const uint8_t *a_expected, size_t a_len,
+                          uint64_t b_offset, uint8_t *b_old_buf,
+                          const uint8_t *b_new_buf, size_t b_len,
+                          int *ok)
+{
+    uint64_t a_end, b_end, data_size;
+    if (crds_setup(bs, a_offset, a_len, b_offset, b_len,
+                   &a_end, &b_end, &data_size) != 0)
+        return -1;
+    (void)a_end; (void)b_end; (void)data_size;
+
+    int cmp = crds_compare_a_masked(bs->fd, a_offset, mask, a_expected, a_len);
+    if (cmp < 0)  goto fail_unlock;
+    if (cmp == 0) { BS_WRUNLOCK(bs); if (ok) *ok = 0; return 0; }
+
+    if (crds_do_swap(bs->fd, b_offset, b_old_buf, b_new_buf, b_len) != 0)
+        goto fail_unlock;
+
+    BS_WRUNLOCK(bs);
+    if (ok) *ok = 1;
+    return 0;
+
+fail_unlock:
+    { int sv = errno; BS_WRUNLOCK(bs); errno = sv; }
+    return -1;
+}
+
+int bstack_masked_ne_crds(bstack_t *bs,
+                          uint64_t a_offset, const uint8_t *mask,
+                          const uint8_t *a_expected, size_t a_len,
+                          uint64_t b_offset, uint8_t *b_old_buf,
+                          const uint8_t *b_new_buf, size_t b_len,
+                          int *ok)
+{
+    uint64_t a_end, b_end, data_size;
+    if (crds_setup(bs, a_offset, a_len, b_offset, b_len,
+                   &a_end, &b_end, &data_size) != 0)
+        return -1;
+    (void)a_end; (void)b_end; (void)data_size;
+
+    int cmp = crds_compare_a_masked(bs->fd, a_offset, mask, a_expected, a_len);
+    if (cmp < 0)  goto fail_unlock;
+    if (cmp == 1) { BS_WRUNLOCK(bs); if (ok) *ok = 0; return 0; }
+
+    if (crds_do_swap(bs->fd, b_offset, b_old_buf, b_new_buf, b_len) != 0)
+        goto fail_unlock;
+
+    BS_WRUNLOCK(bs);
+    if (ok) *ok = 1;
+    return 0;
+
+fail_unlock:
+    { int sv = errno; BS_WRUNLOCK(bs); errno = sv; }
     return -1;
 }
 
