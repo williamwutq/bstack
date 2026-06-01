@@ -10,7 +10,7 @@
 use super::{BStackAllocator, BStackSlice};
 use crate::BStack;
 use core::{cell::Cell, marker::PhantomData};
-use std::{fmt, io};
+use std::{collections::HashSet, fmt, io};
 
 #[cfg(feature = "set")]
 const ALCK_MAGIC: [u8; 8] = *b"ALCK\x00\x01\x00\x00";
@@ -109,6 +109,34 @@ pub struct CheckedSlabBStackAllocator {
     block_size: u64,
     // Mark as !Sync to prevent concurrent access to the free list.
     _not_sync: PhantomData<Cell<()>>,
+}
+
+/// How a single block looks to the recovery scan.
+#[cfg(feature = "set")]
+enum BlockClass {
+    /// `overhead == 0` and the block is reachable from `free_head`.
+    Free,
+    /// `overhead == 0` but the block is **not** in the free list (a leak).
+    Leaked,
+    /// A valid in-use marker spanning this many blocks.
+    InUse(u64),
+    /// Neither a clean free block nor a valid in-use marker.
+    Suspicious,
+}
+
+/// Outcome of attempting to resynchronise the scan after a suspicious block
+/// when no free-list block remains as an anchor.
+#[cfg(feature = "set")]
+enum ResyncOutcome {
+    /// A later block boundary cleanly tiles to the tail; resume there. The gap
+    /// is mid-arena garbage and is left leaked.
+    Resync(u64),
+    /// Nothing valid follows; the suspect region is an orphaned tail (a failed
+    /// `realloc` truncation) and should be discarded.
+    DiscardTail,
+    /// The region is too large to analyse within the memory cap; leave it
+    /// leaked rather than risk an unbounded allocation.
+    LeaveLeaked,
 }
 
 #[cfg(feature = "set")]
@@ -273,16 +301,241 @@ impl CheckedSlabBStackAllocator {
             }
         }
 
-        Ok(Self {
+        let allocator = Self {
             stack,
             block_size: stored_block_size,
             _not_sync: PhantomData,
-        })
+        };
+        // Reclaim leaks and repair a failed tail truncation left by an unclean
+        // shutdown. Best-effort: the residual unsure-block count is discarded
+        // here; call [`recover`](Self::recover) explicitly to inspect it.
+        allocator.recover()?;
+        Ok(allocator)
     }
 
     /// Return the usable bytes per slab block (the `data_size` passed to [`new`](Self::new)).
     pub fn data_size(&self) -> u64 {
         self.block_size - Self::OVERHEAD
+    }
+
+    /// Upper bound on the number of blocks the reach-oracle will analyse in one
+    /// pass. Past this, an ambiguous region is left leaked rather than risk an
+    /// unbounded allocation. Only reached on a corrupt/garbage arena.
+    const MAX_RECOVER_REGION: usize = 1 << 26;
+
+    /// Repair the allocator after an unclean shutdown and return the number of
+    /// blocks that remain leaked or could not be classified with certainty
+    /// (`0` means the arena is fully accounted for).
+    ///
+    /// Recovery is a two-phase, crash-safe, idempotent operation. [`open`](Self::open)
+    /// runs it automatically; it is exposed so callers can inspect the residual
+    /// count or re-run it on demand.
+    ///
+    /// # Phase 1 — scan (read-only)
+    ///
+    /// The free list is walked into a sorted set (with cycle detection), then
+    /// the arena is scanned linearly. A valid in-use block advances the cursor
+    /// by its block count; a zero-overhead block not in the free list is a leak
+    /// and is queued for reclaim; anything else is *suspicious*. At a suspicious
+    /// block the scan resynchronises on the next free-list block if one follows
+    /// (the intervening gap is left leaked); otherwise a backward reachability
+    /// pass decides between a mid-arena gap (left leaked) and an orphaned tail
+    /// from a failed `realloc` truncation (discarded).
+    ///
+    /// # Phase 2 — apply (one block at a time)
+    ///
+    /// Any orphaned tail is discarded, then each reclaimed block is prepended to
+    /// the existing free list individually — the list is never rebuilt. Every
+    /// step is an atomic [`BStack`] operation, so a crash mid-recovery simply
+    /// leaves the remaining leaks to be re-found on the next run.
+    ///
+    /// # Safety of destructive steps
+    ///
+    /// A tail is discarded only when no free-list block lies at or beyond it, so
+    /// `free_head` and every free block survive. If the free-list walk itself
+    /// hits corruption, reclaim and tail-discard are both suppressed for that
+    /// run and the uncertain blocks are merely counted — an unreliable free list
+    /// never authorises relinking or truncation.
+    pub fn recover(&self) -> io::Result<u64> {
+        let stack_len = self.stack.len()?;
+        if stack_len <= Self::ARENA_START {
+            return Ok(0);
+        }
+        let bs = self.block_size;
+        let (free, free_corrupt) = self.scan_free_list(stack_len)?;
+
+        let mut reclaim: Vec<u64> = Vec::new();
+        let mut unsure: u64 = 0;
+        let mut tailcut: Option<u64> = None;
+
+        let mut p = Self::ARENA_START;
+        'scan: while p < stack_len {
+            match self.classify(p, stack_len, &free)? {
+                BlockClass::Free => p += bs,
+                BlockClass::Leaked => {
+                    // A bare zero-overhead block is only trustworthy as a leak
+                    // while the free list walked cleanly; a corrupt list means
+                    // it might already be linked, so leave it leaked.
+                    if free_corrupt {
+                        unsure += 1;
+                    } else {
+                        reclaim.push(p);
+                    }
+                    p += bs;
+                }
+                BlockClass::InUse(n) => p += n * bs,
+                BlockClass::Suspicious => {
+                    // Prefer a known-free block as a reliable resync anchor.
+                    let idx = free.partition_point(|&x| x <= p);
+                    if let Some(&f) = free.get(idx) {
+                        unsure += (f - p) / bs;
+                        p = f;
+                    } else {
+                        match self.resync_tail(p, stack_len, &free)? {
+                            ResyncOutcome::Resync(q) => {
+                                unsure += (q - p) / bs;
+                                p = q;
+                            }
+                            ResyncOutcome::DiscardTail => {
+                                // Only safe when the free list is trusted.
+                                if free_corrupt {
+                                    unsure += (stack_len - p) / bs;
+                                } else {
+                                    tailcut = Some(p);
+                                }
+                                break 'scan;
+                            }
+                            ResyncOutcome::LeaveLeaked => {
+                                unsure += (stack_len - p) / bs;
+                                break 'scan;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(t) = tailcut {
+            self.stack.discard(stack_len - t)?;
+        }
+        for b in reclaim {
+            self.push_free_blocks(b, 1)?;
+        }
+        Ok(unsure)
+    }
+
+    /// Walk the free list from `free_head` into a sorted set of block offsets.
+    ///
+    /// Stops at the first structural problem — a misaligned or out-of-bounds
+    /// pointer, a head whose overhead is non-zero, or a cycle (detected with a
+    /// visited set bounded by the arena block count) — and reports it via the
+    /// returned flag (`true` = the walk was cut short by corruption).
+    fn scan_free_list(&self, stack_len: u64) -> io::Result<(Vec<u64>, bool)> {
+        let mut free = Vec::new();
+        let mut seen: HashSet<u64> = HashSet::new();
+        let arena_blocks = (stack_len - Self::ARENA_START) / self.block_size;
+        let mut head = u64::from_le_bytes(read_bstack!(self.stack, Self::FREE_HEAD_OFFSET => u64));
+        let mut corrupt = false;
+        while head != Self::SENTINEL {
+            if head < Self::ARENA_START
+                || (head - Self::ARENA_START) % self.block_size != 0
+                || head >= stack_len
+                || !seen.insert(head)
+                || seen.len() as u64 > arena_blocks
+            {
+                corrupt = true;
+                break;
+            }
+            let mut prefix = [0u8; 16];
+            self.stack.get_into(head, &mut prefix)?;
+            if u64::from_le_bytes(prefix[0..8].try_into().unwrap()) != 0 {
+                corrupt = true;
+                break;
+            }
+            free.push(head);
+            head = u64::from_le_bytes(prefix[8..16].try_into().unwrap());
+        }
+        free.sort_unstable();
+        Ok((free, corrupt))
+    }
+
+    /// Classify the block at `p` for the recovery scan.
+    fn classify(&self, p: u64, stack_len: u64, free: &[u64]) -> io::Result<BlockClass> {
+        let overhead = self.read_overhead(p)?;
+        if overhead == 0 {
+            return Ok(if free.binary_search(&p).is_ok() {
+                BlockClass::Free
+            } else {
+                BlockClass::Leaked
+            });
+        }
+        Ok(match self.valid_in_use(overhead, p, stack_len, free) {
+            Some(n) => BlockClass::InUse(n),
+            None => BlockClass::Suspicious,
+        })
+    }
+
+    /// If `overhead` at `p` is a valid in-use marker, return its block span.
+    ///
+    /// Rejects markers whose count is zero, whose span overflows or runs past
+    /// `stack_len`, or whose extent engulfs a known free block — a free block
+    /// can never lie inside a live allocation.
+    fn valid_in_use(&self, overhead: u64, p: u64, stack_len: u64, free: &[u64]) -> Option<u64> {
+        if overhead & Self::IN_USE_BIT == 0 {
+            return None;
+        }
+        let n = overhead & Self::BLOCKS_MASK;
+        if n == 0 {
+            return None;
+        }
+        let span = n.checked_mul(self.block_size)?;
+        let end = p.checked_add(span)?;
+        if end > stack_len {
+            return None;
+        }
+        // Engulf check: the first free block past `p` must not fall inside `end`.
+        if let Some(&f) = free.get(free.partition_point(|&x| x <= p)) {
+            if f < end {
+                return None;
+            }
+        }
+        Some(n)
+    }
+
+    /// Decide what to do with a suspicious region `[p, stack_len)` when no
+    /// free-list block follows it.
+    ///
+    /// A backward reachability pass marks each boundary from which a strict
+    /// clean walk (only free or valid in-use blocks) lands exactly on
+    /// `stack_len`. The smallest such interior boundary is a mid-arena gap to
+    /// resync on; if none exists the region is an orphaned tail to discard.
+    fn resync_tail(&self, p: u64, stack_len: u64, free: &[u64]) -> io::Result<ResyncOutcome> {
+        let bs = self.block_size;
+        let m = match usize::try_from((stack_len - p) / bs) {
+            Ok(v) if v <= Self::MAX_RECOVER_REGION => v,
+            _ => return Ok(ResyncOutcome::LeaveLeaked),
+        };
+        // reach[j]: a clean walk starting at block j reaches stack_len exactly.
+        let mut reach = vec![false; m + 1];
+        reach[m] = true;
+        for j in (0..m).rev() {
+            let off = p + (j as u64) * bs;
+            let overhead = self.read_overhead(off)?;
+            reach[j] = if overhead == 0 {
+                reach[j + 1]
+            } else if let Some(n) = self.valid_in_use(overhead, off, stack_len, free) {
+                // valid_in_use guarantees off + n*bs <= stack_len, so j + n <= m.
+                reach[j + n as usize]
+            } else {
+                false
+            };
+        }
+        for j in 1..m {
+            if reach[j] {
+                return Ok(ResyncOutcome::Resync(p + (j as u64) * bs));
+            }
+        }
+        Ok(ResyncOutcome::DiscardTail)
     }
 
     /// Read the overhead word stored at the start of the block at `block_start`.
@@ -977,5 +1230,106 @@ mod tests {
         let s = alloc.realloc(empty, 8).unwrap();
         assert_eq!(s.len(), 8);
         assert!(!s.is_empty());
+    }
+
+    // ── recover() ─────────────────────────────────────────────────────────────
+
+    /// In-use overhead value for an allocation spanning `n` blocks.
+    const fn in_use(n: u64) -> u64 {
+        0x8000_0000_0000_0000u64 | n
+    }
+
+    #[test]
+    fn recover_clean_allocator_returns_zero() {
+        let (stack, path) = empty_stack();
+        let _g = Guard(path);
+        let alloc = CheckedSlabBStackAllocator::new(stack, 8).unwrap(); // block_size 16
+        let _a = alloc.alloc(8).unwrap(); // block 48
+        let b = alloc.alloc(8).unwrap(); // block 64
+        let _c = alloc.alloc(16).unwrap(); // blocks 80,96 (2-block)
+        alloc.dealloc(b).unwrap(); // b -> free list
+        // Nothing leaked or orphaned: a clean scan accounts for every block.
+        assert_eq!(alloc.recover().unwrap(), 0);
+    }
+
+    #[test]
+    fn recover_reclaims_leaked_free_block() {
+        let (stack, path) = empty_stack();
+        let _g = Guard(path);
+        let alloc = CheckedSlabBStackAllocator::new(stack, 8).unwrap(); // block_size 16
+        let _a = alloc.alloc(8).unwrap(); // block 48
+        let b = alloc.alloc(8).unwrap(); // block 64, slice start 72
+        let _c = alloc.alloc(8).unwrap(); // block 80
+        alloc.dealloc(b).unwrap(); // free_head = 64
+        // Simulate a pop crash: advance free_head past b without claiming it.
+        alloc.stack().set(40, 0u64.to_le_bytes()).unwrap();
+        // Block 64 is now leaked (overhead 0, not in the free list).
+        assert_eq!(alloc.recover().unwrap(), 0);
+        // The reclaimed block is handed back out on the next allocation.
+        let reused = alloc.alloc(8).unwrap();
+        assert_eq!(reused.start(), 72);
+    }
+
+    #[test]
+    fn recover_discards_orphan_tail() {
+        let (stack, path) = empty_stack();
+        let _g = Guard(path);
+        let alloc = CheckedSlabBStackAllocator::new(stack, 8).unwrap(); // block_size 16
+        let s = alloc.alloc(40).unwrap(); // 3 blocks: block 48, stack -> 96
+        s.write(&[0xFFu8; 40]).unwrap(); // fill so orphan blocks read as garbage
+        assert_eq!(alloc.stack().len().unwrap(), 96);
+        // Simulate a realloc tail-shrink crash: commit new_n=1, skip the discard.
+        alloc.stack().set(48, in_use(1).to_le_bytes()).unwrap();
+        // Blocks 64 and 80 are now orphaned tail garbage.
+        assert_eq!(alloc.recover().unwrap(), 0);
+        assert_eq!(alloc.stack().len().unwrap(), 64); // tail truncated away
+    }
+
+    #[test]
+    fn recover_leaves_mid_arena_garbage_leaked() {
+        let (stack, path) = empty_stack();
+        let _g = Guard(path);
+        let alloc = CheckedSlabBStackAllocator::new(stack, 8).unwrap(); // block_size 16
+        let _a = alloc.alloc(8).unwrap(); // block 48
+        let _b = alloc.alloc(8).unwrap(); // block 64
+        let c = alloc.alloc(8).unwrap(); // block 80, slice start 88
+        c.write(b"keepkeep").unwrap();
+        // Corrupt the middle block into garbage; the live block after it remains.
+        alloc.stack().set(64, u64::MAX.to_le_bytes()).unwrap();
+        // No free-list anchor follows, so the reach-oracle must resync on block 80.
+        assert_eq!(alloc.recover().unwrap(), 1); // one garbage block left leaked
+        assert_eq!(alloc.stack().len().unwrap(), 96); // nothing discarded
+        assert_eq!(c.read().unwrap(), b"keepkeep"); // live data preserved
+    }
+
+    #[test]
+    fn open_auto_recovers_orphan_tail() {
+        let (stack, path) = empty_stack();
+        let _g = Guard(path.clone());
+        {
+            let alloc = CheckedSlabBStackAllocator::new(stack, 8).unwrap();
+            let s = alloc.alloc(40).unwrap(); // 3 blocks, stack -> 96
+            s.write(&[0xFFu8; 40]).unwrap();
+            alloc.stack().set(48, in_use(1).to_le_bytes()).unwrap(); // crash sim
+        }
+        let reopened = CheckedSlabBStackAllocator::open(BStack::open(&path).unwrap()).unwrap();
+        assert_eq!(reopened.stack().len().unwrap(), 64); // open() ran recovery
+    }
+
+    #[test]
+    fn recover_is_idempotent() {
+        let (stack, path) = empty_stack();
+        let _g = Guard(path);
+        let alloc = CheckedSlabBStackAllocator::new(stack, 8).unwrap();
+        let _a = alloc.alloc(8).unwrap();
+        let b = alloc.alloc(8).unwrap();
+        let _c = alloc.alloc(8).unwrap();
+        alloc.dealloc(b).unwrap();
+        alloc.stack().set(40, 0u64.to_le_bytes()).unwrap(); // leak block 64
+        assert_eq!(alloc.recover().unwrap(), 0);
+        let len_after = alloc.stack().len().unwrap();
+        // A second run finds nothing further and changes nothing.
+        assert_eq!(alloc.recover().unwrap(), 0);
+        assert_eq!(alloc.stack().len().unwrap(), len_after);
     }
 }
