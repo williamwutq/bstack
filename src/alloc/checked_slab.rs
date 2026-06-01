@@ -26,7 +26,7 @@ const ALCK_MAGIC_PREFIX: [u8; 6] = *b"ALCK\x00\x01";
 /// Unlike [`SlabBStackAllocator`](super::SlabBStackAllocator), every block in
 /// the arena carries an 8-byte **overhead** prefix that records the block's
 /// state. The slice handed to the caller covers only the `data` region that
-/// follows the overhead, i.e. `block_size − 8` usable bytes in a single block.
+/// follows the overhead, i.e. `data_size` usable bytes per block.
 ///
 /// # On-disk layout
 ///
@@ -64,7 +64,7 @@ const ALCK_MAGIC_PREFIX: [u8; 6] = *b"ALCK\x00\x01";
 /// # Allocation policy
 ///
 /// * `len == 0` — returns a zero-length sentinel slice (`offset = 0, len = 0`).
-/// * `num_blocks == 1` (`len ≤ block_size − 8`) — pops from the free list if
+/// * `num_blocks == 1` (`len ≤ data_size`) — pops from the free list if
 ///   available; otherwise extends the tail by exactly `block_size` bytes.
 /// * `num_blocks > 1` — always extends the tail by `num_blocks × block_size`
 ///   bytes. Multi-block allocations require a contiguous run and so never draw
@@ -123,8 +123,10 @@ impl CheckedSlabBStackAllocator {
     const FREE_HEAD_OFFSET: u64 = Self::OFFSET_SIZE + 16;
     /// Per-block overhead prefix size in bytes.
     const OVERHEAD: u64 = 8;
-    /// Minimum legal `block_size`: 8 overhead + 8 minimum usable.
+    /// Minimum legal `block_size` (internal): `OVERHEAD + MIN_DATA_SIZE`.
     const MIN_BLOCK_SIZE: u64 = 16;
+    /// Minimum usable bytes per block exposed via `new`.
+    const MIN_DATA_SIZE: u64 = Self::MIN_BLOCK_SIZE - Self::OVERHEAD;
     /// Free-list sentinel meaning "no next block". 0 is safe because all blocks
     /// start at ARENA_START (48) or later and no valid block offset is 0.
     const SENTINEL: u64 = 0;
@@ -135,36 +137,35 @@ impl CheckedSlabBStackAllocator {
 
     /// Initialise a new `CheckedSlabBStackAllocator` over an empty `stack`.
     ///
-    /// Writes the 48-byte allocator header (24 reserved bytes, magic,
-    /// `block_size`, and `free_head = 0`) using a single
+    /// `data_size` is the number of usable bytes per slab block (excluding the
+    /// 8-byte overhead prefix). The on-disk `block_size` stored in the header is
+    /// `data_size + 8`. Writes the 48-byte allocator header using a single
     /// [`BStack::push`] and returns a ready allocator.
     ///
     /// # Errors
     ///
-    /// * [`io::ErrorKind::InvalidInput`] — `block_size < 16`, or `stack` is not
+    /// * [`io::ErrorKind::InvalidInput`] — `data_size < 8`, or `stack` is not
     ///   empty (use [`CheckedSlabBStackAllocator::open`] to reopen an existing
     ///   file).
     /// * Any [`io::Error`] propagated from the underlying [`BStack`] operations.
-    pub fn new(stack: BStack, block_size: u64) -> io::Result<Self> {
+    pub fn new(stack: BStack, data_size: u64) -> io::Result<Self> {
         if !stack.is_empty()? {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "stack is not empty; use CheckedSlabBStackAllocator::open to reopen an existing allocator",
             ));
         }
-        if block_size < Self::MIN_BLOCK_SIZE {
+        if data_size < Self::MIN_DATA_SIZE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!(
-                    "block_size ({block_size}) must be >= {}",
-                    Self::MIN_BLOCK_SIZE
-                ),
+                format!("data_size ({data_size}) must be >= {}", Self::MIN_DATA_SIZE),
             ));
         }
+        let block_size = data_size + Self::OVERHEAD;
         if usize::try_from(block_size).is_err() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "block_size is too large for this platform",
+                "data_size is too large for this platform",
             ));
         }
         let mut hdr = [0u8; Self::ARENA_START as usize];
@@ -274,12 +275,9 @@ impl CheckedSlabBStackAllocator {
         })
     }
 
-    /// Return the `block_size` this allocator was created with.
-    ///
-    /// This covers the full block including the 8-byte overhead; a single block
-    /// holds `block_size − 8` usable bytes.
-    pub fn block_size(&self) -> u64 {
-        self.block_size
+    /// Return the usable bytes per slab block (the `data_size` passed to [`new`](Self::new)).
+    pub fn data_size(&self) -> u64 {
+        self.block_size - Self::OVERHEAD
     }
 
     /// Read the overhead word stored at the start of the block at `block_start`.
@@ -309,13 +307,13 @@ impl CheckedSlabBStackAllocator {
         Ok(total.div_ceil(self.block_size))
     }
 
-    /// Pop the head block off the free list, returning its block start offset.
+    /// Pop the head block off the free list, mark it in use with `num_blocks`,
+    /// and return its block start offset, or `None` if the list is empty.
     ///
-    /// Detaches the block by advancing `free_head` to the popped block's next
-    /// pointer; the block is left with its overhead still zero (free-looking),
-    /// so a crash before the caller marks it in use merely leaks it. Verifies
-    /// the popped block's overhead is zero and errors otherwise.
-    fn pop_free_block(&self) -> io::Result<Option<u64>> {
+    /// Advances `free_head` then writes the full block in one call: the overhead
+    /// is set to `IN_USE_BIT | num_blocks` and the data bytes are zeroed. A
+    /// crash between the two writes merely leaks the detached block.
+    fn pop_and_claim_block(&self, num_blocks: u64) -> io::Result<Option<u64>> {
         let head = u64::from_le_bytes(read_bstack!(self.stack, Self::FREE_HEAD_OFFSET => u64));
         if head == Self::SENTINEL {
             return Ok(None);
@@ -331,9 +329,12 @@ impl CheckedSlabBStackAllocator {
                 ),
             ));
         }
-        // The next pointer lives in data[0..8] (offset head + 8).
-        let next = &prefix[8..16];
-        self.stack.set(Self::FREE_HEAD_OFFSET, next)?;
+        // Advance free_head to the next block (stored in data[0..8]).
+        self.stack.set(Self::FREE_HEAD_OFFSET, &prefix[8..16])?;
+        // Mark in-use and zero data in one write.
+        let mut block_buf = vec![0u8; self.block_size as usize]; // safe: validated in new/open
+        block_buf[..8].copy_from_slice(&(Self::IN_USE_BIT | num_blocks).to_le_bytes());
+        self.stack.set(head, block_buf)?;
         Ok(Some(head))
     }
 
@@ -353,12 +354,6 @@ impl CheckedSlabBStackAllocator {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "freed region size overflows u64",
-            )
-        })?;
-        first_block.checked_add(total).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "freed region end offset overflows u64",
             )
         })?;
         let buf_size = usize::try_from(total).map_err(|_| {
@@ -422,7 +417,7 @@ impl CheckedSlabBStackAllocator {
 impl fmt::Debug for CheckedSlabBStackAllocator {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CheckedSlabBStackAllocator")
-            .field("block_size", &self.block_size)
+            .field("data_size", &self.data_size())
             .finish_non_exhaustive()
     }
 }
@@ -453,17 +448,8 @@ impl BStackAllocator for CheckedSlabBStackAllocator {
 
         let num_blocks = self.blocks_needed(len)?;
         if num_blocks == 1 {
-            if let Some(block_start) = self.pop_free_block()? {
-                // Zero the data region, then flip the overhead to in-use last so
-                // a crash before the marker leaves the block free-looking (and
-                // merely leaked, since it is already detached from the list).
-                self.stack.zero(
-                    block_start + Self::OVERHEAD,
-                    self.block_size - Self::OVERHEAD,
-                )?;
-                self.write_overhead(block_start, Self::IN_USE_BIT | 1)?;
-                // SAFETY: block_start is a valid block from pop_free_block; data
-                // begins after the 8-byte overhead and spans block_size - 8 >= len.
+            if let Some(block_start) = self.pop_and_claim_block(1)? {
+                // SAFETY: block_start is a valid block_size region; data begins after the overhead.
                 return Ok(unsafe {
                     BStackSlice::from_raw_parts(self, block_start + Self::OVERHEAD, len)
                 });
@@ -690,20 +676,20 @@ mod tests {
     // ── new() ─────────────────────────────────────────────────────────────────
 
     #[test]
-    fn new_initialises_header_and_reports_block_size() {
+    fn new_initialises_header_and_reports_data_size() {
         let (stack, path) = empty_stack();
         let _g = Guard(path);
-        let alloc = CheckedSlabBStackAllocator::new(stack, 16).unwrap();
-        assert_eq!(alloc.block_size(), 16);
+        let alloc = CheckedSlabBStackAllocator::new(stack, 8).unwrap();
+        assert_eq!(alloc.data_size(), 8);
         // ARENA_START = OFFSET_SIZE(24) + HEADER_SIZE(24) = 48
         assert_eq!(alloc.stack().len().unwrap(), 48);
     }
 
     #[test]
-    fn new_rejects_block_size_below_minimum() {
+    fn new_rejects_data_size_below_minimum() {
         let (stack, path) = empty_stack();
         let _g = Guard(path);
-        let err = CheckedSlabBStackAllocator::new(stack, 15).unwrap_err();
+        let err = CheckedSlabBStackAllocator::new(stack, 7).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
     }
 
@@ -712,7 +698,7 @@ mod tests {
         let (stack, path) = empty_stack();
         let _g = Guard(path);
         stack.push(b"data").unwrap();
-        let err = CheckedSlabBStackAllocator::new(stack, 16).unwrap_err();
+        let err = CheckedSlabBStackAllocator::new(stack, 8).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
     }
 
@@ -765,7 +751,7 @@ mod tests {
     fn open_rejects_misaligned_tail() {
         let (stack, path) = empty_stack();
         let _g = Guard(path.clone());
-        CheckedSlabBStackAllocator::new(stack, 16).unwrap();
+        CheckedSlabBStackAllocator::new(stack, 8).unwrap();
         let reopen = BStack::open(&path).unwrap();
         reopen.extend(1).unwrap();
         drop(reopen);
@@ -774,12 +760,12 @@ mod tests {
     }
 
     #[test]
-    fn open_succeeds_and_restores_block_size() {
+    fn open_succeeds_and_restores_data_size() {
         let (stack, path) = empty_stack();
         let _g = Guard(path.clone());
-        CheckedSlabBStackAllocator::new(stack, 32).unwrap();
+        CheckedSlabBStackAllocator::new(stack, 24).unwrap();
         let alloc = CheckedSlabBStackAllocator::open(BStack::open(&path).unwrap()).unwrap();
-        assert_eq!(alloc.block_size(), 32);
+        assert_eq!(alloc.data_size(), 24);
     }
 
     // ── allocation behaviour ──────────────────────────────────────────────────
@@ -788,7 +774,7 @@ mod tests {
     fn zero_alloc_returns_empty_slice() {
         let (stack, path) = empty_stack();
         let _g = Guard(path);
-        let alloc = CheckedSlabBStackAllocator::new(stack, 16).unwrap();
+        let alloc = CheckedSlabBStackAllocator::new(stack, 8).unwrap();
         let s = alloc.alloc(0).unwrap();
         assert!(s.is_empty());
     }
@@ -797,7 +783,7 @@ mod tests {
     fn dealloc_pushes_to_free_list_and_next_alloc_reuses_block() {
         let (stack, path) = empty_stack();
         let _g = Guard(path);
-        let alloc = CheckedSlabBStackAllocator::new(stack, 16).unwrap();
+        let alloc = CheckedSlabBStackAllocator::new(stack, 8).unwrap();
 
         let s1 = alloc.alloc(8).unwrap();
         let offset1 = s1.start();
@@ -811,7 +797,7 @@ mod tests {
     fn free_list_recycles_all_dealloc_d_blocks() {
         let (stack, path) = empty_stack();
         let _g = Guard(path);
-        let alloc = CheckedSlabBStackAllocator::new(stack, 16).unwrap();
+        let alloc = CheckedSlabBStackAllocator::new(stack, 8).unwrap();
 
         let a = alloc.alloc(8).unwrap();
         let b = alloc.alloc(8).unwrap();
@@ -835,9 +821,9 @@ mod tests {
     fn oversized_tail_dealloc_shrinks_stack() {
         let (stack, path) = empty_stack();
         let _g = Guard(path);
-        let alloc = CheckedSlabBStackAllocator::new(stack, 16).unwrap();
+        let alloc = CheckedSlabBStackAllocator::new(stack, 8).unwrap();
 
-        // 17 bytes needs ceil((17 + 8) / 16) = 2 blocks (32 bytes backing).
+        // data_size=8, block_size=16: 17 bytes needs ceil((17+8)/16) = 2 blocks = 32 bytes.
         let s = alloc.alloc(17).unwrap();
         let tail_before = alloc.stack().len().unwrap();
         assert_eq!(tail_before, 48 + 32);
@@ -850,7 +836,7 @@ mod tests {
     fn double_free_returns_error() {
         let (stack, path) = empty_stack();
         let _g = Guard(path);
-        let alloc = CheckedSlabBStackAllocator::new(stack, 16).unwrap();
+        let alloc = CheckedSlabBStackAllocator::new(stack, 8).unwrap();
 
         let s = alloc.alloc(8).unwrap();
         let s_copy = s; // BStackSlice is Copy
@@ -863,7 +849,7 @@ mod tests {
     fn write_and_read_round_trip() {
         let (stack, path) = empty_stack();
         let _g = Guard(path);
-        let alloc = CheckedSlabBStackAllocator::new(stack, 24).unwrap();
+        let alloc = CheckedSlabBStackAllocator::new(stack, 16).unwrap();
         let s = alloc.alloc(12).unwrap();
         s.write(b"hello world!").unwrap();
         assert_eq!(s.read().unwrap(), b"hello world!");
@@ -873,7 +859,7 @@ mod tests {
     fn data_survives_reopen() {
         let (stack, path) = empty_stack();
         let _g = Guard(path.clone());
-        let alloc = CheckedSlabBStackAllocator::new(stack, 16).unwrap();
+        let alloc = CheckedSlabBStackAllocator::new(stack, 8).unwrap();
         let s = alloc.alloc(5).unwrap();
         let offset = s.start();
         s.write(b"hello").unwrap();
@@ -888,9 +874,9 @@ mod tests {
     fn multiblock_alloc_round_trip_and_free_reuse() {
         let (stack, path) = empty_stack();
         let _g = Guard(path);
-        let alloc = CheckedSlabBStackAllocator::new(stack, 16).unwrap();
+        let alloc = CheckedSlabBStackAllocator::new(stack, 8).unwrap();
 
-        // 40 bytes needs ceil((40 + 8) / 16) = 3 blocks.
+        // data_size=8, block_size=16: 40 bytes needs ceil((40+8)/16) = 3 blocks.
         let s = alloc.alloc(40).unwrap();
         let payload: Vec<u8> = (0..40u8).collect();
         s.write(&payload).unwrap();
@@ -909,8 +895,8 @@ mod tests {
     fn realloc_same_block_count_grows_in_place_and_zeroes() {
         let (stack, path) = empty_stack();
         let _g = Guard(path);
-        // block_size 32 -> 24 usable per block.
-        let alloc = CheckedSlabBStackAllocator::new(stack, 32).unwrap();
+        // data_size 24: alloc(8) and realloc(16) both fit in 1 block.
+        let alloc = CheckedSlabBStackAllocator::new(stack, 24).unwrap();
         let s = alloc.alloc(8).unwrap();
         s.write(b"abcdefgh").unwrap();
         let s2 = alloc.realloc(s, 16).unwrap();
@@ -924,10 +910,10 @@ mod tests {
     fn realloc_grow_preserves_data_across_blocks() {
         let (stack, path) = empty_stack();
         let _g = Guard(path);
-        let alloc = CheckedSlabBStackAllocator::new(stack, 16).unwrap();
+        let alloc = CheckedSlabBStackAllocator::new(stack, 8).unwrap();
         let s = alloc.alloc(8).unwrap();
         s.write(b"abcdefgh").unwrap();
-        // Grow to 40 bytes -> 3 blocks.
+        // Grow to 40 bytes -> ceil((40+8)/16) = 3 blocks.
         let s2 = alloc.realloc(s, 40).unwrap();
         assert_eq!(s2.len(), 40);
         let data = s2.read().unwrap();
@@ -939,7 +925,7 @@ mod tests {
     fn realloc_shrink_non_tail_recycles_excess() {
         let (stack, path) = empty_stack();
         let _g = Guard(path);
-        let alloc = CheckedSlabBStackAllocator::new(stack, 16).unwrap();
+        let alloc = CheckedSlabBStackAllocator::new(stack, 8).unwrap();
 
         // Allocate a 3-block region, then a guard block so the first is non-tail.
         let s = alloc.alloc(40).unwrap(); // 3 blocks
@@ -961,7 +947,7 @@ mod tests {
     fn realloc_to_zero_deallocs() {
         let (stack, path) = empty_stack();
         let _g = Guard(path);
-        let alloc = CheckedSlabBStackAllocator::new(stack, 16).unwrap();
+        let alloc = CheckedSlabBStackAllocator::new(stack, 8).unwrap();
         let s = alloc.alloc(8).unwrap();
         let start = s.start();
         let s2 = alloc.realloc(s, 0).unwrap();
@@ -975,7 +961,7 @@ mod tests {
     fn realloc_from_empty_allocates() {
         let (stack, path) = empty_stack();
         let _g = Guard(path);
-        let alloc = CheckedSlabBStackAllocator::new(stack, 16).unwrap();
+        let alloc = CheckedSlabBStackAllocator::new(stack, 8).unwrap();
         let empty = alloc.alloc(0).unwrap();
         let s = alloc.realloc(empty, 8).unwrap();
         assert_eq!(s.len(), 8);

@@ -1,11 +1,11 @@
 #![cfg(all(test, feature = "alloc", feature = "set"))]
 
 mod alloc_fuzz_tests {
-    use crate::{BStack, CheckedSlabBStackAllocator};
     use crate::alloc::{
         BStackSlice, BStackSliceAllocator, FirstFitBStackAllocator, GhostTreeBstackAllocator,
         SlabBStackAllocator,
     };
+    use crate::{BStack, CheckedSlabBStackAllocator};
     use rand::RngExt;
     use std::sync::atomic::{AtomicU64, Ordering};
 
