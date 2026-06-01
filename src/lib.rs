@@ -2665,9 +2665,9 @@ impl BStack {
     ///
     /// Like [`eq_crds`](Self::eq_crds) but the comparison applies a bitwise
     /// AND mask before comparing: for each byte `i`, the condition is
-    /// `(A[i] & mask[i]) == a_expected[i]`.  `mask` and `a_expected` must
-    /// have the same length, which determines how many bytes are read from
-    /// region A.
+    /// `(A[i] & mask[i]) == (a_expected[i] & mask[i])`.  `mask` and
+    /// `a_expected` must have the same length, which determines how many
+    /// bytes are read from region A.
     ///
     /// # Feature flags
     ///
@@ -2749,7 +2749,7 @@ impl BStack {
             .iter()
             .zip(mask.iter())
             .zip(a_expected.iter())
-            .all(|((&a, &m), &e)| (a & m) == e);
+            .all(|((&a, &m), &e)| (a & m) == (e & m));
         if !masked_match {
             return Ok(None);
         }
@@ -2769,7 +2769,7 @@ impl BStack {
     ///
     /// Like [`masked_eq_crds`](Self::masked_eq_crds) but performs the
     /// region-B swap only when **any** masked byte differs:
-    /// `(A[i] & mask[i]) != a_expected[i]` for at least one `i`.
+    /// `(A[i] & mask[i]) != (a_expected[i] & mask[i])` for at least one `i`.
     /// Returns `Ok(None)` if all masked bytes compare equal (swap suppressed).
     ///
     /// # Feature flags
@@ -2852,7 +2852,7 @@ impl BStack {
             .iter()
             .zip(mask.iter())
             .zip(a_expected.iter())
-            .all(|((&a, &m), &e)| (a & m) == e);
+            .all(|((&a, &m), &e)| (a & m) == (e & m));
         if masked_match {
             return Ok(None);
         }
