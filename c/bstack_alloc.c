@@ -3325,6 +3325,896 @@ uint64_t slab_bstack_allocator_block_size(const slab_bstack_allocator_t *alloc)
     return alloc->block_size;
 }
 
+/* =========================================================================
+ * checked_slab_bstack_allocator_t — crash-recoverable fixed-block slab allocator
+ * Requires -DBSTACK_FEATURE_SET (depends on bstack_set and bstack_zero).
+ * ====================================================================== */
+
+/* ---- constants --------------------------------------------------------- */
+
+#define ALCK_OFFSET_SIZE      UINT64_C(24)
+#define ALCK_HEADER_SIZE      UINT64_C(24) /* magic[8] + block_size[8] + free_head[8] */
+#define ALCK_ARENA_START      (ALCK_OFFSET_SIZE + ALCK_HEADER_SIZE)
+#define ALCK_FREE_HEAD_OFFSET (ALCK_OFFSET_SIZE + UINT64_C(16))
+#define ALCK_OVERHEAD         UINT64_C(8)
+#define ALCK_MIN_BLOCK_SIZE   UINT64_C(16)
+#define ALCK_MIN_DATA_SIZE    (ALCK_MIN_BLOCK_SIZE - ALCK_OVERHEAD)
+#define ALCK_SENTINEL         UINT64_C(0)
+#define ALCK_IN_USE_BIT       UINT64_C(0x8000000000000000)
+#define ALCK_BLOCKS_MASK      (~ALCK_IN_USE_BIT)
+/* Maximum number of suspect blocks analysed in resync_tail before giving up. */
+#define ALCK_MAX_RECOVER_REGION ((size_t)(1u << 26))
+
+static const uint8_t alck_magic[8]        = {'A','L','C','K',0,1,0,0};
+static const uint8_t alck_magic_prefix[6] = {'A','L','C','K',0,1};
+
+/* ---- LE helpers (reuse read_le64 / write_le64 already defined above) --- */
+
+/* ---- overhead I/O ------------------------------------------------------ */
+
+static int alck_read_overhead(bstack_t *bs, uint64_t block_start, uint64_t *out)
+{
+    uint8_t buf[8];
+    if (bstack_get(bs, block_start, block_start + 8, buf) != 0) return -1;
+    *out = read_le64(buf);
+    return 0;
+}
+
+static int alck_write_overhead(bstack_t *bs, uint64_t block_start, uint64_t value)
+{
+    uint8_t buf[8];
+    write_le64(buf, value);
+    return bstack_set(bs, block_start, buf, 8);
+}
+
+/* ---- free_head I/O ----------------------------------------------------- */
+
+static int alck_read_free_head(bstack_t *bs, uint64_t *out)
+{
+    uint8_t buf[8];
+    if (bstack_get(bs, ALCK_FREE_HEAD_OFFSET,
+                   ALCK_FREE_HEAD_OFFSET + 8, buf) != 0) return -1;
+    *out = read_le64(buf);
+    return 0;
+}
+
+static int alck_write_free_head(bstack_t *bs, uint64_t val)
+{
+    uint8_t buf[8];
+    write_le64(buf, val);
+    return bstack_set(bs, ALCK_FREE_HEAD_OFFSET, buf, 8);
+}
+
+/* ---- blocks_needed ----------------------------------------------------- */
+
+/*
+ * Number of block_size blocks required to hold len usable bytes plus the
+ * 8-byte overhead prefix.
+ */
+static uint64_t alck_blocks_needed(uint64_t len, uint64_t block_size)
+{
+    uint64_t total;
+    if (len == 0) return 0;
+    /* total = len + OVERHEAD; div_ceil(total, block_size) */
+    if (len > UINT64_MAX - ALCK_OVERHEAD) return UINT64_MAX; /* signal overflow */
+    total = len + ALCK_OVERHEAD;
+    return (total - 1) / block_size + 1;
+}
+
+/* ---- valid_in_use ------------------------------------------------------ */
+
+/*
+ * Check whether overhead at block_start is a valid in-use marker.
+ *
+ * Returns the block count (>= 1) on success, 0 on failure.
+ * Rejects: high bit clear, count == 0, span overflows/exceeds stack_len, or
+ * the span engulfs a known free block (free[] is sorted).
+ */
+static uint64_t alck_valid_in_use(uint64_t overhead, uint64_t p,
+                                   uint64_t stack_len, uint64_t block_size,
+                                   const uint64_t *free_arr, size_t free_cnt)
+{
+    uint64_t n, span, end;
+    size_t   lo, hi, mid, idx;
+
+    if ((overhead & ALCK_IN_USE_BIT) == 0) return 0;
+    n = overhead & ALCK_BLOCKS_MASK;
+    if (n == 0) return 0;
+    if (n > UINT64_MAX / block_size) return 0;
+    span = n * block_size;
+    if (p > UINT64_MAX - span) return 0;
+    end = p + span;
+    if (end > stack_len) return 0;
+
+    /* Binary search: find first free block > p */
+    lo = 0; hi = free_cnt; idx = free_cnt;
+    while (lo < hi) {
+        mid = lo + (hi - lo) / 2;
+        if (free_arr[mid] <= p) lo = mid + 1;
+        else { idx = mid; hi = mid; }
+    }
+    if (idx < free_cnt && free_arr[idx] < end)
+        return 0; /* free block inside span — invalid */
+
+    return n;
+}
+
+/* ---- scan_free_list ---------------------------------------------------- */
+
+/*
+ * Walk the free list into a malloc'd sorted array of block offsets.
+ * *out_free and *out_cnt are set on success; caller must free *out_free.
+ * *out_corrupt is set to 1 if the walk was cut short by structural corruption.
+ * Returns 0 on success, -1 on I/O failure.
+ */
+static int alck_scan_free_list(bstack_t *bs, uint64_t stack_len,
+                                uint64_t block_size,
+                                uint64_t **out_free, size_t *out_cnt,
+                                int *out_corrupt)
+{
+    uint64_t  head, max_blocks;
+    uint64_t *arr      = NULL;
+    size_t    cnt      = 0, cap = 0;
+    int       corrupt  = 0;
+
+    *out_free    = NULL;
+    *out_cnt     = 0;
+    *out_corrupt = 0;
+
+    if (alck_read_free_head(bs, &head) != 0) return -1;
+
+    max_blocks = (stack_len > ALCK_ARENA_START)
+                 ? (stack_len - ALCK_ARENA_START) / block_size
+                 : 0;
+
+    while (head != ALCK_SENTINEL) {
+        uint8_t  prefix[16];
+        uint64_t overhead;
+        size_t   i;
+
+        /* Structural checks */
+        if (head < ALCK_ARENA_START
+            || (head - ALCK_ARENA_START) % block_size != 0
+            || head >= stack_len
+            || cnt >= (size_t)max_blocks + 1) { /* cycle guard */
+            corrupt = 1; break;
+        }
+
+        /* Cycle detection: already seen? */
+        for (i = 0; i < cnt; i++) {
+            if (arr[i] == head) { corrupt = 1; break; }
+        }
+        if (corrupt) break;
+
+        if (bstack_get(bs, head, head + 16, prefix) != 0) {
+            free(arr); return -1;
+        }
+        overhead = read_le64(prefix);
+        if (overhead != 0) { corrupt = 1; break; }
+
+        /* Grow array if needed */
+        if (cnt == cap) {
+            size_t    nc  = cap ? cap * 2 : 16;
+            uint64_t *tmp = realloc(arr, nc * sizeof *tmp);
+            if (!tmp) { free(arr); return -1; }
+            arr = tmp; cap = nc;
+        }
+        arr[cnt++] = head;
+        head = read_le64(prefix + 8);
+    }
+
+    /* Sort the array for binary-search use in the caller */
+    if (cnt > 1) {
+        size_t i, j;
+        /* Insertion sort — list is typically short */
+        for (i = 1; i < cnt; i++) {
+            uint64_t key = arr[i];
+            j = i;
+            while (j > 0 && arr[j - 1] > key) { arr[j] = arr[j - 1]; j--; }
+            arr[j] = key;
+        }
+    }
+
+    *out_free    = arr;
+    *out_cnt     = cnt;
+    *out_corrupt = corrupt;
+    return 0;
+}
+
+/* ---- write_free_run ---------------------------------------------------- */
+
+/*
+ * Write the block prefixes for a run of `count` contiguous free blocks
+ * starting at `first_block`, linking them into a chain whose tail points at
+ * the current free_head.  Does NOT update free_head.
+ *
+ * Each block's overhead is zeroed and data[0..8] holds the next block's
+ * offset (or the old free_head for the last block).  All other data bytes in
+ * the run are zeroed.  The single bulk bstack_set is crash-safe: until
+ * free_head is repointed the whole run is simply unreachable.
+ */
+static int alck_write_free_run(bstack_t *bs, uint64_t first_block,
+                                uint64_t count, uint64_t block_size)
+{
+    uint64_t old_head, total, i;
+    uint8_t *buf;
+
+    if (alck_read_free_head(bs, &old_head) != 0) return -1;
+
+    if (count > UINT64_MAX / block_size) { errno = EINVAL; return -1; }
+    total = count * block_size;
+#if UINT64_MAX > SIZE_MAX
+    if (total > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
+#endif
+    buf = calloc(1, (size_t)total);
+    if (!buf) return -1;
+
+    for (i = 0; i < count; i++) {
+        uint64_t next;
+        /* overhead at buf[i*block_size..+8] stays zero */
+        if (i + 1 < count)
+            next = first_block + (i + 1) * block_size;
+        else
+            next = old_head;
+        write_le64(buf + (size_t)(i * block_size) + 8, next);
+    }
+
+    if (bstack_set(bs, first_block, buf, (size_t)total) != 0) {
+        free(buf); return -1;
+    }
+    free(buf);
+    return 0;
+}
+
+/* ---- push_free_blocks -------------------------------------------------- */
+
+/*
+ * Prepend `count` contiguous blocks at `first_block` to the free list.
+ * Clears their overhead bytes as part of the operation (transitions live →
+ * free).  Does nothing if count == 0.
+ */
+static int alck_push_free_blocks(bstack_t *bs, uint64_t first_block,
+                                  uint64_t count, uint64_t block_size)
+{
+    if (count == 0) return 0;
+    if (alck_write_free_run(bs, first_block, count, block_size) != 0) return -1;
+    return alck_write_free_head(bs, first_block);
+}
+
+/* ---- pop_and_claim_block ----------------------------------------------- */
+
+/*
+ * Pop the head block from the free list, mark it in use with `num_blocks`,
+ * zero the data region, and set *out_block_start to its payload offset.
+ * Sets *out_block_start to ALCK_SENTINEL (0) if the list is empty.
+ * Returns 0 on success, -1 on error.
+ */
+static int alck_pop_and_claim_block(bstack_t *bs, uint64_t num_blocks,
+                                     uint64_t block_size,
+                                     uint64_t *out_block_start)
+{
+    uint8_t  prefix[16], *block_buf;
+    uint64_t head, overhead, next;
+
+    if (alck_read_free_head(bs, &head) != 0) return -1;
+    if (head == ALCK_SENTINEL) { *out_block_start = ALCK_SENTINEL; return 0; }
+
+    if (bstack_get(bs, head, head + 16, prefix) != 0) return -1;
+    overhead = read_le64(prefix);
+    if (overhead != 0) { errno = EINVAL; return -1; }
+    next = read_le64(prefix + 8);
+
+    /* Advance free_head to the next block */
+    if (alck_write_free_head(bs, next) != 0) return -1;
+
+    /* Mark in-use and zero data in one bulk write */
+#if UINT64_MAX > SIZE_MAX
+    if (block_size > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
+#endif
+    block_buf = calloc(1, (size_t)block_size);
+    if (!block_buf) return -1;
+    write_le64(block_buf, ALCK_IN_USE_BIT | num_blocks);
+    if (bstack_set(bs, head, block_buf, (size_t)block_size) != 0) {
+        free(block_buf); return -1;
+    }
+    free(block_buf);
+    *out_block_start = head;
+    return 0;
+}
+
+/* ---- recovery helpers -------------------------------------------------- */
+
+typedef enum {
+    ALCK_CLASS_FREE,
+    ALCK_CLASS_LEAKED,
+    ALCK_CLASS_IN_USE,
+    ALCK_CLASS_SUSPICIOUS
+} alck_block_class_t;
+
+/*
+ * Classify the block at `p` for the recovery scan.
+ * `in_use_count` receives the block-span if the class is ALCK_CLASS_IN_USE.
+ */
+static int alck_classify(bstack_t *bs, uint64_t p, uint64_t stack_len,
+                          uint64_t block_size,
+                          const uint64_t *free_arr, size_t free_cnt,
+                          alck_block_class_t *out_class,
+                          uint64_t *out_in_use_count)
+{
+    uint64_t overhead, n;
+    size_t   lo, hi, mid;
+
+    if (alck_read_overhead(bs, p, &overhead) != 0) return -1;
+
+    *out_in_use_count = 0;
+
+    if (overhead == 0) {
+        /* Binary search in free_arr */
+        int found = 0;
+        lo = 0; hi = free_cnt;
+        while (lo < hi) {
+            mid = lo + (hi - lo) / 2;
+            if      (free_arr[mid] < p) lo = mid + 1;
+            else if (free_arr[mid] > p) hi = mid;
+            else    { found = 1; break; }
+        }
+        *out_class = found ? ALCK_CLASS_FREE : ALCK_CLASS_LEAKED;
+        return 0;
+    }
+
+    n = alck_valid_in_use(overhead, p, stack_len, block_size, free_arr, free_cnt);
+    if (n > 0) {
+        *out_class         = ALCK_CLASS_IN_USE;
+        *out_in_use_count  = n;
+    } else {
+        *out_class = ALCK_CLASS_SUSPICIOUS;
+    }
+    return 0;
+}
+
+typedef enum {
+    ALCK_RESYNC_RESYNC,
+    ALCK_RESYNC_DISCARD_TAIL,
+    ALCK_RESYNC_LEAVE_LEAKED
+} alck_resync_outcome_t;
+
+/*
+ * Backward reachability pass over the region [p, stack_len).
+ * Decides whether to resync at a later valid boundary (ALCK_RESYNC_RESYNC,
+ * sets *out_resync_at), discard the orphaned tail (ALCK_RESYNC_DISCARD_TAIL),
+ * or leave the region leaked (ALCK_RESYNC_LEAVE_LEAKED).
+ */
+static int alck_resync_tail(bstack_t *bs, uint64_t p, uint64_t stack_len,
+                             uint64_t block_size,
+                             const uint64_t *free_arr, size_t free_cnt,
+                             alck_resync_outcome_t *out_outcome,
+                             uint64_t *out_resync_at)
+{
+    uint64_t region_blocks;
+    size_t   m, j;
+    uint8_t *reach;
+
+    *out_outcome   = ALCK_RESYNC_LEAVE_LEAKED;
+    *out_resync_at = 0;
+
+    region_blocks = (stack_len - p) / block_size;
+    if (region_blocks > (uint64_t)ALCK_MAX_RECOVER_REGION
+        || region_blocks > (uint64_t)SIZE_MAX) {
+        return 0; /* LeaveLeaked */
+    }
+    m = (size_t)region_blocks;
+
+    reach = calloc(m + 1, 1);
+    if (!reach) return -1;
+    reach[m] = 1;
+
+    for (j = m; j > 0; j--) {
+        uint64_t off = p + (uint64_t)(j - 1) * block_size;
+        uint64_t overhead, n;
+        if (alck_read_overhead(bs, off, &overhead) != 0) { free(reach); return -1; }
+        if (overhead == 0) {
+            reach[j - 1] = reach[j];
+        } else {
+            n = alck_valid_in_use(overhead, off, stack_len, block_size,
+                                   free_arr, free_cnt);
+            if (n > 0 && (j - 1) + (size_t)n <= m) {
+                reach[j - 1] = reach[(j - 1) + (size_t)n];
+            } else {
+                reach[j - 1] = 0;
+            }
+        }
+    }
+
+    /* j=0 excluded (that's p itself, which is Suspicious) */
+    for (j = 1; j < m; j++) {
+        if (reach[j]) {
+            *out_outcome   = ALCK_RESYNC_RESYNC;
+            *out_resync_at = p + (uint64_t)j * block_size;
+            free(reach);
+            return 0;
+        }
+    }
+
+    free(reach);
+    *out_outcome = ALCK_RESYNC_DISCARD_TAIL;
+    return 0;
+}
+
+/* ---- checked_slab_bstack_allocator_recover ----------------------------- */
+
+int checked_slab_bstack_allocator_recover(checked_slab_bstack_allocator_t *alloc,
+                                           uint64_t *out_unsure)
+{
+    bstack_t  *bs         = alloc->bs;
+    uint64_t   block_size = alloc->block_size;
+    uint64_t   stack_len;
+    uint64_t  *free_arr   = NULL;
+    size_t     free_cnt   = 0;
+    int        free_corrupt;
+    uint64_t  *reclaim    = NULL;
+    size_t     reclaim_cnt = 0, reclaim_cap = 0;
+    uint64_t   unsure     = 0;
+    uint64_t   tailcut    = ALCK_SENTINEL;
+    uint64_t   p;
+    size_t     i;
+    int        ret        = 0;
+
+    if (bstack_len(bs, &stack_len) != 0) return -1;
+    if (stack_len <= ALCK_ARENA_START) {
+        if (out_unsure) *out_unsure = 0;
+        return 0;
+    }
+
+    if (alck_scan_free_list(bs, stack_len, block_size,
+                             &free_arr, &free_cnt, &free_corrupt) != 0) return -1;
+
+    p = ALCK_ARENA_START;
+    while (p < stack_len) {
+        alck_block_class_t cls;
+        uint64_t           in_use_n = 0;
+
+        if (alck_classify(bs, p, stack_len, block_size,
+                           free_arr, free_cnt, &cls, &in_use_n) != 0) {
+            ret = -1; goto done;
+        }
+
+        switch (cls) {
+        case ALCK_CLASS_FREE:
+            p += block_size;
+            break;
+
+        case ALCK_CLASS_LEAKED:
+            if (free_corrupt) {
+                unsure++;
+            } else {
+                if (reclaim_cnt == reclaim_cap) {
+                    size_t    nc  = reclaim_cap ? reclaim_cap * 2 : 16;
+                    uint64_t *tmp = realloc(reclaim, nc * sizeof *tmp);
+                    if (!tmp) { ret = -1; goto done; }
+                    reclaim = tmp; reclaim_cap = nc;
+                }
+                reclaim[reclaim_cnt++] = p;
+            }
+            p += block_size;
+            break;
+
+        case ALCK_CLASS_IN_USE:
+            p += in_use_n * block_size;
+            break;
+
+        case ALCK_CLASS_SUSPICIOUS: {
+            /* Prefer a known-free block as a reliable resync anchor */
+            size_t   lo = 0, hi = free_cnt, idx = free_cnt;
+            uint64_t anchor;
+            while (lo < hi) {
+                size_t mid = lo + (hi - lo) / 2;
+                if (free_arr[mid] <= p) lo = mid + 1;
+                else { idx = mid; hi = mid; }
+            }
+            if (idx < free_cnt) {
+                anchor = free_arr[idx];
+                unsure += (anchor - p) / block_size;
+                p = anchor;
+            } else {
+                alck_resync_outcome_t outcome;
+                uint64_t resync_at = 0;
+                if (alck_resync_tail(bs, p, stack_len, block_size,
+                                      free_arr, free_cnt,
+                                      &outcome, &resync_at) != 0) {
+                    ret = -1; goto done;
+                }
+                switch (outcome) {
+                case ALCK_RESYNC_RESYNC:
+                    unsure += (resync_at - p) / block_size;
+                    p = resync_at;
+                    break;
+                case ALCK_RESYNC_DISCARD_TAIL:
+                    if (free_corrupt) {
+                        unsure += (stack_len - p) / block_size;
+                    } else {
+                        tailcut = p;
+                    }
+                    goto end_scan;
+                case ALCK_RESYNC_LEAVE_LEAKED:
+                    unsure += (stack_len - p) / block_size;
+                    goto end_scan;
+                }
+            }
+            break;
+        }
+        }
+    }
+end_scan:
+
+    if (tailcut != ALCK_SENTINEL) {
+        uint64_t discard_n = stack_len - tailcut;
+#if UINT64_MAX > SIZE_MAX
+        if (discard_n > (uint64_t)SIZE_MAX) { ret = -1; goto done; }
+#endif
+        if (bstack_discard(bs, (size_t)discard_n) != 0) { ret = -1; goto done; }
+    }
+    for (i = 0; i < reclaim_cnt; i++) {
+        if (alck_push_free_blocks(bs, reclaim[i], 1, block_size) != 0) {
+            ret = -1; goto done;
+        }
+    }
+    if (out_unsure) *out_unsure = unsure;
+
+done:
+    free(free_arr);
+    free(reclaim);
+    return ret;
+}
+
+/* ---- vtable implementations -------------------------------------------- */
+
+static bstack_t *alck_vt_stack(bstack_allocator_t *base)
+{
+    return ((checked_slab_bstack_allocator_t *)base)->bs;
+}
+
+static int alck_vt_alloc(bstack_allocator_t *base, uint64_t len,
+                          bstack_slice_t *out)
+{
+    checked_slab_bstack_allocator_t *a = (checked_slab_bstack_allocator_t *)base;
+    uint64_t num_blocks;
+
+    if (len == 0) {
+        out->allocator = base; out->offset = 0; out->len = 0;
+        return 0;
+    }
+
+    num_blocks = alck_blocks_needed(len, a->block_size);
+    if (num_blocks == UINT64_MAX) { errno = EINVAL; return -1; } /* overflow */
+
+    if (num_blocks == 1) {
+        uint64_t block_start;
+        if (alck_pop_and_claim_block(a->bs, 1, a->block_size, &block_start) != 0)
+            return -1;
+        if (block_start != ALCK_SENTINEL) {
+            out->allocator = base;
+            out->offset    = block_start + ALCK_OVERHEAD;
+            out->len       = len;
+            return 0;
+        }
+        /* Free list empty: extend tail */
+        if (bstack_extend(a->bs, (size_t)a->block_size, &block_start) != 0)
+            return -1;
+        if (alck_write_overhead(a->bs, block_start, ALCK_IN_USE_BIT | 1) != 0)
+            return -1;
+        out->allocator = base;
+        out->offset    = block_start + ALCK_OVERHEAD;
+        out->len       = len;
+        return 0;
+    }
+
+    /* Multi-block: always extend tail */
+    {
+        uint64_t total, block_start;
+        if (num_blocks > UINT64_MAX / a->block_size) { errno = EINVAL; return -1; }
+        total = num_blocks * a->block_size;
+#if UINT64_MAX > SIZE_MAX
+        if (total > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
+#endif
+        if (bstack_extend(a->bs, (size_t)total, &block_start) != 0) return -1;
+        if (alck_write_overhead(a->bs, block_start,
+                                ALCK_IN_USE_BIT | num_blocks) != 0) return -1;
+        out->allocator = base;
+        out->offset    = block_start + ALCK_OVERHEAD;
+        out->len       = len;
+        return 0;
+    }
+}
+
+static int alck_vt_dealloc(bstack_allocator_t *base, bstack_slice_t s)
+{
+    checked_slab_bstack_allocator_t *a = (checked_slab_bstack_allocator_t *)base;
+    uint64_t block_start, overhead, num_blocks, backing, tail, slice_end;
+
+    if (s.len == 0 && s.offset == 0) return 0;
+
+    if (s.offset < ALCK_OVERHEAD) { errno = EINVAL; return -1; }
+    block_start = s.offset - ALCK_OVERHEAD;
+
+    if (alck_read_overhead(a->bs, block_start, &overhead) != 0) return -1;
+    if ((overhead & ALCK_IN_USE_BIT) == 0) { errno = EINVAL; return -1; }
+
+    num_blocks = overhead & ALCK_BLOCKS_MASK;
+    if (num_blocks == 0) { errno = EINVAL; return -1; }
+
+    if (num_blocks > UINT64_MAX / a->block_size) { errno = EINVAL; return -1; }
+    backing = num_blocks * a->block_size;
+
+    if (bstack_len(a->bs, &tail) != 0) return -1;
+    if (block_start > UINT64_MAX - backing) { errno = EINVAL; return -1; }
+    slice_end = block_start + backing;
+
+    if (slice_end == tail) {
+#if UINT64_MAX > SIZE_MAX
+        if (backing > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
+#endif
+        return bstack_discard(a->bs, (size_t)backing);
+    }
+
+    return alck_push_free_blocks(a->bs, block_start, num_blocks, a->block_size);
+}
+
+static int alck_vt_realloc(bstack_allocator_t *base, bstack_slice_t s,
+                             uint64_t new_len, bstack_slice_t *out)
+{
+    checked_slab_bstack_allocator_t *a = (checked_slab_bstack_allocator_t *)base;
+    uint64_t block_start, overhead, old_n, new_n, old_backing, new_backing;
+    uint64_t tail;
+    int is_tail;
+
+    if (s.len == 0 && s.offset == 0)
+        return alck_vt_alloc(base, new_len, out);
+
+    if (new_len == 0) {
+        if (alck_vt_dealloc(base, s) != 0) return -1;
+        out->allocator = base; out->offset = 0; out->len = 0;
+        return 0;
+    }
+
+    if (new_len == s.len) { *out = s; return 0; }
+
+    if (s.offset < ALCK_OVERHEAD) { errno = EINVAL; return -1; }
+    block_start = s.offset - ALCK_OVERHEAD;
+
+    if (alck_read_overhead(a->bs, block_start, &overhead) != 0) return -1;
+    if ((overhead & ALCK_IN_USE_BIT) == 0) { errno = EINVAL; return -1; }
+
+    old_n = overhead & ALCK_BLOCKS_MASK;
+    if (old_n == 0) { errno = EINVAL; return -1; }
+
+    new_n = alck_blocks_needed(new_len, a->block_size);
+    if (new_n == UINT64_MAX) { errno = EINVAL; return -1; }
+
+    if (old_n == new_n) {
+        /* Same backing blocks: zero newly-exposed bytes on grow */
+        if (new_len > s.len) {
+            uint64_t to_zero = new_len - s.len;
+#if UINT64_MAX > SIZE_MAX
+            if (to_zero > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
+#endif
+            if (bstack_zero(a->bs, s.offset + s.len, (size_t)to_zero) != 0)
+                return -1;
+        }
+        out->allocator = base; out->offset = s.offset; out->len = new_len;
+        return 0;
+    }
+
+    if (old_n > UINT64_MAX / a->block_size) { errno = EINVAL; return -1; }
+    old_backing = old_n * a->block_size;
+    if (new_n > UINT64_MAX / a->block_size) { errno = EINVAL; return -1; }
+    new_backing = new_n * a->block_size;
+
+    if (bstack_len(a->bs, &tail) != 0) return -1;
+    if (block_start > UINT64_MAX - old_backing) { errno = EINVAL; return -1; }
+    is_tail = (block_start + old_backing == tail);
+
+    if (is_tail) {
+        if (new_n > old_n) {
+            uint64_t delta  = new_backing - old_backing;
+            uint64_t to_zero;
+#if UINT64_MAX > SIZE_MAX
+            if (delta > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
+#endif
+            if (bstack_extend(a->bs, (size_t)delta, NULL) != 0) return -1;
+            if (new_len > s.len) {
+                to_zero = new_len - s.len;
+#if UINT64_MAX > SIZE_MAX
+                if (to_zero > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
+#endif
+                if (bstack_zero(a->bs, s.offset + s.len, (size_t)to_zero) != 0)
+                    return -1;
+            }
+            if (alck_write_overhead(a->bs, block_start,
+                                    ALCK_IN_USE_BIT | new_n) != 0) return -1;
+        } else {
+            /* Shrink: update overhead first, then discard (crash-safer) */
+            uint64_t delta = old_backing - new_backing;
+            if (alck_write_overhead(a->bs, block_start,
+                                    ALCK_IN_USE_BIT | new_n) != 0) return -1;
+#if UINT64_MAX > SIZE_MAX
+            if (delta > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
+#endif
+            if (bstack_discard(a->bs, (size_t)delta) != 0) return -1;
+        }
+        out->allocator = base; out->offset = s.offset; out->len = new_len;
+        return 0;
+    }
+
+    if (new_n < old_n) {
+        /* Shrink non-tail: commit the new overhead first, then build free run.
+         * This is the commit point — before it the old view is fully intact. */
+        uint64_t excess_start;
+        if (new_n > UINT64_MAX / a->block_size) { errno = EINVAL; return -1; }
+        excess_start = block_start + new_n * a->block_size;
+
+        if (alck_write_overhead(a->bs, block_start,
+                                ALCK_IN_USE_BIT | new_n) != 0) return -1;
+        if (alck_write_free_run(a->bs, excess_start, old_n - new_n,
+                                a->block_size) != 0) return -1;
+        if (alck_write_free_head(a->bs, excess_start) != 0) return -1;
+
+        out->allocator = base; out->offset = s.offset; out->len = new_len;
+        return 0;
+    }
+
+    /* Grow non-tail: alloc a fresh region, copy data, release the old */
+    {
+        bstack_slice_t new_s;
+        uint8_t       *tmp;
+        uint64_t       copy_len;
+
+        if (alck_vt_alloc(base, new_len, &new_s) != 0) return -1;
+
+        copy_len = s.len < new_len ? s.len : new_len;
+        if (copy_len > 0) {
+#if UINT64_MAX > SIZE_MAX
+            if (copy_len > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
+#endif
+            tmp = malloc((size_t)copy_len);
+            if (!tmp) return -1;
+            if (bstack_get(a->bs, s.offset, s.offset + copy_len, tmp) != 0
+                || bstack_set(a->bs, new_s.offset, tmp, (size_t)copy_len) != 0) {
+                free(tmp); return -1;
+            }
+            free(tmp);
+        }
+
+        if (alck_vt_dealloc(base, s) != 0) return -1;
+        *out = new_s;
+        return 0;
+    }
+}
+
+static const bstack_allocator_vtbl_t alck_allocator_vtbl = {
+    alck_vt_stack,
+    alck_vt_alloc,
+    alck_vt_realloc,
+    alck_vt_dealloc,
+};
+
+/* ---- public API -------------------------------------------------------- */
+
+checked_slab_bstack_allocator_t *checked_slab_bstack_allocator_new(
+    bstack_t *bs, uint64_t data_size)
+{
+    checked_slab_bstack_allocator_t *a;
+    uint64_t block_size;
+    int      is_empty;
+    uint8_t  hdr[ALCK_ARENA_START];
+
+    if (bstack_is_empty(bs, &is_empty) != 0) return NULL;
+    if (!is_empty) { errno = EINVAL; return NULL; }
+
+    if (data_size < ALCK_MIN_DATA_SIZE) { errno = EINVAL; return NULL; }
+    if (data_size > UINT64_MAX - ALCK_OVERHEAD) { errno = EINVAL; return NULL; }
+    block_size = data_size + ALCK_OVERHEAD;
+
+#if UINT64_MAX > SIZE_MAX
+    if (block_size > (uint64_t)SIZE_MAX) { errno = EINVAL; return NULL; }
+#endif
+
+    a = malloc(sizeof *a);
+    if (!a) { errno = ENOMEM; return NULL; }
+
+    memset(hdr, 0, sizeof hdr);
+    memcpy(hdr + (size_t)ALCK_OFFSET_SIZE, alck_magic, 8);
+    write_le64(hdr + (size_t)ALCK_OFFSET_SIZE + 8, block_size);
+    /* free_head at ALCK_FREE_HEAD_OFFSET stays 0 (ALCK_SENTINEL) */
+
+    if (bstack_push(bs, hdr, sizeof hdr, NULL) != 0) { free(a); return NULL; }
+
+    a->base.vtbl      = &alck_allocator_vtbl;
+    a->base.bulk_vtbl = NULL;
+    a->bs             = bs;
+    a->block_size     = block_size;
+    return a;
+}
+
+checked_slab_bstack_allocator_t *checked_slab_bstack_allocator_open(bstack_t *bs)
+{
+    checked_slab_bstack_allocator_t *a;
+    int      is_empty;
+    uint64_t stack_len, stored_block_size, stored_free_head, arena_bytes;
+    uint8_t  header[ALCK_HEADER_SIZE];
+
+    if (bstack_is_empty(bs, &is_empty) != 0) return NULL;
+    if (is_empty) { errno = EINVAL; return NULL; }
+
+    if (bstack_len(bs, &stack_len) != 0) return NULL;
+    if (stack_len < ALCK_ARENA_START) { errno = EINVAL; return NULL; }
+
+    if (bstack_get(bs, ALCK_OFFSET_SIZE,
+                   ALCK_OFFSET_SIZE + ALCK_HEADER_SIZE, header) != 0)
+        return NULL;
+
+    if (memcmp(header, alck_magic_prefix, sizeof alck_magic_prefix) != 0) {
+        errno = EINVAL; return NULL;
+    }
+
+    stored_block_size = read_le64(header + 8);
+    if (stored_block_size < ALCK_MIN_BLOCK_SIZE) { errno = EINVAL; return NULL; }
+#if UINT64_MAX > SIZE_MAX
+    if (stored_block_size > (uint64_t)SIZE_MAX) { errno = EINVAL; return NULL; }
+#endif
+
+    stored_free_head = read_le64(header + 16);
+    if (stored_free_head != ALCK_SENTINEL) {
+        if (stored_free_head < ALCK_ARENA_START
+            || (stored_free_head - ALCK_ARENA_START) % stored_block_size != 0
+            || stored_free_head >= stack_len) {
+            errno = EINVAL; return NULL;
+        }
+    }
+
+    arena_bytes = stack_len - ALCK_ARENA_START;
+    if (arena_bytes % stored_block_size != 0) { errno = EINVAL; return NULL; }
+
+    /* Verify free-list head is itself a free block */
+    if (stored_free_head != ALCK_SENTINEL) {
+        uint8_t prefix[8];
+        if (bstack_get(bs, stored_free_head,
+                       stored_free_head + 8, prefix) != 0) return NULL;
+        if (read_le64(prefix) != 0) { errno = EINVAL; return NULL; }
+    }
+
+    a = malloc(sizeof *a);
+    if (!a) { errno = ENOMEM; return NULL; }
+    a->base.vtbl      = &alck_allocator_vtbl;
+    a->base.bulk_vtbl = NULL;
+    a->bs             = bs;
+    a->block_size     = stored_block_size;
+
+    /* Auto-recover: reclaim leaked blocks and repair orphaned tails */
+    if (checked_slab_bstack_allocator_recover(a, NULL) != 0) {
+        free(a); return NULL;
+    }
+    return a;
+}
+
+void checked_slab_bstack_allocator_free(checked_slab_bstack_allocator_t *alloc)
+{
+    free(alloc);
+}
+
+bstack_t *checked_slab_bstack_allocator_into_stack(
+    checked_slab_bstack_allocator_t *alloc)
+{
+    bstack_t *bs = alloc->bs;
+    free(alloc);
+    return bs;
+}
+
+uint64_t checked_slab_bstack_allocator_data_size(
+    const checked_slab_bstack_allocator_t *alloc)
+{
+    return alloc->block_size - ALCK_OVERHEAD;
+}
+
 #endif /* BSTACK_FEATURE_SET */
 
 #ifdef __cplusplus
