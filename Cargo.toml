@@ -61,6 +61,10 @@ required-features = ["atomic"]
 name = "atomic_race"
 required-features = ["atomic"]
 
+[[example]]
+name = "move_and_cow"
+required-features = ["set", "atomic"]
+
 [dev-dependencies]
 rand = "0.10.1"
 criterion = { version = "0.5", features = ["html_reports"] }

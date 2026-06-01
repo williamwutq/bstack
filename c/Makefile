@@ -66,10 +66,11 @@ EXAMPLE_NAMES = basic buffer_reuse journal reading vec_store
 EXAMPLE_BINS  = $(addprefix ../examples/,$(addsuffix $(EXE_EXT),$(EXAMPLE_NAMES)))
 HASHMAP_BIN   = ../examples/hashmap$(EXE_EXT)
 ATOMIC_BIN    = ../examples/atomic_ops$(EXE_EXT)
+MOVE_COW_BIN  = ../examples/move_and_cow$(EXE_EXT)
 
 .PHONY: all test test-set test-atomic test-set-atomic test-first-fit test-first-fit-atomic test-ghost-tree test-slab test-checked-slab test-bytevec leaks clean alloc \
         example example-basic example-buffer_reuse example-journal \
-        example-reading example-vec_store example-hashmap example-atomic_ops
+        example-reading example-vec_store example-hashmap example-atomic_ops example-move_and_cow
 
 all: $(LIB)
 
@@ -241,6 +242,9 @@ endif
 ../examples/atomic_ops$(EXE_EXT): ../examples/atomic_ops.c $(LIB_SET_ATOMIC)
 	$(CC) $(CFLAGS) -DBSTACK_FEATURE_SET -DBSTACK_FEATURE_ATOMIC -I. -o $@ $< -L. -lbstack-set-atomic -lpthread
 
+../examples/move_and_cow$(EXE_EXT): ../examples/move_and_cow.c $(LIB_SET_ATOMIC)
+	$(CC) $(CFLAGS) -DBSTACK_FEATURE_SET -DBSTACK_FEATURE_ATOMIC -I. -o $@ $< -L. -lbstack-set-atomic -lpthread
+
 example-basic: ../examples/basic$(EXE_EXT)
 	(cd ../examples && $(RUN)basic$(EXE_EXT))
 
@@ -262,7 +266,10 @@ example-hashmap: ../examples/hashmap$(EXE_EXT)
 example-atomic_ops: ../examples/atomic_ops$(EXE_EXT)
 	(cd ../examples && $(RUN)atomic_ops$(EXE_EXT))
 
-example: $(EXAMPLE_BINS) $(HASHMAP_BIN) $(ATOMIC_BIN)
+example-move_and_cow: ../examples/move_and_cow$(EXE_EXT)
+	(cd ../examples && $(RUN)move_and_cow$(EXE_EXT))
+
+example: $(EXAMPLE_BINS) $(HASHMAP_BIN) $(ATOMIC_BIN) $(MOVE_COW_BIN)
 	@echo "==> basic"        && (cd ../examples && $(RUN)basic$(EXE_EXT))
 	@echo "==> buffer_reuse" && (cd ../examples && $(RUN)buffer_reuse$(EXE_EXT))
 	@echo "==> journal"      && (cd ../examples && $(RUN)journal$(EXE_EXT))
@@ -270,6 +277,7 @@ example: $(EXAMPLE_BINS) $(HASHMAP_BIN) $(ATOMIC_BIN)
 	@echo "==> vec_store"    && (cd ../examples && $(RUN)vec_store$(EXE_EXT))
 	@echo "==> hashmap"      && (cd ../examples && $(RUN)hashmap$(EXE_EXT))
 	@echo "==> atomic_ops"   && (cd ../examples && $(RUN)atomic_ops$(EXE_EXT))
+	@echo "==> move_and_cow" && (cd ../examples && $(RUN)move_and_cow$(EXE_EXT))
 
 clean:
 	rm -f $(OBJ) $(TEST_OBJ) $(OBJ_SET) $(LIB) $(LIB_SET) $(TEST_BIN) \
@@ -281,4 +289,4 @@ clean:
 	      $(TEST_GT_OBJ) $(TEST_GT_BIN) \
 	      $(TEST_SL_OBJ) $(TEST_SL_BIN) \
 	      $(OBJ_BYTEVEC) $(LIB_BYTEVEC_SET) $(TEST_BV_OBJ) $(TEST_BV_BIN) \
-	      $(EXAMPLE_BINS) $(HASHMAP_BIN) $(ATOMIC_BIN)
+	      $(EXAMPLE_BINS) $(HASHMAP_BIN) $(ATOMIC_BIN) $(MOVE_COW_BIN)
