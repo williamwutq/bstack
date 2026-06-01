@@ -161,7 +161,12 @@ impl CheckedSlabBStackAllocator {
                 format!("data_size ({data_size}) must be >= {}", Self::MIN_DATA_SIZE),
             ));
         }
-        let block_size = data_size + Self::OVERHEAD;
+        let block_size = data_size.checked_add(Self::OVERHEAD).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "data_size is too large (overflows u64)",
+            )
+        })?;
         if usize::try_from(block_size).is_err() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -518,7 +523,7 @@ impl BStackAllocator for CheckedSlabBStackAllocator {
             )
         })?;
 
-        if num_blocks > 1 && slice_end == current_tail {
+        if slice_end == current_tail {
             return self.stack.discard(backing);
         }
 
