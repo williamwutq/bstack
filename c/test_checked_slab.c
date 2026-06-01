@@ -825,9 +825,20 @@ static int fuzz_with_realloc(uint64_t data_size)
                 }
                 free(rbuf);
             }
+
+            /* Stamp the entire new slice with a fresh id so future
+             * dealloc verification always checks the full length. */
+            uint64_t new_id = next_id++;
+            uint8_t *wbuf = malloc((size_t)new_size);
+            if (!wbuf) { ret = -1; break; }
+            id_fill(wbuf, (size_t)new_size, new_id);
+            if (bstack_slice_write(new_s, wbuf, (size_t)new_size) != 0) {
+                free(wbuf); ret = -1; break;
+            }
+            free(wbuf);
             ep->offset = new_s.offset;
             ep->len    = new_size;
-            /* id is unchanged — existing bytes still carry it */
+            ep->id     = new_id;
         }
     }
 
