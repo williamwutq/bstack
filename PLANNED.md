@@ -22,6 +22,12 @@ For context, accepted optimizations like caching and locked region have demonstr
 
 Reference: https://github.com/williamwutq/bstack/pull/3
 
+### Adding a singly-linked `BStackSList<T>`
+
+Reasons:
+
+A singly-linked variant saves 8 bytes per node by omitting `prev_ptr`, but any workload that reaches for a disk-backed linked list is already paying the cost of allocator round-trips and random-access I/O per element. An 8-byte savings per node is negligible against those overheads, and the restriction to forward-only traversal eliminates `push_front`-with-O(1)-`pop_back`, bidirectional cursors, and `split_off` without a full scan. `BStackList<T>` covers all singly-linked use cases with no meaningful extra cost, so a separate singly-linked type adds complexity without benefit.
+
 ### Making `BStackAllocator::realloc` and `dealloc` `unsafe fn`
 
 Reasons:
@@ -30,9 +36,21 @@ While `realloc` and `dealloc` have a slice-origin requirement, the hazard window
 
 Furthermore, `alloc`, `realloc`, and `dealloc` in the `BStackAllocator` trait do not need to operate on `BStackSlice` directly — they operate on an associated handle type. Custom allocator implementations can define handle types that do not support sub-slicing at all, eliminating the origin problem at the type level for those allocators. The sub-slice concern is therefore a consequence of a specific design choice (using `BStackSlice` itself as the raw handle) rather than an inherent flaw in the trait. The recommended approach is for allocators to use a handle type distinct from `BStackSlice`, where converting from handle to `BStackSlice` is straightforward but the reverse is not possible — making the origin requirement a type-level guarantee. The default allocators in this crate currently do not follow this recommendation, but that is a separate concern addressed in the planned features below.
 
+### Adding `BStackVec<T>` for typed vector storage
+
+Reasons:
+
+A typed vector is a data structure, not an I/O mechanism, and `bstack`'s role is to abstract crash-safe atomic file I/O — the stack, allocators, and slices — not to provide collection types. Such structures compose on top of those mechanisms and belong downstream. `BStackByteVec` already covers the byte-buffer case, and end push/pop is already crash-atomic via a single `clen` write inherited from the stack, so a generic `BStackVec<T>` would mainly add a `bytemuck`/`zerocopy` dependency and POD-soundness surface for a generalization downstream consumers can build themselves. Keeping it out preserves the lean core and avoids freezing API surface ahead of 1.0.
+
+### Adding `BStackList<T>` for typed doubly-linked list storage
+
+Reasons:
+
+As with `BStackVec<T>`, a linked list is a data-structure policy that belongs downstream rather than in the I/O core. The downstream `bllist` crate already provides on-disk doubly-linked lists built on `bstack`, with a no-corruption, recoverable-leak model: every block write is atomic, so a crash degrades to an orphaned node reclaimed on reopen rather than data corruption. The only capability that would justify a first-party type is crash-atomic multi-block structural mutation (`append`, `split_off`), which depends on the write-in-progress journaling primitive planned for 0.5.0 — and once that primitive is public, downstream crates can consume it to achieve the same guarantee. A `bstack`-native list would therefore never hold an exclusive capability. `bstack` should instead ship the mechanisms such structures need (allocators and, later, the public transaction primitive) and leave the structures themselves to downstream.
+
 ---
 
-## Introducing a newtype handle for default allocators
+## Introducing a newtype handle for default allocators (0.4.0)
 
 **Breaking change:** Yes
 
@@ -71,91 +89,6 @@ This is a larger breaking change than the handle type alone, as it touches every
 - **Handle type name.** The name should clearly distinguish the handle from `BStackSlice` and signal that it represents an allocation, not just a region. Candidates include `BStackAlloc`, `BStackBlock`, or `BStackRegion`. The name should not suggest it is a slice (to avoid confusion with subslicing) and should not be so generic that it clashes with custom allocator handle types.
 - **Whether to remove the allocator pointer from `BStackSlice`.** This is the more invasive part of the redesign. It may be worth doing as a separate change or deferring until the allocated handle type is stable. If deferred, `BStackSlice` retains `&'a A` temporarily, with a planned migration.
 - **Unsafe back-conversion.** Should the allocated handle expose an `unsafe` method to recover a `BStackSlice` with no allocator type attached? This would be useful for serialization and low-level introspection, but requires the caller to uphold the origin invariant manually.
-
----
-
-## Optimizing `FirstFitBStackAllocator` with atomic feature
-
-**Feature flag:** `atomic`
-**Breaking change:** No (if added as optional)
-
-### Motivation
-
-The `FirstFitBStackAllocator` could benefit from atomic operations to improve performance and thread-safety in concurrent environments. Atomic operations can reduce contention and allow for lock-free or reduced-lock implementations in certain scenarios. It also allows for better crash resilience by ensuring that metadata updates are atomic, reducing the risk of corruption in the event of a crash.
-
-### Design
-
-[To be determined — implementation details would involve using atomic primitives for metadata updates and allocation tracking.]
-
-### Open questions
-
-- Should this optimization be added as an optional feature flag, or required for all users? If added, we end up maintaining two implementations of `FirstFitBStackAllocator`; if required, all users need the atomic flag.
-
----
-
-## Adding `BStackVec<T>` for typed vector storage
-
-**Feature flag:** `alloc` + `set`
-**Breaking change:** No (additive; new type only)
-
-### Motivation
-
-`BStackByteVec` covers the common byte-buffer use case, but many applications store sequences of fixed-width typed values (e.g. `u32`, `u64`, or a small `repr(C)` struct). A general `BStackVec<T>` would extend the same API to arbitrary element types. The reason this is deferred rather than shipped today is soundness: reading back elements via raw bytes requires that every byte pattern is a valid `T`, and writing elements requires that no uninitialized padding bytes leak into the block. The `Copy` bound alone is not sufficient — types such as `bool`, `char`, `NonZero*`, enums, or structs with padding fields violate one or both requirements. Shipping an unsound API in a 1.0-ready crate is unacceptable, so the general case is deferred until a clean solution is in place.
-
-### Design
-
-`BStackVec<T>` mirrors `BStackByteVec` exactly, but parameterised by `T`. The on-disk memory layout is the same 16-byte header followed by `[T; cap]` elements, using the same little-endian `u64` encoding for `len` and `cap`.
-
-#### Sound element bound
-
-The key design decision is the trait bound on `T`. Options in increasing order of complexity:
-
-1. **`bytemuck::Pod`** (external dependency): `bytemuck::Pod` guarantees no padding and any-bit-pattern validity. This is the most ergonomic approach but adds a dependency that may not be acceptable for all users.
-2. **`zerocopy::FromBytes + zerocopy::IntoBytes`** (external dependency): similar guarantees via the `zerocopy` crate.
-3. **A crate-local sealed `BStackPod` marker trait**: implementors manually assert the POD invariants. No external dependency, but requires users to `unsafe impl` the trait for their types, and adds maintenance burden.
-4. **Make all typed element operations `unsafe`**: put the soundness obligation on the caller at each call site. Consistent with how `std::slice::from_raw_parts` works.
-
-Option 1 (`bytemuck::Pod`) is the recommended approach if a dependency is acceptable; otherwise option 4 (unsafe element ops) is the fallback.
-
-#### API surface
-
-The API mirrors `BStackByteVec` with `u8` replaced by `T`:
-
-```rust
-impl<'a, T: bytemuck::Pod, A: BStackSliceAllocator> BStackVec<'a, T, A> {
-    pub fn new(alloc: &'a A) -> io::Result<Self>;
-    pub fn with_capacity(capacity: u64, alloc: &'a A) -> io::Result<Self>;
-    pub fn from_slice(data: &[T], alloc: &'a A) -> io::Result<Self>;
-    pub unsafe fn from_raw_block(slice: BStackSlice<'a, A>) -> Self;
-    pub fn len(&self) -> io::Result<u64>;
-    pub fn capacity(&self) -> io::Result<u64>;
-    pub fn is_empty(&self) -> io::Result<bool>;
-    pub fn get(&self, index: u64) -> io::Result<Option<T>>;
-    pub fn read_vec(&self) -> io::Result<Vec<T>>;
-    pub fn as_slice(&self) -> io::Result<BStackSlice<'a, A>>;
-    pub fn push(&mut self, value: T) -> io::Result<()>;
-    pub fn pop(&mut self) -> io::Result<Option<T>>;
-    pub fn truncate(&mut self, new_len: u64) -> io::Result<()>;
-    pub fn clear(&mut self) -> io::Result<()>;
-    pub fn reserve(&mut self, additional: u64) -> io::Result<()>;
-    pub fn resize(&mut self, new_len: u64, value: T) -> io::Result<()>;
-    pub fn iter(&self) -> io::Result<BStackVecIter<'_, 'a, T, A>>;
-    pub unsafe fn raw_block(&self) -> BStackSlice<'a, A>;
-    pub fn into_raw_block(self) -> BStackSlice<'a, A>;
-    pub fn dealloc(self) -> io::Result<()>;
-}
-```
-
-### Open questions
-
-- **Dependency policy:** Is adding `bytemuck` or `zerocopy` acceptable? If so, should it be an optional feature flag (e.g. `alloc + set + pod`) or always-on with `alloc + set`?
-- **Sealed marker trait:** If no external dependency is acceptable, define a local `unsafe trait BStackPod` sealed within the crate. Decide whether to provide blanket impls for all primitive integer and float types.
-- **ZST policy:** `size_of::<T>() == 0` makes `elem_offset` a no-op and `block_size` equal to `HEADER_LEN` regardless of capacity. Document clearly and decide whether ZST vecs are supported or rejected at construction time.
-- **Padding detection:** If using the sealed-trait approach, consider adding a compile-time assertion (`assert_eq!(size_of::<T>(), /* expected */)`-style) or a `#[repr(C)]` requirement to help implementors avoid accidental padding.
-- **Generic bounds on `T`:** Should `T` be required to implement `Copy`, or should a `Drop` implementation be provided for types with destructors? A `Drop` impl would be complex, as it must be called on remaining elements when the vec is deallocated.
-- **Error handling:** Should methods return `Result` for all operations, or should some (e.g., `len()`, `capacity()`) be infallible? Returning `Result` allows for better error propagation but may be more verbose for simple accessors.
-- **Initialization of new elements:** When growing the vector, should new elements be zero-initialized, left uninitialized (i.e. `MaybeUninit`), or should we require `T` to be `Default` and call `default()`? Zero-initialization is safer and guranteed for newly allocated space, but may be unnecessary overhead for some types.
-- **Zeroing on deallocation:** Should empty parts of the vector be zeroed on deallocation for security, or should this be left to the caller? Zeroing adds overhead but can prevent data leakage.
 
 ---
 
@@ -223,7 +156,7 @@ Crash-safety depends on three real barriers, in order: stage→arm, arm→in-pla
 
 ---
 
-## Requiring `&mut BStackSlice` for mutation
+## Requiring `&mut BStackSlice` for mutation (0.4.0)
 
 **Feature flag:** `set`
 **Breaking change:** Yes
@@ -244,50 +177,3 @@ The same change applies to the corresponding methods on `BStackGuardedSlice`, an
 
 - Should `writer` and `writer_at` also require `&mut self`, given that they return a `BStackSliceWriter` rather than performing any mutation themselves? Requiring `&mut self` here is consistent with the general principle but may feel overly strict for a constructor that merely captures the slice.
 - `BStackSliceWriter` is currently `Copy`. If `writer` requires `&mut self`, obtaining multiple writers from the same slice would require copying the slice first. Should `BStackSliceWriter` remain `Copy`, or should it be non-`Copy` to better reflect exclusive-write intent?
-
----
-
-## Adding `CheckedSlabBStackAllocator` for crash-recoverable slab allocation
-
-**Feature flag:** `alloc` + `set`
-**Breaking change:** No (additive; new type only)
-
-### Motivation
-
-`SlabBStackAllocator` carries **no per-block metadata**, which means a crash leaves no way to distinguish live blocks from freed ones and offers no defence against double-free. `CheckedSlabBStackAllocator` adds an 8-byte overhead field to every block: zero when freed, non-zero when in use. This makes leaked blocks on crash recoverable by a linear scan and catches double-free at runtime before any list corruption occurs.
-
-### Design
-
-Introduce `CheckedSlabBStackAllocator` in `src/alloc/checked_slab.rs`, implementing `BStackSliceAllocator`.
-
-```rust
-pub struct CheckedSlabBStackAllocator {
-    stack: BStack,
-    block_size: u64, // must be ≥ 16 (8 overhead + 8 minimum usable); never changes after init
-}
-```
-
-The on-disk layout mirrors `SlabBStackAllocator` (same header structure, different magic, e.g. `ALCK\x00\x01\x00\x00`). Every block in the arena has an 8-byte overhead prefix:
-
-```text
-[ overhead(8) | data ... ]
-```
-
-The overhead field encodes block state:
-
-| Value | Meaning |
-|---|---|
-| `0x0000_0000_0000_0000` | Block is free. `data[0..8]` holds the next-free offset (little-endian `u64`, sentinel `u64::MAX`).      |
-| `0x8NNN_NNNN_NNNN_NNNN` | Block is in use; `NNN_NNNN_NNNN_NNNN` is the allocation size in number of blocks; high bit is always 1. |
-
-Note: due to the fact that the minimum block size is 16 bytes, the maximum allocation size in number of blocks is 2^63 / 16 = 2^59 blocks, which means the 2nd-5th hex digits of the overhead are always zero. They may be used in the future for additional metadata if needed.
-
-`block_size` covers the full block including the 8-byte overhead. The slice returned to the caller covers `data` only, i.e. `block_size − 8` bytes per slab block.
-
-**`alloc(len)`:** Compute the number of blocks needed as `ceil((len + 8) / block_size)`. Pop the required count from the free list (verifying each overhead is zero; return an error on mismatch), write the overhead as `(num_blocks | 0x8000_0000_0000_0000)`, zero `data[0..8]`, and update the header. Fall back to tail extension if the free list is insufficient.
-
-**`dealloc(slice)`:** Read the overhead. If the high bit is clear (overhead is zero), the block is already free — return a double-free error without modifying the list. Otherwise do similar processing as `dealloc` of `SlabBStackAllocator`.
-
-**`realloc`:** Same policy as `SlabBStackAllocator` with overhead updated on size changes.
-
-**Crash recovery:** On open, scan the arena linearly. Any block whose overhead is non-zero and whose high bit is set is live; any block whose overhead is zero is free. A scan can reconstruct a valid free list from scratch if needed.

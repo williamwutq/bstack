@@ -639,10 +639,27 @@ is also truncated.
 
 #### Thread safety
 
-`FirstFitBStackAllocator` is **`Send`** but **not `Sync`**.  Ownership can be
-transferred to another thread, but concurrent `&self` access from multiple
-threads would race on the on-disk free list without any allocator-level lock.
-Each instance must be used from at most one thread at a time.
+`FirstFitBStackAllocator` is always **`Send`** — ownership can be transferred to
+another thread.
+
+Without the `atomic` feature it is **not `Sync`**: operations take `&self` and
+mutate the on-disk free list in several steps, so concurrent `&self` access from
+multiple threads would race on that state.  Use one instance from at most one
+thread at a time.
+
+With the `atomic` feature it is **`Send + Sync`**.  An internal
+`std::sync::Mutex` serializes the two compound operations that `BStack`'s own
+per-call write lock does not already make atomic: mutating the free list and
+extending/discarding the stack tail.  Operations that touch only caller-owned
+bytes inside an already-allocated block — growing in place within the existing
+block, or zeroing within the same alignment bucket — run without the lock.  The
+`recovery_needed` flag is updated with a compare-and-swap (no extra cost over the
+disk write it must perform anyway) and additionally rejects operating on a stack
+left in a needs-recovery state.
+
+Unlike `LinearBStackAllocator`, which uses optimistic `try_extend`/`try_discard`
+and reports a lost tail race as `Unsupported`, a contended `FirstFit` operation
+*blocks* on the mutex and proceeds once the lock is free.
 
 #### Example
 
@@ -883,6 +900,101 @@ let _ = alloc.into_stack();
 // Subsequent runs: reopen the existing stack.
 let stack = BStack::open("data.bstack")?;
 let alloc = SlabBStackAllocator::open(stack, 64)?;
+```
+
+### `CheckedSlabBStackAllocator` (`alloc + set` features) *(Experimental)*
+
+A crash-recoverable fixed-block slab allocator. Like `SlabBStackAllocator`, every block is the same physical size on disk. Unlike it, each block carries an 8-byte **overhead** prefix that records whether the block is free or in use, making leaked blocks recoverable by a linear scan after a crash and catching double-frees at runtime before the free list can be corrupted.
+
+The constructor takes `data_size` — the number of usable bytes per block (must be ≥ 8). The physical block size stored on disk is `data_size + 8`.
+
+```toml
+[dependencies]
+bstack = { version = "0.2", features = ["alloc", "set"] }
+```
+
+#### On-disk layout
+
+```
+[ reserved(24) | magic[8] | block_size[8] | free_head[8] | arena ... ]
+  ^               ^
+  offset 0        offset 24 (allocator header start)
+  user data       offset 48 (arena start)
+```
+
+* **`magic`** — `"ALCK\x00\x01\x00\x00"` (version 0.1).
+* **`block_size`** — `data_size + 8`, little-endian `u64`.
+* **`free_head`** — block start offset of the first free block, or `0` (sentinel; no valid block starts at offset 0).
+
+Every block in the arena has the shape:
+
+```
+[ overhead(8) | data(data_size) ]
+```
+
+The overhead field encodes block state:
+
+| Value | Meaning |
+|---|---|
+| `0x0000_0000_0000_0000` | Block is free. `data[0..8]` holds the next-free block offset (`u64` LE, `0` = end of list). |
+| `0x8NNN_NNNN_NNNN_NNNN` | Block is in use; low 63 bits are the allocation's block count; high bit is always 1. |
+
+A multi-block allocation stores the overhead **only in the first block**; the remaining `data_size` bytes of the first block and all subsequent blocks form one contiguous data region. A linear crash-recovery scan advances by the block count at live allocations and by one block at free blocks.
+
+#### Allocation policy
+
+| Request | Strategy |
+|---------|----------|
+| `len == 0` | Null handle (offset 0, len 0) |
+| `len ≤ data_size` | Pop from free list; extend tail by one `block_size` if empty |
+| `len > data_size` | Extend tail by `⌈(len + 8) / block_size⌉ × block_size` bytes |
+
+Multi-block requests always extend the tail — the free list holds single blocks only.
+
+#### Deallocation policy
+
+| Case | Strategy |
+|------|----------|
+| Already free (overhead high bit clear) | Return `InvalidInput` double-free error immediately |
+| Multi-block allocation at tail | `BStack::discard` (single call; crash-safe) |
+| All other cases | Each block becomes a free-list node |
+
+#### Crash consistency
+
+Free-list mutations write block payloads before updating `free_head`. The overhead high bit is flipped to "in use" only after the block's data is clean, so a crash at any intermediate point leaks at most one block without corrupting the free list. A linear arena scan can reconstruct a valid free list from scratch if needed.
+
+#### Constructors
+
+| Constructor | Stack | Effect |
+|---|---|---|
+| `CheckedSlabBStackAllocator::new(stack, data_size)` | **empty** | Writes the 48-byte allocator header; fails with `InvalidInput` if the stack already has data or `data_size < 8`. |
+| `CheckedSlabBStackAllocator::open(stack)` | **non-empty** | Reads and validates the stored header, then runs `recover()` automatically. Fails with `InvalidData` on magic mismatch, invalid block size, or misaligned arena. |
+| `CheckedSlabBStackAllocator::recover()` | any | Reclaims leaked blocks and discards orphaned tails left by an unclean shutdown. Returns the count of blocks that could not be classified with certainty (`0` = fully accounted for). Called automatically by `open`; exposed for explicit inspection or re-runs. |
+
+#### Example
+
+```rust
+use bstack::{BStack, BStackAllocator, CheckedSlabBStackAllocator};
+
+// First run: initialise a fresh empty stack.
+// data_size = 56: each block holds 56 usable bytes, 64 bytes on disk.
+let stack = BStack::open("data.bstack")?;
+let alloc = CheckedSlabBStackAllocator::new(stack, 56)?;
+
+let a = alloc.alloc(48)?;
+let b = alloc.alloc(48)?;
+a.write(b"hello")?;
+
+alloc.dealloc(a)?;        // returned to free list
+
+let c = alloc.alloc(32)?; // reuses a's slot
+assert_eq!(c.start(), a.start());
+
+let _ = alloc.into_stack();
+
+// Subsequent runs: reopen the existing stack.
+let stack = BStack::open("data.bstack")?;
+let alloc = CheckedSlabBStackAllocator::open(stack)?;
 ```
 
 ### `DebugCheckingAllocator` (`alloc` feature)

@@ -578,7 +578,7 @@ bstack_t *linear_bstack_allocator_into_stack(linear_bstack_allocator_t *alloc);
  * On-disk layout (all within the bstack payload):
  *   [0..16)  — reserved (OFFSET_SIZE)
  *   [16..48) — allocator header: magic[8] | flags[4] | reserved[4] | free_head[8]
- *              magic  = "ALFF\x00\x01\x02\x00"
+ *              magic  = "ALFF\x00\x01\x03\x00"
  *              flags  = bit 0: recovery_needed (crash detected)
  *              free_head = payload offset of first free block's payload, or 0
  *   [48..)   — block arena
@@ -591,11 +591,27 @@ bstack_t *linear_bstack_allocator_into_stack(linear_bstack_allocator_t *alloc);
  * Crash safety: recovery_needed is set before any multi-step modification and
  * cleared after.  On open, if recovery_needed is set, the arena is scanned
  * linearly and the free list is rebuilt from is_free flags alone.
+ *
+ * Thread safety: without -DBSTACK_FEATURE_ATOMIC, an allocator handle must be
+ * used from one thread at a time — its operations mutate the on-disk free list
+ * in several steps and would race under concurrent calls.  With
+ * -DBSTACK_FEATURE_ATOMIC the handle owns an in-memory mutex (lock) that
+ * serializes the two compound operations not already made atomic by bstack's
+ * own per-call lock — free-list mutation and stack extension/discard — so a
+ * single handle may then be shared across threads.  recovery_needed is updated
+ * with bstack_cas (no extra cost over the disk write it performs regardless),
+ * which also rejects operating on a stack left in a needs-recovery state.
  * ====================================================================== */
 
 typedef struct {
     bstack_allocator_t base; /* must be first — safe cast to bstack_allocator_t * */
     bstack_t          *bs;
+#ifdef BSTACK_FEATURE_ATOMIC
+    /* Opaque pointer to a platform mutex (pthread_mutex_t / CRITICAL_SECTION),
+     * allocated in first_fit_bstack_allocator_new and released on free.  Kept
+     * opaque so this header need not pull in <pthread.h> / <windows.h>. */
+    void              *lock;
+#endif
 } first_fit_bstack_allocator_t;
 
 /*
@@ -750,6 +766,111 @@ bstack_t *slab_bstack_allocator_into_stack(slab_bstack_allocator_t *alloc);
  * Return the block_size this allocator was created with.
  */
 uint64_t slab_bstack_allocator_block_size(const slab_bstack_allocator_t *alloc);
+
+/* =========================================================================
+ * checked_slab_bstack_allocator_t — crash-recoverable fixed-block slab allocator
+ *
+ * Every block in the arena carries an 8-byte **overhead** prefix that records
+ * the block's state, making double-free detection and post-crash recovery
+ * possible.  The slice returned to the caller covers only the `data` region
+ * after the overhead (data_size = block_size − 8 usable bytes per block).
+ *
+ * On-disk layout (all within the bstack payload):
+ *   [0..24)  — reserved (OFFSET_SIZE; available for caller use)
+ *   [24..48) — allocator header: magic[8] | block_size[8] | free_head[8]
+ *              magic = "ALCK\x00\x01\x00\x00"
+ *   [48..)   — block arena
+ *
+ * Each block in the arena:
+ *   [ overhead(8) | data ... ]
+ *
+ * Overhead encoding:
+ *   0x0000_0000_0000_0000 — free; data[0..8] = next free block offset (LE u64)
+ *   0x8NNN_NNNN_NNNN_NNNN — in use; NNN... = number of blocks (high bit always 1)
+ *
+ * Allocation policy:
+ *   len == 0            → null sentinel slice (offset = 0, len = 0)
+ *   num_blocks == 1     → pop from free list, or extend tail by block_size
+ *   num_blocks > 1      → always extend tail (multi-block never uses free list)
+ *
+ * Deallocation policy:
+ *   high bit clear      → double-free error (errno = EINVAL)
+ *   multi-block at tail → bstack_discard (crash-safe, single call)
+ *   all other cases     → each block prepended to free list
+ *
+ * Crash consistency: each free-list mutation writes block payloads before
+ * updating free_head.  A crash leaks at most the block being operated on;
+ * the rest of the list stays intact.  checked_slab_bstack_allocator_recover
+ * reclaims leaked blocks by a linear arena scan.
+ *
+ * Requires -DBSTACK_FEATURE_SET.
+ * ====================================================================== */
+
+typedef struct {
+    bstack_allocator_t base; /* must be first — safe cast to bstack_allocator_t * */
+    bstack_t          *bs;
+    uint64_t           block_size;
+} checked_slab_bstack_allocator_t;
+
+/*
+ * Initialise a new checked_slab_bstack_allocator_t over an empty bs.
+ *
+ * data_size is the number of usable bytes per slab block (excluding the 8-byte
+ * overhead prefix); block_size = data_size + 8.  data_size must be >= 8.
+ * bs must be empty (use checked_slab_bstack_allocator_open for existing files).
+ *
+ * Returns NULL on failure (errno = EINVAL if bs non-empty or data_size < 8,
+ * ENOMEM on allocation failure, or the errno from any failing bstack op).
+ */
+checked_slab_bstack_allocator_t *checked_slab_bstack_allocator_new(
+    bstack_t *bs, uint64_t data_size);
+
+/*
+ * Open an existing checked_slab_bstack_allocator_t from a non-empty bs.
+ *
+ * Validates the ALCK 0.1.x magic prefix, reads block_size, checks the arena
+ * tail alignment and the free_head pointer, then automatically calls
+ * checked_slab_bstack_allocator_recover to reclaim leaked blocks and discard
+ * any orphaned tail.
+ *
+ * Returns NULL on failure (errno = EINVAL if bs is empty; EINVAL/EPROTO for
+ * bad magic, invalid stored values, or misaligned tail; ENOMEM on allocation
+ * failure; or the errno from any failing bstack op).
+ */
+checked_slab_bstack_allocator_t *checked_slab_bstack_allocator_open(
+    bstack_t *bs);
+
+/*
+ * Repair the allocator after an unclean shutdown.
+ *
+ * Walks the arena linearly: reclaims leaked free-overhead blocks, resyncs
+ * past suspicious regions, and discards any orphaned tail left by a failed
+ * realloc truncation.  Writes *out_unsure (if non-NULL) with the count of
+ * blocks that could not be classified with certainty (0 = fully recovered).
+ *
+ * Returns 0 on success, -1 on I/O error (errno set).
+ * checked_slab_bstack_allocator_open calls this automatically.
+ */
+int checked_slab_bstack_allocator_recover(checked_slab_bstack_allocator_t *alloc,
+                                           uint64_t *out_unsure);
+
+/*
+ * Free the allocator wrapper without closing the underlying bstack.
+ */
+void checked_slab_bstack_allocator_free(checked_slab_bstack_allocator_t *alloc);
+
+/*
+ * Consume the allocator: free the wrapper and return the underlying bstack.
+ * The returned bstack_t * must eventually be passed to bstack_close.
+ */
+bstack_t *checked_slab_bstack_allocator_into_stack(
+    checked_slab_bstack_allocator_t *alloc);
+
+/*
+ * Return the usable bytes per slab block (data_size = block_size − 8).
+ */
+uint64_t checked_slab_bstack_allocator_data_size(
+    const checked_slab_bstack_allocator_t *alloc);
 
 #endif /* BSTACK_FEATURE_SET */
 

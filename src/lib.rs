@@ -362,7 +362,9 @@
 //!
 //! * [`FirstFitBStackAllocator`] — A persistent first-fit free-list allocator
 //!   that reuses freed regions to prevent unbounded file growth.  Requires both
-//!   `alloc` and `set` features.  `Send` but not `Sync`.
+//!   `alloc` and `set` features.  `Send` in all configurations; also `Sync`
+//!   with the `atomic` feature, where an internal `Mutex` serializes free-list
+//!   mutation and stack extension.
 //!
 //! * [`GhostTreeBstackAllocator`] — A pure-AVL general-purpose allocator with
 //!   zero-overhead live allocations.  Free blocks store their AVL node inline,
@@ -376,6 +378,18 @@
 //!   the first 8 bytes of each free block.  O(1) alloc and dealloc.
 //!   Use [`SlabBStackAllocator::new`] to initialise an empty stack and
 //!   [`SlabBStackAllocator::open`] to reopen an existing one.
+//!   Requires both `alloc` and `set` features.
+//!
+//! * [`CheckedSlabBStackAllocator`] — **Experimental.** Crash-recoverable
+//!   variant of [`SlabBStackAllocator`].  Prefixes every block with an 8-byte
+//!   overhead field (zero when free, high bit set with a block count when in
+//!   use) so leaked blocks are recoverable by a linear scan and double-frees
+//!   are caught at runtime before the free list can be corrupted.  Constructor
+//!   takes `data_size` (usable bytes per block, ≥ 8); the on-disk `block_size`
+//!   is `data_size + 8`.  Use [`CheckedSlabBStackAllocator::new`] to initialise
+//!   an empty stack and [`CheckedSlabBStackAllocator::open`] to reopen one
+//!   ([`open`](CheckedSlabBStackAllocator::open) runs
+//!   [`recover`](CheckedSlabBStackAllocator::recover) automatically).
 //!   Requires both `alloc` and `set` features.
 //!
 //! * [`DebugCheckingAllocator`] — Debug/test wrapper around any
@@ -457,8 +471,8 @@ pub use alloc::{
 };
 #[cfg(all(feature = "alloc", feature = "set"))]
 pub use alloc::{
-    BStackByteVec, BStackByteVecIter, BStackSliceWriter, FirstFitBStackAllocator,
-    GhostTreeBstackAllocator, SlabBStackAllocator,
+    BStackByteVec, BStackByteVecIter, BStackSliceWriter, CheckedSlabBStackAllocator,
+    FirstFitBStackAllocator, GhostTreeBstackAllocator, SlabBStackAllocator,
 };
 
 #[cfg(all(feature = "guarded", feature = "atomic"))]
