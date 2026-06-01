@@ -46,6 +46,21 @@
 //!   extension, and the allocator zeroes on free.  `Send` but not `Sync` —
 //!   each instance must be used from at most one thread at a time.
 //!
+//! * [`SlabBStackAllocator`] — a fixed-block slab allocator (requires both
+//!   `alloc` **and** `set` features).  All blocks are exactly `block_size`
+//!   bytes with no per-block overhead; freed blocks form an intrusive
+//!   singly-linked free list.  O(1) alloc and dealloc.  `Send` but not
+//!   `Sync`.  *Experimental.*
+//!
+//! * [`CheckedSlabBStackAllocator`] — a crash-recoverable variant of
+//!   [`SlabBStackAllocator`] (requires both `alloc` **and** `set` features).
+//!   Each block carries an 8-byte overhead prefix encoding its state: zero
+//!   when free (next-free offset in `data[0..8]`), high bit set when in use
+//!   (block count in the low bits).  Leaked blocks are recoverable by a linear
+//!   scan; double-frees are caught before the free list can be corrupted.
+//!   Constructor takes `data_size` (usable bytes per block, ≥ 8); `block_size`
+//!   on disk is `data_size + 8`.  `Send` but not `Sync`.  *Experimental.*
+//!
 //! * [`BStackByteVec`] — a growable byte (`u8`) vector backed by a
 //!   [`BStack`] allocation (requires both `alloc` **and** `set`).  Mirrors the
 //!   core [`Vec<u8>`] API: `push`, `pop`, `get`, `read_bytes`, `as_slice`,
@@ -83,7 +98,8 @@
 //! ```
 //!
 //! In-place slice writes ([`BStackSliceWriter`]), [`FirstFitBStackAllocator`],
-//! and [`BStackByteVec`] additionally require `set`:
+//! [`SlabBStackAllocator`], [`CheckedSlabBStackAllocator`], and [`BStackByteVec`]
+//! additionally require `set`:
 //!
 //! ```toml
 //! bstack = { version = "0.1", features = ["alloc", "set"] }
