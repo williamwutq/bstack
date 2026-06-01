@@ -213,7 +213,7 @@ The overhead field encodes block state:
 | `0x0000_0000_0000_0000` | Block is free. `data[0..8]` holds the next-free offset (little-endian `u64`, sentinel `u64::MAX`).      |
 | `0x8NNN_NNNN_NNNN_NNNN` | Block is in use; `NNN_NNNN_NNNN_NNNN` is the allocation size in number of blocks; high bit is always 1. |
 
-Note: due to the fact that the minimum block size is 16 bytes, the maximum allocation size in number of blocks is 2^63 / 16 = 2^59 blocks, which means the 2nd-5th hex digits of the overhead are always zero. They may be used in the future for additional metadata if needed.
+Note: due to the fact that the minimum block size is 16 bytes, the maximum allocation size in number of blocks is 2^63 / 16 = 2^59 blocks, which means the 2nd-5th hex digits of the overhead are always zero. These bits may not be checked. They may be used in the future for additional metadata if needed.
 
 `block_size` covers the full block including the 8-byte overhead. The slice returned to the caller covers `data` only, i.e. `block_size − 8` bytes per slab block.
 
