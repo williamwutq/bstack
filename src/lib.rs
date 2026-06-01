@@ -1943,11 +1943,11 @@ impl BStack {
 
     /// Read a dependent chain of logical ranges in a single lock acquisition.
     ///
-    /// `gen` is called once per read step.  The first call receives an empty
-    /// slice (`&[]`).  Each subsequent call receives the bytes returned by the
-    /// previous read.  The generator returns `Some(range)` to request the next
-    /// read, or `None` to stop.  Returns a [`Vec`] of all read results in
-    /// order.
+    /// `gen` is called once per read step.  Each call returns `Some((offset,
+    /// buf))` to request a read of `buf.len()` bytes starting at `offset` into
+    /// `buf`, or `None` to stop.  When `gen` is called, the buffer supplied by
+    /// the *previous* call has already been filled with its data — the call
+    /// itself signals that the prior buffer is ready.
     ///
     /// All reads happen under the same shared lock (Unix/Windows: read lock;
     /// other platforms: write lock), so no write can interleave between steps.
@@ -1958,90 +1958,59 @@ impl BStack {
     ///
     /// # Errors
     ///
-    /// Returns [`io::ErrorKind::InvalidInput`] if any yielded range has
-    /// `end < start` or if `end` exceeds the current payload size.
+    /// Returns [`io::ErrorKind::InvalidInput`] if any `offset + buf.len()`
+    /// overflows `u64` or exceeds the current payload size.
     #[cfg(feature = "atomic")]
-    pub fn get_batched_gen<F>(&self, mut f: F) -> io::Result<Vec<Vec<u8>>>
+    pub fn get_batched_gen<'a, F>(&self, mut f: F) -> io::Result<()>
     where
-        F: FnMut(&[u8]) -> Option<std::ops::Range<u64>>,
+        F: FnMut() -> Option<(u64, &'a mut [u8])>,
     {
         #[cfg(any(unix, windows))]
         {
             let file = self.lock.read().unwrap();
             let data_size = file.metadata()?.len().saturating_sub(HEADER_SIZE);
-            let mut results: Vec<Vec<u8>> = Vec::new();
-            loop {
-                let range = {
-                    let last = results.last().map(Vec::as_slice).unwrap_or(&[]);
-                    match f(last) {
-                        Some(r) => r,
-                        None => break,
-                    }
-                };
-                if range.end < range.start {
+            while let Some((offset, buf)) = f() {
+                let end = offset.checked_add(buf.len() as u64).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "get_batched_gen: offset + buf.len() overflows u64",
+                    )
+                })?;
+                if end > data_size {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
                         format!(
-                            "get_batched_gen: end ({}) < start ({})",
-                            range.end, range.start
+                            "get_batched_gen: end ({end}) exceeds payload size ({data_size})"
                         ),
                     ));
                 }
-                if range.end > data_size {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!(
-                            "get_batched_gen: end ({}) exceeds payload size ({data_size})",
-                            range.end
-                        ),
-                    ));
-                }
-                let buf = pread_exact(
-                    &file,
-                    HEADER_SIZE + range.start,
-                    (range.end - range.start) as usize,
-                )?;
-                results.push(buf);
+                pread_exact_into(&file, HEADER_SIZE + offset, buf)?;
             }
-            Ok(results)
+            Ok(())
         }
         #[cfg(not(any(unix, windows)))]
         {
             let mut file = self.lock.write().unwrap();
             let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
-            let mut results: Vec<Vec<u8>> = Vec::new();
-            loop {
-                let range = {
-                    let last = results.last().map(Vec::as_slice).unwrap_or(&[]);
-                    match f(last) {
-                        Some(r) => r,
-                        None => break,
-                    }
-                };
-                if range.end < range.start {
+            while let Some((offset, buf)) = f() {
+                let end = offset.checked_add(buf.len() as u64).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "get_batched_gen: offset + buf.len() overflows u64",
+                    )
+                })?;
+                if end > data_size {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
                         format!(
-                            "get_batched_gen: end ({}) < start ({})",
-                            range.end, range.start
+                            "get_batched_gen: end ({end}) exceeds payload size ({data_size})"
                         ),
                     ));
                 }
-                if range.end > data_size {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!(
-                            "get_batched_gen: end ({}) exceeds payload size ({data_size})",
-                            range.end
-                        ),
-                    ));
-                }
-                file.seek(SeekFrom::Start(HEADER_SIZE + range.start))?;
-                let mut buf = vec![0u8; (range.end - range.start) as usize];
-                file.read_exact(&mut buf)?;
-                results.push(buf);
+                file.seek(SeekFrom::Start(HEADER_SIZE + offset))?;
+                file.read_exact(buf)?;
             }
-            Ok(results)
+            Ok(())
         }
     }
 
