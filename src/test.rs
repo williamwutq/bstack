@@ -4416,6 +4416,604 @@ mod atomic_tests {
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
         assert_eq!(s.len().unwrap(), 10);
     }
+
+    // -----------------------------------------------------------------------
+    // try_extend_zeros  (require atomic)
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn try_extend_zeros_matching_size_appends_zeros() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        let ok = s.try_extend_zeros(5, 3).unwrap();
+        assert!(ok);
+        assert_eq!(s.len().unwrap(), 8);
+        assert_eq!(s.peek(0).unwrap(), b"hello\x00\x00\x00");
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn try_extend_zeros_mismatching_size_returns_false() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        let ok = s.try_extend_zeros(3, 3).unwrap();
+        assert!(!ok);
+        assert_eq!(s.len().unwrap(), 5);
+        assert_eq!(s.peek(0).unwrap(), b"hello");
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn try_extend_zeros_n_zero_is_noop_returns_true() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        let ok = s.try_extend_zeros(5, 0).unwrap();
+        assert!(ok);
+        assert_eq!(s.len().unwrap(), 5);
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn try_extend_zeros_content_is_zeros() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"ab").unwrap();
+        s.try_extend_zeros(2, 4).unwrap();
+        assert_eq!(s.get(2, 6).unwrap(), b"\x00\x00\x00\x00");
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn try_extend_zeros_persists_across_reopen() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+        s.push(b"hi").unwrap();
+        s.try_extend_zeros(2, 2).unwrap();
+        drop(s);
+        let s2 = BStack::open(&p).unwrap();
+        assert_eq!(s2.len().unwrap(), 4);
+        assert_eq!(s2.peek(0).unwrap(), b"hi\x00\x00");
+    }
+
+    // -----------------------------------------------------------------------
+    // get_batched  (require atomic)
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn get_batched_reads_multiple_ranges() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        let results = s.get_batched([0..5, 5..10]).unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0], b"hello");
+        assert_eq!(results[1], b"world");
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn get_batched_empty_input_returns_empty_vec() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        let results = s
+            .get_batched(std::iter::empty::<std::ops::Range<u64>>())
+            .unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn get_batched_zero_length_range_returns_empty_buf() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        let results = s.get_batched([3..3]).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_empty());
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn get_batched_out_of_bounds_returns_error() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        let err = s.get_batched([0..10]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn get_batched_end_less_than_start_returns_error() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        let err = s.get_batched([5..3]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn get_batched_order_matches_input() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"abcde").unwrap();
+        let results = s.get_batched([4..5, 0..2, 2..4]).unwrap();
+        assert_eq!(results[0], b"e");
+        assert_eq!(results[1], b"ab");
+        assert_eq!(results[2], b"cd");
+    }
+
+    // -----------------------------------------------------------------------
+    // get_batched_into  (require atomic)
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn get_batched_into_fills_buffers() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        let mut a = [0u8; 5];
+        let mut b = [0u8; 5];
+        s.get_batched_into([(0, a.as_mut_slice()), (5, b.as_mut_slice())])
+            .unwrap();
+        assert_eq!(&a, b"hello");
+        assert_eq!(&b, b"world");
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn get_batched_into_empty_input_is_noop() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        s.get_batched_into(std::iter::empty::<(u64, &mut [u8])>())
+            .unwrap();
+        assert_eq!(s.len().unwrap(), 5);
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn get_batched_into_out_of_bounds_returns_error() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hi").unwrap();
+        let mut buf = [0u8; 10];
+        let err = s.get_batched_into([(0, buf.as_mut_slice())]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn get_batched_into_matches_get() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"abcdefgh").unwrap();
+        let mut buf1 = [0u8; 3];
+        let mut buf2 = [0u8; 4];
+        s.get_batched_into([(0, buf1.as_mut_slice()), (4, buf2.as_mut_slice())])
+            .unwrap();
+        assert_eq!(&buf1, &s.get(0, 3).unwrap()[..]);
+        assert_eq!(&buf2, &s.get(4, 8).unwrap()[..]);
+    }
+
+    // -----------------------------------------------------------------------
+    // get_batched_gen  (require atomic)
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn get_batched_gen_reads_chain() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        let mut bufs: [Vec<u8>; 2] = [vec![0u8; 5], vec![0u8; 5]];
+        let ptr0 = bufs[0].as_mut_ptr();
+        let ptr1 = bufs[1].as_mut_ptr();
+        let mut step = 0usize;
+        s.get_batched_gen(|| {
+            let r = match step {
+                0 => Some((0u64, unsafe { std::slice::from_raw_parts_mut(ptr0, 5) })),
+                1 => Some((5u64, unsafe { std::slice::from_raw_parts_mut(ptr1, 5) })),
+                _ => None,
+            };
+            step += 1;
+            r
+        })
+        .unwrap();
+        assert_eq!(&bufs[0], b"hello");
+        assert_eq!(&bufs[1], b"world");
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn get_batched_gen_immediate_none_is_noop() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        s.get_batched_gen(|| None).unwrap();
+        assert_eq!(s.len().unwrap(), 5);
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn get_batched_gen_out_of_bounds_returns_error() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hi").unwrap();
+        let mut buf = [0u8; 10];
+        let ptr = buf.as_mut_ptr();
+        let mut called = false;
+        let err = s
+            .get_batched_gen(|| {
+                if called {
+                    return None;
+                }
+                called = true;
+                Some((0u64, unsafe { std::slice::from_raw_parts_mut(ptr, 10) }))
+            })
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    // -----------------------------------------------------------------------
+    // cross_exchange  (require set + atomic)
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn cross_exchange_swaps_two_regions() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        s.cross_exchange(0, 5, 5).unwrap();
+        assert_eq!(s.peek(0).unwrap(), b"worldhello");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn cross_exchange_n_zero_is_noop() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        s.cross_exchange(0, 5, 0).unwrap();
+        assert_eq!(s.peek(0).unwrap(), b"helloworld");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn cross_exchange_overlapping_regions_returns_error() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        let err = s.cross_exchange(0, 3, 5).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(s.peek(0).unwrap(), b"helloworld");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn cross_exchange_out_of_bounds_returns_error() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        let err = s.cross_exchange(0, 3, 5).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn cross_exchange_locked_region_returns_error() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        s.lock_up_to(5).unwrap();
+        let err = s.cross_exchange(0, 5, 5).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(s.peek(0).unwrap(), b"helloworld");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn cross_exchange_persists_across_reopen() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+        s.push(b"abXY").unwrap();
+        s.cross_exchange(0, 2, 2).unwrap();
+        drop(s);
+        let s2 = BStack::open(&p).unwrap();
+        assert_eq!(s2.peek(0).unwrap(), b"XYab");
+    }
+
+    // -----------------------------------------------------------------------
+    // copy  (require set + atomic)
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn copy_copies_bytes() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        s.copy(0, 5, 5).unwrap();
+        assert_eq!(s.peek(0).unwrap(), b"hellohello");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn copy_overlapping_source_to_dest_correct() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"abcde").unwrap();
+        // Copy [0,3) → [1,4): source read before write, so result is "aabcde"[0..5] = "aabcd"
+        s.copy(0, 1, 3).unwrap();
+        assert_eq!(s.peek(0).unwrap(), b"aabce");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn copy_n_zero_is_noop() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        s.copy(0, 4, 0).unwrap();
+        assert_eq!(s.peek(0).unwrap(), b"hello");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn copy_out_of_bounds_returns_error() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        let err = s.copy(0, 0, 10).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn copy_destination_in_locked_region_returns_error() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        s.lock_up_to(5).unwrap();
+        let err = s.copy(5, 0, 5).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(s.peek(0).unwrap(), b"helloworld");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn copy_persists_across_reopen() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+        s.push(b"abcd").unwrap();
+        s.copy(0, 2, 2).unwrap();
+        drop(s);
+        let s2 = BStack::open(&p).unwrap();
+        assert_eq!(s2.peek(0).unwrap(), b"abab");
+    }
+
+    // -----------------------------------------------------------------------
+    // eq_crds  (require set + atomic)
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn eq_crds_match_swaps_b_returns_old() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"aabbcc").unwrap(); // A=[0,2)=aa, B=[2,4)=bb
+        let old = s.eq_crds(0, b"aa", 2, b"XX").unwrap();
+        assert_eq!(old, Some(b"bb".to_vec()));
+        assert_eq!(s.get(2, 4).unwrap(), b"XX");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn eq_crds_no_match_returns_none() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"aabbcc").unwrap();
+        let result = s.eq_crds(0, b"zz", 2, b"XX").unwrap();
+        assert_eq!(result, None);
+        assert_eq!(s.get(2, 4).unwrap(), b"bb"); // unchanged
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn eq_crds_empty_a_always_matches() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        let old = s.eq_crds(0, b"", 0, b"HH").unwrap();
+        assert_eq!(old, Some(b"he".to_vec()));
+        assert_eq!(s.get(0, 2).unwrap(), b"HH");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn eq_crds_empty_b_buf_returns_some_empty_vec() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        let old = s.eq_crds(0, b"hello", 0, b"").unwrap();
+        assert_eq!(old, Some(Vec::new()));
+        assert_eq!(s.peek(0).unwrap(), b"hello"); // unchanged
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn eq_crds_b_in_locked_region_returns_error() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        s.lock_up_to(5).unwrap();
+        let err = s.eq_crds(5, b"world", 0, b"HELLO").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn eq_crds_out_of_bounds_returns_error() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hi").unwrap();
+        let err = s.eq_crds(0, b"hello", 0, b"world").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    // -----------------------------------------------------------------------
+    // ne_crds  (require set + atomic)
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn ne_crds_no_match_swaps_b_returns_old() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"aabbcc").unwrap();
+        let old = s.ne_crds(0, b"zz", 2, b"XX").unwrap();
+        assert_eq!(old, Some(b"bb".to_vec()));
+        assert_eq!(s.get(2, 4).unwrap(), b"XX");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn ne_crds_match_returns_none() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"aabbcc").unwrap();
+        let result = s.ne_crds(0, b"aa", 2, b"XX").unwrap();
+        assert_eq!(result, None);
+        assert_eq!(s.get(2, 4).unwrap(), b"bb"); // unchanged
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn ne_crds_empty_a_trivially_equal_returns_none() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        let result = s.ne_crds(0, b"", 0, b"XX").unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn ne_crds_b_in_locked_region_returns_error() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        s.lock_up_to(5).unwrap();
+        let err = s.ne_crds(5, b"XXXXX", 0, b"HELLO").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    // -----------------------------------------------------------------------
+    // masked_eq_crds  (require set + atomic)
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn masked_eq_crds_match_swaps_b_returns_old() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        // A = [0xFF, 0x0F], expected = [0xFF, 0x0F], mask = [0xFF, 0xF0]
+        // masked A = [0xFF, 0x00], masked expected = [0xFF, 0x00] → equal
+        s.push(b"\xff\x0f--").unwrap();
+        let old = s
+            .masked_eq_crds(0, b"\xff\xf0", b"\xff\x0f", 2, b"ZZ")
+            .unwrap();
+        assert_eq!(old, Some(b"--".to_vec()));
+        assert_eq!(s.get(2, 4).unwrap(), b"ZZ");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn masked_eq_crds_no_match_returns_none() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        // A = [0x0F], expected = [0xFF], mask = [0xFF] → 0x0F != 0xFF
+        s.push(b"\x0f--").unwrap();
+        let result = s.masked_eq_crds(0, b"\xff", b"\xff", 1, b"ZZ").unwrap();
+        assert_eq!(result, None);
+        assert_eq!(s.get(1, 3).unwrap(), b"--"); // unchanged
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn masked_eq_crds_mask_len_mismatch_returns_error() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        let err = s
+            .masked_eq_crds(0, b"\xff\xff", b"\xff", 0, b"")
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn masked_eq_crds_partial_mask_ignores_masked_out_bits() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        // A = 0xAB, expected = 0xCD, mask = 0x00 → all bits masked out → always matches
+        s.push(b"\xab--").unwrap();
+        let old = s.masked_eq_crds(0, b"\x00", b"\xcd", 1, b"ZZ").unwrap();
+        assert_eq!(old, Some(b"--".to_vec()));
+    }
+
+    // -----------------------------------------------------------------------
+    // masked_ne_crds  (require set + atomic)
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn masked_ne_crds_no_match_swaps_b_returns_old() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        // A = [0x0F], expected = [0xFF], mask = [0xFF] → 0x0F != 0xFF → swap
+        s.push(b"\x0f--").unwrap();
+        let old = s.masked_ne_crds(0, b"\xff", b"\xff", 1, b"ZZ").unwrap();
+        assert_eq!(old, Some(b"--".to_vec()));
+        assert_eq!(s.get(1, 3).unwrap(), b"ZZ");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn masked_ne_crds_match_returns_none() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        // A = [0xFF, 0x0F], expected = [0xFF, 0x0F], mask = [0xFF, 0xF0]
+        // masked equal → no swap
+        s.push(b"\xff\x0f--").unwrap();
+        let result = s
+            .masked_ne_crds(0, b"\xff\xf0", b"\xff\x0f", 2, b"ZZ")
+            .unwrap();
+        assert_eq!(result, None);
+        assert_eq!(s.get(2, 4).unwrap(), b"--"); // unchanged
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn masked_ne_crds_mask_len_mismatch_returns_error() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        let err = s
+            .masked_ne_crds(0, b"\xff\xff", b"\xff", 0, b"")
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn masked_ne_crds_all_bits_masked_out_always_equal_returns_none() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        // mask = 0x00 → all bits masked, always equal → no swap
+        s.push(b"\xab--").unwrap();
+        let result = s.masked_ne_crds(0, b"\x00", b"\xcd", 1, b"ZZ").unwrap();
+        assert_eq!(result, None);
+    }
 }
 
 #[cfg(test)]
