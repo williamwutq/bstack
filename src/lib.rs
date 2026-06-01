@@ -1911,9 +1911,7 @@ impl BStack {
                 if end > data_size {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
-                        format!(
-                            "get_batched_into: end ({end}) exceeds payload size ({data_size})",
-                        ),
+                        format!("get_batched_into: end ({end}) exceeds payload size ({data_size})",),
                     ));
                 }
                 pread_exact_into(&file, HEADER_SIZE + ptr, buf)?;
@@ -1929,9 +1927,7 @@ impl BStack {
                 if end > data_size {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
-                        format!(
-                            "get_batched_into: end ({end}) exceeds payload size ({data_size})",
-                        ),
+                        format!("get_batched_into: end ({end}) exceeds payload size ({data_size})",),
                     ));
                 }
                 file.seek(SeekFrom::Start(HEADER_SIZE + ptr))?;
@@ -1979,9 +1975,7 @@ impl BStack {
                 if end > data_size {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
-                        format!(
-                            "get_batched_gen: end ({end}) exceeds payload size ({data_size})"
-                        ),
+                        format!("get_batched_gen: end ({end}) exceeds payload size ({data_size})"),
                     ));
                 }
                 pread_exact_into(&file, HEADER_SIZE + offset, buf)?;
@@ -2002,9 +1996,7 @@ impl BStack {
                 if end > data_size {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
-                        format!(
-                            "get_batched_gen: end ({end}) exceeds payload size ({data_size})"
-                        ),
+                        format!("get_batched_gen: end ({end}) exceeds payload size ({data_size})"),
                     ));
                 }
                 file.seek(SeekFrom::Start(HEADER_SIZE + offset))?;
@@ -2313,9 +2305,7 @@ impl BStack {
             if lo + n > hi {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    format!(
-                        "cross_exchange: regions [{a}, {a_end}) and [{b}, {b_end}) overlap"
-                    ),
+                    format!("cross_exchange: regions [{a}, {a_end}) and [{b}, {b_end}) overlap"),
                 ));
             }
         }
@@ -2341,17 +2331,13 @@ impl BStack {
         if a_end > data_size {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!(
-                    "cross_exchange: region [{a}, {a_end}) exceeds payload size ({data_size})"
-                ),
+                format!("cross_exchange: region [{a}, {a_end}) exceeds payload size ({data_size})"),
             ));
         }
         if b_end > data_size {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!(
-                    "cross_exchange: region [{b}, {b_end}) exceeds payload size ({data_size})"
-                ),
+                format!("cross_exchange: region [{b}, {b_end}) exceeds payload size ({data_size})"),
             ));
         }
         if n == 0 {
@@ -2391,16 +2377,10 @@ impl BStack {
     #[cfg(all(feature = "set", feature = "atomic"))]
     pub fn copy(&self, from: u64, to: u64, n: u64) -> io::Result<()> {
         let from_end = from.checked_add(n).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "copy: from + n overflows u64",
-            )
+            io::Error::new(io::ErrorKind::InvalidInput, "copy: from + n overflows u64")
         })?;
         let to_end = to.checked_add(n).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "copy: to + n overflows u64",
-            )
+            io::Error::new(io::ErrorKind::InvalidInput, "copy: to + n overflows u64")
         })?;
         let mut file = self.lock.write().unwrap();
         let locked = self.locked.load(Ordering::Acquire);
@@ -2420,9 +2400,7 @@ impl BStack {
         if to_end > data_size {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!(
-                    "copy: destination [{to}, {to_end}) exceeds payload size ({data_size})"
-                ),
+                format!("copy: destination [{to}, {to_end}) exceeds payload size ({data_size})"),
             ));
         }
         if n == 0 {
@@ -2556,20 +2534,26 @@ impl BStack {
         if !b_buf.is_empty() && b_offset < locked {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("eq_crds: B range [{b_offset}, {b_end}) overlaps locked region [0, {locked})"),
+                format!(
+                    "eq_crds: B range [{b_offset}, {b_end}) overlaps locked region [0, {locked})"
+                ),
             ));
         }
         let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
         if !a_expected.is_empty() && a_end > data_size {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("eq_crds: A range [{a_offset}, {a_end}) exceeds payload size ({data_size})"),
+                format!(
+                    "eq_crds: A range [{a_offset}, {a_end}) exceeds payload size ({data_size})"
+                ),
             ));
         }
         if !b_buf.is_empty() && b_end > data_size {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("eq_crds: B range [{b_offset}, {b_end}) exceeds payload size ({data_size})"),
+                format!(
+                    "eq_crds: B range [{b_offset}, {b_end}) exceeds payload size ({data_size})"
+                ),
             ));
         }
         let mut a_current = vec![0u8; a_expected.len()];
@@ -2635,20 +2619,26 @@ impl BStack {
         if !b_buf.is_empty() && b_offset < locked {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("ne_crds: B range [{b_offset}, {b_end}) overlaps locked region [0, {locked})"),
+                format!(
+                    "ne_crds: B range [{b_offset}, {b_end}) overlaps locked region [0, {locked})"
+                ),
             ));
         }
         let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
         if !a_expected.is_empty() && a_end > data_size {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("ne_crds: A range [{a_offset}, {a_end}) exceeds payload size ({data_size})"),
+                format!(
+                    "ne_crds: A range [{a_offset}, {a_end}) exceeds payload size ({data_size})"
+                ),
             ));
         }
         if !b_buf.is_empty() && b_end > data_size {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("ne_crds: B range [{b_offset}, {b_end}) exceeds payload size ({data_size})"),
+                format!(
+                    "ne_crds: B range [{b_offset}, {b_end}) exceeds payload size ({data_size})"
+                ),
             ));
         }
         let mut a_current = vec![0u8; a_expected.len()];
@@ -2728,20 +2718,26 @@ impl BStack {
         if !b_buf.is_empty() && b_offset < locked {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("masked_eq_crds: B range [{b_offset}, {b_end}) overlaps locked region [0, {locked})"),
+                format!(
+                    "masked_eq_crds: B range [{b_offset}, {b_end}) overlaps locked region [0, {locked})"
+                ),
             ));
         }
         let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
         if !a_expected.is_empty() && a_end > data_size {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("masked_eq_crds: A range [{a_offset}, {a_end}) exceeds payload size ({data_size})"),
+                format!(
+                    "masked_eq_crds: A range [{a_offset}, {a_end}) exceeds payload size ({data_size})"
+                ),
             ));
         }
         if !b_buf.is_empty() && b_end > data_size {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("masked_eq_crds: B range [{b_offset}, {b_end}) exceeds payload size ({data_size})"),
+                format!(
+                    "masked_eq_crds: B range [{b_offset}, {b_end}) exceeds payload size ({data_size})"
+                ),
             ));
         }
         let mut a_current = vec![0u8; a_expected.len()];
@@ -2825,20 +2821,26 @@ impl BStack {
         if !b_buf.is_empty() && b_offset < locked {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("masked_ne_crds: B range [{b_offset}, {b_end}) overlaps locked region [0, {locked})"),
+                format!(
+                    "masked_ne_crds: B range [{b_offset}, {b_end}) overlaps locked region [0, {locked})"
+                ),
             ));
         }
         let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
         if !a_expected.is_empty() && a_end > data_size {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("masked_ne_crds: A range [{a_offset}, {a_end}) exceeds payload size ({data_size})"),
+                format!(
+                    "masked_ne_crds: A range [{a_offset}, {a_end}) exceeds payload size ({data_size})"
+                ),
             ));
         }
         if !b_buf.is_empty() && b_end > data_size {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("masked_ne_crds: B range [{b_offset}, {b_end}) exceeds payload size ({data_size})"),
+                format!(
+                    "masked_ne_crds: B range [{b_offset}, {b_end}) exceeds payload size ({data_size})"
+                ),
             ));
         }
         let mut a_current = vec![0u8; a_expected.len()];
