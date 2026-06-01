@@ -43,5 +43,11 @@ jobs:
       run: cd c && make test-first-fit
     - name: Build and test ghost-tree allocator
       run: cd c && make test-ghost-tree
+    - name: Build and test slab allocator
+      run: cd c && make test-slab
+    - name: Build and test checked-slab allocator
+      run: cd c && make test-checked-slab
+    - name: Build and test bytevec
+      run: cd c && make test-bytevec
     - name: Build alloc libraries (all feature variants)
       run: cd c && make libbstack-alloc.a libbstack-alloc-set.a
