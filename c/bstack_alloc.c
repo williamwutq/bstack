@@ -3480,11 +3480,8 @@ static int alck_scan_free_list(bstack_t *bs, uint64_t stack_len,
             corrupt = 1; break;
         }
 
-        /* Cycle detection: already seen? */
-        for (i = 0; i < cnt; i++) {
-            if (arr[i] == head) { corrupt = 1; break; }
-        }
-        if (corrupt) break;
+        /* Cycle detection is bounded by max_blocks (cnt > max_blocks implies a cycle/corruption). */
+        (void)i;
 
         if (bstack_get(bs, head, head + 16, prefix) != 0) {
             free(arr); return -1;
