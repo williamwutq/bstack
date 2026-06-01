@@ -614,11 +614,17 @@ impl BStackAllocator for CheckedSlabBStackAllocator {
         if new_n < old_n {
             // Shrink non-tail: recycle the excess blocks into the free list.
             //
-            // Ordering matters. The excess block prefixes (overhead = 0) are
-            // written first, while the still-live first block hides them, then
-            // the first block's count is shrunk (the commit point), and only
-            // then is free_head repointed. A crash before the commit leaves the
-            // original allocation intact; a crash after it leaks the excess.
+            // Ordering matters, and the commit must come first. Shrinking the
+            // first block's count is the commit point: before it the old view
+            // (old_n blocks, original payload) is fully intact; after it the new
+            // view (new_n blocks) is in force. Only once committed do we write
+            // free-list metadata into the excess blocks (which clobbers their old
+            // payload) and repoint free_head. A crash before the commit leaves
+            // the original allocation untouched; a crash after it leaks the
+            // excess blocks but never corrupts a live allocation. Writing the
+            // free run first would shred the tail payload while the header still
+            // claims old_n, leaving a recovered allocation that is neither
+            // cleanly old nor cleanly new.
             let excess_start = block_start
                 .checked_add(new_n.checked_mul(self.block_size).ok_or_else(|| {
                     io::Error::new(
@@ -629,8 +635,8 @@ impl BStackAllocator for CheckedSlabBStackAllocator {
                 .ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidInput, "free start overflows u64")
                 })?;
-            self.write_free_run(excess_start, old_n - new_n)?;
             self.write_overhead(block_start, Self::IN_USE_BIT | new_n)?;
+            self.write_free_run(excess_start, old_n - new_n)?;
             self.stack
                 .set(Self::FREE_HEAD_OFFSET, excess_start.to_le_bytes())?;
             // SAFETY: new_len fits within the first new_n retained blocks.
