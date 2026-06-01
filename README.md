@@ -968,7 +968,8 @@ Free-list mutations write block payloads before updating `free_head`. The overhe
 | Constructor | Stack | Effect |
 |---|---|---|
 | `CheckedSlabBStackAllocator::new(stack, data_size)` | **empty** | Writes the 48-byte allocator header; fails with `InvalidInput` if the stack already has data or `data_size < 8`. |
-| `CheckedSlabBStackAllocator::open(stack)` | **non-empty** | Reads and validates the stored header; fails with `InvalidData` on magic mismatch, invalid block size, or misaligned arena. |
+| `CheckedSlabBStackAllocator::open(stack)` | **non-empty** | Reads and validates the stored header, then runs `recover()` automatically. Fails with `InvalidData` on magic mismatch, invalid block size, or misaligned arena. |
+| `CheckedSlabBStackAllocator::recover()` | any | Reclaims leaked blocks and discards orphaned tails left by an unclean shutdown. Returns the count of blocks that could not be classified with certainty (`0` = fully accounted for). Called automatically by `open`; exposed for explicit inspection or re-runs. |
 
 #### Example
 

@@ -387,7 +387,9 @@
 //!   are caught at runtime before the free list can be corrupted.  Constructor
 //!   takes `data_size` (usable bytes per block, ≥ 8); the on-disk `block_size`
 //!   is `data_size + 8`.  Use [`CheckedSlabBStackAllocator::new`] to initialise
-//!   an empty stack and [`CheckedSlabBStackAllocator::open`] to reopen one.
+//!   an empty stack and [`CheckedSlabBStackAllocator::open`] to reopen one
+//!   ([`open`](CheckedSlabBStackAllocator::open) runs
+//!   [`recover`](CheckedSlabBStackAllocator::recover) automatically).
 //!   Requires both `alloc` and `set` features.
 //!
 //! * [`DebugCheckingAllocator`] — Debug/test wrapper around any

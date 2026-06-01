@@ -59,7 +59,10 @@
 //!   (block count in the low bits).  Leaked blocks are recoverable by a linear
 //!   scan; double-frees are caught before the free list can be corrupted.
 //!   Constructor takes `data_size` (usable bytes per block, ≥ 8); `block_size`
-//!   on disk is `data_size + 8`.  `Send` but not `Sync`.  *Experimental.*
+//!   on disk is `data_size + 8`.  [`open`](CheckedSlabBStackAllocator::open)
+//!   calls [`recover`](CheckedSlabBStackAllocator::recover) automatically to
+//!   reclaim leaked blocks and repair orphaned tails from unclean shutdowns.
+//!   `Send` but not `Sync`.  *Experimental.*
 //!
 //! * [`BStackByteVec`] — a growable byte (`u8`) vector backed by a
 //!   [`BStack`] allocation (requires both `alloc` **and** `set`).  Mirrors the
