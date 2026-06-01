@@ -135,11 +135,13 @@
 //! |-----------|-----------------------|--------------|
 //! | `push`, `extend`, `pop`, `pop_into`, `discard` | write | write |
 //! | `set`, `zero` *(feature)* | write | write |
-//! | `atrunc`, `splice`, `splice_into`, `try_extend` *(feature: atomic)* | write | write |
+//! | `atrunc`, `splice`, `splice_into`, `try_extend`, `try_extend_zeros` *(feature: atomic)* | write | write |
 //! | `try_discard(s, n > 0)` *(feature: atomic)* | write | write |
 //! | `try_discard(s, 0)` *(feature: atomic)* | **read** | **read** |
+//! | `get_batched`, `get_batched_into`, `get_batched_gen` *(feature: atomic)* | **read** | write |
 //! | `swap`, `swap_into`, `cas` *(features: set+atomic)* | write | write |
-//! | `process` *(features: set+atomic)* | write | write |
+//! | `cross_exchange`, `copy`, `process` *(features: set+atomic)* | write | write |
+//! | `eq_crds`, `ne_crds`, `masked_eq_crds`, `masked_ne_crds` *(features: set+atomic)* | write | write |
 //! | `replace` *(feature: atomic)* | write | write |
 //! | `peek`, `peek_into`, `get`, `get_into` | **read** | write |
 //! | `len` | read | read |
@@ -190,9 +192,13 @@
 //!
 //! * **Write protection.**  [`set`](BStack::set), [`zero`](BStack::zero),
 //!   [`swap`](BStack::swap), [`swap_into`](BStack::swap_into),
-//!   [`cas`](BStack::cas), and [`process`](BStack::process) return
-//!   [`io::ErrorKind::InvalidInput`] when their target range overlaps the
-//!   locked region.  [`atrunc`](BStack::atrunc), [`splice`](BStack::splice),
+//!   [`cas`](BStack::cas), [`process`](BStack::process),
+//!   [`cross_exchange`](BStack::cross_exchange), [`copy`](BStack::copy)
+//!   (destination only), [`eq_crds`](BStack::eq_crds),
+//!   [`ne_crds`](BStack::ne_crds), [`masked_eq_crds`](BStack::masked_eq_crds),
+//!   and [`masked_ne_crds`](BStack::masked_ne_crds) (region B) return
+//!   [`io::ErrorKind::InvalidInput`] when their write target range overlaps
+//!   the locked region.  [`atrunc`](BStack::atrunc), [`splice`](BStack::splice),
 //!   [`splice_into`](BStack::splice_into), and [`replace`](BStack::replace)
 //!   return the same error when the operation would modify bytes inside it.
 //!
@@ -314,7 +320,7 @@
 //! |---------|-------------|
 //! | `set`   | Enables [`BStack::set`] and [`BStack::zero`] — in-place overwrite of existing payload bytes (or with zeros) without changing the file size. |
 //! | `alloc` | Enables [`BStackAllocator`], [`BStackBulkAllocator`], [`BStackSlice`], [`BStackSliceReader`], and [`LinearBStackAllocator`] — region-based allocation over a `BStack` payload. Combined with `set`, also enables [`BStackSliceWriter`], [`FirstFitBStackAllocator`], [`GhostTreeBstackAllocator`], and [`BStackByteVec`]. |
-//! | `atomic` | Enables [`BStack::atrunc`], [`BStack::splice`], [`BStack::splice_into`], [`BStack::try_extend`], [`BStack::try_discard`], and [`BStack::replace`] — compound read-modify-write operations that hold the write lock across what would otherwise be separate calls. Combined with `set`, also enables [`BStack::swap`], [`BStack::swap_into`], [`BStack::cas`], and [`BStack::process`]. |
+//! | `atomic` | Enables [`BStack::atrunc`], [`BStack::splice`], [`BStack::splice_into`], [`BStack::try_extend`], [`BStack::try_extend_zeros`], [`BStack::try_discard`], [`BStack::replace`], [`BStack::get_batched`], [`BStack::get_batched_into`], and [`BStack::get_batched_gen`] — compound read-modify-write operations that hold the lock across what would otherwise be separate calls. Combined with `set`, also enables [`BStack::swap`], [`BStack::swap_into`], [`BStack::cas`], [`BStack::process`], [`BStack::cross_exchange`], [`BStack::copy`], [`BStack::eq_crds`], [`BStack::ne_crds`], [`BStack::masked_eq_crds`], and [`BStack::masked_ne_crds`]. |
 //!
 //! Enable with:
 //!
@@ -1732,8 +1738,9 @@ impl BStack {
     ///
     /// # Errors
     ///
-    /// Propagates any I/O error from `set_len`, `write_committed_len`, or
-    /// `durable_sync`.
+    /// Returns [`io::ErrorKind::InvalidInput`] if adding `n` to the current
+    /// payload size would overflow `u64`.  Propagates any I/O error from
+    /// `set_len`, `write_committed_len`, or `durable_sync`.
     #[cfg(feature = "atomic")]
     pub fn try_extend_zeros(&self, s: u64, n: u64) -> io::Result<bool> {
         let mut file = self.lock.write().unwrap();
@@ -1745,7 +1752,12 @@ impl BStack {
         if n == 0 {
             return Ok(true);
         }
-        let new_len = data_size + n;
+        let new_len = data_size.checked_add(n).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "try_extend_zeros: data_size + n overflows u64",
+            )
+        })?;
         file.set_len(HEADER_SIZE + new_len)?;
         if let Err(e) = write_committed_len(&mut file, new_len).and_then(|_| durable_sync(&file)) {
             let _ = file.set_len(file_end);
@@ -1905,8 +1917,9 @@ impl BStack {
     ///
     /// # Errors
     ///
-    /// Returns [`io::ErrorKind::InvalidInput`] if any read would extend beyond
-    /// the current payload size.
+    /// Returns [`io::ErrorKind::InvalidInput`] if any `offset + buf.len()`
+    /// overflows `u64` or if any read would extend beyond the current payload
+    /// size.
     #[cfg(feature = "atomic")]
     pub fn get_batched_into<'a, I>(&self, bufs: I) -> io::Result<()>
     where
@@ -1921,7 +1934,12 @@ impl BStack {
             let file = self.lock.read().unwrap();
             let data_size = file.metadata()?.len().saturating_sub(HEADER_SIZE);
             for (ptr, buf) in bufs {
-                let end = ptr + buf.len() as u64;
+                let end = ptr.checked_add(buf.len() as u64).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "get_batched_into: offset + buf.len() overflows u64",
+                    )
+                })?;
                 if end > data_size {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
@@ -1937,7 +1955,12 @@ impl BStack {
             let mut file = self.lock.write().unwrap();
             let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
             for (ptr, buf) in bufs {
-                let end = ptr + buf.len() as u64;
+                let end = ptr.checked_add(buf.len() as u64).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "get_batched_into: offset + buf.len() overflows u64",
+                    )
+                })?;
                 if end > data_size {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
@@ -2594,8 +2617,11 @@ impl BStack {
     ///
     /// Like [`eq_crds`](Self::eq_crds) but performs the region-B swap only
     /// when the `a_expected.len()` bytes at `a_offset` are **not equal** to
-    /// `a_expected`.  Returns `Ok(None)` if the bytes compare equal (swap
-    /// suppressed).
+    /// `a_expected`.  If the bytes are not equal, atomically swaps region B:
+    /// reads `b_buf.len()` bytes from `b_offset`, writes the contents of
+    /// `b_buf` there, and returns the old region-B bytes as
+    /// `Ok(Some(Vec<u8>))`.  Returns `Ok(None)` if the bytes compare equal
+    /// (swap suppressed).
     ///
     /// # Feature flags
     ///
@@ -2611,9 +2637,10 @@ impl BStack {
         a_offset: u64,
         a_expected: impl AsRef<[u8]>,
         b_offset: u64,
-        b_buf: &mut [u8],
+        b_buf: impl AsRef<[u8]>,
     ) -> io::Result<Option<Vec<u8>>> {
         let a_expected = a_expected.as_ref();
+        let b_buf = b_buf.as_ref();
         let a_len = a_expected.len() as u64;
         let b_len = b_buf.len() as u64;
         let a_end = a_offset.checked_add(a_len).ok_or_else(|| {
@@ -2681,7 +2708,11 @@ impl BStack {
     /// AND mask before comparing: for each byte `i`, the condition is
     /// `(A[i] & mask[i]) == (a_expected[i] & mask[i])`.  `mask` and
     /// `a_expected` must have the same length, which determines how many
-    /// bytes are read from region A.
+    /// bytes are read from region A.  If the masked condition holds,
+    /// atomically swaps region B: reads `b_buf.len()` bytes from `b_offset`,
+    /// writes the contents of `b_buf` there, and returns the old region-B
+    /// bytes as `Ok(Some(Vec<u8>))`.  Returns `Ok(None)` if the masked
+    /// condition does not hold.
     ///
     /// # Feature flags
     ///
@@ -2699,10 +2730,11 @@ impl BStack {
         mask: impl AsRef<[u8]>,
         a_expected: impl AsRef<[u8]>,
         b_offset: u64,
-        b_buf: &mut [u8],
+        b_buf: impl AsRef<[u8]>,
     ) -> io::Result<Option<Vec<u8>>> {
         let mask = mask.as_ref();
         let a_expected = a_expected.as_ref();
+        let b_buf = b_buf.as_ref();
         if mask.len() != a_expected.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -2784,6 +2816,9 @@ impl BStack {
     /// Like [`masked_eq_crds`](Self::masked_eq_crds) but performs the
     /// region-B swap only when **any** masked byte differs:
     /// `(A[i] & mask[i]) != (a_expected[i] & mask[i])` for at least one `i`.
+    /// If any masked byte differs, atomically swaps region B: reads
+    /// `b_buf.len()` bytes from `b_offset`, writes the contents of `b_buf`
+    /// there, and returns the old region-B bytes as `Ok(Some(Vec<u8>))`.
     /// Returns `Ok(None)` if all masked bytes compare equal (swap suppressed).
     ///
     /// # Feature flags
@@ -2802,10 +2837,11 @@ impl BStack {
         mask: impl AsRef<[u8]>,
         a_expected: impl AsRef<[u8]>,
         b_offset: u64,
-        b_buf: &mut [u8],
+        b_buf: impl AsRef<[u8]>,
     ) -> io::Result<Option<Vec<u8>>> {
         let mask = mask.as_ref();
         let a_expected = a_expected.as_ref();
+        let b_buf = b_buf.as_ref();
         if mask.len() != a_expected.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
