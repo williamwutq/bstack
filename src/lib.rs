@@ -380,6 +380,14 @@
 //!   [`SlabBStackAllocator::open`] to reopen an existing one.
 //!   Requires both `alloc` and `set` features.
 //!
+//! * [`CheckedSlabBStackAllocator`] — **Experimental.** Crash-recoverable
+//!   variant of [`SlabBStackAllocator`].  Prefixes every block with an 8-byte
+//!   overhead field (zero when free, high bit set with a block count when in
+//!   use) so leaked blocks are recoverable by a linear scan and double-frees
+//!   are caught at runtime before the free list can be corrupted.  The slice
+//!   returned to the caller covers `block_size − 8` usable bytes per block.
+//!   Requires both `alloc` and `set` features.
+//!
 //! * [`DebugCheckingAllocator`] — Debug/test wrapper around any
 //!   [`BStackAllocator`].  Tracks allocated and freed regions in memory and
 //!   panics on overlapping allocations, double-frees, or partial frees.
@@ -459,8 +467,8 @@ pub use alloc::{
 };
 #[cfg(all(feature = "alloc", feature = "set"))]
 pub use alloc::{
-    BStackByteVec, BStackByteVecIter, BStackSliceWriter, FirstFitBStackAllocator,
-    GhostTreeBstackAllocator, SlabBStackAllocator,
+    BStackByteVec, BStackByteVecIter, BStackSliceWriter, CheckedSlabBStackAllocator,
+    FirstFitBStackAllocator, GhostTreeBstackAllocator, SlabBStackAllocator,
 };
 
 #[cfg(all(feature = "guarded", feature = "atomic"))]
