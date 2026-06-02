@@ -101,10 +101,12 @@ const ALCK_MAGIC_PREFIX: [u8; 6] = *b"ALCK\x00\x01";
 /// then write `free_head` as separate [`BStack`] calls — a TOCTOU race under
 /// concurrent `&self` access.
 ///
-/// With the `atomic` feature it **is `Sync`**.  An internal [`Mutex`] serialises
-/// all compound operations that span multiple [`BStack`] calls: free-list
-/// pop/push, tail-length checks preceding `extend` or `discard`, and the
-/// public [`recover`](Self::recover) method.
+/// With the `atomic` feature it **is `Sync`**. An internal [`Mutex`] serialises
+/// compound allocator operations that span multiple [`BStack`] calls (free-list
+/// pop/push and the public [`recover`](Self::recover) scan). Tail grow/shrink
+/// paths use [`BStack::try_extend_zeros`] / [`BStack::try_discard`] to perform
+/// check-and-act atomically under `BStack`'s write lock without holding the
+/// allocator mutex.
 ///
 /// ```
 /// fn assert_send<T: Send>() {}

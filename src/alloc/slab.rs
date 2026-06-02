@@ -97,10 +97,11 @@ const ALSL_MAGIC_PREFIX: [u8; 6] = *b"ALSL\x00\x01";
 /// TOCTOU race under concurrent `&self` access that can result in two callers
 /// receiving the same block.
 ///
-/// With the `atomic` feature it **is `Sync`**.  An internal [`Mutex`] serialises
-/// all compound operations that span multiple [`BStack`] calls: free-list
-/// pop/push and the tail-length check that precedes any `extend` or `discard`.
-///
+/// With the `atomic` feature it **is `Sync`**. An internal [`Mutex`] serialises
+/// free-list pop/push operations that require multiple [`BStack`] calls.
+/// Tail grow/shrink paths use [`BStack::try_extend_zeros`] / [`BStack::try_discard`]
+/// to perform check-and-act atomically under `BStack`'s write lock without holding
+/// the allocator mutex.
 /// ```
 /// fn assert_send<T: Send>() {}
 /// assert_send::<bstack::SlabBStackAllocator>();
