@@ -7,6 +7,9 @@
  *
  * A pthread_barrier forces thread 2 to attempt its write only after thread 1
  * has already committed, guaranteeing that thread 2's empty cache is stale.
+ * 
+ * Note that XOR checksums are not collision-resistant, so this example is only
+ * intended to demonstrate the pattern, not to provide strong integrity guarantees.
  *
  * Requires: -DBSTACK_FEATURE_SET -DBSTACK_FEATURE_ATOMIC
  *
