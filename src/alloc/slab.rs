@@ -900,4 +900,120 @@ mod tests {
         let s2 = unsafe { crate::alloc::BStackSlice::from_raw_parts(&alloc2, offset, 5) };
         assert_eq!(s2.read().unwrap(), b"hello");
     }
+
+    // ── concurrent (feature = "atomic") ───────────────────────────────────────
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn concurrent_alloc_dealloc_no_live_duplicates() {
+        use std::collections::HashSet;
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+
+        // Verify that concurrent alloc/dealloc never hands the same block to
+        // two callers simultaneously.  Each thread claims a block, inserts its
+        // offset into a shared live-set (asserting uniqueness), writes and
+        // reads back its thread id, then removes the offset and deallocates.
+        // Slab has no per-block overhead, so a free-list race would silently
+        // produce a duplicate offset rather than an error; the HashSet catches
+        // that.
+        const THREADS: usize = 8;
+        const ROUNDS: usize = 200;
+
+        let (stack, path) = empty_stack();
+        let _g = Guard(path);
+        let alloc = Arc::new(SlabBStackAllocator::new(stack, 16).unwrap());
+        let live: Arc<Mutex<HashSet<u64>>> = Arc::new(Mutex::new(HashSet::new()));
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|tid| {
+                let alloc = Arc::clone(&alloc);
+                let live = Arc::clone(&live);
+                thread::spawn(move || {
+                    let a: &SlabBStackAllocator = &alloc;
+                    for _ in 0..ROUNDS {
+                        let slice = a.alloc(16).unwrap();
+                        let off = slice.start();
+                        {
+                            let mut set = live.lock().unwrap();
+                            assert!(set.insert(off), "duplicate live offset {off}");
+                        }
+                        slice.write(&[tid as u8; 16]).unwrap();
+                        let data = slice.read().unwrap();
+                        assert_eq!(data, vec![tid as u8; 16]);
+                        {
+                            let mut set = live.lock().unwrap();
+                            set.remove(&off);
+                        }
+                        a.dealloc(slice).unwrap();
+                    }
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn concurrent_realloc_hammers_tail_paths() {
+        use std::sync::Arc;
+        use std::thread;
+
+        // T threads each own one allocation and repeatedly grow then shrink it.
+        // Whichever allocation sits at the tail exercises try_extend_zeros /
+        // try_discard; the others hit the non-tail copy-grow / block-recycle
+        // paths.  Both branches are exercised on every round because threads
+        // race for the tail.  Verify each thread's data survives every round.
+        //
+        // With block_size = 16:
+        //   alloc(12) → 1 block; alloc(17) → 2 blocks; alloc(33) → 3 blocks.
+        const THREADS: usize = 6;
+        const ROUNDS: usize = 150;
+        const SMALL: u64 = 12; // fits in 1 block (block_size = 16)
+        const LARGE: u64 = 33; // needs 3 blocks
+
+        let (stack, path) = empty_stack();
+        let _g = Guard(path);
+        let alloc = Arc::new(SlabBStackAllocator::new(stack, 16).unwrap());
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|tid| {
+                let alloc = Arc::clone(&alloc);
+                thread::spawn(move || {
+                    let a: &SlabBStackAllocator = &alloc;
+                    let mut slice = a.alloc(SMALL).unwrap();
+                    slice.write(&[tid as u8; SMALL as usize]).unwrap();
+
+                    for _ in 0..ROUNDS {
+                        // Grow: tail → try_extend_zeros; non-tail → copy to new region.
+                        slice = a.realloc(slice, LARGE).unwrap();
+                        let data = slice.read().unwrap();
+                        assert_eq!(
+                            &data[..SMALL as usize],
+                            &[tid as u8; SMALL as usize],
+                            "data corrupted after grow (tid {tid})",
+                        );
+
+                        // Shrink: tail → try_discard; non-tail → recycle excess blocks.
+                        slice = a.realloc(slice, SMALL).unwrap();
+                        let data = slice.read().unwrap();
+                        assert_eq!(
+                            data,
+                            vec![tid as u8; SMALL as usize],
+                            "data corrupted after shrink (tid {tid})",
+                        );
+                    }
+
+                    a.dealloc(slice).unwrap();
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
+    }
 }
