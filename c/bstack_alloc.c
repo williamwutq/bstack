@@ -2952,7 +2952,7 @@ static void bstack_alloc_lock_destroy(void *lock)
 #define SLAB_MIN_BLOCK_SIZE    UINT64_C(8)
 #define SLAB_SENTINEL          UINT64_C(0)
 
-static const uint8_t alsl_magic[8]        = {'A','L','S','L',0,1,0,0};
+static const uint8_t alsl_magic[8]        = {'A','L','S','L',0,1,1,0};
 static const uint8_t alsl_magic_prefix[6] = {'A','L','S','L',0,1};
 
 /* ---- helpers ----------------------------------------------------------- */
@@ -3489,7 +3489,7 @@ uint64_t slab_bstack_allocator_block_size(const slab_bstack_allocator_t *alloc)
 /* Maximum number of suspect blocks analysed in resync_tail before giving up. */
 #define ALCK_MAX_RECOVER_REGION ((size_t)(1u << 26))
 
-static const uint8_t alck_magic[8]        = {'A','L','C','K',0,1,0,0};
+static const uint8_t alck_magic[8]        = {'A','L','C','K',0,1,1,0};
 static const uint8_t alck_magic_prefix[6] = {'A','L','C','K',0,1};
 
 /* ---- LE helpers (reuse read_le64 / write_le64 already defined above) --- */
