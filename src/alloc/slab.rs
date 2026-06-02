@@ -6,7 +6,13 @@
 
 use super::{BStackAllocator, BStackSlice};
 use crate::BStack;
-use core::{cell::Cell, marker::PhantomData, num::NonZeroU64};
+#[cfg(not(feature = "atomic"))]
+use core::cell::Cell;
+#[cfg(not(feature = "atomic"))]
+use core::marker::PhantomData;
+use core::num::NonZeroU64;
+#[cfg(feature = "atomic")]
+use std::sync::Mutex;
 use std::{fmt, io};
 
 #[cfg(feature = "set")]
@@ -83,11 +89,31 @@ const ALSL_MAGIC_PREFIX: [u8; 6] = *b"ALSL\x00\x01";
 ///
 /// # Thread safety
 ///
-/// `SlabBStackAllocator` is only `Send` but not `Sync`: concurrent access to
-/// the same allocator must be externally synchronized. Free-list mutations
+/// `SlabBStackAllocator` is always **`Send`** — ownership can be transferred
+/// to another thread.
+///
+/// Without the `atomic` feature it is **not `Sync`**: free-list mutations
 /// require a read then a write of `free_head` as separate `BStack` calls — a
 /// TOCTOU race under concurrent `&self` access that can result in two callers
 /// receiving the same block.
+///
+/// With the `atomic` feature it **is `Sync`**.  An internal [`Mutex`] serialises
+/// all compound operations that span multiple [`BStack`] calls: free-list
+/// pop/push and the tail-length check that precedes any `extend` or `discard`.
+///
+/// ```
+/// fn assert_send<T: Send>() {}
+/// assert_send::<bstack::SlabBStackAllocator>();
+/// ```
+///
+/// Without `atomic` the type is `!Sync` (this fails to compile); with `atomic`
+/// the internal `Mutex` makes it `Sync` (this compiles):
+///
+#[cfg_attr(not(feature = "atomic"), doc = "```compile_fail")]
+#[cfg_attr(feature = "atomic", doc = "```")]
+/// fn assert_sync<T: Sync>() {}
+/// assert_sync::<bstack::SlabBStackAllocator>();
+/// ```
 ///
 /// # Feature flags
 ///
@@ -101,7 +127,11 @@ pub struct SlabBStackAllocator {
     stack: BStack,
     /// Cached from the on-disk header; fixed for the lifetime of the allocator.
     block_size: u64,
-    // Mark as !Sync to prevent concurrent access to the free list.
+    /// Serialises multi-step free-list and tail operations when `atomic` is
+    /// enabled, making the allocator `Sync`.
+    #[cfg(feature = "atomic")]
+    lock: Mutex<()>,
+    #[cfg(not(feature = "atomic"))]
     _not_sync: PhantomData<Cell<()>>,
 }
 
@@ -162,6 +192,9 @@ impl SlabBStackAllocator {
         Ok(Self {
             stack,
             block_size,
+            #[cfg(feature = "atomic")]
+            lock: Mutex::new(()),
+            #[cfg(not(feature = "atomic"))]
             _not_sync: PhantomData,
         })
     }
@@ -244,6 +277,9 @@ impl SlabBStackAllocator {
         Ok(Self {
             stack,
             block_size: stored_block_size,
+            #[cfg(feature = "atomic")]
+            lock: Mutex::new(()),
+            #[cfg(not(feature = "atomic"))]
             _not_sync: PhantomData,
         })
     }
@@ -415,6 +451,9 @@ impl BStackAllocator for SlabBStackAllocator {
             return Ok(BStackSlice::empty(self));
         }
 
+        #[cfg(feature = "atomic")]
+        let _guard = self.lock.lock().unwrap();
+
         if len <= self.block_size {
             if let Some(block) = self.pop_free_block()? {
                 // SAFETY: block is a valid block_size region from pop_free_block
@@ -457,7 +496,6 @@ impl BStackAllocator for SlabBStackAllocator {
                 "deallocation size overflows u64",
             )
         })?;
-        let current_tail = self.stack.len()?;
         let slice_end = slice.start().checked_add(backing_size).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -465,7 +503,10 @@ impl BStackAllocator for SlabBStackAllocator {
             )
         })?;
 
-        if slice.len() > self.block_size && slice_end == current_tail {
+        #[cfg(feature = "atomic")]
+        let _guard = self.lock.lock().unwrap();
+
+        if slice.len() > self.block_size && slice_end == self.stack.len()? {
             return self.stack.discard(backing_size);
         }
 
@@ -524,12 +565,16 @@ impl BStackAllocator for SlabBStackAllocator {
                 "new allocation size overflows u64",
             )
         })?;
-        let current_tail = self.stack.len()?;
-        let is_tail = slice.start().checked_add(old_backing).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "tail check overflows u64")
-        })? == current_tail;
 
-        if is_tail {
+        let checked_len = slice.start().checked_add(old_backing).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "tail check overflows u64")
+        })?;
+
+        #[cfg(feature = "atomic")]
+        let _guard = self.lock.lock().unwrap();
+        let current_tail = self.stack.len()?;
+
+        if checked_len == current_tail {
             if new_n > old_n {
                 self.stack.extend(new_backing - old_backing)?;
                 if new_len > slice.len() {
@@ -580,6 +625,22 @@ impl BStackAllocator for SlabBStackAllocator {
         self.push_free_blocks(slice.start(), old_n)?;
         // SAFETY: new_len fits within the new_n blocks of the newly pushed region
         Ok(unsafe { BStackSlice::from_raw_parts(self, new_ptr, new_len) })
+    }
+}
+
+#[cfg(all(test, feature = "set"))]
+mod _assertions {
+    use super::SlabBStackAllocator;
+    fn _send()
+    where
+        SlabBStackAllocator: Send,
+    {
+    }
+    #[cfg(feature = "atomic")]
+    fn _sync()
+    where
+        SlabBStackAllocator: Sync,
+    {
     }
 }
 
