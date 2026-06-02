@@ -842,7 +842,7 @@ bstack = { version = "0.2", features = ["alloc", "set"] }
   user data       offset 48 (arena start)
 ```
 
-* **`magic`** — `"ALSL\x00\x01\x00\x00"` (version 0.1).
+* **`magic`** — `"ALSL\x00\x01\x01\x00"` (version 0.1.1).
 * **`block_size`** — fixed size of every arena block, little-endian `u64`.
 * **`free_head`** — payload offset of the first free block's first byte, or `0` (sentinel).
 * **Free block** — first 8 bytes hold the payload offset of the next free block (`u64` LE, `0` = end of list); remaining bytes belong to the caller when live.
@@ -930,7 +930,7 @@ bstack = { version = "0.2", features = ["alloc", "set"] }
   user data       offset 48 (arena start)
 ```
 
-* **`magic`** — `"ALCK\x00\x01\x00\x00"` (version 0.1).
+* **`magic`** — `"ALCK\x00\x01\x01\x00"` (version 0.1.1).
 * **`block_size`** — `data_size + 8`, little-endian `u64`.
 * **`free_head`** — block start offset of the first free block, or `0` (sentinel; no valid block starts at offset 0).
 

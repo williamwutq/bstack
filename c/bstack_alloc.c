@@ -4267,61 +4267,80 @@ static int alck_vt_realloc(bstack_allocator_t *base, bstack_slice_t s,
             }
         }
 
-        /* Shrink path (new_n < old_n).  The lock covers the tail check +
-         * discard and the non-tail free-list update so that the overhead write,
-         * tail-length read, and discard/free-list push are atomic w.r.t. other
-         * threads. */
+        /* Shrink path (new_n < old_n).  The lock covers the overhead write,
+         * tail check, and non-tail free-list update so those steps are atomic
+         * w.r.t. other threads. */
         {
-            uint64_t cur_tail;
             uint64_t delta = old_backing - new_backing;
+            uint64_t excess_start;
+            int r;
 #if UINT64_MAX > SIZE_MAX
             if (delta > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
 #endif
 
             FF_LOCK(a);
 
-            if (bstack_len(a->bs, &cur_tail) != 0) { FF_UNLOCK(a); return -1; }
-
-            if (sentinel == cur_tail) {
-                /* Tail shrink: write the new overhead first so a crash before
-                 * the discard leaves an orphaned (but safely unreferenced) tail
-                 * region rather than an overhead that claims more blocks than
-                 * the file contains. */
-                if (alck_write_overhead(a->bs, block_start,
-                                        ALCK_IN_USE_BIT | new_n) != 0) {
-                    FF_UNLOCK(a); return -1;
-                }
-                if (bstack_discard(a->bs, (size_t)delta) != 0) {
-                    FF_UNLOCK(a); return -1;
-                }
-                FF_UNLOCK(a);
-                out->allocator = base; out->offset = s.offset; out->len = new_len;
-                return 0;
+            /* Overhead is the commit point for both tail and non-tail paths:
+             * write it first so a crash after this point leaves an orphaned
+             * (but safely unreferenced) tail region or leaked blocks that
+             * recover() can reclaim, rather than an overhead that claims more
+             * blocks than the file contains. */
+            if (alck_write_overhead(a->bs, block_start,
+                                    ALCK_IN_USE_BIT | new_n) != 0) {
+                FF_UNLOCK(a); return -1;
             }
 
-            /* Shrink non-tail: commit overhead first (the commit point), then
-             * write free-list metadata into the excess blocks. */
+            /* Tail shrink: try_discard atomically checks tail == sentinel and
+             * removes the excess under bstack's write lock, so no other thread
+             * can race between the check and the truncation.  On failure the
+             * slice is not at the tail; fall through to recycle excess blocks. */
+#ifdef BSTACK_FEATURE_ATOMIC
             {
-                uint64_t excess_start;
-                int r;
-                if (new_n > UINT64_MAX / a->block_size) {
-                    FF_UNLOCK(a); errno = EINVAL; return -1;
-                }
-                excess_start = block_start + new_n * a->block_size;
-                if (alck_write_overhead(a->bs, block_start,
-                                        ALCK_IN_USE_BIT | new_n) != 0) {
+                int ok = 0;
+                if (bstack_try_discard(a->bs, sentinel, (size_t)delta,
+                                       &ok) != 0) {
                     FF_UNLOCK(a); return -1;
                 }
-                if (alck_write_free_run(a->bs, excess_start,
-                                        old_n - new_n, a->block_size) != 0) {
-                    FF_UNLOCK(a); return -1;
+                if (ok) {
+                    FF_UNLOCK(a);
+                    out->allocator = base; out->offset = s.offset;
+                    out->len = new_len;
+                    return 0;
                 }
-                r = alck_write_free_head(a->bs, excess_start);
-                FF_UNLOCK(a);
-                if (r != 0) return -1;
-                out->allocator = base; out->offset = s.offset; out->len = new_len;
-                return 0;
             }
+#else
+            {
+                uint64_t cur_tail;
+                if (bstack_len(a->bs, &cur_tail) != 0) {
+                    FF_UNLOCK(a); return -1;
+                }
+                if (sentinel == cur_tail) {
+                    if (bstack_discard(a->bs, (size_t)delta) != 0) {
+                        FF_UNLOCK(a); return -1;
+                    }
+                    FF_UNLOCK(a);
+                    out->allocator = base; out->offset = s.offset;
+                    out->len = new_len;
+                    return 0;
+                }
+            }
+#endif
+
+            /* Shrink non-tail: overhead already written (commit point); write
+             * free-list metadata into the excess blocks and repoint free_head. */
+            if (new_n > UINT64_MAX / a->block_size) {
+                FF_UNLOCK(a); errno = EINVAL; return -1;
+            }
+            excess_start = block_start + new_n * a->block_size;
+            if (alck_write_free_run(a->bs, excess_start,
+                                    old_n - new_n, a->block_size) != 0) {
+                FF_UNLOCK(a); return -1;
+            }
+            r = alck_write_free_head(a->bs, excess_start);
+            FF_UNLOCK(a);
+            if (r != 0) return -1;
+            out->allocator = base; out->offset = s.offset; out->len = new_len;
+            return 0;
         }
     }
 }

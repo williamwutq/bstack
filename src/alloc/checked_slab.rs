@@ -1085,18 +1085,36 @@ impl BStackAllocator for CheckedSlabBStackAllocator {
             return Ok(new_slice);
         }
 
-        // Shrink path (new_n < old_n). Lock covers the tail check + discard and
-        // the non-tail free-list update.
+        // Shrink path (new_n < old_n). Lock covers the overhead write, tail
+        // check, and non-tail free-list update.
         #[cfg(feature = "atomic")]
         let _guard = self.lock.lock().unwrap();
 
-        let current_tail = self.stack.len()?;
+        // Overhead is the commit point for both tail and non-tail paths: write
+        // it first so a crash after this point leaves an orphaned (but safely
+        // unreferenced) tail region or leaked blocks that recover() can reclaim,
+        // rather than an overhead that claims more blocks than the file contains.
+        self.write_overhead(block_start, Self::IN_USE_BIT | new_n)?;
 
-        if sentinel == current_tail {
-            // Tail shrink: write the new overhead first so a crash before the
-            // discard leaves an orphaned (but safely unreferenced) tail region
-            // rather than an overhead that claims more blocks than the file contains.
-            self.write_overhead(block_start, Self::IN_USE_BIT | new_n)?;
+        // Tail shrink: try_discard atomically checks tail == sentinel and
+        // removes the excess under bstack's write lock, so no other thread can
+        // race between the check and the truncation. On failure the slice is
+        // not at the tail; fall through to recycle the excess blocks.
+        #[cfg(feature = "atomic")]
+        if self
+            .stack
+            .try_discard(sentinel, old_backing - new_backing)?
+        {
+            // SAFETY:
+            // 1. No overflow: slice.start() + new_len ≤ block_start + OVERHEAD + new_n * block_size − OVERHEAD ≤ u64::MAX
+            //    because new_n * block_size ≤ new_backing ≤ stack_len.
+            // 2. In bounds: tail discarded down to new_backing.
+            // 3. Alloc origin: slice.start() is unchanged; overhead records new_n.
+            return Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) });
+        }
+
+        #[cfg(not(feature = "atomic"))]
+        if sentinel == self.stack.len()? {
             self.stack.discard(old_backing - new_backing)?;
             // SAFETY:
             // 1. No overflow: slice.start() + new_len ≤ block_start + OVERHEAD + new_n * block_size − OVERHEAD ≤ u64::MAX
@@ -1119,6 +1137,8 @@ impl BStackAllocator for CheckedSlabBStackAllocator {
         // free run first would shred the tail payload while the header still
         // claims old_n, leaving a recovered allocation that is neither
         // cleanly old nor cleanly new.
+        //
+        // Overhead was already written above (the commit point).
         let excess_start = block_start
             .checked_add(new_n.checked_mul(self.block_size).ok_or_else(|| {
                 io::Error::new(
@@ -1129,7 +1149,6 @@ impl BStackAllocator for CheckedSlabBStackAllocator {
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "free start overflows u64")
             })?;
-        self.write_overhead(block_start, Self::IN_USE_BIT | new_n)?;
         self.write_free_run(excess_start, old_n - new_n)?;
         self.stack
             .set(Self::FREE_HEAD_OFFSET, excess_start.to_le_bytes())?;
