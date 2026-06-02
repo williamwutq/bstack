@@ -718,8 +718,8 @@ bstack_t *ghost_tree_bstack_allocator_into_stack(ghost_tree_bstack_allocator_t *
  *
  * Thread safety: without -DBSTACK_FEATURE_ATOMIC, an allocator handle must be
  * used from one thread at a time — free-list mutations are a read then a write
- * of free_head as separate bstack calls, a TOCTOU race under concurrent &self
- * access that can result in two callers receiving the same block.  With
+ * of free_head as separate bstack calls, a TOCTOU race under concurrent access
+ * that can result in two callers receiving the same block.  With
  * -DBSTACK_FEATURE_ATOMIC the handle owns an in-memory mutex (lock) that
  * serialises all compound operations spanning multiple bstack calls: free-list
  * pop/push and the tail-length checks preceding extend or discard.  bstack
