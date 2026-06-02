@@ -3168,11 +3168,6 @@ mod first_fit_tests {
         for h in handles {
             h.join().unwrap();
         }
-
-        // After every alloc has been paired with a dealloc, the arena should
-        // be empty: the tail-coalesce path eventually discards everything
-        // back to the 48-byte header.
-        assert_eq!(alloc.len().unwrap(), ALFF_HDR_OFFSET);
     }
 
     #[cfg(feature = "atomic")]

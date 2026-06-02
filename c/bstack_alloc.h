@@ -696,7 +696,7 @@ bstack_t *ghost_tree_bstack_allocator_into_stack(ghost_tree_bstack_allocator_t *
  *
  * On-disk layout (all within the bstack payload):
  *   [0..24)  — reserved (OFFSET_SIZE; available for caller use)
- *   [24..32) — magic: "ALSL\x00\x01\x00\x00"
+ *   [24..32) — magic: "ALSL\x00\x01\x01\x00"
  *   [32..40) — block_size (8 B LE)
  *   [40..48) — free_head  (8 B LE) — payload offset of first free block, or 0
  *   [48..)   — block arena
@@ -716,6 +716,16 @@ bstack_t *ghost_tree_bstack_allocator_into_stack(ghost_tree_bstack_allocator_t *
  * next-pointer then update free_head).  A crash between the two leaks the
  * block being added or removed but leaves the rest of the list intact.
  *
+ * Thread safety: without -DBSTACK_FEATURE_ATOMIC, an allocator handle must be
+ * used from one thread at a time — free-list mutations are a read then a write
+ * of free_head as separate bstack calls, a TOCTOU race under concurrent access
+ * that can result in two callers receiving the same block.  With
+ * -DBSTACK_FEATURE_ATOMIC the handle owns an in-memory mutex (lock) that
+ * serialises all compound operations spanning multiple bstack calls: free-list
+ * pop/push and the tail-length checks preceding extend or discard.  bstack
+ * extend / discard are internally serialised by bstack's own write lock; the
+ * allocator lock is not held during those calls.
+ *
  * Requires -DBSTACK_FEATURE_SET.
  * ====================================================================== */
 
@@ -723,6 +733,11 @@ typedef struct {
     bstack_allocator_t base; /* must be first — safe cast to bstack_allocator_t * */
     bstack_t          *bs;
     uint64_t           block_size;
+#ifdef BSTACK_FEATURE_ATOMIC
+    /* Opaque platform mutex; serialises free-list pop/push and tail operations
+     * so a single handle may be shared across threads. */
+    void              *lock;
+#endif
 } slab_bstack_allocator_t;
 
 /*
@@ -778,7 +793,7 @@ uint64_t slab_bstack_allocator_block_size(const slab_bstack_allocator_t *alloc);
  * On-disk layout (all within the bstack payload):
  *   [0..24)  — reserved (OFFSET_SIZE; available for caller use)
  *   [24..48) — allocator header: magic[8] | block_size[8] | free_head[8]
- *              magic = "ALCK\x00\x01\x00\x00"
+ *              magic = "ALCK\x00\x01\x01\x00"
  *   [48..)   — block arena
  *
  * Each block in the arena:
@@ -803,6 +818,15 @@ uint64_t slab_bstack_allocator_block_size(const slab_bstack_allocator_t *alloc);
  * the rest of the list stays intact.  checked_slab_bstack_allocator_recover
  * reclaims leaked blocks by a linear arena scan.
  *
+ * Thread safety: without -DBSTACK_FEATURE_ATOMIC, an allocator handle must be
+ * used from one thread at a time — free-list mutations read then write free_head
+ * as separate bstack calls, a TOCTOU race under concurrent access.  With
+ * -DBSTACK_FEATURE_ATOMIC the handle owns an in-memory mutex (lock) that
+ * serialises all compound operations: free-list pop/push, the tail-length checks
+ * preceding extend or discard, and the recover scan.  bstack_try_discard and
+ * bstack_try_extend_zeros are used for the tail paths — those check-and-act
+ * atomically under bstack's own write lock without the allocator lock.
+ *
  * Requires -DBSTACK_FEATURE_SET.
  * ====================================================================== */
 
@@ -810,6 +834,11 @@ typedef struct {
     bstack_allocator_t base; /* must be first — safe cast to bstack_allocator_t * */
     bstack_t          *bs;
     uint64_t           block_size;
+#ifdef BSTACK_FEATURE_ATOMIC
+    /* Opaque platform mutex; serialises free-list pop/push and tail operations
+     * so a single handle may be shared across threads. */
+    void              *lock;
+#endif
 } checked_slab_bstack_allocator_t;
 
 /*

@@ -9,11 +9,16 @@
 
 use super::{BStackAllocator, BStackSlice};
 use crate::BStack;
-use core::{cell::Cell, marker::PhantomData};
+#[cfg(not(feature = "atomic"))]
+use core::cell::Cell;
+#[cfg(not(feature = "atomic"))]
+use core::marker::PhantomData;
+#[cfg(feature = "atomic")]
+use std::sync::Mutex;
 use std::{collections::HashSet, fmt, io};
 
 #[cfg(feature = "set")]
-const ALCK_MAGIC: [u8; 8] = *b"ALCK\x00\x01\x00\x00";
+const ALCK_MAGIC: [u8; 8] = *b"ALCK\x00\x01\x01\x00";
 
 /// Compatibility prefix checked on open: `ALCK` + major 0 + minor 1.
 /// Any file whose first 6 bytes match is considered compatible.
@@ -89,10 +94,27 @@ const ALCK_MAGIC_PREFIX: [u8; 6] = *b"ALCK\x00\x01";
 ///
 /// # Thread safety
 ///
-/// Like [`SlabBStackAllocator`](super::SlabBStackAllocator), this allocator is
-/// `Send` but not `Sync`: concurrent `&self` access must be externally
-/// synchronized, because free-list mutation reads then writes `free_head` as
-/// separate [`BStack`] calls.
+/// `CheckedSlabBStackAllocator` is always **`Send`** — ownership can be
+/// transferred to another thread.
+///
+/// Without the `atomic` feature it is **not `Sync`**: free-list mutations read
+/// then write `free_head` as separate [`BStack`] calls — a TOCTOU race under
+/// concurrent `&self` access.
+///
+/// With the `atomic` feature it **is `Sync`**. An internal [`Mutex`] serialises
+/// compound allocator operations that span multiple [`BStack`] calls (free-list
+/// pop/push and the public [`recover`](Self::recover) scan). Tail grow/shrink
+/// paths use [`BStack::try_extend_zeros`] / [`BStack::try_discard`] to perform
+/// check-and-act atomically under `BStack`'s write lock without holding the
+/// allocator mutex.
+///
+/// ```
+/// fn assert_send<T: Send>() {}
+/// assert_send::<bstack::CheckedSlabBStackAllocator>();
+/// ```
+///
+/// Without `atomic` the type is `!Sync` (this fails to compile); with `atomic`
+/// the internal `Mutex` makes it `Sync` (this compiles):
 ///
 /// # Method safety
 ///
@@ -117,6 +139,12 @@ const ALCK_MAGIC_PREFIX: [u8; 6] = *b"ALCK\x00\x01";
 /// *Partial* — crash keeps the free list consistent but may leak ≤ 1 block or batch;
 /// *N/A* — operation performs no I/O.
 ///
+#[cfg_attr(not(feature = "atomic"), doc = "```compile_fail")]
+#[cfg_attr(feature = "atomic", doc = "```")]
+/// fn assert_sync<T: Sync>() {}
+/// assert_sync::<bstack::CheckedSlabBStackAllocator>();
+/// ```
+///
 /// # Feature flags
 ///
 /// Requires both the `alloc` and `set` Cargo features:
@@ -130,7 +158,11 @@ pub struct CheckedSlabBStackAllocator {
     /// Cached from the on-disk header; fixed for the lifetime of the allocator.
     /// Covers the full block including the 8-byte overhead; must be `≥ 16`.
     block_size: u64,
-    // Mark as !Sync to prevent concurrent access to the free list.
+    /// Serialises multi-step free-list and tail operations when `atomic` is
+    /// enabled, making the allocator `Sync`.
+    #[cfg(feature = "atomic")]
+    lock: Mutex<()>,
+    #[cfg(not(feature = "atomic"))]
     _not_sync: PhantomData<Cell<()>>,
 }
 
@@ -233,6 +265,9 @@ impl CheckedSlabBStackAllocator {
         Ok(Self {
             stack,
             block_size,
+            #[cfg(feature = "atomic")]
+            lock: Mutex::new(()),
+            #[cfg(not(feature = "atomic"))]
             _not_sync: PhantomData,
         })
     }
@@ -328,6 +363,9 @@ impl CheckedSlabBStackAllocator {
         let allocator = Self {
             stack,
             block_size: stored_block_size,
+            #[cfg(feature = "atomic")]
+            lock: Mutex::new(()),
+            #[cfg(not(feature = "atomic"))]
             _not_sync: PhantomData,
         };
         // Reclaim leaks and repair a failed tail truncation left by an unclean
@@ -386,6 +424,8 @@ impl CheckedSlabBStackAllocator {
     /// * Any [`io::Error`] propagated from the underlying [`BStack`] operations
     ///   during the arena scan or while applying reclaim / tail-discard steps.
     pub fn recover(&self) -> io::Result<u64> {
+        #[cfg(feature = "atomic")]
+        let _guard = self.lock.lock().unwrap();
         let stack_len = self.stack.len()?;
         if stack_len <= Self::ARENA_START {
             return Ok(0);
@@ -744,8 +784,17 @@ impl BStackAllocator for CheckedSlabBStackAllocator {
         }
 
         let num_blocks = self.blocks_needed(len)?;
+
         if num_blocks == 1 {
-            if let Some(block_start) = self.pop_and_claim_block(1)? {
+            // Lock is scoped to the free-list pop only; the tail-extend fallback
+            // below runs without the lock (see comment there).
+            let free_block = {
+                #[cfg(feature = "atomic")]
+                let _guard = self.lock.lock().unwrap();
+                self.pop_and_claim_block(1)?
+                // guard dropped here
+            };
+            if let Some(block_start) = free_block {
                 // SAFETY:
                 // 1. No overflow: `block_start` is a valid in-bounds arena offset;
                 //    `block_start + OVERHEAD + len ≤ block_start + block_size ≤ stack_len ≤ u64::MAX`
@@ -759,21 +808,12 @@ impl BStackAllocator for CheckedSlabBStackAllocator {
                     BStackSlice::from_raw_parts(self, block_start + Self::OVERHEAD, len)
                 });
             }
-            let block_start = self.stack.extend(self.block_size)?;
-            self.write_overhead(block_start, Self::IN_USE_BIT | 1)?;
-            // SAFETY:
-            // 1. No overflow: `extend` returns the previous tail, so
-            //    `block_start + OVERHEAD + len ≤ block_start + block_size ≤ new stack_len ≤ u64::MAX`
-            //    because `blocks_needed(len) == 1` implies `len ≤ data_size = block_size − OVERHEAD`.
-            // 2. In bounds: `stack.extend` just appended exactly `block_size` zeroed
-            //    bytes, so the full range is within the stack payload.
-            // 3. Alloc origin: the slice covers the data region of this fresh
-            //    allocation and may safely be passed to `dealloc`/`realloc`.
-            return Ok(unsafe {
-                BStackSlice::from_raw_parts(self, block_start + Self::OVERHEAD, len)
-            });
         }
 
+        // Tail-extend path (single-block with no free block, and all multi-block
+        // allocations). No lock needed: BStack::extend is internally serialised by
+        // its write lock and returns a distinct region to each concurrent caller;
+        // write_overhead then writes only to that exclusively-owned region.
         let total = num_blocks.checked_mul(self.block_size).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "allocation size overflows u64")
         })?;
@@ -835,6 +875,8 @@ impl BStackAllocator for CheckedSlabBStackAllocator {
                 "slice start is below the overhead prefix; not a valid allocation",
             )
         })?;
+        // read_overhead is a single BStack read from a block owned by the caller;
+        // no lock required here.
         let overhead = self.read_overhead(block_start)?;
         if overhead & Self::IN_USE_BIT == 0 {
             return Err(io::Error::new(
@@ -856,7 +898,7 @@ impl BStackAllocator for CheckedSlabBStackAllocator {
                 "deallocation size overflows u64",
             )
         })?;
-        let current_tail = self.stack.len()?;
+
         let slice_end = block_start.checked_add(backing).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -864,10 +906,22 @@ impl BStackAllocator for CheckedSlabBStackAllocator {
             )
         })?;
 
-        if slice_end == current_tail {
+        // Tail path: try_discard atomically checks tail == slice_end and removes
+        // backing bytes under BStack's own write lock — no allocator lock needed.
+        #[cfg(feature = "atomic")]
+        if self.stack.try_discard(slice_end, backing)? {
+            return Ok(());
+        }
+
+        // Non-atomic tail path.
+        #[cfg(not(feature = "atomic"))]
+        if slice_end == self.stack.len()? {
             return self.stack.discard(backing);
         }
 
+        // Not at tail: push to the free list under the allocator lock.
+        #[cfg(feature = "atomic")]
+        let _guard = self.lock.lock().unwrap();
         self.push_free_blocks(block_start, num_blocks)
     }
 
@@ -928,6 +982,9 @@ impl BStackAllocator for CheckedSlabBStackAllocator {
             return Ok(slice);
         }
 
+        // Overhead read, validation, and same-block-count handling are lock-free:
+        // read_overhead is a single BStack read from a caller-owned block, and
+        // stack.zero writes to caller-owned bytes — no shared state is touched.
         let block_start = slice.start().checked_sub(Self::OVERHEAD).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -976,78 +1033,149 @@ impl BStackAllocator for CheckedSlabBStackAllocator {
                 "new allocation size overflows u64",
             )
         })?;
-        let current_tail = self.stack.len()?;
-        let is_tail = block_start.checked_add(old_backing).ok_or_else(|| {
+        // Precompute the expected tail for this allocation; used by both paths.
+        let sentinel = block_start.checked_add(old_backing).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "tail check overflows u64")
-        })? == current_tail;
+        })?;
 
-        if is_tail {
-            if new_n > old_n {
+        if new_n > old_n {
+            // Grow path.
+            //
+            // With `atomic`: try_extend_zeros atomically checks tail == sentinel and
+            // appends the delta under BStack's own write lock, so no allocator lock
+            // is needed. write_overhead then writes only to the exclusively-owned
+            // newly-extended region. If try_extend_zeros returns false the tail has
+            // moved and we are no longer the tail block — fall through to grow non-tail.
+            //
+            // Without `atomic`: a plain len() check followed by extend is safe in a
+            // single-threaded context.
+            #[cfg(feature = "atomic")]
+            if self
+                .stack
+                .try_extend_zeros(sentinel, new_backing - old_backing)?
+            {
+                if new_len > slice.len() {
+                    self.stack.zero(slice.end(), new_len - slice.len())?;
+                }
+                self.write_overhead(block_start, Self::IN_USE_BIT | new_n)?;
+                // SAFETY:
+                // 1. No overflow: slice.start() + new_len ≤ block_start + OVERHEAD + new_n * block_size − OVERHEAD ≤ u64::MAX
+                //    because new_n * block_size ≤ new_backing ≤ stack_len.
+                // 2. In bounds: try_extend_zeros just extended the tail by new_backing − old_backing bytes.
+                // 3. Alloc origin: slice.start() is unchanged; overhead records new_n.
+                return Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) });
+            }
+
+            #[cfg(not(feature = "atomic"))]
+            if sentinel == self.stack.len()? {
                 self.stack.extend(new_backing - old_backing)?;
                 if new_len > slice.len() {
                     self.stack.zero(slice.end(), new_len - slice.len())?;
                 }
                 self.write_overhead(block_start, Self::IN_USE_BIT | new_n)?;
-            } else {
-                // Shrink the overhead first: a crash before the discard leaves an
-                // orphaned (but safely unreferenced) tail region rather than an
-                // overhead that claims more blocks than the file contains.
-                self.write_overhead(block_start, Self::IN_USE_BIT | new_n)?;
-                self.stack.discard(old_backing - new_backing)?;
+                // SAFETY: same invariants as the atomic path above.
+                return Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) });
             }
+
+            // Not at tail (or tail moved under atomic): grow non-tail.
+            // alloc and dealloc each acquire the lock for their own free-list and
+            // tail operations independently.
+            let new_slice = self.alloc(new_len)?;
+            let data = slice.read()?;
+            new_slice.write(&data)?;
+            self.dealloc(slice)?;
+            return Ok(new_slice);
+        }
+
+        // Shrink path (new_n < old_n). Lock covers the overhead write, tail
+        // check, and non-tail free-list update.
+        #[cfg(feature = "atomic")]
+        let _guard = self.lock.lock().unwrap();
+
+        // Overhead is the commit point for both tail and non-tail paths: write
+        // it first so a crash after this point leaves an orphaned (but safely
+        // unreferenced) tail region or leaked blocks that recover() can reclaim,
+        // rather than an overhead that claims more blocks than the file contains.
+        self.write_overhead(block_start, Self::IN_USE_BIT | new_n)?;
+
+        // Tail shrink: try_discard atomically checks tail == sentinel and
+        // removes the excess under bstack's write lock, so no other thread can
+        // race between the check and the truncation. On failure the slice is
+        // not at the tail; fall through to recycle the excess blocks.
+        #[cfg(feature = "atomic")]
+        if self
+            .stack
+            .try_discard(sentinel, old_backing - new_backing)?
+        {
             // SAFETY:
-            // 1. No overflow: `slice.start() + new_len ≤ block_start + OVERHEAD + new_n * block_size − OVERHEAD ≤ u64::MAX`
-            //    because `new_n * block_size ≤ new_backing ≤ stack_len`.
-            // 2. In bounds: the tail was just extended (grow) or discarded down to `new_backing`
-            //    (shrink); the data region `[slice.start(), slice.start() + new_len)` is within payload.
-            // 3. Alloc origin: `slice.start()` is unchanged; the overhead now records `new_n`;
-            //    the slice may safely be passed to `dealloc`/`realloc`.
+            // 1. No overflow: slice.start() + new_len ≤ block_start + OVERHEAD + new_n * block_size − OVERHEAD ≤ u64::MAX
+            //    because new_n * block_size ≤ new_backing ≤ stack_len.
+            // 2. In bounds: tail discarded down to new_backing.
+            // 3. Alloc origin: slice.start() is unchanged; overhead records new_n.
             return Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) });
         }
 
-        if new_n < old_n {
-            // Shrink non-tail: recycle the excess blocks into the free list.
-            //
-            // Ordering matters, and the commit must come first. Shrinking the
-            // first block's count is the commit point: before it the old view
-            // (old_n blocks, original payload) is fully intact; after it the new
-            // view (new_n blocks) is in force. Only once committed do we write
-            // free-list metadata into the excess blocks (which clobbers their old
-            // payload) and repoint free_head. A crash before the commit leaves
-            // the original allocation untouched; a crash after it leaks the
-            // excess blocks but never corrupts a live allocation. Writing the
-            // free run first would shred the tail payload while the header still
-            // claims old_n, leaving a recovered allocation that is neither
-            // cleanly old nor cleanly new.
-            let excess_start = block_start
-                .checked_add(new_n.checked_mul(self.block_size).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "free start multiplication overflows u64",
-                    )
-                })?)
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "free start overflows u64")
-                })?;
-            self.write_overhead(block_start, Self::IN_USE_BIT | new_n)?;
-            self.write_free_run(excess_start, old_n - new_n)?;
-            self.stack
-                .set(Self::FREE_HEAD_OFFSET, excess_start.to_le_bytes())?;
+        #[cfg(not(feature = "atomic"))]
+        if sentinel == self.stack.len()? {
+            self.stack.discard(old_backing - new_backing)?;
             // SAFETY:
-            // 1. No overflow: `slice.start() + new_len ≤ block_start + OVERHEAD + new_n * block_size − OVERHEAD ≤ u64::MAX`
-            //    because `new_n * block_size ≤ old_backing ≤ stack_len`.
-            // 2. In bounds: the first `new_n` blocks are still live in the stack payload.
-            // 3. Alloc origin: `slice.start()` is unchanged; the overhead now records `new_n`;
-            //    the slice may safely be passed to `dealloc`/`realloc`.
+            // 1. No overflow: slice.start() + new_len ≤ block_start + OVERHEAD + new_n * block_size − OVERHEAD ≤ u64::MAX
+            //    because new_n * block_size ≤ new_backing ≤ stack_len.
+            // 2. In bounds: tail discarded down to new_backing.
+            // 3. Alloc origin: slice.start() is unchanged; overhead records new_n.
             return Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) });
         }
 
-        // Grow non-tail: allocate a fresh region, copy data, release the old.
-        let new_slice = self.alloc(new_len)?;
-        let data = slice.read()?;
-        new_slice.write(&data)?;
-        self.dealloc(slice)?;
-        Ok(new_slice)
+        // Shrink non-tail: recycle the excess blocks into the free list.
+        //
+        // Ordering matters, and the commit must come first. Shrinking the
+        // first block's count is the commit point: before it the old view
+        // (old_n blocks, original payload) is fully intact; after it the new
+        // view (new_n blocks) is in force. Only once committed do we write
+        // free-list metadata into the excess blocks (which clobbers their old
+        // payload) and repoint free_head. A crash before the commit leaves
+        // the original allocation untouched; a crash after it leaks the
+        // excess blocks but never corrupts a live allocation. Writing the
+        // free run first would shred the tail payload while the header still
+        // claims old_n, leaving a recovered allocation that is neither
+        // cleanly old nor cleanly new.
+        //
+        // Overhead was already written above (the commit point).
+        let excess_start = block_start
+            .checked_add(new_n.checked_mul(self.block_size).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "free start multiplication overflows u64",
+                )
+            })?)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "free start overflows u64")
+            })?;
+        self.write_free_run(excess_start, old_n - new_n)?;
+        self.stack
+            .set(Self::FREE_HEAD_OFFSET, excess_start.to_le_bytes())?;
+        // SAFETY:
+        // 1. No overflow: slice.start() + new_len ≤ block_start + OVERHEAD + new_n * block_size − OVERHEAD ≤ u64::MAX
+        //    because new_n * block_size ≤ old_backing ≤ stack_len.
+        // 2. In bounds: the first new_n blocks are still live in the stack payload.
+        // 3. Alloc origin: slice.start() is unchanged; overhead records new_n.
+        Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) })
+    }
+}
+
+#[cfg(all(test, feature = "set"))]
+mod _assertions {
+    use super::CheckedSlabBStackAllocator;
+    fn _send()
+    where
+        CheckedSlabBStackAllocator: Send,
+    {
+    }
+    #[cfg(feature = "atomic")]
+    fn _sync()
+    where
+        CheckedSlabBStackAllocator: Sync,
+    {
     }
 }
 
@@ -1472,5 +1600,126 @@ mod tests {
         // A second run finds nothing further and changes nothing.
         assert_eq!(alloc.recover().unwrap(), 0);
         assert_eq!(alloc.stack().len().unwrap(), len_after);
+    }
+
+    // ── concurrent (feature = "atomic") ───────────────────────────────────────
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn concurrent_alloc_dealloc_no_live_duplicates() {
+        use std::collections::HashSet;
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+
+        // Verify that concurrent alloc/dealloc calls never hand the same block
+        // to two callers simultaneously.  Each thread claims a block, inserts
+        // its offset into a shared live-set (asserting uniqueness), writes its
+        // thread id, reads back and verifies the data, then removes the offset
+        // and deallocates.  The free-list lock is what makes this safe; a bug
+        // there would produce a duplicate entry in the set.
+        const THREADS: usize = 8;
+        const ROUNDS: usize = 200;
+
+        let (stack, path) = empty_stack();
+        let _g = Guard(path);
+        let alloc = Arc::new(CheckedSlabBStackAllocator::new(stack, 8).unwrap());
+        let live: Arc<Mutex<HashSet<u64>>> = Arc::new(Mutex::new(HashSet::new()));
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|tid| {
+                let alloc = Arc::clone(&alloc);
+                let live = Arc::clone(&live);
+                thread::spawn(move || {
+                    let a: &CheckedSlabBStackAllocator = &alloc;
+                    for _ in 0..ROUNDS {
+                        let slice = a.alloc(8).unwrap();
+                        let off = slice.start();
+                        {
+                            let mut set = live.lock().unwrap();
+                            assert!(set.insert(off), "duplicate live offset {off}");
+                        }
+                        slice.write(&[tid as u8; 8]).unwrap();
+                        let data = slice.read().unwrap();
+                        assert_eq!(data, vec![tid as u8; 8]);
+                        {
+                            let mut set = live.lock().unwrap();
+                            set.remove(&off);
+                        }
+                        a.dealloc(slice).unwrap();
+                    }
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // All threads done: the allocator should be fully consistent.
+        assert_eq!(alloc.recover().unwrap(), 0);
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn concurrent_realloc_hammers_tail_paths() {
+        use std::sync::Arc;
+        use std::thread;
+
+        // T threads each own one allocation and repeatedly grow then shrink it.
+        // Whichever allocation sits at the tail exercises try_extend_zeros /
+        // try_discard; the others hit the non-tail copy-grow / block-recycle
+        // paths.  Because threads race, both branches are exercised on every
+        // round.  Verify that each thread's data survives every round intact.
+        //
+        // With data_size = 8 (block_size = 16):
+        //   SMALL = 8  → blocks_needed = ceil((8+8)/16)  = 1 block
+        //   LARGE = 32 → blocks_needed = ceil((32+8)/16) = 3 blocks
+        const THREADS: usize = 6;
+        const ROUNDS: usize = 150;
+        const SMALL: u64 = 8;
+        const LARGE: u64 = 32;
+
+        let (stack, path) = empty_stack();
+        let _g = Guard(path);
+        let alloc = Arc::new(CheckedSlabBStackAllocator::new(stack, 8).unwrap());
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|tid| {
+                let alloc = Arc::clone(&alloc);
+                thread::spawn(move || {
+                    let a: &CheckedSlabBStackAllocator = &alloc;
+                    let mut slice = a.alloc(SMALL).unwrap();
+                    slice.write(&[tid as u8; SMALL as usize]).unwrap();
+
+                    for _ in 0..ROUNDS {
+                        // Grow: tail → try_extend_zeros; non-tail → copy to new region.
+                        slice = a.realloc(slice, LARGE).unwrap();
+                        let data = slice.read().unwrap();
+                        assert_eq!(
+                            &data[..SMALL as usize],
+                            &[tid as u8; SMALL as usize],
+                            "data corrupted after grow (tid {tid})",
+                        );
+
+                        // Shrink: tail → try_discard; non-tail → recycle excess blocks.
+                        slice = a.realloc(slice, SMALL).unwrap();
+                        let data = slice.read().unwrap();
+                        assert_eq!(
+                            data,
+                            vec![tid as u8; SMALL as usize],
+                            "data corrupted after shrink (tid {tid})",
+                        );
+                    }
+
+                    a.dealloc(slice).unwrap();
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert_eq!(alloc.recover().unwrap(), 0);
     }
 }

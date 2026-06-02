@@ -937,6 +937,168 @@ static int test_fuzz_persist_8(void)  { return fuzz_persist_reopen(8);  }
 static int test_fuzz_persist_16(void) { return fuzz_persist_reopen(16); }
 
 /* =========================================================================
+ * Concurrent tests (requires -DBSTACK_FEATURE_ATOMIC)
+ *
+ * Without ATOMIC the allocator is not Sync: free-list mutations span two
+ * bstack calls with no lock, so sharing one allocator across threads is
+ * undefined and these tests would race on the on-disk free list with no
+ * protection.
+ * ====================================================================== */
+
+#ifdef BSTACK_FEATURE_ATOMIC
+#include <pthread.h>
+
+#define CSL_THREADS  8
+#define CSL_ITERS    200
+
+typedef struct {
+    bstack_allocator_t *a;
+    int                 tid;
+    int                 ok;
+} csl_worker_arg_t;
+
+/* --- concurrent alloc / dealloc data integrity ------------------------ */
+
+static void *csl_alloc_dealloc_worker(void *raw)
+{
+    csl_worker_arg_t *w = raw;
+    uint8_t pat = (uint8_t)w->tid;
+    w->ok = 1;
+
+    for (int i = 0; i < CSL_ITERS; i++) {
+        bstack_slice_t s;
+        if (bstack_allocator_alloc(w->a, 8, &s) != 0) { w->ok = 0; return NULL; }
+
+        uint8_t wbuf[8], rbuf[8];
+        memset(wbuf, pat, 8);
+        if (bstack_slice_write(s, wbuf, 8) != 0 ||
+            bstack_slice_read(s, rbuf)     != 0 ||
+            memcmp(wbuf, rbuf, 8)          != 0) {
+            w->ok = 0; return NULL;
+        }
+        if (bstack_allocator_dealloc(w->a, s) != 0) { w->ok = 0; return NULL; }
+    }
+    return NULL;
+}
+
+static int test_concurrent_alloc_dealloc_data_integrity(void)
+{
+    /* Verify that the free-list lock prevents two threads from receiving the
+     * same block.  Each thread writes its pattern and reads it back; a
+     * duplicate-block race would clobber the pattern.  The overhead bit also
+     * means a double-alloc would be caught as a double-free on dealloc. */
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    checked_slab_bstack_allocator_t *a =
+        checked_slab_bstack_allocator_new(bs, 8);
+    CHECK(a);
+
+    pthread_t        threads[CSL_THREADS];
+    csl_worker_arg_t args[CSL_THREADS];
+    for (int i = 0; i < CSL_THREADS; i++) {
+        args[i].a   = (bstack_allocator_t *)a;
+        args[i].tid = i;
+        args[i].ok  = 1;
+        pthread_create(&threads[i], NULL, csl_alloc_dealloc_worker, &args[i]);
+    }
+    for (int i = 0; i < CSL_THREADS; i++) pthread_join(threads[i], NULL);
+    for (int i = 0; i < CSL_THREADS; i++) CHECK(args[i].ok);
+
+    bstack_close(checked_slab_bstack_allocator_into_stack(a));
+    csl_unlink(tmp); return 0;
+}
+
+/* --- concurrent realloc grow/shrink tail paths ------------------------ */
+
+#define CSL_REALLOC_THREADS  6
+#define CSL_REALLOC_ITERS    150
+
+typedef struct {
+    bstack_allocator_t *a;
+    int                 tid;
+    int                 ok;
+} csl_realloc_arg_t;
+
+static void *csl_realloc_worker(void *raw)
+{
+    /* Each thread owns one allocation and repeatedly grows then shrinks it.
+     * Whichever allocation is at the tail exercises try_extend_zeros /
+     * try_discard under bstack's write lock; others hit copy-grow /
+     * block-recycle.  data_size = 8, block_size = 16:
+     *   alloc(8)  → 1 block; alloc(32) → ceil((32+8)/16) = 3 blocks. */
+    csl_realloc_arg_t *w = raw;
+    uint8_t pat = (uint8_t)(w->tid + 0x40);
+    w->ok = 1;
+
+    bstack_slice_t s;
+    if (bstack_allocator_alloc(w->a, 8, &s) != 0) { w->ok = 0; return NULL; }
+    uint8_t init[8]; memset(init, pat, 8);
+    if (bstack_slice_write(s, init, 8) != 0) { w->ok = 0; return NULL; }
+
+    for (int i = 0; i < CSL_REALLOC_ITERS; i++) {
+        bstack_slice_t s2, s3;
+        uint8_t rbuf[32];
+
+        /* Grow: tail → try_extend_zeros; non-tail → copy. */
+        if (bstack_allocator_realloc(w->a, s, 32, &s2) != 0) {
+            w->ok = 0; return NULL;
+        }
+        if (bstack_slice_read(s2, rbuf) != 0) { w->ok = 0; return NULL; }
+        for (size_t j = 0; j < 8; j++) {
+            if (rbuf[j] != pat) {
+                fprintf(stderr,
+                    "  grow clobber tid=%d byte %zu got 0x%02x want 0x%02x\n",
+                    w->tid, j, rbuf[j], pat);
+                w->ok = 0; return NULL;
+            }
+        }
+
+        /* Shrink: tail → try_discard; non-tail → recycle excess blocks. */
+        if (bstack_allocator_realloc(w->a, s2, 8, &s3) != 0) {
+            w->ok = 0; return NULL;
+        }
+        if (bstack_slice_read(s3, rbuf) != 0) { w->ok = 0; return NULL; }
+        for (size_t j = 0; j < 8; j++) {
+            if (rbuf[j] != pat) {
+                fprintf(stderr,
+                    "  shrink clobber tid=%d byte %zu got 0x%02x want 0x%02x\n",
+                    w->tid, j, rbuf[j], pat);
+                w->ok = 0; return NULL;
+            }
+        }
+        s = s3;
+    }
+
+    if (bstack_allocator_dealloc(w->a, s) != 0) { w->ok = 0; return NULL; }
+    return NULL;
+}
+
+static int test_concurrent_realloc_tail_paths(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    checked_slab_bstack_allocator_t *a =
+        checked_slab_bstack_allocator_new(bs, 8);
+    CHECK(a);
+
+    pthread_t         threads[CSL_REALLOC_THREADS];
+    csl_realloc_arg_t args[CSL_REALLOC_THREADS];
+    for (int i = 0; i < CSL_REALLOC_THREADS; i++) {
+        args[i].a   = (bstack_allocator_t *)a;
+        args[i].tid = i;
+        args[i].ok  = 1;
+        pthread_create(&threads[i], NULL, csl_realloc_worker, &args[i]);
+    }
+    for (int i = 0; i < CSL_REALLOC_THREADS; i++) pthread_join(threads[i], NULL);
+    for (int i = 0; i < CSL_REALLOC_THREADS; i++) CHECK(args[i].ok);
+
+    bstack_close(checked_slab_bstack_allocator_into_stack(a));
+    csl_unlink(tmp); return 0;
+}
+
+#endif /* BSTACK_FEATURE_ATOMIC */
+
+/* =========================================================================
  * main
  * ====================================================================== */
 
@@ -980,6 +1142,12 @@ int main(void)
     T(test_fuzz_realloc_24);
     T(test_fuzz_persist_8);
     T(test_fuzz_persist_16);
+
+#ifdef BSTACK_FEATURE_ATOMIC
+    /* ── concurrent ──────────────────────────────────────────────────── */
+    T(test_concurrent_alloc_dealloc_data_integrity);
+    T(test_concurrent_realloc_tail_paths);
+#endif
 
     printf("\n%d / %d passed\n", g_passed, g_total);
     return g_passed == g_total ? 0 : 1;

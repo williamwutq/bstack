@@ -11,6 +11,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`FirstFitBStackAllocator::dealloc` / `realloc` — coalesced tail blocks never reclaimed** (`alloc` + `set` features): `cascade_discard_free_tail` was only called from the explicit tail-discard path in `dealloc`. When `add_to_free_list` coalesced a freed block with its neighbours and the result ended at the stack tail, that merged free block was never discarded — leaving the arena larger than necessary after all allocations were freed. No data corruption occurs; the free list remains structurally valid throughout. Fixed by calling `cascade_discard_free_tail` after every `add_to_free_list` call in both `dealloc` and `realloc`. The cascade is a no-op when the tail is still allocated.
 
+### Changed
+
+- **`SlabBStackAllocator` version bumped to 0.1.1** (`alloc` + `set` features): Magic number updated from `ALSL\x00\x01\x00\x00` to `ALSL\x00\x01\x01\x00`. Reflects the addition of `atomic` / `Sync` support. Existing 0.1.x files remain fully compatible (only the first 6 bytes are checked on open).
+- **`CheckedSlabBStackAllocator` version bumped to 0.1.1** (`alloc` + `set` features): Magic number updated from `ALCK\x00\x01\x00\x00` to `ALCK\x00\x01\x01\x00`. Reflects the addition of `atomic` / `Sync` support. Existing 0.1.x files remain fully compatible (only the first 6 bytes are checked on open).
+- **`SlabBStackAllocator` is `Send + Sync` with the `atomic` feature** (`alloc` + `set` features): Without `atomic`, free-list mutations read then write `free_head` as separate `BStack` calls — a TOCTOU race that can hand the same block to two callers. With `atomic`, an internal mutex serialises free-list pop/push; tail operations use `BStack::try_discard` / `BStack::try_extend_zeros` (atomic check-and-act under `BStack`'s own write lock, no allocator lock needed). Non-tail paths lock only around `push_free_blocks`.
+- **`CheckedSlabBStackAllocator` is `Send + Sync` with the `atomic` feature** (`alloc` + `set` features): Same mutex model. Free-list pop in `alloc` is lock-scoped; tail extend runs lock-free. `dealloc` uses `try_discard` for the tail path without the lock; free-list push is locked. In `realloc`, the grow path uses `try_extend_zeros` lock-free; the shrink path holds the lock across tail-check + overhead-write + discard (overhead must be committed before truncation for crash safety). `recover` holds the lock for its full duration.
+
+---
+
 ## [0.2.3] - 2026-06-01
 
 ### Added
