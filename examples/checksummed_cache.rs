@@ -17,7 +17,7 @@
 //!
 //! Use `get_batched_gen` to read the checksum and, only on a mismatch with the
 //! cached value, fetch the new payload — both under a single read lock.
-//! 
+//!
 //! Note that XOR checksums are not collision-resistant, so this example is only
 //! intended to demonstrate the pattern, not to provide strong integrity guarantees.
 //!

@@ -305,5 +305,6 @@ clean:
 	      test_first_fit-atomic.o test_first_fit-atomic$(EXE_EXT) \
 	      $(TEST_GT_OBJ) $(TEST_GT_BIN) \
 	      $(TEST_SL_OBJ) $(TEST_SL_BIN) \
+		  $(TEST_CSL_OBJ) $(TEST_CSL_BIN) \
 	      $(OBJ_BYTEVEC) $(LIB_BYTEVEC_SET) $(TEST_BV_OBJ) $(TEST_BV_BIN) \
 	      $(EXAMPLE_BINS) $(HASHMAP_BIN) $(ATOMIC_BIN) $(MOVE_COW_BIN) $(LINKED_LIST_BIN) $(CHECKSUMMED_CACHE_BIN)
