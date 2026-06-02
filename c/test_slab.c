@@ -722,6 +722,165 @@ FUZZ_SUITE(16)
 FUZZ_SUITE(64)
 
 /* =========================================================================
+ * Concurrent tests (requires -DBSTACK_FEATURE_ATOMIC)
+ *
+ * Without ATOMIC the allocator is not Sync: free-list mutations span two
+ * bstack calls with no lock, so sharing one allocator across threads is
+ * undefined and these tests would race on the on-disk free list with no
+ * protection.
+ * ====================================================================== */
+
+#ifdef BSTACK_FEATURE_ATOMIC
+#include <pthread.h>
+
+#define SL_THREADS  8
+#define SL_ITERS    200
+
+typedef struct {
+    bstack_allocator_t *a;
+    int                 tid;
+    int                 ok;
+} sl_worker_arg_t;
+
+/* --- concurrent alloc / dealloc data integrity ------------------------ */
+
+static void *sl_alloc_dealloc_worker(void *raw)
+{
+    sl_worker_arg_t *w = raw;
+    uint8_t pat = (uint8_t)w->tid;
+    w->ok = 1;
+
+    for (int i = 0; i < SL_ITERS; i++) {
+        bstack_slice_t s;
+        if (bstack_allocator_alloc(w->a, 16, &s) != 0) { w->ok = 0; return NULL; }
+
+        uint8_t wbuf[16], rbuf[16];
+        memset(wbuf, pat, 16);
+        if (bstack_slice_write(s, wbuf, 16) != 0 ||
+            bstack_slice_read(s, rbuf)      != 0 ||
+            memcmp(wbuf, rbuf, 16)          != 0) {
+            w->ok = 0; return NULL;
+        }
+        if (bstack_allocator_dealloc(w->a, s) != 0) { w->ok = 0; return NULL; }
+    }
+    return NULL;
+}
+
+static int test_concurrent_alloc_dealloc_data_integrity(void)
+{
+    /* Verify that the free-list lock prevents two threads from receiving the
+     * same block.  Each thread writes its pattern after alloc and reads it
+     * back before dealloc; a duplicate-block race would produce a clobber. */
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    slab_bstack_allocator_t *a = slab_bstack_allocator_new(bs, 16);
+    CHECK(a);
+
+    pthread_t       threads[SL_THREADS];
+    sl_worker_arg_t args[SL_THREADS];
+    for (int i = 0; i < SL_THREADS; i++) {
+        args[i].a   = (bstack_allocator_t *)a;
+        args[i].tid = i;
+        args[i].ok  = 1;
+        pthread_create(&threads[i], NULL, sl_alloc_dealloc_worker, &args[i]);
+    }
+    for (int i = 0; i < SL_THREADS; i++) pthread_join(threads[i], NULL);
+    for (int i = 0; i < SL_THREADS; i++) CHECK(args[i].ok);
+
+    bstack_close(slab_bstack_allocator_into_stack(a));
+    sl_unlink(tmp); return 0;
+}
+
+/* --- concurrent realloc grow/shrink tail paths ------------------------ */
+
+#define SL_REALLOC_THREADS  6
+#define SL_REALLOC_ITERS    150
+
+typedef struct {
+    bstack_allocator_t *a;
+    int                 tid;
+    int                 ok;
+} sl_realloc_arg_t;
+
+static void *sl_realloc_worker(void *raw)
+{
+    /* Each thread owns one allocation and repeatedly grows then shrinks it.
+     * Whichever allocation is at the tail exercises try_extend_zeros /
+     * try_discard; others hit copy-grow / block-recycle paths.  Both branches
+     * are exercised every round because threads race for the tail.
+     * block_size = 16: alloc(12) → 1 block; alloc(33) → 3 blocks. */
+    sl_realloc_arg_t *w = raw;
+    uint8_t pat = (uint8_t)(w->tid + 0x40);
+    w->ok = 1;
+
+    bstack_slice_t s;
+    if (bstack_allocator_alloc(w->a, 12, &s) != 0) { w->ok = 0; return NULL; }
+    uint8_t init[12]; memset(init, pat, 12);
+    if (bstack_slice_write(s, init, 12) != 0) { w->ok = 0; return NULL; }
+
+    for (int i = 0; i < SL_REALLOC_ITERS; i++) {
+        bstack_slice_t s2, s3;
+        uint8_t rbuf[33];
+
+        /* Grow: tail → try_extend_zeros; non-tail → copy. */
+        if (bstack_allocator_realloc(w->a, s, 33, &s2) != 0) {
+            w->ok = 0; return NULL;
+        }
+        if (bstack_slice_read(s2, rbuf) != 0) { w->ok = 0; return NULL; }
+        for (size_t j = 0; j < 12; j++) {
+            if (rbuf[j] != pat) {
+                fprintf(stderr,
+                    "  grow clobber tid=%d byte %zu got 0x%02x want 0x%02x\n",
+                    w->tid, j, rbuf[j], pat);
+                w->ok = 0; return NULL;
+            }
+        }
+
+        /* Shrink: tail → try_discard; non-tail → recycle excess blocks. */
+        if (bstack_allocator_realloc(w->a, s2, 12, &s3) != 0) {
+            w->ok = 0; return NULL;
+        }
+        if (bstack_slice_read(s3, rbuf) != 0) { w->ok = 0; return NULL; }
+        for (size_t j = 0; j < 12; j++) {
+            if (rbuf[j] != pat) {
+                fprintf(stderr,
+                    "  shrink clobber tid=%d byte %zu got 0x%02x want 0x%02x\n",
+                    w->tid, j, rbuf[j], pat);
+                w->ok = 0; return NULL;
+            }
+        }
+        s = s3;
+    }
+
+    if (bstack_allocator_dealloc(w->a, s) != 0) { w->ok = 0; return NULL; }
+    return NULL;
+}
+
+static int test_concurrent_realloc_tail_paths(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    slab_bstack_allocator_t *a = slab_bstack_allocator_new(bs, 16);
+    CHECK(a);
+
+    pthread_t        threads[SL_REALLOC_THREADS];
+    sl_realloc_arg_t args[SL_REALLOC_THREADS];
+    for (int i = 0; i < SL_REALLOC_THREADS; i++) {
+        args[i].a   = (bstack_allocator_t *)a;
+        args[i].tid = i;
+        args[i].ok  = 1;
+        pthread_create(&threads[i], NULL, sl_realloc_worker, &args[i]);
+    }
+    for (int i = 0; i < SL_REALLOC_THREADS; i++) pthread_join(threads[i], NULL);
+    for (int i = 0; i < SL_REALLOC_THREADS; i++) CHECK(args[i].ok);
+
+    bstack_close(slab_bstack_allocator_into_stack(a));
+    sl_unlink(tmp); return 0;
+}
+
+#endif /* BSTACK_FEATURE_ATOMIC */
+
+/* =========================================================================
  * main
  * ====================================================================== */
 
@@ -750,6 +909,12 @@ int main(void)
     T(test_fuzz_alloc_dealloc_64);
     T(test_fuzz_alloc_realloc_dealloc_64);
     T(test_fuzz_reopen_64);
+
+#ifdef BSTACK_FEATURE_ATOMIC
+    /* Concurrent */
+    T(test_concurrent_alloc_dealloc_data_integrity);
+    T(test_concurrent_realloc_tail_paths);
+#endif
 
     printf("\n%d/%d passed\n", g_passed, g_total);
     return (g_passed == g_total) ? 0 : 1;

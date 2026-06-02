@@ -54,3 +54,7 @@ jobs:
       run: cargo test --features "set atomic"
     - name: Test Release with set and atomic
       run: cargo test --release --features "set atomic"
+    - name: Test with alloc, set and atomic
+      run: cargo test --features "alloc set atomic" -- --skip alloc_fuzz_tests
+    - name: Test Release with alloc, set and atomic
+      run: cargo test --release --features "alloc set atomic" -- --skip alloc_fuzz_tests

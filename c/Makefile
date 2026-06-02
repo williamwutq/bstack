@@ -52,9 +52,19 @@ TEST_GT_OBJ = test_ghost_tree.o
 TEST_SL_BIN = test_slab$(EXE_EXT)
 TEST_SL_OBJ = test_slab.o
 
+# Slab allocator test compiled with SET+ATOMIC, exercising the mutex and the
+# try_discard / try_extend_zeros tail paths under concurrent access.
+TEST_SL_ATOMIC_OBJ = test_slab-atomic.o
+TEST_SL_ATOMIC_BIN = test_slab-atomic$(EXE_EXT)
+
 # Checked-slab allocator test (requires BSTACK_FEATURE_SET).
 TEST_CSL_BIN = test_checked_slab$(EXE_EXT)
 TEST_CSL_OBJ = test_checked_slab.o
+
+# Checked-slab allocator test compiled with SET+ATOMIC, exercising the mutex
+# and the try_discard / try_extend_zeros tail paths under concurrent access.
+TEST_CSL_ATOMIC_OBJ = test_checked_slab-atomic.o
+TEST_CSL_ATOMIC_BIN = test_checked_slab-atomic$(EXE_EXT)
 
 # ByteVec — requires BSTACK_FEATURE_SET.
 OBJ_BYTEVEC     = bstack_bytevec.o
@@ -70,7 +80,7 @@ MOVE_COW_BIN     = ../examples/move_and_cow$(EXE_EXT)
 LINKED_LIST_BIN        = ../examples/linked_list$(EXE_EXT)
 CHECKSUMMED_CACHE_BIN  = ../examples/checksummed_cache$(EXE_EXT)
 
-.PHONY: all test test-set test-atomic test-set-atomic test-first-fit test-first-fit-atomic test-ghost-tree test-slab test-checked-slab test-bytevec leaks clean alloc \
+.PHONY: all test test-set test-atomic test-set-atomic test-first-fit test-first-fit-atomic test-ghost-tree test-slab test-slab-atomic test-checked-slab test-checked-slab-atomic test-bytevec leaks clean alloc \
         example example-basic example-buffer_reuse example-journal \
         example-reading example-vec_store example-hashmap example-atomic_ops example-move_and_cow \
         example-linked_list example-checksummed_cache
@@ -165,6 +175,13 @@ $(TEST_SL_BIN): $(TEST_SL_OBJ) $(LIB_ALLOC_SET)
 test-slab: $(TEST_SL_BIN)
 	$(RUN)$(TEST_SL_BIN)
 
+# Same slab test compiled against the SET+ATOMIC alloc lib, exercising the
+# in-memory mutex and the try_discard / try_extend_zeros tail paths.
+test-slab-atomic: $(LIB_ALLOC_SET_ATOMIC)
+	$(CC) $(CFLAGS) -DBSTACK_FEATURE_SET -DBSTACK_FEATURE_ATOMIC -c -o $(TEST_SL_ATOMIC_OBJ) test_slab.c
+	$(CC) $(CFLAGS) -DBSTACK_FEATURE_SET -DBSTACK_FEATURE_ATOMIC -o $(TEST_SL_ATOMIC_BIN) $(TEST_SL_ATOMIC_OBJ) -L. -lbstack-alloc-set-atomic -lpthread
+	$(RUN)$(TEST_SL_ATOMIC_BIN)
+
 $(TEST_CSL_OBJ): test_checked_slab.c bstack_alloc.h bstack.h
 	$(CC) $(CFLAGS) -DBSTACK_FEATURE_SET -c -o $@ $<
 
@@ -173,6 +190,13 @@ $(TEST_CSL_BIN): $(TEST_CSL_OBJ) $(LIB_ALLOC_SET)
 
 test-checked-slab: $(TEST_CSL_BIN)
 	$(RUN)$(TEST_CSL_BIN)
+
+# Same checked-slab test compiled against the SET+ATOMIC alloc lib, exercising
+# the in-memory mutex and the try_discard / try_extend_zeros tail paths.
+test-checked-slab-atomic: $(LIB_ALLOC_SET_ATOMIC)
+	$(CC) $(CFLAGS) -DBSTACK_FEATURE_SET -DBSTACK_FEATURE_ATOMIC -c -o $(TEST_CSL_ATOMIC_OBJ) test_checked_slab.c
+	$(CC) $(CFLAGS) -DBSTACK_FEATURE_SET -DBSTACK_FEATURE_ATOMIC -o $(TEST_CSL_ATOMIC_BIN) $(TEST_CSL_ATOMIC_OBJ) -L. -lbstack-alloc-set-atomic -lpthread
+	$(RUN)$(TEST_CSL_ATOMIC_BIN)
 
 $(OBJ_BYTEVEC): bstack_bytevec.c bstack_bytevec.h bstack_alloc.h bstack.h
 	$(CC) $(CFLAGS) -DBSTACK_FEATURE_SET -c -o $@ $<
@@ -305,6 +329,8 @@ clean:
 	      test_first_fit-atomic.o test_first_fit-atomic$(EXE_EXT) \
 	      $(TEST_GT_OBJ) $(TEST_GT_BIN) \
 	      $(TEST_SL_OBJ) $(TEST_SL_BIN) \
-		  $(TEST_CSL_OBJ) $(TEST_CSL_BIN) \
+	      $(TEST_SL_ATOMIC_OBJ) $(TEST_SL_ATOMIC_BIN) \
+	      $(TEST_CSL_OBJ) $(TEST_CSL_BIN) \
+	      $(TEST_CSL_ATOMIC_OBJ) $(TEST_CSL_ATOMIC_BIN) \
 	      $(OBJ_BYTEVEC) $(LIB_BYTEVEC_SET) $(TEST_BV_OBJ) $(TEST_BV_BIN) \
 	      $(EXAMPLE_BINS) $(HASHMAP_BIN) $(ATOMIC_BIN) $(MOVE_COW_BIN) $(LINKED_LIST_BIN) $(CHECKSUMMED_CACHE_BIN)

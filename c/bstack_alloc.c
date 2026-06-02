@@ -2901,6 +2901,43 @@ bstack_t *ghost_tree_bstack_allocator_into_stack(ghost_tree_bstack_allocator_t *
 }
 
 /* =========================================================================
+ * Mutex helpers shared by slab and checked_slab allocators.
+ * Mirrors the pattern used by first_fit_bstack_allocator_t.
+ * Under BSTACK_FEATURE_ATOMIC these allocate/free the opaque lock field;
+ * without it they compile away to nothing.
+ * ====================================================================== */
+
+#ifdef BSTACK_FEATURE_ATOMIC
+static int bstack_alloc_lock_init(void **out)
+{
+#  ifdef _WIN32
+    CRITICAL_SECTION *cs = malloc(sizeof *cs);
+    if (!cs) { errno = ENOMEM; return -1; }
+    InitializeCriticalSection(cs);
+    *out = cs;
+    return 0;
+#  else
+    pthread_mutex_t *m = malloc(sizeof *m);
+    if (!m) { errno = ENOMEM; return -1; }
+    if (pthread_mutex_init(m, NULL) != 0) { free(m); errno = EINVAL; return -1; }
+    *out = m;
+    return 0;
+#  endif
+}
+
+static void bstack_alloc_lock_destroy(void *lock)
+{
+    if (!lock) return;
+#  ifdef _WIN32
+    DeleteCriticalSection((CRITICAL_SECTION *)lock);
+#  else
+    pthread_mutex_destroy((pthread_mutex_t *)lock);
+#  endif
+    free(lock);
+}
+#endif /* BSTACK_FEATURE_ATOMIC */
+
+/* =========================================================================
  * slab_bstack_allocator_t — fixed-block slab allocator
  * Requires -DBSTACK_FEATURE_SET (depends on bstack_set and bstack_zero).
  * ====================================================================== */
@@ -2915,7 +2952,7 @@ bstack_t *ghost_tree_bstack_allocator_into_stack(ghost_tree_bstack_allocator_t *
 #define SLAB_MIN_BLOCK_SIZE    UINT64_C(8)
 #define SLAB_SENTINEL          UINT64_C(0)
 
-static const uint8_t alsl_magic[8]        = {'A','L','S','L',0,1,0,0};
+static const uint8_t alsl_magic[8]        = {'A','L','S','L',0,1,1,0};
 static const uint8_t alsl_magic_prefix[6] = {'A','L','S','L',0,1};
 
 /* ---- helpers ----------------------------------------------------------- */
@@ -3054,11 +3091,17 @@ static int slab_vtbl_alloc(bstack_allocator_t *base, uint64_t len,
     }
 
     if (len <= a->block_size) {
-        if (slab_pop_free_block(a->bs, a->block_size, &block) != 0) return -1;
+        int pop_r;
+        FF_LOCK(a);
+        pop_r = slab_pop_free_block(a->bs, a->block_size, &block);
+        FF_UNLOCK(a);
+        if (pop_r != 0) return -1;
         if (block != SLAB_SENTINEL) {
             out->allocator = base; out->offset = block; out->len = len;
             return 0;
         }
+        /* Free list empty: extend tail (no lock needed — bstack_extend is
+         * internally serialised and returns a distinct region per call). */
 #if UINT64_MAX > SIZE_MAX
         if (a->block_size > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
 #endif
@@ -3082,7 +3125,7 @@ static int slab_vtbl_alloc(bstack_allocator_t *base, uint64_t len,
 static int slab_vtbl_dealloc(bstack_allocator_t *base, bstack_slice_t s)
 {
     slab_bstack_allocator_t *a = (slab_bstack_allocator_t *)base;
-    uint64_t n_blocks, backing_size, tail;
+    uint64_t n_blocks, backing_size;
 
     if (s.len == 0 && s.offset == SLAB_SENTINEL) return 0;
 
@@ -3090,27 +3133,46 @@ static int slab_vtbl_dealloc(bstack_allocator_t *base, bstack_slice_t s)
     if (n_blocks > UINT64_MAX / a->block_size) { errno = EINVAL; return -1; }
     backing_size = n_blocks * a->block_size;
 
-    if (bstack_len(a->bs, &tail) != 0) return -1;
-
+    /* Tail discard path: only for oversized allocations (> 1 block).
+     * try_discard atomically checks tail == slice_end and removes backing_size
+     * bytes under BStack's own write lock — no allocator lock needed. */
     if (s.len > a->block_size) {
         if (s.offset > UINT64_MAX - backing_size) { errno = EINVAL; return -1; }
-        if (s.offset + backing_size == tail) {
 #if UINT64_MAX > SIZE_MAX
-            if (backing_size > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
+        if (backing_size > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
 #endif
-            return bstack_discard(a->bs, (size_t)backing_size);
+#ifdef BSTACK_FEATURE_ATOMIC
+        {
+            int ok = 0;
+            if (bstack_try_discard(a->bs, s.offset + backing_size,
+                                   (size_t)backing_size, &ok) != 0) return -1;
+            if (ok) return 0;
         }
+#else
+        {
+            uint64_t tail;
+            if (bstack_len(a->bs, &tail) != 0) return -1;
+            if (s.offset + backing_size == tail)
+                return bstack_discard(a->bs, (size_t)backing_size);
+        }
+#endif
     }
 
-    return slab_push_free_blocks(a->bs, s.offset, n_blocks, a->block_size);
+    /* Not at tail (or single-block): push to the free list under the lock. */
+    {
+        int r;
+        FF_LOCK(a);
+        r = slab_push_free_blocks(a->bs, s.offset, n_blocks, a->block_size);
+        FF_UNLOCK(a);
+        return r;
+    }
 }
 
 static int slab_vtbl_realloc(bstack_allocator_t *base, bstack_slice_t s,
                               uint64_t new_len, bstack_slice_t *out)
 {
     slab_bstack_allocator_t *a = (slab_bstack_allocator_t *)base;
-    uint64_t old_n, new_n, old_backing, new_backing, tail;
-    int is_tail;
+    uint64_t old_n, new_n, old_backing, new_backing;
 
     if (s.len == 0 && s.offset == SLAB_SENTINEL)
         return slab_vtbl_alloc(base, new_len, out);
@@ -3127,6 +3189,8 @@ static int slab_vtbl_realloc(bstack_allocator_t *base, bstack_slice_t s,
     new_n = slab_blocks_needed(new_len, a->block_size);
 
     if (old_n == new_n) {
+        /* Same backing blocks: zero newly-exposed bytes on grow (lock-free:
+         * zero stays within the caller's allocated region). */
         if (new_len > s.len) {
             uint64_t to_zero = new_len - s.len;
 #if UINT64_MAX > SIZE_MAX
@@ -3143,17 +3207,39 @@ static int slab_vtbl_realloc(bstack_allocator_t *base, bstack_slice_t s,
     old_backing = old_n * a->block_size;
     if (new_n > UINT64_MAX / a->block_size) { errno = EINVAL; return -1; }
     new_backing = new_n * a->block_size;
-    if (bstack_len(a->bs, &tail) != 0) return -1;
     if (s.offset > UINT64_MAX - old_backing) { errno = EINVAL; return -1; }
-    is_tail = (s.offset + old_backing == tail);
 
-    if (is_tail) {
-        if (new_n > old_n) {
-            uint64_t to_extend = new_backing - old_backing;
+    if (new_n > old_n) {
+        /* Grow path.
+         * With atomic: try_extend_zeros atomically checks tail == sentinel and
+         * appends the delta — no allocator lock needed.
+         * Without atomic: plain len() check then extend (single-threaded). */
+        uint64_t to_extend = new_backing - old_backing;
+        uint64_t sentinel  = s.offset + old_backing;
+        int      tail_done = 0;
 #if UINT64_MAX > SIZE_MAX
-            if (to_extend > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
+        if (to_extend > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
 #endif
-            if (bstack_extend(a->bs, (size_t)to_extend, NULL) != 0) return -1;
+
+#ifdef BSTACK_FEATURE_ATOMIC
+        {
+            int ok = 0;
+            if (bstack_try_extend_zeros(a->bs, sentinel,
+                                        (size_t)to_extend, &ok) != 0) return -1;
+            if (ok) tail_done = 1;
+        }
+#else
+        {
+            uint64_t tail;
+            if (bstack_len(a->bs, &tail) != 0) return -1;
+            if (sentinel == tail) {
+                if (bstack_extend(a->bs, (size_t)to_extend, NULL) != 0) return -1;
+                tail_done = 1;
+            }
+        }
+#endif
+
+        if (tail_done) {
             if (new_len > s.len) {
                 uint64_t to_zero = new_len - s.len;
 #if UINT64_MAX > SIZE_MAX
@@ -3162,56 +3248,95 @@ static int slab_vtbl_realloc(bstack_allocator_t *base, bstack_slice_t s,
                 if (bstack_zero(a->bs, s.offset + s.len, (size_t)to_zero) != 0)
                     return -1;
             }
-        } else {
-            uint64_t to_discard = old_backing - new_backing;
-#if UINT64_MAX > SIZE_MAX
-            if (to_discard > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
-#endif
-            if (bstack_discard(a->bs, (size_t)to_discard) != 0) return -1;
+            out->allocator = base; out->offset = s.offset; out->len = new_len;
+            return 0;
         }
-        out->allocator = base; out->offset = s.offset; out->len = new_len;
-        return 0;
-    }
 
-    if (new_n < old_n) {
-        /* Shrink non-tail: return excess blocks to free list. */
-        if (slab_push_free_blocks(a->bs, s.offset + new_n * a->block_size,
-                                  old_n - new_n, a->block_size) != 0)
-            return -1;
-        out->allocator = base; out->offset = s.offset; out->len = new_len;
-        return 0;
-    }
-
-    /* Grow non-tail: read old data into a zeroed new_backing-sized buffer,
-     * push it as a single atomic write, then free the old blocks. */
-    {
-        uint8_t  *buf;
-        uint64_t  push_offset;
+        /* Not at tail (or tail moved under atomic): grow non-tail.
+         * Read old data into a zeroed new_backing-sized buffer, push it as a
+         * single atomic write, then free the old blocks under the lock. */
+        {
+            uint8_t  *buf;
+            uint64_t  push_offset;
+            int       r;
 
 #if UINT64_MAX > SIZE_MAX
-        if (new_backing > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
+            if (new_backing > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
 #endif
-        buf = calloc(1, (size_t)new_backing);
-        if (!buf) return -1;
+            buf = calloc(1, (size_t)new_backing);
+            if (!buf) return -1;
 
-        if (s.len > 0) {
-            if (bstack_get(a->bs, s.offset, s.offset + s.len, buf) != 0) {
+            if (s.len > 0) {
+                if (bstack_get(a->bs, s.offset, s.offset + s.len, buf) != 0) {
+                    free(buf); return -1;
+                }
+            }
+
+            if (bstack_push(a->bs, buf, (size_t)new_backing, &push_offset) != 0) {
                 free(buf); return -1;
             }
+            free(buf);
+
+            FF_LOCK(a);
+            r = slab_push_free_blocks(a->bs, s.offset, old_n, a->block_size);
+            FF_UNLOCK(a);
+            if (r != 0) return -1;
+
+            out->allocator = base;
+            out->offset    = push_offset;
+            out->len       = new_len;
+            return 0;
+        }
+    }
+
+    /* Shrink path (new_n < old_n).
+     * With atomic: try_discard atomically checks tail == sentinel and removes
+     * the excess — no lock needed.  On failure the slice is not at the tail;
+     * fall through to shrink non-tail.
+     * Without atomic: plain len() check then discard (single-threaded). */
+    {
+        uint64_t to_discard = old_backing - new_backing;
+        uint64_t sentinel   = s.offset + old_backing;
+        int      tail_done  = 0;
+#if UINT64_MAX > SIZE_MAX
+        if (to_discard > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
+#endif
+
+#ifdef BSTACK_FEATURE_ATOMIC
+        {
+            int ok = 0;
+            if (bstack_try_discard(a->bs, sentinel,
+                                   (size_t)to_discard, &ok) != 0) return -1;
+            if (ok) tail_done = 1;
+        }
+#else
+        {
+            uint64_t tail;
+            if (bstack_len(a->bs, &tail) != 0) return -1;
+            if (sentinel == tail) {
+                if (bstack_discard(a->bs, (size_t)to_discard) != 0) return -1;
+                tail_done = 1;
+            }
+        }
+#endif
+
+        if (tail_done) {
+            out->allocator = base; out->offset = s.offset; out->len = new_len;
+            return 0;
         }
 
-        if (bstack_push(a->bs, buf, (size_t)new_backing, &push_offset) != 0) {
-            free(buf); return -1;
+        /* Shrink non-tail: return excess blocks to free list under the lock. */
+        {
+            int r;
+            FF_LOCK(a);
+            r = slab_push_free_blocks(a->bs,
+                                      s.offset + new_n * a->block_size,
+                                      old_n - new_n, a->block_size);
+            FF_UNLOCK(a);
+            if (r != 0) return -1;
+            out->allocator = base; out->offset = s.offset; out->len = new_len;
+            return 0;
         }
-        free(buf);
-
-        if (slab_push_free_blocks(a->bs, s.offset, old_n, a->block_size) != 0)
-            return -1;
-
-        out->allocator = base;
-        out->offset    = push_offset;
-        out->len       = new_len;
-        return 0;
     }
 }
 
@@ -3242,12 +3367,21 @@ slab_bstack_allocator_t *slab_bstack_allocator_new(bstack_t *bs,
     a = malloc(sizeof *a);
     if (!a) { errno = ENOMEM; return NULL; }
 
+#ifdef BSTACK_FEATURE_ATOMIC
+    if (bstack_alloc_lock_init(&a->lock) != 0) { free(a); return NULL; }
+#endif
+
     memset(hdr, 0, sizeof hdr);
     memcpy(hdr + (size_t)SLAB_OFFSET_SIZE, alsl_magic, 8);
     write_le64(hdr + (size_t)SLAB_BLOCK_SIZE_OFFSET, block_size);
     /* free_head at SLAB_FREE_HEAD_OFFSET stays 0 (SLAB_SENTINEL) */
 
-    if (bstack_push(bs, hdr, sizeof hdr, NULL) != 0) { free(a); return NULL; }
+    if (bstack_push(bs, hdr, sizeof hdr, NULL) != 0) {
+#ifdef BSTACK_FEATURE_ATOMIC
+        bstack_alloc_lock_destroy(a->lock);
+#endif
+        free(a); return NULL;
+    }
 
     a->base.vtbl      = &slab_allocator_vtbl;
     a->base.bulk_vtbl = NULL;
@@ -3301,6 +3435,10 @@ slab_bstack_allocator_t *slab_bstack_allocator_open(bstack_t *bs)
         return NULL;
     }
 
+#ifdef BSTACK_FEATURE_ATOMIC
+    if (bstack_alloc_lock_init(&a->lock) != 0) { free(a); return NULL; }
+#endif
+
     a->base.vtbl      = &slab_allocator_vtbl;
     a->base.bulk_vtbl = NULL;
     a->bs             = bs;
@@ -3310,12 +3448,18 @@ slab_bstack_allocator_t *slab_bstack_allocator_open(bstack_t *bs)
 
 void slab_bstack_allocator_free(slab_bstack_allocator_t *alloc)
 {
+#ifdef BSTACK_FEATURE_ATOMIC
+    bstack_alloc_lock_destroy(alloc->lock);
+#endif
     free(alloc);
 }
 
 bstack_t *slab_bstack_allocator_into_stack(slab_bstack_allocator_t *alloc)
 {
     bstack_t *bs = alloc->bs;
+#ifdef BSTACK_FEATURE_ATOMIC
+    bstack_alloc_lock_destroy(alloc->lock);
+#endif
     free(alloc);
     return bs;
 }
@@ -3345,7 +3489,7 @@ uint64_t slab_bstack_allocator_block_size(const slab_bstack_allocator_t *alloc)
 /* Maximum number of suspect blocks analysed in resync_tail before giving up. */
 #define ALCK_MAX_RECOVER_REGION ((size_t)(1u << 26))
 
-static const uint8_t alck_magic[8]        = {'A','L','C','K',0,1,0,0};
+static const uint8_t alck_magic[8]        = {'A','L','C','K',0,1,1,0};
 static const uint8_t alck_magic_prefix[6] = {'A','L','C','K',0,1};
 
 /* ---- LE helpers (reuse read_le64 / write_le64 already defined above) --- */
@@ -3756,14 +3900,18 @@ int checked_slab_bstack_allocator_recover(checked_slab_bstack_allocator_t *alloc
     size_t     i;
     int        ret        = 0;
 
-    if (bstack_len(bs, &stack_len) != 0) return -1;
+    FF_LOCK(alloc);
+
+    if (bstack_len(bs, &stack_len) != 0) { FF_UNLOCK(alloc); return -1; }
     if (stack_len <= ALCK_ARENA_START) {
         if (out_unsure) *out_unsure = 0;
-        return 0;
+        FF_UNLOCK(alloc); return 0;
     }
 
     if (alck_scan_free_list(bs, stack_len, block_size,
-                             &free_arr, &free_cnt, &free_corrupt) != 0) return -1;
+                             &free_arr, &free_cnt, &free_corrupt) != 0) {
+        FF_UNLOCK(alloc); return -1;
+    }
 
     p = ALCK_ARENA_START;
     while (p < stack_len) {
@@ -3860,6 +4008,7 @@ end_scan:
 done:
     free(free_arr);
     free(reclaim);
+    FF_UNLOCK(alloc);
     return ret;
 }
 
@@ -3885,9 +4034,15 @@ static int alck_vt_alloc(bstack_allocator_t *base, uint64_t len,
     if (num_blocks == UINT64_MAX) { errno = EINVAL; return -1; } /* overflow */
 
     if (num_blocks == 1) {
+        /* Lock is scoped to the free-list pop only; the tail-extend fallback
+         * below runs without the lock (bstack_extend is internally serialised
+         * and returns a distinct region to each concurrent caller). */
         uint64_t block_start;
-        if (alck_pop_and_claim_block(a->bs, 1, a->block_size, &block_start) != 0)
-            return -1;
+        int pop_r;
+        FF_LOCK(a);
+        pop_r = alck_pop_and_claim_block(a->bs, 1, a->block_size, &block_start);
+        FF_UNLOCK(a);
+        if (pop_r != 0) return -1;
         if (block_start != ALCK_SENTINEL) {
             out->allocator = base;
             out->offset    = block_start + ALCK_OVERHEAD;
@@ -3926,13 +4081,15 @@ static int alck_vt_alloc(bstack_allocator_t *base, uint64_t len,
 static int alck_vt_dealloc(bstack_allocator_t *base, bstack_slice_t s)
 {
     checked_slab_bstack_allocator_t *a = (checked_slab_bstack_allocator_t *)base;
-    uint64_t block_start, overhead, num_blocks, backing, tail, slice_end;
+    uint64_t block_start, overhead, num_blocks, backing, slice_end;
 
     if (s.len == 0 && s.offset == 0) return 0;
 
     if (s.offset < ALCK_OVERHEAD) { errno = EINVAL; return -1; }
     block_start = s.offset - ALCK_OVERHEAD;
 
+    /* read_overhead is a single bstack read from a block owned by the caller;
+     * no lock required here. */
     if (alck_read_overhead(a->bs, block_start, &overhead) != 0) return -1;
     if ((overhead & ALCK_IN_USE_BIT) == 0) { errno = EINVAL; return -1; }
 
@@ -3942,18 +4099,39 @@ static int alck_vt_dealloc(bstack_allocator_t *base, bstack_slice_t s)
     if (num_blocks > UINT64_MAX / a->block_size) { errno = EINVAL; return -1; }
     backing = num_blocks * a->block_size;
 
-    if (bstack_len(a->bs, &tail) != 0) return -1;
     if (block_start > UINT64_MAX - backing) { errno = EINVAL; return -1; }
     slice_end = block_start + backing;
 
-    if (slice_end == tail) {
 #if UINT64_MAX > SIZE_MAX
-        if (backing > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
+    if (backing > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
 #endif
-        return bstack_discard(a->bs, (size_t)backing);
-    }
 
-    return alck_push_free_blocks(a->bs, block_start, num_blocks, a->block_size);
+    /* Tail path: try_discard atomically checks tail == slice_end and removes
+     * backing bytes under bstack's own write lock — no allocator lock needed. */
+#ifdef BSTACK_FEATURE_ATOMIC
+    {
+        int ok = 0;
+        if (bstack_try_discard(a->bs, slice_end, (size_t)backing, &ok) != 0)
+            return -1;
+        if (ok) return 0;
+    }
+#else
+    {
+        uint64_t tail;
+        if (bstack_len(a->bs, &tail) != 0) return -1;
+        if (slice_end == tail)
+            return bstack_discard(a->bs, (size_t)backing);
+    }
+#endif
+
+    /* Not at tail: push to the free list under the allocator lock. */
+    {
+        int r;
+        FF_LOCK(a);
+        r = alck_push_free_blocks(a->bs, block_start, num_blocks, a->block_size);
+        FF_UNLOCK(a);
+        return r;
+    }
 }
 
 static int alck_vt_realloc(bstack_allocator_t *base, bstack_slice_t s,
@@ -3961,8 +4139,7 @@ static int alck_vt_realloc(bstack_allocator_t *base, bstack_slice_t s,
 {
     checked_slab_bstack_allocator_t *a = (checked_slab_bstack_allocator_t *)base;
     uint64_t block_start, overhead, old_n, new_n, old_backing, new_backing;
-    uint64_t tail;
-    int is_tail;
+    /* tail and is_tail are now computed per-path in inner scopes */
 
     if (s.len == 0 && s.offset == 0)
         return alck_vt_alloc(base, new_len, out);
@@ -4005,85 +4182,166 @@ static int alck_vt_realloc(bstack_allocator_t *base, bstack_slice_t s,
     old_backing = old_n * a->block_size;
     if (new_n > UINT64_MAX / a->block_size) { errno = EINVAL; return -1; }
     new_backing = new_n * a->block_size;
-
-    if (bstack_len(a->bs, &tail) != 0) return -1;
     if (block_start > UINT64_MAX - old_backing) { errno = EINVAL; return -1; }
-    is_tail = (block_start + old_backing == tail);
 
-    if (is_tail) {
-        if (new_n > old_n) {
-            uint64_t delta  = new_backing - old_backing;
-            uint64_t to_zero;
-#if UINT64_MAX > SIZE_MAX
-            if (delta > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
-#endif
-            if (bstack_extend(a->bs, (size_t)delta, NULL) != 0) return -1;
-            if (new_len > s.len) {
-                to_zero = new_len - s.len;
-#if UINT64_MAX > SIZE_MAX
-                if (to_zero > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
-#endif
-                if (bstack_zero(a->bs, s.offset + s.len, (size_t)to_zero) != 0)
-                    return -1;
-            }
-            if (alck_write_overhead(a->bs, block_start,
-                                    ALCK_IN_USE_BIT | new_n) != 0) return -1;
-        } else {
-            /* Shrink: update overhead first, then discard (crash-safer) */
-            uint64_t delta = old_backing - new_backing;
-            if (alck_write_overhead(a->bs, block_start,
-                                    ALCK_IN_USE_BIT | new_n) != 0) return -1;
-#if UINT64_MAX > SIZE_MAX
-            if (delta > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
-#endif
-            if (bstack_discard(a->bs, (size_t)delta) != 0) return -1;
-        }
-        out->allocator = base; out->offset = s.offset; out->len = new_len;
-        return 0;
-    }
-
-    if (new_n < old_n) {
-        /* Shrink non-tail: commit the new overhead first, then build free run.
-         * This is the commit point — before it the old view is fully intact. */
-        uint64_t excess_start;
-        if (new_n > UINT64_MAX / a->block_size) { errno = EINVAL; return -1; }
-        excess_start = block_start + new_n * a->block_size;
-
-        if (alck_write_overhead(a->bs, block_start,
-                                ALCK_IN_USE_BIT | new_n) != 0) return -1;
-        if (alck_write_free_run(a->bs, excess_start, old_n - new_n,
-                                a->block_size) != 0) return -1;
-        if (alck_write_free_head(a->bs, excess_start) != 0) return -1;
-
-        out->allocator = base; out->offset = s.offset; out->len = new_len;
-        return 0;
-    }
-
-    /* Grow non-tail: alloc a fresh region, copy data, release the old */
+    /* Precompute the expected tail for this allocation (sentinel). */
     {
-        bstack_slice_t new_s;
-        uint8_t       *tmp;
-        uint64_t       copy_len;
+        uint64_t sentinel = block_start + old_backing;
 
-        if (alck_vt_alloc(base, new_len, &new_s) != 0) return -1;
-
-        copy_len = s.len < new_len ? s.len : new_len;
-        if (copy_len > 0) {
+        if (new_n > old_n) {
+            /* Grow path.
+             * With atomic: try_extend_zeros atomically checks tail == sentinel
+             * and appends the delta under bstack's write lock — no allocator
+             * lock needed.  write_overhead then writes only to the exclusively-
+             * owned newly-extended region.  If try_extend_zeros returns false
+             * the tail has moved and we are no longer the tail block — fall
+             * through to grow non-tail.
+             * Without atomic: plain len() check then extend (single-threaded). */
+            uint64_t delta = new_backing - old_backing;
+            int tail_done = 0;
 #if UINT64_MAX > SIZE_MAX
-            if (copy_len > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
+            if (delta > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
 #endif
-            tmp = malloc((size_t)copy_len);
-            if (!tmp) return -1;
-            if (bstack_get(a->bs, s.offset, s.offset + copy_len, tmp) != 0
-                || bstack_set(a->bs, new_s.offset, tmp, (size_t)copy_len) != 0) {
-                free(tmp); return -1;
+
+#ifdef BSTACK_FEATURE_ATOMIC
+            {
+                int ok = 0;
+                if (bstack_try_extend_zeros(a->bs, sentinel,
+                                            (size_t)delta, &ok) != 0) return -1;
+                if (ok) tail_done = 1;
             }
-            free(tmp);
+#else
+            {
+                uint64_t cur_tail;
+                if (bstack_len(a->bs, &cur_tail) != 0) return -1;
+                if (sentinel == cur_tail) {
+                    if (bstack_extend(a->bs, (size_t)delta, NULL) != 0) return -1;
+                    tail_done = 1;
+                }
+            }
+#endif
+
+            if (tail_done) {
+                if (new_len > s.len) {
+                    uint64_t to_zero = new_len - s.len;
+#if UINT64_MAX > SIZE_MAX
+                    if (to_zero > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
+#endif
+                    if (bstack_zero(a->bs, s.offset + s.len,
+                                    (size_t)to_zero) != 0) return -1;
+                }
+                if (alck_write_overhead(a->bs, block_start,
+                                        ALCK_IN_USE_BIT | new_n) != 0) return -1;
+                out->allocator = base; out->offset = s.offset; out->len = new_len;
+                return 0;
+            }
+
+            /* Not at tail (or tail moved under atomic): grow non-tail.
+             * alloc and dealloc each acquire the lock for their own free-list
+             * and tail operations independently. */
+            {
+                bstack_slice_t new_s;
+                uint8_t       *tmp;
+                uint64_t       copy_len;
+
+                if (alck_vt_alloc(base, new_len, &new_s) != 0) return -1;
+
+                copy_len = s.len < new_len ? s.len : new_len;
+                if (copy_len > 0) {
+#if UINT64_MAX > SIZE_MAX
+                    if (copy_len > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
+#endif
+                    tmp = malloc((size_t)copy_len);
+                    if (!tmp) return -1;
+                    if (bstack_get(a->bs, s.offset, s.offset + copy_len, tmp) != 0
+                        || bstack_set(a->bs, new_s.offset, tmp,
+                                      (size_t)copy_len) != 0) {
+                        free(tmp); return -1;
+                    }
+                    free(tmp);
+                }
+
+                if (alck_vt_dealloc(base, s) != 0) return -1;
+                *out = new_s;
+                return 0;
+            }
         }
 
-        if (alck_vt_dealloc(base, s) != 0) return -1;
-        *out = new_s;
-        return 0;
+        /* Shrink path (new_n < old_n).  The lock covers the overhead write,
+         * tail check, and non-tail free-list update so those steps are atomic
+         * w.r.t. other threads. */
+        {
+            uint64_t delta = old_backing - new_backing;
+            uint64_t excess_start;
+            int r;
+#if UINT64_MAX > SIZE_MAX
+            if (delta > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
+#endif
+
+            FF_LOCK(a);
+
+            /* Overhead is the commit point for both tail and non-tail paths:
+             * write it first so a crash after this point leaves an orphaned
+             * (but safely unreferenced) tail region or leaked blocks that
+             * recover() can reclaim, rather than an overhead that claims more
+             * blocks than the file contains. */
+            if (alck_write_overhead(a->bs, block_start,
+                                    ALCK_IN_USE_BIT | new_n) != 0) {
+                FF_UNLOCK(a); return -1;
+            }
+
+            /* Tail shrink: try_discard atomically checks tail == sentinel and
+             * removes the excess under bstack's write lock, so no other thread
+             * can race between the check and the truncation.  On failure the
+             * slice is not at the tail; fall through to recycle excess blocks. */
+#ifdef BSTACK_FEATURE_ATOMIC
+            {
+                int ok = 0;
+                if (bstack_try_discard(a->bs, sentinel, (size_t)delta,
+                                       &ok) != 0) {
+                    FF_UNLOCK(a); return -1;
+                }
+                if (ok) {
+                    FF_UNLOCK(a);
+                    out->allocator = base; out->offset = s.offset;
+                    out->len = new_len;
+                    return 0;
+                }
+            }
+#else
+            {
+                uint64_t cur_tail;
+                if (bstack_len(a->bs, &cur_tail) != 0) {
+                    FF_UNLOCK(a); return -1;
+                }
+                if (sentinel == cur_tail) {
+                    if (bstack_discard(a->bs, (size_t)delta) != 0) {
+                        FF_UNLOCK(a); return -1;
+                    }
+                    FF_UNLOCK(a);
+                    out->allocator = base; out->offset = s.offset;
+                    out->len = new_len;
+                    return 0;
+                }
+            }
+#endif
+
+            /* Shrink non-tail: overhead already written (commit point); write
+             * free-list metadata into the excess blocks and repoint free_head. */
+            if (new_n > UINT64_MAX / a->block_size) {
+                FF_UNLOCK(a); errno = EINVAL; return -1;
+            }
+            excess_start = block_start + new_n * a->block_size;
+            if (alck_write_free_run(a->bs, excess_start,
+                                    old_n - new_n, a->block_size) != 0) {
+                FF_UNLOCK(a); return -1;
+            }
+            r = alck_write_free_head(a->bs, excess_start);
+            FF_UNLOCK(a);
+            if (r != 0) return -1;
+            out->allocator = base; out->offset = s.offset; out->len = new_len;
+            return 0;
+        }
     }
 }
 
@@ -4118,12 +4376,21 @@ checked_slab_bstack_allocator_t *checked_slab_bstack_allocator_new(
     a = malloc(sizeof *a);
     if (!a) { errno = ENOMEM; return NULL; }
 
+#ifdef BSTACK_FEATURE_ATOMIC
+    if (bstack_alloc_lock_init(&a->lock) != 0) { free(a); return NULL; }
+#endif
+
     memset(hdr, 0, sizeof hdr);
     memcpy(hdr + (size_t)ALCK_OFFSET_SIZE, alck_magic, 8);
     write_le64(hdr + (size_t)ALCK_OFFSET_SIZE + 8, block_size);
     /* free_head at ALCK_FREE_HEAD_OFFSET stays 0 (ALCK_SENTINEL) */
 
-    if (bstack_push(bs, hdr, sizeof hdr, NULL) != 0) { free(a); return NULL; }
+    if (bstack_push(bs, hdr, sizeof hdr, NULL) != 0) {
+#ifdef BSTACK_FEATURE_ATOMIC
+        bstack_alloc_lock_destroy(a->lock);
+#endif
+        free(a); return NULL;
+    }
 
     a->base.vtbl      = &alck_allocator_vtbl;
     a->base.bulk_vtbl = NULL;
@@ -4181,6 +4448,11 @@ checked_slab_bstack_allocator_t *checked_slab_bstack_allocator_open(bstack_t *bs
 
     a = malloc(sizeof *a);
     if (!a) { errno = ENOMEM; return NULL; }
+
+#ifdef BSTACK_FEATURE_ATOMIC
+    if (bstack_alloc_lock_init(&a->lock) != 0) { free(a); return NULL; }
+#endif
+
     a->base.vtbl      = &alck_allocator_vtbl;
     a->base.bulk_vtbl = NULL;
     a->bs             = bs;
@@ -4188,6 +4460,9 @@ checked_slab_bstack_allocator_t *checked_slab_bstack_allocator_open(bstack_t *bs
 
     /* Auto-recover: reclaim leaked blocks and repair orphaned tails */
     if (checked_slab_bstack_allocator_recover(a, NULL) != 0) {
+#ifdef BSTACK_FEATURE_ATOMIC
+        bstack_alloc_lock_destroy(a->lock);
+#endif
         free(a); return NULL;
     }
     return a;
@@ -4195,6 +4470,9 @@ checked_slab_bstack_allocator_t *checked_slab_bstack_allocator_open(bstack_t *bs
 
 void checked_slab_bstack_allocator_free(checked_slab_bstack_allocator_t *alloc)
 {
+#ifdef BSTACK_FEATURE_ATOMIC
+    bstack_alloc_lock_destroy(alloc->lock);
+#endif
     free(alloc);
 }
 
@@ -4202,6 +4480,9 @@ bstack_t *checked_slab_bstack_allocator_into_stack(
     checked_slab_bstack_allocator_t *alloc)
 {
     bstack_t *bs = alloc->bs;
+#ifdef BSTACK_FEATURE_ATOMIC
+    bstack_alloc_lock_destroy(alloc->lock);
+#endif
     free(alloc);
     return bs;
 }
