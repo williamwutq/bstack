@@ -1124,11 +1124,16 @@ All user-visible offsets (returned by `push`, accepted by `peek`/`get`) are
 | `splice`, `splice_into` *(atomic)*     | `lseek(tail)` → `read(n)` → *(then as `atrunc`)*                                          |
 | `try_extend` *(atomic)*                | size check → conditional `push` sequence                                                  |
 | `try_discard` *(atomic)*               | size check → conditional `discard` sequence                                               |
+| `try_extend_zeros` *(atomic)*          | size check → conditional `extend(n)` sequence                                             |
 | `swap`, `swap_into` *(set+atomic)*     | `lseek(offset)` → `read` → `lseek(offset)` → `write(buf)` → sync                          |
 | `cas` *(set+atomic)*                   | `lseek(offset)` → `read` → compare → conditional `write(new)` → sync                      |
 | `process` *(set+atomic)*               | `lseek(start)` → `read(end−start)` → *(callback)* → `lseek(start)` → `write(buf)` → sync  |
 | `replace` *(atomic)*                   | `lseek(tail)` → `read(n)` → *(callback)* → *(then as `atrunc`)*                           |
-| `peek`, `peek_into`, `get`, `get_into` | `pread(2)` on Unix; `ReadFile`+`OVERLAPPED` on Windows; `lseek` → `read` elsewhere        |
+| `cross_exchange` *(set+atomic)*        | `lseek(a)` → `read(n)` → `lseek(b)` → `read(n)` → `lseek(a)` → `write` → `lseek(b)` → `write` → sync |
+| `copy` *(set+atomic)*                  | `lseek(from)` → `read(n)` → `lseek(to)` → `write(n)` → sync                               |
+| `eq_crds`, `ne_crds` *(set+atomic)*    | `lseek(a)` → `read` → compare → conditional `lseek(b)` → `write(b_buf)` → sync            |
+| `masked_eq_crds`, `masked_ne_crds` *(set+atomic)* | `lseek(a)` → `read` → mask+compare → conditional `lseek(b)` → `write(b_buf)` → sync |
+| `peek`, `peek_into`, `get`, `get_into`, `get_batched`, `get_batched_into`, `get_batched_gen` | `pread(2)` on Unix; `ReadFile`+`OVERLAPPED` on Windows; `lseek` → `read` elsewhere |
 
 **`durable_sync` on macOS** issues `fcntl(F_FULLFSYNC)`.  Unlike `fdatasync`,
 this flushes the drive controller's write cache, providing the same "barrier

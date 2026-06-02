@@ -75,11 +75,16 @@
 //! | `splice`, `splice_into` *(feature: atomic)* | `lseek(tail)` → `read(n)` → *(then as `atrunc`)* |
 //! | `try_extend` *(feature: atomic)* | `lseek(END)` — conditional `push` sequence if size matches |
 //! | `try_discard` *(feature: atomic)* | `lseek(END)` — conditional `discard` sequence if size matches |
+//! | `try_extend_zeros` *(feature: atomic)* | `lseek(END)` — conditional `extend(n)` sequence if size matches |
 //! | `swap`, `swap_into` *(features: set+atomic)* | `lseek(offset)` → `read` → `lseek(offset)` → `write(buf)` → `durable_sync` |
 //! | `cas` *(features: set+atomic)* | `lseek(offset)` → `read` → compare — conditional `lseek(offset)` → `write(new)` → `durable_sync` |
 //! | `process` *(features: set+atomic)* | `lseek(start)` → `read(end−start)` → *(callback)* → `lseek(start)` → `write(buf)` → `durable_sync` |
 //! | `replace` *(feature: atomic)* | `lseek(tail)` → `read(n)` → *(callback)* → *(then as `atrunc`)* |
-//! | `peek`, `peek_into`, `get`, `get_into` | `pread(2)` on Unix; `ReadFile`+`OVERLAPPED` on Windows; `lseek` → `read` elsewhere (no sync — read-only) |
+//! | `cross_exchange` *(features: set+atomic)* | `lseek(a)` → `read(n)` → `lseek(b)` → `read(n)` → `lseek(a)` → `write` → `lseek(b)` → `write` → `durable_sync` |
+//! | `copy` *(features: set+atomic)* | `lseek(from)` → `read(n)` → `lseek(to)` → `write(n)` → `durable_sync` |
+//! | `eq_crds`, `ne_crds` *(features: set+atomic)* | `lseek(a)` → `read` → compare — conditional `lseek(b)` → `write(b_buf)` → `durable_sync` |
+//! | `masked_eq_crds`, `masked_ne_crds` *(features: set+atomic)* | `lseek(a)` → `read` → mask+compare — conditional `lseek(b)` → `write(b_buf)` → `durable_sync` |
+//! | `peek`, `peek_into`, `get`, `get_into`, `get_batched`, `get_batched_into`, `get_batched_gen` | `pread(2)` on Unix; `ReadFile`+`OVERLAPPED` on Windows; `lseek` → `read` elsewhere (no sync — read-only) |
 //!
 //! **`durable_sync` on macOS** issues `fcntl(F_FULLFSYNC)`, which flushes the
 //! drive's hardware write cache.  Plain `fdatasync` is not sufficient on macOS
