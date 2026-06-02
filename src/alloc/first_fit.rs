@@ -384,8 +384,8 @@ impl FirstFitBStackAllocator {
         //   1. Marking the block as free (crash before coalescing: recovery finds it as free).
         //   2. Absorbing the right neighbour if it is free (right coalesce).
         //   3. Merging into the left neighbour if it is free (left coalesce).
-        //   4. Tail reclamation: if the merged block ends at the stack tail, discard it entirely.
-        //   5. Otherwise, prepend the merged block to the free list.
+        //   4. Prepend the merged block to the free list.
+        //   (Tail reclamation is the caller's responsibility via cascade_discard_free_tail.)
 
         // Current free list:
         // free_head --------------> next -> ...
@@ -655,16 +655,18 @@ impl FirstFitBStackAllocator {
         }
     }
 
-    /// After discarding the tail block, cascade-discard any free blocks that are now the new tail.
+    /// Cascade-discard any free blocks sitting at the stack tail.
     ///
-    /// This maintains the invariant that no free block ever sits at the stack tail, which in turn
-    /// makes tail reclamation inside `add_to_free_list` impossible (and therefore omitted).
+    /// Called after every operation that can leave a free block at the tail: the explicit
+    /// tail-discard path in `dealloc` and after every `add_to_free_list` call (which may
+    /// coalesce the freed block up to the tail).  This maintains the invariant that no free
+    /// block ever sits at the stack tail.
     ///
-    /// Recovery management: the caller (`dealloc` tail path) is the sole manager of
-    /// `recovery_needed` and must set it before invoking this function and clear it after.
-    /// This avoids a double-set under the CAS-based atomic helpers and matches the C port.
+    /// Recovery management: the caller is the sole manager of `recovery_needed` and must set
+    /// it before invoking this function and clear it after.  This avoids a double-set under
+    /// the CAS-based atomic helpers.
     ///
-    /// With the `atomic` feature the caller (`dealloc`) holds `self.lock` for the duration,
+    /// With the `atomic` feature the caller holds `self.lock` for the duration,
     /// so the free-list unlinks and tail discards here are serialised against other threads.
     fn cascade_discard_free_tail(&self) -> io::Result<()> {
         let arena_start = Self::OFFSET_SIZE + Self::HEADER_SIZE;
@@ -945,6 +947,7 @@ impl BStackAllocator for FirstFitBStackAllocator {
         }
         self.set_recovery_needed()?;
         self.add_to_free_list(slice.start())?;
+        self.cascade_discard_free_tail()?;
         self.clear_recovery_needed()
     }
 
@@ -1239,6 +1242,7 @@ impl BStackAllocator for FirstFitBStackAllocator {
                 block_found.0
             };
             self.add_to_free_list(slice.start())?;
+            self.cascade_discard_free_tail()?;
             self.clear_recovery_needed()?;
             // SAFETY: new_payload from allocated block via unlink_block
             Ok(unsafe { BStackSlice::from_raw_parts(self, new_payload, new_len) })
@@ -1257,6 +1261,7 @@ impl BStackAllocator for FirstFitBStackAllocator {
             self.set_recovery_needed()?;
             let ptr = self.stack.push(&block_buf)? + Self::BLOCK_HEADER_SIZE;
             self.add_to_free_list(slice.start())?;
+            self.cascade_discard_free_tail()?;
             self.clear_recovery_needed()?;
             // SAFETY: ptr from fresh allocation via self.stack.push
             Ok(unsafe { BStackSlice::from_raw_parts(self, ptr, new_len) })
