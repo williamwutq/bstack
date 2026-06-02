@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **`FirstFitBStackAllocator::dealloc` / `realloc` — coalesced tail blocks never reclaimed** (`alloc` + `set` features): `cascade_discard_free_tail` was only called from the explicit tail-discard path in `dealloc`. When `add_to_free_list` coalesced a freed block with its neighbours and the result ended at the stack tail, that merged free block was never discarded — leaving the arena larger than necessary after all allocations were freed. No data corruption occurs; the free list remains structurally valid throughout. Fixed by calling `cascade_discard_free_tail` after every `add_to_free_list` call in both `dealloc` and `realloc`. The cascade is a no-op when the tail is still allocated.
+
 ## [0.2.3] - 2026-06-01
 
 ### Added
