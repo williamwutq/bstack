@@ -716,6 +716,16 @@ bstack_t *ghost_tree_bstack_allocator_into_stack(ghost_tree_bstack_allocator_t *
  * next-pointer then update free_head).  A crash between the two leaks the
  * block being added or removed but leaves the rest of the list intact.
  *
+ * Thread safety: without -DBSTACK_FEATURE_ATOMIC, an allocator handle must be
+ * used from one thread at a time — free-list mutations are a read then a write
+ * of free_head as separate bstack calls, a TOCTOU race under concurrent &self
+ * access that can result in two callers receiving the same block.  With
+ * -DBSTACK_FEATURE_ATOMIC the handle owns an in-memory mutex (lock) that
+ * serialises all compound operations spanning multiple bstack calls: free-list
+ * pop/push and the tail-length checks preceding extend or discard.  bstack
+ * extend / discard are internally serialised by bstack's own write lock; the
+ * allocator lock is not held during those calls.
+ *
  * Requires -DBSTACK_FEATURE_SET.
  * ====================================================================== */
 
@@ -807,6 +817,15 @@ uint64_t slab_bstack_allocator_block_size(const slab_bstack_allocator_t *alloc);
  * updating free_head.  A crash leaks at most the block being operated on;
  * the rest of the list stays intact.  checked_slab_bstack_allocator_recover
  * reclaims leaked blocks by a linear arena scan.
+ *
+ * Thread safety: without -DBSTACK_FEATURE_ATOMIC, an allocator handle must be
+ * used from one thread at a time — free-list mutations read then write free_head
+ * as separate bstack calls, a TOCTOU race under concurrent access.  With
+ * -DBSTACK_FEATURE_ATOMIC the handle owns an in-memory mutex (lock) that
+ * serialises all compound operations: free-list pop/push, the tail-length checks
+ * preceding extend or discard, and the recover scan.  bstack_try_discard and
+ * bstack_try_extend_zeros are used for the tail paths — those check-and-act
+ * atomically under bstack's own write lock without the allocator lock.
  *
  * Requires -DBSTACK_FEATURE_SET.
  * ====================================================================== */
