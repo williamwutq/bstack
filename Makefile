@@ -267,7 +267,8 @@ clean-zip:
 	rm -rf $(BUILD)/*.tar.gz $(BUILD)/*.zip
 
 clean-data:
-	rm -rf **/*.bstack
+	@rm -rf **/*.bstack
+	@rm -rf *.bstack
 
 # ── Zip ───────────────────────────────────────────────────────────────────────
 zip: $(BUILD)
