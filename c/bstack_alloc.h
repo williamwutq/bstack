@@ -723,6 +723,11 @@ typedef struct {
     bstack_allocator_t base; /* must be first — safe cast to bstack_allocator_t * */
     bstack_t          *bs;
     uint64_t           block_size;
+#ifdef BSTACK_FEATURE_ATOMIC
+    /* Opaque platform mutex; serialises free-list pop/push and tail operations
+     * so a single handle may be shared across threads. */
+    void              *lock;
+#endif
 } slab_bstack_allocator_t;
 
 /*
@@ -810,6 +815,11 @@ typedef struct {
     bstack_allocator_t base; /* must be first — safe cast to bstack_allocator_t * */
     bstack_t          *bs;
     uint64_t           block_size;
+#ifdef BSTACK_FEATURE_ATOMIC
+    /* Opaque platform mutex; serialises free-list pop/push and tail operations
+     * so a single handle may be shared across threads. */
+    void              *lock;
+#endif
 } checked_slab_bstack_allocator_t;
 
 /*
