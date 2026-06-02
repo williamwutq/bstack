@@ -127,6 +127,11 @@ impl BStack {
     #[cfg(feature = "atomic")]
     pub fn try_discard(&self, s: u64, n: u64) -> io::Result<bool>;
 
+    /// Append `n` zero bytes only if the current payload size equals `s`; returns whether it did.
+    /// Requires the `atomic` feature.
+    #[cfg(feature = "atomic")]
+    pub fn try_extend_zeros(&self, s: u64, n: u64) -> io::Result<bool>;
+
     /// Atomically read `buf.len()` bytes at `offset` and overwrite them with `buf`;
     /// returns the old contents.  Requires the `set` and `atomic` features.
     #[cfg(all(feature = "set", feature = "atomic"))]
@@ -155,6 +160,44 @@ impl BStack {
     pub fn process<F>(&self, start: u64, end: u64, f: F) -> io::Result<()>
     where F: FnOnce(&mut [u8]);
 
+    /// Atomically swap two non-overlapping byte regions of length `n` under one write lock.
+    /// Requires the `set` and `atomic` features.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    pub fn cross_exchange(&self, a: u64, b: u64, n: u64) -> io::Result<()>;
+
+    /// Copy `n` bytes from `from` to `to` under one write lock.  Regions may overlap.
+    /// Requires the `set` and `atomic` features.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    pub fn copy(&self, from: u64, to: u64, n: u64) -> io::Result<()>;
+
+    /// Write `b_buf` at `b_offset` only if bytes at `a_offset` equal `a_expected`.
+    /// Returns `Some(old_b)` on success, `None` if the condition was not met.
+    /// Requires the `set` and `atomic` features.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    pub fn eq_crds(&self, a_offset: u64, a_expected: impl AsRef<[u8]>,
+                   b_offset: u64, b_buf: impl AsRef<[u8]>) -> io::Result<Option<Vec<u8>>>;
+
+    /// Like `eq_crds` but writes when region A does NOT match `a_expected`.
+    /// Returns `Some(old_b)` on success, `None` if the condition was not met.
+    /// Requires the `set` and `atomic` features.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    pub fn ne_crds(&self, a_offset: u64, a_expected: impl AsRef<[u8]>,
+                   b_offset: u64, b_buf: impl AsRef<[u8]>) -> io::Result<Option<Vec<u8>>>;
+
+    /// Like `eq_crds` with a bitmask applied to the comparison of region A.
+    /// Requires the `set` and `atomic` features.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    pub fn masked_eq_crds(&self, a_offset: u64, mask: impl AsRef<[u8]>,
+                          a_expected: impl AsRef<[u8]>, b_offset: u64,
+                          b_buf: impl AsRef<[u8]>) -> io::Result<Option<Vec<u8>>>;
+
+    /// Like `ne_crds` with a bitmask applied to the comparison of region A.
+    /// Requires the `set` and `atomic` features.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    pub fn masked_ne_crds(&self, a_offset: u64, mask: impl AsRef<[u8]>,
+                          a_expected: impl AsRef<[u8]>, b_offset: u64,
+                          b_buf: impl AsRef<[u8]>) -> io::Result<Option<Vec<u8>>>;
+
     /// Copy all bytes from `offset` to the end of the payload.
     /// `offset == len()` returns an empty Vec.
     pub fn peek(&self, offset: u64) -> io::Result<Vec<u8>>;
@@ -172,6 +215,24 @@ impl BStack {
     /// An empty buffer is a valid no-op.
     /// Prefer this over `get` when a buffer is already available to avoid an extra allocation.
     pub fn get_into(&self, start: u64, buf: &mut [u8]) -> io::Result<()>;
+
+    /// Read multiple byte ranges under a single read lock; ranges may overlap.
+    /// Requires the `atomic` feature.
+    #[cfg(feature = "atomic")]
+    pub fn get_batched<I>(&self, ranges: I) -> io::Result<Vec<Vec<u8>>>
+    where I: IntoIterator<Item = std::ops::Range<u64>>;
+
+    /// Like `get_batched` but reads into caller-supplied `(offset, buf)` pairs.
+    /// Requires the `atomic` feature.
+    #[cfg(feature = "atomic")]
+    pub fn get_batched_into<'a, I>(&self, bufs: I) -> io::Result<()>
+    where I: IntoIterator<Item = (u64, &'a mut [u8])>;
+
+    /// Like `get_batched_into` but the caller supplies a generator closure yielding
+    /// `(offset, buf)` pairs; `None` ends the batch.  Requires the `atomic` feature.
+    #[cfg(feature = "atomic")]
+    pub fn get_batched_gen<'a, F>(&self, f: F) -> io::Result<()>
+    where F: FnMut() -> Option<(u64, &'a mut [u8])>;
 
     /// Current payload size in bytes (excludes the 16-byte header).
     pub fn len(&self) -> io::Result<u64>;
@@ -408,11 +469,21 @@ bstack = { version = "0.2", features = ["set", "atomic"] }
 - **`splice_into(old, new)`** — Like `splice` but reads removed bytes into a caller-supplied buffer instead of allocating a `Vec` (`n = old.len()`).
 - **`try_extend(s, buf)`** — Append `buf` only if the current payload size equals `s`. Returns `true` on success. Useful for optimistic-append protocols.
 - **`try_discard(s, n)`** — Discard `n` bytes only if the current payload size equals `s`. Returns `true` on success.
+- **`try_extend_zeros(s, n)`** — Append `n` zero bytes only if the current payload size equals `s`. Returns `true` on success.
 - **`replace(n, f)`** — Pop `n` bytes, pass them read-only to callback `f`, write back the returned `Vec` as the new tail. File may grow or shrink.
+- **`get_batched(ranges)`** — Read multiple byte ranges under a single read lock; ranges may overlap.  Returns one `Vec<u8>` per range.
+- **`get_batched_into(bufs)`** — Like `get_batched` but reads into caller-supplied `(offset, &mut [u8])` pairs.
+- **`get_batched_gen(f)`** — Like `get_batched_into` but the caller provides a generator closure yielding `(offset, buf)` pairs; useful for dependent reads where each range depends on a prior result.
 - **`swap(offset, buf)`** *(requires `set`)* — Read `buf.len()` bytes at `offset`, overwrite with `buf`, return old bytes. File size never changes.
 - **`swap_into(offset, buf)`** *(requires `set`)* — Like `swap` but exchanges in-place: on entry `buf` holds new bytes, on return holds old bytes.
 - **`cas(offset, old, new)`** *(requires `set`)* — Overwrite bytes at `offset` with `new` only if they currently equal `old`. Returns `true` if exchanged. File size never changes.
 - **`process(start, end, f)`** *(requires `set`)* — Read `[start, end)`, pass to `f` as `&mut [u8]` for in-place mutation, write back. File size never changes. `start == end` is a no-op.
+- **`cross_exchange(a, b, n)`** *(requires `set`)* — Atomically swap two non-overlapping byte regions of length `n` under one write lock.
+- **`copy(from, to, n)`** *(requires `set`)* — Copy `n` bytes from `from` to `to` under one write lock.  Regions may overlap.
+- **`eq_crds(a_offset, a_expected, b_offset, b_buf)`** *(requires `set`)* — Write `b_buf` at `b_offset` only if bytes at `a_offset` equal `a_expected` (compare-and-swap across two regions). Returns `Some(old_b)` on success, `None` otherwise.
+- **`ne_crds(a_offset, a_expected, b_offset, b_buf)`** *(requires `set`)* — Like `eq_crds` but writes when region A does NOT match.
+- **`masked_eq_crds(a_offset, mask, a_expected, b_offset, b_buf)`** *(requires `set`)* — Like `eq_crds` with a bitmask applied to the comparison of region A.
+- **`masked_ne_crds(a_offset, mask, a_expected, b_offset, b_buf)`** *(requires `set`)* — Like `ne_crds` with a bitmask applied to the comparison of region A.
 
 ---
 
@@ -1119,10 +1190,15 @@ maps to `io::ErrorKind::WouldBlock` in Rust).  The lock is released when the
 | `atrunc`, `splice`, `splice_into`, `try_extend` *(atomic)*   | write                 | write        |
 | `try_discard(s, n > 0)` *(atomic)*                           | write                 | write        |
 | `try_discard(s, 0)` *(atomic)*                               | **read**              | **read**     |
+| `try_extend_zeros` *(atomic)*                                | write                 | write        |
 | `swap`, `swap_into`, `cas` *(set+atomic)*                    | write                 | write        |
 | `process` *(set+atomic)*                                     | write                 | write        |
 | `replace` *(atomic)*                                         | write                 | write        |
+| `cross_exchange`, `copy` *(set+atomic)*                      | write                 | write        |
+| `eq_crds`, `ne_crds` *(set+atomic)*                          | write                 | write        |
+| `masked_eq_crds`, `masked_ne_crds` *(set+atomic)*            | write                 | write        |
 | `peek`, `peek_into`, `get`, `get_into`                       | **read**              | write        |
+| `get_batched`, `get_batched_into`, `get_batched_gen` *(atomic)* | **read**           | write        |
 | `len`                                                        | read                  | read         |
 
 On Unix and Windows, `peek`, `peek_into`, `get`, and `get_into` use a
