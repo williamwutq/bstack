@@ -673,7 +673,13 @@ impl GhostTreeBstackAllocator {
                 }
             }
         }
-        let new_root = results.pop().unwrap_or(NULL_PTR);
+        let new_root = results
+            .pop()
+            .expect("build invariant: results must have exactly one element");
+        debug_assert!(
+            results.is_empty(),
+            "build invariant: excess elements on results stack"
+        );
         self.write_root(new_root)
     }
 }
