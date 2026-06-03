@@ -34,6 +34,20 @@ const NODE_HEIGHT_OFF: u64 = 9; // u8 height (max ~59 for balanced; slightly mor
 const NODE_LEFT_OFF: u64 = 16;
 const NODE_RIGHT_OFF: u64 = 24;
 
+/// A node visited during a downward AVL tree traversal.
+///
+/// Used by [`avl_insert`](GhostTreeBstackAllocator::avl_insert) and
+/// [`avl_find_best_fit_and_remove`](GhostTreeBstackAllocator::avl_find_best_fit_and_remove)
+/// to record the path so that balance factors and heights can be updated on
+/// the way back up without recursion.
+struct PathEntry {
+    ptr: u64,
+    size: u64,
+    left: u64,
+    right: u64,
+    went_left: bool,
+}
+
 /// A pure-AVL general-purpose allocator built on top of a [`BStack`].
 ///
 /// Free blocks store their AVL node inline at offset 0 within the block —
@@ -374,190 +388,202 @@ impl GhostTreeBstackAllocator {
         }
     }
 
-    /// Recursive insert into subtree at `root`; return new subtree root.
-    fn avl_insert_rec(&self, root: u64, ptr: u64, size: u64, depth: u32) -> io::Result<u64> {
-        if root == NULL_PTR {
-            self.write_node(ptr, size, 0, 1, NULL_PTR, NULL_PTR)?;
-            return Ok(ptr);
-        }
-        if depth == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "AVL insert exceeded maximum depth: corrupted tree (possible cycle)",
-            ));
-        }
-        let (root_sz, _, _, left, right) = self.read_node(root)?;
-        if (size, ptr) < (root_sz, root) {
-            let new_left = self.avl_insert_rec(left, ptr, size, depth - 1)?;
-            self.avl_write_and_update(root, root_sz, new_left, right)?;
-        } else {
-            let new_right = self.avl_insert_rec(right, ptr, size, depth - 1)?;
-            self.avl_write_and_update(root, root_sz, left, new_right)?;
-        }
-        self.avl_rebalance(root)
-    }
-
     /// Insert a free block at `ptr` with `size` bytes into the AVL tree.
     fn avl_insert(&self, ptr: u64, size: u64) -> io::Result<()> {
         let root = self.read_root()?;
-        let new_root = self.avl_insert_rec(root, ptr, size, MAX_AVL_DEPTH)?;
-        self.write_root(new_root)
+
+        // Down-pass: walk to the insertion position, recording the path.
+        let mut path: Vec<PathEntry> = Vec::new();
+        let mut current = root;
+        while current != NULL_PTR {
+            if path.len() >= MAX_AVL_DEPTH as usize {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "AVL insert exceeded maximum depth: corrupted tree (possible cycle)",
+                ));
+            }
+            let (root_sz, _, _, left, right) = self.read_node(current)?;
+            let went_left = (size, ptr) < (root_sz, current);
+            path.push(PathEntry {
+                ptr: current,
+                size: root_sz,
+                left,
+                right,
+                went_left,
+            });
+            current = if went_left { left } else { right };
+        }
+
+        // Write the new leaf.
+        self.write_node(ptr, size, 0, 1, NULL_PTR, NULL_PTR)?;
+
+        // Up-pass: propagate the new child pointer and rebalance each ancestor.
+        let mut child = ptr;
+        for entry in path.iter().rev() {
+            let (new_left, new_right) = if entry.went_left {
+                (child, entry.right)
+            } else {
+                (entry.left, child)
+            };
+            self.avl_write_and_update(entry.ptr, entry.size, new_left, new_right)?;
+            child = self.avl_rebalance(entry.ptr)?;
+        }
+        self.write_root(child)
     }
 
-    /// Return `(ptr, size)` of the leftmost (minimum-key) node in `subtree`.
-    fn avl_min(&self, subtree: u64, depth: u32) -> io::Result<(u64, u64)> {
-        let (size, _, _, left, _) = self.read_node(subtree)?;
-        if left == NULL_PTR {
-            Ok((subtree, size))
-        } else {
-            if depth == 0 {
+    /// Remove the minimum-key (leftmost) node from the subtree rooted at `root`,
+    /// rebalancing the path back up.
+    ///
+    /// Returns `(min_ptr, min_size, new_subtree_root)`.  The minimum node always
+    /// has no left child, so its replacement is its right child (or [`NULL_PTR`]).
+    fn avl_remove_min(&self, root: u64) -> io::Result<(u64, u64, u64)> {
+        // Walk left, recording (ptr, size, right_child) for each ancestor.
+        let mut path: Vec<(u64, u64, u64)> = Vec::new();
+        let mut current = root;
+        loop {
+            let (size, _, _, left, right) = self.read_node(current)?;
+            if left == NULL_PTR {
+                // `current` is the minimum; replace it with its right child.
+                let mut child = right;
+                for &(anc_ptr, anc_sz, anc_right) in path.iter().rev() {
+                    self.avl_write_and_update(anc_ptr, anc_sz, child, anc_right)?;
+                    child = self.avl_rebalance(anc_ptr)?;
+                }
+                return Ok((current, size, child));
+            }
+            if path.len() >= MAX_AVL_DEPTH as usize {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "AVL min exceeded maximum depth: corrupted tree (possible cycle)",
                 ));
             }
-            self.avl_min(left, depth - 1)
-        }
-    }
-
-    /// Recursive remove of `(size, ptr)` from subtree at `root`; return new root.
-    fn avl_remove_rec(&self, root: u64, ptr: u64, size: u64, depth: u32) -> io::Result<u64> {
-        if root == NULL_PTR {
-            return Ok(NULL_PTR);
-        }
-        if depth == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "AVL remove exceeded maximum depth: corrupted tree (possible cycle)",
-            ));
-        }
-        let (root_sz, _, _, left, right) = self.read_node(root)?;
-        if (size, ptr) < (root_sz, root) {
-            let new_left = self.avl_remove_rec(left, ptr, size, depth - 1)?;
-            self.avl_write_and_update(root, root_sz, new_left, right)?;
-            return self.avl_rebalance(root);
-        }
-        if (size, ptr) > (root_sz, root) {
-            let new_right = self.avl_remove_rec(right, ptr, size, depth - 1)?;
-            self.avl_write_and_update(root, root_sz, left, new_right)?;
-            return self.avl_rebalance(root);
-        }
-        // Found the node to remove.
-        if left == NULL_PTR {
-            return Ok(right);
-        }
-        if right == NULL_PTR {
-            return Ok(left);
-        }
-        // Two children: replace with the in-order successor (leftmost of right
-        // subtree), then delete the successor from the right subtree.
-        let (succ, succ_sz) = self.avl_min(right, depth - 1)?;
-        let new_right = self.avl_remove_rec(right, succ, succ_sz, depth - 1)?;
-        self.avl_write_and_update(succ, succ_sz, left, new_right)?;
-        self.avl_rebalance(succ)
-    }
-
-    /// Find and remove the best-fit block (smallest block ≥ `min_size`) from
-    /// the subtree at `root` in a single O(log n) pass.
-    ///
-    /// Returns `(new_subtree_root, Option<(found_ptr, found_size)>)`.
-    ///
-    /// Strategy: when the current node fits, recurse left to try to find a
-    /// smaller fit.  If the left subtree yields a candidate, wire the updated
-    /// left child back and rebalance — the current node stays in the tree.  If
-    /// not, the current node *is* the best fit and is removed using the standard
-    /// two-child replacement (in-order successor).
-    fn avl_find_best_fit_and_remove_rec(
-        &self,
-        root: u64,
-        min_size: u64,
-        depth: u32,
-    ) -> io::Result<(u64, Option<(u64, u64)>)> {
-        if root == NULL_PTR {
-            return Ok((NULL_PTR, None));
-        }
-        if depth == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "AVL find exceeded maximum depth: corrupted tree (possible cycle)",
-            ));
-        }
-        let (root_sz, _, _, left, right) = self.read_node(root)?;
-        if root_sz >= min_size {
-            // This node fits — try left for something smaller.
-            let (new_left, found) =
-                self.avl_find_best_fit_and_remove_rec(left, min_size, depth - 1)?;
-            if let Some(candidate) = found {
-                // A smaller fit was found; keep root, update its left child.
-                self.avl_write_and_update(root, root_sz, new_left, right)?;
-                let new_root = self.avl_rebalance(root)?;
-                return Ok((new_root, Some(candidate)));
-            }
-            // No smaller fit in the left subtree — remove root itself.
-            // Use `new_left` (not the stale `left`): even though no node was
-            // removed, the recursive call may have rebalanced the left subtree,
-            // changing its root pointer.
-            let new_root = if new_left == NULL_PTR {
-                right
-            } else if right == NULL_PTR {
-                new_left
-            } else {
-                let (succ, succ_sz) = self.avl_min(right, depth - 1)?;
-                let new_right = self.avl_remove_rec(right, succ, succ_sz, depth - 1)?;
-                self.avl_write_and_update(succ, succ_sz, new_left, new_right)?;
-                self.avl_rebalance(succ)?
-            };
-            Ok((new_root, Some((root, root_sz))))
-        } else {
-            // Too small — only right subtree can have a fit.
-            let (new_right, found) =
-                self.avl_find_best_fit_and_remove_rec(right, min_size, depth - 1)?;
-            // Only update the tree structure if a node was actually removed.
-            // Updating unconditionally would corrupt child pointers on a no-fit
-            // path (the recursive call may have rebalanced without removing).
-            if found.is_some() {
-                self.avl_write_and_update(root, root_sz, left, new_right)?;
-                let new_root = self.avl_rebalance(root)?;
-                Ok((new_root, found))
-            } else {
-                Ok((root, None))
-            }
+            path.push((current, size, right));
+            current = left;
         }
     }
 
     /// Find and remove the best-fit block (smallest block ≥ `min_size`).
     ///
     /// Returns `(ptr, size)`, or `None` if no block fits.
+    ///
+    /// Strategy: when the current node fits, go left to try to find a smaller
+    /// fit.  The best fit is the last fitting node encountered before the
+    /// traversal exhausts the left subtree.  Path entries after that index
+    /// searched the best-fit node's left subtree and found nothing — they
+    /// require no updates.
     fn avl_find_best_fit_and_remove(&self, min_size: u64) -> io::Result<Option<(u64, u64)>> {
         let root = self.read_root()?;
-        let (new_root, found) =
-            self.avl_find_best_fit_and_remove_rec(root, min_size, MAX_AVL_DEPTH)?;
-        self.write_root(new_root)?;
-        Ok(found)
+        if root == NULL_PTR {
+            return Ok(None);
+        }
+
+        // Down-pass: record the full traversal path and the index of the last
+        // node that satisfies size >= min_size (the best fit).
+        let mut path: Vec<PathEntry> = Vec::new();
+        let mut last_fit_idx: Option<usize> = None;
+        let mut current = root;
+        while current != NULL_PTR {
+            if path.len() >= MAX_AVL_DEPTH as usize {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "AVL find exceeded maximum depth: corrupted tree (possible cycle)",
+                ));
+            }
+            let (root_sz, _, _, left, right) = self.read_node(current)?;
+            if root_sz >= min_size {
+                last_fit_idx = Some(path.len());
+                path.push(PathEntry {
+                    ptr: current,
+                    size: root_sz,
+                    left,
+                    right,
+                    went_left: true,
+                });
+                current = left;
+            } else {
+                path.push(PathEntry {
+                    ptr: current,
+                    size: root_sz,
+                    left,
+                    right,
+                    went_left: false,
+                });
+                current = right;
+            }
+        }
+
+        let fit_idx = match last_fit_idx {
+            None => return Ok(None),
+            Some(i) => i,
+        };
+
+        let found_ptr = path[fit_idx].ptr;
+        let found_size = path[fit_idx].size;
+        let found_left = path[fit_idx].left;
+        let found_right = path[fit_idx].right;
+
+        // Remove the best-fit node.  The left subtree (path[fit_idx+1..]) was
+        // searched and yielded nothing, so found_left is returned unchanged.
+        let replacement = if found_left == NULL_PTR {
+            found_right
+        } else if found_right == NULL_PTR {
+            found_left
+        } else {
+            // Two children: replace with in-order successor (min of right subtree).
+            let (succ, succ_sz, new_right) = self.avl_remove_min(found_right)?;
+            self.avl_write_and_update(succ, succ_sz, found_left, new_right)?;
+            self.avl_rebalance(succ)?
+        };
+
+        // Up-pass: update path[0..fit_idx] (path[fit_idx] was removed).
+        let mut child = replacement;
+        for entry in path[..fit_idx].iter().rev() {
+            let (new_left, new_right) = if entry.went_left {
+                (child, entry.right)
+            } else {
+                (entry.left, child)
+            };
+            self.avl_write_and_update(entry.ptr, entry.size, new_left, new_right)?;
+            child = self.avl_rebalance(entry.ptr)?;
+        }
+        self.write_root(child)?;
+        Ok(Some((found_ptr, found_size)))
     }
 
     /// In-order walk of the subtree at `root`, calling `f(ptr, size)` per node.
     /// Tolerates imbalance — visits every reachable node.  Returns `InvalidData`
-    /// if `depth` reaches zero (cycle guard against corrupted trees).
+    /// if the traversal stack exceeds [`MAX_AVL_DEPTH`] (cycle guard).
     fn avl_walk_inorder(
         &self,
         root: u64,
-        depth: u32,
         f: &mut dyn FnMut(u64, u64) -> io::Result<()>,
     ) -> io::Result<()> {
-        if root == NULL_PTR {
-            return Ok(());
+        // Each stack entry is `(ptr, right_child, size)` for a node whose left
+        // subtree is currently being visited.
+        let mut stack: Vec<(u64, u64, u64)> = Vec::new();
+        let mut current = root;
+        loop {
+            // Descend left, pushing nodes onto the stack.
+            while current != NULL_PTR {
+                if stack.len() >= MAX_AVL_DEPTH as usize {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "AVL walk exceeded maximum depth: corrupted tree (possible cycle)",
+                    ));
+                }
+                let (size, _, _, left, right) = self.read_node(current)?;
+                stack.push((current, right, size));
+                current = left;
+            }
+            // Pop and visit; then follow the right child.
+            match stack.pop() {
+                None => return Ok(()),
+                Some((ptr, right, size)) => {
+                    f(ptr, size)?;
+                    current = right;
+                }
+            }
         }
-        if depth == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "AVL walk exceeded maximum depth: corrupted tree (possible cycle)",
-            ));
-        }
-        let (size, _, _, left, right) = self.read_node(root)?;
-        self.avl_walk_inorder(left, depth - 1, f)?;
-        f(root, size)?;
-        self.avl_walk_inorder(right, depth - 1, f)
     }
 
     /// Collect all free blocks, merge adjacent ones, and rebuild a balanced AVL
@@ -571,7 +597,7 @@ impl GhostTreeBstackAllocator {
         // Step 1: collect all free blocks in key order
         let root = self.read_root()?;
         let mut blocks: Vec<(u64, u64)> = Vec::new(); // (ptr, size)
-        self.avl_walk_inorder(root, MAX_AVL_DEPTH, &mut |ptr, size| {
+        self.avl_walk_inorder(root, &mut |ptr, size| {
             blocks.push((ptr, size));
             Ok(())
         })?;
@@ -610,25 +636,44 @@ impl GhostTreeBstackAllocator {
 
         // Step 4: rebuild a balanced AVL tree
         // Coalescing sorted by address; now re-sort by the tree's key (size, ptr)
-        // so `build` produces a valid BST.  Without this, insert/remove would
+        // so the build produces a valid BST.  Without this, insert/remove would
         // navigate by (size, ptr) into an address-ordered tree and miss nodes.
         coalesced.sort_by_key(|&(ptr, size)| (size, ptr));
 
-        // Recursive helper: build an optimally balanced BST from a sorted slice,
-        // writing each node and returning the root ptr.
-        fn build(this: &GhostTreeBstackAllocator, blocks: &[(u64, u64)]) -> io::Result<u64> {
-            if blocks.is_empty() {
-                return Ok(NULL_PTR);
-            }
-            let mid = blocks.len() / 2;
-            let (ptr, size) = blocks[mid];
-            let left = build(this, &blocks[..mid])?;
-            let right = build(this, &blocks[mid + 1..])?;
-            this.avl_write_and_update(ptr, size, left, right)?;
-            Ok(ptr)
+        // Iterative balanced BST build using an explicit ops stack.
+        //   Enter(lo, hi) — process range [lo, hi): push Combine(mid), then
+        //     Enter(mid+1, hi), then Enter(lo, mid) (reverse order so left
+        //     executes first).
+        //   Combine(i) — pop right_root then left_root from results, write
+        //     coalesced[i] as a node, push its ptr onto results.
+        enum BuildOp {
+            Enter(usize, usize),
+            Combine(usize),
         }
-
-        let new_root = build(self, &coalesced)?;
+        let mut ops: Vec<BuildOp> = vec![BuildOp::Enter(0, coalesced.len())];
+        let mut results: Vec<u64> = Vec::new();
+        while let Some(op) = ops.pop() {
+            match op {
+                BuildOp::Enter(lo, hi) => {
+                    if lo >= hi {
+                        results.push(NULL_PTR);
+                    } else {
+                        let mid = lo + (hi - lo) / 2;
+                        ops.push(BuildOp::Combine(mid));
+                        ops.push(BuildOp::Enter(mid + 1, hi));
+                        ops.push(BuildOp::Enter(lo, mid));
+                    }
+                }
+                BuildOp::Combine(i) => {
+                    let right_root = results.pop().unwrap();
+                    let left_root = results.pop().unwrap();
+                    let (ptr, size) = coalesced[i];
+                    self.avl_write_and_update(ptr, size, left_root, right_root)?;
+                    results.push(ptr);
+                }
+            }
+        }
+        let new_root = results.pop().unwrap_or(NULL_PTR);
         self.write_root(new_root)
     }
 }
