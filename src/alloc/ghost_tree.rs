@@ -393,7 +393,7 @@ impl GhostTreeBstackAllocator {
         let root = self.read_root()?;
 
         // Down-pass: walk to the insertion position, recording the path.
-        let mut path: Vec<PathEntry> = Vec::new();
+        let mut path: Vec<PathEntry> = Vec::with_capacity(MAX_AVL_DEPTH as usize);
         let mut current = root;
         while current != NULL_PTR {
             if path.len() >= MAX_AVL_DEPTH as usize {
@@ -438,7 +438,7 @@ impl GhostTreeBstackAllocator {
     /// has no left child, so its replacement is its right child (or [`NULL_PTR`]).
     fn avl_remove_min(&self, root: u64) -> io::Result<(u64, u64, u64)> {
         // Walk left, recording (ptr, size, right_child) for each ancestor.
-        let mut path: Vec<(u64, u64, u64)> = Vec::new();
+        let mut path: Vec<(u64, u64, u64)> = Vec::with_capacity(MAX_AVL_DEPTH as usize);
         let mut current = root;
         loop {
             let (size, _, _, left, right) = self.read_node(current)?;
@@ -479,7 +479,7 @@ impl GhostTreeBstackAllocator {
 
         // Down-pass: record the full traversal path and the index of the last
         // node that satisfies size >= min_size (the best fit).
-        let mut path: Vec<PathEntry> = Vec::new();
+        let mut path: Vec<PathEntry> = Vec::with_capacity(MAX_AVL_DEPTH as usize);
         let mut last_fit_idx: Option<usize> = None;
         let mut current = root;
         while current != NULL_PTR {
