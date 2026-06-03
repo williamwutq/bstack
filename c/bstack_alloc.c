@@ -2024,6 +2024,14 @@ bstack_t *first_fit_bstack_allocator_into_stack(first_fit_bstack_allocator_t *al
 static const uint8_t algt_magic[8]        = {'A','L','G','T',0,1,1,0};
 static const uint8_t algt_magic_prefix[6] = {'A','L','G','T',0,1};
 
+typedef struct {
+    uint64_t ptr;
+    uint64_t size;
+    uint64_t left;
+    uint64_t right;
+    int      went_left;
+} algt_path_entry_t;
+
 /* ---- alignment helpers ------------------------------------------------- */
 
 /* Round len up to a multiple of 32, minimum 32. */
@@ -2117,23 +2125,6 @@ static int algt_avl_write_and_update(bstack_t *bs, uint64_t ptr,
 
 /* ---- AVL helpers ------------------------------------------------------- */
 
-/* Return the leftmost (minimum-key) node in subtree. */
-static int algt_avl_min(bstack_t *bs, uint64_t subtree, uint32_t depth,
-    uint64_t *out_ptr, uint64_t *out_size)
-{
-    uint64_t size, left, right;
-    int8_t bf; uint8_t height;
-    if (depth == 0) { errno = EINVAL; return -1; }
-    if (algt_read_node(bs, subtree, &size, &bf, &height, &left, &right) != 0)
-        return -1;
-    if (left == ALGT_NULL_PTR) {
-        *out_ptr  = subtree;
-        *out_size = size;
-        return 0;
-    }
-    return algt_avl_min(bs, left, depth - 1, out_ptr, out_size);
-}
-
 /* Right-rotate around node; return the new subtree root. */
 static int algt_avl_rotate_right(bstack_t *bs, uint64_t node, uint64_t *out_root)
 {
@@ -2202,86 +2193,100 @@ static int algt_avl_rebalance(bstack_t *bs, uint64_t node, uint64_t *out_root)
 
 /* ---- AVL insert -------------------------------------------------------- */
 
-static int algt_avl_insert_rec(bstack_t *bs, uint64_t root,
-    uint64_t ptr, uint64_t size, uint32_t depth, uint64_t *out_root)
+static int algt_avl_insert(bstack_t *bs, uint64_t ptr, uint64_t size)
 {
-    if (root == ALGT_NULL_PTR) {
+    algt_path_entry_t path[ALGT_MAX_AVL_DEPTH];
+    size_t   path_len = 0;
+    uint64_t root, current, child;
+    int      i;
+
+    if (algt_read_root(bs, &root) != 0) return -1;
+
+    current = root;
+    while (current != ALGT_NULL_PTR) {
+        uint64_t root_sz, left, right;
+        int8_t bf; uint8_t height;
+        int went_left;
+        if (path_len >= ALGT_MAX_AVL_DEPTH) { errno = EINVAL; return -1; }
+        if (algt_read_node(bs, current, &root_sz, &bf, &height, &left, &right) != 0)
+            return -1;
+        went_left = (size < root_sz || (size == root_sz && ptr < current));
+        path[path_len].ptr       = current;
+        path[path_len].size      = root_sz;
+        path[path_len].left      = left;
+        path[path_len].right     = right;
+        path[path_len].went_left = went_left;
+        path_len++;
+        current = went_left ? left : right;
+    }
+
+    {
         uint8_t buf[32];
         memset(buf, 0, 32);
         write_le64(buf, size);
-        buf[9] = 1; /* height = 1, bf = 0 */
+        buf[9] = 1;
         if (bstack_set(bs, ptr, buf, 32) != 0) return -1;
-        *out_root = ptr;
-        return 0;
     }
-    if (depth == 0) { errno = EINVAL; return -1; }
-    {
-        uint64_t root_sz, left, right;
-        int8_t bf; uint8_t height;
-        if (algt_read_node(bs, root, &root_sz, &bf, &height, &left, &right) != 0)
-            return -1;
-        if (size < root_sz || (size == root_sz && ptr < root)) {
-            uint64_t new_left;
-            if (algt_avl_insert_rec(bs, left, ptr, size, depth - 1, &new_left) != 0) return -1;
-            if (algt_avl_write_and_update(bs, root, root_sz, new_left, right, NULL) != 0)
-                return -1;
+
+    child = ptr;
+    for (i = (int)path_len - 1; i >= 0; i--) {
+        uint64_t new_left, new_right, new_child;
+        if (path[i].went_left) {
+            new_left  = child;
+            new_right = path[i].right;
         } else {
-            uint64_t new_right;
-            if (algt_avl_insert_rec(bs, right, ptr, size, depth - 1, &new_right) != 0) return -1;
-            if (algt_avl_write_and_update(bs, root, root_sz, left, new_right, NULL) != 0)
-                return -1;
+            new_left  = path[i].left;
+            new_right = child;
         }
+        if (algt_avl_write_and_update(bs, path[i].ptr, path[i].size,
+                                       new_left, new_right, NULL) != 0) return -1;
+        if (algt_avl_rebalance(bs, path[i].ptr, &new_child) != 0) return -1;
+        child = new_child;
     }
-    return algt_avl_rebalance(bs, root, out_root);
+    return algt_write_root(bs, child);
 }
 
-static int algt_avl_insert(bstack_t *bs, uint64_t ptr, uint64_t size)
+/* ---- AVL remove-min ---------------------------------------------------- */
+
+/* Remove the minimum (leftmost) node from subtree rooted at root.
+ * Sets *out_min_ptr and *out_min_size to the removed node; *out_new_root is the
+ * rebalanced subtree after removal. */
+static int algt_avl_remove_min(bstack_t *bs, uint64_t root,
+    uint64_t *out_min_ptr, uint64_t *out_min_size, uint64_t *out_new_root)
 {
-    uint64_t root, new_root;
-    if (algt_read_root(bs, &root) != 0) return -1;
-    if (algt_avl_insert_rec(bs, root, ptr, size, ALGT_MAX_AVL_DEPTH, &new_root) != 0) return -1;
-    return algt_write_root(bs, new_root);
-}
+    uint64_t stk_ptr  [ALGT_MAX_AVL_DEPTH];
+    uint64_t stk_size [ALGT_MAX_AVL_DEPTH];
+    uint64_t stk_right[ALGT_MAX_AVL_DEPTH];
+    size_t   stk_len  = 0;
+    uint64_t current  = root;
 
-/* ---- AVL remove -------------------------------------------------------- */
-
-static int algt_avl_remove_rec(bstack_t *bs, uint64_t root,
-    uint64_t ptr, uint64_t size, uint32_t depth, uint64_t *out_root)
-{
-    uint64_t root_sz, left, right;
-    int8_t bf; uint8_t height;
-    int cmp;
-
-    if (root == ALGT_NULL_PTR) { *out_root = ALGT_NULL_PTR; return 0; }
-    if (depth == 0) { errno = EINVAL; return -1; }
-    if (algt_read_node(bs, root, &root_sz, &bf, &height, &left, &right) != 0) return -1;
-
-    if      (size < root_sz || (size == root_sz && ptr < root)) cmp = -1;
-    else if (size > root_sz || (size == root_sz && ptr > root)) cmp =  1;
-    else                                                          cmp =  0;
-
-    if (cmp < 0) {
-        uint64_t new_left;
-        if (algt_avl_remove_rec(bs, left, ptr, size, depth - 1, &new_left) != 0) return -1;
-        if (algt_avl_write_and_update(bs, root, root_sz, new_left, right, NULL) != 0) return -1;
-        return algt_avl_rebalance(bs, root, out_root);
-    }
-    if (cmp > 0) {
-        uint64_t new_right;
-        if (algt_avl_remove_rec(bs, right, ptr, size, depth - 1, &new_right) != 0) return -1;
-        if (algt_avl_write_and_update(bs, root, root_sz, left, new_right, NULL) != 0) return -1;
-        return algt_avl_rebalance(bs, root, out_root);
-    }
-    /* Found: remove this node */
-    if (left  == ALGT_NULL_PTR) { *out_root = right; return 0; }
-    if (right == ALGT_NULL_PTR) { *out_root = left;  return 0; }
-    /* Two children: replace with in-order successor (leftmost of right subtree) */
-    {
-        uint64_t succ, succ_sz, new_right;
-        if (algt_avl_min(bs, right, depth - 1, &succ, &succ_sz) != 0) return -1;
-        if (algt_avl_remove_rec(bs, right, succ, succ_sz, depth - 1, &new_right) != 0) return -1;
-        if (algt_avl_write_and_update(bs, succ, succ_sz, left, new_right, NULL) != 0) return -1;
-        return algt_avl_rebalance(bs, succ, out_root);
+    for (;;) {
+        uint64_t size, left, right;
+        int8_t bf; uint8_t height;
+        if (algt_read_node(bs, current, &size, &bf, &height, &left, &right) != 0)
+            return -1;
+        if (left == ALGT_NULL_PTR) {
+            uint64_t child = right;
+            int i;
+            for (i = (int)stk_len - 1; i >= 0; i--) {
+                uint64_t new_child;
+                if (algt_avl_write_and_update(bs, stk_ptr[i], stk_size[i],
+                                               child, stk_right[i], NULL) != 0)
+                    return -1;
+                if (algt_avl_rebalance(bs, stk_ptr[i], &new_child) != 0) return -1;
+                child = new_child;
+            }
+            *out_min_ptr  = current;
+            *out_min_size = size;
+            *out_new_root = child;
+            return 0;
+        }
+        if (stk_len >= ALGT_MAX_AVL_DEPTH) { errno = EINVAL; return -1; }
+        stk_ptr  [stk_len] = current;
+        stk_size [stk_len] = size;
+        stk_right[stk_len] = right;
+        stk_len++;
+        current = left;
     }
 }
 
@@ -2289,91 +2294,92 @@ static int algt_avl_remove_rec(bstack_t *bs, uint64_t root,
 
 /* Find and remove the best-fit (smallest block >= min_size) in one O(log n)
  * pass.  Sets *out_found_ptr = ALGT_NULL_PTR when no block fits. */
-static int algt_avl_find_best_fit_rec(bstack_t *bs, uint64_t root,
-    uint64_t min_size, uint32_t depth, uint64_t *out_new_root,
-    uint64_t *out_found_ptr, uint64_t *out_found_size)
-{
-    uint64_t root_sz, left, right;
-    int8_t bf; uint8_t height;
-
-    if (root == ALGT_NULL_PTR) {
-        *out_new_root  = ALGT_NULL_PTR;
-        *out_found_ptr = ALGT_NULL_PTR;
-        return 0;
-    }
-    if (depth == 0) { errno = EINVAL; return -1; }
-    if (algt_read_node(bs, root, &root_sz, &bf, &height, &left, &right) != 0)
-        return -1;
-
-    if (root_sz >= min_size) {
-        /* This node fits — try left for something smaller. */
-        uint64_t new_left, found_ptr, found_sz;
-        if (algt_avl_find_best_fit_rec(bs, left, min_size, depth - 1,
-                &new_left, &found_ptr, &found_sz) != 0) return -1;
-        if (found_ptr != ALGT_NULL_PTR) {
-            /* Smaller fit found; keep root, update its left child. */
-            uint64_t new_root;
-            if (algt_avl_write_and_update(bs, root, root_sz, new_left, right, NULL) != 0)
-                return -1;
-            if (algt_avl_rebalance(bs, root, &new_root) != 0) return -1;
-            *out_new_root   = new_root;
-            *out_found_ptr  = found_ptr;
-            *out_found_size = found_sz;
-            return 0;
-        }
-        /* No smaller fit — remove root itself.  Use new_left (may be rebalanced). */
-        {
-            uint64_t new_root;
-            if (new_left == ALGT_NULL_PTR) {
-                new_root = right;
-            } else if (right == ALGT_NULL_PTR) {
-                new_root = new_left;
-            } else {
-                uint64_t succ, succ_sz, new_right;
-                if (algt_avl_min(bs, right, depth - 1, &succ, &succ_sz) != 0) return -1;
-                if (algt_avl_remove_rec(bs, right, succ, succ_sz, depth - 1, &new_right) != 0) return -1;
-                if (algt_avl_write_and_update(bs, succ, succ_sz, new_left, new_right, NULL) != 0)
-                    return -1;
-                if (algt_avl_rebalance(bs, succ, &new_root) != 0) return -1;
-            }
-            *out_new_root   = new_root;
-            *out_found_ptr  = root;
-            *out_found_size = root_sz;
-        }
-        return 0;
-    }
-
-    /* Too small — only the right subtree can have a fit. */
-    {
-        uint64_t new_right, found_ptr, found_sz;
-        if (algt_avl_find_best_fit_rec(bs, right, min_size, depth - 1,
-                &new_right, &found_ptr, &found_sz) != 0) return -1;
-        if (found_ptr != ALGT_NULL_PTR) {
-            uint64_t new_root;
-            if (algt_avl_write_and_update(bs, root, root_sz, left, new_right, NULL) != 0)
-                return -1;
-            if (algt_avl_rebalance(bs, root, &new_root) != 0) return -1;
-            *out_new_root   = new_root;
-            *out_found_ptr  = found_ptr;
-            *out_found_size = found_sz;
-        } else {
-            *out_new_root   = root;
-            *out_found_ptr  = ALGT_NULL_PTR;
-        }
-        return 0;
-    }
-}
-
 static int algt_avl_find_best_fit_and_remove(bstack_t *bs, uint64_t min_size,
     uint64_t *out_found_ptr, uint64_t *out_found_size)
 {
-    uint64_t root, new_root, found_ptr, found_sz;
+    algt_path_entry_t path[ALGT_MAX_AVL_DEPTH];
+    size_t   path_len    = 0;
+    int      fit_found   = 0;
+    size_t   last_fit_idx = 0;
+    uint64_t root, current;
+    uint64_t found_ptr, found_size, found_left, found_right;
+    uint64_t replacement, child;
+    int      i;
+
     if (algt_read_root(bs, &root) != 0) return -1;
-    if (algt_avl_find_best_fit_rec(bs, root, min_size, ALGT_MAX_AVL_DEPTH,
-            &new_root, &found_ptr, &found_sz) != 0) return -1;
-    if (algt_write_root(bs, new_root) != 0) return -1;
+    if (root == ALGT_NULL_PTR) {
+        *out_found_ptr  = ALGT_NULL_PTR;
+        *out_found_size = 0;
+        return 0;
+    }
+
+    current = root;
+    while (current != ALGT_NULL_PTR) {
+        uint64_t root_sz, left, right;
+        int8_t bf; uint8_t height;
+        int went_left;
+        if (path_len >= ALGT_MAX_AVL_DEPTH) { errno = EINVAL; return -1; }
+        if (algt_read_node(bs, current, &root_sz, &bf, &height, &left, &right) != 0)
+            return -1;
+        if (root_sz >= min_size) {
+            last_fit_idx = path_len;
+            fit_found    = 1;
+            went_left    = 1;
+        } else {
+            went_left = 0;
+        }
+        path[path_len].ptr       = current;
+        path[path_len].size      = root_sz;
+        path[path_len].left      = left;
+        path[path_len].right     = right;
+        path[path_len].went_left = went_left;
+        path_len++;
+        current = went_left ? left : right;
+    }
+
+    if (!fit_found) {
+        *out_found_ptr  = ALGT_NULL_PTR;
+        *out_found_size = 0;
+        return 0;
+    }
+
+    found_ptr   = path[last_fit_idx].ptr;
+    found_size  = path[last_fit_idx].size;
+    found_left  = path[last_fit_idx].left;
+    found_right = path[last_fit_idx].right;
+
+    if (found_left == ALGT_NULL_PTR) {
+        replacement = found_right;
+    } else if (found_right == ALGT_NULL_PTR) {
+        replacement = found_left;
+    } else {
+        uint64_t succ, succ_sz, new_right;
+        if (algt_avl_remove_min(bs, found_right, &succ, &succ_sz, &new_right) != 0)
+            return -1;
+        if (algt_avl_write_and_update(bs, succ, succ_sz, found_left, new_right, NULL) != 0)
+            return -1;
+        if (algt_avl_rebalance(bs, succ, &replacement) != 0) return -1;
+    }
+
+    child = replacement;
+    for (i = (int)last_fit_idx - 1; i >= 0; i--) {
+        uint64_t new_left, new_right, new_child;
+        if (path[i].went_left) {
+            new_left  = child;
+            new_right = path[i].right;
+        } else {
+            new_left  = path[i].left;
+            new_right = child;
+        }
+        if (algt_avl_write_and_update(bs, path[i].ptr, path[i].size,
+                                       new_left, new_right, NULL) != 0) return -1;
+        if (algt_avl_rebalance(bs, path[i].ptr, &new_child) != 0) return -1;
+        child = new_child;
+    }
+    if (algt_write_root(bs, child) != 0) return -1;
+
     *out_found_ptr  = found_ptr;
-    *out_found_size = found_sz;
+    *out_found_size = found_size;
     return 0;
 }
 
@@ -2404,46 +2410,123 @@ struct algt_walk_ctx {
     int           err;
 };
 
-static void algt_avl_walk_inorder(bstack_t *bs, uint64_t root, uint32_t depth,
+static void algt_avl_walk_inorder(bstack_t *bs, uint64_t root,
     struct algt_walk_ctx *ctx)
 {
-    uint64_t size, left, right;
-    int8_t bf; uint8_t height;
+    uint64_t stk_ptr  [ALGT_MAX_AVL_DEPTH];
+    uint64_t stk_right[ALGT_MAX_AVL_DEPTH];
+    uint64_t stk_size [ALGT_MAX_AVL_DEPTH];
+    size_t   stk_len  = 0;
+    uint64_t current  = root;
 
-    if (root == ALGT_NULL_PTR || ctx->err) return;
-    if (depth == 0) { ctx->err = 1; return; }
-    if (algt_read_node(bs, root, &size, &bf, &height, &left, &right) != 0) {
-        ctx->err = 1; return;
-    }
-    algt_avl_walk_inorder(bs, left, depth - 1, ctx);
     if (ctx->err) return;
-    if (ctx->count == ctx->cap) {
-        size_t       nc = ctx->cap ? ctx->cap * 2 : 16;
-        algt_block_t *t = realloc(ctx->blocks, nc * sizeof *t);
-        if (!t) { ctx->err = 1; return; }
-        ctx->blocks = t;
-        ctx->cap    = nc;
+
+    for (;;) {
+        while (current != ALGT_NULL_PTR) {
+            uint64_t size, left, right;
+            int8_t bf; uint8_t height;
+            if (stk_len >= ALGT_MAX_AVL_DEPTH) { ctx->err = 1; return; }
+            if (algt_read_node(bs, current, &size, &bf, &height, &left, &right) != 0) {
+                ctx->err = 1; return;
+            }
+            stk_ptr  [stk_len] = current;
+            stk_right[stk_len] = right;
+            stk_size [stk_len] = size;
+            stk_len++;
+            current = left;
+        }
+        if (stk_len == 0) return;
+        stk_len--;
+        {
+            uint64_t ptr   = stk_ptr  [stk_len];
+            uint64_t right = stk_right[stk_len];
+            uint64_t size  = stk_size [stk_len];
+            if (ctx->count == ctx->cap) {
+                size_t       nc = ctx->cap ? ctx->cap * 2 : 16;
+                algt_block_t *t = realloc(ctx->blocks, nc * sizeof *t);
+                if (!t) { ctx->err = 1; return; }
+                ctx->blocks = t;
+                ctx->cap    = nc;
+            }
+            ctx->blocks[ctx->count].ptr  = ptr;
+            ctx->blocks[ctx->count].size = size;
+            ctx->count++;
+            current = right;
+        }
     }
-    ctx->blocks[ctx->count].ptr  = root;
-    ctx->blocks[ctx->count].size = size;
-    ctx->count++;
-    algt_avl_walk_inorder(bs, right, depth - 1, ctx);
 }
 
-/* Build an optimally balanced BST from a sorted (by key) block array. */
+/* Build an optimally balanced BST from a sorted (by key) block array.
+ * Uses an explicit ops-stack to avoid recursion. */
+typedef struct { int is_combine; size_t lo; size_t hi; } algt_build_op_t;
+
 static int algt_build_tree(bstack_t *bs, const algt_block_t *blocks,
     size_t n, uint64_t *out_root)
 {
-    size_t mid;
-    uint64_t left, right;
-    if (n == 0) { *out_root = ALGT_NULL_PTR; return 0; }
-    mid = n / 2;
-    if (algt_build_tree(bs, blocks,           mid,         &left)  != 0) return -1;
-    if (algt_build_tree(bs, blocks + mid + 1, n - mid - 1, &right) != 0) return -1;
-    if (algt_avl_write_and_update(bs, blocks[mid].ptr, blocks[mid].size,
-                                  left, right, NULL) != 0) return -1;
-    *out_root = blocks[mid].ptr;
-    return 0;
+    algt_build_op_t *ops     = NULL;
+    uint64_t        *results = NULL;
+    size_t           ops_len = 0, ops_cap = 0;
+    size_t           res_len = 0, res_cap = 0;
+    int              ret     = 0;
+
+#define BUILD_OPS_PUSH(comb, lo_, hi_) do { \
+    if (ops_len == ops_cap) { \
+        size_t nc_ = ops_cap ? ops_cap * 2 : 32; \
+        algt_build_op_t *t_ = realloc(ops, nc_ * sizeof *t_); \
+        if (!t_) { ret = -1; goto build_done; } \
+        ops = t_; ops_cap = nc_; \
+    } \
+    ops[ops_len].is_combine = (comb); \
+    ops[ops_len].lo = (lo_); \
+    ops[ops_len].hi = (hi_); \
+    ops_len++; \
+} while (0)
+
+#define BUILD_RES_PUSH(v) do { \
+    if (res_len == res_cap) { \
+        size_t nc_ = res_cap ? res_cap * 2 : 32; \
+        uint64_t *t_ = realloc(results, nc_ * sizeof *t_); \
+        if (!t_) { ret = -1; goto build_done; } \
+        results = t_; res_cap = nc_; \
+    } \
+    results[res_len++] = (v); \
+} while (0)
+
+    BUILD_OPS_PUSH(0, 0, n);
+
+    while (ops_len > 0 && ret == 0) {
+        algt_build_op_t op = ops[--ops_len];
+        if (!op.is_combine) {
+            size_t lo = op.lo, hi = op.hi;
+            if (lo >= hi) {
+                BUILD_RES_PUSH(ALGT_NULL_PTR);
+            } else {
+                size_t mid = lo + (hi - lo) / 2;
+                BUILD_OPS_PUSH(1,  mid, 0);
+                BUILD_OPS_PUSH(0,  mid + 1, hi);
+                BUILD_OPS_PUSH(0,  lo, mid);
+            }
+        } else {
+            size_t   mid        = op.lo;
+            uint64_t right_root = results[--res_len];
+            uint64_t left_root  = results[--res_len];
+            if (algt_avl_write_and_update(bs,
+                    blocks[mid].ptr, blocks[mid].size,
+                    left_root, right_root, NULL) != 0) {
+                ret = -1; goto build_done;
+            }
+            BUILD_RES_PUSH(blocks[mid].ptr);
+        }
+    }
+
+    *out_root = (res_len > 0) ? results[res_len - 1] : ALGT_NULL_PTR;
+
+build_done:
+#undef BUILD_OPS_PUSH
+#undef BUILD_RES_PUSH
+    free(ops);
+    free(results);
+    return ret;
 }
 
 /* Collect all free blocks, merge adjacent ones, and rebuild a balanced AVL
@@ -2460,7 +2543,7 @@ static int algt_coalesce_and_rebalance(bstack_t *bs)
     if (algt_read_root(bs, &root) != 0) return -1;
 
     ctx.blocks = NULL; ctx.count = 0; ctx.cap = 0; ctx.err = 0;
-    algt_avl_walk_inorder(bs, root, ALGT_MAX_AVL_DEPTH, &ctx);
+    algt_avl_walk_inorder(bs, root, &ctx);
     if (ctx.err) { free(ctx.blocks); return -1; }
     if (ctx.count == 0) { free(ctx.blocks); return 0; }
 
