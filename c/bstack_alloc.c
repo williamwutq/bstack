@@ -1478,6 +1478,7 @@ static int ff_vt_dealloc(bstack_allocator_t *self, bstack_slice_t slice)
 
     if (alff_set_recovery_needed(a->bs) != 0) { FF_UNLOCK(a); return -1; }
     if (alff_add_to_free_list(a->bs, slice.offset) != 0) { FF_UNLOCK(a); return -1; }
+    if (alff_cascade_discard_free_tail(a->bs) != 0) { FF_UNLOCK(a); return -1; }
     r = alff_clear_recovery_needed(a->bs);
     FF_UNLOCK(a);
     return r;
@@ -1765,6 +1766,7 @@ static int ff_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
                     : found_start;
 
                 if (alff_add_to_free_list(a->bs, slice.offset) != 0) { FF_UNLOCK(a); return -1; }
+                if (alff_cascade_discard_free_tail(a->bs) != 0) { FF_UNLOCK(a); return -1; }
                 if (alff_clear_recovery_needed(a->bs) != 0) { FF_UNLOCK(a); return -1; }
 
                 out->allocator = self;
@@ -1825,6 +1827,7 @@ static int ff_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
         new_ptr = push_offset + ALFF_BLOCK_HDR_SIZE;
 
         if (alff_add_to_free_list(a->bs, slice.offset) != 0) { FF_UNLOCK(a); return -1; }
+        if (alff_cascade_discard_free_tail(a->bs) != 0) { FF_UNLOCK(a); return -1; }
         if (alff_clear_recovery_needed(a->bs) != 0) { FF_UNLOCK(a); return -1; }
 
         out->allocator = self;

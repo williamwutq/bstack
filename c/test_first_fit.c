@@ -753,6 +753,7 @@ static int test_fuzz_reopen(void)
 
 /* ALFF header layout — mirrored from bstack_alloc.c for the flag poke. */
 #define ALFF_FLAGS_OFFSET   24  /* OFFSET_SIZE(16) + magic(8) */
+#define ALFF_HDR_OFFSET     48  /* OFFSET_SIZE(16) + HEADER_SIZE(32) — arena start */
 
 /* --- concurrent alloc / dealloc data integrity ------------------------ */
 
@@ -895,17 +896,13 @@ static int test_concurrent_realloc_grow_shrink_data_integrity(void)
     for (int i = 0; i < FF_REALLOC_THREADS; i++) pthread_join(threads[i], NULL);
     for (int i = 0; i < FF_REALLOC_THREADS; i++) CHECK(args[i].ok);
 
-    /* Final length is not asserted: non-adjacent mid-arena dealloc calls
-     * can leave coalesced free blocks in the list rather than discarding
-     * to the tail.  Reopen to confirm the free list survived intact. */
-    bstack_close(first_fit_bstack_allocator_into_stack(a));
-    bstack_t *bs2 = bstack_open(tmp); CHECK(bs2);
-    first_fit_bstack_allocator_t *a2 = first_fit_bstack_allocator_new(bs2);
-    CHECK(a2);
-    bstack_slice_t probe;
-    CHECK(bstack_allocator_alloc((bstack_allocator_t *)a2, 16, &probe) == 0);
-    bstack_close(first_fit_bstack_allocator_into_stack(a2));
+    {
+        uint64_t len;
+        CHECK(bstack_allocator_len((bstack_allocator_t *)a, &len) == 0);
+        CHECK(len == ALFF_HDR_OFFSET);
+    }
 
+    bstack_close(first_fit_bstack_allocator_into_stack(a));
     ff_unlink(tmp); return 0;
 }
 
@@ -953,19 +950,16 @@ static int test_concurrent_tail_thrash(void)
         CHECK(ret == NULL);
     }
 
-    /* Final stack length is not asserted: a non-tail-resident realloc
-     * 64→16 stays in-bucket (block stays 64 B) and its subsequent dealloc
-     * misses the tail-discard fast path, so the cascade only catches the
-     * blocks that happen to be tail-resident at join time.  Reopen instead
-     * to confirm the free list survived intact. */
-    bstack_close(first_fit_bstack_allocator_into_stack(a));
-    bstack_t *bs2 = bstack_open(tmp); CHECK(bs2);
-    first_fit_bstack_allocator_t *a2 = first_fit_bstack_allocator_new(bs2);
-    CHECK(a2);
-    bstack_slice_t probe;
-    CHECK(bstack_allocator_alloc((bstack_allocator_t *)a2, 16, &probe) == 0);
-    bstack_close(first_fit_bstack_allocator_into_stack(a2));
+    /* With cascade_discard_free_tail called after every alff_add_to_free_list,
+     * a shrunken block whose dealloc goes through the non-tail path is still
+     * reclaimed as soon as it coalesces to the tail. */
+    {
+        uint64_t len;
+        CHECK(bstack_allocator_len((bstack_allocator_t *)a, &len) == 0);
+        CHECK(len == ALFF_HDR_OFFSET);
+    }
 
+    bstack_close(first_fit_bstack_allocator_into_stack(a));
     ff_unlink(tmp); return 0;
 }
 
@@ -1012,6 +1006,106 @@ static int test_recovery_needed_already_set_rejects_mutation(void)
     ff_unlink(tmp); return 0;
 }
 
+/* --- regression: cascade after non-tail dealloc reclaims arena --------- */
+
+#define FF_CASCADE_THREADS  4
+#define FF_CASCADE_ITERS    100
+
+static void *ff_cascade_dealloc_worker(void *raw)
+{
+    bstack_allocator_t *a = raw;
+    static const uint64_t sizes[] = {16, 32, 64, 128};
+    for (int i = 0; i < FF_CASCADE_ITERS; i++) {
+        uint64_t len = sizes[i % (int)(sizeof sizes / sizeof sizes[0])];
+        bstack_slice_t s;
+        if (bstack_allocator_alloc(a, len, &s) != 0) return (void *)(intptr_t)-1;
+        if (bstack_allocator_dealloc(a, s) != 0)     return (void *)(intptr_t)-1;
+    }
+    return NULL;
+}
+
+static int test_dealloc_non_tail_cascade_reclaims_arena(void)
+{
+    /* Regression for missing alff_cascade_discard_free_tail after
+     * alff_add_to_free_list in ff_vt_dealloc's non-tail path.  With
+     * concurrent threads the last dealloc going through the non-tail path
+     * can coalesce free neighbours to the physical tail, leaving a free
+     * block in the free list permanently unless cascade is called. */
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    first_fit_bstack_allocator_t *a = first_fit_bstack_allocator_new(bs);
+    CHECK(a);
+
+    pthread_t threads[FF_CASCADE_THREADS];
+    for (int i = 0; i < FF_CASCADE_THREADS; i++)
+        pthread_create(&threads[i], NULL, ff_cascade_dealloc_worker,
+                       (bstack_allocator_t *)a);
+    for (int i = 0; i < FF_CASCADE_THREADS; i++) {
+        void *ret = NULL;
+        pthread_join(threads[i], &ret);
+        CHECK(ret == NULL);
+    }
+
+    {
+        uint64_t len;
+        CHECK(bstack_allocator_len((bstack_allocator_t *)a, &len) == 0);
+        CHECK(len == ALFF_HDR_OFFSET);
+    }
+
+    bstack_close(first_fit_bstack_allocator_into_stack(a));
+    ff_unlink(tmp); return 0;
+}
+
+/* --- regression: cascade after realloc copy-and-move reclaims arena ---- */
+
+#define FF_REALLOC_CASCADE_THREADS  4
+#define FF_REALLOC_CASCADE_ITERS    60
+
+static void *ff_realloc_cascade_worker(void *raw)
+{
+    bstack_allocator_t *a = raw;
+    for (int i = 0; i < FF_REALLOC_CASCADE_ITERS; i++) {
+        bstack_slice_t s, s2;
+        /* Grow far beyond the original block to force the copy-and-move
+         * path: the old 16-byte block is freed via alff_add_to_free_list. */
+        if (bstack_allocator_alloc(a, 16, &s) != 0)       return (void *)(intptr_t)-1;
+        if (bstack_allocator_realloc(a, s, 128, &s2) != 0) return (void *)(intptr_t)-1;
+        if (bstack_allocator_dealloc(a, s2) != 0)          return (void *)(intptr_t)-1;
+    }
+    return NULL;
+}
+
+static int test_realloc_copy_move_cascade_reclaims_arena(void)
+{
+    /* Regression for missing alff_cascade_discard_free_tail after
+     * alff_add_to_free_list in ff_vt_realloc's copy-and-move paths.
+     * After realloc copies data to a new block and frees the old one,
+     * the freed old block can coalesce to the tail if cascade is not called. */
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    first_fit_bstack_allocator_t *a = first_fit_bstack_allocator_new(bs);
+    CHECK(a);
+
+    pthread_t threads[FF_REALLOC_CASCADE_THREADS];
+    for (int i = 0; i < FF_REALLOC_CASCADE_THREADS; i++)
+        pthread_create(&threads[i], NULL, ff_realloc_cascade_worker,
+                       (bstack_allocator_t *)a);
+    for (int i = 0; i < FF_REALLOC_CASCADE_THREADS; i++) {
+        void *ret = NULL;
+        pthread_join(threads[i], &ret);
+        CHECK(ret == NULL);
+    }
+
+    {
+        uint64_t len;
+        CHECK(bstack_allocator_len((bstack_allocator_t *)a, &len) == 0);
+        CHECK(len == ALFF_HDR_OFFSET);
+    }
+
+    bstack_close(first_fit_bstack_allocator_into_stack(a));
+    ff_unlink(tmp); return 0;
+}
+
 #endif /* BSTACK_FEATURE_ATOMIC */
 
 /* =========================================================================
@@ -1041,6 +1135,8 @@ int main(void)
     T(test_concurrent_alloc_dealloc_data_integrity);
     T(test_concurrent_realloc_grow_shrink_data_integrity);
     T(test_concurrent_tail_thrash);
+    T(test_dealloc_non_tail_cascade_reclaims_arena);
+    T(test_realloc_copy_move_cascade_reclaims_arena);
     T(test_recovery_needed_already_set_rejects_mutation);
 #endif
 
