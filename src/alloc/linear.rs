@@ -1,6 +1,8 @@
 use super::{BStackAllocator, BStackBulkAllocator, BStackSlice};
 use crate::BStack;
+#[cfg(not(feature = "atomic"))]
 use std::cell::Cell;
+#[cfg(not(feature = "atomic"))]
 use std::marker::PhantomData;
 use std::{fmt, io};
 
@@ -73,24 +75,16 @@ use std::{fmt, io};
 /// ```
 pub struct LinearBStackAllocator {
     stack: BStack,
+    #[cfg(not(feature = "atomic"))]
     _not_sync: PhantomData<Cell<()>>,
 }
-
-// SAFETY: With the `atomic` feature all tail-modifying `&self` operations
-// (`realloc`, `dealloc`, `dealloc_bulk`) use `try_extend`/`try_discard`,
-// which check-and-modify the tail in a single write-locked step inside
-// `BStack`.  Concurrent callers that lose the race receive `Ok(false)` and
-// behave as if their slice is non-tail — no data is corrupted.  `alloc` and
-// `alloc_bulk` use plain `extend`, which is already serialized by the write
-// lock and returns a distinct region to each caller.
-#[cfg(feature = "atomic")]
-unsafe impl Sync for LinearBStackAllocator {}
 
 impl LinearBStackAllocator {
     /// Create a new `LinearBStackAllocator` that takes ownership of `stack`.
     pub fn new(stack: BStack) -> Self {
         Self {
             stack,
+            #[cfg(not(feature = "atomic"))]
             _not_sync: PhantomData,
         }
     }
