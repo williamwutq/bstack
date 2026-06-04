@@ -177,3 +177,66 @@ The same change applies to the corresponding methods on `BStackGuardedSlice`, an
 
 - Should `writer` and `writer_at` also require `&mut self`, given that they return a `BStackSliceWriter` rather than performing any mutation themselves? Requiring `&mut self` here is consistent with the general principle but may feel overly strict for a constructor that merely captures the slice.
 - `BStackSliceWriter` is currently `Copy`. If `writer` requires `&mut self`, obtaining multiple writers from the same slice would require copying the slice first. Should `BStackSliceWriter` remain `Copy`, or should it be non-`Copy` to better reflect exclusive-write intent?
+
+---
+
+## Lock-free free list in `SlabBStackAllocator` and `CheckedSlabBStackAllocator`
+
+**Feature flag:** `atomic`
+**Breaking change:** No (internal implementation change only)
+
+### Motivation
+
+Under the `atomic` feature, `SlabBStackAllocator` guards every free-list mutation with an internal `Mutex<()>`. This mutex serialises `push_free_block`, `push_free_blocks`, and `pop_free_block` across threads, preventing concurrent alloc/dealloc from racing on `free_head`. While correct, the mutex is a point of contention: all threads allocating or deallocating single-block regions must queue behind it, even though the underlying `BStack` already provides atomic compound operations — `cross_exchange` for a lock-free push, and `get_batched_gen` + `cas` for a compare-and-swap pop — that could serve the same role without an allocator-level lock.
+
+The goal is to remove the `Mutex<()>` entirely and replace every free-list path with sequences of BStack primitives that are safe under concurrent `&self` access.
+
+`CheckedSlabBStackAllocator` carries the same `Mutex<()>` and the same free-list pop/push structure as `SlabBStackAllocator`, so whatever solution is adopted here applies to it by extension with no additional design work.
+
+### Design
+
+#### Push: lock-free prepend via `cross_exchange`
+
+To push block `b` (at payload offset `b_addr`) onto the free list:
+
+1. **Plant a self-pointer placeholder.** Write `b_addr` as a little-endian `u64` into the first eight bytes of `b` — i.e., call `stack.set(b_addr, b_addr.to_le_bytes())`. This seeds the slot that will become `b->next` with a safe, in-bounds value.
+
+2. **Atomically splice `b` in as the new head.** Call `stack.cross_exchange(b_addr, FREE_HEAD_OFFSET, 8)`. `cross_exchange` swaps the eight bytes at `b_addr` with the eight bytes at `FREE_HEAD_OFFSET` under a single write lock. Before the call the slot at `b_addr` holds `b_addr` and the slot at `FREE_HEAD_OFFSET` holds the current head `H`; after the call `FREE_HEAD_OFFSET` holds `b_addr` (b is now head) and `b_addr` holds `H` (b's next pointer is the old head). The self-pointer written in step 1 is never observed by any reader: `cross_exchange` atomically replaces it with `H` at the same moment it publishes `b` as the new head.
+
+The call to `set` in step 1 and the call to `cross_exchange` in step 2 are not jointly atomic — a crash between them leaves the self-pointer sitting in `b->next` with `free_head` still pointing to the old head. This leaks `b` rather than corrupting the list, matching the crash-safety class already documented for `push_free_block`.
+
+Push is inherently race-free without any allocator-level mutex: even if two threads push concurrently, each `cross_exchange` is atomic with respect to the other, and each thread's block ends up correctly linked into the list (though their relative order at the head is not deterministic).
+
+#### Pop: state-machine CAS via `get_batched_gen` + `cas`
+
+To pop the head block from the free list:
+
+1. **Read head and next under one lock.** Call `stack.get_batched_gen` with two reads: offset `FREE_HEAD_OFFSET` into an 8-byte buffer `head_buf`, and offset `head_val` (parsed from `head_buf`) into an 8-byte buffer `next_buf`. `get_batched_gen` holds the BStack read lock across both reads, so the pair is consistent: if `head_val` is non-sentinel, `next_buf` contains the next-pointer stored in the head block at the moment `head_buf` was read.
+
+2. **Return early if the list is empty.** If `head_val == SENTINEL` after step 1, there is nothing to pop; return `None`.
+
+3. **Attempt to advance the head.** Call `stack.cas(FREE_HEAD_OFFSET, head_buf, next_buf)`. This acquires the BStack write lock, re-reads `FREE_HEAD_OFFSET`, and writes `next_buf` only if the current value still equals `head_buf`. If the CAS succeeds, the head has been advanced to the next block and the caller owns `head_val`. If the CAS fails, some other thread has modified `free_head` since step 1; do not retry — fall through to the tail-extension branch.
+
+No retry on CAS failure is intentional. Retrying would be correct only if the list state is guaranteed to be consistent across attempts, but the ABA problem (see below) means a re-read cannot be trusted to yield a safe pair. Falling back to tail extension on CAS failure is a conservative, always-correct choice; it may allocate a fresh block instead of recycling one, but it never produces a duplicate live allocation.
+
+#### Why the naive design without a generation counter is unsafe
+
+The pop algorithm above contains a race window between step 1 (releasing the read lock after `get_batched_gen`) and step 3 (acquiring the write lock for `cas`). During this window any number of concurrent operations can modify the free list. The ABA problem exploits this: `free_head` can return to the same byte value it held in step 1 even though the list structure has changed underneath.
+
+**Concrete example.** Suppose the free list is `head → H0 → H1 → H2 → …`:
+
+1. **Thread A** calls `get_batched_gen`, reads `head = H0` and `H0->next = H1`, then releases the read lock.
+2. **Thread B** pops H0 (CAS `FREE_HEAD_OFFSET`: H0 → H1). H0 is now live.
+3. **Thread B** pops H1 (CAS `FREE_HEAD_OFFSET`: H1 → H2). H1 is now live.
+4. **Thread B** deallocates H0 — push: writes `H0->next = H2` (the current head), then sets `head = H0` via `cross_exchange`. The free list is now `H0 → H2 → …`.
+5. **Thread A** fires its CAS: reads `FREE_HEAD_OFFSET`, sees `H0` — this matches `head_buf` from step 1 — and writes `H1`. The CAS succeeds.
+
+After step 5, `free_head = H1`. But H1 is still live (allocated to Thread B in step 3). The next `alloc` call will pop H1 from the free list and hand it out again — a silent double allocation. No error is returned; the corruption is not detected.
+
+The no-retry policy does not prevent this. ABA corrupts on a *successful* CAS, not on a retried one. The CAS succeeds precisely because the head byte-value returned to H0; the algorithm cannot distinguish "head is still H0 because nothing changed" from "head is H0 again because it was freed and returned."
+
+### Open questions
+
+- **How to eliminate ABA.** A generation counter embedded in the high bits of the `free_head` word is one approach: each pop increments the counter, so even if the same block offset returns to head its tagged representation differs and Thread A's CAS fails. But high-bit tagging changes the on-disk format of `free_head` and requires deciding how many bits to allocate for the counter versus the offset. Are there better approaches — for example, a new BStack primitive that reads `free_head` and the next pointer then writes the new `free_head` all under a single write lock (eliminating the window entirely), or a design that makes the same-address ABA structurally impossible? If the window can be closed at the BStack level, the allocator does not need to manage generations at all.
+
+- **Batch push under concurrency.** `push_free_blocks` currently reads `free_head`, builds the entire linked chain in a buffer, then writes the chain and updates `free_head` in two separate calls — not atomic with respect to concurrent pushes. A lock-free batch push requires either (a) holding the allocator mutex for batch operations only, (b) building the chain tail-to-head and using the same `cross_exchange` trick, or (c) a new BStack primitive. The single-block push via `cross_exchange` is already safe; the batch case needs its own solution before the mutex can be removed entirely.

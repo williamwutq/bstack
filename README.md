@@ -913,7 +913,7 @@ bstack = { version = "0.2", features = ["alloc", "set"] }
   user data       offset 48 (arena start)
 ```
 
-* **`magic`** — `"ALSL\x00\x01\x00\x00"` (version 0.1).
+* **`magic`** — `"ALSL\x00\x01\x01\x00"` (version 0.1.1).
 * **`block_size`** — fixed size of every arena block, little-endian `u64`.
 * **`free_head`** — payload offset of the first free block's first byte, or `0` (sentinel).
 * **Free block** — first 8 bytes hold the payload offset of the next free block (`u64` LE, `0` = end of list); remaining bytes belong to the caller when live.
@@ -940,6 +940,14 @@ Slab blocks at the tail are added to the free list (not discarded) so they can b
 #### Crash consistency
 
 Each free-list mutation is two `BStack` calls: write the next-pointer into the block, then update `free_head` in the header.  A crash between the two calls leaks the block being added or removed but leaves the rest of the free list intact.  No recovery scan is required on reopen.
+
+#### Thread safety
+
+`SlabBStackAllocator` is always **`Send`** — ownership can be transferred to another thread.
+
+Without the `atomic` feature it is **not `Sync`**: free-list mutations require a read then a write of `free_head` as separate `BStack` calls — a TOCTOU race under concurrent `&self` access that can result in two callers receiving the same block.
+
+With the `atomic` feature it **is `Sync`**. An internal mutex serialises all compound operations that span multiple `BStack` calls: free-list pop/push and the tail-length check that precedes any `extend` or `discard`. The tail-path operations themselves use `try_discard` / `try_extend_zeros`, which check-and-act atomically under `BStack`'s own write lock without needing the allocator lock.
 
 #### Constructors
 
@@ -993,7 +1001,7 @@ bstack = { version = "0.2", features = ["alloc", "set"] }
   user data       offset 48 (arena start)
 ```
 
-* **`magic`** — `"ALCK\x00\x01\x00\x00"` (version 0.1).
+* **`magic`** — `"ALCK\x00\x01\x01\x00"` (version 0.1.1).
 * **`block_size`** — `data_size + 8`, little-endian `u64`.
 * **`free_head`** — block start offset of the first free block, or `0` (sentinel; no valid block starts at offset 0).
 
@@ -1033,6 +1041,14 @@ Multi-block requests always extend the tail — the free list holds single block
 #### Crash consistency
 
 Free-list mutations write block payloads before updating `free_head`. The overhead high bit is flipped to "in use" only after the block's data is clean, so a crash at any intermediate point leaks at most one block without corrupting the free list. A linear arena scan can reconstruct a valid free list from scratch if needed.
+
+#### Thread safety
+
+`CheckedSlabBStackAllocator` is always **`Send`** — ownership can be transferred to another thread.
+
+Without the `atomic` feature it is **not `Sync`**: free-list mutations read then write `free_head` as separate `BStack` calls — a TOCTOU race under concurrent `&self` access.
+
+With the `atomic` feature it **is `Sync`**. An internal mutex serialises all compound operations: free-list pop/push, the tail-length checks preceding `extend` or `discard`, and the `recover` scan. Tail deallocations use `try_discard` (atomically checks tail and removes bytes under `BStack`'s own write lock) without needing the allocator lock. The shrink path acquires the lock before the tail check because the overhead must be written before discarding.
 
 #### Constructors
 

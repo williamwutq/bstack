@@ -3126,6 +3126,12 @@ mod first_fit_tests {
         // free-list mutation correctly, two threads could be handed the same
         // block (or overlapping blocks), and the read-back would observe a
         // different thread's pattern.
+        //
+        // Regression: the final assert_eq checks that cascade_discard_free_tail
+        // is called after every add_to_free_list in the non-tail dealloc path.
+        // Without the fix, the last dealloc going through the non-tail path
+        // could coalesce free neighbours all the way to the physical tail and
+        // leave a free block in the free list permanently.
         use std::sync::Arc;
         use std::thread;
 
@@ -3162,11 +3168,6 @@ mod first_fit_tests {
         for h in handles {
             h.join().unwrap();
         }
-
-        // After every alloc has been paired with a dealloc, the arena should
-        // be empty: the tail-coalesce path eventually discards everything
-        // back to the 48-byte header.
-        assert_eq!(alloc.len().unwrap(), ALFF_HDR_OFFSET);
     }
 
     #[cfg(feature = "atomic")]
@@ -3228,13 +3229,7 @@ mod first_fit_tests {
             h.join().unwrap();
         }
 
-        // Final length is not asserted: non-adjacent mid-arena dealloc calls
-        // can leave coalesced free blocks in the list rather than discarding
-        // to the tail.  What matters is that no operation errored mid-run
-        // and the allocator survives a reopen with the free list intact.
-        drop(alloc);
-        let reopened = FirstFitBStackAllocator::new(BStack::open(&path).unwrap()).unwrap();
-        let _ = reopened.alloc(16).unwrap();
+        assert_eq!(alloc.len().unwrap(), ALFF_HDR_OFFSET);
     }
 
     #[cfg(feature = "atomic")]
@@ -3243,10 +3238,11 @@ mod first_fit_tests {
         // Hammer the tail paths — alloc → tail-grow → tail-shrink → dealloc —
         // from many threads on one allocator.  Whether each individual op
         // actually lands on the tail depends on the interleaving (another
-        // thread's allocation can sit above this one), so this is about
-        // exercising the `recovery_needed` CAS, the tail-grow extend, the
-        // in-bucket realloc shrink, and the dealloc/cascade paths under
-        // contention — not about asserting a specific final stack size.
+        // thread's allocation can sit above this one), so this exercises the
+        // `recovery_needed` CAS, the tail-grow extend, the in-bucket realloc
+        // shrink, and the dealloc/cascade paths under contention.  With
+        // cascade_discard_free_tail called after every add_to_free_list, the
+        // arena is fully reclaimed even when dealloc takes the non-tail path.
         use std::sync::Arc;
         use std::thread;
 
@@ -3273,19 +3269,93 @@ mod first_fit_tests {
             })
             .collect();
 
+        // With cascade_discard_free_tail called after every add_to_free_list,
+        // a shrunken block whose dealloc goes through the non-tail path
+        // (because the user-visible len is smaller than the physical block
+        // size) is still reclaimed as soon as it coalesces to the tail.
         for h in handles {
             h.join().unwrap();
         }
+        assert_eq!(alloc.len().unwrap(), ALFF_HDR_OFFSET);
+    }
 
-        // Final stack length is not asserted: a non-tail-resident realloc
-        // 64→16 stays in-bucket (block stays 64 B) and its subsequent
-        // dealloc misses the tail-discard fast path, so the cascade only
-        // catches the blocks that happen to be tail-resident at join time.
-        // What we *can* assert is that no operation errored mid-run and the
-        // allocator is openable from disk with a usable free list.
-        drop(alloc);
-        let reopened = FirstFitBStackAllocator::new(BStack::open(&path).unwrap()).unwrap();
-        let _ = reopened.alloc(16).unwrap();
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn dealloc_non_tail_cascade_reclaims_arena() {
+        // Targeted regression for missing cascade_discard_free_tail after
+        // add_to_free_list in dealloc's non-tail path.  With concurrent
+        // threads the last dealloc going through the non-tail path can
+        // coalesce free neighbours to the physical tail, leaving a free block
+        // in the free list permanently unless cascade is called.
+        use std::sync::Arc;
+        use std::thread;
+
+        let (alloc, path) = mk_ff("nontail_cascade");
+        let _g = Guard(path);
+        let alloc = Arc::new(alloc);
+
+        const THREADS: u64 = 4;
+        const ITERS: u64 = 100;
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let alloc = Arc::clone(&alloc);
+                thread::spawn(move || {
+                    let sizes = [16u64, 32, 64, 128];
+                    for i in 0..ITERS {
+                        let len = sizes[(i as usize) % sizes.len()];
+                        let s = alloc.alloc(len).unwrap();
+                        alloc.dealloc(s).unwrap();
+                    }
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(alloc.len().unwrap(), ALFF_HDR_OFFSET);
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn realloc_copy_move_cascade_reclaims_arena() {
+        // Targeted regression for missing cascade_discard_free_tail after
+        // add_to_free_list in realloc's copy-and-move paths.  realloc copies
+        // data to a new block then frees the old one via add_to_free_list;
+        // the freed old block can coalesce to the tail if not immediately
+        // cascade-discarded.
+        use std::sync::Arc;
+        use std::thread;
+
+        let (alloc, path) = mk_ff("realloc_cascade");
+        let _g = Guard(path);
+        let alloc = Arc::new(alloc);
+
+        const THREADS: u64 = 4;
+        const ITERS: u64 = 60;
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let alloc = Arc::clone(&alloc);
+                thread::spawn(move || {
+                    for _ in 0..ITERS {
+                        // Grow far beyond the original block to force the
+                        // copy-and-move path: the 16-byte block can't be
+                        // extended in place to 128 bytes when other threads
+                        // hold adjacent blocks.
+                        let s = alloc.alloc(16).unwrap();
+                        let s = alloc.realloc(s, 128).unwrap();
+                        alloc.dealloc(s).unwrap();
+                    }
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(alloc.len().unwrap(), ALFF_HDR_OFFSET);
     }
 
     #[cfg(feature = "atomic")]
