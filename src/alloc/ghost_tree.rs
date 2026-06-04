@@ -735,33 +735,34 @@ impl BStackAllocator for GhostTreeBstackAllocator {
             // SAFETY: zero-length slice at offset 0 is safe
             return Ok(unsafe { BStackSlice::from_raw_parts(self, 0, 0) });
         }
-        #[cfg(feature = "atomic")]
-        let _guard = self.lock.lock().unwrap();
         let aligned = Self::align_up_len(len);
-        if let Some((ptr, block_size)) = self.avl_find_best_fit_and_remove(aligned)? {
-            let remainder = block_size - aligned;
-            if remainder >= MIN_ALLOC {
-                // Split: the leading `remainder` bytes become a new free block.
-                // The AVL node is written into those bytes by avl_insert.
-                // The tail `aligned` bytes are already zeroed by invariant.
-                self.avl_insert(ptr, remainder)?;
-                // SAFETY: ptr + remainder is the allocated portion after splitting
-                Ok(unsafe { BStackSlice::from_raw_parts(self, ptr + remainder, len) })
-            } else {
-                // No split: give the whole block.  The stale AVL node in the
-                // first 32 bytes must be zeroed; the rest is already zeroed.
-                // Any bytes beyond `len` (up to `block_size`) are internal
-                // padding and will be recovered on dealloc by re-aligning.
-                self.stack.zero(ptr, MIN_ALLOC)?;
-                // SAFETY: ptr from allocated block via avl_find_best_fit_and_remove
-                Ok(unsafe { BStackSlice::from_raw_parts(self, ptr, len) })
+        {
+            #[cfg(feature = "atomic")]
+            let _guard = self.lock.lock().unwrap();
+            if let Some((ptr, block_size)) = self.avl_find_best_fit_and_remove(aligned)? {
+                let remainder = block_size - aligned;
+                if remainder >= MIN_ALLOC {
+                    // Split: the leading `remainder` bytes become a new free block.
+                    // The AVL node is written into those bytes by avl_insert.
+                    // The tail `aligned` bytes are already zeroed by invariant.
+                    self.avl_insert(ptr, remainder)?;
+                    // SAFETY: ptr + remainder is the allocated portion after splitting
+                    return Ok(unsafe { BStackSlice::from_raw_parts(self, ptr + remainder, len) });
+                } else {
+                    // No split: give the whole block.  The stale AVL node in the
+                    // first 32 bytes must be zeroed; the rest is already zeroed.
+                    // Any bytes beyond `len` (up to `block_size`) are internal
+                    // padding and will be recovered on dealloc by re-aligning.
+                    self.stack.zero(ptr, MIN_ALLOC)?;
+                    // SAFETY: ptr from allocated block via avl_find_best_fit_and_remove
+                    return Ok(unsafe { BStackSlice::from_raw_parts(self, ptr, len) });
+                }
             }
-        } else {
-            // No free block fits: grow the BStack (returns zeroed bytes).
-            let start = self.stack.extend(aligned)?;
-            // SAFETY: start from fresh allocation via self.stack.extend
-            Ok(unsafe { BStackSlice::from_raw_parts(self, start, len) })
         }
+        // No free block fits: lock released; grow the BStack (returns zeroed bytes).
+        let start = self.stack.extend(aligned)?;
+        // SAFETY: start from fresh allocation via self.stack.extend
+        Ok(unsafe { BStackSlice::from_raw_parts(self, start, len) })
     }
 
     /// Resize `slice` to `new_len` bytes.
@@ -813,45 +814,57 @@ impl BStackAllocator for GhostTreeBstackAllocator {
             return Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) });
         }
 
-        {
-            // Hold the lock across the tail check and the action that follows
-            // (shrink or tail-grow), so the read-modify on the stack tail and the
-            // AVL tree are atomic w.r.t. other threads.  For non-tail grow the
-            // guard is dropped here; alloc/dealloc below acquire their own locks.
+        if aligned_new < aligned_old {
+            // Shrink.
+            let freed_tail = aligned_old - aligned_new;
+            let tail_ptr = slice.start() + aligned_new;
+
+            // Atomic fast path: discard the tail block without taking the lock.
+            #[cfg(feature = "atomic")]
+            if self
+                .stack
+                .try_discard(slice.start() + aligned_old, freed_tail)?
+            {
+                if new_len < aligned_new {
+                    self.stack
+                        .zero(slice.start() + new_len, aligned_new - new_len)?;
+                }
+                return Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) });
+            }
+
+            #[cfg(not(feature = "atomic"))]
+            if slice.start() + aligned_old == self.stack.len()? {
+                if new_len < aligned_new {
+                    self.stack
+                        .zero(slice.start() + new_len, aligned_new - new_len)?;
+                }
+                self.stack.discard(freed_tail)?;
+                return Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) });
+            }
+
+            // Not tail: zero gap + freed tail before taking the lock, then insert.
+            self.stack
+                .zero(slice.start() + new_len, aligned_old - new_len)?;
             #[cfg(feature = "atomic")]
             let _guard = self.lock.lock().unwrap();
+            self.avl_insert(tail_ptr, freed_tail)?;
+            return Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) });
+        }
 
-            let is_tail = slice.start() + aligned_old == self.stack.len()?;
+        // Grow path.
+        // Atomic fast path: extend the tail without taking the lock.
+        #[cfg(feature = "atomic")]
+        if self
+            .stack
+            .try_extend_zeros(slice.start() + aligned_old, aligned_new - aligned_old)?
+        {
+            return Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) });
+        }
 
-            if aligned_new < aligned_old {
-                // Shrink.
-                let freed_tail = aligned_old - aligned_new;
-                let tail_ptr = slice.start() + aligned_new;
-                if is_tail {
-                    // Zero the gap [new_len..aligned_new] only; then truncate
-                    // the BStack rather than recycling the freed tail.
-                    if new_len < aligned_new {
-                        self.stack
-                            .zero(slice.start() + new_len, aligned_new - new_len)?;
-                    }
-                    self.stack.discard(freed_tail)?;
-                } else {
-                    // Zero [new_len..aligned_old] in one call (gap + freed tail),
-                    // then insert the freed tail into the AVL tree.
-                    self.stack
-                        .zero(slice.start() + new_len, aligned_old - new_len)?;
-                    self.avl_insert(tail_ptr, freed_tail)?;
-                }
-                // SAFETY: slice shrunk, block size reduced
-                return Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) });
-            }
-
-            if is_tail {
-                // Grow at the tail: extend the BStack directly, no copy needed.
-                self.stack.extend(aligned_new - aligned_old)?;
-                // SAFETY: slice extended at tail
-                return Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) });
-            }
+        #[cfg(not(feature = "atomic"))]
+        if slice.start() + aligned_old == self.stack.len()? {
+            self.stack.extend(aligned_new - aligned_old)?;
+            return Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) });
         }
 
         // Grow (non-tail): allocate new region, copy old data, free old region.
@@ -885,10 +898,17 @@ impl BStackAllocator for GhostTreeBstackAllocator {
         let ptr = slice.start();
         let true_len = Self::align_up_len(slice.len());
 
+        // Atomic fast path: discard the tail block without taking the lock.
+        // try_discard succeeds only if the stack size is still ptr + true_len,
+        // making the check-and-discard atomic w.r.t. other threads' pushes.
+        // If it fails the block is no longer at the tail; fall through to insert.
         #[cfg(feature = "atomic")]
-        let _guard = self.lock.lock().unwrap();
+        if self.stack.try_discard(ptr + true_len, true_len)? {
+            return Ok(());
+        }
 
         // Tail optimisation: truncate instead of recycling through the AVL tree.
+        #[cfg(not(feature = "atomic"))]
         if ptr + true_len == self.stack.len()? {
             return self.stack.discard(true_len);
         }
@@ -897,7 +917,11 @@ impl BStackAllocator for GhostTreeBstackAllocator {
         // headers for live allocations, so reliable double-free detection is not
         // possible without false-positives on ordinary user data.
 
+        // Zero before taking the lock: the block is owned by the caller and no
+        // other thread will touch it until it appears in the AVL tree.
         self.stack.zero(ptr, true_len)?;
+        #[cfg(feature = "atomic")]
+        let _guard = self.lock.lock().unwrap();
         self.avl_insert(ptr, true_len)
     }
 }
