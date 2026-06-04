@@ -2898,15 +2898,77 @@ gt_vt_alloc_bulk(bstack_allocator_t *self, const uint64_t *lens, size_t n,
     return 0;
 }
 
+static int algt_cmp_pair_by_ptr(const void *a, const void *b)
+{
+    const algt_block_t *x = (const algt_block_t *)a;
+    const algt_block_t *y = (const algt_block_t *)b;
+    return (x->ptr > y->ptr) - (x->ptr < y->ptr);
+}
+
 static int
 gt_vt_dealloc_bulk(bstack_allocator_t *self, const bstack_slice_t *slices,
                    size_t n)
 {
-    size_t i;
+    ghost_tree_bstack_allocator_t *a = (ghost_tree_bstack_allocator_t *)self;
+    algt_block_t *pairs;
+    size_t pairs_n, i;
+    uint64_t stack_len;
+
+    if (n == 0) return 0;
+
+    pairs = (algt_block_t *)malloc(n * sizeof *pairs);
+    if (!pairs) return -1;
+    pairs_n = 0;
+
+    /* Collect non-empty slices as (ptr, aligned_size) pairs. */
     for (i = 0; i < n; i++) {
-        if (gt_vt_dealloc(self, slices[i]) != 0)
-            return -1;
+        if (slices[i].len == 0) continue;
+        if (slices[i].offset < ALGT_ARENA_START ||
+            slices[i].offset != algt_align_up_ptr(slices[i].offset)) {
+            free(pairs); errno = EINVAL; return -1;
+        }
+        pairs[pairs_n].ptr  = slices[i].offset;
+        pairs[pairs_n].size = algt_align_up_len(slices[i].len);
+        pairs_n++;
     }
+
+    if (pairs_n == 0) { free(pairs); return 0; }
+
+    /* Sort by address so contiguous blocks are adjacent. */
+    qsort(pairs, pairs_n, sizeof *pairs, algt_cmp_pair_by_ptr);
+
+    /* Merge contiguous (ptr, size) pairs. */
+    {
+        size_t out = 0;
+        for (i = 1; i < pairs_n; i++) {
+            if (pairs[out].ptr + pairs[out].size == pairs[i].ptr) {
+                pairs[out].size += pairs[i].size;
+            } else {
+                out++;
+                pairs[out] = pairs[i];
+            }
+        }
+        pairs_n = out + 1;
+    }
+
+    /* Free each merged block: tail-truncate when possible, else zero + insert. */
+    if (bstack_len(a->bs, &stack_len) != 0) { free(pairs); return -1; }
+    for (i = 0; i < pairs_n; i++) {
+        uint64_t ptr  = pairs[i].ptr;
+        uint64_t size = pairs[i].size;
+#if UINT64_MAX > SIZE_MAX
+        if (size > (uint64_t)SIZE_MAX) { free(pairs); errno = EINVAL; return -1; }
+#endif
+        if (ptr + size == stack_len) {
+            if (bstack_discard(a->bs, (size_t)size) != 0) { free(pairs); return -1; }
+            stack_len -= size;
+        } else {
+            if (bstack_zero(a->bs, ptr, (size_t)size) != 0) { free(pairs); return -1; }
+            if (algt_avl_insert(a->bs, ptr, size) != 0) { free(pairs); return -1; }
+        }
+    }
+
+    free(pairs);
     return 0;
 }
 

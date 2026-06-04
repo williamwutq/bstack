@@ -1348,7 +1348,7 @@ mod tests {
         alloc.dealloc(a).unwrap();
         alloc.dealloc(b).unwrap();
         // Two separate free blocks of 64 bytes at a_start.
-        drop(anchor);
+        let _ = anchor;
         drop(alloc.into_stack());
 
         // On reopen, coalesce_and_rebalance merges them into one 128-byte block.
