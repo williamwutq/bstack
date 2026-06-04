@@ -1,9 +1,13 @@
 use super::{BStackAllocator, BStackBulkAllocator, BStackSlice};
 use crate::BStack;
+#[cfg(not(feature = "atomic"))]
 use std::cell::Cell;
 use std::fmt;
 use std::io;
+#[cfg(not(feature = "atomic"))]
 use std::marker::PhantomData;
+#[cfg(feature = "atomic")]
+use std::sync::Mutex;
 
 const ALGT_MAGIC: [u8; 8] = *b"ALGT\x00\x01\x01\x00";
 const ALGT_MAGIC_PREFIX: [u8; 6] = *b"ALGT\x00\x01";
@@ -128,23 +132,36 @@ struct PathEntry {
 ///
 /// # Thread safety
 ///
-/// `GhostTreeBstackAllocator` is **`Send`** — ownership can be transferred to
-/// another thread — but **not `Sync`**.  All allocator operations take `&self`
-/// and mutate the on-disk AVL tree through `BStack`; concurrent shared access
-/// from multiple threads would race on that state.  Each instance must be used
-/// from at most one thread at a time.
+/// `GhostTreeBstackAllocator` is always **`Send`** — ownership can be
+/// transferred to another thread.
+///
+/// Without the `atomic` feature it is **not `Sync`**: all allocator operations
+/// take `&self` and mutate the on-disk AVL tree through `BStack`, so concurrent
+/// shared access from multiple threads would race on that state.  Each instance
+/// must be used from at most one thread at a time.
+///
+/// With the `atomic` feature it **is `Sync`**.  An internal [`Mutex`] serialises
+/// all AVL tree mutations and tail-stack operations that are not already
+/// serialised by `BStack`'s own locking.
 ///
 /// ```
 /// fn assert_send<T: Send>() {}
 /// assert_send::<bstack::GhostTreeBstackAllocator>();
 /// ```
 ///
-/// ```compile_fail
+/// Without `atomic` the type is `!Sync` (this fails to compile); with `atomic`
+/// the internal `Mutex` makes it `Sync` (this compiles):
+///
+#[cfg_attr(not(feature = "atomic"), doc = "```compile_fail")]
+#[cfg_attr(feature = "atomic", doc = "```")]
 /// fn assert_sync<T: Sync>() {}
 /// assert_sync::<bstack::GhostTreeBstackAllocator>();
 /// ```
 pub struct GhostTreeBstackAllocator {
     stack: BStack,
+    #[cfg(feature = "atomic")]
+    lock: Mutex<()>,
+    #[cfg(not(feature = "atomic"))]
     _not_sync: PhantomData<Cell<()>>,
 }
 
@@ -181,6 +198,9 @@ impl GhostTreeBstackAllocator {
             // ROOT_OFFSET is zeroed by extend — null root pointer.
             return Ok(Self {
                 stack,
+                #[cfg(feature = "atomic")]
+                lock: Mutex::new(()),
+                #[cfg(not(feature = "atomic"))]
                 _not_sync: PhantomData,
             });
         }
@@ -214,6 +234,9 @@ impl GhostTreeBstackAllocator {
 
         let this = Self {
             stack,
+            #[cfg(feature = "atomic")]
+            lock: Mutex::new(()),
+            #[cfg(not(feature = "atomic"))]
             _not_sync: PhantomData,
         };
         this.coalesce_and_rebalance()?;
@@ -712,6 +735,8 @@ impl BStackAllocator for GhostTreeBstackAllocator {
             // SAFETY: zero-length slice at offset 0 is safe
             return Ok(unsafe { BStackSlice::from_raw_parts(self, 0, 0) });
         }
+        #[cfg(feature = "atomic")]
+        let _guard = self.lock.lock().unwrap();
         let aligned = Self::align_up_len(len);
         if let Some((ptr, block_size)) = self.avl_find_best_fit_and_remove(aligned)? {
             let remainder = block_size - aligned;
@@ -788,36 +813,45 @@ impl BStackAllocator for GhostTreeBstackAllocator {
             return Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) });
         }
 
-        let is_tail = slice.start() + aligned_old == self.stack.len()?;
+        {
+            // Hold the lock across the tail check and the action that follows
+            // (shrink or tail-grow), so the read-modify on the stack tail and the
+            // AVL tree are atomic w.r.t. other threads.  For non-tail grow the
+            // guard is dropped here; alloc/dealloc below acquire their own locks.
+            #[cfg(feature = "atomic")]
+            let _guard = self.lock.lock().unwrap();
 
-        if aligned_new < aligned_old {
-            // Shrink.
-            let freed_tail = aligned_old - aligned_new;
-            let tail_ptr = slice.start() + aligned_new;
-            if is_tail {
-                // Zero the gap [new_len..aligned_new] only; then truncate
-                // the BStack rather than recycling the freed tail.
-                if new_len < aligned_new {
+            let is_tail = slice.start() + aligned_old == self.stack.len()?;
+
+            if aligned_new < aligned_old {
+                // Shrink.
+                let freed_tail = aligned_old - aligned_new;
+                let tail_ptr = slice.start() + aligned_new;
+                if is_tail {
+                    // Zero the gap [new_len..aligned_new] only; then truncate
+                    // the BStack rather than recycling the freed tail.
+                    if new_len < aligned_new {
+                        self.stack
+                            .zero(slice.start() + new_len, aligned_new - new_len)?;
+                    }
+                    self.stack.discard(freed_tail)?;
+                } else {
+                    // Zero [new_len..aligned_old] in one call (gap + freed tail),
+                    // then insert the freed tail into the AVL tree.
                     self.stack
-                        .zero(slice.start() + new_len, aligned_new - new_len)?;
+                        .zero(slice.start() + new_len, aligned_old - new_len)?;
+                    self.avl_insert(tail_ptr, freed_tail)?;
                 }
-                self.stack.discard(freed_tail)?;
-            } else {
-                // Zero [new_len..aligned_old] in one call (gap + freed tail),
-                // then insert the freed tail into the AVL tree.
-                self.stack
-                    .zero(slice.start() + new_len, aligned_old - new_len)?;
-                self.avl_insert(tail_ptr, freed_tail)?;
+                // SAFETY: slice shrunk, block size reduced
+                return Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) });
             }
-            // SAFETY: slice shrunk, block size reduced
-            return Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) });
-        }
 
-        if is_tail {
-            // Grow at the tail: extend the BStack directly, no copy needed.
-            self.stack.extend(aligned_new - aligned_old)?;
-            // SAFETY: slice extended at tail
-            return Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) });
+            if is_tail {
+                // Grow at the tail: extend the BStack directly, no copy needed.
+                self.stack.extend(aligned_new - aligned_old)?;
+                // SAFETY: slice extended at tail
+                return Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) });
+            }
         }
 
         // Grow (non-tail): allocate new region, copy old data, free old region.
@@ -850,6 +884,9 @@ impl BStackAllocator for GhostTreeBstackAllocator {
         }
         let ptr = slice.start();
         let true_len = Self::align_up_len(slice.len());
+
+        #[cfg(feature = "atomic")]
+        let _guard = self.lock.lock().unwrap();
 
         // Tail optimisation: truncate instead of recycling through the AVL tree.
         if ptr + true_len == self.stack.len()? {
@@ -915,6 +952,8 @@ impl BStackBulkAllocator for GhostTreeBstackAllocator {
 
         // Allocate one contiguous block.  `total` is already a sum of multiples
         // of MIN_ALLOC so no further rounding is needed.
+        #[cfg(feature = "atomic")]
+        let _guard = self.lock.lock().unwrap();
         let block_ptr = if let Some((ptr, block_size)) = self.avl_find_best_fit_and_remove(total)? {
             let remainder = block_size - total;
             if remainder >= MIN_ALLOC {
@@ -994,6 +1033,8 @@ impl BStackBulkAllocator for GhostTreeBstackAllocator {
         }
 
         // Free each merged block: tail-truncate when possible, otherwise zero + insert.
+        #[cfg(feature = "atomic")]
+        let _guard = self.lock.lock().unwrap();
         for (ptr, size) in merged {
             if ptr + size == self.stack.len()? {
                 self.stack.discard(size)?;
