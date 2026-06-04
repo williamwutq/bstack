@@ -975,23 +975,31 @@ impl BStackBulkAllocator for GhostTreeBstackAllocator {
         }
 
         // Allocate one contiguous block.  `total` is already a sum of multiples
-        // of MIN_ALLOC so no further rounding is needed.
-        #[cfg(feature = "atomic")]
-        let _guard = self.lock.lock().unwrap();
-        let block_ptr = if let Some((ptr, block_size)) = self.avl_find_best_fit_and_remove(total)? {
-            let remainder = block_size - total;
-            if remainder >= MIN_ALLOC {
-                // Split: recycle the leading remainder as a new free block,
-                // use the trailing `total` bytes for the allocation.
-                self.avl_insert(ptr, remainder)?;
-                ptr + remainder
+        // of MIN_ALLOC so no further rounding is needed.  The lock is released
+        // before extend and before building per-request slices.
+        let block_ptr = {
+            #[cfg(feature = "atomic")]
+            let _guard = self.lock.lock().unwrap();
+            if let Some((ptr, block_size)) = self.avl_find_best_fit_and_remove(total)? {
+                let remainder = block_size - total;
+                if remainder >= MIN_ALLOC {
+                    // Split: recycle the leading remainder as a new free block,
+                    // use the trailing `total` bytes for the allocation.
+                    self.avl_insert(ptr, remainder)?;
+                    ptr + remainder
+                } else {
+                    // No split: zero the stale AVL node header; rest already zeroed.
+                    self.stack.zero(ptr, MIN_ALLOC)?;
+                    ptr
+                }
             } else {
-                // No split: zero the stale AVL node header; rest already zeroed.
-                self.stack.zero(ptr, MIN_ALLOC)?;
-                ptr
+                NULL_PTR // sentinel: no free block found, extend after lock is released
             }
-        } else {
+        };
+        let block_ptr = if block_ptr == NULL_PTR {
             self.stack.extend(total)?
+        } else {
+            block_ptr
         };
 
         // Build per-request slices from the contiguous block.
@@ -1056,14 +1064,43 @@ impl BStackBulkAllocator for GhostTreeBstackAllocator {
             }
         }
 
-        // Free each merged block: tail-truncate when possible, otherwise zero + insert.
+        // Free each merged block.  The highest-address block may be at the tail;
+        // attempt a lock-free discard on it first.  All remaining blocks are
+        // zeroed outside the lock (each is owned by the caller), then inserted
+        // into the AVL tree under the lock in one pass.
+
+        let last = merged.pop().unwrap(); // highest-address block (merged is sorted)
+
+        // Attempt tail-discard on the highest-address block.
+        let last_discarded;
         #[cfg(feature = "atomic")]
-        let _guard = self.lock.lock().unwrap();
-        for (ptr, size) in merged {
-            if ptr + size == self.stack.len()? {
-                self.stack.discard(size)?;
+        {
+            last_discarded = self.stack.try_discard(last.0 + last.1, last.1)?;
+        }
+        #[cfg(not(feature = "atomic"))]
+        {
+            if last.0 + last.1 == self.stack.len()? {
+                self.stack.discard(last.1)?;
+                last_discarded = true;
             } else {
-                self.stack.zero(ptr, size)?;
+                last_discarded = false;
+            }
+        }
+
+        if !last_discarded {
+            merged.push(last);
+        }
+
+        // Zero all blocks to be inserted (outside the lock).
+        for &(ptr, size) in &merged {
+            self.stack.zero(ptr, size)?;
+        }
+
+        // Insert all zeroed blocks under the lock.
+        if !merged.is_empty() {
+            #[cfg(feature = "atomic")]
+            let _guard = self.lock.lock().unwrap();
+            for (ptr, size) in merged {
                 self.avl_insert(ptr, size)?;
             }
         }
