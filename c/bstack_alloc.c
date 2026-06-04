@@ -1374,9 +1374,7 @@ static int ff_vt_alloc(bstack_allocator_t *self, uint64_t len, bstack_slice_t *o
                   ? found_start + found_size - aligned_len
                   : found_start;
     } else {
-        /* No free block fits: push a new block onto the tail.
-         * Release the lock before pushing: bstack_push is a single atomic
-         * call that needs no free-list coordination. */
+        /* No free block fits: push a new block onto the tail */
         size_t   block_sz;
         uint8_t *block_buf;
         uint64_t push_offset;
@@ -1397,17 +1395,15 @@ static int ff_vt_alloc(bstack_allocator_t *self, uint64_t len, bstack_slice_t *o
         memcpy(block_buf, size_le, 8);
         memcpy(block_buf + ALFF_BLOCK_HDR_SIZE + aligned_len, size_le, 8);
 
-        FF_UNLOCK(a);
+        /* push is a single atomic bstack call; the lock above already excludes
+         * concurrent tail modification, so no recovery_needed marking here. */
         if (bstack_push(a->bs, block_buf, block_sz, &push_offset) != 0) {
             free(block_buf);
+            FF_UNLOCK(a);
             return -1;
         }
         free(block_buf);
-
-        out->allocator = self;
-        out->offset    = push_offset + ALFF_BLOCK_HDR_SIZE;
-        out->len       = len;
-        return 0;
+        payload = push_offset + ALFF_BLOCK_HDR_SIZE;
     }
 
     out->allocator = self;

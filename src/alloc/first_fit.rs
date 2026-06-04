@@ -855,7 +855,7 @@ impl BStackAllocator for FirstFitBStackAllocator {
         // so the read-modify-write of the free list (and any tail push) is atomic w.r.t. other
         // threads. recovery_needed is set only around the actual mutation below.
         #[cfg(feature = "atomic")]
-        let guard = self.lock.lock().unwrap();
+        let _guard = self.lock.lock().unwrap();
 
         let block_found = self.find_large_enough_block(aligned_len)?;
         if block_found.0 != 0 {
@@ -885,13 +885,11 @@ impl BStackAllocator for FirstFitBStackAllocator {
             Ok(unsafe { BStackSlice::from_raw_parts(self, payload, len) })
         } else {
             // No free block fits; push the full block (header + zero payload + footer) in one call.
-            // Release the lock before pushing: push is a single atomic BStack call that needs no
-            // free-list coordination, so holding the allocator mutex across it only adds contention.
-            #[cfg(feature = "atomic")]
-            drop(guard);
             buf[..8].copy_from_slice(&aligned_len.to_le_bytes());
             buf[(aligned_len + Self::BLOCK_HEADER_SIZE) as usize..]
                 .copy_from_slice(&aligned_len.to_le_bytes());
+            // push is a single atomic BStack call, so no recovery_needed marking is required;
+            // the lock above already excludes concurrent tail modification.
             let ptr = self.stack.push(&buf)? + Self::BLOCK_HEADER_SIZE;
             // SAFETY: ptr and len from fresh allocation via self.stack.push
             Ok(unsafe { BStackSlice::from_raw_parts(self, ptr, len) })
