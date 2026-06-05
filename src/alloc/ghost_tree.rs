@@ -738,7 +738,7 @@ impl BStackAllocator for GhostTreeBstackAllocator {
         let aligned = Self::align_up_len(len);
         {
             #[cfg(feature = "atomic")]
-            let _guard = self.lock.lock().unwrap();
+            let guard = self.lock.lock().unwrap();
             if let Some((ptr, block_size)) = self.avl_find_best_fit_and_remove(aligned)? {
                 let remainder = block_size - aligned;
                 if remainder >= MIN_ALLOC {
@@ -749,6 +749,8 @@ impl BStackAllocator for GhostTreeBstackAllocator {
                     // SAFETY: ptr + remainder is the allocated portion after splitting
                     return Ok(unsafe { BStackSlice::from_raw_parts(self, ptr + remainder, len) });
                 } else {
+                    #[cfg(feature = "atomic")]
+                    drop(guard);
                     // No split: give the whole block.  The stale AVL node in the
                     // first 32 bytes must be zeroed; the rest is already zeroed.
                     // Any bytes beyond `len` (up to `block_size`) are internal
@@ -979,7 +981,7 @@ impl BStackBulkAllocator for GhostTreeBstackAllocator {
         // before extend and before building per-request slices.
         let block_ptr = {
             #[cfg(feature = "atomic")]
-            let _guard = self.lock.lock().unwrap();
+            let guard = self.lock.lock().unwrap();
             if let Some((ptr, block_size)) = self.avl_find_best_fit_and_remove(total)? {
                 let remainder = block_size - total;
                 if remainder >= MIN_ALLOC {
@@ -988,6 +990,8 @@ impl BStackBulkAllocator for GhostTreeBstackAllocator {
                     self.avl_insert(ptr, remainder)?;
                     ptr + remainder
                 } else {
+                    #[cfg(feature = "atomic")]
+                    drop(guard); // release lock before zeroing
                     // No split: zero the stale AVL node header; rest already zeroed.
                     self.stack.zero(ptr, MIN_ALLOC)?;
                     ptr
