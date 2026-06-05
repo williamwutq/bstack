@@ -433,6 +433,642 @@ static int test_slice_read_range(void)
 }
 
 /* =========================================================================
+ * Unit tests
+ * ====================================================================== */
+
+#define ALGT_MIN_ALLOC UINT64_C(32)
+
+/* ── basic alloc / dealloc ─────────────────────────────────────────────── */
+
+static int test_alloc_returns_zeroed(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    ghost_tree_bstack_allocator_t *a = ghost_tree_bstack_allocator_new(bs);
+    CHECK(a);
+    bstack_allocator_t *al = (bstack_allocator_t *)a;
+
+    bstack_slice_t s;
+    CHECK(bstack_allocator_alloc(al, 64, &s) == 0);
+    CHECK(s.len == 64);
+    {
+        uint8_t buf[64]; int ok = 1, i;
+        CHECK(bstack_slice_read(s, buf) == 0);
+        for (i = 0; i < 64; i++) if (buf[i]) { ok = 0; break; }
+        CHECK(ok);
+    }
+
+    bstack_close(ghost_tree_bstack_allocator_into_stack(a));
+    gt_unlink(tmp);
+    return 0;
+}
+
+static int test_alloc_zero_len(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    ghost_tree_bstack_allocator_t *a = ghost_tree_bstack_allocator_new(bs);
+    CHECK(a);
+    bstack_allocator_t *al = (bstack_allocator_t *)a;
+
+    bstack_slice_t s;
+    CHECK(bstack_allocator_alloc(al, 0, &s) == 0);
+    CHECK(s.len == 0);
+    CHECK(s.offset == 0);
+
+    bstack_close(ghost_tree_bstack_allocator_into_stack(a));
+    gt_unlink(tmp);
+    return 0;
+}
+
+static int test_dealloc_zero_len_noop(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    ghost_tree_bstack_allocator_t *a = ghost_tree_bstack_allocator_new(bs);
+    CHECK(a);
+    bstack_allocator_t *al = (bstack_allocator_t *)a;
+
+    uint64_t before, after;
+    CHECK(bstack_allocator_len(al, &before) == 0);
+    bstack_slice_t s;
+    CHECK(bstack_allocator_alloc(al, 0, &s) == 0);
+    CHECK(bstack_allocator_dealloc(al, s) == 0);
+    CHECK(bstack_allocator_len(al, &after) == 0);
+    CHECK(after == before);
+
+    bstack_close(ghost_tree_bstack_allocator_into_stack(a));
+    gt_unlink(tmp);
+    return 0;
+}
+
+static int test_dealloc_tail_shrinks_stack(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    ghost_tree_bstack_allocator_t *a = ghost_tree_bstack_allocator_new(bs);
+    CHECK(a);
+    bstack_allocator_t *al = (bstack_allocator_t *)a;
+
+    uint64_t before, after_alloc, after_dealloc;
+    CHECK(bstack_allocator_len(al, &before) == 0);
+    bstack_slice_t s;
+    CHECK(bstack_allocator_alloc(al, 64, &s) == 0);
+    CHECK(bstack_allocator_len(al, &after_alloc) == 0);
+    CHECK(after_alloc > before);
+    CHECK(bstack_allocator_dealloc(al, s) == 0);
+    CHECK(bstack_allocator_len(al, &after_dealloc) == 0);
+    CHECK(after_dealloc == before);
+
+    bstack_close(ghost_tree_bstack_allocator_into_stack(a));
+    gt_unlink(tmp);
+    return 0;
+}
+
+static int test_dealloc_nontail_reuses(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    ghost_tree_bstack_allocator_t *a = ghost_tree_bstack_allocator_new(bs);
+    CHECK(a);
+    bstack_allocator_t *al = (bstack_allocator_t *)a;
+
+    bstack_slice_t sa, sb, sc;
+    CHECK(bstack_allocator_alloc(al, 64, &sa) == 0);
+    CHECK(bstack_allocator_alloc(al, 64, &sb) == 0);
+    uint64_t a_start = sa.offset;
+    CHECK(bstack_allocator_dealloc(al, sa) == 0);
+    uint64_t stack_len, stack_len2;
+    CHECK(bstack_allocator_len(al, &stack_len) == 0);
+    CHECK(bstack_allocator_alloc(al, 64, &sc) == 0);
+    CHECK(sc.offset == a_start);
+    CHECK(bstack_allocator_len(al, &stack_len2) == 0);
+    CHECK(stack_len2 == stack_len);
+
+    bstack_allocator_dealloc(al, sc);
+    bstack_allocator_dealloc(al, sb);
+    bstack_close(ghost_tree_bstack_allocator_into_stack(a));
+    gt_unlink(tmp);
+    return 0;
+}
+
+static int test_freed_block_is_zeroed(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    ghost_tree_bstack_allocator_t *a = ghost_tree_bstack_allocator_new(bs);
+    CHECK(a);
+    bstack_allocator_t *al = (bstack_allocator_t *)a;
+
+    bstack_slice_t sa, sb;
+    CHECK(bstack_allocator_alloc(al, 64, &sa) == 0);
+    CHECK(bstack_allocator_alloc(al, 64, &sb) == 0);
+    uint64_t a_start = sa.offset;
+    {
+        uint8_t fill[64];
+        memset(fill, 0xAA, 64);
+        CHECK(bstack_slice_write(sa, fill, 64) == 0);
+    }
+    CHECK(bstack_allocator_dealloc(al, sa) == 0);
+    /* AVL node header occupies [0..32]; bytes [32..64] must be zero. */
+    {
+        uint8_t raw[64]; int ok = 1, i;
+        CHECK(bstack_get(bstack_allocator_stack(al), a_start, a_start + 64, raw) == 0);
+        for (i = 32; i < 64; i++) if (raw[i]) { ok = 0; break; }
+        CHECK(ok);
+    }
+
+    bstack_allocator_dealloc(al, sb);
+    bstack_close(ghost_tree_bstack_allocator_into_stack(a));
+    gt_unlink(tmp);
+    return 0;
+}
+
+/* ── alignment ─────────────────────────────────────────────────────────── */
+
+static int test_alignment(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    ghost_tree_bstack_allocator_t *a = ghost_tree_bstack_allocator_new(bs);
+    CHECK(a);
+    bstack_allocator_t *al = (bstack_allocator_t *)a;
+
+    bstack_slice_t slices[16]; int i;
+    for (i = 0; i < 16; i++) {
+        uint64_t len = (uint64_t)(i * 7 + 1);
+        CHECK(bstack_allocator_alloc(al, len, &slices[i]) == 0);
+        /* ARENA_START=48; payload offsets ≡ 16 (mod 32) → 32-byte aligned on disk */
+        CHECK(slices[i].offset % 32 == 16);
+    }
+    for (i = 0; i < 16; i++) bstack_allocator_dealloc(al, slices[i]);
+
+    bstack_close(ghost_tree_bstack_allocator_into_stack(a));
+    gt_unlink(tmp);
+    return 0;
+}
+
+static int test_alloc_rounds_up_to_min_alloc(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    ghost_tree_bstack_allocator_t *a = ghost_tree_bstack_allocator_new(bs);
+    CHECK(a);
+    bstack_allocator_t *al = (bstack_allocator_t *)a;
+
+    uint64_t before, after;
+    CHECK(bstack_allocator_len(al, &before) == 0);
+    bstack_slice_t s;
+    CHECK(bstack_allocator_alloc(al, 1, &s) == 0);
+    CHECK(bstack_allocator_len(al, &after) == 0);
+    CHECK(after - before == ALGT_MIN_ALLOC);
+    bstack_allocator_dealloc(al, s);
+
+    bstack_close(ghost_tree_bstack_allocator_into_stack(a));
+    gt_unlink(tmp);
+    return 0;
+}
+
+/* ── split behaviour ───────────────────────────────────────────────────── */
+
+static int test_large_free_block_is_split(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    ghost_tree_bstack_allocator_t *a = ghost_tree_bstack_allocator_new(bs);
+    CHECK(a);
+    bstack_allocator_t *al = (bstack_allocator_t *)a;
+
+    bstack_slice_t sa, anchor, sb, sc;
+    CHECK(bstack_allocator_alloc(al, 128, &sa) == 0);
+    CHECK(bstack_allocator_alloc(al, 32, &anchor) == 0);
+    uint64_t a_start = sa.offset;
+    CHECK(bstack_allocator_dealloc(al, sa) == 0);
+    /* Split: 128-byte block → 96-byte remainder + 32-byte allocation */
+    CHECK(bstack_allocator_alloc(al, 32, &sb) == 0);
+    CHECK(sb.offset == a_start + 96);
+    /* Remainder (96 bytes) can be reused immediately */
+    CHECK(bstack_allocator_alloc(al, 96, &sc) == 0);
+    CHECK(sc.offset == a_start);
+
+    bstack_allocator_dealloc(al, sb);
+    bstack_allocator_dealloc(al, sc);
+    bstack_allocator_dealloc(al, anchor);
+    bstack_close(ghost_tree_bstack_allocator_into_stack(a));
+    gt_unlink(tmp);
+    return 0;
+}
+
+/* ── realloc ───────────────────────────────────────────────────────────── */
+
+static int test_realloc_to_zero(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    ghost_tree_bstack_allocator_t *a = ghost_tree_bstack_allocator_new(bs);
+    CHECK(a);
+    bstack_allocator_t *al = (bstack_allocator_t *)a;
+
+    uint64_t before, after;
+    CHECK(bstack_allocator_len(al, &before) == 0);
+    bstack_slice_t s, s2;
+    CHECK(bstack_allocator_alloc(al, 64, &s) == 0);
+    CHECK(bstack_allocator_realloc(al, s, 0, &s2) == 0);
+    CHECK(s2.len == 0);
+    CHECK(bstack_allocator_len(al, &after) == 0);
+    CHECK(after == before);
+
+    bstack_close(ghost_tree_bstack_allocator_into_stack(a));
+    gt_unlink(tmp);
+    return 0;
+}
+
+static int test_realloc_same_aligned_size(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    ghost_tree_bstack_allocator_t *a = ghost_tree_bstack_allocator_new(bs);
+    CHECK(a);
+    bstack_allocator_t *al = (bstack_allocator_t *)a;
+
+    bstack_slice_t s, s2;
+    CHECK(bstack_allocator_alloc(al, 32, &s) == 0);
+    {
+        uint8_t fill[32];
+        memset(fill, 0x5A, 32);
+        CHECK(bstack_slice_write(s, fill, 32) == 0);
+    }
+    uint64_t start = s.offset;
+    /* Realloc 32→16: same aligned block size (32), tail bytes get zeroed */
+    CHECK(bstack_allocator_realloc(al, s, 16, &s2) == 0);
+    CHECK(s2.offset == start);
+    {
+        uint8_t buf[16]; int ok = 1, i;
+        CHECK(bstack_slice_read(s2, buf) == 0);
+        for (i = 0; i < 16; i++) if (buf[i] != 0x5A) { ok = 0; break; }
+        CHECK(ok);
+    }
+    bstack_allocator_dealloc(al, s2);
+
+    bstack_close(ghost_tree_bstack_allocator_into_stack(a));
+    gt_unlink(tmp);
+    return 0;
+}
+
+static int test_realloc_shrink_tail(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    ghost_tree_bstack_allocator_t *a = ghost_tree_bstack_allocator_new(bs);
+    CHECK(a);
+    bstack_allocator_t *al = (bstack_allocator_t *)a;
+
+    bstack_slice_t s, s2;
+    CHECK(bstack_allocator_alloc(al, 128, &s) == 0);
+    uint64_t start = s.offset;
+    {
+        uint8_t fill[128];
+        memset(fill, 0xBB, 128);
+        CHECK(bstack_slice_write(s, fill, 128) == 0);
+    }
+    CHECK(bstack_allocator_realloc(al, s, 32, &s2) == 0);
+    CHECK(s2.offset == start);
+    uint64_t stack_len;
+    CHECK(bstack_allocator_len(al, &stack_len) == 0);
+    CHECK(stack_len == start + 32);
+    {
+        uint8_t buf[32]; int ok = 1, i;
+        CHECK(bstack_slice_read(s2, buf) == 0);
+        for (i = 0; i < 32; i++) if (buf[i] != 0xBB) { ok = 0; break; }
+        CHECK(ok);
+    }
+    bstack_allocator_dealloc(al, s2);
+
+    bstack_close(ghost_tree_bstack_allocator_into_stack(a));
+    gt_unlink(tmp);
+    return 0;
+}
+
+static int test_realloc_shrink_nontail(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    ghost_tree_bstack_allocator_t *a = ghost_tree_bstack_allocator_new(bs);
+    CHECK(a);
+    bstack_allocator_t *al = (bstack_allocator_t *)a;
+
+    bstack_slice_t s, anchor, s2, r;
+    CHECK(bstack_allocator_alloc(al, 128, &s) == 0);
+    CHECK(bstack_allocator_alloc(al, 32, &anchor) == 0);
+    uint64_t start = s.offset;
+    {
+        uint8_t fill[128];
+        memset(fill, 0xCC, 128);
+        CHECK(bstack_slice_write(s, fill, 128) == 0);
+    }
+    uint64_t stack_len, stack_len2;
+    CHECK(bstack_allocator_len(al, &stack_len) == 0);
+    CHECK(bstack_allocator_realloc(al, s, 32, &s2) == 0);
+    CHECK(s2.offset == start);
+    CHECK(bstack_allocator_len(al, &stack_len2) == 0);
+    CHECK(stack_len2 == stack_len);
+    CHECK(bstack_allocator_alloc(al, 96, &r) == 0);
+    CHECK(r.offset == start + 32);
+
+    bstack_allocator_dealloc(al, s2);
+    bstack_allocator_dealloc(al, r);
+    bstack_allocator_dealloc(al, anchor);
+    bstack_close(ghost_tree_bstack_allocator_into_stack(a));
+    gt_unlink(tmp);
+    return 0;
+}
+
+static int test_realloc_grow_tail(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    ghost_tree_bstack_allocator_t *a = ghost_tree_bstack_allocator_new(bs);
+    CHECK(a);
+    bstack_allocator_t *al = (bstack_allocator_t *)a;
+
+    bstack_slice_t s, s2;
+    CHECK(bstack_allocator_alloc(al, 32, &s) == 0);
+    uint64_t start = s.offset;
+    {
+        uint8_t fill[32];
+        memset(fill, 0xDD, 32);
+        CHECK(bstack_slice_write(s, fill, 32) == 0);
+    }
+    CHECK(bstack_allocator_realloc(al, s, 96, &s2) == 0);
+    CHECK(s2.offset == start);
+    {
+        uint8_t buf[96]; int ok = 1, i;
+        CHECK(bstack_slice_read(s2, buf) == 0);
+        for (i = 0;  i < 32; i++) if (buf[i] != 0xDD) { ok = 0; break; }
+        for (i = 32; i < 96; i++) if (buf[i] != 0x00) { ok = 0; break; }
+        CHECK(ok);
+    }
+    bstack_allocator_dealloc(al, s2);
+
+    bstack_close(ghost_tree_bstack_allocator_into_stack(a));
+    gt_unlink(tmp);
+    return 0;
+}
+
+static int test_realloc_grow_nontail(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    ghost_tree_bstack_allocator_t *a = ghost_tree_bstack_allocator_new(bs);
+    CHECK(a);
+    bstack_allocator_t *al = (bstack_allocator_t *)a;
+
+    bstack_slice_t s, anchor, s2;
+    CHECK(bstack_allocator_alloc(al, 32, &s) == 0);
+    CHECK(bstack_allocator_alloc(al, 32, &anchor) == 0);
+    {
+        uint8_t fill[32];
+        memset(fill, 0xEE, 32);
+        CHECK(bstack_slice_write(s, fill, 32) == 0);
+    }
+    CHECK(bstack_allocator_realloc(al, s, 96, &s2) == 0);
+    CHECK(s2.offset != anchor.offset);
+    {
+        uint8_t buf[96]; int ok = 1, i;
+        CHECK(bstack_slice_read(s2, buf) == 0);
+        for (i = 0;  i < 32; i++) if (buf[i] != 0xEE) { ok = 0; break; }
+        for (i = 32; i < 96; i++) if (buf[i] != 0x00) { ok = 0; break; }
+        CHECK(ok);
+    }
+
+    bstack_allocator_dealloc(al, s2);
+    bstack_allocator_dealloc(al, anchor);
+    bstack_close(ghost_tree_bstack_allocator_into_stack(a));
+    gt_unlink(tmp);
+    return 0;
+}
+
+/* ── invalid input ─────────────────────────────────────────────────────── */
+
+static int test_dealloc_misaligned_error(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    ghost_tree_bstack_allocator_t *a = ghost_tree_bstack_allocator_new(bs);
+    CHECK(a);
+    bstack_allocator_t *al = (bstack_allocator_t *)a;
+
+    bstack_slice_t s;
+    CHECK(bstack_allocator_alloc(al, 64, &s) == 0);
+    {
+        bstack_slice_t bad;
+        bad.allocator = al; bad.offset = s.offset + 1; bad.len = 32;
+        CHECK(bstack_allocator_dealloc(al, bad) == -1);
+    }
+    bstack_allocator_dealloc(al, s);
+
+    bstack_close(ghost_tree_bstack_allocator_into_stack(a));
+    gt_unlink(tmp);
+    return 0;
+}
+
+static int test_realloc_misaligned_error(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    ghost_tree_bstack_allocator_t *a = ghost_tree_bstack_allocator_new(bs);
+    CHECK(a);
+    bstack_allocator_t *al = (bstack_allocator_t *)a;
+
+    bstack_slice_t s;
+    CHECK(bstack_allocator_alloc(al, 64, &s) == 0);
+    {
+        bstack_slice_t bad, out;
+        bad.allocator = al; bad.offset = s.offset + 1; bad.len = 32;
+        CHECK(bstack_allocator_realloc(al, bad, 64, &out) == -1);
+    }
+    bstack_allocator_dealloc(al, s);
+
+    bstack_close(ghost_tree_bstack_allocator_into_stack(a));
+    gt_unlink(tmp);
+    return 0;
+}
+
+/* ── alloc_bulk / dealloc_bulk ─────────────────────────────────────────── */
+
+static int test_alloc_bulk_contiguous(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    ghost_tree_bstack_allocator_t *a = ghost_tree_bstack_allocator_new(bs);
+    CHECK(a);
+    bstack_allocator_t *al = (bstack_allocator_t *)a;
+
+    uint64_t lens[3] = {32, 64, 32};
+    bstack_slice_t slices[3];
+    CHECK(bstack_allocator_alloc_bulk(al, lens, 3, slices) == 0);
+    CHECK(slices[0].len == 32);
+    CHECK(slices[1].len == 64);
+    CHECK(slices[2].len == 32);
+    CHECK(slices[1].offset == slices[0].offset + 32);
+    CHECK(slices[2].offset == slices[1].offset + 64);
+    { int i; for (i = 0; i < 3; i++) bstack_allocator_dealloc(al, slices[i]); }
+
+    bstack_close(ghost_tree_bstack_allocator_into_stack(a));
+    gt_unlink(tmp);
+    return 0;
+}
+
+static int test_alloc_bulk_with_zeros(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    ghost_tree_bstack_allocator_t *a = ghost_tree_bstack_allocator_new(bs);
+    CHECK(a);
+    bstack_allocator_t *al = (bstack_allocator_t *)a;
+
+    uint64_t lens[3] = {0, 32, 0};
+    bstack_slice_t slices[3];
+    CHECK(bstack_allocator_alloc_bulk(al, lens, 3, slices) == 0);
+    CHECK(slices[0].len == 0);
+    CHECK(slices[0].offset == 0);
+    CHECK(slices[2].len == 0);
+    CHECK(slices[2].offset == 0);
+    CHECK(slices[1].len == 32);
+    { int i; for (i = 0; i < 3; i++) bstack_allocator_dealloc(al, slices[i]); }
+
+    bstack_close(ghost_tree_bstack_allocator_into_stack(a));
+    gt_unlink(tmp);
+    return 0;
+}
+
+static int test_dealloc_bulk_merges(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    ghost_tree_bstack_allocator_t *a = ghost_tree_bstack_allocator_new(bs);
+    CHECK(a);
+    bstack_allocator_t *al = (bstack_allocator_t *)a;
+
+    uint64_t before, after;
+    CHECK(bstack_allocator_len(al, &before) == 0);
+    uint64_t lens[3] = {64, 64, 64};
+    bstack_slice_t slices[3];
+    CHECK(bstack_allocator_alloc_bulk(al, lens, 3, slices) == 0);
+    CHECK(bstack_allocator_dealloc_bulk(al, slices, 3) == 0);
+    CHECK(bstack_allocator_len(al, &after) == 0);
+    CHECK(after == before);
+
+    bstack_close(ghost_tree_bstack_allocator_into_stack(a));
+    gt_unlink(tmp);
+    return 0;
+}
+
+/* ── coalesce and rebalance on reopen ──────────────────────────────────── */
+
+static int test_coalesce_on_reopen(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    uint64_t a_start, anchor_start;
+
+    {
+        bstack_t *bs = bstack_open(tmp); CHECK(bs);
+        ghost_tree_bstack_allocator_t *a = ghost_tree_bstack_allocator_new(bs);
+        CHECK(a);
+        bstack_allocator_t *al = (bstack_allocator_t *)a;
+        bstack_slice_t sa, sb, anchor;
+        CHECK(bstack_allocator_alloc(al, 64, &sa) == 0);
+        CHECK(bstack_allocator_alloc(al, 64, &sb) == 0);
+        CHECK(bstack_allocator_alloc(al, 32, &anchor) == 0);
+        a_start = sa.offset;
+        anchor_start = anchor.offset;
+        CHECK(bstack_allocator_dealloc(al, sa) == 0);
+        CHECK(bstack_allocator_dealloc(al, sb) == 0);
+        /* anchor is live — not freed */
+        bstack_close(ghost_tree_bstack_allocator_into_stack(a));
+    }
+
+    {
+        bstack_t *bs = bstack_open(tmp); CHECK(bs);
+        ghost_tree_bstack_allocator_t *a = ghost_tree_bstack_allocator_new(bs);
+        CHECK(a);
+        bstack_allocator_t *al = (bstack_allocator_t *)a;
+        /* On reopen, coalesce_and_rebalance merges the two 64-byte free blocks. */
+        bstack_slice_t c;
+        CHECK(bstack_allocator_alloc(al, 128, &c) == 0);
+        CHECK(c.offset == a_start);
+        CHECK(bstack_allocator_dealloc(al, c) == 0);
+        {
+            bstack_slice_t anchor2;
+            anchor2.allocator = al; anchor2.offset = anchor_start; anchor2.len = 32;
+            CHECK(bstack_allocator_dealloc(al, anchor2) == 0);
+        }
+        bstack_close(ghost_tree_bstack_allocator_into_stack(a));
+    }
+
+    gt_unlink(tmp);
+    return 0;
+}
+
+static int test_data_survives_reopen(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    uint64_t start;
+
+    {
+        bstack_t *bs = bstack_open(tmp); CHECK(bs);
+        ghost_tree_bstack_allocator_t *a = ghost_tree_bstack_allocator_new(bs);
+        CHECK(a);
+        bstack_allocator_t *al = (bstack_allocator_t *)a;
+        bstack_slice_t s;
+        CHECK(bstack_allocator_alloc(al, 64, &s) == 0);
+        start = s.offset;
+        {
+            uint8_t fill[64];
+            memset(fill, 0xAB, 64);
+            CHECK(bstack_slice_write(s, fill, 64) == 0);
+        }
+        bstack_close(ghost_tree_bstack_allocator_into_stack(a));
+    }
+
+    {
+        bstack_t *bs = bstack_open(tmp); CHECK(bs);
+        ghost_tree_bstack_allocator_t *a = ghost_tree_bstack_allocator_new(bs);
+        CHECK(a);
+        bstack_allocator_t *al = (bstack_allocator_t *)a;
+        {
+            bstack_slice_t s;
+            s.allocator = al; s.offset = start; s.len = 64;
+            uint8_t buf[64]; int ok = 1, i;
+            CHECK(bstack_slice_read(s, buf) == 0);
+            for (i = 0; i < 64; i++) if (buf[i] != 0xAB) { ok = 0; break; }
+            CHECK(ok);
+            bstack_allocator_dealloc(al, s);
+        }
+        bstack_close(ghost_tree_bstack_allocator_into_stack(a));
+    }
+
+    gt_unlink(tmp);
+    return 0;
+}
+
+/* ── new() error cases ─────────────────────────────────────────────────── */
+
+static int test_new_rejects_partial_header(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    /* 4 bytes — too small for the 48-byte ghost tree header */
+    CHECK(bstack_extend(bs, 4, NULL) == 0);
+    ghost_tree_bstack_allocator_t *a = ghost_tree_bstack_allocator_new(bs);
+    CHECK(a == NULL);
+    /* ghost_tree_bstack_allocator_new returns NULL without consuming bs */
+    bstack_close(bs);
+    gt_unlink(tmp);
+    return 0;
+}
+
+/* =========================================================================
  * Fuzz tests
  * ====================================================================== */
 
@@ -771,6 +1407,31 @@ static int test_fuzz_reopen(void)
 
 int main(void)
 {
+    /* Unit */
+    T(test_alloc_returns_zeroed);
+    T(test_alloc_zero_len);
+    T(test_dealloc_zero_len_noop);
+    T(test_dealloc_tail_shrinks_stack);
+    T(test_dealloc_nontail_reuses);
+    T(test_freed_block_is_zeroed);
+    T(test_alignment);
+    T(test_alloc_rounds_up_to_min_alloc);
+    T(test_large_free_block_is_split);
+    T(test_realloc_to_zero);
+    T(test_realloc_same_aligned_size);
+    T(test_realloc_shrink_tail);
+    T(test_realloc_shrink_nontail);
+    T(test_realloc_grow_tail);
+    T(test_realloc_grow_nontail);
+    T(test_dealloc_misaligned_error);
+    T(test_realloc_misaligned_error);
+    T(test_alloc_bulk_contiguous);
+    T(test_alloc_bulk_with_zeros);
+    T(test_dealloc_bulk_merges);
+    T(test_coalesce_on_reopen);
+    T(test_data_survives_reopen);
+    T(test_new_rejects_partial_header);
+
     /* Smoke */
     T(test_alloc_small);
     T(test_alloc_write_read);

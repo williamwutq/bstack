@@ -1112,12 +1112,21 @@ impl BStackBulkAllocator for GhostTreeBstackAllocator {
     }
 }
 
-#[cfg(all(test, feature = "set"))]
+#[cfg(all(test, feature = "alloc", feature = "set"))]
 mod tests {
-    use super::GhostTreeBstackAllocator;
+    use super::*;
     use crate::BStack;
-    use crate::alloc::{BStackAllocator, BStackBulkAllocator};
+    use crate::alloc::{BStackAllocator, BStackBulkAllocator, BStackSlice};
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn open_fresh() -> (GhostTreeBstackAllocator, std::path::PathBuf) {
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let id = CTR.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        let path = std::env::temp_dir().join(format!("bstack_gt_{pid}_{id}.bin"));
+        let alloc = GhostTreeBstackAllocator::new(BStack::open(&path).unwrap()).unwrap();
+        (alloc, path)
+    }
 
     struct Guard(std::path::PathBuf);
     impl Drop for Guard {
@@ -1126,19 +1135,366 @@ mod tests {
         }
     }
 
-    fn temp_path() -> std::path::PathBuf {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let pid = std::process::id();
-        std::env::temp_dir().join(format!("bstack_ghost_{pid}_{id}.bin"))
+    fn reopen(path: &std::path::Path) -> GhostTreeBstackAllocator {
+        GhostTreeBstackAllocator::new(BStack::open(path).unwrap()).unwrap()
     }
 
-    fn empty_alloc() -> (GhostTreeBstackAllocator, std::path::PathBuf) {
-        let path = temp_path();
-        (
-            GhostTreeBstackAllocator::new(BStack::open(&path).unwrap()).unwrap(),
-            path,
-        )
+    // ── basic alloc/dealloc ────────────────────────────────────────────────────
+
+    #[test]
+    fn alloc_returns_zeroed_slice() {
+        let (alloc, path) = open_fresh();
+        let _g = Guard(path);
+        let s = alloc.alloc(64).unwrap();
+        assert_eq!(s.len(), 64);
+        assert!(s.read().unwrap().iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn alloc_zero_len_returns_null_slice() {
+        let (alloc, path) = open_fresh();
+        let _g = Guard(path);
+        let s = alloc.alloc(0).unwrap();
+        assert_eq!(s.len(), 0);
+        assert_eq!(s.start(), 0);
+    }
+
+    #[test]
+    fn dealloc_zero_len_is_noop() {
+        let (alloc, path) = open_fresh();
+        let _g = Guard(path);
+        let before = alloc.stack().len().unwrap();
+        let s = alloc.alloc(0).unwrap();
+        alloc.dealloc(s).unwrap();
+        assert_eq!(alloc.stack().len().unwrap(), before);
+    }
+
+    #[test]
+    fn dealloc_tail_shrinks_stack() {
+        let (alloc, path) = open_fresh();
+        let _g = Guard(path);
+        let before = alloc.stack().len().unwrap();
+        let s = alloc.alloc(64).unwrap();
+        let after_alloc = alloc.stack().len().unwrap();
+        assert!(after_alloc > before);
+        alloc.dealloc(s).unwrap();
+        // Tail block is discarded: stack shrinks back.
+        assert_eq!(alloc.stack().len().unwrap(), before);
+    }
+
+    #[test]
+    fn dealloc_nontail_reuses_on_next_alloc() {
+        let (alloc, path) = open_fresh();
+        let _g = Guard(path);
+        let a = alloc.alloc(64).unwrap();
+        let b = alloc.alloc(64).unwrap();
+        let a_start = a.start();
+        alloc.dealloc(a).unwrap();
+        // Stack did not shrink (b still at tail).
+        let stack_len = alloc.stack().len().unwrap();
+        // Next alloc should reuse a's slot from the AVL tree.
+        let c = alloc.alloc(64).unwrap();
+        assert_eq!(c.start(), a_start);
+        assert_eq!(alloc.stack().len().unwrap(), stack_len);
+        alloc.dealloc(c).unwrap();
+        alloc.dealloc(b).unwrap();
+    }
+
+    #[test]
+    fn freed_block_is_zeroed() {
+        let (alloc, path) = open_fresh();
+        let _g = Guard(path);
+        let a = alloc.alloc(64).unwrap();
+        let b = alloc.alloc(64).unwrap();
+        let a_start = a.start();
+        a.write(&[0xAAu8; 64]).unwrap();
+        alloc.dealloc(a).unwrap();
+        // Read the raw bytes where a used to live.
+        let raw = alloc.stack().get(a_start, a_start + 64).unwrap();
+        // The AVL node header (first 32 bytes) has size/child fields written by
+        // avl_insert; the remaining 32 bytes must be zeroed by invariant.
+        assert!(raw[32..].iter().all(|&b| b == 0));
+        alloc.dealloc(b).unwrap();
+    }
+
+    // ── alignment ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn all_pointers_are_32_byte_aligned() {
+        let (alloc, path) = open_fresh();
+        let _g = Guard(path);
+        let slices: Vec<_> = (0..16).map(|i| alloc.alloc(i * 7 + 1).unwrap()).collect();
+        for s in &slices {
+            if s.len() > 0 {
+                // Arena starts at payload offset 48; the 16-byte BStack header means
+                // all payload offsets ≡ 16 (mod 32) map to 32-byte-aligned disk addresses.
+                assert_eq!(
+                    s.start() % 32,
+                    16,
+                    "start {} not 32-byte aligned on disk",
+                    s.start()
+                );
+            }
+        }
+        for s in slices {
+            alloc.dealloc(s).unwrap();
+        }
+    }
+
+    #[test]
+    fn alloc_rounds_up_to_min_alloc() {
+        let (alloc, path) = open_fresh();
+        let _g = Guard(path);
+        let before = alloc.stack().len().unwrap();
+        let s = alloc.alloc(1).unwrap();
+        // Underlying block is MIN_ALLOC (32) bytes even though len is 1.
+        assert_eq!(alloc.stack().len().unwrap() - before, MIN_ALLOC);
+        alloc.dealloc(s).unwrap();
+    }
+
+    // ── split behaviour ───────────────────────────────────────────────────────
+
+    #[test]
+    fn large_free_block_is_split() {
+        let (alloc, path) = open_fresh();
+        let _g = Guard(path);
+        // Alloc 128 bytes then free it: one free block of 128 bytes in the tree.
+        let a = alloc.alloc(128).unwrap();
+        let anchor = alloc.alloc(32).unwrap(); // prevent tail discard of a
+        let a_start = a.start();
+        alloc.dealloc(a).unwrap();
+        // Allocate 32 bytes — should split the 128-byte block, leaving 96 bytes.
+        let b = alloc.alloc(32).unwrap();
+        // b comes from the tail of a's old block.
+        assert_eq!(b.start(), a_start + 96);
+        // The 96-byte remainder can be reused.
+        let c = alloc.alloc(96).unwrap();
+        assert_eq!(c.start(), a_start);
+        alloc.dealloc(b).unwrap();
+        alloc.dealloc(c).unwrap();
+        alloc.dealloc(anchor).unwrap();
+    }
+
+    // ── realloc ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn realloc_to_zero_deallocates() {
+        let (alloc, path) = open_fresh();
+        let _g = Guard(path);
+        let before = alloc.stack().len().unwrap();
+        let s = alloc.alloc(64).unwrap();
+        let z = alloc.realloc(s, 0).unwrap();
+        assert_eq!(z.len(), 0);
+        assert_eq!(alloc.stack().len().unwrap(), before);
+    }
+
+    #[test]
+    fn realloc_same_aligned_size_preserves_data() {
+        let (alloc, path) = open_fresh();
+        let _g = Guard(path);
+        let s = alloc.alloc(32).unwrap();
+        s.write(&[0x5Au8; 32]).unwrap();
+        let start = s.start();
+        // Realloc to a different len with the same aligned block size.
+        let s2 = alloc.realloc(s, 16).unwrap();
+        assert_eq!(s2.start(), start);
+        let buf = s2.read().unwrap();
+        assert!(buf[..16].iter().all(|&b| b == 0x5A));
+        // Bytes [16..32] were zeroed by realloc.
+        assert!(buf[16..].iter().all(|&b| b == 0));
+        alloc.dealloc(s2).unwrap();
+    }
+
+    #[test]
+    fn realloc_shrink_tail_discards() {
+        let (alloc, path) = open_fresh();
+        let _g = Guard(path);
+        let s = alloc.alloc(128).unwrap();
+        let start = s.start();
+        s.write(&[0xBBu8; 128]).unwrap();
+        let s2 = alloc.realloc(s, 32).unwrap();
+        assert_eq!(s2.start(), start);
+        assert_eq!(alloc.stack().len().unwrap(), start + 32);
+        let buf = s2.read().unwrap();
+        assert!(buf[..32].iter().all(|&b| b == 0xBB));
+        alloc.dealloc(s2).unwrap();
+    }
+
+    #[test]
+    fn realloc_shrink_nontail_inserts_remainder() {
+        let (alloc, path) = open_fresh();
+        let _g = Guard(path);
+        let s = alloc.alloc(128).unwrap();
+        let anchor = alloc.alloc(32).unwrap();
+        let start = s.start();
+        s.write(&[0xCCu8; 128]).unwrap();
+        let stack_len = alloc.stack().len().unwrap();
+        let s2 = alloc.realloc(s, 32).unwrap();
+        assert_eq!(s2.start(), start);
+        // Stack did not shrink — remainder was inserted into the tree.
+        assert_eq!(alloc.stack().len().unwrap(), stack_len);
+        // Remainder (96 bytes) can be reused.
+        let r = alloc.alloc(96).unwrap();
+        assert_eq!(r.start(), start + 32);
+        alloc.dealloc(s2).unwrap();
+        alloc.dealloc(r).unwrap();
+        alloc.dealloc(anchor).unwrap();
+    }
+
+    #[test]
+    fn realloc_grow_tail_extends_in_place() {
+        let (alloc, path) = open_fresh();
+        let _g = Guard(path);
+        let s = alloc.alloc(32).unwrap();
+        let start = s.start();
+        s.write(&[0xDDu8; 32]).unwrap();
+        let s2 = alloc.realloc(s, 96).unwrap();
+        assert_eq!(s2.start(), start);
+        let buf = s2.read().unwrap();
+        assert!(buf[..32].iter().all(|&b| b == 0xDD));
+        assert!(buf[32..].iter().all(|&b| b == 0));
+        alloc.dealloc(s2).unwrap();
+    }
+
+    #[test]
+    fn realloc_grow_nontail_copies_data() {
+        let (alloc, path) = open_fresh();
+        let _g = Guard(path);
+        let s = alloc.alloc(32).unwrap();
+        let anchor = alloc.alloc(32).unwrap();
+        s.write(&[0xEEu8; 32]).unwrap();
+        let s2 = alloc.realloc(s, 96).unwrap();
+        // s2 is a new allocation (different address from anchor).
+        assert_ne!(s2.start(), anchor.start());
+        let buf = s2.read().unwrap();
+        assert!(buf[..32].iter().all(|&b| b == 0xEE));
+        assert!(buf[32..].iter().all(|&b| b == 0));
+        alloc.dealloc(s2).unwrap();
+        alloc.dealloc(anchor).unwrap();
+    }
+
+    // ── invalid input ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn dealloc_misaligned_ptr_returns_error() {
+        let (alloc, path) = open_fresh();
+        let _g = Guard(path);
+        let s = alloc.alloc(64).unwrap();
+        let bad = unsafe { BStackSlice::from_raw_parts(&alloc, s.start() + 1, 32) };
+        assert!(alloc.dealloc(bad).is_err());
+        alloc.dealloc(s).unwrap();
+    }
+
+    #[test]
+    fn realloc_misaligned_ptr_returns_error() {
+        let (alloc, path) = open_fresh();
+        let _g = Guard(path);
+        let s = alloc.alloc(64).unwrap();
+        let bad = unsafe { BStackSlice::from_raw_parts(&alloc, s.start() + 1, 32) };
+        assert!(alloc.realloc(bad, 64).is_err());
+        alloc.dealloc(s).unwrap();
+    }
+
+    // ── alloc_bulk / dealloc_bulk ─────────────────────────────────────────────
+
+    #[test]
+    fn alloc_bulk_contiguous() {
+        let (alloc, path) = open_fresh();
+        let _g = Guard(path);
+        let slices = alloc.alloc_bulk([32u64, 64, 32]).unwrap();
+        assert_eq!(slices.len(), 3);
+        assert_eq!(slices[0].len(), 32);
+        assert_eq!(slices[1].len(), 64);
+        assert_eq!(slices[2].len(), 32);
+        // All three must be contiguous in address order.
+        assert_eq!(slices[1].start(), slices[0].start() + 32);
+        assert_eq!(slices[2].start(), slices[1].start() + 64);
+        for s in slices {
+            alloc.dealloc(s).unwrap();
+        }
+    }
+
+    #[test]
+    fn alloc_bulk_with_zeros_returns_null_for_zeros() {
+        let (alloc, path) = open_fresh();
+        let _g = Guard(path);
+        let slices = alloc.alloc_bulk([0u64, 32, 0]).unwrap();
+        assert_eq!(slices[0].len(), 0);
+        assert_eq!(slices[0].start(), 0);
+        assert_eq!(slices[2].len(), 0);
+        assert_eq!(slices[2].start(), 0);
+        assert_eq!(slices[1].len(), 32);
+        for s in slices {
+            alloc.dealloc(s).unwrap();
+        }
+    }
+
+    #[test]
+    fn dealloc_bulk_merges_adjacent_slices() {
+        let (alloc, path) = open_fresh();
+        let _g = Guard(path);
+        let before = alloc.stack().len().unwrap();
+        let slices = alloc.alloc_bulk([64u64, 64, 64]).unwrap();
+        alloc.dealloc_bulk(slices).unwrap();
+        // All three were adjacent and at the tail; merged into one discard.
+        assert_eq!(alloc.stack().len().unwrap(), before);
+    }
+
+    // ── coalesce and rebalance on reopen ───────────────────────────────────────
+
+    #[test]
+    fn coalesce_on_reopen_merges_adjacent_free_blocks() {
+        let (alloc, path) = open_fresh();
+        let _g = Guard(path.clone());
+        let a = alloc.alloc(64).unwrap();
+        let b = alloc.alloc(64).unwrap();
+        let anchor = alloc.alloc(32).unwrap();
+        let a_start = a.start();
+        let anchor_start = anchor.start();
+        alloc.dealloc(a).unwrap();
+        alloc.dealloc(b).unwrap();
+        // Two separate free blocks of 64 bytes at a_start.
+        let _ = anchor;
+        drop(alloc.into_stack());
+
+        // On reopen, coalesce_and_rebalance merges them into one 128-byte block.
+        let alloc2 = reopen(&path);
+        let c = alloc2.alloc(128).unwrap();
+        assert_eq!(c.start(), a_start);
+        alloc2.dealloc(c).unwrap();
+        let anchor2 = unsafe { BStackSlice::from_raw_parts(&alloc2, anchor_start, 32) };
+        alloc2.dealloc(anchor2).unwrap();
+    }
+
+    #[test]
+    fn data_survives_reopen() {
+        let (alloc, path) = open_fresh();
+        let _g = Guard(path.clone());
+        let s = alloc.alloc(64).unwrap();
+        let start = s.start();
+        s.write(&[0xABu8; 64]).unwrap();
+        drop(alloc.into_stack());
+
+        let alloc2 = reopen(&path);
+        let s2 = unsafe { BStackSlice::from_raw_parts(&alloc2, start, 64) };
+        assert!(s2.read().unwrap().iter().all(|&b| b == 0xAB));
+        alloc2.dealloc(s2).unwrap();
+    }
+
+    // ── new() error cases ──────────────────────────────────────────────────────
+
+    #[test]
+    fn new_rejects_partial_header() {
+        use std::io::ErrorKind;
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let id = CTR.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        let path = std::env::temp_dir().join(format!("bstack_gt_partial_{pid}_{id}.bin"));
+        let _g = Guard(path.clone());
+        let stack = BStack::open(&path).unwrap();
+        stack.extend(4).unwrap(); // 4 bytes — too small for header
+        let err = GhostTreeBstackAllocator::new(stack).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
     }
 
     // ── concurrent (feature = "atomic") ───────────────────────────────────────
@@ -1158,7 +1514,7 @@ mod tests {
         const THREADS: usize = 8;
         const ROUNDS: usize = 200;
 
-        let (alloc, path) = empty_alloc();
+        let (alloc, path) = open_fresh();
         let _g = Guard(path);
         let alloc = Arc::new(alloc);
         let live: Arc<Mutex<HashSet<u64>>> = Arc::new(Mutex::new(HashSet::new()));
@@ -1214,7 +1570,7 @@ mod tests {
         const SMALL: u64 = 32;
         const LARGE: u64 = 96;
 
-        let (alloc, path) = empty_alloc();
+        let (alloc, path) = open_fresh();
         let _g = Guard(path);
         let alloc = Arc::new(alloc);
 
@@ -1273,7 +1629,7 @@ mod tests {
         const ROUNDS: usize = 100;
         const SIZES: [u64; 3] = [32, 64, 32]; // all 32-byte aligned; 128 bytes total
 
-        let (alloc, path) = empty_alloc();
+        let (alloc, path) = open_fresh();
         let _g = Guard(path);
         let alloc = Arc::new(alloc);
         let live: Arc<Mutex<HashSet<u64>>> = Arc::new(Mutex::new(HashSet::new()));

@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`GhostTreeBStackAllocator::dealloc_bulk` (C) — arena not reclaimed after bulk free** (`alloc` + `set` features): Freeing all slices returned by a single `alloc_bulk` call now shrinks the stack back to its pre-allocation size, matching the Rust implementation.
 - **`FirstFitBStackAllocator::dealloc` / `realloc` — coalesced tail blocks never reclaimed** (`alloc` + `set` features): `cascade_discard_free_tail` was only called from the explicit tail-discard path in `dealloc`. When `add_to_free_list` coalesced a freed block with its neighbours and the result ended at the stack tail, that merged free block was never discarded — leaving the arena larger than necessary after all allocations were freed. No data corruption occurs; the free list remains structurally valid throughout. Fixed by calling `cascade_discard_free_tail` after every `add_to_free_list` call in both `dealloc` and `realloc`. The cascade is a no-op when the tail is still allocated.
 
 ### Changed
