@@ -381,7 +381,9 @@
 //!   zero-overhead live allocations.  Free blocks store their AVL node inline,
 //!   and the tree is keyed on `(size, address)` for best-fit allocation.
 //!   Provides O(log n) allocation and deallocation with crash recovery through
-//!   tree rebalancing on mount.  `Send` but not `Sync`.
+//!   tree rebalancing on mount.  `Send` in all configurations; `Send + Sync`
+//!   with the `atomic` feature, where an internal `Mutex` serialises AVL tree
+//!   mutations.
 //!
 //! * [`SlabBStackAllocator`] — **Experimental.** Fixed-block slab allocator.  All blocks are
 //!   exactly `block_size` bytes with no per-block header or footer; freed

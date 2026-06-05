@@ -865,10 +865,19 @@ imbalanced — corrected on the next `GhostTreeBstackAllocator::new`.
 
 #### Thread safety
 
-`GhostTreeBstackAllocator` is **`Send`** but **not `Sync`**.  Ownership can be
-transferred to another thread, but concurrent `&self` access from multiple
-threads would race on the on-disk AVL tree without any allocator-level lock.
-Each instance must be used from at most one thread at a time.
+`GhostTreeBstackAllocator` is always **`Send`** — ownership can be transferred
+to another thread.
+
+Without the `atomic` feature it is **not `Sync`**: all allocator operations
+take `&self` and mutate the on-disk AVL tree, so concurrent shared access from
+multiple threads would race on that state.  Each instance must be used from at
+most one thread at a time.
+
+With the `atomic` feature it is **`Send + Sync`**.  An internal `Mutex`
+serialises all AVL tree mutations; tail operations use
+`BStack::try_discard` / `BStack::try_extend_zeros`, which check-and-act
+atomically under `BStack`'s own write lock without holding the allocator
+mutex.
 
 #### Example
 
