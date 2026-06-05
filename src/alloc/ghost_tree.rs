@@ -1111,3 +1111,210 @@ impl BStackBulkAllocator for GhostTreeBstackAllocator {
         Ok(())
     }
 }
+
+#[cfg(all(test, feature = "set"))]
+mod tests {
+    use super::GhostTreeBstackAllocator;
+    use crate::BStack;
+    use crate::alloc::{BStackAllocator, BStackBulkAllocator};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct Guard(std::path::PathBuf);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn temp_path() -> std::path::PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        std::env::temp_dir().join(format!("bstack_ghost_{pid}_{id}.bin"))
+    }
+
+    fn empty_alloc() -> (GhostTreeBstackAllocator, std::path::PathBuf) {
+        let path = temp_path();
+        (
+            GhostTreeBstackAllocator::new(BStack::open(&path).unwrap()).unwrap(),
+            path,
+        )
+    }
+
+    // ── concurrent (feature = "atomic") ───────────────────────────────────────
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn concurrent_alloc_dealloc_no_live_duplicates() {
+        use std::collections::HashSet;
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+
+        // Verify that concurrent alloc/dealloc never hands the same block to
+        // two callers simultaneously.  Each thread claims a block, inserts its
+        // offset into a shared live-set (asserting uniqueness), writes and reads
+        // back its thread id, then removes the offset and deallocates.  A bug
+        // in the AVL mutex would produce a duplicate entry in the set.
+        const THREADS: usize = 8;
+        const ROUNDS: usize = 200;
+
+        let (alloc, path) = empty_alloc();
+        let _g = Guard(path);
+        let alloc = Arc::new(alloc);
+        let live: Arc<Mutex<HashSet<u64>>> = Arc::new(Mutex::new(HashSet::new()));
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|tid| {
+                let alloc = Arc::clone(&alloc);
+                let live = Arc::clone(&live);
+                thread::spawn(move || {
+                    let a: &GhostTreeBstackAllocator = &alloc;
+                    for _ in 0..ROUNDS {
+                        let slice = a.alloc(32).unwrap();
+                        let off = slice.start();
+                        {
+                            let mut set = live.lock().unwrap();
+                            assert!(set.insert(off), "duplicate live offset {off}");
+                        }
+                        slice.write(&[tid as u8; 32]).unwrap();
+                        let data = slice.read().unwrap();
+                        assert_eq!(data, vec![tid as u8; 32]);
+                        {
+                            let mut set = live.lock().unwrap();
+                            set.remove(&off);
+                        }
+                        a.dealloc(slice).unwrap();
+                    }
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn concurrent_realloc_hammers_tail_paths() {
+        use std::sync::Arc;
+        use std::thread;
+
+        // T threads each own one allocation and repeatedly grow then shrink it.
+        // Whichever allocation sits at the tail exercises try_extend_zeros /
+        // try_discard; the others hit the non-tail copy-grow / AVL-insert paths.
+        // Both branches are exercised on every round because threads race for
+        // the tail.  Verify each thread's data survives every round intact.
+        //
+        // All sizes are multiples of 32 (GhostTree's MIN_ALLOC):
+        //   SMALL = 32  → 32-byte aligned block
+        //   LARGE = 96  → 96-byte aligned block (3 × 32)
+        const THREADS: usize = 6;
+        const ROUNDS: usize = 150;
+        const SMALL: u64 = 32;
+        const LARGE: u64 = 96;
+
+        let (alloc, path) = empty_alloc();
+        let _g = Guard(path);
+        let alloc = Arc::new(alloc);
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|tid| {
+                let alloc = Arc::clone(&alloc);
+                thread::spawn(move || {
+                    let a: &GhostTreeBstackAllocator = &alloc;
+                    let mut slice = a.alloc(SMALL).unwrap();
+                    slice.write(&[tid as u8; SMALL as usize]).unwrap();
+
+                    for _ in 0..ROUNDS {
+                        // Grow: tail → try_extend_zeros; non-tail → copy to new region.
+                        slice = a.realloc(slice, LARGE).unwrap();
+                        let data = slice.read().unwrap();
+                        assert_eq!(
+                            &data[..SMALL as usize],
+                            &[tid as u8; SMALL as usize],
+                            "data corrupted after grow (tid {tid})",
+                        );
+
+                        // Shrink: tail → try_discard; non-tail → AVL insert of freed tail.
+                        slice = a.realloc(slice, SMALL).unwrap();
+                        let data = slice.read().unwrap();
+                        assert_eq!(
+                            data,
+                            vec![tid as u8; SMALL as usize],
+                            "data corrupted after shrink (tid {tid})",
+                        );
+                    }
+
+                    a.dealloc(slice).unwrap();
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn concurrent_alloc_bulk_dealloc_bulk_no_live_duplicates() {
+        use std::collections::HashSet;
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+
+        // Verify that concurrent alloc_bulk / dealloc_bulk never hand the same
+        // block to two callers at once.  Each thread requests three slices per
+        // round, inserts all offsets into a shared live-set (asserting
+        // uniqueness), writes and reads back a pattern, then bulk-deallocates.
+        // A bug in the AVL mutex or bulk-allocation path would produce a
+        // duplicate offset in the set.
+        const THREADS: usize = 6;
+        const ROUNDS: usize = 100;
+        const SIZES: [u64; 3] = [32, 64, 32]; // all 32-byte aligned; 128 bytes total
+
+        let (alloc, path) = empty_alloc();
+        let _g = Guard(path);
+        let alloc = Arc::new(alloc);
+        let live: Arc<Mutex<HashSet<u64>>> = Arc::new(Mutex::new(HashSet::new()));
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|tid| {
+                let alloc = Arc::clone(&alloc);
+                let live = Arc::clone(&live);
+                thread::spawn(move || {
+                    let a: &GhostTreeBstackAllocator = &alloc;
+                    for _ in 0..ROUNDS {
+                        let slices = a.alloc_bulk(SIZES).unwrap();
+                        {
+                            let mut set = live.lock().unwrap();
+                            for s in &slices {
+                                assert!(
+                                    set.insert(s.start()),
+                                    "duplicate live offset {}",
+                                    s.start()
+                                );
+                            }
+                        }
+                        for (s, &sz) in slices.iter().zip(SIZES.iter()) {
+                            s.write(&vec![tid as u8; sz as usize]).unwrap();
+                            let data = s.read().unwrap();
+                            assert_eq!(data, vec![tid as u8; sz as usize]);
+                        }
+                        {
+                            let mut set = live.lock().unwrap();
+                            for s in &slices {
+                                set.remove(&s.start());
+                            }
+                        }
+                        a.dealloc_bulk(slices).unwrap();
+                    }
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
+    }
+}
