@@ -648,18 +648,31 @@ bstack_t *first_fit_bstack_allocator_into_stack(first_fit_bstack_allocator_t *al
  *
  * On-disk layout (all within the bstack payload):
  *   [0..32)  — reserved (user area)
- *   [32..40) — magic: "ALGT\x00\x01\x01\x00"
+ *   [32..40) — magic: "ALGT\x00\x01\x02\x00"
  *   [40..48) — AVL root pointer (8 B LE) — absolute payload offset of root
  *   [48..)   — block arena (32-byte aligned)
  *
  * All allocations are aligned to 32 bytes; minimum block size is 32 bytes.
  * No crash-recovery log: on open, adjacent free blocks are coalesced and the
  * tree is rebuilt optimally balanced.
+ *
+ * Thread safety: without -DBSTACK_FEATURE_ATOMIC, an allocator handle must be
+ * used from one thread at a time — AVL tree mutations span multiple bstack
+ * calls and would race under concurrent access.  With -DBSTACK_FEATURE_ATOMIC
+ * the handle owns an in-memory mutex (lock) that serialises all AVL tree
+ * mutations; tail operations use bstack_try_discard / bstack_try_extend_zeros,
+ * which check-and-act atomically under bstack's own write lock without holding
+ * the allocator mutex.
  * ====================================================================== */
 
 typedef struct {
     bstack_allocator_t base; /* must be first — safe cast to bstack_allocator_t * */
     bstack_t          *bs;
+#ifdef BSTACK_FEATURE_ATOMIC
+    /* Opaque platform mutex; serialises AVL tree mutations so a single handle
+     * may be shared across threads. */
+    void              *lock;
+#endif
 } ghost_tree_bstack_allocator_t;
 
 /*
