@@ -838,7 +838,7 @@ bstack = { version = "0.2", features = ["alloc"] }
 ┌─────────────────────────────┐  payload offset 0
 │   User-reserved (32 bytes)  │
 ├─────────────────────────────┤  offset 32
-│   Magic number (8 bytes)    │  "ALGT\x00\x01\x00\x00"
+│   Magic number (8 bytes)    │  "ALGT\x00\x01\x02\x00"
 ├─────────────────────────────┤  offset 40
 │   AVL root pointer (8 B)    │  absolute payload offset of the root node
 ├─────────────────────────────┤  offset 48  ← arena start (32-byte aligned)
