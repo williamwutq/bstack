@@ -43,8 +43,9 @@
 //!   offset 0 within the block — live allocations carry **zero** overhead
 //!   (no headers, no footers).  The tree is keyed on `(size, address)` for a
 //!   strict total order.  All memory is kept zeroed: the BStack zeroes on
-//!   extension, and the allocator zeroes on free.  `Send` but not `Sync` —
-//!   each instance must be used from at most one thread at a time.
+//!   extension, and the allocator zeroes on free.  `Send` in all
+//!   configurations; `Send + Sync` with the `atomic` feature, where an
+//!   internal `Mutex` serialises AVL tree mutations.
 //!
 //! * [`SlabBStackAllocator`] — a fixed-block slab allocator (requires both
 //!   `alloc` **and** `set` features).  All blocks are exactly `block_size`

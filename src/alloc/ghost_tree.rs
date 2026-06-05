@@ -1,11 +1,15 @@
 use super::{BStackAllocator, BStackBulkAllocator, BStackSlice};
 use crate::BStack;
+#[cfg(not(feature = "atomic"))]
 use std::cell::Cell;
 use std::fmt;
 use std::io;
+#[cfg(not(feature = "atomic"))]
 use std::marker::PhantomData;
+#[cfg(feature = "atomic")]
+use std::sync::Mutex;
 
-const ALGT_MAGIC: [u8; 8] = *b"ALGT\x00\x01\x01\x00";
+const ALGT_MAGIC: [u8; 8] = *b"ALGT\x00\x01\x02\x00";
 const ALGT_MAGIC_PREFIX: [u8; 6] = *b"ALGT\x00\x01";
 
 /// Payload offset of the magic number.
@@ -78,7 +82,7 @@ struct PathEntry {
 /// ┌─────────────────────────────┐  payload offset 0
 /// │   User-reserved (32 bytes)  │
 /// ├─────────────────────────────┤  offset 32
-/// │   Magic number (8 bytes)    │  "ALGT\x00\x01\x01\x00"
+/// │   Magic number (8 bytes)    │  "ALGT\x00\x01\x02\x00"
 /// ├─────────────────────────────┤  offset 40
 /// │   AVL root pointer (8 B)    │  absolute payload offset of the root node
 /// ├─────────────────────────────┤  offset 48  ← arena start (32-byte aligned)
@@ -128,23 +132,36 @@ struct PathEntry {
 ///
 /// # Thread safety
 ///
-/// `GhostTreeBstackAllocator` is **`Send`** — ownership can be transferred to
-/// another thread — but **not `Sync`**.  All allocator operations take `&self`
-/// and mutate the on-disk AVL tree through `BStack`; concurrent shared access
-/// from multiple threads would race on that state.  Each instance must be used
-/// from at most one thread at a time.
+/// `GhostTreeBstackAllocator` is always **`Send`** — ownership can be
+/// transferred to another thread.
+///
+/// Without the `atomic` feature it is **not `Sync`**: all allocator operations
+/// take `&self` and mutate the on-disk AVL tree through `BStack`, so concurrent
+/// shared access from multiple threads would race on that state.  Each instance
+/// must be used from at most one thread at a time.
+///
+/// With the `atomic` feature it **is `Sync`**.  An internal [`Mutex`] serialises
+/// all AVL tree mutations and tail-stack operations that are not already
+/// serialised by `BStack`'s own locking.
 ///
 /// ```
 /// fn assert_send<T: Send>() {}
 /// assert_send::<bstack::GhostTreeBstackAllocator>();
 /// ```
 ///
-/// ```compile_fail
+/// Without `atomic` the type is `!Sync` (this fails to compile); with `atomic`
+/// the internal `Mutex` makes it `Sync` (this compiles):
+///
+#[cfg_attr(not(feature = "atomic"), doc = "```compile_fail")]
+#[cfg_attr(feature = "atomic", doc = "```")]
 /// fn assert_sync<T: Sync>() {}
 /// assert_sync::<bstack::GhostTreeBstackAllocator>();
 /// ```
 pub struct GhostTreeBstackAllocator {
     stack: BStack,
+    #[cfg(feature = "atomic")]
+    lock: Mutex<()>,
+    #[cfg(not(feature = "atomic"))]
     _not_sync: PhantomData<Cell<()>>,
 }
 
@@ -181,6 +198,9 @@ impl GhostTreeBstackAllocator {
             // ROOT_OFFSET is zeroed by extend — null root pointer.
             return Ok(Self {
                 stack,
+                #[cfg(feature = "atomic")]
+                lock: Mutex::new(()),
+                #[cfg(not(feature = "atomic"))]
                 _not_sync: PhantomData,
             });
         }
@@ -214,6 +234,9 @@ impl GhostTreeBstackAllocator {
 
         let this = Self {
             stack,
+            #[cfg(feature = "atomic")]
+            lock: Mutex::new(()),
+            #[cfg(not(feature = "atomic"))]
             _not_sync: PhantomData,
         };
         this.coalesce_and_rebalance()?;
@@ -713,30 +736,35 @@ impl BStackAllocator for GhostTreeBstackAllocator {
             return Ok(unsafe { BStackSlice::from_raw_parts(self, 0, 0) });
         }
         let aligned = Self::align_up_len(len);
-        if let Some((ptr, block_size)) = self.avl_find_best_fit_and_remove(aligned)? {
-            let remainder = block_size - aligned;
-            if remainder >= MIN_ALLOC {
-                // Split: the leading `remainder` bytes become a new free block.
-                // The AVL node is written into those bytes by avl_insert.
-                // The tail `aligned` bytes are already zeroed by invariant.
-                self.avl_insert(ptr, remainder)?;
-                // SAFETY: ptr + remainder is the allocated portion after splitting
-                Ok(unsafe { BStackSlice::from_raw_parts(self, ptr + remainder, len) })
-            } else {
-                // No split: give the whole block.  The stale AVL node in the
-                // first 32 bytes must be zeroed; the rest is already zeroed.
-                // Any bytes beyond `len` (up to `block_size`) are internal
-                // padding and will be recovered on dealloc by re-aligning.
-                self.stack.zero(ptr, MIN_ALLOC)?;
-                // SAFETY: ptr from allocated block via avl_find_best_fit_and_remove
-                Ok(unsafe { BStackSlice::from_raw_parts(self, ptr, len) })
+        {
+            #[cfg(feature = "atomic")]
+            let guard = self.lock.lock().unwrap();
+            if let Some((ptr, block_size)) = self.avl_find_best_fit_and_remove(aligned)? {
+                let remainder = block_size - aligned;
+                if remainder >= MIN_ALLOC {
+                    // Split: the leading `remainder` bytes become a new free block.
+                    // The AVL node is written into those bytes by avl_insert.
+                    // The tail `aligned` bytes are already zeroed by invariant.
+                    self.avl_insert(ptr, remainder)?;
+                    // SAFETY: ptr + remainder is the allocated portion after splitting
+                    return Ok(unsafe { BStackSlice::from_raw_parts(self, ptr + remainder, len) });
+                } else {
+                    #[cfg(feature = "atomic")]
+                    drop(guard);
+                    // No split: give the whole block.  The stale AVL node in the
+                    // first 32 bytes must be zeroed; the rest is already zeroed.
+                    // Any bytes beyond `len` (up to `block_size`) are internal
+                    // padding and will be recovered on dealloc by re-aligning.
+                    self.stack.zero(ptr, MIN_ALLOC)?;
+                    // SAFETY: ptr from allocated block via avl_find_best_fit_and_remove
+                    return Ok(unsafe { BStackSlice::from_raw_parts(self, ptr, len) });
+                }
             }
-        } else {
-            // No free block fits: grow the BStack (returns zeroed bytes).
-            let start = self.stack.extend(aligned)?;
-            // SAFETY: start from fresh allocation via self.stack.extend
-            Ok(unsafe { BStackSlice::from_raw_parts(self, start, len) })
         }
+        // No free block fits: lock released; grow the BStack (returns zeroed bytes).
+        let start = self.stack.extend(aligned)?;
+        // SAFETY: start from fresh allocation via self.stack.extend
+        Ok(unsafe { BStackSlice::from_raw_parts(self, start, len) })
     }
 
     /// Resize `slice` to `new_len` bytes.
@@ -788,35 +816,56 @@ impl BStackAllocator for GhostTreeBstackAllocator {
             return Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) });
         }
 
-        let is_tail = slice.start() + aligned_old == self.stack.len()?;
-
         if aligned_new < aligned_old {
             // Shrink.
             let freed_tail = aligned_old - aligned_new;
             let tail_ptr = slice.start() + aligned_new;
-            if is_tail {
-                // Zero the gap [new_len..aligned_new] only; then truncate
-                // the BStack rather than recycling the freed tail.
+
+            // Atomic fast path: discard the tail block without taking the lock.
+            #[cfg(feature = "atomic")]
+            if self
+                .stack
+                .try_discard(slice.start() + aligned_old, freed_tail)?
+            {
+                if new_len < aligned_new {
+                    self.stack
+                        .zero(slice.start() + new_len, aligned_new - new_len)?;
+                }
+                return Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) });
+            }
+
+            #[cfg(not(feature = "atomic"))]
+            if slice.start() + aligned_old == self.stack.len()? {
                 if new_len < aligned_new {
                     self.stack
                         .zero(slice.start() + new_len, aligned_new - new_len)?;
                 }
                 self.stack.discard(freed_tail)?;
-            } else {
-                // Zero [new_len..aligned_old] in one call (gap + freed tail),
-                // then insert the freed tail into the AVL tree.
-                self.stack
-                    .zero(slice.start() + new_len, aligned_old - new_len)?;
-                self.avl_insert(tail_ptr, freed_tail)?;
+                return Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) });
             }
-            // SAFETY: slice shrunk, block size reduced
+
+            // Not tail: zero gap + freed tail before taking the lock, then insert.
+            self.stack
+                .zero(slice.start() + new_len, aligned_old - new_len)?;
+            #[cfg(feature = "atomic")]
+            let _guard = self.lock.lock().unwrap();
+            self.avl_insert(tail_ptr, freed_tail)?;
             return Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) });
         }
 
-        if is_tail {
-            // Grow at the tail: extend the BStack directly, no copy needed.
+        // Grow path.
+        // Atomic fast path: extend the tail without taking the lock.
+        #[cfg(feature = "atomic")]
+        if self
+            .stack
+            .try_extend_zeros(slice.start() + aligned_old, aligned_new - aligned_old)?
+        {
+            return Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) });
+        }
+
+        #[cfg(not(feature = "atomic"))]
+        if slice.start() + aligned_old == self.stack.len()? {
             self.stack.extend(aligned_new - aligned_old)?;
-            // SAFETY: slice extended at tail
             return Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) });
         }
 
@@ -851,7 +900,17 @@ impl BStackAllocator for GhostTreeBstackAllocator {
         let ptr = slice.start();
         let true_len = Self::align_up_len(slice.len());
 
+        // Atomic fast path: discard the tail block without taking the lock.
+        // try_discard succeeds only if the stack size is still ptr + true_len,
+        // making the check-and-discard atomic w.r.t. other threads' pushes.
+        // If it fails the block is no longer at the tail; fall through to insert.
+        #[cfg(feature = "atomic")]
+        if self.stack.try_discard(ptr + true_len, true_len)? {
+            return Ok(());
+        }
+
         // Tail optimisation: truncate instead of recycling through the AVL tree.
+        #[cfg(not(feature = "atomic"))]
         if ptr + true_len == self.stack.len()? {
             return self.stack.discard(true_len);
         }
@@ -860,7 +919,11 @@ impl BStackAllocator for GhostTreeBstackAllocator {
         // headers for live allocations, so reliable double-free detection is not
         // possible without false-positives on ordinary user data.
 
+        // Zero before taking the lock: the block is owned by the caller and no
+        // other thread will touch it until it appears in the AVL tree.
         self.stack.zero(ptr, true_len)?;
+        #[cfg(feature = "atomic")]
+        let _guard = self.lock.lock().unwrap();
         self.avl_insert(ptr, true_len)
     }
 }
@@ -914,21 +977,33 @@ impl BStackBulkAllocator for GhostTreeBstackAllocator {
         }
 
         // Allocate one contiguous block.  `total` is already a sum of multiples
-        // of MIN_ALLOC so no further rounding is needed.
-        let block_ptr = if let Some((ptr, block_size)) = self.avl_find_best_fit_and_remove(total)? {
-            let remainder = block_size - total;
-            if remainder >= MIN_ALLOC {
-                // Split: recycle the leading remainder as a new free block,
-                // use the trailing `total` bytes for the allocation.
-                self.avl_insert(ptr, remainder)?;
-                ptr + remainder
+        // of MIN_ALLOC so no further rounding is needed.  The lock is released
+        // before extend and before building per-request slices.
+        let block_ptr = {
+            #[cfg(feature = "atomic")]
+            let guard = self.lock.lock().unwrap();
+            if let Some((ptr, block_size)) = self.avl_find_best_fit_and_remove(total)? {
+                let remainder = block_size - total;
+                if remainder >= MIN_ALLOC {
+                    // Split: recycle the leading remainder as a new free block,
+                    // use the trailing `total` bytes for the allocation.
+                    self.avl_insert(ptr, remainder)?;
+                    ptr + remainder
+                } else {
+                    #[cfg(feature = "atomic")]
+                    drop(guard); // release lock before zeroing
+                    // No split: zero the stale AVL node header; rest already zeroed.
+                    self.stack.zero(ptr, MIN_ALLOC)?;
+                    ptr
+                }
             } else {
-                // No split: zero the stale AVL node header; rest already zeroed.
-                self.stack.zero(ptr, MIN_ALLOC)?;
-                ptr
+                NULL_PTR // sentinel: no free block found, extend after lock is released
             }
-        } else {
+        };
+        let block_ptr = if block_ptr == NULL_PTR {
             self.stack.extend(total)?
+        } else {
+            block_ptr
         };
 
         // Build per-request slices from the contiguous block.
@@ -993,12 +1068,43 @@ impl BStackBulkAllocator for GhostTreeBstackAllocator {
             }
         }
 
-        // Free each merged block: tail-truncate when possible, otherwise zero + insert.
-        for (ptr, size) in merged {
-            if ptr + size == self.stack.len()? {
-                self.stack.discard(size)?;
+        // Free each merged block.  The highest-address block may be at the tail;
+        // attempt a lock-free discard on it first.  All remaining blocks are
+        // zeroed outside the lock (each is owned by the caller), then inserted
+        // into the AVL tree under the lock in one pass.
+
+        let last = merged.pop().unwrap(); // highest-address block (merged is sorted)
+
+        // Attempt tail-discard on the highest-address block.
+        let last_discarded;
+        #[cfg(feature = "atomic")]
+        {
+            last_discarded = self.stack.try_discard(last.0 + last.1, last.1)?;
+        }
+        #[cfg(not(feature = "atomic"))]
+        {
+            if last.0 + last.1 == self.stack.len()? {
+                self.stack.discard(last.1)?;
+                last_discarded = true;
             } else {
-                self.stack.zero(ptr, size)?;
+                last_discarded = false;
+            }
+        }
+
+        if !last_discarded {
+            merged.push(last);
+        }
+
+        // Zero all blocks to be inserted (outside the lock).
+        for &(ptr, size) in &merged {
+            self.stack.zero(ptr, size)?;
+        }
+
+        // Insert all zeroed blocks under the lock.
+        if !merged.is_empty() {
+            #[cfg(feature = "atomic")]
+            let _guard = self.lock.lock().unwrap();
+            for (ptr, size) in merged {
                 self.avl_insert(ptr, size)?;
             }
         }
@@ -1389,5 +1495,182 @@ mod tests {
         stack.extend(4).unwrap(); // 4 bytes — too small for header
         let err = GhostTreeBstackAllocator::new(stack).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidData);
+    }
+
+    // ── concurrent (feature = "atomic") ───────────────────────────────────────
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn concurrent_alloc_dealloc_no_live_duplicates() {
+        use std::collections::HashSet;
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+
+        // Verify that concurrent alloc/dealloc never hands the same block to
+        // two callers simultaneously.  Each thread claims a block, inserts its
+        // offset into a shared live-set (asserting uniqueness), writes and reads
+        // back its thread id, then removes the offset and deallocates.  A bug
+        // in the AVL mutex would produce a duplicate entry in the set.
+        const THREADS: usize = 8;
+        const ROUNDS: usize = 200;
+
+        let (alloc, path) = open_fresh();
+        let _g = Guard(path);
+        let alloc = Arc::new(alloc);
+        let live: Arc<Mutex<HashSet<u64>>> = Arc::new(Mutex::new(HashSet::new()));
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|tid| {
+                let alloc = Arc::clone(&alloc);
+                let live = Arc::clone(&live);
+                thread::spawn(move || {
+                    let a: &GhostTreeBstackAllocator = &alloc;
+                    for _ in 0..ROUNDS {
+                        let slice = a.alloc(32).unwrap();
+                        let off = slice.start();
+                        {
+                            let mut set = live.lock().unwrap();
+                            assert!(set.insert(off), "duplicate live offset {off}");
+                        }
+                        slice.write(&[tid as u8; 32]).unwrap();
+                        let data = slice.read().unwrap();
+                        assert_eq!(data, vec![tid as u8; 32]);
+                        {
+                            let mut set = live.lock().unwrap();
+                            set.remove(&off);
+                        }
+                        a.dealloc(slice).unwrap();
+                    }
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn concurrent_realloc_hammers_tail_paths() {
+        use std::sync::Arc;
+        use std::thread;
+
+        // T threads each own one allocation and repeatedly grow then shrink it.
+        // Whichever allocation sits at the tail exercises try_extend_zeros /
+        // try_discard; the others hit the non-tail copy-grow / AVL-insert paths.
+        // Both branches are exercised on every round because threads race for
+        // the tail.  Verify each thread's data survives every round intact.
+        //
+        // All sizes are multiples of 32 (GhostTree's MIN_ALLOC):
+        //   SMALL = 32  → 32-byte aligned block
+        //   LARGE = 96  → 96-byte aligned block (3 × 32)
+        const THREADS: usize = 6;
+        const ROUNDS: usize = 150;
+        const SMALL: u64 = 32;
+        const LARGE: u64 = 96;
+
+        let (alloc, path) = open_fresh();
+        let _g = Guard(path);
+        let alloc = Arc::new(alloc);
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|tid| {
+                let alloc = Arc::clone(&alloc);
+                thread::spawn(move || {
+                    let a: &GhostTreeBstackAllocator = &alloc;
+                    let mut slice = a.alloc(SMALL).unwrap();
+                    slice.write(&[tid as u8; SMALL as usize]).unwrap();
+
+                    for _ in 0..ROUNDS {
+                        // Grow: tail → try_extend_zeros; non-tail → copy to new region.
+                        slice = a.realloc(slice, LARGE).unwrap();
+                        let data = slice.read().unwrap();
+                        assert_eq!(
+                            &data[..SMALL as usize],
+                            &[tid as u8; SMALL as usize],
+                            "data corrupted after grow (tid {tid})",
+                        );
+
+                        // Shrink: tail → try_discard; non-tail → AVL insert of freed tail.
+                        slice = a.realloc(slice, SMALL).unwrap();
+                        let data = slice.read().unwrap();
+                        assert_eq!(
+                            data,
+                            vec![tid as u8; SMALL as usize],
+                            "data corrupted after shrink (tid {tid})",
+                        );
+                    }
+
+                    a.dealloc(slice).unwrap();
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn concurrent_alloc_bulk_dealloc_bulk_no_live_duplicates() {
+        use std::collections::HashSet;
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+
+        // Verify that concurrent alloc_bulk / dealloc_bulk never hand the same
+        // block to two callers at once.  Each thread requests three slices per
+        // round, inserts all offsets into a shared live-set (asserting
+        // uniqueness), writes and reads back a pattern, then bulk-deallocates.
+        // A bug in the AVL mutex or bulk-allocation path would produce a
+        // duplicate offset in the set.
+        const THREADS: usize = 6;
+        const ROUNDS: usize = 100;
+        const SIZES: [u64; 3] = [32, 64, 32]; // all 32-byte aligned; 128 bytes total
+
+        let (alloc, path) = open_fresh();
+        let _g = Guard(path);
+        let alloc = Arc::new(alloc);
+        let live: Arc<Mutex<HashSet<u64>>> = Arc::new(Mutex::new(HashSet::new()));
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|tid| {
+                let alloc = Arc::clone(&alloc);
+                let live = Arc::clone(&live);
+                thread::spawn(move || {
+                    let a: &GhostTreeBstackAllocator = &alloc;
+                    for _ in 0..ROUNDS {
+                        let slices = a.alloc_bulk(SIZES).unwrap();
+                        {
+                            let mut set = live.lock().unwrap();
+                            for s in &slices {
+                                assert!(
+                                    set.insert(s.start()),
+                                    "duplicate live offset {}",
+                                    s.start()
+                                );
+                            }
+                        }
+                        for (s, &sz) in slices.iter().zip(SIZES.iter()) {
+                            s.write(&vec![tid as u8; sz as usize]).unwrap();
+                            let data = s.read().unwrap();
+                            assert_eq!(data, vec![tid as u8; sz as usize]);
+                        }
+                        {
+                            let mut set = live.lock().unwrap();
+                            for s in &slices {
+                                set.remove(&s.start());
+                            }
+                        }
+                        a.dealloc_bulk(slices).unwrap();
+                    }
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
     }
 }

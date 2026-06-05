@@ -838,7 +838,7 @@ bstack = { version = "0.2", features = ["alloc"] }
 ┌─────────────────────────────┐  payload offset 0
 │   User-reserved (32 bytes)  │
 ├─────────────────────────────┤  offset 32
-│   Magic number (8 bytes)    │  "ALGT\x00\x01\x00\x00"
+│   Magic number (8 bytes)    │  "ALGT\x00\x01\x02\x00"
 ├─────────────────────────────┤  offset 40
 │   AVL root pointer (8 B)    │  absolute payload offset of the root node
 ├─────────────────────────────┤  offset 48  ← arena start (32-byte aligned)
@@ -865,10 +865,19 @@ imbalanced — corrected on the next `GhostTreeBstackAllocator::new`.
 
 #### Thread safety
 
-`GhostTreeBstackAllocator` is **`Send`** but **not `Sync`**.  Ownership can be
-transferred to another thread, but concurrent `&self` access from multiple
-threads would race on the on-disk AVL tree without any allocator-level lock.
-Each instance must be used from at most one thread at a time.
+`GhostTreeBstackAllocator` is always **`Send`** — ownership can be transferred
+to another thread.
+
+Without the `atomic` feature it is **not `Sync`**: all allocator operations
+take `&self` and mutate the on-disk AVL tree, so concurrent shared access from
+multiple threads would race on that state.  Each instance must be used from at
+most one thread at a time.
+
+With the `atomic` feature it is **`Send + Sync`**.  An internal `Mutex`
+serialises all AVL tree mutations; tail operations use
+`BStack::try_discard` / `BStack::try_extend_zeros`, which check-and-act
+atomically under `BStack`'s own write lock without holding the allocator
+mutex.
 
 #### Example
 
