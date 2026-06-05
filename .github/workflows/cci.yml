@@ -46,6 +46,9 @@ jobs:
       run: cd c && make test-first-fit-atomic
     - name: Build and test ghost-tree allocator
       run: cd c && make test-ghost-tree
+    - name: Build and test ghost-tree allocator (atomic)
+      if: runner.os != 'Windows'
+      run: cd c && make test-ghost-tree-atomic
     - name: Build and test slab allocator
       run: cd c && make test-slab
     - name: Build and test slab allocator (atomic)

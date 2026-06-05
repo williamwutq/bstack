@@ -1402,6 +1402,232 @@ static int test_fuzz_reopen(void)
 }
 
 /* =========================================================================
+ * Concurrent tests (requires -DBSTACK_FEATURE_ATOMIC)
+ *
+ * Without ATOMIC the allocator is not thread-safe: AVL tree mutations span
+ * multiple bstack calls with no lock, so sharing one allocator across threads
+ * is undefined and these tests would race on the on-disk tree with no
+ * protection.
+ * ====================================================================== */
+
+#ifdef BSTACK_FEATURE_ATOMIC
+#include <pthread.h>
+
+#define GT_THREADS  8
+#define GT_ITERS    200
+
+typedef struct {
+    bstack_allocator_t *a;
+    int                 tid;
+    int                 ok;
+} gt_worker_arg_t;
+
+/* --- concurrent alloc / dealloc data integrity ------------------------ */
+
+static void *gt_alloc_dealloc_worker(void *raw)
+{
+    /* Each thread writes its pattern after alloc and reads it back before
+     * dealloc.  A duplicate-block race from a broken AVL lock would let two
+     * threads receive the same block and clobber each other's data. */
+    gt_worker_arg_t *w = raw;
+    uint8_t pat = (uint8_t)w->tid;
+    w->ok = 1;
+
+    for (int i = 0; i < GT_ITERS; i++) {
+        bstack_slice_t s;
+        if (bstack_allocator_alloc(w->a, 32, &s) != 0) { w->ok = 0; return NULL; }
+
+        uint8_t wbuf[32], rbuf[32];
+        memset(wbuf, pat, 32);
+        if (bstack_slice_write(s, wbuf, 32) != 0 ||
+            bstack_slice_read(s, rbuf)      != 0 ||
+            memcmp(wbuf, rbuf, 32)          != 0) {
+            w->ok = 0; return NULL;
+        }
+        if (bstack_allocator_dealloc(w->a, s) != 0) { w->ok = 0; return NULL; }
+    }
+    return NULL;
+}
+
+static int test_concurrent_alloc_dealloc_no_live_duplicates(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    ghost_tree_bstack_allocator_t *a = ghost_tree_bstack_allocator_new(bs);
+    CHECK(a);
+
+    pthread_t       threads[GT_THREADS];
+    gt_worker_arg_t args[GT_THREADS];
+    for (int i = 0; i < GT_THREADS; i++) {
+        args[i].a   = (bstack_allocator_t *)a;
+        args[i].tid = i;
+        args[i].ok  = 1;
+        pthread_create(&threads[i], NULL, gt_alloc_dealloc_worker, &args[i]);
+    }
+    for (int i = 0; i < GT_THREADS; i++) pthread_join(threads[i], NULL);
+    for (int i = 0; i < GT_THREADS; i++) CHECK(args[i].ok);
+
+    bstack_close(ghost_tree_bstack_allocator_into_stack(a));
+    gt_unlink(tmp); return 0;
+}
+
+/* --- concurrent realloc grow/shrink tail paths ------------------------ */
+
+#define GT_REALLOC_THREADS  6
+#define GT_REALLOC_ITERS    150
+#define GT_SMALL            32
+#define GT_LARGE            96
+
+typedef struct {
+    bstack_allocator_t *a;
+    int                 tid;
+    int                 ok;
+} gt_realloc_arg_t;
+
+static void *gt_realloc_worker(void *raw)
+{
+    /* Each thread owns one allocation and repeatedly grows then shrinks it.
+     * Whichever allocation sits at the tail exercises try_extend_zeros /
+     * try_discard; others hit the non-tail copy-grow / AVL-insert paths.
+     * Both branches are exercised every round because threads race for the
+     * tail.  All sizes are multiples of 32 (MIN_ALLOC). */
+    gt_realloc_arg_t *w = raw;
+    uint8_t pat = (uint8_t)(w->tid + 0x40);
+    w->ok = 1;
+
+    bstack_slice_t s;
+    if (bstack_allocator_alloc(w->a, GT_SMALL, &s) != 0) { w->ok = 0; return NULL; }
+    uint8_t init[GT_SMALL]; memset(init, pat, GT_SMALL);
+    if (bstack_slice_write(s, init, GT_SMALL) != 0) { w->ok = 0; return NULL; }
+
+    for (int i = 0; i < GT_REALLOC_ITERS; i++) {
+        bstack_slice_t s2, s3;
+        uint8_t rbuf[GT_LARGE];
+
+        /* Grow: tail → try_extend_zeros; non-tail → copy to new region. */
+        if (bstack_allocator_realloc(w->a, s, GT_LARGE, &s2) != 0) {
+            w->ok = 0; return NULL;
+        }
+        if (bstack_slice_read_into(s2, rbuf, GT_SMALL) != 0) { w->ok = 0; return NULL; }
+        for (int j = 0; j < GT_SMALL; j++) {
+            if (rbuf[j] != pat) {
+                fprintf(stderr,
+                    "  grow clobber tid=%d byte %d got 0x%02x want 0x%02x\n",
+                    w->tid, j, rbuf[j], pat);
+                w->ok = 0; return NULL;
+            }
+        }
+
+        /* Shrink: tail → try_discard; non-tail → AVL insert of freed tail. */
+        if (bstack_allocator_realloc(w->a, s2, GT_SMALL, &s3) != 0) {
+            w->ok = 0; return NULL;
+        }
+        if (bstack_slice_read(s3, rbuf) != 0) { w->ok = 0; return NULL; }
+        for (int j = 0; j < GT_SMALL; j++) {
+            if (rbuf[j] != pat) {
+                fprintf(stderr,
+                    "  shrink clobber tid=%d byte %d got 0x%02x want 0x%02x\n",
+                    w->tid, j, rbuf[j], pat);
+                w->ok = 0; return NULL;
+            }
+        }
+        s = s3;
+    }
+
+    if (bstack_allocator_dealloc(w->a, s) != 0) { w->ok = 0; return NULL; }
+    return NULL;
+}
+
+static int test_concurrent_realloc_hammers_tail_paths(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    ghost_tree_bstack_allocator_t *a = ghost_tree_bstack_allocator_new(bs);
+    CHECK(a);
+
+    pthread_t        threads[GT_REALLOC_THREADS];
+    gt_realloc_arg_t args[GT_REALLOC_THREADS];
+    for (int i = 0; i < GT_REALLOC_THREADS; i++) {
+        args[i].a   = (bstack_allocator_t *)a;
+        args[i].tid = i;
+        args[i].ok  = 1;
+        pthread_create(&threads[i], NULL, gt_realloc_worker, &args[i]);
+    }
+    for (int i = 0; i < GT_REALLOC_THREADS; i++) pthread_join(threads[i], NULL);
+    for (int i = 0; i < GT_REALLOC_THREADS; i++) CHECK(args[i].ok);
+
+    bstack_close(ghost_tree_bstack_allocator_into_stack(a));
+    gt_unlink(tmp); return 0;
+}
+
+/* --- concurrent alloc_bulk / dealloc_bulk data integrity -------------- */
+
+#define GT_BULK_THREADS  6
+#define GT_BULK_ITERS    100
+
+static const uint64_t gt_bulk_sizes[3] = {32, 64, 32}; /* 128 bytes total */
+
+typedef struct {
+    bstack_allocator_t *a;
+    int                 tid;
+    int                 ok;
+} gt_bulk_arg_t;
+
+static void *gt_bulk_worker(void *raw)
+{
+    /* Each thread requests three slices per round.  Write a pattern, read it
+     * back, then bulk-deallocate.  A duplicate-block race would clobber data. */
+    gt_bulk_arg_t *w = raw;
+    uint8_t pat = (uint8_t)(w->tid + 0x80);
+    w->ok = 1;
+
+    for (int i = 0; i < GT_BULK_ITERS; i++) {
+        bstack_slice_t slices[3];
+        if (bstack_allocator_alloc_bulk(w->a, gt_bulk_sizes, 3, slices) != 0) {
+            w->ok = 0; return NULL;
+        }
+        for (int k = 0; k < 3; k++) {
+            size_t sz = (size_t)gt_bulk_sizes[k];
+            uint8_t wbuf[64], rbuf[64];
+            memset(wbuf, pat, sz);
+            if (bstack_slice_write(slices[k], wbuf, sz) != 0 ||
+                bstack_slice_read(slices[k], rbuf)      != 0 ||
+                memcmp(wbuf, rbuf, sz)                  != 0) {
+                w->ok = 0; return NULL;
+            }
+        }
+        if (bstack_allocator_dealloc_bulk(w->a, slices, 3) != 0) {
+            w->ok = 0; return NULL;
+        }
+    }
+    return NULL;
+}
+
+static int test_concurrent_alloc_bulk_dealloc_bulk_no_live_duplicates(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    ghost_tree_bstack_allocator_t *a = ghost_tree_bstack_allocator_new(bs);
+    CHECK(a);
+
+    pthread_t     threads[GT_BULK_THREADS];
+    gt_bulk_arg_t args[GT_BULK_THREADS];
+    for (int i = 0; i < GT_BULK_THREADS; i++) {
+        args[i].a   = (bstack_allocator_t *)a;
+        args[i].tid = i;
+        args[i].ok  = 1;
+        pthread_create(&threads[i], NULL, gt_bulk_worker, &args[i]);
+    }
+    for (int i = 0; i < GT_BULK_THREADS; i++) pthread_join(threads[i], NULL);
+    for (int i = 0; i < GT_BULK_THREADS; i++) CHECK(args[i].ok);
+
+    bstack_close(ghost_tree_bstack_allocator_into_stack(a));
+    gt_unlink(tmp); return 0;
+}
+
+#endif /* BSTACK_FEATURE_ATOMIC */
+
+/* =========================================================================
  * main
  * ====================================================================== */
 
@@ -1446,6 +1672,13 @@ int main(void)
     T(test_fuzz_alloc_dealloc);
     T(test_fuzz_alloc_realloc_dealloc);
     T(test_fuzz_reopen);
+
+#ifdef BSTACK_FEATURE_ATOMIC
+    /* Concurrent */
+    T(test_concurrent_alloc_dealloc_no_live_duplicates);
+    T(test_concurrent_realloc_hammers_tail_paths);
+    T(test_concurrent_alloc_bulk_dealloc_bulk_no_live_duplicates);
+#endif
 
     printf("\n%d/%d passed\n", g_passed, g_total);
     return (g_passed == g_total) ? 0 : 1;

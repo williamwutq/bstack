@@ -2005,6 +2005,43 @@ bstack_t *first_fit_bstack_allocator_into_stack(first_fit_bstack_allocator_t *al
 }
 
 /* =========================================================================
+ * Mutex helpers shared by ghost_tree, slab, and checked_slab allocators.
+ * Mirrors the pattern used by first_fit_bstack_allocator_t.
+ * Under BSTACK_FEATURE_ATOMIC these allocate/free the opaque lock field;
+ * without it they compile away to nothing.
+ * ====================================================================== */
+
+#ifdef BSTACK_FEATURE_ATOMIC
+static int bstack_alloc_lock_init(void **out)
+{
+#  ifdef _WIN32
+    CRITICAL_SECTION *cs = malloc(sizeof *cs);
+    if (!cs) { errno = ENOMEM; return -1; }
+    InitializeCriticalSection(cs);
+    *out = cs;
+    return 0;
+#  else
+    pthread_mutex_t *m = malloc(sizeof *m);
+    if (!m) { errno = ENOMEM; return -1; }
+    if (pthread_mutex_init(m, NULL) != 0) { free(m); errno = EINVAL; return -1; }
+    *out = m;
+    return 0;
+#  endif
+}
+
+static void bstack_alloc_lock_destroy(void *lock)
+{
+    if (!lock) return;
+#  ifdef _WIN32
+    DeleteCriticalSection((CRITICAL_SECTION *)lock);
+#  else
+    pthread_mutex_destroy((pthread_mutex_t *)lock);
+#  endif
+    free(lock);
+}
+#endif /* BSTACK_FEATURE_ATOMIC */
+
+/* =========================================================================
  * ghost_tree_bstack_allocator_t — best-fit AVL tree allocator
  * Requires -DBSTACK_FEATURE_SET (depends on bstack_set and bstack_zero).
  * ====================================================================== */
@@ -2021,7 +2058,7 @@ bstack_t *first_fit_bstack_allocator_into_stack(first_fit_bstack_allocator_t *al
  * reliably detecting cycles created by a partial rotation crash. */
 #define ALGT_MAX_AVL_DEPTH   128u
 
-static const uint8_t algt_magic[8]        = {'A','L','G','T',0,1,1,0};
+static const uint8_t algt_magic[8]        = {'A','L','G','T',0,1,2,0};
 static const uint8_t algt_magic_prefix[6] = {'A','L','G','T',0,1};
 
 typedef struct {
@@ -2614,7 +2651,7 @@ static int gt_vt_alloc(bstack_allocator_t *self, uint64_t len,
     bstack_slice_t *out)
 {
     ghost_tree_bstack_allocator_t *a = (ghost_tree_bstack_allocator_t *)self;
-    uint64_t aligned, found_ptr, found_size, block_start;
+    uint64_t aligned, found_ptr, found_size;
 
     if (len == 0) {
         out->allocator = self; out->offset = 0; out->len = 0;
@@ -2622,41 +2659,60 @@ static int gt_vt_alloc(bstack_allocator_t *self, uint64_t len,
     }
 
     aligned = algt_align_up_len(len);
+
+    /* Lock covers AVL search and conditional insert (split case).
+     * Released before bstack_zero (no-split) and before bstack_extend. */
+    FF_LOCK(a);
     if (algt_avl_find_best_fit_and_remove(a->bs, aligned,
-                                           &found_ptr, &found_size) != 0)
+                                           &found_ptr, &found_size) != 0) {
+        FF_UNLOCK(a);
         return -1;
+    }
 
     if (found_ptr != ALGT_NULL_PTR) {
         uint64_t remainder = found_size - aligned;
         if (remainder >= ALGT_MIN_ALLOC) {
             /* Split: leading remainder becomes a new free block;
              * allocated block is at the back (tail of the found region). */
-            if (algt_avl_insert(a->bs, found_ptr, remainder) != 0) return -1;
-            block_start = found_ptr + remainder;
-        } else {
-            /* No split: zero the stale 32-byte AVL node header. */
-            if (bstack_zero(a->bs, found_ptr, (size_t)ALGT_MIN_ALLOC) != 0)
+            if (algt_avl_insert(a->bs, found_ptr, remainder) != 0) {
+                FF_UNLOCK(a);
                 return -1;
-            block_start = found_ptr;
+            }
+            FF_UNLOCK(a);
+            out->allocator = self;
+            out->offset    = found_ptr + remainder;
+            out->len       = len;
+            return 0;
         }
-    } else {
-        /* No free block fits: extend the stack (returns zeroed bytes). */
-#if UINT64_MAX > SIZE_MAX
-        if (aligned > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
-#endif
-        if (bstack_extend(a->bs, (size_t)aligned, &block_start) != 0) return -1;
+        /* No split: unlock before zeroing the stale 32-byte AVL node header. */
+        FF_UNLOCK(a);
+        if (bstack_zero(a->bs, found_ptr, (size_t)ALGT_MIN_ALLOC) != 0)
+            return -1;
+        out->allocator = self;
+        out->offset    = found_ptr;
+        out->len       = len;
+        return 0;
     }
 
-    out->allocator = self;
-    out->offset    = block_start;
-    out->len       = len;
+    /* No free block fits: unlock before extending the stack. */
+    FF_UNLOCK(a);
+#if UINT64_MAX > SIZE_MAX
+    if (aligned > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
+#endif
+    {
+        uint64_t block_start;
+        if (bstack_extend(a->bs, (size_t)aligned, &block_start) != 0) return -1;
+        out->allocator = self;
+        out->offset    = block_start;
+        out->len       = len;
+    }
     return 0;
 }
 
 static int gt_vt_dealloc(bstack_allocator_t *self, bstack_slice_t slice)
 {
     ghost_tree_bstack_allocator_t *a = (ghost_tree_bstack_allocator_t *)self;
-    uint64_t true_len, stack_len;
+    uint64_t true_len;
 
     if (slice.len == 0) return 0;
 
@@ -2667,30 +2723,51 @@ static int gt_vt_dealloc(bstack_allocator_t *self, bstack_slice_t slice)
     }
 
     true_len = algt_align_up_len(slice.len);
-    if (bstack_len(a->bs, &stack_len) != 0) return -1;
-
-    if (slice.offset + true_len == stack_len) {
-        /* Tail block: truncate instead of recycling through the tree. */
-#if UINT64_MAX > SIZE_MAX
-        if (true_len > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
-#endif
-        return bstack_discard(a->bs, (size_t)true_len);
-    }
-
-    /* Non-tail: zero entire block (upholds zeroed-memory invariant), insert. */
 #if UINT64_MAX > SIZE_MAX
     if (true_len > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
 #endif
+
+#ifdef BSTACK_FEATURE_ATOMIC
+    /* Atomic tail path: check-and-discard under BStack's own write lock. */
+    {
+        int ok = 0;
+        if (bstack_try_discard(a->bs, slice.offset + true_len,
+                               (size_t)true_len, &ok) != 0) return -1;
+        if (ok) return 0;
+    }
+    /* Not at tail: zero block (caller owns it; no lock), then insert under lock. */
     if (bstack_zero(a->bs, slice.offset, (size_t)true_len) != 0) return -1;
-    return algt_avl_insert(a->bs, slice.offset, true_len);
+    {
+        int r;
+        FF_LOCK(a);
+        r = algt_avl_insert(a->bs, slice.offset, true_len);
+        FF_UNLOCK(a);
+        return r;
+    }
+#else
+    {
+        uint64_t stack_len;
+        if (bstack_len(a->bs, &stack_len) != 0) return -1;
+        if (slice.offset + true_len == stack_len) {
+            /* Tail block: truncate instead of recycling through the tree. */
+            return bstack_discard(a->bs, (size_t)true_len);
+        }
+        /* Non-tail: zero entire block (upholds zeroed-memory invariant), insert. */
+        if (bstack_zero(a->bs, slice.offset, (size_t)true_len) != 0) return -1;
+        return algt_avl_insert(a->bs, slice.offset, true_len);
+    }
+#endif
 }
 
 static int gt_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
     uint64_t new_len, bstack_slice_t *out)
 {
     ghost_tree_bstack_allocator_t *a = (ghost_tree_bstack_allocator_t *)self;
-    uint64_t old_len, aligned_old, aligned_new, stack_len;
+    uint64_t old_len, aligned_old, aligned_new;
+#ifndef BSTACK_FEATURE_ATOMIC
+    uint64_t stack_len;
     int      is_tail;
+#endif
 
     if (slice.len == 0)
         return gt_vt_alloc(self, new_len, out);
@@ -2727,13 +2804,39 @@ static int gt_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
         return 0;
     }
 
+#ifndef BSTACK_FEATURE_ATOMIC
     if (bstack_len(a->bs, &stack_len) != 0) return -1;
     is_tail = (slice.offset + aligned_old == stack_len);
+#endif
 
     if (aligned_new < aligned_old) {
-        /* Shrink */
+        /* Shrink. */
         uint64_t freed_tail = aligned_old - aligned_new;
         uint64_t tail_ptr   = slice.offset + aligned_new;
+
+#ifdef BSTACK_FEATURE_ATOMIC
+        /* Atomic tail path: try_discard atomically checks and discards. */
+        {
+            int ok = 0;
+#if UINT64_MAX > SIZE_MAX
+            if (freed_tail > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
+#endif
+            if (bstack_try_discard(a->bs, slice.offset + aligned_old,
+                                   (size_t)freed_tail, &ok) != 0) return -1;
+            if (ok) {
+                if (new_len < aligned_new) {
+                    uint64_t gap = aligned_new - new_len;
+#if UINT64_MAX > SIZE_MAX
+                    if (gap > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
+#endif
+                    if (bstack_zero(a->bs, slice.offset + new_len, (size_t)gap) != 0)
+                        return -1;
+                }
+                out->allocator = self; out->offset = slice.offset; out->len = new_len;
+                return 0;
+            }
+        }
+#else
         if (is_tail) {
             /* Zero [new_len..aligned_new] then discard the freed tail. */
             if (new_len < aligned_new) {
@@ -2748,23 +2851,48 @@ static int gt_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
             if (freed_tail > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
 #endif
             if (bstack_discard(a->bs, (size_t)freed_tail) != 0) return -1;
-        } else {
-            /* Zero [new_len..aligned_old] then insert freed tail into tree. */
+            out->allocator = self; out->offset = slice.offset; out->len = new_len;
+            return 0;
+        }
+#endif
+
+        /* Non-tail: zero gap + freed tail (no lock), insert freed tail under lock. */
+        {
             uint64_t zero_n = aligned_old - new_len;
 #if UINT64_MAX > SIZE_MAX
             if (zero_n > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
 #endif
             if (bstack_zero(a->bs, slice.offset + new_len, (size_t)zero_n) != 0)
                 return -1;
-            if (algt_avl_insert(a->bs, tail_ptr, freed_tail) != 0) return -1;
         }
-        out->allocator = self;
-        out->offset    = slice.offset;
-        out->len       = new_len;
+        {
+            int r;
+            FF_LOCK(a);
+            r = algt_avl_insert(a->bs, tail_ptr, freed_tail);
+            FF_UNLOCK(a);
+            if (r != 0) return -1;
+        }
+        out->allocator = self; out->offset = slice.offset; out->len = new_len;
         return 0;
     }
 
-    /* Grow */
+    /* Grow. */
+#ifdef BSTACK_FEATURE_ATOMIC
+    /* Atomic tail path: try_extend_zeros atomically checks and extends. */
+    {
+        int ok = 0;
+        uint64_t delta = aligned_new - aligned_old;
+#if UINT64_MAX > SIZE_MAX
+        if (delta > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
+#endif
+        if (bstack_try_extend_zeros(a->bs, slice.offset + aligned_old,
+                                    (size_t)delta, &ok) != 0) return -1;
+        if (ok) {
+            out->allocator = self; out->offset = slice.offset; out->len = new_len;
+            return 0;
+        }
+    }
+#else
     if (is_tail) {
         /* Extend in place — no copy needed. */
         uint64_t delta = aligned_new - aligned_old;
@@ -2777,6 +2905,7 @@ static int gt_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
         out->len       = new_len;
         return 0;
     }
+#endif
 
     /* Grow (non-tail): alloc new block, copy old data, free old block. */
     {
@@ -2837,9 +2966,13 @@ gt_vt_alloc_bulk(bstack_allocator_t *self, const uint64_t *lens, size_t n,
         return 0;
     }
 
-    /* Allocate one contiguous block for all requests. */
+    /* Allocate one contiguous block.  Lock covers AVL search and conditional
+     * insert (split); released before bstack_zero and before bstack_extend. */
+    block_ptr = ALGT_NULL_PTR; /* sentinel: no free block found */
+    FF_LOCK(a);
     if (algt_avl_find_best_fit_and_remove(a->bs, total,
                                            &found_ptr, &found_size) != 0) {
+        FF_UNLOCK(a);
         free(aligned);
         return -1;
     }
@@ -2850,19 +2983,15 @@ gt_vt_alloc_bulk(bstack_allocator_t *self, const uint64_t *lens, size_t n,
             /* Split: recycle the leading remainder as a new free block;
              * use the trailing `total` bytes for the allocation. */
             if (algt_avl_insert(a->bs, found_ptr, remainder) != 0) {
+                FF_UNLOCK(a);
                 free(aligned);
                 return -1;
             }
             block_ptr = found_ptr + remainder;
+            FF_UNLOCK(a);
         } else {
-            /* No split: zero the stale 32-byte AVL node header. */
-#if UINT64_MAX > SIZE_MAX
-            if (ALGT_MIN_ALLOC > (uint64_t)SIZE_MAX) {
-                free(aligned);
-                errno = EINVAL;
-                return -1;
-            }
-#endif
+            /* No split: unlock before zeroing the stale AVL node header. */
+            FF_UNLOCK(a);
             if (bstack_zero(a->bs, found_ptr, (size_t)ALGT_MIN_ALLOC) != 0) {
                 free(aligned);
                 return -1;
@@ -2870,6 +2999,10 @@ gt_vt_alloc_bulk(bstack_allocator_t *self, const uint64_t *lens, size_t n,
             block_ptr = found_ptr;
         }
     } else {
+        FF_UNLOCK(a); /* release before extending the stack */
+    }
+
+    if (block_ptr == ALGT_NULL_PTR) {
 #if UINT64_MAX > SIZE_MAX
         if (total > (uint64_t)SIZE_MAX) { free(aligned); errno = EINVAL; return -1; }
 #endif
@@ -2912,7 +3045,6 @@ gt_vt_dealloc_bulk(bstack_allocator_t *self, const bstack_slice_t *slices,
     ghost_tree_bstack_allocator_t *a = (ghost_tree_bstack_allocator_t *)self;
     algt_block_t *pairs;
     size_t pairs_n, i;
-    uint64_t stack_len;
 
     if (n == 0) return 0;
 
@@ -2951,21 +3083,65 @@ gt_vt_dealloc_bulk(bstack_allocator_t *self, const bstack_slice_t *slices,
         pairs_n = out + 1;
     }
 
-    /* Free each merged block: tail-truncate when possible, else zero + insert. */
-    if (bstack_len(a->bs, &stack_len) != 0) { free(pairs); return -1; }
-    for (i = 0; i < pairs_n; i++) {
-        uint64_t ptr  = pairs[i].ptr;
-        uint64_t size = pairs[i].size;
+    /* Free each merged block.  The highest-address block may be at the tail;
+     * attempt a lock-free discard on it first.  All remaining blocks are
+     * zeroed outside the lock (each is owned by the caller), then inserted
+     * into the AVL tree under the lock in one pass. */
+    {
+        algt_block_t last = pairs[pairs_n - 1];
+        int          last_discarded = 0;
+
+#ifdef BSTACK_FEATURE_ATOMIC
+        {
+            int ok = 0;
 #if UINT64_MAX > SIZE_MAX
-        if (size > (uint64_t)SIZE_MAX) { free(pairs); errno = EINVAL; return -1; }
+            if (last.size > (uint64_t)SIZE_MAX) { free(pairs); errno = EINVAL; return -1; }
 #endif
-        if (ptr + size == stack_len) {
-            if (bstack_discard(a->bs, (size_t)size) != 0) { free(pairs); return -1; }
-            stack_len -= size;
-        } else {
-            if (bstack_zero(a->bs, ptr, (size_t)size) != 0) { free(pairs); return -1; }
-            if (algt_avl_insert(a->bs, ptr, size) != 0) { free(pairs); return -1; }
+            if (bstack_try_discard(a->bs, last.ptr + last.size,
+                                   (size_t)last.size, &ok) != 0) {
+                free(pairs); return -1;
+            }
+            last_discarded = ok;
         }
+#else
+        {
+            uint64_t stack_len;
+            if (bstack_len(a->bs, &stack_len) != 0) { free(pairs); return -1; }
+            if (last.ptr + last.size == stack_len) {
+#if UINT64_MAX > SIZE_MAX
+                if (last.size > (uint64_t)SIZE_MAX) { free(pairs); errno = EINVAL; return -1; }
+#endif
+                if (bstack_discard(a->bs, (size_t)last.size) != 0) { free(pairs); return -1; }
+                last_discarded = 1;
+            }
+        }
+#endif
+
+        if (last_discarded)
+            pairs_n--; /* remove last from the insert list */
+    }
+
+    /* Zero all blocks to be inserted (outside the lock). */
+    for (i = 0; i < pairs_n; i++) {
+#if UINT64_MAX > SIZE_MAX
+        if (pairs[i].size > (uint64_t)SIZE_MAX) { free(pairs); errno = EINVAL; return -1; }
+#endif
+        if (bstack_zero(a->bs, pairs[i].ptr, (size_t)pairs[i].size) != 0) {
+            free(pairs); return -1;
+        }
+    }
+
+    /* Insert all zeroed blocks under the lock. */
+    if (pairs_n > 0) {
+        FF_LOCK(a);
+        for (i = 0; i < pairs_n; i++) {
+            if (algt_avl_insert(a->bs, pairs[i].ptr, pairs[i].size) != 0) {
+                FF_UNLOCK(a);
+                free(pairs);
+                return -1;
+            }
+        }
+        FF_UNLOCK(a);
     }
 
     free(pairs);
@@ -2993,18 +3169,35 @@ ghost_tree_bstack_allocator_t *ghost_tree_bstack_allocator_new(bstack_t *bs)
     a->base.bulk_vtbl = &gt_bulk_vtbl;
     a->bs             = bs;
 
-    if (bstack_len(bs, &stack_len) != 0) { free(a); return NULL; }
+#ifdef BSTACK_FEATURE_ATOMIC
+    if (bstack_alloc_lock_init(&a->lock) != 0) { free(a); return NULL; }
+#endif
+
+    if (bstack_len(bs, &stack_len) != 0) {
+#ifdef BSTACK_FEATURE_ATOMIC
+        bstack_alloc_lock_destroy(a->lock);
+#endif
+        free(a); return NULL;
+    }
 
     if (stack_len == 0) {
         /* Fresh init: 32 user-reserved bytes + 8 magic + 8 root pointer */
         uint8_t hdr[48];
         memset(hdr, 0, 48);
         memcpy(hdr + 32, algt_magic, 8);
-        if (bstack_push(bs, hdr, 48, NULL) != 0) { free(a); return NULL; }
+        if (bstack_push(bs, hdr, 48, NULL) != 0) {
+#ifdef BSTACK_FEATURE_ATOMIC
+            bstack_alloc_lock_destroy(a->lock);
+#endif
+            free(a); return NULL;
+        }
         return a;
     }
 
     if (stack_len < ALGT_ARENA_START) {
+#ifdef BSTACK_FEATURE_ATOMIC
+        bstack_alloc_lock_destroy(a->lock);
+#endif
         free(a);
         errno = EINVAL;
         return NULL;
@@ -3014,8 +3207,16 @@ ghost_tree_bstack_allocator_t *ghost_tree_bstack_allocator_new(bstack_t *bs)
     {
         uint8_t prefix[6];
         if (bstack_get(bs, ALGT_MAGIC_OFFSET, ALGT_MAGIC_OFFSET + 6,
-                        prefix) != 0) { free(a); return NULL; }
+                        prefix) != 0) {
+#ifdef BSTACK_FEATURE_ATOMIC
+            bstack_alloc_lock_destroy(a->lock);
+#endif
+            free(a); return NULL;
+        }
         if (memcmp(prefix, algt_magic_prefix, 6) != 0) {
+#ifdef BSTACK_FEATURE_ATOMIC
+            bstack_alloc_lock_destroy(a->lock);
+#endif
             free(a); errno = EINVAL; return NULL;
         }
     }
@@ -3026,64 +3227,48 @@ ghost_tree_bstack_allocator_t *ghost_tree_bstack_allocator_new(bstack_t *bs)
         if (remainder != 0) {
             uint64_t pad = 32 - remainder;
 #if UINT64_MAX > SIZE_MAX
-            if (pad > (uint64_t)SIZE_MAX) { free(a); errno = EINVAL; return NULL; }
+            if (pad > (uint64_t)SIZE_MAX) {
+#ifdef BSTACK_FEATURE_ATOMIC
+                bstack_alloc_lock_destroy(a->lock);
 #endif
-            if (bstack_extend(bs, (size_t)pad, NULL) != 0) { free(a); return NULL; }
+                free(a); errno = EINVAL; return NULL;
+            }
+#endif
+            if (bstack_extend(bs, (size_t)pad, NULL) != 0) {
+#ifdef BSTACK_FEATURE_ATOMIC
+                bstack_alloc_lock_destroy(a->lock);
+#endif
+                free(a); return NULL;
+            }
         }
     }
 
-    if (algt_coalesce_and_rebalance(bs) != 0) { free(a); return NULL; }
+    if (algt_coalesce_and_rebalance(bs) != 0) {
+#ifdef BSTACK_FEATURE_ATOMIC
+        bstack_alloc_lock_destroy(a->lock);
+#endif
+        free(a); return NULL;
+    }
     return a;
 }
 
 void ghost_tree_bstack_allocator_free(ghost_tree_bstack_allocator_t *alloc)
 {
+#ifdef BSTACK_FEATURE_ATOMIC
+    bstack_alloc_lock_destroy(alloc->lock);
+#endif
     free(alloc);
 }
 
 bstack_t *ghost_tree_bstack_allocator_into_stack(ghost_tree_bstack_allocator_t *alloc)
 {
     bstack_t *bs = alloc->bs;
+#ifdef BSTACK_FEATURE_ATOMIC
+    bstack_alloc_lock_destroy(alloc->lock);
+#endif
     free(alloc);
     return bs;
 }
-
-/* =========================================================================
- * Mutex helpers shared by slab and checked_slab allocators.
- * Mirrors the pattern used by first_fit_bstack_allocator_t.
- * Under BSTACK_FEATURE_ATOMIC these allocate/free the opaque lock field;
- * without it they compile away to nothing.
- * ====================================================================== */
-
-#ifdef BSTACK_FEATURE_ATOMIC
-static int bstack_alloc_lock_init(void **out)
-{
-#  ifdef _WIN32
-    CRITICAL_SECTION *cs = malloc(sizeof *cs);
-    if (!cs) { errno = ENOMEM; return -1; }
-    InitializeCriticalSection(cs);
-    *out = cs;
-    return 0;
-#  else
-    pthread_mutex_t *m = malloc(sizeof *m);
-    if (!m) { errno = ENOMEM; return -1; }
-    if (pthread_mutex_init(m, NULL) != 0) { free(m); errno = EINVAL; return -1; }
-    *out = m;
-    return 0;
-#  endif
-}
-
-static void bstack_alloc_lock_destroy(void *lock)
-{
-    if (!lock) return;
-#  ifdef _WIN32
-    DeleteCriticalSection((CRITICAL_SECTION *)lock);
-#  else
-    pthread_mutex_destroy((pthread_mutex_t *)lock);
-#  endif
-    free(lock);
-}
-#endif /* BSTACK_FEATURE_ATOMIC */
 
 /* =========================================================================
  * slab_bstack_allocator_t — fixed-block slab allocator
