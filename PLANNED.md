@@ -261,8 +261,8 @@ Neither primitive covers the case where multiple dependent reads must be perform
 ```rust
 #[non_exhaustive]
 pub enum BStackOp<'a> {
-    Read(u64, &'a mut [u8]),
-    Write(u64, &'a [u8]),
+    Read  { offset: u64, buf:  &'a mut [u8] },
+    Write { offset: u64, data: &'a [u8]     },
 }
 ```
 
