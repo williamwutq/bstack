@@ -298,3 +298,42 @@ Reads of the locked region `[0, locked_len())` under `process_gen` are allowed a
 - **Enum name.** `BStackOp` is intentionally broad — it should not imply the type is only for `process_gen`, since 0.4.0 may introduce additional variants for new primitives or transaction protocols. Alternatives include `BStackGenOp` and `BStackRWOp`; whichever name is chosen should remain valid if the enum gains variants unrelated to read-modify-write.
 - **Write variant buffer ownership.** `Write(u64, &'a [u8])` borrows the data to write. A caller writing back a buffer they just read into can coerce `&'a mut [u8]` to `&'a [u8]` at no cost; a caller writing computed data must ensure the buffer lives long enough. An owned variant (`Cow<'a, [u8]>` or `Vec<u8>`) would be more ergonomic in the computed case but adds a heap allocation per write. The current design chooses the zero-allocation path and defers richer ownership to future variants under `#[non_exhaustive]`.
 - **Multiple writes.** The "write implies end" constraint is a 0.2.x simplification due to the fact that multi-writes are not currently atomic. Future versions may relax it by providing new APIs that support multiple writes under one lock.
+
+---
+
+## Typed region and I/O parameter types
+
+**Feature flag:** None (additive API surface)
+**Breaking change:** No
+
+### Motivation
+
+Many BStack and `BStackSlice` APIs share recurring parameter patterns that are passed as raw function arguments today:
+
+- `(offset: u64, buf: impl AsRef<[u8]>)` — a write region: a position and the data to write there.
+- `(offset: u64, buf: &mut [u8])` — a read region: a position and a buffer to fill; the length is implied by `buf.len()`.
+- `(offset: u64, len: u64)` — a named range: a position and a byte count, with no associated data.
+- `(a: u64, b: u64, len: u64)` — a cross-region pair: two positions and a shared length, as in `cross_exchange`.
+
+These patterns appear in `set`, `get`, `get_range`, `zero`, `zero_range`, `cross_exchange`, `BStackOp::Read`, `BStackOp::Write`, and the generator closures for `get_batched_gen` and `process_gen`. Callers must remember the argument order and meaning at every call site. There is no type-level distinction between "an offset into this stack" and "a length", both of which are `u64`.
+
+Introducing named types for these patterns — for example, `ReadRegion`, `WriteRegion`, `ByteRange`, and `CrossRegion` — would make call sites self-documenting and allow the compiler to reject transposed arguments.
+
+### Design (sketch)
+
+The types would be lightweight, `Copy` structs:
+
+```rust
+pub struct ByteRange       (Range<u64>);
+pub struct ReadRegion<'a>  { pub offset: u64, pub buf: &'a mut [u8] }
+pub struct WriteRegion<'a> { pub offset: u64, pub data: &'a [u8] }
+pub struct CrossRegion     { pub src: u64, pub dst: u64, pub len: u64 }
+```
+
+Existing methods would gain overloaded entry points accepting these types via `Into` or `From`, or new companion methods alongside the originals. `BStackOp` variants could also be restructured around them. No existing call site would break.
+
+### Open questions
+
+- **Is the benefit real?** The patterns already have named parameters in Rust function signatures (`offset`, `buf`, `len`), so transposition is not silent — the compiler infers types, and `buf: impl AsRef<[u8]>` versus `len: u64` are already distinct. The main gain is readability at call sites, which is a matter of taste.
+- **Proliferation cost.** Four new public types add documentation surface, appear in error messages, and must be maintained indefinitely. If the API grows, more pattern types may follow.
+- **Naming.** The names above are illustrative. Alternatives: `Span`, `Slice` (conflicts with `BStackSlice`), `Region`, `Segment`. The right name should not collide with existing types and should signal that these are I/O coordinates, not data containers.
