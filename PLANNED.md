@@ -240,3 +240,61 @@ The no-retry policy does not prevent this. ABA corrupts on a *successful* CAS, n
 - **How to eliminate ABA.** A generation counter embedded in the high bits of the `free_head` word is one approach: each pop increments the counter, so even if the same block offset returns to head its tagged representation differs and Thread A's CAS fails. But high-bit tagging changes the on-disk format of `free_head` and requires deciding how many bits to allocate for the counter versus the offset. Are there better approaches — for example, a new BStack primitive that reads `free_head` and the next pointer then writes the new `free_head` all under a single write lock (eliminating the window entirely), or a design that makes the same-address ABA structurally impossible? If the window can be closed at the BStack level, the allocator does not need to manage generations at all.
 
 - **Batch push under concurrency.** `push_free_blocks` currently reads `free_head`, builds the entire linked chain in a buffer, then writes the chain and updates `free_head` in two separate calls — not atomic with respect to concurrent pushes. A lock-free batch push requires either (a) holding the allocator mutex for batch operations only, (b) building the chain tail-to-head and using the same `cross_exchange` trick, or (c) a new BStack primitive. The single-block push via `cross_exchange` is already safe; the batch case needs its own solution before the mutex can be removed entirely.
+
+---
+
+## `process_gen`: generator-pattern read-modify-write under one write lock
+
+**Feature flag:** `set` and `atomic`
+**Breaking change:** No
+
+### Motivation
+
+`process(start, end, f)` performs a read-modify-write on a single contiguous range under one write lock: it reads `[start, end)`, passes the bytes to a callback for in-place mutation, and writes them back atomically. `get_batched_gen(f)` performs multiple dependent reads under one read lock, with a generator closure that yields `(offset, &mut buf)` pairs until it returns `None`, allowing each result to inform the next read's offset or length.
+
+Neither primitive covers the case where multiple dependent reads must be performed — with each result potentially informing the next — and then a single write issued, all under one write lock. The allocator's lock-free pop path (`get_batched_gen` + `cas`) approaches this pattern but requires two separate lock acquisitions: one read lock for the batched reads and a second write lock for the CAS. Between those two lock acquisitions any other thread can modify the file, producing the ABA window described in the lock-free free list section. A single primitive holding the write lock across all reads and the subsequent write closes that window entirely.
+
+### Design
+
+#### `BStackOp` enum
+
+```rust
+#[non_exhaustive]
+pub enum BStackOp<'a> {
+    Read(u64, &'a mut [u8]),
+    Write(u64, &'a [u8]),
+}
+```
+
+`Read(offset, buf)` requests that `offset..offset+buf.len()` bytes be read from the file into `buf`. `Write(offset, data)` requests that `data` be written to `offset..offset+data.len()`. The enum is `#[non_exhaustive]` to allow new variants in future versions without a breaking change. There is no `End` variant — the end of the sequence is expressed by returning `None` from the generator closure, matching the convention of `get_batched_gen`.
+
+`Write` implies termination: after the runtime processes a `Write`, the generator is not called again. Only one write per invocation is supported. This is a 0.3.x constraint, not a permanent design decision; `#[non_exhaustive]` leaves room for future variants that extend the protocol (see Open questions).
+
+#### `process_gen` function
+
+```rust
+#[cfg(all(feature = "set", feature = "atomic"))]
+pub fn process_gen<'a, F>(&self, f: F) -> io::Result<()>
+where
+    F: FnMut() -> Option<BStackOp<'a>>;
+```
+
+The call holds the BStack write lock from start to finish. The runtime calls `f` in a loop:
+
+- `Some(BStackOp::Read(offset, buf))` — reads `offset..offset+buf.len()` into `buf` under the held write lock, then calls `f` again. Each read's result is available to the closure before the next call, so dependent reads (e.g., "read the head pointer, then read the node it points to") are expressed naturally.
+- `Some(BStackOp::Write(offset, data))` — writes `data` to `offset..offset+data.len()` under the still-held write lock and returns. `f` is not called again.
+- `None` — ends the batch without issuing any write, releasing the write lock. Useful when the reads alone are sufficient to make a decision, or when the decision is to write nothing (e.g., a conditional update that determined no change was needed).
+
+Holding the write lock across all reads and the write means no other thread can observe or modify any file region between the last read and the write. This is the key property `get_batched_gen` + `cas` cannot guarantee. For the lock-free free list pop path specifically, `process_gen` can replace the two-step `get_batched_gen` + `cas` sequence with a single call: read `FREE_HEAD_OFFSET` into `head_buf`, read `head_val` (parsed from `head_buf`) into `next_buf`, then write `next_buf` to `FREE_HEAD_OFFSET` — all under one lock, making ABA structurally impossible without a generation counter.
+
+Unlike `process`, the write region does not need to overlap any read region. The caller may write any region of the payload, including regions that partially or fully overlap with previously read ranges. File size is never changed; `process_gen` does not support `push` or `pop`.
+
+#### Interaction with the locked region
+
+Reads of the locked region `[0, locked_len())` under `process_gen` are allowed and use the lock-free fast path, matching the behavior of `peek`. Writes to the locked region return `InvalidInput`, matching the behavior of `set`.
+
+### Open questions
+
+- **Enum name.** `BStackOp` is intentionally broad — it should not imply the type is only for `process_gen`, since 0.4.0 may introduce additional variants for new primitives or transaction protocols. Alternatives include `BStackGenOp` and `BStackRWOp`; whichever name is chosen should remain valid if the enum gains variants unrelated to read-modify-write.
+- **Write variant buffer ownership.** `Write(u64, &'a [u8])` borrows the data to write. A caller writing back a buffer they just read into can coerce `&'a mut [u8]` to `&'a [u8]` at no cost; a caller writing computed data must ensure the buffer lives long enough. An owned variant (`Cow<'a, [u8]>` or `Vec<u8>`) would be more ergonomic in the computed case but adds a heap allocation per write. The current design chooses the zero-allocation path and defers richer ownership to future variants under `#[non_exhaustive]`.
+- **Multiple writes.** The "write implies end" constraint is a 0.2.x simplification due to the fact that multi-writes are not currently atomic. Future versions may relax it by providing new APIs that support multiple writes under one lock.
