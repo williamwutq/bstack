@@ -268,7 +268,7 @@ pub enum BStackOp<'a> {
 
 `Read(offset, buf)` requests that `offset..offset+buf.len()` bytes be read from the file into `buf`. `Write(offset, data)` requests that `data` be written to `offset..offset+data.len()`. The enum is `#[non_exhaustive]` to allow new variants in future versions without a breaking change. There is no `End` variant — the end of the sequence is expressed by returning `None` from the generator closure, matching the convention of `get_batched_gen`.
 
-`Write` implies termination: after the runtime processes a `Write`, the generator is not called again. Only one write per invocation is supported. This is a 0.3.x constraint, not a permanent design decision; `#[non_exhaustive]` leaves room for future variants that extend the protocol (see Open questions).
+`Write` implies termination: after the runtime processes a `Write`, the generator is not called again. Only one write per invocation is supported. This is a 0.2.x constraint, not a permanent design decision; `#[non_exhaustive]` leaves room for future variants that extend the protocol (see Open questions).
 
 #### `process_gen` function
 
