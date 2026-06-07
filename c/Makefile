@@ -44,9 +44,19 @@ OBJ_ALLOC_SET_ATOMIC = bstack_alloc-set-atomic.o
 TEST_FF_BIN = test_first_fit$(EXE_EXT)
 TEST_FF_OBJ = test_first_fit.o
 
+# Same first-fit test compiled against the SET+ATOMIC alloc lib, exercising the
+# in-memory mutex and the bstack_cas path for recovery_needed.
+TEST_FF_ATOMIC_OBJ = test_first_fit-atomic.o
+TEST_FF_ATOMIC_BIN = test_first_fit-atomic$(EXE_EXT)
+
 # Ghost-tree allocator test (requires BSTACK_FEATURE_SET).
 TEST_GT_BIN = test_ghost_tree$(EXE_EXT)
 TEST_GT_OBJ = test_ghost_tree.o
+
+# Same ghost-tree test compiled against the SET+ATOMIC alloc lib, exercising
+# the in-memory mutex and the try_discard / try_extend_zeros tail paths.
+TEST_GT_ATOMIC_OBJ = test_ghost_tree-atomic.o
+TEST_GT_ATOMIC_BIN = test_ghost_tree-atomic$(EXE_EXT)
 
 # Slab allocator test (requires BSTACK_FEATURE_SET).
 TEST_SL_BIN = test_slab$(EXE_EXT)
@@ -153,9 +163,9 @@ test-first-fit: $(TEST_FF_BIN)
 # Same first-fit test compiled against the SET+ATOMIC alloc lib, exercising the
 # in-memory mutex and the bstack_cas path for recovery_needed.
 test-first-fit-atomic: $(LIB_ALLOC_SET_ATOMIC)
-	$(CC) $(CFLAGS) -DBSTACK_FEATURE_SET -DBSTACK_FEATURE_ATOMIC -c -o test_first_fit-atomic.o test_first_fit.c
-	$(CC) $(CFLAGS) -DBSTACK_FEATURE_SET -DBSTACK_FEATURE_ATOMIC -o test_first_fit-atomic$(EXE_EXT) test_first_fit-atomic.o -L. -lbstack-alloc-set-atomic -lpthread
-	$(RUN)test_first_fit-atomic$(EXE_EXT)
+	$(CC) $(CFLAGS) -DBSTACK_FEATURE_SET -DBSTACK_FEATURE_ATOMIC -c -o $(TEST_FF_ATOMIC_OBJ) test_first_fit.c
+	$(CC) $(CFLAGS) -DBSTACK_FEATURE_SET -DBSTACK_FEATURE_ATOMIC -o $(TEST_FF_ATOMIC_BIN) $(TEST_FF_ATOMIC_OBJ) -L. -lbstack-alloc-set-atomic -lpthread
+	$(RUN)$(TEST_FF_ATOMIC_BIN)
 
 $(TEST_GT_OBJ): test_ghost_tree.c bstack_alloc.h bstack.h
 	$(CC) $(CFLAGS) -DBSTACK_FEATURE_SET -c -o $@ $<
@@ -169,9 +179,9 @@ test-ghost-tree: $(TEST_GT_BIN)
 # Same ghost-tree test compiled against the SET+ATOMIC alloc lib, exercising
 # the in-memory mutex and the try_discard / try_extend_zeros tail paths.
 test-ghost-tree-atomic: $(LIB_ALLOC_SET_ATOMIC)
-	$(CC) $(CFLAGS) -DBSTACK_FEATURE_SET -DBSTACK_FEATURE_ATOMIC -c -o test_ghost_tree-atomic.o test_ghost_tree.c
-	$(CC) $(CFLAGS) -DBSTACK_FEATURE_SET -DBSTACK_FEATURE_ATOMIC -o test_ghost_tree-atomic$(EXE_EXT) test_ghost_tree-atomic.o -L. -lbstack-alloc-set-atomic -lpthread
-	$(RUN)test_ghost_tree-atomic$(EXE_EXT)
+	$(CC) $(CFLAGS) -DBSTACK_FEATURE_SET -DBSTACK_FEATURE_ATOMIC -c -o $(TEST_GT_ATOMIC_OBJ) test_ghost_tree.c
+	$(CC) $(CFLAGS) -DBSTACK_FEATURE_SET -DBSTACK_FEATURE_ATOMIC -o $(TEST_GT_ATOMIC_BIN) $(TEST_GT_ATOMIC_OBJ) -L. -lbstack-alloc-set-atomic -lpthread
+	$(RUN)$(TEST_GT_ATOMIC_BIN)
 
 $(TEST_SL_OBJ): test_slab.c bstack_alloc.h bstack.h
 	$(CC) $(CFLAGS) -DBSTACK_FEATURE_SET -c -o $@ $<
@@ -333,8 +343,9 @@ clean:
 	      $(OBJ_ALLOC) $(OBJ_ALLOC_SET) $(OBJ_ALLOC_SET_ATOMIC) \
 	      $(LIB_ALLOC) $(LIB_ALLOC_SET) $(LIB_ALLOC_SET_ATOMIC) \
 	      $(TEST_FF_OBJ) $(TEST_FF_BIN) \
-	      test_first_fit-atomic.o test_first_fit-atomic$(EXE_EXT) \
+	      $(TEST_FF_ATOMIC_OBJ) $(TEST_FF_ATOMIC_BIN) \
 	      $(TEST_GT_OBJ) $(TEST_GT_BIN) \
+	      $(TEST_GT_ATOMIC_OBJ) $(TEST_GT_ATOMIC_BIN) \
 	      $(TEST_SL_OBJ) $(TEST_SL_BIN) \
 	      $(TEST_SL_ATOMIC_OBJ) $(TEST_SL_ATOMIC_BIN) \
 	      $(TEST_CSL_OBJ) $(TEST_CSL_BIN) \
