@@ -4221,6 +4221,244 @@ mod atomic_tests {
         assert_eq!(s2.peek(0).unwrap(), b"helloWORLD");
     }
 
+    // -----------------------------------------------------------------------
+    // process_gen  (require set + atomic)
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn process_gen_reads_then_writes() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        let mut buf = [0u8; 5];
+        let mut step = 0usize;
+        s.process_gen(|| {
+            // SAFETY: `buf` outlives this whole `process_gen` call.
+            let r = match step {
+                0 => Some(BStackGenOp::Read {
+                    offset: 0,
+                    buf: unsafe { core::mem::transmute::<&mut [u8], _>(&mut buf[..]) },
+                }),
+                1 => Some(BStackGenOp::Write {
+                    offset: 5,
+                    data: unsafe { core::mem::transmute::<&[u8], _>(&buf[..]) },
+                }),
+                _ => None,
+            };
+            step += 1;
+            r
+        })
+        .unwrap();
+        assert_eq!(&buf, b"hello");
+        assert_eq!(s.peek(0).unwrap(), b"hellohello");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn process_gen_dependent_reads_inform_next_offset() {
+        use crate::BStackGenOp;
+        // Layout: [pointer: u64 LE][node "A "][node "B "]
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&8u64.to_le_bytes());
+        payload.extend_from_slice(b"A ");
+        payload.extend_from_slice(b"B ");
+        s.push(&payload).unwrap();
+
+        let mut ptr_buf = [0u8; 8];
+        let mut node_buf = [0u8; 2];
+        let mut step = 0usize;
+        s.process_gen(|| {
+            // SAFETY: `ptr_buf` and `node_buf` outlive this whole `process_gen` call.
+            let r = match step {
+                0 => Some(BStackGenOp::Read {
+                    offset: 0,
+                    buf: unsafe { core::mem::transmute::<&mut [u8], _>(&mut ptr_buf[..]) },
+                }),
+                1 => {
+                    // The previous read has already filled `ptr_buf` by the
+                    // time we're called again.
+                    let target = u64::from_le_bytes(ptr_buf);
+                    Some(BStackGenOp::Read {
+                        offset: target,
+                        buf: unsafe { core::mem::transmute::<&mut [u8], _>(&mut node_buf[..]) },
+                    })
+                }
+                _ => None,
+            };
+            step += 1;
+            r
+        })
+        .unwrap();
+        assert_eq!(u64::from_le_bytes(ptr_buf), 8);
+        assert_eq!(&node_buf, b"A ");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn process_gen_immediate_none_is_noop() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        s.process_gen(|| None).unwrap();
+        assert_eq!(s.len().unwrap(), 5);
+        assert_eq!(s.peek(0).unwrap(), b"hello");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn process_gen_write_ends_sequence() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        let mut calls = 0usize;
+        s.process_gen(|| {
+            calls += 1;
+            match calls {
+                1 => Some(BStackGenOp::Write {
+                    offset: 0,
+                    data: b"HELLO",
+                }),
+                _ => Some(BStackGenOp::Write {
+                    offset: 5,
+                    data: b"WORLD",
+                }),
+            }
+        })
+        .unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!(s.peek(0).unwrap(), b"HELLOworld");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn process_gen_does_not_change_file_size() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        s.process_gen(|| {
+            Some(BStackGenOp::Write {
+                offset: 0,
+                data: b"HELLO",
+            })
+        })
+        .unwrap();
+        assert_eq!(s.len().unwrap(), 10);
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn process_gen_read_out_of_bounds_returns_error() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hi").unwrap();
+        let mut buf = [0u8; 10];
+        let mut called = false;
+        let err = s
+            .process_gen(|| {
+                if called {
+                    return None;
+                }
+                called = true;
+                // SAFETY: `buf` outlives this whole `process_gen` call.
+                Some(BStackGenOp::Read {
+                    offset: 0,
+                    buf: unsafe { core::mem::transmute::<&mut [u8], _>(&mut buf[..]) },
+                })
+            })
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(s.peek(0).unwrap(), b"hi");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn process_gen_write_out_of_bounds_returns_error() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        let err = s
+            .process_gen(|| {
+                Some(BStackGenOp::Write {
+                    offset: 2,
+                    data: b"abcdefgh",
+                })
+            })
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(s.peek(0).unwrap(), b"hello");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn process_gen_write_in_locked_region_returns_error() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        s.lock_up_to(5).unwrap();
+        let err = s
+            .process_gen(|| {
+                Some(BStackGenOp::Write {
+                    offset: 0,
+                    data: b"HELLO",
+                })
+            })
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(s.peek(0).unwrap(), b"helloworld");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn process_gen_read_in_locked_region_succeeds() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        s.lock_up_to(5).unwrap();
+        let mut buf = [0u8; 5];
+        let mut called = false;
+        s.process_gen(|| {
+            if called {
+                return None;
+            }
+            called = true;
+            // SAFETY: `buf` outlives this whole `process_gen` call.
+            Some(BStackGenOp::Read {
+                offset: 0,
+                buf: unsafe { core::mem::transmute::<&mut [u8], _>(&mut buf[..]) },
+            })
+        })
+        .unwrap();
+        assert_eq!(&buf, b"hello");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn process_gen_persists_across_reopen() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+        s.push(b"helloworld").unwrap();
+        s.process_gen(|| {
+            Some(BStackGenOp::Write {
+                offset: 5,
+                data: b"WORLD",
+            })
+        })
+        .unwrap();
+        drop(s);
+        let s2 = BStack::open(&p).unwrap();
+        assert_eq!(s2.peek(0).unwrap(), b"helloWORLD");
+    }
+
     // ---- lock_up_to / locked_len / open_locked_up_to -----------------------
 
     #[test]
