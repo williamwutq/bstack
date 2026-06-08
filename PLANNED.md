@@ -207,37 +207,34 @@ The call to `set` in step 1 and the call to `cross_exchange` in step 2 are not j
 
 Push is inherently race-free without any allocator-level mutex: even if two threads push concurrently, each `cross_exchange` is atomic with respect to the other, and each thread's block ends up correctly linked into the list (though their relative order at the head is not deterministic).
 
-#### Pop: state-machine CAS via `get_batched_gen` + `cas`
+#### Pop: single-lock dependent sequence via `process_gen`
 
 To pop the head block from the free list:
 
-1. **Read head and next under one lock.** Call `stack.get_batched_gen` with two reads: offset `FREE_HEAD_OFFSET` into an 8-byte buffer `head_buf`, and offset `head_val` (parsed from `head_buf`) into an 8-byte buffer `next_buf`. `get_batched_gen` holds the BStack read lock across both reads, so the pair is consistent: if `head_val` is non-sentinel, `next_buf` contains the next-pointer stored in the head block at the moment `head_buf` was read.
+1. **Run the whole pop as one `process_gen` sequence.** Drive `stack.process_gen` through a small state machine:
+   - *Step 0* — issue `Read { offset: FREE_HEAD_OFFSET, buf: head_buf }` to read the current head pointer.
+   - *Step 1* — once `head_buf` is populated, parse `head_val`. If `head_val == SENTINEL`, the list is empty: return `None`, ending the sequence with nothing popped — fall through to the tail-extension branch. Otherwise remember `head_val` and issue `Read { offset: head_val, buf: next_buf }` to read that block's `next` pointer.
+   - *Step 2* — issue `Write { offset: FREE_HEAD_OFFSET, data: next_buf }`, replacing the head with the next block and ending the sequence. The caller now owns `head_val`.
 
-2. **Return early if the list is empty.** If `head_val == SENTINEL` after step 1, there is nothing to pop; return `None`.
+The crucial property is that `process_gen` acquires the BStack write lock *before* the first read and holds it, unreleased, across every subsequent read and the terminating write. The read of `free_head`, the read of its `next` pointer, and the write that advances `free_head` all happen as one indivisible critical section — not as separate lock acquisitions that another thread's operations could interleave between.
 
-3. **Attempt to advance the head.** Call `stack.cas(FREE_HEAD_OFFSET, head_buf, next_buf)`. This acquires the BStack write lock, re-reads `FREE_HEAD_OFFSET`, and writes `next_buf` only if the current value still equals `head_buf`. If the CAS succeeds, the head has been advanced to the next block and the caller owns `head_val`. If the CAS fails, some other thread has modified `free_head` since step 1; do not retry — fall through to the tail-extension branch.
+#### Why a CAS-based design would be unsafe, and how `process_gen` avoids it
 
-No retry on CAS failure is intentional. Retrying would be correct only if the list state is guaranteed to be consistent across attempts, but the ABA problem (see below) means a re-read cannot be trusted to yield a safe pair. Falling back to tail extension on CAS failure is a conservative, always-correct choice; it may allocate a fresh block instead of recycling one, but it never produces a duplicate live allocation.
-
-#### Why the naive design without a generation counter is unsafe
-
-The pop algorithm above contains a race window between step 1 (releasing the read lock after `get_batched_gen`) and step 3 (acquiring the write lock for `cas`). During this window any number of concurrent operations can modify the free list. The ABA problem exploits this: `free_head` can return to the same byte value it held in step 1 even though the list structure has changed underneath.
+A more "obvious" design would pair `get_batched_gen` (read `head` and `head->next` under a read lock, then release it) with `cas` (re-acquire the write lock, compare, and conditionally write `free_head`). That pairing leaves a race window between releasing the read lock and acquiring the write lock — and the ABA problem exploits exactly that window: `free_head` can return to the same byte value it held at read time even though the list structure underneath has completely changed.
 
 **Concrete example.** Suppose the free list is `head → H0 → H1 → H2 → …`:
 
-1. **Thread A** calls `get_batched_gen`, reads `head = H0` and `H0->next = H1`, then releases the read lock.
-2. **Thread B** pops H0 (CAS `FREE_HEAD_OFFSET`: H0 → H1). H0 is now live.
-3. **Thread B** pops H1 (CAS `FREE_HEAD_OFFSET`: H1 → H2). H1 is now live.
-4. **Thread B** deallocates H0 — push: writes `H0->next = H2` (the current head), then sets `head = H0` via `cross_exchange`. The free list is now `H0 → H2 → …`.
-5. **Thread A** fires its CAS: reads `FREE_HEAD_OFFSET`, sees `H0` — this matches `head_buf` from step 1 — and writes `H1`. The CAS succeeds.
+1. **Thread A** reads `head = H0` and `H0->next = H1`, then releases its read lock.
+2. **Thread B** pops H0 (`free_head`: H0 → H1). H0 is now live.
+3. **Thread B** pops H1 (`free_head`: H1 → H2). H1 is now live.
+4. **Thread B** deallocates H0 — push: writes `H0->next = H2` (the current head), then sets `head = H0`. The free list is now `H0 → H2 → …`.
+5. **Thread A** fires its CAS: re-reads `FREE_HEAD_OFFSET`, sees `H0` — matching what it read in step 1 — and writes `H1`. The CAS "succeeds".
 
-After step 5, `free_head = H1`. But H1 is still live (allocated to Thread B in step 3). The next `alloc` call will pop H1 from the free list and hand it out again — a silent double allocation. No error is returned; the corruption is not detected.
+`free_head` is now `H1`, but H1 is still live (allocated to Thread B in step 3): the next `alloc` hands it out a second time — a silent double allocation that no error reports. A no-retry-on-failure policy would not help here; the corruption comes from a *successful* CAS, one that cannot distinguish "head is still H0 because nothing changed" from "head is H0 again because it cycled back".
 
-The no-retry policy does not prevent this. ABA corrupts on a *successful* CAS, not on a retried one. The CAS succeeds precisely because the head byte-value returned to H0; the algorithm cannot distinguish "head is still H0 because nothing changed" from "head is H0 again because it was freed and returned."
+`process_gen` makes this scenario structurally impossible rather than merely improbable. Because Thread A would hold the *same* write lock continuously from its first read of `free_head` through its final write, none of Thread B's steps — pop H0, pop H1, push H0 back — could execute in between; every one of them needs that same write lock and so simply blocks until Thread A's whole sequence, including the terminating write, has completed. There is no window in which `free_head` can change value and cycle back, so the byte-value re-comparison that CAS relies on — and that ABA defeats — is unnecessary. No generation counter, no on-disk format change, and no retry policy are needed; the allocator only has to drive the read-read-write sequence through `process_gen`, which already owns the single lock acquisition that makes it atomic.
 
 ### Open questions
-
-- **How to eliminate ABA.** A generation counter embedded in the high bits of the `free_head` word is one approach: each pop increments the counter, so even if the same block offset returns to head its tagged representation differs and Thread A's CAS fails. But high-bit tagging changes the on-disk format of `free_head` and requires deciding how many bits to allocate for the counter versus the offset. Are there better approaches — for example, a new BStack primitive that reads `free_head` and the next pointer then writes the new `free_head` all under a single write lock (eliminating the window entirely), or a design that makes the same-address ABA structurally impossible? If the window can be closed at the BStack level, the allocator does not need to manage generations at all.
 
 - **Batch push under concurrency.** `push_free_blocks` currently reads `free_head`, builds the entire linked chain in a buffer, then writes the chain and updates `free_head` in two separate calls — not atomic with respect to concurrent pushes. A lock-free batch push requires either (a) holding the allocator mutex for batch operations only, (b) building the chain tail-to-head and using the same `cross_exchange` trick, or (c) a new BStack primitive. The single-block push via `cross_exchange` is already safe; the batch case needs its own solution before the mutex can be removed entirely.
 
