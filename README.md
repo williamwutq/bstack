@@ -478,6 +478,7 @@ bstack = { version = "0.2", features = ["set", "atomic"] }
 - **`swap_into(offset, buf)`** *(requires `set`)* — Like `swap` but exchanges in-place: on entry `buf` holds new bytes, on return holds old bytes.
 - **`cas(offset, old, new)`** *(requires `set`)* — Overwrite bytes at `offset` with `new` only if they currently equal `old`. Returns `true` if exchanged. File size never changes.
 - **`process(start, end, f)`** *(requires `set`)* — Read `[start, end)`, pass to `f` as `&mut [u8]` for in-place mutation, write back. File size never changes. `start == end` is a no-op.
+- **`process_gen(f)`** *(requires `set`)* — Like `get_batched_gen` but the closure can also end the sequence with a write: it yields `BStackGenOp::Read`, `Write`, or `Swap` values one at a time, and the write lock is held continuously from before the first read through the terminating `Write`/`Swap` (at most one, ending the sequence). Useful for dependent read-read-write protocols — e.g. lock-free free-list pop — where a CAS-based retry loop would leave an ABA window open. File size never changes.
 - **`cross_exchange(a, b, n)`** *(requires `set`)* — Atomically swap two non-overlapping byte regions of length `n` under one write lock.
 - **`copy(from, to, n)`** *(requires `set`)* — Copy `n` bytes from `from` to `to` under one write lock.  Regions may overlap.
 - **`eq_crds(a_offset, a_expected, b_offset, b_buf)`** *(requires `set`)* — Write `b_buf` at `b_offset` only if bytes at `a_offset` equal `a_expected` (compare-and-swap across two regions). Returns `Some(old_b)` on success, `None` otherwise.
@@ -1153,6 +1154,7 @@ All user-visible offsets (returned by `push`, accepted by `peek`/`get`) are
 | `swap`, `swap_into` *(set+atomic)*     | `lseek(offset)` → `read` → `lseek(offset)` → `write(buf)` → sync                          |
 | `cas` *(set+atomic)*                   | `lseek(offset)` → `read` → compare → conditional `write(new)` → sync                      |
 | `process` *(set+atomic)*               | `lseek(start)` → `read(end−start)` → *(callback)* → `lseek(start)` → `write(buf)` → sync  |
+| `process_gen` *(set+atomic)*           | closure-driven: zero or more `lseek`/`pread` reads, ending in at most one mutating step — `lseek` → `write` → sync for `Write`, or the two-region read/read/write/write → sync of `cross_exchange` for `Swap` |
 | `replace` *(atomic)*                   | `lseek(tail)` → `read(n)` → *(callback)* → *(then as `atrunc`)*                           |
 | `cross_exchange` *(set+atomic)*        | `lseek(a)` → `read(n)` → `lseek(b)` → `read(n)` → `lseek(a)` → `write` → `lseek(b)` → `write` → sync |
 | `copy` *(set+atomic)*                  | `lseek(from)` → `read(n)` → `lseek(to)` → `write(n)` → sync                               |
@@ -1222,7 +1224,7 @@ maps to `io::ErrorKind::WouldBlock` in Rust).  The lock is released when the
 | `try_discard(s, 0)` *(atomic)*                               | **read**              | **read**     |
 | `try_extend_zeros` *(atomic)*                                | write                 | write        |
 | `swap`, `swap_into`, `cas` *(set+atomic)*                    | write                 | write        |
-| `process` *(set+atomic)*                                     | write                 | write        |
+| `process`, `process_gen` *(set+atomic)*                      | write                 | write        |
 | `replace` *(atomic)*                                         | write                 | write        |
 | `cross_exchange`, `copy` *(set+atomic)*                      | write                 | write        |
 | `eq_crds`, `ne_crds` *(set+atomic)*                          | write                 | write        |
@@ -1241,6 +1243,13 @@ committed state.
 
 On other platforms a seek is required; `peek`, `peek_into`, `get`, and
 `get_into` fall back to the write lock and reads serialise.
+
+Unlike `get_batched_gen`, which only ever takes the **read** lock, `process_gen`
+*always* takes the **write** lock — even for sequences that turn out to be
+read-only and end in `None` — because the closure may decide, only after
+seeing earlier reads, to end the sequence with a `Write` or `Swap`; the lock
+must therefore be acquired before the first read so the whole sequence runs as
+one indivisible step.
 
 ---
 

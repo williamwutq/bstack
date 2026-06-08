@@ -79,6 +79,7 @@
 //! | `swap`, `swap_into` *(features: set+atomic)* | `lseek(offset)` → `read` → `lseek(offset)` → `write(buf)` → `durable_sync` |
 //! | `cas` *(features: set+atomic)* | `lseek(offset)` → `read` → compare — conditional `lseek(offset)` → `write(new)` → `durable_sync` |
 //! | `process` *(features: set+atomic)* | `lseek(start)` → `read(end−start)` → *(callback)* → `lseek(start)` → `write(buf)` → `durable_sync` |
+//! | `process_gen` *(features: set+atomic)* | closure-driven: zero or more `lseek`/`pread` reads, ending in at most one mutating step — `lseek` → `write` → `durable_sync` for `Write`, or the two-region read/read/write/write → `durable_sync` of `cross_exchange` for `Swap` |
 //! | `replace` *(feature: atomic)* | `lseek(tail)` → `read(n)` → *(callback)* → *(then as `atrunc`)* |
 //! | `cross_exchange` *(features: set+atomic)* | `lseek(a)` → `read(n)` → `lseek(b)` → `read(n)` → `lseek(a)` → `write` → `lseek(b)` → `write` → `durable_sync` |
 //! | `copy` *(features: set+atomic)* | `lseek(from)` → `read(n)` → `lseek(to)` → `write(n)` → `durable_sync` |
@@ -145,7 +146,7 @@
 //! | `try_discard(s, 0)` *(feature: atomic)* | **read** | **read** |
 //! | `get_batched`, `get_batched_into`, `get_batched_gen` *(feature: atomic)* | **read** | write |
 //! | `swap`, `swap_into`, `cas` *(features: set+atomic)* | write | write |
-//! | `cross_exchange`, `copy`, `process` *(features: set+atomic)* | write | write |
+//! | `cross_exchange`, `copy`, `process`, `process_gen` *(features: set+atomic)* | write | write |
 //! | `eq_crds`, `ne_crds`, `masked_eq_crds`, `masked_ne_crds` *(features: set+atomic)* | write | write |
 //! | `replace` *(feature: atomic)* | write | write |
 //! | `peek`, `peek_into`, `get`, `get_into` | **read** | write |
@@ -163,6 +164,14 @@
 //!
 //! On other platforms a seek is required, so `peek`, `peek_into`, `get`, and
 //! `get_into` fall back to the write lock and all reads serialise.
+//!
+//! Unlike [`get_batched_gen`](BStack::get_batched_gen), which only ever takes
+//! the **read** lock (Unix/Windows), [`process_gen`](BStack::process_gen)
+//! *always* takes the **write** lock — even for sequences that turn out to
+//! read-only and end in `None` — because the closure may decide, only after
+//! seeing earlier reads, to end the sequence with a `Write` or `Swap`; the
+//! lock therefore has to be acquired before the first read so the whole
+//! sequence runs as one indivisible step.
 //!
 //! # Locked region (`lock_up_to`)
 //!
@@ -325,7 +334,7 @@
 //! |---------|-------------|
 //! | `set`   | Enables [`BStack::set`] and [`BStack::zero`] — in-place overwrite of existing payload bytes (or with zeros) without changing the file size. |
 //! | `alloc` | Enables [`BStackAllocator`], [`BStackBulkAllocator`], [`BStackSlice`], [`BStackSliceReader`], and [`LinearBStackAllocator`] — region-based allocation over a `BStack` payload. Combined with `set`, also enables [`BStackSliceWriter`], [`FirstFitBStackAllocator`], [`GhostTreeBstackAllocator`], and [`BStackByteVec`]. |
-//! | `atomic` | Enables [`BStack::atrunc`], [`BStack::splice`], [`BStack::splice_into`], [`BStack::try_extend`], [`BStack::try_extend_zeros`], [`BStack::try_discard`], [`BStack::replace`], [`BStack::get_batched`], [`BStack::get_batched_into`], and [`BStack::get_batched_gen`] — compound read-modify-write operations that hold the lock across what would otherwise be separate calls. Combined with `set`, also enables [`BStack::swap`], [`BStack::swap_into`], [`BStack::cas`], [`BStack::process`], [`BStack::cross_exchange`], [`BStack::copy`], [`BStack::eq_crds`], [`BStack::ne_crds`], [`BStack::masked_eq_crds`], and [`BStack::masked_ne_crds`]. |
+//! | `atomic` | Enables [`BStack::atrunc`], [`BStack::splice`], [`BStack::splice_into`], [`BStack::try_extend`], [`BStack::try_extend_zeros`], [`BStack::try_discard`], [`BStack::replace`], [`BStack::get_batched`], [`BStack::get_batched_into`], and [`BStack::get_batched_gen`] — compound read-modify-write operations that hold the lock across what would otherwise be separate calls. Combined with `set`, also enables [`BStack::swap`], [`BStack::swap_into`], [`BStack::cas`], [`BStack::process`], [`BStack::process_gen`], [`BStackGenOp`], [`BStack::cross_exchange`], [`BStack::copy`], [`BStack::eq_crds`], [`BStack::ne_crds`], [`BStack::masked_eq_crds`], and [`BStack::masked_ne_crds`]. |
 //!
 //! Enable with:
 //!
@@ -2155,6 +2164,11 @@ impl BStack {
 /// Only available when both the `set` and `atomic` Cargo features are enabled.
 #[cfg(all(feature = "set", feature = "atomic"))]
 #[non_exhaustive]
+// Intentionally not `PartialEq`/`Eq`/`Hash`: each value is a transient,
+// single-use request consumed immediately by `process_gen`'s loop, and for
+// `Read` "equality" would mean comparing the destination buffer's stale
+// pre-read contents — not a meaningful notion of identity.
+#[derive(Debug)]
 pub enum BStackGenOp<'a> {
     /// Read `buf.len()` bytes starting at logical `offset` into `buf`.
     Read {
