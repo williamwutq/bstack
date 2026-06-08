@@ -79,6 +79,7 @@
 //! | `swap`, `swap_into` *(features: set+atomic)* | `lseek(offset)` → `read` → `lseek(offset)` → `write(buf)` → `durable_sync` |
 //! | `cas` *(features: set+atomic)* | `lseek(offset)` → `read` → compare — conditional `lseek(offset)` → `write(new)` → `durable_sync` |
 //! | `process` *(features: set+atomic)* | `lseek(start)` → `read(end−start)` → *(callback)* → `lseek(start)` → `write(buf)` → `durable_sync` |
+//! | `process_gen` *(features: set+atomic)* | closure-driven: zero or more `lseek`/`pread` reads, ending in at most one mutating step — `lseek` → `write` → `durable_sync` for `Write`, or the two-region read/read/write/write → `durable_sync` of `cross_exchange` for `Swap` |
 //! | `replace` *(feature: atomic)* | `lseek(tail)` → `read(n)` → *(callback)* → *(then as `atrunc`)* |
 //! | `cross_exchange` *(features: set+atomic)* | `lseek(a)` → `read(n)` → `lseek(b)` → `read(n)` → `lseek(a)` → `write` → `lseek(b)` → `write` → `durable_sync` |
 //! | `copy` *(features: set+atomic)* | `lseek(from)` → `read(n)` → `lseek(to)` → `write(n)` → `durable_sync` |
@@ -145,7 +146,7 @@
 //! | `try_discard(s, 0)` *(feature: atomic)* | **read** | **read** |
 //! | `get_batched`, `get_batched_into`, `get_batched_gen` *(feature: atomic)* | **read** | write |
 //! | `swap`, `swap_into`, `cas` *(features: set+atomic)* | write | write |
-//! | `cross_exchange`, `copy`, `process` *(features: set+atomic)* | write | write |
+//! | `cross_exchange`, `copy`, `process`, `process_gen` *(features: set+atomic)* | write | write |
 //! | `eq_crds`, `ne_crds`, `masked_eq_crds`, `masked_ne_crds` *(features: set+atomic)* | write | write |
 //! | `replace` *(feature: atomic)* | write | write |
 //! | `peek`, `peek_into`, `get`, `get_into` | **read** | write |
@@ -163,6 +164,14 @@
 //!
 //! On other platforms a seek is required, so `peek`, `peek_into`, `get`, and
 //! `get_into` fall back to the write lock and all reads serialise.
+//!
+//! Unlike [`get_batched_gen`](BStack::get_batched_gen), which only ever takes
+//! the **read** lock (Unix/Windows), [`process_gen`](BStack::process_gen)
+//! *always* takes the **write** lock — even for sequences that turn out to
+//! read-only and end in `None` — because the closure may decide, only after
+//! seeing earlier reads, to end the sequence with a `Write` or `Swap`; the
+//! lock therefore has to be acquired before the first read so the whole
+//! sequence runs as one indivisible step.
 //!
 //! # Locked region (`lock_up_to`)
 //!
@@ -325,7 +334,7 @@
 //! |---------|-------------|
 //! | `set`   | Enables [`BStack::set`] and [`BStack::zero`] — in-place overwrite of existing payload bytes (or with zeros) without changing the file size. |
 //! | `alloc` | Enables [`BStackAllocator`], [`BStackBulkAllocator`], [`BStackSlice`], [`BStackSliceReader`], and [`LinearBStackAllocator`] — region-based allocation over a `BStack` payload. Combined with `set`, also enables [`BStackSliceWriter`], [`FirstFitBStackAllocator`], [`GhostTreeBstackAllocator`], and [`BStackByteVec`]. |
-//! | `atomic` | Enables [`BStack::atrunc`], [`BStack::splice`], [`BStack::splice_into`], [`BStack::try_extend`], [`BStack::try_extend_zeros`], [`BStack::try_discard`], [`BStack::replace`], [`BStack::get_batched`], [`BStack::get_batched_into`], and [`BStack::get_batched_gen`] — compound read-modify-write operations that hold the lock across what would otherwise be separate calls. Combined with `set`, also enables [`BStack::swap`], [`BStack::swap_into`], [`BStack::cas`], [`BStack::process`], [`BStack::cross_exchange`], [`BStack::copy`], [`BStack::eq_crds`], [`BStack::ne_crds`], [`BStack::masked_eq_crds`], and [`BStack::masked_ne_crds`]. |
+//! | `atomic` | Enables [`BStack::atrunc`], [`BStack::splice`], [`BStack::splice_into`], [`BStack::try_extend`], [`BStack::try_extend_zeros`], [`BStack::try_discard`], [`BStack::replace`], [`BStack::get_batched`], [`BStack::get_batched_into`], and [`BStack::get_batched_gen`] — compound read-modify-write operations that hold the lock across what would otherwise be separate calls. Combined with `set`, also enables [`BStack::swap`], [`BStack::swap_into`], [`BStack::cas`], [`BStack::process`], [`BStack::process_gen`], [`BStackGenOp`], [`BStack::cross_exchange`], [`BStack::copy`], [`BStack::eq_crds`], [`BStack::ne_crds`], [`BStack::masked_eq_crds`], and [`BStack::masked_ne_crds`]. |
 //!
 //! Enable with:
 //!
@@ -2129,6 +2138,71 @@ impl BStack {
     }
 }
 
+/// A request to read from, or write to, a region of the payload.
+///
+/// A value of this type describes a single request and carries no protocol of
+/// its own — how a sequence of requests is assembled, interpreted, and
+/// brought to an end is entirely up to the primitive that consumes them.
+/// Different primitives may impose different rules over the same variants:
+/// how many writes are permitted, whether a write ends the sequence, how the
+/// sequence itself signals that it is done, and so on.
+///
+/// # Variants
+///
+/// - `Read { offset, buf }` — read some number of bytes starting at logical
+///   `offset` into the caller-supplied buffer `buf`.
+/// - `Write { offset, data }` — write `data` starting at logical `offset`,
+///   ending the sequence.
+/// - `Swap { a_offset, b_offset, len }` — atomically exchange `len` bytes at
+///   `a_offset` with `len` bytes at `b_offset`, ending the sequence.
+/// - `#[non_exhaustive]` — later versions may add further variants, for
+///   richer write ownership or multi-write protocols, for instance, without
+///   a breaking change.
+///
+/// # Feature flags
+///
+/// Only available when both the `set` and `atomic` Cargo features are enabled.
+#[cfg(all(feature = "set", feature = "atomic"))]
+#[non_exhaustive]
+// Intentionally not `PartialEq`/`Eq`/`Hash`: each value is a transient,
+// single-use request consumed immediately by `process_gen`'s loop, and for
+// `Read` "equality" would mean comparing the destination buffer's stale
+// pre-read contents — not a meaningful notion of identity.
+#[derive(Debug)]
+pub enum BStackGenOp<'a> {
+    /// Read `buf.len()` bytes starting at logical `offset` into `buf`.
+    Read {
+        /// Logical offset to read from.
+        offset: u64,
+        /// Destination buffer; its length determines how many bytes are read.
+        buf: &'a mut [u8],
+    },
+    /// Write `data` to logical `offset..offset + data.len()`, ending the
+    /// sequence.
+    Write {
+        /// Logical offset to write to.
+        offset: u64,
+        /// Bytes to write.
+        data: &'a [u8],
+    },
+    /// Atomically exchange `len` bytes at `a_offset` with `len` bytes at
+    /// `b_offset`, ending the sequence.
+    ///
+    /// Both regions are read and then swapped under the same held write
+    /// lock — the in-sequence equivalent of [`cross_exchange`](BStack::cross_exchange),
+    /// useful when one or both offsets are only known once earlier `Read`s
+    /// in the sequence have been resolved (e.g. "read the free-list head,
+    /// then swap this block into that slot"). The regions must not overlap.
+    Swap {
+        /// Logical offset of the first region.
+        a_offset: u64,
+        /// Logical offset of the second region.
+        b_offset: u64,
+        /// Number of bytes to exchange.
+        len: u64,
+    },
+}
+
 #[cfg(all(feature = "set", feature = "atomic"))]
 impl BStack {
     /// Atomically read `buf.len()` bytes at `offset` and overwrite them with
@@ -2518,6 +2592,229 @@ impl BStack {
             durable_sync(&file)?;
         }
         Ok(())
+    }
+
+    /// Run a sequence of dependent reads, optionally followed by a single
+    /// write, all under one held write lock.
+    ///
+    /// `f` is called in a loop and drives the sequence through [`BStackGenOp`]:
+    ///
+    /// - `Some(BStackGenOp::Read { offset, buf })` reads `offset..offset +
+    ///   buf.len()` into `buf` and calls `f` again.  By the time `f` is called,
+    ///   the buffer from the *previous* `Read` already holds its data, so each
+    ///   step can use earlier results to decide the next one — e.g. "read the
+    ///   head pointer, then read the node it points to".
+    /// - `Some(BStackGenOp::Write { offset, data })` writes `data` to
+    ///   `offset..offset + data.len()` and ends the sequence; `f` is not
+    ///   called again.
+    /// - `Some(BStackGenOp::Swap { a_offset, b_offset, len })` atomically
+    ///   exchanges `len` bytes at `a_offset` with `len` bytes at `b_offset`
+    ///   and ends the sequence — the in-sequence equivalent of
+    ///   [`cross_exchange`](Self::cross_exchange), useful when a swap target
+    ///   is only known once an earlier `Read` has resolved it (e.g. "read the
+    ///   free-list head, then splice this block in as the new head").
+    /// - `None` ends the sequence without writing anything — useful when the
+    ///   reads alone inform a decision, including the decision to change
+    ///   nothing.
+    ///
+    /// `Write` and `Swap` are the only mutating operations, exactly one is
+    /// permitted per call, and either one ends the sequence immediately —
+    /// `f` is not called again afterwards.
+    ///
+    /// Holding the write lock across every read and the final mutation means
+    /// no other thread can observe or modify any region of the file in
+    /// between — the guarantee that [`get_batched_gen`](Self::get_batched_gen)
+    /// followed by a separate [`cas`](Self::cas) cannot provide, since the two
+    /// separate lock acquisitions leave an ABA window.  The mutated region(s)
+    /// need not overlap any region that was read.  The file size is never
+    /// changed; `process_gen` does not support `push` or `pop`.
+    ///
+    /// Reads of the locked region `[0, locked_len())` are permitted, matching
+    /// [`get`](Self::get) — locked bytes are immutable, so observing them
+    /// mid-sequence is always safe.  `Write` and `Swap` ranges that touch the
+    /// locked region are rejected, matching [`set`](Self::set) and
+    /// [`cross_exchange`](Self::cross_exchange).
+    ///
+    /// # Feature flags
+    ///
+    /// Only available when both the `set` and `atomic` Cargo features are
+    /// enabled.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] if any `offset + len` overflows
+    /// `u64`, if a read, write, or swap range exceeds the current payload
+    /// size, if the two `Swap` regions overlap, or if a write or swap range
+    /// overlaps the locked region `[0, locked_len())`.  Propagates any I/O
+    /// error from `read_exact`, `write_all`, or `durable_sync`.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    pub fn process_gen<'a, F>(&self, mut f: F) -> io::Result<()>
+    where
+        F: FnMut() -> Option<BStackGenOp<'a>>,
+    {
+        let mut file = self.lock.write().unwrap();
+        let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
+        let locked = self.locked.load(Ordering::Acquire);
+        loop {
+            match f() {
+                Some(BStackGenOp::Read { offset, buf }) => {
+                    let end = offset.checked_add(buf.len() as u64).ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "process_gen: read offset + buf.len() overflows u64",
+                        )
+                    })?;
+                    if end > data_size {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!(
+                                "process_gen: read range [{offset}, {end}) exceeds payload size ({data_size})"
+                            ),
+                        ));
+                    }
+                    // Fast path: locked bytes are immutable, so they can be
+                    // served from the cache or via a lock-free pread instead
+                    // of going through the held file handle — mirroring how
+                    // `get_into` treats reads of the locked region.
+                    #[cfg(any(unix, windows))]
+                    {
+                        if end <= locked {
+                            if self.cache_enabled {
+                                let cache = self.cache.lock().unwrap();
+                                buf.copy_from_slice(&cache[offset as usize..end as usize]);
+                            } else {
+                                #[cfg(unix)]
+                                pread_exact_raw(self.fd, HEADER_SIZE + offset, buf)?;
+                                #[cfg(windows)]
+                                pread_exact_raw_handle(self.handle, HEADER_SIZE + offset, buf)?;
+                            }
+                        } else {
+                            pread_exact_into(&file, HEADER_SIZE + offset, buf)?;
+                        }
+                    }
+                    #[cfg(not(any(unix, windows)))]
+                    {
+                        if end <= locked && self.cache_enabled {
+                            let cache = self.cache.lock().unwrap();
+                            buf.copy_from_slice(&cache[offset as usize..end as usize]);
+                        } else {
+                            file.seek(SeekFrom::Start(HEADER_SIZE + offset))?;
+                            file.read_exact(buf)?;
+                        }
+                    }
+                }
+                Some(BStackGenOp::Write { offset, data }) => {
+                    let end = offset.checked_add(data.len() as u64).ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "process_gen: write offset + data.len() overflows u64",
+                        )
+                    })?;
+                    if offset < locked {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!(
+                                "process_gen: write range [{offset}, {end}) overlaps locked region [0, {locked})"
+                            ),
+                        ));
+                    }
+                    if end > data_size {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!(
+                                "process_gen: write range [{offset}, {end}) exceeds payload size ({data_size})"
+                            ),
+                        ));
+                    }
+                    if !data.is_empty() {
+                        file.seek(SeekFrom::Start(HEADER_SIZE + offset))?;
+                        file.write_all(data)?;
+                        durable_sync(&file)?;
+                    }
+                    return Ok(());
+                }
+                Some(BStackGenOp::Swap {
+                    a_offset,
+                    b_offset,
+                    len,
+                }) => {
+                    let a_end = a_offset.checked_add(len).ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "process_gen: a_offset + len overflows u64",
+                        )
+                    })?;
+                    let b_end = b_offset.checked_add(len).ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "process_gen: b_offset + len overflows u64",
+                        )
+                    })?;
+                    if len > 0 {
+                        let (lo, hi) = if a_offset < b_offset {
+                            (a_offset, b_offset)
+                        } else {
+                            (b_offset, a_offset)
+                        };
+                        if lo + len > hi {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                format!(
+                                    "process_gen: swap regions [{a_offset}, {a_end}) and [{b_offset}, {b_end}) overlap"
+                                ),
+                            ));
+                        }
+                    }
+                    if a_offset < locked {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!(
+                                "process_gen: swap region [{a_offset}, {a_end}) overlaps locked region [0, {locked})"
+                            ),
+                        ));
+                    }
+                    if b_offset < locked {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!(
+                                "process_gen: swap region [{b_offset}, {b_end}) overlaps locked region [0, {locked})"
+                            ),
+                        ));
+                    }
+                    if a_end > data_size {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!(
+                                "process_gen: swap region [{a_offset}, {a_end}) exceeds payload size ({data_size})"
+                            ),
+                        ));
+                    }
+                    if b_end > data_size {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!(
+                                "process_gen: swap region [{b_offset}, {b_end}) exceeds payload size ({data_size})"
+                            ),
+                        ));
+                    }
+                    if len > 0 {
+                        file.seek(SeekFrom::Start(HEADER_SIZE + a_offset))?;
+                        let mut buf_a = vec![0u8; len as usize];
+                        file.read_exact(&mut buf_a)?;
+                        file.seek(SeekFrom::Start(HEADER_SIZE + b_offset))?;
+                        let mut buf_b = vec![0u8; len as usize];
+                        file.read_exact(&mut buf_b)?;
+                        file.seek(SeekFrom::Start(HEADER_SIZE + a_offset))?;
+                        file.write_all(&buf_b)?;
+                        file.seek(SeekFrom::Start(HEADER_SIZE + b_offset))?;
+                        file.write_all(&buf_a)?;
+                        durable_sync(&file)?;
+                    }
+                    return Ok(());
+                }
+                None => return Ok(()),
+            }
+        }
     }
 
     /// Cross-Region Dependent Swap — equal condition.

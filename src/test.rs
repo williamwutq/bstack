@@ -4221,6 +4221,652 @@ mod atomic_tests {
         assert_eq!(s2.peek(0).unwrap(), b"helloWORLD");
     }
 
+    // -----------------------------------------------------------------------
+    // process_gen  (require set + atomic)
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn process_gen_reads_then_writes() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        let mut buf = [0u8; 5];
+        let mut step = 0usize;
+        s.process_gen(|| {
+            // SAFETY: `buf` outlives this whole `process_gen` call.
+            let r = match step {
+                0 => Some(BStackGenOp::Read {
+                    offset: 0,
+                    buf: unsafe { core::mem::transmute::<&mut [u8], _>(&mut buf[..]) },
+                }),
+                1 => Some(BStackGenOp::Write {
+                    offset: 5,
+                    data: unsafe { core::mem::transmute::<&[u8], _>(&buf[..]) },
+                }),
+                _ => None,
+            };
+            step += 1;
+            r
+        })
+        .unwrap();
+        assert_eq!(&buf, b"hello");
+        assert_eq!(s.peek(0).unwrap(), b"hellohello");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn process_gen_dependent_reads_inform_next_offset() {
+        use crate::BStackGenOp;
+        // Layout: [pointer: u64 LE][node "A "][node "B "]
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&8u64.to_le_bytes());
+        payload.extend_from_slice(b"A ");
+        payload.extend_from_slice(b"B ");
+        s.push(&payload).unwrap();
+
+        let mut ptr_buf = [0u8; 8];
+        let mut node_buf = [0u8; 2];
+        let mut step = 0usize;
+        s.process_gen(|| {
+            // SAFETY: `ptr_buf` and `node_buf` outlive this whole `process_gen` call.
+            let r = match step {
+                0 => Some(BStackGenOp::Read {
+                    offset: 0,
+                    buf: unsafe { core::mem::transmute::<&mut [u8], _>(&mut ptr_buf[..]) },
+                }),
+                1 => {
+                    // The previous read has already filled `ptr_buf` by the
+                    // time we're called again.
+                    let target = u64::from_le_bytes(ptr_buf);
+                    Some(BStackGenOp::Read {
+                        offset: target,
+                        buf: unsafe { core::mem::transmute::<&mut [u8], _>(&mut node_buf[..]) },
+                    })
+                }
+                _ => None,
+            };
+            step += 1;
+            r
+        })
+        .unwrap();
+        assert_eq!(u64::from_le_bytes(ptr_buf), 8);
+        assert_eq!(&node_buf, b"A ");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn process_gen_immediate_none_is_noop() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        s.process_gen(|| None).unwrap();
+        assert_eq!(s.len().unwrap(), 5);
+        assert_eq!(s.peek(0).unwrap(), b"hello");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn process_gen_write_ends_sequence() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        let mut calls = 0usize;
+        s.process_gen(|| {
+            calls += 1;
+            match calls {
+                1 => Some(BStackGenOp::Write {
+                    offset: 0,
+                    data: b"HELLO",
+                }),
+                _ => Some(BStackGenOp::Write {
+                    offset: 5,
+                    data: b"WORLD",
+                }),
+            }
+        })
+        .unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!(s.peek(0).unwrap(), b"HELLOworld");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn process_gen_swap_exchanges_two_regions_and_ends_sequence() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        let mut calls = 0usize;
+        s.process_gen(|| {
+            calls += 1;
+            match calls {
+                1 => Some(BStackGenOp::Swap {
+                    a_offset: 0,
+                    b_offset: 5,
+                    len: 5,
+                }),
+                _ => Some(BStackGenOp::Write {
+                    offset: 0,
+                    data: b"NOPE!",
+                }),
+            }
+        })
+        .unwrap();
+        assert_eq!(calls, 1, "Swap must end the sequence, like Write");
+        assert_eq!(s.peek(0).unwrap(), b"worldhello");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn process_gen_swap_target_informed_by_prior_read() {
+        use crate::BStackGenOp;
+        // Layout: [pointer: u64 LE][block A: 8 bytes][block B: 8 bytes]
+        // The pointer names which block to splice block A with — read it
+        // first, then swap based on what it says, all under one lock. This
+        // is the capability `cross_exchange` lacks: its two offsets are
+        // fixed at call time, so they cannot depend on data read mid-call.
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&16u64.to_le_bytes()); // names block B
+        payload.extend_from_slice(b"AAAAAAAA");
+        payload.extend_from_slice(b"BBBBBBBB");
+        s.push(&payload).unwrap();
+
+        let mut ptr_buf = [0u8; 8];
+        let mut step = 0usize;
+        s.process_gen(|| {
+            let r = match step {
+                0 => Some(BStackGenOp::Read {
+                    offset: 0,
+                    // SAFETY: `ptr_buf` outlives this whole `process_gen` call.
+                    buf: unsafe { core::mem::transmute::<&mut [u8], _>(&mut ptr_buf[..]) },
+                }),
+                1 => {
+                    let target = u64::from_le_bytes(ptr_buf);
+                    Some(BStackGenOp::Swap {
+                        a_offset: 8,
+                        b_offset: target,
+                        len: 8,
+                    })
+                }
+                _ => None,
+            };
+            step += 1;
+            r
+        })
+        .unwrap();
+        assert_eq!(s.peek(8).unwrap(), b"BBBBBBBBAAAAAAAA");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn process_gen_swap_overlapping_regions_returns_error() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        let err = s
+            .process_gen(|| {
+                Some(BStackGenOp::Swap {
+                    a_offset: 0,
+                    b_offset: 3,
+                    len: 5,
+                })
+            })
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(s.peek(0).unwrap(), b"helloworld");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn process_gen_swap_in_locked_region_returns_error() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        s.lock_up_to(5).unwrap();
+        let err = s
+            .process_gen(|| {
+                Some(BStackGenOp::Swap {
+                    a_offset: 0,
+                    b_offset: 5,
+                    len: 5,
+                })
+            })
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(s.peek(0).unwrap(), b"helloworld");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn process_gen_does_not_change_file_size() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        s.process_gen(|| {
+            Some(BStackGenOp::Write {
+                offset: 0,
+                data: b"HELLO",
+            })
+        })
+        .unwrap();
+        assert_eq!(s.len().unwrap(), 10);
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn process_gen_read_out_of_bounds_returns_error() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hi").unwrap();
+        let mut buf = [0u8; 10];
+        let mut called = false;
+        let err = s
+            .process_gen(|| {
+                if called {
+                    return None;
+                }
+                called = true;
+                // SAFETY: `buf` outlives this whole `process_gen` call.
+                Some(BStackGenOp::Read {
+                    offset: 0,
+                    buf: unsafe { core::mem::transmute::<&mut [u8], _>(&mut buf[..]) },
+                })
+            })
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(s.peek(0).unwrap(), b"hi");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn process_gen_write_out_of_bounds_returns_error() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        let err = s
+            .process_gen(|| {
+                Some(BStackGenOp::Write {
+                    offset: 2,
+                    data: b"abcdefgh",
+                })
+            })
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(s.peek(0).unwrap(), b"hello");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn process_gen_write_in_locked_region_returns_error() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        s.lock_up_to(5).unwrap();
+        let err = s
+            .process_gen(|| {
+                Some(BStackGenOp::Write {
+                    offset: 0,
+                    data: b"HELLO",
+                })
+            })
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(s.peek(0).unwrap(), b"helloworld");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn process_gen_read_in_locked_region_succeeds() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        s.lock_up_to(5).unwrap();
+        let mut buf = [0u8; 5];
+        let mut called = false;
+        s.process_gen(|| {
+            if called {
+                return None;
+            }
+            called = true;
+            // SAFETY: `buf` outlives this whole `process_gen` call.
+            Some(BStackGenOp::Read {
+                offset: 0,
+                buf: unsafe { core::mem::transmute::<&mut [u8], _>(&mut buf[..]) },
+            })
+        })
+        .unwrap();
+        assert_eq!(&buf, b"hello");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn process_gen_persists_across_reopen() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+        s.push(b"helloworld").unwrap();
+        s.process_gen(|| {
+            Some(BStackGenOp::Write {
+                offset: 5,
+                data: b"WORLD",
+            })
+        })
+        .unwrap();
+        drop(s);
+        let s2 = BStack::open(&p).unwrap();
+        assert_eq!(s2.peek(0).unwrap(), b"helloWORLD");
+    }
+
+    // ---- process_gen concurrency / atomicity -------------------------------
+    //
+    // `process_gen` exists to replace the two-lock `get_batched_gen` + `cas`
+    // pattern by holding the write lock across the *entire* read-modify-write
+    // sequence, closing the ABA window between the dependent reads and the
+    // terminating write. The tests below exercise that guarantee directly,
+    // rather than just exercising the single-threaded read/write mechanics
+    // covered above.
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn process_gen_concurrent_increments_have_no_lost_updates() {
+        use crate::BStackGenOp;
+        use std::sync::Arc;
+        use std::thread;
+
+        // N threads each run M independent read-increment-write sequences on
+        // a shared u64 counter. The final total is only correct if every
+        // sequence was serialised end to end — if `process_gen` ever released
+        // the write lock between its read and its write, two threads could
+        // read the same value and one increment would be lost.
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(&0u64.to_le_bytes()).unwrap();
+        let s = Arc::new(s);
+
+        const THREADS: usize = 8;
+        const ITERS: usize = 100;
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let s = Arc::clone(&s);
+                thread::spawn(move || {
+                    for _ in 0..ITERS {
+                        let mut buf = [0u8; 8];
+                        let mut step = 0usize;
+                        s.process_gen(|| {
+                            let r = match step {
+                                0 => Some(BStackGenOp::Read {
+                                    offset: 0,
+                                    // SAFETY: `buf` outlives this whole `process_gen` call.
+                                    buf: unsafe {
+                                        core::mem::transmute::<&mut [u8], _>(&mut buf[..])
+                                    },
+                                }),
+                                1 => {
+                                    let v = u64::from_le_bytes(buf) + 1;
+                                    buf = v.to_le_bytes();
+                                    Some(BStackGenOp::Write {
+                                        offset: 0,
+                                        // SAFETY: `buf` outlives this whole `process_gen` call.
+                                        data: unsafe { core::mem::transmute::<&[u8], _>(&buf[..]) },
+                                    })
+                                }
+                                _ => None,
+                            };
+                            step += 1;
+                            r
+                        })
+                        .unwrap();
+                    }
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let total = s.peek(0).unwrap();
+        assert_eq!(
+            u64::from_le_bytes(total[..8].try_into().unwrap()),
+            (THREADS * ITERS) as u64,
+            "lost update: a concurrent read-increment-write was not serialised end to end"
+        );
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn process_gen_concurrent_free_list_pops_each_node_exactly_once() {
+        use crate::BStackGenOp;
+        use std::collections::HashSet;
+        use std::sync::Arc;
+        use std::thread;
+
+        // Build a singly-linked free list:
+        //   [head: u64 LE][node@8.next: u64 LE][node@16.next: u64 LE]...
+        // `head` points at the first free node; each node stores only the
+        // offset of the next one; the last node's `next` is SENTINEL.
+        //
+        // Each thread "pops" exactly one node via a dependent two-read,
+        // one-write `process_gen` sequence: read `head`, read that node's
+        // `next`, then write `next` back into `head`. This is precisely the
+        // free-list pattern that motivated replacing `get_batched_gen` + `cas`
+        // with `process_gen` — if the write lock were ever released between
+        // the dependent reads and the terminating write, two threads could
+        // read the same `head`, "pop" the same node, and corrupt the list
+        // (the classic ABA window this primitive exists to close).
+        const NODES: u64 = 16;
+        const NODE_SIZE: u64 = 8;
+        const SENTINEL: u64 = u64::MAX;
+        const FIRST_NODE: u64 = NODE_SIZE;
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&FIRST_NODE.to_le_bytes());
+        for i in 0..NODES {
+            let next = if i + 1 < NODES {
+                FIRST_NODE + (i + 1) * NODE_SIZE
+            } else {
+                SENTINEL
+            };
+            payload.extend_from_slice(&next.to_le_bytes());
+        }
+
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(&payload).unwrap();
+        let s = Arc::new(s);
+
+        let handles: Vec<_> = (0..NODES)
+            .map(|_| {
+                let s = Arc::clone(&s);
+                thread::spawn(move || {
+                    let mut head_buf = [0u8; 8];
+                    let mut next_buf = [0u8; 8];
+                    let mut step = 0usize;
+                    let mut popped: Option<u64> = None;
+                    s.process_gen(|| {
+                        let r = match step {
+                            0 => Some(BStackGenOp::Read {
+                                offset: 0,
+                                // SAFETY: `head_buf` outlives this whole `process_gen` call.
+                                buf: unsafe {
+                                    core::mem::transmute::<&mut [u8], _>(&mut head_buf[..])
+                                },
+                            }),
+                            1 => {
+                                let head = u64::from_le_bytes(head_buf);
+                                if head == SENTINEL {
+                                    // List already empty — abort, nothing to pop.
+                                    None
+                                } else {
+                                    popped = Some(head);
+                                    Some(BStackGenOp::Read {
+                                        offset: head,
+                                        // SAFETY: `next_buf` outlives this whole `process_gen` call.
+                                        buf: unsafe {
+                                            core::mem::transmute::<&mut [u8], _>(&mut next_buf[..])
+                                        },
+                                    })
+                                }
+                            }
+                            2 => Some(BStackGenOp::Write {
+                                offset: 0,
+                                // SAFETY: `next_buf` outlives this whole `process_gen` call.
+                                data: unsafe { core::mem::transmute::<&[u8], _>(&next_buf[..]) },
+                            }),
+                            _ => None,
+                        };
+                        step += 1;
+                        r
+                    })
+                    .unwrap();
+                    popped
+                })
+            })
+            .collect();
+
+        let popped: Vec<u64> = handles
+            .into_iter()
+            .map(|h| {
+                h.join()
+                    .unwrap()
+                    .expect("every thread should pop a distinct node — the list has exactly enough")
+            })
+            .collect();
+
+        let mut seen = HashSet::new();
+        for &off in &popped {
+            assert!(
+                seen.insert(off),
+                "node at offset {off} was popped more than once"
+            );
+        }
+        let expected: HashSet<u64> = (0..NODES).map(|i| FIRST_NODE + i * NODE_SIZE).collect();
+        assert_eq!(seen, expected, "not every node was popped exactly once");
+
+        let head = s.peek(0).unwrap();
+        assert_eq!(
+            u64::from_le_bytes(head[..8].try_into().unwrap()),
+            SENTINEL,
+            "free list should be empty once every node has been popped"
+        );
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn process_gen_excludes_concurrent_writers_until_sequence_completes() {
+        use crate::BStackGenOp;
+        use std::sync::{Arc, Mutex, mpsc};
+        use std::thread;
+
+        // `process_gen` must hold the write lock from its first read through
+        // its terminating write — that is the entire point of replacing the
+        // two-lock `get_batched_gen` + `cas` pattern with a single
+        // held-lock primitive.
+        //
+        // Thread A parks mid-sequence — after its `Read`, still inside the
+        // closure and so still holding the write lock — until told to
+        // continue. Thread B then attempts `push`, which needs that very
+        // same lock and so can only complete once A's whole sequence (read
+        // *and* write) has run. Therefore "A finished its write" must be
+        // logged before "B's push completed" no matter how the threads are
+        // scheduled — `RwLock::write` is exclusive. If `process_gen` ever
+        // released the lock between steps, B could race ahead and flip that
+        // order (or interleave with / corrupt A's write).
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        let s = Arc::new(s);
+
+        let events: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+        let (tx_ready, rx_ready) = mpsc::channel::<()>();
+        let (tx_continue, rx_continue) = mpsc::channel::<()>();
+        let (tx_b_started, rx_b_started) = mpsc::channel::<()>();
+
+        let a = {
+            let s = Arc::clone(&s);
+            let events = Arc::clone(&events);
+            thread::spawn(move || {
+                let mut buf = [0u8; 5];
+                let mut step = 0usize;
+                s.process_gen(|| {
+                    let r = match step {
+                        0 => {
+                            // `process_gen` has acquired the write lock by
+                            // the time it calls us for the first time.
+                            tx_ready.send(()).unwrap();
+                            // SAFETY: `buf` outlives this whole `process_gen` call.
+                            Some(BStackGenOp::Read {
+                                offset: 0,
+                                buf: unsafe { core::mem::transmute::<&mut [u8], _>(&mut buf[..]) },
+                            })
+                        }
+                        1 => {
+                            // Still inside the closure — and so still holding
+                            // the write lock — block until B is poised to
+                            // race us for it.
+                            rx_continue.recv().unwrap();
+                            events.lock().unwrap().push("A_write");
+                            Some(BStackGenOp::Write {
+                                offset: 5,
+                                data: b"WORLD",
+                            })
+                        }
+                        _ => None,
+                    };
+                    step += 1;
+                    r
+                })
+                .unwrap();
+            })
+        };
+
+        // Block until A is inside `process_gen`, certainly holding the lock.
+        rx_ready.recv().unwrap();
+
+        let b = {
+            let s = Arc::clone(&s);
+            let events = Arc::clone(&events);
+            thread::spawn(move || {
+                tx_b_started.send(()).unwrap();
+                // Needs the very same write lock `process_gen` is holding;
+                // can only complete once A's whole sequence does.
+                s.push(b"!").unwrap();
+                events.lock().unwrap().push("B_push");
+            })
+        };
+
+        // Let B reach the lock before releasing A, so that any early-release
+        // bug in `process_gen` would have B actively racing for it right then.
+        rx_b_started.recv().unwrap();
+        tx_continue.send(()).unwrap();
+
+        a.join().unwrap();
+        b.join().unwrap();
+
+        let recorded = events.lock().unwrap();
+        assert_eq!(
+            &recorded[..],
+            &["A_write", "B_push"][..],
+            "B's push observed/affected state while A's process_gen was still mid-sequence"
+        );
+        drop(recorded);
+        assert_eq!(s.peek(0).unwrap(), b"helloWORLD!");
+    }
+
     // ---- lock_up_to / locked_len / open_locked_up_to -----------------------
 
     #[test]
