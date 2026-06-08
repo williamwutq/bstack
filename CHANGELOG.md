@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `BStack::process_gen` (`set` + `atomic`): generator-closure-driven primitive that acquires the write lock once and holds it across a sequence of dependent reads ending in at most one mutating operation (`Write` or `Swap`), which always ends the sequence. Closes the ABA window that a `get_batched_gen` (read, release lock) + `cas` (re-acquire, compare, write) pairing would otherwise leave open for lock-free pop-style algorithms — see `examples/atomic_linked_list.rs` for a worked free-list push/pop demonstration.
+- `BStackGenOp<'a>` (`set` + `atomic`): non-exhaustive enum of operations yielded by `process_gen`'s closure — `Read { offset, buf }`, `Write { offset, data }`, and `Swap { a_offset, b_offset, len }` (atomically exchanges two same-length, non-overlapping regions; the in-sequence equivalent of `cross_exchange`, useful when one or both offsets are only known once earlier `Read`s in the sequence have resolved). `Write` and `Swap` are the only mutating variants — exactly one is permitted per call, and either ends the sequence immediately. Derives `Debug` (intentionally not `PartialEq`/`Eq`/`Hash` — see the type's doc comment).
+
 ## [0.2.4] - 2026-06-07
 
 ### Fixed
