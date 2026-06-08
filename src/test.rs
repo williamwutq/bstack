@@ -4335,6 +4335,117 @@ mod atomic_tests {
 
     #[cfg(all(feature = "set", feature = "atomic"))]
     #[test]
+    fn process_gen_swap_exchanges_two_regions_and_ends_sequence() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        let mut calls = 0usize;
+        s.process_gen(|| {
+            calls += 1;
+            match calls {
+                1 => Some(BStackGenOp::Swap {
+                    a_offset: 0,
+                    b_offset: 5,
+                    len: 5,
+                }),
+                _ => Some(BStackGenOp::Write {
+                    offset: 0,
+                    data: b"NOPE!",
+                }),
+            }
+        })
+        .unwrap();
+        assert_eq!(calls, 1, "Swap must end the sequence, like Write");
+        assert_eq!(s.peek(0).unwrap(), b"worldhello");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn process_gen_swap_target_informed_by_prior_read() {
+        use crate::BStackGenOp;
+        // Layout: [pointer: u64 LE][block A: 8 bytes][block B: 8 bytes]
+        // The pointer names which block to splice block A with — read it
+        // first, then swap based on what it says, all under one lock. This
+        // is the capability `cross_exchange` lacks: its two offsets are
+        // fixed at call time, so they cannot depend on data read mid-call.
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&16u64.to_le_bytes()); // names block B
+        payload.extend_from_slice(b"AAAAAAAA");
+        payload.extend_from_slice(b"BBBBBBBB");
+        s.push(&payload).unwrap();
+
+        let mut ptr_buf = [0u8; 8];
+        let mut step = 0usize;
+        s.process_gen(|| {
+            let r = match step {
+                0 => Some(BStackGenOp::Read {
+                    offset: 0,
+                    // SAFETY: `ptr_buf` outlives this whole `process_gen` call.
+                    buf: unsafe { core::mem::transmute::<&mut [u8], _>(&mut ptr_buf[..]) },
+                }),
+                1 => {
+                    let target = u64::from_le_bytes(ptr_buf);
+                    Some(BStackGenOp::Swap {
+                        a_offset: 8,
+                        b_offset: target,
+                        len: 8,
+                    })
+                }
+                _ => None,
+            };
+            step += 1;
+            r
+        })
+        .unwrap();
+        assert_eq!(s.peek(8).unwrap(), b"BBBBBBBBAAAAAAAA");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn process_gen_swap_overlapping_regions_returns_error() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        let err = s
+            .process_gen(|| {
+                Some(BStackGenOp::Swap {
+                    a_offset: 0,
+                    b_offset: 3,
+                    len: 5,
+                })
+            })
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(s.peek(0).unwrap(), b"helloworld");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn process_gen_swap_in_locked_region_returns_error() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        s.lock_up_to(5).unwrap();
+        let err = s
+            .process_gen(|| {
+                Some(BStackGenOp::Swap {
+                    a_offset: 0,
+                    b_offset: 5,
+                    len: 5,
+                })
+            })
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(s.peek(0).unwrap(), b"helloworld");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
     fn process_gen_does_not_change_file_size() {
         use crate::BStackGenOp;
         let (s, p) = mk_stack();
