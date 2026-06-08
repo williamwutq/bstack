@@ -1,6 +1,6 @@
-//! Lock-free free-list push and atomic pop: a `SlabBStackAllocator`-style
-//! free list maintained without any allocator-level mutex, using only
-//! `cross_exchange` to push and `process_gen` to pop.
+//! Free-list push and atomic pop without any allocator-level mutex: a `SlabBStackAllocator`-style
+//! free list maintained using only `cross_exchange` to push and `process_gen` to pop.
+//!
 //!
 //! ## Push: splice a freed block onto the head with `cross_exchange`
 //!
