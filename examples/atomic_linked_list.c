@@ -275,15 +275,18 @@ static void concurrent_pop_demo(bstack_t *stack)
     printf("  rebuilt list -> %s\n", list);
 
     pthread_t threads[NUM_BLOCKS];
-    for (int i = 0; i < NUM_BLOCKS; i++)
-        pthread_create(&threads[i], NULL, pop_thread, stack);
-
+    for (int i = 0; i < NUM_BLOCKS; i++) {
+        int rc = pthread_create(&threads[i], NULL, pop_thread, stack);
+        if (rc != 0) { fprintf(stderr, "pthread_create: %s\n", strerror(rc)); exit(1); }
+    }
     uint64_t popped[NUM_BLOCKS];
     int      n_popped = 0;
     for (int i = 0; i < NUM_BLOCKS; i++) {
-        void *res;
-        pthread_join(threads[i], &res);
+        void *res = NULL;
+        int rc = pthread_join(threads[i], &res);
+        if (rc != 0) { fprintf(stderr, "pthread_join: %s\n", strerror(rc)); exit(1); }
         uint64_t *b_addr = res;
+        if (!b_addr) { fprintf(stderr, "pthread_join returned NULL result\n"); exit(1); }
         if (*b_addr != SENTINEL)
             popped[n_popped++] = *b_addr;
         free(b_addr);
