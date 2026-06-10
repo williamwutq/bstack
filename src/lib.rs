@@ -2858,8 +2858,8 @@ impl BStack {
                             return Err(e);
                         }
                         let new_len = logical_offset + data.len() as u64;
-                        if let Err(e) =
-                            write_committed_len(&mut file, new_len).and_then(|_| durable_sync(&file))
+                        if let Err(e) = write_committed_len(&mut file, new_len)
+                            .and_then(|_| durable_sync(&file))
                         {
                             // Roll back: truncate data and reset header.
                             let _ = file.set_len(file_end);

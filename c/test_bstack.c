@@ -3114,6 +3114,285 @@ static int test_process_gen_persists_across_reopen(void)
     return 0;
 }
 
+static int pg_push_ends_sequence_gen(bstack_gen_op_t *out_op, void *userctx)
+{
+    int *calls = userctx;
+    (*calls)++;
+    if (*calls == 1) {
+        out_op->kind        = BSTACK_GEN_PUSH;
+        out_op->u.push.data = (const uint8_t *)"world";
+        out_op->u.push.len  = 5;
+    } else {
+        out_op->kind        = BSTACK_GEN_PUSH;
+        out_op->u.push.data = (const uint8_t *)"NOPE!";
+        out_op->u.push.len  = 5;
+    }
+    return 1;
+}
+
+static int test_process_gen_push_appends_and_ends_sequence(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"hello", 5, NULL) == 0);
+    int calls = 0;
+    CHECK(bstack_process_gen(bs, pg_push_ends_sequence_gen, &calls) == 0);
+    CHECK(calls == 1);
+
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 10);
+    uint8_t buf[10]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(memcmp(buf, "helloworld", 10) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int pg_push_empty_gen(bstack_gen_op_t *out_op, void *userctx)
+{
+    (void)userctx;
+    out_op->kind        = BSTACK_GEN_PUSH;
+    out_op->u.push.data = (const uint8_t *)"";
+    out_op->u.push.len  = 0;
+    return 1;
+}
+
+static int test_process_gen_push_empty_data_is_noop_and_ends_sequence(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"hello", 5, NULL) == 0);
+    CHECK(bstack_process_gen(bs, pg_push_empty_gen, NULL) == 0);
+
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 5);
+    uint8_t buf[5]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(memcmp(buf, "hello", 5) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+struct pg_pop_ctx {
+    uint8_t buf[5];
+    int     calls;
+};
+
+static int pg_pop_ends_sequence_gen(bstack_gen_op_t *out_op, void *userctx)
+{
+    struct pg_pop_ctx *ctx = userctx;
+    ctx->calls++;
+    if (ctx->calls == 1) {
+        out_op->kind       = BSTACK_GEN_POP;
+        out_op->u.pop.buf  = ctx->buf;
+        out_op->u.pop.len  = sizeof ctx->buf;
+    } else {
+        out_op->kind           = BSTACK_GEN_WRITE;
+        out_op->u.write.offset = 0;
+        out_op->u.write.data   = (const uint8_t *)"NOPE!";
+        out_op->u.write.len    = 5;
+    }
+    return 1;
+}
+
+static int test_process_gen_pop_removes_and_ends_sequence(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"helloworld", 10, NULL) == 0);
+    struct pg_pop_ctx ctx = {{0}, 0};
+    CHECK(bstack_process_gen(bs, pg_pop_ends_sequence_gen, &ctx) == 0);
+    CHECK(ctx.calls == 1);
+    CHECK(memcmp(ctx.buf, "world", 5) == 0);
+
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 5);
+    uint8_t buf[5]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(memcmp(buf, "hello", 5) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int pg_pop_zero_gen(bstack_gen_op_t *out_op, void *userctx)
+{
+    (void)userctx;
+    out_op->kind      = BSTACK_GEN_POP;
+    out_op->u.pop.buf = NULL;
+    out_op->u.pop.len = 0;
+    return 1;
+}
+
+static int test_process_gen_pop_zero_is_noop_and_ends_sequence(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"hello", 5, NULL) == 0);
+    CHECK(bstack_process_gen(bs, pg_pop_zero_gen, NULL) == 0);
+
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 5);
+    uint8_t buf[5]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(memcmp(buf, "hello", 5) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int pg_pop_oob_gen(bstack_gen_op_t *out_op, void *userctx)
+{
+    uint8_t *buf = userctx;
+    out_op->kind      = BSTACK_GEN_POP;
+    out_op->u.pop.buf = buf;
+    out_op->u.pop.len = 10;
+    return 1;
+}
+
+static int test_process_gen_pop_exceeds_payload_returns_error(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"hi", 2, NULL) == 0);
+    uint8_t buf[10];
+    CHECK(bstack_process_gen(bs, pg_pop_oob_gen, buf) == -1);
+    CHECK(errno == EINVAL);
+
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 2);
+    uint8_t pbuf[2]; size_t w;
+    CHECK(bstack_peek(bs, 0, pbuf, &w) == 0);
+    CHECK(memcmp(pbuf, "hi", 2) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int pg_pop_locked_gen(bstack_gen_op_t *out_op, void *userctx)
+{
+    uint8_t *buf = userctx;
+    out_op->kind      = BSTACK_GEN_POP;
+    out_op->u.pop.buf = buf;
+    out_op->u.pop.len = 5;
+    return 1;
+}
+
+static int test_process_gen_pop_below_locked_returns_error(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"helloworld", 10, NULL) == 0);
+    CHECK(bstack_lock_up_to(bs, 8) == 0);
+    uint8_t buf[5];
+    CHECK(bstack_process_gen(bs, pg_pop_locked_gen, buf) == -1);
+    CHECK(errno == EINVAL);
+
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 10);
+    uint8_t pbuf[10];
+    CHECK(bstack_get(bs, 0, 10, pbuf) == 0);
+    CHECK(memcmp(pbuf, "helloworld", 10) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+struct pg_len_ctx {
+    uint64_t size;
+    int      calls;
+};
+
+static int pg_len_gen(bstack_gen_op_t *out_op, void *userctx)
+{
+    struct pg_len_ctx *ctx = userctx;
+    ctx->calls++;
+    if (ctx->calls == 1) {
+        out_op->kind      = BSTACK_GEN_LEN;
+        out_op->u.len.out = &ctx->size;
+        return 1;
+    }
+    return 0;
+}
+
+static int test_process_gen_len_reports_current_size_and_continues(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"helloworld", 10, NULL) == 0);
+    struct pg_len_ctx ctx = {0, 0};
+    CHECK(bstack_process_gen(bs, pg_len_gen, &ctx) == 0);
+    CHECK(ctx.calls == 2);
+    CHECK(ctx.size == 10);
+
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 10);
+    uint8_t buf[10]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(memcmp(buf, "helloworld", 10) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+struct pg_len_pop_ctx {
+    uint64_t size;
+    uint8_t  buf[5];
+    int      step;
+};
+
+static int pg_len_informs_pop_gen(bstack_gen_op_t *out_op, void *userctx)
+{
+    struct pg_len_pop_ctx *ctx = userctx;
+    switch (ctx->step++) {
+    case 0:
+        out_op->kind      = BSTACK_GEN_LEN;
+        out_op->u.len.out = &ctx->size;
+        return 1;
+    case 1:
+        out_op->kind      = BSTACK_GEN_POP;
+        out_op->u.pop.buf = ctx->buf;
+        out_op->u.pop.len = (size_t)(ctx->size - 8);
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static int test_process_gen_len_informs_pop_size(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    /* Layout: [count: u64 LE]["world"] — pop the trailing "world" whose
+     * length is only known once BSTACK_GEN_LEN has reported the current
+     * size. */
+    uint8_t payload[13];
+    pg_le64_put(payload, 8);
+    memcpy(payload + 8, "world", 5);
+    CHECK(bstack_push(bs, payload, sizeof payload, NULL) == 0);
+
+    struct pg_len_pop_ctx ctx = {0, {0}, 0};
+    CHECK(bstack_process_gen(bs, pg_len_informs_pop_gen, &ctx) == 0);
+    CHECK(ctx.size == 13);
+    CHECK(memcmp(ctx.buf, "world", 5) == 0);
+
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 8);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
 #endif /* BSTACK_FEATURE_ATOMIC && BSTACK_FEATURE_SET */
 
 /* =========================================================================
@@ -3928,6 +4207,14 @@ int main(void)
     T(test_process_gen_write_in_locked_region_returns_error);
     T(test_process_gen_read_in_locked_region_succeeds);
     T(test_process_gen_persists_across_reopen);
+    T(test_process_gen_push_appends_and_ends_sequence);
+    T(test_process_gen_push_empty_data_is_noop_and_ends_sequence);
+    T(test_process_gen_pop_removes_and_ends_sequence);
+    T(test_process_gen_pop_zero_is_noop_and_ends_sequence);
+    T(test_process_gen_pop_exceeds_payload_returns_error);
+    T(test_process_gen_pop_below_locked_returns_error);
+    T(test_process_gen_len_reports_current_size_and_continues);
+    T(test_process_gen_len_informs_pop_size);
 #endif
 
     printf("\n%d/%d passed\n", g_passed, g_total);
