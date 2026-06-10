@@ -3299,6 +3299,9 @@ static uint64_t slab_blocks_needed(uint64_t len, uint64_t block_size)
     return (len - 1) / block_size + 1;
 }
 
+/* free_head read/write helpers: only the non-atomic free-list paths use them;
+ * the atomic paths drive free_head through process_gen / cross_exchange. */
+#ifndef BSTACK_FEATURE_ATOMIC
 static int slab_read_free_head(bstack_t *bs, uint64_t *out)
 {
     uint8_t buf[8];
@@ -3314,6 +3317,7 @@ static int slab_write_free_head(bstack_t *bs, uint64_t val)
     write_le64(buf, val);
     return bstack_set(bs, SLAB_FREE_HEAD_OFFSET, buf, 8);
 }
+#endif /* !BSTACK_FEATURE_ATOMIC */
 
 /*
  * Pop the head block from the free list.
@@ -3321,6 +3325,75 @@ static int slab_write_free_head(bstack_t *bs, uint64_t val)
  * Zeros the block after popping; failure is propagated to preserve the
  * allocator contract that returned bytes are zero-initialized.
  */
+#ifdef BSTACK_FEATURE_ATOMIC
+/*
+ * Atomic pop: drive a single bstack_process_gen sequence — read free_head,
+ * read the popped block's next-pointer, write that next back into free_head —
+ * under one held write lock, so the read-read-write is indivisible with
+ * respect to any other thread's free-list operation (closing the ABA window a
+ * get/cas pair would leave open).  The popped block is zeroed in a separate
+ * call afterwards, since by then it is exclusively owned by the caller.
+ */
+struct slab_pop_ctx {
+    uint8_t  head_buf[8];
+    uint8_t  next_buf[8];
+    int      step;
+    uint64_t popped;
+    int      have_popped;
+};
+
+static int slab_pop_gen(bstack_gen_op_t *out_op, void *userctx)
+{
+    struct slab_pop_ctx *ctx = userctx;
+    switch (ctx->step++) {
+    case 0: /* read the current free-list head */
+        out_op->kind          = BSTACK_GEN_READ;
+        out_op->u.read.offset = SLAB_FREE_HEAD_OFFSET;
+        out_op->u.read.buf    = ctx->head_buf;
+        out_op->u.read.len    = 8;
+        return 1;
+    case 1: { /* empty list ends with no write; else read head's next-pointer */
+        uint64_t head = read_le64(ctx->head_buf);
+        if (head == SLAB_SENTINEL) return 0;
+        ctx->popped      = head;
+        ctx->have_popped = 1;
+        out_op->kind          = BSTACK_GEN_READ;
+        out_op->u.read.offset = head;
+        out_op->u.read.buf    = ctx->next_buf;
+        out_op->u.read.len    = 8;
+        return 1;
+    }
+    case 2: /* advance free_head to the popped block's next-pointer */
+        out_op->kind           = BSTACK_GEN_WRITE;
+        out_op->u.write.offset = SLAB_FREE_HEAD_OFFSET;
+        out_op->u.write.data   = ctx->next_buf;
+        out_op->u.write.len    = 8;
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static int slab_pop_free_block(bstack_t *bs, uint64_t block_size,
+                                uint64_t *out_block)
+{
+    struct slab_pop_ctx ctx;
+    memset(&ctx, 0, sizeof ctx);
+
+    if (bstack_process_gen(bs, slab_pop_gen, &ctx) != 0) return -1;
+    if (!ctx.have_popped) { *out_block = SLAB_SENTINEL; return 0; }
+
+    /* Zero the block after popping; on failure the popped block is leaked but
+     * not returned to callers in a non-zero state. */
+#if UINT64_MAX > SIZE_MAX
+    if (block_size > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
+#endif
+    if (bstack_zero(bs, ctx.popped, (size_t)block_size) != 0) return -1;
+
+    *out_block = ctx.popped;
+    return 0;
+}
+#else /* !BSTACK_FEATURE_ATOMIC */
 static int slab_pop_free_block(bstack_t *bs, uint64_t block_size,
                                 uint64_t *out_block)
 {
@@ -3346,9 +3419,28 @@ static int slab_pop_free_block(bstack_t *bs, uint64_t block_size,
     *out_block = head;
     return 0;
 }
+#endif /* BSTACK_FEATURE_ATOMIC */
 
 /*
  * Prepend the block at block_start to the free list.
+ */
+#ifdef BSTACK_FEATURE_ATOMIC
+/*
+ * Lock-free splice via bstack_cross_exchange: block_start is first seeded with
+ * a self-pointer placeholder, then atomically swapped with free_head under one
+ * write lock — free_head becomes block_start and block_start's next-pointer
+ * becomes the old head, in a single indivisible step.  A crash between the two
+ * calls leaks block_start rather than corrupting the list.
+ */
+static int slab_push_free_block(bstack_t *bs, uint64_t block_start)
+{
+    uint8_t buf[8];
+    write_le64(buf, block_start); /* placeholder: replaced by old head below */
+    if (bstack_set(bs, block_start, buf, 8) != 0) return -1;
+    return bstack_cross_exchange(bs, block_start, SLAB_FREE_HEAD_OFFSET, 8);
+}
+#else /* !BSTACK_FEATURE_ATOMIC */
+/*
  * Writes the next-pointer into the block before updating free_head:
  * a crash after the first write but before the second leaks the block rather
  * than corrupting the list.
@@ -3363,25 +3455,39 @@ static int slab_push_free_block(bstack_t *bs, uint64_t block_start)
     if (bstack_set(bs, block_start, buf, 8) != 0) return -1;
     return slab_write_free_head(bs, block_start);
 }
+#endif /* BSTACK_FEATURE_ATOMIC */
 
 /*
  * Prepend `count` contiguous blocks starting at `first_block` to the free list.
- * Uses exactly 3 IO calls regardless of count: one read of free_head, one bulk
- * write of all next-pointers into the freed region, and one write of free_head.
- * Crash behaviour matches slab_push_free_block: a crash after the bulk write
- * but before free_head update leaks the entire batch rather than corrupting
- * the list.
+ *
+ * Without atomic: exactly 3 IO calls regardless of count — one read of
+ * free_head, one bulk write of all next-pointers into the freed region, and
+ * one write of free_head.  A crash after the bulk write but before the
+ * free_head update leaks the entire batch rather than corrupting the list.
+ *
+ * With atomic: generalises slab_push_free_block to a whole run.  The chain
+ * first_block -> ... -> last_block is built in one buffer, with last_block's
+ * next-pointer set to the placeholder first_block.  A single bulk bstack_set
+ * writes the chain (still unreachable from free_head), then
+ * bstack_cross_exchange atomically swaps last_block's next-pointer with
+ * free_head — free_head becomes first_block and last_block's next-pointer
+ * becomes the old head, splicing the whole run in under one write lock.
  */
 static int slab_push_free_blocks(bstack_t *bs, uint64_t first_block,
                                   uint64_t count, uint64_t block_size)
 {
-    uint64_t old_head, i, buf_size;
+    uint64_t i, buf_size;
     uint8_t *buf;
+#ifndef BSTACK_FEATURE_ATOMIC
+    uint64_t old_head;
+#endif
 
     if (count == 0) return 0;
     if (count == 1) return slab_push_free_block(bs, first_block);
 
+#ifndef BSTACK_FEATURE_ATOMIC
     if (slab_read_free_head(bs, &old_head) != 0) return -1;
+#endif
 
     if (count > UINT64_MAX / block_size) { errno = EINVAL; return -1; }
     buf_size = count * block_size;
@@ -3395,14 +3501,26 @@ static int slab_push_free_blocks(bstack_t *bs, uint64_t first_block,
         uint64_t next = first_block + (i + 1) * block_size;
         write_le64(buf + (size_t)(i * block_size), next);
     }
+#ifdef BSTACK_FEATURE_ATOMIC
+    /* Placeholder: replaced with the old free_head by cross_exchange below. */
+    write_le64(buf + (size_t)((count - 1) * block_size), first_block);
+#else
     write_le64(buf + (size_t)((count - 1) * block_size), old_head);
+#endif
 
     if (bstack_set(bs, first_block, buf, (size_t)buf_size) != 0) {
         free(buf); return -1;
     }
     free(buf);
 
+#ifdef BSTACK_FEATURE_ATOMIC
+    {
+        uint64_t last_block = first_block + (count - 1) * block_size;
+        return bstack_cross_exchange(bs, last_block, SLAB_FREE_HEAD_OFFSET, 8);
+    }
+#else
     return slab_write_free_head(bs, first_block);
+#endif
 }
 
 /* ---- vtable ------------------------------------------------------------ */
@@ -3424,11 +3542,9 @@ static int slab_vtbl_alloc(bstack_allocator_t *base, uint64_t len,
     }
 
     if (len <= a->block_size) {
-        int pop_r;
-        FF_LOCK(a);
-        pop_r = slab_pop_free_block(a->bs, a->block_size, &block);
-        FF_UNLOCK(a);
-        if (pop_r != 0) return -1;
+        /* Free-list pop is lock-free under atomic (single process_gen
+         * sequence); single-threaded otherwise. */
+        if (slab_pop_free_block(a->bs, a->block_size, &block) != 0) return -1;
         if (block != SLAB_SENTINEL) {
             out->allocator = base; out->offset = block; out->len = len;
             return 0;
@@ -3491,14 +3607,9 @@ static int slab_vtbl_dealloc(bstack_allocator_t *base, bstack_slice_t s)
 #endif
     }
 
-    /* Not at tail (or single-block): push to the free list under the lock. */
-    {
-        int r;
-        FF_LOCK(a);
-        r = slab_push_free_blocks(a->bs, s.offset, n_blocks, a->block_size);
-        FF_UNLOCK(a);
-        return r;
-    }
+    /* Not at tail (or single-block): push to the free list (lock-free under
+     * atomic via cross_exchange; single-threaded otherwise). */
+    return slab_push_free_blocks(a->bs, s.offset, n_blocks, a->block_size);
 }
 
 static int slab_vtbl_realloc(bstack_allocator_t *base, bstack_slice_t s,
@@ -3587,11 +3698,11 @@ static int slab_vtbl_realloc(bstack_allocator_t *base, bstack_slice_t s,
 
         /* Not at tail (or tail moved under atomic): grow non-tail.
          * Read old data into a zeroed new_backing-sized buffer, push it as a
-         * single atomic write, then free the old blocks under the lock. */
+         * single atomic write, then free the old blocks (lock-free under
+         * atomic via cross_exchange). */
         {
             uint8_t  *buf;
             uint64_t  push_offset;
-            int       r;
 
 #if UINT64_MAX > SIZE_MAX
             if (new_backing > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
@@ -3610,10 +3721,8 @@ static int slab_vtbl_realloc(bstack_allocator_t *base, bstack_slice_t s,
             }
             free(buf);
 
-            FF_LOCK(a);
-            r = slab_push_free_blocks(a->bs, s.offset, old_n, a->block_size);
-            FF_UNLOCK(a);
-            if (r != 0) return -1;
+            if (slab_push_free_blocks(a->bs, s.offset, old_n,
+                                      a->block_size) != 0) return -1;
 
             out->allocator = base;
             out->offset    = push_offset;
@@ -3658,18 +3767,13 @@ static int slab_vtbl_realloc(bstack_allocator_t *base, bstack_slice_t s,
             return 0;
         }
 
-        /* Shrink non-tail: return excess blocks to free list under the lock. */
-        {
-            int r;
-            FF_LOCK(a);
-            r = slab_push_free_blocks(a->bs,
-                                      s.offset + new_n * a->block_size,
-                                      old_n - new_n, a->block_size);
-            FF_UNLOCK(a);
-            if (r != 0) return -1;
-            out->allocator = base; out->offset = s.offset; out->len = new_len;
-            return 0;
-        }
+        /* Shrink non-tail: return excess blocks to free list (lock-free under
+         * atomic via cross_exchange). */
+        if (slab_push_free_blocks(a->bs,
+                                  s.offset + new_n * a->block_size,
+                                  old_n - new_n, a->block_size) != 0) return -1;
+        out->allocator = base; out->offset = s.offset; out->len = new_len;
+        return 0;
     }
 }
 
@@ -3700,19 +3804,12 @@ slab_bstack_allocator_t *slab_bstack_allocator_new(bstack_t *bs,
     a = malloc(sizeof *a);
     if (!a) { errno = ENOMEM; return NULL; }
 
-#ifdef BSTACK_FEATURE_ATOMIC
-    if (bstack_alloc_lock_init(&a->lock) != 0) { free(a); return NULL; }
-#endif
-
     memset(hdr, 0, sizeof hdr);
     memcpy(hdr + (size_t)SLAB_OFFSET_SIZE, alsl_magic, 8);
     write_le64(hdr + (size_t)SLAB_BLOCK_SIZE_OFFSET, block_size);
     /* free_head at SLAB_FREE_HEAD_OFFSET stays 0 (SLAB_SENTINEL) */
 
     if (bstack_push(bs, hdr, sizeof hdr, NULL) != 0) {
-#ifdef BSTACK_FEATURE_ATOMIC
-        bstack_alloc_lock_destroy(a->lock);
-#endif
         free(a); return NULL;
     }
 
@@ -3768,10 +3865,6 @@ slab_bstack_allocator_t *slab_bstack_allocator_open(bstack_t *bs)
         return NULL;
     }
 
-#ifdef BSTACK_FEATURE_ATOMIC
-    if (bstack_alloc_lock_init(&a->lock) != 0) { free(a); return NULL; }
-#endif
-
     a->base.vtbl      = &slab_allocator_vtbl;
     a->base.bulk_vtbl = NULL;
     a->bs             = bs;
@@ -3781,18 +3874,12 @@ slab_bstack_allocator_t *slab_bstack_allocator_open(bstack_t *bs)
 
 void slab_bstack_allocator_free(slab_bstack_allocator_t *alloc)
 {
-#ifdef BSTACK_FEATURE_ATOMIC
-    bstack_alloc_lock_destroy(alloc->lock);
-#endif
     free(alloc);
 }
 
 bstack_t *slab_bstack_allocator_into_stack(slab_bstack_allocator_t *alloc)
 {
     bstack_t *bs = alloc->bs;
-#ifdef BSTACK_FEATURE_ATOMIC
-    bstack_alloc_lock_destroy(alloc->lock);
-#endif
     free(alloc);
     return bs;
 }
