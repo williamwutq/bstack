@@ -3337,9 +3337,9 @@ static int slab_write_free_head(bstack_t *bs, uint64_t val)
 struct slab_pop_ctx {
     uint8_t  head_buf[8];
     uint8_t  next_buf[8];
-    int      step;
     uint64_t popped;
     int      have_popped;
+    int      step;
 };
 
 static int slab_pop_gen(bstack_gen_op_t *out_op, void *userctx)
@@ -4198,10 +4198,10 @@ static int alck_push_free_blocks(bstack_t *bs, uint64_t first_block,
 struct alck_pop_ctx {
     uint8_t  head_buf[8];
     uint8_t  prefix_buf[16];
-    int      step;
     uint64_t head;
     int      have_head;
     int      corrupt;
+    int      step;
 };
 
 static int alck_pop_gen(bstack_gen_op_t *out_op, void *userctx)
@@ -4457,14 +4457,14 @@ enum alck_recover_st {
 };
 
 struct alck_recover_ctx {
-    uint64_t   block_size;
-    int        st;
-
     /* buffers filled by Len/Read ops */
-    uint64_t   len_out;
-    uint8_t    head_buf[8];
     uint8_t    node_buf[16];
+    uint8_t    head_buf[8];
     uint8_t    oh_buf[8];
+    uint64_t   len_out;
+
+    /* immutable inputs */
+    uint64_t   block_size;
 
     /* scan cursors / authoritative size */
     uint64_t   stack_len;
@@ -4474,7 +4474,6 @@ struct alck_recover_ctx {
     /* free-list block offsets (sorted once the walk completes) */
     uint64_t  *free_arr;
     size_t     free_cnt, free_cap;
-    int        free_corrupt;
     uint64_t   max_blocks;  /* cycle-guard bound */
 
     /* backward reach DP over a suspicious tail region */
@@ -4487,8 +4486,11 @@ struct alck_recover_ctx {
     uint64_t  *reclaim;
     size_t     reclaim_cnt, reclaim_cap;
     uint64_t   unsure;
-    int        has_discard;
     uint64_t   discard_from;
+
+    int        free_corrupt;
+    int        has_discard;
+    int        st;
 };
 
 /* Append to a grow-on-demand u64 array; returns -1 (errno=ENOMEM) on failure. */
