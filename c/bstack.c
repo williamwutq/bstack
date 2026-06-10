@@ -1902,9 +1902,13 @@ int bstack_process_gen(bstack_t *bs,
                 BS_WRUNLOCK(bs); errno = EINVAL; return -1;
             }
             if (len > 0) {
-                uint64_t read_offset = HEADER_SIZE + new_len;
-                if (plat_pread(bs->fd, buf, len, read_offset) != 0)
-                    goto fail_unlock;
+                /* buf == NULL discards the bytes without copying them out —
+                 * the in-sequence equivalent of bstack_discard. */
+                if (buf != NULL) {
+                    uint64_t read_offset = HEADER_SIZE + new_len;
+                    if (plat_pread(bs->fd, buf, len, read_offset) != 0)
+                        goto fail_unlock;
+                }
                 if (plat_ftruncate(bs->fd, HEADER_SIZE + new_len) != 0 ||
                     write_committed_len(bs->fd, new_len) != 0 ||
                     plat_durable_sync(bs->fd) != 0)
