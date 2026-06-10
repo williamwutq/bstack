@@ -827,19 +827,28 @@ uint64_t slab_bstack_allocator_block_size(const slab_bstack_allocator_t *alloc);
  *   multi-block at tail → bstack_discard (crash-safe, single call)
  *   all other cases     → each block prepended to free list
  *
- * Crash consistency: each free-list mutation writes block payloads before
- * updating free_head.  A crash leaks at most the block being operated on;
- * the rest of the list stays intact.  checked_slab_bstack_allocator_recover
- * reclaims leaked blocks by a linear arena scan.
+ * Crash consistency: each free-list mutation writes block payloads before the
+ * splice (without atomic) or splices atomically with bstack_cross_exchange
+ * (with atomic).  A crash leaks at most the block being operated on; the rest
+ * of the list stays intact.  checked_slab_bstack_allocator_recover reclaims
+ * leaked blocks by a linear arena scan.
  *
  * Thread safety: without -DBSTACK_FEATURE_ATOMIC, an allocator handle must be
  * used from one thread at a time — free-list mutations read then write free_head
  * as separate bstack calls, a TOCTOU race under concurrent access.  With
- * -DBSTACK_FEATURE_ATOMIC the handle owns an in-memory mutex (lock) that
- * serialises all compound operations: free-list pop/push, the tail-length checks
- * preceding extend or discard, and the recover scan.  bstack_try_discard and
- * bstack_try_extend_zeros are used for the tail paths — those check-and-act
- * atomically under bstack's own write lock without the allocator lock.
+ * -DBSTACK_FEATURE_ATOMIC, alloc/dealloc/realloc take no allocator-level lock:
+ * free-list pop drives a single bstack_process_gen sequence (read free_head,
+ * read the popped block's overhead and next-pointer, advance free_head — all
+ * under one held bstack write lock, closing the ABA window a get/cas pair would
+ * leave open), free-list push splices a block or a whole freed run with one
+ * bstack_cross_exchange, and tail grow/shrink use bstack_try_extend_zeros /
+ * bstack_try_discard (check-and-act atomically under bstack's own write lock).
+ * The handle still owns an in-memory mutex (lock), held only by recover to keep
+ * it single-flight: the recover scan and its one optional tail discard run as a
+ * single bstack_process_gen sequence (so the bstack write lock, not the mutex,
+ * serialises the scan against alloc/dealloc), while the mutex only prevents two
+ * concurrent recover runs from each reclaiming the same leaked block.  Ordinary
+ * alloc/dealloc/realloc never take it.
  *
  * Requires -DBSTACK_FEATURE_SET.
  * ====================================================================== */
@@ -849,8 +858,8 @@ typedef struct {
     bstack_t          *bs;
     uint64_t           block_size;
 #ifdef BSTACK_FEATURE_ATOMIC
-    /* Opaque platform mutex; serialises free-list pop/push and tail operations
-     * so a single handle may be shared across threads. */
+    /* Opaque platform mutex; held only by recover() to keep it single-flight
+     * (alloc/dealloc/realloc are lock-free).  Shared across threads. */
     void              *lock;
 #endif
 } checked_slab_bstack_allocator_t;

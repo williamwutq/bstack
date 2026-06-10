@@ -3933,6 +3933,9 @@ static int alck_write_overhead(bstack_t *bs, uint64_t block_start, uint64_t valu
 
 /* ---- free_head I/O ----------------------------------------------------- */
 
+/* Only the non-atomic free-list paths read/write free_head directly; the
+ * atomic paths drive it through process_gen / cross_exchange. */
+#ifndef BSTACK_FEATURE_ATOMIC
 static int alck_read_free_head(bstack_t *bs, uint64_t *out)
 {
     uint8_t buf[8];
@@ -3948,6 +3951,7 @@ static int alck_write_free_head(bstack_t *bs, uint64_t val)
     write_le64(buf, val);
     return bstack_set(bs, ALCK_FREE_HEAD_OFFSET, buf, 8);
 }
+#endif /* !BSTACK_FEATURE_ATOMIC */
 
 /* ---- blocks_needed ----------------------------------------------------- */
 
@@ -4010,7 +4014,11 @@ static uint64_t alck_valid_in_use(uint64_t overhead, uint64_t p,
  * *out_free and *out_cnt are set on success; caller must free *out_free.
  * *out_corrupt is set to 1 if the walk was cut short by structural corruption.
  * Returns 0 on success, -1 on I/O failure.
+ *
+ * Only the non-atomic recovery path uses this; the atomic path performs the
+ * equivalent walk inline inside its process_gen scan.
  */
+#ifndef BSTACK_FEATURE_ATOMIC
 static int alck_scan_free_list(bstack_t *bs, uint64_t stack_len,
                                 uint64_t block_size,
                                 uint64_t **out_free, size_t *out_cnt,
@@ -4081,26 +4089,32 @@ static int alck_scan_free_list(bstack_t *bs, uint64_t stack_len,
     *out_corrupt = corrupt;
     return 0;
 }
+#endif /* !BSTACK_FEATURE_ATOMIC */
 
 /* ---- write_free_run ---------------------------------------------------- */
 
 /*
  * Write the block prefixes for a run of `count` contiguous free blocks
- * starting at `first_block`, linking them into a chain whose tail points at
- * the current free_head.  Does NOT update free_head.
+ * starting at `first_block`, linking them into a chain.  Each block's overhead
+ * is zeroed and data[0..8] holds the next block's offset.  All other data
+ * bytes in the run are zeroed.  Does NOT update free_head.
  *
- * Each block's overhead is zeroed and data[0..8] holds the next block's
- * offset (or the old free_head for the last block).  All other data bytes in
- * the run are zeroed.  The single bulk bstack_set is crash-safe: until
- * free_head is repointed the whole run is simply unreachable.
+ * Without atomic the last block's data[0..8] holds the current free_head, which
+ * the caller then writes into free_head directly.  With atomic it holds the
+ * placeholder first_block; alck_push_free_blocks splices the whole run onto
+ * free_head with bstack_cross_exchange afterwards.  Either way the single bulk
+ * bstack_set is crash-safe: until the run is spliced in the whole run is simply
+ * unreachable.
  */
 static int alck_write_free_run(bstack_t *bs, uint64_t first_block,
                                 uint64_t count, uint64_t block_size)
 {
-    uint64_t old_head, total, i;
+    uint64_t total, i;
     uint8_t *buf;
-
+#ifndef BSTACK_FEATURE_ATOMIC
+    uint64_t old_head;
     if (alck_read_free_head(bs, &old_head) != 0) return -1;
+#endif
 
     if (count > UINT64_MAX / block_size) { errno = EINVAL; return -1; }
     total = count * block_size;
@@ -4113,10 +4127,16 @@ static int alck_write_free_run(bstack_t *bs, uint64_t first_block,
     for (i = 0; i < count; i++) {
         uint64_t next;
         /* overhead at buf[i*block_size..+8] stays zero */
-        if (i + 1 < count)
+        if (i + 1 < count) {
             next = first_block + (i + 1) * block_size;
-        else
+        } else {
+#ifdef BSTACK_FEATURE_ATOMIC
+            /* Placeholder: replaced with the old free_head by cross_exchange. */
+            next = first_block;
+#else
             next = old_head;
+#endif
+        }
         write_le64(buf + (size_t)(i * block_size) + 8, next);
     }
 
@@ -4133,13 +4153,28 @@ static int alck_write_free_run(bstack_t *bs, uint64_t first_block,
  * Prepend `count` contiguous blocks at `first_block` to the free list.
  * Clears their overhead bytes as part of the operation (transitions live →
  * free).  Does nothing if count == 0.
+ *
+ * With atomic the splice is a single bstack_cross_exchange on the last block's
+ * next-pointer slot (data[0..8], at last_block + ALCK_OVERHEAD): it atomically
+ * swaps that slot — currently the placeholder first_block — with free_head, so
+ * free_head becomes first_block and the last block's next-pointer becomes the
+ * old head, in one indivisible step.  For count == 1 the first and last block
+ * coincide, mirroring slab_push_free_block.
  */
 static int alck_push_free_blocks(bstack_t *bs, uint64_t first_block,
                                   uint64_t count, uint64_t block_size)
 {
     if (count == 0) return 0;
     if (alck_write_free_run(bs, first_block, count, block_size) != 0) return -1;
+#ifdef BSTACK_FEATURE_ATOMIC
+    {
+        uint64_t last_block = first_block + (count - 1) * block_size;
+        return bstack_cross_exchange(bs, last_block + ALCK_OVERHEAD,
+                                     ALCK_FREE_HEAD_OFFSET, 8);
+    }
+#else
     return alck_write_free_head(bs, first_block);
+#endif
 }
 
 /* ---- pop_and_claim_block ----------------------------------------------- */
@@ -4150,6 +4185,87 @@ static int alck_push_free_blocks(bstack_t *bs, uint64_t first_block,
  * Sets *out_block_start to ALCK_SENTINEL (0) if the list is empty.
  * Returns 0 on success, -1 on error.
  */
+#ifdef BSTACK_FEATURE_ATOMIC
+/*
+ * Atomic pop: the read of free_head, the read of the popped block's overhead
+ * and next-pointer (the 16-byte prefix), and the write that advances free_head
+ * run as a single bstack_process_gen sequence under one held write lock — the
+ * read-read-write is indivisible with respect to any other free-list operation
+ * (mirrors slab_pop_free_block, plus the overhead-corruption check).  The
+ * claim write (overhead + zeroed data) happens afterwards on the now-detached
+ * block, which is exclusively owned by this call.
+ */
+struct alck_pop_ctx {
+    uint8_t  head_buf[8];
+    uint8_t  prefix_buf[16];
+    int      step;
+    uint64_t head;
+    int      have_head;
+    int      corrupt;
+};
+
+static int alck_pop_gen(bstack_gen_op_t *out_op, void *userctx)
+{
+    struct alck_pop_ctx *ctx = userctx;
+    switch (ctx->step++) {
+    case 0: /* read the current free-list head */
+        out_op->kind          = BSTACK_GEN_READ;
+        out_op->u.read.offset = ALCK_FREE_HEAD_OFFSET;
+        out_op->u.read.buf    = ctx->head_buf;
+        out_op->u.read.len    = 8;
+        return 1;
+    case 1: { /* empty list ends with no write; else read head's prefix */
+        uint64_t head = read_le64(ctx->head_buf);
+        if (head == ALCK_SENTINEL) return 0;
+        ctx->head      = head;
+        ctx->have_head = 1;
+        out_op->kind          = BSTACK_GEN_READ;
+        out_op->u.read.offset = head;
+        out_op->u.read.buf    = ctx->prefix_buf;
+        out_op->u.read.len    = 16;
+        return 1;
+    }
+    case 2: { /* corrupt overhead ends with no write; else advance free_head */
+        uint64_t overhead = read_le64(ctx->prefix_buf);
+        if (overhead != 0) { ctx->corrupt = 1; return 0; }
+        out_op->kind           = BSTACK_GEN_WRITE;
+        out_op->u.write.offset = ALCK_FREE_HEAD_OFFSET;
+        out_op->u.write.data   = ctx->prefix_buf + 8;
+        out_op->u.write.len    = 8;
+        return 1;
+    }
+    default:
+        return 0;
+    }
+}
+
+static int alck_pop_and_claim_block(bstack_t *bs, uint64_t num_blocks,
+                                     uint64_t block_size,
+                                     uint64_t *out_block_start)
+{
+    struct alck_pop_ctx ctx;
+    uint8_t *block_buf;
+    memset(&ctx, 0, sizeof ctx);
+
+    if (bstack_process_gen(bs, alck_pop_gen, &ctx) != 0) return -1;
+    if (!ctx.have_head) { *out_block_start = ALCK_SENTINEL; return 0; }
+    if (ctx.corrupt) { errno = EINVAL; return -1; }
+
+    /* Mark in-use and zero data in one bulk write on the detached block. */
+#if UINT64_MAX > SIZE_MAX
+    if (block_size > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
+#endif
+    block_buf = calloc(1, (size_t)block_size);
+    if (!block_buf) return -1;
+    write_le64(block_buf, ALCK_IN_USE_BIT | num_blocks);
+    if (bstack_set(bs, ctx.head, block_buf, (size_t)block_size) != 0) {
+        free(block_buf); return -1;
+    }
+    free(block_buf);
+    *out_block_start = ctx.head;
+    return 0;
+}
+#else /* !BSTACK_FEATURE_ATOMIC */
 static int alck_pop_and_claim_block(bstack_t *bs, uint64_t num_blocks,
                                      uint64_t block_size,
                                      uint64_t *out_block_start)
@@ -4182,8 +4298,13 @@ static int alck_pop_and_claim_block(bstack_t *bs, uint64_t num_blocks,
     *out_block_start = head;
     return 0;
 }
+#endif /* BSTACK_FEATURE_ATOMIC */
 
 /* ---- recovery helpers -------------------------------------------------- */
+
+/* These classification helpers serve the non-atomic sequential recover; the
+ * atomic recover inlines the equivalent logic inside its process_gen scan. */
+#ifndef BSTACK_FEATURE_ATOMIC
 
 typedef enum {
     ALCK_CLASS_FREE,
@@ -4300,9 +4421,401 @@ static int alck_resync_tail(bstack_t *bs, uint64_t p, uint64_t stack_len,
     *out_outcome = ALCK_RESYNC_DISCARD_TAIL;
     return 0;
 }
+#endif /* !BSTACK_FEATURE_ATOMIC */
 
 /* ---- checked_slab_bstack_allocator_recover ----------------------------- */
 
+#ifdef BSTACK_FEATURE_ATOMIC
+/*
+ * Atomic recovery: the free-list walk (with cycle detection), the linear arena
+ * scan, and the single optional orphaned-tail discard run as ONE
+ * bstack_process_gen sequence — every read happens under one held bstack write
+ * lock, so a concurrent alloc/dealloc cannot mutate the free list between the
+ * moment it is walked and the moment a block is classified against it.  The
+ * scan is expressed as a pull-driven state machine: the gen callback contains
+ * its own loop and only returns an op when it needs a Read/Len (or the
+ * terminating discard); pure transitions `continue` internally.  After the
+ * locked scan, each reclaimed leak is spliced onto the free list lock-free
+ * (a leak is unreachable by alloc/dealloc, so its state is stable across the
+ * gap, and the splice is itself an atomic cross_exchange).
+ *
+ * The allocator Mutex is held for the whole call solely to make recovery
+ * single-flight: two overlapping runs could each observe the same leak and
+ * splice it in twice.  Ordinary alloc/dealloc/realloc never take it.
+ */
+enum alck_recover_st {
+    ALCK_ST_READ_LEN,
+    ALCK_ST_READ_FREE_HEAD,
+    ALCK_ST_CONSUME_FREE_HEAD,
+    ALCK_ST_WALK_HEAD,
+    ALCK_ST_CONSUME_NODE,
+    ALCK_ST_ARENA_AT,
+    ALCK_ST_CONSUME_ARENA,
+    ALCK_ST_CONSUME_RESYNC,
+    ALCK_ST_FINISH,
+    ALCK_ST_DONE
+};
+
+struct alck_recover_ctx {
+    uint64_t   block_size;
+    int        st;
+
+    /* buffers filled by Len/Read ops */
+    uint64_t   len_out;
+    uint8_t    head_buf[8];
+    uint8_t    node_buf[16];
+    uint8_t    oh_buf[8];
+
+    /* scan cursors / authoritative size */
+    uint64_t   stack_len;
+    uint64_t   walk_head;   /* WALK_HEAD / CONSUME_NODE cursor */
+    uint64_t   p;           /* ARENA_AT / CONSUME_ARENA cursor */
+
+    /* free-list block offsets (sorted once the walk completes) */
+    uint64_t  *free_arr;
+    size_t     free_cnt, free_cap;
+    int        free_corrupt;
+    uint64_t   max_blocks;  /* cycle-guard bound */
+
+    /* backward reach DP over a suspicious tail region */
+    uint8_t   *reach;
+    size_t     reach_m;
+    uint64_t   resync_p;
+    size_t     rj;
+
+    /* results consumed after the locked scan */
+    uint64_t  *reclaim;
+    size_t     reclaim_cnt, reclaim_cap;
+    uint64_t   unsure;
+    int        has_discard;
+    uint64_t   discard_from;
+};
+
+/* Append to a grow-on-demand u64 array; returns -1 (errno=ENOMEM) on failure. */
+static int alck_u64_push(uint64_t **arr, size_t *cnt, size_t *cap, uint64_t v)
+{
+    if (*cnt == *cap) {
+        size_t    nc  = *cap ? *cap * 2 : 16;
+        uint64_t *tmp = realloc(*arr, nc * sizeof *tmp);
+        if (!tmp) { errno = ENOMEM; return -1; }
+        *arr = tmp; *cap = nc;
+    }
+    (*arr)[(*cnt)++] = v;
+    return 0;
+}
+
+/* Sort free_arr ascending (insertion sort — the list is typically short). */
+static void alck_recover_sort_free(struct alck_recover_ctx *c)
+{
+    size_t i, j;
+    for (i = 1; i < c->free_cnt; i++) {
+        uint64_t key = c->free_arr[i];
+        j = i;
+        while (j > 0 && c->free_arr[j - 1] > key) {
+            c->free_arr[j] = c->free_arr[j - 1];
+            j--;
+        }
+        c->free_arr[j] = key;
+    }
+}
+
+/* Binary search: is p present in the sorted free_arr? */
+static int alck_recover_free_contains(const struct alck_recover_ctx *c, uint64_t p)
+{
+    size_t lo = 0, hi = c->free_cnt;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if      (c->free_arr[mid] < p) lo = mid + 1;
+        else if (c->free_arr[mid] > p) hi = mid;
+        else    return 1;
+    }
+    return 0;
+}
+
+/* First index in sorted free_arr whose offset is > p (== free_cnt if none). */
+static size_t alck_recover_free_upper(const struct alck_recover_ctx *c, uint64_t p)
+{
+    size_t lo = 0, hi = c->free_cnt, idx = c->free_cnt;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (c->free_arr[mid] <= p) lo = mid + 1;
+        else { idx = mid; hi = mid; }
+    }
+    return idx;
+}
+
+static int alck_recover_gen(bstack_gen_op_t *out_op, void *userctx)
+{
+    struct alck_recover_ctx *c = userctx;
+    uint64_t bs_sz = c->block_size;
+
+    for (;;) {
+        switch (c->st) {
+        /* Read the authoritative payload size first. */
+        case ALCK_ST_READ_LEN:
+            c->st = ALCK_ST_READ_FREE_HEAD;
+            out_op->kind      = BSTACK_GEN_LEN;
+            out_op->u.len.out = &c->len_out;
+            return 1;
+
+        case ALCK_ST_READ_FREE_HEAD:
+            c->stack_len = c->len_out;
+            if (c->stack_len <= ALCK_ARENA_START) { c->st = ALCK_ST_FINISH; continue; }
+            c->max_blocks = (c->stack_len - ALCK_ARENA_START) / bs_sz;
+            c->st = ALCK_ST_CONSUME_FREE_HEAD;
+            out_op->kind          = BSTACK_GEN_READ;
+            out_op->u.read.offset = ALCK_FREE_HEAD_OFFSET;
+            out_op->u.read.buf    = c->head_buf;
+            out_op->u.read.len    = 8;
+            return 1;
+
+        case ALCK_ST_CONSUME_FREE_HEAD:
+            c->walk_head = read_le64(c->head_buf);
+            c->st = ALCK_ST_WALK_HEAD;
+            continue;
+
+        /* Free-list walk: validate the head, then read its node. */
+        case ALCK_ST_WALK_HEAD: {
+            uint64_t head = c->walk_head;
+            if (head == ALCK_SENTINEL) {
+                alck_recover_sort_free(c);
+                c->p = ALCK_ARENA_START;
+                c->st = ALCK_ST_ARENA_AT;
+                continue;
+            }
+            if (head < ALCK_ARENA_START
+                || (head - ALCK_ARENA_START) % bs_sz != 0
+                || head >= c->stack_len
+                || (uint64_t)c->free_cnt > c->max_blocks /* cycle guard */) {
+                c->free_corrupt = 1;
+                alck_recover_sort_free(c);
+                c->p = ALCK_ARENA_START;
+                c->st = ALCK_ST_ARENA_AT;
+                continue;
+            }
+            c->st = ALCK_ST_CONSUME_NODE;
+            out_op->kind          = BSTACK_GEN_READ;
+            out_op->u.read.offset = head;
+            out_op->u.read.buf    = c->node_buf;
+            out_op->u.read.len    = 16;
+            return 1;
+        }
+
+        case ALCK_ST_CONSUME_NODE: {
+            uint64_t overhead = read_le64(c->node_buf);
+            if (overhead != 0) {
+                c->free_corrupt = 1;
+                alck_recover_sort_free(c);
+                c->p = ALCK_ARENA_START;
+                c->st = ALCK_ST_ARENA_AT;
+                continue;
+            }
+            if (alck_u64_push(&c->free_arr, &c->free_cnt, &c->free_cap,
+                              c->walk_head) != 0) return -1;
+            c->walk_head = read_le64(c->node_buf + 8);
+            c->st = ALCK_ST_WALK_HEAD;
+            continue;
+        }
+
+        /* Linear arena scan: read the overhead at the cursor. */
+        case ALCK_ST_ARENA_AT:
+            if (c->p >= c->stack_len) { c->st = ALCK_ST_FINISH; continue; }
+            c->st = ALCK_ST_CONSUME_ARENA;
+            out_op->kind          = BSTACK_GEN_READ;
+            out_op->u.read.offset = c->p;
+            out_op->u.read.buf    = c->oh_buf;
+            out_op->u.read.len    = 8;
+            return 1;
+
+        case ALCK_ST_CONSUME_ARENA: {
+            uint64_t overhead = read_le64(c->oh_buf);
+            uint64_t p = c->p;
+            uint64_t n;
+            size_t   idx;
+            uint64_t span, m64;
+            size_t   m;
+
+            if (overhead == 0) {
+                if (alck_recover_free_contains(c, p)) {
+                    /* Free: reachable from free_head. */
+                } else if (c->free_corrupt) {
+                    /* A bare zero-overhead block is only trustworthy as a leak
+                     * while the free list walked cleanly. */
+                    c->unsure += 1;
+                } else {
+                    if (alck_u64_push(&c->reclaim, &c->reclaim_cnt,
+                                      &c->reclaim_cap, p) != 0) return -1;
+                }
+                c->p = p + bs_sz;
+                c->st = ALCK_ST_ARENA_AT;
+                continue;
+            }
+            n = alck_valid_in_use(overhead, p, c->stack_len, bs_sz,
+                                  c->free_arr, c->free_cnt);
+            if (n > 0) {
+                c->p = p + n * bs_sz;  /* valid_in_use bounds p + n*bs <= stack_len */
+                c->st = ALCK_ST_ARENA_AT;
+                continue;
+            }
+            /* Suspicious: prefer a known-free block as resync anchor. */
+            idx = alck_recover_free_upper(c, p);
+            if (idx < c->free_cnt) {
+                uint64_t f = c->free_arr[idx];
+                c->unsure += (f - p) / bs_sz;
+                c->p = f;
+                c->st = ALCK_ST_ARENA_AT;
+                continue;
+            }
+            /* No anchor follows: set up the backward reach DP over
+             * [p, stack_len) (see the non-atomic alck_resync_tail). */
+            span = c->stack_len - p;
+            m64  = span / bs_sz;
+            if (m64 > (uint64_t)ALCK_MAX_RECOVER_REGION
+                || m64 > (uint64_t)SIZE_MAX) {
+                /* Region too large to analyse safely: leave leaked. */
+                c->unsure += span / bs_sz;
+                c->st = ALCK_ST_FINISH;
+                continue;
+            }
+            m = (size_t)m64;  /* m >= 1 since p < stack_len and both are aligned */
+            free(c->reach);
+            c->reach = calloc(m + 1, 1);
+            if (!c->reach) { errno = ENOMEM; return -1; }
+            c->reach[m] = 1;
+            c->reach_m  = m;
+            c->resync_p = p;
+            c->rj       = m - 1;
+            c->st = ALCK_ST_CONSUME_RESYNC;
+            out_op->kind          = BSTACK_GEN_READ;
+            out_op->u.read.offset = c->resync_p + (uint64_t)c->rj * bs_sz;
+            out_op->u.read.buf    = c->oh_buf;
+            out_op->u.read.len    = 8;
+            return 1;
+        }
+
+        case ALCK_ST_CONSUME_RESYNC: {
+            uint64_t overhead = read_le64(c->oh_buf);
+            uint64_t off = c->resync_p + (uint64_t)c->rj * bs_sz;
+            size_t   m, jr;
+            int      found;
+
+            if (overhead == 0) {
+                c->reach[c->rj] = c->reach[c->rj + 1];
+            } else {
+                uint64_t n = alck_valid_in_use(overhead, off, c->stack_len,
+                                               bs_sz, c->free_arr, c->free_cnt);
+                if (n > 0 && c->rj + (size_t)n <= c->reach_m)
+                    c->reach[c->rj] = c->reach[c->rj + (size_t)n];
+                else
+                    c->reach[c->rj] = 0;
+            }
+            if (c->rj != 0) {
+                c->rj -= 1;
+                c->st = ALCK_ST_CONSUME_RESYNC;
+                out_op->kind          = BSTACK_GEN_READ;
+                out_op->u.read.offset = c->resync_p + (uint64_t)c->rj * bs_sz;
+                out_op->u.read.buf    = c->oh_buf;
+                out_op->u.read.len    = 8;
+                return 1;
+            }
+            /* DP complete.  The smallest interior boundary that tiles cleanly to
+             * the tail is a mid-arena gap to resync on; j=0 is excluded (it
+             * would contradict the Suspicious classification that got us here). */
+            m = c->reach_m;
+            found = 0; jr = 0;
+            for (jr = 1; jr < m; jr++) {
+                if (c->reach[jr]) { found = 1; break; }
+            }
+            if (found) {
+                c->unsure += (uint64_t)jr;
+                c->p = c->resync_p + (uint64_t)jr * bs_sz;
+                c->st = ALCK_ST_ARENA_AT;
+                continue;
+            }
+            /* Orphaned tail.  Only safe to discard when the free list is
+             * trusted; otherwise leave it leaked. */
+            if (c->free_corrupt) {
+                c->unsure += (c->stack_len - c->resync_p) / bs_sz;
+            } else {
+                c->has_discard  = 1;
+                c->discard_from = c->resync_p;
+            }
+            c->st = ALCK_ST_FINISH;
+            continue;
+        }
+
+        /* Emit the single permitted mutation: the orphaned-tail discard, as a
+         * NULL-buffer Pop (drops the bytes without reading them back). */
+        case ALCK_ST_FINISH:
+            c->st = ALCK_ST_DONE;
+            if (!c->has_discard) return 0;  /* no write */
+            {
+                uint64_t dlen = c->stack_len - c->discard_from;
+#if UINT64_MAX > SIZE_MAX
+                if (dlen > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
+#endif
+                out_op->kind      = BSTACK_GEN_POP;
+                out_op->u.pop.buf = NULL;
+                out_op->u.pop.len = (size_t)dlen;
+            }
+            return 1;
+
+        case ALCK_ST_DONE:
+        default:
+            return 0;
+        }
+    }
+}
+
+int checked_slab_bstack_allocator_recover(checked_slab_bstack_allocator_t *alloc,
+                                           uint64_t *out_unsure)
+{
+    bstack_t              *bs = alloc->bs;
+    struct alck_recover_ctx c;
+    uint64_t               stack_len;
+    size_t                 i;
+    int                    ret = 0;
+
+    /* Held for the entire call.  Phase-1 reads are serialised against
+     * alloc/dealloc by the bstack write lock inside process_gen; this lock
+     * instead prevents two recover runs from overlapping (which would let both
+     * reclaim the same leaked block and double-link it). */
+    FF_LOCK(alloc);
+
+    /* Cheap early-out hint; the authoritative size is read under the
+     * process_gen lock below via BSTACK_GEN_LEN. */
+    if (bstack_len(bs, &stack_len) != 0) { FF_UNLOCK(alloc); return -1; }
+    if (stack_len <= ALCK_ARENA_START) {
+        if (out_unsure) *out_unsure = 0;
+        FF_UNLOCK(alloc); return 0;
+    }
+
+    memset(&c, 0, sizeof c);
+    c.block_size = alloc->block_size;
+    c.st         = ALCK_ST_READ_LEN;
+
+    if (bstack_process_gen(bs, alck_recover_gen, &c) != 0) {
+        ret = -1; goto done;
+    }
+
+    /* Phase 2: splice reclaimed leaks onto the free list, lock-free.  Each is
+     * unreachable by alloc/dealloc, so its leaked state is stable across the
+     * unlocked gap, and alck_push_free_blocks splices atomically. */
+    for (i = 0; i < c.reclaim_cnt; i++) {
+        if (alck_push_free_blocks(bs, c.reclaim[i], 1, alloc->block_size) != 0) {
+            ret = -1; goto done;
+        }
+    }
+    if (out_unsure) *out_unsure = c.unsure;
+
+done:
+    free(c.free_arr);
+    free(c.reclaim);
+    free(c.reach);
+    FF_UNLOCK(alloc);
+    return ret;
+}
+#else /* !BSTACK_FEATURE_ATOMIC */
 int checked_slab_bstack_allocator_recover(checked_slab_bstack_allocator_t *alloc,
                                            uint64_t *out_unsure)
 {
@@ -4431,6 +4944,7 @@ done:
     FF_UNLOCK(alloc);
     return ret;
 }
+#endif /* BSTACK_FEATURE_ATOMIC */
 
 /* ---- vtable implementations -------------------------------------------- */
 
@@ -4454,15 +4968,13 @@ static int alck_vt_alloc(bstack_allocator_t *base, uint64_t len,
     if (num_blocks == UINT64_MAX) { errno = EINVAL; return -1; } /* overflow */
 
     if (num_blocks == 1) {
-        /* Lock is scoped to the free-list pop only; the tail-extend fallback
-         * below runs without the lock (bstack_extend is internally serialised
-         * and returns a distinct region to each concurrent caller). */
+        /* Free-list pop is lock-free under atomic (single process_gen
+         * sequence); single-threaded otherwise.  The tail-extend fallback below
+         * uses bstack_extend, which is internally serialised and returns a
+         * distinct region to each concurrent caller. */
         uint64_t block_start;
-        int pop_r;
-        FF_LOCK(a);
-        pop_r = alck_pop_and_claim_block(a->bs, 1, a->block_size, &block_start);
-        FF_UNLOCK(a);
-        if (pop_r != 0) return -1;
+        if (alck_pop_and_claim_block(a->bs, 1, a->block_size, &block_start) != 0)
+            return -1;
         if (block_start != ALCK_SENTINEL) {
             out->allocator = base;
             out->offset    = block_start + ALCK_OVERHEAD;
@@ -4544,14 +5056,9 @@ static int alck_vt_dealloc(bstack_allocator_t *base, bstack_slice_t s)
     }
 #endif
 
-    /* Not at tail: push to the free list under the allocator lock. */
-    {
-        int r;
-        FF_LOCK(a);
-        r = alck_push_free_blocks(a->bs, block_start, num_blocks, a->block_size);
-        FF_UNLOCK(a);
-        return r;
-    }
+    /* Not at tail: push to the free list (lock-free under atomic via
+     * cross_exchange; single-threaded otherwise). */
+    return alck_push_free_blocks(a->bs, block_start, num_blocks, a->block_size);
 }
 
 static int alck_vt_realloc(bstack_allocator_t *base, bstack_slice_t s,
@@ -4657,8 +5164,8 @@ static int alck_vt_realloc(bstack_allocator_t *base, bstack_slice_t s,
             }
 
             /* Not at tail (or tail moved under atomic): grow non-tail.
-             * alloc and dealloc each acquire the lock for their own free-list
-             * and tail operations independently. */
+             * alloc and dealloc each handle their own free-list and tail
+             * operations independently. */
             {
                 bstack_slice_t new_s;
                 uint8_t       *tmp;
@@ -4687,18 +5194,15 @@ static int alck_vt_realloc(bstack_allocator_t *base, bstack_slice_t s,
             }
         }
 
-        /* Shrink path (new_n < old_n).  The lock covers the overhead write,
-         * tail check, and non-tail free-list update so those steps are atomic
-         * w.r.t. other threads. */
+        /* Shrink path (new_n < old_n).  Lock-free under atomic: the overhead
+         * write is the commit point, try_discard is atomic, and the non-tail
+         * push splices via cross_exchange.  Single-threaded otherwise. */
         {
             uint64_t delta = old_backing - new_backing;
             uint64_t excess_start;
-            int r;
 #if UINT64_MAX > SIZE_MAX
             if (delta > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
 #endif
-
-            FF_LOCK(a);
 
             /* Overhead is the commit point for both tail and non-tail paths:
              * write it first so a crash after this point leaves an orphaned
@@ -4706,9 +5210,7 @@ static int alck_vt_realloc(bstack_allocator_t *base, bstack_slice_t s,
              * recover() can reclaim, rather than an overhead that claims more
              * blocks than the file contains. */
             if (alck_write_overhead(a->bs, block_start,
-                                    ALCK_IN_USE_BIT | new_n) != 0) {
-                FF_UNLOCK(a); return -1;
-            }
+                                    ALCK_IN_USE_BIT | new_n) != 0) return -1;
 
             /* Tail shrink: try_discard atomically checks tail == sentinel and
              * removes the excess under bstack's write lock, so no other thread
@@ -4718,11 +5220,8 @@ static int alck_vt_realloc(bstack_allocator_t *base, bstack_slice_t s,
             {
                 int ok = 0;
                 if (bstack_try_discard(a->bs, sentinel, (size_t)delta,
-                                       &ok) != 0) {
-                    FF_UNLOCK(a); return -1;
-                }
+                                       &ok) != 0) return -1;
                 if (ok) {
-                    FF_UNLOCK(a);
                     out->allocator = base; out->offset = s.offset;
                     out->len = new_len;
                     return 0;
@@ -4731,14 +5230,9 @@ static int alck_vt_realloc(bstack_allocator_t *base, bstack_slice_t s,
 #else
             {
                 uint64_t cur_tail;
-                if (bstack_len(a->bs, &cur_tail) != 0) {
-                    FF_UNLOCK(a); return -1;
-                }
+                if (bstack_len(a->bs, &cur_tail) != 0) return -1;
                 if (sentinel == cur_tail) {
-                    if (bstack_discard(a->bs, (size_t)delta) != 0) {
-                        FF_UNLOCK(a); return -1;
-                    }
-                    FF_UNLOCK(a);
+                    if (bstack_discard(a->bs, (size_t)delta) != 0) return -1;
                     out->allocator = base; out->offset = s.offset;
                     out->len = new_len;
                     return 0;
@@ -4746,19 +5240,13 @@ static int alck_vt_realloc(bstack_allocator_t *base, bstack_slice_t s,
             }
 #endif
 
-            /* Shrink non-tail: overhead already written (commit point); write
-             * free-list metadata into the excess blocks and repoint free_head. */
-            if (new_n > UINT64_MAX / a->block_size) {
-                FF_UNLOCK(a); errno = EINVAL; return -1;
-            }
+            /* Shrink non-tail: overhead already written (commit point); push the
+             * excess blocks onto the free list (lock-free under atomic). */
+            if (new_n > UINT64_MAX / a->block_size) { errno = EINVAL; return -1; }
             excess_start = block_start + new_n * a->block_size;
-            if (alck_write_free_run(a->bs, excess_start,
-                                    old_n - new_n, a->block_size) != 0) {
-                FF_UNLOCK(a); return -1;
-            }
-            r = alck_write_free_head(a->bs, excess_start);
-            FF_UNLOCK(a);
-            if (r != 0) return -1;
+            if (alck_push_free_blocks(a->bs, excess_start,
+                                      old_n - new_n, a->block_size) != 0)
+                return -1;
             out->allocator = base; out->offset = s.offset; out->len = new_len;
             return 0;
         }
