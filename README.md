@@ -957,7 +957,7 @@ Each free-list mutation is two `BStack` calls: write the next-pointer into the b
 
 Without the `atomic` feature it is **not `Sync`**: free-list mutations require a read then a write of `free_head` as separate `BStack` calls — a TOCTOU race under concurrent `&self` access that can result in two callers receiving the same block.
 
-With the `atomic` feature it **is `Sync`**. An internal mutex serialises all compound operations that span multiple `BStack` calls: free-list pop/push and the tail-length check that precedes any `extend` or `discard`. The tail-path operations themselves use `try_discard` / `try_extend_zeros`, which check-and-act atomically under `BStack`'s own write lock without needing the allocator lock.
+With the `atomic` feature it **is `Sync`** with no allocator-level lock at all. Free-list pop drives a single `BStack::process_gen` sequence that holds `BStack`'s write lock across the read of `free_head`, the read of the popped block's `next` pointer, and the write that advances `free_head` — closing the ABA window a `get`/`cas` pair would leave open. Free-list push splices a single block (or a whole freed run) onto the head with one `BStack::cross_exchange`. Tail grow/shrink use `try_extend_zeros` / `try_discard`, which check-and-act atomically under `BStack`'s own write lock. Every concurrent `&self` operation is therefore safe through `BStack`'s interior mutability alone — no `Mutex`.
 
 #### Constructors
 
@@ -1058,7 +1058,7 @@ Free-list mutations write block payloads before updating `free_head`. The overhe
 
 Without the `atomic` feature it is **not `Sync`**: free-list mutations read then write `free_head` as separate `BStack` calls — a TOCTOU race under concurrent `&self` access.
 
-With the `atomic` feature it **is `Sync`**. An internal mutex serialises all compound operations: free-list pop/push, the tail-length checks preceding `extend` or `discard`, and the `recover` scan. Tail deallocations use `try_discard` (atomically checks tail and removes bytes under `BStack`'s own write lock) without needing the allocator lock. The shrink path acquires the lock before the tail check because the overhead must be written before discarding.
+With the `atomic` feature it **is `Sync`**. `alloc` / `dealloc` / `realloc` take no allocator-level lock: free-list pop uses a single `BStack::process_gen` sequence, free-list push uses `BStack::cross_exchange`, and tail grow/shrink use `try_extend_zeros` / `try_discard` — all check-and-act atomically under `BStack`'s own write lock (the shrink path writes the overhead before the tail check, since the overhead must be committed before discarding). The one retained `Mutex` is held only by `recover`, to keep recovery single-flight (two concurrent runs could otherwise reclaim the same leaked block twice); the recovery scan itself is serialised against alloc/dealloc/realloc by the `BStack` write lock it holds across one `process_gen` sequence, not by the `Mutex`.
 
 #### Constructors
 

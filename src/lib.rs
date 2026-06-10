@@ -394,9 +394,9 @@
 //!   with the `atomic` feature, where an internal `Mutex` serialises AVL tree
 //!   mutations.
 //!
-//! * [`SlabBStackAllocator`] — **Experimental.** Fixed-block slab allocator.  All blocks are
-//!   exactly `block_size` bytes with no per-block header or footer; freed
-//!   blocks are tracked via an intrusive singly-linked free list stored in
+//! * [`SlabBStackAllocator`] — **Experimental.** Fixed-block slab allocator.
+//!   All blocks are exactly `block_size` bytes with no per-block header or footer;
+//!   freed blocks are tracked via an intrusive singly-linked free list stored in
 //!   the first 8 bytes of each free block.  O(1) alloc and dealloc.
 //!   Use [`SlabBStackAllocator::new`] to initialise an empty stack and
 //!   [`SlabBStackAllocator::open`] to reopen an existing one.

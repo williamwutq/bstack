@@ -50,8 +50,11 @@
 //! * [`SlabBStackAllocator`] — a fixed-block slab allocator (requires both
 //!   `alloc` **and** `set` features).  All blocks are exactly `block_size`
 //!   bytes with no per-block overhead; freed blocks form an intrusive
-//!   singly-linked free list.  O(1) alloc and dealloc.  `Send` but not
-//!   `Sync`.  *Experimental.*
+//!   singly-linked free list.  O(1) alloc and dealloc.  `Send` without the
+//!   `atomic` feature (not `Sync`); `Send + Sync` with `atomic`, with no
+//!   allocator-level lock — free-list pop/push use [`BStack::process_gen`] /
+//!   [`BStack::cross_exchange`] and tail grow/shrink use the `try_*` ops.
+//!   *Experimental.*
 //!
 //! * [`CheckedSlabBStackAllocator`] — a crash-recoverable variant of
 //!   [`SlabBStackAllocator`] (requires both `alloc` **and** `set` features).
@@ -63,7 +66,11 @@
 //!   on disk is `data_size + 8`.  [`open`](CheckedSlabBStackAllocator::open)
 //!   calls [`recover`](CheckedSlabBStackAllocator::recover) automatically to
 //!   reclaim leaked blocks and repair orphaned tails from unclean shutdowns.
-//!   `Send` but not `Sync`.  *Experimental.*
+//!   `Send` without the `atomic` feature (not `Sync`); `Send + Sync` with
+//!   `atomic`, where `alloc`/`dealloc`/`realloc` are lock-free (as for
+//!   [`SlabBStackAllocator`]) and an internal `Mutex` keeps
+//!   [`recover`](CheckedSlabBStackAllocator::recover) single-flight.
+//!   *Experimental.*
 //!
 //! * [`BStackByteVec`] — a growable byte (`u8`) vector backed by a
 //!   [`BStack`] allocation (requires both `alloc` **and** `set`).  Mirrors the
