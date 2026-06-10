@@ -315,7 +315,7 @@ impl SlabBStackAllocator {
                 0 => Some(BStackGenOp::Read {
                     offset: Self::FREE_HEAD_OFFSET,
                     // SAFETY: `head_buf` outlives this `process_gen` call.
-                    buf: unsafe { core::mem::transmute::<&mut [u8], _>(&mut head_buf[..]) },
+                    buf: unsafe { core::mem::transmute::<&mut [u8], &mut [u8]>(&mut head_buf[..]) },
                 }),
                 // Step 1: an empty list ends the sequence with no write;
                 // otherwise read the head block's next-pointer.
@@ -328,7 +328,9 @@ impl SlabBStackAllocator {
                         Some(BStackGenOp::Read {
                             offset: head,
                             // SAFETY: `next_buf` outlives this `process_gen` call.
-                            buf: unsafe { core::mem::transmute::<&mut [u8], _>(&mut next_buf[..]) },
+                            buf: unsafe {
+                                core::mem::transmute::<&mut [u8], &mut [u8]>(&mut next_buf[..])
+                            },
                         })
                     }
                 }
@@ -337,7 +339,7 @@ impl SlabBStackAllocator {
                 2 => Some(BStackGenOp::Write {
                     offset: Self::FREE_HEAD_OFFSET,
                     // SAFETY: `next_buf` outlives this `process_gen` call.
-                    data: unsafe { core::mem::transmute::<&[u8], _>(&next_buf[..]) },
+                    data: unsafe { core::mem::transmute::<&[u8], &[u8]>(&next_buf[..]) },
                 }),
                 _ => None,
             };

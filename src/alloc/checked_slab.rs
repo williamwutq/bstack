@@ -9,6 +9,8 @@
 
 use super::{BStackAllocator, BStackSlice};
 use crate::BStack;
+#[cfg(feature = "atomic")]
+use crate::BStackGenOp;
 #[cfg(not(feature = "atomic"))]
 use core::cell::Cell;
 #[cfg(not(feature = "atomic"))]
@@ -101,12 +103,19 @@ const ALCK_MAGIC_PREFIX: [u8; 6] = *b"ALCK\x00\x01";
 /// then write `free_head` as separate [`BStack`] calls — a TOCTOU race under
 /// concurrent `&self` access.
 ///
-/// With the `atomic` feature it **is `Sync`**. An internal [`Mutex`] serialises
-/// compound allocator operations that span multiple [`BStack`] calls (free-list
-/// pop/push and the public [`recover`](Self::recover) scan). Tail grow/shrink
-/// paths use [`BStack::try_extend_zeros`] / [`BStack::try_discard`] to perform
-/// check-and-act atomically under `BStack`'s write lock without holding the
-/// allocator mutex.
+/// With the `atomic` feature it **is `Sync`**. Free-list push and pop —
+/// [`alloc`](Self::alloc), [`dealloc`](Self::dealloc), and the free-list paths
+/// of [`realloc`](Self::realloc) — use [`BStack::cross_exchange`] and
+/// [`BStack::process_gen`] exactly as described for
+/// [`SlabBStackAllocator`](super::SlabBStackAllocator), and need no
+/// allocator-level lock. Tail grow/shrink paths use
+/// [`BStack::try_extend_zeros`] / [`BStack::try_discard`] to perform
+/// check-and-act atomically under `BStack`'s write lock, also without a lock.
+///
+/// An internal [`Mutex`] is retained solely to serialise the multi-step,
+/// read-then-act recovery scan in [`recover`](Self::recover) (and the
+/// automatic `recover` call in [`open`](Self::open)) against concurrent
+/// `&self` access; it plays no part in ordinary alloc/dealloc/realloc.
 ///
 /// ```
 /// fn assert_send<T: Send>() {}
@@ -641,6 +650,98 @@ impl CheckedSlabBStackAllocator {
     /// Advances `free_head` then writes the full block in one call: the overhead
     /// is set to `IN_USE_BIT | num_blocks` and the data bytes are zeroed. A
     /// crash between the two writes merely leaks the detached block.
+    ///
+    /// # `atomic` feature
+    ///
+    /// The read of `free_head`, the read of the popped block's overhead and
+    /// `next` pointer (`data[0..8]`), and the write that advances `free_head`
+    /// run as a single [`BStack::process_gen`] sequence under one held write
+    /// lock — see [`SlabBStackAllocator::pop_free_block`](super::SlabBStackAllocator).
+    /// The final claim write (overhead + zeroed data) happens afterwards on
+    /// the now-detached block, which is exclusively owned by this call.
+    #[cfg(feature = "atomic")]
+    fn pop_and_claim_block(&self, num_blocks: u64) -> io::Result<Option<u64>> {
+        let mut head_buf = [0u8; 8];
+        let mut prefix_buf = [0u8; 16];
+        let mut step = 0usize;
+        let mut head_opt: Option<u64> = None;
+        let mut corrupt: Option<u64> = None;
+
+        self.stack.process_gen(|| {
+            let op = match step {
+                // Step 0: read the current free-list head.
+                0 => Some(BStackGenOp::Read {
+                    offset: Self::FREE_HEAD_OFFSET,
+                    // SAFETY: `head_buf` outlives this `process_gen` call.
+                    buf: unsafe { core::mem::transmute::<&mut [u8], &mut [u8]>(&mut head_buf[..]) },
+                }),
+                // Step 1: an empty list ends the sequence with no write;
+                // otherwise read the head block's overhead and next-pointer.
+                1 => {
+                    let head = u64::from_le_bytes(head_buf);
+                    if head == Self::SENTINEL {
+                        None
+                    } else {
+                        head_opt = Some(head);
+                        Some(BStackGenOp::Read {
+                            offset: head,
+                            // SAFETY: `prefix_buf` outlives this `process_gen` call.
+                            buf: unsafe {
+                                core::mem::transmute::<&mut [u8], &mut [u8]>(&mut prefix_buf[..])
+                            },
+                        })
+                    }
+                }
+                // Step 2: a non-zero overhead means the free list is corrupt —
+                // end the sequence with no write and report the error after.
+                // Otherwise advance free_head to the popped block's next
+                // pointer, still under the lock acquired for step 0's read.
+                2 => {
+                    let overhead = u64::from_le_bytes(prefix_buf[0..8].try_into().unwrap());
+                    if overhead != 0 {
+                        corrupt = Some(overhead);
+                        None
+                    } else {
+                        Some(BStackGenOp::Write {
+                            offset: Self::FREE_HEAD_OFFSET,
+                            // SAFETY: `prefix_buf` outlives this `process_gen` call.
+                            data: unsafe {
+                                core::mem::transmute::<&[u8], &[u8]>(&prefix_buf[8..16])
+                            },
+                        })
+                    }
+                }
+                _ => None,
+            };
+            step += 1;
+            op
+        })?;
+
+        let Some(head) = head_opt else {
+            return Ok(None);
+        };
+        if let Some(overhead) = corrupt {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "free-list block at {head} has non-zero overhead {overhead:#018x}; free list corrupt"
+                ),
+            ));
+        }
+        // Mark in-use and zero data in one write.
+        let mut block_buf = vec![0u8; self.block_size as usize]; // safe: validated in new/open
+        block_buf[..8].copy_from_slice(&(Self::IN_USE_BIT | num_blocks).to_le_bytes());
+        self.stack.set(head, block_buf)?;
+        Ok(Some(head))
+    }
+
+    /// Pop the head block off the free list, mark it in use with `num_blocks`,
+    /// and return its block start offset, or `None` if the list is empty.
+    ///
+    /// Advances `free_head` then writes the full block in one call: the overhead
+    /// is set to `IN_USE_BIT | num_blocks` and the data bytes are zeroed. A
+    /// crash between the two writes merely leaks the detached block.
+    #[cfg(not(feature = "atomic"))]
     fn pop_and_claim_block(&self, num_blocks: u64) -> io::Result<Option<u64>> {
         let head = u64::from_le_bytes(read_bstack!(self.stack, Self::FREE_HEAD_OFFSET => u64));
         if head == Self::SENTINEL {
@@ -667,16 +768,28 @@ impl CheckedSlabBStackAllocator {
     }
 
     /// Write the block prefixes for a run of `count` contiguous free blocks
-    /// starting at `first_block`, linking them into a chain whose tail points at
-    /// the current `free_head`. Does **not** update `free_head`.
+    /// starting at `first_block`, linking them into a chain. All blocks'
+    /// overhead is cleared (transitioning a live allocation into free blocks)
+    /// and `data[0..8]` is set to the next block's offset.
     ///
-    /// Each block's overhead is set to zero and its `data[0..8]` to the next
-    /// block's offset (or the existing `free_head` for the last block). All
-    /// other data bytes in the run are zeroed. The single bulk
-    /// [`BStack::set`] makes this crash-safe: until `free_head` is repointed the
-    /// whole run is simply unreachable.
+    /// # `atomic` feature
+    ///
+    /// The last block's `data[0..8]` is set to the placeholder `first_block`;
+    /// [`push_free_blocks`](Self::push_free_blocks) splices the whole run onto
+    /// `free_head` with [`BStack::cross_exchange`] afterwards. Does **not**
+    /// touch `free_head`.
+    ///
+    /// # non-`atomic`
+    ///
+    /// The last block's `data[0..8]` is set to the current `free_head`, whose
+    /// value the caller then writes into `free_head` directly. Does **not**
+    /// update `free_head`.
+    ///
+    /// The single bulk [`BStack::set`] makes this crash-safe: until the run is
+    /// spliced in (or `free_head` is repointed), it is simply unreachable.
     fn write_free_run(&self, first_block: u64, count: u64) -> io::Result<()> {
         debug_assert!(count > 0);
+        #[cfg(not(feature = "atomic"))]
         let old_head = read_bstack!(self.stack, Self::FREE_HEAD_OFFSET => u64);
         let total = count.checked_mul(self.block_size).ok_or_else(|| {
             io::Error::new(
@@ -720,7 +833,16 @@ impl CheckedSlabBStackAllocator {
                     })?;
                 next.to_le_bytes()
             } else {
-                old_head
+                #[cfg(feature = "atomic")]
+                {
+                    // Placeholder: replaced with the old free_head by
+                    // cross_exchange in push_free_blocks.
+                    first_block.to_le_bytes()
+                }
+                #[cfg(not(feature = "atomic"))]
+                {
+                    old_head
+                }
             };
             // Overhead at buf[base..base+8] stays zero; next pointer at data[0..8].
             buf[base + 8..base + 16].copy_from_slice(&next_bytes);
@@ -731,13 +853,46 @@ impl CheckedSlabBStackAllocator {
     /// Prepend `count` contiguous blocks starting at `first_block` to the free
     /// list. The blocks' overhead bytes are cleared as part of the operation,
     /// so this also transitions a live allocation into free blocks.
+    ///
+    /// # `atomic` feature
+    ///
+    /// [`write_free_run`](Self::write_free_run) writes the chain with the last
+    /// block's `data[0..8]` set to the placeholder `first_block`. A single
+    /// [`BStack::cross_exchange`] then atomically swaps that slot with
+    /// `free_head`: `free_head` becomes `first_block` (the new head) and the
+    /// last block's next-pointer becomes the old head — splicing the whole run
+    /// in under one write lock, lock-free. For `count == 1`, the first and last
+    /// block are the same, exactly mirroring
+    /// [`SlabBStackAllocator::push_free_block`](super::SlabBStackAllocator).
     fn push_free_blocks(&self, first_block: u64, count: u64) -> io::Result<()> {
         if count == 0 {
             return Ok(());
         }
         self.write_free_run(first_block, count)?;
-        self.stack
-            .set(Self::FREE_HEAD_OFFSET, first_block.to_le_bytes())
+
+        #[cfg(feature = "atomic")]
+        {
+            let last_block = first_block
+                .checked_add((count - 1).checked_mul(self.block_size).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "last free-list offset overflows u64",
+                    )
+                })?)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "last block offset overflows u64",
+                    )
+                })?;
+            self.stack
+                .cross_exchange(last_block + Self::OVERHEAD, Self::FREE_HEAD_OFFSET, 8)
+        }
+        #[cfg(not(feature = "atomic"))]
+        {
+            self.stack
+                .set(Self::FREE_HEAD_OFFSET, first_block.to_le_bytes())
+        }
     }
 }
 
@@ -785,29 +940,21 @@ impl BStackAllocator for CheckedSlabBStackAllocator {
 
         let num_blocks = self.blocks_needed(len)?;
 
-        if num_blocks == 1 {
-            // Lock is scoped to the free-list pop only; the tail-extend fallback
-            // below runs without the lock (see comment there).
-            let free_block = {
-                #[cfg(feature = "atomic")]
-                let _guard = self.lock.lock().unwrap();
-                self.pop_and_claim_block(1)?
-                // guard dropped here
-            };
-            if let Some(block_start) = free_block {
-                // SAFETY:
-                // 1. No overflow: `block_start` is a valid in-bounds arena offset;
-                //    `block_start + OVERHEAD + len ≤ block_start + block_size ≤ stack_len ≤ u64::MAX`
-                //    because `blocks_needed(len) == 1` implies `len ≤ data_size = block_size − OVERHEAD`.
-                // 2. In bounds: the block was just popped from the free list and
-                //    marked in-use by `pop_and_claim_block`; the full `block_size`
-                //    region is part of the arena and present in the stack payload.
-                // 3. Alloc origin: the slice spans exactly the data region of this
-                //    allocation and may safely be passed to `dealloc`/`realloc`.
-                return Ok(unsafe {
-                    BStackSlice::from_raw_parts(self, block_start + Self::OVERHEAD, len)
-                });
-            }
+        if num_blocks == 1
+            && let Some(block_start) = self.pop_and_claim_block(1)?
+        {
+            // SAFETY:
+            // 1. No overflow: `block_start` is a valid in-bounds arena offset;
+            //    `block_start + OVERHEAD + len ≤ block_start + block_size ≤ stack_len ≤ u64::MAX`
+            //    because `blocks_needed(len) == 1` implies `len ≤ data_size = block_size − OVERHEAD`.
+            // 2. In bounds: the block was just popped from the free list and
+            //    marked in-use by `pop_and_claim_block`; the full `block_size`
+            //    region is part of the arena and present in the stack payload.
+            // 3. Alloc origin: the slice spans exactly the data region of this
+            //    allocation and may safely be passed to `dealloc`/`realloc`.
+            return Ok(unsafe {
+                BStackSlice::from_raw_parts(self, block_start + Self::OVERHEAD, len)
+            });
         }
 
         // Tail-extend path (single-block with no free block, and all multi-block
@@ -919,9 +1066,7 @@ impl BStackAllocator for CheckedSlabBStackAllocator {
             return self.stack.discard(backing);
         }
 
-        // Not at tail: push to the free list under the allocator lock.
-        #[cfg(feature = "atomic")]
-        let _guard = self.lock.lock().unwrap();
+        // Not at tail: push to the free list.
         self.push_free_blocks(block_start, num_blocks)
     }
 
@@ -1078,8 +1223,8 @@ impl BStackAllocator for CheckedSlabBStackAllocator {
             }
 
             // Not at tail (or tail moved under atomic): grow non-tail.
-            // alloc and dealloc each acquire the lock for their own free-list and
-            // tail operations independently.
+            // alloc and dealloc each handle their own free-list and tail
+            // operations independently.
             let new_slice = self.alloc(new_len)?;
             let data = slice.read()?;
             new_slice.write(&data)?;
@@ -1087,11 +1232,7 @@ impl BStackAllocator for CheckedSlabBStackAllocator {
             return Ok(new_slice);
         }
 
-        // Shrink path (new_n < old_n). Lock covers the overhead write, tail
-        // check, and non-tail free-list update.
-        #[cfg(feature = "atomic")]
-        let _guard = self.lock.lock().unwrap();
-
+        // Shrink path (new_n < old_n).
         // Overhead is the commit point for both tail and non-tail paths: write
         // it first so a crash after this point leaves an orphaned (but safely
         // unreferenced) tail region or leaked blocks that recover() can reclaim,
@@ -1151,9 +1292,7 @@ impl BStackAllocator for CheckedSlabBStackAllocator {
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "free start overflows u64")
             })?;
-        self.write_free_run(excess_start, old_n - new_n)?;
-        self.stack
-            .set(Self::FREE_HEAD_OFFSET, excess_start.to_le_bytes())?;
+        self.push_free_blocks(excess_start, old_n - new_n)?;
         // SAFETY:
         // 1. No overflow: slice.start() + new_len ≤ block_start + OVERHEAD + new_n * block_size − OVERHEAD ≤ u64::MAX
         //    because new_n * block_size ≤ old_backing ≤ stack_len.
