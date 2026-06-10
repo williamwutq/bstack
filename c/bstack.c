@@ -1868,6 +1868,55 @@ int bstack_process_gen(bstack_t *bs,
             BS_WRUNLOCK(bs);
             return 0;
         }
+        case BSTACK_GEN_PUSH: {
+            const uint8_t *data = op.u.push.data;
+            size_t   len  = op.u.push.len;
+            if (len > 0) {
+                uint64_t raw_size_now = HEADER_SIZE + data_size;
+                if (plat_pwrite(bs->fd, data, len, raw_size_now) != 0) {
+                    plat_ftruncate(bs->fd, raw_size_now);
+                    goto fail_unlock;
+                }
+                uint64_t new_len = data_size + (uint64_t)len;
+                if (write_committed_len(bs->fd, new_len) != 0 ||
+                    plat_durable_sync(bs->fd) != 0)
+                {
+                    /* Rollback: remove written data and reset committed
+                     * length. */
+                    plat_ftruncate(bs->fd, raw_size_now);
+                    write_committed_len(bs->fd, data_size);
+                    goto fail_unlock;
+                }
+            }
+            BS_WRUNLOCK(bs);
+            return 0;
+        }
+        case BSTACK_GEN_POP: {
+            uint8_t *buf = op.u.pop.buf;
+            size_t   len = op.u.pop.len;
+            if ((uint64_t)len > data_size) {
+                BS_WRUNLOCK(bs); errno = EINVAL; return -1;
+            }
+            uint64_t new_len = data_size - (uint64_t)len;
+            if (new_len < locked) {
+                BS_WRUNLOCK(bs); errno = EINVAL; return -1;
+            }
+            if (len > 0) {
+                uint64_t read_offset = HEADER_SIZE + new_len;
+                if (plat_pread(bs->fd, buf, len, read_offset) != 0)
+                    goto fail_unlock;
+                if (plat_ftruncate(bs->fd, HEADER_SIZE + new_len) != 0 ||
+                    write_committed_len(bs->fd, new_len) != 0 ||
+                    plat_durable_sync(bs->fd) != 0)
+                    goto fail_unlock;
+            }
+            BS_WRUNLOCK(bs);
+            return 0;
+        }
+        case BSTACK_GEN_LEN: {
+            *op.u.len.out = data_size;
+            break;
+        }
         default:
             BS_WRUNLOCK(bs);
             errno = EINVAL;

@@ -4553,6 +4553,192 @@ mod atomic_tests {
 
     #[cfg(all(feature = "set", feature = "atomic"))]
     #[test]
+    fn process_gen_push_appends_and_ends_sequence() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        let mut calls = 0usize;
+        s.process_gen(|| {
+            calls += 1;
+            match calls {
+                1 => Some(BStackGenOp::Push { data: b"world" }),
+                _ => Some(BStackGenOp::Push { data: b"NOPE!" }),
+            }
+        })
+        .unwrap();
+        assert_eq!(calls, 1, "Push must end the sequence, like Write");
+        assert_eq!(s.len().unwrap(), 10);
+        assert_eq!(s.peek(0).unwrap(), b"helloworld");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn process_gen_push_empty_data_is_noop_and_ends_sequence() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        s.process_gen(|| Some(BStackGenOp::Push { data: b"" }))
+            .unwrap();
+        assert_eq!(s.len().unwrap(), 5);
+        assert_eq!(s.peek(0).unwrap(), b"hello");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn process_gen_pop_removes_and_ends_sequence() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        let mut buf = [0u8; 5];
+        let mut calls = 0usize;
+        s.process_gen(|| {
+            calls += 1;
+            match calls {
+                // SAFETY: `buf` outlives this whole `process_gen` call.
+                1 => Some(BStackGenOp::Pop {
+                    buf: unsafe { core::mem::transmute::<&mut [u8], _>(&mut buf[..]) },
+                }),
+                _ => Some(BStackGenOp::Write {
+                    offset: 0,
+                    data: b"NOPE!",
+                }),
+            }
+        })
+        .unwrap();
+        assert_eq!(calls, 1, "Pop must end the sequence, like Write");
+        assert_eq!(&buf, b"world");
+        assert_eq!(s.len().unwrap(), 5);
+        assert_eq!(s.peek(0).unwrap(), b"hello");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn process_gen_pop_zero_is_noop_and_ends_sequence() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        s.process_gen(|| Some(BStackGenOp::Pop { buf: &mut [] }))
+            .unwrap();
+        assert_eq!(s.len().unwrap(), 5);
+        assert_eq!(s.peek(0).unwrap(), b"hello");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn process_gen_pop_exceeds_payload_returns_error() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hi").unwrap();
+        let mut buf = [0u8; 10];
+        let err = s
+            .process_gen(|| {
+                // SAFETY: `buf` outlives this whole `process_gen` call.
+                Some(BStackGenOp::Pop {
+                    buf: unsafe { core::mem::transmute::<&mut [u8], _>(&mut buf[..]) },
+                })
+            })
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(s.len().unwrap(), 2);
+        assert_eq!(s.peek(0).unwrap(), b"hi");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn process_gen_pop_below_locked_returns_error() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        s.lock_up_to(8).unwrap();
+        let mut buf = [0u8; 5];
+        let err = s
+            .process_gen(|| {
+                // SAFETY: `buf` outlives this whole `process_gen` call.
+                Some(BStackGenOp::Pop {
+                    buf: unsafe { core::mem::transmute::<&mut [u8], _>(&mut buf[..]) },
+                })
+            })
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(s.len().unwrap(), 10);
+        assert_eq!(s.peek(0).unwrap(), b"helloworld");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn process_gen_len_reports_current_size_and_continues() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        let mut size = 0u64;
+        let mut calls = 0usize;
+        s.process_gen(|| {
+            calls += 1;
+            match calls {
+                // SAFETY: `size` outlives this whole `process_gen` call.
+                1 => Some(BStackGenOp::Len {
+                    out: unsafe { core::mem::transmute::<&mut u64, _>(&mut size) },
+                }),
+                _ => None,
+            }
+        })
+        .unwrap();
+        assert_eq!(calls, 2, "Len must not end the sequence, unlike Write");
+        assert_eq!(size, 10);
+        assert_eq!(s.len().unwrap(), 10);
+        assert_eq!(s.peek(0).unwrap(), b"helloworld");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn process_gen_len_informs_pop_size() {
+        use crate::BStackGenOp;
+        // Layout: [count: u64 LE]["world"] — pop the trailing "world" whose
+        // length is only known once `Len` has reported the current size.
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&8u64.to_le_bytes());
+        payload.extend_from_slice(b"world");
+        s.push(&payload).unwrap();
+
+        let mut size = 0u64;
+        let mut buf = Vec::new();
+        let mut step = 0usize;
+        s.process_gen(|| {
+            let r = match step {
+                // SAFETY: `size` outlives this whole `process_gen` call.
+                0 => Some(BStackGenOp::Len {
+                    out: unsafe { core::mem::transmute::<&mut u64, _>(&mut size) },
+                }),
+                1 => {
+                    let n = (size - 8) as usize;
+                    buf = vec![0u8; n];
+                    // SAFETY: `buf` outlives this whole `process_gen` call.
+                    Some(BStackGenOp::Pop {
+                        buf: unsafe { core::mem::transmute::<&mut [u8], _>(&mut buf[..]) },
+                    })
+                }
+                _ => None,
+            };
+            step += 1;
+            r
+        })
+        .unwrap();
+        assert_eq!(size, 13);
+        assert_eq!(buf, b"world");
+        assert_eq!(s.len().unwrap(), 8);
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
     fn process_gen_persists_across_reopen() {
         use crate::BStackGenOp;
         let (s, p) = mk_stack();

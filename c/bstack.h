@@ -382,6 +382,15 @@ typedef enum {
     /* Atomically exchange u.swap.len bytes at u.swap.a_offset with
      * u.swap.len bytes at u.swap.b_offset, ending the sequence. */
     BSTACK_GEN_SWAP,
+    /* Append u.push.len bytes from u.push.data to the end of the file,
+     * growing the payload, and ending the sequence. */
+    BSTACK_GEN_PUSH,
+    /* Remove the last u.pop.len bytes from the end of the file into
+     * u.pop.buf, shrinking the payload, and ending the sequence. */
+    BSTACK_GEN_POP,
+    /* Write the current logical payload size into *u.len.out, then call gen
+     * again — does not end the sequence. */
+    BSTACK_GEN_LEN,
 } bstack_gen_op_kind_t;
 
 /*
@@ -397,10 +406,19 @@ typedef enum {
  * - BSTACK_GEN_SWAP: atomically exchange u.swap.len bytes at u.swap.a_offset
  *   with u.swap.len bytes at u.swap.b_offset, ending the sequence.  The
  *   regions must not overlap.
+ * - BSTACK_GEN_PUSH: append u.push.len bytes from u.push.data to the end of
+ *   the file, growing the payload, and ending the sequence — the in-sequence
+ *   equivalent of bstack_push.
+ * - BSTACK_GEN_POP: remove the last u.pop.len bytes from the end of the file
+ *   into u.pop.buf, shrinking the payload, and ending the sequence — the
+ *   in-sequence equivalent of bstack_pop.
+ * - BSTACK_GEN_LEN: write the current logical payload size into
+ *   *u.len.out and call gen again — the in-sequence equivalent of
+ *   bstack_len.  Does not end the sequence.
  *
- * BSTACK_GEN_WRITE and BSTACK_GEN_SWAP are the only mutating kinds — exactly
- * one is permitted per bstack_process_gen call, and either ends the sequence
- * immediately.
+ * BSTACK_GEN_WRITE, BSTACK_GEN_SWAP, BSTACK_GEN_PUSH, and BSTACK_GEN_POP are
+ * the only mutating kinds — exactly one is permitted per bstack_process_gen
+ * call, and any one of them ends the sequence immediately.
  *
  * Only available when compiled with both -DBSTACK_FEATURE_SET and
  * -DBSTACK_FEATURE_ATOMIC.
@@ -423,6 +441,17 @@ typedef struct {
             uint64_t b_offset;
             uint64_t len;
         } swap;
+        struct {
+            const uint8_t *data;
+            size_t   len;
+        } push;
+        struct {
+            uint8_t *buf;
+            size_t   len;
+        } pop;
+        struct {
+            uint64_t *out;
+        } len;
     } u;
 } bstack_gen_op_t;
 
@@ -497,6 +526,18 @@ int bstack_process(bstack_t *bs, uint64_t start, uint64_t end,
  *   the in-sequence equivalent of bstack_cross_exchange, useful when a swap
  *   target is only known once an earlier read has resolved it (e.g. "read the
  *   free-list head, then splice this block in as the new head").
+ * - Returning 1 with *out_op set to BSTACK_GEN_PUSH appends u.push.data to
+ *   the end of the file, growing the payload, and ends the sequence; gen is
+ *   not called again — the in-sequence equivalent of bstack_push.
+ * - Returning 1 with *out_op set to BSTACK_GEN_POP removes the last
+ *   u.pop.len bytes from the end of the file into u.pop.buf, shrinking the
+ *   payload, and ends the sequence; gen is not called again — the
+ *   in-sequence equivalent of bstack_pop.
+ * - Returning 1 with *out_op set to BSTACK_GEN_LEN writes the current logical
+ *   payload size into *u.len.out and calls gen again — the in-sequence
+ *   equivalent of bstack_len, useful when a later step's offset or length
+ *   depends on the current payload size (e.g. "read the size, then read the
+ *   last element").
  * - Returning 0 ends the sequence without writing anything — useful when the
  *   reads alone inform a decision, including the decision to change nothing.
  * - Returning -1 aborts the operation; errno must be set by gen.
@@ -506,17 +547,21 @@ int bstack_process(bstack_t *bs, uint64_t start, uint64_t end,
  * guarantee that bstack_get_batched_gen followed by a separate bstack_cas
  * cannot provide, since the two separate lock acquisitions leave an ABA
  * window.  The mutated region(s) need not overlap any region that was read.
- * The file size is never changed; bstack_process_gen does not support
- * push or pop.
+ * BSTACK_GEN_PUSH and BSTACK_GEN_POP are the only steps that change the file
+ * size.
  *
  * Reads of the locked region [0, bstack_locked_len()) are permitted, matching
  * bstack_get.  Write and swap ranges that touch the locked region are
- * rejected, matching bstack_set and bstack_cross_exchange.
+ * rejected, matching bstack_set and bstack_cross_exchange.  A pop that would
+ * shrink the payload below bstack_locked_len() is rejected, matching
+ * bstack_pop.
  *
  * Returns EINVAL if any offset + len overflows uint64_t, if a read, write, or
  * swap range exceeds the current payload size, if the two swap regions
- * overlap, or if a write or swap range overlaps the locked region
- * [0, bstack_locked_len()).  Returns -1 (errno set) if gen returns -1, or if
+ * overlap, if a write or swap range overlaps the locked region
+ * [0, bstack_locked_len()), if a pop removes more bytes than the current
+ * payload size, or if a pop would shrink the payload below
+ * bstack_locked_len().  Returns -1 (errno set) if gen returns -1, or if
  * an I/O error occurs.
  *
  * Only available when compiled with both -DBSTACK_FEATURE_SET and
