@@ -481,9 +481,6 @@ impl CheckedSlabBStackAllocator {
         let mut reclaim: Vec<u64> = Vec::new();
         let mut unsure: u64 = 0;
         let mut discard_from: Option<u64> = None;
-        // Set if the chosen tail discard is too large to represent on this
-        // platform; surfaced as an error once the borrow of the buffers ends.
-        let mut size_err = false;
 
         // Resume points for the pull-driven `process_gen` state machine. Each
         // variant carries the cursor it operates on; shared working state
@@ -513,8 +510,8 @@ impl CheckedSlabBStackAllocator {
         let mut resync_p: u64 = 0;
         let mut rj: usize = 0;
 
-        // Buffers filled by `Len`/`Read`/`Pop`; declared here so they outlive
-        // the `process_gen` borrow. The transmutes detach the borrow from these
+        // Buffers filled by `Len`/`Read`; declared here so they outlive the
+        // `process_gen` borrow. The transmutes detach the borrow from these
         // locals (see `pop_and_claim_block` for the same idiom); each is safe
         // because the local outlives the call and is never aliased while an op
         // holds the reference — `process_gen` resolves each op fully before it
@@ -523,7 +520,6 @@ impl CheckedSlabBStackAllocator {
         let mut head_buf = [0u8; 8];
         let mut node_buf = [0u8; 16];
         let mut oh_buf = [0u8; 8];
-        let mut pop_buf: Vec<u8> = Vec::new();
 
         self.stack.process_gen(|| {
             loop {
@@ -711,41 +707,19 @@ impl CheckedSlabBStackAllocator {
                         continue;
                     }
                     // Emit the single permitted mutation: the tail discard.
+                    // `Discard` drops the bytes without reading them, so no
+                    // throwaway buffer is needed.
                     St::Finish => {
                         // No tail discard chosen: end the sequence with no write.
                         let t = discard_from?;
-                        match usize::try_from(stack_len - t) {
-                            Ok(n) => {
-                                pop_buf = vec![0u8; n];
-                                st = St::Done;
-                                return Some(BStackGenOp::Pop {
-                                    // SAFETY: `pop_buf` outlives this call and is
-                                    // not touched again before the sequence ends.
-                                    buf: unsafe {
-                                        core::mem::transmute::<&mut [u8], &mut [u8]>(
-                                            &mut pop_buf[..],
-                                        )
-                                    },
-                                });
-                            }
-                            Err(_) => {
-                                size_err = true;
-                                return None;
-                            }
-                        }
+                        st = St::Done;
+                        return Some(BStackGenOp::Discard { len: stack_len - t });
                     }
-                    // `Pop` is terminal, so this is defensive only.
+                    // `Discard` is terminal, so this is defensive only.
                     St::Done => return None,
                 }
             }
         })?;
-
-        if size_err {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "orphaned tail size exceeds platform pointer size",
-            ));
-        }
 
         // Phase 2: splice reclaimed leaks onto the free list, lock-free. Each
         // block is unreachable by alloc/dealloc, so its leaked state is stable
