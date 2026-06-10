@@ -1744,6 +1744,142 @@ fail_unlock:
     return -1;
 }
 
+int bstack_process_gen(bstack_t *bs,
+                       int (*gen)(bstack_gen_op_t *out_op, void *ctx),
+                       void *ctx)
+{
+    BS_WRLOCK(bs);
+
+    uint64_t raw_size;
+    if (file_size(bs->fd, &raw_size) != 0)
+        goto fail_unlock;
+    uint64_t data_size = raw_size - HEADER_SIZE;
+
+    /* Load locked under the write lock (see bstack_set for rationale). */
+    uint64_t locked = ATOMIC_LOAD_ACQUIRE(&bs->locked);
+
+    for (;;) {
+        bstack_gen_op_t op;
+        int r = gen(&op, ctx);
+        if (r == 0) {
+            BS_WRUNLOCK(bs);
+            return 0;
+        }
+        if (r < 0)
+            goto fail_unlock;
+
+        switch (op.kind) {
+        case BSTACK_GEN_READ: {
+            uint64_t offset = op.u.read.offset;
+            size_t   len    = op.u.read.len;
+            if ((uint64_t)len > UINT64_MAX - offset) {
+                BS_WRUNLOCK(bs); errno = EINVAL; return -1;
+            }
+            uint64_t end = offset + (uint64_t)len;
+            if (end > data_size) {
+                BS_WRUNLOCK(bs); errno = EINVAL; return -1;
+            }
+            if (len > 0) {
+                /* Fast path: locked bytes are immutable, so they can be
+                 * served from the cache instead of a pread — mirroring how
+                 * bstack_get treats reads of the locked region. */
+                if (end <= locked && bs->cache_enabled) {
+                    CACHE_LOCK(bs);
+                    memcpy(op.u.read.buf, bs->cache_buf + offset, len);
+                    CACHE_UNLOCK(bs);
+                } else if (plat_pread(bs->fd, op.u.read.buf, len,
+                                       HEADER_SIZE + offset) != 0) {
+                    goto fail_unlock;
+                }
+            }
+            break;
+        }
+        case BSTACK_GEN_WRITE: {
+            uint64_t offset = op.u.write.offset;
+            size_t   len    = op.u.write.len;
+            if ((uint64_t)len > UINT64_MAX - offset) {
+                BS_WRUNLOCK(bs); errno = EINVAL; return -1;
+            }
+            uint64_t end = offset + (uint64_t)len;
+            if (offset < locked) {
+                BS_WRUNLOCK(bs); errno = EINVAL; return -1;
+            }
+            if (end > data_size) {
+                BS_WRUNLOCK(bs); errno = EINVAL; return -1;
+            }
+            if (len > 0) {
+                if (plat_pwrite(bs->fd, op.u.write.data, len,
+                                HEADER_SIZE + offset) != 0)
+                    goto fail_unlock;
+                if (plat_durable_sync(bs->fd) != 0)
+                    goto fail_unlock;
+            }
+            BS_WRUNLOCK(bs);
+            return 0;
+        }
+        case BSTACK_GEN_SWAP: {
+            uint64_t a_offset = op.u.swap.a_offset;
+            uint64_t b_offset = op.u.swap.b_offset;
+            uint64_t len      = op.u.swap.len;
+            if (len > UINT64_MAX - a_offset || len > UINT64_MAX - b_offset) {
+                BS_WRUNLOCK(bs); errno = EINVAL; return -1;
+            }
+            uint64_t a_end = a_offset + len;
+            uint64_t b_end = b_offset + len;
+
+            if (len > 0) {
+                uint64_t lo = a_offset < b_offset ? a_offset : b_offset;
+                uint64_t hi = a_offset < b_offset ? b_offset : a_offset;
+                if (lo + len > hi) {
+                    BS_WRUNLOCK(bs); errno = EINVAL; return -1;
+                }
+            }
+            if (a_offset < locked || b_offset < locked) {
+                BS_WRUNLOCK(bs); errno = EINVAL; return -1;
+            }
+            if (a_end > data_size || b_end > data_size) {
+                BS_WRUNLOCK(bs); errno = EINVAL; return -1;
+            }
+
+            if (len > 0) {
+#if UINT64_MAX > SIZE_MAX
+                if (len > (uint64_t)SIZE_MAX) {
+                    BS_WRUNLOCK(bs); errno = EINVAL; return -1;
+                }
+#endif
+                uint8_t *buf_a = (uint8_t *)malloc((size_t)len);
+                if (!buf_a) goto fail_unlock;
+                uint8_t *buf_b = (uint8_t *)malloc((size_t)len);
+                if (!buf_b) { free(buf_a); goto fail_unlock; }
+
+                if (plat_pread(bs->fd,  buf_a, (size_t)len, HEADER_SIZE + a_offset) != 0 ||
+                    plat_pread(bs->fd,  buf_b, (size_t)len, HEADER_SIZE + b_offset) != 0 ||
+                    plat_pwrite(bs->fd, buf_b, (size_t)len, HEADER_SIZE + a_offset) != 0 ||
+                    plat_pwrite(bs->fd, buf_a, (size_t)len, HEADER_SIZE + b_offset) != 0 ||
+                    plat_durable_sync(bs->fd) != 0)
+                {
+                    free(buf_a);
+                    free(buf_b);
+                    goto fail_unlock;
+                }
+                free(buf_a);
+                free(buf_b);
+            }
+            BS_WRUNLOCK(bs);
+            return 0;
+        }
+        default:
+            BS_WRUNLOCK(bs);
+            errno = EINVAL;
+            return -1;
+        }
+    }
+
+fail_unlock:
+    { int sv = errno; BS_WRUNLOCK(bs); errno = sv; }
+    return -1;
+}
+
 int bstack_cross_exchange(bstack_t *bs, uint64_t a, uint64_t b, uint64_t n)
 {
     if (n > UINT64_MAX - a) { errno = EINVAL; return -1; }

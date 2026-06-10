@@ -28,7 +28,7 @@
  * bstack_set / bstack_zero / bstack_atrunc / bstack_splice /
  * bstack_try_extend / bstack_try_extend_zeros / bstack_try_discard(s, n>0) /
  * bstack_swap / bstack_cas / bstack_replace / bstack_process /
- * bstack_cross_exchange / bstack_copy /
+ * bstack_process_gen / bstack_cross_exchange / bstack_copy /
  * bstack_eq_crds / bstack_ne_crds /
  * bstack_masked_eq_crds / bstack_masked_ne_crds
  * hold a write lock.  bstack_try_discard(s, 0) holds a read lock.
@@ -50,8 +50,9 @@
  *   bstack_try_extend, bstack_try_extend_zeros, bstack_try_discard,
  *   bstack_replace, bstack_get_batched, and bstack_get_batched_gen.  Both
  *   flags together also enable bstack_swap, bstack_cas, bstack_process,
- *   bstack_cross_exchange, bstack_copy, bstack_eq_crds, bstack_ne_crds,
- *   bstack_masked_eq_crds, and bstack_masked_ne_crds.
+ *   bstack_process_gen, bstack_gen_op_t, bstack_cross_exchange, bstack_copy,
+ *   bstack_eq_crds, bstack_ne_crds, bstack_masked_eq_crds, and
+ *   bstack_masked_ne_crds.
  */
 
 typedef struct bstack bstack_t;
@@ -365,6 +366,67 @@ int bstack_get_batched_gen(bstack_t *bs,
 
 #if defined(BSTACK_FEATURE_ATOMIC) && defined(BSTACK_FEATURE_SET)
 /*
+ * Discriminant for bstack_gen_op_t — identifies which member of the union
+ * is populated.
+ *
+ * Only available when compiled with both -DBSTACK_FEATURE_SET and
+ * -DBSTACK_FEATURE_ATOMIC.
+ */
+typedef enum {
+    /* Read u.read.len bytes starting at logical u.read.offset into
+     * u.read.buf. */
+    BSTACK_GEN_READ,
+    /* Write u.write.len bytes from u.write.data to logical u.write.offset,
+     * ending the sequence. */
+    BSTACK_GEN_WRITE,
+    /* Atomically exchange u.swap.len bytes at u.swap.a_offset with
+     * u.swap.len bytes at u.swap.b_offset, ending the sequence. */
+    BSTACK_GEN_SWAP,
+} bstack_gen_op_kind_t;
+
+/*
+ * A request to read from, or write to, a region of the payload, yielded by
+ * the generator callback passed to bstack_process_gen.
+ *
+ * kind selects which member of u is populated:
+ *
+ * - BSTACK_GEN_READ: read u.read.len bytes starting at logical u.read.offset
+ *   into u.read.buf.
+ * - BSTACK_GEN_WRITE: write u.write.len bytes from u.write.data to logical
+ *   u.write.offset, ending the sequence.
+ * - BSTACK_GEN_SWAP: atomically exchange u.swap.len bytes at u.swap.a_offset
+ *   with u.swap.len bytes at u.swap.b_offset, ending the sequence.  The
+ *   regions must not overlap.
+ *
+ * BSTACK_GEN_WRITE and BSTACK_GEN_SWAP are the only mutating kinds — exactly
+ * one is permitted per bstack_process_gen call, and either ends the sequence
+ * immediately.
+ *
+ * Only available when compiled with both -DBSTACK_FEATURE_SET and
+ * -DBSTACK_FEATURE_ATOMIC.
+ */
+typedef struct {
+    bstack_gen_op_kind_t kind;
+    union {
+        struct {
+            uint64_t offset;
+            uint8_t *buf;
+            size_t   len;
+        } read;
+        struct {
+            uint64_t offset;
+            const uint8_t *data;
+            size_t   len;
+        } write;
+        struct {
+            uint64_t a_offset;
+            uint64_t b_offset;
+            uint64_t len;
+        } swap;
+    } u;
+} bstack_gen_op_t;
+
+/*
  * Atomically read len bytes at logical offset into old_buf and overwrite
  * them with new_buf.  The file size is never changed.
  *
@@ -416,6 +478,53 @@ int bstack_cas(bstack_t *bs, uint64_t offset,
 int bstack_process(bstack_t *bs, uint64_t start, uint64_t end,
                    int (*cb)(uint8_t *buf, size_t len, void *ctx),
                    void *ctx);
+
+/*
+ * Run a sequence of dependent reads, optionally followed by a single write
+ * or swap, all under one held write lock.
+ *
+ * gen is called repeatedly while bstack's write lock is held, with *out_op left
+ * for it to populate. gen must not call other bstack_* APIs on the same handle:
+ * - Returning 1 with *out_op set to BSTACK_GEN_READ reads the requested range
+ *   into u.read.buf and calls gen again.  By the time gen is called again,
+ *   the buffer from the *previous* read already holds its data, so each step
+ *   can use earlier results to decide the next one — e.g. "read the head
+ *   pointer, then read the node it points to".
+ * - Returning 1 with *out_op set to BSTACK_GEN_WRITE writes u.write.data to
+ *   the requested range and ends the sequence; gen is not called again.
+ * - Returning 1 with *out_op set to BSTACK_GEN_SWAP atomically exchanges the
+ *   two requested regions and ends the sequence; gen is not called again —
+ *   the in-sequence equivalent of bstack_cross_exchange, useful when a swap
+ *   target is only known once an earlier read has resolved it (e.g. "read the
+ *   free-list head, then splice this block in as the new head").
+ * - Returning 0 ends the sequence without writing anything — useful when the
+ *   reads alone inform a decision, including the decision to change nothing.
+ * - Returning -1 aborts the operation; errno must be set by gen.
+ *
+ * Holding the write lock across every read and the final mutation means no
+ * other thread can observe or modify any region of the file in between — the
+ * guarantee that bstack_get_batched_gen followed by a separate bstack_cas
+ * cannot provide, since the two separate lock acquisitions leave an ABA
+ * window.  The mutated region(s) need not overlap any region that was read.
+ * The file size is never changed; bstack_process_gen does not support
+ * push or pop.
+ *
+ * Reads of the locked region [0, bstack_locked_len()) are permitted, matching
+ * bstack_get.  Write and swap ranges that touch the locked region are
+ * rejected, matching bstack_set and bstack_cross_exchange.
+ *
+ * Returns EINVAL if any offset + len overflows uint64_t, if a read, write, or
+ * swap range exceeds the current payload size, if the two swap regions
+ * overlap, or if a write or swap range overlaps the locked region
+ * [0, bstack_locked_len()).  Returns -1 (errno set) if gen returns -1, or if
+ * an I/O error occurs.
+ *
+ * Only available when compiled with both -DBSTACK_FEATURE_SET and
+ * -DBSTACK_FEATURE_ATOMIC.
+ */
+int bstack_process_gen(bstack_t *bs,
+                       int (*gen)(bstack_gen_op_t *out_op, void *ctx),
+                       void *ctx);
 
 /*
  * Atomically swap two equal-size, non-overlapping regions within the file.
