@@ -89,11 +89,12 @@ ATOMIC_BIN       = ../examples/atomic_ops$(EXE_EXT)
 MOVE_COW_BIN     = ../examples/move_and_cow$(EXE_EXT)
 LINKED_LIST_BIN        = ../examples/linked_list$(EXE_EXT)
 CHECKSUMMED_CACHE_BIN  = ../examples/checksummed_cache$(EXE_EXT)
+ATOMIC_LINKED_LIST_BIN = ../examples/atomic_linked_list$(EXE_EXT)
 
 .PHONY: all test test-set test-atomic test-set-atomic test-first-fit test-first-fit-atomic test-ghost-tree test-ghost-tree-atomic test-slab test-slab-atomic test-checked-slab test-checked-slab-atomic test-bytevec leaks clean alloc \
         example example-basic example-buffer_reuse example-journal \
         example-reading example-vec_store example-hashmap example-atomic_ops example-move_and_cow \
-        example-linked_list example-checksummed_cache
+        example-linked_list example-checksummed_cache example-atomic_linked_list
 
 all: $(LIB)
 
@@ -295,6 +296,9 @@ endif
 ../examples/checksummed_cache$(EXE_EXT): ../examples/checksummed_cache.c $(LIB_SET_ATOMIC)
 	$(CC) $(CFLAGS) -DBSTACK_FEATURE_SET -DBSTACK_FEATURE_ATOMIC -I. -o $@ $< -L. -lbstack-set-atomic -lpthread
 
+../examples/atomic_linked_list$(EXE_EXT): ../examples/atomic_linked_list.c $(LIB_SET_ATOMIC)
+	$(CC) $(CFLAGS) -DBSTACK_FEATURE_SET -DBSTACK_FEATURE_ATOMIC -I. -o $@ $< -L. -lbstack-set-atomic -lpthread
+
 example-basic: ../examples/basic$(EXE_EXT)
 	(cd ../examples && $(RUN)basic$(EXE_EXT))
 
@@ -325,7 +329,10 @@ example-linked_list: ../examples/linked_list$(EXE_EXT)
 example-checksummed_cache: ../examples/checksummed_cache$(EXE_EXT)
 	(cd ../examples && $(RUN)checksummed_cache$(EXE_EXT))
 
-example: $(EXAMPLE_BINS) $(HASHMAP_BIN) $(ATOMIC_BIN) $(MOVE_COW_BIN) $(LINKED_LIST_BIN) $(CHECKSUMMED_CACHE_BIN)
+example-atomic_linked_list: ../examples/atomic_linked_list$(EXE_EXT)
+	(cd ../examples && $(RUN)atomic_linked_list$(EXE_EXT))
+
+example: $(EXAMPLE_BINS) $(HASHMAP_BIN) $(ATOMIC_BIN) $(MOVE_COW_BIN) $(LINKED_LIST_BIN) $(CHECKSUMMED_CACHE_BIN) $(ATOMIC_LINKED_LIST_BIN)
 	@echo "==> basic"        && (cd ../examples && $(RUN)basic$(EXE_EXT))
 	@echo "==> buffer_reuse" && (cd ../examples && $(RUN)buffer_reuse$(EXE_EXT))
 	@echo "==> journal"      && (cd ../examples && $(RUN)journal$(EXE_EXT))
@@ -336,6 +343,7 @@ example: $(EXAMPLE_BINS) $(HASHMAP_BIN) $(ATOMIC_BIN) $(MOVE_COW_BIN) $(LINKED_L
 	@echo "==> move_and_cow" && (cd ../examples && $(RUN)move_and_cow$(EXE_EXT))
 	@echo "==> linked_list"       && (cd ../examples && $(RUN)linked_list$(EXE_EXT))
 	@echo "==> checksummed_cache" && (cd ../examples && $(RUN)checksummed_cache$(EXE_EXT))
+	@echo "==> atomic_linked_list" && (cd ../examples && $(RUN)atomic_linked_list$(EXE_EXT))
 
 clean:
 	rm -f $(OBJ) $(TEST_OBJ) $(OBJ_SET) $(LIB) $(LIB_SET) $(TEST_BIN) \
@@ -351,4 +359,4 @@ clean:
 	      $(TEST_CSL_OBJ) $(TEST_CSL_BIN) \
 	      $(TEST_CSL_ATOMIC_OBJ) $(TEST_CSL_ATOMIC_BIN) \
 	      $(OBJ_BYTEVEC) $(LIB_BYTEVEC_SET) $(TEST_BV_OBJ) $(TEST_BV_BIN) \
-	      $(EXAMPLE_BINS) $(HASHMAP_BIN) $(ATOMIC_BIN) $(MOVE_COW_BIN) $(LINKED_LIST_BIN) $(CHECKSUMMED_CACHE_BIN)
+	      $(EXAMPLE_BINS) $(HASHMAP_BIN) $(ATOMIC_BIN) $(MOVE_COW_BIN) $(LINKED_LIST_BIN) $(CHECKSUMMED_CACHE_BIN) $(ATOMIC_LINKED_LIST_BIN)
