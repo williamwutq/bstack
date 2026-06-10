@@ -483,8 +483,8 @@ int bstack_process(bstack_t *bs, uint64_t start, uint64_t end,
  * Run a sequence of dependent reads, optionally followed by a single write
  * or swap, all under one held write lock.
  *
- * gen is called repeatedly with *out_op left for it to populate:
- *
+ * gen is called repeatedly while bstack's write lock is held, with *out_op left
+ * for it to populate. gen must not call other bstack_* APIs on the same handle:
  * - Returning 1 with *out_op set to BSTACK_GEN_READ reads the requested range
  *   into u.read.buf and calls gen again.  By the time gen is called again,
  *   the buffer from the *previous* read already holds its data, so each step
