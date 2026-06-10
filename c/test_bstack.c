@@ -2618,6 +2618,502 @@ static int test_process_persists_across_reopen(void)
     return 0;
 }
 
+/* -------------------------------------------------------------------------
+ * process_gen  (require BSTACK_FEATURE_ATOMIC and BSTACK_FEATURE_SET)
+ * ---------------------------------------------------------------------- */
+
+static uint64_t pg_le64_get(const uint8_t *p)
+{
+    uint64_t v = 0;
+    for (int i = 0; i < 8; i++) v |= (uint64_t)p[i] << (8 * i);
+    return v;
+}
+
+static void pg_le64_put(uint8_t *p, uint64_t v)
+{
+    for (int i = 0; i < 8; i++) p[i] = (uint8_t)(v >> (8 * i));
+}
+
+struct pg_read_then_write_ctx {
+    uint8_t buf[5];
+    int     step;
+};
+
+static int pg_read_then_write_gen(bstack_gen_op_t *out_op, void *userctx)
+{
+    struct pg_read_then_write_ctx *ctx = userctx;
+    switch (ctx->step++) {
+    case 0:
+        out_op->kind          = BSTACK_GEN_READ;
+        out_op->u.read.offset = 0;
+        out_op->u.read.buf    = ctx->buf;
+        out_op->u.read.len    = sizeof ctx->buf;
+        return 1;
+    case 1:
+        out_op->kind           = BSTACK_GEN_WRITE;
+        out_op->u.write.offset = 5;
+        out_op->u.write.data   = ctx->buf;
+        out_op->u.write.len    = sizeof ctx->buf;
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static int test_process_gen_reads_then_writes(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"helloworld", 10, NULL) == 0);
+
+    struct pg_read_then_write_ctx ctx = {{0}, 0};
+    CHECK(bstack_process_gen(bs, pg_read_then_write_gen, &ctx) == 0);
+    CHECK(memcmp(ctx.buf, "hello", 5) == 0);
+
+    uint8_t buf[10]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(memcmp(buf, "hellohello", 10) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+struct pg_dependent_ctx {
+    uint8_t ptr_buf[8];
+    uint8_t node_buf[2];
+    int     step;
+};
+
+static int pg_dependent_gen(bstack_gen_op_t *out_op, void *userctx)
+{
+    struct pg_dependent_ctx *ctx = userctx;
+    switch (ctx->step++) {
+    case 0:
+        out_op->kind          = BSTACK_GEN_READ;
+        out_op->u.read.offset = 0;
+        out_op->u.read.buf    = ctx->ptr_buf;
+        out_op->u.read.len    = sizeof ctx->ptr_buf;
+        return 1;
+    case 1:
+        /* The previous read has already filled ptr_buf by the time we're
+         * called again. */
+        out_op->kind          = BSTACK_GEN_READ;
+        out_op->u.read.offset = pg_le64_get(ctx->ptr_buf);
+        out_op->u.read.buf    = ctx->node_buf;
+        out_op->u.read.len    = sizeof ctx->node_buf;
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static int test_process_gen_dependent_reads_inform_next_offset(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    /* Layout: [pointer: u64 LE][node "A "][node "B "] */
+    uint8_t payload[12];
+    pg_le64_put(payload, 8);
+    memcpy(payload + 8, "A ", 2);
+    memcpy(payload + 10, "B ", 2);
+    CHECK(bstack_push(bs, payload, sizeof payload, NULL) == 0);
+
+    struct pg_dependent_ctx ctx = {{0}, {0}, 0};
+    CHECK(bstack_process_gen(bs, pg_dependent_gen, &ctx) == 0);
+    CHECK(pg_le64_get(ctx.ptr_buf) == 8);
+    CHECK(memcmp(ctx.node_buf, "A ", 2) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int pg_immediate_none_gen(bstack_gen_op_t *out_op, void *userctx)
+{
+    (void)out_op; (void)userctx;
+    return 0;
+}
+
+static int test_process_gen_immediate_none_is_noop(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"hello", 5, NULL) == 0);
+    CHECK(bstack_process_gen(bs, pg_immediate_none_gen, NULL) == 0);
+
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 5);
+    uint8_t buf[5]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(memcmp(buf, "hello", 5) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int pg_write_ends_sequence_gen(bstack_gen_op_t *out_op, void *userctx)
+{
+    int *calls = userctx;
+    (*calls)++;
+    if (*calls == 1) {
+        out_op->kind           = BSTACK_GEN_WRITE;
+        out_op->u.write.offset = 0;
+        out_op->u.write.data   = (const uint8_t *)"HELLO";
+        out_op->u.write.len    = 5;
+    } else {
+        out_op->kind           = BSTACK_GEN_WRITE;
+        out_op->u.write.offset = 5;
+        out_op->u.write.data   = (const uint8_t *)"WORLD";
+        out_op->u.write.len    = 5;
+    }
+    return 1;
+}
+
+static int test_process_gen_write_ends_sequence(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"helloworld", 10, NULL) == 0);
+    int calls = 0;
+    CHECK(bstack_process_gen(bs, pg_write_ends_sequence_gen, &calls) == 0);
+    CHECK(calls == 1);
+
+    uint8_t buf[10]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(memcmp(buf, "HELLOworld", 10) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int pg_swap_ends_sequence_gen(bstack_gen_op_t *out_op, void *userctx)
+{
+    int *calls = userctx;
+    (*calls)++;
+    if (*calls == 1) {
+        out_op->kind           = BSTACK_GEN_SWAP;
+        out_op->u.swap.a_offset = 0;
+        out_op->u.swap.b_offset = 5;
+        out_op->u.swap.len      = 5;
+    } else {
+        out_op->kind           = BSTACK_GEN_WRITE;
+        out_op->u.write.offset = 0;
+        out_op->u.write.data   = (const uint8_t *)"NOPE!";
+        out_op->u.write.len    = 5;
+    }
+    return 1;
+}
+
+static int test_process_gen_swap_exchanges_two_regions_and_ends_sequence(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"helloworld", 10, NULL) == 0);
+    int calls = 0;
+    CHECK(bstack_process_gen(bs, pg_swap_ends_sequence_gen, &calls) == 0);
+    CHECK(calls == 1);
+
+    uint8_t buf[10]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(memcmp(buf, "worldhello", 10) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+struct pg_swap_informed_ctx {
+    uint8_t ptr_buf[8];
+    int     step;
+};
+
+static int pg_swap_informed_gen(bstack_gen_op_t *out_op, void *userctx)
+{
+    struct pg_swap_informed_ctx *ctx = userctx;
+    switch (ctx->step++) {
+    case 0:
+        out_op->kind          = BSTACK_GEN_READ;
+        out_op->u.read.offset = 0;
+        out_op->u.read.buf    = ctx->ptr_buf;
+        out_op->u.read.len    = sizeof ctx->ptr_buf;
+        return 1;
+    case 1:
+        out_op->kind            = BSTACK_GEN_SWAP;
+        out_op->u.swap.a_offset = 8;
+        out_op->u.swap.b_offset = pg_le64_get(ctx->ptr_buf);
+        out_op->u.swap.len      = 8;
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static int test_process_gen_swap_target_informed_by_prior_read(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    /* Layout: [pointer: u64 LE][block A: 8 bytes][block B: 8 bytes] */
+    uint8_t payload[24];
+    pg_le64_put(payload, 16); /* names block B */
+    memcpy(payload + 8,  "AAAAAAAA", 8);
+    memcpy(payload + 16, "BBBBBBBB", 8);
+    CHECK(bstack_push(bs, payload, sizeof payload, NULL) == 0);
+
+    struct pg_swap_informed_ctx ctx = {{0}, 0};
+    CHECK(bstack_process_gen(bs, pg_swap_informed_gen, &ctx) == 0);
+
+    uint8_t buf[16]; size_t w;
+    CHECK(bstack_peek(bs, 8, buf, &w) == 0);
+    CHECK(memcmp(buf, "BBBBBBBBAAAAAAAA", 16) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int pg_swap_overlapping_gen(bstack_gen_op_t *out_op, void *userctx)
+{
+    (void)userctx;
+    out_op->kind            = BSTACK_GEN_SWAP;
+    out_op->u.swap.a_offset = 0;
+    out_op->u.swap.b_offset = 3;
+    out_op->u.swap.len      = 5;
+    return 1;
+}
+
+static int test_process_gen_swap_overlapping_regions_returns_error(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"helloworld", 10, NULL) == 0);
+    CHECK(bstack_process_gen(bs, pg_swap_overlapping_gen, NULL) == -1);
+    CHECK(errno == EINVAL);
+
+    uint8_t buf[10]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(memcmp(buf, "helloworld", 10) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int pg_swap_locked_gen(bstack_gen_op_t *out_op, void *userctx)
+{
+    (void)userctx;
+    out_op->kind            = BSTACK_GEN_SWAP;
+    out_op->u.swap.a_offset = 0;
+    out_op->u.swap.b_offset = 5;
+    out_op->u.swap.len      = 5;
+    return 1;
+}
+
+static int test_process_gen_swap_in_locked_region_returns_error(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"helloworld", 10, NULL) == 0);
+    CHECK(bstack_lock_up_to(bs, 5) == 0);
+    CHECK(bstack_process_gen(bs, pg_swap_locked_gen, NULL) == -1);
+    CHECK(errno == EINVAL);
+
+    uint8_t buf[10];
+    CHECK(bstack_get(bs, 0, 10, buf) == 0);
+    CHECK(memcmp(buf, "helloworld", 10) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int pg_write_gen(bstack_gen_op_t *out_op, void *userctx)
+{
+    (void)userctx;
+    out_op->kind           = BSTACK_GEN_WRITE;
+    out_op->u.write.offset = 0;
+    out_op->u.write.data   = (const uint8_t *)"HELLO";
+    out_op->u.write.len    = 5;
+    return 1;
+}
+
+static int test_process_gen_does_not_change_file_size(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"helloworld", 10, NULL) == 0);
+    CHECK(bstack_process_gen(bs, pg_write_gen, NULL) == 0);
+
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 10);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+struct pg_read_oob_ctx {
+    uint8_t buf[10];
+    int     called;
+};
+
+static int pg_read_oob_gen(bstack_gen_op_t *out_op, void *userctx)
+{
+    struct pg_read_oob_ctx *ctx = userctx;
+    if (ctx->called)
+        return 0;
+    ctx->called = 1;
+    out_op->kind          = BSTACK_GEN_READ;
+    out_op->u.read.offset = 0;
+    out_op->u.read.buf    = ctx->buf;
+    out_op->u.read.len    = sizeof ctx->buf;
+    return 1;
+}
+
+static int test_process_gen_read_out_of_bounds_returns_error(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"hi", 2, NULL) == 0);
+    struct pg_read_oob_ctx ctx = {{0}, 0};
+    CHECK(bstack_process_gen(bs, pg_read_oob_gen, &ctx) == -1);
+    CHECK(errno == EINVAL);
+
+    uint8_t buf[2]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(memcmp(buf, "hi", 2) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int pg_write_oob_gen(bstack_gen_op_t *out_op, void *userctx)
+{
+    (void)userctx;
+    out_op->kind           = BSTACK_GEN_WRITE;
+    out_op->u.write.offset = 2;
+    out_op->u.write.data   = (const uint8_t *)"abcdefgh";
+    out_op->u.write.len    = 8;
+    return 1;
+}
+
+static int test_process_gen_write_out_of_bounds_returns_error(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"hello", 5, NULL) == 0);
+    CHECK(bstack_process_gen(bs, pg_write_oob_gen, NULL) == -1);
+    CHECK(errno == EINVAL);
+
+    uint8_t buf[5]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(memcmp(buf, "hello", 5) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_process_gen_write_in_locked_region_returns_error(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"helloworld", 10, NULL) == 0);
+    CHECK(bstack_lock_up_to(bs, 5) == 0);
+    CHECK(bstack_process_gen(bs, pg_write_gen, NULL) == -1);
+    CHECK(errno == EINVAL);
+
+    uint8_t buf[10];
+    CHECK(bstack_get(bs, 0, 10, buf) == 0);
+    CHECK(memcmp(buf, "helloworld", 10) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+struct pg_read_locked_ctx {
+    uint8_t buf[5];
+    int     called;
+};
+
+static int pg_read_locked_gen(bstack_gen_op_t *out_op, void *userctx)
+{
+    struct pg_read_locked_ctx *ctx = userctx;
+    if (ctx->called)
+        return 0;
+    ctx->called = 1;
+    out_op->kind          = BSTACK_GEN_READ;
+    out_op->u.read.offset = 0;
+    out_op->u.read.buf    = ctx->buf;
+    out_op->u.read.len    = sizeof ctx->buf;
+    return 1;
+}
+
+static int test_process_gen_read_in_locked_region_succeeds(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"helloworld", 10, NULL) == 0);
+    CHECK(bstack_lock_up_to(bs, 5) == 0);
+
+    struct pg_read_locked_ctx ctx = {{0}, 0};
+    CHECK(bstack_process_gen(bs, pg_read_locked_gen, &ctx) == 0);
+    CHECK(memcmp(ctx.buf, "hello", 5) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int pg_write_world_gen(bstack_gen_op_t *out_op, void *userctx)
+{
+    (void)userctx;
+    out_op->kind           = BSTACK_GEN_WRITE;
+    out_op->u.write.offset = 5;
+    out_op->u.write.data   = (const uint8_t *)"WORLD";
+    out_op->u.write.len    = 5;
+    return 1;
+}
+
+static int test_process_gen_persists_across_reopen(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+
+    {
+        bstack_t *bs = bstack_open(tmp);
+        CHECK(bs != NULL);
+        CHECK(bstack_push(bs, (uint8_t *)"helloworld", 10, NULL) == 0);
+        CHECK(bstack_process_gen(bs, pg_write_world_gen, NULL) == 0);
+        bstack_close(bs);
+    }
+    {
+        bstack_t *bs = bstack_open(tmp);
+        CHECK(bs != NULL);
+        uint8_t buf[10]; size_t w;
+        CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+        CHECK(memcmp(buf, "helloWORLD", 10) == 0);
+        bstack_close(bs);
+    }
+
+    unlink(tmp);
+    return 0;
+}
+
 #endif /* BSTACK_FEATURE_ATOMIC && BSTACK_FEATURE_SET */
 
 /* =========================================================================
@@ -3416,6 +3912,22 @@ int main(void)
     T(test_swap_respects_locked_region);
     T(test_cas_respects_locked_region);
     T(test_process_respects_locked_region);
+
+    /* bstack_process_gen */
+    T(test_process_gen_reads_then_writes);
+    T(test_process_gen_dependent_reads_inform_next_offset);
+    T(test_process_gen_immediate_none_is_noop);
+    T(test_process_gen_write_ends_sequence);
+    T(test_process_gen_swap_exchanges_two_regions_and_ends_sequence);
+    T(test_process_gen_swap_target_informed_by_prior_read);
+    T(test_process_gen_swap_overlapping_regions_returns_error);
+    T(test_process_gen_swap_in_locked_region_returns_error);
+    T(test_process_gen_does_not_change_file_size);
+    T(test_process_gen_read_out_of_bounds_returns_error);
+    T(test_process_gen_write_out_of_bounds_returns_error);
+    T(test_process_gen_write_in_locked_region_returns_error);
+    T(test_process_gen_read_in_locked_region_succeeds);
+    T(test_process_gen_persists_across_reopen);
 #endif
 
     printf("\n%d/%d passed\n", g_passed, g_total);
