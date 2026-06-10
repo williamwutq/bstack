@@ -112,10 +112,13 @@ const ALCK_MAGIC_PREFIX: [u8; 6] = *b"ALCK\x00\x01";
 /// [`BStack::try_extend_zeros`] / [`BStack::try_discard`] to perform
 /// check-and-act atomically under `BStack`'s write lock, also without a lock.
 ///
-/// An internal [`Mutex`] is retained solely to serialise the multi-step,
-/// read-then-act recovery scan in [`recover`](Self::recover) (and the
-/// automatic `recover` call in [`open`](Self::open)) against concurrent
-/// `&self` access; it plays no part in ordinary alloc/dealloc/realloc.
+/// An internal [`Mutex`] is retained solely to make [`recover`](Self::recover)
+/// (and the automatic `recover` call in [`open`](Self::open)) single-flight:
+/// the recovery *scan* itself is serialised against alloc/dealloc by the
+/// [`BStack`] write lock it holds across one [`BStack::process_gen`] sequence,
+/// while the `Mutex` only prevents two concurrent `recover` runs from each
+/// reclaiming the same leaked block. It plays no part in ordinary
+/// alloc/dealloc/realloc.
 ///
 /// ```
 /// fn assert_send<T: Send>() {}
@@ -167,8 +170,9 @@ pub struct CheckedSlabBStackAllocator {
     /// Cached from the on-disk header; fixed for the lifetime of the allocator.
     /// Covers the full block including the 8-byte overhead; must be `≥ 16`.
     block_size: u64,
-    /// Serialises multi-step free-list and tail operations when `atomic` is
-    /// enabled, making the allocator `Sync`.
+    /// Serialises [`recover`](Self::recover) against itself when `atomic` is
+    /// enabled, so two recovery runs cannot both reclaim the same leaked block.
+    /// Ordinary alloc/dealloc/realloc never take it — they stay lock-free.
     #[cfg(feature = "atomic")]
     lock: Mutex<()>,
     #[cfg(not(feature = "atomic"))]
@@ -176,7 +180,10 @@ pub struct CheckedSlabBStackAllocator {
 }
 
 /// How a single block looks to the recovery scan.
-#[cfg(feature = "set")]
+///
+/// Only used by the non-`atomic` recovery path; the `atomic` path inlines the
+/// equivalent classification inside its `process_gen` state machine.
+#[cfg(all(feature = "set", not(feature = "atomic")))]
 enum BlockClass {
     /// `overhead == 0` and the block is reachable from `free_head`.
     Free,
@@ -190,7 +197,10 @@ enum BlockClass {
 
 /// Outcome of attempting to resynchronise the scan after a suspicious block
 /// when no free-list block remains as an anchor.
-#[cfg(feature = "set")]
+///
+/// Only used by the non-`atomic` recovery path; the `atomic` path inlines the
+/// equivalent decision inside its `process_gen` state machine.
+#[cfg(all(feature = "set", not(feature = "atomic")))]
 enum ResyncOutcome {
     /// A later block boundary cleanly tiles to the tail; resume there. The gap
     /// is mid-arena garbage and is left leaked.
@@ -402,23 +412,43 @@ impl CheckedSlabBStackAllocator {
     /// runs it automatically; it is exposed so callers can inspect the residual
     /// count or re-run it on demand.
     ///
-    /// # Phase 1 — scan (read-only)
+    /// # Phase 1 — scan (single locked pass)
     ///
-    /// The free list is walked into a sorted set (with cycle detection), then
-    /// the arena is scanned linearly. A valid in-use block advances the cursor
-    /// by its block count; a zero-overhead block not in the free list is a leak
-    /// and is queued for reclaim; anything else is *suspicious*. At a suspicious
-    /// block the scan resynchronises on the next free-list block if one follows
-    /// (the intervening gap is left leaked); otherwise a backward reachability
-    /// pass decides between a mid-arena gap (left leaked) and an orphaned tail
-    /// from a failed `realloc` truncation (discarded).
+    /// The free-list walk (with cycle detection) and the linear arena scan run
+    /// as **one** [`BStack::process_gen`] sequence: every read happens under one
+    /// held `BStack` write lock, so a concurrent [`alloc`](Self::alloc) or
+    /// [`dealloc`](Self::dealloc) cannot mutate the free list between the moment
+    /// it is walked and the moment a block is classified against it. A valid
+    /// in-use block advances the cursor by its block count; a zero-overhead
+    /// block not in the free list is a leak and is queued for reclaim; anything
+    /// else is *suspicious*. At a suspicious block the scan resynchronises on the
+    /// next free-list block if one follows (the intervening gap is left leaked);
+    /// otherwise a backward reachability pass decides between a mid-arena gap
+    /// (left leaked) and an orphaned tail from a failed `realloc` truncation. The
+    /// orphaned-tail discard is the single mutation permitted in the sequence,
+    /// expressed as a terminating [`BStackGenOp::Pop`]; because it is performed
+    /// under the same lock as the scan that chose it, no concurrent `alloc` can
+    /// extend the tail into the region being discarded.
     ///
-    /// # Phase 2 — apply (one block at a time)
+    /// # Phase 2 — reclaim (one block at a time, lock-free)
     ///
-    /// Any orphaned tail is discarded, then each reclaimed block is prepended to
-    /// the existing free list individually — the list is never rebuilt. Every
-    /// step is an atomic [`BStack`] operation, so a crash mid-recovery simply
-    /// leaves the remaining leaks to be re-found on the next run.
+    /// After the locked scan, each reclaimed block is prepended to the free list
+    /// individually with [`push_free_blocks`](Self::push_free_blocks) — the list
+    /// is never rebuilt. This runs **outside** the scan lock and may overlap a
+    /// concurrent `alloc`/`dealloc`: a reclaimed block is a *leak*, reachable by
+    /// neither (no live slice points at it and it is absent from the free list),
+    /// so its state cannot change between the scan and the splice, and each
+    /// splice is itself an atomic [`BStack::cross_exchange`]. A crash mid-reclaim
+    /// simply leaves the remaining leaks to be re-found on the next run.
+    ///
+    /// # Concurrency
+    ///
+    /// The allocator-level [`Mutex`] is held for the whole call. It no longer
+    /// guards individual free-list reads — Phase 1 does that with the `BStack`
+    /// write lock — but it serialises `recover` against **itself**: two
+    /// overlapping runs could each observe the same block as leaked and splice
+    /// it into the free list twice, corrupting the list. The lock makes recovery
+    /// single-flight; ordinary `alloc`/`dealloc` never take it.
     ///
     /// # Safety of destructive steps
     ///
@@ -432,9 +462,316 @@ impl CheckedSlabBStackAllocator {
     ///
     /// * Any [`io::Error`] propagated from the underlying [`BStack`] operations
     ///   during the arena scan or while applying reclaim / tail-discard steps.
+    #[cfg(feature = "atomic")]
     pub fn recover(&self) -> io::Result<u64> {
-        #[cfg(feature = "atomic")]
+        // Held for the entire call. Phase 1's reads are serialised against
+        // alloc/dealloc by the `BStack` write lock inside `process_gen`; this
+        // lock instead prevents two `recover` runs from overlapping, which would
+        // let both reclaim the same leaked block and double-link it.
         let _guard = self.lock.lock().unwrap();
+
+        // Cheap early-out for an empty allocator. Only a hint: the authoritative
+        // payload size is taken under the `process_gen` lock below via `Len`.
+        if self.stack.len()? <= Self::ARENA_START {
+            return Ok(0);
+        }
+        let bs = self.block_size;
+
+        // Results produced by the locked scan, consumed after it returns.
+        let mut reclaim: Vec<u64> = Vec::new();
+        let mut unsure: u64 = 0;
+        let mut discard_from: Option<u64> = None;
+        // Set if the chosen tail discard is too large to represent on this
+        // platform; surfaced as an error once the borrow of the buffers ends.
+        let mut size_err = false;
+
+        // Resume points for the pull-driven `process_gen` state machine. Each
+        // variant carries the cursor it operates on; shared working state
+        // (free set, reach DP) lives in the captured locals below.
+        #[derive(Clone, Copy)]
+        enum St {
+            ReadLen,
+            ReadFreeHead,
+            ConsumeFreeHead,
+            WalkHead(u64),
+            ConsumeNode(u64),
+            ArenaAt(u64),
+            ConsumeArena(u64),
+            ConsumeResync,
+            Finish,
+            Done,
+        }
+        let mut st = St::ReadLen;
+        // Authoritative payload size, read under the lock via `Len`.
+        let mut stack_len: u64 = 0;
+        // Sorted free-block offsets and whether the walk was cut short.
+        let mut free: Vec<u64> = Vec::new();
+        let mut free_corrupt = false;
+        let mut seen: HashSet<u64> = HashSet::new();
+        // Backward reach DP over a suspicious tail region `[resync_p, stack_len)`.
+        let mut reach: Vec<bool> = Vec::new();
+        let mut resync_p: u64 = 0;
+        let mut rj: usize = 0;
+
+        // Buffers filled by `Len`/`Read`/`Pop`; declared here so they outlive
+        // the `process_gen` borrow. The transmutes detach the borrow from these
+        // locals (see `pop_and_claim_block` for the same idiom); each is safe
+        // because the local outlives the call and is never aliased while an op
+        // holds the reference — `process_gen` resolves each op fully before it
+        // calls the closure again.
+        let mut len_out: u64 = 0;
+        let mut head_buf = [0u8; 8];
+        let mut node_buf = [0u8; 16];
+        let mut oh_buf = [0u8; 8];
+        let mut pop_buf: Vec<u8> = Vec::new();
+
+        self.stack.process_gen(|| {
+            loop {
+                match st {
+                    // Read the authoritative payload size first.
+                    St::ReadLen => {
+                        st = St::ReadFreeHead;
+                        return Some(BStackGenOp::Len {
+                            // SAFETY: `len_out` outlives this `process_gen` call.
+                            out: unsafe {
+                                core::mem::transmute::<&mut u64, &mut u64>(&mut len_out)
+                            },
+                        });
+                    }
+                    St::ReadFreeHead => {
+                        stack_len = len_out;
+                        if stack_len <= Self::ARENA_START {
+                            st = St::Finish;
+                            continue;
+                        }
+                        st = St::ConsumeFreeHead;
+                        return Some(BStackGenOp::Read {
+                            offset: Self::FREE_HEAD_OFFSET,
+                            // SAFETY: `head_buf` outlives this `process_gen` call.
+                            buf: unsafe {
+                                core::mem::transmute::<&mut [u8], &mut [u8]>(&mut head_buf[..])
+                            },
+                        });
+                    }
+                    St::ConsumeFreeHead => {
+                        st = St::WalkHead(u64::from_le_bytes(head_buf));
+                        continue;
+                    }
+                    // Free-list walk: validate `head`, then read its node.
+                    St::WalkHead(head) => {
+                        if head == Self::SENTINEL {
+                            free.sort_unstable();
+                            st = St::ArenaAt(Self::ARENA_START);
+                            continue;
+                        }
+                        if head < Self::ARENA_START
+                            || (head - Self::ARENA_START) % bs != 0
+                            || head >= stack_len
+                            || !seen.insert(head)
+                        {
+                            free_corrupt = true;
+                            free.sort_unstable();
+                            st = St::ArenaAt(Self::ARENA_START);
+                            continue;
+                        }
+                        st = St::ConsumeNode(head);
+                        return Some(BStackGenOp::Read {
+                            offset: head,
+                            // SAFETY: `node_buf` outlives this `process_gen` call.
+                            buf: unsafe {
+                                core::mem::transmute::<&mut [u8], &mut [u8]>(&mut node_buf[..])
+                            },
+                        });
+                    }
+                    St::ConsumeNode(head) => {
+                        let overhead = u64::from_le_bytes(node_buf[0..8].try_into().unwrap());
+                        if overhead != 0 {
+                            free_corrupt = true;
+                            free.sort_unstable();
+                            st = St::ArenaAt(Self::ARENA_START);
+                            continue;
+                        }
+                        free.push(head);
+                        let next = u64::from_le_bytes(node_buf[8..16].try_into().unwrap());
+                        st = St::WalkHead(next);
+                        continue;
+                    }
+                    // Linear arena scan: read the overhead at `p`.
+                    St::ArenaAt(p) => {
+                        if p >= stack_len {
+                            st = St::Finish;
+                            continue;
+                        }
+                        st = St::ConsumeArena(p);
+                        return Some(BStackGenOp::Read {
+                            offset: p,
+                            // SAFETY: `oh_buf` outlives this `process_gen` call.
+                            buf: unsafe {
+                                core::mem::transmute::<&mut [u8], &mut [u8]>(&mut oh_buf[..])
+                            },
+                        });
+                    }
+                    St::ConsumeArena(p) => {
+                        let overhead = u64::from_le_bytes(oh_buf);
+                        if overhead == 0 {
+                            if free.binary_search(&p).is_ok() {
+                                // Free: reachable from free_head.
+                            } else if free_corrupt {
+                                // A bare zero-overhead block is only trustworthy
+                                // as a leak while the free list walked cleanly; a
+                                // corrupt list means it might already be linked.
+                                unsure += 1;
+                            } else {
+                                reclaim.push(p);
+                            }
+                            st = St::ArenaAt(p + bs);
+                            continue;
+                        }
+                        if let Some(n) = self.valid_in_use(overhead, p, stack_len, &free) {
+                            // valid_in_use guarantees p + n*bs <= stack_len.
+                            st = St::ArenaAt(p + n * bs);
+                            continue;
+                        }
+                        // Suspicious: prefer a known-free block as resync anchor.
+                        let idx = free.partition_point(|&x| x <= p);
+                        if let Some(&f) = free.get(idx) {
+                            unsure += (f - p) / bs;
+                            st = St::ArenaAt(f);
+                            continue;
+                        }
+                        // No anchor follows: set up the backward reach DP over
+                        // `[p, stack_len)` (see the non-atomic `resync_tail`).
+                        let span = stack_len - p;
+                        match usize::try_from(span / bs) {
+                            Ok(m) if m <= Self::MAX_RECOVER_REGION => {
+                                // m >= 1 since p < stack_len and both are aligned.
+                                reach = vec![false; m + 1];
+                                reach[m] = true;
+                                resync_p = p;
+                                rj = m - 1;
+                                st = St::ConsumeResync;
+                                return Some(BStackGenOp::Read {
+                                    offset: resync_p + (rj as u64) * bs,
+                                    // SAFETY: `oh_buf` outlives this call.
+                                    buf: unsafe {
+                                        core::mem::transmute::<&mut [u8], &mut [u8]>(
+                                            &mut oh_buf[..],
+                                        )
+                                    },
+                                });
+                            }
+                            // Region too large to analyse safely: leave leaked.
+                            _ => {
+                                unsure += span / bs;
+                                st = St::Finish;
+                                continue;
+                            }
+                        }
+                    }
+                    St::ConsumeResync => {
+                        let overhead = u64::from_le_bytes(oh_buf);
+                        let off = resync_p + (rj as u64) * bs;
+                        reach[rj] = if overhead == 0 {
+                            reach[rj + 1]
+                        } else if let Some(n) = self.valid_in_use(overhead, off, stack_len, &free) {
+                            // valid_in_use guarantees rj + n <= m.
+                            reach[rj + n as usize]
+                        } else {
+                            false
+                        };
+                        if rj != 0 {
+                            rj -= 1;
+                            st = St::ConsumeResync;
+                            return Some(BStackGenOp::Read {
+                                offset: resync_p + (rj as u64) * bs,
+                                // SAFETY: `oh_buf` outlives this call.
+                                buf: unsafe {
+                                    core::mem::transmute::<&mut [u8], &mut [u8]>(&mut oh_buf[..])
+                                },
+                            });
+                        }
+                        // DP complete. The smallest interior boundary that tiles
+                        // cleanly to the tail is a mid-arena gap to resync on;
+                        // j=0 is excluded (it would contradict the Suspicious
+                        // classification that brought us here).
+                        let m = reach.len() - 1;
+                        if let Some(jr) = (1..m).find(|&j| reach[j]) {
+                            unsure += jr as u64;
+                            st = St::ArenaAt(resync_p + (jr as u64) * bs);
+                            continue;
+                        }
+                        // Orphaned tail. Only safe to discard when the free list
+                        // is trusted; otherwise leave it leaked.
+                        if free_corrupt {
+                            unsure += (stack_len - resync_p) / bs;
+                        } else {
+                            discard_from = Some(resync_p);
+                        }
+                        st = St::Finish;
+                        continue;
+                    }
+                    // Emit the single permitted mutation: the tail discard.
+                    St::Finish => {
+                        // No tail discard chosen: end the sequence with no write.
+                        let t = discard_from?;
+                        match usize::try_from(stack_len - t) {
+                            Ok(n) => {
+                                pop_buf = vec![0u8; n];
+                                st = St::Done;
+                                return Some(BStackGenOp::Pop {
+                                    // SAFETY: `pop_buf` outlives this call and is
+                                    // not touched again before the sequence ends.
+                                    buf: unsafe {
+                                        core::mem::transmute::<&mut [u8], &mut [u8]>(
+                                            &mut pop_buf[..],
+                                        )
+                                    },
+                                });
+                            }
+                            Err(_) => {
+                                size_err = true;
+                                return None;
+                            }
+                        }
+                    }
+                    // `Pop` is terminal, so this is defensive only.
+                    St::Done => return None,
+                }
+            }
+        })?;
+
+        if size_err {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "orphaned tail size exceeds platform pointer size",
+            ));
+        }
+
+        // Phase 2: splice reclaimed leaks onto the free list, lock-free. Each
+        // block is unreachable by alloc/dealloc, so its leaked state is stable
+        // across the unlocked gap, and `push_free_blocks` splices atomically.
+        for b in reclaim {
+            self.push_free_blocks(b, 1)?;
+        }
+        Ok(unsure)
+    }
+
+    /// Repair the allocator after an unclean shutdown and return the number of
+    /// blocks that remain leaked or could not be classified with certainty
+    /// (`0` means the arena is fully accounted for).
+    ///
+    /// Single-threaded (non-`atomic`) variant: the free-list walk and arena
+    /// scan run as ordinary sequential [`BStack`] reads, then any orphaned tail
+    /// is discarded and each reclaimed block is prepended to the free list. See
+    /// the `atomic` build for the crash- and concurrency-safety contract; here
+    /// `&self` access is assumed exclusive.
+    ///
+    /// # Errors
+    ///
+    /// * Any [`io::Error`] propagated from the underlying [`BStack`] operations
+    ///   during the arena scan or while applying reclaim / tail-discard steps.
+    #[cfg(not(feature = "atomic"))]
+    pub fn recover(&self) -> io::Result<u64> {
         let stack_len = self.stack.len()?;
         if stack_len <= Self::ARENA_START {
             return Ok(0);
@@ -508,6 +845,10 @@ impl CheckedSlabBStackAllocator {
     /// pointer, a head whose overhead is non-zero, or a cycle (detected with a
     /// visited set bounded by the arena block count) — and reports it via the
     /// returned flag (`true` = the walk was cut short by corruption).
+    ///
+    /// The `atomic` recovery path performs the equivalent walk inline inside
+    /// its `process_gen` scan, so this helper is only compiled without `atomic`.
+    #[cfg(not(feature = "atomic"))]
     fn scan_free_list(&self, stack_len: u64) -> io::Result<(Vec<u64>, bool)> {
         let mut free = Vec::new();
         let mut seen: HashSet<u64> = HashSet::new();
@@ -536,6 +877,10 @@ impl CheckedSlabBStackAllocator {
     }
 
     /// Classify the block at `p` for the recovery scan.
+    ///
+    /// The `atomic` recovery path inlines this classification inside its
+    /// `process_gen` scan, so this helper is only compiled without `atomic`.
+    #[cfg(not(feature = "atomic"))]
     fn classify(&self, p: u64, stack_len: u64, free: &[u64]) -> io::Result<BlockClass> {
         let overhead = self.read_overhead(p)?;
         if overhead == 0 {
@@ -588,6 +933,10 @@ impl CheckedSlabBStackAllocator {
     /// clean walk (only free or valid in-use blocks) lands exactly on
     /// `stack_len`. The smallest such interior boundary is a mid-arena gap to
     /// resync on; if none exists the region is an orphaned tail to discard.
+    ///
+    /// The `atomic` recovery path runs the equivalent reach DP inline inside
+    /// its `process_gen` scan, so this helper is only compiled without `atomic`.
+    #[cfg(not(feature = "atomic"))]
     fn resync_tail(&self, p: u64, stack_len: u64, free: &[u64]) -> io::Result<ResyncOutcome> {
         let bs = self.block_size;
         let m = match usize::try_from((stack_len - p) / bs) {
