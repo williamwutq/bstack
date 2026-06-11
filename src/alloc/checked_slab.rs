@@ -432,9 +432,9 @@ impl CheckedSlabBStackAllocator {
     ///
     /// # Phase 2 — reclaim (one block at a time, lock-free)
     ///
-    /// After the locked scan, each reclaimed block is prepended to the free list
-    /// individually with [`push_free_blocks`](Self::push_free_blocks) — the list
-    /// is never rebuilt. This runs **outside** the scan lock and may overlap a
+    /// After the locked scan, each reclaimed block is prepended to the free
+    /// list individually with `push_free_blocks` — the list is never
+    /// rebuilt. This runs **outside** the scan lock and may overlap a
     /// concurrent `alloc`/`dealloc`: a reclaimed block is a *leak*, reachable by
     /// neither (no live slice points at it and it is absent from the free list),
     /// so its state cannot change between the scan and the splice, and each
