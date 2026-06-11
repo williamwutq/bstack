@@ -2,9 +2,10 @@
 
 A persistent, fsync-durable binary stack backed by a single file.
 
-`push` and `pop` perform a *durable sync* before returning, so data survives a
-process crash or unclean shutdown.  On **macOS**, `fcntl(F_FULLFSYNC)` is used
-instead of `fdatasync` to flush the drive's hardware write cache, which plain
+Every write — `push`, `pop`, and the optional `set`/`atomic` operations —
+performs a *durable sync* before returning, so data survives a process crash
+or unclean shutdown.  On **macOS**, `fcntl(F_FULLFSYNC)` is used instead of
+`fdatasync` to flush the drive's hardware write cache, which plain
 `fdatasync` does not guarantee.
 
 [![Crates.io](https://img.shields.io/crates/v/bstack)](https://crates.io/crates/bstack)
@@ -19,7 +20,18 @@ On **Unix**, `open` acquires an **exclusive advisory `flock`**; on
 **Windows**, `LockFileEx` is used instead.  Both prevent two processes from
 concurrently corrupting the same stack file.
 
-**Minimal dependencies (`libc` on Unix, `windows-sys` on Windows).  No `unsafe` beyond required FFI calls.**
+The optional `atomic` feature adds compound read-modify-write and
+compare-and-swap operations, including a generator-driven `get_batched_gen` for
+multi-step reads and `process_gen` for multi-step read and writes. Independent of 
+features, `lock_up_to` lets a prefix of the file be marked permanently immutable
+for lock-free reads, and an optional in-memory cache (`open_cached`) can
+mirror that region for even faster, syscall-free access.
+
+Other optional Cargo features layer on more: `set` adds in-place writes to
+existing bytes, and `alloc` adds typed sub-allocators (linear, first-fit,
+slab, etc.) over the payload.
+
+**Minimal dependencies (`libc` on Unix, `windows-sys` on Windows).
 
 > **Warning:** bstack files must only be opened through this crate or a
 > compatible implementation that understands the file format, header protocol,
@@ -473,27 +485,16 @@ bstack = { version = "0.2", features = ["atomic"] }
 bstack = { version = "0.2", features = ["set", "atomic"] }
 ```
 
-- **`atrunc(n, buf)`** — Cut `n` bytes off the tail, then append `buf`. Equivalent to `discard(n)` + `push(buf)` with no intermediate visible state.
-- **`splice(n, buf)`** — Remove and return the last `n` bytes, then append `buf`. Equivalent to `pop(n)` + `push(buf)` but atomically.
-- **`splice_into(old, new)`** — Like `splice` but reads removed bytes into a caller-supplied buffer instead of allocating a `Vec` (`n = old.len()`).
-- **`try_extend(s, buf)`** — Append `buf` only if the current payload size equals `s`. Returns `true` on success. Useful for optimistic-append protocols.
-- **`try_discard(s, n)`** — Discard `n` bytes only if the current payload size equals `s`. Returns `true` on success.
-- **`try_extend_zeros(s, n)`** — Append `n` zero bytes only if the current payload size equals `s`. Returns `true` on success.
-- **`replace(n, f)`** — Pop `n` bytes, pass them read-only to callback `f`, write back the returned `Vec` as the new tail. File may grow or shrink.
-- **`get_batched(ranges)`** — Read multiple byte ranges under a single read lock; ranges may overlap.  Returns one `Vec<u8>` per range.
-- **`get_batched_into(bufs)`** — Like `get_batched` but reads into caller-supplied `(offset, &mut [u8])` pairs.
-- **`get_batched_gen(f)`** — Like `get_batched_into` but the caller provides a generator closure yielding `(offset, buf)` pairs; useful for dependent reads where each range depends on a prior result.
-- **`swap(offset, buf)`** *(requires `set`)* — Read `buf.len()` bytes at `offset`, overwrite with `buf`, return old bytes. File size never changes.
-- **`swap_into(offset, buf)`** *(requires `set`)* — Like `swap` but exchanges in-place: on entry `buf` holds new bytes, on return holds old bytes.
-- **`cas(offset, old, new)`** *(requires `set`)* — Overwrite bytes at `offset` with `new` only if they currently equal `old`. Returns `true` if exchanged. File size never changes.
-- **`process(start, end, f)`** *(requires `set`)* — Read `[start, end)`, pass to `f` as `&mut [u8]` for in-place mutation, write back. File size never changes. `start == end` is a no-op.
-- **`process_gen(f)`** *(requires `set`)* — Like `get_batched_gen` but the closure can also end the sequence with a mutation: it yields `BStackGenOp::Read`, `Len`, `Write`, `Swap`, `Push`, `Pop`, or `Discard` values one at a time (in C, `Discard` is a `Pop` with a `NULL` destination buffer), and the write lock is held continuously from before the first step through the terminating `Write`/`Swap`/`Push`/`Pop`/`Discard` (at most one, ending the sequence). `Read` and `Len` do not end the sequence. Useful for dependent read-read-write protocols — e.g. mutex-free free-list pop at the allocator layer — where a CAS-based retry loop would leave an ABA window open. `Push`, `Pop`, and `Discard` are the only steps that change the file size; `Discard` truncates a tail without reading it back.
-- **`cross_exchange(a, b, n)`** *(requires `set`)* — Atomically swap two non-overlapping byte regions of length `n` under one write lock.
-- **`copy(from, to, n)`** *(requires `set`)* — Copy `n` bytes from `from` to `to` under one write lock.  Regions may overlap.
-- **`eq_crds(a_offset, a_expected, b_offset, b_buf)`** *(requires `set`)* — Write `b_buf` at `b_offset` only if bytes at `a_offset` equal `a_expected` (compare-and-swap across two regions). Returns `Some(old_b)` on success, `None` otherwise.
-- **`ne_crds(a_offset, a_expected, b_offset, b_buf)`** *(requires `set`)* — Like `eq_crds` but writes when region A does NOT match.
-- **`masked_eq_crds(a_offset, mask, a_expected, b_offset, b_buf)`** *(requires `set`)* — Like `eq_crds` with a bitmask applied to the comparison of region A.
-- **`masked_ne_crds(a_offset, mask, a_expected, b_offset, b_buf)`** *(requires `set`)* — Like `ne_crds` with a bitmask applied to the comparison of region A.
+- **`atrunc`**, **`splice`**, **`splice_into`** — atomic discard+push / pop+push tail replacement.
+- **`try_extend`**, **`try_discard`**, **`try_extend_zeros`** — size-checked, optimistic append/discard.
+- **`replace(n, f)`** — pop `n` bytes, pass to `f`, push back the returned tail.
+- **`get_batched`**, **`get_batched_into`**, **`get_batched_gen`** — read multiple (possibly dependent) ranges under one read lock.
+- **`swap`**, **`swap_into`**, **`cas`** *(requires `set`)* — atomic read-modify-write / compare-and-swap of a single region.
+- **`process`**, **`process_gen`** *(requires `set`)* — in-place mutation, or a dependent read/write sequence ending in at most one `Write`/`Swap`/`Push`/`Pop`/`Discard`.
+- **`cross_exchange`**, **`copy`** *(requires `set`)* — swap or copy two regions under one write lock.
+- **`eq_crds`**, **`ne_crds`**, **`masked_eq_crds`**, **`masked_ne_crds`** *(requires `set`)* — cross-region compare-and-swap, with `==`/`!=`/masked variants.
+
+See [API](#api) for full signatures and details.
 
 ---
 
@@ -519,7 +520,173 @@ bstack = { version = "0.2", features = ["alloc", "set"] }
 
 ---
 
-## Allocator (`alloc` feature)
+## File format
+
+```
+┌────────────────────────┬──────────────┬──────────────┐
+│      header (16 B)     │  payload 0   │  payload 1   │  ...
+│  magic[8] | clen[8 LE] │              │              │
+└────────────────────────┴──────────────┴──────────────┘
+^                        ^              ^              ^
+file offset 0        offset 16       16+n0          EOF
+```
+
+* **`magic`** — 8 bytes: `BSTK` + major(1 B) + minor(1 B) + patch(1 B) + reserved(1 B).
+  This version writes `BSTK\x00\x01\x0e\x00` (0.1.14).  `open` accepts any
+  0.1.x file (first 6 bytes `BSTK\x00\x01`) and rejects a different major or
+  minor as incompatible.
+* **`clen`** — little-endian `u64` recording the last successfully committed
+  payload length.  Updated on every `push` and `pop` before the durable sync.
+
+All user-visible offsets (returned by `push`, accepted by `peek`/`get`) are
+**logical** — 0-based from the start of the payload region (file byte 16).
+
+---
+
+## Durability
+
+| Operation                              | Sequence                                                                                  |
+|----------------------------------------|-------------------------------------------------------------------------------------------|
+| `push`                                 | `lseek(END)` → `write(data)` → `lseek(8)` → `write(clen)` → sync                          |
+| `extend`                               | `lseek(END)` → `set_len(new_end)` → `lseek(8)` → `write(clen)` → sync                     |
+| `pop`, `pop_into`                      | `lseek` → `read` → `ftruncate` → `lseek(8)` → `write(clen)` → sync                        |
+| `discard`                              | `ftruncate` → `lseek(8)` → `write(clen)` → sync                                           |
+| `set` *(feature)*                      | `lseek(offset)` → `write(data)` → sync                                                    |
+| `zero` *(feature)*                     | `lseek(offset)` → `write(zeros)` → sync                                                   |
+| `atrunc` *(atomic, net extension)*     | `set_len(new_end)` → `lseek(tail)` → `write(buf)` → sync → `write(clen)`                  |
+| `atrunc` *(atomic, net truncation)*    | `lseek(tail)` → `write(buf)` → `set_len(new_end)` → sync → `write(clen)`                  |
+| `splice`, `splice_into` *(atomic)*     | `lseek(tail)` → `read(n)` → *(then as `atrunc`)*                                          |
+| `try_extend` *(atomic)*                | size check → conditional `push` sequence                                                  |
+| `try_discard` *(atomic)*               | size check → conditional `discard` sequence                                               |
+| `try_extend_zeros` *(atomic)*          | size check → conditional `extend(n)` sequence                                             |
+| `swap`, `swap_into` *(set+atomic)*     | `lseek(offset)` → `read` → `lseek(offset)` → `write(buf)` → sync                          |
+| `cas` *(set+atomic)*                   | `lseek(offset)` → `read` → compare → conditional `write(new)` → sync                      |
+| `process` *(set+atomic)*               | `lseek(start)` → `read(end−start)` → *(callback)* → `lseek(start)` → `write(buf)` → sync  |
+| `process_gen` *(set+atomic)*           | closure-driven: zero or more `lseek`/`pread` reads and `Len` size queries, ending in at most one mutating step — `lseek` → `write` → sync for `Write`, the two-region read/read/write/write → sync of `cross_exchange` for `Swap`, an append (then `set_len` on rollback) → sync for `Push`, `lseek` → `read` → `set_len` → sync for `Pop`, or `set_len` → sync for `Discard` (a `Pop` with no read) |
+| `replace` *(atomic)*                   | `lseek(tail)` → `read(n)` → *(callback)* → *(then as `atrunc`)*                           |
+| `cross_exchange` *(set+atomic)*        | `lseek(a)` → `read(n)` → `lseek(b)` → `read(n)` → `lseek(a)` → `write` → `lseek(b)` → `write` → sync |
+| `copy` *(set+atomic)*                  | `lseek(from)` → `read(n)` → `lseek(to)` → `write(n)` → sync                               |
+| `eq_crds`, `ne_crds` *(set+atomic)*    | `lseek(a)` → `read` → compare → conditional `lseek(b)` → `write(b_buf)` → sync            |
+| `masked_eq_crds`, `masked_ne_crds` *(set+atomic)* | `lseek(a)` → `read` → mask+compare → conditional `lseek(b)` → `write(b_buf)` → sync |
+| `peek`, `peek_into`, `get`, `get_into`, `get_batched`, `get_batched_into`, `get_batched_gen` | `pread(2)` on Unix; `ReadFile`+`OVERLAPPED` on Windows; `lseek` → `read` elsewhere |
+
+**`durable_sync` on macOS** issues `fcntl(F_FULLFSYNC)`.  Unlike `fdatasync`,
+this flushes the drive controller's write cache, providing the same "barrier
+to stable media" guarantee that `fsync` gives on Linux.  Falls back to
+`sync_data` if the device does not support `F_FULLFSYNC`.
+
+**`durable_sync` on Linux / other Unix** calls `sync_data` (`fdatasync`).
+
+**`durable_sync` on Windows** calls `sync_data`, which maps to
+`FlushFileBuffers`.  This flushes the kernel write-back cache and waits for
+the drive to acknowledge, providing equivalent durability to `fdatasync`.
+
+**Push rollback:** if the write or sync fails, a best-effort `ftruncate` and
+header reset restore the pre-push state.
+
+---
+
+## Crash recovery
+
+The committed-length sentinel in the header ensures automatic recovery on the
+next `open`:
+
+| Condition               | Cause                                             | Recovery                                  |
+|-------------------------|---------------------------------------------------|-------------------------------------------|
+| `file_size − 16 > clen` | partial tail write (crashed before header update) | truncate to `16 + clen`, durable-sync     |
+| `file_size − 16 < clen` | partial truncation (crashed before header update) | set `clen = file_size − 16`, durable-sync |
+
+No caller action is required; recovery is transparent.
+
+---
+
+## Multi-process safety
+
+On **Unix**, `open` calls `flock(LOCK_EX | LOCK_NB)` on the file.  If another
+process already holds the lock, `open` returns immediately with
+`io::ErrorKind::WouldBlock`.  The lock is released when the `BStack` is
+dropped.
+
+On **Windows**, `open` calls `LockFileEx` with
+`LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY` covering the entire
+file range.  The same `WouldBlock` semantics apply (`ERROR_LOCK_VIOLATION`
+maps to `io::ErrorKind::WouldBlock` in Rust).  The lock is released when the
+`BStack` is dropped.
+
+> Both `flock` (Unix) and `LockFileEx` (Windows) are advisory and per-process.
+> They protect against concurrent `BStack::open` calls across well-behaved
+> processes, not against raw file access.
+
+---
+
+## Thread safety
+
+`BStack` wraps the file in a `RwLock<File>`.
+
+| Operation                                                    | Lock (Unix / Windows) | Lock (other) |
+|--------------------------------------------------------------|-----------------------|--------------|
+| `push`, `extend`, `pop`, `pop_into`, `discard`               | write                 | write        |
+| `set`, `zero` *(feature)*                                    | write                 | write        |
+| `atrunc`, `splice`, `splice_into`, `try_extend` *(atomic)*   | write                 | write        |
+| `try_discard(s, n > 0)` *(atomic)*                           | write                 | write        |
+| `try_discard(s, 0)` *(atomic)*                               | **read**              | **read**     |
+| `try_extend_zeros` *(atomic)*                                | write                 | write        |
+| `swap`, `swap_into`, `cas` *(set+atomic)*                    | write                 | write        |
+| `process`, `process_gen` *(set+atomic)*                      | write                 | write        |
+| `replace` *(atomic)*                                         | write                 | write        |
+| `cross_exchange`, `copy` *(set+atomic)*                      | write                 | write        |
+| `eq_crds`, `ne_crds` *(set+atomic)*                          | write                 | write        |
+| `masked_eq_crds`, `masked_ne_crds` *(set+atomic)*            | write                 | write        |
+| `peek`, `peek_into`, `get`, `get_into`                       | **read**              | write        |
+| `get_batched`, `get_batched_into`, `get_batched_gen` *(atomic)* | **read**           | write        |
+| `len`                                                        | read                  | read         |
+
+On Unix and Windows, `peek`, `peek_into`, `get`, and `get_into` use a
+cursor-safe positional read (`pread(2)` / `read_exact_at` on Unix; `ReadFile`
+with `OVERLAPPED` via `seek_read` on Windows) that does not modify the shared
+file-position cursor.  Multiple concurrent calls to any of these methods can
+therefore run in parallel.  Any in-progress `push`, `pop`, or `pop_into` still
+blocks all readers via the write lock, so readers always observe a consistent,
+committed state.
+
+On other platforms a seek is required; `peek`, `peek_into`, `get`, and
+`get_into` fall back to the write lock and reads serialise.
+
+Unlike `get_batched_gen`, which only ever takes the **read** lock, `process_gen`
+*always* takes the **write** lock — even for sequences that turn out to be
+read-only and end in `None` — because the closure may decide, only after
+seeing earlier reads, to end the sequence with a `Write` or `Swap`; the lock
+must therefore be acquired before the first read so the whole sequence runs as
+one indivisible step.
+
+---
+
+## Known limitations
+
+- **No record framing.** The file stores raw bytes; the caller must track how
+  many bytes each logical record occupies.
+- **Push rollback is best-effort.** A failure during rollback is silently
+  swallowed; crash recovery on the next `open` will repair the state.
+- **No `O_DIRECT`.** Writes go through the page cache; durability relies on
+  `durable_sync`, not cache bypass.
+- **Single file only.** There is no WAL, manifest, or secondary index.
+- **Multi-process lock is advisory.** `flock` (Unix) and `LockFileEx` (Windows) protect well-behaved processes but not raw file access.
+
+---
+
+## Why async is not planned
+
+Durability requires `fcntl(F_FULLFSYNC)` (macOS), `fdatasync` (Linux), or `FlushFileBuffers` (Windows) — all blocking syscalls that must complete before returning. All writes are tail-ordered with a mandatory `durable_sync` barrier; there is nothing to pipeline, and a `RwLock` serialises concurrent writers regardless. Adding Tokio even as an optional dependency would break the minimal-dependency guarantee. The idiomatic approach from async code is:
+
+```rust
+let result = tokio::task::spawn_blocking(move || {
+    stack.push(&data)
+}).await?;
+```
+
+---
+
+## Allocators (`alloc` feature)
 
 The `alloc` feature adds typed region management over a `BStack` payload.
 
@@ -759,59 +926,6 @@ let c = alloc.alloc(64)?; // reuses a's slot
 assert_eq!(c.start(), a.start());
 
 let stack = alloc.into_stack();
-```
-
-### `BStackByteVec<'a, A>` (`alloc + set` features)
-
-A growable byte (`u8`) vector backed by a `BStack` allocation, mirroring the core `Vec<u8>` API.
-
-For a general typed vector over arbitrary `Copy` types, see `PLANNED.md` — the general case requires a sound POD/byte-castable bound and is planned for a future release.
-
-```toml
-[dependencies]
-bstack = { version = "0.2", features = ["alloc", "set"] }
-```
-
-#### Memory layout
-
-```
-┌──────────────────────┬──────────────────────┬────────────────────────┐
-│   len  (8 B, LE u64) │   cap  (8 B, LE u64) │   elements: [u8; cap]  │
-└──────────────────────┴──────────────────────┴────────────────────────┘
-  byte 0                 byte 8                  byte 16
-```
-
-The header is re-read from disk on every call, so the `(len, cap)` metadata is
-recoverable after a crash by reconstructing the handle from the raw block via
-`BStackByteVec::from_raw_block`.
-
-#### Key behaviour
-
-- **Growth**: `push` reallocates to `max(cap × 2, 4)` bytes when `len == cap`. New space is zero-initialised by `BStack::extend`.
-- **Readback helper**: `read_bytes` loads all logical bytes into a Rust `Vec<u8>`.
-- **Zeroing on removal**: `pop` decrements `len` before zeroing the vacated slot; `truncate` writes the new `len` before zeroing removed slots in a single `BStackSlice::zero_range` call. Deallocation zeroing is delegated to the allocator.
-- **Iterator**: `BStackByteVecIter` borrows the vec immutably for its lifetime (preventing concurrent mutation) and yields `io::Result<u8>` per byte, reading from disk on demand.
-
-#### Example
-
-```rust
-use bstack::{BStack, BStackByteVec, LinearBStackAllocator};
-
-let alloc = LinearBStackAllocator::new(BStack::open("buf.bstack")?);
-
-let mut v: BStackByteVec<_> = BStackByteVec::new(&alloc)?;
-v.push(b'A')?;
-v.push(b'B')?;
-v.push(b'C')?;
-
-assert_eq!(v.len()?, 3);
-assert_eq!(v.get(1)?, Some(b'B'));
-assert_eq!(v.pop()?, Some(b'C'));
-
-let all = v.read_bytes()?;
-println!("{}", String::from_utf8_lossy(&all));
-
-alloc.dealloc(v.into_raw_block())?;
 ```
 
 ### `GhostTreeBstackAllocator` (`alloc` feature)
@@ -1121,166 +1235,56 @@ complements but does not replace the allocator's own crash-safety guarantees.
 
 ---
 
-## File format
+## `BStackByteVec<'a, A>` (`alloc + set` features)
+
+A growable byte (`u8`) vector backed by a `BStack` allocation, mirroring the core `Vec<u8>` API.
+
+For a general typed vector over arbitrary `Copy` types, see `PLANNED.md` — the general case requires a sound POD/byte-castable bound and is planned for a future release.
+
+```toml
+[dependencies]
+bstack = { version = "0.2", features = ["alloc", "set"] }
+```
+
+### Memory layout
 
 ```
-┌────────────────────────┬──────────────┬──────────────┐
-│      header (16 B)     │  payload 0   │  payload 1   │  ...
-│  magic[8] | clen[8 LE] │              │              │
-└────────────────────────┴──────────────┴──────────────┘
-^                        ^              ^              ^
-file offset 0        offset 16       16+n0          EOF
+┌──────────────────────┬──────────────────────┬────────────────────────┐
+│   len  (8 B, LE u64) │   cap  (8 B, LE u64) │   elements: [u8; cap]  │
+└──────────────────────┴──────────────────────┴────────────────────────┘
+  byte 0                 byte 8                  byte 16
 ```
 
-* **`magic`** — 8 bytes: `BSTK` + major(1 B) + minor(1 B) + patch(1 B) + reserved(1 B).
-  This version writes `BSTK\x00\x01\x0e\x00` (0.1.14).  `open` accepts any
-  0.1.x file (first 6 bytes `BSTK\x00\x01`) and rejects a different major or
-  minor as incompatible.
-* **`clen`** — little-endian `u64` recording the last successfully committed
-  payload length.  Updated on every `push` and `pop` before the durable sync.
+The header is re-read from disk on every call, so the `(len, cap)` metadata is
+recoverable after a crash by reconstructing the handle from the raw block via
+`BStackByteVec::from_raw_block`.
 
-All user-visible offsets (returned by `push`, accepted by `peek`/`get`) are
-**logical** — 0-based from the start of the payload region (file byte 16).
+### Key behaviour
 
----
+- **Growth**: `push` reallocates to `max(cap × 2, 4)` bytes when `len == cap`. New space is zero-initialised by `BStack::extend`.
+- **Readback helper**: `read_bytes` loads all logical bytes into a Rust `Vec<u8>`.
+- **Zeroing on removal**: `pop` decrements `len` before zeroing the vacated slot; `truncate` writes the new `len` before zeroing removed slots in a single `BStackSlice::zero_range` call. Deallocation zeroing is delegated to the allocator.
+- **Iterator**: `BStackByteVecIter` borrows the vec immutably for its lifetime (preventing concurrent mutation) and yields `io::Result<u8>` per byte, reading from disk on demand.
 
-## Durability
-
-| Operation                              | Sequence                                                                                  |
-|----------------------------------------|-------------------------------------------------------------------------------------------|
-| `push`                                 | `lseek(END)` → `write(data)` → `lseek(8)` → `write(clen)` → sync                          |
-| `extend`                               | `lseek(END)` → `set_len(new_end)` → `lseek(8)` → `write(clen)` → sync                     |
-| `pop`, `pop_into`                      | `lseek` → `read` → `ftruncate` → `lseek(8)` → `write(clen)` → sync                        |
-| `discard`                              | `ftruncate` → `lseek(8)` → `write(clen)` → sync                                           |
-| `set` *(feature)*                      | `lseek(offset)` → `write(data)` → sync                                                    |
-| `zero` *(feature)*                     | `lseek(offset)` → `write(zeros)` → sync                                                   |
-| `atrunc` *(atomic, net extension)*     | `set_len(new_end)` → `lseek(tail)` → `write(buf)` → sync → `write(clen)`                  |
-| `atrunc` *(atomic, net truncation)*    | `lseek(tail)` → `write(buf)` → `set_len(new_end)` → sync → `write(clen)`                  |
-| `splice`, `splice_into` *(atomic)*     | `lseek(tail)` → `read(n)` → *(then as `atrunc`)*                                          |
-| `try_extend` *(atomic)*                | size check → conditional `push` sequence                                                  |
-| `try_discard` *(atomic)*               | size check → conditional `discard` sequence                                               |
-| `try_extend_zeros` *(atomic)*          | size check → conditional `extend(n)` sequence                                             |
-| `swap`, `swap_into` *(set+atomic)*     | `lseek(offset)` → `read` → `lseek(offset)` → `write(buf)` → sync                          |
-| `cas` *(set+atomic)*                   | `lseek(offset)` → `read` → compare → conditional `write(new)` → sync                      |
-| `process` *(set+atomic)*               | `lseek(start)` → `read(end−start)` → *(callback)* → `lseek(start)` → `write(buf)` → sync  |
-| `process_gen` *(set+atomic)*           | closure-driven: zero or more `lseek`/`pread` reads and `Len` size queries, ending in at most one mutating step — `lseek` → `write` → sync for `Write`, the two-region read/read/write/write → sync of `cross_exchange` for `Swap`, an append (then `set_len` on rollback) → sync for `Push`, `lseek` → `read` → `set_len` → sync for `Pop`, or `set_len` → sync for `Discard` (a `Pop` with no read) |
-| `replace` *(atomic)*                   | `lseek(tail)` → `read(n)` → *(callback)* → *(then as `atrunc`)*                           |
-| `cross_exchange` *(set+atomic)*        | `lseek(a)` → `read(n)` → `lseek(b)` → `read(n)` → `lseek(a)` → `write` → `lseek(b)` → `write` → sync |
-| `copy` *(set+atomic)*                  | `lseek(from)` → `read(n)` → `lseek(to)` → `write(n)` → sync                               |
-| `eq_crds`, `ne_crds` *(set+atomic)*    | `lseek(a)` → `read` → compare → conditional `lseek(b)` → `write(b_buf)` → sync            |
-| `masked_eq_crds`, `masked_ne_crds` *(set+atomic)* | `lseek(a)` → `read` → mask+compare → conditional `lseek(b)` → `write(b_buf)` → sync |
-| `peek`, `peek_into`, `get`, `get_into`, `get_batched`, `get_batched_into`, `get_batched_gen` | `pread(2)` on Unix; `ReadFile`+`OVERLAPPED` on Windows; `lseek` → `read` elsewhere |
-
-**`durable_sync` on macOS** issues `fcntl(F_FULLFSYNC)`.  Unlike `fdatasync`,
-this flushes the drive controller's write cache, providing the same "barrier
-to stable media" guarantee that `fsync` gives on Linux.  Falls back to
-`sync_data` if the device does not support `F_FULLFSYNC`.
-
-**`durable_sync` on Linux / other Unix** calls `sync_data` (`fdatasync`).
-
-**`durable_sync` on Windows** calls `sync_data`, which maps to
-`FlushFileBuffers`.  This flushes the kernel write-back cache and waits for
-the drive to acknowledge, providing equivalent durability to `fdatasync`.
-
-**Push rollback:** if the write or sync fails, a best-effort `ftruncate` and
-header reset restore the pre-push state.
-
----
-
-## Crash recovery
-
-The committed-length sentinel in the header ensures automatic recovery on the
-next `open`:
-
-| Condition               | Cause                                             | Recovery                                  |
-|-------------------------|---------------------------------------------------|-------------------------------------------|
-| `file_size − 16 > clen` | partial tail write (crashed before header update) | truncate to `16 + clen`, durable-sync     |
-| `file_size − 16 < clen` | partial truncation (crashed before header update) | set `clen = file_size − 16`, durable-sync |
-
-No caller action is required; recovery is transparent.
-
----
-
-## Multi-process safety
-
-On **Unix**, `open` calls `flock(LOCK_EX | LOCK_NB)` on the file.  If another
-process already holds the lock, `open` returns immediately with
-`io::ErrorKind::WouldBlock`.  The lock is released when the `BStack` is
-dropped.
-
-On **Windows**, `open` calls `LockFileEx` with
-`LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY` covering the entire
-file range.  The same `WouldBlock` semantics apply (`ERROR_LOCK_VIOLATION`
-maps to `io::ErrorKind::WouldBlock` in Rust).  The lock is released when the
-`BStack` is dropped.
-
-> Both `flock` (Unix) and `LockFileEx` (Windows) are advisory and per-process.
-> They protect against concurrent `BStack::open` calls across well-behaved
-> processes, not against raw file access.
-
----
-
-## Thread safety
-
-`BStack` wraps the file in a `RwLock<File>`.
-
-| Operation                                                    | Lock (Unix / Windows) | Lock (other) |
-|--------------------------------------------------------------|-----------------------|--------------|
-| `push`, `extend`, `pop`, `pop_into`, `discard`               | write                 | write        |
-| `set`, `zero` *(feature)*                                    | write                 | write        |
-| `atrunc`, `splice`, `splice_into`, `try_extend` *(atomic)*   | write                 | write        |
-| `try_discard(s, n > 0)` *(atomic)*                           | write                 | write        |
-| `try_discard(s, 0)` *(atomic)*                               | **read**              | **read**     |
-| `try_extend_zeros` *(atomic)*                                | write                 | write        |
-| `swap`, `swap_into`, `cas` *(set+atomic)*                    | write                 | write        |
-| `process`, `process_gen` *(set+atomic)*                      | write                 | write        |
-| `replace` *(atomic)*                                         | write                 | write        |
-| `cross_exchange`, `copy` *(set+atomic)*                      | write                 | write        |
-| `eq_crds`, `ne_crds` *(set+atomic)*                          | write                 | write        |
-| `masked_eq_crds`, `masked_ne_crds` *(set+atomic)*            | write                 | write        |
-| `peek`, `peek_into`, `get`, `get_into`                       | **read**              | write        |
-| `get_batched`, `get_batched_into`, `get_batched_gen` *(atomic)* | **read**           | write        |
-| `len`                                                        | read                  | read         |
-
-On Unix and Windows, `peek`, `peek_into`, `get`, and `get_into` use a
-cursor-safe positional read (`pread(2)` / `read_exact_at` on Unix; `ReadFile`
-with `OVERLAPPED` via `seek_read` on Windows) that does not modify the shared
-file-position cursor.  Multiple concurrent calls to any of these methods can
-therefore run in parallel.  Any in-progress `push`, `pop`, or `pop_into` still
-blocks all readers via the write lock, so readers always observe a consistent,
-committed state.
-
-On other platforms a seek is required; `peek`, `peek_into`, `get`, and
-`get_into` fall back to the write lock and reads serialise.
-
-Unlike `get_batched_gen`, which only ever takes the **read** lock, `process_gen`
-*always* takes the **write** lock — even for sequences that turn out to be
-read-only and end in `None` — because the closure may decide, only after
-seeing earlier reads, to end the sequence with a `Write` or `Swap`; the lock
-must therefore be acquired before the first read so the whole sequence runs as
-one indivisible step.
-
----
-
-## Known limitations
-
-- **No record framing.** The file stores raw bytes; the caller must track how
-  many bytes each logical record occupies.
-- **Push rollback is best-effort.** A failure during rollback is silently
-  swallowed; crash recovery on the next `open` will repair the state.
-- **No `O_DIRECT`.** Writes go through the page cache; durability relies on
-  `durable_sync`, not cache bypass.
-- **Single file only.** There is no WAL, manifest, or secondary index.
-- **Multi-process lock is advisory.** `flock` (Unix) and `LockFileEx` (Windows) protect well-behaved processes but not raw file access.
-
----
-
-## Why async is not planned
-
-Durability requires `fcntl(F_FULLFSYNC)` (macOS), `fdatasync` (Linux), or `FlushFileBuffers` (Windows) — all blocking syscalls that must complete before returning. All writes are tail-ordered with a mandatory `durable_sync` barrier; there is nothing to pipeline, and a `RwLock` serialises concurrent writers regardless. Adding Tokio even as an optional dependency would break the minimal-dependency guarantee. The idiomatic approach from async code is:
+### Example
 
 ```rust
-let result = tokio::task::spawn_blocking(move || {
-    stack.push(&data)
-}).await?;
+use bstack::{BStack, BStackByteVec, LinearBStackAllocator};
+
+let alloc = LinearBStackAllocator::new(BStack::open("buf.bstack")?);
+
+let mut v: BStackByteVec<_> = BStackByteVec::new(&alloc)?;
+v.push(b'A')?;
+v.push(b'B')?;
+v.push(b'C')?;
+
+assert_eq!(v.len()?, 3);
+assert_eq!(v.get(1)?, Some(b'B'));
+assert_eq!(v.pop()?, Some(b'C'));
+
+let all = v.read_bytes()?;
+println!("{}", String::from_utf8_lossy(&all));
+
+alloc.dealloc(v.into_raw_block())?;
 ```
+
