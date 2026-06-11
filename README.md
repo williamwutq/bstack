@@ -165,6 +165,15 @@ impl BStack {
     #[cfg(all(feature = "set", feature = "atomic"))]
     pub fn cross_exchange(&self, a: u64, b: u64, n: u64) -> io::Result<()>;
 
+    /// Run a sequence of dependent reads, optionally followed by a single write, under
+    /// one held write lock. `f` is called in a loop and drives the sequence through
+    /// `BStackGenOp::{Read, Len, Write, Swap, Push, Pop, Discard}`; at most one of
+    /// `Write`/`Swap`/`Push`/`Pop`/`Discard` is permitted and ends the sequence.
+    /// Requires the `set` and `atomic` features.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    pub fn process_gen<'a, F>(&self, f: F) -> io::Result<()>
+    where F: FnMut() -> Option<BStackGenOp<'a>>;
+
     /// Copy `n` bytes from `from` to `to` under one write lock.  Regions may overlap.
     /// Requires the `set` and `atomic` features.
     #[cfg(all(feature = "set", feature = "atomic"))]
