@@ -165,6 +165,15 @@ impl BStack {
     #[cfg(all(feature = "set", feature = "atomic"))]
     pub fn cross_exchange(&self, a: u64, b: u64, n: u64) -> io::Result<()>;
 
+    /// Run a sequence of dependent reads, optionally followed by a single write, under
+    /// one held write lock. `f` is called in a loop and drives the sequence through
+    /// `BStackGenOp::{Read, Len, Write, Swap, Push, Pop, Discard}`; at most one of
+    /// `Write`/`Swap`/`Push`/`Pop`/`Discard` is permitted and ends the sequence.
+    /// Requires the `set` and `atomic` features.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    pub fn process_gen<'a, F>(&self, f: F) -> io::Result<()>
+    where F: FnMut() -> Option<BStackGenOp<'a>>;
+
     /// Copy `n` bytes from `from` to `to` under one write lock.  Regions may overlap.
     /// Requires the `set` and `atomic` features.
     #[cfg(all(feature = "set", feature = "atomic"))]
@@ -478,7 +487,7 @@ bstack = { version = "0.2", features = ["set", "atomic"] }
 - **`swap_into(offset, buf)`** *(requires `set`)* — Like `swap` but exchanges in-place: on entry `buf` holds new bytes, on return holds old bytes.
 - **`cas(offset, old, new)`** *(requires `set`)* — Overwrite bytes at `offset` with `new` only if they currently equal `old`. Returns `true` if exchanged. File size never changes.
 - **`process(start, end, f)`** *(requires `set`)* — Read `[start, end)`, pass to `f` as `&mut [u8]` for in-place mutation, write back. File size never changes. `start == end` is a no-op.
-- **`process_gen(f)`** *(requires `set`)* — Like `get_batched_gen` but the closure can also end the sequence with a mutation: it yields `BStackGenOp::Read`, `Len`, `Write`, `Swap`, `Push`, or `Pop` values one at a time, and the write lock is held continuously from before the first step through the terminating `Write`/`Swap`/`Push`/`Pop` (at most one, ending the sequence). `Read` and `Len` do not end the sequence. Useful for dependent read-read-write protocols — e.g. mutex-free free-list pop at the allocator layer — where a CAS-based retry loop would leave an ABA window open. `Push` and `Pop` are the only steps that change the file size.
+- **`process_gen(f)`** *(requires `set`)* — Like `get_batched_gen` but the closure can also end the sequence with a mutation: it yields `BStackGenOp::Read`, `Len`, `Write`, `Swap`, `Push`, `Pop`, or `Discard` values one at a time (in C, `Discard` is a `Pop` with a `NULL` destination buffer), and the write lock is held continuously from before the first step through the terminating `Write`/`Swap`/`Push`/`Pop`/`Discard` (at most one, ending the sequence). `Read` and `Len` do not end the sequence. Useful for dependent read-read-write protocols — e.g. mutex-free free-list pop at the allocator layer — where a CAS-based retry loop would leave an ABA window open. `Push`, `Pop`, and `Discard` are the only steps that change the file size; `Discard` truncates a tail without reading it back.
 - **`cross_exchange(a, b, n)`** *(requires `set`)* — Atomically swap two non-overlapping byte regions of length `n` under one write lock.
 - **`copy(from, to, n)`** *(requires `set`)* — Copy `n` bytes from `from` to `to` under one write lock.  Regions may overlap.
 - **`eq_crds(a_offset, a_expected, b_offset, b_buf)`** *(requires `set`)* — Write `b_buf` at `b_offset` only if bytes at `a_offset` equal `a_expected` (compare-and-swap across two regions). Returns `Some(old_b)` on success, `None` otherwise.
@@ -957,7 +966,7 @@ Each free-list mutation is two `BStack` calls: write the next-pointer into the b
 
 Without the `atomic` feature it is **not `Sync`**: free-list mutations require a read then a write of `free_head` as separate `BStack` calls — a TOCTOU race under concurrent `&self` access that can result in two callers receiving the same block.
 
-With the `atomic` feature it **is `Sync`**. An internal mutex serialises all compound operations that span multiple `BStack` calls: free-list pop/push and the tail-length check that precedes any `extend` or `discard`. The tail-path operations themselves use `try_discard` / `try_extend_zeros`, which check-and-act atomically under `BStack`'s own write lock without needing the allocator lock.
+With the `atomic` feature it **is `Sync`** with no allocator-level lock at all. Free-list pop drives a single `BStack::process_gen` sequence that holds `BStack`'s write lock across the read of `free_head`, the read of the popped block's `next` pointer, and the write that advances `free_head` — closing the ABA window a `get`/`cas` pair would leave open. Free-list push splices a single block (or a whole freed run) onto the head with one `BStack::cross_exchange`. Tail grow/shrink use `try_extend_zeros` / `try_discard`, which check-and-act atomically under `BStack`'s own write lock. Every concurrent `&self` operation is therefore safe through `BStack`'s interior mutability alone — no `Mutex`.
 
 #### Constructors
 
@@ -1058,7 +1067,7 @@ Free-list mutations write block payloads before updating `free_head`. The overhe
 
 Without the `atomic` feature it is **not `Sync`**: free-list mutations read then write `free_head` as separate `BStack` calls — a TOCTOU race under concurrent `&self` access.
 
-With the `atomic` feature it **is `Sync`**. An internal mutex serialises all compound operations: free-list pop/push, the tail-length checks preceding `extend` or `discard`, and the `recover` scan. Tail deallocations use `try_discard` (atomically checks tail and removes bytes under `BStack`'s own write lock) without needing the allocator lock. The shrink path acquires the lock before the tail check because the overhead must be written before discarding.
+With the `atomic` feature it **is `Sync`**. `alloc` / `dealloc` / `realloc` take no allocator-level lock: free-list pop uses a single `BStack::process_gen` sequence, free-list push uses `BStack::cross_exchange`, and tail grow/shrink use `try_extend_zeros` / `try_discard` — all check-and-act atomically under `BStack`'s own write lock (the shrink path writes the overhead before the tail check, since the overhead must be committed before discarding). The one retained `Mutex` is held only by `recover`, to keep recovery single-flight (two concurrent runs could otherwise reclaim the same leaked block twice); the recovery scan itself is serialised against alloc/dealloc/realloc by the `BStack` write lock it holds across one `process_gen` sequence, not by the `Mutex`.
 
 #### Constructors
 
@@ -1154,7 +1163,7 @@ All user-visible offsets (returned by `push`, accepted by `peek`/`get`) are
 | `swap`, `swap_into` *(set+atomic)*     | `lseek(offset)` → `read` → `lseek(offset)` → `write(buf)` → sync                          |
 | `cas` *(set+atomic)*                   | `lseek(offset)` → `read` → compare → conditional `write(new)` → sync                      |
 | `process` *(set+atomic)*               | `lseek(start)` → `read(end−start)` → *(callback)* → `lseek(start)` → `write(buf)` → sync  |
-| `process_gen` *(set+atomic)*           | closure-driven: zero or more `lseek`/`pread` reads and `Len` size queries, ending in at most one mutating step — `lseek` → `write` → sync for `Write`, the two-region read/read/write/write → sync of `cross_exchange` for `Swap`, an append (then `set_len` on rollback) → sync for `Push`, or `lseek` → `read` → `set_len` → sync for `Pop` |
+| `process_gen` *(set+atomic)*           | closure-driven: zero or more `lseek`/`pread` reads and `Len` size queries, ending in at most one mutating step — `lseek` → `write` → sync for `Write`, the two-region read/read/write/write → sync of `cross_exchange` for `Swap`, an append (then `set_len` on rollback) → sync for `Push`, `lseek` → `read` → `set_len` → sync for `Pop`, or `set_len` → sync for `Discard` (a `Pop` with no read) |
 | `replace` *(atomic)*                   | `lseek(tail)` → `read(n)` → *(callback)* → *(then as `atrunc`)*                           |
 | `cross_exchange` *(set+atomic)*        | `lseek(a)` → `read(n)` → `lseek(b)` → `read(n)` → `lseek(a)` → `write` → `lseek(b)` → `write` → sync |
 | `copy` *(set+atomic)*                  | `lseek(from)` → `read(n)` → `lseek(to)` → `write(n)` → sync                               |

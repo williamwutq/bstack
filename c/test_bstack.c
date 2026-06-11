@@ -3220,6 +3220,44 @@ static int test_process_gen_pop_removes_and_ends_sequence(void)
     return 0;
 }
 
+static int pg_pop_null_buf_gen(bstack_gen_op_t *out_op, void *userctx)
+{
+    int *calls = userctx;
+    (*calls)++;
+    if (*calls == 1) {
+        /* NULL destination: discard the tail without copying it out. */
+        out_op->kind      = BSTACK_GEN_POP;
+        out_op->u.pop.buf = NULL;
+        out_op->u.pop.len = 5;
+    } else {
+        out_op->kind           = BSTACK_GEN_WRITE;
+        out_op->u.write.offset = 0;
+        out_op->u.write.data   = (const uint8_t *)"NOPE!";
+        out_op->u.write.len    = 5;
+    }
+    return 1;
+}
+
+static int test_process_gen_pop_null_buf_discards_and_ends_sequence(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"helloworld", 10, NULL) == 0);
+    int calls = 0;
+    CHECK(bstack_process_gen(bs, pg_pop_null_buf_gen, &calls) == 0);
+    CHECK(calls == 1);
+
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 5);
+    uint8_t buf[5]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(memcmp(buf, "hello", 5) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
 static int pg_pop_zero_gen(bstack_gen_op_t *out_op, void *userctx)
 {
     (void)userctx;
@@ -4210,6 +4248,7 @@ int main(void)
     T(test_process_gen_push_appends_and_ends_sequence);
     T(test_process_gen_push_empty_data_is_noop_and_ends_sequence);
     T(test_process_gen_pop_removes_and_ends_sequence);
+    T(test_process_gen_pop_null_buf_discards_and_ends_sequence);
     T(test_process_gen_pop_zero_is_noop_and_ends_sequence);
     T(test_process_gen_pop_exceeds_payload_returns_error);
     T(test_process_gen_pop_below_locked_returns_error);

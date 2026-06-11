@@ -394,9 +394,9 @@
 //!   with the `atomic` feature, where an internal `Mutex` serialises AVL tree
 //!   mutations.
 //!
-//! * [`SlabBStackAllocator`] — **Experimental.** Fixed-block slab allocator.  All blocks are
-//!   exactly `block_size` bytes with no per-block header or footer; freed
-//!   blocks are tracked via an intrusive singly-linked free list stored in
+//! * [`SlabBStackAllocator`] — **Experimental.** Fixed-block slab allocator.
+//!   All blocks are exactly `block_size` bytes with no per-block header or footer;
+//!   freed blocks are tracked via an intrusive singly-linked free list stored in
 //!   the first 8 bytes of each free block.  O(1) alloc and dealloc.
 //!   Use [`SlabBStackAllocator::new`] to initialise an empty stack and
 //!   [`SlabBStackAllocator::open`] to reopen an existing one.
@@ -2220,6 +2220,18 @@ pub enum BStackGenOp<'a> {
         /// popped.
         buf: &'a mut [u8],
     },
+    /// Remove the last `len` bytes from the end of the file, shrinking the
+    /// payload by `len` bytes, and ending the sequence.
+    ///
+    /// The dropped bytes are **not** read back — the in-sequence equivalent of
+    /// [`discard`](BStack::discard), and the buffer-free counterpart of
+    /// [`Pop`](Self::Pop) (mirroring a C `pop` with a `NULL` destination).
+    /// Useful for truncating a tail whose size is only known once earlier
+    /// `Read`s have been resolved, without allocating a throwaway buffer.
+    Discard {
+        /// Number of bytes to remove from the end of the file.
+        len: u64,
+    },
     /// Write the current logical payload size, in bytes, into `out`, then
     /// call `f` again — does not end the sequence.
     Len {
@@ -2644,6 +2656,10 @@ impl BStack {
     /// - `Some(BStackGenOp::Pop { buf })` removes the last `buf.len()` bytes
     ///   from the end of the file into `buf`, shrinking the payload, and ends
     ///   the sequence — the in-sequence equivalent of [`pop`](Self::pop).
+    /// - `Some(BStackGenOp::Discard { len })` removes the last `len` bytes from
+    ///   the end of the file without reading them back, shrinking the payload,
+    ///   and ends the sequence — the in-sequence equivalent of
+    ///   [`discard`](Self::discard) and the buffer-free counterpart of `Pop`.
     /// - `Some(BStackGenOp::Len { out })` writes the current logical payload
     ///   size into `out` and calls `f` again — the in-sequence equivalent of
     ///   [`len`](Self::len), useful when a later step's offset depends on the
@@ -2652,17 +2668,17 @@ impl BStack {
     ///   reads alone inform a decision, including the decision to change
     ///   nothing.
     ///
-    /// `Write`, `Swap`, `Push`, and `Pop` are the only mutating operations,
-    /// exactly one is permitted per call, and any one of them ends the
-    /// sequence immediately — `f` is not called again afterwards.
+    /// `Write`, `Swap`, `Push`, `Pop`, and `Discard` are the only mutating
+    /// operations, exactly one is permitted per call, and any one of them ends
+    /// the sequence immediately — `f` is not called again afterwards.
     ///
     /// Holding the write lock across every read and the final mutation means
     /// no other thread can observe or modify any region of the file in
     /// between — the guarantee that [`get_batched_gen`](Self::get_batched_gen)
     /// followed by a separate [`cas`](Self::cas) cannot provide, since the two
     /// separate lock acquisitions leave an ABA window.  The mutated region(s)
-    /// need not overlap any region that was read.  `Push` and `Pop` are the
-    /// only steps that change the file size.
+    /// need not overlap any region that was read.  `Push`, `Pop`, and
+    /// `Discard` are the only steps that change the file size.
     ///
     /// Reads of the locked region `[0, locked_len())` are permitted, matching
     /// [`get`](Self::get) — locked bytes are immutable, so observing them
@@ -2680,10 +2696,11 @@ impl BStack {
     /// Returns [`io::ErrorKind::InvalidInput`] if any `offset + len` overflows
     /// `u64`, if a read, write, or swap range exceeds the current payload
     /// size, if the two `Swap` regions overlap, if a write or swap range
-    /// overlaps the locked region `[0, locked_len())`, if a `Pop` removes more
-    /// bytes than the current payload size, or if a `Pop` would shrink the
-    /// payload below the locked length.  Propagates any I/O error from
-    /// `read_exact`, `write_all`, `set_len`, or `durable_sync`.
+    /// overlaps the locked region `[0, locked_len())`, if a `Pop` or `Discard`
+    /// removes more bytes than the current payload size, or if a `Pop` or
+    /// `Discard` would shrink the payload below the locked length.  Propagates
+    /// any I/O error from `read_exact`, `write_all`, `set_len`, or
+    /// `durable_sync`.
     #[cfg(all(feature = "set", feature = "atomic"))]
     pub fn process_gen<'a, F>(&self, mut f: F) -> io::Result<()>
     where
@@ -2889,6 +2906,31 @@ impl BStack {
                     if n > 0 {
                         file.seek(SeekFrom::Start(HEADER_SIZE + new_data_len))?;
                         file.read_exact(buf)?;
+                        file.set_len(HEADER_SIZE + new_data_len)?;
+                        write_committed_len(&mut file, new_data_len)?;
+                        durable_sync(&file)?;
+                    }
+                    return Ok(());
+                }
+                Some(BStackGenOp::Discard { len }) => {
+                    if len > data_size {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!(
+                                "process_gen: discard({len}) exceeds payload size ({data_size})"
+                            ),
+                        ));
+                    }
+                    let new_data_len = data_size - len;
+                    if new_data_len < locked {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!(
+                                "process_gen: discard({len}) would shrink payload below locked length ({locked})"
+                            ),
+                        ));
+                    }
+                    if len > 0 {
                         file.set_len(HEADER_SIZE + new_data_len)?;
                         write_committed_len(&mut file, new_data_len)?;
                         durable_sync(&file)?;

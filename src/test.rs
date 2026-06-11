@@ -4672,6 +4672,101 @@ mod atomic_tests {
 
     #[cfg(all(feature = "set", feature = "atomic"))]
     #[test]
+    fn process_gen_discard_removes_and_ends_sequence() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        let mut calls = 0usize;
+        s.process_gen(|| {
+            calls += 1;
+            match calls {
+                1 => Some(BStackGenOp::Discard { len: 5 }),
+                _ => Some(BStackGenOp::Write {
+                    offset: 0,
+                    data: b"NOPE!",
+                }),
+            }
+        })
+        .unwrap();
+        assert_eq!(calls, 1, "Discard must end the sequence, like Pop");
+        assert_eq!(s.len().unwrap(), 5);
+        assert_eq!(s.peek(0).unwrap(), b"hello");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn process_gen_discard_zero_is_noop_and_ends_sequence() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        s.process_gen(|| Some(BStackGenOp::Discard { len: 0 }))
+            .unwrap();
+        assert_eq!(s.len().unwrap(), 5);
+        assert_eq!(s.peek(0).unwrap(), b"hello");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn process_gen_discard_exceeds_payload_returns_error() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hi").unwrap();
+        let err = s
+            .process_gen(|| Some(BStackGenOp::Discard { len: 10 }))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(s.len().unwrap(), 2);
+        assert_eq!(s.peek(0).unwrap(), b"hi");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn process_gen_discard_below_locked_returns_error() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        s.lock_up_to(8).unwrap();
+        let err = s
+            .process_gen(|| Some(BStackGenOp::Discard { len: 5 }))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(s.len().unwrap(), 10);
+        assert_eq!(s.peek(0).unwrap(), b"helloworld");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn process_gen_len_informs_discard_size() {
+        use crate::BStackGenOp;
+        // Discard a trailing region whose length is only known once `Len` has
+        // reported the current size — the buffer-free analogue of the Pop case.
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"keepDROP").unwrap();
+        let mut size = 0u64;
+        let mut calls = 0usize;
+        s.process_gen(|| {
+            calls += 1;
+            match calls {
+                // SAFETY: `size` outlives this whole `process_gen` call.
+                1 => Some(BStackGenOp::Len {
+                    out: unsafe { core::mem::transmute::<&mut u64, _>(&mut size) },
+                }),
+                _ => Some(BStackGenOp::Discard { len: size - 4 }),
+            }
+        })
+        .unwrap();
+        assert_eq!(size, 8);
+        assert_eq!(s.len().unwrap(), 4);
+        assert_eq!(s.peek(0).unwrap(), b"keep");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
     fn process_gen_len_reports_current_size_and_continues() {
         use crate::BStackGenOp;
         let (s, p) = mk_stack();

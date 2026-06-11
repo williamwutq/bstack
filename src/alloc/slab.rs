@@ -6,13 +6,13 @@
 
 use super::{BStackAllocator, BStackSlice};
 use crate::BStack;
+#[cfg(feature = "atomic")]
+use crate::BStackGenOp;
 #[cfg(not(feature = "atomic"))]
 use core::cell::Cell;
 #[cfg(not(feature = "atomic"))]
 use core::marker::PhantomData;
 use core::num::NonZeroU64;
-#[cfg(feature = "atomic")]
-use std::sync::Mutex;
 use std::{fmt, io};
 
 #[cfg(feature = "set")]
@@ -62,6 +62,12 @@ const ALSL_MAGIC_PREFIX: [u8; 6] = *b"ALSL\x00\x01";
 /// block being operated on; the rest of the free list remains consistent and
 /// the file can be used without recovery.
 ///
+/// With the `atomic` feature, free-list push and pop instead use
+/// [`BStack::cross_exchange`] and [`BStack::process_gen`] (see
+/// [Thread safety](#thread-safety)); the call counts in the table below are
+/// for the non-`atomic` implementation, but the atomicity class of each
+/// operation is unchanged or improved.
+///
 /// # Method safety
 ///
 /// | Method                               | Atomicity       | `BStack` op      | Crash effect.             |
@@ -97,18 +103,22 @@ const ALSL_MAGIC_PREFIX: [u8; 6] = *b"ALSL\x00\x01";
 /// TOCTOU race under concurrent `&self` access that can result in two callers
 /// receiving the same block.
 ///
-/// With the `atomic` feature it **is `Sync`**. An internal [`Mutex`] serialises
-/// free-list pop/push operations that require multiple [`BStack`] calls.
-/// Tail grow/shrink paths use [`BStack::try_extend_zeros`] / [`BStack::try_discard`]
-/// to perform check-and-act atomically under `BStack`'s write lock without holding
-/// the allocator mutex.
+/// With the `atomic` feature it **is `Sync`** with no allocator-level lock.
+/// Free-list push uses [`BStack::cross_exchange`] to splice a block (or a
+/// whole freed run) onto the head in one atomic step; free-list pop drives a
+/// single [`BStack::process_gen`] sequence that holds `BStack`'s write lock
+/// across the read of `free_head`, the read of the popped block's `next`
+/// pointer, and the write that advances `free_head`. Tail grow/shrink paths
+/// use [`BStack::try_extend_zeros`] / [`BStack::try_discard`] to perform
+/// check-and-act atomically under `BStack`'s write lock. Every concurrent
+/// `&self` operation is therefore safe without any `Mutex`.
 /// ```
 /// fn assert_send<T: Send>() {}
 /// assert_send::<bstack::SlabBStackAllocator>();
 /// ```
 ///
 /// Without `atomic` the type is `!Sync` (this fails to compile); with `atomic`
-/// the internal `Mutex` makes it `Sync` (this compiles):
+/// `BStack`'s own interior mutability makes it `Sync` (this compiles):
 ///
 #[cfg_attr(not(feature = "atomic"), doc = "```compile_fail")]
 #[cfg_attr(feature = "atomic", doc = "```")]
@@ -128,10 +138,6 @@ pub struct SlabBStackAllocator {
     stack: BStack,
     /// Cached from the on-disk header; fixed for the lifetime of the allocator.
     block_size: u64,
-    /// Serialises multi-step free-list and tail operations when `atomic` is
-    /// enabled, making the allocator `Sync`.
-    #[cfg(feature = "atomic")]
-    lock: Mutex<()>,
     #[cfg(not(feature = "atomic"))]
     _not_sync: PhantomData<Cell<()>>,
 }
@@ -193,8 +199,6 @@ impl SlabBStackAllocator {
         Ok(Self {
             stack,
             block_size,
-            #[cfg(feature = "atomic")]
-            lock: Mutex::new(()),
             #[cfg(not(feature = "atomic"))]
             _not_sync: PhantomData,
         })
@@ -278,8 +282,6 @@ impl SlabBStackAllocator {
         Ok(Self {
             stack,
             block_size: stored_block_size,
-            #[cfg(feature = "atomic")]
-            lock: Mutex::new(()),
             #[cfg(not(feature = "atomic"))]
             _not_sync: PhantomData,
         })
@@ -291,6 +293,70 @@ impl SlabBStackAllocator {
     }
 
     /// Pop the head block from the free list. Returns its payload offset, or `None`.
+    ///
+    /// # `atomic` feature
+    ///
+    /// Drives a single [`BStack::process_gen`] sequence — read `free_head`,
+    /// read its `next` pointer, write `next` back into `free_head` — under one
+    /// held write lock, so the read-read-write is indivisible with respect to
+    /// any other thread's free-list operations. The freed block is zeroed in a
+    /// separate call afterwards, since by then it is exclusively owned by the
+    /// caller.
+    #[cfg(feature = "atomic")]
+    fn pop_free_block(&self) -> io::Result<Option<NonZeroU64>> {
+        let mut head_buf = [0u8; 8];
+        let mut next_buf = [0u8; 8];
+        let mut step = 0usize;
+        let mut popped: Option<u64> = None;
+
+        self.stack.process_gen(|| {
+            let op = match step {
+                // Step 0: read the current free-list head.
+                0 => Some(BStackGenOp::Read {
+                    offset: Self::FREE_HEAD_OFFSET,
+                    // SAFETY: `head_buf` outlives this `process_gen` call.
+                    buf: unsafe { core::mem::transmute::<&mut [u8], &mut [u8]>(&mut head_buf[..]) },
+                }),
+                // Step 1: an empty list ends the sequence with no write;
+                // otherwise read the head block's next-pointer.
+                1 => {
+                    let head = u64::from_le_bytes(head_buf);
+                    if head == Self::SENTINEL {
+                        None
+                    } else {
+                        popped = Some(head);
+                        Some(BStackGenOp::Read {
+                            offset: head,
+                            // SAFETY: `next_buf` outlives this `process_gen` call.
+                            buf: unsafe {
+                                core::mem::transmute::<&mut [u8], &mut [u8]>(&mut next_buf[..])
+                            },
+                        })
+                    }
+                }
+                // Step 2: advance free_head to the popped block's next pointer,
+                // still under the lock acquired for step 0's read.
+                2 => Some(BStackGenOp::Write {
+                    offset: Self::FREE_HEAD_OFFSET,
+                    // SAFETY: `next_buf` outlives this `process_gen` call.
+                    data: unsafe { core::mem::transmute::<&[u8], &[u8]>(&next_buf[..]) },
+                }),
+                _ => None,
+            };
+            step += 1;
+            op
+        })?;
+
+        let Some(head) = popped else {
+            return Ok(None);
+        };
+        self.stack.zero(head, self.block_size)?;
+        // SAFETY: head is not zero since we checked for the SENTINEL case above, so it is a valid NonZeroU64
+        Ok(Some(head.try_into().unwrap()))
+    }
+
+    /// Pop the head block from the free list. Returns its payload offset, or `None`.
+    #[cfg(not(feature = "atomic"))]
     fn pop_free_block(&self) -> io::Result<Option<NonZeroU64>> {
         let head = u64::from_le_bytes(read_bstack!(self.stack, Self::FREE_HEAD_OFFSET => u64));
         if head == Self::SENTINEL {
@@ -306,6 +372,24 @@ impl SlabBStackAllocator {
     }
 
     /// Prepend the block at `block_start` to the free list.
+    ///
+    /// # `atomic` feature
+    ///
+    /// Lock-free splice via [`BStack::cross_exchange`]: `block_start` is first
+    /// seeded with a self-pointer placeholder, then atomically swapped with
+    /// `free_head` under one write lock — `free_head` becomes `block_start` and
+    /// `block_start`'s next-pointer becomes the old head, in a single
+    /// indivisible step. A crash between the two calls leaks `block_start`
+    /// rather than corrupting the list.
+    #[cfg(feature = "atomic")]
+    fn push_free_block(&self, block_start: u64) -> io::Result<()> {
+        self.stack.set(block_start, block_start.to_le_bytes())?;
+        self.stack
+            .cross_exchange(block_start, Self::FREE_HEAD_OFFSET, 8)
+    }
+
+    /// Prepend the block at `block_start` to the free list.
+    #[cfg(not(feature = "atomic"))]
     fn push_free_block(&self, block_start: u64) -> io::Result<()> {
         // Write the next-pointer into the block before updating free_head: a
         // crash after this write but before the header update leaks the block
@@ -320,15 +404,22 @@ impl SlabBStackAllocator {
 
     /// Prepend `count` contiguous blocks starting at `first_block` to the free list.
     ///
-    /// Uses exactly 3 IO calls regardless of `count`: one read of `free_head`,
-    /// one bulk write of all next-pointers into the freed region, and one write
-    /// of the new `free_head`. Crash behaviour matches `push_free_block`: a
-    /// crash after the bulk write but before the `free_head` update leaks the
-    /// entire batch rather than corrupting the list.
-    ///
     /// Requires that count * block_size does not overflow u64 and
     /// first_block + count * block_size does not overflow u64 and is a valid offset
     /// on the stack by the caller.
+    ///
+    /// # `atomic` feature
+    ///
+    /// Generalises [`push_free_block`](Self::push_free_block) to a whole run:
+    /// the chain `first_block -> first_block + block_size -> ... -> last_block`
+    /// is built in one buffer, with `last_block`'s next-pointer set to the
+    /// placeholder `first_block`. A single bulk [`BStack::set`] writes the
+    /// chain (still unreachable from `free_head`), then
+    /// [`BStack::cross_exchange`] atomically swaps `last_block`'s next-pointer
+    /// with `free_head` — `free_head` becomes `first_block` and `last_block`'s
+    /// next-pointer becomes the old head, splicing the whole run in under one
+    /// write lock. For `count == 1`, `first_block == last_block` and this is
+    /// exactly `push_free_block`.
     fn push_free_blocks(&self, first_block: u64, count: u64) -> io::Result<()> {
         if count == 0 {
             return Ok(());
@@ -336,7 +427,6 @@ impl SlabBStackAllocator {
         if count == 1 {
             return self.push_free_block(first_block);
         }
-        let old_head = read_bstack!(self.stack, Self::FREE_HEAD_OFFSET => u64);
         let total_bytes = count.checked_mul(self.block_size).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -356,20 +446,33 @@ impl SlabBStackAllocator {
             )
         })?;
         let mut buf = vec![0u8; buf_size];
-        for i in 0..count - 1 {
-            let next = first_block
-                .checked_add((i + 1).checked_mul(self.block_size).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "next block index multiplication overflows u64",
-                    )
-                })?)
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "next block offset overflows u64",
-                    )
-                })?;
+        for i in 0..count {
+            let next = if i + 1 < count {
+                first_block
+                    .checked_add((i + 1).checked_mul(self.block_size).ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "next block index multiplication overflows u64",
+                        )
+                    })?)
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "next block offset overflows u64",
+                        )
+                    })?
+            } else {
+                #[cfg(feature = "atomic")]
+                {
+                    // Placeholder: replaced with the old free_head by
+                    // cross_exchange below.
+                    first_block
+                }
+                #[cfg(not(feature = "atomic"))]
+                {
+                    u64::from_le_bytes(read_bstack!(self.stack, Self::FREE_HEAD_OFFSET => u64))
+                }
+            };
             let off = usize::try_from(i.checked_mul(self.block_size).ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -384,23 +487,31 @@ impl SlabBStackAllocator {
             })?;
             buf[off..off + 8].copy_from_slice(&next.to_le_bytes());
         }
-        let last_off =
-            usize::try_from((count - 1).checked_mul(self.block_size).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "last free-list offset overflows u64",
-                )
-            })?)
-            .map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "last free-list offset overflows usize",
-                )
-            })?;
-        buf[last_off..last_off + 8].copy_from_slice(&old_head);
         self.stack.set(first_block, buf)?;
-        self.stack
-            .set(Self::FREE_HEAD_OFFSET, first_block.to_le_bytes())
+
+        #[cfg(feature = "atomic")]
+        {
+            let last_block = first_block
+                .checked_add((count - 1).checked_mul(self.block_size).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "last free-list offset overflows u64",
+                    )
+                })?)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "last block offset overflows u64",
+                    )
+                })?;
+            self.stack
+                .cross_exchange(last_block, Self::FREE_HEAD_OFFSET, 8)
+        }
+        #[cfg(not(feature = "atomic"))]
+        {
+            self.stack
+                .set(Self::FREE_HEAD_OFFSET, first_block.to_le_bytes())
+        }
     }
 
     /// Number of `block_size` blocks required to back `len` bytes.
@@ -453,8 +564,6 @@ impl BStackAllocator for SlabBStackAllocator {
         }
 
         if len <= self.block_size {
-            #[cfg(feature = "atomic")]
-            let _guard = self.lock.lock().unwrap();
             if let Some(block) = self.pop_free_block()? {
                 // SAFETY: block is a valid block_size region from pop_free_block
                 return Ok(unsafe { BStackSlice::from_raw_parts(self, block.into(), len) });
@@ -516,9 +625,7 @@ impl BStackAllocator for SlabBStackAllocator {
             return self.stack.discard(backing_size);
         }
 
-        // Not at tail (or single-block): push to the free list under the lock.
-        #[cfg(feature = "atomic")]
-        let _guard = self.lock.lock().unwrap();
+        // Not at tail (or single-block): push to the free list.
         self.push_free_blocks(slice.start(), n_blocks)
     }
 
@@ -624,8 +731,6 @@ impl BStackAllocator for SlabBStackAllocator {
             self.stack
                 .get_into(slice.start(), &mut data_buf[..old_visible_len])?;
             let new_ptr = self.stack.push(data_buf)?;
-            #[cfg(feature = "atomic")]
-            let _guard = self.lock.lock().unwrap();
             self.push_free_blocks(slice.start(), old_n)?;
             // SAFETY: new_len fits within the new_n blocks of the newly pushed region
             return Ok(unsafe { BStackSlice::from_raw_parts(self, new_ptr, new_len) });
@@ -664,8 +769,6 @@ impl BStackAllocator for SlabBStackAllocator {
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "free start overflows u64")
             })?;
-        #[cfg(feature = "atomic")]
-        let _guard = self.lock.lock().unwrap();
         self.push_free_blocks(free_start, old_n - new_n)?;
         // SAFETY: new_len fits within the first new_n retained blocks
         Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) })

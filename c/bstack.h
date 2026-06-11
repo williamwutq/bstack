@@ -411,7 +411,9 @@ typedef enum {
  *   equivalent of bstack_push.
  * - BSTACK_GEN_POP: remove the last u.pop.len bytes from the end of the file
  *   into u.pop.buf, shrinking the payload, and ending the sequence — the
- *   in-sequence equivalent of bstack_pop.
+ *   in-sequence equivalent of bstack_pop.  If u.pop.buf is NULL the bytes are
+ *   dropped without being copied out — the in-sequence equivalent of
+ *   bstack_discard.
  * - BSTACK_GEN_LEN: write the current logical payload size into
  *   *u.len.out and call gen again — the in-sequence equivalent of
  *   bstack_len.  Does not end the sequence.
@@ -446,7 +448,7 @@ typedef struct {
             size_t   len;
         } push;
         struct {
-            uint8_t *buf;
+            uint8_t *buf;   /* destination, or NULL to discard the bytes */
             size_t   len;
         } pop;
         struct {
@@ -532,7 +534,8 @@ int bstack_process(bstack_t *bs, uint64_t start, uint64_t end,
  * - Returning 1 with *out_op set to BSTACK_GEN_POP removes the last
  *   u.pop.len bytes from the end of the file into u.pop.buf, shrinking the
  *   payload, and ends the sequence; gen is not called again — the
- *   in-sequence equivalent of bstack_pop.
+ *   in-sequence equivalent of bstack_pop.  A NULL u.pop.buf drops the bytes
+ *   without copying them out — the in-sequence equivalent of bstack_discard.
  * - Returning 1 with *out_op set to BSTACK_GEN_LEN writes the current logical
  *   payload size into *u.len.out and calls gen again — the in-sequence
  *   equivalent of bstack_len, useful when a later step's offset or length
