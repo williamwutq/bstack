@@ -82,6 +82,13 @@ struct bstack {
     pthread_rwlock_t lock;
     pthread_mutex_t  cache_mutex;
 #endif
+    /* Cached copy of the on-disk header's committed payload length (clen).
+     * Seeded from the validated header at construction time (after recovery)
+     * and kept in sync by every write-lock-held operation that commits a new
+     * clen to the header, via write_committed_len. bstack_len and
+     * bstack_is_empty read it under the same lock used for the on-disk
+     * state, so no extra synchronisation is needed. */
+    uint64_t clen;
     /* Monotonically growing partition boundary. Bytes in [0, locked) are
      * immutable and can be read without the rwlock on supported platforms.
      * Not persisted — resets to 0 on every open. */
@@ -300,9 +307,14 @@ static int write_le64(bstack_fd_t fd, uint64_t file_offset, uint64_t val)
  * Header helpers
  * ---------------------------------------------------------------------- */
 
-static int write_committed_len(bstack_fd_t fd, uint64_t len)
+/* Overwrite the committed-length field at file offset 8 and update the
+ * in-memory cache (*clen) to match. */
+static int write_committed_len(bstack_fd_t fd, uint64_t *clen, uint64_t len)
 {
-    return write_le64(fd, 8, len);
+    if (write_le64(fd, 8, len) != 0)
+        return -1;
+    *clen = len;
+    return 0;
 }
 
 static int init_header(bstack_fd_t fd)
@@ -399,6 +411,7 @@ bstack_t *bstack_open(const char *path)
         return NULL;
     }
 
+    uint64_t clen = 0;
     if (raw_size == 0) {
         /* New file — write header and sync. */
         if (init_header(fd) != 0 || plat_durable_sync(fd) != 0) {
@@ -413,8 +426,8 @@ bstack_t *bstack_open(const char *path)
         return NULL;
     } else {
         /* Existing file — validate header and crash-recover if needed. */
-        uint64_t clen;
-        if (read_header(fd, &clen) != 0) {
+        uint64_t committed_len;
+        if (read_header(fd, &committed_len) != 0) {
             int saved = errno;
             close_fd(fd);
             errno = saved;
@@ -422,10 +435,10 @@ bstack_t *bstack_open(const char *path)
         }
 
         uint64_t actual = raw_size - HEADER_SIZE;
-        if (actual != clen) {
-            uint64_t correct = (clen < actual) ? clen : actual;
+        if (actual != committed_len) {
+            uint64_t correct = (committed_len < actual) ? committed_len : actual;
             if (plat_ftruncate(fd, HEADER_SIZE + correct) != 0 ||
-                write_committed_len(fd, correct) != 0 ||
+                write_committed_len(fd, &clen, correct) != 0 ||
                 plat_durable_sync(fd) != 0)
             {
                 int saved = errno;
@@ -433,6 +446,8 @@ bstack_t *bstack_open(const char *path)
                 errno = saved;
                 return NULL;
             }
+        } else {
+            clen = committed_len;
         }
     }
 
@@ -442,6 +457,7 @@ bstack_t *bstack_open(const char *path)
         return NULL;
     }
     bs->fd            = fd;
+    bs->clen          = clen;
     bs->locked        = ATOMIC_INIT(0);
     bs->cache_enabled = 0;
     bs->cache_buf     = NULL;
@@ -516,12 +532,12 @@ int bstack_push(bstack_t *bs, const uint8_t *data, size_t len,
     }
 
     uint64_t new_len = logical_offset + (uint64_t)len;
-    if (write_committed_len(bs->fd, new_len) != 0 ||
+    if (write_committed_len(bs->fd, &bs->clen, new_len) != 0 ||
         plat_durable_sync(bs->fd) != 0)
     {
         /* Rollback: remove written data and reset committed length. */
         plat_ftruncate(bs->fd, raw_size);
-        write_committed_len(bs->fd, logical_offset);
+        write_committed_len(bs->fd, &bs->clen, logical_offset);
         goto fail_unlock;
     }
 
@@ -566,12 +582,12 @@ int bstack_extend(bstack_t *bs, size_t n, uint64_t *out_offset)
         goto fail_unlock;
 
     uint64_t new_len = logical_offset + (uint64_t)n;
-    if (write_committed_len(bs->fd, new_len) != 0 ||
+    if (write_committed_len(bs->fd, &bs->clen, new_len) != 0 ||
         plat_durable_sync(bs->fd) != 0)
     {
         /* Rollback: truncate and reset committed length. */
         plat_ftruncate(bs->fd, raw_size);
-        write_committed_len(bs->fd, logical_offset);
+        write_committed_len(bs->fd, &bs->clen, logical_offset);
         goto fail_unlock;
     }
 
@@ -628,7 +644,7 @@ int bstack_pop(bstack_t *bs, size_t n,
     }
 
     if (plat_ftruncate(bs->fd, HEADER_SIZE + new_len) != 0 ||
-        write_committed_len(bs->fd, new_len) != 0 ||
+        write_committed_len(bs->fd, &bs->clen, new_len) != 0 ||
         plat_durable_sync(bs->fd) != 0)
         goto fail_unlock;
 
@@ -783,7 +799,7 @@ int bstack_discard(bstack_t *bs, size_t n)
     }
 
     if (plat_ftruncate(bs->fd, HEADER_SIZE + new_len) != 0 ||
-        write_committed_len(bs->fd, new_len) != 0 ||
+        write_committed_len(bs->fd, &bs->clen, new_len) != 0 ||
         plat_durable_sync(bs->fd) != 0)
         goto fail_unlock;
 
@@ -806,17 +822,8 @@ fail_unlock:
 int bstack_len(bstack_t *bs, uint64_t *out_len)
 {
     BS_RDLOCK(bs);
-
-    uint64_t raw_size;
-    if (file_size(bs->fd, &raw_size) != 0) {
-        int saved = errno;
-        BS_RDUNLOCK(bs);
-        errno = saved;
-        return -1;
-    }
-
+    *out_len = bs->clen;
     BS_RDUNLOCK(bs);
-    *out_len = raw_size - HEADER_SIZE;
     return 0;
 }
 
@@ -827,17 +834,8 @@ int bstack_len(bstack_t *bs, uint64_t *out_len)
 int bstack_is_empty(bstack_t *bs, int *out_empty)
 {
     BS_RDLOCK(bs);
-
-    uint64_t raw_size;
-    if (file_size(bs->fd, &raw_size) != 0) {
-        int saved = errno;
-        BS_RDUNLOCK(bs);
-        errno = saved;
-        return -1;
-    }
-
+    *out_empty = (bs->clen == 0) ? 1 : 0;
     BS_RDUNLOCK(bs);
-    *out_empty = (raw_size == HEADER_SIZE) ? 1 : 0;
     return 0;
 }
 
@@ -1122,13 +1120,14 @@ fail_unlock:
 /* Shared body for atrunc and splice (after the removed bytes are read).
  * Caller already holds the write lock.  raw_size / data_size / tail_offset /
  * final_data_len are pre-computed by the caller. */
-static int atomic_write_tail(bstack_fd_t fd,
+static int atomic_write_tail(bstack_t *bs,
                               uint64_t raw_size,
                               uint64_t tail_offset,
                               uint64_t final_data_len,
                               const uint8_t *buf, size_t buf_len,
                               size_t n)
 {
+    bstack_fd_t fd = bs->fd;
     if (buf_len > n) {
         /* Net extension: extend first so crashes roll back cleanly, then
          * write buf over the old tail + the new space, sync, commit clen. */
@@ -1143,7 +1142,7 @@ static int atomic_write_tail(bstack_fd_t fd,
             plat_ftruncate(fd, raw_size); /* best-effort rollback */
             return -1;
         }
-        return write_committed_len(fd, final_data_len);
+        return write_committed_len(fd, &bs->clen, final_data_len);
     } else {
         /* Net truncation or same size: write buf into old tail, truncate,
          * sync, commit clen.  A crash after truncate is committed by
@@ -1155,7 +1154,7 @@ static int atomic_write_tail(bstack_fd_t fd,
             return -1;
         if (plat_durable_sync(fd) != 0)
             return -1;
-        return write_committed_len(fd, final_data_len);
+        return write_committed_len(fd, &bs->clen, final_data_len);
     }
 }
 
@@ -1189,7 +1188,7 @@ int bstack_atrunc(bstack_t *bs, size_t n,
     uint64_t tail_offset    = HEADER_SIZE + new_tail_start;
     uint64_t final_data_len = new_tail_start + (uint64_t)buf_len;
 
-    if (atomic_write_tail(bs->fd, raw_size, tail_offset,
+    if (atomic_write_tail(bs, raw_size, tail_offset,
                           final_data_len, buf, buf_len, n) != 0)
         goto fail_unlock;
 
@@ -1238,7 +1237,7 @@ int bstack_splice(bstack_t *bs,
             goto fail_unlock;
     }
 
-    if (atomic_write_tail(bs->fd, raw_size, tail_offset,
+    if (atomic_write_tail(bs, raw_size, tail_offset,
                           final_data_len, new_buf, new_len, n) != 0)
         goto fail_unlock;
 
@@ -1277,10 +1276,10 @@ int bstack_try_extend(bstack_t *bs, uint64_t s,
         goto fail_unlock;
     }
     uint64_t new_len = data_size + (uint64_t)buf_len;
-    if (write_committed_len(bs->fd, new_len) != 0 ||
+    if (write_committed_len(bs->fd, &bs->clen, new_len) != 0 ||
         plat_durable_sync(bs->fd) != 0) {
         plat_ftruncate(bs->fd, raw_size);
-        write_committed_len(bs->fd, data_size);
+        write_committed_len(bs->fd, &bs->clen, data_size);
         goto fail_unlock;
     }
 
@@ -1339,7 +1338,7 @@ int bstack_try_discard(bstack_t *bs, uint64_t s, size_t n, int *ok)
     }
     
     if (plat_ftruncate(bs->fd, HEADER_SIZE + new_len) != 0 ||
-        write_committed_len(bs->fd, new_len) != 0 ||
+        write_committed_len(bs->fd, &bs->clen, new_len) != 0 ||
         plat_durable_sync(bs->fd) != 0)
         goto fail_unlock;
 
@@ -1410,7 +1409,7 @@ int bstack_replace(bstack_t *bs, size_t n,
 
     uint64_t final_data_len = new_tail_start + (uint64_t)new_len;
 
-    if (atomic_write_tail(bs->fd, raw_size, tail_offset,
+    if (atomic_write_tail(bs, raw_size, tail_offset,
                           final_data_len, new_buf, new_len, n) != 0) {
         free(new_buf);
         goto fail_unlock;
@@ -1447,12 +1446,12 @@ int bstack_try_extend_zeros(bstack_t *bs, uint64_t s, size_t n, int *ok)
 
     uint64_t new_len = data_size + (uint64_t)n;
     if (plat_ftruncate(bs->fd, HEADER_SIZE + new_len) != 0 ||
-        write_committed_len(bs->fd, new_len) != 0 ||
+        write_committed_len(bs->fd, &bs->clen, new_len) != 0 ||
         plat_durable_sync(bs->fd) != 0)
     {
         /* Best-effort rollback. */
         plat_ftruncate(bs->fd, raw_size);
-        write_committed_len(bs->fd, data_size);
+        write_committed_len(bs->fd, &bs->clen, data_size);
         goto fail_unlock;
     }
 
@@ -1878,13 +1877,13 @@ int bstack_process_gen(bstack_t *bs,
                     goto fail_unlock;
                 }
                 uint64_t new_len = data_size + (uint64_t)len;
-                if (write_committed_len(bs->fd, new_len) != 0 ||
+                if (write_committed_len(bs->fd, &bs->clen, new_len) != 0 ||
                     plat_durable_sync(bs->fd) != 0)
                 {
                     /* Rollback: remove written data and reset committed
                      * length. */
                     plat_ftruncate(bs->fd, raw_size_now);
-                    write_committed_len(bs->fd, data_size);
+                    write_committed_len(bs->fd, &bs->clen, data_size);
                     goto fail_unlock;
                 }
             }
@@ -1910,7 +1909,7 @@ int bstack_process_gen(bstack_t *bs,
                         goto fail_unlock;
                 }
                 if (plat_ftruncate(bs->fd, HEADER_SIZE + new_len) != 0 ||
-                    write_committed_len(bs->fd, new_len) != 0 ||
+                    write_committed_len(bs->fd, &bs->clen, new_len) != 0 ||
                     plat_durable_sync(bs->fd) != 0)
                     goto fail_unlock;
             }

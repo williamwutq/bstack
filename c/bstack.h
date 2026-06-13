@@ -120,13 +120,16 @@ int bstack_discard(bstack_t *bs, size_t n);
 
 /*
  * Write the current logical payload size (excluding the 16-byte header)
- * into *out_len.  Takes the read lock; concurrent calls are allowed.
+ * into *out_len.  This value is cached in memory, so no syscall is made;
+ * it takes the read lock, so it can run concurrently with other readers
+ * but blocks while a writer is in progress.
  */
 int bstack_len(bstack_t *bs, uint64_t *out_len);
 
 /*
  * Write 1 into *out_empty if the payload is empty (len == 0), else 0.
- * Takes the read lock; concurrent calls are allowed.
+ * Like bstack_len, this is a cached read under the read lock and makes
+ * no syscall.
  */
 int bstack_is_empty(bstack_t *bs, int *out_empty);
 
