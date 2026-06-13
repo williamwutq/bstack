@@ -621,7 +621,10 @@ maps to `io::ErrorKind::WouldBlock` in Rust).  The lock is released when the
 
 ## Thread safety
 
-`BStack` wraps the file in a `RwLock<File>`.
+`BStack` wraps the file in a `RwLock`. The committed payload length is also
+cached in memory and kept in sync with the on-disk header by every
+write-lock-held operation, so `len`/`is_empty` can be answered under the read
+lock without any `File::metadata` syscall.
 
 | Operation                                                    | Lock (Unix / Windows) | Lock (other) |
 |--------------------------------------------------------------|-----------------------|--------------|
