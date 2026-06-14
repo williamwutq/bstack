@@ -921,8 +921,11 @@ impl BStack {
 
         let new_len = logical_offset + data.len() as u64;
         if let Err(e) = write_committed_len(file, clen, new_len).and_then(|_| durable_sync(file)) {
-            // Roll back: truncate data and reset header.
+            // Roll back: truncate data and reset header. The cache is reset
+            // up front so it reflects the rolled-back file even if the
+            // best-effort header rewrite below fails.
             let _ = file.set_len(file_end);
+            *clen = logical_offset;
             let _ = write_committed_len(file, clen, logical_offset);
             let _ = durable_sync(file);
             return Err(e);
@@ -962,8 +965,11 @@ impl BStack {
 
         let new_len = logical_offset + n;
         if let Err(e) = write_committed_len(file, clen, new_len).and_then(|_| durable_sync(file)) {
-            // Roll back: truncate and reset header.
+            // Roll back: truncate and reset header. The cache is reset up
+            // front so it reflects the rolled-back file even if the
+            // best-effort header rewrite below fails.
             let _ = file.set_len(file_end);
+            *clen = logical_offset;
             let _ = write_committed_len(file, clen, logical_offset);
             let _ = durable_sync(file);
             return Err(e);
@@ -1781,7 +1787,10 @@ impl BStack {
         }
         let new_len = data_size + buf.len() as u64;
         if let Err(e) = write_committed_len(file, clen, new_len).and_then(|_| durable_sync(file)) {
+            // Reset the cache up front so it reflects the rolled-back file
+            // even if the best-effort header rewrite below fails.
             let _ = file.set_len(file_end);
+            *clen = data_size;
             let _ = write_committed_len(file, clen, data_size);
             let _ = durable_sync(file);
             return Err(e);
@@ -1824,7 +1833,10 @@ impl BStack {
         })?;
         file.set_len(HEADER_SIZE + new_len)?;
         if let Err(e) = write_committed_len(file, clen, new_len).and_then(|_| durable_sync(file)) {
+            // Reset the cache up front so it reflects the rolled-back file
+            // even if the best-effort header rewrite below fails.
             let _ = file.set_len(file_end);
+            *clen = data_size;
             let _ = write_committed_len(file, clen, data_size);
             let _ = durable_sync(file);
             return Err(e);
@@ -2945,8 +2957,12 @@ impl BStack {
                         if let Err(e) = write_committed_len(file, clen, new_len)
                             .and_then(|_| durable_sync(file))
                         {
-                            // Roll back: truncate data and reset header.
+                            // Roll back: truncate data and reset header. The
+                            // cache is reset up front so it reflects the
+                            // rolled-back file even if the best-effort header
+                            // rewrite below fails.
                             let _ = file.set_len(file_end);
+                            *clen = logical_offset;
                             let _ = write_committed_len(file, clen, logical_offset);
                             let _ = durable_sync(file);
                             return Err(e);

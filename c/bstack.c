@@ -535,8 +535,11 @@ int bstack_push(bstack_t *bs, const uint8_t *data, size_t len,
     if (write_committed_len(bs->fd, &bs->clen, new_len) != 0 ||
         plat_durable_sync(bs->fd) != 0)
     {
-        /* Rollback: remove written data and reset committed length. */
+        /* Rollback: remove written data and reset committed length. The
+         * cache is reset up front so it reflects the rolled-back file even
+         * if the best-effort header rewrite below fails. */
         plat_ftruncate(bs->fd, raw_size);
+        bs->clen = logical_offset;
         write_committed_len(bs->fd, &bs->clen, logical_offset);
         plat_durable_sync(bs->fd);
         goto fail_unlock;
@@ -586,8 +589,11 @@ int bstack_extend(bstack_t *bs, size_t n, uint64_t *out_offset)
     if (write_committed_len(bs->fd, &bs->clen, new_len) != 0 ||
         plat_durable_sync(bs->fd) != 0)
     {
-        /* Rollback: truncate and reset committed length. */
+        /* Rollback: truncate and reset committed length. The cache is reset
+         * up front so it reflects the rolled-back file even if the
+         * best-effort header rewrite below fails. */
         plat_ftruncate(bs->fd, raw_size);
+        bs->clen = logical_offset;
         write_committed_len(bs->fd, &bs->clen, logical_offset);
         plat_durable_sync(bs->fd);
         goto fail_unlock;
@@ -1284,7 +1290,10 @@ int bstack_try_extend(bstack_t *bs, uint64_t s,
     uint64_t new_len = data_size + (uint64_t)buf_len;
     if (write_committed_len(bs->fd, &bs->clen, new_len) != 0 ||
         plat_durable_sync(bs->fd) != 0) {
+        /* The cache is reset up front so it reflects the rolled-back file
+         * even if the best-effort header rewrite below fails. */
         plat_ftruncate(bs->fd, raw_size);
+        bs->clen = data_size;
         write_committed_len(bs->fd, &bs->clen, data_size);
         plat_durable_sync(bs->fd);
         goto fail_unlock;
@@ -1456,8 +1465,10 @@ int bstack_try_extend_zeros(bstack_t *bs, uint64_t s, size_t n, int *ok)
         write_committed_len(bs->fd, &bs->clen, new_len) != 0 ||
         plat_durable_sync(bs->fd) != 0)
     {
-        /* Best-effort rollback. */
+        /* Best-effort rollback. The cache is reset up front so it reflects
+         * the rolled-back file even if the header rewrite below fails. */
         plat_ftruncate(bs->fd, raw_size);
+        bs->clen = data_size;
         write_committed_len(bs->fd, &bs->clen, data_size);
         plat_durable_sync(bs->fd);
         goto fail_unlock;
@@ -1889,8 +1900,11 @@ int bstack_process_gen(bstack_t *bs,
                     plat_durable_sync(bs->fd) != 0)
                 {
                     /* Rollback: remove written data and reset committed
-                     * length. */
+                     * length. The cache is reset up front so it reflects
+                     * the rolled-back file even if the header rewrite below
+                     * fails. */
                     plat_ftruncate(bs->fd, raw_size_now);
+                    bs->clen = data_size;
                     write_committed_len(bs->fd, &bs->clen, data_size);
                     plat_durable_sync(bs->fd);
                     goto fail_unlock;
