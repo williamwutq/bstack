@@ -15,6 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `BStackGenOp::Len { out }` / `BSTACK_GEN_LEN` (Rust + C, `set` + `atomic`): writes the current logical payload size into `out` and, unlike the mutating variants, does not end the sequence — the in-sequence equivalent of `len`, useful when a later step's offset or length depends on the current payload size.
 - `BStackGenOp::Discard { len }` (Rust) / `BSTACK_GEN_POP` with a `NULL` `u.pop.buf` (C) (`set` + `atomic`): removes the last `len` bytes from the end of the file without reading them back, shrinking the payload and ending the sequence — the in-sequence, buffer-free equivalent of `discard` and the counterpart of `Pop`. Useful for truncating a tail whose size is only known once earlier `Read`s/`Len` have resolved, without allocating a throwaway buffer. In Rust this is a dedicated variant (slices cannot be null); in C it is expressed idiomatically as a `Pop` whose destination pointer is `NULL`. Errors on the same conditions as `Pop`.
 
+### Fixed
+
+- **`atrunc`, `splice`, `splice_into`, `replace` (Rust, `atomic`) and `bstack_atrunc`, `bstack_splice` (C, `BSTACK_FEATURE_ATOMIC`) — committed-length write not durably synced**: The header `clen` write that commits the new payload length was the last step of these operations and was never followed by `durable_sync`/`plat_durable_sync`, so a crash could leave the on-disk `clen` update only in the OS page cache. Every commit of a new `clen` — including best-effort rollback writes after a failed commit — is now followed by a sync. Crate-level durability table updated to reflect the additional sync.
+
 ### Changed
 
 - **`BStack::len` (Rust) / `bstack_len` (C) and `BStack::is_empty` / `bstack_is_empty` no longer make a syscall**: The committed payload length is now cached in memory and kept in sync by every write-lock-held operation that commits a new length to the header. `len`/`is_empty` read this cache under the read lock instead of calling `File::metadata` (Rust) or `fstat`/`GetFileSizeEx` (C). Behaviour and signatures are unchanged.

@@ -70,8 +70,8 @@
 //! | `discard` | `ftruncate` → `lseek(8)` → `write(clen)` → `durable_sync` |
 //! | `set` *(feature)* | `lseek(offset)` → `write(data)` → `durable_sync` |
 //! | `zero` *(feature)* | `lseek(offset)` → `write(zeros)` → `durable_sync` |
-//! | `atrunc` *(feature: atomic, net extension)* | `set_len(new_end)` → `lseek(tail)` → `write(buf)` → `durable_sync` → `lseek(8)` → `write(clen)` |
-//! | `atrunc` *(feature: atomic, net truncation)* | `lseek(tail)` → `write(buf)` → `set_len(new_end)` → `durable_sync` → `lseek(8)` → `write(clen)` |
+//! | `atrunc` *(feature: atomic, net extension)* | `set_len(new_end)` → `lseek(tail)` → `write(buf)` → `durable_sync` → `lseek(8)` → `write(clen)` → `durable_sync` |
+//! | `atrunc` *(feature: atomic, net truncation)* | `lseek(tail)` → `write(buf)` → `set_len(new_end)` → `durable_sync` → `lseek(8)` → `write(clen)` → `durable_sync` |
 //! | `splice`, `splice_into` *(feature: atomic)* | `lseek(tail)` → `read(n)` → *(then as `atrunc`)* |
 //! | `try_extend` *(feature: atomic)* | `lseek(END)` — conditional `push` sequence if size matches |
 //! | `try_discard` *(feature: atomic)* | `lseek(END)` — conditional `discard` sequence if size matches |
@@ -924,6 +924,7 @@ impl BStack {
             // Roll back: truncate data and reset header.
             let _ = file.set_len(file_end);
             let _ = write_committed_len(file, clen, logical_offset);
+            let _ = durable_sync(file);
             return Err(e);
         }
 
@@ -964,6 +965,7 @@ impl BStack {
             // Roll back: truncate and reset header.
             let _ = file.set_len(file_end);
             let _ = write_committed_len(file, clen, logical_offset);
+            let _ = durable_sync(file);
             return Err(e);
         }
 
@@ -1570,6 +1572,7 @@ impl BStack {
                 return Err(e);
             }
             write_committed_len(file, clen, final_data_len)?;
+            durable_sync(file)?;
         } else {
             // Net truncation or same size: write buf into the old tail first,
             // truncate, sync, then commit the new length.
@@ -1580,6 +1583,7 @@ impl BStack {
             file.set_len(HEADER_SIZE + final_data_len)?;
             durable_sync(file)?;
             write_committed_len(file, clen, final_data_len)?;
+            durable_sync(file)?;
         }
         Ok(())
     }
@@ -1648,6 +1652,7 @@ impl BStack {
                 return Err(e);
             }
             write_committed_len(file, clen, final_data_len)?;
+            durable_sync(file)?;
         } else {
             // Net truncation or same size: write buf, truncate, sync, commit.
             if !buf.is_empty() {
@@ -1657,6 +1662,7 @@ impl BStack {
             file.set_len(HEADER_SIZE + final_data_len)?;
             durable_sync(file)?;
             write_committed_len(file, clen, final_data_len)?;
+            durable_sync(file)?;
         }
 
         Ok(removed)
@@ -1727,6 +1733,7 @@ impl BStack {
                 return Err(e);
             }
             write_committed_len(file, clen, final_data_len)?;
+            durable_sync(file)?;
         } else {
             // Net truncation or same size: write new, truncate, sync, commit.
             if !new.is_empty() {
@@ -1736,6 +1743,7 @@ impl BStack {
             file.set_len(HEADER_SIZE + final_data_len)?;
             durable_sync(file)?;
             write_committed_len(file, clen, final_data_len)?;
+            durable_sync(file)?;
         }
         Ok(())
     }
@@ -1775,6 +1783,7 @@ impl BStack {
         if let Err(e) = write_committed_len(file, clen, new_len).and_then(|_| durable_sync(file)) {
             let _ = file.set_len(file_end);
             let _ = write_committed_len(file, clen, data_size);
+            let _ = durable_sync(file);
             return Err(e);
         }
         Ok(true)
@@ -1817,6 +1826,7 @@ impl BStack {
         if let Err(e) = write_committed_len(file, clen, new_len).and_then(|_| durable_sync(file)) {
             let _ = file.set_len(file_end);
             let _ = write_committed_len(file, clen, data_size);
+            let _ = durable_sync(file);
             return Err(e);
         }
         Ok(true)
@@ -2172,6 +2182,7 @@ impl BStack {
                 return Err(e);
             }
             write_committed_len(file, clen, final_data_len)?;
+            durable_sync(file)?;
         } else {
             // Net truncation or same size: write new tail, truncate, sync, commit.
             if !new_tail.is_empty() {
@@ -2181,6 +2192,7 @@ impl BStack {
             file.set_len(HEADER_SIZE + final_data_len)?;
             durable_sync(file)?;
             write_committed_len(file, clen, final_data_len)?;
+            durable_sync(file)?;
         }
         Ok(())
     }
@@ -2936,6 +2948,7 @@ impl BStack {
                             // Roll back: truncate data and reset header.
                             let _ = file.set_len(file_end);
                             let _ = write_committed_len(file, clen, logical_offset);
+                            let _ = durable_sync(file);
                             return Err(e);
                         }
                     }

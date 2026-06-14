@@ -538,6 +538,7 @@ int bstack_push(bstack_t *bs, const uint8_t *data, size_t len,
         /* Rollback: remove written data and reset committed length. */
         plat_ftruncate(bs->fd, raw_size);
         write_committed_len(bs->fd, &bs->clen, logical_offset);
+        plat_durable_sync(bs->fd);
         goto fail_unlock;
     }
 
@@ -588,6 +589,7 @@ int bstack_extend(bstack_t *bs, size_t n, uint64_t *out_offset)
         /* Rollback: truncate and reset committed length. */
         plat_ftruncate(bs->fd, raw_size);
         write_committed_len(bs->fd, &bs->clen, logical_offset);
+        plat_durable_sync(bs->fd);
         goto fail_unlock;
     }
 
@@ -1142,7 +1144,9 @@ static int atomic_write_tail(bstack_t *bs,
             plat_ftruncate(fd, raw_size); /* best-effort rollback */
             return -1;
         }
-        return write_committed_len(fd, &bs->clen, final_data_len);
+        if (write_committed_len(fd, &bs->clen, final_data_len) != 0)
+            return -1;
+        return plat_durable_sync(fd);
     } else {
         /* Net truncation or same size: write buf into old tail, truncate,
          * sync, commit clen.  A crash after truncate is committed by
@@ -1154,7 +1158,9 @@ static int atomic_write_tail(bstack_t *bs,
             return -1;
         if (plat_durable_sync(fd) != 0)
             return -1;
-        return write_committed_len(fd, &bs->clen, final_data_len);
+        if (write_committed_len(fd, &bs->clen, final_data_len) != 0)
+            return -1;
+        return plat_durable_sync(fd);
     }
 }
 
@@ -1280,6 +1286,7 @@ int bstack_try_extend(bstack_t *bs, uint64_t s,
         plat_durable_sync(bs->fd) != 0) {
         plat_ftruncate(bs->fd, raw_size);
         write_committed_len(bs->fd, &bs->clen, data_size);
+        plat_durable_sync(bs->fd);
         goto fail_unlock;
     }
 
@@ -1452,6 +1459,7 @@ int bstack_try_extend_zeros(bstack_t *bs, uint64_t s, size_t n, int *ok)
         /* Best-effort rollback. */
         plat_ftruncate(bs->fd, raw_size);
         write_committed_len(bs->fd, &bs->clen, data_size);
+        plat_durable_sync(bs->fd);
         goto fail_unlock;
     }
 
@@ -1884,6 +1892,7 @@ int bstack_process_gen(bstack_t *bs,
                      * length. */
                     plat_ftruncate(bs->fd, raw_size_now);
                     write_committed_len(bs->fd, &bs->clen, data_size);
+                    plat_durable_sync(bs->fd);
                     goto fail_unlock;
                 }
             }
