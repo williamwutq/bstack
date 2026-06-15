@@ -651,8 +651,13 @@ int bstack_pop(bstack_t *bs, size_t n,
             goto fail_unlock;
     }
 
-    if (plat_ftruncate(bs->fd, HEADER_SIZE + new_len) != 0 ||
-        write_committed_len(bs->fd, &bs->clen, new_len) != 0 ||
+    if (plat_ftruncate(bs->fd, HEADER_SIZE + new_len) != 0)
+        goto fail_unlock;
+    /* The truncation is the commit point: the tail bytes are gone and
+     * recovery would adopt the smaller file size, so update the cache now —
+     * before the header write, which can fail and skip it. */
+    bs->clen = new_len;
+    if (write_committed_len(bs->fd, &bs->clen, new_len) != 0 ||
         plat_durable_sync(bs->fd) != 0)
         goto fail_unlock;
 
@@ -806,8 +811,13 @@ int bstack_discard(bstack_t *bs, size_t n)
         return -1;
     }
 
-    if (plat_ftruncate(bs->fd, HEADER_SIZE + new_len) != 0 ||
-        write_committed_len(bs->fd, &bs->clen, new_len) != 0 ||
+    if (plat_ftruncate(bs->fd, HEADER_SIZE + new_len) != 0)
+        goto fail_unlock;
+    /* The truncation is the commit point: the tail bytes are gone and
+     * recovery would adopt the smaller file size, so update the cache now —
+     * before the header write, which can fail and skip it. */
+    bs->clen = new_len;
+    if (write_committed_len(bs->fd, &bs->clen, new_len) != 0 ||
         plat_durable_sync(bs->fd) != 0)
         goto fail_unlock;
 
@@ -1162,6 +1172,10 @@ static int atomic_write_tail(bstack_t *bs,
             return -1;
         if (plat_ftruncate(fd, HEADER_SIZE + final_data_len) != 0)
             return -1;
+        /* The truncation is the commit point (recovery adopts the smaller
+         * file size), so update the cache now — before the sync and header
+         * write, which can fail and skip it. */
+        bs->clen = final_data_len;
         if (plat_durable_sync(fd) != 0)
             return -1;
         if (write_committed_len(fd, &bs->clen, final_data_len) != 0)
@@ -1353,8 +1367,13 @@ int bstack_try_discard(bstack_t *bs, uint64_t s, size_t n, int *ok)
         return -1;
     }
     
-    if (plat_ftruncate(bs->fd, HEADER_SIZE + new_len) != 0 ||
-        write_committed_len(bs->fd, &bs->clen, new_len) != 0 ||
+    if (plat_ftruncate(bs->fd, HEADER_SIZE + new_len) != 0)
+        goto fail_unlock;
+    /* The truncation is the commit point: the tail bytes are gone and
+     * recovery would adopt the smaller file size, so update the cache now —
+     * before the header write, which can fail and skip it. */
+    bs->clen = new_len;
+    if (write_committed_len(bs->fd, &bs->clen, new_len) != 0 ||
         plat_durable_sync(bs->fd) != 0)
         goto fail_unlock;
 
@@ -1931,8 +1950,14 @@ int bstack_process_gen(bstack_t *bs,
                     if (plat_pread(bs->fd, buf, len, read_offset) != 0)
                         goto fail_unlock;
                 }
-                if (plat_ftruncate(bs->fd, HEADER_SIZE + new_len) != 0 ||
-                    write_committed_len(bs->fd, &bs->clen, new_len) != 0 ||
+                if (plat_ftruncate(bs->fd, HEADER_SIZE + new_len) != 0)
+                    goto fail_unlock;
+                /* The truncation is the commit point: the tail bytes are
+                 * gone and recovery would adopt the smaller file size, so
+                 * update the cache now — before the header write, which can
+                 * fail and skip it. */
+                bs->clen = new_len;
+                if (write_committed_len(bs->fd, &bs->clen, new_len) != 0 ||
                     plat_durable_sync(bs->fd) != 0)
                     goto fail_unlock;
             }

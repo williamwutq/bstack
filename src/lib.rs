@@ -1016,6 +1016,10 @@ impl BStack {
         let mut buf = vec![0u8; n as usize];
         file.read_exact(&mut buf)?;
         file.set_len(HEADER_SIZE + new_data_len)?;
+        // The truncation is the commit point: the tail bytes are gone and
+        // recovery would adopt the smaller file size, so update the cache now
+        // — before the header write, which `?` could skip on error.
+        *clen = new_data_len;
         write_committed_len(file, clen, new_data_len)?;
         durable_sync(file)?;
         Ok(buf)
@@ -1344,6 +1348,10 @@ impl BStack {
         file.seek(SeekFrom::Start(HEADER_SIZE + new_data_len))?;
         file.read_exact(buf)?;
         file.set_len(HEADER_SIZE + new_data_len)?;
+        // The truncation is the commit point: the tail bytes are gone and
+        // recovery would adopt the smaller file size, so update the cache now
+        // — before the header write, which `?` could skip on error.
+        *clen = new_data_len;
         write_committed_len(file, clen, new_data_len)?;
         durable_sync(file)?;
         Ok(())
@@ -1386,6 +1394,10 @@ impl BStack {
             ));
         }
         file.set_len(HEADER_SIZE + new_data_len)?;
+        // The truncation is the commit point: the tail bytes are gone and
+        // recovery would adopt the smaller file size, so update the cache now
+        // — before the header write, which `?` could skip on error.
+        *clen = new_data_len;
         write_committed_len(file, clen, new_data_len)?;
         durable_sync(file)?;
         Ok(())
@@ -1587,6 +1599,10 @@ impl BStack {
                 file.write_all(buf)?;
             }
             file.set_len(HEADER_SIZE + final_data_len)?;
+            // The truncation is the commit point (recovery adopts the smaller
+            // file size), so update the cache now — before the sync and header
+            // write, which `?` could skip on error.
+            *clen = final_data_len;
             durable_sync(file)?;
             write_committed_len(file, clen, final_data_len)?;
             durable_sync(file)?;
@@ -1666,6 +1682,10 @@ impl BStack {
                 file.write_all(buf)?;
             }
             file.set_len(HEADER_SIZE + final_data_len)?;
+            // The truncation is the commit point (recovery adopts the smaller
+            // file size), so update the cache now — before the sync and header
+            // write, which `?` could skip on error.
+            *clen = final_data_len;
             durable_sync(file)?;
             write_committed_len(file, clen, final_data_len)?;
             durable_sync(file)?;
@@ -1747,6 +1767,10 @@ impl BStack {
                 file.write_all(new)?;
             }
             file.set_len(HEADER_SIZE + final_data_len)?;
+            // The truncation is the commit point (recovery adopts the smaller
+            // file size), so update the cache now — before the sync and header
+            // write, which `?` could skip on error.
+            *clen = final_data_len;
             durable_sync(file)?;
             write_committed_len(file, clen, final_data_len)?;
             durable_sync(file)?;
@@ -1891,6 +1915,10 @@ impl BStack {
             ));
         }
         file.set_len(HEADER_SIZE + new_data_len)?;
+        // The truncation is the commit point: the tail bytes are gone and
+        // recovery would adopt the smaller file size, so update the cache now
+        // — before the header write, which `?` could skip on error.
+        *clen = new_data_len;
         write_committed_len(file, clen, new_data_len)?;
         durable_sync(file)?;
         Ok(true)
@@ -2202,6 +2230,10 @@ impl BStack {
                 file.write_all(&new_tail)?;
             }
             file.set_len(HEADER_SIZE + final_data_len)?;
+            // The truncation is the commit point (recovery adopts the smaller
+            // file size), so update the cache now — before the sync and header
+            // write, which `?` could skip on error.
+            *clen = final_data_len;
             durable_sync(file)?;
             write_committed_len(file, clen, final_data_len)?;
             durable_sync(file)?;
@@ -2991,6 +3023,11 @@ impl BStack {
                         file.seek(SeekFrom::Start(HEADER_SIZE + new_data_len))?;
                         file.read_exact(buf)?;
                         file.set_len(HEADER_SIZE + new_data_len)?;
+                        // The truncation is the commit point: the tail bytes
+                        // are gone and recovery would adopt the smaller file
+                        // size, so update the cache now — before the header
+                        // write, which `?` could skip on error.
+                        *clen = new_data_len;
                         write_committed_len(file, clen, new_data_len)?;
                         durable_sync(file)?;
                     }
@@ -3016,6 +3053,11 @@ impl BStack {
                     }
                     if len > 0 {
                         file.set_len(HEADER_SIZE + new_data_len)?;
+                        // The truncation is the commit point: the tail bytes
+                        // are gone and recovery would adopt the smaller file
+                        // size, so update the cache now — before the header
+                        // write, which `?` could skip on error.
+                        *clen = new_data_len;
                         write_committed_len(file, clen, new_data_len)?;
                         durable_sync(file)?;
                     }
