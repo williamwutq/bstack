@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.5] - 2026-06-15
+
 ### Added
 
 - `BStack::process_gen` (Rust) / `bstack_process_gen` (C) (`set` + `atomic`): generator/callback-driven primitive that acquires the write lock once and holds it across a sequence of dependent reads ending in at most one mutating operation (`Write`, `Swap`, `Push`, or `Pop`), which always ends the sequence. Closes the ABA window that a `get_batched_gen` (read, release lock) + `cas` (re-acquire, compare, write) pairing would otherwise leave open for allocator-mutex-free pop-style algorithms — see `examples/atomic_linked_list.rs` / `examples/atomic_linked_list.c` for a worked free-list push/pop demonstration.
