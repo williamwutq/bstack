@@ -162,6 +162,35 @@ The 8 B primitive is the conservative baseline, but bstack's stricter runtime gu
 
 3. **Inline data (filesystem-level).** Some filesystems (ext4 with `inline_data`, APFS with inline extents for small files, btrfs inline extents) store the file's payload directly inside the inode structure when the file is small enough to fit. This has two competing effects on the atomicity picture. On one hand, the block-alignment argument above rests on the file's first byte mapping to the start of a dedicated data block; with inline data there is no separate data block, so that specific alignment guarantee no longer holds. On the other hand, the entire file — header and payload together — now lives within a single inode block, which the filesystem must write atomically when flushing that metadata block. If the inode block itself is treated as the atomic unit (as journaling filesystems generally guarantee for metadata), then *all* in-file offsets become co-located in the same atomic region, potentially offering stronger end-to-end atomicity than the aligned-data-block argument alone. Whether this guarantee is durable across power loss (versus only crash-consistent) depends on the filesystem's journal mode (`data=writeback` vs `data=ordered` vs `data=journal` on ext4, for example) and is not safe to assume without explicit detection or documentation of the target filesystem.
 
+#### Multi-write journaling
+
+The single-write journal treats `wip_ptr` and `clen` as a two-field descriptor for one (range, payload) pair. To atomically apply `k` non-overlapping writes `{(s_i, e_i, data_i)}` in a single crash-safe step, the design generalises by replacing that two-field descriptor with a concatenated sequence of variable-length blocks appended into the same tail region, using `wip_aux` — the header field after `wip_ptr` — as the state discriminant while `wip_ptr` remains `0` throughout.
+
+**Tail layout.** Starting at `clen`, blocks are packed back-to-back with no padding or explicit links. Each block is self-delimiting: the header fields `s_i` and `e_i` encode the target range, and the block's payload length is simply `e_i − s_i`.
+
+```
+[head + 0  .. head + 8)              →  s_i   (start of target range)
+[head + 8  .. head + 16)             →  e_i   (end of target range)
+[head + 16 .. head + 16 + (e_i−s_i)) →  data_i (payload bytes)
+```
+
+The next block begins immediately after the previous payload. The sequence runs from `clen` to `file_size`; no explicit count or end pointer is needed — `file_size` is the boundary.
+
+**Protocol.**
+
+1. **Stage.** Append blocks one by one to the tail (`file_size` grows with each append). The header is not touched; `wip_ptr` and `wip_aux` remain `0`.
+2. **Arm.** Set `wip_aux` to the *intent-complete* sentinel. Sync.
+3. **Replay.** Scan the sequence from `clen` to `file_size`. For each block, copy `data_i` into `[s_i .. e_i)` in the payload region. Order within the replay does not matter so long as the ranges are non-overlapping.
+4. **Disarm.** Clear `wip_aux = 0`. Sync. Truncate to `clen`.
+
+**Recovery.** The existing `wip_ptr == 0` rule (truncate to `clen`) already handles a crash during step 1: no header sentinel was set, the tail is partial, and truncation discards it silently — identical to having never started. The only new recovery case is:
+
+- `wip_ptr == 0` and `wip_aux == intent-complete sentinel` → all blocks are fully staged; scan the sequence from `[clen .. file_size)` and replay each block, then disarm as in step 4.
+
+Every other combination is handled by the existing rules. The sentinel value for `wip_aux` in the multi-write case must be chosen so that it cannot be confused with the non-zero `wip_aux` values used by splice (which only appear when `wip_ptr != 0`); since the `wip_ptr == 0` prefix already disambiguates, any non-zero value is valid, but an explicit reserved constant (e.g., `u64::MAX`) is cleaner.
+
+**Constraint: no file-size-changing operations may be compounded with a multi-write.** The protocol relies on `clen` as the fixed start of the staging region and `file_size` as its end. Any operation that moves either boundary — `push`, `pop`, extension of the stack, or truncation/discard — would corrupt the staging region or make it unreadable during recovery. Multi-write is therefore strictly limited to in-place mutations of existing payload bytes; it cannot be batched together with operations that grow or shrink the file.
+
 #### Durability barriers
 
 Crash-safety depends on three real barriers, in order: stage→arm, arm→in-place, in-place→disarm. Without any of these, recovery can observe a header that disagrees with on-disk content. Each "sync" step above is the existing `durable_sync` primitive (already `F_FULLFSYNC` on macOS with fdatasync fallback, `fsync` elsewhere); no new platform handling is introduced — the journaling protocol only adds barriers at the three transitions above.
