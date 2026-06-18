@@ -391,14 +391,22 @@ mod alloc_fuzz_tests {
         }
     });
 
-    // double_free_error is FirstFit-only: GhostTree carries no per-block is_free
-    // flag, so reliable double-free detection would require false-positives on
-    // ordinary user data that happens to match the AVL size field value.
-    mod first_fit_only {
+    mod double_free {
         use super::*;
         #[test]
-        fn double_free_error() {
+        fn first_fit() {
             super::run_double_free_error(FirstFitBStackAllocator::new);
+        }
+
+        #[test]
+        fn check_slab_16() {
+            super::run_double_free_error(|bs: BStack| {
+                if bs.is_empty().unwrap() {
+                    CheckedSlabBStackAllocator::new(bs, 16)
+                } else {
+                    CheckedSlabBStackAllocator::open(bs)
+                }
+            });
         }
     }
 }
