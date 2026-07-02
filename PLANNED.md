@@ -120,9 +120,17 @@ The header grows from 16 B to 32 B:
 
 Magic bumps to a new 0.4.0 value so old binaries fail loudly on a new file rather than misinterpret the longer header as payload. `wip_ptr == 0` is the steady state ("no write in progress"); a non-zero `wip_ptr` names the start of the in-progress write slice. The slice length is **not** stored — it is reconstructed at recovery time as `file_size − clen`, which is exact by construction (see algorithm below).
 
-`wip_aux` is reserved: in 0.4.0 it is always zero. A zero value signals "this is the same-length atomic-`set` case, recover by the inferred-length rule". A non-zero value is reserved for future splice (different-length `set`) operations, where it will encode whatever extra metadata splice needs — at minimum a direction flag, possibly a packed direction + target-clen tuple. Because `wip_aux` is already present in the 0.4.0 header, splice can be added later without another ABI bump.
+`wip_aux` discriminates which kind of write is armed, and is meaningful only while `wip_ptr != 0`. 0.4.0 ships the full set of modes below — same-length `set`, splice (grow/shrink), and repeat-fill — so all of them are recognized by every 0.4.0 reader. The encoding leaves room for further modes with no change to the header *layout* (see *Forward compatibility of `wip_aux`* below for how modes are added later and when a new one forces a version bump).
 
-Only `set` (and, eventually, splice) ever arms `wip` — `push` and `pop` remain crash-atomic under a single `clen` write and leave `wip_ptr == 0` throughout. The at-rest invariant is `file_size == clen`; during a `set` the file grows to `clen + n` to hold a tail backup of the new bytes.
+- **`wip_aux == 0`** — same-length `set`. The slice length is inferred as `file_size − clen` (see below).
+- **`wip_aux != 0`** — splice (different-length `set`). The top two bits are a **mode tag** and the low 62 bits carry the absolute length delta `d = |n_new − n_old| ≥ 1`:
+  - `0b01` — **grow** (`n_new > n_old`); target length `clen' = clen + d`.
+  - `0b10` — **shrink** (`n_new < n_old`); target length `clen' = clen − d`.
+  - `0b00` is reserved. `0b11` is the **extension tag**: its low bits name a sub-mode. The repeat-fill optimization below is the first, written `REPEAT` (sub-mode `1`) and shipping in 0.4.0; the remaining `0b11` sub-modes are open for later versions.
+
+Storing the delta rather than the absolute `clen'` keeps `wip_aux` small (typical splices change the length by a handful of bytes) and, together with the non-zero mode tag, guarantees `wip_aux != 0` for every splice — so it can never be mistaken for the same-length case. Every single-region journal — same-length `set`, splice, and the extension modes — arms `wip_ptr != 0`; the multi-write journal (below) instead keeps `wip_ptr == 0` and parks its `u64::MAX` sentinel in `wip_aux`. The `wip_ptr` field alone therefore separates multi-write from every single-region mode, so no armed `wip_aux` can be confused with that sentinel.
+
+Only the in-place mutators — `set`, splice, and repeat-fill — ever arm `wip`; `push` and `pop` remain crash-atomic under a single `clen` write and leave `wip_ptr == 0` throughout. The at-rest invariant is `file_size == clen`; during a same-length `set` the file grows to `clen + n` to hold a tail backup of the new bytes, and during a splice it grows further to hold the rewritten suffix (see below).
 
 #### `set` for the same-length case
 
@@ -136,17 +144,69 @@ Replacing `[a .. a+n]` with new bytes `dn`:
 
 `wip_aux` stays zero throughout; the slice length is implied by `file_size − clen`. Arming is therefore a single 8 B header write, with no ordering subtlety between two fields — `wip_ptr` is the only armed bit.
 
+#### `splice` for the different-length case
+
+Splice replaces `[a .. a+n_old)` with new bytes `dn` of length `n_new ≠ n_old`. It changes both the slice contents and the stack length, so every byte above the splice point moves. Let:
+
+- `clen' = clen − n_old + n_new` — the new stack length,
+- `d = |n_new − n_old|` — the length delta armed in `wip_aux` (grow or shrink),
+- `L = clen' − a` — the length of the **rewritten suffix** (the new bytes followed by the relocated tail),
+- `S = max(clen, clen')` — the **staging base**.
+
+`S` sits at or beyond both the old end `clen` and the new end `clen'`, so the staging region `[S .. S+L)` overlaps neither the live payload `[0 .. clen)` nor the in-place rewrite target `[a .. clen')`. That disjointness is what makes replay idempotent, in both directions, with no memmove-style overlap hazard.
+
+1. **Stage.** Extend the file to `S + L`. Write the rewritten suffix into `[S .. S+L)`: `dn` into `[S .. S+n_new)`, then the surviving tail `[a+n_old .. clen)` into `[S+n_new .. S+L)`. Sync.
+2. **Arm.** Atomically write `wip_ptr = a` and `wip_aux = (tag << 62) | d`. Both fields lie within the first 32 B, so this is a single aligned-block header write — `wip_ptr` and `wip_aux` can never tear apart. Sync.
+3. **Replay in place.** Copy `[S .. S+L)` into `[a .. clen')`. Source and destination are disjoint (`a + L = clen' ≤ S`), so this is a plain forward block copy, restartable from the start. Sync.
+4. **Disarm & commit length.** Atomically write `clen = clen'`, `wip_ptr = 0`, and `wip_aux = 0` (offsets 8/16/24, all within the first block). This single write is the commit point: the new length and the disarmed journal land together or not at all. Sync.
+5. **Clean up.** Truncate the file to `clen'`, dropping the staged suffix (and, on a shrink, the vacated gap `[clen' .. clen)`).
+
+When `n_new = n_old` the tail does not move, so the cheaper same-length path above stages and rewrites only the `n` changed bytes rather than the whole suffix; splice is used only when the length actually changes (`d ≥ 1`).
+
+Every intermediate state recovers to the old or the new value, never a mix, by the same argument as the same-length case. A crash before **Arm** leaves `wip_ptr == 0` and rolls back — the base rule truncates to `clen`, discarding the staged suffix. A crash at or after **Arm** rolls forward, re-running the idempotent replay from the immutable staged suffix; because **Arm** and **Disarm** are each single aligned-block header writes, there is no torn state in which `wip_ptr`, `wip_aux`, and `clen` disagree. After **Disarm** the header already reads `clen'` with `wip_ptr == 0`, so a crash before **Clean up** finishes under the base `wip_ptr == 0` rule (truncate to `clen'`).
+
+Splice writes the rewritten suffix twice — once to the staging region, once in place — i.e. `O(clen − a)`. This is inherent: a length change relocates every byte above `a`, so splice is cheap near the top of the stack and expensive near the bottom.
+
+#### Repeating-fill (`repeat`) optimization
+
+A same-length write whose new bytes are a repeating pattern does not need to stage the whole region — only the pattern and the repeat count. To fill `[n .. m)` with `k` copies of a slice `S` (so `m − n = k·|S|`, with `|S| ≥ 1` and `k ≥ 1`), the length is unchanged, so `clen` stays constant. `repeat` uses the extension `wip_aux` mode `REPEAT`.
+
+1. **Stage.** Extend the file by `8 + |S|`; write `k` as a u64 (LE) into `[clen .. clen+8)` and `S` into `[clen+8 .. clen+8+|S|)`. Sync.
+2. **Arm.** Atomically write `wip_ptr = n` and `wip_aux = REPEAT`. Sync.
+3. **Fill in place.** Write `S` repeated `k` times across `[n .. m)`. Sync.
+4. **Disarm.** Write `wip_ptr = 0` and `wip_aux = 0`. Sync.
+5. **Clean up.** Truncate back to `clen`, dropping the `8 + |S|`-byte tail.
+
+As with `set`, the tail is fully staged and synced before the journal is armed, so an armed `REPEAT` always names a complete, durable `[k | S]` tail — this is why the arm follows the stage rather than preceding it. Recovery (`wip_ptr != 0`, `wip_aux == REPEAT`) reads `k` from the first 8 tail bytes and `S` from the remaining `file_size − clen − 8`, refills `[wip_ptr .. wip_ptr + k·|S|)` with `k` copies of `S` (idempotent — the tail is immutable and disjoint from the target), truncates to `clen`, and clears the journal.
+
+The win is that staging is `8 + |S|` bytes regardless of how large `[n, m)` is, versus the `m − n` bytes a plain `set` would back up. **Zeroing is the extreme case:** `zero(n, len)` is `repeat` with `S = [0x00]` and `k = len`, so the tail is a fixed 9 bytes no matter how many bytes are cleared.
+
+Because its in-place fill destroys the previous contents of `[n, m)` with no verbatim backup, a reader that does not understand `REPEAT` cannot recover a crashed `repeat` safely. Shipping it in 0.4.0 is fine — the 0.4.0 magic bump away from 0.1.x already keeps it out of the hands of readers that would mishandle it — and the same reasoning is what would force a version bump for any *further* destructive mode added after 0.4.0 (see *Forward compatibility of `wip_aux`*).
+
 #### Recovery on open
 
 Recovery runs once during construction, while the write lock is held, before the `BStack` is exposed. It reads only the header and the file size:
 
-- **`wip_ptr == 0`** — no active operation. Truncate to `clen` (drops any stale tail from a crashed step 1). Done.
+- **`wip_ptr == 0`** and **`wip_aux == 0`** — no operation in flight. Truncate to `clen` (drops any stale tail from a crashed stage). Done.
+- **`wip_ptr == 0`** and **`wip_aux ==` the multi-write sentinel** — a fully staged multi-write. Replay it (see *Multi-write journaling*).
 - **`wip_ptr != 0`** and **`wip_aux == 0`** — a same-length `set` was in progress. The staged tail is at `[clen .. file_size)`, length `n = file_size − clen`. Copy it into `[wip_ptr .. wip_ptr + n)`, truncate to `clen`, clear `wip_ptr`. The new value is committed.
-- **`wip_ptr != 0`** and **`wip_aux != 0`** — a splice operation. Handling is deferred; see open questions.
+- **`wip_ptr != 0`** and **`wip_aux` is a splice tag (`0b01`/`0b10`)** — a splice was in progress. Decode `a = wip_ptr` and delta `d` from `wip_aux`; set `clen' = clen + d` (grow) or `clen − d` (shrink) per the tag, then `S = max(clen, clen')` and `L = clen' − a`. Copy the staged suffix `[S .. S+L)` into `[a .. clen')` — idempotent, since the source is immutable and disjoint from the target — then atomically set `clen = clen'` and clear `wip_ptr`/`wip_aux`, and truncate to `clen'`. The new value is committed.
+- **`wip_ptr != 0`** and **`wip_aux == REPEAT`** — a repeat-fill was in progress. Read `k` from the first 8 tail bytes and `S` from `[clen+8 .. file_size)`; refill `[wip_ptr .. wip_ptr + k·|S|)` with `k` copies of `S`, truncate to `clen`, clear the journal. The new value is committed.
+- **any other combination** — an operation from a newer release that shares this magic. Apply the **default**: roll back to `clen` (truncate the tail, clear the journal), abandoning the in-flight operation. This is safe by construction — any mode whose abandonment could lose committed data bumps the magic, so it never reaches a program that would mishandle it (see *Forward compatibility of `wip_aux`*).
 
 Every intermediate on-disk state of the algorithm is recoverable to either the old or the new value, never an interleaving. Crashes in step 1 leave `wip_ptr == 0` (rollback by truncate). Crashes in step 2 are either `wip_ptr == 0` (rollback) or `wip_ptr == a` (roll forward via the staged tail). Crashes in step 3 roll forward; the recovery copy is idempotent over any partial in-place write. Crashes in step 4 are either roll forward (one more idempotent copy) or `wip_ptr == 0` (the new value is already in place; just truncate).
 
 Recovery must run to completion **before** the locked-region cache (#4) is populated, otherwise the cache could snapshot mid-rollback bytes. Any `set` that touches the locked region must also invalidate or refresh the cache atomically with the disk-level commit. This is a hard requirement of the journaling protocol, not an open question.
+
+#### Forward compatibility of `wip_aux`
+
+The `wip_aux` mode space is open: releases after 0.4.0 may define new modes in the reserved encoding (the `0b11` extension tag has ample sub-mode room). Two rules keep this safe across versions:
+
+1. **Unrecognized modes recover by default.** A program that opens a file armed with a `wip_aux` mode it does not recognize does not guess at the staging format. It applies the **default recovery** — roll back to the last committed `clen` (truncate the tail, clear the journal), abandoning the in-flight operation as though the crash had landed one step earlier.
+
+2. **Data-lossy modes bump the version.** The default is safe only for modes whose abandonment cannot lose committed data — modes that stage their result outside `[0, clen)` and commit with a single atomic header flip, so rolling back merely discards uncommitted scratch. A mode that overwrites committed bytes in place before committing (same-length `set`, `splice`, and `repeat` all do) cannot be finished by a program that does not understand it, and rolling it back would leave a torn region. **Introducing such a mode bumps the minor version** (`0.4.0 → 0.5.0`, and so on), which changes the magic so older releases refuse the file at open rather than corrupting it.
+
+Together these guarantee that whenever the default path actually runs, the mode it is defaulting on is non-destructive, so no data is lost; and any destructive new mode is gated behind a magic that older releases reject. It is the same mechanism that protects the 0.4.0 journal itself: 0.4.0's own destructive modes — same-length `set`, splice, and repeat-fill — all have in-place recovery a 0.1.x reader could not perform, and the single 0.4.0 magic bump away from 0.1.x already keeps the file out of its hands. The rule bites again only for a *further* destructive mode introduced after 0.4.0.
 
 #### Migration from 0.1.0 files
 
@@ -198,8 +258,6 @@ Crash-safety depends on three real barriers, in order: stage→arm, arm→in-pla
 ### Open questions
 
 - **Aligned-block atomicity in `set`.** If the target slice fits within a single aligned block (i.e. `n ≤ block_size` and the write does not cross a block boundary), the write is atomic at the storage level and the `wip` journal could be skipped entirely — reducing a 4-sync protocol to a single write+sync. Determine whether this optimization is safe and, if so, define the precise size and alignment conditions under which `wip` is unnecessary.
-
-- **Splice (different-length `set`) is deferred.** Replacing `[a..t]` of length `n_old` with bytes of length `n_new ≠ n_old` changes both slice contents and stack length. The current recovery rule in this document (length implied by `file_size − clen`) cannot distinguish the shrink and grow cases — the bytes immediately after the wip range carry opposite meanings (old content to discard vs new content to keep). Splice will use `wip_aux` to encode the metadata needed to disambiguate: at minimum a direction bit, possibly a packed direction + target-`clen` tuple. No header growth, no further ABI bump. The exact encoding inside `wip_aux`, the staging sequence for each direction should be considered before this is actually implemented.
 
 ---
 
