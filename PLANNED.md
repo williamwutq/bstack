@@ -270,9 +270,23 @@ Every other combination is handled by the existing rules. The sentinel value for
 
 Crash-safety depends on three real barriers, in order: stage→arm, arm→in-place, in-place→disarm. Without any of these, recovery can observe a header that disagrees with on-disk content. Each "sync" step above is the existing `durable_sync` primitive (already `F_FULLFSYNC` on macOS with fdatasync fallback, `fsync` elsewhere); no new platform handling is introduced — the journaling protocol only adds barriers at the three transitions above.
 
+#### Choosing a write strategy
+
+Every mutation picks the cheapest correct strategy for its shape. Evaluated in order, the first that applies wins:
+
+1. **Derived atomicity — skip the journal entirely.** If the modified bytes fall within a single aligned block (see *Derived atomicity beyond 8 B*), the write is atomic at the storage level: do a plain write + sync, no `wip`. A same-length write in this class also touches no `clen`, so there is nothing else to commit.
+2. **Already crash-atomic — skip the journal.** Some operations are safe without `wip` by construction: `push`/`pop` and append-copy commit through the single atomic `clen` write (a crash rolls back by truncation), so they never arm `wip`.
+3. **Special compact-journal mode — use it if it applies.** REPEAT (repeating pattern) and COPY (disjoint in-file source) journal only a few bytes of metadata instead of a full-data backup. Prefer these whenever their preconditions hold.
+4. **General single-region journal.** Otherwise stage the full new bytes — for splice, the rewritten suffix — in the tail, then arm → replay → disarm.
+5. **Multi-write journal.** When several non-overlapping in-place writes must commit atomically as one unit.
+
+The ladder is strictly cheapest-first: each rung avoids a `clen` write, a sync, a file-size change, or a data-sized tail that the next rung down would incur. A given call walks the list and stops at the first rung whose conditions it meets.
+
 ### Open questions
 
 - **Aligned-block atomicity in `set`.** If the target slice fits within a single aligned block (i.e. `n ≤ block_size` and the write does not cross a block boundary), the write is atomic at the storage level and the `wip` journal could be skipped entirely — reducing a 4-sync protocol to a single write+sync. Determine whether this optimization is safe and, if so, define the precise size and alignment conditions under which `wip` is unnecessary.
+
+- **Coordinate-only batch relocation.** The multi-write journal stages full `(start, end, data)` blocks. A variant could stage `(dest, source, len)` triples replayed by in-place copy — the COPY optimization generalized to a batch — giving a crash-atomic bulk move whose journal is proportional to the *number* of moves, not the bytes moved (e.g. allocator compaction or defragmentation, sliding many live blocks in one atomic step). It needs preconditions the single COPY does not: every source disjoint from every destination, *and* the move graph acyclic — a cycle such as `A→B→A` has no safe in-place replay order, since replaying it re-reads a source that an earlier step already overwrote. Define the precondition checks, the tail layout, and whether a cyclic batch falls back to staging one region per cycle (breaking the cycle) or to the full-data multi-write path.
 
 ---
 
