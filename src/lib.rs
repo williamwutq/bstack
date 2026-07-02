@@ -544,6 +544,20 @@ const MAGIC_PREFIX: [u8; 6] = *b"BSTK\x00\x01";
 /// Bytes occupied by the file header (magic[8] + committed_len[8]).
 const HEADER_SIZE: u64 = 16;
 
+/// Conservative power-fail atomic block size, in bytes.
+///
+/// Real storage writes whole blocks atomically: a single write confined to one
+/// block either lands in full or not at all across a power loss. Devices differ
+/// in their true block size (commonly 512 B or 4 KB), but 256 B is a lower bound
+/// that holds on virtually all hardware — including eMMC and older NVMe
+/// controllers that advertise larger blocks yet only guarantee 512 B or 256 B
+/// power-fail atomicity. Because 256 divides those sizes and the file's first
+/// byte is block-aligned, a write confined to one 256 B-aligned region is always
+/// contained within a single hardware block. See *Derived atomicity beyond 8 B*
+/// in `PLANNED.md`.
+#[cfg(any(feature = "set", feature = "atomic"))]
+const ATOMIC_BLOCK: u64 = 256;
+
 /// Flush all in-flight writes to stable storage.
 ///
 /// On macOS this uses `F_FULLFSYNC` to flush the drive's hardware write cache,
@@ -661,6 +675,40 @@ fn check_offset_unlocked(op: &str, offset: u64, end: u64, locked: u64) -> io::Re
         ));
     }
     Ok(())
+}
+
+/// Return `true` if overwriting `[offset, offset + data.len())` of the payload is
+/// guaranteed atomic at the storage level — i.e. the bytes are confined to a
+/// single [`ATOMIC_BLOCK`]-aligned region of the file and therefore cannot tear
+/// across a block boundary on power loss.
+///
+/// `offset` is a logical payload offset; the test is applied to the physical
+/// file position `HEADER_SIZE + offset`, since the file's first byte is
+/// block-aligned. The write is atomic exactly when its first and last bytes fall
+/// in the same block. An empty write is trivially atomic; an offset/length that
+/// overflows `u64` cannot be confined to one block and is reported non-atomic.
+///
+/// This is the gate for skipping the write-in-progress journal on a same-length
+/// `set` whose slice fits within one block (see the *Aligned-block atomicity*
+/// open question in `PLANNED.md`). It is conservative: a write it rejects may
+/// still be atomic on hardware with a larger true block size, but a write it
+/// accepts is atomic on all supported storage.
+// Not yet wired into `set`; it is the primitive the journaling work will call to
+// decide when the write-in-progress journal can be skipped.
+#[cfg(any(feature = "set", feature = "atomic"))]
+#[allow(dead_code)]
+fn is_atomic_write(offset: u64, data: &[u8]) -> bool {
+    let len = data.len() as u64;
+    if len == 0 {
+        return true;
+    }
+    let Some(start) = HEADER_SIZE.checked_add(offset) else {
+        return false;
+    };
+    let Some(last) = start.checked_add(len - 1) else {
+        return false;
+    };
+    start / ATOMIC_BLOCK == last / ATOMIC_BLOCK
 }
 
 /// Commit a payload growth to `new_len` and durably sync.
