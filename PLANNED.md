@@ -120,17 +120,17 @@ The header grows from 16 B to 32 B:
 
 Magic bumps to a new 0.4.0 value so old binaries fail loudly on a new file rather than misinterpret the longer header as payload. `wip_ptr == 0` is the steady state ("no write in progress"); a non-zero `wip_ptr` names the start of the in-progress write slice. The slice length is **not** stored — it is reconstructed at recovery time as `file_size − clen`, which is exact by construction (see algorithm below).
 
-`wip_aux` discriminates which kind of write is armed, and is meaningful only while `wip_ptr != 0`. 0.4.0 ships the full set of modes below — same-length `set`, splice (grow/shrink), and repeat-fill — so all of them are recognized by every 0.4.0 reader. The encoding leaves room for further modes with no change to the header *layout* (see *Forward compatibility of `wip_aux`* below for how modes are added later and when a new one forces a version bump).
+`wip_aux` discriminates which kind of write is armed, and is meaningful only while `wip_ptr != 0`. 0.4.0 ships the full set of modes below — same-length `set`, splice (grow/shrink), repeat-fill, and copy — so all of them are recognized by every 0.4.0 reader. The encoding leaves room for further modes with no change to the header *layout* (see *Forward compatibility of `wip_aux`* below for how modes are added later and when a new one forces a version bump).
 
 - **`wip_aux == 0`** — same-length `set`. The slice length is inferred as `file_size − clen` (see below).
 - **`wip_aux != 0`** — splice (different-length `set`). The top two bits are a **mode tag** and the low 62 bits carry the absolute length delta `d = |n_new − n_old| ≥ 1`:
   - `0b01` — **grow** (`n_new > n_old`); target length `clen' = clen + d`.
   - `0b10` — **shrink** (`n_new < n_old`); target length `clen' = clen − d`.
-  - `0b00` is reserved. `0b11` is the **extension tag**: its low bits name a sub-mode. The repeat-fill optimization below is the first, written `REPEAT` (sub-mode `1`) and shipping in 0.4.0; the remaining `0b11` sub-modes are open for later versions.
+  - `0b00` is reserved. `0b11` is the **extension tag**: its low bits name a sub-mode. The repeat-fill and copy optimizations below are the first two, written `REPEAT` (sub-mode `1`) and `COPY` (sub-mode `2`), both shipping in 0.4.0; the remaining `0b11` sub-modes are open for later versions.
 
 Storing the delta rather than the absolute `clen'` keeps `wip_aux` small (typical splices change the length by a handful of bytes) and, together with the non-zero mode tag, guarantees `wip_aux != 0` for every splice — so it can never be mistaken for the same-length case. Every single-region journal — same-length `set`, splice, and the extension modes — arms `wip_ptr != 0`; the multi-write journal (below) instead keeps `wip_ptr == 0` and parks its `u64::MAX` sentinel in `wip_aux`. The `wip_ptr` field alone therefore separates multi-write from every single-region mode, so no armed `wip_aux` can be confused with that sentinel.
 
-Only the in-place mutators — `set`, splice, and repeat-fill — ever arm `wip`; `push` and `pop` remain crash-atomic under a single `clen` write and leave `wip_ptr == 0` throughout. The at-rest invariant is `file_size == clen`; during a same-length `set` the file grows to `clen + n` to hold a tail backup of the new bytes, and during a splice it grows further to hold the rewritten suffix (see below).
+Only the in-place mutators — `set`, splice, repeat-fill, and copy — ever arm `wip`; `push` and `pop` remain crash-atomic under a single `clen` write and leave `wip_ptr == 0` throughout. The at-rest invariant is `file_size == clen`; during a same-length `set` the file grows to `clen + n` to hold a tail backup of the new bytes, and during a splice it grows further to hold the rewritten suffix (see below).
 
 #### `set` for the same-length case
 
@@ -183,6 +183,20 @@ The win is that staging is `8 + |S|` bytes regardless of how large `[n, m)` is, 
 
 Because its in-place fill destroys the previous contents of `[n, m)` with no verbatim backup, a reader that does not understand `REPEAT` cannot recover a crashed `repeat` safely. Shipping it in 0.4.0 is fine — the 0.4.0 magic bump away from 0.1.x already keeps it out of the hands of readers that would mishandle it — and the same reasoning is what would force a version bump for any *further* destructive mode added after 0.4.0 (see *Forward compatibility of `wip_aux`*).
 
+#### Copy (`copy`) optimization
+
+Copying an existing slice from a **disjoint** source `[s .. s+n)` onto a destination `[c .. c+n)` needs no data staged at all. The source is committed data that the copy does not touch, so it is already a durable backup; the destination's old bytes are being discarded, so they need none. Only the *coordinates* have to be journaled. `copy` uses the extension `wip_aux` mode `COPY`, with `wip_ptr = c` (the destination — the write target, as in every other mode) and a 16-byte tail holding the length `n` and the source start `s`. Like `set` and `repeat`, it is same-length, so `clen` stays constant.
+
+1. **Stage.** Extend the file by 16; write `n` (u64 LE) into `[clen .. clen+8)` and `s` (u64 LE) into `[clen+8 .. clen+16)`. Sync.
+2. **Arm.** Atomically write `wip_ptr = c` and `wip_aux = COPY`. Sync.
+3. **Copy in place.** Copy `[s .. s+n)` into `[c .. c+n)`. Sync.
+4. **Disarm.** Write `wip_ptr = 0` and `wip_aux = 0`. Sync.
+5. **Clean up.** Truncate back to `clen`, dropping the 16-byte tail.
+
+Recovery (`wip_ptr != 0`, `wip_aux == COPY`) reads `n` and `s` from the tail and re-copies `[s .. s+n)` into `[wip_ptr .. wip_ptr + n)`, then truncates to `clen` and clears the journal. This is idempotent precisely because the source is disjoint from the destination: the copy never modifies `[s .. s+n)`, so a replay always reads the same original bytes no matter how far a crashed copy had progressed. The win is that the tail is a fixed 16 bytes of metadata rather than the `n` bytes of source data a plain `set` would have to back up.
+
+**Disjointness is mandatory, and `cross_exchange` is explicitly excluded.** The optimization rests on the source surviving the copy intact. If `[s, s+n)` and `[c, c+n)` overlapped, the in-place write would clobber source bytes before they were read, and a post-crash replay would read corrupted source — so an overlapping copy must fall back to the same-length `set` path, which stages the actual bytes in the tail. **`cross_exchange` can never use `COPY`** for the same reason: a swap makes each region simultaneously a source and a destination, so writing either half destroys data the other half still needs. It must copy the region contents into the tail first — the general backup-in-tail path — to preserve data integrity.
+
 #### Recovery on open
 
 Recovery runs once during construction, while the write lock is held, before the `BStack` is exposed. It reads only the header and the file size:
@@ -192,6 +206,7 @@ Recovery runs once during construction, while the write lock is held, before the
 - **`wip_ptr != 0`** and **`wip_aux == 0`** — a same-length `set` was in progress. The staged tail is at `[clen .. file_size)`, length `n = file_size − clen`. Copy it into `[wip_ptr .. wip_ptr + n)`, truncate to `clen`, clear `wip_ptr`. The new value is committed.
 - **`wip_ptr != 0`** and **`wip_aux` is a splice tag (`0b01`/`0b10`)** — a splice was in progress. Decode `a = wip_ptr` and delta `d` from `wip_aux`; set `clen' = clen + d` (grow) or `clen − d` (shrink) per the tag, then `S = max(clen, clen')` and `L = clen' − a`. Copy the staged suffix `[S .. S+L)` into `[a .. clen')` — idempotent, since the source is immutable and disjoint from the target — then atomically set `clen = clen'` and clear `wip_ptr`/`wip_aux`, and truncate to `clen'`. The new value is committed.
 - **`wip_ptr != 0`** and **`wip_aux == REPEAT`** — a repeat-fill was in progress. Read `k` from the first 8 tail bytes and `S` from `[clen+8 .. file_size)`; refill `[wip_ptr .. wip_ptr + k·|S|)` with `k` copies of `S`, truncate to `clen`, clear the journal. The new value is committed.
+- **`wip_ptr != 0`** and **`wip_aux == COPY`** — a copy was in progress. Read `n` and `s` from the 16-byte tail; copy `[s .. s+n)` into `[wip_ptr .. wip_ptr + n)`, truncate to `clen`, clear the journal. The new value is committed.
 - **any other combination** — an operation from a newer release that shares this magic. Apply the **default**: roll back to `clen` (truncate the tail, clear the journal), abandoning the in-flight operation. This is safe by construction — any mode whose abandonment could lose committed data bumps the magic, so it never reaches a program that would mishandle it (see *Forward compatibility of `wip_aux`*).
 
 Every intermediate on-disk state of the algorithm is recoverable to either the old or the new value, never an interleaving. Crashes in step 1 leave `wip_ptr == 0` (rollback by truncate). Crashes in step 2 are either `wip_ptr == 0` (rollback) or `wip_ptr == a` (roll forward via the staged tail). Crashes in step 3 roll forward; the recovery copy is idempotent over any partial in-place write. Crashes in step 4 are either roll forward (one more idempotent copy) or `wip_ptr == 0` (the new value is already in place; just truncate).
@@ -204,9 +219,9 @@ The `wip_aux` mode space is open: releases after 0.4.0 may define new modes in t
 
 1. **Unrecognized modes recover by default.** A program that opens a file armed with a `wip_aux` mode it does not recognize does not guess at the staging format. It applies the **default recovery** — roll back to the last committed `clen` (truncate the tail, clear the journal), abandoning the in-flight operation as though the crash had landed one step earlier.
 
-2. **Data-lossy modes bump the version.** The default is safe only for modes whose abandonment cannot lose committed data — modes that stage their result outside `[0, clen)` and commit with a single atomic header flip, so rolling back merely discards uncommitted scratch. A mode that overwrites committed bytes in place before committing (same-length `set`, `splice`, and `repeat` all do) cannot be finished by a program that does not understand it, and rolling it back would leave a torn region. **Introducing such a mode bumps the minor version** (`0.4.0 → 0.5.0`, and so on), which changes the magic so older releases refuse the file at open rather than corrupting it.
+2. **Data-lossy modes bump the version.** The default is safe only for modes whose abandonment cannot lose committed data — modes that stage their result outside `[0, clen)` and commit with a single atomic header flip, so rolling back merely discards uncommitted scratch. A mode that overwrites committed bytes in place before committing (same-length `set`, `splice`, `repeat`, and `copy` all do) cannot be finished by a program that does not understand it, and rolling it back would leave a torn region. **Introducing such a mode bumps the minor version** (`0.4.0 → 0.5.0`, and so on), which changes the magic so older releases refuse the file at open rather than corrupting it.
 
-Together these guarantee that whenever the default path actually runs, the mode it is defaulting on is non-destructive, so no data is lost; and any destructive new mode is gated behind a magic that older releases reject. It is the same mechanism that protects the 0.4.0 journal itself: 0.4.0's own destructive modes — same-length `set`, splice, and repeat-fill — all have in-place recovery a 0.1.x reader could not perform, and the single 0.4.0 magic bump away from 0.1.x already keeps the file out of its hands. The rule bites again only for a *further* destructive mode introduced after 0.4.0.
+Together these guarantee that whenever the default path actually runs, the mode it is defaulting on is non-destructive, so no data is lost; and any destructive new mode is gated behind a magic that older releases reject. It is the same mechanism that protects the 0.4.0 journal itself: 0.4.0's own destructive modes — same-length `set`, splice, repeat-fill, and copy — all have in-place recovery a 0.1.x reader could not perform, and the single 0.4.0 magic bump away from 0.1.x already keeps the file out of its hands. The rule bites again only for a *further* destructive mode introduced after 0.4.0.
 
 #### Migration from 0.1.0 files
 
