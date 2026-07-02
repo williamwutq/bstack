@@ -619,6 +619,140 @@ fn write_committed_len(file: &mut File, clen: &mut u64, len: u64) -> io::Result<
     Ok(())
 }
 
+/// Seek to logical `offset` (just past the header) and fill `buf` from the file.
+///
+/// Shared by every write-lock-held operation that reads a payload region
+/// through the file cursor.
+fn read_at(file: &mut File, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+    file.seek(SeekFrom::Start(HEADER_SIZE + offset))?;
+    file.read_exact(buf)
+}
+
+/// Seek to logical `offset` (just past the header) and write `data` there.
+///
+/// Shared by every write-lock-held operation that mutates a payload region
+/// through the file cursor.
+#[cfg(any(feature = "set", feature = "atomic"))]
+fn write_at(file: &mut File, offset: u64, data: &[u8]) -> io::Result<()> {
+    file.seek(SeekFrom::Start(HEADER_SIZE + offset))?;
+    file.write_all(data)
+}
+
+/// Compute `base + len`, mapping `u64` overflow to an `InvalidInput` error
+/// carrying `msg`.
+#[cfg(any(feature = "set", feature = "atomic"))]
+fn checked_end(base: u64, len: u64, msg: &'static str) -> io::Result<u64> {
+    base.checked_add(len)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, msg))
+}
+
+/// Reject an in-place write whose range `[offset, end)` starts inside the locked
+/// prefix `[0, locked)`. `op` names the operation for the error message.
+///
+/// Shared by the single-range in-place mutators (`set`, `zero`, `swap`,
+/// `swap_into`, `cas`); callers must load `locked` under the write lock so the
+/// check cannot race a concurrent `lock_up_to`.
+#[cfg(feature = "set")]
+fn check_offset_unlocked(op: &str, offset: u64, end: u64, locked: u64) -> io::Result<()> {
+    if offset < locked {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{op}: range [{offset}, {end}) overlaps locked region [0, {locked})"),
+        ));
+    }
+    Ok(())
+}
+
+/// Commit a payload growth to `new_len` and durably sync.
+///
+/// On failure the file is rolled back (best effort) to `file_end` bytes and the
+/// cached/committed length is reset to `old_len` before the original error is
+/// returned. The cache is reset up front so it reflects the rolled-back file
+/// even if the best-effort header rewrite fails. Shared by `push`, `extend`,
+/// `try_extend`, `try_extend_zeros`, and the `Push` arm of `process_gen`.
+fn commit_grow(
+    file: &mut File,
+    clen: &mut u64,
+    new_len: u64,
+    old_len: u64,
+    file_end: u64,
+) -> io::Result<()> {
+    if let Err(e) = write_committed_len(file, clen, new_len).and_then(|_| durable_sync(file)) {
+        let _ = file.set_len(file_end);
+        *clen = old_len;
+        let _ = write_committed_len(file, clen, old_len);
+        let _ = durable_sync(file);
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Commit a payload shrink to `new_len`: truncate the file, update the cached
+/// length, write the header, and durably sync.
+///
+/// The truncation is the commit point — recovery adopts the smaller file size —
+/// so the cache is updated before the header write, which `?` could skip on
+/// error. Shared by `pop`, `pop_into`, `discard`, `try_discard`, and the `Pop`
+/// and `Discard` arms of `process_gen`.
+fn commit_shrink(file: &mut File, clen: &mut u64, new_len: u64) -> io::Result<()> {
+    file.set_len(HEADER_SIZE + new_len)?;
+    *clen = new_len;
+    write_committed_len(file, clen, new_len)?;
+    durable_sync(file)
+}
+
+/// Commit a tail replacement: the payload from `new_tail_start` onward is
+/// replaced by `buf`, changing the payload length to `new_tail_start +
+/// buf.len()`. `n` is the number of bytes removed from the old tail; `file_end`
+/// is the pre-operation raw file size, used for rollback on the net-extension
+/// path.
+///
+/// The write ordering is chosen from the net size change to maximise crash
+/// safety (see *Durability* in the crate docs). Shared by `atrunc`, `splice`,
+/// `splice_into`, and `replace`.
+#[cfg(feature = "atomic")]
+fn commit_tail_replace(
+    file: &mut File,
+    clen: &mut u64,
+    new_tail_start: u64,
+    n: u64,
+    buf: &[u8],
+    file_end: u64,
+) -> io::Result<()> {
+    let buf_len = buf.len() as u64;
+    let final_data_len = new_tail_start + buf_len;
+    if buf_len > n {
+        // Net extension: extend first so data is never lost, then write buf,
+        // sync the data, then commit the new length.
+        file.set_len(HEADER_SIZE + final_data_len)?;
+        if let Err(e) = write_at(file, new_tail_start, buf) {
+            let _ = file.set_len(file_end);
+            return Err(e);
+        }
+        if let Err(e) = durable_sync(file) {
+            let _ = file.set_len(file_end);
+            return Err(e);
+        }
+        write_committed_len(file, clen, final_data_len)?;
+        durable_sync(file)?;
+    } else {
+        // Net truncation or same size: write buf into the old tail first,
+        // truncate, sync, then commit the new length.
+        if !buf.is_empty() {
+            write_at(file, new_tail_start, buf)?;
+        }
+        file.set_len(HEADER_SIZE + final_data_len)?;
+        // The truncation is the commit point (recovery adopts the smaller file
+        // size), so update the cache now — before the sync and header write,
+        // which `?` could skip on error.
+        *clen = final_data_len;
+        durable_sync(file)?;
+        write_committed_len(file, clen, final_data_len)?;
+        durable_sync(file)?;
+    }
+    Ok(())
+}
+
 /// Read `len` bytes from absolute file position `offset` without modifying
 /// the file-position cursor, so the caller only needs a shared (read) lock.
 ///
@@ -920,17 +1054,7 @@ impl BStack {
         }
 
         let new_len = logical_offset + data.len() as u64;
-        if let Err(e) = write_committed_len(file, clen, new_len).and_then(|_| durable_sync(file)) {
-            // Roll back: truncate data and reset header. The cache is reset
-            // up front so it reflects the rolled-back file even if the
-            // best-effort header rewrite below fails.
-            let _ = file.set_len(file_end);
-            *clen = logical_offset;
-            let _ = write_committed_len(file, clen, logical_offset);
-            let _ = durable_sync(file);
-            return Err(e);
-        }
-
+        commit_grow(file, clen, new_len, logical_offset, file_end)?;
         Ok(logical_offset)
     }
 
@@ -964,17 +1088,7 @@ impl BStack {
         file.set_len(new_file_end)?;
 
         let new_len = logical_offset + n;
-        if let Err(e) = write_committed_len(file, clen, new_len).and_then(|_| durable_sync(file)) {
-            // Roll back: truncate and reset header. The cache is reset up
-            // front so it reflects the rolled-back file even if the
-            // best-effort header rewrite below fails.
-            let _ = file.set_len(file_end);
-            *clen = logical_offset;
-            let _ = write_committed_len(file, clen, logical_offset);
-            let _ = durable_sync(file);
-            return Err(e);
-        }
-
+        commit_grow(file, clen, new_len, logical_offset, file_end)?;
         Ok(logical_offset)
     }
 
@@ -1012,16 +1126,9 @@ impl BStack {
                 format!("pop({n}) would shrink payload below locked length ({locked})"),
             ));
         }
-        file.seek(SeekFrom::Start(HEADER_SIZE + new_data_len))?;
         let mut buf = vec![0u8; n as usize];
-        file.read_exact(&mut buf)?;
-        file.set_len(HEADER_SIZE + new_data_len)?;
-        // The truncation is the commit point: the tail bytes are gone and
-        // recovery would adopt the smaller file size, so update the cache now
-        // — before the header write, which `?` could skip on error.
-        *clen = new_data_len;
-        write_committed_len(file, clen, new_data_len)?;
-        durable_sync(file)?;
+        read_at(file, new_data_len, &mut buf)?;
+        commit_shrink(file, clen, new_data_len)?;
         Ok(buf)
     }
 
@@ -1345,15 +1452,8 @@ impl BStack {
                 format!("pop_into({n}) would shrink payload below locked length ({locked})"),
             ));
         }
-        file.seek(SeekFrom::Start(HEADER_SIZE + new_data_len))?;
-        file.read_exact(buf)?;
-        file.set_len(HEADER_SIZE + new_data_len)?;
-        // The truncation is the commit point: the tail bytes are gone and
-        // recovery would adopt the smaller file size, so update the cache now
-        // — before the header write, which `?` could skip on error.
-        *clen = new_data_len;
-        write_committed_len(file, clen, new_data_len)?;
-        durable_sync(file)?;
+        read_at(file, new_data_len, buf)?;
+        commit_shrink(file, clen, new_data_len)?;
         Ok(())
     }
 
@@ -1393,13 +1493,7 @@ impl BStack {
                 format!("discard({n}) would shrink payload below locked length ({locked})"),
             ));
         }
-        file.set_len(HEADER_SIZE + new_data_len)?;
-        // The truncation is the commit point: the tail bytes are gone and
-        // recovery would adopt the smaller file size, so update the cache now
-        // — before the header write, which `?` could skip on error.
-        *clen = new_data_len;
-        write_committed_len(file, clen, new_data_len)?;
-        durable_sync(file)?;
+        commit_shrink(file, clen, new_data_len)?;
         Ok(())
     }
 
@@ -1429,24 +1523,14 @@ impl BStack {
         if data.is_empty() {
             return Ok(());
         }
-        let end = offset.checked_add(data.len() as u64).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "set: offset + len overflows u64",
-            )
-        })?;
+        let end = checked_end(offset, data.len() as u64, "set: offset + len overflows u64")?;
         let mut guard = self.lock.write().unwrap();
         let file = &mut guard.0;
         // Load `locked` under the write lock — otherwise a concurrent
         // `lock_up_to` could extend the locked region between our check and
         // our write, letting us mutate a now-immutable byte.
         let locked = self.locked.load(Ordering::Acquire);
-        if offset < locked {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("set: range [{offset}, {end}) overlaps locked region [0, {locked})"),
-            ));
-        }
+        check_offset_unlocked("set", offset, end, locked)?;
         let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
         if end > data_size {
             return Err(io::Error::new(
@@ -1454,8 +1538,7 @@ impl BStack {
                 format!("set: write end ({end}) exceeds payload size ({data_size})"),
             ));
         }
-        file.seek(SeekFrom::Start(HEADER_SIZE + offset))?;
-        file.write_all(data)?;
+        write_at(file, offset, data)?;
         durable_sync(file)
     }
 
@@ -1484,22 +1567,12 @@ impl BStack {
         if n == 0 {
             return Ok(());
         }
-        let end = offset.checked_add(n).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "zero: offset + n overflows u64",
-            )
-        })?;
+        let end = checked_end(offset, n, "zero: offset + n overflows u64")?;
         let mut guard = self.lock.write().unwrap();
         let file = &mut guard.0;
         // Load `locked` under the write lock (see `set` for rationale).
         let locked = self.locked.load(Ordering::Acquire);
-        if offset < locked {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("zero: range [{offset}, {end}) overlaps locked region [0, {locked})"),
-            ));
-        }
+        check_offset_unlocked("zero", offset, end, locked)?;
         let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
         if end > data_size {
             return Err(io::Error::new(
@@ -1507,9 +1580,8 @@ impl BStack {
                 format!("zero: write end ({end}) exceeds payload size ({data_size})"),
             ));
         }
-        file.seek(SeekFrom::Start(HEADER_SIZE + offset))?;
         let zeros = vec![0u8; n as usize];
-        file.write_all(&zeros)?;
+        write_at(file, offset, &zeros)?;
         durable_sync(file)
     }
 }
@@ -1572,42 +1644,7 @@ impl BStack {
                 format!("atrunc: operation would modify locked region [0, {locked})"),
             ));
         }
-        let tail_offset = HEADER_SIZE + new_tail_start;
-        let final_data_len = new_tail_start + buf_len;
-
-        if buf_len > n {
-            // Net extension: extend first so data is never lost, then write buf,
-            // sync the data, then commit the new length.
-            let new_file_end = HEADER_SIZE + final_data_len;
-            file.set_len(new_file_end)?;
-            file.seek(SeekFrom::Start(tail_offset))?;
-            if let Err(e) = file.write_all(buf) {
-                let _ = file.set_len(file_end);
-                return Err(e);
-            }
-            if let Err(e) = durable_sync(file) {
-                let _ = file.set_len(file_end);
-                return Err(e);
-            }
-            write_committed_len(file, clen, final_data_len)?;
-            durable_sync(file)?;
-        } else {
-            // Net truncation or same size: write buf into the old tail first,
-            // truncate, sync, then commit the new length.
-            if !buf.is_empty() {
-                file.seek(SeekFrom::Start(tail_offset))?;
-                file.write_all(buf)?;
-            }
-            file.set_len(HEADER_SIZE + final_data_len)?;
-            // The truncation is the commit point (recovery adopts the smaller
-            // file size), so update the cache now — before the sync and header
-            // write, which `?` could skip on error.
-            *clen = final_data_len;
-            durable_sync(file)?;
-            write_committed_len(file, clen, final_data_len)?;
-            durable_sync(file)?;
-        }
-        Ok(())
+        commit_tail_replace(file, clen, new_tail_start, n, buf, file_end)
     }
 
     /// Pop `n` bytes off the tail then append `buf`, returning the removed bytes.
@@ -1652,45 +1689,11 @@ impl BStack {
                 format!("splice: operation would modify locked region [0, {locked})"),
             ));
         }
-        let tail_offset = HEADER_SIZE + new_tail_start;
-        let final_data_len = new_tail_start + buf_len;
-
         // Read the bytes to remove before any mutation.
-        file.seek(SeekFrom::Start(tail_offset))?;
         let mut removed = vec![0u8; n as usize];
-        file.read_exact(&mut removed)?;
+        read_at(file, new_tail_start, &mut removed)?;
 
-        if buf_len > n {
-            // Net extension: extend first, write buf, sync, commit.
-            let new_file_end = HEADER_SIZE + final_data_len;
-            file.set_len(new_file_end)?;
-            file.seek(SeekFrom::Start(tail_offset))?;
-            if let Err(e) = file.write_all(buf) {
-                let _ = file.set_len(file_end);
-                return Err(e);
-            }
-            if let Err(e) = durable_sync(file) {
-                let _ = file.set_len(file_end);
-                return Err(e);
-            }
-            write_committed_len(file, clen, final_data_len)?;
-            durable_sync(file)?;
-        } else {
-            // Net truncation or same size: write buf, truncate, sync, commit.
-            if !buf.is_empty() {
-                file.seek(SeekFrom::Start(tail_offset))?;
-                file.write_all(buf)?;
-            }
-            file.set_len(HEADER_SIZE + final_data_len)?;
-            // The truncation is the commit point (recovery adopts the smaller
-            // file size), so update the cache now — before the sync and header
-            // write, which `?` could skip on error.
-            *clen = final_data_len;
-            durable_sync(file)?;
-            write_committed_len(file, clen, final_data_len)?;
-            durable_sync(file)?;
-        }
-
+        commit_tail_replace(file, clen, new_tail_start, n, buf, file_end)?;
         Ok(removed)
     }
 
@@ -1738,44 +1741,10 @@ impl BStack {
                 format!("splice_into: operation would modify locked region [0, {locked})"),
             ));
         }
-        let tail_offset = HEADER_SIZE + new_tail_start;
-        let final_data_len = new_tail_start + new_len;
-
         // Read the bytes to remove before any mutation.
-        file.seek(SeekFrom::Start(tail_offset))?;
-        file.read_exact(old)?;
+        read_at(file, new_tail_start, old)?;
 
-        if new_len > n {
-            // Net extension: extend first, write new, sync, commit.
-            let new_file_end = HEADER_SIZE + final_data_len;
-            file.set_len(new_file_end)?;
-            file.seek(SeekFrom::Start(tail_offset))?;
-            if let Err(e) = file.write_all(new) {
-                let _ = file.set_len(file_end);
-                return Err(e);
-            }
-            if let Err(e) = durable_sync(file) {
-                let _ = file.set_len(file_end);
-                return Err(e);
-            }
-            write_committed_len(file, clen, final_data_len)?;
-            durable_sync(file)?;
-        } else {
-            // Net truncation or same size: write new, truncate, sync, commit.
-            if !new.is_empty() {
-                file.seek(SeekFrom::Start(tail_offset))?;
-                file.write_all(new)?;
-            }
-            file.set_len(HEADER_SIZE + final_data_len)?;
-            // The truncation is the commit point (recovery adopts the smaller
-            // file size), so update the cache now — before the sync and header
-            // write, which `?` could skip on error.
-            *clen = final_data_len;
-            durable_sync(file)?;
-            write_committed_len(file, clen, final_data_len)?;
-            durable_sync(file)?;
-        }
-        Ok(())
+        commit_tail_replace(file, clen, new_tail_start, n, new, file_end)
     }
 
     /// Append `buf` only if the current logical payload size equals `s`.
@@ -1810,15 +1779,7 @@ impl BStack {
             return Err(e);
         }
         let new_len = data_size + buf.len() as u64;
-        if let Err(e) = write_committed_len(file, clen, new_len).and_then(|_| durable_sync(file)) {
-            // Reset the cache up front so it reflects the rolled-back file
-            // even if the best-effort header rewrite below fails.
-            let _ = file.set_len(file_end);
-            *clen = data_size;
-            let _ = write_committed_len(file, clen, data_size);
-            let _ = durable_sync(file);
-            return Err(e);
-        }
+        commit_grow(file, clen, new_len, data_size, file_end)?;
         Ok(true)
     }
 
@@ -1849,22 +1810,13 @@ impl BStack {
         if n == 0 {
             return Ok(true);
         }
-        let new_len = data_size.checked_add(n).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "try_extend_zeros: data_size + n overflows u64",
-            )
-        })?;
+        let new_len = checked_end(
+            data_size,
+            n,
+            "try_extend_zeros: data_size + n overflows u64",
+        )?;
         file.set_len(HEADER_SIZE + new_len)?;
-        if let Err(e) = write_committed_len(file, clen, new_len).and_then(|_| durable_sync(file)) {
-            // Reset the cache up front so it reflects the rolled-back file
-            // even if the best-effort header rewrite below fails.
-            let _ = file.set_len(file_end);
-            *clen = data_size;
-            let _ = write_committed_len(file, clen, data_size);
-            let _ = durable_sync(file);
-            return Err(e);
-        }
+        commit_grow(file, clen, new_len, data_size, file_end)?;
         Ok(true)
     }
 
@@ -1914,13 +1866,7 @@ impl BStack {
                 format!("try_discard: would shrink payload below locked length ({locked})"),
             ));
         }
-        file.set_len(HEADER_SIZE + new_data_len)?;
-        // The truncation is the commit point: the tail bytes are gone and
-        // recovery would adopt the smaller file size, so update the cache now
-        // — before the header write, which `?` could skip on error.
-        *clen = new_data_len;
-        write_committed_len(file, clen, new_data_len)?;
-        durable_sync(file)?;
+        commit_shrink(file, clen, new_data_len)?;
         Ok(true)
     }
 
@@ -2200,45 +2146,11 @@ impl BStack {
                 format!("replace: operation would modify locked region [0, {locked})"),
             ));
         }
-        let tail_offset = HEADER_SIZE + new_tail_start;
-        file.seek(SeekFrom::Start(tail_offset))?;
         let mut old_tail = vec![0u8; n as usize];
-        file.read_exact(&mut old_tail)?;
+        read_at(file, new_tail_start, &mut old_tail)?;
         let new_tail = f(&old_tail);
-        let new_tail_len = new_tail.len() as u64;
-        let final_data_len = new_tail_start + new_tail_len;
 
-        if new_tail_len > n {
-            // Net extension: extend first, write new tail, sync, commit.
-            let new_file_end = HEADER_SIZE + final_data_len;
-            file.set_len(new_file_end)?;
-            file.seek(SeekFrom::Start(tail_offset))?;
-            if let Err(e) = file.write_all(&new_tail) {
-                let _ = file.set_len(file_end);
-                return Err(e);
-            }
-            if let Err(e) = durable_sync(file) {
-                let _ = file.set_len(file_end);
-                return Err(e);
-            }
-            write_committed_len(file, clen, final_data_len)?;
-            durable_sync(file)?;
-        } else {
-            // Net truncation or same size: write new tail, truncate, sync, commit.
-            if !new_tail.is_empty() {
-                file.seek(SeekFrom::Start(tail_offset))?;
-                file.write_all(&new_tail)?;
-            }
-            file.set_len(HEADER_SIZE + final_data_len)?;
-            // The truncation is the commit point (recovery adopts the smaller
-            // file size), so update the cache now — before the sync and header
-            // write, which `?` could skip on error.
-            *clen = final_data_len;
-            durable_sync(file)?;
-            write_committed_len(file, clen, final_data_len)?;
-            durable_sync(file)?;
-        }
-        Ok(())
+        commit_tail_replace(file, clen, new_tail_start, n, &new_tail, file_end)
     }
 }
 
@@ -2371,22 +2283,12 @@ impl BStack {
         if buf.is_empty() {
             return Ok(Vec::new());
         }
-        let end = offset.checked_add(buf.len() as u64).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "swap: offset + len overflows u64",
-            )
-        })?;
+        let end = checked_end(offset, buf.len() as u64, "swap: offset + len overflows u64")?;
         let mut guard = self.lock.write().unwrap();
         let file = &mut guard.0;
         // Load `locked` under the write lock (see `set` for rationale).
         let locked = self.locked.load(Ordering::Acquire);
-        if offset < locked {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("swap: range [{offset}, {end}) overlaps locked region [0, {locked})"),
-            ));
-        }
+        check_offset_unlocked("swap", offset, end, locked)?;
         let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
         if end > data_size {
             return Err(io::Error::new(
@@ -2394,11 +2296,9 @@ impl BStack {
                 format!("swap: range [{offset}, {end}) exceeds payload size ({data_size})"),
             ));
         }
-        file.seek(SeekFrom::Start(HEADER_SIZE + offset))?;
         let mut old = vec![0u8; buf.len()];
-        file.read_exact(&mut old)?;
-        file.seek(SeekFrom::Start(HEADER_SIZE + offset))?;
-        file.write_all(buf)?;
+        read_at(file, offset, &mut old)?;
+        write_at(file, offset, buf)?;
         durable_sync(file)?;
         Ok(old)
     }
@@ -2427,22 +2327,16 @@ impl BStack {
         if buf.is_empty() {
             return Ok(());
         }
-        let end = offset.checked_add(buf.len() as u64).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "swap_into: offset + len overflows u64",
-            )
-        })?;
+        let end = checked_end(
+            offset,
+            buf.len() as u64,
+            "swap_into: offset + len overflows u64",
+        )?;
         let mut guard = self.lock.write().unwrap();
         let file = &mut guard.0;
         // Load `locked` under the write lock (see `set` for rationale).
         let locked = self.locked.load(Ordering::Acquire);
-        if offset < locked {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("swap_into: range [{offset}, {end}) overlaps locked region [0, {locked})"),
-            ));
-        }
+        check_offset_unlocked("swap_into", offset, end, locked)?;
         let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
         if end > data_size {
             return Err(io::Error::new(
@@ -2450,11 +2344,9 @@ impl BStack {
                 format!("swap_into: range [{offset}, {end}) exceeds payload size ({data_size})"),
             ));
         }
-        file.seek(SeekFrom::Start(HEADER_SIZE + offset))?;
         let mut tmp = vec![0u8; buf.len()];
-        file.read_exact(&mut tmp)?;
-        file.seek(SeekFrom::Start(HEADER_SIZE + offset))?;
-        file.write_all(buf)?;
+        read_at(file, offset, &mut tmp)?;
+        write_at(file, offset, buf)?;
         durable_sync(file)?;
         buf.copy_from_slice(&tmp);
         Ok(())
@@ -2494,22 +2386,12 @@ impl BStack {
         if old.is_empty() {
             return Ok(true);
         }
-        let end = offset.checked_add(old.len() as u64).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "cas: offset + len overflows u64",
-            )
-        })?;
+        let end = checked_end(offset, old.len() as u64, "cas: offset + len overflows u64")?;
         let mut guard = self.lock.write().unwrap();
         let file = &mut guard.0;
         // Load `locked` under the write lock (see `set` for rationale).
         let locked = self.locked.load(Ordering::Acquire);
-        if offset < locked {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("cas: range [{offset}, {end}) overlaps locked region [0, {locked})"),
-            ));
-        }
+        check_offset_unlocked("cas", offset, end, locked)?;
         let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
         if end > data_size {
             return Err(io::Error::new(
@@ -2517,14 +2399,12 @@ impl BStack {
                 format!("cas: range [{offset}, {end}) exceeds payload size ({data_size})"),
             ));
         }
-        file.seek(SeekFrom::Start(HEADER_SIZE + offset))?;
         let mut current = vec![0u8; old.len()];
-        file.read_exact(&mut current)?;
+        read_at(file, offset, &mut current)?;
         if current != old {
             return Ok(false);
         }
-        file.seek(SeekFrom::Start(HEADER_SIZE + offset))?;
-        file.write_all(new)?;
+        write_at(file, offset, new)?;
         durable_sync(file)?;
         Ok(true)
     }
@@ -2550,18 +2430,8 @@ impl BStack {
     /// `durable_sync`.
     #[cfg(all(feature = "set", feature = "atomic"))]
     pub fn cross_exchange(&self, a: u64, b: u64, n: u64) -> io::Result<()> {
-        let a_end = a.checked_add(n).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "cross_exchange: a + n overflows u64",
-            )
-        })?;
-        let b_end = b.checked_add(n).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "cross_exchange: b + n overflows u64",
-            )
-        })?;
+        let a_end = checked_end(a, n, "cross_exchange: a + n overflows u64")?;
+        let b_end = checked_end(b, n, "cross_exchange: b + n overflows u64")?;
         if n > 0 {
             let (lo, hi) = if a < b { (a, b) } else { (b, a) };
             if lo + n > hi {
@@ -2606,16 +2476,12 @@ impl BStack {
         if n == 0 {
             return Ok(());
         }
-        file.seek(SeekFrom::Start(HEADER_SIZE + a))?;
         let mut buf_a = vec![0u8; n as usize];
-        file.read_exact(&mut buf_a)?;
-        file.seek(SeekFrom::Start(HEADER_SIZE + b))?;
+        read_at(file, a, &mut buf_a)?;
         let mut buf_b = vec![0u8; n as usize];
-        file.read_exact(&mut buf_b)?;
-        file.seek(SeekFrom::Start(HEADER_SIZE + a))?;
-        file.write_all(&buf_b)?;
-        file.seek(SeekFrom::Start(HEADER_SIZE + b))?;
-        file.write_all(&buf_a)?;
+        read_at(file, b, &mut buf_b)?;
+        write_at(file, a, &buf_b)?;
+        write_at(file, b, &buf_a)?;
         durable_sync(file)
     }
 
@@ -2639,12 +2505,8 @@ impl BStack {
     /// `durable_sync`.
     #[cfg(all(feature = "set", feature = "atomic"))]
     pub fn copy(&self, from: u64, to: u64, n: u64) -> io::Result<()> {
-        let from_end = from.checked_add(n).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "copy: from + n overflows u64")
-        })?;
-        let to_end = to.checked_add(n).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "copy: to + n overflows u64")
-        })?;
+        let from_end = checked_end(from, n, "copy: from + n overflows u64")?;
+        let to_end = checked_end(to, n, "copy: to + n overflows u64")?;
         let mut guard = self.lock.write().unwrap();
         let file = &mut guard.0;
         let locked = self.locked.load(Ordering::Acquire);
@@ -2670,11 +2532,9 @@ impl BStack {
         if n == 0 {
             return Ok(());
         }
-        file.seek(SeekFrom::Start(HEADER_SIZE + from))?;
         let mut buf = vec![0u8; n as usize];
-        file.read_exact(&mut buf)?;
-        file.seek(SeekFrom::Start(HEADER_SIZE + to))?;
-        file.write_all(&buf)?;
+        read_at(file, from, &mut buf)?;
+        write_at(file, to, &buf)?;
         durable_sync(file)
     }
 
@@ -2729,13 +2589,11 @@ impl BStack {
         }
         let mut buf = vec![0u8; n as usize];
         if n > 0 {
-            file.seek(SeekFrom::Start(HEADER_SIZE + start))?;
-            file.read_exact(&mut buf)?;
+            read_at(file, start, &mut buf)?;
         }
         f(&mut buf);
         if n > 0 {
-            file.seek(SeekFrom::Start(HEADER_SIZE + start))?;
-            file.write_all(&buf)?;
+            write_at(file, start, &buf)?;
             durable_sync(file)?;
         }
         Ok(())
@@ -2823,12 +2681,11 @@ impl BStack {
         loop {
             match f() {
                 Some(BStackGenOp::Read { offset, buf }) => {
-                    let end = offset.checked_add(buf.len() as u64).ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            "process_gen: read offset + buf.len() overflows u64",
-                        )
-                    })?;
+                    let end = checked_end(
+                        offset,
+                        buf.len() as u64,
+                        "process_gen: read offset + buf.len() overflows u64",
+                    )?;
                     if end > data_size {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidInput,
@@ -2863,18 +2720,16 @@ impl BStack {
                             let cache = self.cache.lock().unwrap();
                             buf.copy_from_slice(&cache[offset as usize..end as usize]);
                         } else {
-                            file.seek(SeekFrom::Start(HEADER_SIZE + offset))?;
-                            file.read_exact(buf)?;
+                            read_at(file, offset, buf)?;
                         }
                     }
                 }
                 Some(BStackGenOp::Write { offset, data }) => {
-                    let end = offset.checked_add(data.len() as u64).ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            "process_gen: write offset + data.len() overflows u64",
-                        )
-                    })?;
+                    let end = checked_end(
+                        offset,
+                        data.len() as u64,
+                        "process_gen: write offset + data.len() overflows u64",
+                    )?;
                     if offset < locked {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidInput,
@@ -2892,8 +2747,7 @@ impl BStack {
                         ));
                     }
                     if !data.is_empty() {
-                        file.seek(SeekFrom::Start(HEADER_SIZE + offset))?;
-                        file.write_all(data)?;
+                        write_at(file, offset, data)?;
                         durable_sync(file)?;
                     }
                     return Ok(());
@@ -2903,18 +2757,10 @@ impl BStack {
                     b_offset,
                     len,
                 }) => {
-                    let a_end = a_offset.checked_add(len).ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            "process_gen: a_offset + len overflows u64",
-                        )
-                    })?;
-                    let b_end = b_offset.checked_add(len).ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            "process_gen: b_offset + len overflows u64",
-                        )
-                    })?;
+                    let a_end =
+                        checked_end(a_offset, len, "process_gen: a_offset + len overflows u64")?;
+                    let b_end =
+                        checked_end(b_offset, len, "process_gen: b_offset + len overflows u64")?;
                     if len > 0 {
                         let (lo, hi) = if a_offset < b_offset {
                             (a_offset, b_offset)
@@ -2963,16 +2809,12 @@ impl BStack {
                         ));
                     }
                     if len > 0 {
-                        file.seek(SeekFrom::Start(HEADER_SIZE + a_offset))?;
                         let mut buf_a = vec![0u8; len as usize];
-                        file.read_exact(&mut buf_a)?;
-                        file.seek(SeekFrom::Start(HEADER_SIZE + b_offset))?;
+                        read_at(file, a_offset, &mut buf_a)?;
                         let mut buf_b = vec![0u8; len as usize];
-                        file.read_exact(&mut buf_b)?;
-                        file.seek(SeekFrom::Start(HEADER_SIZE + a_offset))?;
-                        file.write_all(&buf_b)?;
-                        file.seek(SeekFrom::Start(HEADER_SIZE + b_offset))?;
-                        file.write_all(&buf_a)?;
+                        read_at(file, b_offset, &mut buf_b)?;
+                        write_at(file, a_offset, &buf_b)?;
+                        write_at(file, b_offset, &buf_a)?;
                         durable_sync(file)?;
                     }
                     return Ok(());
@@ -2986,19 +2828,7 @@ impl BStack {
                             return Err(e);
                         }
                         let new_len = logical_offset + data.len() as u64;
-                        if let Err(e) = write_committed_len(file, clen, new_len)
-                            .and_then(|_| durable_sync(file))
-                        {
-                            // Roll back: truncate data and reset header. The
-                            // cache is reset up front so it reflects the
-                            // rolled-back file even if the best-effort header
-                            // rewrite below fails.
-                            let _ = file.set_len(file_end);
-                            *clen = logical_offset;
-                            let _ = write_committed_len(file, clen, logical_offset);
-                            let _ = durable_sync(file);
-                            return Err(e);
-                        }
+                        commit_grow(file, clen, new_len, logical_offset, file_end)?;
                     }
                     return Ok(());
                 }
@@ -3020,16 +2850,8 @@ impl BStack {
                         ));
                     }
                     if n > 0 {
-                        file.seek(SeekFrom::Start(HEADER_SIZE + new_data_len))?;
-                        file.read_exact(buf)?;
-                        file.set_len(HEADER_SIZE + new_data_len)?;
-                        // The truncation is the commit point: the tail bytes
-                        // are gone and recovery would adopt the smaller file
-                        // size, so update the cache now — before the header
-                        // write, which `?` could skip on error.
-                        *clen = new_data_len;
-                        write_committed_len(file, clen, new_data_len)?;
-                        durable_sync(file)?;
+                        read_at(file, new_data_len, buf)?;
+                        commit_shrink(file, clen, new_data_len)?;
                     }
                     return Ok(());
                 }
@@ -3052,14 +2874,7 @@ impl BStack {
                         ));
                     }
                     if len > 0 {
-                        file.set_len(HEADER_SIZE + new_data_len)?;
-                        // The truncation is the commit point: the tail bytes
-                        // are gone and recovery would adopt the smaller file
-                        // size, so update the cache now — before the header
-                        // write, which `?` could skip on error.
-                        *clen = new_data_len;
-                        write_committed_len(file, clen, new_data_len)?;
-                        durable_sync(file)?;
+                        commit_shrink(file, clen, new_data_len)?;
                     }
                     return Ok(());
                 }
@@ -3112,18 +2927,8 @@ impl BStack {
         let b_buf = b_buf.as_ref();
         let a_len = a_expected.len() as u64;
         let b_len = b_buf.len() as u64;
-        let a_end = a_offset.checked_add(a_len).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "eq_crds: a_offset + a_len overflows u64",
-            )
-        })?;
-        let b_end = b_offset.checked_add(b_len).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "eq_crds: b_offset + b_len overflows u64",
-            )
-        })?;
+        let a_end = checked_end(a_offset, a_len, "eq_crds: a_offset + a_len overflows u64")?;
+        let b_end = checked_end(b_offset, b_len, "eq_crds: b_offset + b_len overflows u64")?;
         let mut guard = self.lock.write().unwrap();
         let file = &mut guard.0;
         let locked = self.locked.load(Ordering::Acquire);
@@ -3154,8 +2959,7 @@ impl BStack {
         }
         let mut a_current = vec![0u8; a_expected.len()];
         if !a_expected.is_empty() {
-            file.seek(SeekFrom::Start(HEADER_SIZE + a_offset))?;
-            file.read_exact(&mut a_current)?;
+            read_at(file, a_offset, &mut a_current)?;
         }
         if a_current != a_expected {
             return Ok(None);
@@ -3163,11 +2967,9 @@ impl BStack {
         if b_buf.is_empty() {
             return Ok(Some(Vec::new()));
         }
-        file.seek(SeekFrom::Start(HEADER_SIZE + b_offset))?;
         let mut old_b = vec![0u8; b_buf.len()];
-        file.read_exact(&mut old_b)?;
-        file.seek(SeekFrom::Start(HEADER_SIZE + b_offset))?;
-        file.write_all(b_buf)?;
+        read_at(file, b_offset, &mut old_b)?;
+        write_at(file, b_offset, b_buf)?;
         durable_sync(file)?;
         Ok(Some(old_b))
     }
@@ -3202,18 +3004,8 @@ impl BStack {
         let b_buf = b_buf.as_ref();
         let a_len = a_expected.len() as u64;
         let b_len = b_buf.len() as u64;
-        let a_end = a_offset.checked_add(a_len).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "ne_crds: a_offset + a_len overflows u64",
-            )
-        })?;
-        let b_end = b_offset.checked_add(b_len).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "ne_crds: b_offset + b_len overflows u64",
-            )
-        })?;
+        let a_end = checked_end(a_offset, a_len, "ne_crds: a_offset + a_len overflows u64")?;
+        let b_end = checked_end(b_offset, b_len, "ne_crds: b_offset + b_len overflows u64")?;
         let mut guard = self.lock.write().unwrap();
         let file = &mut guard.0;
         let locked = self.locked.load(Ordering::Acquire);
@@ -3244,8 +3036,7 @@ impl BStack {
         }
         let mut a_current = vec![0u8; a_expected.len()];
         if !a_expected.is_empty() {
-            file.seek(SeekFrom::Start(HEADER_SIZE + a_offset))?;
-            file.read_exact(&mut a_current)?;
+            read_at(file, a_offset, &mut a_current)?;
         }
         if a_current == a_expected {
             return Ok(None);
@@ -3253,11 +3044,9 @@ impl BStack {
         if b_buf.is_empty() {
             return Ok(Some(Vec::new()));
         }
-        file.seek(SeekFrom::Start(HEADER_SIZE + b_offset))?;
         let mut old_b = vec![0u8; b_buf.len()];
-        file.read_exact(&mut old_b)?;
-        file.seek(SeekFrom::Start(HEADER_SIZE + b_offset))?;
-        file.write_all(b_buf)?;
+        read_at(file, b_offset, &mut old_b)?;
+        write_at(file, b_offset, b_buf)?;
         durable_sync(file)?;
         Ok(Some(old_b))
     }
@@ -3307,18 +3096,16 @@ impl BStack {
         }
         let a_len = a_expected.len() as u64;
         let b_len = b_buf.len() as u64;
-        let a_end = a_offset.checked_add(a_len).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "masked_eq_crds: a_offset + a_len overflows u64",
-            )
-        })?;
-        let b_end = b_offset.checked_add(b_len).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "masked_eq_crds: b_offset + b_len overflows u64",
-            )
-        })?;
+        let a_end = checked_end(
+            a_offset,
+            a_len,
+            "masked_eq_crds: a_offset + a_len overflows u64",
+        )?;
+        let b_end = checked_end(
+            b_offset,
+            b_len,
+            "masked_eq_crds: b_offset + b_len overflows u64",
+        )?;
         let mut guard = self.lock.write().unwrap();
         let file = &mut guard.0;
         let locked = self.locked.load(Ordering::Acquire);
@@ -3349,8 +3136,7 @@ impl BStack {
         }
         let mut a_current = vec![0u8; a_expected.len()];
         if !a_expected.is_empty() {
-            file.seek(SeekFrom::Start(HEADER_SIZE + a_offset))?;
-            file.read_exact(&mut a_current)?;
+            read_at(file, a_offset, &mut a_current)?;
         }
         let masked_match = a_current
             .iter()
@@ -3363,11 +3149,9 @@ impl BStack {
         if b_buf.is_empty() {
             return Ok(Some(Vec::new()));
         }
-        file.seek(SeekFrom::Start(HEADER_SIZE + b_offset))?;
         let mut old_b = vec![0u8; b_buf.len()];
-        file.read_exact(&mut old_b)?;
-        file.seek(SeekFrom::Start(HEADER_SIZE + b_offset))?;
-        file.write_all(b_buf)?;
+        read_at(file, b_offset, &mut old_b)?;
+        write_at(file, b_offset, b_buf)?;
         durable_sync(file)?;
         Ok(Some(old_b))
     }
@@ -3415,18 +3199,16 @@ impl BStack {
         }
         let a_len = a_expected.len() as u64;
         let b_len = b_buf.len() as u64;
-        let a_end = a_offset.checked_add(a_len).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "masked_ne_crds: a_offset + a_len overflows u64",
-            )
-        })?;
-        let b_end = b_offset.checked_add(b_len).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "masked_ne_crds: b_offset + b_len overflows u64",
-            )
-        })?;
+        let a_end = checked_end(
+            a_offset,
+            a_len,
+            "masked_ne_crds: a_offset + a_len overflows u64",
+        )?;
+        let b_end = checked_end(
+            b_offset,
+            b_len,
+            "masked_ne_crds: b_offset + b_len overflows u64",
+        )?;
         let mut guard = self.lock.write().unwrap();
         let file = &mut guard.0;
         let locked = self.locked.load(Ordering::Acquire);
@@ -3457,8 +3239,7 @@ impl BStack {
         }
         let mut a_current = vec![0u8; a_expected.len()];
         if !a_expected.is_empty() {
-            file.seek(SeekFrom::Start(HEADER_SIZE + a_offset))?;
-            file.read_exact(&mut a_current)?;
+            read_at(file, a_offset, &mut a_current)?;
         }
         let masked_match = a_current
             .iter()
@@ -3471,11 +3252,9 @@ impl BStack {
         if b_buf.is_empty() {
             return Ok(Some(Vec::new()));
         }
-        file.seek(SeekFrom::Start(HEADER_SIZE + b_offset))?;
         let mut old_b = vec![0u8; b_buf.len()];
-        file.read_exact(&mut old_b)?;
-        file.seek(SeekFrom::Start(HEADER_SIZE + b_offset))?;
-        file.write_all(b_buf)?;
+        read_at(file, b_offset, &mut old_b)?;
+        write_at(file, b_offset, b_buf)?;
         durable_sync(file)?;
         Ok(Some(old_b))
     }
