@@ -2588,8 +2588,7 @@ impl BStack {
         }
         let mut old = vec![0u8; buf.len()];
         read_at(file, offset, &mut old)?;
-        write_at(file, offset, buf)?;
-        durable_sync(file)?;
+        commit_in_place(file, data_size, offset, buf)?;
         Ok(old)
     }
 
@@ -2636,8 +2635,7 @@ impl BStack {
         }
         let mut tmp = vec![0u8; buf.len()];
         read_at(file, offset, &mut tmp)?;
-        write_at(file, offset, buf)?;
-        durable_sync(file)?;
+        commit_in_place(file, data_size, offset, buf)?;
         buf.copy_from_slice(&tmp);
         Ok(())
     }
@@ -2694,8 +2692,7 @@ impl BStack {
         if current != old {
             return Ok(false);
         }
-        write_at(file, offset, new)?;
-        durable_sync(file)?;
+        commit_in_place(file, data_size, offset, new)?;
         Ok(true)
     }
 
@@ -2824,8 +2821,7 @@ impl BStack {
         }
         let mut buf = vec![0u8; n as usize];
         read_at(file, from, &mut buf)?;
-        write_at(file, to, &buf)?;
-        durable_sync(file)
+        commit_in_place(file, data_size, to, &buf)
     }
 
     /// Read bytes in the half-open logical range `[start, end)`, pass them to
@@ -2883,8 +2879,7 @@ impl BStack {
         }
         f(&mut buf);
         if n > 0 {
-            write_at(file, start, &buf)?;
-            durable_sync(file)?;
+            commit_in_place(file, data_size, start, &buf)?;
         }
         Ok(())
     }
@@ -3037,8 +3032,7 @@ impl BStack {
                         ));
                     }
                     if !data.is_empty() {
-                        write_at(file, offset, data)?;
-                        durable_sync(file)?;
+                        commit_in_place(file, data_size, offset, data)?;
                     }
                     return Ok(());
                 }
@@ -3259,8 +3253,7 @@ impl BStack {
         }
         let mut old_b = vec![0u8; b_buf.len()];
         read_at(file, b_offset, &mut old_b)?;
-        write_at(file, b_offset, b_buf)?;
-        durable_sync(file)?;
+        commit_in_place(file, data_size, b_offset, b_buf)?;
         Ok(Some(old_b))
     }
 
@@ -3336,8 +3329,7 @@ impl BStack {
         }
         let mut old_b = vec![0u8; b_buf.len()];
         read_at(file, b_offset, &mut old_b)?;
-        write_at(file, b_offset, b_buf)?;
-        durable_sync(file)?;
+        commit_in_place(file, data_size, b_offset, b_buf)?;
         Ok(Some(old_b))
     }
 
@@ -3441,8 +3433,7 @@ impl BStack {
         }
         let mut old_b = vec![0u8; b_buf.len()];
         read_at(file, b_offset, &mut old_b)?;
-        write_at(file, b_offset, b_buf)?;
-        durable_sync(file)?;
+        commit_in_place(file, data_size, b_offset, b_buf)?;
         Ok(Some(old_b))
     }
 
@@ -3544,8 +3535,7 @@ impl BStack {
         }
         let mut old_b = vec![0u8; b_buf.len()];
         read_at(file, b_offset, &mut old_b)?;
-        write_at(file, b_offset, b_buf)?;
-        durable_sync(file)?;
+        commit_in_place(file, data_size, b_offset, b_buf)?;
         Ok(Some(old_b))
     }
 }
