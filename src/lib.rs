@@ -36,8 +36,8 @@
 //! ```
 //!
 //! * **`magic`** — 8 bytes: `BSTK` + major(1 B) + minor(1 B) + patch(1 B) + reserved(1 B).
-//!   This version writes `BSTK\x00\x01\x0f\x00` (0.1.15).  [`open`](BStack::open)
-//!   accepts any file whose first 6 bytes match `BSTK\x00\x01` (any 0.1.x) and
+//!   This version writes `BSTK\x00\x04\x00\x00` (0.4.0).  [`open`](BStack::open)
+//!   accepts any file whose first 6 bytes match `BSTK\x00\x04` (any 0.4.x) and
 //!   rejects anything with a different major or minor.
 //! * **`clen`** — little-endian `u64` recording the *committed* payload length.
 //!   It is updated atomically with each [`push`](BStack::push) or
@@ -320,7 +320,7 @@
 //!
 //! | Trait | Semantics |
 //! |-------|-----------|
-//! | `Debug` | Shows `version` (semver string from the magic header, e.g. `"0.1.6"`) and `len` (`Option<u64>`, `None` on I/O failure). |
+//! | `Debug` | Shows `version` (semver string from the magic header, e.g. `"0.4.0"`) and `len` (`Option<u64>`, `None` on I/O failure). |
 //! | `PartialEq` / `Eq` | **Pointer identity.** Two values are equal iff they are the same instance. No two distinct `BStack` values in one process can refer to the same file. |
 //! | `Hash` | Hashes the instance address — consistent with pointer-identity `PartialEq`. |
 //!
@@ -344,11 +344,11 @@
 //!
 //! ```toml
 //! [dependencies]
-//! bstack = { version = "0.1", features = ["set"] }
+//! bstack = { version = "0.4", features = ["set"] }
 //! # or
-//! bstack = { version = "0.1", features = ["alloc"] }
+//! bstack = { version = "0.4", features = ["alloc"] }
 //! # or both
-//! bstack = { version = "0.1", features = ["alloc", "set"] }
+//! bstack = { version = "0.4", features = ["alloc", "set"] }
 //! ```
 //!
 //! # Allocator (`alloc` feature)
@@ -534,12 +534,25 @@ use windows_sys::Win32::Storage::FileSystem::{
 #[cfg(windows)]
 use windows_sys::Win32::System::IO::OVERLAPPED;
 
-/// Full magic for files written by this version (`BSTK` + major 0 + minor 1 + patch 15 + 0).
-const MAGIC: [u8; 8] = *b"BSTK\x00\x01\x0f\x00";
+/// On-disk **format** version encoded in the magic header. This is independent
+/// of the crate version: it bumps only when the file format changes in a way an
+/// older reader cannot handle. 0.4.0 introduces the 32-byte write-in-progress
+/// journal header (see `PLANNED.md`); bumping the minor here makes older binaries
+/// reject the new files loudly instead of misreading them.
+const FORMAT_MAJOR: u8 = 0;
+const FORMAT_MINOR: u8 = 4;
+const FORMAT_PATCH: u8 = 0;
 
-/// Compatibility prefix checked on open: `BSTK` + major 0 + minor 1.
-/// Any file whose first 6 bytes match is considered a compatible 0.1.x file.
-const MAGIC_PREFIX: [u8; 6] = *b"BSTK\x00\x01";
+/// Full magic for files written by this version
+/// (`BSTK` + major + minor + patch + reserved(0)).
+const MAGIC: [u8; 8] = [
+    b'B', b'S', b'T', b'K', FORMAT_MAJOR, FORMAT_MINOR, FORMAT_PATCH, 0,
+];
+
+/// Compatibility prefix checked on open: `BSTK` + format major + minor. A file
+/// is accepted only when its first 6 bytes match — i.e. the same format
+/// `major.minor`. The patch byte is informational and is not compared.
+const MAGIC_PREFIX: [u8; 6] = [b'B', b'S', b'T', b'K', FORMAT_MAJOR, FORMAT_MINOR];
 
 /// Bytes occupied by the file header (magic[8] + committed_len[8]).
 const HEADER_SIZE: u64 = 16;

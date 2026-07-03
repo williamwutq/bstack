@@ -2032,7 +2032,7 @@ mod alloc_tests {
         assert!(dbg.contains("version"), "{dbg}");
         assert!(dbg.contains("len"), "{dbg}");
         // Version must be a recognisable semver string.
-        assert!(dbg.contains("0.1"), "{dbg}");
+        assert!(dbg.contains("0.4"), "{dbg}");
     }
 
     #[test]

@@ -480,9 +480,9 @@ crash-safe ordering.
 
 ```toml
 [dependencies]
-bstack = { version = "0.2", features = ["atomic"] }
+bstack = { version = "0.4", features = ["atomic"] }
 # Combined set + atomic unlocks swap, swap_into, and cas:
-bstack = { version = "0.2", features = ["set", "atomic"] }
+bstack = { version = "0.4", features = ["set", "atomic"] }
 ```
 
 - **`atrunc`**, **`splice`**, **`splice_into`** — atomic discard+push / pop+push tail replacement.
@@ -504,7 +504,7 @@ Enables `BStack::set(offset, data)` (in-place overwrite) and `BStack::zero(offse
 
 ```toml
 [dependencies]
-bstack = { version = "0.2", features = ["set"] }
+bstack = { version = "0.4", features = ["set"] }
 ```
 
 ### `alloc`
@@ -513,9 +513,9 @@ Enables the region-management layer on top of `BStack`: `BStackAllocator`, `BSta
 
 ```toml
 [dependencies]
-bstack = { version = "0.2", features = ["alloc"] }
+bstack = { version = "0.4", features = ["alloc"] }
 # In-place slice writes (BStackSliceWriter) also need `set`:
-bstack = { version = "0.2", features = ["alloc", "set"] }
+bstack = { version = "0.4", features = ["alloc", "set"] }
 ```
 
 ---
@@ -833,7 +833,7 @@ the file does not grow without bound.
 
 ```toml
 [dependencies]
-bstack = { version = "0.2", features = ["alloc", "set"] }
+bstack = { version = "0.4", features = ["alloc", "set"] }
 ```
 
 #### On-disk layout
@@ -943,7 +943,7 @@ Implements both `BStackAllocator` and `BStackBulkAllocator`.
 
 ```toml
 [dependencies]
-bstack = { version = "0.2", features = ["alloc"] }
+bstack = { version = "0.4", features = ["alloc"] }
 ```
 
 | Operation               | Strategy                                         | Crash-safe  |
@@ -1037,7 +1037,7 @@ block; live allocations carry zero metadata overhead.
 
 ```toml
 [dependencies]
-bstack = { version = "0.2", features = ["alloc", "set"] }
+bstack = { version = "0.4", features = ["alloc", "set"] }
 ```
 
 #### On-disk layout
@@ -1125,7 +1125,7 @@ The constructor takes `data_size` — the number of usable bytes per block (must
 
 ```toml
 [dependencies]
-bstack = { version = "0.2", features = ["alloc", "set"] }
+bstack = { version = "0.4", features = ["alloc", "set"] }
 ```
 
 #### On-disk layout
@@ -1246,7 +1246,7 @@ For a general typed vector over arbitrary `Copy` types, see `PLANNED.md` — the
 
 ```toml
 [dependencies]
-bstack = { version = "0.2", features = ["alloc", "set"] }
+bstack = { version = "0.4", features = ["alloc", "set"] }
 ```
 
 ### Memory layout

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **On-disk format version bumped to `0.4.0` (magic `BSTK\x00\x04\x00\x00`).** Incompatible with `0.1.x` files, which `open` now rejects.
+
 ## [0.2.5] - 2026-06-15
 
 ### Added
