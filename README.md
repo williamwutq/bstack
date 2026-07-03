@@ -114,6 +114,13 @@ impl BStack {
     #[cfg(feature = "set")]
     pub fn zero(&self, offset: u64, n: u64) -> io::Result<()>;
 
+    /// Fill `count` copies of `pattern` in place starting at logical `offset`
+    /// (the general form of `zero`).  Never changes the file size; errors if the
+    /// fill would exceed the current payload.  An empty `pattern` or `count = 0`
+    /// is a no-op.  Requires the `set` feature.
+    #[cfg(feature = "set")]
+    pub fn repeat(&self, offset: u64, pattern: impl AsRef<[u8]>, count: u64) -> io::Result<()>;
+
     /// Atomically cut `n` bytes off the tail then append `buf`.
     /// Combines discard + push under a single write lock.  Requires the `atomic` feature.
     #[cfg(feature = "atomic")]
@@ -397,7 +404,7 @@ cached stacks (it must read up to `n` bytes from disk before returning).
     in-memory buffer under a `Mutex` (so RwLock-free, but not lock-free).
   The locked length remains a sufficient upper bound, so no extra payload-size
   check is needed on this path.
-* **Write protection.**  `set`, `zero`, `swap`, `swap_into`, `cas`,
+* **Write protection.**  `set`, `zero`, `repeat`, `swap`, `swap_into`, `cas`,
   `process`, `atrunc`, `splice`, `splice_into`, and `replace` return
   `InvalidInput` if their target overlaps the locked region.
 * **Shrink protection.**  `pop`, `pop_into`, `discard`, and `try_discard`
@@ -500,7 +507,7 @@ See [API](#api) for full signatures and details.
 
 ### `set`
 
-Enables `BStack::set(offset, data)` (in-place overwrite) and `BStack::zero(offset, n)` (zero-fill in place). Neither changes the file size or the committed-length header.
+Enables `BStack::set(offset, data)` (in-place overwrite), `BStack::zero(offset, n)` (zero-fill in place), and `BStack::repeat(offset, pattern, count)` (fill with a repeated pattern — the general form of `zero`). None changes the file size or the committed-length header.
 
 ```toml
 [dependencies]
@@ -553,6 +560,7 @@ All user-visible offsets (returned by `push`, accepted by `peek`/`get`) are
 | `discard`                              | `ftruncate` → `lseek(8)` → `write(clen)` → sync                                           |
 | `set` *(feature)*                      | `lseek(offset)` → `write(data)` → sync                                                    |
 | `zero` *(feature)*                     | `lseek(offset)` → `write(zeros)` → sync                                                   |
+| `repeat` *(feature)*                   | `lseek(offset)` → repeated `write(pattern)` → sync                                        |
 | `atrunc` *(atomic, net extension)*     | `set_len(new_end)` → `lseek(tail)` → `write(buf)` → sync → `write(clen)`                  |
 | `atrunc` *(atomic, net truncation)*    | `lseek(tail)` → `write(buf)` → `set_len(new_end)` → sync → `write(clen)`                  |
 | `splice`, `splice_into` *(atomic)*     | `lseek(tail)` → `read(n)` → *(then as `atrunc`)*                                          |
@@ -629,7 +637,7 @@ lock without any `File::metadata` syscall.
 | Operation                                                    | Lock (Unix / Windows) | Lock (other) |
 |--------------------------------------------------------------|-----------------------|--------------|
 | `push`, `extend`, `pop`, `pop_into`, `discard`               | write                 | write        |
-| `set`, `zero` *(feature)*                                    | write                 | write        |
+| `set`, `zero`, `repeat` *(feature)*                          | write                 | write        |
 | `atrunc`, `splice`, `splice_into`, `try_extend` *(atomic)*   | write                 | write        |
 | `try_discard(s, n > 0)` *(atomic)*                           | write                 | write        |
 | `try_discard(s, 0)` *(atomic)*                               | **read**              | **read**     |

@@ -5,7 +5,8 @@
 //! [`BStack`] treats a file as a flat byte buffer that grows and shrinks from
 //! the tail.  Every mutating operation — [`push`](BStack::push),
 //! [`extend`](BStack::extend), [`pop`](BStack::pop), [`discard`](BStack::discard), (with the `set`
-//! feature) [`set`](BStack::set) and [`zero`](BStack::zero), (with the `atomic` feature)
+//! feature) [`set`](BStack::set), [`zero`](BStack::zero), and
+//! [`repeat`](BStack::repeat), (with the `atomic` feature)
 //! [`replace`](BStack::replace), and (with both `set` and `atomic`)
 //! [`process`](BStack::process) — calls a *durable sync* before returning,
 //! so the data survives a process crash or an unclean system shutdown.
@@ -77,6 +78,7 @@
 //! | `discard` | `ftruncate` → `lseek(8)` → `write(clen)` → `durable_sync` |
 //! | `set` *(feature)* | `lseek(offset)` → `write(data)` → `durable_sync` |
 //! | `zero` *(feature)* | `lseek(offset)` → `write(zeros)` → `durable_sync` |
+//! | `repeat` *(feature)* | `lseek(offset)` → repeated `write(pattern)` → `durable_sync` |
 //! | `atrunc` *(feature: atomic, net extension)* | `set_len(new_end)` → `lseek(tail)` → `write(buf)` → `durable_sync` → `lseek(8)` → `write(clen)` → `durable_sync` |
 //! | `atrunc` *(feature: atomic, net truncation)* | `lseek(tail)` → `write(buf)` → `set_len(new_end)` → `durable_sync` → `lseek(8)` → `write(clen)` → `durable_sync` |
 //! | `splice`, `splice_into` *(feature: atomic)* | `lseek(tail)` → `read(n)` → *(then as `atrunc`)* |
@@ -151,7 +153,7 @@
 //! | Operation | Lock (Unix / Windows) | Lock (other) |
 //! |-----------|-----------------------|--------------|
 //! | `push`, `extend`, `pop`, `pop_into`, `discard` | write | write |
-//! | `set`, `zero` *(feature)* | write | write |
+//! | `set`, `zero`, `repeat` *(feature)* | write | write |
 //! | `atrunc`, `splice`, `splice_into`, `try_extend`, `try_extend_zeros` *(feature: atomic)* | write | write |
 //! | `try_discard(s, n > 0)` *(feature: atomic)* | write | write |
 //! | `try_discard(s, 0)` *(feature: atomic)* | **read** | **read** |
@@ -216,6 +218,7 @@
 //!     sufficient upper bound.
 //!
 //! * **Write protection.**  [`set`](BStack::set), [`zero`](BStack::zero),
+//!   [`repeat`](BStack::repeat),
 //!   [`swap`](BStack::swap), [`swap_into`](BStack::swap_into),
 //!   [`cas`](BStack::cas), [`process`](BStack::process),
 //!   [`cross_exchange`](BStack::cross_exchange), [`copy`](BStack::copy)
@@ -343,7 +346,7 @@
 //!
 //! | Feature | Description |
 //! |---------|-------------|
-//! | `set`   | Enables [`BStack::set`] and [`BStack::zero`] — in-place overwrite of existing payload bytes (or with zeros) without changing the file size. |
+//! | `set`   | Enables [`BStack::set`], [`BStack::zero`], and [`BStack::repeat`] — in-place overwrite of existing payload bytes (with data, zeros, or a repeated pattern) without changing the file size. |
 //! | `alloc` | Enables [`BStackAllocator`], [`BStackBulkAllocator`], [`BStackSlice`], [`BStackSliceReader`], and [`LinearBStackAllocator`] — region-based allocation over a `BStack` payload. Combined with `set`, also enables [`BStackSliceWriter`], [`FirstFitBStackAllocator`], [`GhostTreeBstackAllocator`], and [`BStackByteVec`]. |
 //! | `atomic` | Enables [`BStack::atrunc`], [`BStack::splice`], [`BStack::splice_into`], [`BStack::try_extend`], [`BStack::try_extend_zeros`], [`BStack::try_discard`], [`BStack::replace`], [`BStack::get_batched`], [`BStack::get_batched_into`], and [`BStack::get_batched_gen`] — compound read-modify-write operations that hold the lock across what would otherwise be separate calls. Combined with `set`, also enables [`BStack::swap`], [`BStack::swap_into`], [`BStack::cas`], [`BStack::process`], [`BStack::process_gen`], [`BStackGenOp`], [`BStack::cross_exchange`], [`BStack::copy`], [`BStack::eq_crds`], [`BStack::ne_crds`], [`BStack::masked_eq_crds`], and [`BStack::masked_ne_crds`]. |
 //!
