@@ -378,7 +378,7 @@ mod tests {
         assert_eq!(
             raw.len(),
             HEADER_SIZE as usize,
-            "new file should be exactly 16 bytes"
+            "new file should be exactly the header size (32 bytes)"
         );
         assert_eq!(&raw[0..8], &MAGIC, "magic mismatch");
         let clen = u64::from_le_bytes(raw[8..16].try_into().unwrap());
@@ -426,9 +426,9 @@ mod tests {
         };
         let _g = Guard(path.clone());
 
-        // Write 16 bytes with wrong magic.
+        // Write a full-size header with wrong magic.
         let mut bad: Vec<u8> = b"WRONGHDR".to_vec();
-        bad.extend_from_slice(&0u64.to_le_bytes());
+        bad.resize(HEADER_SIZE as usize, 0);
         std::fs::write(&path, &bad).unwrap();
 
         let err = BStack::open(&path).err().unwrap();
@@ -451,6 +451,49 @@ mod tests {
 
         let err = BStack::open(&path).err().unwrap();
         assert_eq!(err.kind(), ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn migrate_upgrades_legacy_file() {
+        let path = {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static C: AtomicU64 = AtomicU64::new(0);
+            let id = C.fetch_add(1, Ordering::Relaxed);
+            std::env::temp_dir().join(format!("bstack_migrate_{}.bin", id))
+        };
+        let _g = Guard(path.clone());
+
+        // Craft a legacy 0.1.x file: 16-byte header (0.1.15 magic + clen) + payload.
+        let payload = b"legacy payload contents!";
+        let mut legacy: Vec<u8> = b"BSTK\x00\x01\x0f\x00".to_vec();
+        legacy.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        legacy.extend_from_slice(payload);
+        std::fs::write(&path, &legacy).unwrap();
+
+        // A current-version open rejects it (wrong major.minor).
+        assert!(BStack::open(&path).is_err());
+
+        // Migrate, then open succeeds and the payload survives unchanged.
+        BStack::migrate(&path).unwrap();
+        let s = BStack::open(&path).unwrap();
+        assert_eq!(s.len().unwrap(), payload.len() as u64);
+        assert_eq!(s.peek(0).unwrap(), payload);
+        drop(s);
+
+        // The file now has a 32-byte header + payload, current magic, and the
+        // sibling scratch file is gone.
+        let raw = std::fs::read(&path).unwrap();
+        assert_eq!(raw.len() as u64, HEADER_SIZE + payload.len() as u64);
+        assert_eq!(&raw[0..8], &MAGIC, "migrated magic");
+        let mut sibling = path.clone().into_os_string();
+        sibling.push(".migrating");
+        assert!(
+            !std::path::Path::new(&sibling).exists(),
+            "sibling left behind"
+        );
+
+        // Migrating an already-current file is rejected (not a legacy magic).
+        assert!(BStack::migrate(&path).is_err());
     }
 
     #[test]

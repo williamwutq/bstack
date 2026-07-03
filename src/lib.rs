@@ -24,15 +24,17 @@
 //!
 //! # File format
 //!
-//! Every file begins with a fixed 16-byte header:
+//! Every file begins with a fixed 32-byte header, then the concatenated payload
+//! (push 0, push 1, …):
 //!
 //! ```text
-//! ┌────────────────────────┬──────────────┬──────────────┐
-//! │      header (16 B)     │  payload 0   │  payload 1   │  ...
-//! │  magic[8] | clen[8 LE] │              │              │
-//! └────────────────────────┴──────────────┴──────────────┘
-//! ^                        ^              ^              ^
-//! file offset 0         offset 16      16+n0          EOF
+//!   bytes      field
+//!   ─────      ─────
+//!    0 ..  8   magic[8]
+//!    8 .. 16   clen      — committed payload length (u64 LE)
+//!   16 .. 24   wip_ptr   — reserved for the write-in-progress journal (u64 LE)
+//!   24 .. 32   wip_aux   — reserved for the write-in-progress journal (u64 LE)
+//!   32 ..      payload   — push 0, push 1, … concatenated
 //! ```
 //!
 //! * **`magic`** — 8 bytes: `BSTK` + major(1 B) + minor(1 B) + patch(1 B) + reserved(1 B).
@@ -43,9 +45,14 @@
 //!   It is updated atomically with each [`push`](BStack::push) or
 //!   [`pop`](BStack::pop) and is used for crash recovery on the next
 //!   [`open`](BStack::open).
+//! * **`wip_ptr` / `wip_aux`** — two little-endian `u64` fields reserved for the
+//!   write-in-progress journal (crash-atomic `set`/splice/…, see `PLANNED.md`).
+//!   Both are currently always zero and are not yet interpreted by recovery.
+//!   Legacy 0.1.x files (16-byte header) can be upgraded in place with
+//!   [`BStack::migrate`].
 //!
 //! All user-visible offsets are **logical** (0-based from the start of the
-//! payload region, i.e. from file byte 16).
+//! payload region, i.e. from file byte 32).
 //!
 //! # Crash recovery
 //!
@@ -510,7 +517,7 @@ use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
 
@@ -546,7 +553,14 @@ const FORMAT_PATCH: u8 = 0;
 /// Full magic for files written by this version
 /// (`BSTK` + major + minor + patch + reserved(0)).
 const MAGIC: [u8; 8] = [
-    b'B', b'S', b'T', b'K', FORMAT_MAJOR, FORMAT_MINOR, FORMAT_PATCH, 0,
+    b'B',
+    b'S',
+    b'T',
+    b'K',
+    FORMAT_MAJOR,
+    FORMAT_MINOR,
+    FORMAT_PATCH,
+    0,
 ];
 
 /// Compatibility prefix checked on open: `BSTK` + format major + minor. A file
@@ -554,8 +568,20 @@ const MAGIC: [u8; 8] = [
 /// `major.minor`. The patch byte is informational and is not compared.
 const MAGIC_PREFIX: [u8; 6] = [b'B', b'S', b'T', b'K', FORMAT_MAJOR, FORMAT_MINOR];
 
-/// Bytes occupied by the file header (magic[8] + committed_len[8]).
-const HEADER_SIZE: u64 = 16;
+/// Magic prefix of the pre-0.4.0 (0.1.x) format that [`BStack::migrate`]
+/// upgrades from: `BSTK` + major 0 + minor 1.
+const LEGACY_MAGIC_PREFIX: [u8; 6] = [b'B', b'S', b'T', b'K', 0, 1];
+
+/// Header size of the pre-0.4.0 (0.1.x) format: `magic[8] + committed_len[8]`.
+const LEGACY_HEADER_SIZE: u64 = 16;
+
+/// Bytes occupied by the file header
+/// (magic[8] + committed_len[8] + wip_ptr[8] + wip_aux[8]).
+///
+/// `wip_ptr`/`wip_aux` are reserved for the write-in-progress journal (see
+/// `PLANNED.md`) and are currently always zero; the header is sized for them now
+/// so the format need not change again when journaling lands.
+const HEADER_SIZE: u64 = 32;
 
 /// Conservative power-fail atomic block size, in bytes.
 ///
@@ -634,7 +660,8 @@ fn lock_file_exclusive(file: &File) -> io::Result<()> {
 fn init_header(file: &mut File) -> io::Result<()> {
     file.seek(SeekFrom::Start(0))?;
     file.write_all(&MAGIC)?;
-    file.write_all(&0u64.to_le_bytes())
+    // committed_len[8] + wip_ptr[8] + wip_aux[8], all zero on a fresh file.
+    file.write_all(&[0u8; (HEADER_SIZE - 8) as usize])
 }
 
 /// Overwrite the committed-length field at file offset 8 and update the
@@ -1047,7 +1074,7 @@ impl BStack {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "bstack: file is {raw_size} bytes — too small to contain the 16-byte header"
+                    "bstack: file is {raw_size} bytes — too small to contain the {HEADER_SIZE}-byte header"
                 ),
             ));
         } else {
@@ -1080,6 +1107,87 @@ impl BStack {
             cache_enabled: false,
             cache: Mutex::new(Vec::new()),
         })
+    }
+
+    /// Upgrade a legacy pre-0.4.0 (0.1.x, 16-byte header) file at `path` to the
+    /// current 0.4.0 layout (32-byte header), in place.
+    ///
+    /// The file is rewritten into a sibling `"<path>.migrating"` — a fresh 0.4.0
+    /// header followed by the old payload shifted from offset 16 to offset 32 —
+    /// which is then swapped in: the original is removed and the sibling renamed
+    /// onto it. The committed length is preserved (clamped to the bytes actually
+    /// present, mirroring [`open`](BStack::open)'s recovery).
+    ///
+    /// The caller must not hold the file open elsewhere. On success `path` is a
+    /// valid 0.4.0 file ready for [`open`](BStack::open).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidData`] if `path` is not a legacy 0.1.x
+    /// file (wrong magic, or shorter than the 16-byte legacy header), and
+    /// propagates any I/O error from reading, writing, syncing, removing, or
+    /// renaming.
+    pub fn migrate(path: impl AsRef<Path>) -> io::Result<()> {
+        let path = path.as_ref();
+
+        // Read and validate the legacy 16-byte header.
+        let mut old = OpenOptions::new().read(true).open(path)?;
+        let old_size = old.metadata()?.len();
+        if old_size < LEGACY_HEADER_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "bstack: file is {old_size} bytes — too small to be a legacy {LEGACY_HEADER_SIZE}-byte-header file"
+                ),
+            ));
+        }
+        let mut hdr = [0u8; LEGACY_HEADER_SIZE as usize];
+        old.read_exact(&mut hdr)?;
+        if hdr[0..6] != LEGACY_MAGIC_PREFIX {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bstack: not a legacy 0.1.x file — nothing to migrate",
+            ));
+        }
+        // Committed length, clamped to the payload actually present.
+        let clen =
+            u64::from_le_bytes(hdr[8..16].try_into().unwrap()).min(old_size - LEGACY_HEADER_SIZE);
+
+        // Sibling path "<path>.migrating", in the same directory so the final
+        // rename stays within one filesystem.
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(".migrating");
+        let tmp = PathBuf::from(tmp);
+
+        // Write the new file: 32-byte 0.4.0 header, then the old payload shifted
+        // from offset 16 to offset 32.
+        {
+            let mut new = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&tmp)?;
+            new.write_all(&MAGIC)?; // magic[8]
+            new.write_all(&clen.to_le_bytes())?; // committed_len[8]
+            new.write_all(&[0u8; 16])?; // wip_ptr[8] | wip_aux[8] = 0
+            old.seek(SeekFrom::Start(LEGACY_HEADER_SIZE))?;
+            let mut src = (&mut old).take(clen);
+            let copied = io::copy(&mut src, &mut new)?;
+            if copied != clen {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "bstack: legacy payload shorter than committed length during migration",
+                ));
+            }
+            new.sync_all()?;
+        }
+        drop(old);
+
+        // Swap the sibling in for the original.
+        std::fs::remove_file(path)?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
     }
 
     /// Append `data` to the end of the file.
