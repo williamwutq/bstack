@@ -594,7 +594,6 @@ const HEADER_SIZE: u64 = 32;
 /// byte is block-aligned, a write confined to one 256 B-aligned region is always
 /// contained within a single hardware block. See *Derived atomicity beyond 8 B*
 /// in `PLANNED.md`.
-#[cfg(any(feature = "set", feature = "atomic"))]
 const ATOMIC_BLOCK: u64 = 256;
 
 /// Flush all in-flight writes to stable storage.
@@ -673,6 +672,109 @@ fn write_committed_len(file: &mut File, clen: &mut u64, len: u64) -> io::Result<
     Ok(())
 }
 
+/// Overwrite the write-in-progress journal fields — `wip_ptr` at offset 16,
+/// `wip_aux` at offset 24 — in a single 16-byte header write.
+///
+/// Both fields lie within the first 32 bytes (one aligned block), so the write
+/// is atomic at the storage level: recovery never observes `wip_ptr` and
+/// `wip_aux` out of step. `wip_ptr == 0` is the disarmed (steady) state.
+fn write_wip(file: &mut File, wip_ptr: u64, wip_aux: u64) -> io::Result<()> {
+    let mut buf = [0u8; 16];
+    buf[0..8].copy_from_slice(&wip_ptr.to_le_bytes());
+    buf[8..16].copy_from_slice(&wip_aux.to_le_bytes());
+    file.seek(SeekFrom::Start(16))?;
+    file.write_all(&buf)
+}
+
+/// Recover an armed in-place journal (`wip_ptr != 0`) found on open, restoring
+/// the at-rest invariant `file_size == HEADER_SIZE + committed_len`.
+///
+/// `wip_aux == 0` is a same-length `set`: the staged new bytes are the tail
+/// `[HEADER_SIZE + committed_len, raw_size)` and are copied — idempotently, the
+/// tail is immutable and disjoint from the target — into `[wip_ptr, wip_ptr + n)`,
+/// committing the new value. Any other `wip_aux` is a mode this build does not
+/// interpret and is rolled back to the committed length (the forward-compatibility
+/// default). Either way the journal is disarmed and the staged tail dropped;
+/// `committed_len` is unchanged.
+///
+/// Not feature-gated: a file armed by a `set`-enabled build must still recover
+/// correctly when reopened by a build without the feature.
+fn recover_wip(
+    file: &mut File,
+    committed_len: u64,
+    wip_ptr: u64,
+    wip_aux: u64,
+    raw_size: u64,
+) -> io::Result<()> {
+    let tail_start = HEADER_SIZE + committed_len;
+    if wip_aux == 0 {
+        let n = raw_size.saturating_sub(tail_start);
+        // Replay only when the staged tail is present and the target lies wholly
+        // within the committed payload; otherwise fall through to a clean rollback.
+        if n > 0 && wip_ptr >= HEADER_SIZE && wip_ptr.saturating_add(n) <= tail_start {
+            let mut buf = vec![0u8; n as usize];
+            file.seek(SeekFrom::Start(tail_start))?;
+            file.read_exact(&mut buf)?;
+            file.seek(SeekFrom::Start(wip_ptr))?;
+            file.write_all(&buf)?;
+            durable_sync(file)?;
+        }
+    }
+    // Disarm, then drop the staged tail.
+    write_wip(file, 0, 0)?;
+    durable_sync(file)?;
+    file.set_len(tail_start)?;
+    durable_sync(file)
+}
+
+/// Crash-atomically overwrite the payload slice `[offset, offset + data.len())`
+/// with `data` (same length, so `clen` is unchanged) via the write-in-progress
+/// journal.
+///
+/// Callers must have validated the range and already ruled out the atomic-write
+/// fast path. `data_size` is the current payload length, so `HEADER_SIZE +
+/// data_size` is both the committed end and the current file end.
+///
+/// The four-barrier protocol (stage → arm → commit → disarm) guarantees a crash
+/// leaves either the old bytes or the new bytes, never a mix — see the
+/// same-length `set` algorithm in `PLANNED.md`.
+#[cfg(feature = "set")]
+fn journaled_set(file: &mut File, data_size: u64, offset: u64, data: &[u8]) -> io::Result<()> {
+    // 1. Stage: append `data` as a tail backup beyond the committed end.
+    write_at(file, data_size, data)?;
+    durable_sync(file)?;
+    // 2. Arm: point `wip_ptr` at the physical target (`wip_aux` stays 0).
+    write_wip(file, HEADER_SIZE + offset, 0)?;
+    durable_sync(file)?;
+    // 3. Commit in place. The new bytes are already in memory; the staged tail
+    //    is the crash backup recovery would replay from.
+    write_at(file, offset, data)?;
+    durable_sync(file)?;
+    // 4. Disarm.
+    write_wip(file, 0, 0)?;
+    durable_sync(file)?;
+    // 5. Drop the tail backup, restoring `file_size == HEADER_SIZE + data_size`.
+    file.set_len(HEADER_SIZE + data_size)
+}
+
+/// Durably overwrite the same-length payload slice `[offset, offset+data.len())`
+/// with `data`, picking the cheapest crash-safe strategy: a slice confined to a
+/// single aligned block is written atomically at the storage level (one synced
+/// write); anything larger goes through [`journaled_set`]. `data_size` is the
+/// current payload length. See *Choosing a write strategy* in `PLANNED.md`.
+///
+/// Callers must have already validated the range and the locked region.
+#[cfg(feature = "set")]
+#[inline]
+fn commit_in_place(file: &mut File, data_size: u64, offset: u64, data: &[u8]) -> io::Result<()> {
+    if is_atomic_write(offset, data) {
+        write_at(file, offset, data)?;
+        durable_sync(file)
+    } else {
+        journaled_set(file, data_size, offset, data)
+    }
+}
+
 /// Seek to logical `offset` (just past the header) and fill `buf` from the file.
 ///
 /// Shared by every write-lock-held operation that reads a payload region
@@ -729,13 +831,13 @@ fn check_offset_unlocked(op: &str, offset: u64, end: u64, locked: u64) -> io::Re
 /// overflows `u64` cannot be confined to one block and is reported non-atomic.
 ///
 /// This is the gate for skipping the write-in-progress journal on a same-length
-/// `set` whose slice fits within one block (see the *Aligned-block atomicity*
-/// open question in `PLANNED.md`). It is conservative: a write it rejects may
-/// still be atomic on hardware with a larger true block size, but a write it
-/// accepts is atomic on all supported storage.
-// Not yet wired into `set`; it is the primitive the journaling work will call to
-// decide when the write-in-progress journal can be skipped.
-#[cfg(any(feature = "set", feature = "atomic"))]
+/// `set` whose slice fits within one block (the top rung of *Choosing a write
+/// strategy* in `PLANNED.md`). It is conservative: a write it rejects may still
+/// be atomic on hardware with a larger true block size, but a write it accepts
+/// is atomic on all supported storage.
+// Always compiled (not feature-gated) so the atomic-write fast path is available
+// to every in-place mutator; `allow(dead_code)` covers builds with no features
+// enabled, where nothing calls it.
 #[allow(dead_code)]
 fn is_atomic_write(offset: u64, data: &[u8]) -> bool {
     let len = data.len() as u64;
@@ -968,10 +1070,11 @@ fn pread_exact_raw_handle(handle: isize, offset: u64, buf: &mut [u8]) -> io::Res
     Ok(())
 }
 
-/// Read and validate the header; return the committed payload length.
-fn read_header(file: &mut File) -> io::Result<u64> {
+/// Read and validate the 32-byte header; return `(committed_len, wip_ptr,
+/// wip_aux)`.
+fn read_header(file: &mut File) -> io::Result<(u64, u64, u64)> {
     file.seek(SeekFrom::Start(0))?;
-    let mut hdr = [0u8; 16];
+    let mut hdr = [0u8; HEADER_SIZE as usize];
     file.read_exact(&mut hdr)?;
     if hdr[0..6] != MAGIC_PREFIX {
         return Err(io::Error::new(
@@ -979,7 +1082,10 @@ fn read_header(file: &mut File) -> io::Result<u64> {
             "bstack: bad magic number — not a bstack file or incompatible version",
         ));
     }
-    Ok(u64::from_le_bytes(hdr[8..16].try_into().unwrap()))
+    let committed_len = u64::from_le_bytes(hdr[8..16].try_into().unwrap());
+    let wip_ptr = u64::from_le_bytes(hdr[16..24].try_into().unwrap());
+    let wip_aux = u64::from_le_bytes(hdr[24..32].try_into().unwrap());
+    Ok((committed_len, wip_ptr, wip_aux))
 }
 
 // ---------------------------------------------------------------------------
@@ -1078,17 +1184,25 @@ impl BStack {
                 ),
             ));
         } else {
-            let committed_len = read_header(&mut file)?;
-            let actual_data_len = raw_size - HEADER_SIZE;
-            if actual_data_len != committed_len {
-                // Recover: use whichever length is smaller (the committed
-                // value is the last successfully synced boundary).
-                let correct_len = committed_len.min(actual_data_len);
-                file.set_len(HEADER_SIZE + correct_len)?;
-                write_committed_len(&mut file, &mut clen, correct_len)?;
-                durable_sync(&file)?;
+            let (committed_len, wip_ptr, wip_aux) = read_header(&mut file)?;
+            clen = committed_len;
+            if wip_ptr != 0 {
+                // An in-place write was in flight. Replay or roll it back, then
+                // restore the at-rest invariant. (`committed_len` is unchanged by
+                // the same-length modes implemented so far.)
+                recover_wip(&mut file, committed_len, wip_ptr, wip_aux, raw_size)?;
             } else {
-                clen = committed_len;
+                // No journal armed: reconcile the committed length against the
+                // file size, using whichever is smaller (the committed value is
+                // the last successfully synced boundary). This drops a stale tail
+                // from a crashed push/extend or a crashed journal stage.
+                let actual_data_len = raw_size - HEADER_SIZE;
+                if actual_data_len != committed_len {
+                    let correct_len = committed_len.min(actual_data_len);
+                    file.set_len(HEADER_SIZE + correct_len)?;
+                    write_committed_len(&mut file, &mut clen, correct_len)?;
+                    durable_sync(&file)?;
+                }
             }
         }
 
@@ -1676,16 +1790,20 @@ impl BStack {
     ///
     /// Only available when the `set` Cargo feature is enabled.
     ///
-    /// # Durability
+    /// # Durability & atomicity
     ///
-    /// Equivalent to `push`/`pop`: the overwritten bytes are durably synced
-    /// before the call returns.
+    /// Crash-atomic: after a crash the slice holds either its old contents or the
+    /// full new `data`, never a partial mix. A write confined to a single aligned
+    /// storage block is committed with one durably-synced write; a larger write
+    /// goes through the write-in-progress journal (stage → arm → commit → disarm),
+    /// which recovery replays or rolls back on the next [`open`](Self::open). The
+    /// overwritten bytes are durably synced before the call returns.
     ///
     /// # Errors
     ///
     /// Returns [`io::ErrorKind::InvalidInput`] if `offset + data.len()`
     /// exceeds the current payload size, or if the addition overflows `u64`.
-    /// Propagates any I/O error from `write_all` or `durable_sync`.
+    /// Propagates any I/O error from `write_all`, `set_len`, or `durable_sync`.
     #[cfg(feature = "set")]
     pub fn set(&self, offset: u64, data: impl AsRef<[u8]>) -> io::Result<()> {
         let data = data.as_ref();
@@ -1707,8 +1825,7 @@ impl BStack {
                 format!("set: write end ({end}) exceeds payload size ({data_size})"),
             ));
         }
-        write_at(file, offset, data)?;
-        durable_sync(file)
+        commit_in_place(file, data_size, offset, data)
     }
 
     /// Overwrite `n` bytes with zeros in place starting at logical `offset`.
@@ -1721,16 +1838,19 @@ impl BStack {
     ///
     /// Only available when the `set` Cargo feature is enabled.
     ///
-    /// # Durability
+    /// # Durability & atomicity
     ///
-    /// Equivalent to `push`/`pop`: the overwritten bytes are durably synced
-    /// before the call returns.
+    /// Crash-atomic on the same terms as [`set`](Self::set): the zeroed slice
+    /// survives a crash as either its old contents or all-zeros, never a mix.
+    /// Small writes take the single-block atomic path; larger ones go through the
+    /// write-in-progress journal. The overwritten bytes are durably synced before
+    /// the call returns.
     ///
     /// # Errors
     ///
     /// Returns [`io::ErrorKind::InvalidInput`] if `offset + n`
     /// exceeds the current payload size, or if the addition overflows `u64`.
-    /// Propagates any I/O error from `write_all` or `durable_sync`.
+    /// Propagates any I/O error from `write_all`, `set_len`, or `durable_sync`.
     #[cfg(feature = "set")]
     pub fn zero(&self, offset: u64, n: u64) -> io::Result<()> {
         if n == 0 {
@@ -1749,9 +1869,10 @@ impl BStack {
                 format!("zero: write end ({end}) exceeds payload size ({data_size})"),
             ));
         }
+        // (A dedicated repeat-fill journal for large zeroing is a future
+        // optimisation — see `PLANNED.md`.)
         let zeros = vec![0u8; n as usize];
-        write_at(file, offset, &zeros)?;
-        durable_sync(file)
+        commit_in_place(file, data_size, offset, &zeros)
     }
 }
 

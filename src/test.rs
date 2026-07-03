@@ -21,7 +21,6 @@ mod tests {
         }
     }
 
-    #[cfg(any(feature = "set", feature = "atomic"))]
     #[test]
     fn is_atomic_write_block_confinement() {
         use crate::{ATOMIC_BLOCK, is_atomic_write};
@@ -567,6 +566,109 @@ mod tests {
         let raw2 = std::fs::read(&p).unwrap();
         let clen_after = u64::from_le_bytes(raw2[8..16].try_into().unwrap());
         assert_eq!(clen_after, 5, "clen should be repaired to 5 after recovery");
+    }
+
+    // ---- write-in-progress (wip) journal ------------------------------------
+
+    // Build a raw 32-byte header (current magic) with the given fields.
+    fn wip_header(clen: u64, wip_ptr: u64, wip_aux: u64) -> Vec<u8> {
+        let mut h = MAGIC.to_vec();
+        h.extend_from_slice(&clen.to_le_bytes());
+        h.extend_from_slice(&wip_ptr.to_le_bytes());
+        h.extend_from_slice(&wip_aux.to_le_bytes());
+        h
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn set_journals_block_spanning_write_and_reopens_clean() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+
+        // 400-byte payload; a 300-byte `set` at offset 0 spans a 256 B block
+        // boundary (physical [32, 332)), so it goes through the journal rather
+        // than the atomic-write fast path.
+        s.push(vec![b'A'; 400]).unwrap();
+        s.set(0, vec![b'B'; 300]).unwrap();
+
+        let mut expect = vec![b'B'; 300];
+        expect.extend_from_slice(&[b'A'; 100]);
+        assert_eq!(s.peek(0).unwrap(), expect);
+        drop(s);
+
+        // The tail backup is gone, wip is disarmed, and the value survives reopen.
+        let raw = std::fs::read(&p).unwrap();
+        assert_eq!(raw.len() as u64, HEADER_SIZE + 400, "tail not truncated");
+        assert_eq!(&raw[16..24], &[0u8; 8], "wip_ptr not disarmed");
+        let s2 = BStack::open(&p).unwrap();
+        assert_eq!(s2.peek(0).unwrap(), expect);
+        assert_eq!(s2.len().unwrap(), 400);
+    }
+
+    #[test]
+    fn recovery_replays_armed_same_length_set() {
+        // Craft the on-disk state of a `set` crashed after arm: header armed at
+        // the target, old bytes still in place, new bytes staged in the tail.
+        let path = {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static C: AtomicU64 = AtomicU64::new(0);
+            let id = C.fetch_add(1, Ordering::Relaxed);
+            std::env::temp_dir().join(format!("bstack_wip_replay_{}.bin", id))
+        };
+        let _g = Guard(path.clone());
+
+        let clen = 400u64;
+        // Target offset a = 0 → physical wip_ptr = HEADER_SIZE.
+        let mut file = wip_header(clen, HEADER_SIZE, 0);
+        file.extend_from_slice(&vec![b'A'; clen as usize]); // old payload
+        file.extend_from_slice(&vec![b'B'; 300]); // staged tail (new bytes)
+        std::fs::write(&path, &file).unwrap();
+
+        // Recovery on open replays the tail into [0, 300).
+        let s = BStack::open(&path).unwrap();
+        let mut expect = vec![b'B'; 300];
+        expect.extend_from_slice(&[b'A'; 100]);
+        assert_eq!(s.len().unwrap(), 400);
+        assert_eq!(s.peek(0).unwrap(), expect);
+        drop(s);
+
+        // The journal is disarmed and the tail dropped.
+        let raw = std::fs::read(&path).unwrap();
+        assert_eq!(raw.len() as u64, HEADER_SIZE + 400);
+        assert_eq!(&raw[16..24], &[0u8; 8], "wip_ptr not cleared");
+    }
+
+    #[test]
+    fn recovery_rolls_back_unrecognized_wip_aux() {
+        // wip_ptr armed with a wip_aux mode this build does not implement: the
+        // forward-compatibility default rolls back to the committed length (no
+        // replay), leaving the old bytes intact and dropping the staged tail.
+        let path = {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static C: AtomicU64 = AtomicU64::new(0);
+            let id = C.fetch_add(1, Ordering::Relaxed);
+            std::env::temp_dir().join(format!("bstack_wip_rollback_{}.bin", id))
+        };
+        let _g = Guard(path.clone());
+
+        let clen = 400u64;
+        let mut file = wip_header(clen, HEADER_SIZE, 1); // wip_aux = 1 (unknown mode)
+        file.extend_from_slice(&vec![b'A'; clen as usize]);
+        file.extend_from_slice(&vec![b'B'; 300]); // staged tail, must be discarded
+        std::fs::write(&path, &file).unwrap();
+
+        let s = BStack::open(&path).unwrap();
+        assert_eq!(s.len().unwrap(), 400);
+        assert_eq!(
+            s.peek(0).unwrap(),
+            vec![b'A'; 400],
+            "should roll back, not replay"
+        );
+        drop(s);
+
+        let raw = std::fs::read(&path).unwrap();
+        assert_eq!(raw.len() as u64, HEADER_SIZE + 400);
+        assert_eq!(&raw[16..24], &[0u8; 8], "wip_ptr not cleared");
     }
 
     // ---- peek_into ----------------------------------------------------------
