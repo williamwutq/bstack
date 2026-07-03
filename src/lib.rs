@@ -775,6 +775,99 @@ fn commit_in_place(file: &mut File, data_size: u64, offset: u64, data: &[u8]) ->
     }
 }
 
+/// Upper bound on the streaming-move buffer, in bytes. A move copies at most this
+/// many bytes per iteration, so an on-disk relocation of any length uses O(1)
+/// memory. Sized to one typical filesystem page.
+#[cfg(all(feature = "set", feature = "atomic"))]
+const MOVE_CHUNK: u64 = 4 * 1024;
+
+/// Copy `n` bytes from logical `src` to logical `dst` within the file using a
+/// buffer bounded by [`MOVE_CHUNK`] (O(1) memory).
+///
+/// The source and destination must not overlap. Every caller routes an
+/// overlapping move through the disjoint tail region, so this always holds and no
+/// memmove-direction handling is needed.
+///
+/// Splitting the copy into chunks introduces no concurrency hazard: a move is
+/// only ever performed while its caller holds the `BStack` write lock, so no
+/// other writer — and, on the rwlock-guarded paths, no reader — can observe or
+/// touch the region between chunks. The chunking is purely an in-memory detail.
+#[cfg(all(feature = "set", feature = "atomic"))]
+fn move_chunked(file: &mut File, src: u64, dst: u64, n: u64) -> io::Result<()> {
+    let cap = n.min(MOVE_CHUNK) as usize;
+    let mut buf = vec![0u8; cap];
+    let mut done = 0u64;
+    while done < n {
+        let take = ((n - done) as usize).min(cap);
+        read_at(file, src + done, &mut buf[..take])?;
+        write_at(file, dst + done, &buf[..take])?;
+        done += take as u64;
+    }
+    Ok(())
+}
+
+/// Crash-atomically exchange the equal-length payload regions `[a, a+n)` and
+/// `[b, b+n)`: on return A holds B's old bytes and B holds A's old bytes.
+///
+/// **O(1) memory** — the bytes are streamed on disk, never buffered whole. Only
+/// A's original bytes are staged (in the tail); the exchange commits at a single
+/// atomic `wip_ptr` flip from A to B. The journal reuses the same-length replay
+/// format (`wip_aux == 0`): the tail is A's bytes and `wip_ptr` names where
+/// recovery replays them — at A (a no-op that rolls the exchange back) before the
+/// flip, at B (which rolls it forward) after. `data_size` is the current payload
+/// length. `a`/`b` are logical offsets of non-overlapping, unlocked regions the
+/// caller has already validated.
+#[cfg(all(feature = "set", feature = "atomic"))]
+fn journaled_exchange(file: &mut File, data_size: u64, a: u64, b: u64, n: u64) -> io::Result<()> {
+    // 1. Stage A's bytes beyond the committed end as the replay backup.
+    move_chunked(file, a, data_size, n)?;
+    durable_sync(file)?;
+    // 2. Arm "replay tail into A". While `wip_ptr == A` a crash rolls the whole
+    //    exchange back: recovery writes A's original bytes back into A (a no-op
+    //    right now, and a repair once step 3 has overwritten A), leaving B alone.
+    write_wip(file, HEADER_SIZE + a, 0)?;
+    durable_sync(file)?;
+    // 3. A <- B's bytes (streamed straight from B). Still armed at A → rolls back.
+    move_chunked(file, b, a, n)?;
+    durable_sync(file)?;
+    // 4. Flip to "replay tail into B" — the atomic commit point. Before it a crash
+    //    rolls back (A restored); after it a crash rolls forward (B filled with
+    //    A's bytes while A already holds B's bytes).
+    write_wip(file, HEADER_SIZE + b, 0)?;
+    durable_sync(file)?;
+    // 5. B <- A's bytes (streamed from the tail). A crash now rolls forward.
+    move_chunked(file, data_size, b, n)?;
+    durable_sync(file)?;
+    // 6. Disarm and drop the staged tail.
+    write_wip(file, 0, 0)?;
+    durable_sync(file)?;
+    file.set_len(HEADER_SIZE + data_size)
+}
+
+/// Crash-atomically copy `n` bytes from logical `src` to logical `dst` (same
+/// length) through the write-in-progress journal, **O(1) memory**.
+///
+/// `src` and `dst` may overlap: the bytes route through the tail backup, which is
+/// disjoint from both, so the two streamed moves never self-overwrite. `data_size`
+/// is the current payload length.
+#[cfg(all(feature = "set", feature = "atomic"))]
+fn journaled_move(file: &mut File, data_size: u64, src: u64, dst: u64, n: u64) -> io::Result<()> {
+    // 1. Stage the source bytes in the tail.
+    move_chunked(file, src, data_size, n)?;
+    durable_sync(file)?;
+    // 2. Arm the destination as the replay target.
+    write_wip(file, HEADER_SIZE + dst, 0)?;
+    durable_sync(file)?;
+    // 3. Commit: stream the staged bytes into the destination.
+    move_chunked(file, data_size, dst, n)?;
+    durable_sync(file)?;
+    // 4. Disarm.
+    write_wip(file, 0, 0)?;
+    durable_sync(file)?;
+    // 5. Drop the tail.
+    file.set_len(HEADER_SIZE + data_size)
+}
+
 /// Seek to logical `offset` (just past the header) and fill `buf` from the file.
 ///
 /// Shared by every write-lock-held operation that reads a payload region
@@ -840,7 +933,15 @@ fn check_offset_unlocked(op: &str, offset: u64, end: u64, locked: u64) -> io::Re
 // enabled, where nothing calls it.
 #[allow(dead_code)]
 fn is_atomic_write(offset: u64, data: &[u8]) -> bool {
-    let len = data.len() as u64;
+    is_atomic_len(offset, data.len() as u64)
+}
+
+/// Length-based core of [`is_atomic_write`]: `true` if a write of `len` bytes at
+/// logical `offset` is confined to a single aligned block. Lets a caller that
+/// knows only the size (e.g. an on-disk `copy`) test the fast path before it has
+/// read the bytes.
+#[allow(dead_code)]
+fn is_atomic_len(offset: u64, len: u64) -> bool {
     if len == 0 {
         return true;
     }
@@ -2700,8 +2801,18 @@ impl BStack {
     ///
     /// Bytes at `[a, a + n)` and `[b, b + n)` are exchanged under a single
     /// write lock, so no other thread can observe an intermediate state.
-    /// The file size is never changed.  `n = 0` is a valid no-op (bounds are
-    /// still checked).
+    /// The at-rest file size is never changed.  `n = 0` is a valid no-op (bounds
+    /// are still checked).
+    ///
+    /// # Crash atomicity
+    ///
+    /// Crash-safe: after a crash the two regions hold either their original
+    /// contents or the fully swapped contents, never a half-swap. Region A's
+    /// bytes are staged in a tail backup and the swap commits at a single atomic
+    /// `wip_ptr` flip; recovery on the next [`open`](Self::open) rolls the
+    /// exchange back (before the flip) or forward (after it). During the operation
+    /// the file grows by `n` bytes to hold the backup, which is dropped on
+    /// completion.
     ///
     /// # Feature flags
     ///
@@ -2763,13 +2874,7 @@ impl BStack {
         if n == 0 {
             return Ok(());
         }
-        let mut buf_a = vec![0u8; n as usize];
-        read_at(file, a, &mut buf_a)?;
-        let mut buf_b = vec![0u8; n as usize];
-        read_at(file, b, &mut buf_b)?;
-        write_at(file, a, &buf_b)?;
-        write_at(file, b, &buf_a)?;
-        durable_sync(file)
+        journaled_exchange(file, data_size, a, b, n)
     }
 
     /// Copy `n` bytes from `from..from+n` to `to..to+n` under a single write lock.
@@ -2819,9 +2924,18 @@ impl BStack {
         if n == 0 {
             return Ok(());
         }
-        let mut buf = vec![0u8; n as usize];
-        read_at(file, from, &mut buf)?;
-        commit_in_place(file, data_size, to, &buf)
+        // Write-strategy hierarchy: a destination within one aligned block is
+        // committed atomically (read the source into a bounded buffer — `n` is at
+        // most one block here — and write it); anything larger streams through the
+        // journal with O(1) memory (see `journaled_move`).
+        if is_atomic_len(to, n) {
+            let mut buf = vec![0u8; n as usize];
+            read_at(file, from, &mut buf)?;
+            write_at(file, to, &buf)?;
+            durable_sync(file)
+        } else {
+            journaled_move(file, data_size, from, to, n)
+        }
     }
 
     /// Read bytes in the half-open logical range `[start, end)`, pass them to
@@ -3093,13 +3207,7 @@ impl BStack {
                         ));
                     }
                     if len > 0 {
-                        let mut buf_a = vec![0u8; len as usize];
-                        read_at(file, a_offset, &mut buf_a)?;
-                        let mut buf_b = vec![0u8; len as usize];
-                        read_at(file, b_offset, &mut buf_b)?;
-                        write_at(file, a_offset, &buf_b)?;
-                        write_at(file, b_offset, &buf_a)?;
-                        durable_sync(file)?;
+                        journaled_exchange(file, data_size, a_offset, b_offset, len)?;
                     }
                     return Ok(());
                 }

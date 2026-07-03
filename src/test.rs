@@ -671,6 +671,146 @@ mod tests {
         assert_eq!(&raw[16..24], &[0u8; 8], "wip_ptr not cleared");
     }
 
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn cross_exchange_journals_and_reopens_clean() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+
+        // Region A = [0, 50), region B = [100, 150); an exchange always journals.
+        let mut payload = vec![b'm'; 200];
+        payload[0..50].fill(b'A');
+        payload[100..150].fill(b'B');
+        s.push(&payload).unwrap();
+
+        s.cross_exchange(0, 100, 50).unwrap();
+
+        let out = s.peek(0).unwrap();
+        assert_eq!(&out[0..50], &[b'B'; 50], "A should now hold B's bytes");
+        assert_eq!(&out[100..150], &[b'A'; 50], "B should now hold A's bytes");
+        drop(s);
+
+        // Tail dropped, journal disarmed, exchange persists across reopen.
+        let raw = std::fs::read(&p).unwrap();
+        assert_eq!(raw.len() as u64, HEADER_SIZE + 200, "tail not truncated");
+        assert_eq!(&raw[16..24], &[0u8; 8], "wip_ptr not disarmed");
+        let s2 = BStack::open(&p).unwrap();
+        let out2 = s2.peek(0).unwrap();
+        assert_eq!(&out2[0..50], &[b'B'; 50]);
+        assert_eq!(&out2[100..150], &[b'A'; 50]);
+    }
+
+    #[test]
+    fn recovery_rolls_back_exchange_before_flip() {
+        // Crashed after A <- B's bytes but while `wip_ptr` still names region A:
+        // recovery replays A's staged bytes into A, restoring the original (B
+        // was never touched). The whole exchange rolls back.
+        let path = {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static C: AtomicU64 = AtomicU64::new(0);
+            let id = C.fetch_add(1, Ordering::Relaxed);
+            std::env::temp_dir().join(format!("bstack_xchg_rb_{}.bin", id))
+        };
+        let _g = Guard(path.clone());
+
+        let clen = 200u64;
+        let mut file = wip_header(clen, HEADER_SIZE, 0); // wip_ptr = region A
+        let mut payload = vec![b'm'; clen as usize];
+        payload[0..50].fill(b'B'); // A already overwritten with B's bytes
+        payload[100..150].fill(b'B'); // B untouched (original)
+        file.extend_from_slice(&payload);
+        file.extend_from_slice(&[b'A'; 50]); // tail = A's original bytes
+        std::fs::write(&path, &file).unwrap();
+
+        let s = BStack::open(&path).unwrap();
+        let out = s.peek(0).unwrap();
+        assert_eq!(&out[0..50], &[b'A'; 50], "A restored to original");
+        assert_eq!(&out[100..150], &[b'B'; 50], "B unchanged");
+        assert_eq!(s.len().unwrap(), 200);
+    }
+
+    #[test]
+    fn recovery_rolls_forward_exchange_after_flip() {
+        // Crashed after the flip (`wip_ptr` names region B): recovery replays A's
+        // staged bytes into B, completing the exchange (A already holds B's bytes).
+        let path = {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static C: AtomicU64 = AtomicU64::new(0);
+            let id = C.fetch_add(1, Ordering::Relaxed);
+            std::env::temp_dir().join(format!("bstack_xchg_rf_{}.bin", id))
+        };
+        let _g = Guard(path.clone());
+
+        let clen = 200u64;
+        let mut file = wip_header(clen, HEADER_SIZE + 100, 0); // wip_ptr = region B
+        let mut payload = vec![b'm'; clen as usize];
+        payload[0..50].fill(b'B'); // A holds B's bytes (done)
+        payload[100..150].fill(b'B'); // B not yet overwritten
+        file.extend_from_slice(&payload);
+        file.extend_from_slice(&[b'A'; 50]); // tail = A's original bytes
+        std::fs::write(&path, &file).unwrap();
+
+        let s = BStack::open(&path).unwrap();
+        let out = s.peek(0).unwrap();
+        assert_eq!(&out[0..50], &[b'B'; 50], "A holds B's bytes");
+        assert_eq!(&out[100..150], &[b'A'; 50], "B filled with A's bytes");
+        assert_eq!(s.len().unwrap(), 200);
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn copy_streams_regions_larger_than_move_chunk() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+
+        // n exceeds MOVE_CHUNK (64 KiB), so the on-disk copy streams over several
+        // buffer-sized iterations rather than buffering the whole region.
+        let n = 200 * 1024usize;
+        let mut payload = vec![0u8; 2 * n];
+        for (i, b) in payload[..n].iter_mut().enumerate() {
+            *b = (i % 251) as u8; // recognizable pattern in the source
+        }
+        s.push(&payload).unwrap();
+
+        s.copy(0, n as u64, n as u64).unwrap(); // [0, n) -> [n, 2n)
+
+        let out = s.peek(0).unwrap();
+        assert_eq!(&out[..n], &out[n..2 * n], "destination should equal source");
+        assert_eq!(out[n + 100_000], (100_000 % 251) as u8, "deep byte copied");
+        drop(s);
+
+        let s2 = BStack::open(&p).unwrap();
+        let out2 = s2.peek(0).unwrap();
+        assert_eq!(&out2[..n], &out2[n..2 * n], "copy survives reopen");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn cross_exchange_streams_large_regions() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+
+        let n = 100 * 1024usize; // > MOVE_CHUNK
+        let mut payload = vec![b'A'; n];
+        payload.extend(std::iter::repeat(b'B').take(n));
+        s.push(&payload).unwrap();
+
+        s.cross_exchange(0, n as u64, n as u64).unwrap(); // swap [0,n) with [n,2n)
+
+        let out = s.peek(0).unwrap();
+        assert!(out[..n].iter().all(|&x| x == b'B'), "A now holds B's bytes");
+        assert!(
+            out[n..2 * n].iter().all(|&x| x == b'A'),
+            "B now holds A's bytes"
+        );
+        drop(s);
+
+        let s2 = BStack::open(&p).unwrap();
+        let out2 = s2.peek(0).unwrap();
+        assert!(out2[..n].iter().all(|&x| x == b'B'));
+        assert!(out2[n..2 * n].iter().all(|&x| x == b'A'));
+    }
+
     // ---- peek_into ----------------------------------------------------------
 
     #[test]
