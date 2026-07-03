@@ -672,16 +672,61 @@ fn write_committed_len(file: &mut File, clen: &mut u64, len: u64) -> io::Result<
     Ok(())
 }
 
+/// The `wip_aux` header field: which kind of in-place journal is armed.
+///
+/// Each variant has an explicit on-disk `u64` value. `Set` is `0` (the steady
+/// disarmed state also reads as `0`); every other mode takes a value near
+/// `u64::MAX`, decrementing as modes are added, so the low-value range stays free
+/// for any future packed encoding and unrecognized values are unmistakable. Any
+/// per-operation data (a fill count, a length delta, …) lives in the staged tail,
+/// not in `wip_aux`.
+///
+/// Convert to the on-disk value with `u64::from(aux)`; classify a value read back
+/// from the header with `WipAux::try_from(v)` (an unknown value is an `Err`,
+/// which recovery treats as a roll-back). Not feature-gated: recovery must
+/// understand every mode regardless of which features this build enables.
+#[repr(u64)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum WipAux {
+    /// Same-length replay: the tail holds the exact bytes to write into
+    /// `[wip_ptr, wip_ptr + tail_len)`. Armed by `set`, `swap`/`cas`, `copy`, and
+    /// `cross_exchange` (whose commit is a `wip_ptr` flip between two `Set` arms).
+    Set = 0,
+    /// Repeat-fill: the tail holds `[k: u64 LE | s]`; recovery writes `k` copies
+    /// of `s` into `[wip_ptr, wip_ptr + k*s.len())`.
+    Repeat = u64::MAX,
+}
+
+impl From<WipAux> for u64 {
+    #[inline]
+    fn from(aux: WipAux) -> Self {
+        aux as u64
+    }
+}
+
+impl TryFrom<u64> for WipAux {
+    type Error = ();
+
+    #[inline]
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        match value {
+            v if v == WipAux::Set as u64 => Ok(WipAux::Set),
+            v if v == WipAux::Repeat as u64 => Ok(WipAux::Repeat),
+            _ => Err(()),
+        }
+    }
+}
+
 /// Overwrite the write-in-progress journal fields — `wip_ptr` at offset 16,
 /// `wip_aux` at offset 24 — in a single 16-byte header write.
 ///
 /// Both fields lie within the first 32 bytes (one aligned block), so the write
 /// is atomic at the storage level: recovery never observes `wip_ptr` and
 /// `wip_aux` out of step. `wip_ptr == 0` is the disarmed (steady) state.
-fn write_wip(file: &mut File, wip_ptr: u64, wip_aux: u64) -> io::Result<()> {
+fn write_wip(file: &mut File, wip_ptr: u64, wip_aux: WipAux) -> io::Result<()> {
     let mut buf = [0u8; 16];
     buf[0..8].copy_from_slice(&wip_ptr.to_le_bytes());
-    buf[8..16].copy_from_slice(&wip_aux.to_le_bytes());
+    buf[8..16].copy_from_slice(&u64::from(wip_aux).to_le_bytes());
     file.seek(SeekFrom::Start(16))?;
     file.write_all(&buf)
 }
@@ -689,10 +734,11 @@ fn write_wip(file: &mut File, wip_ptr: u64, wip_aux: u64) -> io::Result<()> {
 /// Recover an armed in-place journal (`wip_ptr != 0`) found on open, restoring
 /// the at-rest invariant `file_size == HEADER_SIZE + committed_len`.
 ///
-/// `wip_aux == 0` is a same-length `set`: the staged new bytes are the tail
-/// `[HEADER_SIZE + committed_len, raw_size)` and are copied — idempotently, the
-/// tail is immutable and disjoint from the target — into `[wip_ptr, wip_ptr + n)`,
-/// committing the new value. Any other `wip_aux` is a mode this build does not
+/// [`WipAux::Set`] replays the staged tail `[HEADER_SIZE + committed_len,
+/// raw_size)` — the exact new bytes — into `[wip_ptr, wip_ptr + n)`. [`WipAux::Repeat`]
+/// reads `[k | s]` from that tail and writes `k` copies of `s` into `[wip_ptr,
+/// wip_ptr + k*s.len())`. Both replays are idempotent (the tail is immutable and
+/// disjoint from the target). Any other `wip_aux` is a mode this build does not
 /// interpret and is rolled back to the committed length (the forward-compatibility
 /// default). Either way the journal is disarmed and the staged tail dropped;
 /// `committed_len` is unchanged.
@@ -707,21 +753,46 @@ fn recover_wip(
     raw_size: u64,
 ) -> io::Result<()> {
     let tail_start = HEADER_SIZE + committed_len;
-    if wip_aux == 0 {
-        let n = raw_size.saturating_sub(tail_start);
-        // Replay only when the staged tail is present and the target lies wholly
-        // within the committed payload; otherwise fall through to a clean rollback.
-        if n > 0 && wip_ptr >= HEADER_SIZE && wip_ptr.saturating_add(n) <= tail_start {
-            let mut buf = vec![0u8; n as usize];
-            file.seek(SeekFrom::Start(tail_start))?;
-            file.read_exact(&mut buf)?;
-            file.seek(SeekFrom::Start(wip_ptr))?;
-            file.write_all(&buf)?;
-            durable_sync(file)?;
+    let tail_len = raw_size.saturating_sub(tail_start);
+    match WipAux::try_from(wip_aux) {
+        Ok(WipAux::Set) => {
+            // Replay the tail verbatim into the target, if the tail is present and
+            // the target lies wholly within the committed payload.
+            let n = tail_len;
+            if n > 0 && wip_ptr >= HEADER_SIZE && wip_ptr.saturating_add(n) <= tail_start {
+                let mut buf = vec![0u8; n as usize];
+                file.seek(SeekFrom::Start(tail_start))?;
+                file.read_exact(&mut buf)?;
+                file.seek(SeekFrom::Start(wip_ptr))?;
+                file.write_all(&buf)?;
+                durable_sync(file)?;
+            }
         }
+        Ok(WipAux::Repeat) => {
+            // Tail is `[k: u64 LE | s]`; replay `k` copies of `s` into the target.
+            if tail_len >= 8 {
+                let mut kbuf = [0u8; 8];
+                file.seek(SeekFrom::Start(tail_start))?;
+                file.read_exact(&mut kbuf)?;
+                let k = u64::from_le_bytes(kbuf);
+                let s_len = tail_len - 8;
+                let total = k.saturating_mul(s_len);
+                if s_len > 0
+                    && wip_ptr >= HEADER_SIZE
+                    && wip_ptr.saturating_add(total) <= tail_start
+                {
+                    let mut s = vec![0u8; s_len as usize];
+                    file.read_exact(&mut s)?;
+                    write_repeated(file, wip_ptr, &s, k)?;
+                    durable_sync(file)?;
+                }
+            }
+        }
+        // Unknown mode: roll back to the committed length (no replay).
+        Err(()) => {}
     }
     // Disarm, then drop the staged tail.
-    write_wip(file, 0, 0)?;
+    write_wip(file, 0, WipAux::Set)?;
     durable_sync(file)?;
     file.set_len(tail_start)?;
     durable_sync(file)
@@ -743,15 +814,15 @@ fn journaled_set(file: &mut File, data_size: u64, offset: u64, data: &[u8]) -> i
     // 1. Stage: append `data` as a tail backup beyond the committed end.
     write_at(file, data_size, data)?;
     durable_sync(file)?;
-    // 2. Arm: point `wip_ptr` at the physical target (`wip_aux` stays 0).
-    write_wip(file, HEADER_SIZE + offset, 0)?;
+    // 2. Arm: point `wip_ptr` at the physical target.
+    write_wip(file, HEADER_SIZE + offset, WipAux::Set)?;
     durable_sync(file)?;
     // 3. Commit in place. The new bytes are already in memory; the staged tail
     //    is the crash backup recovery would replay from.
     write_at(file, offset, data)?;
     durable_sync(file)?;
     // 4. Disarm.
-    write_wip(file, 0, 0)?;
+    write_wip(file, 0, WipAux::Set)?;
     durable_sync(file)?;
     // 5. Drop the tail backup, restoring `file_size == HEADER_SIZE + data_size`.
     file.set_len(HEADER_SIZE + data_size)
@@ -775,11 +846,93 @@ fn commit_in_place(file: &mut File, data_size: u64, offset: u64, data: &[u8]) ->
     }
 }
 
-/// Upper bound on the streaming-move buffer, in bytes. A move copies at most this
-/// many bytes per iteration, so an on-disk relocation of any length uses O(1)
-/// memory. Sized to one typical filesystem page.
-#[cfg(all(feature = "set", feature = "atomic"))]
+/// Upper bound on the streaming buffer for on-disk moves and repeat-fills, in
+/// bytes. Each iteration copies at most this many bytes, so a relocation or fill
+/// of any length uses O(1) memory. Sized to one typical filesystem page. Not
+/// feature-gated: recovery's repeat-fill replay ([`write_repeated`]) uses it.
 const MOVE_CHUNK: u64 = 4 * 1024;
+
+/// Fill `[phys .. phys + k*s.len())` with `k` back-to-back copies of `s`, writing
+/// through a buffer of whole copies of `s` bounded by [`MOVE_CHUNK`] (so O(1)
+/// memory beyond `s` itself). `phys` is a physical file offset.
+///
+/// Because the buffer is an exact number of copies of `s` and the total is
+/// `k*s.len()`, every chunk boundary lands on a copy boundary, so the pattern
+/// stays aligned even on the final short write. Used both by the live repeat-fill
+/// and by recovery. Not feature-gated (recovery needs it).
+fn write_repeated(file: &mut File, phys: u64, s: &[u8], k: u64) -> io::Result<()> {
+    let unit = s.len() as u64;
+    if unit == 0 || k == 0 {
+        return Ok(());
+    }
+    let total = k * unit;
+    // Pack as many whole copies of `s` into one buffer as fit under MOVE_CHUNK
+    // (at least one), capped at `k`.
+    let copies = (MOVE_CHUNK / unit).max(1).min(k);
+    let mut buf = Vec::with_capacity((copies * unit) as usize);
+    for _ in 0..copies {
+        buf.extend_from_slice(s);
+    }
+    let mut done = 0u64;
+    while done < total {
+        let take = ((total - done) as usize).min(buf.len());
+        file.seek(SeekFrom::Start(phys + done))?;
+        file.write_all(&buf[..take])?;
+        done += take as u64;
+    }
+    Ok(())
+}
+
+/// Fill `[offset, offset + k*s.len())` with `k` copies of `s`, crash-atomically,
+/// choosing the atomic-block fast path or the repeat-fill journal. Same length,
+/// so `clen` is unchanged. `s` is non-empty and `k >= 1`, and the caller has
+/// validated the region lies within the payload. `data_size` is the current
+/// payload length.
+#[cfg(feature = "set")]
+fn repeat_fill(file: &mut File, data_size: u64, offset: u64, s: &[u8], k: u64) -> io::Result<()> {
+    let total = k.saturating_mul(s.len() as u64);
+    if is_atomic_len(offset, total) {
+        // Confined to one aligned block: a single write of the pattern is atomic.
+        write_repeated(file, HEADER_SIZE + offset, s, k)?;
+        durable_sync(file)
+    } else {
+        journaled_repeat(file, data_size, offset, s, k)
+    }
+}
+
+/// Crash-atomically fill `[offset, offset + k*s.len())` with `k` copies of `s`
+/// through the repeat-fill journal.
+///
+/// Only the pattern and count are staged, so the tail is `8 + s.len()` bytes no
+/// matter how large the filled region is — the win over journaling the whole
+/// region. The fill itself streams through a bounded buffer ([`write_repeated`]),
+/// so the operation is O(s.len()) memory.
+#[cfg(feature = "set")]
+fn journaled_repeat(
+    file: &mut File,
+    data_size: u64,
+    offset: u64,
+    s: &[u8],
+    k: u64,
+) -> io::Result<()> {
+    // 1. Stage `[k | s]` beyond the committed end.
+    let tail = HEADER_SIZE + data_size;
+    file.seek(SeekFrom::Start(tail))?;
+    file.write_all(&k.to_le_bytes())?;
+    file.write_all(s)?;
+    durable_sync(file)?;
+    // 2. Arm the repeat-fill journal at the target.
+    write_wip(file, HEADER_SIZE + offset, WipAux::Repeat)?;
+    durable_sync(file)?;
+    // 3. Fill in place.
+    write_repeated(file, HEADER_SIZE + offset, s, k)?;
+    durable_sync(file)?;
+    // 4. Disarm.
+    write_wip(file, 0, WipAux::Set)?;
+    durable_sync(file)?;
+    // 5. Drop the staged tail, restoring `file_size == HEADER_SIZE + data_size`.
+    file.set_len(HEADER_SIZE + data_size)
+}
 
 /// Copy `n` bytes from logical `src` to logical `dst` within the file using a
 /// buffer bounded by [`MOVE_CHUNK`] (O(1) memory).
@@ -825,7 +978,7 @@ fn journaled_exchange(file: &mut File, data_size: u64, a: u64, b: u64, n: u64) -
     // 2. Arm "replay tail into A". While `wip_ptr == A` a crash rolls the whole
     //    exchange back: recovery writes A's original bytes back into A (a no-op
     //    right now, and a repair once step 3 has overwritten A), leaving B alone.
-    write_wip(file, HEADER_SIZE + a, 0)?;
+    write_wip(file, HEADER_SIZE + a, WipAux::Set)?;
     durable_sync(file)?;
     // 3. A <- B's bytes (streamed straight from B). Still armed at A → rolls back.
     move_chunked(file, b, a, n)?;
@@ -833,13 +986,13 @@ fn journaled_exchange(file: &mut File, data_size: u64, a: u64, b: u64, n: u64) -
     // 4. Flip to "replay tail into B" — the atomic commit point. Before it a crash
     //    rolls back (A restored); after it a crash rolls forward (B filled with
     //    A's bytes while A already holds B's bytes).
-    write_wip(file, HEADER_SIZE + b, 0)?;
+    write_wip(file, HEADER_SIZE + b, WipAux::Set)?;
     durable_sync(file)?;
     // 5. B <- A's bytes (streamed from the tail). A crash now rolls forward.
     move_chunked(file, data_size, b, n)?;
     durable_sync(file)?;
     // 6. Disarm and drop the staged tail.
-    write_wip(file, 0, 0)?;
+    write_wip(file, 0, WipAux::Set)?;
     durable_sync(file)?;
     file.set_len(HEADER_SIZE + data_size)
 }
@@ -856,13 +1009,13 @@ fn journaled_move(file: &mut File, data_size: u64, src: u64, dst: u64, n: u64) -
     move_chunked(file, src, data_size, n)?;
     durable_sync(file)?;
     // 2. Arm the destination as the replay target.
-    write_wip(file, HEADER_SIZE + dst, 0)?;
+    write_wip(file, HEADER_SIZE + dst, WipAux::Set)?;
     durable_sync(file)?;
     // 3. Commit: stream the staged bytes into the destination.
     move_chunked(file, data_size, dst, n)?;
     durable_sync(file)?;
     // 4. Disarm.
-    write_wip(file, 0, 0)?;
+    write_wip(file, 0, WipAux::Set)?;
     durable_sync(file)?;
     // 5. Drop the tail.
     file.set_len(HEADER_SIZE + data_size)
@@ -1970,10 +2123,74 @@ impl BStack {
                 format!("zero: write end ({end}) exceeds payload size ({data_size})"),
             ));
         }
-        // (A dedicated repeat-fill journal for large zeroing is a future
-        // optimisation — see `PLANNED.md`.)
-        let zeros = vec![0u8; n as usize];
-        commit_in_place(file, data_size, offset, &zeros)
+        // Zeroing is a repeat-fill of the single-byte pattern `[0x00]` `n` times:
+        // the journal stages a fixed 9-byte `[k | s]` tail instead of `n` bytes.
+        repeat_fill(file, data_size, offset, &[0u8], n)
+    }
+
+    /// Fill `count` copies of `pattern` in place starting at logical `offset` —
+    /// i.e. overwrite `[offset, offset + count * pattern.len())` with the pattern
+    /// repeated back to back.
+    ///
+    /// The file size is never changed: if the filled region would exceed the
+    /// current payload size the call is rejected. An empty `pattern` or
+    /// `count == 0` is a valid no-op.
+    ///
+    /// This is the general form of [`zero`](Self::zero) (which is `repeat` of the
+    /// single byte `0x00`). Because only the pattern and count are journaled, a
+    /// crash-safe fill of a large region costs a fixed-size journal rather than
+    /// one proportional to the region — cheap for e.g. clearing or stamping a
+    /// large area with a small repeating value.
+    ///
+    /// # Feature flag
+    ///
+    /// Only available when the `set` Cargo feature is enabled.
+    ///
+    /// # Durability & atomicity
+    ///
+    /// Crash-atomic on the same terms as [`set`](Self::set): after a crash the
+    /// region holds either its old contents or the fully repeated pattern, never a
+    /// mix. A fill confined to one aligned block takes the single-block atomic
+    /// path; a larger one goes through the write-in-progress journal, which stages
+    /// only `[count | pattern]` and replays it on the next [`open`](Self::open).
+    /// The written bytes are durably synced before the call returns.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] if `count * pattern.len()` or
+    /// `offset + count * pattern.len()` overflows `u64`, or if the filled region
+    /// exceeds the current payload size. Propagates any I/O error from `write_all`,
+    /// `set_len`, or `durable_sync`.
+    #[cfg(feature = "set")]
+    pub fn repeat(&self, offset: u64, pattern: impl AsRef<[u8]>, count: u64) -> io::Result<()> {
+        let pattern = pattern.as_ref();
+        if pattern.is_empty() || count == 0 {
+            return Ok(());
+        }
+        let total = (pattern.len() as u64).checked_mul(count).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "repeat: count * pattern.len() overflows u64",
+            )
+        })?;
+        let end = checked_end(
+            offset,
+            total,
+            "repeat: offset + count*pattern.len() overflows u64",
+        )?;
+        let mut guard = self.lock.write().unwrap();
+        let file = &mut guard.0;
+        // Load `locked` under the write lock (see `set` for rationale).
+        let locked = self.locked.load(Ordering::Acquire);
+        check_offset_unlocked("repeat", offset, end, locked)?;
+        let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
+        if end > data_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("repeat: write end ({end}) exceeds payload size ({data_size})"),
+            ));
+        }
+        repeat_fill(file, data_size, offset, pattern, count)
     }
 }
 

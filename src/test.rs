@@ -811,6 +811,85 @@ mod tests {
         assert!(out2[n..2 * n].iter().all(|&x| x == b'A'));
     }
 
+    // ---- repeat -------------------------------------------------------------
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn repeat_fills_pattern_and_reopens_clean() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+
+        // 600-byte region; 300 copies of a 2-byte pattern spans a block, so it
+        // goes through the repeat-fill journal.
+        s.push(vec![b'.'; 600]).unwrap();
+        s.repeat(0, b"ab", 300).unwrap();
+
+        let expect: Vec<u8> = b"ab".iter().copied().cycle().take(600).collect();
+        assert_eq!(s.peek(0).unwrap(), expect);
+        drop(s);
+
+        // The 10-byte `[k | s]` tail is dropped and the journal disarmed.
+        let raw = std::fs::read(&p).unwrap();
+        assert_eq!(raw.len() as u64, HEADER_SIZE + 600, "tail not truncated");
+        assert_eq!(&raw[16..24], &[0u8; 8], "wip_ptr not disarmed");
+        let s2 = BStack::open(&p).unwrap();
+        assert_eq!(s2.peek(0).unwrap(), expect);
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn repeat_empty_or_zero_count_is_noop() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello world").unwrap();
+        s.repeat(0, b"", 5).unwrap(); // empty pattern
+        s.repeat(0, b"xy", 0).unwrap(); // zero count
+        assert_eq!(s.peek(0).unwrap(), b"hello world");
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn repeat_rejects_past_end() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(vec![0u8; 10]).unwrap();
+        // 3 copies of a 4-byte pattern = 12 bytes > 10-byte payload.
+        let err = s.repeat(0, b"abcd", 3).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn recovery_replays_armed_repeat() {
+        use crate::WipAux;
+        // Craft a crashed repeat: header armed REPEAT at offset 0, old bytes still
+        // in place, tail = [k | s]. Recovery writes k copies of s.
+        let path = {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static C: AtomicU64 = AtomicU64::new(0);
+            let id = C.fetch_add(1, Ordering::Relaxed);
+            std::env::temp_dir().join(format!("bstack_wip_repeat_{}.bin", id))
+        };
+        let _g = Guard(path.clone());
+
+        let clen = 600u64;
+        let mut file = wip_header(clen, HEADER_SIZE, u64::from(WipAux::Repeat));
+        file.extend_from_slice(&vec![b'.'; clen as usize]); // unfilled old payload
+        let k: u64 = 300;
+        file.extend_from_slice(&k.to_le_bytes()); // tail: k
+        file.extend_from_slice(b"ab"); // tail: s
+        std::fs::write(&path, &file).unwrap();
+
+        let s = BStack::open(&path).unwrap();
+        let expect: Vec<u8> = b"ab".iter().copied().cycle().take(600).collect();
+        assert_eq!(s.peek(0).unwrap(), expect, "repeat replayed on recovery");
+        assert_eq!(s.len().unwrap(), 600);
+        drop(s);
+
+        let raw = std::fs::read(&path).unwrap();
+        assert_eq!(raw.len() as u64, HEADER_SIZE + 600);
+        assert_eq!(&raw[16..24], &[0u8; 8], "wip_ptr not cleared");
+    }
+
     // ---- peek_into ----------------------------------------------------------
 
     #[test]
