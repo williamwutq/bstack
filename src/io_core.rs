@@ -342,6 +342,14 @@ pub(crate) enum WipAux {
     /// `[wip_ptr, wip_ptr + tail_len)`. Armed by `set`, `swap`/`cas`, `copy`, and
     /// `cross_exchange` (whose commit is a `wip_ptr` flip between two `Set` arms).
     Set = 0,
+    /// Length-growing tail splice (`clen' > clen`): the tail holds the new bytes.
+    /// `wip_ptr` is the splice point `a`; the staged bytes are replayed into
+    /// `[a, clen')` and the new length is derived from the file size. See
+    /// [`journaled_splice`].
+    SpliceGrow = u64::MAX - 1,
+    /// Length-shrinking tail splice (`clen' < clen`): the shrink counterpart of
+    /// [`SpliceGrow`](WipAux::SpliceGrow).
+    SpliceShrink = u64::MAX - 2,
     /// Repeat-fill: the tail holds `[k: u64 LE | s]`; recovery writes `k` copies
     /// of `s` into `[wip_ptr, wip_ptr + k*s.len())`.
     Repeat = u64::MAX - 3,
@@ -361,6 +369,8 @@ impl TryFrom<u64> for WipAux {
     fn try_from(value: u64) -> Result<Self, Self::Error> {
         match value {
             v if v == WipAux::Set as u64 => Ok(WipAux::Set),
+            v if v == WipAux::SpliceGrow as u64 => Ok(WipAux::SpliceGrow),
+            v if v == WipAux::SpliceShrink as u64 => Ok(WipAux::SpliceShrink),
             v if v == WipAux::Repeat as u64 => Ok(WipAux::Repeat),
             _ => Err(()),
         }
@@ -381,29 +391,58 @@ pub(crate) fn write_wip(file: &mut File, wip_ptr: u64, wip_aux: WipAux) -> io::R
     file.write_all(&buf)
 }
 
+/// Atomically commit a new committed length **and** disarm the journal in a
+/// single 24-byte header write: `clen` at offset 8, `wip_ptr`/`wip_aux` at 16/24.
+///
+/// All three fields lie within the first 32 bytes (one aligned block), so the new
+/// length and the disarm land together — recovery never sees `clen` updated while
+/// `wip` is still armed (which would break the splice length derivation). Used to
+/// commit a splice and, uniformly, to finalize every recovery. Does not touch the
+/// in-memory cache; the caller updates it.
+pub(crate) fn write_header_commit(
+    file: &mut File,
+    clen: u64,
+    wip_ptr: u64,
+    wip_aux: WipAux,
+) -> io::Result<()> {
+    let mut buf = [0u8; 24];
+    buf[0..8].copy_from_slice(&clen.to_le_bytes());
+    buf[8..16].copy_from_slice(&wip_ptr.to_le_bytes());
+    buf[16..24].copy_from_slice(&u64::from(wip_aux).to_le_bytes());
+    file.seek(SeekFrom::Start(8))?;
+    file.write_all(&buf)
+}
+
 /// Recover an armed in-place journal (`wip_ptr != 0`) found on open, restoring
-/// the at-rest invariant `file_size == HEADER_SIZE + committed_len`.
+/// the at-rest invariant `file_size == HEADER_SIZE + clen`. Returns the committed
+/// length after recovery (unchanged except by a splice).
 ///
-/// [`WipAux::Set`] replays the staged tail `[HEADER_SIZE + committed_len,
-/// raw_size)` — the exact new bytes — into `[wip_ptr, wip_ptr + n)`. [`WipAux::Repeat`]
-/// reads `[k | s]` from that tail and writes `k` copies of `s` into `[wip_ptr,
-/// wip_ptr + k*s.len())`. Both replays are idempotent (the tail is immutable and
-/// disjoint from the target). Any other `wip_aux` is a mode this build does not
-/// interpret and is rolled back to the committed length (the forward-compatibility
-/// default). Either way the journal is disarmed and the staged tail dropped;
-/// `committed_len` is unchanged.
+/// - [`WipAux::Set`] replays the staged tail `[HEADER_SIZE + committed_len,
+///   raw_size)` — the exact new bytes — into `[wip_ptr, wip_ptr + n)`.
+/// - [`WipAux::Repeat`] reads `[k | s]` from that tail and writes `k` copies of
+///   `s` into `[wip_ptr, wip_ptr + k*s.len())`.
+/// - [`WipAux::SpliceGrow`]/[`WipAux::SpliceShrink`] replay the staged new tail
+///   into `[a, clen')`, deriving `clen'` from the file size and direction, and
+///   commit the new length.
 ///
-/// Not feature-gated: a file armed by a `set`-enabled build must still recover
-/// correctly when reopened by a build without the feature.
+/// Every replay is idempotent (the staged bytes are immutable and disjoint from
+/// their target), so a crash during recovery is safe to re-run. Any unrecognized
+/// `wip_aux`, or an inconsistent splice header, rolls back to `committed_len`.
+/// The finalize (commit length + disarm, then truncate) is uniform across modes.
+///
+/// Not feature-gated: a file armed by a feature-enabled build must still recover
+/// correctly when reopened by a build without that feature.
 pub(crate) fn recover_wip(
     file: &mut File,
     committed_len: u64,
     wip_ptr: u64,
     wip_aux: u64,
     raw_size: u64,
-) -> io::Result<()> {
+) -> io::Result<u64> {
     let tail_start = HEADER_SIZE + committed_len;
     let tail_len = raw_size.saturating_sub(tail_start);
+    // Committed length after recovery; only a splice changes it.
+    let mut final_clen = committed_len;
     match WipAux::try_from(wip_aux) {
         Ok(WipAux::Set) => {
             // Replay the tail verbatim into the target, if the tail is present and
@@ -436,14 +475,56 @@ pub(crate) fn recover_wip(
                 }
             }
         }
+        Ok(dir @ (WipAux::SpliceGrow | WipAux::SpliceShrink)) => {
+            // The staged new tail sits at `[s, s+m)` where `s = max(clen, clen')`;
+            // replay it into `[a, clen')`. `clen'` is derived from the armed file
+            // size (`payload_end = S + m`) and the direction. Roll back on any
+            // inconsistency (a corrupt or truncated header).
+            let grow = matches!(dir, WipAux::SpliceGrow);
+            if wip_ptr >= HEADER_SIZE {
+                let a = wip_ptr - HEADER_SIZE;
+                let payload_end = raw_size - HEADER_SIZE;
+                let clen_new = if grow {
+                    // payload_end == 2*clen' - a
+                    payload_end.checked_add(a).map(|x| x / 2)
+                } else {
+                    // payload_end == clen + (clen' - a)
+                    payload_end
+                        .checked_add(a)
+                        .and_then(|x| x.checked_sub(committed_len))
+                };
+                if let Some(clen_new) = clen_new {
+                    let s = committed_len.max(clen_new);
+                    let m = clen_new.saturating_sub(a);
+                    let dir_ok = if grow {
+                        clen_new > committed_len
+                    } else {
+                        clen_new < committed_len
+                    };
+                    // `s + m == payload_end` also rejects the odd-sum grow case
+                    // that integer division would otherwise round.
+                    if a <= committed_len
+                        && clen_new >= a
+                        && dir_ok
+                        && s.saturating_add(m) == payload_end
+                    {
+                        move_chunked(file, s, a, m)?;
+                        durable_sync(file)?;
+                        final_clen = clen_new;
+                    }
+                }
+            }
+        }
         // Unknown mode: roll back to the committed length (no replay).
         Err(()) => {}
     }
-    // Disarm, then drop the staged tail.
-    write_wip(file, 0, WipAux::Set)?;
+    // Atomically commit the (possibly new) length and disarm, then drop any bytes
+    // beyond it — restoring `file_size == HEADER_SIZE + final_clen`.
+    write_header_commit(file, final_clen, 0, WipAux::Set)?;
     durable_sync(file)?;
-    file.set_len(tail_start)?;
-    durable_sync(file)
+    file.set_len(HEADER_SIZE + final_clen)?;
+    durable_sync(file)?;
+    Ok(final_clen)
 }
 
 // ------------------------------------------ Set ------------------------------------------
@@ -459,7 +540,7 @@ pub(crate) fn recover_wip(
 /// The four-barrier protocol (stage → arm → commit → disarm) guarantees a crash
 /// leaves either the old bytes or the new bytes, never a mix — see the
 /// same-length `set` algorithm in `PLANNED.md`.
-#[cfg(feature = "set")]
+#[cfg(any(feature = "set", feature = "atomic"))]
 pub(crate) fn journaled_set(
     file: &mut File,
     data_size: u64,
@@ -490,7 +571,7 @@ pub(crate) fn journaled_set(
 /// current payload length. See *Choosing a write strategy* in `PLANNED.md`.
 ///
 /// Callers must have already validated the range and the locked region.
-#[cfg(feature = "set")]
+#[cfg(any(feature = "set", feature = "atomic"))]
 #[inline]
 pub(crate) fn set_in_place(
     file: &mut File,
@@ -550,7 +631,6 @@ pub(crate) fn journaled_repeat(
 /// `k*s.len()`, every chunk boundary lands on a copy boundary, so the pattern
 /// stays aligned even on the final short write. Used both by the live repeat-fill
 /// and by recovery. Not feature-gated (recovery needs it).
-#[cfg(feature = "set")]
 pub(crate) fn write_repeated(file: &mut File, phys: u64, s: &[u8], k: u64) -> io::Result<()> {
     let unit = s.len() as u64;
     if unit == 0 || k == 0 {
@@ -716,15 +796,68 @@ pub(crate) fn commit_shrink(file: &mut File, clen: &mut u64, new_len: u64) -> io
     durable_sync(file)
 }
 
-/// Commit a tail replacement: the payload from `new_tail_start` onward is
-/// replaced by `buf`, changing the payload length to `new_tail_start +
-/// buf.len()`. `n` is the number of bytes removed from the old tail; `file_end`
-/// is the pre-operation raw file size, used for rollback on the net-extension
-/// path.
+/// Crash-atomically replace the last `n_old` payload bytes — the tail slice
+/// `[*clen − n_old, *clen)` — with `dn` (`dn.len() != n_old`), via the splice
+/// journal. Updates `clen` (the cache) to `clen' = *clen − n_old + dn.len()`.
 ///
-/// The write ordering is chosen from the net size change to maximise crash
-/// safety (see *Durability* in the crate docs). Shared by `atrunc`, `splice`,
-/// `splice_into`, and `replace`.
+/// This overwrites committed bytes in place, so — unlike a pure append or
+/// truncation — it needs the journal to avoid a torn commit. The file grows during
+/// the operation to hold `dn` staged past the payload; recovery derives `clen'`
+/// from the file size and rolls a crash forward (see [`recover_wip`]). Memory is
+/// O(1) beyond `dn`. Callers guarantee `0 < n_old <= *clen`, `dn` non-empty, and
+/// `dn.len() != n_old`.
+#[cfg(feature = "atomic")]
+pub(crate) fn journaled_splice(
+    file: &mut File,
+    clen: &mut u64,
+    n_old: u64,
+    dn: &[u8],
+) -> io::Result<()> {
+    let old_clen = *clen;
+    let a = old_clen - n_old; // splice point (tail slice start)
+    let m = dn.len() as u64;
+    let clen_new = a + m; // = old_clen - n_old + m
+    let s = old_clen.max(clen_new); // staging base, past the live end and clen'
+
+    // 1. Stage `dn` at [s, s+m), disjoint from the live payload and the target.
+    file.set_len(HEADER_SIZE + s + m)?;
+    write_at(file, s, dn)?;
+    durable_sync(file)?;
+    // 2. Arm with the direction; recovery derives `clen'` from the file size.
+    let dir = if m > n_old {
+        WipAux::SpliceGrow
+    } else {
+        WipAux::SpliceShrink
+    };
+    write_wip(file, HEADER_SIZE + a, dir)?;
+    durable_sync(file)?;
+    // 3. Replay `dn` into the target [a, clen'). Disjoint → idempotent.
+    move_chunked(file, s, a, m)?;
+    durable_sync(file)?;
+    // 4. Commit the new length while disarming, in one atomic header write.
+    write_header_commit(file, clen_new, 0, WipAux::Set)?;
+    *clen = clen_new;
+    durable_sync(file)?;
+    // 5. Drop the staged bytes, restoring `file_size == HEADER_SIZE + clen'`.
+    file.set_len(HEADER_SIZE + clen_new)
+}
+
+/// Commit a tail replacement: replace the last `n` payload bytes with `buf`,
+/// changing the length to `*clen − n + buf.len()`. `new_tail_start` is the splice
+/// point `a == *clen − n`; `file_end` is the pre-op raw file size (rollback anchor
+/// for the append path).
+///
+/// Dispatches by shape to the cheapest crash-atomic path (see *Choosing a write
+/// strategy* in `PLANNED.md`):
+/// - `buf` empty → pure truncation (drop the tail, commit `clen`);
+/// - `n == 0` → pure append (bytes land beyond `clen`) — no journal, since no
+///   committed bytes are overwritten;
+/// - `buf.len() == n` → same-length tail overwrite via the `Set` journal
+///   ([`set_in_place`]);
+/// - otherwise → length-changing tail replace via the splice journal
+///   ([`journaled_splice`]).
+///
+/// Shared by `atrunc`, `splice`, `splice_into`, and `replace`.
 #[cfg(feature = "atomic")]
 pub(crate) fn commit_tail_replace(
     file: &mut File,
@@ -734,13 +867,17 @@ pub(crate) fn commit_tail_replace(
     buf: &[u8],
     file_end: u64,
 ) -> io::Result<()> {
-    let buf_len = buf.len() as u64;
-    let final_data_len = new_tail_start + buf_len;
-    if buf_len > n {
-        // Net extension: extend first so data is never lost, then write buf,
-        // sync the data, then commit the new length.
+    let m = buf.len() as u64;
+    let a = new_tail_start; // == *clen - n
+    if m == 0 {
+        // Pure truncation (or a no-op when n == 0): no committed bytes overwritten.
+        commit_shrink(file, clen, a)
+    } else if n == 0 {
+        // Pure append: `buf` lands beyond the committed end, uncommitted until the
+        // `clen` write, so a crash rolls back by truncation.
+        let final_data_len = a + m;
         file.set_len(HEADER_SIZE + final_data_len)?;
-        if let Err(e) = write_at(file, new_tail_start, buf) {
+        if let Err(e) = write_at(file, a, buf) {
             let _ = file.set_len(file_end);
             return Err(e);
         }
@@ -749,21 +886,13 @@ pub(crate) fn commit_tail_replace(
             return Err(e);
         }
         write_committed_len(file, clen, final_data_len)?;
-        durable_sync(file)?;
+        durable_sync(file)
+    } else if m == n {
+        // Same-length overwrite of the tail: no length change, so the `Set`
+        // journal (or a single-block atomic write) suffices.
+        set_in_place(file, *clen, a, buf)
     } else {
-        // Net truncation or same size: write buf into the old tail first,
-        // truncate, sync, then commit the new length.
-        if !buf.is_empty() {
-            write_at(file, new_tail_start, buf)?;
-        }
-        file.set_len(HEADER_SIZE + final_data_len)?;
-        // The truncation is the commit point (recovery adopts the smaller file
-        // size), so update the cache now — before the sync and header write,
-        // which `?` could skip on error.
-        *clen = final_data_len;
-        durable_sync(file)?;
-        write_committed_len(file, clen, final_data_len)?;
-        durable_sync(file)?;
+        // Length-changing tail replace: journal it.
+        journaled_splice(file, clen, n, buf)
     }
-    Ok(())
 }

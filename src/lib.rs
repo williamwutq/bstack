@@ -769,9 +769,9 @@ impl BStack {
             clen = committed_len;
             if wip_ptr != 0 {
                 // An in-place write was in flight. Replay or roll it back, then
-                // restore the at-rest invariant. (`committed_len` is unchanged by
-                // the same-length modes implemented so far.)
-                recover_wip(&mut file, committed_len, wip_ptr, wip_aux, raw_size)?;
+                // restore the at-rest invariant. A splice changes the committed
+                // length, so adopt whatever recovery commits.
+                clen = recover_wip(&mut file, committed_len, wip_ptr, wip_aux, raw_size)?;
             } else {
                 // No journal armed: reconcile the committed length against the
                 // file size, using whichever is smaller (the committed value is
