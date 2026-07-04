@@ -42,6 +42,7 @@ const HEADER_SIZE: u64 = 32;
 /// byte is block-aligned, a write confined to one 256 B-aligned region is always
 /// contained within a single hardware block. See *Derived atomicity beyond 8 B*
 /// in `PLANNED.md`.
+#[cfg(any(feature = "set", feature = "atomic"))]
 pub(crate) const ATOMIC_BLOCK: u64 = 256;
 
 /// Upper bound on the streaming buffer for on-disk moves and repeat-fills, in
@@ -256,6 +257,7 @@ pub(crate) fn lock_file_exclusive(file: &File) -> io::Result<()> {
 /// strategy* in `PLANNED.md`). It is conservative: a write it rejects may still
 /// be atomic on hardware with a larger true block size, but a write it accepts
 /// is atomic on all supported storage.
+#[cfg(any(feature = "set", feature = "atomic"))]
 pub(crate) fn is_atomic_write(offset: u64, len: u64) -> bool {
     if len == 0 {
         return true;
@@ -383,6 +385,7 @@ impl TryFrom<u64> for WipAux {
 /// Both fields lie within the first 32 bytes (one aligned block), so the write
 /// is atomic at the storage level: recovery never observes `wip_ptr` and
 /// `wip_aux` out of step. `wip_ptr == 0` is the disarmed (steady) state.
+#[cfg(any(feature = "set", feature = "atomic"))]
 pub(crate) fn write_wip(file: &mut File, wip_ptr: u64, wip_aux: WipAux) -> io::Result<()> {
     let mut buf = [0u8; 16];
     buf[0..8].copy_from_slice(&wip_ptr.to_le_bytes());
