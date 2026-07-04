@@ -51,9 +51,11 @@
 //!   `wip_ptr` is the physical offset an interrupted in-place write must be
 //!   replayed into (`0` in the steady state); `wip_aux` names the journal mode
 //!   (`Set` — verbatim replay of the staged tail; `Repeat` — repeat a staged
-//!   pattern; `SpliceGrow`/`SpliceShrink` — a length-changing tail replace, whose
-//!   new committed length recovery derives from the file size and the recorded
-//!   direction). Recovery interprets them on [`open`](BStack::open) — see *Crash
+//!   pattern; `Copy` — replay a disjoint copy from its still-intact source, of
+//!   which only the coordinate is staged; `SpliceGrow`/`SpliceShrink` — a
+//!   length-changing tail replace, whose new committed length recovery derives
+//!   from the file size and the recorded direction). Recovery interprets them on
+//!   [`open`](BStack::open) — see *Crash
 //!   recovery*. Legacy 0.1.x files (16-byte header) are upgraded in place by
 //!   [`BStack::migrate`].
 //!
@@ -70,6 +72,7 @@
 //! |-----------|-------|----------|
 //! | `wip_ptr != 0`, `wip_aux = Set` | an in-place `set`/`swap`/`cas`/`copy`/`cross_exchange` crashed mid-commit | replay the staged tail verbatim into `[wip_ptr, …)`, disarm, truncate to `32 + clen` |
 //! | `wip_ptr != 0`, `wip_aux = Repeat` | a `zero`/`repeat` crashed mid-fill | write `count` copies of the staged pattern into `[wip_ptr, …)`, disarm, truncate |
+//! | `wip_ptr != 0`, `wip_aux = Copy` | a disjoint `copy` crashed mid-copy | replay `move_chunked(src → wip_ptr)` from the untouched source (the tail stages only `[src \| n]`), disarm, truncate |
 //! | `wip_ptr != 0`, `wip_aux = SpliceGrow`/`SpliceShrink` | a length-changing `atrunc`/`splice`/`splice_into`/`replace` crashed mid-replace | derive `clen'` from the file size and direction, replay the staged new tail into `[wip_ptr, …)`, commit `clen'` while disarming, truncate |
 //! | `wip_ptr != 0`, `wip_aux` unrecognized | a mode armed by a newer build | roll back: disarm, truncate to `32 + clen` |
 //! | `wip_ptr == 0`, `file_size − 32 > clen` | partial tail write (push, or a crashed journal stage) before the header update | truncate to `32 + clen` |
@@ -122,7 +125,7 @@
 //! | `process_gen` *(features: set+atomic)* | closure-driven reads, ending in at most one mutating step: `Write` *commits*; `Swap` uses the exchange journal (as `cross_exchange`); `Push`/`Pop`/`Discard` behave as their standalone forms |
 //! | `replace` *(feature: atomic)* | `lseek(tail)` → `read(n)` → *(callback)* → *(then as `atrunc`)* |
 //! | `cross_exchange` *(features: set+atomic)* | `read(a)`, `read(b)` → exchange journal: stage `a` → arm at `a` → write `b`→`a` → flip `wip_ptr` to `b` → write `a`→`b` → disarm → `ftruncate` (a `durable_sync` at each barrier) |
-//! | `copy` *(features: set+atomic)* | `read(from)` → *commit* to `to` (streamed source→tail→dest on the journaled path) |
+//! | `copy` *(features: set+atomic)* | same-location → no-op; single-block dest → *commit*; overlapping → stream source→tail→dest (`Set` journal); disjoint → **copy journal** (stage only `[src \| n]` → arm `Copy` → stream source→dest → disarm; recovery replays from the untouched source) |
 //! | `eq_crds`, `ne_crds` *(features: set+atomic)* | `read(a)` → compare — conditional *commit* of `b_buf` |
 //! | `masked_eq_crds`, `masked_ne_crds` *(features: set+atomic)* | `read(a)` → mask+compare — conditional *commit* of `b_buf` |
 //! | `peek`, `peek_into`, `get`, `get_into`, `get_batched`, `get_batched_into`, `get_batched_gen` | `pread(2)` on Unix; `ReadFile`+`OVERLAPPED` on Windows; `lseek` → `read` elsewhere (no sync — read-only) |

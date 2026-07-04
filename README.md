@@ -552,9 +552,9 @@ A fixed 32-byte header precedes the payload:
 * **`wip_ptr` / `wip_aux`** — the write-in-progress journal that makes in-place
   mutations crash-atomic.  `wip_ptr` is the physical offset a crashed in-place
   write is replayed into (`0` when idle); `wip_aux` names the mode (verbatim
-  replay, repeated pattern, or a length-changing tail replace whose new committed
-  length recovery derives from the file size and direction).  Interpreted by
-  recovery on `open`.
+  replay, repeated pattern, a disjoint copy replayed from its still-intact source,
+  or a length-changing tail replace whose new committed length recovery derives
+  from the file size and direction).  Interpreted by recovery on `open`.
 
 All user-visible offsets (returned by `push`, accepted by `peek`/`get`) are
 **logical** — 0-based from the start of the payload region (file byte 32).
@@ -598,7 +598,7 @@ before it is read/compare/callback work under the lock.
 | `process_gen` *(set+atomic)*           | closure-driven reads (and `Len` queries), ending in at most one mutating step — `Write` *commits*; `Swap` uses the exchange journal (as `cross_exchange`); `Push`/`Pop`/`Discard` behave as their standalone forms |
 | `replace` *(atomic)*                   | `lseek(tail)` → `read(n)` → *(callback)* → *(then as `atrunc`)*                           |
 | `cross_exchange` *(set+atomic)*        | `read(a)`, `read(b)` → exchange journal: stage `a` → arm at `a` → write `b`→`a` → flip `wip_ptr` to `b` → write `a`→`b` → disarm → `ftruncate` (sync at each barrier) |
-| `copy` *(set+atomic)*                  | `read(from)` → *commit* to `to` (streamed source→tail→dest on the journaled path)          |
+| `copy` *(set+atomic)*                  | same-location → no-op; single-block dest → *commit*; overlapping → stream source→tail→dest (`Set` journal); disjoint → copy journal (stage only `[src \| n]`, arm `Copy`, stream source→dest; recovery replays from the untouched source) |
 | `eq_crds`, `ne_crds` *(set+atomic)*    | `read(a)` → compare → conditional *commit* of `b_buf`                                      |
 | `masked_eq_crds`, `masked_ne_crds` *(set+atomic)* | `read(a)` → mask+compare → conditional *commit* of `b_buf`                     |
 | `peek`, `peek_into`, `get`, `get_into`, `get_batched`, `get_batched_into`, `get_batched_gen` | `pread(2)` on Unix; `ReadFile`+`OVERLAPPED` on Windows; `lseek` → `read` elsewhere |
@@ -629,6 +629,7 @@ size:
 |------------------------------------------------|--------------------------------------------------------------|--------------------------------------------------------------|
 | `wip_ptr != 0`, `wip_aux = Set`                | in-place `set`/`swap`/`cas`/`copy`/`cross_exchange` crashed mid-commit | replay the staged tail into `[wip_ptr, …)`, disarm, truncate |
 | `wip_ptr != 0`, `wip_aux = Repeat`             | `zero`/`repeat` crashed mid-fill                             | write `count` copies of the staged pattern, disarm, truncate |
+| `wip_ptr != 0`, `wip_aux = Copy`               | disjoint `copy` crashed mid-copy                            | replay `move_chunked(src → wip_ptr)` from the untouched source (tail stages only `[src \| n]`), disarm, truncate |
 | `wip_ptr != 0`, `wip_aux = SpliceGrow`/`SpliceShrink` | length-changing `atrunc`/`splice`/`splice_into`/`replace` crashed mid-replace | derive `clen'` from the file size and direction, replay the staged new tail, commit `clen'` while disarming, truncate |
 | `wip_ptr != 0`, `wip_aux` unrecognized         | mode armed by a newer build                                 | roll back: disarm, truncate to `32 + clen`                   |
 | `wip_ptr == 0`, `file_size − 32 > clen`        | partial tail write (crashed before header update)           | truncate to `32 + clen`, durable-sync                        |

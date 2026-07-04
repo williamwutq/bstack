@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`BStack::copy` (`set` + `atomic`) — disjoint copies journal in O(1) instead of O(n).** A copy whose source and destination do not overlap now uses a dedicated copy journal (`wip_aux = Copy`) that stages only the source coordinate `[src | n]` (16 bytes) rather than a full backup of the `n` copied bytes: because the disjoint source is untouched during the copy, recovery replays it directly from the still-intact source. Overlapping copies are unchanged (they still route source→tail→dest through the verbatim journal, since a replay must not read clobbered source bytes), a destination within one aligned block still takes the single-block atomic path, and a copy onto its own location is now a no-op. Behaviour and signature are unchanged.
 - **On-disk format version bumped to `0.4.0` (magic `BSTK\x00\x04\x00\x00`).** Incompatible with `0.1.x` files, which `open` now rejects.
 
 ## [0.2.5] - 2026-06-15
