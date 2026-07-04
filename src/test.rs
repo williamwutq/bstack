@@ -23,35 +23,35 @@ mod tests {
 
     #[test]
     fn is_atomic_write_block_confinement() {
-        use crate::{ATOMIC_BLOCK, is_atomic_write};
+        use crate::{io_core::ATOMIC_BLOCK, is_atomic_write};
         let b = ATOMIC_BLOCK;
         // `boundary` is the logical offset whose physical position is exactly the
         // start of the second block (`HEADER_SIZE + boundary == ATOMIC_BLOCK`).
         let boundary = b - HEADER_SIZE;
 
         // An empty write touches no bytes and never tears.
-        assert!(is_atomic_write(0, &[]));
-        assert!(is_atomic_write(u64::MAX, &[]));
+        assert!(is_atomic_write(0, 0));
+        assert!(is_atomic_write(u64::MAX, 0));
 
         // Filling the remainder of the first block is atomic; one more byte
         // spills into the next block.
-        assert!(is_atomic_write(0, &vec![0u8; boundary as usize]));
-        assert!(!is_atomic_write(0, &vec![0u8; boundary as usize + 1]));
+        assert!(is_atomic_write(0, boundary));
+        assert!(!is_atomic_write(0, boundary + 1));
 
         // A single byte on either side of a block boundary is atomic; two bytes
         // straddling it are not.
-        assert!(is_atomic_write(boundary - 1, &[0u8]));
-        assert!(is_atomic_write(boundary, &[0u8]));
-        assert!(!is_atomic_write(boundary - 1, &[0u8; 2]));
+        assert!(is_atomic_write(boundary - 1, 1));
+        assert!(is_atomic_write(boundary, 1));
+        assert!(!is_atomic_write(boundary - 1, 2));
 
         // A block-aligned write of exactly one block is atomic; one byte over is
         // not.
-        assert!(is_atomic_write(boundary, &vec![0u8; b as usize]));
-        assert!(!is_atomic_write(boundary, &vec![0u8; b as usize + 1]));
+        assert!(is_atomic_write(boundary, b));
+        assert!(!is_atomic_write(boundary, b + 1));
 
         // An offset that overflows `u64` once the header is added cannot be
         // confined to a block.
-        assert!(!is_atomic_write(u64::MAX, &[0u8]));
+        assert!(!is_atomic_write(u64::MAX, 1));
     }
 
     // -------------------------------------------------------------------------

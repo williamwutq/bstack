@@ -42,7 +42,7 @@ const HEADER_SIZE: u64 = 32;
 /// byte is block-aligned, a write confined to one 256 B-aligned region is always
 /// contained within a single hardware block. See *Derived atomicity beyond 8 B*
 /// in `PLANNED.md`.
-const ATOMIC_BLOCK: u64 = 256;
+pub(crate) const ATOMIC_BLOCK: u64 = 256;
 
 /// Upper bound on the streaming buffer for on-disk moves and repeat-fills, in
 /// bytes. Each iteration copies at most this many bytes, so a relocation or fill
