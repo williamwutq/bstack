@@ -33,8 +33,8 @@
 //!   ─────      ─────
 //!    0 ..  8   magic[8]
 //!    8 .. 16   clen      — committed payload length (u64 LE)
-//!   16 .. 24   wip_ptr   — reserved for the write-in-progress journal (u64 LE)
-//!   24 .. 32   wip_aux   — reserved for the write-in-progress journal (u64 LE)
+//!   16 .. 24   wip_ptr   — write-in-progress journal target (u64 LE; 0 when idle)
+//!   24 .. 32   wip_aux   — write-in-progress journal mode (u64 LE)
 //!   32 ..      payload   — push 0, push 1, … concatenated
 //! ```
 //!
@@ -46,10 +46,13 @@
 //!   It is updated atomically with each [`push`](BStack::push) or
 //!   [`pop`](BStack::pop) and is used for crash recovery on the next
 //!   [`open`](BStack::open).
-//! * **`wip_ptr` / `wip_aux`** — two little-endian `u64` fields reserved for the
-//!   write-in-progress journal (crash-atomic `set`/splice/…, see `PLANNED.md`).
-//!   Both are currently always zero and are not yet interpreted by recovery.
-//!   Legacy 0.1.x files (16-byte header) can be upgraded in place with
+//! * **`wip_ptr` / `wip_aux`** — two little-endian `u64` fields holding the
+//!   write-in-progress journal that makes in-place mutations crash-atomic.
+//!   `wip_ptr` is the physical offset an interrupted in-place write must be
+//!   replayed into (`0` in the steady state); `wip_aux` names the journal mode
+//!   (`Set` — verbatim replay of the staged tail; `Repeat` — repeat a staged
+//!   pattern). Recovery interprets them on [`open`](BStack::open) — see *Crash
+//!   recovery*. Legacy 0.1.x files (16-byte header) are upgraded in place by
 //!   [`BStack::migrate`].
 //!
 //! All user-visible offsets are **logical** (0-based from the start of the
@@ -57,18 +60,45 @@
 //!
 //! # Crash recovery
 //!
-//! On [`open`](BStack::open), the header's committed length is compared against
-//! the actual file size:
+//! On [`open`](BStack::open), recovery first checks the write-in-progress journal
+//! (`wip_ptr`); if disarmed, it reconciles the committed length against the file
+//! size:
 //!
 //! | Condition | Cause | Recovery |
 //! |-----------|-------|----------|
-//! | `file_size − 16 > clen` | partial tail write (push crashed before header update) | truncate to `16 + clen` |
-//! | `file_size − 16 < clen` | partial truncation (pop crashed before header update) | set `clen = file_size − 16` |
+//! | `wip_ptr != 0`, `wip_aux = Set` | an in-place `set`/`swap`/`cas`/`copy`/`cross_exchange` crashed mid-commit | replay the staged tail verbatim into `[wip_ptr, …)`, disarm, truncate to `32 + clen` |
+//! | `wip_ptr != 0`, `wip_aux = Repeat` | a `zero`/`repeat` crashed mid-fill | write `count` copies of the staged pattern into `[wip_ptr, …)`, disarm, truncate |
+//! | `wip_ptr != 0`, `wip_aux` unrecognized | a mode armed by a newer build | roll back: disarm, truncate to `32 + clen` |
+//! | `wip_ptr == 0`, `file_size − 32 > clen` | partial tail write (push, or a crashed journal stage) before the header update | truncate to `32 + clen` |
+//! | `wip_ptr == 0`, `file_size − 32 < clen` | partial truncation (pop crashed before the header update) | set `clen = file_size − 32` |
 //!
-//! After recovery a `durable_sync` ensures the repaired state is on stable
-//! storage before any caller can observe or modify the file.
+//! Each replay is idempotent — the staged tail is immutable and disjoint from
+//! its target — so a crash during recovery itself is safe to re-run. After
+//! recovery a `durable_sync` ensures the repaired state is on stable storage
+//! before any caller can observe or modify the file.
 //!
 //! # Durability
+//!
+//! **In-place same-length writes** — [`set`](BStack::set), [`zero`](BStack::zero),
+//! [`repeat`](BStack::repeat), [`swap`](BStack::swap),
+//! [`swap_into`](BStack::swap_into), [`cas`](BStack::cas), [`copy`](BStack::copy),
+//! [`cross_exchange`](BStack::cross_exchange), [`process`](BStack::process), and
+//! the `crds` family — leave the payload length unchanged and are each
+//! **crash-atomic**, committing by one of two strategies (recovered on the next
+//! [`open`](BStack::open); see *Crash recovery*):
+//!
+//! * **Aligned-block write** — when the target lies within one power-fail-atomic
+//!   block, a single `write` + `durable_sync` is already all-or-nothing; no
+//!   journal is armed.
+//! * **Write-in-progress journal** — otherwise: stage a backup past `clen` →
+//!   `durable_sync` → arm `wip_ptr` → `durable_sync` → write in place →
+//!   `durable_sync` → clear `wip_ptr` → `durable_sync` → `ftruncate` the backup.
+//!   `zero`/`repeat` stage only `[count | pattern]`; `cross_exchange` stages one
+//!   region and commits at a single atomic `wip_ptr` flip; moves and fills stream
+//!   through a bounded buffer (O(1) memory).
+//!
+//! Below, *commit* denotes whichever of those two strategies applies to the bytes
+//! being written; anything before it is read/compare/callback work under the lock.
 //!
 //! | Operation | Syscall sequence |
 //! |-----------|-----------------|
@@ -76,24 +106,23 @@
 //! | `extend` | `lseek(END)` → `set_len(new_end)` → `lseek(8)` → `write(clen)` → `durable_sync` |
 //! | `pop`, `pop_into` | `lseek` → `read` → `ftruncate` → `lseek(8)` → `write(clen)` → `durable_sync` |
 //! | `discard` | `ftruncate` → `lseek(8)` → `write(clen)` → `durable_sync` |
-//! | `set` *(feature)* | `lseek(offset)` → `write(data)` → `durable_sync` |
-//! | `zero` *(feature)* | `lseek(offset)` → `write(zeros)` → `durable_sync` |
-//! | `repeat` *(feature)* | `lseek(offset)` → repeated `write(pattern)` → `durable_sync` |
+//! | `set` *(feature)* | *commit* `data` |
+//! | `zero`, `repeat` *(feature)* | *commit* the repeated pattern (the journal stages only `[count \| pattern]`) |
 //! | `atrunc` *(feature: atomic, net extension)* | `set_len(new_end)` → `lseek(tail)` → `write(buf)` → `durable_sync` → `lseek(8)` → `write(clen)` → `durable_sync` |
 //! | `atrunc` *(feature: atomic, net truncation)* | `lseek(tail)` → `write(buf)` → `set_len(new_end)` → `durable_sync` → `lseek(8)` → `write(clen)` → `durable_sync` |
 //! | `splice`, `splice_into` *(feature: atomic)* | `lseek(tail)` → `read(n)` → *(then as `atrunc`)* |
 //! | `try_extend` *(feature: atomic)* | `lseek(END)` — conditional `push` sequence if size matches |
 //! | `try_discard` *(feature: atomic)* | `lseek(END)` — conditional `discard` sequence if size matches |
 //! | `try_extend_zeros` *(feature: atomic)* | `lseek(END)` — conditional `extend(n)` sequence if size matches |
-//! | `swap`, `swap_into` *(features: set+atomic)* | `lseek(offset)` → `read` → `lseek(offset)` → `write(buf)` → `durable_sync` |
-//! | `cas` *(features: set+atomic)* | `lseek(offset)` → `read` → compare — conditional `lseek(offset)` → `write(new)` → `durable_sync` |
-//! | `process` *(features: set+atomic)* | `lseek(start)` → `read(end−start)` → *(callback)* → `lseek(start)` → `write(buf)` → `durable_sync` |
-//! | `process_gen` *(features: set+atomic)* | closure-driven: zero or more `lseek`/`pread` reads, ending in at most one mutating step — `lseek` → `write` → `durable_sync` for `Write`, or the two-region read/read/write/write → `durable_sync` of `cross_exchange` for `Swap` |
+//! | `swap`, `swap_into` *(features: set+atomic)* | `read` old bytes → *commit* `buf` |
+//! | `cas` *(features: set+atomic)* | `read` → compare — conditional *commit* of `new` |
+//! | `process` *(features: set+atomic)* | `read(start..end)` → *(callback)* → *commit* the buffer |
+//! | `process_gen` *(features: set+atomic)* | closure-driven reads, ending in at most one mutating step: `Write` *commits*; `Swap` uses the exchange journal (as `cross_exchange`); `Push`/`Pop`/`Discard` behave as their standalone forms |
 //! | `replace` *(feature: atomic)* | `lseek(tail)` → `read(n)` → *(callback)* → *(then as `atrunc`)* |
-//! | `cross_exchange` *(features: set+atomic)* | `lseek(a)` → `read(n)` → `lseek(b)` → `read(n)` → `lseek(a)` → `write` → `lseek(b)` → `write` → `durable_sync` |
-//! | `copy` *(features: set+atomic)* | `lseek(from)` → `read(n)` → `lseek(to)` → `write(n)` → `durable_sync` |
-//! | `eq_crds`, `ne_crds` *(features: set+atomic)* | `lseek(a)` → `read` → compare — conditional `lseek(b)` → `write(b_buf)` → `durable_sync` |
-//! | `masked_eq_crds`, `masked_ne_crds` *(features: set+atomic)* | `lseek(a)` → `read` → mask+compare — conditional `lseek(b)` → `write(b_buf)` → `durable_sync` |
+//! | `cross_exchange` *(features: set+atomic)* | `read(a)`, `read(b)` → exchange journal: stage `a` → arm at `a` → write `b`→`a` → flip `wip_ptr` to `b` → write `a`→`b` → disarm → `ftruncate` (a `durable_sync` at each barrier) |
+//! | `copy` *(features: set+atomic)* | `read(from)` → *commit* to `to` (streamed source→tail→dest on the journaled path) |
+//! | `eq_crds`, `ne_crds` *(features: set+atomic)* | `read(a)` → compare — conditional *commit* of `b_buf` |
+//! | `masked_eq_crds`, `masked_ne_crds` *(features: set+atomic)* | `read(a)` → mask+compare — conditional *commit* of `b_buf` |
 //! | `peek`, `peek_into`, `get`, `get_into`, `get_batched`, `get_batched_into`, `get_batched_gen` | `pread(2)` on Unix; `ReadFile`+`OVERLAPPED` on Windows; `lseek` → `read` elsewhere (no sync — read-only) |
 //!
 //! **`durable_sync` on macOS** issues `fcntl(F_FULLFSYNC)`, which flushes the
@@ -581,9 +610,9 @@ const LEGACY_HEADER_SIZE: u64 = 16;
 /// Bytes occupied by the file header
 /// (magic[8] + committed_len[8] + wip_ptr[8] + wip_aux[8]).
 ///
-/// `wip_ptr`/`wip_aux` are reserved for the write-in-progress journal (see
-/// `PLANNED.md`) and are currently always zero; the header is sized for them now
-/// so the format need not change again when journaling lands.
+/// `wip_ptr`/`wip_aux` hold the write-in-progress journal that makes in-place
+/// mutations crash-atomic (see *Crash recovery* in the crate docs); both are
+/// zero in the steady state.
 const HEADER_SIZE: u64 = 32;
 
 /// Conservative power-fail atomic block size, in bytes.
@@ -658,7 +687,7 @@ fn lock_file_exclusive(file: &File) -> io::Result<()> {
     }
 }
 
-/// Write the 16-byte header into a brand-new (empty) file.
+/// Write the 32-byte header into a brand-new (empty) file.
 fn init_header(file: &mut File) -> io::Result<()> {
     file.seek(SeekFrom::Start(0))?;
     file.write_all(&MAGIC)?;
@@ -721,7 +750,7 @@ impl TryFrom<u64> for WipAux {
 }
 
 /// Overwrite the write-in-progress journal fields — `wip_ptr` at offset 16,
-/// `wip_aux` at offset 24 — in a single 16-byte header write.
+/// `wip_aux` at offset 24 — in a single 16-byte write to the header.
 ///
 /// Both fields lie within the first 32 bytes (one aligned block), so the write
 /// is atomic at the storage level: recovery never observes `wip_ptr` and
@@ -1393,7 +1422,7 @@ pub struct BStack {
 impl BStack {
     /// Open or create a stack file at `path`.
     ///
-    /// On a **new** file the 16-byte header is written and durably synced
+    /// On a **new** file the 32-byte header is written and durably synced
     /// before returning.
     ///
     /// On an **existing** file the header is validated and, if a previous crash
@@ -2883,6 +2912,12 @@ impl BStack {
     /// Only available when both the `set` and `atomic` Cargo features are
     /// enabled.
     ///
+    /// # Crash atomicity
+    ///
+    /// Crash-atomic: after a crash the region holds either its old or its new
+    /// contents, never a mix — the write commits via a single-block atomic write
+    /// or the write-in-progress journal (see the crate-level *Durability* docs).
+    ///
     /// # Errors
     ///
     /// Returns [`io::ErrorKind::InvalidInput`] if `offset + buf.len()`
@@ -2926,6 +2961,10 @@ impl BStack {
     ///
     /// Only available when both the `set` and `atomic` Cargo features are
     /// enabled.
+    ///
+    /// # Crash atomicity
+    ///
+    /// Crash-atomic, on the same terms as [`swap`](Self::swap).
     ///
     /// # Errors
     ///
@@ -2974,6 +3013,12 @@ impl BStack {
     ///
     /// Only available when both the `set` and `atomic` Cargo features are
     /// enabled.
+    ///
+    /// # Crash atomicity
+    ///
+    /// When the exchange is performed it is crash-atomic, on the same terms as
+    /// [`set`](Self::set): after a crash the region holds either `old` or `new`,
+    /// never a mix.
     ///
     /// # Errors
     ///
@@ -3099,14 +3144,22 @@ impl BStack {
 
     /// Copy `n` bytes from `from..from+n` to `to..to+n` under a single write lock.
     ///
-    /// The source is read into a temporary buffer before writing, so overlapping
-    /// regions are handled correctly.  `n = 0` is a valid no-op (bounds are
-    /// still checked).  The file size is never changed.
+    /// Overlapping source and destination are handled correctly: the bytes route
+    /// through the journal's tail region, disjoint from both.  `n = 0` is a valid
+    /// no-op (bounds are still checked).  The file size is never changed.
     ///
     /// # Feature flags
     ///
     /// Only available when both the `set` and `atomic` Cargo features are
     /// enabled.
+    ///
+    /// # Durability & atomicity
+    ///
+    /// Crash-atomic: after a crash the destination holds either its old contents
+    /// or the full copy, never a mix.  A destination within one aligned block
+    /// takes the single-block atomic path; a larger copy streams source→tail→dest
+    /// through the write-in-progress journal in O(1) memory, replayed on the next
+    /// [`open`](Self::open).
     ///
     /// # Errors
     ///
@@ -3173,6 +3226,12 @@ impl BStack {
     ///
     /// Only available when both the `set` and `atomic` Cargo features are
     /// enabled.
+    ///
+    /// # Crash atomicity
+    ///
+    /// Crash-atomic, on the same terms as [`set`](Self::set): after a crash the
+    /// range holds either its pre-callback bytes or the callback's output, never a
+    /// mix. (The callback runs in memory, under the lock, before the commit.)
     ///
     /// # Errors
     ///
@@ -3872,7 +3931,7 @@ impl BStack {
 
 impl BStack {
     /// Return the current **logical** payload size in bytes (excludes the
-    /// 16-byte header).
+    /// 32-byte header).
     ///
     /// Reads the in-memory `clen` cache under the read lock, so it can run
     /// concurrently with other `len` calls but blocks while any write-lock
