@@ -1282,7 +1282,7 @@ complements but does not replace the allocator's own crash-safety guarantees.
 
 A growable byte (`u8`) vector backed by a `BStack` allocation, mirroring the core `Vec<u8>` API.
 
-For a general typed vector over arbitrary `Copy` types, see `PLANNED.md` — the general case requires a sound POD/byte-castable bound and is planned for a future release.
+A general typed vector over arbitrary `Copy` types requires a sound POD/byte-castable bound and is planned for a future release.
 
 ```toml
 [dependencies]

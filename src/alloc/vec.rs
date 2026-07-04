@@ -15,8 +15,8 @@ const HEADER_LEN: u64 = 16;
 /// allocation managed by allocator `A`.  Every mutation issues a durable sync
 /// through the allocator so the contents survive a process crash.
 ///
-/// For a general typed vector (e.g. over `u32`, structs, etc.), see the
-/// `BStackVec<T>` entry in `PLANNED.md`.  A general type parameter requires a
+/// For a general typed vector (e.g. over `u32`, structs, etc.), a general type
+/// parameter requires a
 /// sound POD/byte-castable bound that would add an external dependency; this
 /// type covers the common byte-buffer use case without any additional
 /// requirements on element validity.

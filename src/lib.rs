@@ -579,7 +579,7 @@ use windows_sys::Win32::System::IO::OVERLAPPED;
 /// On-disk **format** version encoded in the magic header. This is independent
 /// of the crate version: it bumps only when the file format changes in a way an
 /// older reader cannot handle. 0.4.0 introduces the 32-byte write-in-progress
-/// journal header (see `PLANNED.md`); bumping the minor here makes older binaries
+/// journal header (see `algos/WIP.md`); bumping the minor here makes older binaries
 /// reject the new files loudly instead of misreading them.
 const FORMAT_MAJOR: u8 = 0;
 const FORMAT_MINOR: u8 = 4;
@@ -2505,7 +2505,7 @@ impl BStack {
         if from == to {
             return Ok(());
         }
-        // Write-strategy hierarchy (see `PLANNED.md`):
+        // Write-strategy hierarchy (see `algos/WIP.md`):
         //  * destination within one aligned block → single-block atomic write
         //    (read the source into a bounded buffer — `n` is at most one block
         //    here — and write it);

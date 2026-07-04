@@ -40,8 +40,8 @@ const HEADER_SIZE: u64 = 32;
 /// controllers that advertise larger blocks yet only guarantee 512 B or 256 B
 /// power-fail atomicity. Because 256 divides those sizes and the file's first
 /// byte is block-aligned, a write confined to one 256 B-aligned region is always
-/// contained within a single hardware block. See *Derived atomicity beyond 8 B*
-/// in `PLANNED.md`.
+/// contained within a single hardware block. See *Derived atomicity* in
+/// `algos/WIP.md`.
 #[cfg(any(feature = "set", feature = "atomic"))]
 pub(crate) const ATOMIC_BLOCK: u64 = 256;
 
@@ -254,7 +254,7 @@ pub(crate) fn lock_file_exclusive(file: &File) -> io::Result<()> {
 ///
 /// This is the gate for skipping the write-in-progress journal on a same-length
 /// `set` whose slice fits within one block (the top rung of *Choosing a write
-/// strategy* in `PLANNED.md`). It is conservative: a write it rejects may still
+/// strategy* in `algos/WIP.md`). It is conservative: a write it rejects may still
 /// be atomic on hardware with a larger true block size, but a write it accepts
 /// is atomic on all supported storage.
 #[cfg(any(feature = "set", feature = "atomic"))]
@@ -577,7 +577,7 @@ pub(crate) fn recover_wip(
 ///
 /// The four-barrier protocol (stage → arm → commit → disarm) guarantees a crash
 /// leaves either the old bytes or the new bytes, never a mix — see the
-/// same-length `set` algorithm in `PLANNED.md`.
+/// Set mode in `algos/WIP.md`.
 #[cfg(any(feature = "set", feature = "atomic"))]
 pub(crate) fn journaled_set(
     file: &mut File,
@@ -606,7 +606,7 @@ pub(crate) fn journaled_set(
 /// with `data`, picking the cheapest crash-safe strategy: a slice confined to a
 /// single aligned block is written atomically at the storage level (one synced
 /// write); anything larger goes through [`journaled_set`]. `data_size` is the
-/// current payload length. See *Choosing a write strategy* in `PLANNED.md`.
+/// current payload length. See *Choosing a write strategy* in `algos/WIP.md`.
 ///
 /// Callers must have already validated the range and the locked region.
 #[cfg(any(feature = "set", feature = "atomic"))]
@@ -925,7 +925,7 @@ pub(crate) fn journaled_splice(
 /// for the append path).
 ///
 /// Dispatches by shape to the cheapest crash-atomic path (see *Choosing a write
-/// strategy* in `PLANNED.md`):
+/// strategy* in `algos/WIP.md`):
 /// - `buf` empty → pure truncation (drop the tail, commit `clen`);
 /// - `n == 0` → pure append (bytes land beyond `clen`) — no journal, since no
 ///   committed bytes are overwritten;
