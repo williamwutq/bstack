@@ -51,7 +51,9 @@
 //!   `wip_ptr` is the physical offset an interrupted in-place write must be
 //!   replayed into (`0` in the steady state); `wip_aux` names the journal mode
 //!   (`Set` — verbatim replay of the staged tail; `Repeat` — repeat a staged
-//!   pattern). Recovery interprets them on [`open`](BStack::open) — see *Crash
+//!   pattern; `SpliceGrow`/`SpliceShrink` — a length-changing tail replace, whose
+//!   new committed length recovery derives from the file size and the recorded
+//!   direction). Recovery interprets them on [`open`](BStack::open) — see *Crash
 //!   recovery*. Legacy 0.1.x files (16-byte header) are upgraded in place by
 //!   [`BStack::migrate`].
 //!
@@ -68,6 +70,7 @@
 //! |-----------|-------|----------|
 //! | `wip_ptr != 0`, `wip_aux = Set` | an in-place `set`/`swap`/`cas`/`copy`/`cross_exchange` crashed mid-commit | replay the staged tail verbatim into `[wip_ptr, …)`, disarm, truncate to `32 + clen` |
 //! | `wip_ptr != 0`, `wip_aux = Repeat` | a `zero`/`repeat` crashed mid-fill | write `count` copies of the staged pattern into `[wip_ptr, …)`, disarm, truncate |
+//! | `wip_ptr != 0`, `wip_aux = SpliceGrow`/`SpliceShrink` | a length-changing `atrunc`/`splice`/`splice_into`/`replace` crashed mid-replace | derive `clen'` from the file size and direction, replay the staged new tail into `[wip_ptr, …)`, commit `clen'` while disarming, truncate |
 //! | `wip_ptr != 0`, `wip_aux` unrecognized | a mode armed by a newer build | roll back: disarm, truncate to `32 + clen` |
 //! | `wip_ptr == 0`, `file_size − 32 > clen` | partial tail write (push, or a crashed journal stage) before the header update | truncate to `32 + clen` |
 //! | `wip_ptr == 0`, `file_size − 32 < clen` | partial truncation (pop crashed before the header update) | set `clen = file_size − 32` |
@@ -108,8 +111,7 @@
 //! | `discard` | `ftruncate` → `lseek(8)` → `write(clen)` → `durable_sync` |
 //! | `set` *(feature)* | *commit* `data` |
 //! | `zero`, `repeat` *(feature)* | *commit* the repeated pattern (the journal stages only `[count \| pattern]`) |
-//! | `atrunc` *(feature: atomic, net extension)* | `set_len(new_end)` → `lseek(tail)` → `write(buf)` → `durable_sync` → `lseek(8)` → `write(clen)` → `durable_sync` |
-//! | `atrunc` *(feature: atomic, net truncation)* | `lseek(tail)` → `write(buf)` → `set_len(new_end)` → `durable_sync` → `lseek(8)` → `write(clen)` → `durable_sync` |
+//! | `atrunc` *(feature: atomic)* | dispatch on the tail-replace shape: pure truncation → `ftruncate` → *commit* `clen`; pure append → `set_len(new_end)` → `write(buf)` → `durable_sync` → *commit* `clen`; same-length → *commit* `buf` in place; length change → **splice journal** (stage the new tail past the payload → arm `SpliceGrow`/`SpliceShrink` → replay into place → atomically commit `clen'` + disarm → truncate, a `durable_sync` at each barrier) |
 //! | `splice`, `splice_into` *(feature: atomic)* | `lseek(tail)` → `read(n)` → *(then as `atrunc`)* |
 //! | `try_extend` *(feature: atomic)* | `lseek(END)` — conditional `push` sequence if size matches |
 //! | `try_discard` *(feature: atomic)* | `lseek(END)` — conditional `discard` sequence if size matches |

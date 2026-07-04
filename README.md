@@ -552,7 +552,9 @@ A fixed 32-byte header precedes the payload:
 * **`wip_ptr` / `wip_aux`** — the write-in-progress journal that makes in-place
   mutations crash-atomic.  `wip_ptr` is the physical offset a crashed in-place
   write is replayed into (`0` when idle); `wip_aux` names the mode (verbatim
-  replay or repeated pattern).  Interpreted by recovery on `open`.
+  replay, repeated pattern, or a length-changing tail replace whose new committed
+  length recovery derives from the file size and direction).  Interpreted by
+  recovery on `open`.
 
 All user-visible offsets (returned by `push`, accepted by `peek`/`get`) are
 **logical** — 0-based from the start of the payload region (file byte 32).
@@ -585,8 +587,7 @@ before it is read/compare/callback work under the lock.
 | `discard`                              | `ftruncate` → `lseek(8)` → `write(clen)` → sync                                           |
 | `set` *(feature)*                      | *commit* `data`                                                                           |
 | `zero`, `repeat` *(feature)*           | *commit* the repeated pattern (the journal stages only `[count \| pattern]`)              |
-| `atrunc` *(atomic, net extension)*     | `set_len(new_end)` → `lseek(tail)` → `write(buf)` → sync → `write(clen)`                  |
-| `atrunc` *(atomic, net truncation)*    | `lseek(tail)` → `write(buf)` → `set_len(new_end)` → sync → `write(clen)`                  |
+| `atrunc` *(atomic)*                    | dispatch on shape: truncation → `ftruncate` → *commit* `clen`; append → `set_len(new_end)` → `write(buf)` → sync → *commit* `clen`; same-length → *commit* `buf` in place; length change → **splice journal** (stage new tail past the payload → arm `SpliceGrow`/`SpliceShrink` → replay into place → atomically commit `clen'` + disarm → truncate, sync at each barrier) |
 | `splice`, `splice_into` *(atomic)*     | `lseek(tail)` → `read(n)` → *(then as `atrunc`)*                                          |
 | `try_extend` *(atomic)*                | size check → conditional `push` sequence                                                  |
 | `try_discard` *(atomic)*               | size check → conditional `discard` sequence                                               |
@@ -628,6 +629,7 @@ size:
 |------------------------------------------------|--------------------------------------------------------------|--------------------------------------------------------------|
 | `wip_ptr != 0`, `wip_aux = Set`                | in-place `set`/`swap`/`cas`/`copy`/`cross_exchange` crashed mid-commit | replay the staged tail into `[wip_ptr, …)`, disarm, truncate |
 | `wip_ptr != 0`, `wip_aux = Repeat`             | `zero`/`repeat` crashed mid-fill                             | write `count` copies of the staged pattern, disarm, truncate |
+| `wip_ptr != 0`, `wip_aux = SpliceGrow`/`SpliceShrink` | length-changing `atrunc`/`splice`/`splice_into`/`replace` crashed mid-replace | derive `clen'` from the file size and direction, replay the staged new tail, commit `clen'` while disarming, truncate |
 | `wip_ptr != 0`, `wip_aux` unrecognized         | mode armed by a newer build                                 | roll back: disarm, truncate to `32 + clen`                   |
 | `wip_ptr == 0`, `file_size − 32 > clen`        | partial tail write (crashed before header update)           | truncate to `32 + clen`, durable-sync                        |
 | `wip_ptr == 0`, `file_size − 32 < clen`        | partial truncation (crashed before header update)           | set `clen = file_size − 32`, durable-sync                    |
