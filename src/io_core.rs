@@ -29,7 +29,10 @@ use windows_sys::Win32::System::IO::OVERLAPPED;
 /// `wip_ptr`/`wip_aux` hold the write-in-progress journal that makes in-place
 /// mutations crash-atomic (see *Crash recovery* in the crate docs); both are
 /// zero in the steady state.
-const HEADER_SIZE: u64 = 32;
+///
+/// Single source of truth for the header size; re-exported into `lib.rs` via
+/// `use io_core::*`.
+pub(crate) const HEADER_SIZE: u64 = 32;
 
 /// Conservative power-fail atomic block size, in bytes.
 ///

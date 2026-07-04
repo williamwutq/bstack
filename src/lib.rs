@@ -610,14 +610,6 @@ const LEGACY_MAGIC_PREFIX: [u8; 6] = [b'B', b'S', b'T', b'K', 0, 1];
 /// Header size of the pre-0.4.0 (0.1.x) format: `magic[8] + committed_len[8]`.
 const LEGACY_HEADER_SIZE: u64 = 16;
 
-/// Bytes occupied by the file header
-/// (magic[8] + committed_len[8] + wip_ptr[8] + wip_aux[8]).
-///
-/// `wip_ptr`/`wip_aux` hold the write-in-progress journal that makes in-place
-/// mutations crash-atomic (see *Crash recovery* in the crate docs); both are
-/// zero in the steady state.
-const HEADER_SIZE: u64 = 32;
-
 /// Compute `base + len`, mapping `u64` overflow to an `InvalidInput` error
 /// carrying `msg`.
 #[cfg(any(feature = "set", feature = "atomic"))]
