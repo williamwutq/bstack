@@ -187,8 +187,9 @@ impl BStack {
 
     /// Run a sequence of dependent reads, optionally followed by a single write, under
     /// one held write lock. `f` is called in a loop and drives the sequence through
-    /// `BStackGenOp::{Read, Len, Write, Swap, Push, Pop, Discard}`; at most one of
-    /// `Write`/`Swap`/`Push`/`Pop`/`Discard` is permitted and ends the sequence.
+    /// `BStackGenOp::{Read, Len, Write, Swap, Push, Pop, Discard, Atrunc, Splice}`; at
+    /// most one of `Write`/`Swap`/`Push`/`Pop`/`Discard`/`Atrunc`/`Splice` is permitted
+    /// and ends the sequence.
     /// Requires the `set` and `atomic` features.
     #[cfg(all(feature = "set", feature = "atomic"))]
     pub fn process_gen<'a, F>(&self, f: F) -> io::Result<()>
@@ -498,7 +499,7 @@ bstack = { version = "0.4", features = ["set", "atomic"] }
 - **`replace(n, f)`** — pop `n` bytes, pass to `f`, push back the returned tail.
 - **`get_batched`**, **`get_batched_into`**, **`get_batched_gen`** — read multiple (possibly dependent) ranges under one read lock.
 - **`swap`**, **`swap_into`**, **`cas`** *(requires `set`)* — atomic read-modify-write / compare-and-swap of a single region.
-- **`process`**, **`process_gen`** *(requires `set`)* — in-place mutation, or a dependent read/write sequence ending in at most one `Write`/`Swap`/`Push`/`Pop`/`Discard`.
+- **`process`**, **`process_gen`** *(requires `set`)* — in-place mutation, or a dependent read/write sequence ending in at most one `Write`/`Swap`/`Push`/`Pop`/`Discard`/`Atrunc`/`Splice`.
 - **`cross_exchange`**, **`copy`** *(requires `set`)* — swap or copy two regions under one write lock.
 - **`eq_crds`**, **`ne_crds`**, **`masked_eq_crds`**, **`masked_ne_crds`** *(requires `set`)* — cross-region compare-and-swap, with `==`/`!=`/masked variants.
 
@@ -595,7 +596,7 @@ before it is read/compare/callback work under the lock.
 | `swap`, `swap_into` *(set+atomic)*     | `read` old bytes → *commit* `buf`                                                         |
 | `cas` *(set+atomic)*                   | `read` → compare → conditional *commit* of `new`                                          |
 | `process` *(set+atomic)*               | `read(start..end)` → *(callback)* → *commit* the buffer                                    |
-| `process_gen` *(set+atomic)*           | closure-driven reads (and `Len` queries), ending in at most one mutating step — `Write` *commits*; `Swap` uses the exchange journal (as `cross_exchange`); `Push`/`Pop`/`Discard` behave as their standalone forms |
+| `process_gen` *(set+atomic)*           | closure-driven reads (and `Len` queries), ending in at most one mutating step — `Write` *commits*; `Swap` uses the exchange journal (as `cross_exchange`); `Push`/`Pop`/`Discard`/`Atrunc`/`Splice` behave as their standalone forms |
 | `replace` *(atomic)*                   | `lseek(tail)` → `read(n)` → *(callback)* → *(then as `atrunc`)*                           |
 | `cross_exchange` *(set+atomic)*        | `read(a)`, `read(b)` → exchange journal: stage `a` → arm at `a` → write `b`→`a` → flip `wip_ptr` to `b` → write `a`→`b` → disarm → `ftruncate` (sync at each barrier) |
 | `copy` *(set+atomic)*                  | same-location → no-op; single-block dest → *commit*; overlapping → stream source→tail→dest (`Set` journal); disjoint → copy journal (stage only `[src \| n]`, arm `Copy`, stream source→dest; recovery replays from the untouched source) |

@@ -122,7 +122,7 @@
 //! | `swap`, `swap_into` *(features: set+atomic)* | `read` old bytes → *commit* `buf` |
 //! | `cas` *(features: set+atomic)* | `read` → compare — conditional *commit* of `new` |
 //! | `process` *(features: set+atomic)* | `read(start..end)` → *(callback)* → *commit* the buffer |
-//! | `process_gen` *(features: set+atomic)* | closure-driven reads, ending in at most one mutating step: `Write` *commits*; `Swap` uses the exchange journal (as `cross_exchange`); `Push`/`Pop`/`Discard` behave as their standalone forms |
+//! | `process_gen` *(features: set+atomic)* | closure-driven reads, ending in at most one mutating step: `Write` *commits*; `Swap` uses the exchange journal (as `cross_exchange`); `Push`/`Pop`/`Discard`/`Atrunc`/`Splice` behave as their standalone forms |
 //! | `replace` *(feature: atomic)* | `lseek(tail)` → `read(n)` → *(callback)* → *(then as `atrunc`)* |
 //! | `cross_exchange` *(features: set+atomic)* | `read(a)`, `read(b)` → exchange journal: stage `a` → arm at `a` → write `b`→`a` → flip `wip_ptr` to `b` → write `a`→`b` → disarm → `ftruncate` (a `durable_sync` at each barrier) |
 //! | `copy` *(features: set+atomic)* | same-location → no-op; single-block dest → *commit*; overlapping → stream source→tail→dest (`Set` journal); disjoint → **copy journal** (stage only `[src \| n]` → arm `Copy` → stream source→dest → disarm; recovery replays from the untouched source) |
@@ -2115,6 +2115,12 @@ impl BStack {
 ///   payload, and ending the sequence.
 /// - `Pop { buf }` — remove the last `buf.len()` bytes from the end of the
 ///   file into `buf`, shrinking the payload, and ending the sequence.
+/// - `Discard { len }` — remove the last `len` bytes without reading them back,
+///   shrinking the payload, and ending the sequence.
+/// - `Atrunc { n, data }` — cut `n` bytes off the tail then append `data`
+///   (no readback), ending the sequence.
+/// - `Splice { old, new }` — pop `old.len()` bytes off the tail into `old` then
+///   append `new`, ending the sequence.
 /// - `Len { out }` — write the current logical payload size into `out`.
 /// - `#[non_exhaustive]` — later versions may add further variants, for
 ///   richer write ownership or multi-write protocols, for instance, without
@@ -2187,6 +2193,36 @@ pub enum BStackGenOp<'a> {
     Discard {
         /// Number of bytes to remove from the end of the file.
         len: u64,
+    },
+    /// Cut `n` bytes off the tail then append `data` as a single operation,
+    /// ending the sequence.
+    ///
+    /// The removed bytes are **not** read back — the in-sequence equivalent of
+    /// [`atrunc`](BStack::atrunc), and the buffer-free counterpart of
+    /// [`Splice`](Self::Splice) (as [`Discard`](Self::Discard) is to
+    /// [`Pop`](Self::Pop)). The net payload change is `data.len() − n`; useful
+    /// for replacing a tail whose size is only known once earlier `Read`s have
+    /// been resolved, without allocating a buffer for the discarded bytes.
+    Atrunc {
+        /// Number of bytes to cut off the tail before appending.
+        n: u64,
+        /// Bytes to append after the cut.
+        data: &'a [u8],
+    },
+    /// Pop `old.len()` bytes off the tail into `old`, then append `new`, ending
+    /// the sequence.
+    ///
+    /// The removed bytes are read into `old` before any mutation — the
+    /// in-sequence equivalent of [`splice_into`](BStack::splice_into), and the
+    /// readback counterpart of [`Atrunc`](Self::Atrunc) (as [`Pop`](Self::Pop)
+    /// is to [`Discard`](Self::Discard)). The net payload change is
+    /// `new.len() − old.len()`.
+    Splice {
+        /// Destination for the removed tail bytes; its length determines how
+        /// many bytes are popped.
+        old: &'a mut [u8],
+        /// Bytes to append after the pop.
+        new: &'a [u8],
     },
     /// Write the current logical payload size, in bytes, into `out`, then
     /// call `f` again — does not end the sequence.
@@ -2622,6 +2658,15 @@ impl BStack {
     ///   the end of the file without reading them back, shrinking the payload,
     ///   and ends the sequence — the in-sequence equivalent of
     ///   [`discard`](Self::discard) and the buffer-free counterpart of `Pop`.
+    /// - `Some(BStackGenOp::Atrunc { n, data })` cuts `n` bytes off the tail
+    ///   then appends `data` (without reading the removed bytes), changing the
+    ///   payload by `data.len() − n`, and ends the sequence — the in-sequence
+    ///   equivalent of [`atrunc`](Self::atrunc) and the buffer-free counterpart
+    ///   of `Splice`.
+    /// - `Some(BStackGenOp::Splice { old, new })` pops `old.len()` bytes off the
+    ///   tail into `old` then appends `new`, changing the payload by
+    ///   `new.len() − old.len()`, and ends the sequence — the in-sequence
+    ///   equivalent of [`splice_into`](Self::splice_into).
     /// - `Some(BStackGenOp::Len { out })` writes the current logical payload
     ///   size into `out` and calls `f` again — the in-sequence equivalent of
     ///   [`len`](Self::len), useful when a later step's offset depends on the
@@ -2630,23 +2675,26 @@ impl BStack {
     ///   reads alone inform a decision, including the decision to change
     ///   nothing.
     ///
-    /// `Write`, `Swap`, `Push`, `Pop`, and `Discard` are the only mutating
-    /// operations, exactly one is permitted per call, and any one of them ends
-    /// the sequence immediately — `f` is not called again afterwards.
+    /// `Write`, `Swap`, `Push`, `Pop`, `Discard`, `Atrunc`, and `Splice` are the
+    /// only mutating operations, exactly one is permitted per call, and any one
+    /// of them ends the sequence immediately — `f` is not called again
+    /// afterwards.
     ///
     /// Holding the write lock across every read and the final mutation means
     /// no other thread can observe or modify any region of the file in
     /// between — the guarantee that [`get_batched_gen`](Self::get_batched_gen)
     /// followed by a separate [`cas`](Self::cas) cannot provide, since the two
     /// separate lock acquisitions leave an ABA window.  The mutated region(s)
-    /// need not overlap any region that was read.  `Push`, `Pop`, and
-    /// `Discard` are the only steps that change the file size.
+    /// need not overlap any region that was read.  `Push`, `Pop`, `Discard`,
+    /// `Atrunc`, and `Splice` are the steps that change the file size.
     ///
     /// Reads of the locked region `[0, locked_len())` are permitted, matching
     /// [`get`](Self::get) — locked bytes are immutable, so observing them
     /// mid-sequence is always safe.  `Write` and `Swap` ranges that touch the
     /// locked region are rejected, matching [`set`](Self::set) and
-    /// [`cross_exchange`](Self::cross_exchange).
+    /// [`cross_exchange`](Self::cross_exchange); an `Atrunc` or `Splice` whose
+    /// cut point falls inside the locked region is likewise rejected, matching
+    /// [`atrunc`](Self::atrunc) and [`splice_into`](Self::splice_into).
     ///
     /// # Feature flags
     ///
@@ -2658,10 +2706,10 @@ impl BStack {
     /// Returns [`io::ErrorKind::InvalidInput`] if any `offset + len` overflows
     /// `u64`, if a read, write, or swap range exceeds the current payload
     /// size, if the two `Swap` regions overlap, if a write or swap range
-    /// overlaps the locked region `[0, locked_len())`, if a `Pop` or `Discard`
-    /// removes more bytes than the current payload size, or if a `Pop` or
-    /// `Discard` would shrink the payload below the locked length.  Propagates
-    /// any I/O error from `read_exact`, `write_all`, `set_len`, or
+    /// overlaps the locked region `[0, locked_len())`, if a `Pop`, `Discard`,
+    /// `Atrunc`, or `Splice` removes more bytes than the current payload size,
+    /// or if it would shrink the payload below (or cut into) the locked length.
+    /// Propagates any I/O error from `read_exact`, `write_all`, `set_len`, or
     /// `durable_sync`.
     #[cfg(all(feature = "set", feature = "atomic"))]
     pub fn process_gen<'a, F>(&self, mut f: F) -> io::Result<()>
@@ -2862,6 +2910,53 @@ impl BStack {
                     }
                     if len > 0 {
                         commit_shrink(file, clen, new_data_len)?;
+                    }
+                    return Ok(());
+                }
+                Some(BStackGenOp::Atrunc { n, data }) => {
+                    if n > data_size {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!(
+                                "process_gen: atrunc n ({n}) exceeds payload size ({data_size})"
+                            ),
+                        ));
+                    }
+                    let new_tail_start = data_size - n;
+                    if new_tail_start < locked {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("process_gen: atrunc would modify locked region [0, {locked})"),
+                        ));
+                    }
+                    if n != 0 || !data.is_empty() {
+                        let file_end = HEADER_SIZE + data_size;
+                        commit_tail_replace(file, clen, new_tail_start, n, data, file_end)?;
+                    }
+                    return Ok(());
+                }
+                Some(BStackGenOp::Splice { old, new }) => {
+                    let n = old.len() as u64;
+                    if n > data_size {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!(
+                                "process_gen: splice n ({n}) exceeds payload size ({data_size})"
+                            ),
+                        ));
+                    }
+                    let new_tail_start = data_size - n;
+                    if new_tail_start < locked {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("process_gen: splice would modify locked region [0, {locked})"),
+                        ));
+                    }
+                    if n != 0 || !new.is_empty() {
+                        // Read the removed bytes before any mutation.
+                        read_at(file, new_tail_start, old)?;
+                        let file_end = HEADER_SIZE + data_size;
+                        commit_tail_replace(file, clen, new_tail_start, n, new, file_end)?;
                     }
                     return Ok(());
                 }

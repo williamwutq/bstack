@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **`BStack::repeat` (`set` feature): crash-atomic in-place repeating fill.** `repeat(offset, pattern, count)` overwrites `[offset, offset + count * pattern.len())` with `count` back-to-back copies of `pattern`. An empty `pattern` or `count == 0` is a no-op. It is the general form of `zero` (which is now `repeat` of the single byte `0x00`), and only the pattern and count are journaled, so a crash-safe fill of a large region uses a fixed-size write-in-progress journal (`8 + pattern.len()` bytes) rather than one proportional to the region.
+- **`BStackGenOp::Atrunc { n, data }` and `BStackGenOp::Splice { old, new }` (`set` + `atomic`): in-sequence tail-replace for `process_gen`.** `Atrunc` cuts `n` bytes off the tail then appends `data` without reading the removed bytes (the in-sequence equivalent of `atrunc`, and the buffer-free counterpart of `Splice`); `Splice` pops `old.len()` bytes off the tail into `old` then appends `new` (the in-sequence equivalent of `splice_into`). Both change the payload length by the difference of the two lengths, both end the `process_gen` sequence like the other mutating variants, and both are crash-atomic through the shared tail-replace commit path (truncate / append / `Set` journal / splice journal). Adds the length-changing tail operations to the set of in-sequence mutations, completing the `Discard`/`Pop` pairing with `Atrunc`/`Splice`. `BStackGenOp` is `#[non_exhaustive]`, so this is not a breaking change.
 
 ### Fixed
 

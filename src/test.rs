@@ -5300,6 +5300,129 @@ mod atomic_tests {
 
     #[cfg(all(feature = "set", feature = "atomic"))]
     #[test]
+    fn process_gen_atrunc_replaces_tail_and_ends_sequence() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        let mut calls = 0usize;
+        s.process_gen(|| {
+            calls += 1;
+            match calls {
+                1 => Some(BStackGenOp::Atrunc {
+                    n: 5,
+                    data: b"THERE!",
+                }),
+                _ => Some(BStackGenOp::Write {
+                    offset: 0,
+                    data: b"NOPE!",
+                }),
+            }
+        })
+        .unwrap();
+        assert_eq!(calls, 1, "Atrunc must end the sequence, like Write");
+        assert_eq!(s.len().unwrap(), 11);
+        assert_eq!(s.peek(0).unwrap(), b"helloTHERE!");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn process_gen_atrunc_zero_empty_is_noop_and_ends_sequence() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        s.process_gen(|| Some(BStackGenOp::Atrunc { n: 0, data: b"" }))
+            .unwrap();
+        assert_eq!(s.len().unwrap(), 5);
+        assert_eq!(s.peek(0).unwrap(), b"hello");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn process_gen_atrunc_exceeds_payload_returns_error() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hi").unwrap();
+        let err = s
+            .process_gen(|| Some(BStackGenOp::Atrunc { n: 5, data: b"x" }))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(s.peek(0).unwrap(), b"hi");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn process_gen_atrunc_below_locked_returns_error() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        s.lock_up_to(8).unwrap();
+        let err = s
+            .process_gen(|| Some(BStackGenOp::Atrunc { n: 5, data: b"x" }))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(s.len().unwrap(), 10);
+        assert_eq!(s.peek(0).unwrap(), b"helloworld");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn process_gen_splice_reads_tail_and_replaces_and_ends_sequence() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        let mut old = [0u8; 5];
+        let mut calls = 0usize;
+        s.process_gen(|| {
+            calls += 1;
+            match calls {
+                // SAFETY: `old` outlives this whole `process_gen` call.
+                1 => Some(BStackGenOp::Splice {
+                    old: unsafe { core::mem::transmute::<&mut [u8], _>(&mut old[..]) },
+                    new: b"THERE!",
+                }),
+                _ => Some(BStackGenOp::Write {
+                    offset: 0,
+                    data: b"NOPE!",
+                }),
+            }
+        })
+        .unwrap();
+        assert_eq!(calls, 1, "Splice must end the sequence, like Pop");
+        assert_eq!(&old, b"world", "removed tail read back into `old`");
+        assert_eq!(s.len().unwrap(), 11);
+        assert_eq!(s.peek(0).unwrap(), b"helloTHERE!");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn process_gen_splice_below_locked_returns_error() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        s.lock_up_to(8).unwrap();
+        let mut old = [0u8; 5];
+        let err = s
+            .process_gen(|| {
+                // SAFETY: `old` outlives this whole `process_gen` call.
+                Some(BStackGenOp::Splice {
+                    old: unsafe { core::mem::transmute::<&mut [u8], _>(&mut old[..]) },
+                    new: b"x",
+                })
+            })
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(s.len().unwrap(), 10);
+        assert_eq!(s.peek(0).unwrap(), b"helloworld");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
     fn process_gen_len_informs_discard_size() {
         use crate::BStackGenOp;
         // Discard a trailing region whose length is only known once `Len` has
