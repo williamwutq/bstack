@@ -892,6 +892,49 @@ mod tests {
     }
 
     #[test]
+    fn recovery_replays_armed_copy() {
+        use crate::WipAux;
+        // Craft a crashed disjoint copy: header armed COPY with wip_ptr = dest,
+        // tail = [src | n], destination bytes not yet written. Recovery replays
+        // move_chunked(src → dst) from the still-intact source.
+        let path = {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static C: AtomicU64 = AtomicU64::new(0);
+            let id = C.fetch_add(1, Ordering::Relaxed);
+            std::env::temp_dir().join(format!("bstack_wip_copy_{}.bin", id))
+        };
+        let _g = Guard(path.clone());
+
+        let clen = 600u64;
+        let (src, dst, n) = (0u64, 300u64, 200u64);
+        let mut payload = vec![b'S'; n as usize]; // source [0,200)
+        payload.extend_from_slice(&vec![b'.'; (clen - n) as usize]); // rest incl. dest
+        let mut file = wip_header(clen, HEADER_SIZE + dst, u64::from(WipAux::Copy));
+        file.extend_from_slice(&payload);
+        file.extend_from_slice(&src.to_le_bytes()); // tail: src
+        file.extend_from_slice(&n.to_le_bytes()); // tail: n
+        std::fs::write(&path, &file).unwrap();
+
+        let s = BStack::open(&path).unwrap();
+        assert_eq!(s.len().unwrap(), 600);
+        assert_eq!(
+            s.get(dst, dst + n).unwrap(),
+            vec![b'S'; n as usize],
+            "copy replayed"
+        );
+        assert_eq!(
+            s.get(0, n).unwrap(),
+            vec![b'S'; n as usize],
+            "source intact"
+        );
+        drop(s);
+
+        let raw = std::fs::read(&path).unwrap();
+        assert_eq!(raw.len() as u64, HEADER_SIZE + 600, "tail not truncated");
+        assert_eq!(&raw[16..24], &[0u8; 8], "wip_ptr not cleared");
+    }
+
+    #[test]
     fn recovery_rolls_forward_splice_grow() {
         use crate::WipAux;
         // Crashed grow-splice: the last 20 of 100 bytes are being replaced with 50
@@ -6307,6 +6350,51 @@ mod atomic_tests {
         drop(s);
         let s2 = BStack::open(&p).unwrap();
         assert_eq!(s2.peek(0).unwrap(), b"abab");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn copy_disjoint_larger_than_block_journals_and_reopens_clean() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+        // 800-byte payload; copy 300 disjoint bytes [0,300) → [400,700). 300 > one
+        // aligned block, so it takes the copy-journal path (not the atomic write).
+        let mut data = vec![b'S'; 300];
+        data.extend_from_slice(&vec![b'.'; 500]);
+        s.push(&data).unwrap();
+        s.copy(0, 400, 300).unwrap();
+
+        assert_eq!(
+            s.get(400, 700).unwrap(),
+            vec![b'S'; 300],
+            "disjoint copy landed"
+        );
+        assert_eq!(s.get(0, 300).unwrap(), vec![b'S'; 300], "source unchanged");
+        drop(s);
+
+        // Only the source coordinate was staged; the tail backup is gone, wip is
+        // disarmed, and the value survives reopen.
+        let raw = std::fs::read(&p).unwrap();
+        assert_eq!(
+            raw.len() as u64,
+            crate::HEADER_SIZE + 800,
+            "tail not truncated"
+        );
+        assert_eq!(&raw[16..24], &[0u8; 8], "wip_ptr not disarmed");
+        let s2 = BStack::open(&p).unwrap();
+        assert_eq!(s2.get(400, 700).unwrap(), vec![b'S'; 300]);
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn copy_same_location_is_noop() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(vec![b'Z'; 400]).unwrap();
+        // from == to with a block-spanning length: the same-location short-circuit
+        // returns without arming any journal.
+        s.copy(50, 50, 300).unwrap();
+        assert_eq!(s.get(50, 350).unwrap(), vec![b'Z'; 300]);
     }
 
     // -----------------------------------------------------------------------

@@ -355,6 +355,14 @@ pub(crate) enum WipAux {
     /// Repeat-fill: the tail holds `[k: u64 LE | s]`; recovery writes `k` copies
     /// of `s` into `[wip_ptr, wip_ptr + k*s.len())`.
     Repeat = u64::MAX - 3,
+    /// Disjoint copy: the tail holds `[src: u64 LE | n: u64 LE]` and `wip_ptr` is
+    /// the destination. Because the source region does not overlap the
+    /// destination, the source is untouched during the copy, so recovery replays
+    /// `move_chunked(src → dst)` directly from it — only the source coordinate is
+    /// journaled, never the `n` payload bytes. See [`journaled_copy`]. (An
+    /// overlapping copy cannot use this mode and routes through [`WipAux::Set`]
+    /// via [`journaled_move`] instead.)
+    Copy = u64::MAX - 4,
 }
 
 impl From<WipAux> for u64 {
@@ -374,6 +382,7 @@ impl TryFrom<u64> for WipAux {
             v if v == WipAux::SpliceGrow as u64 => Ok(WipAux::SpliceGrow),
             v if v == WipAux::SpliceShrink as u64 => Ok(WipAux::SpliceShrink),
             v if v == WipAux::Repeat as u64 => Ok(WipAux::Repeat),
+            v if v == WipAux::Copy as u64 => Ok(WipAux::Copy),
             _ => Err(()),
         }
     }
@@ -424,6 +433,8 @@ pub(crate) fn write_header_commit(
 ///   raw_size)` — the exact new bytes — into `[wip_ptr, wip_ptr + n)`.
 /// - [`WipAux::Repeat`] reads `[k | s]` from that tail and writes `k` copies of
 ///   `s` into `[wip_ptr, wip_ptr + k*s.len())`.
+/// - [`WipAux::Copy`] reads `[src | n]` from that tail and replays
+///   `move_chunked(src → wip_ptr)` from the untouched (disjoint) source.
 /// - [`WipAux::SpliceGrow`]/[`WipAux::SpliceShrink`] replay the staged new tail
 ///   into `[a, clen')`, deriving `clen'` from the file size and direction, and
 ///   commit the new length.
@@ -474,6 +485,30 @@ pub(crate) fn recover_wip(
                     let mut s = vec![0u8; s_len as usize];
                     file.read_exact(&mut s)?;
                     write_repeated(file, wip_ptr, &s, k)?;
+                    durable_sync(file)?;
+                }
+            }
+        }
+        Ok(WipAux::Copy) => {
+            // Tail is `[src: u64 LE | n: u64 LE]`; `wip_ptr` is the destination.
+            // The source is disjoint from the destination (the writer only arms
+            // this mode when they don't overlap), so the source still holds the
+            // original bytes — replay the copy directly from it. Roll back on a
+            // corrupt or inconsistent header (out of range, or overlapping).
+            if tail_len >= 16 && wip_ptr >= HEADER_SIZE {
+                let mut meta = [0u8; 16];
+                file.seek(SeekFrom::Start(tail_start))?;
+                file.read_exact(&mut meta)?;
+                let src = u64::from_le_bytes(meta[0..8].try_into().unwrap());
+                let n = u64::from_le_bytes(meta[8..16].try_into().unwrap());
+                let dst = wip_ptr - HEADER_SIZE;
+                let disjoint = dst >= src.saturating_add(n) || src >= dst.saturating_add(n);
+                if n > 0
+                    && src.saturating_add(n) <= committed_len
+                    && dst.saturating_add(n) <= committed_len
+                    && disjoint
+                {
+                    move_chunked(file, src, dst, n)?;
                     durable_sync(file)?;
                 }
             }
@@ -756,6 +791,45 @@ pub(crate) fn journaled_move(
     write_wip(file, 0, WipAux::Set)?;
     durable_sync(file)?;
     // 5. Drop the tail.
+    file.set_len(HEADER_SIZE + data_size)
+}
+
+/// Crash-atomically copy `n` bytes from logical `src` to logical `dst` when the
+/// two regions are **disjoint**, through the copy journal — O(1) memory *and*
+/// O(1) staging (only the source coordinate is journaled, never the bytes).
+///
+/// Because `src` and `dst` do not overlap, the source is never modified during the
+/// in-place copy, so recovery re-runs `move_chunked(src → dst)` idempotently from
+/// the still-intact source — no tail backup of the payload is needed. Only
+/// `[src | n]` (16 bytes) is staged so recovery knows what to replay. This is the
+/// win over [`journaled_move`], which stages the full `n` bytes to route an
+/// *overlapping* copy through a disjoint tail. `data_size` is the current payload
+/// length. Callers guarantee `[src, src+n)` and `[dst, dst+n)` do not overlap and
+/// `n > 0`.
+#[cfg(all(feature = "set", feature = "atomic"))]
+pub(crate) fn journaled_copy(
+    file: &mut File,
+    data_size: u64,
+    src: u64,
+    dst: u64,
+    n: u64,
+) -> io::Result<()> {
+    // 1. Stage `[src | n]` past the payload so recovery knows the source.
+    let mut meta = [0u8; 16];
+    meta[0..8].copy_from_slice(&src.to_le_bytes());
+    meta[8..16].copy_from_slice(&n.to_le_bytes());
+    write_at(file, data_size, &meta)?;
+    durable_sync(file)?;
+    // 2. Arm the destination as the replay target.
+    write_wip(file, HEADER_SIZE + dst, WipAux::Copy)?;
+    durable_sync(file)?;
+    // 3. Commit: stream source → destination in place (disjoint → idempotent).
+    move_chunked(file, src, dst, n)?;
+    durable_sync(file)?;
+    // 4. Disarm.
+    write_wip(file, 0, WipAux::Set)?;
+    durable_sync(file)?;
+    // 5. Drop the staged metadata, restoring `file_size == HEADER_SIZE + data_size`.
     file.set_len(HEADER_SIZE + data_size)
 }
 

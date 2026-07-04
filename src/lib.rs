@@ -2454,9 +2454,12 @@ impl BStack {
     ///
     /// Crash-atomic: after a crash the destination holds either its old contents
     /// or the full copy, never a mix.  A destination within one aligned block
-    /// takes the single-block atomic path; a larger copy streams source→tail→dest
-    /// through the write-in-progress journal in O(1) memory, replayed on the next
-    /// [`open`](Self::open).
+    /// takes the single-block atomic path.  A larger *overlapping* copy streams
+    /// source→tail→dest through the write-in-progress journal in O(1) memory.  A
+    /// larger *disjoint* copy uses the copy journal, which stages only the source
+    /// coordinate (not the bytes) and replays directly from the untouched source —
+    /// O(1) staging as well.  A copy onto the same location is a no-op.  All paths
+    /// are replayed on the next [`open`](Self::open).
     ///
     /// # Errors
     ///
@@ -2494,17 +2497,30 @@ impl BStack {
         if n == 0 {
             return Ok(());
         }
-        // Write-strategy hierarchy: a destination within one aligned block is
-        // committed atomically (read the source into a bounded buffer — `n` is at
-        // most one block here — and write it); anything larger streams through the
-        // journal with O(1) memory (see `journaled_move`).
+        // A copy onto its own location leaves every byte unchanged — a no-op once
+        // the bounds above are validated.
+        if from == to {
+            return Ok(());
+        }
+        // Write-strategy hierarchy (see `PLANNED.md`):
+        //  * destination within one aligned block → single-block atomic write
+        //    (read the source into a bounded buffer — `n` is at most one block
+        //    here — and write it);
+        //  * overlapping source/destination → route the bytes through the tail
+        //    backup (source→tail→dest) so a replay never reads clobbered source
+        //    bytes — `journaled_move`, O(1) memory but staging the full `n` bytes;
+        //  * disjoint source/destination → copy journal: stage only the source
+        //    coordinate `[src | n]`, since the untouched source lets recovery
+        //    replay the copy directly — `journaled_copy`, O(1) staging.
         if is_atomic_write(to, n) {
             let mut buf = vec![0u8; n as usize];
             read_at(file, from, &mut buf)?;
             write_at(file, to, &buf)?;
             durable_sync(file)
-        } else {
+        } else if from < to_end && to < from_end {
             journaled_move(file, data_size, from, to, n)
+        } else {
+            journaled_copy(file, data_size, from, to, n)
         }
     }
 
