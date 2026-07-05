@@ -696,7 +696,7 @@ static int test_open_rejects_bad_magic(void)
 {
     char tmp[64]; make_tmp(tmp, sizeof tmp);
 
-    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, 0666);
     CHECK(fd >= 0);
     uint8_t garbage[TEST_HEADER_SIZE];
     memcpy(garbage, "GARBAGE!", 8);
@@ -840,7 +840,7 @@ static int test_recovery_replays_armed_set(void)
     CHECK(memcmp(buf, "NNNNNNNNNN", 10) == 0);
     bstack_close(bs);
 
-    int fd = open(tmp, O_RDONLY);
+    int fd = open(tmp, O_RDONLY | O_BINARY);
     struct stat st; fstat(fd, &st);
     CHECK(st.st_size == TEST_HEADER_SIZE + 10);       /* tail truncated */
     CHECK(raw_read_le64(fd, 16) == 0);                /* wip_ptr disarmed */
@@ -913,7 +913,7 @@ static int test_recovery_rolls_forward_splice_grow(void)
     for (int i = 80; i < 130; i++) CHECK(buf[i] == 'N');
     bstack_close(bs);
 
-    int fd = open(tmp, O_RDONLY);
+    int fd = open(tmp, O_RDONLY | O_BINARY);
     struct stat st; fstat(fd, &st);
     CHECK(st.st_size == TEST_HEADER_SIZE + 130);
     CHECK(raw_read_le64(fd, 16) == 0);
@@ -960,7 +960,7 @@ static int test_recovery_rolls_back_unknown_mode(void)
     CHECK(memcmp(buf, "AAAAAAAAAA", 10) == 0); /* original preserved */
     bstack_close(bs);
 
-    int fd = open(tmp, O_RDONLY);
+    int fd = open(tmp, O_RDONLY | O_BINARY);
     struct stat st; fstat(fd, &st);
     CHECK(st.st_size == TEST_HEADER_SIZE + 10);
     CHECK(raw_read_le64(fd, 16) == 0);
@@ -1563,7 +1563,7 @@ static int test_repeat_journals_large_region_and_reopens_clean(void)
     bstack_close(bs);
 
     /* Journal disarmed, tail truncated, value survives reopen. */
-    int fd = open(tmp, O_RDONLY);
+    int fd = open(tmp, O_RDONLY | O_BINARY);
     struct stat st; fstat(fd, &st);
     CHECK(st.st_size == TEST_HEADER_SIZE + 400);
     CHECK(raw_read_le64(fd, 16) == 0);
@@ -2519,7 +2519,7 @@ static int test_atrunc_splice_journal_grow_and_reopens_clean(void)
     for (int i = 300; i < 500; i++) CHECK(out[i] == 'B');
     bstack_close(bs);
 
-    int fd = open(tmp, O_RDONLY);
+    int fd = open(tmp, O_RDONLY | O_BINARY);
     struct stat st; fstat(fd, &st);
     CHECK(st.st_size == TEST_HEADER_SIZE + 500);
     CHECK(raw_read_le64(fd, 16) == 0);
@@ -2554,7 +2554,7 @@ static int test_atrunc_splice_journal_shrink_and_reopens_clean(void)
     for (int i = 200; i < 250; i++) CHECK(out[i] == 'B');
     bstack_close(bs);
 
-    int fd = open(tmp, O_RDONLY);
+    int fd = open(tmp, O_RDONLY | O_BINARY);
     struct stat st; fstat(fd, &st);
     CHECK(st.st_size == TEST_HEADER_SIZE + 250);
     CHECK(raw_read_le64(fd, 16) == 0);
@@ -3839,7 +3839,7 @@ static int test_copy_disjoint_journals_and_reopens_clean(void)
     for (int i = 0; i < 300; i++)   CHECK(out[i] == 'S'); /* source unchanged */
     bstack_close(bs);
 
-    int fd = open(tmp, O_RDONLY);
+    int fd = open(tmp, O_RDONLY | O_BINARY);
     struct stat st; fstat(fd, &st);
     CHECK(st.st_size == TEST_HEADER_SIZE + 800); /* staging tail truncated */
     CHECK(raw_read_le64(fd, 16) == 0);           /* wip disarmed */
