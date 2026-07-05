@@ -485,11 +485,12 @@ pub(crate) fn recover_wip(
                     && wip_ptr >= HEADER_SIZE
                     && wip_ptr.saturating_add(total) <= tail_start
                 {
-                    let mut s = vec![0u8; s_len as usize];
-                    file.read_exact(&mut s)?;
-                    write_repeated(file, wip_ptr, &s, k)?;
-                    durable_sync(file)?;
-                }
+                    if let Ok(s_len_usize) = usize::try_from(s_len) {
+                        let mut s = vec![0u8; s_len_usize];
+                        file.read_exact(&mut s)?;
+                        write_repeated(file, wip_ptr, &s, k)?;
+                        durable_sync(file)?;
+                    }
             }
         }
         Ok(WipAux::Copy) => {
@@ -677,7 +678,9 @@ pub(crate) fn write_repeated(file: &mut File, phys: u64, s: &[u8], k: u64) -> io
     if unit == 0 || k == 0 {
         return Ok(());
     }
-    let total = k * unit;
+    let total = k.checked_mul(unit).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "write_repeated: length overflow")
+    })?;
     // Pack as many whole copies of `s` into one buffer as fit under MOVE_CHUNK
     // (at least one), capped at `k`.
     let copies = (MOVE_CHUNK / unit).max(1).min(k);
