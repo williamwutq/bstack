@@ -893,14 +893,30 @@ int bstack_migrate(const char *path)
         return -1;
     }
 
-    /* Swap the sibling in for the original. */
-    if (remove(path) != 0 || rename(tmp, path) != 0) {
+    /* Atomically swap the sibling in for the original: the rename replaces the
+     * destination in a single step, so a crash leaves either the intact original
+     * or the finished 0.4.0 file at path — never neither. (Removing the original
+     * first would open a window where a crash leaves only the sibling.) POSIX
+     * rename(2) replaces atomically; the C stdio rename does not on Windows, so
+     * MoveFileExA(MOVEFILE_REPLACE_EXISTING) is used there. */
+#ifdef _WIN32
+    if (!MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING)) {
+        win_set_errno();
         int s = errno;
         remove(tmp);
         free(tmp);
         errno = s;
         return -1;
     }
+#else
+    if (rename(tmp, path) != 0) {
+        int s = errno;
+        remove(tmp);
+        free(tmp);
+        errno = s;
+        return -1;
+    }
+#endif
     free(tmp);
     return 0;
 }

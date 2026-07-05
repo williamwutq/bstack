@@ -806,9 +806,10 @@ impl BStack {
     ///
     /// The file is rewritten into a sibling `"<path>.migrating"` — a fresh 0.4.0
     /// header followed by the old payload shifted from offset 16 to offset 32 —
-    /// which is then swapped in: the original is removed and the sibling renamed
-    /// onto it. The committed length is preserved (clamped to the bytes actually
-    /// present, mirroring [`open`](BStack::open)'s recovery).
+    /// which is then atomically renamed onto the original (a crash leaves either
+    /// the intact original or the finished new file, never neither). The
+    /// committed length is preserved (clamped to the bytes actually present,
+    /// mirroring [`open`](BStack::open)'s recovery).
     ///
     /// The caller must not hold the file open elsewhere. On success `path` is a
     /// valid 0.4.0 file ready for [`open`](BStack::open).
@@ -876,8 +877,12 @@ impl BStack {
         }
         drop(old);
 
-        // Swap the sibling in for the original.
-        std::fs::remove_file(path)?;
+        // Atomically swap the sibling in for the original. `rename` replaces the
+        // destination in a single step on both Unix (`rename(2)`) and Windows
+        // (`MoveFileExW` with `MOVEFILE_REPLACE_EXISTING`), so a crash leaves
+        // either the intact original or the completed 0.4.0 file at `path` —
+        // never neither. (Removing the original first would open a window where
+        // a crash leaves only the sibling.)
         std::fs::rename(&tmp, path)?;
         Ok(())
     }
