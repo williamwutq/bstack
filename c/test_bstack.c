@@ -590,8 +590,41 @@ static int test_large_payload_roundtrip(void)
  * Header / magic
  * ====================================================================== */
 
-static const uint8_t MAGIC[8]        = {'B','S','T','K', 0, 1, 15, 0};
-static const uint8_t MAGIC_PREFIX[6] = {'B','S','T','K', 0, 1};
+static const uint8_t MAGIC[8]        = {'B','S','T','K', 0, 4, 0, 0};
+static const uint8_t MAGIC_PREFIX[6] = {'B','S','T','K', 0, 4};
+#define TEST_HEADER_SIZE 32
+
+/* Write-in-progress journal modes (mirror bstack.c). */
+#define WIP_SET           ((uint64_t)0)
+#define WIP_SPLICE_GROW   (UINT64_MAX - 1)
+#define WIP_SPLICE_SHRINK (UINT64_MAX - 2)
+#define WIP_REPEAT        (UINT64_MAX - 3)
+#define WIP_COPY          (UINT64_MAX - 4)
+
+/* Write a crafted 0.4.0 file image: 32-byte header (magic, clen, wip_ptr,
+ * wip_aux) followed by payload_len raw payload bytes. Used to simulate a file
+ * left with an armed journal by a crash mid-write. */
+static int write_wip_file(const char *path, uint64_t clen,
+                          uint64_t wip_ptr, uint64_t wip_aux,
+                          const uint8_t *payload, size_t payload_len)
+{
+    uint8_t hdr[TEST_HEADER_SIZE];
+    memcpy(hdr, MAGIC, 8);
+    for (int i = 0; i < 8; i++) hdr[8 + i]  = (uint8_t)(clen    >> (8 * i));
+    for (int i = 0; i < 8; i++) hdr[16 + i] = (uint8_t)(wip_ptr >> (8 * i));
+    for (int i = 0; i < 8; i++) hdr[24 + i] = (uint8_t)(wip_aux >> (8 * i));
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (fd < 0) return -1;
+    if (write(fd, hdr, TEST_HEADER_SIZE) != (ssize_t)TEST_HEADER_SIZE) {
+        close(fd); return -1;
+    }
+    if (payload_len &&
+        write(fd, payload, payload_len) != (ssize_t)payload_len) {
+        close(fd); return -1;
+    }
+    close(fd);
+    return 0;
+}
 
 static int test_new_file_has_valid_header(void)
 {
@@ -604,12 +637,14 @@ static int test_new_file_has_valid_header(void)
     CHECK(fd >= 0);
 
     struct stat st; fstat(fd, &st);
-    CHECK(st.st_size == 16);
+    CHECK(st.st_size == TEST_HEADER_SIZE);
 
-    uint8_t hdr[16];
-    CHECK(pread(fd, hdr, 16, 0) == 16);
-    CHECK(memcmp(hdr,     MAGIC,        8) == 0);
-    CHECK(memcmp(hdr + 8, "\0\0\0\0\0\0\0\0", 8) == 0);
+    uint8_t hdr[TEST_HEADER_SIZE];
+    CHECK(pread(fd, hdr, TEST_HEADER_SIZE, 0) == TEST_HEADER_SIZE);
+    CHECK(memcmp(hdr, MAGIC, 8) == 0);
+    /* committed_len[8] + wip_ptr[8] + wip_aux[8] all zero on a fresh file. */
+    uint8_t zeros[24] = {0};
+    CHECK(memcmp(hdr + 8, zeros, 24) == 0);
 
     close(fd); unlink(tmp);
     return 0;
@@ -656,10 +691,10 @@ static int test_open_rejects_bad_magic(void)
 
     int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0666);
     CHECK(fd >= 0);
-    uint8_t garbage[16];
+    uint8_t garbage[TEST_HEADER_SIZE];
     memcpy(garbage, "GARBAGE!", 8);
-    memset(garbage + 8, 0, 8);
-    CHECK(write(fd, garbage, 16) == 16);
+    memset(garbage + 8, 0, sizeof garbage - 8);
+    CHECK(write(fd, garbage, sizeof garbage) == (ssize_t)sizeof garbage);
     close(fd);
 
     bstack_t *bs = bstack_open(tmp);
@@ -696,7 +731,7 @@ static int test_recovery_truncates_partial_push(void)
 {
     char tmp[64]; make_tmp(tmp, sizeof tmp);
 
-    /* Commit "hello" (clen == 5, file == 16+5 == 21 bytes). */
+    /* Commit "hello" (clen == 5, file == 32+5 == 37 bytes). */
     {
         bstack_t *bs = bstack_open(tmp);
         CHECK(bs != NULL);
@@ -709,12 +744,12 @@ static int test_recovery_truncates_partial_push(void)
     {
         int fd = open(tmp, O_WRONLY);
         CHECK(fd >= 0);
-        CHECK(ftruncate(fd, 16 + 5 + 3) == 0);
+        CHECK(ftruncate(fd, TEST_HEADER_SIZE + 5 + 3) == 0);
         /* clen at offset 8 still says 5 — do NOT update it. */
         close(fd);
     }
 
-    /* Reopen: recovery must truncate back to 16+5. */
+    /* Reopen: recovery must truncate back to 32+5. */
     {
         bstack_t *bs = bstack_open(tmp);
         CHECK(bs != NULL);
@@ -746,12 +781,12 @@ static int test_recovery_repairs_header_after_partial_pop(void)
         bstack_close(bs);
     }
 
-    /* Simulate a pop that truncated the file to 16+5 but crashed before
+    /* Simulate a pop that truncated the file to 32+5 but crashed before
      * writing the new committed length to the header. */
     {
         int fd = open(tmp, O_WRONLY);
         CHECK(fd >= 0);
-        CHECK(ftruncate(fd, 16 + 5) == 0);
+        CHECK(ftruncate(fd, TEST_HEADER_SIZE + 5) == 0);
         /* clen at offset 8 still says 10 — do NOT update it. */
         close(fd);
     }
@@ -771,6 +806,194 @@ static int test_recovery_repairs_header_after_partial_pop(void)
 
         bstack_close(bs);
     }
+
+    unlink(tmp);
+    return 0;
+}
+
+/* =========================================================================
+ * Write-in-progress journal recovery (armed on open) — recovery is always
+ * compiled, so these run in every feature configuration.
+ * ====================================================================== */
+
+static int test_recovery_replays_armed_set(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    /* clen=10, target at offset 0; old bytes still 'X', staged new bytes 'N'
+     * in the tail. Recovery copies the tail into [0,10). */
+    uint8_t payload[20];
+    memset(payload, 'X', 10);
+    memset(payload + 10, 'N', 10);
+    CHECK(write_wip_file(tmp, 10, TEST_HEADER_SIZE, WIP_SET, payload, 20) == 0);
+
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 10);
+    uint8_t buf[10]; CHECK(bstack_peek(bs, 0, buf, NULL) == 0);
+    CHECK(memcmp(buf, "NNNNNNNNNN", 10) == 0);
+    bstack_close(bs);
+
+    int fd = open(tmp, O_RDONLY);
+    struct stat st; fstat(fd, &st);
+    CHECK(st.st_size == TEST_HEADER_SIZE + 10);       /* tail truncated */
+    CHECK(raw_read_le64(fd, 16) == 0);                /* wip_ptr disarmed */
+    close(fd); unlink(tmp);
+    return 0;
+}
+
+static int test_recovery_replays_armed_repeat(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    /* clen=12, target at 0; tail is [k=6 | "ab"] → fill [0,12) with "ab"x6. */
+    uint8_t payload[22];
+    memset(payload, '.', 12);
+    uint64_t k = 6;
+    for (int i = 0; i < 8; i++) payload[12 + i] = (uint8_t)(k >> (8 * i));
+    payload[20] = 'a'; payload[21] = 'b';
+    CHECK(write_wip_file(tmp, 12, TEST_HEADER_SIZE, WIP_REPEAT, payload, 22) == 0);
+
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 12);
+    uint8_t buf[12]; CHECK(bstack_peek(bs, 0, buf, NULL) == 0);
+    CHECK(memcmp(buf, "abababababab", 12) == 0);
+    bstack_close(bs);
+    unlink(tmp);
+    return 0;
+}
+
+static int test_recovery_replays_armed_copy(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    /* clen=20; source [0,10)='S', dest [10,20) old='d'; tail [src=0 | n=10].
+     * wip_ptr = HEADER+10 (dest). Recovery copies source into [10,20). */
+    uint8_t payload[36];
+    memset(payload, 'S', 10);
+    memset(payload + 10, 'd', 10);
+    uint64_t src = 0, n = 10;
+    for (int i = 0; i < 8; i++) payload[20 + i] = (uint8_t)(src >> (8 * i));
+    for (int i = 0; i < 8; i++) payload[28 + i] = (uint8_t)(n   >> (8 * i));
+    CHECK(write_wip_file(tmp, 20, TEST_HEADER_SIZE + 10, WIP_COPY, payload, 36) == 0);
+
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 20);
+    uint8_t buf[20]; CHECK(bstack_peek(bs, 0, buf, NULL) == 0);
+    CHECK(memcmp(buf, "SSSSSSSSSSSSSSSSSSSS", 20) == 0); /* both halves = source */
+    bstack_close(bs);
+    unlink(tmp);
+    return 0;
+}
+
+static int test_recovery_rolls_forward_splice_grow(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    /* Replace last 20 of 100 bytes with 50 → clen'=130, a=80, S=130.
+     * payload: 80 'A' + 20 'X' + 30 gap + 50 'N' staged at [130,180). */
+    uint8_t payload[180];
+    memset(payload, 'A', 80);
+    memset(payload + 80, 'X', 20);
+    memset(payload + 100, 0, 30);
+    memset(payload + 130, 'N', 50);
+    CHECK(write_wip_file(tmp, 100, TEST_HEADER_SIZE + 80, WIP_SPLICE_GROW,
+                         payload, 180) == 0);
+
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 130);
+    uint8_t buf[130]; CHECK(bstack_peek(bs, 0, buf, NULL) == 0);
+    for (int i = 0; i < 80; i++)  CHECK(buf[i] == 'A');
+    for (int i = 80; i < 130; i++) CHECK(buf[i] == 'N');
+    bstack_close(bs);
+
+    int fd = open(tmp, O_RDONLY);
+    struct stat st; fstat(fd, &st);
+    CHECK(st.st_size == TEST_HEADER_SIZE + 130);
+    CHECK(raw_read_le64(fd, 16) == 0);
+    close(fd); unlink(tmp);
+    return 0;
+}
+
+static int test_recovery_rolls_forward_splice_shrink(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    /* Replace last 50 of 130 bytes with 20 → clen'=100, a=80, S=130.
+     * payload: 80 'A' + 50 'X' + 20 'N' staged at [130,150). */
+    uint8_t payload[150];
+    memset(payload, 'A', 80);
+    memset(payload + 80, 'X', 50);
+    memset(payload + 130, 'N', 20);
+    CHECK(write_wip_file(tmp, 130, TEST_HEADER_SIZE + 80, WIP_SPLICE_SHRINK,
+                         payload, 150) == 0);
+
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 100);
+    uint8_t buf[100]; CHECK(bstack_peek(bs, 0, buf, NULL) == 0);
+    for (int i = 0; i < 80; i++)   CHECK(buf[i] == 'A');
+    for (int i = 80; i < 100; i++) CHECK(buf[i] == 'N');
+    bstack_close(bs);
+    unlink(tmp);
+    return 0;
+}
+
+static int test_recovery_rolls_back_unknown_mode(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    /* An armed but unrecognized wip_aux rolls back to the committed length. */
+    uint8_t payload[20];
+    memset(payload, 'A', 10);
+    memset(payload + 10, 'Z', 10); /* stale staged bytes to be dropped */
+    CHECK(write_wip_file(tmp, 10, TEST_HEADER_SIZE, 0x1234, payload, 20) == 0);
+
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 10);
+    uint8_t buf[10]; CHECK(bstack_peek(bs, 0, buf, NULL) == 0);
+    CHECK(memcmp(buf, "AAAAAAAAAA", 10) == 0); /* original preserved */
+    bstack_close(bs);
+
+    int fd = open(tmp, O_RDONLY);
+    struct stat st; fstat(fd, &st);
+    CHECK(st.st_size == TEST_HEADER_SIZE + 10);
+    CHECK(raw_read_le64(fd, 16) == 0);
+    close(fd); unlink(tmp);
+    return 0;
+}
+
+/* =========================================================================
+ * Legacy migration
+ * ====================================================================== */
+
+static int test_migrate_upgrades_legacy_file(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    /* Craft a legacy 0.1.x file: 16-byte header (magic 0.1.15, clen=5) + payload. */
+    {
+        uint8_t hdr[16] = {'B','S','T','K', 0, 1, 15, 0};
+        uint64_t clen = 5;
+        for (int i = 0; i < 8; i++) hdr[8 + i] = (uint8_t)(clen >> (8 * i));
+        int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+        CHECK(fd >= 0);
+        CHECK(write(fd, hdr, 16) == 16);
+        CHECK(write(fd, "hello", 5) == 5);
+        close(fd);
+    }
+    /* Opening it directly must fail (incompatible magic). */
+    CHECK(bstack_open(tmp) == NULL);
+
+    /* Migrate, then open and verify the payload survived. */
+    CHECK(bstack_migrate(tmp) == 0);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 5);
+    uint8_t buf[5]; CHECK(bstack_peek(bs, 0, buf, NULL) == 0);
+    CHECK(memcmp(buf, "hello", 5) == 0);
+    bstack_close(bs);
+
+    /* Second migrate must fail: the file is no longer legacy. */
+    CHECK(bstack_migrate(tmp) == -1);
+    CHECK(errno == EINVAL);
 
     unlink(tmp);
     return 0;
@@ -1277,6 +1500,73 @@ static int test_set_persists_across_reopen(void)
         bstack_close(bs);
     }
 
+    unlink(tmp);
+    return 0;
+}
+
+/* --- bstack_repeat ----------------------------------------------------- */
+
+static int test_repeat_fills_pattern(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    CHECK(bstack_push(bs, (uint8_t *)"..........", 10, NULL) == 0);
+    /* 3 copies of "xy" over [0,6). */
+    CHECK(bstack_repeat(bs, 0, (uint8_t *)"xy", 2, 3) == 0);
+    uint8_t buf[10]; CHECK(bstack_peek(bs, 0, buf, NULL) == 0);
+    CHECK(memcmp(buf, "xyxyxy....", 10) == 0);
+    bstack_close(bs);
+    unlink(tmp);
+    return 0;
+}
+
+static int test_repeat_empty_or_zero_count_is_noop(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    CHECK(bstack_push(bs, (uint8_t *)"hello", 5, NULL) == 0);
+    CHECK(bstack_repeat(bs, 0, (uint8_t *)"x", 0, 5) == 0); /* empty pattern */
+    CHECK(bstack_repeat(bs, 0, (uint8_t *)"x", 1, 0) == 0); /* zero count */
+    uint8_t buf[5]; CHECK(bstack_peek(bs, 0, buf, NULL) == 0);
+    CHECK(memcmp(buf, "hello", 5) == 0);
+    bstack_close(bs);
+    unlink(tmp);
+    return 0;
+}
+
+static int test_repeat_journals_large_region_and_reopens_clean(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    /* 400-byte payload; fill [0,300) with "ab"x150 spans a 256B block, so it
+     * goes through the repeat journal, not the atomic-block fast path. */
+    uint8_t *big = (uint8_t *)malloc(400);
+    CHECK(big != NULL);
+    memset(big, 'Z', 400);
+    CHECK(bstack_push(bs, big, 400, NULL) == 0);
+    CHECK(bstack_repeat(bs, 0, (uint8_t *)"ab", 2, 150) == 0);
+    uint8_t *out = (uint8_t *)malloc(400);
+    CHECK(out != NULL);
+    CHECK(bstack_peek(bs, 0, out, NULL) == 0);
+    for (int i = 0; i < 300; i++) CHECK(out[i] == (i % 2 == 0 ? 'a' : 'b'));
+    for (int i = 300; i < 400; i++) CHECK(out[i] == 'Z');
+    bstack_close(bs);
+
+    /* Journal disarmed, tail truncated, value survives reopen. */
+    int fd = open(tmp, O_RDONLY);
+    struct stat st; fstat(fd, &st);
+    CHECK(st.st_size == TEST_HEADER_SIZE + 400);
+    CHECK(raw_read_le64(fd, 16) == 0);
+    close(fd);
+    bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    CHECK(bstack_peek(bs, 0, out, NULL) == 0);
+    for (int i = 0; i < 300; i++) CHECK(out[i] == (i % 2 == 0 ? 'a' : 'b'));
+    bstack_close(bs);
+    free(big); free(out);
     unlink(tmp);
     return 0;
 }
@@ -2193,6 +2483,94 @@ static int test_replace_persists_across_reopen(void)
         bstack_close(bs);
     }
 
+    unlink(tmp);
+    return 0;
+}
+
+/* --- splice journal (length-changing tail replace) --------------------- */
+
+static int test_atrunc_splice_journal_grow_and_reopens_clean(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    /* 400 'A'; replace the last 100 with 200 'B' — a length-changing tail
+     * replace (m=200 != n=100, both > 0), so it goes through the splice
+     * journal. clen' = 300 + 200 = 500. */
+    uint8_t *a = (uint8_t *)malloc(400);
+    CHECK(a != NULL); memset(a, 'A', 400);
+    CHECK(bstack_push(bs, a, 400, NULL) == 0);
+    uint8_t *b = (uint8_t *)malloc(200);
+    CHECK(b != NULL); memset(b, 'B', 200);
+    CHECK(bstack_atrunc(bs, 100, b, 200) == 0);
+
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 500);
+    uint8_t *out = (uint8_t *)malloc(500);
+    CHECK(out != NULL);
+    CHECK(bstack_peek(bs, 0, out, NULL) == 0);
+    for (int i = 0; i < 300; i++) CHECK(out[i] == 'A');
+    for (int i = 300; i < 500; i++) CHECK(out[i] == 'B');
+    bstack_close(bs);
+
+    int fd = open(tmp, O_RDONLY);
+    struct stat st; fstat(fd, &st);
+    CHECK(st.st_size == TEST_HEADER_SIZE + 500);
+    CHECK(raw_read_le64(fd, 16) == 0);
+    close(fd);
+    bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    CHECK(bstack_len(bs, &len) == 0); CHECK(len == 500);
+    bstack_close(bs);
+    free(a); free(b); free(out);
+    unlink(tmp);
+    return 0;
+}
+
+static int test_atrunc_splice_journal_shrink_and_reopens_clean(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    /* 400 'A'; replace the last 200 with 50 'B' — length-changing shrink
+     * (m=50 != n=200). clen' = 200 + 50 = 250. */
+    uint8_t *a = (uint8_t *)malloc(400);
+    CHECK(a != NULL); memset(a, 'A', 400);
+    CHECK(bstack_push(bs, a, 400, NULL) == 0);
+    uint8_t b[50]; memset(b, 'B', 50);
+    CHECK(bstack_atrunc(bs, 200, b, 50) == 0);
+
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 250);
+    uint8_t *out = (uint8_t *)malloc(250);
+    CHECK(out != NULL);
+    CHECK(bstack_peek(bs, 0, out, NULL) == 0);
+    for (int i = 0; i < 200; i++)   CHECK(out[i] == 'A');
+    for (int i = 200; i < 250; i++) CHECK(out[i] == 'B');
+    bstack_close(bs);
+
+    int fd = open(tmp, O_RDONLY);
+    struct stat st; fstat(fd, &st);
+    CHECK(st.st_size == TEST_HEADER_SIZE + 250);
+    CHECK(raw_read_le64(fd, 16) == 0);
+    close(fd);
+    free(a); free(out);
+    unlink(tmp);
+    return 0;
+}
+
+static int test_splice_returns_removed_on_length_change(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    CHECK(bstack_push(bs, (uint8_t *)"helloworld", 10, NULL) == 0);
+    /* Replace last 5 with 3 bytes (length change). */
+    uint8_t removed[5];
+    CHECK(bstack_splice(bs, removed, 5, (uint8_t *)"XYZ", 3) == 0);
+    CHECK(memcmp(removed, "world", 5) == 0);
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 8);
+    uint8_t buf[8]; CHECK(bstack_peek(bs, 0, buf, NULL) == 0);
+    CHECK(memcmp(buf, "helloXYZ", 8) == 0);
+    bstack_close(bs);
     unlink(tmp);
     return 0;
 }
@@ -3431,6 +3809,132 @@ static int test_process_gen_len_informs_pop_size(void)
     return 0;
 }
 
+/* --- copy: disjoint copy journal --------------------------------------- */
+
+static int test_copy_disjoint_journals_and_reopens_clean(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    /* 800-byte payload; copy 300 disjoint bytes [0,300) -> [400,700). 300 > one
+     * aligned block, so it takes the copy-journal path (not the atomic write). */
+    uint8_t *data = (uint8_t *)malloc(800);
+    CHECK(data != NULL);
+    memset(data, 'S', 300);
+    memset(data + 300, '.', 500);
+    CHECK(bstack_push(bs, data, 800, NULL) == 0);
+    CHECK(bstack_copy(bs, 0, 400, 300) == 0);
+
+    uint8_t *out = (uint8_t *)malloc(800);
+    CHECK(out != NULL);
+    CHECK(bstack_peek(bs, 0, out, NULL) == 0);
+    for (int i = 400; i < 700; i++) CHECK(out[i] == 'S'); /* copy landed */
+    for (int i = 0; i < 300; i++)   CHECK(out[i] == 'S'); /* source unchanged */
+    bstack_close(bs);
+
+    int fd = open(tmp, O_RDONLY);
+    struct stat st; fstat(fd, &st);
+    CHECK(st.st_size == TEST_HEADER_SIZE + 800); /* staging tail truncated */
+    CHECK(raw_read_le64(fd, 16) == 0);           /* wip disarmed */
+    close(fd);
+    bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    CHECK(bstack_peek(bs, 0, out, NULL) == 0);
+    for (int i = 400; i < 700; i++) CHECK(out[i] == 'S');
+    bstack_close(bs);
+    free(data); free(out);
+    unlink(tmp);
+    return 0;
+}
+
+static int test_copy_same_location_is_noop(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    uint8_t *data = (uint8_t *)malloc(400);
+    CHECK(data != NULL); memset(data, 'Z', 400);
+    CHECK(bstack_push(bs, data, 400, NULL) == 0);
+    /* from == to with a block-spanning length: short-circuits, no journal. */
+    CHECK(bstack_copy(bs, 50, 50, 300) == 0);
+    uint8_t *out = (uint8_t *)malloc(400);
+    CHECK(out != NULL);
+    CHECK(bstack_peek(bs, 0, out, NULL) == 0);
+    for (int i = 0; i < 400; i++) CHECK(out[i] == 'Z');
+    bstack_close(bs);
+    free(data); free(out);
+    unlink(tmp);
+    return 0;
+}
+
+/* --- process_gen: BSTACK_GEN_SPLICE ------------------------------------ */
+
+struct pg_splice_ctx { uint8_t removed[5]; int calls; };
+
+static int pg_splice_gen(bstack_gen_op_t *out_op, void *userctx)
+{
+    struct pg_splice_ctx *c = userctx;
+    c->calls++;
+    if (c->calls == 1) {
+        out_op->kind              = BSTACK_GEN_SPLICE;
+        out_op->u.splice.removed  = c->removed;   /* read popped bytes back */
+        out_op->u.splice.n        = 5;
+        out_op->u.splice.new_buf  = (const uint8_t *)"THERE!";
+        out_op->u.splice.new_len  = 6;
+    } else {
+        out_op->kind           = BSTACK_GEN_WRITE;
+        out_op->u.write.offset = 0;
+        out_op->u.write.data   = (const uint8_t *)"NOPE!";
+        out_op->u.write.len    = 5;
+    }
+    return 1;
+}
+
+static int test_process_gen_splice_replaces_tail_and_ends_sequence(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    CHECK(bstack_push(bs, (uint8_t *)"helloworld", 10, NULL) == 0);
+
+    struct pg_splice_ctx ctx = {{0}, 0};
+    CHECK(bstack_process_gen(bs, pg_splice_gen, &ctx) == 0);
+    CHECK(ctx.calls == 1); /* Splice ends the sequence */
+    CHECK(memcmp(ctx.removed, "world", 5) == 0);
+
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 11);
+    uint8_t buf[11]; CHECK(bstack_peek(bs, 0, buf, NULL) == 0);
+    CHECK(memcmp(buf, "helloTHERE!", 11) == 0);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int pg_splice_atrunc_gen(bstack_gen_op_t *out_op, void *userctx)
+{
+    (void)userctx;
+    /* NULL removed = the atrunc form (discard the popped bytes). */
+    out_op->kind              = BSTACK_GEN_SPLICE;
+    out_op->u.splice.removed  = NULL;
+    out_op->u.splice.n        = 5;
+    out_op->u.splice.new_buf  = (const uint8_t *)"THERE!";
+    out_op->u.splice.new_len  = 6;
+    return 1;
+}
+
+static int test_process_gen_splice_null_removed_acts_like_atrunc(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    CHECK(bstack_push(bs, (uint8_t *)"helloworld", 10, NULL) == 0);
+    CHECK(bstack_process_gen(bs, pg_splice_atrunc_gen, NULL) == 0);
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 11);
+    uint8_t buf[11]; CHECK(bstack_peek(bs, 0, buf, NULL) == 0);
+    CHECK(memcmp(buf, "helloTHERE!", 11) == 0);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
 #endif /* BSTACK_FEATURE_ATOMIC && BSTACK_FEATURE_SET */
 
 /* =========================================================================
@@ -4078,6 +4582,17 @@ int main(void)
     T(test_recovery_truncates_partial_push);
     T(test_recovery_repairs_header_after_partial_pop);
 
+    /* Write-in-progress journal recovery (always compiled) */
+    T(test_recovery_replays_armed_set);
+    T(test_recovery_replays_armed_repeat);
+    T(test_recovery_replays_armed_copy);
+    T(test_recovery_rolls_forward_splice_grow);
+    T(test_recovery_rolls_forward_splice_shrink);
+    T(test_recovery_rolls_back_unknown_mode);
+
+    /* Legacy migration */
+    T(test_migrate_upgrades_legacy_file);
+
     /* Concurrency */
     T(test_concurrent_reads_do_not_serialise);
     T(test_concurrent_pushes_non_overlapping);
@@ -4140,6 +4655,11 @@ int main(void)
     T(test_zero_rejects_write_past_end);
     T(test_zero_persists_across_reopen);
 
+    /* bstack_repeat */
+    T(test_repeat_fills_pattern);
+    T(test_repeat_empty_or_zero_count_is_noop);
+    T(test_repeat_journals_large_region_and_reopens_clean);
+
     /* bstack_set / bstack_zero — locked-region protection */
     T(test_set_respects_locked_region);
     T(test_zero_respects_locked_region);
@@ -4165,6 +4685,11 @@ int main(void)
     T(test_splice_buf_empty_acts_like_pop);
     T(test_splice_exceeds_size_returns_error);
     T(test_splice_persists_across_reopen);
+
+    /* splice journal (length-changing tail replace) */
+    T(test_atrunc_splice_journal_grow_and_reopens_clean);
+    T(test_atrunc_splice_journal_shrink_and_reopens_clean);
+    T(test_splice_returns_removed_on_length_change);
 
     /* bstack_try_extend */
     T(test_try_extend_matching_returns_true);
@@ -4254,6 +4779,12 @@ int main(void)
     T(test_process_gen_pop_below_locked_returns_error);
     T(test_process_gen_len_reports_current_size_and_continues);
     T(test_process_gen_len_informs_pop_size);
+    T(test_process_gen_splice_replaces_tail_and_ends_sequence);
+    T(test_process_gen_splice_null_removed_acts_like_atrunc);
+
+    /* bstack_copy — disjoint copy journal */
+    T(test_copy_disjoint_journals_and_reopens_clean);
+    T(test_copy_same_location_is_noop);
 #endif
 
     printf("\n%d/%d passed\n", g_passed, g_total);
