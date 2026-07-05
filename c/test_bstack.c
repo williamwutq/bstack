@@ -25,6 +25,13 @@
 #  include <windows.h>
 #endif
 
+/* On Windows, open()/read()/write() default to text mode and translate
+ * 0x0A <-> 0x0D 0x0A, which corrupts the binary file images these tests craft
+ * and inspect.  O_BINARY suppresses that; it is a no-op (0) on POSIX. */
+#ifndef O_BINARY
+#  define O_BINARY 0
+#endif
+
 /* =========================================================================
  * Harness
  * ====================================================================== */
@@ -613,7 +620,7 @@ static int write_wip_file(const char *path, uint64_t clen,
     for (int i = 0; i < 8; i++) hdr[8 + i]  = (uint8_t)(clen    >> (8 * i));
     for (int i = 0; i < 8; i++) hdr[16 + i] = (uint8_t)(wip_ptr >> (8 * i));
     for (int i = 0; i < 8; i++) hdr[24 + i] = (uint8_t)(wip_aux >> (8 * i));
-    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, 0666);
     if (fd < 0) return -1;
     if (write(fd, hdr, TEST_HEADER_SIZE) != (ssize_t)TEST_HEADER_SIZE) {
         close(fd); return -1;
@@ -973,7 +980,7 @@ static int test_migrate_upgrades_legacy_file(void)
         uint8_t hdr[16] = {'B','S','T','K', 0, 1, 15, 0};
         uint64_t clen = 5;
         for (int i = 0; i < 8; i++) hdr[8 + i] = (uint8_t)(clen >> (8 * i));
-        int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+        int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, 0666);
         CHECK(fd >= 0);
         CHECK(write(fd, hdr, 16) == 16);
         CHECK(write(fd, "hello", 5) == 5);
