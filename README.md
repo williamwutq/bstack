@@ -12,9 +12,10 @@ or unclean shutdown.  On **macOS**, `fcntl(F_FULLFSYNC)` is used instead of
 [![Docs.rs](https://img.shields.io/docsrs/bstack)](https://docs.rs/bstack)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
-A 16-byte file header stores a **magic number** and a **committed-length
-sentinel**.  On reopen, any mismatch between the header and the actual file
-size is repaired automatically — no user intervention required.
+A 32-byte file header stores a **magic number**, a **committed-length
+sentinel**, and a **write-in-progress journal**.  On reopen, an interrupted
+in-place write is replayed or rolled back and any header/size mismatch is
+repaired automatically — no user intervention required.
 
 On **Unix**, `open` acquires an **exclusive advisory `flock`**; on
 **Windows**, `LockFileEx` is used instead.  Both prevent two processes from
@@ -114,6 +115,13 @@ impl BStack {
     #[cfg(feature = "set")]
     pub fn zero(&self, offset: u64, n: u64) -> io::Result<()>;
 
+    /// Fill `count` copies of `pattern` in place starting at logical `offset`
+    /// (the general form of `zero`).  Never changes the file size; errors if the
+    /// fill would exceed the current payload.  An empty `pattern` or `count = 0`
+    /// is a no-op.  Requires the `set` feature.
+    #[cfg(feature = "set")]
+    pub fn repeat(&self, offset: u64, pattern: impl AsRef<[u8]>, count: u64) -> io::Result<()>;
+
     /// Atomically cut `n` bytes off the tail then append `buf`.
     /// Combines discard + push under a single write lock.  Requires the `atomic` feature.
     #[cfg(feature = "atomic")]
@@ -179,8 +187,9 @@ impl BStack {
 
     /// Run a sequence of dependent reads, optionally followed by a single write, under
     /// one held write lock. `f` is called in a loop and drives the sequence through
-    /// `BStackGenOp::{Read, Len, Write, Swap, Push, Pop, Discard}`; at most one of
-    /// `Write`/`Swap`/`Push`/`Pop`/`Discard` is permitted and ends the sequence.
+    /// `BStackGenOp::{Read, Len, Write, Swap, Push, Pop, Discard, Atrunc, Splice}`; at
+    /// most one of `Write`/`Swap`/`Push`/`Pop`/`Discard`/`Atrunc`/`Splice` is permitted
+    /// and ends the sequence.
     /// Requires the `set` and `atomic` features.
     #[cfg(all(feature = "set", feature = "atomic"))]
     pub fn process_gen<'a, F>(&self, f: F) -> io::Result<()>
@@ -255,7 +264,7 @@ impl BStack {
     pub fn get_batched_gen<'a, F>(&self, f: F) -> io::Result<()>
     where F: FnMut() -> Option<(u64, &'a mut [u8])>;
 
-    /// Current payload size in bytes (excludes the 16-byte header).
+    /// Current payload size in bytes (excludes the 32-byte header).
     pub fn len(&self) -> io::Result<u64>;
 
     /// Current locked length.  `0` means no bytes are locked.
@@ -397,7 +406,7 @@ cached stacks (it must read up to `n` bytes from disk before returning).
     in-memory buffer under a `Mutex` (so RwLock-free, but not lock-free).
   The locked length remains a sufficient upper bound, so no extra payload-size
   check is needed on this path.
-* **Write protection.**  `set`, `zero`, `swap`, `swap_into`, `cas`,
+* **Write protection.**  `set`, `zero`, `repeat`, `swap`, `swap_into`, `cas`,
   `process`, `atrunc`, `splice`, `splice_into`, and `replace` return
   `InvalidInput` if their target overlaps the locked region.
 * **Shrink protection.**  `pop`, `pop_into`, `discard`, and `try_discard`
@@ -480,9 +489,9 @@ crash-safe ordering.
 
 ```toml
 [dependencies]
-bstack = { version = "0.2", features = ["atomic"] }
+bstack = { version = "0.4", features = ["atomic"] }
 # Combined set + atomic unlocks swap, swap_into, and cas:
-bstack = { version = "0.2", features = ["set", "atomic"] }
+bstack = { version = "0.4", features = ["set", "atomic"] }
 ```
 
 - **`atrunc`**, **`splice`**, **`splice_into`** — atomic discard+push / pop+push tail replacement.
@@ -490,7 +499,7 @@ bstack = { version = "0.2", features = ["set", "atomic"] }
 - **`replace(n, f)`** — pop `n` bytes, pass to `f`, push back the returned tail.
 - **`get_batched`**, **`get_batched_into`**, **`get_batched_gen`** — read multiple (possibly dependent) ranges under one read lock.
 - **`swap`**, **`swap_into`**, **`cas`** *(requires `set`)* — atomic read-modify-write / compare-and-swap of a single region.
-- **`process`**, **`process_gen`** *(requires `set`)* — in-place mutation, or a dependent read/write sequence ending in at most one `Write`/`Swap`/`Push`/`Pop`/`Discard`.
+- **`process`**, **`process_gen`** *(requires `set`)* — in-place mutation, or a dependent read/write sequence ending in at most one `Write`/`Swap`/`Push`/`Pop`/`Discard`/`Atrunc`/`Splice`.
 - **`cross_exchange`**, **`copy`** *(requires `set`)* — swap or copy two regions under one write lock.
 - **`eq_crds`**, **`ne_crds`**, **`masked_eq_crds`**, **`masked_ne_crds`** *(requires `set`)* — cross-region compare-and-swap, with `==`/`!=`/masked variants.
 
@@ -500,11 +509,11 @@ See [API](#api) for full signatures and details.
 
 ### `set`
 
-Enables `BStack::set(offset, data)` (in-place overwrite) and `BStack::zero(offset, n)` (zero-fill in place). Neither changes the file size or the committed-length header.
+Enables `BStack::set(offset, data)` (in-place overwrite), `BStack::zero(offset, n)` (zero-fill in place), and `BStack::repeat(offset, pattern, count)` (fill with a repeated pattern — the general form of `zero`). None changes the file size or the committed-length header.
 
 ```toml
 [dependencies]
-bstack = { version = "0.2", features = ["set"] }
+bstack = { version = "0.4", features = ["set"] }
 ```
 
 ### `alloc`
@@ -513,37 +522,63 @@ Enables the region-management layer on top of `BStack`: `BStackAllocator`, `BSta
 
 ```toml
 [dependencies]
-bstack = { version = "0.2", features = ["alloc"] }
+bstack = { version = "0.4", features = ["alloc"] }
 # In-place slice writes (BStackSliceWriter) also need `set`:
-bstack = { version = "0.2", features = ["alloc", "set"] }
+bstack = { version = "0.4", features = ["alloc", "set"] }
 ```
 
 ---
 
 ## File format
 
-```
-┌────────────────────────┬──────────────┬──────────────┐
-│      header (16 B)     │  payload 0   │  payload 1   │  ...
-│  magic[8] | clen[8 LE] │              │              │
-└────────────────────────┴──────────────┴──────────────┘
-^                        ^              ^              ^
-file offset 0        offset 16       16+n0          EOF
+A fixed 32-byte header precedes the payload:
+
+```text
+  bytes      field
+  ─────      ─────
+   0 ..  8   magic[8]
+   8 .. 16   clen      — committed payload length (u64 LE)
+  16 .. 24   wip_ptr   — write-in-progress journal target (u64 LE)
+  24 .. 32   wip_aux   — write-in-progress journal mode (u64 LE)
+  32 ..      payload   — push 0, push 1, … concatenated
 ```
 
 * **`magic`** — 8 bytes: `BSTK` + major(1 B) + minor(1 B) + patch(1 B) + reserved(1 B).
-  This version writes `BSTK\x00\x01\x0f\x00` (0.1.15).  `open` accepts any
-  0.1.x file (first 6 bytes `BSTK\x00\x01`) and rejects a different major or
-  minor as incompatible.
+  This version writes `BSTK\x00\x04\x00\x00` (0.4.0).  `open` accepts any
+  0.4.x file (first 6 bytes `BSTK\x00\x04`) and rejects a different major or
+  minor as incompatible.  Legacy `0.1.x` files can be upgraded in place with
+  `BStack::migrate`.
 * **`clen`** — little-endian `u64` recording the last successfully committed
   payload length.  Updated on every `push` and `pop` before the durable sync.
+* **`wip_ptr` / `wip_aux`** — the write-in-progress journal that makes in-place
+  mutations crash-atomic.  `wip_ptr` is the physical offset a crashed in-place
+  write is replayed into (`0` when idle); `wip_aux` names the mode (verbatim
+  replay, repeated pattern, a disjoint copy replayed from its still-intact source,
+  or a length-changing tail replace whose new committed length recovery derives
+  from the file size and direction).  Interpreted by recovery on `open`.
 
 All user-visible offsets (returned by `push`, accepted by `peek`/`get`) are
-**logical** — 0-based from the start of the payload region (file byte 16).
+**logical** — 0-based from the start of the payload region (file byte 32).
 
 ---
 
 ## Durability
+
+**In-place same-length writes** — `set`, `zero`, `repeat`, `swap`, `swap_into`,
+`cas`, `copy`, `cross_exchange`, `process`, and the `crds` family — never change
+the payload length and are each **crash-atomic**, committing by one of two
+strategies (recovered on the next `open`):
+
+* **Aligned-block write** — a target within one power-fail-atomic block is
+  committed by a single `write` + sync; no journal is armed.
+* **Write-in-progress journal** — otherwise: stage a backup past `clen` → sync →
+  arm `wip_ptr` → sync → write in place → sync → clear `wip_ptr` → sync →
+  `ftruncate`.  `zero`/`repeat` stage only `[count | pattern]`; `cross_exchange`
+  stages one region and commits at a single atomic `wip_ptr` flip; moves and
+  fills stream through a bounded buffer.
+
+Below, *commit* denotes whichever strategy applies to the bytes written; anything
+before it is read/compare/callback work under the lock.
 
 | Operation                              | Sequence                                                                                  |
 |----------------------------------------|-------------------------------------------------------------------------------------------|
@@ -551,23 +586,22 @@ All user-visible offsets (returned by `push`, accepted by `peek`/`get`) are
 | `extend`                               | `lseek(END)` → `set_len(new_end)` → `lseek(8)` → `write(clen)` → sync                     |
 | `pop`, `pop_into`                      | `lseek` → `read` → `ftruncate` → `lseek(8)` → `write(clen)` → sync                        |
 | `discard`                              | `ftruncate` → `lseek(8)` → `write(clen)` → sync                                           |
-| `set` *(feature)*                      | `lseek(offset)` → `write(data)` → sync                                                    |
-| `zero` *(feature)*                     | `lseek(offset)` → `write(zeros)` → sync                                                   |
-| `atrunc` *(atomic, net extension)*     | `set_len(new_end)` → `lseek(tail)` → `write(buf)` → sync → `write(clen)`                  |
-| `atrunc` *(atomic, net truncation)*    | `lseek(tail)` → `write(buf)` → `set_len(new_end)` → sync → `write(clen)`                  |
+| `set` *(feature)*                      | *commit* `data`                                                                           |
+| `zero`, `repeat` *(feature)*           | *commit* the repeated pattern (the journal stages only `[count \| pattern]`)              |
+| `atrunc` *(atomic)*                    | dispatch on shape: truncation → `ftruncate` → *commit* `clen`; append → `set_len(new_end)` → `write(buf)` → sync → *commit* `clen`; same-length → *commit* `buf` in place; length change → **splice journal** (stage new tail past the payload → arm `SpliceGrow`/`SpliceShrink` → replay into place → atomically commit `clen'` + disarm → truncate, sync at each barrier) |
 | `splice`, `splice_into` *(atomic)*     | `lseek(tail)` → `read(n)` → *(then as `atrunc`)*                                          |
 | `try_extend` *(atomic)*                | size check → conditional `push` sequence                                                  |
 | `try_discard` *(atomic)*               | size check → conditional `discard` sequence                                               |
 | `try_extend_zeros` *(atomic)*          | size check → conditional `extend(n)` sequence                                             |
-| `swap`, `swap_into` *(set+atomic)*     | `lseek(offset)` → `read` → `lseek(offset)` → `write(buf)` → sync                          |
-| `cas` *(set+atomic)*                   | `lseek(offset)` → `read` → compare → conditional `write(new)` → sync                      |
-| `process` *(set+atomic)*               | `lseek(start)` → `read(end−start)` → *(callback)* → `lseek(start)` → `write(buf)` → sync  |
-| `process_gen` *(set+atomic)*           | closure-driven: zero or more `lseek`/`pread` reads and `Len` size queries, ending in at most one mutating step — `lseek` → `write` → sync for `Write`, the two-region read/read/write/write → sync of `cross_exchange` for `Swap`, an append (then `set_len` on rollback) → sync for `Push`, `lseek` → `read` → `set_len` → sync for `Pop`, or `set_len` → sync for `Discard` (a `Pop` with no read) |
+| `swap`, `swap_into` *(set+atomic)*     | `read` old bytes → *commit* `buf`                                                         |
+| `cas` *(set+atomic)*                   | `read` → compare → conditional *commit* of `new`                                          |
+| `process` *(set+atomic)*               | `read(start..end)` → *(callback)* → *commit* the buffer                                    |
+| `process_gen` *(set+atomic)*           | closure-driven reads (and `Len` queries), ending in at most one mutating step — `Write` *commits*; `Swap` uses the exchange journal (as `cross_exchange`); `Push`/`Pop`/`Discard`/`Atrunc`/`Splice` behave as their standalone forms |
 | `replace` *(atomic)*                   | `lseek(tail)` → `read(n)` → *(callback)* → *(then as `atrunc`)*                           |
-| `cross_exchange` *(set+atomic)*        | `lseek(a)` → `read(n)` → `lseek(b)` → `read(n)` → `lseek(a)` → `write` → `lseek(b)` → `write` → sync |
-| `copy` *(set+atomic)*                  | `lseek(from)` → `read(n)` → `lseek(to)` → `write(n)` → sync                               |
-| `eq_crds`, `ne_crds` *(set+atomic)*    | `lseek(a)` → `read` → compare → conditional `lseek(b)` → `write(b_buf)` → sync            |
-| `masked_eq_crds`, `masked_ne_crds` *(set+atomic)* | `lseek(a)` → `read` → mask+compare → conditional `lseek(b)` → `write(b_buf)` → sync |
+| `cross_exchange` *(set+atomic)*        | `read(a)`, `read(b)` → exchange journal: stage `a` → arm at `a` → write `b`→`a` → flip `wip_ptr` to `b` → write `a`→`b` → disarm → `ftruncate` (sync at each barrier) |
+| `copy` *(set+atomic)*                  | same-location → no-op; single-block dest → *commit*; overlapping → stream source→tail→dest (`Set` journal); disjoint → copy journal (stage only `[src \| n]`, arm `Copy`, stream source→dest; recovery replays from the untouched source) |
+| `eq_crds`, `ne_crds` *(set+atomic)*    | `read(a)` → compare → conditional *commit* of `b_buf`                                      |
+| `masked_eq_crds`, `masked_ne_crds` *(set+atomic)* | `read(a)` → mask+compare → conditional *commit* of `b_buf`                     |
 | `peek`, `peek_into`, `get`, `get_into`, `get_batched`, `get_batched_into`, `get_batched_gen` | `pread(2)` on Unix; `ReadFile`+`OVERLAPPED` on Windows; `lseek` → `read` elsewhere |
 
 **`durable_sync` on macOS** issues `fcntl(F_FULLFSYNC)`.  Unlike `fdatasync`,
@@ -588,15 +622,22 @@ header reset restore the pre-push state.
 
 ## Crash recovery
 
-The committed-length sentinel in the header ensures automatic recovery on the
-next `open`:
+On the next `open`, recovery first checks the write-in-progress journal
+(`wip_ptr`); if disarmed, it reconciles the committed length against the file
+size:
 
-| Condition               | Cause                                             | Recovery                                  |
-|-------------------------|---------------------------------------------------|-------------------------------------------|
-| `file_size − 16 > clen` | partial tail write (crashed before header update) | truncate to `16 + clen`, durable-sync     |
-| `file_size − 16 < clen` | partial truncation (crashed before header update) | set `clen = file_size − 16`, durable-sync |
+| Condition                                      | Cause                                                        | Recovery                                                      |
+|------------------------------------------------|--------------------------------------------------------------|--------------------------------------------------------------|
+| `wip_ptr != 0`, `wip_aux = Set`                | in-place `set`/`swap`/`cas`/`copy`/`cross_exchange` crashed mid-commit | replay the staged tail into `[wip_ptr, …)`, disarm, truncate |
+| `wip_ptr != 0`, `wip_aux = Repeat`             | `zero`/`repeat` crashed mid-fill                             | write `count` copies of the staged pattern, disarm, truncate |
+| `wip_ptr != 0`, `wip_aux = Copy`               | disjoint `copy` crashed mid-copy                            | replay `move_chunked(src → wip_ptr)` from the untouched source (tail stages only `[src \| n]`), disarm, truncate |
+| `wip_ptr != 0`, `wip_aux = SpliceGrow`/`SpliceShrink` | length-changing `atrunc`/`splice`/`splice_into`/`replace` crashed mid-replace | derive `clen'` from the file size and direction, replay the staged new tail, commit `clen'` while disarming, truncate |
+| `wip_ptr != 0`, `wip_aux` unrecognized         | mode armed by a newer build                                 | roll back: disarm, truncate to `32 + clen`                   |
+| `wip_ptr == 0`, `file_size − 32 > clen`        | partial tail write (crashed before header update)           | truncate to `32 + clen`, durable-sync                        |
+| `wip_ptr == 0`, `file_size − 32 < clen`        | partial truncation (crashed before header update)           | set `clen = file_size − 32`, durable-sync                    |
 
-No caller action is required; recovery is transparent.
+Each replay is idempotent (the staged tail is immutable), so a crash during
+recovery is safe to re-run.  No caller action is required; recovery is transparent.
 
 ---
 
@@ -629,7 +670,7 @@ lock without any `File::metadata` syscall.
 | Operation                                                    | Lock (Unix / Windows) | Lock (other) |
 |--------------------------------------------------------------|-----------------------|--------------|
 | `push`, `extend`, `pop`, `pop_into`, `discard`               | write                 | write        |
-| `set`, `zero` *(feature)*                                    | write                 | write        |
+| `set`, `zero`, `repeat` *(feature)*                          | write                 | write        |
 | `atrunc`, `splice`, `splice_into`, `try_extend` *(atomic)*   | write                 | write        |
 | `try_discard(s, n > 0)` *(atomic)*                           | write                 | write        |
 | `try_discard(s, 0)` *(atomic)*                               | **read**              | **read**     |
@@ -833,7 +874,7 @@ the file does not grow without bound.
 
 ```toml
 [dependencies]
-bstack = { version = "0.2", features = ["alloc", "set"] }
+bstack = { version = "0.4", features = ["alloc", "set"] }
 ```
 
 #### On-disk layout
@@ -943,7 +984,7 @@ Implements both `BStackAllocator` and `BStackBulkAllocator`.
 
 ```toml
 [dependencies]
-bstack = { version = "0.2", features = ["alloc"] }
+bstack = { version = "0.4", features = ["alloc"] }
 ```
 
 | Operation               | Strategy                                         | Crash-safe  |
@@ -1037,7 +1078,7 @@ block; live allocations carry zero metadata overhead.
 
 ```toml
 [dependencies]
-bstack = { version = "0.2", features = ["alloc", "set"] }
+bstack = { version = "0.4", features = ["alloc", "set"] }
 ```
 
 #### On-disk layout
@@ -1125,7 +1166,7 @@ The constructor takes `data_size` — the number of usable bytes per block (must
 
 ```toml
 [dependencies]
-bstack = { version = "0.2", features = ["alloc", "set"] }
+bstack = { version = "0.4", features = ["alloc", "set"] }
 ```
 
 #### On-disk layout
@@ -1242,11 +1283,11 @@ complements but does not replace the allocator's own crash-safety guarantees.
 
 A growable byte (`u8`) vector backed by a `BStack` allocation, mirroring the core `Vec<u8>` API.
 
-For a general typed vector over arbitrary `Copy` types, see `PLANNED.md` — the general case requires a sound POD/byte-castable bound and is planned for a future release.
+A general typed vector over arbitrary `Copy` types requires a sound POD/byte-castable bound and is planned for a future release.
 
 ```toml
 [dependencies]
-bstack = { version = "0.2", features = ["alloc", "set"] }
+bstack = { version = "0.4", features = ["alloc", "set"] }
 ```
 
 ### Memory layout

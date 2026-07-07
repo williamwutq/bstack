@@ -5,7 +5,8 @@
 //! [`BStack`] treats a file as a flat byte buffer that grows and shrinks from
 //! the tail.  Every mutating operation — [`push`](BStack::push),
 //! [`extend`](BStack::extend), [`pop`](BStack::pop), [`discard`](BStack::discard), (with the `set`
-//! feature) [`set`](BStack::set) and [`zero`](BStack::zero), (with the `atomic` feature)
+//! feature) [`set`](BStack::set), [`zero`](BStack::zero), and
+//! [`repeat`](BStack::repeat), (with the `atomic` feature)
 //! [`replace`](BStack::replace), and (with both `set` and `atomic`)
 //! [`process`](BStack::process) — calls a *durable sync* before returning,
 //! so the data survives a process crash or an unclean system shutdown.
@@ -24,43 +25,86 @@
 //!
 //! # File format
 //!
-//! Every file begins with a fixed 16-byte header:
+//! Every file begins with a fixed 32-byte header, then the concatenated payload
+//! (push 0, push 1, …):
 //!
 //! ```text
-//! ┌────────────────────────┬──────────────┬──────────────┐
-//! │      header (16 B)     │  payload 0   │  payload 1   │  ...
-//! │  magic[8] | clen[8 LE] │              │              │
-//! └────────────────────────┴──────────────┴──────────────┘
-//! ^                        ^              ^              ^
-//! file offset 0         offset 16      16+n0          EOF
+//!   bytes      field
+//!   ─────      ─────
+//!    0 ..  8   magic[8]
+//!    8 .. 16   clen      — committed payload length (u64 LE)
+//!   16 .. 24   wip_ptr   — write-in-progress journal target (u64 LE; 0 when idle)
+//!   24 .. 32   wip_aux   — write-in-progress journal mode (u64 LE)
+//!   32 ..      payload   — push 0, push 1, … concatenated
 //! ```
 //!
 //! * **`magic`** — 8 bytes: `BSTK` + major(1 B) + minor(1 B) + patch(1 B) + reserved(1 B).
-//!   This version writes `BSTK\x00\x01\x0f\x00` (0.1.15).  [`open`](BStack::open)
-//!   accepts any file whose first 6 bytes match `BSTK\x00\x01` (any 0.1.x) and
+//!   This version writes `BSTK\x00\x04\x00\x00` (0.4.0).  [`open`](BStack::open)
+//!   accepts any file whose first 6 bytes match `BSTK\x00\x04` (any 0.4.x) and
 //!   rejects anything with a different major or minor.
 //! * **`clen`** — little-endian `u64` recording the *committed* payload length.
 //!   It is updated atomically with each [`push`](BStack::push) or
 //!   [`pop`](BStack::pop) and is used for crash recovery on the next
 //!   [`open`](BStack::open).
+//! * **`wip_ptr` / `wip_aux`** — two little-endian `u64` fields holding the
+//!   write-in-progress journal that makes in-place mutations crash-atomic.
+//!   `wip_ptr` is the physical offset an interrupted in-place write must be
+//!   replayed into (`0` in the steady state); `wip_aux` names the journal mode
+//!   (`Set` — verbatim replay of the staged tail; `Repeat` — repeat a staged
+//!   pattern; `Copy` — replay a disjoint copy from its still-intact source, of
+//!   which only the coordinate is staged; `SpliceGrow`/`SpliceShrink` — a
+//!   length-changing tail replace, whose new committed length recovery derives
+//!   from the file size and the recorded direction). Recovery interprets them on
+//!   [`open`](BStack::open) — see *Crash
+//!   recovery*. Legacy 0.1.x files (16-byte header) are upgraded in place by
+//!   [`BStack::migrate`].
 //!
 //! All user-visible offsets are **logical** (0-based from the start of the
-//! payload region, i.e. from file byte 16).
+//! payload region, i.e. from file byte 32).
 //!
 //! # Crash recovery
 //!
-//! On [`open`](BStack::open), the header's committed length is compared against
-//! the actual file size:
+//! On [`open`](BStack::open), recovery first checks the write-in-progress journal
+//! (`wip_ptr`); if disarmed, it reconciles the committed length against the file
+//! size:
 //!
 //! | Condition | Cause | Recovery |
 //! |-----------|-------|----------|
-//! | `file_size − 16 > clen` | partial tail write (push crashed before header update) | truncate to `16 + clen` |
-//! | `file_size − 16 < clen` | partial truncation (pop crashed before header update) | set `clen = file_size − 16` |
+//! | `wip_ptr != 0`, `wip_aux = Set` | an in-place `set`/`swap`/`cas`/`copy`/`cross_exchange` crashed mid-commit | replay the staged tail verbatim into `[wip_ptr, …)`, disarm, truncate to `32 + clen` |
+//! | `wip_ptr != 0`, `wip_aux = Repeat` | a `zero`/`repeat` crashed mid-fill | write `count` copies of the staged pattern into `[wip_ptr, …)`, disarm, truncate |
+//! | `wip_ptr != 0`, `wip_aux = Copy` | a disjoint `copy` crashed mid-copy | replay `move_chunked(src → wip_ptr)` from the untouched source (the tail stages only `[src \| n]`), disarm, truncate |
+//! | `wip_ptr != 0`, `wip_aux = SpliceGrow`/`SpliceShrink` | a length-changing `atrunc`/`splice`/`splice_into`/`replace` crashed mid-replace | derive `clen'` from the file size and direction, replay the staged new tail into `[wip_ptr, …)`, commit `clen'` while disarming, truncate |
+//! | `wip_ptr != 0`, `wip_aux` unrecognized | a mode armed by a newer build | roll back: disarm, truncate to `32 + clen` |
+//! | `wip_ptr == 0`, `file_size − 32 > clen` | partial tail write (push, or a crashed journal stage) before the header update | truncate to `32 + clen` |
+//! | `wip_ptr == 0`, `file_size − 32 < clen` | partial truncation (pop crashed before the header update) | set `clen = file_size − 32` |
 //!
-//! After recovery a `durable_sync` ensures the repaired state is on stable
-//! storage before any caller can observe or modify the file.
+//! Each replay is idempotent — the staged tail is immutable and disjoint from
+//! its target — so a crash during recovery itself is safe to re-run. After
+//! recovery a `durable_sync` ensures the repaired state is on stable storage
+//! before any caller can observe or modify the file.
 //!
 //! # Durability
+//!
+//! **In-place same-length writes** — [`set`](BStack::set), [`zero`](BStack::zero),
+//! [`repeat`](BStack::repeat), [`swap`](BStack::swap),
+//! [`swap_into`](BStack::swap_into), [`cas`](BStack::cas), [`copy`](BStack::copy),
+//! [`cross_exchange`](BStack::cross_exchange), [`process`](BStack::process), and
+//! the `crds` family — leave the payload length unchanged and are each
+//! **crash-atomic**, committing by one of two strategies (recovered on the next
+//! [`open`](BStack::open); see *Crash recovery*):
+//!
+//! * **Aligned-block write** — when the target lies within one power-fail-atomic
+//!   block, a single `write` + `durable_sync` is already all-or-nothing; no
+//!   journal is armed.
+//! * **Write-in-progress journal** — otherwise: stage a backup past `clen` →
+//!   `durable_sync` → arm `wip_ptr` → `durable_sync` → write in place →
+//!   `durable_sync` → clear `wip_ptr` → `durable_sync` → `ftruncate` the backup.
+//!   `zero`/`repeat` stage only `[count | pattern]`; `cross_exchange` stages one
+//!   region and commits at a single atomic `wip_ptr` flip; moves and fills stream
+//!   through a bounded buffer (O(1) memory).
+//!
+//! Below, *commit* denotes whichever of those two strategies applies to the bytes
+//! being written; anything before it is read/compare/callback work under the lock.
 //!
 //! | Operation | Syscall sequence |
 //! |-----------|-----------------|
@@ -68,23 +112,22 @@
 //! | `extend` | `lseek(END)` → `set_len(new_end)` → `lseek(8)` → `write(clen)` → `durable_sync` |
 //! | `pop`, `pop_into` | `lseek` → `read` → `ftruncate` → `lseek(8)` → `write(clen)` → `durable_sync` |
 //! | `discard` | `ftruncate` → `lseek(8)` → `write(clen)` → `durable_sync` |
-//! | `set` *(feature)* | `lseek(offset)` → `write(data)` → `durable_sync` |
-//! | `zero` *(feature)* | `lseek(offset)` → `write(zeros)` → `durable_sync` |
-//! | `atrunc` *(feature: atomic, net extension)* | `set_len(new_end)` → `lseek(tail)` → `write(buf)` → `durable_sync` → `lseek(8)` → `write(clen)` → `durable_sync` |
-//! | `atrunc` *(feature: atomic, net truncation)* | `lseek(tail)` → `write(buf)` → `set_len(new_end)` → `durable_sync` → `lseek(8)` → `write(clen)` → `durable_sync` |
+//! | `set` *(feature)* | *commit* `data` |
+//! | `zero`, `repeat` *(feature)* | *commit* the repeated pattern (the journal stages only `[count \| pattern]`) |
+//! | `atrunc` *(feature: atomic)* | dispatch on the tail-replace shape: pure truncation → `ftruncate` → *commit* `clen`; pure append → `set_len(new_end)` → `write(buf)` → `durable_sync` → *commit* `clen`; same-length → *commit* `buf` in place; length change → **splice journal** (stage the new tail past the payload → arm `SpliceGrow`/`SpliceShrink` → replay into place → atomically commit `clen'` + disarm → truncate, a `durable_sync` at each barrier) |
 //! | `splice`, `splice_into` *(feature: atomic)* | `lseek(tail)` → `read(n)` → *(then as `atrunc`)* |
 //! | `try_extend` *(feature: atomic)* | `lseek(END)` — conditional `push` sequence if size matches |
 //! | `try_discard` *(feature: atomic)* | `lseek(END)` — conditional `discard` sequence if size matches |
 //! | `try_extend_zeros` *(feature: atomic)* | `lseek(END)` — conditional `extend(n)` sequence if size matches |
-//! | `swap`, `swap_into` *(features: set+atomic)* | `lseek(offset)` → `read` → `lseek(offset)` → `write(buf)` → `durable_sync` |
-//! | `cas` *(features: set+atomic)* | `lseek(offset)` → `read` → compare — conditional `lseek(offset)` → `write(new)` → `durable_sync` |
-//! | `process` *(features: set+atomic)* | `lseek(start)` → `read(end−start)` → *(callback)* → `lseek(start)` → `write(buf)` → `durable_sync` |
-//! | `process_gen` *(features: set+atomic)* | closure-driven: zero or more `lseek`/`pread` reads, ending in at most one mutating step — `lseek` → `write` → `durable_sync` for `Write`, or the two-region read/read/write/write → `durable_sync` of `cross_exchange` for `Swap` |
+//! | `swap`, `swap_into` *(features: set+atomic)* | `read` old bytes → *commit* `buf` |
+//! | `cas` *(features: set+atomic)* | `read` → compare — conditional *commit* of `new` |
+//! | `process` *(features: set+atomic)* | `read(start..end)` → *(callback)* → *commit* the buffer |
+//! | `process_gen` *(features: set+atomic)* | closure-driven reads, ending in at most one mutating step: `Write` *commits*; `Swap` uses the exchange journal (as `cross_exchange`); `Push`/`Pop`/`Discard`/`Atrunc`/`Splice` behave as their standalone forms |
 //! | `replace` *(feature: atomic)* | `lseek(tail)` → `read(n)` → *(callback)* → *(then as `atrunc`)* |
-//! | `cross_exchange` *(features: set+atomic)* | `lseek(a)` → `read(n)` → `lseek(b)` → `read(n)` → `lseek(a)` → `write` → `lseek(b)` → `write` → `durable_sync` |
-//! | `copy` *(features: set+atomic)* | `lseek(from)` → `read(n)` → `lseek(to)` → `write(n)` → `durable_sync` |
-//! | `eq_crds`, `ne_crds` *(features: set+atomic)* | `lseek(a)` → `read` → compare — conditional `lseek(b)` → `write(b_buf)` → `durable_sync` |
-//! | `masked_eq_crds`, `masked_ne_crds` *(features: set+atomic)* | `lseek(a)` → `read` → mask+compare — conditional `lseek(b)` → `write(b_buf)` → `durable_sync` |
+//! | `cross_exchange` *(features: set+atomic)* | `read(a)`, `read(b)` → exchange journal: stage `a` → arm at `a` → write `b`→`a` → flip `wip_ptr` to `b` → write `a`→`b` → disarm → `ftruncate` (a `durable_sync` at each barrier) |
+//! | `copy` *(features: set+atomic)* | same-location → no-op; single-block dest → *commit*; overlapping → stream source→tail→dest (`Set` journal); disjoint → **copy journal** (stage only `[src \| n]` → arm `Copy` → stream source→dest → disarm; recovery replays from the untouched source) |
+//! | `eq_crds`, `ne_crds` *(features: set+atomic)* | `read(a)` → compare — conditional *commit* of `b_buf` |
+//! | `masked_eq_crds`, `masked_ne_crds` *(features: set+atomic)* | `read(a)` → mask+compare — conditional *commit* of `b_buf` |
 //! | `peek`, `peek_into`, `get`, `get_into`, `get_batched`, `get_batched_into`, `get_batched_gen` | `pread(2)` on Unix; `ReadFile`+`OVERLAPPED` on Windows; `lseek` → `read` elsewhere (no sync — read-only) |
 //!
 //! **`durable_sync` on macOS** issues `fcntl(F_FULLFSYNC)`, which flushes the
@@ -144,7 +187,7 @@
 //! | Operation | Lock (Unix / Windows) | Lock (other) |
 //! |-----------|-----------------------|--------------|
 //! | `push`, `extend`, `pop`, `pop_into`, `discard` | write | write |
-//! | `set`, `zero` *(feature)* | write | write |
+//! | `set`, `zero`, `repeat` *(feature)* | write | write |
 //! | `atrunc`, `splice`, `splice_into`, `try_extend`, `try_extend_zeros` *(feature: atomic)* | write | write |
 //! | `try_discard(s, n > 0)` *(feature: atomic)* | write | write |
 //! | `try_discard(s, 0)` *(feature: atomic)* | **read** | **read** |
@@ -209,6 +252,7 @@
 //!     sufficient upper bound.
 //!
 //! * **Write protection.**  [`set`](BStack::set), [`zero`](BStack::zero),
+//!   [`repeat`](BStack::repeat),
 //!   [`swap`](BStack::swap), [`swap_into`](BStack::swap_into),
 //!   [`cas`](BStack::cas), [`process`](BStack::process),
 //!   [`cross_exchange`](BStack::cross_exchange), [`copy`](BStack::copy)
@@ -320,7 +364,7 @@
 //!
 //! | Trait | Semantics |
 //! |-------|-----------|
-//! | `Debug` | Shows `version` (semver string from the magic header, e.g. `"0.1.6"`) and `len` (`Option<u64>`, `None` on I/O failure). |
+//! | `Debug` | Shows `version` (semver string from the magic header, e.g. `"0.4.0"`) and `len` (`Option<u64>`, `None` on I/O failure). |
 //! | `PartialEq` / `Eq` | **Pointer identity.** Two values are equal iff they are the same instance. No two distinct `BStack` values in one process can refer to the same file. |
 //! | `Hash` | Hashes the instance address — consistent with pointer-identity `PartialEq`. |
 //!
@@ -336,7 +380,7 @@
 //!
 //! | Feature | Description |
 //! |---------|-------------|
-//! | `set`   | Enables [`BStack::set`] and [`BStack::zero`] — in-place overwrite of existing payload bytes (or with zeros) without changing the file size. |
+//! | `set`   | Enables [`BStack::set`], [`BStack::zero`], and [`BStack::repeat`] — in-place overwrite of existing payload bytes (with data, zeros, or a repeated pattern) without changing the file size. |
 //! | `alloc` | Enables [`BStackAllocator`], [`BStackBulkAllocator`], [`BStackSlice`], [`BStackSliceReader`], and [`LinearBStackAllocator`] — region-based allocation over a `BStack` payload. Combined with `set`, also enables [`BStackSliceWriter`], [`FirstFitBStackAllocator`], [`GhostTreeBstackAllocator`], and [`BStackByteVec`]. |
 //! | `atomic` | Enables [`BStack::atrunc`], [`BStack::splice`], [`BStack::splice_into`], [`BStack::try_extend`], [`BStack::try_extend_zeros`], [`BStack::try_discard`], [`BStack::replace`], [`BStack::get_batched`], [`BStack::get_batched_into`], and [`BStack::get_batched_gen`] — compound read-modify-write operations that hold the lock across what would otherwise be separate calls. Combined with `set`, also enables [`BStack::swap`], [`BStack::swap_into`], [`BStack::cas`], [`BStack::process`], [`BStack::process_gen`], [`BStackGenOp`], [`BStack::cross_exchange`], [`BStack::copy`], [`BStack::eq_crds`], [`BStack::ne_crds`], [`BStack::masked_eq_crds`], and [`BStack::masked_ne_crds`]. |
 //!
@@ -344,11 +388,11 @@
 //!
 //! ```toml
 //! [dependencies]
-//! bstack = { version = "0.1", features = ["set"] }
+//! bstack = { version = "0.4", features = ["set"] }
 //! # or
-//! bstack = { version = "0.1", features = ["alloc"] }
+//! bstack = { version = "0.4", features = ["alloc"] }
 //! # or both
-//! bstack = { version = "0.1", features = ["alloc", "set"] }
+//! bstack = { version = "0.4", features = ["alloc", "set"] }
 //! ```
 //!
 //! # Allocator (`alloc` feature)
@@ -484,6 +528,8 @@
 //! # }
 //! ```
 
+mod io_core;
+use io_core::*;
 #[cfg(all(test, feature = "alloc", feature = "set"))]
 mod alloc_fuzz_tests;
 mod test;
@@ -510,19 +556,15 @@ use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
 
-#[cfg(unix)]
-use std::os::unix::fs::FileExt;
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 #[cfg(unix)]
 use std::os::unix::io::RawFd;
 
-#[cfg(windows)]
-use std::os::windows::fs::FileExt as WindowsFileExt;
 #[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
 #[cfg(windows)]
@@ -534,128 +576,44 @@ use windows_sys::Win32::Storage::FileSystem::{
 #[cfg(windows)]
 use windows_sys::Win32::System::IO::OVERLAPPED;
 
-/// Full magic for files written by this version (`BSTK` + major 0 + minor 1 + patch 15 + 0).
-const MAGIC: [u8; 8] = *b"BSTK\x00\x01\x0f\x00";
+/// On-disk **format** version encoded in the magic header. This is independent
+/// of the crate version: it bumps only when the file format changes in a way an
+/// older reader cannot handle. 0.4.0 introduces the 32-byte write-in-progress
+/// journal header (see `algos/WIP.md`); bumping the minor here makes older binaries
+/// reject the new files loudly instead of misreading them.
+const FORMAT_MAJOR: u8 = 0;
+const FORMAT_MINOR: u8 = 4;
+const FORMAT_PATCH: u8 = 0;
 
-/// Compatibility prefix checked on open: `BSTK` + major 0 + minor 1.
-/// Any file whose first 6 bytes match is considered a compatible 0.1.x file.
-const MAGIC_PREFIX: [u8; 6] = *b"BSTK\x00\x01";
+/// Full magic for files written by this version
+/// (`BSTK` + major + minor + patch + reserved(0)).
+const MAGIC: [u8; 8] = [
+    b'B',
+    b'S',
+    b'T',
+    b'K',
+    FORMAT_MAJOR,
+    FORMAT_MINOR,
+    FORMAT_PATCH,
+    0,
+];
 
-/// Bytes occupied by the file header (magic[8] + committed_len[8]).
-const HEADER_SIZE: u64 = 16;
+/// Compatibility prefix checked on open: `BSTK` + format major + minor. A file
+/// is accepted only when its first 6 bytes match — i.e. the same format
+/// `major.minor`. The patch byte is informational and is not compared.
+const MAGIC_PREFIX: [u8; 6] = [b'B', b'S', b'T', b'K', FORMAT_MAJOR, FORMAT_MINOR];
 
-/// Conservative power-fail atomic block size, in bytes.
-///
-/// Real storage writes whole blocks atomically: a single write confined to one
-/// block either lands in full or not at all across a power loss. Devices differ
-/// in their true block size (commonly 512 B or 4 KB), but 256 B is a lower bound
-/// that holds on virtually all hardware — including eMMC and older NVMe
-/// controllers that advertise larger blocks yet only guarantee 512 B or 256 B
-/// power-fail atomicity. Because 256 divides those sizes and the file's first
-/// byte is block-aligned, a write confined to one 256 B-aligned region is always
-/// contained within a single hardware block. See *Derived atomicity beyond 8 B*
-/// in `PLANNED.md`.
-#[cfg(any(feature = "set", feature = "atomic"))]
-const ATOMIC_BLOCK: u64 = 256;
+/// Magic prefix of the pre-0.4.0 (0.1.x) format that [`BStack::migrate`]
+/// upgrades from: `BSTK` + major 0 + minor 1.
+const LEGACY_MAGIC_PREFIX: [u8; 6] = [b'B', b'S', b'T', b'K', 0, 1];
 
-/// Flush all in-flight writes to stable storage.
-///
-/// On macOS this uses `F_FULLFSYNC` to flush the drive's hardware write cache,
-/// which `fdatasync` alone does not guarantee.  Falls back to `sync_data` if
-/// `F_FULLFSYNC` returns an error (e.g. the device doesn't support it).
-/// On all other platforms this delegates to `sync_data` (`fdatasync`).
-fn durable_sync(file: &File) -> io::Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        let ret = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC) };
-        if ret != -1 {
-            return Ok(());
-        }
-        // Device does not support F_FULLFSYNC; fall back to fdatasync.
-    }
-    file.sync_data()
-}
-
-/// Acquire an exclusive, non-blocking advisory flock on `file`.
-///
-/// Returns `Err(WouldBlock)` if another process already holds the lock.
-#[cfg(unix)]
-fn flock_exclusive(file: &File) -> io::Result<()> {
-    let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if ret == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
-/// Acquire an exclusive, non-blocking `LockFileEx` lock on `file`.
-///
-/// Locks the entire file range (offset 0, length `u64::MAX`).
-/// Returns `Err(WouldBlock)` if another process already holds the lock
-/// (`ERROR_LOCK_VIOLATION` maps to `io::ErrorKind::WouldBlock` in Rust).
-#[cfg(windows)]
-fn lock_file_exclusive(file: &File) -> io::Result<()> {
-    let handle = file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
-    // OVERLAPPED is required by LockFileEx even for synchronous handles.
-    // Offset fields (0, 0) anchor the lock at byte 0 of the file.
-    let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
-    let ret = unsafe {
-        LockFileEx(
-            handle,
-            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
-            0,        // reserved, must be zero
-            u32::MAX, // nNumberOfBytesToLockLow  ─┐ lock entire
-            u32::MAX, // nNumberOfBytesToLockHigh ─┘ file space
-            &mut overlapped,
-        )
-    };
-    if ret != 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
-/// Write the 16-byte header into a brand-new (empty) file.
-fn init_header(file: &mut File) -> io::Result<()> {
-    file.seek(SeekFrom::Start(0))?;
-    file.write_all(&MAGIC)?;
-    file.write_all(&0u64.to_le_bytes())
-}
-
-/// Overwrite the committed-length field at file offset 8 and update the
-/// in-memory cache (`clen`) to match.
-fn write_committed_len(file: &mut File, clen: &mut u64, len: u64) -> io::Result<()> {
-    file.seek(SeekFrom::Start(8))?;
-    file.write_all(&len.to_le_bytes())?;
-    *clen = len;
-    Ok(())
-}
-
-/// Seek to logical `offset` (just past the header) and fill `buf` from the file.
-///
-/// Shared by every write-lock-held operation that reads a payload region
-/// through the file cursor.
-fn read_at(file: &mut File, offset: u64, buf: &mut [u8]) -> io::Result<()> {
-    file.seek(SeekFrom::Start(HEADER_SIZE + offset))?;
-    file.read_exact(buf)
-}
-
-/// Seek to logical `offset` (just past the header) and write `data` there.
-///
-/// Shared by every write-lock-held operation that mutates a payload region
-/// through the file cursor.
-#[cfg(any(feature = "set", feature = "atomic"))]
-fn write_at(file: &mut File, offset: u64, data: &[u8]) -> io::Result<()> {
-    file.seek(SeekFrom::Start(HEADER_SIZE + offset))?;
-    file.write_all(data)
-}
+/// Header size of the pre-0.4.0 (0.1.x) format: `magic[8] + committed_len[8]`.
+const LEGACY_HEADER_SIZE: u64 = 16;
 
 /// Compute `base + len`, mapping `u64` overflow to an `InvalidInput` error
 /// carrying `msg`.
 #[cfg(any(feature = "set", feature = "atomic"))]
-fn checked_end(base: u64, len: u64, msg: &'static str) -> io::Result<u64> {
+pub(crate) fn checked_end(base: u64, len: u64, msg: &'static str) -> io::Result<u64> {
     base.checked_add(len)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, msg))
 }
@@ -667,7 +625,12 @@ fn checked_end(base: u64, len: u64, msg: &'static str) -> io::Result<u64> {
 /// `swap_into`, `cas`); callers must load `locked` under the write lock so the
 /// check cannot race a concurrent `lock_up_to`.
 #[cfg(feature = "set")]
-fn check_offset_unlocked(op: &str, offset: u64, end: u64, locked: u64) -> io::Result<()> {
+pub(crate) fn check_offset_unlocked(
+    op: &str,
+    offset: u64,
+    end: u64,
+    locked: u64,
+) -> io::Result<()> {
     if offset < locked {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -675,271 +638,6 @@ fn check_offset_unlocked(op: &str, offset: u64, end: u64, locked: u64) -> io::Re
         ));
     }
     Ok(())
-}
-
-/// Return `true` if overwriting `[offset, offset + data.len())` of the payload is
-/// guaranteed atomic at the storage level — i.e. the bytes are confined to a
-/// single [`ATOMIC_BLOCK`]-aligned region of the file and therefore cannot tear
-/// across a block boundary on power loss.
-///
-/// `offset` is a logical payload offset; the test is applied to the physical
-/// file position `HEADER_SIZE + offset`, since the file's first byte is
-/// block-aligned. The write is atomic exactly when its first and last bytes fall
-/// in the same block. An empty write is trivially atomic; an offset/length that
-/// overflows `u64` cannot be confined to one block and is reported non-atomic.
-///
-/// This is the gate for skipping the write-in-progress journal on a same-length
-/// `set` whose slice fits within one block (see the *Aligned-block atomicity*
-/// open question in `PLANNED.md`). It is conservative: a write it rejects may
-/// still be atomic on hardware with a larger true block size, but a write it
-/// accepts is atomic on all supported storage.
-// Not yet wired into `set`; it is the primitive the journaling work will call to
-// decide when the write-in-progress journal can be skipped.
-#[cfg(any(feature = "set", feature = "atomic"))]
-#[allow(dead_code)]
-fn is_atomic_write(offset: u64, data: &[u8]) -> bool {
-    let len = data.len() as u64;
-    if len == 0 {
-        return true;
-    }
-    let Some(start) = HEADER_SIZE.checked_add(offset) else {
-        return false;
-    };
-    let Some(last) = start.checked_add(len - 1) else {
-        return false;
-    };
-    start / ATOMIC_BLOCK == last / ATOMIC_BLOCK
-}
-
-/// Commit a payload growth to `new_len` and durably sync.
-///
-/// On failure the file is rolled back (best effort) to `file_end` bytes and the
-/// cached/committed length is reset to `old_len` before the original error is
-/// returned. The cache is reset up front so it reflects the rolled-back file
-/// even if the best-effort header rewrite fails. Shared by `push`, `extend`,
-/// `try_extend`, `try_extend_zeros`, and the `Push` arm of `process_gen`.
-fn commit_grow(
-    file: &mut File,
-    clen: &mut u64,
-    new_len: u64,
-    old_len: u64,
-    file_end: u64,
-) -> io::Result<()> {
-    if let Err(e) = write_committed_len(file, clen, new_len).and_then(|_| durable_sync(file)) {
-        let _ = file.set_len(file_end);
-        *clen = old_len;
-        let _ = write_committed_len(file, clen, old_len);
-        let _ = durable_sync(file);
-        return Err(e);
-    }
-    Ok(())
-}
-
-/// Commit a payload shrink to `new_len`: truncate the file, update the cached
-/// length, write the header, and durably sync.
-///
-/// The truncation is the commit point — recovery adopts the smaller file size —
-/// so the cache is updated before the header write, which `?` could skip on
-/// error. Shared by `pop`, `pop_into`, `discard`, `try_discard`, and the `Pop`
-/// and `Discard` arms of `process_gen`.
-fn commit_shrink(file: &mut File, clen: &mut u64, new_len: u64) -> io::Result<()> {
-    file.set_len(HEADER_SIZE + new_len)?;
-    *clen = new_len;
-    write_committed_len(file, clen, new_len)?;
-    durable_sync(file)
-}
-
-/// Commit a tail replacement: the payload from `new_tail_start` onward is
-/// replaced by `buf`, changing the payload length to `new_tail_start +
-/// buf.len()`. `n` is the number of bytes removed from the old tail; `file_end`
-/// is the pre-operation raw file size, used for rollback on the net-extension
-/// path.
-///
-/// The write ordering is chosen from the net size change to maximise crash
-/// safety (see *Durability* in the crate docs). Shared by `atrunc`, `splice`,
-/// `splice_into`, and `replace`.
-#[cfg(feature = "atomic")]
-fn commit_tail_replace(
-    file: &mut File,
-    clen: &mut u64,
-    new_tail_start: u64,
-    n: u64,
-    buf: &[u8],
-    file_end: u64,
-) -> io::Result<()> {
-    let buf_len = buf.len() as u64;
-    let final_data_len = new_tail_start + buf_len;
-    if buf_len > n {
-        // Net extension: extend first so data is never lost, then write buf,
-        // sync the data, then commit the new length.
-        file.set_len(HEADER_SIZE + final_data_len)?;
-        if let Err(e) = write_at(file, new_tail_start, buf) {
-            let _ = file.set_len(file_end);
-            return Err(e);
-        }
-        if let Err(e) = durable_sync(file) {
-            let _ = file.set_len(file_end);
-            return Err(e);
-        }
-        write_committed_len(file, clen, final_data_len)?;
-        durable_sync(file)?;
-    } else {
-        // Net truncation or same size: write buf into the old tail first,
-        // truncate, sync, then commit the new length.
-        if !buf.is_empty() {
-            write_at(file, new_tail_start, buf)?;
-        }
-        file.set_len(HEADER_SIZE + final_data_len)?;
-        // The truncation is the commit point (recovery adopts the smaller file
-        // size), so update the cache now — before the sync and header write,
-        // which `?` could skip on error.
-        *clen = final_data_len;
-        durable_sync(file)?;
-        write_committed_len(file, clen, final_data_len)?;
-        durable_sync(file)?;
-    }
-    Ok(())
-}
-
-/// Read `len` bytes from absolute file position `offset` without modifying
-/// the file-position cursor, so the caller only needs a shared (read) lock.
-///
-/// On Unix this uses `pread(2)` via `read_exact_at`.
-/// On Windows this uses `ReadFile` with an `OVERLAPPED` offset (via
-/// `seek_read`), which is also cursor-safe on synchronous handles.
-#[cfg(unix)]
-fn pread_exact(file: &File, offset: u64, len: usize) -> io::Result<Vec<u8>> {
-    let mut buf = vec![0u8; len];
-    file.read_exact_at(&mut buf, offset)?;
-    Ok(buf)
-}
-
-/// Windows counterpart of `pread_exact` — see the shared doc comment above.
-#[cfg(windows)]
-fn pread_exact(file: &File, offset: u64, len: usize) -> io::Result<Vec<u8>> {
-    let mut buf = vec![0u8; len];
-    let mut filled = 0usize;
-    while filled < len {
-        let n = file.seek_read(&mut buf[filled..], offset + filled as u64)?;
-        if n == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "pread_exact: unexpected EOF",
-            ));
-        }
-        filled += n;
-    }
-    Ok(buf)
-}
-
-/// Fill `buf` from absolute file position `offset` without modifying the
-/// file-position cursor.  Unix uses `pread(2)` via `read_exact_at`;
-/// Windows uses `ReadFile` with an `OVERLAPPED` offset via `seek_read`.
-#[cfg(unix)]
-fn pread_exact_into(file: &File, offset: u64, buf: &mut [u8]) -> io::Result<()> {
-    file.read_exact_at(buf, offset)
-}
-
-/// Windows counterpart of `pread_exact_into`.
-#[cfg(windows)]
-fn pread_exact_into(file: &File, offset: u64, buf: &mut [u8]) -> io::Result<()> {
-    let len = buf.len();
-    let mut filled = 0usize;
-    while filled < len {
-        let n = file.seek_read(&mut buf[filled..], offset + filled as u64)?;
-        if n == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "pread_exact_into: unexpected EOF",
-            ));
-        }
-        filled += n;
-    }
-    Ok(())
-}
-
-/// Lock-free positional read using a raw file descriptor (Unix).
-///
-/// Calls `pread(2)` directly, bypassing the `RwLock<File>`.  Safe only when
-/// the target range is within the immutable locked region, ensuring no
-/// concurrent writer can touch those bytes.
-#[cfg(unix)]
-fn pread_exact_raw(fd: RawFd, offset: u64, buf: &mut [u8]) -> io::Result<()> {
-    let mut filled = 0usize;
-    while filled < buf.len() {
-        let n = unsafe {
-            libc::pread(
-                fd,
-                buf[filled..].as_mut_ptr() as *mut libc::c_void,
-                buf.len() - filled,
-                (offset + filled as u64) as libc::off_t,
-            )
-        };
-        if n < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if n == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "locked pread: unexpected EOF",
-            ));
-        }
-        filled += n as usize;
-    }
-    Ok(())
-}
-
-/// Lock-free positional read using a raw Windows HANDLE.
-///
-/// Calls `ReadFile` with an `OVERLAPPED` offset, bypassing the `RwLock<File>`.
-/// Safe under the same invariant as `pread_exact_raw`.
-#[cfg(windows)]
-fn pread_exact_raw_handle(handle: isize, offset: u64, buf: &mut [u8]) -> io::Result<()> {
-    let handle = handle as HANDLE;
-    let mut filled = 0usize;
-    let len = buf.len();
-    while filled < len {
-        let current_offset = offset + filled as u64;
-        let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
-        // SAFETY: the Anonymous/Anonymous path exists in the windows-sys OVERLAPPED layout.
-        overlapped.Anonymous.Anonymous.Offset = current_offset as u32;
-        overlapped.Anonymous.Anonymous.OffsetHigh = (current_offset >> 32) as u32;
-        let mut bytes_read: u32 = 0;
-        let ret = unsafe {
-            ReadFile(
-                handle,
-                buf[filled..].as_mut_ptr(),
-                (len - filled) as u32,
-                &mut bytes_read,
-                &mut overlapped,
-            )
-        };
-        if ret == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if bytes_read == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "locked ReadFile: unexpected EOF",
-            ));
-        }
-        filled += bytes_read as usize;
-    }
-    Ok(())
-}
-
-/// Read and validate the header; return the committed payload length.
-fn read_header(file: &mut File) -> io::Result<u64> {
-    file.seek(SeekFrom::Start(0))?;
-    let mut hdr = [0u8; 16];
-    file.read_exact(&mut hdr)?;
-    if hdr[0..6] != MAGIC_PREFIX {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "bstack: bad magic number — not a bstack file or incompatible version",
-        ));
-    }
-    Ok(u64::from_le_bytes(hdr[8..16].try_into().unwrap()))
 }
 
 // ---------------------------------------------------------------------------
@@ -988,9 +686,35 @@ pub struct BStack {
 // fd / handle remains valid for as long as `BStack` owns the `File`.
 
 impl BStack {
+    /// Write the 32-byte header into a brand-new (empty) file.
+    fn init_header(file: &mut File) -> io::Result<()> {
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(&MAGIC)?;
+        // committed_len[8] + wip_ptr[8] + wip_aux[8], all zero on a fresh file.
+        file.write_all(&[0u8; (HEADER_SIZE - 8) as usize])
+    }
+
+    /// Read and validate the 32-byte header; return `(committed_len, wip_ptr,
+    /// wip_aux)`.
+    fn read_header(file: &mut File) -> io::Result<(u64, u64, u64)> {
+        file.seek(SeekFrom::Start(0))?;
+        let mut hdr = [0u8; HEADER_SIZE as usize];
+        file.read_exact(&mut hdr)?;
+        if hdr[0..6] != MAGIC_PREFIX {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bstack: bad magic number — not a bstack file or incompatible version",
+            ));
+        }
+        let committed_len = u64::from_le_bytes(hdr[8..16].try_into().unwrap());
+        let wip_ptr = u64::from_le_bytes(hdr[16..24].try_into().unwrap());
+        let wip_aux = u64::from_le_bytes(hdr[24..32].try_into().unwrap());
+        Ok((committed_len, wip_ptr, wip_aux))
+    }
+
     /// Open or create a stack file at `path`.
     ///
-    /// On a **new** file the 16-byte header is written and durably synced
+    /// On a **new** file the 32-byte header is written and durably synced
     /// before returning.
     ///
     /// On an **existing** file the header is validated and, if a previous crash
@@ -1028,27 +752,35 @@ impl BStack {
 
         let mut clen = 0u64;
         if raw_size == 0 {
-            init_header(&mut file)?;
+            Self::init_header(&mut file)?;
             durable_sync(&file)?;
         } else if raw_size < HEADER_SIZE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "bstack: file is {raw_size} bytes — too small to contain the 16-byte header"
+                    "bstack: file is {raw_size} bytes — too small to contain the {HEADER_SIZE}-byte header"
                 ),
             ));
         } else {
-            let committed_len = read_header(&mut file)?;
-            let actual_data_len = raw_size - HEADER_SIZE;
-            if actual_data_len != committed_len {
-                // Recover: use whichever length is smaller (the committed
-                // value is the last successfully synced boundary).
-                let correct_len = committed_len.min(actual_data_len);
-                file.set_len(HEADER_SIZE + correct_len)?;
-                write_committed_len(&mut file, &mut clen, correct_len)?;
-                durable_sync(&file)?;
+            let (committed_len, wip_ptr, wip_aux) = Self::read_header(&mut file)?;
+            clen = committed_len;
+            if wip_ptr != 0 {
+                // An in-place write was in flight. Replay or roll it back, then
+                // restore the at-rest invariant. A splice changes the committed
+                // length, so adopt whatever recovery commits.
+                clen = recover_wip(&mut file, committed_len, wip_ptr, wip_aux, raw_size)?;
             } else {
-                clen = committed_len;
+                // No journal armed: reconcile the committed length against the
+                // file size, using whichever is smaller (the committed value is
+                // the last successfully synced boundary). This drops a stale tail
+                // from a crashed push/extend or a crashed journal stage.
+                let actual_data_len = raw_size - HEADER_SIZE;
+                if actual_data_len != committed_len {
+                    let correct_len = committed_len.min(actual_data_len);
+                    file.set_len(HEADER_SIZE + correct_len)?;
+                    write_committed_len(&mut file, &mut clen, correct_len)?;
+                    durable_sync(&file)?;
+                }
             }
         }
 
@@ -1067,6 +799,92 @@ impl BStack {
             cache_enabled: false,
             cache: Mutex::new(Vec::new()),
         })
+    }
+
+    /// Upgrade a legacy pre-0.4.0 (0.1.x, 16-byte header) file at `path` to the
+    /// current 0.4.0 layout (32-byte header), in place.
+    ///
+    /// The file is rewritten into a sibling `"<path>.migrating"` — a fresh 0.4.0
+    /// header followed by the old payload shifted from offset 16 to offset 32 —
+    /// which is then atomically renamed onto the original (a crash leaves either
+    /// the intact original or the finished new file, never neither). The
+    /// committed length is preserved (clamped to the bytes actually present,
+    /// mirroring [`open`](BStack::open)'s recovery).
+    ///
+    /// The caller must not hold the file open elsewhere. On success `path` is a
+    /// valid 0.4.0 file ready for [`open`](BStack::open).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidData`] if `path` is not a legacy 0.1.x
+    /// file (wrong magic, or shorter than the 16-byte legacy header), and
+    /// propagates any I/O error from reading, writing, syncing, removing, or
+    /// renaming.
+    pub fn migrate(path: impl AsRef<Path>) -> io::Result<()> {
+        let path = path.as_ref();
+
+        // Read and validate the legacy 16-byte header.
+        let mut old = OpenOptions::new().read(true).open(path)?;
+        let old_size = old.metadata()?.len();
+        if old_size < LEGACY_HEADER_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "bstack: file is {old_size} bytes — too small to be a legacy {LEGACY_HEADER_SIZE}-byte-header file"
+                ),
+            ));
+        }
+        let mut hdr = [0u8; LEGACY_HEADER_SIZE as usize];
+        old.read_exact(&mut hdr)?;
+        if hdr[0..6] != LEGACY_MAGIC_PREFIX {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bstack: not a legacy 0.1.x file — nothing to migrate",
+            ));
+        }
+        // Committed length, clamped to the payload actually present.
+        let clen =
+            u64::from_le_bytes(hdr[8..16].try_into().unwrap()).min(old_size - LEGACY_HEADER_SIZE);
+
+        // Sibling path "<path>.migrating", in the same directory so the final
+        // rename stays within one filesystem.
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(".migrating");
+        let tmp = PathBuf::from(tmp);
+
+        // Write the new file: 32-byte 0.4.0 header, then the old payload shifted
+        // from offset 16 to offset 32.
+        {
+            let mut new = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&tmp)?;
+            new.write_all(&MAGIC)?; // magic[8]
+            new.write_all(&clen.to_le_bytes())?; // committed_len[8]
+            new.write_all(&[0u8; 16])?; // wip_ptr[8] | wip_aux[8] = 0
+            old.seek(SeekFrom::Start(LEGACY_HEADER_SIZE))?;
+            let mut src = (&mut old).take(clen);
+            let copied = io::copy(&mut src, &mut new)?;
+            if copied != clen {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "bstack: legacy payload shorter than committed length during migration",
+                ));
+            }
+            new.sync_all()?;
+        }
+        drop(old);
+
+        // Atomically swap the sibling in for the original. `rename` replaces the
+        // destination in a single step on both Unix (`rename(2)`) and Windows
+        // (`MoveFileExW` with `MOVEFILE_REPLACE_EXISTING`), so a crash leaves
+        // either the intact original or the completed 0.4.0 file at `path` —
+        // never neither. (Removing the original first would open a window where
+        // a crash leaves only the sibling.)
+        std::fs::rename(&tmp, path)?;
+        Ok(())
     }
 
     /// Append `data` to the end of the file.
@@ -1555,16 +1373,20 @@ impl BStack {
     ///
     /// Only available when the `set` Cargo feature is enabled.
     ///
-    /// # Durability
+    /// # Durability & atomicity
     ///
-    /// Equivalent to `push`/`pop`: the overwritten bytes are durably synced
-    /// before the call returns.
+    /// Crash-atomic: after a crash the slice holds either its old contents or the
+    /// full new `data`, never a partial mix. A write confined to a single aligned
+    /// storage block is committed with one durably-synced write; a larger write
+    /// goes through the write-in-progress journal (stage → arm → commit → disarm),
+    /// which recovery replays or rolls back on the next [`open`](Self::open). The
+    /// overwritten bytes are durably synced before the call returns.
     ///
     /// # Errors
     ///
     /// Returns [`io::ErrorKind::InvalidInput`] if `offset + data.len()`
     /// exceeds the current payload size, or if the addition overflows `u64`.
-    /// Propagates any I/O error from `write_all` or `durable_sync`.
+    /// Propagates any I/O error from `write_all`, `set_len`, or `durable_sync`.
     #[cfg(feature = "set")]
     pub fn set(&self, offset: u64, data: impl AsRef<[u8]>) -> io::Result<()> {
         let data = data.as_ref();
@@ -1586,8 +1408,7 @@ impl BStack {
                 format!("set: write end ({end}) exceeds payload size ({data_size})"),
             ));
         }
-        write_at(file, offset, data)?;
-        durable_sync(file)
+        set_in_place(file, data_size, offset, data)
     }
 
     /// Overwrite `n` bytes with zeros in place starting at logical `offset`.
@@ -1600,16 +1421,19 @@ impl BStack {
     ///
     /// Only available when the `set` Cargo feature is enabled.
     ///
-    /// # Durability
+    /// # Durability & atomicity
     ///
-    /// Equivalent to `push`/`pop`: the overwritten bytes are durably synced
-    /// before the call returns.
+    /// Crash-atomic on the same terms as [`set`](Self::set): the zeroed slice
+    /// survives a crash as either its old contents or all-zeros, never a mix.
+    /// Small writes take the single-block atomic path; larger ones go through the
+    /// write-in-progress journal. The overwritten bytes are durably synced before
+    /// the call returns.
     ///
     /// # Errors
     ///
     /// Returns [`io::ErrorKind::InvalidInput`] if `offset + n`
     /// exceeds the current payload size, or if the addition overflows `u64`.
-    /// Propagates any I/O error from `write_all` or `durable_sync`.
+    /// Propagates any I/O error from `write_all`, `set_len`, or `durable_sync`.
     #[cfg(feature = "set")]
     pub fn zero(&self, offset: u64, n: u64) -> io::Result<()> {
         if n == 0 {
@@ -1628,9 +1452,74 @@ impl BStack {
                 format!("zero: write end ({end}) exceeds payload size ({data_size})"),
             ));
         }
-        let zeros = vec![0u8; n as usize];
-        write_at(file, offset, &zeros)?;
-        durable_sync(file)
+        // Zeroing is a repeat-fill of the single-byte pattern `[0x00]` `n` times:
+        // the journal stages a fixed 9-byte `[k | s]` tail instead of `n` bytes.
+        repeat_fill(file, data_size, offset, &[0u8], n)
+    }
+
+    /// Fill `count` copies of `pattern` in place starting at logical `offset` —
+    /// i.e. overwrite `[offset, offset + count * pattern.len())` with the pattern
+    /// repeated back to back.
+    ///
+    /// The file size is never changed: if the filled region would exceed the
+    /// current payload size the call is rejected. An empty `pattern` or
+    /// `count == 0` is a valid no-op.
+    ///
+    /// This is the general form of [`zero`](Self::zero) (which is `repeat` of the
+    /// single byte `0x00`). Because only the pattern and count are journaled, a
+    /// crash-safe fill of a large region costs a fixed-size journal rather than
+    /// one proportional to the region — cheap for e.g. clearing or stamping a
+    /// large area with a small repeating value.
+    ///
+    /// # Feature flag
+    ///
+    /// Only available when the `set` Cargo feature is enabled.
+    ///
+    /// # Durability & atomicity
+    ///
+    /// Crash-atomic on the same terms as [`set`](Self::set): after a crash the
+    /// region holds either its old contents or the fully repeated pattern, never a
+    /// mix. A fill confined to one aligned block takes the single-block atomic
+    /// path; a larger one goes through the write-in-progress journal, which stages
+    /// only `[count | pattern]` and replays it on the next [`open`](Self::open).
+    /// The written bytes are durably synced before the call returns.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] if `count * pattern.len()` or
+    /// `offset + count * pattern.len()` overflows `u64`, or if the filled region
+    /// exceeds the current payload size. Propagates any I/O error from `write_all`,
+    /// `set_len`, or `durable_sync`.
+    #[cfg(feature = "set")]
+    pub fn repeat(&self, offset: u64, pattern: impl AsRef<[u8]>, count: u64) -> io::Result<()> {
+        let pattern = pattern.as_ref();
+        if pattern.is_empty() || count == 0 {
+            return Ok(());
+        }
+        let total = (pattern.len() as u64).checked_mul(count).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "repeat: count * pattern.len() overflows u64",
+            )
+        })?;
+        let end = checked_end(
+            offset,
+            total,
+            "repeat: offset + count*pattern.len() overflows u64",
+        )?;
+        let mut guard = self.lock.write().unwrap();
+        let file = &mut guard.0;
+        // Load `locked` under the write lock (see `set` for rationale).
+        let locked = self.locked.load(Ordering::Acquire);
+        check_offset_unlocked("repeat", offset, end, locked)?;
+        let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
+        if end > data_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("repeat: write end ({end}) exceeds payload size ({data_size})"),
+            ));
+        }
+        repeat_fill(file, data_size, offset, pattern, count)
     }
 }
 
@@ -1641,20 +1530,22 @@ impl BStack {
 impl BStack {
     /// Cut `n` bytes off the tail then append `buf` as a single atomic operation.
     ///
-    /// The operation ordering is chosen based on the net size change to maximise
-    /// crash-recovery safety (see *Durability* in the crate docs):
+    /// **Crash-atomic:** after a crash the tail holds either its old contents or
+    /// the full replacement, never a mix. The commit dispatches on the shape of
+    /// the replacement (see *Durability* in the crate docs and `algos/WIP.md`):
     ///
-    /// * **Net extension** (`buf.len() > n`): the file is extended first, `buf`
-    ///   is written into the freed tail region plus the new space, then a
-    ///   `durable_sync` commits the data before the header committed-length is
-    ///   updated.  On crash before the header update, recovery truncates back to
-    ///   the original committed length — a clean rollback.
-    ///
-    /// * **Net truncation or same size** (`buf.len() ≤ n`): `buf` is written
-    ///   into the tail first, then the file is truncated, then `durable_sync`
-    ///   commits the result before the header is updated.  On crash after
-    ///   truncation, recovery sets the committed length to the (smaller) file
-    ///   size, committing the final state.
+    /// * **Pure truncation** (`buf` empty): drop the tail and commit the smaller
+    ///   `clen` — the truncation is the commit point.
+    /// * **Pure append** (`n == 0`): the bytes land beyond the committed end,
+    ///   uncommitted until the `clen` write, so a crash rolls back by truncation.
+    /// * **Same length** (`buf.len() == n`): overwrite in place via the `Set`
+    ///   write-in-progress journal (or a single-block atomic write).
+    /// * **Length change** (`buf.len() != n`, both non-zero): the **splice
+    ///   journal** (`SpliceGrow`/`SpliceShrink`) — stage the new tail past the
+    ///   live payload, arm the direction, replay it into place, then commit the
+    ///   new `clen` and disarm in one atomic header write. Recovery derives the
+    ///   new length from the file size and rolls a crash forward, or rolls back
+    ///   if the arm never landed.
     ///
     /// `n = 0` with an empty `buf` is a valid no-op.
     ///
@@ -1698,8 +1589,9 @@ impl BStack {
     /// Pop `n` bytes off the tail then append `buf`, returning the removed bytes.
     ///
     /// The bytes are read before any mutation, so they are always available in
-    /// the returned `Vec` even if the subsequent write fails.  The same
-    /// ordering strategy as [`atrunc`](Self::atrunc) is used.
+    /// the returned `Vec` even if the subsequent write fails.  The replacement
+    /// commits with the same crash-atomic, shape-dispatched strategy as
+    /// [`atrunc`](Self::atrunc).
     ///
     /// `n = 0` with an empty `buf` is a valid no-op and returns an empty `Vec`.
     ///
@@ -1749,8 +1641,8 @@ impl BStack {
     ///
     /// Buffer-reuse counterpart of [`splice`](Self::splice): avoids allocating
     /// a `Vec` for the removed bytes by writing them into the caller-supplied
-    /// `old` slice.  The same ordering strategy as [`atrunc`](Self::atrunc) is
-    /// used for the write/truncation side.
+    /// `old` slice.  The replacement commits with the same crash-atomic,
+    /// shape-dispatched strategy as [`atrunc`](Self::atrunc).
     ///
     /// An empty `old` with an empty `new` is a valid no-op.
     ///
@@ -2223,6 +2115,12 @@ impl BStack {
 ///   payload, and ending the sequence.
 /// - `Pop { buf }` — remove the last `buf.len()` bytes from the end of the
 ///   file into `buf`, shrinking the payload, and ending the sequence.
+/// - `Discard { len }` — remove the last `len` bytes without reading them back,
+///   shrinking the payload, and ending the sequence.
+/// - `Atrunc { n, data }` — cut `n` bytes off the tail then append `data`
+///   (no readback), ending the sequence.
+/// - `Splice { old, new }` — pop `old.len()` bytes off the tail into `old` then
+///   append `new`, ending the sequence.
 /// - `Len { out }` — write the current logical payload size into `out`.
 /// - `#[non_exhaustive]` — later versions may add further variants, for
 ///   richer write ownership or multi-write protocols, for instance, without
@@ -2296,6 +2194,36 @@ pub enum BStackGenOp<'a> {
         /// Number of bytes to remove from the end of the file.
         len: u64,
     },
+    /// Cut `n` bytes off the tail then append `data` as a single operation,
+    /// ending the sequence.
+    ///
+    /// The removed bytes are **not** read back — the in-sequence equivalent of
+    /// [`atrunc`](BStack::atrunc), and the buffer-free counterpart of
+    /// [`Splice`](Self::Splice) (as [`Discard`](Self::Discard) is to
+    /// [`Pop`](Self::Pop)). The net payload change is `data.len() − n`; useful
+    /// for replacing a tail whose size is only known once earlier `Read`s have
+    /// been resolved, without allocating a buffer for the discarded bytes.
+    Atrunc {
+        /// Number of bytes to cut off the tail before appending.
+        n: u64,
+        /// Bytes to append after the cut.
+        data: &'a [u8],
+    },
+    /// Pop `old.len()` bytes off the tail into `old`, then append `new`, ending
+    /// the sequence.
+    ///
+    /// The removed bytes are read into `old` before any mutation — the
+    /// in-sequence equivalent of [`splice_into`](BStack::splice_into), and the
+    /// readback counterpart of [`Atrunc`](Self::Atrunc) (as [`Pop`](Self::Pop)
+    /// is to [`Discard`](Self::Discard)). The net payload change is
+    /// `new.len() − old.len()`.
+    Splice {
+        /// Destination for the removed tail bytes; its length determines how
+        /// many bytes are popped.
+        old: &'a mut [u8],
+        /// Bytes to append after the pop.
+        new: &'a [u8],
+    },
     /// Write the current logical payload size, in bytes, into `out`, then
     /// call `f` again — does not end the sequence.
     Len {
@@ -2319,6 +2247,12 @@ impl BStack {
     ///
     /// Only available when both the `set` and `atomic` Cargo features are
     /// enabled.
+    ///
+    /// # Crash atomicity
+    ///
+    /// Crash-atomic: after a crash the region holds either its old or its new
+    /// contents, never a mix — the write commits via a single-block atomic write
+    /// or the write-in-progress journal (see the crate-level *Durability* docs).
     ///
     /// # Errors
     ///
@@ -2346,8 +2280,7 @@ impl BStack {
         }
         let mut old = vec![0u8; buf.len()];
         read_at(file, offset, &mut old)?;
-        write_at(file, offset, buf)?;
-        durable_sync(file)?;
+        set_in_place(file, data_size, offset, buf)?;
         Ok(old)
     }
 
@@ -2364,6 +2297,10 @@ impl BStack {
     ///
     /// Only available when both the `set` and `atomic` Cargo features are
     /// enabled.
+    ///
+    /// # Crash atomicity
+    ///
+    /// Crash-atomic, on the same terms as [`swap`](Self::swap).
     ///
     /// # Errors
     ///
@@ -2394,8 +2331,7 @@ impl BStack {
         }
         let mut tmp = vec![0u8; buf.len()];
         read_at(file, offset, &mut tmp)?;
-        write_at(file, offset, buf)?;
-        durable_sync(file)?;
+        set_in_place(file, data_size, offset, buf)?;
         buf.copy_from_slice(&tmp);
         Ok(())
     }
@@ -2413,6 +2349,12 @@ impl BStack {
     ///
     /// Only available when both the `set` and `atomic` Cargo features are
     /// enabled.
+    ///
+    /// # Crash atomicity
+    ///
+    /// When the exchange is performed it is crash-atomic, on the same terms as
+    /// [`set`](Self::set): after a crash the region holds either `old` or `new`,
+    /// never a mix.
     ///
     /// # Errors
     ///
@@ -2452,8 +2394,7 @@ impl BStack {
         if current != old {
             return Ok(false);
         }
-        write_at(file, offset, new)?;
-        durable_sync(file)?;
+        set_in_place(file, data_size, offset, new)?;
         Ok(true)
     }
 
@@ -2461,8 +2402,18 @@ impl BStack {
     ///
     /// Bytes at `[a, a + n)` and `[b, b + n)` are exchanged under a single
     /// write lock, so no other thread can observe an intermediate state.
-    /// The file size is never changed.  `n = 0` is a valid no-op (bounds are
-    /// still checked).
+    /// The at-rest file size is never changed.  `n = 0` is a valid no-op (bounds
+    /// are still checked).
+    ///
+    /// # Crash atomicity
+    ///
+    /// Crash-safe: after a crash the two regions hold either their original
+    /// contents or the fully swapped contents, never a half-swap. Region A's
+    /// bytes are staged in a tail backup and the swap commits at a single atomic
+    /// `wip_ptr` flip; recovery on the next [`open`](Self::open) rolls the
+    /// exchange back (before the flip) or forward (after it). During the operation
+    /// the file grows by `n` bytes to hold the backup, which is dropped on
+    /// completion.
     ///
     /// # Feature flags
     ///
@@ -2524,25 +2475,30 @@ impl BStack {
         if n == 0 {
             return Ok(());
         }
-        let mut buf_a = vec![0u8; n as usize];
-        read_at(file, a, &mut buf_a)?;
-        let mut buf_b = vec![0u8; n as usize];
-        read_at(file, b, &mut buf_b)?;
-        write_at(file, a, &buf_b)?;
-        write_at(file, b, &buf_a)?;
-        durable_sync(file)
+        journaled_exchange(file, data_size, a, b, n)
     }
 
     /// Copy `n` bytes from `from..from+n` to `to..to+n` under a single write lock.
     ///
-    /// The source is read into a temporary buffer before writing, so overlapping
-    /// regions are handled correctly.  `n = 0` is a valid no-op (bounds are
-    /// still checked).  The file size is never changed.
+    /// Overlapping source and destination are handled correctly: the bytes route
+    /// through the journal's tail region, disjoint from both.  `n = 0` is a valid
+    /// no-op (bounds are still checked).  The file size is never changed.
     ///
     /// # Feature flags
     ///
     /// Only available when both the `set` and `atomic` Cargo features are
     /// enabled.
+    ///
+    /// # Durability & atomicity
+    ///
+    /// Crash-atomic: after a crash the destination holds either its old contents
+    /// or the full copy, never a mix.  A destination within one aligned block
+    /// takes the single-block atomic path.  A larger *overlapping* copy streams
+    /// source→tail→dest through the write-in-progress journal in O(1) memory.  A
+    /// larger *disjoint* copy uses the copy journal, which stages only the source
+    /// coordinate (not the bytes) and replays directly from the untouched source —
+    /// O(1) staging as well.  A copy onto the same location is a no-op.  All paths
+    /// are replayed on the next [`open`](Self::open).
     ///
     /// # Errors
     ///
@@ -2580,10 +2536,31 @@ impl BStack {
         if n == 0 {
             return Ok(());
         }
-        let mut buf = vec![0u8; n as usize];
-        read_at(file, from, &mut buf)?;
-        write_at(file, to, &buf)?;
-        durable_sync(file)
+        // A copy onto its own location leaves every byte unchanged — a no-op once
+        // the bounds above are validated.
+        if from == to {
+            return Ok(());
+        }
+        // Write-strategy hierarchy (see `algos/WIP.md`):
+        //  * destination within one aligned block → single-block atomic write
+        //    (read the source into a bounded buffer — `n` is at most one block
+        //    here — and write it);
+        //  * overlapping source/destination → route the bytes through the tail
+        //    backup (source→tail→dest) so a replay never reads clobbered source
+        //    bytes — `journaled_move`, O(1) memory but staging the full `n` bytes;
+        //  * disjoint source/destination → copy journal: stage only the source
+        //    coordinate `[src | n]`, since the untouched source lets recovery
+        //    replay the copy directly — `journaled_copy`, O(1) staging.
+        if is_atomic_write(to, n) {
+            let mut buf = vec![0u8; n as usize];
+            read_at(file, from, &mut buf)?;
+            write_at(file, to, &buf)?;
+            durable_sync(file)
+        } else if from < to_end && to < from_end {
+            journaled_move(file, data_size, from, to, n)
+        } else {
+            journaled_copy(file, data_size, from, to, n)
+        }
     }
 
     /// Read bytes in the half-open logical range `[start, end)`, pass them to
@@ -2601,6 +2578,12 @@ impl BStack {
     ///
     /// Only available when both the `set` and `atomic` Cargo features are
     /// enabled.
+    ///
+    /// # Crash atomicity
+    ///
+    /// Crash-atomic, on the same terms as [`set`](Self::set): after a crash the
+    /// range holds either its pre-callback bytes or the callback's output, never a
+    /// mix. (The callback runs in memory, under the lock, before the commit.)
     ///
     /// # Errors
     ///
@@ -2641,8 +2624,7 @@ impl BStack {
         }
         f(&mut buf);
         if n > 0 {
-            write_at(file, start, &buf)?;
-            durable_sync(file)?;
+            set_in_place(file, data_size, start, &buf)?;
         }
         Ok(())
     }
@@ -2676,6 +2658,15 @@ impl BStack {
     ///   the end of the file without reading them back, shrinking the payload,
     ///   and ends the sequence — the in-sequence equivalent of
     ///   [`discard`](Self::discard) and the buffer-free counterpart of `Pop`.
+    /// - `Some(BStackGenOp::Atrunc { n, data })` cuts `n` bytes off the tail
+    ///   then appends `data` (without reading the removed bytes), changing the
+    ///   payload by `data.len() − n`, and ends the sequence — the in-sequence
+    ///   equivalent of [`atrunc`](Self::atrunc) and the buffer-free counterpart
+    ///   of `Splice`.
+    /// - `Some(BStackGenOp::Splice { old, new })` pops `old.len()` bytes off the
+    ///   tail into `old` then appends `new`, changing the payload by
+    ///   `new.len() − old.len()`, and ends the sequence — the in-sequence
+    ///   equivalent of [`splice_into`](Self::splice_into).
     /// - `Some(BStackGenOp::Len { out })` writes the current logical payload
     ///   size into `out` and calls `f` again — the in-sequence equivalent of
     ///   [`len`](Self::len), useful when a later step's offset depends on the
@@ -2684,23 +2675,26 @@ impl BStack {
     ///   reads alone inform a decision, including the decision to change
     ///   nothing.
     ///
-    /// `Write`, `Swap`, `Push`, `Pop`, and `Discard` are the only mutating
-    /// operations, exactly one is permitted per call, and any one of them ends
-    /// the sequence immediately — `f` is not called again afterwards.
+    /// `Write`, `Swap`, `Push`, `Pop`, `Discard`, `Atrunc`, and `Splice` are the
+    /// only mutating operations, exactly one is permitted per call, and any one
+    /// of them ends the sequence immediately — `f` is not called again
+    /// afterwards.
     ///
     /// Holding the write lock across every read and the final mutation means
     /// no other thread can observe or modify any region of the file in
     /// between — the guarantee that [`get_batched_gen`](Self::get_batched_gen)
     /// followed by a separate [`cas`](Self::cas) cannot provide, since the two
     /// separate lock acquisitions leave an ABA window.  The mutated region(s)
-    /// need not overlap any region that was read.  `Push`, `Pop`, and
-    /// `Discard` are the only steps that change the file size.
+    /// need not overlap any region that was read.  `Push`, `Pop`, `Discard`,
+    /// `Atrunc`, and `Splice` are the steps that change the file size.
     ///
     /// Reads of the locked region `[0, locked_len())` are permitted, matching
     /// [`get`](Self::get) — locked bytes are immutable, so observing them
     /// mid-sequence is always safe.  `Write` and `Swap` ranges that touch the
     /// locked region are rejected, matching [`set`](Self::set) and
-    /// [`cross_exchange`](Self::cross_exchange).
+    /// [`cross_exchange`](Self::cross_exchange); an `Atrunc` or `Splice` whose
+    /// cut point falls inside the locked region is likewise rejected, matching
+    /// [`atrunc`](Self::atrunc) and [`splice_into`](Self::splice_into).
     ///
     /// # Feature flags
     ///
@@ -2712,10 +2706,10 @@ impl BStack {
     /// Returns [`io::ErrorKind::InvalidInput`] if any `offset + len` overflows
     /// `u64`, if a read, write, or swap range exceeds the current payload
     /// size, if the two `Swap` regions overlap, if a write or swap range
-    /// overlaps the locked region `[0, locked_len())`, if a `Pop` or `Discard`
-    /// removes more bytes than the current payload size, or if a `Pop` or
-    /// `Discard` would shrink the payload below the locked length.  Propagates
-    /// any I/O error from `read_exact`, `write_all`, `set_len`, or
+    /// overlaps the locked region `[0, locked_len())`, if a `Pop`, `Discard`,
+    /// `Atrunc`, or `Splice` removes more bytes than the current payload size,
+    /// or if it would shrink the payload below (or cut into) the locked length.
+    /// Propagates any I/O error from `read_exact`, `write_all`, `set_len`, or
     /// `durable_sync`.
     #[cfg(all(feature = "set", feature = "atomic"))]
     pub fn process_gen<'a, F>(&self, mut f: F) -> io::Result<()>
@@ -2795,8 +2789,7 @@ impl BStack {
                         ));
                     }
                     if !data.is_empty() {
-                        write_at(file, offset, data)?;
-                        durable_sync(file)?;
+                        set_in_place(file, data_size, offset, data)?;
                     }
                     return Ok(());
                 }
@@ -2857,13 +2850,7 @@ impl BStack {
                         ));
                     }
                     if len > 0 {
-                        let mut buf_a = vec![0u8; len as usize];
-                        read_at(file, a_offset, &mut buf_a)?;
-                        let mut buf_b = vec![0u8; len as usize];
-                        read_at(file, b_offset, &mut buf_b)?;
-                        write_at(file, a_offset, &buf_b)?;
-                        write_at(file, b_offset, &buf_a)?;
-                        durable_sync(file)?;
+                        journaled_exchange(file, data_size, a_offset, b_offset, len)?;
                     }
                     return Ok(());
                 }
@@ -2923,6 +2910,53 @@ impl BStack {
                     }
                     if len > 0 {
                         commit_shrink(file, clen, new_data_len)?;
+                    }
+                    return Ok(());
+                }
+                Some(BStackGenOp::Atrunc { n, data }) => {
+                    if n > data_size {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!(
+                                "process_gen: atrunc n ({n}) exceeds payload size ({data_size})"
+                            ),
+                        ));
+                    }
+                    let new_tail_start = data_size - n;
+                    if new_tail_start < locked {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("process_gen: atrunc would modify locked region [0, {locked})"),
+                        ));
+                    }
+                    if n != 0 || !data.is_empty() {
+                        let file_end = HEADER_SIZE + data_size;
+                        commit_tail_replace(file, clen, new_tail_start, n, data, file_end)?;
+                    }
+                    return Ok(());
+                }
+                Some(BStackGenOp::Splice { old, new }) => {
+                    let n = old.len() as u64;
+                    if n > data_size {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!(
+                                "process_gen: splice n ({n}) exceeds payload size ({data_size})"
+                            ),
+                        ));
+                    }
+                    let new_tail_start = data_size - n;
+                    if new_tail_start < locked {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("process_gen: splice would modify locked region [0, {locked})"),
+                        ));
+                    }
+                    if n != 0 || !new.is_empty() {
+                        // Read the removed bytes before any mutation.
+                        read_at(file, new_tail_start, old)?;
+                        let file_end = HEADER_SIZE + data_size;
+                        commit_tail_replace(file, clen, new_tail_start, n, new, file_end)?;
                     }
                     return Ok(());
                 }
@@ -3017,8 +3051,7 @@ impl BStack {
         }
         let mut old_b = vec![0u8; b_buf.len()];
         read_at(file, b_offset, &mut old_b)?;
-        write_at(file, b_offset, b_buf)?;
-        durable_sync(file)?;
+        set_in_place(file, data_size, b_offset, b_buf)?;
         Ok(Some(old_b))
     }
 
@@ -3094,8 +3127,7 @@ impl BStack {
         }
         let mut old_b = vec![0u8; b_buf.len()];
         read_at(file, b_offset, &mut old_b)?;
-        write_at(file, b_offset, b_buf)?;
-        durable_sync(file)?;
+        set_in_place(file, data_size, b_offset, b_buf)?;
         Ok(Some(old_b))
     }
 
@@ -3199,8 +3231,7 @@ impl BStack {
         }
         let mut old_b = vec![0u8; b_buf.len()];
         read_at(file, b_offset, &mut old_b)?;
-        write_at(file, b_offset, b_buf)?;
-        durable_sync(file)?;
+        set_in_place(file, data_size, b_offset, b_buf)?;
         Ok(Some(old_b))
     }
 
@@ -3302,8 +3333,7 @@ impl BStack {
         }
         let mut old_b = vec![0u8; b_buf.len()];
         read_at(file, b_offset, &mut old_b)?;
-        write_at(file, b_offset, b_buf)?;
-        durable_sync(file)?;
+        set_in_place(file, data_size, b_offset, b_buf)?;
         Ok(Some(old_b))
     }
 }
@@ -3312,7 +3342,7 @@ impl BStack {
 
 impl BStack {
     /// Return the current **logical** payload size in bytes (excludes the
-    /// 16-byte header).
+    /// 32-byte header).
     ///
     /// Reads the in-memory `clen` cache under the read lock, so it can run
     /// concurrently with other `len` calls but blocks while any write-lock

@@ -7,10 +7,17 @@
 /*
  * bstack — persistent, fsync-durable binary stack backed by a single file.
  *
- * File format (16-byte header followed by payload):
- *   [0..8)  magic: "BSTK" + major(1) + minor(1) + patch(2) + reserved(1)
- *   [8..16) committed payload length, little-endian uint64
- *   [16..)  payload bytes
+ * File format (32-byte header followed by payload):
+ *   [0..8)   magic: "BSTK" + major(0) + minor(4) + patch(0) + reserved(0)
+ *   [8..16)  committed payload length (clen), little-endian uint64
+ *   [16..24) wip_ptr: write-in-progress journal target (0 when idle), LE uint64
+ *   [24..32) wip_aux: write-in-progress journal mode, LE uint64
+ *   [32..)   payload bytes
+ *
+ * wip_ptr / wip_aux hold the write-in-progress journal that makes in-place
+ * mutations crash-atomic; both are zero in the steady state.  On open, an
+ * interrupted in-place write is replayed or rolled back (see algos/WIP.md).
+ * Legacy 0.1.x files (16-byte header) are upgraded by bstack_migrate.
  *
  * All logical offsets are 0-based from the start of the payload region.
  *
@@ -25,7 +32,7 @@
  * -------------
  * On Unix a pthread_rwlock protects each handle; on Windows an SRWLOCK is
  * used.  bstack_push / bstack_extend / bstack_pop / bstack_discard /
- * bstack_set / bstack_zero / bstack_atrunc / bstack_splice /
+ * bstack_set / bstack_zero / bstack_repeat / bstack_atrunc / bstack_splice /
  * bstack_try_extend / bstack_try_extend_zeros / bstack_try_discard(s, n>0) /
  * bstack_swap / bstack_cas / bstack_replace / bstack_process /
  * bstack_process_gen / bstack_cross_exchange / bstack_copy /
@@ -45,7 +52,8 @@
  *
  * Feature flags
  * -------------
- * Compile with -DBSTACK_FEATURE_SET    to enable bstack_set and bstack_zero.
+ * Compile with -DBSTACK_FEATURE_SET    to enable bstack_set, bstack_zero, and
+ *   bstack_repeat.
  * Compile with -DBSTACK_FEATURE_ATOMIC to enable bstack_atrunc, bstack_splice,
  *   bstack_try_extend, bstack_try_extend_zeros, bstack_try_discard,
  *   bstack_replace, bstack_get_batched, and bstack_get_batched_gen.  Both
@@ -66,6 +74,19 @@ bstack_t *bstack_open(const char *path);
 
 /* Close the handle and release all resources (flock, rwlock, fd, memory). */
 void bstack_close(bstack_t *bs);
+
+/*
+ * Upgrade a legacy pre-0.4.0 (0.1.x, 16-byte header) file at path to the
+ * current 0.4.0 layout (32-byte header), in place.  The file is rewritten into
+ * a sibling "<path>.migrating" (a fresh 0.4.0 header followed by the old payload
+ * shifted from offset 16 to offset 32) which is then swapped in.  The committed
+ * length is preserved (clamped to the bytes actually present).  The caller must
+ * not hold the file open elsewhere.  On success path is a valid 0.4.0 file.
+ * Returns 0 on success, -1 (errno = EINVAL) if path is not a legacy 0.1.x file
+ * (wrong magic or shorter than the 16-byte legacy header), or -1 (errno set) on
+ * any I/O error.
+ */
+int bstack_migrate(const char *path);
 
 /*
  * Append len bytes from data to the stack.
@@ -119,7 +140,7 @@ int bstack_get(bstack_t *bs, uint64_t start, uint64_t end,
 int bstack_discard(bstack_t *bs, size_t n);
 
 /*
- * Write the current logical payload size (excluding the 16-byte header)
+ * Write the current logical payload size (excluding the 32-byte header)
  * into *out_len.  This value is cached in memory, so no syscall is made;
  * it takes the read lock, so it can run concurrently with other readers
  * but blocks while a writer is in progress.
@@ -207,11 +228,30 @@ int bstack_set(bstack_t *bs, uint64_t offset,
  * Overwrite n bytes with zeros in place starting at logical offset.
  * The file size is never changed.  n = 0 is a valid no-op.
  * Returns EINVAL if offset + n would exceed the payload size or overflow
- * uint64_t.
+ * uint64_t.  Equivalent to bstack_repeat with the single-byte pattern 0x00.
  *
  * Only available when compiled with -DBSTACK_FEATURE_SET.
  */
 int bstack_zero(bstack_t *bs, uint64_t offset, size_t n);
+
+/*
+ * Fill count copies of pattern in place starting at logical offset — i.e.
+ * overwrite [offset, offset + count * pattern_len) with the pattern repeated
+ * back to back.  The file size is never changed.  An empty pattern
+ * (pattern_len == 0) or count == 0 is a valid no-op.
+ *
+ * This is the general form of bstack_zero.  Only the pattern and count are
+ * journaled, so a crash-safe fill of a large region costs a fixed-size journal
+ * (8 + pattern_len bytes) rather than one proportional to the region.  A fill
+ * confined to one aligned block takes the single-block atomic path.
+ *
+ * Returns EINVAL if count * pattern_len or offset + count * pattern_len would
+ * overflow uint64_t, or if the filled region would exceed the payload size.
+ *
+ * Only available when compiled with -DBSTACK_FEATURE_SET.
+ */
+int bstack_repeat(bstack_t *bs, uint64_t offset,
+                  const uint8_t *pattern, size_t pattern_len, uint64_t count);
 #endif /* BSTACK_FEATURE_SET */
 
 /*
@@ -228,11 +268,14 @@ typedef struct {
 /*
  * Atomically cut n bytes off the tail then append buf_len bytes from buf.
  *
- * The write ordering is chosen for crash safety: when buf_len > n (net
- * extension) the file is extended before writing buf so a crash before the
- * committed-length update cleanly rolls back to the original state; when
- * buf_len <= n (net truncation or same size) buf is written first, then the
- * file is truncated, so a crash after truncation is committed by recovery.
+ * Crash-atomic: after a crash the tail holds either its old contents or the
+ * full replacement, never a mix.  The commit dispatches on the shape of the
+ * replacement (see algos/WIP.md): a pure truncation (buf_len == 0) drops the
+ * tail; a pure append (n == 0) writes beyond the committed end and commits with
+ * the clen write; a same-length replace overwrites in place via the Set journal
+ * (or a single-block atomic write); a length change (buf_len != n, both > 0)
+ * uses the splice journal, which stages the new tail past the live payload,
+ * replays it into place, and commits the new length in one atomic header write.
  *
  * n = 0 with buf_len = 0 is a valid no-op.
  * Returns EINVAL if n exceeds the current payload size.
@@ -247,8 +290,8 @@ int bstack_atrunc(bstack_t *bs, size_t n,
  * bytes from new_buf.
  *
  * removed must point to at least n bytes of caller-allocated storage;
- * it may be NULL when n == 0.  Uses the same two-path ordering strategy as
- * bstack_atrunc.
+ * it may be NULL when n == 0.  The replacement commits with the same
+ * crash-atomic, shape-dispatched strategy as bstack_atrunc.
  *
  * Returns EINVAL if n exceeds the current payload size.
  *
@@ -298,9 +341,10 @@ int bstack_try_discard(bstack_t *bs, uint64_t s, size_t n, int *ok);
  * If the callback returns -1 the operation is aborted (errno set by the
  * callback); *new_buf is not freed by bstack in that case.
  *
- * The file may grow or shrink according to *new_len; the same two-path
- * crash-safe ordering as bstack_atrunc is used.  n = 0 is valid (old is
- * NULL and old_len is 0).  Returns EINVAL if n exceeds the payload size.
+ * The file may grow or shrink according to *new_len; the replacement commits
+ * with the same crash-atomic, shape-dispatched strategy as bstack_atrunc.
+ * n = 0 is valid (old is NULL and old_len is 0).  Returns EINVAL if n exceeds
+ * the payload size.
  *
  * Only available when compiled with -DBSTACK_FEATURE_ATOMIC.
  */
@@ -391,6 +435,11 @@ typedef enum {
     /* Remove the last u.pop.len bytes from the end of the file into
      * u.pop.buf, shrinking the payload, and ending the sequence. */
     BSTACK_GEN_POP,
+    /* Cut u.splice.n bytes off the tail then append u.splice.new_buf, changing
+     * the payload length, and ending the sequence.  If u.splice.removed is
+     * non-NULL the popped bytes are read into it first (in-sequence
+     * bstack_splice); if NULL they are discarded (in-sequence bstack_atrunc). */
+    BSTACK_GEN_SPLICE,
     /* Write the current logical payload size into *u.len.out, then call gen
      * again — does not end the sequence. */
     BSTACK_GEN_LEN,
@@ -417,13 +466,20 @@ typedef enum {
  *   in-sequence equivalent of bstack_pop.  If u.pop.buf is NULL the bytes are
  *   dropped without being copied out — the in-sequence equivalent of
  *   bstack_discard.
+ * - BSTACK_GEN_SPLICE: cut u.splice.n bytes off the tail then append
+ *   u.splice.new_len bytes from u.splice.new_buf, changing the payload length
+ *   by new_len - n, and ending the sequence — the in-sequence equivalent of
+ *   bstack_splice.  If u.splice.removed is non-NULL the popped bytes are read
+ *   into it first (which must hold n bytes); if NULL they are discarded, which
+ *   is the in-sequence equivalent of bstack_atrunc (mirroring how a NULL
+ *   u.pop.buf turns a POP into a discard).
  * - BSTACK_GEN_LEN: write the current logical payload size into
  *   *u.len.out and call gen again — the in-sequence equivalent of
  *   bstack_len.  Does not end the sequence.
  *
- * BSTACK_GEN_WRITE, BSTACK_GEN_SWAP, BSTACK_GEN_PUSH, and BSTACK_GEN_POP are
- * the only mutating kinds — exactly one is permitted per bstack_process_gen
- * call, and any one of them ends the sequence immediately.
+ * BSTACK_GEN_WRITE, BSTACK_GEN_SWAP, BSTACK_GEN_PUSH, BSTACK_GEN_POP, and
+ * BSTACK_GEN_SPLICE are the only mutating kinds — exactly one is permitted per
+ * bstack_process_gen call, and any one of them ends the sequence immediately.
  *
  * Only available when compiled with both -DBSTACK_FEATURE_SET and
  * -DBSTACK_FEATURE_ATOMIC.
@@ -454,6 +510,13 @@ typedef struct {
             uint8_t *buf;   /* destination, or NULL to discard the bytes */
             size_t   len;
         } pop;
+        struct {
+            uint8_t       *removed;  /* dest for the popped tail bytes, or NULL
+                                      * to discard them (the atrunc form) */
+            size_t         n;        /* number of bytes to cut off the tail */
+            const uint8_t *new_buf;  /* bytes to append after the cut */
+            size_t         new_len;
+        } splice;
         struct {
             uint64_t *out;
         } len;
@@ -539,6 +602,11 @@ int bstack_process(bstack_t *bs, uint64_t start, uint64_t end,
  *   payload, and ends the sequence; gen is not called again — the
  *   in-sequence equivalent of bstack_pop.  A NULL u.pop.buf drops the bytes
  *   without copying them out — the in-sequence equivalent of bstack_discard.
+ * - Returning 1 with *out_op set to BSTACK_GEN_SPLICE cuts u.splice.n bytes off
+ *   the tail then appends u.splice.new_buf, changing the payload length, and
+ *   ends the sequence; gen is not called again — the in-sequence equivalent of
+ *   bstack_splice.  A NULL u.splice.removed discards the popped bytes instead of
+ *   reading them out — the in-sequence equivalent of bstack_atrunc.
  * - Returning 1 with *out_op set to BSTACK_GEN_LEN writes the current logical
  *   payload size into *u.len.out and calls gen again — the in-sequence
  *   equivalent of bstack_len, useful when a later step's offset or length
@@ -553,8 +621,8 @@ int bstack_process(bstack_t *bs, uint64_t start, uint64_t end,
  * guarantee that bstack_get_batched_gen followed by a separate bstack_cas
  * cannot provide, since the two separate lock acquisitions leave an ABA
  * window.  The mutated region(s) need not overlap any region that was read.
- * BSTACK_GEN_PUSH and BSTACK_GEN_POP are the only steps that change the file
- * size.
+ * BSTACK_GEN_PUSH, BSTACK_GEN_POP, and BSTACK_GEN_SPLICE are the steps that
+ * change the file size.
  *
  * Reads of the locked region [0, bstack_locked_len()) are permitted, matching
  * bstack_get.  Write and swap ranges that touch the locked region are

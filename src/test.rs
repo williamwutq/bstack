@@ -21,38 +21,38 @@ mod tests {
         }
     }
 
-    #[cfg(any(feature = "set", feature = "atomic"))]
     #[test]
+    #[cfg(any(feature = "set", feature = "atomic"))]
     fn is_atomic_write_block_confinement() {
-        use crate::{ATOMIC_BLOCK, is_atomic_write};
+        use crate::{io_core::ATOMIC_BLOCK, is_atomic_write};
         let b = ATOMIC_BLOCK;
         // `boundary` is the logical offset whose physical position is exactly the
         // start of the second block (`HEADER_SIZE + boundary == ATOMIC_BLOCK`).
         let boundary = b - HEADER_SIZE;
 
         // An empty write touches no bytes and never tears.
-        assert!(is_atomic_write(0, &[]));
-        assert!(is_atomic_write(u64::MAX, &[]));
+        assert!(is_atomic_write(0, 0));
+        assert!(is_atomic_write(u64::MAX, 0));
 
         // Filling the remainder of the first block is atomic; one more byte
         // spills into the next block.
-        assert!(is_atomic_write(0, &vec![0u8; boundary as usize]));
-        assert!(!is_atomic_write(0, &vec![0u8; boundary as usize + 1]));
+        assert!(is_atomic_write(0, boundary));
+        assert!(!is_atomic_write(0, boundary + 1));
 
         // A single byte on either side of a block boundary is atomic; two bytes
         // straddling it are not.
-        assert!(is_atomic_write(boundary - 1, &[0u8]));
-        assert!(is_atomic_write(boundary, &[0u8]));
-        assert!(!is_atomic_write(boundary - 1, &[0u8; 2]));
+        assert!(is_atomic_write(boundary - 1, 1));
+        assert!(is_atomic_write(boundary, 1));
+        assert!(!is_atomic_write(boundary - 1, 2));
 
         // A block-aligned write of exactly one block is atomic; one byte over is
         // not.
-        assert!(is_atomic_write(boundary, &vec![0u8; b as usize]));
-        assert!(!is_atomic_write(boundary, &vec![0u8; b as usize + 1]));
+        assert!(is_atomic_write(boundary, b));
+        assert!(!is_atomic_write(boundary, b + 1));
 
         // An offset that overflows `u64` once the header is added cannot be
         // confined to a block.
-        assert!(!is_atomic_write(u64::MAX, &[0u8]));
+        assert!(!is_atomic_write(u64::MAX, 1));
     }
 
     // -------------------------------------------------------------------------
@@ -378,7 +378,7 @@ mod tests {
         assert_eq!(
             raw.len(),
             HEADER_SIZE as usize,
-            "new file should be exactly 16 bytes"
+            "new file should be exactly the header size (32 bytes)"
         );
         assert_eq!(&raw[0..8], &MAGIC, "magic mismatch");
         let clen = u64::from_le_bytes(raw[8..16].try_into().unwrap());
@@ -426,9 +426,9 @@ mod tests {
         };
         let _g = Guard(path.clone());
 
-        // Write 16 bytes with wrong magic.
+        // Write a full-size header with wrong magic.
         let mut bad: Vec<u8> = b"WRONGHDR".to_vec();
-        bad.extend_from_slice(&0u64.to_le_bytes());
+        bad.resize(HEADER_SIZE as usize, 0);
         std::fs::write(&path, &bad).unwrap();
 
         let err = BStack::open(&path).err().unwrap();
@@ -451,6 +451,49 @@ mod tests {
 
         let err = BStack::open(&path).err().unwrap();
         assert_eq!(err.kind(), ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn migrate_upgrades_legacy_file() {
+        let path = {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static C: AtomicU64 = AtomicU64::new(0);
+            let id = C.fetch_add(1, Ordering::Relaxed);
+            std::env::temp_dir().join(format!("bstack_migrate_{}.bin", id))
+        };
+        let _g = Guard(path.clone());
+
+        // Craft a legacy 0.1.x file: 16-byte header (0.1.15 magic + clen) + payload.
+        let payload = b"legacy payload contents!";
+        let mut legacy: Vec<u8> = b"BSTK\x00\x01\x0f\x00".to_vec();
+        legacy.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        legacy.extend_from_slice(payload);
+        std::fs::write(&path, &legacy).unwrap();
+
+        // A current-version open rejects it (wrong major.minor).
+        assert!(BStack::open(&path).is_err());
+
+        // Migrate, then open succeeds and the payload survives unchanged.
+        BStack::migrate(&path).unwrap();
+        let s = BStack::open(&path).unwrap();
+        assert_eq!(s.len().unwrap(), payload.len() as u64);
+        assert_eq!(s.peek(0).unwrap(), payload);
+        drop(s);
+
+        // The file now has a 32-byte header + payload, current magic, and the
+        // sibling scratch file is gone.
+        let raw = std::fs::read(&path).unwrap();
+        assert_eq!(raw.len() as u64, HEADER_SIZE + payload.len() as u64);
+        assert_eq!(&raw[0..8], &MAGIC, "migrated magic");
+        let mut sibling = path.clone().into_os_string();
+        sibling.push(".migrating");
+        assert!(
+            !std::path::Path::new(&sibling).exists(),
+            "sibling left behind"
+        );
+
+        // Migrating an already-current file is rejected (not a legacy magic).
+        assert!(BStack::migrate(&path).is_err());
     }
 
     #[test]
@@ -524,6 +567,489 @@ mod tests {
         let raw2 = std::fs::read(&p).unwrap();
         let clen_after = u64::from_le_bytes(raw2[8..16].try_into().unwrap());
         assert_eq!(clen_after, 5, "clen should be repaired to 5 after recovery");
+    }
+
+    // ---- write-in-progress (wip) journal ------------------------------------
+
+    // Build a raw 32-byte header (current magic) with the given fields.
+    fn wip_header(clen: u64, wip_ptr: u64, wip_aux: u64) -> Vec<u8> {
+        let mut h = MAGIC.to_vec();
+        h.extend_from_slice(&clen.to_le_bytes());
+        h.extend_from_slice(&wip_ptr.to_le_bytes());
+        h.extend_from_slice(&wip_aux.to_le_bytes());
+        h
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn set_journals_block_spanning_write_and_reopens_clean() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+
+        // 400-byte payload; a 300-byte `set` at offset 0 spans a 256 B block
+        // boundary (physical [32, 332)), so it goes through the journal rather
+        // than the atomic-write fast path.
+        s.push(vec![b'A'; 400]).unwrap();
+        s.set(0, vec![b'B'; 300]).unwrap();
+
+        let mut expect = vec![b'B'; 300];
+        expect.extend_from_slice(&[b'A'; 100]);
+        assert_eq!(s.peek(0).unwrap(), expect);
+        drop(s);
+
+        // The tail backup is gone, wip is disarmed, and the value survives reopen.
+        let raw = std::fs::read(&p).unwrap();
+        assert_eq!(raw.len() as u64, HEADER_SIZE + 400, "tail not truncated");
+        assert_eq!(&raw[16..24], &[0u8; 8], "wip_ptr not disarmed");
+        let s2 = BStack::open(&p).unwrap();
+        assert_eq!(s2.peek(0).unwrap(), expect);
+        assert_eq!(s2.len().unwrap(), 400);
+    }
+
+    #[test]
+    fn recovery_replays_armed_same_length_set() {
+        // Craft the on-disk state of a `set` crashed after arm: header armed at
+        // the target, old bytes still in place, new bytes staged in the tail.
+        let path = {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static C: AtomicU64 = AtomicU64::new(0);
+            let id = C.fetch_add(1, Ordering::Relaxed);
+            std::env::temp_dir().join(format!("bstack_wip_replay_{}.bin", id))
+        };
+        let _g = Guard(path.clone());
+
+        let clen = 400u64;
+        // Target offset a = 0 → physical wip_ptr = HEADER_SIZE.
+        let mut file = wip_header(clen, HEADER_SIZE, 0);
+        file.extend_from_slice(&vec![b'A'; clen as usize]); // old payload
+        file.extend_from_slice(&vec![b'B'; 300]); // staged tail (new bytes)
+        std::fs::write(&path, &file).unwrap();
+
+        // Recovery on open replays the tail into [0, 300).
+        let s = BStack::open(&path).unwrap();
+        let mut expect = vec![b'B'; 300];
+        expect.extend_from_slice(&[b'A'; 100]);
+        assert_eq!(s.len().unwrap(), 400);
+        assert_eq!(s.peek(0).unwrap(), expect);
+        drop(s);
+
+        // The journal is disarmed and the tail dropped.
+        let raw = std::fs::read(&path).unwrap();
+        assert_eq!(raw.len() as u64, HEADER_SIZE + 400);
+        assert_eq!(&raw[16..24], &[0u8; 8], "wip_ptr not cleared");
+    }
+
+    #[test]
+    fn recovery_rolls_back_unrecognized_wip_aux() {
+        // wip_ptr armed with a wip_aux mode this build does not implement: the
+        // forward-compatibility default rolls back to the committed length (no
+        // replay), leaving the old bytes intact and dropping the staged tail.
+        let path = {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static C: AtomicU64 = AtomicU64::new(0);
+            let id = C.fetch_add(1, Ordering::Relaxed);
+            std::env::temp_dir().join(format!("bstack_wip_rollback_{}.bin", id))
+        };
+        let _g = Guard(path.clone());
+
+        let clen = 400u64;
+        let mut file = wip_header(clen, HEADER_SIZE, 1); // wip_aux = 1 (unknown mode)
+        file.extend_from_slice(&vec![b'A'; clen as usize]);
+        file.extend_from_slice(&vec![b'B'; 300]); // staged tail, must be discarded
+        std::fs::write(&path, &file).unwrap();
+
+        let s = BStack::open(&path).unwrap();
+        assert_eq!(s.len().unwrap(), 400);
+        assert_eq!(
+            s.peek(0).unwrap(),
+            vec![b'A'; 400],
+            "should roll back, not replay"
+        );
+        drop(s);
+
+        let raw = std::fs::read(&path).unwrap();
+        assert_eq!(raw.len() as u64, HEADER_SIZE + 400);
+        assert_eq!(&raw[16..24], &[0u8; 8], "wip_ptr not cleared");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn cross_exchange_journals_and_reopens_clean() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+
+        // Region A = [0, 50), region B = [100, 150); an exchange always journals.
+        let mut payload = vec![b'm'; 200];
+        payload[0..50].fill(b'A');
+        payload[100..150].fill(b'B');
+        s.push(&payload).unwrap();
+
+        s.cross_exchange(0, 100, 50).unwrap();
+
+        let out = s.peek(0).unwrap();
+        assert_eq!(&out[0..50], &[b'B'; 50], "A should now hold B's bytes");
+        assert_eq!(&out[100..150], &[b'A'; 50], "B should now hold A's bytes");
+        drop(s);
+
+        // Tail dropped, journal disarmed, exchange persists across reopen.
+        let raw = std::fs::read(&p).unwrap();
+        assert_eq!(raw.len() as u64, HEADER_SIZE + 200, "tail not truncated");
+        assert_eq!(&raw[16..24], &[0u8; 8], "wip_ptr not disarmed");
+        let s2 = BStack::open(&p).unwrap();
+        let out2 = s2.peek(0).unwrap();
+        assert_eq!(&out2[0..50], &[b'B'; 50]);
+        assert_eq!(&out2[100..150], &[b'A'; 50]);
+    }
+
+    #[test]
+    fn recovery_rolls_back_exchange_before_flip() {
+        // Crashed after A <- B's bytes but while `wip_ptr` still names region A:
+        // recovery replays A's staged bytes into A, restoring the original (B
+        // was never touched). The whole exchange rolls back.
+        let path = {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static C: AtomicU64 = AtomicU64::new(0);
+            let id = C.fetch_add(1, Ordering::Relaxed);
+            std::env::temp_dir().join(format!("bstack_xchg_rb_{}.bin", id))
+        };
+        let _g = Guard(path.clone());
+
+        let clen = 200u64;
+        let mut file = wip_header(clen, HEADER_SIZE, 0); // wip_ptr = region A
+        let mut payload = vec![b'm'; clen as usize];
+        payload[0..50].fill(b'B'); // A already overwritten with B's bytes
+        payload[100..150].fill(b'B'); // B untouched (original)
+        file.extend_from_slice(&payload);
+        file.extend_from_slice(&[b'A'; 50]); // tail = A's original bytes
+        std::fs::write(&path, &file).unwrap();
+
+        let s = BStack::open(&path).unwrap();
+        let out = s.peek(0).unwrap();
+        assert_eq!(&out[0..50], &[b'A'; 50], "A restored to original");
+        assert_eq!(&out[100..150], &[b'B'; 50], "B unchanged");
+        assert_eq!(s.len().unwrap(), 200);
+    }
+
+    #[test]
+    fn recovery_rolls_forward_exchange_after_flip() {
+        // Crashed after the flip (`wip_ptr` names region B): recovery replays A's
+        // staged bytes into B, completing the exchange (A already holds B's bytes).
+        let path = {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static C: AtomicU64 = AtomicU64::new(0);
+            let id = C.fetch_add(1, Ordering::Relaxed);
+            std::env::temp_dir().join(format!("bstack_xchg_rf_{}.bin", id))
+        };
+        let _g = Guard(path.clone());
+
+        let clen = 200u64;
+        let mut file = wip_header(clen, HEADER_SIZE + 100, 0); // wip_ptr = region B
+        let mut payload = vec![b'm'; clen as usize];
+        payload[0..50].fill(b'B'); // A holds B's bytes (done)
+        payload[100..150].fill(b'B'); // B not yet overwritten
+        file.extend_from_slice(&payload);
+        file.extend_from_slice(&[b'A'; 50]); // tail = A's original bytes
+        std::fs::write(&path, &file).unwrap();
+
+        let s = BStack::open(&path).unwrap();
+        let out = s.peek(0).unwrap();
+        assert_eq!(&out[0..50], &[b'B'; 50], "A holds B's bytes");
+        assert_eq!(&out[100..150], &[b'A'; 50], "B filled with A's bytes");
+        assert_eq!(s.len().unwrap(), 200);
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn copy_streams_regions_larger_than_move_chunk() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+
+        // n exceeds MOVE_CHUNK (64 KiB), so the on-disk copy streams over several
+        // buffer-sized iterations rather than buffering the whole region.
+        let n = 200 * 1024usize;
+        let mut payload = vec![0u8; 2 * n];
+        for (i, b) in payload[..n].iter_mut().enumerate() {
+            *b = (i % 251) as u8; // recognizable pattern in the source
+        }
+        s.push(&payload).unwrap();
+
+        s.copy(0, n as u64, n as u64).unwrap(); // [0, n) -> [n, 2n)
+
+        let out = s.peek(0).unwrap();
+        assert_eq!(&out[..n], &out[n..2 * n], "destination should equal source");
+        assert_eq!(out[n + 100_000], (100_000 % 251) as u8, "deep byte copied");
+        drop(s);
+
+        let s2 = BStack::open(&p).unwrap();
+        let out2 = s2.peek(0).unwrap();
+        assert_eq!(&out2[..n], &out2[n..2 * n], "copy survives reopen");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn cross_exchange_streams_large_regions() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+
+        let n = 100 * 1024usize; // > MOVE_CHUNK
+        let mut payload = vec![b'A'; n];
+        payload.extend(std::iter::repeat(b'B').take(n));
+        s.push(&payload).unwrap();
+
+        s.cross_exchange(0, n as u64, n as u64).unwrap(); // swap [0,n) with [n,2n)
+
+        let out = s.peek(0).unwrap();
+        assert!(out[..n].iter().all(|&x| x == b'B'), "A now holds B's bytes");
+        assert!(
+            out[n..2 * n].iter().all(|&x| x == b'A'),
+            "B now holds A's bytes"
+        );
+        drop(s);
+
+        let s2 = BStack::open(&p).unwrap();
+        let out2 = s2.peek(0).unwrap();
+        assert!(out2[..n].iter().all(|&x| x == b'B'));
+        assert!(out2[n..2 * n].iter().all(|&x| x == b'A'));
+    }
+
+    // ---- repeat -------------------------------------------------------------
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn repeat_fills_pattern_and_reopens_clean() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+
+        // 600-byte region; 300 copies of a 2-byte pattern spans a block, so it
+        // goes through the repeat-fill journal.
+        s.push(vec![b'.'; 600]).unwrap();
+        s.repeat(0, b"ab", 300).unwrap();
+
+        let expect: Vec<u8> = b"ab".iter().copied().cycle().take(600).collect();
+        assert_eq!(s.peek(0).unwrap(), expect);
+        drop(s);
+
+        // The 10-byte `[k | s]` tail is dropped and the journal disarmed.
+        let raw = std::fs::read(&p).unwrap();
+        assert_eq!(raw.len() as u64, HEADER_SIZE + 600, "tail not truncated");
+        assert_eq!(&raw[16..24], &[0u8; 8], "wip_ptr not disarmed");
+        let s2 = BStack::open(&p).unwrap();
+        assert_eq!(s2.peek(0).unwrap(), expect);
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn repeat_empty_or_zero_count_is_noop() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello world").unwrap();
+        s.repeat(0, b"", 5).unwrap(); // empty pattern
+        s.repeat(0, b"xy", 0).unwrap(); // zero count
+        assert_eq!(s.peek(0).unwrap(), b"hello world");
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn repeat_rejects_past_end() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(vec![0u8; 10]).unwrap();
+        // 3 copies of a 4-byte pattern = 12 bytes > 10-byte payload.
+        let err = s.repeat(0, b"abcd", 3).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn recovery_replays_armed_repeat() {
+        use crate::WipAux;
+        // Craft a crashed repeat: header armed REPEAT at offset 0, old bytes still
+        // in place, tail = [k | s]. Recovery writes k copies of s.
+        let path = {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static C: AtomicU64 = AtomicU64::new(0);
+            let id = C.fetch_add(1, Ordering::Relaxed);
+            std::env::temp_dir().join(format!("bstack_wip_repeat_{}.bin", id))
+        };
+        let _g = Guard(path.clone());
+
+        let clen = 600u64;
+        let mut file = wip_header(clen, HEADER_SIZE, u64::from(WipAux::Repeat));
+        file.extend_from_slice(&vec![b'.'; clen as usize]); // unfilled old payload
+        let k: u64 = 300;
+        file.extend_from_slice(&k.to_le_bytes()); // tail: k
+        file.extend_from_slice(b"ab"); // tail: s
+        std::fs::write(&path, &file).unwrap();
+
+        let s = BStack::open(&path).unwrap();
+        let expect: Vec<u8> = b"ab".iter().copied().cycle().take(600).collect();
+        assert_eq!(s.peek(0).unwrap(), expect, "repeat replayed on recovery");
+        assert_eq!(s.len().unwrap(), 600);
+        drop(s);
+
+        let raw = std::fs::read(&path).unwrap();
+        assert_eq!(raw.len() as u64, HEADER_SIZE + 600);
+        assert_eq!(&raw[16..24], &[0u8; 8], "wip_ptr not cleared");
+    }
+
+    #[test]
+    fn recovery_replays_armed_copy() {
+        use crate::WipAux;
+        // Craft a crashed disjoint copy: header armed COPY with wip_ptr = dest,
+        // tail = [src | n], destination bytes not yet written. Recovery replays
+        // move_chunked(src → dst) from the still-intact source.
+        let path = {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static C: AtomicU64 = AtomicU64::new(0);
+            let id = C.fetch_add(1, Ordering::Relaxed);
+            std::env::temp_dir().join(format!("bstack_wip_copy_{}.bin", id))
+        };
+        let _g = Guard(path.clone());
+
+        let clen = 600u64;
+        let (src, dst, n) = (0u64, 300u64, 200u64);
+        let mut payload = vec![b'S'; n as usize]; // source [0,200)
+        payload.extend_from_slice(&vec![b'.'; (clen - n) as usize]); // rest incl. dest
+        let mut file = wip_header(clen, HEADER_SIZE + dst, u64::from(WipAux::Copy));
+        file.extend_from_slice(&payload);
+        file.extend_from_slice(&src.to_le_bytes()); // tail: src
+        file.extend_from_slice(&n.to_le_bytes()); // tail: n
+        std::fs::write(&path, &file).unwrap();
+
+        let s = BStack::open(&path).unwrap();
+        assert_eq!(s.len().unwrap(), 600);
+        assert_eq!(
+            s.get(dst, dst + n).unwrap(),
+            vec![b'S'; n as usize],
+            "copy replayed"
+        );
+        assert_eq!(
+            s.get(0, n).unwrap(),
+            vec![b'S'; n as usize],
+            "source intact"
+        );
+        drop(s);
+
+        let raw = std::fs::read(&path).unwrap();
+        assert_eq!(raw.len() as u64, HEADER_SIZE + 600, "tail not truncated");
+        assert_eq!(&raw[16..24], &[0u8; 8], "wip_ptr not cleared");
+    }
+
+    #[test]
+    fn recovery_rolls_forward_splice_grow() {
+        use crate::WipAux;
+        // Crashed grow-splice: the last 20 of 100 bytes are being replaced with 50
+        // bytes → clen' = 130, splice point a = 80, staging base S = clen' = 130.
+        let path = {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static C: AtomicU64 = AtomicU64::new(0);
+            let id = C.fetch_add(1, Ordering::Relaxed);
+            std::env::temp_dir().join(format!("bstack_wip_splice_grow_{}.bin", id))
+        };
+        let _g = Guard(path.clone());
+
+        let mut file = wip_header(100, HEADER_SIZE + 80, u64::from(WipAux::SpliceGrow));
+        let mut payload = vec![b'A'; 80];
+        payload.extend_from_slice(&[b'X'; 20]); // old tail region, not yet replaced
+        file.extend_from_slice(&payload); // 100 committed bytes
+        file.extend_from_slice(&[0u8; 30]); // gap [100,130) from the extend
+        file.extend_from_slice(&[b'N'; 50]); // staged new bytes [130,180)
+        std::fs::write(&path, &file).unwrap();
+
+        let s = BStack::open(&path).unwrap();
+        let mut expect = vec![b'A'; 80];
+        expect.extend_from_slice(&[b'N'; 50]);
+        assert_eq!(s.len().unwrap(), 130, "clen' derived from file size");
+        assert_eq!(s.peek(0).unwrap(), expect, "grow splice rolled forward");
+        drop(s);
+
+        let raw = std::fs::read(&path).unwrap();
+        assert_eq!(raw.len() as u64, HEADER_SIZE + 130);
+        assert_eq!(&raw[16..24], &[0u8; 8], "wip_ptr not cleared");
+    }
+
+    #[test]
+    fn recovery_rolls_forward_splice_shrink() {
+        use crate::WipAux;
+        // Crashed shrink-splice: the last 50 of 130 bytes are being replaced with
+        // 20 bytes → clen' = 100, a = 80, staging base S = clen = 130.
+        let path = {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static C: AtomicU64 = AtomicU64::new(0);
+            let id = C.fetch_add(1, Ordering::Relaxed);
+            std::env::temp_dir().join(format!("bstack_wip_splice_shrink_{}.bin", id))
+        };
+        let _g = Guard(path.clone());
+
+        let mut file = wip_header(130, HEADER_SIZE + 80, u64::from(WipAux::SpliceShrink));
+        let mut payload = vec![b'A'; 80];
+        payload.extend_from_slice(&[b'X'; 50]); // old tail region
+        file.extend_from_slice(&payload); // 130 committed bytes
+        file.extend_from_slice(&[b'N'; 20]); // staged new bytes [130,150)
+        std::fs::write(&path, &file).unwrap();
+
+        let s = BStack::open(&path).unwrap();
+        let mut expect = vec![b'A'; 80];
+        expect.extend_from_slice(&[b'N'; 20]);
+        assert_eq!(s.len().unwrap(), 100, "clen' derived from file size");
+        assert_eq!(s.peek(0).unwrap(), expect, "shrink splice rolled forward");
+        drop(s);
+
+        let raw = std::fs::read(&path).unwrap();
+        assert_eq!(raw.len() as u64, HEADER_SIZE + 100);
+        assert_eq!(&raw[16..24], &[0u8; 8], "wip_ptr not cleared");
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn splice_journals_grow_and_reopens_clean() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+        s.push(vec![b'A'; 400]).unwrap();
+        // Pop the last 100, push 300 → length-changing tail replace (grow to 600).
+        s.atrunc(100, vec![b'N'; 300]).unwrap();
+
+        let mut expect = vec![b'A'; 300];
+        expect.extend_from_slice(&[b'N'; 300]);
+        assert_eq!(s.len().unwrap(), 600);
+        assert_eq!(s.peek(0).unwrap(), expect);
+        drop(s);
+
+        let raw = std::fs::read(&p).unwrap();
+        assert_eq!(
+            raw.len() as u64,
+            HEADER_SIZE + 600,
+            "staged bytes not dropped"
+        );
+        assert_eq!(&raw[16..24], &[0u8; 8], "wip_ptr not disarmed");
+        let s2 = BStack::open(&p).unwrap();
+        assert_eq!(s2.peek(0).unwrap(), expect);
+        assert_eq!(s2.len().unwrap(), 600);
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn splice_journals_shrink_and_reopens_clean() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+        s.push(vec![b'A'; 600]).unwrap();
+        // Pop the last 400, push 100 → length-changing tail replace (shrink to 300).
+        s.atrunc(400, vec![b'N'; 100]).unwrap();
+
+        let mut expect = vec![b'A'; 200];
+        expect.extend_from_slice(&[b'N'; 100]);
+        assert_eq!(s.len().unwrap(), 300);
+        assert_eq!(s.peek(0).unwrap(), expect);
+        drop(s);
+
+        let raw = std::fs::read(&p).unwrap();
+        assert_eq!(
+            raw.len() as u64,
+            HEADER_SIZE + 300,
+            "staged bytes not dropped"
+        );
+        assert_eq!(&raw[16..24], &[0u8; 8], "wip_ptr not disarmed");
+        let s2 = BStack::open(&p).unwrap();
+        assert_eq!(s2.peek(0).unwrap(), expect);
     }
 
     // ---- peek_into ----------------------------------------------------------
@@ -2032,7 +2558,7 @@ mod alloc_tests {
         assert!(dbg.contains("version"), "{dbg}");
         assert!(dbg.contains("len"), "{dbg}");
         // Version must be a recognisable semver string.
-        assert!(dbg.contains("0.1"), "{dbg}");
+        assert!(dbg.contains("0.4"), "{dbg}");
     }
 
     #[test]
@@ -4774,6 +5300,129 @@ mod atomic_tests {
 
     #[cfg(all(feature = "set", feature = "atomic"))]
     #[test]
+    fn process_gen_atrunc_replaces_tail_and_ends_sequence() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        let mut calls = 0usize;
+        s.process_gen(|| {
+            calls += 1;
+            match calls {
+                1 => Some(BStackGenOp::Atrunc {
+                    n: 5,
+                    data: b"THERE!",
+                }),
+                _ => Some(BStackGenOp::Write {
+                    offset: 0,
+                    data: b"NOPE!",
+                }),
+            }
+        })
+        .unwrap();
+        assert_eq!(calls, 1, "Atrunc must end the sequence, like Write");
+        assert_eq!(s.len().unwrap(), 11);
+        assert_eq!(s.peek(0).unwrap(), b"helloTHERE!");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn process_gen_atrunc_zero_empty_is_noop_and_ends_sequence() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        s.process_gen(|| Some(BStackGenOp::Atrunc { n: 0, data: b"" }))
+            .unwrap();
+        assert_eq!(s.len().unwrap(), 5);
+        assert_eq!(s.peek(0).unwrap(), b"hello");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn process_gen_atrunc_exceeds_payload_returns_error() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hi").unwrap();
+        let err = s
+            .process_gen(|| Some(BStackGenOp::Atrunc { n: 5, data: b"x" }))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(s.peek(0).unwrap(), b"hi");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn process_gen_atrunc_below_locked_returns_error() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        s.lock_up_to(8).unwrap();
+        let err = s
+            .process_gen(|| Some(BStackGenOp::Atrunc { n: 5, data: b"x" }))
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(s.len().unwrap(), 10);
+        assert_eq!(s.peek(0).unwrap(), b"helloworld");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn process_gen_splice_reads_tail_and_replaces_and_ends_sequence() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        let mut old = [0u8; 5];
+        let mut calls = 0usize;
+        s.process_gen(|| {
+            calls += 1;
+            match calls {
+                // SAFETY: `old` outlives this whole `process_gen` call.
+                1 => Some(BStackGenOp::Splice {
+                    old: unsafe { core::mem::transmute::<&mut [u8], _>(&mut old[..]) },
+                    new: b"THERE!",
+                }),
+                _ => Some(BStackGenOp::Write {
+                    offset: 0,
+                    data: b"NOPE!",
+                }),
+            }
+        })
+        .unwrap();
+        assert_eq!(calls, 1, "Splice must end the sequence, like Pop");
+        assert_eq!(&old, b"world", "removed tail read back into `old`");
+        assert_eq!(s.len().unwrap(), 11);
+        assert_eq!(s.peek(0).unwrap(), b"helloTHERE!");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn process_gen_splice_below_locked_returns_error() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        s.lock_up_to(8).unwrap();
+        let mut old = [0u8; 5];
+        let err = s
+            .process_gen(|| {
+                // SAFETY: `old` outlives this whole `process_gen` call.
+                Some(BStackGenOp::Splice {
+                    old: unsafe { core::mem::transmute::<&mut [u8], _>(&mut old[..]) },
+                    new: b"x",
+                })
+            })
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(s.len().unwrap(), 10);
+        assert_eq!(s.peek(0).unwrap(), b"helloworld");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
     fn process_gen_len_informs_discard_size() {
         use crate::BStackGenOp;
         // Discard a trailing region whose length is only known once `Len` has
@@ -5824,6 +6473,51 @@ mod atomic_tests {
         drop(s);
         let s2 = BStack::open(&p).unwrap();
         assert_eq!(s2.peek(0).unwrap(), b"abab");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn copy_disjoint_larger_than_block_journals_and_reopens_clean() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+        // 800-byte payload; copy 300 disjoint bytes [0,300) → [400,700). 300 > one
+        // aligned block, so it takes the copy-journal path (not the atomic write).
+        let mut data = vec![b'S'; 300];
+        data.extend_from_slice(&vec![b'.'; 500]);
+        s.push(&data).unwrap();
+        s.copy(0, 400, 300).unwrap();
+
+        assert_eq!(
+            s.get(400, 700).unwrap(),
+            vec![b'S'; 300],
+            "disjoint copy landed"
+        );
+        assert_eq!(s.get(0, 300).unwrap(), vec![b'S'; 300], "source unchanged");
+        drop(s);
+
+        // Only the source coordinate was staged; the tail backup is gone, wip is
+        // disarmed, and the value survives reopen.
+        let raw = std::fs::read(&p).unwrap();
+        assert_eq!(
+            raw.len() as u64,
+            crate::HEADER_SIZE + 800,
+            "tail not truncated"
+        );
+        assert_eq!(&raw[16..24], &[0u8; 8], "wip_ptr not disarmed");
+        let s2 = BStack::open(&p).unwrap();
+        assert_eq!(s2.get(400, 700).unwrap(), vec![b'S'; 300]);
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn copy_same_location_is_noop() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(vec![b'Z'; 400]).unwrap();
+        // from == to with a block-spanning length: the same-location short-circuit
+        // returns without arming any journal.
+        s.copy(50, 50, 300).unwrap();
+        assert_eq!(s.get(50, 350).unwrap(), vec![b'Z'; 300]);
     }
 
     // -----------------------------------------------------------------------
