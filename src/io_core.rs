@@ -1174,26 +1174,40 @@ pub(crate) fn inplace_overlay_insert<'a>(
 ) {
     let end = off + data.len() as u64;
     let mut next: Vec<(u64, &'a [u8])> = Vec::with_capacity(overlay.len() + 1);
+    // The overlay is already sorted and every retained piece keeps its relative
+    // order, so the new edit is the only element that could be out of place. Emit
+    // it in one pass at its sorted position (`off` is unique — no retained piece
+    // starts at `off`) instead of re-sorting the whole vector.
+    let mut inserted = false;
     for &(s, d) in overlay.iter() {
         let e = s + d.len() as u64;
         if e <= off || s >= end {
-            // Disjoint from the new write: keep unchanged.
+            // Disjoint. If it sits past the new edit, emit the new edit first.
+            if !inserted && s > off {
+                next.push((off, data));
+                inserted = true;
+            }
             next.push((s, d));
         } else {
             // Overlaps `[off, end)`: keep whatever prefix/suffix lies outside it,
-            // drop the covered middle. When `new` encloses `old`, both guards are
-            // false and `old` vanishes; when `old` encloses `new`, both fire and
-            // `old` splits in two around the new edit.
+            // drop the covered middle, and slot the new edit between them. When
+            // `new` encloses `old`, both guards are false and `old` vanishes; when
+            // `old` encloses `new`, both fire and `old` splits in two around it.
             if s < off {
                 next.push((s, &d[..(off - s) as usize]));
+            }
+            if !inserted {
+                next.push((off, data));
+                inserted = true;
             }
             if e > end {
                 next.push((end, &d[(end - s) as usize..]));
             }
         }
     }
-    next.push((off, data));
-    next.sort_by_key(|&(s, _)| s);
+    if !inserted {
+        next.push((off, data));
+    }
     *overlay = next;
 }
 

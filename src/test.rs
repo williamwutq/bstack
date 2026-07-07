@@ -6049,6 +6049,59 @@ mod atomic_tests {
 
     #[cfg(all(feature = "set", feature = "atomic"))]
     #[test]
+    fn inplace_gen_overlay_enclosure_and_gaps() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(vec![b'.'; 20]).unwrap();
+
+        // A mix that exercises every overlay case and forces the new edit into a
+        // non-tail sorted position each time:
+        //   1. [4, 12)  = '1'                          (a plain edit)
+        //   2. [14, 18) = '2'                          (a gap after it)
+        //   3. [6, 8)   = '3'  -> old encloses new     (splits edit 1 in three)
+        //   4. [2, 16)  = '4'  -> new encloses several (drops 3, trims 1 and 2)
+        let e1 = vec![b'1'; 8];
+        let e2 = vec![b'2'; 4];
+        let e3 = vec![b'3'; 2];
+        let e4 = vec![b'4'; 14];
+        let mut step = 0usize;
+        s.inplace_gen(|res| {
+            assert!(res.is_ok());
+            let r = match step {
+                0 => Some(BStackGenOp::Write {
+                    offset: 4,
+                    data: unsafe { core::mem::transmute::<&[u8], _>(&e1[..]) },
+                }),
+                1 => Some(BStackGenOp::Write {
+                    offset: 14,
+                    data: unsafe { core::mem::transmute::<&[u8], _>(&e2[..]) },
+                }),
+                2 => Some(BStackGenOp::Write {
+                    offset: 6,
+                    data: unsafe { core::mem::transmute::<&[u8], _>(&e3[..]) },
+                }),
+                3 => Some(BStackGenOp::Write {
+                    offset: 2,
+                    data: unsafe { core::mem::transmute::<&[u8], _>(&e4[..]) },
+                }),
+                _ => None,
+            };
+            step += 1;
+            r
+        })
+        .unwrap();
+        // Final: [0,2)='.', [2,16)='4' (edit 4 overrode everything it covered),
+        // [16,18)='2' (surviving suffix of edit 2), [18,20)='.'.
+        let mut expect = vec![b'.'; 2];
+        expect.extend_from_slice(&[b'4'; 14]);
+        expect.extend_from_slice(&[b'2'; 2]);
+        expect.extend_from_slice(&[b'.'; 2]);
+        assert_eq!(s.peek(0).unwrap(), expect);
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
     fn inplace_gen_rejects_size_ops_but_still_commits() {
         use crate::BStackGenOp;
         let (s, p) = mk_stack();
