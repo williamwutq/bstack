@@ -366,6 +366,15 @@ pub(crate) enum WipAux {
     /// overlapping copy cannot use this mode and routes through [`WipAux::Set`]
     /// via [`journaled_move`] instead.)
     Copy = u64::MAX - 4,
+    /// Multi-write intent-complete sentinel: several non-overlapping in-place
+    /// writes have all been staged and must commit as one atomic unit. Unlike
+    /// every other mode this is armed with `wip_ptr == 0` (it never names a
+    /// single target), so it can never be confused with a single-region journal,
+    /// which always arms `wip_ptr != 0`. The staged tail is a back-to-back
+    /// sequence of `[s: u64 LE | e: u64 LE | data]` blocks running from
+    /// `HEADER_SIZE + clen` to `file_size`; recovery replays each into
+    /// `[s, e)`. See [`journaled_multi_set`] and [`recover_multi_write`].
+    MultiWrite = u64::MAX - 5,
 }
 
 impl From<WipAux> for u64 {
@@ -386,6 +395,7 @@ impl TryFrom<u64> for WipAux {
             v if v == WipAux::SpliceShrink as u64 => Ok(WipAux::SpliceShrink),
             v if v == WipAux::Repeat as u64 => Ok(WipAux::Repeat),
             v if v == WipAux::Copy as u64 => Ok(WipAux::Copy),
+            v if v == WipAux::MultiWrite as u64 => Ok(WipAux::MultiWrite),
             _ => Err(()),
         }
     }
@@ -557,6 +567,10 @@ pub(crate) fn recover_wip(
                 }
             }
         }
+        // The multi-write sentinel is only ever armed with `wip_ptr == 0`, so
+        // seeing it here (`recover_wip` runs only when `wip_ptr != 0`) is an
+        // inconsistent header — roll back like any unknown mode.
+        Ok(WipAux::MultiWrite) => {}
         // Unknown mode: roll back to the committed length (no replay).
         Err(()) => {}
     }
@@ -981,4 +995,281 @@ pub(crate) fn commit_tail_replace(
         // Length-changing tail replace: journal it.
         journaled_splice(file, clen, n, buf)
     }
+}
+
+// --------------------------------------- Multi-write journal --------------------------------------
+
+/// Crash-atomically commit `k` non-overlapping in-place writes `{(offset_i,
+/// data_i)}` as a single unit through the multi-write journal, **O(1) memory
+/// beyond the caller's own slices**.
+///
+/// `data_size` is the current payload length (`clen`); it is never changed —
+/// every write is a same-length, in-place overwrite of committed bytes, so the
+/// staging region is pinned between `HEADER_SIZE + data_size` (start) and the
+/// grown file end. Callers guarantee every block lies within `[0, data_size)`,
+/// no block overlaps the locked prefix, and the blocks are pairwise
+/// non-overlapping (`set_batched` rejects overlap; `inplace_gen` resolves it).
+/// Empty `data_i` blocks must be filtered out by the caller. `blocks` must be
+/// non-empty (a lone write should take [`set_in_place`], and an empty batch is a
+/// no-op) — this path is for `k >= 2`.
+///
+/// The four-barrier protocol (stage → arm → replay → disarm) guarantees a crash
+/// leaves either every block's old bytes or every block's new bytes, never a
+/// partial mix — see the Multi-write journal in `algos/WIP.md`. `wip_ptr` stays
+/// `0` throughout; the intent-complete sentinel ([`WipAux::MultiWrite`]) is the
+/// commit point.
+#[cfg(all(feature = "set", feature = "atomic"))]
+pub(crate) fn journaled_multi_set(
+    file: &mut File,
+    data_size: u64,
+    blocks: &[(u64, &[u8])],
+) -> io::Result<()> {
+    // 1. Stage every block `[s | e | data]` back-to-back beyond the committed
+    //    end. The blocks are contiguous, so one seek then sequential writes
+    //    suffice; the file grows to hold them.
+    file.seek(SeekFrom::Start(HEADER_SIZE + data_size))?;
+    for (offset, data) in blocks {
+        let end = offset + data.len() as u64;
+        file.write_all(&offset.to_le_bytes())?;
+        file.write_all(&end.to_le_bytes())?;
+        file.write_all(data)?;
+    }
+    durable_sync(file)?;
+    // 2. Arm the intent-complete sentinel. `wip_ptr` stays 0 (single header
+    //    write), so this can never be confused with a single-region journal.
+    write_wip(file, 0, WipAux::MultiWrite)?;
+    durable_sync(file)?;
+    // 3. Replay: write each block into its target in place. Order is arbitrary
+    //    (the ranges are non-overlapping), and every block's staged copy is the
+    //    crash backup recovery replays from.
+    for (offset, data) in blocks {
+        write_at(file, *offset, data)?;
+    }
+    durable_sync(file)?;
+    // 4. Disarm.
+    write_wip(file, 0, WipAux::Set)?;
+    durable_sync(file)?;
+    // 5. Drop the staged tail, restoring `file_size == HEADER_SIZE + data_size`.
+    file.set_len(HEADER_SIZE + data_size)
+}
+
+/// Walk the staged multi-write tail `[tail_start, raw_size)` and, for each
+/// well-formed `[s | e | data]` block, invoke `apply(s, data_src_logical, len)`.
+///
+/// Returns `Ok(true)` if the entire tail parsed into a clean sequence of blocks
+/// that ends exactly at `raw_size` with every target range within
+/// `[0, committed_len)`, and `Ok(false)` on any malformation (a truncated or
+/// oversized block, a reversed range, an out-of-bounds target, or trailing
+/// bytes). A legitimately-armed tail always parses; `false` means genuine
+/// corruption, for which recovery rolls back.
+///
+/// `data_src_logical` is the logical offset of the block's payload bytes (their
+/// physical position minus the header), suitable for [`move_chunked`]'s `src`.
+fn walk_multi_blocks(
+    file: &mut File,
+    committed_len: u64,
+    tail_start: u64,
+    raw_size: u64,
+    mut apply: impl FnMut(&mut File, u64, u64, u64) -> io::Result<()>,
+) -> io::Result<bool> {
+    let mut cursor = tail_start;
+    while cursor < raw_size {
+        // Header must be fully present.
+        if cursor + 16 > raw_size {
+            return Ok(false);
+        }
+        let mut hdr = [0u8; 16];
+        file.seek(SeekFrom::Start(cursor))?;
+        file.read_exact(&mut hdr)?;
+        let s = u64::from_le_bytes(hdr[0..8].try_into().unwrap());
+        let e = u64::from_le_bytes(hdr[8..16].try_into().unwrap());
+        // Well-formedness: forward range, within the committed payload.
+        if e < s || e > committed_len {
+            return Ok(false);
+        }
+        let plen = e - s;
+        let payload_phys = cursor + 16;
+        // Payload must be fully present in the staged tail.
+        if payload_phys.saturating_add(plen) > raw_size {
+            return Ok(false);
+        }
+        apply(file, s, payload_phys - HEADER_SIZE, plen)?;
+        cursor = payload_phys + plen;
+    }
+    // A clean walk lands exactly on `raw_size` (guaranteed by the fits-checks
+    // above, which reject any trailing partial block).
+    Ok(cursor == raw_size)
+}
+
+/// Recover a crashed multi-write journal found on open (`wip_ptr == 0`,
+/// `wip_aux == MultiWrite`), restoring the at-rest invariant `file_size ==
+/// HEADER_SIZE + committed_len`. Returns the committed length (unchanged — a
+/// multi-write never changes the payload size).
+///
+/// The staged tail `[HEADER_SIZE + committed_len, raw_size)` holds a back-to-back
+/// sequence of `[s | e | data]` blocks. Recovery validates the whole sequence
+/// first (a two-pass walk), then — only if it is clean — replays every block into
+/// `[s, e)`. Validating before applying makes the replay all-or-nothing: a
+/// genuinely-armed tail always validates, and a corrupt one applies nothing and
+/// rolls back. Each replay is idempotent (the staged bytes are immutable and
+/// disjoint from every target, which all sit below `committed_len`), so a crash
+/// during recovery is safe to re-run.
+///
+/// Not feature-gated: a file armed by a feature-enabled build must still recover
+/// correctly when reopened by a build without that feature.
+pub(crate) fn recover_multi_write(
+    file: &mut File,
+    committed_len: u64,
+    raw_size: u64,
+) -> io::Result<u64> {
+    let tail_start = HEADER_SIZE + committed_len;
+    if raw_size > tail_start {
+        // Pass 1: validate the whole sequence without touching the payload.
+        let valid = walk_multi_blocks(file, committed_len, tail_start, raw_size, |_, _, _, _| {
+            Ok(())
+        })?;
+        // Pass 2: apply, but only if the sequence is clean end-to-end.
+        if valid {
+            walk_multi_blocks(
+                file,
+                committed_len,
+                tail_start,
+                raw_size,
+                |f, dst, src, n| move_chunked(f, src, dst, n),
+            )?;
+            durable_sync(file)?;
+        }
+    }
+    // Disarm and drop the staged tail (finalize). `clen` is unchanged.
+    write_header_commit(file, committed_len, 0, WipAux::Set)?;
+    durable_sync(file)?;
+    file.set_len(tail_start)?;
+    durable_sync(file)?;
+    Ok(committed_len)
+}
+
+/// Insert an in-place write `[off, off + data.len())` into an `inplace_gen`
+/// overlay, keeping it a sorted, pairwise-non-overlapping set of pending edits.
+///
+/// Overlap is resolved in favour of the newer write: any portion of an existing
+/// edit covered by `[off, off + data.len())` is dropped, and its non-overlapping
+/// prefix and/or suffix are retained as sub-slices of the same `&'a` data. All
+/// containment cases fall out of the prefix/suffix split:
+///
+/// - **new encloses old** (`off <= s` and `e <= end`): neither prefix nor suffix
+///   survives — the old edit is dropped entirely.
+/// - **old encloses new** (`s < off` and `e > end`): both a prefix `[s, off)` and
+///   a suffix `[end, e)` survive, and the new edit fills the gap between them —
+///   one edit splits into three.
+/// - **partial overlap on either side**: only the non-covered end survives.
+///
+/// So issuing `a..c` then `b..d` (with `a<b<c<d`) leaves `a..b` (first write),
+/// `b..c` (second, overriding), and `c..d` (second) — the non-overlapping blocks
+/// the multi-write journal commits. Callers pass only non-empty `data`.
+#[cfg(all(feature = "set", feature = "atomic"))]
+pub(crate) fn inplace_overlay_insert<'a>(
+    overlay: &mut Vec<(u64, &'a [u8])>,
+    off: u64,
+    data: &'a [u8],
+) {
+    let end = off + data.len() as u64;
+    let mut next: Vec<(u64, &'a [u8])> = Vec::with_capacity(overlay.len() + 1);
+    for &(s, d) in overlay.iter() {
+        let e = s + d.len() as u64;
+        if e <= off || s >= end {
+            // Disjoint from the new write: keep unchanged.
+            next.push((s, d));
+        } else {
+            // Overlaps `[off, end)`: keep whatever prefix/suffix lies outside it,
+            // drop the covered middle. When `new` encloses `old`, both guards are
+            // false and `old` vanishes; when `old` encloses `new`, both fire and
+            // `old` splits in two around the new edit.
+            if s < off {
+                next.push((s, &d[..(off - s) as usize]));
+            }
+            if e > end {
+                next.push((end, &d[(end - s) as usize..]));
+            }
+        }
+    }
+    next.push((off, data));
+    next.sort_by_key(|&(s, _)| s);
+    *overlay = next;
+}
+
+/// Validate an `inplace_gen` `Write` op against the fixed payload size and the
+/// locked prefix, mirroring `set`'s checks. An empty `data` is a valid no-op
+/// (nothing is staged).
+#[cfg(all(feature = "set", feature = "atomic"))]
+pub(crate) fn inplace_validate_write(
+    offset: u64,
+    data: &[u8],
+    data_size: u64,
+    locked: u64,
+) -> io::Result<()> {
+    if data.is_empty() {
+        return Ok(());
+    }
+    let end = crate::checked_end(
+        offset,
+        data.len() as u64,
+        "inplace_gen: write offset + data.len() overflows u64",
+    )?;
+    if offset < locked {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "inplace_gen: write range [{offset}, {end}) overlaps locked region [0, {locked})"
+            ),
+        ));
+    }
+    if end > data_size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "inplace_gen: write range [{offset}, {end}) exceeds payload size ({data_size})"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Serve an `inplace_gen` `Read` op: validate the range, fill `buf` from disk,
+/// then overlay the pending edits so the read reflects the batch-so-far ("new")
+/// content rather than the committed bytes.
+#[cfg(all(feature = "set", feature = "atomic"))]
+pub(crate) fn inplace_overlay_read(
+    file: &mut File,
+    data_size: u64,
+    offset: u64,
+    buf: &mut [u8],
+    overlay: &[(u64, &[u8])],
+) -> io::Result<()> {
+    let end = crate::checked_end(
+        offset,
+        buf.len() as u64,
+        "inplace_gen: read offset + buf.len() overflows u64",
+    )?;
+    if end > data_size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("inplace_gen: read range [{offset}, {end}) exceeds payload size ({data_size})"),
+        ));
+    }
+    if buf.is_empty() {
+        return Ok(());
+    }
+    read_at(file, offset, buf)?;
+    // Overlay each pending edit that intersects `[offset, end)`.
+    for &(s, d) in overlay {
+        let e = s + d.len() as u64;
+        let lo = s.max(offset);
+        let hi = e.min(end);
+        if lo < hi {
+            let (b_lo, b_hi) = ((lo - offset) as usize, (hi - offset) as usize);
+            let (d_lo, d_hi) = ((lo - s) as usize, (hi - s) as usize);
+            buf[b_lo..b_hi].copy_from_slice(&d[d_lo..d_hi]);
+        }
+    }
+    Ok(())
 }
