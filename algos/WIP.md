@@ -391,8 +391,9 @@ The next block begins immediately after `data_i`. The full sequence runs from
 ### Protocol
 
 1. **Stage.** Append blocks one by one to the tail. The header is not touched;
-   `wip_ptr` and `wip_aux` remain 0. Sync after each block (or at minimum once
-   after all are appended — see implementation choice below).
+   `wip_ptr` and `wip_aux` remain 0. One sync after all blocks are appended
+   suffices — the arm in step 2 is the commit point, so the staged blocks only
+   need to be durable before it.
 2. **Arm.** Write `wip_aux = u64::MAX` (intent-complete sentinel), `wip_ptr`
    stays 0 — single header write → sync.
 3. **Replay.** Scan `[32+clen, file_size)`. For each block, copy `data_i` into
