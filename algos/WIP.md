@@ -38,20 +38,20 @@ partially updated by a crash.
 ```
 WipAux value     Mode
 -----------      ----
-0                Set        — same-length verbatim replay
-u64::MAX - 1     SpliceGrow — length-growing tail replace (clen' > clen)
+0                Set          — same-length verbatim replay
+u64::MAX - 1     SpliceGrow   — length-growing tail replace (clen' > clen)
 u64::MAX - 2     SpliceShrink — length-shrinking tail replace (clen' < clen)
-u64::MAX - 3     Repeat     — repeating-pattern fill
-u64::MAX - 4     Copy       — disjoint in-file copy (coordinate-only staging)
-u64::MAX         (reserved) — multi-write intent-complete sentinel
-other            unknown    — roll back on recovery
+u64::MAX - 3     Repeat       — repeating-pattern fill
+u64::MAX - 4     Copy         — disjoint in-file copy (coordinate-only staging)
+u64::MAX - 5     MultiWrite   — multi-write intent-complete sentinel
+other            unknown      — roll back on recovery
 ```
 
 Non-zero modes take values near `u64::MAX`, decrementing as modes are added,
 so the low-value range is free for future packed encodings and unrecognized
-values are unmistakable. An unrecognized value is always treated as unknown and
-triggers rollback. All modes in the current list shipped in 0.4.0, so every
-0.4.0 reader recognizes all of them.
+values are unmistakable. `u64::MAX` should never be used. An unrecognized value
+is always treated as unknown and triggers rollback. All modes in the current list
+shipped in 0.4.0, so every 0.4.0 reader recognizes all of them.
 
 ---
 
@@ -367,7 +367,7 @@ reference).
 
 When several non-overlapping in-place writes must commit atomically, the
 multi-write journal generalizes the single-region protocol. `wip_ptr` stays `0`
-throughout; `wip_aux` carries the intent-complete sentinel (`u64::MAX`) once all
+throughout; `wip_aux` carries the intent-complete sentinel (`MultiWrite`) once all
 blocks are staged.
 
 **Constraint:** only in-place mutations (`set`-equivalent writes). No size-
@@ -394,7 +394,7 @@ The next block begins immediately after `data_i`. The full sequence runs from
    `wip_ptr` and `wip_aux` remain 0. One sync after all blocks are appended
    suffices — the arm in step 2 is the commit point, so the staged blocks only
    need to be durable before it.
-2. **Arm.** Write `wip_aux = u64::MAX` (intent-complete sentinel), `wip_ptr`
+2. **Arm.** Write `wip_aux =  MultiWrite` (intent-complete sentinel), `wip_ptr`
    stays 0 — single header write → sync.
 3. **Replay.** Scan `[32+clen, file_size)`. For each block, copy `data_i` into
    `[32+s_i, 32+e_i)`. Order is arbitrary as long as ranges are non-overlapping.
@@ -405,7 +405,7 @@ The next block begins immediately after `data_i`. The full sequence runs from
 
 - `wip_ptr == 0`, `wip_aux == 0` (steady state or crash during step 1): base
   rule — truncate to `32 + clen`. Partial tail discarded silently.
-- `wip_ptr == 0`, `wip_aux == u64::MAX` (crash after arm): scan
+- `wip_ptr == 0`, `wip_aux == MultiWrite` (crash after arm): scan
   `[32+clen, file_size)`, replay each block, then disarm (step 4).
 
 All other combinations are handled by the existing single-region rules (which
@@ -428,7 +428,7 @@ require `wip_ptr != 0`). The intent-complete sentinel is only valid when
 ## Forward compatibility of `wip_aux`
 
 The mode space is open: future releases may define new modes by decrementing
-from `u64::MAX - 4`. Two rules keep this safe across versions:
+from `u64::MAX - 5`. Two rules keep this safe across versions:
 
 **Rule 1 — Unknown modes roll back.** A reader that sees an unrecognized
 `wip_aux` does not guess at the staging format. It applies the default: roll back
@@ -462,7 +462,7 @@ wip_ptr  wip_aux          action
 -------  -------          ------
   0        0              steady state; if file_size > 32+clen truncate (partial push rolled back);
                           if file_size < 32+clen set clen = file_size-32 (partial pop rolled back)
-  0        u64::MAX       multi-write: scan [32+clen, file_size), replay each block, finalize
+  0        MultiWrite     multi-write: scan [32+clen, file_size), replay each block, finalize
   0        other          unknown multi-write sentinel: roll back (truncate to 32+clen)
   !=0      Set (0)        same-length set: replay staged tail into [wip_ptr, wip_ptr+tail_len), finalize
   !=0      Repeat         repeat-fill: read [k|s] from tail, write_repeated, finalize
