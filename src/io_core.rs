@@ -1239,9 +1239,10 @@ pub(crate) fn inplace_validate_write(
     Ok(())
 }
 
-/// Serve an `inplace_gen` `Read` op: validate the range, fill `buf` from disk,
-/// then overlay the pending edits so the read reflects the batch-so-far ("new")
-/// content rather than the committed bytes.
+/// Serve an `inplace_gen` `Read` op: validate the range, then fill `buf` with the
+/// batch-so-far ("new") content — the pending edits overlaid on the committed
+/// bytes. The disk read is skipped entirely when the pending edits already cover
+/// the whole range, so a read fully served from the overlay does no I/O.
 #[cfg(all(feature = "set", feature = "atomic"))]
 pub(crate) fn inplace_overlay_read(
     file: &mut File,
@@ -1264,17 +1265,37 @@ pub(crate) fn inplace_overlay_read(
     if buf.is_empty() {
         return Ok(());
     }
-    read_at(file, offset, buf)?;
     // The overlay is sorted by start and non-overlapping, so its ends are sorted
     // too: the edits intersecting `[offset, end)` form one contiguous run. Binary
     // search for the first edit that could reach into the read (`edit end >
-    // offset`), then walk forward only until an edit starts at or past `end` —
-    // O(log n + k) instead of scanning every pending edit.
+    // offset`) — O(log n) instead of scanning every pending edit.
     let start = overlay.partition_point(|&(s, d)| s + d.len() as u64 <= offset);
+    // First pass: find the run's end index and whether the edits leave any gap
+    // over `[offset, end)`. A fully-covered read needs no committed bytes at all,
+    // so the disk read can be skipped.
+    let mut run_end = start;
+    let mut covered_to = offset;
+    let mut has_gap = false;
     for &(s, d) in &overlay[start..] {
         if s >= end {
             break;
         }
+        if s > covered_to {
+            has_gap = true; // a stretch of committed bytes shows through here
+        }
+        covered_to = s + d.len() as u64;
+        run_end += 1;
+    }
+    if covered_to < end {
+        has_gap = true; // committed bytes show through past the last edit
+    }
+    // Only touch the disk when some committed bytes are actually visible.
+    if has_gap {
+        read_at(file, offset, buf)?;
+    }
+    // Second pass: overlay each edit in the run. When there was no gap these
+    // copies fill `buf` completely, so the skipped read left nothing uninitialised.
+    for &(s, d) in &overlay[start..run_end] {
         let e = s + d.len() as u64;
         let lo = s.max(offset);
         let hi = e.min(end);
