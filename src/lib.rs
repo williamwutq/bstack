@@ -1530,20 +1530,22 @@ impl BStack {
 impl BStack {
     /// Cut `n` bytes off the tail then append `buf` as a single atomic operation.
     ///
-    /// The operation ordering is chosen based on the net size change to maximise
-    /// crash-recovery safety (see *Durability* in the crate docs):
+    /// **Crash-atomic:** after a crash the tail holds either its old contents or
+    /// the full replacement, never a mix. The commit dispatches on the shape of
+    /// the replacement (see *Durability* in the crate docs and `algos/WIP.md`):
     ///
-    /// * **Net extension** (`buf.len() > n`): the file is extended first, `buf`
-    ///   is written into the freed tail region plus the new space, then a
-    ///   `durable_sync` commits the data before the header committed-length is
-    ///   updated.  On crash before the header update, recovery truncates back to
-    ///   the original committed length — a clean rollback.
-    ///
-    /// * **Net truncation or same size** (`buf.len() ≤ n`): `buf` is written
-    ///   into the tail first, then the file is truncated, then `durable_sync`
-    ///   commits the result before the header is updated.  On crash after
-    ///   truncation, recovery sets the committed length to the (smaller) file
-    ///   size, committing the final state.
+    /// * **Pure truncation** (`buf` empty): drop the tail and commit the smaller
+    ///   `clen` — the truncation is the commit point.
+    /// * **Pure append** (`n == 0`): the bytes land beyond the committed end,
+    ///   uncommitted until the `clen` write, so a crash rolls back by truncation.
+    /// * **Same length** (`buf.len() == n`): overwrite in place via the `Set`
+    ///   write-in-progress journal (or a single-block atomic write).
+    /// * **Length change** (`buf.len() != n`, both non-zero): the **splice
+    ///   journal** (`SpliceGrow`/`SpliceShrink`) — stage the new tail past the
+    ///   live payload, arm the direction, replay it into place, then commit the
+    ///   new `clen` and disarm in one atomic header write. Recovery derives the
+    ///   new length from the file size and rolls a crash forward, or rolls back
+    ///   if the arm never landed.
     ///
     /// `n = 0` with an empty `buf` is a valid no-op.
     ///
@@ -1587,8 +1589,9 @@ impl BStack {
     /// Pop `n` bytes off the tail then append `buf`, returning the removed bytes.
     ///
     /// The bytes are read before any mutation, so they are always available in
-    /// the returned `Vec` even if the subsequent write fails.  The same
-    /// ordering strategy as [`atrunc`](Self::atrunc) is used.
+    /// the returned `Vec` even if the subsequent write fails.  The replacement
+    /// commits with the same crash-atomic, shape-dispatched strategy as
+    /// [`atrunc`](Self::atrunc).
     ///
     /// `n = 0` with an empty `buf` is a valid no-op and returns an empty `Vec`.
     ///
@@ -1638,8 +1641,8 @@ impl BStack {
     ///
     /// Buffer-reuse counterpart of [`splice`](Self::splice): avoids allocating
     /// a `Vec` for the removed bytes by writing them into the caller-supplied
-    /// `old` slice.  The same ordering strategy as [`atrunc`](Self::atrunc) is
-    /// used for the write/truncation side.
+    /// `old` slice.  The replacement commits with the same crash-atomic,
+    /// shape-dispatched strategy as [`atrunc`](Self::atrunc).
     ///
     /// An empty `old` with an empty `new` is a valid no-op.
     ///

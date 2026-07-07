@@ -7,10 +7,17 @@
 /*
  * bstack — persistent, fsync-durable binary stack backed by a single file.
  *
- * File format (16-byte header followed by payload):
- *   [0..8)  magic: "BSTK" + major(1) + minor(1) + patch(2) + reserved(1)
- *   [8..16) committed payload length, little-endian uint64
- *   [16..)  payload bytes
+ * File format (32-byte header followed by payload):
+ *   [0..8)   magic: "BSTK" + major(0) + minor(4) + patch(0) + reserved(0)
+ *   [8..16)  committed payload length (clen), little-endian uint64
+ *   [16..24) wip_ptr: write-in-progress journal target (0 when idle), LE uint64
+ *   [24..32) wip_aux: write-in-progress journal mode, LE uint64
+ *   [32..)   payload bytes
+ *
+ * wip_ptr / wip_aux hold the write-in-progress journal that makes in-place
+ * mutations crash-atomic; both are zero in the steady state.  On open, an
+ * interrupted in-place write is replayed or rolled back (see algos/WIP.md).
+ * Legacy 0.1.x files (16-byte header) are upgraded by bstack_migrate.
  *
  * All logical offsets are 0-based from the start of the payload region.
  *
@@ -133,7 +140,7 @@ int bstack_get(bstack_t *bs, uint64_t start, uint64_t end,
 int bstack_discard(bstack_t *bs, size_t n);
 
 /*
- * Write the current logical payload size (excluding the 16-byte header)
+ * Write the current logical payload size (excluding the 32-byte header)
  * into *out_len.  This value is cached in memory, so no syscall is made;
  * it takes the read lock, so it can run concurrently with other readers
  * but blocks while a writer is in progress.
@@ -261,11 +268,14 @@ typedef struct {
 /*
  * Atomically cut n bytes off the tail then append buf_len bytes from buf.
  *
- * The write ordering is chosen for crash safety: when buf_len > n (net
- * extension) the file is extended before writing buf so a crash before the
- * committed-length update cleanly rolls back to the original state; when
- * buf_len <= n (net truncation or same size) buf is written first, then the
- * file is truncated, so a crash after truncation is committed by recovery.
+ * Crash-atomic: after a crash the tail holds either its old contents or the
+ * full replacement, never a mix.  The commit dispatches on the shape of the
+ * replacement (see algos/WIP.md): a pure truncation (buf_len == 0) drops the
+ * tail; a pure append (n == 0) writes beyond the committed end and commits with
+ * the clen write; a same-length replace overwrites in place via the Set journal
+ * (or a single-block atomic write); a length change (buf_len != n, both > 0)
+ * uses the splice journal, which stages the new tail past the live payload,
+ * replays it into place, and commits the new length in one atomic header write.
  *
  * n = 0 with buf_len = 0 is a valid no-op.
  * Returns EINVAL if n exceeds the current payload size.
@@ -280,8 +290,8 @@ int bstack_atrunc(bstack_t *bs, size_t n,
  * bytes from new_buf.
  *
  * removed must point to at least n bytes of caller-allocated storage;
- * it may be NULL when n == 0.  Uses the same two-path ordering strategy as
- * bstack_atrunc.
+ * it may be NULL when n == 0.  The replacement commits with the same
+ * crash-atomic, shape-dispatched strategy as bstack_atrunc.
  *
  * Returns EINVAL if n exceeds the current payload size.
  *
@@ -331,9 +341,10 @@ int bstack_try_discard(bstack_t *bs, uint64_t s, size_t n, int *ok);
  * If the callback returns -1 the operation is aborted (errno set by the
  * callback); *new_buf is not freed by bstack in that case.
  *
- * The file may grow or shrink according to *new_len; the same two-path
- * crash-safe ordering as bstack_atrunc is used.  n = 0 is valid (old is
- * NULL and old_len is 0).  Returns EINVAL if n exceeds the payload size.
+ * The file may grow or shrink according to *new_len; the replacement commits
+ * with the same crash-atomic, shape-dispatched strategy as bstack_atrunc.
+ * n = 0 is valid (old is NULL and old_len is 0).  Returns EINVAL if n exceeds
+ * the payload size.
  *
  * Only available when compiled with -DBSTACK_FEATURE_ATOMIC.
  */
