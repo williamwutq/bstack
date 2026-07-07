@@ -1173,42 +1173,33 @@ pub(crate) fn inplace_overlay_insert<'a>(
     data: &'a [u8],
 ) {
     let end = off + data.len() as u64;
-    let mut next: Vec<(u64, &'a [u8])> = Vec::with_capacity(overlay.len() + 1);
-    // The overlay is already sorted and every retained piece keeps its relative
-    // order, so the new edit is the only element that could be out of place. Emit
-    // it in one pass at its sorted position (`off` is unique — no retained piece
-    // starts at `off`) instead of re-sorting the whole vector.
-    let mut inserted = false;
-    for &(s, d) in overlay.iter() {
-        let e = s + d.len() as u64;
-        if e <= off || s >= end {
-            // Disjoint. If it sits past the new edit, emit the new edit first.
-            if !inserted && s > off {
-                next.push((off, data));
-                inserted = true;
-            }
-            next.push((s, d));
-        } else {
-            // Overlaps `[off, end)`: keep whatever prefix/suffix lies outside it,
-            // drop the covered middle, and slot the new edit between them. When
-            // `new` encloses `old`, both guards are false and `old` vanishes; when
-            // `old` encloses `new`, both fire and `old` splits in two around it.
-            if s < off {
-                next.push((s, &d[..(off - s) as usize]));
-            }
-            if !inserted {
-                next.push((off, data));
-                inserted = true;
-            }
-            if e > end {
-                next.push((end, &d[(end - s) as usize..]));
-            }
+    // The overlay is sorted by start and non-overlapping, so its ends are sorted
+    // too: the edits the new write touches form one contiguous run `[lo, hi)`.
+    // Binary search both ends instead of scanning — `lo` is the first edit
+    // reaching past `off` (`edit end > off`), `hi` the first edit starting at or
+    // past `end`.
+    let lo = overlay.partition_point(|&(s, d)| s + d.len() as u64 <= off);
+    let hi = overlay.partition_point(|&(s, _)| s < end);
+    // Only the run's first edit can start before `off`, and only its last can end
+    // after `end` (interior edits are fully covered and dropped); each contributes
+    // at most a surviving prefix / suffix around the new edit.
+    let mut repl: Vec<(u64, &'a [u8])> = Vec::with_capacity(3);
+    if lo < hi {
+        let (s0, d0) = overlay[lo];
+        if s0 < off {
+            repl.push((s0, &d0[..(off - s0) as usize]));
         }
     }
-    if !inserted {
-        next.push((off, data));
+    repl.push((off, data));
+    if lo < hi {
+        let (s_last, d_last) = overlay[hi - 1];
+        let e_last = s_last + d_last.len() as u64;
+        if e_last > end {
+            repl.push((end, &d_last[(end - s_last) as usize..]));
+        }
     }
-    *overlay = next;
+    // Replace the touched run in place; the surrounding edits keep their order.
+    overlay.splice(lo..hi, repl);
 }
 
 /// Validate an `inplace_gen` `Write` op against the fixed payload size and the
@@ -1274,16 +1265,22 @@ pub(crate) fn inplace_overlay_read(
         return Ok(());
     }
     read_at(file, offset, buf)?;
-    // Overlay each pending edit that intersects `[offset, end)`.
-    for &(s, d) in overlay {
+    // The overlay is sorted by start and non-overlapping, so its ends are sorted
+    // too: the edits intersecting `[offset, end)` form one contiguous run. Binary
+    // search for the first edit that could reach into the read (`edit end >
+    // offset`), then walk forward only until an edit starts at or past `end` —
+    // O(log n + k) instead of scanning every pending edit.
+    let start = overlay.partition_point(|&(s, d)| s + d.len() as u64 <= offset);
+    for &(s, d) in &overlay[start..] {
+        if s >= end {
+            break;
+        }
         let e = s + d.len() as u64;
         let lo = s.max(offset);
         let hi = e.min(end);
-        if lo < hi {
-            let (b_lo, b_hi) = ((lo - offset) as usize, (hi - offset) as usize);
-            let (d_lo, d_hi) = ((lo - s) as usize, (hi - s) as usize);
-            buf[b_lo..b_hi].copy_from_slice(&d[d_lo..d_hi]);
-        }
+        let (b_lo, b_hi) = ((lo - offset) as usize, (hi - offset) as usize);
+        let (d_lo, d_hi) = ((lo - s) as usize, (hi - s) as usize);
+        buf[b_lo..b_hi].copy_from_slice(&d[d_lo..d_hi]);
     }
     Ok(())
 }

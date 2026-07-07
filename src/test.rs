@@ -6017,6 +6017,58 @@ mod atomic_tests {
 
     #[cfg(all(feature = "set", feature = "atomic"))]
     #[test]
+    fn inplace_gen_read_spans_multiple_edits_and_gaps() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(vec![b'.'; 30]).unwrap();
+
+        // Several disjoint edits with gaps between them; a later read across the
+        // whole payload must reflect exactly the edited spans (binary search must
+        // locate the contiguous intersecting run correctly).
+        let a = vec![b'A'; 4]; // [2, 6)
+        let b = vec![b'B'; 4]; // [10, 14)
+        let c = vec![b'C'; 4]; // [22, 26)
+        let mut rbuf = [0u8; 30];
+        let mut step = 0usize;
+        s.inplace_gen(|res| {
+            assert!(res.is_ok());
+            let r = match step {
+                0 => Some(BStackGenOp::Write {
+                    offset: 2,
+                    data: unsafe { core::mem::transmute::<&[u8], _>(&a[..]) },
+                }),
+                1 => Some(BStackGenOp::Write {
+                    offset: 10,
+                    data: unsafe { core::mem::transmute::<&[u8], _>(&b[..]) },
+                }),
+                2 => Some(BStackGenOp::Write {
+                    offset: 22,
+                    data: unsafe { core::mem::transmute::<&[u8], _>(&c[..]) },
+                }),
+                // Read a middle window [4, 24) that clips edit A on its left,
+                // fully contains B, and clips C on its right.
+                3 => Some(BStackGenOp::Read {
+                    offset: 4,
+                    buf: unsafe { core::mem::transmute::<&mut [u8], _>(&mut rbuf[..20]) },
+                }),
+                _ => None,
+            };
+            step += 1;
+            r
+        })
+        .unwrap();
+        // [4,6)='A', [6,10)='.', [10,14)='B', [14,22)='.', [22,24)='C'.
+        let mut expect = vec![b'A'; 2];
+        expect.extend_from_slice(&[b'.'; 4]);
+        expect.extend_from_slice(&[b'B'; 4]);
+        expect.extend_from_slice(&[b'.'; 8]);
+        expect.extend_from_slice(&[b'C'; 2]);
+        assert_eq!(&rbuf[..20], &expect[..]);
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
     fn inplace_gen_later_write_overrides_overlap() {
         use crate::BStackGenOp;
         let (s, p) = mk_stack();
