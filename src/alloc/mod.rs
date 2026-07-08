@@ -125,13 +125,14 @@
 //!
 //! Passing an *arbitrary* sub-slice — obtained through
 //! [`BStackSlice::subslice`], [`BStackSlice::subslice_range`], or a manually
-//! constructed [`BStackSlice::new`] — is **not supported** and may silently
+//! constructed [`BStackSlice::from_raw_parts`] — is **not supported** and may silently
 //! corrupt the allocator's internal state (e.g. corrupting block headers,
 //! writing free-list pointers into live data, or double-freeing memory).
 //!
 //! If you need to store a slice handle across a session boundary (e.g. after
 //! closing and reopening the file), serialise the `(start, len)` fields as raw
-//! `u64` values and reconstruct the full slice via [`BStackSlice::new`] only
+//! `u64` values and reconstruct the full slice via
+//! `unsafe { BStackSlice::from_raw_parts(...) }` only
 //! for I/O calls such as [`BStackSlice::read`] or [`BStackSlice::write`] — not
 //! for passing back to `realloc` or `dealloc`.  Only the original handle
 //! returned by the allocator carries the correct block-level metadata implied
@@ -322,7 +323,7 @@ pub trait BStackAllocator: Sized {
     /// or by a prior call to [`realloc`](Self::realloc) on this same allocator
     /// instance.  Passing an arbitrary sub-slice obtained via
     /// [`BStackSlice::subslice`], [`BStackSlice::subslice_range`], or a
-    /// manually constructed [`BStackSlice::new`] is not supported and may
+    /// manually constructed [`BStackSlice::from_raw_parts`] is not supported and may
     /// corrupt the allocator's internal state.
     ///
     /// # Errors

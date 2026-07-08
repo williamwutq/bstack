@@ -54,38 +54,10 @@ impl<'a, A: BStackAllocator> fmt::Debug for BStackSlice<'a, A> {
 }
 
 impl<'a, A: BStackAllocator> BStackSlice<'a, A> {
-    /// Create a new `BStackSlice`.
-    ///
-    /// Does not validate that `offset + len <= stack.len()`.  Invalid slices
-    /// produce errors on the first I/O call.
-    ///
-    /// # Deprecation
-    ///
-    /// This constructor is deprecated in favour of the explicitly-unsafe
-    /// [`BStackSlice::from_raw_parts`], which makes the caller's
-    /// responsibility visible at the call site.  Replace any call
-    /// `BStackSlice::new(allocator, offset, len)` with
-    /// `unsafe { BStackSlice::from_raw_parts(allocator, offset, len) }` and
-    /// ensure the `# Safety` contract of `from_raw_parts` is upheld.
-    #[deprecated(
-        since = "0.1.10",
-        note = "Use `unsafe { BStackSlice::from_raw_parts(allocator, offset, len) }` instead; \
-                see `BStackSlice::from_raw_parts` for the required safety contract."
-    )]
-    #[inline]
-    pub fn new(allocator: &'a A, offset: u64, len: u64) -> Self {
-        Self {
-            allocator,
-            offset,
-            len,
-        }
-    }
-
     /// Construct a `BStackSlice` from raw parts.
     ///
-    /// This is the explicitly-unsafe replacement for the deprecated
-    /// [`BStackSlice::new`].  The name reflects that an arbitrary
-    /// `(offset, len)` pair can bypass invariants that allocators rely on.
+    /// The name reflects that an arbitrary `(offset, len)` pair can bypass
+    /// invariants that allocators rely on.
     ///
     /// # Safety
     ///
