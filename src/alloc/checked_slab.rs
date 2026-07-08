@@ -1406,7 +1406,7 @@ impl BStackAllocator for CheckedSlabBStackAllocator {
     /// or by a prior call to [`realloc`](Self::realloc) on this same allocator
     /// instance. Passing an arbitrary sub-slice obtained via
     /// [`BStackSlice::subslice`], [`BStackSlice::subslice_range`], or a
-    /// manually constructed [`BStackSlice::new`] is not supported and may
+    /// manually constructed [`BStackSlice::from_raw_parts`] is not supported and may
     /// corrupt the allocator's internal state.
     ///
     /// # Resize strategies
