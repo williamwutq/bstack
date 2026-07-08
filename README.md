@@ -23,7 +23,9 @@ concurrently corrupting the same stack file.
 
 The optional `atomic` feature adds compound read-modify-write and
 compare-and-swap operations, including a generator-driven `get_batched_gen` for
-multi-step reads and `process_gen` for multi-step read and writes. Independent of 
+multi-step reads, `process_gen` for multi-step read and writes, and `set_batched`
+/ `inplace_gen` for committing several in-place writes as one crash-atomic unit.
+Independent of 
 features, `lock_up_to` lets a prefix of the file be marked permanently immutable
 for lock-free reads, and an optional in-memory cache (`open_cached`) can
 mirror that region for even faster, syscall-free access.
@@ -194,6 +196,27 @@ impl BStack {
     #[cfg(all(feature = "set", feature = "atomic"))]
     pub fn process_gen<'a, F>(&self, f: F) -> io::Result<()>
     where F: FnMut() -> Option<BStackGenOp<'a>>;
+
+    /// Commit several non-overlapping in-place writes as one crash-atomic unit.
+    /// Each `(offset, data)` overwrites `[offset, offset + data.len())`; either all
+    /// apply or none do. Empty `data` is ignored, overlapping writes are rejected,
+    /// and the file size never changes.
+    /// Requires the `set` and `atomic` features.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    pub fn set_batched<I, D>(&self, writes: I) -> io::Result<()>
+    where I: IntoIterator<Item = (u64, D)>, D: AsRef<[u8]>;
+
+    /// Run dependent reads interleaved with multiple in-place writes, committing
+    /// every write together at the end via the multi-write journal. `f` is called
+    /// in a loop over `BStackGenOp::{Read, Write, Len}` (size-changing ops and
+    /// `Swap` are rejected); `Write`s accumulate rather than ending the sequence,
+    /// later writes override earlier overlapping ones, and `Read`s see the
+    /// batch-so-far content. `f` receives the previous op's `io::Result` (an
+    /// erroring op is simply not recorded); `None` commits and ends.
+    /// Requires the `set` and `atomic` features.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    pub fn inplace_gen<'a, F>(&self, f: F) -> io::Result<()>
+    where F: FnMut(io::Result<()>) -> Option<BStackGenOp<'a>>;
 
     /// Copy `n` bytes from `from` to `to` under one write lock.  Regions may overlap.
     /// Requires the `set` and `atomic` features.
@@ -500,6 +523,7 @@ bstack = { version = "0.4", features = ["set", "atomic"] }
 - **`get_batched`**, **`get_batched_into`**, **`get_batched_gen`** — read multiple (possibly dependent) ranges under one read lock.
 - **`swap`**, **`swap_into`**, **`cas`** *(requires `set`)* — atomic read-modify-write / compare-and-swap of a single region.
 - **`process`**, **`process_gen`** *(requires `set`)* — in-place mutation, or a dependent read/write sequence ending in at most one `Write`/`Swap`/`Push`/`Pop`/`Discard`/`Atrunc`/`Splice`.
+- **`set_batched`**, **`inplace_gen`** *(requires `set`)* — commit several non-overlapping in-place writes as one crash-atomic unit (a batch, or a generator that also reads the batch-so-far state).
 - **`cross_exchange`**, **`copy`** *(requires `set`)* — swap or copy two regions under one write lock.
 - **`eq_crds`**, **`ne_crds`**, **`masked_eq_crds`**, **`masked_ne_crds`** *(requires `set`)* — cross-region compare-and-swap, with `==`/`!=`/masked variants.
 
@@ -555,7 +579,10 @@ A fixed 32-byte header precedes the payload:
   write is replayed into (`0` when idle); `wip_aux` names the mode (verbatim
   replay, repeated pattern, a disjoint copy replayed from its still-intact source,
   or a length-changing tail replace whose new committed length recovery derives
-  from the file size and direction).  Interpreted by recovery on `open`.
+  from the file size and direction).  A batch of several in-place writes
+  (`set_batched`/`inplace_gen`) uses the `MultiWrite` sentinel in `wip_aux` with
+  `wip_ptr` left `0`, staging the writes as `[s | e | data]` blocks past `clen`.
+  Interpreted by recovery on `open`.
 
 All user-visible offsets (returned by `push`, accepted by `peek`/`get`) are
 **logical** — 0-based from the start of the payload region (file byte 32).
@@ -565,9 +592,9 @@ All user-visible offsets (returned by `push`, accepted by `peek`/`get`) are
 ## Durability
 
 **In-place same-length writes** — `set`, `zero`, `repeat`, `swap`, `swap_into`,
-`cas`, `copy`, `cross_exchange`, `process`, and the `crds` family — never change
-the payload length and are each **crash-atomic**, committing by one of two
-strategies (recovered on the next `open`):
+`cas`, `copy`, `cross_exchange`, `process`, `set_batched`, `inplace_gen`, and the
+`crds` family — never change the payload length and are each **crash-atomic**,
+committing by one of three strategies (recovered on the next `open`):
 
 * **Aligned-block write** — a target within one power-fail-atomic block is
   committed by a single `write` + sync; no journal is armed.
@@ -576,6 +603,12 @@ strategies (recovered on the next `open`):
   `ftruncate`.  `zero`/`repeat` stage only `[count | pattern]`; `cross_exchange`
   stages one region and commits at a single atomic `wip_ptr` flip; moves and
   fills stream through a bounded buffer.
+* **Multi-write journal** — `set_batched` and `inplace_gen` commit several
+  non-overlapping in-place writes as one unit: stage every `[s | e | data]` block
+  past `clen` → sync → arm the `MultiWrite` sentinel (`wip_ptr` stays `0`, so it
+  never collides with a single-region journal) → sync → replay each block in place
+  → sync → disarm → `ftruncate`. A batch of one write falls back to the
+  single-write strategies above.
 
 Below, *commit* denotes whichever strategy applies to the bytes written; anything
 before it is read/compare/callback work under the lock.
@@ -597,6 +630,8 @@ before it is read/compare/callback work under the lock.
 | `cas` *(set+atomic)*                   | `read` → compare → conditional *commit* of `new`                                          |
 | `process` *(set+atomic)*               | `read(start..end)` → *(callback)* → *commit* the buffer                                    |
 | `process_gen` *(set+atomic)*           | closure-driven reads (and `Len` queries), ending in at most one mutating step — `Write` *commits*; `Swap` uses the exchange journal (as `cross_exchange`); `Push`/`Pop`/`Discard`/`Atrunc`/`Splice` behave as their standalone forms |
+| `set_batched` *(set+atomic)*           | validate + reject overlap → **multi-write journal**: stage every `[s \| e \| data]` block past `clen` → arm the `MultiWrite` sentinel (`wip_ptr` stays `0`) → replay each block in place → disarm → `ftruncate` (sync at each barrier); a lone effective write takes the ordinary single-write *commit* |
+| `inplace_gen` *(set+atomic)*           | closure-driven reads (each overlaid with the batch-so-far edits) interleaved with accumulated `Write`s (later overrides earlier on overlap); on `None` the pending edits commit together via the multi-write journal (as `set_batched`) |
 | `replace` *(atomic)*                   | `lseek(tail)` → `read(n)` → *(callback)* → *(then as `atrunc`)*                           |
 | `cross_exchange` *(set+atomic)*        | `read(a)`, `read(b)` → exchange journal: stage `a` → arm at `a` → write `b`→`a` → flip `wip_ptr` to `b` → write `a`→`b` → disarm → `ftruncate` (sync at each barrier) |
 | `copy` *(set+atomic)*                  | same-location → no-op; single-block dest → *commit*; overlapping → stream source→tail→dest (`Set` journal); disjoint → copy journal (stage only `[src \| n]`, arm `Copy`, stream source→dest; recovery replays from the untouched source) |
@@ -633,6 +668,7 @@ size:
 | `wip_ptr != 0`, `wip_aux = Copy`               | disjoint `copy` crashed mid-copy                            | replay `move_chunked(src → wip_ptr)` from the untouched source (tail stages only `[src \| n]`), disarm, truncate |
 | `wip_ptr != 0`, `wip_aux = SpliceGrow`/`SpliceShrink` | length-changing `atrunc`/`splice`/`splice_into`/`replace` crashed mid-replace | derive `clen'` from the file size and direction, replay the staged new tail, commit `clen'` while disarming, truncate |
 | `wip_ptr != 0`, `wip_aux` unrecognized         | mode armed by a newer build                                 | roll back: disarm, truncate to `32 + clen`                   |
+| `wip_ptr == 0`, `wip_aux = MultiWrite`         | `set_batched`/`inplace_gen` batch crashed after all blocks were staged | replay each staged `[s \| e \| data]` block into `[s, e)`, disarm, truncate (a corrupt tail rolls back, applying nothing) |
 | `wip_ptr == 0`, `file_size − 32 > clen`        | partial tail write (crashed before header update)           | truncate to `32 + clen`, durable-sync                        |
 | `wip_ptr == 0`, `file_size − 32 < clen`        | partial truncation (crashed before header update)           | set `clen = file_size − 32`, durable-sync                    |
 
@@ -677,6 +713,7 @@ lock without any `File::metadata` syscall.
 | `try_extend_zeros` *(atomic)*                                | write                 | write        |
 | `swap`, `swap_into`, `cas` *(set+atomic)*                    | write                 | write        |
 | `process`, `process_gen` *(set+atomic)*                      | write                 | write        |
+| `set_batched`, `inplace_gen` *(set+atomic)*                  | write                 | write        |
 | `replace` *(atomic)*                                         | write                 | write        |
 | `cross_exchange`, `copy` *(set+atomic)*                      | write                 | write        |
 | `eq_crds`, `ne_crds` *(set+atomic)*                          | write                 | write        |
@@ -697,11 +734,10 @@ On other platforms a seek is required; `peek`, `peek_into`, `get`, and
 `get_into` fall back to the write lock and reads serialise.
 
 Unlike `get_batched_gen`, which only ever takes the **read** lock, `process_gen`
-*always* takes the **write** lock — even for sequences that turn out to be
-read-only and end in `None` — because the closure may decide, only after
-seeing earlier reads, to end the sequence with a `Write` or `Swap`; the lock
-must therefore be acquired before the first read so the whole sequence runs as
-one indivisible step.
+and `inplace_gen` *always* take the **write** lock — even for sequences that turn
+out to be read-only and end in `None` — because the closure may decide, only
+after seeing earlier reads, to mutate; the lock must therefore be acquired before
+the first read so the whole sequence runs as one indivisible step.
 
 ---
 

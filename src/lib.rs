@@ -75,7 +75,8 @@
 //! | `wip_ptr != 0`, `wip_aux = Copy` | a disjoint `copy` crashed mid-copy | replay `move_chunked(src → wip_ptr)` from the untouched source (the tail stages only `[src \| n]`), disarm, truncate |
 //! | `wip_ptr != 0`, `wip_aux = SpliceGrow`/`SpliceShrink` | a length-changing `atrunc`/`splice`/`splice_into`/`replace` crashed mid-replace | derive `clen'` from the file size and direction, replay the staged new tail into `[wip_ptr, …)`, commit `clen'` while disarming, truncate |
 //! | `wip_ptr != 0`, `wip_aux` unrecognized | a mode armed by a newer build | roll back: disarm, truncate to `32 + clen` |
-//! | `wip_ptr == 0`, `file_size − 32 > clen` | partial tail write (push, or a crashed journal stage) before the header update | truncate to `32 + clen` |
+//! | `wip_ptr == 0`, `wip_aux = MultiWrite` | a `set_batched`/`inplace_gen` multi-write batch crashed after all blocks were staged | replay each staged `[s \| e \| data]` block into `[s, e)`, disarm, truncate to `32 + clen` (a corrupt tail rolls back, applying nothing) |
+//! | `wip_ptr == 0`, `file_size − 32 > clen` | partial tail write (push, or a crashed journal or multi-write stage) before the header update | truncate to `32 + clen` |
 //! | `wip_ptr == 0`, `file_size − 32 < clen` | partial truncation (pop crashed before the header update) | set `clen = file_size − 32` |
 //!
 //! Each replay is idempotent — the staged tail is immutable and disjoint from
@@ -88,9 +89,10 @@
 //! **In-place same-length writes** — [`set`](BStack::set), [`zero`](BStack::zero),
 //! [`repeat`](BStack::repeat), [`swap`](BStack::swap),
 //! [`swap_into`](BStack::swap_into), [`cas`](BStack::cas), [`copy`](BStack::copy),
-//! [`cross_exchange`](BStack::cross_exchange), [`process`](BStack::process), and
+//! [`cross_exchange`](BStack::cross_exchange), [`process`](BStack::process),
+//! [`set_batched`](BStack::set_batched), [`inplace_gen`](BStack::inplace_gen), and
 //! the `crds` family — leave the payload length unchanged and are each
-//! **crash-atomic**, committing by one of two strategies (recovered on the next
+//! **crash-atomic**, committing by one of three strategies (recovered on the next
 //! [`open`](BStack::open); see *Crash recovery*):
 //!
 //! * **Aligned-block write** — when the target lies within one power-fail-atomic
@@ -102,6 +104,13 @@
 //!   `zero`/`repeat` stage only `[count | pattern]`; `cross_exchange` stages one
 //!   region and commits at a single atomic `wip_ptr` flip; moves and fills stream
 //!   through a bounded buffer (O(1) memory).
+//! * **Multi-write journal** — [`set_batched`](BStack::set_batched) and
+//!   [`inplace_gen`](BStack::inplace_gen) commit several non-overlapping in-place
+//!   writes as one unit: stage every `[s | e | data]` block past `clen` →
+//!   `durable_sync` → arm the `MultiWrite` sentinel (`wip_ptr` stays `0`, so it
+//!   never collides with a single-region journal) → `durable_sync` → replay each
+//!   block in place → `durable_sync` → disarm → `ftruncate`. A batch that reduces
+//!   to one write falls back to the single-write strategies above.
 //!
 //! Below, *commit* denotes whichever of those two strategies applies to the bytes
 //! being written; anything before it is read/compare/callback work under the lock.
@@ -123,6 +132,8 @@
 //! | `cas` *(features: set+atomic)* | `read` → compare — conditional *commit* of `new` |
 //! | `process` *(features: set+atomic)* | `read(start..end)` → *(callback)* → *commit* the buffer |
 //! | `process_gen` *(features: set+atomic)* | closure-driven reads, ending in at most one mutating step: `Write` *commits*; `Swap` uses the exchange journal (as `cross_exchange`); `Push`/`Pop`/`Discard`/`Atrunc`/`Splice` behave as their standalone forms |
+//! | `set_batched` *(features: set+atomic)* | validate + reject overlap → **multi-write journal**: stage every `[s \| e \| data]` block past `clen` → arm the `MultiWrite` sentinel (`wip_ptr` stays `0`) → replay each block in place → disarm → `ftruncate` (a `durable_sync` at each barrier); a lone effective write takes the ordinary single-write *commit* |
+//! | `inplace_gen` *(features: set+atomic)* | closure-driven reads (each overlaid with the batch-so-far edits) interleaved with accumulated `Write`s (later overrides earlier on overlap); on `None` the pending edits commit together via the multi-write journal (as `set_batched`) |
 //! | `replace` *(feature: atomic)* | `lseek(tail)` → `read(n)` → *(callback)* → *(then as `atrunc`)* |
 //! | `cross_exchange` *(features: set+atomic)* | `read(a)`, `read(b)` → exchange journal: stage `a` → arm at `a` → write `b`→`a` → flip `wip_ptr` to `b` → write `a`→`b` → disarm → `ftruncate` (a `durable_sync` at each barrier) |
 //! | `copy` *(features: set+atomic)* | same-location → no-op; single-block dest → *commit*; overlapping → stream source→tail→dest (`Set` journal); disjoint → **copy journal** (stage only `[src \| n]` → arm `Copy` → stream source→dest → disarm; recovery replays from the untouched source) |
@@ -193,7 +204,7 @@
 //! | `try_discard(s, 0)` *(feature: atomic)* | **read** | **read** |
 //! | `get_batched`, `get_batched_into`, `get_batched_gen` *(feature: atomic)* | **read** | write |
 //! | `swap`, `swap_into`, `cas` *(features: set+atomic)* | write | write |
-//! | `cross_exchange`, `copy`, `process`, `process_gen` *(features: set+atomic)* | write | write |
+//! | `cross_exchange`, `copy`, `process`, `process_gen`, `set_batched`, `inplace_gen` *(features: set+atomic)* | write | write |
 //! | `eq_crds`, `ne_crds`, `masked_eq_crds`, `masked_ne_crds` *(features: set+atomic)* | write | write |
 //! | `replace` *(feature: atomic)* | write | write |
 //! | `peek`, `peek_into`, `get`, `get_into` | **read** | write |
@@ -213,12 +224,12 @@
 //! `get_into` fall back to the write lock and all reads serialise.
 //!
 //! Unlike [`get_batched_gen`](BStack::get_batched_gen), which only ever takes
-//! the **read** lock (Unix/Windows), [`process_gen`](BStack::process_gen)
-//! *always* takes the **write** lock — even for sequences that turn out to
-//! read-only and end in `None` — because the closure may decide, only after
-//! seeing earlier reads, to end the sequence with a `Write` or `Swap`; the
-//! lock therefore has to be acquired before the first read so the whole
-//! sequence runs as one indivisible step.
+//! the **read** lock (Unix/Windows), [`process_gen`](BStack::process_gen) and
+//! [`inplace_gen`](BStack::inplace_gen) *always* take the **write** lock — even
+//! for sequences that turn out to be read-only and end in `None` — because the
+//! closure may decide, only after seeing earlier reads, to mutate; the lock
+//! therefore has to be acquired before the first read so the whole sequence
+//! runs as one indivisible step.
 //!
 //! # Locked region (`lock_up_to`)
 //!
@@ -382,7 +393,7 @@
 //! |---------|-------------|
 //! | `set`   | Enables [`BStack::set`], [`BStack::zero`], and [`BStack::repeat`] — in-place overwrite of existing payload bytes (with data, zeros, or a repeated pattern) without changing the file size. |
 //! | `alloc` | Enables [`BStackAllocator`], [`BStackBulkAllocator`], [`BStackSlice`], [`BStackSliceReader`], and [`LinearBStackAllocator`] — region-based allocation over a `BStack` payload. Combined with `set`, also enables [`BStackSliceWriter`], [`FirstFitBStackAllocator`], [`GhostTreeBstackAllocator`], and [`BStackByteVec`]. |
-//! | `atomic` | Enables [`BStack::atrunc`], [`BStack::splice`], [`BStack::splice_into`], [`BStack::try_extend`], [`BStack::try_extend_zeros`], [`BStack::try_discard`], [`BStack::replace`], [`BStack::get_batched`], [`BStack::get_batched_into`], and [`BStack::get_batched_gen`] — compound read-modify-write operations that hold the lock across what would otherwise be separate calls. Combined with `set`, also enables [`BStack::swap`], [`BStack::swap_into`], [`BStack::cas`], [`BStack::process`], [`BStack::process_gen`], [`BStackGenOp`], [`BStack::cross_exchange`], [`BStack::copy`], [`BStack::eq_crds`], [`BStack::ne_crds`], [`BStack::masked_eq_crds`], and [`BStack::masked_ne_crds`]. |
+//! | `atomic` | Enables [`BStack::atrunc`], [`BStack::splice`], [`BStack::splice_into`], [`BStack::try_extend`], [`BStack::try_extend_zeros`], [`BStack::try_discard`], [`BStack::replace`], [`BStack::get_batched`], [`BStack::get_batched_into`], and [`BStack::get_batched_gen`] — compound read-modify-write operations that hold the lock across what would otherwise be separate calls. Combined with `set`, also enables [`BStack::swap`], [`BStack::swap_into`], [`BStack::cas`], [`BStack::process`], [`BStack::process_gen`], [`BStack::set_batched`], [`BStack::inplace_gen`], [`BStackGenOp`], [`BStack::cross_exchange`], [`BStack::copy`], [`BStack::eq_crds`], [`BStack::ne_crds`], [`BStack::masked_eq_crds`], and [`BStack::masked_ne_crds`]. |
 //!
 //! Enable with:
 //!
@@ -2107,7 +2118,10 @@ impl BStack {
 /// brought to an end is entirely up to the primitive that consumes them.
 /// Different primitives may impose different rules over the same variants:
 /// how many writes are permitted, whether a write ends the sequence, how the
-/// sequence itself signals that it is done, and so on.
+/// sequence itself signals that it is done, and so on. The "ending the
+/// sequence" notes below describe [`process_gen`](BStack::process_gen);
+/// [`inplace_gen`](BStack::inplace_gen) instead accumulates multiple `Write`s
+/// (none ends the sequence) and permits only `Read`, `Write`, and `Len`.
 ///
 /// # Variants
 ///
