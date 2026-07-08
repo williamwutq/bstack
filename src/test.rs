@@ -5831,6 +5831,375 @@ mod atomic_tests {
         assert_eq!(s.peek(0).unwrap(), b"helloWORLD!");
     }
 
+    // ---- set_batched / inplace_gen (multi-write journal) -------------------
+
+    // Build a staged multi-write tail block `[s | e | data]`.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    fn mw_block(start: u64, data: &[u8]) -> Vec<u8> {
+        let mut b = start.to_le_bytes().to_vec();
+        b.extend_from_slice(&(start + data.len() as u64).to_le_bytes());
+        b.extend_from_slice(data);
+        b
+    }
+
+    // Build a raw 32-byte header (current magic) with the given fields.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    fn mw_wip_header(clen: u64, wip_ptr: u64, wip_aux: u64) -> Vec<u8> {
+        let mut h = crate::MAGIC.to_vec();
+        h.extend_from_slice(&clen.to_le_bytes());
+        h.extend_from_slice(&wip_ptr.to_le_bytes());
+        h.extend_from_slice(&wip_aux.to_le_bytes());
+        h
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn set_batched_commits_all_writes_and_reopens_clean() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+        s.push(vec![b'.'; 500]).unwrap();
+
+        s.set_batched([
+            (0u64, vec![b'X'; 100]),
+            (400u64, vec![b'Z'; 100]),
+            (200u64, vec![b'Y'; 100]),
+        ])
+        .unwrap();
+
+        let mut expect = vec![b'X'; 100];
+        expect.extend_from_slice(&[b'.'; 100]);
+        expect.extend_from_slice(&[b'Y'; 100]);
+        expect.extend_from_slice(&[b'.'; 100]);
+        expect.extend_from_slice(&[b'Z'; 100]);
+        assert_eq!(s.peek(0).unwrap(), expect);
+        drop(s);
+
+        // Staging tail dropped, journal disarmed, value survives reopen.
+        let raw = std::fs::read(&p).unwrap();
+        assert_eq!(
+            raw.len() as u64,
+            crate::io_core::HEADER_SIZE + 500,
+            "tail not truncated"
+        );
+        assert_eq!(&raw[16..24], &[0u8; 8], "wip_ptr not disarmed");
+        assert_eq!(&raw[24..32], &[0u8; 8], "wip_aux not disarmed");
+        let s2 = BStack::open(&p).unwrap();
+        assert_eq!(s2.peek(0).unwrap(), expect);
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn set_batched_rejects_overlap() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(vec![b'.'; 200]).unwrap();
+        let err = s
+            .set_batched([(0u64, vec![b'a'; 100]), (50u64, vec![b'b'; 100])])
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        // File untouched.
+        assert_eq!(s.peek(0).unwrap(), vec![b'.'; 200]);
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn set_batched_empty_single_and_out_of_range() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(vec![b'.'; 100]).unwrap();
+
+        // Empty iterator: no-op.
+        s.set_batched(Vec::<(u64, Vec<u8>)>::new()).unwrap();
+        // Empty data entries are dropped, leaving a lone effective write.
+        s.set_batched([(0u64, Vec::new()), (10u64, vec![b'q'; 5])])
+            .unwrap();
+        assert_eq!(s.peek(10).unwrap()[..5], [b'q'; 5]);
+
+        // Out-of-range write rejected, nothing applied.
+        let err = s.set_batched([(90u64, vec![b'z'; 20])]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn recovery_replays_armed_multi_write() {
+        let path =
+            std::env::temp_dir().join(format!("bstack_mw_replay_{}.bin", std::process::id()));
+        let _g = Guard(path.clone());
+
+        let clen = 300u64;
+        // wip_ptr == 0, wip_aux == MultiWrite sentinel.
+        let mut file = mw_wip_header(clen, 0, u64::MAX - 5);
+        file.extend_from_slice(&vec![b'.'; clen as usize]); // committed payload
+        // Two staged blocks: [0,100) <- 'A', [200,300) <- 'B'.
+        file.extend_from_slice(&mw_block(0, &[b'A'; 100]));
+        file.extend_from_slice(&mw_block(200, &[b'B'; 100]));
+        std::fs::write(&path, &file).unwrap();
+
+        let s = BStack::open(&path).unwrap();
+        let mut expect = vec![b'A'; 100];
+        expect.extend_from_slice(&[b'.'; 100]);
+        expect.extend_from_slice(&[b'B'; 100]);
+        assert_eq!(s.len().unwrap(), 300);
+        assert_eq!(s.peek(0).unwrap(), expect);
+        drop(s);
+
+        let raw = std::fs::read(&path).unwrap();
+        assert_eq!(
+            raw.len() as u64,
+            crate::io_core::HEADER_SIZE + 300,
+            "tail not truncated"
+        );
+        assert_eq!(&raw[24..32], &[0u8; 8], "wip_aux not cleared");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn recovery_rolls_back_corrupt_multi_write_tail() {
+        let path =
+            std::env::temp_dir().join(format!("bstack_mw_corrupt_{}.bin", std::process::id()));
+        let _g = Guard(path.clone());
+
+        let clen = 300u64;
+        let mut file = mw_wip_header(clen, 0, u64::MAX - 5);
+        file.extend_from_slice(&vec![b'.'; clen as usize]);
+        // First block is valid, second names an end beyond the committed
+        // payload — the whole sequence is corrupt, so nothing is applied.
+        file.extend_from_slice(&mw_block(0, &[b'A'; 100]));
+        file.extend_from_slice(&mw_block(250, &[b'B'; 100])); // end 350 > clen 300
+        std::fs::write(&path, &file).unwrap();
+
+        let s = BStack::open(&path).unwrap();
+        assert_eq!(
+            s.peek(0).unwrap(),
+            vec![b'.'; 300],
+            "corrupt tail must roll back, applying nothing"
+        );
+        drop(s);
+        let raw = std::fs::read(&path).unwrap();
+        assert_eq!(raw.len() as u64, crate::io_core::HEADER_SIZE + 300);
+        assert_eq!(&raw[24..32], &[0u8; 8]);
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn inplace_gen_reads_see_pending_writes() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+
+        let src = b"ABCDE";
+        let mut rbuf = [0u8; 10];
+        let mut step = 0usize;
+        s.inplace_gen(|res| {
+            assert!(res.is_ok(), "unexpected feedback: {res:?}");
+            // SAFETY: `src` and `rbuf` outlive this whole `inplace_gen` call.
+            let r = match step {
+                0 => Some(BStackGenOp::Write {
+                    offset: 0,
+                    data: unsafe { core::mem::transmute::<&[u8], _>(&src[..]) },
+                }),
+                1 => Some(BStackGenOp::Read {
+                    offset: 0,
+                    buf: unsafe { core::mem::transmute::<&mut [u8], _>(&mut rbuf[..]) },
+                }),
+                _ => None,
+            };
+            step += 1;
+            r
+        })
+        .unwrap();
+        // The read observed the batch-so-far content: "ABCDE" overlaid on "hello".
+        assert_eq!(&rbuf, b"ABCDEworld");
+        assert_eq!(s.peek(0).unwrap(), b"ABCDEworld");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn inplace_gen_read_spans_multiple_edits_and_gaps() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(vec![b'.'; 30]).unwrap();
+
+        // Several disjoint edits with gaps between them; a later read across the
+        // whole payload must reflect exactly the edited spans (binary search must
+        // locate the contiguous intersecting run correctly).
+        let a = vec![b'A'; 4]; // [2, 6)
+        let b = vec![b'B'; 4]; // [10, 14)
+        let c = vec![b'C'; 4]; // [22, 26)
+        let mut rbuf = [0u8; 30];
+        let mut step = 0usize;
+        s.inplace_gen(|res| {
+            assert!(res.is_ok());
+            let r = match step {
+                0 => Some(BStackGenOp::Write {
+                    offset: 2,
+                    data: unsafe { core::mem::transmute::<&[u8], _>(&a[..]) },
+                }),
+                1 => Some(BStackGenOp::Write {
+                    offset: 10,
+                    data: unsafe { core::mem::transmute::<&[u8], _>(&b[..]) },
+                }),
+                2 => Some(BStackGenOp::Write {
+                    offset: 22,
+                    data: unsafe { core::mem::transmute::<&[u8], _>(&c[..]) },
+                }),
+                // Read a middle window [4, 24) that clips edit A on its left,
+                // fully contains B, and clips C on its right.
+                3 => Some(BStackGenOp::Read {
+                    offset: 4,
+                    buf: unsafe { core::mem::transmute::<&mut [u8], _>(&mut rbuf[..20]) },
+                }),
+                _ => None,
+            };
+            step += 1;
+            r
+        })
+        .unwrap();
+        // [4,6)='A', [6,10)='.', [10,14)='B', [14,22)='.', [22,24)='C'.
+        let mut expect = vec![b'A'; 2];
+        expect.extend_from_slice(&[b'.'; 4]);
+        expect.extend_from_slice(&[b'B'; 4]);
+        expect.extend_from_slice(&[b'.'; 8]);
+        expect.extend_from_slice(&[b'C'; 2]);
+        assert_eq!(&rbuf[..20], &expect[..]);
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn inplace_gen_later_write_overrides_overlap() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(vec![b'.'; 10]).unwrap();
+
+        // a<b<c<d: write a..c then b..d — commits a..b (first), b..d (second).
+        let first = vec![b'1'; 6]; // [0, 6)
+        let second = vec![b'2'; 6]; // [3, 9)
+        let mut step = 0usize;
+        s.inplace_gen(|_res| {
+            let r = match step {
+                0 => Some(BStackGenOp::Write {
+                    offset: 0,
+                    data: unsafe { core::mem::transmute::<&[u8], _>(&first[..]) },
+                }),
+                1 => Some(BStackGenOp::Write {
+                    offset: 3,
+                    data: unsafe { core::mem::transmute::<&[u8], _>(&second[..]) },
+                }),
+                _ => None,
+            };
+            step += 1;
+            r
+        })
+        .unwrap();
+        // [0,3)='1', [3,9)='2', [9,10)='.'
+        assert_eq!(s.peek(0).unwrap(), b"111222222.");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn inplace_gen_overlay_enclosure_and_gaps() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(vec![b'.'; 20]).unwrap();
+
+        // A mix that exercises every overlay case and forces the new edit into a
+        // non-tail sorted position each time:
+        //   1. [4, 12)  = '1'                          (a plain edit)
+        //   2. [14, 18) = '2'                          (a gap after it)
+        //   3. [6, 8)   = '3'  -> old encloses new     (splits edit 1 in three)
+        //   4. [2, 16)  = '4'  -> new encloses several (drops 3, trims 1 and 2)
+        let e1 = vec![b'1'; 8];
+        let e2 = vec![b'2'; 4];
+        let e3 = vec![b'3'; 2];
+        let e4 = vec![b'4'; 14];
+        let mut step = 0usize;
+        s.inplace_gen(|res| {
+            assert!(res.is_ok());
+            let r = match step {
+                0 => Some(BStackGenOp::Write {
+                    offset: 4,
+                    data: unsafe { core::mem::transmute::<&[u8], _>(&e1[..]) },
+                }),
+                1 => Some(BStackGenOp::Write {
+                    offset: 14,
+                    data: unsafe { core::mem::transmute::<&[u8], _>(&e2[..]) },
+                }),
+                2 => Some(BStackGenOp::Write {
+                    offset: 6,
+                    data: unsafe { core::mem::transmute::<&[u8], _>(&e3[..]) },
+                }),
+                3 => Some(BStackGenOp::Write {
+                    offset: 2,
+                    data: unsafe { core::mem::transmute::<&[u8], _>(&e4[..]) },
+                }),
+                _ => None,
+            };
+            step += 1;
+            r
+        })
+        .unwrap();
+        // Final: [0,2)='.', [2,16)='4' (edit 4 overrode everything it covered),
+        // [16,18)='2' (surviving suffix of edit 2), [18,20)='.'.
+        let mut expect = vec![b'.'; 2];
+        expect.extend_from_slice(&[b'4'; 14]);
+        expect.extend_from_slice(&[b'2'; 2]);
+        expect.extend_from_slice(&[b'.'; 2]);
+        assert_eq!(s.peek(0).unwrap(), expect);
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn inplace_gen_rejects_size_ops_but_still_commits() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+
+        let data = b"HELLO";
+        let mut errored = false;
+        let mut step = 0usize;
+        s.inplace_gen(|res| {
+            if step == 2 {
+                // Feedback for the Push op is an error.
+                assert!(res.is_err());
+                errored = true;
+            }
+            let r = match step {
+                0 => Some(BStackGenOp::Write {
+                    offset: 0,
+                    data: unsafe { core::mem::transmute::<&[u8], _>(&data[..]) },
+                }),
+                1 => Some(BStackGenOp::Push { data: b"!!!" }),
+                _ => None,
+            };
+            step += 1;
+            r
+        })
+        .unwrap();
+        assert!(
+            errored,
+            "Push should have reported an error to the callback"
+        );
+        // Size unchanged; the valid write still committed.
+        assert_eq!(s.len().unwrap(), 10);
+        assert_eq!(s.peek(0).unwrap(), b"HELLOworld");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn inplace_gen_immediate_none_is_noop() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        s.inplace_gen(|_| None).unwrap();
+        assert_eq!(s.peek(0).unwrap(), b"hello");
+    }
+
     // ---- lock_up_to / locked_len / open_locked_up_to -----------------------
 
     #[test]

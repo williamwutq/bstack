@@ -78,6 +78,7 @@ static const uint64_t LEGACY_HEADER_SIZE     = 16;
 #define WIP_SPLICE_SHRINK (UINT64_MAX - 2)
 #define WIP_REPEAT       (UINT64_MAX - 3)
 #define WIP_COPY         (UINT64_MAX - 4)
+#define WIP_MULTI        (UINT64_MAX - 5)
 
 /* Conservative power-fail atomic block size (bytes): a write confined to one
  * 256-byte-aligned region cannot tear across a hardware block on power loss.
@@ -626,6 +627,92 @@ static int recover_wip(bstack_fd_t fd, uint64_t committed_len,
     return 0;
 }
 
+/* Walk the staged multi-write tail [tail_start, raw_size). For each well-formed
+ * [s: u64 LE | e: u64 LE | data] block, when apply != 0, replay data into
+ * [s, e) via move_chunked (the payload is its own crash backup). Sets *out_valid
+ * to 1 iff the whole tail parsed into a clean, contiguous sequence ending exactly
+ * at raw_size with every target within [0, committed_len); 0 on any malformation
+ * (a truncated or oversized block, a reversed range, an out-of-range target, or
+ * trailing bytes). A legitimately-armed tail always validates. Returns 0, or -1
+ * (errno set) on an I/O error. Not feature-gated: recovery needs it. */
+static int walk_multi_blocks(bstack_fd_t fd, uint64_t committed_len,
+                             uint64_t tail_start, uint64_t raw_size,
+                             int apply, int *out_valid)
+{
+    uint64_t cursor = tail_start;
+    while (cursor < raw_size) {
+        /* Header must be fully present. */
+        if (raw_size - cursor < 16) { *out_valid = 0; return 0; }
+        uint8_t hdr[16];
+        if (plat_pread(fd, hdr, 16, cursor) != 0)
+            return -1;
+        uint64_t s = decode_le64(hdr);
+        uint64_t e = decode_le64(hdr + 8);
+        /* Well-formed: forward range, within the committed payload. */
+        if (e < s || e > committed_len) { *out_valid = 0; return 0; }
+        uint64_t plen = e - s;
+        uint64_t payload_phys = cursor + 16; /* <= raw_size (checked above) */
+        /* Payload must be fully present in the staged tail. */
+        if (plen > raw_size - payload_phys) { *out_valid = 0; return 0; }
+        if (apply) {
+            /* Source is the payload at logical (payload_phys - HEADER_SIZE);
+             * destination is the target [s, e). */
+            if (move_chunked(fd, payload_phys - HEADER_SIZE, s, plen) != 0)
+                return -1;
+        }
+        cursor = payload_phys + plen;
+    }
+    /* A clean walk lands exactly on raw_size (the fits-checks reject any
+     * trailing partial block). */
+    *out_valid = (cursor == raw_size) ? 1 : 0;
+    return 0;
+}
+
+/* Recover a crashed multi-write journal found on open (wip_ptr == 0,
+ * wip_aux == WIP_MULTI), restoring file_size == HEADER_SIZE + committed_len.
+ * Writes committed_len (unchanged — a multi-write never changes the payload
+ * size) into *out_clen. Validates the whole block sequence first, then replays
+ * every block only if it is clean — making the replay all-or-nothing: a
+ * genuinely-armed tail always validates, a corrupt one applies nothing and rolls
+ * back. Each replay is idempotent, so a crash during recovery is safe to re-run.
+ * Not feature-gated: a file armed by a featured build must still recover in a
+ * build without that feature. */
+static int recover_multi_write(bstack_fd_t fd, uint64_t committed_len,
+                               uint64_t raw_size, uint64_t *out_clen)
+{
+    uint64_t actual_len = (raw_size >= HEADER_SIZE) ? (raw_size - HEADER_SIZE) : 0;
+    if (committed_len > actual_len)
+        committed_len = actual_len;
+    uint64_t tail_start = HEADER_SIZE + committed_len;
+    if (raw_size > tail_start) {
+        int valid = 0;
+        /* Pass 1: validate without touching the payload. */
+        if (walk_multi_blocks(fd, committed_len, tail_start, raw_size, 0,
+                              &valid) != 0)
+            return -1;
+        /* Pass 2: apply, but only if the sequence is clean end-to-end. */
+        if (valid) {
+            int applied_valid = 0;
+            if (walk_multi_blocks(fd, committed_len, tail_start, raw_size, 1,
+                                  &applied_valid) != 0)
+                return -1;
+            if (plat_durable_sync(fd) != 0)
+                return -1;
+        }
+    }
+    /* Disarm and drop the staged tail (finalize). clen is unchanged. */
+    if (write_header_commit(fd, committed_len, 0, WIP_SET) != 0)
+        return -1;
+    if (plat_durable_sync(fd) != 0)
+        return -1;
+    if (plat_ftruncate(fd, tail_start) != 0)
+        return -1;
+    if (plat_durable_sync(fd) != 0)
+        return -1;
+    *out_clen = committed_len;
+    return 0;
+}
+
 /* -------------------------------------------------------------------------
  * File size helper
  * ---------------------------------------------------------------------- */
@@ -722,6 +809,16 @@ bstack_t *bstack_open(const char *path)
              * length, so adopt whatever recovery commits. */
             if (recover_wip(fd, committed_len, wip_ptr, wip_aux,
                             raw_size, &clen) != 0) {
+                int saved = errno;
+                close_fd(fd);
+                errno = saved;
+                return NULL;
+            }
+        } else if (wip_aux == WIP_MULTI) {
+            /* A multi-write batch was in flight (armed with wip_ptr == 0 and the
+             * intent-complete sentinel). All blocks were fully staged before the
+             * arm, so replay the sequence and disarm. clen is unchanged. */
+            if (recover_multi_write(fd, committed_len, raw_size, &clen) != 0) {
                 int saved = errno;
                 close_fd(fd);
                 errno = saved;
@@ -1588,6 +1685,58 @@ static int journaled_exchange(bstack_fd_t fd, uint64_t data_size,
     /* 6. Disarm and drop the staged tail. */
     if (write_wip(fd, 0, WIP_SET) != 0) return -1;
     if (plat_durable_sync(fd) != 0) return -1;
+    return plat_ftruncate(fd, HEADER_SIZE + data_size);
+}
+
+/* Crash-atomically commit count non-overlapping in-place writes {(offset_i,
+ * buf_i, len_i)} as one unit through the multi-write journal, O(1) memory beyond
+ * the caller's own buffers. data_size is the current payload length; it is never
+ * changed. Callers guarantee every block lies within [0, data_size), no block
+ * overlaps the locked prefix, the blocks are pairwise non-overlapping, and
+ * count >= 2 (a lone write should take set_in_place, an empty batch is a no-op).
+ * The four-barrier protocol (stage -> arm -> replay -> disarm) makes a crash
+ * leave either every block's old bytes or every block's new bytes. wip_ptr stays
+ * 0 throughout; the WIP_MULTI sentinel is the commit point. */
+static int journaled_multi_set(bstack_fd_t fd, uint64_t data_size,
+                               const bstack_iovec_t *writes, size_t count)
+{
+    /* 1. Stage every block [s | e | data] back-to-back beyond the committed
+     *    end; the file grows to hold them. */
+    uint64_t phys = HEADER_SIZE + data_size;
+    for (size_t i = 0; i < count; i++) {
+        uint64_t s = writes[i].offset;
+        uint64_t e = s + (uint64_t)writes[i].len;
+        uint8_t hdr[16];
+        for (int j = 0; j < 8; j++) hdr[j]     = (uint8_t)(s >> (8 * j));
+        for (int j = 0; j < 8; j++) hdr[8 + j] = (uint8_t)(e >> (8 * j));
+        if (plat_pwrite(fd, hdr, 16, phys) != 0) return -1;
+        phys += 16;
+        if (writes[i].len > 0) {
+            if (plat_pwrite(fd, writes[i].buf, writes[i].len, phys) != 0)
+                return -1;
+            phys += writes[i].len;
+        }
+    }
+    if (plat_durable_sync(fd) != 0) return -1;
+    /* 2. Arm the intent-complete sentinel; wip_ptr stays 0 (single header
+     *    write), so this can never be confused with a single-region journal. */
+    if (write_wip(fd, 0, WIP_MULTI) != 0) return -1;
+    if (plat_durable_sync(fd) != 0) return -1;
+    /* 3. Replay: write each block into its target in place. Order is arbitrary
+     *    (the ranges are non-overlapping); each block's staged copy is the crash
+     *    backup recovery replays from. */
+    for (size_t i = 0; i < count; i++) {
+        if (writes[i].len > 0) {
+            if (plat_pwrite(fd, writes[i].buf, writes[i].len,
+                            HEADER_SIZE + writes[i].offset) != 0)
+                return -1;
+        }
+    }
+    if (plat_durable_sync(fd) != 0) return -1;
+    /* 4. Disarm. */
+    if (write_wip(fd, 0, WIP_SET) != 0) return -1;
+    if (plat_durable_sync(fd) != 0) return -1;
+    /* 5. Drop the staged tail, restoring file_size == HEADER_SIZE + data_size. */
     return plat_ftruncate(fd, HEADER_SIZE + data_size);
 }
 #endif /* SET && ATOMIC */
@@ -2590,6 +2739,304 @@ int bstack_process_gen(bstack_t *bs,
         }
     }
 
+fail_unlock:
+    { int sv = errno; BS_WRUNLOCK(bs); errno = sv; }
+    return -1;
+}
+
+/* qsort comparator: order write descriptors by ascending logical offset. */
+static int cmp_iovec_offset(const void *pa, const void *pb)
+{
+    uint64_t a = ((const bstack_iovec_t *)pa)->offset;
+    uint64_t b = ((const bstack_iovec_t *)pb)->offset;
+    return (a < b) ? -1 : (a > b) ? 1 : 0;
+}
+
+int bstack_set_batched(bstack_t *bs, const bstack_iovec_t *writes, size_t count)
+{
+    if (writes == NULL || count == 0)
+        return 0;
+
+    /* Materialise the non-empty writes into a working array we can sort
+     * (empty writes touch nothing and are dropped). */
+    if (count > SIZE_MAX / sizeof(bstack_iovec_t)) { errno = EINVAL; return -1; }
+    bstack_iovec_t *w = malloc(count * sizeof(bstack_iovec_t));
+    if (!w) return -1;
+    size_t n = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (writes[i].len != 0)
+            w[n++] = writes[i];
+    }
+    if (n == 0) { free(w); return 0; }
+
+    BS_WRLOCK(bs);
+
+    /* Load locked under the write lock (see bstack_set for rationale). */
+    uint64_t locked = ATOMIC_LOAD_ACQUIRE(&bs->locked);
+    uint64_t raw_size;
+    if (file_size(bs->fd, &raw_size) != 0)
+        goto fail;
+    uint64_t data_size = raw_size - HEADER_SIZE;
+
+    /* Validate each block against the payload size and the locked prefix. */
+    for (size_t i = 0; i < n; i++) {
+        if ((uint64_t)w[i].len > UINT64_MAX - w[i].offset) goto fail_einval;
+        uint64_t end = w[i].offset + (uint64_t)w[i].len;
+        if (w[i].offset < locked)  goto fail_einval;
+        if (end > data_size)       goto fail_einval;
+    }
+
+    /* A lone write cannot overlap anything and is already atomic on its own, so
+     * skip the overlap scan and the multi-write journal. */
+    if (n == 1) {
+        if (set_in_place(bs->fd, data_size, w[0].offset, w[0].buf, w[0].len) != 0)
+            goto fail;
+        BS_WRUNLOCK(bs);
+        free(w);
+        return 0;
+    }
+
+    /* Reject overlap: sort by offset, then check each block ends at or before
+     * the next one begins. */
+    qsort(w, n, sizeof(bstack_iovec_t), cmp_iovec_offset);
+    for (size_t i = 0; i + 1 < n; i++) {
+        uint64_t a_end = w[i].offset + (uint64_t)w[i].len;
+        if (a_end > w[i + 1].offset) goto fail_einval;
+    }
+
+    if (journaled_multi_set(bs->fd, data_size, w, n) != 0)
+        goto fail;
+
+    BS_WRUNLOCK(bs);
+    free(w);
+    return 0;
+
+fail_einval:
+    BS_WRUNLOCK(bs);
+    free(w);
+    errno = EINVAL;
+    return -1;
+fail:
+    { int sv = errno; BS_WRUNLOCK(bs); errno = sv; }
+    free(w);
+    return -1;
+}
+
+/* ---- inplace_gen overlay ------------------------------------------------
+ * The pending edits are kept as a sorted, pairwise-non-overlapping array of
+ * bstack_iovec_t (offset, buf = borrowed caller data, len). Because it is sorted
+ * by start and non-overlapping, the ends are sorted too, so the edits touching
+ * any range form one contiguous run that binary search can locate. */
+
+/* First index i with arr[i].offset + arr[i].len > off (== n if none). */
+static size_t overlay_lower(const bstack_iovec_t *arr, size_t n, uint64_t off)
+{
+    size_t lo = 0, hi = n;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (arr[mid].offset + (uint64_t)arr[mid].len <= off) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo;
+}
+
+/* First index i with arr[i].offset >= end (== n if none). */
+static size_t overlay_upper(const bstack_iovec_t *arr, size_t n, uint64_t end)
+{
+    size_t lo = 0, hi = n;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (arr[mid].offset < end) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo;
+}
+
+/* Insert the edit [off, off+len) into the overlay, resolving overlap in favour
+ * of the newer write. The touched run [lo, hi) is replaced by at most three
+ * entries: the surviving prefix of the run's first edit, the new edit, and the
+ * surviving suffix of the run's last edit (all containment cases fall out of
+ * this). Returns 0, or -1 on allocation failure. */
+static int overlay_insert(bstack_iovec_t **parr, size_t *pcount, size_t *pcap,
+                          uint64_t off, uint8_t *data, size_t len)
+{
+    bstack_iovec_t *arr = *parr;
+    size_t count = *pcount;
+    uint64_t end = off + (uint64_t)len;
+    size_t lo = overlay_lower(arr, count, off);
+    size_t hi = overlay_upper(arr, count, end);
+
+    /* Build the replacement (value copies; buf points to caller data, never into
+     * arr, so a realloc below cannot invalidate them). */
+    bstack_iovec_t repl[3];
+    size_t rn = 0;
+    if (lo < hi && arr[lo].offset < off) {
+        repl[rn].offset = arr[lo].offset;
+        repl[rn].buf    = arr[lo].buf;
+        repl[rn].len    = (size_t)(off - arr[lo].offset);
+        rn++;
+    }
+    repl[rn].offset = off; repl[rn].buf = data; repl[rn].len = len; rn++;
+    if (lo < hi) {
+        bstack_iovec_t last = arr[hi - 1];
+        uint64_t last_end = last.offset + (uint64_t)last.len;
+        if (last_end > end) {
+            repl[rn].offset = end;
+            repl[rn].buf    = last.buf + (size_t)(end - last.offset);
+            repl[rn].len    = (size_t)(last_end - end);
+            rn++;
+        }
+    }
+
+    size_t new_count = count - (hi - lo) + rn;
+    if (new_count > *pcap) {
+        size_t newcap = (*pcap == 0) ? 4 : *pcap;
+        while (newcap < new_count) newcap *= 2;
+        bstack_iovec_t *na = realloc(arr, newcap * sizeof(bstack_iovec_t));
+        if (!na) return -1;
+        arr = na; *parr = na; *pcap = newcap;
+    }
+    /* Splice arr[lo..hi) -> repl[0..rn): shift the tail, then drop in repl. */
+    memmove(arr + lo + rn, arr + hi, (count - hi) * sizeof(bstack_iovec_t));
+    memcpy(arr + lo, repl, rn * sizeof(bstack_iovec_t));
+    *pcount = new_count;
+    return 0;
+}
+
+/* Fill buf with the batch-so-far content for [offset, offset+len): the overlay
+ * edits overlaid on committed bytes. The disk read is skipped when the edits
+ * already cover the whole range. Returns 0, or -1 on I/O error (errno set). */
+static int overlay_read(bstack_fd_t fd, const bstack_iovec_t *arr, size_t count,
+                        uint64_t offset, uint8_t *buf, size_t len)
+{
+    uint64_t end = offset + (uint64_t)len;
+    size_t start = overlay_lower(arr, count, offset);
+    /* First pass: find the run end and whether any committed bytes show through. */
+    size_t run_end = start;
+    uint64_t covered_to = offset;
+    int has_gap = 0;
+    for (size_t i = start; i < count; i++) {
+        if (arr[i].offset >= end) break;
+        if (arr[i].offset > covered_to) has_gap = 1;
+        covered_to = arr[i].offset + (uint64_t)arr[i].len;
+        run_end = i + 1;
+    }
+    if (covered_to < end) has_gap = 1;
+    /* Only touch the disk when some committed bytes are actually visible. */
+    if (has_gap) {
+        if (plat_pread(fd, buf, len, HEADER_SIZE + offset) != 0)
+            return -1;
+    }
+    /* Second pass: overlay each edit in the run (fills buf completely when there
+     * was no gap, so the skipped read left nothing uninitialised). */
+    for (size_t i = start; i < run_end; i++) {
+        uint64_t s = arr[i].offset;
+        uint64_t e = s + (uint64_t)arr[i].len;
+        uint64_t l = (s > offset) ? s : offset;
+        uint64_t h = (e < end)    ? e : end;
+        memcpy(buf + (size_t)(l - offset), arr[i].buf + (size_t)(l - s),
+               (size_t)(h - l));
+    }
+    return 0;
+}
+
+int bstack_inplace_gen(bstack_t *bs,
+                       int (*gen)(bstack_gen_op_t *out_op, void *ctx),
+                       void *ctx, int *prev_status)
+{
+    BS_WRLOCK(bs);
+
+    uint64_t raw_size;
+    if (file_size(bs->fd, &raw_size) != 0)
+        goto fail_unlock;
+    uint64_t data_size = raw_size - HEADER_SIZE;
+    uint64_t locked = ATOMIC_LOAD_ACQUIRE(&bs->locked);
+
+    /* Sorted, pairwise-non-overlapping pending edits, each borrowing the
+     * caller's Write data for the duration of the call. */
+    bstack_iovec_t *overlay = NULL;
+    size_t ov_count = 0, ov_cap = 0;
+    int prev = 0; /* previous op's status: 0 = ok, else errno */
+
+    for (;;) {
+        if (prev_status) *prev_status = prev;
+        bstack_gen_op_t op;
+        int r = gen(&op, ctx);
+        if (r == 0)
+            break; /* commit the accumulated edits */
+
+        switch (op.kind) {
+        case BSTACK_GEN_READ: {
+            uint64_t offset = op.u.read.offset;
+            size_t   len    = op.u.read.len;
+            if ((uint64_t)len > UINT64_MAX - offset ||
+                offset + (uint64_t)len > data_size) {
+                prev = EINVAL;
+                break;
+            }
+            if (len > 0) {
+                if (overlay_read(bs->fd, overlay, ov_count, offset,
+                                 op.u.read.buf, len) != 0) {
+                    prev = errno ? errno : EIO;
+                    break;
+                }
+            }
+            prev = 0;
+            break;
+        }
+        case BSTACK_GEN_WRITE: {
+            uint64_t offset = op.u.write.offset;
+            size_t   len    = op.u.write.len;
+            if (len == 0) { prev = 0; break; } /* no-op, nothing recorded */
+            if ((uint64_t)len > UINT64_MAX - offset ||
+                offset < locked ||
+                offset + (uint64_t)len > data_size) {
+                prev = EINVAL;
+                break;
+            }
+            /* op.u.write.data is const; the overlay only reads it and hands it
+             * back to the journal as a source, so the cast is sound. */
+            if (overlay_insert(&overlay, &ov_count, &ov_cap, offset,
+                               (uint8_t *)(uintptr_t)op.u.write.data, len) != 0) {
+                prev = errno ? errno : ENOMEM;
+                goto fail_free; /* allocation failure is fatal */
+            }
+            prev = 0;
+            break;
+        }
+        case BSTACK_GEN_LEN: {
+            *op.u.len.out = data_size;
+            prev = 0;
+            break;
+        }
+        default:
+            /* SWAP / PUSH / POP / SPLICE and any unknown kind are not permitted
+             * (in-place Read/Write/Len only); report and continue. */
+            prev = EINVAL;
+            break;
+        }
+    }
+
+    /* Commit the accumulated edits: 0 -> nothing; 1 -> the ordinary single-write
+     * path; many -> the multi-write journal. */
+    {
+        int rc = 0;
+        if (ov_count == 1) {
+            rc = set_in_place(bs->fd, data_size, overlay[0].offset,
+                              overlay[0].buf, overlay[0].len);
+        } else if (ov_count > 1) {
+            rc = journaled_multi_set(bs->fd, data_size, overlay, ov_count);
+        }
+        if (rc != 0)
+            goto fail_free;
+    }
+    BS_WRUNLOCK(bs);
+    free(overlay);
+    return 0;
+
+fail_free:
+    { int sv = errno; BS_WRUNLOCK(bs); free(overlay); errno = sv; }
+    return -1;
 fail_unlock:
     { int sv = errno; BS_WRUNLOCK(bs); errno = sv; }
     return -1;

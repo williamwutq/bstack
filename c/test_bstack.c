@@ -607,6 +607,7 @@ static const uint8_t MAGIC_PREFIX[6] = {'B','S','T','K', 0, 4};
 #define WIP_SPLICE_SHRINK (UINT64_MAX - 2)
 #define WIP_REPEAT        (UINT64_MAX - 3)
 #define WIP_COPY          (UINT64_MAX - 4)
+#define WIP_MULTI         (UINT64_MAX - 5)
 
 /* Write a crafted 0.4.0 file image: 32-byte header (magic, clen, wip_ptr,
  * wip_aux) followed by payload_len raw payload bytes. Used to simulate a file
@@ -3942,6 +3943,453 @@ static int test_process_gen_splice_null_removed_acts_like_atrunc(void)
     return 0;
 }
 
+/* -------------------------------------------------------------------------
+ * set_batched / inplace_gen  (multi-write journal)
+ * ---------------------------------------------------------------------- */
+
+static int test_set_batched_commits_all_writes_and_reopens_clean(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    uint8_t init[500]; memset(init, '.', sizeof init);
+    CHECK(bstack_push(bs, init, sizeof init, NULL) == 0);
+
+    uint8_t x[100], y[100], z[100];
+    memset(x, 'X', 100); memset(y, 'Y', 100); memset(z, 'Z', 100);
+    bstack_iovec_t writes[3] = {
+        { 0,   x, 100 },
+        { 400, z, 100 },
+        { 200, y, 100 },
+    };
+    CHECK(bstack_set_batched(bs, writes, 3) == 0);
+
+    uint8_t expect[500];
+    memset(expect, '.', 500);
+    memset(expect + 0,   'X', 100);
+    memset(expect + 200, 'Y', 100);
+    memset(expect + 400, 'Z', 100);
+    uint8_t buf[500];
+    CHECK(bstack_peek(bs, 0, buf, NULL) == 0);
+    CHECK(memcmp(buf, expect, 500) == 0);
+    bstack_close(bs);
+
+    /* Staging tail dropped, journal disarmed, value survives reopen. */
+    int fd = open(tmp, O_RDONLY | O_BINARY);
+    struct stat st; fstat(fd, &st);
+    CHECK(st.st_size == TEST_HEADER_SIZE + 500);
+    CHECK(raw_read_le64(fd, 16) == 0);   /* wip_ptr disarmed */
+    CHECK(raw_read_le64(fd, 24) == 0);   /* wip_aux disarmed */
+    close(fd);
+
+    bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    CHECK(bstack_peek(bs, 0, buf, NULL) == 0);
+    CHECK(memcmp(buf, expect, 500) == 0);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_set_batched_rejects_overlap(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    uint8_t init[200]; memset(init, '.', sizeof init);
+    CHECK(bstack_push(bs, init, sizeof init, NULL) == 0);
+
+    uint8_t a[100], b[100];
+    memset(a, 'a', 100); memset(b, 'b', 100);
+    bstack_iovec_t writes[2] = { { 0, a, 100 }, { 50, b, 100 } };
+    errno = 0;
+    CHECK(bstack_set_batched(bs, writes, 2) == -1);
+    CHECK(errno == EINVAL);
+
+    /* File untouched. */
+    uint8_t buf[200];
+    CHECK(bstack_peek(bs, 0, buf, NULL) == 0);
+    CHECK(memcmp(buf, init, 200) == 0);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_set_batched_empty_single_and_out_of_range(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    uint8_t init[100]; memset(init, '.', sizeof init);
+    CHECK(bstack_push(bs, init, sizeof init, NULL) == 0);
+
+    /* Empty batch: no-op. */
+    CHECK(bstack_set_batched(bs, NULL, 0) == 0);
+
+    /* Empty-data entries dropped, leaving a lone effective write. */
+    uint8_t q[5]; memset(q, 'q', 5);
+    bstack_iovec_t mixed[2] = { { 0, NULL, 0 }, { 10, q, 5 } };
+    CHECK(bstack_set_batched(bs, mixed, 2) == 0);
+    uint8_t buf[5]; CHECK(bstack_peek(bs, 10, buf, NULL) == 0);
+    CHECK(memcmp(buf, "qqqqq", 5) == 0);
+
+    /* Out-of-range write rejected. */
+    uint8_t z[20]; memset(z, 'z', 20);
+    bstack_iovec_t oob[1] = { { 90, z, 20 } };
+    errno = 0;
+    CHECK(bstack_set_batched(bs, oob, 1) == -1);
+    CHECK(errno == EINVAL);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_recovery_replays_armed_multi_write(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    /* clen=300; two staged blocks [0,100)<-'A' and [200,300)<-'B'. */
+    uint8_t payload[300 + 16 + 100 + 16 + 100];
+    size_t p = 0;
+    memset(payload, '.', 300); p = 300;
+    /* block 1: s=0, e=100, data 'A'x100 */
+    for (int i = 0; i < 8; i++) payload[p + i]     = (uint8_t)((uint64_t)0   >> (8 * i));
+    for (int i = 0; i < 8; i++) payload[p + 8 + i] = (uint8_t)((uint64_t)100 >> (8 * i));
+    p += 16; memset(payload + p, 'A', 100); p += 100;
+    /* block 2: s=200, e=300, data 'B'x100 */
+    for (int i = 0; i < 8; i++) payload[p + i]     = (uint8_t)((uint64_t)200 >> (8 * i));
+    for (int i = 0; i < 8; i++) payload[p + 8 + i] = (uint8_t)((uint64_t)300 >> (8 * i));
+    p += 16; memset(payload + p, 'B', 100); p += 100;
+    CHECK(write_wip_file(tmp, 300, 0, WIP_MULTI, payload, p) == 0);
+
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 300);
+    uint8_t expect[300];
+    memset(expect, '.', 300);
+    memset(expect + 0,   'A', 100);
+    memset(expect + 200, 'B', 100);
+    uint8_t buf[300]; CHECK(bstack_peek(bs, 0, buf, NULL) == 0);
+    CHECK(memcmp(buf, expect, 300) == 0);
+    bstack_close(bs);
+
+    int fd = open(tmp, O_RDONLY | O_BINARY);
+    struct stat st; fstat(fd, &st);
+    CHECK(st.st_size == TEST_HEADER_SIZE + 300);   /* tail truncated */
+    CHECK(raw_read_le64(fd, 24) == 0);             /* wip_aux cleared */
+    close(fd); unlink(tmp);
+    return 0;
+}
+
+static int test_recovery_rolls_back_corrupt_multi_write_tail(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    /* First block valid; second names end 350 > clen 300 -> whole tail corrupt,
+     * so nothing is applied. */
+    uint8_t payload[300 + 16 + 100 + 16 + 100];
+    size_t p = 0;
+    memset(payload, '.', 300); p = 300;
+    for (int i = 0; i < 8; i++) payload[p + i]     = (uint8_t)((uint64_t)0   >> (8 * i));
+    for (int i = 0; i < 8; i++) payload[p + 8 + i] = (uint8_t)((uint64_t)100 >> (8 * i));
+    p += 16; memset(payload + p, 'A', 100); p += 100;
+    for (int i = 0; i < 8; i++) payload[p + i]     = (uint8_t)((uint64_t)250 >> (8 * i));
+    for (int i = 0; i < 8; i++) payload[p + 8 + i] = (uint8_t)((uint64_t)350 >> (8 * i));
+    p += 16; memset(payload + p, 'B', 100); p += 100;
+    CHECK(write_wip_file(tmp, 300, 0, WIP_MULTI, payload, p) == 0);
+
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    uint8_t all_dots[300]; memset(all_dots, '.', 300);
+    uint8_t buf[300]; CHECK(bstack_peek(bs, 0, buf, NULL) == 0);
+    CHECK(memcmp(buf, all_dots, 300) == 0);   /* rolled back, nothing applied */
+    bstack_close(bs);
+
+    int fd = open(tmp, O_RDONLY | O_BINARY);
+    struct stat st; fstat(fd, &st);
+    CHECK(st.st_size == TEST_HEADER_SIZE + 300);
+    CHECK(raw_read_le64(fd, 24) == 0);
+    close(fd); unlink(tmp);
+    return 0;
+}
+
+/* ---- inplace_gen ---- */
+
+struct ig_ctx {
+    int      step;
+    int      prev_status;   /* bstack writes the previous op's status here */
+    uint8_t *src;
+    uint8_t *rbuf;
+};
+
+static int ig_reads_see_pending_gen(bstack_gen_op_t *out_op, void *userctx)
+{
+    struct ig_ctx *c = userctx;
+    switch (c->step++) {
+    case 0:
+        out_op->kind = BSTACK_GEN_WRITE;
+        out_op->u.write.offset = 0;
+        out_op->u.write.data   = c->src;   /* "ABCDE" */
+        out_op->u.write.len    = 5;
+        return 1;
+    case 1:
+        out_op->kind = BSTACK_GEN_READ;
+        out_op->u.read.offset = 0;
+        out_op->u.read.buf    = c->rbuf;
+        out_op->u.read.len    = 10;
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static int test_inplace_gen_reads_see_pending_writes(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    CHECK(bstack_push(bs, (uint8_t *)"helloworld", 10, NULL) == 0);
+
+    uint8_t src[5]; memcpy(src, "ABCDE", 5);
+    uint8_t rbuf[10] = {0};
+    struct ig_ctx c = { 0, 0, src, rbuf };
+    CHECK(bstack_inplace_gen(bs, ig_reads_see_pending_gen, &c, &c.prev_status) == 0);
+    /* Read observed batch-so-far: "ABCDE" overlaid on "hello". */
+    CHECK(memcmp(rbuf, "ABCDEworld", 10) == 0);
+    uint8_t buf[10]; CHECK(bstack_peek(bs, 0, buf, NULL) == 0);
+    CHECK(memcmp(buf, "ABCDEworld", 10) == 0);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+struct ig_two_ctx { int step; uint8_t *first; uint8_t *second; };
+
+static int ig_overlap_gen(bstack_gen_op_t *out_op, void *userctx)
+{
+    struct ig_two_ctx *c = userctx;
+    switch (c->step++) {
+    case 0:
+        out_op->kind = BSTACK_GEN_WRITE;
+        out_op->u.write.offset = 0;
+        out_op->u.write.data   = c->first;   /* '1'x6 -> [0,6) */
+        out_op->u.write.len    = 6;
+        return 1;
+    case 1:
+        out_op->kind = BSTACK_GEN_WRITE;
+        out_op->u.write.offset = 3;
+        out_op->u.write.data   = c->second;  /* '2'x6 -> [3,9) */
+        out_op->u.write.len    = 6;
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static int test_inplace_gen_later_write_overrides_overlap(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    uint8_t init[10]; memset(init, '.', 10);
+    CHECK(bstack_push(bs, init, 10, NULL) == 0);
+
+    uint8_t first[6], second[6];
+    memset(first, '1', 6); memset(second, '2', 6);
+    struct ig_two_ctx c = { 0, first, second };
+    CHECK(bstack_inplace_gen(bs, ig_overlap_gen, &c, NULL) == 0);
+    /* [0,3)='1', [3,9)='2', [9,10)='.' */
+    uint8_t buf[10]; CHECK(bstack_peek(bs, 0, buf, NULL) == 0);
+    CHECK(memcmp(buf, "111222222.", 10) == 0);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+struct ig_enc_ctx { int step; uint8_t *e1; uint8_t *e2; uint8_t *e3; uint8_t *e4; };
+
+static int ig_enclosure_gen(bstack_gen_op_t *out_op, void *userctx)
+{
+    struct ig_enc_ctx *c = userctx;
+    out_op->kind = BSTACK_GEN_WRITE;
+    switch (c->step++) {
+    case 0: out_op->u.write.offset = 4;  out_op->u.write.data = c->e1; out_op->u.write.len = 8;  return 1;
+    case 1: out_op->u.write.offset = 14; out_op->u.write.data = c->e2; out_op->u.write.len = 4;  return 1;
+    case 2: out_op->u.write.offset = 6;  out_op->u.write.data = c->e3; out_op->u.write.len = 2;  return 1;
+    case 3: out_op->u.write.offset = 2;  out_op->u.write.data = c->e4; out_op->u.write.len = 14; return 1;
+    default: return 0;
+    }
+}
+
+static int test_inplace_gen_overlay_enclosure_and_gaps(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    uint8_t init[20]; memset(init, '.', 20);
+    CHECK(bstack_push(bs, init, 20, NULL) == 0);
+
+    uint8_t e1[8], e2[4], e3[2], e4[14];
+    memset(e1, '1', 8); memset(e2, '2', 4); memset(e3, '3', 2); memset(e4, '4', 14);
+    struct ig_enc_ctx c = { 0, e1, e2, e3, e4 };
+    CHECK(bstack_inplace_gen(bs, ig_enclosure_gen, &c, NULL) == 0);
+    /* [0,2)='.', [2,16)='4', [16,18)='2', [18,20)='.' */
+    uint8_t expect[20];
+    memset(expect, '.', 20);
+    memset(expect + 2, '4', 14);
+    memset(expect + 16, '2', 2);
+    uint8_t buf[20]; CHECK(bstack_peek(bs, 0, buf, NULL) == 0);
+    CHECK(memcmp(buf, expect, 20) == 0);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+struct ig_cover_ctx { int step; uint8_t *a; uint8_t *b; uint8_t *rbuf; };
+
+static int ig_fully_covered_gen(bstack_gen_op_t *out_op, void *userctx)
+{
+    struct ig_cover_ctx *c = userctx;
+    switch (c->step++) {
+    case 0:
+        out_op->kind = BSTACK_GEN_WRITE;
+        out_op->u.write.offset = 0; out_op->u.write.data = c->a; out_op->u.write.len = 4;
+        return 1;
+    case 1:
+        out_op->kind = BSTACK_GEN_WRITE;
+        out_op->u.write.offset = 4; out_op->u.write.data = c->b; out_op->u.write.len = 4;
+        return 1;
+    case 2:
+        out_op->kind = BSTACK_GEN_READ;
+        out_op->u.read.offset = 2; out_op->u.read.buf = c->rbuf; out_op->u.read.len = 6;
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static int test_inplace_gen_read_fully_covered_by_overlay(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    uint8_t init[12]; memset(init, '.', 12);
+    CHECK(bstack_push(bs, init, 12, NULL) == 0);
+
+    uint8_t a[4], b[4]; memset(a, 'A', 4); memset(b, 'B', 4);
+    uint8_t rbuf[6] = {0};
+    struct ig_cover_ctx c = { 0, a, b, rbuf };
+    CHECK(bstack_inplace_gen(bs, ig_fully_covered_gen, &c, NULL) == 0);
+    /* [2,4)='A', [4,8)='B' */
+    CHECK(memcmp(rbuf, "AABBBB", 6) == 0);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+struct ig_span_ctx { int step; uint8_t *a; uint8_t *b; uint8_t *cc; uint8_t *rbuf; };
+
+static int ig_span_gen(bstack_gen_op_t *out_op, void *userctx)
+{
+    struct ig_span_ctx *c = userctx;
+    switch (c->step++) {
+    case 0:
+        out_op->kind = BSTACK_GEN_WRITE;
+        out_op->u.write.offset = 2;  out_op->u.write.data = c->a;  out_op->u.write.len = 4;
+        return 1;
+    case 1:
+        out_op->kind = BSTACK_GEN_WRITE;
+        out_op->u.write.offset = 10; out_op->u.write.data = c->b;  out_op->u.write.len = 4;
+        return 1;
+    case 2:
+        out_op->kind = BSTACK_GEN_WRITE;
+        out_op->u.write.offset = 22; out_op->u.write.data = c->cc; out_op->u.write.len = 4;
+        return 1;
+    case 3:
+        out_op->kind = BSTACK_GEN_READ;
+        out_op->u.read.offset = 4;  out_op->u.read.buf = c->rbuf; out_op->u.read.len = 20;
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static int test_inplace_gen_read_spans_multiple_edits_and_gaps(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    uint8_t init[30]; memset(init, '.', 30);
+    CHECK(bstack_push(bs, init, 30, NULL) == 0);
+
+    uint8_t a[4], b[4], cc[4];
+    memset(a, 'A', 4); memset(b, 'B', 4); memset(cc, 'C', 4);
+    uint8_t rbuf[20] = {0};
+    struct ig_span_ctx c = { 0, a, b, cc, rbuf };
+    CHECK(bstack_inplace_gen(bs, ig_span_gen, &c, NULL) == 0);
+    /* Read [4,24): [4,6)='A', [6,10)='.', [10,14)='B', [14,22)='.', [22,24)='C' */
+    uint8_t expect[20];
+    memset(expect, '.', 20);
+    memset(expect + 0,  'A', 2);
+    memset(expect + 6,  'B', 4);
+    memset(expect + 18, 'C', 2);
+    CHECK(memcmp(rbuf, expect, 20) == 0);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+struct ig_reject_ctx { int step; uint8_t *data; };
+
+static int ig_reject_size_ops_gen(bstack_gen_op_t *out_op, void *userctx)
+{
+    struct ig_reject_ctx *c = userctx;
+    switch (c->step++) {
+    case 0:
+        out_op->kind = BSTACK_GEN_WRITE;
+        out_op->u.write.offset = 0; out_op->u.write.data = c->data; out_op->u.write.len = 5;
+        return 1;
+    case 1:
+        out_op->kind = BSTACK_GEN_PUSH;
+        out_op->u.push.data = (const uint8_t *)"!!!";
+        out_op->u.push.len  = 3;
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static int test_inplace_gen_rejects_size_ops_but_still_commits(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    CHECK(bstack_push(bs, (uint8_t *)"helloworld", 10, NULL) == 0);
+
+    uint8_t data[5]; memcpy(data, "HELLO", 5);
+    struct ig_reject_ctx c;
+    c.step = 0; c.data = data;
+    int prev = 0;
+    CHECK(bstack_inplace_gen(bs, ig_reject_size_ops_gen, &c, &prev) == 0);
+    /* After the PUSH was rejected, the next call sees prev == EINVAL. */
+    CHECK(prev == EINVAL);
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 10);
+    uint8_t buf[10]; CHECK(bstack_peek(bs, 0, buf, NULL) == 0);
+    CHECK(memcmp(buf, "HELLOworld", 10) == 0);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int ig_immediate_none_gen(bstack_gen_op_t *out_op, void *userctx)
+{
+    (void)out_op; (void)userctx;
+    return 0;
+}
+
+static int test_inplace_gen_immediate_none_is_noop(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    CHECK(bstack_push(bs, (uint8_t *)"hello", 5, NULL) == 0);
+    CHECK(bstack_inplace_gen(bs, ig_immediate_none_gen, NULL, NULL) == 0);
+    uint8_t buf[5]; CHECK(bstack_peek(bs, 0, buf, NULL) == 0);
+    CHECK(memcmp(buf, "hello", 5) == 0);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
 #endif /* BSTACK_FEATURE_ATOMIC && BSTACK_FEATURE_SET */
 
 /* =========================================================================
@@ -4788,6 +5236,20 @@ int main(void)
     T(test_process_gen_len_informs_pop_size);
     T(test_process_gen_splice_replaces_tail_and_ends_sequence);
     T(test_process_gen_splice_null_removed_acts_like_atrunc);
+
+    /* bstack_set_batched / bstack_inplace_gen — multi-write journal */
+    T(test_set_batched_commits_all_writes_and_reopens_clean);
+    T(test_set_batched_rejects_overlap);
+    T(test_set_batched_empty_single_and_out_of_range);
+    T(test_recovery_replays_armed_multi_write);
+    T(test_recovery_rolls_back_corrupt_multi_write_tail);
+    T(test_inplace_gen_reads_see_pending_writes);
+    T(test_inplace_gen_later_write_overrides_overlap);
+    T(test_inplace_gen_overlay_enclosure_and_gaps);
+    T(test_inplace_gen_read_fully_covered_by_overlay);
+    T(test_inplace_gen_read_spans_multiple_edits_and_gaps);
+    T(test_inplace_gen_rejects_size_ops_but_still_commits);
+    T(test_inplace_gen_immediate_none_is_noop);
 
     /* bstack_copy — disjoint copy journal */
     T(test_copy_disjoint_journals_and_reopens_clean);

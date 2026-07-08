@@ -75,7 +75,8 @@
 //! | `wip_ptr != 0`, `wip_aux = Copy` | a disjoint `copy` crashed mid-copy | replay `move_chunked(src → wip_ptr)` from the untouched source (the tail stages only `[src \| n]`), disarm, truncate |
 //! | `wip_ptr != 0`, `wip_aux = SpliceGrow`/`SpliceShrink` | a length-changing `atrunc`/`splice`/`splice_into`/`replace` crashed mid-replace | derive `clen'` from the file size and direction, replay the staged new tail into `[wip_ptr, …)`, commit `clen'` while disarming, truncate |
 //! | `wip_ptr != 0`, `wip_aux` unrecognized | a mode armed by a newer build | roll back: disarm, truncate to `32 + clen` |
-//! | `wip_ptr == 0`, `file_size − 32 > clen` | partial tail write (push, or a crashed journal stage) before the header update | truncate to `32 + clen` |
+//! | `wip_ptr == 0`, `wip_aux = MultiWrite` | a `set_batched`/`inplace_gen` multi-write batch crashed after all blocks were staged | replay each staged `[s \| e \| data]` block into `[s, e)`, disarm, truncate to `32 + clen` (a corrupt tail rolls back, applying nothing) |
+//! | `wip_ptr == 0`, `file_size − 32 > clen` | partial tail write (push, or a crashed journal or multi-write stage) before the header update | truncate to `32 + clen` |
 //! | `wip_ptr == 0`, `file_size − 32 < clen` | partial truncation (pop crashed before the header update) | set `clen = file_size − 32` |
 //!
 //! Each replay is idempotent — the staged tail is immutable and disjoint from
@@ -88,9 +89,10 @@
 //! **In-place same-length writes** — [`set`](BStack::set), [`zero`](BStack::zero),
 //! [`repeat`](BStack::repeat), [`swap`](BStack::swap),
 //! [`swap_into`](BStack::swap_into), [`cas`](BStack::cas), [`copy`](BStack::copy),
-//! [`cross_exchange`](BStack::cross_exchange), [`process`](BStack::process), and
+//! [`cross_exchange`](BStack::cross_exchange), [`process`](BStack::process),
+//! [`set_batched`](BStack::set_batched), [`inplace_gen`](BStack::inplace_gen), and
 //! the `crds` family — leave the payload length unchanged and are each
-//! **crash-atomic**, committing by one of two strategies (recovered on the next
+//! **crash-atomic**, committing by one of three strategies (recovered on the next
 //! [`open`](BStack::open); see *Crash recovery*):
 //!
 //! * **Aligned-block write** — when the target lies within one power-fail-atomic
@@ -102,6 +104,13 @@
 //!   `zero`/`repeat` stage only `[count | pattern]`; `cross_exchange` stages one
 //!   region and commits at a single atomic `wip_ptr` flip; moves and fills stream
 //!   through a bounded buffer (O(1) memory).
+//! * **Multi-write journal** — [`set_batched`](BStack::set_batched) and
+//!   [`inplace_gen`](BStack::inplace_gen) commit several non-overlapping in-place
+//!   writes as one unit: stage every `[s | e | data]` block past `clen` →
+//!   `durable_sync` → arm the `MultiWrite` sentinel (`wip_ptr` stays `0`, so it
+//!   never collides with a single-region journal) → `durable_sync` → replay each
+//!   block in place → `durable_sync` → disarm → `ftruncate`. A batch that reduces
+//!   to one write falls back to the single-write strategies above.
 //!
 //! Below, *commit* denotes whichever of those two strategies applies to the bytes
 //! being written; anything before it is read/compare/callback work under the lock.
@@ -123,6 +132,8 @@
 //! | `cas` *(features: set+atomic)* | `read` → compare — conditional *commit* of `new` |
 //! | `process` *(features: set+atomic)* | `read(start..end)` → *(callback)* → *commit* the buffer |
 //! | `process_gen` *(features: set+atomic)* | closure-driven reads, ending in at most one mutating step: `Write` *commits*; `Swap` uses the exchange journal (as `cross_exchange`); `Push`/`Pop`/`Discard`/`Atrunc`/`Splice` behave as their standalone forms |
+//! | `set_batched` *(features: set+atomic)* | validate + reject overlap → **multi-write journal**: stage every `[s \| e \| data]` block past `clen` → arm the `MultiWrite` sentinel (`wip_ptr` stays `0`) → replay each block in place → disarm → `ftruncate` (a `durable_sync` at each barrier); a lone effective write takes the ordinary single-write *commit* |
+//! | `inplace_gen` *(features: set+atomic)* | closure-driven reads (each overlaid with the batch-so-far edits) interleaved with accumulated `Write`s (later overrides earlier on overlap); on `None` the pending edits commit together via the multi-write journal (as `set_batched`) |
 //! | `replace` *(feature: atomic)* | `lseek(tail)` → `read(n)` → *(callback)* → *(then as `atrunc`)* |
 //! | `cross_exchange` *(features: set+atomic)* | `read(a)`, `read(b)` → exchange journal: stage `a` → arm at `a` → write `b`→`a` → flip `wip_ptr` to `b` → write `a`→`b` → disarm → `ftruncate` (a `durable_sync` at each barrier) |
 //! | `copy` *(features: set+atomic)* | same-location → no-op; single-block dest → *commit*; overlapping → stream source→tail→dest (`Set` journal); disjoint → **copy journal** (stage only `[src \| n]` → arm `Copy` → stream source→dest → disarm; recovery replays from the untouched source) |
@@ -193,7 +204,7 @@
 //! | `try_discard(s, 0)` *(feature: atomic)* | **read** | **read** |
 //! | `get_batched`, `get_batched_into`, `get_batched_gen` *(feature: atomic)* | **read** | write |
 //! | `swap`, `swap_into`, `cas` *(features: set+atomic)* | write | write |
-//! | `cross_exchange`, `copy`, `process`, `process_gen` *(features: set+atomic)* | write | write |
+//! | `cross_exchange`, `copy`, `process`, `process_gen`, `set_batched`, `inplace_gen` *(features: set+atomic)* | write | write |
 //! | `eq_crds`, `ne_crds`, `masked_eq_crds`, `masked_ne_crds` *(features: set+atomic)* | write | write |
 //! | `replace` *(feature: atomic)* | write | write |
 //! | `peek`, `peek_into`, `get`, `get_into` | **read** | write |
@@ -213,12 +224,12 @@
 //! `get_into` fall back to the write lock and all reads serialise.
 //!
 //! Unlike [`get_batched_gen`](BStack::get_batched_gen), which only ever takes
-//! the **read** lock (Unix/Windows), [`process_gen`](BStack::process_gen)
-//! *always* takes the **write** lock — even for sequences that turn out to
-//! read-only and end in `None` — because the closure may decide, only after
-//! seeing earlier reads, to end the sequence with a `Write` or `Swap`; the
-//! lock therefore has to be acquired before the first read so the whole
-//! sequence runs as one indivisible step.
+//! the **read** lock (Unix/Windows), [`process_gen`](BStack::process_gen) and
+//! [`inplace_gen`](BStack::inplace_gen) *always* take the **write** lock — even
+//! for sequences that turn out to be read-only and end in `None` — because the
+//! closure may decide, only after seeing earlier reads, to mutate; the lock
+//! therefore has to be acquired before the first read so the whole sequence
+//! runs as one indivisible step.
 //!
 //! # Locked region (`lock_up_to`)
 //!
@@ -382,7 +393,7 @@
 //! |---------|-------------|
 //! | `set`   | Enables [`BStack::set`], [`BStack::zero`], and [`BStack::repeat`] — in-place overwrite of existing payload bytes (with data, zeros, or a repeated pattern) without changing the file size. |
 //! | `alloc` | Enables [`BStackAllocator`], [`BStackBulkAllocator`], [`BStackSlice`], [`BStackSliceReader`], and [`LinearBStackAllocator`] — region-based allocation over a `BStack` payload. Combined with `set`, also enables [`BStackSliceWriter`], [`FirstFitBStackAllocator`], [`GhostTreeBstackAllocator`], and [`BStackByteVec`]. |
-//! | `atomic` | Enables [`BStack::atrunc`], [`BStack::splice`], [`BStack::splice_into`], [`BStack::try_extend`], [`BStack::try_extend_zeros`], [`BStack::try_discard`], [`BStack::replace`], [`BStack::get_batched`], [`BStack::get_batched_into`], and [`BStack::get_batched_gen`] — compound read-modify-write operations that hold the lock across what would otherwise be separate calls. Combined with `set`, also enables [`BStack::swap`], [`BStack::swap_into`], [`BStack::cas`], [`BStack::process`], [`BStack::process_gen`], [`BStackGenOp`], [`BStack::cross_exchange`], [`BStack::copy`], [`BStack::eq_crds`], [`BStack::ne_crds`], [`BStack::masked_eq_crds`], and [`BStack::masked_ne_crds`]. |
+//! | `atomic` | Enables [`BStack::atrunc`], [`BStack::splice`], [`BStack::splice_into`], [`BStack::try_extend`], [`BStack::try_extend_zeros`], [`BStack::try_discard`], [`BStack::replace`], [`BStack::get_batched`], [`BStack::get_batched_into`], and [`BStack::get_batched_gen`] — compound read-modify-write operations that hold the lock across what would otherwise be separate calls. Combined with `set`, also enables [`BStack::swap`], [`BStack::swap_into`], [`BStack::cas`], [`BStack::process`], [`BStack::process_gen`], [`BStack::set_batched`], [`BStack::inplace_gen`], [`BStackGenOp`], [`BStack::cross_exchange`], [`BStack::copy`], [`BStack::eq_crds`], [`BStack::ne_crds`], [`BStack::masked_eq_crds`], and [`BStack::masked_ne_crds`]. |
 //!
 //! Enable with:
 //!
@@ -769,6 +780,12 @@ impl BStack {
                 // restore the at-rest invariant. A splice changes the committed
                 // length, so adopt whatever recovery commits.
                 clen = recover_wip(&mut file, committed_len, wip_ptr, wip_aux, raw_size)?;
+            } else if wip_aux == u64::from(WipAux::MultiWrite) {
+                // A multi-write batch was in flight (armed with `wip_ptr == 0`
+                // and the intent-complete sentinel). All blocks were fully
+                // staged before the arm, so replay the sequence and disarm. The
+                // committed length is unchanged.
+                clen = recover_multi_write(&mut file, committed_len, raw_size)?;
             } else {
                 // No journal armed: reconcile the committed length against the
                 // file size, using whichever is smaller (the committed value is
@@ -2101,7 +2118,10 @@ impl BStack {
 /// brought to an end is entirely up to the primitive that consumes them.
 /// Different primitives may impose different rules over the same variants:
 /// how many writes are permitted, whether a write ends the sequence, how the
-/// sequence itself signals that it is done, and so on.
+/// sequence itself signals that it is done, and so on. The "ending the
+/// sequence" notes below describe [`process_gen`](BStack::process_gen);
+/// [`inplace_gen`](BStack::inplace_gen) instead accumulates multiple `Write`s
+/// (none ends the sequence) and permits only `Read`, `Write`, and `Len`.
 ///
 /// # Variants
 ///
@@ -2965,6 +2985,247 @@ impl BStack {
                 }
                 None => return Ok(()),
             }
+        }
+    }
+
+    /// Crash-atomically commit several non-overlapping in-place writes as a
+    /// single unit.
+    ///
+    /// Takes any iterator of `(offset, data)` pairs and overwrites each
+    /// `[offset, offset + data.len())` with `data`, all committing together:
+    /// after a crash either every write is applied or none is, never a partial
+    /// subset. Empty `data` slices are ignored. The file size is never changed —
+    /// every write is an in-place overwrite of committed bytes.
+    ///
+    /// The writes must be **pairwise non-overlapping**; an overlapping pair is
+    /// rejected as invalid input. (The generator form,
+    /// [`inplace_gen`](Self::inplace_gen), instead resolves overlap in favour of
+    /// the later write.)
+    ///
+    /// # Feature flags
+    ///
+    /// Only available when both the `set` and `atomic` Cargo features are
+    /// enabled.
+    ///
+    /// # Durability & atomicity
+    ///
+    /// Crash-atomic across the whole batch via the multi-write journal (stage all
+    /// blocks → arm → replay → disarm), which recovery replays or rolls back on
+    /// the next [`open`](Self::open). A batch that reduces to a single non-empty
+    /// write takes the ordinary single-write path (a single-block atomic write or
+    /// the write-in-progress journal). The written bytes are durably synced
+    /// before the call returns.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] if any `offset + data.len()`
+    /// overflows `u64` or exceeds the current payload size, if any write overlaps
+    /// the locked region `[0, locked_len())`, or if two writes overlap.
+    /// Propagates any I/O error from `write_all`, `set_len`, or `durable_sync`.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    pub fn set_batched<I, D>(&self, writes: I) -> io::Result<()>
+    where
+        I: IntoIterator<Item = (u64, D)>,
+        D: AsRef<[u8]>,
+    {
+        // Materialise the inputs so their `AsRef` slices can be borrowed while we
+        // validate, sort, and stage; drop empty writes (they touch nothing).
+        let owned: Vec<(u64, D)> = writes.into_iter().collect();
+        let mut blocks: Vec<(u64, &[u8])> = owned
+            .iter()
+            .map(|(off, d)| (*off, d.as_ref()))
+            .filter(|(_, d)| !d.is_empty())
+            .collect();
+        if blocks.is_empty() {
+            return Ok(());
+        }
+        let mut guard = self.lock.write().unwrap();
+        let file = &mut guard.0;
+        // Load `locked` under the write lock (see `set` for rationale).
+        let locked = self.locked.load(Ordering::Acquire);
+        let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
+        // Validate each block against the payload size and the locked prefix.
+        for (off, data) in &blocks {
+            let end = checked_end(
+                *off,
+                data.len() as u64,
+                "set_batched: offset + len overflows u64",
+            )?;
+            if *off < locked {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "set_batched: write range [{off}, {end}) overlaps locked region [0, {locked})"
+                    ),
+                ));
+            }
+            if end > data_size {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "set_batched: write range [{off}, {end}) exceeds payload size ({data_size})"
+                    ),
+                ));
+            }
+        }
+        // A lone write cannot overlap anything and is already atomic on its own,
+        // so skip the overlap scan and the multi-write journal.
+        if blocks.len() == 1 {
+            let (off, data) = blocks[0];
+            return set_in_place(file, data_size, off, data);
+        }
+        // Reject overlap: sort by offset, then check that each block ends at or
+        // before the next one begins.
+        blocks.sort_by_key(|(off, _)| *off);
+        for pair in blocks.windows(2) {
+            let (a_off, a_data) = pair[0];
+            let (b_off, _) = pair[1];
+            let a_end = a_off + a_data.len() as u64;
+            if a_end > b_off {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("set_batched: write range [{a_off}, {a_end}) overlaps [{b_off}, ...)"),
+                ));
+            }
+        }
+        journaled_multi_set(file, data_size, &blocks)
+    }
+
+    /// Run a sequence of dependent reads interleaved with multiple in-place
+    /// writes, committing every write as one crash-atomic unit when the sequence
+    /// ends.
+    ///
+    /// Like [`process_gen`](Self::process_gen), `f` is called in a loop and drives
+    /// the sequence through [`BStackGenOp`], all under one held write lock — but
+    /// with three differences:
+    ///
+    /// - **Writes accumulate; they do not end the sequence.** Each
+    ///   `Some(BStackGenOp::Write { offset, data })` records a pending in-place
+    ///   write and `f` is called again. Every recorded write commits together
+    ///   when the sequence ends (`None`), via the multi-write journal: after a
+    ///   crash either all of them are applied or none is.
+    /// - **Later writes override earlier overlapping ones.** Overlap is not
+    ///   rejected (unlike [`set_batched`](Self::set_batched)); the later write
+    ///   wins on the overlapping bytes. For `a<b<c<d`, writing `a..c` then `b..d`
+    ///   commits `a..b` from the first write and `b..d` from the second.
+    /// - **Reads see the batch-so-far content.** A `Some(BStackGenOp::Read {
+    ///   offset, buf })` returns the payload as it *would* look with every pending
+    ///   write applied — committed bytes overlaid with the edits recorded so far —
+    ///   not the on-disk committed bytes.
+    ///
+    /// `f` receives the [`io::Result`] of the **previous** op (the first call
+    /// receives `Ok(())`): the outcome of a `Read`, or the validation result of a
+    /// `Write`. An erroring op is simply not recorded — `f` can inspect the error
+    /// and choose to continue, issue a different op, or end the sequence, rather
+    /// than the whole batch being torn down. `Some(BStackGenOp::Len { out })`
+    /// writes the current payload size into `out` (it never changes here) and
+    /// continues. `None` ends the sequence and commits the accumulated writes.
+    ///
+    /// Only in-place operations are permitted: `Read`, `Write`, and `Len`. The
+    /// size-changing ops (`Push`, `Pop`, `Discard`, `Atrunc`, `Splice`) and
+    /// `Swap` are rejected with [`io::ErrorKind::InvalidInput`] reported to `f`
+    /// (they are not recorded and do not end the sequence) — the multi-write
+    /// journal pins `clen` and `file_size` as the staging bounds, so no
+    /// size-changing operation may be compounded with it.
+    ///
+    /// Every slice returned by `f` — both `Write` data and any sub-slice it is
+    /// derived from — must outlive the call: pending `Write` data is borrowed
+    /// (`&'a [u8]`) until the final commit and consulted by later `Read`s, so a
+    /// buffer handed to a `Write` must not be reused or mutated until
+    /// `inplace_gen` returns.
+    ///
+    /// Reads of the locked region `[0, locked_len())` are permitted (those bytes
+    /// are immutable); `Write` ranges that touch it are rejected, matching
+    /// [`set`](Self::set).
+    ///
+    /// # Feature flags
+    ///
+    /// Only available when both the `set` and `atomic` Cargo features are
+    /// enabled.
+    ///
+    /// # Errors
+    ///
+    /// Per-op validation failures (overflow, out-of-range, locked-region or
+    /// disallowed-op errors) are reported to `f` as the next call's argument, not
+    /// returned. The call itself returns an error only if a `Read`'s I/O fails, or
+    /// if staging, replaying, or disarming the final commit fails — propagating
+    /// any I/O error from `read_exact`, `write_all`, `set_len`, or `durable_sync`.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    pub fn inplace_gen<'a, F>(&self, mut f: F) -> io::Result<()>
+    where
+        F: FnMut(io::Result<()>) -> Option<BStackGenOp<'a>>,
+    {
+        let mut guard = self.lock.write().unwrap();
+        let file = &mut guard.0;
+        let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
+        let locked = self.locked.load(Ordering::Acquire);
+        // Sorted, pairwise-non-overlapping set of pending in-place edits, each
+        // borrowing the caller's `Write` data for the lifetime of the call.
+        let mut overlay: Vec<(u64, &'a [u8])> = Vec::new();
+        let mut feedback: io::Result<()> = Ok(());
+        loop {
+            match f(feedback) {
+                Some(BStackGenOp::Read { offset, buf }) => {
+                    feedback = inplace_overlay_read(file, data_size, offset, buf, &overlay);
+                }
+                Some(BStackGenOp::Write { offset, data }) => {
+                    feedback = inplace_validate_write(offset, data, data_size, locked);
+                    if feedback.is_ok() && !data.is_empty() {
+                        inplace_overlay_insert(&mut overlay, offset, data);
+                    }
+                }
+                Some(BStackGenOp::Len { out }) => {
+                    *out = data_size;
+                    feedback = Ok(());
+                }
+                Some(BStackGenOp::Swap { .. }) => {
+                    feedback = Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "inplace_gen: Swap is not permitted (Read/Write/Len only)",
+                    ));
+                }
+                Some(BStackGenOp::Push { .. }) => {
+                    feedback = Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "inplace_gen: Push is not permitted (in-place writes only)",
+                    ));
+                }
+                Some(BStackGenOp::Pop { .. }) => {
+                    feedback = Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "inplace_gen: Pop is not permitted (in-place writes only)",
+                    ));
+                }
+                Some(BStackGenOp::Discard { .. }) => {
+                    feedback = Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "inplace_gen: Discard is not permitted (in-place writes only)",
+                    ));
+                }
+                Some(BStackGenOp::Atrunc { .. }) => {
+                    feedback = Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "inplace_gen: Atrunc is not permitted (in-place writes only)",
+                    ));
+                }
+                Some(BStackGenOp::Splice { .. }) => {
+                    feedback = Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "inplace_gen: Splice is not permitted (in-place writes only)",
+                    ));
+                }
+                None => break,
+            }
+        }
+        // Commit the accumulated edits. Zero → nothing to do; one → the ordinary
+        // single-write path; many → the multi-write journal.
+        match overlay.len() {
+            0 => Ok(()),
+            1 => {
+                let (offset, data) = overlay[0];
+                set_in_place(file, data_size, offset, data)
+            }
+            _ => journaled_multi_set(file, data_size, &overlay),
         }
     }
 
