@@ -16,7 +16,10 @@
  *
  * wip_ptr / wip_aux hold the write-in-progress journal that makes in-place
  * mutations crash-atomic; both are zero in the steady state.  On open, an
- * interrupted in-place write is replayed or rolled back (see algos/WIP.md).
+ * interrupted in-place write is replayed or rolled back (see algos/WIP.md).  A
+ * batch of several in-place writes (bstack_set_batched / bstack_inplace_gen) uses
+ * the multi-write sentinel in wip_aux with wip_ptr left 0, staging the writes as
+ * [s | e | data] blocks past clen.
  * Legacy 0.1.x files (16-byte header) are upgraded by bstack_migrate.
  *
  * All logical offsets are 0-based from the start of the payload region.
@@ -35,7 +38,8 @@
  * bstack_set / bstack_zero / bstack_repeat / bstack_atrunc / bstack_splice /
  * bstack_try_extend / bstack_try_extend_zeros / bstack_try_discard(s, n>0) /
  * bstack_swap / bstack_cas / bstack_replace / bstack_process /
- * bstack_process_gen / bstack_cross_exchange / bstack_copy /
+ * bstack_process_gen / bstack_set_batched / bstack_inplace_gen /
+ * bstack_cross_exchange / bstack_copy /
  * bstack_eq_crds / bstack_ne_crds /
  * bstack_masked_eq_crds / bstack_masked_ne_crds
  * hold a write lock.  bstack_try_discard(s, 0) holds a read lock.
@@ -58,9 +62,9 @@
  *   bstack_try_extend, bstack_try_extend_zeros, bstack_try_discard,
  *   bstack_replace, bstack_get_batched, and bstack_get_batched_gen.  Both
  *   flags together also enable bstack_swap, bstack_cas, bstack_process,
- *   bstack_process_gen, bstack_gen_op_t, bstack_cross_exchange, bstack_copy,
- *   bstack_eq_crds, bstack_ne_crds, bstack_masked_eq_crds, and
- *   bstack_masked_ne_crds.
+ *   bstack_process_gen, bstack_set_batched, bstack_inplace_gen, bstack_gen_op_t,
+ *   bstack_cross_exchange, bstack_copy, bstack_eq_crds, bstack_ne_crds,
+ *   bstack_masked_eq_crds, and bstack_masked_ne_crds.
  */
 
 typedef struct bstack bstack_t;
@@ -644,6 +648,78 @@ int bstack_process(bstack_t *bs, uint64_t start, uint64_t end,
 int bstack_process_gen(bstack_t *bs,
                        int (*gen)(bstack_gen_op_t *out_op, void *ctx),
                        void *ctx);
+
+/*
+ * Commit several non-overlapping in-place writes as one crash-atomic unit.
+ *
+ * writes is an array of count descriptors; each (offset, buf, len) overwrites
+ * [offset, offset + len) with the len bytes at buf.  Either every write is
+ * applied or none is — after a crash the file holds all of them or all of the
+ * old bytes, never a partial subset.  The bstack_iovec_t type is reused for the
+ * descriptors (its buf is read as the write source here).  Empty (len == 0)
+ * entries are ignored, and the file size is never changed.
+ *
+ * The writes must be pairwise non-overlapping; an overlapping pair is rejected.
+ * (The generator form, bstack_inplace_gen, instead resolves overlap in favour of
+ * the later write.)
+ *
+ * Crash-atomic across the whole batch via the multi-write journal (stage all
+ * blocks, arm, replay, disarm), recovered on the next bstack_open.  A batch that
+ * reduces to a single non-empty write takes the ordinary single-write path.
+ *
+ * Returns EINVAL if any offset + len overflows uint64_t or exceeds the current
+ * payload size, if any write overlaps the locked region [0, bstack_locked_len()),
+ * or if two writes overlap.  Returns -1 (errno set) on an I/O error.
+ *
+ * Only available when compiled with both -DBSTACK_FEATURE_SET and
+ * -DBSTACK_FEATURE_ATOMIC.
+ */
+int bstack_set_batched(bstack_t *bs, const bstack_iovec_t *writes, size_t count);
+
+/*
+ * Run a sequence of dependent reads interleaved with multiple in-place writes,
+ * committing every write as one crash-atomic unit when the sequence ends.
+ *
+ * Like bstack_process_gen, gen is called repeatedly while the write lock is held,
+ * populating *out_op and returning 1 to yield an op or 0 to end.  Unlike
+ * bstack_process_gen:
+ *
+ * - Writes accumulate; they do not end the sequence.  A BSTACK_GEN_WRITE records
+ *   a pending in-place write and gen is called again.  Every recorded write
+ *   commits together when gen returns 0, via the multi-write journal.
+ * - Later writes override earlier overlapping ones (overlap is not rejected).
+ *   For a<b<c<d, writing a..c then b..d commits a..b from the first and b..d
+ *   from the second.
+ * - A BSTACK_GEN_READ returns the batch-so-far content: committed bytes overlaid
+ *   with the edits recorded so far, not the on-disk bytes.
+ *
+ * Only in-place ops are permitted: BSTACK_GEN_READ, BSTACK_GEN_WRITE, and
+ * BSTACK_GEN_LEN.  The size-changing ops (PUSH/POP/SPLICE) and SWAP are rejected
+ * (reported as EINVAL via prev_status; not recorded, and the sequence continues).
+ * There is no abort: returning 0 always commits whatever validly accumulated.
+ *
+ * If prev_status is non-NULL, before each gen call *prev_status is set to the
+ * previous op's result — 0 on success, or the errno of a failed op (the first
+ * call sees 0).  An erroring op is simply not recorded; gen inspects the status
+ * and decides whether to continue, issue a different op, or end.  A common
+ * pattern is to stash prev_status inside ctx so gen can read it.
+ *
+ * Every buffer handed to a BSTACK_GEN_WRITE must outlive the call: pending write
+ * data is borrowed until the final commit and consulted by later reads, so it
+ * must not be reused or mutated until bstack_inplace_gen returns.
+ *
+ * Reads of the locked region [0, bstack_locked_len()) are permitted; write ranges
+ * touching it are rejected, matching bstack_set.
+ *
+ * Returns 0 on success (including an empty sequence).  Returns -1 (errno set) on
+ * an I/O error during a read or the final commit, or on allocation failure.
+ *
+ * Only available when compiled with both -DBSTACK_FEATURE_SET and
+ * -DBSTACK_FEATURE_ATOMIC.
+ */
+int bstack_inplace_gen(bstack_t *bs,
+                       int (*gen)(bstack_gen_op_t *out_op, void *ctx),
+                       void *ctx, int *prev_status);
 
 /*
  * Atomically swap two equal-size, non-overlapping regions within the file.
