@@ -165,59 +165,6 @@ The same change applies to the corresponding methods on `BStackGuardedSlice`, an
 
 ---
 
-## Caching the logical length (`clen`) for lock-free `len`
-
-**Feature flag:** None (additive API surface)
-**Breaking change:** No (signature change to `len`/`is_empty` deferred — see open questions)
-
-### Motivation
-
-[`BStack::len`](src/lib.rs) currently takes the read lock and calls `File::metadata` to query the on-disk file size via `fstat`/`GetFileSizeEx`, then subtracts the header. This is correct, but it costs a syscall and an `RwLock::read()` acquisition on every call — even though `clen` only ever changes under the write lock, during `push`, `pop`, `pop_into`, `extend`, `discard`, `try_discard`, `set`, `splice`, `splice_into`, `atrunc`, and `replace`.
-
-Mirroring the `locked` field (an `AtomicU64` already used for the locked-region fast path), an in-memory cache of `clen` updated by every write-lock-held operation that changes the payload length would let `len` and `is_empty` become a single uncontended `Ordering::Acquire` atomic load with no syscall and no lock acquisition. This matters for callers that poll `len`/`is_empty` frequently — e.g. to check capacity before each `push`/`pop`.
-
-### Design
-
-Add a `clen` field to `BStack`, seeded from the validated header during construction (after recovery has run, so the seed value is always the post-recovery `clen`). Every operation that commits a new `clen` to the on-disk header also updates `self.clen` in the same write-lock critical section, right after (or as part of) the durable header write.
-
-#### Open question: `AtomicU64` vs. plain field under the existing `RwLock`
-
-Two implementations are possible, and the choice is not obvious:
-
-- **`AtomicU64` (lock-free).** `len` becomes a single uncontended load with no lock acquisition at all:
-
-  ```rust
-  pub fn len(&self) -> u64 {
-      self.clen.load(Ordering::Acquire)
-  }
-  ```
-
-  This mirrors `locked`, but `locked` needs lock-freedom because it is checked on hot read/write paths that otherwise avoid the rwlock entirely. `len` is not on such a path today.
-
-- **Plain `u64` under the existing `RwLock`.** All `clen`-changing operations already hold the write lock when they would update the cache, so no new synchronisation is needed — the field is just read alongside the rest of the locked state:
-
-  ```rust
-  pub fn len(&self) -> u64 {
-      self.lock.read().unwrap().clen
-  }
-  ```
-
-  This keeps `len` exactly as cheap as today *minus the `metadata` syscall*, with no atomic-ordering reasoning required, at the cost of retaining the (uncontended) lock acquisition.
-
-The atomic avoids that lock acquisition but introduces an `Ordering::Release`/`Acquire` pair and a second source of truth that must be kept in lockstep with the header write at every call site — more places to get wrong for a cache whose main competing cost (the syscall) is removed either way. The plain-field approach is simpler and lower-risk, and matches the existing pattern that `len` is already a locking operation. Given the modest further win of full lock-freedom versus the simplicity of reusing the existing lock, the plain-field approach is the better default unless profiling shows the read-lock acquisition itself is a measurable cost for `len`-polling callers.
-
-### Concurrency considerations
-
-- The cache reflects the *logical* post-operation `clen`, not necessarily a value that has reached durable storage at the instant of the store — consistent with how `locked` already provides a logical, non-durability-tied guarantee rather than a crash-safety one.
-- Recovery already computes the correct `clen` from the header and file size at construction time; the cache is seeded from that result and introduces no new recovery logic.
-- Bypassing `BStack` to truncate or extend the backing file directly is already outside its supported usage and would desynchronise the cache from the file regardless of this change.
-
-### Open questions
-
-- **Return type.** `len` and `is_empty` currently return `io::Result<u64>` / `io::Result<bool>` to surface `File::metadata` errors. With a lock-free atomic load, no I/O occurs and no error can arise. Dropping `io::Result` is a breaking signature change — it could be bundled with another 0.4.0 breaking release, or `io::Result` could be retained (always `Ok`) for source compatibility until then.
-
----
-
 ## `BStackUninitAllocator` extension trait for uninitialised allocation
 
 **Feature flag:** None (additive API surface)
