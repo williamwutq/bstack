@@ -98,49 +98,6 @@ This is a larger breaking change than the handle type alone, as it touches every
 
 ---
 
-## Multi-write journaling (0.4.0)
-
-**Breaking change:** Yes, but since it is a part of the 0.4.0 on-disk format, so it ships under the existing 0.4.0 magic — no bump beyond 0.4.0.
-
-The single-region write-in-progress journal — the same-length `set`, splice (grow/shrink), repeat-fill, and disjoint copy modes, plus the derived-atomicity single-block fast path — shipped in 0.4.0 and is specified in full in [`algos/WIP.md`](algos/WIP.md). Multi-write journaling is the one remaining generalisation of that machinery: committing `k` non-overlapping in-place writes `{(s_i, e_i, data_i)}` as a single crash-atomic unit, so a compound edit (a sequence similar to `process_gen`, or an allocator splicing several free-list nodes in one shot) either applies in full or not at all.
-
-### Design
-
-The single-write journal treats `wip_ptr` + `clen` as a two-field descriptor for one (range, payload) pair. Multi-write replaces that with a concatenated sequence of variable-length blocks appended into the same tail region, using `wip_aux` as the state discriminant while `wip_ptr` stays `0` throughout — so it never collides with a single-region journal, which always arms `wip_ptr != 0`.
-
-**Tail layout.** Starting at `clen`, blocks are packed back-to-back with no padding or links. Each block is self-delimiting: `s_i`/`e_i` encode the target range and the payload length is simply `e_i − s_i`.
-
-```
-[head + 0  .. head + 8)              →  s_i    (start of target range)
-[head + 8  .. head + 16)             →  e_i    (end of target range)
-[head + 16 .. head + 16 + (e_i−s_i)) →  data_i (payload bytes)
-```
-
-The next block begins immediately after the previous payload; the sequence runs from `clen` to `file_size`, so no count or end pointer is needed — `file_size` is the boundary.
-
-**Protocol.**
-
-1. **Stage.** Append blocks one by one to the tail (`file_size` grows with each). The header is untouched; `wip_ptr` and `wip_aux` stay `0`.
-2. **Arm.** Set `wip_aux` to the *intent-complete* sentinel (reserved so it can never be confused with a single-region mode — those only appear with `wip_ptr != 0`). Sync.
-3. **Replay.** Scan `[clen .. file_size)`; copy each `data_i` into `[s_i .. e_i)`. Order is arbitrary because the ranges are non-overlapping.
-4. **Disarm.** Clear `wip_aux = 0`. Sync. Truncate to `clen`.
-
-**Recovery.** The existing `wip_ptr == 0` rule (truncate to `clen`) already covers a crash during step 1: no sentinel was set, so the partial tail is discarded silently — identical to never having started. The only new case: `wip_ptr == 0` **and** `wip_aux == intent-complete sentinel` → all blocks are fully staged, so replay the sequence and disarm as in step 4. Replay is idempotent (the staged blocks are immutable and disjoint from their payload targets), so a crash during recovery is safe to re-run. Every other header combination is handled by the single-region rules in `algos/WIP.md`.
-
-### Clarifications
-
-- **Replay order is irrelevant.** The target ranges are non-overlapping, so the staged blocks may be replayed in any order to the same result. This is what makes the read-consistency question below a *behavioural* design choice rather than a correctness constraint — the writes themselves compose regardless of order.
-- **The compact-mode optimizations can apply, per block.** A block whose payload is a repeating pattern could use the `REPEAT` encoding (stage `[k | s]` instead of the full region), and a block copying a disjoint in-file source could use the `COPY` encoding (stage `[src | n]` instead of the bytes) — the same tail-size wins as the single-region journal, so a batch containing a large repeated or copied edit need not bloat the staging tail with data. The per-block tail encoding that would carry these is not yet designed (see *Open questions*).
-- **No file-size-changing operation may be compounded with a multi-write.** The protocol pins `clen` as the staging region's start and `file_size` as its end; `push`, `pop`, extension, or truncation/discard would move either boundary and corrupt or truncate the staging region during recovery. Multi-write is strictly in-place mutation of existing payload bytes.
-
-### Open questions
-
-- **Per-block `REPEAT`/`COPY` tail encoding.** The compact-mode optimizations above need a per-block tag distinguishing verbatim / repeat / copy blocks, each with its own self-delimiting layout (roughly `[s_i | e_i | data_i]` for verbatim, `[s_i | e_i | k | s]` for repeat, `[dest | src | n]` for copy) so recovery can still walk the sequence with no explicit count. This format is not yet designed.
-- **wip bypass vs. read consistency under a generator.** A plain multi-write has no interleaved reads, so the derived-atomicity fast path is harmless; the choice only matters once a generator-driven form (planned) lets reads interleave with the batch's writes. With bypass, a mid-sequence read is inconsistent — **new** content for block-confined edits that bypassed into the payload, **old** for staged ones. Two consistent routes: (1) **no bypass** — reads return the **old** content until the final replay; (2) **bypass with a read overlay** — reads consult an in-memory queue of pending edits and return the **new** (batch-so-far) content. Decide between "reads see old" (simplest) and "reads see new" (keeps the fast path, at an overlay lookup per read); the case to avoid is bypass without the overlay.
-- **Coordinate-only batch relocation.** The multi-write journal stages full `(start, end, data)` blocks. A variant could stage `(dest, source, len)` triples replayed by in-place copy — the `COPY` optimization generalized to a batch — giving a crash-atomic bulk move whose journal is proportional to the *number* of moves, not the bytes moved (e.g. allocator compaction or defragmentation, sliding many live blocks in one atomic step). It needs preconditions the single `COPY` does not: every source disjoint from every destination, *and* the move graph acyclic — a cycle such as `A→B→A` has no safe in-place replay order, since replaying it re-reads a source that an earlier step already overwrote. Define the precondition checks, the tail layout, and whether a cyclic batch falls back to staging one region per cycle (breaking the cycle) or to the full-data multi-write path.
-
----
-
 ## Requiring `&mut BStackSlice` for mutation (0.4.0)
 
 **Feature flag:** `set`
