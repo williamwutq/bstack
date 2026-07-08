@@ -680,6 +680,9 @@ static int walk_multi_blocks(bstack_fd_t fd, uint64_t committed_len,
 static int recover_multi_write(bstack_fd_t fd, uint64_t committed_len,
                                uint64_t raw_size, uint64_t *out_clen)
 {
+    uint64_t actual_len = (raw_size >= HEADER_SIZE) ? (raw_size - HEADER_SIZE) : 0;
+    if (committed_len > actual_len)
+        committed_len = actual_len;
     uint64_t tail_start = HEADER_SIZE + committed_len;
     if (raw_size > tail_start) {
         int valid = 0;

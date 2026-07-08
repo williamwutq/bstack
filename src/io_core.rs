@@ -1075,7 +1075,7 @@ fn walk_multi_blocks(
     let mut cursor = tail_start;
     while cursor < raw_size {
         // Header must be fully present.
-        if cursor + 16 > raw_size {
+        if raw_size - cursor < 16 {
             return Ok(false);
         }
         let mut hdr = [0u8; 16];
@@ -1122,6 +1122,8 @@ pub(crate) fn recover_multi_write(
     committed_len: u64,
     raw_size: u64,
 ) -> io::Result<u64> {
+    let actual_len = raw_size.saturating_sub(HEADER_SIZE);
+    let committed_len = committed_len.min(actual_len);
     let tail_start = HEADER_SIZE + committed_len;
     if raw_size > tail_start {
         // Pass 1: validate the whole sequence without touching the payload.
