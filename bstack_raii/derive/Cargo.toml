@@ -1,0 +1,17 @@
+[package]
+name = "bstack_raii_derive"
+version = "0.0.0"
+edition = "2024"
+authors = ["William Wu <williamwutq@gmail.com>", "Claude <claude@anthropic.com>"]
+license = "MIT"
+description = "Procedural macros for bstack_raii (#[bstack_block], bstack_move!, bstack_cast!)"
+repository = "https://github.com/williamwutq/bstack"
+publish = false
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"

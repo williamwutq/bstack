@@ -1,0 +1,29 @@
+[package]
+name = "bstack_raii"
+version = "0.0.0"
+edition = "2024"
+authors = ["William Wu <williamwutq@gmail.com>", "Claude <claude@anthropic.com>"]
+license = "MIT"
+description = "Typed, RAII-style ownership and lifetime layer over the bstack allocation primitives"
+repository = "https://github.com/williamwutq/bstack"
+publish = false
+
+# This crate is developed inside the `bstack` repository but is NOT part of the
+# `bstack` package or its CI. It is its own self-contained workspace so that
+# root-level `cargo` commands in the bstack repo never descend into it. See
+# RAII.md (in the repo root) for the full design this crate implements.
+[workspace]
+members = ["derive"]
+
+[dependencies]
+# bstack 0.4.0 is feature-complete but not yet published to crates.io, so we
+# depend on the GitHub source for now. Pin a `branch`/`rev`/`tag` here once the
+# RAII primitives land on a stable ref (or swap to a `path = ".."` dep for local
+# iteration). RAII requires `alloc` + `set`; `atomic` is needed for on-disk
+# refcount CAS (control blocks, strong/weak counters).
+bstack = { git = "https://github.com/williamwutq/bstack", features = ["alloc", "set", "atomic"] }
+bstack_raii_derive = { path = "derive", version = "0.0.0" }
+
+# Gate for POD (plain-old-data) inline fields: any `bytemuck::Pod` type is safe
+# to store inline in an on-disk block and receives the blanket no-op BStackDrop.
+bytemuck = { version = "1", features = ["derive"] }

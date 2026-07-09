@@ -3,8 +3,12 @@ name: Check
 on:
   push:
     branches: [ master ]
+    # The nested bstack_raii crate is its own workspace and not part of the
+    # bstack package; skip these checks when only it changed.
+    paths-ignore: [ bstack_raii/** ]
   pull_request:
     branches: [ master ]
+    paths-ignore: [ bstack_raii/** ]
 
 permissions:
   contents: read

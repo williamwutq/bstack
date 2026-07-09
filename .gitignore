@@ -1,5 +1,9 @@
 # Rust
 /target
+# Nested bstack_raii crate build output (its own self-contained workspace)
+/bstack_raii/target
+/bstack_raii/**/target
+/bstack_raii/Cargo.lock
 
 # C
 /obj
