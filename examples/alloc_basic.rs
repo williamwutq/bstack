@@ -40,7 +40,9 @@ fn main() -> io::Result<()> {
         // Grow the slice to 32 bytes.  Data is preserved; new bytes are zero.
         // realloc takes ownership of `a`, so save start before calling.
         let a_start = a.start();
-        let a = alloc.realloc(a, 32)?;
+        // On failure `realloc` returns the surviving handle inside the error;
+        // this example just propagates the underlying error.
+        let a = alloc.realloc(a, 32).map_err(|e| e.source)?;
         assert_eq!(a.start(), a_start); // grew in-place (tail block)
         let data = a.read()?;
         assert_eq!(&data[..16], b"Hello, allocator");
@@ -52,7 +54,7 @@ fn main() -> io::Result<()> {
         println!("allocated second block at offset {}", b.start());
 
         // Free the first block. Its slot goes to the free list.
-        alloc.dealloc(a)?;
+        alloc.dealloc(a).map_err(|e| e.source)?;
         println!("freed first block");
 
         // The next alloc reuses the freed slot (first-fit).

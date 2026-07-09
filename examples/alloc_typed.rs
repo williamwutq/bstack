@@ -98,7 +98,9 @@ fn update(alloc: &FirstFitBStackAllocator, token: &[u8; 16], record: &Record) ->
 fn delete(alloc: &FirstFitBStackAllocator, token: &[u8; 16]) -> io::Result<()> {
     let range = BStackRange::from_bytes(*token);
     let slice = unsafe { bstack::BStackOwnedSlice::from_raw_range(alloc, range) };
-    alloc.dealloc(slice)
+    // On failure `dealloc` hands the handle back inside the error; this caller
+    // has nothing to retry with, so it surfaces only the underlying error.
+    alloc.dealloc(slice).map_err(|e| e.source)
 }
 
 // -----------------------------------------------------------------------

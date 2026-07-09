@@ -23,7 +23,8 @@
 
 #[cfg(all(feature = "alloc", feature = "set"))]
 use bstack::{
-    BStack, BStackAllocator, BStackOwnedSlice, BStackOwnedSliceAllocator, LinearBStackAllocator,
+    BStack, BStackAllocError, BStackAllocator, BStackOwnedSlice, BStackOwnedSliceAllocator,
+    LinearBStackAllocator,
 };
 #[cfg(all(feature = "alloc", feature = "set"))]
 use std::io;
@@ -133,34 +134,64 @@ impl BStackAllocator for SequenceBumpAllocator {
         &'a self,
         handle: StampedSlice<'a>,
         new_len: u64,
-    ) -> Result<StampedSlice<'a>, BumpError> {
+    ) -> Result<StampedSlice<'a>, BStackAllocError<'a, Self>> {
         let start = handle.inner.start();
         let old_len = handle.inner.len();
         let end = handle.inner.end();
         let seq = handle.seq;
-        // handle dropped (Drop is no-op); reconstruct below on success.
-        if end != self.stack.len()? {
-            return Err(BumpError::NotTail);
-        }
-        match new_len.cmp(&old_len) {
-            std::cmp::Ordering::Greater => {
-                self.stack.extend(new_len - old_len)?;
+        // handle dropped (Drop is no-op); reconstruct below.
+        (|| -> Result<StampedSlice<'a>, BumpError> {
+            if end != self.stack.len()? {
+                return Err(BumpError::NotTail);
             }
-            std::cmp::Ordering::Less => {
-                self.stack.discard(old_len - new_len)?;
+            match new_len.cmp(&old_len) {
+                std::cmp::Ordering::Greater => {
+                    self.stack.extend(new_len - old_len)?;
+                }
+                std::cmp::Ordering::Less => {
+                    self.stack.discard(old_len - new_len)?;
+                }
+                std::cmp::Ordering::Equal => {}
             }
-            std::cmp::Ordering::Equal => {}
-        }
-        // SAFETY: start unchanged; tail adjusted to new_len.
-        let inner = unsafe { BStackOwnedSlice::from_raw_parts(self, start, new_len) };
-        Ok(StampedSlice { inner, seq })
+            // SAFETY: start unchanged; tail adjusted to new_len.
+            let inner = unsafe { BStackOwnedSlice::from_raw_parts(self, start, new_len) };
+            Ok(StampedSlice { inner, seq })
+        })()
+        .map_err(|source| BStackAllocError {
+            source,
+            // Every failure path leaves the original tail region intact, so hand
+            // the (stamp-preserving) original handle back to the caller.
+            handle: Some(StampedSlice {
+                // SAFETY: (start, old_len) still describes the live original region.
+                inner: unsafe { BStackOwnedSlice::from_raw_parts(self, start, old_len) },
+                seq,
+            }),
+        })
     }
 
-    fn dealloc(&self, handle: StampedSlice<'_>) -> Result<(), BumpError> {
-        if handle.inner.end() == self.stack.len()? {
-            self.stack.discard(handle.inner.len())?;
-        }
-        Ok(())
+    fn dealloc<'a>(
+        &'a self,
+        handle: StampedSlice<'a>,
+    ) -> Result<(), BStackAllocError<'a, Self>> {
+        let start = handle.inner.start();
+        let len = handle.inner.len();
+        let end = handle.inner.end();
+        let seq = handle.seq;
+        (|| -> Result<(), BumpError> {
+            if end == self.stack.len()? {
+                self.stack.discard(len)?;
+            }
+            Ok(())
+        })()
+        .map_err(|source| BStackAllocError {
+            source,
+            // A failed discard leaves the region still allocated.
+            handle: Some(StampedSlice {
+                // SAFETY: (start, len) still describes the live region.
+                inner: unsafe { BStackOwnedSlice::from_raw_parts(self, start, len) },
+                seq,
+            }),
+        })
     }
 }
 
@@ -210,11 +241,15 @@ fn main() -> io::Result<()> {
         let b = alloc.alloc(8).unwrap();
         println!("alloc  seq={} offset={} len={}", b.seq, b.start(), b.len());
 
-        // Non-tail realloc returns the custom NotTail variant.
-        match alloc.realloc(a, 32).unwrap_err() {
-            BumpError::NotTail => println!("realloc(a) → NotTail"),
+        // Non-tail realloc returns the custom NotTail variant, and hands the
+        // original handle back so it is not leaked.
+        let err = alloc.realloc(a, 32).unwrap_err();
+        let a = err.handle.expect("failed realloc returns the original handle");
+        match err.source {
+            BumpError::NotTail => println!("realloc(a) → NotTail (original recovered)"),
             other => println!("realloc(a) → {other}"),
         }
+        let _ = a;
 
         // Tail realloc preserves the sequence number.
         let b = alloc.realloc(b, 24).unwrap();
