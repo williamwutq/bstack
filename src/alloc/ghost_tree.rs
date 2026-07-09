@@ -1,4 +1,4 @@
-use super::{BStackAllocator, BStackBulkAllocator, BStackSlice};
+use super::{BStackAllocator, BStackBulkAllocator, BStackOwnedSlice};
 use crate::BStack;
 #[cfg(not(feature = "atomic"))]
 use std::cell::Cell;
@@ -709,7 +709,7 @@ impl GhostTreeBstackAllocator {
 
 impl BStackAllocator for GhostTreeBstackAllocator {
     type Error = io::Error;
-    type Allocated<'a> = BStackSlice<'a, Self>;
+    type Allocated<'a> = BStackOwnedSlice<'a, Self>;
 
     fn stack(&self) -> &BStack {
         &self.stack
@@ -730,10 +730,9 @@ impl BStackAllocator for GhostTreeBstackAllocator {
     /// Multi-call.  A crash between AVL remove and the split-insert permanently
     /// loses the remainder fragment; a crash between AVL remove and return
     /// loses the entire block.
-    fn alloc(&self, len: u64) -> io::Result<BStackSlice<'_, Self>> {
+    fn alloc(&self, len: u64) -> io::Result<BStackOwnedSlice<'_, Self>> {
         if len == 0 {
-            // SAFETY: zero-length slice at offset 0 is safe
-            return Ok(unsafe { BStackSlice::from_raw_parts(self, 0, 0) });
+            return Ok(BStackOwnedSlice::empty(self));
         }
         let aligned = Self::align_up_len(len);
         {
@@ -747,7 +746,9 @@ impl BStackAllocator for GhostTreeBstackAllocator {
                     // The tail `aligned` bytes are already zeroed by invariant.
                     self.avl_insert(ptr, remainder)?;
                     // SAFETY: ptr + remainder is the allocated portion after splitting
-                    return Ok(unsafe { BStackSlice::from_raw_parts(self, ptr + remainder, len) });
+                    return Ok(unsafe {
+                        BStackOwnedSlice::from_raw_parts(self, ptr + remainder, len)
+                    });
                 } else {
                     #[cfg(feature = "atomic")]
                     drop(guard);
@@ -757,14 +758,14 @@ impl BStackAllocator for GhostTreeBstackAllocator {
                     // padding and will be recovered on dealloc by re-aligning.
                     self.stack.zero(ptr, MIN_ALLOC)?;
                     // SAFETY: ptr from allocated block via avl_find_best_fit_and_remove
-                    return Ok(unsafe { BStackSlice::from_raw_parts(self, ptr, len) });
+                    return Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, ptr, len) });
                 }
             }
         }
         // No free block fits: lock released; grow the BStack (returns zeroed bytes).
         let start = self.stack.extend(aligned)?;
         // SAFETY: start from fresh allocation via self.stack.extend
-        Ok(unsafe { BStackSlice::from_raw_parts(self, start, len) })
+        Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, start, len) })
     }
 
     /// Resize `slice` to `new_len` bytes.
@@ -781,9 +782,9 @@ impl BStackAllocator for GhostTreeBstackAllocator {
     /// Grow: multi-call (alloc + copy + dealloc).
     fn realloc<'a>(
         &'a self,
-        slice: BStackSlice<'a, Self>,
+        slice: BStackOwnedSlice<'a, Self>,
         new_len: u64,
-    ) -> io::Result<BStackSlice<'a, Self>> {
+    ) -> io::Result<BStackOwnedSlice<'a, Self>> {
         if slice.is_empty() {
             return self.alloc(new_len);
         }
@@ -795,8 +796,7 @@ impl BStackAllocator for GhostTreeBstackAllocator {
         }
         if new_len == 0 {
             self.dealloc(slice)?;
-            // SAFETY: zero-length slice at offset 0 is safe
-            return Ok(unsafe { BStackSlice::from_raw_parts(self, 0, 0) });
+            return Ok(BStackOwnedSlice::empty(self));
         }
         let old_len = slice.len();
         // Re-align to recover the true underlying block sizes.
@@ -813,7 +813,7 @@ impl BStackAllocator for GhostTreeBstackAllocator {
                 self.stack.zero(tail_ptr, tail_len)?;
             }
             // SAFETY: same block, just changing visible length
-            return Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) });
+            return Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, slice.start(), new_len) });
         }
 
         if aligned_new < aligned_old {
@@ -831,7 +831,9 @@ impl BStackAllocator for GhostTreeBstackAllocator {
                     self.stack
                         .zero(slice.start() + new_len, aligned_new - new_len)?;
                 }
-                return Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) });
+                return Ok(unsafe {
+                    BStackOwnedSlice::from_raw_parts(self, slice.start(), new_len)
+                });
             }
 
             #[cfg(not(feature = "atomic"))]
@@ -841,7 +843,9 @@ impl BStackAllocator for GhostTreeBstackAllocator {
                         .zero(slice.start() + new_len, aligned_new - new_len)?;
                 }
                 self.stack.discard(freed_tail)?;
-                return Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) });
+                return Ok(unsafe {
+                    BStackOwnedSlice::from_raw_parts(self, slice.start(), new_len)
+                });
             }
 
             // Not tail: zero gap + freed tail before taking the lock, then insert.
@@ -850,7 +854,7 @@ impl BStackAllocator for GhostTreeBstackAllocator {
             #[cfg(feature = "atomic")]
             let _guard = self.lock.lock().unwrap();
             self.avl_insert(tail_ptr, freed_tail)?;
-            return Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) });
+            return Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, slice.start(), new_len) });
         }
 
         // Grow path.
@@ -860,13 +864,13 @@ impl BStackAllocator for GhostTreeBstackAllocator {
             .stack
             .try_extend_zeros(slice.start() + aligned_old, aligned_new - aligned_old)?
         {
-            return Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) });
+            return Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, slice.start(), new_len) });
         }
 
         #[cfg(not(feature = "atomic"))]
         if slice.start() + aligned_old == self.stack.len()? {
             self.stack.extend(aligned_new - aligned_old)?;
-            return Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) });
+            return Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, slice.start(), new_len) });
         }
 
         // Grow (non-tail): allocate new region, copy old data, free old region.
@@ -887,7 +891,7 @@ impl BStackAllocator for GhostTreeBstackAllocator {
     ///
     /// Multi-call: a crash after the zero but before the AVL insert permanently
     /// loses the block.
-    fn dealloc(&self, slice: BStackSlice<'_, Self>) -> io::Result<()> {
+    fn dealloc(&self, slice: BStackOwnedSlice<'_, Self>) -> io::Result<()> {
         if slice.is_empty() {
             return Ok(());
         }
@@ -972,7 +976,7 @@ impl BStackBulkAllocator for GhostTreeBstackAllocator {
             return Ok(lengths
                 .iter()
                 // SAFETY: zero-length slices are safe
-                .map(|_| unsafe { BStackSlice::from_raw_parts(self, 0, 0) })
+                .map(|_| BStackOwnedSlice::empty(self))
                 .collect());
         }
 
@@ -1011,11 +1015,12 @@ impl BStackBulkAllocator for GhostTreeBstackAllocator {
         let mut offset = 0u64;
         for (&len, &al) in lengths.iter().zip(aligned.iter()) {
             if len == 0 {
-                // SAFETY: zero-length slice is safe
-                result.push(unsafe { BStackSlice::from_raw_parts(self, 0, 0) });
+                result.push(BStackOwnedSlice::empty(self));
             } else {
                 // SAFETY: block_ptr + offset is within the bulk allocated block
-                result.push(unsafe { BStackSlice::from_raw_parts(self, block_ptr + offset, len) });
+                result.push(unsafe {
+                    BStackOwnedSlice::from_raw_parts(self, block_ptr + offset, len)
+                });
                 offset += al;
             }
         }
@@ -1030,13 +1035,13 @@ impl BStackBulkAllocator for GhostTreeBstackAllocator {
     /// freed in a single operation when given back together.
     fn dealloc_bulk<'a>(
         &'a self,
-        slices: impl AsRef<[Self::Allocated<'a>]>,
+        slices: impl IntoIterator<Item = Self::Allocated<'a>>,
     ) -> Result<(), Self::Error> {
-        let slices = slices.as_ref();
+        let slices: Vec<BStackOwnedSlice<'a, Self>> = slices.into_iter().collect();
 
         // Collect, validate, and convert to (ptr, aligned_size) pairs.
         let mut entries: Vec<(u64, u64)> = Vec::new();
-        for s in slices {
+        for s in &slices {
             if s.is_empty() {
                 continue;
             }
@@ -1116,7 +1121,7 @@ impl BStackBulkAllocator for GhostTreeBstackAllocator {
 mod tests {
     use super::*;
     use crate::BStack;
-    use crate::alloc::{BStackAllocator, BStackBulkAllocator, BStackSlice};
+    use crate::alloc::{BStackAllocator, BStackBulkAllocator, BStackOwnedSlice};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     fn open_fresh() -> (GhostTreeBstackAllocator, std::path::PathBuf) {
@@ -1204,7 +1209,7 @@ mod tests {
     fn freed_block_is_zeroed() {
         let (alloc, path) = open_fresh();
         let _g = Guard(path);
-        let a = alloc.alloc(64).unwrap();
+        let mut a = alloc.alloc(64).unwrap();
         let b = alloc.alloc(64).unwrap();
         let a_start = a.start();
         a.write(&[0xAAu8; 64]).unwrap();
@@ -1292,7 +1297,7 @@ mod tests {
     fn realloc_same_aligned_size_preserves_data() {
         let (alloc, path) = open_fresh();
         let _g = Guard(path);
-        let s = alloc.alloc(32).unwrap();
+        let mut s = alloc.alloc(32).unwrap();
         s.write(&[0x5Au8; 32]).unwrap();
         let start = s.start();
         // Realloc to a different len with the same aligned block size.
@@ -1309,7 +1314,7 @@ mod tests {
     fn realloc_shrink_tail_discards() {
         let (alloc, path) = open_fresh();
         let _g = Guard(path);
-        let s = alloc.alloc(128).unwrap();
+        let mut s = alloc.alloc(128).unwrap();
         let start = s.start();
         s.write(&[0xBBu8; 128]).unwrap();
         let s2 = alloc.realloc(s, 32).unwrap();
@@ -1324,7 +1329,7 @@ mod tests {
     fn realloc_shrink_nontail_inserts_remainder() {
         let (alloc, path) = open_fresh();
         let _g = Guard(path);
-        let s = alloc.alloc(128).unwrap();
+        let mut s = alloc.alloc(128).unwrap();
         let anchor = alloc.alloc(32).unwrap();
         let start = s.start();
         s.write(&[0xCCu8; 128]).unwrap();
@@ -1345,7 +1350,7 @@ mod tests {
     fn realloc_grow_tail_extends_in_place() {
         let (alloc, path) = open_fresh();
         let _g = Guard(path);
-        let s = alloc.alloc(32).unwrap();
+        let mut s = alloc.alloc(32).unwrap();
         let start = s.start();
         s.write(&[0xDDu8; 32]).unwrap();
         let s2 = alloc.realloc(s, 96).unwrap();
@@ -1360,7 +1365,7 @@ mod tests {
     fn realloc_grow_nontail_copies_data() {
         let (alloc, path) = open_fresh();
         let _g = Guard(path);
-        let s = alloc.alloc(32).unwrap();
+        let mut s = alloc.alloc(32).unwrap();
         let anchor = alloc.alloc(32).unwrap();
         s.write(&[0xEEu8; 32]).unwrap();
         let s2 = alloc.realloc(s, 96).unwrap();
@@ -1380,7 +1385,7 @@ mod tests {
         let (alloc, path) = open_fresh();
         let _g = Guard(path);
         let s = alloc.alloc(64).unwrap();
-        let bad = unsafe { BStackSlice::from_raw_parts(&alloc, s.start() + 1, 32) };
+        let bad = unsafe { BStackOwnedSlice::from_raw_parts(&alloc, s.start() + 1, 32) };
         assert!(alloc.dealloc(bad).is_err());
         alloc.dealloc(s).unwrap();
     }
@@ -1390,7 +1395,7 @@ mod tests {
         let (alloc, path) = open_fresh();
         let _g = Guard(path);
         let s = alloc.alloc(64).unwrap();
-        let bad = unsafe { BStackSlice::from_raw_parts(&alloc, s.start() + 1, 32) };
+        let bad = unsafe { BStackOwnedSlice::from_raw_parts(&alloc, s.start() + 1, 32) };
         assert!(alloc.realloc(bad, 64).is_err());
         alloc.dealloc(s).unwrap();
     }
@@ -1462,7 +1467,7 @@ mod tests {
         let c = alloc2.alloc(128).unwrap();
         assert_eq!(c.start(), a_start);
         alloc2.dealloc(c).unwrap();
-        let anchor2 = unsafe { BStackSlice::from_raw_parts(&alloc2, anchor_start, 32) };
+        let anchor2 = unsafe { BStackOwnedSlice::from_raw_parts(&alloc2, anchor_start, 32) };
         alloc2.dealloc(anchor2).unwrap();
     }
 
@@ -1470,13 +1475,13 @@ mod tests {
     fn data_survives_reopen() {
         let (alloc, path) = open_fresh();
         let _g = Guard(path.clone());
-        let s = alloc.alloc(64).unwrap();
+        let mut s = alloc.alloc(64).unwrap();
         let start = s.start();
         s.write(&[0xABu8; 64]).unwrap();
         drop(alloc.into_stack());
 
         let alloc2 = reopen(&path);
-        let s2 = unsafe { BStackSlice::from_raw_parts(&alloc2, start, 64) };
+        let s2 = unsafe { BStackOwnedSlice::from_raw_parts(&alloc2, start, 64) };
         assert!(s2.read().unwrap().iter().all(|&b| b == 0xAB));
         alloc2.dealloc(s2).unwrap();
     }
@@ -1526,7 +1531,7 @@ mod tests {
                 thread::spawn(move || {
                     let a: &GhostTreeBstackAllocator = &alloc;
                     for _ in 0..ROUNDS {
-                        let slice = a.alloc(32).unwrap();
+                        let mut slice = a.alloc(32).unwrap();
                         let off = slice.start();
                         {
                             let mut set = live.lock().unwrap();
@@ -1580,7 +1585,10 @@ mod tests {
                 thread::spawn(move || {
                     let a: &GhostTreeBstackAllocator = &alloc;
                     let mut slice = a.alloc(SMALL).unwrap();
-                    slice.write(&[tid as u8; SMALL as usize]).unwrap();
+                    slice
+                        .as_slice_mut()
+                        .write(&[tid as u8; SMALL as usize])
+                        .unwrap();
 
                     for _ in 0..ROUNDS {
                         // Grow: tail → try_extend_zeros; non-tail → copy to new region.
@@ -1641,7 +1649,7 @@ mod tests {
                 thread::spawn(move || {
                     let a: &GhostTreeBstackAllocator = &alloc;
                     for _ in 0..ROUNDS {
-                        let slices = a.alloc_bulk(SIZES).unwrap();
+                        let mut slices = a.alloc_bulk(SIZES).unwrap();
                         {
                             let mut set = live.lock().unwrap();
                             for s in &slices {
@@ -1652,8 +1660,10 @@ mod tests {
                                 );
                             }
                         }
-                        for (s, &sz) in slices.iter().zip(SIZES.iter()) {
-                            s.write(&vec![tid as u8; sz as usize]).unwrap();
+                        for (s, &sz) in slices.iter_mut().zip(SIZES.iter()) {
+                            s.as_slice_mut()
+                                .write(&vec![tid as u8; sz as usize])
+                                .unwrap();
                             let data = s.read().unwrap();
                             assert_eq!(data, vec![tid as u8; sz as usize]);
                         }
