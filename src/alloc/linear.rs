@@ -1,4 +1,4 @@
-use super::{BStackAllocator, BStackBulkAllocator, BStackSlice};
+use super::{BStackAllocator, BStackBulkAllocator, BStackOwnedSlice};
 use crate::BStack;
 #[cfg(not(feature = "atomic"))]
 use std::cell::Cell;
@@ -66,8 +66,8 @@ use std::{fmt, io};
 ///
 /// # fn main() -> std::io::Result<()> {
 /// let alloc = LinearBStackAllocator::new(BStack::open("data.bstack")?);
-/// let slice = alloc.alloc(128)?;
-/// let data = slice.read()?;
+/// let mut slice = alloc.alloc(128)?;
+/// let data = slice.as_slice().read()?;
 /// alloc.dealloc(slice)?;
 /// let stack = alloc.into_stack();
 /// # Ok(())
@@ -111,7 +111,7 @@ impl From<LinearBStackAllocator> for BStack {
 
 impl BStackAllocator for LinearBStackAllocator {
     type Error = io::Error;
-    type Allocated<'a> = BStackSlice<'a, Self>;
+    type Allocated<'a> = BStackOwnedSlice<'a, Self>;
 
     fn stack(&self) -> &BStack {
         &self.stack
@@ -121,20 +121,24 @@ impl BStackAllocator for LinearBStackAllocator {
         self.stack
     }
 
-    fn alloc(&self, len: u64) -> io::Result<BStackSlice<'_, Self>> {
+    fn alloc(&self, len: u64) -> io::Result<BStackOwnedSlice<'_, Self>> {
         let offset = self.stack.extend(len)?;
-        // SAFETY: offset and len come from a fresh allocation via self.stack.extend(len)
-        Ok(unsafe { BStackSlice::from_raw_parts(self, offset, len) })
+        // SAFETY: offset and len come from a fresh allocation via self.stack.extend
+        Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, offset, len) })
     }
 
     #[cfg(not(feature = "atomic"))]
     fn realloc<'a>(
         &'a self,
-        slice: BStackSlice<'a, Self>,
+        handle: BStackOwnedSlice<'a, Self>,
         new_len: u64,
-    ) -> io::Result<BStackSlice<'a, Self>> {
+    ) -> io::Result<BStackOwnedSlice<'a, Self>> {
+        let start = handle.start();
+        let old_len = handle.len();
+        let end = handle.end();
+        // handle is dropped here (no-op Drop); we reconstruct below on success
         let current_tail = self.stack.len()?;
-        if slice.end() != current_tail {
+        if end != current_tail {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "LinearBStackAllocator does not support reallocation of non-tail slices; \
@@ -142,17 +146,20 @@ impl BStackAllocator for LinearBStackAllocator {
                  Note: dealloc of the old (non-tail) slice is also a no-op and leaks the region.",
             ));
         }
-        match new_len.cmp(&slice.len()) {
-            std::cmp::Ordering::Equal => Ok(slice),
+        match new_len.cmp(&old_len) {
+            std::cmp::Ordering::Equal => {
+                // SAFETY: same region, reconstructed handle
+                Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, start, old_len) })
+            }
             std::cmp::Ordering::Greater => {
-                self.stack.extend(new_len - slice.len())?;
-                // SAFETY: slice was previously allocated and we're extending it in place at the tail
-                Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) })
+                self.stack.extend(new_len - old_len)?;
+                // SAFETY: tail was extended in place
+                Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, start, new_len) })
             }
             std::cmp::Ordering::Less => {
-                self.stack.discard(slice.len() - new_len)?;
-                // SAFETY: slice was previously allocated and we're shrinking it in place
-                Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) })
+                self.stack.discard(old_len - new_len)?;
+                // SAFETY: tail was shrunk in place
+                Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, start, new_len) })
             }
         }
     }
@@ -160,20 +167,25 @@ impl BStackAllocator for LinearBStackAllocator {
     // With the `atomic` feature the tail check and the modification are a
     // single locked step (`try_extend`/`try_discard`), eliminating the TOCTOU
     // race that exists in the non-atomic version.  A `false` return means
-    // another thread moved the tail first; we surface this as `Unsupported`,
-    // the same error returned for a non-tail slice on a single thread.
+    // another thread moved the tail first; we surface this as `Unsupported`.
     #[cfg(feature = "atomic")]
     fn realloc<'a>(
         &'a self,
-        slice: BStackSlice<'a, Self>,
+        handle: BStackOwnedSlice<'a, Self>,
         new_len: u64,
-    ) -> io::Result<BStackSlice<'a, Self>> {
-        match new_len.cmp(&slice.len()) {
-            std::cmp::Ordering::Equal => Ok(slice),
+    ) -> io::Result<BStackOwnedSlice<'a, Self>> {
+        let start = handle.start();
+        let old_len = handle.len();
+        let end = handle.end();
+        // handle dropped (no-op); reconstruct below on success
+        match new_len.cmp(&old_len) {
+            std::cmp::Ordering::Equal => {
+                Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, start, old_len) })
+            }
             std::cmp::Ordering::Greater => {
-                let delta = new_len - slice.len();
+                let delta = new_len - old_len;
                 let zeros = vec![0u8; delta as usize];
-                if !self.stack.try_extend(slice.end(), zeros)? {
+                if !self.stack.try_extend(end, zeros)? {
                     return Err(io::Error::new(
                         io::ErrorKind::Unsupported,
                         "LinearBStackAllocator does not support reallocation of non-tail slices; \
@@ -181,11 +193,11 @@ impl BStackAllocator for LinearBStackAllocator {
                          Note: dealloc of the old (non-tail) slice is also a no-op and leaks the region.",
                     ));
                 }
-                // SAFETY: slice was previously allocated and we atomically extended it in place
-                Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) })
+                // SAFETY: tail atomically extended in place
+                Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, start, new_len) })
             }
             std::cmp::Ordering::Less => {
-                if !self.stack.try_discard(slice.end(), slice.len() - new_len)? {
+                if !self.stack.try_discard(end, old_len - new_len)? {
                     return Err(io::Error::new(
                         io::ErrorKind::Unsupported,
                         "LinearBStackAllocator does not support reallocation of non-tail slices; \
@@ -193,25 +205,27 @@ impl BStackAllocator for LinearBStackAllocator {
                          Note: dealloc of the old (non-tail) slice is also a no-op and leaks the region.",
                     ));
                 }
-                // SAFETY: slice was previously allocated and we atomically shrunk it in place
-                Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) })
+                // SAFETY: tail atomically shrunk in place
+                Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, start, new_len) })
             }
         }
     }
 
     #[cfg(not(feature = "atomic"))]
-    fn dealloc(&self, slice: BStackSlice<'_, Self>) -> io::Result<()> {
+    fn dealloc(&self, handle: BStackOwnedSlice<'_, Self>) -> io::Result<()> {
+        let end = handle.end();
+        let len = handle.len();
         let current_tail = self.stack.len()?;
-        if slice.end() == current_tail {
-            self.stack.discard(slice.len())?;
+        if end == current_tail {
+            self.stack.discard(len)?;
         }
         Ok(())
     }
 
     #[cfg(feature = "atomic")]
-    fn dealloc(&self, slice: BStackSlice<'_, Self>) -> io::Result<()> {
+    fn dealloc(&self, handle: BStackOwnedSlice<'_, Self>) -> io::Result<()> {
         // try_discard is a no-op when the tail has moved, matching non-tail dealloc semantics.
-        self.stack.try_discard(slice.end(), slice.len())?;
+        self.stack.try_discard(handle.end(), handle.len())?;
         Ok(())
     }
 }
@@ -254,7 +268,7 @@ impl BStackBulkAllocator for LinearBStackAllocator {
         let mut offset = base;
         for &len in lengths {
             // SAFETY: offset and len are within the bulk allocation starting at base
-            result.push(unsafe { BStackSlice::from_raw_parts(self, offset, len) });
+            result.push(unsafe { BStackOwnedSlice::from_raw_parts(self, offset, len) });
             offset += len;
         }
         Ok(result)
@@ -263,37 +277,31 @@ impl BStackBulkAllocator for LinearBStackAllocator {
     /// Reclaim the largest contiguous region at the tail with a single
     /// [`BStack::discard`] call.
     ///
-    /// Slices that form a contiguous sequence ending at the current tail are
-    /// all removed in one operation.  Slices that do not touch the tail (or
-    /// that are separated from the tail by slices not included in `slices`)
+    /// Handles that form a contiguous sequence ending at the current tail are
+    /// all removed in one operation.  Handles that do not touch the tail (or
+    /// that are separated from the tail by handles not included in `handles`)
     /// are silently ignored, matching the single-item
     /// [`dealloc`](BStackAllocator::dealloc) semantics.
     ///
-    /// # Duplicates and overlapping slices
+    /// # Duplicates and overlapping handles
     ///
-    /// Duplicate or overlapping slices are silently coalesced — no error is
+    /// Duplicate or overlapping handles are silently coalesced — no error is
     /// returned, and only the bytes they collectively cover are discarded once.
-    /// Callers that pass the same handle twice or supply overlapping sub-slices
-    /// will not observe data corruption, but the silent swallowing of the
-    /// programmer error may mask bugs. Add a debug assertion at the call site
-    /// if uniqueness must be enforced.
     #[cfg(not(feature = "atomic"))]
     fn dealloc_bulk<'a>(
         &'a self,
-        slices: impl AsRef<[Self::Allocated<'a>]>,
+        handles: impl IntoIterator<Item = Self::Allocated<'a>>,
     ) -> Result<(), Self::Error> {
-        let slices = slices.as_ref();
-        if slices.is_empty() {
+        let current_tail = self.stack.len()?;
+        let mut sorted: Vec<BStackOwnedSlice<'a, Self>> = handles.into_iter().collect();
+        if sorted.is_empty() {
             return Ok(());
         }
-        let current_tail = self.stack.len()?;
-        // Walk from the tail backwards, collecting contiguous covered bytes.
-        let mut sorted: Vec<BStackSlice<'_, Self>> = slices.to_vec();
         sorted.sort_by_key(|s| std::cmp::Reverse(s.end()));
         let mut discard_start = current_tail;
-        for slice in &sorted {
-            if slice.end() == discard_start {
-                discard_start = slice.start();
+        for handle in &sorted {
+            if handle.end() == discard_start {
+                discard_start = handle.start();
             }
         }
         let to_discard = current_tail - discard_start;
@@ -306,24 +314,22 @@ impl BStackBulkAllocator for LinearBStackAllocator {
     // With `atomic`, we snapshot the tail once to determine what to discard,
     // then use `try_discard` to make the actual removal atomic.  If another
     // thread has moved the tail since the snapshot, `try_discard` returns
-    // `false` and the discard is silently skipped — same semantics as
-    // non-tail `dealloc` on a single thread.
+    // `false` and the discard is silently skipped.
     #[cfg(feature = "atomic")]
     fn dealloc_bulk<'a>(
         &'a self,
-        slices: impl AsRef<[Self::Allocated<'a>]>,
+        handles: impl IntoIterator<Item = Self::Allocated<'a>>,
     ) -> Result<(), Self::Error> {
-        let slices = slices.as_ref();
-        if slices.is_empty() {
+        let current_tail = self.stack.len()?;
+        let mut sorted: Vec<BStackOwnedSlice<'a, Self>> = handles.into_iter().collect();
+        if sorted.is_empty() {
             return Ok(());
         }
-        let current_tail = self.stack.len()?;
-        let mut sorted: Vec<BStackSlice<'_, Self>> = slices.to_vec();
         sorted.sort_by_key(|s| std::cmp::Reverse(s.end()));
         let mut discard_start = current_tail;
-        for slice in &sorted {
-            if slice.end() == discard_start {
-                discard_start = slice.start();
+        for handle in &sorted {
+            if handle.end() == discard_start {
+                discard_start = handle.start();
             }
         }
         let to_discard = current_tail - discard_start;
