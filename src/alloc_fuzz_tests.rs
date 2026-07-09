@@ -2,8 +2,8 @@
 
 mod alloc_fuzz_tests {
     use crate::alloc::{
-        BStackSlice, BStackSliceAllocator, FirstFitBStackAllocator, GhostTreeBstackAllocator,
-        SlabBStackAllocator,
+        BStackOwnedSlice, BStackOwnedSliceAllocator, BStackRange, FirstFitBStackAllocator,
+        GhostTreeBstackAllocator, SlabBStackAllocator,
     };
     use crate::{BStack, CheckedSlabBStackAllocator};
     use rand::RngExt;
@@ -47,13 +47,13 @@ mod alloc_fuzz_tests {
         }
     }
 
-    fn write_id<A: BStackSliceAllocator>(s: &BStackSlice<'_, A>, id: u64) {
+    fn write_id<A: BStackOwnedSliceAllocator>(s: &mut BStackOwnedSlice<'_, A>, id: u64) {
         let mut buf = vec![0u8; s.len() as usize];
         fill(&mut buf, id);
         s.write(&buf).unwrap();
     }
 
-    fn verify_id<A: BStackSliceAllocator>(s: &BStackSlice<'_, A>, id: u64, ctx: &str) {
+    fn verify_id<A: BStackOwnedSliceAllocator>(s: &BStackOwnedSlice<'_, A>, id: u64, ctx: &str) {
         check(&s.read().unwrap(), id, ctx);
     }
 
@@ -61,7 +61,7 @@ mod alloc_fuzz_tests {
 
     fn run_alloc_dealloc<A, F>(make: F)
     where
-        A: BStackSliceAllocator,
+        A: BStackOwnedSliceAllocator,
         F: Fn(BStack) -> std::io::Result<A>,
     {
         let path = temp_path("ad");
@@ -73,9 +73,9 @@ mod alloc_fuzz_tests {
         for _ in 0..FUZZ_COUNT {
             if rng.random_bool(0.7) || live.is_empty() {
                 let size = rng.random_range(0..=1024);
-                if let Ok(s) = alloc.alloc(size) {
+                if let Ok(mut s) = alloc.alloc(size) {
                     let id = live.len() as u64;
-                    write_id(&s, id);
+                    write_id(&mut s, id);
                     live.push((s, id));
                 }
             } else {
@@ -89,7 +89,7 @@ mod alloc_fuzz_tests {
 
     fn run_alloc_realloc_dealloc<A, F>(make: F)
     where
-        A: BStackSliceAllocator,
+        A: BStackOwnedSliceAllocator,
         F: Fn(BStack) -> std::io::Result<A>,
     {
         let path = temp_path("ard");
@@ -101,9 +101,9 @@ mod alloc_fuzz_tests {
         for _ in 0..FUZZ_COUNT {
             if rng.random_bool(0.6) || live.is_empty() {
                 let size = rng.random_range(0..=1024);
-                if let Ok(s) = alloc.alloc(size) {
+                if let Ok(mut s) = alloc.alloc(size) {
                     let id = live.len() as u64;
-                    write_id(&s, id);
+                    write_id(&mut s, id);
                     live.push((s, id));
                 }
             } else {
@@ -112,14 +112,14 @@ mod alloc_fuzz_tests {
                 if rng.random_bool(0.8) {
                     let new_size = rng.random_range(0..=1024);
                     let old_len = s.len();
-                    if let Ok(s2) = alloc.realloc(s, new_size) {
+                    if let Ok(mut s2) = alloc.realloc(s, new_size) {
                         let buf = s2.read().unwrap();
                         let overlap = old_len.min(new_size) as usize;
                         check(&buf[..overlap], id, &format!("realloc {id} overlap"));
                         for (j, &b) in buf.iter().enumerate().skip(overlap) {
                             assert_eq!(b, 0, "realloc {id}: non-zero at new byte [{j}]");
                         }
-                        write_id(&s2, id);
+                        write_id(&mut s2, id);
                         live.push((s2, id));
                     }
                 } else {
@@ -132,34 +132,28 @@ mod alloc_fuzz_tests {
 
     fn run_reopen<A, F>(make: F)
     where
-        A: BStackSliceAllocator,
+        A: BStackOwnedSliceAllocator,
         F: Fn(BStack) -> std::io::Result<A>,
     {
-        #[derive(Clone, Copy)]
-        struct Rec {
-            start: u64,
-            len: u64,
-            id: u64,
-        }
-
         let path = temp_path("reopen");
         let _guard = Guard(path.clone());
         drop(make(BStack::open(&path).unwrap()).unwrap());
 
         let mut rng = rand::rng();
-        let mut live: Vec<Rec> = Vec::new();
+        let mut live: Vec<(BStackRange, u64)> = Vec::new();
         let mut next_id: u64 = 1;
 
         for session in 0..SESSIONS {
             let alloc = make(BStack::open(&path).unwrap()).unwrap();
 
-            for (i, &rec) in live.iter().enumerate() {
-                let s = unsafe { BStackSlice::from_raw_parts(&alloc, rec.start, rec.len) };
+            for (i, &(range, id)) in live.iter().enumerate() {
+                let s = unsafe { BStackOwnedSlice::from_raw_parts(&alloc, range.start(), range.len()) };
                 check(
-                    &s.read().unwrap()[..rec.len as usize],
-                    rec.id,
+                    &s.read().unwrap()[..range.len() as usize],
+                    id,
                     &format!("s{session} rec{i}"),
                 );
+                // Drop s without dealloc (no-op Drop).
             }
 
             for _ in 0..OPS_PER_SESSION {
@@ -171,59 +165,55 @@ mod alloc_fuzz_tests {
                 match choice {
                     0 => {
                         let len = rng.random_range(0..=512);
-                        if let Ok(s) = alloc.alloc(len) {
+                        if let Ok(mut s) = alloc.alloc(len) {
                             let id = next_id;
                             next_id += 1;
-                            write_id(&s, id);
-                            live.push(Rec {
-                                start: s.start(),
-                                len,
-                                id,
-                            });
+                            write_id(&mut s, id);
+                            live.push((BStackRange::new(s.start(), len), id));
                         }
                     }
                     1 => {
                         let i = rng.random_range(0..live.len());
-                        let rec = live[i];
+                        let (range, id) = live[i];
                         let new_len = rng.random_range(0..=512);
-                        let s = unsafe { BStackSlice::from_raw_parts(&alloc, rec.start, rec.len) };
-                        if let Ok(s2) = alloc.realloc(s, new_len) {
-                            let overlap = rec.len.min(new_len) as usize;
+                        let s =
+                            unsafe { BStackOwnedSlice::from_raw_parts(&alloc, range.start(), range.len()) };
+                        if let Ok(mut s2) = alloc.realloc(s, new_len) {
+                            let overlap = range.len().min(new_len) as usize;
                             check(
                                 &s2.read().unwrap()[..overlap],
-                                rec.id,
+                                id,
                                 &format!("s{session} realloc{i}"),
                             );
-                            let id = next_id;
+                            let new_id = next_id;
                             next_id += 1;
-                            write_id(&s2, id);
-                            live[i] = Rec {
-                                start: s2.start(),
-                                len: new_len,
-                                id,
-                            };
+                            write_id(&mut s2, new_id);
+                            live[i] = (BStackRange::new(s2.start(), new_len), new_id);
                         }
                     }
                     2 => {
                         let i = rng.random_range(0..live.len());
-                        let rec = live.swap_remove(i);
-                        let s = unsafe { BStackSlice::from_raw_parts(&alloc, rec.start, rec.len) };
+                        let (range, id) = live.swap_remove(i);
+                        let s =
+                            unsafe { BStackOwnedSlice::from_raw_parts(&alloc, range.start(), range.len()) };
                         check(
-                            &s.read().unwrap()[..rec.len as usize],
-                            rec.id,
+                            &s.read().unwrap()[..range.len() as usize],
+                            id,
                             &format!("s{session} dealloc{i}"),
                         );
                         alloc.dealloc(s).unwrap();
                     }
                     _ => {
                         let i = rng.random_range(0..live.len());
-                        let rec = live[i];
-                        let s = unsafe { BStackSlice::from_raw_parts(&alloc, rec.start, rec.len) };
+                        let (range, id) = live[i];
+                        let s =
+                            unsafe { BStackOwnedSlice::from_raw_parts(&alloc, range.start(), range.len()) };
                         check(
-                            &s.read().unwrap()[..rec.len as usize],
-                            rec.id,
+                            &s.read().unwrap()[..range.len() as usize],
+                            id,
                             &format!("s{session} verify{i}"),
                         );
+                        // No dealloc — Drop is no-op.
                     }
                 }
             }
@@ -237,7 +227,7 @@ mod alloc_fuzz_tests {
     // ensure that all allocators provided by the crate itself handle zero-size allocs correctly.
     fn run_zero_size_alloc<A, F>(make: F)
     where
-        A: BStackSliceAllocator,
+        A: BStackOwnedSliceAllocator,
         F: Fn(BStack) -> std::io::Result<A>,
     {
         let path = temp_path("zalloc");
@@ -261,7 +251,7 @@ mod alloc_fuzz_tests {
     // allocations does not cause any corruption or panics.
     fn run_free_zero_slices<A, F>(make: F)
     where
-        A: BStackSliceAllocator,
+        A: BStackOwnedSliceAllocator,
         F: Fn(BStack) -> std::io::Result<A>,
     {
         let path = temp_path("fzero");
@@ -277,8 +267,8 @@ mod alloc_fuzz_tests {
             alloc.dealloc(zero).unwrap();
 
             if rng.random_bool(0.5) || live.is_empty() {
-                let s = alloc.alloc(rng.random_range(16..=256)).unwrap();
-                write_id(&s, i as u64);
+                let mut s = alloc.alloc(rng.random_range(16..=256)).unwrap();
+                write_id(&mut s, i as u64);
                 live.push((s, i as u64));
             } else {
                 let idx = rng.random_range(0..live.len());
@@ -291,15 +281,13 @@ mod alloc_fuzz_tests {
 
     // This tests that attempting to free the same slice twice results in an error rather than panicking
     // or corrupting the allocator state. We test this by allocating three adjacent slices, freeing the
-    // middle one, then reconstructing a handle to the same region and freeing it again.
+    // middle one, then reconstructing a handle to the same region via from_raw_parts and freeing it again.
     //
-    // This is not strictly required by the API, since the slice-origin requirement already makes it UB
-    // to construct a handle to the same region. However, it is beneficial for allocators provided by
-    // this crate to handle this case gracefully and return an error rather than panic or corrupt state,
-    // so we test it explicitly.
+    // It is beneficial for allocators provided by this crate to handle this case gracefully and return
+    // an error rather than panic or corrupt state, so we test it explicitly.
     fn run_double_free_error<A, F>(make: F)
     where
-        A: BStackSliceAllocator,
+        A: BStackOwnedSliceAllocator,
         F: Fn(BStack) -> std::io::Result<A>,
     {
         let path = temp_path("dfree");
@@ -315,7 +303,7 @@ mod alloc_fuzz_tests {
         alloc.dealloc(target).unwrap();
 
         // Reconstruct a handle to the same region and free it a second time.
-        let again = unsafe { BStackSlice::from_raw_parts(&alloc, start, len) };
+        let again = unsafe { BStackOwnedSlice::from_raw_parts(&alloc, start, len) };
         let result = alloc.dealloc(again);
         assert!(result.is_err(), "double-free must return an error");
 
