@@ -4,7 +4,7 @@
 //! O(1) alloc and dealloc by keeping all blocks the same size and tracking
 //! freed blocks in an intrusive singly-linked free list.
 
-use super::{BStackAllocator, BStackSlice};
+use super::{BStackAllocator, BStackOwnedSlice};
 use crate::BStack;
 #[cfg(feature = "atomic")]
 use crate::BStackGenOp;
@@ -538,7 +538,7 @@ impl fmt::Debug for SlabBStackAllocator {
 #[cfg(feature = "set")]
 impl BStackAllocator for SlabBStackAllocator {
     type Error = io::Error;
-    type Allocated<'a> = BStackSlice<'a, Self>;
+    type Allocated<'a> = BStackOwnedSlice<'a, Self>;
 
     fn stack(&self) -> &BStack {
         &self.stack
@@ -558,19 +558,19 @@ impl BStackAllocator for SlabBStackAllocator {
     /// | slab, free list hit | 4 (2× `get_into` + `set` + `zero`) | crash may leak popped block |
     /// | slab, tail extend | 1 (`extend`) | crash-safe by inheritance |
     /// | oversized | 1 (`extend`) | crash-safe by inheritance |
-    fn alloc(&self, len: u64) -> io::Result<BStackSlice<'_, Self>> {
+    fn alloc(&self, len: u64) -> io::Result<BStackOwnedSlice<'_, Self>> {
         if len == 0 {
-            return Ok(BStackSlice::empty(self));
+            return Ok(BStackOwnedSlice::empty(self));
         }
 
         if len <= self.block_size {
             if let Some(block) = self.pop_free_block()? {
                 // SAFETY: block is a valid block_size region from pop_free_block
-                return Ok(unsafe { BStackSlice::from_raw_parts(self, block.into(), len) });
+                return Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, block.into(), len) });
             }
             let offset = self.stack.extend(self.block_size)?;
             // SAFETY: offset from a fresh tail extension of block_size bytes
-            return Ok(unsafe { BStackSlice::from_raw_parts(self, offset, len) });
+            return Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, offset, len) });
         }
 
         let n = len.div_ceil(self.block_size);
@@ -579,7 +579,7 @@ impl BStackAllocator for SlabBStackAllocator {
         })?;
         let offset = self.stack.extend(total)?;
         // SAFETY: offset from a fresh tail extension of n * block_size bytes
-        Ok(unsafe { BStackSlice::from_raw_parts(self, offset, len) })
+        Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, offset, len) })
     }
 
     /// Release the region described by `slice`.
@@ -593,7 +593,7 @@ impl BStackAllocator for SlabBStackAllocator {
     /// | slab / oversized non-tail | 3 total (`get_into` + bulk `set` + `set`) | crash leaks entire freed batch |
     ///
     /// Double-freeing a slice corrupts the free list; this allocator does not guard against it.
-    fn dealloc(&self, slice: BStackSlice<'_, Self>) -> io::Result<()> {
+    fn dealloc(&self, slice: BStackOwnedSlice<'_, Self>) -> io::Result<()> {
         if slice.is_empty() && slice.start() == Self::SENTINEL {
             return Ok(());
         }
@@ -641,15 +641,15 @@ impl BStackAllocator for SlabBStackAllocator {
     /// | Grow, non-tail | Allocate fresh region, copy, release old |
     fn realloc<'a>(
         &'a self,
-        slice: BStackSlice<'a, Self>,
+        slice: BStackOwnedSlice<'a, Self>,
         new_len: u64,
-    ) -> io::Result<BStackSlice<'a, Self>> {
+    ) -> io::Result<BStackOwnedSlice<'a, Self>> {
         if slice.is_empty() && slice.start() == Self::SENTINEL {
             return self.alloc(new_len);
         }
         if new_len == 0 {
             self.dealloc(slice)?;
-            return Ok(BStackSlice::empty(self));
+            return Ok(BStackOwnedSlice::empty(self));
         }
         if new_len == slice.len() {
             return Ok(slice);
@@ -666,7 +666,7 @@ impl BStackAllocator for SlabBStackAllocator {
                 self.stack.zero(slice.end(), new_len - slice.len())?;
             }
             // SAFETY: new_len still fits within the same block_size-aligned region
-            return Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) });
+            return Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, slice.start(), new_len) });
         }
 
         let old_backing = old_n.checked_mul(self.block_size).ok_or_else(|| {
@@ -700,7 +700,9 @@ impl BStackAllocator for SlabBStackAllocator {
                     self.stack.zero(slice.end(), new_len - slice.len())?;
                 }
                 // SAFETY: slice extended in place at the tail
-                return Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) });
+                return Ok(unsafe {
+                    BStackOwnedSlice::from_raw_parts(self, slice.start(), new_len)
+                });
             }
 
             #[cfg(not(feature = "atomic"))]
@@ -710,7 +712,9 @@ impl BStackAllocator for SlabBStackAllocator {
                     self.stack.zero(slice.end(), new_len - slice.len())?;
                 }
                 // SAFETY: slice extended in place at the tail
-                return Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) });
+                return Ok(unsafe {
+                    BStackOwnedSlice::from_raw_parts(self, slice.start(), new_len)
+                });
             }
 
             // Grow non-tail: copy data into a fresh region, then free the old blocks.
@@ -733,7 +737,7 @@ impl BStackAllocator for SlabBStackAllocator {
             let new_ptr = self.stack.push(data_buf)?;
             self.push_free_blocks(slice.start(), old_n)?;
             // SAFETY: new_len fits within the new_n blocks of the newly pushed region
-            return Ok(unsafe { BStackSlice::from_raw_parts(self, new_ptr, new_len) });
+            return Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, new_ptr, new_len) });
         }
 
         // Shrink path (new_n < old_n).
@@ -747,14 +751,14 @@ impl BStackAllocator for SlabBStackAllocator {
             .try_discard(checked_len, old_backing - new_backing)?
         {
             // SAFETY: slice shrunk in place at the tail
-            return Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) });
+            return Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, slice.start(), new_len) });
         }
 
         #[cfg(not(feature = "atomic"))]
         if checked_len == self.stack.len()? {
             self.stack.discard(old_backing - new_backing)?;
             // SAFETY: slice shrunk in place at the tail
-            return Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) });
+            return Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, slice.start(), new_len) });
         }
 
         // Shrink non-tail: recycle excess blocks into the free list.
@@ -771,7 +775,7 @@ impl BStackAllocator for SlabBStackAllocator {
             })?;
         self.push_free_blocks(free_start, old_n - new_n)?;
         // SAFETY: new_len fits within the first new_n retained blocks
-        Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) })
+        Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, slice.start(), new_len) })
     }
 }
 
@@ -795,7 +799,7 @@ mod _assertions {
 mod tests {
     use super::SlabBStackAllocator;
     use crate::BStack;
-    use crate::alloc::BStackAllocator;
+    use crate::alloc::{BStackAllocator, BStackSlice};
     use std::io::ErrorKind;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -985,9 +989,9 @@ mod tests {
         let (stack, path) = empty_stack();
         let _g = Guard(path);
         let alloc = SlabBStackAllocator::new(stack, 16).unwrap();
-        let s = alloc.alloc(12).unwrap();
-        s.write(b"hello world!").unwrap();
-        assert_eq!(s.read().unwrap(), b"hello world!");
+        let mut s = alloc.alloc(12).unwrap();
+        s.as_slice_mut().write(b"hello world!").unwrap();
+        assert_eq!(s.as_slice().read().unwrap(), b"hello world!");
     }
 
     #[test]
@@ -995,13 +999,13 @@ mod tests {
         let (stack, path) = empty_stack();
         let _g = Guard(path.clone());
         let alloc = SlabBStackAllocator::new(stack, 16).unwrap();
-        let s = alloc.alloc(5).unwrap();
+        let mut s = alloc.alloc(5).unwrap();
         let offset = s.start();
-        s.write(b"hello").unwrap();
+        s.as_slice_mut().write(b"hello").unwrap();
         drop(alloc);
 
         let alloc2 = SlabBStackAllocator::open(BStack::open(&path).unwrap()).unwrap();
-        let s2 = unsafe { crate::alloc::BStackSlice::from_raw_parts(&alloc2, offset, 5) };
+        let s2 = unsafe { BStackSlice::from_raw_parts(alloc2.stack(), offset, 5) };
         assert_eq!(s2.read().unwrap(), b"hello");
     }
 
@@ -1036,14 +1040,14 @@ mod tests {
                 thread::spawn(move || {
                     let a: &SlabBStackAllocator = &alloc;
                     for _ in 0..ROUNDS {
-                        let slice = a.alloc(16).unwrap();
+                        let mut slice = a.alloc(16).unwrap();
                         let off = slice.start();
                         {
                             let mut set = live.lock().unwrap();
                             assert!(set.insert(off), "duplicate live offset {off}");
                         }
-                        slice.write(&[tid as u8; 16]).unwrap();
-                        let data = slice.read().unwrap();
+                        slice.as_slice_mut().write(&[tid as u8; 16]).unwrap();
+                        let data = slice.as_slice().read().unwrap();
                         assert_eq!(data, vec![tid as u8; 16]);
                         {
                             let mut set = live.lock().unwrap();
@@ -1089,12 +1093,15 @@ mod tests {
                 thread::spawn(move || {
                     let a: &SlabBStackAllocator = &alloc;
                     let mut slice = a.alloc(SMALL).unwrap();
-                    slice.write(&[tid as u8; SMALL as usize]).unwrap();
+                    slice
+                        .as_slice_mut()
+                        .write(&[tid as u8; SMALL as usize])
+                        .unwrap();
 
                     for _ in 0..ROUNDS {
                         // Grow: tail → try_extend_zeros; non-tail → copy to new region.
                         slice = a.realloc(slice, LARGE).unwrap();
-                        let data = slice.read().unwrap();
+                        let data = slice.as_slice().read().unwrap();
                         assert_eq!(
                             &data[..SMALL as usize],
                             &[tid as u8; SMALL as usize],
@@ -1103,7 +1110,7 @@ mod tests {
 
                         // Shrink: tail → try_discard; non-tail → recycle excess blocks.
                         slice = a.realloc(slice, SMALL).unwrap();
-                        let data = slice.read().unwrap();
+                        let data = slice.as_slice().read().unwrap();
                         assert_eq!(
                             data,
                             vec![tid as u8; SMALL as usize],
