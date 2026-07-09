@@ -169,10 +169,7 @@ impl BStackAllocator for SequenceBumpAllocator {
         })
     }
 
-    fn dealloc<'a>(
-        &'a self,
-        handle: StampedSlice<'a>,
-    ) -> Result<(), BStackAllocError<'a, Self>> {
+    fn dealloc<'a>(&'a self, handle: StampedSlice<'a>) -> Result<(), BStackAllocError<'a, Self>> {
         let start = handle.inner.start();
         let len = handle.inner.len();
         let end = handle.inner.end();
@@ -244,7 +241,9 @@ fn main() -> io::Result<()> {
         // Non-tail realloc returns the custom NotTail variant, and hands the
         // original handle back so it is not leaked.
         let err = alloc.realloc(a, 32).unwrap_err();
-        let a = err.handle.expect("failed realloc returns the original handle");
+        let a = err
+            .handle
+            .expect("failed realloc returns the original handle");
         match err.source {
             BumpError::NotTail => println!("realloc(a) → NotTail (original recovered)"),
             other => println!("realloc(a) → {other}"),
