@@ -61,10 +61,21 @@ impl<T: BStackBlock> BStackRef<T> {
     /// Buffer-based (no zero-copy without `mmap`): `buf` must be at least
     /// `size_of::<T::OnDisk>()` bytes. The returned reference borrows `buf`.
     pub fn read_on_disk<'b>(self, stack: &BStack, buf: &'b mut [u8]) -> io::Result<&'b T::OnDisk> {
-        // let slice = unsafe { BStackSlice::from_raw_range(stack, self.range) };
-        // slice.read_into(&mut buf[..size_of::<T::OnDisk>()])?;
-        // Ok(bytemuck::from_bytes(&buf[..size_of::<T::OnDisk>()]))
-        todo!("read_into buf via BStackSlice, then bytemuck::from_bytes")
+        let size = core::mem::size_of::<T::OnDisk>();
+        if buf.len() < size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("read_on_disk: buffer of {} < OnDisk size {size}", buf.len()),
+            ));
+        }
+        let dst = &mut buf[..size];
+        // `OnDisk` is `#[repr(C, packed)]` (alignment 1), so any buffer address is
+        // adequately aligned and `from_bytes` will not panic on alignment.
+        // `read_into` fills `min(dst.len(), block.len())`; for a fixed-size block
+        // those are equal.
+        let slice = unsafe { BStackSlice::from_raw_range(stack, self.range) };
+        slice.read_into(dst)?;
+        Ok(bytemuck::from_bytes(dst))
     }
 }
 

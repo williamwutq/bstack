@@ -7,30 +7,22 @@
 //! ([`crate::BStackOwned`], [`crate::BStackRc`], [`crate::BStackWeak`]) hold one
 //! of these plus an allocator reference.
 //!
-//! ## Open design note — what generic teardown needs from a block type
-//!
-//! The `todo!()` bodies below all need layout facts that only the concrete block
-//! type knows, and which the macro can generate. Before implementing them, we
-//! must decide how the block-type traits expose:
-//!
-//! * **Plain `(rc)`**: the byte offset of the inline `refcount` within `OnDisk`
-//!   (for [`StrongRef`]).
-//! * **`(rc, weak)`**: the `ctrl` back-pointer range out of the data `OnDisk`,
-//!   the `x` forward-pointer range out of the `Control` block, and the byte
-//!   offsets of `strong` / `weak` within `Control` (for [`StrongWeakRef`] /
-//!   [`WeakRef`] / `upgrade`).
-//!
-//! These are additive trait members (associated `const`s + small accessors) on
-//! [`crate::BStackBlock`] / [`crate::BStackWeakable`]; they are intentionally
-//! left out until we settle the shape, to avoid baking in surface prematurely.
+//! All the layout facts these teardowns need are constants in [`crate::layout`]
+//! (the injected refcount / control fields sit at fixed offsets after the
+//! header, per RAII.md) plus the `OnDisk` / `Control` sizes from
+//! [`BStackBlock`] / [`BStackWeakable`]. No per-type layout members are
+//! required.
 
+use core::mem::size_of;
 use std::io;
 
-use bstack::BStackOwnedSliceAllocator;
+use bstack::{BStackOwnedSliceAllocator, BStackRange};
 
 use crate::block::{BStackBlock, BStackWeakable};
+use crate::layout;
 use crate::reference::BStackRef;
-use crate::teardown::BStackDrop;
+use crate::refcount;
+use crate::teardown::{dealloc_range, BStackDrop};
 
 /// `#[bstack_owned]`: an exclusively-owned child.
 #[derive(Clone, Copy)]
@@ -38,6 +30,10 @@ pub struct OwnedRef<T>(pub BStackRef<T>);
 
 /// `#[bstack_strong]` on a plain `(rc)` `T`: holds just the data ref; teardown
 /// decrements the inline refcount and frees at zero.
+///
+/// The macro only emits this for children whose type is `#[bstack_block(rc)]`,
+/// so the inline `refcount` at [`layout::RC_REFCOUNT_OFFSET`] is guaranteed
+/// present; the type system does not otherwise enforce it.
 #[derive(Clone, Copy)]
 pub struct StrongRef<T>(pub BStackRef<T>);
 
@@ -52,6 +48,21 @@ pub struct StrongWeakRef<T: BStackWeakable>(pub BStackRef<T>, pub BStackRef<T::C
 #[derive(Clone, Copy)]
 pub struct WeakRef<T: BStackWeakable>(pub BStackRef<T::Control>);
 
+/// Read a data block's `ctrl` back-pointer (a `u64` offset at
+/// [`layout::CTRL_BACKPTR_OFFSET`]) and resolve it to a typed control ref,
+/// recovering the control block's length from `size_of::<T::Control>()`.
+fn read_ctrl_ref<T: BStackWeakable, A: BStackOwnedSliceAllocator>(
+    data_ref: BStackRef<T>,
+    allocator: &A,
+) -> io::Result<BStackRef<T::Control>> {
+    let pos = data_ref.into_range().start() + layout::CTRL_BACKPTR_OFFSET;
+    let mut bytes = [0u8; 8];
+    allocator.stack().get_into(pos, &mut bytes)?;
+    let ctrl_offset = u64::from_le_bytes(bytes);
+    let ctrl_range = BStackRange::new(ctrl_offset, size_of::<T::Control>() as u64);
+    Ok(unsafe { BStackRef::from_range(ctrl_range) })
+}
+
 impl<T: BStackBlock> BStackDrop for OwnedRef<T> {
     fn bstack_drop<A: BStackOwnedSliceAllocator>(self, allocator: &A) -> io::Result<()> {
         // An owned child is freed by running the block's own recursive teardown,
@@ -62,45 +73,68 @@ impl<T: BStackBlock> BStackDrop for OwnedRef<T> {
 
 impl<T: BStackBlock> BStackDrop for StrongRef<T> {
     fn bstack_drop<A: BStackOwnedSliceAllocator>(self, allocator: &A) -> io::Result<()> {
-        // CAS-decrement the inline refcount; at zero, run T's teardown.
-        todo!("decrement inline refcount (needs refcount offset); free at zero")
+        let data_range = self.0.into_range();
+        let off = data_range.start() + layout::RC_REFCOUNT_OFFSET;
+        // Decrement the inline refcount; only the last owner frees the block.
+        if refcount::fetch_sub(allocator.stack(), off, 1)? == 1 {
+            T::from_range(data_range).bstack_drop(allocator)?;
+        }
+        Ok(())
     }
 }
 
 impl<T: BStackWeakable> StrongWeakRef<T> {
-    /// Resolve the control ref from the data block's on-disk `ctrl` back-pointer
-    /// with a single read, then pair it with the data ref.
+    /// Resolve the control ref from the data block's `ctrl` back-pointer with a
+    /// single read, then pair it with the data ref.
     pub fn from_disk<A: BStackOwnedSliceAllocator>(
         data_ref: BStackRef<T>,
         allocator: &A,
     ) -> io::Result<Self> {
-        todo!("read T::OnDisk, extract ctrl back-pointer, pair with data_ref")
+        let ctrl = read_ctrl_ref(data_ref, allocator)?;
+        Ok(StrongWeakRef(data_ref, ctrl))
     }
 }
 
 impl<T: BStackWeakable> BStackDrop for StrongWeakRef<T> {
     fn bstack_drop<A: BStackOwnedSliceAllocator>(self, allocator: &A) -> io::Result<()> {
-        // Phase 1: decrement ctrl.strong. At zero, free the data block (children
-        // + shell), then release the phantom weak by decrementing ctrl.weak;
-        // if that hits zero, free the control block too.
-        todo!("two-phase strong release; see RAII.md 'Two-Phase Teardown'")
+        let stack = allocator.stack();
+        let data_range = self.0.into_range();
+        let ctrl_range = self.1.into_range();
+        let strong_off = ctrl_range.start() + layout::CTRL_STRONG_OFFSET;
+        // Phase 1: last strong owner frees the data block (children + shell),
+        // then releases the phantom weak the strong owners collectively held.
+        if refcount::fetch_sub(stack, strong_off, 1)? == 1 {
+            T::from_range(data_range).bstack_drop(allocator)?;
+            let weak_off = ctrl_range.start() + layout::CTRL_WEAK_OFFSET;
+            // Phase 2 (early): if no real weak handles remain, the phantom
+            // release drives weak to zero and the control block is freed here.
+            if refcount::fetch_sub(stack, weak_off, 1)? == 1 {
+                unsafe { dealloc_range(allocator, ctrl_range)? };
+            }
+        }
+        Ok(())
     }
 }
 
 impl<T: BStackWeakable> WeakRef<T> {
-    /// Resolve the control ref from the data block's on-disk `ctrl` back-pointer
-    /// with a single read.
+    /// Resolve the control ref from the data block's `ctrl` back-pointer.
     pub fn from_disk<A: BStackOwnedSliceAllocator>(
         data_ref: BStackRef<T>,
         allocator: &A,
     ) -> io::Result<Self> {
-        todo!("read T::OnDisk, extract ctrl back-pointer")
+        Ok(WeakRef(read_ctrl_ref(data_ref, allocator)?))
     }
 }
 
 impl<T: BStackWeakable> BStackDrop for WeakRef<T> {
     fn bstack_drop<A: BStackOwnedSliceAllocator>(self, allocator: &A) -> io::Result<()> {
-        // Decrement ctrl.weak; free the control block when it reaches zero.
-        todo!("decrement ctrl.weak; free control block at zero")
+        let ctrl_range = self.0.into_range();
+        let weak_off = ctrl_range.start() + layout::CTRL_WEAK_OFFSET;
+        // Decrement ctrl.weak; free the control block when the last weak handle
+        // (or the phantom) drops it to zero. The data block is never touched.
+        if refcount::fetch_sub(allocator.stack(), weak_off, 1)? == 1 {
+            unsafe { dealloc_range(allocator, ctrl_range)? };
+        }
+        Ok(())
     }
 }

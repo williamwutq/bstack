@@ -49,3 +49,54 @@ pub struct BlockHeader {
     pub size: u64,
     pub tag: EightCC,
 }
+
+/// Byte length of a [`BlockHeader`] — the offset at which a block's payload
+/// begins.
+pub const HEADER_SIZE: u64 = core::mem::size_of::<BlockHeader>() as u64;
+
+/// On-disk width of a reference. Per RAII.md, an on-disk `BStackRef<T>` stores
+/// only the `u64` offset; the length is recovered at resolve time from the
+/// target type's fixed `size_of::<T::OnDisk>()`. (This is why the RAII layer is,
+/// for now, a fixed-size-block model.)
+pub const REF_SIZE: u64 = 8;
+
+// -- Injected-field offsets ------------------------------------------------
+//
+// RAII.md injects the refcount / control back-pointer / control counters
+// immediately after the header, ahead of any user fields and in a fixed order.
+// Their offsets are therefore the same for *every* block, so they live here as
+// constants rather than as per-type trait members.
+
+/// `#[bstack_block(rc)]` data block: offset of the inline `refcount: AtomicU64`,
+/// injected right after the header.
+///
+/// ```text
+/// struct XOnDisk { header, refcount: AtomicU64, <user fields...> }
+/// ```
+pub const RC_REFCOUNT_OFFSET: u64 = HEADER_SIZE;
+
+/// `#[bstack_block(rc, weak)]` data block: offset of the `ctrl` back-pointer to
+/// the control block, injected right after the header.
+///
+/// ```text
+/// struct XOnDisk { header, ctrl: BStackRef<XOnDiskRef>, <user fields...> }
+/// ```
+pub const CTRL_BACKPTR_OFFSET: u64 = HEADER_SIZE;
+
+/// `#[bstack_block(rc, weak)]` control block (`XOnDiskRef`): offset of `strong`.
+///
+/// ```text
+/// struct XOnDiskRef { header, strong: AtomicU64, weak: AtomicU64, x: BStackRef<X> }
+/// ```
+pub const CTRL_STRONG_OFFSET: u64 = HEADER_SIZE;
+
+/// Control block: offset of `weak` (starts at 1 — the phantom weak held
+/// collectively by all live strong owners).
+pub const CTRL_WEAK_OFFSET: u64 = HEADER_SIZE + 8;
+
+/// Control block: offset of `x`, the forward pointer back to the data block.
+/// Read by [`crate::BStackWeak::upgrade`] once it wins the strong CAS.
+pub const CTRL_DATA_OFFSET: u64 = HEADER_SIZE + 16;
+
+// Guard the hand-derived offsets against a header size change.
+const _: () = assert!(HEADER_SIZE == 16);
