@@ -56,69 +56,71 @@ The mutex in `FirstFitBStackAllocator` serialises free-list mutation and tail ex
 
 ---
 
-## Introducing a newtype handle for default allocators (0.4.0)
+## Region handle redesign: owned, borrowed, and raw region types (0.4.0)
 
-**Breaking change:** Yes
-
-### Motivation
-
-The default allocators in this crate (e.g., `FirstFitBStackAllocator`) currently use `BStackSlice` as their raw handle type. Because `BStackSlice` exposes safe `subslice` and `subslice_range` methods, it is possible to produce a slice with an origin that does not correspond to any allocator-returned allocation and then pass it to `realloc` or `dealloc`, violating the origin requirement without any `unsafe` block at the call site. A dedicated newtype handle, constructible only by the allocator, closes this gap at the type level: it can be cheaply dereferenced to `BStackSlice` for reads and writes, but `BStackSlice` cannot be converted back into it, so sub-slices are statically prevented from being used as allocator handles.
-
-A fuller redesign — described below — also reconsiders the roles of `BStackSlice` and the allocated handle type more broadly. The two types serve different purposes and should have different capabilities and ownership semantics to reflect that.
-
-### Design
-
-#### Allocated handle type
-
-Introduce an allocated handle type (name TBD — see Open questions) as the associated handle type returned by `alloc` and accepted by `realloc` and `dealloc`. This type represents ownership of a specific allocation and has the following properties:
-
-- **Not `Copy`.** The handle represents a unique allocation. Allowing it to be copied would make it possible to call `dealloc` on one copy while the other remains in use, or to pass two copies to `realloc` independently, both corrupting allocator metadata. Non-`Copy` ensures the handle is consumed when the allocation is released or resized.
-- **No subslicing.** The handle does not expose `subslice` or `subslice_range`. A sub-range derived from an allocation is not itself an allocation, and preventing this at the type level closes the origin-requirement gap entirely without relying on documentation or convention.
-- **Lifetime tied to the allocation, not the allocator.** The handle's lifetime parameter expresses that the underlying region is valid for reads and writes, not that the allocator is borrowed. In practice, this means the handle holds `&'a A` where `'a` is the allocator borrow, but the semantic intent is that the region is live for `'a` — which is guaranteed as long as the allocator (and thus the backing `BStack`) is alive.
-- **Convertible to `BStackSlice` for I/O.** The handle can produce a `BStackSlice` for reading and writing the allocated region. This conversion is cheap (no allocation) and explicit.
-- **Unsafe construction from `(allocator, BStackSlice)`.** For advanced use cases — such as reconstructing a handle from a serialized offset/length pair — an `unsafe` constructor takes an allocator reference and a `BStackSlice` and produces a handle. The caller must ensure the slice describes a valid, allocator-owned region.
-
-#### `BStackSlice` without allocator pointer
-
-`BStackSlice` currently carries a generic allocator reference `&'a A`. Since `BStackSlice` cannot directly call `realloc` or `dealloc` (those require the allocated handle type), it does not need to know the allocator's type. It only needs access to the backing `BStack` for I/O — and it should continue to carry a `&'a BStack` reference for exactly that purpose. Replacing `&'a A` with `&'a BStack` directly would:
-
-- Simplify the type signature from `BStackSlice<'a, A>` to `BStackSlice<'a>`, removing the allocator type parameter entirely.
-- Allow `BStackSlice` to be used across allocators or outside any allocator context, since the `&'a BStack` reference is sufficient for all read and write operations the slice needs to perform.
-- Make the role of `BStackSlice` clearer: it is a view, not a handle. Like `&[u8]`, it is `Copy`, has no ownership, and carries no allocation identity.
-
-The lifetime of a `BStackSlice` should tie to the stack (or the allocation it was derived from), but this is enforced by the context — the allocator or the allocated handle — rather than by `BStackSlice` itself. This is a known limitation: the crate cannot statically enforce that a `BStackSlice` does not outlive its allocation, since allocations have no RAII drop and the file is not memory. The allocated handle type is the mechanism for expressing allocation identity; `BStackSlice` is not.
-
-This is a larger breaking change than the handle type alone, as it touches every existing use of `BStackSlice<'a, A>`.
-
-### Open questions
-
-- **Handle type name.** The name should clearly distinguish the handle from `BStackSlice` and signal that it represents an allocation, not just a region. Candidates include `BStackAlloc`, `BStackBlock`, or `BStackRegion`. The name should not suggest it is a slice (to avoid confusion with subslicing) and should not be so generic that it clashes with custom allocator handle types.
-- **Whether to remove the allocator pointer from `BStackSlice`.** This is the more invasive part of the redesign. It may be worth doing as a separate change or deferring until the allocated handle type is stable. If deferred, `BStackSlice` retains `&'a A` temporarily, with a planned migration.
-- **Unsafe back-conversion.** Should the allocated handle expose an `unsafe` method to recover a `BStackSlice` with no allocator type attached? This would be useful for serialization and low-level introspection, but requires the caller to uphold the origin invariant manually.
-
----
-
-## Requiring `&mut BStackSlice` for mutation (0.4.0)
-
-**Feature flag:** `set`
-**Breaking change:** Yes
+**Breaking change:** Yes — touches every use of `BStackSlice` and the `BStackAllocator` associated handle type.
 
 ### Motivation
 
-All write methods on `BStackSlice` — `write`, `write_range`, `zero`, `zero_range`, `writer`, and `writer_at` — currently take `&self`. This is because `BStack` uses interior mutability (`RwLock<File>`), so no exclusive reference to the slice is needed at the Rust level to perform the underlying I/O. However, this means a shared, copied, or aliased `BStackSlice` can silently mutate the same region of the file from multiple places, with no indication at the call site that mutation is occurring. This is surprising and contrary to Rust conventions.
+The default allocators use `BStackSlice` as both the allocation handle (passed to `realloc`/`dealloc`) and the I/O view (used for reads and writes). Conflating these two roles causes three problems, none of which documentation alone can fix:
 
-Requiring `&mut self` for write methods makes mutation visible and explicit. It does not provide exclusive access to the underlying file region — `BStackSlice` is `Copy` and the file is shared — but it signals intent and prevents accidental mutation through a shared reference. It also lays the groundwork for future read-only slice types and borrow-checked slice access, where `&BStackSlice` and `&mut BStackSlice` could eventually carry stronger semantic guarantees.
+1. **Sub-slices can be deallocated.** `BStackSlice` exposes safe `subslice`/`subslice_range`. A sub-range has an origin no allocator ever returned, yet it can be passed to `realloc`/`dealloc` with no `unsafe` at the call site, silently corrupting allocator metadata.
+2. **Handles outlive the allocation they name.** `BStackSlice` is `Copy`. After `realloc` moves a region or `dealloc` frees it, the old value remains a usable handle pointing at a stale or freed offset — a use-after-free / use-after-realloc that the type system currently permits.
+3. **Mutation is invisible.** Every write method takes `&self` (because `BStack` is interior-mutable via `RwLock<File>`), so a shared or copied slice can mutate the file from any call site with no `&mut` at the point of mutation.
+
+Splitting the single type into three — an **owned** handle, a **borrowed** view, and a **raw** range — resolves all three at the type level. Each type carries exactly one role, and the capability that causes each problem is simply absent from the type that must not have it. This entry supersedes the two former 0.4.0 entries ("newtype handle for default allocators" and "requiring `&mut BStackSlice` for mutation"); those were two facets of this one redesign and are specified together here.
 
 ### Design
 
-Change the receiver of `write`, `write_range`, `zero`, `zero_range`, `writer`, and `writer_at` from `&self` to `&mut self`. Since `BStackSlice` is `Copy`, callers can always bind a local `mut` copy if needed — the change imposes no semantic restriction, only a mutability annotation.
+Three region types replace today's single `BStackSlice<'a, A>`.
 
-The same change applies to the corresponding methods on `BStackGuardedSlice`, and to any future slice types such as `BStackVec`.
+#### `BStackOwnedSlice<'a, A>` — the owned allocation handle
+
+Represents ownership of one allocation. Returned by `alloc`; consumed by `realloc` and `dealloc`.
+
+- **Carries `&'a A`** (the allocator), an offset, and a length.
+- **Not `Copy`, not `Clone`.** An allocation has exactly one owner. Consuming the handle in `realloc`/`dealloc` makes use-after-free and use-after-realloc *compile errors*: there is no surviving copy left to misuse. This — not the sub-slice gap — is the headline win of the redesign.
+- **No I/O.** It cannot read or write. Allocation identity and region access are separate operations; to touch bytes you first convert to a `BStackSlice`.
+- **No subslicing.** A sub-range is not an allocation, so the owned handle cannot produce one. This closes the sub-slice-dealloc gap structurally.
+- **Convertible to a borrowed `BStackSlice` for I/O.** A by-value conversion (working name `as_slice<'s>(&'s self) -> BStackSlice<'s>`) derives `&'s BStack` from the stored `&'a A` via `BStackAllocator::stack()`. **The returned view's lifetime is tied to the `&self` borrow (`'s ≤ 'a`), not to `'a`.** This is load-bearing: it makes the view a genuine borrow *of the handle*, so a view cannot outlive a `dealloc`/`realloc` (both move the handle by value and are blocked while any view is live). Returning `BStackSlice<'a>` instead — decoupled from the handle — would let a view survive its own deallocation, and that hole exists whether or not the view is `Copy`, so tying the lifetime is the actual fix, not merely making the view non-`Copy`. A literal `Deref` impl is *not* possible: `Deref` must return a reference into stored data, but the handle stores `&A`, not a `BStackSlice` — so this is an explicit by-value method, not the `Deref` trait.
+- **`Drop` is a no-op.** Allocations persist on disk beyond the process, so dropping the handle leaks (recoverably) rather than freeing. Freeing is always the explicit `dealloc`/`realloc` call. This is inherent to persistence, not a RAII feature.
+- **Unsafe reconstruction.** An `unsafe` constructor takes `(&'a A, BStackRange)`, for rehydrating a serialized offset/length against a live allocator on reopen. The caller upholds the origin invariant.
+
+#### `BStackSlice<'a>` — the borrowed region view
+
+The read/write view of a region. A view, not a handle; carries no allocation identity — but, unlike `&[u8]`, it is a unique borrow rather than a freely copied one (see below).
+
+- **Carries `&'a BStack`**, an offset, and a length. **The `A` type parameter is gone** — the slice reaches the file only through `BStack` (today's `BStackSlice` already routes all I/O through `self.allocator.stack()`), so it never needs the allocator type. When derived from an owned handle, `'a` is instantiated to the handle-borrow lifetime `'s`, so the view borrows the handle.
+- **Not `Copy`.** A `Copy` view could be duplicated out of a `&mut` borrow, which would defeat the write-exclusivity below and let a mutable view be aliased. Dropping `Copy` makes `&mut self` writes *genuinely* single-writer within safe code, not merely advisory. (It does **not** need to drop `Copy` to be dealloc-safe — that is handled by the lifetime tie on the conversion above; non-`Copy` is about write-exclusivity.) It stays `Clone`-able if a caller genuinely needs a second independent view, which is an explicit act rather than an implicit copy.
+- **Subsliceable.** `subslice`/`subslice_range` produce sub-*views*, never handles, so there is no origin hazard. Because the view is non-`Copy`, the *mutable* subslice path needs a `split_at_mut`-style API (consume/reborrow into disjoint ranges) rather than a plain `&self` split; immutable subslicing off `&self` is unrestricted.
+- **Reads take `&self`, writes take `&mut self`.** `write`, `write_range`, `zero`, `zero_range`, `writer`, and `writer_at` change from `&self` to `&mut self`. With the view non-`Copy`, `&mut self` is a real exclusive-write borrow within safe code — no aliased mutable view can exist through safe code.
+- **`Drop` is a no-op.** Same persistence reasoning as the owned handle.
+- **Unsafe construction.** An `unsafe` constructor takes `(&'a BStack, BStackRange)` — the successor to today's `from_raw_parts`.
+
+The same `&self` → `&mut self` write-receiver change applies to `BStackGuardedSlice` and any future slice type.
+
+#### `BStackRange` — the raw region
+
+An offset/length pair, analogous to `Range<u64>`. No pointer, no I/O, no allocation participation.
+
+- **`Copy`, carries no reference.** This is the serialization / persistence representation: what you store on disk and reload.
+- Cannot read, write, `dealloc`, or `realloc`. To do anything it must be `unsafe`-cast into a `BStackOwnedSlice` (supplying `&A`) or a `BStackSlice` (supplying `&BStack`). No validation is performed on the cast: serialized bytes are just data, per-handle validation is both infeasible and falsely reassuring, and the `unsafe` cast makes the caller's obligation explicit.
+
+#### `BStackAllocator` trait changes
+
+- The associated handle bound changes from `Copy + TryInto<BStackSlice<'a, Self>>` to `Into<BStackOwnedSlice<'a, Self>>`, and the handle is **no longer required to be `Copy`**. Moving from fallible `TryInto` to infallible `Into` follows from dropping per-handle validation. All library allocators set `type Allocated<'a> = BStackOwnedSlice<'a, Self>`, for which the `Into` is the identity.
+- `Into<BStackOwnedSlice>` is an ownership-normalization / interop bound only. It is *consuming*, and therefore is **not** the I/O path — generic code reads and writes by converting the owned handle to a `BStackSlice`. It is also one-way: a custom `Allocated` normalized to `BStackOwnedSlice` cannot be fed back to that allocator's `dealloc` (which wants `Self::Allocated`), which is moot for the library's own allocators where the two coincide.
+- `realloc` and `dealloc` continue to take `Self::Allocated` by value, but with a non-`Copy`/non-`Clone` handle this now has teeth: the caller cannot retain a usable handle across the call.
+
+Within safe code the guarantees are real: the non-`Copy` owned handle makes use-after-free/realloc a compile error, the lifetime-tied conversion prevents a view outliving its allocation, and the non-`Copy` view makes `&mut self` writes genuinely single-writer. **At the process boundary, however, they remain advisory:** interior-mutable `RwLock<File>` plus the `unsafe` `BStackRange` casts can still mint two owned handles — or two views — for one region. The types prevent *accidental* aliasing through safe code, not aliasing outright, and the documentation must claim exactly that.
+
+As a 0.4.0 breaking release, backward compatibility is not a constraint; every use of `BStackSlice<'a, A>` migrates to one of the three new types.
 
 ### Open questions
 
-- Should `writer` and `writer_at` also require `&mut self`, given that they return a `BStackSliceWriter` rather than performing any mutation themselves? Requiring `&mut self` here is consistent with the general principle but may feel overly strict for a constructor that merely captures the slice.
-- `BStackSliceWriter` is currently `Copy`. If `writer` requires `&mut self`, obtaining multiple writers from the same slice would require copying the slice first. Should `BStackSliceWriter` remain `Copy`, or should it be non-`Copy` to better reflect exclusive-write intent?
+- **Names.** `BStackOwnedSlice` / `BStackSlice` / `BStackRange` are working names. `BStackOwnedSlice` still contains "Slice" despite doing no I/O; alternatives (`BStackOwned`, `BStackBlock`, `BStackAlloc`) drop that but lose the parallel with `BStackSlice`. `BStackRange` should not be confused with the `Range<u64>` used elsewhere in the API.
+- **Conversion API shape.** Owned → borrowed is a by-value method (`as_slice`, `slice`, `to_slice`?). Now that `BStackSlice` is non-`Copy`, a single `as_slice(&self)` yields a shared (read-only in practice) view; a separate `as_slice_mut(&mut self)` is needed to obtain a view usable for writes, since a `&self`-derived view cannot be reborrowed mutably. Confirm the pair `as_slice`/`as_slice_mut` mirroring `&`/`&mut`.
+- **`writer`/`writer_at` receiver.** These construct a `BStackSliceWriter` rather than mutating. Requiring `&mut self` is consistent but may feel strict; and `BStackSliceWriter` is currently `Copy` — should it stay `Copy`, or become non-`Copy` to reflect exclusive-write intent?
 
 ---
 
