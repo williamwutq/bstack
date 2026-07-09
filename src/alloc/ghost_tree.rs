@@ -923,11 +923,19 @@ impl BStackAllocator for GhostTreeBstackAllocator {
             handle: Some(unsafe { BStackOwnedSlice::from_raw_parts(self, start, old_len) }),
         })?;
         let new_start = new_slice.start();
-        if let Err(source) = self
+        // Move the old payload into the freshly-allocated region. With `atomic`
+        // this is a single crash-atomic `BStack::copy` — the source and
+        // destination are disjoint, so it stages only the source coordinate
+        // (O(1) journal) and never materialises the payload in memory. Without
+        // `atomic`, fall back to read-then-write.
+        #[cfg(feature = "atomic")]
+        let copy_result = self.stack.copy(start, new_start, old_len);
+        #[cfg(not(feature = "atomic"))]
+        let copy_result = self
             .stack
             .get(start, start + old_len)
-            .and_then(|data| self.stack.set(new_start, &data))
-        {
+            .and_then(|data| self.stack.set(new_start, &data));
+        if let Err(source) = copy_result {
             // The new region was allocated but the copy failed. Roll it back
             // (best-effort) so it is not leaked: GhostTree recovery only rebuilds
             // the free tree by walking existing nodes, so an allocated-but-

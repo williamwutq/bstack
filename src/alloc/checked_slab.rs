@@ -1573,12 +1573,21 @@ impl BStackAllocator for CheckedSlabBStackAllocator {
                 // Not at tail (or tail moved under atomic): grow non-tail.
                 // alloc and dealloc each handle their own free-list and tail
                 // operations independently.
-                let mut new_slice = self.alloc(new_len)?;
-                // Copy old → new. If this fails, roll back the freshly-allocated
-                // block (best-effort) so it is not leaked: an allocated-but-
-                // orphaned block stays marked in-use and no handle can free it.
-                // The original is untouched (`recovered` still points at it).
-                if let Err(source) = slice.read().and_then(|data| new_slice.write(&data)) {
+                let new_slice = self.alloc(new_len)?;
+                // Move old → new. With `atomic` this is a single crash-atomic
+                // `BStack::copy` (disjoint regions → O(1) journal, no in-memory
+                // buffer); otherwise fall back to read-then-write. If it fails,
+                // roll back the freshly-allocated block (best-effort) so it is
+                // not leaked: an allocated-but-orphaned block stays marked in-use
+                // and no handle can free it. The original is untouched
+                // (`recovered` still points at it).
+                #[cfg(feature = "atomic")]
+                let copy_result = self.stack.copy(slice.start(), new_slice.start(), slice.len());
+                #[cfg(not(feature = "atomic"))]
+                let copy_result = slice
+                    .read()
+                    .and_then(|data| self.stack.set(new_slice.start(), &data));
+                if let Err(source) = copy_result {
                     let _ = self.dealloc(new_slice);
                     return Err(source);
                 }
