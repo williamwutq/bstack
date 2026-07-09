@@ -64,11 +64,11 @@
 //!
 //! The three handle types cleanly separate concerns:
 //!
-//! | Type                                         | Carries      | Copy | I/O | Alloc ops |
-//! |----------------------------------------------|--------------|------|-----|-----------|
-//! | [`BStackRange`]                              | nothing      | yes  | no  | no        |
-//! | [`BStackOwnedSlice<'a,A>`](BStackOwnedSlice) | `&'a A`      | no   | no  | yes       |
-//! | [`BStackSlice<'a>`](BStackSlice)             | `&'a BStack` | no   | yes | no        |
+//! | Type                                         | Carries      | Copy | I/O      | Alloc ops |
+//! |----------------------------------------------|--------------|------|----------|-----------|
+//! | [`BStackRange`]                              | nothing      | yes  | no       | no        |
+//! | [`BStackOwnedSlice<'a,A>`](BStackOwnedSlice) | `&'a A`      | no   | via view | yes       |
+//! | [`BStackSlice<'a>`](BStackSlice)             | `&'a BStack` | no   | yes      | no        |
 //!
 //! `BStackOwnedSlice` is non-`Copy` and non-`Clone`: an allocation has exactly
 //! one owner.  Consuming it for `realloc` or `dealloc` is a compile error if

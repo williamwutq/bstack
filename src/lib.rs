@@ -389,11 +389,21 @@
 //!
 //! # Feature flags
 //!
-//! | Feature | Description |
-//! |---------|-------------|
-//! | `set`   | Enables [`BStack::set`], [`BStack::zero`], and [`BStack::repeat`] — in-place overwrite of existing payload bytes (with data, zeros, or a repeated pattern) without changing the file size. |
-//! | `alloc` | Enables [`BStackAllocator`], [`BStackBulkAllocator`], [`BStackSlice`], [`BStackSliceReader`], and [`LinearBStackAllocator`] — region-based allocation over a `BStack` payload. Combined with `set`, also enables [`BStackSliceWriter`], [`FirstFitBStackAllocator`], [`GhostTreeBstackAllocator`], and [`BStackByteVec`]. |
-//! | `atomic` | Enables [`BStack::atrunc`], [`BStack::splice`], [`BStack::splice_into`], [`BStack::try_extend`], [`BStack::try_extend_zeros`], [`BStack::try_discard`], [`BStack::replace`], [`BStack::get_batched`], [`BStack::get_batched_into`], and [`BStack::get_batched_gen`] — compound read-modify-write operations that hold the lock across what would otherwise be separate calls. Combined with `set`, also enables [`BStack::swap`], [`BStack::swap_into`], [`BStack::cas`], [`BStack::process`], [`BStack::process_gen`], [`BStack::set_batched`], [`BStack::inplace_gen`], [`BStackGenOp`], [`BStack::cross_exchange`], [`BStack::copy`], [`BStack::eq_crds`], [`BStack::ne_crds`], [`BStack::masked_eq_crds`], and [`BStack::masked_ne_crds`]. |
+//! * **`set`** — In-place overwrite of existing payload bytes without changing
+//!   the file size ([`BStack::set`], [`BStack::zero`], [`BStack::repeat`]).
+//!
+//! * **`alloc`** — Region-based sub-allocation over a `BStack` payload.
+//!   Adds the allocator traits, handle types ([`BStackRange`],
+//!   [`BStackOwnedSlice`], [`BStackSlice`]), and [`LinearBStackAllocator`] /
+//!   [`GhostTreeBstackAllocator`].  Combined with `set`, also enables
+//!   [`BStackSliceWriter`], [`FirstFitBStackAllocator`],
+//!   [`SlabBStackAllocator`], [`CheckedSlabBStackAllocator`], and
+//!   [`BStackByteVec`].
+//!
+//! * **`atomic`** — Compound read-modify-write operations that hold the write
+//!   lock across what would otherwise be separate calls.  Combined with `set`,
+//!   also enables atomic swap, CAS, in-place batch writes, and cross-region
+//!   operations.
 //!
 //! Enable with:
 //!
@@ -421,12 +431,22 @@
 //!   adds atomic bulk operations.  Both methods are required with no default; on error
 //!   the backing store is left unchanged unless a crash occur.
 //!
-//! * [`BStackSlice`]`<'a, A>` — lightweight `Copy` handle (allocator reference +
-//!   offset + length) to a contiguous region.  Exposes `read`, `read_into`,
+//! * [`BStackRange`] — raw `(offset, len)` pair; `Copy`, no pointer, no I/O.
+//!   Serialises to/from `[u8; 16]` for persistent bookkeeping.
+//!
+//! * [`BStackOwnedSlice`]`<'a, A>` — ownership handle returned by `alloc` /
+//!   `realloc`.  Non-Copy, non-Clone; owns the allocation lifetime `'a`.
+//!   Does not do I/O directly — obtain a view via `as_slice()` (reads) or
+//!   `as_slice_mut()` (reads + writes).  Passed by value to `realloc` and
+//!   `dealloc`; Drop is a no-op (freeing is always explicit).
+//!
+//! * [`BStackSlice`]`<'a>` — borrowed I/O view over a region.  Non-Copy;
+//!   obtained from `BStackOwnedSlice::as_slice[_mut]()` or directly from
+//!   `BStackSlice::from_raw_parts`.  Exposes `read`, `read_into`,
 //!   `read_range_into`, `subslice`, `subslice_range`, `reader`, `reader_at`,
 //!   and (with the `set` feature) `write`, `write_range`, `zero`, `zero_range`.
 //!
-//! * [`BStackSliceReader`]`<'a, A>` — cursor-based reader over a
+//! * [`BStackSliceReader`]`<'a>` — cursor-based reader over a
 //!   [`BStackSlice`], implementing [`io::Read`] and [`io::Seek`] in the
 //!   slice's coordinate space.
 //!
@@ -473,10 +493,6 @@
 //!   [`recover`](CheckedSlabBStackAllocator::recover) automatically).
 //!   Requires both `alloc` and `set` features.
 //!
-//! * [`DebugCheckingAllocator`] — Debug/test wrapper around any
-//!   [`BStackAllocator`].  Tracks allocated and freed regions in memory and
-//!   panics on overlapping allocations, double-frees, or partial frees.
-//!   Not for production use.
 //!
 //! * [`BStackByteVec`]`<'a, A>` — a growable byte (`u8`) vector backed by a
 //!   [`BStack`] allocation (requires `alloc` + `set`).  Mirrors the core
@@ -490,10 +506,12 @@
 //!
 //! ## Lifetime model
 //!
-//! `BStackSlice<'a, A>` borrows the **allocator** for `'a`, not the
-//! [`BStack`] directly.  As a result the borrow checker statically prevents
-//! calling [`BStackAllocator::into_stack`] — which consumes the allocator by
-//! value — while any slice is still in scope.
+//! `BStackOwnedSlice<'a, A>` borrows the **allocator** for `'a`.
+//! The borrow checker statically prevents calling
+//! [`BStackAllocator::into_stack`] — which consumes the allocator by value —
+//! while any owned slice is still in scope.  `BStackSlice<'a>` views obtained
+//! via `as_slice[_mut]()` have a shorter lifetime tied to the borrow of the
+//! owned slice, preventing them from outliving the handle that owns the region.
 //!
 //! ## Quick example
 //!
@@ -503,8 +521,8 @@
 //! # fn main() -> std::io::Result<()> {
 //! let alloc = LinearBStackAllocator::new(BStack::open("data.bstack")?);
 //!
-//! let slice = alloc.alloc(128)?;          // reserve 128 zero bytes
-//! let data  = slice.read()?;              // read them back
+//! let mut slice = alloc.alloc(128)?;      // reserve 128 zero bytes
+//! let data = slice.read()?;    // read them back
 //! alloc.dealloc(slice)?;                  // release (tail, so O(1))
 //!
 //! let stack = alloc.into_stack();         // reclaim the BStack
@@ -549,8 +567,8 @@ mod test;
 mod alloc;
 #[cfg(feature = "alloc")]
 pub use alloc::{
-    BStackAllocator, BStackBulkAllocator, BStackSlice, BStackSliceAllocator, BStackSliceReader,
-    DebugCheckingAllocator, DebugHandle, LinearBStackAllocator, ManualAllocator,
+    BStackAllocator, BStackBulkAllocator, BStackOwnedSlice, BStackOwnedSliceAllocator, BStackRange,
+    BStackSlice, BStackSliceReader, LinearBStackAllocator,
 };
 #[cfg(all(feature = "alloc", feature = "set"))]
 pub use alloc::{

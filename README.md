@@ -321,82 +321,31 @@ impl BStack {
 
 ### Writing — `impl Write for BStack` / `impl Write for &BStack`
 
-`BStack` implements [`std::io::Write`].  Each call to `write` is forwarded to
-`push`, so every write is atomically appended and durably synced before
-returning.  `flush` is a no-op.
-
-`&BStack` also implements `Write` (mirroring `impl Write for &File`), which
-lets you pass a shared reference wherever a writer is expected.
+`BStack` and `&BStack` implement [`std::io::Write`]; each `write` call
+forwards to `push` (atomic append + durable sync).  `flush` is a no-op.
+Wrap in `BufWriter` to batch many small writes into a single `push`.
 
 ```rust
 use std::io::Write;
-use bstack::BStack;
-
 let mut stack = BStack::open("log.bin")?;
-
-// write / write_all forward to push.
 stack.write_all(b"hello")?;
-stack.write_all(b"world")?;
-assert_eq!(stack.len()?, 10);
-
-// io::copy works out of the box.
-let mut src = std::io::Cursor::new(b"more data");
-std::io::copy(&mut src, &mut stack)?;
+std::io::copy(&mut std::io::Cursor::new(b"world"), &mut stack)?;
 ```
-
-Wrapping in `BufWriter` batches small writes into fewer `push` calls (and
-fewer `durable_sync` calls):
-
-```rust
-use std::io::{BufWriter, Write};
-use bstack::BStack;
-
-let stack = BStack::open("log.bin")?;
-let mut bw = BufWriter::new(&stack);
-for chunk in chunks {
-    bw.write_all(chunk)?;
-}
-bw.flush()?; // one push + one durable_sync for the whole batch
-```
-
-> **Note:** Each raw `write` call issues one `durable_sync`.  If you call
-> `write` or `write_all` in a tight loop, prefer `push` directly or use
-> `BufWriter` to batch.
 
 ### Reading — `BStackReader`
 
 [`BStackReader`] wraps a `&BStack` with a cursor and implements
-[`std::io::Read`] and [`std::io::Seek`].
+[`std::io::Read`] and [`std::io::Seek`].  Multiple readers can coexist
+concurrently with each other and with `peek`/`get` calls.
 
 ```rust
-use std::io::{Read, Seek, SeekFrom};
-use bstack::{BStack, BStackReader};
-
+use std::io::{Read, SeekFrom, Seek};
 let stack = BStack::open("log.bin")?;
-stack.push(b"hello world")?;
-
-// From the beginning:
-let mut reader = stack.reader();
-
-// From an arbitrary offset:
-let mut mid = stack.reader_at(6);
-
-// From<&BStack> is also implemented:
-let mut r = BStackReader::from(&stack);
-
+let mut reader = stack.reader();        // from the start
+let mut mid    = stack.reader_at(6);   // from offset 6
 let mut buf = [0u8; 5];
-reader.read_exact(&mut buf)?;  // b"hello"
-
-reader.seek(SeekFrom::Start(6))?;
-reader.read_exact(&mut buf)?;  // b"world"
-
-// read_to_end, BufReader, etc. all work.
-let mut out = Vec::new();
-stack.reader().read_to_end(&mut out)?;
+reader.read_exact(&mut buf)?;
 ```
-
-`BStackReader` borrows the stack immutably, so multiple readers can coexist
-and run concurrently with each other and with `peek`/`get` calls.
 
 ---
 
@@ -472,20 +421,38 @@ assert!(stack.pop(stack.len()? - 60).is_err()); // would shrink below locked
 
 ### `BStackReader`
 
-| Trait | Semantics |
-|-------|-----------|
-| `PartialEq` / `Eq` | Equal when both the `BStack` pointer and the cursor offset match. |
-| `Hash` | Hashes `(BStack pointer, offset)`. |
-| `PartialOrd` / `Ord` | Ordered by `BStack` instance address, then by cursor offset. |
+| Trait                | Semantics                                                         |
+|----------------------|-------------------------------------------------------------------|
+| `PartialEq` / `Eq`   | Equal when both the `BStack` pointer and the cursor offset match. |
+| `Hash`               | Hashes `(BStack pointer, offset)`.                                |
+| `PartialOrd` / `Ord` | Ordered by `BStack` instance address, then by cursor offset.      |
 
-### `BStackSlice` (`alloc` feature)
+### Region handle types (`alloc` feature)
 
-| Trait                            | Semantics                                                                                               |
-|----------------------------------|---------------------------------------------------------------------------------------------------------|
-| `PartialEq` / `Eq`               | Compares `(offset, len)`. The allocator reference is **not** compared.                                  |
-| `Hash`                           | Hashes `(offset, len)`.                                                                                 |
-| `PartialOrd` / `Ord`             | Ordered by `offset`, then `len`.                                                                        |
-| `From<BStackSlice> for [u8; 16]` | Serialises to `[offset_le8 ‖ len_le8]` for on-disk storage. Reconstruct with `unsafe { BStackSlice::from_bytes(...) }` — caller must ensure the bytes encode a valid range within the payload. |
+**`BStackRange`** — raw `(offset, len)` coordinate pair, no backing reference.
+
+| Trait                                                               | Semantics                                                             |
+|---------------------------------------------------------------------|-----------------------------------------------------------------------|
+| `PartialEq` / `Eq`                                                  | Compares `(offset, len)`.                                             |
+| `Hash`                                                              | Hashes `(offset, len)`.                                               |
+| `PartialOrd` / `Ord`                                                | Ordered by `offset`, then `len`.                                      |
+| `From<[u8; 16]> for BStackRange` / `From<BStackRange> for [u8; 16]` | Serialises/deserialises `[offset_le8 ‖ len_le8]` for on-disk storage. |
+
+**`BStackOwnedSlice<'a, A>`** — ownership handle carrying `&'a A`. Non-`Copy`, non-`Clone`.
+
+| Trait                | Semantics                                                              |
+|----------------------|------------------------------------------------------------------------|
+| `PartialEq` / `Eq`   | Compares `(offset, len)`. The allocator reference is **not** compared. |
+| `Hash`               | Hashes `(offset, len)`.                                                |
+| `PartialOrd` / `Ord` | Ordered by `offset`, then `len`.                                       |
+
+**`BStackSlice<'a>`** — borrowed I/O view carrying `&'a BStack`. Non-`Copy`, `Clone`.
+
+| Trait                | Semantics                                                          |
+|----------------------|--------------------------------------------------------------------|
+| `PartialEq` / `Eq`   | Compares `(offset, len)`. The stack reference is **not** compared. |
+| `Hash`               | Hashes `(offset, len)`.                                            |
+| `PartialOrd` / `Ord` | Ordered by `offset`, then `len`.                                   |
 
 ### `BStackSliceReader` and `BStackSliceWriter` (`alloc` / `alloc + set` features)
 
@@ -542,7 +509,7 @@ bstack = { version = "0.4", features = ["set"] }
 
 ### `alloc`
 
-Enables the region-management layer on top of `BStack`: `BStackAllocator`, `BStackBulkAllocator`, `BStackSlice`, `BStackSliceReader`, `LinearBStackAllocator`, `FirstFitBStackAllocator`, `GhostTreeBstackAllocator`, `ManualAllocator`, and the `BStackSliceAllocator` supertrait.  Combined with `set`, also enables `BStackSliceWriter`, `BStackByteVec`, and `BStackByteVecIter`.
+Enables the region-management layer on top of `BStack`: `BStackAllocator`, `BStackBulkAllocator`, `BStackOwnedSliceAllocator`, `BStackRange`, `BStackOwnedSlice`, `BStackSlice`, `BStackSliceReader`, `LinearBStackAllocator`, and `GhostTreeBstackAllocator`.  Combined with `set`, also enables `BStackSliceWriter`, `FirstFitBStackAllocator`, `SlabBStackAllocator`, `CheckedSlabBStackAllocator`, `BStackByteVec`, and `BStackByteVecIter`.
 
 ```toml
 [dependencies]
@@ -703,24 +670,24 @@ cached in memory and kept in sync with the on-disk header by every
 write-lock-held operation, so `len`/`is_empty` can be answered under the read
 lock without any `File::metadata` syscall.
 
-| Operation                                                    | Lock (Unix / Windows) | Lock (other) |
-|--------------------------------------------------------------|-----------------------|--------------|
-| `push`, `extend`, `pop`, `pop_into`, `discard`               | write                 | write        |
-| `set`, `zero`, `repeat` *(feature)*                          | write                 | write        |
-| `atrunc`, `splice`, `splice_into`, `try_extend` *(atomic)*   | write                 | write        |
-| `try_discard(s, n > 0)` *(atomic)*                           | write                 | write        |
-| `try_discard(s, 0)` *(atomic)*                               | **read**              | **read**     |
-| `try_extend_zeros` *(atomic)*                                | write                 | write        |
-| `swap`, `swap_into`, `cas` *(set+atomic)*                    | write                 | write        |
-| `process`, `process_gen` *(set+atomic)*                      | write                 | write        |
-| `set_batched`, `inplace_gen` *(set+atomic)*                  | write                 | write        |
-| `replace` *(atomic)*                                         | write                 | write        |
-| `cross_exchange`, `copy` *(set+atomic)*                      | write                 | write        |
-| `eq_crds`, `ne_crds` *(set+atomic)*                          | write                 | write        |
-| `masked_eq_crds`, `masked_ne_crds` *(set+atomic)*            | write                 | write        |
-| `peek`, `peek_into`, `get`, `get_into`                       | **read**              | write        |
-| `get_batched`, `get_batched_into`, `get_batched_gen` *(atomic)* | **read**           | write        |
-| `len`                                                        | read                  | read         |
+| Operation                                                       | Lock (Unix / Windows) | Lock (other) |
+|-----------------------------------------------------------------|-----------------------|--------------|
+| `push`, `extend`, `pop`, `pop_into`, `discard`                  | write                 | write        |
+| `set`, `zero`, `repeat` *(feature)*                             | write                 | write        |
+| `atrunc`, `splice`, `splice_into`, `try_extend` *(atomic)*      | write                 | write        |
+| `try_discard(s, n > 0)` *(atomic)*                              | write                 | write        |
+| `try_discard(s, 0)` *(atomic)*                                  | **read**              | **read**     |
+| `try_extend_zeros` *(atomic)*                                   | write                 | write        |
+| `swap`, `swap_into`, `cas` *(set+atomic)*                       | write                 | write        |
+| `process`, `process_gen` *(set+atomic)*                         | write                 | write        |
+| `set_batched`, `inplace_gen` *(set+atomic)*                     | write                 | write        |
+| `replace` *(atomic)*                                            | write                 | write        |
+| `cross_exchange`, `copy` *(set+atomic)*                         | write                 | write        |
+| `eq_crds`, `ne_crds` *(set+atomic)*                             | write                 | write        |
+| `masked_eq_crds`, `masked_ne_crds` *(set+atomic)*               | write                 | write        |
+| `peek`, `peek_into`, `get`, `get_into`                          | **read**              | write        |
+| `get_batched`, `get_batched_into`, `get_batched_gen` *(atomic)* | **read**              | write        |
+| `len`                                                           | read                  | read         |
 
 On Unix and Windows, `peek`, `peek_into`, `get`, and `get_into` use a
 cursor-safe positional read (`pread(2)` / `read_exact_at` on Unix; `ReadFile`
@@ -754,21 +721,21 @@ the first read so the whole sequence runs as one indivisible step.
 
 ---
 
-## Why async is not planned
-
-Durability requires `fcntl(F_FULLFSYNC)` (macOS), `fdatasync` (Linux), or `FlushFileBuffers` (Windows) — all blocking syscalls that must complete before returning. All writes are tail-ordered with a mandatory `durable_sync` barrier; there is nothing to pipeline, and a `RwLock` serialises concurrent writers regardless. Adding Tokio even as an optional dependency would break the minimal-dependency guarantee. The idiomatic approach from async code is:
-
-```rust
-let result = tokio::task::spawn_blocking(move || {
-    stack.push(&data)
-}).await?;
-```
-
----
-
 ## Allocators (`alloc` feature)
 
 The `alloc` feature adds typed region management over a `BStack` payload.
+
+### Region handle design
+
+The `alloc` feature provides three distinct handle types for different roles:
+
+| Type                      | Carries      | Copy | I/O      | Alloc ops |
+|---------------------------|--------------|------|----------|-----------|
+| `BStackRange`             | nothing      | yes  | no       | no        |
+| `BStackOwnedSlice<'a, A>` | `&'a A`      | no   | via view | yes       |
+| `BStackSlice<'a>`         | `&'a BStack` | no   | yes      | no        |
+
+`BStackOwnedSlice` is non-`Copy` and non-`Clone`: an allocation has exactly one owner.  Obtaining an I/O view via `as_slice()` or `as_slice_mut()` ties the view's lifetime to the borrow of the owned slice, preventing it from outliving the handle.  `BStackSlice` is non-`Copy` so that `write*(&mut self)` provides single-writer exclusivity; it is `Clone` for explicit second views.
 
 ### `BStackAllocator` trait
 
@@ -777,17 +744,19 @@ within its payload.  Implementors must provide:
 
 ```rust
 pub trait BStackAllocator: Sized {
-    // All allocators in this library set Error = io::Error.
     type Error: fmt::Debug + fmt::Display;
+    // All built-in allocators set Allocated<'a> = BStackOwnedSlice<'a, Self>.
+    // Custom allocators may use a richer type that implements Into<BStackOwnedSlice<'a, Self>>.
+    type Allocated<'a>: Into<BStackOwnedSlice<'a, Self>> where Self: 'a;
 
     fn stack(&self) -> &BStack;
     fn into_stack(self) -> BStack;
-    fn alloc(&self, len: u64) -> Result<BStackSlice<'_, Self>, Self::Error>;
-    fn realloc<'a>(&'a self, slice: BStackSlice<'a, Self>, new_len: u64)
-        -> Result<BStackSlice<'a, Self>, Self::Error>;
+    fn alloc(&self, len: u64) -> Result<Self::Allocated<'_>, Self::Error>;
+    fn realloc<'a>(&'a self, handle: Self::Allocated<'a>, new_len: u64)
+        -> Result<Self::Allocated<'a>, Self::Error>;
 
     // Default no-op; override for free-list allocators:
-    fn dealloc(&self, slice: BStackSlice<'_, Self>) -> Result<(), Self::Error> { Ok(()) }
+    fn dealloc(&self, handle: Self::Allocated<'_>) -> Result<(), Self::Error> { Ok(()) }
 
     // Delegation helpers:
     fn len(&self) -> io::Result<u64>;
@@ -795,67 +764,76 @@ pub trait BStackAllocator: Sized {
 }
 ```
 
-For batch allocation and deallocation, see [`BStackBulkAllocator`](#bstackbulkallocator-trait).
+### `BStackOwnedSliceAllocator` supertrait
+
+A convenience bound for the common case of a `BStackAllocator` whose handle type is `BStackOwnedSlice` and whose error type is `io::Error`:
+
+```rust
+// Compact form:
+A: BStackOwnedSliceAllocator
+
+// Equivalent verbose form:
+A: 'static + BStackAllocator<Error = io::Error>,
+for<'a> A: BStackAllocator<Allocated<'a> = BStackOwnedSlice<'a, A>>,
+```
+
+All built-in allocators implement `BStackOwnedSliceAllocator`.
 
 ### `BStackBulkAllocator` trait
 
-An extension trait for `BStackAllocator` that adds two atomic bulk methods. "Atomic" means either the operation succeeds completely or the backing store is left entirely unchanged. After a crash, the on-disk state is always consistent or recovery succeeds before the next user operation.
+An extension trait for `BStackAllocator` that adds two atomic bulk methods. "Atomic" means either the operation succeeds completely or the backing store is left entirely unchanged.
 
 ```rust
 pub trait BStackBulkAllocator: BStackAllocator {
-    /// Allocate one slice per entry in `lengths` in a single atomic operation.
     fn alloc_bulk(&self, lengths: impl AsRef<[u64]>)
-        -> io::Result<Vec<Self::Allocated<'_>>>;
+        -> Result<Vec<Self::Allocated<'_>>, Self::Error>;
 
-    /// Deallocate all supplied slices in a single atomic operation.
-    fn dealloc_bulk<'a>(&'a self, slices: impl AsRef<[Self::Allocated<'a>]>)
-        -> io::Result<()>;
+    fn dealloc_bulk<'a>(&'a self, handles: impl IntoIterator<Item = Self::Allocated<'a>>)
+        -> Result<(), Self::Error>;
 }
 ```
 
-### `BStackSlice<'a, A>`
+### `BStackOwnedSlice<'a, A>`
 
-A lightweight `Copy` handle — one `&'a A` reference plus two `u64` fields
-(`offset`, `len`) — to a contiguous region of the allocator's `BStack`.
-Produced by `BStackAllocator::alloc`; consumed by `realloc` and `dealloc`.
+The ownership handle for one allocation. Returned by `alloc`, consumed by `realloc` and `dealloc`. Non-`Copy`, non-`Clone` — exactly one owner per region.
 
-> **Slice origin requirement.** `realloc` and `dealloc` are only guaranteed to
-> work correctly with a slice returned directly by `alloc` or a prior `realloc`
-> on the **same allocator instance**.  Passing a sub-slice (`subslice`,
-> `subslice_range`) or a manually reconstructed slice may silently corrupt
-> allocator metadata.  To preserve a handle across a file reopen, serialise the
-> raw `(start, len)` fields and reconstruct via
-> `unsafe { BStackSlice::from_raw_parts(...) }` for read/write I/O only —
-> never pass a reconstructed slice to `realloc` or `dealloc`.
+Key methods on `BStackOwnedSlice`:
 
-Key methods:
+| Method                                              | Description                                  |
+|-----------------------------------------------------|----------------------------------------------|
+| `start()` / `end()` / `len()`                       | Coordinate accessors                         |
+| `as_slice<'s>(&'s self) -> BStackSlice<'s>`         | Shared read view (lifetime tied to `&self`)  |
+| `as_slice_mut<'s>(&'s mut self) -> BStackSlice<'s>` | Exclusive write view                         |
+| `to_range()`                                        | Convert to a `BStackRange` for serialisation |
 
-| Method                                       | Description                                    |
-|----------------------------------------------|------------------------------------------------|
-| `read()`                                     | Read the entire region into a new `Vec<u8>`    |
-| `read_into(buf)`                             | Read into a caller-supplied buffer             |
-| `read_range(start, end)`                     | Read a sub-range into a new `Vec<u8>`          |
-| `read_range_into(start, buf)`                | Read a sub-range into a caller-supplied buffer |
-| `subslice(start, end)`                       | Narrow to a sub-range (relative offsets)       |
-| `subslice_range(range)`                      | Narrow to a sub-range using a `Range<u64>`     |
-| `reader()`                                   | Cursor-based `BStackSliceReader` at position 0 |
-| `reader_at(offset)`                          | Cursor-based `BStackSliceReader` at `offset`   |
-| `write(data)` *(feature `set`)*              | Overwrite the beginning of the region in place |
-| `write_range(start, data)` *(feature `set`)* | Overwrite a sub-range in place                 |
-| `zero()` *(feature `set`)*                   | Zero the entire region in place                |
-| `zero_range(start, n)` *(feature `set`)*     | Zero a sub-range in place                      |
+### `BStackSlice<'a>`
 
-### `BStackSliceReader<'a, A>`
+A borrowed I/O view carrying `&'a BStack` directly. Obtained from `BStackOwnedSlice::as_slice[_mut]()` or constructed via `unsafe { BStackSlice::from_raw_parts(stack, offset, len) }`.
 
-A cursor-based reader over a `BStackSlice`.  Implements `io::Read` and
-`io::Seek` within the slice's coordinate space (position 0 = `slice.start()`).
-Constructed via `BStackSlice::reader()` or `BStackSlice::reader_at(offset)`.
+Key methods on `BStackSlice`:
+
+| Method                                              | Description                                 |
+|-----------------------------------------------------|---------------------------------------------|
+| `read()`                                            | Read the entire region into a new `Vec<u8>` |
+| `read_into(buf)`                                    | Read into a caller-supplied buffer          |
+| `read_range(start, end)`                            | Read a sub-range                            |
+| `subslice(start, end)`                              | Narrow to a sub-range                       |
+| `reader()` / `reader_at(offset)`                    | Cursor-based `BStackSliceReader`            |
+| `write(data)` *(feature `set`)*                     | Overwrite the beginning of the region       |
+| `write_range(start, data)` *(feature `set`)*        | Overwrite a sub-range                       |
+| `zero()` / `zero_range(start, n)` *(feature `set`)* | Zero the region or a sub-range              |
+
+### `BStackRange`
+
+A raw `(offset, len)` coordinate pair with no backing reference. `Copy`, serializable to/from `[u8; 16]` via `to_bytes()`/`from_bytes()`. Used for on-disk token storage.
+
+### `BStackSliceReader`
+
+A cursor-based reader over a `BStackSlice`. Implements `io::Read` and `io::Seek`.
 
 ### Lifetime model
 
-`BStackSlice<'a, A>` borrows the **allocator** for `'a`, not the `BStack`
-directly.  This lets the borrow checker statically prevent calling
-`into_stack()` — which consumes the allocator — while any slice is still alive.
+`BStackOwnedSlice<'a, A>` borrows the allocator for `'a`.  Views obtained via `as_slice[_mut]()` have a shorter lifetime tied to the borrow of the owned slice, preventing them from outliving the handle that owns the region.
 
 ### Example
 
@@ -864,26 +842,26 @@ use bstack::{BStack, BStackAllocator, LinearBStackAllocator};
 
 let alloc = LinearBStackAllocator::new(BStack::open("data.bstack")?);
 
-let slice = alloc.alloc(128)?;     // reserve 128 zero bytes
-let data  = slice.read()?;         // read them back
-alloc.dealloc(slice)?;             // release (tail → O(1) discard)
+let mut slice = alloc.alloc(128)?;      // reserve 128 zero bytes
+let data = slice.as_slice().read()?;   // read them back
+alloc.dealloc(slice)?;                 // release (tail → O(1) discard)
 
-let stack = alloc.into_stack();    // reclaim the BStack
+let stack = alloc.into_stack();        // reclaim the BStack
 ```
 
 ### `LinearBStackAllocator`
 
 The reference bump allocator.  Regions are appended sequentially to the tail.
 
-| Operation              | Without `atomic`  | With `atomic`          | Crash-safe |
-|------------------------|-------------------|------------------------|------------|
-| `alloc`                | `BStack::extend`  | `BStack::extend`       | yes        |
-| `alloc_bulk`           | `BStack::extend`  | `BStack::extend`       | yes        |
-| `realloc` grow         | `BStack::extend`  | `BStack::try_extend`   | yes        |
-| `realloc` shrink       | `BStack::discard` | `BStack::try_discard`  | yes        |
-| `dealloc` (tail)       | `BStack::discard` | `BStack::try_discard`  | yes        |
-| `dealloc` (non-tail)   | no-op             | no-op                  | yes        |
-| `dealloc_bulk` (tail)  | `BStack::discard` | `BStack::try_discard`  | yes        |
+| Operation             | Without `atomic`  | With `atomic`         | Crash-safe |
+|-----------------------|-------------------|-----------------------|------------|
+| `alloc`               | `BStack::extend`  | `BStack::extend`      | yes        |
+| `alloc_bulk`          | `BStack::extend`  | `BStack::extend`      | yes        |
+| `realloc` grow        | `BStack::extend`  | `BStack::try_extend`  | yes        |
+| `realloc` shrink      | `BStack::discard` | `BStack::try_discard` | yes        |
+| `dealloc` (tail)      | `BStack::discard` | `BStack::try_discard` | yes        |
+| `dealloc` (non-tail)  | no-op             | no-op                 | yes        |
+| `dealloc_bulk` (tail) | `BStack::discard` | `BStack::try_discard` | yes        |
 
 `realloc` returns `io::ErrorKind::Unsupported` for non-tail slices.  With the
 `atomic` feature, `realloc` also returns `Unsupported` when another thread
@@ -996,14 +974,15 @@ use bstack::{BStack, BStackAllocator, FirstFitBStackAllocator};
 
 let alloc = FirstFitBStackAllocator::new(BStack::open("data.bstack")?)?;
 
-let a = alloc.alloc(64)?;
-let b = alloc.alloc(64)?;
-a.write(b"hello world")?;
+let mut a = alloc.alloc(64)?;
+let a_start = a.start();
+let _b = alloc.alloc(64)?;
+a.as_slice_mut().write(b"hello world")?;
 
 alloc.dealloc(a)?;        // freed; slot available for reuse
 
 let c = alloc.alloc(64)?; // reuses a's slot
-assert_eq!(c.start(), a.start());
+assert_eq!(c.start(), a_start);
 
 let stack = alloc.into_stack();
 ```
@@ -1090,17 +1069,17 @@ use bstack::{BStack, BStackAllocator, BStackBulkAllocator, GhostTreeBstackAlloca
 
 let alloc = GhostTreeBstackAllocator::new(BStack::open("data.bstack")?)?;
 
-let a = alloc.alloc(64)?;
-let b = alloc.alloc(64)?;
-a.write(b"hello world")?;
+let mut a = alloc.alloc(64)?;
+let _b = alloc.alloc(64)?;
+a.as_slice_mut().write(b"hello world")?;
 
 alloc.dealloc(a)?;        // freed; slot available for reuse
 
-let c = alloc.alloc(64)?; // may reuse a's slot
+let _c = alloc.alloc(64)?; // may reuse a's slot
 
 // Bulk: one block allocation, one block free when returned together.
 let slices = alloc.alloc_bulk(&[32, 64, 128])?;
-alloc.dealloc_bulk(&slices)?;
+alloc.dealloc_bulk(slices)?;
 
 let stack = alloc.into_stack();
 ```
@@ -1133,20 +1112,20 @@ bstack = { version = "0.4", features = ["alloc", "set"] }
 
 #### Allocation policy
 
-| Request | Strategy |
-|---------|----------|
-| `len == 0` | Null handle (offset 0, len 0) |
+| Request            | Strategy                                                 |
+|--------------------|----------------------------------------------------------|
+| `len == 0`         | Null handle (offset 0, len 0)                            |
 | `len ≤ block_size` | Pop from free list; extend tail by `block_size` if empty |
-| `len > block_size` | Extend tail by `⌈len / block_size⌉ × block_size` |
+| `len > block_size` | Extend tail by `⌈len / block_size⌉ × block_size`         |
 
 The returned slice covers exactly `len` bytes; backing blocks have no visible overhead.
 
 #### Deallocation policy
 
-| Case | Strategy |
-|------|----------|
-| Oversized block at tail | `BStack::discard` (single call; crash-safe) |
-| All other blocks | Segment into `block_size` chunks; prepend each to free list |
+| Case                    | Strategy                                                    |
+|-------------------------|-------------------------------------------------------------|
+| Oversized block at tail | `BStack::discard` (single call; crash-safe)                 |
+| All other blocks        | Segment into `block_size` chunks; prepend each to free list |
 
 Slab blocks at the tail are added to the free list (not discarded) so they can be reused without searching.
 
@@ -1164,10 +1143,10 @@ With the `atomic` feature it **is `Sync`** with no allocator-level lock at all. 
 
 #### Constructors
 
-| Constructor                                    | Stack         | Effect                                                                                                          |
-|------------------------------------------------|---------------|-----------------------------------------------------------------------------------------------------------------|
-| `SlabBStackAllocator::new(stack, block_size)`  | **empty**     | Writes the 48-byte allocator header; fails with `InvalidInput` if the stack already has data.                   |
-| `SlabBStackAllocator::open(stack, block_size)` | **non-empty** | Reads and validates the stored header; fails with `InvalidInput` if the stack is empty or information mismatch. |
+| Constructor                                   | Stack         | Effect                                                                                                            |
+|-----------------------------------------------|---------------|-------------------------------------------------------------------------------------------------------------------|
+| `SlabBStackAllocator::new(stack, block_size)` | **empty**     | Writes the 48-byte allocator header; fails with `InvalidInput` if the stack already has data.                     |
+| `SlabBStackAllocator::open(stack)`            | **non-empty** | Reads and validates the stored header; fails with `InvalidInput` if the stack is empty or has a mismatched magic. |
 
 #### Example
 
@@ -1178,20 +1157,21 @@ use bstack::{BStack, BStackAllocator, SlabBStackAllocator};
 let stack = BStack::open("data.bstack")?;
 let alloc = SlabBStackAllocator::new(stack, 64)?;
 
-let a = alloc.alloc(48)?;
-let b = alloc.alloc(48)?;
-a.write(b"hello")?;
+let mut a = alloc.alloc(48)?;
+let a_start = a.start();
+let _b = alloc.alloc(48)?;
+a.as_slice_mut().write(b"hello")?;
 
 alloc.dealloc(a)?;        // returned to free list
 
 let c = alloc.alloc(32)?; // reuses a's slot
-assert_eq!(c.start(), a.start());
+assert_eq!(c.start(), a_start);
 
 let _ = alloc.into_stack();
 
 // Subsequent runs: reopen the existing stack.
 let stack = BStack::open("data.bstack")?;
-let alloc = SlabBStackAllocator::open(stack, 64)?;
+let alloc = SlabBStackAllocator::open(stack)?;
 ```
 
 ### `CheckedSlabBStackAllocator` (`alloc + set` features) *(Experimental)*
@@ -1226,18 +1206,18 @@ Every block in the arena has the shape:
 
 The overhead field encodes block state:
 
-| Value | Meaning |
-|---|---|
+| Value                   | Meaning                                                                                     |
+|-------------------------|---------------------------------------------------------------------------------------------|
 | `0x0000_0000_0000_0000` | Block is free. `data[0..8]` holds the next-free block offset (`u64` LE, `0` = end of list). |
-| `0x8NNN_NNNN_NNNN_NNNN` | Block is in use; low 63 bits are the allocation's block count; high bit is always 1. |
+| `0x8NNN_NNNN_NNNN_NNNN` | Block is in use; low 63 bits are the allocation's block count; high bit is always 1.        |
 
 A multi-block allocation stores the overhead **only in the first block**; the remaining `data_size` bytes of the first block and all subsequent blocks form one contiguous data region. A linear crash-recovery scan advances by the block count at live allocations and by one block at free blocks.
 
 #### Allocation policy
 
-| Request | Strategy |
-|---------|----------|
-| `len == 0` | Null handle (offset 0, len 0) |
+| Request           | Strategy                                                     |
+|-------------------|--------------------------------------------------------------|
+| `len == 0`        | Null handle (offset 0, len 0)                                |
 | `len ≤ data_size` | Pop from free list; extend tail by one `block_size` if empty |
 | `len > data_size` | Extend tail by `⌈(len + 8) / block_size⌉ × block_size` bytes |
 
@@ -1245,11 +1225,11 @@ Multi-block requests always extend the tail — the free list holds single block
 
 #### Deallocation policy
 
-| Case | Strategy |
-|------|----------|
+| Case                                   | Strategy                                            |
+|----------------------------------------|-----------------------------------------------------|
 | Already free (overhead high bit clear) | Return `InvalidInput` double-free error immediately |
-| Multi-block allocation at tail | `BStack::discard` (single call; crash-safe) |
-| All other cases | Each block becomes a free-list node |
+| Multi-block allocation at tail         | `BStack::discard` (single call; crash-safe)         |
+| All other cases                        | Each block becomes a free-list node                 |
 
 #### Crash consistency
 
@@ -1265,11 +1245,11 @@ With the `atomic` feature it **is `Sync`**. `alloc` / `dealloc` / `realloc` take
 
 #### Constructors
 
-| Constructor | Stack | Effect |
-|---|---|---|
-| `CheckedSlabBStackAllocator::new(stack, data_size)` | **empty** | Writes the 48-byte allocator header; fails with `InvalidInput` if the stack already has data or `data_size < 8`. |
-| `CheckedSlabBStackAllocator::open(stack)` | **non-empty** | Reads and validates the stored header, then runs `recover()` automatically. Fails with `InvalidData` on magic mismatch, invalid block size, or misaligned arena. |
-| `CheckedSlabBStackAllocator::recover()` | any | Reclaims leaked blocks and discards orphaned tails left by an unclean shutdown. Returns the count of blocks that could not be classified with certainty (`0` = fully accounted for). Called automatically by `open`; exposed for explicit inspection or re-runs. |
+| Constructor                                         | Stack         | Effect                                                                                                                                                                                                                                                           |
+|-----------------------------------------------------|---------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `CheckedSlabBStackAllocator::new(stack, data_size)` | **empty**     | Writes the 48-byte allocator header; fails with `InvalidInput` if the stack already has data or `data_size < 8`.                                                                                                                                                 |
+| `CheckedSlabBStackAllocator::open(stack)`           | **non-empty** | Reads and validates the stored header, then runs `recover()` automatically. Fails with `InvalidData` on magic mismatch, invalid block size, or misaligned arena.                                                                                                 |
+| `CheckedSlabBStackAllocator::recover()`             | any           | Reclaims leaked blocks and discards orphaned tails left by an unclean shutdown. Returns the count of blocks that could not be classified with certainty (`0` = fully accounted for). Called automatically by `open`; exposed for explicit inspection or re-runs. |
 
 #### Example
 
@@ -1281,14 +1261,15 @@ use bstack::{BStack, BStackAllocator, CheckedSlabBStackAllocator};
 let stack = BStack::open("data.bstack")?;
 let alloc = CheckedSlabBStackAllocator::new(stack, 56)?;
 
-let a = alloc.alloc(48)?;
-let b = alloc.alloc(48)?;
-a.write(b"hello")?;
+let mut a = alloc.alloc(48)?;
+let a_start = a.start();
+let _b = alloc.alloc(48)?;
+a.as_slice_mut().write(b"hello")?;
 
 alloc.dealloc(a)?;        // returned to free list
 
 let c = alloc.alloc(32)?; // reuses a's slot
-assert_eq!(c.start(), a.start());
+assert_eq!(c.start(), a_start);
 
 let _ = alloc.into_stack();
 
@@ -1296,24 +1277,6 @@ let _ = alloc.into_stack();
 let stack = BStack::open("data.bstack")?;
 let alloc = CheckedSlabBStackAllocator::open(stack)?;
 ```
-
-### `DebugCheckingAllocator` (`alloc` feature)
-
-A debug/test wrapper around any `BStackAllocator`.  It tracks allocated and freed
-regions in memory and panics immediately if it detects:
-
-- **Overlapping allocations** — the inner allocator returned a region that overlaps
-  an existing live allocation.
-- **Double-frees** — a region is freed twice within the same session.
-- **Partial or spanning frees** — a deallocation does not exactly match one recorded
-  allocation.
-
-The tracking state is **in-memory only** and is reset on process restart, so it
-complements but does not replace the allocator's own crash-safety guarantees.
-
-> **Warning:** Not for production use. The in-memory tracking state adds significant overhead, so this wrapper is intended only for debugging and testing. You should not rely on it to detect double-frees or overlapping allocations in production.
-
----
 
 ## `BStackByteVec<'a, A>` (`alloc + set` features)
 
