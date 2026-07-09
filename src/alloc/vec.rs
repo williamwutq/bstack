@@ -167,9 +167,22 @@ impl<'a, A: BStackOwnedSliceAllocator> BStackByteVec<'a, A> {
     /// Reallocate the block to hold `new_cap` bytes, updating `self.slice`.
     ///
     /// Uses `mem::replace` with a placeholder (same coords) to transfer
-    /// ownership to `realloc`.  If realloc fails, the placeholder still
-    /// points at the original region (Drop is a no-op), so `self` remains
-    /// in a valid state.
+    /// ownership to `realloc`.
+    ///
+    /// On failure, `realloc` returns the surviving allocation in
+    /// [`BStackAllocError::handle`]:
+    ///
+    /// * `Some(handle)` — we adopt it, so `self` tracks the real region (the
+    ///   untouched original, or a fully committed new region whose old block
+    ///   could not be freed) rather than the stale placeholder. **Every
+    ///   built-in allocator returns `Some` here**, so this is the only branch
+    ///   that runs in practice.
+    /// * `None` — the backing block was genuinely lost mid-operation. Keeping
+    ///   the placeholder would leave `self` pointing at a freed region that a
+    ///   later allocation may reuse, so a subsequent `push` could corrupt an
+    ///   unrelated allocation. Instead we detach to the empty sentinel: the
+    ///   vec loses its backing (its contents are gone with the allocation) and
+    ///   every subsequent operation fails cleanly rather than risking corruption.
     fn grow_to(&mut self, new_cap: u64) -> io::Result<()> {
         let new_size = Self::block_size(new_cap)?;
         let alloc: &'a A = self.slice.allocator();
@@ -183,7 +196,13 @@ impl<'a, A: BStackOwnedSliceAllocator> BStackByteVec<'a, A> {
                 self.slice = new_slice;
                 Ok(())
             }
-            Err(e) => Err(e),
+            Err(e) => {
+                self.slice = match e.handle {
+                    Some(handle) => handle,
+                    None => BStackOwnedSlice::empty(alloc),
+                };
+                Err(e.source)
+            }
         }
     }
 }
@@ -437,7 +456,9 @@ impl<'a, A: BStackOwnedSliceAllocator> BStackByteVec<'a, A> {
     /// dealloc call co-located with the type.
     pub fn dealloc(self) -> io::Result<()> {
         let alloc: &'a A = self.slice.allocator();
-        alloc.dealloc(self.slice)
+        // The vec is consumed, so there is nowhere to return a recovered handle;
+        // surface only the underlying error.
+        alloc.dealloc(self.slice).map_err(|e| e.source)
     }
 }
 
