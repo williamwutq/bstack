@@ -576,7 +576,7 @@ impl<'a, A: BStackAllocator> BStackOwnedSlice<'a, A> {
     /// Passing an arbitrary or sub-slice coordinate and then passing it to `realloc`
     /// or `dealloc` may silently corrupt allocator metadata.
     #[inline]
-    pub unsafe fn from_raw_ange(allocator: &'a A, range: BStackRange) -> Self {
+    pub unsafe fn from_raw_range(allocator: &'a A, range: BStackRange) -> Self {
         Self { allocator, range }
     }
 
@@ -648,23 +648,130 @@ impl<'a, A: BStackAllocator> BStackOwnedSlice<'a, A> {
         }
     }
 
+    /// Read the entire allocation into a new `Vec<u8>`.
+    ///
+    /// Internally borrows a [`BStackSlice`] via [`as_slice`](Self::as_slice)
+    /// and delegates to [`BStackSlice::read`].
+    #[inline]
+    pub fn read(&self) -> io::Result<Vec<u8>> {
+        self.as_slice().read()
+    }
+
+    /// Read up to `buf.len()` bytes into `buf`.
+    ///
+    /// Internally borrows a [`BStackSlice`] via [`as_slice`](Self::as_slice)
+    /// and delegates to [`BStackSlice::read_into`].
+    #[inline]
+    pub fn read_into(&self, buf: &mut [u8]) -> io::Result<()> {
+        self.as_slice().read_into(buf)
+    }
+
+    /// Read `[start, end)` relative to this allocation into a new `Vec<u8>`.
+    ///
+    /// Internally borrows a [`BStackSlice`] via [`as_slice`](Self::as_slice)
+    /// and delegates to [`BStackSlice::read_range`].
+    #[inline]
+    pub fn read_range(&self, start: u64, end: u64) -> io::Result<Vec<u8>> {
+        self.as_slice().read_range(start, end)
+    }
+
+    /// Read `[start, start + buf.len())` into `buf`.
+    ///
+    /// Internally borrows a [`BStackSlice`] via [`as_slice`](Self::as_slice)
+    /// and delegates to [`BStackSlice::read_range_into`].
+    #[inline]
+    pub fn read_range_into(&self, start: u64, buf: &mut [u8]) -> io::Result<()> {
+        self.as_slice().read_range_into(start, buf)
+    }
+
+    /// Overwrite the beginning of this allocation with `data`.
+    ///
+    /// Internally borrows a [`BStackSlice`] via [`as_slice_mut`](Self::as_slice_mut)
+    /// and delegates to [`BStackSlice::write`].
+    ///
+    /// Requires the `set` feature.
+    #[cfg(feature = "set")]
+    #[inline]
+    pub fn write(&mut self, data: impl AsRef<[u8]>) -> io::Result<()> {
+        self.as_slice_mut().write(data)
+    }
+
+    /// Overwrite `[start, start + data.len())` within this allocation.
+    ///
+    /// Internally borrows a [`BStackSlice`] via [`as_slice_mut`](Self::as_slice_mut)
+    /// and delegates to [`BStackSlice::write_range`].
+    ///
+    /// Requires the `set` feature.
+    #[cfg(feature = "set")]
+    #[inline]
+    pub fn write_range(&mut self, start: u64, data: impl AsRef<[u8]>) -> io::Result<()> {
+        self.as_slice_mut().write_range(start, data)
+    }
+
+    /// Zero out the entire allocation.
+    ///
+    /// Internally borrows a [`BStackSlice`] via [`as_slice_mut`](Self::as_slice_mut)
+    /// and delegates to [`BStackSlice::zero`].
+    ///
+    /// Requires the `set` feature.
+    #[cfg(feature = "set")]
+    #[inline]
+    pub fn zero(&mut self) -> io::Result<()> {
+        self.as_slice_mut().zero()
+    }
+
+    /// Zero `[start, start + n)` within this allocation.
+    ///
+    /// Internally borrows a [`BStackSlice`] via [`as_slice_mut`](Self::as_slice_mut)
+    /// and delegates to [`BStackSlice::zero_range`].
+    ///
+    /// Requires the `set` feature.
+    #[cfg(feature = "set")]
+    #[inline]
+    pub fn zero_range(&mut self, start: u64, n: u64) -> io::Result<()> {
+        self.as_slice_mut().zero_range(start, n)
+    }
+
     /// Create a cursor-based reader over this allocation.
     ///
-    /// The reader borrows `self` for its lifetime.
+    /// Internally borrows a [`BStackSlice`] via [`as_slice`](Self::as_slice)
+    /// and delegates to [`BStackSlice::reader`].
     #[inline]
     pub fn reader<'s>(&'s self) -> BStackSliceReader<'s> {
         self.as_slice().reader()
     }
 
-    /// Create a cursor-based writer over this allocation.
+    /// Create a cursor-based reader positioned at `offset` into this allocation.
     ///
-    /// The writer borrows `self` mutably for its lifetime.
+    /// Internally borrows a [`BStackSlice`] via [`as_slice`](Self::as_slice)
+    /// and delegates to [`BStackSlice::reader_at`].
+    #[inline]
+    pub fn reader_at<'s>(&'s self, offset: u64) -> BStackSliceReader<'s> {
+        self.as_slice().reader_at(offset)
+    }
+
+    /// Create a cursor-based writer over this allocation, borrowing it mutably.
+    ///
+    /// Internally borrows a [`BStackSlice`] via [`as_slice_mut`](Self::as_slice_mut)
+    /// and delegates to [`BStackSlice::writer`].
     ///
     /// Requires the `set` feature.
     #[cfg(feature = "set")]
     #[inline]
     pub fn writer<'s>(&'s mut self) -> BStackSliceWriter<'s> {
         self.as_slice_mut().writer()
+    }
+
+    /// Create a cursor-based writer positioned at `offset`, borrowing this allocation mutably.
+    ///
+    /// Internally borrows a [`BStackSlice`] via [`as_slice_mut`](Self::as_slice_mut)
+    /// and delegates to [`BStackSlice::writer_at`].
+    ///
+    /// Requires the `set` feature.
+    #[cfg(feature = "set")]
+    #[inline]
+    pub fn writer_at<'s>(&'s mut self, offset: u64) -> BStackSliceWriter<'s> {
+        self.as_slice_mut().writer_at(offset)
     }
 }
 
