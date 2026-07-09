@@ -8,9 +8,23 @@ This document describes the ownership, lifetime, and on-disk layout system for B
 
 The design of this RAII semantics is inspired by C++ RAII with shared ownership: `std::unique_ptr`, `std::shared_ptr`, and `std::weak_ptr`. It is adapted to persistent storage and Rust `Drop` semantics.
 
+## Why
+
+The allocation layer, which exists on top of `BStack`'s atomicity and crash-safety guarantees, already abstracts away the details of persistent storage and complicated IO operations. While `BStackRange`, `BStackSlice`, and `BStackOwnedSlice` already provide the ownership, lifetime, mutability, and allocation guarantees needed for sound persistent storage, they deliberately operate at the level of byte ranges rather than typed values. This keeps the core allocator small, composable, and independent of any object model.
+
+Working directly with byte slices, however, becomes repetitive for larger object graphs. Every block requires manual offset resolution, header parsing, field access, recursive destruction, and runtime type checking. While all of this is possible using the primitive APIs alone, it places the same boilerplate on every caller. This naturally require a new, higher level of abstractions that also concerns itself with Typing and automatic resource management, in addition to the existing guarantees of the underlying primitives. The RAII layer is that abstraction.
+
+This layer exists to generate that boilerplate automatically. It introduces typed wrappers, generated accessors, recursive destruction, shared ownership, and compile-time validation while preserving the semantics of the underlying primitives. The ownership model is not replaced or redefined. Every typed handle ultimately wraps `BStackRange`, `BStackSlice`, or `BStackOwnedSlice`, and all persistent allocation semantics continue to be enforced by those foundational types.
+
+As a result, the core API remains small, providing a minimal set of guarantees of atomicity and crash-safety, suitable for applications that need safe, but raw IO, the alloc layer provides allocation and lifetime guarantees, suitable for applications that builds complicated blocks of data inside single files while manual management of these blocks is desired, while higher-level code can opt into a strongly typed, RAII-style interface without sacrificing the guarantees of the underlying storage model.
+
+## When
+
+`bstack` crate requires stable features to be ABI stable since breaking ABI changes are to be avoided unless soundness or security is at stake. The RAII layer is a new feature that introduces a lot of ABI through block layouts, control blocks, and refcounting. It also introduces a lot of new APIs, which are not yet stable. Therefore, merging into `master` might take a while.
+
 ---
 
-## Primitive Handles: `BStackRange`, `BStackSlice`, `BStackOwnedSlice`
+## Primitive Handles
 
 The mainline `alloc` module splits what used to be a single foundational handle into three tiers. Each tier adds a capability the previous one lacks.
 
@@ -256,7 +270,7 @@ Plain `#[bstack_block(rc)]` has no weak count and no control block. So `BStackRc
 
 ---
 
-## Control Block: Strong/Weak Split
+## Strong and Weak References via Control Block
 
 Checking only the `EightCC` tag in `upgrade()` is not a liveness guarantee. If the block is deallocated, the allocator may later hand the same offset to a new unrelated allocation of the same type. Then the tag check passes on stale data. Blocks that expect weak references need a control block that governs liveness indirectly, the same way `std::sync::Arc`/`Weak` do.
 
@@ -478,9 +492,9 @@ Capturing values before `dealloc_range` is safe because `BStackRef<T>` and the c
 
 ---
 
-## `bstack_cast`: Type-Checked Handle Conversion
+## `bstack_cast!`: Type-Checked Handle Conversion
 
-`bstack_cast` converts between a typed block handle (e.g. `BStackOwned<X, A>` or borrowed `X`) and its untyped primitive (`BStackOwnedSlice<'a, A>` or `BStackSlice<'a>`), in both directions. Upcasts (typed → untyped) are infallible. Downcasts (untyped → typed) check the `EightCC` tag stored in the block header and are fallible.
+`bstack_cast!` converts between a typed block handle (e.g. `BStackOwned<X, A>` or borrowed `X`) and its untyped primitive (`BStackOwnedSlice<'a, A>` or `BStackSlice<'a>`), in both directions. Upcasts (typed → untyped) are infallible. Downcasts (untyped → typed) check the `EightCC` tag stored in the block header and are fallible.
 
 The `EightCC` tag is derived from the type name at `#[bstack_block]` expansion time and written into every block's `BlockHeader` by the allocator at creation. It is the sole discriminant for safe downcasting.
 
