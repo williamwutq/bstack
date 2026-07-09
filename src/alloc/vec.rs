@@ -174,9 +174,11 @@ impl<'a, A: BStackOwnedSliceAllocator> BStackByteVec<'a, A> {
     ///
     /// * `Some(handle)` — we adopt it, so `self` tracks the real region (the
     ///   untouched original, or a fully committed new region whose old block
-    ///   could not be freed) rather than the stale placeholder. **Every
-    ///   built-in allocator returns `Some` here**, so this is the only branch
-    ///   that runs in practice.
+    ///   could not be freed) rather than the stale placeholder. Built-in
+    ///   allocators return `Some` for the growth reallocations `grow_to`
+    ///   performs (the `None`-producing paths are non-tail *shrinks* and
+    ///   free-list frees, which this method never triggers), so this is the
+    ///   only branch that runs in practice.
     /// * `None` — the backing block was genuinely lost mid-operation. Keeping
     ///   the placeholder would leave `self` pointing at a freed region that a
     ///   later allocation may reuse, so a subsequent `push` could corrupt an
