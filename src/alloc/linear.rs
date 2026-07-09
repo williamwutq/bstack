@@ -70,7 +70,9 @@ use std::{fmt, io};
 /// let alloc = LinearBStackAllocator::new(BStack::open("data.bstack")?);
 /// let mut slice = alloc.alloc(128)?;
 /// let data = slice.read()?;
-/// alloc.dealloc(slice)?;
+/// // On failure `dealloc` returns the handle inside the error; surface just
+/// // the underlying error with `.map_err(|e| e.source)`.
+/// alloc.dealloc(slice).map_err(|e| e.source)?;
 /// let stack = alloc.into_stack();
 /// # Ok(())
 /// # }

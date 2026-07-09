@@ -141,7 +141,9 @@ const ALFF_MAGIC_PREFIX: [u8; 6] = *b"ALFF\x00\x01";
 /// a.write(b"hello world")?;
 ///
 /// let a_start = a.start();
-/// alloc.dealloc(a)?;           // freed; coalesced if adjacent to another free block
+/// // On failure `dealloc` returns the handle inside the error; surface just
+/// // the underlying error with `.map_err(|e| e.source)`.
+/// alloc.dealloc(a).map_err(|e| e.source)?;  // freed; coalesced if adjacent to another free block
 ///
 /// let c = alloc.alloc(64)?;    // reuses a's slot
 /// assert_eq!(c.start(), a_start);

@@ -892,7 +892,9 @@ let alloc = LinearBStackAllocator::new(BStack::open("data.bstack")?);
 
 let mut slice = alloc.alloc(128)?;      // reserve 128 zero bytes
 let data = slice.as_slice().read()?;   // read them back
-alloc.dealloc(slice)?;                 // release (tail → O(1) discard)
+// dealloc returns the handle inside its error on failure; `.map_err(|e| e.source)`
+// surfaces just the io::Error.
+alloc.dealloc(slice).map_err(|e| e.source)?;  // release (tail → O(1) discard)
 
 let stack = alloc.into_stack();        // reclaim the BStack
 ```
@@ -986,6 +988,6 @@ assert_eq!(v.pop()?, Some(b'C'));
 let all = v.read_bytes()?;
 println!("{}", String::from_utf8_lossy(&all));
 
-alloc.dealloc(v.into_raw_block())?;
+alloc.dealloc(v.into_raw_block()).map_err(|e| e.source)?;
 ```
 
