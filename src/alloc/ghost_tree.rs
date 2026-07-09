@@ -928,9 +928,14 @@ impl BStackAllocator for GhostTreeBstackAllocator {
             .get(start, start + old_len)
             .and_then(|data| self.stack.set(new_start, &data))
         {
-            // The new region was allocated but the copy failed; the original
-            // still holds the data. Return it — the new region is reclaimed by
-            // the allocator's recovery on the next open.
+            // The new region was allocated but the copy failed. Roll it back
+            // (best-effort) so it is not leaked: GhostTree recovery only rebuilds
+            // the free tree by walking existing nodes, so an allocated-but-
+            // untracked region cannot be reclaimed on reopen and would leak the
+            // space permanently. The original still holds the data, so hand it
+            // back. If the rollback dealloc also fails the region is genuinely
+            // lost (the same I/O fault just prevented reclaiming it).
+            let _ = self.dealloc(new_slice);
             return Err(BStackAllocError {
                 source,
                 // SAFETY: (start, old_len) still describes the live original block.

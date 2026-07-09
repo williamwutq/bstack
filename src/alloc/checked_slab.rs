@@ -1574,8 +1574,14 @@ impl BStackAllocator for CheckedSlabBStackAllocator {
                 // alloc and dealloc each handle their own free-list and tail
                 // operations independently.
                 let mut new_slice = self.alloc(new_len)?;
-                let data = slice.read()?;
-                new_slice.write(&data)?;
+                // Copy old → new. If this fails, roll back the freshly-allocated
+                // block (best-effort) so it is not leaked: an allocated-but-
+                // orphaned block stays marked in-use and no handle can free it.
+                // The original is untouched (`recovered` still points at it).
+                if let Err(source) = slice.read().and_then(|data| new_slice.write(&data)) {
+                    let _ = self.dealloc(new_slice);
+                    return Err(source);
+                }
                 // New region committed and populated; it is now the survivor, so a
                 // failure freeing the old block returns the new region instead.
                 recovered = (new_slice.start(), new_len);
