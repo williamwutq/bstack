@@ -995,9 +995,12 @@ impl BStackAllocator for FirstFitBStackAllocator {
 
         let start = slice.start();
         let old_len = slice.len();
-        // Set to true once the original block has been freed as part of a move
-        // to a new block, after which it can no longer be safely returned.
-        let mut lost = false;
+        // The surviving allocation to hand back on failure. Starts as the
+        // original block; in the move-to-new-block paths it becomes the new
+        // region once that region is committed and populated (which happens
+        // before the old block is freed), so a later failure freeing the old
+        // block still returns a valid, fully-resized handle.
+        let mut recovered = (start, old_len);
         let result = (|| -> io::Result<BStackOwnedSlice<'a, Self>> {
             // Use the aligned block size for validation (same reason as dealloc).
             let aligned_current_len = self.align_len(slice.len());
@@ -1293,9 +1296,10 @@ impl BStackAllocator for FirstFitBStackAllocator {
                 } else {
                     block_found.0
                 };
-                // Past this point the original block is freed; it can no longer be
-                // returned, and the state is repaired by crash recovery on error.
-                lost = true;
+                // The new block is committed and populated; it is now the
+                // survivor, so a failure freeing the old block returns the new
+                // region (the old block leaks until crash recovery).
+                recovered = (new_payload, new_len);
                 self.add_to_free_list(slice.start())?;
                 self.cascade_discard_free_tail()?;
                 self.clear_recovery_needed()?;
@@ -1315,9 +1319,10 @@ impl BStackAllocator for FirstFitBStackAllocator {
                     .copy_from_slice(&aligned_new_len.to_le_bytes());
                 self.set_recovery_needed()?;
                 let ptr = self.stack.push(&block_buf)? + Self::BLOCK_HEADER_SIZE;
-                // Past this point the original block is freed; it can no longer be
-                // returned, and the state is repaired by crash recovery on error.
-                lost = true;
+                // The new block is committed and populated; it is now the
+                // survivor, so a failure freeing the old block returns the new
+                // region (the old block leaks until crash recovery).
+                recovered = (ptr, new_len);
                 self.add_to_free_list(slice.start())?;
                 self.cascade_discard_free_tail()?;
                 self.clear_recovery_needed()?;
@@ -1327,12 +1332,11 @@ impl BStackAllocator for FirstFitBStackAllocator {
         })();
         result.map_err(|source| BStackAllocError {
             source,
-            handle: if lost {
-                None
-            } else {
-                // SAFETY: (start, old_len) still describes the live original block.
-                Some(unsafe { BStackOwnedSlice::from_raw_parts(self, start, old_len) })
-            },
+            // SAFETY: `recovered` names a live region owned by the caller — the
+            // untouched original, or the committed new region on the move paths.
+            handle: Some(unsafe {
+                BStackOwnedSlice::from_raw_parts(self, recovered.0, recovered.1)
+            }),
         })
     }
 }
