@@ -1,4 +1,6 @@
-use super::{BStackAllocator, BStackBulkAllocator, BStackOwnedSlice};
+use super::{
+    BStackAllocError, BStackAllocator, BStackBulkAllocError, BStackBulkAllocator, BStackOwnedSlice,
+};
 use crate::BStack;
 #[cfg(not(feature = "atomic"))]
 use std::cell::Cell;
@@ -132,36 +134,44 @@ impl BStackAllocator for LinearBStackAllocator {
         &'a self,
         handle: BStackOwnedSlice<'a, Self>,
         new_len: u64,
-    ) -> io::Result<BStackOwnedSlice<'a, Self>> {
+    ) -> Result<BStackOwnedSlice<'a, Self>, BStackAllocError<'a, Self>> {
         let start = handle.start();
         let old_len = handle.len();
         let end = handle.end();
         // handle is dropped here (no-op Drop); we reconstruct below on success
-        let current_tail = self.stack.len()?;
-        if end != current_tail {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "LinearBStackAllocator does not support reallocation of non-tail slices; \
-                 callers must alloc a new region and copy manually. \
-                 Note: dealloc of the old (non-tail) slice is also a no-op and leaks the region.",
-            ));
-        }
-        match new_len.cmp(&old_len) {
-            std::cmp::Ordering::Equal => {
-                // SAFETY: same region, reconstructed handle
-                Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, start, old_len) })
+        (|| -> io::Result<BStackOwnedSlice<'a, Self>> {
+            let current_tail = self.stack.len()?;
+            if end != current_tail {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "LinearBStackAllocator does not support reallocation of non-tail slices; \
+                     callers must alloc a new region and copy manually. \
+                     Note: dealloc of the old (non-tail) slice is also a no-op and leaks the region.",
+                ));
             }
-            std::cmp::Ordering::Greater => {
-                self.stack.extend(new_len - old_len)?;
-                // SAFETY: tail was extended in place
-                Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, start, new_len) })
+            match new_len.cmp(&old_len) {
+                std::cmp::Ordering::Equal => {
+                    // SAFETY: same region, reconstructed handle
+                    Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, start, old_len) })
+                }
+                std::cmp::Ordering::Greater => {
+                    self.stack.extend(new_len - old_len)?;
+                    // SAFETY: tail was extended in place
+                    Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, start, new_len) })
+                }
+                std::cmp::Ordering::Less => {
+                    self.stack.discard(old_len - new_len)?;
+                    // SAFETY: tail was shrunk in place
+                    Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, start, new_len) })
+                }
             }
-            std::cmp::Ordering::Less => {
-                self.stack.discard(old_len - new_len)?;
-                // SAFETY: tail was shrunk in place
-                Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, start, new_len) })
-            }
-        }
+        })()
+        .map_err(|source| BStackAllocError {
+            source,
+            // Every failure path above leaves the original region intact.
+            // SAFETY: (start, old_len) still describes the live, unmodified allocation.
+            handle: Some(unsafe { BStackOwnedSlice::from_raw_parts(self, start, old_len) }),
+        })
     }
 
     // With the `atomic` feature the tail check and the modification are a
@@ -173,60 +183,93 @@ impl BStackAllocator for LinearBStackAllocator {
         &'a self,
         handle: BStackOwnedSlice<'a, Self>,
         new_len: u64,
-    ) -> io::Result<BStackOwnedSlice<'a, Self>> {
+    ) -> Result<BStackOwnedSlice<'a, Self>, BStackAllocError<'a, Self>> {
         let start = handle.start();
         let old_len = handle.len();
         let end = handle.end();
         // handle dropped (no-op); reconstruct below on success
-        match new_len.cmp(&old_len) {
-            std::cmp::Ordering::Equal => {
-                Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, start, old_len) })
-            }
-            std::cmp::Ordering::Greater => {
-                let delta = new_len - old_len;
-                let zeros = vec![0u8; delta as usize];
-                if !self.stack.try_extend(end, zeros)? {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        "LinearBStackAllocator does not support reallocation of non-tail slices; \
-                         callers must alloc a new region and copy manually. \
-                         Note: dealloc of the old (non-tail) slice is also a no-op and leaks the region.",
-                    ));
+        (|| -> io::Result<BStackOwnedSlice<'a, Self>> {
+            match new_len.cmp(&old_len) {
+                std::cmp::Ordering::Equal => {
+                    Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, start, old_len) })
                 }
-                // SAFETY: tail atomically extended in place
-                Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, start, new_len) })
-            }
-            std::cmp::Ordering::Less => {
-                if !self.stack.try_discard(end, old_len - new_len)? {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        "LinearBStackAllocator does not support reallocation of non-tail slices; \
-                         callers must alloc a new region and copy manually. \
-                         Note: dealloc of the old (non-tail) slice is also a no-op and leaks the region.",
-                    ));
+                std::cmp::Ordering::Greater => {
+                    let delta = new_len - old_len;
+                    let zeros = vec![0u8; delta as usize];
+                    if !self.stack.try_extend(end, zeros)? {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Unsupported,
+                            "LinearBStackAllocator does not support reallocation of non-tail slices; \
+                             callers must alloc a new region and copy manually. \
+                             Note: dealloc of the old (non-tail) slice is also a no-op and leaks the region.",
+                        ));
+                    }
+                    // SAFETY: tail atomically extended in place
+                    Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, start, new_len) })
                 }
-                // SAFETY: tail atomically shrunk in place
-                Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, start, new_len) })
+                std::cmp::Ordering::Less => {
+                    if !self.stack.try_discard(end, old_len - new_len)? {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Unsupported,
+                            "LinearBStackAllocator does not support reallocation of non-tail slices; \
+                             callers must alloc a new region and copy manually. \
+                             Note: dealloc of the old (non-tail) slice is also a no-op and leaks the region.",
+                        ));
+                    }
+                    // SAFETY: tail atomically shrunk in place
+                    Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, start, new_len) })
+                }
             }
-        }
+        })()
+        .map_err(|source| BStackAllocError {
+            source,
+            // Every failure path above leaves the original region intact.
+            // SAFETY: (start, old_len) still describes the live, unmodified allocation.
+            handle: Some(unsafe { BStackOwnedSlice::from_raw_parts(self, start, old_len) }),
+        })
     }
 
     #[cfg(not(feature = "atomic"))]
-    fn dealloc(&self, handle: BStackOwnedSlice<'_, Self>) -> io::Result<()> {
+    fn dealloc<'a>(
+        &'a self,
+        handle: BStackOwnedSlice<'a, Self>,
+    ) -> Result<(), BStackAllocError<'a, Self>> {
+        let start = handle.start();
         let end = handle.end();
         let len = handle.len();
-        let current_tail = self.stack.len()?;
-        if end == current_tail {
-            self.stack.discard(len)?;
-        }
-        Ok(())
+        (|| -> io::Result<()> {
+            let current_tail = self.stack.len()?;
+            if end == current_tail {
+                self.stack.discard(len)?;
+            }
+            Ok(())
+        })()
+        .map_err(|source| BStackAllocError {
+            source,
+            // A failed discard leaves the region still allocated.
+            // SAFETY: (start, len) still describes the live allocation.
+            handle: Some(unsafe { BStackOwnedSlice::from_raw_parts(self, start, len) }),
+        })
     }
 
     #[cfg(feature = "atomic")]
-    fn dealloc(&self, handle: BStackOwnedSlice<'_, Self>) -> io::Result<()> {
+    fn dealloc<'a>(
+        &'a self,
+        handle: BStackOwnedSlice<'a, Self>,
+    ) -> Result<(), BStackAllocError<'a, Self>> {
+        let start = handle.start();
+        let end = handle.end();
+        let len = handle.len();
         // try_discard is a no-op when the tail has moved, matching non-tail dealloc semantics.
-        self.stack.try_discard(handle.end(), handle.len())?;
-        Ok(())
+        self.stack
+            .try_discard(end, len)
+            .map(|_| ())
+            .map_err(|source| BStackAllocError {
+                source,
+                // A failed discard leaves the region still allocated.
+                // SAFETY: (start, len) still describes the live allocation.
+                handle: Some(unsafe { BStackOwnedSlice::from_raw_parts(self, start, len) }),
+            })
     }
 }
 
@@ -291,24 +334,32 @@ impl BStackBulkAllocator for LinearBStackAllocator {
     fn dealloc_bulk<'a>(
         &'a self,
         handles: impl IntoIterator<Item = Self::Allocated<'a>>,
-    ) -> Result<(), Self::Error> {
-        let current_tail = self.stack.len()?;
+    ) -> Result<(), BStackBulkAllocError<'a, Self>> {
         let mut sorted: Vec<BStackOwnedSlice<'a, Self>> = handles.into_iter().collect();
         if sorted.is_empty() {
             return Ok(());
         }
         sorted.sort_by_key(|s| std::cmp::Reverse(s.end()));
-        let mut discard_start = current_tail;
-        for handle in &sorted {
-            if handle.end() == discard_start {
-                discard_start = handle.start();
+        let result = (|| -> io::Result<()> {
+            let current_tail = self.stack.len()?;
+            let mut discard_start = current_tail;
+            for handle in &sorted {
+                if handle.end() == discard_start {
+                    discard_start = handle.start();
+                }
             }
-        }
-        let to_discard = current_tail - discard_start;
-        if to_discard > 0 {
-            self.stack.discard(to_discard)?;
-        }
-        Ok(())
+            let to_discard = current_tail - discard_start;
+            if to_discard > 0 {
+                self.stack.discard(to_discard)?;
+            }
+            Ok(())
+        })();
+        // The discard is a single call: on failure nothing was freed, so every
+        // handle is still owned by the caller.
+        result.map_err(|source| BStackBulkAllocError {
+            source,
+            handles: sorted,
+        })
     }
 
     // With `atomic`, we snapshot the tail once to determine what to discard,
@@ -319,24 +370,32 @@ impl BStackBulkAllocator for LinearBStackAllocator {
     fn dealloc_bulk<'a>(
         &'a self,
         handles: impl IntoIterator<Item = Self::Allocated<'a>>,
-    ) -> Result<(), Self::Error> {
-        let current_tail = self.stack.len()?;
+    ) -> Result<(), BStackBulkAllocError<'a, Self>> {
         let mut sorted: Vec<BStackOwnedSlice<'a, Self>> = handles.into_iter().collect();
         if sorted.is_empty() {
             return Ok(());
         }
         sorted.sort_by_key(|s| std::cmp::Reverse(s.end()));
-        let mut discard_start = current_tail;
-        for handle in &sorted {
-            if handle.end() == discard_start {
-                discard_start = handle.start();
+        let result = (|| -> io::Result<()> {
+            let current_tail = self.stack.len()?;
+            let mut discard_start = current_tail;
+            for handle in &sorted {
+                if handle.end() == discard_start {
+                    discard_start = handle.start();
+                }
             }
-        }
-        let to_discard = current_tail - discard_start;
-        if to_discard > 0 {
-            self.stack.try_discard(current_tail, to_discard)?;
-        }
-        Ok(())
+            let to_discard = current_tail - discard_start;
+            if to_discard > 0 {
+                self.stack.try_discard(current_tail, to_discard)?;
+            }
+            Ok(())
+        })();
+        // The try_discard is a single call: on failure nothing was freed, so
+        // every handle is still owned by the caller.
+        result.map_err(|source| BStackBulkAllocError {
+            source,
+            handles: sorted,
+        })
     }
 }
 
