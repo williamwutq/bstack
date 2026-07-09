@@ -340,6 +340,7 @@ concurrently with each other and with `peek`/`get` calls.
 
 ```rust
 use std::io::{Read, SeekFrom, Seek};
+use bstack::{BStack, BStackReader};
 let stack = BStack::open("log.bin")?;
 let mut reader = stack.reader();        // from the start
 let mut mid    = stack.reader_at(6);   // from offset 6
