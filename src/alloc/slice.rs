@@ -276,6 +276,35 @@ impl<'a> BStackSlice<'a> {
         self.range.range()
     }
 
+    /// Return the raw coordinate pair as a [`BStackRange`].
+    #[inline]
+    pub fn as_range(&self) -> BStackRange {
+        self.range
+    }
+
+    /// Serialize the coordinate pair to a 16-byte array: `offset` (8 bytes LE) then `len` (8 bytes LE).
+    ///
+    /// Delegates to [`BStackRange::to_bytes`]. The result can be stored on disk
+    /// and later reconstructed with [`from_bytes`](Self::from_bytes).
+    #[inline]
+    pub fn to_bytes(&self) -> [u8; 16] {
+        self.range.to_bytes()
+    }
+
+    /// Deserialize a `BStackSlice` from a 16-byte array produced by [`to_bytes`](Self::to_bytes).
+    ///
+    /// # Safety
+    ///
+    /// `[offset, offset + len)` should lie within the current payload of `stack`
+    /// for I/O to succeed.
+    #[inline]
+    pub unsafe fn from_bytes(stack: &'a BStack, bytes: [u8; 16]) -> Self {
+        Self {
+            stack,
+            range: BStackRange::from_bytes(bytes),
+        }
+    }
+
     /// Return the underlying [`BStack`].
     #[inline]
     pub fn stack(&self) -> &'a BStack {
@@ -536,6 +565,14 @@ impl<'a> From<BStackSlice<'a>> for BStackSliceWriter<'a> {
 /// - [`as_slice_mut`](Self::as_slice_mut) — exclusive view, allows reads and
 ///   writes. Blocks any other use of `self` while live.
 ///
+/// # Serialization
+///
+/// [`to_bytes`](Self::to_bytes) encodes the coordinate pair as a 16-byte
+/// little-endian array for on-disk storage; [`from_bytes`](Self::from_bytes)
+/// reconstructs the handle from those bytes. [`as_range`](Self::as_range)
+/// extracts the raw [`BStackRange`] for passing to code that should not hold
+/// an ownership handle.
+///
 /// # Drop
 ///
 /// Drop is a no-op. The allocation persists on disk beyond this handle's scope.
@@ -626,6 +663,37 @@ impl<'a, A: BStackAllocator> BStackOwnedSlice<'a, A> {
     #[inline]
     pub fn range(&self) -> Range<u64> {
         self.range.range()
+    }
+
+    /// Return the raw coordinate pair as a [`BStackRange`].
+    #[inline]
+    pub fn as_range(&self) -> BStackRange {
+        self.range
+    }
+
+    /// Serialize the coordinate pair to a 16-byte array: `offset` (8 bytes LE) then `len` (8 bytes LE).
+    ///
+    /// Delegates to [`BStackRange::to_bytes`]. The result can be stored on disk
+    /// and later reconstructed with [`from_bytes`](Self::from_bytes).
+    #[inline]
+    pub fn to_bytes(&self) -> [u8; 16] {
+        self.range.to_bytes()
+    }
+
+    /// Deserialize an owned handle from a 16-byte array produced by [`to_bytes`](Self::to_bytes).
+    ///
+    /// # Safety
+    ///
+    /// The decoded `(offset, len)` must describe an allocation that was returned
+    /// by `allocator.alloc` or a prior `allocator.realloc` and has not yet been
+    /// freed. Passing a stale, forged, or sub-slice coordinate and then passing
+    /// the handle to `realloc` or `dealloc` may silently corrupt allocator metadata.
+    #[inline]
+    pub unsafe fn from_bytes(allocator: &'a A, bytes: [u8; 16]) -> Self {
+        Self {
+            allocator,
+            range: BStackRange::from_bytes(bytes),
+        }
     }
 
     /// Return the allocator that owns this handle.
