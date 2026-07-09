@@ -136,14 +136,15 @@ const ALFF_MAGIC_PREFIX: [u8; 6] = *b"ALFF\x00\x01";
 /// # fn main() -> std::io::Result<()> {
 /// let alloc = FirstFitBStackAllocator::new(BStack::open("data.bstack")?)?;
 ///
-/// let a = alloc.alloc(64)?;
+/// let mut a = alloc.alloc(64)?;
 /// let b = alloc.alloc(64)?;
 /// a.write(b"hello world")?;
 ///
+/// let a_start = a.start();
 /// alloc.dealloc(a)?;           // freed; coalesced if adjacent to another free block
 ///
 /// let c = alloc.alloc(64)?;    // reuses a's slot
-/// assert_eq!(c.start(), a.start());
+/// assert_eq!(c.start(), a_start);
 ///
 /// let stack = alloc.into_stack();
 /// # Ok(())
