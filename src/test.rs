@@ -2300,7 +2300,9 @@ mod alloc_tests {
         let s = alloc.alloc(8).unwrap();
         let _ = alloc.alloc(4).unwrap(); // push another on top
         let err = alloc.realloc(s, 16).unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+        assert_eq!(err.source.kind(), std::io::ErrorKind::Unsupported);
+        // A failed realloc must hand the untouched original back to the caller.
+        assert!(err.handle.is_some());
     }
 
     // 13. dealloc tail reclaims space

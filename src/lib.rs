@@ -431,6 +431,12 @@
 //!   adds atomic bulk operations.  Both methods are required with no default; on error
 //!   the backing store is left unchanged unless a crash occur.
 //!
+//! * [`BStackAllocError`]`<'a, A>` — error returned by `realloc` / `dealloc`.
+//!   Carries the failing `source` plus `handle: Option<A::Allocated<'a>>`, the
+//!   surviving allocation handed back to the caller so a failed resize/free is
+//!   not a silent leak.  [`BStackBulkAllocError`] is its `dealloc_bulk`
+//!   counterpart, returning a `Vec` of the handles it did not free.
+//!
 //! * [`BStackRange`] — raw `(offset, len)` pair; `Copy`, no pointer, no I/O.
 //!   Serialises to/from `[u8; 16]` for persistent bookkeeping.
 //!
@@ -567,8 +573,8 @@ mod test;
 mod alloc;
 #[cfg(feature = "alloc")]
 pub use alloc::{
-    BStackAllocator, BStackBulkAllocator, BStackOwnedSlice, BStackOwnedSliceAllocator, BStackRange,
-    BStackSlice, BStackSliceReader, LinearBStackAllocator,
+    BStackAllocError, BStackAllocator, BStackBulkAllocError, BStackBulkAllocator, BStackOwnedSlice,
+    BStackOwnedSliceAllocator, BStackRange, BStackSlice, BStackSliceReader, LinearBStackAllocator,
 };
 #[cfg(all(feature = "alloc", feature = "set"))]
 pub use alloc::{

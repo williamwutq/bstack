@@ -510,7 +510,7 @@ bstack = { version = "0.4", features = ["set"] }
 
 ### `alloc`
 
-Enables the region-management layer on top of `BStack`: `BStackAllocator`, `BStackBulkAllocator`, `BStackOwnedSliceAllocator`, `BStackRange`, `BStackOwnedSlice`, `BStackSlice`, `BStackSliceReader`, `LinearBStackAllocator`, and `GhostTreeBstackAllocator`.  Combined with `set`, also enables `BStackSliceWriter`, `FirstFitBStackAllocator`, `SlabBStackAllocator`, `CheckedSlabBStackAllocator`, `BStackByteVec`, and `BStackByteVecIter`.
+Enables the region-management layer on top of `BStack`: `BStackAllocator`, `BStackBulkAllocator`, `BStackOwnedSliceAllocator`, `BStackAllocError`, `BStackBulkAllocError`, `BStackRange`, `BStackOwnedSlice`, `BStackSlice`, `BStackSliceReader`, `LinearBStackAllocator`, and `GhostTreeBstackAllocator`.  Combined with `set`, also enables `BStackSliceWriter`, `FirstFitBStackAllocator`, `SlabBStackAllocator`, `CheckedSlabBStackAllocator`, `BStackByteVec`, and `BStackByteVecIter`.
 
 ```toml
 [dependencies]
@@ -753,16 +753,57 @@ pub trait BStackAllocator: Sized {
     fn stack(&self) -> &BStack;
     fn into_stack(self) -> BStack;
     fn alloc(&self, len: u64) -> Result<Self::Allocated<'_>, Self::Error>;
+
+    // On failure, realloc/dealloc return a BStackAllocError carrying the
+    // surviving allocation (see below), so a failed operation never leaks it.
     fn realloc<'a>(&'a self, handle: Self::Allocated<'a>, new_len: u64)
-        -> Result<Self::Allocated<'a>, Self::Error>;
+        -> Result<Self::Allocated<'a>, BStackAllocError<'a, Self>>;
 
     // Default no-op; override for free-list allocators:
-    fn dealloc(&self, handle: Self::Allocated<'_>) -> Result<(), Self::Error> { Ok(()) }
+    fn dealloc<'a>(&'a self, handle: Self::Allocated<'a>)
+        -> Result<(), BStackAllocError<'a, Self>> { Ok(()) }
 
     // Delegation helpers:
     fn len(&self) -> io::Result<u64>;
     fn is_empty(&self) -> io::Result<bool>;
 }
+```
+
+#### `BStackAllocError<'a, A>` — the failing handle is returned, not leaked
+
+`realloc` and `dealloc` consume the handle by value, but a failed resize or free
+almost always leaves a valid allocation behind — either the original region is
+untouched, or a new region is fully committed. Because `BStackOwnedSlice`'s
+`Drop` is a no-op, dropping that handle on the error path would silently leak the
+region, so both methods return it instead:
+
+```rust
+pub struct BStackAllocError<'a, A: BStackAllocator> {
+    pub source: A::Error,
+    /// `Some` — the region survived and is owned by the caller again
+    /// (implementations return this whenever possible); `None` — the allocation
+    /// was genuinely lost mid-operation (recoverable only via crash recovery).
+    pub handle: Option<A::Allocated<'a>>,
+}
+```
+
+It implements `Display` (delegating to `source`) and `std::error::Error`, so `?`
+works within functions that return it. Converting *out* to a bare `Self::Error`
+discards the recovered handle, so that step is deliberately explicit — decide
+whether to retry, fall back, or free the allocation first:
+
+```rust
+// Give up and surface just the error (drops the recovered handle):
+let resized = alloc.realloc(handle, new_len).map_err(|e| e.source)?;
+
+// Or recover the handle and retry / fall back:
+let resized = match alloc.realloc(handle, new_len) {
+    Ok(h) => h,
+    Err(e) => {
+        let original = e.handle.expect("region survived the failed realloc");
+        // ... retry with a different size, or alloc.dealloc(original), etc.
+    }
+};
 ```
 
 ### `BStackOwnedSliceAllocator` supertrait
@@ -789,10 +830,16 @@ pub trait BStackBulkAllocator: BStackAllocator {
     fn alloc_bulk(&self, lengths: impl AsRef<[u64]>)
         -> Result<Vec<Self::Allocated<'_>>, Self::Error>;
 
+    // On failure, returns the handles it did not free (every handle, for an
+    // atomic implementation) rather than leaking them.
     fn dealloc_bulk<'a>(&'a self, handles: impl IntoIterator<Item = Self::Allocated<'a>>)
-        -> Result<(), Self::Error>;
+        -> Result<(), BStackBulkAllocError<'a, Self>>;
 }
 ```
+
+`BStackBulkAllocError<'a, A>` is the bulk analogue of `BStackAllocError`: it
+carries `source: A::Error` plus `handles: Vec<A::Allocated<'a>>`, the handles
+still owned by the caller after a failed bulk free.
 
 ### `BStackOwnedSlice<'a, A>`
 
