@@ -24,15 +24,15 @@ The mainline `alloc` module splits what used to be a single foundational handle 
 
 Built on top of `BStackRange` / `BStackSlice` / `BStackOwnedSlice`:
 
-| Type                         | Ownership                                         | Drop Behavior                       |
-|------------------------------|---------------------------------------------------|--------------------------------------|
-| `BStackRange`                | None (bare coordinates, no backing ref)           | No-op                               |
-| `BStackSlice<'a>`            | None (borrow/I/O view)                            | No-op                               |
-| `BStackOwnedSlice<'a, A>`    | Exclusive (allocator-bound)                       | No-op, explicit `dealloc` required  |
-| `BStackRef<T>`               | None (typed wrapper over `BStackRange`)           | No-op                               |
-| `BStackOwned<T: BStackDrop>` | Exclusive (typed wrapper over `BStackOwnedSlice`) | Calls `T::bstack_drop`              |
-| `BStackRc<T: BStackDrop>`    | Shared (refcounted)                               | Calls `T::bstack_drop` at zero      |
-| `BStackWeak<T>`              | None (non-owning)                                 | No-op                               |
+| Type                         | Ownership                                         | Drop Behavior                      |
+|------------------------------|---------------------------------------------------|------------------------------------|
+| `BStackRange`                | None (bare coordinates, no backing ref)           | No-op                              |
+| `BStackSlice<'a>`            | None (borrow/I/O view)                            | No-op                              |
+| `BStackOwnedSlice<'a, A>`    | Exclusive (allocator-bound)                       | No-op, explicit `dealloc` required |
+| `BStackRef<T>`               | None (typed wrapper over `BStackRange`)           | No-op                              |
+| `BStackOwned<T: BStackDrop>` | Exclusive (newtype over `(ManuallyDrop<T>, &'a A)`) | Calls `T::bstack_drop`             |
+| `BStackRc<T: BStackDrop>`    | Shared (newtype over `(StrongRef<T>, &'a A)` or `(StrongWeakRef<T>, &'a A)`) | Calls `T::bstack_drop` at zero     |
+| `BStackWeak<T>`              | None (newtype over `(WeakRef<T>, &'a A)`)                                    | No-op                              |
 
 ---
 
@@ -59,9 +59,9 @@ Programmers write the ergonomic form:
 ```rust
 #[bstack_block]
 struct X {
-    #[bstack_blockref]
+    #[bstack_owned]
     a: A,
-    #[bstack_blockref]
+    #[bstack_owned]
     b: B,
     c: u32,
 }
@@ -79,7 +79,14 @@ struct XOnDisk {
 }
 ```
 
-Fields must be either annotated `#[bstack_blockref]`, which becomes a `BStackRef<T>` offset on disk, or plain POD, stored inline. The macro enforces this.
+Every non-POD field must carry exactly one of four ownership annotations. The macro enforces this. All four become a `BStackRef<T>` offset on disk; the annotation governs destruction semantics and what `bstack_move!` returns.
+
+- `#[bstack_owned]`: the block owns this child exclusively. `BStackDrop` recurses into it. `bstack_move!` returns `BStackOwned<'a, T, A>`.
+- `#[bstack_strong]`: the block holds a strong refcounted reference. `BStackDrop` decrements the refcount (and drops at zero). `bstack_move!` returns `BStackRc<'a, T, A>`.
+- `#[bstack_weak]`: a non-owning weak reference. `BStackDrop` decrements the weak count only. `bstack_move!` returns `BStackWeak<'a, T, A>`.
+- `#[bstack_ref]`: a raw reference with no ownership semantics. `BStackDrop` skips this field entirely. `bstack_move!` returns the bare `BStackRef<T>` with no allocator attached.
+
+Plain POD fields (no annotation) are stored inline and copied by value.
 
 ### `X` in Memory
 
@@ -107,29 +114,119 @@ impl X {
 
 `BStackDrop` is a trait describing how to recursively free a block and all its owned children. It is completely decoupled from Rust's `Drop` and is not tied to any process or scope lifetime.
 
-`BStackAllocator::dealloc` consumes an allocator-bound `BStackOwnedSlice<'a, A>`, not a bare `BStackSlice`, and it returns a `Result`. So `bstack_drop` must be generic over the allocator and must propagate errors:
+The trait takes `self` — the **without-allocator** handle — plus an explicit allocator reference. This makes it generic over all handle-like types, not just `BStackOwnedSlice`:
 
 ```rust
-trait BStackDrop {
-    fn bstack_drop<A: BStackAllocator>(handle: BStackOwnedSlice<'_, A>) -> Result<(), A::Error>;
+trait BStackDrop: Sized {
+    fn bstack_drop<A: BStackAllocator>(self, allocator: &A) -> Result<(), A::Error>;
 }
 ```
 
-The macro generates the implementation. Destruction is **post-order**:
+Every `#[bstack_block]` type is a newtype over `BStackRange`. It carries no allocator. The allocator is supplied externally at drop time:
 
 ```rust
-impl BStackDrop for X {
-    fn bstack_drop<A: BStackAllocator>(handle: BStackOwnedSlice<'_, A>) -> Result<(), A::Error> {
-        let allocator = handle.allocator();
-        let on_disk: &XOnDisk = handle.as_slice().cast();
-        A::bstack_drop(on_disk.a.resolve(allocator))?;
-        B::bstack_drop(on_disk.b.resolve(allocator))?;
-        allocator.dealloc(handle).map_err(|e| e.source)
+// Generated by #[bstack_block] for every block type.
+struct X(BStackRange);
+```
+
+### Child Handle Types
+
+Each field annotation maps to a child handle type. These are small, `Copy` types constructed transiently during `bstack_drop`. Each implements `BStackDrop` and encapsulates its own destruction logic, keeping the generated code for any given block type uniform:
+
+```rust
+// #[bstack_owned]: exclusive child. bstack_drop calls T::bstack_drop recursively.
+struct OwnedRef<T>(BStackRef<T>);
+
+// #[bstack_strong] on plain (rc) T. bstack_drop decrements the inline refcount;
+// calls T::bstack_drop if it reaches zero.
+struct StrongRef<T>(BStackRef<T>);
+
+// #[bstack_strong] on (rc, weak) T. bstack_drop decrements ctrl.strong;
+// at zero: calls T::bstack_drop, releases the phantom ctrl.weak, and frees the
+// ctrl block if weak also reaches zero.
+struct StrongWeakRef<T: BStackWeakable>(BStackRef<T>, BStackRef<T::Control>);
+
+// #[bstack_weak] on (rc, weak) T. bstack_drop decrements ctrl.weak only;
+// frees the ctrl block if weak reaches zero. Data block is never touched.
+struct WeakRef<T: BStackWeakable>(BStackRef<T::Control>);
+
+// #[bstack_ref]: BStackDrop for BStackRef<T> is a no-op. No child handle type needed.
+// POD types: blanket no-op BStackDrop impl covers all Copy + !BStackOnDisk types.
+```
+
+POD types are identified via `bytemuck::Pod`. Any type that implements `bytemuck::Pod` is safe to store inline in an `XOnDisk` struct (since `Pod` guarantees `#[repr(C)]`-compatible, fully initialized, zero-padding-free bytes), and automatically receives the blanket no-op `BStackDrop` impl. The macro rejects non-annotated fields that do not implement `bytemuck::Pod` at compile time.
+
+`StrongWeakRef` and `WeakRef` must resolve the ctrl ref from the child block before the parent is deallocated. Both provide a `from_disk` constructor that does one read:
+
+```rust
+impl<T: BStackWeakable> StrongWeakRef<T> {
+    fn from_disk<S: BStackStorage>(data_ref: BStackRef<T>, stack: &S) -> Self {
+        let on_disk: &T::OnDisk = stack.read(data_ref).cast();
+        StrongWeakRef(data_ref, on_disk.ctrl)
+    }
+}
+
+impl<T: BStackWeakable> WeakRef<T> {
+    fn from_disk<S: BStackStorage>(data_ref: BStackRef<T>, stack: &S) -> Self {
+        let on_disk: &T::OnDisk = stack.read(data_ref).cast();
+        WeakRef(on_disk.ctrl)
     }
 }
 ```
 
-`BStackOwned<T>` ties this to a Rust scope by calling `T::bstack_drop` in its `Drop` impl. `BStackRc<T>` calls it when the refcount reaches zero.
+### Generated `bstack_drop`
+
+The macro emits one `.bstack_drop(allocator)?` call per non-skipped field, then deallocates the block itself. Destruction is **post-order**. For the example block used throughout this document:
+
+```rust
+#[bstack_block]
+struct X {
+    #[bstack_owned]    a: A,
+    #[bstack_strong]   b: B,   // B is #[bstack_block(rc, weak)]
+    #[bstack_weak]     c: C,   // C is #[bstack_block(rc, weak)]
+    #[bstack_ref]      e: E,
+    d: u32,
+}
+```
+
+```rust
+impl BStackDrop for X {
+    fn bstack_drop<A: BStackAllocator>(self, allocator: &A) -> Result<(), A::Error> {
+        let stack = allocator.stack();
+        let on_disk: &XOnDisk = stack.read(self.0).cast();
+
+        OwnedRef(on_disk.a).bstack_drop(allocator)?;
+        StrongWeakRef::from_disk(on_disk.b, stack).bstack_drop(allocator)?;
+        WeakRef::from_disk(on_disk.c, stack).bstack_drop(allocator)?;
+        // #[bstack_ref] e: BStackRef::bstack_drop is a no-op — skipped by macro
+        // POD d: no action
+
+        allocator.dealloc_range(self.0)
+    }
+}
+```
+
+All the atomic operations and two-phase teardown logic live inside the `BStackDrop` impls of `StrongWeakRef` and `WeakRef`, not in the generated block code. The macro output for any block is a flat sequence of uniform calls.
+
+### With-Allocator Wrappers
+
+`BStackOwned<T: BStackDrop, A>` is a newtype over `(ManuallyDrop<T>, &'a A)`. Rust's `Drop` takes the inner `T` out and calls `T::bstack_drop`. Errors during drop are swallowed, matching the contract of Rust's `Drop`:
+
+```rust
+struct BStackOwned<'a, T: BStackDrop, A> {
+    inner: ManuallyDrop<T>,
+    allocator: &'a A,
+}
+
+impl<T: BStackDrop, A: BStackAllocator> Drop for BStackOwned<'_, T, A> {
+    fn drop(&mut self) {
+        let inner = unsafe { ManuallyDrop::take(&mut self.inner) };
+        let _ = T::bstack_drop(inner, self.allocator);
+    }
+}
+```
+
+`BStackRc<T>` calls `T::bstack_drop` (via `StrongWeakRef::bstack_drop`) when the strong refcount reaches zero, passing the allocator it already holds. The `BStackDrop` impls on the child handle types carry all refcount and ctrl-block logic, so `BStackRc`'s own `Drop` impl stays minimal.
 
 ---
 
@@ -148,10 +245,10 @@ struct XOnDisk {
 }
 ```
 
-`BStackRc<'a, T, A>` holds a `BStackRange` plus `&'a A`. This mirrors `BStackOwnedSlice`'s allocator-bound shape instead of duplicating a live `BStackOwnedSlice` per clone, which can't be duplicated by design. `BStackRc<T>` behaves as follows.
+`BStackRc<'a, T, A>` is a newtype over `(StrongRef<T>, &'a A)` for plain `(rc)` blocks. `StrongRef<T>` is the without-allocator inner handle; it carries just a `BStackRef<T>` and implements `BStackDrop`. The allocator is held alongside but not inside the inner type. `BStackRc` is neither `Copy` nor the same as duplicating a `BStackOwnedSlice` — it simply wraps the inner handle and an allocator reference. `BStackRc<T>` behaves as follows.
 
-- `clone`: increments refcount atomically.
-- `drop`: decrements refcount. On reaching zero, it reconstructs a `BStackOwnedSlice` via `unsafe { BStackOwnedSlice::from_raw_range(allocator, range) }` and calls `T::bstack_drop` on it.
+- `clone`: increments refcount atomically (reading it from the block on disk), then constructs a new `BStackRc` wrapping the same `StrongRef<T>` and `&'a A`.
+- `drop`: calls `StrongRef<T>::bstack_drop(self.0, self.1)`, which decrements the refcount and calls `T::bstack_drop` if it reaches zero.
 
 Refcount is stored inline in the block rather than in a separate allocation. This avoids an extra indirection on access. The cost is that every `(rc)` block carries 8 bytes of refcount overhead unconditionally.
 
@@ -199,19 +296,20 @@ The `ctrl` back-pointer costs the data block one field, 8 bytes. It makes the da
 
 ### In-Memory Shape
 
-`BStackRc<T>` for an `(rc, weak)` block carries two references in memory. `x: BStackRef<X>` is for direct field access. `ctrl: BStackRef<XOnDiskRef>` is for refcount operations and for finalizing the control block on drop:
+`BStackRc<T>` for an `(rc, weak)` block is a newtype over `(StrongWeakRef<T>, &'a A)`. `StrongWeakRef<T>` is the without-allocator inner handle: it holds both the data ref and the ctrl ref, and its `BStackDrop` impl encapsulates the two-phase teardown. `BStackWeak<T>` is analogously a newtype over `(WeakRef<T>, &'a A)`, where `WeakRef<T>` holds only the ctrl ref:
 
 ```rust
-struct BStackRc<'a, T, A> {
-    x: BStackRef<T>,
-    ctrl: BStackRef<XOnDiskRef>,   // only present for (rc, weak) blocks
-    allocator: &'a A,
-}
+// (rc, weak) block
+struct BStackRc<'a, T: BStackWeakable, A>(StrongWeakRef<T>, &'a A);
+struct BStackWeak<'a, T: BStackWeakable, A>(WeakRef<T>, &'a A);
+
+// plain (rc) block
+struct BStackRc<'a, T, A>(StrongRef<T>, &'a A);
 ```
 
-`.clone()` and every non-final `.drop()` touch `ctrl.strong`. This is a single field read or write on an already-resolved reference, since `BStackRc<T>` already carries `ctrl` in memory. `.downgrade()` clones `ctrl` and increments `ctrl.weak`. The result is a `BStackWeak<T>` that just wraps `ctrl`.
+For `(rc, weak)`, `.clone()` increments `ctrl.strong` and returns a new `BStackRc` wrapping the same `StrongWeakRef<T>` and `&'a A`. `.drop()` calls `StrongWeakRef<T>::bstack_drop(self.0, self.1)`. `.downgrade()` increments `ctrl.weak`, copies the `WeakRef<T>` out of `self.0`, and wraps it with the allocator into a `BStackWeak<T>`.
 
-`BStackWeak<T>` is `Clone`, the same way `BStackRc<T>` is. Cloning a `BStackWeak<T>` increments `ctrl.weak` directly, with no need to go through a live `BStackRc<T>`. So a `BStackWeak<T>` comes from either `BStackRc<T>::downgrade()` or `BStackWeak<T>::clone()`. This mirrors how `std::sync::Weak` can come from either `Arc::downgrade` or `Weak::clone`.
+`BStackWeak<T>` is `Clone`, the same way `BStackRc<T>` is. Cloning a `BStackWeak<T>` calls `WeakRef<T>::clone` on its inner handle, which increments `ctrl.weak` directly with no need for a live `BStackRc<T>`. `drop` calls `WeakRef<T>::bstack_drop`, which decrements `ctrl.weak` and frees the ctrl block if it reaches zero. So a `BStackWeak<T>` comes from either `BStackRc<T>::downgrade()` or `BStackWeak<T>::clone()`. This mirrors how `std::sync::Weak` can come from either `Arc::downgrade` or `Weak::clone`.
 
 ### Type-Level Gate
 
@@ -244,12 +342,12 @@ Destruction happens in two independent phases, across two independent allocation
 ### `upgrade()` Revisited
 
 ```rust
-impl<T> BStackWeak<T> {
-    pub fn upgrade<A: BStackAllocator>(&self, allocator: &A) -> Option<BStackRc<T, A>> {
-        // self.ctrl: BStackRef<XOnDiskRef>
+impl<'a, T: BStackWeakable, A: BStackAllocator> BStackWeak<'a, T, A> {
+    pub fn upgrade(&self, allocator: &'a A) -> Option<BStackRc<'a, T, A>> {
+        // self.0: WeakRef<T> — holds BStackRef<T::Control>
         // CAS-increment ctrl.strong, but only if it is currently nonzero.
-        // On success, resolve ctrl.x to populate the returned BStackRc<T>'s
-        // data-side reference.
+        // On success, read ctrl.x (the data ref) and construct a StrongWeakRef<T>,
+        // then wrap it with the allocator into a BStackRc<T>.
     }
 }
 ```
@@ -278,8 +376,183 @@ A `BStackWeak<T>` has only two safe origins: `BStackRc<T>::downgrade()` on a liv
 
 ---
 
-## Open Questions
+## `bstack_move!`: Destructuring an Owned Block
 
-1. **`bstack_move`**: destructuring an owned block into its children. The correct order is to read child offsets from `XOnDisk`, transfer ownership of children, then dealloc the parent block. This must be made explicit to avoid use-after-free.
+`bstack_move!` is a procedural macro for transferring ownership of all fields out of a `BStackOwned<X>`. It reads every field from `XOnDisk`, captures `BStackRef<T>` offsets and POD values before the dealloc, frees the parent shell (not the children), reconstructs typed handles with the allocator attached, and returns them as a tuple.
 
-2. **`bstack_cast`**: safe casting between a typed handle (e.g. `X`) and its underlying primitive (`BStackSlice` for borrowed views, `BStackOwnedSlice` for owned handles) and back. Needs a defined API.
+Usage:
+
+```rust
+let (a, b, c) = bstack_move!(x)?;
+```
+
+`bstack_move!` can only be called on a `BStackOwned<X, A>`. Using it on a `BStackRef<X>`, `BStackSlice`, or any non-owned handle is a compile error, enforced by the trait bound on `BStackOwned`.
+
+### Return Types by Field Annotation
+
+Each field's return type in the tuple is the allocator-stripped in-memory representation of the corresponding handle kind. The allocator is never included in the return — the caller already holds it.
+
+| Field Annotation                      | Returned Type           | Returned Handle's Drop Behavior |
+|---------------------------------------|-------------------------|---------------------------------|
+| `#[bstack_owned]`                     | `BStackOwned<'a, T, A>` | Frees child (via `BStackDrop`)  |
+| `#[bstack_strong]` on plain `(rc)` T  | `BStackRc<'a, T, A>`    | Frees child at refcount zero    |
+| `#[bstack_strong]` on `(rc, weak)` T  | `BStackRc<'a, T, A>`    | Frees child at refcount zero    |
+| `#[bstack_weak]`                      | `BStackWeak<'a, T, A>`  | Decrements weak count only      |
+| `#[bstack_ref]`                       | `BStackRef<T>`          | No-op                           |
+| POD field                             | `T`                     | N/A                             |
+
+The lifetime `'a` is the same as the allocator lifetime carried by the input `BStackOwned<'a, X, A>`.
+
+For `(rc, weak)` and weak fields, the macro performs one extra read per field to resolve the `ctrl` ref from the child block's on-disk `ctrl` back-pointer before `dealloc` is called on the parent, so it can construct the full `BStackRc` or `BStackWeak` in-place. For plain `(rc)` fields, `BStackRef<T>` alone is sufficient.
+
+### Expansion
+
+The macro expands to roughly the following. Given a block with all four field kinds:
+
+```rust
+#[bstack_block]
+struct X {
+    #[bstack_owned]    // owned
+    a: A,
+    #[bstack_strong]   // shared, B is #[bstack_block(rc, weak)]
+    b: B,
+    #[bstack_weak]     // weak back-pointer, C is #[bstack_block(rc, weak)]
+    c: C,
+    #[bstack_ref]      // raw ref, no ownership
+    e: E,
+    d: u32,
+}
+```
+
+```rust
+// bstack_move!(x) where x: BStackOwned<'a, X, Alloc>
+// Returns: Result<(BStackOwned<'a, A, Alloc>, BStackRc<'a, B, Alloc>, BStackWeak<'a, C, Alloc>, BStackRef<E>, u32), Alloc::Error>
+let (a, b, c, e, d) = {
+    // Take the inner X(BStackRange) out of ManuallyDrop, preventing BStackDrop
+    // from running on drop. The allocator is separated out alongside.
+    let (inner, allocator): (X, &Alloc) = x.into_raw_parts();
+    let stack = allocator.stack();
+    // BStackRef<T> is Copy (just a u64 offset), so all refs can be captured
+    // before the range is passed to dealloc_range.
+    let on_disk: &XOnDisk = stack.read(inner.0).cast();
+
+    // #[bstack_owned]: owned child — read offset, reconstruct as BStackOwned
+    let a_ref: BStackRef<A> = on_disk.a;
+
+    // #[bstack_strong] on (rc, weak) B: read B's ctrl ref via StrongWeakRef::from_disk
+    let b_swr: StrongWeakRef<B> = StrongWeakRef::from_disk(on_disk.b, stack);
+
+    // #[bstack_weak] on (rc, weak) C: read C's ctrl ref via WeakRef::from_disk
+    let c_wr: WeakRef<C> = WeakRef::from_disk(on_disk.c, stack);
+
+    // #[bstack_ref]: raw ref — copy offset as-is, no allocator attached
+    let e_ref: BStackRef<E> = on_disk.e;
+
+    // POD: copied inline
+    let d_val: u32 = on_disk.d;
+
+    // Free the parent shell only. Children are untouched on disk.
+    allocator.dealloc_range(inner.0)?;
+
+    // All unsafe reconstruction happens inside the macro, after dealloc_range,
+    // using the allocator reference that outlives the consumed inner handle.
+    // #[bstack_ref] fields are returned as bare BStackRef<T> — no unsafe needed.
+    let owned_a = unsafe { BStackOwned::from_raw(X(a_ref.into_range()), allocator) };
+    let rc_b    = unsafe { BStackRc::from_raw_parts(b_swr.0, b_swr.1, allocator) };
+    let weak_c  = unsafe { BStackWeak::from_raw(c_wr.0, allocator) };
+    (owned_a, rc_b, weak_c, e_ref, d_val)
+}?;
+```
+
+Capturing values before `dealloc_range` is safe because `BStackRef<T>` and the child handle types are all `Copy` and carry no reference into the allocation being freed. After `dealloc_range` returns, all on-disk children remain intact. The allocator reference `&'a A` is still valid. Taking `X` out via `into_raw_parts()` prevents the `BStackOwned` `Drop` impl from running, which is the compile-time proof that no parallel destruction path exists. All `unsafe` reconstruction is emitted by the macro and justified by these invariants — the call site is fully safe.
+
+### Error Handling
+
+`bstack_move!` returns `Result<(...), A::Error>`. If `dealloc` fails on the parent shell, the macro returns `Err`. The raw child values are not in scope from the caller's perspective because `?` propagates before the tuple is bound. The parent block's allocation is still live in that case. The caller can retry or abort.
+
+### Restrictions
+
+- `bstack_move!` is not defined for `#[bstack_block(rc)]` or `#[bstack_block(rc, weak)]` blocks. Those blocks have a refcount or control block that would be bypassed. Use `BStackRc::try_unwrap` for the `(rc)` case instead.
+- `#[bstack_weak]` fields require `T: BStackWeakable`. This is already enforced at `#[bstack_block]` expansion time, so it is not an additional constraint at the `bstack_move!` call site.
+- `#[bstack_ref]` fields return a bare `BStackRef<T>` with no allocator and no ownership guarantee. The caller is responsible for the lifetime and validity of the referenced allocation.
+
+---
+
+## `bstack_cast`: Type-Checked Handle Conversion
+
+`bstack_cast` converts between a typed block handle (e.g. `BStackOwned<X, A>` or borrowed `X`) and its untyped primitive (`BStackOwnedSlice<'a, A>` or `BStackSlice<'a>`), in both directions. Upcasts (typed → untyped) are infallible. Downcasts (untyped → typed) check the `EightCC` tag stored in the block header and are fallible.
+
+The `EightCC` tag is derived from the type name at `#[bstack_block]` expansion time and written into every block's `BlockHeader` by the allocator at creation. It is the sole discriminant for safe downcasting.
+
+### Trait
+
+`BStackCast` is generated by `#[bstack_block]` for every block type and is the gate for all downcast paths:
+
+```rust
+/// Implemented by every `#[bstack_block]` type.
+/// The `EightCC` returned here must match the tag in a block's `BlockHeader`
+/// for a downcast to succeed.
+pub trait BStackCast {
+    fn eightcc() -> EightCC;
+}
+```
+
+### Owned Casts
+
+```rust
+// Upcast: strip type info. Infallible. Consumes the typed handle.
+impl<'a, T: BStackCast, A: BStackAllocator> BStackOwned<'a, T, A> {
+    pub fn into_slice(self) -> BStackOwnedSlice<'a, A> { ... }
+}
+
+// Downcast: re-apply type by checking the EightCC tag.
+// Returns Err(self) if the tag does not match, so the caller retains
+// ownership and can try another type or handle the mismatch.
+impl<'a, A: BStackAllocator> BStackOwnedSlice<'a, A> {
+    pub fn cast_into<T: BStackCast>(self) -> Result<BStackOwned<'a, T, A>, Self> {
+        let header: &BlockHeader = self.as_slice().cast();
+        if header.type != T::eightcc() {
+            return Err(self);
+        }
+        Ok(BStackOwned::from_inner(self))
+    }
+}
+```
+
+### Borrowed Casts
+
+```rust
+// Upcast: strip type info. Infallible. Generated per block type by the macro.
+impl X {
+    pub fn as_slice(&self) -> BStackSlice<'_> { ... }
+}
+
+// Downcast: re-apply type by checking the EightCC tag.
+// Returns None if the tag does not match.
+impl<'a> BStackSlice<'a> {
+    pub fn cast_as<T: BStackCast>(&self) -> Option<T> {
+        let header: &BlockHeader = self.cast();
+        if header.type != T::eightcc() {
+            return None;
+        }
+        Some(T::from_slice(self.clone()))
+    }
+}
+```
+
+### Macro Convenience
+
+`bstack_cast!` is a convenience macro that infers the direction from the target type:
+
+```rust
+// Owned downcast (fallible): emits .cast_into::<X>() on the slice
+let x: BStackOwned<X, _> = bstack_cast!(slice)?;
+
+// Owned upcast (infallible): emits .into_slice() on the owned handle
+let slice: BStackOwnedSlice<_, _> = bstack_cast!(x);
+
+// Borrowed downcast (returns Option): emits .cast_as::<X>() on the slice ref
+let x: Option<X> = bstack_cast!(&slice_ref);
+```
+
+The macro inspects whether the target type is `BStackOwnedSlice` / `BStackSlice` (upcast path) or a concrete `#[bstack_block]` type (downcast path) and emits the corresponding method call, removing the need to name the direction explicitly.
