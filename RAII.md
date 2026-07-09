@@ -2,35 +2,35 @@
 
 ## Overview
 
-This document describes the ownership, lifetime, and on-disk layout system for BStack blocks. This is a competing concept to the mainline BStack slice ownership model in the current alloc module, which is manually managed. The design decouples disk-level destruction (`BStackDrop`) from Rust's process-scoped `Drop`, allowing persistent storage semantics while still offering RAII conveniences when desired.
+This document describes the ownership, lifetime, and on-disk layout system for BStack blocks. It is a typed layer built on top of the mainline `alloc` module's primitives — [`BStackRange`], [`BStackSlice`], and [`BStackOwnedSlice`] — which already enforce single ownership of allocations at compile time but leave `Drop` as a no-op. This document's contribution is to decouple disk-level destruction (`BStackDrop`) from Rust's process-scoped `Drop`, allowing persistent storage semantics while still offering RAII conveniences when desired.
 
 The design of this RAII semantics is inspired by C++ RAII with shared ownership — specifically `std::unique_ptr`, `std::shared_ptr`, and `std::weak_ptr`. It is adapted to persistent storage and Rust `Drop` semantics.
 
 ---
 
-## Primitive Handle: `BStackSlice`
+## Primitive Handles: `BStackRange`, `BStackSlice`, `BStackOwnedSlice`
 
-`BStackSlice` is the foundational handle. It is a lightweight `Copy` value carrying:
+The mainline `alloc` module now splits what used to be a single foundational handle into three tiers, each adding a capability the previous one lacks:
 
-- A reference to the allocator
-- A byte offset into the BStack file
-- A length
-
-`Drop` on `BStackSlice` does nothing. Deallocation is explicit — the block is freed only by passing the slice to `allocator.dealloc()`. This means `BStackSlice` is safe to copy and pass around without triggering any side effects.
+- **`BStackRange`** — a bare `(offset, len)` coordinate pair. `Copy`, and carries no backing reference at all — not even a `&BStack`. This is the serialization/persistence form: store it on disk, send it across sessions, or pass it through code that should not perform I/O. It carries no validity guarantee; casting it into a `BStackSlice` or `BStackOwnedSlice` is an `unsafe` operation the caller must justify.
+- **`BStackSlice<'a>`** — a borrowed, non-owning I/O view bound to a `&'a BStack`. It is deliberately *not* `Copy` (so `&mut self` write methods provide genuine single-writer exclusivity in safe code) but is `Clone` for cases where an explicit second view is needed. `Drop` is a no-op: the region persists on disk beyond the handle's scope regardless.
+- **`BStackOwnedSlice<'a, A: BStackAllocator>`** — the exclusive allocation handle, bound to `&'a A` (the allocator, not just the stack). It is neither `Copy` nor `Clone`: an allocation has exactly one owner, and the type system turns use-after-free / use-after-realloc into compile errors, since `realloc`/`dealloc` consume the handle by value and no copy survives to be misused. `Drop` is still a no-op — the allocation persists on disk until explicitly passed to `allocator.dealloc()`.
 
 ---
 
 ## Handle Type Hierarchy
 
-Built on top of `BStackSlice`:
+Built on top of `BStackRange` / `BStackSlice` / `BStackOwnedSlice`:
 
-| Type | Ownership | Drop Behavior |
-|---|---|---|
-| `BStackSlice` | None | No-op |
-| `BStackRef<T>` | None (borrow/navigation) | No-op |
-| `BStackOwned<T: BStackDrop>` | Exclusive | Calls `T::bstack_drop` |
-| `BStackRc<T: BStackDrop>` | Shared (refcounted) | Decrements refcount; calls `T::bstack_drop` at zero |
-| `BStackWeak<T>` | None (non-owning) | No-op |
+| Type                         | Ownership                                         | Drop Behavior                       |
+|------------------------------|---------------------------------------------------|-------------------------------------|
+| `BStackRange`                | None (bare coordinates, no backing ref)           | No-op                               |
+| `BStackSlice<'a>`            | None (borrow/I/O view)                            | No-op                               |
+| `BStackOwnedSlice<'a, A>`    | Exclusive (allocator-bound)                       | No-op — explicit `dealloc` required |
+| `BStackRef<T>`               | None (typed wrapper over `BStackRange`)           | No-op                               |
+| `BStackOwned<T: BStackDrop>` | Exclusive (typed wrapper over `BStackOwnedSlice`) | Calls `T::bstack_drop`              |
+| `BStackRc<T: BStackDrop>`    | Shared (refcounted)                               | Calls `T::bstack_drop` at zero      |
+| `BStackWeak<T>`              | None (non-owning)                                 | No-op                               |
 
 ---
 
@@ -81,17 +81,17 @@ Fields must be either annotated `#[bstack_blockref]` (becomes a `BStackRef<T>` o
 
 ### `X` in Memory
 
-`X` in memory is a typed wrapper over `BStackSlice` — not a deserialized struct. Field access is via generated methods that read from the on-disk payload:
+`X` in memory is a typed wrapper over `BStackOwnedSlice<'a, A>` (when owned via `BStackOwned<X>`/`BStackRc<X>`) or `BStackSlice<'a>` (when merely borrowed) — not a deserialized struct. Field access is via generated methods that read from the on-disk payload, going through `as_slice()` for I/O and `allocator()` to resolve child `BStackRef`s (which, like `BStackRange`, carry no backing reference of their own):
 
 ```rust
 impl X {
     pub fn a(&self) -> A {
-        let on_disk: &XOnDisk = self.0.cast();
-        A(on_disk.a.resolve(self.0.allocator))
+        let on_disk: &XOnDisk = self.0.as_slice().cast();
+        A(on_disk.a.resolve(self.0.allocator()))
     }
 
     pub fn c(&self) -> u32 {
-        let on_disk: &XOnDisk = self.0.cast();
+        let on_disk: &XOnDisk = self.0.as_slice().cast();
         on_disk.c
     }
 }
@@ -105,9 +105,11 @@ impl X {
 
 `BStackDrop` is a trait describing how to recursively free a block and all its owned children. It is completely decoupled from Rust's `Drop` and is not tied to any process or scope lifetime.
 
+Because `BStackAllocator::dealloc` consumes an allocator-bound `BStackOwnedSlice<'a, A>` (not a bare `BStackSlice`) and returns a `Result`, `bstack_drop` must be generic over the allocator and propagate errors:
+
 ```rust
 trait BStackDrop {
-    fn bstack_drop(slice: BStackSlice);
+    fn bstack_drop<A: BStackAllocator>(handle: BStackOwnedSlice<'_, A>) -> Result<(), A::Error>;
 }
 ```
 
@@ -115,11 +117,12 @@ The macro generates the implementation. Destruction is **post-order** — childr
 
 ```rust
 impl BStackDrop for X {
-    fn bstack_drop(slice: BStackSlice) {
-        let on_disk: &XOnDisk = slice.cast();
-        A::bstack_drop(on_disk.a.resolve(slice.allocator));
-        B::bstack_drop(on_disk.b.resolve(slice.allocator));
-        slice.allocator.dealloc(slice);
+    fn bstack_drop<A: BStackAllocator>(handle: BStackOwnedSlice<'_, A>) -> Result<(), A::Error> {
+        let allocator = handle.allocator();
+        let on_disk: &XOnDisk = handle.as_slice().cast();
+        A::bstack_drop(on_disk.a.resolve(allocator))?;
+        B::bstack_drop(on_disk.b.resolve(allocator))?;
+        allocator.dealloc(handle).map_err(|e| e.source)
     }
 }
 ```
@@ -143,9 +146,9 @@ struct XOnDisk {
 }
 ```
 
-`BStackRc<T>` behavior:
+Internally, `BStackRc<'a, T, A>` holds a `BStackRange` plus `&'a A`, mirroring `BStackOwnedSlice`'s allocator-bound shape rather than duplicating a live `BStackOwnedSlice` per clone (which can't be duplicated by design). `BStackRc<T>` behavior:
 - `clone` — increments refcount atomically
-- `drop` — decrements refcount; calls `T::bstack_drop` when it reaches zero
+- `drop` — decrements refcount; on reaching zero, reconstructs a `BStackOwnedSlice` via `unsafe { BStackOwnedSlice::from_raw_range(allocator, range) }` and calls `T::bstack_drop` on it
 
 Refcount is stored inline in the block rather than in a separate allocation, avoiding an extra indirection on access. The cost is that every `(rc)` block carries 8 bytes of refcount overhead unconditionally.
 
@@ -169,12 +172,12 @@ impl<T> BStackOwned<T> {
 
 ### Cross-Session / On-Disk Weak Refs
 
-Weak refs stored on disk as `BStackRef` fields cannot be statically checked. Safety is runtime only:
+Weak refs stored on disk as `BStackRef` fields cannot be statically checked. Safety is runtime only. Since `BStackRef<T>`, like `BStackRange`, carries no backing reference of its own, `upgrade` takes the allocator (or stack) explicitly to perform the validating read:
 
 ```rust
 impl<T> BStackWeak<T> {
-    pub fn upgrade(&self) -> Option<BStackRef<T>> {
-        // Validates block header EightCC before returning
+    pub fn upgrade<A: BStackAllocator>(&self, allocator: &A) -> Option<BStackRef<T>> {
+        // Validates block header EightCC via allocator.stack() before returning
     }
 }
 ```
@@ -191,4 +194,4 @@ The programmer is responsible for not calling `bstack_drop` on a block while liv
 
 2. **`BStackWeak` validation** — `upgrade()` currently checks the EightCC tag. This guards against type confusion but is not a liveness guarantee if a new block has been allocated at the same offset. Whether this is sufficient depends on allocator reuse policy.
 
-3. **`bstack_cast`** — safe casting between a typed handle (e.g. `X`) and `BStackSlice` and back. Needs a defined API.
+3. **`bstack_cast`** — safe casting between a typed handle (e.g. `X`) and its underlying primitive (`BStackSlice` for borrowed views, `BStackOwnedSlice` for owned handles) and back. Needs a defined API.
