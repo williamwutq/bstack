@@ -814,10 +814,17 @@ impl BStackAllocator for GhostTreeBstackAllocator {
         let aligned_old = Self::align_up_len(old_len);
         let aligned_new = Self::align_up_len(new_len);
 
-        // In-place resize paths. Every failure here leaves the original block
+        // In-place resize paths. Most failures here leave the original block
         // intact at (start, old_len); `Some(_)` means the resize was handled,
         // `None` falls through to the move-to-new-region path below.
-        let inplace = (|| -> io::Result<Option<BStackOwnedSlice<'a, Self>>> {
+        //
+        // Exception: the non-tail shrink commits a (non-atomic) AVL insert of
+        // the freed tail. Once that begins, a torn insert means the block can no
+        // longer be safely returned for a retry (which would re-insert an
+        // already-linked node and corrupt the free tree), so `lost` is set and
+        // the error carries `None`.
+        let mut lost = false;
+        let inplace_result = (|| -> io::Result<Option<BStackOwnedSlice<'a, Self>>> {
             if aligned_new == aligned_old {
                 // Same underlying block — just update the visible length.
                 // If it is a shrink, zero the tail to uphold the invariant; the
@@ -864,6 +871,8 @@ impl BStackAllocator for GhostTreeBstackAllocator {
                 self.stack.zero(start + new_len, aligned_old - new_len)?;
                 #[cfg(feature = "atomic")]
                 let _guard = self.lock.lock().unwrap();
+                // Past this point a torn AVL insert cannot be safely retried.
+                lost = true;
                 self.avl_insert(tail_ptr, freed_tail)?;
                 return Ok(Some(unsafe {
                     BStackOwnedSlice::from_raw_parts(self, start, new_len)
@@ -891,11 +900,15 @@ impl BStackAllocator for GhostTreeBstackAllocator {
             }
 
             Ok(None)
-        })()
-        .map_err(|source| BStackAllocError {
+        })();
+        let inplace = inplace_result.map_err(|source| BStackAllocError {
             source,
-            // SAFETY: (start, old_len) still describes the live original block.
-            handle: Some(unsafe { BStackOwnedSlice::from_raw_parts(self, start, old_len) }),
+            handle: if lost {
+                None
+            } else {
+                // SAFETY: (start, old_len) still describes the live original block.
+                Some(unsafe { BStackOwnedSlice::from_raw_parts(self, start, old_len) })
+            },
         })?;
 
         if let Some(resized) = inplace {
@@ -953,7 +966,15 @@ impl BStackAllocator for GhostTreeBstackAllocator {
     ) -> Result<(), BStackAllocError<'a, Self>> {
         let start = slice.start();
         let len = slice.len();
-        (|| -> io::Result<()> {
+        // Set once the (non-atomic) AVL insert has begun. A torn insert leaves
+        // the tree inconsistent, and GhostTree has no is_free flag to repair it
+        // in-process, so the block can no longer be returned for a retry —
+        // re-inserting an already-linked node would corrupt the free tree
+        // (self-cycle / duplicate parent link → the same region handed to two
+        // allocations). Failures before this point (validation, or the atomic
+        // tail discard, which frees nothing on failure) keep the handle.
+        let mut lost = false;
+        let result = (|| -> io::Result<()> {
             if slice.is_empty() {
                 return Ok(());
             }
@@ -990,14 +1011,17 @@ impl BStackAllocator for GhostTreeBstackAllocator {
             self.stack.zero(ptr, true_len)?;
             #[cfg(feature = "atomic")]
             let _guard = self.lock.lock().unwrap();
+            lost = true;
             self.avl_insert(ptr, true_len)
-        })()
-        .map_err(|source| BStackAllocError {
+        })();
+        result.map_err(|source| BStackAllocError {
             source,
-            // Every failure path leaves the block still owned by the caller —
-            // either not yet freed, or zeroed but safely re-deallocatable.
-            // SAFETY: (start, len) still describes the caller's block.
-            handle: Some(unsafe { BStackOwnedSlice::from_raw_parts(self, start, len) }),
+            handle: if lost {
+                None
+            } else {
+                // SAFETY: (start, len) still describes the caller's live block.
+                Some(unsafe { BStackOwnedSlice::from_raw_parts(self, start, len) })
+            },
         })
     }
 }
