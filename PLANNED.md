@@ -198,3 +198,60 @@ Implementing this trait is optional. Allocators for which zero-fill is already f
 
 - **Default implementations.** Could `BStackAllocator` provide default `alloc_uninit`/`realloc_uninit` implementations that simply delegate to `alloc`/`realloc` (i.e., always zero), with `BStackUninitAllocator` only needed as a marker for allocators that actually skip the zero-fill? This would let generic code call `alloc_uninit` without a separate trait bound, at the cost of the trait no longer signalling "this allocator supports the fast path."
 - **New Type** Should the unspecification contract be encoded in the type system, allowing the return to be `Self::UninitAllocated<'a>` instead of `Self::Allocated<'a>`? This would make it impossible to accidentally treat an uninitialised allocation as a normal one, but it would also require more boilerplate for callers who want to use the fast path, as they would need to convert from `UninitAllocated` to `Allocated` after writing to the region, or an allocator could simply set `Self::UninitAllocated<'a>` to `Self::Allocated<'a>` if no such distinction is needed.
+
+---
+
+## Restoring `DebugCheckingAllocator` (post-0.4.0)
+
+**Feature flag:** `alloc` (as before)
+**Breaking change:** No — additive; the type was withdrawn in 0.4.0 and returns as new API surface.
+
+### Motivation
+
+`DebugCheckingAllocator<A>` was a wrapping allocator that validated an inner allocator's behaviour at runtime: it tracked the set of live and freed regions, detected overlapping allocations, caught double-frees and use-after-free, and flagged any invariant violation — a drop-in checker for both the built-in allocators and third-party implementations. It was temporarily removed in 0.4.0 because its implementation predated the three-type handle redesign and the `BStackAllocError` / `BStackBulkAllocError` return types, and porting it under the pressure of a large breaking release would have shipped a messy, under-reviewed version. Rather than block the release, it was withdrawn with the intent to reintroduce it cleanly.
+
+The value it provides is hard to replicate ad hoc: allocator bugs — overlap, double-free, leaks, metadata corruption — are exactly the class that ordinary unit tests miss and that only surface under randomized or adversarial workloads. A maintained checking wrapper is the natural place to assert those invariants once and reuse them across every allocator and fuzz test.
+
+### Design
+
+Reintroduce `DebugCheckingAllocator<A: BStackAllocator>` as a transparent wrapper:
+
+- Wraps an inner `A`, forwards `alloc` / `realloc` / `dealloc` / bulk to it, and records the resulting `(offset, len)` regions in an in-memory tracking structure.
+- On each operation validates: no returned region overlaps a live region; no `dealloc` / `realloc` targets a region that is not currently live (double-free / use-after-free); bulk operations are all-or-nothing against the tracked set.
+- Its handle type carries the inner handle plus enough identity to map back to the tracking entry, and converts `Into<BStackOwnedSlice>` like any other handle.
+- Must thread through the new error types: on a failed `realloc` / `dealloc` the inner allocator now returns the surviving handle inside `BStackAllocError`, so the wrapper must **re-wrap that handle and update its tracking** rather than dropping it — otherwise the checker itself would introduce the very leak the 0.4.0 change set out to prevent. `dealloc_bulk` likewise re-wraps the un-freed handles from `BStackBulkAllocError`.
+
+### Open questions
+
+- **Panic vs. error on violation.** Panicking gives loud, immediate test failures but is unusable in `Result`-based property tests that want to *assert* an error was produced; a configurable mode (panic / return `Self::Error`) may be needed.
+- **Tracking under `None`-handle errors.** When an inner operation fails and reports `handle: None` (allocation genuinely lost — e.g. `ghost_tree`'s torn AVL insert), the wrapper must decide whether to keep the region "live," mark it "lost," or drop it from tracking; each choice changes which subsequent operations the checker flags.
+- **Overhead and gating.** Whether it lives behind a dedicated feature or is always available under `alloc`; the tracking set adds allocation and per-op cost that should not leak into production builds.
+
+---
+
+## `FaultInjectingBStack` for deterministic I/O-failure testing (post-0.4.0)
+
+**Feature flag:** dedicated (working name `fault-injection`), test/dev-oriented
+**Breaking change:** No — additive.
+
+### Motivation
+
+The 0.4.0 error-handling change makes `realloc` / `dealloc` return the surviving allocation in `BStackAllocError` (and `dealloc_bulk` the un-freed handles in `BStackBulkAllocError`), under a delicate contract: `Some` when the region survives, `None` only when it is genuinely lost, plus best-effort rollback of a freshly-allocated region when a mid-operation copy fails. Almost none of this is exercised by the current test suite — the fuzzers drive only *successful* `alloc` / `realloc` / `dealloc` sequences, so the failure paths (which handle is returned, whether it points at valid data, whether a rollback actually frees the orphaned region) are validated only by a couple of synchronous validation-error asserts. The behaviour that most needs testing is precisely the behaviour under I/O faults, which the happy path can never reach.
+
+A `BStack` that fails I/O on demand closes that gap: a test allocates, arms a fault at a chosen operation (or a seeded random schedule), performs the `realloc` / `dealloc`, and asserts on the returned error — that `handle` is `Some` and reads back the correct bytes on the in-place and copy paths, that it is `None` exactly where a partial free makes retry unsafe (`ghost_tree`'s torn AVL insert, the slab free-list paths), and that best-effort rollback left no leaked region. The same tool exercises crash recovery (`open` / `recover`) and the write-in-progress journal by cutting I/O mid-commit.
+
+### Design
+
+A fault source that surfaces `io::Error`s at controlled points in `BStack`'s I/O, without changing allocator code:
+
+- **Fault policy.** Configurable by: fail the Nth I/O op; fail every op matching a predicate (kind, offset range); or a seeded PRNG with a failure probability — deterministic and reproducible from the seed. Policies compose (arm once, arm repeatedly, disarm).
+- **Injected error shape.** Returns representative `io::ErrorKind`s (`Other`, `StorageFull`, `Interrupted`), and optionally injects *after* the bytes reach the file but before `sync` (to simulate a crash between write and durability) versus *before* the write (a clean failure that changed nothing).
+- **Integration.** Because the allocators hold a concrete `BStack` by value, the cleanest shape is an opt-in, feature-gated fault hook *inside* `BStack` — a policy object consulted before each syscall — rather than a separate wrapper type the allocators could not accept. `FaultInjectingBStack` would then be a thin constructor/newtype that builds a `BStack` with a policy installed, or the capability may be exposed directly on `BStack` under the feature. This mirrors how the `guarded` feature already hooks slice access.
+
+### Open questions
+
+- **Wrapper vs. built-in hook.** A standalone `FaultInjectingBStack` type would require the allocators to be generic over their backing store — a large, breaking change — so a feature-gated hook on `BStack` is likely the only drop-in option, at the cost of putting (flag-gated) test scaffolding in the core type.
+- **Compile-time type substitution.** Alternatively, keep `FaultInjectingBStack` a fully separate type that mirrors `BStack`'s API, and under the feature (or `#[cfg(debug_assertions)]`) alias it into the allocators crate-wide — e.g. `#[cfg(feature = "fault-injection")] use fault::FaultInjectingBStack as BStack;` — so every allocator compiles against the faulting type with **no code change and no genericity**, and release builds contain none of the fault machinery. Costs: the alias must be an internal name the allocators reference (not the public `BStack`), the faulting type has to track `BStack`'s entire allocator-facing surface (including internal methods, keeping it in lockstep as `BStack` evolves), and a single build cannot mix real and faulting stacks — it is all-or-nothing per compilation. Weigh this against the runtime hook, which needs no API mirroring but does bake a (disabled) branch into the shipped type.
+- **Granularity.** Whether faults are injected per public `BStack` method or per underlying syscall (`read_exact` / `write_all` / `sync`); the latter is needed to test partial-write and write-vs-sync crash windows, but couples the policy to internal I/O structure.
+- **Determinism across threads.** Under `atomic`, concurrent operations share one fault schedule; a global counter/PRNG must be synchronized, and reproducibility across thread interleavings is limited.
+- **Scope.** Whether this ships as public API (useful for downstream allocator authors testing their own implementations) or stays `pub(crate)` / `#[doc(hidden)]` for the crate's own test suite.

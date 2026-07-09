@@ -1582,7 +1582,9 @@ impl BStackAllocator for CheckedSlabBStackAllocator {
                 // and no handle can free it. The original is untouched
                 // (`recovered` still points at it).
                 #[cfg(feature = "atomic")]
-                let copy_result = self.stack.copy(slice.start(), new_slice.start(), slice.len());
+                let copy_result = self
+                    .stack
+                    .copy(slice.start(), new_slice.start(), slice.len());
                 #[cfg(not(feature = "atomic"))]
                 let copy_result = slice
                     .read()
