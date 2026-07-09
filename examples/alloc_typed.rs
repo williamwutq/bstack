@@ -1,8 +1,8 @@
 //! Typed persistent records using `FirstFitBStackAllocator`.
 //!
 //! Shows how to build a simple key-value store where each entry is a
-//! fixed-size struct serialised into a `BStackSlice`.  Slice handles are
-//! themselves serialised as 16-byte tokens (via `From<BStackSlice>`) so they
+//! fixed-size struct serialised into a `BStackOwnedSlice`.  Slice handles are
+//! serialised as 16-byte tokens via [`BStackRange`](bstack::BStackRange) so they
 //! survive a close/reopen cycle and can be used to update or delete specific
 //! records without scanning the whole file.
 //!
@@ -14,7 +14,7 @@
 //!
 //! ## Token storage
 //!
-//! The example stores the 16-byte `[u8; 16]` slice tokens in a plain `Vec`
+//! The example stores the 16-byte `[u8; 16]` range tokens in a plain `Vec`
 //! in memory.  In a real application you would append them to a separate
 //! bstack (or any durable store) so the token list also survives restarts.
 //!
@@ -25,7 +25,7 @@
 //! ```
 
 #[cfg(all(feature = "alloc", feature = "set"))]
-use bstack::{BStack, BStackAllocator, BStackSlice, FirstFitBStackAllocator};
+use bstack::{BStack, BStackAllocator, BStackRange, FirstFitBStackAllocator};
 #[cfg(all(feature = "alloc", feature = "set"))]
 use std::io;
 
@@ -64,18 +64,22 @@ impl Record {
 // Helpers
 // -----------------------------------------------------------------------
 
-/// Write `record` into a fresh allocation and return the 16-byte token.
+/// Write `record` into a fresh allocation and return a 16-byte range token.
 #[cfg(all(feature = "alloc", feature = "set"))]
 fn insert(alloc: &FirstFitBStackAllocator, record: &Record) -> io::Result<[u8; 16]> {
-    let slice = alloc.alloc(RECORD_SIZE)?;
+    let mut slice = alloc.alloc(RECORD_SIZE)?;
     slice.write(&record.to_bytes())?;
-    Ok(<[u8; 16]>::from(slice))
+    // Serialise coords to a persistent 16-byte token. Drop is a no-op.
+    Ok(BStackRange::new(slice.start(), slice.len()).to_bytes())
 }
 
 /// Read the record pointed to by `token`.
 #[cfg(all(feature = "alloc", feature = "set"))]
 fn read(alloc: &FirstFitBStackAllocator, token: &[u8; 16]) -> io::Result<Record> {
-    let slice = unsafe { BStackSlice::from_bytes(alloc, *token) };
+    let range = BStackRange::from_bytes(*token);
+    // Borrow the region directly as a read-only view (no ownership taken).
+    let slice =
+        unsafe { bstack::BStackSlice::from_raw_parts(alloc.stack(), range.start(), range.len()) };
     let buf = slice.read()?;
     Ok(Record::from_bytes(&buf))
 }
@@ -83,14 +87,17 @@ fn read(alloc: &FirstFitBStackAllocator, token: &[u8; 16]) -> io::Result<Record>
 /// Overwrite the record pointed to by `token` with new data.
 #[cfg(all(feature = "alloc", feature = "set"))]
 fn update(alloc: &FirstFitBStackAllocator, token: &[u8; 16], record: &Record) -> io::Result<()> {
-    let slice = unsafe { BStackSlice::from_bytes(alloc, *token) };
+    let range = BStackRange::from_bytes(*token);
+    // Reconstruct an owned handle in order to write. Drop is a no-op.
+    let mut slice = unsafe { bstack::BStackOwnedSlice::from_raw_range(alloc, range) };
     slice.write(&record.to_bytes())
 }
 
 /// Free the record pointed to by `token`.
 #[cfg(all(feature = "alloc", feature = "set"))]
 fn delete(alloc: &FirstFitBStackAllocator, token: &[u8; 16]) -> io::Result<()> {
-    let slice = unsafe { BStackSlice::from_bytes(alloc, *token) };
+    let range = BStackRange::from_bytes(*token);
+    let slice = unsafe { bstack::BStackOwnedSlice::from_raw_range(alloc, range) };
     alloc.dealloc(slice)
 }
 
@@ -162,10 +169,11 @@ fn main() -> io::Result<()> {
         );
 
         let new_slot = alloc.alloc(RECORD_SIZE)?;
+        let deleted_start = BStackRange::from_bytes(tokens[0]).start();
         println!(
             "new alloc at offset {} (deleted key=0 was at offset {})",
             new_slot.start(),
-            unsafe { BStackSlice::from_bytes(&alloc, tokens[0]) }.start(),
+            deleted_start,
         );
 
         let _ = new_slot;
