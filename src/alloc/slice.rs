@@ -135,10 +135,10 @@ impl From<Range<u64>> for BStackRange {
     }
 }
 
-impl Into<Range<u64>> for BStackRange {
+impl From<BStackRange> for Range<u64> {
     #[inline]
-    fn into(self) -> Range<u64> {
-        self.offset..self.offset + self.len
+    fn from(range: BStackRange) -> Self {
+        range.offset..range.offset + range.len
     }
 }
 

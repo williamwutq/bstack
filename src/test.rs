@@ -2640,7 +2640,10 @@ mod alloc_tests {
         let w0 = s.as_slice().writer_at(0);
         let w5 = s.as_slice().writer_at(5);
         assert!(w0 < w5);
-        assert_eq!(w5.cmp(&s.as_slice().writer_at(5)), std::cmp::Ordering::Equal);
+        assert_eq!(
+            w5.cmp(&s.as_slice().writer_at(5)),
+            std::cmp::Ordering::Equal
+        );
     }
 
     #[cfg(feature = "set")]

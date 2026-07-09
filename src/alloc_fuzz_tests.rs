@@ -147,7 +147,8 @@ mod alloc_fuzz_tests {
             let alloc = make(BStack::open(&path).unwrap()).unwrap();
 
             for (i, &(range, id)) in live.iter().enumerate() {
-                let s = unsafe { BStackOwnedSlice::from_raw_parts(&alloc, range.start(), range.len()) };
+                let s =
+                    unsafe { BStackOwnedSlice::from_raw_parts(&alloc, range.start(), range.len()) };
                 check(
                     &s.read().unwrap()[..range.len() as usize],
                     id,
@@ -176,8 +177,9 @@ mod alloc_fuzz_tests {
                         let i = rng.random_range(0..live.len());
                         let (range, id) = live[i];
                         let new_len = rng.random_range(0..=512);
-                        let s =
-                            unsafe { BStackOwnedSlice::from_raw_parts(&alloc, range.start(), range.len()) };
+                        let s = unsafe {
+                            BStackOwnedSlice::from_raw_parts(&alloc, range.start(), range.len())
+                        };
                         if let Ok(mut s2) = alloc.realloc(s, new_len) {
                             let overlap = range.len().min(new_len) as usize;
                             check(
@@ -194,8 +196,9 @@ mod alloc_fuzz_tests {
                     2 => {
                         let i = rng.random_range(0..live.len());
                         let (range, id) = live.swap_remove(i);
-                        let s =
-                            unsafe { BStackOwnedSlice::from_raw_parts(&alloc, range.start(), range.len()) };
+                        let s = unsafe {
+                            BStackOwnedSlice::from_raw_parts(&alloc, range.start(), range.len())
+                        };
                         check(
                             &s.read().unwrap()[..range.len() as usize],
                             id,
@@ -206,8 +209,9 @@ mod alloc_fuzz_tests {
                     _ => {
                         let i = rng.random_range(0..live.len());
                         let (range, id) = live[i];
-                        let s =
-                            unsafe { BStackOwnedSlice::from_raw_parts(&alloc, range.start(), range.len()) };
+                        let s = unsafe {
+                            BStackOwnedSlice::from_raw_parts(&alloc, range.start(), range.len())
+                        };
                         check(
                             &s.read().unwrap()[..range.len() as usize],
                             id,
