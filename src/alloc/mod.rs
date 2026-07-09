@@ -55,10 +55,10 @@
 //!   `Send` in all configurations; `Send + Sync` with `atomic`.
 //!
 //! * [`SlabBStackAllocator`] — fixed-block slab allocator (`alloc` + `set`).
-//!   O(1) alloc/dealloc.  *Experimental.*
+//!   O(1) alloc/dealloc.
 //!
 //! * [`CheckedSlabBStackAllocator`] — crash-recoverable slab variant (`alloc` + `set`).
-//!   8-byte per-block header tracks state; double-frees caught.  *Experimental.*
+//!   8-byte per-block header tracks state; double-frees caught.
 //!
 //! # Region handle design
 //!

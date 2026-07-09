@@ -479,7 +479,7 @@
 //!   with the `atomic` feature, where an internal `Mutex` serialises AVL tree
 //!   mutations.
 //!
-//! * [`SlabBStackAllocator`] — **Experimental.** Fixed-block slab allocator.
+//! * [`SlabBStackAllocator`] — Fixed-block slab allocator.
 //!   All blocks are exactly `block_size` bytes with no per-block header or footer;
 //!   freed blocks are tracked via an intrusive singly-linked free list stored in
 //!   the first 8 bytes of each free block.  O(1) alloc and dealloc.
@@ -487,7 +487,7 @@
 //!   [`SlabBStackAllocator::open`] to reopen an existing one.
 //!   Requires both `alloc` and `set` features.
 //!
-//! * [`CheckedSlabBStackAllocator`] — **Experimental.** Crash-recoverable
+//! * [`CheckedSlabBStackAllocator`] — Crash-recoverable
 //!   variant of [`SlabBStackAllocator`].  Prefixes every block with an 8-byte
 //!   overhead field (zero when free, high bit set with a block count when in
 //!   use) so leaked blocks are recoverable by a linear scan and double-frees

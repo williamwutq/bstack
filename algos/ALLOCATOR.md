@@ -194,7 +194,7 @@ mutex.
 
 ---
 
-## `SlabBStackAllocator` (`alloc + set` features) *(Experimental)*
+## `SlabBStackAllocator` (`alloc + set` features)
 
 A fixed-block slab allocator.  All blocks in the arena are exactly `block_size`
 bytes (must be ≥ 8) with **no** per-block header or footer.  Freed blocks form
@@ -255,7 +255,7 @@ With the `atomic` feature it **is `Sync`** with no allocator-level lock at all. 
 
 ---
 
-## `CheckedSlabBStackAllocator` (`alloc + set` features) *(Experimental)*
+## `CheckedSlabBStackAllocator` (`alloc + set` features)
 
 A crash-recoverable fixed-block slab allocator. Like `SlabBStackAllocator`, every block is the same physical size on disk. Unlike it, each block carries an 8-byte **overhead** prefix that records whether the block is free or in use, making leaked blocks recoverable by a linear scan after a crash and catching double-frees at runtime before the free list can be corrupted.
 

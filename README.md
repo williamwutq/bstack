@@ -923,14 +923,14 @@ AVL tree keyed on `(size, address)`; best-fit; zero per-allocation overhead.
 Also implements `BStackBulkAllocator`.  Without `atomic`: `Send` only.  With
 `atomic`: `Send + Sync` via an internal `Mutex`.
 
-### `SlabBStackAllocator` (`alloc + set`) *(Experimental)*
+### `SlabBStackAllocator` (`alloc + set`)
 
 Fixed `block_size` slab; singly-linked free list; zero per-block overhead.
 Constructors: `new(stack, block_size)` for a fresh stack, `open(stack)` to
 reattach.  Without `atomic`: `Send` only.  With `atomic`: `Send + Sync` with
 no allocator-level lock (uses `BStack::process_gen` / `cross_exchange`).
 
-### `CheckedSlabBStackAllocator` (`alloc + set`) *(Experimental)*
+### `CheckedSlabBStackAllocator` (`alloc + set`)
 
 Like `SlabBStackAllocator` but each block has an 8-byte overhead tag that
 catches double-frees immediately and allows full recovery after a crash.
