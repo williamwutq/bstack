@@ -150,6 +150,13 @@ pub struct BStackAllocError<'a, A: BStackAllocator + 'a> {
     ///   (e.g. a free-then-allocate strategy whose second step failed, or a
     ///   crash mid-operation). Any bytes that remain are recoverable only
     ///   through the allocator's crash-recovery procedure.
+    ///
+    /// Every built-in allocator's [`realloc`](BStackAllocator::realloc) returns
+    /// `Some` on failure — even the copy-to-new-region paths hand back either
+    /// the untouched original or the fully committed new region — so `None` is
+    /// only reachable from a custom allocator that cannot preserve the handle.
+    /// (Built-in [`dealloc`](BStackAllocator::dealloc) may still return `None`,
+    /// where returning a partially-freed block would risk a double-free.)
     pub handle: Option<A::Allocated<'a>>,
 }
 
