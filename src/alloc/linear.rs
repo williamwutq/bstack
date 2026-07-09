@@ -67,7 +67,7 @@ use std::{fmt, io};
 /// # fn main() -> std::io::Result<()> {
 /// let alloc = LinearBStackAllocator::new(BStack::open("data.bstack")?);
 /// let mut slice = alloc.alloc(128)?;
-/// let data = slice.as_slice().read()?;
+/// let data = slice.read()?;
 /// alloc.dealloc(slice)?;
 /// let stack = alloc.into_stack();
 /// # Ok(())

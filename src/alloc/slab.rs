@@ -990,8 +990,8 @@ mod tests {
         let _g = Guard(path);
         let alloc = SlabBStackAllocator::new(stack, 16).unwrap();
         let mut s = alloc.alloc(12).unwrap();
-        s.as_slice_mut().write(b"hello world!").unwrap();
-        assert_eq!(s.as_slice().read().unwrap(), b"hello world!");
+        s.write(b"hello world!").unwrap();
+        assert_eq!(s.read().unwrap(), b"hello world!");
     }
 
     #[test]
@@ -1001,7 +1001,7 @@ mod tests {
         let alloc = SlabBStackAllocator::new(stack, 16).unwrap();
         let mut s = alloc.alloc(5).unwrap();
         let offset = s.start();
-        s.as_slice_mut().write(b"hello").unwrap();
+        s.write(b"hello").unwrap();
         drop(alloc);
 
         let alloc2 = SlabBStackAllocator::open(BStack::open(&path).unwrap()).unwrap();
@@ -1046,8 +1046,8 @@ mod tests {
                             let mut set = live.lock().unwrap();
                             assert!(set.insert(off), "duplicate live offset {off}");
                         }
-                        slice.as_slice_mut().write(&[tid as u8; 16]).unwrap();
-                        let data = slice.as_slice().read().unwrap();
+                        slice.write(&[tid as u8; 16]).unwrap();
+                        let data = slice.read().unwrap();
                         assert_eq!(data, vec![tid as u8; 16]);
                         {
                             let mut set = live.lock().unwrap();
@@ -1101,7 +1101,7 @@ mod tests {
                     for _ in 0..ROUNDS {
                         // Grow: tail → try_extend_zeros; non-tail → copy to new region.
                         slice = a.realloc(slice, LARGE).unwrap();
-                        let data = slice.as_slice().read().unwrap();
+                        let data = slice.read().unwrap();
                         assert_eq!(
                             &data[..SMALL as usize],
                             &[tid as u8; SMALL as usize],
@@ -1110,7 +1110,7 @@ mod tests {
 
                         // Shrink: tail → try_discard; non-tail → recycle excess blocks.
                         slice = a.realloc(slice, SMALL).unwrap();
-                        let data = slice.as_slice().read().unwrap();
+                        let data = slice.read().unwrap();
                         assert_eq!(
                             data,
                             vec![tid as u8; SMALL as usize],

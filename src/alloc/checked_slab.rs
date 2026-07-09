@@ -1537,8 +1537,8 @@ impl BStackAllocator for CheckedSlabBStackAllocator {
             // alloc and dealloc each handle their own free-list and tail
             // operations independently.
             let mut new_slice = self.alloc(new_len)?;
-            let data = slice.as_slice().read()?;
-            new_slice.as_slice_mut().write(&data)?;
+            let data = slice.read()?;
+            new_slice.write(&data)?;
             self.dealloc(slice)?;
             return Ok(new_slice);
         }
@@ -1838,8 +1838,8 @@ mod tests {
         let _g = Guard(path);
         let alloc = CheckedSlabBStackAllocator::new(stack, 16).unwrap();
         let mut s = alloc.alloc(12).unwrap();
-        s.as_slice_mut().write(b"hello world!").unwrap();
-        assert_eq!(s.as_slice().read().unwrap(), b"hello world!");
+        s.write(b"hello world!").unwrap();
+        assert_eq!(s.read().unwrap(), b"hello world!");
     }
 
     #[test]
@@ -1849,7 +1849,7 @@ mod tests {
         let alloc = CheckedSlabBStackAllocator::new(stack, 8).unwrap();
         let mut s = alloc.alloc(5).unwrap();
         let offset = s.start();
-        s.as_slice_mut().write(b"hello").unwrap();
+        s.write(b"hello").unwrap();
         drop(alloc);
 
         let alloc2 = CheckedSlabBStackAllocator::open(BStack::open(&path).unwrap()).unwrap();
@@ -1866,8 +1866,8 @@ mod tests {
         // data_size=8, block_size=16: 40 bytes needs ceil((40+8)/16) = 3 blocks.
         let mut s = alloc.alloc(40).unwrap();
         let payload: Vec<u8> = (0..40u8).collect();
-        s.as_slice_mut().write(&payload).unwrap();
-        assert_eq!(s.as_slice().read().unwrap(), payload);
+        s.write(&payload).unwrap();
+        assert_eq!(s.read().unwrap(), payload);
 
         // Free, then a single-block alloc should reuse the first freed block.
         let start = s.start();
@@ -1885,11 +1885,11 @@ mod tests {
         // data_size 24: alloc(8) and realloc(16) both fit in 1 block.
         let alloc = CheckedSlabBStackAllocator::new(stack, 24).unwrap();
         let mut s = alloc.alloc(8).unwrap();
-        s.as_slice_mut().write(b"abcdefgh").unwrap();
+        s.write(b"abcdefgh").unwrap();
         let s_start = s.start();
         let s2 = alloc.realloc(s, 16).unwrap();
         assert_eq!(s2.start(), s_start);
-        let data = s2.as_slice().read().unwrap();
+        let data = s2.read().unwrap();
         assert_eq!(&data[..8], b"abcdefgh");
         assert_eq!(&data[8..], &[0u8; 8]); // newly-exposed bytes are zeroed
     }
@@ -1900,11 +1900,11 @@ mod tests {
         let _g = Guard(path);
         let alloc = CheckedSlabBStackAllocator::new(stack, 8).unwrap();
         let mut s = alloc.alloc(8).unwrap();
-        s.as_slice_mut().write(b"abcdefgh").unwrap();
+        s.write(b"abcdefgh").unwrap();
         // Grow to 40 bytes -> ceil((40+8)/16) = 3 blocks.
         let s2 = alloc.realloc(s, 40).unwrap();
         assert_eq!(s2.len(), 40);
-        let data = s2.as_slice().read().unwrap();
+        let data = s2.read().unwrap();
         assert_eq!(&data[..8], b"abcdefgh");
         assert_eq!(&data[8..], &[0u8; 32]);
     }
@@ -1918,14 +1918,14 @@ mod tests {
         // Allocate a 3-block region, then a guard block so the first is non-tail.
         let mut s = alloc.alloc(40).unwrap(); // 3 blocks
         let payload: Vec<u8> = (0..40u8).collect();
-        s.as_slice_mut().write(&payload).unwrap();
+        s.write(&payload).unwrap();
         let s_start = s.start();
         let _guard_block = alloc.alloc(8).unwrap();
 
         // Shrink to a single block; the two freed blocks become reusable.
         let s2 = alloc.realloc(s, 8).unwrap();
         assert_eq!(s2.start(), s_start);
-        assert_eq!(s2.as_slice().read().unwrap(), &payload[..8]);
+        assert_eq!(s2.read().unwrap(), &payload[..8]);
 
         // The recycled blocks are now served from the free list.
         let r = alloc.alloc(8).unwrap();
@@ -2001,7 +2001,7 @@ mod tests {
         let _g = Guard(path);
         let alloc = CheckedSlabBStackAllocator::new(stack, 8).unwrap(); // block_size 16
         let mut s = alloc.alloc(40).unwrap(); // 3 blocks: block 48, stack -> 96
-        s.as_slice_mut().write(&[0xFFu8; 40]).unwrap(); // fill so orphan blocks read as garbage
+        s.write(&[0xFFu8; 40]).unwrap(); // fill so orphan blocks read as garbage
         assert_eq!(alloc.stack().len().unwrap(), 96);
         // Simulate a realloc tail-shrink crash: commit new_n=1, skip the discard.
         alloc.stack().set(48, in_use(1).to_le_bytes()).unwrap();
@@ -2018,13 +2018,13 @@ mod tests {
         let _a = alloc.alloc(8).unwrap(); // block 48
         let _b = alloc.alloc(8).unwrap(); // block 64
         let mut c = alloc.alloc(8).unwrap(); // block 80, slice start 88
-        c.as_slice_mut().write(b"keepkeep").unwrap();
+        c.write(b"keepkeep").unwrap();
         // Corrupt the middle block into garbage; the live block after it remains.
         alloc.stack().set(64, u64::MAX.to_le_bytes()).unwrap();
         // No free-list anchor follows, so the reach-oracle must resync on block 80.
         assert_eq!(alloc.recover().unwrap(), 1); // one garbage block left leaked
         assert_eq!(alloc.stack().len().unwrap(), 96); // nothing discarded
-        assert_eq!(c.as_slice().read().unwrap(), b"keepkeep"); // live data preserved
+        assert_eq!(c.read().unwrap(), b"keepkeep"); // live data preserved
     }
 
     #[test]
@@ -2034,7 +2034,7 @@ mod tests {
         {
             let alloc = CheckedSlabBStackAllocator::new(stack, 8).unwrap();
             let mut s = alloc.alloc(40).unwrap(); // 3 blocks, stack -> 96
-            s.as_slice_mut().write(&[0xFFu8; 40]).unwrap();
+            s.write(&[0xFFu8; 40]).unwrap();
             alloc.stack().set(48, in_use(1).to_le_bytes()).unwrap(); // crash sim
         }
         let reopened = CheckedSlabBStackAllocator::open(BStack::open(&path).unwrap()).unwrap();
@@ -2094,8 +2094,8 @@ mod tests {
                             let mut set = live.lock().unwrap();
                             assert!(set.insert(off), "duplicate live offset {off}");
                         }
-                        slice.as_slice_mut().write(&[tid as u8; 8]).unwrap();
-                        let data = slice.as_slice().read().unwrap();
+                        slice.write(&[tid as u8; 8]).unwrap();
+                        let data = slice.read().unwrap();
                         assert_eq!(data, vec![tid as u8; 8]);
                         {
                             let mut set = live.lock().unwrap();
@@ -2153,7 +2153,7 @@ mod tests {
                     for _ in 0..ROUNDS {
                         // Grow: tail → try_extend_zeros; non-tail → copy to new region.
                         slice = a.realloc(slice, LARGE).unwrap();
-                        let data = slice.as_slice().read().unwrap();
+                        let data = slice.read().unwrap();
                         assert_eq!(
                             &data[..SMALL as usize],
                             &[tid as u8; SMALL as usize],
@@ -2162,7 +2162,7 @@ mod tests {
 
                         // Shrink: tail → try_discard; non-tail → recycle excess blocks.
                         slice = a.realloc(slice, SMALL).unwrap();
-                        let data = slice.as_slice().read().unwrap();
+                        let data = slice.read().unwrap();
                         assert_eq!(
                             data,
                             vec![tid as u8; SMALL as usize],
