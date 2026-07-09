@@ -95,24 +95,35 @@ impl<T: BStackWeakable> StrongWeakRef<T> {
     }
 }
 
+/// The two-phase strong release for an `(rc, weak)` block, given raw data and
+/// control ranges. Requires only `T: BStackBlock` (for the data block's own
+/// recursive teardown), so it is shared by both [`StrongWeakRef::bstack_drop`]
+/// and [`crate::BStackRc`]'s `Drop` — the latter carries `T: BStackBlock` and so
+/// cannot construct a `StrongWeakRef<T>` (which needs `BStackWeakable`) itself.
+pub(crate) fn strong_release_ctrl<T: BStackBlock, A: BStackOwnedSliceAllocator>(
+    allocator: &A,
+    data_range: BStackRange,
+    ctrl_range: BStackRange,
+) -> io::Result<()> {
+    let stack = allocator.stack();
+    let strong_off = ctrl_range.start() + layout::CTRL_STRONG_OFFSET;
+    // Phase 1: last strong owner frees the data block (children + shell), then
+    // releases the phantom weak the strong owners collectively held.
+    if refcount::fetch_sub(stack, strong_off, 1)? == 1 {
+        T::from_range(data_range).bstack_drop(allocator)?;
+        let weak_off = ctrl_range.start() + layout::CTRL_WEAK_OFFSET;
+        // Phase 2 (early): if no real weak handles remain, the phantom release
+        // drives weak to zero and the control block is freed here.
+        if refcount::fetch_sub(stack, weak_off, 1)? == 1 {
+            unsafe { dealloc_range(allocator, ctrl_range)? };
+        }
+    }
+    Ok(())
+}
+
 impl<T: BStackWeakable> BStackDrop for StrongWeakRef<T> {
     fn bstack_drop<A: BStackOwnedSliceAllocator>(self, allocator: &A) -> io::Result<()> {
-        let stack = allocator.stack();
-        let data_range = self.0.into_range();
-        let ctrl_range = self.1.into_range();
-        let strong_off = ctrl_range.start() + layout::CTRL_STRONG_OFFSET;
-        // Phase 1: last strong owner frees the data block (children + shell),
-        // then releases the phantom weak the strong owners collectively held.
-        if refcount::fetch_sub(stack, strong_off, 1)? == 1 {
-            T::from_range(data_range).bstack_drop(allocator)?;
-            let weak_off = ctrl_range.start() + layout::CTRL_WEAK_OFFSET;
-            // Phase 2 (early): if no real weak handles remain, the phantom
-            // release drives weak to zero and the control block is freed here.
-            if refcount::fetch_sub(stack, weak_off, 1)? == 1 {
-                unsafe { dealloc_range(allocator, ctrl_range)? };
-            }
-        }
-        Ok(())
+        strong_release_ctrl::<T, A>(allocator, self.0.into_range(), self.1.into_range())
     }
 }
 
