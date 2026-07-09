@@ -1,4 +1,6 @@
-use super::{BStackAllocator, BStackBulkAllocator, BStackSlice};
+use super::{
+    BStackAllocError, BStackAllocator, BStackBulkAllocError, BStackBulkAllocator, BStackOwnedSlice,
+};
 use crate::BStack;
 #[cfg(not(feature = "atomic"))]
 use std::cell::Cell;
@@ -709,7 +711,7 @@ impl GhostTreeBstackAllocator {
 
 impl BStackAllocator for GhostTreeBstackAllocator {
     type Error = io::Error;
-    type Allocated<'a> = BStackSlice<'a, Self>;
+    type Allocated<'a> = BStackOwnedSlice<'a, Self>;
 
     fn stack(&self) -> &BStack {
         &self.stack
@@ -730,10 +732,9 @@ impl BStackAllocator for GhostTreeBstackAllocator {
     /// Multi-call.  A crash between AVL remove and the split-insert permanently
     /// loses the remainder fragment; a crash between AVL remove and return
     /// loses the entire block.
-    fn alloc(&self, len: u64) -> io::Result<BStackSlice<'_, Self>> {
+    fn alloc(&self, len: u64) -> io::Result<BStackOwnedSlice<'_, Self>> {
         if len == 0 {
-            // SAFETY: zero-length slice at offset 0 is safe
-            return Ok(unsafe { BStackSlice::from_raw_parts(self, 0, 0) });
+            return Ok(BStackOwnedSlice::empty(self));
         }
         let aligned = Self::align_up_len(len);
         {
@@ -747,7 +748,9 @@ impl BStackAllocator for GhostTreeBstackAllocator {
                     // The tail `aligned` bytes are already zeroed by invariant.
                     self.avl_insert(ptr, remainder)?;
                     // SAFETY: ptr + remainder is the allocated portion after splitting
-                    return Ok(unsafe { BStackSlice::from_raw_parts(self, ptr + remainder, len) });
+                    return Ok(unsafe {
+                        BStackOwnedSlice::from_raw_parts(self, ptr + remainder, len)
+                    });
                 } else {
                     #[cfg(feature = "atomic")]
                     drop(guard);
@@ -757,14 +760,14 @@ impl BStackAllocator for GhostTreeBstackAllocator {
                     // padding and will be recovered on dealloc by re-aligning.
                     self.stack.zero(ptr, MIN_ALLOC)?;
                     // SAFETY: ptr from allocated block via avl_find_best_fit_and_remove
-                    return Ok(unsafe { BStackSlice::from_raw_parts(self, ptr, len) });
+                    return Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, ptr, len) });
                 }
             }
         }
         // No free block fits: lock released; grow the BStack (returns zeroed bytes).
         let start = self.stack.extend(aligned)?;
         // SAFETY: start from fresh allocation via self.stack.extend
-        Ok(unsafe { BStackSlice::from_raw_parts(self, start, len) })
+        Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, start, len) })
     }
 
     /// Resize `slice` to `new_len` bytes.
@@ -781,100 +784,183 @@ impl BStackAllocator for GhostTreeBstackAllocator {
     /// Grow: multi-call (alloc + copy + dealloc).
     fn realloc<'a>(
         &'a self,
-        slice: BStackSlice<'a, Self>,
+        slice: BStackOwnedSlice<'a, Self>,
         new_len: u64,
-    ) -> io::Result<BStackSlice<'a, Self>> {
+    ) -> Result<BStackOwnedSlice<'a, Self>, BStackAllocError<'a, Self>> {
         if slice.is_empty() {
-            return self.alloc(new_len);
+            return self.alloc(new_len).map_err(|source| {
+                BStackAllocError::with_handle(source, BStackOwnedSlice::empty(self))
+            });
         }
-        if slice.start() < ARENA_START || slice.start() != Self::align_up_ptr(slice.start()) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "realloc: slice origin is not a valid allocator address",
-            ));
+        let start = slice.start();
+        let old_len = slice.len();
+        if start < ARENA_START || start != Self::align_up_ptr(start) {
+            // Invalid address: the caller's handle is unchanged, hand it back.
+            return Err(BStackAllocError {
+                source: io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "realloc: slice origin is not a valid allocator address",
+                ),
+                // SAFETY: (start, old_len) is exactly what the caller passed in.
+                handle: Some(unsafe { BStackOwnedSlice::from_raw_parts(self, start, old_len) }),
+            });
         }
         if new_len == 0 {
+            // dealloc consumes `slice`; its BStackAllocError propagates unchanged.
             self.dealloc(slice)?;
-            // SAFETY: zero-length slice at offset 0 is safe
-            return Ok(unsafe { BStackSlice::from_raw_parts(self, 0, 0) });
+            return Ok(BStackOwnedSlice::empty(self));
         }
-        let old_len = slice.len();
         // Re-align to recover the true underlying block sizes.
         let aligned_old = Self::align_up_len(old_len);
         let aligned_new = Self::align_up_len(new_len);
 
-        if aligned_new == aligned_old {
-            // Same underlying block — just update the visible length.
-            // If it is a shrink, we need to zero the tail to uphold the invariant
-            // but we can do that in-place without touching the AVL tree since the block size doesn't change.
-            if new_len < old_len {
-                let tail_ptr = slice.start() + new_len;
-                let tail_len = old_len - new_len;
-                self.stack.zero(tail_ptr, tail_len)?;
+        // In-place resize paths. Most failures here leave the original block
+        // intact at (start, old_len); `Some(_)` means the resize was handled,
+        // `None` falls through to the move-to-new-region path below.
+        //
+        // Exception: the non-tail shrink commits a (non-atomic) AVL insert of
+        // the freed tail. Once that begins, a torn insert means the block can no
+        // longer be safely returned for a retry (which would re-insert an
+        // already-linked node and corrupt the free tree), so `lost` is set and
+        // the error carries `None`.
+        let mut lost = false;
+        let inplace_result = (|| -> io::Result<Option<BStackOwnedSlice<'a, Self>>> {
+            if aligned_new == aligned_old {
+                // Same underlying block — just update the visible length.
+                // If it is a shrink, zero the tail to uphold the invariant; the
+                // block size doesn't change so the AVL tree is untouched.
+                if new_len < old_len {
+                    let tail_ptr = start + new_len;
+                    let tail_len = old_len - new_len;
+                    self.stack.zero(tail_ptr, tail_len)?;
+                }
+                // SAFETY: same block, just changing visible length
+                return Ok(Some(unsafe {
+                    BStackOwnedSlice::from_raw_parts(self, start, new_len)
+                }));
             }
-            // SAFETY: same block, just changing visible length
-            return Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) });
-        }
 
-        if aligned_new < aligned_old {
-            // Shrink.
-            let freed_tail = aligned_old - aligned_new;
-            let tail_ptr = slice.start() + aligned_new;
+            if aligned_new < aligned_old {
+                // Shrink.
+                let freed_tail = aligned_old - aligned_new;
+                let tail_ptr = start + aligned_new;
 
-            // Atomic fast path: discard the tail block without taking the lock.
+                // Atomic fast path: discard the tail block without taking the lock.
+                #[cfg(feature = "atomic")]
+                if self.stack.try_discard(start + aligned_old, freed_tail)? {
+                    if new_len < aligned_new {
+                        self.stack.zero(start + new_len, aligned_new - new_len)?;
+                    }
+                    return Ok(Some(unsafe {
+                        BStackOwnedSlice::from_raw_parts(self, start, new_len)
+                    }));
+                }
+
+                #[cfg(not(feature = "atomic"))]
+                if start + aligned_old == self.stack.len()? {
+                    if new_len < aligned_new {
+                        self.stack.zero(start + new_len, aligned_new - new_len)?;
+                    }
+                    self.stack.discard(freed_tail)?;
+                    return Ok(Some(unsafe {
+                        BStackOwnedSlice::from_raw_parts(self, start, new_len)
+                    }));
+                }
+
+                // Not tail: zero gap + freed tail before taking the lock, then insert.
+                self.stack.zero(start + new_len, aligned_old - new_len)?;
+                #[cfg(feature = "atomic")]
+                let _guard = self.lock.lock().unwrap();
+                // Past this point a torn AVL insert cannot be safely retried.
+                lost = true;
+                self.avl_insert(tail_ptr, freed_tail)?;
+                return Ok(Some(unsafe {
+                    BStackOwnedSlice::from_raw_parts(self, start, new_len)
+                }));
+            }
+
+            // Grow path.
+            // Atomic fast path: extend the tail without taking the lock.
             #[cfg(feature = "atomic")]
             if self
                 .stack
-                .try_discard(slice.start() + aligned_old, freed_tail)?
+                .try_extend_zeros(start + aligned_old, aligned_new - aligned_old)?
             {
-                if new_len < aligned_new {
-                    self.stack
-                        .zero(slice.start() + new_len, aligned_new - new_len)?;
-                }
-                return Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) });
+                return Ok(Some(unsafe {
+                    BStackOwnedSlice::from_raw_parts(self, start, new_len)
+                }));
             }
 
             #[cfg(not(feature = "atomic"))]
-            if slice.start() + aligned_old == self.stack.len()? {
-                if new_len < aligned_new {
-                    self.stack
-                        .zero(slice.start() + new_len, aligned_new - new_len)?;
-                }
-                self.stack.discard(freed_tail)?;
-                return Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) });
+            if start + aligned_old == self.stack.len()? {
+                self.stack.extend(aligned_new - aligned_old)?;
+                return Ok(Some(unsafe {
+                    BStackOwnedSlice::from_raw_parts(self, start, new_len)
+                }));
             }
 
-            // Not tail: zero gap + freed tail before taking the lock, then insert.
-            self.stack
-                .zero(slice.start() + new_len, aligned_old - new_len)?;
-            #[cfg(feature = "atomic")]
-            let _guard = self.lock.lock().unwrap();
-            self.avl_insert(tail_ptr, freed_tail)?;
-            return Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) });
-        }
+            Ok(None)
+        })();
+        let inplace = inplace_result.map_err(|source| BStackAllocError {
+            source,
+            handle: if lost {
+                None
+            } else {
+                // SAFETY: (start, old_len) still describes the live original block.
+                Some(unsafe { BStackOwnedSlice::from_raw_parts(self, start, old_len) })
+            },
+        })?;
 
-        // Grow path.
-        // Atomic fast path: extend the tail without taking the lock.
-        #[cfg(feature = "atomic")]
-        if self
-            .stack
-            .try_extend_zeros(slice.start() + aligned_old, aligned_new - aligned_old)?
-        {
-            return Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) });
-        }
-
-        #[cfg(not(feature = "atomic"))]
-        if slice.start() + aligned_old == self.stack.len()? {
-            self.stack.extend(aligned_new - aligned_old)?;
-            return Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) });
+        if let Some(resized) = inplace {
+            return Ok(resized);
         }
 
         // Grow (non-tail): allocate new region, copy old data, free old region.
-        let new_slice = self.alloc(new_len)?;
-        let data = self.stack.get(slice.start(), slice.start() + old_len)?;
-        self.stack.set(new_slice.start(), &data)?;
-        self.dealloc(slice)?;
-        Ok(new_slice)
+        let new_slice = self.alloc(new_len).map_err(|source| BStackAllocError {
+            source,
+            // Allocation of the new region failed; the original is untouched.
+            // SAFETY: (start, old_len) still describes the live original block.
+            handle: Some(unsafe { BStackOwnedSlice::from_raw_parts(self, start, old_len) }),
+        })?;
+        let new_start = new_slice.start();
+        // Move the old payload into the freshly-allocated region. With `atomic`
+        // this is a single crash-atomic `BStack::copy` — the source and
+        // destination are disjoint, so it stages only the source coordinate
+        // (O(1) journal) and never materialises the payload in memory. Without
+        // `atomic`, fall back to read-then-write.
+        #[cfg(feature = "atomic")]
+        let copy_result = self.stack.copy(start, new_start, old_len);
+        #[cfg(not(feature = "atomic"))]
+        let copy_result = self
+            .stack
+            .get(start, start + old_len)
+            .and_then(|data| self.stack.set(new_start, &data));
+        if let Err(source) = copy_result {
+            // The new region was allocated but the copy failed. Roll it back
+            // (best-effort) so it is not leaked: GhostTree recovery only rebuilds
+            // the free tree by walking existing nodes, so an allocated-but-
+            // untracked region cannot be reclaimed on reopen and would leak the
+            // space permanently. The original still holds the data, so hand it
+            // back. If the rollback dealloc also fails the region is genuinely
+            // lost (the same I/O fault just prevented reclaiming it).
+            let _ = self.dealloc(new_slice);
+            return Err(BStackAllocError {
+                source,
+                // SAFETY: (start, old_len) still describes the live original block.
+                handle: Some(unsafe { BStackOwnedSlice::from_raw_parts(self, start, old_len) }),
+            });
+        }
+        // Data copied and the new region is fully committed. Free the old block.
+        match self.dealloc(slice) {
+            Ok(()) => Ok(new_slice),
+            Err(mut e) => {
+                // The resize itself succeeded — the new region is valid and
+                // populated; only freeing the old block failed. Hand back the
+                // new region (the old block leaks until recovery).
+                e.handle = Some(new_slice);
+                Err(e)
+            }
+        }
     }
 
     /// Release `slice` back to the free pool.
@@ -887,44 +973,69 @@ impl BStackAllocator for GhostTreeBstackAllocator {
     ///
     /// Multi-call: a crash after the zero but before the AVL insert permanently
     /// loses the block.
-    fn dealloc(&self, slice: BStackSlice<'_, Self>) -> io::Result<()> {
-        if slice.is_empty() {
-            return Ok(());
-        }
-        if slice.start() < ARENA_START || slice.start() != Self::align_up_ptr(slice.start()) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "dealloc: slice origin is not a valid allocator address",
-            ));
-        }
-        let ptr = slice.start();
-        let true_len = Self::align_up_len(slice.len());
+    fn dealloc<'a>(
+        &'a self,
+        slice: BStackOwnedSlice<'a, Self>,
+    ) -> Result<(), BStackAllocError<'a, Self>> {
+        let start = slice.start();
+        let len = slice.len();
+        // Set once the (non-atomic) AVL insert has begun. A torn insert leaves
+        // the tree inconsistent, and GhostTree has no is_free flag to repair it
+        // in-process, so the block can no longer be returned for a retry —
+        // re-inserting an already-linked node would corrupt the free tree
+        // (self-cycle / duplicate parent link → the same region handed to two
+        // allocations). Failures before this point (validation, or the atomic
+        // tail discard, which frees nothing on failure) keep the handle.
+        let mut lost = false;
+        let result = (|| -> io::Result<()> {
+            if slice.is_empty() {
+                return Ok(());
+            }
+            if slice.start() < ARENA_START || slice.start() != Self::align_up_ptr(slice.start()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "dealloc: slice origin is not a valid allocator address",
+                ));
+            }
+            let ptr = slice.start();
+            let true_len = Self::align_up_len(slice.len());
 
-        // Atomic fast path: discard the tail block without taking the lock.
-        // try_discard succeeds only if the stack size is still ptr + true_len,
-        // making the check-and-discard atomic w.r.t. other threads' pushes.
-        // If it fails the block is no longer at the tail; fall through to insert.
-        #[cfg(feature = "atomic")]
-        if self.stack.try_discard(ptr + true_len, true_len)? {
-            return Ok(());
-        }
+            // Atomic fast path: discard the tail block without taking the lock.
+            // try_discard succeeds only if the stack size is still ptr + true_len,
+            // making the check-and-discard atomic w.r.t. other threads' pushes.
+            // If it fails the block is no longer at the tail; fall through to insert.
+            #[cfg(feature = "atomic")]
+            if self.stack.try_discard(ptr + true_len, true_len)? {
+                return Ok(());
+            }
 
-        // Tail optimisation: truncate instead of recycling through the AVL tree.
-        #[cfg(not(feature = "atomic"))]
-        if ptr + true_len == self.stack.len()? {
-            return self.stack.discard(true_len);
-        }
+            // Tail optimisation: truncate instead of recycling through the AVL tree.
+            #[cfg(not(feature = "atomic"))]
+            if ptr + true_len == self.stack.len()? {
+                return self.stack.discard(true_len);
+            }
 
-        // Note: GhostTree carries no per-block is_free flag and stores no block
-        // headers for live allocations, so reliable double-free detection is not
-        // possible without false-positives on ordinary user data.
+            // Note: GhostTree carries no per-block is_free flag and stores no block
+            // headers for live allocations, so reliable double-free detection is not
+            // possible without false-positives on ordinary user data.
 
-        // Zero before taking the lock: the block is owned by the caller and no
-        // other thread will touch it until it appears in the AVL tree.
-        self.stack.zero(ptr, true_len)?;
-        #[cfg(feature = "atomic")]
-        let _guard = self.lock.lock().unwrap();
-        self.avl_insert(ptr, true_len)
+            // Zero before taking the lock: the block is owned by the caller and no
+            // other thread will touch it until it appears in the AVL tree.
+            self.stack.zero(ptr, true_len)?;
+            #[cfg(feature = "atomic")]
+            let _guard = self.lock.lock().unwrap();
+            lost = true;
+            self.avl_insert(ptr, true_len)
+        })();
+        result.map_err(|source| BStackAllocError {
+            source,
+            handle: if lost {
+                None
+            } else {
+                // SAFETY: (start, len) still describes the caller's live block.
+                Some(unsafe { BStackOwnedSlice::from_raw_parts(self, start, len) })
+            },
+        })
     }
 }
 
@@ -972,7 +1083,7 @@ impl BStackBulkAllocator for GhostTreeBstackAllocator {
             return Ok(lengths
                 .iter()
                 // SAFETY: zero-length slices are safe
-                .map(|_| unsafe { BStackSlice::from_raw_parts(self, 0, 0) })
+                .map(|_| BStackOwnedSlice::empty(self))
                 .collect());
         }
 
@@ -1011,11 +1122,12 @@ impl BStackBulkAllocator for GhostTreeBstackAllocator {
         let mut offset = 0u64;
         for (&len, &al) in lengths.iter().zip(aligned.iter()) {
             if len == 0 {
-                // SAFETY: zero-length slice is safe
-                result.push(unsafe { BStackSlice::from_raw_parts(self, 0, 0) });
+                result.push(BStackOwnedSlice::empty(self));
             } else {
                 // SAFETY: block_ptr + offset is within the bulk allocated block
-                result.push(unsafe { BStackSlice::from_raw_parts(self, block_ptr + offset, len) });
+                result.push(unsafe {
+                    BStackOwnedSlice::from_raw_parts(self, block_ptr + offset, len)
+                });
                 offset += al;
             }
         }
@@ -1030,85 +1142,100 @@ impl BStackBulkAllocator for GhostTreeBstackAllocator {
     /// freed in a single operation when given back together.
     fn dealloc_bulk<'a>(
         &'a self,
-        slices: impl AsRef<[Self::Allocated<'a>]>,
-    ) -> Result<(), Self::Error> {
-        let slices = slices.as_ref();
+        slices: impl IntoIterator<Item = Self::Allocated<'a>>,
+    ) -> Result<(), BStackBulkAllocError<'a, Self>> {
+        let slices: Vec<BStackOwnedSlice<'a, Self>> = slices.into_iter().collect();
 
-        // Collect, validate, and convert to (ptr, aligned_size) pairs.
-        let mut entries: Vec<(u64, u64)> = Vec::new();
-        for s in slices {
-            if s.is_empty() {
-                continue;
+        // Set once any block has begun to be freed. This free is progressive
+        // (tail discard, then per-block zero + AVL insert), so once it starts a
+        // mid-way failure can leave some blocks freed and the merge has erased
+        // the original per-handle boundaries — no handle can then be safely
+        // returned. Before this point every handle is still fully owned.
+        let mut freeing = false;
+        let result = (|| -> io::Result<()> {
+            // Collect, validate, and convert to (ptr, aligned_size) pairs.
+            let mut entries: Vec<(u64, u64)> = Vec::new();
+            for s in &slices {
+                if s.is_empty() {
+                    continue;
+                }
+                if s.start() < ARENA_START || s.start() != Self::align_up_ptr(s.start()) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "dealloc_bulk: invalid slice origin",
+                    ));
+                }
+                entries.push((s.start(), Self::align_up_len(s.len())));
             }
-            if s.start() < ARENA_START || s.start() != Self::align_up_ptr(s.start()) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "dealloc_bulk: invalid slice origin",
-                ));
+
+            if entries.is_empty() {
+                return Ok(());
             }
-            entries.push((s.start(), Self::align_up_len(s.len())));
-        }
 
-        if entries.is_empty() {
-            return Ok(());
-        }
+            // Sort by address so adjacent slices are neighbours.
+            entries.sort_by_key(|&(ptr, _)| ptr);
 
-        // Sort by address so adjacent slices are neighbours.
-        entries.sort_by_key(|&(ptr, _)| ptr);
-
-        // Merge contiguous (ptr, size) pairs into combined blocks.
-        let mut merged: Vec<(u64, u64)> = Vec::new();
-        for (ptr, size) in entries {
-            if let Some(last) = merged.last_mut()
-                && last.0 + last.1 == ptr
-            {
-                last.1 += size;
-            } else {
-                merged.push((ptr, size));
+            // Merge contiguous (ptr, size) pairs into combined blocks.
+            let mut merged: Vec<(u64, u64)> = Vec::new();
+            for (ptr, size) in entries {
+                if let Some(last) = merged.last_mut()
+                    && last.0 + last.1 == ptr
+                {
+                    last.1 += size;
+                } else {
+                    merged.push((ptr, size));
+                }
             }
-        }
 
-        // Free each merged block.  The highest-address block may be at the tail;
-        // attempt a lock-free discard on it first.  All remaining blocks are
-        // zeroed outside the lock (each is owned by the caller), then inserted
-        // into the AVL tree under the lock in one pass.
+            // Free each merged block.  The highest-address block may be at the tail;
+            // attempt a lock-free discard on it first.  All remaining blocks are
+            // zeroed outside the lock (each is owned by the caller), then inserted
+            // into the AVL tree under the lock in one pass.
 
-        let last = merged.pop().unwrap(); // highest-address block (merged is sorted)
+            let last = merged.pop().unwrap(); // highest-address block (merged is sorted)
 
-        // Attempt tail-discard on the highest-address block.
-        let last_discarded;
-        #[cfg(feature = "atomic")]
-        {
-            last_discarded = self.stack.try_discard(last.0 + last.1, last.1)?;
-        }
-        #[cfg(not(feature = "atomic"))]
-        {
-            if last.0 + last.1 == self.stack.len()? {
-                self.stack.discard(last.1)?;
-                last_discarded = true;
-            } else {
-                last_discarded = false;
-            }
-        }
+            // Past this point blocks are physically reclaimed.
+            freeing = true;
 
-        if !last_discarded {
-            merged.push(last);
-        }
-
-        // Zero all blocks to be inserted (outside the lock).
-        for &(ptr, size) in &merged {
-            self.stack.zero(ptr, size)?;
-        }
-
-        // Insert all zeroed blocks under the lock.
-        if !merged.is_empty() {
+            // Attempt tail-discard on the highest-address block.
+            let last_discarded;
             #[cfg(feature = "atomic")]
-            let _guard = self.lock.lock().unwrap();
-            for (ptr, size) in merged {
-                self.avl_insert(ptr, size)?;
+            {
+                last_discarded = self.stack.try_discard(last.0 + last.1, last.1)?;
             }
-        }
-        Ok(())
+            #[cfg(not(feature = "atomic"))]
+            {
+                if last.0 + last.1 == self.stack.len()? {
+                    self.stack.discard(last.1)?;
+                    last_discarded = true;
+                } else {
+                    last_discarded = false;
+                }
+            }
+
+            if !last_discarded {
+                merged.push(last);
+            }
+
+            // Zero all blocks to be inserted (outside the lock).
+            for &(ptr, size) in &merged {
+                self.stack.zero(ptr, size)?;
+            }
+
+            // Insert all zeroed blocks under the lock.
+            if !merged.is_empty() {
+                #[cfg(feature = "atomic")]
+                let _guard = self.lock.lock().unwrap();
+                for (ptr, size) in merged {
+                    self.avl_insert(ptr, size)?;
+                }
+            }
+            Ok(())
+        })();
+        result.map_err(|source| BStackBulkAllocError {
+            source,
+            handles: if freeing { Vec::new() } else { slices },
+        })
     }
 }
 
@@ -1116,7 +1243,7 @@ impl BStackBulkAllocator for GhostTreeBstackAllocator {
 mod tests {
     use super::*;
     use crate::BStack;
-    use crate::alloc::{BStackAllocator, BStackBulkAllocator, BStackSlice};
+    use crate::alloc::{BStackAllocator, BStackBulkAllocator, BStackOwnedSlice};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     fn open_fresh() -> (GhostTreeBstackAllocator, std::path::PathBuf) {
@@ -1204,7 +1331,7 @@ mod tests {
     fn freed_block_is_zeroed() {
         let (alloc, path) = open_fresh();
         let _g = Guard(path);
-        let a = alloc.alloc(64).unwrap();
+        let mut a = alloc.alloc(64).unwrap();
         let b = alloc.alloc(64).unwrap();
         let a_start = a.start();
         a.write(&[0xAAu8; 64]).unwrap();
@@ -1292,7 +1419,7 @@ mod tests {
     fn realloc_same_aligned_size_preserves_data() {
         let (alloc, path) = open_fresh();
         let _g = Guard(path);
-        let s = alloc.alloc(32).unwrap();
+        let mut s = alloc.alloc(32).unwrap();
         s.write(&[0x5Au8; 32]).unwrap();
         let start = s.start();
         // Realloc to a different len with the same aligned block size.
@@ -1309,7 +1436,7 @@ mod tests {
     fn realloc_shrink_tail_discards() {
         let (alloc, path) = open_fresh();
         let _g = Guard(path);
-        let s = alloc.alloc(128).unwrap();
+        let mut s = alloc.alloc(128).unwrap();
         let start = s.start();
         s.write(&[0xBBu8; 128]).unwrap();
         let s2 = alloc.realloc(s, 32).unwrap();
@@ -1324,7 +1451,7 @@ mod tests {
     fn realloc_shrink_nontail_inserts_remainder() {
         let (alloc, path) = open_fresh();
         let _g = Guard(path);
-        let s = alloc.alloc(128).unwrap();
+        let mut s = alloc.alloc(128).unwrap();
         let anchor = alloc.alloc(32).unwrap();
         let start = s.start();
         s.write(&[0xCCu8; 128]).unwrap();
@@ -1345,7 +1472,7 @@ mod tests {
     fn realloc_grow_tail_extends_in_place() {
         let (alloc, path) = open_fresh();
         let _g = Guard(path);
-        let s = alloc.alloc(32).unwrap();
+        let mut s = alloc.alloc(32).unwrap();
         let start = s.start();
         s.write(&[0xDDu8; 32]).unwrap();
         let s2 = alloc.realloc(s, 96).unwrap();
@@ -1360,7 +1487,7 @@ mod tests {
     fn realloc_grow_nontail_copies_data() {
         let (alloc, path) = open_fresh();
         let _g = Guard(path);
-        let s = alloc.alloc(32).unwrap();
+        let mut s = alloc.alloc(32).unwrap();
         let anchor = alloc.alloc(32).unwrap();
         s.write(&[0xEEu8; 32]).unwrap();
         let s2 = alloc.realloc(s, 96).unwrap();
@@ -1380,7 +1507,7 @@ mod tests {
         let (alloc, path) = open_fresh();
         let _g = Guard(path);
         let s = alloc.alloc(64).unwrap();
-        let bad = unsafe { BStackSlice::from_raw_parts(&alloc, s.start() + 1, 32) };
+        let bad = unsafe { BStackOwnedSlice::from_raw_parts(&alloc, s.start() + 1, 32) };
         assert!(alloc.dealloc(bad).is_err());
         alloc.dealloc(s).unwrap();
     }
@@ -1390,7 +1517,7 @@ mod tests {
         let (alloc, path) = open_fresh();
         let _g = Guard(path);
         let s = alloc.alloc(64).unwrap();
-        let bad = unsafe { BStackSlice::from_raw_parts(&alloc, s.start() + 1, 32) };
+        let bad = unsafe { BStackOwnedSlice::from_raw_parts(&alloc, s.start() + 1, 32) };
         assert!(alloc.realloc(bad, 64).is_err());
         alloc.dealloc(s).unwrap();
     }
@@ -1462,7 +1589,7 @@ mod tests {
         let c = alloc2.alloc(128).unwrap();
         assert_eq!(c.start(), a_start);
         alloc2.dealloc(c).unwrap();
-        let anchor2 = unsafe { BStackSlice::from_raw_parts(&alloc2, anchor_start, 32) };
+        let anchor2 = unsafe { BStackOwnedSlice::from_raw_parts(&alloc2, anchor_start, 32) };
         alloc2.dealloc(anchor2).unwrap();
     }
 
@@ -1470,13 +1597,13 @@ mod tests {
     fn data_survives_reopen() {
         let (alloc, path) = open_fresh();
         let _g = Guard(path.clone());
-        let s = alloc.alloc(64).unwrap();
+        let mut s = alloc.alloc(64).unwrap();
         let start = s.start();
         s.write(&[0xABu8; 64]).unwrap();
         drop(alloc.into_stack());
 
         let alloc2 = reopen(&path);
-        let s2 = unsafe { BStackSlice::from_raw_parts(&alloc2, start, 64) };
+        let s2 = unsafe { BStackOwnedSlice::from_raw_parts(&alloc2, start, 64) };
         assert!(s2.read().unwrap().iter().all(|&b| b == 0xAB));
         alloc2.dealloc(s2).unwrap();
     }
@@ -1526,7 +1653,7 @@ mod tests {
                 thread::spawn(move || {
                     let a: &GhostTreeBstackAllocator = &alloc;
                     for _ in 0..ROUNDS {
-                        let slice = a.alloc(32).unwrap();
+                        let mut slice = a.alloc(32).unwrap();
                         let off = slice.start();
                         {
                             let mut set = live.lock().unwrap();
@@ -1580,7 +1707,10 @@ mod tests {
                 thread::spawn(move || {
                     let a: &GhostTreeBstackAllocator = &alloc;
                     let mut slice = a.alloc(SMALL).unwrap();
-                    slice.write(&[tid as u8; SMALL as usize]).unwrap();
+                    slice
+                        .as_slice_mut()
+                        .write(&[tid as u8; SMALL as usize])
+                        .unwrap();
 
                     for _ in 0..ROUNDS {
                         // Grow: tail → try_extend_zeros; non-tail → copy to new region.
@@ -1641,7 +1771,7 @@ mod tests {
                 thread::spawn(move || {
                     let a: &GhostTreeBstackAllocator = &alloc;
                     for _ in 0..ROUNDS {
-                        let slices = a.alloc_bulk(SIZES).unwrap();
+                        let mut slices = a.alloc_bulk(SIZES).unwrap();
                         {
                             let mut set = live.lock().unwrap();
                             for s in &slices {
@@ -1652,8 +1782,10 @@ mod tests {
                                 );
                             }
                         }
-                        for (s, &sz) in slices.iter().zip(SIZES.iter()) {
-                            s.write(&vec![tid as u8; sz as usize]).unwrap();
+                        for (s, &sz) in slices.iter_mut().zip(SIZES.iter()) {
+                            s.as_slice_mut()
+                                .write(&vec![tid as u8; sz as usize])
+                                .unwrap();
                             let data = s.read().unwrap();
                             assert_eq!(data, vec![tid as u8; sz as usize]);
                         }

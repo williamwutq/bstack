@@ -1,13 +1,37 @@
+//! Custom allocator showcasing `Into<BStackOwnedSlice>` and the owned/borrowed split.
+//!
+//! Demonstrates:
+//!
+//! 1. **`Into<BStackOwnedSlice>`** — the `Allocated` associated type can carry
+//!    extra metadata alongside the region handle.  The trait only requires
+//!    `Into<BStackOwnedSlice<'a, Self>>`, so the custom type can be richer than
+//!    a bare slice.
+//!
+//! 2. **Owned vs borrowed I/O** — `BStackOwnedSlice` exposes `read*` / `write*` /
+//!    `zero*` convenience methods directly.  Read methods take `&self`; write and
+//!    zero methods take `&mut self`, enforcing single-writer exclusivity in the
+//!    type system without requiring an explicit `as_slice[_mut]()` call.
+//!
+//! 3. **`BStackOwnedSliceAllocator` convenience bound** — a compact replacement
+//!    for the three-part allocator + error + type bound.
+//!
+//! Run:
+//!
+//! ```sh
+//! cargo run --example custom_alloc --features alloc,set
+//! ```
+
 #[cfg(all(feature = "alloc", feature = "set"))]
-use bstack::{BStack, BStackAllocator, BStackSlice, BStackSliceAllocator, LinearBStackAllocator};
-#[cfg(all(feature = "alloc", feature = "set"))]
-use std::convert::Infallible;
-#[cfg(all(feature = "alloc", feature = "set"))]
-use std::fmt;
+use bstack::{
+    BStack, BStackAllocError, BStackAllocator, BStackOwnedSlice, BStackOwnedSliceAllocator,
+    LinearBStackAllocator,
+};
 #[cfg(all(feature = "alloc", feature = "set"))]
 use std::io;
 #[cfg(all(feature = "alloc", feature = "set"))]
 use std::sync::atomic::{AtomicU64, Ordering};
+
+// ── Custom error type ────────────────────────────────────────────────────────
 
 #[cfg(all(feature = "alloc", feature = "set"))]
 #[derive(Debug)]
@@ -17,13 +41,13 @@ enum BumpError {
 }
 
 #[cfg(all(feature = "alloc", feature = "set"))]
-impl fmt::Display for BumpError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl std::fmt::Display for BumpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             BumpError::Io(e) => write!(f, "I/O error: {e}"),
-            BumpError::NotTail => f.write_str(
-                "SequenceBumpAllocator: realloc is only supported for the tail allocation",
-            ),
+            BumpError::NotTail => {
+                f.write_str("SequenceBumpAllocator: realloc only supported for the tail allocation")
+            }
         }
     }
 }
@@ -35,27 +59,40 @@ impl From<io::Error> for BumpError {
     }
 }
 
-// Custom handle: BStackSlice + in-memory sequence number.
+// ── Custom handle: BStackOwnedSlice + in-memory sequence number ──────────────
+
+/// A region handle that carries the allocation coordinate AND a sequence number.
+///
+/// This illustrates that `Allocated` can hold more than just the offset and
+/// length: any per-allocation metadata lives here, and the allocator trait only
+/// requires that it can be converted `Into<BStackOwnedSlice<'a, Self>>`.
 #[cfg(all(feature = "alloc", feature = "set"))]
-#[derive(Copy, Clone, Debug)]
+#[derive(Debug)]
 struct StampedSlice<'a> {
-    slice: BStackSlice<'a, SequenceBumpAllocator>,
+    inner: BStackOwnedSlice<'a, SequenceBumpAllocator>,
     seq: u64,
 }
 
-// Required: Allocated<'a>: TryInto<BStackSlice<'a, Self>>.
-// Infallible error — we just unwrap the inner slice.
 #[cfg(all(feature = "alloc", feature = "set"))]
-impl<'a> TryFrom<StampedSlice<'a>> for BStackSlice<'a, SequenceBumpAllocator> {
-    type Error = Infallible;
-
-    fn try_from(s: StampedSlice<'a>) -> Result<Self, Infallible> {
-        Ok(s.slice)
+impl<'a> StampedSlice<'a> {
+    fn start(&self) -> u64 {
+        self.inner.start()
+    }
+    fn len(&self) -> u64 {
+        self.inner.len()
     }
 }
 
-// Bump allocator with custom associated types.
-// Does NOT satisfy BStackSliceAllocator (uses custom Error + Allocated).
+// Required: `Allocated<'a>: Into<BStackOwnedSlice<'a, Self>>`.
+#[cfg(all(feature = "alloc", feature = "set"))]
+impl<'a> From<StampedSlice<'a>> for BStackOwnedSlice<'a, SequenceBumpAllocator> {
+    fn from(s: StampedSlice<'a>) -> Self {
+        s.inner
+    }
+}
+
+// ── Custom allocator ─────────────────────────────────────────────────────────
+
 #[cfg(all(feature = "alloc", feature = "set"))]
 struct SequenceBumpAllocator {
     stack: BStack,
@@ -87,114 +124,147 @@ impl BStackAllocator for SequenceBumpAllocator {
 
     fn alloc(&self, len: u64) -> Result<StampedSlice<'_>, BumpError> {
         let offset = self.stack.extend(len)?;
-        // SAFETY: offset and len come from BStack::extend on self.stack.
-        let slice = unsafe { BStackSlice::from_raw_parts(self, offset, len) };
         let seq = self.counter.fetch_add(1, Ordering::Relaxed);
-        Ok(StampedSlice { slice, seq })
+        // SAFETY: offset and len come from BStack::extend on self.stack.
+        let inner = unsafe { BStackOwnedSlice::from_raw_parts(self, offset, len) };
+        Ok(StampedSlice { inner, seq })
     }
 
     fn realloc<'a>(
         &'a self,
         handle: StampedSlice<'a>,
         new_len: u64,
-    ) -> Result<StampedSlice<'a>, BumpError> {
-        if handle.slice.end() != self.stack.len()? {
-            return Err(BumpError::NotTail);
-        }
-        let old_len = handle.slice.len();
-        match new_len.cmp(&old_len) {
-            std::cmp::Ordering::Greater => {
-                self.stack.extend(new_len - old_len)?;
+    ) -> Result<StampedSlice<'a>, BStackAllocError<'a, Self>> {
+        let start = handle.inner.start();
+        let old_len = handle.inner.len();
+        let end = handle.inner.end();
+        let seq = handle.seq;
+        // handle dropped (Drop is no-op); reconstruct below.
+        (|| -> Result<StampedSlice<'a>, BumpError> {
+            if end != self.stack.len()? {
+                return Err(BumpError::NotTail);
             }
-            std::cmp::Ordering::Less => {
-                self.stack.discard(old_len - new_len)?;
+            match new_len.cmp(&old_len) {
+                std::cmp::Ordering::Greater => {
+                    self.stack.extend(new_len - old_len)?;
+                }
+                std::cmp::Ordering::Less => {
+                    self.stack.discard(old_len - new_len)?;
+                }
+                std::cmp::Ordering::Equal => {}
             }
-            std::cmp::Ordering::Equal => {}
-        }
-        // SAFETY: start unchanged; tail adjusted to new_len.
-        let slice = unsafe { BStackSlice::from_raw_parts(self, handle.slice.start(), new_len) };
-        Ok(StampedSlice {
-            slice,
-            seq: handle.seq,
+            // SAFETY: start unchanged; tail adjusted to new_len.
+            let inner = unsafe { BStackOwnedSlice::from_raw_parts(self, start, new_len) };
+            Ok(StampedSlice { inner, seq })
+        })()
+        .map_err(|source| BStackAllocError {
+            source,
+            // Every failure path leaves the original tail region intact, so hand
+            // the (stamp-preserving) original handle back to the caller.
+            handle: Some(StampedSlice {
+                // SAFETY: (start, old_len) still describes the live original region.
+                inner: unsafe { BStackOwnedSlice::from_raw_parts(self, start, old_len) },
+                seq,
+            }),
         })
     }
 
-    fn dealloc(&self, handle: StampedSlice<'_>) -> Result<(), BumpError> {
-        if handle.slice.end() == self.stack.len()? {
-            self.stack.discard(handle.slice.len())?;
-        }
-        Ok(())
+    fn dealloc<'a>(&'a self, handle: StampedSlice<'a>) -> Result<(), BStackAllocError<'a, Self>> {
+        let start = handle.inner.start();
+        let len = handle.inner.len();
+        let end = handle.inner.end();
+        let seq = handle.seq;
+        (|| -> Result<(), BumpError> {
+            if end == self.stack.len()? {
+                self.stack.discard(len)?;
+            }
+            Ok(())
+        })()
+        .map_err(|source| BStackAllocError {
+            source,
+            // A failed discard leaves the region still allocated.
+            handle: Some(StampedSlice {
+                // SAFETY: (start, len) still describes the live region.
+                inner: unsafe { BStackOwnedSlice::from_raw_parts(self, start, len) },
+                seq,
+            }),
+        })
     }
 }
 
-// Generic helper using BStackSliceAllocator — compact bound covering all
-// library allocators (Error = io::Error, Allocated<'a> = BStackSlice<'a, A>).
-// Does NOT accept SequenceBumpAllocator (custom Error + Allocated types).
+// ── Generic helpers ───────────────────────────────────────────────────────────
+
+/// Write `data` via `BStackOwnedSliceAllocator` (compact bound covering all
+/// built-in allocators with `Error = io::Error` and `Allocated<'a> = BStackOwnedSlice<'a, A>`).
+///
+/// Does NOT accept `SequenceBumpAllocator` (custom Error and Allocated types).
 #[cfg(all(feature = "alloc", feature = "set"))]
-fn write_and_read<A: BStackSliceAllocator>(alloc: &A, data: &[u8]) -> io::Result<Vec<u8>> {
-    let slice: BStackSlice<'_, A> = alloc.alloc(data.len() as u64)?;
-    slice.write(data)?;
-    slice.read()
+fn write_and_read<A: BStackOwnedSliceAllocator>(alloc: &A, data: &[u8]) -> io::Result<Vec<u8>> {
+    let mut owned: BStackOwnedSlice<'_, A> = alloc.alloc(data.len() as u64)?;
+    owned.write(data)?;
+    owned.read()
 }
 
-// Generic helper using raw BStackAllocator — accepts any allocator including
-// custom ones, converting the handle via TryInto<BStackSlice>.
+/// Allocate `len` bytes and read them back via any `BStackAllocator` whose
+/// `Allocated` converts `Into<BStackOwnedSlice>` — this covers both built-in
+/// and custom allocators.
 #[cfg(all(feature = "alloc", feature = "set"))]
 fn alloc_read_back<A>(alloc: &A, len: u64) -> Result<Vec<u8>, A::Error>
 where
     A: BStackAllocator,
     A::Error: From<io::Error>,
-    for<'a> A::Allocated<'a>: TryInto<BStackSlice<'a, A>, Error = Infallible>,
+    for<'a> A::Allocated<'a>: Into<BStackOwnedSlice<'a, A>>,
 {
     let handle: A::Allocated<'_> = alloc.alloc(len)?;
-    let slice: BStackSlice<'_, A> = handle.try_into().unwrap();
-    slice.read().map_err(A::Error::from)
+    // Convert the custom Allocated into a plain BStackOwnedSlice for I/O.
+    let owned: BStackOwnedSlice<'_, A> = handle.into();
+    owned.read().map_err(A::Error::from)
 }
+
+// ── Main ──────────────────────────────────────────────────────────────────────
 
 #[cfg(all(feature = "alloc", feature = "set"))]
 fn main() -> io::Result<()> {
     let path = "custom_alloc_example.bstack";
     let _ = std::fs::remove_file(path);
 
-    // -- custom Error + Allocated<'a> -----------------------------------------
+    // ── Custom Error + Allocated<'a> ─────────────────────────────────────────
     println!("=== SequenceBumpAllocator ===");
     {
         let alloc = SequenceBumpAllocator::new(BStack::open(path)?);
 
         let a = alloc.alloc(16).unwrap();
-        println!(
-            "alloc  seq={} offset={} len={}",
-            a.seq,
-            a.slice.start(),
-            a.slice.len()
-        );
+        println!("alloc  seq={} offset={} len={}", a.seq, a.start(), a.len());
         let b = alloc.alloc(8).unwrap();
-        println!(
-            "alloc  seq={} offset={} len={}",
-            b.seq,
-            b.slice.start(),
-            b.slice.len()
-        );
+        println!("alloc  seq={} offset={} len={}", b.seq, b.start(), b.len());
 
-        // Non-tail realloc returns the custom NotTail variant.
-        match alloc.realloc(a, 32).unwrap_err() {
-            BumpError::NotTail => println!("realloc(a) → NotTail"),
+        // Non-tail realloc returns the custom NotTail variant, and hands the
+        // original handle back so it is not leaked.
+        let err = alloc.realloc(a, 32).unwrap_err();
+        let a = err
+            .handle
+            .expect("failed realloc returns the original handle");
+        match err.source {
+            BumpError::NotTail => println!("realloc(a) → NotTail (original recovered)"),
             other => println!("realloc(a) → {other}"),
         }
+        let _ = a;
 
         // Tail realloc preserves the sequence number.
         let b = alloc.realloc(b, 24).unwrap();
-        println!("realloc(b) → seq={} len={}", b.seq, b.slice.len());
+        println!("realloc(b) → seq={} len={}", b.seq, b.len());
 
-        // TryInto converts the custom handle to a plain BStackSlice for I/O.
-        let plain: BStackSlice<'_, SequenceBumpAllocator> = b.try_into().unwrap();
-        plain.write(b"custom handle")?;
-        println!(
-            "write+read → {:?}",
-            String::from_utf8_lossy(&plain.read()?[..13])
-        );
+        // Convert StampedSlice → BStackOwnedSlice via Into, then do I/O.
+        // This is the core "Into<BStackOwnedSlice>" pattern: the rich handle
+        // yields a plain owned slice for generic I/O code.
+        let mut owned: BStackOwnedSlice<'_, SequenceBumpAllocator> = b.into();
+        owned.write(b"stamped data!!\0")?;
+        println!("write+read → {:?}", String::from_utf8_lossy(&owned.read()?));
+        // Drop is a no-op: the allocation persists on disk until explicitly dealloc'd.
+        // Must drop before into_stack() so the borrow of `alloc` ends.
+        drop(owned);
 
-        // alloc_read_back uses the raw BStackAllocator bound with TryInto.
+        // alloc_read_back works for SequenceBumpAllocator via Into<BStackOwnedSlice>.
         let zeros = alloc_read_back(&alloc, 4).unwrap();
         println!("alloc_read_back(4) → {:?}", zeros);
 
@@ -210,12 +280,12 @@ fn main() -> io::Result<()> {
         drop(alloc.into_stack());
     }
 
-    // -- BStackSliceAllocator compact bound -----------------------------------
-    println!("\n=== BStackSliceAllocator ===");
+    // ── BStackOwnedSliceAllocator compact bound ──────────────────────────────
+    println!("\n=== BStackOwnedSliceAllocator (LinearBStackAllocator) ===");
     {
         let _ = std::fs::remove_file(path);
         let alloc = LinearBStackAllocator::new(BStack::open(path)?);
-        let data = write_and_read(&alloc, b"hello, BStackSliceAllocator")?;
+        let data = write_and_read(&alloc, b"hello, BStackOwnedSliceAllocator")?;
         println!("{:?}", String::from_utf8_lossy(&data));
         drop(alloc.into_stack());
     }

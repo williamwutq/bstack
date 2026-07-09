@@ -47,7 +47,7 @@ use std::{borrow::Cow, io};
 ///
 /// # Lifetime
 ///
-/// `'a` is the allocator lifetime, matching [`BStackSlice<'a, A>`].
+/// `'a` is the allocator lifetime, matching [`BStackSlice<'a>`].
 /// All implementors must satisfy `Self: 'a` and `A: 'a`.
 ///
 /// [`pre_read`]: BStackGuardedSlice::pre_read
@@ -79,7 +79,7 @@ where
     /// allows mutation, it must ensure that all hooks are properly fired on
     /// subsequent reads and writes, and that any necessary synchronization is
     /// performed to prevent data races or undefined behavior.
-    fn as_slice(&self) -> Result<BStackSlice<'a, A>, io::Error> {
+    fn as_slice(&self) -> Result<BStackSlice<'a>, io::Error> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "operation not supported on this guarded slice",
@@ -114,7 +114,7 @@ where
     /// hooks are not active or are called during the call, otherwise the caller
     /// may risk data corruption or undefined behavior. Prefer overriding `as_slice`
     /// when possible.
-    unsafe fn raw_block(&self) -> BStackSlice<'a, A>;
+    unsafe fn raw_block(&self) -> BStackSlice<'a>;
 
     /// Called before a read at `[offset, offset + len)` within the Range.
     ///
@@ -188,7 +188,7 @@ where
     /// Requires feature `set`.
     #[cfg(feature = "set")]
     fn write(&self, data: impl AsRef<[u8]>) -> io::Result<()> {
-        let slice = unsafe { self.raw_block() };
+        let mut slice = unsafe { self.raw_block() };
         let raw = data.as_ref();
         let n = self.len().min(raw.len() as u64);
         let cooked = self.pre_write(&raw[..n as usize])?;
@@ -204,7 +204,7 @@ where
     /// Requires feature `set`.
     #[cfg(feature = "set")]
     fn zero(&self) -> io::Result<()> {
-        let slice = unsafe { self.raw_block() };
+        let mut slice = unsafe { self.raw_block() };
         let n = self.len();
         let zeros = vec![0u8; n as usize];
         let cooked = self.pre_write(&zeros)?;

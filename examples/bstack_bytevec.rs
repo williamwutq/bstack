@@ -7,7 +7,7 @@
 //! * Serialising the raw block handle, closing the file, reopening it, and
 //!   reconstructing the vec — the reopen / crash-recovery path.
 
-use bstack::{BStack, BStackByteVec, LinearBStackAllocator};
+use bstack::{BStack, BStackByteVec, BStackOwnedSlice, LinearBStackAllocator};
 use std::io;
 use std::path::PathBuf;
 
@@ -73,10 +73,10 @@ fn main() -> io::Result<()> {
     {
         let alloc = LinearBStackAllocator::new(BStack::open(&path)?);
 
-        // Reconstruct the BStackSlice from the serialised bytes.
-        // SAFETY: `block_bytes` was produced by `BStackSlice::into()` in
+        // Reconstruct the BStackOwnedSlice from the serialised bytes.
+        // SAFETY: `block_bytes` was produced by `BStackOwnedSlice::into()` in
         // Session 1 on the same file; the offset and length are valid.
-        let block = unsafe { bstack::BStackSlice::from_bytes(&alloc, block_bytes) };
+        let block = unsafe { BStackOwnedSlice::from_bytes(&alloc, block_bytes) };
 
         // Reconstruct the BStackByteVec.
         // SAFETY: the block was created by `BStackByteVec::new` with the same

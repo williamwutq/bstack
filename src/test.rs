@@ -2239,7 +2239,7 @@ mod alloc_tests {
         let (alloc, path) = mk_alloc();
         let _g = Guard(path);
         let _ = alloc.alloc(8).unwrap(); // offset 0..8, all zeros
-        let s = unsafe { BStackSlice::from_raw_parts(&alloc, 0, 8) };
+        let s = unsafe { BStackSlice::from_raw_parts(alloc.stack(), 0, 8) };
         let mut buf = [0u8; 3];
         s.read_range_into(2, &mut buf).unwrap(); // reads bytes at relative offsets 2, 3, 4
         assert_eq!(buf, [0u8; 3]);
@@ -2300,7 +2300,9 @@ mod alloc_tests {
         let s = alloc.alloc(8).unwrap();
         let _ = alloc.alloc(4).unwrap(); // push another on top
         let err = alloc.realloc(s, 16).unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+        assert_eq!(err.source.kind(), std::io::ErrorKind::Unsupported);
+        // A failed realloc must hand the untouched original back to the caller.
+        assert!(err.handle.is_some());
     }
 
     // 13. dealloc tail reclaims space
@@ -2399,7 +2401,7 @@ mod alloc_tests {
     fn write_read_roundtrip() {
         let (alloc, path) = mk_alloc();
         let _g = Guard(path);
-        let s = alloc.alloc(5).unwrap();
+        let mut s = alloc.alloc(5).unwrap();
         s.write(b"hello").unwrap();
         assert_eq!(s.read().unwrap(), b"hello");
     }
@@ -2410,7 +2412,7 @@ mod alloc_tests {
     fn write_shorter_data() {
         let (alloc, path) = mk_alloc();
         let _g = Guard(path);
-        let s = alloc.alloc(5).unwrap();
+        let mut s = alloc.alloc(5).unwrap();
         s.write(b"hi").unwrap(); // writes 2 of the 5 slice bytes
         let data = s.read().unwrap();
         assert_eq!(data, b"hi\x00\x00\x00");
@@ -2422,7 +2424,7 @@ mod alloc_tests {
     fn write_longer_data() {
         let (alloc, path) = mk_alloc();
         let _g = Guard(path);
-        let s = alloc.alloc(3).unwrap();
+        let mut s = alloc.alloc(3).unwrap();
         s.write(b"hello").unwrap(); // writes only 3 bytes
         assert_eq!(s.read().unwrap(), b"hel");
     }
@@ -2432,7 +2434,7 @@ mod alloc_tests {
     fn write_range_partial() {
         let (alloc, path) = mk_alloc();
         let _g = Guard(path);
-        let s = alloc.alloc(5).unwrap();
+        let mut s = alloc.alloc(5).unwrap();
         s.write_range(1, b"abc").unwrap();
         let data = s.read().unwrap();
         assert_eq!(data, b"\x00abc\x00");
@@ -2443,7 +2445,7 @@ mod alloc_tests {
     fn write_range_out_of_bounds() {
         let (alloc, path) = mk_alloc();
         let _g = Guard(path);
-        let s = alloc.alloc(5).unwrap();
+        let mut s = alloc.alloc(5).unwrap();
         let err = s.write_range(3, b"abc").unwrap_err(); // 3+3 > 5
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
@@ -2453,7 +2455,7 @@ mod alloc_tests {
     fn zero_clears_slice() {
         let (alloc, path) = mk_alloc();
         let _g = Guard(path);
-        let s = alloc.alloc(4).unwrap();
+        let mut s = alloc.alloc(4).unwrap();
         s.write(b"abcd").unwrap();
         s.zero().unwrap();
         assert_eq!(s.read().unwrap(), vec![0u8; 4]);
@@ -2464,7 +2466,7 @@ mod alloc_tests {
     fn zero_range_partial() {
         let (alloc, path) = mk_alloc();
         let _g = Guard(path);
-        let s = alloc.alloc(4).unwrap();
+        let mut s = alloc.alloc(4).unwrap();
         s.write(b"abcd").unwrap();
         s.zero_range(1, 2).unwrap();
         assert_eq!(s.read().unwrap(), b"a\x00\x00d");
@@ -2475,7 +2477,7 @@ mod alloc_tests {
     fn zero_range_out_of_bounds() {
         let (alloc, path) = mk_alloc();
         let _g = Guard(path);
-        let s = alloc.alloc(4).unwrap();
+        let mut s = alloc.alloc(4).unwrap();
         let err = s.zero_range(3, 2).unwrap_err(); // 3+2 > 4
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
@@ -2486,7 +2488,7 @@ mod alloc_tests {
         let (alloc, path) = mk_alloc();
         let _g = Guard(path);
         let s = alloc.alloc(10).unwrap();
-        let sub = s.subslice(2, 8);
+        let sub = s.as_slice().subslice(2, 8);
         assert_eq!(sub.start(), 2);
         assert_eq!(sub.len(), 6);
         assert_eq!(sub.start(), 2);
@@ -2499,7 +2501,7 @@ mod alloc_tests {
         let (alloc, path) = mk_alloc();
         let _g = Guard(path);
         let s = alloc.alloc(10).unwrap();
-        let sub = s.subslice(5, 5);
+        let sub = s.as_slice().subslice(5, 5);
         assert_eq!(sub.start(), 5);
         assert_eq!(sub.len(), 0);
         assert!(sub.is_empty());
@@ -2512,7 +2514,7 @@ mod alloc_tests {
         let (alloc, path) = mk_alloc();
         let _g = Guard(path);
         let s = alloc.alloc(10).unwrap();
-        let _ = s.subslice(8, 5); // start > end
+        let _ = s.as_slice().subslice(8, 5); // start > end
     }
 
     // 23. subslice panics on out of bounds
@@ -2522,7 +2524,7 @@ mod alloc_tests {
         let (alloc, path) = mk_alloc();
         let _g = Guard(path);
         let s = alloc.alloc(10).unwrap();
-        let _ = s.subslice(5, 15); // end > len
+        let _ = s.as_slice().subslice(5, 15); // end > len
     }
 
     // 24. start returns offset
@@ -2532,7 +2534,7 @@ mod alloc_tests {
         let _g = Guard(path);
         let s = alloc.alloc(10).unwrap();
         assert_eq!(s.start(), 0);
-        let sub = s.subslice(3, 7);
+        let sub = s.as_slice().subslice(3, 7);
         assert_eq!(sub.start(), 3);
     }
 
@@ -2543,7 +2545,7 @@ mod alloc_tests {
         let _g = Guard(path);
         let s = alloc.alloc(10).unwrap();
         assert_eq!(s.range(), 0..10);
-        let sub = s.subslice(2, 8);
+        let sub = s.as_slice().subslice(2, 8);
         assert_eq!(sub.range(), 2..8);
     }
 
@@ -2583,7 +2585,7 @@ mod alloc_tests {
         let (alloc, path) = mk_alloc();
         let _g = Guard(path);
         let s = alloc.alloc(10).unwrap();
-        let writer = s.writer_at(3);
+        let writer = s.as_slice().writer_at(3);
         let dbg = format!("{:?}", writer);
         assert!(dbg.contains("BStackSliceWriter"), "{dbg}");
         assert!(dbg.contains("start"), "{dbg}");
@@ -2623,8 +2625,8 @@ mod alloc_tests {
         let (alloc, path) = mk_alloc();
         let _g = Guard(path);
         let s = alloc.alloc(10).unwrap();
-        let short = s.subslice(0, 3).reader();
-        let long_ = s.subslice(0, 8).reader();
+        let short = s.as_slice().subslice(0, 3).reader();
+        let long_ = s.as_slice().subslice(0, 8).reader();
         // Both cursors are at absolute position 0; shorter slice is less.
         assert!(short < long_);
     }
@@ -2637,10 +2639,13 @@ mod alloc_tests {
         let (alloc, path) = mk_alloc();
         let _g = Guard(path);
         let s = alloc.alloc(10).unwrap();
-        let w0 = s.writer_at(0);
-        let w5 = s.writer_at(5);
+        let w0 = s.as_slice().writer_at(0);
+        let w5 = s.as_slice().writer_at(5);
         assert!(w0 < w5);
-        assert_eq!(w5.cmp(&s.writer_at(5)), std::cmp::Ordering::Equal);
+        assert_eq!(
+            w5.cmp(&s.as_slice().writer_at(5)),
+            std::cmp::Ordering::Equal
+        );
     }
 
     #[cfg(feature = "set")]
@@ -2650,7 +2655,7 @@ mod alloc_tests {
         let _g = Guard(path);
         let a = alloc.alloc(8).unwrap(); // offset 0..8
         let b = alloc.alloc(8).unwrap(); // offset 8..16
-        assert!(a.writer() < b.writer());
+        assert!(a.as_slice().writer() < b.as_slice().writer());
     }
 
     // ---- Cross-type PartialOrd (reader ↔ writer) ----------------------------
@@ -2661,10 +2666,10 @@ mod alloc_tests {
         let (alloc, path) = mk_alloc();
         let _g = Guard(path);
         let s = alloc.alloc(10).unwrap();
-        let r3 = s.reader_at(3);
-        let w5 = s.writer_at(5);
-        let w3 = s.writer_at(3);
-        let r5 = s.reader_at(5);
+        let r3 = s.as_slice().reader_at(3);
+        let w5 = s.as_slice().writer_at(5);
+        let w3 = s.as_slice().writer_at(3);
+        let r5 = s.as_slice().reader_at(5);
         assert!(r3 < w5);
         assert!(w3 < r5);
         assert_eq!(r3.partial_cmp(&w3), Some(std::cmp::Ordering::Equal));
@@ -2678,9 +2683,9 @@ mod alloc_tests {
         let _g = Guard(path);
         let s = alloc.alloc(20).unwrap();
         // r2 < w8 < r15: check transitivity across types
-        let r2 = s.reader_at(2);
-        let w8 = s.writer_at(8);
-        let r15 = s.reader_at(15);
+        let r2 = s.as_slice().reader_at(2);
+        let w8 = s.as_slice().writer_at(8);
+        let r15 = s.as_slice().reader_at(15);
         assert!(r2 < w8);
         assert!(w8 < r15);
         assert!(r2 < r15);
@@ -2896,16 +2901,16 @@ mod alloc_tests {
     fn bulk_dealloc_partial_then_realloc() {
         let (alloc, path) = mk_alloc();
         let _g = Guard(path);
-        let slices = alloc.alloc_bulk([8_u64, 16, 32]).unwrap();
-        let (head, tail) = slices.split_at(1);
-        // Reclaim only the last two slices (tail suffix).
-        alloc.dealloc_bulk(tail.to_vec()).unwrap();
+        let mut slices = alloc.alloc_bulk([8_u64, 16, 32]).unwrap();
+        // Reclaim only the last two slices (tail suffix), keeping slices[0] alive.
+        let tail = slices.drain(1..).collect::<Vec<_>>();
+        alloc.dealloc_bulk(tail).unwrap();
         assert_eq!(alloc.len().unwrap(), 8);
-        // head[0] (0..8) is still live; a new bulk alloc goes right after it.
+        // slices[0] (0..8) is still live; a new bulk alloc goes right after it.
         let new = alloc.alloc_bulk([4_u64, 4]).unwrap();
         assert_eq!(new[0].start(), 8);
         assert_eq!(new[1].start(), 12);
-        let _ = head; // keep the borrow alive
+        let _ = slices; // keep the first slice alive
     }
 }
 
@@ -2976,7 +2981,7 @@ mod first_fit_tests {
     fn new_reopens_existing_file() {
         let (alloc, path) = mk_ff("reopen");
         let _g = Guard(path.clone());
-        let s = alloc.alloc(32).unwrap();
+        let mut s = alloc.alloc(32).unwrap();
         s.write(b"hello world reopen test!!!!!!!!! ").unwrap();
         let s_start = s.start();
         let _ = s;
@@ -3121,7 +3126,7 @@ mod first_fit_tests {
     fn reused_block_is_zero_initialised() {
         let (alloc, path) = mk_ff("reuse_zero");
         let _g = Guard(path);
-        let a = alloc.alloc(32).unwrap();
+        let mut a = alloc.alloc(32).unwrap();
         let _b = alloc.alloc(16).unwrap();
         a.write(b"dirty data from previous use!!!!").unwrap();
         alloc.dealloc(a).unwrap();
@@ -3245,8 +3250,8 @@ mod first_fit_tests {
     fn coalesce_data_is_zeroed_in_reused_merged_block() {
         let (alloc, path) = mk_ff("coal_zero");
         let _g = Guard(path);
-        let a = alloc.alloc(16).unwrap();
-        let b = alloc.alloc(16).unwrap();
+        let mut a = alloc.alloc(16).unwrap();
+        let mut b = alloc.alloc(16).unwrap();
         let _sentinel = alloc.alloc(16).unwrap();
         a.write(b"AAAAAAAAAAAAAAAA").unwrap();
         b.write(b"BBBBBBBBBBBBBBBB").unwrap();
@@ -3264,8 +3269,9 @@ mod first_fit_tests {
         let (alloc, path) = mk_ff("realloc_tail_grow");
         let _g = Guard(path);
         let s = alloc.alloc(16).unwrap();
+        let s_start = s.start();
         let s2 = alloc.realloc(s, 32).unwrap();
-        assert_eq!(s2.start(), s.start());
+        assert_eq!(s2.start(), s_start);
         assert_eq!(s2.len(), 32);
         assert_eq!(alloc.len().unwrap(), ALFF_HDR_OFFSET + 32 + BLOCK_OVERHEAD);
     }
@@ -3275,8 +3281,9 @@ mod first_fit_tests {
         let (alloc, path) = mk_ff("realloc_tail_shrink");
         let _g = Guard(path);
         let s = alloc.alloc(32).unwrap();
+        let s_start = s.start();
         let s2 = alloc.realloc(s, 16).unwrap();
-        assert_eq!(s2.start(), s.start());
+        assert_eq!(s2.start(), s_start);
         assert_eq!(s2.len(), 16);
         assert_eq!(alloc.len().unwrap(), ALFF_HDR_OFFSET + 16 + BLOCK_OVERHEAD);
     }
@@ -3285,7 +3292,7 @@ mod first_fit_tests {
     fn realloc_tail_preserves_data() {
         let (alloc, path) = mk_ff("realloc_tail_data");
         let _g = Guard(path);
-        let s = alloc.alloc(16).unwrap();
+        let mut s = alloc.alloc(16).unwrap();
         s.write(b"hello world!!!!").unwrap();
         let s2 = alloc.realloc(s, 32).unwrap();
         let data = s2.read().unwrap();
@@ -3298,9 +3305,10 @@ mod first_fit_tests {
         let (alloc, path) = mk_ff("realloc_same");
         let _g = Guard(path);
         let s = alloc.alloc(16).unwrap();
+        let s_start = s.start();
         let before_len = alloc.len().unwrap();
         let s2 = alloc.realloc(s, 16).unwrap();
-        assert_eq!(s2.start(), s.start());
+        assert_eq!(s2.start(), s_start);
         assert_eq!(alloc.len().unwrap(), before_len);
     }
 
@@ -3320,7 +3328,7 @@ mod first_fit_tests {
     fn realloc_nontail_preserves_data() {
         let (alloc, path) = mk_ff("realloc_move_data");
         let _g = Guard(path);
-        let a = alloc.alloc(16).unwrap();
+        let mut a = alloc.alloc(16).unwrap();
         let _b = alloc.alloc(16).unwrap();
         a.write(b"preserved!!!!!!!").unwrap();
         let a2 = alloc.realloc(a, 32).unwrap();
@@ -3398,7 +3406,7 @@ mod first_fit_tests {
         // Grow in-place via merge; existing bytes survive, new bytes are zero.
         let (alloc, path) = mk_ff("merge_data");
         let _g = Guard(path);
-        let a = alloc.alloc(16).unwrap();
+        let mut a = alloc.alloc(16).unwrap();
         let b = alloc.alloc(64).unwrap();
         let _c = alloc.alloc(16).unwrap();
         a.write(b"0123456789ABCDEF").unwrap();
@@ -3416,7 +3424,7 @@ mod first_fit_tests {
         let (alloc, path) = mk_ff("merge_rem_zero");
         let _g = Guard(path);
         let a = alloc.alloc(16).unwrap();
-        let b = alloc.alloc(80).unwrap();
+        let mut b = alloc.alloc(80).unwrap();
         let _c = alloc.alloc(16).unwrap();
         // Write garbage into B so the overlap area is dirty before freeing.
         b.write(&vec![0xFFu8; 80]).unwrap();
@@ -3551,7 +3559,7 @@ mod first_fit_tests {
     fn alloc_persists_across_reopen() {
         let (alloc, path) = mk_ff("persist");
         let _g = Guard(path.clone());
-        let s = alloc.alloc(8).unwrap();
+        let mut s = alloc.alloc(8).unwrap();
         s.write(b"durably!").unwrap();
         let start = s.start();
         drop(alloc.into_stack());
@@ -3667,7 +3675,7 @@ mod first_fit_tests {
     fn stack_accessor_exposes_raw_reads() {
         let (alloc, path) = mk_ff("stack_acc");
         let _g = Guard(path);
-        let s = alloc.alloc(8).unwrap();
+        let mut s = alloc.alloc(8).unwrap();
         s.write(b"testdata").unwrap();
         let raw = alloc.stack().get(s.start(), s.start() + 8).unwrap();
         assert_eq!(raw, b"testdata");
@@ -3709,7 +3717,7 @@ mod first_fit_tests {
                     let sizes = [16u64, 24, 40, 64, 96, 128];
                     for i in 0..ITERS {
                         let len = sizes[(i as usize) % sizes.len()];
-                        let slice = alloc.alloc(len).unwrap();
+                        let mut slice = alloc.alloc(len).unwrap();
                         let pat = (tid as u8).wrapping_add(i as u8);
                         let buf = vec![pat; len as usize];
                         slice.write(&buf).unwrap();
