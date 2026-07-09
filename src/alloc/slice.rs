@@ -270,6 +270,12 @@ impl<'a> BStackSlice<'a> {
         self.range.is_empty()
     }
 
+    /// Half-open byte range `start..end` of this slice.
+    #[inline]
+    pub fn range(&self) -> Range<u64> {
+        self.range.range()
+    }
+
     /// Return the underlying [`BStack`].
     #[inline]
     pub fn stack(&self) -> &'a BStack {
@@ -614,6 +620,12 @@ impl<'a, A: BStackAllocator> BStackOwnedSlice<'a, A> {
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.range.is_empty()
+    }
+
+    /// Half-open byte range `start..end` of this allocation.
+    #[inline]
+    pub fn range(&self) -> Range<u64> {
+        self.range.range()
     }
 
     /// Return the allocator that owns this handle.
