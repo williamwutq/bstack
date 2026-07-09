@@ -59,7 +59,9 @@ pub fn bstack_block(_args: TokenStream, item: TokenStream) -> TokenStream {
 pub fn bstack_move(_input: TokenStream) -> TokenStream {
     // Scaffold: emit an unimplemented expression so any (currently nonexistent)
     // call site type-checks. TODO: implement the destructuring expansion.
-    "::core::todo!(\"bstack_move! not yet implemented\")".parse().unwrap()
+    "::core::todo!(\"bstack_move! not yet implemented\")"
+        .parse()
+        .unwrap()
 }
 
 /// `bstack_cast!(handle)` — type-checked handle conversion, direction inferred
@@ -71,5 +73,7 @@ pub fn bstack_move(_input: TokenStream) -> TokenStream {
 /// (upcast). See RAII.md "`bstack_cast!`".
 #[proc_macro]
 pub fn bstack_cast(_input: TokenStream) -> TokenStream {
-    "::core::todo!(\"bstack_cast! not yet implemented\")".parse().unwrap()
+    "::core::todo!(\"bstack_cast! not yet implemented\")"
+        .parse()
+        .unwrap()
 }
