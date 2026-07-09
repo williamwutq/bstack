@@ -436,9 +436,9 @@
 //!
 //! * [`BStackOwnedSlice`]`<'a, A>` — ownership handle returned by `alloc` /
 //!   `realloc`.  Non-Copy, non-Clone; owns the allocation lifetime `'a`.
-//!   Does not do I/O directly — obtain a view via `as_slice()` (reads) or
-//!   `as_slice_mut()` (reads + writes).  Passed by value to `realloc` and
-//!   `dealloc`; Drop is a no-op (freeing is always explicit).
+//!   Exposes `as_slice()` / `as_slice_mut()` to obtain a borrowed view, and also
+//!   provides convenience `read*` / `write*` / `zero*` methods that delegate via
+//!   those views. Passed by value to `realloc` and `dealloc`; Drop is a no-op.
 //!
 //! * [`BStackSlice`]`<'a>` — borrowed I/O view over a region.  Non-Copy;
 //!   obtained from `BStackOwnedSlice::as_slice[_mut]()` or directly from
