@@ -46,6 +46,7 @@
 
 mod block;
 mod clone;
+mod construct;
 mod handle;
 mod layout;
 mod owned;
@@ -54,8 +55,12 @@ mod reference;
 mod shared;
 mod teardown;
 
+#[cfg(test)]
+mod tests;
+
 pub use block::{BStackBlock, BStackCast, BStackWeakable};
 pub use clone::TryClone;
+pub use construct::{alloc_block, alloc_control, init_rc};
 pub use handle::{OwnedRef, StrongRef, StrongWeakRef, WeakRef};
 pub use layout::{BlockHeader, EightCC};
 pub use owned::BStackOwned;
