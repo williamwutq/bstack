@@ -571,8 +571,30 @@
 //! # }
 //! ```
 
+// This crate-doc section is emitted only when the dev/test-only fault-injection
+// machinery is actually compiled in (see the [`fault`] module).
+#![cfg_attr(
+    all(debug_assertions, feature = "fault-injection"),
+    doc = "# Fault injection (`fault-injection` feature)",
+    doc = "",
+    doc = "This build has the dev/test-only `fault-injection` feature active, so",
+    doc = "`BStack` I/O can be made to fail on demand. Implement [`FaultPolicy`] and arm",
+    doc = "it with [`BStack::with_fault_policy`] (at construction) or",
+    doc = "[`BStack::set_fault_policy`] (arm, re-arm, or disarm mid-test); every I/O",
+    doc = "method then consults the policy once, **after** validating its arguments. This",
+    doc = "exercises error-handling and rollback paths that a successful sequence of calls",
+    doc = "can never reach. The whole mechanism is gated on `all(debug_assertions, feature",
+    doc = "= \"fault-injection\")`, so a `--release` build carries none of it and its",
+    doc = "performance is unaffected. See the [`fault`] module for details."
+)]
+
 mod io_core;
 use io_core::*;
+
+pub mod fault;
+use fault::fault_point;
+#[cfg(all(debug_assertions, feature = "fault-injection"))]
+pub use fault::{FaultPolicy, FaultState};
 #[cfg(all(test, feature = "alloc", feature = "set"))]
 mod alloc_fuzz_tests;
 mod test;
@@ -721,6 +743,12 @@ pub struct BStack {
     /// call on a cached stack.  Capacity follows a power-of-two growth rule;
     /// `self.locked` is the count of valid bytes within the buffer.
     cache: Mutex<Vec<u8>>,
+    /// Deterministic I/O-fault injection state, consulted at the API boundary of
+    /// every instrumented method (see the [`fault`] module). Present only in
+    /// builds with `debug_assertions` on and the `fault-injection` feature
+    /// enabled; release builds carry neither the field nor its per-call branch.
+    #[cfg(all(debug_assertions, feature = "fault-injection"))]
+    fault: fault::FaultState,
 }
 
 // `BStack` is auto-`Send + Sync` on every platform: all fields
@@ -848,6 +876,8 @@ impl BStack {
             locked: AtomicU64::new(0),
             cache_enabled: false,
             cache: Mutex::new(Vec::new()),
+            #[cfg(all(debug_assertions, feature = "fault-injection"))]
+            fault: fault::FaultState::new(),
         })
     }
 
@@ -964,6 +994,7 @@ impl BStack {
             return Ok(logical_offset);
         }
 
+        fault_point!(self, "push");
         if let Err(e) = file.write_all(data) {
             let _ = file.set_len(file_end);
             return Err(e);
@@ -1000,6 +1031,7 @@ impl BStack {
             return Ok(logical_offset);
         }
 
+        fault_point!(self, "extend");
         let new_file_end = file_end + n;
         file.set_len(new_file_end)?;
 
@@ -1043,6 +1075,7 @@ impl BStack {
             ));
         }
         let mut buf = vec![0u8; n as usize];
+        fault_point!(self, "pop");
         read_at(file, new_data_len, &mut buf)?;
         commit_shrink(file, clen, new_data_len)?;
         Ok(buf)
@@ -1081,6 +1114,7 @@ impl BStack {
                     format!("peek offset ({offset}) exceeds payload size ({data_size})"),
                 ));
             }
+            fault_point!(self, "peek");
             pread_exact(file, HEADER_SIZE + offset, (data_size - offset) as usize)
         }
         #[cfg(not(any(unix, windows)))]
@@ -1095,6 +1129,7 @@ impl BStack {
                     format!("peek offset ({offset}) exceeds payload size ({data_size})"),
                 ));
             }
+            fault_point!(self, "peek");
             file.seek(SeekFrom::Start(HEADER_SIZE + offset))?;
             let mut buf = vec![0u8; (data_size - offset) as usize];
             file.read_exact(&mut buf)?;
@@ -1163,6 +1198,7 @@ impl BStack {
                     format!("get: end ({end}) exceeds payload size ({data_size})"),
                 ));
             }
+            fault_point!(self, "get");
             pread_exact(file, HEADER_SIZE + start, (end - start) as usize)
         }
         #[cfg(not(any(unix, windows)))]
@@ -1182,6 +1218,7 @@ impl BStack {
                     format!("get: end ({end}) exceeds payload size ({data_size})"),
                 ));
             }
+            fault_point!(self, "get");
             file.seek(SeekFrom::Start(HEADER_SIZE + start))?;
             let mut buf = vec![0u8; (end - start) as usize];
             file.read_exact(&mut buf)?;
@@ -1230,6 +1267,7 @@ impl BStack {
                     ),
                 ));
             }
+            fault_point!(self, "peek_into");
             pread_exact_into(file, HEADER_SIZE + offset, buf)
         }
         #[cfg(not(any(unix, windows)))]
@@ -1245,6 +1283,7 @@ impl BStack {
                     ),
                 ));
             }
+            fault_point!(self, "peek_into");
             file.seek(SeekFrom::Start(HEADER_SIZE + offset))?;
             file.read_exact(buf)
         }
@@ -1305,6 +1344,7 @@ impl BStack {
                     format!("get_into: end ({end}) exceeds payload size ({data_size})"),
                 ));
             }
+            fault_point!(self, "get_into");
             pread_exact_into(file, HEADER_SIZE + start, buf)
         }
         #[cfg(not(any(unix, windows)))]
@@ -1324,6 +1364,7 @@ impl BStack {
                     format!("get_into: end ({end}) exceeds payload size ({data_size})"),
                 ));
             }
+            fault_point!(self, "get_into");
             file.seek(SeekFrom::Start(HEADER_SIZE + start))?;
             file.read_exact(buf)
         }
@@ -1368,6 +1409,7 @@ impl BStack {
                 format!("pop_into({n}) would shrink payload below locked length ({locked})"),
             ));
         }
+        fault_point!(self, "pop_into");
         read_at(file, new_data_len, buf)?;
         commit_shrink(file, clen, new_data_len)?;
         Ok(())
@@ -1409,6 +1451,7 @@ impl BStack {
                 format!("discard({n}) would shrink payload below locked length ({locked})"),
             ));
         }
+        fault_point!(self, "discard");
         commit_shrink(file, clen, new_data_len)?;
         Ok(())
     }
@@ -1458,6 +1501,7 @@ impl BStack {
                 format!("set: write end ({end}) exceeds payload size ({data_size})"),
             ));
         }
+        fault_point!(self, "set");
         set_in_place(file, data_size, offset, data)
     }
 
@@ -1504,6 +1548,7 @@ impl BStack {
         }
         // Zeroing is a repeat-fill of the single-byte pattern `[0x00]` `n` times:
         // the journal stages a fixed 9-byte `[k | s]` tail instead of `n` bytes.
+        fault_point!(self, "zero");
         repeat_fill(file, data_size, offset, &[0u8], n)
     }
 
@@ -1569,6 +1614,7 @@ impl BStack {
                 format!("repeat: write end ({end}) exceeds payload size ({data_size})"),
             ));
         }
+        fault_point!(self, "repeat");
         repeat_fill(file, data_size, offset, pattern, count)
     }
 }
@@ -1633,6 +1679,7 @@ impl BStack {
                 format!("atrunc: operation would modify locked region [0, {locked})"),
             ));
         }
+        fault_point!(self, "atrunc");
         commit_tail_replace(file, clen, new_tail_start, n, buf, file_end)
     }
 
@@ -1679,6 +1726,7 @@ impl BStack {
                 format!("splice: operation would modify locked region [0, {locked})"),
             ));
         }
+        fault_point!(self, "splice");
         // Read the bytes to remove before any mutation.
         let mut removed = vec![0u8; n as usize];
         read_at(file, new_tail_start, &mut removed)?;
@@ -1731,6 +1779,7 @@ impl BStack {
                 format!("splice_into: operation would modify locked region [0, {locked})"),
             ));
         }
+        fault_point!(self, "splice_into");
         // Read the bytes to remove before any mutation.
         read_at(file, new_tail_start, old)?;
 
@@ -1764,6 +1813,7 @@ impl BStack {
         if buf.is_empty() {
             return Ok(true);
         }
+        fault_point!(self, "try_extend");
         if let Err(e) = file.write_all(buf) {
             let _ = file.set_len(file_end);
             return Err(e);
@@ -1805,6 +1855,7 @@ impl BStack {
             n,
             "try_extend_zeros: data_size + n overflows u64",
         )?;
+        fault_point!(self, "try_extend_zeros");
         file.set_len(HEADER_SIZE + new_len)?;
         commit_grow(file, clen, new_len, data_size, file_end)?;
         Ok(true)
@@ -1856,6 +1907,7 @@ impl BStack {
                 format!("try_discard: would shrink payload below locked length ({locked})"),
             ));
         }
+        fault_point!(self, "try_discard");
         commit_shrink(file, clen, new_data_len)?;
         Ok(true)
     }
@@ -1902,6 +1954,7 @@ impl BStack {
             let guard = self.lock.read().unwrap();
             let file = &guard.0;
             let data_size = file.metadata()?.len().saturating_sub(HEADER_SIZE);
+            fault_point!(self, "get_batched");
             let mut results = Vec::with_capacity(ranges.len());
             for r in &ranges {
                 if r.end > data_size {
@@ -1926,6 +1979,7 @@ impl BStack {
             let mut guard = self.lock.write().unwrap();
             let file = &mut guard.0;
             let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
+            fault_point!(self, "get_batched");
             let mut results = Vec::with_capacity(ranges.len());
             for r in &ranges {
                 if r.end > data_size {
@@ -1979,6 +2033,7 @@ impl BStack {
             let guard = self.lock.read().unwrap();
             let file = &guard.0;
             let data_size = file.metadata()?.len().saturating_sub(HEADER_SIZE);
+            fault_point!(self, "get_batched_into");
             for (ptr, buf) in bufs {
                 let end = ptr.checked_add(buf.len() as u64).ok_or_else(|| {
                     io::Error::new(
@@ -2001,6 +2056,7 @@ impl BStack {
             let mut guard = self.lock.write().unwrap();
             let file = &mut guard.0;
             let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
+            fault_point!(self, "get_batched_into");
             for (ptr, buf) in bufs {
                 let end = ptr.checked_add(buf.len() as u64).ok_or_else(|| {
                     io::Error::new(
@@ -2050,6 +2106,7 @@ impl BStack {
             let guard = self.lock.read().unwrap();
             let file = &guard.0;
             let data_size = file.metadata()?.len().saturating_sub(HEADER_SIZE);
+            fault_point!(self, "get_batched_gen");
             while let Some((offset, buf)) = f() {
                 let end = offset.checked_add(buf.len() as u64).ok_or_else(|| {
                     io::Error::new(
@@ -2072,6 +2129,7 @@ impl BStack {
             let mut guard = self.lock.write().unwrap();
             let file = &mut guard.0;
             let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
+            fault_point!(self, "get_batched_gen");
             while let Some((offset, buf)) = f() {
                 let end = offset.checked_add(buf.len() as u64).ok_or_else(|| {
                     io::Error::new(
@@ -2136,6 +2194,7 @@ impl BStack {
                 format!("replace: operation would modify locked region [0, {locked})"),
             ));
         }
+        fault_point!(self, "replace");
         let mut old_tail = vec![0u8; n as usize];
         read_at(file, new_tail_start, &mut old_tail)?;
         let new_tail = f(&old_tail);
@@ -2331,6 +2390,7 @@ impl BStack {
                 format!("swap: range [{offset}, {end}) exceeds payload size ({data_size})"),
             ));
         }
+        fault_point!(self, "swap");
         let mut old = vec![0u8; buf.len()];
         read_at(file, offset, &mut old)?;
         set_in_place(file, data_size, offset, buf)?;
@@ -2382,6 +2442,7 @@ impl BStack {
                 format!("swap_into: range [{offset}, {end}) exceeds payload size ({data_size})"),
             ));
         }
+        fault_point!(self, "swap_into");
         let mut tmp = vec![0u8; buf.len()];
         read_at(file, offset, &mut tmp)?;
         set_in_place(file, data_size, offset, buf)?;
@@ -2442,6 +2503,7 @@ impl BStack {
                 format!("cas: range [{offset}, {end}) exceeds payload size ({data_size})"),
             ));
         }
+        fault_point!(self, "cas");
         let mut current = vec![0u8; old.len()];
         read_at(file, offset, &mut current)?;
         if current != old {
@@ -2528,6 +2590,7 @@ impl BStack {
         if n == 0 {
             return Ok(());
         }
+        fault_point!(self, "cross_exchange");
         journaled_exchange(file, data_size, a, b, n)
     }
 
@@ -2594,6 +2657,7 @@ impl BStack {
         if from == to {
             return Ok(());
         }
+        fault_point!(self, "copy");
         // Write-strategy hierarchy (see `algos/WIP.md`):
         //  * destination within one aligned block → single-block atomic write
         //    (read the source into a bounded buffer — `n` is at most one block
@@ -2671,6 +2735,7 @@ impl BStack {
                 format!("process: range [{start}, {end}) overlaps locked region [0, {locked})"),
             ));
         }
+        fault_point!(self, "process");
         let mut buf = vec![0u8; n as usize];
         if n > 0 {
             read_at(file, start, &mut buf)?;
@@ -2773,6 +2838,7 @@ impl BStack {
         let (file, clen) = &mut *guard;
         let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
         let locked = self.locked.load(Ordering::Acquire);
+        fault_point!(self, "process_gen");
         loop {
             match f() {
                 Some(BStackGenOp::Read { offset, buf }) => {
@@ -3101,6 +3167,7 @@ impl BStack {
                 ));
             }
         }
+        fault_point!(self, "set_batched");
         // A lone write cannot overlap anything and is already atomic on its own,
         // so skip the overlap scan and the multi-write journal.
         if blocks.len() == 1 {
@@ -3192,6 +3259,7 @@ impl BStack {
         let file = &mut guard.0;
         let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
         let locked = self.locked.load(Ordering::Acquire);
+        fault_point!(self, "inplace_gen");
         // Sorted, pairwise-non-overlapping set of pending in-place edits, each
         // borrowing the caller's `Write` data for the lifetime of the call.
         let mut overlay: Vec<(u64, &'a [u8])> = Vec::new();
@@ -3333,6 +3401,7 @@ impl BStack {
                 ),
             ));
         }
+        fault_point!(self, "eq_crds");
         let mut a_current = vec![0u8; a_expected.len()];
         if !a_expected.is_empty() {
             read_at(file, a_offset, &mut a_current)?;
@@ -3409,6 +3478,7 @@ impl BStack {
                 ),
             ));
         }
+        fault_point!(self, "ne_crds");
         let mut a_current = vec![0u8; a_expected.len()];
         if !a_expected.is_empty() {
             read_at(file, a_offset, &mut a_current)?;
@@ -3508,6 +3578,7 @@ impl BStack {
                 ),
             ));
         }
+        fault_point!(self, "masked_eq_crds");
         let mut a_current = vec![0u8; a_expected.len()];
         if !a_expected.is_empty() {
             read_at(file, a_offset, &mut a_current)?;
@@ -3610,6 +3681,7 @@ impl BStack {
                 ),
             ));
         }
+        fault_point!(self, "masked_ne_crds");
         let mut a_current = vec![0u8; a_expected.len()];
         if !a_expected.is_empty() {
             read_at(file, a_offset, &mut a_current)?;
@@ -3645,8 +3717,11 @@ impl BStack {
     ///
     /// # Errors
     ///
-    /// Never actually fails; returns [`io::Result`] for source compatibility.
+    /// Never actually fails outside of an armed fault policy under the
+    /// `fault-injection` feature; returns [`io::Result`] for source
+    /// compatibility.
     pub fn len(&self) -> io::Result<u64> {
+        fault_point!(self, "len");
         Ok(self.lock.read().unwrap().1)
     }
 
@@ -3654,8 +3729,11 @@ impl BStack {
     ///
     /// # Errors
     ///
-    /// Never actually fails; returns [`io::Result`] for source compatibility.
+    /// Never actually fails outside of an armed fault policy under the
+    /// `fault-injection` feature; returns [`io::Result`] for source
+    /// compatibility.
     pub fn is_empty(&self) -> io::Result<bool> {
+        fault_point!(self, "is_empty");
         Ok(self.lock.read().unwrap().1 == 0)
     }
 
@@ -3718,6 +3796,7 @@ impl BStack {
                 format!("lock_up_to: n ({n}) exceeds payload size ({data_size})"),
             ));
         }
+        fault_point!(self, "lock_up_to");
         // Populate or extend the in-memory cache before publishing the new
         // boundary.  `locked` is only advanced after the cache is consistent,
         // so readers always see a coherent view.
@@ -3853,6 +3932,44 @@ impl BStack {
         let stack = Self::open_cached(path)?;
         stack.lock_up_to(n)?;
         Ok(stack)
+    }
+}
+
+/// Deterministic I/O-fault injection controls.
+///
+/// These methods exist only in builds with `debug_assertions` on and the
+/// `fault-injection` feature enabled (see the [`fault`] module); a normal release
+/// build exposes none of them and carries no fault-injection machinery.
+#[cfg(all(debug_assertions, feature = "fault-injection"))]
+impl BStack {
+    /// Install a [`FaultPolicy`] on this stack at construction time, consuming and
+    /// returning `self` so it can be chained onto a constructor:
+    ///
+    /// ```ignore
+    /// let stack = BStack::open(path)?.with_fault_policy(Arc::new(my_policy));
+    /// ```
+    ///
+    /// Equivalent to [`open`](Self::open) followed by
+    /// [`set_fault_policy`](Self::set_fault_policy)`(Some(policy))`; the operation
+    /// sequence counter starts at 0.
+    pub fn with_fault_policy(self, policy: std::sync::Arc<dyn fault::FaultPolicy>) -> Self {
+        self.fault.set(Some(policy));
+        self
+    }
+
+    /// Arm, re-arm, or (with `None`) disarm the fault policy on an already-open
+    /// stack. Setting a policy resets the operation sequence counter to 0, so a
+    /// seeded schedule replays identically each time it is armed. Because this
+    /// takes `&self`, a test holding a shared reference can arm a fault, drive the
+    /// operation under test, then disarm before reading results back.
+    pub fn set_fault_policy(&self, policy: Option<std::sync::Arc<dyn fault::FaultPolicy>>) {
+        self.fault.set(policy);
+    }
+
+    /// Return the currently armed [`FaultPolicy`], or `None` if the stack is
+    /// unarmed.
+    pub fn fault_policy(&self) -> Option<std::sync::Arc<dyn fault::FaultPolicy>> {
+        self.fault.get()
     }
 }
 
