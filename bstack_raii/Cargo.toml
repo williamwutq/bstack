@@ -16,14 +16,11 @@ publish = false
 members = ["derive"]
 
 [dependencies]
-# bstack 0.4.0 is feature-complete but not yet published to crates.io, so we
-# depend on the GitHub source for now. Pin a `branch`/`rev`/`tag` here once the
-# RAII primitives land on a stable ref (or swap to a `path = ".."` dep for local
-# iteration). RAII requires `alloc` + `set`; `atomic` is needed for on-disk
-# refcount CAS (control blocks, strong/weak counters).
-bstack = { git = "https://github.com/williamwutq/bstack", features = ["alloc", "set", "atomic"] }
+# RAII requires `alloc` + `set`; `atomic` is needed for the on-disk refcount RMW
+# (control blocks, strong/weak counters).
+bstack = { version = "=0.4", features = ["alloc", "set", "atomic"] }
 bstack_raii_derive = { path = "derive", version = "0.0.0" }
 
 # Gate for POD (plain-old-data) inline fields: any `bytemuck::Pod` type is safe
 # to store inline in an on-disk block and receives the blanket no-op BStackDrop.
-bytemuck = { version = "1", features = ["derive"] }
+bytemuck = { version = "=1.25", features = ["derive"] }
