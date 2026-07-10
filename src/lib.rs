@@ -431,6 +431,14 @@
 //!   adds atomic bulk operations.  Both methods are required with no default; on error
 //!   the backing store is left unchanged unless a crash occur.
 //!
+//! * [`BStackUninitAllocator`] — opt-in extension trait for [`BStackAllocator`]
+//!   whose `alloc_uninit` / `realloc_uninit` skip zero-initialising newly
+//!   allocated or grown bytes.  The returned bytes are **unspecified** (leftover
+//!   from a prior allocation) but always valid to read, saving the zero-fill
+//!   write for callers that overwrite the region before reading it.  Existing
+//!   bytes are preserved exactly as `realloc`.  Implementing it is optional and
+//!   signals that the allocator actually has a cheaper uninitialised path.
+//!
 //! * [`BStackAllocError`]`<'a, A>` — error returned by `realloc` / `dealloc`.
 //!   Carries the failing `source` plus `handle: Option<A::Allocated<'a>>`, the
 //!   surviving allocation handed back to the caller so a failed resize/free is
@@ -574,7 +582,8 @@ mod alloc;
 #[cfg(feature = "alloc")]
 pub use alloc::{
     BStackAllocError, BStackAllocator, BStackBulkAllocError, BStackBulkAllocator, BStackOwnedSlice,
-    BStackOwnedSliceAllocator, BStackRange, BStackSlice, BStackSliceReader, LinearBStackAllocator,
+    BStackOwnedSliceAllocator, BStackRange, BStackSlice, BStackSliceReader, BStackUninitAllocator,
+    LinearBStackAllocator,
 };
 #[cfg(all(feature = "alloc", feature = "set"))]
 pub use alloc::{
