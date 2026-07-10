@@ -13,7 +13,7 @@
 //! Faults are injected at the **`BStack` public-API level**, not per underlying
 //! syscall: each fault-instrumented method consults the installed [`FaultPolicy`]
 //! once, *after* validating its arguments, and — if the policy elects to fail —
-//! returns the policy-supplied [`io::Error`] instead of performing its I/O.
+//! returns the policy-supplied [`io::Error`](std::io::Error) instead of performing its I/O.
 //! Argument-validation errors (overflow, out-of-range offsets, locked-region
 //! violations) are therefore always reported in preference to an injected fault:
 //! a call that would fail validation never reaches its fault point.
@@ -37,7 +37,7 @@
 //! # Determinism under `atomic`
 //!
 //! When compound/concurrent operations run against a single stack, they share one
-//! fault schedule: the per-stack operation counter is a single [`AtomicU64`] and
+//! fault schedule: the per-stack operation counter is a single [`AtomicU64`](std::sync::atomic::AtomicU64) and
 //! the policy is consulted under a shared lock, so a seeded policy is reproducible
 //! from its seed for a fixed interleaving. Reproducibility *across* arbitrary
 //! thread interleavings is inherently limited.
@@ -86,7 +86,7 @@ mod active {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
 
-    /// A user-supplied decision procedure that chooses when a [`BStack`] I/O
+    /// A user-supplied decision procedure that chooses when a [`BStack`](crate::BStack) I/O
     /// operation should fail, and with what [`io::Error`].
     ///
     /// A policy is installed on a stack with
@@ -133,7 +133,7 @@ mod active {
     }
 
     /// Per-stack fault-injection state: the currently armed policy (if any) and a
-    /// shared operation counter. One instance lives inside each [`BStack`] under
+    /// shared operation counter. One instance lives inside each [`BStack`](crate::BStack) under
     /// the fault-injection configuration.
     #[derive(Default)]
     pub struct FaultState {

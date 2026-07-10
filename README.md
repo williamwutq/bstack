@@ -722,6 +722,14 @@ the first read so the whole sequence runs as one indivisible step.
 
 ---
 
+## Fault injection (`fault-injection` feature, dev/test only)
+
+The `fault-injection` feature lets tests make `BStack` I/O fail on demand, to exercise error-handling and rollback paths that a successful `push`/`pop`/`realloc`/`dealloc` sequence can never reach. Implement `FaultPolicy` — `fn next_fault(&self, op: &'static str, seq: u64) -> Option<io::Error>` — and arm it with `BStack::with_fault_policy(policy)` (at construction) or `set_fault_policy(Some(policy))` / `fault_policy()` (arm, re-arm, or disarm mid-test). Every I/O method then consults the policy once, **after** validating its arguments, so validation errors always take precedence over an injected fault; under `atomic`, concurrent operations share one per-stack sequence counter for reproducible, seedable schedules.
+
+The whole mechanism is gated on `all(debug_assertions, feature = "fault-injection")`: it is off by default, and a `--release` build carries none of it — no struct field, no per-call branch — so release performance is unaffected.
+
+---
+
 ## Allocators (`alloc` feature)
 
 The `alloc` feature adds typed region management over a `BStack` payload.

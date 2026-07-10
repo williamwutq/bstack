@@ -563,6 +563,23 @@
 //! # }
 //! ```
 
+// This crate-doc section is emitted only when the dev/test-only fault-injection
+// machinery is actually compiled in (see the [`fault`] module).
+#![cfg_attr(
+    all(debug_assertions, feature = "fault-injection"),
+    doc = "# Fault injection (`fault-injection` feature)",
+    doc = "",
+    doc = "This build has the dev/test-only `fault-injection` feature active, so",
+    doc = "`BStack` I/O can be made to fail on demand. Implement [`FaultPolicy`] and arm",
+    doc = "it with [`BStack::with_fault_policy`] (at construction) or",
+    doc = "[`BStack::set_fault_policy`] (arm, re-arm, or disarm mid-test); every I/O",
+    doc = "method then consults the policy once, **after** validating its arguments. This",
+    doc = "exercises error-handling and rollback paths that a successful sequence of calls",
+    doc = "can never reach. The whole mechanism is gated on `all(debug_assertions, feature",
+    doc = "= \"fault-injection\")`, so a `--release` build carries none of it and its",
+    doc = "performance is unaffected. See the [`fault`] module for details."
+)]
+
 mod io_core;
 use io_core::*;
 
