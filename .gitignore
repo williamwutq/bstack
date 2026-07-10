@@ -1,5 +1,6 @@
 # Rust
 /target
+**/target
 
 # C
 /obj
@@ -17,6 +18,7 @@ test_*
 
 # Build
 /build
+**/build
 
 # Generated example data files
 *.bstack
