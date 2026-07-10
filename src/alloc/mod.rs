@@ -32,6 +32,13 @@
 //!   [`alloc_bulk`](BStackBulkAllocator::alloc_bulk) /
 //!   [`dealloc_bulk`](BStackBulkAllocator::dealloc_bulk).
 //!
+//! * [`BStackUninitAllocator`] — opt-in extension trait for allocators with a
+//!   cheaper uninitialised path.  [`alloc_uninit`](BStackUninitAllocator::alloc_uninit) /
+//!   [`realloc_uninit`](BStackUninitAllocator::realloc_uninit) skip the
+//!   zero-fill of newly allocated or grown bytes, returning **unspecified**
+//!   (but always valid-to-read) contents for callers that overwrite the region
+//!   immediately.
+//!
 //! * [`BStackOwnedSliceAllocator`] — convenience supertrait:
 //!   `BStackAllocator<Error = io::Error, Allocated<'a> = BStackOwnedSlice<'a, Self>>`.
 //!
@@ -489,6 +496,71 @@ pub trait BStackBulkAllocator: BStackAllocator {
         &'a self,
         handles: impl IntoIterator<Item = Self::Allocated<'a>>,
     ) -> Result<(), BStackBulkAllocError<'a, Self>>;
+}
+
+/// Extension trait for allocators that can skip zero-initialisation of newly
+/// allocated or grown regions.
+///
+/// [`BStackAllocator::alloc`] guarantees a zero-initialised region and
+/// [`realloc`](BStackAllocator::realloc) zero-fills any newly added bytes when
+/// growing.  That guarantee costs a write: a region pulled from a free list may
+/// hold leftover bytes from a previous allocation, which the allocator must
+/// scrub before returning.  Callers that immediately overwrite the whole region
+/// (for example, `write`-ing a serialized record right after `alloc`) have no
+/// use for that zero-fill.  This trait lets them opt out of it.
+///
+/// The bytes in a region returned by [`alloc_uninit`](Self::alloc_uninit), or
+/// in the newly added portion of a region returned by
+/// [`realloc_uninit`](Self::realloc_uninit), are **unspecified**: they may be
+/// zero, or may be leftover bytes from a previous allocation that occupied the
+/// same on-disk space.  They are always valid to read — no undefined behavior
+/// results, unlike `MaybeUninit<u8>` in memory — but callers must not rely on
+/// their value until they have written to the region themselves.  This mirrors
+/// `Vec::with_capacity` followed by `set_len`, except no analog of `set_len` is
+/// needed since the bytes are always valid to read, just unspecified in value.
+///
+/// # Implementing this trait is optional
+///
+/// Implementing it signals that the allocator actually has a cheaper
+/// uninitialised path.  Allocators for which zero-fill is already free — an
+/// always-extend bump allocator whose growth goes through [`BStack::extend`]
+/// (the tail is already zero via `set_len` on a sparse file), or an allocator
+/// that scrubs blocks eagerly on free — gain nothing and may either implement
+/// the trait as a thin wrapper around `alloc`/`realloc` or not implement it at
+/// all.  The savings are concentrated in the free-list-reuse path, where a
+/// previously-occupied block is handed back without being scrubbed first.
+pub trait BStackUninitAllocator: BStackAllocator {
+    /// Allocate `len` bytes without zero-initialising them.
+    ///
+    /// Equivalent to [`alloc`](BStackAllocator::alloc) except that the returned
+    /// region's contents are unspecified rather than guaranteed zero.  The
+    /// region is still durably synced before returning.  `len = 0` is valid.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Self::Error` on failure.
+    fn alloc_uninit(&self, len: u64) -> Result<Self::Allocated<'_>, Self::Error>;
+
+    /// Resize the region described by `handle` to `new_len` bytes without
+    /// zero-initialising any newly added bytes.
+    ///
+    /// Equivalent to [`realloc`](BStackAllocator::realloc) except that, when
+    /// `new_len` is larger than the current length, the contents of the added
+    /// bytes are unspecified rather than guaranteed zero.  Shrinking is
+    /// unaffected, as no new bytes are introduced.  Existing bytes within
+    /// `[0, min(old_len, new_len))` are always preserved, exactly as `realloc`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`BStackAllocError`] on failure, carrying the surviving
+    /// allocation under the same contract as
+    /// [`realloc`](BStackAllocator::realloc), including when the implementation
+    /// does not support reallocation.
+    fn realloc_uninit<'a>(
+        &'a self,
+        handle: Self::Allocated<'a>,
+        new_len: u64,
+    ) -> Result<Self::Allocated<'a>, BStackAllocError<'a, Self>>;
 }
 
 /// Convenience supertrait for the common case of a [`BStackAllocator`] whose
