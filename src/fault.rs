@@ -150,7 +150,8 @@ mod active {
         /// Install (or, with `None`, clear) the policy and reset the sequence
         /// counter to 0 so the next arming starts a fresh, reproducible schedule.
         pub(crate) fn set(&self, policy: Option<Arc<dyn FaultPolicy>>) {
-            *self.policy.lock().unwrap() = policy;
+            let mut guard = self.policy.lock().unwrap();
+            *guard = policy;
             self.seq.store(0, Ordering::SeqCst);
         }
 
@@ -259,6 +260,9 @@ mod tests {
         stack.set_fault_policy(None);
         stack.push(b"more").unwrap();
         assert_eq!(stack.len().unwrap(), 8);
+        // Drop `stack` before `_g` removes the backing file: on Windows,
+        // deleting a file that's still open typically fails.
+        drop(stack);
     }
 
     #[test]
@@ -299,6 +303,9 @@ mod tests {
                 .iter()
                 .any(|(op, _)| *op == "pop")
         );
+        // Drop `stack` before `_g` removes the backing file: on Windows,
+        // deleting a file that's still open typically fails.
+        drop(stack);
     }
 
     #[test]
@@ -318,6 +325,10 @@ mod tests {
         let _ = stack.len();
         let seen = policy.seen.lock().unwrap();
         assert_eq!(&seen[..], &[("len", 0), ("push", 1), ("len", 2)]);
+        drop(seen);
+        // Drop `stack` before `_g` removes the backing file: on Windows,
+        // deleting a file that's still open typically fails.
+        drop(stack);
     }
 
     #[test]
@@ -338,5 +349,8 @@ mod tests {
         stack.set_fault_policy(Some(policy2.clone()));
         let _ = stack.len();
         assert_eq!(&policy2.seen.lock().unwrap()[..], &[("len", 0)]);
+        // Drop `stack` before `_g` removes the backing file: on Windows,
+        // deleting a file that's still open typically fails.
+        drop(stack);
     }
 }
