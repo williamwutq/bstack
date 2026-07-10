@@ -22,6 +22,11 @@ alloc = []
 atomic = []
 # Enables BStackGuardedSlice and related hook-based slice abstractions.
 guarded = ["alloc"]
+# Enables deterministic I/O-fault injection at the BStack API level, for testing
+# allocator and downstream error-handling paths. Only takes effect in builds with
+# `debug_assertions` on (dev/test); release builds are completely unaffected even
+# with the feature enabled. See the `fault` module. Not enabled by default.
+fault-injection = []
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

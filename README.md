@@ -36,6 +36,8 @@ slab, etc.) over the payload.
 
 **Minimal dependencies (`libc` on Unix, `windows-sys` on Windows).
 
+> Upgrading from 0.2.x? See [docs/MIGRATION_0.4.0.md](docs/MIGRATION_0.4.0.md) for a step-by-step migration guide.
+
 > **Warning:** bstack files must only be opened through this crate or a
 > compatible implementation that understands the file format, header protocol,
 > and locking semantics.  Reading or writing the file with raw tools (`dd`,
@@ -510,7 +512,7 @@ bstack = { version = "0.4", features = ["set"] }
 
 ### `alloc`
 
-Enables the region-management layer on top of `BStack`: `BStackAllocator`, `BStackBulkAllocator`, `BStackOwnedSliceAllocator`, `BStackAllocError`, `BStackBulkAllocError`, `BStackRange`, `BStackOwnedSlice`, `BStackSlice`, `BStackSliceReader`, `LinearBStackAllocator`, and `GhostTreeBstackAllocator`.  Combined with `set`, also enables `BStackSliceWriter`, `FirstFitBStackAllocator`, `SlabBStackAllocator`, `CheckedSlabBStackAllocator`, `BStackByteVec`, and `BStackByteVecIter`.
+Enables the region-management layer on top of `BStack`: `BStackAllocator`, `BStackBulkAllocator`, `BStackUninitAllocator`, `BStackOwnedSliceAllocator`, `BStackAllocError`, `BStackBulkAllocError`, `BStackRange`, `BStackOwnedSlice`, `BStackSlice`, `BStackSliceReader`, `LinearBStackAllocator`, and `GhostTreeBstackAllocator`.  Combined with `set`, also enables `BStackSliceWriter`, `FirstFitBStackAllocator`, `SlabBStackAllocator`, `CheckedSlabBStackAllocator`, `BStackByteVec`, and `BStackByteVecIter`.
 
 ```toml
 [dependencies]
@@ -722,6 +724,14 @@ the first read so the whole sequence runs as one indivisible step.
 
 ---
 
+## Fault injection (`fault-injection` feature, dev/test only)
+
+The `fault-injection` feature lets tests make `BStack` I/O fail on demand, to exercise error-handling and rollback paths that a successful `push`/`pop`/`realloc`/`dealloc` sequence can never reach. Implement `FaultPolicy` — `fn next_fault(&self, op: &'static str, seq: u64) -> Option<io::Error>` — and arm it with `BStack::with_fault_policy(policy)` (at construction) or `set_fault_policy(Some(policy))` / `fault_policy()` (arm, re-arm, or disarm mid-test). Every I/O method then consults the policy once, **after** validating its arguments, so validation errors always take precedence over an injected fault; under `atomic`, concurrent operations share one per-stack sequence counter for reproducible, seedable schedules.
+
+The whole mechanism is gated on `all(debug_assertions, feature = "fault-injection")`: it is off by default, and a `--release` build carries none of it — no struct field, no per-call branch — so release performance is unaffected.
+
+---
+
 ## Allocators (`alloc` feature)
 
 The `alloc` feature adds typed region management over a `BStack` payload.
@@ -840,6 +850,41 @@ pub trait BStackBulkAllocator: BStackAllocator {
 `BStackBulkAllocError<'a, A>` is the bulk analogue of `BStackAllocError`: it
 carries `source: A::Error` plus `handles: Vec<A::Allocated<'a>>`, the handles
 still owned by the caller after a failed bulk free.
+
+### `BStackUninitAllocator` trait
+
+An opt-in extension trait for `BStackAllocator` that adds uninitialised
+variants of `alloc` and `realloc`. `alloc` guarantees a zero-initialised region
+and `realloc` zero-fills newly added bytes when growing; that guarantee costs a
+write, since a region pulled from a free list may hold leftover bytes that the
+allocator must scrub first. Callers that immediately overwrite the whole region
+(for example, `write`-ing a serialized record right after `alloc`) have no use
+for the zero-fill. These methods let them skip it.
+
+```rust
+pub trait BStackUninitAllocator: BStackAllocator {
+    fn alloc_uninit(&self, len: u64) -> Result<Self::Allocated<'_>, Self::Error>;
+
+    fn realloc_uninit<'a>(&'a self, handle: Self::Allocated<'a>, new_len: u64)
+        -> Result<Self::Allocated<'a>, BStackAllocError<'a, Self>>;
+}
+```
+
+The bytes in a region returned by `alloc_uninit`, or in the newly added portion
+of one returned by `realloc_uninit`, are **unspecified**: they may be zero, or
+may be leftover bytes from a previous allocation that occupied the same on-disk
+space. They are always valid to read — no undefined behavior, unlike
+`MaybeUninit<u8>` in memory — but callers must not rely on their value until
+they have written to the region themselves. Existing bytes are preserved exactly
+as `realloc`; only *newly added* bytes are left unspecified.
+
+Implementing the trait is optional and signals that the allocator actually has a
+cheaper uninitialised path. The savings are concentrated in the free-list-reuse
+path, where a previously-occupied block is handed back without being scrubbed.
+Allocators for which zero-fill is already free — an always-extend bump allocator
+(the freshly extended tail is already zero via `set_len` on a sparse file), or
+one that scrubs blocks eagerly on free — gain nothing and may either implement
+the trait as a thin wrapper around `alloc`/`realloc` or not implement it at all.
 
 ### `BStackOwnedSlice<'a, A>`
 
