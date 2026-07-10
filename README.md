@@ -36,6 +36,8 @@ slab, etc.) over the payload.
 
 **Minimal dependencies (`libc` on Unix, `windows-sys` on Windows).
 
+> Upgrading from 0.2.x? See [docs/MIGRATION_0.4.0.md](docs/MIGRATION_0.4.0.md) for a step-by-step migration guide.
+
 > **Warning:** bstack files must only be opened through this crate or a
 > compatible implementation that understands the file format, header protocol,
 > and locking semantics.  Reading or writing the file with raw tools (`dd`,
