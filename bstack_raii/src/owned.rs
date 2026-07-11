@@ -6,9 +6,11 @@
 //! which defuses this `Drop` so no parallel destruction path exists.
 
 use core::mem::ManuallyDrop;
+use std::io;
 
 use bstack::BStackOwnedSliceAllocator;
 
+use crate::block::{BStackMove, BStackMoveExpr};
 use crate::teardown::BStackDrop;
 
 /// An owned, allocator-bound handle to a block whose `Drop` recursively frees it
@@ -58,5 +60,13 @@ impl<'a, T: BStackDrop, A: BStackOwnedSliceAllocator> Drop for BStackOwned<'a, T
     fn drop(&mut self) {
         let inner = unsafe { ManuallyDrop::take(&mut self.inner) };
         let _ = inner.bstack_drop(self.allocator);
+    }
+}
+
+impl<'a, T: BStackMove, A: BStackOwnedSliceAllocator> BStackMoveExpr for BStackOwned<'a, T, A> {
+    // A unique owner: the destructure is always valid.
+    type Output = io::Result<T::Fields<'a, A>>;
+    fn bstack_move(self) -> Self::Output {
+        T::bstack_move(self)
     }
 }

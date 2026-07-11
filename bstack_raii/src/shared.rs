@@ -5,13 +5,14 @@ use std::io;
 
 use bstack::{BStackOwnedSliceAllocator, BStackRange};
 
-use crate::block::{BStackBlock, BStackWeakable};
+use crate::block::{BStackBlock, BStackMove, BStackMoveExpr, BStackWeakable};
 use crate::clone::TryClone;
 use crate::handle::{StrongRef, WeakRef, strong_release_ctrl};
 use crate::layout;
+use crate::owned::BStackOwned;
 use crate::refcount;
 use crate::reference::BStackRef;
-use crate::teardown::BStackDrop;
+use crate::teardown::{BStackDrop, dealloc_range};
 
 /// A shared, refcounted, allocator-bound handle.
 ///
@@ -121,6 +122,52 @@ impl<'a, T: BStackBlock, A: BStackOwnedSliceAllocator> Drop for BStackRc<'a, T, 
             None => StrongRef(self.data).bstack_drop(self.allocator),
             Some(ctrl) => strong_release_ctrl::<T, A>(self.allocator, self.data.into_range(), ctrl),
         };
+    }
+}
+
+impl<'a, T: BStackMove, A: BStackOwnedSliceAllocator> BStackRc<'a, T, A> {
+    /// `Rc::try_unwrap` + destructure: if this handle is the **sole strong
+    /// owner**, move every field out (freeing only the data shell) and return
+    /// them; otherwise hand the handle back in `Err`.
+    ///
+    /// The check-and-take is an atomic CAS `strong: 1 -> 0`, so a concurrent
+    /// clone or `upgrade` makes it fail cleanly rather than tearing a shared
+    /// block apart. Works for both `(rc)` (inline count) and `(rc, weak)` (the
+    /// control block's phantom weak is released, freeing it if no weak handles
+    /// remain). This is what `bstack_move!` calls on a `BStackRc`.
+    pub fn try_move(self) -> io::Result<Result<T::Fields<'a, A>, Self>> {
+        let allocator = self.allocator;
+        let stack = allocator.stack();
+        let strong_off = self.strong_offset();
+
+        // Atomic try-unwrap: succeed only if the strong count is exactly 1.
+        if !refcount::cas(stack, strong_off, 1, 0)? {
+            return Ok(Err(self));
+        }
+
+        // Strong is now 0 — no concurrent upgrade can revive the data block, so
+        // it is safe to move the fields out and free the data shell.
+        let (data, ctrl) = self.into_raw();
+        let owned = unsafe {
+            BStackOwned::from_raw(<T as BStackBlock>::from_range(data.into_range()), allocator)
+        };
+        let fields = T::bstack_move(owned)?;
+
+        // `(rc, weak)`: release the phantom weak; free the control block at zero.
+        if let Some(ctrl) = ctrl {
+            let weak_off = ctrl.start() + layout::CTRL_WEAK_OFFSET;
+            if refcount::fetch_sub(stack, weak_off, 1)? == 1 {
+                unsafe { dealloc_range(allocator, ctrl)? };
+            }
+        }
+        Ok(Ok(fields))
+    }
+}
+
+impl<'a, T: BStackMove, A: BStackOwnedSliceAllocator> BStackMoveExpr for BStackRc<'a, T, A> {
+    type Output = io::Result<Result<T::Fields<'a, A>, Self>>;
+    fn bstack_move(self) -> Self::Output {
+        self.try_move()
     }
 }
 

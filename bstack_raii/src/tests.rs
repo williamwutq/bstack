@@ -794,3 +794,79 @@ fn macro_cast() {
     assert_eq!(owned.handle().val(stack).unwrap(), 9);
     drop(owned); // frees the leaf
 }
+
+// --------------------------------------------------------------------------
+// bstack_move! on a BStackRc — try_unwrap-style, solo strong owner only
+// --------------------------------------------------------------------------
+
+#[bstack_block(rc)]
+struct RcHolder {
+    #[bstack_owned]
+    leaf: MacroLeaf,
+    n: u32,
+}
+
+#[bstack_block(rc, weak)]
+struct RcwHolder {
+    #[bstack_owned]
+    leaf: MacroLeaf,
+    n: u32,
+}
+
+#[test]
+fn macro_bstack_move_rc() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let leaf = MacroLeaf::new(&alloc, 5).unwrap();
+    let leaf_off = leaf.handle().range().start();
+    let rc = RcHolder::new(&alloc, leaf, 7).unwrap(); // BStackRc<RcHolder>, strong = 1
+
+    // A second strong owner blocks the move.
+    let clone = rc.try_clone().unwrap(); // strong = 2
+    let rc = match bstack_move!(rc).unwrap() {
+        Ok(_) => panic!("must not move a shared block"),
+        Err(rc) => rc, // handed back, untouched
+    };
+    drop(clone); // strong = 1 — now the sole owner
+
+    // Sole owner: the move succeeds and transfers the owned child out.
+    let (moved_leaf, n) = bstack_move!(rc).unwrap().ok().expect("sole owner");
+    assert_eq!(n, 7);
+    assert_eq!(moved_leaf.handle().val(stack).unwrap(), 5);
+
+    // Only the RcHolder shell was freed; the child is still live. Dropping it
+    // reclaims the last block, so the lowest slot (the leaf's) comes back.
+    drop(moved_leaf);
+    let reused = alloc_block(
+        &alloc,
+        MacroLeaf::eightcc(),
+        size_of::<<MacroLeaf as BStackBlock>::OnDisk>() as u64,
+    )
+    .unwrap();
+    assert_eq!(reused.start(), leaf_off);
+    unsafe { dealloc_range(&alloc, reused).unwrap() };
+}
+
+#[test]
+fn macro_bstack_move_rc_weak() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let leaf = MacroLeaf::new(&alloc, 9).unwrap();
+    let rc = RcwHolder::new(&alloc, leaf, 3).unwrap();
+    let weak = rc.downgrade().unwrap(); // a weak observer does NOT block the move
+
+    // Sole *strong* owner: move succeeds even with a weak outstanding.
+    let (moved_leaf, n) = bstack_move!(rc).unwrap().ok().expect("sole strong owner");
+    assert_eq!(n, 3);
+    assert_eq!(moved_leaf.handle().val(stack).unwrap(), 9);
+
+    // The data block is gone, so the weak can no longer upgrade.
+    assert!(weak.upgrade().unwrap().is_none());
+
+    drop(moved_leaf); // frees the moved-out child
+    drop(weak); // frees the now-unreferenced control block
+}

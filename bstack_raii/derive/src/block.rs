@@ -368,9 +368,9 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         &ctor_inits,
     );
 
-    // `bstack_move!` is defined for plain blocks (not rc / rc,weak themselves);
-    // their fields may be any kind, including strong/weak.
-    let move_impl = if mode == Mode::Plain {
+    // The field destructure is generated for every mode: plain blocks use it via
+    // `BStackOwned` (infallible), rc / rc,weak via `BStackRc::try_move`.
+    let move_impl = {
         quote! {
             // Implemented on the block type (local downstream) so the orphan rule
             // is satisfied; `bstack_move!` selects it from the argument's type.
@@ -395,8 +395,6 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                 }
             }
         }
-    } else {
-        quote!()
     };
 
     Ok(quote! {

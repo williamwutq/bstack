@@ -63,7 +63,9 @@ mod teardown;
 #[cfg(test)]
 mod tests;
 
-pub use block::{BStackBlock, BStackCast, BStackMove, BStackShared, BStackWeakable};
+pub use block::{
+    BStackBlock, BStackCast, BStackMove, BStackMoveExpr, BStackShared, BStackWeakable,
+};
 pub use cast::{BStackCastAs, BStackCastInto};
 pub use clone::TryClone;
 pub use construct::{alloc_block, alloc_control, init_rc, set_weak_field, upgrade_weak_field};

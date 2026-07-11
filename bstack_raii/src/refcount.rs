@@ -30,6 +30,13 @@ fn underflow_err() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, "refcount underflow")
 }
 
+/// Compare-and-swap the counter at `offset`: set it to `new` iff it currently
+/// equals `expected`. Returns whether the swap happened. The atomic "try-unwrap"
+/// primitive behind [`crate::BStackRc::try_move`].
+pub fn cas(stack: &BStack, offset: u64, expected: u64, new: u64) -> io::Result<bool> {
+    stack.cas(offset, expected.to_le_bytes(), new.to_le_bytes())
+}
+
 /// Load the current value of the counter at `offset` (little-endian). Read-only,
 /// so it takes only `get_into` (no lock upgrade, no write-back).
 pub fn load(stack: &BStack, offset: u64) -> io::Result<u64> {

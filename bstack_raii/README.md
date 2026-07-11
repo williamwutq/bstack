@@ -216,8 +216,11 @@ owner first and then the holder is sound — no use-after-free of freed data.
 
 ## Moving fields out: `bstack_move!`
 
-`bstack_move!` destructures a `BStackOwned<X>` (plain blocks only), transferring
-ownership of every field out as a tuple and freeing only the parent shell:
+`bstack_move!` destructures a handle into its fields, transferring ownership of
+each out as a tuple and freeing only the parent *shell* — the children stay live
+on disk, now owned independently.
+
+On a **`BStackOwned<X>`** it is infallible (a unique owner):
 
 ```rust
 #[bstack_block]
@@ -232,7 +235,18 @@ let (left, shared, right) = bstack_move!(pair)?;
 //   ^BStackOwned<Leaf>  ^BStackRc<Thing>  ^u32
 ```
 
-The children stay live on disk; you now own them independently.
+On a **`BStackRc<X>`** (an `(rc)` or `(rc, weak)` block) it is a `try_unwrap`: it
+succeeds only when this handle is the **sole strong owner** (an atomic
+`strong: 1 → 0`), otherwise it hands the handle back. A weak observer does *not*
+block the move — afterward its `upgrade()` just returns `None`.
+
+```rust
+let rc: BStackRc<Pair> = /* … */;
+match bstack_move!(rc)? {
+    Ok((left, shared, right)) => { /* we were the only owner */ }
+    Err(rc)                    => { /* someone else still holds it */ }
+}
+```
 
 ## Casting: `bstack_cast!`
 

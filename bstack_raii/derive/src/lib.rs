@@ -76,7 +76,7 @@ pub fn bstack_move(input: TokenStream) -> TokenStream {
     // `BStackMove` impl on `BStackOwned<X, A>`; here we just invoke it, letting
     // type inference select the block's impl from the argument's type.
     let expr = syn::parse_macro_input!(input as syn::Expr);
-    quote::quote!(::bstack_raii::BStackMove::bstack_move(#expr)).into()
+    quote::quote!(::bstack_raii::BStackMoveExpr::bstack_move(#expr)).into()
 }
 
 /// `bstack_cast!(expr as Target)` — type-checked handle conversion. The target
