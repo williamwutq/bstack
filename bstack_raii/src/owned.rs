@@ -1,11 +1,19 @@
-//! [`BStackOwned`]: the with-allocator unique handle.
+//! [`AutoDrop`]: the generic RAII guard bridging [`BStackDrop`] to Rust `Drop`.
 //!
-//! A newtype over `(ManuallyDrop<T>, &'a A)`. Rust's `Drop` takes the inner `T`
-//! out and calls [`BStackDrop::bstack_drop`]; errors are swallowed, matching the
-//! contract of `Drop`. `bstack_move!` consumes it via [`BStackOwned::into_raw_parts`],
-//! which defuses this `Drop` so no parallel destruction path exists.
+//! On-disk teardown ([`BStackDrop::bstack_drop`]) is fallible and needs an
+//! allocator, so it can't live directly in a `Drop` impl. `AutoDrop<T>` pairs a
+//! `BStackDrop` handle with its allocator and runs the teardown on scope exit
+//! (swallowing the error, matching the contract of `Drop`). It is the *one* place
+//! that calls `bstack_drop` from a `Drop` impl — every allocator-bound handle
+//! that wants automatic cleanup is either an `AutoDrop` (as [`BStackOwned`] is)
+//! or embeds one, rather than hand-writing its own `Drop`.
+//!
+//! Without wrapping in `AutoDrop`, a bare `BStackDrop` handle frees nothing on
+//! its own: its `bstack_drop` is invoked explicitly, or runs as a child of some
+//! parent block's recursive teardown.
 
 use core::mem::ManuallyDrop;
+use core::ops::Deref;
 use std::io;
 
 use bstack::BStackOwnedSliceAllocator;
@@ -13,15 +21,25 @@ use bstack::BStackOwnedSliceAllocator;
 use crate::block::{BStackMove, BStackMoveExpr};
 use crate::teardown::BStackDrop;
 
-/// An owned, allocator-bound handle to a block whose `Drop` recursively frees it
-/// on disk via [`BStackDrop`].
-pub struct BStackOwned<'a, T: BStackDrop, A: BStackOwnedSliceAllocator> {
+/// A guard that runs [`BStackDrop::bstack_drop`] on its inner handle when it goes
+/// out of scope, bridging fallible on-disk teardown to Rust's `Drop`.
+///
+/// It is a newtype over `(ManuallyDrop<T>, &'a A)`. `bstack_move!` and the raw
+/// accessors defuse it via [`into_raw_parts`](Self::into_raw_parts) so no
+/// parallel destruction path exists.
+pub struct AutoDrop<'a, T: BStackDrop, A: BStackOwnedSliceAllocator> {
     inner: ManuallyDrop<T>,
     allocator: &'a A,
 }
 
-impl<'a, T: BStackDrop, A: BStackOwnedSliceAllocator> BStackOwned<'a, T, A> {
-    /// Wrap an inner handle and allocator into an owned handle.
+/// An owned, allocator-bound handle to a block whose `Drop` recursively frees it
+/// on disk. Just an [`AutoDrop`] over the block type itself (whose
+/// [`BStackDrop`] is the recursive free), so a fresh block hands back an
+/// auto-freeing handle with no bespoke `Drop`.
+pub type BStackOwned<'a, T, A> = AutoDrop<'a, T, A>;
+
+impl<'a, T: BStackDrop, A: BStackOwnedSliceAllocator> AutoDrop<'a, T, A> {
+    /// Pair an inner handle with its allocator into an auto-dropping guard.
     ///
     /// # Safety
     /// The caller asserts `inner` describes a live allocation owned by
@@ -34,11 +52,11 @@ impl<'a, T: BStackDrop, A: BStackOwnedSliceAllocator> BStackOwned<'a, T, A> {
     }
 
     /// Split into the raw inner handle and allocator **without** running the
-    /// disk-level `Drop`. This is the destructuring entry point `bstack_move!`
-    /// uses; the caller takes over responsibility for the allocation.
+    /// disk-level `Drop`. The caller takes over responsibility for the
+    /// allocation (e.g. `bstack_move!`, which frees only the parent shell).
     pub fn into_raw_parts(self) -> (T, &'a A) {
-        // Wrapping `self` in ManuallyDrop prevents our own `Drop` from running,
-        // so `bstack_drop` is not called; then move the inner `T` out.
+        // Wrapping `self` in ManuallyDrop defuses our own `Drop`, so
+        // `bstack_drop` is not called; then move the inner `T` out.
         let mut me = ManuallyDrop::new(self);
         let inner = unsafe { ManuallyDrop::take(&mut me.inner) };
         (inner, me.allocator)
@@ -49,21 +67,29 @@ impl<'a, T: BStackDrop, A: BStackOwnedSliceAllocator> BStackOwned<'a, T, A> {
         self.allocator
     }
 
-    /// Borrow the underlying typed handle, e.g. to call generated field
-    /// accessors: `owned.handle().field(stack)`.
+    /// Borrow the underlying handle, e.g. to call generated field accessors:
+    /// `owned.handle().field(stack)`.
     pub fn handle(&self) -> &T {
         &self.inner
     }
 }
 
-impl<'a, T: BStackDrop, A: BStackOwnedSliceAllocator> Drop for BStackOwned<'a, T, A> {
+impl<'a, T: BStackDrop, A: BStackOwnedSliceAllocator> Deref for AutoDrop<'a, T, A> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.inner
+    }
+}
+
+impl<'a, T: BStackDrop, A: BStackOwnedSliceAllocator> Drop for AutoDrop<'a, T, A> {
     fn drop(&mut self) {
         let inner = unsafe { ManuallyDrop::take(&mut self.inner) };
+        // Errors are swallowed, matching the contract of Rust's `Drop`.
         let _ = inner.bstack_drop(self.allocator);
     }
 }
 
-impl<'a, T: BStackMove, A: BStackOwnedSliceAllocator> BStackMoveExpr for BStackOwned<'a, T, A> {
+impl<'a, T: BStackMove, A: BStackOwnedSliceAllocator> BStackMoveExpr for AutoDrop<'a, T, A> {
     // A unique owner: the destructure is always valid.
     type Output = io::Result<T::Fields<'a, A>>;
     fn bstack_move(self) -> Self::Output {

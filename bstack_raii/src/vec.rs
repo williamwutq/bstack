@@ -29,10 +29,39 @@ use std::io;
 use bstack::{BStackByteVec, BStackOwnedSlice, BStackOwnedSliceAllocator, BStackRange};
 use bytemuck::Pod;
 
-use crate::teardown::dealloc_range;
+use crate::teardown::{BStackDrop, dealloc_range};
 
 /// Byte size of a descriptor block: `{ data_off: u64, data_size: u64 }`.
 pub(crate) const DESCRIPTOR_SIZE: u64 = 16;
+
+/// The without-allocator drop core of a [`BStackVec`]: just its descriptor
+/// range. Its [`BStackDrop`] frees the data block and then the descriptor, so a
+/// vector field's teardown (and [`crate::AutoDrop`]) frees it uniformly with the
+/// other handle kinds — without carrying the element type or an allocator.
+#[derive(Clone, Copy)]
+pub struct VecRef(pub BStackRange);
+
+impl VecRef {
+    /// Build from a descriptor block offset (its length is the fixed descriptor
+    /// size).
+    pub fn from_descriptor(desc_off: u64) -> Self {
+        VecRef(BStackRange::new(desc_off, DESCRIPTOR_SIZE))
+    }
+}
+
+impl BStackDrop for VecRef {
+    fn bstack_drop<A: BStackOwnedSliceAllocator>(self, allocator: &A) -> io::Result<()> {
+        let mut buf = [0u8; DESCRIPTOR_SIZE as usize];
+        allocator.stack().get_into(self.0.start(), &mut buf)?;
+        let off = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+        let size = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+        unsafe {
+            dealloc_range(allocator, BStackRange::new(off, size))?;
+            dealloc_range(allocator, self.0)?;
+        }
+        Ok(())
+    }
+}
 
 /// A persistent, growable vector of POD elements, addressed by a stable
 /// descriptor block. Backs `#[bstack_owned] Vec<T>` / `String` fields.
@@ -89,14 +118,11 @@ impl<'a, T, A: BStackOwnedSliceAllocator> BStackVec<'a, T, A> {
         Ok(unsafe { BStackByteVec::from_raw_block(block) })
     }
 
-    /// Free the data block and the descriptor. Consumes the handle.
+    /// Free the data block and the descriptor. Consumes the handle. Delegates to
+    /// the without-allocator [`VecRef`] core, the same teardown a vector field
+    /// runs during its parent's recursive drop.
     pub fn bstack_drop(self) -> io::Result<()> {
-        let (off, size) = self.read_desc()?;
-        unsafe {
-            dealloc_range(self.allocator, BStackRange::new(off, size))?;
-            dealloc_range(self.allocator, self.desc)?;
-        }
-        Ok(())
+        VecRef(self.desc).bstack_drop(self.allocator)
     }
 }
 

@@ -14,9 +14,9 @@ use bstack::{
 
 use crate::layout::{self, BlockHeader};
 use crate::{
-    BStackBlock, BStackCast, BStackCastAs, BStackCastInto, BStackDrop, BStackOwned, BStackRc,
-    BStackRef, BStackShared, BStackWeakable, EightCC, TryClone, alloc_block, alloc_control,
-    bstack_block, bstack_cast, bstack_move, dealloc_range,
+    AutoDrop, BStackBlock, BStackCast, BStackCastAs, BStackCastInto, BStackDrop, BStackOwned,
+    BStackRc, BStackRef, BStackShared, BStackWeakable, EightCC, TryClone, alloc_block,
+    alloc_control, bstack_block, bstack_cast, bstack_move, dealloc_range,
 };
 
 // --------------------------------------------------------------------------
@@ -344,6 +344,52 @@ fn macro_recursive_drop() {
     let reused = alloc_block(&alloc, MacroLeaf::eightcc(), leaf_size).unwrap();
     assert_eq!(reused.start(), leaf.start());
     unsafe { dealloc_range(&alloc, reused).unwrap() };
+}
+
+// --------------------------------------------------------------------------
+// AutoDrop: the RAII guard vs. bare / manual teardown
+// --------------------------------------------------------------------------
+
+#[test]
+fn autodrop_guard_frees_on_scope_exit() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let size = size_of::<<MacroLeaf as BStackBlock>::OnDisk>() as u64;
+
+    let leaf = alloc_block(&alloc, MacroLeaf::eightcc(), size).unwrap();
+    let handle = <MacroLeaf as BStackBlock>::from_range(leaf);
+
+    // Wrapping a bare `BStackDrop` handle in `AutoDrop` makes it free on scope
+    // exit — the single, reusable auto-drop mechanism.
+    let guard = unsafe { AutoDrop::from_raw(handle, &alloc) };
+    drop(guard);
+
+    // The slot is reclaimed: the guard's `Drop` ran the teardown.
+    let reused = alloc_block(&alloc, MacroLeaf::eightcc(), size).unwrap();
+    assert_eq!(reused.start(), leaf.start());
+    unsafe { dealloc_range(&alloc, reused).unwrap() };
+}
+
+#[test]
+fn bare_handle_frees_only_when_asked() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let size = size_of::<<MacroLeaf as BStackBlock>::OnDisk>() as u64;
+
+    let leaf = alloc_block(&alloc, MacroLeaf::eightcc(), size).unwrap();
+    let handle = <MacroLeaf as BStackBlock>::from_range(leaf);
+
+    // A bare handle is `Copy` and owns nothing — holding one triggers no
+    // teardown, so the block stays live and the next alloc lands elsewhere.
+    let other = alloc_block(&alloc, MacroLeaf::eightcc(), size).unwrap();
+    assert_ne!(other.start(), leaf.start());
+
+    // Teardown is explicit: invoke `bstack_drop` directly (the "otherwise" path).
+    handle.bstack_drop(&alloc).unwrap();
+    let reused = alloc_block(&alloc, MacroLeaf::eightcc(), size).unwrap();
+    assert_eq!(reused.start(), leaf.start());
+    unsafe { dealloc_range(&alloc, reused).unwrap() };
+    unsafe { dealloc_range(&alloc, other).unwrap() };
 }
 
 // --------------------------------------------------------------------------

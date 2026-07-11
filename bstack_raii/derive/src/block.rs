@@ -501,13 +501,11 @@ fn vec_field(ty: &Type) -> Option<VecInfo> {
 
 /// Teardown for an owned `Vec<T>` / `String` field: free its `BStackVec` (data +
 /// descriptor blocks).
-fn vec_drop_stmt(fname: &Ident, elem: &TokenStream) -> TokenStream {
+fn vec_drop_stmt(fname: &Ident, _elem: &TokenStream) -> TokenStream {
     quote! {
         {
-            unsafe {
-                ::bstack_raii::BStackVec::<#elem, __A>::from_descriptor(__on_disk.#fname, allocator)
-                    .bstack_drop()?;
-            }
+            use ::bstack_raii::BStackDrop as _;
+            ::bstack_raii::VecRef::from_descriptor(__on_disk.#fname).bstack_drop(allocator)?;
         }
     }
 }

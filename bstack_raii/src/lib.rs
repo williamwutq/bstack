@@ -22,7 +22,7 @@
 //! | [`refcount`]   | Little-endian atomic CAS ops over on-disk `u64` counters.    |
 //! | [`clone`]      | [`TryClone`]: fallible clone for handles that touch disk.    |
 //! | [`handle`]     | Without-allocator inner handles: [`OwnedRef`], [`StrongRef`], [`StrongWeakRef`], [`WeakRef`]. |
-//! | [`owned`]      | [`BStackOwned`]: with-allocator unique handle.               |
+//! | [`owned`]      | [`AutoDrop`]: the RAII guard bridging `BStackDrop` to `Drop`, and its [`BStackOwned`] alias. |
 //! | [`shared`]     | [`BStackRc`] + [`BStackWeak`]: with-allocator shared handles.|
 //!
 //! ## Conventions fixed by the ABI
@@ -72,11 +72,11 @@ pub use clone::TryClone;
 pub use construct::{alloc_block, alloc_control, init_rc, set_weak_field, upgrade_weak_field};
 pub use handle::{OwnedRef, StrongRef, StrongWeakRef, WeakRef};
 pub use layout::{BlockHeader, EightCC};
-pub use owned::BStackOwned;
+pub use owned::{AutoDrop, BStackOwned};
 pub use reference::BStackRef;
 pub use shared::{BStackRc, BStackWeak};
 pub use teardown::{BStackDrop, dealloc_range};
-pub use vec::BStackVec;
+pub use vec::{BStackVec, VecRef};
 
 // Re-exports for use by `#[bstack_block]`-generated code (and callers), so that
 // generated code can name everything through `::bstack_raii::…` and downstream
