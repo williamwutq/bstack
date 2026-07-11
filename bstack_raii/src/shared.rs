@@ -7,10 +7,10 @@ use bstack::{BStackOwnedSliceAllocator, BStackRange};
 
 use crate::block::{BStackBlock, BStackWeakable};
 use crate::clone::TryClone;
-use crate::handle::{strong_release_ctrl, StrongRef, WeakRef};
+use crate::handle::{StrongRef, WeakRef, strong_release_ctrl};
 use crate::layout;
-use crate::reference::BStackRef;
 use crate::refcount;
+use crate::reference::BStackRef;
 use crate::teardown::BStackDrop;
 
 /// A shared, refcounted, allocator-bound handle.
@@ -51,7 +51,26 @@ impl<'a, T: BStackBlock, A: BStackOwnedSliceAllocator> BStackRc<'a, T, A> {
         ctrl: Option<BStackRange>,
         allocator: &'a A,
     ) -> Self {
-        Self { data, ctrl, allocator }
+        Self {
+            data,
+            ctrl,
+            allocator,
+        }
+    }
+
+    /// The underlying typed handle, e.g. to call generated field accessors:
+    /// `rc.handle().field(stack)`. Cheap: it just re-wraps the data ref and does
+    /// not touch the refcount.
+    pub fn handle(&self) -> T {
+        <T as BStackBlock>::from_range(self.data.into_range())
+    }
+
+    /// Consume the handle into its raw parts **without** decrementing the strong
+    /// count — the count is transferred to the caller (e.g. into a parent's
+    /// `#[bstack_strong]` field). `ctrl` is `Some` for `(rc, weak)` blocks.
+    pub fn into_raw(self) -> (BStackRef<T>, Option<BStackRange>) {
+        let me = core::mem::ManuallyDrop::new(self);
+        (me.data, me.ctrl)
     }
 
     /// Byte offset of the strong counter for this handle's block kind.
@@ -66,7 +85,11 @@ impl<'a, T: BStackBlock, A: BStackOwnedSliceAllocator> BStackRc<'a, T, A> {
 impl<'a, T: BStackBlock, A: BStackOwnedSliceAllocator> TryClone for BStackRc<'a, T, A> {
     fn try_clone(&self) -> io::Result<Self> {
         refcount::fetch_add(self.allocator.stack(), self.strong_offset(), 1)?;
-        Ok(Self { data: self.data, ctrl: self.ctrl, allocator: self.allocator })
+        Ok(Self {
+            data: self.data,
+            ctrl: self.ctrl,
+            allocator: self.allocator,
+        })
     }
 }
 
@@ -84,7 +107,10 @@ impl<'a, T: BStackWeakable, A: BStackOwnedSliceAllocator> BStackRc<'a, T, A> {
         let weak_off = ctrl_range.start() + layout::CTRL_WEAK_OFFSET;
         refcount::fetch_add(self.allocator.stack(), weak_off, 1)?;
         let ctrl = unsafe { BStackRef::<T::Control>::from_range(ctrl_range) };
-        Ok(BStackWeak { ctrl, allocator: self.allocator })
+        Ok(BStackWeak {
+            ctrl,
+            allocator: self.allocator,
+        })
     }
 }
 
@@ -93,9 +119,7 @@ impl<'a, T: BStackBlock, A: BStackOwnedSliceAllocator> Drop for BStackRc<'a, T, 
         // Errors are swallowed, matching the contract of Rust's `Drop`.
         let _ = match self.ctrl {
             None => StrongRef(self.data).bstack_drop(self.allocator),
-            Some(ctrl) => {
-                strong_release_ctrl::<T, A>(self.allocator, self.data.into_range(), ctrl)
-            }
+            Some(ctrl) => strong_release_ctrl::<T, A>(self.allocator, self.data.into_range(), ctrl),
         };
     }
 }
@@ -120,6 +144,13 @@ impl<'a, T: BStackWeakable, A: BStackOwnedSliceAllocator> BStackWeak<'a, T, A> {
         Self { ctrl, allocator }
     }
 
+    /// Consume the handle into its raw control ref **without** decrementing the
+    /// weak count — the count is transferred to the caller.
+    pub fn into_raw(self) -> BStackRef<T::Control> {
+        let me = core::mem::ManuallyDrop::new(self);
+        me.ctrl
+    }
+
     /// Attempt to promote to a strong handle. Succeeds iff `ctrl.strong` is
     /// currently non-zero (CAS-increment-if-nonzero), reading `ctrl.x` to recover
     /// the data ref. Returns `None` if the data block is already gone.
@@ -136,7 +167,11 @@ impl<'a, T: BStackWeakable, A: BStackOwnedSliceAllocator> BStackWeak<'a, T, A> {
         stack.get_into(data_pos, &mut bytes)?;
         let data_range = BStackRange::new(u64::from_le_bytes(bytes), size_of::<T::OnDisk>() as u64);
         let data = unsafe { BStackRef::<T>::from_range(data_range) };
-        Ok(Some(BStackRc { data, ctrl: Some(ctrl_range), allocator: self.allocator }))
+        Ok(Some(BStackRc {
+            data,
+            ctrl: Some(ctrl_range),
+            allocator: self.allocator,
+        }))
     }
 }
 
@@ -144,7 +179,10 @@ impl<'a, T: BStackWeakable, A: BStackOwnedSliceAllocator> TryClone for BStackWea
     fn try_clone(&self) -> io::Result<Self> {
         let weak_off = self.ctrl.into_range().start() + layout::CTRL_WEAK_OFFSET;
         refcount::fetch_add(self.allocator.stack(), weak_off, 1)?;
-        Ok(Self { ctrl: self.ctrl, allocator: self.allocator })
+        Ok(Self {
+            ctrl: self.ctrl,
+            allocator: self.allocator,
+        })
     }
 }
 

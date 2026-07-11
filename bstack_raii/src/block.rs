@@ -4,10 +4,13 @@
 //! runtime code (handles, `bstack_move!`) name a block's on-disk shape, tag, and
 //! control block without knowing the concrete type.
 
-use bstack::BStackRange;
+use std::io;
+
+use bstack::{BStackOwnedSliceAllocator, BStackRange};
 use bytemuck::Pod;
 
 use crate::layout::EightCC;
+use crate::reference::BStackRef;
 use crate::teardown::BStackDrop;
 
 /// The downcast discriminant. The returned [`EightCC`] must match the tag in a
@@ -30,6 +33,48 @@ pub trait BStackBlock: BStackCast + BStackDrop + Sized {
 
     /// The underlying range this handle points at.
     fn range(&self) -> BStackRange;
+}
+
+/// Destructure an owned block into its typed field handles.
+///
+/// Implemented for `BStackOwned<X, A>` by `#[bstack_block]` (plain blocks only)
+/// and invoked by the `bstack_move!` macro. It transfers ownership of every
+/// field out — owned children as `BStackOwned`, refs as `BStackRef`, POD by
+/// value — and frees only the parent shell. Not implemented for `(rc)` /
+/// `(rc, weak)` blocks, nor (yet) for blocks with `#[bstack_strong]` /
+/// `#[bstack_weak]` fields.
+pub trait BStackMove: Sized {
+    /// The tuple of field handles produced, in field-declaration order.
+    type Fields;
+    fn bstack_move(self) -> io::Result<Self::Fields>;
+}
+
+/// Implemented by refcounted blocks (`#[bstack_block(rc)]` and
+/// `#[bstack_block(rc, weak)]`), i.e. any block that can be the target of a
+/// `#[bstack_strong]` field.
+///
+/// It abstracts "drop one strong reference to a child of this type" so a
+/// parent's generated teardown does not need to know whether the child is a
+/// plain `(rc)` block (inline refcount, [`crate::StrongRef`]) or an
+/// `(rc, weak)` block (control block, [`crate::StrongWeakRef`]). The child's own
+/// `#[bstack_block]` expansion picks the right implementation.
+pub trait BStackShared: BStackBlock {
+    /// Drop one strong reference to a block of this type located at `data`,
+    /// freeing it (and, for `(rc, weak)`, releasing the control block) when the
+    /// strong count reaches zero.
+    fn drop_strong_ref<A: BStackOwnedSliceAllocator>(
+        data: BStackRef<Self>,
+        allocator: &A,
+    ) -> io::Result<()>;
+
+    /// Resolve the raw parts of a strong handle to a child of this type at
+    /// `data`: the data ref, plus the control-block range for `(rc, weak)`
+    /// blocks (`None` for plain `(rc)`). Used by `bstack_move!` to rebuild a
+    /// `BStackRc` for a `#[bstack_strong]` field.
+    fn strong_parts<A: BStackOwnedSliceAllocator>(
+        data: BStackRef<Self>,
+        allocator: &A,
+    ) -> io::Result<(BStackRef<Self>, Option<BStackRange>)>;
 }
 
 /// Implemented only for blocks declared `#[bstack_block(rc, weak)]`.

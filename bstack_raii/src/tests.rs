@@ -8,12 +8,15 @@ use core::mem::size_of;
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use bstack::{BStack, BStackAllocator, BStackOwnedSliceAllocator, BStackRange, FirstFitBStackAllocator};
+use bstack::{
+    BStack, BStackAllocator, BStackOwnedSliceAllocator, BStackRange, FirstFitBStackAllocator,
+};
 
 use crate::layout::{self, BlockHeader};
 use crate::{
-    alloc_block, alloc_control, dealloc_range, BStackBlock, BStackCast, BStackDrop, BStackRc,
-    BStackRef, BStackWeakable, EightCC, TryClone,
+    BStackBlock, BStackCast, BStackDrop, BStackOwned, BStackRc, BStackRef, BStackShared,
+    BStackWeakable, EightCC, TryClone, alloc_block, alloc_control, bstack_block, bstack_move,
+    dealloc_range,
 };
 
 // --------------------------------------------------------------------------
@@ -31,7 +34,10 @@ impl TempStack {
     fn new() -> Self {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let mut path = std::env::temp_dir();
-        path.push(format!("bstack_raii_test_{}_{n}.bstack", std::process::id()));
+        path.push(format!(
+            "bstack_raii_test_{}_{n}.bstack",
+            std::process::id()
+        ));
         let _ = std::fs::remove_file(&path);
         TempStack { path }
     }
@@ -143,12 +149,18 @@ fn refcount_ops() {
     assert_eq!(crate::refcount::load(&stack, off).unwrap(), 6);
     assert_eq!(crate::refcount::fetch_sub(&stack, off, 2).unwrap(), 6);
     assert_eq!(crate::refcount::load(&stack, off).unwrap(), 4);
-    assert_eq!(crate::refcount::increment_if_nonzero(&stack, off).unwrap(), Some(5));
+    assert_eq!(
+        crate::refcount::increment_if_nonzero(&stack, off).unwrap(),
+        Some(5)
+    );
 
     // Drive to zero, then confirm zero is terminal for increment_if_nonzero.
     assert_eq!(crate::refcount::fetch_sub(&stack, off, 5).unwrap(), 5);
     assert_eq!(crate::refcount::load(&stack, off).unwrap(), 0);
-    assert_eq!(crate::refcount::increment_if_nonzero(&stack, off).unwrap(), None);
+    assert_eq!(
+        crate::refcount::increment_if_nonzero(&stack, off).unwrap(),
+        None
+    );
     assert_eq!(crate::refcount::load(&stack, off).unwrap(), 0);
 
     // Underflow is an error, not a wrap.
@@ -170,7 +182,10 @@ fn rc_weak_lifecycle() {
     // Initial state and the wired back/forward pointers.
     assert_eq!(load(strong_off), 1);
     assert_eq!(load(weak_off), 1);
-    assert_eq!(load(data.start() + layout::CTRL_BACKPTR_OFFSET), ctrl.start());
+    assert_eq!(
+        load(data.start() + layout::CTRL_BACKPTR_OFFSET),
+        ctrl.start()
+    );
     assert_eq!(load(ctrl.start() + layout::CTRL_DATA_OFFSET), data.start());
 
     let rc = rc_of(&alloc, data, ctrl);
@@ -283,4 +298,362 @@ fn concurrent_upgrade_downgrade() {
 
     drop(weak); // weak 2 -> 1
     drop(rc); // strong -> 0 frees data; phantom release frees control
+}
+
+// --------------------------------------------------------------------------
+// #[bstack_block] macro — recursive teardown of an owned child
+// --------------------------------------------------------------------------
+
+#[bstack_block]
+struct MacroLeaf {
+    val: u32,
+}
+
+#[bstack_block]
+struct MacroParent {
+    #[bstack_owned]
+    child: MacroLeaf,
+    tag: u32,
+}
+
+#[test]
+fn macro_recursive_drop() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let leaf_size = size_of::<<MacroLeaf as BStackBlock>::OnDisk>() as u64;
+    let parent_size = size_of::<<MacroParent as BStackBlock>::OnDisk>() as u64;
+
+    let leaf = alloc_block(&alloc, MacroLeaf::eightcc(), leaf_size).unwrap();
+    let parent = alloc_block(&alloc, MacroParent::eightcc(), parent_size).unwrap();
+    // Wire parent.child -> leaf (the first user field sits right after the header).
+    alloc
+        .stack()
+        .set(
+            parent.start() + layout::HEADER_SIZE,
+            leaf.start().to_le_bytes(),
+        )
+        .unwrap();
+
+    // Own the parent; dropping it must recursively free the child, then itself.
+    let owned =
+        unsafe { BStackOwned::from_raw(<MacroParent as BStackBlock>::from_range(parent), &alloc) };
+    drop(owned);
+
+    // The child's slot (allocated first, so the lowest offset) is reclaimed —
+    // proof the generated `bstack_drop` recursed into the owned child.
+    let reused = alloc_block(&alloc, MacroLeaf::eightcc(), leaf_size).unwrap();
+    assert_eq!(reused.start(), leaf.start());
+    unsafe { dealloc_range(&alloc, reused).unwrap() };
+}
+
+// --------------------------------------------------------------------------
+// #[bstack_block(rc, weak)] macro — control block + recursive owned child
+// --------------------------------------------------------------------------
+
+#[bstack_block(rc, weak)]
+struct MacroShared {
+    #[bstack_owned]
+    child: MacroLeaf,
+}
+
+#[test]
+fn macro_rc_weak_with_child() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+
+    let leaf_size = size_of::<<MacroLeaf as BStackBlock>::OnDisk>() as u64;
+    let data_size = size_of::<<MacroShared as BStackBlock>::OnDisk>() as u64;
+    let ctrl_size = size_of::<<MacroShared as BStackWeakable>::Control>() as u64;
+
+    let leaf = alloc_block(&alloc, MacroLeaf::eightcc(), leaf_size).unwrap();
+    let data = alloc_block(&alloc, MacroShared::eightcc(), data_size).unwrap();
+    // `child` sits after the header and the injected `ctrl` field (16 + 8).
+    alloc
+        .stack()
+        .set(
+            data.start() + layout::HEADER_SIZE + 8,
+            leaf.start().to_le_bytes(),
+        )
+        .unwrap();
+    let ctrl = alloc_control(&alloc, ctrl_tag(), data, ctrl_size).unwrap();
+
+    let strong_off = ctrl.start() + layout::CTRL_STRONG_OFFSET;
+    let weak_off = ctrl.start() + layout::CTRL_WEAK_OFFSET;
+    let load = |o: u64| crate::refcount::load(alloc.stack(), o).unwrap();
+    assert_eq!(load(strong_off), 1);
+    assert_eq!(load(weak_off), 1);
+
+    let rc = unsafe {
+        BStackRc::<MacroShared, _>::from_raw(BStackRef::from_range(data), Some(ctrl), &alloc)
+    };
+    let rc2 = rc.try_clone().unwrap();
+    assert_eq!(load(strong_off), 2);
+    let weak = rc.downgrade().unwrap();
+    assert_eq!(load(weak_off), 2);
+
+    drop(rc2);
+    // Last strong drop: frees the data block AND recursively its owned child,
+    // then releases the phantom weak (2 -> 1); control survives.
+    drop(rc);
+    assert_eq!(load(strong_off), 0);
+    assert_eq!(load(weak_off), 1);
+
+    assert!(weak.upgrade().unwrap().is_none());
+    drop(weak); // frees the control block
+
+    // With leaf + data + control all freed (and coalesced, since they were
+    // allocated consecutively), the lowest slot is reclaimable only if the owned
+    // child was actually recursively freed — otherwise leaf's slot would still be
+    // live and a fresh alloc would land higher.
+    let reused = alloc_block(&alloc, MacroLeaf::eightcc(), leaf_size).unwrap();
+    assert_eq!(reused.start(), leaf.start());
+    unsafe { dealloc_range(&alloc, reused).unwrap() };
+}
+
+// --------------------------------------------------------------------------
+// #[bstack_strong] — parent drop dispatches through BStackShared to the child
+// --------------------------------------------------------------------------
+
+#[bstack_block(rc, weak)]
+struct MacroStrongChild {
+    val: u32,
+}
+
+#[bstack_block]
+struct MacroStrongParent {
+    #[bstack_strong]
+    s: MacroStrongChild,
+}
+
+#[test]
+fn macro_strong_child() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+
+    let child_data_size = size_of::<<MacroStrongChild as BStackBlock>::OnDisk>() as u64;
+    let child_ctrl_size = size_of::<<MacroStrongChild as BStackWeakable>::Control>() as u64;
+    let parent_size = size_of::<<MacroStrongParent as BStackBlock>::OnDisk>() as u64;
+
+    let child = alloc_block(&alloc, MacroStrongChild::eightcc(), child_data_size).unwrap();
+    let child_ctrl = alloc_control(&alloc, ctrl_tag(), child, child_ctrl_size).unwrap();
+    let strong_off = child_ctrl.start() + layout::CTRL_STRONG_OFFSET;
+    // A second, keep-alive strong owner besides the parent's `s` field.
+    crate::refcount::fetch_add(alloc.stack(), strong_off, 1).unwrap(); // strong = 2
+
+    let parent = alloc_block(&alloc, MacroStrongParent::eightcc(), parent_size).unwrap();
+    // `s` is the first user field, right after the header.
+    alloc
+        .stack()
+        .set(
+            parent.start() + layout::HEADER_SIZE,
+            child.start().to_le_bytes(),
+        )
+        .unwrap();
+
+    // Dropping the parent runs its generated teardown, which dispatches through
+    // BStackShared::drop_strong_ref to decrement the child's strong count.
+    let owned = unsafe {
+        BStackOwned::from_raw(
+            <MacroStrongParent as BStackBlock>::from_range(parent),
+            &alloc,
+        )
+    };
+    drop(owned);
+    assert_eq!(crate::refcount::load(alloc.stack(), strong_off).unwrap(), 1); // child survives
+
+    // Release the keep-alive: strong -> 0 frees the child data + control block.
+    MacroStrongChild::drop_strong_ref(unsafe { BStackRef::from_range(child) }, &alloc).unwrap();
+    let reused = alloc_block(&alloc, MacroStrongChild::eightcc(), child_data_size).unwrap();
+    assert_eq!(reused.start(), child.start());
+    unsafe { dealloc_range(&alloc, reused).unwrap() };
+}
+
+// --------------------------------------------------------------------------
+// Generated `new` constructors + field accessors
+// --------------------------------------------------------------------------
+
+#[test]
+fn macro_new_and_accessors() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    // Plain-block constructor: allocates and writes the whole payload.
+    let leaf = MacroLeaf::new(&alloc, 42).unwrap();
+    assert_eq!(leaf.handle().val(stack).unwrap(), 42);
+
+    // Owned child is consumed by the parent constructor (ownership transferred).
+    let parent = MacroParent::new(&alloc, leaf, 7).unwrap();
+    assert_eq!(parent.handle().tag(stack).unwrap(), 7);
+
+    // Accessor resolves the owned-ref field to the child handle; reading its own
+    // field proves the child pointer was wired correctly.
+    let child = parent.handle().child(stack).unwrap();
+    assert_eq!(child.val(stack).unwrap(), 42);
+
+    // Dropping the parent recursively frees the child then itself (no panic /
+    // error swallowed by Drop); recursion correctness is covered elsewhere.
+    drop(parent);
+}
+
+#[test]
+fn macro_new_rc_weak() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    // (rc, weak) constructor allocates the data block AND wires a control block.
+    let leaf = MacroLeaf::new(&alloc, 99).unwrap();
+    let rc = MacroShared::new(&alloc, leaf).unwrap();
+
+    // Traverse through the shared handle to the owned child and read it.
+    assert_eq!(rc.handle().child(stack).unwrap().val(stack).unwrap(), 99);
+
+    // Full shared lifecycle on a constructor-built block.
+    let rc2 = rc.try_clone().unwrap();
+    let weak = rc.downgrade().unwrap();
+    drop(rc2);
+    drop(rc);
+    assert!(weak.upgrade().unwrap().is_none());
+    drop(weak);
+}
+
+// --------------------------------------------------------------------------
+// #[bstack_weak] field — constructor (null init), setter, upgrade accessor, and
+// sound teardown when the target's data is freed first (the cycle case).
+// --------------------------------------------------------------------------
+
+#[bstack_block(rc, weak)]
+struct WNode {
+    #[bstack_weak]
+    back: WNode,
+    val: u32,
+}
+
+#[test]
+fn macro_weak_field_cycle() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+
+    // Constructor works for a weak-field block; `back` starts null.
+    let a = WNode::new(&alloc, 1).unwrap();
+    let b = WNode::new(&alloc, 2).unwrap();
+    let a_data = a.handle().range().start(); // lowest allocation
+
+    // Setter wires b.back -> a as a weak reference.
+    b.handle().set_back(&alloc, a.downgrade().unwrap()).unwrap();
+
+    // Upgrade accessor resolves the live target.
+    let up = b.handle().back(&alloc).unwrap().expect("a is alive");
+    assert_eq!(up.handle().val(alloc.stack()).unwrap(), 1);
+    drop(up);
+
+    // Drop the strong owner `a` first: its DATA block is freed, but its control
+    // block survives because b.back still holds a weak count.
+    drop(a);
+
+    // The weak field can no longer upgrade — and reaching this did NOT read a's
+    // freed data block, because the field stores a's control offset.
+    assert!(b.handle().back(&alloc).unwrap().is_none());
+
+    // Dropping `b` releases b.back's weak on a's control block (freeing it), then
+    // frees b. No use-after-free of a's data.
+    drop(b);
+
+    // Everything (a data+control, b data+control) is freed and coalesced, so the
+    // lowest slot — a's — is reclaimed.
+    let reused = alloc_block(
+        &alloc,
+        WNode::eightcc(),
+        size_of::<<WNode as BStackBlock>::OnDisk>() as u64,
+    )
+    .unwrap();
+    assert_eq!(reused.start(), a_data);
+    unsafe { dealloc_range(&alloc, reused).unwrap() };
+}
+
+// --------------------------------------------------------------------------
+// bstack_move! — destructure an owned block into its field handles
+// --------------------------------------------------------------------------
+
+#[test]
+fn macro_bstack_move() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let leaf = MacroLeaf::new(&alloc, 55).unwrap();
+    let leaf_off = leaf.handle().range().start();
+    let parent = MacroParent::new(&alloc, leaf, 7).unwrap();
+
+    // Move the fields out: owned child -> BStackOwned<MacroLeaf>, tag -> u32.
+    let (child, tag) = bstack_move!(parent).unwrap();
+    assert_eq!(tag, 7);
+
+    // Ownership of the child transferred (same allocation), and it is still live
+    // because bstack_move! frees only the parent shell.
+    assert_eq!(child.handle().range().start(), leaf_off);
+    assert_eq!(child.handle().val(stack).unwrap(), 55);
+
+    // Dropping the moved-out child frees the leaf. With the parent shell already
+    // freed, both slots coalesce and the lowest (leaf's) is reclaimed.
+    drop(child);
+    let reused = alloc_block(
+        &alloc,
+        MacroLeaf::eightcc(),
+        size_of::<<MacroLeaf as BStackBlock>::OnDisk>() as u64,
+    )
+    .unwrap();
+    assert_eq!(reused.start(), leaf_off);
+    unsafe { dealloc_range(&alloc, reused).unwrap() };
+}
+
+// A plain block whose fields reference shared blocks (both `(rc, weak)`).
+#[bstack_block]
+struct MoveHolder {
+    #[bstack_strong]
+    s: MacroStrongChild,
+    #[bstack_weak]
+    w: WNode,
+    n: u32,
+}
+
+#[test]
+fn macro_bstack_move_shared() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let sc = MacroStrongChild::new(&alloc, 88).unwrap(); // BStackRc, strong = 1
+    let wt = WNode::new(&alloc, 3).unwrap(); // the weak target
+
+    // The strong field consumes `sc` (transferring its strong count); the weak
+    // field is wired after construction.
+    let holder = MoveHolder::new(&alloc, sc, 5).unwrap();
+    holder
+        .handle()
+        .set_w(&alloc, wt.downgrade().unwrap())
+        .unwrap();
+
+    // Move every field out: strong -> BStackRc, weak -> Option<BStackWeak>, pod.
+    let (moved_s, moved_w, n) = bstack_move!(holder).unwrap();
+    assert_eq!(n, 5);
+
+    // The strong field came back as a live BStackRc.
+    assert_eq!(moved_s.handle().val(stack).unwrap(), 88);
+
+    // The weak field came back as Some(weak) and still upgrades (target alive).
+    let up = moved_w
+        .as_ref()
+        .unwrap()
+        .upgrade()
+        .unwrap()
+        .expect("wt alive");
+    assert_eq!(up.handle().val(stack).unwrap(), 3);
+    drop(up);
+
+    // Clean teardown across the moved-out handles.
+    drop(moved_s); // frees the strong child
+    drop(moved_w); // releases the weak on wt's control block
+    drop(wt); // frees wt (data + control)
 }

@@ -8,12 +8,17 @@
 //! caller's job; these helpers only lay down the header and the injected
 //! refcount / control machinery at the fixed offsets from [`crate::layout`].
 
+use core::mem::size_of;
 use std::io;
 
 use bstack::{BStackOwnedSliceAllocator, BStackRange};
 
+use crate::block::BStackWeakable;
+use crate::handle::WeakRef;
 use crate::layout::{self, BlockHeader, EightCC};
-use crate::teardown::dealloc_range;
+use crate::reference::BStackRef;
+use crate::shared::{BStackRc, BStackWeak};
+use crate::teardown::{BStackDrop, dealloc_range};
 
 /// Allocate a `size`-byte block and stamp its `BlockHeader { size, tag }`.
 ///
@@ -38,10 +43,7 @@ pub fn alloc_block<A: BStackOwnedSliceAllocator>(
 ///
 /// Call once after [`alloc_block`] and after the payload is written. One is the
 /// count the single returned `BStackRc` accounts for.
-pub fn init_rc<A: BStackOwnedSliceAllocator>(
-    allocator: &A,
-    data: BStackRange,
-) -> io::Result<()> {
+pub fn init_rc<A: BStackOwnedSliceAllocator>(allocator: &A, data: BStackRange) -> io::Result<()> {
     let off = data.start() + layout::RC_REFCOUNT_OFFSET;
     allocator.stack().set(off, 1u64.to_le_bytes())
 }
@@ -65,7 +67,10 @@ pub fn alloc_control<A: BStackOwnedSliceAllocator>(
     // Build the entire control-block payload in memory and commit it in a single
     // write: header, strong = 1, weak = 1 (phantom), x -> data.
     let mut payload = vec![0u8; control_size as usize];
-    let header = BlockHeader { size: control_size, tag: ctrl_tag };
+    let header = BlockHeader {
+        size: control_size,
+        tag: ctrl_tag,
+    };
     payload[..layout::HEADER_SIZE as usize].copy_from_slice(bytemuck::bytes_of(&header));
     let put = |payload: &mut [u8], off: u64, val: u64| {
         let o = off as usize;
@@ -90,4 +95,64 @@ pub fn alloc_control<A: BStackOwnedSliceAllocator>(
         return Err(e);
     }
     Ok(ctrl)
+}
+
+/// Set a `#[bstack_weak]` field, located at absolute on-disk offset `field_off`,
+/// to point at `new_weak` — releasing any weak reference the field previously
+/// held.
+///
+/// The field stores the child's **control-block** offset, not its data offset:
+/// the control block outlives the data block (it lives while `weak > 0`), so
+/// resolving it at teardown is sound even after the target's data has been
+/// freed. `new_weak` is consumed and the weak count it holds becomes the field's;
+/// a previous non-null target has its weak count decremented. 0 means "unset".
+pub fn set_weak_field<'w, T: BStackWeakable, A: BStackOwnedSliceAllocator>(
+    allocator: &A,
+    field_off: u64,
+    new_weak: BStackWeak<'w, T, A>,
+) -> io::Result<()> {
+    let stack = allocator.stack();
+
+    // Release the control reference the field previously held, if any.
+    let mut buf = [0u8; 8];
+    stack.get_into(field_off, &mut buf)?;
+    let old = u64::from_le_bytes(buf);
+    if old != 0 {
+        let old_ctrl = unsafe {
+            BStackRef::<T::Control>::from_range(BStackRange::new(
+                old,
+                size_of::<T::Control>() as u64,
+            ))
+        };
+        WeakRef::<T>(old_ctrl).bstack_drop(allocator)?;
+    }
+
+    // Store the new control offset; the consumed weak's count is now the field's.
+    let ctrl = new_weak.into_raw();
+    stack.set(field_off, ctrl.into_range().start().to_le_bytes())
+}
+
+/// Attempt to upgrade a `#[bstack_weak]` field (holding a control-block offset at
+/// `field_off`) to a strong handle. Returns `None` if the field is unset (0) or
+/// the target's strong count has already reached zero. What a generated weak
+/// field accessor calls.
+pub fn upgrade_weak_field<'a, T: BStackWeakable, A: BStackOwnedSliceAllocator>(
+    allocator: &'a A,
+    field_off: u64,
+) -> io::Result<Option<BStackRc<'a, T, A>>> {
+    let mut buf = [0u8; 8];
+    allocator.stack().get_into(field_off, &mut buf)?;
+    let off = u64::from_le_bytes(buf);
+    if off == 0 {
+        return Ok(None);
+    }
+    let ctrl = unsafe {
+        BStackRef::<T::Control>::from_range(BStackRange::new(off, size_of::<T::Control>() as u64))
+    };
+    // Borrow a weak over the field's control ref just long enough to upgrade;
+    // consume it via `into_raw` so the field's own weak count is untouched.
+    let weak = unsafe { BStackWeak::from_raw(ctrl, allocator) };
+    let result = weak.upgrade();
+    let _ = weak.into_raw();
+    result
 }

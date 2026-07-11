@@ -46,6 +46,12 @@ impl<'a, T: BStackDrop, A: BStackOwnedSliceAllocator> BStackOwned<'a, T, A> {
     pub fn allocator(&self) -> &'a A {
         self.allocator
     }
+
+    /// Borrow the underlying typed handle, e.g. to call generated field
+    /// accessors: `owned.handle().field(stack)`.
+    pub fn handle(&self) -> &T {
+        &self.inner
+    }
 }
 
 impl<'a, T: BStackDrop, A: BStackOwnedSliceAllocator> Drop for BStackOwned<'a, T, A> {
