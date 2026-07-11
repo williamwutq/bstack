@@ -8,9 +8,13 @@ use bytemuck::{Pod, Zeroable};
 /// An 8-byte type tag stored in every [`BlockHeader`].
 ///
 /// Used instead of a 4-byte `FourCC` because `bstack` offsets are 64-bit, so
-/// 8-byte alignment is natural. The `#[bstack_block]` macro derives it from the
-/// block type's name via [`EightCC::from_name`]; [`crate::BStackCast`] compares
-/// it during safe downcasts.
+/// 8-byte alignment is natural. [`crate::BStackCast`] compares it during safe
+/// downcasts, so it must be unique per block type.
+///
+/// The `#[bstack_block]` macro generates it as a readable ASCII prefix followed
+/// by the high-bit-set tail of a hash of the crate + type name (so distinct
+/// types stay distinct even with a shared prefix) — see the macro docs.
+/// [`EightCC::from_name`] is the simpler truncating form, for manual use.
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Pod, Zeroable)]
 pub struct EightCC(pub [u8; 8]);

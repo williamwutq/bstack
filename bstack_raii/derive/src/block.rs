@@ -14,7 +14,7 @@ use proc_macro2::{Span, TokenStream};
 use quote::{format_ident, quote};
 use syn::parse::Parser;
 use syn::punctuated::Punctuated;
-use syn::{Error, Fields, Ident, ItemStruct, Token, Type};
+use syn::{Error, Expr, ExprLit, Fields, Ident, ItemStruct, Lit, Meta, Token, Type};
 
 /// The block mode from the attribute arguments.
 #[derive(Clone, Copy, PartialEq)]
@@ -39,7 +39,8 @@ enum Kind {
 }
 
 pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> {
-    let mode = parse_mode(attr)?;
+    let attr = parse_attr(attr)?;
+    let mode = attr.mode;
 
     if !input.generics.params.is_empty() {
         return Err(Error::new_spanned(
@@ -243,7 +244,48 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         }
     }
 
-    let tag = name.to_string();
+    // EightCC tags: readable prefix over a hash of `crate ++ type_name`. The
+    // control tag uses the same hash with the prefix lowercased.
+    let type_name = name.to_string();
+    let crate_name = std::env::var("CARGO_PKG_NAME").unwrap_or_default();
+    let hash = fnv1a64(&format!("{crate_name}\0{type_name}"));
+    let data_prefix = attr.tag.as_ref().map_or_else(
+        || auto_prefix(&type_name),
+        |t| t.bytes().collect::<Vec<u8>>(),
+    );
+    let ctrl_prefix = attr.ctrl_tag.as_ref().map_or_else(
+        || {
+            data_prefix
+                .iter()
+                .map(u8::to_ascii_lowercase)
+                .collect::<Vec<u8>>()
+        },
+        |t| t.bytes().collect::<Vec<u8>>(),
+    );
+    let data_tag = build_tag(hash, &data_prefix);
+    let ctrl_tag = build_tag(hash, &ctrl_prefix);
+    let data_eightcc = eightcc_expr(&data_tag.bytes);
+    let ctrl_eightcc = eightcc_expr(&ctrl_tag.bytes);
+
+    // Overlong `tag =` / `ctrl_tag =` overrides warn (unless silenced) + truncate.
+    let overlong_warning = if (data_tag.truncated || ctrl_tag.truncated) && !attr.allow_long {
+        let warn_fn = format_ident!("__bstack_tag_overlong_{}", name);
+        let msg = format!(
+            "#[bstack_block] on `{type_name}`: a tag override longer than 8 bytes was truncated; \
+             add `allow_long_tag` to silence"
+        );
+        quote! {
+            #[doc(hidden)]
+            #[allow(dead_code, non_snake_case)]
+            fn #warn_fn() {
+                #[deprecated(note = #msg)]
+                fn overlong_tag() {}
+                overlong_tag();
+            }
+        }
+    } else {
+        quote!()
+    };
 
     // BStackShared / BStackWeakable / control block for the refcounted modes.
     let shared_impl = match mode {
@@ -317,10 +359,10 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
     };
 
     let constructor = constructor(
-        name,
         vis,
         &on_disk,
         mode,
+        &ctrl_eightcc,
         &ctor_params,
         &ctor_preps,
         &ctor_inits,
@@ -378,7 +420,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
 
         impl ::bstack_raii::BStackCast for #name {
             fn eightcc() -> ::bstack_raii::EightCC {
-                ::bstack_raii::EightCC::from_name(#tag)
+                #data_eightcc
             }
         }
 
@@ -416,6 +458,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         #shared_impl
         #weakable_items
         #move_impl
+        #overlong_warning
     })
 }
 
@@ -520,10 +563,10 @@ fn weak_setter(vis: &syn::Visibility, fname: &Ident, fty: &Type, on_disk: &Ident
 
 /// Assemble the `new` constructor.
 fn constructor(
-    name: &Ident,
     vis: &syn::Visibility,
     on_disk: &Ident,
     mode: Mode,
+    ctrl_eightcc: &TokenStream,
     params: &[TokenStream],
     preps: &[TokenStream],
     inits: &[TokenStream],
@@ -556,11 +599,10 @@ fn constructor(
             })
         },
         Mode::RcWeak => {
-            let ctrl_tag = format!("{name}Ref");
             quote! {
                 let __ctrl = match ::bstack_raii::alloc_control(
                     allocator,
-                    ::bstack_raii::EightCC::from_name(#ctrl_tag),
+                    #ctrl_eightcc,
                     __data,
                     ::core::mem::size_of::<<Self as ::bstack_raii::BStackWeakable>::Control>() as u64,
                 ) {
@@ -624,25 +666,199 @@ fn child_range_stmt(fname: &Ident, fty: &Type, body: TokenStream) -> TokenStream
     }
 }
 
-/// Parse the attribute arguments into a [`Mode`]: ``, `rc`, or `rc, weak`.
-fn parse_mode(attr: TokenStream) -> syn::Result<Mode> {
-    if attr.is_empty() {
-        return Ok(Mode::Plain);
+/// Parsed `#[bstack_block(...)]` arguments.
+struct Attr {
+    mode: Mode,
+    /// Explicit data-block tag prefix (`tag = "..."`).
+    tag: Option<String>,
+    /// Explicit control-block tag prefix (`ctrl_tag = "..."`).
+    ctrl_tag: Option<String>,
+    /// Suppress the overlong-tag warning (`allow_long_tag`).
+    allow_long: bool,
+}
+
+/// Parse `rc`, `weak`, `tag = "..."`, `ctrl_tag = "..."`, `allow_long_tag` in any
+/// order.
+fn parse_attr(attr: TokenStream) -> syn::Result<Attr> {
+    let (mut rc, mut weak) = (false, false);
+    let (mut tag, mut ctrl_tag, mut allow_long) = (None, None, false);
+
+    if !attr.is_empty() {
+        let metas = Punctuated::<Meta, Token![,]>::parse_terminated.parse2(attr)?;
+        for meta in metas {
+            match &meta {
+                Meta::Path(p) => match ident_of(p).as_deref() {
+                    Some("rc") => rc = true,
+                    Some("weak") => weak = true,
+                    Some("allow_long_tag") => allow_long = true,
+                    _ => return Err(Error::new_spanned(&meta, unknown_opt())),
+                },
+                Meta::NameValue(nv) => {
+                    let value = match &nv.value {
+                        Expr::Lit(ExprLit {
+                            lit: Lit::Str(s), ..
+                        }) => s.value(),
+                        other => {
+                            return Err(Error::new_spanned(other, "expected a string literal"));
+                        }
+                    };
+                    match ident_of(&nv.path).as_deref() {
+                        Some("tag") => tag = Some(value),
+                        Some("ctrl_tag") => ctrl_tag = Some(value),
+                        _ => return Err(Error::new_spanned(&meta, unknown_opt())),
+                    }
+                }
+                _ => return Err(Error::new_spanned(&meta, unknown_opt())),
+            }
+        }
     }
-    let parser = Punctuated::<Ident, Token![,]>::parse_terminated;
-    let idents: Vec<String> = parser
-        .parse2(attr)?
-        .into_iter()
-        .map(|i| i.to_string())
-        .collect();
-    match idents.as_slice() {
-        [rc] if rc == "rc" => Ok(Mode::Rc),
-        [rc, weak] if rc == "rc" && weak == "weak" => Ok(Mode::RcWeak),
-        _ => Err(Error::new(
-            Span::call_site(),
-            "expected `#[bstack_block]`, `#[bstack_block(rc)]`, or `#[bstack_block(rc, weak)]`",
-        )),
+
+    let mode = match (rc, weak) {
+        (false, false) => Mode::Plain,
+        (true, false) => Mode::Rc,
+        (true, true) => Mode::RcWeak,
+        (false, true) => {
+            return Err(Error::new(
+                Span::call_site(),
+                "`weak` requires `rc` (use `rc, weak`)",
+            ));
+        }
+    };
+    Ok(Attr {
+        mode,
+        tag,
+        ctrl_tag,
+        allow_long,
+    })
+}
+
+fn ident_of(path: &syn::Path) -> Option<String> {
+    path.get_ident().map(|i| i.to_string())
+}
+
+fn unknown_opt() -> &'static str {
+    "expected `rc`, `weak`, `tag = \"...\"`, `ctrl_tag = \"...\"`, or `allow_long_tag`"
+}
+
+// ---------------------------------------------------------------------------
+// EightCC tag generation
+//
+// An 8-byte tag = a readable ASCII prefix (2–5 auto, or a `tag =` override) over
+// the first N bytes, followed by the tail of a 64-bit FNV-1a hash of
+// `crate_name ++ "\0" ++ type_name`. Every tail byte has its high bit set so it
+// lands in the non-printable range and can't be mistaken for the prefix. The
+// control-block tag is the same, with the prefix lowercased. See the
+// `#[bstack_block]` docs.
+// ---------------------------------------------------------------------------
+
+/// The value passed to `EightCC::new([..])` plus whether the prefix was longer
+/// than 8 bytes (and hence truncated).
+struct Tag {
+    bytes: [u8; 8],
+    truncated: bool,
+}
+
+fn fnv1a64(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
+    h
+}
+
+/// Compose a tag from a hash and a readable prefix. Prefix bytes overwrite the
+/// (high-bit-set) hash bytes from the front; > 8 prefix bytes are truncated.
+fn build_tag(hash: u64, prefix: &[u8]) -> Tag {
+    let mut bytes = hash.to_le_bytes();
+    for b in bytes.iter_mut() {
+        *b |= 0x80;
+    }
+    let truncated = prefix.len() > 8;
+    let n = prefix.len().min(8);
+    bytes[..n].copy_from_slice(&prefix[..n]);
+    Tag { bytes, truncated }
+}
+
+fn is_ascii_vowel(b: u8) -> bool {
+    matches!(
+        b.to_ascii_uppercase(),
+        b'A' | b'E' | b'I' | b'O' | b'U' | b'Y'
+    )
+}
+
+/// Split a type name into words on camel-case boundaries and separators.
+fn split_words(name: &str) -> Vec<String> {
+    let chars: Vec<char> = name.chars().collect();
+    let mut words = Vec::new();
+    let mut cur = String::new();
+    for (i, &c) in chars.iter().enumerate() {
+        if !c.is_alphanumeric() {
+            if !cur.is_empty() {
+                words.push(std::mem::take(&mut cur));
+            }
+            continue;
+        }
+        let boundary = !cur.is_empty()
+            && ((c.is_uppercase() && chars[i - 1].is_lowercase())
+                || (c.is_uppercase()
+                    && chars[i - 1].is_uppercase()
+                    && chars.get(i + 1).is_some_and(|n| n.is_lowercase())));
+        if boundary {
+            words.push(std::mem::take(&mut cur));
+        }
+        cur.push(c);
+    }
+    if !cur.is_empty() {
+        words.push(cur);
+    }
+    words
+}
+
+/// Auto-derive a 2–5 byte uppercase prefix from a type name: initials of the
+/// words if there are ≥ 2, else the de-voweled single word.
+fn auto_prefix(name: &str) -> Vec<u8> {
+    let words = split_words(name);
+    let prefix: Vec<u8> = if words.len() >= 2 {
+        words
+            .iter()
+            .filter_map(|w| w.bytes().next())
+            .map(|b| b.to_ascii_uppercase())
+            .take(5)
+            .collect()
+    } else {
+        let letters: Vec<u8> = words
+            .first()
+            .map(|w| {
+                w.bytes()
+                    .filter(u8::is_ascii_alphanumeric)
+                    .map(|b| b.to_ascii_uppercase())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut v = Vec::new();
+        for (i, &b) in letters.iter().enumerate() {
+            // Keep the first letter always; drop vowels from the rest.
+            if i == 0 || !is_ascii_vowel(b) {
+                v.push(b);
+            }
+            if v.len() == 5 {
+                break;
+            }
+        }
+        // Fall back to the first two letters if de-voweling left < 2.
+        if v.len() < 2 {
+            v = letters.into_iter().take(2).collect();
+        }
+        v
+    };
+    prefix
+}
+
+/// Emit `::bstack_raii::EightCC::new([..])` from tag bytes.
+fn eightcc_expr(bytes: &[u8; 8]) -> TokenStream {
+    let bytes = bytes.iter();
+    quote!(::bstack_raii::EightCC::new([#(#bytes),*]))
 }
 
 /// Classify a field by its ownership annotation.

@@ -225,9 +225,9 @@ fn rc_weak_lifecycle() {
 }
 
 /// Many threads hammering `try_clone` + `drop` on a shared strong handle. Each
-/// iteration is a balanced +1/-1 on `strong`, and the main handle keeps `strong`
-/// >= 1 throughout (so no teardown races). If the on-disk RMW were not atomic
-/// under contention, lost updates would leave the final count off.
+/// iteration is a balanced +1/-1 on `strong`, and the main handle keeps at least
+/// one strong reference throughout (so no teardown races). If the on-disk RMW
+/// were not atomic under contention, lost updates would leave the final count off.
 #[test]
 fn concurrent_clone_drop() {
     const THREADS: usize = 8;
@@ -656,4 +656,99 @@ fn macro_bstack_move_shared() {
     drop(moved_s); // frees the strong child
     drop(moved_w); // releases the weak on wt's control block
     drop(wt); // frees wt (data + control)
+}
+
+// --------------------------------------------------------------------------
+// EightCC tag generation: readable prefix + non-printable hash tail
+// --------------------------------------------------------------------------
+
+#[bstack_block]
+struct SomeAbstractThing {
+    x: u32,
+}
+
+#[bstack_block]
+struct ABlock {
+    x: u32,
+}
+
+#[bstack_block(tag = "OVR")]
+struct Overridden {
+    x: u32,
+}
+
+#[bstack_block(rc, weak)]
+struct TagCtrl {
+    x: u32,
+}
+
+// Same forced prefix, different type names → hash tails must differ.
+#[bstack_block(tag = "SAME")]
+struct SameA {
+    x: u32,
+}
+#[bstack_block(tag = "SAME")]
+struct SameB {
+    x: u32,
+}
+
+// Overlong override is truncated to 8 bytes (warning silenced).
+#[bstack_block(tag = "TOOLONGTAG12", allow_long_tag)]
+struct Truncated {
+    x: u32,
+}
+
+#[test]
+fn macro_tag_generation() {
+    // CamelCase initials, and the tail is the high-bit (non-printable) hash.
+    let t = SomeAbstractThing::eightcc().0;
+    assert_eq!(&t[0..3], b"SAT");
+    assert!(t[3..].iter().all(|&b| b & 0x80 != 0));
+
+    // Two-word initials.
+    assert_eq!(&ABlock::eightcc().0[0..2], b"AB");
+
+    // Manual prefix override.
+    let o = Overridden::eightcc().0;
+    assert_eq!(&o[0..3], b"OVR");
+    assert!(o[3..].iter().all(|&b| b & 0x80 != 0));
+
+    // Same prefix, different names → identical prefix, different hash tails.
+    let a = SameA::eightcc().0;
+    let b = SameB::eightcc().0;
+    assert_eq!(&a[0..4], b"SAME");
+    assert_eq!(&b[0..4], b"SAME");
+    assert_ne!(a[4..], b[4..]);
+
+    // Overlong override truncated to the first 8 bytes.
+    assert_eq!(&Truncated::eightcc().0, b"TOOLONGT");
+}
+
+#[test]
+fn macro_control_tag_is_lowercased() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let rc = TagCtrl::new(&alloc, 1).unwrap();
+    let data_off = rc.handle().range().start();
+
+    // data.__bstack_ctrl (offset 16) -> control block offset.
+    let mut buf = [0u8; 8];
+    stack
+        .get_into(data_off + layout::CTRL_BACKPTR_OFFSET, &mut buf)
+        .unwrap();
+    let ctrl_off = u64::from_le_bytes(buf);
+
+    // Control block's header tag lives at ctrl_off + 8 (after size: u64).
+    let mut ctrl_tag = [0u8; 8];
+    stack.get_into(ctrl_off + 8, &mut ctrl_tag).unwrap();
+
+    let data_tag = TagCtrl::eightcc().0; // prefix "TC"
+    assert_eq!(&data_tag[0..2], b"TC");
+    // Control tag = data tag with the prefix lowercased, same hash tail.
+    assert_eq!(&ctrl_tag[0..2], b"tc");
+    assert_eq!(ctrl_tag[2..], data_tag[2..]);
+
+    drop(rc);
 }

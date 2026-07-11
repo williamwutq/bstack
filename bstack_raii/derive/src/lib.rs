@@ -10,11 +10,6 @@
 //!   transferring ownership of every field out as a tuple of typed handles.
 //! * [`bstack_cast`] — function-like macro. Direction-inferring typed/untyped
 //!   handle conversion.
-//!
-//! Everything below is a scaffold: the parsing/validation/codegen bodies are the
-//! work to be filled in. The signatures and the emitted-shape contracts are
-//! fixed so the runtime crate and downstream callers can be developed in
-//! parallel.
 
 use proc_macro::TokenStream;
 
@@ -22,26 +17,41 @@ mod block;
 
 /// `#[bstack_block]` — generate the on-disk layout and typed handle machinery.
 ///
-/// Accepts optional mode arguments: `#[bstack_block]`, `#[bstack_block(rc)]`, or
-/// `#[bstack_block(rc, weak)]`.
+/// # Arguments
 ///
-/// Must generate, for an input `struct X { .. }`:
-/// 1. `struct XOnDisk` — `#[repr(C, packed)]`, `header: BlockHeader` first, then
-///    each field lowered per its annotation:
-///    * `#[bstack_owned]` / `#[bstack_strong]` / `#[bstack_weak]` /
-///      `#[bstack_ref]` → `BStackRef<T>` (validate exactly one annotation on
-///      each non-POD field).
-///    * un-annotated field → stored inline; must be `bytemuck::Pod` (reject
-///      otherwise at expansion time).
-///    * `(rc)` injects `refcount: AtomicU64` after the header; `(rc, weak)`
-///      instead injects `ctrl: BStackRef<XOnDiskRef>` and emits a separate
-///      `struct XOnDiskRef` control block (`strong`, `weak`, back-pointer).
-/// 2. Field accessor methods on `X` that `read_into` a buffer and read the field.
-/// 3. `impl BStackDrop for X` — post-order: one child-handle `.bstack_drop(allocator)?`
-///    per non-`#[bstack_ref]`, non-POD field, then `dealloc_range` of the block.
-/// 4. `impl BStackCast for X` with an `EightCC` derived from the type name.
-/// 5. `impl BStackWeakable for X { type Control = XOnDiskRef; }` only for
-///    `(rc, weak)`.
+/// `#[bstack_block(rc)]` / `#[bstack_block(rc, weak)]` select the refcount mode.
+/// `tag = "…"` / `ctrl_tag = "…"` override the generated tags (see below), and
+/// `allow_long_tag` silences the truncation warning for an over-long override.
+/// All are optional and may appear in any order.
+///
+/// # Generated items (for `struct X { .. }`)
+///
+/// * `struct X(BStackRange)` — the typed handle, and `struct XOnDisk`
+///   (`#[repr(C, packed)]`, `Pod`) — the on-disk payload. `#[bstack_owned]` /
+///   `#[bstack_strong]` / `#[bstack_weak]` / `#[bstack_ref]` fields lower to a
+///   `u64` offset; un-annotated fields are stored inline (and must be `Pod`).
+///   `(rc)` injects an inline `refcount`; `(rc, weak)` injects a `ctrl`
+///   back-pointer and emits an `XOnDiskRef` control block.
+/// * `impl BStackCast / BStackBlock / BStackDrop`, plus `BStackShared`
+///   (`rc` / `rc, weak`), `BStackWeakable` (`rc, weak`), and `BStackMove`
+///   (plain blocks — the `bstack_move!` target).
+/// * Field accessors, `set_<field>` for weak fields, and a `new` constructor.
+///
+/// # EightCC tag generation
+///
+/// Each block's [`EightCC`](../bstack_raii/struct.EightCC.html) is an 8-byte tag
+/// = a **readable ASCII prefix** over the first bytes, followed by the tail of a
+/// **64-bit FNV-1a hash** of `crate_name ++ "\0" ++ type_name` (little-endian).
+/// Every hash-tail byte has its high bit set, so it lands in the non-printable
+/// range and reads as clearly-not-a-name in a hex dump. The hash keeps distinct
+/// types apart even when their prefixes collide, and is deterministic (stable
+/// across builds/versions) so it is safe as on-disk ABI.
+///
+/// The prefix is derived from the type name: initials of the camel-case words
+/// (≥ 2 words), or the de-voweled single word, clamped to 2–5 bytes. Override it
+/// with `tag = "PREFIX"` (0–8 bytes; fewer than 8 leaves room for hash, exactly
+/// 8 is a fully manual tag, over 8 warns and truncates). The control block's tag
+/// is the data tag with its prefix **lowercased**, or an explicit `ctrl_tag`.
 #[proc_macro_attribute]
 pub fn bstack_block(args: TokenStream, item: TokenStream) -> TokenStream {
     let input = syn::parse_macro_input!(item as syn::ItemStruct);
