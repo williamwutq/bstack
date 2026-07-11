@@ -21,9 +21,11 @@ mod cast;
 /// # Arguments
 ///
 /// `#[bstack_block(rc)]` / `#[bstack_block(rc, weak)]` select the refcount mode.
-/// `tag = "…"` / `ctrl_tag = "…"` override the generated tags (see below), and
-/// `allow_long_tag` silences the truncation warning for an over-long override.
-/// All are optional and may appear in any order.
+/// `tag = "…"` / `ctrl_tag = "…"` override the generated tags (see below).
+/// `allow(overlong_tag)` / `allow(coerced_ref)` silence the corresponding
+/// warnings (and a real `#[allow(deprecated)]` on the struct silences both,
+/// since the warnings use the deprecation mechanism). All are optional and may
+/// appear in any order.
 ///
 /// # Generated items (for `struct X { .. }`)
 ///

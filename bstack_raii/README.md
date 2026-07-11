@@ -173,6 +173,39 @@ The accessor then returns `io::Result<Option<Handle>>`, the constructor takes
 `Option<BStackOwned<Child>>` / `Option<BStackRc<Thing>>`, and `bstack_move!`
 yields `Option<…>`. (`#[bstack_weak]` fields are already nullable by nature.)
 
+### Variable-length: `Vec<T>` and `String`
+
+An `#[bstack_owned] Vec<T>` (POD `T`) or `String` field stores a growable
+sequence. On disk the field is a fixed-size pointer to a small **descriptor**
+block, which in turn points to the (growable, reallocating) data block — so the
+field stays fixed-size while the data can grow and move:
+
+```rust
+#[bstack_block]
+struct Record {
+    #[bstack_owned] name: String,
+    #[bstack_owned] tags: Vec<u32>,
+    id: u64,
+}
+
+let rec = Record::new(&alloc, "hello", &[1u32, 2, 3], 42)?;  // &str / &[T] / value
+let mut tags = rec.handle().tags(&alloc)?;    // a BStackVec<u32> handle
+tags.push(4)?;                                // grows in place, visible on re-read
+assert_eq!(rec.handle().tags(&alloc)?.to_vec()?, vec![1, 2, 3, 4]);
+```
+
+The accessor returns a [`BStackVec<T>`] handle (`len` / `to_vec` / `push`); the
+constructor takes `&str` / `&[T]`; `bstack_move!` yields the `BStackVec`. Freeing
+the block frees the data + descriptor. Elements must be `Pod` — `Vec<Thing>`
+(vectors of blocks), `#[bstack_ref] Vec<T>`, and `Option<Vec<T>>` are not
+supported yet.
+
+### Ergonomic reference coercion
+
+For convenience, a field written `&T` is coerced to owned `T` (and `&str` to
+`String`) with a compile warning — so a stray reference doesn't fail to compile,
+but you're nudged to write the owned type.
+
 ## Handles
 
 The typed handle `X` is a bare `(offset, len)` with no allocator — cheap,
@@ -319,7 +352,8 @@ struct OrderLine { /* … */ }
 
 `ctrl_tag = "…"` overrides the control-block tag (default: the data tag,
 lowercased). An override longer than 8 bytes is truncated with a compile warning;
-`allow_long_tag` silences it.
+`#[bstack_block(allow(overlong_tag))]` silences it (as does the reference-coercion
+warning's `allow(coerced_ref)`, or a real `#[allow(deprecated)]` on the struct).
 
 ## How it works on disk
 
@@ -353,3 +387,4 @@ MIT (same as `bstack`).
 
 [`bstack`]: https://github.com/williamwutq/bstack
 [`TryClone`]: src/clone.rs
+[`BStackVec<T>`]: src/vec.rs

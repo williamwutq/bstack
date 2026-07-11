@@ -693,7 +693,7 @@ struct SameB {
 }
 
 // Overlong override is truncated to 8 bytes (warning silenced).
-#[bstack_block(tag = "TOOLONGTAG12", allow_long_tag)]
+#[bstack_block(tag = "TOOLONGTAG12", allow(overlong_tag))]
 struct Truncated {
     x: u32,
 }
@@ -990,8 +990,14 @@ fn macro_vec_string_fields() {
     assert_eq!(rec.handle().id(stack).unwrap(), 42);
 
     // Accessors return BStackVec handles (take the allocator).
-    assert_eq!(rec.handle().name(&alloc).unwrap().to_vec().unwrap(), b"hello");
-    assert_eq!(rec.handle().tags(&alloc).unwrap().to_vec().unwrap(), vec![1u32, 2, 3]);
+    assert_eq!(
+        rec.handle().name(&alloc).unwrap().to_vec().unwrap(),
+        b"hello"
+    );
+    assert_eq!(
+        rec.handle().tags(&alloc).unwrap().to_vec().unwrap(),
+        vec![1u32, 2, 3]
+    );
 
     // Mutate through the handle: the field points at the stable descriptor, so
     // growth (even if the data block moves) is visible on the next read.
@@ -1007,8 +1013,14 @@ fn macro_vec_string_fields() {
 
     // Allocator is healthy: a fresh record round-trips.
     let rec2 = Record::new(&alloc, "again", &[9u32], 1).unwrap();
-    assert_eq!(rec2.handle().name(&alloc).unwrap().to_vec().unwrap(), b"again");
-    assert_eq!(rec2.handle().tags(&alloc).unwrap().to_vec().unwrap(), vec![9u32]);
+    assert_eq!(
+        rec2.handle().name(&alloc).unwrap().to_vec().unwrap(),
+        b"again"
+    );
+    assert_eq!(
+        rec2.handle().tags(&alloc).unwrap().to_vec().unwrap(),
+        vec![9u32]
+    );
     drop(rec2);
 }
 

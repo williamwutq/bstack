@@ -87,14 +87,34 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
     let mut mv_caps = Vec::new();
     let mut mv_types = Vec::new();
     let mut mv_recon = Vec::new();
+    // Whether any field was written `&T` (coerced to owned `T`, with a warning).
+    let mut ref_coerced = false;
 
     for field in fields {
         let fname = field.ident.as_ref().expect("named field");
         let kind = classify(field)?;
 
-        // `Vec<T>` / `String` fields: a fixed-size descriptor offset on disk, a
-        // `BStackVec` at runtime. Handled entirely here.
-        if let Some(vinfo) = vec_field(&field.ty) {
+        // Ergonomic: `&T` is coerced to owned `T` (and `&str` to `String`), with
+        // a warning. `eff_ty` is the type after stripping a leading `&`.
+        let eff_ty: &Type = match &field.ty {
+            Type::Reference(r) => &r.elem,
+            other => other,
+        };
+        if matches!(&field.ty, Type::Reference(_)) {
+            ref_coerced = true;
+        }
+
+        // `Vec<T>` / `String` fields (and `&str` → `String`): a fixed-size
+        // descriptor offset on disk, a `BStackVec` at runtime. Handled here.
+        let vinfo = if is_str(eff_ty) {
+            Some(VecInfo {
+                elem: quote!(u8),
+                is_string: true,
+            })
+        } else {
+            vec_field(eff_ty)
+        };
+        if let Some(vinfo) = vinfo {
             if kind != Kind::Owned {
                 return Err(Error::new_spanned(
                     &field.ty,
@@ -119,9 +139,9 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
 
         // `Option<Inner>` makes a reference field nullable: `0` on disk == `None`
         // (no allocation ever lives at offset 0). The annotation applies to Inner.
-        let (inner_ty, nullable) = match option_inner(&field.ty) {
+        let (inner_ty, nullable) = match option_inner(eff_ty) {
             Some(inner) => (inner, true),
-            None => (&field.ty, false),
+            None => (eff_ty, false),
         };
         if nullable && kind == Kind::Pod {
             return Err(Error::new_spanned(
@@ -205,12 +225,18 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
     let data_eightcc = eightcc_expr(&data_tag.bytes);
     let ctrl_eightcc = eightcc_expr(&ctrl_tag.bytes);
 
+    // The warnings use the `deprecated` mechanism, so a real `#[allow(deprecated)]`
+    // on the struct also silences them (in addition to the `allow(...)` args).
+    let allow_deprecated = input.attrs.iter().any(is_allow_deprecated);
+    let allow_overlong = attr.allow_overlong || allow_deprecated;
+    let allow_coerced_ref = attr.allow_coerced_ref || allow_deprecated;
+
     // Overlong `tag =` / `ctrl_tag =` overrides warn (unless silenced) + truncate.
-    let overlong_warning = if (data_tag.truncated || ctrl_tag.truncated) && !attr.allow_long {
+    let overlong_warning = if (data_tag.truncated || ctrl_tag.truncated) && !allow_overlong {
         let warn_fn = format_ident!("__bstack_tag_overlong_{}", name);
         let msg = format!(
             "#[bstack_block] on `{type_name}`: a tag override longer than 8 bytes was truncated; \
-             add `allow_long_tag` to silence"
+             add `allow(overlong_tag)` to silence"
         );
         quote! {
             #[doc(hidden)]
@@ -219,6 +245,27 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                 #[deprecated(note = #msg)]
                 fn overlong_tag() {}
                 overlong_tag();
+            }
+        }
+    } else {
+        quote!()
+    };
+
+    // A `&T` field is coerced to owned `T` (`&str` to `String`); warn once.
+    let ref_warning = if ref_coerced && !allow_coerced_ref {
+        let warn_fn = format_ident!("__bstack_ref_coerced_{}", name);
+        let msg = format!(
+            "#[bstack_block] on `{type_name}`: a `&T` field was coerced to owned `T` \
+             (and `&str` to `String`); write the owned type directly, or add \
+             `allow(coerced_ref)` to silence"
+        );
+        quote! {
+            #[doc(hidden)]
+            #[allow(dead_code, non_snake_case)]
+            fn #warn_fn() {
+                #[deprecated(note = #msg)]
+                fn ref_coerced() {}
+                ref_coerced();
             }
         }
     } else {
@@ -412,6 +459,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         #weakable_items
         #move_impl
         #overlong_warning
+        #ref_warning
     })
 }
 
@@ -422,6 +470,11 @@ struct VecInfo {
     is_string: bool,
 }
 
+/// Whether `ty` is the `str` type.
+fn is_str(ty: &Type) -> bool {
+    matches!(ty, Type::Path(tp) if tp.path.segments.last().is_some_and(|s| s.ident == "str"))
+}
+
 /// Detect `Vec<T>` / `String` field types.
 fn vec_field(ty: &Type) -> Option<VecInfo> {
     let Type::Path(tp) = ty else {
@@ -429,14 +482,19 @@ fn vec_field(ty: &Type) -> Option<VecInfo> {
     };
     let seg = tp.path.segments.last()?;
     if seg.ident == "String" {
-        return Some(VecInfo { elem: quote!(u8), is_string: true });
+        return Some(VecInfo {
+            elem: quote!(u8),
+            is_string: true,
+        });
     }
-    if seg.ident == "Vec" {
-        if let PathArguments::AngleBracketed(ab) = &seg.arguments {
-            if let Some(GenericArgument::Type(inner)) = ab.args.first() {
-                return Some(VecInfo { elem: quote!(#inner), is_string: false });
-            }
-        }
+    if seg.ident == "Vec"
+        && let PathArguments::AngleBracketed(ab) = &seg.arguments
+        && let Some(GenericArgument::Type(inner)) = ab.args.first()
+    {
+        return Some(VecInfo {
+            elem: quote!(#inner),
+            is_string: false,
+        });
     }
     None
 }
@@ -456,7 +514,12 @@ fn vec_drop_stmt(fname: &Ident, elem: &TokenStream) -> TokenStream {
 
 /// Accessor for a `Vec<T>` / `String` field: resolve the descriptor offset to a
 /// `BStackVec` handle. Takes the allocator (the vector's ops need it).
-fn vec_accessor(vis: &syn::Visibility, fname: &Ident, elem: &TokenStream, on_disk: &Ident) -> TokenStream {
+fn vec_accessor(
+    vis: &syn::Visibility,
+    fname: &Ident,
+    elem: &TokenStream,
+    on_disk: &Ident,
+) -> TokenStream {
     quote! {
         #vis fn #fname<'__v, __A: ::bstack_raii::BStackOwnedSliceAllocator>(
             &self,
@@ -911,15 +974,20 @@ struct Attr {
     tag: Option<String>,
     /// Explicit control-block tag prefix (`ctrl_tag = "..."`).
     ctrl_tag: Option<String>,
-    /// Suppress the overlong-tag warning (`allow_long_tag`).
-    allow_long: bool,
+    /// Suppress the overlong-tag warning (`allow(overlong_tag)`).
+    allow_overlong: bool,
+    /// Suppress the reference-coercion warning (`allow(coerced_ref)`).
+    allow_coerced_ref: bool,
 }
 
-/// Parse `rc`, `weak`, `tag = "..."`, `ctrl_tag = "..."`, `allow_long_tag` in any
-/// order.
+/// Parse `rc`, `weak`, `tag = "..."`, `ctrl_tag = "..."`, and
+/// `allow(overlong_tag | coerced_ref | deprecated)` in any order.
 fn parse_attr(attr: TokenStream) -> syn::Result<Attr> {
     let (mut rc, mut weak) = (false, false);
-    let (mut tag, mut ctrl_tag, mut allow_long) = (None, None, false);
+    let mut tag = None;
+    let mut ctrl_tag = None;
+    let mut allow_overlong = false;
+    let mut allow_coerced_ref = false;
 
     if !attr.is_empty() {
         let metas = Punctuated::<Meta, Token![,]>::parse_terminated.parse2(attr)?;
@@ -928,7 +996,6 @@ fn parse_attr(attr: TokenStream) -> syn::Result<Attr> {
                 Meta::Path(p) => match ident_of(p).as_deref() {
                     Some("rc") => rc = true,
                     Some("weak") => weak = true,
-                    Some("allow_long_tag") => allow_long = true,
                     _ => return Err(Error::new_spanned(&meta, unknown_opt())),
                 },
                 Meta::NameValue(nv) => {
@@ -944,6 +1011,29 @@ fn parse_attr(attr: TokenStream) -> syn::Result<Attr> {
                         Some("tag") => tag = Some(value),
                         Some("ctrl_tag") => ctrl_tag = Some(value),
                         _ => return Err(Error::new_spanned(&meta, unknown_opt())),
+                    }
+                }
+                // `allow(overlong_tag, coerced_ref, deprecated)` — suppress warnings.
+                Meta::List(list) if list.path.is_ident("allow") => {
+                    let lints =
+                        list.parse_args_with(Punctuated::<Ident, Token![,]>::parse_terminated)?;
+                    for lint in lints {
+                        match lint.to_string().as_str() {
+                            "overlong_tag" => allow_overlong = true,
+                            "coerced_ref" => allow_coerced_ref = true,
+                            // The warnings use the `deprecated` mechanism, so
+                            // `allow(deprecated)` covers all of them.
+                            "deprecated" => {
+                                allow_overlong = true;
+                                allow_coerced_ref = true;
+                            }
+                            _ => {
+                                return Err(Error::new_spanned(
+                                    &lint,
+                                    "expected `overlong_tag`, `coerced_ref`, or `deprecated`",
+                                ));
+                            }
+                        }
                     }
                 }
                 _ => return Err(Error::new_spanned(&meta, unknown_opt())),
@@ -966,7 +1056,8 @@ fn parse_attr(attr: TokenStream) -> syn::Result<Attr> {
         mode,
         tag,
         ctrl_tag,
-        allow_long,
+        allow_overlong,
+        allow_coerced_ref,
     })
 }
 
@@ -974,8 +1065,16 @@ fn ident_of(path: &syn::Path) -> Option<String> {
     path.get_ident().map(|i| i.to_string())
 }
 
+/// Whether a struct attribute is `#[allow(.., deprecated, ..)]`.
+fn is_allow_deprecated(attr: &syn::Attribute) -> bool {
+    attr.path().is_ident("allow")
+        && attr
+            .parse_args_with(Punctuated::<Ident, Token![,]>::parse_terminated)
+            .is_ok_and(|lints| lints.iter().any(|l| l == "deprecated"))
+}
+
 fn unknown_opt() -> &'static str {
-    "expected `rc`, `weak`, `tag = \"...\"`, `ctrl_tag = \"...\"`, or `allow_long_tag`"
+    "expected `rc`, `weak`, `tag = \"...\"`, `ctrl_tag = \"...\"`, or `allow(...)`"
 }
 
 // ---------------------------------------------------------------------------
