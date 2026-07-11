@@ -31,6 +31,7 @@ mod cast;
 ///   (`#[repr(C, packed)]`, `Pod`) — the on-disk payload. `#[bstack_owned]` /
 ///   `#[bstack_strong]` / `#[bstack_weak]` / `#[bstack_ref]` fields lower to a
 ///   `u64` offset; un-annotated fields are stored inline (and must be `Pod`).
+///   Wrapping a reference field in `Option<T>` makes it nullable (`0 == None`).
 ///   `(rc)` injects an inline `refcount`; `(rc, weak)` injects a `ctrl`
 ///   back-pointer and emits an `XOnDiskRef` control block.
 /// * `impl BStackCast / BStackBlock / BStackDrop`, plus `BStackShared`

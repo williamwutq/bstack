@@ -14,7 +14,10 @@ use proc_macro2::{Span, TokenStream};
 use quote::{format_ident, quote};
 use syn::parse::Parser;
 use syn::punctuated::Punctuated;
-use syn::{Error, Expr, ExprLit, Fields, Ident, ItemStruct, Lit, Meta, Token, Type};
+use syn::{
+    Error, Expr, ExprLit, Fields, GenericArgument, Ident, ItemStruct, Lit, Meta, PathArguments,
+    Token, Type,
+};
 
 /// The block mode from the attribute arguments.
 #[derive(Clone, Copy, PartialEq)]
@@ -87,65 +90,58 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
 
     for field in fields {
         let fname = field.ident.as_ref().expect("named field");
-        let fty = &field.ty;
         let kind = classify(field)?;
+        // `Option<Inner>` makes a reference field nullable: `0` on disk == `None`
+        // (no allocation ever lives at offset 0). The annotation applies to Inner.
+        let (inner_ty, nullable) = match option_inner(&field.ty) {
+            Some(inner) => (inner, true),
+            None => (&field.ty, false),
+        };
+        if nullable && kind == Kind::Pod {
+            return Err(Error::new_spanned(
+                &field.ty,
+                "Option is only supported on #[bstack_owned] / #[bstack_strong] / \
+                 #[bstack_weak] / #[bstack_ref] fields",
+            ));
+        }
 
-        // On-disk lowering + teardown.
+        // On-disk lowering.
         match kind {
             Kind::Pod => {
-                on_disk_fields.push(quote!(#fname: #fty,));
-                pod_types.push(fty);
+                on_disk_fields.push(quote!(#fname: #inner_ty,));
+                pod_types.push(inner_ty);
             }
             _ => on_disk_fields.push(quote!(#fname: u64,)),
         }
+
+        // Teardown.
         match kind {
             Kind::Owned => drop_stmts.push(child_range_stmt(
                 fname,
-                fty,
-                quote! {
-                    ::bstack_raii::OwnedRef(__child).bstack_drop(allocator)?;
-                },
+                inner_ty,
+                nullable,
+                quote!(::bstack_raii::OwnedRef(__child).bstack_drop(allocator)?;),
             )),
             Kind::Strong => drop_stmts.push(child_range_stmt(
                 fname,
-                fty,
-                quote! {
-                    <#fty as ::bstack_raii::BStackShared>::drop_strong_ref(__child, allocator)?;
-                },
+                inner_ty,
+                nullable,
+                quote!(<#inner_ty as ::bstack_raii::BStackShared>::drop_strong_ref(__child, allocator)?;),
             )),
-            // Weak fields store the child's *control-block* offset (sound even if
-            // the target's data is already freed), and may be null (0 = unset).
-            Kind::Weak => drop_stmts.push(quote! {
-                {
-                    let __off = __on_disk.#fname;
-                    if __off != 0 {
-                        let __ctrl = unsafe {
-                            ::bstack_raii::BStackRef::<
-                                <#fty as ::bstack_raii::BStackWeakable>::Control
-                            >::from_range(::bstack_raii::BStackRange::new(
-                                __off,
-                                ::core::mem::size_of::<
-                                    <#fty as ::bstack_raii::BStackWeakable>::Control
-                                >() as u64,
-                            ))
-                        };
-                        ::bstack_raii::WeakRef::<#fty>(__ctrl).bstack_drop(allocator)?;
-                    }
-                }
-            }),
+            Kind::Weak => drop_stmts.push(weak_drop_stmt(fname, inner_ty)),
             Kind::Ref | Kind::Pod => {}
         }
 
         // Accessor.
-        accessors.push(accessor(vis, fname, fty, &on_disk, kind));
+        accessors.push(accessor(vis, fname, inner_ty, &on_disk, kind, nullable));
 
-        // Constructor pieces. Weak fields are not constructor parameters — they
-        // start null and are wired afterwards via the generated `set_<field>`.
+        // Constructor. Weak fields are not parameters — they start null and are
+        // wired afterwards via the generated `set_<field>`.
         if kind == Kind::Weak {
             ctor_inits.push(quote!(#fname: 0u64,));
-            setters.push(weak_setter(vis, fname, fty, &on_disk));
+            setters.push(weak_setter(vis, fname, inner_ty, &on_disk));
         } else {
-            let (param, prep, init) = ctor_field(fname, fty, kind);
+            let (param, prep, init) = ctor_field(fname, inner_ty, kind, nullable);
             ctor_params.push(param);
             ctor_preps.push(prep);
             ctor_inits.push(init);
@@ -155,93 +151,9 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         // then reconstruct the transferred handle after.
         let cap = format_ident!("__cap_{}", fname);
         mv_caps.push(quote!(let #cap = __od.#fname;));
-        match kind {
-            Kind::Owned => {
-                mv_types.push(quote!(::bstack_raii::BStackOwned<'__mv, #fty, __A>));
-                mv_recon.push(quote! {
-                    unsafe {
-                        ::bstack_raii::BStackOwned::from_raw(
-                            <#fty as ::bstack_raii::BStackBlock>::from_range(
-                                ::bstack_raii::BStackRange::new(
-                                    #cap,
-                                    ::core::mem::size_of::<
-                                        <#fty as ::bstack_raii::BStackBlock>::OnDisk
-                                    >() as u64,
-                                ),
-                            ),
-                            __alloc,
-                        )
-                    }
-                });
-            }
-            Kind::Ref => {
-                mv_types.push(quote!(::bstack_raii::BStackRef<#fty>));
-                mv_recon.push(quote! {
-                    unsafe {
-                        ::bstack_raii::BStackRef::<#fty>::from_range(
-                            ::bstack_raii::BStackRange::new(
-                                #cap,
-                                ::core::mem::size_of::<
-                                    <#fty as ::bstack_raii::BStackBlock>::OnDisk
-                                >() as u64,
-                            ),
-                        )
-                    }
-                });
-            }
-            Kind::Pod => {
-                mv_types.push(quote!(#fty));
-                mv_recon.push(quote!(#cap));
-            }
-            Kind::Strong => {
-                // Rebuild a BStackRc, dispatching through BStackShared so the
-                // child's kind (rc vs rc,weak) picks up the control block if any.
-                mv_types.push(quote!(::bstack_raii::BStackRc<'__mv, #fty, __A>));
-                mv_recon.push(quote! {
-                    {
-                        let __data = unsafe {
-                            ::bstack_raii::BStackRef::<#fty>::from_range(
-                                ::bstack_raii::BStackRange::new(
-                                    #cap,
-                                    ::core::mem::size_of::<
-                                        <#fty as ::bstack_raii::BStackBlock>::OnDisk
-                                    >() as u64,
-                                ),
-                            )
-                        };
-                        let (__d, __c) =
-                            <#fty as ::bstack_raii::BStackShared>::strong_parts(__data, __alloc)?;
-                        unsafe { ::bstack_raii::BStackRc::from_raw(__d, __c, __alloc) }
-                    }
-                });
-            }
-            Kind::Weak => {
-                // The field holds the child's control offset directly; rebuild a
-                // BStackWeak, or None if the field was never set (0).
-                mv_types.push(quote! {
-                    ::core::option::Option<::bstack_raii::BStackWeak<'__mv, #fty, __A>>
-                });
-                mv_recon.push(quote! {
-                    if #cap == 0 {
-                        ::core::option::Option::None
-                    } else {
-                        let __ctrl = unsafe {
-                            ::bstack_raii::BStackRef::<
-                                <#fty as ::bstack_raii::BStackWeakable>::Control
-                            >::from_range(::bstack_raii::BStackRange::new(
-                                #cap,
-                                ::core::mem::size_of::<
-                                    <#fty as ::bstack_raii::BStackWeakable>::Control
-                                >() as u64,
-                            ))
-                        };
-                        ::core::option::Option::Some(
-                            unsafe { ::bstack_raii::BStackWeak::from_raw(__ctrl, __alloc) }
-                        )
-                    }
-                });
-            }
-        }
+        let (mv_ty, mv_rc) = move_field(&cap, inner_ty, kind, nullable);
+        mv_types.push(mv_ty);
+        mv_recon.push(mv_rc);
     }
 
     // EightCC tags: readable prefix over a hash of `crate ++ type_name`. The
@@ -477,13 +389,33 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
     })
 }
 
-/// Generate the reader method for one field.
+/// Return `Some(Inner)` if `ty` is `Option<Inner>`.
+fn option_inner(ty: &Type) -> Option<&Type> {
+    let Type::Path(tp) = ty else {
+        return None;
+    };
+    let seg = tp.path.segments.last()?;
+    if seg.ident != "Option" {
+        return None;
+    }
+    let PathArguments::AngleBracketed(ab) = &seg.arguments else {
+        return None;
+    };
+    match ab.args.first()? {
+        GenericArgument::Type(inner) => Some(inner),
+        _ => None,
+    }
+}
+
+/// Generate the reader method for one field. `nullable` (an `Option<_>` field)
+/// makes ref accessors return `Option<Handle>`, treating a `0` offset as `None`.
 fn accessor(
     vis: &syn::Visibility,
     fname: &Ident,
-    fty: &Type,
+    inner_ty: &Type,
     on_disk: &Ident,
     kind: Kind,
+    nullable: bool,
 ) -> TokenStream {
     // Weak fields hold a control offset; the accessor attempts a live upgrade.
     if kind == Kind::Weak {
@@ -492,7 +424,7 @@ fn accessor(
                 &self,
                 allocator: &'__u __A,
             ) -> ::std::io::Result<
-                ::core::option::Option<::bstack_raii::BStackRc<'__u, #fty, __A>>
+                ::core::option::Option<::bstack_raii::BStackRc<'__u, #inner_ty, __A>>
             > {
                 let __field = self.0.start() + ::core::mem::offset_of!(#on_disk, #fname) as u64;
                 ::bstack_raii::upgrade_weak_field(allocator, __field)
@@ -505,58 +437,195 @@ fn accessor(
         let __od: #on_disk = *__r.read_on_disk(stack, &mut __buf)?;
     };
     if kind == Kind::Pod {
-        quote! {
-            #vis fn #fname(&self, stack: &::bstack_raii::BStack) -> ::std::io::Result<#fty> {
+        return quote! {
+            #vis fn #fname(&self, stack: &::bstack_raii::BStack) -> ::std::io::Result<#inner_ty> {
                 #read
                 ::std::result::Result::Ok(__od.#fname)
             }
+        };
+    }
+    // Owned/strong/ref field: resolve the stored data offset to the handle.
+    let resolve = quote! {
+        <#inner_ty as ::bstack_raii::BStackBlock>::from_range(::bstack_raii::BStackRange::new(
+            __od.#fname,
+            ::core::mem::size_of::<<#inner_ty as ::bstack_raii::BStackBlock>::OnDisk>() as u64,
+        ))
+    };
+    if nullable {
+        quote! {
+            #vis fn #fname(
+                &self,
+                stack: &::bstack_raii::BStack,
+            ) -> ::std::io::Result<::core::option::Option<#inner_ty>> {
+                #read
+                if __od.#fname == 0 {
+                    ::std::result::Result::Ok(::core::option::Option::None)
+                } else {
+                    ::std::result::Result::Ok(::core::option::Option::Some(#resolve))
+                }
+            }
         }
     } else {
-        // Owned/strong/ref field: resolve the stored data offset to the handle.
         quote! {
-            #vis fn #fname(&self, stack: &::bstack_raii::BStack) -> ::std::io::Result<#fty> {
+            #vis fn #fname(&self, stack: &::bstack_raii::BStack) -> ::std::io::Result<#inner_ty> {
                 #read
-                let __range = ::bstack_raii::BStackRange::new(
-                    __od.#fname,
-                    ::core::mem::size_of::<<#fty as ::bstack_raii::BStackBlock>::OnDisk>() as u64,
-                );
-                ::std::result::Result::Ok(<#fty as ::bstack_raii::BStackBlock>::from_range(__range))
+                ::std::result::Result::Ok(#resolve)
             }
         }
     }
 }
 
 /// Generate `(param, prep, init)` for one constructor field. Not called for
-/// `#[bstack_weak]` fields.
-fn ctor_field(fname: &Ident, fty: &Type, kind: Kind) -> (TokenStream, TokenStream, TokenStream) {
-    match kind {
-        Kind::Pod => (quote!(#fname: #fty,), quote!(), quote!(#fname: #fname,)),
+/// `#[bstack_weak]` fields. `nullable` fields take an `Option<Handle>` (None => 0).
+fn ctor_field(
+    fname: &Ident,
+    inner_ty: &Type,
+    kind: Kind,
+    nullable: bool,
+) -> (TokenStream, TokenStream, TokenStream) {
+    // The prep body that turns a consumed handle into its `u64` offset.
+    let (handle_ty, to_offset): (TokenStream, TokenStream) = match kind {
+        Kind::Pod => return (quote!(#fname: #inner_ty,), quote!(), quote!(#fname: #fname,)),
         Kind::Owned => (
-            quote!(#fname: ::bstack_raii::BStackOwned<'__ctor, #fty, __A>,),
-            quote! {
-                let #fname: u64 = {
-                    let (__h, _) = #fname.into_raw_parts();
-                    ::bstack_raii::BStackBlock::range(&__h).start()
-                };
-            },
-            quote!(#fname: #fname,),
+            quote!(::bstack_raii::BStackOwned<'__ctor, #inner_ty, __A>),
+            quote!({
+                let (__h, _) = __handle.into_raw_parts();
+                ::bstack_raii::BStackBlock::range(&__h).start()
+            }),
         ),
         Kind::Strong => (
-            quote!(#fname: ::bstack_raii::BStackRc<'__ctor, #fty, __A>,),
+            quote!(::bstack_raii::BStackRc<'__ctor, #inner_ty, __A>),
+            quote!({
+                let (__d, _) = __handle.into_raw();
+                __d.into_range().start()
+            }),
+        ),
+        Kind::Ref => (
+            quote!(::bstack_raii::BStackRef<#inner_ty>),
+            quote!(__handle.into_range().start()),
+        ),
+        Kind::Weak => unreachable!("weak fields are wired via set_<field>, not the constructor"),
+    };
+    if nullable {
+        (
+            quote!(#fname: ::core::option::Option<#handle_ty>,),
             quote! {
-                let #fname: u64 = {
-                    let (__d, _) = #fname.into_raw();
-                    __d.into_range().start()
+                let #fname: u64 = match #fname {
+                    ::core::option::Option::Some(__handle) => #to_offset,
+                    ::core::option::Option::None => 0u64,
                 };
             },
             quote!(#fname: #fname,),
+        )
+    } else {
+        (
+            quote!(#fname: #handle_ty,),
+            quote! { let #fname: u64 = { let __handle = #fname; #to_offset }; },
+            quote!(#fname: #fname,),
+        )
+    }
+}
+
+/// Build one `bstack_move!` field: its type in the result tuple and the
+/// expression that reconstructs it from the captured offset `cap`.
+fn move_field(cap: &Ident, inner_ty: &Type, kind: Kind, nullable: bool) -> (TokenStream, TokenStream) {
+    let size_od =
+        quote!(::core::mem::size_of::<<#inner_ty as ::bstack_raii::BStackBlock>::OnDisk>() as u64);
+    match kind {
+        Kind::Pod => (quote!(#inner_ty), quote!(#cap)),
+        // Weak is inherently nullable and stores the control offset.
+        Kind::Weak => {
+            let ty = quote! {
+                ::core::option::Option<::bstack_raii::BStackWeak<'__mv, #inner_ty, __A>>
+            };
+            let recon = quote! {
+                if #cap == 0 {
+                    ::core::option::Option::None
+                } else {
+                    let __ctrl = unsafe {
+                        ::bstack_raii::BStackRef::<
+                            <#inner_ty as ::bstack_raii::BStackWeakable>::Control
+                        >::from_range(::bstack_raii::BStackRange::new(
+                            #cap,
+                            ::core::mem::size_of::<
+                                <#inner_ty as ::bstack_raii::BStackWeakable>::Control
+                            >() as u64,
+                        ))
+                    };
+                    ::core::option::Option::Some(
+                        unsafe { ::bstack_raii::BStackWeak::from_raw(__ctrl, __alloc) }
+                    )
+                }
+            };
+            (ty, recon)
+        }
+        Kind::Owned => wrap_move(
+            quote!(::bstack_raii::BStackOwned<'__mv, #inner_ty, __A>),
+            quote! {
+                unsafe {
+                    ::bstack_raii::BStackOwned::from_raw(
+                        <#inner_ty as ::bstack_raii::BStackBlock>::from_range(
+                            ::bstack_raii::BStackRange::new(#cap, #size_od),
+                        ),
+                        __alloc,
+                    )
+                }
+            },
+            cap,
+            nullable,
         ),
-        Kind::Ref => (
-            quote!(#fname: ::bstack_raii::BStackRef<#fty>,),
-            quote!(),
-            quote!(#fname: #fname.into_range().start(),),
+        Kind::Ref => wrap_move(
+            quote!(::bstack_raii::BStackRef<#inner_ty>),
+            quote! {
+                unsafe {
+                    ::bstack_raii::BStackRef::<#inner_ty>::from_range(
+                        ::bstack_raii::BStackRange::new(#cap, #size_od),
+                    )
+                }
+            },
+            cap,
+            nullable,
         ),
-        Kind::Weak => unreachable!("weak fields are wired via set_<field>, not the constructor"),
+        Kind::Strong => wrap_move(
+            quote!(::bstack_raii::BStackRc<'__mv, #inner_ty, __A>),
+            quote! {
+                {
+                    let __data = unsafe {
+                        ::bstack_raii::BStackRef::<#inner_ty>::from_range(
+                            ::bstack_raii::BStackRange::new(#cap, #size_od),
+                        )
+                    };
+                    let (__d, __c) =
+                        <#inner_ty as ::bstack_raii::BStackShared>::strong_parts(__data, __alloc)?;
+                    unsafe { ::bstack_raii::BStackRc::from_raw(__d, __c, __alloc) }
+                }
+            },
+            cap,
+            nullable,
+        ),
+    }
+}
+
+/// Wrap a move field's type/expr in `Option` when the field is nullable.
+fn wrap_move(
+    ty: TokenStream,
+    build: TokenStream,
+    cap: &Ident,
+    nullable: bool,
+) -> (TokenStream, TokenStream) {
+    if nullable {
+        (
+            quote!(::core::option::Option<#ty>),
+            quote! {
+                if #cap == 0 {
+                    ::core::option::Option::None
+                } else {
+                    ::core::option::Option::Some(#build)
+                }
+            },
+        )
+    } else {
+        (ty, build)
     }
 }
 
@@ -665,18 +734,44 @@ fn constructor(
     }
 }
 
-/// Build a teardown statement that resolves a child field's `u64` offset into a
-/// typed `BStackRef<#fty>` bound to `__child`, then runs `body`.
-fn child_range_stmt(fname: &Ident, fty: &Type, body: TokenStream) -> TokenStream {
+/// Build an owned/strong teardown statement: resolve the child field's `u64`
+/// offset into a typed `BStackRef<#inner_ty>` bound to `__child`, then run
+/// `body`. A `nullable` field guards on a non-zero offset.
+fn child_range_stmt(fname: &Ident, inner_ty: &Type, nullable: bool, body: TokenStream) -> TokenStream {
+    let core = quote! {
+        let __range = ::bstack_raii::BStackRange::new(
+            __off,
+            ::core::mem::size_of::<<#inner_ty as ::bstack_raii::BStackBlock>::OnDisk>() as u64,
+        );
+        let __child = unsafe { ::bstack_raii::BStackRef::<#inner_ty>::from_range(__range) };
+        #body
+    };
+    if nullable {
+        quote! { { let __off = __on_disk.#fname; if __off != 0 { #core } } }
+    } else {
+        quote! { { let __off = __on_disk.#fname; #core } }
+    }
+}
+
+/// Teardown statement for a `#[bstack_weak]` field, which stores the child's
+/// control-block offset (`0` = unset).
+fn weak_drop_stmt(fname: &Ident, inner_ty: &Type) -> TokenStream {
     quote! {
         {
             let __off = __on_disk.#fname;
-            let __range = ::bstack_raii::BStackRange::new(
-                __off,
-                ::core::mem::size_of::<<#fty as ::bstack_raii::BStackBlock>::OnDisk>() as u64,
-            );
-            let __child = unsafe { ::bstack_raii::BStackRef::<#fty>::from_range(__range) };
-            #body
+            if __off != 0 {
+                let __ctrl = unsafe {
+                    ::bstack_raii::BStackRef::<
+                        <#inner_ty as ::bstack_raii::BStackWeakable>::Control
+                    >::from_range(::bstack_raii::BStackRange::new(
+                        __off,
+                        ::core::mem::size_of::<
+                            <#inner_ty as ::bstack_raii::BStackWeakable>::Control
+                        >() as u64,
+                    ))
+                };
+                ::bstack_raii::WeakRef::<#inner_ty>(__ctrl).bstack_drop(allocator)?;
+            }
         }
     }
 }

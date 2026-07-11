@@ -103,6 +103,14 @@ Every non-POD field carries an ownership annotation that decides how it is torn
 down. Plain-old-data fields (anything `Pod` — integers, `[u8; N]`, etc.) are
 stored inline and copied by value.
 
+> **Requires a real allocator.** This layer needs a `bstack` allocator that
+> actually frees (`dealloc`) and reserves offset 0 for its own metadata — e.g.
+> `FirstFitBStackAllocator`, `SlabBStackAllocator`, `GhostTreeBstackAllocator`.
+> **Do not use `LinearBStackAllocator`**: it's a bump allocator whose `dealloc`
+> is a no-op (so teardown frees nothing), and it can hand out offset 0 (which
+> would break the `Option<T>` niche). RAII over a non-freeing allocator doesn't
+> make sense anyway.
+
 ## Defining blocks
 
 ```rust
@@ -142,6 +150,24 @@ For each block the macro generates:
 Ownership rules are enforced at compile time: a `#[bstack_weak]` field whose
 target isn't `(rc, weak)`, or a non-`Pod` field with no annotation, is a
 compile error.
+
+### Nullable references: `Option<T>`
+
+Wrap a reference field in `Option` to make it nullable — on disk it's still a
+single `u64`, with `0 == None` (no allocation ever lives at offset 0, so it's a
+free niche, no tag byte):
+
+```rust
+#[bstack_block]
+struct Node {
+    #[bstack_owned] left: Option<Child>,   // may be absent
+    #[bstack_strong] shared: Option<Thing>,
+}
+```
+
+The accessor then returns `io::Result<Option<Handle>>`, the constructor takes
+`Option<BStackOwned<Child>>` / `Option<BStackRc<Thing>>`, and `bstack_move!`
+yields `Option<…>`. (`#[bstack_weak]` fields are already nullable by nature.)
 
 ## Handles
 
@@ -311,10 +337,10 @@ no spin loop). All operations are durable and speak `std::io::Result`.
 - **Fixed-size blocks.** A block's on-disk size equals its `OnDisk` struct size;
   there are no variable-length arrays or inline slices. Model collections as
   linked blocks.
-- **No nullable owned/strong fields.** `#[bstack_owned]` / `#[bstack_strong]`
-  fields must always be present (they're required constructor parameters). Only
-  `#[bstack_weak]` fields may be null/unset.
+- **Requires a freeing allocator** that reserves offset 0 — not
+  `LinearBStackAllocator` (see [Concepts](#concepts)).
 - **No generic block types**, and non-`Pod` fields must carry an annotation.
+- No enums or variable-length fields yet (planned).
 - The on-disk **ABI is not yet stable**.
 
 ## License

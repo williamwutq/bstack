@@ -870,3 +870,54 @@ fn macro_bstack_move_rc_weak() {
     drop(moved_leaf); // frees the moved-out child
     drop(weak); // frees the now-unreferenced control block
 }
+
+// --------------------------------------------------------------------------
+// Option<Thing> — nullable reference fields (0 == None)
+// --------------------------------------------------------------------------
+
+#[bstack_block]
+struct OptHolder {
+    #[bstack_owned]
+    child: Option<MacroLeaf>,
+    n: u32,
+}
+
+#[test]
+fn macro_option_owned() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    // Some: constructor takes Option<BStackOwned<_>>, accessor returns Option.
+    let leaf = MacroLeaf::new(&alloc, 42).unwrap();
+    let leaf_off = leaf.handle().range().start();
+    let holder = OptHolder::new(&alloc, Some(leaf), 7).unwrap();
+    assert_eq!(holder.handle().n(stack).unwrap(), 7);
+    let got = holder.handle().child(stack).unwrap();
+    assert_eq!(got.unwrap().val(stack).unwrap(), 42);
+
+    // bstack_move! yields Option<BStackOwned<_>>.
+    let (moved_child, n) = bstack_move!(holder).unwrap();
+    assert_eq!(n, 7);
+    assert_eq!(
+        moved_child.as_ref().unwrap().handle().val(stack).unwrap(),
+        42
+    );
+    drop(moved_child); // frees the leaf
+
+    // The leaf + holder shell are both freed; the lowest slot (leaf's) returns.
+    let reused = alloc_block(
+        &alloc,
+        MacroLeaf::eightcc(),
+        size_of::<<MacroLeaf as BStackBlock>::OnDisk>() as u64,
+    )
+    .unwrap();
+    assert_eq!(reused.start(), leaf_off);
+    unsafe { dealloc_range(&alloc, reused).unwrap() };
+
+    // None: no child, accessor is None, teardown skips the null field cleanly.
+    let empty = OptHolder::new(&alloc, None, 9).unwrap();
+    assert_eq!(empty.handle().n(stack).unwrap(), 9);
+    assert!(empty.handle().child(stack).unwrap().is_none());
+    drop(empty);
+}
