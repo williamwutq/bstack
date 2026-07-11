@@ -14,6 +14,7 @@
 use proc_macro::TokenStream;
 
 mod block;
+mod cast;
 
 /// `#[bstack_block]` — generate the on-disk layout and typed handle machinery.
 ///
@@ -78,16 +79,19 @@ pub fn bstack_move(input: TokenStream) -> TokenStream {
     quote::quote!(::bstack_raii::BStackMove::bstack_move(#expr)).into()
 }
 
-/// `bstack_cast!(handle)` — type-checked handle conversion, direction inferred
-/// from the target type.
+/// `bstack_cast!(expr as Target)` — type-checked handle conversion. The target
+/// is given explicitly (a function-like macro can't read a `let` annotation) and
+/// selects the direction:
 ///
-/// Emits `.cast_into::<X>()` / `.into_slice()` (owned) or `.cast_as::<X>()` /
-/// `.as_slice()` (borrowed) depending on whether the target is a concrete
-/// `#[bstack_block]` type (downcast) or a `BStackOwnedSlice` / `BStackSlice`
-/// (upcast). See RAII.md "`bstack_cast!`".
+/// * `owned as BStackOwnedSlice` — owned upcast (infallible).
+/// * `slice as BStackOwned<X, _>` — owned downcast → `io::Result<Result<BStackOwned<X>, _>>`.
+/// * `slice as X` — borrowed downcast off a `BStackSlice` → `io::Result<Option<X>>`.
+///
+/// The borrowed upcast is the generated `handle.as_slice(stack)` method.
 #[proc_macro]
-pub fn bstack_cast(_input: TokenStream) -> TokenStream {
-    "::core::todo!(\"bstack_cast! not yet implemented\")"
-        .parse()
-        .unwrap()
+pub fn bstack_cast(input: TokenStream) -> TokenStream {
+    match cast::expand(input.into()) {
+        Ok(ts) => ts.into(),
+        Err(e) => e.to_compile_error().into(),
+    }
 }

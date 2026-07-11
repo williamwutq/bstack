@@ -452,6 +452,20 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         impl #name {
             #(#accessors)*
             #(#setters)*
+
+            /// Borrow this block as an untyped slice (infallible upcast).
+            #vis fn as_slice<'__s>(
+                &self,
+                stack: &'__s ::bstack_raii::BStack,
+            ) -> ::bstack_raii::BStackSlice<'__s> {
+                unsafe {
+                    ::bstack_raii::BStackSlice::from_raw_range(
+                        stack,
+                        ::bstack_raii::BStackBlock::range(self),
+                    )
+                }
+            }
+
             #constructor
         }
 

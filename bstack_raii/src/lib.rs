@@ -49,6 +49,7 @@
 extern crate self as bstack_raii;
 
 mod block;
+mod cast;
 mod clone;
 mod construct;
 mod handle;
@@ -63,6 +64,7 @@ mod teardown;
 mod tests;
 
 pub use block::{BStackBlock, BStackCast, BStackMove, BStackShared, BStackWeakable};
+pub use cast::{BStackCastAs, BStackCastInto};
 pub use clone::TryClone;
 pub use construct::{alloc_block, alloc_control, init_rc, set_weak_field, upgrade_weak_field};
 pub use handle::{OwnedRef, StrongRef, StrongWeakRef, WeakRef};
@@ -75,7 +77,7 @@ pub use teardown::{BStackDrop, dealloc_range};
 // Re-exports for use by `#[bstack_block]`-generated code (and callers), so that
 // generated code can name everything through `::bstack_raii::…` and downstream
 // crates need not depend on `bstack` or `bytemuck` directly.
-pub use bstack::{BStack, BStackAllocator, BStackOwnedSliceAllocator, BStackRange};
+pub use bstack::{BStack, BStackAllocator, BStackOwnedSliceAllocator, BStackRange, BStackSlice};
 pub use bytemuck::{Pod, Zeroable};
 // Re-exported whole so generated code can call `::bstack_raii::bytemuck::bytes_of`.
 pub use bytemuck;

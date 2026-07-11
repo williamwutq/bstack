@@ -14,9 +14,9 @@ use bstack::{
 
 use crate::layout::{self, BlockHeader};
 use crate::{
-    BStackBlock, BStackCast, BStackDrop, BStackOwned, BStackRc, BStackRef, BStackShared,
-    BStackWeakable, EightCC, TryClone, alloc_block, alloc_control, bstack_block, bstack_move,
-    dealloc_range,
+    BStackBlock, BStackCast, BStackCastAs, BStackCastInto, BStackDrop, BStackOwned, BStackRc,
+    BStackRef, BStackShared, BStackWeakable, EightCC, TryClone, alloc_block, alloc_control,
+    bstack_block, bstack_cast, bstack_move, dealloc_range,
 };
 
 // --------------------------------------------------------------------------
@@ -751,4 +751,46 @@ fn macro_control_tag_is_lowercased() {
     assert_eq!(ctrl_tag[2..], data_tag[2..]);
 
     drop(rc);
+}
+
+// --------------------------------------------------------------------------
+// bstack_cast! + cast methods — typed <-> untyped conversion
+// --------------------------------------------------------------------------
+
+#[test]
+fn macro_cast() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let leaf = MacroLeaf::new(&alloc, 9).unwrap();
+
+    // Borrowed: upcast via the generated `as_slice`, downcast via method + macro.
+    let sl = leaf.handle().as_slice(stack);
+    assert_eq!(
+        sl.cast_as::<MacroLeaf>()
+            .unwrap()
+            .unwrap()
+            .val(stack)
+            .unwrap(),
+        9
+    );
+    assert!(sl.cast_as::<MacroParent>().unwrap().is_none()); // wrong tag
+    assert!(bstack_cast!(sl as MacroLeaf).unwrap().is_some());
+    assert!(bstack_cast!(sl as MacroParent).unwrap().is_none());
+
+    // Owned upcast (macro), then a wrong-type downcast hands the slice back.
+    let slice = bstack_cast!(leaf as BStackOwnedSlice);
+    let slice = match slice.cast_into::<MacroParent>().unwrap() {
+        Ok(_) => panic!("tag should not match"),
+        Err(s) => s,
+    };
+
+    // Correct owned downcast (macro) round-trips to the typed handle.
+    let owned = bstack_cast!(slice as BStackOwned<MacroLeaf, _>)
+        .unwrap()
+        .ok()
+        .unwrap();
+    assert_eq!(owned.handle().val(stack).unwrap(), 9);
+    drop(owned); // frees the leaf
 }
