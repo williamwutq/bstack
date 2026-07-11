@@ -372,14 +372,17 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
     // their fields may be any kind, including strong/weak.
     let move_impl = if mode == Mode::Plain {
         quote! {
-            impl<'__mv, __A: ::bstack_raii::BStackOwnedSliceAllocator>
-                ::bstack_raii::BStackMove for ::bstack_raii::BStackOwned<'__mv, #name, __A>
-            {
-                type Fields = ( #(#mv_types,)* );
-                fn bstack_move(self) -> ::std::io::Result<Self::Fields> {
+            // Implemented on the block type (local downstream) so the orphan rule
+            // is satisfied; `bstack_move!` selects it from the argument's type.
+            impl ::bstack_raii::BStackMove for #name {
+                type Fields<'__mv, __A: ::bstack_raii::BStackOwnedSliceAllocator> =
+                    ( #(#mv_types,)* );
+                fn bstack_move<'__mv, __A: ::bstack_raii::BStackOwnedSliceAllocator>(
+                    owned: ::bstack_raii::BStackOwned<'__mv, Self, __A>,
+                ) -> ::std::io::Result<Self::Fields<'__mv, __A>> {
                     // Take the inner handle out (defusing the owned Drop) and read
                     // the payload before freeing anything.
-                    let (__inner, __alloc) = self.into_raw_parts();
+                    let (__inner, __alloc) = owned.into_raw_parts();
                     let __stack = __alloc.stack();
                     let __range = ::bstack_raii::BStackBlock::range(&__inner);
                     let mut __buf = [0u8; ::core::mem::size_of::<#on_disk>()];

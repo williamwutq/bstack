@@ -10,6 +10,7 @@ use bstack::{BStackOwnedSliceAllocator, BStackRange};
 use bytemuck::Pod;
 
 use crate::layout::EightCC;
+use crate::owned::BStackOwned;
 use crate::reference::BStackRef;
 use crate::teardown::BStackDrop;
 
@@ -37,16 +38,21 @@ pub trait BStackBlock: BStackCast + BStackDrop + Sized {
 
 /// Destructure an owned block into its typed field handles.
 ///
-/// Implemented for `BStackOwned<X, A>` by `#[bstack_block]` (plain blocks only)
-/// and invoked by the `bstack_move!` macro. It transfers ownership of every
-/// field out — owned children as `BStackOwned`, refs as `BStackRef`, POD by
-/// value — and frees only the parent shell. Not implemented for `(rc)` /
-/// `(rc, weak)` blocks, nor (yet) for blocks with `#[bstack_strong]` /
-/// `#[bstack_weak]` fields.
-pub trait BStackMove: Sized {
+/// Implemented on the block type `X` by `#[bstack_block]` (plain blocks only)
+/// and invoked by the `bstack_move!` macro, which selects the impl from the
+/// argument's `BStackOwned<X, A>` type. It transfers ownership of every field
+/// out — owned children as `BStackOwned`, strong as `BStackRc`, weak as
+/// `Option<BStackWeak>`, refs as `BStackRef`, POD by value — and frees only the
+/// parent shell. Not implemented for `(rc)` / `(rc, weak)` blocks.
+///
+/// The impl lives on `X` (a local type in the caller's crate) rather than on
+/// `BStackOwned<X, A>` so it satisfies the orphan rule downstream.
+pub trait BStackMove: BStackBlock {
     /// The tuple of field handles produced, in field-declaration order.
-    type Fields;
-    fn bstack_move(self) -> io::Result<Self::Fields>;
+    type Fields<'a, A: BStackOwnedSliceAllocator>;
+    fn bstack_move<'a, A: BStackOwnedSliceAllocator>(
+        owned: BStackOwned<'a, Self, A>,
+    ) -> io::Result<Self::Fields<'a, A>>;
 }
 
 /// Implemented by refcounted blocks (`#[bstack_block(rc)]` and
