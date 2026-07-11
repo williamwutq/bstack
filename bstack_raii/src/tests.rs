@@ -921,3 +921,47 @@ fn macro_option_owned() {
     assert!(empty.handle().child(stack).unwrap().is_none());
     drop(empty);
 }
+
+// --------------------------------------------------------------------------
+// BStackVec — persistent growable POD vector via the descriptor indirection
+// --------------------------------------------------------------------------
+
+#[test]
+fn bstack_vec_grow_and_free() {
+    use crate::BStackVec;
+
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+
+    // Build from a slice, read it back.
+    let mut v = BStackVec::<u8, _>::from_slice(&alloc, b"hello").unwrap();
+    assert_eq!(v.len().unwrap(), 5);
+    assert_eq!(v.to_vec().unwrap(), b"hello");
+
+    // The stable identity is the descriptor.
+    let desc = v.descriptor();
+
+    // Grow past capacity: the data block reallocs/moves, but the descriptor
+    // (and hence the field pointer) is unchanged.
+    for &b in b", world!" {
+        v.push(b).unwrap();
+    }
+    assert_eq!(v.descriptor(), desc); // identity stable across growth
+    assert_eq!(v.to_vec().unwrap(), b"hello, world!");
+    assert_eq!(v.len().unwrap(), 13);
+
+    // Free the data block + descriptor.
+    v.bstack_drop().unwrap();
+
+    // Allocator is healthy afterwards: a fresh vector round-trips.
+    let v2 = BStackVec::<u8, _>::from_slice(&alloc, b"again").unwrap();
+    assert_eq!(v2.to_vec().unwrap(), b"again");
+    v2.bstack_drop().unwrap();
+
+    // A larger POD element type also works (unaligned reads).
+    let mut nums = BStackVec::<u32, _>::from_slice(&alloc, &[1u32, 2, 3]).unwrap();
+    nums.push(4).unwrap();
+    assert_eq!(nums.to_vec().unwrap(), vec![1u32, 2, 3, 4]);
+    assert_eq!(nums.len().unwrap(), 4);
+    nums.bstack_drop().unwrap();
+}

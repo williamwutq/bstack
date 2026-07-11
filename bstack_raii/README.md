@@ -110,6 +110,10 @@ stored inline and copied by value.
 > is a no-op (so teardown frees nothing), and it can hand out offset 0 (which
 > would break the `Option<T>` niche). RAII over a non-freeing allocator doesn't
 > make sense anyway.
+>
+> For growable fields (`Vec<T>` / `String`), prefer a **realloc-safe** allocator:
+> growth reallocates the backing block, and a torn realloc under a poorly-behaved
+> allocator can corrupt it. `FirstFitBStackAllocator` is realloc-safe.
 
 ## Defining blocks
 

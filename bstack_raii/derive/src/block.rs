@@ -485,7 +485,13 @@ fn ctor_field(
 ) -> (TokenStream, TokenStream, TokenStream) {
     // The prep body that turns a consumed handle into its `u64` offset.
     let (handle_ty, to_offset): (TokenStream, TokenStream) = match kind {
-        Kind::Pod => return (quote!(#fname: #inner_ty,), quote!(), quote!(#fname: #fname,)),
+        Kind::Pod => {
+            return (
+                quote!(#fname: #inner_ty,),
+                quote!(),
+                quote!(#fname: #fname,),
+            );
+        }
         Kind::Owned => (
             quote!(::bstack_raii::BStackOwned<'__ctor, #inner_ty, __A>),
             quote!({
@@ -528,7 +534,12 @@ fn ctor_field(
 
 /// Build one `bstack_move!` field: its type in the result tuple and the
 /// expression that reconstructs it from the captured offset `cap`.
-fn move_field(cap: &Ident, inner_ty: &Type, kind: Kind, nullable: bool) -> (TokenStream, TokenStream) {
+fn move_field(
+    cap: &Ident,
+    inner_ty: &Type,
+    kind: Kind,
+    nullable: bool,
+) -> (TokenStream, TokenStream) {
     let size_od =
         quote!(::core::mem::size_of::<<#inner_ty as ::bstack_raii::BStackBlock>::OnDisk>() as u64);
     match kind {
@@ -737,7 +748,12 @@ fn constructor(
 /// Build an owned/strong teardown statement: resolve the child field's `u64`
 /// offset into a typed `BStackRef<#inner_ty>` bound to `__child`, then run
 /// `body`. A `nullable` field guards on a non-zero offset.
-fn child_range_stmt(fname: &Ident, inner_ty: &Type, nullable: bool, body: TokenStream) -> TokenStream {
+fn child_range_stmt(
+    fname: &Ident,
+    inner_ty: &Type,
+    nullable: bool,
+    body: TokenStream,
+) -> TokenStream {
     let core = quote! {
         let __range = ::bstack_raii::BStackRange::new(
             __off,
