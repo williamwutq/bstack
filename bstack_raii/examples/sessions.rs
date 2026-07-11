@@ -18,7 +18,9 @@ use std::io;
 use bstack::FirstFitBStackAllocator;
 // `BStack` / `BStackAllocator` / `BStackBlock` / `BStackRange` are re-exported by
 // `bstack_raii`, so a downstream crate only depends on `bstack_raii`.
-use bstack_raii::{BStack, BStackAllocator, BStackBlock, BStackRange, TryClone, bstack_block};
+use bstack_raii::{
+    BStack, BStackAllocator, BStackBlock, BStackDrop, BStackRange, TryClone, bstack_block,
+};
 
 /// A shared, reference-counted configuration. `(rc, weak)` makes it refcounted
 /// and weak-observable on disk.
@@ -62,15 +64,19 @@ fn shared_ownership_demo(path: &std::path::Path) -> io::Result<()> {
         sessions.len(),
     );
 
-    // Close sessions one at a time; the config stays alive until the last drops.
+    // Close sessions one at a time. A `Session` is a *uniquely owned* block, so
+    // its teardown is explicit (`bstack_drop`) — dropping the handle alone would
+    // persist it, which is what you want for a durable root. Each close releases
+    // the session's strong reference to the shared config.
     while let Some(session) = sessions.pop() {
-        drop(session);
+        session.bstack_drop(&alloc)?;
         let still_alive = monitor.upgrade()?.is_some();
         println!("closed a session -> shared config still alive: {still_alive}");
     }
 
-    // The last session is gone, so the shared config was reclaimed automatically —
-    // no manual free, no leak, no dangling weak handle.
+    // The last session released the last strong reference, so the *shared* config
+    // was reclaimed automatically by its refcount — no manual free of the config,
+    // no leak, no dangling weak handle.
     assert!(monitor.upgrade()?.is_none());
     println!("last session closed -> shared config freed automatically");
 

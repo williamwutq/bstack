@@ -17,12 +17,12 @@
 //! |----------------|-------------------------------------------------------------|
 //! | [`layout`]     | On-disk primitives: [`EightCC`], [`BlockHeader`] (both Pod). |
 //! | [`reference`]  | [`BStackRef`]: typed range wrapper + buffered `OnDisk` read. |
-//! | [`teardown`]   | [`BStackDrop`] trait + [`dealloc_range`] helper.            |
+//! | [`teardown`]   | [`BStackDrop`] trait, [`AutoDrop`] RAII guard, [`dealloc_range`]. |
 //! | [`block`]      | Block-type contracts: [`BStackCast`], [`BStackBlock`], [`BStackWeakable`]. |
 //! | [`refcount`]   | Little-endian atomic CAS ops over on-disk `u64` counters.    |
 //! | [`clone`]      | [`TryClone`]: fallible clone for handles that touch disk.    |
 //! | [`handle`]     | Without-allocator inner handles: [`OwnedRef`], [`StrongRef`], [`StrongWeakRef`], [`WeakRef`]. |
-//! | [`owned`]      | [`AutoDrop`]: the RAII guard bridging `BStackDrop` to `Drop`, and its [`BStackOwned`] alias. |
+//! | [`owned`]      | [`BStackOwned`]: the without-allocator, uniquely-owned block handle. |
 //! | [`shared`]     | [`BStackRc`] + [`BStackWeak`]: with-allocator shared handles.|
 //!
 //! ## Conventions fixed by the ABI
@@ -72,10 +72,10 @@ pub use clone::TryClone;
 pub use construct::{alloc_block, alloc_control, init_rc, set_weak_field, upgrade_weak_field};
 pub use handle::{OwnedRef, StrongRef, StrongWeakRef, WeakRef};
 pub use layout::{BlockHeader, EightCC};
-pub use owned::{AutoDrop, BStackOwned};
+pub use owned::BStackOwned;
 pub use reference::BStackRef;
 pub use shared::{BStackRc, BStackWeak};
-pub use teardown::{BStackDrop, dealloc_range};
+pub use teardown::{AutoDrop, BStackDrop, dealloc_range};
 pub use vec::{BStackVec, VecRef};
 
 // Re-exports for use by `#[bstack_block]`-generated code (and callers), so that

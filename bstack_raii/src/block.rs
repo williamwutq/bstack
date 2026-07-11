@@ -46,11 +46,15 @@ pub trait BStackBlock: BStackCast + BStackDrop + Sized {
 /// and the `Rc` `bstack_move!` paths in [`BStackMoveExpr`]; it does not touch
 /// refcounts or the control block, so the caller must have already established
 /// that the shell may be freed.
+///
+/// Takes the (bare, allocator-less) [`BStackOwned`] handle plus an explicit
+/// allocator, since neither the owned handle nor the block type carries one.
 pub trait BStackMove: BStackBlock {
     /// The tuple of field handles produced, in field-declaration order.
     type Fields<'a, A: BStackOwnedSliceAllocator>;
     fn bstack_move<'a, A: BStackOwnedSliceAllocator>(
-        owned: BStackOwned<'a, Self, A>,
+        owned: BStackOwned<Self>,
+        allocator: &'a A,
     ) -> io::Result<Self::Fields<'a, A>>;
 }
 

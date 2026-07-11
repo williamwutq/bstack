@@ -363,11 +363,12 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                 type Fields<'__mv, __A: ::bstack_raii::BStackOwnedSliceAllocator> =
                     ( #(#mv_types,)* );
                 fn bstack_move<'__mv, __A: ::bstack_raii::BStackOwnedSliceAllocator>(
-                    owned: ::bstack_raii::BStackOwned<'__mv, Self, __A>,
+                    owned: ::bstack_raii::BStackOwned<Self>,
+                    __alloc: &'__mv __A,
                 ) -> ::std::io::Result<Self::Fields<'__mv, __A>> {
-                    // Take the inner handle out (defusing the owned Drop) and read
-                    // the payload before freeing anything.
-                    let (__inner, __alloc) = owned.into_raw_parts();
+                    // Unwrap the ownership marker and read the payload before
+                    // freeing anything.
+                    let __inner = owned.into_inner();
                     let __stack = __alloc.stack();
                     let __range = ::bstack_raii::BStackBlock::range(&__inner);
                     let mut __buf = [0u8; ::core::mem::size_of::<#on_disk>()];
@@ -666,9 +667,9 @@ fn ctor_field(
             );
         }
         Kind::Owned => (
-            quote!(::bstack_raii::BStackOwned<'__ctor, #inner_ty, __A>),
+            quote!(::bstack_raii::BStackOwned<#inner_ty>),
             quote!({
-                let (__h, _) = __handle.into_raw_parts();
+                let __h = __handle.into_inner();
                 ::bstack_raii::BStackBlock::range(&__h).start()
             }),
         ),
@@ -744,14 +745,13 @@ fn move_field(
             (ty, recon)
         }
         Kind::Owned => wrap_move(
-            quote!(::bstack_raii::BStackOwned<'__mv, #inner_ty, __A>),
+            quote!(::bstack_raii::BStackOwned<#inner_ty>),
             quote! {
                 unsafe {
                     ::bstack_raii::BStackOwned::from_raw(
                         <#inner_ty as ::bstack_raii::BStackBlock>::from_range(
                             ::bstack_raii::BStackRange::new(#cap, #size_od),
                         ),
-                        __alloc,
                     )
                 }
             },
@@ -845,7 +845,7 @@ fn constructor(
         Mode::RcWeak => quote!(__bstack_ctrl: 0u64,),
     };
     let ret = match mode {
-        Mode::Plain => quote!(::bstack_raii::BStackOwned<'__ctor, Self, __A>),
+        Mode::Plain => quote!(::bstack_raii::BStackOwned<Self>),
         _ => quote!(::bstack_raii::BStackRc<'__ctor, Self, __A>),
     };
     let finish = match mode {
@@ -853,7 +853,6 @@ fn constructor(
             ::std::result::Result::Ok(unsafe {
                 ::bstack_raii::BStackOwned::from_raw(
                     <Self as ::bstack_raii::BStackBlock>::from_range(__data),
-                    allocator,
                 )
             })
         },

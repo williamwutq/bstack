@@ -34,7 +34,7 @@ pub fn expand(input: TokenStream) -> syn::Result<TokenStream> {
     let seg = tp.path.segments.last().expect("non-empty path");
 
     let tokens = match seg.ident.to_string().as_str() {
-        "BStackOwnedSlice" => quote!(::bstack_raii::BStackOwned::into_slice(#expr)),
+        "BStackOwnedSlice" => quote!((#expr).into_slice()),
         "BStackSlice" => {
             return Err(Error::new_spanned(
                 ty,

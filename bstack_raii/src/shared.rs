@@ -14,10 +14,10 @@ use crate::block::{BStackBlock, BStackMove, BStackMoveExpr, BStackWeakable};
 use crate::clone::TryClone;
 use crate::handle::{StrongRef, WeakRef, strong_release_ctrl};
 use crate::layout;
-use crate::owned::{AutoDrop, BStackOwned};
+use crate::owned::BStackOwned;
 use crate::refcount;
 use crate::reference::BStackRef;
-use crate::teardown::{BStackDrop, dealloc_range};
+use crate::teardown::{AutoDrop, BStackDrop, dealloc_range};
 
 /// The without-allocator drop core of a [`BStackRc`]: the data ref plus the
 /// optional control-block range.
@@ -168,10 +168,9 @@ impl<'a, T: BStackMove, A: BStackOwnedSliceAllocator> BStackRc<'a, T, A> {
         // embedded guard so it does not double-free.
         let (core, allocator) = self.inner.into_raw_parts();
         let StrongCore { data, ctrl } = core;
-        let owned = unsafe {
-            BStackOwned::from_raw(<T as BStackBlock>::from_range(data.into_range()), allocator)
-        };
-        let fields = T::bstack_move(owned)?;
+        let owned =
+            unsafe { BStackOwned::from_raw(<T as BStackBlock>::from_range(data.into_range())) };
+        let fields = T::bstack_move(owned, allocator)?;
 
         // `(rc, weak)`: release the phantom weak; free the control block at zero.
         if let Some(ctrl) = ctrl {

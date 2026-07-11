@@ -334,10 +334,9 @@ fn macro_recursive_drop() {
         )
         .unwrap();
 
-    // Own the parent; dropping it must recursively free the child, then itself.
-    let owned =
-        unsafe { BStackOwned::from_raw(<MacroParent as BStackBlock>::from_range(parent), &alloc) };
-    drop(owned);
+    // Own the parent; freeing it must recursively free the child, then itself.
+    let owned = unsafe { BStackOwned::from_raw(<MacroParent as BStackBlock>::from_range(parent)) };
+    owned.bstack_drop(&alloc).unwrap();
 
     // The child's slot (allocated first, so the lowest offset) is reclaimed —
     // proof the generated `bstack_drop` recursed into the owned child.
@@ -496,15 +495,11 @@ fn macro_strong_child() {
         )
         .unwrap();
 
-    // Dropping the parent runs its generated teardown, which dispatches through
+    // Freeing the parent runs its generated teardown, which dispatches through
     // BStackShared::drop_strong_ref to decrement the child's strong count.
-    let owned = unsafe {
-        BStackOwned::from_raw(
-            <MacroStrongParent as BStackBlock>::from_range(parent),
-            &alloc,
-        )
-    };
-    drop(owned);
+    let owned =
+        unsafe { BStackOwned::from_raw(<MacroStrongParent as BStackBlock>::from_range(parent)) };
+    owned.bstack_drop(&alloc).unwrap();
     assert_eq!(crate::refcount::load(alloc.stack(), strong_off).unwrap(), 1); // child survives
 
     // Release the keep-alive: strong -> 0 frees the child data + control block.
@@ -537,9 +532,9 @@ fn macro_new_and_accessors() {
     let child = parent.handle().child(stack).unwrap();
     assert_eq!(child.val(stack).unwrap(), 42);
 
-    // Dropping the parent recursively frees the child then itself (no panic /
-    // error swallowed by Drop); recursion correctness is covered elsewhere.
-    drop(parent);
+    // Freeing the parent recursively frees the child then itself; recursion
+    // correctness is covered elsewhere.
+    parent.bstack_drop(&alloc).unwrap();
 }
 
 #[test]
@@ -633,7 +628,8 @@ fn macro_bstack_move() {
     let parent = MacroParent::new(&alloc, leaf, 7).unwrap();
 
     // Move the fields out: owned child -> BStackOwned<MacroLeaf>, tag -> u32.
-    let (child, tag) = bstack_move!(parent).unwrap();
+    // A bare owned handle carries no allocator, so pass it explicitly.
+    let (child, tag) = bstack_move!(parent, &alloc).unwrap();
     assert_eq!(tag, 7);
 
     // Ownership of the child transferred (same allocation), and it is still live
@@ -641,9 +637,9 @@ fn macro_bstack_move() {
     assert_eq!(child.handle().range().start(), leaf_off);
     assert_eq!(child.handle().val(stack).unwrap(), 55);
 
-    // Dropping the moved-out child frees the leaf. With the parent shell already
+    // Freeing the moved-out child frees the leaf. With the parent shell already
     // freed, both slots coalesce and the lowest (leaf's) is reclaimed.
-    drop(child);
+    child.bstack_drop(&alloc).unwrap();
     let reused = alloc_block(
         &alloc,
         MacroLeaf::eightcc(),
@@ -682,7 +678,7 @@ fn macro_bstack_move_shared() {
         .unwrap();
 
     // Move every field out: strong -> BStackRc, weak -> Option<BStackWeak>, pod.
-    let (moved_s, moved_w, n) = bstack_move!(holder).unwrap();
+    let (moved_s, moved_w, n) = bstack_move!(holder, &alloc).unwrap();
     assert_eq!(n, 5);
 
     // The strong field came back as a live BStackRc.
@@ -825,20 +821,21 @@ fn macro_cast() {
     assert!(bstack_cast!(sl as MacroLeaf).unwrap().is_some());
     assert!(bstack_cast!(sl as MacroParent).unwrap().is_none());
 
-    // Owned upcast (macro), then a wrong-type downcast hands the slice back.
-    let slice = bstack_cast!(leaf as BStackOwnedSlice);
+    // Owned upcast (macro) — a bare owned handle is wrapped (`auto`) to attach an
+    // allocator first — then a wrong-type downcast hands the slice back.
+    let slice = bstack_cast!(leaf.auto(&alloc) as BStackOwnedSlice);
     let slice = match slice.cast_into::<MacroParent>().unwrap() {
         Ok(_) => panic!("tag should not match"),
         Err(s) => s,
     };
 
-    // Correct owned downcast (macro) round-trips to the typed handle.
+    // Correct owned downcast (macro) round-trips to the typed (bare) handle.
     let owned = bstack_cast!(slice as BStackOwned<MacroLeaf, _>)
         .unwrap()
         .ok()
         .unwrap();
     assert_eq!(owned.handle().val(stack).unwrap(), 9);
-    drop(owned); // frees the leaf
+    owned.bstack_drop(&alloc).unwrap(); // frees the leaf
 }
 
 // --------------------------------------------------------------------------
@@ -882,9 +879,9 @@ fn macro_bstack_move_rc() {
     assert_eq!(n, 7);
     assert_eq!(moved_leaf.handle().val(stack).unwrap(), 5);
 
-    // Only the RcHolder shell was freed; the child is still live. Dropping it
+    // Only the RcHolder shell was freed; the child is still live. Freeing it
     // reclaims the last block, so the lowest slot (the leaf's) comes back.
-    drop(moved_leaf);
+    moved_leaf.bstack_drop(&alloc).unwrap();
     let reused = alloc_block(
         &alloc,
         MacroLeaf::eightcc(),
@@ -913,7 +910,7 @@ fn macro_bstack_move_rc_weak() {
     // The data block is gone, so the weak can no longer upgrade.
     assert!(weak.upgrade().unwrap().is_none());
 
-    drop(moved_leaf); // frees the moved-out child
+    moved_leaf.bstack_drop(&alloc).unwrap(); // frees the moved-out child
     drop(weak); // frees the now-unreferenced control block
 }
 
@@ -943,13 +940,13 @@ fn macro_option_owned() {
     assert_eq!(got.unwrap().val(stack).unwrap(), 42);
 
     // bstack_move! yields Option<BStackOwned<_>>.
-    let (moved_child, n) = bstack_move!(holder).unwrap();
+    let (moved_child, n) = bstack_move!(holder, &alloc).unwrap();
     assert_eq!(n, 7);
     assert_eq!(
         moved_child.as_ref().unwrap().handle().val(stack).unwrap(),
         42
     );
-    drop(moved_child); // frees the leaf
+    moved_child.unwrap().bstack_drop(&alloc).unwrap(); // frees the leaf
 
     // The leaf + holder shell are both freed; the lowest slot (leaf's) returns.
     let reused = alloc_block(
@@ -965,7 +962,7 @@ fn macro_option_owned() {
     let empty = OptHolder::new(&alloc, None, 9).unwrap();
     assert_eq!(empty.handle().n(stack).unwrap(), 9);
     assert!(empty.handle().child(stack).unwrap().is_none());
-    drop(empty);
+    empty.bstack_drop(&alloc).unwrap();
 }
 
 // --------------------------------------------------------------------------
@@ -1054,8 +1051,8 @@ fn macro_vec_string_fields() {
         vec![1u32, 2, 3, 4],
     );
 
-    // Dropping the record frees both vectors (data + descriptor) and the record.
-    drop(rec);
+    // Freeing the record frees both vectors (data + descriptor) and the record.
+    rec.bstack_drop(&alloc).unwrap();
 
     // Allocator is healthy: a fresh record round-trips.
     let rec2 = Record::new(&alloc, "again", &[9u32], 1).unwrap();
@@ -1067,7 +1064,7 @@ fn macro_vec_string_fields() {
         rec2.handle().tags(&alloc).unwrap().to_vec().unwrap(),
         vec![9u32]
     );
-    drop(rec2);
+    rec2.bstack_drop(&alloc).unwrap();
 }
 
 #[test]
@@ -1077,7 +1074,7 @@ fn macro_vec_bstack_move() {
 
     let rec = Record::new(&alloc, "movable", &[7u32, 8], 5).unwrap();
     // bstack_move! yields the BStackVec handles + the POD.
-    let (name, tags, id) = bstack_move!(rec).unwrap();
+    let (name, tags, id) = bstack_move!(rec, &alloc).unwrap();
     assert_eq!(id, 5);
     assert_eq!(name.to_vec().unwrap(), b"movable");
     assert_eq!(tags.to_vec().unwrap(), vec![7u32, 8]);
