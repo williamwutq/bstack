@@ -44,13 +44,15 @@ pub struct BStackVec<'a, T, A: BStackOwnedSliceAllocator> {
 }
 
 impl<'a, T, A: BStackOwnedSliceAllocator> BStackVec<'a, T, A> {
-    /// Reconstruct a handle from its descriptor block (e.g. a field accessor).
+    /// Reconstruct a handle from its descriptor block offset (e.g. a field
+    /// accessor, which stores just that offset).
     ///
     /// # Safety
-    /// `desc` must point at a live descriptor block written by this type.
-    pub unsafe fn from_descriptor(desc: BStackRange, allocator: &'a A) -> Self {
+    /// `desc_off` must be the offset of a live descriptor block written by this
+    /// type.
+    pub unsafe fn from_descriptor(desc_off: u64, allocator: &'a A) -> Self {
         Self {
-            desc,
+            desc: BStackRange::new(desc_off, DESCRIPTOR_SIZE),
             allocator,
             _marker: PhantomData,
         }

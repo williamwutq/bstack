@@ -965,3 +965,65 @@ fn bstack_vec_grow_and_free() {
     assert_eq!(nums.len().unwrap(), 4);
     nums.bstack_drop().unwrap();
 }
+
+// --------------------------------------------------------------------------
+// Vec<T> / String fields (POD elements) via BStackVec
+// --------------------------------------------------------------------------
+
+#[bstack_block]
+struct Record {
+    #[bstack_owned]
+    name: String,
+    #[bstack_owned]
+    tags: Vec<u32>,
+    id: u64,
+}
+
+#[test]
+fn macro_vec_string_fields() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    // Constructor takes `&str` for String and `&[T]` for Vec<T>.
+    let rec = Record::new(&alloc, "hello", &[1u32, 2, 3], 42).unwrap();
+    assert_eq!(rec.handle().id(stack).unwrap(), 42);
+
+    // Accessors return BStackVec handles (take the allocator).
+    assert_eq!(rec.handle().name(&alloc).unwrap().to_vec().unwrap(), b"hello");
+    assert_eq!(rec.handle().tags(&alloc).unwrap().to_vec().unwrap(), vec![1u32, 2, 3]);
+
+    // Mutate through the handle: the field points at the stable descriptor, so
+    // growth (even if the data block moves) is visible on the next read.
+    let mut tags = rec.handle().tags(&alloc).unwrap();
+    tags.push(4).unwrap();
+    assert_eq!(
+        rec.handle().tags(&alloc).unwrap().to_vec().unwrap(),
+        vec![1u32, 2, 3, 4],
+    );
+
+    // Dropping the record frees both vectors (data + descriptor) and the record.
+    drop(rec);
+
+    // Allocator is healthy: a fresh record round-trips.
+    let rec2 = Record::new(&alloc, "again", &[9u32], 1).unwrap();
+    assert_eq!(rec2.handle().name(&alloc).unwrap().to_vec().unwrap(), b"again");
+    assert_eq!(rec2.handle().tags(&alloc).unwrap().to_vec().unwrap(), vec![9u32]);
+    drop(rec2);
+}
+
+#[test]
+fn macro_vec_bstack_move() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+
+    let rec = Record::new(&alloc, "movable", &[7u32, 8], 5).unwrap();
+    // bstack_move! yields the BStackVec handles + the POD.
+    let (name, tags, id) = bstack_move!(rec).unwrap();
+    assert_eq!(id, 5);
+    assert_eq!(name.to_vec().unwrap(), b"movable");
+    assert_eq!(tags.to_vec().unwrap(), vec![7u32, 8]);
+    // The vectors are now independently owned; free them.
+    name.bstack_drop().unwrap();
+    tags.bstack_drop().unwrap();
+}

@@ -91,6 +91,32 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
     for field in fields {
         let fname = field.ident.as_ref().expect("named field");
         let kind = classify(field)?;
+
+        // `Vec<T>` / `String` fields: a fixed-size descriptor offset on disk, a
+        // `BStackVec` at runtime. Handled entirely here.
+        if let Some(vinfo) = vec_field(&field.ty) {
+            if kind != Kind::Owned {
+                return Err(Error::new_spanned(
+                    &field.ty,
+                    "`Vec<T>` / `String` fields must be annotated `#[bstack_owned]`",
+                ));
+            }
+            let elem = &vinfo.elem;
+            on_disk_fields.push(quote!(#fname: u64,));
+            drop_stmts.push(vec_drop_stmt(fname, elem));
+            accessors.push(vec_accessor(vis, fname, elem, &on_disk));
+            let (param, prep, init) = vec_ctor(fname, &vinfo);
+            ctor_params.push(param);
+            ctor_preps.push(prep);
+            ctor_inits.push(init);
+            let cap = format_ident!("__cap_{}", fname);
+            mv_caps.push(quote!(let #cap = __od.#fname;));
+            let (mv_ty, mv_rc) = vec_move(&cap, elem);
+            mv_types.push(mv_ty);
+            mv_recon.push(mv_rc);
+            continue;
+        }
+
         // `Option<Inner>` makes a reference field nullable: `0` on disk == `None`
         // (no allocation ever lives at offset 0). The annotation applies to Inner.
         let (inner_ty, nullable) = match option_inner(&field.ty) {
@@ -387,6 +413,92 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         #move_impl
         #overlong_warning
     })
+}
+
+/// A `Vec<T>` / `String` field: its element type (tokens) and whether it's a
+/// `String` (so the constructor takes `&str`).
+struct VecInfo {
+    elem: TokenStream,
+    is_string: bool,
+}
+
+/// Detect `Vec<T>` / `String` field types.
+fn vec_field(ty: &Type) -> Option<VecInfo> {
+    let Type::Path(tp) = ty else {
+        return None;
+    };
+    let seg = tp.path.segments.last()?;
+    if seg.ident == "String" {
+        return Some(VecInfo { elem: quote!(u8), is_string: true });
+    }
+    if seg.ident == "Vec" {
+        if let PathArguments::AngleBracketed(ab) = &seg.arguments {
+            if let Some(GenericArgument::Type(inner)) = ab.args.first() {
+                return Some(VecInfo { elem: quote!(#inner), is_string: false });
+            }
+        }
+    }
+    None
+}
+
+/// Teardown for an owned `Vec<T>` / `String` field: free its `BStackVec` (data +
+/// descriptor blocks).
+fn vec_drop_stmt(fname: &Ident, elem: &TokenStream) -> TokenStream {
+    quote! {
+        {
+            unsafe {
+                ::bstack_raii::BStackVec::<#elem, __A>::from_descriptor(__on_disk.#fname, allocator)
+                    .bstack_drop()?;
+            }
+        }
+    }
+}
+
+/// Accessor for a `Vec<T>` / `String` field: resolve the descriptor offset to a
+/// `BStackVec` handle. Takes the allocator (the vector's ops need it).
+fn vec_accessor(vis: &syn::Visibility, fname: &Ident, elem: &TokenStream, on_disk: &Ident) -> TokenStream {
+    quote! {
+        #vis fn #fname<'__v, __A: ::bstack_raii::BStackOwnedSliceAllocator>(
+            &self,
+            allocator: &'__v __A,
+        ) -> ::std::io::Result<::bstack_raii::BStackVec<'__v, #elem, __A>> {
+            let __field = self.0.start() + ::core::mem::offset_of!(#on_disk, #fname) as u64;
+            let mut __buf = [0u8; 8];
+            allocator.stack().get_into(__field, &mut __buf)?;
+            ::std::result::Result::Ok(unsafe {
+                ::bstack_raii::BStackVec::from_descriptor(u64::from_le_bytes(__buf), allocator)
+            })
+        }
+    }
+}
+
+/// Constructor `(param, prep, init)` for a `Vec<T>` / `String` field: build the
+/// `BStackVec` from the passed data and store its descriptor offset.
+fn vec_ctor(fname: &Ident, vinfo: &VecInfo) -> (TokenStream, TokenStream, TokenStream) {
+    let elem = &vinfo.elem;
+    let (param_ty, data): (TokenStream, TokenStream) = if vinfo.is_string {
+        (quote!(&str), quote!(#fname.as_bytes()))
+    } else {
+        (quote!(&[#elem]), quote!(#fname))
+    };
+    (
+        quote!(#fname: #param_ty,),
+        quote! {
+            let #fname: u64 =
+                ::bstack_raii::BStackVec::<#elem, __A>::from_slice(allocator, #data)?
+                    .descriptor()
+                    .start();
+        },
+        quote!(#fname: #fname,),
+    )
+}
+
+/// `bstack_move!` field for a `Vec<T>` / `String`: yield the `BStackVec` handle.
+fn vec_move(cap: &Ident, elem: &TokenStream) -> (TokenStream, TokenStream) {
+    (
+        quote!(::bstack_raii::BStackVec<'__mv, #elem, __A>),
+        quote!(unsafe { ::bstack_raii::BStackVec::from_descriptor(#cap, __alloc) }),
+    )
 }
 
 /// Return `Some(Inner)` if `ty` is `Option<Inner>`.
