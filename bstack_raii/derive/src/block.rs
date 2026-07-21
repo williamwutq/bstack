@@ -104,15 +104,24 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
             ref_coerced = true;
         }
 
-        // `Vec<T>` / `String` fields (and `&str` → `String`): a fixed-size
-        // descriptor offset on disk, a `BStackVec` at runtime. Handled here.
-        let vinfo = if is_str(eff_ty) {
+        // `Option<Inner>` makes a field nullable (`0` on disk == `None`, since no
+        // allocation ever lives at offset 0). Strip it first, so the inner type —
+        // which may itself be a `Vec` / `String` — is what we classify.
+        let (inner_ty, nullable) = match option_inner(eff_ty) {
+            Some(inner) => (inner, true),
+            None => (eff_ty, false),
+        };
+
+        // `Vec<T>` / `String` (and `&str` → `String`): an inline descriptor on
+        // disk, a `BStackVec` at runtime. A nullable vec uses the `data_off == 0`
+        // niche. Handled here.
+        let vinfo = if is_str(inner_ty) {
             Some(VecInfo {
                 elem: quote!(u8),
                 is_string: true,
             })
         } else {
-            vec_field(eff_ty)
+            vec_field(inner_ty)
         };
         if let Some(vinfo) = vinfo {
             let elem = &vinfo.elem;
@@ -134,54 +143,58 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
             // POD elements (byte storage, requiring `T: Pod`).
             let (drop_s, acc, ctor, mv) = match kind {
                 Kind::Pod => (
-                    vec_drop_stmt(fname, elem),
-                    vec_accessor(vis, fname, elem, &on_disk),
-                    vec_ctor(fname, &vinfo),
-                    vec_move(&cap, elem),
+                    vec_drop_stmt(fname, elem, nullable),
+                    vec_accessor(vis, fname, elem, &on_disk, nullable),
+                    vec_ctor(fname, &vinfo, nullable),
+                    vec_move(&cap, elem, nullable),
                 ),
                 Kind::Owned => (
-                    block_vec_drop_stmt(fname, quote!(BStackBlockVec), elem),
-                    block_vec_accessor(vis, fname, elem, &on_disk, quote!(BStackBlockVec)),
+                    block_vec_drop_stmt(fname, quote!(BStackBlockVec), elem, nullable),
+                    block_vec_accessor(vis, fname, elem, &on_disk, quote!(BStackBlockVec), nullable),
                     block_vec_ctor(
                         fname,
                         elem,
                         quote!(BStackBlockVec),
                         quote!(::bstack_raii::BStackOwned<#elem>),
+                        nullable,
                     ),
-                    block_vec_move(&cap, elem, quote!(BStackBlockVec)),
+                    block_vec_move(&cap, elem, quote!(BStackBlockVec), nullable),
                 ),
                 Kind::Strong => (
-                    block_vec_drop_stmt(fname, quote!(BStackStrongVec), elem),
-                    block_vec_accessor(vis, fname, elem, &on_disk, quote!(BStackStrongVec)),
+                    block_vec_drop_stmt(fname, quote!(BStackStrongVec), elem, nullable),
+                    block_vec_accessor(vis, fname, elem, &on_disk, quote!(BStackStrongVec), nullable),
                     block_vec_ctor(
                         fname,
                         elem,
                         quote!(BStackStrongVec),
                         quote!(::bstack_raii::BStackRc<'__ctor, #elem, __A>),
+                        nullable,
                     ),
-                    block_vec_move(&cap, elem, quote!(BStackStrongVec)),
+                    block_vec_move(&cap, elem, quote!(BStackStrongVec), nullable),
                 ),
                 Kind::Weak => (
-                    block_vec_drop_stmt(fname, quote!(BStackWeakVec), elem),
-                    block_vec_accessor(vis, fname, elem, &on_disk, quote!(BStackWeakVec)),
+                    block_vec_drop_stmt(fname, quote!(BStackWeakVec), elem, nullable),
+                    block_vec_accessor(vis, fname, elem, &on_disk, quote!(BStackWeakVec), nullable),
                     block_vec_ctor(
                         fname,
                         elem,
                         quote!(BStackWeakVec),
                         quote!(::bstack_raii::BStackWeak<'__ctor, #elem, __A>),
+                        nullable,
                     ),
-                    block_vec_move(&cap, elem, quote!(BStackWeakVec)),
+                    block_vec_move(&cap, elem, quote!(BStackWeakVec), nullable),
                 ),
                 Kind::Ref => (
-                    block_vec_drop_stmt(fname, quote!(BStackRefVec), elem),
-                    block_vec_accessor(vis, fname, elem, &on_disk, quote!(BStackRefVec)),
+                    block_vec_drop_stmt(fname, quote!(BStackRefVec), elem, nullable),
+                    block_vec_accessor(vis, fname, elem, &on_disk, quote!(BStackRefVec), nullable),
                     block_vec_ctor(
                         fname,
                         elem,
                         quote!(BStackRefVec),
                         quote!(::bstack_raii::BStackRef<#elem>),
+                        nullable,
                     ),
-                    block_vec_move(&cap, elem, quote!(BStackRefVec)),
+                    block_vec_move(&cap, elem, quote!(BStackRefVec), nullable),
                 ),
             };
             drop_stmts.push(drop_s);
@@ -196,12 +209,6 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
             continue;
         }
 
-        // `Option<Inner>` makes a reference field nullable: `0` on disk == `None`
-        // (no allocation ever lives at offset 0). The annotation applies to Inner.
-        let (inner_ty, nullable) = match option_inner(eff_ty) {
-            Some(inner) => (inner, true),
-            None => (eff_ty, false),
-        };
         if nullable && kind == Kind::Pod {
             return Err(Error::new_spanned(
                 &field.ty,
@@ -562,133 +569,239 @@ fn vec_field(ty: &Type) -> Option<VecInfo> {
 }
 
 /// Teardown for a POD `Vec<T>` / `String` field: free the vector's data block
-/// (the inline descriptor is freed with the enclosing struct's block).
-fn vec_drop_stmt(fname: &Ident, elem: &TokenStream) -> TokenStream {
-    quote! {
-        {
-            ::bstack_raii::BStackVec::<#elem, __A>::from_desc(__on_disk.#fname, allocator)
-                .bstack_drop()?;
-        }
+/// (the inline descriptor is freed with the enclosing struct's block). A nullable
+/// field frees nothing when the descriptor is the `0` niche.
+fn vec_drop_stmt(fname: &Ident, elem: &TokenStream, nullable: bool) -> TokenStream {
+    let free = quote! {
+        ::bstack_raii::BStackVec::<#elem, __A>::from_desc(__on_disk.#fname, allocator)
+            .bstack_drop()?;
+    };
+    if nullable {
+        quote! { { if __on_disk.#fname.data_off != 0 { #free } } }
+    } else {
+        quote! { { #free } }
     }
 }
 
 /// Accessor for a `Vec<T>` / `String` field: read the inline descriptor at the
-/// field's location into a `BStackVec` handle. Takes the allocator (the vector's
-/// ops need it).
+/// field's location into a `BStackVec` handle. A nullable field returns
+/// `Option<_>` (`None` for the `0` niche).
 fn vec_accessor(
     vis: &syn::Visibility,
     fname: &Ident,
     elem: &TokenStream,
     on_disk: &Ident,
+    nullable: bool,
 ) -> TokenStream {
-    quote! {
-        #vis fn #fname<'__v, __A: ::bstack_raii::BStackOwnedSliceAllocator>(
-            &self,
-            allocator: &'__v __A,
-        ) -> ::std::io::Result<::bstack_raii::BStackVec<'__v, #elem, __A>> {
-            let __field = self.0.start() + ::core::mem::offset_of!(#on_disk, #fname) as u64;
-            unsafe { ::bstack_raii::BStackVec::from_field(__field, allocator) }
+    let field = quote!(self.0.start() + ::core::mem::offset_of!(#on_disk, #fname) as u64);
+    if nullable {
+        quote! {
+            #vis fn #fname<'__v, __A: ::bstack_raii::BStackOwnedSliceAllocator>(
+                &self,
+                allocator: &'__v __A,
+            ) -> ::std::io::Result<
+                ::core::option::Option<::bstack_raii::BStackVec<'__v, #elem, __A>>
+            > {
+                unsafe { ::bstack_raii::BStackVec::from_field_opt(#field, allocator) }
+            }
+        }
+    } else {
+        quote! {
+            #vis fn #fname<'__v, __A: ::bstack_raii::BStackOwnedSliceAllocator>(
+                &self,
+                allocator: &'__v __A,
+            ) -> ::std::io::Result<::bstack_raii::BStackVec<'__v, #elem, __A>> {
+                unsafe { ::bstack_raii::BStackVec::from_field(#field, allocator) }
+            }
         }
     }
 }
 
 /// Constructor `(param, prep, init)` for a `Vec<T>` / `String` field: allocate
-/// the data block and store its descriptor inline in the field.
-fn vec_ctor(fname: &Ident, vinfo: &VecInfo) -> (TokenStream, TokenStream, TokenStream) {
+/// the data block and store its descriptor inline. A nullable field takes an
+/// `Option` (`None` => the `0` niche, no allocation).
+fn vec_ctor(fname: &Ident, vinfo: &VecInfo, nullable: bool) -> (TokenStream, TokenStream, TokenStream) {
     let elem = &vinfo.elem;
-    let (param_ty, data): (TokenStream, TokenStream) = if vinfo.is_string {
-        (quote!(&str), quote!(#fname.as_bytes()))
+    let base_param: TokenStream = if vinfo.is_string {
+        quote!(&str)
     } else {
-        (quote!(&[#elem]), quote!(#fname))
+        quote!(&[#elem])
     };
-    (
-        quote!(#fname: #param_ty,),
+    // The byte slice passed to `from_slice`, given the source binding `b`.
+    let data_of = |b: TokenStream| -> TokenStream {
+        if vinfo.is_string {
+            quote!(#b.as_bytes())
+        } else {
+            b
+        }
+    };
+    let prep = if nullable {
+        let some_data = data_of(quote!(__d));
+        quote! {
+            let #fname: ::bstack_raii::VecDesc = match #fname {
+                ::core::option::Option::Some(__d) =>
+                    ::bstack_raii::BStackVec::<#elem, __A>::from_slice(allocator, #some_data)?
+                        .descriptor(),
+                ::core::option::Option::None => ::core::default::Default::default(),
+            };
+        }
+    } else {
+        let data = data_of(quote!(#fname));
         quote! {
             let #fname: ::bstack_raii::VecDesc =
                 ::bstack_raii::BStackVec::<#elem, __A>::from_slice(allocator, #data)?
                     .descriptor();
-        },
-        quote!(#fname: #fname,),
-    )
+        }
+    };
+    let param = if nullable {
+        quote!(#fname: ::core::option::Option<#base_param>,)
+    } else {
+        quote!(#fname: #base_param,)
+    };
+    (param, prep, quote!(#fname: #fname,))
 }
 
 /// `bstack_move!` field for a `Vec<T>` / `String`: yield a detached `BStackVec`
 /// carrying the inline descriptor (captured from the parent before it is freed).
-fn vec_move(cap: &Ident, elem: &TokenStream) -> (TokenStream, TokenStream) {
-    (
-        quote!(::bstack_raii::BStackVec<'__mv, #elem, __A>),
-        quote!(::bstack_raii::BStackVec::from_desc(#cap, __alloc)),
-    )
+/// Nullable yields `Option<_>`.
+fn vec_move(cap: &Ident, elem: &TokenStream, nullable: bool) -> (TokenStream, TokenStream) {
+    let ty = quote!(::bstack_raii::BStackVec<'__mv, #elem, __A>);
+    let build = quote!(::bstack_raii::BStackVec::from_desc(#cap, __alloc));
+    wrap_vec_move(ty, build, cap, nullable)
 }
 
 // Block-element vectors (`#[bstack_owned/strong/weak/ref] Vec<Thing>`) all share
 // the same inline-descriptor offset-array storage and a uniform codegen-facing
-// API (`from_field` / `from_desc` / `from_handles` / `descriptor` /
-// `bstack_drop`); only the runtime type (`vec_ty`) and the element-handle type
-// differ per element relationship. These helpers are parameterized over both.
+// API (`from_field` / `from_field_opt` / `from_desc` / `from_handles` /
+// `descriptor` / `bstack_drop`); only the runtime type (`vec_ty`) and the
+// element-handle type differ per element relationship. These helpers are
+// parameterized over both.
+
+/// Wrap a vector move field's type/expr in `Option` when the field is nullable
+/// (the `data_off == 0` niche == `None`).
+fn wrap_vec_move(
+    ty: TokenStream,
+    build: TokenStream,
+    cap: &Ident,
+    nullable: bool,
+) -> (TokenStream, TokenStream) {
+    if nullable {
+        (
+            quote!(::core::option::Option<#ty>),
+            quote! {
+                if #cap.data_off != 0 {
+                    ::core::option::Option::Some(#build)
+                } else {
+                    ::core::option::Option::None
+                }
+            },
+        )
+    } else {
+        (ty, build)
+    }
+}
 
 /// Teardown for a block-element `Vec<Thing>` field: run the vector's own
-/// `bstack_drop` (per-element release + free the offset array).
-fn block_vec_drop_stmt(fname: &Ident, vec_ty: TokenStream, elem: &TokenStream) -> TokenStream {
-    quote! {
-        {
-            ::bstack_raii::#vec_ty::<#elem, __A>::from_desc(__on_disk.#fname, allocator)
-                .bstack_drop()?;
-        }
+/// `bstack_drop` (per-element release + free the offset array). Nullable frees
+/// nothing for the `0` niche.
+fn block_vec_drop_stmt(
+    fname: &Ident,
+    vec_ty: TokenStream,
+    elem: &TokenStream,
+    nullable: bool,
+) -> TokenStream {
+    let free = quote! {
+        ::bstack_raii::#vec_ty::<#elem, __A>::from_desc(__on_disk.#fname, allocator)
+            .bstack_drop()?;
+    };
+    if nullable {
+        quote! { { if __on_disk.#fname.data_off != 0 { #free } } }
+    } else {
+        quote! { { #free } }
     }
 }
 
 /// Accessor for a block-element `Vec<Thing>` field: read the inline descriptor at
-/// the field's location into the vector handle. Takes the allocator.
+/// the field's location into the vector handle. Nullable returns `Option<_>`.
 fn block_vec_accessor(
     vis: &syn::Visibility,
     fname: &Ident,
     elem: &TokenStream,
     on_disk: &Ident,
     vec_ty: TokenStream,
+    nullable: bool,
 ) -> TokenStream {
-    quote! {
-        #vis fn #fname<'__v, __A: ::bstack_raii::BStackOwnedSliceAllocator>(
-            &self,
-            allocator: &'__v __A,
-        ) -> ::std::io::Result<::bstack_raii::#vec_ty<'__v, #elem, __A>> {
-            let __field = self.0.start() + ::core::mem::offset_of!(#on_disk, #fname) as u64;
-            unsafe { ::bstack_raii::#vec_ty::from_field(__field, allocator) }
+    let field = quote!(self.0.start() + ::core::mem::offset_of!(#on_disk, #fname) as u64);
+    if nullable {
+        quote! {
+            #vis fn #fname<'__v, __A: ::bstack_raii::BStackOwnedSliceAllocator>(
+                &self,
+                allocator: &'__v __A,
+            ) -> ::std::io::Result<
+                ::core::option::Option<::bstack_raii::#vec_ty<'__v, #elem, __A>>
+            > {
+                unsafe { ::bstack_raii::#vec_ty::from_field_opt(#field, allocator) }
+            }
+        }
+    } else {
+        quote! {
+            #vis fn #fname<'__v, __A: ::bstack_raii::BStackOwnedSliceAllocator>(
+                &self,
+                allocator: &'__v __A,
+            ) -> ::std::io::Result<::bstack_raii::#vec_ty<'__v, #elem, __A>> {
+                unsafe { ::bstack_raii::#vec_ty::from_field(#field, allocator) }
+            }
         }
     }
 }
 
 /// Constructor `(param, prep, init)` for a block-element `Vec<Thing>` field:
 /// build the vector from a `Vec` of element handles (each consumed) and store its
-/// descriptor inline in the field.
+/// descriptor inline. Nullable takes an `Option<Vec<..>>` (`None` => the niche).
 fn block_vec_ctor(
     fname: &Ident,
     elem: &TokenStream,
     vec_ty: TokenStream,
     handle_ty: TokenStream,
+    nullable: bool,
 ) -> (TokenStream, TokenStream, TokenStream) {
-    (
-        quote!(#fname: ::std::vec::Vec<#handle_ty>,),
-        quote! {
-            let #fname: ::bstack_raii::VecDesc =
-                ::bstack_raii::#vec_ty::<#elem, __A>::from_handles(allocator, #fname)?
-                    .descriptor();
-        },
-        quote!(#fname: #fname,),
-    )
+    if nullable {
+        (
+            quote!(#fname: ::core::option::Option<::std::vec::Vec<#handle_ty>>,),
+            quote! {
+                let #fname: ::bstack_raii::VecDesc = match #fname {
+                    ::core::option::Option::Some(__v) =>
+                        ::bstack_raii::#vec_ty::<#elem, __A>::from_handles(allocator, __v)?
+                            .descriptor(),
+                    ::core::option::Option::None => ::core::default::Default::default(),
+                };
+            },
+            quote!(#fname: #fname,),
+        )
+    } else {
+        (
+            quote!(#fname: ::std::vec::Vec<#handle_ty>,),
+            quote! {
+                let #fname: ::bstack_raii::VecDesc =
+                    ::bstack_raii::#vec_ty::<#elem, __A>::from_handles(allocator, #fname)?
+                        .descriptor();
+            },
+            quote!(#fname: #fname,),
+        )
+    }
 }
 
 /// `bstack_move!` field for a block-element `Vec<Thing>`: yield a detached vector
-/// handle carrying the inline descriptor (now independently owned).
+/// handle carrying the inline descriptor. Nullable yields `Option<_>`.
 fn block_vec_move(
     cap: &Ident,
     elem: &TokenStream,
     vec_ty: TokenStream,
+    nullable: bool,
 ) -> (TokenStream, TokenStream) {
-    (
-        quote!(::bstack_raii::#vec_ty<'__mv, #elem, __A>),
-        quote!(::bstack_raii::#vec_ty::from_desc(#cap, __alloc)),
-    )
+    let ty = quote!(::bstack_raii::#vec_ty<'__mv, #elem, __A>);
+    let build = quote!(::bstack_raii::#vec_ty::from_desc(#cap, __alloc));
+    wrap_vec_move(ty, build, cap, nullable)
 }
 
 /// Return `Some(Inner)` if `ty` is `Option<Inner>`.

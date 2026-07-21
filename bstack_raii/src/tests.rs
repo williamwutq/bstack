@@ -1284,3 +1284,56 @@ fn macro_ref_block_vec() {
     a.bstack_drop(&alloc).unwrap();
     b.bstack_drop(&alloc).unwrap();
 }
+
+// --------------------------------------------------------------------------
+// Option<Vec<T>> / Option<String> — nullable vectors via the data_off==0 niche
+// --------------------------------------------------------------------------
+
+#[bstack_block]
+struct OptVec {
+    tags: Option<Vec<u32>>,
+    name: Option<String>,
+    id: u64,
+}
+
+#[test]
+fn macro_option_vec() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    // Some: constructor takes Option<&[T]> / Option<&str>; accessors resolve.
+    let a = OptVec::new(&alloc, Some(&[1u32, 2, 3][..]), Some("hi"), 7).unwrap();
+    assert_eq!(a.handle().id(stack).unwrap(), 7);
+    assert_eq!(
+        a.handle()
+            .tags(&alloc)
+            .unwrap()
+            .expect("some")
+            .to_vec()
+            .unwrap(),
+        vec![1u32, 2, 3]
+    );
+    assert_eq!(
+        a.handle()
+            .name(&alloc)
+            .unwrap()
+            .expect("some")
+            .to_vec()
+            .unwrap(),
+        b"hi"
+    );
+
+    // bstack_move! yields Option<BStackVec<_>>; free the moved-out vectors.
+    let (tags, name, id) = bstack_move!(a, &alloc).unwrap();
+    assert_eq!(id, 7);
+    tags.unwrap().bstack_drop().unwrap();
+    name.unwrap().bstack_drop().unwrap();
+
+    // None: `0` niche — accessors are None, teardown frees nothing extra.
+    let b = OptVec::new(&alloc, None, None, 9).unwrap();
+    assert_eq!(b.handle().id(stack).unwrap(), 9);
+    assert!(b.handle().tags(&alloc).unwrap().is_none());
+    assert!(b.handle().name(&alloc).unwrap().is_none());
+    b.bstack_drop(&alloc).unwrap();
+}

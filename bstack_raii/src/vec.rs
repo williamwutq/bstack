@@ -104,6 +104,25 @@ impl<'a, T, A: BStackOwnedSliceAllocator> BStackVec<'a, T, A> {
         })
     }
 
+    /// Like [`from_field`](Self::from_field), but for a nullable field: a
+    /// `data_off` of `0` (the offset-0 niche, since no allocation lives there)
+    /// reads as `None`. Backs `Option<Vec<T>>` accessors.
+    ///
+    /// # Safety
+    /// As [`from_field`](Self::from_field).
+    pub unsafe fn from_field_opt(loc: u64, allocator: &'a A) -> io::Result<Option<Self>> {
+        let desc = read_vecdesc(allocator.stack(), loc)?;
+        if desc.data_off == 0 {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            data: BStackRange::new(desc.data_off, desc.data_size),
+            writeback: Some(BStackRange::new(loc, size_of::<VecDesc>() as u64)),
+            allocator,
+            _marker: PhantomData,
+        }))
+    }
+
     /// Reconstruct a **detached** handle from a descriptor value (no write-back;
     /// the descriptor lives only in memory). Used by `bstack_move!`.
     pub fn from_desc(desc: VecDesc, allocator: &'a A) -> Self {
@@ -228,6 +247,20 @@ impl<'a, T: BStackBlock, A: BStackOwnedSliceAllocator> BStackBlockVec<'a, T, A> 
         })
     }
 
+    /// Like [`from_field`](Self::from_field), but nullable — `None` when the
+    /// inline descriptor is the offset-0 niche. Backs `Option<Vec<Thing>>`.
+    ///
+    /// # Safety
+    /// As [`from_field`](Self::from_field).
+    pub unsafe fn from_field_opt(loc: u64, allocator: &'a A) -> io::Result<Option<Self>> {
+        Ok(
+            unsafe { BStackVec::from_field_opt(loc, allocator)? }.map(|offsets| Self {
+                offsets,
+                _marker: PhantomData,
+            }),
+        )
+    }
+
     /// Reconstruct a detached handle from a descriptor value. Used by `bstack_move!`.
     pub fn from_desc(desc: VecDesc, allocator: &'a A) -> Self {
         Self {
@@ -327,6 +360,20 @@ impl<'a, T: BStackShared, A: BStackOwnedSliceAllocator> BStackStrongVec<'a, T, A
             offsets: unsafe { BStackVec::from_field(loc, allocator)? },
             _marker: PhantomData,
         })
+    }
+
+    /// Like [`from_field`](Self::from_field), but nullable — `None` when the
+    /// inline descriptor is the offset-0 niche. Backs `Option<Vec<Thing>>`.
+    ///
+    /// # Safety
+    /// As [`from_field`](Self::from_field).
+    pub unsafe fn from_field_opt(loc: u64, allocator: &'a A) -> io::Result<Option<Self>> {
+        Ok(
+            unsafe { BStackVec::from_field_opt(loc, allocator)? }.map(|offsets| Self {
+                offsets,
+                _marker: PhantomData,
+            }),
+        )
     }
 
     /// Reconstruct a detached handle from a descriptor value. Used by `bstack_move!`.
@@ -433,6 +480,20 @@ impl<'a, T: BStackWeakable, A: BStackOwnedSliceAllocator> BStackWeakVec<'a, T, A
         })
     }
 
+    /// Like [`from_field`](Self::from_field), but nullable — `None` when the
+    /// inline descriptor is the offset-0 niche. Backs `Option<Vec<Thing>>`.
+    ///
+    /// # Safety
+    /// As [`from_field`](Self::from_field).
+    pub unsafe fn from_field_opt(loc: u64, allocator: &'a A) -> io::Result<Option<Self>> {
+        Ok(
+            unsafe { BStackVec::from_field_opt(loc, allocator)? }.map(|offsets| Self {
+                offsets,
+                _marker: PhantomData,
+            }),
+        )
+    }
+
     /// Reconstruct a detached handle from a descriptor value. Used by `bstack_move!`.
     pub fn from_desc(desc: VecDesc, allocator: &'a A) -> Self {
         Self {
@@ -524,6 +585,20 @@ impl<'a, T: BStackBlock, A: BStackOwnedSliceAllocator> BStackRefVec<'a, T, A> {
             offsets: unsafe { BStackVec::from_field(loc, allocator)? },
             _marker: PhantomData,
         })
+    }
+
+    /// Like [`from_field`](Self::from_field), but nullable — `None` when the
+    /// inline descriptor is the offset-0 niche. Backs `Option<Vec<Thing>>`.
+    ///
+    /// # Safety
+    /// As [`from_field`](Self::from_field).
+    pub unsafe fn from_field_opt(loc: u64, allocator: &'a A) -> io::Result<Option<Self>> {
+        Ok(
+            unsafe { BStackVec::from_field_opt(loc, allocator)? }.map(|offsets| Self {
+                offsets,
+                _marker: PhantomData,
+            }),
+        )
     }
 
     /// Reconstruct a detached handle from a descriptor value. Used by `bstack_move!`.
