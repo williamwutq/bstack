@@ -116,7 +116,8 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         };
         if let Some(vinfo) = vinfo {
             let elem = &vinfo.elem;
-            on_disk_fields.push(quote!(#fname: u64,));
+            // The descriptor lives inline in the field (no descriptor block).
+            on_disk_fields.push(quote!(#fname: ::bstack_raii::VecDesc,));
             let cap = format_ident!("__cap_{}", fname);
             mv_caps.push(quote!(let #cap = __od.#fname;));
 
@@ -560,19 +561,20 @@ fn vec_field(ty: &Type) -> Option<VecInfo> {
     None
 }
 
-/// Teardown for an owned `Vec<T>` / `String` field: free its `BStackVec` (data +
-/// descriptor blocks).
-fn vec_drop_stmt(fname: &Ident, _elem: &TokenStream) -> TokenStream {
+/// Teardown for a POD `Vec<T>` / `String` field: free the vector's data block
+/// (the inline descriptor is freed with the enclosing struct's block).
+fn vec_drop_stmt(fname: &Ident, elem: &TokenStream) -> TokenStream {
     quote! {
         {
-            use ::bstack_raii::BStackDrop as _;
-            ::bstack_raii::VecRef::from_descriptor(__on_disk.#fname).bstack_drop(allocator)?;
+            ::bstack_raii::BStackVec::<#elem, __A>::from_desc(__on_disk.#fname, allocator)
+                .bstack_drop()?;
         }
     }
 }
 
-/// Accessor for a `Vec<T>` / `String` field: resolve the descriptor offset to a
-/// `BStackVec` handle. Takes the allocator (the vector's ops need it).
+/// Accessor for a `Vec<T>` / `String` field: read the inline descriptor at the
+/// field's location into a `BStackVec` handle. Takes the allocator (the vector's
+/// ops need it).
 fn vec_accessor(
     vis: &syn::Visibility,
     fname: &Ident,
@@ -585,17 +587,13 @@ fn vec_accessor(
             allocator: &'__v __A,
         ) -> ::std::io::Result<::bstack_raii::BStackVec<'__v, #elem, __A>> {
             let __field = self.0.start() + ::core::mem::offset_of!(#on_disk, #fname) as u64;
-            let mut __buf = [0u8; 8];
-            allocator.stack().get_into(__field, &mut __buf)?;
-            ::std::result::Result::Ok(unsafe {
-                ::bstack_raii::BStackVec::from_descriptor(u64::from_le_bytes(__buf), allocator)
-            })
+            unsafe { ::bstack_raii::BStackVec::from_field(__field, allocator) }
         }
     }
 }
 
-/// Constructor `(param, prep, init)` for a `Vec<T>` / `String` field: build the
-/// `BStackVec` from the passed data and store its descriptor offset.
+/// Constructor `(param, prep, init)` for a `Vec<T>` / `String` field: allocate
+/// the data block and store its descriptor inline in the field.
 fn vec_ctor(fname: &Ident, vinfo: &VecInfo) -> (TokenStream, TokenStream, TokenStream) {
     let elem = &vinfo.elem;
     let (param_ty, data): (TokenStream, TokenStream) = if vinfo.is_string {
@@ -606,44 +604,42 @@ fn vec_ctor(fname: &Ident, vinfo: &VecInfo) -> (TokenStream, TokenStream, TokenS
     (
         quote!(#fname: #param_ty,),
         quote! {
-            let #fname: u64 =
+            let #fname: ::bstack_raii::VecDesc =
                 ::bstack_raii::BStackVec::<#elem, __A>::from_slice(allocator, #data)?
-                    .descriptor()
-                    .start();
+                    .descriptor();
         },
         quote!(#fname: #fname,),
     )
 }
 
-/// `bstack_move!` field for a `Vec<T>` / `String`: yield the `BStackVec` handle.
+/// `bstack_move!` field for a `Vec<T>` / `String`: yield a detached `BStackVec`
+/// carrying the inline descriptor (captured from the parent before it is freed).
 fn vec_move(cap: &Ident, elem: &TokenStream) -> (TokenStream, TokenStream) {
     (
         quote!(::bstack_raii::BStackVec<'__mv, #elem, __A>),
-        quote!(unsafe { ::bstack_raii::BStackVec::from_descriptor(#cap, __alloc) }),
+        quote!(::bstack_raii::BStackVec::from_desc(#cap, __alloc)),
     )
 }
 
 // Block-element vectors (`#[bstack_owned/strong/weak/ref] Vec<Thing>`) all share
-// the same descriptor-indirected offset-array storage and a uniform
-// codegen-facing API (`from_descriptor` / `from_handles` / `descriptor` /
+// the same inline-descriptor offset-array storage and a uniform codegen-facing
+// API (`from_field` / `from_desc` / `from_handles` / `descriptor` /
 // `bstack_drop`); only the runtime type (`vec_ty`) and the element-handle type
 // differ per element relationship. These helpers are parameterized over both.
 
 /// Teardown for a block-element `Vec<Thing>` field: run the vector's own
-/// `bstack_drop` (per-element release + free the offset array + descriptor).
+/// `bstack_drop` (per-element release + free the offset array).
 fn block_vec_drop_stmt(fname: &Ident, vec_ty: TokenStream, elem: &TokenStream) -> TokenStream {
     quote! {
         {
-            unsafe {
-                ::bstack_raii::#vec_ty::<#elem, __A>::from_descriptor(__on_disk.#fname, allocator)
-                    .bstack_drop()?;
-            }
+            ::bstack_raii::#vec_ty::<#elem, __A>::from_desc(__on_disk.#fname, allocator)
+                .bstack_drop()?;
         }
     }
 }
 
-/// Accessor for a block-element `Vec<Thing>` field: resolve the descriptor offset
-/// to the vector handle. Takes the allocator (its ops need it).
+/// Accessor for a block-element `Vec<Thing>` field: read the inline descriptor at
+/// the field's location into the vector handle. Takes the allocator.
 fn block_vec_accessor(
     vis: &syn::Visibility,
     fname: &Ident,
@@ -657,18 +653,14 @@ fn block_vec_accessor(
             allocator: &'__v __A,
         ) -> ::std::io::Result<::bstack_raii::#vec_ty<'__v, #elem, __A>> {
             let __field = self.0.start() + ::core::mem::offset_of!(#on_disk, #fname) as u64;
-            let mut __buf = [0u8; 8];
-            allocator.stack().get_into(__field, &mut __buf)?;
-            ::std::result::Result::Ok(unsafe {
-                ::bstack_raii::#vec_ty::from_descriptor(u64::from_le_bytes(__buf), allocator)
-            })
+            unsafe { ::bstack_raii::#vec_ty::from_field(__field, allocator) }
         }
     }
 }
 
 /// Constructor `(param, prep, init)` for a block-element `Vec<Thing>` field:
 /// build the vector from a `Vec` of element handles (each consumed) and store its
-/// descriptor offset.
+/// descriptor inline in the field.
 fn block_vec_ctor(
     fname: &Ident,
     elem: &TokenStream,
@@ -678,21 +670,24 @@ fn block_vec_ctor(
     (
         quote!(#fname: ::std::vec::Vec<#handle_ty>,),
         quote! {
-            let #fname: u64 =
+            let #fname: ::bstack_raii::VecDesc =
                 ::bstack_raii::#vec_ty::<#elem, __A>::from_handles(allocator, #fname)?
-                    .descriptor()
-                    .start();
+                    .descriptor();
         },
         quote!(#fname: #fname,),
     )
 }
 
-/// `bstack_move!` field for a block-element `Vec<Thing>`: yield the vector handle
-/// (now independently owned).
-fn block_vec_move(cap: &Ident, elem: &TokenStream, vec_ty: TokenStream) -> (TokenStream, TokenStream) {
+/// `bstack_move!` field for a block-element `Vec<Thing>`: yield a detached vector
+/// handle carrying the inline descriptor (now independently owned).
+fn block_vec_move(
+    cap: &Ident,
+    elem: &TokenStream,
+    vec_ty: TokenStream,
+) -> (TokenStream, TokenStream) {
     (
         quote!(::bstack_raii::#vec_ty<'__mv, #elem, __A>),
-        quote!(unsafe { ::bstack_raii::#vec_ty::from_descriptor(#cap, __alloc) }),
+        quote!(::bstack_raii::#vec_ty::from_desc(#cap, __alloc)),
     )
 }
 

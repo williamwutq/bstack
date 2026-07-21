@@ -976,24 +976,22 @@ fn bstack_vec_grow_and_free() {
     let tmp = TempStack::new();
     let alloc = tmp.allocator();
 
-    // Build from a slice, read it back.
+    // Build a detached vector from a slice, read it back.
     let mut v = BStackVec::<u8, _>::from_slice(&alloc, b"hello").unwrap();
     assert_eq!(v.len().unwrap(), 5);
     assert_eq!(v.to_vec().unwrap(), b"hello");
 
-    // The stable identity is the descriptor.
-    let desc = v.descriptor();
-
-    // Grow past capacity: the data block reallocs/moves, but the descriptor
-    // (and hence the field pointer) is unchanged.
+    // A detached vector carries its descriptor in memory: as it grows, the
+    // descriptor tracks the (reallocating) data block.
+    let before = v.descriptor().data_size;
     for &b in b", world!" {
         v.push(b).unwrap();
     }
-    assert_eq!(v.descriptor(), desc); // identity stable across growth
+    assert!(v.descriptor().data_size >= before); // block tracks growth
     assert_eq!(v.to_vec().unwrap(), b"hello, world!");
     assert_eq!(v.len().unwrap(), 13);
 
-    // Free the data block + descriptor.
+    // Free the data block (there is no descriptor block).
     v.bstack_drop().unwrap();
 
     // Allocator is healthy afterwards: a fresh vector round-trips.

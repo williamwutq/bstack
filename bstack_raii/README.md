@@ -182,10 +182,11 @@ yields `Option<…>`. (`#[bstack_weak]` fields are already nullable by nature.)
 
 ### Variable-length: `Vec<T>` and `String`
 
-An `#[bstack_owned] Vec<T>` (POD `T`) or `String` field stores a growable
-sequence. On disk the field is a fixed-size pointer to a small **descriptor**
-block, which in turn points to the (growable, reallocating) data block — so the
-field stays fixed-size while the data can grow and move:
+A `Vec<T>` (POD `T`) or `String` field stores a growable sequence. On disk the
+field holds a fixed-size **descriptor** — `{ data_off, data_size }` stored
+*inline* — pointing at the (growable, reallocating) data block. The field stays
+fixed-size while the data grows and moves; because the struct uniquely owns the
+vector, the descriptor needs no separate block:
 
 ```rust
 #[bstack_block]
@@ -197,14 +198,19 @@ struct Record {
 
 let rec = Record::new(&alloc, "hello", &[1u32, 2, 3], 42)?;  // &str / &[T] / value
 let mut tags = rec.handle().tags(&alloc)?;    // a BStackVec<u32> handle
-tags.push(4)?;                                // grows in place, visible on re-read
+tags.push(4)?;                                // grows; rewrites the inline descriptor
 assert_eq!(rec.handle().tags(&alloc)?.to_vec()?, vec![1, 2, 3, 4]);
 ```
 
 The accessor returns a [`BStackVec<T>`] handle (`len` / `to_vec` / `push`); the
-constructor takes `&str` / `&[T]`; `bstack_move!` yields the `BStackVec`. The
-descriptor + data array are always owned by the enclosing struct, so freeing the
-block frees them.
+constructor takes `&str` / `&[T]`; freeing the block frees the data (the inline
+descriptor goes with the struct). A field handle rewrites the inline descriptor
+when a push reallocates.
+
+A vector **not** resident in a field — built by `BStackVec::from_slice` or handed
+out by `bstack_move!` — is *detached*: it carries its descriptor in memory and
+frees only its data block on `bstack_drop`. It becomes persistent when written
+into a struct field (which stamps the inline descriptor).
 
 #### Vectors of blocks: `#[bstack_owned/strong/weak/ref] Vec<Thing>`
 
@@ -213,13 +219,13 @@ When the elements are `#[bstack_block]` values, the field annotation states the
 struct). The vector stores each element's offset; the annotation decides what
 happens to the elements on teardown — mirroring single-field annotations:
 
-| Field                              | Element handle       | Accessor type          | On the struct's teardown        |
-|------------------------------------|----------------------|------------------------|---------------------------------|
-| `Vec<T>` / `String` *(un-annotated)* | POD value (`T: Pod`) | `BStackVec<T>`         | frees array + descriptor        |
-| `#[bstack_owned] Vec<Thing>`       | `BStackOwned<Thing>` | `BStackBlockVec<Thing>`| recursively frees every child   |
-| `#[bstack_strong] Vec<Thing>`      | `BStackRc<Thing>`    | `BStackStrongVec<Thing>`| releases each strong ref (frees at 0) |
-| `#[bstack_weak] Vec<Thing>`        | `BStackWeak<Thing>`  | `BStackWeakVec<Thing>` | releases each weak ref          |
-| `#[bstack_ref] Vec<Thing>`         | `BStackRef<Thing>`   | `BStackRefVec<Thing>`  | frees array + descriptor only   |
+| Field                                | Element handle       | Accessor type            | On the struct's teardown                              |
+|--------------------------------------|----------------------|--------------------------|-------------------------------------------------------|
+| `Vec<T>` / `String` *(un-annotated)* | POD value (`T: Pod`) | `BStackVec<T>`           | frees the data block                                  |
+| `#[bstack_owned] Vec<Thing>`         | `BStackOwned<Thing>` | `BStackBlockVec<Thing>`  | recursively frees every child, then the offset array  |
+| `#[bstack_strong] Vec<Thing>`        | `BStackRc<Thing>`    | `BStackStrongVec<Thing>` | releases each strong ref (frees at 0), then the array |
+| `#[bstack_weak] Vec<Thing>`          | `BStackWeak<Thing>`  | `BStackWeakVec<Thing>`   | releases each weak ref, then the array                |
+| `#[bstack_ref] Vec<Thing>`           | `BStackRef<Thing>`   | `BStackRefVec<Thing>`    | frees the offset array only                           |
 
 ```rust
 #[bstack_block]
@@ -257,14 +263,14 @@ but you're nudged to write the owned type.
 The typed handle `X` is a bare `(offset, len)` with no allocator — cheap,
 `Copy`, and the thing you read fields through. Ownership wrappers layer on top:
 
-| Handle               | Allocator | Ownership                        | Teardown                                                          |
-|----------------------|-----------|----------------------------------|-------------------------------------------------------------------|
-| `X` (the block type) | no        | none (borrowed view / bare ref)  | `x.bstack_drop(alloc)?` — explicit only                           |
-| `BStackOwned<X>`     | no        | exclusive (ownership marker)     | `owned.bstack_drop(alloc)?` — **nothing on `Drop`**               |
-| `AutoDrop<T>`        | yes       | RAII guard over any `BStackDrop` | runs `bstack_drop` on Rust `Drop`                                 |
+| Handle               | Allocator | Ownership                        | Teardown                                                             |
+|----------------------|-----------|----------------------------------|----------------------------------------------------------------------|
+| `X` (the block type) | no        | none (borrowed view / bare ref)  | `x.bstack_drop(alloc)?` — explicit only                              |
+| `BStackOwned<X>`     | no        | exclusive (ownership marker)     | `owned.bstack_drop(alloc)?` — **nothing on `Drop`**                  |
+| `AutoDrop<T>`        | yes       | RAII guard over any `BStackDrop` | runs `bstack_drop` on Rust `Drop`                                    |
 | `BStackRc<X>`        | yes       | shared strong                    | `try_clone` / `downgrade`; **auto-decrements on `Drop`**, frees at 0 |
-| `BStackWeak<X>`      | yes       | none (keeps control block alive) | `try_clone` / `upgrade`; auto-decrements weak on `Drop`           |
-| `BStackRef<X>`       | no        | none (raw offset)                | none                                                              |
+| `BStackWeak<X>`      | yes       | none (keeps control block alive) | `try_clone` / `upgrade`; auto-decrements weak on `Drop`              |
+| `BStackRef<X>`       | no        | none (raw offset)                | none                                                                 |
 
 **Owned is manual; shared is automatic.** A uniquely-owned `BStackOwned<X>`
 carries no allocator and frees **nothing** when its handle drops — so a
