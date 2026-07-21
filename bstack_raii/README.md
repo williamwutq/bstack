@@ -210,7 +210,15 @@ when a push reallocates.
 A vector **not** resident in a field — built by `BStackVec::from_slice` or handed
 out by `bstack_move!` — is *detached*: it carries its descriptor in memory and
 frees only its data block on `bstack_drop`. It becomes persistent when written
-into a struct field (which stamps the inline descriptor).
+into a struct field (which stamps the inline descriptor) — the general
+[moved-out-values-are-unrooted](#moving-fields-out-bstack_move) rule.
+
+Wrapping a vector field in `Option` makes it nullable — `Option<Vec<T>>` /
+`Option<String>` (and `Option<#[bstack_owned] Vec<Thing>>`, etc.). On disk it is
+the same inline descriptor with the `data_off == 0` niche as `None` (distinct
+from an *empty* present vector, whose data block is at a non-zero offset). The
+constructor takes `Option<&[T]>` / `Option<&str>` / `Option<Vec<Handle>>`, the
+accessor returns `Option<_>`, and `bstack_move!` yields `Option<_>`.
 
 #### Vectors of blocks: `#[bstack_owned/strong/weak/ref] Vec<Thing>`
 
@@ -249,8 +257,6 @@ block elements, an **un-annotated** `Vec<T>` is always POD and requires `T: Pod`
 **Sharing a vector** between two structs isn't done by pointing both at the same
 descriptor (a descriptor has a single owner). Instead, wrap the vector in its own
 `#[bstack_block]` and share *that* block with `#[bstack_strong]` / `#[bstack_ref]`.
-
-Still unsupported: `Option<Vec<T>>`.
 
 ### Ergonomic reference coercion
 
@@ -377,6 +383,13 @@ match bstack_move!(rc)? {
 }
 ```
 
+> **Moved-out values are unrooted.** A handle produced by `bstack_move!` — like
+> one from `X::new` — is detached from any persistent structure. Its block still
+> lives on disk, but it is reachable *only* through your in-memory handle: if the
+> program ends without re-attaching it (storing it into another block's field) or
+> freeing it (`bstack_drop`), it becomes unreachable garbage. Persistence comes
+> from being reachable through a struct, not from having been moved out.
+
 ## Casting: `bstack_cast!`
 
 Convert between typed handles and the untyped `bstack` primitives. Upcasts are
@@ -441,9 +454,9 @@ no spin loop). All operations are durable and speak `std::io::Result`.
 
 - **Fixed-size block payloads.** A block's `OnDisk` struct is fixed-size — no
   *inline* variable-length arrays or slices. Growable data lives out-of-line via
-  the descriptor indirection: `Vec<T>` / `String` (POD) and
-  `#[bstack_owned/strong/weak/ref] Vec<Thing>` (block elements) are supported;
-  `Option<Vec<T>>` is not yet.
+  an inline descriptor: `Vec<T>` / `String` (POD),
+  `#[bstack_owned/strong/weak/ref] Vec<Thing>` (block elements), and their
+  `Option<…>` (nullable) forms are all supported.
 - **Requires a freeing allocator** that reserves offset 0 — not
   `LinearBStackAllocator` (see [Concepts](#concepts)).
 - **No generic block types**, and non-`Pod` fields must carry an annotation.
