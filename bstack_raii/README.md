@@ -25,7 +25,7 @@ object model on top.
 - [Concepts](#concepts)
 - [Defining blocks](#defining-blocks)
 - [Field ownership](#field-ownership)
-- [Handles](#handles)
+- [Handles & lifetimes](#handles--lifetimes)
 - [Shared ownership & weak references](#shared-ownership--weak-references)
 - [Moving fields out: `bstack_move!`](#moving-fields-out-bstack_move)
 - [Casting: `bstack_cast!`](#casting-bstack_cast)
@@ -47,7 +47,7 @@ bstack = "0.4"
 ```rust
 use std::io;
 use bstack::FirstFitBStackAllocator;
-use bstack_raii::{BStack, BStackAllocator, TryClone, bstack_block};
+use bstack_raii::{BStack, BStackAllocator, BStackDrop, TryClone, bstack_block};
 
 // A shared, reference-counted, weak-observable block.
 #[bstack_block(rc, weak)]
@@ -75,11 +75,18 @@ fn main() -> io::Result<()> {
     let cfg = session.handle().config(stack)?;         // -> a Config handle
     println!("v{} flags {:#b}", cfg.version(stack)?, cfg.flags(stack)?);
 
-    drop(config);   // strong = 1 — the session still owns it
-    drop(session);  // strong = 0 — Config is freed from disk automatically
+    drop(config);                 // strong = 1 — the session still owns it (Rc: auto-decrement)
+    session.bstack_drop(&alloc)?;  // strong = 0 — Config freed automatically by its refcount
     Ok(())
 }
 ```
+
+> **Owned vs. shared teardown.** A `Session` is a *uniquely owned* block, so its
+> handle (`BStackOwned<Session>`) frees **nothing on `Drop`** — you free it
+> explicitly with `bstack_drop`, so a persistent root is never silently deleted
+> when a handle goes out of scope. A shared `Config` handle (`BStackRc`) *does*
+> auto-manage its refcount on `Drop` (like `std::rc::Rc`). See
+> [Handles & lifetimes](#handles--lifetimes).
 
 A fuller walk-through (shared ownership, weak observers, durability across a
 reopen) is in [`examples/sessions.rs`](examples/sessions.rs):
@@ -183,8 +190,8 @@ field stays fixed-size while the data can grow and move:
 ```rust
 #[bstack_block]
 struct Record {
-    #[bstack_owned] name: String,
-    #[bstack_owned] tags: Vec<u32>,
+    name: String,        // POD vectors are un-annotated
+    tags: Vec<u32>,
     id: u64,
 }
 
@@ -195,10 +202,49 @@ assert_eq!(rec.handle().tags(&alloc)?.to_vec()?, vec![1, 2, 3, 4]);
 ```
 
 The accessor returns a [`BStackVec<T>`] handle (`len` / `to_vec` / `push`); the
-constructor takes `&str` / `&[T]`; `bstack_move!` yields the `BStackVec`. Freeing
-the block frees the data + descriptor. Elements must be `Pod` — `Vec<Thing>`
-(vectors of blocks), `#[bstack_ref] Vec<T>`, and `Option<Vec<T>>` are not
-supported yet.
+constructor takes `&str` / `&[T]`; `bstack_move!` yields the `BStackVec`. The
+descriptor + data array are always owned by the enclosing struct, so freeing the
+block frees them.
+
+#### Vectors of blocks: `#[bstack_owned/strong/weak/ref] Vec<Thing>`
+
+When the elements are `#[bstack_block]` values, the field annotation states the
+**elements'** ownership (the descriptor + offset array are still owned by the
+struct). The vector stores each element's offset; the annotation decides what
+happens to the elements on teardown — mirroring single-field annotations:
+
+| Field                              | Element handle       | Accessor type          | On the struct's teardown        |
+|------------------------------------|----------------------|------------------------|---------------------------------|
+| `Vec<T>` / `String` *(un-annotated)* | POD value (`T: Pod`) | `BStackVec<T>`         | frees array + descriptor        |
+| `#[bstack_owned] Vec<Thing>`       | `BStackOwned<Thing>` | `BStackBlockVec<Thing>`| recursively frees every child   |
+| `#[bstack_strong] Vec<Thing>`      | `BStackRc<Thing>`    | `BStackStrongVec<Thing>`| releases each strong ref (frees at 0) |
+| `#[bstack_weak] Vec<Thing>`        | `BStackWeak<Thing>`  | `BStackWeakVec<Thing>` | releases each weak ref          |
+| `#[bstack_ref] Vec<Thing>`         | `BStackRef<Thing>`   | `BStackRefVec<Thing>`  | frees array + descriptor only   |
+
+```rust
+#[bstack_block]
+struct Tree {
+    #[bstack_owned] kids: Vec<Leaf>,   // Tree owns each Leaf
+    label: u32,
+}
+
+let kids = vec![Leaf::new(&alloc, 10)?, Leaf::new(&alloc, 20)?];
+let tree = Tree::new(&alloc, kids, 7)?;                 // ctor takes Vec<BStackOwned<Leaf>>
+let v = tree.handle().kids(&alloc)?;                    // a BStackBlockVec<Leaf>
+assert_eq!(v.get(1)?.unwrap().val(stack)?, 20);
+tree.bstack_drop(&alloc)?;                              // recursively frees every child
+```
+
+The constructor takes a `Vec` of the corresponding element handle; the accessor
+returns the vector handle (`len` / `to_vec` / `get`; `BStackWeakVec` has
+`upgrade(i)`; each has a `push_*`). Because the annotation *is* what marks
+block elements, an **un-annotated** `Vec<T>` is always POD and requires `T: Pod`.
+
+**Sharing a vector** between two structs isn't done by pointing both at the same
+descriptor (a descriptor has a single owner). Instead, wrap the vector in its own
+`#[bstack_block]` and share *that* block with `#[bstack_strong]` / `#[bstack_ref]`.
+
+Still unsupported: `Option<Vec<T>>`.
 
 ### Ergonomic reference coercion
 
@@ -206,26 +252,35 @@ For convenience, a field written `&T` is coerced to owned `T` (and `&str` to
 `String`) with a compile warning — so a stray reference doesn't fail to compile,
 but you're nudged to write the owned type.
 
-## Handles
+## Handles & lifetimes
 
 The typed handle `X` is a bare `(offset, len)` with no allocator — cheap,
-`Copy`, and the thing you read fields through. The *owning* wrappers carry an
-allocator and run teardown on `Drop`:
+`Copy`, and the thing you read fields through. Ownership wrappers layer on top:
 
-| Handle               | Ownership                        | Notes                                      |
-|----------------------|----------------------------------|--------------------------------------------|
-| `X` (the block type) | none (borrowed view)             | `x.field(stack)`; get from `.handle()`     |
-| `BStackOwned<X>`     | exclusive                        | frees the block (recursively) on `Drop`    |
-| `BStackRc<X>`        | shared strong                    | `try_clone`, `downgrade`; frees at count 0 |
-| `BStackWeak<X>`      | none (keeps control block alive) | `try_clone`, `upgrade`                     |
-| `BStackRef<X>`       | none (raw offset)                | resolve manually                           |
+| Handle               | Allocator | Ownership                        | Teardown                                                          |
+|----------------------|-----------|----------------------------------|-------------------------------------------------------------------|
+| `X` (the block type) | no        | none (borrowed view / bare ref)  | `x.bstack_drop(alloc)?` — explicit only                           |
+| `BStackOwned<X>`     | no        | exclusive (ownership marker)     | `owned.bstack_drop(alloc)?` — **nothing on `Drop`**               |
+| `AutoDrop<T>`        | yes       | RAII guard over any `BStackDrop` | runs `bstack_drop` on Rust `Drop`                                 |
+| `BStackRc<X>`        | yes       | shared strong                    | `try_clone` / `downgrade`; **auto-decrements on `Drop`**, frees at 0 |
+| `BStackWeak<X>`      | yes       | none (keeps control block alive) | `try_clone` / `upgrade`; auto-decrements weak on `Drop`           |
+| `BStackRef<X>`       | no        | none (raw offset)                | none                                                              |
 
-Get the read handle from a wrapper with `.handle()`:
+**Owned is manual; shared is automatic.** A uniquely-owned `BStackOwned<X>`
+carries no allocator and frees **nothing** when its handle drops — so a
+persistent root is never silently deleted by going out of scope. You free it
+explicitly, or wrap it in an `AutoDrop` guard for RAII:
 
 ```rust
 let owned: BStackOwned<Node> = Node::new(&alloc, /* … */)?;
-let value = owned.handle().tag(stack)?;   // read a field
+let value = owned.handle().tag(stack)?;   // read a field (or `owned.tag(stack)?` via Deref)
+
+owned.bstack_drop(&alloc)?;               // free it now, explicitly …
+// … or: let _guard = owned.auto(&alloc); // RAII — freed when `_guard` drops
 ```
+
+Shared handles (`BStackRc` / `BStackWeak`) *do* manage their reference counts
+automatically on `Drop`, exactly like `std::rc::Rc` / `Weak`.
 
 Construction (`new`) consumes the children it takes ownership of:
 
@@ -283,7 +338,9 @@ owner first and then the holder is sound — no use-after-free of freed data.
 each out as a tuple and freeing only the parent *shell* — the children stay live
 on disk, now owned independently.
 
-On a **`BStackOwned<X>`** it is infallible (a unique owner):
+On a **`BStackOwned<X>`** it is infallible (a unique owner). Because a bare
+owned handle carries no allocator, pass one — `bstack_move!(owned, &alloc)`
+(symmetric with `owned.bstack_drop(&alloc)`):
 
 ```rust
 #[bstack_block]
@@ -294,7 +351,7 @@ struct Pair {
 }
 
 let pair: BStackOwned<Pair> = /* … */;
-let (left, shared, right) = bstack_move!(pair)?;
+let (left, shared, right) = bstack_move!(pair, &alloc)?;
 //   ^BStackOwned<Leaf>  ^BStackRc<Thing>  ^u32
 ```
 
@@ -302,6 +359,9 @@ On a **`BStackRc<X>`** (an `(rc)` or `(rc, weak)` block) it is a `try_unwrap`: i
 succeeds only when this handle is the **sole strong owner** (an atomic
 `strong: 1 → 0`), otherwise it hands the handle back. A weak observer does *not*
 block the move — afterward its `upgrade()` just returns `None`.
+
+An allocator-carrying handle — a `BStackRc`, or a `BStackOwned` wrapped as
+`owned.auto(&alloc)` — takes the single-argument form (the allocator rides along):
 
 ```rust
 let rc: BStackRc<Pair> = /* … */;
@@ -322,9 +382,10 @@ use bstack_raii::{BStackCastAs, BStackCastInto};   // the cast methods
 
 let owned: BStackOwned<Node> = /* … */;
 
-let slice = bstack_cast!(owned as BStackOwnedSlice);        // upcast (infallible)
+// Upcast needs an allocator, so wrap the bare owned handle first (`auto`):
+let slice = bstack_cast!(owned.auto(&alloc) as BStackOwnedSlice);   // infallible
 
-match bstack_cast!(slice as BStackOwned<Node, _>)? {        // owned downcast
+match bstack_cast!(slice as BStackOwned<Node, _>)? {        // owned downcast (bare handle)
     Ok(node)  => { /* tag matched */ }
     Err(slice) => { /* tag mismatch — slice handed back */ }
 }
@@ -372,13 +433,15 @@ no spin loop). All operations are durable and speak `std::io::Result`.
 
 ## Limitations
 
-- **Fixed-size blocks.** A block's on-disk size equals its `OnDisk` struct size;
-  there are no variable-length arrays or inline slices. Model collections as
-  linked blocks.
+- **Fixed-size block payloads.** A block's `OnDisk` struct is fixed-size — no
+  *inline* variable-length arrays or slices. Growable data lives out-of-line via
+  the descriptor indirection: `Vec<T>` / `String` (POD) and
+  `#[bstack_owned/strong/weak/ref] Vec<Thing>` (block elements) are supported;
+  `Option<Vec<T>>` is not yet.
 - **Requires a freeing allocator** that reserves offset 0 — not
   `LinearBStackAllocator` (see [Concepts](#concepts)).
 - **No generic block types**, and non-`Pod` fields must carry an annotation.
-- No enums or variable-length fields yet (planned).
+- No enums yet (planned).
 - The on-disk **ABI is not yet stable**.
 
 ## License
@@ -388,3 +451,7 @@ MIT (same as `bstack`).
 [`bstack`]: https://github.com/williamwutq/bstack
 [`TryClone`]: src/clone.rs
 [`BStackVec<T>`]: src/vec.rs
+[`BStackBlockVec<T>`]: src/vec.rs
+[`BStackStrongVec<T>`]: src/vec.rs
+[`BStackWeakVec<T>`]: src/vec.rs
+[`BStackRefVec<T>`]: src/vec.rs

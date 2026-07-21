@@ -1015,9 +1015,8 @@ fn bstack_vec_grow_and_free() {
 
 #[bstack_block]
 struct Record {
-    #[bstack_owned]
+    // POD vectors are un-annotated (an annotation would mean block elements).
     name: String,
-    #[bstack_owned]
     tags: Vec<u32>,
     id: u64,
 }
@@ -1081,4 +1080,209 @@ fn macro_vec_bstack_move() {
     // The vectors are now independently owned; free them.
     name.bstack_drop().unwrap();
     tags.bstack_drop().unwrap();
+}
+
+// --------------------------------------------------------------------------
+// #[bstack_owned] Vec<Thing> — a vector of owned block children
+// --------------------------------------------------------------------------
+
+#[bstack_block]
+struct Tree {
+    #[bstack_owned]
+    kids: Vec<MacroLeaf>,
+    label: u32,
+}
+
+#[test]
+fn macro_owned_block_vec() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    // Allocate three owned leaves, then a Tree that owns them.
+    let kids = vec![
+        MacroLeaf::new(&alloc, 10).unwrap(),
+        MacroLeaf::new(&alloc, 20).unwrap(),
+        MacroLeaf::new(&alloc, 30).unwrap(),
+    ];
+    let first_off = kids[0].handle().range().start(); // lowest allocation
+    let tree = Tree::new(&alloc, kids, 7).unwrap();
+    assert_eq!(tree.handle().label(stack).unwrap(), 7);
+
+    // Accessor resolves to a BStackBlockVec; read the children back.
+    let v = tree.handle().kids(&alloc).unwrap();
+    assert_eq!(v.len().unwrap(), 3);
+    let vals: Vec<u32> = v
+        .to_vec()
+        .unwrap()
+        .iter()
+        .map(|k| k.val(stack).unwrap())
+        .collect();
+    assert_eq!(vals, vec![10, 20, 30]);
+    assert_eq!(v.get(1).unwrap().unwrap().val(stack).unwrap(), 20);
+    assert!(v.get(3).unwrap().is_none());
+
+    // Freeing the tree recursively frees every owned child, plus the offset
+    // array and descriptor. The lowest child slot returns as proof.
+    tree.bstack_drop(&alloc).unwrap();
+    let reused = alloc_block(
+        &alloc,
+        MacroLeaf::eightcc(),
+        size_of::<<MacroLeaf as BStackBlock>::OnDisk>() as u64,
+    )
+    .unwrap();
+    assert_eq!(reused.start(), first_off);
+    unsafe { dealloc_range(&alloc, reused).unwrap() };
+}
+
+#[test]
+fn macro_owned_block_vec_move() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let kids = vec![
+        MacroLeaf::new(&alloc, 1).unwrap(),
+        MacroLeaf::new(&alloc, 2).unwrap(),
+    ];
+    let tree = Tree::new(&alloc, kids, 9).unwrap();
+
+    // bstack_move! transfers the vector out (children stay live); only the Tree
+    // shell is freed.
+    let (kids_vec, label) = bstack_move!(tree, &alloc).unwrap();
+    assert_eq!(label, 9);
+    assert_eq!(kids_vec.len().unwrap(), 2);
+    assert_eq!(kids_vec.get(0).unwrap().unwrap().val(stack).unwrap(), 1);
+
+    // The moved-out vector is independently owned; free it (children + arrays).
+    kids_vec.bstack_drop().unwrap();
+}
+
+// --------------------------------------------------------------------------
+// #[bstack_strong] / #[bstack_weak] / #[bstack_ref] Vec<Thing> — block-element
+// vectors whose annotation states the *elements'* ownership
+// --------------------------------------------------------------------------
+
+#[bstack_block]
+struct StrongList {
+    #[bstack_strong]
+    items: Vec<MacroStrongChild>,
+    n: u32,
+}
+
+/// Read a block's strong count via its data-block `ctrl` back-pointer.
+fn strong_of(stack: &BStack, data_off: u64) -> u64 {
+    let mut buf = [0u8; 8];
+    stack
+        .get_into(data_off + layout::CTRL_BACKPTR_OFFSET, &mut buf)
+        .unwrap();
+    let ctrl = u64::from_le_bytes(buf);
+    crate::refcount::load(stack, ctrl + layout::CTRL_STRONG_OFFSET).unwrap()
+}
+
+#[test]
+fn macro_strong_block_vec() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let a = MacroStrongChild::new(&alloc, 100).unwrap(); // BStackRc, strong = 1
+    let b = MacroStrongChild::new(&alloc, 200).unwrap();
+    let a_clone = a.try_clone().unwrap(); // a strong = 2
+    let a_data = a_clone.handle().range().start();
+
+    // The strong vector consumes each Rc, transferring its strong count.
+    let list = StrongList::new(&alloc, vec![a, b], 3).unwrap();
+    assert_eq!(strong_of(stack, a_data), 2); // list + a_clone
+
+    let v = list.handle().items(&alloc).unwrap();
+    assert_eq!(v.len().unwrap(), 2);
+    assert_eq!(v.get(0).unwrap().unwrap().val(stack).unwrap(), 100);
+
+    // Freeing the list releases every element's strong ref: `b` (sole owner) is
+    // freed; `a` survives via `a_clone`.
+    list.bstack_drop(&alloc).unwrap();
+    assert_eq!(strong_of(stack, a_data), 1); // a_clone only
+
+    assert_eq!(a_clone.handle().val(stack).unwrap(), 100);
+    drop(a_clone); // a freed now
+}
+
+#[bstack_block]
+struct WeakList {
+    #[bstack_weak]
+    watchers: Vec<MacroStrongChild>,
+    n: u32,
+}
+
+#[test]
+fn macro_weak_block_vec() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let a = MacroStrongChild::new(&alloc, 1).unwrap(); // strong owner
+    let b = MacroStrongChild::new(&alloc, 2).unwrap();
+
+    // The weak vector consumes each downgraded weak handle.
+    let list = WeakList::new(
+        &alloc,
+        vec![a.downgrade().unwrap(), b.downgrade().unwrap()],
+        5,
+    )
+    .unwrap();
+
+    let v = list.handle().watchers(&alloc).unwrap();
+    assert_eq!(v.len().unwrap(), 2);
+
+    // Upgrade element 0 while `a` is alive.
+    let up = v.upgrade(0).unwrap().expect("a alive");
+    assert_eq!(up.handle().val(stack).unwrap(), 1);
+    drop(up);
+
+    // Drop `a`'s data block: element 0 can no longer upgrade (sound — the vector
+    // stores control offsets, not freed data offsets).
+    drop(a);
+    let v = list.handle().watchers(&alloc).unwrap();
+    assert!(v.upgrade(0).unwrap().is_none());
+    assert!(v.upgrade(1).unwrap().is_some()); // b still alive
+
+    // Teardown releases each weak count (freeing control blocks at zero).
+    list.bstack_drop(&alloc).unwrap();
+    drop(b);
+}
+
+#[bstack_block]
+struct RefList {
+    #[bstack_ref]
+    links: Vec<MacroLeaf>,
+    n: u32,
+}
+
+#[test]
+fn macro_ref_block_vec() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    // Standalone leaves owned by us; the list only references them.
+    let a = MacroLeaf::new(&alloc, 7).unwrap();
+    let b = MacroLeaf::new(&alloc, 8).unwrap();
+    let refs = vec![
+        unsafe { BStackRef::from_range(a.handle().range()) },
+        unsafe { BStackRef::from_range(b.handle().range()) },
+    ];
+    let list = RefList::new(&alloc, refs, 9).unwrap();
+
+    let v = list.handle().links(&alloc).unwrap();
+    assert_eq!(v.len().unwrap(), 2);
+    assert_eq!(v.get(1).unwrap().unwrap().val(stack).unwrap(), 8);
+
+    // Freeing the list frees only the offset array + descriptor, not the targets.
+    list.bstack_drop(&alloc).unwrap();
+    assert_eq!(a.handle().val(stack).unwrap(), 7); // still alive
+    assert_eq!(b.handle().val(stack).unwrap(), 8);
+
+    a.bstack_drop(&alloc).unwrap();
+    b.bstack_drop(&alloc).unwrap();
 }

@@ -24,11 +24,17 @@
 //! > docs) to avoid corruption on a torn realloc.
 
 use core::marker::PhantomData;
+use core::mem::size_of;
 use std::io;
 
 use bstack::{BStackByteVec, BStackOwnedSlice, BStackOwnedSliceAllocator, BStackRange};
 use bytemuck::Pod;
 
+use crate::block::{BStackBlock, BStackShared, BStackWeakable};
+use crate::handle::WeakRef;
+use crate::owned::BStackOwned;
+use crate::reference::BStackRef;
+use crate::shared::{BStackRc, BStackWeak};
 use crate::teardown::{BStackDrop, dealloc_range};
 
 /// Byte size of a descriptor block: `{ data_off: u64, data_size: u64 }`.
@@ -90,6 +96,11 @@ impl<'a, T, A: BStackOwnedSliceAllocator> BStackVec<'a, T, A> {
     /// The descriptor block's range — the vector's stable on-disk identity.
     pub fn descriptor(&self) -> BStackRange {
         self.desc
+    }
+
+    /// The allocator this vector is bound to.
+    pub fn allocator(&self) -> &'a A {
+        self.allocator
     }
 
     fn read_desc(&self) -> io::Result<(u64, u64)> {
@@ -197,5 +208,376 @@ impl<'a, T: Pod, A: BStackOwnedSliceAllocator> BStackVec<'a, T, A> {
             self.write_desc(new_range.start(), new_range.len())?;
         }
         Ok(())
+    }
+}
+
+/// A persistent, growable vector of **owned block children**, addressed by a
+/// stable descriptor.
+///
+/// Like [`BStackVec`], but each element is a `u64` offset to a
+/// separately-allocated `#[bstack_block]` child that this vector *owns*: the
+/// backing data block stores the child offsets, and dropping the vector
+/// recursively frees every child (post-order) plus the offset array and the
+/// descriptor. Backs `#[bstack_owned] Vec<Thing>` fields.
+///
+/// > Like [`BStackVec`], growth reallocates the offset array, so use a
+/// > realloc-safe allocator.
+pub struct BStackBlockVec<'a, T: BStackBlock, A: BStackOwnedSliceAllocator> {
+    /// The offset array, stored as a POD `u64` vector behind the same descriptor
+    /// indirection. Its identity (the descriptor) is the field's stable pointer.
+    offsets: BStackVec<'a, u64, A>,
+    _marker: PhantomData<fn() -> T>,
+}
+
+impl<'a, T: BStackBlock, A: BStackOwnedSliceAllocator> BStackBlockVec<'a, T, A> {
+    /// Reconstruct a handle from its descriptor block offset.
+    ///
+    /// # Safety
+    /// `desc_off` must be the offset of a live descriptor block written by this
+    /// type, over an array of offsets to live `T` blocks this vector owns.
+    pub unsafe fn from_descriptor(desc_off: u64, allocator: &'a A) -> Self {
+        Self {
+            offsets: unsafe { BStackVec::from_descriptor(desc_off, allocator) },
+            _marker: PhantomData,
+        }
+    }
+
+    /// The descriptor block's range — the vector's stable on-disk identity.
+    pub fn descriptor(&self) -> BStackRange {
+        self.offsets.descriptor()
+    }
+
+    /// Number of elements.
+    pub fn len(&self) -> io::Result<u64> {
+        self.offsets.len()
+    }
+
+    /// Whether the vector is empty.
+    pub fn is_empty(&self) -> io::Result<bool> {
+        self.offsets.is_empty()
+    }
+
+    /// The child block's range, recovered from a stored offset and `T`'s fixed
+    /// on-disk size.
+    fn elem_range(off: u64) -> BStackRange {
+        BStackRange::new(off, size_of::<T::OnDisk>() as u64)
+    }
+
+    /// Read all element handles (non-owning views; the vector still owns them).
+    pub fn to_vec(&self) -> io::Result<Vec<T>> {
+        Ok(self
+            .offsets
+            .to_vec()?
+            .into_iter()
+            .map(|off| T::from_range(Self::elem_range(off)))
+            .collect())
+    }
+
+    /// The element at index `i`, or `None` if out of range.
+    pub fn get(&self, i: u64) -> io::Result<Option<T>> {
+        Ok(self
+            .offsets
+            .to_vec()?
+            .get(i as usize)
+            .map(|&off| T::from_range(Self::elem_range(off))))
+    }
+
+    /// Build from a list of owned children (each consumed, its ownership moved
+    /// into the vector).
+    pub fn from_handles(allocator: &'a A, children: Vec<BStackOwned<T>>) -> io::Result<Self> {
+        let offs: Vec<u64> = children
+            .into_iter()
+            .map(|c| c.into_inner().range().start())
+            .collect();
+        Ok(Self {
+            offsets: BStackVec::from_slice(allocator, &offs)?,
+            _marker: PhantomData,
+        })
+    }
+
+    /// Create an empty vector.
+    pub fn new(allocator: &'a A) -> io::Result<Self> {
+        Self::from_handles(allocator, Vec::new())
+    }
+
+    /// Append an owned child, transferring its ownership into the vector (the
+    /// offset array may realloc/move; the descriptor follows).
+    pub fn push_owned(&mut self, child: BStackOwned<T>) -> io::Result<()> {
+        let off = child.into_inner().range().start();
+        self.offsets.push(off)
+    }
+
+    /// Recursively free every owned child (post-order), then the offset array and
+    /// the descriptor. Consumes the handle.
+    pub fn bstack_drop(self) -> io::Result<()> {
+        let allocator = self.offsets.allocator();
+        for off in self.offsets.to_vec()? {
+            T::from_range(Self::elem_range(off)).bstack_drop(allocator)?;
+        }
+        self.offsets.bstack_drop()
+    }
+}
+
+/// A persistent, growable vector of **strong references** to shared block
+/// children (`(rc)` / `(rc, weak)` blocks), behind a stable descriptor.
+///
+/// Each element holds one strong reference (contributes 1 to the child's strong
+/// count); dropping the vector releases every one (freeing a child when its count
+/// hits zero) and frees the offset array + descriptor. Backs
+/// `#[bstack_strong] Vec<Thing>` fields.
+pub struct BStackStrongVec<'a, T: BStackShared, A: BStackOwnedSliceAllocator> {
+    offsets: BStackVec<'a, u64, A>,
+    _marker: PhantomData<fn() -> T>,
+}
+
+impl<'a, T: BStackShared, A: BStackOwnedSliceAllocator> BStackStrongVec<'a, T, A> {
+    /// # Safety
+    /// `desc_off` must be a live descriptor over an array of data offsets to
+    /// live `T` blocks, each accounting for one strong reference this vector owns.
+    pub unsafe fn from_descriptor(desc_off: u64, allocator: &'a A) -> Self {
+        Self {
+            offsets: unsafe { BStackVec::from_descriptor(desc_off, allocator) },
+            _marker: PhantomData,
+        }
+    }
+
+    /// The vector's stable on-disk identity.
+    pub fn descriptor(&self) -> BStackRange {
+        self.offsets.descriptor()
+    }
+
+    /// Number of elements.
+    pub fn len(&self) -> io::Result<u64> {
+        self.offsets.len()
+    }
+
+    /// Whether the vector is empty.
+    pub fn is_empty(&self) -> io::Result<bool> {
+        self.offsets.is_empty()
+    }
+
+    fn elem_range(off: u64) -> BStackRange {
+        BStackRange::new(off, size_of::<T::OnDisk>() as u64)
+    }
+
+    /// Read all element handles (non-owning views — the vector still holds the
+    /// strong references).
+    pub fn to_vec(&self) -> io::Result<Vec<T>> {
+        Ok(self
+            .offsets
+            .to_vec()?
+            .into_iter()
+            .map(|off| T::from_range(Self::elem_range(off)))
+            .collect())
+    }
+
+    /// The element at index `i`, or `None` if out of range.
+    pub fn get(&self, i: u64) -> io::Result<Option<T>> {
+        Ok(self
+            .offsets
+            .to_vec()?
+            .get(i as usize)
+            .map(|&off| T::from_range(Self::elem_range(off))))
+    }
+
+    /// Build from a list of strong handles (each consumed, its strong count moved
+    /// into the vector).
+    pub fn from_handles(allocator: &'a A, elems: Vec<BStackRc<'a, T, A>>) -> io::Result<Self> {
+        let offs: Vec<u64> = elems
+            .into_iter()
+            .map(|rc| {
+                let (data, _ctrl) = rc.into_raw();
+                data.into_range().start()
+            })
+            .collect();
+        Ok(Self {
+            offsets: BStackVec::from_slice(allocator, &offs)?,
+            _marker: PhantomData,
+        })
+    }
+
+    /// Append a strong reference (consumed, its count moved into the vector).
+    pub fn push_strong(&mut self, elem: BStackRc<'a, T, A>) -> io::Result<()> {
+        let (data, _ctrl) = elem.into_raw();
+        self.offsets.push(data.into_range().start())
+    }
+
+    /// Release every strong reference (freeing children that reach zero), then
+    /// free the offset array and descriptor. Consumes the handle.
+    pub fn bstack_drop(self) -> io::Result<()> {
+        let allocator = self.offsets.allocator();
+        for off in self.offsets.to_vec()? {
+            let data = unsafe { BStackRef::<T>::from_range(Self::elem_range(off)) };
+            T::drop_strong_ref(data, allocator)?;
+        }
+        self.offsets.bstack_drop()
+    }
+}
+
+/// A persistent, growable vector of **weak references** to `(rc, weak)` block
+/// children, behind a stable descriptor.
+///
+/// Each element holds one weak reference (a stored control-block offset).
+/// Dropping the vector releases every weak count (freeing a control block when
+/// it reaches zero) and frees the offset array + descriptor. Backs
+/// `#[bstack_weak] Vec<Thing>` fields.
+pub struct BStackWeakVec<'a, T: BStackWeakable, A: BStackOwnedSliceAllocator> {
+    offsets: BStackVec<'a, u64, A>,
+    _marker: PhantomData<fn() -> T>,
+}
+
+impl<'a, T: BStackWeakable, A: BStackOwnedSliceAllocator> BStackWeakVec<'a, T, A> {
+    /// # Safety
+    /// `desc_off` must be a live descriptor over an array of control-block
+    /// offsets, each accounting for one weak reference this vector owns.
+    pub unsafe fn from_descriptor(desc_off: u64, allocator: &'a A) -> Self {
+        Self {
+            offsets: unsafe { BStackVec::from_descriptor(desc_off, allocator) },
+            _marker: PhantomData,
+        }
+    }
+
+    /// The vector's stable on-disk identity.
+    pub fn descriptor(&self) -> BStackRange {
+        self.offsets.descriptor()
+    }
+
+    /// Number of elements.
+    pub fn len(&self) -> io::Result<u64> {
+        self.offsets.len()
+    }
+
+    /// Whether the vector is empty.
+    pub fn is_empty(&self) -> io::Result<bool> {
+        self.offsets.is_empty()
+    }
+
+    fn ctrl_ref(off: u64) -> BStackRef<T::Control> {
+        unsafe { BStackRef::from_range(BStackRange::new(off, size_of::<T::Control>() as u64)) }
+    }
+
+    /// Attempt to upgrade the element at index `i` to a strong handle. `None` if
+    /// out of range, or if the target's strong count has already reached zero.
+    pub fn upgrade(&self, i: u64) -> io::Result<Option<BStackRc<'a, T, A>>> {
+        let offs = self.offsets.to_vec()?;
+        let Some(&off) = offs.get(i as usize) else {
+            return Ok(None);
+        };
+        // Borrow a weak over the element's control ref just long enough to
+        // upgrade; consume it via `into_raw` so the vector's own weak count is
+        // untouched.
+        let allocator = self.offsets.allocator();
+        let weak = unsafe { BStackWeak::from_raw(Self::ctrl_ref(off), allocator) };
+        let result = weak.upgrade();
+        let _ = weak.into_raw();
+        result
+    }
+
+    /// Build from a list of weak handles (each consumed, its weak count moved
+    /// into the vector).
+    pub fn from_handles(allocator: &'a A, elems: Vec<BStackWeak<'a, T, A>>) -> io::Result<Self> {
+        let offs: Vec<u64> = elems
+            .into_iter()
+            .map(|w| w.into_raw().into_range().start())
+            .collect();
+        Ok(Self {
+            offsets: BStackVec::from_slice(allocator, &offs)?,
+            _marker: PhantomData,
+        })
+    }
+
+    /// Append a weak reference (consumed, its count moved into the vector).
+    pub fn push_weak(&mut self, elem: BStackWeak<'a, T, A>) -> io::Result<()> {
+        self.offsets.push(elem.into_raw().into_range().start())
+    }
+
+    /// Release every weak reference (freeing control blocks that reach zero),
+    /// then free the offset array and descriptor. Consumes the handle.
+    pub fn bstack_drop(self) -> io::Result<()> {
+        let allocator = self.offsets.allocator();
+        for off in self.offsets.to_vec()? {
+            WeakRef::<T>(Self::ctrl_ref(off)).bstack_drop(allocator)?;
+        }
+        self.offsets.bstack_drop()
+    }
+}
+
+/// A persistent, growable vector of **raw references** to block children, behind
+/// a stable descriptor.
+///
+/// Elements carry no ownership: dropping the vector frees only the offset array
+/// and descriptor, never the targets. Backs `#[bstack_ref] Vec<Thing>` fields.
+pub struct BStackRefVec<'a, T: BStackBlock, A: BStackOwnedSliceAllocator> {
+    offsets: BStackVec<'a, u64, A>,
+    _marker: PhantomData<fn() -> T>,
+}
+
+impl<'a, T: BStackBlock, A: BStackOwnedSliceAllocator> BStackRefVec<'a, T, A> {
+    /// # Safety
+    /// `desc_off` must be a live descriptor over an array of offsets to `T`
+    /// blocks (which this vector does not own).
+    pub unsafe fn from_descriptor(desc_off: u64, allocator: &'a A) -> Self {
+        Self {
+            offsets: unsafe { BStackVec::from_descriptor(desc_off, allocator) },
+            _marker: PhantomData,
+        }
+    }
+
+    /// The vector's stable on-disk identity.
+    pub fn descriptor(&self) -> BStackRange {
+        self.offsets.descriptor()
+    }
+
+    /// Number of elements.
+    pub fn len(&self) -> io::Result<u64> {
+        self.offsets.len()
+    }
+
+    /// Whether the vector is empty.
+    pub fn is_empty(&self) -> io::Result<bool> {
+        self.offsets.is_empty()
+    }
+
+    fn elem_range(off: u64) -> BStackRange {
+        BStackRange::new(off, size_of::<T::OnDisk>() as u64)
+    }
+
+    /// Read all element handles (non-owning views).
+    pub fn to_vec(&self) -> io::Result<Vec<T>> {
+        Ok(self
+            .offsets
+            .to_vec()?
+            .into_iter()
+            .map(|off| T::from_range(Self::elem_range(off)))
+            .collect())
+    }
+
+    /// The element at index `i`, or `None` if out of range.
+    pub fn get(&self, i: u64) -> io::Result<Option<T>> {
+        Ok(self
+            .offsets
+            .to_vec()?
+            .get(i as usize)
+            .map(|&off| T::from_range(Self::elem_range(off))))
+    }
+
+    /// Build from a list of raw references.
+    pub fn from_handles(allocator: &'a A, elems: Vec<BStackRef<T>>) -> io::Result<Self> {
+        let offs: Vec<u64> = elems.into_iter().map(|r| r.into_range().start()).collect();
+        Ok(Self {
+            offsets: BStackVec::from_slice(allocator, &offs)?,
+            _marker: PhantomData,
+        })
+    }
+
+    /// Append a raw reference.
+    pub fn push_ref(&mut self, elem: BStackRef<T>) -> io::Result<()> {
+        self.offsets.push(elem.into_range().start())
+    }
+
+    /// Free only the offset array and descriptor (elements are not owned).
+    /// Consumes the handle.
+    pub fn bstack_drop(self) -> io::Result<()> {
+        self.offsets.bstack_drop()
     }
 }

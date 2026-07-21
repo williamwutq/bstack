@@ -115,23 +115,81 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
             vec_field(eff_ty)
         };
         if let Some(vinfo) = vinfo {
-            if kind != Kind::Owned {
-                return Err(Error::new_spanned(
-                    &field.ty,
-                    "`Vec<T>` / `String` fields must be annotated `#[bstack_owned]`",
-                ));
-            }
             let elem = &vinfo.elem;
             on_disk_fields.push(quote!(#fname: u64,));
-            drop_stmts.push(vec_drop_stmt(fname, elem));
-            accessors.push(vec_accessor(vis, fname, elem, &on_disk));
-            let (param, prep, init) = vec_ctor(fname, &vinfo);
+            let cap = format_ident!("__cap_{}", fname);
+            mv_caps.push(quote!(let #cap = __od.#fname;));
+
+            // `String` is always POD bytes; a block annotation on it is meaningless.
+            if vinfo.is_string && kind != Kind::Pod {
+                return Err(Error::new_spanned(
+                    &field.ty,
+                    "`String` is always POD; remove the ownership annotation",
+                ));
+            }
+
+            // The annotation states the *elements'* relationship (the descriptor
+            // + array is always owned by this struct regardless). No annotation =>
+            // POD elements (byte storage, requiring `T: Pod`).
+            let (drop_s, acc, ctor, mv) = match kind {
+                Kind::Pod => (
+                    vec_drop_stmt(fname, elem),
+                    vec_accessor(vis, fname, elem, &on_disk),
+                    vec_ctor(fname, &vinfo),
+                    vec_move(&cap, elem),
+                ),
+                Kind::Owned => (
+                    block_vec_drop_stmt(fname, quote!(BStackBlockVec), elem),
+                    block_vec_accessor(vis, fname, elem, &on_disk, quote!(BStackBlockVec)),
+                    block_vec_ctor(
+                        fname,
+                        elem,
+                        quote!(BStackBlockVec),
+                        quote!(::bstack_raii::BStackOwned<#elem>),
+                    ),
+                    block_vec_move(&cap, elem, quote!(BStackBlockVec)),
+                ),
+                Kind::Strong => (
+                    block_vec_drop_stmt(fname, quote!(BStackStrongVec), elem),
+                    block_vec_accessor(vis, fname, elem, &on_disk, quote!(BStackStrongVec)),
+                    block_vec_ctor(
+                        fname,
+                        elem,
+                        quote!(BStackStrongVec),
+                        quote!(::bstack_raii::BStackRc<'__ctor, #elem, __A>),
+                    ),
+                    block_vec_move(&cap, elem, quote!(BStackStrongVec)),
+                ),
+                Kind::Weak => (
+                    block_vec_drop_stmt(fname, quote!(BStackWeakVec), elem),
+                    block_vec_accessor(vis, fname, elem, &on_disk, quote!(BStackWeakVec)),
+                    block_vec_ctor(
+                        fname,
+                        elem,
+                        quote!(BStackWeakVec),
+                        quote!(::bstack_raii::BStackWeak<'__ctor, #elem, __A>),
+                    ),
+                    block_vec_move(&cap, elem, quote!(BStackWeakVec)),
+                ),
+                Kind::Ref => (
+                    block_vec_drop_stmt(fname, quote!(BStackRefVec), elem),
+                    block_vec_accessor(vis, fname, elem, &on_disk, quote!(BStackRefVec)),
+                    block_vec_ctor(
+                        fname,
+                        elem,
+                        quote!(BStackRefVec),
+                        quote!(::bstack_raii::BStackRef<#elem>),
+                    ),
+                    block_vec_move(&cap, elem, quote!(BStackRefVec)),
+                ),
+            };
+            drop_stmts.push(drop_s);
+            accessors.push(acc);
+            let (param, prep, init) = ctor;
             ctor_params.push(param);
             ctor_preps.push(prep);
             ctor_inits.push(init);
-            let cap = format_ident!("__cap_{}", fname);
-            mv_caps.push(quote!(let #cap = __od.#fname;));
-            let (mv_ty, mv_rc) = vec_move(&cap, elem);
+            let (mv_ty, mv_rc) = mv;
             mv_types.push(mv_ty);
             mv_recon.push(mv_rc);
             continue;
@@ -465,7 +523,9 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
 }
 
 /// A `Vec<T>` / `String` field: its element type (tokens) and whether it's a
-/// `String` (so the constructor takes `&str`).
+/// `String` (so the constructor takes `&str`). Whether the elements are POD
+/// (byte storage) or blocks (offset storage) is decided by the field's ownership
+/// annotation, not by inspecting the element type.
 struct VecInfo {
     elem: TokenStream,
     is_string: bool,
@@ -560,6 +620,79 @@ fn vec_move(cap: &Ident, elem: &TokenStream) -> (TokenStream, TokenStream) {
     (
         quote!(::bstack_raii::BStackVec<'__mv, #elem, __A>),
         quote!(unsafe { ::bstack_raii::BStackVec::from_descriptor(#cap, __alloc) }),
+    )
+}
+
+// Block-element vectors (`#[bstack_owned/strong/weak/ref] Vec<Thing>`) all share
+// the same descriptor-indirected offset-array storage and a uniform
+// codegen-facing API (`from_descriptor` / `from_handles` / `descriptor` /
+// `bstack_drop`); only the runtime type (`vec_ty`) and the element-handle type
+// differ per element relationship. These helpers are parameterized over both.
+
+/// Teardown for a block-element `Vec<Thing>` field: run the vector's own
+/// `bstack_drop` (per-element release + free the offset array + descriptor).
+fn block_vec_drop_stmt(fname: &Ident, vec_ty: TokenStream, elem: &TokenStream) -> TokenStream {
+    quote! {
+        {
+            unsafe {
+                ::bstack_raii::#vec_ty::<#elem, __A>::from_descriptor(__on_disk.#fname, allocator)
+                    .bstack_drop()?;
+            }
+        }
+    }
+}
+
+/// Accessor for a block-element `Vec<Thing>` field: resolve the descriptor offset
+/// to the vector handle. Takes the allocator (its ops need it).
+fn block_vec_accessor(
+    vis: &syn::Visibility,
+    fname: &Ident,
+    elem: &TokenStream,
+    on_disk: &Ident,
+    vec_ty: TokenStream,
+) -> TokenStream {
+    quote! {
+        #vis fn #fname<'__v, __A: ::bstack_raii::BStackOwnedSliceAllocator>(
+            &self,
+            allocator: &'__v __A,
+        ) -> ::std::io::Result<::bstack_raii::#vec_ty<'__v, #elem, __A>> {
+            let __field = self.0.start() + ::core::mem::offset_of!(#on_disk, #fname) as u64;
+            let mut __buf = [0u8; 8];
+            allocator.stack().get_into(__field, &mut __buf)?;
+            ::std::result::Result::Ok(unsafe {
+                ::bstack_raii::#vec_ty::from_descriptor(u64::from_le_bytes(__buf), allocator)
+            })
+        }
+    }
+}
+
+/// Constructor `(param, prep, init)` for a block-element `Vec<Thing>` field:
+/// build the vector from a `Vec` of element handles (each consumed) and store its
+/// descriptor offset.
+fn block_vec_ctor(
+    fname: &Ident,
+    elem: &TokenStream,
+    vec_ty: TokenStream,
+    handle_ty: TokenStream,
+) -> (TokenStream, TokenStream, TokenStream) {
+    (
+        quote!(#fname: ::std::vec::Vec<#handle_ty>,),
+        quote! {
+            let #fname: u64 =
+                ::bstack_raii::#vec_ty::<#elem, __A>::from_handles(allocator, #fname)?
+                    .descriptor()
+                    .start();
+        },
+        quote!(#fname: #fname,),
+    )
+}
+
+/// `bstack_move!` field for a block-element `Vec<Thing>`: yield the vector handle
+/// (now independently owned).
+fn block_vec_move(cap: &Ident, elem: &TokenStream, vec_ty: TokenStream) -> (TokenStream, TokenStream) {
+    (
+        quote!(::bstack_raii::#vec_ty<'__mv, #elem, __A>),
+        quote!(unsafe { ::bstack_raii::#vec_ty::from_descriptor(#cap, __alloc) }),
     )
 }
 
