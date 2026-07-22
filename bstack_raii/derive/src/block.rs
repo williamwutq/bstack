@@ -1598,16 +1598,25 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
     // or, absent that, the smallest integer type that fits every value.
     let disc_values: Vec<i128> = {
         let mut next: i128 = 0;
-        let mut out = Vec::with_capacity(input.variants.len());
+        let mut out: Vec<i128> = Vec::with_capacity(input.variants.len());
         for v in &input.variants {
             let d = match &v.discriminant {
                 Some((_, expr)) => parse_disc_expr(expr)?,
                 None => next,
             };
+            // The macro replaces the enum, so rustc's E0081 never fires; a
+            // duplicate would only surface as an `unreachable_patterns` warning on
+            // the generated match (and read the wrong variant). Reject it clearly.
+            if out.contains(&d) {
+                return Err(Error::new_spanned(
+                    v,
+                    format!("discriminant value `{d}` assigned more than once"),
+                ));
+            }
             out.push(d);
-            next = d.checked_add(1).ok_or_else(|| {
-                Error::new_spanned(v, "#[bstack_enum] discriminant overflow")
-            })?;
+            next = d
+                .checked_add(1)
+                .ok_or_else(|| Error::new_spanned(v, "#[bstack_enum] discriminant overflow"))?;
         }
         out
     };
