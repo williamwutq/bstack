@@ -1675,3 +1675,137 @@ fn macro_enum_cast() {
     ));
     back.bstack_drop(&alloc).unwrap();
 }
+
+// --------------------------------------------------------------------------
+// #[bstack_enum] discriminant width — repr(..) + inference from values
+// --------------------------------------------------------------------------
+
+// repr(u64) (== `repr(aligned)`): an 8-byte discriminant leaves the payload
+// 8-aligned. header(16) + disc(8) + payload(8) = 32.
+#[bstack_enum(repr(u64))]
+enum Aligned {
+    X(u32),
+    #[bstack_owned]
+    Y(MacroLeaf),
+}
+
+#[test]
+fn macro_enum_repr_aligned() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    assert_eq!(size_of::<<Aligned as BStackBlock>::OnDisk>(), 32);
+
+    let e = Aligned::new(&alloc, AlignedData::X(77)).unwrap();
+    match e.handle().read(&alloc).unwrap() {
+        AlignedView::X(n) => assert_eq!(n, 77),
+        _ => panic!("expected X"),
+    }
+    e.bstack_drop(&alloc).unwrap();
+
+    let leaf = MacroLeaf::new(&alloc, 3).unwrap();
+    let e = Aligned::new(&alloc, AlignedData::Y(leaf)).unwrap();
+    match e.handle().read(&alloc).unwrap() {
+        AlignedView::Y(c) => assert_eq!(c.val(stack).unwrap(), 3),
+        _ => panic!("expected Y"),
+    }
+    e.bstack_drop(&alloc).unwrap();
+}
+
+// Explicit values wider than a byte force a `u16` discriminant (a `u8` literal
+// `404` would be a compile error, so compiling here proves inference widened).
+#[bstack_enum]
+enum Status {
+    Ok = 200,
+    NotFound = 404,
+    Error = 500,
+}
+
+// A negative value forces a *signed* discriminant.
+#[bstack_enum]
+enum Temp {
+    Freezing = -40,
+    Zero = 0,
+    Boiling = 100,
+}
+
+#[test]
+fn macro_enum_discriminant_inference() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+
+    // header(16) + disc(u16 = 2) + payload(0) = 18. (The value 404 would not fit a
+    // `u8` discriminant, so compiling at all proves inference widened to u16.)
+    assert_eq!(size_of::<<Status as BStackBlock>::OnDisk>(), 18);
+
+    let e = Status::new(&alloc, StatusData::Ok).unwrap();
+    assert!(matches!(e.handle().read(&alloc).unwrap(), StatusView::Ok));
+    e.bstack_drop(&alloc).unwrap();
+    let e = Status::new(&alloc, StatusData::NotFound).unwrap();
+    assert!(matches!(
+        e.handle().read(&alloc).unwrap(),
+        StatusView::NotFound
+    ));
+    e.bstack_drop(&alloc).unwrap();
+    let e = Status::new(&alloc, StatusData::Error).unwrap();
+    assert!(matches!(
+        e.handle().read(&alloc).unwrap(),
+        StatusView::Error
+    ));
+    e.bstack_drop(&alloc).unwrap();
+
+    // Signed: header(16) + disc(i8 = 1) + payload(0) = 17.
+    assert_eq!(size_of::<<Temp as BStackBlock>::OnDisk>(), 17);
+    let e = Temp::new(&alloc, TempData::Freezing).unwrap();
+    assert!(matches!(
+        e.handle().read(&alloc).unwrap(),
+        TempView::Freezing
+    ));
+    e.bstack_drop(&alloc).unwrap();
+    let e = Temp::new(&alloc, TempData::Boiling).unwrap();
+    assert!(matches!(
+        e.handle().read(&alloc).unwrap(),
+        TempView::Boiling
+    ));
+    e.bstack_drop(&alloc).unwrap();
+}
+
+// --------------------------------------------------------------------------
+// #[bstack_enum] custom tags — tag / ctrl_tag / allow(overlong_tag)
+// --------------------------------------------------------------------------
+
+#[bstack_enum(tag = "EN", ctrl_tag = "ec", rc, weak)]
+enum TaggedEnum {
+    A,
+    B(u32),
+}
+
+#[bstack_enum(tag = "WAYTOOLONGENUMTAG", allow(overlong_tag))]
+enum LongTagEnum {
+    A,
+}
+
+#[test]
+fn macro_enum_tags() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    // Custom data-tag prefix; overlong override truncated to 8 (allow silences).
+    assert_eq!(&TaggedEnum::eightcc().0[0..2], b"EN");
+    assert_eq!(&LongTagEnum::eightcc().0, b"WAYTOOLO");
+
+    // ctrl_tag applies to the (rc, weak) control block.
+    let rc = TaggedEnum::new(&alloc, TaggedEnumData::A).unwrap();
+    let data_off = rc.handle().range().start();
+    let mut buf = [0u8; 8];
+    stack
+        .get_into(data_off + layout::CTRL_BACKPTR_OFFSET, &mut buf)
+        .unwrap();
+    let ctrl_off = u64::from_le_bytes(buf);
+    let mut ctag = [0u8; 8];
+    stack.get_into(ctrl_off + 8, &mut ctag).unwrap();
+    assert_eq!(&ctag[0..2], b"ec");
+    drop(rc);
+}

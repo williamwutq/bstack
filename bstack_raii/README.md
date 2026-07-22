@@ -353,7 +353,7 @@ other sum type is a `#[bstack_enum]`.
 
 ### Enums: `#[bstack_enum]`
 
-A `#[bstack_enum]` lowers a Rust `enum` to a **tagged-union block**: a 1-byte
+A `#[bstack_enum]` lowers a Rust `enum` to a **tagged-union block**: a
 discriminant plus a payload area sized to the largest variant. Each variant is
 **unit** (no data), a **POD** newtype `V(P)` (`P: Pod`, stored inline), or an
 annotated newtype whose annotation states the *variant's* relationship, exactly
@@ -406,6 +406,24 @@ match bstack_move!(node, &alloc)? {
 An enum is a block, so it is **always referenced** — store it as a struct field
 (inline embedding isn't supported). Struct and multi-field tuple variants aren't
 supported.
+
+#### Discriminant width
+
+The discriminant defaults to the **smallest integer** that fits every variant's
+value — honoring explicit `= value` discriminants (Rust's rules: explicit, else
+previous + 1), and choosing a **signed** type if any value is negative. So a
+plain enum is a `u8`; `enum S { Ok = 200, NotFound = 404 }` widens to `u16`;
+`enum T { Freezing = -40, .. }` becomes `i8`.
+
+Pin it with `repr(..)` — `#[bstack_enum(repr(u16))]` (any of
+`u8|u16|u32|u64|i8|i16|i32|i64`; `usize`/`isize` are rejected, since bstack
+offsets are 64-bit). `repr(aligned)` is `repr(u64)`: the 8-byte discriminant
+leaves the payload **8-aligned**, so a variant's on-disk `u64` ref gets aligned
+(single-I/O) writes.
+
+Enums take the same tag controls as structs: `tag = "…"`, `ctrl_tag = "…"` (for
+`(rc, weak)`), and `allow(overlong_tag)` — e.g.
+`#[bstack_enum(repr(u64), rc, weak, tag = "NODE")]`.
 
 ### Field types
 
@@ -515,6 +533,8 @@ struct OrderLine { /* … */ }
 lowercased). An override longer than 8 bytes is truncated with a compile warning;
 `#[bstack_block(allow(overlong_tag))]` silences it (as does `allow(coerced_ref)`
 for the coercion warning, or a real `#[allow(deprecated)]` on the item).
+
+This also works for `#[bstack_enum]` — e.g. `#[bstack_enum(rc, tag = "ENMTAG")] enum Mode { Unit, Val(u32) }`.
 
 ## Limitations
 

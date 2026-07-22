@@ -67,14 +67,26 @@ pub fn bstack_block(args: TokenStream, item: TokenStream) -> TokenStream {
 
 /// `#[bstack_enum]` — a tagged-union block.
 ///
-/// Lowers an `enum` to a fixed-size block: a 1-byte discriminant plus a payload
-/// area sized to the largest variant. Variants may be **unit** (no data), a
-/// **POD** newtype `V(P)` (`P: Pod`, stored inline), or an annotated newtype
+/// Lowers an `enum` to a fixed-size block: a discriminant plus a payload area
+/// sized to the largest variant. Variants may be **unit** (no data), a **POD**
+/// newtype `V(P)` (`P: Pod`, stored inline), or an annotated newtype
 /// `#[bstack_owned]` / `#[bstack_strong]` / `#[bstack_weak]` / `#[bstack_ref]`
 /// `V(T)` (a `u64` offset to the child / control block, released on teardown per
 /// the annotation). Only single-field tuple variants are allowed (no struct or
 /// multi-field variants). All three modes are supported (`#[bstack_enum]`,
 /// `(rc)`, `(rc, weak)`).
+///
+/// # Arguments
+///
+/// Accepts the same `rc` / `weak` / `tag = "…"` / `ctrl_tag = "…"` /
+/// `allow(overlong_tag)` as [`macro@bstack_block`], plus **`repr(..)`** to fix
+/// the discriminant width: `repr(u8|u16|u32|u64|i8|i16|i32|i64)`, or
+/// `repr(aligned)` (== `repr(u64)`, so the 8-byte discriminant leaves the payload
+/// 8-aligned and its on-disk refs get aligned writes). `usize` / `isize` are
+/// rejected (bstack offsets are 64-bit). Without `repr`, the width is **inferred**
+/// as the smallest integer type holding every variant's discriminant — honoring
+/// explicit `= value` discriminants (Rust's rules: explicit, else previous + 1)
+/// and choosing a **signed** type if any value is negative.
 ///
 /// Generates:
 /// * `struct E(BStackRange)` (the handle) and its `EOnDisk` payload.

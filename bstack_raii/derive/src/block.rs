@@ -45,6 +45,13 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
     let attr = parse_attr(attr)?;
     let mode = attr.mode;
 
+    if attr.repr.is_some() {
+        return Err(Error::new(
+            Span::call_site(),
+            "`repr(..)` selects an enum discriminant width; it is only for #[bstack_enum]",
+        ));
+    }
+
     if !input.generics.params.is_empty() {
         return Err(Error::new_spanned(
             &input.generics,
@@ -1205,7 +1212,7 @@ fn weak_drop_stmt(fname: &Ident, inner_ty: &Type) -> TokenStream {
     }
 }
 
-/// Parsed `#[bstack_block(...)]` arguments.
+/// Parsed `#[bstack_block(...)]` / `#[bstack_enum(...)]` arguments.
 struct Attr {
     mode: Mode,
     /// Explicit data-block tag prefix (`tag = "..."`).
@@ -1216,16 +1223,21 @@ struct Attr {
     allow_overlong: bool,
     /// Suppress the reference-coercion warning (`allow(coerced_ref)`).
     allow_coerced_ref: bool,
+    /// `#[bstack_enum(repr(..))]`: the discriminant integer type name (e.g.
+    /// `"u16"`), with `aligned` normalized to `"u64"`. Enum-only.
+    repr: Option<String>,
 }
 
-/// Parse `rc`, `weak`, `tag = "..."`, `ctrl_tag = "..."`, and
-/// `allow(overlong_tag | coerced_ref | deprecated)` in any order.
+/// Parse `rc`, `weak`, `tag = "..."`, `ctrl_tag = "..."`,
+/// `allow(overlong_tag | coerced_ref | deprecated)`, and (enums)
+/// `repr(u8|u16|u32|u64|i8|i16|i32|i64|aligned)` in any order.
 fn parse_attr(attr: TokenStream) -> syn::Result<Attr> {
     let (mut rc, mut weak) = (false, false);
     let mut tag = None;
     let mut ctrl_tag = None;
     let mut allow_overlong = false;
     let mut allow_coerced_ref = false;
+    let mut repr = None;
 
     if !attr.is_empty() {
         let metas = Punctuated::<Meta, Token![,]>::parse_terminated.parse2(attr)?;
@@ -1250,6 +1262,36 @@ fn parse_attr(attr: TokenStream) -> syn::Result<Attr> {
                         Some("ctrl_tag") => ctrl_tag = Some(value),
                         _ => return Err(Error::new_spanned(&meta, unknown_opt())),
                     }
+                }
+                // `repr(u16)` / `repr(aligned)` — the enum discriminant width.
+                Meta::List(list) if list.path.is_ident("repr") => {
+                    let r: Ident = list.parse_args().map_err(|_| {
+                        Error::new_spanned(
+                            list,
+                            "expected `repr(u8|u16|u32|u64|i8|i16|i32|i64|aligned)`",
+                        )
+                    })?;
+                    repr = Some(match r.to_string().as_str() {
+                        // `aligned` == `u64`: an 8-byte discriminant leaves the
+                        // payload 8-aligned, so its on-disk refs get aligned writes.
+                        "aligned" => "u64".to_string(),
+                        name @ ("u8" | "u16" | "u32" | "u64" | "i8" | "i16" | "i32" | "i64") => {
+                            name.to_string()
+                        }
+                        "usize" | "isize" => {
+                            return Err(Error::new_spanned(
+                                &r,
+                                "`repr(usize)` / `repr(isize)` are not allowed — bstack offsets \
+                                 are 64-bit, so pick an explicit width (e.g. `repr(u64)`)",
+                            ));
+                        }
+                        _ => {
+                            return Err(Error::new_spanned(
+                                &r,
+                                "expected `u8|u16|u32|u64|i8|i16|i32|i64|aligned`",
+                            ));
+                        }
+                    });
                 }
                 // `allow(overlong_tag, coerced_ref, deprecated)` — suppress warnings.
                 Meta::List(list) if list.path.is_ident("allow") => {
@@ -1296,6 +1338,7 @@ fn parse_attr(attr: TokenStream) -> syn::Result<Attr> {
         ctrl_tag,
         allow_overlong,
         allow_coerced_ref,
+        repr,
     })
 }
 
@@ -1312,7 +1355,7 @@ fn is_allow_deprecated(attr: &syn::Attribute) -> bool {
 }
 
 fn unknown_opt() -> &'static str {
-    "expected `rc`, `weak`, `tag = \"...\"`, `ctrl_tag = \"...\"`, or `allow(...)`"
+    "expected `rc`, `weak`, `tag = \"...\"`, `ctrl_tag = \"...\"`, `allow(...)`, or (enums) `repr(...)`"
 }
 
 // ---------------------------------------------------------------------------
@@ -1479,7 +1522,67 @@ fn classify(field: &syn::Field) -> syn::Result<Kind> {
 // through a generated `EView` + `E::read`; teardown matches the discriminant and
 // frees the owned child, if any.
 
-/// Implementation of the `#[bstack_enum]` attribute macro (plain/owned mode).
+/// Parse a variant's explicit discriminant expression (`= <int>` / `= -<int>`)
+/// into an `i128`.
+fn parse_disc_expr(expr: &Expr) -> syn::Result<i128> {
+    match expr {
+        Expr::Lit(ExprLit {
+            lit: Lit::Int(li), ..
+        }) => li.base10_parse::<i128>(),
+        Expr::Unary(syn::ExprUnary {
+            op: syn::UnOp::Neg(_),
+            expr,
+            ..
+        }) => match &**expr {
+            Expr::Lit(ExprLit {
+                lit: Lit::Int(li), ..
+            }) => Ok(-li.base10_parse::<i128>()?),
+            other => Err(Error::new_spanned(
+                other,
+                "expected an integer literal discriminant",
+            )),
+        },
+        other => Err(Error::new_spanned(
+            other,
+            "expected an integer literal discriminant",
+        )),
+    }
+}
+
+/// The `[min, max]` bounds of an integer type name, as `i128`.
+fn int_bounds(ty: &str) -> (i128, i128) {
+    match ty {
+        "u8" => (0, u8::MAX as i128),
+        "u16" => (0, u16::MAX as i128),
+        "u32" => (0, u32::MAX as i128),
+        "u64" => (0, u64::MAX as i128),
+        "i8" => (i8::MIN as i128, i8::MAX as i128),
+        "i16" => (i16::MIN as i128, i16::MAX as i128),
+        "i32" => (i32::MIN as i128, i32::MAX as i128),
+        "i64" => (i64::MIN as i128, i64::MAX as i128),
+        _ => unreachable!("discriminant repr is validated in parse_attr"),
+    }
+}
+
+/// The smallest integer type name holding every value in `[min, max]` — signed
+/// iff a value is negative. This is the inferred discriminant width when no
+/// explicit `repr(..)` is given.
+fn infer_disc_ty(min: i128, max: i128) -> &'static str {
+    let candidates: [&str; 4] = if min < 0 {
+        ["i8", "i16", "i32", "i64"]
+    } else {
+        ["u8", "u16", "u32", "u64"]
+    };
+    for ty in candidates {
+        let (lo, hi) = int_bounds(ty);
+        if min >= lo && max <= hi {
+            return ty;
+        }
+    }
+    candidates[3] // i64 / u64 — the widest
+}
+
+/// Implementation of the `#[bstack_enum]` attribute macro.
 pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<TokenStream> {
     let attr = parse_attr(attr)?;
     let mode = attr.mode;
@@ -1489,12 +1592,53 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
             "#[bstack_enum] does not support generic enums",
         ));
     }
-    if input.variants.len() > 256 {
-        return Err(Error::new_spanned(
-            &input.variants,
-            "#[bstack_enum] supports at most 256 variants (1-byte discriminant)",
-        ));
-    }
+
+    // The on-disk discriminant. Each variant's value follows Rust's rules
+    // (explicit `= N`, else previous + 1); the width is an explicit `repr(..)`
+    // or, absent that, the smallest integer type that fits every value.
+    let disc_values: Vec<i128> = {
+        let mut next: i128 = 0;
+        let mut out = Vec::with_capacity(input.variants.len());
+        for v in &input.variants {
+            let d = match &v.discriminant {
+                Some((_, expr)) => parse_disc_expr(expr)?,
+                None => next,
+            };
+            out.push(d);
+            next = d.checked_add(1).ok_or_else(|| {
+                Error::new_spanned(v, "#[bstack_enum] discriminant overflow")
+            })?;
+        }
+        out
+    };
+    let dmin = disc_values.iter().copied().min().unwrap_or(0);
+    let dmax = disc_values.iter().copied().max().unwrap_or(0);
+    let disc_ty_name: String = match &attr.repr {
+        Some(r) => {
+            let (lo, hi) = int_bounds(r);
+            if dmin < lo || dmax > hi {
+                return Err(Error::new_spanned(
+                    &input.variants,
+                    format!(
+                        "a discriminant value is out of range for `repr({r})` \
+                         (values span {dmin}..={dmax})"
+                    ),
+                ));
+            }
+            r.clone()
+        }
+        None => infer_disc_ty(dmin, dmax).to_string(),
+    };
+    let disc_ty: TokenStream = disc_ty_name.parse().expect("valid integer type name");
+    // Typed literal patterns for the match arms / stored value (e.g. `300u16`).
+    let disc_pats: Vec<TokenStream> = disc_values
+        .iter()
+        .map(|v| {
+            format!("{v}{disc_ty_name}")
+                .parse()
+                .expect("valid integer literal")
+        })
+        .collect();
 
     let name = &input.ident;
     let vis = &input.vis;
@@ -1521,7 +1665,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
     let mut has_weak = false;
 
     for (i, variant) in input.variants.iter().enumerate() {
-        let disc = i as u8;
+        let disc = &disc_pats[i];
         let vname = &variant.ident;
         let kind = classify_attrs(&variant.attrs)?;
 
@@ -2001,7 +2145,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
         #vis struct #on_disk {
             __bstack_header: ::bstack_raii::BlockHeader,
             #injected_ondisk
-            __bstack_disc: u8,
+            __bstack_disc: #disc_ty,
             __bstack_payload: [u8; #name::__PAYLOAD],
         }
         unsafe impl ::bstack_raii::Zeroable for #on_disk {}
@@ -2062,7 +2206,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                 allocator: &'__e __A,
                 data: #data_ty,
             ) -> ::std::io::Result<#new_ret> {
-                let (__disc, __payload): (u8, [u8; Self::__PAYLOAD]) = match data {
+                let (__disc, __payload): (#disc_ty, [u8; Self::__PAYLOAD]) = match data {
                     #(#new_arms)*
                 };
                 let __on_disk = #on_disk {
