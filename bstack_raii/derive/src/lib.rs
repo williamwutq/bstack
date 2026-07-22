@@ -70,21 +70,25 @@ pub fn bstack_block(args: TokenStream, item: TokenStream) -> TokenStream {
 /// Lowers an `enum` to a fixed-size block: a 1-byte discriminant plus a payload
 /// area sized to the largest variant. Variants may be **unit** (no data), a
 /// **POD** newtype `V(P)` (`P: Pod`, stored inline), or an annotated newtype
-/// `#[bstack_owned] V(T)` / `#[bstack_ref] V(T)` (a `u64` offset to a child
-/// block, freed / not freed on teardown accordingly). Only single-field tuple
-/// variants are allowed (no struct or multi-field variants).
+/// `#[bstack_owned]` / `#[bstack_strong]` / `#[bstack_weak]` / `#[bstack_ref]`
+/// `V(T)` (a `u64` offset to the child / control block, released on teardown per
+/// the annotation). Only single-field tuple variants are allowed (no struct or
+/// multi-field variants). All three modes are supported (`#[bstack_enum]`,
+/// `(rc)`, `(rc, weak)`).
 ///
 /// Generates:
 /// * `struct E(BStackRange)` (the handle) and its `EOnDisk` payload.
-/// * `enum EInit` (construction input) and `enum EView` (read result — POD by
-///   value, child blocks as borrowed handles).
-/// * `impl BStackCast / BStackBlock / BStackDrop`, plus `E::new(alloc, EInit)`,
-///   `E::read(stack) -> EView`, and `E::as_slice`.
+/// * `enum EData` — the in-memory owned form: passed to `new` **and** returned by
+///   `bstack_move!` (construction and destructuring are duals), and `enum EView`
+///   — the read result (POD by value, owned/ref children as borrowed handles, a
+///   weak variant upgraded to `Option<BStackRc>`).
+/// * `impl BStackCast / BStackBlock / BStackDrop / BStackMove`, plus
+///   `E::new(alloc, EData)`, `E::read(alloc) -> EView`, and `E::as_slice`.
+///   `bstack_move!` and `bstack_cast!` work on enums as on structs.
 ///
-/// An enum is always **referenced** (it is a block; store it as a
-/// `#[bstack_owned]` / `#[bstack_ref]` field of a struct — inline embedding is
-/// not supported). `#[bstack_enum(rc)]` / `(rc, weak)` and
-/// `#[bstack_strong]` / `#[bstack_weak]` variants are not yet implemented.
+/// An enum is always **referenced** (it is a block; store it as a field of a
+/// struct — inline embedding is not supported). Struct / multi-field tuple
+/// variants are not supported.
 #[proc_macro_attribute]
 pub fn bstack_enum(args: TokenStream, item: TokenStream) -> TokenStream {
     let input = syn::parse_macro_input!(item as syn::ItemEnum);

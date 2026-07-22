@@ -1360,12 +1360,12 @@ fn macro_enum_basic() {
     let leaf_size = size_of::<<MacroLeaf as BStackBlock>::OnDisk>() as u64;
 
     // Unit variant.
-    let e = Node::new(&alloc, NodeInit::Empty).unwrap();
+    let e = Node::new(&alloc, NodeData::Empty).unwrap();
     assert!(matches!(e.handle().read(&alloc).unwrap(), NodeView::Empty));
     e.bstack_drop(&alloc).unwrap();
 
     // POD variant: value stored inline, read back.
-    let e = Node::new(&alloc, NodeInit::Num(42)).unwrap();
+    let e = Node::new(&alloc, NodeData::Num(42)).unwrap();
     match e.handle().read(&alloc).unwrap() {
         NodeView::Num(n) => assert_eq!(n, 42),
         _ => panic!("expected Num"),
@@ -1375,7 +1375,7 @@ fn macro_enum_basic() {
     // Owned variant: the enum owns the child; dropping it recursively frees it.
     let leaf = MacroLeaf::new(&alloc, 7).unwrap();
     let leaf_off = leaf.handle().range().start();
-    let e = Node::new(&alloc, NodeInit::Child(leaf)).unwrap();
+    let e = Node::new(&alloc, NodeData::Child(leaf)).unwrap();
     match e.handle().read(&alloc).unwrap() {
         NodeView::Child(c) => assert_eq!(c.val(stack).unwrap(), 7),
         _ => panic!("expected Child"),
@@ -1388,7 +1388,7 @@ fn macro_enum_basic() {
     // Ref variant: references a leaf it does NOT own; dropping the enum leaves it.
     let keep = MacroLeaf::new(&alloc, 9).unwrap();
     let link = unsafe { BStackRef::from_range(keep.handle().range()) };
-    let e = Node::new(&alloc, NodeInit::Link(link)).unwrap();
+    let e = Node::new(&alloc, NodeData::Link(link)).unwrap();
     match e.handle().read(&alloc).unwrap() {
         NodeView::Link(l) => assert_eq!(l.val(stack).unwrap(), 9),
         _ => panic!("expected Link"),
@@ -1415,7 +1415,7 @@ fn macro_enum_as_field() {
 
     let leaf = MacroLeaf::new(&alloc, 5).unwrap();
     let leaf_off = leaf.handle().range().start();
-    let node = Node::new(&alloc, NodeInit::Child(leaf)).unwrap();
+    let node = Node::new(&alloc, NodeData::Child(leaf)).unwrap();
     let holder = EnumHolder::new(&alloc, node, 3).unwrap();
     assert_eq!(holder.handle().tag(stack).unwrap(), 3);
 
@@ -1454,7 +1454,7 @@ fn macro_enum_rc() {
 
     let leaf = MacroLeaf::new(&alloc, 4).unwrap();
     let leaf_off = leaf.handle().range().start();
-    let rc = RcNode::new(&alloc, RcNodeInit::Child(leaf)).unwrap(); // BStackRc, strong = 1
+    let rc = RcNode::new(&alloc, RcNodeData::Child(leaf)).unwrap(); // BStackRc, strong = 1
     let rc2 = rc.try_clone().unwrap(); // strong = 2
 
     match rc.handle().read(&alloc).unwrap() {
@@ -1484,7 +1484,7 @@ fn macro_enum_rc_weak() {
     let stack = alloc.stack();
 
     let leaf = MacroLeaf::new(&alloc, 8).unwrap();
-    let rc = RcwNode::new(&alloc, RcwNodeInit::One(leaf)).unwrap(); // BStackRc, strong = 1
+    let rc = RcwNode::new(&alloc, RcwNodeData::One(leaf)).unwrap(); // BStackRc, strong = 1
     let weak = rc.downgrade().unwrap();
 
     match rc.handle().read(&alloc).unwrap() {
@@ -1530,7 +1530,7 @@ fn macro_enum_strong_weak_variants() {
     // Strong variant: consumes a BStackRc, the enum holds one strong reference.
     let child = MacroStrongChild::new(&alloc, 11).unwrap(); // strong = 1
     let keep = child.try_clone().unwrap(); // strong = 2 (observe after the enum drops)
-    let cell = Cell::new(&alloc, CellInit::Shared(child)).unwrap(); // consumes child's ref
+    let cell = Cell::new(&alloc, CellData::Shared(child)).unwrap(); // consumes child's ref
     match cell.handle().read(&alloc).unwrap() {
         CellView::Shared(c) => assert_eq!(c.val(stack).unwrap(), 11),
         _ => panic!("expected Shared"),
@@ -1541,7 +1541,7 @@ fn macro_enum_strong_weak_variants() {
 
     // Weak variant: consumes a BStackWeak; reading upgrades it.
     let owner = MacroStrongChild::new(&alloc, 22).unwrap(); // strong owner
-    let cell = Cell::new(&alloc, CellInit::Watch(owner.downgrade().unwrap())).unwrap();
+    let cell = Cell::new(&alloc, CellData::Watch(owner.downgrade().unwrap())).unwrap();
     match cell.handle().read(&alloc).unwrap() {
         CellView::Watch(Some(up)) => assert_eq!(up.handle().val(stack).unwrap(), 22),
         _ => panic!("expected a live Watch"),
@@ -1556,7 +1556,122 @@ fn macro_enum_strong_weak_variants() {
     cell.bstack_drop(&alloc).unwrap(); // releases the enum's weak ref (frees control)
 
     // The Nil unit variant still works alongside the shared ones.
-    let cell = Cell::new(&alloc, CellInit::Nil).unwrap();
+    let cell = Cell::new(&alloc, CellData::Nil).unwrap();
     assert!(matches!(cell.handle().read(&alloc).unwrap(), CellView::Nil));
     cell.bstack_drop(&alloc).unwrap();
+}
+
+// --------------------------------------------------------------------------
+// bstack_move! and bstack_cast! on enums
+// --------------------------------------------------------------------------
+
+#[test]
+fn macro_enum_move() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    // Owned variant: the child is moved out; the enum shell is freed.
+    let leaf = MacroLeaf::new(&alloc, 5).unwrap();
+    let node = Node::new(&alloc, NodeData::Child(leaf)).unwrap();
+    match bstack_move!(node, &alloc).unwrap() {
+        NodeData::Child(owned_leaf) => {
+            assert_eq!(owned_leaf.handle().val(stack).unwrap(), 5); // survived the move
+            owned_leaf.bstack_drop(&alloc).unwrap();
+        }
+        _ => panic!("expected Child"),
+    }
+
+    // POD / unit variants move by value.
+    let node = Node::new(&alloc, NodeData::Num(9)).unwrap();
+    assert!(matches!(
+        bstack_move!(node, &alloc).unwrap(),
+        NodeData::Num(9)
+    ));
+    let node = Node::new(&alloc, NodeData::Empty).unwrap();
+    assert!(matches!(
+        bstack_move!(node, &alloc).unwrap(),
+        NodeData::Empty
+    ));
+
+    // Ref variant: the raw ref is handed out; the target is not owned.
+    let keep = MacroLeaf::new(&alloc, 3).unwrap();
+    let link = unsafe { BStackRef::from_range(keep.handle().range()) };
+    let node = Node::new(&alloc, NodeData::Link(link)).unwrap();
+    match bstack_move!(node, &alloc).unwrap() {
+        NodeData::Link(r) => {
+            assert_eq!(r.into_range().start(), keep.handle().range().start());
+        }
+        _ => panic!("expected Link"),
+    }
+    assert_eq!(keep.handle().val(stack).unwrap(), 3); // untouched
+    keep.bstack_drop(&alloc).unwrap();
+}
+
+#[test]
+fn macro_enum_move_shared() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    // Strong variant: the BStackRc is moved out (transferring the strong ref).
+    let child = MacroStrongChild::new(&alloc, 11).unwrap();
+    let keep = child.try_clone().unwrap();
+    let cell = Cell::new(&alloc, CellData::Shared(child)).unwrap();
+    match bstack_move!(cell, &alloc).unwrap() {
+        CellData::Shared(rc) => {
+            assert_eq!(rc.handle().val(stack).unwrap(), 11);
+            drop(rc); // releases the moved-out strong ref
+        }
+        _ => panic!("expected Shared"),
+    }
+    assert_eq!(keep.handle().val(stack).unwrap(), 11); // still alive
+    drop(keep);
+
+    // Weak variant: the BStackWeak is moved out (transferring the weak ref).
+    let owner = MacroStrongChild::new(&alloc, 22).unwrap();
+    let cell = Cell::new(&alloc, CellData::Watch(owner.downgrade().unwrap())).unwrap();
+    match bstack_move!(cell, &alloc).unwrap() {
+        CellData::Watch(w) => {
+            assert_eq!(
+                w.upgrade()
+                    .unwrap()
+                    .expect("alive")
+                    .handle()
+                    .val(stack)
+                    .unwrap(),
+                22
+            );
+            drop(w);
+        }
+        _ => panic!("expected Watch"),
+    }
+    drop(owner);
+}
+
+#[test]
+fn macro_enum_cast() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let node = Node::new(&alloc, NodeData::Num(7)).unwrap();
+
+    // Borrowed downcast: slice -> enum handle (tag-checked), like a struct.
+    let slice = node.handle().as_slice(stack);
+    let n = bstack_cast!(slice as Node).unwrap().expect("tag matches");
+    assert!(matches!(n.read(&alloc).unwrap(), NodeView::Num(7)));
+    assert!(slice.cast_as::<MacroLeaf>().unwrap().is_none()); // wrong tag
+
+    // Owned upcast then downcast round-trips through BStackOwnedSlice.
+    let owned_slice = bstack_cast!(node.auto(&alloc) as BStackOwnedSlice);
+    let back = bstack_cast!(owned_slice as BStackOwned<Node, _>)
+        .unwrap()
+        .ok()
+        .unwrap();
+    assert!(matches!(
+        back.handle().read(&alloc).unwrap(),
+        NodeView::Num(7)
+    ));
+    back.bstack_drop(&alloc).unwrap();
 }

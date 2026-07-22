@@ -294,20 +294,34 @@ match node.handle().read(&alloc)? {                     // read / match the curr
 node.bstack_drop(&alloc)?;                              // frees the owned child too
 ```
 
-The macro generates the handle `Node`, plus **`NodeInit`** (construction input:
-POD by value, `#[bstack_owned]` → `BStackOwned<T>`, `#[bstack_strong]` →
-`BStackRc<T>`, `#[bstack_weak]` → `BStackWeak<T>`, `#[bstack_ref]` →
-`BStackRef<T>`) and **`NodeView`** (the read result: POD by value, owned/ref
-children as borrowed handles, a weak variant *upgraded* to `Option<BStackRc<T>>`).
-`read` takes the allocator (a weak variant upgrades through it). Teardown matches
-the discriminant and releases the variant's reference — recursively freeing an
-owned child, decrementing a strong/weak count, and nothing for a ref.
+The macro generates the handle `Node` plus two companion enums. **`NodeInit`**
+is the in-memory *owned* form (POD by value, `#[bstack_owned]` → `BStackOwned<T>`,
+`#[bstack_strong]` → `BStackRc<T>`, `#[bstack_weak]` → `BStackWeak<T>`,
+`#[bstack_ref]` → `BStackRef<T>`) — the **same** type you pass to `new` and get
+back from `bstack_move!` (construction and destructuring are duals). **`NodeView`**
+is the read result (POD by value, owned/ref children as borrowed handles, a weak
+variant *upgraded* to `Option<BStackRc<T>>`); `read` takes the allocator (a weak
+variant upgrades through it). Teardown matches the discriminant and releases the
+variant's reference — recursively freeing an owned child, decrementing a
+strong/weak count, and nothing for a ref.
 
 Like a struct, an enum has **modes**: `#[bstack_enum]` is owned, while
 `#[bstack_enum(rc)]` / `#[bstack_enum(rc, weak)]` make the enum itself
 reference-counted / weak-observable — `new` then returns a `BStackRc<E>` (with
 `try_clone` / `downgrade` / `upgrade`), and the enum can be a `#[bstack_strong]` /
 `#[bstack_weak]` field of a struct.
+
+`bstack_move!` and `bstack_cast!` work on enums too. Moving destructures the
+active variant, freeing the enum shell and handing the payload out through
+`NodeInit` (each child moved out as an owned handle):
+
+```rust
+match bstack_move!(node, &alloc)? {          // owned enum: `bstack_move!(node, &alloc)`
+    NodeInit::Child(owned) => { /* owned: BStackOwned<Leaf> — you now own it */ }
+    _ => {}
+}
+let n: Option<Node> = bstack_cast!(slice as Node)?;   // tag-checked, like a struct
+```
 
 An enum is a block, so it is **always referenced** — store it as a field of a
 struct (inline embedding isn't supported). Struct and multi-field tuple variants
@@ -511,8 +525,8 @@ no spin loop). All operations are durable and speak `std::io::Result`.
 - **No generic block types**, and non-`Pod` fields must carry an annotation.
 - **Enums** ([`#[bstack_enum]`](#enums-bstack_enum)) support unit / POD /
   `#[bstack_owned]` / `#[bstack_strong]` / `#[bstack_weak]` / `#[bstack_ref]`
-  variants in all three modes (owned / `(rc)` / `(rc, weak)`). Struct /
-  multi-field tuple variants, and `bstack_move!` on an enum, are not done.
+  variants in all three modes (owned / `(rc)` / `(rc, weak)`), plus `bstack_move!`
+  and `bstack_cast!`. Struct / multi-field tuple variants aren't supported.
 - The on-disk **ABI is not yet stable**.
 
 ## License

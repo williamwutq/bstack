@@ -1475,7 +1475,7 @@ fn classify(field: &syn::Field) -> syn::Result<Kind> {
 // area sized to the largest variant. Each variant is either a unit (no payload),
 // a POD newtype `V(P)` (bytes stored inline), or an annotated newtype
 // `#[bstack_owned]`/`#[bstack_ref]` `V(T)` (a `u64` offset to a child block).
-// Construction goes through a generated `EInit` input enum + `E::new`; reading
+// Construction goes through a generated `EData` input enum + `E::new`; reading
 // through a generated `EView` + `E::read`; teardown matches the discriminant and
 // frees the owned child, if any.
 
@@ -1500,18 +1500,22 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
     let vis = &input.vis;
     let on_disk = format_ident!("{}OnDisk", name);
     let control = format_ident!("{}OnDiskRef", name);
-    let init = format_ident!("{}Init", name);
+    // `EData` is the in-memory owned form of the enum's payload — the same type is
+    // used to *construct* (`E::new`) and to receive a *destructured* variant
+    // (`bstack_move!`), since both hold owned handles (they are duals).
+    let data = format_ident!("{}Data", name);
     let view = format_ident!("{}View", name);
 
-    let mut init_variants = Vec::new();
+    let mut data_variants = Vec::new();
     let mut view_variants = Vec::new();
     let mut new_arms = Vec::new();
     let mut read_arms = Vec::new();
+    let mut move_arms = Vec::new();
     let mut drop_arms = Vec::new();
     let mut payload_sizes = Vec::new();
     let mut pod_types: Vec<Type> = Vec::new();
     let mut needs_payload = false;
-    // A strong/weak variant makes `EInit` generic over `<'e, A>`; a weak variant
+    // A strong/weak variant makes `EData` generic over `<'e, A>`; a weak variant
     // also makes `EView` generic (its read upgrades to a `BStackRc`).
     let mut has_shared = false;
     let mut has_weak = false;
@@ -1530,6 +1534,15 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                 ))
             }
         };
+        // A `BStackRef<T>` over the child block, recovered from a stored offset.
+        let child_ref = |ty: &Type| {
+            quote! {
+                ::bstack_raii::BStackRef::<#ty>::from_range(::bstack_raii::BStackRange::new(
+                    u64::from_le_bytes(__pl[..8].try_into().unwrap()),
+                    ::core::mem::size_of::<<#ty as ::bstack_raii::BStackBlock>::OnDisk>() as u64,
+                ))
+            }
+        };
 
         match &variant.fields {
             Fields::Unit => {
@@ -1539,10 +1552,11 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                         "a unit variant carries no data, so it cannot have an ownership annotation",
                     ));
                 }
-                init_variants.push(quote!(#vname,));
+                data_variants.push(quote!(#vname,));
                 view_variants.push(quote!(#vname,));
-                new_arms.push(quote!(#init::#vname => (#disc, [0u8; Self::__PAYLOAD]),));
+                new_arms.push(quote!(#data::#vname => (#disc, [0u8; Self::__PAYLOAD]),));
                 read_arms.push(quote!(#disc => #view::#vname,));
+                move_arms.push(quote!(#disc => #data::#vname,));
             }
             Fields::Unnamed(f) if f.unnamed.len() == 1 => {
                 needs_payload = true;
@@ -1551,31 +1565,31 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                     Kind::Pod => {
                         pod_types.push(ty.clone());
                         payload_sizes.push(quote!(::core::mem::size_of::<#ty>()));
-                        init_variants.push(quote!(#vname(#ty),));
+                        data_variants.push(quote!(#vname(#ty),));
                         view_variants.push(quote!(#vname(#ty),));
                         new_arms.push(quote! {
-                            #init::#vname(__v) => {
+                            #data::#vname(__v) => {
                                 let mut __pl = [0u8; Self::__PAYLOAD];
                                 __pl[..::core::mem::size_of::<#ty>()]
                                     .copy_from_slice(::bstack_raii::bytemuck::bytes_of(&__v));
                                 (#disc, __pl)
                             }
                         });
-                        read_arms.push(quote! {
-                            #disc => #view::#vname(
-                                ::bstack_raii::bytemuck::pod_read_unaligned::<#ty>(
-                                    &__pl[..::core::mem::size_of::<#ty>()],
-                                )
-                            ),
-                        });
+                        let read_pod = quote! {
+                            ::bstack_raii::bytemuck::pod_read_unaligned::<#ty>(
+                                &__pl[..::core::mem::size_of::<#ty>()],
+                            )
+                        };
+                        read_arms.push(quote!(#disc => #view::#vname(#read_pod),));
+                        move_arms.push(quote!(#disc => #data::#vname(#read_pod),));
                     }
                     Kind::Owned => {
                         payload_sizes.push(quote!(8usize));
                         let child = child_from_off(ty);
-                        init_variants.push(quote!(#vname(::bstack_raii::BStackOwned<#ty>),));
+                        data_variants.push(quote!(#vname(::bstack_raii::BStackOwned<#ty>),));
                         view_variants.push(quote!(#vname(#ty),));
                         new_arms.push(quote! {
-                            #init::#vname(__v) => {
+                            #data::#vname(__v) => {
                                 let __h = __v.into_inner();
                                 let __off = ::bstack_raii::BStackBlock::range(&__h).start();
                                 let mut __pl = [0u8; Self::__PAYLOAD];
@@ -1584,6 +1598,11 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                             }
                         });
                         read_arms.push(quote!(#disc => #view::#vname(#child),));
+                        move_arms.push(quote! {
+                            #disc => #data::#vname(unsafe {
+                                ::bstack_raii::BStackOwned::from_raw(#child)
+                            }),
+                        });
                         drop_arms.push(quote! {
                             #disc => {
                                 let __child = unsafe {
@@ -1603,16 +1622,18 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                     Kind::Ref => {
                         payload_sizes.push(quote!(8usize));
                         let child = child_from_off(ty);
-                        init_variants.push(quote!(#vname(::bstack_raii::BStackRef<#ty>),));
+                        let cref = child_ref(ty);
+                        data_variants.push(quote!(#vname(::bstack_raii::BStackRef<#ty>),));
                         view_variants.push(quote!(#vname(#ty),));
                         new_arms.push(quote! {
-                            #init::#vname(__v) => {
+                            #data::#vname(__v) => {
                                 let mut __pl = [0u8; Self::__PAYLOAD];
                                 __pl[..8].copy_from_slice(&__v.into_range().start().to_le_bytes());
                                 (#disc, __pl)
                             }
                         });
                         read_arms.push(quote!(#disc => #view::#vname(#child),));
+                        move_arms.push(quote!(#disc => #data::#vname(unsafe { #cref }),));
                         // A raw reference owns nothing: no teardown.
                     }
                     Kind::Strong => {
@@ -1621,11 +1642,12 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                         let child = child_from_off(ty);
                         // A strong variant stores the child's DATA offset and holds
                         // one strong reference (like a `#[bstack_strong]` field).
-                        init_variants
+                        let cref = child_ref(ty);
+                        data_variants
                             .push(quote!(#vname(::bstack_raii::BStackRc<'__e, #ty, __A>),));
                         view_variants.push(quote!(#vname(#ty),));
                         new_arms.push(quote! {
-                            #init::#vname(__v) => {
+                            #data::#vname(__v) => {
                                 let (__data, _ctrl) = __v.into_raw();
                                 let mut __pl = [0u8; Self::__PAYLOAD];
                                 __pl[..8].copy_from_slice(&__data.into_range().start().to_le_bytes());
@@ -1633,18 +1655,21 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                             }
                         });
                         read_arms.push(quote!(#disc => #view::#vname(#child),));
+                        // Move: rebuild a `BStackRc` (transferring the strong ref)
+                        // via `strong_parts` — exactly like a `#[bstack_strong]` field.
+                        move_arms.push(quote! {
+                            #disc => {
+                                let __data = unsafe { #cref };
+                                let (__d, __c) =
+                                    <#ty as ::bstack_raii::BStackShared>::strong_parts(__data, __alloc)?;
+                                #data::#vname(unsafe {
+                                    ::bstack_raii::BStackRc::from_raw(__d, __c, __alloc)
+                                })
+                            }
+                        });
                         drop_arms.push(quote! {
                             #disc => {
-                                let __data = unsafe {
-                                    ::bstack_raii::BStackRef::<#ty>::from_range(
-                                        ::bstack_raii::BStackRange::new(
-                                            u64::from_le_bytes(__pl[..8].try_into().unwrap()),
-                                            ::core::mem::size_of::<
-                                                <#ty as ::bstack_raii::BStackBlock>::OnDisk
-                                            >() as u64,
-                                        ),
-                                    )
-                                };
+                                let __data = unsafe { #cref };
                                 <#ty as ::bstack_raii::BStackShared>::drop_strong_ref(
                                     __data, allocator,
                                 )?;
@@ -1669,7 +1694,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                         };
                         // A weak variant stores the child's CONTROL offset and holds
                         // one weak reference (like a `#[bstack_weak]` field).
-                        init_variants
+                        data_variants
                             .push(quote!(#vname(::bstack_raii::BStackWeak<'__e, #ty, __A>),));
                         view_variants.push(quote! {
                             #vname(::core::option::Option<
@@ -1677,7 +1702,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                             >),
                         });
                         new_arms.push(quote! {
-                            #init::#vname(__v) => {
+                            #data::#vname(__v) => {
                                 let __ctrl = __v.into_raw();
                                 let mut __pl = [0u8; Self::__PAYLOAD];
                                 __pl[..8].copy_from_slice(&__ctrl.into_range().start().to_le_bytes());
@@ -1696,6 +1721,13 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                                 let _ = __w.into_raw();
                                 #view::#vname(__up)
                             }
+                        });
+                        // Move: hand out the `BStackWeak` (transferring the weak ref),
+                        // like moving out a `#[bstack_weak]` field.
+                        move_arms.push(quote! {
+                            #disc => #data::#vname(unsafe {
+                                ::bstack_raii::BStackWeak::from_raw(#ctrl_ref, __alloc)
+                            }),
                         });
                         drop_arms.push(quote! {
                             #disc => {
@@ -1906,17 +1938,17 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
         }
     };
 
-    // `EInit` is generic over `<'e, A>` when a variant holds a strong/weak
+    // `EData` is generic over `<'e, A>` when a variant holds a strong/weak
     // reference; `EView` only when a weak variant makes `read` upgrade.
-    let init_generics = if has_shared {
+    let data_generics = if has_shared {
         quote!(<'__e, __A: ::bstack_raii::BStackOwnedSliceAllocator>)
     } else {
         quote!()
     };
-    let init_ty = if has_shared {
-        quote!(#init<'__e, __A>)
+    let data_ty = if has_shared {
+        quote!(#data<'__e, __A>)
     } else {
-        quote!(#init)
+        quote!(#data)
     };
     let view_generics = if has_weak {
         quote!(<'__e, __A: ::bstack_raii::BStackOwnedSliceAllocator>)
@@ -1927,6 +1959,20 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
         quote!(#view<'__e, __A>)
     } else {
         quote!(#view)
+    };
+    // `bstack_move!` yields the same `EData` (owned handles); `Fields` just names
+    // it with the move lifetime.
+    let move_fields_ty = if has_shared {
+        quote!(#data<'__mv, __A>)
+    } else {
+        quote!(#data)
+    };
+    // `bstack_move!` frees the enum shell, then rebuilds the active variant's
+    // payload as an owned handle.
+    let move_payload = if needs_payload {
+        quote!(let __pl = __od.__bstack_payload;)
+    } else {
+        quote!()
     };
 
     Ok(quote! {
@@ -1966,9 +2012,14 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
             #( __assert_pod::<#pod_types>(); )*
         };
 
-        /// Input for [`new`](#name::new): the variant to create, with its payload.
-        #vis enum #init #init_generics {
-            #(#init_variants)*
+        /// The in-memory owned form of the enum's payload — POD by value and
+        /// each child/reference as an owned handle (owned → `BStackOwned`,
+        /// strong → `BStackRc`, weak → `BStackWeak`, ref → `BStackRef`).
+        ///
+        /// The *same* type is passed to [`new`](#name::new) to construct a variant
+        /// and returned by `bstack_move!` to destructure one (they are duals).
+        #vis enum #data #data_generics {
+            #(#data_variants)*
         }
 
         /// The result of [`read`](#name::read): the current variant, with POD
@@ -2006,12 +2057,12 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
         }
 
         impl #name {
-            /// Allocate a new enum block holding `init`'s variant + payload.
+            /// Allocate a new enum block holding `data`'s variant + payload.
             #vis fn new<'__e, __A: ::bstack_raii::BStackOwnedSliceAllocator>(
                 allocator: &'__e __A,
-                init: #init_ty,
+                data: #data_ty,
             ) -> ::std::io::Result<#new_ret> {
-                let (__disc, __payload): (u8, [u8; Self::__PAYLOAD]) = match init {
+                let (__disc, __payload): (u8, [u8; Self::__PAYLOAD]) = match data {
                     #(#new_arms)*
                 };
                 let __on_disk = #on_disk {
@@ -2072,6 +2123,35 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
 
         #shared_impl
         #weakable_items
+
+        impl ::bstack_raii::BStackMove for #name {
+            type Fields<'__mv, __A: ::bstack_raii::BStackOwnedSliceAllocator> = #move_fields_ty;
+            fn bstack_move<'__mv, __A: ::bstack_raii::BStackOwnedSliceAllocator>(
+                owned: ::bstack_raii::BStackOwned<Self>,
+                __alloc: &'__mv __A,
+            ) -> ::std::io::Result<Self::Fields<'__mv, __A>> {
+                let __inner = owned.into_inner();
+                let __range = ::bstack_raii::BStackBlock::range(&__inner);
+                let mut __buf = [0u8; ::core::mem::size_of::<#on_disk>()];
+                let __r = unsafe { ::bstack_raii::BStackRef::<Self>::from_range(__range) };
+                let __od: #on_disk = *__r.read_on_disk(__alloc.stack(), &mut __buf)?;
+                let __disc = __od.__bstack_disc;
+                #move_payload
+                let __result = match __disc {
+                    #(#move_arms)*
+                    _ => {
+                        return ::std::result::Result::Err(::std::io::Error::new(
+                            ::std::io::ErrorKind::InvalidData,
+                            "bstack_enum: invalid discriminant",
+                        ));
+                    }
+                };
+                // Free the enum shell only; the moved-out payload stays live.
+                unsafe { ::bstack_raii::dealloc_range(__alloc, __range)?; }
+                ::std::result::Result::Ok(__result)
+            }
+        }
+
         #overlong_warning
     })
 }
