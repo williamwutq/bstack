@@ -68,13 +68,19 @@ pub fn bstack_block(args: TokenStream, item: TokenStream) -> TokenStream {
 /// `#[bstack_enum]` — a tagged-union block.
 ///
 /// Lowers an `enum` to a fixed-size block: a discriminant plus a payload area
-/// sized to the largest variant. Variants may be **unit** (no data), a **POD**
-/// newtype `V(P)` (`P: Pod`, stored inline), or an annotated newtype
-/// `#[bstack_owned]` / `#[bstack_strong]` / `#[bstack_weak]` / `#[bstack_ref]`
-/// `V(T)` (a `u64` offset to the child / control block, released on teardown per
-/// the annotation). Only single-field tuple variants are allowed (no struct or
-/// multi-field variants). All three modes are supported (`#[bstack_enum]`,
-/// `(rc)`, `(rc, weak)`).
+/// sized to the largest variant. A variant is either:
+///
+/// * a **POD aggregate** — unit (`V`), an all-`Pod` tuple (`V(A, B, ..)`), or an
+///   all-`Pod` struct (`V { x: A, .. }`); the fields are packed into the payload
+///   in declaration order (read/written unaligned, so alignment is irrelevant),
+///   with no ownership annotation; or
+/// * an **annotated single-field tuple** `#[bstack_owned]` / `#[bstack_strong]` /
+///   `#[bstack_weak]` / `#[bstack_ref]` `V(T)` — a `u64` offset to the child /
+///   control block, released on teardown per the annotation.
+///
+/// All three modes are supported (`#[bstack_enum]`, `(rc)`, `(rc, weak)`).
+/// Duplicate discriminant values are rejected (rustc's `E0081` cannot fire, since
+/// the macro replaces the `enum`).
 ///
 /// # Arguments
 ///
@@ -99,8 +105,7 @@ pub fn bstack_block(args: TokenStream, item: TokenStream) -> TokenStream {
 ///   `bstack_move!` and `bstack_cast!` work on enums as on structs.
 ///
 /// An enum is always **referenced** (it is a block; store it as a field of a
-/// struct — inline embedding is not supported). Struct / multi-field tuple
-/// variants are not supported.
+/// struct — inline embedding is not supported).
 #[proc_macro_attribute]
 pub fn bstack_enum(args: TokenStream, item: TokenStream) -> TokenStream {
     let input = syn::parse_macro_input!(item as syn::ItemEnum);

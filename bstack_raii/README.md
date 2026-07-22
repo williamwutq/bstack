@@ -354,17 +354,20 @@ other sum type is a `#[bstack_enum]`.
 ### Enums: `#[bstack_enum]`
 
 A `#[bstack_enum]` lowers a Rust `enum` to a **tagged-union block**: a
-discriminant plus a payload area sized to the largest variant. Each variant is
-**unit** (no data), a **POD** newtype `V(P)` (`P: Pod`, stored inline), or an
-annotated newtype whose annotation states the *variant's* relationship, exactly
-like a struct field — `#[bstack_owned]` / `#[bstack_strong]` / `#[bstack_weak]` /
-`#[bstack_ref]` (each a `u64` offset to the child / control block):
+discriminant plus a payload area sized to the largest variant. A variant is
+either a **POD aggregate** — unit, an all-`Pod` tuple `V(A, B, …)`, or an
+all-`Pod` struct `V { x: A, … }` (fields packed inline, no annotation) — or an
+**annotated single-field tuple** whose annotation states the *variant's*
+relationship, exactly like a struct field — `#[bstack_owned]` /
+`#[bstack_strong]` / `#[bstack_weak]` / `#[bstack_ref]` (each a `u64` offset to
+the child / control block):
 
 ```rust
 #[bstack_enum]
 enum Node {
-    Empty,                            // unit
+    Empty,                            // unit (POD aggregate, 0 fields)
     Num(u32),                         // POD, inline
+    Rect { w: u32, h: u32 },          // POD struct variant, packed inline
     #[bstack_ref]    Link(Leaf),      // borrowed reference (frees nothing)
     #[bstack_owned]  Child(Leaf),     // owned child (freed on teardown)
     #[bstack_strong] Shared(Thing),   // a strong ref (Thing is (rc)/(rc, weak))
@@ -404,8 +407,10 @@ match bstack_move!(node, &alloc)? {
 ```
 
 An enum is a block, so it is **always referenced** — store it as a struct field
-(inline embedding isn't supported). Struct and multi-field tuple variants aren't
-supported.
+(inline embedding isn't supported). A POD aggregate variant's fields must all be
+`Pod`, and it takes no ownership annotation (only a single-field tuple variant
+does). Duplicate discriminant values are a clear compile error (rustc's `E0081`
+can't fire, since the macro replaces the `enum`).
 
 #### Discriminant width
 

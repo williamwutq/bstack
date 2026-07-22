@@ -1698,44 +1698,14 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
         };
 
         match &variant.fields {
-            Fields::Unit => {
-                if kind != Kind::Pod {
-                    return Err(Error::new_spanned(
-                        variant,
-                        "a unit variant carries no data, so it cannot have an ownership annotation",
-                    ));
-                }
-                data_variants.push(quote!(#vname,));
-                view_variants.push(quote!(#vname,));
-                new_arms.push(quote!(#data::#vname => (#disc, [0u8; Self::__PAYLOAD]),));
-                read_arms.push(quote!(#disc => #view::#vname,));
-                move_arms.push(quote!(#disc => #data::#vname,));
-            }
-            Fields::Unnamed(f) if f.unnamed.len() == 1 => {
+            // Annotated single-field tuple `#[..] V(T)`: an owned / strong / weak /
+            // ref child stored as a `u64` offset. (Unit, un-annotated single-POD,
+            // multi-field tuple, and struct variants are POD aggregates, below.)
+            Fields::Unnamed(f) if f.unnamed.len() == 1 && kind != Kind::Pod => {
                 needs_payload = true;
                 let ty = &f.unnamed.first().unwrap().ty;
                 match kind {
-                    Kind::Pod => {
-                        pod_types.push(ty.clone());
-                        payload_sizes.push(quote!(::core::mem::size_of::<#ty>()));
-                        data_variants.push(quote!(#vname(#ty),));
-                        view_variants.push(quote!(#vname(#ty),));
-                        new_arms.push(quote! {
-                            #data::#vname(__v) => {
-                                let mut __pl = [0u8; Self::__PAYLOAD];
-                                __pl[..::core::mem::size_of::<#ty>()]
-                                    .copy_from_slice(::bstack_raii::bytemuck::bytes_of(&__v));
-                                (#disc, __pl)
-                            }
-                        });
-                        let read_pod = quote! {
-                            ::bstack_raii::bytemuck::pod_read_unaligned::<#ty>(
-                                &__pl[..::core::mem::size_of::<#ty>()],
-                            )
-                        };
-                        read_arms.push(quote!(#disc => #view::#vname(#read_pod),));
-                        move_arms.push(quote!(#disc => #data::#vname(#read_pod),));
-                    }
+                    Kind::Pod => unreachable!("guarded out above"),
                     Kind::Owned => {
                         payload_sizes.push(quote!(8usize));
                         let child = child_from_off(ty);
@@ -1890,12 +1860,93 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                     }
                 }
             }
+            // A POD aggregate: unit, an all-POD tuple `V(A, B, ..)`, or an all-POD
+            // struct `V { x: A, .. }`. The fields are packed sequentially into the
+            // payload (declaration order). This is sound because the payload is
+            // read/written **unaligned**, so field alignment is irrelevant — the
+            // packed byte sequence of POD fields is itself just POD bytes.
             _ => {
-                return Err(Error::new_spanned(
-                    &variant.fields,
-                    "#[bstack_enum] variants must be unit or single-field tuple `V(T)` \
-                     (struct and multi-field tuple variants are not supported)",
-                ));
+                if kind != Kind::Pod {
+                    return Err(Error::new_spanned(
+                        variant,
+                        "an ownership annotation is only allowed on a single-field tuple \
+                         variant, e.g. `#[bstack_owned] V(T)`",
+                    ));
+                }
+                let named = matches!(&variant.fields, Fields::Named(_));
+                let mut binds = Vec::new();
+                let mut tys: Vec<Type> = Vec::new();
+                let mut fnames = Vec::new();
+                for (j, f) in variant.fields.iter().enumerate() {
+                    pod_types.push(f.ty.clone());
+                    tys.push(f.ty.clone());
+                    binds.push(format_ident!("__f{}", j));
+                    if let Some(id) = &f.ident {
+                        fnames.push(id.clone());
+                    }
+                }
+
+                // Cumulative byte offsets of each field within the payload.
+                let mut offsets = Vec::new();
+                let mut acc = quote!(0usize);
+                for ty in &tys {
+                    offsets.push(acc.clone());
+                    acc = quote!(#acc + ::core::mem::size_of::<#ty>());
+                }
+                let payload_size = if tys.is_empty() { quote!(0usize) } else { acc };
+
+                let writes = binds.iter().zip(&offsets).zip(&tys).map(|((b, off), ty)| {
+                    quote! {
+                        __pl[(#off)..(#off) + ::core::mem::size_of::<#ty>()]
+                            .copy_from_slice(::bstack_raii::bytemuck::bytes_of(&#b));
+                    }
+                });
+                let reads: Vec<TokenStream> = offsets
+                    .iter()
+                    .zip(&tys)
+                    .map(|(off, ty)| {
+                        quote! {
+                            ::bstack_raii::bytemuck::pod_read_unaligned::<#ty>(
+                                &__pl[(#off)..(#off) + ::core::mem::size_of::<#ty>()],
+                            )
+                        }
+                    })
+                    .collect();
+
+                // The variant's in-memory shape (`V`, `V(A, B)`, or `V { x: A, .. }`),
+                // its destructuring pattern, and its reconstruction from `reads`.
+                let (decl, pat, cons) = if tys.is_empty() {
+                    (quote!(#vname,), quote!(#vname), quote!(#vname))
+                } else if named {
+                    (
+                        quote!(#vname { #(#fnames: #tys),* },),
+                        quote!(#vname { #(#fnames: #binds),* }),
+                        quote!(#vname { #(#fnames: #reads),* }),
+                    )
+                } else {
+                    (
+                        quote!(#vname(#(#tys),*),),
+                        quote!(#vname(#(#binds),*)),
+                        quote!(#vname(#(#reads),*)),
+                    )
+                };
+                if !tys.is_empty() {
+                    needs_payload = true;
+                }
+
+                data_variants.push(decl.clone());
+                view_variants.push(decl);
+                payload_sizes.push(payload_size);
+                new_arms.push(quote! {
+                    #data::#pat => {
+                        let mut __pl = [0u8; Self::__PAYLOAD];
+                        #(#writes)*
+                        (#disc, __pl)
+                    }
+                });
+                read_arms.push(quote!(#disc => #view::#cons,));
+                move_arms.push(quote!(#disc => #data::#cons,));
+                // POD: no teardown.
             }
         }
     }

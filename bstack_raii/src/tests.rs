@@ -1809,3 +1809,60 @@ fn macro_enum_tags() {
     assert_eq!(&ctag[0..2], b"ec");
     drop(rc);
 }
+
+// --------------------------------------------------------------------------
+// #[bstack_enum] POD aggregate variants — multi-field tuple + struct variants
+// --------------------------------------------------------------------------
+
+#[bstack_enum]
+enum Shape {
+    Empty,
+    Point(i32, i32),         // multi-field tuple (POD)
+    Rect { w: u32, h: u32 }, // struct variant (POD)
+    Tagged(u8, u16, u8),     // heterogeneous, packed unaligned
+}
+
+#[test]
+fn macro_enum_pod_aggregate_variants() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+
+    // header(16) + disc(u8 = 1) + payload(max 8: Point/Rect) = 25.
+    assert_eq!(size_of::<<Shape as BStackBlock>::OnDisk>(), 25);
+
+    // Multi-field tuple round-trips.
+    let e = Shape::new(&alloc, ShapeData::Point(3, -4)).unwrap();
+    match e.handle().read(&alloc).unwrap() {
+        ShapeView::Point(x, y) => assert_eq!((x, y), (3, -4)),
+        _ => panic!("expected Point"),
+    }
+    e.bstack_drop(&alloc).unwrap();
+
+    // Struct variant round-trips.
+    let e = Shape::new(&alloc, ShapeData::Rect { w: 100, h: 200 }).unwrap();
+    match e.handle().read(&alloc).unwrap() {
+        ShapeView::Rect { w, h } => assert_eq!((w, h), (100, 200)),
+        _ => panic!("expected Rect"),
+    }
+    e.bstack_drop(&alloc).unwrap();
+
+    // Heterogeneous, packed (u8, u16, u8) — read unaligned.
+    let e = Shape::new(&alloc, ShapeData::Tagged(1, 258, 255)).unwrap();
+    match e.handle().read(&alloc).unwrap() {
+        ShapeView::Tagged(a, b, c) => assert_eq!((a, b, c), (1, 258, 255)),
+        _ => panic!("expected Tagged"),
+    }
+    e.bstack_drop(&alloc).unwrap();
+
+    // Unit still round-trips through the same aggregate path.
+    let e = Shape::new(&alloc, ShapeData::Empty).unwrap();
+    assert!(matches!(e.handle().read(&alloc).unwrap(), ShapeView::Empty));
+    e.bstack_drop(&alloc).unwrap();
+
+    // bstack_move! yields the same aggregate variant.
+    let e = Shape::new(&alloc, ShapeData::Point(7, 8)).unwrap();
+    match bstack_move!(e, &alloc).unwrap() {
+        ShapeData::Point(x, y) => assert_eq!((x, y), (7, 8)),
+        _ => panic!("expected Point"),
+    }
+}
