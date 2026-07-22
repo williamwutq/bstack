@@ -1436,10 +1436,11 @@ fn eightcc_expr(bytes: &[u8; 8]) -> TokenStream {
     quote!(::bstack_raii::EightCC::new([#(#bytes),*]))
 }
 
-/// Classify a field by its ownership annotation.
-fn classify(field: &syn::Field) -> syn::Result<Kind> {
+/// Classify by ownership annotation among a set of attributes (a field's or an
+/// enum variant's). No annotation => `Pod`.
+fn classify_attrs(attrs: &[syn::Attribute]) -> syn::Result<Kind> {
     let mut found: Option<Kind> = None;
-    for attr in &field.attrs {
+    for attr in attrs {
         let Some(id) = attr.path().get_ident() else {
             continue;
         };
@@ -1453,10 +1454,624 @@ fn classify(field: &syn::Field) -> syn::Result<Kind> {
         if found.is_some() {
             return Err(Error::new_spanned(
                 attr,
-                "a field may carry at most one bstack ownership annotation",
+                "at most one bstack ownership annotation is allowed here",
             ));
         }
         found = Some(kind);
     }
     Ok(found.unwrap_or(Kind::Pod))
+}
+
+/// Classify a struct field by its ownership annotation.
+fn classify(field: &syn::Field) -> syn::Result<Kind> {
+    classify_attrs(&field.attrs)
+}
+
+// ===========================================================================
+// #[bstack_enum] — a tagged union block
+// ===========================================================================
+//
+// An enum lowers to a fixed-size block: a 1-byte discriminant plus a payload
+// area sized to the largest variant. Each variant is either a unit (no payload),
+// a POD newtype `V(P)` (bytes stored inline), or an annotated newtype
+// `#[bstack_owned]`/`#[bstack_ref]` `V(T)` (a `u64` offset to a child block).
+// Construction goes through a generated `EInit` input enum + `E::new`; reading
+// through a generated `EView` + `E::read`; teardown matches the discriminant and
+// frees the owned child, if any.
+
+/// Implementation of the `#[bstack_enum]` attribute macro (plain/owned mode).
+pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<TokenStream> {
+    let attr = parse_attr(attr)?;
+    let mode = attr.mode;
+    if !input.generics.params.is_empty() {
+        return Err(Error::new_spanned(
+            &input.generics,
+            "#[bstack_enum] does not support generic enums",
+        ));
+    }
+    if input.variants.len() > 256 {
+        return Err(Error::new_spanned(
+            &input.variants,
+            "#[bstack_enum] supports at most 256 variants (1-byte discriminant)",
+        ));
+    }
+
+    let name = &input.ident;
+    let vis = &input.vis;
+    let on_disk = format_ident!("{}OnDisk", name);
+    let control = format_ident!("{}OnDiskRef", name);
+    let init = format_ident!("{}Init", name);
+    let view = format_ident!("{}View", name);
+
+    let mut init_variants = Vec::new();
+    let mut view_variants = Vec::new();
+    let mut new_arms = Vec::new();
+    let mut read_arms = Vec::new();
+    let mut drop_arms = Vec::new();
+    let mut payload_sizes = Vec::new();
+    let mut pod_types: Vec<Type> = Vec::new();
+    let mut needs_payload = false;
+    // A strong/weak variant makes `EInit` generic over `<'e, A>`; a weak variant
+    // also makes `EView` generic (its read upgrades to a `BStackRc`).
+    let mut has_shared = false;
+    let mut has_weak = false;
+
+    for (i, variant) in input.variants.iter().enumerate() {
+        let disc = i as u8;
+        let vname = &variant.ident;
+        let kind = classify_attrs(&variant.attrs)?;
+
+        // The child block's range recovered from a stored offset (owned / ref).
+        let child_from_off = |ty: &Type| {
+            quote! {
+                <#ty as ::bstack_raii::BStackBlock>::from_range(::bstack_raii::BStackRange::new(
+                    u64::from_le_bytes(__pl[..8].try_into().unwrap()),
+                    ::core::mem::size_of::<<#ty as ::bstack_raii::BStackBlock>::OnDisk>() as u64,
+                ))
+            }
+        };
+
+        match &variant.fields {
+            Fields::Unit => {
+                if kind != Kind::Pod {
+                    return Err(Error::new_spanned(
+                        variant,
+                        "a unit variant carries no data, so it cannot have an ownership annotation",
+                    ));
+                }
+                init_variants.push(quote!(#vname,));
+                view_variants.push(quote!(#vname,));
+                new_arms.push(quote!(#init::#vname => (#disc, [0u8; Self::__PAYLOAD]),));
+                read_arms.push(quote!(#disc => #view::#vname,));
+            }
+            Fields::Unnamed(f) if f.unnamed.len() == 1 => {
+                needs_payload = true;
+                let ty = &f.unnamed.first().unwrap().ty;
+                match kind {
+                    Kind::Pod => {
+                        pod_types.push(ty.clone());
+                        payload_sizes.push(quote!(::core::mem::size_of::<#ty>()));
+                        init_variants.push(quote!(#vname(#ty),));
+                        view_variants.push(quote!(#vname(#ty),));
+                        new_arms.push(quote! {
+                            #init::#vname(__v) => {
+                                let mut __pl = [0u8; Self::__PAYLOAD];
+                                __pl[..::core::mem::size_of::<#ty>()]
+                                    .copy_from_slice(::bstack_raii::bytemuck::bytes_of(&__v));
+                                (#disc, __pl)
+                            }
+                        });
+                        read_arms.push(quote! {
+                            #disc => #view::#vname(
+                                ::bstack_raii::bytemuck::pod_read_unaligned::<#ty>(
+                                    &__pl[..::core::mem::size_of::<#ty>()],
+                                )
+                            ),
+                        });
+                    }
+                    Kind::Owned => {
+                        payload_sizes.push(quote!(8usize));
+                        let child = child_from_off(ty);
+                        init_variants.push(quote!(#vname(::bstack_raii::BStackOwned<#ty>),));
+                        view_variants.push(quote!(#vname(#ty),));
+                        new_arms.push(quote! {
+                            #init::#vname(__v) => {
+                                let __h = __v.into_inner();
+                                let __off = ::bstack_raii::BStackBlock::range(&__h).start();
+                                let mut __pl = [0u8; Self::__PAYLOAD];
+                                __pl[..8].copy_from_slice(&__off.to_le_bytes());
+                                (#disc, __pl)
+                            }
+                        });
+                        read_arms.push(quote!(#disc => #view::#vname(#child),));
+                        drop_arms.push(quote! {
+                            #disc => {
+                                let __child = unsafe {
+                                    ::bstack_raii::BStackRef::<#ty>::from_range(
+                                        ::bstack_raii::BStackRange::new(
+                                            u64::from_le_bytes(__pl[..8].try_into().unwrap()),
+                                            ::core::mem::size_of::<
+                                                <#ty as ::bstack_raii::BStackBlock>::OnDisk
+                                            >() as u64,
+                                        ),
+                                    )
+                                };
+                                ::bstack_raii::OwnedRef(__child).bstack_drop(allocator)?;
+                            }
+                        });
+                    }
+                    Kind::Ref => {
+                        payload_sizes.push(quote!(8usize));
+                        let child = child_from_off(ty);
+                        init_variants.push(quote!(#vname(::bstack_raii::BStackRef<#ty>),));
+                        view_variants.push(quote!(#vname(#ty),));
+                        new_arms.push(quote! {
+                            #init::#vname(__v) => {
+                                let mut __pl = [0u8; Self::__PAYLOAD];
+                                __pl[..8].copy_from_slice(&__v.into_range().start().to_le_bytes());
+                                (#disc, __pl)
+                            }
+                        });
+                        read_arms.push(quote!(#disc => #view::#vname(#child),));
+                        // A raw reference owns nothing: no teardown.
+                    }
+                    Kind::Strong => {
+                        has_shared = true;
+                        payload_sizes.push(quote!(8usize));
+                        let child = child_from_off(ty);
+                        // A strong variant stores the child's DATA offset and holds
+                        // one strong reference (like a `#[bstack_strong]` field).
+                        init_variants
+                            .push(quote!(#vname(::bstack_raii::BStackRc<'__e, #ty, __A>),));
+                        view_variants.push(quote!(#vname(#ty),));
+                        new_arms.push(quote! {
+                            #init::#vname(__v) => {
+                                let (__data, _ctrl) = __v.into_raw();
+                                let mut __pl = [0u8; Self::__PAYLOAD];
+                                __pl[..8].copy_from_slice(&__data.into_range().start().to_le_bytes());
+                                (#disc, __pl)
+                            }
+                        });
+                        read_arms.push(quote!(#disc => #view::#vname(#child),));
+                        drop_arms.push(quote! {
+                            #disc => {
+                                let __data = unsafe {
+                                    ::bstack_raii::BStackRef::<#ty>::from_range(
+                                        ::bstack_raii::BStackRange::new(
+                                            u64::from_le_bytes(__pl[..8].try_into().unwrap()),
+                                            ::core::mem::size_of::<
+                                                <#ty as ::bstack_raii::BStackBlock>::OnDisk
+                                            >() as u64,
+                                        ),
+                                    )
+                                };
+                                <#ty as ::bstack_raii::BStackShared>::drop_strong_ref(
+                                    __data, allocator,
+                                )?;
+                            }
+                        });
+                    }
+                    Kind::Weak => {
+                        has_shared = true;
+                        has_weak = true;
+                        payload_sizes.push(quote!(8usize));
+                        let ctrl_ref = quote! {
+                            unsafe {
+                                ::bstack_raii::BStackRef::<
+                                    <#ty as ::bstack_raii::BStackWeakable>::Control
+                                >::from_range(::bstack_raii::BStackRange::new(
+                                    u64::from_le_bytes(__pl[..8].try_into().unwrap()),
+                                    ::core::mem::size_of::<
+                                        <#ty as ::bstack_raii::BStackWeakable>::Control
+                                    >() as u64,
+                                ))
+                            }
+                        };
+                        // A weak variant stores the child's CONTROL offset and holds
+                        // one weak reference (like a `#[bstack_weak]` field).
+                        init_variants
+                            .push(quote!(#vname(::bstack_raii::BStackWeak<'__e, #ty, __A>),));
+                        view_variants.push(quote! {
+                            #vname(::core::option::Option<
+                                ::bstack_raii::BStackRc<'__e, #ty, __A>
+                            >),
+                        });
+                        new_arms.push(quote! {
+                            #init::#vname(__v) => {
+                                let __ctrl = __v.into_raw();
+                                let mut __pl = [0u8; Self::__PAYLOAD];
+                                __pl[..8].copy_from_slice(&__ctrl.into_range().start().to_le_bytes());
+                                (#disc, __pl)
+                            }
+                        });
+                        read_arms.push(quote! {
+                            #disc => {
+                                // Borrow a weak over the stored control ref just long
+                                // enough to upgrade; consume it via `into_raw` so the
+                                // variant's own weak count is untouched.
+                                let __w = unsafe {
+                                    ::bstack_raii::BStackWeak::<#ty, __A>::from_raw(#ctrl_ref, allocator)
+                                };
+                                let __up = __w.upgrade()?;
+                                let _ = __w.into_raw();
+                                #view::#vname(__up)
+                            }
+                        });
+                        drop_arms.push(quote! {
+                            #disc => {
+                                ::bstack_raii::WeakRef::<#ty>(#ctrl_ref).bstack_drop(allocator)?;
+                            }
+                        });
+                    }
+                }
+            }
+            _ => {
+                return Err(Error::new_spanned(
+                    &variant.fields,
+                    "#[bstack_enum] variants must be unit or single-field tuple `V(T)` \
+                     (struct and multi-field tuple variants are not supported)",
+                ));
+            }
+        }
+    }
+
+    // EightCC tag: readable prefix over a hash of `crate ++ type_name` (as structs).
+    let type_name = name.to_string();
+    let crate_name = std::env::var("CARGO_PKG_NAME").unwrap_or_default();
+    let hash = fnv1a64(&format!("{crate_name}\0{type_name}"));
+    let prefix = attr
+        .tag
+        .as_ref()
+        .map_or_else(|| auto_prefix(&type_name), |t| t.bytes().collect::<Vec<u8>>());
+    let tag = build_tag(hash, &prefix);
+    let eightcc = eightcc_expr(&tag.bytes);
+
+    // Control-block tag (rc, weak): the data tag with its prefix lowercased, or a
+    // `ctrl_tag` override.
+    let ctrl_prefix = attr.ctrl_tag.as_ref().map_or_else(
+        || prefix.iter().map(u8::to_ascii_lowercase).collect::<Vec<u8>>(),
+        |t| t.bytes().collect::<Vec<u8>>(),
+    );
+    let ctrl_tag = build_tag(hash, &ctrl_prefix);
+    let ctrl_eightcc = eightcc_expr(&ctrl_tag.bytes);
+
+    // Refcount / control machinery, mirroring the struct rc modes: an injected
+    // field after the header, `BStackShared` (rc / rc,weak), and (rc, weak) a
+    // control block + `BStackWeakable`. `new` returns `BStackRc` for rc modes.
+    let injected_ondisk = match mode {
+        Mode::Plain => quote!(),
+        Mode::Rc => quote!(__bstack_refcount: u64,),
+        Mode::RcWeak => quote!(__bstack_ctrl: u64,),
+    };
+    let injected_init = match mode {
+        Mode::Plain => quote!(),
+        Mode::Rc => quote!(__bstack_refcount: 1u64,),
+        Mode::RcWeak => quote!(__bstack_ctrl: 0u64,),
+    };
+    let new_ret = match mode {
+        Mode::Plain => quote!(::bstack_raii::BStackOwned<Self>),
+        _ => quote!(::bstack_raii::BStackRc<'__e, Self, __A>),
+    };
+    let new_finish = match mode {
+        Mode::Plain => quote! {
+            ::std::result::Result::Ok(unsafe {
+                ::bstack_raii::BStackOwned::from_raw(
+                    <Self as ::bstack_raii::BStackBlock>::from_range(__data),
+                )
+            })
+        },
+        Mode::Rc => quote! {
+            ::std::result::Result::Ok(unsafe {
+                ::bstack_raii::BStackRc::from_raw(
+                    ::bstack_raii::BStackRef::from_range(__data),
+                    ::core::option::Option::None,
+                    allocator,
+                )
+            })
+        },
+        Mode::RcWeak => quote! {
+            let __ctrl = match ::bstack_raii::alloc_control(
+                allocator,
+                #ctrl_eightcc,
+                __data,
+                ::core::mem::size_of::<<Self as ::bstack_raii::BStackWeakable>::Control>() as u64,
+            ) {
+                ::std::result::Result::Ok(__c) => __c,
+                ::std::result::Result::Err(__e) => {
+                    let _ = unsafe { ::bstack_raii::dealloc_range(allocator, __data) };
+                    return ::std::result::Result::Err(__e);
+                }
+            };
+            ::std::result::Result::Ok(unsafe {
+                ::bstack_raii::BStackRc::from_raw(
+                    ::bstack_raii::BStackRef::from_range(__data),
+                    ::core::option::Option::Some(__ctrl),
+                    allocator,
+                )
+            })
+        },
+    };
+    let shared_impl = match mode {
+        Mode::Plain => quote!(),
+        Mode::Rc => quote! {
+            impl ::bstack_raii::BStackShared for #name {
+                fn drop_strong_ref<__A: ::bstack_raii::BStackOwnedSliceAllocator>(
+                    data: ::bstack_raii::BStackRef<Self>,
+                    allocator: &__A,
+                ) -> ::std::io::Result<()> {
+                    use ::bstack_raii::BStackDrop as _;
+                    ::bstack_raii::StrongRef(data).bstack_drop(allocator)
+                }
+                fn strong_parts<__A: ::bstack_raii::BStackOwnedSliceAllocator>(
+                    data: ::bstack_raii::BStackRef<Self>,
+                    _allocator: &__A,
+                ) -> ::std::io::Result<(
+                    ::bstack_raii::BStackRef<Self>,
+                    ::core::option::Option<::bstack_raii::BStackRange>,
+                )> {
+                    ::std::result::Result::Ok((data, ::core::option::Option::None))
+                }
+            }
+        },
+        Mode::RcWeak => quote! {
+            impl ::bstack_raii::BStackShared for #name {
+                fn drop_strong_ref<__A: ::bstack_raii::BStackOwnedSliceAllocator>(
+                    data: ::bstack_raii::BStackRef<Self>,
+                    allocator: &__A,
+                ) -> ::std::io::Result<()> {
+                    use ::bstack_raii::BStackDrop as _;
+                    ::bstack_raii::StrongWeakRef::from_disk(data, allocator)?
+                        .bstack_drop(allocator)
+                }
+                fn strong_parts<__A: ::bstack_raii::BStackOwnedSliceAllocator>(
+                    data: ::bstack_raii::BStackRef<Self>,
+                    allocator: &__A,
+                ) -> ::std::io::Result<(
+                    ::bstack_raii::BStackRef<Self>,
+                    ::core::option::Option<::bstack_raii::BStackRange>,
+                )> {
+                    let __swr = ::bstack_raii::StrongWeakRef::from_disk(data, allocator)?;
+                    ::std::result::Result::Ok((
+                        __swr.0,
+                        ::core::option::Option::Some(__swr.1.into_range()),
+                    ))
+                }
+            }
+        },
+    };
+    let weakable_items = if mode == Mode::RcWeak {
+        quote! {
+            #[repr(C, packed)]
+            #[derive(::core::clone::Clone, ::core::marker::Copy)]
+            #vis struct #control {
+                __bstack_header: ::bstack_raii::BlockHeader,
+                __bstack_strong: u64,
+                __bstack_weak: u64,
+                __bstack_x: u64,
+            }
+            unsafe impl ::bstack_raii::Zeroable for #control {}
+            unsafe impl ::bstack_raii::Pod for #control {}
+
+            impl ::bstack_raii::BStackWeakable for #name {
+                type Control = #control;
+            }
+        }
+    } else {
+        quote!()
+    };
+
+    let allow_deprecated = input.attrs.iter().any(is_allow_deprecated);
+    let ctrl_truncated = mode == Mode::RcWeak && ctrl_tag.truncated;
+    let overlong_warning = if (tag.truncated || ctrl_truncated)
+        && !(attr.allow_overlong || allow_deprecated)
+    {
+        let warn_fn = format_ident!("__bstack_tag_overlong_{}", name);
+        let msg = format!(
+            "#[bstack_enum] on `{type_name}`: a tag override longer than 8 bytes was truncated; \
+             add `allow(overlong_tag)` to silence"
+        );
+        quote! {
+            #[doc(hidden)]
+            #[allow(dead_code, non_snake_case)]
+            fn #warn_fn() {
+                #[deprecated(note = #msg)]
+                fn overlong_tag() {}
+                overlong_tag();
+            }
+        }
+    } else {
+        quote!()
+    };
+
+    // `read` / `bstack_drop` only need the payload bytes when a variant carries one.
+    let read_payload = if needs_payload {
+        quote!(let __pl = __od.__bstack_payload;)
+    } else {
+        quote!()
+    };
+    let drop_body = if drop_arms.is_empty() {
+        quote!()
+    } else {
+        quote! {
+            let __stack = allocator.stack();
+            let mut __buf = [0u8; ::core::mem::size_of::<#on_disk>()];
+            let __r = unsafe { ::bstack_raii::BStackRef::<Self>::from_range(self.0) };
+            let __od: #on_disk = *__r.read_on_disk(__stack, &mut __buf)?;
+            let __disc = __od.__bstack_disc;
+            let __pl = __od.__bstack_payload;
+            match __disc {
+                #(#drop_arms)*
+                _ => {}
+            }
+        }
+    };
+
+    // `EInit` is generic over `<'e, A>` when a variant holds a strong/weak
+    // reference; `EView` only when a weak variant makes `read` upgrade.
+    let init_generics = if has_shared {
+        quote!(<'__e, __A: ::bstack_raii::BStackOwnedSliceAllocator>)
+    } else {
+        quote!()
+    };
+    let init_ty = if has_shared {
+        quote!(#init<'__e, __A>)
+    } else {
+        quote!(#init)
+    };
+    let view_generics = if has_weak {
+        quote!(<'__e, __A: ::bstack_raii::BStackOwnedSliceAllocator>)
+    } else {
+        quote!()
+    };
+    let view_ty = if has_weak {
+        quote!(#view<'__e, __A>)
+    } else {
+        quote!(#view)
+    };
+
+    Ok(quote! {
+        #[derive(::core::clone::Clone, ::core::marker::Copy)]
+        #vis struct #name(::bstack_raii::BStackRange);
+
+        impl #name {
+            /// The payload area size (bytes) — the max over all variants.
+            #[doc(hidden)]
+            pub const __PAYLOAD: usize = {
+                let __s = [0usize #(, #payload_sizes)*];
+                let mut __m = 0usize;
+                let mut __i = 0usize;
+                while __i < __s.len() {
+                    if __s[__i] > __m {
+                        __m = __s[__i];
+                    }
+                    __i += 1;
+                }
+                __m
+            };
+        }
+
+        #[repr(C, packed)]
+        #[derive(::core::clone::Clone, ::core::marker::Copy)]
+        #vis struct #on_disk {
+            __bstack_header: ::bstack_raii::BlockHeader,
+            #injected_ondisk
+            __bstack_disc: u8,
+            __bstack_payload: [u8; #name::__PAYLOAD],
+        }
+        unsafe impl ::bstack_raii::Zeroable for #on_disk {}
+        unsafe impl ::bstack_raii::Pod for #on_disk {}
+
+        const _: fn() = || {
+            fn __assert_pod<__T: ::bstack_raii::Pod>() {}
+            #( __assert_pod::<#pod_types>(); )*
+        };
+
+        /// Input for [`new`](#name::new): the variant to create, with its payload.
+        #vis enum #init #init_generics {
+            #(#init_variants)*
+        }
+
+        /// The result of [`read`](#name::read): the current variant, with POD
+        /// values by value, owned/ref children as borrowed handles, and a weak
+        /// variant upgraded to `Option<BStackRc>`.
+        #vis enum #view #view_generics {
+            #(#view_variants)*
+        }
+
+        impl ::bstack_raii::BStackCast for #name {
+            fn eightcc() -> ::bstack_raii::EightCC {
+                #eightcc
+            }
+        }
+
+        impl ::bstack_raii::BStackBlock for #name {
+            type OnDisk = #on_disk;
+            fn from_range(range: ::bstack_raii::BStackRange) -> Self {
+                #name(range)
+            }
+            fn range(&self) -> ::bstack_raii::BStackRange {
+                self.0
+            }
+        }
+
+        impl ::bstack_raii::BStackDrop for #name {
+            fn bstack_drop<__A: ::bstack_raii::BStackOwnedSliceAllocator>(
+                self,
+                allocator: &__A,
+            ) -> ::std::io::Result<()> {
+                use ::bstack_raii::BStackDrop as _;
+                #drop_body
+                unsafe { ::bstack_raii::dealloc_range(allocator, self.0) }
+            }
+        }
+
+        impl #name {
+            /// Allocate a new enum block holding `init`'s variant + payload.
+            #vis fn new<'__e, __A: ::bstack_raii::BStackOwnedSliceAllocator>(
+                allocator: &'__e __A,
+                init: #init_ty,
+            ) -> ::std::io::Result<#new_ret> {
+                let (__disc, __payload): (u8, [u8; Self::__PAYLOAD]) = match init {
+                    #(#new_arms)*
+                };
+                let __on_disk = #on_disk {
+                    __bstack_header: ::bstack_raii::BlockHeader {
+                        size: ::core::mem::size_of::<#on_disk>() as u64,
+                        tag: <Self as ::bstack_raii::BStackCast>::eightcc(),
+                    },
+                    #injected_init
+                    __bstack_disc: __disc,
+                    __bstack_payload: __payload,
+                };
+                let mut __slice = allocator.alloc(::core::mem::size_of::<#on_disk>() as u64)?;
+                let __data = __slice.as_range();
+                if let ::std::result::Result::Err(__e) =
+                    __slice.write_range(0, ::bstack_raii::bytemuck::bytes_of(&__on_disk))
+                {
+                    let _ = allocator.dealloc(__slice);
+                    return ::std::result::Result::Err(__e);
+                }
+                #new_finish
+            }
+
+            /// Read the current variant. Takes the allocator (a weak variant's
+            /// read upgrades through it; other variants just read the block).
+            #vis fn read<'__e, __A: ::bstack_raii::BStackOwnedSliceAllocator>(
+                &self,
+                allocator: &'__e __A,
+            ) -> ::std::io::Result<#view_ty> {
+                let mut __buf = [0u8; ::core::mem::size_of::<#on_disk>()];
+                let __r = unsafe { ::bstack_raii::BStackRef::<Self>::from_range(self.0) };
+                let __od: #on_disk = *__r.read_on_disk(allocator.stack(), &mut __buf)?;
+                let __disc = __od.__bstack_disc;
+                #read_payload
+                ::std::result::Result::Ok(match __disc {
+                    #(#read_arms)*
+                    _ => {
+                        return ::std::result::Result::Err(::std::io::Error::new(
+                            ::std::io::ErrorKind::InvalidData,
+                            "bstack_enum: invalid discriminant",
+                        ));
+                    }
+                })
+            }
+
+            /// Borrow this block as an untyped slice (infallible upcast).
+            #vis fn as_slice<'__s>(
+                &self,
+                stack: &'__s ::bstack_raii::BStack,
+            ) -> ::bstack_raii::BStackSlice<'__s> {
+                unsafe {
+                    ::bstack_raii::BStackSlice::from_raw_range(
+                        stack,
+                        ::bstack_raii::BStackBlock::range(self),
+                    )
+                }
+            }
+        }
+
+        #shared_impl
+        #weakable_items
+        #overlong_warning
+    })
 }

@@ -87,4 +87,4 @@ pub use bytemuck::{Pod, Zeroable};
 pub use bytemuck;
 
 // Procedural macros, re-exported so downstream depends only on `bstack_raii`.
-pub use bstack_raii_derive::{bstack_block, bstack_cast, bstack_move};
+pub use bstack_raii_derive::{bstack_block, bstack_cast, bstack_enum, bstack_move};

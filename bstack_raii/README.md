@@ -25,6 +25,7 @@ object model on top.
 - [Concepts](#concepts)
 - [Defining blocks](#defining-blocks)
 - [Field ownership](#field-ownership)
+- [Enums: `#[bstack_enum]`](#enums-bstack_enum)
 - [Handles & lifetimes](#handles--lifetimes)
 - [Shared ownership & weak references](#shared-ownership--weak-references)
 - [Moving fields out: `bstack_move!`](#moving-fields-out-bstack_move)
@@ -264,6 +265,54 @@ For convenience, a field written `&T` is coerced to owned `T` (and `&str` to
 `String`) with a compile warning — so a stray reference doesn't fail to compile,
 but you're nudged to write the owned type.
 
+## Enums: `#[bstack_enum]`
+
+A `#[bstack_enum]` lowers a Rust `enum` to a **tagged-union block**: a 1-byte
+discriminant plus a payload area sized to the largest variant. Each variant is
+**unit** (no data), a **POD** newtype `V(P)` (`P: Pod`, stored inline), or an
+annotated newtype whose annotation states the *variant's* relationship, exactly
+like a struct field — `#[bstack_owned]` / `#[bstack_strong]` / `#[bstack_weak]` /
+`#[bstack_ref]` (each a `u64` offset to the child / control block).
+
+```rust
+#[bstack_enum]
+enum Node {
+    Empty,                            // unit
+    Num(u32),                         // POD, inline
+    #[bstack_ref]    Link(Leaf),      // borrowed reference (frees nothing)
+    #[bstack_owned]  Child(Leaf),     // owned child (freed on teardown)
+    #[bstack_strong] Shared(Thing),   // a strong ref (Thing is (rc)/(rc, weak))
+    #[bstack_weak]   Watch(Thing),    // a weak ref (Thing is (rc, weak))
+}
+
+let leaf = Leaf::new(&alloc, 7)?;
+let node = Node::new(&alloc, NodeInit::Child(leaf))?;   // construct a variant
+match node.handle().read(&alloc)? {                     // read / match the current one
+    NodeView::Child(c) => assert_eq!(c.val(stack)?, 7),
+    _ => {}
+}
+node.bstack_drop(&alloc)?;                              // frees the owned child too
+```
+
+The macro generates the handle `Node`, plus **`NodeInit`** (construction input:
+POD by value, `#[bstack_owned]` → `BStackOwned<T>`, `#[bstack_strong]` →
+`BStackRc<T>`, `#[bstack_weak]` → `BStackWeak<T>`, `#[bstack_ref]` →
+`BStackRef<T>`) and **`NodeView`** (the read result: POD by value, owned/ref
+children as borrowed handles, a weak variant *upgraded* to `Option<BStackRc<T>>`).
+`read` takes the allocator (a weak variant upgrades through it). Teardown matches
+the discriminant and releases the variant's reference — recursively freeing an
+owned child, decrementing a strong/weak count, and nothing for a ref.
+
+Like a struct, an enum has **modes**: `#[bstack_enum]` is owned, while
+`#[bstack_enum(rc)]` / `#[bstack_enum(rc, weak)]` make the enum itself
+reference-counted / weak-observable — `new` then returns a `BStackRc<E>` (with
+`try_clone` / `downgrade` / `upgrade`), and the enum can be a `#[bstack_strong]` /
+`#[bstack_weak]` field of a struct.
+
+An enum is a block, so it is **always referenced** — store it as a field of a
+struct (inline embedding isn't supported). Struct and multi-field tuple variants
+aren't supported.
+
 ## Handles & lifetimes
 
 The typed handle `X` is a bare `(offset, len)` with no allocator — cheap,
@@ -460,7 +509,10 @@ no spin loop). All operations are durable and speak `std::io::Result`.
 - **Requires a freeing allocator** that reserves offset 0 — not
   `LinearBStackAllocator` (see [Concepts](#concepts)).
 - **No generic block types**, and non-`Pod` fields must carry an annotation.
-- No enums yet (planned).
+- **Enums** ([`#[bstack_enum]`](#enums-bstack_enum)) support unit / POD /
+  `#[bstack_owned]` / `#[bstack_strong]` / `#[bstack_weak]` / `#[bstack_ref]`
+  variants in all three modes (owned / `(rc)` / `(rc, weak)`). Struct /
+  multi-field tuple variants, and `bstack_move!` on an enum, are not done.
 - The on-disk **ABI is not yet stable**.
 
 ## License

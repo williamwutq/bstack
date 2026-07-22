@@ -65,6 +65,35 @@ pub fn bstack_block(args: TokenStream, item: TokenStream) -> TokenStream {
     }
 }
 
+/// `#[bstack_enum]` — a tagged-union block.
+///
+/// Lowers an `enum` to a fixed-size block: a 1-byte discriminant plus a payload
+/// area sized to the largest variant. Variants may be **unit** (no data), a
+/// **POD** newtype `V(P)` (`P: Pod`, stored inline), or an annotated newtype
+/// `#[bstack_owned] V(T)` / `#[bstack_ref] V(T)` (a `u64` offset to a child
+/// block, freed / not freed on teardown accordingly). Only single-field tuple
+/// variants are allowed (no struct or multi-field variants).
+///
+/// Generates:
+/// * `struct E(BStackRange)` (the handle) and its `EOnDisk` payload.
+/// * `enum EInit` (construction input) and `enum EView` (read result — POD by
+///   value, child blocks as borrowed handles).
+/// * `impl BStackCast / BStackBlock / BStackDrop`, plus `E::new(alloc, EInit)`,
+///   `E::read(stack) -> EView`, and `E::as_slice`.
+///
+/// An enum is always **referenced** (it is a block; store it as a
+/// `#[bstack_owned]` / `#[bstack_ref]` field of a struct — inline embedding is
+/// not supported). `#[bstack_enum(rc)]` / `(rc, weak)` and
+/// `#[bstack_strong]` / `#[bstack_weak]` variants are not yet implemented.
+#[proc_macro_attribute]
+pub fn bstack_enum(args: TokenStream, item: TokenStream) -> TokenStream {
+    let input = syn::parse_macro_input!(item as syn::ItemEnum);
+    match block::expand_enum(args.into(), input) {
+        Ok(ts) => ts.into(),
+        Err(e) => e.to_compile_error().into(),
+    }
+}
+
 /// `bstack_move!(handle)` / `bstack_move!(owned, allocator)` — transfer every
 /// field out of a block, freeing only the parent shell.
 ///
