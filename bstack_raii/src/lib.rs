@@ -88,3 +88,117 @@ pub use bytemuck;
 
 // Procedural macros, re-exported so downstream depends only on `bstack_raii`.
 pub use bstack_raii_derive::{bstack_block, bstack_cast, bstack_enum, bstack_move};
+
+/// `compile_fail` checks for illegal macro inputs. Each block must **fail** to
+/// compile; the accompanying comment says why.
+///
+/// An ownership annotation is only allowed on a **single-field tuple** variant; a
+/// unit, struct, or multi-field tuple variant is a POD aggregate that rejects
+/// annotations.
+///
+/// `#[bstack_ref]` on a **unit** variant:
+/// ```compile_fail
+/// use bstack_raii::bstack_enum;
+/// #[bstack_enum]
+/// enum E { #[bstack_ref] Unit }
+/// # fn main() {}
+/// ```
+///
+/// `#[bstack_ref]` on a **struct** variant:
+/// ```compile_fail
+/// use bstack_raii::bstack_enum;
+/// #[bstack_enum]
+/// enum E { #[bstack_ref] S { a: u32, b: u32 } }
+/// # fn main() {}
+/// ```
+///
+/// `#[bstack_strong]` on a **multi-field tuple** variant:
+/// ```compile_fail
+/// use bstack_raii::bstack_enum;
+/// #[bstack_enum]
+/// enum E { #[bstack_strong] T(u32, i8) }
+/// # fn main() {}
+/// ```
+///
+/// **Two** ownership annotations on one variant:
+/// ```compile_fail
+/// use bstack_raii::bstack_enum;
+/// #[bstack_enum]
+/// enum E { #[bstack_owned] #[bstack_ref] V(u32) }
+/// # fn main() {}
+/// ```
+///
+/// **Duplicate discriminant** values (rustc's `E0081` can't fire — the macro
+/// replaces the enum — so the macro rejects it itself):
+/// ```compile_fail
+/// use bstack_raii::bstack_enum;
+/// #[bstack_enum]
+/// enum E { A = 1, B = 1 }
+/// # fn main() {}
+/// ```
+///
+/// A discriminant **out of range** for the chosen `repr`:
+/// ```compile_fail
+/// use bstack_raii::bstack_enum;
+/// #[bstack_enum(repr(u8))]
+/// enum E { A = 300 }
+/// # fn main() {}
+/// ```
+///
+/// `repr(usize)` / `repr(isize)` (bstack offsets are 64-bit):
+/// ```compile_fail
+/// use bstack_raii::bstack_enum;
+/// #[bstack_enum(repr(usize))]
+/// enum E { A }
+/// # fn main() {}
+/// ```
+///
+/// An unsupported `repr` width:
+/// ```compile_fail
+/// use bstack_raii::bstack_enum;
+/// #[bstack_enum(repr(u128))]
+/// enum E { A }
+/// # fn main() {}
+/// ```
+///
+/// A **generic** enum:
+/// ```compile_fail
+/// use bstack_raii::bstack_enum;
+/// #[bstack_enum]
+/// enum E<T> { A(T) }
+/// # fn main() {}
+/// ```
+///
+/// `weak` without `rc`:
+/// ```compile_fail
+/// use bstack_raii::bstack_enum;
+/// #[bstack_enum(weak)]
+/// enum E { A }
+/// # fn main() {}
+/// ```
+///
+/// A **non-`Pod`** field in a POD aggregate variant:
+/// ```compile_fail
+/// use bstack_raii::bstack_enum;
+/// #[bstack_enum]
+/// enum E { V(String) }
+/// # fn main() {}
+/// ```
+///
+/// An ownership annotation targeting a **non-block** type:
+/// ```compile_fail
+/// use bstack_raii::bstack_enum;
+/// #[bstack_enum]
+/// enum E { #[bstack_owned] V(u32) }
+/// # fn main() {}
+/// ```
+///
+/// `repr(..)` on a **struct** (it selects an enum discriminant width):
+/// ```compile_fail
+/// use bstack_raii::bstack_block;
+/// #[bstack_block(repr(u64))]
+/// struct X { a: u32 }
+/// # fn main() {}
+/// ```
+#[doc(hidden)]
+pub mod __macro_compile_fail_tests {}
