@@ -418,3 +418,81 @@ mod _assertions {
     {
     }
 }
+
+// Fault-injection failure tests. These are white-box: they target the exact
+// `BStack` op each path issues in the non-`atomic` build (`extend`/`discard`),
+// so they are gated off under `atomic` (which routes through
+// `try_extend`/`try_discard`). The op-agnostic fault fuzz covers both builds.
+#[cfg(all(
+    test,
+    debug_assertions,
+    feature = "fault-injection",
+    not(feature = "atomic")
+))]
+mod fault_tests {
+    use super::LinearBStackAllocator;
+    use crate::BStack;
+    use crate::alloc::BStackAllocator;
+    use crate::alloc_test_common::{Guard, policies::FailOpAt, temp_path};
+    use crate::fault::FaultPolicy;
+    use std::io::ErrorKind;
+    use std::sync::Arc;
+
+    fn arm(alloc: &LinearBStackAllocator, policy: FailOpAt) {
+        let policy: Arc<dyn FaultPolicy> = Arc::new(policy);
+        alloc.stack().set_fault_policy(Some(policy));
+    }
+    fn disarm(alloc: &LinearBStackAllocator) {
+        alloc.stack().set_fault_policy(None);
+    }
+
+    // `alloc` is a single `extend`; a fault there surfaces the error verbatim
+    // and leaves the allocator untouched and usable.
+    #[test]
+    fn alloc_extend_fault_surfaces_cleanly() {
+        let path = temp_path("lin_alloc");
+        let _g = Guard(path.clone());
+        let alloc = LinearBStackAllocator::new(BStack::open(&path).unwrap());
+
+        arm(&alloc, FailOpAt::new("extend", 0, ErrorKind::Other));
+        let err = alloc
+            .alloc(64)
+            .expect_err("alloc must fail when extend faults");
+        disarm(&alloc);
+        assert_eq!(err.kind(), ErrorKind::Other);
+
+        // Nothing was allocated, and the allocator is still fully usable.
+        let mut s = alloc.alloc(64).unwrap();
+        s.write([7u8; 64]).unwrap();
+        assert_eq!(s.read().unwrap(), vec![7u8; 64]);
+    }
+
+    // Tail `dealloc` faults on its `discard` (after the `len` tail check, before
+    // any mutation): the region survives, so the error must hand the handle back
+    // and a retry must succeed.
+    #[test]
+    fn dealloc_tail_discard_fault_returns_handle() {
+        let path = temp_path("lin_dealloc");
+        let _g = Guard(path.clone());
+        let alloc = LinearBStackAllocator::new(BStack::open(&path).unwrap());
+
+        let mut s = alloc.alloc(64).unwrap();
+        s.write([9u8; 64]).unwrap();
+        let (start, len) = (s.start(), s.len());
+
+        arm(&alloc, FailOpAt::new("discard", 0, ErrorKind::Other));
+        let err = alloc
+            .dealloc(s)
+            .expect_err("dealloc must fail when discard faults");
+        disarm(&alloc);
+
+        let handle = err
+            .handle
+            .expect("linear dealloc leaves the region live, so the handle must be returned");
+        assert_eq!((handle.start(), handle.len()), (start, len));
+        assert_eq!(handle.read().unwrap(), vec![9u8; 64], "data must be intact");
+
+        // Retrying the free (unarmed) reclaims the tail cleanly.
+        alloc.dealloc(handle).unwrap();
+    }
+}

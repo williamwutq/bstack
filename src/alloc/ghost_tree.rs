@@ -1806,3 +1806,122 @@ mod tests {
         }
     }
 }
+
+// Fault-injection failure tests (non-`atomic` white-box; op-agnostic fuzz covers
+// the `atomic` build). GhostTree's load-bearing failure path is the non-tail
+// `dealloc`, which zeros the block and then commits a non-atomic AVL insert:
+// once the insert begins a torn insert cannot be retried, so the handle is lost
+// (`None`). The tests pin both the pre-insert (handle retained) and mid-insert
+// (handle lost) boundaries.
+#[cfg(all(
+    test,
+    debug_assertions,
+    feature = "fault-injection",
+    not(feature = "atomic")
+))]
+mod fault_tests {
+    use super::GhostTreeBstackAllocator;
+    use crate::BStack;
+    use crate::alloc::BStackAllocator;
+    use crate::alloc_test_common::{Guard, policies::FailOpAt, temp_path};
+    use crate::fault::FaultPolicy;
+    use std::io::ErrorKind;
+    use std::sync::Arc;
+
+    fn arm(alloc: &GhostTreeBstackAllocator, policy: FailOpAt) {
+        let policy: Arc<dyn FaultPolicy> = Arc::new(policy);
+        alloc.stack().set_fault_policy(Some(policy));
+    }
+    fn disarm(alloc: &GhostTreeBstackAllocator) {
+        alloc.stack().set_fault_policy(None);
+    }
+
+    // A fresh allocation with no free block grows via a single `extend`; a fault
+    // there surfaces cleanly and leaves the allocator usable.
+    #[test]
+    fn alloc_extend_fault_surfaces_cleanly() {
+        let path = temp_path("gt_alloc");
+        let _g = Guard(path.clone());
+        let alloc = GhostTreeBstackAllocator::new(BStack::open(&path).unwrap()).unwrap();
+
+        arm(&alloc, FailOpAt::new("extend", 0, ErrorKind::Other));
+        let err = alloc
+            .alloc(64)
+            .expect_err("alloc must fail when extend faults");
+        disarm(&alloc);
+        assert_eq!(err.kind(), ErrorKind::Other);
+
+        let mut s = alloc.alloc(64).unwrap();
+        s.write([7u8; 64]).unwrap();
+        assert_eq!(s.read().unwrap(), vec![7u8; 64]);
+    }
+
+    // Non-tail `dealloc` zeros the block before the AVL insert. Faulting that
+    // `zero` fires before any mutation, so the block survives and the handle is
+    // returned for a clean retry.
+    #[test]
+    fn dealloc_nontail_fault_before_insert_returns_handle() {
+        let path = temp_path("gt_retain");
+        let _g = Guard(path.clone());
+        let alloc = GhostTreeBstackAllocator::new(BStack::open(&path).unwrap()).unwrap();
+
+        let mut a = alloc.alloc(64).unwrap();
+        a.write([2u8; 64]).unwrap();
+        let _b = alloc.alloc(64).unwrap(); // keep a non-tail
+        let (a_start, a_len) = (a.start(), a.len());
+
+        arm(&alloc, FailOpAt::new("zero", 0, ErrorKind::Other));
+        let err = alloc
+            .dealloc(a)
+            .expect_err("dealloc must fail when the zero faults");
+        disarm(&alloc);
+
+        let handle = err
+            .handle
+            .expect("fault before the AVL insert must return the surviving handle");
+        assert_eq!((handle.start(), handle.len()), (a_start, a_len));
+        assert_eq!(handle.read().unwrap(), vec![2u8; 64], "data must be intact");
+        alloc.dealloc(handle).unwrap();
+    }
+
+    // Non-tail `dealloc` faults the AVL insert's first `set` (after the block is
+    // zeroed and the `lost` point is crossed): the block cannot be safely handed
+    // back, so the handle is `None`. A reopen must leave surviving allocations
+    // intact and the allocator usable.
+    #[test]
+    fn dealloc_nontail_avl_insert_fault_is_lost() {
+        let path = temp_path("gt_lost");
+        let _g = Guard(path.clone());
+
+        let b_start = {
+            let alloc = GhostTreeBstackAllocator::new(BStack::open(&path).unwrap()).unwrap();
+            let a = alloc.alloc(64).unwrap();
+            let mut b = alloc.alloc(64).unwrap();
+            b.write([5u8; 64]).unwrap();
+            let b_start = b.start();
+
+            arm(&alloc, FailOpAt::new("set", 0, ErrorKind::Other));
+            let err = alloc
+                .dealloc(a)
+                .expect_err("dealloc must fail when the AVL insert faults");
+            disarm(&alloc);
+            assert!(
+                err.handle.is_none(),
+                "a torn AVL insert must report the block lost (handle None)"
+            );
+            drop(alloc);
+            b_start
+        };
+
+        // Reopen (coalesce/rebalance walks reachable nodes). The surviving
+        // allocation is intact and the allocator continues to work.
+        let alloc = GhostTreeBstackAllocator::new(BStack::open(&path).unwrap()).unwrap();
+        assert_eq!(
+            alloc.stack().get(b_start, b_start + 64).unwrap(),
+            vec![5u8; 64]
+        );
+        let mut c = alloc.alloc(96).unwrap();
+        c.write([6u8; 96]).unwrap();
+        assert_eq!(c.read().unwrap(), vec![6u8; 96]);
+    }
+}

@@ -1342,3 +1342,132 @@ impl BStackAllocator for FirstFitBStackAllocator {
         })
     }
 }
+
+// Fault-injection failure tests (non-`atomic` white-box; op-agnostic fuzz covers
+// the `atomic` build). FirstFit's central crash-consistency invariant is the
+// `recovery_needed` flag protocol plus the reopen recovery scan, so the tests
+// drive faults across that boundary and confirm the handle contract and that a
+// reopen leaves surviving allocations intact.
+#[cfg(all(
+    test,
+    debug_assertions,
+    feature = "fault-injection",
+    not(feature = "atomic")
+))]
+mod fault_tests {
+    use super::FirstFitBStackAllocator;
+    use crate::BStack;
+    use crate::alloc::BStackAllocator;
+    use crate::alloc_test_common::{Guard, policies::FailOpAt, temp_path};
+    use crate::fault::FaultPolicy;
+    use std::io::ErrorKind;
+    use std::sync::Arc;
+
+    fn arm(alloc: &FirstFitBStackAllocator, policy: FailOpAt) {
+        let policy: Arc<dyn FaultPolicy> = Arc::new(policy);
+        alloc.stack().set_fault_policy(Some(policy));
+    }
+    fn disarm(alloc: &FirstFitBStackAllocator) {
+        alloc.stack().set_fault_policy(None);
+    }
+
+    // Allocating with no reusable free block pushes a fresh block in one `push`.
+    // A fault there surfaces cleanly and leaves the arena unchanged and usable.
+    #[test]
+    fn alloc_push_fault_surfaces_cleanly() {
+        let path = temp_path("ff_alloc");
+        let _g = Guard(path.clone());
+        let alloc = FirstFitBStackAllocator::new(BStack::open(&path).unwrap()).unwrap();
+
+        arm(&alloc, FailOpAt::new("push", 0, ErrorKind::Other));
+        let err = alloc
+            .alloc(64)
+            .expect_err("alloc must fail when push faults");
+        disarm(&alloc);
+        assert_eq!(err.kind(), ErrorKind::Other);
+
+        // Arena untouched: a fresh alloc succeeds and round-trips.
+        let mut s = alloc.alloc(64).unwrap();
+        s.write([7u8; 64]).unwrap();
+        assert_eq!(s.read().unwrap(), vec![7u8; 64]);
+    }
+
+    // A non-tail free-list `dealloc` sets `recovery_needed` first; faulting that
+    // very first `set` fires before any mutation, so the flag is *not* left set,
+    // the block stays live, and the handle is returned for a clean retry.
+    #[test]
+    fn dealloc_nontail_fault_before_mutation_returns_handle() {
+        let path = temp_path("ff_retain");
+        let _g = Guard(path.clone());
+        let alloc = FirstFitBStackAllocator::new(BStack::open(&path).unwrap()).unwrap();
+
+        let _a = alloc.alloc(64).unwrap();
+        let mut b = alloc.alloc(64).unwrap();
+        b.write([2u8; 64]).unwrap();
+        let _c = alloc.alloc(64).unwrap(); // keep b non-tail
+        let (b_start, b_len) = (b.start(), b.len());
+
+        arm(&alloc, FailOpAt::new("set", 0, ErrorKind::Other));
+        let err = alloc
+            .dealloc(b)
+            .expect_err("dealloc must fail when the flag write faults");
+        disarm(&alloc);
+
+        let handle = err
+            .handle
+            .expect("fault before mutation must return the surviving handle");
+        assert_eq!((handle.start(), handle.len()), (b_start, b_len));
+        assert_eq!(handle.read().unwrap(), vec![2u8; 64], "data must be intact");
+        // Retry (unarmed) frees it cleanly.
+        alloc.dealloc(handle).unwrap();
+    }
+
+    // A tail `dealloc` sets `recovery_needed`, then faults its `discard`. The
+    // block is reported lost (handle `None`), the flag is left set on disk, and a
+    // reopen runs the recovery scan; surviving allocations must be intact and the
+    // allocator usable afterwards.
+    #[test]
+    fn dealloc_tail_discard_fault_recovers_on_reopen() {
+        let path = temp_path("ff_tail");
+        let _g = Guard(path.clone());
+
+        let (a_start, b_start) = {
+            let alloc = FirstFitBStackAllocator::new(BStack::open(&path).unwrap()).unwrap();
+            let mut a = alloc.alloc(64).unwrap();
+            a.write([1u8; 64]).unwrap();
+            let mut b = alloc.alloc(64).unwrap();
+            b.write([2u8; 64]).unwrap();
+            let mut c = alloc.alloc(64).unwrap();
+            c.write([3u8; 64]).unwrap();
+            let (a_start, b_start) = (a.start(), b.start());
+
+            arm(&alloc, FailOpAt::new("discard", 0, ErrorKind::Other));
+            let err = alloc
+                .dealloc(c)
+                .expect_err("tail dealloc must fail when discard faults");
+            disarm(&alloc);
+            assert!(
+                err.handle.is_none(),
+                "past the lost point the handle must not be returned"
+            );
+            drop(alloc);
+            (a_start, b_start)
+        };
+
+        // Reopen runs the recovery scan (recovery_needed was set).
+        let alloc = FirstFitBStackAllocator::new(BStack::open(&path).unwrap()).unwrap();
+        assert_eq!(
+            alloc.stack().get(a_start, a_start + 64).unwrap(),
+            vec![1u8; 64]
+        );
+        assert_eq!(
+            alloc.stack().get(b_start, b_start + 64).unwrap(),
+            vec![2u8; 64]
+        );
+
+        // Allocator is consistent and usable.
+        let mut d = alloc.alloc(128).unwrap();
+        d.write([4u8; 128]).unwrap();
+        assert_eq!(d.read().unwrap(), vec![4u8; 128]);
+    }
+}

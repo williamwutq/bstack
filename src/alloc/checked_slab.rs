@@ -2256,3 +2256,136 @@ mod tests {
         assert_eq!(alloc.recover().unwrap(), 0);
     }
 }
+
+// Fault-injection failure tests (non-`atomic` white-box; op-agnostic fuzz covers
+// the `atomic` build). CheckedSlab tags every block with an overhead word and
+// runs a full `recover()` scan in `open`, so it can reclaim blocks orphaned by a
+// mid-operation fault. The tests drive the two orphaning paths — a faulted
+// overhead write in `alloc` (orphan tail) and a faulted free-list push in
+// `dealloc` (lost handle) — and confirm the reopen recovery reclaims them while
+// surviving allocations stay intact.
+#[cfg(all(
+    test,
+    debug_assertions,
+    feature = "fault-injection",
+    not(feature = "atomic")
+))]
+mod fault_tests {
+    use super::CheckedSlabBStackAllocator;
+    use crate::BStack;
+    use crate::alloc::BStackAllocator;
+    use crate::alloc_test_common::{Guard, policies::FailOpAt, temp_path};
+    use crate::fault::FaultPolicy;
+    use std::io::ErrorKind;
+    use std::sync::Arc;
+
+    const DATA: u64 = 64;
+
+    fn arm(alloc: &CheckedSlabBStackAllocator, policy: FailOpAt) {
+        let policy: Arc<dyn FaultPolicy> = Arc::new(policy);
+        alloc.stack().set_fault_policy(Some(policy));
+    }
+    fn disarm(alloc: &CheckedSlabBStackAllocator) {
+        alloc.stack().set_fault_policy(None);
+    }
+
+    // A fresh block is grown with a single `extend` (before the overhead write);
+    // a fault there surfaces cleanly and leaves the allocator usable.
+    #[test]
+    fn alloc_extend_fault_surfaces_cleanly() {
+        let path = temp_path("cslab_alloc");
+        let _g = Guard(path.clone());
+        let alloc = CheckedSlabBStackAllocator::new(BStack::open(&path).unwrap(), DATA).unwrap();
+
+        arm(&alloc, FailOpAt::new("extend", 0, ErrorKind::Other));
+        let err = alloc
+            .alloc(DATA)
+            .expect_err("alloc must fail when extend faults");
+        disarm(&alloc);
+        assert_eq!(err.kind(), ErrorKind::Other);
+
+        let mut s = alloc.alloc(DATA).unwrap();
+        s.write([7u8; DATA as usize]).unwrap();
+        assert_eq!(s.read().unwrap(), vec![7u8; DATA as usize]);
+    }
+
+    // `alloc` extends the tail and then writes the in-use overhead word. Faulting
+    // that `set` leaves an extended-but-untagged (overhead == 0) orphan tail; the
+    // reopen `recover()` must discard it, leaving prior data intact.
+    #[test]
+    fn alloc_overhead_write_fault_recovers_orphan_tail() {
+        let path = temp_path("cslab_orphan");
+        let _g = Guard(path.clone());
+
+        let a_start = {
+            let alloc =
+                CheckedSlabBStackAllocator::new(BStack::open(&path).unwrap(), DATA).unwrap();
+            let mut a = alloc.alloc(DATA).unwrap();
+            a.write([1u8; DATA as usize]).unwrap();
+            let a_start = a.start();
+
+            // Second alloc: extend succeeds, the overhead `set` faults.
+            arm(&alloc, FailOpAt::new("set", 0, ErrorKind::Other));
+            let err = alloc
+                .alloc(DATA)
+                .expect_err("alloc must fail when the overhead write faults");
+            disarm(&alloc);
+            assert_eq!(err.kind(), ErrorKind::Other);
+            drop(alloc);
+            a_start
+        };
+
+        // Reopen runs recover(); the orphan tail is reclaimed and A survives.
+        let alloc = CheckedSlabBStackAllocator::open(BStack::open(&path).unwrap()).unwrap();
+        assert_eq!(
+            alloc.stack().get(a_start, a_start + DATA).unwrap(),
+            vec![1u8; DATA as usize]
+        );
+        // Idempotent recovery: nothing left to reclaim.
+        assert_eq!(alloc.recover().unwrap(), 0);
+        let mut c = alloc.alloc(DATA).unwrap();
+        c.write([4u8; DATA as usize]).unwrap();
+        assert_eq!(c.read().unwrap(), vec![4u8; DATA as usize]);
+    }
+
+    // A non-tail free enters the free-list push, which sets `lost` before the
+    // first link write. Faulting that `set` reports the block lost (handle
+    // `None`); the reopen `recover()` reclaims the leaked block, the surviving
+    // allocation is intact, and double-free detection still works afterwards.
+    #[test]
+    fn dealloc_freelist_fault_is_lost_and_recovers() {
+        let path = temp_path("cslab_lost");
+        let _g = Guard(path.clone());
+
+        let b_start = {
+            let alloc =
+                CheckedSlabBStackAllocator::new(BStack::open(&path).unwrap(), DATA).unwrap();
+            let a = alloc.alloc(DATA).unwrap();
+            let mut b = alloc.alloc(DATA).unwrap();
+            b.write([5u8; DATA as usize]).unwrap();
+            let b_start = b.start();
+
+            arm(&alloc, FailOpAt::new("set", 0, ErrorKind::Other));
+            let err = alloc
+                .dealloc(a)
+                .expect_err("free-list dealloc must fail when set faults");
+            disarm(&alloc);
+            assert!(
+                err.handle.is_none(),
+                "past the lost point the handle must be None"
+            );
+            drop(alloc);
+            b_start
+        };
+
+        let alloc = CheckedSlabBStackAllocator::open(BStack::open(&path).unwrap()).unwrap();
+        assert_eq!(
+            alloc.stack().get(b_start, b_start + DATA).unwrap(),
+            vec![5u8; DATA as usize]
+        );
+        // A fresh allocation and its normal free still work (double-free guard
+        // and free list are healthy after recovery).
+        let d = alloc.alloc(DATA).unwrap();
+        alloc.dealloc(d).unwrap();
+    }
+}

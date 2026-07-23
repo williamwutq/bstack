@@ -1182,3 +1182,127 @@ mod tests {
         }
     }
 }
+
+// Fault-injection failure tests (non-`atomic` white-box; op-agnostic fuzz covers
+// the `atomic` build). Slab has no recovery routine — consistency rests entirely
+// on write ordering (payload before `free_head`), so a fault during a free-list
+// push leaks at most the in-flight block and never corrupts the list. The tests
+// pin the handle contract for the retained (oversized tail) and lost (free-list)
+// paths and confirm a reopen sees an intact, usable arena.
+#[cfg(all(
+    test,
+    debug_assertions,
+    feature = "fault-injection",
+    not(feature = "atomic")
+))]
+mod fault_tests {
+    use super::SlabBStackAllocator;
+    use crate::BStack;
+    use crate::alloc::BStackAllocator;
+    use crate::alloc_test_common::{Guard, policies::FailOpAt, temp_path};
+    use crate::fault::FaultPolicy;
+    use std::io::ErrorKind;
+    use std::sync::Arc;
+
+    const BLOCK: u64 = 64;
+
+    fn arm(alloc: &SlabBStackAllocator, policy: FailOpAt) {
+        let policy: Arc<dyn FaultPolicy> = Arc::new(policy);
+        alloc.stack().set_fault_policy(Some(policy));
+    }
+    fn disarm(alloc: &SlabBStackAllocator) {
+        alloc.stack().set_fault_policy(None);
+    }
+
+    // A fresh block is grown with a single `extend`; a fault there surfaces
+    // cleanly and leaves the allocator usable.
+    #[test]
+    fn alloc_extend_fault_surfaces_cleanly() {
+        let path = temp_path("slab_alloc");
+        let _g = Guard(path.clone());
+        let alloc = SlabBStackAllocator::new(BStack::open(&path).unwrap(), BLOCK).unwrap();
+
+        arm(&alloc, FailOpAt::new("extend", 0, ErrorKind::Other));
+        let err = alloc
+            .alloc(BLOCK)
+            .expect_err("alloc must fail when extend faults");
+        disarm(&alloc);
+        assert_eq!(err.kind(), ErrorKind::Other);
+
+        let mut s = alloc.alloc(BLOCK).unwrap();
+        s.write([7u8; BLOCK as usize]).unwrap();
+        assert_eq!(s.read().unwrap(), vec![7u8; BLOCK as usize]);
+    }
+
+    // Freeing an oversized tail allocation is a single `discard` with no `lost`
+    // marking; a fault there leaves the region live, so the handle comes back and
+    // a retry succeeds.
+    #[test]
+    fn dealloc_oversized_tail_discard_fault_returns_handle() {
+        let path = temp_path("slab_tail");
+        let _g = Guard(path.clone());
+        let alloc = SlabBStackAllocator::new(BStack::open(&path).unwrap(), BLOCK).unwrap();
+
+        let mut s = alloc.alloc(200).unwrap(); // oversized (4 blocks), at the tail
+        s.write([3u8; 200]).unwrap();
+        let (start, len) = (s.start(), s.len());
+
+        arm(&alloc, FailOpAt::new("discard", 0, ErrorKind::Other));
+        let err = alloc
+            .dealloc(s)
+            .expect_err("tail dealloc must fail when discard faults");
+        disarm(&alloc);
+
+        let handle = err
+            .handle
+            .expect("oversized-tail dealloc leaves the region live");
+        assert_eq!((handle.start(), handle.len()), (start, len));
+        assert_eq!(
+            handle.read().unwrap(),
+            vec![3u8; 200],
+            "data must be intact"
+        );
+        alloc.dealloc(handle).unwrap();
+    }
+
+    // A single-block, non-tail free enters the free-list push, which sets `lost`
+    // before touching any links. Faulting its first `set` reports the block lost
+    // (handle `None`); because the fault fires before the write, `free_head` is
+    // unchanged, so the list stays valid and a reopen sees an intact arena.
+    #[test]
+    fn dealloc_freelist_fault_is_lost_and_list_stays_valid() {
+        let path = temp_path("slab_lost");
+        let _g = Guard(path.clone());
+
+        let b_start = {
+            let alloc = SlabBStackAllocator::new(BStack::open(&path).unwrap(), BLOCK).unwrap();
+            let a = alloc.alloc(BLOCK).unwrap();
+            let mut b = alloc.alloc(BLOCK).unwrap();
+            b.write([5u8; BLOCK as usize]).unwrap();
+            let b_start = b.start();
+
+            arm(&alloc, FailOpAt::new("set", 0, ErrorKind::Other));
+            let err = alloc
+                .dealloc(a)
+                .expect_err("free-list dealloc must fail when set faults");
+            disarm(&alloc);
+            assert!(
+                err.handle.is_none(),
+                "past the lost point the handle must be None"
+            );
+            drop(alloc);
+            b_start
+        };
+
+        // Reopen: Slab::open validates the header/free_head; the list must be
+        // intact and the surviving allocation preserved.
+        let alloc = SlabBStackAllocator::open(BStack::open(&path).unwrap()).unwrap();
+        assert_eq!(
+            alloc.stack().get(b_start, b_start + BLOCK).unwrap(),
+            vec![5u8; BLOCK as usize]
+        );
+        let mut c = alloc.alloc(BLOCK).unwrap();
+        c.write([6u8; BLOCK as usize]).unwrap();
+        assert_eq!(c.read().unwrap(), vec![6u8; BLOCK as usize]);
+    }
+}
