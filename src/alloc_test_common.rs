@@ -143,8 +143,14 @@ impl Payload {
         match self {
             Payload::Seeded(id) => check(&got[..n], *id, bias, ctx),
             Payload::Raw(bytes) => {
-                assert!(bytes.len() >= n, "{ctx}: stored raw payload shorter than prefix");
-                assert!(got[..n] == bytes[..n], "{ctx}: raw payload prefix corruption");
+                assert!(
+                    bytes.len() >= n,
+                    "{ctx}: stored raw payload shorter than prefix"
+                );
+                assert!(
+                    got[..n] == bytes[..n],
+                    "{ctx}: raw payload prefix corruption"
+                );
             }
         }
     }
@@ -346,8 +352,7 @@ pub(crate) mod policies {
                 return None;
             }
             let n = self.seen.fetch_add(1, Ordering::SeqCst);
-            (n == self.at)
-                .then(|| io::Error::new(self.kind, format!("injected fault at {op}#{n}")))
+            (n == self.at).then(|| io::Error::new(self.kind, format!("injected fault at {op}#{n}")))
         }
     }
 }
