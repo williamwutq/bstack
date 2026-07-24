@@ -2,6 +2,8 @@ use super::{
     BStackAllocError, BStackAllocator, BStackBulkAllocError, BStackBulkAllocator, BStackOwnedSlice,
 };
 use crate::BStack;
+#[cfg(feature = "atomic")]
+use crate::BStackGenOp;
 #[cfg(not(feature = "atomic"))]
 use std::cell::Cell;
 use std::fmt;
@@ -845,23 +847,72 @@ impl BStackAllocator for GhostTreeBstackAllocator {
                 let freed_tail = aligned_old - aligned_new;
                 let tail_ptr = start + aligned_new;
 
-                // Atomic fast path: discard the tail block without taking the lock.
+                // Atomic fast path (lock-free): fuse the tail truncation and the
+                // padding zeroing into ONE crash-atomic splice. As two calls
+                // (`try_discard` then `zero`) a fault between them shrinks the
+                // stack yet still returns `old_len` — an out-of-bounds handle.
+                // `Len` confirms the tail under `process_gen`'s held write lock,
+                // then `Atrunc` cuts `[start+new_len, start+aligned_old)` and
+                // re-appends `aligned_new - new_len` zeros. The fault policy is
+                // consulted before any mutation, so a fault leaves the block
+                // intact and `map_err` returns `Some(start, old_len)`.
                 #[cfg(feature = "atomic")]
-                if self.stack.try_discard(start + aligned_old, freed_tail)? {
-                    if new_len < aligned_new {
-                        self.stack.zero(start + new_len, aligned_new - new_len)?;
+                {
+                    // Padding is `aligned_new - new_len`, always < MIN_ALLOC (32,
+                    // the alignment granularity), so a stack buffer suffices.
+                    // Used later in the `process_gen` closure to avoid a heap allocation.
+                    let zeros = [0u8; MIN_ALLOC as usize];
+                    let mut cur_len = 0u64;
+                    let cur_ptr: *mut u64 = &mut cur_len;
+                    let mut phase = 0u8;
+                    let mut truncated = false;
+                    self.stack.process_gen(|| match phase {
+                        0 => {
+                            phase = 1;
+                            // SAFETY: `process_gen` invokes this closure strictly
+                            // sequentially and finishes writing `out` before the
+                            // next call, so the `&mut` never aliases the reads below.
+                            Some(BStackGenOp::Len {
+                                out: unsafe { &mut *cur_ptr },
+                            })
+                        }
+                        1 => {
+                            phase = 2;
+                            // SAFETY: the `Len` write above has completed.
+                            if start + aligned_old == unsafe { *cur_ptr } {
+                                truncated = true;
+                                Some(BStackGenOp::Atrunc {
+                                    n: aligned_old - new_len,
+                                    data: &zeros[..(aligned_new - new_len) as usize],
+                                })
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    })?;
+                    if truncated {
+                        return Ok(Some(unsafe {
+                            BStackOwnedSlice::from_raw_parts(self, start, new_len)
+                        }));
                     }
-                    return Ok(Some(unsafe {
-                        BStackOwnedSlice::from_raw_parts(self, start, new_len)
-                    }));
+                    // Not the tail — fall through to the non-tail shrink below.
                 }
 
+                // Non-atomic tail shrink. No `atrunc`/`process_gen` without the
+                // `atomic` feature, so discard FIRST (a fault there fires before
+                // any mutation → the original is fully intact → `Some(old_len)`),
+                // then mark the shrink committed and zero the sub-block padding. A
+                // fault at that zero can no longer hand back the (now-shrunk)
+                // original, so `lost` makes the caller get `None` rather than a
+                // partially-zeroed "original".
                 #[cfg(not(feature = "atomic"))]
                 if start + aligned_old == self.stack.len()? {
+                    self.stack.discard(freed_tail)?;
+                    lost = true;
                     if new_len < aligned_new {
                         self.stack.zero(start + new_len, aligned_new - new_len)?;
                     }
-                    self.stack.discard(freed_tail)?;
                     return Ok(Some(unsafe {
                         BStackOwnedSlice::from_raw_parts(self, start, new_len)
                     }));
