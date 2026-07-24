@@ -595,8 +595,18 @@ pub mod fault;
 use fault::fault_point;
 #[cfg(all(debug_assertions, feature = "fault-injection"))]
 pub use fault::{FaultPolicy, FaultState};
+#[cfg(all(
+    test,
+    debug_assertions,
+    feature = "fault-injection",
+    feature = "alloc",
+    feature = "set"
+))]
+mod alloc_fault_tests;
 #[cfg(all(test, feature = "alloc", feature = "set"))]
 mod alloc_fuzz_tests;
+#[cfg(all(test, feature = "alloc", feature = "set"))]
+mod alloc_test_common;
 mod test;
 
 #[cfg(feature = "alloc")]

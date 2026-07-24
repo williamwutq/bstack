@@ -2,6 +2,8 @@ use super::{
     BStackAllocError, BStackAllocator, BStackBulkAllocError, BStackBulkAllocator, BStackOwnedSlice,
 };
 use crate::BStack;
+#[cfg(feature = "atomic")]
+use crate::BStackGenOp;
 #[cfg(not(feature = "atomic"))]
 use std::cell::Cell;
 use std::fmt;
@@ -845,23 +847,72 @@ impl BStackAllocator for GhostTreeBstackAllocator {
                 let freed_tail = aligned_old - aligned_new;
                 let tail_ptr = start + aligned_new;
 
-                // Atomic fast path: discard the tail block without taking the lock.
+                // Atomic fast path (lock-free): fuse the tail truncation and the
+                // padding zeroing into ONE crash-atomic splice. As two calls
+                // (`try_discard` then `zero`) a fault between them shrinks the
+                // stack yet still returns `old_len` — an out-of-bounds handle.
+                // `Len` confirms the tail under `process_gen`'s held write lock,
+                // then `Atrunc` cuts `[start+new_len, start+aligned_old)` and
+                // re-appends `aligned_new - new_len` zeros. The fault policy is
+                // consulted before any mutation, so a fault leaves the block
+                // intact and `map_err` returns `Some(start, old_len)`.
                 #[cfg(feature = "atomic")]
-                if self.stack.try_discard(start + aligned_old, freed_tail)? {
-                    if new_len < aligned_new {
-                        self.stack.zero(start + new_len, aligned_new - new_len)?;
+                {
+                    // Padding is `aligned_new - new_len`, always < MIN_ALLOC (32,
+                    // the alignment granularity), so a stack buffer suffices.
+                    // Used later in the `process_gen` closure to avoid a heap allocation.
+                    let zeros = [0u8; MIN_ALLOC as usize];
+                    let mut cur_len = 0u64;
+                    let cur_ptr: *mut u64 = &mut cur_len;
+                    let mut phase = 0u8;
+                    let mut truncated = false;
+                    self.stack.process_gen(|| match phase {
+                        0 => {
+                            phase = 1;
+                            // SAFETY: `process_gen` invokes this closure strictly
+                            // sequentially and finishes writing `out` before the
+                            // next call, so the `&mut` never aliases the reads below.
+                            Some(BStackGenOp::Len {
+                                out: unsafe { &mut *cur_ptr },
+                            })
+                        }
+                        1 => {
+                            phase = 2;
+                            // SAFETY: the `Len` write above has completed.
+                            if start + aligned_old == unsafe { *cur_ptr } {
+                                truncated = true;
+                                Some(BStackGenOp::Atrunc {
+                                    n: aligned_old - new_len,
+                                    data: &zeros[..(aligned_new - new_len) as usize],
+                                })
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    })?;
+                    if truncated {
+                        return Ok(Some(unsafe {
+                            BStackOwnedSlice::from_raw_parts(self, start, new_len)
+                        }));
                     }
-                    return Ok(Some(unsafe {
-                        BStackOwnedSlice::from_raw_parts(self, start, new_len)
-                    }));
+                    // Not the tail — fall through to the non-tail shrink below.
                 }
 
+                // Non-atomic tail shrink. No `atrunc`/`process_gen` without the
+                // `atomic` feature, so discard FIRST (a fault there fires before
+                // any mutation → the original is fully intact → `Some(old_len)`),
+                // then mark the shrink committed and zero the sub-block padding. A
+                // fault at that zero can no longer hand back the (now-shrunk)
+                // original, so `lost` makes the caller get `None` rather than a
+                // partially-zeroed "original".
                 #[cfg(not(feature = "atomic"))]
                 if start + aligned_old == self.stack.len()? {
+                    self.stack.discard(freed_tail)?;
+                    lost = true;
                     if new_len < aligned_new {
                         self.stack.zero(start + new_len, aligned_new - new_len)?;
                     }
-                    self.stack.discard(freed_tail)?;
                     return Ok(Some(unsafe {
                         BStackOwnedSlice::from_raw_parts(self, start, new_len)
                     }));
@@ -1804,5 +1855,125 @@ mod tests {
         for h in handles {
             h.join().unwrap();
         }
+    }
+}
+
+// Fault-injection failure tests (non-`atomic` white-box; op-agnostic fuzz covers
+// the `atomic` build). GhostTree's load-bearing failure path is the non-tail
+// `dealloc`, which zeros the block and then commits a non-atomic AVL insert:
+// once the insert begins a torn insert cannot be retried, so the handle is lost
+// (`None`). The tests pin both the pre-insert (handle retained) and mid-insert
+// (handle lost) boundaries.
+#[cfg(all(
+    test,
+    debug_assertions,
+    feature = "fault-injection",
+    feature = "set",
+    not(feature = "atomic")
+))]
+mod fault_tests {
+    use super::GhostTreeBstackAllocator;
+    use crate::BStack;
+    use crate::alloc::BStackAllocator;
+    use crate::alloc_test_common::{Guard, policies::FailOpAt, temp_path};
+    use crate::fault::FaultPolicy;
+    use std::io::ErrorKind;
+    use std::sync::Arc;
+
+    fn arm(alloc: &GhostTreeBstackAllocator, policy: FailOpAt) {
+        let policy: Arc<dyn FaultPolicy> = Arc::new(policy);
+        alloc.stack().set_fault_policy(Some(policy));
+    }
+    fn disarm(alloc: &GhostTreeBstackAllocator) {
+        alloc.stack().set_fault_policy(None);
+    }
+
+    // A fresh allocation with no free block grows via a single `extend`; a fault
+    // there surfaces cleanly and leaves the allocator usable.
+    #[test]
+    fn alloc_extend_fault_surfaces_cleanly() {
+        let path = temp_path("gt_alloc");
+        let _g = Guard(path.clone());
+        let alloc = GhostTreeBstackAllocator::new(BStack::open(&path).unwrap()).unwrap();
+
+        arm(&alloc, FailOpAt::new("extend", 0, ErrorKind::Other));
+        let err = alloc
+            .alloc(64)
+            .expect_err("alloc must fail when extend faults");
+        disarm(&alloc);
+        assert_eq!(err.kind(), ErrorKind::Other);
+
+        let mut s = alloc.alloc(64).unwrap();
+        s.write([7u8; 64]).unwrap();
+        assert_eq!(s.read().unwrap(), vec![7u8; 64]);
+    }
+
+    // Non-tail `dealloc` zeros the block before the AVL insert. Faulting that
+    // `zero` fires before any mutation, so the block survives and the handle is
+    // returned for a clean retry.
+    #[test]
+    fn dealloc_nontail_fault_before_insert_returns_handle() {
+        let path = temp_path("gt_retain");
+        let _g = Guard(path.clone());
+        let alloc = GhostTreeBstackAllocator::new(BStack::open(&path).unwrap()).unwrap();
+
+        let mut a = alloc.alloc(64).unwrap();
+        a.write([2u8; 64]).unwrap();
+        let _b = alloc.alloc(64).unwrap(); // keep a non-tail
+        let (a_start, a_len) = (a.start(), a.len());
+
+        arm(&alloc, FailOpAt::new("zero", 0, ErrorKind::Other));
+        let err = alloc
+            .dealloc(a)
+            .expect_err("dealloc must fail when the zero faults");
+        disarm(&alloc);
+
+        let handle = err
+            .handle
+            .expect("fault before the AVL insert must return the surviving handle");
+        assert_eq!((handle.start(), handle.len()), (a_start, a_len));
+        assert_eq!(handle.read().unwrap(), vec![2u8; 64], "data must be intact");
+        alloc.dealloc(handle).unwrap();
+    }
+
+    // Non-tail `dealloc` faults the AVL insert's first `set` (after the block is
+    // zeroed and the `lost` point is crossed): the block cannot be safely handed
+    // back, so the handle is `None`. A reopen must leave surviving allocations
+    // intact and the allocator usable.
+    #[test]
+    fn dealloc_nontail_avl_insert_fault_is_lost() {
+        let path = temp_path("gt_lost");
+        let _g = Guard(path.clone());
+
+        let b_start = {
+            let alloc = GhostTreeBstackAllocator::new(BStack::open(&path).unwrap()).unwrap();
+            let a = alloc.alloc(64).unwrap();
+            let mut b = alloc.alloc(64).unwrap();
+            b.write([5u8; 64]).unwrap();
+            let b_start = b.start();
+
+            arm(&alloc, FailOpAt::new("set", 0, ErrorKind::Other));
+            let err = alloc
+                .dealloc(a)
+                .expect_err("dealloc must fail when the AVL insert faults");
+            disarm(&alloc);
+            assert!(
+                err.handle.is_none(),
+                "a torn AVL insert must report the block lost (handle None)"
+            );
+            drop(alloc);
+            b_start
+        };
+
+        // Reopen (coalesce/rebalance walks reachable nodes). The surviving
+        // allocation is intact and the allocator continues to work.
+        let alloc = GhostTreeBstackAllocator::new(BStack::open(&path).unwrap()).unwrap();
+        assert_eq!(
+            alloc.stack().get(b_start, b_start + 64).unwrap(),
+            vec![5u8; 64]
+        );
+        let mut c = alloc.alloc(96).unwrap();
+        c.write([6u8; 96]).unwrap();
+        assert_eq!(c.read().unwrap(), vec![6u8; 96]);
     }
 }

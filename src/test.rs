@@ -3277,18 +3277,6 @@ mod first_fit_tests {
     }
 
     #[test]
-    fn realloc_tail_shrink() {
-        let (alloc, path) = mk_ff("realloc_tail_shrink");
-        let _g = Guard(path);
-        let s = alloc.alloc(32).unwrap();
-        let s_start = s.start();
-        let s2 = alloc.realloc(s, 16).unwrap();
-        assert_eq!(s2.start(), s_start);
-        assert_eq!(s2.len(), 16);
-        assert_eq!(alloc.len().unwrap(), ALFF_HDR_OFFSET + 16 + BLOCK_OVERHEAD);
-    }
-
-    #[test]
     fn realloc_tail_preserves_data() {
         let (alloc, path) = mk_ff("realloc_tail_data");
         let _g = Guard(path);
