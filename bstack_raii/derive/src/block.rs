@@ -59,14 +59,23 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         ));
     }
 
-    let fields = match &input.fields {
-        Fields::Named(named) => &named.named,
-        _ => {
-            return Err(Error::new_spanned(
-                &input.fields,
-                "#[bstack_block] requires a struct with named fields",
-            ));
-        }
+    // Normalize fields to `(name, field)`: named fields keep their name, a tuple
+    // struct's positional fields get synthetic `field0` / `field1` / … names (so
+    // they access as `x.field0(stack)` and reuse the whole field machinery), and a
+    // unit struct has none — yielding a valid **header-only** block.
+    let field_list: Vec<(Ident, &syn::Field)> = match &input.fields {
+        Fields::Named(named) => named
+            .named
+            .iter()
+            .map(|f| (f.ident.clone().expect("named field"), f))
+            .collect(),
+        Fields::Unnamed(unnamed) => unnamed
+            .unnamed
+            .iter()
+            .enumerate()
+            .map(|(i, f)| (format_ident!("field{i}"), f))
+            .collect(),
+        Fields::Unit => Vec::new(),
     };
 
     let name = &input.ident;
@@ -94,11 +103,12 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
     let mut mv_caps = Vec::new();
     let mut mv_types = Vec::new();
     let mut mv_recon = Vec::new();
+    // Generated `#[repr(C, packed)]` Pod wrappers for POD tuple fields.
+    let mut wrapper_defs = Vec::new();
     // Whether any field was written `&T` (coerced to owned `T`, with a warning).
     let mut ref_coerced = false;
 
-    for field in fields {
-        let fname = field.ident.as_ref().expect("named field");
+    for (fname, field) in &field_list {
         let kind = classify(field)?;
 
         // Ergonomic: `&T` is coerced to owned `T` (and `&str` to `String`), with
@@ -111,10 +121,10 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
             ref_coerced = true;
         }
 
-        // `Option<Inner>` makes a field nullable (`0` on disk == `None`, since no
-        // allocation ever lives at offset 0). Strip it first, so the inner type —
-        // which may itself be a `Vec` / `String` — is what we classify.
-        let (inner_ty, nullable) = match option_inner(eff_ty) {
+        // Peek through `Option<Inner>` (which makes a *reference* field nullable,
+        // `0` on disk == `None`) so the inner type — which may itself be a `Vec` /
+        // `String` — is what we classify. A POD field keeps the whole type (below).
+        let (opt_inner, nullable) = match option_inner(eff_ty) {
             Some(inner) => (inner, true),
             None => (eff_ty, false),
         };
@@ -122,13 +132,13 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         // `Vec<T>` / `String` (and `&str` → `String`): an inline descriptor on
         // disk, a `BStackVec` at runtime. A nullable vec uses the `data_off == 0`
         // niche. Handled here.
-        let vinfo = if is_str(inner_ty) {
+        let vinfo = if is_str(opt_inner) {
             Some(VecInfo {
                 elem: quote!(u8),
                 is_string: true,
             })
         } else {
-            vec_field(inner_ty)
+            vec_field(opt_inner)
         };
         if let Some(vinfo) = vinfo {
             let elem = &vinfo.elem;
@@ -216,12 +226,60 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
             continue;
         }
 
-        if nullable && kind == Kind::Pod {
-            return Err(Error::new_spanned(
-                &field.ty,
-                "Option is only supported on #[bstack_owned] / #[bstack_strong] / \
-                 #[bstack_weak] / #[bstack_ref] fields",
-            ));
+        // Decide the stored type + nullability now that vectors are handled.
+        //
+        // * A **reference** kind (owned/strong/weak/ref) lowers to a `u64` offset;
+        //   `Option<T>` makes it nullable.
+        // * A **POD** field stores its *whole* type inline. That includes an
+        //   `Option<A>` — stored via the bytemuck `PodInOption` niche (so
+        //   `Option<A>: Pod` iff `A: PodInOption`) — so no annotation is needed and
+        //   the accessor/`bstack_move!` hand back the `Option<A>` by value.
+        let (inner_ty, nullable) = if kind == Kind::Pod {
+            (eff_ty, false)
+        } else {
+            (opt_inner, nullable)
+        };
+
+        // A POD **tuple** field `a: (A, B, ..)`: a Rust tuple is not `Pod`, but a
+        // packed struct of its (POD) elements is — alignment is irrelevant on disk
+        // — so store it through a generated wrapper and rebuild the tuple on read.
+        // `bstack_move!` hands back the tuple as one element (not flattened).
+        if kind == Kind::Pod && let Type::Tuple(tup) = inner_ty {
+            let elems: Vec<&Type> = tup.elems.iter().collect();
+            let wrapper = format_ident!("__BstackTup_{}_{}", name, fname);
+            let idx: Vec<syn::Index> = (0..elems.len()).map(syn::Index::from).collect();
+            wrapper_defs.push(quote! {
+                #[repr(C, packed)]
+                #[derive(::core::clone::Clone, ::core::marker::Copy)]
+                #[doc(hidden)]
+                #vis struct #wrapper( #(#elems),* );
+                // SAFETY: `#[repr(C, packed)]` => no padding; every element is
+                // `Pod` (asserted below), so all bit patterns are valid.
+                unsafe impl ::bstack_raii::Zeroable for #wrapper {}
+                unsafe impl ::bstack_raii::Pod for #wrapper {}
+            });
+            pod_types.extend(elems.iter().copied());
+            on_disk_fields.push(quote!(#fname: #wrapper,));
+            accessors.push(quote! {
+                #vis fn #fname(
+                    &self,
+                    stack: &::bstack_raii::BStack,
+                ) -> ::std::io::Result<#inner_ty> {
+                    let mut __buf = [0u8; ::core::mem::size_of::<#on_disk>()];
+                    let __r = unsafe { ::bstack_raii::BStackRef::<Self>::from_range(self.0) };
+                    let __od: #on_disk = *__r.read_on_disk(stack, &mut __buf)?;
+                    let __w = __od.#fname;
+                    ::std::result::Result::Ok(( #(__w.#idx,)* ))
+                }
+            });
+            ctor_params.push(quote!(#fname: #inner_ty,));
+            ctor_preps.push(quote!(let #fname: #wrapper = #wrapper( #(#fname.#idx),* );));
+            ctor_inits.push(quote!(#fname: #fname,));
+            let cap = format_ident!("__cap_{}", fname);
+            mv_caps.push(quote!(let #cap = __od.#fname;));
+            mv_types.push(quote!(#inner_ty));
+            mv_recon.push(quote!(( #(#cap.#idx,)* )));
+            continue;
         }
 
         // On-disk lowering.
@@ -459,6 +517,9 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
     Ok(quote! {
         #[derive(::core::clone::Clone, ::core::marker::Copy)]
         #vis struct #name(::bstack_raii::BStackRange);
+
+        // Packed Pod wrappers for any POD tuple fields.
+        #(#wrapper_defs)*
 
         #[repr(C, packed)]
         #[derive(::core::clone::Clone, ::core::marker::Copy)]

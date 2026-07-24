@@ -200,5 +200,63 @@ pub use bstack_raii_derive::{bstack_block, bstack_cast, bstack_enum, bstack_move
 /// struct X { a: u32 }
 /// # fn main() {}
 /// ```
+///
+/// ---
+///
+/// The same shapes on `#[bstack_block]` **structs**.
+///
+/// **Two** ownership annotations on one field:
+/// ```compile_fail
+/// use bstack_raii::bstack_block;
+/// #[bstack_block]
+/// struct X { #[bstack_owned] #[bstack_ref] f: u32 }
+/// # fn main() {}
+/// ```
+///
+/// An ownership annotation targeting a **non-block** type — including a generic
+/// wrapper like `Wrapper<Foo<Bar>>` (an on-disk ref is not generic), even when
+/// the type would be fine stored inline as POD *without* the annotation:
+/// ```compile_fail
+/// use bstack_raii::bstack_block;
+/// #[bstack_block]
+/// struct X { #[bstack_owned] f: core::num::Wrapping<u32> }
+/// # fn main() {}
+/// ```
+///
+/// A `#[bstack_weak]` field whose target isn't weak-observable:
+/// ```compile_fail
+/// use bstack_raii::bstack_block;
+/// #[bstack_block]
+/// struct X { #[bstack_weak] f: u32 }
+/// # fn main() {}
+/// ```
+///
+/// An un-annotated **non-`Pod`** field:
+/// ```compile_fail
+/// use bstack_raii::bstack_block;
+/// struct NotPod(String);
+/// #[bstack_block]
+/// struct X { f: NotPod }
+/// # fn main() {}
+/// ```
+///
+/// A **generic** struct:
+/// ```compile_fail
+/// use bstack_raii::bstack_block;
+/// #[bstack_block]
+/// struct X<T> { f: T }
+/// # fn main() {}
+/// ```
+///
+/// `weak` without `rc`:
+/// ```compile_fail
+/// use bstack_raii::bstack_block;
+/// #[bstack_block(weak)]
+/// struct X { f: u32 }
+/// # fn main() {}
+/// ```
+///
+/// (Tuple structs of POD fields and unit structs are **valid**, not errors — see
+/// the tests.)
 #[doc(hidden)]
 pub mod __macro_compile_fail_tests {}

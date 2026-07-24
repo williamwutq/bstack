@@ -1866,3 +1866,95 @@ fn macro_enum_pod_aggregate_variants() {
         _ => panic!("expected Point"),
     }
 }
+
+// --------------------------------------------------------------------------
+// POD field conveniences: Option<A> via bytemuck::PodInOption, tuple fields
+// (`bstack_move!` keeps each tuple as one element), and generic POD wrappers.
+// --------------------------------------------------------------------------
+
+#[bstack_block]
+struct PodFeat {
+    maybe: Option<core::num::NonZeroU32>, // PodInOption niche, stored inline
+    wrap: core::num::Wrapping<u32>,       // a generic wrapper that *is* POD
+    pair: (u8, u8),                       // POD tuple field
+    mixed: (u16, i32),
+    n: u64,
+}
+
+#[test]
+#[allow(clippy::type_complexity)] // the explicit move tuple type is the assertion
+fn macro_pod_option_and_tuple_fields() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let f = PodFeat::new(
+        &alloc,
+        core::num::NonZeroU32::new(7),
+        core::num::Wrapping(42),
+        (1, 2),
+        (300, -5),
+        99,
+    )
+    .unwrap();
+    assert_eq!(
+        f.handle().maybe(stack).unwrap(),
+        core::num::NonZeroU32::new(7)
+    );
+    assert_eq!(f.handle().wrap(stack).unwrap(), core::num::Wrapping(42u32));
+    assert_eq!(f.handle().pair(stack).unwrap(), (1u8, 2u8));
+    assert_eq!(f.handle().mixed(stack).unwrap(), (300u16, -5i32));
+    assert_eq!(f.handle().n(stack).unwrap(), 99);
+
+    // `bstack_move!` returns each tuple as ONE element (not flattened into
+    // `(u8, u8, u16, i32, ..)`), so this exact type annotation must hold.
+    let (maybe, wrap, pair, mixed, n): (
+        Option<core::num::NonZeroU32>,
+        core::num::Wrapping<u32>,
+        (u8, u8),
+        (u16, i32),
+        u64,
+    ) = bstack_move!(f, &alloc).unwrap();
+    assert_eq!(maybe, core::num::NonZeroU32::new(7));
+    assert_eq!(wrap, core::num::Wrapping(42));
+    assert_eq!(pair, (1, 2));
+    assert_eq!(mixed, (300, -5));
+    assert_eq!(n, 99);
+
+    // `Option<A>` None round-trips too (the niche).
+    let g = PodFeat::new(&alloc, None, core::num::Wrapping(0), (0, 0), (0, 0), 0).unwrap();
+    assert!(g.handle().maybe(stack).unwrap().is_none());
+    g.bstack_drop(&alloc).unwrap();
+}
+
+// --------------------------------------------------------------------------
+// Unit struct (header-only block) and tuple struct (POD positional fields)
+// --------------------------------------------------------------------------
+
+#[bstack_block]
+struct Marker;
+
+#[bstack_block]
+struct Rgb(u8, u8, u8);
+
+#[test]
+fn macro_unit_and_tuple_structs() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    // Unit struct: a valid header-only block (just the 16-byte BlockHeader).
+    assert_eq!(size_of::<<Marker as BStackBlock>::OnDisk>(), 16);
+    let m = Marker::new(&alloc).unwrap();
+    let () = bstack_move!(m, &alloc).unwrap(); // moving a unit yields ()
+
+    // Tuple struct: positional constructor, `.field0` / `.field1` / … accessors.
+    let c = Rgb::new(&alloc, 10, 20, 30).unwrap();
+    assert_eq!(c.handle().field0(stack).unwrap(), 10);
+    assert_eq!(c.handle().field1(stack).unwrap(), 20);
+    assert_eq!(c.handle().field2(stack).unwrap(), 30);
+
+    // bstack_move! yields the fields in order.
+    let (r, g, b) = bstack_move!(c, &alloc).unwrap();
+    assert_eq!((r, g, b), (10, 20, 30));
+}

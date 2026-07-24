@@ -249,6 +249,13 @@ methods:
 - recursive teardown, [casting](#casting-bstack_cast), and
   [moving](#moving-out-bstack_move).
 
+A **tuple struct** works too, as long as every field is `Pod`: its positional
+fields get synthetic names, so `struct Rgb(u8, u8, u8)` is constructed
+`Rgb::new(&alloc, 10, 20, 30)`, read via `rgb.field0(stack)?` / `field1` / …, and
+`bstack_move!` hands the fields back in order. A **unit struct**
+(`#[bstack_block] struct Marker;`) is a valid **header-only** block — just the
+16-byte header, no payload.
+
 ### Reference-counted blocks
 
 Declare `#[bstack_block(rc)]` / `#[bstack_block(rc, weak)]` (the on-disk layout
@@ -346,6 +353,12 @@ The accessor returns `io::Result<Option<_>>`, the constructor takes an `Option`
 (`Option<BStackOwned<Child>>` / `Option<&[T]>` / …), and `bstack_move!` yields
 `Option<_>`. (`#[bstack_weak]` fields are already nullable.)
 
+An `Option` on an **un-annotated POD** field is different: `Option<A>` is stored
+*inline* whenever `A: bytemuck::PodInOption` (so `Option<A>: Pod`) — e.g.
+`Option<NonZeroU32>` — riding bytemuck's niche, with the `Option<A>` handed back
+by value. (A plain `Option<u32>` is *not* `Pod`, so it doesn't compile as a POD
+field — annotate it, or use a `NonZero`.)
+
 `Option` *is* a Rust `enum`, but this is a niche optimization baked into the
 macro — **not** a [`#[bstack_enum]`](#enums-bstack_enum) (no discriminant byte, no
 `EData` / `EView`, no extra block). `Option` is the only enum that gets it; any
@@ -437,6 +450,12 @@ the `std` types — the macro lowers each to a bstack_raii on-disk form (a growa
 [vector descriptor](#vectors-and-strings), a nullable offset, …). Nothing on disk
 is ever an actual `std::vec::Vec` / `String` / `Option`; they're borrowed as
 familiar names for convenience.
+
+A **POD tuple** field — `a: (A, B, …)` where every element is `Pod` — also works,
+even though a Rust tuple isn't itself `Pod`: it's stored through a generated
+packed wrapper (alignment is irrelevant on disk) and handed back as a tuple by
+the accessor. `bstack_move!` keeps each tuple as **one** element — a `(u8, u8)`
+field comes back as `(u8, u8)`, not flattened into the surrounding tuple.
 
 In the same spirit, a field written `&T` is coerced to owned `T` (and `&str` to
 `String`) with a compile warning — a stray reference doesn't fail to compile, but
