@@ -131,20 +131,16 @@ impl Payload {
         bias: u64,
         ctx: &str,
     ) {
-        let got = slice.read().unwrap();
+        let got = slice.read_range(0, n).unwrap();
         let n = n as usize;
-        assert!(got.len() >= n, "{ctx}: slice shorter than preserved prefix");
         match self {
-            Payload::Seeded(id) => check(&got[..n], *id, bias, ctx),
+            Payload::Seeded(id) => check(&got, *id, bias, ctx),
             Payload::Raw(bytes) => {
                 assert!(
                     bytes.len() >= n,
                     "{ctx}: stored raw payload shorter than prefix"
                 );
-                assert!(
-                    got[..n] == bytes[..n],
-                    "{ctx}: raw payload prefix corruption"
-                );
+                assert!(got == bytes[..n], "{ctx}: raw payload prefix corruption");
             }
         }
     }
