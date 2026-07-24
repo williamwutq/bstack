@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **`GhostTreeBstackAllocator::realloc` tail shrink was not crash-atomic.** Shrinking a tail allocation to a sub-block-unaligned length truncated the freed tail and zeroed the retained block's padding as two separate operations, so a fault (or crash) between them left the stack shrunk with un-zeroed padding — violating the zeroed-memory invariant and yielding a `realloc`-failure handle claiming a length past the now-shorter stack. The `atomic` path now fuses both into one crash-atomic tail-replace, so a fault leaves the block fully intact; the non-`atomic` path discards first and commits the shrink before zeroing, so a fault after the commit reports the allocation as lost (`handle: None`) rather than handing back a partially-zeroed "original". Surfaced by the new allocator fault-injection fuzz.
+
 ## [0.4.0] - 2026-07-10
 
 > Upgrading from 0.2.x? See [docs/MIGRATION_0.4.0.md](docs/MIGRATION_0.4.0.md) for a step-by-step migration guide.

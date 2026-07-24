@@ -2759,6 +2759,52 @@ static int gt_vt_dealloc(bstack_allocator_t *self, bstack_slice_t slice)
 #endif
 }
 
+#ifdef BSTACK_FEATURE_ATOMIC
+/*
+ * Context + generator for gt_vt_realloc's crash-atomic tail shrink.
+ *
+ * BSTACK_GEN_LEN confirms this block is still the tail under bstack_process_gen's
+ * single held write lock (so no concurrent push/discard can move it between the
+ * check and the cut), then a NULL-`removed` BSTACK_GEN_SPLICE (the atrunc form)
+ * cuts `cut` bytes off the tail and re-appends `pad_len` zero bytes — fusing the
+ * tail truncation and the sub-block padding zeroing into one crash-atomic splice.
+ */
+typedef struct {
+    int      phase;
+    int      truncated;
+    uint64_t expected_tail;   /* slice.offset + aligned_old */
+    uint64_t cur;             /* BSTACK_GEN_LEN output */
+    size_t   cut;             /* bytes to cut off the tail */
+    size_t   pad_len;         /* zero bytes to re-append (< ALGT_MIN_ALLOC) */
+    uint8_t  pad[ALGT_MIN_ALLOC];
+} algt_shrink_ctx_t;
+
+static int algt_shrink_gen(bstack_gen_op_t *out_op, void *ctx_)
+{
+    algt_shrink_ctx_t *c = (algt_shrink_ctx_t *)ctx_;
+    if (c->phase == 0) {
+        c->phase = 1;
+        out_op->kind = BSTACK_GEN_LEN;
+        out_op->u.len.out = &c->cur;
+        return 1;
+    }
+    if (c->phase == 1) {
+        c->phase = 2;
+        if (c->expected_tail == c->cur) {
+            c->truncated = 1;
+            out_op->kind = BSTACK_GEN_SPLICE;
+            out_op->u.splice.removed = NULL;   /* atrunc form: discard the cut bytes */
+            out_op->u.splice.n = c->cut;
+            out_op->u.splice.new_buf = c->pad;
+            out_op->u.splice.new_len = c->pad_len;
+            return 1;
+        }
+        return 0;   /* not the tail — change nothing, fall through to non-tail */
+    }
+    return 0;
+}
+#endif /* BSTACK_FEATURE_ATOMIC */
+
 static int gt_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
     uint64_t new_len, bstack_slice_t *out)
 {
@@ -2815,26 +2861,32 @@ static int gt_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
         uint64_t tail_ptr   = slice.offset + aligned_new;
 
 #ifdef BSTACK_FEATURE_ATOMIC
-        /* Atomic tail path: try_discard atomically checks and discards. */
+        /* Atomic tail path: fuse the tail truncation and the sub-block padding
+         * zeroing into ONE crash-atomic splice. As two calls (try_discard then
+         * zero) a crash between them shrinks the stack yet leaves the padding
+         * un-zeroed — violating the zeroed-memory invariant, so a later
+         * whole-block reuse could hand back stale bytes, and the shrunk stack no
+         * longer covers the old length. bstack_process_gen holds one write lock
+         * across the LEN tail-check and the SPLICE, so a crash leaves the block
+         * fully intact. Padding is aligned_new - new_len, always < ALGT_MIN_ALLOC. */
         {
-            int ok = 0;
+            algt_shrink_ctx_t ctx;
 #if UINT64_MAX > SIZE_MAX
-            if (freed_tail > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
+            if (aligned_old - new_len > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
 #endif
-            if (bstack_try_discard(a->bs, slice.offset + aligned_old,
-                                   (size_t)freed_tail, &ok) != 0) return -1;
-            if (ok) {
-                if (new_len < aligned_new) {
-                    uint64_t gap = aligned_new - new_len;
-#if UINT64_MAX > SIZE_MAX
-                    if (gap > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
-#endif
-                    if (bstack_zero(a->bs, slice.offset + new_len, (size_t)gap) != 0)
-                        return -1;
-                }
+            ctx.phase         = 0;
+            ctx.truncated     = 0;
+            ctx.expected_tail = slice.offset + aligned_old;
+            ctx.cur           = 0;
+            ctx.cut           = (size_t)(aligned_old - new_len);
+            ctx.pad_len       = (size_t)(aligned_new - new_len);
+            memset(ctx.pad, 0, sizeof ctx.pad);
+            if (bstack_process_gen(a->bs, algt_shrink_gen, &ctx) != 0) return -1;
+            if (ctx.truncated) {
                 out->allocator = self; out->offset = slice.offset; out->len = new_len;
                 return 0;
             }
+            /* Not the tail — fall through to the non-tail shrink below. */
         }
 #else
         if (is_tail) {
