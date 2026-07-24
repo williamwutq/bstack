@@ -19,8 +19,6 @@ mod alloc_fuzz_tests {
         rng.random_range(0..=u64::MAX)
     }
 
-    // ── generic fuzz runners ──────────────────────────────────────────────────
-
     // Alloc/dealloc/check mix. Each live allocation carries a `Payload` — either a
     // cheap seeded pattern or an adversarial snapshot copied out of the BStack
     // (bytes that look like allocator internals) — verified on read-back.
@@ -331,8 +329,6 @@ mod alloc_fuzz_tests {
         alloc.dealloc(before).unwrap();
         alloc.dealloc(after).unwrap();
     }
-
-    // ── test suite macro ──────────────────────────────────────────────────────
 
     macro_rules! fuzz_suite {
         ($mod_name:ident, $make:expr) => {

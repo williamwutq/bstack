@@ -18,8 +18,6 @@ use crate::alloc::{BStackOwnedSlice, BStackOwnedSliceAllocator};
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-// ── temp-file management ────────────────────────────────────────────────────
-
 /// RAII guard that removes a temp backing file when dropped.
 pub(crate) struct Guard(pub std::path::PathBuf);
 impl Drop for Guard {
@@ -35,8 +33,6 @@ pub(crate) fn temp_path(prefix: &str) -> std::path::PathBuf {
     let pid = std::process::id();
     std::env::temp_dir().join(format!("bstack_fuzz_{prefix}_{pid}_{id}.bin"))
 }
-
-// ── deterministic byte-pattern payloads ─────────────────────────────────────
 
 /// Fill `buf` with a cheap, regenerable pattern derived from `id` and `bias`.
 ///
@@ -68,8 +64,6 @@ pub(crate) fn check_is_zero(buf: &[u8], ctx: &str) {
         assert_eq!(b, 0, "{ctx}: expected zero at [{i}], got {b:#04x}");
     }
 }
-
-// ── payloads ────────────────────────────────────────────────────────────────
 
 /// The two kinds of data a fuzz allocation is filled with.
 ///
@@ -156,8 +150,6 @@ impl Payload {
     }
 }
 
-// ── adversarial payload source ──────────────────────────────────────────────
-
 /// Read `len` bytes from a random, 8-byte-**aligned**, in-bounds region of
 /// `stack` to use as an allocation's payload.
 ///
@@ -189,8 +181,6 @@ pub(crate) fn adversarial_bytes<R: rand::RngExt>(
     };
     stack.get(src, src + len).ok()
 }
-
-// ── operations ──────────────────────────────────────────────────────────────
 
 /// A single fuzz operation. `Reopen` is only emitted by suites that opt in via
 /// `allow_reopen` (the fault suite).
@@ -245,8 +235,6 @@ pub(crate) fn make_payload<R: rand::RngExt>(
     Payload::Seeded(id)
 }
 
-// ── configuration ───────────────────────────────────────────────────────────
-
 /// Volume/shape knobs, read once from the environment with sane defaults so CI
 /// can crank a longer fuzz run without recompiling. No file snapshots are
 /// taken: a failing run panics with enough context (id/bias/offset) to
@@ -285,8 +273,6 @@ impl FuzzConfig {
     }
 }
 
-// ── allocator constructor closures ──────────────────────────────────────────
-
 /// Build a `Fn(BStack) -> io::Result<A>` constructor for cross-allocator drivers.
 ///
 /// * `make_allocator!(SlabBStackAllocator, 16)` — for slab-style allocators
@@ -310,7 +296,7 @@ macro_rules! make_allocator {
 }
 pub(crate) use make_allocator;
 
-// ── fault policies ──────────────────────────────────────────────────────────
+// Fault-injection policies
 // Only compiled when the fault-injection machinery exists. Shared by the
 // per-allocator failure unit tests (`FailOpAt`) and the fault fuzz suite.
 

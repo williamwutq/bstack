@@ -27,10 +27,6 @@
 //! operation before continuing — modelling "crash → restart → recover" — and
 //! also on a fixed period. [`LinearBStackAllocator`](crate::LinearBStackAllocator)
 //! is intentionally excluded: it keeps no metadata and has no recovery path.
-//!
-//! Not run in normal CI (see `--skip alloc_fault_tests`); it is driven by the
-//! dedicated fault-fuzz workflow, and cannot run in `--release` (the fault
-//! machinery is stripped without `debug_assertions`).
 
 mod alloc_fault_tests {
     use crate::alloc::{
@@ -47,8 +43,6 @@ mod alloc_fault_tests {
     use std::io;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
-
-    // ── the fault policy ──────────────────────────────────────────────────────
 
     /// Fails a pseudo-random subset of consultations at rate `per_mille`
     /// (faults per thousand), deterministically from `seed` and an internal
@@ -92,8 +86,6 @@ mod alloc_fault_tests {
             .and_then(|v| v.parse().ok())
             .unwrap_or(30)
     }
-
-    // ── driver ────────────────────────────────────────────────────────────────
 
     /// Disarm, reopen (running recovery), and re-verify every live allocation.
     /// Returns the reopened allocator. Panics on any data mismatch — that is the
@@ -254,8 +246,6 @@ mod alloc_fault_tests {
         // Final integrity pass.
         let _alloc = reopen_and_verify(alloc, &make, &live, bias, "final");
     }
-
-    // ── per-allocator instantiations (Linear intentionally excluded) ───────────
 
     macro_rules! fault_suite {
         ($mod_name:ident, $make:expr, $salt:expr) => {
