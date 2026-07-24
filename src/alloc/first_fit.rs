@@ -1085,21 +1085,15 @@ impl BStackAllocator for FirstFitBStackAllocator {
                             });
                         }
                         std::cmp::Ordering::Less => {
-                            // No recovery_needed: the header/footer writes and the discard touch
-                            // only this tail block, not the free list. The lock held above excludes
-                            // concurrent tail modification; within that, the discard is a single
-                            // atomic BStack call.
-                            // Write new footer before discarding so it lands at the right position
-                            self.stack.set(
-                                slice.start() + aligned_new_len,
-                                aligned_new_len.to_le_bytes(),
-                            )?;
-                            self.stack.set(
-                                slice.start() - Self::BLOCK_HEADER_SIZE,
-                                aligned_new_len.to_le_bytes(),
-                            )?;
-                            self.stack.discard(aligned_current_len - aligned_new_len)?;
-                            // SAFETY: slice shrunk in place at tail
+                            // Keep the block; don't reclaim the tail in place. A
+                            // physical shrink needs a header write plus a discard
+                            // (metadata + size change) that cannot be one
+                            // crash-atomic call, and the block-walking recovery
+                            // cannot parse the torn intermediate. Narrowing only
+                            // the user length (an oversized block, as a non-tail
+                            // shrink does) needs no writes; the tail is reclaimed
+                            // on free.
+                            // SAFETY: same block, new_len ≤ old len ≤ block size.
                             return Ok(unsafe {
                                 BStackOwnedSlice::from_raw_parts(self, slice.start(), new_len)
                             });

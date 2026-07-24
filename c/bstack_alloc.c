@@ -1552,19 +1552,12 @@ static int ff_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
                            size_le, 8) != 0) { MUTEX_UNLOCK(a); return -1; }
             if (alff_clear_recovery_needed(a->bs) != 0) { MUTEX_UNLOCK(a); return -1; }
         } else {
-            uint64_t delta = aligned_current_len - aligned_new_len;
-#if UINT64_MAX > SIZE_MAX
-            if (delta > (uint64_t)SIZE_MAX) { MUTEX_UNLOCK(a); errno = EINVAL; return -1; }
-#endif
-            /* Tail-shrink touches only this block's header/footer and the tail.
-             * The lock above excludes concurrent tail modification; within that,
-             * the discard is a single atomic bstack call, so no recovery flag. */
-            write_le64(size_le, aligned_new_len);
-            if (bstack_set(a->bs, slice.offset + aligned_new_len,
-                           size_le, 8) != 0) { MUTEX_UNLOCK(a); return -1; }
-            if (bstack_set(a->bs, slice.offset - ALFF_BLOCK_HDR_SIZE,
-                           size_le, 8) != 0) { MUTEX_UNLOCK(a); return -1; }
-            if (bstack_discard(a->bs, (size_t)delta) != 0) { MUTEX_UNLOCK(a); return -1; }
+            /* Tail shrink: keep the block; don't reclaim the tail in place. A
+             * physical shrink needs a header write plus a discard (metadata +
+             * size change) that cannot be one crash-atomic call, and the
+             * block-walking recovery cannot parse the torn intermediate.
+             * Narrowing only the user length (an oversized block, as a non-tail
+             * shrink does) needs no writes; the tail is reclaimed on free. */
         }
         out->allocator = self;
         out->offset    = slice.offset;
@@ -2861,14 +2854,12 @@ static int gt_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
         uint64_t tail_ptr   = slice.offset + aligned_new;
 
 #ifdef BSTACK_FEATURE_ATOMIC
-        /* Atomic tail path: fuse the tail truncation and the sub-block padding
-         * zeroing into ONE crash-atomic splice. As two calls (try_discard then
-         * zero) a crash between them shrinks the stack yet leaves the padding
-         * un-zeroed — violating the zeroed-memory invariant, so a later
-         * whole-block reuse could hand back stale bytes, and the shrunk stack no
-         * longer covers the old length. bstack_process_gen holds one write lock
-         * across the LEN tail-check and the SPLICE, so a crash leaves the block
-         * fully intact. Padding is aligned_new - new_len, always < ALGT_MIN_ALLOC. */
+        /* Atomic tail path: fuse the truncation and padding zeroing into ONE
+         * crash-atomic splice. As two calls (try_discard then zero) a crash
+         * between them shrinks the stack yet leaves the padding un-zeroed —
+         * violating the zeroed-memory invariant. bstack_process_gen holds one
+         * write lock across the LEN tail-check and the SPLICE, so a crash leaves
+         * the block intact. */
         {
             algt_shrink_ctx_t ctx;
 #if UINT64_MAX > SIZE_MAX

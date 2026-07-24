@@ -284,7 +284,7 @@ mod alloc_fault_tests {
         };
     }
 
-    // fault_suite!(first_fit, make_allocator!(FirstFitBStackAllocator), 0x1111);
+    fault_suite!(first_fit, make_allocator!(FirstFitBStackAllocator), 0x1111);
     fault_suite!(
         ghost_tree,
         make_allocator!(GhostTreeBstackAllocator),
