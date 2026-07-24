@@ -1346,6 +1346,7 @@ impl BStackAllocator for FirstFitBStackAllocator {
     test,
     debug_assertions,
     feature = "fault-injection",
+    feature = "set",
     not(feature = "atomic")
 ))]
 mod fault_tests {
