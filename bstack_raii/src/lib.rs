@@ -68,7 +68,7 @@ pub use block::{
     BStackBlock, BStackCast, BStackMove, BStackMoveExpr, BStackShared, BStackWeakable,
 };
 pub use cast::{BStackCastAs, BStackCastInto};
-pub use clone::TryClone;
+pub use clone::{ClonePlan, TryClone, TryCloneIn};
 pub use construct::{alloc_block, alloc_control, init_rc, set_weak_field, upgrade_weak_field};
 pub use handle::{OwnedRef, StrongRef, StrongWeakRef, WeakRef};
 pub use layout::{BlockHeader, EightCC};

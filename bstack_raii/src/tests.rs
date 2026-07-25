@@ -15,7 +15,7 @@ use bstack::{
 use crate::layout::{self, BlockHeader};
 use crate::{
     AutoDrop, BStackBlock, BStackCast, BStackCastAs, BStackCastInto, BStackDrop, BStackOwned,
-    BStackRc, BStackRef, BStackShared, BStackWeakable, EightCC, TryClone, alloc_block,
+    BStackRc, BStackRef, BStackShared, BStackWeakable, EightCC, TryClone, TryCloneIn, alloc_block,
     alloc_control, bstack_block, bstack_cast, bstack_enum, bstack_move, dealloc_range,
 };
 
@@ -535,6 +535,77 @@ fn macro_new_and_accessors() {
     // Freeing the parent recursively frees the child then itself; recursion
     // correctness is covered elsewhere.
     parent.bstack_drop(&alloc).unwrap();
+}
+
+// --------------------------------------------------------------------------
+// TryCloneIn — deep clone: owned children copied, shared children re-referenced
+// --------------------------------------------------------------------------
+
+#[test]
+fn macro_clone_deep_owned() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let leaf = MacroLeaf::new(&alloc, 42).unwrap();
+    let parent = MacroParent::new(&alloc, leaf, 7).unwrap();
+    let orig_child = parent.handle().child(stack).unwrap();
+
+    // Deep clone -> a fresh, independent BStackOwned copy.
+    let clone = parent.try_clone_in(&alloc).unwrap();
+
+    // Same values read back through the clone.
+    assert_eq!(clone.handle().tag(stack).unwrap(), 7);
+    assert_eq!(clone.handle().child(stack).unwrap().val(stack).unwrap(), 42);
+
+    // Independent storage: both the clone's block and its owned child are new
+    // allocations, distinct from the originals (proves the recursion + repoint).
+    assert_ne!(
+        clone.handle().range().start(),
+        parent.handle().range().start()
+    );
+    assert_ne!(
+        clone.handle().child(stack).unwrap().range().start(),
+        orig_child.range().start()
+    );
+
+    // Freeing the clone frees only the clone's subtree; the original stays intact.
+    clone.bstack_drop(&alloc).unwrap();
+    assert_eq!(parent.handle().child(stack).unwrap().val(stack).unwrap(), 42);
+    parent.bstack_drop(&alloc).unwrap();
+}
+
+#[test]
+fn macro_clone_bumps_shared_refcount() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    // A shared child, kept alive by an extra handle, wired into a parent's
+    // `#[bstack_strong]` field. After `new` + `try_clone`, strong = 2.
+    let rc = MacroStrongChild::new(&alloc, 5).unwrap();
+    let rc_keep = rc.try_clone().unwrap();
+    let parent = MacroStrongParent::new(&alloc, rc).unwrap();
+
+    // Resolve the child's strong-count offset: parent.s (first user field) ->
+    // data block -> ctrl back-pointer -> strong counter.
+    let s_data = crate::refcount::load(stack, parent.handle().range().start() + layout::HEADER_SIZE)
+        .unwrap();
+    let ctrl = crate::refcount::load(stack, s_data + layout::CTRL_BACKPTR_OFFSET).unwrap();
+    let strong_off = ctrl + layout::CTRL_STRONG_OFFSET;
+    assert_eq!(crate::refcount::load(stack, strong_off).unwrap(), 2);
+
+    // Deep-cloning the parent must make the clone's `s` acquire its OWN strong
+    // reference (a shared child is re-referenced, not deep-copied): 2 -> 3.
+    let clone = parent.try_clone_in(&alloc).unwrap();
+    assert_eq!(crate::refcount::load(stack, strong_off).unwrap(), 3);
+
+    // Both parents release their strong ref: 3 -> 1. `rc_keep` still holds one.
+    clone.bstack_drop(&alloc).unwrap();
+    parent.bstack_drop(&alloc).unwrap();
+    assert_eq!(crate::refcount::load(stack, strong_off).unwrap(), 1);
+    assert_eq!(rc_keep.handle().val(stack).unwrap(), 5);
+    drop(rc_keep);
 }
 
 #[test]
