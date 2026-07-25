@@ -1228,6 +1228,135 @@ fn macro_owned_block_vec_move() {
 }
 
 // --------------------------------------------------------------------------
+// TryCloneIn on vector fields — POD data copied, owned children deep-cloned,
+// shared elements re-referenced
+// --------------------------------------------------------------------------
+
+#[test]
+fn macro_clone_pod_vec() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let rec = Record::new(&alloc, "hello", &[1u32, 2, 3], 42).unwrap();
+    let orig_name_off = rec.handle().name(&alloc).unwrap().descriptor().data_off;
+
+    let clone = rec.try_clone_in(&alloc).unwrap();
+    assert_eq!(clone.handle().id(stack).unwrap(), 42);
+    assert_eq!(
+        clone.handle().name(&alloc).unwrap().to_vec().unwrap(),
+        b"hello"
+    );
+    assert_eq!(
+        clone.handle().tags(&alloc).unwrap().to_vec().unwrap(),
+        vec![1u32, 2, 3]
+    );
+
+    // The clone's data blocks are fresh allocations, distinct from the original's.
+    let clone_name_off = clone.handle().name(&alloc).unwrap().descriptor().data_off;
+    assert_ne!(clone_name_off, orig_name_off);
+
+    // Growing the clone's vector leaves the original untouched (independent data).
+    let mut ct = clone.handle().tags(&alloc).unwrap();
+    ct.push(99).unwrap();
+    assert_eq!(
+        clone.handle().tags(&alloc).unwrap().to_vec().unwrap(),
+        vec![1u32, 2, 3, 99]
+    );
+    assert_eq!(
+        rec.handle().tags(&alloc).unwrap().to_vec().unwrap(),
+        vec![1u32, 2, 3]
+    );
+
+    clone.bstack_drop(&alloc).unwrap();
+    rec.bstack_drop(&alloc).unwrap();
+}
+
+#[test]
+fn macro_clone_owned_vec() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let kids = vec![
+        MacroLeaf::new(&alloc, 10).unwrap(),
+        MacroLeaf::new(&alloc, 20).unwrap(),
+    ];
+    let tree = Tree::new(&alloc, kids, 7).unwrap();
+    let orig_first = tree
+        .handle()
+        .kids(&alloc)
+        .unwrap()
+        .get(0)
+        .unwrap()
+        .unwrap()
+        .range()
+        .start();
+
+    let clone = tree.try_clone_in(&alloc).unwrap();
+    let cv = clone.handle().kids(&alloc).unwrap();
+    assert_eq!(cv.len().unwrap(), 2);
+    let vals: Vec<u32> = cv
+        .to_vec()
+        .unwrap()
+        .iter()
+        .map(|k| k.val(stack).unwrap())
+        .collect();
+    assert_eq!(vals, vec![10, 20]);
+
+    // Each child is a fresh, independent block (deep clone, not aliased).
+    let clone_first = cv.get(0).unwrap().unwrap().range().start();
+    assert_ne!(clone_first, orig_first);
+
+    // Freeing the clone frees only the clone's children; the original survives.
+    clone.bstack_drop(&alloc).unwrap();
+    assert_eq!(
+        tree.handle()
+            .kids(&alloc)
+            .unwrap()
+            .get(0)
+            .unwrap()
+            .unwrap()
+            .val(stack)
+            .unwrap(),
+        10
+    );
+    tree.bstack_drop(&alloc).unwrap();
+}
+
+#[test]
+fn macro_clone_strong_vec() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let a = MacroStrongChild::new(&alloc, 100).unwrap();
+    let a_keep = a.try_clone().unwrap();
+    let a_data = a_keep.handle().range().start();
+    let b = MacroStrongChild::new(&alloc, 200).unwrap();
+    let b_keep = b.try_clone().unwrap();
+    let b_data = b_keep.handle().range().start();
+
+    let list = StrongList::new(&alloc, vec![a, b], 3).unwrap();
+    assert_eq!(strong_of(stack, a_data), 2); // list + a_keep
+    assert_eq!(strong_of(stack, b_data), 2);
+
+    // Cloning the list re-references each shared element: strong 2 -> 3.
+    let clone = list.try_clone_in(&alloc).unwrap();
+    assert_eq!(strong_of(stack, a_data), 3);
+    assert_eq!(strong_of(stack, b_data), 3);
+
+    // Freeing both lists releases their references: 3 -> 1. The `keep`s survive.
+    clone.bstack_drop(&alloc).unwrap();
+    list.bstack_drop(&alloc).unwrap();
+    assert_eq!(strong_of(stack, a_data), 1);
+    assert_eq!(strong_of(stack, b_data), 1);
+    assert_eq!(a_keep.handle().val(stack).unwrap(), 100);
+    drop(a_keep);
+    drop(b_keep);
+}
+
+// --------------------------------------------------------------------------
 // #[bstack_strong] / #[bstack_weak] / #[bstack_ref] Vec<Thing> — block-element
 // vectors whose annotation states the *elements'* ownership
 // --------------------------------------------------------------------------
@@ -1630,6 +1759,92 @@ fn macro_enum_strong_weak_variants() {
     let cell = Cell::new(&alloc, CellData::Nil).unwrap();
     assert!(matches!(cell.handle().read(&alloc).unwrap(), CellView::Nil));
     cell.bstack_drop(&alloc).unwrap();
+}
+
+// --------------------------------------------------------------------------
+// TryCloneIn on enums — POD copied, owned variant deep-cloned, ref aliased,
+// shared variant re-referenced
+// --------------------------------------------------------------------------
+
+#[test]
+fn macro_clone_enum() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    // POD variant: value byte-copied into an independent block.
+    let e = Node::new(&alloc, NodeData::Num(42)).unwrap();
+    let c = e.try_clone_in(&alloc).unwrap();
+    assert_ne!(c.handle().range().start(), e.handle().range().start());
+    match c.handle().read(&alloc).unwrap() {
+        NodeView::Num(n) => assert_eq!(n, 42),
+        _ => panic!("expected Num"),
+    }
+    c.bstack_drop(&alloc).unwrap();
+    e.bstack_drop(&alloc).unwrap();
+
+    // Owned variant: the child is deep-cloned into a fresh block.
+    let leaf = MacroLeaf::new(&alloc, 7).unwrap();
+    let e = Node::new(&alloc, NodeData::Child(leaf)).unwrap();
+    let orig_child_off = match e.handle().read(&alloc).unwrap() {
+        NodeView::Child(ch) => ch.range().start(),
+        _ => panic!("expected Child"),
+    };
+    let c = e.try_clone_in(&alloc).unwrap();
+    let clone_child_off = match c.handle().read(&alloc).unwrap() {
+        NodeView::Child(ch) => {
+            assert_eq!(ch.val(stack).unwrap(), 7);
+            ch.range().start()
+        }
+        _ => panic!("expected Child"),
+    };
+    assert_ne!(clone_child_off, orig_child_off); // deep clone, not aliased
+    c.bstack_drop(&alloc).unwrap();
+    match e.handle().read(&alloc).unwrap() {
+        NodeView::Child(ch) => assert_eq!(ch.val(stack).unwrap(), 7), // original intact
+        _ => panic!("expected Child"),
+    }
+    e.bstack_drop(&alloc).unwrap();
+
+    // Ref variant: the clone aliases the same target (non-owning).
+    let keep = MacroLeaf::new(&alloc, 9).unwrap();
+    let link = unsafe { BStackRef::from_range(keep.handle().range()) };
+    let e = Node::new(&alloc, NodeData::Link(link)).unwrap();
+    let c = e.try_clone_in(&alloc).unwrap();
+    match c.handle().read(&alloc).unwrap() {
+        NodeView::Link(l) => {
+            assert_eq!(l.val(stack).unwrap(), 9);
+            assert_eq!(l.range().start(), keep.handle().range().start()); // aliased
+        }
+        _ => panic!("expected Link"),
+    }
+    c.bstack_drop(&alloc).unwrap();
+    e.bstack_drop(&alloc).unwrap();
+    assert_eq!(keep.handle().val(stack).unwrap(), 9); // target untouched
+    keep.bstack_drop(&alloc).unwrap();
+}
+
+#[test]
+fn macro_clone_enum_shared() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let child = MacroStrongChild::new(&alloc, 11).unwrap();
+    let keep = child.try_clone().unwrap();
+    let data = keep.handle().range().start();
+    let cell = Cell::new(&alloc, CellData::Shared(child)).unwrap();
+    assert_eq!(strong_of(stack, data), 2); // cell + keep
+
+    // Cloning the enum re-references the strong variant's target: 2 -> 3.
+    let clone = cell.try_clone_in(&alloc).unwrap();
+    assert_eq!(strong_of(stack, data), 3);
+
+    clone.bstack_drop(&alloc).unwrap();
+    cell.bstack_drop(&alloc).unwrap();
+    assert_eq!(strong_of(stack, data), 1);
+    assert_eq!(keep.handle().val(stack).unwrap(), 11);
+    drop(keep);
 }
 
 // --------------------------------------------------------------------------

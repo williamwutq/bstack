@@ -34,11 +34,26 @@ use bstack::{BStack, BStackByteVec, BStackOwnedSlice, BStackOwnedSliceAllocator,
 use bytemuck::{Pod, Zeroable};
 
 use crate::block::{BStackBlock, BStackShared, BStackWeakable};
+use crate::clone::ClonePlan;
 use crate::handle::WeakRef;
 use crate::owned::BStackOwned;
 use crate::reference::BStackRef;
 use crate::shared::{BStackRc, BStackWeak};
 use crate::teardown::{BStackDrop, dealloc_range};
+
+/// Build a fresh data block holding `offs` (an offset array), register it in
+/// `plan` for rollback, and return its descriptor. The shared back end of the
+/// block-element vector clones, whose elements are all `u64` offsets.
+fn build_offset_desc<A: BStackOwnedSliceAllocator>(
+    allocator: &A,
+    offs: &[u64],
+    plan: &mut ClonePlan,
+) -> io::Result<VecDesc> {
+    let v = BStackVec::<u64, A>::from_slice(allocator, offs)?;
+    let desc = v.descriptor();
+    plan.track_alloc(BStackRange::new(desc.data_off, desc.data_size));
+    Ok(desc)
+}
 
 /// The inline, fixed-size descriptor of a persistent vector: the current offset
 /// and byte size of its (reallocating) data block.
@@ -218,6 +233,18 @@ impl<'a, T: Pod, A: BStackOwnedSliceAllocator> BStackVec<'a, T, A> {
         self.data = bytevec.into_raw_block().as_range();
         self.persist()
     }
+
+    /// Deep-clone this POD vector's data into a fresh block for a [`ClonePlan`]:
+    /// copy every element into a new data block, register it for rollback, and
+    /// return its descriptor (what the cloned owner stores inline). The new block
+    /// is written eagerly by the vector runtime, not staged in the plan's batch.
+    pub fn clone_data_into(&self, plan: &mut ClonePlan) -> io::Result<VecDesc> {
+        let elems = self.to_vec()?;
+        let v = BStackVec::from_slice(self.allocator, &elems)?;
+        let desc = v.descriptor();
+        plan.track_alloc(BStackRange::new(desc.data_off, desc.data_size));
+        Ok(desc)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -338,6 +365,24 @@ impl<'a, T: BStackBlock, A: BStackOwnedSliceAllocator> BStackBlockVec<'a, T, A> 
         }
         self.offsets.bstack_drop()
     }
+
+    /// Deep-clone this owned vector into a fresh block for a [`ClonePlan`]:
+    /// deep-clone every child via `clone_elem` (which recurses the child into the
+    /// plan and returns its new block range), then build a new offset array over
+    /// the fresh children. The per-element callback is supplied by codegen so it
+    /// can name the concrete child type's `__bstack_clone_into`.
+    pub fn clone_into<F>(&self, plan: &mut ClonePlan, mut clone_elem: F) -> io::Result<VecDesc>
+    where
+        F: FnMut(BStackRange, &mut ClonePlan) -> io::Result<BStackRange>,
+    {
+        let allocator = self.offsets.allocator();
+        let mut new_offs = Vec::new();
+        for off in self.offsets.to_vec()? {
+            let new_block = clone_elem(Self::elem_range(off), plan)?;
+            new_offs.push(new_block.start());
+        }
+        build_offset_desc(allocator, &new_offs, plan)
+    }
 }
 
 /// A persistent, growable vector of **strong references** to shared block
@@ -455,6 +500,20 @@ impl<'a, T: BStackShared, A: BStackOwnedSliceAllocator> BStackStrongVec<'a, T, A
         }
         self.offsets.bstack_drop()
     }
+
+    /// Clone this strong vector into a fresh block for a [`ClonePlan`]: the shared
+    /// children are re-referenced, not copied — bump each element's strong count
+    /// and keep its data offset, then build a new offset array over the same
+    /// targets.
+    pub fn clone_into(&self, plan: &mut ClonePlan) -> io::Result<VecDesc> {
+        let allocator = self.offsets.allocator();
+        let offs = self.offsets.to_vec()?;
+        for &off in &offs {
+            let data = unsafe { BStackRef::<T>::from_range(Self::elem_range(off)) };
+            plan.bump_strong(data, allocator)?;
+        }
+        build_offset_desc(allocator, &offs, plan)
+    }
 }
 
 /// A persistent, growable vector of **weak references** to `(rc, weak)` block
@@ -565,6 +624,18 @@ impl<'a, T: BStackWeakable, A: BStackOwnedSliceAllocator> BStackWeakVec<'a, T, A
         }
         self.offsets.bstack_drop()
     }
+
+    /// Clone this weak vector into a fresh block for a [`ClonePlan`]: bump each
+    /// element's weak count and keep its control offset, then build a new offset
+    /// array over the same control blocks.
+    pub fn clone_into(&self, plan: &mut ClonePlan) -> io::Result<VecDesc> {
+        let allocator = self.offsets.allocator();
+        let offs = self.offsets.to_vec()?;
+        for &off in &offs {
+            plan.bump_weak(off);
+        }
+        build_offset_desc(allocator, &offs, plan)
+    }
 }
 
 /// A persistent, growable vector of **raw references** to block children.
@@ -664,5 +735,14 @@ impl<'a, T: BStackBlock, A: BStackOwnedSliceAllocator> BStackRefVec<'a, T, A> {
     /// Free only the offset array (elements are not owned). Consumes the handle.
     pub fn bstack_drop(self) -> io::Result<()> {
         self.offsets.bstack_drop()
+    }
+
+    /// Clone this ref vector into a fresh block for a [`ClonePlan`]: the elements
+    /// are non-owning, so copy the offset array verbatim (the clone aliases the
+    /// same targets).
+    pub fn clone_into(&self, plan: &mut ClonePlan) -> io::Result<VecDesc> {
+        let allocator = self.offsets.allocator();
+        let offs = self.offsets.to_vec()?;
+        build_offset_desc(allocator, &offs, plan)
     }
 }

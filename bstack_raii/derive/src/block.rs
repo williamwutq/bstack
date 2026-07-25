@@ -230,7 +230,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                 ),
             };
             drop_stmts.push(drop_s);
-            clone_block_reason = Some("`Vec` / `String`");
+            clone_stmts.push(vec_clone_stmt(fname, kind, elem));
             accessors.push(acc);
             let (param, prep, init) = ctor;
             ctor_params.push(param);
@@ -941,6 +941,52 @@ fn vec_move(cap: &Ident, elem: &TokenStream, nullable: bool) -> (TokenStream, To
     let ty = quote!(::bstack_raii::BStackVec<'__mv, #elem, __A>);
     let build = quote!(::bstack_raii::BStackVec::from_desc(#cap, __alloc));
     wrap_vec_move(ty, build, cap, nullable)
+}
+
+/// A `TryCloneIn` statement for any `Vec` / `String` field: reconstruct the
+/// source vector from its (already-read) inline descriptor, deep-clone its data
+/// block into `__plan` per the element relationship, and repoint `__od`'s inline
+/// descriptor at the fresh block. A `data_off` of `0` (a null `Option<Vec>` /
+/// unset vec) is left copied as-is. POD elements are byte-copied; owned elements
+/// are deep-cloned (recursing each child); strong/weak elements are
+/// re-referenced (their refcount bumped); ref elements are aliased.
+fn vec_clone_stmt(fname: &Ident, kind: Kind, elem: &TokenStream) -> TokenStream {
+    let clone_expr = match kind {
+        Kind::Pod => quote! {
+            ::bstack_raii::BStackVec::<#elem, __A>::from_desc(__srcdesc, allocator)
+                .clone_data_into(__plan)?
+        },
+        Kind::Owned => quote! {
+            ::bstack_raii::BStackBlockVec::<#elem, __A>::from_desc(__srcdesc, allocator)
+                .clone_into(__plan, |__er, __p| {
+                    <#elem as ::bstack_raii::BStackBlock>::from_range(__er)
+                        .__bstack_clone_into(allocator, __p)
+                })?
+        },
+        Kind::Strong => quote! {
+            ::bstack_raii::BStackStrongVec::<#elem, __A>::from_desc(__srcdesc, allocator)
+                .clone_into(__plan)?
+        },
+        Kind::Weak => quote! {
+            ::bstack_raii::BStackWeakVec::<#elem, __A>::from_desc(__srcdesc, allocator)
+                .clone_into(__plan)?
+        },
+        Kind::Ref => quote! {
+            ::bstack_raii::BStackRefVec::<#elem, __A>::from_desc(__srcdesc, allocator)
+                .clone_into(__plan)?
+        },
+        // `#[embed]` never reaches the vec branch (rejected earlier).
+        Kind::Embed => quote!(unreachable!()),
+    };
+    quote! {
+        {
+            let __srcdesc: ::bstack_raii::VecDesc = __od.#fname;
+            if __srcdesc.data_off != 0 {
+                let __newdesc: ::bstack_raii::VecDesc = #clone_expr;
+                __od.#fname = __newdesc;
+            }
+        }
+    }
 }
 
 // Block-element vectors (`#[bstack_owned/strong/weak/ref] Vec<Thing>`) all share
@@ -2004,6 +2050,10 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
     let mut read_arms = Vec::new();
     let mut move_arms = Vec::new();
     let mut drop_arms = Vec::new();
+    // `TryCloneIn` per-variant payload fix-ups (mirror of `drop_arms`). Variants
+    // that need no fix-up (unit / POD aggregate / ref) emit none and fall to the
+    // catch-all; the whole payload is byte-copied regardless.
+    let mut clone_arms = Vec::new();
     let mut payload_sizes = Vec::new();
     let mut pod_types: Vec<Type> = Vec::new();
     let mut needs_payload = false;
@@ -2080,6 +2130,21 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                                 ::bstack_raii::OwnedRef(__child).bstack_drop(allocator)?;
                             }
                         });
+                        clone_arms.push(quote! {
+                            #disc => {
+                                let __off = u64::from_le_bytes(__pl[..8].try_into().unwrap());
+                                let __child = <#ty as ::bstack_raii::BStackBlock>::from_range(
+                                    ::bstack_raii::BStackRange::new(
+                                        __off,
+                                        ::core::mem::size_of::<
+                                            <#ty as ::bstack_raii::BStackBlock>::OnDisk
+                                        >() as u64,
+                                    ),
+                                );
+                                let __new = __child.__bstack_clone_into(allocator, __plan)?;
+                                __pl[..8].copy_from_slice(&__new.start().to_le_bytes());
+                            }
+                        });
                     }
                     Kind::Ref => {
                         payload_sizes.push(quote!(8usize));
@@ -2135,6 +2200,12 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                                 <#ty as ::bstack_raii::BStackShared>::drop_strong_ref(
                                     __data, allocator,
                                 )?;
+                            }
+                        });
+                        clone_arms.push(quote! {
+                            #disc => {
+                                let __data = unsafe { #cref };
+                                __plan.bump_strong(__data, allocator)?;
                             }
                         });
                     }
@@ -2194,6 +2265,12 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                         drop_arms.push(quote! {
                             #disc => {
                                 ::bstack_raii::WeakRef::<#ty>(#ctrl_ref).bstack_drop(allocator)?;
+                            }
+                        });
+                        clone_arms.push(quote! {
+                            #disc => {
+                                let __ctrl_off = u64::from_le_bytes(__pl[..8].try_into().unwrap());
+                                __plan.bump_weak(__ctrl_off);
                             }
                         });
                     }
@@ -2263,6 +2340,14 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                                     ::core::mem::size_of::<#co>() as u64,
                                 );
                                 <#ty>::__bstack_drop_children(__embed, allocator)?;
+                            }
+                        });
+                        clone_arms.push(quote! {
+                            #disc => {
+                                return ::std::result::Result::Err(::std::io::Error::new(
+                                    ::std::io::ErrorKind::Unsupported,
+                                    "TryCloneIn: cloning an #[embed] enum variant is not yet implemented",
+                                ));
                             }
                         });
                     }
@@ -2553,6 +2638,74 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
         }
     };
 
+    // Body of `__bstack_clone_into`: real deep clone for a plain enum, a runtime
+    // error for `rc` / `rc, weak` (its injected refcount / control block would
+    // need re-initialization). The whole OnDisk is byte-copied; the active
+    // variant's payload is then fixed up (owned → deep clone + repoint, strong /
+    // weak → refcount bump, ref → alias, embed → not yet supported).
+    let clone_into_body = if mode != Mode::Plain {
+        quote! {
+            ::std::result::Result::Err(::std::io::Error::new(
+                ::std::io::ErrorKind::Unsupported,
+                "TryCloneIn: cloning a reference-counted enum block is not yet implemented",
+            ))
+        }
+    } else {
+        let dispatch = if clone_arms.is_empty() {
+            quote!()
+        } else {
+            quote! {
+                let __disc = __od.__bstack_disc;
+                let mut __pl = __od.__bstack_payload;
+                match __disc {
+                    #(#clone_arms)*
+                    _ => {}
+                }
+                __od.__bstack_payload = __pl;
+            }
+        };
+        quote! {
+            let __stack = allocator.stack();
+            let __src = self.0;
+            let mut __buf = [0u8; ::core::mem::size_of::<#on_disk>()];
+            let __r = unsafe { ::bstack_raii::BStackRef::<Self>::from_range(__src) };
+            #[allow(unused_mut)]
+            let mut __od: #on_disk = *__r.read_on_disk(__stack, &mut __buf)?;
+            let __dst = __plan.alloc_raw(allocator, ::core::mem::size_of::<#on_disk>() as u64)?;
+            #dispatch
+            __plan.write(__dst.start(), ::bstack_raii::bytemuck::bytes_of(&__od).to_vec());
+            ::std::result::Result::Ok(__dst)
+        }
+    };
+    // The public `TryCloneIn` entry point, for plain enums only.
+    let enum_clone_trait = if mode == Mode::Plain {
+        quote! {
+            impl ::bstack_raii::TryCloneIn for #name {
+                fn try_clone_in<__A: ::bstack_raii::BStackOwnedSliceAllocator>(
+                    &self,
+                    allocator: &__A,
+                ) -> ::std::io::Result<::bstack_raii::BStackOwned<Self>> {
+                    let mut __plan = ::bstack_raii::ClonePlan::new();
+                    let __dst = match self.__bstack_clone_into(allocator, &mut __plan) {
+                        ::std::result::Result::Ok(__d) => __d,
+                        ::std::result::Result::Err(__e) => {
+                            __plan.rollback(allocator);
+                            return ::std::result::Result::Err(__e);
+                        }
+                    };
+                    __plan.commit(allocator)?;
+                    ::std::result::Result::Ok(unsafe {
+                        ::bstack_raii::BStackOwned::from_raw(
+                            <Self as ::bstack_raii::BStackBlock>::from_range(__dst),
+                        )
+                    })
+                }
+            }
+        }
+    } else {
+        quote!()
+    };
+
     // `EData` is generic over `<'e, A>` when a variant holds a strong/weak
     // reference; `EView` only when a weak variant makes `read` upgrade.
     let data_generics = if has_shared {
@@ -2674,9 +2827,10 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                 ::std::result::Result::Ok(())
             }
 
-            /// Deep clone into a `ClonePlan`. Not yet implemented for enums; fails
-            /// at runtime. Present so an owned enum child of a struct can be
-            /// recursed into (the parent's clone then surfaces this error).
+            /// Deep-clone this enum into a `ClonePlan`: byte-copy the OnDisk, then
+            /// fix up the active variant's payload (deep-clone an owned child,
+            /// bump a strong/weak reference, alias a ref). Returns the new block's
+            /// range. Also lets an owned enum child of a struct be recursed into.
             #[doc(hidden)]
             #[allow(unused_variables)]
             #vis fn __bstack_clone_into<__A: ::bstack_raii::BStackOwnedSliceAllocator>(
@@ -2684,10 +2838,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                 allocator: &__A,
                 __plan: &mut ::bstack_raii::ClonePlan,
             ) -> ::std::io::Result<::bstack_raii::BStackRange> {
-                ::std::result::Result::Err(::std::io::Error::new(
-                    ::std::io::ErrorKind::Unsupported,
-                    "TryCloneIn: cloning an enum block is not yet implemented",
-                ))
+                #clone_into_body
             }
         }
 
@@ -2797,6 +2948,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
             }
         }
 
+        #enum_clone_trait
         #overlong_warning
     })
 }

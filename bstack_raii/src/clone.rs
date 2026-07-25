@@ -118,6 +118,14 @@ impl ClonePlan {
         self.writes.push((offset, bytes));
     }
 
+    /// Register an already-allocated range for rollback — for allocations made
+    /// outside [`alloc_raw`](Self::alloc_raw) (e.g. a vector data block built and
+    /// written eagerly by the vector runtime, whose bytes are committed on
+    /// creation rather than staged in [`write`](Self::write)).
+    pub fn track_alloc(&mut self, range: BStackRange) {
+        self.allocated.push(range);
+    }
+
     /// Record that the strong count of a shared child at `data` must be bumped by
     /// one — the strong reference this clone's `#[bstack_strong]` field acquires.
     pub fn bump_strong<T: BStackShared, A: BStackOwnedSliceAllocator>(
