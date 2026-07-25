@@ -96,12 +96,10 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
     }
 
     let mut drop_stmts = Vec::new();
-    // `TryCloneIn` deep-clone statements for scalar fields, mirroring `drop_stmts`
-    // in reverse. If a field kind whose clone is not yet supported (vec / embed)
-    // is present, `clone_block_reason` is set and the whole clone short-circuits
-    // to a runtime error instead (so the block still compiles).
+    // `TryCloneIn` deep-clone statements for user fields, mirroring `drop_stmts`
+    // in reverse (owned → recurse, strong/weak → refcount bump, embed → fold
+    // inline, vec → per-element; POD / ref are byte-copied so emit nothing).
     let mut clone_stmts = Vec::new();
-    let mut clone_block_reason: Option<&'static str> = None;
     let mut pod_types: Vec<&Type> = Vec::new();
     let mut accessors = Vec::new();
     let mut setters = Vec::new();
@@ -381,7 +379,21 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                     }
                 }
             });
-            clone_block_reason = Some("`#[embed]`");
+            // Clone: fold the embedded child's clone inline — deep-clone its own
+            // children into the plan and store the fixed-up child OnDisk in place
+            // (no separate child allocation, mirroring the in-place teardown).
+            clone_stmts.push(quote! {
+                {
+                    let __child = <#child as ::bstack_raii::BStackBlock>::from_range(
+                        ::bstack_raii::BStackRange::new(
+                            __src.start() + ::core::mem::offset_of!(#on_disk, #fname) as u64,
+                            ::core::mem::size_of::<#child_od>() as u64,
+                        ),
+                    );
+                    __od.#fname =
+                        __child.__bstack_clone_children_inplace(allocator, __plan)?;
+                }
+            });
             continue;
         }
 
@@ -623,48 +635,70 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         }
     };
 
-    // Deep clone. `__bstack_clone_into` is generated for every block (so an
-    // owned child of any kind can be recursed into); it does the real work for a
-    // plain block whose fields are all clone-supported, and returns a runtime
-    // error otherwise. The public `TryCloneIn` entry point is generated for plain
-    // blocks only — a shared (`rc` / `rc, weak`) block is cloned by duplicating
-    // its handle (a refcount bump) via `BStackRc::try_clone`, never deep-copied to
-    // an owned block, so it never implements `TryCloneIn`.
-    let clone_into_body = if mode != Mode::Plain {
-        // Reachable only by `#[bstack_owned]`-owning a shared block (a misuse:
-        // shared blocks are referenced, not owned) and deep-cloning the owner.
-        quote! {
+    // Deep clone. `__bstack_clone_children_inplace` reads this block's OnDisk and
+    // returns a fixed-up copy — owned children deep-cloned into `__plan`, shared
+    // children's refcounts bumped, embedded children cloned in place — without
+    // allocating a block for `self` (so an `#[embed]` parent can fold it inline).
+    // `__bstack_clone_into` layers on the destination allocation + staged write.
+    // Both are generated for every block (so an owned/embedded child of any kind
+    // can be recursed into) but do real work only for a plain block; a shared
+    // (`rc` / `rc, weak`) block returns an error — its clone is a handle
+    // duplication via `BStackRc::try_clone`, never a deep copy. The public
+    // `TryCloneIn` entry point is generated for plain blocks only.
+    let (clone_children_body, clone_into_body) = if mode != Mode::Plain {
+        // Reachable only by owning / embedding a shared block (a misuse: shared
+        // blocks are referenced, not owned) and deep-cloning the owner.
+        let err = quote! {
             ::std::result::Result::Err(::std::io::Error::new(
                 ::std::io::ErrorKind::Unsupported,
                 "TryCloneIn: a reference-counted (`rc` / `rc, weak`) block is shared, \
                  not deep-cloned — duplicate its handle with `BStackRc::try_clone` \
                  (see the `TryClone` trait)",
             ))
-        }
-    } else if let Some(what) = clone_block_reason {
-        clone_unsupported_body(what)
+        };
+        (err.clone(), err)
     } else {
-        quote! {
+        let children = quote! {
             let __stack = allocator.stack();
             let __src = ::bstack_raii::BStackBlock::range(self);
             let mut __buf = [0u8; ::core::mem::size_of::<#on_disk>()];
             let __r = unsafe { ::bstack_raii::BStackRef::<Self>::from_range(__src) };
             #[allow(unused_mut)]
             let mut __od: #on_disk = *__r.read_on_disk(__stack, &mut __buf)?;
+            #(#clone_stmts)*
+            ::std::result::Result::Ok(__od)
+        };
+        let into = quote! {
+            let __od = self.__bstack_clone_children_inplace(allocator, __plan)?;
             let __dst = __plan.alloc_raw(
                 allocator,
                 ::core::mem::size_of::<#on_disk>() as u64,
             )?;
-            #(#clone_stmts)*
             __plan.write(
                 __dst.start(),
                 ::bstack_raii::bytemuck::bytes_of(&__od).to_vec(),
             );
             ::std::result::Result::Ok(__dst)
-        }
+        };
+        (children, into)
     };
     let clone_into_method = quote! {
         impl #name {
+            /// Read this block's OnDisk and return a deep-cloned copy: owned
+            /// children cloned into `__plan`, shared children's refcounts bumped,
+            /// embedded children folded in place. Does **not** allocate a block for
+            /// `self` — used to fold an `#[embed]`ded child inline into its parent's
+            /// clone, and by `__bstack_clone_into` before the self-allocation.
+            #[doc(hidden)]
+            #[allow(unused_variables)]
+            #vis fn __bstack_clone_children_inplace<__A: ::bstack_raii::BStackOwnedSliceAllocator>(
+                &self,
+                allocator: &__A,
+                __plan: &mut ::bstack_raii::ClonePlan,
+            ) -> ::std::io::Result<#on_disk> {
+                #clone_children_body
+            }
+
             /// Deep-clone this block's subtree into `__plan`: allocate a fresh
             /// destination block, recurse into owned children (bumping shared
             /// children's refcounts), and stage the destination payload —
@@ -1588,19 +1622,8 @@ fn clone_field_stmt(fname: &Ident, inner_ty: &Type, kind: Kind) -> Option<TokenS
                 }
             }
         }),
+        // `#[embed]` is folded in its own branch (it `continue`s before this).
         Kind::Ref | Kind::Pod | Kind::Embed => None,
-    }
-}
-
-/// The body of a not-yet-supported deep clone: a runtime error naming what makes
-/// the block unclonable. The block still compiles; only `try_clone_in` fails.
-fn clone_unsupported_body(what: &str) -> TokenStream {
-    let msg = format!("TryCloneIn: cloning a block with {what} is not yet implemented");
-    quote! {
-        ::std::result::Result::Err(::std::io::Error::new(
-            ::std::io::ErrorKind::Unsupported,
-            #msg,
-        ))
     }
 }
 
@@ -2352,10 +2375,18 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                         });
                         clone_arms.push(quote! {
                             #disc => {
-                                return ::std::result::Result::Err(::std::io::Error::new(
-                                    ::std::io::ErrorKind::Unsupported,
-                                    "TryCloneIn: cloning an #[embed] enum variant is not yet implemented",
-                                ));
+                                let __child = <#ty as ::bstack_raii::BStackBlock>::from_range(
+                                    ::bstack_raii::BStackRange::new(
+                                        self.0.start()
+                                            + ::core::mem::offset_of!(#on_disk, __bstack_payload)
+                                                as u64,
+                                        ::core::mem::size_of::<#co>() as u64,
+                                    ),
+                                );
+                                let __fixed =
+                                    __child.__bstack_clone_children_inplace(allocator, __plan)?;
+                                __pl[..::core::mem::size_of::<#co>()]
+                                    .copy_from_slice(::bstack_raii::bytemuck::bytes_of(&__fixed));
                             }
                         });
                     }
@@ -2651,15 +2682,16 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
     // need re-initialization). The whole OnDisk is byte-copied; the active
     // variant's payload is then fixed up (owned → deep clone + repoint, strong /
     // weak → refcount bump, ref → alias, embed → not yet supported).
-    let clone_into_body = if mode != Mode::Plain {
-        quote! {
+    let (clone_children_body, clone_into_body) = if mode != Mode::Plain {
+        let err = quote! {
             ::std::result::Result::Err(::std::io::Error::new(
                 ::std::io::ErrorKind::Unsupported,
                 "TryCloneIn: a reference-counted (`rc` / `rc, weak`) enum block is shared, \
                  not deep-cloned — duplicate its handle with `BStackRc::try_clone` \
                  (see the `TryClone` trait)",
             ))
-        }
+        };
+        (err.clone(), err)
     } else {
         let dispatch = if clone_arms.is_empty() {
             quote!()
@@ -2674,18 +2706,23 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                 __od.__bstack_payload = __pl;
             }
         };
-        quote! {
+        let children = quote! {
             let __stack = allocator.stack();
             let __src = self.0;
             let mut __buf = [0u8; ::core::mem::size_of::<#on_disk>()];
             let __r = unsafe { ::bstack_raii::BStackRef::<Self>::from_range(__src) };
             #[allow(unused_mut)]
             let mut __od: #on_disk = *__r.read_on_disk(__stack, &mut __buf)?;
-            let __dst = __plan.alloc_raw(allocator, ::core::mem::size_of::<#on_disk>() as u64)?;
             #dispatch
+            ::std::result::Result::Ok(__od)
+        };
+        let into = quote! {
+            let __od = self.__bstack_clone_children_inplace(allocator, __plan)?;
+            let __dst = __plan.alloc_raw(allocator, ::core::mem::size_of::<#on_disk>() as u64)?;
             __plan.write(__dst.start(), ::bstack_raii::bytemuck::bytes_of(&__od).to_vec());
             ::std::result::Result::Ok(__dst)
-        }
+        };
+        (children, into)
     };
     // The public `TryCloneIn` entry point, for plain enums only.
     let enum_clone_trait = if mode == Mode::Plain {
@@ -2837,10 +2874,24 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                 ::std::result::Result::Ok(())
             }
 
-            /// Deep-clone this enum into a `ClonePlan`: byte-copy the OnDisk, then
-            /// fix up the active variant's payload (deep-clone an owned child,
-            /// bump a strong/weak reference, alias a ref). Returns the new block's
-            /// range. Also lets an owned enum child of a struct be recursed into.
+            /// Read this enum's OnDisk and return a deep-cloned copy: the active
+            /// variant's payload fixed up (owned child cloned into `__plan`,
+            /// strong/weak bumped, ref aliased, embedded child folded in place),
+            /// without allocating a block for `self`. Used to fold an
+            /// `#[embed]`ded enum inline, and by `__bstack_clone_into`.
+            #[doc(hidden)]
+            #[allow(unused_variables)]
+            #vis fn __bstack_clone_children_inplace<__A: ::bstack_raii::BStackOwnedSliceAllocator>(
+                &self,
+                allocator: &__A,
+                __plan: &mut ::bstack_raii::ClonePlan,
+            ) -> ::std::io::Result<#on_disk> {
+                #clone_children_body
+            }
+
+            /// Deep-clone this enum into a `ClonePlan`: allocate a fresh block and
+            /// stage its fixed-up payload. Returns the new block's range. Also lets
+            /// an owned enum child of a struct be recursed into.
             #[doc(hidden)]
             #[allow(unused_variables)]
             #vis fn __bstack_clone_into<__A: ::bstack_raii::BStackOwnedSliceAllocator>(

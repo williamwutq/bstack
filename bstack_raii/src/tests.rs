@@ -2319,3 +2319,59 @@ fn macro_embed_struct_and_enum() {
     assert_eq!(moved.handle().n(stack).unwrap(), 9);
     moved.bstack_drop(&alloc).unwrap();
 }
+
+#[test]
+fn macro_clone_embed() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    // Struct embed: holder -> inline child -> the child's own owned leaf.
+    let leaf = MacroLeaf::new(&alloc, 42).unwrap();
+    let child = EmbChild::new(&alloc, leaf, 7).unwrap();
+    let holder = EmbHolder::new(&alloc, child, 99).unwrap();
+    let orig_leaf_off = holder.handle().child().leaf(stack).unwrap().range().start();
+
+    let clone = holder.try_clone_in(&alloc).unwrap();
+    assert_eq!(clone.handle().tag(stack).unwrap(), 99);
+    let cc = clone.handle().child();
+    assert_eq!(cc.n(stack).unwrap(), 7);
+    assert_eq!(cc.leaf(stack).unwrap().val(stack).unwrap(), 42);
+
+    // The embedded child's OWN owned leaf was deep-cloned into a fresh block
+    // (the inline region was folded, not just byte-copied with an aliased offset).
+    let clone_leaf_off = cc.leaf(stack).unwrap().range().start();
+    assert_ne!(clone_leaf_off, orig_leaf_off);
+
+    // Freeing the clone frees only the clone's leaf; the original stays intact.
+    clone.bstack_drop(&alloc).unwrap();
+    assert_eq!(
+        holder.handle().child().leaf(stack).unwrap().val(stack).unwrap(),
+        42
+    );
+    holder.bstack_drop(&alloc).unwrap();
+
+    // Enum embed variant: same in-place fold through the payload.
+    let leaf = MacroLeaf::new(&alloc, 3).unwrap();
+    let child = EmbChild::new(&alloc, leaf, 9).unwrap();
+    let e = EmbEnum::new(&alloc, EmbEnumData::Wrap(child)).unwrap();
+    let orig_off = match e.handle().read(&alloc).unwrap() {
+        EmbEnumView::Wrap(c) => c.leaf(stack).unwrap().range().start(),
+        _ => panic!("expected Wrap"),
+    };
+    let ce = e.try_clone_in(&alloc).unwrap();
+    let clone_off = match ce.handle().read(&alloc).unwrap() {
+        EmbEnumView::Wrap(c) => {
+            assert_eq!(c.leaf(stack).unwrap().val(stack).unwrap(), 3);
+            c.leaf(stack).unwrap().range().start()
+        }
+        _ => panic!("expected Wrap"),
+    };
+    assert_ne!(clone_off, orig_off); // deep-cloned, not aliased
+    ce.bstack_drop(&alloc).unwrap();
+    match e.handle().read(&alloc).unwrap() {
+        EmbEnumView::Wrap(c) => assert_eq!(c.leaf(stack).unwrap().val(stack).unwrap(), 3),
+        _ => panic!("expected Wrap"),
+    }
+    e.bstack_drop(&alloc).unwrap();
+}
