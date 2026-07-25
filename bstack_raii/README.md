@@ -36,6 +36,7 @@ object model on top.
   - [Enums: `#[bstack_enum]`](#enums-bstack_enum)
   - [Field types](#field-types)
 - [Moving out: `bstack_move!`](#moving-out-bstack_move)
+- [Cloning: `TryCloneIn` / `TryClone`](#cloning-tryclonein--tryclone)
 - [Casting: `bstack_cast!`](#casting-bstack_cast)
 - [Type tags (`EightCC`)](#type-tags-eightcc)
 - [Limitations](#limitations)
@@ -533,6 +534,64 @@ a tuple.
 > disk, but it is reachable *only* through your in-memory handle: drop it without
 > re-attaching it (into another block's field) or freeing it and it becomes
 > unreachable garbage. Persistence comes from being reachable through a struct.
+
+## Cloning: `TryCloneIn` / `TryClone`
+
+Duplicating a handle means one of two things, depending on whether the block is
+uniquely owned or shared.
+
+### Deep-clone an owned block: `TryCloneIn`
+
+A plain `#[bstack_block]` / `#[bstack_enum]` implements `TryCloneIn`, a **deep**,
+fallible clone into a fresh, independent `BStackOwned<Self>`:
+
+```rust
+use bstack_raii::TryCloneIn;
+
+let copy: BStackOwned<Node> = node.try_clone_in(&alloc)?;
+```
+
+Each field is duplicated according to its ownership — the mirror of teardown:
+
+| Field                 | On clone                                                          |
+|-----------------------|-------------------------------------------------------------------|
+| POD / `#[bstack_ref]` | byte-copied (a ref clone **aliases** the same target)             |
+| `#[bstack_owned]`     | the child is recursively deep-cloned into a fresh block           |
+| `#[embed]`            | the inline child is folded — its own children deep-cloned in place |
+| `#[bstack_strong]`    | the shared child stays shared; its strong count is bumped         |
+| `#[bstack_weak]`      | stays weak to the same target; its weak count is bumped           |
+| `Vec<Thing>`          | per element, by the vector's annotation (POD data copied; owned elements deep-cloned; strong/weak bumped; ref aliased) |
+
+So an owned subtree is copied into independent storage while shared children are
+*re-referenced* rather than duplicated: freeing the clone never disturbs the
+original's owned data, and a shared target stays live as long as either handle
+holds it.
+
+> **Atomicity.** A clone allocates the whole new subtree up front, then commits
+> every payload write as one crash-atomic batch (`BStack::set_batched`): a
+> mid-clone allocation failure rolls back with nothing written, and a crash can
+> leak the fresh allocations but never leaves a torn copy.
+
+### Duplicate a shared handle: `TryClone`
+
+A shared block is **not** deep-cloned. `BStackRc` / `BStackWeak` implement
+`TryClone`, whose `try_clone` bumps the on-disk refcount and hands back another
+handle to the *same* block — exactly like `Rc::clone` / `shared_ptr`:
+
+```rust
+use bstack_raii::TryClone;
+
+let rc2 = rc.try_clone()?;      // another strong owner of the same block
+let weak2 = weak.try_clone()?;  // another weak observer of the same block
+```
+
+An `(rc)` / `(rc, weak)` block therefore has no `try_clone_in` — calling it is a
+compile error. This is deliberate: sharing, not copying, is what a reference
+count *means*. It is clearest for a **weak** reference, which has no coherent deep
+copy at all: a weak reference observes a live object's control block, and a "copy"
+would either point at the same object (just another weak handle — a count bump) or
+at some other object (observing nothing the original did — not a copy). So a weak
+clone can only ever be another weak reference to the same target.
 
 ## Casting: `bstack_cast!`
 
