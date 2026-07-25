@@ -1958,3 +1958,78 @@ fn macro_unit_and_tuple_structs() {
     let (r, g, b) = bstack_move!(c, &alloc).unwrap();
     assert_eq!((r, g, b), (10, 20, 30));
 }
+
+// --------------------------------------------------------------------------
+// #[embed] — a child block stored inline (its whole on-disk form), in a struct
+// and an enum variant. The embedded child keeps its OWN owned children.
+// --------------------------------------------------------------------------
+
+#[bstack_block]
+struct EmbChild {
+    #[bstack_owned]
+    leaf: MacroLeaf,
+    n: u32,
+}
+
+#[bstack_block]
+struct EmbHolder {
+    #[embed]
+    child: EmbChild,
+    tag: u32,
+}
+
+#[bstack_enum]
+enum EmbEnum {
+    Empty,
+    #[embed]
+    Wrap(EmbChild),
+}
+
+#[test]
+fn macro_embed_struct_and_enum() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+    let leaf_size = size_of::<<MacroLeaf as BStackBlock>::OnDisk>() as u64;
+
+    // Struct embed: parent -> embedded child -> the child's own owned leaf.
+    let leaf = MacroLeaf::new(&alloc, 42).unwrap();
+    let leaf_off = leaf.handle().range().start();
+    let child = EmbChild::new(&alloc, leaf, 7).unwrap();
+    let holder = EmbHolder::new(&alloc, child, 99).unwrap();
+    assert_eq!(holder.handle().tag(stack).unwrap(), 99);
+    let c = holder.handle().child(); // a handle into the inline region (no I/O)
+    assert_eq!(c.n(stack).unwrap(), 7);
+    assert_eq!(c.leaf(stack).unwrap().val(stack).unwrap(), 42);
+
+    // Teardown frees the embedded child's owned leaf *in place*, then the holder;
+    // the leaf's slot (lowest) is reclaimed — proof the embed recursed.
+    holder.bstack_drop(&alloc).unwrap();
+    let reused = alloc_block(&alloc, MacroLeaf::eightcc(), leaf_size).unwrap();
+    assert_eq!(reused.start(), leaf_off);
+    unsafe { dealloc_range(&alloc, reused).unwrap() };
+
+    // bstack_move! re-homes the embedded child to a fresh standalone allocation.
+    let leaf = MacroLeaf::new(&alloc, 5).unwrap();
+    let child = EmbChild::new(&alloc, leaf, 8).unwrap();
+    let holder = EmbHolder::new(&alloc, child, 1).unwrap();
+    let (moved, tag) = bstack_move!(holder, &alloc).unwrap();
+    assert_eq!(tag, 1);
+    assert_eq!(moved.handle().leaf(stack).unwrap().val(stack).unwrap(), 5);
+    moved.bstack_drop(&alloc).unwrap();
+
+    // Enum embed: construct, read (a borrowed child handle), move out.
+    let leaf = MacroLeaf::new(&alloc, 3).unwrap();
+    let child = EmbChild::new(&alloc, leaf, 9).unwrap();
+    let e = EmbEnum::new(&alloc, EmbEnumData::Wrap(child)).unwrap();
+    match e.handle().read(&alloc).unwrap() {
+        EmbEnumView::Wrap(c) => assert_eq!(c.leaf(stack).unwrap().val(stack).unwrap(), 3),
+        _ => panic!("expected Wrap"),
+    }
+    let moved = match bstack_move!(e, &alloc).unwrap() {
+        EmbEnumData::Wrap(c) => c,
+        _ => panic!("expected Wrap"),
+    };
+    assert_eq!(moved.handle().n(stack).unwrap(), 9);
+    moved.bstack_drop(&alloc).unwrap();
+}

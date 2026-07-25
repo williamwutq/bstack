@@ -256,6 +256,42 @@ pub use bstack_raii_derive::{bstack_block, bstack_cast, bstack_enum, bstack_move
 /// # fn main() {}
 /// ```
 ///
+/// ---
+///
+/// Misuse of `#[embed]` (which inlines a whole child *block*).
+///
+/// `#[embed]` on a **non-block** type:
+/// ```compile_fail
+/// use bstack_raii::bstack_block;
+/// #[bstack_block]
+/// struct X { #[embed] f: u32 }
+/// # fn main() {}
+/// ```
+///
+/// `#[embed]` on a **tuple**:
+/// ```compile_fail
+/// use bstack_raii::bstack_block;
+/// #[bstack_block]
+/// struct X { #[embed] f: (u8, u8) }
+/// # fn main() {}
+/// ```
+///
+/// `#[embed]` wrapped in `Option`:
+/// ```compile_fail
+/// use bstack_raii::bstack_block;
+/// #[bstack_block]
+/// struct X { #[embed] f: Option<u32> }
+/// # fn main() {}
+/// ```
+///
+/// `#[embed]` combined with another ownership annotation:
+/// ```compile_fail
+/// use bstack_raii::bstack_block;
+/// #[bstack_block]
+/// struct X { #[embed] #[bstack_owned] f: u32 }
+/// # fn main() {}
+/// ```
+///
 /// (Tuple structs of POD fields and unit structs are **valid**, not errors — see
 /// the tests.)
 #[doc(hidden)]

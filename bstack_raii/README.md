@@ -216,6 +216,7 @@ and what [`bstack_move!`](#moving-out-bstack_move) yields:
 | Annotation         | Child kind required    | On teardown                        | `bstack_move!` yields   |
 |--------------------|------------------------|------------------------------------|-------------------------|
 | `#[bstack_owned]`  | any block              | recursively frees the child        | `BStackOwned<T>`        |
+| `#[embed]`         | any block              | frees the child's children in place | `BStackOwned<T>` (re-homed) |
 | `#[bstack_strong]` | `(rc)` or `(rc, weak)` | decrements refcount; frees at zero | `BStackRc<T>`           |
 | `#[bstack_weak]`   | `(rc, weak)`           | decrements weak count only         | `Option<BStackWeak<T>>` |
 | `#[bstack_ref]`    | any block              | nothing                            | `BStackRef<T>`          |
@@ -223,6 +224,39 @@ and what [`bstack_move!`](#moving-out-bstack_move) yields:
 
 Rules are enforced at compile time: a `#[bstack_weak]` field whose target isn't
 `(rc, weak)`, or a non-`Pod` field with no annotation, is a compile error.
+
+#### `#[embed]` — inline a child block
+
+`#[bstack_owned]` stores a `u64` **offset** to a separately-allocated child.
+`#[embed]` instead stores the child's *whole on-disk form* — its header and all —
+**inline** in the parent, so the parent block is one contiguous region and the
+child needs no separate allocation:
+
+```text
+#[bstack_owned]:  [ parent header ][ .. u64 offset .. ] ─▶ [ child header ][ child fields ]
+#[embed]:         [ parent header ][ child header ][ child fields ][ .. ]
+```
+
+```rust
+#[bstack_block]
+struct Holder {
+    #[embed] child: Child,   // Child's OnDisk lives here, inline
+    tag: u32,
+}
+enum Wrapper {
+    #[embed] One(Child),     // also works as an enum variant
+    None,
+}
+```
+
+It's still **exclusive ownership** (like `#[bstack_owned]`): `new` takes a
+`BStackOwned<Child>` — you build the child normally, and the parent folds its
+bytes in and frees the child's now-redundant shell (the child's *own* children
+stay live). The accessor (`holder.handle().child()`) hands back a borrowed
+`Child` handle into the inline region; teardown frees the embedded child's
+children in place; and `bstack_move!` re-homes the child to a fresh standalone
+`BStackOwned<Child>`. You can embed any block (`#[bstack_block]` /
+`#[bstack_enum]`), but not a tuple, a `Vec`, or an `Option`.
 
 ### Structs
 

@@ -37,6 +37,9 @@ enum Kind {
     Strong,
     Weak,
     Ref,
+    /// `#[embed]`: an exclusively-owned child block stored **inline** (its whole
+    /// on-disk form, header and all), not as a `u64` offset.
+    Embed,
     /// POD field stored inline.
     Pod,
 }
@@ -159,6 +162,12 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
             // + array is always owned by this struct regardless). No annotation =>
             // POD elements (byte storage, requiring `T: Pod`).
             let (drop_s, acc, ctor, mv) = match kind {
+                Kind::Embed => {
+                    return Err(Error::new_spanned(
+                        &field.ty,
+                        "cannot #[embed] a `Vec` / `String`; embed a `#[bstack_block]` type",
+                    ));
+                }
                 Kind::Pod => (
                     vec_drop_stmt(fname, elem, nullable),
                     vec_accessor(vis, fname, elem, &on_disk, nullable),
@@ -282,6 +291,92 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
             continue;
         }
 
+        // `#[embed] child: Block`: store the child's whole on-disk form INLINE
+        // (`<Child as BStackBlock>::OnDisk`, header and all) instead of a `u64`
+        // offset — an exclusively-owned inline block.
+        if kind == Kind::Embed {
+            if let Type::Tuple(_) = inner_ty {
+                return Err(Error::new_spanned(
+                    &field.ty,
+                    "cannot #[embed] a tuple — embed a `#[bstack_block]` / `#[bstack_enum]` type",
+                ));
+            }
+            if nullable {
+                return Err(Error::new_spanned(
+                    &field.ty,
+                    "#[embed] does not support `Option`",
+                ));
+            }
+            let child = inner_ty;
+            let child_od = quote!(<#child as ::bstack_raii::BStackBlock>::OnDisk);
+            on_disk_fields.push(quote!(#fname: #child_od,));
+
+            // Teardown: free the embedded child's own children *in place* (its
+            // storage is part of this block, so no separate dealloc). `__range` is
+            // this block's range, bound by `__bstack_drop_children`.
+            drop_stmts.push(quote! {
+                {
+                    let __embed = ::bstack_raii::BStackRange::new(
+                        __range.start() + ::core::mem::offset_of!(#on_disk, #fname) as u64,
+                        ::core::mem::size_of::<#child_od>() as u64,
+                    );
+                    <#child>::__bstack_drop_children(__embed, allocator)?;
+                }
+            });
+
+            // Accessor: a child handle at the embedded offset (pure offset math).
+            accessors.push(quote! {
+                #vis fn #fname(&self) -> #child {
+                    <#child as ::bstack_raii::BStackBlock>::from_range(
+                        ::bstack_raii::BStackRange::new(
+                            self.0.start() + ::core::mem::offset_of!(#on_disk, #fname) as u64,
+                            ::core::mem::size_of::<#child_od>() as u64,
+                        ),
+                    )
+                }
+            });
+
+            // Constructor: fold a `BStackOwned<Child>` in — read its OnDisk, free
+            // its shell (its own children stay live, now owned by the embed).
+            ctor_params.push(quote!(#fname: ::bstack_raii::BStackOwned<#child>,));
+            ctor_preps.push(quote! {
+                let #fname: #child_od = {
+                    let __h = #fname.into_inner();
+                    let __cr = ::bstack_raii::BStackBlock::range(&__h);
+                    let mut __b = [0u8; ::core::mem::size_of::<#child_od>()];
+                    let __od = *unsafe { ::bstack_raii::BStackRef::<#child>::from_range(__cr) }
+                        .read_on_disk(allocator.stack(), &mut __b)?;
+                    unsafe { ::bstack_raii::dealloc_range(allocator, __cr)?; }
+                    __od
+                };
+            });
+            ctor_inits.push(quote!(#fname: #fname,));
+
+            // Move: re-home the embedded child to a fresh standalone allocation.
+            let cap = format_ident!("__cap_{}", fname);
+            mv_caps.push(quote!(let #cap = __od.#fname;));
+            mv_types.push(quote!(::bstack_raii::BStackOwned<#child>));
+            mv_recon.push(quote! {
+                {
+                    let mut __slice =
+                        __alloc.alloc(::core::mem::size_of::<#child_od>() as u64)?;
+                    let __r = __slice.as_range();
+                    if let ::std::result::Result::Err(__e) =
+                        __slice.write_range(0, ::bstack_raii::bytemuck::bytes_of(&#cap))
+                    {
+                        let _ = __alloc.dealloc(__slice);
+                        return ::std::result::Result::Err(__e);
+                    }
+                    unsafe {
+                        ::bstack_raii::BStackOwned::from_raw(
+                            <#child as ::bstack_raii::BStackBlock>::from_range(__r),
+                        )
+                    }
+                }
+            });
+            continue;
+        }
+
         // On-disk lowering.
         match kind {
             Kind::Pod => {
@@ -306,7 +401,8 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                 quote!(<#inner_ty as ::bstack_raii::BStackShared>::drop_strong_ref(__child, allocator)?;),
             )),
             Kind::Weak => drop_stmts.push(weak_drop_stmt(fname, inner_ty)),
-            Kind::Ref | Kind::Pod => {}
+            // `#[embed]` is fully handled above (it `continue`s).
+            Kind::Ref | Kind::Pod | Kind::Embed => {}
         }
 
         // Accessor.
@@ -555,17 +651,32 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
             }
         }
 
-        impl ::bstack_raii::BStackDrop for #name {
-            fn bstack_drop<__A: ::bstack_raii::BStackOwnedSliceAllocator>(
-                self,
+        impl #name {
+            /// Free this block's owned children (recursively) given its range,
+            /// **without** freeing the block itself — used when the block is
+            /// `#[embed]`ded (its storage is part of its parent), and by
+            /// `bstack_drop` before the self-dealloc.
+            #[doc(hidden)]
+            #vis fn __bstack_drop_children<__A: ::bstack_raii::BStackOwnedSliceAllocator>(
+                __range: ::bstack_raii::BStackRange,
                 allocator: &__A,
             ) -> ::std::io::Result<()> {
                 use ::bstack_raii::BStackDrop as _;
                 let __stack = allocator.stack();
                 let mut __buf = [0u8; ::core::mem::size_of::<#on_disk>()];
-                let __r = unsafe { ::bstack_raii::BStackRef::<Self>::from_range(self.0) };
+                let __r = unsafe { ::bstack_raii::BStackRef::<Self>::from_range(__range) };
                 let __on_disk: #on_disk = *__r.read_on_disk(__stack, &mut __buf)?;
                 #(#drop_stmts)*
+                ::std::result::Result::Ok(())
+            }
+        }
+
+        impl ::bstack_raii::BStackDrop for #name {
+            fn bstack_drop<__A: ::bstack_raii::BStackOwnedSliceAllocator>(
+                self,
+                allocator: &__A,
+            ) -> ::std::io::Result<()> {
+                Self::__bstack_drop_children(self.0, allocator)?;
                 unsafe { ::bstack_raii::dealloc_range(allocator, self.0) }
             }
         }
@@ -994,6 +1105,7 @@ fn ctor_field(
             quote!(__handle.into_range().start()),
         ),
         Kind::Weak => unreachable!("weak fields are wired via set_<field>, not the constructor"),
+        Kind::Embed => unreachable!("#[embed] fields are handled before ctor_field"),
     };
     if nullable {
         (
@@ -1027,6 +1139,7 @@ fn move_field(
         quote!(::core::mem::size_of::<<#inner_ty as ::bstack_raii::BStackBlock>::OnDisk>() as u64);
     match kind {
         Kind::Pod => (quote!(#inner_ty), quote!(#cap)),
+        Kind::Embed => unreachable!("#[embed] fields are handled before move_field"),
         // Weak is inherently nullable and stores the control offset.
         Kind::Weak => {
             let ty = quote! {
@@ -1553,6 +1666,7 @@ fn classify_attrs(attrs: &[syn::Attribute]) -> syn::Result<Kind> {
             "bstack_strong" => Kind::Strong,
             "bstack_weak" => Kind::Weak,
             "bstack_ref" => Kind::Ref,
+            "embed" => Kind::Embed,
             _ => continue,
         };
         if found.is_some() {
@@ -1919,6 +2033,75 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                             }
                         });
                     }
+                    // `#[embed] V(Child)`: the child's whole on-disk form is stored
+                    // INLINE in the payload (header and all).
+                    Kind::Embed => {
+                        let co = quote!(<#ty as ::bstack_raii::BStackBlock>::OnDisk);
+                        payload_sizes.push(quote!(::core::mem::size_of::<#co>()));
+                        data_variants.push(quote!(#vname(::bstack_raii::BStackOwned<#ty>),));
+                        view_variants.push(quote!(#vname(#ty),));
+                        // new: fold a `BStackOwned<Child>` in (read OnDisk, free its
+                        // shell), copying its bytes into the payload.
+                        new_arms.push(quote! {
+                            #data::#vname(__v) => {
+                                let __h = __v.into_inner();
+                                let __cr = ::bstack_raii::BStackBlock::range(&__h);
+                                let mut __b = [0u8; ::core::mem::size_of::<#co>()];
+                                let __cod = *unsafe {
+                                    ::bstack_raii::BStackRef::<#ty>::from_range(__cr)
+                                }
+                                .read_on_disk(allocator.stack(), &mut __b)?;
+                                unsafe { ::bstack_raii::dealloc_range(allocator, __cr)?; }
+                                let mut __pl = [0u8; Self::__PAYLOAD];
+                                __pl[..::core::mem::size_of::<#co>()]
+                                    .copy_from_slice(::bstack_raii::bytemuck::bytes_of(&__cod));
+                                (#disc, __pl)
+                            }
+                        });
+                        // read (view): a child handle at the embedded payload offset.
+                        read_arms.push(quote! {
+                            #disc => #view::#vname(
+                                <#ty as ::bstack_raii::BStackBlock>::from_range(
+                                    ::bstack_raii::BStackRange::new(
+                                        self.0.start()
+                                            + ::core::mem::offset_of!(#on_disk, __bstack_payload)
+                                                as u64,
+                                        ::core::mem::size_of::<#co>() as u64,
+                                    ),
+                                )
+                            ),
+                        });
+                        // move: re-home the embedded child to a fresh allocation.
+                        move_arms.push(quote! {
+                            #disc => {
+                                let mut __slice =
+                                    __alloc.alloc(::core::mem::size_of::<#co>() as u64)?;
+                                let __r = __slice.as_range();
+                                if let ::std::result::Result::Err(__e) = __slice
+                                    .write_range(0, &__pl[..::core::mem::size_of::<#co>()])
+                                {
+                                    let _ = __alloc.dealloc(__slice);
+                                    return ::std::result::Result::Err(__e);
+                                }
+                                #data::#vname(unsafe {
+                                    ::bstack_raii::BStackOwned::from_raw(
+                                        <#ty as ::bstack_raii::BStackBlock>::from_range(__r),
+                                    )
+                                })
+                            }
+                        });
+                        // teardown: free the embedded child's children in place.
+                        drop_arms.push(quote! {
+                            #disc => {
+                                let __embed = ::bstack_raii::BStackRange::new(
+                                    __range.start()
+                                        + ::core::mem::offset_of!(#on_disk, __bstack_payload) as u64,
+                                    ::core::mem::size_of::<#co>() as u64,
+                                );
+                                <#ty>::__bstack_drop_children(__embed, allocator)?;
+                            }
+                        });
+                    }
                 }
             }
             // A POD aggregate: unit, an all-POD tuple `V(A, B, ..)`, or an all-POD
@@ -2186,13 +2369,16 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
     } else {
         quote!()
     };
-    let drop_body = if drop_arms.is_empty() {
+    // Body of `__bstack_drop_children(__range, allocator)`: free the active
+    // variant's owned child (if any). `__range` is this block's range (its own,
+    // or — when `#[embed]`ded — its slot in the parent).
+    let drop_children_body = if drop_arms.is_empty() {
         quote!()
     } else {
         quote! {
             let __stack = allocator.stack();
             let mut __buf = [0u8; ::core::mem::size_of::<#on_disk>()];
-            let __r = unsafe { ::bstack_raii::BStackRef::<Self>::from_range(self.0) };
+            let __r = unsafe { ::bstack_raii::BStackRef::<Self>::from_range(__range) };
             let __od: #on_disk = *__r.read_on_disk(__stack, &mut __buf)?;
             let __disc = __od.__bstack_disc;
             let __pl = __od.__bstack_payload;
@@ -2310,13 +2496,27 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
             }
         }
 
+        impl #name {
+            /// Free the active variant's owned child (recursively) given this
+            /// block's range, **without** freeing the block itself — used when the
+            /// enum is `#[embed]`ded, and by `bstack_drop` before the self-dealloc.
+            #[doc(hidden)]
+            #vis fn __bstack_drop_children<__A: ::bstack_raii::BStackOwnedSliceAllocator>(
+                __range: ::bstack_raii::BStackRange,
+                allocator: &__A,
+            ) -> ::std::io::Result<()> {
+                use ::bstack_raii::BStackDrop as _;
+                #drop_children_body
+                ::std::result::Result::Ok(())
+            }
+        }
+
         impl ::bstack_raii::BStackDrop for #name {
             fn bstack_drop<__A: ::bstack_raii::BStackOwnedSliceAllocator>(
                 self,
                 allocator: &__A,
             ) -> ::std::io::Result<()> {
-                use ::bstack_raii::BStackDrop as _;
-                #drop_body
+                Self::__bstack_drop_children(self.0, allocator)?;
                 unsafe { ::bstack_raii::dealloc_range(allocator, self.0) }
             }
         }
