@@ -294,5 +294,20 @@ pub use bstack_raii_derive::{bstack_block, bstack_cast, bstack_enum, bstack_move
 ///
 /// (Tuple structs of POD fields and unit structs are **valid**, not errors — see
 /// the tests.)
+///
+/// ---
+///
+/// A **shared** (`rc` / `rc, weak`) block has no `TryCloneIn`: it is cloned by
+/// duplicating its handle (a refcount bump) via `BStackRc::try_clone`, not
+/// deep-copied to an owned block, so `try_clone_in` on one is a compile error:
+/// ```compile_fail
+/// use bstack_raii::{bstack_block, BStackOwnedSliceAllocator, TryCloneIn};
+/// #[bstack_block(rc)]
+/// struct S { v: u32 }
+/// fn f<A: BStackOwnedSliceAllocator>(s: &S, a: &A) {
+///     let _ = s.try_clone_in(a); // no such method on a shared block
+/// }
+/// # fn main() {}
+/// ```
 #[doc(hidden)]
 pub mod __macro_compile_fail_tests {}

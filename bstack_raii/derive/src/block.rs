@@ -627,16 +627,24 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
     // owned child of any kind can be recursed into); it does the real work for a
     // plain block whose fields are all clone-supported, and returns a runtime
     // error otherwise. The public `TryCloneIn` entry point is generated for plain
-    // blocks only — `rc` / `rc, weak` blocks are shared, not deep-cloned to owned
-    // (re-initializing their injected refcount / control block is a later step).
-    let clone_reason: Option<String> = if mode != Mode::Plain {
-        Some("a reference count (`rc` / `rc, weak`)".to_string())
+    // blocks only — a shared (`rc` / `rc, weak`) block is cloned by duplicating
+    // its handle (a refcount bump) via `BStackRc::try_clone`, never deep-copied to
+    // an owned block, so it never implements `TryCloneIn`.
+    let clone_into_body = if mode != Mode::Plain {
+        // Reachable only by `#[bstack_owned]`-owning a shared block (a misuse:
+        // shared blocks are referenced, not owned) and deep-cloning the owner.
+        quote! {
+            ::std::result::Result::Err(::std::io::Error::new(
+                ::std::io::ErrorKind::Unsupported,
+                "TryCloneIn: a reference-counted (`rc` / `rc, weak`) block is shared, \
+                 not deep-cloned — duplicate its handle with `BStackRc::try_clone` \
+                 (see the `TryClone` trait)",
+            ))
+        }
+    } else if let Some(what) = clone_block_reason {
+        clone_unsupported_body(what)
     } else {
-        clone_block_reason.map(|s| s.to_string())
-    };
-    let clone_into_body = match &clone_reason {
-        Some(what) => clone_unsupported_body(what),
-        None => quote! {
+        quote! {
             let __stack = allocator.stack();
             let __src = ::bstack_raii::BStackBlock::range(self);
             let mut __buf = [0u8; ::core::mem::size_of::<#on_disk>()];
@@ -653,7 +661,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                 ::bstack_raii::bytemuck::bytes_of(&__od).to_vec(),
             );
             ::std::result::Result::Ok(__dst)
-        },
+        }
     };
     let clone_into_method = quote! {
         impl #name {
@@ -2647,7 +2655,9 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
         quote! {
             ::std::result::Result::Err(::std::io::Error::new(
                 ::std::io::ErrorKind::Unsupported,
-                "TryCloneIn: cloning a reference-counted enum block is not yet implemented",
+                "TryCloneIn: a reference-counted (`rc` / `rc, weak`) enum block is shared, \
+                 not deep-cloned — duplicate its handle with `BStackRc::try_clone` \
+                 (see the `TryClone` trait)",
             ))
         }
     } else {

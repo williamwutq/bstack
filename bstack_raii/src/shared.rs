@@ -116,6 +116,10 @@ impl<'a, T: BStackBlock, A: BStackOwnedSliceAllocator> BStackRc<'a, T, A> {
     }
 }
 
+/// Cloning a strong handle bumps the block's strong count and returns another
+/// handle to the **same** block — sharing, not copying (like `Rc::clone`). This
+/// is the clone semantics for a shared block; there is deliberately no
+/// deep-copy-to-owned (`TryCloneIn`) for one.
 impl<'a, T: BStackBlock, A: BStackOwnedSliceAllocator> TryClone for BStackRc<'a, T, A> {
     fn try_clone(&self) -> io::Result<Self> {
         refcount::fetch_add(self.allocator().stack(), self.strong_offset(), 1)?;
@@ -251,6 +255,12 @@ impl<'a, T: BStackWeakable, A: BStackOwnedSliceAllocator> BStackWeak<'a, T, A> {
     }
 }
 
+/// Cloning a weak handle bumps the control block's weak count and returns
+/// another weak handle to the **same** control block. This is the *only* sound
+/// meaning of a weak clone: a weak reference observes a live object's control
+/// block, and a copy that observed anything else would not be observing what the
+/// original does. So a weak clone shares the observation (a count bump) rather
+/// than deep-copying — there is no `TryCloneIn` for a weak reference.
 impl<'a, T: BStackWeakable, A: BStackOwnedSliceAllocator> TryClone for BStackWeak<'a, T, A> {
     fn try_clone(&self) -> io::Result<Self> {
         let weak_off = self.ctrl().into_range().start() + layout::CTRL_WEAK_OFFSET;
