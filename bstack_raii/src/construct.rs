@@ -113,10 +113,21 @@ pub fn set_weak_field<'w, T: BStackWeakable, A: BStackOwnedSliceAllocator>(
 ) -> io::Result<()> {
     let stack = allocator.stack();
 
-    // Release the control reference the field previously held, if any.
+    // Read the old target before overwriting it.
     let mut buf = [0u8; 8];
     stack.get_into(field_off, &mut buf)?;
     let old = u64::from_le_bytes(buf);
+
+    // Commit the new pointer FIRST, as a single atomic write: the live field
+    // transitions directly from the old target to the new one and is never
+    // observed pointing at a released control block. `new_weak` is consumed
+    // without decrementing — its weak count becomes the field's.
+    let ctrl = new_weak.into_raw();
+    stack.set(field_off, ctrl.into_range().start().to_le_bytes())?;
+
+    // Only now release the old target — pure reclamation, since the field no
+    // longer refers to it. A crash before this leaks at most the old control
+    // block (its weak count stays one too high), never a dangling field.
     if old != 0 {
         let old_ctrl = unsafe {
             BStackRef::<T::Control>::from_range(BStackRange::new(
@@ -126,10 +137,7 @@ pub fn set_weak_field<'w, T: BStackWeakable, A: BStackOwnedSliceAllocator>(
         };
         WeakRef::<T>(old_ctrl).bstack_drop(allocator)?;
     }
-
-    // Store the new control offset; the consumed weak's count is now the field's.
-    let ctrl = new_weak.into_raw();
-    stack.set(field_off, ctrl.into_range().start().to_le_bytes())
+    Ok(())
 }
 
 /// Attempt to upgrade a `#[bstack_weak]` field (holding a control-block offset at

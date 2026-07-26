@@ -41,6 +41,12 @@ use crate::reference::BStackRef;
 use crate::shared::{BStackRc, BStackWeak};
 use crate::teardown::{BStackDrop, dealloc_range};
 
+/// The on-disk header length of a `BStackByteVec` block: `len: u64` @ 0,
+/// `cap: u64` @ 8, elements from offset 16. Fixed by bstack's ABI (stable across
+/// `0.4.x`). Used where we build a byte-vec block image by hand to keep a
+/// mutation crash-atomic.
+pub(crate) const BYTEVEC_HEADER: u64 = 16;
+
 /// Build a fresh data block holding `offs` (an offset array), register it in
 /// `plan` for rollback, and return its descriptor. The shared back end of the
 /// block-element vector clones, whose elements are all `u64` offsets.
@@ -49,10 +55,9 @@ fn build_offset_desc<A: BStackOwnedSliceAllocator>(
     offs: &[u64],
     plan: &mut ClonePlan,
 ) -> io::Result<VecDesc> {
-    let v = BStackVec::<u64, A>::from_slice(allocator, offs)?;
-    let desc = v.descriptor();
-    plan.track_alloc(BStackRange::new(desc.data_off, desc.data_size));
-    Ok(desc)
+    // Fold the offset-array block into the plan: allocated through our machinery,
+    // its bytes committed in the plan's single atomic batch.
+    plan.stage_bytevec(allocator, bytemuck::cast_slice(offs))
 }
 
 /// The inline, fixed-size descriptor of a persistent vector: the current offset
@@ -223,15 +228,55 @@ impl<'a, T: Pod, A: BStackOwnedSliceAllocator> BStackVec<'a, T, A> {
             .collect())
     }
 
-    /// Append an element, growing the data block if needed (which may move it —
-    /// the inline descriptor is rewritten to follow, if field-resident).
+    /// Append an element, growing the data block if needed.
+    ///
+    /// When the element fits the current capacity, or this is a **detached** vec
+    /// (no live on-disk descriptor), the ordinary path is used — no block move is
+    /// observable. When a **field-resident** vec must grow (a `realloc` could
+    /// *move* the block, freeing the old one before the inline descriptor is
+    /// rewritten, momentarily leaving the live descriptor pointing at freed
+    /// space), it instead allocates a new larger block, **commits** the descriptor
+    /// to it in one atomic write, then frees the old block — allocate → commit →
+    /// free, so the live descriptor is never observed dangling.
     pub fn push(&mut self, value: T) -> io::Result<()> {
-        let mut bytevec = self.bytes()?;
-        for &b in bytemuck::bytes_of(&value) {
-            bytevec.push(b)?;
+        let bytevec = self.bytes()?;
+        let elem = size_of::<T>() as u64;
+        let len = bytevec.len()?;
+        let cap = bytevec.capacity()?;
+
+        if len + elem <= cap || self.writeback.is_none() {
+            let mut bytevec = bytevec;
+            for &b in bytemuck::bytes_of(&value) {
+                bytevec.push(b)?;
+            }
+            self.data = bytevec.into_raw_block().as_range();
+            return self.persist();
         }
-        self.data = bytevec.into_raw_block().as_range();
-        self.persist()
+
+        // Field-resident growth: build the new block, commit, then free the old.
+        let mut bytes = bytevec.read_bytes()?;
+        bytes.extend_from_slice(bytemuck::bytes_of(&value));
+        let new_len = bytes.len() as u64;
+        let new_cap = core::cmp::max(cap.saturating_mul(2), new_len);
+        let old = self.data;
+
+        let mut slice = self.allocator.alloc(BYTEVEC_HEADER + new_cap)?;
+        let new_range = slice.as_range();
+        let mut image = Vec::with_capacity((BYTEVEC_HEADER + new_len) as usize);
+        image.extend_from_slice(&new_len.to_le_bytes()); // len @ 0
+        image.extend_from_slice(&new_cap.to_le_bytes()); // cap @ 8
+        image.extend_from_slice(&bytes); // elements @ 16
+        if let Err(e) = slice.write_range(0, &image) {
+            let _ = self.allocator.dealloc(slice);
+            return Err(e);
+        }
+
+        // Commit: repoint the (in-memory + inline) descriptor at the new block.
+        self.data = new_range;
+        self.persist()?;
+        // Reclaim the old block (a crash before here leaks it; never dangles).
+        unsafe { dealloc_range(self.allocator, old)? };
+        Ok(())
     }
 
     /// Deep-clone this POD vector's data into a fresh block for a [`ClonePlan`]:
@@ -239,11 +284,10 @@ impl<'a, T: Pod, A: BStackOwnedSliceAllocator> BStackVec<'a, T, A> {
     /// return its descriptor (what the cloned owner stores inline). The new block
     /// is written eagerly by the vector runtime, not staged in the plan's batch.
     pub fn clone_data_into(&self, plan: &mut ClonePlan) -> io::Result<VecDesc> {
-        let elems = self.to_vec()?;
-        let v = BStackVec::from_slice(self.allocator, &elems)?;
-        let desc = v.descriptor();
-        plan.track_alloc(BStackRange::new(desc.data_off, desc.data_size));
-        Ok(desc)
+        // Fold the data block into the plan: read the source elements, then let
+        // the plan allocate + stage a fresh block so it rides the atomic commit.
+        let bytes = self.bytes()?.read_bytes()?;
+        plan.stage_bytevec(self.allocator, &bytes)
     }
 }
 

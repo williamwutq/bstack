@@ -37,14 +37,14 @@
 
 use std::io;
 
-use bstack::{BStackOwnedSliceAllocator, BStackRange};
+use bstack::{BStackGenOp, BStackOwnedSliceAllocator, BStackRange};
 
 use crate::block::BStackShared;
 use crate::layout;
 use crate::owned::BStackOwned;
 use crate::reference::BStackRef;
-use crate::refcount;
 use crate::teardown::{BStackDrop, dealloc_range};
+use crate::vec::{BYTEVEC_HEADER, VecDesc};
 
 /// Duplicate `self`, performing any fallible I/O the duplication requires,
 /// **without** needing an allocator.
@@ -142,11 +142,36 @@ impl ClonePlan {
     }
 
     /// Register an already-allocated range for rollback — for allocations made
-    /// outside [`alloc_raw`](Self::alloc_raw) (e.g. a vector data block built and
-    /// written eagerly by the vector runtime, whose bytes are committed on
-    /// creation rather than staged in [`write`](Self::write)).
+    /// outside [`alloc_raw`](Self::alloc_raw).
     pub fn track_alloc(&mut self, range: BStackRange) {
         self.allocated.push(range);
+    }
+
+    /// Stage a fresh `BStackByteVec` data block holding `data` into the plan:
+    /// allocate the block (`[len | cap | data]`, `16`-byte header) via
+    /// [`alloc_raw`](Self::alloc_raw), stage its full on-disk image into the
+    /// commit batch, and return its descriptor. This folds a cloned vector's data
+    /// block into the plan's single atomic commit — the block is allocated through
+    /// our machinery and its bytes ride the same `inplace_gen` as everything else,
+    /// instead of the vector runtime writing it eagerly. `cap == len` (a fresh
+    /// clone carries no spare capacity, matching `BStackByteVec::from_slice`).
+    pub fn stage_bytevec<A: BStackOwnedSliceAllocator>(
+        &mut self,
+        allocator: &A,
+        data: &[u8],
+    ) -> io::Result<VecDesc> {
+        let len = data.len() as u64;
+        let size = BYTEVEC_HEADER + len;
+        let range = self.alloc_raw(allocator, size)?;
+        let mut image = Vec::with_capacity(size as usize);
+        image.extend_from_slice(&len.to_le_bytes()); // len @ 0
+        image.extend_from_slice(&len.to_le_bytes()); // cap @ 8 (== len)
+        image.extend_from_slice(data); // elements @ 16
+        self.write(range.start(), image);
+        Ok(VecDesc {
+            data_off: range.start(),
+            data_size: size,
+        })
     }
 
     /// Record that the strong count of a shared child at `data` must be bumped by
@@ -178,37 +203,117 @@ impl ClonePlan {
         Self::free_all(self.allocated, allocator);
     }
 
-    /// Apply the refcount bumps, then commit every pending write as one
-    /// crash-atomic batch. On any failure, undoes the applied bumps and frees the
-    /// allocations before propagating.
+    /// Commit the whole plan as **one** crash-atomic unit: every refcount bump
+    /// (as an atomic read-modify-write) and every staged payload / vec-data write,
+    /// via a single [`BStack::inplace_gen`]. Either all of it lands or none of it
+    /// does. On failure (I/O, or a refcount overflow) nothing is committed and the
+    /// plan's allocations are freed.
+    ///
+    /// Bumps are de-duplicated to distinct counters (a shared child referenced N
+    /// times in the clone is one counter `+N`), then applied as **all reads, then
+    /// all writes**: because the counters are distinct, no read depends on another
+    /// bump's pending write, so an overflow can be detected after the reads —
+    /// before any write is emitted — and abort with nothing committed.
     pub fn commit<A: BStackOwnedSliceAllocator>(self, allocator: &A) -> io::Result<()> {
+        let ClonePlan {
+            allocated,
+            writes,
+            mut bumps,
+        } = self;
         let stack = allocator.stack();
-        // Phase 2a: refcount bumps (each atomic on its own counter).
-        let mut applied = 0usize;
-        for &off in &self.bumps {
-            if let Err(e) = refcount::fetch_add(stack, off, 1) {
-                self.unwind(applied, allocator);
-                return Err(e);
-            }
-            applied += 1;
-        }
-        // Phase 2b: one crash-atomic batch of all block payloads. The new blocks
-        // are distinct ranges, so `set_batched`'s no-overlap rule always holds.
-        if let Err(e) = stack.set_batched(self.writes.iter().map(|(o, d)| (*o, d.as_slice()))) {
-            self.unwind(applied, allocator);
-            return Err(e);
-        }
-        Ok(())
-    }
 
-    /// Undo the first `applied` bumps and free every allocation. Shared error
-    /// path for [`commit`](Self::commit).
-    fn unwind<A: BStackOwnedSliceAllocator>(self, applied: usize, allocator: &A) {
-        let stack = allocator.stack();
-        for &off in &self.bumps[..applied] {
-            let _ = refcount::fetch_sub(stack, off, 1);
+        // De-duplicate bump offsets into distinct `(counter, delta)`.
+        bumps.sort_unstable();
+        let mut counters: Vec<(u64, u64)> = Vec::new();
+        for off in bumps {
+            match counters.last_mut() {
+                Some(last) if last.0 == off => last.1 += 1,
+                _ => counters.push((off, 1)),
+            }
         }
-        Self::free_all(self.allocated, allocator);
+
+        // Buffers that must outlive the whole `inplace_gen` call (bstack's
+        // documented generator pattern): the read-back counter values and the
+        // computed new values. `writes` is borrowed for its `Write` data.
+        let n = counters.len();
+        let mut readbufs: Vec<[u8; 8]> = vec![[0u8; 8]; n];
+        let mut newbufs: Vec<[u8; 8]> = vec![[0u8; 8]; n];
+        let mut overflow = false;
+
+        let mut read_i = 0usize;
+        let mut computed = false;
+        let mut cwrite_i = 0usize;
+        let mut write_i = 0usize;
+
+        let result = stack.inplace_gen(|_feedback| {
+            // Phase 1 — read every distinct counter.
+            if read_i < n {
+                let i = read_i;
+                read_i += 1;
+                // SAFETY: `readbufs` outlives this `inplace_gen` call and each
+                // read buffer is used by exactly one in-flight `Read` op.
+                let buf: &mut [u8] =
+                    unsafe { core::mem::transmute::<&mut [u8], _>(&mut readbufs[i][..]) };
+                return Some(BStackGenOp::Read {
+                    offset: counters[i].0,
+                    buf,
+                });
+            }
+            // Transition — compute new values + check overflow before any write.
+            if !computed {
+                computed = true;
+                for i in 0..n {
+                    let cur = u64::from_le_bytes(readbufs[i]);
+                    match cur.checked_add(counters[i].1) {
+                        Some(v) => newbufs[i] = v.to_le_bytes(),
+                        None => overflow = true,
+                    }
+                }
+                if overflow {
+                    // No `Write` emitted yet → ending now commits nothing.
+                    return None;
+                }
+            }
+            // Phase 2a — write the incremented counters.
+            if cwrite_i < n {
+                let i = cwrite_i;
+                cwrite_i += 1;
+                // SAFETY: `newbufs` outlives this call; each slot is written once
+                // above and only read here.
+                let data: &[u8] = unsafe { core::mem::transmute::<&[u8], _>(&newbufs[i][..]) };
+                return Some(BStackGenOp::Write {
+                    offset: counters[i].0,
+                    data,
+                });
+            }
+            // Phase 2b — write every staged payload / vec-data block.
+            if write_i < writes.len() {
+                let i = write_i;
+                write_i += 1;
+                let (off, ref bytes) = writes[i];
+                // SAFETY: `writes` outlives this call; each entry is read once.
+                let data: &[u8] = unsafe { core::mem::transmute::<&[u8], _>(bytes.as_slice()) };
+                return Some(BStackGenOp::Write { offset: off, data });
+            }
+            None
+        });
+
+        match result {
+            Ok(()) if overflow => {
+                Self::free_all(allocated, allocator);
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "refcount overflow while committing clone",
+                ))
+            }
+            Ok(()) => Ok(()),
+            // `inplace_gen` is atomic: on error nothing committed, so just free
+            // the plan's allocations (no bumps to undo — none were applied).
+            Err(e) => {
+                Self::free_all(allocated, allocator);
+                Err(e)
+            }
+        }
     }
 
     fn free_all<A: BStackOwnedSliceAllocator>(allocated: Vec<BStackRange>, allocator: &A) {

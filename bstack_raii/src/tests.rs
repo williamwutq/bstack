@@ -1136,6 +1136,35 @@ fn macro_vec_string_fields() {
 }
 
 #[test]
+fn macro_vec_field_push_growth_reclaims_old() {
+    // A field-resident growth push uses allocate → commit → free: the descriptor
+    // moves to a fresh block and the OLD block is reclaimed (not leaked).
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+
+    let rec = Record::new(&alloc, "hi", &[1u32, 2, 3], 0).unwrap();
+    let old = rec.handle().tags(&alloc).unwrap().descriptor(); // cap == len == 12 B
+
+    // len 12 + elem 4 > cap 12 → field-resident growth → the reorder path.
+    let mut tags = rec.handle().tags(&alloc).unwrap();
+    tags.push(4).unwrap();
+
+    let new = rec.handle().tags(&alloc).unwrap().descriptor();
+    assert_ne!(new.data_off, old.data_off); // moved to a fresh block
+    assert_eq!(
+        rec.handle().tags(&alloc).unwrap().to_vec().unwrap(),
+        vec![1u32, 2, 3, 4]
+    );
+
+    // The old block's slot is reclaimed: a probe of its size reuses its offset.
+    let probe = alloc_block(&alloc, MacroLeaf::eightcc(), old.data_size).unwrap();
+    assert_eq!(probe.start(), old.data_off);
+    unsafe { dealloc_range(&alloc, probe).unwrap() };
+
+    rec.bstack_drop(&alloc).unwrap();
+}
+
+#[test]
 fn macro_vec_bstack_move() {
     let tmp = TempStack::new();
     let alloc = tmp.allocator();
