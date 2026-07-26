@@ -1010,6 +1010,7 @@ recoverable after a crash by reconstructing the handle from the raw block via
 ### Key behaviour
 
 - **Growth**: `push` reallocates to `max(cap × 2, 4)` bytes when `len == cap`. New space is zero-initialised by `BStack::extend`.
+- **Bulk append**: `extend_from_slice` appends a whole `&[u8]` at once, reserving the needed capacity in a single reallocation and writing all bytes with one durable `set` before committing `len` — cheaper than a `push` per byte. A crash before the `len` write leaves the appended bytes invisible (beyond `len`); re-running with the same data recovers.
 - **Readback helper**: `read_bytes` loads all logical bytes into a Rust `Vec<u8>`.
 - **Zeroing on removal**: `pop` decrements `len` before zeroing the vacated slot; `truncate` writes the new `len` before zeroing removed slots in a single `BStackSlice::zero_range` call. Deallocation zeroing is delegated to the allocator.
 - **Iterator**: `BStackByteVecIter` borrows the vec immutably for its lifetime (preventing concurrent mutation) and yields `io::Result<u8>` per byte, reading from disk on demand.
@@ -1023,8 +1024,7 @@ let alloc = LinearBStackAllocator::new(BStack::open("buf.bstack")?);
 
 let mut v: BStackByteVec<_> = BStackByteVec::new(&alloc)?;
 v.push(b'A')?;
-v.push(b'B')?;
-v.push(b'C')?;
+v.extend_from_slice(b"BC")?; // bulk append
 
 assert_eq!(v.len()?, 3);
 assert_eq!(v.get(1)?, Some(b'B'));

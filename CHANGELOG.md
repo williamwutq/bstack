@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`BStackByteVec::extend_from_slice` (`alloc` + `set`): bulk byte append.** Appends an entire `&[u8]` in one shot — reserving the required capacity in a single reallocation (if any) and writing all bytes with one durable `set` before committing the new `len`. Empty input is a no-op. Crash consistency matches the other multi-step methods.
+
 ### Fixed
 
 - **`GhostTreeBstackAllocator::realloc` tail shrink was not crash-atomic.** Shrinking a tail allocation to a sub-block-unaligned length truncated the freed tail and zeroed the retained block's padding as two separate operations, so a fault (or crash) between them left the stack shrunk with un-zeroed padding — violating the zeroed-memory invariant and yielding a `realloc`-failure handle claiming a length past the now-shorter stack. The `atomic` path now fuses both into one crash-atomic tail-replace, so a fault leaves the block fully intact; the non-`atomic` path discards first and commits the shrink before zeroing, so a fault after the commit reports the allocation as lost (`handle: None`) rather than handing back a partially-zeroed "original". Surfaced by the new allocator fault-injection fuzz.

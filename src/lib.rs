@@ -510,9 +510,9 @@
 //!
 //! * [`BStackByteVec`]`<'a, A>` — a growable byte (`u8`) vector backed by a
 //!   [`BStack`] allocation (requires `alloc` + `set`).  Mirrors the core
-//!   [`Vec<u8>`] API: `new`, `with_capacity`, `from_slice`, `push`, `pop`,
-//!   `get`, `read_bytes`, `as_slice`, `truncate`, `clear`, `reserve`,
-//!   `resize`, and `iter`.
+//!   [`Vec<u8>`] API: `new`, `with_capacity`, `from_slice`, `push`,
+//!   `extend_from_slice`, `pop`, `get`, `read_bytes`, `as_slice`, `truncate`,
+//!   `clear`, `reserve`, `resize`, and `iter`.
 //!   The block stores a 16-byte header (`len`, `cap`) followed by the byte
 //!   data; the header is re-read on every call for crash recoverability.
 //!   `push` doubles capacity (minimum 4); `pop` decrements `len` then zeros

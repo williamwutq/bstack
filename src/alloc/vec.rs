@@ -71,6 +71,7 @@ const HEADER_LEN: u64 = 16;
 /// |--------|-----------|----------------------|
 /// | `push` (no realloc) | write element → increment `len` | Crash after element write: element on disk but `len` not updated; slot is effectively invisible. Re-running `push` with the same value recovers correctly. |
 /// | `push` (with realloc) | `realloc` → write `cap` → write element → increment `len` | Crash at any point: header re-read on next open reflects the committed state; worst case is allocator-specific intermediate metadata or a stale cap value. |
+/// | `extend_from_slice` | `reserve` → write elements → write `len` | Appended bytes may be partially written beyond the old `len`; they are invisible until the `len` write commits, and re-running with the same `data` recovers correctly. |
 /// | `pop` | read element → decrement `len` → zero slot | Crash after `len` decrement but before zero: stale byte may remain in the now out-of-range slot, but reads never include it because it is beyond `len`. |
 /// | `truncate` | write `len` → zero removed slots | Crash after `len` write but before zero: stale bytes may remain in now out-of-range slots, but reads never include them because they are beyond `len`. |
 /// | `resize` (grow) | `reserve` → write elements → write `len` | Elements between the old and new `len` may be partially written. |
@@ -329,6 +330,33 @@ impl<'a, A: BStackOwnedSliceAllocator> BStackByteVec<'a, A> {
         }
         self.write_byte_at(len, value)?;
         self.write_len_field(len + 1)
+    }
+
+    /// Append every byte in `data` to the end of the vec.
+    ///
+    /// This is the bulk counterpart to [`push`](Self::push): it reserves the
+    /// required capacity in a single reallocation (if any) and writes all of
+    /// `data` with a single durable `set` before committing the new `len`,
+    /// rather than issuing a grow/write/len cycle per byte.  A no-op when
+    /// `data` is empty.
+    ///
+    /// # Crash consistency
+    ///
+    /// The step order is `reserve` → write elements → write `len`.  A crash
+    /// before the `len` write leaves the appended bytes on disk but beyond the
+    /// committed `len`, so they are invisible; re-running `extend_from_slice`
+    /// with the same `data` recovers correctly.
+    pub fn extend_from_slice(&mut self, data: &[u8]) -> io::Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        let (len, _) = self.read_header()?;
+        let additional = data.len() as u64;
+        // `reserve` re-reads the header, checks `len + additional` for overflow,
+        // and grows the block if needed; `len` is left unchanged.
+        self.reserve(additional)?;
+        self.write_bytes_at(len, data)?;
+        self.write_len_field(len + additional)
     }
 
     /// Remove and return the last byte, or `None` if empty.
@@ -702,6 +730,51 @@ mod tests {
         v.push(3).unwrap(); // triggers doubling
         assert!(v.capacity().unwrap() >= 4);
         assert_eq!(v.len().unwrap(), 3);
+    }
+
+    #[test]
+    fn extend_from_slice_appends_all_bytes() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let mut v = BStackByteVec::new(&alloc).unwrap();
+        v.push(1).unwrap();
+        v.extend_from_slice(&[2, 3, 4, 5]).unwrap();
+        assert_eq!(v.len().unwrap(), 5);
+        assert_eq!(v.read_bytes().unwrap(), [1u8, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn extend_from_slice_empty_is_noop() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let mut v = BStackByteVec::from_slice(&[9u8, 8], &alloc).unwrap();
+        let cap_before = v.capacity().unwrap();
+        v.extend_from_slice(&[]).unwrap();
+        assert_eq!(v.len().unwrap(), 2);
+        assert_eq!(v.capacity().unwrap(), cap_before);
+        assert_eq!(v.read_bytes().unwrap(), [9u8, 8]);
+    }
+
+    #[test]
+    fn extend_from_slice_grows_capacity_once() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let mut v = BStackByteVec::new(&alloc).unwrap();
+        // cap starts at 0; extending by 100 must grow to hold all bytes.
+        let data: Vec<u8> = (0..100u8).collect();
+        v.extend_from_slice(&data).unwrap();
+        assert_eq!(v.len().unwrap(), 100);
+        assert!(v.capacity().unwrap() >= 100);
+        assert_eq!(v.read_bytes().unwrap(), data);
+    }
+
+    #[test]
+    fn extend_from_slice_onto_empty_vec() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let mut v = BStackByteVec::new(&alloc).unwrap();
+        v.extend_from_slice(&[10u8, 20, 30]).unwrap();
+        assert_eq!(v.read_bytes().unwrap(), [10u8, 20, 30]);
     }
 
     #[test]
