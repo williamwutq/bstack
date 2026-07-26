@@ -35,10 +35,10 @@ fn main() -> io::Result<()> {
         let alloc = LinearBStackAllocator::new(BStack::open(&path)?);
         let mut buf: BStackByteVec<_> = BStackByteVec::new(&alloc)?;
 
-        // Append the bytes of a short ASCII message.
-        for &b in b"Hello, BStack!" {
-            buf.push(b)?;
-        }
+        // Append the bytes of a short ASCII message.  `extend_from_slice` is the
+        // bulk counterpart to `push`: it grows once and writes the whole slice
+        // in a single durable `set` instead of one call per byte.
+        buf.extend_from_slice(b"Hello, BStack!")?;
 
         println!("After initial push:");
         print_bytes(&buf)?;
