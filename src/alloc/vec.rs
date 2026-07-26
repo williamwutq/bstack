@@ -190,7 +190,10 @@ impl<'a, A: BStackOwnedSliceAllocator> BStackByteVec<'a, A> {
     /// Equal to the block's start plus the 16-byte header plus `index`.  Must be
     /// recomputed after any reallocation, since the block's start may move.
     fn abs_offset(&self, index: u64) -> u64 {
-        self.slice.start() + Self::byte_offset(index)
+        self.slice
+            .start()
+            .saturating_add(HEADER_LEN)
+            .saturating_add(index)
     }
 
     /// Reallocate the block to hold `new_cap` bytes, updating `self.slice`.
@@ -832,8 +835,11 @@ impl<'a, A: BStackOwnedSliceAllocator> BStackByteVec<'a, A> {
         let stack = alloc.stack();
         let other_alloc: &'a A = other.allocator();
         if !std::ptr::eq(other_alloc.stack(), stack) {
-            // Free the mismatched handle so a wrong-BStack call is not a leak.
-            let _ = other_alloc.dealloc(other);
+            // `other` belongs to a different BStack (a misuse). Free it through its
+            // own allocator so the call is not a leak; if that free itself fails,
+            // surface the I/O error rather than swallowing it — either way the
+            // dealloc result is not discarded.
+            other_alloc.dealloc(other).map_err(|e| e.source)?;
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "BStackByteVec::append_from_owned: source belongs to a different BStack",
