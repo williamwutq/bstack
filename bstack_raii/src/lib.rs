@@ -49,6 +49,7 @@
 extern crate self as bstack_raii;
 
 mod block;
+mod bulk;
 mod cast;
 mod clone;
 mod construct;
@@ -68,8 +69,11 @@ pub use block::{
     BStackBlock, BStackCast, BStackMove, BStackMoveExpr, BStackShared, BStackWeakable,
 };
 pub use cast::{BStackCastAs, BStackCastInto};
+pub use bulk::{alloc_many, free_many};
 pub use clone::{ClonePlan, TryClone, TryCloneIn};
-pub use construct::{alloc_block, alloc_control, init_rc, set_weak_field, upgrade_weak_field};
+pub use construct::{
+    alloc_block, alloc_control, build_control_payload, init_rc, set_weak_field, upgrade_weak_field,
+};
 pub use handle::{OwnedRef, StrongRef, StrongWeakRef, WeakRef};
 pub use layout::{BlockHeader, EightCC};
 pub use owned::BStackOwned;

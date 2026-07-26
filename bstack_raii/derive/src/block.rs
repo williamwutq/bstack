@@ -1443,80 +1443,123 @@ fn constructor(
     preps: &[TokenStream],
     inits: &[TokenStream],
 ) -> TokenStream {
-    let injected = match mode {
-        Mode::Plain => quote!(),
-        Mode::Rc => quote!(__bstack_refcount: 1u64,),
-        Mode::RcWeak => quote!(__bstack_ctrl: 0u64,),
-    };
-    let ret = match mode {
-        Mode::Plain => quote!(::bstack_raii::BStackOwned<Self>),
-        _ => quote!(::bstack_raii::BStackRc<'__ctor, Self, __A>),
-    };
-    let finish = match mode {
-        Mode::Plain => quote! {
-            ::std::result::Result::Ok(unsafe {
-                ::bstack_raii::BStackOwned::from_raw(
-                    <Self as ::bstack_raii::BStackBlock>::from_range(__data),
-                )
-            })
+    let header = quote! {
+        __bstack_header: ::bstack_raii::BlockHeader {
+            size: ::core::mem::size_of::<#on_disk>() as u64,
+            tag: <Self as ::bstack_raii::BStackCast>::eightcc(),
         },
-        Mode::Rc => quote! {
-            ::std::result::Result::Ok(unsafe {
-                ::bstack_raii::BStackRc::from_raw(
-                    ::bstack_raii::BStackRef::from_range(__data),
-                    ::core::option::Option::None,
-                    allocator,
-                )
-            })
-        },
-        Mode::RcWeak => {
+    };
+    let size = quote!(::core::mem::size_of::<#on_disk>() as u64);
+
+    match mode {
+        // Plain and `rc` are already a single atomic write: the injected refcount
+        // is baked into the OnDisk image, so one `alloc` + one `write_range` fully
+        // constructs the block (a crash before the write just orphans the block).
+        Mode::Plain | Mode::Rc => {
+            let injected = if let Mode::Rc = mode {
+                quote!(__bstack_refcount: 1u64,)
+            } else {
+                quote!()
+            };
+            let ret = if let Mode::Rc = mode {
+                quote!(::bstack_raii::BStackRc<'__ctor, Self, __A>)
+            } else {
+                quote!(::bstack_raii::BStackOwned<Self>)
+            };
+            let finish = if let Mode::Rc = mode {
+                quote! {
+                    ::std::result::Result::Ok(unsafe {
+                        ::bstack_raii::BStackRc::from_raw(
+                            ::bstack_raii::BStackRef::from_range(__data),
+                            ::core::option::Option::None,
+                            allocator,
+                        )
+                    })
+                }
+            } else {
+                quote! {
+                    ::std::result::Result::Ok(unsafe {
+                        ::bstack_raii::BStackOwned::from_raw(
+                            <Self as ::bstack_raii::BStackBlock>::from_range(__data),
+                        )
+                    })
+                }
+            };
             quote! {
-                let __ctrl = match ::bstack_raii::alloc_control(
-                    allocator,
-                    #ctrl_eightcc,
-                    __data,
-                    ::core::mem::size_of::<<Self as ::bstack_raii::BStackWeakable>::Control>() as u64,
-                ) {
-                    ::std::result::Result::Ok(__c) => __c,
-                    ::std::result::Result::Err(__e) => {
-                        let _ = unsafe { ::bstack_raii::dealloc_range(allocator, __data) };
+                #vis fn new<'__ctor, __A: ::bstack_raii::BStackOwnedSliceAllocator>(
+                    allocator: &'__ctor __A,
+                    #(#params)*
+                ) -> ::std::io::Result<#ret> {
+                    #(#preps)*
+                    let __on_disk = #on_disk {
+                        #header
+                        #injected
+                        #(#inits)*
+                    };
+                    let mut __slice = allocator.alloc(#size)?;
+                    let __data = __slice.as_range();
+                    if let ::std::result::Result::Err(__e) =
+                        __slice.write_range(0, ::bstack_raii::bytemuck::bytes_of(&__on_disk))
+                    {
+                        let _ = allocator.dealloc(__slice);
                         return ::std::result::Result::Err(__e);
                     }
-                };
-                ::std::result::Result::Ok(unsafe {
-                    ::bstack_raii::BStackRc::from_raw(
-                        ::bstack_raii::BStackRef::from_range(__data),
-                        ::core::option::Option::Some(__ctrl),
-                        allocator,
-                    )
-                })
+                    #finish
+                }
             }
         }
-    };
-
-    quote! {
-        #vis fn new<'__ctor, __A: ::bstack_raii::BStackOwnedSliceAllocator>(
-            allocator: &'__ctor __A,
-            #(#params)*
-        ) -> ::std::io::Result<#ret> {
-            #(#preps)*
-            let __on_disk = #on_disk {
-                __bstack_header: ::bstack_raii::BlockHeader {
-                    size: ::core::mem::size_of::<#on_disk>() as u64,
-                    tag: <Self as ::bstack_raii::BStackCast>::eightcc(),
-                },
-                #injected
-                #(#inits)*
+        // `(rc, weak)` needs two blocks (data + control). Allocate both up front,
+        // bake the real control back-pointer into the data image, and commit both
+        // images in ONE `set_batched` — so the block is created atomically, with
+        // no separate back-pointer write and no transient half-wired state (a
+        // crash before the commit just orphans the two fresh blocks).
+        Mode::RcWeak => {
+            let ctrl_size = quote! {
+                ::core::mem::size_of::<<Self as ::bstack_raii::BStackWeakable>::Control>() as u64
             };
-            let mut __slice = allocator.alloc(::core::mem::size_of::<#on_disk>() as u64)?;
-            let __data = __slice.as_range();
-            if let ::std::result::Result::Err(__e) =
-                __slice.write_range(0, ::bstack_raii::bytemuck::bytes_of(&__on_disk))
-            {
-                let _ = allocator.dealloc(__slice);
-                return ::std::result::Result::Err(__e);
+            quote! {
+                #vis fn new<'__ctor, __A: ::bstack_raii::BStackOwnedSliceAllocator>(
+                    allocator: &'__ctor __A,
+                    #(#params)*
+                ) -> ::std::io::Result<::bstack_raii::BStackRc<'__ctor, Self, __A>> {
+                    #(#preps)*
+                    // Allocate data + control up front (atomically when the
+                    // allocator supports bulk); both are orphans until the commit.
+                    let __blocks = ::bstack_raii::alloc_many(allocator, &[#size, #ctrl_size])?;
+                    let __data = __blocks[0];
+                    let __ctrl = __blocks[1];
+                    let __on_disk = #on_disk {
+                        #header
+                        __bstack_ctrl: __ctrl.start(),
+                        #(#inits)*
+                    };
+                    let __ctrl_payload = ::bstack_raii::build_control_payload(
+                        #ctrl_eightcc,
+                        __data.start(),
+                        #ctrl_size,
+                    );
+                    let __writes: [(u64, ::std::vec::Vec<u8>); 2] = [
+                        (
+                            __data.start(),
+                            ::bstack_raii::bytemuck::bytes_of(&__on_disk).to_vec(),
+                        ),
+                        (__ctrl.start(), __ctrl_payload),
+                    ];
+                    if let ::std::result::Result::Err(__e) =
+                        allocator.stack().set_batched(__writes)
+                    {
+                        let _ = ::bstack_raii::free_many(allocator, [__data, __ctrl]);
+                        return ::std::result::Result::Err(__e);
+                    }
+                    ::std::result::Result::Ok(unsafe {
+                        ::bstack_raii::BStackRc::from_raw(
+                            ::bstack_raii::BStackRef::from_range(__data),
+                            ::core::option::Option::Some(__ctrl),
+                            allocator,
+                        )
+                    })
+                }
             }
-            #finish
         }
     }
 }
@@ -2511,53 +2554,129 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
         Mode::Rc => quote!(__bstack_refcount: u64,),
         Mode::RcWeak => quote!(__bstack_ctrl: u64,),
     };
-    let injected_init = match mode {
-        Mode::Plain => quote!(),
-        Mode::Rc => quote!(__bstack_refcount: 1u64,),
-        Mode::RcWeak => quote!(__bstack_ctrl: 0u64,),
-    };
     let new_ret = match mode {
         Mode::Plain => quote!(::bstack_raii::BStackOwned<Self>),
         _ => quote!(::bstack_raii::BStackRc<'__e, Self, __A>),
     };
-    let new_finish = match mode {
-        Mode::Plain => quote! {
-            ::std::result::Result::Ok(unsafe {
-                ::bstack_raii::BStackOwned::from_raw(
-                    <Self as ::bstack_raii::BStackBlock>::from_range(__data),
-                )
-            })
+    // `EData` type name — `new`'s `data` parameter and `bstack_move!` output.
+    let data_ty = if has_shared {
+        quote!(#data<'__e, __A>)
+    } else {
+        quote!(#data)
+    };
+    // The `new` constructor. Plain / `rc` are one atomic write (the injected
+    // refcount is baked into the image); `(rc, weak)` allocates data + control and
+    // commits both images in one `set_batched`, with the control back-pointer
+    // baked into the data image — no separate back-pointer write, no half-wired
+    // transient state.
+    let enum_header = quote! {
+        __bstack_header: ::bstack_raii::BlockHeader {
+            size: ::core::mem::size_of::<#on_disk>() as u64,
+            tag: <Self as ::bstack_raii::BStackCast>::eightcc(),
         },
-        Mode::Rc => quote! {
-            ::std::result::Result::Ok(unsafe {
-                ::bstack_raii::BStackRc::from_raw(
-                    ::bstack_raii::BStackRef::from_range(__data),
-                    ::core::option::Option::None,
-                    allocator,
-                )
-            })
-        },
-        Mode::RcWeak => quote! {
-            let __ctrl = match ::bstack_raii::alloc_control(
-                allocator,
-                #ctrl_eightcc,
-                __data,
-                ::core::mem::size_of::<<Self as ::bstack_raii::BStackWeakable>::Control>() as u64,
-            ) {
-                ::std::result::Result::Ok(__c) => __c,
-                ::std::result::Result::Err(__e) => {
-                    let _ = unsafe { ::bstack_raii::dealloc_range(allocator, __data) };
-                    return ::std::result::Result::Err(__e);
+    };
+    let enum_size = quote!(::core::mem::size_of::<#on_disk>() as u64);
+    let enum_new = match mode {
+        Mode::Plain | Mode::Rc => {
+            let injected_init = if let Mode::Rc = mode {
+                quote!(__bstack_refcount: 1u64,)
+            } else {
+                quote!()
+            };
+            let finish = if let Mode::Rc = mode {
+                quote! {
+                    ::std::result::Result::Ok(unsafe {
+                        ::bstack_raii::BStackRc::from_raw(
+                            ::bstack_raii::BStackRef::from_range(__data),
+                            ::core::option::Option::None,
+                            allocator,
+                        )
+                    })
+                }
+            } else {
+                quote! {
+                    ::std::result::Result::Ok(unsafe {
+                        ::bstack_raii::BStackOwned::from_raw(
+                            <Self as ::bstack_raii::BStackBlock>::from_range(__data),
+                        )
+                    })
                 }
             };
-            ::std::result::Result::Ok(unsafe {
-                ::bstack_raii::BStackRc::from_raw(
-                    ::bstack_raii::BStackRef::from_range(__data),
-                    ::core::option::Option::Some(__ctrl),
-                    allocator,
-                )
-            })
-        },
+            quote! {
+                #vis fn new<'__e, __A: ::bstack_raii::BStackOwnedSliceAllocator>(
+                    allocator: &'__e __A,
+                    data: #data_ty,
+                ) -> ::std::io::Result<#new_ret> {
+                    let (__disc, __payload): (#disc_ty, [u8; Self::__PAYLOAD]) = match data {
+                        #(#new_arms)*
+                    };
+                    let __on_disk = #on_disk {
+                        #enum_header
+                        #injected_init
+                        __bstack_disc: __disc,
+                        __bstack_payload: __payload,
+                    };
+                    let mut __slice = allocator.alloc(#enum_size)?;
+                    let __data = __slice.as_range();
+                    if let ::std::result::Result::Err(__e) =
+                        __slice.write_range(0, ::bstack_raii::bytemuck::bytes_of(&__on_disk))
+                    {
+                        let _ = allocator.dealloc(__slice);
+                        return ::std::result::Result::Err(__e);
+                    }
+                    #finish
+                }
+            }
+        }
+        Mode::RcWeak => {
+            let ctrl_size = quote! {
+                ::core::mem::size_of::<<Self as ::bstack_raii::BStackWeakable>::Control>() as u64
+            };
+            quote! {
+                #vis fn new<'__e, __A: ::bstack_raii::BStackOwnedSliceAllocator>(
+                    allocator: &'__e __A,
+                    data: #data_ty,
+                ) -> ::std::io::Result<::bstack_raii::BStackRc<'__e, Self, __A>> {
+                    let (__disc, __payload): (#disc_ty, [u8; Self::__PAYLOAD]) = match data {
+                        #(#new_arms)*
+                    };
+                    let __blocks = ::bstack_raii::alloc_many(allocator, &[#enum_size, #ctrl_size])?;
+                    let __data = __blocks[0];
+                    let __ctrl = __blocks[1];
+                    let __on_disk = #on_disk {
+                        #enum_header
+                        __bstack_ctrl: __ctrl.start(),
+                        __bstack_disc: __disc,
+                        __bstack_payload: __payload,
+                    };
+                    let __ctrl_payload = ::bstack_raii::build_control_payload(
+                        #ctrl_eightcc,
+                        __data.start(),
+                        #ctrl_size,
+                    );
+                    let __writes: [(u64, ::std::vec::Vec<u8>); 2] = [
+                        (
+                            __data.start(),
+                            ::bstack_raii::bytemuck::bytes_of(&__on_disk).to_vec(),
+                        ),
+                        (__ctrl.start(), __ctrl_payload),
+                    ];
+                    if let ::std::result::Result::Err(__e) =
+                        allocator.stack().set_batched(__writes)
+                    {
+                        let _ = ::bstack_raii::free_many(allocator, [__data, __ctrl]);
+                        return ::std::result::Result::Err(__e);
+                    }
+                    ::std::result::Result::Ok(unsafe {
+                        ::bstack_raii::BStackRc::from_raw(
+                            ::bstack_raii::BStackRef::from_range(__data),
+                            ::core::option::Option::Some(__ctrl),
+                            allocator,
+                        )
+                    })
+                }
+            }
+        }
     };
     let shared_impl = match mode {
         Mode::Plain => quote!(),
@@ -2760,11 +2879,6 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
     } else {
         quote!()
     };
-    let data_ty = if has_shared {
-        quote!(#data<'__e, __A>)
-    } else {
-        quote!(#data)
-    };
     let view_generics = if has_weak {
         quote!(<'__e, __A: ::bstack_raii::BStackOwnedSliceAllocator>)
     } else {
@@ -2915,32 +3029,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
 
         impl #name {
             /// Allocate a new enum block holding `data`'s variant + payload.
-            #vis fn new<'__e, __A: ::bstack_raii::BStackOwnedSliceAllocator>(
-                allocator: &'__e __A,
-                data: #data_ty,
-            ) -> ::std::io::Result<#new_ret> {
-                let (__disc, __payload): (#disc_ty, [u8; Self::__PAYLOAD]) = match data {
-                    #(#new_arms)*
-                };
-                let __on_disk = #on_disk {
-                    __bstack_header: ::bstack_raii::BlockHeader {
-                        size: ::core::mem::size_of::<#on_disk>() as u64,
-                        tag: <Self as ::bstack_raii::BStackCast>::eightcc(),
-                    },
-                    #injected_init
-                    __bstack_disc: __disc,
-                    __bstack_payload: __payload,
-                };
-                let mut __slice = allocator.alloc(::core::mem::size_of::<#on_disk>() as u64)?;
-                let __data = __slice.as_range();
-                if let ::std::result::Result::Err(__e) =
-                    __slice.write_range(0, ::bstack_raii::bytemuck::bytes_of(&__on_disk))
-                {
-                    let _ = allocator.dealloc(__slice);
-                    return ::std::result::Result::Err(__e);
-                }
-                #new_finish
-            }
+            #enum_new
 
             /// Read the current variant. Takes the allocator (a weak variant's
             /// read upgrades through it; other variants just read the block).

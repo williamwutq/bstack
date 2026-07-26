@@ -64,22 +64,7 @@ pub fn alloc_control<A: BStackOwnedSliceAllocator>(
     data: BStackRange,
     control_size: u64,
 ) -> io::Result<BStackRange> {
-    // Build the entire control-block payload in memory and commit it in a single
-    // write: header, strong = 1, weak = 1 (phantom), x -> data.
-    let mut payload = vec![0u8; control_size as usize];
-    let header = BlockHeader {
-        size: control_size,
-        tag: ctrl_tag,
-    };
-    payload[..layout::HEADER_SIZE as usize].copy_from_slice(bytemuck::bytes_of(&header));
-    let put = |payload: &mut [u8], off: u64, val: u64| {
-        let o = off as usize;
-        payload[o..o + 8].copy_from_slice(&val.to_le_bytes());
-    };
-    put(&mut payload, layout::CTRL_STRONG_OFFSET, 1);
-    put(&mut payload, layout::CTRL_WEAK_OFFSET, 1);
-    put(&mut payload, layout::CTRL_DATA_OFFSET, data.start());
-
+    let payload = build_control_payload(ctrl_tag, data.start(), control_size);
     let mut slice = allocator.alloc(control_size)?;
     let ctrl = slice.as_range();
     if let Err(e) = slice.write_range(0, &payload) {
@@ -95,6 +80,32 @@ pub fn alloc_control<A: BStackOwnedSliceAllocator>(
         return Err(e);
     }
     Ok(ctrl)
+}
+
+/// Build a `(rc, weak)` control-block payload image in memory (no allocation, no
+/// write): header, `strong = 1`, `weak = 1` (the phantom weak the strong owners
+/// hold), and the `x` forward pointer to the data block at `data_start`.
+///
+/// The building block for a **batched** constructor: the caller allocates the
+/// data and control blocks up front, bakes the control offset into the data
+/// block's `ctrl` back-pointer, and commits both block images in one
+/// [`bstack::BStack::set_batched`] — so a `(rc, weak)` block is created atomically,
+/// with no separate back-pointer write and no transient half-wired state.
+pub fn build_control_payload(ctrl_tag: EightCC, data_start: u64, control_size: u64) -> Vec<u8> {
+    let mut payload = vec![0u8; control_size as usize];
+    let header = BlockHeader {
+        size: control_size,
+        tag: ctrl_tag,
+    };
+    payload[..layout::HEADER_SIZE as usize].copy_from_slice(bytemuck::bytes_of(&header));
+    let put = |payload: &mut [u8], off: u64, val: u64| {
+        let o = off as usize;
+        payload[o..o + 8].copy_from_slice(&val.to_le_bytes());
+    };
+    put(&mut payload, layout::CTRL_STRONG_OFFSET, 1);
+    put(&mut payload, layout::CTRL_WEAK_OFFSET, 1);
+    put(&mut payload, layout::CTRL_DATA_OFFSET, data_start);
+    payload
 }
 
 /// Set a `#[bstack_weak]` field, located at absolute on-disk offset `field_off`,
