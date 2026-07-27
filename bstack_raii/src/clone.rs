@@ -163,11 +163,8 @@ impl ClonePlan {
         let len = data.len() as u64;
         let size = BYTEVEC_HEADER + len;
         let range = self.alloc_raw(allocator, size)?;
-        let mut image = Vec::with_capacity(size as usize);
-        image.extend_from_slice(&len.to_le_bytes()); // len @ 0
-        image.extend_from_slice(&len.to_le_bytes()); // cap @ 8 (== len)
-        image.extend_from_slice(data); // elements @ 16
-        self.write(range.start(), image);
+        // cap == len: a fresh clone carries no spare capacity.
+        self.write(range.start(), crate::vec::bytevec_image(len, len, data));
         Ok(VecDesc {
             data_off: range.start(),
             data_size: size,

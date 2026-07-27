@@ -2404,3 +2404,58 @@ fn macro_clone_embed() {
     }
     e.bstack_drop(&alloc).unwrap();
 }
+
+// --------------------------------------------------------------------------
+// WAL: completing / abandoning a crash-left transaction
+// --------------------------------------------------------------------------
+
+#[test]
+fn wal_finish_rolls_forward_committed() {
+    use crate::wal::{finish_at, persist_at};
+    use crate::{WalEntry, WalLog, WalStatus};
+
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    // A stable anchor slot, plus two "old" slices the transaction was freeing.
+    let anchor = alloc.alloc(8).unwrap().as_range().start();
+    let v1 = alloc.alloc(64).unwrap().as_range();
+    let v2 = alloc.alloc(64).unwrap().as_range();
+
+    // A COMMITTED transaction that had not finished its deallocs.
+    let mut log = WalLog::with_capacity(2);
+    log.append(WalEntry::dealloc(WalStatus::Pending, v1));
+    log.append(WalEntry::dealloc(WalStatus::Pending, v2));
+    persist_at(&alloc, anchor, &log, WalStatus::Complete).unwrap();
+
+    // Completing it rolls both deallocs forward.
+    assert_eq!(finish_at(&alloc, anchor).unwrap(), 2);
+
+    // Anchor cleared, and v1/v2 reclaimed (a fresh 64-byte alloc reuses a slot).
+    let mut buf = [0u8; 8];
+    alloc.stack().get_into(anchor, &mut buf).unwrap();
+    assert_eq!(u64::from_le_bytes(buf), 0);
+    let reused = alloc.alloc(64).unwrap().as_range();
+    assert!(reused.start() == v1.start() || reused.start() == v2.start());
+}
+
+#[test]
+fn wal_finish_abandons_uncommitted() {
+    use crate::wal::{finish_at, persist_at};
+    use crate::{WalEntry, WalLog, WalStatus};
+
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let anchor = alloc.alloc(8).unwrap().as_range().start();
+    let v1 = alloc.alloc(64).unwrap().as_range();
+
+    // An UNCOMMITTED transaction: its dealloc must NOT be performed.
+    let mut log = WalLog::with_capacity(1);
+    log.append(WalEntry::dealloc(WalStatus::Pending, v1));
+    persist_at(&alloc, anchor, &log, WalStatus::Pending).unwrap();
+
+    // Abandoned: nothing freed, anchor cleared.
+    assert_eq!(finish_at(&alloc, anchor).unwrap(), 0);
+    let mut buf = [0u8; 8];
+    alloc.stack().get_into(anchor, &mut buf).unwrap();
+    assert_eq!(u64::from_le_bytes(buf), 0);
+}

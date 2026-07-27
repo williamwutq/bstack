@@ -43,9 +43,12 @@
 //! reclamation.
 
 use core::mem::size_of;
+use std::io;
 
-use bstack::BStackRange;
+use bstack::{BStackAllocator, BStackOwnedSliceAllocator, BStackRange};
 use bytemuck::{Pod, Zeroable};
+
+use crate::teardown::dealloc_range;
 
 /// `R'`: an allocation requirement carrying identity — a length whose address has
 /// been "forgotten", plus an `id` that keeps equal-length requirements distinct.
@@ -280,6 +283,158 @@ pub fn reduce(allocs: Vec<AllocReq>, mut deallocs: Vec<BStackRange>) -> Reduced 
         allocs: rem_allocs,
         deallocs,
     }
+}
+
+// ---------------------------------------------------------------------------
+// On-disk WAL block + completion runtime.
+//
+// A WAL block is `[WalHeader | WalEntry × count]`, allocated from the allocator
+// and reached through a stable anchor slot (see [`BStackWalAnchor`]) that holds
+// the block's offset (`0` = none). The header's `txn_status` is the
+// transaction-level commit marker: `Complete` = committed (roll forward on the
+// next open), `Pending` = uncommitted (abandon).
+// ---------------------------------------------------------------------------
+
+const WAL_MAGIC: u64 = 0x6273_7461_636b_5741; // "bstackWA"
+
+/// On-disk header of a WAL block. `txn_status` is the transaction-level commit
+/// marker (`Pending` = uncommitted, `Complete` = committed).
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+#[repr(C)]
+pub struct WalHeader {
+    magic: u64,
+    txn_status: u8,
+    _pad: [u8; 7],
+    count: u64,
+}
+
+impl WalHeader {
+    fn txn_status(&self) -> WalStatus {
+        WalStatus::from_u8(self.txn_status)
+    }
+}
+
+impl WalLog {
+    /// The full WAL-block image `[WalHeader | entries]` at the given
+    /// transaction-level status, ready to write to an allocated block.
+    pub fn block_image(&self, txn_status: WalStatus) -> Vec<u8> {
+        let header = WalHeader {
+            magic: WAL_MAGIC,
+            txn_status: txn_status as u8,
+            _pad: [0; 7],
+            count: self.entries.len() as u64,
+        };
+        let mut img = Vec::with_capacity(
+            size_of::<WalHeader>() + self.entries.len() * size_of::<WalEntry>(),
+        );
+        img.extend_from_slice(bytemuck::bytes_of(&header));
+        img.extend_from_slice(bytemuck::cast_slice(&self.entries));
+        img
+    }
+}
+
+/// A [`BStackOwnedSliceAllocator`] that can point `bstack_raii` at a stable
+/// on-disk slot for its WAL block pointer.
+///
+/// # Safety
+///
+/// The implementor asserts that `[wal_anchor(), wal_anchor() + 8)` is a stable,
+/// persistent 8-byte region that the allocator **never** hands out via `alloc`
+/// and **never** uses for its own metadata, and that survives across open/close.
+/// `bstack_raii` stores the current WAL block's offset there (`0` = none).
+pub unsafe trait BStackWalAnchor: BStackOwnedSliceAllocator {
+    fn wal_anchor(&self) -> u64;
+}
+
+/// Write `log` as a WAL block with transaction status `txn_status`, allocate the
+/// block, and point the anchor slot at it. Returns the block's range.
+pub fn persist_at<A: BStackOwnedSliceAllocator>(
+    allocator: &A,
+    anchor: u64,
+    log: &WalLog,
+    txn_status: WalStatus,
+) -> io::Result<BStackRange> {
+    let image = log.block_image(txn_status);
+    let mut slice = allocator.alloc(image.len() as u64)?;
+    let range = slice.as_range();
+    if let Err(e) = slice.write_range(0, &image) {
+        let _ = allocator.dealloc(slice);
+        return Err(e);
+    }
+    allocator.stack().set(anchor, range.start().to_le_bytes())?;
+    Ok(range)
+}
+
+/// Read the WAL block referenced by the anchor slot, if any (and valid).
+fn load_at<A: BStackOwnedSliceAllocator>(
+    allocator: &A,
+    anchor: u64,
+) -> io::Result<Option<(BStackRange, WalHeader, Vec<WalEntry>)>> {
+    let stack = allocator.stack();
+    let mut buf = [0u8; 8];
+    stack.get_into(anchor, &mut buf)?;
+    let wal_off = u64::from_le_bytes(buf);
+    if wal_off == 0 {
+        return Ok(None);
+    }
+    let mut hbuf = [0u8; size_of::<WalHeader>()];
+    stack.get_into(wal_off, &mut hbuf)?;
+    let header: WalHeader = bytemuck::pod_read_unaligned(&hbuf);
+    if header.magic != WAL_MAGIC {
+        return Ok(None);
+    }
+    let ebytes = header.count as usize * size_of::<WalEntry>();
+    let mut ebuf = vec![0u8; ebytes];
+    stack.get_into(wal_off + size_of::<WalHeader>() as u64, &mut ebuf)?;
+    let entries = WalLog::entries_from_bytes(&ebuf);
+    let block_size = size_of::<WalHeader>() as u64 + ebytes as u64;
+    Ok(Some((BStackRange::new(wal_off, block_size), header, entries)))
+}
+
+/// **Complete** a crash-left transaction referenced by the anchor slot at
+/// `anchor`, or abandon it.
+///
+/// * **Committed** (`txn_status == Complete`): roll forward — for each still-
+///   `Pending` `Dealloc`, persist its entry `Complete` **then** free the slice
+///   (so a re-`finish` after another crash skips it — no double-free).
+/// * **Uncommitted** (`txn_status == Pending`): abandon — free nothing (the old
+///   slices stay; any new allocations leak, since an `Alloc` records only `R'`).
+///
+/// Either way the WAL block is then cleared (anchor `:= 0`) and freed. Returns
+/// the number of deallocations completed. This is what a caller runs after
+/// `open` — a *completion*, not a leaky recovery.
+pub fn finish_at<A: BStackOwnedSliceAllocator>(allocator: &A, anchor: u64) -> io::Result<usize> {
+    let (wal_range, header, entries) = match load_at(allocator, anchor)? {
+        Some(x) => x,
+        None => return Ok(0),
+    };
+    let stack = allocator.stack();
+    let mut completed = 0usize;
+
+    if header.txn_status() == WalStatus::Complete {
+        let base = wal_range.start() + size_of::<WalHeader>() as u64;
+        for (i, e) in entries.iter().enumerate() {
+            // `as_dealloc` is `Some` only for a `Dealloc` entry.
+            if e.status() == WalStatus::Pending && let Some(slice) = e.as_dealloc() {
+                // Persist Complete for this entry (its status is byte 0), THEN
+                // free — so a second crash can't double-free it.
+                let entry_off = base + (i * size_of::<WalEntry>()) as u64;
+                stack.set(entry_off, [WalStatus::Complete as u8])?;
+                unsafe { dealloc_range(allocator, slice)? };
+                completed += 1;
+            }
+        }
+    }
+
+    // Clear the anchor, then free the WAL block.
+    stack.set(anchor, 0u64.to_le_bytes())?;
+    unsafe { dealloc_range(allocator, wal_range)? };
+    Ok(completed)
+}
+
+/// Like [`finish_at`], using the allocator's own [`BStackWalAnchor`] slot.
+pub fn finish<A: BStackWalAnchor>(allocator: &A) -> io::Result<usize> {
+    finish_at(allocator, allocator.wal_anchor())
 }
 
 #[cfg(test)]

@@ -36,6 +36,7 @@ use bytemuck::{Pod, Zeroable};
 use crate::block::{BStackBlock, BStackShared, BStackWeakable};
 use crate::clone::ClonePlan;
 use crate::handle::WeakRef;
+use crate::layout::put_u64;
 use crate::owned::BStackOwned;
 use crate::reference::BStackRef;
 use crate::shared::{BStackRc, BStackWeak};
@@ -46,6 +47,18 @@ use crate::teardown::{BStackDrop, dealloc_range};
 /// `0.4.x`). Used where we build a byte-vec block image by hand to keep a
 /// mutation crash-atomic.
 pub(crate) const BYTEVEC_HEADER: u64 = 16;
+
+/// Build a `BStackByteVec` block image `[len@0 | cap@8 | data@16]` by hand — the
+/// single place that on-disk shape is assembled, shared by a cloned vec
+/// ([`crate::ClonePlan::stage_bytevec`]) and a field-resident growth
+/// [`push`](BStackVec::push).
+pub(crate) fn bytevec_image(len: u64, cap: u64, data: &[u8]) -> Vec<u8> {
+    let mut img = vec![0u8; BYTEVEC_HEADER as usize + data.len()];
+    put_u64!(img, 0, len);
+    put_u64!(img, 8, cap);
+    img[BYTEVEC_HEADER as usize..].copy_from_slice(data);
+    img
+}
 
 /// Build a fresh data block holding `offs` (an offset array), register it in
 /// `plan` for rollback, and return its descriptor. The shared back end of the
@@ -262,10 +275,7 @@ impl<'a, T: Pod, A: BStackOwnedSliceAllocator> BStackVec<'a, T, A> {
 
         let mut slice = self.allocator.alloc(BYTEVEC_HEADER + new_cap)?;
         let new_range = slice.as_range();
-        let mut image = Vec::with_capacity((BYTEVEC_HEADER + new_len) as usize);
-        image.extend_from_slice(&new_len.to_le_bytes()); // len @ 0
-        image.extend_from_slice(&new_cap.to_le_bytes()); // cap @ 8
-        image.extend_from_slice(&bytes); // elements @ 16
+        let image = bytevec_image(new_len, new_cap, &bytes);
         if let Err(e) = slice.write_range(0, &image) {
             let _ = self.allocator.dealloc(slice);
             return Err(e);

@@ -5,6 +5,18 @@
 
 use bytemuck::{Pod, Zeroable};
 
+/// Write `$val` as a little-endian `u64` at byte offset `$off` in the slice
+/// `$buf`. The one place the crate builds on-disk integer fields by hand, instead
+/// of the ad-hoc `copy_from_slice(&x.to_le_bytes())` pattern repeated across the
+/// image builders (control payloads, byte-vec headers, WAL records).
+macro_rules! put_u64 {
+    ($buf:expr, $off:expr, $val:expr) => {{
+        let __o = ($off) as usize;
+        $buf[__o..__o + 8].copy_from_slice(&($val as u64).to_le_bytes());
+    }};
+}
+pub(crate) use put_u64;
+
 /// An 8-byte type tag stored in every [`BlockHeader`].
 ///
 /// Used instead of a 4-byte `FourCC` because `bstack` offsets are 64-bit, so

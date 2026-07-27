@@ -15,7 +15,7 @@ use bstack::{BStackOwnedSliceAllocator, BStackRange};
 
 use crate::block::BStackWeakable;
 use crate::handle::WeakRef;
-use crate::layout::{self, BlockHeader, EightCC};
+use crate::layout::{self, BlockHeader, EightCC, put_u64};
 use crate::reference::BStackRef;
 use crate::shared::{BStackRc, BStackWeak};
 use crate::teardown::{BStackDrop, dealloc_range};
@@ -98,13 +98,9 @@ pub fn build_control_payload(ctrl_tag: EightCC, data_start: u64, control_size: u
         tag: ctrl_tag,
     };
     payload[..layout::HEADER_SIZE as usize].copy_from_slice(bytemuck::bytes_of(&header));
-    let put = |payload: &mut [u8], off: u64, val: u64| {
-        let o = off as usize;
-        payload[o..o + 8].copy_from_slice(&val.to_le_bytes());
-    };
-    put(&mut payload, layout::CTRL_STRONG_OFFSET, 1);
-    put(&mut payload, layout::CTRL_WEAK_OFFSET, 1);
-    put(&mut payload, layout::CTRL_DATA_OFFSET, data_start);
+    put_u64!(payload, layout::CTRL_STRONG_OFFSET, 1);
+    put_u64!(payload, layout::CTRL_WEAK_OFFSET, 1);
+    put_u64!(payload, layout::CTRL_DATA_OFFSET, data_start);
     payload
 }
 
