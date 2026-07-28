@@ -616,11 +616,9 @@ fn bench_checked_slab(c: &mut Criterion) {
     );
 }
 
-criterion_group!(
-    benches,
-    bench_first_fit,
-    bench_ghost_tree,
-    bench_slab,
-    bench_checked_slab
-);
+criterion_group! {
+    name = benches;
+    config = Criterion::default().measurement_time(Duration::from_secs(60));
+    targets = bench_first_fit, bench_ghost_tree, bench_slab, bench_checked_slab
+}
 criterion_main!(benches);
