@@ -983,6 +983,48 @@ Constructor takes `data_size` (usable bytes per block; physical = `data_size + 8
 `open` runs `recover()` automatically.  Without `atomic`: `Send` only.  With
 `atomic`: `Send + Sync` (same lock-free strategy as `SlabBStackAllocator`).
 
+### Benchmarks (`alloc + atomic`)
+
+`benches/alloc.rs` measures cross-allocator throughput at several thread counts.
+It requires the `atomic` feature for `Sync` allocators. Use `-- <allocator>` to select one of the built-in allocators:
+
+> **Note:** Benchmarks are only available when building from source (e.g. after cloning this repository). They are not included in the crate published to [crates.io](https://crates.io).
+> If you have the source, consider running the benchmarks to identify the best allocator for your workload.
+> For the most accurate results, edit `benches/alloc.rs` to model your actual allocation patterns (sizes, op mix, thread count) before running.
+
+```sh
+cargo bench --bench alloc --features "alloc set atomic" -- "first_fit"
+```
+
+As a general guideline:
+- **`first_fit`** tends to be the best-performing allocator for general-purpose workloads.
+- **`slab`** (sized to match your typical allocation) gives the best throughput for slab-style usage patterns.
+- **`checked_slab`** is somewhat slower than `slab` but less prone to corruption — prefer it when safety is a priority.
+
+**Configuration** — all knobs are environment variables read once at startup:
+
+| Variable                 | Meaning                                                        | Default     |
+|--------------------------|----------------------------------------------------------------|-------------|
+| `BSTACK_BENCH_OP`        | op mix: preset name or `alloc,realloc,dealloc` weight triple   | `mixed`     |
+| `BSTACK_BENCH_SIZE`      | size distribution preset                                       | `uniform`   |
+| `BSTACK_BENCH_MAX`       | maximum allocation length drawn                                | `1024`      |
+| `BSTACK_BENCH_THREADS`   | comma-separated thread counts                                  | `1,2,4,16`  |
+| `BSTACK_BENCH_PRE_ALLOC` | live allocations pre-populated per benchmark                   | `256`       |
+| `BSTACK_BENCH_SEED`      | seed for the decision stream                                   | `48`        |
+
+Op-mix presets: `mixed`, `alloc-only`, `alloc-heavy`, `realloc-heavy`, `churn`.  
+Size presets: `uniform`, `fixed`, `gamma[:k:theta_frac]`, `bimodal[:small:p_large]`.
+
+Example — alloc-only workload, gamma-distributed sizes up to 4096 bytes, single thread for `FirstFitBStackAllocator`:
+
+```sh
+BSTACK_BENCH_OP=alloc-only \
+BSTACK_BENCH_SIZE=gamma \
+BSTACK_BENCH_MAX=4096 \
+BSTACK_BENCH_THREADS=1 \
+cargo bench --bench alloc --features "alloc set atomic" -- "first_fit"
+```
+
 ## `BStackByteVec<'a, A>` (`alloc + set` features)
 
 A growable byte (`u8`) vector backed by a `BStack` allocation, mirroring the core `Vec<u8>` API.

@@ -90,5 +90,10 @@ criterion = { version = "0.8", features = ["html_reports"] }
 name = "locked_region"
 harness = false
 
+[[bench]]
+name = "alloc"
+harness = false
+required-features = ["alloc", "set", "atomic"]
+
 [package.metadata.docs.rs]
 all-features = true
