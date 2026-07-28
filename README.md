@@ -1008,7 +1008,7 @@ As a general guideline:
 | `BSTACK_BENCH_OP`        | op mix: preset name or `alloc,realloc,dealloc` weight triple   | `mixed`     |
 | `BSTACK_BENCH_SIZE`      | size distribution preset                                       | `uniform`   |
 | `BSTACK_BENCH_MAX`       | maximum allocation length drawn                                | `1024`      |
-| `BSTACK_BENCH_THREADS`   | comma-separated thread counts                                  | `1,4,8`     |
+| `BSTACK_BENCH_THREADS`   | comma-separated thread counts                                  | `1,2,4,16`  |
 | `BSTACK_BENCH_PRE_ALLOC` | live allocations pre-populated per benchmark                   | `256`       |
 | `BSTACK_BENCH_SEED`      | seed for the decision stream                                   | `48`        |
 

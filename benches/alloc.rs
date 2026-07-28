@@ -32,7 +32,7 @@
 //! | `BSTACK_BENCH_OP`         | op mix: preset name, or a `alloc,realloc,dealloc` weight triple | `mixed` |
 //! | `BSTACK_BENCH_SIZE`       | size distribution (see [`SizeDist`])               | `uniform`      |
 //! | `BSTACK_BENCH_MAX`        | maximum allocation length drawn                    | `1024`         |
-//! | `BSTACK_BENCH_THREADS`    | comma-separated thread counts                      | `1,4,8`        |
+//! | `BSTACK_BENCH_THREADS`    | comma-separated thread counts                      | `1,2,4,16`     |
 //! | `BSTACK_BENCH_PRE_ALLOC`  | live allocations pre-populated per benchmark       | `256`          |
 //! | `BSTACK_BENCH_SEED`       | seed for the decision stream                       | `48`           |
 //!
@@ -59,7 +59,7 @@ use std::time::{Duration, Instant};
 // --- defaults (overridable via the environment) -----------------------------
 
 const DEFAULT_PRE_ALLOC: usize = 256;
-const DEFAULT_THREADS: &[usize] = &[1, 4, 8];
+const DEFAULT_THREADS: &[usize] = &[1, 2, 4, 16];
 const DEFAULT_SEED: u64 = 48;
 const DEFAULT_MAX_SIZE: u64 = 1024;
 
@@ -598,17 +598,55 @@ fn bench_ghost_tree(c: &mut Criterion) {
     );
 }
 
-fn bench_slab(c: &mut Criterion) {
+fn bench_slab_16(c: &mut Criterion) {
     register!(c, "alloc/slab_16", make_allocator!(SlabBStackAllocator, 16));
+}
+
+fn bench_slab_24(c: &mut Criterion) {
+    register!(c, "alloc/slab_24", make_allocator!(SlabBStackAllocator, 24));
+}
+
+fn bench_slab_32(c: &mut Criterion) {
+    register!(c, "alloc/slab_32", make_allocator!(SlabBStackAllocator, 32));
+}
+
+fn bench_slab_64(c: &mut Criterion) {
     register!(c, "alloc/slab_64", make_allocator!(SlabBStackAllocator, 64));
 }
 
-fn bench_checked_slab(c: &mut Criterion) {
+fn bench_slab_128(c: &mut Criterion) {
+    register!(
+        c,
+        "alloc/slab_128",
+        make_allocator!(SlabBStackAllocator, 128)
+    );
+}
+
+fn bench_checked_slab_16(c: &mut Criterion) {
     register!(
         c,
         "alloc/checked_slab_16",
         make_allocator!(CheckedSlabBStackAllocator, 16)
     );
+}
+
+fn bench_checked_slab_24(c: &mut Criterion) {
+    register!(
+        c,
+        "alloc/checked_slab_24",
+        make_allocator!(CheckedSlabBStackAllocator, 24)
+    );
+}
+
+fn bench_checked_slab_32(c: &mut Criterion) {
+    register!(
+        c,
+        "alloc/checked_slab_32",
+        make_allocator!(CheckedSlabBStackAllocator, 32)
+    );
+}
+
+fn bench_checked_slab_64(c: &mut Criterion) {
     register!(
         c,
         "alloc/checked_slab_64",
@@ -616,9 +654,29 @@ fn bench_checked_slab(c: &mut Criterion) {
     );
 }
 
+fn bench_checked_slab_128(c: &mut Criterion) {
+    register!(
+        c,
+        "alloc/checked_slab_128",
+        make_allocator!(CheckedSlabBStackAllocator, 128)
+    );
+}
+
 criterion_group! {
     name = benches;
     config = Criterion::default().measurement_time(Duration::from_secs(60));
-    targets = bench_first_fit, bench_ghost_tree, bench_slab, bench_checked_slab
+    targets =
+        bench_first_fit,
+        bench_ghost_tree,
+        bench_slab_16,
+        bench_slab_24,
+        bench_slab_32,
+        bench_slab_64,
+        bench_slab_128,
+        bench_checked_slab_16,
+        bench_checked_slab_24,
+        bench_checked_slab_32,
+        bench_checked_slab_64,
+        bench_checked_slab_128
 }
 criterion_main!(benches);
