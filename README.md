@@ -997,7 +997,7 @@ cargo bench --bench alloc --features "alloc set atomic" -- "first_fit"
 ```
 
 As a general guideline (based on `benches/alloc.rs` mixed-workload results):
-- **`ghost_tree`** is the best default: fastest overall and its latency stays flat from 1 to 16 threads, making it the safest choice under unknown or high contention.
+- **`ghost_tree`** is the best default: fastest overall and its latency stays flat from 1 to 16 threads, making it the safest choice under unknown or high contention. However, long term use of `ghost_tree` may lead to fragmentation and wasted space since it does not support coalescing. If fragmentation is a concern, consider using `first_fit` or `checked_slab` instead.
 - **`checked_slab`** (sized to match your typical allocation) is usually faster than plain `slab` at the same block size, in addition to catching double-frees and supporting crash recovery — prefer it over `slab` in most cases, especially at smaller block sizes.
 - **`slab`** can still win for single-threaded, fixed-size workloads at some block sizes (e.g. `slab_32`), but is inconsistent across sizes and degrades at others (e.g. `slab_64`) — benchmark your specific `block_size` before choosing it over `checked_slab`.
 
