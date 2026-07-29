@@ -148,3 +148,21 @@ Give the C `realloc`/`dealloc` a survivor signal mirroring Rust's `handle`. Two 
 - **Return code vs out-parameter vs result struct.** The `-2` return code is the least intrusive but relies on a magic value and on `*out` being read on failure; an explicit `int *survived` or a by-value `bstack_alloc_result_t { bstack_slice_t handle; int survived; }` (closer to Rust's `BStackAllocError`) trade ABI compatibility for clarity. Whether the extra explicitness is worth the break.
 - **Vtable impact.** The out-parameter/result-struct variants change the vtable function-pointer signatures, so every built-in and third-party C allocator must update. The `-2` return-code variant leaves the signatures untouched — each allocator only refines its own failure-return logic — which is the main reason to prefer it.
 - **Bulk `dealloc`.** The analogue of `BStackBulkAllocError.handles` — reporting *which* handles survived a partial bulk free — needs its own out-array shape regardless of which single-handle variant is chosen.
+
+## GhostTree allocator: multithreaded performance improvement
+
+**Feature flag:** `alloc` (optionally `atomic` for the `Sync` path)
+**Breaking change:** No — internal implementation only.
+
+### Motivation
+
+`benches/alloc.rs` result shows `GhostTreeBstackAllocator` is already the fastest general-purpose allocator in the suite, but its scaling under concurrency has received less attention than its single-threaded design: throughput rises from 1t to 4t and then flattens through 16t. This is consistent with `GhostTreeBstackAllocator::lock` — the single mutex serializing all non-tail `alloc`/`dealloc`/`realloc` — capping throughput once contention saturates it. As the crate's best-performing allocator, it is also the one most likely to be used under concurrent load, so its scaling behavior warrants continued performance work, independent of any specific defect.
+
+The mutex's scope and implementation are not in question here (see the `NOT PLANNED` entry on `FirstFitBStackAllocator`'s mutex), and no tree-sharding or other data-structure redesign is intended — that would be a different allocator. The improvement surface is reducing the amount of work done per operation while the mutex is held. Two examples found by code inspection, illustrative rather than exhaustive:
+
+- `avl_insert`, `avl_find_best_fit_and_remove`, and `avl_remove_min` each allocate a `Vec::with_capacity(MAX_AVL_DEPTH)` path buffer under the mutex on every call, despite `MAX_AVL_DEPTH` being a fixed compile-time bound that a stack array could cover instead.
+- In the up-pass of `avl_insert` and `avl_find_best_fit_and_remove`, `avl_write_and_update` calls `avl_height` on a child subtree whose height was already computed and written in the previous loop iteration, issuing an avoidable `BStack::get_into` (lock + syscall) to re-fetch it.
+
+### Open questions
+
+- **Validation.** Whether `mixed/uniform` workload is sufficient to measure improvement, or whether a contention-specific microbenchmark (concurrent non-tail alloc/dealloc only) is needed to isolate the critical-section-size effect.
