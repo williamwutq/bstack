@@ -996,10 +996,10 @@ It requires the `atomic` feature for `Sync` allocators. Use `-- <allocator>` to 
 cargo bench --bench alloc --features "alloc set atomic" -- "first_fit"
 ```
 
-As a general guideline:
-- **`first_fit`** tends to be the best-performing allocator for general-purpose workloads.
-- **`slab`** (sized to match your typical allocation) gives the best throughput for slab-style usage patterns.
-- **`checked_slab`** is somewhat slower than `slab` but less prone to corruption — prefer it when safety is a priority.
+As a general guideline (based on `benches/alloc.rs` mixed-workload results):
+- **`ghost_tree`** is the best default: fastest overall and its latency stays flat from 1 to 16 threads, making it the safest choice under unknown or high contention.
+- **`checked_slab`** (sized to match your typical allocation) is usually faster than plain `slab` at the same block size, in addition to catching double-frees and supporting crash recovery — prefer it over `slab` in most cases, especially at smaller block sizes.
+- **`slab`** can still win for single-threaded, fixed-size workloads at some block sizes (e.g. `slab_32`), but is inconsistent across sizes and degrades at others (e.g. `slab_64`) — benchmark your specific `block_size` before choosing it over `checked_slab`.
 
 **Configuration** — all knobs are environment variables read once at startup:
 
