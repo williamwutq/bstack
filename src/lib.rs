@@ -720,6 +720,55 @@ pub(crate) fn check_offset_unlocked(
     Ok(())
 }
 
+/// Validate a batch of sparse-extend writes against a declared extension of
+/// `length` bytes.
+///
+/// `blocks` holds `(relative_offset, data)` pairs (already stripped of empty
+/// `data`), where each relative offset is measured from the current tail. Every
+/// block must fit within the freshly grown region `[0, length)` — a block whose
+/// range `[off, off + data.len())` runs past `length` (or overflows `u64`) is
+/// rejected — and blocks must be pairwise non-overlapping. On success `blocks` is
+/// left sorted by relative offset. `op` names the operation for error messages.
+///
+/// Shared by `extend_sparse_batched` and `try_extend_sparse_batched`. Kept
+/// feature-agnostic (no dependency on the `set`/`atomic`-gated `checked_end`) so
+/// the base-API batched form compiles with no features enabled.
+fn validate_sparse_blocks(
+    blocks: &mut [(u64, &[u8])],
+    length: u64,
+    op: &str,
+) -> io::Result<()> {
+    for (off, data) in blocks.iter() {
+        let end = off.checked_add(data.len() as u64).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{op}: relative offset ({off}) + len ({}) overflows u64", data.len()),
+            )
+        })?;
+        if end > length {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{op}: write range [{off}, {end}) exceeds declared length ({length})"),
+            ));
+        }
+    }
+    // Reject overlap: sort by offset, then check each block ends at or before the
+    // next one begins (mirrors `set_batched`).
+    blocks.sort_by_key(|(off, _)| *off);
+    for pair in blocks.windows(2) {
+        let (a_off, a_data) = pair[0];
+        let (b_off, _) = pair[1];
+        let a_end = a_off + a_data.len() as u64;
+        if a_end > b_off {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{op}: write range [{a_off}, {a_end}) overlaps [{b_off}, ...)"),
+            ));
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 
 /// A persistent, fsync-durable binary stack backed by a single file.
@@ -1051,6 +1100,136 @@ impl BStack {
 
         let new_len = logical_offset + n;
         commit_grow(file, clen, new_len, logical_offset, file_end)?;
+        Ok(logical_offset)
+    }
+
+    /// Sparsely grow the payload by `length` bytes, writing `buf` at the start of
+    /// the freshly grown region and leaving the remaining `length - buf.len()`
+    /// bytes zero.
+    ///
+    /// Returns the **logical** byte offset at which the growth begins — i.e. the
+    /// payload size immediately before the call, the anchor `buf` is written at.
+    ///
+    /// This is a more efficient alternative to [`push`](Self::push) followed by
+    /// [`extend`](Self::extend) (or a `push` of a large mostly-zero buffer) when
+    /// you need a large zero-filled region with only a small prefix of real data:
+    /// the whole `length` is realised with a single `set_len`, so the tail past
+    /// `buf` costs no write I/O (it reads back as zero from the sparse file), and
+    /// only `buf` and the header commit are written and synced.
+    ///
+    /// `length = 0` is valid only when `buf` is empty; it writes nothing and
+    /// returns the current end offset. An empty `buf` with `length > 0` is
+    /// equivalent to [`extend(length)`](Self::extend).
+    ///
+    /// # Atomicity
+    ///
+    /// Either the file is grown, `buf` written, the header committed-length
+    /// updated, and the whole thing durably synced, or the file is left unchanged
+    /// (best-effort rollback via `ftruncate` + header reset). No journal is
+    /// needed: the entire grown region sits beyond the committed length, so a
+    /// crash before the header commit rolls back by truncation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] if `buf.len()` exceeds `length`, or
+    /// if the current payload size plus `length` overflows `u64`. Also propagates
+    /// any I/O error from `set_len`, `write_all`, or `durable_sync`.
+    pub fn extend_sparse(&self, buf: impl AsRef<[u8]>, length: u64) -> io::Result<u64> {
+        let buf = buf.as_ref();
+        if buf.len() as u64 > length {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "extend_sparse: buffer length ({}) exceeds extension length ({length})",
+                    buf.len()
+                ),
+            ));
+        }
+        let mut guard = self.lock.write().unwrap();
+        let (file, clen) = &mut *guard;
+        let file_end = file.seek(SeekFrom::End(0))?;
+        let logical_offset = file_end - HEADER_SIZE;
+
+        if length == 0 {
+            return Ok(logical_offset);
+        }
+        let new_len = logical_offset.checked_add(length).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "extend_sparse: payload size + length overflows u64",
+            )
+        })?;
+        fault_point!(self, "extend_sparse");
+        let one = [(0u64, buf)];
+        let blocks: &[(u64, &[u8])] = if buf.is_empty() { &[] } else { &one };
+        commit_sparse_extend(file, clen, logical_offset, file_end, new_len, blocks)?;
+        Ok(logical_offset)
+    }
+
+    /// Sparsely grow the payload by `length` bytes, scattering several buffers
+    /// into the freshly grown region and leaving the gaps between them zero.
+    ///
+    /// `writes` is any iterator of `(relative_offset, data)` pairs, where each
+    /// relative offset is measured from the current tail (the returned offset).
+    /// Each `data` is written at logical offset `tail + relative_offset`; the
+    /// bytes not covered by any buffer read back as zero. Returns the **logical**
+    /// byte offset at which the growth begins (the current payload size, the
+    /// anchor every relative offset is measured from).
+    ///
+    /// Like [`extend_sparse`](Self::extend_sparse), the whole `length` is realised
+    /// with a single `set_len`, so the zero gaps cost no write I/O and only the
+    /// buffers and the header commit are written and synced. Empty `data` slices
+    /// are ignored.
+    ///
+    /// The writes must be **pairwise non-overlapping** and each must fit within
+    /// the grown region `[0, length)`; violations are rejected as invalid input.
+    /// `length = 0` is valid only when every buffer is empty.
+    ///
+    /// # Atomicity
+    ///
+    /// Either every buffer lands, the header committed-length is updated, and the
+    /// whole thing is durably synced, or the file is left unchanged (best-effort
+    /// rollback via `ftruncate` + header reset). No journal is needed: the entire
+    /// grown region sits beyond the committed length.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] if any `relative_offset +
+    /// data.len()` overflows `u64` or exceeds `length`, if two writes overlap, or
+    /// if the current payload size plus `length` overflows `u64`. Also propagates
+    /// any I/O error from `set_len`, `write_all`, or `durable_sync`.
+    pub fn extend_sparse_batched<I, D>(&self, writes: I, length: u64) -> io::Result<u64>
+    where
+        I: IntoIterator<Item = (u64, D)>,
+        D: AsRef<[u8]>,
+    {
+        // Materialise the inputs so their `AsRef` slices can be borrowed while we
+        // validate and stage; drop empty writes (they touch nothing).
+        let owned: Vec<(u64, D)> = writes.into_iter().collect();
+        let mut blocks: Vec<(u64, &[u8])> = owned
+            .iter()
+            .map(|(off, d)| (*off, d.as_ref()))
+            .filter(|(_, d)| !d.is_empty())
+            .collect();
+        validate_sparse_blocks(&mut blocks, length, "extend_sparse_batched")?;
+
+        let mut guard = self.lock.write().unwrap();
+        let (file, clen) = &mut *guard;
+        let file_end = file.seek(SeekFrom::End(0))?;
+        let logical_offset = file_end - HEADER_SIZE;
+
+        if length == 0 {
+            // Every block was validated to fit within `[0, 0)`, so `blocks` is empty.
+            return Ok(logical_offset);
+        }
+        let new_len = logical_offset.checked_add(length).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "extend_sparse_batched: payload size + length overflows u64",
+            )
+        })?;
+        fault_point!(self, "extend_sparse_batched");
+        commit_sparse_extend(file, clen, logical_offset, file_end, new_len, &blocks)?;
         Ok(logical_offset)
     }
 
@@ -1872,6 +2051,130 @@ impl BStack {
         fault_point!(self, "try_extend_zeros");
         file.set_len(HEADER_SIZE + new_len)?;
         commit_grow(file, clen, new_len, data_size, file_end)?;
+        Ok(true)
+    }
+
+    /// Sparsely grow the payload by `length` bytes with `buf` at the start, only
+    /// if the current logical payload size equals `s`.
+    ///
+    /// The size-guarded counterpart of [`extend_sparse`](Self::extend_sparse).
+    /// Returns `Ok(true)` if the size matched and the growth was applied (or
+    /// `length = 0` and no I/O was needed); returns `Ok(false)` without modifying
+    /// the file if the size does not match. See [`extend_sparse`](Self::extend_sparse)
+    /// for the sparse-write semantics and efficiency rationale.
+    ///
+    /// A malformed request (`buf.len()` exceeding `length`) is rejected with an
+    /// error regardless of whether the size matches, so it always surfaces rather
+    /// than being masked by a size mismatch.
+    ///
+    /// # Feature flag
+    ///
+    /// Only available when the `atomic` Cargo feature is enabled.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] if `buf.len()` exceeds `length`, or
+    /// if the current payload size plus `length` overflows `u64`. Propagates any
+    /// I/O error from `set_len`, `write_all`, or `durable_sync`.
+    #[cfg(feature = "atomic")]
+    pub fn try_extend_sparse(
+        &self,
+        s: u64,
+        buf: impl AsRef<[u8]>,
+        length: u64,
+    ) -> io::Result<bool> {
+        let buf = buf.as_ref();
+        if buf.len() as u64 > length {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "try_extend_sparse: buffer length ({}) exceeds extension length ({length})",
+                    buf.len()
+                ),
+            ));
+        }
+        let mut guard = self.lock.write().unwrap();
+        let (file, clen) = &mut *guard;
+        let file_end = file.seek(SeekFrom::End(0))?;
+        let data_size = file_end - HEADER_SIZE;
+        if data_size != s {
+            return Ok(false);
+        }
+        if length == 0 {
+            return Ok(true);
+        }
+        let new_len = checked_end(
+            data_size,
+            length,
+            "try_extend_sparse: data_size + length overflows u64",
+        )?;
+        fault_point!(self, "try_extend_sparse");
+        let one = [(0u64, buf)];
+        let blocks: &[(u64, &[u8])] = if buf.is_empty() { &[] } else { &one };
+        commit_sparse_extend(file, clen, data_size, file_end, new_len, blocks)?;
+        Ok(true)
+    }
+
+    /// Sparsely grow the payload by `length` bytes, scattering several buffers
+    /// into the grown region, only if the current logical payload size equals `s`.
+    ///
+    /// The size-guarded counterpart of
+    /// [`extend_sparse_batched`](Self::extend_sparse_batched). Returns `Ok(true)`
+    /// if the size matched and the growth was applied (or `length = 0` and no I/O
+    /// was needed); returns `Ok(false)` without modifying the file if the size
+    /// does not match. See [`extend_sparse_batched`](Self::extend_sparse_batched)
+    /// for the scatter semantics.
+    ///
+    /// A malformed batch (overlapping writes, or a write past `length`) is
+    /// rejected with an error regardless of whether the size matches, so it always
+    /// surfaces rather than being masked by a size mismatch.
+    ///
+    /// # Feature flag
+    ///
+    /// Only available when the `atomic` Cargo feature is enabled.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] if any `relative_offset +
+    /// data.len()` overflows `u64` or exceeds `length`, if two writes overlap, or
+    /// if the current payload size plus `length` overflows `u64`. Propagates any
+    /// I/O error from `set_len`, `write_all`, or `durable_sync`.
+    #[cfg(feature = "atomic")]
+    pub fn try_extend_sparse_batched<I, D>(
+        &self,
+        s: u64,
+        writes: I,
+        length: u64,
+    ) -> io::Result<bool>
+    where
+        I: IntoIterator<Item = (u64, D)>,
+        D: AsRef<[u8]>,
+    {
+        let owned: Vec<(u64, D)> = writes.into_iter().collect();
+        let mut blocks: Vec<(u64, &[u8])> = owned
+            .iter()
+            .map(|(off, d)| (*off, d.as_ref()))
+            .filter(|(_, d)| !d.is_empty())
+            .collect();
+        validate_sparse_blocks(&mut blocks, length, "try_extend_sparse_batched")?;
+
+        let mut guard = self.lock.write().unwrap();
+        let (file, clen) = &mut *guard;
+        let file_end = file.seek(SeekFrom::End(0))?;
+        let data_size = file_end - HEADER_SIZE;
+        if data_size != s {
+            return Ok(false);
+        }
+        if length == 0 {
+            return Ok(true);
+        }
+        let new_len = checked_end(
+            data_size,
+            length,
+            "try_extend_sparse_batched: data_size + length overflows u64",
+        )?;
+        fault_point!(self, "try_extend_sparse_batched");
+        commit_sparse_extend(file, clen, data_size, file_end, new_len, &blocks)?;
         Ok(true)
     }
 
