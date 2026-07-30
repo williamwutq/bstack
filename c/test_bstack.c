@@ -1657,6 +1657,148 @@ static int test_extend_persists_across_reopen(void)
     return 0;
 }
 
+/* =========================================================================
+ * bstack_extend_sparse / bstack_extend_sparse_batched
+ * ====================================================================== */
+
+static int test_extend_sparse_writes_prefix_and_zeros_rest(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"abc", 3, NULL) == 0);
+    uint64_t off;
+    CHECK(bstack_extend_sparse(bs, (uint8_t *)"XY", 2, 6, &off) == 0);
+    CHECK(off == 3);
+
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 9);
+    uint8_t buf[9]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(w == 9);
+    CHECK(memcmp(buf, "abcXY\x00\x00\x00\x00", 9) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_extend_sparse_empty_buf_is_pure_extend(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"ab", 2, NULL) == 0);
+    uint64_t off;
+    CHECK(bstack_extend_sparse(bs, NULL, 0, 4, &off) == 0);
+    CHECK(off == 2);
+
+    uint8_t buf[6]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(memcmp(buf, "ab\x00\x00\x00\x00", 6) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_extend_sparse_buf_longer_than_length_errors(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    errno = 0;
+    CHECK(bstack_extend_sparse(bs, (uint8_t *)"toolong", 7, 3, NULL) == -1);
+    CHECK(errno == EINVAL);
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_extend_sparse_batched_scatters_buffers(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"..", 2, NULL) == 0);
+    bstack_iovec_t writes[2] = {
+        { 0, (uint8_t *)"AA", 2 },
+        { 5, (uint8_t *)"BB", 2 },
+    };
+    uint64_t off;
+    CHECK(bstack_extend_sparse_batched(bs, writes, 2, 8, &off) == 0);
+    CHECK(off == 2);
+
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 10);
+    uint8_t buf[10]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(memcmp(buf, "..AA\x00\x00\x00" "BB" "\x00", 10) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_extend_sparse_batched_overlap_errors(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    bstack_iovec_t writes[2] = {
+        { 0, (uint8_t *)"aaa", 3 },
+        { 2, (uint8_t *)"bb", 2 },
+    };
+    errno = 0;
+    CHECK(bstack_extend_sparse_batched(bs, writes, 2, 8, NULL) == -1);
+    CHECK(errno == EINVAL);
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_extend_sparse_batched_out_of_range_errors(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    bstack_iovec_t writes[1] = { { 3, (uint8_t *)"zzz", 3 } };
+    errno = 0;
+    CHECK(bstack_extend_sparse_batched(bs, writes, 1, 5, NULL) == -1);
+    CHECK(errno == EINVAL);
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_extend_sparse_persists_across_reopen(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+
+    {
+        bstack_t *bs = bstack_open(tmp);
+        CHECK(bs != NULL);
+        CHECK(bstack_push(bs, (uint8_t *)"hi", 2, NULL) == 0);
+        CHECK(bstack_extend_sparse(bs, (uint8_t *)"Z", 1, 4, NULL) == 0);
+        bstack_close(bs);
+    }
+    {
+        bstack_t *bs = bstack_open(tmp);
+        CHECK(bs != NULL);
+        uint8_t buf[6]; size_t w;
+        CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+        CHECK(memcmp(buf, "hiZ\x00\x00\x00", 6) == 0);
+        bstack_close(bs);
+    }
+
+    unlink(tmp);
+    return 0;
+}
+
 #ifdef BSTACK_FEATURE_SET
 
 /* =========================================================================
@@ -2173,6 +2315,99 @@ static int test_try_extend_persists_across_reopen(void)
     }
 
     unlink(tmp);
+    return 0;
+}
+
+/* ---- bstack_try_extend_sparse --------------------------------------------- */
+
+static int test_try_extend_sparse_matching_writes(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"hello", 5, NULL) == 0);
+    int ok = -1;
+    CHECK(bstack_try_extend_sparse(bs, 5, (uint8_t *)"XY", 2, 6, &ok) == 0);
+    CHECK(ok == 1);
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 11);
+    uint8_t buf[11]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(memcmp(buf, "helloXY\x00\x00\x00\x00", 11) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_try_extend_sparse_mismatching_returns_false(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"hello", 5, NULL) == 0);
+    int ok = -1;
+    CHECK(bstack_try_extend_sparse(bs, 3, (uint8_t *)"XY", 2, 6, &ok) == 0);
+    CHECK(ok == 0);
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 5);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_try_extend_sparse_malformed_errors_even_on_mismatch(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"hello", 5, NULL) == 0);
+    /* Size does not match (3 != 5), but the malformed request still errors. */
+    errno = 0;
+    CHECK(bstack_try_extend_sparse(bs, 3, (uint8_t *)"toolong", 7, 2, NULL) == -1);
+    CHECK(errno == EINVAL);
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 5);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_try_extend_sparse_batched_matching_scatters(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"..", 2, NULL) == 0);
+    bstack_iovec_t writes[2] = {
+        { 0, (uint8_t *)"AA", 2 },
+        { 5, (uint8_t *)"BB", 2 },
+    };
+    int ok = -1;
+    CHECK(bstack_try_extend_sparse_batched(bs, 2, writes, 2, 8, &ok) == 0);
+    CHECK(ok == 1);
+    uint8_t buf[10]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(memcmp(buf, "..AA\x00\x00\x00" "BB" "\x00", 10) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_try_extend_sparse_batched_mismatching_returns_false(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"..", 2, NULL) == 0);
+    bstack_iovec_t writes[1] = { { 0, (uint8_t *)"AA", 2 } };
+    int ok = -1;
+    CHECK(bstack_try_extend_sparse_batched(bs, 99, writes, 1, 8, &ok) == 0);
+    CHECK(ok == 0);
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 2);
+
+    bstack_close(bs); unlink(tmp);
     return 0;
 }
 
@@ -3943,6 +4178,81 @@ static int test_process_gen_splice_null_removed_acts_like_atrunc(void)
     return 0;
 }
 
+/* --- process_gen: BSTACK_GEN_SPARSE ------------------------------------ */
+
+static const bstack_iovec_t pg_sparse_writes[2] = {
+    { 0, (uint8_t *)"AA", 2 },
+    { 5, (uint8_t *)"BB", 2 },
+};
+
+static int pg_sparse_gen(bstack_gen_op_t *out_op, void *userctx)
+{
+    int *calls = userctx;
+    (*calls)++;
+    if (*calls == 1) {
+        out_op->kind            = BSTACK_GEN_SPARSE;
+        out_op->u.sparse.writes = pg_sparse_writes;
+        out_op->u.sparse.count  = 2;
+        out_op->u.sparse.length = 8;
+    } else {
+        out_op->kind           = BSTACK_GEN_WRITE;
+        out_op->u.write.offset = 0;
+        out_op->u.write.data   = (const uint8_t *)"NOPE";
+        out_op->u.write.len    = 4;
+    }
+    return 1;
+}
+
+static int test_process_gen_sparse_scatters_and_ends_sequence(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    CHECK(bstack_push(bs, (uint8_t *)"..", 2, NULL) == 0);
+
+    int calls = 0;
+    CHECK(bstack_process_gen(bs, pg_sparse_gen, &calls) == 0);
+    CHECK(calls == 1); /* Sparse ends the sequence */
+
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 10);
+    uint8_t buf[10]; CHECK(bstack_peek(bs, 0, buf, NULL) == 0);
+    CHECK(memcmp(buf, "..AA\x00\x00\x00" "BB" "\x00", 10) == 0);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static const bstack_iovec_t pg_sparse_overlap_writes[2] = {
+    { 0, (uint8_t *)"aaa", 3 },
+    { 2, (uint8_t *)"bb", 2 },
+};
+
+static int pg_sparse_overlap_gen(bstack_gen_op_t *out_op, void *userctx)
+{
+    (void)userctx;
+    out_op->kind            = BSTACK_GEN_SPARSE;
+    out_op->u.sparse.writes = pg_sparse_overlap_writes;
+    out_op->u.sparse.count  = 2;
+    out_op->u.sparse.length = 8;
+    return 1;
+}
+
+static int test_process_gen_sparse_overlap_returns_error(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    CHECK(bstack_push(bs, (uint8_t *)"hi", 2, NULL) == 0);
+
+    errno = 0;
+    CHECK(bstack_process_gen(bs, pg_sparse_overlap_gen, NULL) == -1);
+    CHECK(errno == EINVAL);
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 2);
+    uint8_t buf[2]; CHECK(bstack_peek(bs, 0, buf, NULL) == 0);
+    CHECK(memcmp(buf, "hi", 2) == 0);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
 /* -------------------------------------------------------------------------
  * set_batched / inplace_gen  (multi-write journal)
  * ---------------------------------------------------------------------- */
@@ -4330,7 +4640,15 @@ static int test_inplace_gen_read_spans_multiple_edits_and_gaps(void)
     return 0;
 }
 
-struct ig_reject_ctx { int step; uint8_t *data; };
+struct ig_reject_ctx {
+    int step;
+    uint8_t *data;
+    const int *prev;   /* points at the caller's prev_status variable */
+    int push_prev;     /* prev_status captured after the PUSH op */
+    int sparse_prev;   /* prev_status captured after the SPARSE op */
+};
+
+static const bstack_iovec_t ig_reject_sparse_writes[1] = { { 0, (uint8_t *)"Z", 1 } };
 
 static int ig_reject_size_ops_gen(bstack_gen_op_t *out_op, void *userctx)
 {
@@ -4345,7 +4663,15 @@ static int ig_reject_size_ops_gen(bstack_gen_op_t *out_op, void *userctx)
         out_op->u.push.data = (const uint8_t *)"!!!";
         out_op->u.push.len  = 3;
         return 1;
+    case 2:
+        c->push_prev = *c->prev;   /* feedback for the rejected PUSH */
+        out_op->kind = BSTACK_GEN_SPARSE;
+        out_op->u.sparse.writes = ig_reject_sparse_writes;
+        out_op->u.sparse.count  = 1;
+        out_op->u.sparse.length = 4;
+        return 1;
     default:
+        c->sparse_prev = *c->prev; /* feedback for the rejected SPARSE */
         return 0;
     }
 }
@@ -4358,12 +4684,15 @@ static int test_inplace_gen_rejects_size_ops_but_still_commits(void)
     CHECK(bstack_push(bs, (uint8_t *)"helloworld", 10, NULL) == 0);
 
     uint8_t data[5]; memcpy(data, "HELLO", 5);
-    struct ig_reject_ctx c;
-    c.step = 0; c.data = data;
     int prev = 0;
+    struct ig_reject_ctx c;
+    c.step = 0; c.data = data; c.prev = &prev;
+    c.push_prev = 0; c.sparse_prev = 0;
     CHECK(bstack_inplace_gen(bs, ig_reject_size_ops_gen, &c, &prev) == 0);
-    /* After the PUSH was rejected, the next call sees prev == EINVAL. */
-    CHECK(prev == EINVAL);
+    /* Both size-changing ops were rejected as they were yielded. */
+    CHECK(c.push_prev == EINVAL);
+    CHECK(c.sparse_prev == EINVAL);
+    /* Only the valid in-place WRITE committed; the size is unchanged. */
     uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 10);
     uint8_t buf[10]; CHECK(bstack_peek(bs, 0, buf, NULL) == 0);
     CHECK(memcmp(buf, "HELLOworld", 10) == 0);
@@ -5069,6 +5398,15 @@ int main(void)
     T(test_extend_zero_is_noop);
     T(test_extend_persists_across_reopen);
 
+    /* bstack_extend_sparse / bstack_extend_sparse_batched */
+    T(test_extend_sparse_writes_prefix_and_zeros_rest);
+    T(test_extend_sparse_empty_buf_is_pure_extend);
+    T(test_extend_sparse_buf_longer_than_length_errors);
+    T(test_extend_sparse_batched_scatters_buffers);
+    T(test_extend_sparse_batched_overlap_errors);
+    T(test_extend_sparse_batched_out_of_range_errors);
+    T(test_extend_sparse_persists_across_reopen);
+
     /* bstack_lock_up_to / bstack_locked_len / bstack_open_locked_up_to */
     T(test_locked_len_is_zero_by_default);
     T(test_lock_up_to_sets_boundary);
@@ -5151,6 +5489,13 @@ int main(void)
     T(test_try_extend_mismatching_returns_false);
     T(test_try_extend_empty_buf_matching);
     T(test_try_extend_persists_across_reopen);
+
+    /* bstack_try_extend_sparse / bstack_try_extend_sparse_batched */
+    T(test_try_extend_sparse_matching_writes);
+    T(test_try_extend_sparse_mismatching_returns_false);
+    T(test_try_extend_sparse_malformed_errors_even_on_mismatch);
+    T(test_try_extend_sparse_batched_matching_scatters);
+    T(test_try_extend_sparse_batched_mismatching_returns_false);
 
     /* bstack_try_discard */
     T(test_try_discard_matching_returns_true);
@@ -5236,6 +5581,8 @@ int main(void)
     T(test_process_gen_len_informs_pop_size);
     T(test_process_gen_splice_replaces_tail_and_ends_sequence);
     T(test_process_gen_splice_null_removed_acts_like_atrunc);
+    T(test_process_gen_sparse_scatters_and_ends_sequence);
+    T(test_process_gen_sparse_overlap_returns_error);
 
     /* bstack_set_batched / bstack_inplace_gen — multi-write journal */
     T(test_set_batched_commits_all_writes_and_reopens_clean);
