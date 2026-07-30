@@ -119,6 +119,7 @@
 //! |-----------|-----------------|
 //! | `push` | `lseek(END)` → `write(data)` → `lseek(8)` → `write(clen)` → `durable_sync` |
 //! | `extend` | `lseek(END)` → `set_len(new_end)` → `lseek(8)` → `write(clen)` → `durable_sync` |
+//! | `extend_sparse`, `extend_sparse_batched` | `set_len(new_end)` → `write` each buffer into the grown region (gaps left zero) → `lseek(8)` → `write(clen)` → `durable_sync` |
 //! | `pop`, `pop_into` | `lseek` → `read` → `ftruncate` → `lseek(8)` → `write(clen)` → `durable_sync` |
 //! | `discard` | `ftruncate` → `lseek(8)` → `write(clen)` → `durable_sync` |
 //! | `set` *(feature)* | *commit* `data` |
@@ -128,6 +129,7 @@
 //! | `try_extend` *(feature: atomic)* | `lseek(END)` — conditional `push` sequence if size matches |
 //! | `try_discard` *(feature: atomic)* | `lseek(END)` — conditional `discard` sequence if size matches |
 //! | `try_extend_zeros` *(feature: atomic)* | `lseek(END)` — conditional `extend(n)` sequence if size matches |
+//! | `try_extend_sparse`, `try_extend_sparse_batched` *(feature: atomic)* | `lseek(END)` — conditional `extend_sparse` / `extend_sparse_batched` sequence if size matches |
 //! | `swap`, `swap_into` *(features: set+atomic)* | `read` old bytes → *commit* `buf` |
 //! | `cas` *(features: set+atomic)* | `read` → compare — conditional *commit* of `new` |
 //! | `process` *(features: set+atomic)* | `read(start..end)` → *(callback)* → *commit* the buffer |
@@ -197,9 +199,9 @@
 //!
 //! | Operation | Lock (Unix / Windows) | Lock (other) |
 //! |-----------|-----------------------|--------------|
-//! | `push`, `extend`, `pop`, `pop_into`, `discard` | write | write |
+//! | `push`, `extend`, `extend_sparse`, `extend_sparse_batched`, `pop`, `pop_into`, `discard` | write | write |
 //! | `set`, `zero`, `repeat` *(feature)* | write | write |
-//! | `atrunc`, `splice`, `splice_into`, `try_extend`, `try_extend_zeros` *(feature: atomic)* | write | write |
+//! | `atrunc`, `splice`, `splice_into`, `try_extend`, `try_extend_zeros`, `try_extend_sparse`, `try_extend_sparse_batched` *(feature: atomic)* | write | write |
 //! | `try_discard(s, n > 0)` *(feature: atomic)* | write | write |
 //! | `try_discard(s, 0)` *(feature: atomic)* | **read** | **read** |
 //! | `get_batched`, `get_batched_into`, `get_batched_gen` *(feature: atomic)* | **read** | write |
@@ -733,16 +735,15 @@ pub(crate) fn check_offset_unlocked(
 /// Shared by `extend_sparse_batched` and `try_extend_sparse_batched`. Kept
 /// feature-agnostic (no dependency on the `set`/`atomic`-gated `checked_end`) so
 /// the base-API batched form compiles with no features enabled.
-fn validate_sparse_blocks(
-    blocks: &mut [(u64, &[u8])],
-    length: u64,
-    op: &str,
-) -> io::Result<()> {
+fn validate_sparse_blocks(blocks: &mut [(u64, &[u8])], length: u64, op: &str) -> io::Result<()> {
     for (off, data) in blocks.iter() {
         let end = off.checked_add(data.len() as u64).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("{op}: relative offset ({off}) + len ({}) overflows u64", data.len()),
+                format!(
+                    "{op}: relative offset ({off}) + len ({}) overflows u64",
+                    data.len()
+                ),
             )
         })?;
         if end > length {

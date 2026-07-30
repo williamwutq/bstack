@@ -1513,7 +1513,11 @@ mod tests {
 
         let off = s
             .extend_sparse_batched(
-                vec![(4u64, b"cc".as_slice()), (0, b"".as_slice()), (0, b"a".as_slice())],
+                vec![
+                    (4u64, b"cc".as_slice()),
+                    (0, b"".as_slice()),
+                    (0, b"a".as_slice()),
+                ],
                 6,
             )
             .unwrap();
@@ -4495,11 +4499,7 @@ mod atomic_tests {
         let _g = Guard(p);
         s.push(b"..").unwrap();
         let ok = s
-            .try_extend_sparse_batched(
-                2,
-                vec![(0u64, b"AA".as_slice()), (5, b"BB".as_slice())],
-                8,
-            )
+            .try_extend_sparse_batched(2, vec![(0u64, b"AA".as_slice()), (5, b"BB".as_slice())], 8)
             .unwrap();
         assert!(ok);
         assert_eq!(s.peek(0).unwrap(), b"..AA\x00\x00\x00BB\x00");
