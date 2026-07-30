@@ -1421,6 +1421,142 @@ mod tests {
         assert_eq!(s2.peek(0).unwrap(), b"hi\x00\x00");
     }
 
+    // ---- extend_sparse ------------------------------------------------------
+
+    #[test]
+    fn extend_sparse_writes_prefix_and_zeros_rest() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        s.push(b"abc").unwrap();
+        let off = s.extend_sparse(b"XY", 6).unwrap();
+        assert_eq!(off, 3);
+        assert_eq!(s.len().unwrap(), 9);
+        assert_eq!(s.peek(0).unwrap(), b"abcXY\x00\x00\x00\x00");
+    }
+
+    #[test]
+    fn extend_sparse_full_length_prefix() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        let off = s.extend_sparse(b"hello", 5).unwrap();
+        assert_eq!(off, 0);
+        assert_eq!(s.peek(0).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn extend_sparse_empty_buf_is_pure_extend() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        s.push(b"ab").unwrap();
+        let off = s.extend_sparse(b"", 4).unwrap();
+        assert_eq!(off, 2);
+        assert_eq!(s.peek(0).unwrap(), b"ab\x00\x00\x00\x00");
+    }
+
+    #[test]
+    fn extend_sparse_zero_length_is_noop() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        s.push(b"data").unwrap();
+        let off = s.extend_sparse(b"", 0).unwrap();
+        assert_eq!(off, 4);
+        assert_eq!(s.len().unwrap(), 4);
+    }
+
+    #[test]
+    fn extend_sparse_buf_longer_than_length_errors() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        let err = s.extend_sparse(b"toolong", 3).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(s.len().unwrap(), 0);
+    }
+
+    #[test]
+    fn extend_sparse_persists_across_reopen() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+
+        s.push(b"hi").unwrap();
+        s.extend_sparse(b"Z", 4).unwrap();
+        drop(s);
+
+        let s2 = BStack::open(&p).unwrap();
+        assert_eq!(s2.peek(0).unwrap(), b"hiZ\x00\x00\x00");
+    }
+
+    // ---- extend_sparse_batched ----------------------------------------------
+
+    #[test]
+    fn extend_sparse_batched_scatters_buffers() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        s.push(b"..").unwrap();
+        let off = s
+            .extend_sparse_batched(vec![(0u64, b"AA".as_slice()), (5, b"BB".as_slice())], 8)
+            .unwrap();
+        assert_eq!(off, 2);
+        assert_eq!(s.len().unwrap(), 10);
+        assert_eq!(s.peek(0).unwrap(), b"..AA\x00\x00\x00BB\x00");
+    }
+
+    #[test]
+    fn extend_sparse_batched_ignores_empty_and_reorders() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        let off = s
+            .extend_sparse_batched(
+                vec![(4u64, b"cc".as_slice()), (0, b"".as_slice()), (0, b"a".as_slice())],
+                6,
+            )
+            .unwrap();
+        assert_eq!(off, 0);
+        assert_eq!(s.peek(0).unwrap(), b"a\x00\x00\x00cc");
+    }
+
+    #[test]
+    fn extend_sparse_batched_overlap_errors() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        let err = s
+            .extend_sparse_batched(vec![(0u64, b"aaa".as_slice()), (2, b"bb".as_slice())], 8)
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(s.len().unwrap(), 0);
+    }
+
+    #[test]
+    fn extend_sparse_batched_out_of_range_errors() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        let err = s
+            .extend_sparse_batched(vec![(3u64, b"zzz".as_slice())], 5)
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(s.len().unwrap(), 0);
+    }
+
+    #[test]
+    fn extend_sparse_batched_empty_is_pure_extend() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        let off = s
+            .extend_sparse_batched(Vec::<(u64, Vec<u8>)>::new(), 4)
+            .unwrap();
+        assert_eq!(off, 0);
+        assert_eq!(s.peek(0).unwrap(), b"\x00\x00\x00\x00");
+    }
+
     // ---- zero (feature-gated) -----------------------------------------------
 
     #[cfg(feature = "set")]
@@ -4303,6 +4439,98 @@ mod atomic_tests {
         drop(s);
         let s2 = BStack::open(&p).unwrap();
         assert_eq!(s2.peek(0).unwrap(), b"helloworld");
+    }
+
+    // ---- try_extend_sparse --------------------------------------------------
+
+    #[test]
+    fn try_extend_sparse_matching_size_writes_returns_true() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        let ok = s.try_extend_sparse(5, b"XY", 6).unwrap();
+        assert!(ok);
+        assert_eq!(s.len().unwrap(), 11);
+        assert_eq!(s.peek(0).unwrap(), b"helloXY\x00\x00\x00\x00");
+    }
+
+    #[test]
+    fn try_extend_sparse_mismatching_size_returns_false() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        let ok = s.try_extend_sparse(3, b"XY", 6).unwrap();
+        assert!(!ok);
+        assert_eq!(s.len().unwrap(), 5);
+        assert_eq!(s.peek(0).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn try_extend_sparse_buf_longer_than_length_errors_even_on_mismatch() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        // Size does not match (3 != 5), but the malformed request still errors.
+        let err = s.try_extend_sparse(3, b"toolong", 2).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(s.len().unwrap(), 5);
+    }
+
+    #[test]
+    fn try_extend_sparse_persists_across_reopen() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+        s.push(b"hi").unwrap();
+        s.try_extend_sparse(2, b"Z", 4).unwrap();
+        drop(s);
+        let s2 = BStack::open(&p).unwrap();
+        assert_eq!(s2.peek(0).unwrap(), b"hiZ\x00\x00\x00");
+    }
+
+    // ---- try_extend_sparse_batched ------------------------------------------
+
+    #[test]
+    fn try_extend_sparse_batched_matching_scatters_returns_true() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"..").unwrap();
+        let ok = s
+            .try_extend_sparse_batched(
+                2,
+                vec![(0u64, b"AA".as_slice()), (5, b"BB".as_slice())],
+                8,
+            )
+            .unwrap();
+        assert!(ok);
+        assert_eq!(s.peek(0).unwrap(), b"..AA\x00\x00\x00BB\x00");
+    }
+
+    #[test]
+    fn try_extend_sparse_batched_mismatching_returns_false() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"..").unwrap();
+        let ok = s
+            .try_extend_sparse_batched(99, vec![(0u64, b"AA".as_slice())], 8)
+            .unwrap();
+        assert!(!ok);
+        assert_eq!(s.len().unwrap(), 2);
+    }
+
+    #[test]
+    fn try_extend_sparse_batched_overlap_errors_even_on_mismatch() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"..").unwrap();
+        let err = s
+            .try_extend_sparse_batched(
+                99,
+                vec![(0u64, b"aaa".as_slice()), (2, b"bb".as_slice())],
+                8,
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(s.len().unwrap(), 2);
     }
 
     // -----------------------------------------------------------------------
