@@ -1254,8 +1254,8 @@ impl BStackAllocator for CheckedSlabBStackAllocator {
     /// |------|-------|--------|
     /// | `len == 0` | 0 | trivially safe |
     /// | free-list hit | 2 (`set` + `set`) | crash may leak popped block |
-    /// | tail extend, single block | 2 (`extend` + `set`) | crash may leak extended block |
-    /// | tail extend, multi-block | 2 (`extend` + `set`) | crash may leak extended blocks |
+    /// | tail extend, single block | 1 (`extend_sparse`) | crash-atomic (rolls back) |
+    /// | tail extend, multi-block | 1 (`extend_sparse`) | crash-atomic (rolls back) |
     fn alloc(&self, len: u64) -> io::Result<BStackOwnedSlice<'_, Self>> {
         if len == 0 {
             return Ok(BStackOwnedSlice::empty(self));
@@ -1281,20 +1281,29 @@ impl BStackAllocator for CheckedSlabBStackAllocator {
         }
 
         // Tail-extend path (single-block with no free block, and all multi-block
-        // allocations). No lock needed: BStack::extend is internally serialised by
-        // its write lock and returns a distinct region to each concurrent caller;
-        // write_overhead then writes only to that exclusively-owned region.
+        // allocations). No lock needed: BStack::extend_sparse is internally
+        // serialised by its write lock and returns a distinct region to each
+        // concurrent caller; the overhead prefix is written only to that
+        // exclusively-owned region.
         let total = num_blocks.checked_mul(self.block_size).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "allocation size overflows u64")
         })?;
-        let block_start = self.stack.extend(total)?;
-        self.write_overhead(block_start, Self::IN_USE_BIT | num_blocks)?;
+        // Grow by `total` and write the overhead prefix at the start of the new
+        // region in one crash-atomic step: the whole region (overhead + zeroed
+        // data) commits together, so a crash cannot leave an extended-but-unmarked
+        // (leaked) block. `total ≥ OVERHEAD` since `blocks_needed` rounds up past
+        // the 8-byte prefix, so the prefix always fits. The data bytes past the
+        // overhead are left zero by the sparse extension (no write I/O).
+        let block_start = self
+            .stack
+            .extend_sparse((Self::IN_USE_BIT | num_blocks).to_le_bytes(), total)?;
         // SAFETY:
         // 1. No overflow: `block_start + OVERHEAD + len ≤ block_start + total ≤ new stack_len ≤ u64::MAX`
         //    because `total = num_blocks * block_size` and `OVERHEAD + len ≤ num_blocks * block_size`
         //    by the definition of `blocks_needed`.
-        // 2. In bounds: `stack.extend` just appended exactly `total` zeroed bytes;
-        //    the full range is within the stack payload.
+        // 2. In bounds: `extend_sparse` just appended exactly `total` bytes (the
+        //    8-byte overhead followed by zeros); the full range is within the
+        //    stack payload.
         // 3. Alloc origin: the slice covers the data region of this fresh
         //    allocation and may safely be passed to `dealloc`/`realloc`.
         Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, block_start + Self::OVERHEAD, len) })
@@ -2260,10 +2269,11 @@ mod tests {
 // Fault-injection failure tests (non-`atomic` white-box; op-agnostic fuzz covers
 // the `atomic` build). CheckedSlab tags every block with an overhead word and
 // runs a full `recover()` scan in `open`, so it can reclaim blocks orphaned by a
-// mid-operation fault. The tests drive the two orphaning paths — a faulted
-// overhead write in `alloc` (orphan tail) and a faulted free-list push in
-// `dealloc` (lost handle) — and confirm the reopen recovery reclaims them while
-// surviving allocations stay intact.
+// mid-operation fault. `alloc` grows the tail and writes the overhead prefix in a
+// single crash-atomic `extend_sparse`, so a fault there rolls the whole thing
+// back and leaves no orphan (recovery finds nothing to reclaim). The remaining
+// orphaning path is a faulted free-list push in `dealloc` (lost handle), which
+// the reopen recovery reclaims while surviving allocations stay intact.
 #[cfg(all(
     test,
     debug_assertions,
@@ -2290,18 +2300,19 @@ mod fault_tests {
         alloc.stack().set_fault_policy(None);
     }
 
-    // A fresh block is grown with a single `extend` (before the overhead write);
-    // a fault there surfaces cleanly and leaves the allocator usable.
+    // A fresh block is grown by a single `extend_sparse` (which also writes the
+    // overhead prefix); a fault there surfaces cleanly and leaves the allocator
+    // usable.
     #[test]
     fn alloc_extend_fault_surfaces_cleanly() {
         let path = temp_path("cslab_alloc");
         let _g = Guard(path.clone());
         let alloc = CheckedSlabBStackAllocator::new(BStack::open(&path).unwrap(), DATA).unwrap();
 
-        arm(&alloc, FailOpAt::new("extend", 0, ErrorKind::Other));
+        arm(&alloc, FailOpAt::new("extend_sparse", 0, ErrorKind::Other));
         let err = alloc
             .alloc(DATA)
-            .expect_err("alloc must fail when extend faults");
+            .expect_err("alloc must fail when extend_sparse faults");
         disarm(&alloc);
         assert_eq!(err.kind(), ErrorKind::Other);
 
@@ -2310,11 +2321,12 @@ mod fault_tests {
         assert_eq!(s.read().unwrap(), vec![7u8; DATA as usize]);
     }
 
-    // `alloc` extends the tail and then writes the in-use overhead word. Faulting
-    // that `set` leaves an extended-but-untagged (overhead == 0) orphan tail; the
-    // reopen `recover()` must discard it, leaving prior data intact.
+    // `alloc` grows the tail and writes the in-use overhead word in one atomic
+    // `extend_sparse`. Faulting it rolls the whole thing back — no
+    // extended-but-untagged orphan tail is left — so the reopen `recover()` finds
+    // nothing to reclaim and prior data stays intact.
     #[test]
-    fn alloc_overhead_write_fault_recovers_orphan_tail() {
+    fn alloc_fault_leaves_no_orphan_tail() {
         let path = temp_path("cslab_orphan");
         let _g = Guard(path.clone());
 
@@ -2325,25 +2337,24 @@ mod fault_tests {
             a.write([1u8; DATA as usize]).unwrap();
             let a_start = a.start();
 
-            // Second alloc: extend succeeds, the overhead `set` faults.
-            arm(&alloc, FailOpAt::new("set", 0, ErrorKind::Other));
+            // Second alloc: the fused grow-and-tag `extend_sparse` faults and rolls back.
+            arm(&alloc, FailOpAt::new("extend_sparse", 0, ErrorKind::Other));
             let err = alloc
                 .alloc(DATA)
-                .expect_err("alloc must fail when the overhead write faults");
+                .expect_err("alloc must fail when extend_sparse faults");
             disarm(&alloc);
             assert_eq!(err.kind(), ErrorKind::Other);
             drop(alloc);
             a_start
         };
 
-        // Reopen runs recover(); the orphan tail is reclaimed and A survives.
+        // Reopen runs recover(); there is no orphan to reclaim and A survives.
         let alloc = CheckedSlabBStackAllocator::open(BStack::open(&path).unwrap()).unwrap();
+        assert_eq!(alloc.recover().unwrap(), 0);
         assert_eq!(
             alloc.stack().get(a_start, a_start + DATA).unwrap(),
             vec![1u8; DATA as usize]
         );
-        // Idempotent recovery: nothing left to reclaim.
-        assert_eq!(alloc.recover().unwrap(), 0);
         let mut c = alloc.alloc(DATA).unwrap();
         c.write([4u8; DATA as usize]).unwrap();
         assert_eq!(c.read().unwrap(), vec![4u8; DATA as usize]);

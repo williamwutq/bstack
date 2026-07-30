@@ -754,23 +754,21 @@ impl BStackAllocator for SlabBStackAllocator {
                 }
 
                 // Grow non-tail: copy data into a fresh region, then free the old blocks.
-                // get_into and push need no lock; push_free_blocks mutates the free list.
-                let buf_len = usize::try_from(new_backing).map_err(|_| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "reallocation too large for this platform",
-                    )
-                })?;
-                let mut data_buf = vec![0u8; buf_len];
+                // get_into and extend_sparse need no lock; push_free_blocks mutates the
+                // free list. The new region is grown by `new_backing` with only the old
+                // visible bytes written at its start — the block-padding and
+                // newly-exposed bytes past them are left zero by the sparse extension
+                // (no write I/O, and only `old_visible_len` bytes are buffered in memory
+                // rather than the full `new_backing`).
                 let old_visible_len = usize::try_from(slice.len()).map_err(|_| {
                     io::Error::new(
                         io::ErrorKind::InvalidInput,
                         "existing allocation too large for this platform",
                     )
                 })?;
-                self.stack
-                    .get_into(slice.start(), &mut data_buf[..old_visible_len])?;
-                let new_ptr = self.stack.push(data_buf)?;
+                let mut data_buf = vec![0u8; old_visible_len];
+                self.stack.get_into(slice.start(), &mut data_buf)?;
+                let new_ptr = self.stack.extend_sparse(&data_buf, new_backing)?;
                 // New region committed and populated; it is now the survivor, so a
                 // failure freeing the old blocks returns the new region instead.
                 recovered = (new_ptr, new_len);
