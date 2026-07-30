@@ -69,6 +69,19 @@
 
 typedef struct bstack bstack_t;
 
+/*
+ * Descriptor for one entry in a batched operation: a logical byte offset, a
+ * buffer pointer, and a byte count.  Used as a read destination by
+ * bstack_get_batched, and as a write source by bstack_set_batched,
+ * bstack_extend_sparse_batched, and bstack_try_extend_sparse_batched (where
+ * offset is interpreted relative to the current tail).
+ */
+typedef struct {
+    uint64_t offset;
+    uint8_t *buf;
+    size_t   len;
+} bstack_iovec_t;
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -108,6 +121,50 @@ int bstack_push(bstack_t *bs, const uint8_t *data, size_t len,
  * n = 0 is valid and returns the current end offset.
  */
 int bstack_extend(bstack_t *bs, size_t n, uint64_t *out_offset);
+
+/*
+ * Sparsely grow the payload by length bytes, writing the buf_len bytes at buf at
+ * the start of the freshly grown region and leaving the remaining
+ * length - buf_len bytes zero.
+ *
+ * The whole length is realised with a single ftruncate (the OS zero-fills), so
+ * the tail past buf costs no write I/O — a cheaper alternative to a bstack_push
+ * of a large mostly-zero buffer when only a small prefix carries real data.
+ * If out_offset is non-NULL it receives the logical byte offset where the growth
+ * begins (the payload size before the call, the anchor buf is written at).
+ *
+ * length = 0 is valid only when buf_len == 0; it writes nothing and returns the
+ * current end offset.  A NULL buf is permitted only when buf_len == 0.  No
+ * journal is needed: the grown region sits beyond the committed length, so a
+ * crash before the commit rolls back by truncation (like bstack_push).
+ * Returns EINVAL if buf_len exceeds length or if the payload size plus length
+ * overflows uint64_t; otherwise -1 (errno set) on I/O error.
+ */
+int bstack_extend_sparse(bstack_t *bs, const uint8_t *buf, size_t buf_len,
+                         uint64_t length, uint64_t *out_offset);
+
+/*
+ * Sparsely grow the payload by length bytes, scattering count buffers into the
+ * freshly grown region and leaving the gaps between them zero.
+ *
+ * writes is an array of count bstack_iovec_t descriptors; each (offset, buf, len)
+ * writes its len bytes at logical offset tail + offset, where tail is the payload
+ * size before the growth (the returned offset).  The bytes not covered by any
+ * buffer read back as zero.  Empty (len == 0) entries are ignored.  As with
+ * bstack_extend_sparse, the whole length is realised with a single ftruncate, so
+ * the zero gaps cost no write I/O.
+ *
+ * The writes must be pairwise non-overlapping and each must fit within
+ * [0, length); a violation is rejected.  count = 0 (or writes = NULL with
+ * count = 0) extends by length with no data (equivalent to bstack_extend).
+ * length = 0 is valid only when every buffer is empty.
+ * Returns EINVAL if any offset + len overflows uint64_t or exceeds length, if two
+ * writes overlap, or if the payload size plus length overflows uint64_t;
+ * otherwise -1 (errno set) on I/O error.
+ */
+int bstack_extend_sparse_batched(bstack_t *bs,
+                                 const bstack_iovec_t *writes, size_t count,
+                                 uint64_t length, uint64_t *out_offset);
 
 /*
  * Remove and copy the last n bytes of the stack into buf.
@@ -258,16 +315,6 @@ int bstack_repeat(bstack_t *bs, uint64_t offset,
                   const uint8_t *pattern, size_t pattern_len, uint64_t count);
 #endif /* BSTACK_FEATURE_SET */
 
-/*
- * Descriptor for one entry in a batched read: logical byte offset, destination
- * buffer pointer, and number of bytes to read.
- */
-typedef struct {
-    uint64_t offset;
-    uint8_t *buf;
-    size_t   len;
-} bstack_iovec_t;
-
 #ifdef BSTACK_FEATURE_ATOMIC
 /*
  * Atomically cut n bytes off the tail then append buf_len bytes from buf.
@@ -371,6 +418,44 @@ int bstack_replace(bstack_t *bs, size_t n,
 int bstack_try_extend_zeros(bstack_t *bs, uint64_t s, size_t n, int *ok);
 
 /*
+ * Sparsely grow the payload by length bytes with buf at the start, only if the
+ * current logical payload size equals s.  Size-guarded counterpart of
+ * bstack_extend_sparse.
+ *
+ * *ok (if non-NULL) is set to 1 when the condition matched and the growth was
+ * applied (or length == 0 and no I/O was needed), or 0 when the size did not
+ * match (no-op).  A malformed request (buf_len exceeding length) is rejected with
+ * EINVAL regardless of whether the size matches, so it always surfaces rather
+ * than being masked by a size mismatch.
+ * Returns EINVAL if buf_len exceeds length or if the payload size plus length
+ * overflows uint64_t; otherwise -1 (errno set) on I/O error.
+ *
+ * Only available when compiled with -DBSTACK_FEATURE_ATOMIC.
+ */
+int bstack_try_extend_sparse(bstack_t *bs, uint64_t s,
+                             const uint8_t *buf, size_t buf_len,
+                             uint64_t length, int *ok);
+
+/*
+ * Sparsely grow the payload by length bytes, scattering count buffers into the
+ * grown region, only if the current logical payload size equals s.  Size-guarded
+ * counterpart of bstack_extend_sparse_batched.
+ *
+ * *ok (if non-NULL) is set to 1 when the condition matched and the growth was
+ * applied (or length == 0 and no I/O was needed), or 0 when the size did not
+ * match (no-op).  A malformed batch (overlapping writes, or a write past length)
+ * is rejected with EINVAL regardless of whether the size matches.
+ * Returns EINVAL if any offset + len overflows uint64_t or exceeds length, if two
+ * writes overlap, or if the payload size plus length overflows uint64_t;
+ * otherwise -1 (errno set) on I/O error.
+ *
+ * Only available when compiled with -DBSTACK_FEATURE_ATOMIC.
+ */
+int bstack_try_extend_sparse_batched(bstack_t *bs, uint64_t s,
+                                     const bstack_iovec_t *writes, size_t count,
+                                     uint64_t length, int *ok);
+
+/*
  * Read multiple logical ranges into caller-provided buffers in a single
  * lock acquisition.
  *
@@ -444,6 +529,12 @@ typedef enum {
      * non-NULL the popped bytes are read into it first (in-sequence
      * bstack_splice); if NULL they are discarded (in-sequence bstack_atrunc). */
     BSTACK_GEN_SPLICE,
+    /* Sparsely grow the payload by u.sparse.length bytes, scattering the
+     * u.sparse.count descriptors in u.sparse.writes (each offset relative to the
+     * current tail) into the freshly grown region and leaving the gaps zero,
+     * then ending the sequence — the in-sequence equivalent of
+     * bstack_extend_sparse_batched. */
+    BSTACK_GEN_SPARSE,
     /* Write the current logical payload size into *u.len.out, then call gen
      * again — does not end the sequence. */
     BSTACK_GEN_LEN,
@@ -477,13 +568,22 @@ typedef enum {
  *   into it first (which must hold n bytes); if NULL they are discarded, which
  *   is the in-sequence equivalent of bstack_atrunc (mirroring how a NULL
  *   u.pop.buf turns a POP into a discard).
+ * - BSTACK_GEN_SPARSE: sparsely grow the payload by u.sparse.length bytes,
+ *   scattering the u.sparse.count (offset, buf, len) descriptors in
+ *   u.sparse.writes into the freshly grown region — each written at logical
+ *   offset tail + offset, with the gaps left zero — and ending the sequence, the
+ *   in-sequence equivalent of bstack_extend_sparse_batched (a single descriptor
+ *   at offset 0 covers bstack_extend_sparse).  The writes must be pairwise
+ *   non-overlapping and each must fit within [0, length); empty entries are
+ *   ignored.
  * - BSTACK_GEN_LEN: write the current logical payload size into
  *   *u.len.out and call gen again — the in-sequence equivalent of
  *   bstack_len.  Does not end the sequence.
  *
- * BSTACK_GEN_WRITE, BSTACK_GEN_SWAP, BSTACK_GEN_PUSH, BSTACK_GEN_POP, and
- * BSTACK_GEN_SPLICE are the only mutating kinds — exactly one is permitted per
- * bstack_process_gen call, and any one of them ends the sequence immediately.
+ * BSTACK_GEN_WRITE, BSTACK_GEN_SWAP, BSTACK_GEN_PUSH, BSTACK_GEN_POP,
+ * BSTACK_GEN_SPLICE, and BSTACK_GEN_SPARSE are the only mutating kinds — exactly
+ * one is permitted per bstack_process_gen call, and any one of them ends the
+ * sequence immediately.
  *
  * Only available when compiled with both -DBSTACK_FEATURE_SET and
  * -DBSTACK_FEATURE_ATOMIC.
@@ -521,6 +621,12 @@ typedef struct {
             const uint8_t *new_buf;  /* bytes to append after the cut */
             size_t         new_len;
         } splice;
+        struct {
+            const bstack_iovec_t *writes;  /* (relative offset, buf, len) blocks,
+                                            * each offset from the current tail */
+            size_t                count;
+            uint64_t              length;  /* total bytes to grow the payload by */
+        } sparse;
         struct {
             uint64_t *out;
         } len;
@@ -611,6 +717,12 @@ int bstack_process(bstack_t *bs, uint64_t start, uint64_t end,
  *   ends the sequence; gen is not called again — the in-sequence equivalent of
  *   bstack_splice.  A NULL u.splice.removed discards the popped bytes instead of
  *   reading them out — the in-sequence equivalent of bstack_atrunc.
+ * - Returning 1 with *out_op set to BSTACK_GEN_SPARSE sparsely grows the payload
+ *   by u.sparse.length bytes, scattering the u.sparse.count descriptors in
+ *   u.sparse.writes into the freshly grown region and leaving the gaps zero, and
+ *   ends the sequence; gen is not called again — the in-sequence equivalent of
+ *   bstack_extend_sparse_batched.  The writes must be pairwise non-overlapping
+ *   and each must fit within [0, length).
  * - Returning 1 with *out_op set to BSTACK_GEN_LEN writes the current logical
  *   payload size into *u.len.out and calls gen again — the in-sequence
  *   equivalent of bstack_len, useful when a later step's offset or length
@@ -625,8 +737,8 @@ int bstack_process(bstack_t *bs, uint64_t start, uint64_t end,
  * guarantee that bstack_get_batched_gen followed by a separate bstack_cas
  * cannot provide, since the two separate lock acquisitions leave an ABA
  * window.  The mutated region(s) need not overlap any region that was read.
- * BSTACK_GEN_PUSH, BSTACK_GEN_POP, and BSTACK_GEN_SPLICE are the steps that
- * change the file size.
+ * BSTACK_GEN_PUSH, BSTACK_GEN_POP, BSTACK_GEN_SPLICE, and BSTACK_GEN_SPARSE are
+ * the steps that change the file size.
  *
  * Reads of the locked region [0, bstack_locked_len()) are permitted, matching
  * bstack_get.  Write and swap ranges that touch the locked region are
@@ -694,8 +806,9 @@ int bstack_set_batched(bstack_t *bs, const bstack_iovec_t *writes, size_t count)
  *   with the edits recorded so far, not the on-disk bytes.
  *
  * Only in-place ops are permitted: BSTACK_GEN_READ, BSTACK_GEN_WRITE, and
- * BSTACK_GEN_LEN.  The size-changing ops (PUSH/POP/SPLICE) and SWAP are rejected
- * (reported as EINVAL via prev_status; not recorded, and the sequence continues).
+ * BSTACK_GEN_LEN.  The size-changing ops (PUSH/POP/SPLICE/SPARSE) and SWAP are
+ * rejected (reported as EINVAL via prev_status; not recorded, and the sequence
+ * continues).
  * There is no abort: returning 0 always commits whatever validly accumulated.
  *
  * If prev_status is non-NULL, before each gen call *prev_status is set to the
