@@ -3328,7 +3328,7 @@ bstack_t *ghost_tree_bstack_allocator_into_stack(ghost_tree_bstack_allocator_t *
 #define SLAB_MIN_BLOCK_SIZE    UINT64_C(8)
 #define SLAB_SENTINEL          UINT64_C(0)
 
-static const uint8_t alsl_magic[8]        = {'A','L','S','L',0,1,1,0};
+static const uint8_t alsl_magic[8]        = {'A','L','S','L',0,1,2,0};
 static const uint8_t alsl_magic_prefix[6] = {'A','L','S','L',0,1};
 
 /* ---- helpers ----------------------------------------------------------- */
@@ -3740,26 +3740,30 @@ static int slab_vtbl_realloc(bstack_allocator_t *base, bstack_slice_t s,
         }
 
         /* Not at tail (or tail moved under atomic): grow non-tail.
-         * Read old data into a zeroed new_backing-sized buffer, push it as a
-         * single atomic write, then free the old blocks (lock-free under
+         * Read the old bytes into a small buffer and write them at the start of a
+         * sparse new_backing-byte extension — the block-padding past them is left
+         * zero (no write I/O and only s.len bytes are buffered in memory rather
+         * than the full new_backing) — then free the old blocks (lock-free under
          * atomic via cross_exchange). */
         {
-            uint8_t  *buf;
-            uint64_t  push_offset;
-
-#if UINT64_MAX > SIZE_MAX
-            if (new_backing > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
-#endif
-            buf = calloc(1, (size_t)new_backing);
-            if (!buf) return -1;
+            uint8_t  *buf = NULL;
+            size_t    old_visible = 0;
+            uint64_t  new_offset;
 
             if (s.len > 0) {
+#if UINT64_MAX > SIZE_MAX
+                if (s.len > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
+#endif
+                old_visible = (size_t)s.len;
+                buf = malloc(old_visible);
+                if (!buf) return -1;
                 if (bstack_get(a->bs, s.offset, s.offset + s.len, buf) != 0) {
                     free(buf); return -1;
                 }
             }
 
-            if (bstack_push(a->bs, buf, (size_t)new_backing, &push_offset) != 0) {
+            if (bstack_extend_sparse(a->bs, buf, old_visible, new_backing,
+                                     &new_offset) != 0) {
                 free(buf); return -1;
             }
             free(buf);
@@ -3768,7 +3772,7 @@ static int slab_vtbl_realloc(bstack_allocator_t *base, bstack_slice_t s,
                                       a->block_size) != 0) return -1;
 
             out->allocator = base;
-            out->offset    = push_offset;
+            out->offset    = new_offset;
             out->len       = new_len;
             return 0;
         }
@@ -3952,7 +3956,7 @@ uint64_t slab_bstack_allocator_block_size(const slab_bstack_allocator_t *alloc)
 /* Maximum number of suspect blocks analysed in resync_tail before giving up. */
 #define ALCK_MAX_RECOVER_REGION ((size_t)(1u << 26))
 
-static const uint8_t alck_magic[8]        = {'A','L','C','K',0,1,1,0};
+static const uint8_t alck_magic[8]        = {'A','L','C','K',0,1,2,0};
 static const uint8_t alck_magic_prefix[6] = {'A','L','C','K',0,1};
 
 /* ---- LE helpers (reuse read_le64 / write_le64 already defined above) --- */
@@ -4981,9 +4985,10 @@ static int alck_vt_alloc(bstack_allocator_t *base, uint64_t len,
     if (num_blocks == 1) {
         /* Free-list pop is lock-free under atomic (single process_gen
          * sequence); single-threaded otherwise.  The tail-extend fallback below
-         * uses bstack_extend, which is internally serialised and returns a
+         * uses bstack_extend_sparse, which is internally serialised and returns a
          * distinct region to each concurrent caller. */
         uint64_t block_start;
+        uint8_t  ov[8];
         if (alck_pop_and_claim_block(a->bs, 1, a->block_size, &block_start) != 0)
             return -1;
         if (block_start != ALCK_SENTINEL) {
@@ -4992,10 +4997,13 @@ static int alck_vt_alloc(bstack_allocator_t *base, uint64_t len,
             out->len       = len;
             return 0;
         }
-        /* Free list empty: extend tail */
-        if (bstack_extend(a->bs, (size_t)a->block_size, &block_start) != 0)
-            return -1;
-        if (alck_write_overhead(a->bs, block_start, ALCK_IN_USE_BIT | 1) != 0)
+        /* Free list empty: grow the block and write its in-use overhead prefix
+         * in one crash-atomic extend_sparse — the whole block (overhead + zeroed
+         * data) commits together, so a fault mid-alloc rolls back rather than
+         * leaving an extended-but-untagged orphan tail.  The data bytes past the
+         * 8-byte overhead are left zero by the sparse extension (no write I/O). */
+        write_le64(ov, ALCK_IN_USE_BIT | 1);
+        if (bstack_extend_sparse(a->bs, ov, 8, a->block_size, &block_start) != 0)
             return -1;
         out->allocator = base;
         out->offset    = block_start + ALCK_OVERHEAD;
@@ -5003,17 +5011,14 @@ static int alck_vt_alloc(bstack_allocator_t *base, uint64_t len,
         return 0;
     }
 
-    /* Multi-block: always extend tail */
+    /* Multi-block: always extend tail (same fused crash-atomic extend_sparse). */
     {
         uint64_t total, block_start;
+        uint8_t  ov[8];
         if (num_blocks > UINT64_MAX / a->block_size) { errno = EINVAL; return -1; }
         total = num_blocks * a->block_size;
-#if UINT64_MAX > SIZE_MAX
-        if (total > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
-#endif
-        if (bstack_extend(a->bs, (size_t)total, &block_start) != 0) return -1;
-        if (alck_write_overhead(a->bs, block_start,
-                                ALCK_IN_USE_BIT | num_blocks) != 0) return -1;
+        write_le64(ov, ALCK_IN_USE_BIT | num_blocks);
+        if (bstack_extend_sparse(a->bs, ov, 8, total, &block_start) != 0) return -1;
         out->allocator = base;
         out->offset    = block_start + ALCK_OVERHEAD;
         out->len       = len;

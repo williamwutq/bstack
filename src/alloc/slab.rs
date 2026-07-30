@@ -16,7 +16,7 @@ use core::num::NonZeroU64;
 use std::{fmt, io};
 
 #[cfg(feature = "set")]
-const ALSL_MAGIC: [u8; 8] = *b"ALSL\x00\x01\x01\x00";
+const ALSL_MAGIC: [u8; 8] = *b"ALSL\x00\x01\x02\x00";
 
 /// Compatibility prefix checked on open: `ALSL` + major 0 + minor 1.
 /// Any file whose first 6 bytes match is considered compatible.
