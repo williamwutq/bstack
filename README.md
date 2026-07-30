@@ -93,6 +93,19 @@ impl BStack {
     /// `n = 0` is valid and a no-op on disk.
     pub fn extend(&self, n: u64) -> io::Result<u64>;
 
+    /// Sparsely grow the payload by `length` bytes, writing `buf` at the start of the
+    /// new region and leaving the rest zero (realised with one `set_len`, so the zero
+    /// tail costs no write I/O).  Returns the starting logical offset.  Errors if
+    /// `buf.len()` exceeds `length`.
+    pub fn extend_sparse(&self, buf: impl AsRef<[u8]>, length: u64) -> io::Result<u64>;
+
+    /// Sparsely grow the payload by `length` bytes, scattering `(relative_offset, data)`
+    /// buffers (relative to the current tail) into the new region and leaving the gaps
+    /// zero.  Returns the starting logical offset.  Writes must be pairwise non-overlapping
+    /// and fit within `[0, length)`; empty buffers are ignored.
+    pub fn extend_sparse_batched<I, D>(&self, writes: I, length: u64) -> io::Result<u64>
+    where I: IntoIterator<Item = (u64, D)>, D: AsRef<[u8]>;
+
     /// Remove and return the last `n` bytes, then durable-sync.
     /// `n = 0` is valid.  Errors if `n` exceeds the current payload size.
     pub fn pop(&self, n: u64) -> io::Result<Vec<u8>>;
@@ -156,6 +169,15 @@ impl BStack {
     #[cfg(feature = "atomic")]
     pub fn try_extend_zeros(&self, s: u64, n: u64) -> io::Result<bool>;
 
+    /// Sparse `extend_sparse`/`extend_sparse_batched` gated on a size check: apply the
+    /// growth only if the current payload size equals `s`; returns whether it did.
+    /// A malformed request still errors regardless of the size match.  Requires the `atomic` feature.
+    #[cfg(feature = "atomic")]
+    pub fn try_extend_sparse(&self, s: u64, buf: impl AsRef<[u8]>, length: u64) -> io::Result<bool>;
+    #[cfg(feature = "atomic")]
+    pub fn try_extend_sparse_batched<I, D>(&self, s: u64, writes: I, length: u64) -> io::Result<bool>
+    where I: IntoIterator<Item = (u64, D)>, D: AsRef<[u8]>;
+
     /// Atomically read `buf.len()` bytes at `offset` and overwrite them with `buf`;
     /// returns the old contents.  Requires the `set` and `atomic` features.
     #[cfg(all(feature = "set", feature = "atomic"))]
@@ -191,8 +213,8 @@ impl BStack {
 
     /// Run a sequence of dependent reads, optionally followed by a single write, under
     /// one held write lock. `f` is called in a loop and drives the sequence through
-    /// `BStackGenOp::{Read, Len, Write, Swap, Push, Pop, Discard, Atrunc, Splice}`; at
-    /// most one of `Write`/`Swap`/`Push`/`Pop`/`Discard`/`Atrunc`/`Splice` is permitted
+    /// `BStackGenOp::{Read, Len, Write, Swap, Push, Pop, Discard, Atrunc, Splice, Sparse}`; at
+    /// most one of `Write`/`Swap`/`Push`/`Pop`/`Discard`/`Atrunc`/`Splice`/`Sparse` is permitted
     /// and ends the sequence.
     /// Requires the `set` and `atomic` features.
     #[cfg(all(feature = "set", feature = "atomic"))]
@@ -489,10 +511,11 @@ bstack = { version = "0.4", features = ["set", "atomic"] }
 
 - **`atrunc`**, **`splice`**, **`splice_into`** — atomic discard+push / pop+push tail replacement.
 - **`try_extend`**, **`try_discard`**, **`try_extend_zeros`** — size-checked, optimistic append/discard.
+- **`try_extend_sparse`**, **`try_extend_sparse_batched`** — size-checked, optimistic sparse tail growth.
 - **`replace(n, f)`** — pop `n` bytes, pass to `f`, push back the returned tail.
 - **`get_batched`**, **`get_batched_into`**, **`get_batched_gen`** — read multiple (possibly dependent) ranges under one read lock.
 - **`swap`**, **`swap_into`**, **`cas`** *(requires `set`)* — atomic read-modify-write / compare-and-swap of a single region.
-- **`process`**, **`process_gen`** *(requires `set`)* — in-place mutation, or a dependent read/write sequence ending in at most one `Write`/`Swap`/`Push`/`Pop`/`Discard`/`Atrunc`/`Splice`.
+- **`process`**, **`process_gen`** *(requires `set`)* — in-place mutation, or a dependent read/write sequence ending in at most one `Write`/`Swap`/`Push`/`Pop`/`Discard`/`Atrunc`/`Splice`/`Sparse`.
 - **`set_batched`**, **`inplace_gen`** *(requires `set`)* — commit several non-overlapping in-place writes as one crash-atomic unit (a batch, or a generator that also reads the batch-so-far state).
 - **`cross_exchange`**, **`copy`** *(requires `set`)* — swap or copy two regions under one write lock.
 - **`eq_crds`**, **`ne_crds`**, **`masked_eq_crds`**, **`masked_ne_crds`** *(requires `set`)* — cross-region compare-and-swap, with `==`/`!=`/masked variants.
@@ -587,6 +610,7 @@ before it is read/compare/callback work under the lock.
 |----------------------------------------|-------------------------------------------------------------------------------------------|
 | `push`                                 | `lseek(END)` → `write(data)` → `lseek(8)` → `write(clen)` → sync                          |
 | `extend`                               | `lseek(END)` → `set_len(new_end)` → `lseek(8)` → `write(clen)` → sync                     |
+| `extend_sparse`, `extend_sparse_batched` | `set_len(new_end)` → `write` each buffer into the grown region (gaps left zero) → `lseek(8)` → `write(clen)` → sync |
 | `pop`, `pop_into`                      | `lseek` → `read` → `ftruncate` → `lseek(8)` → `write(clen)` → sync                        |
 | `discard`                              | `ftruncate` → `lseek(8)` → `write(clen)` → sync                                           |
 | `set` *(feature)*                      | *commit* `data`                                                                           |
@@ -596,10 +620,11 @@ before it is read/compare/callback work under the lock.
 | `try_extend` *(atomic)*                | size check → conditional `push` sequence                                                  |
 | `try_discard` *(atomic)*               | size check → conditional `discard` sequence                                               |
 | `try_extend_zeros` *(atomic)*          | size check → conditional `extend(n)` sequence                                             |
+| `try_extend_sparse`, `try_extend_sparse_batched` *(atomic)* | size check → conditional `extend_sparse` / `extend_sparse_batched` sequence               |
 | `swap`, `swap_into` *(set+atomic)*     | `read` old bytes → *commit* `buf`                                                         |
 | `cas` *(set+atomic)*                   | `read` → compare → conditional *commit* of `new`                                          |
 | `process` *(set+atomic)*               | `read(start..end)` → *(callback)* → *commit* the buffer                                    |
-| `process_gen` *(set+atomic)*           | closure-driven reads (and `Len` queries), ending in at most one mutating step — `Write` *commits*; `Swap` uses the exchange journal (as `cross_exchange`); `Push`/`Pop`/`Discard`/`Atrunc`/`Splice` behave as their standalone forms |
+| `process_gen` *(set+atomic)*           | closure-driven reads (and `Len` queries), ending in at most one mutating step — `Write` *commits*; `Swap` uses the exchange journal (as `cross_exchange`); `Push`/`Pop`/`Discard`/`Atrunc`/`Splice`/`Sparse` behave as their standalone forms |
 | `set_batched` *(set+atomic)*           | validate + reject overlap → **multi-write journal**: stage every `[s \| e \| data]` block past `clen` → arm the `MultiWrite` sentinel (`wip_ptr` stays `0`) → replay each block in place → disarm → `ftruncate` (sync at each barrier); a lone effective write takes the ordinary single-write *commit* |
 | `inplace_gen` *(set+atomic)*           | closure-driven reads (each overlaid with the batch-so-far edits) interleaved with accumulated `Write`s (later overrides earlier on overlap); on `None` the pending edits commit together via the multi-write journal (as `set_batched`) |
 | `replace` *(atomic)*                   | `lseek(tail)` → `read(n)` → *(callback)* → *(then as `atrunc`)*                           |
@@ -676,11 +701,13 @@ lock without any `File::metadata` syscall.
 | Operation                                                       | Lock (Unix / Windows) | Lock (other) |
 |-----------------------------------------------------------------|-----------------------|--------------|
 | `push`, `extend`, `pop`, `pop_into`, `discard`                  | write                 | write        |
+| `extend_sparse`, `extend_sparse_batched`                        | write                 | write        |
 | `set`, `zero`, `repeat` *(feature)*                             | write                 | write        |
 | `atrunc`, `splice`, `splice_into`, `try_extend` *(atomic)*      | write                 | write        |
 | `try_discard(s, n > 0)` *(atomic)*                              | write                 | write        |
 | `try_discard(s, 0)` *(atomic)*                                  | **read**              | **read**     |
 | `try_extend_zeros` *(atomic)*                                   | write                 | write        |
+| `try_extend_sparse`, `try_extend_sparse_batched` *(atomic)*     | write                 | write        |
 | `swap`, `swap_into`, `cas` *(set+atomic)*                       | write                 | write        |
 | `process`, `process_gen` *(set+atomic)*                         | write                 | write        |
 | `set_batched`, `inplace_gen` *(set+atomic)*                     | write                 | write        |
