@@ -133,7 +133,7 @@
 //! | `swap`, `swap_into` *(features: set+atomic)* | `read` old bytes → *commit* `buf` |
 //! | `cas` *(features: set+atomic)* | `read` → compare — conditional *commit* of `new` |
 //! | `process` *(features: set+atomic)* | `read(start..end)` → *(callback)* → *commit* the buffer |
-//! | `process_gen` *(features: set+atomic)* | closure-driven reads, ending in at most one mutating step: `Write` *commits*; `Swap` uses the exchange journal (as `cross_exchange`); `Push`/`Pop`/`Discard`/`Atrunc`/`Splice` behave as their standalone forms |
+//! | `process_gen` *(features: set+atomic)* | closure-driven reads, ending in at most one mutating step: `Write` *commits*; `Swap` uses the exchange journal (as `cross_exchange`); `Push`/`Pop`/`Discard`/`Atrunc`/`Splice`/`Sparse` behave as their standalone forms |
 //! | `set_batched` *(features: set+atomic)* | validate + reject overlap → **multi-write journal**: stage every `[s \| e \| data]` block past `clen` → arm the `MultiWrite` sentinel (`wip_ptr` stays `0`) → replay each block in place → disarm → `ftruncate` (a `durable_sync` at each barrier); a lone effective write takes the ordinary single-write *commit* |
 //! | `inplace_gen` *(features: set+atomic)* | closure-driven reads (each overlaid with the batch-so-far edits) interleaved with accumulated `Write`s (later overrides earlier on overlap); on `None` the pending edits commit together via the multi-write journal (as `set_batched`) |
 //! | `replace` *(feature: atomic)* | `lseek(tail)` → `read(n)` → *(callback)* → *(then as `atrunc`)* |
@@ -2654,6 +2654,31 @@ pub enum BStackGenOp<'a> {
         /// Bytes to append after the pop.
         new: &'a [u8],
     },
+    /// Sparsely grow the payload by `length` bytes, scattering `writes` into the
+    /// freshly grown region and leaving the gaps between them zero, then ending
+    /// the sequence.
+    ///
+    /// The in-sequence equivalent of
+    /// [`extend_sparse_batched`](BStack::extend_sparse_batched) (and, with a
+    /// single write at relative offset `0`, of
+    /// [`extend_sparse`](BStack::extend_sparse)). Each `(relative_offset, data)`
+    /// pair writes `data` at logical offset `tail + relative_offset`, where `tail`
+    /// is the payload size before the growth; the bytes not covered by any write
+    /// read back as zero. The whole `length` is realised with a single `set_len`,
+    /// so the zero gaps cost no write I/O. Useful when a large mostly-zero tail —
+    /// or a set of blocks at offsets only known once earlier `Read`s have been
+    /// resolved — must be appended without materialising the zeros.
+    ///
+    /// The writes must be **pairwise non-overlapping** and each must fit within
+    /// the grown region `[0, length)`; empty `data` slices are ignored. `length =
+    /// 0` is valid only when every write is empty.
+    Sparse {
+        /// `(relative_offset, data)` pairs, each relative offset measured from the
+        /// current tail.
+        writes: &'a [(u64, &'a [u8])],
+        /// Total number of bytes to grow the payload by.
+        length: u64,
+    },
     /// Write the current logical payload size, in bytes, into `out`, then
     /// call `f` again — does not end the sequence.
     Len {
@@ -3103,6 +3128,11 @@ impl BStack {
     ///   tail into `old` then appends `new`, changing the payload by
     ///   `new.len() − old.len()`, and ends the sequence — the in-sequence
     ///   equivalent of [`splice_into`](Self::splice_into).
+    /// - `Some(BStackGenOp::Sparse { writes, length })` sparsely grows the payload
+    ///   by `length` bytes, scattering the `(relative_offset, data)` `writes` into
+    ///   the new region and leaving the gaps zero, and ends the sequence — the
+    ///   in-sequence equivalent of
+    ///   [`extend_sparse_batched`](Self::extend_sparse_batched).
     /// - `Some(BStackGenOp::Len { out })` writes the current logical payload
     ///   size into `out` and calls `f` again — the in-sequence equivalent of
     ///   [`len`](Self::len), useful when a later step's offset depends on the
@@ -3111,10 +3141,10 @@ impl BStack {
     ///   reads alone inform a decision, including the decision to change
     ///   nothing.
     ///
-    /// `Write`, `Swap`, `Push`, `Pop`, `Discard`, `Atrunc`, and `Splice` are the
-    /// only mutating operations, exactly one is permitted per call, and any one
-    /// of them ends the sequence immediately — `f` is not called again
-    /// afterwards.
+    /// `Write`, `Swap`, `Push`, `Pop`, `Discard`, `Atrunc`, `Splice`, and
+    /// `Sparse` are the only mutating operations, exactly one is permitted per
+    /// call, and any one of them ends the sequence immediately — `f` is not called
+    /// again afterwards.
     ///
     /// Holding the write lock across every read and the final mutation means
     /// no other thread can observe or modify any region of the file in
@@ -3122,7 +3152,7 @@ impl BStack {
     /// followed by a separate [`cas`](Self::cas) cannot provide, since the two
     /// separate lock acquisitions leave an ABA window.  The mutated region(s)
     /// need not overlap any region that was read.  `Push`, `Pop`, `Discard`,
-    /// `Atrunc`, and `Splice` are the steps that change the file size.
+    /// `Atrunc`, `Splice`, and `Sparse` are the steps that change the file size.
     ///
     /// Reads of the locked region `[0, locked_len())` are permitted, matching
     /// [`get`](Self::get) — locked bytes are immutable, so observing them
@@ -3397,6 +3427,26 @@ impl BStack {
                     }
                     return Ok(());
                 }
+                Some(BStackGenOp::Sparse { writes, length }) => {
+                    // Copy the borrowed blocks into a local list so they can be
+                    // filtered and sorted for validation (the source slice is `&'a`).
+                    let mut blocks: Vec<(u64, &[u8])> = writes
+                        .iter()
+                        .map(|(off, d)| (*off, *d))
+                        .filter(|(_, d)| !d.is_empty())
+                        .collect();
+                    validate_sparse_blocks(&mut blocks, length, "process_gen: sparse")?;
+                    if length != 0 {
+                        let file_end = HEADER_SIZE + data_size;
+                        let new_len = checked_end(
+                            data_size,
+                            length,
+                            "process_gen: sparse data_size + length overflows u64",
+                        )?;
+                        commit_sparse_extend(file, clen, data_size, file_end, new_len, &blocks)?;
+                    }
+                    return Ok(());
+                }
                 Some(BStackGenOp::Len { out }) => {
                     *out = data_size;
                 }
@@ -3540,8 +3590,8 @@ impl BStack {
     /// continues. `None` ends the sequence and commits the accumulated writes.
     ///
     /// Only in-place operations are permitted: `Read`, `Write`, and `Len`. The
-    /// size-changing ops (`Push`, `Pop`, `Discard`, `Atrunc`, `Splice`) and
-    /// `Swap` are rejected with [`io::ErrorKind::InvalidInput`] reported to `f`
+    /// size-changing ops (`Push`, `Pop`, `Discard`, `Atrunc`, `Splice`, `Sparse`)
+    /// and `Swap` are rejected with [`io::ErrorKind::InvalidInput`] reported to `f`
     /// (they are not recorded and do not end the sequence) — the multi-write
     /// journal pins `clen` and `file_size` as the staging bounds, so no
     /// size-changing operation may be compounded with it.
@@ -3631,6 +3681,12 @@ impl BStack {
                     feedback = Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
                         "inplace_gen: Splice is not permitted (in-place writes only)",
+                    ));
+                }
+                Some(BStackGenOp::Sparse { .. }) => {
+                    feedback = Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "inplace_gen: Sparse is not permitted (in-place writes only)",
                     ));
                 }
                 None => break,
