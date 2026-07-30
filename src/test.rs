@@ -5647,6 +5647,146 @@ mod atomic_tests {
 
     #[cfg(all(feature = "set", feature = "atomic"))]
     #[test]
+    fn process_gen_sparse_scatters_and_ends_sequence() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"..").unwrap();
+        // The `writes` slice must outlive the whole `process_gen` call, so it is
+        // bound here rather than in the closure's return expression.
+        let writes: [(u64, &[u8]); 2] = [(0, b"AA"), (5, b"BB")];
+        let mut calls = 0usize;
+        s.process_gen(|| {
+            calls += 1;
+            match calls {
+                1 => Some(BStackGenOp::Sparse {
+                    writes: &writes,
+                    length: 8,
+                }),
+                _ => Some(BStackGenOp::Write {
+                    offset: 0,
+                    data: b"NOPE",
+                }),
+            }
+        })
+        .unwrap();
+        assert_eq!(calls, 1, "Sparse must end the sequence, like Push");
+        assert_eq!(s.len().unwrap(), 10);
+        assert_eq!(s.peek(0).unwrap(), b"..AA\x00\x00\x00BB\x00");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn process_gen_sparse_length_informed_by_prior_len() {
+        use crate::BStackGenOp;
+        // Grow to a total size only known once `Len` has reported the current size.
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hi").unwrap();
+        let writes: [(u64, &[u8]); 1] = [(0, b"Z")];
+        let mut size = 0u64;
+        let mut calls = 0usize;
+        s.process_gen(|| {
+            calls += 1;
+            match calls {
+                // SAFETY: `size` outlives this whole `process_gen` call.
+                1 => Some(BStackGenOp::Len {
+                    out: unsafe { core::mem::transmute::<&mut u64, _>(&mut size) },
+                }),
+                _ => Some(BStackGenOp::Sparse {
+                    writes: &writes,
+                    length: size + 2, // grow by (current size) + 2
+                }),
+            }
+        })
+        .unwrap();
+        assert_eq!(size, 2);
+        assert_eq!(s.len().unwrap(), 6);
+        assert_eq!(s.peek(0).unwrap(), b"hiZ\x00\x00\x00");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn process_gen_sparse_empty_writes_zero_length_is_noop() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        let writes: [(u64, &[u8]); 0] = [];
+        s.process_gen(|| {
+            Some(BStackGenOp::Sparse {
+                writes: &writes,
+                length: 0,
+            })
+        })
+        .unwrap();
+        assert_eq!(s.len().unwrap(), 5);
+        assert_eq!(s.peek(0).unwrap(), b"hello");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn process_gen_sparse_overlap_returns_error() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hi").unwrap();
+        let writes: [(u64, &[u8]); 2] = [(0, b"aaa"), (2, b"bb")];
+        let err = s
+            .process_gen(|| {
+                Some(BStackGenOp::Sparse {
+                    writes: &writes,
+                    length: 8,
+                })
+            })
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(s.len().unwrap(), 2);
+        assert_eq!(s.peek(0).unwrap(), b"hi");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn process_gen_sparse_out_of_range_returns_error() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hi").unwrap();
+        let writes: [(u64, &[u8]); 1] = [(3, b"zzz")];
+        let err = s
+            .process_gen(|| {
+                Some(BStackGenOp::Sparse {
+                    writes: &writes,
+                    length: 5,
+                })
+            })
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(s.len().unwrap(), 2);
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn process_gen_sparse_persists_across_reopen() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+        s.push(b"hi").unwrap();
+        let writes: [(u64, &[u8]); 1] = [(0, b"Z")];
+        s.process_gen(|| {
+            Some(BStackGenOp::Sparse {
+                writes: &writes,
+                length: 4,
+            })
+        })
+        .unwrap();
+        drop(s);
+        let s2 = BStack::open(&p).unwrap();
+        assert_eq!(s2.peek(0).unwrap(), b"hiZ\x00\x00\x00");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
     fn process_gen_len_informs_discard_size() {
         use crate::BStackGenOp;
         // Discard a trailing region whose length is only known once `Len` has
@@ -6385,13 +6525,24 @@ mod atomic_tests {
         s.push(b"helloworld").unwrap();
 
         let data = b"HELLO";
-        let mut errored = false;
+        let writes: [(u64, &[u8]); 1] = [(0, b"Z")];
+        // Feedback for op N arrives on call N+1: Write (step 0) is valid, so its
+        // feedback at step 1 is Ok; the size-changing Push (step 1) and Sparse
+        // (step 2) are each rejected, so their feedback at steps 2 and 3 is Err.
+        let mut push_errored = false;
+        let mut sparse_errored = false;
         let mut step = 0usize;
         s.inplace_gen(|res| {
-            if step == 2 {
-                // Feedback for the Push op is an error.
-                assert!(res.is_err());
-                errored = true;
+            match step {
+                2 => {
+                    assert!(res.is_err(), "Push should have reported an error");
+                    push_errored = true;
+                }
+                3 => {
+                    assert!(res.is_err(), "Sparse should have reported an error");
+                    sparse_errored = true;
+                }
+                _ => {}
             }
             let r = match step {
                 0 => Some(BStackGenOp::Write {
@@ -6399,17 +6550,18 @@ mod atomic_tests {
                     data: unsafe { core::mem::transmute::<&[u8], _>(&data[..]) },
                 }),
                 1 => Some(BStackGenOp::Push { data: b"!!!" }),
+                2 => Some(BStackGenOp::Sparse {
+                    writes: &writes,
+                    length: 4,
+                }),
                 _ => None,
             };
             step += 1;
             r
         })
         .unwrap();
-        assert!(
-            errored,
-            "Push should have reported an error to the callback"
-        );
-        // Size unchanged; the valid write still committed.
+        assert!(push_errored && sparse_errored);
+        // Size unchanged; only the valid in-place write committed.
         assert_eq!(s.len().unwrap(), 10);
         assert_eq!(s.peek(0).unwrap(), b"HELLOworld");
     }
