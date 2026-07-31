@@ -139,6 +139,12 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
             None => (eff_ty, false),
         };
 
+        // Reject unsupported `Vec` / `Option` nesting (`Vec<Vec<T>>`,
+        // `Option<Option<T>>`, and every mix like `Vec<Option<Vec<T>>>`) with a
+        // directed error, scanning outermost-first so the message names the first
+        // offending construct. Valid mixes (`Option<Vec<Option<T>>>`, …) pass.
+        check_container_nesting(eff_ty)?;
+
         // `Vec<T>` / `String` (and `&str` → `String`): an inline descriptor on
         // disk, a `BStackVec` at runtime. A nullable vec uses the `data_off == 0`
         // niche. Handled here.
@@ -1334,6 +1340,95 @@ struct VecInfo {
 /// Whether `ty` is the `str` type.
 fn is_str(ty: &Type) -> bool {
     matches!(ty, Type::Path(tp) if tp.path.segments.last().is_some_and(|s| s.ident == "str"))
+}
+
+/// The element type `T` of a `Vec<T>`, if `ty` is a `Vec`. Used to reject
+/// nested `Vec<Vec<T>>` / `Vec<String>` with a directed error.
+fn vec_inner(ty: &Type) -> Option<&Type> {
+    let Type::Path(tp) = ty else {
+        return None;
+    };
+    let seg = tp.path.segments.last()?;
+    if seg.ident != "Vec" {
+        return None;
+    }
+    let PathArguments::AngleBracketed(ab) = &seg.arguments else {
+        return None;
+    };
+    match ab.args.first()? {
+        GenericArgument::Type(inner) => Some(inner),
+        _ => None,
+    }
+}
+
+/// Directed error for a double `Option` (`Option<Option<T>>`) anywhere in the
+/// container nesting.
+fn err_double_option(ty: &Type) -> Error {
+    Error::new_spanned(
+        ty,
+        "nested `Option<Option<T>>` is not supported: a field / `Vec` slot lowers a \
+         single `Option` to the absent/`0` niche, and a second layer has nowhere to \
+         live on disk. Model the states explicitly with a `#[bstack_enum]`, e.g. \
+         `enum Slot { Missing, Empty, Present(T) }`.",
+    )
+}
+
+/// Directed error for a `Vec` / `String` nested inside another `Vec`
+/// (`Vec<Vec<T>>`, `Vec<String>`, `Vec<Option<Vec<T>>>`, …).
+fn err_vec_in_vec(ty: &Type) -> Error {
+    Error::new_spanned(
+        ty,
+        "nested `Vec<Vec<T>>` / `Vec<String>` is not supported: a `Vec` field stores one \
+         inline descriptor whose elements are a single leaf (POD or a block reference), \
+         not another dynamically-sized region. Wrap the inner vector in an explicit \
+         `#[bstack_block]` struct and store `Vec<ThatStruct>` (annotating the element \
+         per its ownership).",
+    )
+}
+
+/// Validate the `Vec` / `Option` nesting of a field type, outermost-first. A
+/// field allows at most one leading `Option` (the absent niche) around a `Vec`
+/// or a leaf; a `Vec` element allows at most one `Option` around a leaf. Any
+/// deeper `Vec`-in-`Vec` or `Option`-in-`Option` is rejected with a directed
+/// error naming the first offending construct. Leaves (POD, blocks, arrays,
+/// tuples) end the walk.
+fn check_container_nesting(ty: &Type) -> syn::Result<()> {
+    // Field top: peel at most one `Option`, then validate the bare type.
+    if let Some(inner) = option_inner(ty) {
+        if option_inner(inner).is_some() {
+            return Err(err_double_option(ty));
+        }
+        return check_bare(inner);
+    }
+    check_bare(ty)
+}
+
+/// A "bare" (no leading `Option` to peel) type: a `Vec` whose element must be a
+/// leaf-or-`Option<leaf>`, `String`, or a leaf.
+fn check_bare(ty: &Type) -> syn::Result<()> {
+    if let Some(elem) = vec_inner(ty) {
+        return check_vec_elem(elem);
+    }
+    Ok(())
+}
+
+/// A `Vec` element: a leaf, optionally wrapped in exactly one `Option`. A `Vec`
+/// / `String` here is `Vec<Vec>`; an `Option<Option>` is a double option; an
+/// `Option<Vec>` is again a nested `Vec`.
+fn check_vec_elem(ty: &Type) -> syn::Result<()> {
+    if let Some(inner) = option_inner(ty) {
+        if option_inner(inner).is_some() {
+            return Err(err_double_option(ty));
+        }
+        if vec_field(inner).is_some() {
+            return Err(err_vec_in_vec(ty));
+        }
+        return Ok(());
+    }
+    if vec_field(ty).is_some() {
+        return Err(err_vec_in_vec(ty));
+    }
+    Ok(())
 }
 
 /// Detect `Vec<T>` / `String` field types.
