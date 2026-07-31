@@ -3420,3 +3420,110 @@ fn macro_ref_vec_of_array() {
         l.bstack_drop(&alloc).unwrap();
     }
 }
+
+#[bstack_block]
+struct OwnedVecOfArr {
+    #[bstack_owned]
+    rows: Vec<[MacroLeaf; 2]>,
+    tag: u32,
+}
+
+#[test]
+fn macro_owned_vec_of_array() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let mk = |v| MacroLeaf::new(&alloc, v).unwrap();
+    let h = OwnedVecOfArr::new(&alloc, vec![[mk(1), mk(2)], [mk(3), mk(4)]], 7).unwrap();
+    assert_eq!(h.handle().tag(stack).unwrap(), 7);
+
+    let rows = h.handle().rows(&alloc).unwrap(); // Vec<[MacroLeaf; 2]>
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][0].val(stack).unwrap(), 1);
+    assert_eq!(rows[0][1].val(stack).unwrap(), 2);
+    assert_eq!(rows[1][0].val(stack).unwrap(), 3);
+    assert_eq!(rows[1][1].val(stack).unwrap(), 4);
+
+    // Deep clone: distinct child blocks.
+    let clone = h.try_clone_in(&alloc).unwrap();
+    let crows = clone.handle().rows(&alloc).unwrap();
+    assert_eq!(crows[1][1].val(stack).unwrap(), 4);
+    assert_ne!(crows[0][0].range().start(), rows[0][0].range().start());
+    clone.bstack_drop(&alloc).unwrap();
+    assert_eq!(h.handle().rows(&alloc).unwrap()[1][0].val(stack).unwrap(), 3);
+
+    h.bstack_drop(&alloc).unwrap();
+}
+
+#[bstack_block]
+struct StrongVecOfArr {
+    #[bstack_strong]
+    groups: Vec<[MacroStrongChild; 2]>,
+}
+
+#[test]
+fn macro_strong_vec_of_array() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let a = MacroStrongChild::new(&alloc, 10).unwrap();
+    let b = MacroStrongChild::new(&alloc, 20).unwrap();
+    let a_keep = a.try_clone().unwrap(); // a strong = 2
+    let a_data = a_keep.handle().range().start();
+
+    let h = StrongVecOfArr::new(&alloc, vec![[a, b]]).unwrap();
+    assert_eq!(strong_of(stack, a_data), 2); // h + a_keep
+
+    let g = h.handle().groups(&alloc).unwrap(); // Vec<[MacroStrongChild; 2]>
+    assert_eq!(g[0][0].val(stack).unwrap(), 10);
+    assert_eq!(g[0][1].val(stack).unwrap(), 20);
+
+    // Clone bumps every element's strong count.
+    let clone = h.try_clone_in(&alloc).unwrap();
+    assert_eq!(strong_of(stack, a_data), 3); // h + a_keep + clone
+    clone.bstack_drop(&alloc).unwrap();
+    assert_eq!(strong_of(stack, a_data), 2);
+
+    h.bstack_drop(&alloc).unwrap();
+    assert_eq!(strong_of(stack, a_data), 1); // a_keep only
+    drop(a_keep);
+}
+
+#[bstack_block]
+struct WeakVecOfArr {
+    #[bstack_weak]
+    groups: Vec<[MacroStrongChild; 2]>,
+}
+
+#[test]
+fn macro_weak_vec_of_array() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let a = MacroStrongChild::new(&alloc, 1).unwrap();
+    let b = MacroStrongChild::new(&alloc, 2).unwrap();
+    let h = WeakVecOfArr::new(
+        &alloc,
+        vec![[a.downgrade().unwrap(), b.downgrade().unwrap()]],
+    )
+    .unwrap();
+
+    let g = h.handle().groups(&alloc).unwrap(); // Vec<[Option<BStackRc>; 2]>
+    assert_eq!(g[0][0].as_ref().unwrap().handle().val(stack).unwrap(), 1);
+    assert!(g[0][1].as_ref().is_some());
+    drop(g); // release the upgraded strong refs so `a` can actually be freed
+
+    // Drop `a`'s data: its slot no longer upgrades; `b` still does.
+    drop(a);
+    let g = h.handle().groups(&alloc).unwrap();
+    assert!(g[0][0].is_none());
+    assert!(g[0][1].is_some());
+    drop(g);
+
+    // Teardown releases each weak count.
+    h.bstack_drop(&alloc).unwrap();
+    drop(b);
+}
