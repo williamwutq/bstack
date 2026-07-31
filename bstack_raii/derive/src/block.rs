@@ -249,10 +249,230 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
             continue;
         }
 
-        // Inline fixed-size array `[T; N]` of block references. (A POD array falls
-        // through to the POD path below — an array of `Pod` is `Pod`.) A reference
-        // array is stored inline as `[u64; N]`, no data block, with per-element
-        // ownership; the accessor / ctor traffic in arrays of handles `[Handle; N]`.
+        // Inline array of vectors `[Vec<T>; N]` — possibly nested `[[Vec<T>;N];M]`
+        // and/or per-element `[Option<Vec<T>>; N]`: N independent inline `VecDesc`s,
+        // each owning its own data block. Detected as an array whose leaf is a
+        // `Vec` / `String`. A POD `[Vec<Pod>; N]` is intercepted here too — the
+        // `VecDesc`s are Pod bytes, but the data blocks need a real lifecycle, so it
+        // must NOT fall through to the plain POD path. The element annotation names
+        // the inner vectors' element ownership, exactly like a scalar `Vec<T>`.
+        if let Type::Array(_) = opt_inner {
+            let (dims, leaf, leaf_nullable) = array_shape(opt_inner)?;
+            let leaf_vinfo = if is_str(leaf) {
+                Some(VecInfo {
+                    elem: quote!(u8),
+                    is_string: true,
+                })
+            } else {
+                vec_field(leaf)
+            };
+            if let Some(leaf_vinfo) = leaf_vinfo {
+                // Validate the leaf vector's own element nesting (`Vec<Vec<..>>`).
+                check_container_nesting(leaf)?;
+                if nullable {
+                    return Err(Error::new_spanned(
+                        &field.ty,
+                        "a whole-array `Option<[Vec<T>; N]>` is not supported; use \
+                         `[Option<Vec<T>>; N]` for per-element nullability",
+                    ));
+                }
+                if leaf_vinfo.is_string && kind != Kind::Pod {
+                    return Err(Error::new_spanned(
+                        &field.ty,
+                        "`String` is always POD; remove the ownership annotation",
+                    ));
+                }
+                if kind == Kind::Embed {
+                    return Err(Error::new_spanned(
+                        &field.ty,
+                        "cannot #[embed] a `Vec` / `String`; embed a `#[bstack_block]` type",
+                    ));
+                }
+                let total = dims_prod(&dims);
+                let elem = &leaf_vinfo.elem;
+                let is_string = leaf_vinfo.is_string;
+                let vec_ty = match kind {
+                    Kind::Pod => quote!(BStackVec),
+                    Kind::Owned => quote!(BStackBlockVec),
+                    Kind::Strong => quote!(BStackStrongVec),
+                    Kind::Weak => quote!(BStackWeakVec),
+                    Kind::Ref => quote!(BStackRefVec),
+                    Kind::Embed => unreachable!(),
+                };
+                on_disk_fields.push(quote!(#fname: [::bstack_raii::VecDesc; #total],));
+
+                // Accessor: nested `[[VecHandle; ..]; ..]` (or `Option` per slot),
+                // reading each `VecDesc` from the on-disk field once.
+                let handle_lt = quote!(::bstack_raii::#vec_ty<'__v, #elem, __A>);
+                let acc_leaf = if leaf_nullable {
+                    quote!(::core::option::Option<#handle_lt>)
+                } else {
+                    handle_lt.clone()
+                };
+                let acc_ret = nested_ty(&dims, &acc_leaf);
+                // Each slot resolves through `from_field` so descriptor updates
+                // (growth / realloc) persist back to its OWN inline `VecDesc` — like
+                // a scalar `Vec` field, but at `base + k * size_of::<VecDesc>()`.
+                let acc_read = |k: &Ident| {
+                    let slot = quote!(
+                        __base + (#k as u64) * (::core::mem::size_of::<::bstack_raii::VecDesc>() as u64));
+                    if leaf_nullable {
+                        quote!(unsafe { ::bstack_raii::#vec_ty::from_field_opt(#slot, allocator) }?)
+                    } else {
+                        quote!(unsafe { ::bstack_raii::#vec_ty::from_field(#slot, allocator) }?)
+                    }
+                };
+                let acc_body = nested_build(&dims, &acc_leaf, &acc_read);
+                accessors.push(quote! {
+                    #vis fn #fname<'__v, __A: ::bstack_raii::BStackOwnedSliceAllocator>(
+                        &self,
+                        allocator: &'__v __A,
+                    ) -> ::std::io::Result<#acc_ret> {
+                        let __base =
+                            self.0.start() + ::core::mem::offset_of!(#on_disk, #fname) as u64;
+                        ::std::result::Result::Ok(#acc_body)
+                    }
+                });
+
+                // Constructor: allocate a data block per slot, store its descriptor.
+                // POD slots take `&[T]` / `&str` (`from_slice`); block slots take
+                // `Vec<Handle>` (`from_handles`).
+                let handle_ctor = match kind {
+                    Kind::Owned => quote!(::bstack_raii::BStackOwned<#elem>),
+                    Kind::Strong => quote!(::bstack_raii::BStackRc<'__ctor, #elem, __A>),
+                    Kind::Weak => quote!(::bstack_raii::BStackWeak<'__ctor, #elem, __A>),
+                    Kind::Ref => quote!(::bstack_raii::BStackRef<#elem>),
+                    _ => quote!(),
+                };
+                let ctor_leaf = match kind {
+                    Kind::Pod if is_string => quote!(&str),
+                    Kind::Pod => quote!(&[#elem]),
+                    _ => quote!(::std::vec::Vec<#handle_ctor>),
+                };
+                let param_leaf = if leaf_nullable {
+                    quote!(::core::option::Option<#ctor_leaf>)
+                } else {
+                    ctor_leaf.clone()
+                };
+                let ctor_param_ty = nested_ty(&dims, &param_leaf);
+                ctor_params.push(quote!(#fname: #ctor_param_ty,));
+                let desc_of = |b: &Ident| -> TokenStream {
+                    match kind {
+                        Kind::Pod => {
+                            let data = if is_string {
+                                quote!(#b.as_bytes())
+                            } else {
+                                quote!(#b)
+                            };
+                            quote!(::bstack_raii::BStackVec::<#elem, __A>::from_slice(
+                                allocator, #data)?.descriptor())
+                        }
+                        _ => quote!(::bstack_raii::#vec_ty::<#elem, __A>::from_handles(
+                            allocator, #b)?.descriptor()),
+                    }
+                };
+                let ctor_write = |k: &Ident, leaf: &Ident| {
+                    if leaf_nullable {
+                        let inner = format_ident!("__vd");
+                        let d = desc_of(&inner);
+                        quote!({
+                            __slots[#k] = match #leaf {
+                                ::core::option::Option::Some(#inner) => #d,
+                                ::core::option::Option::None =>
+                                    ::core::default::Default::default(),
+                            };
+                        })
+                    } else {
+                        let d = desc_of(leaf);
+                        quote!(__slots[#k] = #d;)
+                    }
+                };
+                let flatten = nested_consume(&dims, &quote!(#fname), &ctor_write);
+                ctor_preps.push(quote! {
+                    let #fname: [::bstack_raii::VecDesc; #total] = {
+                        let mut __slots =
+                            [<::bstack_raii::VecDesc as ::core::default::Default>::default();
+                                #total];
+                        #flatten
+                        __slots
+                    };
+                });
+                ctor_inits.push(quote!(#fname: #fname,));
+
+                // Teardown: free each vector's data block.
+                drop_stmts.push(quote! {
+                    {
+                        let __descs: [::bstack_raii::VecDesc; #total] = __on_disk.#fname;
+                        for __k in 0usize..(#total) {
+                            if __descs[__k].data_off != 0 {
+                                ::bstack_raii::#vec_ty::<#elem, __A>::from_desc(
+                                    __descs[__k], allocator).bstack_drop()?;
+                            }
+                        }
+                    }
+                });
+
+                // Clone: deep-clone each vector's data block per the element
+                // relationship, repointing the slot descriptor (a `0` niche is kept).
+                let clone_expr = match kind {
+                    Kind::Pod => quote!(::bstack_raii::BStackVec::<#elem, __A>::from_desc(
+                        __sd, allocator).clone_data_into(__plan)?),
+                    Kind::Owned => quote!(::bstack_raii::BStackBlockVec::<#elem, __A>::from_desc(
+                        __sd, allocator).clone_into(__plan, |__er, __p| {
+                            <#elem as ::bstack_raii::BStackBlock>::from_range(__er)
+                                .__bstack_clone_into(allocator, __p)
+                        })?),
+                    Kind::Strong => quote!(::bstack_raii::BStackStrongVec::<#elem, __A>::from_desc(
+                        __sd, allocator).clone_into(__plan)?),
+                    Kind::Weak => quote!(::bstack_raii::BStackWeakVec::<#elem, __A>::from_desc(
+                        __sd, allocator).clone_into(__plan)?),
+                    Kind::Ref => quote!(::bstack_raii::BStackRefVec::<#elem, __A>::from_desc(
+                        __sd, allocator).clone_into(__plan)?),
+                    Kind::Embed => unreachable!(),
+                };
+                clone_stmts.push(quote! {
+                    {
+                        let mut __descs: [::bstack_raii::VecDesc; #total] = __od.#fname;
+                        for __k in 0usize..(#total) {
+                            let __sd: ::bstack_raii::VecDesc = __descs[__k];
+                            if __sd.data_off != 0 {
+                                __descs[__k] = #clone_expr;
+                            }
+                        }
+                        __od.#fname = __descs;
+                    }
+                });
+
+                // Move: nested `[[VecHandle; ..]; ..]` from the captured descriptors.
+                let cap = format_ident!("__cap_{}", fname);
+                mv_caps.push(quote!(let #cap = __od.#fname;));
+                let mv_handle = quote!(::bstack_raii::#vec_ty<'__mv, #elem, __A>);
+                let mv_leaf = if leaf_nullable {
+                    quote!(::core::option::Option<#mv_handle>)
+                } else {
+                    mv_handle.clone()
+                };
+                mv_types.push(nested_ty(&dims, &mv_leaf));
+                let mv_read = |k: &Ident| {
+                    if leaf_nullable {
+                        quote!({
+                            let __d = #cap[#k];
+                            if __d.data_off != 0 {
+                                ::core::option::Option::Some(
+                                    ::bstack_raii::#vec_ty::from_desc(__d, __alloc))
+                            } else {
+                                ::core::option::Option::None
+                            }
+                        })
+                    } else {
+                        quote!(::bstack_raii::#vec_ty::from_desc(#cap[#k], __alloc))
+                    }
+                };
+                mv_recon.push(nested_build(&dims, &mv_leaf, &mv_read));
+                continue;
+            }
+        }
+
         // Inline fixed-size array `[T; N]` — possibly *nested* `[[..]; ..]` — of
         // block references. (A POD array falls through to the POD path below: an
         // array of `Pod` is `Pod`.) Stored **flat** as `[u64; N0*..*Nk]` inline

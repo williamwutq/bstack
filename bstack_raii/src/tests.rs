@@ -3243,3 +3243,132 @@ fn macro_enum_owned_nested_array() {
         _ => panic!("expected Grid"),
     }
 }
+
+// --------------------------------------------------------------------------
+// Inline arrays of vectors `[Vec<T>; N]` (N independent inline VecDescs)
+// --------------------------------------------------------------------------
+
+#[bstack_block]
+struct PodVecArr {
+    rows: [Vec<u32>; 2],
+    tag: u32,
+}
+
+#[test]
+fn macro_pod_vec_array() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let h = PodVecArr::new(&alloc, [&[1u32, 2][..], &[3, 4, 5][..]], 9).unwrap();
+    assert_eq!(h.handle().tag(stack).unwrap(), 9);
+
+    let rows = h.handle().rows(&alloc).unwrap(); // [BStackVec<u32,_>; 2]
+    assert_eq!(rows[0].to_vec().unwrap(), vec![1u32, 2]);
+    assert_eq!(rows[1].to_vec().unwrap(), vec![3u32, 4, 5]);
+
+    // Each slot is an independent, growable vector.
+    let mut rows_mut = h.handle().rows(&alloc).unwrap();
+    rows_mut[0].push(99).unwrap();
+    assert_eq!(h.handle().rows(&alloc).unwrap()[0].to_vec().unwrap(), vec![1u32, 2, 99]);
+    assert_eq!(h.handle().rows(&alloc).unwrap()[1].to_vec().unwrap(), vec![3u32, 4, 5]);
+
+    // Clone deep-copies both data blocks.
+    let clone = h.try_clone_in(&alloc).unwrap();
+    let crows = clone.handle().rows(&alloc).unwrap();
+    assert_eq!(crows[1].to_vec().unwrap(), vec![3u32, 4, 5]);
+    clone.bstack_drop(&alloc).unwrap();
+    assert_eq!(h.handle().rows(&alloc).unwrap()[1].to_vec().unwrap(), vec![3u32, 4, 5]);
+
+    // Move yields the two vec handles.
+    let (moved, tag) = bstack_move!(h, &alloc).unwrap();
+    assert_eq!(tag, 9);
+    assert_eq!(moved[1].to_vec().unwrap(), vec![3u32, 4, 5]);
+    for v in moved {
+        v.bstack_drop().unwrap();
+    }
+}
+
+#[bstack_block]
+struct RefVecArr {
+    #[bstack_ref]
+    lists: [Vec<MacroLeaf>; 2],
+}
+
+#[test]
+fn macro_ref_vec_array() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let leaves: Vec<_> = (0..4).map(|v| MacroLeaf::new(&alloc, v).unwrap()).collect();
+    let r = |i: usize| unsafe { BStackRef::from_range(leaves[i].handle().range()) };
+    let h = RefVecArr::new(&alloc, [vec![r(0), r(1)], vec![r(2), r(3)]]).unwrap();
+
+    let ls = h.handle().lists(&alloc).unwrap(); // [BStackRefVec<MacroLeaf,_>; 2]
+    assert_eq!(ls[0].len().unwrap(), 2);
+    assert_eq!(ls[0].get(1).unwrap().unwrap().val(stack).unwrap(), 1);
+    assert_eq!(ls[1].get(0).unwrap().unwrap().val(stack).unwrap(), 2);
+
+    // Ref vecs own the offset arrays but not the targets.
+    h.bstack_drop(&alloc).unwrap();
+    for l in leaves {
+        assert!(l.handle().val(stack).unwrap() < 4);
+        l.bstack_drop(&alloc).unwrap();
+    }
+}
+
+#[bstack_block]
+struct OwnedVecArr {
+    #[bstack_owned]
+    groups: [Vec<MacroLeaf>; 2],
+    tag: u32,
+}
+
+#[test]
+fn macro_owned_vec_array() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let g0 = vec![MacroLeaf::new(&alloc, 10).unwrap(), MacroLeaf::new(&alloc, 11).unwrap()];
+    let g1 = vec![MacroLeaf::new(&alloc, 20).unwrap()];
+    let h = OwnedVecArr::new(&alloc, [g0, g1], 7).unwrap();
+    assert_eq!(h.handle().tag(stack).unwrap(), 7);
+
+    let gs = h.handle().groups(&alloc).unwrap();
+    assert_eq!(gs[0].len().unwrap(), 2);
+    assert_eq!(gs[0].get(0).unwrap().unwrap().val(stack).unwrap(), 10);
+    assert_eq!(gs[1].get(0).unwrap().unwrap().val(stack).unwrap(), 20);
+
+    // Deep clone: distinct child blocks.
+    let clone = h.try_clone_in(&alloc).unwrap();
+    let cgs = clone.handle().groups(&alloc).unwrap();
+    assert_eq!(cgs[0].get(1).unwrap().unwrap().val(stack).unwrap(), 11);
+    assert_ne!(
+        cgs[0].get(0).unwrap().unwrap().range().start(),
+        gs[0].get(0).unwrap().unwrap().range().start()
+    );
+    clone.bstack_drop(&alloc).unwrap();
+    assert_eq!(h.handle().groups(&alloc).unwrap()[1].get(0).unwrap().unwrap().val(stack).unwrap(), 20);
+
+    h.bstack_drop(&alloc).unwrap();
+}
+
+#[bstack_block]
+struct OptVecArr {
+    slots: [Option<Vec<u32>>; 3],
+}
+
+#[test]
+fn macro_option_vec_array() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+
+    let h = OptVecArr::new(&alloc, [Some(&[1u32, 2][..]), None, Some(&[9][..])]).unwrap();
+    let s = h.handle().slots(&alloc).unwrap(); // [Option<BStackVec<u32,_>>; 3]
+    assert_eq!(s[0].as_ref().unwrap().to_vec().unwrap(), vec![1u32, 2]);
+    assert!(s[1].is_none());
+    assert_eq!(s[2].as_ref().unwrap().to_vec().unwrap(), vec![9u32]);
+    h.bstack_drop(&alloc).unwrap();
+}
