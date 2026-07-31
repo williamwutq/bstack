@@ -251,11 +251,120 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                 Some(__inner) => (__inner, true),
                 None => (&arr.elem, false),
             };
+            // `#[embed] [Child; N]`: N verbatim child on-disk forms inline
+            // (`[<Child as BStackBlock>::OnDisk; N]`). Construction folds each
+            // `BStackOwned<Child>` in (a lot of movement — read OnDisk, free shell).
             if kind == Kind::Embed {
-                return Err(Error::new_spanned(
-                    &field.ty,
-                    "#[embed] arrays are not yet supported",
-                ));
+                if nullable || elem_nullable {
+                    return Err(Error::new_spanned(
+                        &field.ty,
+                        "#[embed] does not support `Option`",
+                    ));
+                }
+                let child = elem;
+                let child_od = quote!(<#child as ::bstack_raii::BStackBlock>::OnDisk);
+                on_disk_fields.push(quote!(#fname: [#child_od; #len],));
+
+                // Teardown: free each embedded child's children in place.
+                drop_stmts.push(quote! {
+                    {
+                        let __base =
+                            __range.start() + ::core::mem::offset_of!(#on_disk, #fname) as u64;
+                        let __step = ::core::mem::size_of::<#child_od>() as u64;
+                        for __i in 0..#len {
+                            let __embed = ::bstack_raii::BStackRange::new(
+                                __base + (__i as u64) * __step, __step);
+                            <#child>::__bstack_drop_children(__embed, allocator)?;
+                        }
+                    }
+                });
+
+                // Accessor: `[Child; N]`, each a handle into its inline slot.
+                accessors.push(quote! {
+                    #vis fn #fname(&self) -> [#child; #len] {
+                        let __base =
+                            self.0.start() + ::core::mem::offset_of!(#on_disk, #fname) as u64;
+                        let __step = ::core::mem::size_of::<#child_od>() as u64;
+                        ::core::array::from_fn(|__i| {
+                            <#child as ::bstack_raii::BStackBlock>::from_range(
+                                ::bstack_raii::BStackRange::new(
+                                    __base + (__i as u64) * __step, __step))
+                        })
+                    }
+                });
+
+                // Constructor: fold each `BStackOwned<Child>` in — read its OnDisk,
+                // free its shell (its own children stay live, now owned by the embed).
+                ctor_params.push(quote!(#fname: [::bstack_raii::BStackOwned<#child>; #len],));
+                ctor_preps.push(quote! {
+                    let #fname: [#child_od; #len] = {
+                        let mut __v = ::std::vec::Vec::with_capacity(#len);
+                        for __owned in #fname {
+                            let __h = __owned.into_inner();
+                            let __cr = ::bstack_raii::BStackBlock::range(&__h);
+                            let mut __b = [0u8; ::core::mem::size_of::<#child_od>()];
+                            let __cod = *unsafe {
+                                ::bstack_raii::BStackRef::<#child>::from_range(__cr)
+                            }.read_on_disk(allocator.stack(), &mut __b)?;
+                            unsafe { ::bstack_raii::dealloc_range(allocator, __cr)?; }
+                            __v.push(__cod);
+                        }
+                        match <[#child_od; #len]>::try_from(__v) {
+                            ::std::result::Result::Ok(__a) => __a,
+                            ::std::result::Result::Err(_) => unreachable!(),
+                        }
+                    };
+                });
+                ctor_inits.push(quote!(#fname: #fname,));
+
+                // Move: re-home each embedded child to a fresh standalone allocation.
+                let cap = format_ident!("__cap_{}", fname);
+                mv_caps.push(quote!(let #cap = __od.#fname;));
+                mv_types.push(quote!([::bstack_raii::BStackOwned<#child>; #len]));
+                mv_recon.push(quote! {
+                    {
+                        let mut __v = ::std::vec::Vec::with_capacity(#len);
+                        for __cod in #cap {
+                            let mut __slice =
+                                __alloc.alloc(::core::mem::size_of::<#child_od>() as u64)?;
+                            let __r = __slice.as_range();
+                            if let ::std::result::Result::Err(__e) =
+                                __slice.write_range(0, ::bstack_raii::bytemuck::bytes_of(&__cod))
+                            {
+                                let _ = __alloc.dealloc(__slice);
+                                return ::std::result::Result::Err(__e);
+                            }
+                            __v.push(unsafe {
+                                ::bstack_raii::BStackOwned::from_raw(
+                                    <#child as ::bstack_raii::BStackBlock>::from_range(__r))
+                            });
+                        }
+                        match <[::bstack_raii::BStackOwned<#child>; #len]>::try_from(__v) {
+                            ::std::result::Result::Ok(__a) => __a,
+                            ::std::result::Result::Err(_) => unreachable!(),
+                        }
+                    }
+                });
+
+                // Clone: fold each embedded child's clone inline (copy the array out,
+                // mutate, write back — a packed field's elements can't be `&mut`'d).
+                clone_stmts.push(quote! {
+                    {
+                        let __base =
+                            __src.start() + ::core::mem::offset_of!(#on_disk, #fname) as u64;
+                        let __step = ::core::mem::size_of::<#child_od>() as u64;
+                        let mut __arr: [#child_od; #len] = __od.#fname;
+                        for __i in 0..#len {
+                            let __child = <#child as ::bstack_raii::BStackBlock>::from_range(
+                                ::bstack_raii::BStackRange::new(
+                                    __base + (__i as u64) * __step, __step));
+                            __arr[__i] =
+                                __child.__bstack_clone_children_inplace(allocator, __plan)?;
+                        }
+                        __od.#fname = __arr;
+                    }
+                });
+                continue;
             }
             if nullable {
                 return Err(Error::new_spanned(

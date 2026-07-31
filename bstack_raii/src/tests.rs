@@ -2773,3 +2773,48 @@ fn macro_pod_option_array() {
     assert_eq!(arr[2].map(|n| n.get()), Some(9));
     p.bstack_drop(&alloc).unwrap();
 }
+
+#[bstack_block]
+struct EmbArrHolder {
+    #[embed]
+    kids: [EmbChild; 2],
+    tag: u32,
+}
+
+#[test]
+fn macro_embed_array() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    // Two embedded children, each owning its own leaf.
+    let k0 = EmbChild::new(&alloc, MacroLeaf::new(&alloc, 10).unwrap(), 1).unwrap();
+    let k1 = EmbChild::new(&alloc, MacroLeaf::new(&alloc, 20).unwrap(), 2).unwrap();
+    let h = EmbArrHolder::new(&alloc, [k0, k1], 99).unwrap();
+    assert_eq!(h.handle().tag(stack).unwrap(), 99);
+
+    // Accessor: `[EmbChild; 2]` handles into the inline slots (pure offset math).
+    let kids = h.handle().kids();
+    assert_eq!(kids[0].n(stack).unwrap(), 1);
+    assert_eq!(kids[0].leaf(stack).unwrap().val(stack).unwrap(), 10);
+    assert_eq!(kids[1].leaf(stack).unwrap().val(stack).unwrap(), 20);
+
+    // Clone folds each embedded child inline, deep-cloning its owned leaf.
+    let clone = h.try_clone_in(&alloc).unwrap();
+    let ckids = clone.handle().kids();
+    assert_eq!(ckids[1].leaf(stack).unwrap().val(stack).unwrap(), 20);
+    assert_ne!(
+        ckids[0].leaf(stack).unwrap().range().start(),
+        kids[0].leaf(stack).unwrap().range().start()
+    );
+    clone.bstack_drop(&alloc).unwrap();
+    assert_eq!(h.handle().kids()[1].leaf(stack).unwrap().val(stack).unwrap(), 20);
+
+    // Move re-homes each embedded child to a fresh standalone allocation.
+    let (moved, tag) = bstack_move!(h, &alloc).unwrap();
+    assert_eq!(tag, 99);
+    assert_eq!(moved[0].handle().leaf(stack).unwrap().val(stack).unwrap(), 10);
+    for m in moved {
+        m.bstack_drop(&alloc).unwrap();
+    }
+}
