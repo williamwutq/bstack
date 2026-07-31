@@ -2674,3 +2674,102 @@ fn macro_weak_array() {
     drop(c0);
     drop(c1);
 }
+
+#[bstack_block]
+struct OptArrHolder {
+    #[bstack_owned]
+    leaves: [Option<MacroLeaf>; 3],
+}
+
+#[test]
+fn macro_owned_option_array() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+    let leaf_size = size_of::<<MacroLeaf as BStackBlock>::OnDisk>() as u64;
+
+    // Middle element is None.
+    let l0 = MacroLeaf::new(&alloc, 10).unwrap();
+    let l2 = MacroLeaf::new(&alloc, 30).unwrap();
+    let off0 = l0.handle().range().start();
+    let h = OptArrHolder::new(&alloc, [Some(l0), None, Some(l2)]).unwrap();
+
+    let arr = h.handle().leaves(stack).unwrap(); // [Option<MacroLeaf>; 3]
+    assert_eq!(arr[0].as_ref().unwrap().val(stack).unwrap(), 10);
+    assert!(arr[1].is_none());
+    assert_eq!(arr[2].as_ref().unwrap().val(stack).unwrap(), 30);
+
+    // Clone deep-copies the present elements, keeps the hole.
+    let clone = h.try_clone_in(&alloc).unwrap();
+    let carr = clone.handle().leaves(stack).unwrap();
+    assert_eq!(carr[0].as_ref().unwrap().val(stack).unwrap(), 10);
+    assert!(carr[1].is_none());
+    assert_ne!(
+        carr[0].as_ref().unwrap().range().start(),
+        arr[0].as_ref().unwrap().range().start()
+    );
+
+    // Move yields `[Option<BStackOwned<MacroLeaf>>; 3]`.
+    clone.bstack_drop(&alloc).unwrap();
+    let (moved,) = bstack_move!(h, &alloc).unwrap();
+    assert_eq!(moved[2].as_ref().unwrap().handle().val(stack).unwrap(), 30);
+    assert!(moved[1].is_none());
+    for o in moved.into_iter().flatten() {
+        o.bstack_drop(&alloc).unwrap();
+    }
+    // The present children were freed by the move re-home + drop; a slot comes back.
+    let reused = alloc_block(&alloc, MacroLeaf::eightcc(), leaf_size).unwrap();
+    let _ = off0;
+    unsafe { dealloc_range(&alloc, reused).unwrap() };
+}
+
+#[bstack_block]
+struct OptRefArrHolder {
+    #[bstack_ref]
+    refs: [Option<MacroLeaf>; 2],
+}
+
+#[test]
+fn macro_ref_option_array() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+    let l0 = MacroLeaf::new(&alloc, 1).unwrap();
+    let r0 = unsafe { BStackRef::from_range(l0.handle().range()) };
+
+    // Element 1 is a null reference.
+    let h = OptRefArrHolder::new(&alloc, [Some(r0), None]).unwrap();
+    let arr = h.handle().refs(stack).unwrap(); // [Option<MacroLeaf>; 2]
+    assert_eq!(arr[0].as_ref().unwrap().val(stack).unwrap(), 1);
+    assert!(arr[1].is_none());
+
+    h.bstack_drop(&alloc).unwrap(); // owns nothing
+    assert_eq!(l0.handle().val(stack).unwrap(), 1);
+    l0.bstack_drop(&alloc).unwrap();
+}
+
+#[bstack_block]
+struct PodOptArr {
+    xs: [Option<core::num::NonZeroU32>; 3],
+}
+
+#[test]
+fn macro_pod_option_array() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+    let p = PodOptArr::new(
+        &alloc,
+        [
+            core::num::NonZeroU32::new(5),
+            None,
+            core::num::NonZeroU32::new(9),
+        ],
+    )
+    .unwrap();
+    let arr = p.handle().xs(stack).unwrap(); // [Option<NonZeroU32>; 3]
+    assert_eq!(arr[0].map(|n| n.get()), Some(5));
+    assert!(arr[1].is_none());
+    assert_eq!(arr[2].map(|n| n.get()), Some(9));
+    p.bstack_drop(&alloc).unwrap();
+}

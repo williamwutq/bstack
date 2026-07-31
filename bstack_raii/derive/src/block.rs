@@ -245,8 +245,12 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         // array is stored inline as `[u64; N]`, no data block, with per-element
         // ownership; the accessor / ctor traffic in arrays of handles `[Handle; N]`.
         if kind != Kind::Pod && let Type::Array(arr) = opt_inner {
-            let elem = &arr.elem;
             let len = &arr.len;
+            // A per-element `Option<T>` makes each slot nullable (offset 0 == None).
+            let (elem, elem_nullable): (&Type, bool) = match option_inner(&arr.elem) {
+                Some(__inner) => (__inner, true),
+                None => (&arr.elem, false),
+            };
             if kind == Kind::Embed {
                 return Err(Error::new_spanned(
                     &field.ty,
@@ -256,7 +260,8 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
             if nullable {
                 return Err(Error::new_spanned(
                     &field.ty,
-                    "nullable arrays (`Option<[T; N]>` / `[Option<_>; N]`) are not yet supported",
+                    "a whole-array `Option<[T; N]>` is not supported; use `[Option<T>; N]` \
+                     for per-element nullability",
                 ));
             }
             on_disk_fields.push(quote!(#fname: [u64; #len],));
@@ -364,21 +369,32 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                 ::core::mem::size_of::<<#elem as ::bstack_raii::BStackBlock>::OnDisk>() as u64
             };
 
-            // Accessor: read the inline offsets, resolve each to a handle.
+            // Accessor: read the inline offsets, resolve each to a handle (or
+            // `None` for a `0` slot in an `Option`-element array).
+            let resolve_expr = quote!(<#elem as ::bstack_raii::BStackBlock>::from_range(
+                ::bstack_raii::BStackRange::new(__off, #size_elem)));
+            let (acc_ret, acc_map) = if elem_nullable {
+                (
+                    quote!([::core::option::Option<#elem>; #len]),
+                    quote!(if __off == 0 {
+                        ::core::option::Option::None
+                    } else {
+                        ::core::option::Option::Some(#resolve_expr)
+                    }),
+                )
+            } else {
+                (quote!([#elem; #len]), resolve_expr.clone())
+            };
             accessors.push(quote! {
                 #vis fn #fname(
                     &self,
                     stack: &::bstack_raii::BStack,
-                ) -> ::std::io::Result<[#elem; #len]> {
+                ) -> ::std::io::Result<#acc_ret> {
                     let mut __buf = [0u8; ::core::mem::size_of::<#on_disk>()];
                     let __r = unsafe { ::bstack_raii::BStackRef::<Self>::from_range(self.0) };
                     let __od: #on_disk = *__r.read_on_disk(stack, &mut __buf)?;
                     let __offs: [u64; #len] = __od.#fname;
-                    ::std::result::Result::Ok(__offs.map(|__off| {
-                        <#elem as ::bstack_raii::BStackBlock>::from_range(
-                            ::bstack_raii::BStackRange::new(__off, #size_elem),
-                        )
-                    }))
+                    ::std::result::Result::Ok(__offs.map(|__off| #acc_map))
                 }
             });
 
@@ -404,9 +420,17 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                 ),
                 _ => unreachable!(),
             };
-            ctor_params.push(quote!(#fname: [#handle_ty; #len],));
-            ctor_preps
-                .push(quote!(let #fname: [u64; #len] = #fname.map(|__handle| #to_off);));
+            if elem_nullable {
+                ctor_params.push(quote!(#fname: [::core::option::Option<#handle_ty>; #len],));
+                ctor_preps.push(quote!(let #fname: [u64; #len] = #fname.map(|__opt| match __opt {
+                    ::core::option::Option::Some(__handle) => #to_off,
+                    ::core::option::Option::None => 0u64,
+                });));
+            } else {
+                ctor_params.push(quote!(#fname: [#handle_ty; #len],));
+                ctor_preps
+                    .push(quote!(let #fname: [u64; #len] = #fname.map(|__handle| #to_off);));
+            }
             ctor_inits.push(quote!(#fname: #fname,));
 
             // Teardown: free / release each non-null element (a ref owns nothing).
@@ -472,41 +496,81 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                 _ => {}
             }
 
-            // Move: `[u64; N]` → `[Handle; N]`.
+            // Move: `[u64; N]` → `[Handle; N]` (or `[Option<Handle>; N]`).
             let cap = format_ident!("__cap_{}", fname);
             mv_caps.push(quote!(let #cap = __od.#fname;));
             match kind {
-                Kind::Owned => {
-                    mv_types.push(quote!([::bstack_raii::BStackOwned<#elem>; #len]));
-                    mv_recon.push(quote!(#cap.map(|__off| unsafe {
-                        ::bstack_raii::BStackOwned::from_raw(
-                            <#elem as ::bstack_raii::BStackBlock>::from_range(
-                                ::bstack_raii::BStackRange::new(__off, #size_elem)))
-                    })));
+                // Owned / ref reconstruct infallibly, via `array::map`.
+                Kind::Owned | Kind::Ref => {
+                    let (inner_ty, recon_one) = if kind == Kind::Owned {
+                        (
+                            quote!(::bstack_raii::BStackOwned<#elem>),
+                            quote!(unsafe {
+                                ::bstack_raii::BStackOwned::from_raw(
+                                    <#elem as ::bstack_raii::BStackBlock>::from_range(
+                                        ::bstack_raii::BStackRange::new(__off, #size_elem)))
+                            }),
+                        )
+                    } else {
+                        (
+                            quote!(::bstack_raii::BStackRef<#elem>),
+                            quote!(unsafe {
+                                ::bstack_raii::BStackRef::<#elem>::from_range(
+                                    ::bstack_raii::BStackRange::new(__off, #size_elem))
+                            }),
+                        )
+                    };
+                    if elem_nullable {
+                        mv_types.push(quote!([::core::option::Option<#inner_ty>; #len]));
+                        mv_recon.push(quote!(#cap.map(|__off| if __off == 0 {
+                            ::core::option::Option::None
+                        } else {
+                            ::core::option::Option::Some(#recon_one)
+                        })));
+                    } else {
+                        mv_types.push(quote!([#inner_ty; #len]));
+                        mv_recon.push(quote!(#cap.map(|__off| #recon_one)));
+                    }
                 }
-                Kind::Ref => {
-                    mv_types.push(quote!([::bstack_raii::BStackRef<#elem>; #len]));
-                    mv_recon.push(quote!(#cap.map(|__off| unsafe {
-                        ::bstack_raii::BStackRef::<#elem>::from_range(
-                            ::bstack_raii::BStackRange::new(__off, #size_elem))
-                    })));
-                }
+                // Strong's `strong_parts` is fallible → build via a `Vec`.
                 Kind::Strong => {
-                    // `strong_parts` is fallible → build via a `Vec`, then convert.
-                    mv_types.push(quote!([::bstack_raii::BStackRc<'__mv, #elem, __A>; #len]));
+                    let (elem_ty, push_expr) = if elem_nullable {
+                        (
+                            quote!(::core::option::Option<
+                                ::bstack_raii::BStackRc<'__mv, #elem, __A>>),
+                            quote!(if __off == 0 {
+                                ::core::option::Option::None
+                            } else {
+                                let __data = unsafe {
+                                    ::bstack_raii::BStackRef::<#elem>::from_range(
+                                        ::bstack_raii::BStackRange::new(__off, #size_elem)) };
+                                let (__d, __c) =
+                                    <#elem as ::bstack_raii::BStackShared>::strong_parts(__data, __alloc)?;
+                                ::core::option::Option::Some(unsafe {
+                                    ::bstack_raii::BStackRc::from_raw(__d, __c, __alloc) })
+                            }),
+                        )
+                    } else {
+                        (
+                            quote!(::bstack_raii::BStackRc<'__mv, #elem, __A>),
+                            quote!({
+                                let __data = unsafe {
+                                    ::bstack_raii::BStackRef::<#elem>::from_range(
+                                        ::bstack_raii::BStackRange::new(__off, #size_elem)) };
+                                let (__d, __c) =
+                                    <#elem as ::bstack_raii::BStackShared>::strong_parts(__data, __alloc)?;
+                                unsafe { ::bstack_raii::BStackRc::from_raw(__d, __c, __alloc) }
+                            }),
+                        )
+                    };
+                    mv_types.push(quote!([#elem_ty; #len]));
                     mv_recon.push(quote! {
                         {
                             let mut __v = ::std::vec::Vec::with_capacity(#len);
                             for __off in #cap {
-                                let __data = unsafe {
-                                    ::bstack_raii::BStackRef::<#elem>::from_range(
-                                        ::bstack_raii::BStackRange::new(__off, #size_elem))
-                                };
-                                let (__d, __c) = <#elem as ::bstack_raii::BStackShared>::strong_parts(
-                                    __data, __alloc)?;
-                                __v.push(unsafe { ::bstack_raii::BStackRc::from_raw(__d, __c, __alloc) });
+                                __v.push(#push_expr);
                             }
-                            match <[::bstack_raii::BStackRc<'__mv, #elem, __A>; #len]>::try_from(__v) {
+                            match <[#elem_ty; #len]>::try_from(__v) {
                                 ::std::result::Result::Ok(__a) => __a,
                                 ::std::result::Result::Err(_) => unreachable!(),
                             }
