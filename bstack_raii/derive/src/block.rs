@@ -1889,6 +1889,19 @@ fn err_vec_in_vec(ty: &Type) -> Error {
     )
 }
 
+/// Directed error for a tuple used as a `Vec` element (`Vec<(A, B)>`,
+/// `Vec<[(A, B); N]>`, …).
+fn err_tuple_in_vec(ty: &Type) -> Error {
+    Error::new_spanned(
+        ty,
+        "a tuple is not supported as a `Vec` element: a `Vec` element must be a single \
+         leaf — POD, or a block reference — and a tuple (a POD one has no `Vec` layout, \
+         a `(ref, pod)` one cannot be split into offset + inline bytes) is neither. Wrap \
+         it in a named `#[bstack_block]` struct and store `Vec<ThatStruct>` (annotating \
+         each reference field inside it, leaving POD fields plain).",
+    )
+}
+
 /// Validate the `Vec` / `Option` nesting of a field type, outermost-first. A
 /// field allows at most one leading `Option` (the absent niche) around a `Vec`
 /// or a leaf; a `Vec` element allows at most one `Option` around a leaf. Any
@@ -1933,10 +1946,16 @@ fn check_vec_elem(ty: &Type) -> syn::Result<()> {
         if vec_field(inner).is_some() {
             return Err(err_vec_in_vec(ty));
         }
+        if let Type::Tuple(_) = inner {
+            return Err(err_tuple_in_vec(inner));
+        }
         return Ok(());
     }
     if vec_field(ty).is_some() {
         return Err(err_vec_in_vec(ty));
+    }
+    if let Type::Tuple(_) = ty {
+        return Err(err_tuple_in_vec(ty));
     }
     Ok(())
 }
