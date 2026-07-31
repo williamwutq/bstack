@@ -54,6 +54,20 @@ Reasons:
 
 The mutex in `FirstFitBStackAllocator` serialises free-list mutation and tail extension/retraction. The size-conditional `try_extend`/`try_discard` primitives could pull the tail operations out from under it, leaving it to guard only the free list — but the win is small. Tail operations are not the common case, and a thread doing one still contends on the free-list mutex for the surrounding read-modify-write. While the free list remains a single mutex-guarded doubly-linked list (lock-free traversal is not possible yet), removing tail-op contention alone does not move the bottleneck — and it trades an obviously-correct design for an optimistic protocol resting on per-path ABA arguments (`try_*` checks payload *size*, not block identity).
 
+### Adding a `Copy { from, to, len }` op to `BStackGenOp`
+
+Reasons:
+
+A single-shot `copy` is well-defined because there is exactly one source read and one destination write against a fixed state, so overlap can be rejected up front. Inside a generator (`process_gen`/`inplace_gen`) that guarantee dissolves. Chaining copies makes the source of a later copy depend on the destination of an earlier one — `Copy a→b` then `Copy b→a` has no single answer (does the second copy read `b`'s original bytes or the bytes the first copy just wrote?), and the choice silently changes the result. Worse, a sequence of individually non-overlapping copies can compose into an *effective* overlap that no per-op bounds check can catch, so the "regions must not overlap" invariant that makes standalone `copy` crash-atomic cannot be enforced across the batch. Resolving this would require either snapshotting the whole payload or defining a read-vs-write ordering that the crash-atomic commit model has no way to represent. Callers who need copy-like behaviour in a generator can express it explicitly with `Read` into a caller-owned buffer followed by `Write`, which makes the intended source state unambiguous.
+
+### Adopting `extend_sparse` in the slab allocators
+
+Reasons:
+
+`SlabBStackAllocator::realloc` (grow-non-tail) and `CheckedSlabBStackAllocator::alloc` (tail-extend) each materialise a mostly-zero region — a `push` of a full zeroed buffer, and an `extend` followed by a separate overhead `set` — that `extend_sparse` could collapse into a single call (also making `CheckedSlab::alloc` crash-atomic, closing its extended-but-untagged orphan-tail window). Benchmarking showed the performance benefit is insignificant: tail growth is not the bottleneck and the elided zero-byte writes are cheap next to the surrounding I/O. The gain does not justify churning both allocators' on-disk writer version (a magic bump), and the minor crash-window improvement for `CheckedSlab::alloc` is not, on its own, compelling enough to pursue.
+
+Reference: https://github.com/williamwutq/bstack/pull/32
+
 ---
 
 ## Restoring `DebugCheckingAllocator` (post-0.4.0)
@@ -81,3 +95,82 @@ Reintroduce `DebugCheckingAllocator<A: BStackAllocator>` as a transparent wrappe
 - **Panic vs. error on violation.** Panicking gives loud, immediate test failures but is unusable in `Result`-based property tests that want to *assert* an error was produced; a configurable mode (panic / return `Self::Error`) may be needed.
 - **Tracking under `None`-handle errors.** When an inner operation fails and reports `handle: None` (allocation genuinely lost — e.g. `ghost_tree`'s torn AVL insert), the wrapper must decide whether to keep the region "live," mark it "lost," or drop it from tracking; each choice changes which subsequent operations the checker flags.
 - **Overhead and gating.** Whether it lives behind a dedicated feature or is always available under `alloc`; the tracking set adds allocation and per-op cost that should not leak into production builds.
+
+---
+
+## `BStackInPlaceGuard` — ambient atomic-block guard over in-place writes
+
+**Feature flag:** `set` + `atomic` (same gate as `inplace_gen`/`process_gen`)
+**Breaking change:** No — purely additive.
+
+### Motivation
+
+`inplace_gen`/`process_gen` batch in-place reads/writes into one crash-atomic multi-write journal, but only for callers willing to speak `BStackGenOp`. Code already written against the ordinary `&BStack` API — including third-party code with no notion of an atomic block — can't be folded into one `inplace_gen` call without a rewrite.
+
+`BStackInPlaceGuard` fixes this: acquire once, then call ordinary `BStack` methods (`set`, `get`, `swap`, `process`, …) from ordinary `&BStack`-taking functions. While held, those calls are transparently redirected into `inplace_gen`'s overlay/journal machinery, so an atomic block can be built around code that wasn't written for one.
+
+### Design
+
+- **Acquisition.** `BStack::inplace_guard(&self) -> BStackInPlaceGuard<'_>` takes the write lock, then, still holding it: sets a `thread_local!` marker (this thread holds a guard on this instance), populates overlay storage on `BStack` itself (`Mutex<Option<Overlay>>` — needed because intercepted methods see only `&self`, never the guard value; the `Mutex` is for `Sync`, not contention, since no other thread can be mid-method while the write lock is held), and sets an `AtomicBool` (`guard_acquired`) used solely by `is_inplace_guarded()`, not by routing. `BStackInPlaceGuard` holds the `RwLockWriteGuard` and is `!Send`.
+
+- **Routing is thread-local, no cross-thread identity needed.** Two threads can never both hold the write lock, so a different thread's unmodified `self.lock.write()`/`.read()` already blocks correctly — no check required on that path. The only failure mode is the *same* thread re-entering its own guard (deadlock on the non-reentrant `RwLock`), which the `thread_local!` marker answers with no synchronization:
+  - **Unset:** proceed via the existing lock path, unchanged.
+  - **Set:** served from the overlay, per `inplace_gen`'s model:
+    - Reads (`get`/`peek`/`len`, read half of `swap`/`cas`/`process`/`cross_exchange`/`copy`/`eq_crds`/`ne_crds`/…) resolve against committed bytes overlaid with pending writes (`inplace_overlay_read`); no read lock, write lock already suffices.
+    - In-place writes (`set`/`zero`/`repeat`, write half of the above) stage into the overlay (`inplace_overlay_insert`), later overlapping writes winning, and return without touching disk.
+    - Length-changing calls (`push`, `extend`, `pop`, `pop_into`, `discard`, `atrunc`, `splice`, `splice_into`, `try_extend*`, `try_discard(_, n>0)`, `replace`) return `Err(InvalidInput)` immediately, matching `inplace_gen`'s existing rejection, and discard the overlay — poisoning the transaction. An ordinary `Err` needs no special plumbing: `?` unwinds into `Drop`.
+  - **Nested `inplace_guard`/`inplace_gen`/`process_gen`, same thread:** join the outer transaction — reads/writes stage into the same overlay, and the nested call's own end-of-sequence does *not* commit. Persistence defers to the outermost guard. `Ok(())` from a nested `inplace_gen` therefore does not imply persisted — the main implicit/sharp edge of this design.
+
+- **Commit.** `BStackInPlaceGuard::commit(self) -> io::Result<()>` consumes the guard, runs the same reduction `inplace_gen` uses (0 writes → no-op, 1 → single-write path, many → `journaled_multi_set`), and suppresses the subsequent `Drop` (e.g. via `ManuallyDrop`/`mem::forget`) so it isn't run twice. `Drop::drop`, reached only if `commit` was never called, runs the identical reduction and `.unwrap()`s it — panics on I/O failure. A poisoned transaction commits/drops an empty overlay (no-op, `Ok(())`). The write lock releases only once this runs.
+
+- **Query API.** `BStack::is_inplace_guarded(&self) -> bool` — `Acquire` load of `guard_acquired`; whether *any* thread holds a guard, independent of routing.
+
+### Open questions
+
+- **Thread-local keying.** One thread may hold guards on two different `BStack` instances at once (joining applies only within one instance), so the marker must be keyed per-instance (e.g. by address), not a single flag. Representation (thread-local set/small-map of instance pointers) is an implementation detail, not a soundness question.
+- **Overlay ownership.** `inplace_gen`'s overlay borrows (`Vec<(u64, &'a [u8])>`) within one call's lifetime. A guard's overlay spans many independent calls with no shared lifetime (e.g. `swap`'s written data is a just-read value, not a caller buffer), so it likely needs to own its bytes (`Vec<(u64, Vec<u8>)>`) — a real memory/copy cost versus `inplace_gen`.
+- **Overlay-aware `swap`/`cas`/`process`/`cross_exchange`/`copy`/`eq_crds`/`ne_crds`/`masked_eq_crds`/`masked_ne_crds`.** Each has its own direct read-then-write shape today; each needs a guarded variant reading/writing through the overlay. `cas`/`eq_crds`/`ne_crds` also need their comparison step to read through the overlay, or an earlier guarded write in the same transaction is invisible to it.
+- **Recovery format.** Whether commit reuses the existing multi-write journal (`wip_aux = MultiWrite`) unchanged — the guard still reduces to a flat non-overlapping `[offset, data]` set — or needs its own `wip_aux` mode.
+- **Naming.** `BStackInPlaceGuard`/`inplace_guard()`/`commit()`/`is_inplace_guarded()` are working names.
+
+## C allocator API: signal whether the original survived a failed `realloc`/`dealloc`
+
+**Feature flag:** `alloc` (C: `BSTACK_FEATURE_ALLOC`)
+**Breaking change:** C only — an API break; the return-code variant below keeps it ABI-compatible.
+
+### Motivation
+
+Rust's `BStackAllocator::realloc`/`dealloc` return `BStackAllocError { handle: Option<A::Allocated> }`: on failure `Some` hands back a still-usable region (the untouched original, or a fully-committed new region) and `None` means the allocation was genuinely lost mid-operation, recoverable only through crash recovery. The C vtable equivalents (`gt_vt_realloc`, `..._dealloc`, …) return only `0`/`-1` with `errno` and write nothing meaningful to `*out` on `-1`, so a C caller cannot tell after a failed resize/free whether its original handle is still valid to reuse or must be dropped.
+
+This is not hypothetical — the GhostTree tail-shrink fix showed several failure paths legitimately invalidate the original: a non-`atomic` shrink that has already committed part-way, a grow-that-moved-then-failed-to-free-the-old-block, or any path that returns the new region in place of the old. A C caller that keeps using its original handle after such a failure can double-free or read past a shrunk region. Today the only safe C policy is "on `-1`, treat the handle as lost and rely on crash recovery," which needlessly leaks the common case where the original is in fact intact.
+
+### Design
+
+Give the C `realloc`/`dealloc` a survivor signal mirroring Rust's `handle`. Two shapes are on the table; both let a failure-agnostic caller keep working unchanged.
+
+- **Distinct return code (preferred — API-only break, ABI-preserving).** Keep the existing signatures and split the failure return: `-1` = failed, original **survived** (its handle is written to the existing `*out`); `-2` = failed, allocation **lost** (do not reuse the handle). Because every existing caller tests `ret < 0` (or `ret != 0`) for failure, both codes are still seen as errors and old code keeps working untouched — only callers that want the distinction check for `-2`. This refines the contract (what the negative codes and `*out`-on-failure mean) without touching any signature or the vtable layout, so it stays binary-compatible.
+- **Out-parameter (API + ABI break).** `..._realloc(alloc, slice, new_len, bstack_slice_t *out, int *survived)` — on failure `*survived == 1` means `*out` is a valid handle the caller still owns and `*survived == 0` means the region was lost; `survived` may be `NULL` to opt into the current "treat as lost on any failure" policy. More explicit than a magic return code, but changes the function-pointer signatures, so it breaks the ABI.
+
+### Open questions
+
+- **Return code vs out-parameter vs result struct.** The `-2` return code is the least intrusive but relies on a magic value and on `*out` being read on failure; an explicit `int *survived` or a by-value `bstack_alloc_result_t { bstack_slice_t handle; int survived; }` (closer to Rust's `BStackAllocError`) trade ABI compatibility for clarity. Whether the extra explicitness is worth the break.
+- **Vtable impact.** The out-parameter/result-struct variants change the vtable function-pointer signatures, so every built-in and third-party C allocator must update. The `-2` return-code variant leaves the signatures untouched — each allocator only refines its own failure-return logic — which is the main reason to prefer it.
+- **Bulk `dealloc`.** The analogue of `BStackBulkAllocError.handles` — reporting *which* handles survived a partial bulk free — needs its own out-array shape regardless of which single-handle variant is chosen.
+
+## GhostTree allocator: multithreaded performance improvement
+
+**Feature flag:** `alloc` (optionally `atomic` for the `Sync` path)
+**Breaking change:** No — internal implementation only.
+
+### Motivation
+
+`benches/alloc.rs` result shows `GhostTreeBstackAllocator` is already the fastest general-purpose allocator in the suite, but its scaling under concurrency has received less attention than its single-threaded design: throughput rises from 1t to 4t and then flattens through 16t. This is consistent with `GhostTreeBstackAllocator::lock` — the single mutex serializing all non-tail `alloc`/`dealloc`/`realloc` — capping throughput once contention saturates it. As the crate's best-performing allocator, it is also the one most likely to be used under concurrent load, so its scaling behavior warrants continued performance work, independent of any specific defect.
+
+The mutex's scope and implementation are not in question here (see the `NOT PLANNED` entry on `FirstFitBStackAllocator`'s mutex), and no tree-sharding or other data-structure redesign is intended — that would be a different allocator. The improvement surface is reducing the amount of work done per operation while the mutex is held. Two examples found by code inspection, illustrative rather than exhaustive:
+
+- `avl_insert`, `avl_find_best_fit_and_remove`, and `avl_remove_min` each allocate a `Vec::with_capacity(MAX_AVL_DEPTH)` path buffer under the mutex on every call, despite `MAX_AVL_DEPTH` being a fixed compile-time bound that a stack array could cover instead.
+- In the up-pass of `avl_insert` and `avl_find_best_fit_and_remove`, `avl_write_and_update` calls `avl_height` on a child subtree whose height was already computed and written in the previous loop iteration, issuing an avoidable `BStack::get_into` (lock + syscall) to re-fetch it.
+
+### Open questions
+
+- **Validation.** Whether `mixed/uniform` workload is sufficient to measure improvement, or whether a contention-specific microbenchmark (concurrent non-tail alloc/dealloc only) is needed to isolate the critical-section-size effect.

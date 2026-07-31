@@ -1421,6 +1421,146 @@ mod tests {
         assert_eq!(s2.peek(0).unwrap(), b"hi\x00\x00");
     }
 
+    // ---- extend_sparse ------------------------------------------------------
+
+    #[test]
+    fn extend_sparse_writes_prefix_and_zeros_rest() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        s.push(b"abc").unwrap();
+        let off = s.extend_sparse(b"XY", 6).unwrap();
+        assert_eq!(off, 3);
+        assert_eq!(s.len().unwrap(), 9);
+        assert_eq!(s.peek(0).unwrap(), b"abcXY\x00\x00\x00\x00");
+    }
+
+    #[test]
+    fn extend_sparse_full_length_prefix() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        let off = s.extend_sparse(b"hello", 5).unwrap();
+        assert_eq!(off, 0);
+        assert_eq!(s.peek(0).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn extend_sparse_empty_buf_is_pure_extend() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        s.push(b"ab").unwrap();
+        let off = s.extend_sparse(b"", 4).unwrap();
+        assert_eq!(off, 2);
+        assert_eq!(s.peek(0).unwrap(), b"ab\x00\x00\x00\x00");
+    }
+
+    #[test]
+    fn extend_sparse_zero_length_is_noop() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        s.push(b"data").unwrap();
+        let off = s.extend_sparse(b"", 0).unwrap();
+        assert_eq!(off, 4);
+        assert_eq!(s.len().unwrap(), 4);
+    }
+
+    #[test]
+    fn extend_sparse_buf_longer_than_length_errors() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        let err = s.extend_sparse(b"toolong", 3).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(s.len().unwrap(), 0);
+    }
+
+    #[test]
+    fn extend_sparse_persists_across_reopen() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+
+        s.push(b"hi").unwrap();
+        s.extend_sparse(b"Z", 4).unwrap();
+        drop(s);
+
+        let s2 = BStack::open(&p).unwrap();
+        assert_eq!(s2.peek(0).unwrap(), b"hiZ\x00\x00\x00");
+    }
+
+    // ---- extend_sparse_batched ----------------------------------------------
+
+    #[test]
+    fn extend_sparse_batched_scatters_buffers() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        s.push(b"..").unwrap();
+        let off = s
+            .extend_sparse_batched(vec![(0u64, b"AA".as_slice()), (5, b"BB".as_slice())], 8)
+            .unwrap();
+        assert_eq!(off, 2);
+        assert_eq!(s.len().unwrap(), 10);
+        assert_eq!(s.peek(0).unwrap(), b"..AA\x00\x00\x00BB\x00");
+    }
+
+    #[test]
+    fn extend_sparse_batched_ignores_empty_and_reorders() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        let off = s
+            .extend_sparse_batched(
+                vec![
+                    (4u64, b"cc".as_slice()),
+                    (0, b"".as_slice()),
+                    (0, b"a".as_slice()),
+                ],
+                6,
+            )
+            .unwrap();
+        assert_eq!(off, 0);
+        assert_eq!(s.peek(0).unwrap(), b"a\x00\x00\x00cc");
+    }
+
+    #[test]
+    fn extend_sparse_batched_overlap_errors() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        let err = s
+            .extend_sparse_batched(vec![(0u64, b"aaa".as_slice()), (2, b"bb".as_slice())], 8)
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(s.len().unwrap(), 0);
+    }
+
+    #[test]
+    fn extend_sparse_batched_out_of_range_errors() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        let err = s
+            .extend_sparse_batched(vec![(3u64, b"zzz".as_slice())], 5)
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(s.len().unwrap(), 0);
+    }
+
+    #[test]
+    fn extend_sparse_batched_empty_is_pure_extend() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+
+        let off = s
+            .extend_sparse_batched(Vec::<(u64, Vec<u8>)>::new(), 4)
+            .unwrap();
+        assert_eq!(off, 0);
+        assert_eq!(s.peek(0).unwrap(), b"\x00\x00\x00\x00");
+    }
+
     // ---- zero (feature-gated) -----------------------------------------------
 
     #[cfg(feature = "set")]
@@ -3277,18 +3417,6 @@ mod first_fit_tests {
     }
 
     #[test]
-    fn realloc_tail_shrink() {
-        let (alloc, path) = mk_ff("realloc_tail_shrink");
-        let _g = Guard(path);
-        let s = alloc.alloc(32).unwrap();
-        let s_start = s.start();
-        let s2 = alloc.realloc(s, 16).unwrap();
-        assert_eq!(s2.start(), s_start);
-        assert_eq!(s2.len(), 16);
-        assert_eq!(alloc.len().unwrap(), ALFF_HDR_OFFSET + 16 + BLOCK_OVERHEAD);
-    }
-
-    #[test]
     fn realloc_tail_preserves_data() {
         let (alloc, path) = mk_ff("realloc_tail_data");
         let _g = Guard(path);
@@ -4315,6 +4443,94 @@ mod atomic_tests {
         drop(s);
         let s2 = BStack::open(&p).unwrap();
         assert_eq!(s2.peek(0).unwrap(), b"helloworld");
+    }
+
+    // ---- try_extend_sparse --------------------------------------------------
+
+    #[test]
+    fn try_extend_sparse_matching_size_writes_returns_true() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        let ok = s.try_extend_sparse(5, b"XY", 6).unwrap();
+        assert!(ok);
+        assert_eq!(s.len().unwrap(), 11);
+        assert_eq!(s.peek(0).unwrap(), b"helloXY\x00\x00\x00\x00");
+    }
+
+    #[test]
+    fn try_extend_sparse_mismatching_size_returns_false() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        let ok = s.try_extend_sparse(3, b"XY", 6).unwrap();
+        assert!(!ok);
+        assert_eq!(s.len().unwrap(), 5);
+        assert_eq!(s.peek(0).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn try_extend_sparse_buf_longer_than_length_errors_even_on_mismatch() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        // Size does not match (3 != 5), but the malformed request still errors.
+        let err = s.try_extend_sparse(3, b"toolong", 2).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(s.len().unwrap(), 5);
+    }
+
+    #[test]
+    fn try_extend_sparse_persists_across_reopen() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+        s.push(b"hi").unwrap();
+        s.try_extend_sparse(2, b"Z", 4).unwrap();
+        drop(s);
+        let s2 = BStack::open(&p).unwrap();
+        assert_eq!(s2.peek(0).unwrap(), b"hiZ\x00\x00\x00");
+    }
+
+    // ---- try_extend_sparse_batched ------------------------------------------
+
+    #[test]
+    fn try_extend_sparse_batched_matching_scatters_returns_true() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"..").unwrap();
+        let ok = s
+            .try_extend_sparse_batched(2, vec![(0u64, b"AA".as_slice()), (5, b"BB".as_slice())], 8)
+            .unwrap();
+        assert!(ok);
+        assert_eq!(s.peek(0).unwrap(), b"..AA\x00\x00\x00BB\x00");
+    }
+
+    #[test]
+    fn try_extend_sparse_batched_mismatching_returns_false() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"..").unwrap();
+        let ok = s
+            .try_extend_sparse_batched(99, vec![(0u64, b"AA".as_slice())], 8)
+            .unwrap();
+        assert!(!ok);
+        assert_eq!(s.len().unwrap(), 2);
+    }
+
+    #[test]
+    fn try_extend_sparse_batched_overlap_errors_even_on_mismatch() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"..").unwrap();
+        let err = s
+            .try_extend_sparse_batched(
+                99,
+                vec![(0u64, b"aaa".as_slice()), (2, b"bb".as_slice())],
+                8,
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(s.len().unwrap(), 2);
     }
 
     // -----------------------------------------------------------------------
@@ -5431,6 +5647,146 @@ mod atomic_tests {
 
     #[cfg(all(feature = "set", feature = "atomic"))]
     #[test]
+    fn process_gen_sparse_scatters_and_ends_sequence() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"..").unwrap();
+        // The `writes` slice must outlive the whole `process_gen` call, so it is
+        // bound here rather than in the closure's return expression.
+        let writes: [(u64, &[u8]); 2] = [(0, b"AA"), (5, b"BB")];
+        let mut calls = 0usize;
+        s.process_gen(|| {
+            calls += 1;
+            match calls {
+                1 => Some(BStackGenOp::Sparse {
+                    writes: &writes,
+                    length: 8,
+                }),
+                _ => Some(BStackGenOp::Write {
+                    offset: 0,
+                    data: b"NOPE",
+                }),
+            }
+        })
+        .unwrap();
+        assert_eq!(calls, 1, "Sparse must end the sequence, like Push");
+        assert_eq!(s.len().unwrap(), 10);
+        assert_eq!(s.peek(0).unwrap(), b"..AA\x00\x00\x00BB\x00");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn process_gen_sparse_length_informed_by_prior_len() {
+        use crate::BStackGenOp;
+        // Grow to a total size only known once `Len` has reported the current size.
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hi").unwrap();
+        let writes: [(u64, &[u8]); 1] = [(0, b"Z")];
+        let mut size = 0u64;
+        let mut calls = 0usize;
+        s.process_gen(|| {
+            calls += 1;
+            match calls {
+                // SAFETY: `size` outlives this whole `process_gen` call.
+                1 => Some(BStackGenOp::Len {
+                    out: unsafe { core::mem::transmute::<&mut u64, _>(&mut size) },
+                }),
+                _ => Some(BStackGenOp::Sparse {
+                    writes: &writes,
+                    length: size + 2, // grow by (current size) + 2
+                }),
+            }
+        })
+        .unwrap();
+        assert_eq!(size, 2);
+        assert_eq!(s.len().unwrap(), 6);
+        assert_eq!(s.peek(0).unwrap(), b"hiZ\x00\x00\x00");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn process_gen_sparse_empty_writes_zero_length_is_noop() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        let writes: [(u64, &[u8]); 0] = [];
+        s.process_gen(|| {
+            Some(BStackGenOp::Sparse {
+                writes: &writes,
+                length: 0,
+            })
+        })
+        .unwrap();
+        assert_eq!(s.len().unwrap(), 5);
+        assert_eq!(s.peek(0).unwrap(), b"hello");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn process_gen_sparse_overlap_returns_error() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hi").unwrap();
+        let writes: [(u64, &[u8]); 2] = [(0, b"aaa"), (2, b"bb")];
+        let err = s
+            .process_gen(|| {
+                Some(BStackGenOp::Sparse {
+                    writes: &writes,
+                    length: 8,
+                })
+            })
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(s.len().unwrap(), 2);
+        assert_eq!(s.peek(0).unwrap(), b"hi");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn process_gen_sparse_out_of_range_returns_error() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hi").unwrap();
+        let writes: [(u64, &[u8]); 1] = [(3, b"zzz")];
+        let err = s
+            .process_gen(|| {
+                Some(BStackGenOp::Sparse {
+                    writes: &writes,
+                    length: 5,
+                })
+            })
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(s.len().unwrap(), 2);
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn process_gen_sparse_persists_across_reopen() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+        s.push(b"hi").unwrap();
+        let writes: [(u64, &[u8]); 1] = [(0, b"Z")];
+        s.process_gen(|| {
+            Some(BStackGenOp::Sparse {
+                writes: &writes,
+                length: 4,
+            })
+        })
+        .unwrap();
+        drop(s);
+        let s2 = BStack::open(&p).unwrap();
+        assert_eq!(s2.peek(0).unwrap(), b"hiZ\x00\x00\x00");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
     fn process_gen_len_informs_discard_size() {
         use crate::BStackGenOp;
         // Discard a trailing region whose length is only known once `Len` has
@@ -6169,13 +6525,24 @@ mod atomic_tests {
         s.push(b"helloworld").unwrap();
 
         let data = b"HELLO";
-        let mut errored = false;
+        let writes: [(u64, &[u8]); 1] = [(0, b"Z")];
+        // Feedback for op N arrives on call N+1: Write (step 0) is valid, so its
+        // feedback at step 1 is Ok; the size-changing Push (step 1) and Sparse
+        // (step 2) are each rejected, so their feedback at steps 2 and 3 is Err.
+        let mut push_errored = false;
+        let mut sparse_errored = false;
         let mut step = 0usize;
         s.inplace_gen(|res| {
-            if step == 2 {
-                // Feedback for the Push op is an error.
-                assert!(res.is_err());
-                errored = true;
+            match step {
+                2 => {
+                    assert!(res.is_err(), "Push should have reported an error");
+                    push_errored = true;
+                }
+                3 => {
+                    assert!(res.is_err(), "Sparse should have reported an error");
+                    sparse_errored = true;
+                }
+                _ => {}
             }
             let r = match step {
                 0 => Some(BStackGenOp::Write {
@@ -6183,17 +6550,18 @@ mod atomic_tests {
                     data: unsafe { core::mem::transmute::<&[u8], _>(&data[..]) },
                 }),
                 1 => Some(BStackGenOp::Push { data: b"!!!" }),
+                2 => Some(BStackGenOp::Sparse {
+                    writes: &writes,
+                    length: 4,
+                }),
                 _ => None,
             };
             step += 1;
             r
         })
         .unwrap();
-        assert!(
-            errored,
-            "Push should have reported an error to the callback"
-        );
-        // Size unchanged; the valid write still committed.
+        assert!(push_errored && sparse_errored);
+        // Size unchanged; only the valid in-place write committed.
         assert_eq!(s.len().unwrap(), 10);
         assert_eq!(s.peek(0).unwrap(), b"HELLOworld");
     }

@@ -881,6 +881,42 @@ pub(crate) fn commit_grow(
     Ok(())
 }
 
+/// Commit a *sparse* payload growth to `new_len`, writing only `blocks` into the
+/// freshly grown region and leaving the rest zero-filled by the filesystem.
+///
+/// `logical_offset` is the pre-op payload size (the tail the growth is anchored
+/// at); `file_end == HEADER_SIZE + logical_offset` is the pre-op raw file size;
+/// `new_len == logical_offset + length` is the post-op payload size (already
+/// overflow-checked by the caller). Each `(rel, data)` block is written at logical
+/// offset `logical_offset + rel`; callers guarantee every block fits within
+/// `[logical_offset, new_len)` and that blocks do not overlap.
+///
+/// The efficiency win over a full `push` of `length` bytes: the extension is
+/// realised with a single `set_len`, so the gaps between blocks cost no I/O (they
+/// read back as zero from the sparse file), and only the header commit is synced.
+/// No journal is needed — the entire grown region sits beyond the committed
+/// length, so a crash before the header commit rolls back by truncation, exactly
+/// like [`commit_grow`]. Shared by `extend_sparse`, `extend_sparse_batched`, and
+/// their `try_` variants.
+#[inline]
+pub(crate) fn commit_sparse_extend(
+    file: &mut File,
+    clen: &mut u64,
+    logical_offset: u64,
+    file_end: u64,
+    new_len: u64,
+    blocks: &[(u64, &[u8])],
+) -> io::Result<()> {
+    file.set_len(HEADER_SIZE + new_len)?;
+    for (rel, data) in blocks {
+        if let Err(e) = write_at(file, logical_offset + rel, data) {
+            let _ = file.set_len(file_end);
+            return Err(e);
+        }
+    }
+    commit_grow(file, clen, new_len, logical_offset, file_end)
+}
+
 /// Commit a payload shrink to `new_len`: truncate the file, update the cached
 /// length, write the header, and durably sync.
 ///

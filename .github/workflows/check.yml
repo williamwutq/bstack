@@ -37,5 +37,15 @@ jobs:
       run: cargo clippy --features alloc -- -D warnings
     - name: Clippy (set and alloc features)
       run: cargo clippy --features "set alloc" -- -D warnings
+    # Feature-gating compile checks for the fault-injection test suites.
+    - name: Check tests (fault-injection)
+      run: cargo check --tests --features "fault-injection"
+    - name: Check tests (alloc, fault-injection)
+      run: cargo check --tests --features "alloc fault-injection"
+    - name: Check tests (set, alloc, fault-injection)
+      run: cargo check --tests --features "set alloc fault-injection"
+    - name: Check tests (set, alloc, atomic, fault-injection)
+      run: cargo check --tests --features "set alloc atomic fault-injection"
+    # Format check
     - name: Format
       run: cargo fmt --check

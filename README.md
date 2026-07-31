@@ -93,6 +93,19 @@ impl BStack {
     /// `n = 0` is valid and a no-op on disk.
     pub fn extend(&self, n: u64) -> io::Result<u64>;
 
+    /// Sparsely grow the payload by `length` bytes, writing `buf` at the start of the
+    /// new region and leaving the rest zero (realised with one `set_len`, so the zero
+    /// tail costs no write I/O).  Returns the starting logical offset.  Errors if
+    /// `buf.len()` exceeds `length`.
+    pub fn extend_sparse(&self, buf: impl AsRef<[u8]>, length: u64) -> io::Result<u64>;
+
+    /// Sparsely grow the payload by `length` bytes, scattering `(relative_offset, data)`
+    /// buffers (relative to the current tail) into the new region and leaving the gaps
+    /// zero.  Returns the starting logical offset.  Writes must be pairwise non-overlapping
+    /// and fit within `[0, length)`; empty buffers are ignored.
+    pub fn extend_sparse_batched<I, D>(&self, writes: I, length: u64) -> io::Result<u64>
+    where I: IntoIterator<Item = (u64, D)>, D: AsRef<[u8]>;
+
     /// Remove and return the last `n` bytes, then durable-sync.
     /// `n = 0` is valid.  Errors if `n` exceeds the current payload size.
     pub fn pop(&self, n: u64) -> io::Result<Vec<u8>>;
@@ -156,6 +169,15 @@ impl BStack {
     #[cfg(feature = "atomic")]
     pub fn try_extend_zeros(&self, s: u64, n: u64) -> io::Result<bool>;
 
+    /// Sparse `extend_sparse`/`extend_sparse_batched` gated on a size check: apply the
+    /// growth only if the current payload size equals `s`; returns whether it did.
+    /// A malformed request still errors regardless of the size match.  Requires the `atomic` feature.
+    #[cfg(feature = "atomic")]
+    pub fn try_extend_sparse(&self, s: u64, buf: impl AsRef<[u8]>, length: u64) -> io::Result<bool>;
+    #[cfg(feature = "atomic")]
+    pub fn try_extend_sparse_batched<I, D>(&self, s: u64, writes: I, length: u64) -> io::Result<bool>
+    where I: IntoIterator<Item = (u64, D)>, D: AsRef<[u8]>;
+
     /// Atomically read `buf.len()` bytes at `offset` and overwrite them with `buf`;
     /// returns the old contents.  Requires the `set` and `atomic` features.
     #[cfg(all(feature = "set", feature = "atomic"))]
@@ -191,8 +213,8 @@ impl BStack {
 
     /// Run a sequence of dependent reads, optionally followed by a single write, under
     /// one held write lock. `f` is called in a loop and drives the sequence through
-    /// `BStackGenOp::{Read, Len, Write, Swap, Push, Pop, Discard, Atrunc, Splice}`; at
-    /// most one of `Write`/`Swap`/`Push`/`Pop`/`Discard`/`Atrunc`/`Splice` is permitted
+    /// `BStackGenOp::{Read, Len, Write, Swap, Push, Pop, Discard, Atrunc, Splice, Sparse}`; at
+    /// most one of `Write`/`Swap`/`Push`/`Pop`/`Discard`/`Atrunc`/`Splice`/`Sparse` is permitted
     /// and ends the sequence.
     /// Requires the `set` and `atomic` features.
     #[cfg(all(feature = "set", feature = "atomic"))]
@@ -489,10 +511,11 @@ bstack = { version = "0.4", features = ["set", "atomic"] }
 
 - **`atrunc`**, **`splice`**, **`splice_into`** — atomic discard+push / pop+push tail replacement.
 - **`try_extend`**, **`try_discard`**, **`try_extend_zeros`** — size-checked, optimistic append/discard.
+- **`try_extend_sparse`**, **`try_extend_sparse_batched`** — size-checked, optimistic sparse tail growth.
 - **`replace(n, f)`** — pop `n` bytes, pass to `f`, push back the returned tail.
 - **`get_batched`**, **`get_batched_into`**, **`get_batched_gen`** — read multiple (possibly dependent) ranges under one read lock.
 - **`swap`**, **`swap_into`**, **`cas`** *(requires `set`)* — atomic read-modify-write / compare-and-swap of a single region.
-- **`process`**, **`process_gen`** *(requires `set`)* — in-place mutation, or a dependent read/write sequence ending in at most one `Write`/`Swap`/`Push`/`Pop`/`Discard`/`Atrunc`/`Splice`.
+- **`process`**, **`process_gen`** *(requires `set`)* — in-place mutation, or a dependent read/write sequence ending in at most one `Write`/`Swap`/`Push`/`Pop`/`Discard`/`Atrunc`/`Splice`/`Sparse`.
 - **`set_batched`**, **`inplace_gen`** *(requires `set`)* — commit several non-overlapping in-place writes as one crash-atomic unit (a batch, or a generator that also reads the batch-so-far state).
 - **`cross_exchange`**, **`copy`** *(requires `set`)* — swap or copy two regions under one write lock.
 - **`eq_crds`**, **`ne_crds`**, **`masked_eq_crds`**, **`masked_ne_crds`** *(requires `set`)* — cross-region compare-and-swap, with `==`/`!=`/masked variants.
@@ -587,6 +610,7 @@ before it is read/compare/callback work under the lock.
 |----------------------------------------|-------------------------------------------------------------------------------------------|
 | `push`                                 | `lseek(END)` → `write(data)` → `lseek(8)` → `write(clen)` → sync                          |
 | `extend`                               | `lseek(END)` → `set_len(new_end)` → `lseek(8)` → `write(clen)` → sync                     |
+| `extend_sparse`, `extend_sparse_batched` | `set_len(new_end)` → `write` each buffer into the grown region (gaps left zero) → `lseek(8)` → `write(clen)` → sync |
 | `pop`, `pop_into`                      | `lseek` → `read` → `ftruncate` → `lseek(8)` → `write(clen)` → sync                        |
 | `discard`                              | `ftruncate` → `lseek(8)` → `write(clen)` → sync                                           |
 | `set` *(feature)*                      | *commit* `data`                                                                           |
@@ -596,10 +620,11 @@ before it is read/compare/callback work under the lock.
 | `try_extend` *(atomic)*                | size check → conditional `push` sequence                                                  |
 | `try_discard` *(atomic)*               | size check → conditional `discard` sequence                                               |
 | `try_extend_zeros` *(atomic)*          | size check → conditional `extend(n)` sequence                                             |
+| `try_extend_sparse`, `try_extend_sparse_batched` *(atomic)* | size check → conditional `extend_sparse` / `extend_sparse_batched` sequence               |
 | `swap`, `swap_into` *(set+atomic)*     | `read` old bytes → *commit* `buf`                                                         |
 | `cas` *(set+atomic)*                   | `read` → compare → conditional *commit* of `new`                                          |
 | `process` *(set+atomic)*               | `read(start..end)` → *(callback)* → *commit* the buffer                                    |
-| `process_gen` *(set+atomic)*           | closure-driven reads (and `Len` queries), ending in at most one mutating step — `Write` *commits*; `Swap` uses the exchange journal (as `cross_exchange`); `Push`/`Pop`/`Discard`/`Atrunc`/`Splice` behave as their standalone forms |
+| `process_gen` *(set+atomic)*           | closure-driven reads (and `Len` queries), ending in at most one mutating step — `Write` *commits*; `Swap` uses the exchange journal (as `cross_exchange`); `Push`/`Pop`/`Discard`/`Atrunc`/`Splice`/`Sparse` behave as their standalone forms |
 | `set_batched` *(set+atomic)*           | validate + reject overlap → **multi-write journal**: stage every `[s \| e \| data]` block past `clen` → arm the `MultiWrite` sentinel (`wip_ptr` stays `0`) → replay each block in place → disarm → `ftruncate` (sync at each barrier); a lone effective write takes the ordinary single-write *commit* |
 | `inplace_gen` *(set+atomic)*           | closure-driven reads (each overlaid with the batch-so-far edits) interleaved with accumulated `Write`s (later overrides earlier on overlap); on `None` the pending edits commit together via the multi-write journal (as `set_batched`) |
 | `replace` *(atomic)*                   | `lseek(tail)` → `read(n)` → *(callback)* → *(then as `atrunc`)*                           |
@@ -676,11 +701,13 @@ lock without any `File::metadata` syscall.
 | Operation                                                       | Lock (Unix / Windows) | Lock (other) |
 |-----------------------------------------------------------------|-----------------------|--------------|
 | `push`, `extend`, `pop`, `pop_into`, `discard`                  | write                 | write        |
+| `extend_sparse`, `extend_sparse_batched`                        | write                 | write        |
 | `set`, `zero`, `repeat` *(feature)*                             | write                 | write        |
 | `atrunc`, `splice`, `splice_into`, `try_extend` *(atomic)*      | write                 | write        |
 | `try_discard(s, n > 0)` *(atomic)*                              | write                 | write        |
 | `try_discard(s, 0)` *(atomic)*                                  | **read**              | **read**     |
 | `try_extend_zeros` *(atomic)*                                   | write                 | write        |
+| `try_extend_sparse`, `try_extend_sparse_batched` *(atomic)*     | write                 | write        |
 | `swap`, `swap_into`, `cas` *(set+atomic)*                       | write                 | write        |
 | `process`, `process_gen` *(set+atomic)*                         | write                 | write        |
 | `set_batched`, `inplace_gen` *(set+atomic)*                     | write                 | write        |
@@ -983,6 +1010,48 @@ Constructor takes `data_size` (usable bytes per block; physical = `data_size + 8
 `open` runs `recover()` automatically.  Without `atomic`: `Send` only.  With
 `atomic`: `Send + Sync` (same lock-free strategy as `SlabBStackAllocator`).
 
+### Benchmarks (`alloc + atomic`)
+
+`benches/alloc.rs` measures cross-allocator throughput at several thread counts.
+It requires the `atomic` feature for `Sync` allocators. Use `-- <allocator>` to select one of the built-in allocators:
+
+> **Note:** Benchmarks are only available when building from source (e.g. after cloning this repository). They are not included in the crate published to [crates.io](https://crates.io).
+> If you have the source, consider running the benchmarks to identify the best allocator for your workload.
+> For the most accurate results, edit `benches/alloc.rs` to model your actual allocation patterns (sizes, op mix, thread count) before running.
+
+```sh
+cargo bench --bench alloc --features "alloc set atomic" -- "first_fit"
+```
+
+As a general guideline (based on `benches/alloc.rs` mixed-workload results):
+- **`ghost_tree`** is the best default: fastest overall and its latency stays flat from 1 to 16 threads, making it the safest choice under unknown or high contention. However, long term use of `ghost_tree` may lead to fragmentation and wasted space since it does not support coalescing. If fragmentation is a concern, consider using `first_fit` or `checked_slab` instead.
+- **`checked_slab`** (sized to match your typical allocation) is usually faster than plain `slab` at the same block size, in addition to catching double-frees and supporting crash recovery — prefer it over `slab` in most cases, especially at smaller block sizes.
+- **`slab`** can still win for single-threaded, fixed-size workloads at some block sizes (e.g. `slab_32`), but is inconsistent across sizes and degrades at others (e.g. `slab_64`) — benchmark your specific `block_size` before choosing it over `checked_slab`.
+
+**Configuration** — all knobs are environment variables read once at startup:
+
+| Variable                 | Meaning                                                        | Default     |
+|--------------------------|----------------------------------------------------------------|-------------|
+| `BSTACK_BENCH_OP`        | op mix: preset name or `alloc,realloc,dealloc` weight triple   | `mixed`     |
+| `BSTACK_BENCH_SIZE`      | size distribution preset                                       | `uniform`   |
+| `BSTACK_BENCH_MAX`       | maximum allocation length drawn                                | `1024`      |
+| `BSTACK_BENCH_THREADS`   | comma-separated thread counts                                  | `1,2,4,16`  |
+| `BSTACK_BENCH_PRE_ALLOC` | live allocations pre-populated per benchmark                   | `256`       |
+| `BSTACK_BENCH_SEED`      | seed for the decision stream                                   | `48`        |
+
+Op-mix presets: `mixed`, `alloc-only`, `alloc-heavy`, `realloc-heavy`, `churn`.  
+Size presets: `uniform`, `fixed`, `gamma[:k:theta_frac]`, `bimodal[:small:p_large]`.
+
+Example — alloc-only workload, gamma-distributed sizes up to 4096 bytes, single thread for `FirstFitBStackAllocator`:
+
+```sh
+BSTACK_BENCH_OP=alloc-only \
+BSTACK_BENCH_SIZE=gamma \
+BSTACK_BENCH_MAX=4096 \
+BSTACK_BENCH_THREADS=1 \
+cargo bench --bench alloc --features "alloc set atomic" -- "first_fit"
+```
+
 ## `BStackByteVec<'a, A>` (`alloc + set` features)
 
 A growable byte (`u8`) vector backed by a `BStack` allocation, mirroring the core `Vec<u8>` API.
@@ -1010,6 +1079,13 @@ recoverable after a crash by reconstructing the handle from the raw block via
 ### Key behaviour
 
 - **Growth**: `push` reallocates to `max(cap × 2, 4)` bytes when `len == cap`. New space is zero-initialised by `BStack::extend`.
+- **Bulk append**: `extend_from_slice` appends a whole `&[u8]` at once, reserving the needed capacity in a single reallocation and writing all bytes with one durable `set` before committing `len` — cheaper than a `push` per byte. A crash before the `len` write leaves the appended bytes invisible (beyond `len`); re-running with the same data recovers.
+- **In-place edits**: `set(index, value)` overwrites one slot; `fill(value)` overwrites the whole populated region with a single `BStack::repeat` (fixed-size journal regardless of `len`). Both are single crash-atomic writes.
+- **Out-of-bounds convention**: the index/range-taking methods (`set`, `insert`, `remove`, `swap_remove`, `extend_from_within`, `copy_into_bstack_slice`, `move_tail_into`) return `io::Result<Option<_>>` and yield `Ok(None)` for an out-of-range index/length or a `u64` overflow (like `get`), leaving the vec untouched. `Err` is reserved for I/O failures; passing a slice from a *different* `BStack` to a cross-slice method is an `Err` (a misuse, not an out-of-range request).
+- **Capacity control**: `reserve_exact` grows to exactly `len + additional` (no amortised over-allocation); `shrink_to(min)` / `shrink_to_fit()` reallocate the block down to `max(len, min)` / `len`, releasing spare capacity.
+- **Atomic byte movers** (`atomic` feature): built on the crash-atomic `BStack::copy` and `BStack::cross_exchange` primitives, so no method shifts bytes one at a time.
+  - Append-only, benign crash model (like `push`): `extend_from_within(start, count)` appends a copy of an existing range; `extend_from_bstack_slice(&src)` appends an on-disk slice from the same `BStack`; `append_from_owned(owned)` appends a `BStackOwnedSlice`'s bytes then frees it (a move).
+  - In-place, torn-but-valid on crash: `insert(index, value)` / `remove(index)` shift the tail via `copy`; `swap_remove(index)` swaps the hole with the last byte via `cross_exchange`; `move_tail_into(&mut dest)` swaps the vec's tail into a `BStackOwnedSlice` and shrinks. `copy_into_bstack_slice(start, &mut dst)` copies vec bytes out into a same-`BStack` slice (a single atomic `copy`).
 - **Readback helper**: `read_bytes` loads all logical bytes into a Rust `Vec<u8>`.
 - **Zeroing on removal**: `pop` decrements `len` before zeroing the vacated slot; `truncate` writes the new `len` before zeroing removed slots in a single `BStackSlice::zero_range` call. Deallocation zeroing is delegated to the allocator.
 - **Iterator**: `BStackByteVecIter` borrows the vec immutably for its lifetime (preventing concurrent mutation) and yields `io::Result<u8>` per byte, reading from disk on demand.
@@ -1023,8 +1099,7 @@ let alloc = LinearBStackAllocator::new(BStack::open("buf.bstack")?);
 
 let mut v: BStackByteVec<_> = BStackByteVec::new(&alloc)?;
 v.push(b'A')?;
-v.push(b'B')?;
-v.push(b'C')?;
+v.extend_from_slice(b"BC")?; // bulk append
 
 assert_eq!(v.len()?, 3);
 assert_eq!(v.get(1)?, Some(b'B'));

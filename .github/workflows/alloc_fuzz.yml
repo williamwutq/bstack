@@ -3,10 +3,10 @@ name: Alloc Fuzz
 on:
   push:
     branches: [ master ]
-    paths: [ src/alloc/**, src/alloc_fuzz_tests.rs ]
+    paths: [ src/alloc/**, src/alloc_fuzz_tests.rs, src/alloc_fault_tests.rs, src/alloc_test_common.rs, src/fault.rs ]
   pull_request:
     branches: [ master ]
-    paths: [ src/alloc/**, src/alloc_fuzz_tests.rs ]
+    paths: [ src/alloc/**, src/alloc_fuzz_tests.rs, src/alloc_fault_tests.rs, src/alloc_test_common.rs, src/fault.rs ]
 
 permissions:
   contents: read
@@ -22,3 +22,7 @@ jobs:
       run: cargo test --features "set alloc" -- alloc_fuzz_tests
     - name: Fuzz tests (release)
       run: cargo test --release --features "set alloc" -- alloc_fuzz_tests
+    - name: Fault fuzz
+      run: cargo test --features "set alloc fault-injection" -- alloc_fault_tests
+    - name: Fault fuzz (atomic)
+      run: cargo test --features "set alloc atomic fault-injection" -- alloc_fault_tests

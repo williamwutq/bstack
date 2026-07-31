@@ -83,12 +83,17 @@ name = "checksummed_cache"
 required-features = ["set", "atomic"]
 
 [dev-dependencies]
-rand = "0.10.1"
+rand = "0.10"
 criterion = { version = "0.8", features = ["html_reports"] }
 
 [[bench]]
 name = "locked_region"
 harness = false
+
+[[bench]]
+name = "alloc"
+harness = false
+required-features = ["alloc", "set", "atomic"]
 
 [package.metadata.docs.rs]
 all-features = true
