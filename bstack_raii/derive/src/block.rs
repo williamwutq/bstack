@@ -106,6 +106,9 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
     let mut ctor_params = Vec::new();
     let mut ctor_preps = Vec::new();
     let mut ctor_inits = Vec::new();
+    // Post-write construction steps (`#[embed]` `BStack::copy`s the child into its
+    // inline slot after the block's OnDisk is written).
+    let mut ctor_post: Vec<TokenStream> = Vec::new();
     // `bstack_move!` support (owned/ref/pod fields only, plain blocks only).
     let mut mv_caps = Vec::new();
     let mut mv_types = Vec::new();
@@ -293,29 +296,33 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                     }
                 });
 
-                // Constructor: fold each `BStackOwned<Child>` in — read its OnDisk,
-                // free its shell (its own children stay live, now owned by the embed).
+                // Constructor: capture each child's block range; the OnDisk slots
+                // are zeroed placeholders, and a post-write step `BStack::copy`s each
+                // child into its slot (then frees the shell) — no materialising.
+                let src_id = format_ident!("__embed_src_{}", fname);
                 ctor_params.push(quote!(#fname: [::bstack_raii::BStackOwned<#child>; #len],));
                 ctor_preps.push(quote! {
-                    let #fname: [#child_od; #len] = {
-                        let mut __v = ::std::vec::Vec::with_capacity(#len);
-                        for __owned in #fname {
-                            let __h = __owned.into_inner();
-                            let __cr = ::bstack_raii::BStackBlock::range(&__h);
-                            let mut __b = [0u8; ::core::mem::size_of::<#child_od>()];
-                            let __cod = *unsafe {
-                                ::bstack_raii::BStackRef::<#child>::from_range(__cr)
-                            }.read_on_disk(allocator.stack(), &mut __b)?;
-                            unsafe { ::bstack_raii::dealloc_range(allocator, __cr)?; }
-                            __v.push(__cod);
-                        }
-                        match <[#child_od; #len]>::try_from(__v) {
-                            ::std::result::Result::Ok(__a) => __a,
-                            ::std::result::Result::Err(_) => unreachable!(),
-                        }
-                    };
+                    let #src_id: [::bstack_raii::BStackRange; #len] = #fname.map(|__owned| {
+                        let __h = __owned.into_inner();
+                        ::bstack_raii::BStackBlock::range(&__h)
+                    });
                 });
-                ctor_inits.push(quote!(#fname: #fname,));
+                ctor_inits.push(
+                    quote!(#fname: [<#child_od as ::bstack_raii::Zeroable>::zeroed(); #len],),
+                );
+                ctor_post.push(quote! {
+                    {
+                        let __base =
+                            __data.start() + ::core::mem::offset_of!(#on_disk, #fname) as u64;
+                        let __step = ::core::mem::size_of::<#child_od>() as u64;
+                        for __i in 0..#len {
+                            let __src = #src_id[__i];
+                            allocator.stack().copy(
+                                __src.start(), __base + (__i as u64) * __step, __step)?;
+                            unsafe { ::bstack_raii::dealloc_range(allocator, __src)?; }
+                        }
+                    }
+                });
 
                 // Move: re-home each embedded child to a fresh standalone allocation.
                 let cap = format_ident!("__cap_{}", fname);
@@ -792,21 +799,28 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                 }
             });
 
-            // Constructor: fold a `BStackOwned<Child>` in — read its OnDisk, free
-            // its shell (its own children stay live, now owned by the embed).
+            // Constructor: capture the child's block range; the OnDisk slot is a
+            // zeroed placeholder, and a post-write step `BStack::copy`s the child
+            // into it (then frees the child shell) — no materialising the OnDisk.
+            let src_id = format_ident!("__embed_src_{}", fname);
             ctor_params.push(quote!(#fname: ::bstack_raii::BStackOwned<#child>,));
             ctor_preps.push(quote! {
-                let #fname: #child_od = {
+                let #src_id = {
                     let __h = #fname.into_inner();
-                    let __cr = ::bstack_raii::BStackBlock::range(&__h);
-                    let mut __b = [0u8; ::core::mem::size_of::<#child_od>()];
-                    let __od = *unsafe { ::bstack_raii::BStackRef::<#child>::from_range(__cr) }
-                        .read_on_disk(allocator.stack(), &mut __b)?;
-                    unsafe { ::bstack_raii::dealloc_range(allocator, __cr)?; }
-                    __od
+                    ::bstack_raii::BStackBlock::range(&__h)
                 };
             });
-            ctor_inits.push(quote!(#fname: #fname,));
+            ctor_inits.push(quote!(#fname: <#child_od as ::bstack_raii::Zeroable>::zeroed(),));
+            ctor_post.push(quote! {
+                {
+                    allocator.stack().copy(
+                        #src_id.start(),
+                        __data.start() + ::core::mem::offset_of!(#on_disk, #fname) as u64,
+                        ::core::mem::size_of::<#child_od>() as u64,
+                    )?;
+                    unsafe { ::bstack_raii::dealloc_range(allocator, #src_id)?; }
+                }
+            });
 
             // Move: re-home the embedded child to a fresh standalone allocation.
             let cap = format_ident!("__cap_{}", fname);
@@ -1054,6 +1068,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         &ctor_params,
         &ctor_preps,
         &ctor_inits,
+        &ctor_post,
     );
 
     // The field destructure is generated for every mode: plain blocks use it via
@@ -1885,6 +1900,7 @@ fn weak_setter(vis: &syn::Visibility, fname: &Ident, fty: &Type, on_disk: &Ident
 }
 
 /// Assemble the `new` constructor.
+#[allow(clippy::too_many_arguments)]
 fn constructor(
     vis: &syn::Visibility,
     on_disk: &Ident,
@@ -1893,6 +1909,10 @@ fn constructor(
     params: &[TokenStream],
     preps: &[TokenStream],
     inits: &[TokenStream],
+    // Steps run *after* the block's OnDisk is written (with `__data` = the block
+    // range in scope): `#[embed]` fields copy each child block into its now-written
+    // inline slot via `BStack::copy` and free the child shell.
+    post: &[TokenStream],
 ) -> TokenStream {
     let header = quote! {
         __bstack_header: ::bstack_raii::BlockHeader {
@@ -1955,6 +1975,7 @@ fn constructor(
                         let _ = allocator.dealloc(__slice);
                         return ::std::result::Result::Err(__e);
                     }
+                    #(#post)*
                     #finish
                 }
             }
@@ -2002,6 +2023,7 @@ fn constructor(
                         let _ = ::bstack_raii::free_many(allocator, [__data, __ctrl]);
                         return ::std::result::Result::Err(__e);
                     }
+                    #(#post)*
                     ::std::result::Result::Ok(unsafe {
                         ::bstack_raii::BStackRc::from_raw(
                             ::bstack_raii::BStackRef::from_range(__data),
@@ -2572,6 +2594,8 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
     let mut data_variants = Vec::new();
     let mut view_variants = Vec::new();
     let mut new_arms = Vec::new();
+    // Whether any variant is `#[embed]` (its `new` folds the child in post-write).
+    let mut enum_has_embed = false;
     let mut read_arms = Vec::new();
     let mut move_arms = Vec::new();
     let mut drop_arms = Vec::new();
@@ -2806,22 +2830,19 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                         payload_sizes.push(quote!(::core::mem::size_of::<#co>()));
                         data_variants.push(quote!(#vname(::bstack_raii::BStackOwned<#ty>),));
                         view_variants.push(quote!(#vname(#ty),));
-                        // new: fold a `BStackOwned<Child>` in (read OnDisk, free its
-                        // shell), copying its bytes into the payload.
+                        // new: capture the child's block range; the payload is a
+                        // zeroed placeholder, and a post-write step `BStack::copy`s
+                        // the child into it (then frees the shell) — no materialising.
+                        enum_has_embed = true;
                         new_arms.push(quote! {
                             #data::#vname(__v) => {
                                 let __h = __v.into_inner();
                                 let __cr = ::bstack_raii::BStackBlock::range(&__h);
-                                let mut __b = [0u8; ::core::mem::size_of::<#co>()];
-                                let __cod = *unsafe {
-                                    ::bstack_raii::BStackRef::<#ty>::from_range(__cr)
-                                }
-                                .read_on_disk(allocator.stack(), &mut __b)?;
-                                unsafe { ::bstack_raii::dealloc_range(allocator, __cr)?; }
-                                let mut __pl = [0u8; Self::__PAYLOAD];
-                                __pl[..::core::mem::size_of::<#co>()]
-                                    .copy_from_slice(::bstack_raii::bytemuck::bytes_of(&__cod));
-                                (#disc, __pl)
+                                __embed_copy = ::core::option::Option::Some((
+                                    __cr,
+                                    ::core::mem::size_of::<#co>() as u64,
+                                ));
+                                (#disc, [0u8; Self::__PAYLOAD])
                             }
                         });
                         // read (view): a child handle at the embedded payload offset.
@@ -3027,6 +3048,29 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
         },
     };
     let enum_size = quote!(::core::mem::size_of::<#on_disk>() as u64);
+    // For an `#[embed]` variant, `new` declares a captured child range (set by the
+    // active variant's arm) and, after writing the OnDisk with a zeroed payload,
+    // `BStack::copy`s the child into the payload and frees its shell.
+    let (embed_decl, embed_post) = if enum_has_embed {
+        (
+            quote!(let mut __embed_copy:
+                ::core::option::Option<(::bstack_raii::BStackRange, u64)> =
+                ::core::option::Option::None;),
+            quote! {
+                if let ::core::option::Option::Some((__cr, __sz)) = __embed_copy {
+                    allocator.stack().copy(
+                        __cr.start(),
+                        __data.start()
+                            + ::core::mem::offset_of!(#on_disk, __bstack_payload) as u64,
+                        __sz,
+                    )?;
+                    unsafe { ::bstack_raii::dealloc_range(allocator, __cr)?; }
+                }
+            },
+        )
+    } else {
+        (quote!(), quote!())
+    };
     let enum_new = match mode {
         Mode::Plain | Mode::Rc => {
             let injected_init = if let Mode::Rc = mode {
@@ -3058,6 +3102,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                     allocator: &'__e __A,
                     data: #data_ty,
                 ) -> ::std::io::Result<#new_ret> {
+                    #embed_decl
                     let (__disc, __payload): (#disc_ty, [u8; Self::__PAYLOAD]) = match data {
                         #(#new_arms)*
                     };
@@ -3075,6 +3120,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                         let _ = allocator.dealloc(__slice);
                         return ::std::result::Result::Err(__e);
                     }
+                    #embed_post
                     #finish
                 }
             }
@@ -3088,6 +3134,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                     allocator: &'__e __A,
                     data: #data_ty,
                 ) -> ::std::io::Result<::bstack_raii::BStackRc<'__e, Self, __A>> {
+                    #embed_decl
                     let (__disc, __payload): (#disc_ty, [u8; Self::__PAYLOAD]) = match data {
                         #(#new_arms)*
                     };
@@ -3118,6 +3165,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                         let _ = ::bstack_raii::free_many(allocator, [__data, __ctrl]);
                         return ::std::result::Result::Err(__e);
                     }
+                    #embed_post
                     ::std::result::Result::Ok(unsafe {
                         ::bstack_raii::BStackRc::from_raw(
                             ::bstack_raii::BStackRef::from_range(__data),

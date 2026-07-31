@@ -266,17 +266,31 @@ impl<'a, T: Pod, A: BStackOwnedSliceAllocator> BStackVec<'a, T, A> {
             return self.persist();
         }
 
-        // Field-resident growth: build the new block, commit, then free the old.
-        let mut bytes = bytevec.read_bytes()?;
-        bytes.extend_from_slice(bytemuck::bytes_of(&value));
-        let new_len = bytes.len() as u64;
+        // Field-resident growth: allocate a new block, copy the old elements over
+        // with the crash-atomic `BStack::copy` (no materialising), append the new
+        // element, commit the descriptor, then free the old block.
+        let new_len = len + elem;
         let new_cap = core::cmp::max(cap.saturating_mul(2), new_len);
         let old = self.data;
 
-        let mut slice = self.allocator.alloc(BYTEVEC_HEADER + new_cap)?;
+        let slice = self.allocator.alloc(BYTEVEC_HEADER + new_cap)?;
         let new_range = slice.as_range();
-        let image = bytevec_image(new_len, new_cap, &bytes);
-        if let Err(e) = slice.write_range(0, &image) {
+        let stack = self.allocator.stack();
+        let build = (|| -> io::Result<()> {
+            stack.set(new_range.start(), bytevec_image(new_len, new_cap, &[]))?;
+            if len > 0 {
+                stack.copy(
+                    old.start() + BYTEVEC_HEADER,
+                    new_range.start() + BYTEVEC_HEADER,
+                    len,
+                )?;
+            }
+            stack.set(
+                new_range.start() + BYTEVEC_HEADER + len,
+                bytemuck::bytes_of(&value),
+            )
+        })();
+        if let Err(e) = build {
             let _ = self.allocator.dealloc(slice);
             return Err(e);
         }
@@ -296,6 +310,8 @@ impl<'a, T: Pod, A: BStackOwnedSliceAllocator> BStackVec<'a, T, A> {
     pub fn clone_data_into(&self, plan: &mut ClonePlan) -> io::Result<VecDesc> {
         // Fold the data block into the plan: read the source elements, then let
         // the plan allocate + stage a fresh block so it rides the atomic commit.
+        // (Staging is intentional — the clone commits as one unit — so this does
+        // NOT use `BStack::copy`, which would land outside the batch.)
         let bytes = self.bytes()?.read_bytes()?;
         plan.stage_bytevec(self.allocator, &bytes)
     }
