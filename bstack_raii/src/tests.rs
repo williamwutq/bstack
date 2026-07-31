@@ -2459,3 +2459,174 @@ fn wal_finish_abandons_uncommitted() {
     alloc.stack().get_into(anchor, &mut buf).unwrap();
     assert_eq!(u64::from_le_bytes(buf), 0);
 }
+
+// --------------------------------------------------------------------------
+// Inline fixed-size arrays [T; N]
+// --------------------------------------------------------------------------
+
+#[bstack_block]
+struct PodArr {
+    xs: [u16; 4],
+    tag: u32,
+}
+
+#[test]
+fn macro_pod_array() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+    let p = PodArr::new(&alloc, [1u16, 2, 3, 4], 9).unwrap();
+    assert_eq!(p.handle().xs(stack).unwrap(), [1u16, 2, 3, 4]);
+    assert_eq!(p.handle().tag(stack).unwrap(), 9);
+    p.bstack_drop(&alloc).unwrap();
+}
+
+#[bstack_block]
+struct ArrHolder {
+    #[bstack_owned]
+    leaves: [MacroLeaf; 3],
+    tag: u32,
+}
+
+#[test]
+fn macro_owned_array() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+    let leaf_size = size_of::<<MacroLeaf as BStackBlock>::OnDisk>() as u64;
+
+    let l0 = MacroLeaf::new(&alloc, 10).unwrap();
+    let l1 = MacroLeaf::new(&alloc, 20).unwrap();
+    let l2 = MacroLeaf::new(&alloc, 30).unwrap();
+    let off0 = l0.handle().range().start();
+
+    let h = ArrHolder::new(&alloc, [l0, l1, l2], 7).unwrap();
+    assert_eq!(h.handle().tag(stack).unwrap(), 7);
+    let arr = h.handle().leaves(stack).unwrap(); // [MacroLeaf; 3]
+    assert_eq!(arr[0].val(stack).unwrap(), 10);
+    assert_eq!(arr[1].val(stack).unwrap(), 20);
+    assert_eq!(arr[2].val(stack).unwrap(), 30);
+
+    // Teardown frees all three inline children; the lowest slot (l0) is reclaimed.
+    h.bstack_drop(&alloc).unwrap();
+    let reused = alloc_block(&alloc, MacroLeaf::eightcc(), leaf_size).unwrap();
+    assert_eq!(reused.start(), off0);
+    unsafe { dealloc_range(&alloc, reused).unwrap() };
+}
+
+#[test]
+fn macro_owned_array_clone() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let h = ArrHolder::new(
+        &alloc,
+        [
+            MacroLeaf::new(&alloc, 1).unwrap(),
+            MacroLeaf::new(&alloc, 2).unwrap(),
+            MacroLeaf::new(&alloc, 3).unwrap(),
+        ],
+        0,
+    )
+    .unwrap();
+
+    let clone = h.try_clone_in(&alloc).unwrap();
+    let carr = clone.handle().leaves(stack).unwrap();
+    let oarr = h.handle().leaves(stack).unwrap();
+    assert_eq!(carr[1].val(stack).unwrap(), 2);
+    // Deep-cloned: each clone element is a fresh block, distinct from the original.
+    assert_ne!(carr[0].range().start(), oarr[0].range().start());
+
+    clone.bstack_drop(&alloc).unwrap();
+    assert_eq!(h.handle().leaves(stack).unwrap()[2].val(stack).unwrap(), 3);
+    h.bstack_drop(&alloc).unwrap();
+}
+
+#[bstack_block]
+struct RefArrHolder {
+    #[bstack_ref]
+    refs: [MacroLeaf; 2],
+}
+
+#[test]
+fn macro_ref_array() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+    let l0 = MacroLeaf::new(&alloc, 1).unwrap();
+    let l1 = MacroLeaf::new(&alloc, 2).unwrap();
+    let r0 = unsafe { BStackRef::from_range(l0.handle().range()) };
+    let r1 = unsafe { BStackRef::from_range(l1.handle().range()) };
+
+    let h = RefArrHolder::new(&alloc, [r0, r1]).unwrap();
+    let arr = h.handle().refs(stack).unwrap();
+    assert_eq!(arr[0].val(stack).unwrap(), 1);
+    assert_eq!(arr[1].val(stack).unwrap(), 2);
+
+    // A ref array owns nothing: dropping the holder leaves the targets alive.
+    h.bstack_drop(&alloc).unwrap();
+    assert_eq!(l0.handle().val(stack).unwrap(), 1);
+    l0.bstack_drop(&alloc).unwrap();
+    l1.bstack_drop(&alloc).unwrap();
+}
+
+#[bstack_block]
+struct StrongArrHolder {
+    #[bstack_strong]
+    shared: [MacroStrongChild; 2],
+}
+
+#[test]
+fn macro_strong_array() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+    let c0 = MacroStrongChild::new(&alloc, 5).unwrap();
+    let c1 = MacroStrongChild::new(&alloc, 6).unwrap();
+    // A keep-alive so element 0's control block survives the holders' teardown.
+    let keep0 = c0.try_clone().unwrap();
+
+    let h = StrongArrHolder::new(&alloc, [c0, c1]).unwrap();
+    let arr = h.handle().shared(stack).unwrap();
+    assert_eq!(arr[0].val(stack).unwrap(), 5);
+
+    // Cloning the holder re-references each shared child: strong count +1.
+    let d0 = arr[0].range().start();
+    let ctrl0 = crate::refcount::load(stack, d0 + layout::CTRL_BACKPTR_OFFSET).unwrap();
+    let strong0 = ctrl0 + layout::CTRL_STRONG_OFFSET;
+    let before = crate::refcount::load(stack, strong0).unwrap(); // keep0 + h = 2
+    let clone = h.try_clone_in(&alloc).unwrap();
+    assert_eq!(crate::refcount::load(stack, strong0).unwrap(), before + 1);
+
+    // Tear both holders down: element 0's count returns to keep0's alone.
+    clone.bstack_drop(&alloc).unwrap();
+    h.bstack_drop(&alloc).unwrap();
+    assert_eq!(crate::refcount::load(stack, strong0).unwrap(), before - 1);
+    assert_eq!(keep0.handle().val(stack).unwrap(), 5);
+    drop(keep0);
+}
+
+#[test]
+fn macro_owned_array_move() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+    let h = ArrHolder::new(
+        &alloc,
+        [
+            MacroLeaf::new(&alloc, 10).unwrap(),
+            MacroLeaf::new(&alloc, 20).unwrap(),
+            MacroLeaf::new(&alloc, 30).unwrap(),
+        ],
+        7,
+    )
+    .unwrap();
+    let (leaves, tag) = bstack_move!(h, &alloc).unwrap();
+    assert_eq!(tag, 7);
+    assert_eq!(leaves[0].handle().val(stack).unwrap(), 10);
+    assert_eq!(leaves[2].handle().val(stack).unwrap(), 30);
+    for l in leaves {
+        l.bstack_drop(&alloc).unwrap();
+    }
+}

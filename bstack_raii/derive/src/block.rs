@@ -240,6 +240,190 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
             continue;
         }
 
+        // Inline fixed-size array `[T; N]` of block references. (A POD array falls
+        // through to the POD path below — an array of `Pod` is `Pod`.) A reference
+        // array is stored inline as `[u64; N]`, no data block, with per-element
+        // ownership; the accessor / ctor traffic in arrays of handles `[Handle; N]`.
+        if kind != Kind::Pod && let Type::Array(arr) = opt_inner {
+            let elem = &arr.elem;
+            let len = &arr.len;
+            if kind == Kind::Embed {
+                return Err(Error::new_spanned(
+                    &field.ty,
+                    "#[embed] arrays are not yet supported",
+                ));
+            }
+            if nullable {
+                return Err(Error::new_spanned(
+                    &field.ty,
+                    "nullable arrays (`Option<[T; N]>` / `[Option<_>; N]`) are not yet supported",
+                ));
+            }
+            if kind == Kind::Weak {
+                return Err(Error::new_spanned(
+                    &field.ty,
+                    "`#[bstack_weak]` arrays are not yet supported",
+                ));
+            }
+            let size_elem = quote! {
+                ::core::mem::size_of::<<#elem as ::bstack_raii::BStackBlock>::OnDisk>() as u64
+            };
+            on_disk_fields.push(quote!(#fname: [u64; #len],));
+
+            // Accessor: read the inline offsets, resolve each to a handle.
+            accessors.push(quote! {
+                #vis fn #fname(
+                    &self,
+                    stack: &::bstack_raii::BStack,
+                ) -> ::std::io::Result<[#elem; #len]> {
+                    let mut __buf = [0u8; ::core::mem::size_of::<#on_disk>()];
+                    let __r = unsafe { ::bstack_raii::BStackRef::<Self>::from_range(self.0) };
+                    let __od: #on_disk = *__r.read_on_disk(stack, &mut __buf)?;
+                    let __offs: [u64; #len] = __od.#fname;
+                    ::std::result::Result::Ok(__offs.map(|__off| {
+                        <#elem as ::bstack_raii::BStackBlock>::from_range(
+                            ::bstack_raii::BStackRange::new(__off, #size_elem),
+                        )
+                    }))
+                }
+            });
+
+            // Constructor: `[Handle; N]` → `[u64; N]` (per-kind offset extraction).
+            let (handle_ty, to_off): (TokenStream, TokenStream) = match kind {
+                Kind::Owned => (
+                    quote!(::bstack_raii::BStackOwned<#elem>),
+                    quote!({
+                        let __h = __handle.into_inner();
+                        ::bstack_raii::BStackBlock::range(&__h).start()
+                    }),
+                ),
+                Kind::Strong => (
+                    quote!(::bstack_raii::BStackRc<'__ctor, #elem, __A>),
+                    quote!({
+                        let (__d, _) = __handle.into_raw();
+                        __d.into_range().start()
+                    }),
+                ),
+                Kind::Ref => (
+                    quote!(::bstack_raii::BStackRef<#elem>),
+                    quote!(__handle.into_range().start()),
+                ),
+                _ => unreachable!(),
+            };
+            ctor_params.push(quote!(#fname: [#handle_ty; #len],));
+            ctor_preps
+                .push(quote!(let #fname: [u64; #len] = #fname.map(|__handle| #to_off);));
+            ctor_inits.push(quote!(#fname: #fname,));
+
+            // Teardown: free / release each non-null element (a ref owns nothing).
+            let per_teardown = match kind {
+                Kind::Owned => quote! {
+                    ::bstack_raii::OwnedRef(unsafe {
+                        ::bstack_raii::BStackRef::<#elem>::from_range(
+                            ::bstack_raii::BStackRange::new(__off, #size_elem))
+                    }).bstack_drop(allocator)?;
+                },
+                Kind::Strong => quote! {
+                    <#elem as ::bstack_raii::BStackShared>::drop_strong_ref(unsafe {
+                        ::bstack_raii::BStackRef::<#elem>::from_range(
+                            ::bstack_raii::BStackRange::new(__off, #size_elem))
+                    }, allocator)?;
+                },
+                _ => quote!(),
+            };
+            if kind != Kind::Ref {
+                drop_stmts.push(quote! {
+                    {
+                        let __offs: [u64; #len] = __on_disk.#fname;
+                        for __off in __offs {
+                            if __off != 0 { #per_teardown }
+                        }
+                    }
+                });
+            }
+
+            // Clone: owned deep-clones each; strong bumps each; ref aliases.
+            match kind {
+                Kind::Owned => clone_stmts.push(quote! {
+                    {
+                        let __offs: [u64; #len] = __od.#fname;
+                        let mut __new = __offs;
+                        for __i in 0..#len {
+                            let __off = __offs[__i];
+                            if __off != 0 {
+                                let __child = <#elem as ::bstack_raii::BStackBlock>::from_range(
+                                    ::bstack_raii::BStackRange::new(__off, #size_elem));
+                                __new[__i] =
+                                    __child.__bstack_clone_into(allocator, __plan)?.start();
+                            }
+                        }
+                        __od.#fname = __new;
+                    }
+                }),
+                Kind::Strong => clone_stmts.push(quote! {
+                    {
+                        let __offs: [u64; #len] = __od.#fname;
+                        for __off in __offs {
+                            if __off != 0 {
+                                let __child = unsafe {
+                                    ::bstack_raii::BStackRef::<#elem>::from_range(
+                                        ::bstack_raii::BStackRange::new(__off, #size_elem))
+                                };
+                                __plan.bump_strong(__child, allocator)?;
+                            }
+                        }
+                    }
+                }),
+                // Ref: aliased — the copied `[u64; N]` is kept verbatim.
+                _ => {}
+            }
+
+            // Move: `[u64; N]` → `[Handle; N]`.
+            let cap = format_ident!("__cap_{}", fname);
+            mv_caps.push(quote!(let #cap = __od.#fname;));
+            match kind {
+                Kind::Owned => {
+                    mv_types.push(quote!([::bstack_raii::BStackOwned<#elem>; #len]));
+                    mv_recon.push(quote!(#cap.map(|__off| unsafe {
+                        ::bstack_raii::BStackOwned::from_raw(
+                            <#elem as ::bstack_raii::BStackBlock>::from_range(
+                                ::bstack_raii::BStackRange::new(__off, #size_elem)))
+                    })));
+                }
+                Kind::Ref => {
+                    mv_types.push(quote!([::bstack_raii::BStackRef<#elem>; #len]));
+                    mv_recon.push(quote!(#cap.map(|__off| unsafe {
+                        ::bstack_raii::BStackRef::<#elem>::from_range(
+                            ::bstack_raii::BStackRange::new(__off, #size_elem))
+                    })));
+                }
+                Kind::Strong => {
+                    // `strong_parts` is fallible → build via a `Vec`, then convert.
+                    mv_types.push(quote!([::bstack_raii::BStackRc<'__mv, #elem, __A>; #len]));
+                    mv_recon.push(quote! {
+                        {
+                            let mut __v = ::std::vec::Vec::with_capacity(#len);
+                            for __off in #cap {
+                                let __data = unsafe {
+                                    ::bstack_raii::BStackRef::<#elem>::from_range(
+                                        ::bstack_raii::BStackRange::new(__off, #size_elem))
+                                };
+                                let (__d, __c) = <#elem as ::bstack_raii::BStackShared>::strong_parts(
+                                    __data, __alloc)?;
+                                __v.push(unsafe { ::bstack_raii::BStackRc::from_raw(__d, __c, __alloc) });
+                            }
+                            match <[::bstack_raii::BStackRc<'__mv, #elem, __A>; #len]>::try_from(__v) {
+                                ::std::result::Result::Ok(__a) => __a,
+                                ::std::result::Result::Err(_) => unreachable!(),
+                            }
+                        }
+                    });
+                }
+                _ => unreachable!(),
+            }
+            continue;
+        }
+
         // Decide the stored type + nullability now that vectors are handled.
         //
         // * A **reference** kind (owned/strong/weak/ref) lowers to a `u64` offset;
