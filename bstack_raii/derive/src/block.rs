@@ -259,16 +259,110 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                     "nullable arrays (`Option<[T; N]>` / `[Option<_>; N]`) are not yet supported",
                 ));
             }
+            on_disk_fields.push(quote!(#fname: [u64; #len],));
+
+            // A weak array stores control offsets (`0` = unset), is not a ctor
+            // parameter (starts null, wired per-index via a setter), and its
+            // accessor upgrades each element.
             if kind == Kind::Weak {
-                return Err(Error::new_spanned(
-                    &field.ty,
-                    "`#[bstack_weak]` arrays are not yet supported",
+                let ctrl_ty = quote!(<#elem as ::bstack_raii::BStackWeakable>::Control);
+                let ctrl_size = quote!(::core::mem::size_of::<#ctrl_ty>() as u64);
+                ctor_inits.push(quote!(#fname: [0u64; #len],));
+
+                let setter = format_ident!("set_{}", fname);
+                setters.push(quote! {
+                    #vis fn #setter<'__s, __A: ::bstack_raii::BStackOwnedSliceAllocator>(
+                        &self,
+                        allocator: &'__s __A,
+                        index: usize,
+                        weak: ::bstack_raii::BStackWeak<'__s, #elem, __A>,
+                    ) -> ::std::io::Result<()> {
+                        let __field = self.0.start()
+                            + ::core::mem::offset_of!(#on_disk, #fname) as u64
+                            + (index as u64) * 8;
+                        ::bstack_raii::set_weak_field(allocator, __field, weak)
+                    }
+                });
+
+                accessors.push(quote! {
+                    #vis fn #fname<'__u, __A: ::bstack_raii::BStackOwnedSliceAllocator>(
+                        &self,
+                        allocator: &'__u __A,
+                    ) -> ::std::io::Result<
+                        [::core::option::Option<::bstack_raii::BStackRc<'__u, #elem, __A>>; #len]
+                    > {
+                        let __base =
+                            self.0.start() + ::core::mem::offset_of!(#on_disk, #fname) as u64;
+                        let mut __v = ::std::vec::Vec::with_capacity(#len);
+                        for __i in 0..#len {
+                            __v.push(::bstack_raii::upgrade_weak_field(
+                                allocator, __base + (__i as u64) * 8)?);
+                        }
+                        match <[::core::option::Option<
+                            ::bstack_raii::BStackRc<'__u, #elem, __A>>; #len]>::try_from(__v)
+                        {
+                            ::std::result::Result::Ok(__a) => ::std::result::Result::Ok(__a),
+                            ::std::result::Result::Err(_) => unreachable!(),
+                        }
+                    }
+                });
+
+                // Teardown: release each non-null weak reference.
+                drop_stmts.push(quote! {
+                    {
+                        let __offs: [u64; #len] = __on_disk.#fname;
+                        for __off in __offs {
+                            if __off != 0 {
+                                let __ctrl = unsafe {
+                                    ::bstack_raii::BStackRef::<#ctrl_ty>::from_range(
+                                        ::bstack_raii::BStackRange::new(__off, #ctrl_size))
+                                };
+                                ::bstack_raii::WeakRef::<#elem>(__ctrl).bstack_drop(allocator)?;
+                            }
+                        }
+                    }
+                });
+
+                // Clone: bump each non-null weak count (offsets are kept — a weak
+                // clone aliases the same control block).
+                clone_stmts.push(quote! {
+                    {
+                        let __offs: [u64; #len] = __od.#fname;
+                        for __off in __offs {
+                            if __off != 0 {
+                                __plan.bump_weak(__off);
+                            }
+                        }
+                    }
+                });
+
+                // Move: `[u64; N]` → `[Option<BStackWeak>; N]`.
+                let cap = format_ident!("__cap_{}", fname);
+                mv_caps.push(quote!(let #cap = __od.#fname;));
+                mv_types.push(quote!(
+                    [::core::option::Option<::bstack_raii::BStackWeak<'__mv, #elem, __A>>; #len]
                 ));
+                mv_recon.push(quote! {
+                    #cap.map(|__off| {
+                        if __off == 0 {
+                            ::core::option::Option::None
+                        } else {
+                            let __ctrl = unsafe {
+                                ::bstack_raii::BStackRef::<#ctrl_ty>::from_range(
+                                    ::bstack_raii::BStackRange::new(__off, #ctrl_size))
+                            };
+                            ::core::option::Option::Some(unsafe {
+                                ::bstack_raii::BStackWeak::from_raw(__ctrl, __alloc)
+                            })
+                        }
+                    })
+                });
+                continue;
             }
+
             let size_elem = quote! {
                 ::core::mem::size_of::<<#elem as ::bstack_raii::BStackBlock>::OnDisk>() as u64
             };
-            on_disk_fields.push(quote!(#fname: [u64; #len],));
 
             // Accessor: read the inline offsets, resolve each to a handle.
             accessors.push(quote! {

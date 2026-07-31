@@ -2630,3 +2630,47 @@ fn macro_owned_array_move() {
         l.bstack_drop(&alloc).unwrap();
     }
 }
+
+#[bstack_block]
+struct WeakArrHolder {
+    #[bstack_weak]
+    weaks: [MacroStrongChild; 2],
+}
+
+#[test]
+fn macro_weak_array() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+    let c0 = MacroStrongChild::new(&alloc, 5).unwrap();
+    let c1 = MacroStrongChild::new(&alloc, 6).unwrap();
+
+    // Weak arrays start null (not a ctor parameter).
+    let h = WeakArrHolder::new(&alloc).unwrap();
+    let arr = h.handle().weaks(&alloc).unwrap();
+    assert!(arr[0].is_none() && arr[1].is_none());
+
+    // Wire each element via the per-index setter.
+    h.handle().set_weaks(&alloc, 0, c0.downgrade().unwrap()).unwrap();
+    h.handle().set_weaks(&alloc, 1, c1.downgrade().unwrap()).unwrap();
+
+    // The accessor upgrades each live element.
+    let arr = h.handle().weaks(&alloc).unwrap();
+    assert_eq!(arr[0].as_ref().unwrap().handle().val(stack).unwrap(), 5);
+    assert_eq!(arr[1].as_ref().unwrap().handle().val(stack).unwrap(), 6);
+    drop(arr);
+
+    // Cloning aliases the same control blocks (weak counts bumped).
+    let clone = h.try_clone_in(&alloc).unwrap();
+    let carr = clone.handle().weaks(&alloc).unwrap();
+    assert_eq!(carr[0].as_ref().unwrap().handle().val(stack).unwrap(), 5);
+    drop(carr);
+
+    // Both holders' teardown releases the weak refs (no underflow); c0/c1 live.
+    clone.bstack_drop(&alloc).unwrap();
+    h.bstack_drop(&alloc).unwrap();
+    assert_eq!(c0.handle().val(stack).unwrap(), 5);
+    assert_eq!(c1.handle().val(stack).unwrap(), 6);
+    drop(c0);
+    drop(c1);
+}
