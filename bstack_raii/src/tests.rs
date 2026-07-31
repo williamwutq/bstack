@@ -3372,3 +3372,51 @@ fn macro_option_vec_array() {
     assert_eq!(s[2].as_ref().unwrap().to_vec().unwrap(), vec![9u32]);
     h.bstack_drop(&alloc).unwrap();
 }
+
+// --------------------------------------------------------------------------
+// #[bstack_ref] Vec<[T; N]> — a vector of fixed-size arrays of references
+// --------------------------------------------------------------------------
+
+#[bstack_block]
+struct RefVecOfArr {
+    #[bstack_ref]
+    rows: Vec<[MacroLeaf; 2]>,
+    tag: u32,
+}
+
+#[test]
+fn macro_ref_vec_of_array() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let leaves: Vec<_> = (0..4).map(|v| MacroLeaf::new(&alloc, v).unwrap()).collect();
+    let r = |i: usize| unsafe { BStackRef::from_range(leaves[i].handle().range()) };
+    let h = RefVecOfArr::new(&alloc, vec![[r(0), r(1)], [r(2), r(3)]], 7).unwrap();
+    assert_eq!(h.handle().tag(stack).unwrap(), 7);
+
+    let rows = h.handle().rows(&alloc).unwrap(); // Vec<[MacroLeaf; 2]>
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][0].val(stack).unwrap(), 0);
+    assert_eq!(rows[0][1].val(stack).unwrap(), 1);
+    assert_eq!(rows[1][0].val(stack).unwrap(), 2);
+    assert_eq!(rows[1][1].val(stack).unwrap(), 3);
+
+    // Clone aliases: same target offsets, but a fresh offset-array data block.
+    let clone = h.try_clone_in(&alloc).unwrap();
+    let crows = clone.handle().rows(&alloc).unwrap();
+    assert_eq!(
+        crows[1][0].range().start(),
+        rows[1][0].range().start() // same target (aliased)
+    );
+    clone.bstack_drop(&alloc).unwrap();
+    // Original + targets still alive after clone teardown.
+    assert_eq!(h.handle().rows(&alloc).unwrap()[0][1].val(stack).unwrap(), 1);
+
+    // Dropping the holder frees only the offset array, not the targets.
+    h.bstack_drop(&alloc).unwrap();
+    for l in leaves {
+        assert!(l.handle().val(stack).unwrap() < 4);
+        l.bstack_drop(&alloc).unwrap();
+    }
+}

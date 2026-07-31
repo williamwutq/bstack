@@ -171,6 +171,169 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                 ));
             }
 
+            // `#[bstack_ref] Vec<[T; N]>` — a vector whose elements are fixed-size
+            // arrays of block references (nested `[[T;N];M]` allowed). Each element
+            // is stored flat as `[u64; TOTAL]` in a POD data vector; the accessor
+            // materializes `Vec<[[T; ..]; ..]>` handles, teardown frees only the data
+            // block, and clone aliases (verbatim offset copy). Only `#[bstack_ref]`
+            // is supported — owned/strong/weak would need per-element child
+            // lifecycle across the whole (dynamic) vector.
+            if kind != Kind::Pod
+                && let Some(velem) = vec_inner(opt_inner)
+                && let Type::Array(_) = velem
+            {
+                if kind != Kind::Ref {
+                    return Err(Error::new_spanned(
+                        &field.ty,
+                        "only `#[bstack_ref]` is supported for a `Vec<[T; N]>` of block \
+                         references; owned / strong / weak array-element vectors are not \
+                         yet supported",
+                    ));
+                }
+                let (dims, elem_ty, leaf_nullable) = array_shape(velem)?;
+                let total = dims_prod(&dims);
+                let size_elem = quote!(::core::mem::size_of::<
+                    <#elem_ty as ::bstack_raii::BStackBlock>::OnDisk>() as u64);
+                let store = quote!(::bstack_raii::BStackVec::<[u64; #total], __A>);
+                let field_loc =
+                    quote!(self.0.start() + ::core::mem::offset_of!(#on_disk, #fname) as u64);
+
+                // Accessor: materialize `Vec<[[T; ..]; ..]>` (or `Option`) from the
+                // stored `[u64; TOTAL]` elements.
+                let one_leaf = if leaf_nullable {
+                    quote!(::core::option::Option<#elem_ty>)
+                } else {
+                    quote!(#elem_ty)
+                };
+                let handle_arr = nested_ty(&dims, &one_leaf);
+                let build_read = |k: &Ident| {
+                    if leaf_nullable {
+                        quote!({
+                            let __o = __offs[#k];
+                            if __o == 0 {
+                                ::core::option::Option::None
+                            } else {
+                                ::core::option::Option::Some(
+                                    <#elem_ty as ::bstack_raii::BStackBlock>::from_range(
+                                        ::bstack_raii::BStackRange::new(__o, #size_elem)))
+                            }
+                        })
+                    } else {
+                        quote!(<#elem_ty as ::bstack_raii::BStackBlock>::from_range(
+                            ::bstack_raii::BStackRange::new(__offs[#k], #size_elem)))
+                    }
+                };
+                let build_body = nested_build(&dims, &one_leaf, &build_read);
+                let (acc_ret, acc_map): (TokenStream, TokenStream) = if nullable {
+                    (
+                        quote!(::core::option::Option<::std::vec::Vec<#handle_arr>>),
+                        quote!(match unsafe { #store::from_field_opt(#field_loc, allocator) }? {
+                            ::core::option::Option::Some(__v) => ::core::option::Option::Some(
+                                __v.to_vec()?.into_iter().map(|__offs| #build_body).collect()),
+                            ::core::option::Option::None => ::core::option::Option::None,
+                        }),
+                    )
+                } else {
+                    (
+                        quote!(::std::vec::Vec<#handle_arr>),
+                        quote!({
+                            let __v = unsafe { #store::from_field(#field_loc, allocator)? };
+                            __v.to_vec()?.into_iter().map(|__offs| #build_body).collect()
+                        }),
+                    )
+                };
+                accessors.push(quote! {
+                    #vis fn #fname<'__v, __A: ::bstack_raii::BStackOwnedSliceAllocator>(
+                        &self,
+                        allocator: &'__v __A,
+                    ) -> ::std::io::Result<#acc_ret> {
+                        ::std::result::Result::Ok(#acc_map)
+                    }
+                });
+
+                // Constructor: `Vec<[[BStackRef<T>; ..]; ..]>` → `Vec<[u64; TOTAL]>`.
+                let ref_leaf = if leaf_nullable {
+                    quote!(::core::option::Option<::bstack_raii::BStackRef<#elem_ty>>)
+                } else {
+                    quote!(::bstack_raii::BStackRef<#elem_ty>)
+                };
+                let ref_arr = nested_ty(&dims, &ref_leaf);
+                let write_off = |k: &Ident, leaf: &Ident| {
+                    if leaf_nullable {
+                        quote!(__slots[#k] = match #leaf {
+                            ::core::option::Option::Some(__r) => __r.into_range().start(),
+                            ::core::option::Option::None => 0u64,
+                        };)
+                    } else {
+                        quote!(__slots[#k] = #leaf.into_range().start();)
+                    }
+                };
+                let consume = nested_consume(&dims, &quote!(__a), &write_off);
+                let (param, prep) = if nullable {
+                    (
+                        quote!(#fname: ::core::option::Option<::std::vec::Vec<#ref_arr>>,),
+                        quote! {
+                            let #fname: ::bstack_raii::VecDesc = match #fname {
+                                ::core::option::Option::Some(__list) => {
+                                    let __arrs: ::std::vec::Vec<[u64; #total]> =
+                                        __list.into_iter().map(|__a| {
+                                            let mut __slots = [0u64; #total];
+                                            #consume
+                                            __slots
+                                        }).collect();
+                                    #store::from_slice(allocator, &__arrs)?.descriptor()
+                                }
+                                ::core::option::Option::None => ::core::default::Default::default(),
+                            };
+                        },
+                    )
+                } else {
+                    (
+                        quote!(#fname: ::std::vec::Vec<#ref_arr>,),
+                        quote! {
+                            let __arrs: ::std::vec::Vec<[u64; #total]> =
+                                #fname.into_iter().map(|__a| {
+                                    let mut __slots = [0u64; #total];
+                                    #consume
+                                    __slots
+                                }).collect();
+                            let #fname: ::bstack_raii::VecDesc =
+                                #store::from_slice(allocator, &__arrs)?.descriptor();
+                        },
+                    )
+                };
+                ctor_params.push(param);
+                ctor_preps.push(prep);
+                ctor_inits.push(quote!(#fname: #fname,));
+
+                // Teardown: free only the data block (refs own nothing).
+                let free = quote!(#store::from_desc(__on_disk.#fname, allocator).bstack_drop()?;);
+                drop_stmts.push(if nullable {
+                    quote!({ if __on_disk.#fname.data_off != 0 { #free } })
+                } else {
+                    quote!({ #free })
+                });
+
+                // Clone: alias — copy the offset-array data block verbatim (staged).
+                clone_stmts.push(quote! {
+                    {
+                        let __srcdesc: ::bstack_raii::VecDesc = __od.#fname;
+                        if __srcdesc.data_off != 0 {
+                            __od.#fname = #store::from_desc(__srcdesc, allocator)
+                                .clone_data_into(__plan)?;
+                        }
+                    }
+                });
+
+                // Move: yield the raw offset-array vector (it owns the data block).
+                let mv_ty = quote!(::bstack_raii::BStackVec<'__mv, [u64; #total], __A>);
+                let mv_build = quote!(::bstack_raii::BStackVec::from_desc(#cap, __alloc));
+                let (mvt, mvr) = wrap_vec_move(mv_ty, mv_build, &cap, nullable);
+                mv_types.push(mvt);
+                mv_recon.push(mvr);
+                continue;
+            }
+
             // The annotation states the *elements'* relationship (the descriptor
             // + array is always owned by this struct regardless). No annotation =>
             // POD elements (byte storage, requiring `T: Pod`).
@@ -1632,10 +1795,17 @@ fn check_bare(ty: &Type) -> syn::Result<()> {
     Ok(())
 }
 
-/// A `Vec` element: a leaf, optionally wrapped in exactly one `Option`. A `Vec`
-/// / `String` here is `Vec<Vec>`; an `Option<Option>` is a double option; an
-/// `Option<Vec>` is again a nested `Vec`.
+/// A `Vec` element: a leaf, optionally an array `[..; N]` of leaves, optionally
+/// wrapped in exactly one `Option`. A `Vec` / `String` in leaf position is
+/// `Vec<Vec>` (`Vec<[Vec<T>; N]>` included — arrays are peeled first); an
+/// `Option<Option>` is a double option; an `Option<Vec>` is again a nested `Vec`.
 fn check_vec_elem(ty: &Type) -> syn::Result<()> {
+    // A `Vec` element may itself be a (nested) array of leaves; peel the array
+    // layers and validate the innermost element.
+    let mut ty = ty;
+    while let Type::Array(a) = ty {
+        ty = &a.elem;
+    }
     if let Some(inner) = option_inner(ty) {
         if option_inner(inner).is_some() {
             return Err(err_double_option(ty));
