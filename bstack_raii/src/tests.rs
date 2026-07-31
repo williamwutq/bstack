@@ -2980,3 +2980,266 @@ fn macro_enum_pod_array() {
     }
     e.bstack_drop(&alloc).unwrap();
 }
+
+// --------------------------------------------------------------------------
+// Nested arrays `[[..]; ..]` of handles (structs)
+// --------------------------------------------------------------------------
+
+#[bstack_block]
+struct OwnedGrid {
+    #[bstack_owned]
+    grid: [[MacroLeaf; 2]; 2],
+    tag: u32,
+}
+
+#[test]
+fn macro_owned_nested_array() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let mk = |v| MacroLeaf::new(&alloc, v).unwrap();
+    let h = OwnedGrid::new(
+        &alloc,
+        [[mk(1), mk(2)], [mk(3), mk(4)]],
+        7,
+    )
+    .unwrap();
+
+    assert_eq!(h.handle().tag(stack).unwrap(), 7);
+    let g = h.handle().grid(stack).unwrap(); // [[MacroLeaf; 2]; 2]
+    assert_eq!(g[0][0].val(stack).unwrap(), 1);
+    assert_eq!(g[0][1].val(stack).unwrap(), 2);
+    assert_eq!(g[1][0].val(stack).unwrap(), 3);
+    assert_eq!(g[1][1].val(stack).unwrap(), 4);
+
+    // Deep clone: fresh blocks, same values.
+    let clone = h.try_clone_in(&alloc).unwrap();
+    let cg = clone.handle().grid(stack).unwrap();
+    assert_eq!(cg[1][1].val(stack).unwrap(), 4);
+    assert_ne!(cg[0][0].range().start(), g[0][0].range().start());
+    clone.bstack_drop(&alloc).unwrap();
+    assert_eq!(h.handle().grid(stack).unwrap()[1][0].val(stack).unwrap(), 3);
+
+    // Move: nested owning handles.
+    let (moved, tag) = bstack_move!(h, &alloc).unwrap();
+    assert_eq!(tag, 7);
+    assert_eq!(moved[1][1].handle().val(stack).unwrap(), 4);
+    for row in moved {
+        for m in row {
+            m.bstack_drop(&alloc).unwrap();
+        }
+    }
+}
+
+#[bstack_block]
+struct RefCube {
+    #[bstack_ref]
+    cube: [[[MacroLeaf; 2]; 1]; 2],
+}
+
+#[test]
+fn macro_ref_nested3_array() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let leaves: Vec<_> = (0..4).map(|v| MacroLeaf::new(&alloc, v).unwrap()).collect();
+    let r = |i: usize| unsafe { BStackRef::from_range(leaves[i].handle().range()) };
+    let h = RefCube::new(&alloc, [[[r(0), r(1)]], [[r(2), r(3)]]]).unwrap();
+
+    let c = h.handle().cube(stack).unwrap(); // [[[MacroLeaf; 2]; 1]; 2]
+    assert_eq!(c[0][0][0].val(stack).unwrap(), 0);
+    assert_eq!(c[0][0][1].val(stack).unwrap(), 1);
+    assert_eq!(c[1][0][0].val(stack).unwrap(), 2);
+    assert_eq!(c[1][0][1].val(stack).unwrap(), 3);
+
+    // A ref cube owns nothing: dropping leaves targets alive.
+    h.bstack_drop(&alloc).unwrap();
+    for l in leaves {
+        assert!(l.handle().val(stack).unwrap() < 4);
+        l.bstack_drop(&alloc).unwrap();
+    }
+}
+
+#[bstack_block]
+struct EmbGrid {
+    #[embed]
+    kids: [[EmbChild; 2]; 1],
+    tag: u32,
+}
+
+#[test]
+fn macro_embed_nested_array() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let k = |v| EmbChild::new(&alloc, MacroLeaf::new(&alloc, v).unwrap(), v).unwrap();
+    let h = EmbGrid::new(&alloc, [[k(10), k(20)]], 5).unwrap();
+    assert_eq!(h.handle().tag(stack).unwrap(), 5);
+
+    let g = h.handle().kids(); // [[EmbChild; 2]; 1]
+    assert_eq!(g[0][0].leaf(stack).unwrap().val(stack).unwrap(), 10);
+    assert_eq!(g[0][1].leaf(stack).unwrap().val(stack).unwrap(), 20);
+
+    let clone = h.try_clone_in(&alloc).unwrap();
+    let cg = clone.handle().kids();
+    assert_eq!(cg[0][1].leaf(stack).unwrap().val(stack).unwrap(), 20);
+    assert_ne!(
+        cg[0][0].leaf(stack).unwrap().range().start(),
+        g[0][0].leaf(stack).unwrap().range().start()
+    );
+    clone.bstack_drop(&alloc).unwrap();
+
+    let (moved, tag) = bstack_move!(h, &alloc).unwrap();
+    assert_eq!(tag, 5);
+    assert_eq!(moved[0][0].handle().leaf(stack).unwrap().val(stack).unwrap(), 10);
+    for row in moved {
+        for m in row {
+            m.bstack_drop(&alloc).unwrap();
+        }
+    }
+}
+
+// --------------------------------------------------------------------------
+// Enum array variants: Option leaves, #[embed], and nesting
+// --------------------------------------------------------------------------
+
+#[bstack_enum]
+enum OptArrEnum {
+    Empty,
+    #[bstack_owned]
+    Slots([Option<MacroLeaf>; 3]),
+}
+
+#[test]
+fn macro_enum_owned_option_array() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let e = OptArrEnum::new(
+        &alloc,
+        OptArrEnumData::Slots([
+            Some(MacroLeaf::new(&alloc, 10).unwrap()),
+            None,
+            Some(MacroLeaf::new(&alloc, 30).unwrap()),
+        ]),
+    )
+    .unwrap();
+    match e.handle().read(&alloc).unwrap() {
+        OptArrEnumView::Slots(arr) => {
+            assert_eq!(arr[0].map(|h| h.val(stack).unwrap()), Some(10));
+            assert!(arr[1].is_none());
+            assert_eq!(arr[2].map(|h| h.val(stack).unwrap()), Some(30));
+        }
+        _ => panic!("expected Slots"),
+    }
+
+    let clone = e.try_clone_in(&alloc).unwrap();
+    match clone.handle().read(&alloc).unwrap() {
+        OptArrEnumView::Slots(arr) => {
+            assert_eq!(arr[2].map(|h| h.val(stack).unwrap()), Some(30));
+            assert!(arr[1].is_none());
+        }
+        _ => panic!("expected Slots"),
+    }
+    clone.bstack_drop(&alloc).unwrap();
+
+    match bstack_move!(e, &alloc).unwrap() {
+        OptArrEnumData::Slots(arr) => {
+            assert_eq!(arr[0].as_ref().map(|h| h.handle().val(stack).unwrap()), Some(10));
+            assert!(arr[1].is_none());
+            for slot in arr.into_iter().flatten() {
+                slot.bstack_drop(&alloc).unwrap();
+            }
+        }
+        _ => panic!("expected Slots"),
+    }
+}
+
+#[bstack_enum]
+enum EmbArrEnum {
+    Empty,
+    #[embed]
+    Kids([EmbChild; 2]),
+}
+
+#[test]
+fn macro_enum_embed_array() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let k = |v| EmbChild::new(&alloc, MacroLeaf::new(&alloc, v).unwrap(), v).unwrap();
+    let e = EmbArrEnum::new(&alloc, EmbArrEnumData::Kids([k(10), k(20)])).unwrap();
+
+    match e.handle().read(&alloc).unwrap() {
+        EmbArrEnumView::Kids(arr) => {
+            assert_eq!(arr[0].leaf(stack).unwrap().val(stack).unwrap(), 10);
+            assert_eq!(arr[1].leaf(stack).unwrap().val(stack).unwrap(), 20);
+        }
+        _ => panic!("expected Kids"),
+    }
+
+    let clone = e.try_clone_in(&alloc).unwrap();
+    match clone.handle().read(&alloc).unwrap() {
+        EmbArrEnumView::Kids(arr) => assert_eq!(arr[1].leaf(stack).unwrap().val(stack).unwrap(), 20),
+        _ => panic!("expected Kids"),
+    }
+    clone.bstack_drop(&alloc).unwrap();
+
+    match bstack_move!(e, &alloc).unwrap() {
+        EmbArrEnumData::Kids(arr) => {
+            assert_eq!(arr[0].handle().leaf(stack).unwrap().val(stack).unwrap(), 10);
+            for m in arr {
+                m.bstack_drop(&alloc).unwrap();
+            }
+        }
+        _ => panic!("expected Kids"),
+    }
+}
+
+#[bstack_enum]
+enum NestArrEnum {
+    Empty,
+    #[bstack_owned]
+    Grid([[MacroLeaf; 2]; 2]),
+}
+
+#[test]
+fn macro_enum_owned_nested_array() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let mk = |v| MacroLeaf::new(&alloc, v).unwrap();
+    let e = NestArrEnum::new(
+        &alloc,
+        NestArrEnumData::Grid([[mk(1), mk(2)], [mk(3), mk(4)]]),
+    )
+    .unwrap();
+    match e.handle().read(&alloc).unwrap() {
+        NestArrEnumView::Grid(g) => {
+            assert_eq!(g[0][0].val(stack).unwrap(), 1);
+            assert_eq!(g[1][1].val(stack).unwrap(), 4);
+        }
+        _ => panic!("expected Grid"),
+    }
+
+    let clone = e.try_clone_in(&alloc).unwrap();
+    clone.bstack_drop(&alloc).unwrap();
+
+    match bstack_move!(e, &alloc).unwrap() {
+        NestArrEnumData::Grid(g) => {
+            assert_eq!(g[1][0].handle().val(stack).unwrap(), 3);
+            for row in g {
+                for m in row {
+                    m.bstack_drop(&alloc).unwrap();
+                }
+            }
+        }
+        _ => panic!("expected Grid"),
+    }
+}

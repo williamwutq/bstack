@@ -247,18 +247,27 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         // through to the POD path below — an array of `Pod` is `Pod`.) A reference
         // array is stored inline as `[u64; N]`, no data block, with per-element
         // ownership; the accessor / ctor traffic in arrays of handles `[Handle; N]`.
-        if kind != Kind::Pod && let Type::Array(arr) = opt_inner {
-            let len = &arr.len;
-            // A per-element `Option<T>` makes each slot nullable (offset 0 == None).
-            let (elem, elem_nullable): (&Type, bool) = match option_inner(&arr.elem) {
-                Some(__inner) => (__inner, true),
-                None => (&arr.elem, false),
-            };
-            // `#[embed] [Child; N]`: N verbatim child on-disk forms inline
-            // (`[<Child as BStackBlock>::OnDisk; N]`). Construction folds each
-            // `BStackOwned<Child>` in (a lot of movement — read OnDisk, free shell).
+        // Inline fixed-size array `[T; N]` — possibly *nested* `[[..]; ..]` — of
+        // block references. (A POD array falls through to the POD path below: an
+        // array of `Pod` is `Pod`.) Stored **flat** as `[u64; N0*..*Nk]` inline
+        // (no data block), one offset per leaf, with per-element ownership; the
+        // accessor / ctor / move traffic in the nested `[[Handle; ..]; ..]` shape.
+        if kind != Kind::Pod && let Type::Array(_) = opt_inner {
+            if nullable {
+                return Err(Error::new_spanned(
+                    &field.ty,
+                    "a whole-array `Option<[T; N]>` is not supported; use `[Option<T>; N]` \
+                     for per-element nullability",
+                ));
+            }
+            let (dims, elem, elem_nullable) = array_shape(opt_inner)?;
+            let total = dims_prod(&dims);
+
+            // `#[embed] [Child; N]` (or nested): N verbatim child on-disk forms
+            // inline (`[<Child as BStackBlock>::OnDisk; TOTAL]`, flat). Construction
+            // folds each `BStackOwned<Child>` in (read OnDisk, copy, free shell).
             if kind == Kind::Embed {
-                if nullable || elem_nullable {
+                if elem_nullable {
                     return Err(Error::new_spanned(
                         &field.ty,
                         "#[embed] does not support `Option`",
@@ -266,7 +275,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                 }
                 let child = elem;
                 let child_od = quote!(<#child as ::bstack_raii::BStackBlock>::OnDisk);
-                on_disk_fields.push(quote!(#fname: [#child_od; #len],));
+                on_disk_fields.push(quote!(#fname: [#child_od; #total],));
 
                 // Teardown: free each embedded child's children in place.
                 drop_stmts.push(quote! {
@@ -274,51 +283,64 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                         let __base =
                             __range.start() + ::core::mem::offset_of!(#on_disk, #fname) as u64;
                         let __step = ::core::mem::size_of::<#child_od>() as u64;
-                        for __i in 0..#len {
+                        for __k in 0usize..(#total) {
                             let __embed = ::bstack_raii::BStackRange::new(
-                                __base + (__i as u64) * __step, __step);
+                                __base + (__k as u64) * __step, __step);
                             <#child>::__bstack_drop_children(__embed, allocator)?;
                         }
                     }
                 });
 
-                // Accessor: `[Child; N]`, each a handle into its inline slot.
+                // Accessor: nested `[[Child; ..]; ..]`, each a handle into its slot.
+                let acc_ret = nested_ty(&dims, &quote!(#child));
+                let acc_read = |k: &Ident| {
+                    quote!(<#child as ::bstack_raii::BStackBlock>::from_range(
+                        ::bstack_raii::BStackRange::new(__base + (#k as u64) * __step, __step)))
+                };
+                let acc_body = nested_build(&dims, &quote!(#child), &acc_read);
                 accessors.push(quote! {
-                    #vis fn #fname(&self) -> [#child; #len] {
+                    #vis fn #fname(&self) -> #acc_ret {
                         let __base =
                             self.0.start() + ::core::mem::offset_of!(#on_disk, #fname) as u64;
                         let __step = ::core::mem::size_of::<#child_od>() as u64;
-                        ::core::array::from_fn(|__i| {
-                            <#child as ::bstack_raii::BStackBlock>::from_range(
-                                ::bstack_raii::BStackRange::new(
-                                    __base + (__i as u64) * __step, __step))
-                        })
+                        #acc_body
                     }
                 });
 
-                // Constructor: capture each child's block range; the OnDisk slots
-                // are zeroed placeholders, and a post-write step `BStack::copy`s each
-                // child into its slot (then frees the shell) — no materialising.
+                // Constructor: flatten the nested owned array to `[BStackRange; TOTAL]`
+                // (each child's source block), zero the slots, and `copy` each child
+                // into place post-write (then free the shell) — no materialising.
                 let src_id = format_ident!("__embed_src_{}", fname);
-                ctor_params.push(quote!(#fname: [::bstack_raii::BStackOwned<#child>; #len],));
+                let param_ty = nested_ty(&dims, &quote!(::bstack_raii::BStackOwned<#child>));
+                ctor_params.push(quote!(#fname: #param_ty,));
+                let cap_write = |k: &Ident, leaf: &Ident| {
+                    quote! {
+                        #src_id[#k] = {
+                            let __h = #leaf.into_inner();
+                            ::bstack_raii::BStackBlock::range(&__h)
+                        };
+                    }
+                };
+                let flatten = nested_consume(&dims, &quote!(#fname), &cap_write);
                 ctor_preps.push(quote! {
-                    let #src_id: [::bstack_raii::BStackRange; #len] = #fname.map(|__owned| {
-                        let __h = __owned.into_inner();
-                        ::bstack_raii::BStackBlock::range(&__h)
-                    });
+                    let #src_id: [::bstack_raii::BStackRange; #total] = {
+                        let mut #src_id = [::bstack_raii::BStackRange::new(0, 0); #total];
+                        #flatten
+                        #src_id
+                    };
                 });
                 ctor_inits.push(
-                    quote!(#fname: [<#child_od as ::bstack_raii::Zeroable>::zeroed(); #len],),
+                    quote!(#fname: [<#child_od as ::bstack_raii::Zeroable>::zeroed(); #total],),
                 );
                 ctor_post.push(quote! {
                     {
                         let __base =
                             __data.start() + ::core::mem::offset_of!(#on_disk, #fname) as u64;
                         let __step = ::core::mem::size_of::<#child_od>() as u64;
-                        for __i in 0..#len {
-                            let __src = #src_id[__i];
+                        for __k in 0usize..(#total) {
+                            let __src = #src_id[__k];
                             allocator.stack().copy(
-                                __src.start(), __base + (__i as u64) * __step, __step)?;
+                                __src.start(), __base + (__k as u64) * __step, __step)?;
                             unsafe { ::bstack_raii::dealloc_range(allocator, __src)?; }
                         }
                     }
@@ -327,45 +349,44 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                 // Move: re-home each embedded child to a fresh standalone allocation.
                 let cap = format_ident!("__cap_{}", fname);
                 mv_caps.push(quote!(let #cap = __od.#fname;));
-                mv_types.push(quote!([::bstack_raii::BStackOwned<#child>; #len]));
-                mv_recon.push(quote! {
-                    {
-                        let mut __v = ::std::vec::Vec::with_capacity(#len);
-                        for __cod in #cap {
-                            let mut __slice =
-                                __alloc.alloc(::core::mem::size_of::<#child_od>() as u64)?;
-                            let __r = __slice.as_range();
-                            if let ::std::result::Result::Err(__e) =
-                                __slice.write_range(0, ::bstack_raii::bytemuck::bytes_of(&__cod))
-                            {
-                                let _ = __alloc.dealloc(__slice);
-                                return ::std::result::Result::Err(__e);
-                            }
-                            __v.push(unsafe {
-                                ::bstack_raii::BStackOwned::from_raw(
-                                    <#child as ::bstack_raii::BStackBlock>::from_range(__r))
-                            });
+                mv_types.push(nested_ty(&dims, &quote!(::bstack_raii::BStackOwned<#child>)));
+                let mv_read = |k: &Ident| {
+                    quote! {{
+                        let __cod = #cap[#k];
+                        let mut __slice =
+                            __alloc.alloc(::core::mem::size_of::<#child_od>() as u64)?;
+                        let __r = __slice.as_range();
+                        if let ::std::result::Result::Err(__e) =
+                            __slice.write_range(0, ::bstack_raii::bytemuck::bytes_of(&__cod))
+                        {
+                            let _ = __alloc.dealloc(__slice);
+                            return ::std::result::Result::Err(__e);
                         }
-                        match <[::bstack_raii::BStackOwned<#child>; #len]>::try_from(__v) {
-                            ::std::result::Result::Ok(__a) => __a,
-                            ::std::result::Result::Err(_) => unreachable!(),
+                        unsafe {
+                            ::bstack_raii::BStackOwned::from_raw(
+                                <#child as ::bstack_raii::BStackBlock>::from_range(__r))
                         }
-                    }
-                });
+                    }}
+                };
+                mv_recon.push(nested_build(
+                    &dims,
+                    &quote!(::bstack_raii::BStackOwned<#child>),
+                    &mv_read,
+                ));
 
-                // Clone: fold each embedded child's clone inline (copy the array out,
-                // mutate, write back — a packed field's elements can't be `&mut`'d).
+                // Clone: fold each embedded child's clone inline (flat; copy the
+                // array out, mutate, write back — packed fields can't be `&mut`'d).
                 clone_stmts.push(quote! {
                     {
                         let __base =
                             __src.start() + ::core::mem::offset_of!(#on_disk, #fname) as u64;
                         let __step = ::core::mem::size_of::<#child_od>() as u64;
-                        let mut __arr: [#child_od; #len] = __od.#fname;
-                        for __i in 0..#len {
+                        let mut __arr: [#child_od; #total] = __od.#fname;
+                        for __k in 0usize..(#total) {
                             let __child = <#child as ::bstack_raii::BStackBlock>::from_range(
                                 ::bstack_raii::BStackRange::new(
-                                    __base + (__i as u64) * __step, __step));
-                            __arr[__i] =
+                                    __base + (__k as u64) * __step, __step));
+                            __arr[__k] =
                                 __child.__bstack_clone_children_inplace(allocator, __plan)?;
                         }
                         __od.#fname = __arr;
@@ -373,22 +394,19 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                 });
                 continue;
             }
-            if nullable {
-                return Err(Error::new_spanned(
-                    &field.ty,
-                    "a whole-array `Option<[T; N]>` is not supported; use `[Option<T>; N]` \
-                     for per-element nullability",
-                ));
-            }
-            on_disk_fields.push(quote!(#fname: [u64; #len],));
+
+            on_disk_fields.push(quote!(#fname: [u64; #total],));
+            let size_elem = quote! {
+                ::core::mem::size_of::<<#elem as ::bstack_raii::BStackBlock>::OnDisk>() as u64
+            };
 
             // A weak array stores control offsets (`0` = unset), is not a ctor
-            // parameter (starts null, wired per-index via a setter), and its
-            // accessor upgrades each element.
+            // parameter (starts null, wired per flat index via a setter), and its
+            // accessor upgrades each element (address-based).
             if kind == Kind::Weak {
                 let ctrl_ty = quote!(<#elem as ::bstack_raii::BStackWeakable>::Control);
                 let ctrl_size = quote!(::core::mem::size_of::<#ctrl_ty>() as u64);
-                ctor_inits.push(quote!(#fname: [0u64; #len],));
+                ctor_inits.push(quote!(#fname: [0u64; #total],));
 
                 let setter = format_ident!("set_{}", fname);
                 setters.push(quote! {
@@ -405,33 +423,29 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                     }
                 });
 
+                let leaf_ty =
+                    quote!(::core::option::Option<::bstack_raii::BStackRc<'__u, #elem, __A>>);
+                let acc_ret = nested_ty(&dims, &leaf_ty);
+                let acc_read = |k: &Ident| {
+                    quote!(::bstack_raii::upgrade_weak_field(
+                        allocator, __base + (#k as u64) * 8)?)
+                };
+                let acc_body = nested_build(&dims, &leaf_ty, &acc_read);
                 accessors.push(quote! {
                     #vis fn #fname<'__u, __A: ::bstack_raii::BStackOwnedSliceAllocator>(
                         &self,
                         allocator: &'__u __A,
-                    ) -> ::std::io::Result<
-                        [::core::option::Option<::bstack_raii::BStackRc<'__u, #elem, __A>>; #len]
-                    > {
+                    ) -> ::std::io::Result<#acc_ret> {
                         let __base =
                             self.0.start() + ::core::mem::offset_of!(#on_disk, #fname) as u64;
-                        let mut __v = ::std::vec::Vec::with_capacity(#len);
-                        for __i in 0..#len {
-                            __v.push(::bstack_raii::upgrade_weak_field(
-                                allocator, __base + (__i as u64) * 8)?);
-                        }
-                        match <[::core::option::Option<
-                            ::bstack_raii::BStackRc<'__u, #elem, __A>>; #len]>::try_from(__v)
-                        {
-                            ::std::result::Result::Ok(__a) => ::std::result::Result::Ok(__a),
-                            ::std::result::Result::Err(_) => unreachable!(),
-                        }
+                        ::std::result::Result::Ok(#acc_body)
                     }
                 });
 
                 // Teardown: release each non-null weak reference.
                 drop_stmts.push(quote! {
                     {
-                        let __offs: [u64; #len] = __on_disk.#fname;
+                        let __offs: [u64; #total] = __on_disk.#fname;
                         for __off in __offs {
                             if __off != 0 {
                                 let __ctrl = unsafe {
@@ -444,11 +458,11 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                     }
                 });
 
-                // Clone: bump each non-null weak count (offsets are kept — a weak
-                // clone aliases the same control block).
+                // Clone: bump each non-null weak count (offsets kept — a weak clone
+                // aliases the same control block).
                 clone_stmts.push(quote! {
                     {
-                        let __offs: [u64; #len] = __od.#fname;
+                        let __offs: [u64; #total] = __od.#fname;
                         for __off in __offs {
                             if __off != 0 {
                                 __plan.bump_weak(__off);
@@ -457,14 +471,15 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                     }
                 });
 
-                // Move: `[u64; N]` → `[Option<BStackWeak>; N]`.
+                // Move: nested `[[Option<BStackWeak>; ..]; ..]` from flat offsets.
                 let cap = format_ident!("__cap_{}", fname);
                 mv_caps.push(quote!(let #cap = __od.#fname;));
-                mv_types.push(quote!(
-                    [::core::option::Option<::bstack_raii::BStackWeak<'__mv, #elem, __A>>; #len]
-                ));
-                mv_recon.push(quote! {
-                    #cap.map(|__off| {
+                let mv_leaf_ty =
+                    quote!(::core::option::Option<::bstack_raii::BStackWeak<'__mv, #elem, __A>>);
+                mv_types.push(nested_ty(&dims, &mv_leaf_ty));
+                let mv_read = |k: &Ident| {
+                    quote! {{
+                        let __off = #cap[#k];
                         if __off == 0 {
                             ::core::option::Option::None
                         } else {
@@ -476,31 +491,38 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                                 ::bstack_raii::BStackWeak::from_raw(__ctrl, __alloc)
                             })
                         }
-                    })
-                });
+                    }}
+                };
+                mv_recon.push(nested_build(&dims, &mv_leaf_ty, &mv_read));
                 continue;
             }
 
-            let size_elem = quote! {
-                ::core::mem::size_of::<<#elem as ::bstack_raii::BStackBlock>::OnDisk>() as u64
-            };
-
-            // Accessor: read the inline offsets, resolve each to a handle (or
-            // `None` for a `0` slot in an `Option`-element array).
-            let resolve_expr = quote!(<#elem as ::bstack_raii::BStackBlock>::from_range(
-                ::bstack_raii::BStackRange::new(__off, #size_elem)));
-            let (acc_ret, acc_map) = if elem_nullable {
-                (
-                    quote!([::core::option::Option<#elem>; #len]),
-                    quote!(if __off == 0 {
-                        ::core::option::Option::None
-                    } else {
-                        ::core::option::Option::Some(#resolve_expr)
-                    }),
-                )
+            // Owned / strong / ref: nested `[[Handle; ..]; ..]`, value-based from
+            // the flat offsets. A `0` slot is `None` for an `Option`-element array.
+            let leaf_view = if elem_nullable {
+                quote!(::core::option::Option<#elem>)
             } else {
-                (quote!([#elem; #len]), resolve_expr.clone())
+                quote!(#elem)
             };
+            let acc_ret = nested_ty(&dims, &leaf_view);
+            let acc_read = |k: &Ident| {
+                if elem_nullable {
+                    quote!({
+                        let __o = __offs[#k];
+                        if __o == 0 {
+                            ::core::option::Option::None
+                        } else {
+                            ::core::option::Option::Some(
+                                <#elem as ::bstack_raii::BStackBlock>::from_range(
+                                    ::bstack_raii::BStackRange::new(__o, #size_elem)))
+                        }
+                    })
+                } else {
+                    quote!(<#elem as ::bstack_raii::BStackBlock>::from_range(
+                        ::bstack_raii::BStackRange::new(__offs[#k], #size_elem)))
+                }
+            };
+            let acc_body = nested_build(&dims, &leaf_view, &acc_read);
             accessors.push(quote! {
                 #vis fn #fname(
                     &self,
@@ -509,44 +531,60 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                     let mut __buf = [0u8; ::core::mem::size_of::<#on_disk>()];
                     let __r = unsafe { ::bstack_raii::BStackRef::<Self>::from_range(self.0) };
                     let __od: #on_disk = *__r.read_on_disk(stack, &mut __buf)?;
-                    let __offs: [u64; #len] = __od.#fname;
-                    ::std::result::Result::Ok(__offs.map(|__off| #acc_map))
+                    let __offs: [u64; #total] = __od.#fname;
+                    ::std::result::Result::Ok(#acc_body)
                 }
             });
 
-            // Constructor: `[Handle; N]` → `[u64; N]` (per-kind offset extraction).
-            let (handle_ty, to_off): (TokenStream, TokenStream) = match kind {
-                Kind::Owned => (
-                    quote!(::bstack_raii::BStackOwned<#elem>),
-                    quote!({
-                        let __h = __handle.into_inner();
-                        ::bstack_raii::BStackBlock::range(&__h).start()
-                    }),
-                ),
-                Kind::Strong => (
-                    quote!(::bstack_raii::BStackRc<'__ctor, #elem, __A>),
-                    quote!({
-                        let (__d, _) = __handle.into_raw();
-                        __d.into_range().start()
-                    }),
-                ),
-                Kind::Ref => (
-                    quote!(::bstack_raii::BStackRef<#elem>),
-                    quote!(__handle.into_range().start()),
-                ),
+            // Constructor: nested `[[Handle; ..]; ..]` → flat `[u64; TOTAL]`.
+            let handle_ty = match kind {
+                Kind::Owned => quote!(::bstack_raii::BStackOwned<#elem>),
+                Kind::Strong => quote!(::bstack_raii::BStackRc<'__ctor, #elem, __A>),
+                Kind::Ref => quote!(::bstack_raii::BStackRef<#elem>),
                 _ => unreachable!(),
             };
-            if elem_nullable {
-                ctor_params.push(quote!(#fname: [::core::option::Option<#handle_ty>; #len],));
-                ctor_preps.push(quote!(let #fname: [u64; #len] = #fname.map(|__opt| match __opt {
-                    ::core::option::Option::Some(__handle) => #to_off,
-                    ::core::option::Option::None => 0u64,
-                });));
+            let off_of = |h: &Ident| match kind {
+                Kind::Owned => quote!({
+                    let __h = #h.into_inner();
+                    ::bstack_raii::BStackBlock::range(&__h).start()
+                }),
+                Kind::Strong => quote!({
+                    let (__d, _) = #h.into_raw();
+                    __d.into_range().start()
+                }),
+                Kind::Ref => quote!(#h.into_range().start()),
+                _ => unreachable!(),
+            };
+            let ctor_leaf_ty = if elem_nullable {
+                quote!(::core::option::Option<#handle_ty>)
             } else {
-                ctor_params.push(quote!(#fname: [#handle_ty; #len],));
-                ctor_preps
-                    .push(quote!(let #fname: [u64; #len] = #fname.map(|__handle| #to_off);));
-            }
+                quote!(#handle_ty)
+            };
+            let ctor_param_ty = nested_ty(&dims, &ctor_leaf_ty);
+            ctor_params.push(quote!(#fname: #ctor_param_ty,));
+            let ctor_write = |k: &Ident, leaf: &Ident| {
+                if elem_nullable {
+                    let h = format_ident!("__handle");
+                    let off = off_of(&h);
+                    quote! {
+                        __a[#k] = match #leaf {
+                            ::core::option::Option::Some(#h) => #off,
+                            ::core::option::Option::None => 0u64,
+                        };
+                    }
+                } else {
+                    let off = off_of(leaf);
+                    quote!(__a[#k] = #off;)
+                }
+            };
+            let flatten = nested_consume(&dims, &quote!(#fname), &ctor_write);
+            ctor_preps.push(quote! {
+                let #fname: [u64; #total] = {
+                    let mut __a = [0u64; #total];
+                    #flatten
+                    __a
+                };
+            });
             ctor_inits.push(quote!(#fname: #fname,));
 
             // Teardown: free / release each non-null element (a ref owns nothing).
@@ -568,7 +606,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
             if kind != Kind::Ref {
                 drop_stmts.push(quote! {
                     {
-                        let __offs: [u64; #len] = __on_disk.#fname;
+                        let __offs: [u64; #total] = __on_disk.#fname;
                         for __off in __offs {
                             if __off != 0 { #per_teardown }
                         }
@@ -580,23 +618,22 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
             match kind {
                 Kind::Owned => clone_stmts.push(quote! {
                     {
-                        let __offs: [u64; #len] = __od.#fname;
-                        let mut __new = __offs;
-                        for __i in 0..#len {
-                            let __off = __offs[__i];
+                        let mut __arr: [u64; #total] = __od.#fname;
+                        for __k in 0usize..(#total) {
+                            let __off = __arr[__k];
                             if __off != 0 {
                                 let __child = <#elem as ::bstack_raii::BStackBlock>::from_range(
                                     ::bstack_raii::BStackRange::new(__off, #size_elem));
-                                __new[__i] =
+                                __arr[__k] =
                                     __child.__bstack_clone_into(allocator, __plan)?.start();
                             }
                         }
-                        __od.#fname = __new;
+                        __od.#fname = __arr;
                     }
                 }),
                 Kind::Strong => clone_stmts.push(quote! {
                     {
-                        let __offs: [u64; #len] = __od.#fname;
+                        let __offs: [u64; #total] = __od.#fname;
                         for __off in __offs {
                             if __off != 0 {
                                 let __child = unsafe {
@@ -608,93 +645,67 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                         }
                     }
                 }),
-                // Ref: aliased — the copied `[u64; N]` is kept verbatim.
+                // Ref: aliased — the copied `[u64; TOTAL]` is kept verbatim.
                 _ => {}
             }
 
-            // Move: `[u64; N]` → `[Handle; N]` (or `[Option<Handle>; N]`).
+            // Move: nested `[[Handle; ..]; ..]` from flat offsets.
             let cap = format_ident!("__cap_{}", fname);
             mv_caps.push(quote!(let #cap = __od.#fname;));
-            match kind {
-                // Owned / ref reconstruct infallibly, via `array::map`.
-                Kind::Owned | Kind::Ref => {
-                    let (inner_ty, recon_one) = if kind == Kind::Owned {
-                        (
-                            quote!(::bstack_raii::BStackOwned<#elem>),
-                            quote!(unsafe {
-                                ::bstack_raii::BStackOwned::from_raw(
-                                    <#elem as ::bstack_raii::BStackBlock>::from_range(
-                                        ::bstack_raii::BStackRange::new(__off, #size_elem)))
-                            }),
-                        )
-                    } else {
-                        (
-                            quote!(::bstack_raii::BStackRef<#elem>),
-                            quote!(unsafe {
-                                ::bstack_raii::BStackRef::<#elem>::from_range(
-                                    ::bstack_raii::BStackRange::new(__off, #size_elem))
-                            }),
-                        )
-                    };
-                    if elem_nullable {
-                        mv_types.push(quote!([::core::option::Option<#inner_ty>; #len]));
-                        mv_recon.push(quote!(#cap.map(|__off| if __off == 0 {
+            let (mv_leaf, build_one): (TokenStream, TokenStream) = match kind {
+                Kind::Owned => (
+                    quote!(::bstack_raii::BStackOwned<#elem>),
+                    quote!(unsafe {
+                        ::bstack_raii::BStackOwned::from_raw(
+                            <#elem as ::bstack_raii::BStackBlock>::from_range(
+                                ::bstack_raii::BStackRange::new(__off, #size_elem)))
+                    }),
+                ),
+                Kind::Ref => (
+                    quote!(::bstack_raii::BStackRef<#elem>),
+                    quote!(unsafe {
+                        ::bstack_raii::BStackRef::<#elem>::from_range(
+                            ::bstack_raii::BStackRange::new(__off, #size_elem))
+                    }),
+                ),
+                Kind::Strong => (
+                    quote!(::bstack_raii::BStackRc<'__mv, #elem, __A>),
+                    quote!({
+                        let __data = unsafe {
+                            ::bstack_raii::BStackRef::<#elem>::from_range(
+                                ::bstack_raii::BStackRange::new(__off, #size_elem))
+                        };
+                        let (__d, __c) =
+                            <#elem as ::bstack_raii::BStackShared>::strong_parts(__data, __alloc)?;
+                        unsafe { ::bstack_raii::BStackRc::from_raw(__d, __c, __alloc) }
+                    }),
+                ),
+                _ => unreachable!(),
+            };
+            let mv_leaf_ty = if elem_nullable {
+                quote!(::core::option::Option<#mv_leaf>)
+            } else {
+                mv_leaf.clone()
+            };
+            mv_types.push(nested_ty(&dims, &mv_leaf_ty));
+            let mv_read = |k: &Ident| {
+                if elem_nullable {
+                    quote! {{
+                        let __off = #cap[#k];
+                        if __off == 0 {
                             ::core::option::Option::None
                         } else {
-                            ::core::option::Option::Some(#recon_one)
-                        })));
-                    } else {
-                        mv_types.push(quote!([#inner_ty; #len]));
-                        mv_recon.push(quote!(#cap.map(|__off| #recon_one)));
-                    }
-                }
-                // Strong's `strong_parts` is fallible → build via a `Vec`.
-                Kind::Strong => {
-                    let (elem_ty, push_expr) = if elem_nullable {
-                        (
-                            quote!(::core::option::Option<
-                                ::bstack_raii::BStackRc<'__mv, #elem, __A>>),
-                            quote!(if __off == 0 {
-                                ::core::option::Option::None
-                            } else {
-                                let __data = unsafe {
-                                    ::bstack_raii::BStackRef::<#elem>::from_range(
-                                        ::bstack_raii::BStackRange::new(__off, #size_elem)) };
-                                let (__d, __c) =
-                                    <#elem as ::bstack_raii::BStackShared>::strong_parts(__data, __alloc)?;
-                                ::core::option::Option::Some(unsafe {
-                                    ::bstack_raii::BStackRc::from_raw(__d, __c, __alloc) })
-                            }),
-                        )
-                    } else {
-                        (
-                            quote!(::bstack_raii::BStackRc<'__mv, #elem, __A>),
-                            quote!({
-                                let __data = unsafe {
-                                    ::bstack_raii::BStackRef::<#elem>::from_range(
-                                        ::bstack_raii::BStackRange::new(__off, #size_elem)) };
-                                let (__d, __c) =
-                                    <#elem as ::bstack_raii::BStackShared>::strong_parts(__data, __alloc)?;
-                                unsafe { ::bstack_raii::BStackRc::from_raw(__d, __c, __alloc) }
-                            }),
-                        )
-                    };
-                    mv_types.push(quote!([#elem_ty; #len]));
-                    mv_recon.push(quote! {
-                        {
-                            let mut __v = ::std::vec::Vec::with_capacity(#len);
-                            for __off in #cap {
-                                __v.push(#push_expr);
-                            }
-                            match <[#elem_ty; #len]>::try_from(__v) {
-                                ::std::result::Result::Ok(__a) => __a,
-                                ::std::result::Result::Err(_) => unreachable!(),
-                            }
+                            ::core::option::Option::Some(#build_one)
                         }
-                    });
+                    }}
+                } else {
+                    quote! {{
+                        let __off = #cap[#k];
+                        #build_one
+                    }}
                 }
-                _ => unreachable!(),
-            }
+            };
+            mv_recon.push(nested_build(&dims, &mv_leaf_ty, &mv_read));
             continue;
         }
 
@@ -1647,6 +1658,140 @@ fn option_inner(ty: &Type) -> Option<&Type> {
         GenericArgument::Type(inner) => Some(inner),
         _ => None,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Nested fixed-size arrays `[[.. [T; N0]; N1]..; Nk]` of block references.
+//
+// A block-reference array — at any nesting depth — is stored **flat** on disk /
+// in an enum payload as `[u64; N0*N1*..*Nk]` (row-major), one `u64` offset per
+// leaf. The runtime rebuilds / consumes the nested `[[..]; ..]` shape of handles
+// through the recursive helpers below, driven by a single flat counter `__k`.
+// Every leaf may be an `Option<T>` (per-element nullability, `0` == `None`); an
+// `Option` wrapping a *whole* sub-array is rejected (only whole-field
+// `Option<[T;N]>` was ever a niche, and that stays unsupported).
+// ---------------------------------------------------------------------------
+
+/// Peel a (possibly nested) `[[..]; ..]` array type into its dimensions
+/// (outer→inner) plus the innermost element and whether that element is a
+/// per-element `Option<T>`. Errors if an `Option` wraps a non-leaf sub-array.
+fn array_shape(ty: &Type) -> syn::Result<(Vec<&Expr>, &Type, bool)> {
+    let mut dims: Vec<&Expr> = Vec::new();
+    let mut cur = ty;
+    while let Type::Array(a) = cur {
+        dims.push(&a.len);
+        cur = &a.elem;
+    }
+    let (leaf, nullable) = match option_inner(cur) {
+        Some(inner) => (inner, true),
+        None => (cur, false),
+    };
+    if let Type::Array(_) = leaf {
+        return Err(Error::new_spanned(
+            cur,
+            "`Option` wrapping a whole sub-array is not supported; move the \
+             `Option` onto the leaf element, e.g. `[[Option<T>; N]; M]`",
+        ));
+    }
+    Ok((dims, leaf, nullable))
+}
+
+/// The product `N0 * N1 * .. * Nk` of the dimensions as a `usize` const
+/// expression (`1usize` when empty) — the flat element count.
+fn dims_prod(dims: &[&Expr]) -> TokenStream {
+    if dims.is_empty() {
+        return quote!(1usize);
+    }
+    let first = dims[0];
+    let mut t = quote!((#first));
+    for d in &dims[1..] {
+        t = quote!(#t * (#d));
+    }
+    t
+}
+
+/// The nested handle-array type `[[.. [leaf; N0]..]; Nk]` for the given
+/// dimensions (outer→inner) around a leaf token type.
+fn nested_ty(dims: &[&Expr], leaf: &TokenStream) -> TokenStream {
+    if dims.is_empty() {
+        return leaf.clone();
+    }
+    let d = dims[0];
+    let inner = nested_ty(&dims[1..], leaf);
+    quote!([#inner; #d])
+}
+
+/// Build the nested array value by reading each leaf in flat, row-major order.
+/// `leaf_read(k)` yields the leaf value expression for flat index ident `k`
+/// (which it must NOT advance — the engine advances it). May be fallible (the
+/// leaf expression may use `?`); the enclosing context must return `Result`.
+fn nested_build(
+    dims: &[&Expr],
+    leaf_ty: &TokenStream,
+    leaf_read: &dyn Fn(&Ident) -> TokenStream,
+) -> TokenStream {
+    let k = format_ident!("__k");
+    let body = nested_build_inner(dims, leaf_ty, 0, &k, leaf_read);
+    quote!({ let mut #k = 0usize; #body })
+}
+
+fn nested_build_inner(
+    dims: &[&Expr],
+    leaf_ty: &TokenStream,
+    depth: usize,
+    k: &Ident,
+    leaf_read: &dyn Fn(&Ident) -> TokenStream,
+) -> TokenStream {
+    if dims.is_empty() {
+        let val = leaf_read(k);
+        return quote!({ let __e = #val; #k += 1; __e });
+    }
+    let d = dims[0];
+    let rest = &dims[1..];
+    let vv = format_ident!("__bv{depth}");
+    let inner_ty = nested_ty(rest, leaf_ty);
+    let body = nested_build_inner(rest, leaf_ty, depth + 1, k, leaf_read);
+    quote!({
+        let mut #vv = ::std::vec::Vec::with_capacity(#d);
+        for _ in 0usize..(#d) {
+            #vv.push(#body);
+        }
+        match <[#inner_ty; #d]>::try_from(#vv) {
+            ::std::result::Result::Ok(__a) => __a,
+            ::std::result::Result::Err(_) => unreachable!(),
+        }
+    })
+}
+
+/// Consume the nested array `val`, invoking `leaf_write(k, leaf)` for each leaf
+/// in flat, row-major order (`k` is the flat-index ident, `leaf` the moved
+/// element binding). The engine advances `k`.
+fn nested_consume(
+    dims: &[&Expr],
+    val: &TokenStream,
+    leaf_write: &dyn Fn(&Ident, &Ident) -> TokenStream,
+) -> TokenStream {
+    let k = format_ident!("__k");
+    let body = nested_consume_inner(dims, val, 0, &k, leaf_write);
+    quote!({ let mut #k = 0usize; #body })
+}
+
+fn nested_consume_inner(
+    dims: &[&Expr],
+    val: &TokenStream,
+    depth: usize,
+    k: &Ident,
+    leaf_write: &dyn Fn(&Ident, &Ident) -> TokenStream,
+) -> TokenStream {
+    if dims.is_empty() {
+        let leaf = format_ident!("__leaf");
+        let w = leaf_write(k, &leaf);
+        return quote!({ let #leaf = #val; #w #k += 1; });
+    }
+    let rest = &dims[1..];
+    let cv = format_ident!("__cn{depth}");
+    let inner = nested_consume_inner(rest, &quote!(#cv), depth + 1, k, leaf_write);
+    quote!(for #cv in #val { #inner })
 }
 
 /// Generate the reader method for one field. `nullable` (an `Option<_>` field)
@@ -2646,261 +2791,417 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                 // Annotated **array** variant `#[..] V([T; N])`: N block references
                 // stored inline in the payload as `[u64; N]` (N*8 bytes), the
                 // per-element mirror of a `#[bstack_owned/strong/weak/ref] V(T)`.
-                if let Type::Array(__arr) = ty {
-                    let elem = &__arr.elem;
-                    let len = &__arr.len;
+                // Annotated **array** variant `#[..] V([T; N])` — possibly nested
+                // `[[..]; ..]`, and (for owned/strong/ref) possibly with `Option<T>`
+                // leaves. Block refs are stored **flat** in the payload as
+                // `[u64; TOTAL]` (TOTAL*8 bytes), the per-element mirror of a
+                // `#[bstack_owned/strong/weak/ref] V(T)`; `#[embed]` stores each
+                // child's whole on-disk form verbatim.
+                if let Type::Array(_) = ty {
+                    let (dims, elem, elem_nullable) = array_shape(ty)?;
+                    let total = dims_prod(&dims);
+                    // Flat byte read/write of leaf `#k`'s `u64` in the payload.
+                    let pl_off = |k: &Ident| {
+                        quote!(u64::from_le_bytes(
+                            __pl[(#k) * 8..(#k) * 8 + 8].try_into().unwrap()))
+                    };
+                    let pl_put = |k: &Ident, off: TokenStream| {
+                        quote!(__pl[(#k) * 8..(#k) * 8 + 8]
+                            .copy_from_slice(&(#off).to_le_bytes());)
+                    };
+
+                    // ---- #[embed] array: verbatim child on-disk forms ----
+                    if kind == Kind::Embed {
+                        if elem_nullable {
+                            return Err(Error::new_spanned(
+                                ty,
+                                "#[embed] does not support `Option`",
+                            ));
+                        }
+                        enum_has_embed = true;
+                        let child = elem;
+                        let co = quote!(<#child as ::bstack_raii::BStackBlock>::OnDisk);
+                        payload_sizes.push(quote!((#total) * ::core::mem::size_of::<#co>()));
+
+                        let data_leaf = quote!(::bstack_raii::BStackOwned<#child>);
+                        let data_ty_nested = nested_ty(&dims, &data_leaf);
+                        data_variants.push(quote!(#vname(#data_ty_nested),));
+                        let view_ty_nested = nested_ty(&dims, &quote!(#child));
+                        view_variants.push(quote!(#vname(#view_ty_nested),));
+
+                        // new: push one copy entry per flat slot; payload stays zeroed.
+                        let cap_write = |k: &Ident, leaf: &Ident| {
+                            quote! {
+                                let __h = #leaf.into_inner();
+                                let __cr = ::bstack_raii::BStackBlock::range(&__h);
+                                __embed_copy.push((
+                                    __cr,
+                                    ::core::mem::size_of::<#co>() as u64,
+                                    (#k as u64) * ::core::mem::size_of::<#co>() as u64,
+                                ));
+                            }
+                        };
+                        let consume = nested_consume(&dims, &quote!(__arr), &cap_write);
+                        new_arms.push(quote! {
+                            #data::#vname(__arr) => {
+                                #consume
+                                (#disc, [0u8; Self::__PAYLOAD])
+                            }
+                        });
+
+                        // read (view): nested child handles into the payload slots.
+                        let read_leaf = |k: &Ident| {
+                            quote!(<#child as ::bstack_raii::BStackBlock>::from_range(
+                                ::bstack_raii::BStackRange::new(
+                                    __base + (#k as u64) * __step, __step)))
+                        };
+                        let read_body = nested_build(&dims, &quote!(#child), &read_leaf);
+                        read_arms.push(quote! {
+                            #disc => {
+                                let __base = self.0.start()
+                                    + ::core::mem::offset_of!(#on_disk, __bstack_payload) as u64;
+                                let __step = ::core::mem::size_of::<#co>() as u64;
+                                #view::#vname(#read_body)
+                            }
+                        });
+
+                        // move: re-home each embedded child to a fresh allocation.
+                        let mv_read = |k: &Ident| {
+                            quote! {{
+                                let __start = (#k) * ::core::mem::size_of::<#co>();
+                                let mut __slice =
+                                    __alloc.alloc(::core::mem::size_of::<#co>() as u64)?;
+                                let __r = __slice.as_range();
+                                if let ::std::result::Result::Err(__e) = __slice.write_range(
+                                    0, &__pl[__start..__start + ::core::mem::size_of::<#co>()])
+                                {
+                                    let _ = __alloc.dealloc(__slice);
+                                    return ::std::result::Result::Err(__e);
+                                }
+                                unsafe { ::bstack_raii::BStackOwned::from_raw(
+                                    <#child as ::bstack_raii::BStackBlock>::from_range(__r)) }
+                            }}
+                        };
+                        let mv_body = nested_build(&dims, &data_leaf, &mv_read);
+                        move_arms.push(quote!(#disc => #data::#vname(#mv_body),));
+
+                        // teardown: free each embedded child's children in place.
+                        drop_arms.push(quote! {
+                            #disc => {
+                                let __base = __range.start()
+                                    + ::core::mem::offset_of!(#on_disk, __bstack_payload) as u64;
+                                let __step = ::core::mem::size_of::<#co>() as u64;
+                                for __k in 0usize..(#total) {
+                                    let __embed = ::bstack_raii::BStackRange::new(
+                                        __base + (__k as u64) * __step, __step);
+                                    <#child>::__bstack_drop_children(__embed, allocator)?;
+                                }
+                            }
+                        });
+
+                        // clone: fold each embedded child inline; patch payload bytes.
+                        clone_arms.push(quote! {
+                            #disc => {
+                                let __base = self.0.start()
+                                    + ::core::mem::offset_of!(#on_disk, __bstack_payload) as u64;
+                                let __step = ::core::mem::size_of::<#co>() as u64;
+                                for __k in 0usize..(#total) {
+                                    let __child = <#child as ::bstack_raii::BStackBlock>::from_range(
+                                        ::bstack_raii::BStackRange::new(
+                                            __base + (__k as u64) * __step, __step));
+                                    let __fixed =
+                                        __child.__bstack_clone_children_inplace(allocator, __plan)?;
+                                    let __start = (__k) * ::core::mem::size_of::<#co>();
+                                    __pl[__start..__start + ::core::mem::size_of::<#co>()]
+                                        .copy_from_slice(::bstack_raii::bytemuck::bytes_of(&__fixed));
+                                }
+                            }
+                        });
+                        continue;
+                    }
+
+                    // ---- owned / strong / weak / ref: flat `[u64; TOTAL]` ----
                     let elem_size = quote!(::core::mem::size_of::<
                         <#elem as ::bstack_raii::BStackBlock>::OnDisk>() as u64);
-                    payload_sizes.push(quote!((#len) * 8));
-                    match kind {
-                        Kind::Owned => {
-                            data_variants
-                                .push(quote!(#vname([::bstack_raii::BStackOwned<#elem>; #len]),));
-                            view_variants.push(quote!(#vname([#elem; #len]),));
-                            new_arms.push(quote! {
-                                #data::#vname(__arr) => {
-                                    let mut __pl = [0u8; Self::__PAYLOAD];
-                                    for (__i, __owned) in __arr.into_iter().enumerate() {
-                                        let __off = ::bstack_raii::BStackBlock::range(
-                                            &__owned.into_inner()).start();
-                                        __pl[__i * 8..__i * 8 + 8]
-                                            .copy_from_slice(&__off.to_le_bytes());
-                                    }
-                                    (#disc, __pl)
+                    payload_sizes.push(quote!((#total) * 8));
+
+                    if kind == Kind::Weak {
+                        has_shared = true;
+                        has_weak = true;
+                        let ctrl_ty = quote!(<#elem as ::bstack_raii::BStackWeakable>::Control);
+                        let ctrl_size = quote!(::core::mem::size_of::<#ctrl_ty>() as u64);
+
+                        let data_leaf = quote!(::bstack_raii::BStackWeak<'__e, #elem, __A>);
+                        let data_ty_nested = nested_ty(&dims, &data_leaf);
+                        data_variants.push(quote!(#vname(#data_ty_nested),));
+                        let view_leaf =
+                            quote!(::core::option::Option<::bstack_raii::BStackRc<'__e, #elem, __A>>);
+                        let view_ty_nested = nested_ty(&dims, &view_leaf);
+                        view_variants.push(quote!(#vname(#view_ty_nested),));
+
+                        // new: consume nested weaks → control offsets.
+                        let cap_write = |k: &Ident, leaf: &Ident| {
+                            pl_put(k, quote!(#leaf.into_raw().into_range().start()))
+                        };
+                        let consume = nested_consume(&dims, &quote!(__arr), &cap_write);
+                        new_arms.push(quote! {
+                            #data::#vname(__arr) => {
+                                let mut __pl = [0u8; Self::__PAYLOAD];
+                                #consume
+                                (#disc, __pl)
+                            }
+                        });
+
+                        // read: upgrade each control offset (fallible).
+                        let view_leaf_e = view_leaf.clone();
+                        let read_leaf = |k: &Ident| {
+                            let off = pl_off(k);
+                            quote! {{
+                                let __off = #off;
+                                let __ctrl = unsafe {
+                                    ::bstack_raii::BStackRef::<#ctrl_ty>::from_range(
+                                        ::bstack_raii::BStackRange::new(__off, #ctrl_size)) };
+                                let __wk = unsafe {
+                                    ::bstack_raii::BStackWeak::<#elem, __A>::from_raw(__ctrl, allocator) };
+                                let __up = __wk.upgrade()?;
+                                let _ = __wk.into_raw();
+                                __up
+                            }}
+                        };
+                        let read_body = nested_build(&dims, &view_leaf_e, &read_leaf);
+                        read_arms.push(quote!(#disc => #view::#vname(#read_body),));
+
+                        // move: nested `BStackWeak<'__mv>` from control offsets.
+                        let mv_leaf = quote!(::bstack_raii::BStackWeak<'__mv, #elem, __A>);
+                        let mv_read = |k: &Ident| {
+                            let off = pl_off(k);
+                            quote! {{
+                                let __ctrl = unsafe {
+                                    ::bstack_raii::BStackRef::<#ctrl_ty>::from_range(
+                                        ::bstack_raii::BStackRange::new(#off, #ctrl_size)) };
+                                unsafe { ::bstack_raii::BStackWeak::from_raw(__ctrl, __alloc) }
+                            }}
+                        };
+                        let mv_body = nested_build(&dims, &mv_leaf, &mv_read);
+                        move_arms.push(quote!(#disc => #data::#vname(#mv_body),));
+
+                        // teardown: release each weak.
+                        drop_arms.push(quote! {
+                            #disc => {
+                                for __k in 0usize..(#total) {
+                                    let __off = u64::from_le_bytes(
+                                        __pl[__k * 8..__k * 8 + 8].try_into().unwrap());
+                                    let __ctrl = unsafe {
+                                        ::bstack_raii::BStackRef::<#ctrl_ty>::from_range(
+                                            ::bstack_raii::BStackRange::new(__off, #ctrl_size)) };
+                                    ::bstack_raii::WeakRef::<#elem>(__ctrl).bstack_drop(allocator)?;
                                 }
-                            });
-                            read_arms.push(quote! {
-                                #disc => #view::#vname(::core::array::from_fn(|__i| {
+                            }
+                        });
+                        // clone: bump each weak.
+                        clone_arms.push(quote! {
+                            #disc => {
+                                for __k in 0usize..(#total) {
                                     let __off = u64::from_le_bytes(
-                                        __pl[__i * 8..__i * 8 + 8].try_into().unwrap());
-                                    <#elem as ::bstack_raii::BStackBlock>::from_range(
-                                        ::bstack_raii::BStackRange::new(__off, #elem_size))
-                                })),
-                            });
-                            move_arms.push(quote! {
-                                #disc => #data::#vname(::core::array::from_fn(|__i| {
+                                        __pl[__k * 8..__k * 8 + 8].try_into().unwrap());
+                                    __plan.bump_weak(__off);
+                                }
+                            }
+                        });
+                        continue;
+                    }
+
+                    // owned / strong / ref
+                    if kind == Kind::Strong {
+                        has_shared = true;
+                    }
+                    let view_leaf = if elem_nullable {
+                        quote!(::core::option::Option<#elem>)
+                    } else {
+                        quote!(#elem)
+                    };
+                    let view_ty_nested = nested_ty(&dims, &view_leaf);
+                    view_variants.push(quote!(#vname(#view_ty_nested),));
+
+                    let data_leaf = match kind {
+                        Kind::Owned => quote!(::bstack_raii::BStackOwned<#elem>),
+                        Kind::Strong => quote!(::bstack_raii::BStackRc<'__e, #elem, __A>),
+                        Kind::Ref => quote!(::bstack_raii::BStackRef<#elem>),
+                        _ => unreachable!(),
+                    };
+                    let data_leaf_full = if elem_nullable {
+                        quote!(::core::option::Option<#data_leaf>)
+                    } else {
+                        data_leaf.clone()
+                    };
+                    let data_ty_nested = nested_ty(&dims, &data_leaf_full);
+                    data_variants.push(quote!(#vname(#data_ty_nested),));
+
+                    let off_of = |h: &Ident| match kind {
+                        Kind::Owned => quote!({
+                            let __h = #h.into_inner();
+                            ::bstack_raii::BStackBlock::range(&__h).start()
+                        }),
+                        Kind::Strong => quote!({
+                            let (__d, _c) = #h.into_raw();
+                            __d.into_range().start()
+                        }),
+                        Kind::Ref => quote!(#h.into_range().start()),
+                        _ => unreachable!(),
+                    };
+                    // new: consume nested handles → offsets.
+                    let cap_write = |k: &Ident, leaf: &Ident| {
+                        if elem_nullable {
+                            let hh = format_ident!("__handle");
+                            let off = off_of(&hh);
+                            let put = pl_put(k, quote!(__off));
+                            quote! {{
+                                let __off: u64 = match #leaf {
+                                    ::core::option::Option::Some(#hh) => #off,
+                                    ::core::option::Option::None => 0u64,
+                                };
+                                #put
+                            }}
+                        } else {
+                            pl_put(k, off_of(leaf))
+                        }
+                    };
+                    let consume = nested_consume(&dims, &quote!(__arr), &cap_write);
+                    new_arms.push(quote! {
+                        #data::#vname(__arr) => {
+                            let mut __pl = [0u8; Self::__PAYLOAD];
+                            #consume
+                            (#disc, __pl)
+                        }
+                    });
+
+                    // read (view): nested block views.
+                    let read_leaf = |k: &Ident| {
+                        let off = pl_off(k);
+                        let build = quote!(<#elem as ::bstack_raii::BStackBlock>::from_range(
+                            ::bstack_raii::BStackRange::new(__off, #elem_size)));
+                        if elem_nullable {
+                            quote! {{
+                                let __off = #off;
+                                if __off == 0 { ::core::option::Option::None }
+                                else { ::core::option::Option::Some(#build) }
+                            }}
+                        } else {
+                            quote!({ let __off = #off; #build })
+                        }
+                    };
+                    let read_body = nested_build(&dims, &view_leaf, &read_leaf);
+                    read_arms.push(quote!(#disc => #view::#vname(#read_body),));
+
+                    // move.
+                    let mv_leaf_base = match kind {
+                        Kind::Owned => quote!(::bstack_raii::BStackOwned<#elem>),
+                        Kind::Ref => quote!(::bstack_raii::BStackRef<#elem>),
+                        Kind::Strong => quote!(::bstack_raii::BStackRc<'__mv, #elem, __A>),
+                        _ => unreachable!(),
+                    };
+                    let mv_leaf_ty = if elem_nullable {
+                        quote!(::core::option::Option<#mv_leaf_base>)
+                    } else {
+                        mv_leaf_base.clone()
+                    };
+                    let build_one = match kind {
+                        Kind::Owned => quote!(unsafe {
+                            ::bstack_raii::BStackOwned::from_raw(
+                                <#elem as ::bstack_raii::BStackBlock>::from_range(
+                                    ::bstack_raii::BStackRange::new(__off, #elem_size)))
+                        }),
+                        Kind::Ref => quote!(unsafe {
+                            ::bstack_raii::BStackRef::<#elem>::from_range(
+                                ::bstack_raii::BStackRange::new(__off, #elem_size))
+                        }),
+                        Kind::Strong => quote!({
+                            let __data = unsafe {
+                                ::bstack_raii::BStackRef::<#elem>::from_range(
+                                    ::bstack_raii::BStackRange::new(__off, #elem_size)) };
+                            let (__d, __c) =
+                                <#elem as ::bstack_raii::BStackShared>::strong_parts(__data, __alloc)?;
+                            unsafe { ::bstack_raii::BStackRc::from_raw(__d, __c, __alloc) }
+                        }),
+                        _ => unreachable!(),
+                    };
+                    let mv_read = |k: &Ident| {
+                        let off = pl_off(k);
+                        if elem_nullable {
+                            quote! {{
+                                let __off = #off;
+                                if __off == 0 { ::core::option::Option::None }
+                                else { ::core::option::Option::Some(#build_one) }
+                            }}
+                        } else {
+                            quote!({ let __off = #off; #build_one })
+                        }
+                    };
+                    let mv_body = nested_build(&dims, &mv_leaf_ty, &mv_read);
+                    move_arms.push(quote!(#disc => #data::#vname(#mv_body),));
+
+                    // teardown (owned/strong; ref owns nothing).
+                    if kind != Kind::Ref {
+                        let per = match kind {
+                            Kind::Owned => quote! {
+                                ::bstack_raii::OwnedRef(__child).bstack_drop(allocator)?;
+                            },
+                            Kind::Strong => quote! {
+                                <#elem as ::bstack_raii::BStackShared>::drop_strong_ref(
+                                    __child, allocator)?;
+                            },
+                            _ => unreachable!(),
+                        };
+                        drop_arms.push(quote! {
+                            #disc => {
+                                for __k in 0usize..(#total) {
                                     let __off = u64::from_le_bytes(
-                                        __pl[__i * 8..__i * 8 + 8].try_into().unwrap());
-                                    unsafe { ::bstack_raii::BStackOwned::from_raw(
-                                        <#elem as ::bstack_raii::BStackBlock>::from_range(
-                                            ::bstack_raii::BStackRange::new(__off, #elem_size))) }
-                                })),
-                            });
-                            drop_arms.push(quote! {
-                                #disc => {
-                                    for __i in 0..#len {
-                                        let __off = u64::from_le_bytes(
-                                            __pl[__i * 8..__i * 8 + 8].try_into().unwrap());
+                                        __pl[__k * 8..__k * 8 + 8].try_into().unwrap());
+                                    if __off != 0 {
                                         let __child = unsafe {
                                             ::bstack_raii::BStackRef::<#elem>::from_range(
                                                 ::bstack_raii::BStackRange::new(__off, #elem_size)) };
-                                        ::bstack_raii::OwnedRef(__child).bstack_drop(allocator)?;
+                                        #per
                                     }
                                 }
-                            });
-                            clone_arms.push(quote! {
-                                #disc => {
-                                    for __i in 0..#len {
-                                        let __off = u64::from_le_bytes(
-                                            __pl[__i * 8..__i * 8 + 8].try_into().unwrap());
+                            }
+                        });
+                    }
+
+                    // clone: owned deep-clones each; strong bumps each; ref aliases.
+                    match kind {
+                        Kind::Owned => clone_arms.push(quote! {
+                            #disc => {
+                                for __k in 0usize..(#total) {
+                                    let __off = u64::from_le_bytes(
+                                        __pl[__k * 8..__k * 8 + 8].try_into().unwrap());
+                                    if __off != 0 {
                                         let __child =
                                             <#elem as ::bstack_raii::BStackBlock>::from_range(
                                                 ::bstack_raii::BStackRange::new(__off, #elem_size));
                                         let __new = __child.__bstack_clone_into(allocator, __plan)?;
-                                        __pl[__i * 8..__i * 8 + 8]
+                                        __pl[__k * 8..__k * 8 + 8]
                                             .copy_from_slice(&__new.start().to_le_bytes());
                                     }
                                 }
-                            });
-                        }
-                        Kind::Ref => {
-                            data_variants
-                                .push(quote!(#vname([::bstack_raii::BStackRef<#elem>; #len]),));
-                            view_variants.push(quote!(#vname([#elem; #len]),));
-                            new_arms.push(quote! {
-                                #data::#vname(__arr) => {
-                                    let mut __pl = [0u8; Self::__PAYLOAD];
-                                    for (__i, __r) in __arr.into_iter().enumerate() {
-                                        __pl[__i * 8..__i * 8 + 8]
-                                            .copy_from_slice(&__r.into_range().start().to_le_bytes());
-                                    }
-                                    (#disc, __pl)
-                                }
-                            });
-                            read_arms.push(quote! {
-                                #disc => #view::#vname(::core::array::from_fn(|__i| {
+                            }
+                        }),
+                        Kind::Strong => clone_arms.push(quote! {
+                            #disc => {
+                                for __k in 0usize..(#total) {
                                     let __off = u64::from_le_bytes(
-                                        __pl[__i * 8..__i * 8 + 8].try_into().unwrap());
-                                    <#elem as ::bstack_raii::BStackBlock>::from_range(
-                                        ::bstack_raii::BStackRange::new(__off, #elem_size))
-                                })),
-                            });
-                            move_arms.push(quote! {
-                                #disc => #data::#vname(::core::array::from_fn(|__i| {
-                                    let __off = u64::from_le_bytes(
-                                        __pl[__i * 8..__i * 8 + 8].try_into().unwrap());
-                                    unsafe { ::bstack_raii::BStackRef::<#elem>::from_range(
-                                        ::bstack_raii::BStackRange::new(__off, #elem_size)) }
-                                })),
-                            });
-                            // A ref owns nothing: no teardown, and clone aliases
-                            // (the payload offsets are copied verbatim).
-                        }
-                        Kind::Strong => {
-                            has_shared = true;
-                            data_variants.push(
-                                quote!(#vname([::bstack_raii::BStackRc<'__e, #elem, __A>; #len]),),
-                            );
-                            view_variants.push(quote!(#vname([#elem; #len]),));
-                            new_arms.push(quote! {
-                                #data::#vname(__arr) => {
-                                    let mut __pl = [0u8; Self::__PAYLOAD];
-                                    for (__i, __rc) in __arr.into_iter().enumerate() {
-                                        let (__d, _c) = __rc.into_raw();
-                                        __pl[__i * 8..__i * 8 + 8]
-                                            .copy_from_slice(&__d.into_range().start().to_le_bytes());
-                                    }
-                                    (#disc, __pl)
-                                }
-                            });
-                            read_arms.push(quote! {
-                                #disc => #view::#vname(::core::array::from_fn(|__i| {
-                                    let __off = u64::from_le_bytes(
-                                        __pl[__i * 8..__i * 8 + 8].try_into().unwrap());
-                                    <#elem as ::bstack_raii::BStackBlock>::from_range(
-                                        ::bstack_raii::BStackRange::new(__off, #elem_size))
-                                })),
-                            });
-                            move_arms.push(quote! {
-                                #disc => {
-                                    let mut __v = ::std::vec::Vec::with_capacity(#len);
-                                    for __i in 0..#len {
-                                        let __off = u64::from_le_bytes(
-                                            __pl[__i * 8..__i * 8 + 8].try_into().unwrap());
-                                        let __data = unsafe {
-                                            ::bstack_raii::BStackRef::<#elem>::from_range(
-                                                ::bstack_raii::BStackRange::new(__off, #elem_size)) };
-                                        let (__d, __c) =
-                                            <#elem as ::bstack_raii::BStackShared>::strong_parts(__data, __alloc)?;
-                                        __v.push(unsafe {
-                                            ::bstack_raii::BStackRc::from_raw(__d, __c, __alloc) });
-                                    }
-                                    #data::#vname(
-                                        match <[::bstack_raii::BStackRc<'__mv, #elem, __A>; #len]>::try_from(__v) {
-                                            ::std::result::Result::Ok(__a) => __a,
-                                            ::std::result::Result::Err(_) => unreachable!(),
-                                        })
-                                }
-                            });
-                            drop_arms.push(quote! {
-                                #disc => {
-                                    for __i in 0..#len {
-                                        let __off = u64::from_le_bytes(
-                                            __pl[__i * 8..__i * 8 + 8].try_into().unwrap());
-                                        let __data = unsafe {
-                                            ::bstack_raii::BStackRef::<#elem>::from_range(
-                                                ::bstack_raii::BStackRange::new(__off, #elem_size)) };
-                                        <#elem as ::bstack_raii::BStackShared>::drop_strong_ref(
-                                            __data, allocator)?;
-                                    }
-                                }
-                            });
-                            clone_arms.push(quote! {
-                                #disc => {
-                                    for __i in 0..#len {
-                                        let __off = u64::from_le_bytes(
-                                            __pl[__i * 8..__i * 8 + 8].try_into().unwrap());
+                                        __pl[__k * 8..__k * 8 + 8].try_into().unwrap());
+                                    if __off != 0 {
                                         let __data = unsafe {
                                             ::bstack_raii::BStackRef::<#elem>::from_range(
                                                 ::bstack_raii::BStackRange::new(__off, #elem_size)) };
                                         __plan.bump_strong(__data, allocator)?;
                                     }
                                 }
-                            });
-                        }
-                        Kind::Weak => {
-                            has_shared = true;
-                            has_weak = true;
-                            let ctrl_size = quote!(::core::mem::size_of::<
-                                <#elem as ::bstack_raii::BStackWeakable>::Control>() as u64);
-                            let ctrl_ty = quote!(<#elem as ::bstack_raii::BStackWeakable>::Control);
-                            data_variants.push(
-                                quote!(#vname([::bstack_raii::BStackWeak<'__e, #elem, __A>; #len]),),
-                            );
-                            view_variants.push(quote!(#vname([::core::option::Option<
-                                ::bstack_raii::BStackRc<'__e, #elem, __A>>; #len]),));
-                            new_arms.push(quote! {
-                                #data::#vname(__arr) => {
-                                    let mut __pl = [0u8; Self::__PAYLOAD];
-                                    for (__i, __w) in __arr.into_iter().enumerate() {
-                                        __pl[__i * 8..__i * 8 + 8].copy_from_slice(
-                                            &__w.into_raw().into_range().start().to_le_bytes());
-                                    }
-                                    (#disc, __pl)
-                                }
-                            });
-                            read_arms.push(quote! {
-                                #disc => {
-                                    let mut __v = ::std::vec::Vec::with_capacity(#len);
-                                    for __i in 0..#len {
-                                        let __off = u64::from_le_bytes(
-                                            __pl[__i * 8..__i * 8 + 8].try_into().unwrap());
-                                        let __ctrl = unsafe {
-                                            ::bstack_raii::BStackRef::<#ctrl_ty>::from_range(
-                                                ::bstack_raii::BStackRange::new(__off, #ctrl_size)) };
-                                        let __wk = unsafe {
-                                            ::bstack_raii::BStackWeak::<#elem, __A>::from_raw(__ctrl, allocator) };
-                                        let __up = __wk.upgrade()?;
-                                        let _ = __wk.into_raw();
-                                        __v.push(__up);
-                                    }
-                                    #view::#vname(
-                                        match <[::core::option::Option<
-                                            ::bstack_raii::BStackRc<'__e, #elem, __A>>; #len]>::try_from(__v) {
-                                            ::std::result::Result::Ok(__a) => __a,
-                                            ::std::result::Result::Err(_) => unreachable!(),
-                                        })
-                                }
-                            });
-                            move_arms.push(quote! {
-                                #disc => #data::#vname(::core::array::from_fn(|__i| {
-                                    let __off = u64::from_le_bytes(
-                                        __pl[__i * 8..__i * 8 + 8].try_into().unwrap());
-                                    let __ctrl = unsafe {
-                                        ::bstack_raii::BStackRef::<#ctrl_ty>::from_range(
-                                            ::bstack_raii::BStackRange::new(__off, #ctrl_size)) };
-                                    unsafe { ::bstack_raii::BStackWeak::from_raw(__ctrl, __alloc) }
-                                })),
-                            });
-                            drop_arms.push(quote! {
-                                #disc => {
-                                    for __i in 0..#len {
-                                        let __off = u64::from_le_bytes(
-                                            __pl[__i * 8..__i * 8 + 8].try_into().unwrap());
-                                        let __ctrl = unsafe {
-                                            ::bstack_raii::BStackRef::<#ctrl_ty>::from_range(
-                                                ::bstack_raii::BStackRange::new(__off, #ctrl_size)) };
-                                        ::bstack_raii::WeakRef::<#elem>(__ctrl).bstack_drop(allocator)?;
-                                    }
-                                }
-                            });
-                            clone_arms.push(quote! {
-                                #disc => {
-                                    for __i in 0..#len {
-                                        let __off = u64::from_le_bytes(
-                                            __pl[__i * 8..__i * 8 + 8].try_into().unwrap());
-                                        __plan.bump_weak(__off);
-                                    }
-                                }
-                            });
-                        }
-                        Kind::Embed => {
-                            return Err(Error::new_spanned(
-                                ty,
-                                "#[embed] array enum variants are not yet supported",
-                            ));
-                        }
-                        Kind::Pod => unreachable!("guarded out above"),
+                            }
+                        }),
+                        // Ref: aliased — payload offsets copied verbatim.
+                        _ => {}
                     }
                     continue;
                 }
@@ -3101,9 +3402,10 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                             #data::#vname(__v) => {
                                 let __h = __v.into_inner();
                                 let __cr = ::bstack_raii::BStackBlock::range(&__h);
-                                __embed_copy = ::core::option::Option::Some((
+                                __embed_copy.push((
                                     __cr,
                                     ::core::mem::size_of::<#co>() as u64,
+                                    0u64,
                                 ));
                                 (#disc, [0u8; Self::__PAYLOAD])
                             }
@@ -3316,15 +3618,19 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
     // `BStack::copy`s the child into the payload and frees its shell.
     let (embed_decl, embed_post) = if enum_has_embed {
         (
+            // Each entry: (child source range, byte size, destination offset WITHIN
+            // the payload). A scalar `#[embed] V(Child)` pushes one entry at offset
+            // 0; an `#[embed] V([Child; N])` (or nested) pushes one per flat slot.
             quote!(let mut __embed_copy:
-                ::core::option::Option<(::bstack_raii::BStackRange, u64)> =
-                ::core::option::Option::None;),
+                ::std::vec::Vec<(::bstack_raii::BStackRange, u64, u64)> =
+                ::std::vec::Vec::new();),
             quote! {
-                if let ::core::option::Option::Some((__cr, __sz)) = __embed_copy {
+                for (__cr, __sz, __doff) in __embed_copy {
                     allocator.stack().copy(
                         __cr.start(),
                         __data.start()
-                            + ::core::mem::offset_of!(#on_disk, __bstack_payload) as u64,
+                            + ::core::mem::offset_of!(#on_disk, __bstack_payload) as u64
+                            + __doff,
                         __sz,
                     )?;
                     unsafe { ::bstack_raii::dealloc_range(allocator, __cr)?; }
