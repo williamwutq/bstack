@@ -2818,3 +2818,165 @@ fn macro_embed_array() {
         m.bstack_drop(&alloc).unwrap();
     }
 }
+
+#[bstack_enum]
+enum ArrEnum {
+    Empty,
+    #[bstack_owned]
+    Leaves([MacroLeaf; 2]),
+}
+
+#[test]
+fn macro_enum_owned_array() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let e = ArrEnum::new(
+        &alloc,
+        ArrEnumData::Leaves([
+            MacroLeaf::new(&alloc, 10).unwrap(),
+            MacroLeaf::new(&alloc, 20).unwrap(),
+        ]),
+    )
+    .unwrap();
+    match e.handle().read(&alloc).unwrap() {
+        ArrEnumView::Leaves(arr) => {
+            assert_eq!(arr[0].val(stack).unwrap(), 10);
+            assert_eq!(arr[1].val(stack).unwrap(), 20);
+        }
+        _ => panic!("expected Leaves"),
+    }
+
+    // Clone deep-copies each element.
+    let clone = e.try_clone_in(&alloc).unwrap();
+    match clone.handle().read(&alloc).unwrap() {
+        ArrEnumView::Leaves(arr) => assert_eq!(arr[0].val(stack).unwrap(), 10),
+        _ => panic!("expected Leaves"),
+    }
+    clone.bstack_drop(&alloc).unwrap();
+
+    // Move yields `[BStackOwned<MacroLeaf>; 2]`.
+    match bstack_move!(e, &alloc).unwrap() {
+        ArrEnumData::Leaves(arr) => {
+            assert_eq!(arr[1].handle().val(stack).unwrap(), 20);
+            for l in arr {
+                l.bstack_drop(&alloc).unwrap();
+            }
+        }
+        _ => panic!("expected Leaves"),
+    }
+}
+
+#[bstack_enum]
+enum RefArrEnum {
+    Empty,
+    #[bstack_ref]
+    Refs([MacroLeaf; 2]),
+}
+
+#[test]
+fn macro_enum_ref_array() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+    let l0 = MacroLeaf::new(&alloc, 1).unwrap();
+    let l1 = MacroLeaf::new(&alloc, 2).unwrap();
+    let e = RefArrEnum::new(
+        &alloc,
+        RefArrEnumData::Refs([
+            unsafe { BStackRef::from_range(l0.handle().range()) },
+            unsafe { BStackRef::from_range(l1.handle().range()) },
+        ]),
+    )
+    .unwrap();
+    match e.handle().read(&alloc).unwrap() {
+        RefArrEnumView::Refs(arr) => {
+            assert_eq!(arr[0].val(stack).unwrap(), 1);
+            assert_eq!(arr[1].val(stack).unwrap(), 2);
+        }
+        _ => panic!("expected Refs"),
+    }
+    e.bstack_drop(&alloc).unwrap(); // owns nothing
+    assert_eq!(l0.handle().val(stack).unwrap(), 1);
+    l0.bstack_drop(&alloc).unwrap();
+    l1.bstack_drop(&alloc).unwrap();
+}
+
+#[bstack_enum]
+enum StrongArrEnum {
+    Empty,
+    #[bstack_strong]
+    Shared([MacroStrongChild; 2]),
+}
+
+#[test]
+fn macro_enum_strong_array() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+    let c0 = MacroStrongChild::new(&alloc, 5).unwrap();
+    let c1 = MacroStrongChild::new(&alloc, 6).unwrap();
+    let keep0 = c0.try_clone().unwrap();
+    let e = StrongArrEnum::new(&alloc, StrongArrEnumData::Shared([c0, c1])).unwrap();
+    match e.handle().read(&alloc).unwrap() {
+        StrongArrEnumView::Shared(arr) => assert_eq!(arr[0].val(stack).unwrap(), 5),
+        _ => panic!("expected Shared"),
+    }
+    // Clone re-references each; teardown of both holders returns to keep0's ref.
+    let clone = e.try_clone_in(&alloc).unwrap();
+    clone.bstack_drop(&alloc).unwrap();
+    e.bstack_drop(&alloc).unwrap();
+    assert_eq!(keep0.handle().val(stack).unwrap(), 5);
+    drop(keep0);
+}
+
+#[bstack_enum]
+enum WeakArrEnum {
+    Empty,
+    #[bstack_weak]
+    Weaks([MacroStrongChild; 2]),
+}
+
+#[test]
+fn macro_enum_weak_array() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+    let c0 = MacroStrongChild::new(&alloc, 5).unwrap();
+    let c1 = MacroStrongChild::new(&alloc, 6).unwrap();
+    let e = WeakArrEnum::new(
+        &alloc,
+        WeakArrEnumData::Weaks([c0.downgrade().unwrap(), c1.downgrade().unwrap()]),
+    )
+    .unwrap();
+    match e.handle().read(&alloc).unwrap() {
+        WeakArrEnumView::Weaks(arr) => {
+            assert_eq!(arr[0].as_ref().unwrap().handle().val(stack).unwrap(), 5);
+            assert_eq!(arr[1].as_ref().unwrap().handle().val(stack).unwrap(), 6);
+        }
+        _ => panic!("expected Weaks"),
+    }
+    e.bstack_drop(&alloc).unwrap(); // releases the weak refs
+    assert_eq!(c0.handle().val(stack).unwrap(), 5);
+    drop(c0);
+    drop(c1);
+}
+
+#[bstack_enum]
+enum PodArrEnum {
+    Empty,
+    Bytes([u16; 3]),
+}
+
+#[test]
+fn macro_enum_pod_array() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let e = PodArrEnum::new(&alloc, PodArrEnumData::Bytes([7, 8, 9])).unwrap();
+    match e.handle().read(&alloc).unwrap() {
+        PodArrEnumView::Bytes(a) => assert_eq!(a, [7u16, 8, 9]),
+        _ => panic!("expected Bytes"),
+    }
+    e.bstack_drop(&alloc).unwrap();
+}

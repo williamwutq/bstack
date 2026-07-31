@@ -2642,6 +2642,269 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
             Fields::Unnamed(f) if f.unnamed.len() == 1 && kind != Kind::Pod => {
                 needs_payload = true;
                 let ty = &f.unnamed.first().unwrap().ty;
+
+                // Annotated **array** variant `#[..] V([T; N])`: N block references
+                // stored inline in the payload as `[u64; N]` (N*8 bytes), the
+                // per-element mirror of a `#[bstack_owned/strong/weak/ref] V(T)`.
+                if let Type::Array(__arr) = ty {
+                    let elem = &__arr.elem;
+                    let len = &__arr.len;
+                    let elem_size = quote!(::core::mem::size_of::<
+                        <#elem as ::bstack_raii::BStackBlock>::OnDisk>() as u64);
+                    payload_sizes.push(quote!((#len) * 8));
+                    match kind {
+                        Kind::Owned => {
+                            data_variants
+                                .push(quote!(#vname([::bstack_raii::BStackOwned<#elem>; #len]),));
+                            view_variants.push(quote!(#vname([#elem; #len]),));
+                            new_arms.push(quote! {
+                                #data::#vname(__arr) => {
+                                    let mut __pl = [0u8; Self::__PAYLOAD];
+                                    for (__i, __owned) in __arr.into_iter().enumerate() {
+                                        let __off = ::bstack_raii::BStackBlock::range(
+                                            &__owned.into_inner()).start();
+                                        __pl[__i * 8..__i * 8 + 8]
+                                            .copy_from_slice(&__off.to_le_bytes());
+                                    }
+                                    (#disc, __pl)
+                                }
+                            });
+                            read_arms.push(quote! {
+                                #disc => #view::#vname(::core::array::from_fn(|__i| {
+                                    let __off = u64::from_le_bytes(
+                                        __pl[__i * 8..__i * 8 + 8].try_into().unwrap());
+                                    <#elem as ::bstack_raii::BStackBlock>::from_range(
+                                        ::bstack_raii::BStackRange::new(__off, #elem_size))
+                                })),
+                            });
+                            move_arms.push(quote! {
+                                #disc => #data::#vname(::core::array::from_fn(|__i| {
+                                    let __off = u64::from_le_bytes(
+                                        __pl[__i * 8..__i * 8 + 8].try_into().unwrap());
+                                    unsafe { ::bstack_raii::BStackOwned::from_raw(
+                                        <#elem as ::bstack_raii::BStackBlock>::from_range(
+                                            ::bstack_raii::BStackRange::new(__off, #elem_size))) }
+                                })),
+                            });
+                            drop_arms.push(quote! {
+                                #disc => {
+                                    for __i in 0..#len {
+                                        let __off = u64::from_le_bytes(
+                                            __pl[__i * 8..__i * 8 + 8].try_into().unwrap());
+                                        let __child = unsafe {
+                                            ::bstack_raii::BStackRef::<#elem>::from_range(
+                                                ::bstack_raii::BStackRange::new(__off, #elem_size)) };
+                                        ::bstack_raii::OwnedRef(__child).bstack_drop(allocator)?;
+                                    }
+                                }
+                            });
+                            clone_arms.push(quote! {
+                                #disc => {
+                                    for __i in 0..#len {
+                                        let __off = u64::from_le_bytes(
+                                            __pl[__i * 8..__i * 8 + 8].try_into().unwrap());
+                                        let __child =
+                                            <#elem as ::bstack_raii::BStackBlock>::from_range(
+                                                ::bstack_raii::BStackRange::new(__off, #elem_size));
+                                        let __new = __child.__bstack_clone_into(allocator, __plan)?;
+                                        __pl[__i * 8..__i * 8 + 8]
+                                            .copy_from_slice(&__new.start().to_le_bytes());
+                                    }
+                                }
+                            });
+                        }
+                        Kind::Ref => {
+                            data_variants
+                                .push(quote!(#vname([::bstack_raii::BStackRef<#elem>; #len]),));
+                            view_variants.push(quote!(#vname([#elem; #len]),));
+                            new_arms.push(quote! {
+                                #data::#vname(__arr) => {
+                                    let mut __pl = [0u8; Self::__PAYLOAD];
+                                    for (__i, __r) in __arr.into_iter().enumerate() {
+                                        __pl[__i * 8..__i * 8 + 8]
+                                            .copy_from_slice(&__r.into_range().start().to_le_bytes());
+                                    }
+                                    (#disc, __pl)
+                                }
+                            });
+                            read_arms.push(quote! {
+                                #disc => #view::#vname(::core::array::from_fn(|__i| {
+                                    let __off = u64::from_le_bytes(
+                                        __pl[__i * 8..__i * 8 + 8].try_into().unwrap());
+                                    <#elem as ::bstack_raii::BStackBlock>::from_range(
+                                        ::bstack_raii::BStackRange::new(__off, #elem_size))
+                                })),
+                            });
+                            move_arms.push(quote! {
+                                #disc => #data::#vname(::core::array::from_fn(|__i| {
+                                    let __off = u64::from_le_bytes(
+                                        __pl[__i * 8..__i * 8 + 8].try_into().unwrap());
+                                    unsafe { ::bstack_raii::BStackRef::<#elem>::from_range(
+                                        ::bstack_raii::BStackRange::new(__off, #elem_size)) }
+                                })),
+                            });
+                            // A ref owns nothing: no teardown, and clone aliases
+                            // (the payload offsets are copied verbatim).
+                        }
+                        Kind::Strong => {
+                            has_shared = true;
+                            data_variants.push(
+                                quote!(#vname([::bstack_raii::BStackRc<'__e, #elem, __A>; #len]),),
+                            );
+                            view_variants.push(quote!(#vname([#elem; #len]),));
+                            new_arms.push(quote! {
+                                #data::#vname(__arr) => {
+                                    let mut __pl = [0u8; Self::__PAYLOAD];
+                                    for (__i, __rc) in __arr.into_iter().enumerate() {
+                                        let (__d, _c) = __rc.into_raw();
+                                        __pl[__i * 8..__i * 8 + 8]
+                                            .copy_from_slice(&__d.into_range().start().to_le_bytes());
+                                    }
+                                    (#disc, __pl)
+                                }
+                            });
+                            read_arms.push(quote! {
+                                #disc => #view::#vname(::core::array::from_fn(|__i| {
+                                    let __off = u64::from_le_bytes(
+                                        __pl[__i * 8..__i * 8 + 8].try_into().unwrap());
+                                    <#elem as ::bstack_raii::BStackBlock>::from_range(
+                                        ::bstack_raii::BStackRange::new(__off, #elem_size))
+                                })),
+                            });
+                            move_arms.push(quote! {
+                                #disc => {
+                                    let mut __v = ::std::vec::Vec::with_capacity(#len);
+                                    for __i in 0..#len {
+                                        let __off = u64::from_le_bytes(
+                                            __pl[__i * 8..__i * 8 + 8].try_into().unwrap());
+                                        let __data = unsafe {
+                                            ::bstack_raii::BStackRef::<#elem>::from_range(
+                                                ::bstack_raii::BStackRange::new(__off, #elem_size)) };
+                                        let (__d, __c) =
+                                            <#elem as ::bstack_raii::BStackShared>::strong_parts(__data, __alloc)?;
+                                        __v.push(unsafe {
+                                            ::bstack_raii::BStackRc::from_raw(__d, __c, __alloc) });
+                                    }
+                                    #data::#vname(
+                                        match <[::bstack_raii::BStackRc<'__mv, #elem, __A>; #len]>::try_from(__v) {
+                                            ::std::result::Result::Ok(__a) => __a,
+                                            ::std::result::Result::Err(_) => unreachable!(),
+                                        })
+                                }
+                            });
+                            drop_arms.push(quote! {
+                                #disc => {
+                                    for __i in 0..#len {
+                                        let __off = u64::from_le_bytes(
+                                            __pl[__i * 8..__i * 8 + 8].try_into().unwrap());
+                                        let __data = unsafe {
+                                            ::bstack_raii::BStackRef::<#elem>::from_range(
+                                                ::bstack_raii::BStackRange::new(__off, #elem_size)) };
+                                        <#elem as ::bstack_raii::BStackShared>::drop_strong_ref(
+                                            __data, allocator)?;
+                                    }
+                                }
+                            });
+                            clone_arms.push(quote! {
+                                #disc => {
+                                    for __i in 0..#len {
+                                        let __off = u64::from_le_bytes(
+                                            __pl[__i * 8..__i * 8 + 8].try_into().unwrap());
+                                        let __data = unsafe {
+                                            ::bstack_raii::BStackRef::<#elem>::from_range(
+                                                ::bstack_raii::BStackRange::new(__off, #elem_size)) };
+                                        __plan.bump_strong(__data, allocator)?;
+                                    }
+                                }
+                            });
+                        }
+                        Kind::Weak => {
+                            has_shared = true;
+                            has_weak = true;
+                            let ctrl_size = quote!(::core::mem::size_of::<
+                                <#elem as ::bstack_raii::BStackWeakable>::Control>() as u64);
+                            let ctrl_ty = quote!(<#elem as ::bstack_raii::BStackWeakable>::Control);
+                            data_variants.push(
+                                quote!(#vname([::bstack_raii::BStackWeak<'__e, #elem, __A>; #len]),),
+                            );
+                            view_variants.push(quote!(#vname([::core::option::Option<
+                                ::bstack_raii::BStackRc<'__e, #elem, __A>>; #len]),));
+                            new_arms.push(quote! {
+                                #data::#vname(__arr) => {
+                                    let mut __pl = [0u8; Self::__PAYLOAD];
+                                    for (__i, __w) in __arr.into_iter().enumerate() {
+                                        __pl[__i * 8..__i * 8 + 8].copy_from_slice(
+                                            &__w.into_raw().into_range().start().to_le_bytes());
+                                    }
+                                    (#disc, __pl)
+                                }
+                            });
+                            read_arms.push(quote! {
+                                #disc => {
+                                    let mut __v = ::std::vec::Vec::with_capacity(#len);
+                                    for __i in 0..#len {
+                                        let __off = u64::from_le_bytes(
+                                            __pl[__i * 8..__i * 8 + 8].try_into().unwrap());
+                                        let __ctrl = unsafe {
+                                            ::bstack_raii::BStackRef::<#ctrl_ty>::from_range(
+                                                ::bstack_raii::BStackRange::new(__off, #ctrl_size)) };
+                                        let __wk = unsafe {
+                                            ::bstack_raii::BStackWeak::<#elem, __A>::from_raw(__ctrl, allocator) };
+                                        let __up = __wk.upgrade()?;
+                                        let _ = __wk.into_raw();
+                                        __v.push(__up);
+                                    }
+                                    #view::#vname(
+                                        match <[::core::option::Option<
+                                            ::bstack_raii::BStackRc<'__e, #elem, __A>>; #len]>::try_from(__v) {
+                                            ::std::result::Result::Ok(__a) => __a,
+                                            ::std::result::Result::Err(_) => unreachable!(),
+                                        })
+                                }
+                            });
+                            move_arms.push(quote! {
+                                #disc => #data::#vname(::core::array::from_fn(|__i| {
+                                    let __off = u64::from_le_bytes(
+                                        __pl[__i * 8..__i * 8 + 8].try_into().unwrap());
+                                    let __ctrl = unsafe {
+                                        ::bstack_raii::BStackRef::<#ctrl_ty>::from_range(
+                                            ::bstack_raii::BStackRange::new(__off, #ctrl_size)) };
+                                    unsafe { ::bstack_raii::BStackWeak::from_raw(__ctrl, __alloc) }
+                                })),
+                            });
+                            drop_arms.push(quote! {
+                                #disc => {
+                                    for __i in 0..#len {
+                                        let __off = u64::from_le_bytes(
+                                            __pl[__i * 8..__i * 8 + 8].try_into().unwrap());
+                                        let __ctrl = unsafe {
+                                            ::bstack_raii::BStackRef::<#ctrl_ty>::from_range(
+                                                ::bstack_raii::BStackRange::new(__off, #ctrl_size)) };
+                                        ::bstack_raii::WeakRef::<#elem>(__ctrl).bstack_drop(allocator)?;
+                                    }
+                                }
+                            });
+                            clone_arms.push(quote! {
+                                #disc => {
+                                    for __i in 0..#len {
+                                        let __off = u64::from_le_bytes(
+                                            __pl[__i * 8..__i * 8 + 8].try_into().unwrap());
+                                        __plan.bump_weak(__off);
+                                    }
+                                }
+                            });
+                        }
+                        Kind::Embed => {
+                            return Err(Error::new_spanned(
+                                ty,
+                                "#[embed] array enum variants are not yet supported",
+                            ));
+                        }
+                        Kind::Pod => unreachable!("guarded out above"),
+                    }
+                    continue;
+                }
+
                 match kind {
                     Kind::Pod => unreachable!("guarded out above"),
                     Kind::Owned => {
