@@ -11,10 +11,13 @@
 //!
 //! ## Contents
 //!
-//! | Type                | Rust analogue      | What it holds                          |
-//! |---------------------|--------------------|----------------------------------------|
+//! | Type                | Rust analogue        | What it holds                          |
+//! |---------------------|----------------------|----------------------------------------|
 //! | [`BStackCow<T>`]    | [`std::borrow::Cow`] | either a borrowed [`crate::BStackRef`] or an owned [`crate::BStackOwned`] block, deep-copying on first write. |
+//! | [`BStackBox<T>`]    | [`std::boxed::Box`]  | a single owned [`Pod`](bytemuck::Pod) value in its own block — the macro-free way to own a bare scalar/POD struct. |
 
+mod boxed;
 mod cow;
 
+pub use boxed::{BStackBox, BoxOnDisk};
 pub use cow::BStackCow;

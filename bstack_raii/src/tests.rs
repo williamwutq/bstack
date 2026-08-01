@@ -14,10 +14,10 @@ use bstack::{
 
 use crate::layout::{self, BlockHeader};
 use crate::{
-    AutoDrop, BStackBlock, BStackBlockVec, BStackCast, BStackCastAs, BStackCastInto, BStackCow,
-    BStackDrop, BStackOwned, BStackRc, BStackRef, BStackShared, BStackWeakable, EightCC, TryClone,
-    TryCloneIn, alloc_block, alloc_control, bstack_block, bstack_cast, bstack_enum, bstack_move,
-    dealloc_range,
+    AutoDrop, BStackBlock, BStackBlockVec, BStackBox, BStackCast, BStackCastAs, BStackCastInto,
+    BStackCow, BStackDrop, BStackOwned, BStackRc, BStackRef, BStackShared, BStackWeakable, EightCC,
+    TryClone, TryCloneIn, alloc_block, alloc_control, bstack_block, bstack_cast, bstack_enum,
+    bstack_move, dealloc_range,
 };
 
 // --------------------------------------------------------------------------
@@ -4276,5 +4276,145 @@ fn stdlib_cow_borrowed_drop_frees_nothing() {
     // Dropping a borrowed Cow has no claim on the target.
     cow.bstack_drop(&alloc).unwrap();
     assert_eq!(base.handle().val(stack).unwrap(), 3);
+    base.bstack_drop(&alloc).unwrap();
+}
+
+// --------------------------------------------------------------------------
+// stdlib: BStackBox<T> — an owned single-value block for Pod T
+// --------------------------------------------------------------------------
+
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct Point3 {
+    x: i32,
+    y: i32,
+    z: i32,
+}
+
+// A block that owns a box as a child, proving BStackBox composes as a field.
+#[bstack_block]
+struct BoxHolder {
+    #[bstack_owned]
+    boxed: BStackBox<u64>,
+    tag: u32,
+}
+
+#[test]
+fn stdlib_box_roundtrip_and_set() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    // A bare scalar owned as its own block — no macro struct needed.
+    let b = BStackBox::new(&alloc, 42u64).unwrap();
+    assert_eq!(b.handle().get(stack).unwrap(), 42);
+
+    // In-place overwrite.
+    b.handle().set(&alloc, 99).unwrap();
+    assert_eq!(b.handle().get(stack).unwrap(), 99);
+
+    // A plain POD struct payload works too (the point of the Pod bound).
+    let p = BStackBox::new(&alloc, Point3 { x: 1, y: 2, z: 3 }).unwrap();
+    assert_eq!(p.handle().get(stack).unwrap(), Point3 { x: 1, y: 2, z: 3 });
+
+    b.bstack_drop(&alloc).unwrap();
+    p.bstack_drop(&alloc).unwrap();
+}
+
+#[test]
+fn stdlib_box_clone_is_a_byte_copy() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let b = BStackBox::new(&alloc, 7u32).unwrap();
+    let clone = b.try_clone_in(&alloc).unwrap();
+
+    // Fresh, independent block, same value.
+    assert_ne!(
+        clone.handle().range().start(),
+        b.handle().range().start()
+    );
+    assert_eq!(clone.handle().get(stack).unwrap(), 7);
+
+    // Mutating the clone leaves the original untouched.
+    clone.handle().set(&alloc, 8).unwrap();
+    assert_eq!(b.handle().get(stack).unwrap(), 7);
+
+    b.bstack_drop(&alloc).unwrap();
+    clone.bstack_drop(&alloc).unwrap();
+}
+
+#[test]
+fn stdlib_box_move_yields_the_value() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+
+    let b = BStackBox::new(&alloc, 123u64).unwrap();
+    let start = b.handle().range().start();
+    let value = bstack_move!(b, &alloc).unwrap();
+    assert_eq!(value, 123);
+
+    // The shell was freed: its slot is reused by the next allocation.
+    let b2 = BStackBox::new(&alloc, 5u64).unwrap();
+    assert_eq!(b2.handle().range().start(), start);
+    b2.bstack_drop(&alloc).unwrap();
+}
+
+#[test]
+fn stdlib_box_distinct_tags_by_size() {
+    // Boxes of differently-sized payloads get distinct tags.
+    assert_ne!(
+        <BStackBox<u32> as BStackCast>::eightcc(),
+        <BStackBox<u64> as BStackCast>::eightcc(),
+    );
+    // Same size => same tag (the generic-POD tag scheme distinguishes by size).
+    assert_eq!(
+        <BStackBox<u32> as BStackCast>::eightcc(),
+        <BStackBox<i32> as BStackCast>::eightcc(),
+    );
+}
+
+#[test]
+fn stdlib_box_composes_as_owned_field() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let inner = BStackBox::new(&alloc, 500u64).unwrap();
+    let holder = BoxHolder::new(&alloc, inner, 9).unwrap();
+    assert_eq!(holder.handle().boxed(stack).unwrap().get(stack).unwrap(), 500);
+    assert_eq!(holder.handle().tag(stack).unwrap(), 9);
+
+    // Deep-cloning the parent recurses into the child box (fresh child block).
+    let clone = holder.try_clone_in(&alloc).unwrap();
+    assert_ne!(
+        clone.handle().boxed(stack).unwrap().range().start(),
+        holder.handle().boxed(stack).unwrap().range().start(),
+    );
+    assert_eq!(clone.handle().boxed(stack).unwrap().get(stack).unwrap(), 500);
+
+    clone.bstack_drop(&alloc).unwrap();
+    holder.bstack_drop(&alloc).unwrap();
+}
+
+#[test]
+fn stdlib_box_in_cow() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    // A borrowed Cow over a box; first write deep-copies the box.
+    let base = BStackBox::new(&alloc, 11u64).unwrap();
+    let mut cow =
+        BStackCow::borrowed(unsafe { BStackRef::<BStackBox<u64>>::from_range(base.handle().range()) });
+    assert_eq!(cow.handle().get(stack).unwrap(), 11);
+
+    let owned = cow.to_mut(&alloc).unwrap();
+    owned.handle().set(&alloc, 22).unwrap();
+    assert_ne!(cow.range().start(), base.handle().range().start());
+    assert_eq!(base.handle().get(stack).unwrap(), 11); // source untouched
+
+    cow.bstack_drop(&alloc).unwrap();
     base.bstack_drop(&alloc).unwrap();
 }
