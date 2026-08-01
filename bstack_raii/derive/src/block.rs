@@ -102,6 +102,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
     let name = &input.ident;
     let vis = &input.vis;
     let on_disk = format_ident!("{}OnDisk", name);
+    let on_disk_ty = quote!(#on_disk);
     let control = format_ident!("{}OnDiskRef", name);
 
     // Layout-preserving check + per-parameter bound: a type parameter may appear
@@ -274,7 +275,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                     <#elem_ty as ::bstack_raii::BStackBlock>::OnDisk>() as u64);
                 let store = quote!(::bstack_raii::BStackVec::<u64, __A>);
                 let field_loc =
-                    quote!(self.0.start() + ::core::mem::offset_of!(#on_disk, #fname) as u64);
+                    quote!(self.0.start() + ::core::mem::offset_of!(#on_disk_ty, #fname) as u64);
                 let is_weak = kind == Kind::Weak;
                 let (ctrl_ty, ctrl_size) = (
                     quote!(<#elem_ty as ::bstack_raii::BStackWeakable>::Control),
@@ -551,13 +552,13 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                 }
                 Kind::Pod => (
                     vec_drop_stmt(fname, elem, nullable),
-                    vec_accessor(vis, fname, elem, &on_disk, nullable),
+                    vec_accessor(vis, fname, elem, &on_disk_ty, nullable),
                     vec_ctor(fname, &vinfo, nullable),
                     vec_move(&cap, elem, nullable),
                 ),
                 Kind::Owned => (
                     block_vec_drop_stmt(fname, quote!(BStackBlockVec), elem, nullable),
-                    block_vec_accessor(vis, fname, elem, &on_disk, quote!(BStackBlockVec), nullable),
+                    block_vec_accessor(vis, fname, elem, &on_disk_ty, quote!(BStackBlockVec), nullable),
                     block_vec_ctor(
                         fname,
                         elem,
@@ -569,7 +570,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                 ),
                 Kind::Strong => (
                     block_vec_drop_stmt(fname, quote!(BStackStrongVec), elem, nullable),
-                    block_vec_accessor(vis, fname, elem, &on_disk, quote!(BStackStrongVec), nullable),
+                    block_vec_accessor(vis, fname, elem, &on_disk_ty, quote!(BStackStrongVec), nullable),
                     block_vec_ctor(
                         fname,
                         elem,
@@ -581,7 +582,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                 ),
                 Kind::Weak => (
                     block_vec_drop_stmt(fname, quote!(BStackWeakVec), elem, nullable),
-                    block_vec_accessor(vis, fname, elem, &on_disk, quote!(BStackWeakVec), nullable),
+                    block_vec_accessor(vis, fname, elem, &on_disk_ty, quote!(BStackWeakVec), nullable),
                     block_vec_ctor(
                         fname,
                         elem,
@@ -593,7 +594,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                 ),
                 Kind::Ref => (
                     block_vec_drop_stmt(fname, quote!(BStackRefVec), elem, nullable),
-                    block_vec_accessor(vis, fname, elem, &on_disk, quote!(BStackRefVec), nullable),
+                    block_vec_accessor(vis, fname, elem, &on_disk_ty, quote!(BStackRefVec), nullable),
                     block_vec_ctor(
                         fname,
                         elem,
@@ -697,7 +698,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                         allocator: &'__v __A,
                     ) -> ::std::io::Result<#acc_ret> {
                         let __base =
-                            self.0.start() + ::core::mem::offset_of!(#on_disk, #fname) as u64;
+                            self.0.start() + ::core::mem::offset_of!(#on_disk_ty, #fname) as u64;
                         ::std::result::Result::Ok(#acc_body)
                     }
                 });
@@ -875,7 +876,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                 drop_stmts.push(quote! {
                     {
                         let __base =
-                            __range.start() + ::core::mem::offset_of!(#on_disk, #fname) as u64;
+                            __range.start() + ::core::mem::offset_of!(#on_disk_ty, #fname) as u64;
                         let __step = ::core::mem::size_of::<#child_od>() as u64;
                         for __k in 0usize..(#total) {
                             let __embed = ::bstack_raii::BStackRange::new(
@@ -895,7 +896,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                 accessors.push(quote! {
                     #vis fn #fname(&self) -> #acc_ret {
                         let __base =
-                            self.0.start() + ::core::mem::offset_of!(#on_disk, #fname) as u64;
+                            self.0.start() + ::core::mem::offset_of!(#on_disk_ty, #fname) as u64;
                         let __step = ::core::mem::size_of::<#child_od>() as u64;
                         #acc_body
                     }
@@ -929,7 +930,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                 ctor_post.push(quote! {
                     {
                         let __base =
-                            __data.start() + ::core::mem::offset_of!(#on_disk, #fname) as u64;
+                            __data.start() + ::core::mem::offset_of!(#on_disk_ty, #fname) as u64;
                         let __step = ::core::mem::size_of::<#child_od>() as u64;
                         for __k in 0usize..(#total) {
                             let __src = #src_id[__k];
@@ -973,7 +974,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                 clone_stmts.push(quote! {
                     {
                         let __base =
-                            __src.start() + ::core::mem::offset_of!(#on_disk, #fname) as u64;
+                            __src.start() + ::core::mem::offset_of!(#on_disk_ty, #fname) as u64;
                         let __step = ::core::mem::size_of::<#child_od>() as u64;
                         let mut __arr: [#child_od; #total] = __od.#fname;
                         for __k in 0usize..(#total) {
@@ -1011,7 +1012,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                         weak: ::bstack_raii::BStackWeak<'__s, #elem, __A>,
                     ) -> ::std::io::Result<()> {
                         let __field = self.0.start()
-                            + ::core::mem::offset_of!(#on_disk, #fname) as u64
+                            + ::core::mem::offset_of!(#on_disk_ty, #fname) as u64
                             + (index as u64) * 8;
                         ::bstack_raii::set_weak_field(allocator, __field, weak)
                     }
@@ -1031,7 +1032,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                         allocator: &'__u __A,
                     ) -> ::std::io::Result<#acc_ret> {
                         let __base =
-                            self.0.start() + ::core::mem::offset_of!(#on_disk, #fname) as u64;
+                            self.0.start() + ::core::mem::offset_of!(#on_disk_ty, #fname) as u64;
                         ::std::result::Result::Ok(#acc_body)
                     }
                 });
@@ -1122,9 +1123,9 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                     &self,
                     stack: &::bstack_raii::BStack,
                 ) -> ::std::io::Result<#acc_ret> {
-                    let mut __buf = [0u8; ::core::mem::size_of::<#on_disk>()];
+                    let mut __buf = [0u8; ::core::mem::size_of::<#on_disk_ty>()];
                     let __r = unsafe { ::bstack_raii::BStackRef::<Self>::from_range(self.0) };
-                    let __od: #on_disk = *__r.read_on_disk(stack, &mut __buf)?;
+                    let __od: #on_disk_ty = *__r.read_on_disk(stack, &mut __buf)?;
                     let __offs: [u64; #total] = __od.#fname;
                     ::std::result::Result::Ok(#acc_body)
                 }
@@ -1342,9 +1343,9 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                     &self,
                     stack: &::bstack_raii::BStack,
                 ) -> ::std::io::Result<#inner_ty> {
-                    let mut __buf = [0u8; ::core::mem::size_of::<#on_disk>()];
+                    let mut __buf = [0u8; ::core::mem::size_of::<#on_disk_ty>()];
                     let __r = unsafe { ::bstack_raii::BStackRef::<Self>::from_range(self.0) };
-                    let __od: #on_disk = *__r.read_on_disk(stack, &mut __buf)?;
+                    let __od: #on_disk_ty = *__r.read_on_disk(stack, &mut __buf)?;
                     let __w = __od.#fname;
                     ::std::result::Result::Ok(( #(__w.#idx,)* ))
                 }
@@ -1385,7 +1386,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
             drop_stmts.push(quote! {
                 {
                     let __embed = ::bstack_raii::BStackRange::new(
-                        __range.start() + ::core::mem::offset_of!(#on_disk, #fname) as u64,
+                        __range.start() + ::core::mem::offset_of!(#on_disk_ty, #fname) as u64,
                         ::core::mem::size_of::<#child_od>() as u64,
                     );
                     <#child>::__bstack_drop_children(__embed, allocator)?;
@@ -1397,7 +1398,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                 #vis fn #fname(&self) -> #child {
                     <#child as ::bstack_raii::BStackBlock>::from_range(
                         ::bstack_raii::BStackRange::new(
-                            self.0.start() + ::core::mem::offset_of!(#on_disk, #fname) as u64,
+                            self.0.start() + ::core::mem::offset_of!(#on_disk_ty, #fname) as u64,
                             ::core::mem::size_of::<#child_od>() as u64,
                         ),
                     )
@@ -1420,7 +1421,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                 {
                     allocator.stack().copy(
                         #src_id.start(),
-                        __data.start() + ::core::mem::offset_of!(#on_disk, #fname) as u64,
+                        __data.start() + ::core::mem::offset_of!(#on_disk_ty, #fname) as u64,
                         ::core::mem::size_of::<#child_od>() as u64,
                     )?;
                     unsafe { ::bstack_raii::dealloc_range(allocator, #src_id)?; }
@@ -1456,7 +1457,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                 {
                     let __child = <#child as ::bstack_raii::BStackBlock>::from_range(
                         ::bstack_raii::BStackRange::new(
-                            __src.start() + ::core::mem::offset_of!(#on_disk, #fname) as u64,
+                            __src.start() + ::core::mem::offset_of!(#on_disk_ty, #fname) as u64,
                             ::core::mem::size_of::<#child_od>() as u64,
                         ),
                     );
@@ -1501,13 +1502,13 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         }
 
         // Accessor.
-        accessors.push(accessor(vis, fname, inner_ty, &on_disk, kind, nullable));
+        accessors.push(accessor(vis, fname, inner_ty, &on_disk_ty, kind, nullable));
 
         // Constructor. Weak fields are not parameters — they start null and are
         // wired afterwards via the generated `set_<field>`.
         if kind == Kind::Weak {
             ctor_inits.push(quote!(#fname: 0u64,));
-            setters.push(weak_setter(vis, fname, inner_ty, &on_disk));
+            setters.push(weak_setter(vis, fname, inner_ty, &on_disk_ty));
         } else {
             let (param, prep, init) = ctor_field(fname, inner_ty, kind, nullable);
             ctor_params.push(param);
@@ -1678,7 +1679,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
 
     let constructor = constructor(
         vis,
-        &on_disk,
+        &on_disk_ty,
         mode,
         &ctrl_eightcc,
         &ctor_params,
@@ -1705,9 +1706,9 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                     let __inner = owned.into_inner();
                     let __stack = __alloc.stack();
                     let __range = ::bstack_raii::BStackBlock::range(&__inner);
-                    let mut __buf = [0u8; ::core::mem::size_of::<#on_disk>()];
+                    let mut __buf = [0u8; ::core::mem::size_of::<#on_disk_ty>()];
                     let __r = unsafe { ::bstack_raii::BStackRef::<Self>::from_range(__range) };
-                    let __od: #on_disk = *__r.read_on_disk(__stack, &mut __buf)?;
+                    let __od: #on_disk_ty = *__r.read_on_disk(__stack, &mut __buf)?;
                     #(#mv_caps)*
                     // Free the parent shell only; children stay live on disk.
                     unsafe { ::bstack_raii::dealloc_range(__alloc, __range)?; }
@@ -1743,10 +1744,10 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         let children = quote! {
             let __stack = allocator.stack();
             let __src = ::bstack_raii::BStackBlock::range(self);
-            let mut __buf = [0u8; ::core::mem::size_of::<#on_disk>()];
+            let mut __buf = [0u8; ::core::mem::size_of::<#on_disk_ty>()];
             let __r = unsafe { ::bstack_raii::BStackRef::<Self>::from_range(__src) };
             #[allow(unused_mut)]
-            let mut __od: #on_disk = *__r.read_on_disk(__stack, &mut __buf)?;
+            let mut __od: #on_disk_ty = *__r.read_on_disk(__stack, &mut __buf)?;
             #(#clone_stmts)*
             ::std::result::Result::Ok(__od)
         };
@@ -1754,7 +1755,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
             let __od = self.__bstack_clone_children_inplace(allocator, __plan)?;
             let __dst = __plan.alloc_raw(
                 allocator,
-                ::core::mem::size_of::<#on_disk>() as u64,
+                ::core::mem::size_of::<#on_disk_ty>() as u64,
             )?;
             __plan.write(
                 __dst.start(),
@@ -1774,7 +1775,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
             &self,
             allocator: &__A,
             __plan: &mut ::bstack_raii::ClonePlan,
-        ) -> ::std::io::Result<#on_disk> {
+        ) -> ::std::io::Result<#on_disk_ty> {
             // Bring the trait into scope so a child's (possibly generic) clone hook
             // resolves via method syntax.
             use ::bstack_raii::BStackBlock as _;
@@ -1853,8 +1854,8 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         // SAFETY: `#[repr(C, packed)]` guarantees no padding, and every field is
         // `Pod` (u64 for refs/injected counters, header is Pod, each inline field
         // is asserted `Pod` below), so all bit patterns are valid.
-        unsafe impl ::bstack_raii::Zeroable for #on_disk {}
-        unsafe impl ::bstack_raii::Pod for #on_disk {}
+        unsafe impl ::bstack_raii::Zeroable for #on_disk_ty {}
+        unsafe impl ::bstack_raii::Pod for #on_disk_ty {}
 
         const _: fn() = || {
             fn __assert_pod<__T: ::bstack_raii::Pod>() {}
@@ -1868,7 +1869,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         }
 
         impl #impl_g ::bstack_raii::BStackBlock for #name #ty_g #where_g {
-            type OnDisk = #on_disk;
+            type OnDisk = #on_disk_ty;
             fn from_range(range: ::bstack_raii::BStackRange) -> Self {
                 #name(range #phantom_ctor)
             }
@@ -1877,23 +1878,26 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
             }
 
             #clone_trait_methods
-        }
 
-        impl #impl_g #name #ty_g #where_g {
             /// Free this block's owned children (recursively) given its range,
             /// **without** freeing the block itself — used when the block is
             /// `#[embed]`ded (its storage is part of its parent), and by
-            /// `bstack_drop` before the self-dealloc.
+            /// `bstack_drop` before the self-dealloc. Overrides the childless
+            /// `BStackBlock` default.
             #[doc(hidden)]
-            #vis fn __bstack_drop_children<__A: ::bstack_raii::BStackOwnedSliceAllocator>(
+            #[allow(unused_imports)]
+            fn __bstack_drop_children<__A: ::bstack_raii::BStackOwnedSliceAllocator>(
                 __range: ::bstack_raii::BStackRange,
                 allocator: &__A,
             ) -> ::std::io::Result<()> {
                 use ::bstack_raii::BStackDrop as _;
+                // Bring the trait into scope so a child's (possibly generic) teardown
+                // hook resolves.
+                use ::bstack_raii::BStackBlock as _;
                 let __stack = allocator.stack();
-                let mut __buf = [0u8; ::core::mem::size_of::<#on_disk>()];
+                let mut __buf = [0u8; ::core::mem::size_of::<#on_disk_ty>()];
                 let __r = unsafe { ::bstack_raii::BStackRef::<Self>::from_range(__range) };
-                let __on_disk: #on_disk = *__r.read_on_disk(__stack, &mut __buf)?;
+                let __on_disk: #on_disk_ty = *__r.read_on_disk(__stack, &mut __buf)?;
                 #(#drop_stmts)*
                 ::std::result::Result::Ok(())
             }
@@ -1904,7 +1908,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                 self,
                 allocator: &__A,
             ) -> ::std::io::Result<()> {
-                Self::__bstack_drop_children(self.0, allocator)?;
+                <Self as ::bstack_raii::BStackBlock>::__bstack_drop_children(self.0, allocator)?;
                 unsafe { ::bstack_raii::dealloc_range(allocator, self.0) }
             }
         }
@@ -2127,7 +2131,7 @@ fn vec_accessor(
     vis: &syn::Visibility,
     fname: &Ident,
     elem: &TokenStream,
-    on_disk: &Ident,
+    on_disk: &TokenStream,
     nullable: bool,
 ) -> TokenStream {
     let field = quote!(self.0.start() + ::core::mem::offset_of!(#on_disk, #fname) as u64);
@@ -2310,7 +2314,7 @@ fn block_vec_accessor(
     vis: &syn::Visibility,
     fname: &Ident,
     elem: &TokenStream,
-    on_disk: &Ident,
+    on_disk: &TokenStream,
     vec_ty: TokenStream,
     nullable: bool,
 ) -> TokenStream {
@@ -2545,7 +2549,7 @@ fn accessor(
     vis: &syn::Visibility,
     fname: &Ident,
     inner_ty: &Type,
-    on_disk: &Ident,
+    on_disk: &TokenStream,
     kind: Kind,
     nullable: bool,
 ) -> TokenStream {
@@ -2775,7 +2779,7 @@ fn wrap_move(
 
 /// Generate the `set_<field>` method for a `#[bstack_weak]` field: point it at a
 /// weak target (consumed), releasing whatever it held before.
-fn weak_setter(vis: &syn::Visibility, fname: &Ident, fty: &Type, on_disk: &Ident) -> TokenStream {
+fn weak_setter(vis: &syn::Visibility, fname: &Ident, fty: &Type, on_disk: &TokenStream) -> TokenStream {
     let setter = format_ident!("set_{}", fname);
     quote! {
         #vis fn #setter<'__s, __A: ::bstack_raii::BStackOwnedSliceAllocator>(
@@ -2793,7 +2797,7 @@ fn weak_setter(vis: &syn::Visibility, fname: &Ident, fty: &Type, on_disk: &Ident
 #[allow(clippy::too_many_arguments)]
 fn constructor(
     vis: &syn::Visibility,
-    on_disk: &Ident,
+    on_disk: &TokenStream,
     mode: Mode,
     ctrl_eightcc: &TokenStream,
     params: &[TokenStream],
@@ -5187,18 +5191,19 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
             ) -> ::std::io::Result<::bstack_raii::BStackRange> {
                 #clone_into_body
             }
-        }
 
-        impl #name {
             /// Free the active variant's owned child (recursively) given this
             /// block's range, **without** freeing the block itself — used when the
-            /// enum is `#[embed]`ded, and by `bstack_drop` before the self-dealloc.
+            /// enum is `#[embed]`ded, and by `bstack_drop`. Overrides the childless
+            /// `BStackBlock` default.
             #[doc(hidden)]
-            #vis fn __bstack_drop_children<__A: ::bstack_raii::BStackOwnedSliceAllocator>(
+            #[allow(unused_imports)]
+            fn __bstack_drop_children<__A: ::bstack_raii::BStackOwnedSliceAllocator>(
                 __range: ::bstack_raii::BStackRange,
                 allocator: &__A,
             ) -> ::std::io::Result<()> {
                 use ::bstack_raii::BStackDrop as _;
+                use ::bstack_raii::BStackBlock as _;
                 #drop_children_body
                 ::std::result::Result::Ok(())
             }
@@ -5209,7 +5214,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                 self,
                 allocator: &__A,
             ) -> ::std::io::Result<()> {
-                Self::__bstack_drop_children(self.0, allocator)?;
+                <Self as ::bstack_raii::BStackBlock>::__bstack_drop_children(self.0, allocator)?;
                 unsafe { ::bstack_raii::dealloc_range(allocator, self.0) }
             }
         }

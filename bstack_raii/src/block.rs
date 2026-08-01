@@ -36,6 +36,21 @@ pub trait BStackBlock: BStackCast + BStackDrop + Sized {
     /// The underlying range this handle points at.
     fn range(&self) -> BStackRange;
 
+    /// Recursively free this block's owned children given its `range`, **without**
+    /// freeing the block itself — used when the block is `#[embed]`ded (its storage
+    /// is part of the parent) and by `bstack_drop` before the self-dealloc. The
+    /// generated impl overrides this; the default (a **childless** block) frees
+    /// nothing. Exposed on the trait — rather than as a generated inherent method —
+    /// so a generic parent can recurse into a type parameter. `#[doc(hidden)]`.
+    #[doc(hidden)]
+    fn __bstack_drop_children<A: BStackOwnedSliceAllocator>(
+        range: BStackRange,
+        allocator: &A,
+    ) -> io::Result<()> {
+        let _ = (range, allocator);
+        Ok(())
+    }
+
     /// Read this block's `OnDisk` and return a deep-cloned copy for a
     /// [`ClonePlan`]: owned children cloned into the plan, shared children's
     /// refcounts bumped, embedded children folded in place — *without* allocating
