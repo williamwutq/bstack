@@ -32,6 +32,7 @@ object model on top.
   - [Structs](#structs)
   - [Reference-counted blocks](#reference-counted-blocks)
   - [Vectors and strings](#vectors-and-strings)
+  - [Fixed-size arrays: `[T; N]`](#fixed-size-arrays-t-n)
   - [Nullable fields: `Option`](#nullable-fields-option)
   - [Enums: `#[bstack_enum]`](#enums-bstack_enum)
   - [Field types](#field-types)
@@ -363,9 +364,56 @@ The constructor takes a `Vec` of the matching element handle; the accessor
 returns the vector handle (`len` / `to_vec` / `get`; `BStackWeakVec` has
 `upgrade(i)`; each has a `push_*`).
 
+A vector's element may itself be a [fixed-size array](#fixed-size-arrays-t-n):
+`Vec<[T; N]>` (and nested `Vec<[[T; N]; M]>`) is a growable sequence of
+reference-arrays. It works for POD (`Vec<[u16; 4]>`, just a POD vector) and for
+every annotated kind (`#[bstack_owned/strong/weak/ref] Vec<[Thing; N]>`), with
+the accessor materializing `Vec<[Thing; N]>`.
+
+A `Vec` element must be a single leaf, though: `Vec<Vec<T>>` (nested vectors) and
+`Vec<(A, B)>` (a tuple element) are rejected with a directed error — wrap the
+inner value in a named `#[bstack_block]` and store `Vec<ThatBlock>`.
+
 To **share** a vector between two structs, wrap it in its own `#[bstack_block]`
 and share *that* block with `#[bstack_strong]` / `#[bstack_ref]` — a descriptor
 has a single owner.
+
+### Fixed-size arrays: `[T; N]`
+
+A fixed-size array `[T; N]` is stored **inline** — no separate data block. As with
+a scalar field, the annotation states the elements' ownership; an un-annotated
+array of `Pod` is itself `Pod`.
+
+```rust
+#[bstack_block]
+struct Board {
+    cells: [u16; 9],                    // POD array (un-annotated) — inline bytes
+    #[bstack_owned] tiles: [Leaf; 3],   // 3 owned children (freed on teardown)
+    #[bstack_ref]   marks: [Leaf; 2],   // 2 borrowed refs (free nothing)
+    #[embed]        kids:  [Child; 2],   // 2 children embedded verbatim, inline
+}
+
+let b = Board::new(&alloc, [0; 9], [a, b, c], [r0, r1], [k0, k1])?;
+let tiles: [Leaf; 3] = b.handle().tiles(stack)?;   // an array of block views
+```
+
+A reference array stores `[u64; N]` inline (one offset per element). The
+constructor takes an array of the matching handle (`[BStackOwned<T>; N]` /
+`[BStackRc<T>; N]` / `[BStackRef<T>; N]`) and the accessor hands back `[T; N]`
+block views; teardown frees/releases each element per the annotation, exactly
+like the vector kinds. `#[bstack_weak]` is wired per index
+(`set_field(&alloc, i, weak)`) and its accessor upgrades each slot to
+`[Option<BStackRc<T>>; N]`. `#[embed] [Child; N]` stores the N children's on-disk
+forms back-to-back.
+
+Arrays compose freely:
+
+- **Per-element `Option`** — `[Option<T>; N]` makes each slot nullable (offset
+  `0` == `None`), so the accessor/constructor use `[Option<Handle>; N]`. A
+  whole-array `Option<[T; N]>` is rejected — put the `Option` on the element.
+- **Nesting to any depth** — `[[T; N]; M]`, `[[[T; N]; M]; K]`, … work for every
+  kind (POD / owned / strong / weak / ref / embed), in both structs and enums,
+  the accessor/constructor trafficking in the matching nested `[[Handle; …]; …]`.
 
 ### Nullable fields: `Option`
 
@@ -440,6 +488,28 @@ The two [companion enums](#generated-types) are duals of each other's directions
   handles, a weak variant *upgraded* to `Option<BStackRc<T>>`. `read` takes the
   allocator (a weak variant upgrades through it).
 
+A single-field variant carries the same shapes a struct field does — not just a
+scalar block, but a [fixed-size array](#fixed-size-arrays-t-n) or a
+[vector](#vectors-and-strings):
+
+```rust
+#[bstack_enum]
+enum Cell {
+    Empty,
+    Tags(Vec<u32>),                          // POD vector variant
+    Text(String),                            // POD string variant
+    #[bstack_owned] Kids(Vec<Leaf>),         // owned vector (freed on teardown)
+    #[bstack_ref]   Row([Leaf; 3]),          // inline reference array
+    #[bstack_owned] Grid(Vec<[Leaf; 2]>),    // vector of reference-arrays
+}
+```
+
+An array variant `V([T; N])` mirrors a scalar `V(T)` per element (its offsets
+sit inline in the payload); a vector variant `V(Vec<…>)` stores a descriptor in
+the payload (build it as a `BStackVec` / `BStackBlockVec` / … and pass it in
+`CellData::Kids(vec)`). A `Vec<[T; N]>` variant reads back as `Vec<[T; N]>`. The
+same nesting and directed-error rules apply as for struct fields.
+
 Like a struct, an enum has [modes](#concepts): `#[bstack_enum(rc)]` /
 `(rc, weak)` make the enum itself refcounted / weak-observable (`new` returns
 `BStackRc<E>`), and such an enum can be a `#[bstack_strong]` / `#[bstack_weak]`
@@ -486,11 +556,24 @@ the `std` types — the macro lowers each to a bstack_raii on-disk form (a growa
 is ever an actual `std::vec::Vec` / `String` / `Option`; they're borrowed as
 familiar names for convenience.
 
+A fixed-size [array](#fixed-size-arrays-t-n) `[T; N]` is likewise recognized —
+inline, per-element ownership, nestable to any depth.
+
 A **POD tuple** field — `a: (A, B, …)` where every element is `Pod` — also works,
 even though a Rust tuple isn't itself `Pod`: it's stored through a generated
 packed wrapper (alignment is irrelevant on disk) and handed back as a tuple by
 the accessor. `bstack_move!` keeps each tuple as **one** element — a `(u8, u8)`
-field comes back as `(u8, u8)`, not flattened into the surrounding tuple.
+field comes back as `(u8, u8)`, not flattened into the surrounding tuple. A tuple
+is *not* a valid `Vec`/array element, though (it can't carry per-element
+annotations) — `Vec<(A, B)>` is rejected in favor of a named `#[bstack_block]`.
+
+These spellings **compose**, with two limits that draw a directed compile error
+rather than a confusing one: a field takes at most one `Option` layer
+(`Option<Option<T>>` → use a `#[bstack_enum]`), and a `Vec` element must be a
+single leaf (`Vec<Vec<T>>` / `Vec<String>` → wrap the inner one in a named
+`#[bstack_block]` and store `Vec<ThatBlock>`). So `Option<Vec<[Thing; N]>>`,
+`[Option<T>; N]`, and `Vec<[[T; N]; M]>` are fine; `Vec<Vec<T>>` and
+`Option<Option<T>>` are not.
 
 In the same spirit, a field written `&T` is coerced to owned `T` (and `&str` to
 `String`) with a compile warning — a stray reference doesn't fail to compile, but
@@ -655,15 +738,21 @@ This also works for `#[bstack_enum]` — e.g. `#[bstack_enum(rc, tag = "ENMTAG")
 
 ## Limitations
 
-- **Fixed-size block payloads** — no *inline* variable-length arrays. Growable
-  data lives out-of-line via an inline descriptor: `Vec<T>` / `String`,
-  `#[bstack_owned/strong/weak/ref] Vec<Thing>`, and their `Option<…>` forms.
+- **Fixed-size block payloads.** Fixed-size [arrays](#fixed-size-arrays-t-n)
+  `[T; N]` (nested to any depth) are stored *inline*, but a *variable-length*
+  sequence lives out-of-line via an inline descriptor: `Vec<T>` / `String`,
+  `#[bstack_owned/strong/weak/ref] Vec<Thing>`, `Vec<[Thing; N]>`, and their
+  `Option<…>` forms.
 - **Requires a freeing allocator** that reserves offset 0 — not
   `LinearBStackAllocator` (see [Concepts](#concepts)).
 - **No generic block types**; non-`Pod` fields must carry an annotation.
-- **Enums** support unit / POD / all four annotated variant kinds in all three
-  modes, plus `bstack_move!` / `bstack_cast!`; struct and multi-field tuple
-  variants aren't supported.
+- **`Vec` / `Option` nesting** is capped at a single leaf / one `Option` layer
+  (see [Field types](#field-types)); deeper nesting or a tuple element must be
+  named as a `#[bstack_block]` / `#[bstack_enum]`.
+- **Enums** support unit / POD / all four annotated variant kinds — as scalars,
+  arrays `V([T; N])`, and vectors `V(Vec<…>)` — in all three modes, plus
+  `bstack_move!` / `bstack_cast!`; struct and multi-field tuple variants aren't
+  supported, and a variant can't be `#[embed]`ed.
 - The on-disk **ABI is not yet stable**.
 
 ## License
