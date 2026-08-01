@@ -3954,3 +3954,77 @@ fn macro_generic_owns_enum() {
     clone.bstack_drop(&alloc).unwrap();
     b.bstack_drop(&alloc).unwrap();
 }
+
+// --------------------------------------------------------------------------
+// Generic blocks storing T INLINE: POD (`item: T`, T: Pod) and #[embed]
+// (`item: T`, T: BStackBlock) — XOnDisk<T> is generic over the stored param.
+// --------------------------------------------------------------------------
+
+#[bstack_block]
+struct PodBoxG<T> {
+    item: T,
+    tag: u64,
+}
+
+#[test]
+fn macro_generic_pod_box() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let b = PodBoxG::<u32>::new(&alloc, 42u32, 7).unwrap();
+    assert_eq!(b.handle().item(stack).unwrap(), 42);
+    assert_eq!(b.handle().tag(stack).unwrap(), 7);
+
+    // Clone byte-copies the POD value.
+    let clone = b.try_clone_in(&alloc).unwrap();
+    assert_eq!(clone.handle().item(stack).unwrap(), 42);
+    clone.bstack_drop(&alloc).unwrap();
+
+    // Distinct type args → distinct on-disk layout → distinct tags.
+    assert_ne!(
+        <PodBoxG<u32> as BStackCast>::eightcc(),
+        <PodBoxG<u64> as BStackCast>::eightcc(),
+    );
+
+    // Move hands the POD value back.
+    let (item, tag) = bstack_move!(b, &alloc).unwrap();
+    assert_eq!((item, tag), (42u32, 7u64));
+}
+
+#[bstack_block]
+struct EmbBoxG<T> {
+    #[embed]
+    item: T,
+    tag: u32,
+}
+
+#[test]
+fn macro_generic_emb_box() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    // EmbChild owns a MacroLeaf; embedding inlines the whole child on disk.
+    let child = EmbChild::new(&alloc, MacroLeaf::new(&alloc, 10).unwrap(), 1).unwrap();
+    let b = EmbBoxG::<EmbChild>::new(&alloc, child, 99).unwrap();
+    assert_eq!(b.handle().tag(stack).unwrap(), 99);
+    // Accessor: an EmbChild handle into the inline slot (pure offset math).
+    assert_eq!(b.handle().item().leaf(stack).unwrap().val(stack).unwrap(), 10);
+
+    // Clone folds the embedded child inline, deep-cloning its owned leaf — via the
+    // generic `T`'s `BStackBlock` clone hook (a trait method, not inherent).
+    let clone = b.try_clone_in(&alloc).unwrap();
+    assert_eq!(clone.handle().item().leaf(stack).unwrap().val(stack).unwrap(), 10);
+    assert_ne!(
+        clone.handle().item().leaf(stack).unwrap().range().start(),
+        b.handle().item().leaf(stack).unwrap().range().start()
+    );
+    clone.bstack_drop(&alloc).unwrap();
+
+    // Move re-homes the embedded child to a fresh standalone block.
+    let (moved, tag) = bstack_move!(b, &alloc).unwrap();
+    assert_eq!(tag, 99);
+    assert_eq!(moved.handle().leaf(stack).unwrap().val(stack).unwrap(), 10);
+    moved.bstack_drop(&alloc).unwrap();
+}

@@ -102,67 +102,133 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
     let name = &input.ident;
     let vis = &input.vis;
     let on_disk = format_ident!("{}OnDisk", name);
-    let on_disk_ty = quote!(#on_disk);
     let control = format_ident!("{}OnDiskRef", name);
 
-    // Layout-preserving check + per-parameter bound: a type parameter may appear
-    // only in a `#[bstack_ref]` / `#[bstack_strong]` / `#[bstack_weak]` field —
-    // each a bare `u64` offset on disk whose teardown/clone recurse through
-    // *traits* (`BStackShared`) or library helpers, never the generated inherent
-    // methods. Every such parameter is bounded `BStackBlock`, plus `BStackShared`
-    // if it is ever a `#[bstack_strong]` element and `BStackWeakable` if ever a
-    // `#[bstack_weak]` element. (Owned needs a not-yet-done clone-recursion
-    // change; embed/POD change the on-disk layout — both rejected.)
-    let mut param_extra: Vec<(Ident, bool, bool)> =
-        type_params.iter().map(|p| ((*p).clone(), false, false)).collect();
+    // Per-parameter usage across fields — driving both the trait bound and whether
+    // the parameter is stored INLINE (making `XOnDisk`, and its `size_of` /
+    // `offset_of`, depend on it). A parameter is either a **POD** value (`T: Pod`,
+    // stored by value) or a **block reference / embed** (`T: BStackBlock`, plus
+    // `BStackShared` / `BStackWeakable` for strong / weak elements). `ref` / `owned`
+    // / `strong` / `weak` lower to a bare `u64` offset (not in `XOnDisk`); `#[embed]`
+    // and POD store the type inline (in `XOnDisk`).
+    #[derive(Default)]
+    struct Usage {
+        pod: bool,
+        blockish: bool,
+        strong: bool,
+        weak: bool,
+        in_ondisk: bool,
+    }
+    let mut usage: Vec<(Ident, Usage)> = type_params
+        .iter()
+        .map(|p| ((*p).clone(), Usage::default()))
+        .collect();
     for (_, field) in &field_list {
         let kind = classify(field)?;
         if !type_mentions_any(&field.ty, &type_params) {
             continue;
         }
-        match kind {
-            // ref / owned lower to a `u64` offset and recurse through traits
-            // (`BStackDrop`, the clone hooks on `BStackBlock`) — base bound only.
-            Kind::Ref | Kind::Owned => {}
-            Kind::Strong | Kind::Weak => {
-                for (p, is_strong, is_weak) in param_extra.iter_mut() {
-                    if type_mentions_any(&field.ty, &[p]) {
-                        *is_strong |= kind == Kind::Strong;
-                        *is_weak |= kind == Kind::Weak;
-                    }
-                }
+        for (p, u) in usage.iter_mut() {
+            if !type_mentions_any(&field.ty, &[&*p]) {
+                continue;
             }
-            _ => {
-                return Err(Error::new_spanned(
-                    &field.ty,
-                    "a generic type parameter may currently be used only in a `#[bstack_ref]` / \
-                     `#[bstack_owned]` / `#[bstack_strong]` / `#[bstack_weak]` field — each a bare \
-                     `u64` offset that keeps the block's on-disk layout independent of the type. \
-                     An embed / POD use stores the type inline, changing the layout — not yet \
-                     supported.",
-                ));
+            match kind {
+                Kind::Pod => {
+                    u.pod = true;
+                    u.in_ondisk = true;
+                }
+                Kind::Embed => {
+                    u.blockish = true;
+                    u.in_ondisk = true;
+                }
+                Kind::Ref | Kind::Owned => u.blockish = true,
+                Kind::Strong => {
+                    u.blockish = true;
+                    u.strong = true;
+                }
+                Kind::Weak => {
+                    u.blockish = true;
+                    u.weak = true;
+                }
             }
         }
     }
-    // Generics threaded into the generated impls (with the computed bounds added
-    // to every parameter), plus the handle's phantom marker over them.
-    // `impl_g`/`ty_g`/`where_g` carry the bounds (for the bstack trait impls);
-    // `decl_g`/`decl_ty_g`/`decl_where` are the user's own (for the handle type
-    // and its `Clone`/`Copy`, which hold regardless of `T`).
+    for (p, u) in &usage {
+        if u.pod && u.blockish {
+            return Err(Error::new_spanned(
+                p,
+                "a generic type parameter cannot be used both as a POD field and as a \
+                 reference / embed field — a `Pod` value and a `#[bstack_block]` reference are \
+                 different kinds of thing, with incompatible bounds",
+            ));
+        }
+    }
+    // Generics threaded into the generated impls (with the computed bounds), plus
+    // the handle's phantom marker over them. `impl_g`/`ty_g`/`where_g` carry the
+    // bounds (for the bstack trait impls); `decl_g`/`decl_ty_g`/`decl_where` are
+    // the user's own (for the handle type + its `Clone`/`Copy`, which hold
+    // regardless of `T`).
     let mut aug_generics = input.generics.clone();
     for tp in aug_generics.type_params_mut() {
-        tp.bounds.push(syn::parse_quote!(::bstack_raii::BStackBlock));
-        if let Some((_, is_strong, is_weak)) = param_extra.iter().find(|(p, ..)| *p == tp.ident) {
-            if *is_strong {
-                tp.bounds.push(syn::parse_quote!(::bstack_raii::BStackShared));
+        let u = usage.iter().find(|(p, _)| *p == tp.ident).map(|(_, u)| u);
+        if u.is_some_and(|u| u.pod) {
+            tp.bounds.push(syn::parse_quote!(::bstack_raii::Pod));
+        } else {
+            tp.bounds.push(syn::parse_quote!(::bstack_raii::BStackBlock));
+            if let Some(u) = u {
+                if u.strong {
+                    tp.bounds.push(syn::parse_quote!(::bstack_raii::BStackShared));
+                }
+                if u.weak {
+                    tp.bounds.push(syn::parse_quote!(::bstack_raii::BStackWeakable));
+                }
             }
-            if *is_weak {
-                tp.bounds.push(syn::parse_quote!(::bstack_raii::BStackWeakable));
-            }
+        }
+        // A parameter stored inline makes `XOnDisk: Pod` depend on it, and
+        // `bytemuck::Pod` requires `'static`. A stored parameter is a `Pod` value or
+        // a block handle (a `BStackRange` newtype) — both `'static` — so the block's
+        // own impls need the bound too, to use `Self::OnDisk: Pod`.
+        if u.is_some_and(|u| u.in_ondisk) {
+            tp.bounds.push(syn::parse_quote!('static));
         }
     }
     let (impl_g, ty_g, where_g) = aug_generics.split_for_impl();
     let (decl_g, decl_ty_g, decl_where) = input.generics.split_for_impl();
+
+    // `XOnDisk` is generic over exactly the parameters stored inline (embed / POD).
+    // For a block with none (ref/owned/strong/weak-only, or non-generic), it stays
+    // a plain non-generic struct and `on_disk_ty` is just its name.
+    let ondisk_idents: Vec<Ident> = usage
+        .iter()
+        .filter(|(_, u)| u.in_ondisk)
+        .map(|(p, _)| p.clone())
+        .collect();
+    let ondisk_generics: syn::Generics = {
+        let mut g = syn::Generics::default();
+        for tp in aug_generics.type_params() {
+            if ondisk_idents.contains(&tp.ident) {
+                // Inherits the `Pod`/`BStackBlock` + `'static` bounds from
+                // `aug_generics` above.
+                g.params.push(syn::GenericParam::Type(tp.clone()));
+            }
+        }
+        g
+    };
+    let (od_impl_g, od_ty_g, od_where) = ondisk_generics.split_for_impl();
+    let on_disk_ty = if ondisk_idents.is_empty() {
+        quote!(#on_disk)
+    } else {
+        quote!(#on_disk #od_ty_g)
+    };
+    // For a struct *literal* `XOnDisk { .. }`: bare when non-generic (or when the
+    // fields determine the parameters, as for a POD field), but an `#[embed]`
+    // field is `<T>::OnDisk`, which does NOT determine `T` — so use a turbofish
+    // `XOnDisk::<T> { .. }` whenever generic.
+    let on_disk_ctor = if ondisk_idents.is_empty() {
+        quote!(#on_disk)
+    } else {
+        quote!(#on_disk::#od_ty_g)
+    };
     let (phantom_field, phantom_ctor): (TokenStream, TokenStream) = if type_params.is_empty() {
         (quote!(), quote!())
     } else {
@@ -1123,7 +1189,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                     &self,
                     stack: &::bstack_raii::BStack,
                 ) -> ::std::io::Result<#acc_ret> {
-                    let mut __buf = [0u8; ::core::mem::size_of::<#on_disk_ty>()];
+                    let mut __buf = ::std::vec![0u8; ::core::mem::size_of::<#on_disk_ty>()];
                     let __r = unsafe { ::bstack_raii::BStackRef::<Self>::from_range(self.0) };
                     let __od: #on_disk_ty = *__r.read_on_disk(stack, &mut __buf)?;
                     let __offs: [u64; #total] = __od.#fname;
@@ -1343,7 +1409,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                     &self,
                     stack: &::bstack_raii::BStack,
                 ) -> ::std::io::Result<#inner_ty> {
-                    let mut __buf = [0u8; ::core::mem::size_of::<#on_disk_ty>()];
+                    let mut __buf = ::std::vec![0u8; ::core::mem::size_of::<#on_disk_ty>()];
                     let __r = unsafe { ::bstack_raii::BStackRef::<Self>::from_range(self.0) };
                     let __od: #on_disk_ty = *__r.read_on_disk(stack, &mut __buf)?;
                     let __w = __od.#fname;
@@ -1553,9 +1619,17 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
     let data_eightcc = if type_params.is_empty() {
         data_eightcc
     } else {
-        let mixes = type_params
-            .iter()
-            .map(|p| quote!(.mix(<#p as ::bstack_raii::BStackCast>::eightcc())));
+        // A block parameter has its own `eightcc`; a POD one does not, so fold in
+        // its byte size instead (distinct-size instantiations get distinct tags;
+        // same-size POD types are bit-compatible on disk, so sharing one is sound).
+        let mixes = usage.iter().map(|(p, u)| {
+            if u.pod {
+                quote!(.mix(::bstack_raii::EightCC::new(
+                    (::core::mem::size_of::<#p>() as u64).to_le_bytes())))
+            } else {
+                quote!(.mix(<#p as ::bstack_raii::BStackCast>::eightcc()))
+            }
+        });
         quote!(#data_eightcc #(#mixes)*)
     };
 
@@ -1680,6 +1754,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
     let constructor = constructor(
         vis,
         &on_disk_ty,
+        &on_disk_ctor,
         mode,
         &ctrl_eightcc,
         &ctor_params,
@@ -1706,7 +1781,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                     let __inner = owned.into_inner();
                     let __stack = __alloc.stack();
                     let __range = ::bstack_raii::BStackBlock::range(&__inner);
-                    let mut __buf = [0u8; ::core::mem::size_of::<#on_disk_ty>()];
+                    let mut __buf = ::std::vec![0u8; ::core::mem::size_of::<#on_disk_ty>()];
                     let __r = unsafe { ::bstack_raii::BStackRef::<Self>::from_range(__range) };
                     let __od: #on_disk_ty = *__r.read_on_disk(__stack, &mut __buf)?;
                     #(#mv_caps)*
@@ -1744,7 +1819,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         let children = quote! {
             let __stack = allocator.stack();
             let __src = ::bstack_raii::BStackBlock::range(self);
-            let mut __buf = [0u8; ::core::mem::size_of::<#on_disk_ty>()];
+            let mut __buf = ::std::vec![0u8; ::core::mem::size_of::<#on_disk_ty>()];
             let __r = unsafe { ::bstack_raii::BStackRef::<Self>::from_range(__src) };
             #[allow(unused_mut)]
             let mut __od: #on_disk_ty = *__r.read_on_disk(__stack, &mut __buf)?;
@@ -1838,6 +1913,37 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         }
     };
 
+    // A generic `OnDisk` (embed / POD parameters) can't `#[derive(Copy)]` — the
+    // derived `T: Copy` bound isn't implied by `T: BStackBlock`, though the fields
+    // (`<T>::OnDisk` / `T: Pod`) always are — so hand-write `Clone`/`Copy` with the
+    // `OnDisk`'s own bounds. A non-generic `OnDisk` keeps the derive.
+    let (on_disk_derive, on_disk_clonecopy): (TokenStream, TokenStream) = if ondisk_idents
+        .is_empty()
+    {
+        (
+            quote!(#[derive(::core::clone::Clone, ::core::marker::Copy)]),
+            quote!(),
+        )
+    } else {
+        (
+            quote!(),
+            quote! {
+                impl #od_impl_g ::core::clone::Clone for #on_disk_ty #od_where {
+                    fn clone(&self) -> Self { *self }
+                }
+                impl #od_impl_g ::core::marker::Copy for #on_disk_ty #od_where {}
+            },
+        )
+    };
+    // The `Pod` assertion can only name concrete field types — a generic parameter
+    // in a POD field carries a `T: Pod` bound instead (and the `OnDisk`'s own `Pod`
+    // impl checks the composite).
+    let concrete_pod_types: Vec<&Type> = pod_types
+        .iter()
+        .filter(|t| !type_mentions_any(t, &type_params))
+        .copied()
+        .collect();
+
     Ok(quote! {
         #handle_def
 
@@ -1845,21 +1951,23 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         #(#wrapper_defs)*
 
         #[repr(C, packed)]
-        #[derive(::core::clone::Clone, ::core::marker::Copy)]
-        #vis struct #on_disk {
+        #on_disk_derive
+        #vis struct #on_disk #od_impl_g #od_where {
             __bstack_header: ::bstack_raii::BlockHeader,
             #(#on_disk_fields)*
         }
+        #on_disk_clonecopy
 
         // SAFETY: `#[repr(C, packed)]` guarantees no padding, and every field is
         // `Pod` (u64 for refs/injected counters, header is Pod, each inline field
-        // is asserted `Pod` below), so all bit patterns are valid.
-        unsafe impl ::bstack_raii::Zeroable for #on_disk_ty {}
-        unsafe impl ::bstack_raii::Pod for #on_disk_ty {}
+        // is asserted `Pod` below, and a generic inline field is `Pod` by its
+        // parameter's bound), so all bit patterns are valid.
+        unsafe impl #od_impl_g ::bstack_raii::Zeroable for #on_disk_ty #od_where {}
+        unsafe impl #od_impl_g ::bstack_raii::Pod for #on_disk_ty #od_where {}
 
         const _: fn() = || {
             fn __assert_pod<__T: ::bstack_raii::Pod>() {}
-            #( __assert_pod::<#pod_types>(); )*
+            #( __assert_pod::<#concrete_pod_types>(); )*
         };
 
         impl #impl_g ::bstack_raii::BStackCast for #name #ty_g #where_g {
@@ -1895,7 +2003,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                 // hook resolves.
                 use ::bstack_raii::BStackBlock as _;
                 let __stack = allocator.stack();
-                let mut __buf = [0u8; ::core::mem::size_of::<#on_disk_ty>()];
+                let mut __buf = ::std::vec![0u8; ::core::mem::size_of::<#on_disk_ty>()];
                 let __r = unsafe { ::bstack_raii::BStackRef::<Self>::from_range(__range) };
                 let __on_disk: #on_disk_ty = *__r.read_on_disk(__stack, &mut __buf)?;
                 #(#drop_stmts)*
@@ -2568,7 +2676,7 @@ fn accessor(
         };
     }
     let read = quote! {
-        let mut __buf = [0u8; ::core::mem::size_of::<#on_disk>()];
+        let mut __buf = ::std::vec![0u8; ::core::mem::size_of::<#on_disk>()];
         let __r = unsafe { ::bstack_raii::BStackRef::<Self>::from_range(self.0) };
         let __od: #on_disk = *__r.read_on_disk(stack, &mut __buf)?;
     };
@@ -2798,6 +2906,11 @@ fn weak_setter(vis: &syn::Visibility, fname: &Ident, fty: &Type, on_disk: &Token
 fn constructor(
     vis: &syn::Visibility,
     on_disk: &TokenStream,
+    // The `XOnDisk` name for a struct *literal* — bare, or a turbofish
+    // `XOnDisk::<T>` when generic (`XOnDisk<T> { .. }` in expression position would
+    // parse as a comparison, and `<T>::OnDisk` fields don't infer `T`). `on_disk`
+    // above is the plain *type* (`XOnDisk<T>`), for `size_of`.
+    on_disk_ctor: &TokenStream,
     mode: Mode,
     ctrl_eightcc: &TokenStream,
     params: &[TokenStream],
@@ -2856,7 +2969,7 @@ fn constructor(
                     #(#params)*
                 ) -> ::std::io::Result<#ret> {
                     #(#preps)*
-                    let __on_disk = #on_disk {
+                    let __on_disk = #on_disk_ctor {
                         #header
                         #injected
                         #(#inits)*
@@ -2894,7 +3007,7 @@ fn constructor(
                     let __blocks = ::bstack_raii::alloc_many(allocator, &[#size, #ctrl_size])?;
                     let __data = __blocks[0];
                     let __ctrl = __blocks[1];
-                    let __on_disk = #on_disk {
+                    let __on_disk = #on_disk_ctor {
                         #header
                         __bstack_ctrl: __ctrl.start(),
                         #(#inits)*
