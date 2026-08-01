@@ -3525,12 +3525,87 @@ fn infer_disc_ty(min: i128, max: i128) -> &'static str {
 pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<TokenStream> {
     let attr = parse_attr(attr)?;
     let mode = attr.mode;
+
+    // Generic enums (layout-preserving): a type parameter may appear only in a
+    // *reference* variant (`#[bstack_owned/strong/weak/ref] V(T)`, and array / vec
+    // forms) — each a bare `u64` offset (or `VecDesc`) in the payload, keeping the
+    // fixed payload size independent of the parameter. A POD or `#[embed]` variant
+    // stores the parameter inline, so its payload width would depend on it —
+    // rejected. Const / lifetime parameters and non-plain modes are not supported.
+    let type_params: Vec<&Ident> = input.generics.type_params().map(|tp| &tp.ident).collect();
     if !input.generics.params.is_empty() {
-        return Err(Error::new_spanned(
-            &input.generics,
-            "#[bstack_enum] does not support generic enums",
-        ));
+        for p in &input.generics.params {
+            if !matches!(p, syn::GenericParam::Type(_)) {
+                return Err(Error::new_spanned(
+                    p,
+                    "a generic #[bstack_enum] currently supports only type parameters (no \
+                     lifetime or const generics)",
+                ));
+            }
+        }
+        if mode != Mode::Plain {
+            return Err(Error::new_spanned(
+                &input.generics,
+                "a generic #[bstack_enum] currently supports plain mode only (not `rc` / \
+                 `rc, weak`)",
+            ));
+        }
     }
+    #[derive(Default)]
+    struct EUsage {
+        strong: bool,
+        weak: bool,
+    }
+    let mut eusage: Vec<(Ident, EUsage)> = type_params
+        .iter()
+        .map(|p| ((*p).clone(), EUsage::default()))
+        .collect();
+    for variant in &input.variants {
+        let kind = classify_attrs(&variant.attrs)?;
+        for f in &variant.fields {
+            if !type_mentions_any(&f.ty, &type_params) {
+                continue;
+            }
+            if kind == Kind::Pod || kind == Kind::Embed {
+                return Err(Error::new_spanned(
+                    &f.ty,
+                    "a generic type parameter in a `#[bstack_enum]` variant must be a reference \
+                     (`#[bstack_owned]` / `#[bstack_strong]` / `#[bstack_weak]` / `#[bstack_ref]`), \
+                     not stored inline — a POD or `#[embed]` variant's payload width would depend \
+                     on the parameter",
+                ));
+            }
+            for (p, u) in eusage.iter_mut() {
+                if type_mentions_any(&f.ty, &[&*p]) {
+                    u.strong |= kind == Kind::Strong;
+                    u.weak |= kind == Kind::Weak;
+                }
+            }
+        }
+    }
+    let mut aug_generics = input.generics.clone();
+    for tp in aug_generics.type_params_mut() {
+        tp.bounds.push(syn::parse_quote!(::bstack_raii::BStackBlock));
+        if let Some((_, u)) = eusage.iter().find(|(p, _)| *p == tp.ident) {
+            if u.strong {
+                tp.bounds.push(syn::parse_quote!(::bstack_raii::BStackShared));
+            }
+            if u.weak {
+                tp.bounds.push(syn::parse_quote!(::bstack_raii::BStackWeakable));
+            }
+        }
+    }
+    let (enum_impl_g, enum_ty_g, enum_where) = aug_generics.split_for_impl();
+    let (enum_decl_g, enum_decl_ty_g, enum_decl_where) = input.generics.split_for_impl();
+    let (enum_phantom_field, enum_phantom_ctor): (TokenStream, TokenStream) =
+        if type_params.is_empty() {
+            (quote!(), quote!())
+        } else {
+            (
+                quote!(, ::core::marker::PhantomData<fn() -> (#(#type_params,)*)>),
+                quote!(, ::core::marker::PhantomData),
+            )
+        };
 
     // The on-disk discriminant. Each variant's value follows Rust's rules
     // (explicit `= N`, else previous + 1); the width is an explicit `repr(..)`
@@ -3592,6 +3667,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
     let vis = &input.vis;
     let on_disk = format_ident!("{}OnDisk", name);
     let control = format_ident!("{}OnDiskRef", name);
+    let payload_const = format_ident!("__bstack_payload_{}", name);
     // `EData` is the in-memory owned form of the enum's payload — the same type is
     // used to *construct* (`E::new`) and to receive a *destructured* variant
     // (`bstack_move!`), since both hold owned handles (they are duals).
@@ -3695,7 +3771,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                         new_arms.push(quote! {
                             #data::#vname(__v) => {
                                 let __desc = __v.descriptor();
-                                let mut __pl = [0u8; Self::__PAYLOAD];
+                                let mut __pl = [0u8; #payload_const];
                                 __pl[..16].copy_from_slice(
                                     ::bstack_raii::bytemuck::bytes_of(&__desc));
                                 (#disc, __pl)
@@ -3812,7 +3888,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                         new_arms.push(quote! {
                             #data::#vname(__v) => {
                                 let __desc = __v.descriptor();
-                                let mut __pl = [0u8; Self::__PAYLOAD];
+                                let mut __pl = [0u8; #payload_const];
                                 __pl[..16].copy_from_slice(
                                     ::bstack_raii::bytemuck::bytes_of(&__desc));
                                 (#disc, __pl)
@@ -3932,7 +4008,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                             }
                             let __desc = ::bstack_raii::BStackVec::<u64, __A>::from_slice(
                                 allocator, &__flat)?.descriptor();
-                            let mut __pl = [0u8; Self::__PAYLOAD];
+                            let mut __pl = [0u8; #payload_const];
                             __pl[..16].copy_from_slice(::bstack_raii::bytemuck::bytes_of(&__desc));
                             (#disc, __pl)
                         }
@@ -4078,7 +4154,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                         new_arms.push(quote! {
                             #data::#vname(__arr) => {
                                 #consume
-                                (#disc, [0u8; Self::__PAYLOAD])
+                                (#disc, [0u8; #payload_const])
                             }
                         });
 
@@ -4179,7 +4255,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                         let consume = nested_consume(&dims, &quote!(__arr), &cap_write);
                         new_arms.push(quote! {
                             #data::#vname(__arr) => {
-                                let mut __pl = [0u8; Self::__PAYLOAD];
+                                let mut __pl = [0u8; #payload_const];
                                 #consume
                                 (#disc, __pl)
                             }
@@ -4302,7 +4378,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                     let consume = nested_consume(&dims, &quote!(__arr), &cap_write);
                     new_arms.push(quote! {
                         #data::#vname(__arr) => {
-                            let mut __pl = [0u8; Self::__PAYLOAD];
+                            let mut __pl = [0u8; #payload_const];
                             #consume
                             (#disc, __pl)
                         }
@@ -4450,7 +4526,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                             #data::#vname(__v) => {
                                 let __h = __v.into_inner();
                                 let __off = ::bstack_raii::BStackBlock::range(&__h).start();
-                                let mut __pl = [0u8; Self::__PAYLOAD];
+                                let mut __pl = [0u8; #payload_const];
                                 __pl[..8].copy_from_slice(&__off.to_le_bytes());
                                 (#disc, __pl)
                             }
@@ -4500,7 +4576,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                         view_variants.push(quote!(#vname(#ty),));
                         new_arms.push(quote! {
                             #data::#vname(__v) => {
-                                let mut __pl = [0u8; Self::__PAYLOAD];
+                                let mut __pl = [0u8; #payload_const];
                                 __pl[..8].copy_from_slice(&__v.into_range().start().to_le_bytes());
                                 (#disc, __pl)
                             }
@@ -4522,7 +4598,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                         new_arms.push(quote! {
                             #data::#vname(__v) => {
                                 let (__data, _ctrl) = __v.into_raw();
-                                let mut __pl = [0u8; Self::__PAYLOAD];
+                                let mut __pl = [0u8; #payload_const];
                                 __pl[..8].copy_from_slice(&__data.into_range().start().to_le_bytes());
                                 (#disc, __pl)
                             }
@@ -4583,7 +4659,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                         new_arms.push(quote! {
                             #data::#vname(__v) => {
                                 let __ctrl = __v.into_raw();
-                                let mut __pl = [0u8; Self::__PAYLOAD];
+                                let mut __pl = [0u8; #payload_const];
                                 __pl[..8].copy_from_slice(&__ctrl.into_range().start().to_le_bytes());
                                 (#disc, __pl)
                             }
@@ -4640,7 +4716,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                                     ::core::mem::size_of::<#co>() as u64,
                                     0u64,
                                 ));
-                                (#disc, [0u8; Self::__PAYLOAD])
+                                (#disc, [0u8; #payload_const])
                             }
                         });
                         // read (view): a child handle at the embedded payload offset.
@@ -4784,7 +4860,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                 payload_sizes.push(payload_size);
                 new_arms.push(quote! {
                     #data::#pat => {
-                        let mut __pl = [0u8; Self::__PAYLOAD];
+                        let mut __pl = [0u8; #payload_const];
                         #(#writes)*
                         (#disc, __pl)
                     }
@@ -4806,6 +4882,16 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
         .map_or_else(|| auto_prefix(&type_name), |t| t.bytes().collect::<Vec<u8>>());
     let tag = build_tag(hash, &prefix);
     let eightcc = eightcc_expr(&tag.bytes);
+    // For a generic enum, fold each type argument's tag into the discriminant so
+    // distinct instantiations get distinct tags (mixed at runtime in `eightcc()`).
+    let eightcc = if type_params.is_empty() {
+        eightcc
+    } else {
+        let mixes = type_params
+            .iter()
+            .map(|p| quote!(.mix(<#p as ::bstack_raii::BStackCast>::eightcc())));
+        quote!(#eightcc #(#mixes)*)
+    };
 
     // Control-block tag (rc, weak): the data tag with its prefix lowercased, or a
     // `ctrl_tag` override.
@@ -4829,11 +4915,39 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
         _ => quote!(::bstack_raii::BStackRc<'__e, Self, __A>),
     };
     // `EData` type name — `new`'s `data` parameter and `bstack_move!` output.
-    let data_ty = if has_shared {
-        quote!(#data<'__e, __A>)
-    } else {
-        quote!(#data)
+    // The companion `EData` / `EView` enums are generic over `<'e, A>` (when a
+    // strong/weak variant needs it) AND over the enum's own type parameters. These
+    // helpers assemble a use (`EData<'e, A, T>`) or a decl (`<'e, A, T: Bound>`)
+    // with the right subset present.
+    let etp_args: Vec<TokenStream> = type_params.iter().map(|p| quote!(#p)).collect();
+    let etp_decl: Vec<TokenStream> = aug_generics.type_params().map(|tp| quote!(#tp)).collect();
+    let comp_ty = |id: &Ident, lt: &TokenStream, la: bool| -> TokenStream {
+        let mut args: Vec<TokenStream> = Vec::new();
+        if la {
+            args.push(lt.clone());
+            args.push(quote!(__A));
+        }
+        args.extend(etp_args.iter().cloned());
+        if args.is_empty() {
+            quote!(#id)
+        } else {
+            quote!(#id < #(#args),* >)
+        }
     };
+    let comp_decl = |lt: &TokenStream, la: bool| -> TokenStream {
+        let mut parts: Vec<TokenStream> = Vec::new();
+        if la {
+            parts.push(lt.clone());
+            parts.push(quote!(__A: ::bstack_raii::BStackOwnedSliceAllocator));
+        }
+        parts.extend(etp_decl.iter().cloned());
+        if parts.is_empty() {
+            quote!()
+        } else {
+            quote!(< #(#parts),* >)
+        }
+    };
+    let data_ty = comp_ty(&data, &quote!('__e), has_shared);
     // The `new` constructor. Plain / `rc` are one atomic write (the injected
     // refcount is baked into the image); `(rc, weak)` allocates data + control and
     // commits both images in one `set_batched`, with the control back-pointer
@@ -4905,7 +5019,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                     data: #data_ty,
                 ) -> ::std::io::Result<#new_ret> {
                     #embed_decl
-                    let (__disc, __payload): (#disc_ty, [u8; Self::__PAYLOAD]) = match data {
+                    let (__disc, __payload): (#disc_ty, [u8; #payload_const]) = match data {
                         #(#new_arms)*
                     };
                     let __on_disk = #on_disk {
@@ -4937,7 +5051,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                     data: #data_ty,
                 ) -> ::std::io::Result<::bstack_raii::BStackRc<'__e, Self, __A>> {
                     #embed_decl
-                    let (__disc, __payload): (#disc_ty, [u8; Self::__PAYLOAD]) = match data {
+                    let (__disc, __payload): (#disc_ty, [u8; #payload_const]) = match data {
                         #(#new_arms)*
                     };
                     let __blocks = ::bstack_raii::alloc_many(allocator, &[#enum_size, #ctrl_size])?;
@@ -5147,7 +5261,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
     // The public `TryCloneIn` entry point, for plain enums only.
     let enum_clone_trait = if mode == Mode::Plain {
         quote! {
-            impl ::bstack_raii::TryCloneIn for #name {
+            impl #enum_impl_g ::bstack_raii::TryCloneIn for #name #enum_ty_g #enum_where {
                 fn try_clone_in<__A: ::bstack_raii::BStackOwnedSliceAllocator>(
                     &self,
                     allocator: &__A,
@@ -5175,29 +5289,14 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
     };
 
     // `EData` is generic over `<'e, A>` when a variant holds a strong/weak
-    // reference; `EView` only when a weak variant makes `read` upgrade.
-    let data_generics = if has_shared {
-        quote!(<'__e, __A: ::bstack_raii::BStackOwnedSliceAllocator>)
-    } else {
-        quote!()
-    };
-    let view_generics = if has_weak {
-        quote!(<'__e, __A: ::bstack_raii::BStackOwnedSliceAllocator>)
-    } else {
-        quote!()
-    };
-    let view_ty = if has_weak {
-        quote!(#view<'__e, __A>)
-    } else {
-        quote!(#view)
-    };
+    // reference; `EView` only when a weak variant makes `read` upgrade; both are
+    // also generic over the enum's own type parameters.
+    let data_generics = comp_decl(&quote!('__e), has_shared);
+    let view_generics = comp_decl(&quote!('__e), has_weak);
+    let view_ty = comp_ty(&view, &quote!('__e), has_weak);
     // `bstack_move!` yields the same `EData` (owned handles); `Fields` just names
     // it with the move lifetime.
-    let move_fields_ty = if has_shared {
-        quote!(#data<'__mv, __A>)
-    } else {
-        quote!(#data)
-    };
+    let move_fields_ty = comp_ty(&data, &quote!('__mv), has_shared);
     // `bstack_move!` frees the enum shell, then rebuilds the active variant's
     // payload as an owned handle.
     let move_payload = if needs_payload {
@@ -5206,25 +5305,44 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
         quote!()
     };
 
+    let enum_handle_def = if type_params.is_empty() {
+        quote! {
+            #[derive(::core::clone::Clone, ::core::marker::Copy)]
+            #vis struct #name(::bstack_raii::BStackRange);
+        }
+    } else {
+        quote! {
+            #vis struct #name #enum_decl_g(
+                ::bstack_raii::BStackRange #enum_phantom_field
+            ) #enum_decl_where;
+            impl #enum_decl_g ::core::clone::Clone for #name #enum_decl_ty_g #enum_decl_where {
+                fn clone(&self) -> Self { *self }
+            }
+            impl #enum_decl_g ::core::marker::Copy for #name #enum_decl_ty_g #enum_decl_where {}
+        }
+    };
     Ok(quote! {
-        #[derive(::core::clone::Clone, ::core::marker::Copy)]
-        #vis struct #name(::bstack_raii::BStackRange);
+        #enum_handle_def
 
-        impl #name {
+        #[doc(hidden)]
+        #[allow(non_upper_case_globals)]
+        #vis const #payload_const: usize = {
+            let __s = [0usize #(, #payload_sizes)*];
+            let mut __m = 0usize;
+            let mut __i = 0usize;
+            while __i < __s.len() {
+                if __s[__i] > __m {
+                    __m = __s[__i];
+                }
+                __i += 1;
+            }
+            __m
+        };
+
+        impl #enum_impl_g #name #enum_ty_g #enum_where {
             /// The payload area size (bytes) — the max over all variants.
             #[doc(hidden)]
-            pub const __PAYLOAD: usize = {
-                let __s = [0usize #(, #payload_sizes)*];
-                let mut __m = 0usize;
-                let mut __i = 0usize;
-                while __i < __s.len() {
-                    if __s[__i] > __m {
-                        __m = __s[__i];
-                    }
-                    __i += 1;
-                }
-                __m
-            };
+            pub const __PAYLOAD: usize = #payload_const;
         }
 
         #[repr(C, packed)]
@@ -5233,7 +5351,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
             __bstack_header: ::bstack_raii::BlockHeader,
             #injected_ondisk
             __bstack_disc: #disc_ty,
-            __bstack_payload: [u8; #name::__PAYLOAD],
+            __bstack_payload: [u8; #payload_const],
         }
         unsafe impl ::bstack_raii::Zeroable for #on_disk {}
         unsafe impl ::bstack_raii::Pod for #on_disk {}
@@ -5260,16 +5378,16 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
             #(#view_variants)*
         }
 
-        impl ::bstack_raii::BStackCast for #name {
+        impl #enum_impl_g ::bstack_raii::BStackCast for #name #enum_ty_g #enum_where {
             fn eightcc() -> ::bstack_raii::EightCC {
                 #eightcc
             }
         }
 
-        impl ::bstack_raii::BStackBlock for #name {
+        impl #enum_impl_g ::bstack_raii::BStackBlock for #name #enum_ty_g #enum_where {
             type OnDisk = #on_disk;
             fn from_range(range: ::bstack_raii::BStackRange) -> Self {
-                #name(range)
+                #name(range #enum_phantom_ctor)
             }
             fn range(&self) -> ::bstack_raii::BStackRange {
                 self.0
@@ -5322,7 +5440,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
             }
         }
 
-        impl ::bstack_raii::BStackDrop for #name {
+        impl #enum_impl_g ::bstack_raii::BStackDrop for #name #enum_ty_g #enum_where {
             fn bstack_drop<__A: ::bstack_raii::BStackOwnedSliceAllocator>(
                 self,
                 allocator: &__A,
@@ -5332,7 +5450,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
             }
         }
 
-        impl #name {
+        impl #enum_impl_g #name #enum_ty_g #enum_where {
             /// Allocate a new enum block holding `data`'s variant + payload.
             #enum_new
 
@@ -5375,7 +5493,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
         #shared_impl
         #weakable_items
 
-        impl ::bstack_raii::BStackMove for #name {
+        impl #enum_impl_g ::bstack_raii::BStackMove for #name #enum_ty_g #enum_where {
             type Fields<'__mv, __A: ::bstack_raii::BStackOwnedSliceAllocator> = #move_fields_ty;
             fn bstack_move<'__mv, __A: ::bstack_raii::BStackOwnedSliceAllocator>(
                 owned: ::bstack_raii::BStackOwned<Self>,

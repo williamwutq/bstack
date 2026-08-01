@@ -4028,3 +4028,82 @@ fn macro_generic_emb_box() {
     assert_eq!(moved.handle().leaf(stack).unwrap().val(stack).unwrap(), 10);
     moved.bstack_drop(&alloc).unwrap();
 }
+
+// --------------------------------------------------------------------------
+// Generic enums (layout-preserving: type params only in reference variants)
+// --------------------------------------------------------------------------
+
+#[bstack_enum]
+enum BoxEnumG<T> {
+    Empty,
+    Tag(u32),
+    #[bstack_owned]
+    Item(T),
+}
+
+#[test]
+fn macro_generic_enum_owned() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let leaf = MacroLeaf::new(&alloc, 42).unwrap();
+    let e = BoxEnumG::<MacroLeaf>::new(&alloc, BoxEnumGData::Item(leaf)).unwrap();
+    match e.handle().read(&alloc).unwrap() {
+        BoxEnumGView::Item(l) => assert_eq!(l.val(stack).unwrap(), 42),
+        _ => panic!("expected Item"),
+    }
+
+    // Deep clone recurses into the owned child through T's BStackBlock hooks.
+    let clone = e.try_clone_in(&alloc).unwrap();
+    match clone.handle().read(&alloc).unwrap() {
+        BoxEnumGView::Item(l) => assert_eq!(l.val(stack).unwrap(), 42),
+        _ => panic!("expected Item"),
+    }
+    clone.bstack_drop(&alloc).unwrap();
+
+    // Distinct instantiations → distinct tags.
+    assert_ne!(
+        <BoxEnumG<MacroLeaf> as BStackCast>::eightcc(),
+        <BoxEnumG<MacroStrongChild> as BStackCast>::eightcc(),
+    );
+
+    // Move yields the owned child.
+    match bstack_move!(e, &alloc).unwrap() {
+        BoxEnumGData::Item(owned) => {
+            assert_eq!(owned.handle().val(stack).unwrap(), 42);
+            owned.bstack_drop(&alloc).unwrap();
+        }
+        _ => panic!("expected Item"),
+    }
+}
+
+#[bstack_enum]
+enum StrongEnumG<T> {
+    Empty,
+    #[bstack_strong]
+    S(T),
+}
+
+#[test]
+fn macro_generic_enum_strong() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let c = MacroStrongChild::new(&alloc, 5).unwrap();
+    let keep = c.try_clone().unwrap(); // strong = 2
+    let data = keep.handle().range().start();
+
+    let e = StrongEnumG::<MacroStrongChild>::new(&alloc, StrongEnumGData::S(c)).unwrap();
+    assert_eq!(strong_of(stack, data), 2); // e + keep
+
+    // Clone bumps the strong count; teardown restores it.
+    let clone = e.try_clone_in(&alloc).unwrap();
+    assert_eq!(strong_of(stack, data), 3);
+    clone.bstack_drop(&alloc).unwrap();
+    assert_eq!(strong_of(stack, data), 2);
+    e.bstack_drop(&alloc).unwrap();
+    assert_eq!(strong_of(stack, data), 1);
+    drop(keep);
+}
