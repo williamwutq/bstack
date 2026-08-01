@@ -104,27 +104,59 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
     let on_disk = format_ident!("{}OnDisk", name);
     let control = format_ident!("{}OnDiskRef", name);
 
-    // Layout-preserving check: a type parameter may appear only in a
-    // `#[bstack_ref]` field (which lowers to a bare `u64` offset).
+    // Layout-preserving check + per-parameter bound: a type parameter may appear
+    // only in a `#[bstack_ref]` / `#[bstack_strong]` / `#[bstack_weak]` field —
+    // each a bare `u64` offset on disk whose teardown/clone recurse through
+    // *traits* (`BStackShared`) or library helpers, never the generated inherent
+    // methods. Every such parameter is bounded `BStackBlock`, plus `BStackShared`
+    // if it is ever a `#[bstack_strong]` element and `BStackWeakable` if ever a
+    // `#[bstack_weak]` element. (Owned needs a not-yet-done clone-recursion
+    // change; embed/POD change the on-disk layout — both rejected.)
+    let mut param_extra: Vec<(Ident, bool, bool)> =
+        type_params.iter().map(|p| ((*p).clone(), false, false)).collect();
     for (_, field) in &field_list {
-        if classify(field)? != Kind::Ref && type_mentions_any(&field.ty, &type_params) {
-            return Err(Error::new_spanned(
-                &field.ty,
-                "a generic type parameter may currently be used only in a `#[bstack_ref]` field \
-                 — it lowers to a bare `u64` offset, keeping the block's on-disk layout \
-                 independent of the type. An owned/strong/weak/embed/POD use would change the \
-                 layout or require recursing into the type, which is not yet supported.",
-            ));
+        let kind = classify(field)?;
+        if !type_mentions_any(&field.ty, &type_params) {
+            continue;
+        }
+        match kind {
+            Kind::Ref => {}
+            Kind::Strong | Kind::Weak => {
+                for (p, is_strong, is_weak) in param_extra.iter_mut() {
+                    if type_mentions_any(&field.ty, &[p]) {
+                        *is_strong |= kind == Kind::Strong;
+                        *is_weak |= kind == Kind::Weak;
+                    }
+                }
+            }
+            _ => {
+                return Err(Error::new_spanned(
+                    &field.ty,
+                    "a generic type parameter may currently be used only in a `#[bstack_ref]` / \
+                     `#[bstack_strong]` / `#[bstack_weak]` field — each a bare `u64` offset that \
+                     keeps the block's on-disk layout independent of the type. An owned use needs \
+                     a clone-recursion change, and embed/POD change the layout — not yet \
+                     supported.",
+                ));
+            }
         }
     }
-    // Generics threaded into the generated impls (with a `BStackBlock` bound
-    // added to every parameter), plus the handle's phantom marker over them.
-    // `impl_g`/`ty_g`/`where_g` carry the bound (for the bstack trait impls);
+    // Generics threaded into the generated impls (with the computed bounds added
+    // to every parameter), plus the handle's phantom marker over them.
+    // `impl_g`/`ty_g`/`where_g` carry the bounds (for the bstack trait impls);
     // `decl_g`/`decl_ty_g`/`decl_where` are the user's own (for the handle type
     // and its `Clone`/`Copy`, which hold regardless of `T`).
     let mut aug_generics = input.generics.clone();
     for tp in aug_generics.type_params_mut() {
         tp.bounds.push(syn::parse_quote!(::bstack_raii::BStackBlock));
+        if let Some((_, is_strong, is_weak)) = param_extra.iter().find(|(p, ..)| *p == tp.ident) {
+            if *is_strong {
+                tp.bounds.push(syn::parse_quote!(::bstack_raii::BStackShared));
+            }
+            if *is_weak {
+                tp.bounds.push(syn::parse_quote!(::bstack_raii::BStackWeakable));
+            }
+        }
     }
     let (impl_g, ty_g, where_g) = aug_generics.split_for_impl();
     let (decl_g, decl_ty_g, decl_where) = input.generics.split_for_impl();

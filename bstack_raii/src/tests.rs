@@ -3816,3 +3816,58 @@ fn macro_generic_move_cast() {
     assert_eq!(item.into_range().start(), leaf.handle().range().start());
     leaf.bstack_drop(&alloc).unwrap();
 }
+
+#[bstack_block]
+struct StrongBox<T> {
+    #[bstack_strong]
+    item: T,
+    tag: u64,
+}
+
+#[test]
+fn macro_generic_strong_box() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+    let c = MacroStrongChild::new(&alloc, 10).unwrap();
+    let keep = c.try_clone().unwrap(); // strong = 2
+    let data = keep.handle().range().start();
+
+    let b = StrongBox::<MacroStrongChild>::new(&alloc, c, 5).unwrap();
+    assert_eq!(strong_of(stack, data), 2); // b + keep
+    assert_eq!(b.handle().tag(stack).unwrap(), 5);
+
+    // Deep-cloning the box bumps the shared child's strong count.
+    let clone = b.try_clone_in(&alloc).unwrap();
+    assert_eq!(strong_of(stack, data), 3);
+    clone.bstack_drop(&alloc).unwrap();
+    assert_eq!(strong_of(stack, data), 2);
+
+    b.bstack_drop(&alloc).unwrap();
+    assert_eq!(strong_of(stack, data), 1); // keep only
+    drop(keep);
+}
+
+#[bstack_block]
+struct WeakBox<T> {
+    #[bstack_weak]
+    item: T,
+}
+
+#[test]
+fn macro_generic_weak_box() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+    let c = MacroStrongChild::new(&alloc, 7).unwrap();
+    let b = WeakBox::<MacroStrongChild>::new(&alloc).unwrap();
+    b.handle().set_item(&alloc, c.downgrade().unwrap()).unwrap();
+
+    let up = b.handle().item(&alloc).unwrap().expect("alive");
+    assert_eq!(up.handle().val(stack).unwrap(), 7);
+    drop(up);
+
+    drop(c); // sole strong owner gone → can't upgrade
+    assert!(b.handle().item(&alloc).unwrap().is_none());
+    b.bstack_drop(&alloc).unwrap();
+}
