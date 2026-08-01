@@ -26,6 +26,19 @@ pub trait BStackCast {
 ///
 /// `OnDisk` is the generated `#[repr(C, packed)]` payload struct; it must be
 /// [`Pod`] so it can be read back with `bytemuck::from_bytes`.
+///
+/// The `#[diagnostic::on_unimplemented]` message turns the trait-bound failure
+/// that a bad *generic* instantiation produces (which the macro cannot catch, as
+/// the type parameter is opaque at expansion) into a readable one — e.g. a
+/// `#[bstack_owned] Vec<T>` field instantiated with `T = Vec<u32>`.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not a `#[bstack_block]` / `#[bstack_enum]` type",
+    label = "not a bstack block",
+    note = "`#[bstack_owned]` / `#[bstack_strong]` / `#[bstack_weak]` / `#[bstack_ref]` fields \
+            (and generic parameters used as them) require a block type. Primitives, `Vec`, \
+            `String`, tuples and `Option` are not blocks — a nested `Vec`/`Option` or a tuple \
+            needs its own named `#[bstack_block]` wrapper."
+)]
 pub trait BStackBlock: BStackCast + BStackDrop + Sized {
     /// The on-disk payload layout (the generated `XOnDisk`).
     type OnDisk: Pod;
@@ -134,6 +147,12 @@ pub trait BStackMoveExpr {
 /// plain `(rc)` block (inline refcount, [`crate::StrongRef`]) or an
 /// `(rc, weak)` block (control block, [`crate::StrongWeakRef`]). The child's own
 /// `#[bstack_block]` expansion picks the right implementation.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not a reference-counted block (`#[bstack_block(rc)]` / `(rc, weak)`)",
+    label = "not a shared block",
+    note = "`#[bstack_strong]` fields (and generic parameters used as them) require an \
+            `#[bstack_block(rc)]` or `#[bstack_block(rc, weak)]` type."
+)]
 pub trait BStackShared: BStackBlock {
     /// Drop one strong reference to a block of this type located at `data`,
     /// freeing it (and, for `(rc, weak)`, releasing the control block) when the
@@ -160,6 +179,12 @@ pub trait BStackShared: BStackBlock {
 /// `XOnDiskRef` control-block payload holding the `strong`/`weak` counters.
 /// Plain `#[bstack_block(rc)]` blocks do not implement it, so weak references to
 /// them are a compile error rather than a runtime hazard.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not a weak-observable block (`#[bstack_block(rc, weak)]`)",
+    label = "not a weakable block",
+    note = "`#[bstack_weak]` fields (and generic parameters used as them) require an \
+            `#[bstack_block(rc, weak)]` type; a plain `#[bstack_block(rc)]` is not weak-observable."
+)]
 pub trait BStackWeakable: BStackBlock {
     /// The on-disk control-block payload (the generated `XOnDiskRef`).
     type Control: Pod;

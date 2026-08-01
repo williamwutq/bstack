@@ -362,6 +362,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                 && let Type::Array(_) = velem
             {
                 let (dims, elem_ty, leaf_nullable) = array_shape(velem)?;
+                reject_nested_const_dims(&dims, &const_params, &field.ty)?;
                 let total = dims_prod(&dims);
                 let elem_ts = quote!(#elem_ty);
                 let size_elem = quote!(::core::mem::size_of::<
@@ -720,6 +721,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         // the inner vectors' element ownership, exactly like a scalar `Vec<T>`.
         if let Type::Array(_) = opt_inner {
             let (dims, leaf, leaf_nullable) = array_shape(opt_inner)?;
+            reject_nested_const_dims(&dims, &const_params, &field.ty)?;
             let leaf_vinfo = if is_str(leaf) {
                 Some(VecInfo {
                     elem: quote!(u8),
@@ -949,6 +951,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                 ));
             }
             let (dims, elem, elem_nullable) = array_shape(opt_inner)?;
+            reject_nested_const_dims(&dims, &const_params, &field.ty)?;
             let total = dims_prod(&dims);
 
             // `#[embed] [Child; N]` (or nested): N verbatim child on-disk forms
@@ -2102,15 +2105,41 @@ fn is_str(ty: &Type) -> bool {
 /// Whether `ty` mentions any of the given (generic type-parameter) identifiers
 /// anywhere in its token tree. Used to enforce that a generic parameter is only
 /// ever used in a `#[bstack_ref]` field.
+fn tokens_mention(ts: TokenStream, params: &[&Ident]) -> bool {
+    ts.into_iter().any(|t| match t {
+        proc_macro2::TokenTree::Ident(id) => params.iter().any(|p| **p == id),
+        proc_macro2::TokenTree::Group(g) => tokens_mention(g.stream(), params),
+        _ => false,
+    })
+}
+
 fn type_mentions_any(ty: &Type, params: &[&Ident]) -> bool {
-    fn walk(ts: TokenStream, params: &[&Ident]) -> bool {
-        ts.into_iter().any(|t| match t {
-            proc_macro2::TokenTree::Ident(id) => params.iter().any(|p| **p == id),
-            proc_macro2::TokenTree::Group(g) => walk(g.stream(), params),
-            _ => false,
-        })
+    tokens_mention(quote!(#ty), params)
+}
+
+/// Reject a *nested* inline reference array (`[[T; N]; M]`, …) whose flattened
+/// length would be a product `N * (M)` referencing a const parameter — Rust bars
+/// generic parameters in an array-length *operation* on stable (a single `[T; N]`
+/// with a direct const `N` is fine). POD arrays keep the nested type verbatim, so
+/// this applies only where the array is flattened. `dims` is outer→inner.
+fn reject_nested_const_dims(
+    dims: &[&Expr],
+    const_params: &[&Ident],
+    span: &Type,
+) -> syn::Result<()> {
+    if dims.len() > 1
+        && !const_params.is_empty()
+        && dims.iter().any(|d| tokens_mention(quote!(#d), const_params))
+    {
+        return Err(Error::new_spanned(
+            span,
+            "a nested array `[[T; N]; M]` with a const-parameter dimension is not supported: \
+             its flattened length would be a const expression (`N * M`), which stable Rust \
+             forbids from using a generic parameter. Use a single `[T; N]`, or make the \
+             dimensions concrete.",
+        ));
     }
-    walk(quote!(#ty), params)
+    Ok(())
 }
 
 /// The element type `T` of a `Vec<T>`, if `ty` is a `Vec`. Used to reject
