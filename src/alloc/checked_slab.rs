@@ -395,6 +395,7 @@ impl CheckedSlabBStackAllocator {
     }
 
     /// Return the usable bytes per slab block (the `data_size` passed to [`new`](Self::new)).
+    #[inline]
     pub fn data_size(&self) -> u64 {
         self.block_size - Self::OVERHEAD
     }
@@ -1233,10 +1234,12 @@ impl BStackAllocator for CheckedSlabBStackAllocator {
     type Error = io::Error;
     type Allocated<'a> = BStackOwnedSlice<'a, Self>;
 
+    #[inline]
     fn stack(&self) -> &BStack {
         &self.stack
     }
 
+    #[inline]
     fn into_stack(self) -> BStack {
         self.stack
     }

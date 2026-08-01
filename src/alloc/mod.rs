@@ -173,6 +173,7 @@ pub struct BStackAllocError<'a, A: BStackAllocator + 'a> {
 impl<'a, A: BStackAllocator + 'a> BStackAllocError<'a, A> {
     /// Construct an error that hands the still-valid original handle back to
     /// the caller.
+    #[inline]
     pub fn with_handle(source: A::Error, handle: A::Allocated<'a>) -> Self {
         Self {
             source,
@@ -182,6 +183,7 @@ impl<'a, A: BStackAllocator + 'a> BStackAllocError<'a, A> {
 
     /// Construct an error whose allocation was consumed or lost by the failed
     /// operation and cannot be returned.
+    #[inline]
     pub fn lost(source: A::Error) -> Self {
         Self {
             source,
@@ -190,6 +192,7 @@ impl<'a, A: BStackAllocator + 'a> BStackAllocError<'a, A> {
     }
 
     /// Consume the error and return the recovered handle, if any.
+    #[inline]
     pub fn into_handle(self) -> Option<A::Allocated<'a>> {
         self.handle
     }
@@ -208,6 +211,7 @@ impl<'a, A: BStackAllocator + 'a> fmt::Debug for BStackAllocError<'a, A> {
 }
 
 impl<'a, A: BStackAllocator + 'a> fmt::Display for BStackAllocError<'a, A> {
+    #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(&self.source, f)
     }
@@ -243,11 +247,13 @@ pub struct BStackBulkAllocError<'a, A: BStackAllocator + 'a> {
 
 impl<'a, A: BStackAllocator + 'a> BStackBulkAllocError<'a, A> {
     /// Construct an error carrying the handles still owned by the caller.
+    #[inline]
     pub fn with_handles(source: A::Error, handles: Vec<A::Allocated<'a>>) -> Self {
         Self { source, handles }
     }
 
     /// Consume the error and return the recovered handles.
+    #[inline]
     pub fn into_handles(self) -> Vec<A::Allocated<'a>> {
         self.handles
     }
@@ -265,6 +271,7 @@ impl<'a, A: BStackAllocator + 'a> fmt::Debug for BStackBulkAllocError<'a, A> {
 }
 
 impl<'a, A: BStackAllocator + 'a> fmt::Display for BStackBulkAllocError<'a, A> {
+    #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(&self.source, f)
     }
@@ -411,6 +418,7 @@ pub trait BStackAllocator: Sized {
     /// leaves the region still allocated, so implementations **must** return
     /// the handle in [`BStackAllocError::handle`] (`Some`) whenever it survives,
     /// reserving `None` for a genuinely lost allocation.
+    #[inline]
     fn dealloc<'a>(
         &'a self,
         _handle: Self::Allocated<'a>,
@@ -421,6 +429,7 @@ pub trait BStackAllocator: Sized {
     /// Return the current logical length of the backing stack payload.
     ///
     /// Delegates to [`BStack::len`].
+    #[inline]
     fn len(&self) -> io::Result<u64> {
         self.stack().len()
     }
@@ -428,6 +437,7 @@ pub trait BStackAllocator: Sized {
     /// Return `true` if the backing stack is empty.
     ///
     /// Delegates to [`BStack::is_empty`].
+    #[inline]
     fn is_empty(&self) -> io::Result<bool> {
         self.stack().is_empty()
     }
