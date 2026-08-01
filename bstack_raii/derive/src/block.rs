@@ -55,11 +55,29 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         ));
     }
 
+    // A generic block is supported only in the **layout-preserving** case: every
+    // type parameter must be used ONLY in `#[bstack_ref]` fields (a bare `u64`
+    // offset on disk), so `XOnDisk` stays independent of the parameters and
+    // teardown/clone need no recursion into them. The per-field check is below,
+    // once the fields are parsed; here we gate the coarse constraints.
+    let type_params: Vec<&Ident> = input.generics.type_params().map(|tp| &tp.ident).collect();
     if !input.generics.params.is_empty() {
-        return Err(Error::new_spanned(
-            &input.generics,
-            "#[bstack_block] does not support generic block types",
-        ));
+        for p in &input.generics.params {
+            if !matches!(p, syn::GenericParam::Type(_)) {
+                return Err(Error::new_spanned(
+                    p,
+                    "a generic #[bstack_block] currently supports only type parameters (no \
+                     lifetime or const generics)",
+                ));
+            }
+        }
+        if mode != Mode::Plain {
+            return Err(Error::new_spanned(
+                &input.generics,
+                "a generic #[bstack_block] currently supports plain mode only (not `rc` / \
+                 `rc, weak`)",
+            ));
+        }
     }
 
     // Normalize fields to `(name, field)`: named fields keep their name, a tuple
@@ -85,6 +103,39 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
     let vis = &input.vis;
     let on_disk = format_ident!("{}OnDisk", name);
     let control = format_ident!("{}OnDiskRef", name);
+
+    // Layout-preserving check: a type parameter may appear only in a
+    // `#[bstack_ref]` field (which lowers to a bare `u64` offset).
+    for (_, field) in &field_list {
+        if classify(field)? != Kind::Ref && type_mentions_any(&field.ty, &type_params) {
+            return Err(Error::new_spanned(
+                &field.ty,
+                "a generic type parameter may currently be used only in a `#[bstack_ref]` field \
+                 — it lowers to a bare `u64` offset, keeping the block's on-disk layout \
+                 independent of the type. An owned/strong/weak/embed/POD use would change the \
+                 layout or require recursing into the type, which is not yet supported.",
+            ));
+        }
+    }
+    // Generics threaded into the generated impls (with a `BStackBlock` bound
+    // added to every parameter), plus the handle's phantom marker over them.
+    // `impl_g`/`ty_g`/`where_g` carry the bound (for the bstack trait impls);
+    // `decl_g`/`decl_ty_g`/`decl_where` are the user's own (for the handle type
+    // and its `Clone`/`Copy`, which hold regardless of `T`).
+    let mut aug_generics = input.generics.clone();
+    for tp in aug_generics.type_params_mut() {
+        tp.bounds.push(syn::parse_quote!(::bstack_raii::BStackBlock));
+    }
+    let (impl_g, ty_g, where_g) = aug_generics.split_for_impl();
+    let (decl_g, decl_ty_g, decl_where) = input.generics.split_for_impl();
+    let (phantom_field, phantom_ctor): (TokenStream, TokenStream) = if type_params.is_empty() {
+        (quote!(), quote!())
+    } else {
+        (
+            quote!(, ::core::marker::PhantomData<fn() -> (#(#type_params,)*)>),
+            quote!(, ::core::marker::PhantomData),
+        )
+    };
 
     // On-disk fields: header, then the injected refcount/ctrl (if any), then user
     // fields lowered per annotation.
@@ -1461,6 +1512,17 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
     let ctrl_tag = build_tag(hash, &ctrl_prefix);
     let data_eightcc = eightcc_expr(&data_tag.bytes);
     let ctrl_eightcc = eightcc_expr(&ctrl_tag.bytes);
+    // For a generic block, fold each type argument's tag into the discriminant
+    // so distinct instantiations get distinct tags (the `eightcc()` body — always
+    // called at runtime — mixes them; the readable prefix stays the outer name's).
+    let data_eightcc = if type_params.is_empty() {
+        data_eightcc
+    } else {
+        let mixes = type_params
+            .iter()
+            .map(|p| quote!(.mix(<#p as ::bstack_raii::BStackCast>::eightcc())));
+        quote!(#data_eightcc #(#mixes)*)
+    };
 
     // The warnings use the `deprecated` mechanism, so a real `#[allow(deprecated)]`
     // on the struct also silences them (in addition to the `allow(...)` args).
@@ -1597,7 +1659,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         quote! {
             // Implemented on the block type (local downstream) so the orphan rule
             // is satisfied; `bstack_move!` selects it from the argument's type.
-            impl ::bstack_raii::BStackMove for #name {
+            impl #impl_g ::bstack_raii::BStackMove for #name #ty_g #where_g {
                 type Fields<'__mv, __A: ::bstack_raii::BStackOwnedSliceAllocator> =
                     ( #(#mv_types,)* );
                 fn bstack_move<'__mv, __A: ::bstack_raii::BStackOwnedSliceAllocator>(
@@ -1610,7 +1672,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                     let __stack = __alloc.stack();
                     let __range = ::bstack_raii::BStackBlock::range(&__inner);
                     let mut __buf = [0u8; ::core::mem::size_of::<#on_disk>()];
-                    let __r = unsafe { ::bstack_raii::BStackRef::<#name>::from_range(__range) };
+                    let __r = unsafe { ::bstack_raii::BStackRef::<Self>::from_range(__range) };
                     let __od: #on_disk = *__r.read_on_disk(__stack, &mut __buf)?;
                     #(#mv_caps)*
                     // Free the parent shell only; children stay live on disk.
@@ -1669,7 +1731,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         (children, into)
     };
     let clone_into_method = quote! {
-        impl #name {
+        impl #impl_g #name #ty_g #where_g {
             /// Read this block's OnDisk and return a deep-cloned copy: owned
             /// children cloned into `__plan`, shared children's refcounts bumped,
             /// embedded children folded in place. Does **not** allocate a block for
@@ -1705,7 +1767,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         quote! {
             #clone_into_method
 
-            impl ::bstack_raii::TryCloneIn for #name {
+            impl #impl_g ::bstack_raii::TryCloneIn for #name #ty_g #where_g {
                 fn try_clone_in<__A: ::bstack_raii::BStackOwnedSliceAllocator>(
                     &self,
                     allocator: &__A,
@@ -1731,9 +1793,26 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         clone_into_method
     };
 
+    // The handle: a `BStackRange` newtype (plus a phantom over the type
+    // parameters when generic). `Clone`/`Copy` hold regardless of `T` — for the
+    // generic case they're hand-written (no `T: Copy` bound) rather than derived.
+    let handle_def = if type_params.is_empty() {
+        quote! {
+            #[derive(::core::clone::Clone, ::core::marker::Copy)]
+            #vis struct #name(::bstack_raii::BStackRange);
+        }
+    } else {
+        quote! {
+            #vis struct #name #decl_g(::bstack_raii::BStackRange #phantom_field) #decl_where;
+            impl #decl_g ::core::clone::Clone for #name #decl_ty_g #decl_where {
+                fn clone(&self) -> Self { *self }
+            }
+            impl #decl_g ::core::marker::Copy for #name #decl_ty_g #decl_where {}
+        }
+    };
+
     Ok(quote! {
-        #[derive(::core::clone::Clone, ::core::marker::Copy)]
-        #vis struct #name(::bstack_raii::BStackRange);
+        #handle_def
 
         // Packed Pod wrappers for any POD tuple fields.
         #(#wrapper_defs)*
@@ -1756,23 +1835,23 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
             #( __assert_pod::<#pod_types>(); )*
         };
 
-        impl ::bstack_raii::BStackCast for #name {
+        impl #impl_g ::bstack_raii::BStackCast for #name #ty_g #where_g {
             fn eightcc() -> ::bstack_raii::EightCC {
                 #data_eightcc
             }
         }
 
-        impl ::bstack_raii::BStackBlock for #name {
+        impl #impl_g ::bstack_raii::BStackBlock for #name #ty_g #where_g {
             type OnDisk = #on_disk;
             fn from_range(range: ::bstack_raii::BStackRange) -> Self {
-                #name(range)
+                #name(range #phantom_ctor)
             }
             fn range(&self) -> ::bstack_raii::BStackRange {
                 self.0
             }
         }
 
-        impl #name {
+        impl #impl_g #name #ty_g #where_g {
             /// Free this block's owned children (recursively) given its range,
             /// **without** freeing the block itself — used when the block is
             /// `#[embed]`ded (its storage is part of its parent), and by
@@ -1792,7 +1871,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
             }
         }
 
-        impl ::bstack_raii::BStackDrop for #name {
+        impl #impl_g ::bstack_raii::BStackDrop for #name #ty_g #where_g {
             fn bstack_drop<__A: ::bstack_raii::BStackOwnedSliceAllocator>(
                 self,
                 allocator: &__A,
@@ -1802,7 +1881,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
             }
         }
 
-        impl #name {
+        impl #impl_g #name #ty_g #where_g {
             #(#accessors)*
             #(#setters)*
 
@@ -1843,6 +1922,20 @@ struct VecInfo {
 /// Whether `ty` is the `str` type.
 fn is_str(ty: &Type) -> bool {
     matches!(ty, Type::Path(tp) if tp.path.segments.last().is_some_and(|s| s.ident == "str"))
+}
+
+/// Whether `ty` mentions any of the given (generic type-parameter) identifiers
+/// anywhere in its token tree. Used to enforce that a generic parameter is only
+/// ever used in a `#[bstack_ref]` field.
+fn type_mentions_any(ty: &Type, params: &[&Ident]) -> bool {
+    fn walk(ts: TokenStream, params: &[&Ident]) -> bool {
+        ts.into_iter().any(|t| match t {
+            proc_macro2::TokenTree::Ident(id) => params.iter().any(|p| **p == id),
+            proc_macro2::TokenTree::Group(g) => walk(g.stream(), params),
+            _ => false,
+        })
+    }
+    walk(quote!(#ty), params)
 }
 
 /// The element type `T` of a `Vec<T>`, if `ty` is a `Vec`. Used to reject

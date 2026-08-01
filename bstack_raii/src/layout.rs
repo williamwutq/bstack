@@ -49,6 +49,38 @@ impl EightCC {
         }
         Self(out)
     }
+
+    /// Fold another tag into this one's non-readable (high-bit-set) bytes,
+    /// leaving the leading ASCII prefix untouched. A generic `#[bstack_block]`
+    /// uses this to give each instantiation a distinct-but-related tag — the
+    /// readable prefix stays the outer type's, while the type arguments perturb
+    /// the hash bytes so `Foo<A>` and `Foo<B>` never share a discriminant (which
+    /// would let `bstack_cast!` confuse them). Deterministic and associative
+    /// enough to compose for nested generics.
+    ///
+    /// Note: a fully-specified 8-byte explicit `tag = "…"` leaves no hash bytes,
+    /// so every instantiation shares it — don't pin an 8-byte tag on a generic.
+    pub const fn mix(self, other: EightCC) -> EightCC {
+        // A small FNV-1a digest of `other`'s bytes.
+        let mut d: u64 = 0xcbf2_9ce4_8422_2325;
+        let ob = other.0;
+        let mut i = 0;
+        while i < 8 {
+            d ^= ob[i] as u64;
+            d = d.wrapping_mul(0x0000_0100_0000_01b3);
+            i += 1;
+        }
+        let db = d.to_le_bytes();
+        let mut out = self.0;
+        let mut i = 0;
+        while i < 8 {
+            if out[i] & 0x80 != 0 {
+                out[i] = (out[i] ^ db[i]) | 0x80;
+            }
+            i += 1;
+        }
+        Self(out)
+    }
 }
 
 /// The header prefixing every on-disk block. 16 bytes.

@@ -3742,3 +3742,77 @@ fn macro_enum_pod_vec() {
     }
     e2.bstack_drop(&alloc).unwrap();
 }
+
+// --------------------------------------------------------------------------
+// Generic blocks (layout-preserving: type params only in #[bstack_ref] fields)
+// --------------------------------------------------------------------------
+
+#[bstack_block]
+struct RefBox<T> {
+    #[bstack_ref]
+    item: T,
+    tag: u64,
+}
+
+#[test]
+fn macro_generic_ref_box() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let leaf = MacroLeaf::new(&alloc, 42).unwrap();
+    let r = unsafe { BStackRef::from_range(leaf.handle().range()) };
+    let b = RefBox::<MacroLeaf>::new(&alloc, r, 7).unwrap();
+    assert_eq!(b.handle().tag(stack).unwrap(), 7);
+    assert_eq!(b.handle().item(stack).unwrap().val(stack).unwrap(), 42);
+
+    // Clone aliases the ref (same target block); the box itself is fresh.
+    let clone = b.try_clone_in(&alloc).unwrap();
+    assert_eq!(
+        clone.handle().item(stack).unwrap().range().start(),
+        b.handle().item(stack).unwrap().range().start()
+    );
+    assert_ne!(clone.handle().range().start(), b.handle().range().start());
+    clone.bstack_drop(&alloc).unwrap();
+
+    // The box references but does not own the leaf: dropping it leaves it alive.
+    b.bstack_drop(&alloc).unwrap();
+    assert_eq!(leaf.handle().val(stack).unwrap(), 42);
+    leaf.bstack_drop(&alloc).unwrap();
+}
+
+#[test]
+fn macro_generic_distinct_tags() {
+    // Each instantiation gets a distinct discriminant, so `bstack_cast!` can't
+    // confuse `RefBox<A>` with `RefBox<B>` (they have the same layout).
+    assert_ne!(
+        <RefBox<MacroLeaf> as BStackCast>::eightcc(),
+        <RefBox<MacroStrongChild> as BStackCast>::eightcc(),
+    );
+    // …and distinct from an unrelated block, and from the type argument itself.
+    assert_ne!(
+        <RefBox<MacroLeaf> as BStackCast>::eightcc(),
+        <MacroLeaf as BStackCast>::eightcc(),
+    );
+}
+
+#[test]
+fn macro_generic_move_cast() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+    let leaf = MacroLeaf::new(&alloc, 9).unwrap();
+    let r = unsafe { BStackRef::from_range(leaf.handle().range()) };
+    let b = RefBox::<MacroLeaf>::new(&alloc, r, 3).unwrap();
+
+    // bstack_cast!: an untyped slice back to the typed generic block (tag checked).
+    let sl = b.handle().as_slice(stack);
+    let back = bstack_cast!(sl as RefBox<MacroLeaf>).unwrap().expect("same tag");
+    assert_eq!(back.item(stack).unwrap().val(stack).unwrap(), 9);
+
+    // bstack_move!: hand out the ref + pod fields, freeing the box shell.
+    let (item, tag) = bstack_move!(b, &alloc).unwrap();
+    assert_eq!(tag, 3);
+    assert_eq!(item.into_range().start(), leaf.handle().range().start());
+    leaf.bstack_drop(&alloc).unwrap();
+}

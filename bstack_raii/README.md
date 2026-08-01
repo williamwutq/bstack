@@ -745,7 +745,15 @@ This also works for `#[bstack_enum]` — e.g. `#[bstack_enum(rc, tag = "ENMTAG")
   `Option<…>` forms.
 - **Requires a freeing allocator** that reserves offset 0 — not
   `LinearBStackAllocator` (see [Concepts](#concepts)).
-- **No generic block types**; non-`Pod` fields must carry an annotation.
+- **Generic block types** are supported only in the *layout-preserving* case: a
+  type parameter may appear **only** in `#[bstack_ref]` fields (scalar, `Vec<T>`,
+  `[T; N]`, …), which lower to a bare `u64` offset so `XOnDisk` stays independent
+  of the parameter — e.g. `#[bstack_block] struct RefBox<T> { #[bstack_ref] item:
+  T, tag: u64 }`. Each instantiation gets its own type tag (so `bstack_cast!`
+  can't confuse `RefBox<A>` with `RefBox<B>`). An owned/strong/weak/embed/POD use
+  of the parameter — which would change the layout or need recursion into the
+  type — is rejected; plain mode only (not `rc` / `rc, weak`). Non-`Pod` fields
+  must still carry an annotation.
 - **`Vec` / `Option` nesting** is capped at a single leaf / one `Option` layer
   (see [Field types](#field-types)); deeper nesting or a tuple element must be
   named as a `#[bstack_block]` / `#[bstack_enum]`.
