@@ -4107,3 +4107,80 @@ fn macro_generic_enum_strong() {
     assert_eq!(strong_of(stack, data), 1);
     drop(keep);
 }
+
+// --------------------------------------------------------------------------
+// Const generics: `[T; N]` / `[Pod; N]` with a generic `const N: usize`.
+// --------------------------------------------------------------------------
+
+#[bstack_block]
+struct RefArrN<T, const N: usize> {
+    #[bstack_ref]
+    arr: [T; N],
+    tag: u64,
+}
+
+#[bstack_block]
+struct OwnArrN<T, const N: usize> {
+    #[bstack_owned]
+    arr: [T; N],
+}
+
+#[bstack_block]
+struct PodArrN<const N: usize> {
+    xs: [u16; N],
+    tag: u32,
+}
+
+#[test]
+fn macro_generic_const_ref_array() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let leaves: Vec<_> = (0..3).map(|v| MacroLeaf::new(&alloc, v).unwrap()).collect();
+    let r = |i: usize| unsafe { BStackRef::from_range(leaves[i].handle().range()) };
+    let b = RefArrN::<MacroLeaf, 3>::new(&alloc, [r(0), r(1), r(2)], 9).unwrap();
+    assert_eq!(b.handle().tag(stack).unwrap(), 9);
+    let arr = b.handle().arr(stack).unwrap(); // [MacroLeaf; 3]
+    assert_eq!(arr[0].val(stack).unwrap(), 0);
+    assert_eq!(arr[2].val(stack).unwrap(), 2);
+
+    // Distinct N → distinct on-disk layout → distinct tags.
+    assert_ne!(
+        <RefArrN<MacroLeaf, 3> as BStackCast>::eightcc(),
+        <RefArrN<MacroLeaf, 4> as BStackCast>::eightcc(),
+    );
+
+    // A ref array owns nothing: dropping leaves the targets alive.
+    b.bstack_drop(&alloc).unwrap();
+    for l in leaves {
+        assert!(l.handle().val(stack).unwrap() < 3);
+        l.bstack_drop(&alloc).unwrap();
+    }
+}
+
+#[test]
+fn macro_generic_const_owned_pod_array() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    // Owned const array: deep-clone + teardown reuse the concrete paths.
+    let mk = |v| MacroLeaf::new(&alloc, v).unwrap();
+    let o = OwnArrN::<MacroLeaf, 2>::new(&alloc, [mk(10), mk(20)]).unwrap();
+    let a = o.handle().arr(stack).unwrap();
+    assert_eq!(a[1].val(stack).unwrap(), 20);
+    let clone = o.try_clone_in(&alloc).unwrap();
+    assert_ne!(
+        clone.handle().arr(stack).unwrap()[0].range().start(),
+        a[0].range().start()
+    );
+    clone.bstack_drop(&alloc).unwrap();
+    o.bstack_drop(&alloc).unwrap();
+
+    // POD const array.
+    let p = PodArrN::<4>::new(&alloc, [1u16, 2, 3, 4], 7).unwrap();
+    assert_eq!(p.handle().xs(stack).unwrap(), [1u16, 2, 3, 4]);
+    assert_eq!(p.handle().tag(stack).unwrap(), 7);
+    p.bstack_drop(&alloc).unwrap();
+}

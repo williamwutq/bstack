@@ -61,13 +61,17 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
     // teardown/clone need no recursion into them. The per-field check is below,
     // once the fields are parsed; here we gate the coarse constraints.
     let type_params: Vec<&Ident> = input.generics.type_params().map(|tp| &tp.ident).collect();
+    // Const parameters `const N: usize` are supported as array lengths (`[T; N]`);
+    // a direct const-param length is legal on stable, unlike an arbitrary const
+    // expression. Lifetimes are still rejected.
+    let const_params: Vec<&Ident> = input.generics.const_params().map(|cp| &cp.ident).collect();
     if !input.generics.params.is_empty() {
         for p in &input.generics.params {
-            if !matches!(p, syn::GenericParam::Type(_)) {
+            if matches!(p, syn::GenericParam::Lifetime(_)) {
                 return Err(Error::new_spanned(
                     p,
-                    "a generic #[bstack_block] currently supports only type parameters (no \
-                     lifetime or const generics)",
+                    "a generic #[bstack_block] currently supports type and const parameters, \
+                     not lifetimes",
                 ));
             }
         }
@@ -203,19 +207,37 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         .filter(|(_, u)| u.in_ondisk)
         .map(|(p, _)| p.clone())
         .collect();
+    // A const parameter appears only as an array length (`[T; N]`), which always
+    // sizes the `OnDisk`, so any const parameter used in a field is an `OnDisk`
+    // parameter.
+    let mut ondisk_const_idents: Vec<Ident> = Vec::new();
+    for cp in &const_params {
+        if field_list
+            .iter()
+            .any(|(_, f)| type_mentions_any(&f.ty, &[*cp]))
+        {
+            ondisk_const_idents.push((*cp).clone());
+        }
+    }
+    let ondisk_empty = ondisk_idents.is_empty() && ondisk_const_idents.is_empty();
     let ondisk_generics: syn::Generics = {
         let mut g = syn::Generics::default();
-        for tp in aug_generics.type_params() {
-            if ondisk_idents.contains(&tp.ident) {
-                // Inherits the `Pod`/`BStackBlock` + `'static` bounds from
-                // `aug_generics` above.
-                g.params.push(syn::GenericParam::Type(tp.clone()));
+        // Preserve declaration order (Rust requires types before consts). Inherits
+        // the `Pod`/`BStackBlock` + `'static` bounds from `aug_generics`.
+        for p in &aug_generics.params {
+            let keep = match p {
+                syn::GenericParam::Type(tp) => ondisk_idents.contains(&tp.ident),
+                syn::GenericParam::Const(cp) => ondisk_const_idents.contains(&cp.ident),
+                syn::GenericParam::Lifetime(_) => false,
+            };
+            if keep {
+                g.params.push(p.clone());
             }
         }
         g
     };
     let (od_impl_g, od_ty_g, od_where) = ondisk_generics.split_for_impl();
-    let on_disk_ty = if ondisk_idents.is_empty() {
+    let on_disk_ty = if ondisk_empty {
         quote!(#on_disk)
     } else {
         quote!(#on_disk #od_ty_g)
@@ -223,17 +245,22 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
     // For a struct *literal* `XOnDisk { .. }`: bare when non-generic (or when the
     // fields determine the parameters, as for a POD field), but an `#[embed]`
     // field is `<T>::OnDisk`, which does NOT determine `T` — so use a turbofish
-    // `XOnDisk::<T> { .. }` whenever generic.
-    let on_disk_ctor = if ondisk_idents.is_empty() {
+    // `XOnDisk::<T, N> { .. }` whenever generic.
+    let on_disk_ctor = if ondisk_empty {
         quote!(#on_disk)
     } else {
         quote!(#on_disk::#od_ty_g)
     };
-    let (phantom_field, phantom_ctor): (TokenStream, TokenStream) = if type_params.is_empty() {
+    let (phantom_field, phantom_ctor): (TokenStream, TokenStream) = if type_params.is_empty()
+        && const_params.is_empty()
+    {
         (quote!(), quote!())
     } else {
+        // Const parameters are held via `[(); N]` so they count as "used".
+        let const_markers = const_params.iter().map(|c| quote!([(); #c]));
         (
-            quote!(, ::core::marker::PhantomData<fn() -> (#(#type_params,)*)>),
+            quote!(, ::core::marker::PhantomData<
+                fn() -> (#(#type_params,)* #(#const_markers,)*)>),
             quote!(, ::core::marker::PhantomData),
         )
     };
@@ -1616,7 +1643,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
     // For a generic block, fold each type argument's tag into the discriminant
     // so distinct instantiations get distinct tags (the `eightcc()` body — always
     // called at runtime — mixes them; the readable prefix stays the outer name's).
-    let data_eightcc = if type_params.is_empty() {
+    let data_eightcc = if type_params.is_empty() && const_params.is_empty() {
         data_eightcc
     } else {
         // A block parameter has its own `eightcc`; a POD one does not, so fold in
@@ -1630,7 +1657,12 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                 quote!(.mix(<#p as ::bstack_raii::BStackCast>::eightcc()))
             }
         });
-        quote!(#data_eightcc #(#mixes)*)
+        // A const parameter changes the array width (the layout), so fold its value
+        // in — distinct `N` gives distinct tags.
+        let const_mixes = const_params.iter().map(|c| {
+            quote!(.mix(::bstack_raii::EightCC::new((#c as u64).to_le_bytes())))
+        });
+        quote!(#data_eightcc #(#mixes)* #(#const_mixes)*)
     };
 
     // The warnings use the `deprecated` mechanism, so a real `#[allow(deprecated)]`
@@ -1898,7 +1930,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
     // The handle: a `BStackRange` newtype (plus a phantom over the type
     // parameters when generic). `Clone`/`Copy` hold regardless of `T` — for the
     // generic case they're hand-written (no `T: Copy` bound) rather than derived.
-    let handle_def = if type_params.is_empty() {
+    let handle_def = if type_params.is_empty() && const_params.is_empty() {
         quote! {
             #[derive(::core::clone::Clone, ::core::marker::Copy)]
             #vis struct #name(::bstack_raii::BStackRange);
@@ -1917,9 +1949,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
     // derived `T: Copy` bound isn't implied by `T: BStackBlock`, though the fields
     // (`<T>::OnDisk` / `T: Pod`) always are — so hand-write `Clone`/`Copy` with the
     // `OnDisk`'s own bounds. A non-generic `OnDisk` keeps the derive.
-    let (on_disk_derive, on_disk_clonecopy): (TokenStream, TokenStream) = if ondisk_idents
-        .is_empty()
-    {
+    let (on_disk_derive, on_disk_clonecopy): (TokenStream, TokenStream) = if ondisk_empty {
         (
             quote!(#[derive(::core::clone::Clone, ::core::marker::Copy)]),
             quote!(),
@@ -1938,9 +1968,14 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
     // The `Pod` assertion can only name concrete field types — a generic parameter
     // in a POD field carries a `T: Pod` bound instead (and the `OnDisk`'s own `Pod`
     // impl checks the composite).
+    let all_param_idents: Vec<&Ident> = type_params
+        .iter()
+        .copied()
+        .chain(const_params.iter().copied())
+        .collect();
     let concrete_pod_types: Vec<&Type> = pod_types
         .iter()
-        .filter(|t| !type_mentions_any(t, &type_params))
+        .filter(|t| !type_mentions_any(t, &all_param_idents))
         .copied()
         .collect();
 
@@ -2559,8 +2594,14 @@ fn dims_prod(dims: &[&Expr]) -> TokenStream {
     if dims.is_empty() {
         return quote!(1usize);
     }
+    // A SINGLE dimension is emitted bare (`N`, not `(N)`): as an array length a
+    // bare const parameter is legal on stable, whereas any operation — including a
+    // parenthesised or multiplied one — is not. So `[T; N]` (single, const `N`)
+    // works; nested `[[T; N]; M]` folds to `N * (M)`, which is only legal when the
+    // dimensions are concrete (a const-generic nested array is a stable-Rust
+    // limitation, surfacing as a const-operation error).
     let first = dims[0];
-    let mut t = quote!((#first));
+    let mut t = quote!(#first);
     for d in &dims[1..] {
         t = quote!(#t * (#d));
     }
