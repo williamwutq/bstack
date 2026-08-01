@@ -14,9 +14,9 @@ use bstack::{
 
 use crate::layout::{self, BlockHeader};
 use crate::{
-    AutoDrop, BStackBlock, BStackCast, BStackCastAs, BStackCastInto, BStackDrop, BStackOwned,
-    BStackRc, BStackRef, BStackShared, BStackWeakable, EightCC, TryClone, TryCloneIn, alloc_block,
-    alloc_control, bstack_block, bstack_cast, bstack_enum, bstack_move, dealloc_range,
+    AutoDrop, BStackBlock, BStackBlockVec, BStackCast, BStackCastAs, BStackCastInto, BStackDrop,
+    BStackOwned, BStackRc, BStackRef, BStackShared, BStackWeakable, EightCC, TryClone, TryCloneIn,
+    alloc_block, alloc_control, bstack_block, bstack_cast, bstack_enum, bstack_move, dealloc_range,
 };
 
 // --------------------------------------------------------------------------
@@ -3526,4 +3526,172 @@ fn macro_weak_vec_of_array() {
     // Teardown releases each weak count.
     h.bstack_drop(&alloc).unwrap();
     drop(b);
+}
+
+// --------------------------------------------------------------------------
+// Vec<T> and Vec<[T; N]> in enum variants
+// --------------------------------------------------------------------------
+
+#[bstack_enum]
+enum OwnedVecEnum {
+    Empty,
+    #[bstack_owned]
+    Items(Vec<MacroLeaf>),
+}
+
+#[test]
+fn macro_enum_owned_vec() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let items = BStackBlockVec::from_handles(
+        &alloc,
+        vec![MacroLeaf::new(&alloc, 10).unwrap(), MacroLeaf::new(&alloc, 20).unwrap()],
+    )
+    .unwrap();
+    let e = OwnedVecEnum::new(&alloc, OwnedVecEnumData::Items(items)).unwrap();
+
+    match e.handle().read(&alloc).unwrap() {
+        OwnedVecEnumView::Items(v) => {
+            assert_eq!(v.len().unwrap(), 2);
+            assert_eq!(v.get(0).unwrap().unwrap().val(stack).unwrap(), 10);
+            assert_eq!(v.get(1).unwrap().unwrap().val(stack).unwrap(), 20);
+        }
+        _ => panic!("expected Items"),
+    }
+
+    // Clone deep-copies the vector + its children.
+    let clone = e.try_clone_in(&alloc).unwrap();
+    match clone.handle().read(&alloc).unwrap() {
+        OwnedVecEnumView::Items(v) => assert_eq!(v.get(1).unwrap().unwrap().val(stack).unwrap(), 20),
+        _ => panic!("expected Items"),
+    }
+    clone.bstack_drop(&alloc).unwrap();
+
+    // Move hands back the vector handle.
+    match bstack_move!(e, &alloc).unwrap() {
+        OwnedVecEnumData::Items(v) => {
+            assert_eq!(v.get(0).unwrap().unwrap().val(stack).unwrap(), 10);
+            v.bstack_drop().unwrap();
+        }
+        _ => panic!("expected Items"),
+    }
+}
+
+#[bstack_enum]
+enum RefVecArrEnum {
+    Empty,
+    #[bstack_ref]
+    Rows(Vec<[MacroLeaf; 2]>),
+}
+
+#[test]
+fn macro_enum_ref_vec_of_array() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let leaves: Vec<_> = (0..4).map(|v| MacroLeaf::new(&alloc, v).unwrap()).collect();
+    let r = |i: usize| unsafe { BStackRef::from_range(leaves[i].handle().range()) };
+    let e = RefVecArrEnum::new(
+        &alloc,
+        RefVecArrEnumData::Rows(vec![[r(0), r(1)], [r(2), r(3)]]),
+    )
+    .unwrap();
+
+    match e.handle().read(&alloc).unwrap() {
+        RefVecArrEnumView::Rows(v) => {
+            // Vec<[MacroLeaf; 2]>
+            assert_eq!(v.len(), 2);
+            assert_eq!(v[0][0].val(stack).unwrap(), 0);
+            assert_eq!(v[1][1].val(stack).unwrap(), 3);
+        }
+        _ => panic!("expected Rows"),
+    }
+
+    // A ref vec of arrays owns nothing: teardown leaves targets alive.
+    e.bstack_drop(&alloc).unwrap();
+    for l in leaves {
+        assert!(l.handle().val(stack).unwrap() < 4);
+        l.bstack_drop(&alloc).unwrap();
+    }
+}
+
+#[bstack_enum]
+enum OwnedVecArrEnum {
+    Empty,
+    #[bstack_owned]
+    Grid(Vec<[MacroLeaf; 2]>),
+}
+
+#[test]
+fn macro_enum_owned_vec_of_array() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let mk = |v| MacroLeaf::new(&alloc, v).unwrap();
+    let e = OwnedVecArrEnum::new(
+        &alloc,
+        OwnedVecArrEnumData::Grid(vec![[mk(1), mk(2)], [mk(3), mk(4)]]),
+    )
+    .unwrap();
+
+    match e.handle().read(&alloc).unwrap() {
+        OwnedVecArrEnumView::Grid(v) => {
+            assert_eq!(v.len(), 2);
+            assert_eq!(v[0][0].val(stack).unwrap(), 1);
+            assert_eq!(v[1][1].val(stack).unwrap(), 4);
+        }
+        _ => panic!("expected Grid"),
+    }
+
+    let clone = e.try_clone_in(&alloc).unwrap();
+    clone.bstack_drop(&alloc).unwrap();
+
+    // Move rebuilds Vec<[BStackOwned<MacroLeaf>; 2]> and frees the offset array.
+    match bstack_move!(e, &alloc).unwrap() {
+        OwnedVecArrEnumData::Grid(v) => {
+            assert_eq!(v[1][0].handle().val(stack).unwrap(), 3);
+            for row in v {
+                for m in row {
+                    m.bstack_drop(&alloc).unwrap();
+                }
+            }
+        }
+        _ => panic!("expected Grid"),
+    }
+}
+
+#[bstack_enum]
+enum StrongVecEnum {
+    Empty,
+    #[bstack_strong]
+    Items(Vec<MacroStrongChild>),
+}
+
+#[test]
+fn macro_enum_strong_vec_rc() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let a = MacroStrongChild::new(&alloc, 10).unwrap();
+    let a_keep = a.try_clone().unwrap(); // a strong = 2
+    let a_data = a_keep.handle().range().start();
+
+    let items = crate::BStackStrongVec::from_handles(&alloc, vec![a]).unwrap();
+    let e = StrongVecEnum::new(&alloc, StrongVecEnumData::Items(items)).unwrap();
+    assert_eq!(strong_of(stack, a_data), 2); // e + a_keep
+
+    // Clone bumps the strong count; its teardown restores it.
+    let clone = e.try_clone_in(&alloc).unwrap();
+    assert_eq!(strong_of(stack, a_data), 3);
+    clone.bstack_drop(&alloc).unwrap();
+    assert_eq!(strong_of(stack, a_data), 2);
+
+    e.bstack_drop(&alloc).unwrap();
+    assert_eq!(strong_of(stack, a_data), 1); // a_keep only
+    drop(a_keep);
 }

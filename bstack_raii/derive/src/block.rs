@@ -3412,6 +3412,316 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                 needs_payload = true;
                 let ty = &f.unnamed.first().unwrap().ty;
 
+                // Annotated **vector** variant `#[..] V(Vec<T>)` / `V(Vec<[T; N]>)`:
+                // a `VecDesc` (16 bytes) in the payload naming a data block — the
+                // per-variant mirror of a `#[bstack_owned/strong/weak/ref] Vec<..>`
+                // struct field. A `Vec<[T; N]>` stores its offsets FLAT (like the
+                // struct case), reshaped to `Vec<[[T;..];..]>` on read.
+                if vec_field(ty).is_some() {
+                    check_container_nesting(ty)?;
+                    if vec_field(ty).is_some_and(|vi| vi.is_string) {
+                        return Err(Error::new_spanned(
+                            ty,
+                            "`String` is always POD and is not supported as an annotated \
+                             enum variant",
+                        ));
+                    }
+                    if kind == Kind::Embed {
+                        return Err(Error::new_spanned(
+                            ty,
+                            "cannot #[embed] a `Vec`; embed a `#[bstack_block]` type",
+                        ));
+                    }
+                    needs_payload = true;
+                    payload_sizes.push(quote!(::core::mem::size_of::<::bstack_raii::VecDesc>()));
+                    let is_weak = kind == Kind::Weak;
+                    let vec_ty = match kind {
+                        Kind::Owned => quote!(BStackBlockVec),
+                        Kind::Strong => quote!(BStackStrongVec),
+                        Kind::Weak => quote!(BStackWeakVec),
+                        Kind::Ref => quote!(BStackRefVec),
+                        _ => unreachable!(),
+                    };
+                    let read_desc = quote!(::bstack_raii::bytemuck::pod_read_unaligned::<
+                        ::bstack_raii::VecDesc>(&__pl[..16]));
+
+                    // Shared teardown / clone (offset-agnostic: a `Vec<[T;N]>` stores
+                    // its offsets FLAT, so the per-offset lifecycle is identical to a
+                    // scalar block vector). `#elem` is the leaf block type below.
+                    let velem = vec_inner(ty).unwrap();
+                    let (dims, elem, leaf_nullable) = if let Type::Array(_) = velem {
+                        array_shape(velem)?
+                    } else {
+                        (Vec::new(), velem, false)
+                    };
+                    let is_array = !dims.is_empty();
+                    let size_elem = quote!(::core::mem::size_of::<
+                        <#elem as ::bstack_raii::BStackBlock>::OnDisk>() as u64);
+
+                    // The data / view enums must carry `<'__e, __A>` only when a
+                    // variant's stored handle actually borrows the allocator. Scalar
+                    // vecs always do (the `BStack*Vec` handle); an array's owning
+                    // handle does only for strong/weak, and its view only for weak.
+                    if !is_array || matches!(kind, Kind::Strong | Kind::Weak) {
+                        has_shared = true;
+                    }
+                    if !is_array || is_weak {
+                        has_weak = true;
+                    }
+
+                    // ---- Teardown (shared) ----
+                    drop_arms.push(quote! {
+                        #disc => {
+                            ::bstack_raii::#vec_ty::<#elem, __A>::from_desc(#read_desc, allocator)
+                                .bstack_drop()?;
+                        }
+                    });
+                    // ---- Clone (shared) ----
+                    let clone_expr = match kind {
+                        Kind::Owned => quote!(
+                            ::bstack_raii::BStackBlockVec::<#elem, __A>::from_desc(__srcdesc, allocator)
+                                .clone_into(__plan, |__er, __p| {
+                                    <#elem as ::bstack_raii::BStackBlock>::from_range(__er)
+                                        .__bstack_clone_into(allocator, __p)
+                                })?),
+                        Kind::Strong => quote!(
+                            ::bstack_raii::BStackStrongVec::<#elem, __A>::from_desc(__srcdesc, allocator)
+                                .clone_into(__plan)?),
+                        Kind::Weak => quote!(
+                            ::bstack_raii::BStackWeakVec::<#elem, __A>::from_desc(__srcdesc, allocator)
+                                .clone_into(__plan)?),
+                        Kind::Ref => quote!(
+                            ::bstack_raii::BStackRefVec::<#elem, __A>::from_desc(__srcdesc, allocator)
+                                .clone_into(__plan)?),
+                        _ => unreachable!(),
+                    };
+                    clone_arms.push(quote! {
+                        #disc => {
+                            let __srcdesc = #read_desc;
+                            let __newdesc = #clone_expr;
+                            __pl[..16].copy_from_slice(
+                                ::bstack_raii::bytemuck::bytes_of(&__newdesc));
+                        }
+                    });
+
+                    if !is_array {
+                        // ---- Scalar `Vec<T>`: data = view = the vec handle ----
+                        data_variants
+                            .push(quote!(#vname(::bstack_raii::#vec_ty<'__e, #elem, __A>),));
+                        view_variants
+                            .push(quote!(#vname(::bstack_raii::#vec_ty<'__e, #elem, __A>),));
+                        new_arms.push(quote! {
+                            #data::#vname(__v) => {
+                                let __desc = __v.descriptor();
+                                let mut __pl = [0u8; Self::__PAYLOAD];
+                                __pl[..16].copy_from_slice(
+                                    ::bstack_raii::bytemuck::bytes_of(&__desc));
+                                (#disc, __pl)
+                            }
+                        });
+                        read_arms.push(quote! {
+                            #disc => #view::#vname(
+                                ::bstack_raii::#vec_ty::<#elem, __A>::from_desc(
+                                    #read_desc, allocator)),
+                        });
+                        move_arms.push(quote! {
+                            #disc => #data::#vname(
+                                ::bstack_raii::#vec_ty::<#elem, __A>::from_desc(
+                                    #read_desc, __alloc)),
+                        });
+                        continue;
+                    }
+
+                    // ---- `Vec<[T; N]>` (array element): flat storage, reshaped ----
+                    let total = dims_prod(&dims);
+                    let ctrl_ty = quote!(<#elem as ::bstack_raii::BStackWeakable>::Control);
+                    let ctrl_size = quote!(::core::mem::size_of::<
+                        <#elem as ::bstack_raii::BStackWeakable>::Control>() as u64);
+
+                    // View leaf + per-leaf read from a chunk `__grp[k]`.
+                    let view_leaf = if is_weak {
+                        quote!(::core::option::Option<
+                            ::bstack_raii::BStackRc<'__e, #elem, __A>>)
+                    } else if leaf_nullable {
+                        quote!(::core::option::Option<#elem>)
+                    } else {
+                        quote!(#elem)
+                    };
+                    let view_read = |k: &Ident| {
+                        if is_weak {
+                            quote!({
+                                let __o = __grp[#k];
+                                if __o == 0 { ::core::option::Option::None } else {
+                                    let __ctrl = unsafe {
+                                        ::bstack_raii::BStackRef::<#ctrl_ty>::from_range(
+                                            ::bstack_raii::BStackRange::new(__o, #ctrl_size)) };
+                                    let __wk = unsafe {
+                                        ::bstack_raii::BStackWeak::<#elem, __A>::from_raw(
+                                            __ctrl, allocator) };
+                                    let __up = __wk.upgrade()?;
+                                    let _ = __wk.into_raw();
+                                    __up
+                                }
+                            })
+                        } else if leaf_nullable {
+                            quote!({
+                                let __o = __grp[#k];
+                                if __o == 0 { ::core::option::Option::None } else {
+                                    ::core::option::Option::Some(
+                                        <#elem as ::bstack_raii::BStackBlock>::from_range(
+                                            ::bstack_raii::BStackRange::new(__o, #size_elem)))
+                                }
+                            })
+                        } else {
+                            quote!(<#elem as ::bstack_raii::BStackBlock>::from_range(
+                                ::bstack_raii::BStackRange::new(__grp[#k], #size_elem)))
+                        }
+                    };
+                    let view_build = nested_build(&dims, &view_leaf, &view_read);
+                    let view_ret = nested_ty(&dims, &view_leaf);
+                    view_variants.push(quote!(#vname(::std::vec::Vec<#view_ret>),));
+
+                    // Owning-handle leaf + per-leaf reconstruction for `new`/`move`.
+                    let own_leaf_base = match kind {
+                        Kind::Owned => quote!(::bstack_raii::BStackOwned<#elem>),
+                        Kind::Strong => quote!(::bstack_raii::BStackRc<'__e, #elem, __A>),
+                        Kind::Weak => quote!(::bstack_raii::BStackWeak<'__e, #elem, __A>),
+                        Kind::Ref => quote!(::bstack_raii::BStackRef<#elem>),
+                        _ => unreachable!(),
+                    };
+                    let own_leaf = if leaf_nullable {
+                        quote!(::core::option::Option<#own_leaf_base>)
+                    } else {
+                        own_leaf_base.clone()
+                    };
+                    let data_ty = nested_ty(&dims, &own_leaf);
+                    data_variants.push(quote!(#vname(::std::vec::Vec<#data_ty>),));
+
+                    // `new`: flatten `Vec<[[Handle;..];..]>` → flat offsets.
+                    let off_of = |h: &Ident| match kind {
+                        Kind::Owned => quote!({
+                            let __h = #h.into_inner();
+                            ::bstack_raii::BStackBlock::range(&__h).start()
+                        }),
+                        Kind::Strong => quote!({
+                            let (__d, _c) = #h.into_raw();
+                            __d.into_range().start()
+                        }),
+                        Kind::Weak => quote!(#h.into_raw().into_range().start()),
+                        Kind::Ref => quote!(#h.into_range().start()),
+                        _ => unreachable!(),
+                    };
+                    let leaf_write = |_k: &Ident, leaf: &Ident| {
+                        if leaf_nullable {
+                            let hh = format_ident!("__h");
+                            let off = off_of(&hh);
+                            quote!(__flat.push(match #leaf {
+                                ::core::option::Option::Some(#hh) => #off,
+                                ::core::option::Option::None => 0u64,
+                            });)
+                        } else {
+                            let off = off_of(leaf);
+                            quote!(__flat.push(#off);)
+                        }
+                    };
+                    let consume_one = nested_consume(&dims, &quote!(__a), &leaf_write);
+                    new_arms.push(quote! {
+                        #data::#vname(__list) => {
+                            let mut __flat: ::std::vec::Vec<u64> = ::std::vec::Vec::new();
+                            for __a in __list {
+                                #consume_one
+                            }
+                            let __desc = ::bstack_raii::BStackVec::<u64, __A>::from_slice(
+                                allocator, &__flat)?.descriptor();
+                            let mut __pl = [0u8; Self::__PAYLOAD];
+                            __pl[..16].copy_from_slice(::bstack_raii::bytemuck::bytes_of(&__desc));
+                            (#disc, __pl)
+                        }
+                    });
+
+                    // `read`: flat offsets → chunk → reshape to `Vec<[[View;..];..]>`.
+                    read_arms.push(quote! {
+                        #disc => {
+                            let __flat = ::bstack_raii::BStackVec::<u64, __A>::from_desc(
+                                #read_desc, allocator).to_vec()?;
+                            let mut __out = ::std::vec::Vec::with_capacity(__flat.len() / (#total));
+                            for __grp in __flat.chunks(#total) {
+                                __out.push(#view_build);
+                            }
+                            #view::#vname(__out)
+                        }
+                    });
+
+                    // `move`: reshape to nested owning handles, then free the flat
+                    // offset-array block (children now owned by the handles).
+                    let move_read = |k: &Ident| {
+                        let one = match kind {
+                            Kind::Owned => quote!(unsafe {
+                                ::bstack_raii::BStackOwned::from_raw(
+                                    <#elem as ::bstack_raii::BStackBlock>::from_range(
+                                        ::bstack_raii::BStackRange::new(__o, #size_elem)))
+                            }),
+                            Kind::Ref => quote!(unsafe {
+                                ::bstack_raii::BStackRef::<#elem>::from_range(
+                                    ::bstack_raii::BStackRange::new(__o, #size_elem))
+                            }),
+                            Kind::Strong => quote!({
+                                let __data = unsafe {
+                                    ::bstack_raii::BStackRef::<#elem>::from_range(
+                                        ::bstack_raii::BStackRange::new(__o, #size_elem)) };
+                                let (__d, __c) =
+                                    <#elem as ::bstack_raii::BStackShared>::strong_parts(__data, __alloc)?;
+                                unsafe { ::bstack_raii::BStackRc::from_raw(__d, __c, __alloc) }
+                            }),
+                            Kind::Weak => quote!({
+                                let __ctrl = unsafe {
+                                    ::bstack_raii::BStackRef::<#ctrl_ty>::from_range(
+                                        ::bstack_raii::BStackRange::new(__o, #ctrl_size)) };
+                                unsafe { ::bstack_raii::BStackWeak::from_raw(__ctrl, __alloc) }
+                            }),
+                            _ => unreachable!(),
+                        };
+                        if leaf_nullable {
+                            quote!({
+                                let __o = __grp[#k];
+                                if __o == 0 { ::core::option::Option::None }
+                                else { ::core::option::Option::Some(#one) }
+                            })
+                        } else {
+                            quote!({ let __o = __grp[#k]; #one })
+                        }
+                    };
+                    // The move fn's lifetime is `'__mv`, not the data enum's `'__e`,
+                    // so `try_from::<[Handle; N]>` inside the reshape must name `'__mv`.
+                    let own_leaf_base_mv = match kind {
+                        Kind::Owned => quote!(::bstack_raii::BStackOwned<#elem>),
+                        Kind::Strong => quote!(::bstack_raii::BStackRc<'__mv, #elem, __A>),
+                        Kind::Weak => quote!(::bstack_raii::BStackWeak<'__mv, #elem, __A>),
+                        Kind::Ref => quote!(::bstack_raii::BStackRef<#elem>),
+                        _ => unreachable!(),
+                    };
+                    let own_leaf_mv = if leaf_nullable {
+                        quote!(::core::option::Option<#own_leaf_base_mv>)
+                    } else {
+                        own_leaf_base_mv.clone()
+                    };
+                    let move_build = nested_build(&dims, &own_leaf_mv, &move_read);
+                    move_arms.push(quote! {
+                        #disc => {
+                            let __flat = ::bstack_raii::BStackVec::<u64, __A>::from_desc(
+                                #read_desc, __alloc).to_vec()?;
+                            let mut __out = ::std::vec::Vec::with_capacity(__flat.len() / (#total));
+                            for __grp in __flat.chunks(#total) {
+                                __out.push(#move_build);
+                            }
+                            ::bstack_raii::BStackVec::<u64, __A>::from_desc(#read_desc, __alloc)
+                                .bstack_drop()?;
+                            #data::#vname(__out)
+                        }
+                    });
+                    continue;
+                }
+
                 // Annotated **array** variant `#[..] V([T; N])`: N block references
                 // stored inline in the payload as `[u64; N]` (N*8 bytes), the
                 // per-element mirror of a `#[bstack_owned/strong/weak/ref] V(T)`.
