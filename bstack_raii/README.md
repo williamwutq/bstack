@@ -36,6 +36,7 @@ object model on top.
   - [Nullable fields: `Option`](#nullable-fields-option)
   - [Enums: `#[bstack_enum]`](#enums-bstack_enum)
   - [Field types](#field-types)
+  - [Generic blocks](#generic-blocks)
 - [Moving out: `bstack_move!`](#moving-out-bstack_move)
 - [Cloning: `TryCloneIn` / `TryClone`](#cloning-tryclonein--tryclone)
 - [Casting: `bstack_cast!`](#casting-bstack_cast)
@@ -580,6 +581,66 @@ In the same spirit, a field written `&T` is coerced to owned `T` (and `&str` to
 you're nudged to write the owned type. Silence it with
 `#[bstack_block(allow(coerced_ref))]`.
 
+### Generic blocks
+
+A `#[bstack_block]` / `#[bstack_enum]` may be **generic** — over type parameters
+(and, for arrays, `const` parameters). Each concrete instantiation is its own
+block type, with its own `XOnDisk` layout and its own [type tag](#type-tags-eightcc).
+
+```rust
+#[bstack_block]
+struct Node<T> {
+    #[bstack_owned] child: T,          // owns a child of any block type
+    #[bstack_ref]   refs:  [T; 3],     // an array of references to T
+    weight: u32,
+}
+
+#[bstack_block]
+struct Buf<const N: usize> { data: [u16; N], len: u32 }   // const-length POD array
+
+let n = Node::<Leaf>::new(&alloc, leaf, [r0, r1, r2], 5)?;
+let b = Buf::<8>::new(&alloc, [0; 8], 0)?;
+```
+
+A type parameter works in **every** field shape it makes sense in:
+
+- **Reference kinds** — `#[bstack_owned/strong/weak/ref]` (scalar, `Vec<T>`,
+  `[T; N]`, `Vec<[T; N]>`, …): the on-disk form is a bare `u64` offset, so the
+  layout is independent of `T`. The parameter is auto-bounded `BStackBlock` (plus
+  `BStackShared` / `BStackWeakable` for a `#[bstack_strong]` / `#[bstack_weak]`
+  use).
+- **Inline kinds** — a POD field (`item: T`, bounded `T: Pod`) or `#[embed] item:
+  T` (bounded `BStackBlock`): here `T` is stored *inline*, so `XOnDisk` becomes
+  generic over it. A parameter can't be used **both** as POD and as a reference —
+  those are incompatible bounds, and the macro says so.
+- **`const N`** in an array length — `[T; N]` (single dimension). A nested
+  `[[T; N]; M]` with a const dimension is rejected (its flattened length would be
+  the const expression `N * M`, which stable Rust bars a generic parameter from);
+  make one dimension concrete or use a single array.
+
+Each instantiation folds its arguments into the tag, so
+[`bstack_cast!`](#casting-bstack_cast) can't confuse `Node<A>` with `Node<B>`, or
+`Buf<8>` with `Buf<16>`. A generic **enum** is supported in the layout-preserving
+case (type parameters only in reference variants — a POD/`#[embed]` variant
+storing `T` inline would make the payload width depend on it):
+
+```rust
+#[bstack_enum]
+enum Tree<T> {
+    Leaf(u32),
+    #[bstack_owned] Branch(T),
+}
+```
+
+When a *concrete* argument violates a rule the macro couldn't see through the
+parameter — instantiating `Node<Vec<u32>>`, say — the failing trait bound carries
+a directed message (`` `Vec<u32>` is not a `#[bstack_block]` type … a nested
+`Vec`/`Option` or a tuple needs its own named `#[bstack_block]` wrapper``) via
+`#[diagnostic::on_unimplemented]`.
+
+Currently unsupported (a clear compile error): lifetime parameters, a generic
+block in `rc` / `rc, weak` mode, and const parameters in a generic *enum*.
+
 ## Moving out: `bstack_move!`
 
 `bstack_move!` destructures a handle, transferring each field/variant out and
@@ -745,18 +806,10 @@ This also works for `#[bstack_enum]` — e.g. `#[bstack_enum(rc, tag = "ENMTAG")
   `Option<…>` forms.
 - **Requires a freeing allocator** that reserves offset 0 — not
   `LinearBStackAllocator` (see [Concepts](#concepts)).
-- **Generic block types** are supported in the *layout-preserving* case: a type
-  parameter may appear in `#[bstack_owned]` / `#[bstack_strong]` / `#[bstack_weak]`
-  / `#[bstack_ref]` fields (scalar, `Vec<T>`, `[T; N]`, …), each a bare `u64`
-  offset so `XOnDisk` stays independent of the parameter and its teardown/clone
-  recurse through traits — e.g. `#[bstack_block] struct OwnedBox<T> {
-  #[bstack_owned] item: T, tag: u64 }`. The parameter is bounded `BStackBlock`
-  (plus `BStackShared` / `BStackWeakable` for strong / weak uses); each
-  instantiation gets its own type tag (so `bstack_cast!` can't confuse
-  `OwnedBox<A>` with `OwnedBox<B>`). An **embed / POD** use — which stores the
-  type *inline*, changing the layout — is rejected for now, as are lifetime /
-  const parameters and `rc` / `rc, weak` mode. Non-`Pod` fields must still carry
-  an annotation.
+- **[Generic blocks](#generic-blocks)** work over type parameters (in every field
+  kind — reference, POD, and `#[embed]`) and `const` array lengths; the exceptions
+  are lifetime parameters, `rc` / `rc, weak` mode, and const parameters in a
+  generic enum. Non-`Pod` fields must still carry an annotation.
 - **`Vec` / `Option` nesting** is capped at a single leaf / one `Option` layer
   (see [Field types](#field-types)); deeper nesting or a tuple element must be
   named as a `#[bstack_block]` / `#[bstack_enum]`.
