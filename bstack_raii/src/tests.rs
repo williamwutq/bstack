@@ -3871,3 +3871,86 @@ fn macro_generic_weak_box() {
     assert!(b.handle().item(&alloc).unwrap().is_none());
     b.bstack_drop(&alloc).unwrap();
 }
+
+#[bstack_block]
+struct OwnedBox<T> {
+    #[bstack_owned]
+    item: T,
+    tag: u64,
+}
+
+#[test]
+fn macro_generic_owned_box() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let leaf = MacroLeaf::new(&alloc, 42).unwrap();
+    let leaf_off = leaf.handle().range().start();
+    let b = OwnedBox::<MacroLeaf>::new(&alloc, leaf, 7).unwrap();
+    assert_eq!(b.handle().tag(stack).unwrap(), 7);
+    assert_eq!(b.handle().item(stack).unwrap().val(stack).unwrap(), 42);
+
+    // Deep clone: the owned child is a FRESH block (distinct offset), same value.
+    let clone = b.try_clone_in(&alloc).unwrap();
+    let citem = clone.handle().item(stack).unwrap();
+    assert_eq!(citem.val(stack).unwrap(), 42);
+    assert_ne!(citem.range().start(), b.handle().item(stack).unwrap().range().start());
+    clone.bstack_drop(&alloc).unwrap();
+    // Original child survives the clone's teardown.
+    assert_eq!(b.handle().item(stack).unwrap().val(stack).unwrap(), 42);
+
+    // Dropping the box frees its owned child; the slot is reclaimable.
+    b.bstack_drop(&alloc).unwrap();
+    let leaf_size = size_of::<<MacroLeaf as BStackBlock>::OnDisk>() as u64;
+    let reused = alloc_block(&alloc, MacroLeaf::eightcc(), leaf_size).unwrap();
+    assert_eq!(reused.start(), leaf_off);
+    unsafe { dealloc_range(&alloc, reused).unwrap() };
+}
+
+#[bstack_block]
+struct OwnsEnumG<T> {
+    #[bstack_owned]
+    e: T,
+    n: u32,
+}
+
+// Generic owned Vec / array compile (deep-clone/teardown reuse the concrete paths).
+#[bstack_block]
+struct OwnedVecG<T> {
+    #[bstack_owned]
+    items: Vec<T>,
+}
+#[bstack_block]
+struct OwnedArrG<T> {
+    #[bstack_owned]
+    items: [T; 2],
+}
+
+#[test]
+fn macro_generic_owns_enum() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+    // ArrEnum::Leaves owns two MacroLeaf children.
+    let e = ArrEnum::new(
+        &alloc,
+        ArrEnumData::Leaves([
+            MacroLeaf::new(&alloc, 1).unwrap(),
+            MacroLeaf::new(&alloc, 2).unwrap(),
+        ]),
+    )
+    .unwrap();
+    let b = OwnsEnumG::<ArrEnum>::new(&alloc, e, 9).unwrap();
+
+    // Deep clone must recurse into the owned enum's OWN owned children — which
+    // works only because the enum's clone hook is a `BStackBlock` trait method
+    // (reachable through the generic `T` bound), not a generated inherent method.
+    let clone = b.try_clone_in(&alloc).unwrap();
+    match clone.handle().e(stack).unwrap().read(&alloc).unwrap() {
+        ArrEnumView::Leaves(a) => assert_eq!(a[1].val(stack).unwrap(), 2),
+        _ => panic!("expected Leaves"),
+    }
+    clone.bstack_drop(&alloc).unwrap();
+    b.bstack_drop(&alloc).unwrap();
+}

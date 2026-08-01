@@ -746,17 +746,17 @@ This also works for `#[bstack_enum]` — e.g. `#[bstack_enum(rc, tag = "ENMTAG")
 - **Requires a freeing allocator** that reserves offset 0 — not
   `LinearBStackAllocator` (see [Concepts](#concepts)).
 - **Generic block types** are supported in the *layout-preserving* case: a type
-  parameter may appear in `#[bstack_ref]` / `#[bstack_strong]` / `#[bstack_weak]`
-  fields (scalar, `Vec<T>`, `[T; N]`, …), each a bare `u64` offset so `XOnDisk`
-  stays independent of the parameter and its teardown/clone recurse through
-  traits — e.g. `#[bstack_block] struct RefBox<T> { #[bstack_ref] item: T, tag:
-  u64 }`. The parameter is bounded `BStackBlock` (plus `BStackShared` /
-  `BStackWeakable` for strong / weak uses); each instantiation gets its own type
-  tag (so `bstack_cast!` can't confuse `RefBox<A>` with `RefBox<B>`). An
-  **owned / embed / POD** use of the parameter — which changes the on-disk layout
-  or needs recursion into the type — is rejected for now, as are lifetime / const
-  parameters and `rc` / `rc, weak` mode. Non-`Pod` fields must still carry an
-  annotation.
+  parameter may appear in `#[bstack_owned]` / `#[bstack_strong]` / `#[bstack_weak]`
+  / `#[bstack_ref]` fields (scalar, `Vec<T>`, `[T; N]`, …), each a bare `u64`
+  offset so `XOnDisk` stays independent of the parameter and its teardown/clone
+  recurse through traits — e.g. `#[bstack_block] struct OwnedBox<T> {
+  #[bstack_owned] item: T, tag: u64 }`. The parameter is bounded `BStackBlock`
+  (plus `BStackShared` / `BStackWeakable` for strong / weak uses); each
+  instantiation gets its own type tag (so `bstack_cast!` can't confuse
+  `OwnedBox<A>` with `OwnedBox<B>`). An **embed / POD** use — which stores the
+  type *inline*, changing the layout — is rejected for now, as are lifetime /
+  const parameters and `rc` / `rc, weak` mode. Non-`Pod` fields must still carry
+  an annotation.
 - **`Vec` / `Option` nesting** is capped at a single leaf / one `Option` layer
   (see [Field types](#field-types)); deeper nesting or a tuple element must be
   named as a `#[bstack_block]` / `#[bstack_enum]`.

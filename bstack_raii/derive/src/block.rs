@@ -120,7 +120,9 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
             continue;
         }
         match kind {
-            Kind::Ref => {}
+            // ref / owned lower to a `u64` offset and recurse through traits
+            // (`BStackDrop`, the clone hooks on `BStackBlock`) — base bound only.
+            Kind::Ref | Kind::Owned => {}
             Kind::Strong | Kind::Weak => {
                 for (p, is_strong, is_weak) in param_extra.iter_mut() {
                     if type_mentions_any(&field.ty, &[p]) {
@@ -133,9 +135,9 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                 return Err(Error::new_spanned(
                     &field.ty,
                     "a generic type parameter may currently be used only in a `#[bstack_ref]` / \
-                     `#[bstack_strong]` / `#[bstack_weak]` field — each a bare `u64` offset that \
-                     keeps the block's on-disk layout independent of the type. An owned use needs \
-                     a clone-recursion change, and embed/POD change the layout — not yet \
+                     `#[bstack_owned]` / `#[bstack_strong]` / `#[bstack_weak]` field — each a bare \
+                     `u64` offset that keeps the block's on-disk layout independent of the type. \
+                     An embed / POD use stores the type inline, changing the layout — not yet \
                      supported.",
                 ));
             }
@@ -1762,48 +1764,40 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         };
         (children, into)
     };
-    let clone_into_method = quote! {
-        impl #impl_g #name #ty_g #where_g {
-            /// Read this block's OnDisk and return a deep-cloned copy: owned
-            /// children cloned into `__plan`, shared children's refcounts bumped,
-            /// embedded children folded in place. Does **not** allocate a block for
-            /// `self` — used to fold an `#[embed]`ded child inline into its parent's
-            /// clone, and by `__bstack_clone_into` before the self-allocation.
-            #[doc(hidden)]
-            #[allow(unused_variables)]
-            #vis fn __bstack_clone_children_inplace<__A: ::bstack_raii::BStackOwnedSliceAllocator>(
-                &self,
-                allocator: &__A,
-                __plan: &mut ::bstack_raii::ClonePlan,
-            ) -> ::std::io::Result<#on_disk> {
-                #clone_children_body
-            }
-
-            /// Deep-clone this block's subtree into `__plan`: allocate a fresh
-            /// destination block, recurse into owned children (bumping shared
-            /// children's refcounts), and stage the destination payload —
-            /// returning the new block's range. Writes are staged, not committed;
-            /// the caller commits `__plan` once.
-            #[doc(hidden)]
-            #[allow(unused_variables)]
-            #vis fn __bstack_clone_into<__A: ::bstack_raii::BStackOwnedSliceAllocator>(
-                &self,
-                allocator: &__A,
-                __plan: &mut ::bstack_raii::ClonePlan,
-            ) -> ::std::io::Result<::bstack_raii::BStackRange> {
-                #clone_into_body
-            }
+    // The two clone hooks are `BStackBlock` **trait** methods (overriding the
+    // childless defaults) so a generic parent can recurse into a `#[bstack_owned]`
+    // type parameter. Emitted into the `impl BStackBlock for X` block below.
+    let clone_trait_methods = quote! {
+        #[doc(hidden)]
+        #[allow(unused_variables, unused_imports)]
+        fn __bstack_clone_children_inplace<__A: ::bstack_raii::BStackOwnedSliceAllocator>(
+            &self,
+            allocator: &__A,
+            __plan: &mut ::bstack_raii::ClonePlan,
+        ) -> ::std::io::Result<#on_disk> {
+            // Bring the trait into scope so a child's (possibly generic) clone hook
+            // resolves via method syntax.
+            use ::bstack_raii::BStackBlock as _;
+            #clone_children_body
+        }
+        #[doc(hidden)]
+        #[allow(unused_variables)]
+        fn __bstack_clone_into<__A: ::bstack_raii::BStackOwnedSliceAllocator>(
+            &self,
+            allocator: &__A,
+            __plan: &mut ::bstack_raii::ClonePlan,
+        ) -> ::std::io::Result<::bstack_raii::BStackRange> {
+            #clone_into_body
         }
     };
     let clone_impl = if mode == Mode::Plain {
         quote! {
-            #clone_into_method
-
             impl #impl_g ::bstack_raii::TryCloneIn for #name #ty_g #where_g {
                 fn try_clone_in<__A: ::bstack_raii::BStackOwnedSliceAllocator>(
                     &self,
                     allocator: &__A,
                 ) -> ::std::io::Result<::bstack_raii::BStackOwned<Self>> {
+                    use ::bstack_raii::BStackBlock as _;
                     let mut __plan = ::bstack_raii::ClonePlan::new();
                     let __dst = match self.__bstack_clone_into(allocator, &mut __plan) {
                         ::std::result::Result::Ok(__d) => __d,
@@ -1822,7 +1816,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
             }
         }
     } else {
-        clone_into_method
+        quote!()
     };
 
     // The handle: a `BStackRange` newtype (plus a phantom over the type
@@ -1881,6 +1875,8 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
             fn range(&self) -> ::bstack_raii::BStackRange {
                 self.0
             }
+
+            #clone_trait_methods
         }
 
         impl #impl_g #name #ty_g #where_g {
@@ -5039,6 +5035,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                     &self,
                     allocator: &__A,
                 ) -> ::std::io::Result<::bstack_raii::BStackOwned<Self>> {
+                    use ::bstack_raii::BStackBlock as _;
                     let mut __plan = ::bstack_raii::ClonePlan::new();
                     let __dst = match self.__bstack_clone_into(allocator, &mut __plan) {
                         ::std::result::Result::Ok(__d) => __d,
@@ -5160,6 +5157,36 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
             fn range(&self) -> ::bstack_raii::BStackRange {
                 self.0
             }
+
+            /// Read this enum's OnDisk and return a deep-cloned copy: the active
+            /// variant's payload fixed up (owned child cloned into `__plan`,
+            /// strong/weak bumped, ref aliased, embedded child folded in place),
+            /// without allocating a block for `self`. Overrides the childless
+            /// `BStackBlock` default. Used to fold an `#[embed]`ded enum inline,
+            /// and by `__bstack_clone_into`.
+            #[doc(hidden)]
+            #[allow(unused_variables, unused_imports)]
+            fn __bstack_clone_children_inplace<__A: ::bstack_raii::BStackOwnedSliceAllocator>(
+                &self,
+                allocator: &__A,
+                __plan: &mut ::bstack_raii::ClonePlan,
+            ) -> ::std::io::Result<#on_disk> {
+                use ::bstack_raii::BStackBlock as _;
+                #clone_children_body
+            }
+
+            /// Deep-clone this enum into a `ClonePlan`: allocate a fresh block and
+            /// stage its fixed-up payload. Returns the new block's range. Also lets
+            /// an owned enum child of a struct be recursed into.
+            #[doc(hidden)]
+            #[allow(unused_variables)]
+            fn __bstack_clone_into<__A: ::bstack_raii::BStackOwnedSliceAllocator>(
+                &self,
+                allocator: &__A,
+                __plan: &mut ::bstack_raii::ClonePlan,
+            ) -> ::std::io::Result<::bstack_raii::BStackRange> {
+                #clone_into_body
+            }
         }
 
         impl #name {
@@ -5174,34 +5201,6 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                 use ::bstack_raii::BStackDrop as _;
                 #drop_children_body
                 ::std::result::Result::Ok(())
-            }
-
-            /// Read this enum's OnDisk and return a deep-cloned copy: the active
-            /// variant's payload fixed up (owned child cloned into `__plan`,
-            /// strong/weak bumped, ref aliased, embedded child folded in place),
-            /// without allocating a block for `self`. Used to fold an
-            /// `#[embed]`ded enum inline, and by `__bstack_clone_into`.
-            #[doc(hidden)]
-            #[allow(unused_variables)]
-            #vis fn __bstack_clone_children_inplace<__A: ::bstack_raii::BStackOwnedSliceAllocator>(
-                &self,
-                allocator: &__A,
-                __plan: &mut ::bstack_raii::ClonePlan,
-            ) -> ::std::io::Result<#on_disk> {
-                #clone_children_body
-            }
-
-            /// Deep-clone this enum into a `ClonePlan`: allocate a fresh block and
-            /// stage its fixed-up payload. Returns the new block's range. Also lets
-            /// an owned enum child of a struct be recursed into.
-            #[doc(hidden)]
-            #[allow(unused_variables)]
-            #vis fn __bstack_clone_into<__A: ::bstack_raii::BStackOwnedSliceAllocator>(
-                &self,
-                allocator: &__A,
-                __plan: &mut ::bstack_raii::ClonePlan,
-            ) -> ::std::io::Result<::bstack_raii::BStackRange> {
-                #clone_into_body
             }
         }
 

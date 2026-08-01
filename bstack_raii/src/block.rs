@@ -9,6 +9,7 @@ use std::io;
 use bstack::{BStackOwnedSliceAllocator, BStackRange};
 use bytemuck::Pod;
 
+use crate::clone::ClonePlan;
 use crate::layout::EightCC;
 use crate::owned::BStackOwned;
 use crate::reference::BStackRef;
@@ -34,6 +35,43 @@ pub trait BStackBlock: BStackCast + BStackDrop + Sized {
 
     /// The underlying range this handle points at.
     fn range(&self) -> BStackRange;
+
+    /// Read this block's `OnDisk` and return a deep-cloned copy for a
+    /// [`ClonePlan`]: owned children cloned into the plan, shared children's
+    /// refcounts bumped, embedded children folded in place — *without* allocating
+    /// a block for `self`. The generated `#[bstack_block]` impl overrides this
+    /// with the field-aware body; the default (used by hand-written impls of a
+    /// **childless** block) copies the `OnDisk` verbatim. Exposed on the trait —
+    /// rather than as a generated inherent method — so a generic parent can
+    /// recurse into a type parameter's clone. `#[doc(hidden)]`: an impl detail.
+    #[doc(hidden)]
+    fn __bstack_clone_children_inplace<A: BStackOwnedSliceAllocator>(
+        &self,
+        allocator: &A,
+        _plan: &mut ClonePlan,
+    ) -> io::Result<Self::OnDisk> {
+        let mut buf = std::vec![0u8; core::mem::size_of::<Self::OnDisk>()];
+        let r = unsafe { BStackRef::<Self>::from_range(self.range()) };
+        Ok(*r.read_on_disk(allocator.stack(), &mut buf)?)
+    }
+
+    /// Deep-clone this block's subtree into a [`ClonePlan`]: allocate a fresh
+    /// destination block, recurse into children via
+    /// [`__bstack_clone_children_inplace`](Self::__bstack_clone_children_inplace),
+    /// and stage the destination payload (writes are staged, committed by the
+    /// caller). Overridden by the generated impl; the default suffices for a
+    /// childless block. `#[doc(hidden)]`: an impl detail.
+    #[doc(hidden)]
+    fn __bstack_clone_into<A: BStackOwnedSliceAllocator>(
+        &self,
+        allocator: &A,
+        plan: &mut ClonePlan,
+    ) -> io::Result<BStackRange> {
+        let od = self.__bstack_clone_children_inplace(allocator, plan)?;
+        let dst = plan.alloc_raw(allocator, core::mem::size_of::<Self::OnDisk>() as u64)?;
+        plan.write(dst.start(), bytemuck::bytes_of(&od).to_vec());
+        Ok(dst)
+    }
 }
 
 /// The per-block field destructure behind `bstack_move!`: read every field, then
