@@ -3695,3 +3695,50 @@ fn macro_enum_strong_vec_rc() {
     assert_eq!(strong_of(stack, a_data), 1); // a_keep only
     drop(a_keep);
 }
+
+#[bstack_enum]
+enum PodVecEnum {
+    Empty,
+    Nums(Vec<u32>),
+    Text(String),
+}
+
+#[test]
+fn macro_enum_pod_vec() {
+    use crate::BStackVec;
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+
+    let nums = BStackVec::<u32, _>::from_slice(&alloc, &[1u32, 2, 3]).unwrap();
+    let e = PodVecEnum::new(&alloc, PodVecEnumData::Nums(nums)).unwrap();
+    match e.handle().read(&alloc).unwrap() {
+        PodVecEnumView::Nums(v) => assert_eq!(v.to_vec().unwrap(), vec![1u32, 2, 3]),
+        _ => panic!("expected Nums"),
+    }
+
+    // Clone deep-copies the data block.
+    let clone = e.try_clone_in(&alloc).unwrap();
+    match clone.handle().read(&alloc).unwrap() {
+        PodVecEnumView::Nums(v) => assert_eq!(v.to_vec().unwrap(), vec![1u32, 2, 3]),
+        _ => panic!("expected Nums"),
+    }
+    clone.bstack_drop(&alloc).unwrap();
+
+    // Move hands back the BStackVec.
+    match bstack_move!(e, &alloc).unwrap() {
+        PodVecEnumData::Nums(v) => {
+            assert_eq!(v.to_vec().unwrap(), vec![1u32, 2, 3]);
+            v.bstack_drop().unwrap();
+        }
+        _ => panic!("expected Nums"),
+    }
+
+    // String variant round-trips as bytes.
+    let text = BStackVec::<u8, _>::from_slice(&alloc, b"hello").unwrap();
+    let e2 = PodVecEnum::new(&alloc, PodVecEnumData::Text(text)).unwrap();
+    match e2.handle().read(&alloc).unwrap() {
+        PodVecEnumView::Text(v) => assert_eq!(v.to_vec().unwrap(), b"hello"),
+        _ => panic!("expected Text"),
+    }
+    e2.bstack_drop(&alloc).unwrap();
+}

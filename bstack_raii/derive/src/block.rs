@@ -3408,7 +3408,13 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
             // Annotated single-field tuple `#[..] V(T)`: an owned / strong / weak /
             // ref child stored as a `u64` offset. (Unit, un-annotated single-POD,
             // multi-field tuple, and struct variants are POD aggregates, below.)
-            Fields::Unnamed(f) if f.unnamed.len() == 1 && kind != Kind::Pod => {
+            // Annotated single-field `#[..] V(T)`, OR a POD `V(Vec<T>)` / `V(String)`
+            // (which needs the vec machinery, not the byte-packed POD aggregate).
+            Fields::Unnamed(f)
+                if f.unnamed.len() == 1
+                    && (kind != Kind::Pod
+                        || vec_field(&f.unnamed.first().unwrap().ty).is_some()) =>
+            {
                 needs_payload = true;
                 let ty = &f.unnamed.first().unwrap().ty;
 
@@ -3419,13 +3425,6 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                 // struct case), reshaped to `Vec<[[T;..];..]>` on read.
                 if vec_field(ty).is_some() {
                     check_container_nesting(ty)?;
-                    if vec_field(ty).is_some_and(|vi| vi.is_string) {
-                        return Err(Error::new_spanned(
-                            ty,
-                            "`String` is always POD and is not supported as an annotated \
-                             enum variant",
-                        ));
-                    }
                     if kind == Kind::Embed {
                         return Err(Error::new_spanned(
                             ty,
@@ -3434,6 +3433,70 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                     }
                     needs_payload = true;
                     payload_sizes.push(quote!(::core::mem::size_of::<::bstack_raii::VecDesc>()));
+                    let read_desc = quote!(::bstack_raii::bytemuck::pod_read_unaligned::<
+                        ::bstack_raii::VecDesc>(&__pl[..16]));
+
+                    // A POD `V(Vec<Pod>)` / `V(String)` (un-annotated): a plain
+                    // `BStackVec<elem>` (elem = the whole vec element type, itself
+                    // `Pod` — arrays included — or `u8` for `String`). No block
+                    // lifecycle, so clone is a verbatim byte copy.
+                    if kind == Kind::Pod {
+                        let elem: TokenStream = if vec_field(ty).is_some_and(|vi| vi.is_string) {
+                            quote!(u8)
+                        } else {
+                            let vi = vec_inner(ty).unwrap();
+                            quote!(#vi)
+                        };
+                        // The vec handle borrows the allocator → both enums need generics.
+                        has_shared = true;
+                        has_weak = true;
+                        data_variants
+                            .push(quote!(#vname(::bstack_raii::BStackVec<'__e, #elem, __A>),));
+                        view_variants
+                            .push(quote!(#vname(::bstack_raii::BStackVec<'__e, #elem, __A>),));
+                        new_arms.push(quote! {
+                            #data::#vname(__v) => {
+                                let __desc = __v.descriptor();
+                                let mut __pl = [0u8; Self::__PAYLOAD];
+                                __pl[..16].copy_from_slice(
+                                    ::bstack_raii::bytemuck::bytes_of(&__desc));
+                                (#disc, __pl)
+                            }
+                        });
+                        read_arms.push(quote! {
+                            #disc => #view::#vname(
+                                ::bstack_raii::BStackVec::<#elem, __A>::from_desc(
+                                    #read_desc, allocator)),
+                        });
+                        move_arms.push(quote! {
+                            #disc => #data::#vname(
+                                ::bstack_raii::BStackVec::<#elem, __A>::from_desc(
+                                    #read_desc, __alloc)),
+                        });
+                        drop_arms.push(quote! {
+                            #disc => {
+                                ::bstack_raii::BStackVec::<#elem, __A>::from_desc(
+                                    #read_desc, allocator).bstack_drop()?;
+                            }
+                        });
+                        clone_arms.push(quote! {
+                            #disc => {
+                                let __srcdesc = #read_desc;
+                                let __newdesc = ::bstack_raii::BStackVec::<#elem, __A>::from_desc(
+                                    __srcdesc, allocator).clone_data_into(__plan)?;
+                                __pl[..16].copy_from_slice(
+                                    ::bstack_raii::bytemuck::bytes_of(&__newdesc));
+                            }
+                        });
+                        continue;
+                    }
+                    if vec_field(ty).is_some_and(|vi| vi.is_string) {
+                        return Err(Error::new_spanned(
+                            ty,
+                            "`String` is always POD; drop the ownership annotation to store \
+                             it as a POD `V(String)` variant",
+                        ));
+                    }
                     let is_weak = kind == Kind::Weak;
                     let vec_ty = match kind {
                         Kind::Owned => quote!(BStackBlockVec),
@@ -3442,8 +3505,6 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                         Kind::Ref => quote!(BStackRefVec),
                         _ => unreachable!(),
                     };
-                    let read_desc = quote!(::bstack_raii::bytemuck::pod_read_unaligned::<
-                        ::bstack_raii::VecDesc>(&__pl[..16]));
 
                     // Shared teardown / clone (offset-agnostic: a `Vec<[T;N]>` stores
                     // its offsets FLAT, so the per-offset lifecycle is identical to a
