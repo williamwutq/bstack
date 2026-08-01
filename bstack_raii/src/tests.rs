@@ -14,9 +14,10 @@ use bstack::{
 
 use crate::layout::{self, BlockHeader};
 use crate::{
-    AutoDrop, BStackBlock, BStackBlockVec, BStackCast, BStackCastAs, BStackCastInto, BStackDrop,
-    BStackOwned, BStackRc, BStackRef, BStackShared, BStackWeakable, EightCC, TryClone, TryCloneIn,
-    alloc_block, alloc_control, bstack_block, bstack_cast, bstack_enum, bstack_move, dealloc_range,
+    AutoDrop, BStackBlock, BStackBlockVec, BStackCast, BStackCastAs, BStackCastInto, BStackCow,
+    BStackDrop, BStackOwned, BStackRc, BStackRef, BStackShared, BStackWeakable, EightCC, TryClone,
+    TryCloneIn, alloc_block, alloc_control, bstack_block, bstack_cast, bstack_enum, bstack_move,
+    dealloc_range,
 };
 
 // --------------------------------------------------------------------------
@@ -4183,4 +4184,97 @@ fn macro_generic_const_owned_pod_array() {
     assert_eq!(p.handle().xs(stack).unwrap(), [1u16, 2, 3, 4]);
     assert_eq!(p.handle().tag(stack).unwrap(), 7);
     p.bstack_drop(&alloc).unwrap();
+}
+
+// --------------------------------------------------------------------------
+// stdlib: BStackCow<T> — clone-on-write ownership of a block
+// --------------------------------------------------------------------------
+
+#[test]
+fn stdlib_cow_borrowed_into_owned_deep_copies() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    // A block owned elsewhere; the Cow only borrows it.
+    let base = MacroLeaf::new(&alloc, 7).unwrap();
+    let base_start = base.handle().range().start();
+    let cow = BStackCow::borrowed(unsafe { BStackRef::<MacroLeaf>::from_range(base.handle().range()) });
+
+    assert!(cow.is_borrowed());
+    // Reads go through the borrowed block, at its address.
+    assert_eq!(cow.handle().val(stack).unwrap(), 7);
+    assert_eq!(cow.range().start(), base_start);
+
+    // into_owned deep-copies: a fresh block at a different address, same value.
+    let owned = cow.into_owned(&alloc).unwrap();
+    assert_ne!(owned.handle().range().start(), base_start);
+    assert_eq!(owned.handle().val(stack).unwrap(), 7);
+    owned.bstack_drop(&alloc).unwrap();
+
+    // The borrowed source is untouched.
+    assert_eq!(base.handle().val(stack).unwrap(), 7);
+    base.bstack_drop(&alloc).unwrap();
+}
+
+#[test]
+fn stdlib_cow_owned_into_owned_is_free() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let src = MacroLeaf::new(&alloc, 5).unwrap();
+    let start = src.handle().range().start();
+    let cow = BStackCow::owned(src);
+    assert!(cow.is_owned());
+
+    // Already owned: into_owned hands back the *same* block, no copy.
+    let owned = cow.into_owned(&alloc).unwrap();
+    assert_eq!(owned.handle().range().start(), start);
+    assert_eq!(owned.handle().val(stack).unwrap(), 5);
+    owned.bstack_drop(&alloc).unwrap();
+}
+
+#[test]
+fn stdlib_cow_to_mut_copies_then_owns() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let base = MacroLeaf::new(&alloc, 9).unwrap();
+    let base_start = base.handle().range().start();
+    let mut cow = BStackCow::borrowed(unsafe { BStackRef::<MacroLeaf>::from_range(base.handle().range()) });
+
+    // First write forces a private copy and flips to Owned.
+    {
+        let m = cow.to_mut(&alloc).unwrap();
+        assert_ne!(m.handle().range().start(), base_start);
+        assert_eq!(m.handle().val(stack).unwrap(), 9);
+    }
+    assert!(cow.is_owned());
+
+    // A second to_mut is a no-op: still the same owned copy.
+    let owned_start = cow.range().start();
+    let _ = cow.to_mut(&alloc).unwrap();
+    assert_eq!(cow.range().start(), owned_start);
+
+    // Dropping the Cow frees only the copy; the borrowed source survives.
+    cow.bstack_drop(&alloc).unwrap();
+    assert_eq!(base.handle().val(stack).unwrap(), 9);
+    base.bstack_drop(&alloc).unwrap();
+}
+
+#[test]
+fn stdlib_cow_borrowed_drop_frees_nothing() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let base = MacroLeaf::new(&alloc, 3).unwrap();
+    let cow = BStackCow::borrowed(unsafe { BStackRef::<MacroLeaf>::from_range(base.handle().range()) });
+
+    // Dropping a borrowed Cow has no claim on the target.
+    cow.bstack_drop(&alloc).unwrap();
+    assert_eq!(base.handle().val(stack).unwrap(), 3);
+    base.bstack_drop(&alloc).unwrap();
 }
