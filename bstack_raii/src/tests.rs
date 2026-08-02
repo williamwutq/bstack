@@ -4537,3 +4537,70 @@ fn stdlib_list_deep_clone_is_independent() {
     clone.bstack_drop(&alloc).unwrap();
     list.bstack_drop(&alloc).unwrap();
 }
+
+/// Many threads hammering one shared list. Phase 1 is concurrent `push_back`
+/// only; phase 2 is concurrent `pop_front` only. If the relink/len RMW were not
+/// atomic under contention, lost updates would corrupt the chain (a wrong length,
+/// a broken `next` walk, or duplicate/missing values). The `inplace_gen`-based
+/// [`crate::BStackLinkedList`] mutators need no external lock around them.
+#[test]
+fn stdlib_list_concurrent_push_pop() {
+    // Kept modest: each op is a durable `inplace_gen` commit (an fsync), so the
+    // cost is in the op count, not the thread count — the contention that would
+    // expose a non-atomic RMW comes from the parallel threads, not from more
+    // iterations.
+    const THREADS: u32 = 8;
+    const ITERS: u32 = 8;
+
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let list = BStackLinkedList::<MacroLeaf>::new(&alloc).unwrap();
+    let total = (THREADS * ITERS) as u64;
+
+    // Phase 1 — concurrent pushes of distinct values.
+    std::thread::scope(|s| {
+        for t in 0..THREADS {
+            let list = &list;
+            let alloc = &alloc;
+            s.spawn(move || {
+                for i in 0..ITERS {
+                    let leaf = MacroLeaf::new(alloc, t * ITERS + i).unwrap();
+                    list.push_back(alloc, leaf).unwrap();
+                }
+            });
+        }
+    });
+
+    assert_eq!(list.len(alloc.stack()).unwrap(), total);
+    // Chain integrity: walking `next` yields exactly the distinct values 0..total.
+    let mut seen: Vec<u32> = list
+        .to_vec(alloc.stack())
+        .unwrap()
+        .iter()
+        .map(|h| h.val(alloc.stack()).unwrap())
+        .collect();
+    seen.sort_unstable();
+    assert_eq!(seen.len() as u64, total);
+    seen.dedup();
+    assert_eq!(seen.len() as u64, total, "no lost/duplicated nodes");
+    assert_eq!(seen.first().copied(), Some(0));
+    assert_eq!(seen.last().copied(), Some(total as u32 - 1));
+
+    // Phase 2 — concurrent pops (exactly `total` across threads, so none miss).
+    std::thread::scope(|s| {
+        for _ in 0..THREADS {
+            let list = &list;
+            let alloc = &alloc;
+            s.spawn(move || {
+                for _ in 0..ITERS {
+                    let v = list.pop_front(alloc).unwrap().expect("list non-empty");
+                    v.bstack_drop(alloc).unwrap();
+                }
+            });
+        }
+    });
+
+    assert_eq!(list.len(alloc.stack()).unwrap(), 0);
+    assert!(list.front(alloc.stack()).unwrap().is_none());
+    list.bstack_drop(&alloc).unwrap();
+}
