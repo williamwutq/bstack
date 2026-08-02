@@ -15,9 +15,12 @@
 //! |---------------------|----------------------|----------------------------------------|
 //! | [`BStackCow<T>`]    | [`std::borrow::Cow`] | either a borrowed [`crate::BStackRef`] or an owned [`crate::BStackOwned`] block, deep-copying on first write. |
 //! | [`BStackBox<T>`]    | [`std::boxed::Box`]  | a single owned [`Pod`](bytemuck::Pod) value in its own block — the macro-free way to own a bare scalar/POD struct. |
+//! | [`BStackLinkedList<T>`] | [`std::collections::LinkedList`] | an owned doubly-linked list of block values (non-intrusive, single-ref nodes). Prefer [`crate::BStackBlockVec`] unless you need O(1) end/splice ops. |
 
 mod boxed;
 mod cow;
+mod list;
 
 pub use boxed::{BStackBox, BoxOnDisk};
 pub use cow::BStackCow;
+pub use list::{BStackLinkedList, ListOnDisk, NodeOnDisk};

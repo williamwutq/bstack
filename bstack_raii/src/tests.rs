@@ -15,9 +15,9 @@ use bstack::{
 use crate::layout::{self, BlockHeader};
 use crate::{
     AutoDrop, BStackBlock, BStackBlockVec, BStackBox, BStackCast, BStackCastAs, BStackCastInto,
-    BStackCow, BStackDrop, BStackOwned, BStackRc, BStackRef, BStackShared, BStackWeakable, EightCC,
-    TryClone, TryCloneIn, alloc_block, alloc_control, bstack_block, bstack_cast, bstack_enum,
-    bstack_move, dealloc_range,
+    BStackCow, BStackDrop, BStackLinkedList, BStackOwned, BStackRc, BStackRef, BStackShared,
+    BStackWeakable, EightCC, TryClone, TryCloneIn, alloc_block, alloc_control, bstack_block,
+    bstack_cast, bstack_enum, bstack_move, dealloc_range,
 };
 
 // --------------------------------------------------------------------------
@@ -4417,4 +4417,123 @@ fn stdlib_box_in_cow() {
 
     cow.bstack_drop(&alloc).unwrap();
     base.bstack_drop(&alloc).unwrap();
+}
+
+// --------------------------------------------------------------------------
+// stdlib: BStackLinkedList<T> — owned doubly-linked list of block values
+// --------------------------------------------------------------------------
+
+fn list_values(list: &BStackLinkedList<MacroLeaf>, stack: &BStack) -> Vec<u32> {
+    list.to_vec(stack)
+        .unwrap()
+        .iter()
+        .map(|h| h.val(stack).unwrap())
+        .collect()
+}
+
+#[test]
+fn stdlib_list_push_back_pop_front() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let list = BStackLinkedList::<MacroLeaf>::new(&alloc).unwrap();
+    assert!(list.is_empty(stack).unwrap());
+
+    for v in [1u32, 2, 3] {
+        list.push_back(&alloc, MacroLeaf::new(&alloc, v).unwrap()).unwrap();
+    }
+    assert_eq!(list.len(stack).unwrap(), 3);
+    assert_eq!(list_values(&list, stack), vec![1, 2, 3]);
+    assert_eq!(list.front(stack).unwrap().unwrap().val(stack).unwrap(), 1);
+    assert_eq!(list.back(stack).unwrap().unwrap().val(stack).unwrap(), 3);
+
+    // FIFO drain from the front.
+    let a = list.pop_front(&alloc).unwrap().unwrap();
+    assert_eq!(a.handle().val(stack).unwrap(), 1);
+    a.bstack_drop(&alloc).unwrap();
+    assert_eq!(list.len(stack).unwrap(), 2);
+    assert_eq!(list_values(&list, stack), vec![2, 3]);
+
+    list.bstack_drop(&alloc).unwrap(); // frees remaining nodes + values
+}
+
+#[test]
+fn stdlib_list_both_ends() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let list = BStackLinkedList::<MacroLeaf>::new(&alloc).unwrap();
+    list.push_front(&alloc, MacroLeaf::new(&alloc, 2).unwrap()).unwrap();
+    list.push_front(&alloc, MacroLeaf::new(&alloc, 1).unwrap()).unwrap();
+    list.push_back(&alloc, MacroLeaf::new(&alloc, 3).unwrap()).unwrap();
+    assert_eq!(list_values(&list, stack), vec![1, 2, 3]);
+
+    let back = list.pop_back(&alloc).unwrap().unwrap();
+    assert_eq!(back.handle().val(stack).unwrap(), 3);
+    back.bstack_drop(&alloc).unwrap();
+
+    let front = list.pop_front(&alloc).unwrap().unwrap();
+    assert_eq!(front.handle().val(stack).unwrap(), 1);
+    front.bstack_drop(&alloc).unwrap();
+
+    assert_eq!(list_values(&list, stack), vec![2]);
+    assert!(list.pop_back(&alloc).unwrap().is_some());
+    assert!(list.is_empty(stack).unwrap());
+    assert!(list.pop_front(&alloc).unwrap().is_none());
+
+    list.bstack_drop(&alloc).unwrap();
+}
+
+#[test]
+fn stdlib_list_drop_is_recursive() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+
+    // A value type that itself owns a child, to prove teardown recurses through
+    // the node's single value ref into the value's own children.
+    let leaf = MacroLeaf::new(&alloc, 10).unwrap();
+    let leaf_start = leaf.handle().range().start();
+    let parent = MacroParent::new(&alloc, leaf, 1).unwrap();
+
+    let list = BStackLinkedList::<MacroParent>::new(&alloc).unwrap();
+    list.push_back(&alloc, parent).unwrap();
+    list.bstack_drop(&alloc).unwrap();
+
+    // The leaf (a grandchild, freed only via full recursion) slot is reclaimed.
+    let reused = MacroLeaf::new(&alloc, 0).unwrap();
+    assert_eq!(reused.handle().range().start(), leaf_start);
+    reused.bstack_drop(&alloc).unwrap();
+}
+
+#[test]
+fn stdlib_list_deep_clone_is_independent() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let list = BStackLinkedList::<MacroLeaf>::new(&alloc).unwrap();
+    for v in [1u32, 2, 3] {
+        list.push_back(&alloc, MacroLeaf::new(&alloc, v).unwrap()).unwrap();
+    }
+
+    let clone = list.try_clone_in(&alloc).unwrap();
+    assert_eq!(list_values(&clone, stack), vec![1, 2, 3]);
+
+    // The clone's values are fresh blocks, not aliases of the source's.
+    assert_ne!(
+        clone.front(stack).unwrap().unwrap().range().start(),
+        list.front(stack).unwrap().unwrap().range().start(),
+    );
+
+    // Mutating the clone leaves the original intact.
+    let popped = clone.pop_back(&alloc).unwrap().unwrap();
+    popped.bstack_drop(&alloc).unwrap();
+    assert_eq!(clone.len(stack).unwrap(), 2);
+    assert_eq!(list.len(stack).unwrap(), 3);
+    assert_eq!(list_values(&list, stack), vec![1, 2, 3]);
+
+    clone.bstack_drop(&alloc).unwrap();
+    list.bstack_drop(&alloc).unwrap();
 }
