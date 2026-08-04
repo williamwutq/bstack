@@ -812,6 +812,24 @@ impl FirstFitBStackAllocator {
                 }
             }
 
+            // Normalize the footer to the (authoritative) header size. Every
+            // block-resizing operation commits its new size to the header before
+            // the matching footer — a coalescing free writes header then footer,
+            // a tail grow writes header then footer, a split's header is fixed by
+            // the partial-split check above — so on a crash between those two
+            // writes the header is correct and the footer is stale. The walk
+            // follows headers, so a stale footer slips through undetected here yet
+            // corrupts a later neighbour's coalesce (which reads this footer) and
+            // eventually desyncs the walk. Rewriting the footer to match makes the
+            // block whole. Healthy blocks already agree, so this is a no-op for
+            // them.
+            let footer_pos = pos + Self::BLOCK_HEADER_SIZE + size;
+            let mut footer_buf = [0u8; 8];
+            self.stack.get_into(footer_pos, &mut footer_buf)?;
+            if u64::from_le_bytes(footer_buf) != size {
+                self.stack.set(footer_pos, size.to_le_bytes().as_slice())?;
+            }
+
             if is_free {
                 free_blocks.push(pos + Self::BLOCK_HEADER_SIZE);
             }
