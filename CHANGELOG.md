@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-08-03
+
 ### Added
 
 - **`BStack::extend_sparse` / `extend_sparse_batched` (Rust, base API) and `try_extend_sparse` / `try_extend_sparse_batched` (Rust, `atomic`) / `bstack_extend_sparse` / `bstack_extend_sparse_batched` (C, base API) / `bstack_try_extend_sparse` / `bstack_try_extend_sparse_batched` (C, `BSTACK_FEATURE_ATOMIC`): efficient sparse tail growth.** Grow the payload by `length` while writing only a little real data into the new region, leaving the rest zero. `extend_sparse(buf, length)` writes `buf` at the start; `extend_sparse_batched(writes, length)` scatters `(relative_offset, data)` buffers (relative to the current tail) across it (in C the batch reuses `bstack_iovec_t`, its `offset` read as the tail-relative position). The whole `length` is realised with one `set_len`/`ftruncate`, so the zero gaps cost no write I/O and only the supplied bytes plus the header commit are synced — cheaper than a `push` of a large mostly-zero buffer. No journal is needed (the grown region sits beyond `clen`, so a crash rolls back by truncation, like `push`/`extend`). The `try_` variants add a `try_extend`-style size guard `s` (apply only if the current size equals `s`, else `Ok(false)` / `*ok = 0`). Batched writes must be pairwise non-overlapping and fit within `[0, length)`; `length = 0` is a no-op; a malformed request is rejected as invalid input (for the `try_` forms, regardless of the size match).
