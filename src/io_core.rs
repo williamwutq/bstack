@@ -189,16 +189,32 @@ pub(crate) fn pread_exact_raw_handle(handle: isize, offset: u64, buf: &mut [u8])
 /// which `fdatasync` alone does not guarantee.  Falls back to `sync_data` if
 /// `F_FULLFSYNC` returns an error (e.g. the device doesn't support it).
 /// On all other platforms this delegates to `sync_data` (`fdatasync`).
+///
+/// **The crate's own test builds skip the flush entirely.**  The tests never
+/// crash the process — crash consistency is exercised by injecting faults
+/// logically and reopening the file in-process — so the physical sync changes
+/// neither their observable behavior nor the on-disk bytes, yet on macOS
+/// `F_FULLFSYNC` dominates their runtime (it takes the allocator fault fuzz from
+/// minutes to seconds).  This applies only to `cfg(test)` debug builds of this
+/// crate; release builds and any dependent crate always issue the real sync.
 pub(crate) fn durable_sync(file: &File) -> io::Result<()> {
-    #[cfg(target_os = "macos")]
+    #[cfg(all(test, debug_assertions))]
     {
-        let ret = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC) };
-        if ret != -1 {
-            return Ok(());
-        }
-        // Device does not support F_FULLFSYNC; fall back to fdatasync.
+        let _ = file;
+        return Ok(());
     }
-    file.sync_data()
+    #[cfg(not(all(test, debug_assertions)))]
+    {
+        #[cfg(target_os = "macos")]
+        {
+            let ret = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC) };
+            if ret != -1 {
+                return Ok(());
+            }
+            // Device does not support F_FULLFSYNC; fall back to fdatasync.
+        }
+        file.sync_data()
+    }
 }
 
 /// Acquire an exclusive, non-blocking advisory flock on `file`.
