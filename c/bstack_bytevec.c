@@ -92,23 +92,46 @@ static uint64_t sat_double(uint64_t cap)
 
 /*
  * Reallocate the block to hold new_cap bytes of data (total block size is
- * BYTEVEC_HEADER_LEN + new_cap).  Updates v->slice on success.
+ * BYTEVEC_HEADER_LEN + new_cap).  Handles both growth (push, reserve,
+ * reserve_exact) and shrink (shrink_to, shrink_to_fit).
+ *
+ * On failure, bstack_allocator_realloc reports whether the original
+ * allocation survived:
+ *   -1 — survived (untouched, or a fully-committed replacement region);
+ *        adopt the handle written to new_slice so v tracks the real region
+ *        instead of a stale one.
+ *   -2 — genuinely lost mid-operation.  Keeping the old handle would leave v
+ *        pointing at a freed region a later allocation may reuse, so a
+ *        subsequent push could corrupt an unrelated allocation.  Detach to
+ *        the empty sentinel instead: v loses its backing (its contents are
+ *        gone with the allocation) and every later operation on it fails
+ *        cleanly rather than risking corruption.
+ * Either way this function itself still reports plain failure (-1) to its
+ * callers, matching the rest of the bytevec API.
  */
 static int bytevec_grow_to(bstack_bytevec_t *v, uint64_t new_cap)
 {
     uint64_t new_size;
     bstack_slice_t new_slice;
+    bstack_allocator_t *a = v->slice.allocator;
+    int r;
 
     if (new_cap > UINT64_MAX - BYTEVEC_HEADER_LEN) {
         errno = EINVAL;
         return -1;
     }
     new_size = BYTEVEC_HEADER_LEN + new_cap;
-    if (bstack_allocator_realloc(v->slice.allocator, v->slice,
-                                  new_size, &new_slice) != 0)
+    r = bstack_allocator_realloc(a, v->slice, new_size, &new_slice);
+    if (r == 0) {
+        v->slice = new_slice;
+        return 0;
+    }
+    if (r == -1) {
+        v->slice = new_slice;
         return -1;
-    v->slice = new_slice;
-    return 0;
+    }
+    v->slice = bstack_slice_empty(a);
+    return -1;
 }
 
 /* =========================================================================

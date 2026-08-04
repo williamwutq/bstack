@@ -741,8 +741,21 @@ impl FirstFitBStackAllocator {
                         || size % 8 != 0
                         || size.checked_add(Self::BLOCK_OVERHEAD_SIZE).is_none()
                     {
-                        // Invalid size: this is mid-arena corruption, not a partial tail write.
-                        // Refuse to silently discard all data that follows.
+                        // The header does not describe a valid block. Two cases:
+                        //   * All-zero trailing region → an interrupted tail-grow
+                        //     `realloc`, which `extend`s (zero-filling) the payload
+                        //     before rewriting the header/footer to cover it. The
+                        //     valid block ends at `pos` and the zeros beyond it have
+                        //     no header (`size` reads 0). A real block is never
+                        //     all-zero (size ≥ MIN_BLOCK_PAYLOAD_SIZE), so roll the
+                        //     extension back by truncating to `pos` — restoring the
+                        //     pre-grow tail the failed `realloc` handed back.
+                        //   * Anything else → genuine mid-arena corruption; fail
+                        //     loudly rather than discard the data that follows.
+                        if self.stack.get(pos, stack_len)?.iter().all(|&b| b == 0) {
+                            self.stack.discard(remaining)?;
+                            break;
+                        }
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
                             format!(
@@ -799,6 +812,24 @@ impl FirstFitBStackAllocator {
                 }
             }
 
+            // Normalize the footer to the (authoritative) header size. Every
+            // block-resizing operation commits its new size to the header before
+            // the matching footer — a coalescing free writes header then footer,
+            // a tail grow writes header then footer, a split's header is fixed by
+            // the partial-split check above — so on a crash between those two
+            // writes the header is correct and the footer is stale. The walk
+            // follows headers, so a stale footer slips through undetected here yet
+            // corrupts a later neighbour's coalesce (which reads this footer) and
+            // eventually desyncs the walk. Rewriting the footer to match makes the
+            // block whole. Healthy blocks already agree, so this is a no-op for
+            // them.
+            let footer_pos = pos + Self::BLOCK_HEADER_SIZE + size;
+            let mut footer_buf = [0u8; 8];
+            self.stack.get_into(footer_pos, &mut footer_buf)?;
+            if u64::from_le_bytes(footer_buf) != size {
+                self.stack.set(footer_pos, size.to_le_bytes().as_slice())?;
+            }
+
             if is_free {
                 free_blocks.push(pos + Self::BLOCK_HEADER_SIZE);
             }
@@ -835,10 +866,12 @@ impl BStackAllocator for FirstFitBStackAllocator {
     type Error = io::Error;
     type Allocated<'a> = BStackOwnedSlice<'a, Self>;
 
+    #[inline]
     fn stack(&self) -> &BStack {
         &self.stack
     }
 
+    #[inline]
     fn into_stack(self) -> BStack {
         self.stack
     }
@@ -1464,5 +1497,157 @@ mod fault_tests {
         let mut d = alloc.alloc(128).unwrap();
         d.write([4u8; 128]).unwrap();
         assert_eq!(d.read().unwrap(), vec![4u8; 128]);
+    }
+
+    // A tail-block-grow `realloc` `extend`s (zero-filling) the payload before
+    // rewriting the header/footer to cover it. A fault in that window strands a
+    // zero-filled tail region with no block header; the recovery scan used to
+    // read it as a size-0 block and reject the whole file. Recovery now rolls
+    // the extension back by truncation, so reopen succeeds, the block's bytes
+    // survive, and the allocator stays usable. Faulting the post-`extend` `zero`
+    // and the header `set` covers both stranded-tail variants.
+    fn tail_grow_fault_recovers(fault_op: &'static str) {
+        let path = temp_path(&format!("ff_tailgrow_{fault_op}"));
+        let _g = Guard(path.clone());
+
+        let (start, old_len) = {
+            let alloc = FirstFitBStackAllocator::new(BStack::open(&path).unwrap()).unwrap();
+            // A single allocation is the tail block, so the grow takes the
+            // in-place tail-extend path. 866 → 941 crosses an 8-byte alignment
+            // bucket (872 → 944), so the grow really extends the file.
+            let mut a = alloc.alloc(866).unwrap();
+            a.write([0xA7u8; 866]).unwrap();
+            let (start, old_len) = (a.start(), a.len());
+
+            arm(&alloc, FailOpAt::new(fault_op, 0, ErrorKind::Other));
+            let err = alloc
+                .realloc(a, 941)
+                .expect_err("realloc must report the injected fault");
+            disarm(&alloc);
+            // The grow faulted before committing: the original block is handed back.
+            let handle = err.handle.expect("the original block must survive");
+            assert_eq!((handle.start(), handle.len()), (start, old_len));
+            drop(handle);
+            (start, old_len)
+        };
+
+        // Reopen runs recovery (recovery_needed was left set); it must not error.
+        let alloc = FirstFitBStackAllocator::new(BStack::open(&path).unwrap())
+            .expect("recovery must roll back the interrupted tail grow, not error");
+        assert_eq!(
+            alloc.stack().get(start, start + old_len).unwrap(),
+            vec![0xA7u8; old_len as usize],
+            "the block's bytes survive the rolled-back grow"
+        );
+        let mut d = alloc.alloc(200).unwrap();
+        d.write([0x5Cu8; 200]).unwrap();
+        assert_eq!(d.read().unwrap(), vec![0x5Cu8; 200]);
+    }
+
+    #[test]
+    fn tail_grow_fault_at_zero_recovers() {
+        tail_grow_fault_recovers("zero");
+    }
+
+    #[test]
+    fn tail_grow_fault_at_header_set_recovers() {
+        tail_grow_fault_recovers("set");
+    }
+
+    /// Walk the arena block-by-block (by header size) and assert every block's
+    /// footer equals its header — the invariant recovery must restore. Panics on
+    /// the first mismatch or an unparseable header, so a stale footer left by an
+    /// interrupted coalesce is caught directly.
+    fn assert_arena_footers_match(alloc: &FirstFitBStackAllocator, ctx: &str) {
+        const ARENA_START: u64 = 48;
+        const HDR: u64 = 16;
+        const OVERHEAD: u64 = 24;
+        const MIN: u64 = 16;
+        let stack = alloc.stack();
+        let stack_len = stack.len().unwrap();
+        let mut pos = ARENA_START;
+        while pos + OVERHEAD <= stack_len {
+            let mut hb = [0u8; 8];
+            stack.get_into(pos, &mut hb).unwrap();
+            let size = u64::from_le_bytes(hb);
+            assert!(
+                size >= MIN && size % 8 == 0 && pos + size + OVERHEAD <= stack_len,
+                "{ctx}: unparseable header {size} at {pos}"
+            );
+            let mut fb = [0u8; 8];
+            stack.get_into(pos + HDR + size, &mut fb).unwrap();
+            assert_eq!(
+                u64::from_le_bytes(fb),
+                size,
+                "{ctx}: footer≠header at block {pos}"
+            );
+            pos += size + OVERHEAD;
+        }
+    }
+
+    // Freeing a block sandwiched between two free blocks coalesces all three:
+    // `add_to_free_list` writes the merged block's header, then its footer, as
+    // two separate `set`s. A fault between them leaves header=merged-size but a
+    // stale footer. The recovery walk follows headers, so the merged block spans
+    // correctly and the flag is cleared — the mismatch slips through. Left there,
+    // the stale footer (it still equals the right sub-block's size, so it points
+    // back at that sub-block's untouched interior header) later lets a
+    // neighbour's left-coalesce walk into the merged block's interior and
+    // coalesce onto a ghost header, overlapping two blocks and eventually
+    // desyncing the walk. Recovery now normalizes every block's footer to its
+    // (authoritative, written-first) header. Sweep the fault across the
+    // coalescing free's writes and assert the arena is whole after recovery.
+    #[test]
+    fn dealloc_three_way_coalesce_footer_fault_recovers() {
+        for at in 0..16u64 {
+            let path = temp_path(&format!("ff_coalesce_{at}"));
+            let _g = Guard(path.clone());
+
+            let g0 = {
+                let alloc = FirstFitBStackAllocator::new(BStack::open(&path).unwrap()).unwrap();
+                // guard0 | A | B | C | tail, all non-tail middle blocks. Distinct
+                // sizes so the stale-footer geometry matches the fuzz's finding.
+                let mut g0 = alloc.alloc(64).unwrap();
+                g0.write([0x10u8; 64]).unwrap();
+                let a = alloc.alloc(56).unwrap();
+                let b = alloc.alloc(64).unwrap();
+                let c = alloc.alloc(32).unwrap();
+                let _tail = alloc.alloc(64).unwrap();
+                let g0s = g0.start();
+
+                // Free the two outer blocks so B is sandwiched between free A and C.
+                alloc.dealloc(a).unwrap();
+                alloc.dealloc(c).unwrap();
+
+                // Free B: a three-way coalesce. Fault its `at`-th `set`.
+                arm(&alloc, FailOpAt::new("set", at, ErrorKind::Other));
+                let _ = alloc.dealloc(b); // may fault (past-lost → handle None) or succeed
+                disarm(&alloc);
+                drop(g0);
+                g0s
+            };
+
+            // Reopen runs recovery; it must not error on the interrupted coalesce.
+            let alloc = FirstFitBStackAllocator::new(BStack::open(&path).unwrap())
+                .unwrap_or_else(|e| panic!("at={at}: recovery must not error: {e}"));
+            // Recovery must have made every block whole (header == footer); a stale
+            // merged-block footer is exactly the bug.
+            assert_arena_footers_match(&alloc, &format!("at={at}"));
+            // Untouched neighbour survives, and the allocator stays usable.
+            assert_eq!(
+                alloc.stack().get(g0, g0 + 64).unwrap(),
+                vec![0x10u8; 64],
+                "at={at}: left guard intact"
+            );
+            let mut r = alloc.alloc(240).unwrap();
+            r.write([0x22u8; 240]).unwrap();
+            assert_eq!(
+                r.read().unwrap(),
+                vec![0x22u8; 240],
+                "at={at}: reuse reads back"
+            );
+            alloc.dealloc(r).unwrap();
+            assert_arena_footers_match(&alloc, &format!("at={at} after reuse"));
+        }
     }
 }

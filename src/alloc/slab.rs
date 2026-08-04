@@ -288,6 +288,7 @@ impl SlabBStackAllocator {
     }
 
     /// Return the `block_size` this allocator was created with.
+    #[inline]
     pub fn block_size(&self) -> u64 {
         self.block_size
     }
@@ -540,10 +541,12 @@ impl BStackAllocator for SlabBStackAllocator {
     type Error = io::Error;
     type Allocated<'a> = BStackOwnedSlice<'a, Self>;
 
+    #[inline]
     fn stack(&self) -> &BStack {
         &self.stack
     }
 
+    #[inline]
     fn into_stack(self) -> BStack {
         self.stack
     }

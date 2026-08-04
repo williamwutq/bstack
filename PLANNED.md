@@ -70,34 +70,6 @@ Reference: https://github.com/williamwutq/bstack/pull/32
 
 ---
 
-## Restoring `DebugCheckingAllocator` (post-0.4.0)
-
-**Feature flag:** `alloc` (as before)
-**Breaking change:** No — additive; the type was withdrawn in 0.4.0 and returns as new API surface.
-
-### Motivation
-
-`DebugCheckingAllocator<A>` was a wrapping allocator that validated an inner allocator's behaviour at runtime: it tracked the set of live and freed regions, detected overlapping allocations, caught double-frees and use-after-free, and flagged any invariant violation — a drop-in checker for both the built-in allocators and third-party implementations. It was temporarily removed in 0.4.0 because its implementation predated the three-type handle redesign and the `BStackAllocError` / `BStackBulkAllocError` return types, and porting it under the pressure of a large breaking release would have shipped a messy, under-reviewed version. Rather than block the release, it was withdrawn with the intent to reintroduce it cleanly.
-
-The value it provides is hard to replicate ad hoc: allocator bugs — overlap, double-free, leaks, metadata corruption — are exactly the class that ordinary unit tests miss and that only surface under randomized or adversarial workloads. A maintained checking wrapper is the natural place to assert those invariants once and reuse them across every allocator and fuzz test.
-
-### Design
-
-Reintroduce `DebugCheckingAllocator<A: BStackAllocator>` as a transparent wrapper:
-
-- Wraps an inner `A`, forwards `alloc` / `realloc` / `dealloc` / bulk to it, and records the resulting `(offset, len)` regions in an in-memory tracking structure.
-- On each operation validates: no returned region overlaps a live region; no `dealloc` / `realloc` targets a region that is not currently live (double-free / use-after-free); bulk operations are all-or-nothing against the tracked set.
-- Its handle type carries the inner handle plus enough identity to map back to the tracking entry, and converts `Into<BStackOwnedSlice>` like any other handle.
-- Must thread through the new error types: on a failed `realloc` / `dealloc` the inner allocator now returns the surviving handle inside `BStackAllocError`, so the wrapper must **re-wrap that handle and update its tracking** rather than dropping it — otherwise the checker itself would introduce the very leak the 0.4.0 change set out to prevent. `dealloc_bulk` likewise re-wraps the un-freed handles from `BStackBulkAllocError`.
-
-### Open questions
-
-- **Panic vs. error on violation.** Panicking gives loud, immediate test failures but is unusable in `Result`-based property tests that want to *assert* an error was produced; a configurable mode (panic / return `Self::Error`) may be needed.
-- **Tracking under `None`-handle errors.** When an inner operation fails and reports `handle: None` (allocation genuinely lost — e.g. `ghost_tree`'s torn AVL insert), the wrapper must decide whether to keep the region "live," mark it "lost," or drop it from tracking; each choice changes which subsequent operations the checker flags.
-- **Overhead and gating.** Whether it lives behind a dedicated feature or is always available under `alloc`; the tracking set adds allocation and per-op cost that should not leak into production builds.
-
----
-
 ## `BStackInPlaceGuard` — ambient atomic-block guard over in-place writes
 
 **Feature flag:** `set` + `atomic` (same gate as `inplace_gen`/`process_gen`)
@@ -132,30 +104,6 @@ Reintroduce `DebugCheckingAllocator<A: BStackAllocator>` as a transparent wrappe
 - **Overlay-aware `swap`/`cas`/`process`/`cross_exchange`/`copy`/`eq_crds`/`ne_crds`/`masked_eq_crds`/`masked_ne_crds`.** Each has its own direct read-then-write shape today; each needs a guarded variant reading/writing through the overlay. `cas`/`eq_crds`/`ne_crds` also need their comparison step to read through the overlay, or an earlier guarded write in the same transaction is invisible to it.
 - **Recovery format.** Whether commit reuses the existing multi-write journal (`wip_aux = MultiWrite`) unchanged — the guard still reduces to a flat non-overlapping `[offset, data]` set — or needs its own `wip_aux` mode.
 - **Naming.** `BStackInPlaceGuard`/`inplace_guard()`/`commit()`/`is_inplace_guarded()` are working names.
-
-## C allocator API: signal whether the original survived a failed `realloc`/`dealloc`
-
-**Feature flag:** `alloc` (C: `BSTACK_FEATURE_ALLOC`)
-**Breaking change:** C only — an API break; the return-code variant below keeps it ABI-compatible.
-
-### Motivation
-
-Rust's `BStackAllocator::realloc`/`dealloc` return `BStackAllocError { handle: Option<A::Allocated> }`: on failure `Some` hands back a still-usable region (the untouched original, or a fully-committed new region) and `None` means the allocation was genuinely lost mid-operation, recoverable only through crash recovery. The C vtable equivalents (`gt_vt_realloc`, `..._dealloc`, …) return only `0`/`-1` with `errno` and write nothing meaningful to `*out` on `-1`, so a C caller cannot tell after a failed resize/free whether its original handle is still valid to reuse or must be dropped.
-
-This is not hypothetical — the GhostTree tail-shrink fix showed several failure paths legitimately invalidate the original: a non-`atomic` shrink that has already committed part-way, a grow-that-moved-then-failed-to-free-the-old-block, or any path that returns the new region in place of the old. A C caller that keeps using its original handle after such a failure can double-free or read past a shrunk region. Today the only safe C policy is "on `-1`, treat the handle as lost and rely on crash recovery," which needlessly leaks the common case where the original is in fact intact.
-
-### Design
-
-Give the C `realloc`/`dealloc` a survivor signal mirroring Rust's `handle`. Two shapes are on the table; both let a failure-agnostic caller keep working unchanged.
-
-- **Distinct return code (preferred — API-only break, ABI-preserving).** Keep the existing signatures and split the failure return: `-1` = failed, original **survived** (its handle is written to the existing `*out`); `-2` = failed, allocation **lost** (do not reuse the handle). Because every existing caller tests `ret < 0` (or `ret != 0`) for failure, both codes are still seen as errors and old code keeps working untouched — only callers that want the distinction check for `-2`. This refines the contract (what the negative codes and `*out`-on-failure mean) without touching any signature or the vtable layout, so it stays binary-compatible.
-- **Out-parameter (API + ABI break).** `..._realloc(alloc, slice, new_len, bstack_slice_t *out, int *survived)` — on failure `*survived == 1` means `*out` is a valid handle the caller still owns and `*survived == 0` means the region was lost; `survived` may be `NULL` to opt into the current "treat as lost on any failure" policy. More explicit than a magic return code, but changes the function-pointer signatures, so it breaks the ABI.
-
-### Open questions
-
-- **Return code vs out-parameter vs result struct.** The `-2` return code is the least intrusive but relies on a magic value and on `*out` being read on failure; an explicit `int *survived` or a by-value `bstack_alloc_result_t { bstack_slice_t handle; int survived; }` (closer to Rust's `BStackAllocError`) trade ABI compatibility for clarity. Whether the extra explicitness is worth the break.
-- **Vtable impact.** The out-parameter/result-struct variants change the vtable function-pointer signatures, so every built-in and third-party C allocator must update. The `-2` return-code variant leaves the signatures untouched — each allocator only refines its own failure-return logic — which is the main reason to prefer it.
-- **Bulk `dealloc`.** The analogue of `BStackBulkAllocError.handles` — reporting *which* handles survived a partial bulk free — needs its own out-array shape regardless of which single-handle variant is chosen.
 
 ## GhostTree allocator: multithreaded performance improvement
 

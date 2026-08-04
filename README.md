@@ -535,7 +535,7 @@ bstack = { version = "0.4", features = ["set"] }
 
 ### `alloc`
 
-Enables the region-management layer on top of `BStack`: `BStackAllocator`, `BStackBulkAllocator`, `BStackUninitAllocator`, `BStackOwnedSliceAllocator`, `BStackAllocError`, `BStackBulkAllocError`, `BStackRange`, `BStackOwnedSlice`, `BStackSlice`, `BStackSliceReader`, `LinearBStackAllocator`, and `GhostTreeBstackAllocator`.  Combined with `set`, also enables `BStackSliceWriter`, `FirstFitBStackAllocator`, `SlabBStackAllocator`, `CheckedSlabBStackAllocator`, `BStackByteVec`, and `BStackByteVecIter`.
+Enables the region-management layer on top of `BStack`: `BStackAllocator`, `BStackBulkAllocator`, `BStackUninitAllocator`, `BStackOwnedSliceAllocator`, `BStackAllocError`, `BStackBulkAllocError`, `BStackRange`, `BStackOwnedSlice`, `BStackSlice`, `BStackSliceReader`, `LinearBStackAllocator`, `GhostTreeBstackAllocator`, and `DebugCheckingAllocator`.  Combined with `set`, also enables `BStackSliceWriter`, `FirstFitBStackAllocator`, `SlabBStackAllocator`, `CheckedSlabBStackAllocator`, `BStackByteVec`, and `BStackByteVecIter`.
 
 ```toml
 [dependencies]
@@ -561,7 +561,7 @@ A fixed 32-byte header precedes the payload:
 ```
 
 * **`magic`** — 8 bytes: `BSTK` + major(1 B) + minor(1 B) + patch(1 B) + reserved(1 B).
-  This version writes `BSTK\x00\x04\x00\x00` (0.4.0).  `open` accepts any
+  This version writes `BSTK\x00\x04\x01\x00` (0.4.1).  `open` accepts any
   0.4.x file (first 6 bytes `BSTK\x00\x04`) and rejects a different major or
   minor as incompatible.  Legacy `0.1.x` files can be upgraded in place with
   `BStack::migrate`.
@@ -1009,6 +1009,24 @@ catches double-frees immediately and allows full recovery after a crash.
 Constructor takes `data_size` (usable bytes per block; physical = `data_size + 8`).
 `open` runs `recover()` automatically.  Without `atomic`: `Send` only.  With
 `atomic`: `Send + Sync` (same lock-free strategy as `SlabBStackAllocator`).
+
+### `DebugCheckingAllocator` (`alloc`)
+
+Transparent debug wrapper that can be placed around any allocator.  Tracks
+allocated and freed regions in memory and panics on overlapping allocations,
+double-frees, partial-frees, and multi-span frees.  When the inner allocator
+reports a lost handle (`handle: None`), the region is removed from tracking
+entirely.  Intended for tests and debugging only — the O(n) overlap checks add
+significant per-operation overhead.
+
+```rust
+use bstack::{BStack, BStackAllocator, DebugCheckingAllocator, LinearBStackAllocator};
+
+let inner = LinearBStackAllocator::new(BStack::open("debug.bstack")?);
+let alloc = DebugCheckingAllocator::new(inner);
+let handle = alloc.alloc(256)?;
+// alloc/realloc/dealloc are validated against the tracking sets
+```
 
 ### Benchmarks (`alloc + atomic`)
 

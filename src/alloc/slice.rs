@@ -29,6 +29,7 @@ impl BStackRange {
     /// # Safety
     /// `offset + len` must not overflow `u64`. The caller is responsible
     /// for ensuring that the range describes a valid region within the payload.
+    #[inline]
     pub unsafe fn from_raw_parts(offset: u64, len: u64) -> Self {
         Self { offset, len }
     }
@@ -47,6 +48,7 @@ impl BStackRange {
     }
 
     /// Construct a zero-length range anchored at offset 0.
+    #[inline]
     pub fn empty() -> Self {
         Self { offset: 0, len: 0 }
     }
@@ -485,6 +487,7 @@ impl<'a> BStackSlice<'a> {
 }
 
 impl<'a> PartialEq for BStackSlice<'a> {
+    #[inline]
     fn eq(&self, other: &Self) -> bool {
         self.range == other.range
     }
@@ -915,6 +918,7 @@ pub struct BStackSliceReader<'a> {
 }
 
 impl<'a> Clone for BStackSliceReader<'a> {
+    #[inline]
     fn clone(&self) -> Self {
         BStackSliceReader {
             slice: self.slice.clone(),
@@ -1120,6 +1124,7 @@ impl<'a> io::Write for BStackSliceWriter<'a> {
         Ok(n)
     }
 
+    #[inline]
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }

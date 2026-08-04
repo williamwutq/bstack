@@ -39,7 +39,7 @@
 //! ```
 //!
 //! * **`magic`** — 8 bytes: `BSTK` + major(1 B) + minor(1 B) + patch(1 B) + reserved(1 B).
-//!   This version writes `BSTK\x00\x04\x00\x00` (0.4.0).  [`open`](BStack::open)
+//!   This version writes `BSTK\x00\x04\x01\x00` (0.4.1).  [`open`](BStack::open)
 //!   accepts any file whose first 6 bytes match `BSTK\x00\x04` (any 0.4.x) and
 //!   rejects anything with a different major or minor.
 //! * **`clen`** — little-endian `u64` recording the *committed* payload length.
@@ -377,7 +377,7 @@
 //!
 //! | Trait | Semantics |
 //! |-------|-----------|
-//! | `Debug` | Shows `version` (semver string from the magic header, e.g. `"0.4.0"`) and `len` (`Option<u64>`, `None` on I/O failure). |
+//! | `Debug` | Shows `version` (semver string from the magic header, e.g. `"0.4.1"`) and `len` (`Option<u64>`, `None` on I/O failure). |
 //! | `PartialEq` / `Eq` | **Pointer identity.** Two values are equal iff they are the same instance. No two distinct `BStack` values in one process can refer to the same file. |
 //! | `Hash` | Hashes the instance address — consistent with pointer-identity `PartialEq`. |
 //!
@@ -396,11 +396,11 @@
 //!
 //! * **`alloc`** — Region-based sub-allocation over a `BStack` payload.
 //!   Adds the allocator traits, handle types ([`BStackRange`],
-//!   [`BStackOwnedSlice`], [`BStackSlice`]), and [`LinearBStackAllocator`] /
-//!   [`GhostTreeBstackAllocator`].  Combined with `set`, also enables
-//!   [`BStackSliceWriter`], [`FirstFitBStackAllocator`],
-//!   [`SlabBStackAllocator`], [`CheckedSlabBStackAllocator`], and
-//!   [`BStackByteVec`].
+//!   [`BStackOwnedSlice`], [`BStackSlice`]), [`LinearBStackAllocator`],
+//!   [`GhostTreeBstackAllocator`], and [`DebugCheckingAllocator`].
+//!   Combined with `set`, also enables [`BStackSliceWriter`],
+//!   [`FirstFitBStackAllocator`], [`SlabBStackAllocator`],
+//!   [`CheckedSlabBStackAllocator`], and [`BStackByteVec`].
 //!
 //! * **`atomic`** — Compound read-modify-write operations that hold the write
 //!   lock across what would otherwise be separate calls.  Combined with `set`,
@@ -509,6 +509,15 @@
 //!   [`recover`](CheckedSlabBStackAllocator::recover) automatically).
 //!   Requires both `alloc` and `set` features.
 //!
+//! * [`DebugCheckingAllocator<A>`](DebugCheckingAllocator) — transparent debug
+//!   wrapper.  Wraps any allocator whose `Allocated` type is [`BStackOwnedSlice`]
+//!   and whose `Error` is [`io::Error`].  Tracks allocated and freed regions in
+//!   memory and panics on overlapping allocations, double-frees, partial-frees,
+//!   and multi-span frees.  When the inner allocator reports a lost handle
+//!   (`handle: None` in [`BStackAllocError`]), the region is removed from
+//!   tracking entirely — its fate is unknown, so neither "live" nor "freed" would
+//!   be correct.  Intended for tests and debugging; O(n) per-operation overhead.
+//!   Requires `alloc` only.
 //!
 //! * [`BStackByteVec`]`<'a, A>` — a growable byte (`u8`) vector backed by a
 //!   [`BStack`] allocation (requires `alloc` + `set`).  Mirrors the core
@@ -621,7 +630,7 @@ mod alloc;
 pub use alloc::{
     BStackAllocError, BStackAllocator, BStackBulkAllocError, BStackBulkAllocator, BStackOwnedSlice,
     BStackOwnedSliceAllocator, BStackRange, BStackSlice, BStackSliceReader, BStackUninitAllocator,
-    LinearBStackAllocator,
+    DebugCheckingAllocator, LinearBStackAllocator,
 };
 #[cfg(all(feature = "alloc", feature = "set"))]
 pub use alloc::{
@@ -665,7 +674,7 @@ use windows_sys::Win32::System::IO::OVERLAPPED;
 /// reject the new files loudly instead of misreading them.
 const FORMAT_MAJOR: u8 = 0;
 const FORMAT_MINOR: u8 = 4;
-const FORMAT_PATCH: u8 = 0;
+const FORMAT_PATCH: u8 = 1;
 
 /// Full magic for files written by this version
 /// (`BSTK` + major + minor + patch + reserved(0)).
@@ -4094,6 +4103,7 @@ impl BStack {
     /// Never actually fails outside of an armed fault policy under the
     /// `fault-injection` feature; returns [`io::Result`] for source
     /// compatibility.
+    #[inline]
     pub fn len(&self) -> io::Result<u64> {
         fault_point!(self, "len");
         Ok(self.lock.read().unwrap().1)
@@ -4106,6 +4116,7 @@ impl BStack {
     /// Never actually fails outside of an armed fault policy under the
     /// `fault-injection` feature; returns [`io::Result`] for source
     /// compatibility.
+    #[inline]
     pub fn is_empty(&self) -> io::Result<bool> {
         fault_point!(self, "is_empty");
         Ok(self.lock.read().unwrap().1 == 0)
@@ -4118,6 +4129,7 @@ impl BStack {
     /// touch them return [`io::ErrorKind::InvalidInput`]. For
     /// [`get`](Self::get) and [`get_into`](Self::get_into), reads to ranges
     /// entirely within it skip the rwlock.
+    #[inline]
     pub fn locked_len(&self) -> u64 {
         self.locked.load(Ordering::Acquire)
     }
@@ -4267,6 +4279,7 @@ impl BStack {
     /// Propagates all errors from [`open`](Self::open).  Returns
     /// [`io::ErrorKind::InvalidInput`] if `n` exceeds the payload length of
     /// the opened file.
+    #[inline]
     pub fn open_locked_up_to(path: impl AsRef<Path>, n: u64) -> io::Result<Self> {
         let stack = Self::open(path)?;
         stack.lock_up_to(n)?;
@@ -4285,6 +4298,7 @@ impl BStack {
     /// # Errors
     ///
     /// Propagates all errors from [`open`](Self::open).
+    #[inline]
     pub fn open_cached(path: impl AsRef<Path>) -> io::Result<Self> {
         let mut stack = Self::open(path)?;
         stack.cache_enabled = true;
@@ -4302,6 +4316,7 @@ impl BStack {
     /// [`lock_up_to`](Self::lock_up_to).
     /// Returns [`io::ErrorKind::InvalidInput`] if `n` exceeds the payload
     /// length of the opened file.
+    #[inline]
     pub fn open_locked_up_to_cached(path: impl AsRef<Path>, n: u64) -> io::Result<Self> {
         let stack = Self::open_cached(path)?;
         stack.lock_up_to(n)?;
@@ -4326,6 +4341,7 @@ impl BStack {
     /// Equivalent to [`open`](Self::open) followed by
     /// [`set_fault_policy`](Self::set_fault_policy)`(Some(policy))`; the operation
     /// sequence counter starts at 0.
+    #[inline]
     pub fn with_fault_policy(self, policy: std::sync::Arc<dyn fault::FaultPolicy>) -> Self {
         self.fault.set(Some(policy));
         self
@@ -4336,12 +4352,14 @@ impl BStack {
     /// seeded schedule replays identically each time it is armed. Because this
     /// takes `&self`, a test holding a shared reference can arm a fault, drive the
     /// operation under test, then disarm before reading results back.
+    #[inline]
     pub fn set_fault_policy(&self, policy: Option<std::sync::Arc<dyn fault::FaultPolicy>>) {
         self.fault.set(policy);
     }
 
     /// Return the currently armed [`FaultPolicy`], or `None` if the stack is
     /// unarmed.
+    #[inline]
     pub fn fault_policy(&self) -> Option<std::sync::Arc<dyn fault::FaultPolicy>> {
         self.fault.get()
     }
@@ -4361,11 +4379,13 @@ impl BStack {
 /// [`flush`](io::Write::flush) is a no-op because every `write` is already
 /// durable.
 impl io::Write for BStack {
+    #[inline]
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.push(buf)?;
         Ok(buf.len())
     }
 
+    #[inline]
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
@@ -4377,11 +4397,13 @@ impl io::Write for BStack {
 /// `RwLock`), the `Write` implementation is also available on `&BStack`,
 /// mirroring the standard library's `impl Write for &File`.
 impl io::Write for &BStack {
+    #[inline]
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.push(buf)?;
         Ok(buf.len())
     }
 
+    #[inline]
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
@@ -4408,6 +4430,7 @@ impl Eq for BStack {}
 /// time.  Pointer identity is therefore the only meaningful equality: a stack
 /// is equal to itself and to nothing else.
 impl PartialEq for BStack {
+    #[inline]
     fn eq(&self, other: &Self) -> bool {
         std::ptr::eq(self, other)
     }
@@ -4415,6 +4438,7 @@ impl PartialEq for BStack {
 
 /// Hashes the instance address, consistent with the pointer-identity [`PartialEq`].
 impl Hash for BStack {
+    #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
         (self as *const BStack).hash(state);
     }
@@ -4461,6 +4485,7 @@ pub struct BStackReader<'a> {
 
 impl BStack {
     /// Create a [`BStackReader`] positioned at the start of the payload.
+    #[inline]
     pub fn reader(&self) -> BStackReader<'_> {
         BStackReader {
             stack: self,
@@ -4472,6 +4497,7 @@ impl BStack {
     ///
     /// Seeking past the current end is allowed; [`read`](io::Read::read) will
     /// return `Ok(0)` until new data is pushed past that point.
+    #[inline]
     pub fn reader_at(&self, offset: u64) -> BStackReader<'_> {
         BStackReader {
             stack: self,
@@ -4482,24 +4508,28 @@ impl BStack {
 
 impl<'a> BStackReader<'a> {
     /// Return the current logical read offset within the payload.
+    #[inline]
     pub fn position(&self) -> u64 {
         self.offset
     }
 }
 
 impl<'a> From<&'a BStack> for BStackReader<'a> {
+    #[inline]
     fn from(stack: &'a BStack) -> Self {
         stack.reader()
     }
 }
 
 impl<'a> From<BStackReader<'a>> for &'a BStack {
+    #[inline]
     fn from(val: BStackReader<'a>) -> Self {
         val.stack
     }
 }
 
 impl<'a> PartialOrd for BStackReader<'a> {
+    #[inline]
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
@@ -4511,6 +4541,7 @@ impl<'a> PartialOrd for BStackReader<'a> {
 /// and within that group the natural read order (smaller offset first) applies.
 /// This ordering is consistent with the pointer-identity [`PartialEq`].
 impl<'a> Ord for BStackReader<'a> {
+    #[inline]
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         let self_ptr = self.stack as *const BStack as usize;
         let other_ptr = other.stack as *const BStack as usize;

@@ -27,6 +27,13 @@
  * reallocated to max(cap * 2, 4) bytes.  New element space is zero-initialised
  * by the allocator's realloc.
  *
+ * If a reallocation (growth or shrink) fails, the vec adopts whatever the
+ * allocator's -1/-2 survivor signal reports: on -1 (original survived) it
+ * keeps tracking the real region, which may not be the block it started
+ * with; on -2 (original lost) it detaches to the empty sentinel so later
+ * operations fail cleanly instead of risking corruption of an unrelated
+ * allocation. Either way the bytevec call itself still just reports -1.
+ *
  * Crash consistency
  * -----------------
  * Every individual bstack call (set, zero, extend, discard) is durably synced
