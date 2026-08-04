@@ -1317,6 +1317,30 @@ static int alff_recovery(bstack_t *bs)
             }
         }
 
+        /* Normalize the footer to the (authoritative) header size. Every
+         * block-resizing operation commits its new size to the header before the
+         * matching footer (a coalescing free writes header then footer, a tail
+         * grow writes header then footer, a split's header is fixed above), so a
+         * crash between those two writes leaves the header correct and the footer
+         * stale. The walk follows headers, so a stale footer slips through here
+         * yet corrupts a later neighbour's coalesce (which reads this footer) and
+         * eventually desyncs the walk. Rewriting the footer to match makes the
+         * block whole; healthy blocks already agree, so this is a no-op. */
+        {
+            uint64_t footer_pos = pos + ALFF_BLOCK_HDR_SIZE + size;
+            uint8_t  cur_ftr[8];
+            if (bstack_get(bs, footer_pos, footer_pos + 8, cur_ftr) != 0) {
+                ret = -1; goto done;
+            }
+            if (read_le64(cur_ftr) != size) {
+                uint8_t size_le[8];
+                write_le64(size_le, size);
+                if (bstack_set(bs, footer_pos, size_le, 8) != 0) {
+                    ret = -1; goto done;
+                }
+            }
+        }
+
         if (is_free) {
             if (free_cnt == free_cap) {
                 size_t    nc  = free_cap ? free_cap * 2 : 16;
