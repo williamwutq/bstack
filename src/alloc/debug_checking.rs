@@ -54,7 +54,7 @@
 //! let slice2 = alloc.alloc(200)?;
 //!
 //! // This would panic if slice2 overlapped with slice1
-//! alloc.dealloc(slice1)?;
+//! alloc.dealloc(slice1).map_err(|e| e.source)?;
 //! // This would panic if we tried to dealloc slice1 again
 //!
 //! # Ok(())
