@@ -741,8 +741,24 @@ impl FirstFitBStackAllocator {
                         || size % 8 != 0
                         || size.checked_add(Self::BLOCK_OVERHEAD_SIZE).is_none()
                     {
-                        // Invalid size: this is mid-arena corruption, not a partial tail write.
-                        // Refuse to silently discard all data that follows.
+                        // The header does not describe a valid block. Two cases:
+                        //   * All-zero trailing region → an interrupted tail-grow
+                        //     `realloc`, which `extend`s (zero-filling) the payload
+                        //     before rewriting the header/footer to cover it. The
+                        //     valid block ends at `pos` and the zeros beyond it have
+                        //     no header (`size` reads 0). A real block is never
+                        //     all-zero (size ≥ MIN_BLOCK_PAYLOAD_SIZE), so roll the
+                        //     extension back by truncating to `pos` — restoring the
+                        //     pre-grow tail the failed `realloc` handed back.
+                        //   * Anything else → genuine mid-arena corruption; fail
+                        //     loudly rather than discard the data that follows.
+                        let remaining = stack_len - pos;
+                        let mut trailing = vec![0u8; remaining as usize];
+                        self.stack.get_into(pos, &mut trailing)?;
+                        if trailing.iter().all(|&b| b == 0) {
+                            self.stack.discard(remaining)?;
+                            break;
+                        }
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
                             format!(
@@ -1466,5 +1482,60 @@ mod fault_tests {
         let mut d = alloc.alloc(128).unwrap();
         d.write([4u8; 128]).unwrap();
         assert_eq!(d.read().unwrap(), vec![4u8; 128]);
+    }
+
+    // A tail-block-grow `realloc` `extend`s (zero-filling) the payload before
+    // rewriting the header/footer to cover it. A fault in that window strands a
+    // zero-filled tail region with no block header; the recovery scan used to
+    // read it as a size-0 block and reject the whole file. Recovery now rolls
+    // the extension back by truncation, so reopen succeeds, the block's bytes
+    // survive, and the allocator stays usable. Faulting the post-`extend` `zero`
+    // and the header `set` covers both stranded-tail variants.
+    fn tail_grow_fault_recovers(fault_op: &'static str) {
+        let path = temp_path(&format!("ff_tailgrow_{fault_op}"));
+        let _g = Guard(path.clone());
+
+        let (start, old_len) = {
+            let alloc = FirstFitBStackAllocator::new(BStack::open(&path).unwrap()).unwrap();
+            // A single allocation is the tail block, so the grow takes the
+            // in-place tail-extend path. 866 → 941 crosses an 8-byte alignment
+            // bucket (872 → 944), so the grow really extends the file.
+            let mut a = alloc.alloc(866).unwrap();
+            a.write([0xA7u8; 866]).unwrap();
+            let (start, old_len) = (a.start(), a.len());
+
+            arm(&alloc, FailOpAt::new(fault_op, 0, ErrorKind::Other));
+            let err = alloc
+                .realloc(a, 941)
+                .expect_err("realloc must report the injected fault");
+            disarm(&alloc);
+            // The grow faulted before committing: the original block is handed back.
+            let handle = err.handle.expect("the original block must survive");
+            assert_eq!((handle.start(), handle.len()), (start, old_len));
+            drop(handle);
+            (start, old_len)
+        };
+
+        // Reopen runs recovery (recovery_needed was left set); it must not error.
+        let alloc = FirstFitBStackAllocator::new(BStack::open(&path).unwrap())
+            .expect("recovery must roll back the interrupted tail grow, not error");
+        assert_eq!(
+            alloc.stack().get(start, start + old_len).unwrap(),
+            vec![0xA7u8; old_len as usize],
+            "the block's bytes survive the rolled-back grow"
+        );
+        let mut d = alloc.alloc(200).unwrap();
+        d.write([0x5Cu8; 200]).unwrap();
+        assert_eq!(d.read().unwrap(), vec![0x5Cu8; 200]);
+    }
+
+    #[test]
+    fn tail_grow_fault_at_zero_recovers() {
+        tail_grow_fault_recovers("zero");
+    }
+
+    #[test]
+    fn tail_grow_fault_at_header_set_recovers() {
+        tail_grow_fault_recovers("set");
     }
 }
