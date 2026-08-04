@@ -1553,4 +1553,97 @@ mod fault_tests {
     fn tail_grow_fault_at_header_set_recovers() {
         tail_grow_fault_recovers("set");
     }
+
+    /// Walk the arena block-by-block (by header size) and assert every block's
+    /// footer equals its header — the invariant recovery must restore. Panics on
+    /// the first mismatch or an unparseable header, so a stale footer left by an
+    /// interrupted coalesce is caught directly.
+    fn assert_arena_footers_match(alloc: &FirstFitBStackAllocator, ctx: &str) {
+        const ARENA_START: u64 = 48;
+        const HDR: u64 = 16;
+        const OVERHEAD: u64 = 24;
+        const MIN: u64 = 16;
+        let stack = alloc.stack();
+        let stack_len = stack.len().unwrap();
+        let mut pos = ARENA_START;
+        while pos + OVERHEAD <= stack_len {
+            let mut hb = [0u8; 8];
+            stack.get_into(pos, &mut hb).unwrap();
+            let size = u64::from_le_bytes(hb);
+            assert!(
+                size >= MIN && size % 8 == 0 && pos + size + OVERHEAD <= stack_len,
+                "{ctx}: unparseable header {size} at {pos}"
+            );
+            let mut fb = [0u8; 8];
+            stack.get_into(pos + HDR + size, &mut fb).unwrap();
+            assert_eq!(
+                u64::from_le_bytes(fb),
+                size,
+                "{ctx}: footer≠header at block {pos}"
+            );
+            pos += size + OVERHEAD;
+        }
+    }
+
+    // Freeing a block sandwiched between two free blocks coalesces all three:
+    // `add_to_free_list` writes the merged block's header, then its footer, as
+    // two separate `set`s. A fault between them leaves header=merged-size but a
+    // stale footer. The recovery walk follows headers, so the merged block spans
+    // correctly and the flag is cleared — the mismatch slips through. Left there,
+    // the stale footer (it still equals the right sub-block's size, so it points
+    // back at that sub-block's untouched interior header) later lets a
+    // neighbour's left-coalesce walk into the merged block's interior and
+    // coalesce onto a ghost header, overlapping two blocks and eventually
+    // desyncing the walk. Recovery now normalizes every block's footer to its
+    // (authoritative, written-first) header. Sweep the fault across the
+    // coalescing free's writes and assert the arena is whole after recovery.
+    #[test]
+    fn dealloc_three_way_coalesce_footer_fault_recovers() {
+        for at in 0..16u64 {
+            let path = temp_path(&format!("ff_coalesce_{at}"));
+            let _g = Guard(path.clone());
+
+            let g0 = {
+                let alloc = FirstFitBStackAllocator::new(BStack::open(&path).unwrap()).unwrap();
+                // guard0 | A | B | C | tail, all non-tail middle blocks. Distinct
+                // sizes so the stale-footer geometry matches the fuzz's finding.
+                let mut g0 = alloc.alloc(64).unwrap();
+                g0.write([0x10u8; 64]).unwrap();
+                let a = alloc.alloc(56).unwrap();
+                let b = alloc.alloc(64).unwrap();
+                let c = alloc.alloc(32).unwrap();
+                let _tail = alloc.alloc(64).unwrap();
+                let g0s = g0.start();
+
+                // Free the two outer blocks so B is sandwiched between free A and C.
+                alloc.dealloc(a).unwrap();
+                alloc.dealloc(c).unwrap();
+
+                // Free B: a three-way coalesce. Fault its `at`-th `set`.
+                arm(&alloc, FailOpAt::new("set", at, ErrorKind::Other));
+                let _ = alloc.dealloc(b); // may fault (past-lost → handle None) or succeed
+                disarm(&alloc);
+                drop(g0);
+                g0s
+            };
+
+            // Reopen runs recovery; it must not error on the interrupted coalesce.
+            let alloc = FirstFitBStackAllocator::new(BStack::open(&path).unwrap())
+                .unwrap_or_else(|e| panic!("at={at}: recovery must not error: {e}"));
+            // Recovery must have made every block whole (header == footer); a stale
+            // merged-block footer is exactly the bug.
+            assert_arena_footers_match(&alloc, &format!("at={at}"));
+            // Untouched neighbour survives, and the allocator stays usable.
+            assert_eq!(
+                alloc.stack().get(g0, g0 + 64).unwrap(),
+                vec![0x10u8; 64],
+                "at={at}: left guard intact"
+            );
+            let mut r = alloc.alloc(240).unwrap();
+            r.write([0x22u8; 240]).unwrap();
+            assert_eq!(r.read().unwrap(), vec![0x22u8; 240], "at={at}: reuse reads back");
+            alloc.dealloc(r).unwrap();
+            assert_arena_footers_match(&alloc, &format!("at={at} after reuse"));
+        }
+    }
 }
