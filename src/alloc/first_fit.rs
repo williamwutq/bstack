@@ -752,10 +752,7 @@ impl FirstFitBStackAllocator {
                         //     pre-grow tail the failed `realloc` handed back.
                         //   * Anything else → genuine mid-arena corruption; fail
                         //     loudly rather than discard the data that follows.
-                        let remaining = stack_len - pos;
-                        let mut trailing = vec![0u8; remaining as usize];
-                        self.stack.get_into(pos, &mut trailing)?;
-                        if trailing.iter().all(|&b| b == 0) {
+                        if self.stack.get(pos, stack_len)?.iter().all(|&b| b == 0) {
                             self.stack.discard(remaining)?;
                             break;
                         }
