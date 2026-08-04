@@ -386,19 +386,34 @@ typedef struct {
 
     /*
      * Resize slice to new_len bytes; write the (possibly repositioned) handle
-     * into *out.  Returns 0 on success, -1 on failure (errno set).
+     * into *out.  Returns 0 on success.
+     * On failure returns a negative code and leaves errno set:
+     *   -1 — the original allocation survived the failure (either untouched,
+     *        or a fully-committed replacement region); its handle is written
+     *        to *out and remains safe to use or free.
+     *   -2 — the allocation was lost mid-operation; *out is not meaningful
+     *        and the original handle must not be reused (only recoverable,
+     *        if at all, through crash recovery).
      * May return -1 with errno = ENOTSUP if the implementation does not
-     * support the requested resize (e.g. non-tail resize on a bump allocator).
+     * support the requested resize (e.g. non-tail resize on a bump allocator)
+     * — the original is untouched in that case.
      */
     int (*realloc)(bstack_allocator_t *self, bstack_slice_t slice,
                    uint64_t new_len, bstack_slice_t *out);
 
     /*
      * Release the region described by slice.
-     * After dealloc, slice must not be used for further I/O.
+     * Returns 0 on success — after which slice must not be used for further
+     * I/O.
+     * On failure returns a negative code and leaves errno set:
+     *   -1 — the original allocation survived the failure and remains the
+     *        same as the passed-in slice; it is still safe to use or retry
+     *        freeing.
+     *   -2 — the allocation was lost mid-operation (e.g. a partially
+     *        committed free-list splice or tail truncation); slice must not
+     *        be reused (only recoverable, if at all, through crash recovery).
      * May be NULL to indicate a permanent no-op; bstack_allocator_dealloc
      * checks for NULL before dispatching.
-     * Returns 0 on success, -1 on failure (errno set).
      */
     int (*dealloc)(bstack_allocator_t *self, bstack_slice_t slice);
 } bstack_allocator_vtbl_t;
