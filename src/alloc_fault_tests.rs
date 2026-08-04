@@ -264,6 +264,16 @@ mod alloc_fault_tests {
 
             let periodic = cfg.reopen_every > 0 && step > 0 && step % cfg.reopen_every == 0;
             if faulted || periodic {
+                // Debug aid: when `BSTACK_SNAPSHOT_PATH` is set, copy the backing
+                // file just *before* recovery runs, overwriting each time. If the
+                // recovery scan then panics, the last snapshot is the exact
+                // pre-recovery image of the failure (its step is written to
+                // `<path>.step`) — feed it to a block walker to see which block's
+                // header/footer the crash left inconsistent.
+                if let Ok(snap) = std::env::var("BSTACK_SNAPSHOT_PATH") {
+                    let _ = std::fs::copy(&path, &snap);
+                    let _ = std::fs::write(format!("{snap}.step"), format!("{step}"));
+                }
                 alloc = reopen_and_verify(alloc, &make, &live, bias, &format!("reopen@{step}"));
             }
         }
