@@ -590,10 +590,20 @@ static int linear_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
 {
     linear_bstack_allocator_t *a = (linear_bstack_allocator_t *)self;
     uint64_t cur_tail, extra, shrink, dummy;
-    if (bstack_len(a->bs, &cur_tail) != 0)
+    /*
+     * Every failure path below leaves the original region untouched: the
+     * validation checks reject before any mutation, and the extend/discard
+     * calls are each a single bstack operation that either fully commits or
+     * leaves the stack unchanged. So every failure here is survivable (-1),
+     * never a loss (-2).
+     */
+    if (bstack_len(a->bs, &cur_tail) != 0) {
+        *out = slice;
         return -1;
+    }
     if (slice.offset + slice.len != cur_tail) {
         errno = ENOTSUP;
+        *out = slice;
         return -1;
     }
     if (new_len == slice.len) {
@@ -605,21 +615,27 @@ static int linear_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
 #if UINT64_MAX > SIZE_MAX
         if (extra > (uint64_t)SIZE_MAX) {
             errno = EINVAL;
+            *out = slice;
             return -1;
         }
 #endif
-        if (bstack_extend(a->bs, (size_t)extra, &dummy) != 0)
+        if (bstack_extend(a->bs, (size_t)extra, &dummy) != 0) {
+            *out = slice;
             return -1;
+        }
     } else {
         shrink = slice.len - new_len;
 #if UINT64_MAX > SIZE_MAX
         if (shrink > (uint64_t)SIZE_MAX) {
             errno = EINVAL;
+            *out = slice;
             return -1;
         }
 #endif
-        if (bstack_discard(a->bs, (size_t)shrink) != 0)
+        if (bstack_discard(a->bs, (size_t)shrink) != 0) {
+            *out = slice;
             return -1;
+        }
     }
     out->allocator = self;
     out->offset    = slice.offset;
@@ -631,6 +647,11 @@ static int linear_vt_dealloc(bstack_allocator_t *self, bstack_slice_t slice)
 {
     linear_bstack_allocator_t *a = (linear_bstack_allocator_t *)self;
     uint64_t cur_tail;
+    /*
+     * discard is a single bstack operation: on failure the stack is
+     * unchanged, so slice always survives a failed dealloc here (-1),
+     * never -2.
+     */
     if (bstack_len(a->bs, &cur_tail) != 0)
         return -1;
     if (slice.offset + slice.len == cur_tail) {
@@ -640,7 +661,7 @@ static int linear_vt_dealloc(bstack_allocator_t *self, bstack_slice_t slice)
             return -1;
         }
 #endif
-        return bstack_discard(a->bs, (size_t)slice.len);
+        return bstack_discard(a->bs, (size_t)slice.len) == 0 ? 0 : -1;
     }
     return 0; /* non-tail slice: no-op */
 }
@@ -1469,19 +1490,23 @@ static int ff_vt_dealloc(bstack_allocator_t *self, bstack_slice_t slice)
 #endif
         discard_n = (size_t)(aligned_len + ALFF_BLOCK_OVERHEAD);
         if (alff_set_recovery_needed(a->bs) != 0) { MUTEX_UNLOCK(a); return -1; }
-        if (bstack_discard(a->bs, discard_n) != 0) { MUTEX_UNLOCK(a); return -1; }
-        if (alff_cascade_discard_free_tail(a->bs) != 0) { MUTEX_UNLOCK(a); return -1; }
+        /* Past this point the tail block is being physically discarded: a
+         * failure below can no longer safely hand the original back. */
+        if (bstack_discard(a->bs, discard_n) != 0) { MUTEX_UNLOCK(a); return -2; }
+        if (alff_cascade_discard_free_tail(a->bs) != 0) { MUTEX_UNLOCK(a); return -2; }
         r = alff_clear_recovery_needed(a->bs);
         MUTEX_UNLOCK(a);
-        return r;
+        return r == 0 ? 0 : -2;
     }
 
     if (alff_set_recovery_needed(a->bs) != 0) { MUTEX_UNLOCK(a); return -1; }
-    if (alff_add_to_free_list(a->bs, slice.offset) != 0) { MUTEX_UNLOCK(a); return -1; }
-    if (alff_cascade_discard_free_tail(a->bs) != 0) { MUTEX_UNLOCK(a); return -1; }
+    /* Past this point the block is being pushed onto the free list: a
+     * failure below can no longer safely hand the original back. */
+    if (alff_add_to_free_list(a->bs, slice.offset) != 0) { MUTEX_UNLOCK(a); return -2; }
+    if (alff_cascade_discard_free_tail(a->bs) != 0) { MUTEX_UNLOCK(a); return -2; }
     r = alff_clear_recovery_needed(a->bs);
     MUTEX_UNLOCK(a);
-    return r;
+    return r == 0 ? 0 : -2;
 }
 
 static int ff_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
@@ -1491,17 +1516,28 @@ static int ff_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
     uint64_t aligned_current_len = alff_align_len(slice.len);
     uint64_t aligned_new_len;
     uint64_t stack_len;
+    /*
+     * The surviving allocation to hand back on failure. Starts as the
+     * original block; in the move-to-new-block paths it becomes the new
+     * region once that region is committed and populated (which happens
+     * before the old block is freed), so a later failure freeing the old
+     * block still returns a valid, fully-resized handle. Every failure path
+     * in this function leaves `recovered` valid, so realloc here always
+     * fails with -1 (survived), never -2 (lost).
+     */
+    bstack_slice_t recovered = slice;
+    recovered.allocator = self;
 
     /* Validation reads stack_len once.  No lock yet — only caller-owned bytes
      * are touched by the lock-free fast paths (cases 1 and 3). */
-    if (bstack_len(a->bs, &stack_len) != 0) return -1;
+    if (bstack_len(a->bs, &stack_len) != 0) { *out = recovered; return -1; }
 
     if (alff_is_impossible_block_start(stack_len, slice.offset)
         || alff_is_impossible_block_end(stack_len,
                slice.offset + aligned_current_len)
         || alff_is_impossible_block_size(stack_len, aligned_current_len)) {
         errno = EINVAL;
-        return -1;
+        *out = recovered; return -1;
     }
 
     aligned_new_len = alff_align_len(new_len);
@@ -1511,7 +1547,7 @@ static int ff_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
     if (aligned_new_len == aligned_current_len) {
         if (new_len > slice.len) {
             size_t zero_n = (size_t)(new_len - slice.len);
-            if (bstack_zero(a->bs, slice.offset + slice.len, zero_n) != 0) return -1;
+            if (bstack_zero(a->bs, slice.offset + slice.len, zero_n) != 0) { *out = recovered; return -1; }
         }
         out->allocator = self;
         out->offset    = slice.offset;
@@ -1525,7 +1561,7 @@ static int ff_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
      * If this is not the tail block the lock is released before the lock-free
      * in-place paths below run. */
     MUTEX_LOCK(a);
-    if (bstack_len(a->bs, &stack_len) != 0) { MUTEX_UNLOCK(a); return -1; }
+    if (bstack_len(a->bs, &stack_len) != 0) { MUTEX_UNLOCK(a); *out = recovered; return -1; }
     if (slice.offset + aligned_current_len == stack_len - ALFF_BLOCK_FTR_SIZE) {
         uint8_t size_le[8];
         if (aligned_new_len > aligned_current_len) {
@@ -1535,22 +1571,22 @@ static int ff_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
             if (delta > (uint64_t)SIZE_MAX || zero_n > (uint64_t)SIZE_MAX) {
                 MUTEX_UNLOCK(a);
                 errno = EINVAL;
-                return -1;
+                *out = recovered; return -1;
             }
 #endif
             /* Tail-grow is multi-step (extend + zero + header + footer); without
              * the recovery flag a crash after extend but before the header write
              * leaves an unrecoverable mid-arena layout (for delta >= 24 bytes
              * recovery would error on the zero "header" past the old block). */
-            if (alff_set_recovery_needed(a->bs) != 0) { MUTEX_UNLOCK(a); return -1; }
-            if (bstack_extend(a->bs, (size_t)delta, NULL) != 0) { MUTEX_UNLOCK(a); return -1; }
-            if (bstack_zero(a->bs, slice.offset + slice.len, (size_t)zero_n) != 0) { MUTEX_UNLOCK(a); return -1; }
+            if (alff_set_recovery_needed(a->bs) != 0) { MUTEX_UNLOCK(a); *out = recovered; return -1; }
+            if (bstack_extend(a->bs, (size_t)delta, NULL) != 0) { MUTEX_UNLOCK(a); *out = recovered; return -1; }
+            if (bstack_zero(a->bs, slice.offset + slice.len, (size_t)zero_n) != 0) { MUTEX_UNLOCK(a); *out = recovered; return -1; }
             write_le64(size_le, aligned_new_len);
             if (bstack_set(a->bs, slice.offset - ALFF_BLOCK_HDR_SIZE,
-                           size_le, 8) != 0) { MUTEX_UNLOCK(a); return -1; }
+                           size_le, 8) != 0) { MUTEX_UNLOCK(a); *out = recovered; return -1; }
             if (bstack_set(a->bs, slice.offset + aligned_new_len,
-                           size_le, 8) != 0) { MUTEX_UNLOCK(a); return -1; }
-            if (alff_clear_recovery_needed(a->bs) != 0) { MUTEX_UNLOCK(a); return -1; }
+                           size_le, 8) != 0) { MUTEX_UNLOCK(a); *out = recovered; return -1; }
+            if (alff_clear_recovery_needed(a->bs) != 0) { MUTEX_UNLOCK(a); *out = recovered; return -1; }
         } else {
             /* Tail shrink: keep the block; don't reclaim the tail in place. A
              * physical shrink needs a header write plus a discard (metadata +
@@ -1574,7 +1610,7 @@ static int ff_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
         uint64_t block_size;
         if (bstack_get(a->bs, slice.offset - ALFF_BLOCK_HDR_SIZE,
                        slice.offset - ALFF_BLOCK_HDR_SIZE + 8,
-                       block_size_buf) != 0) return -1;
+                       block_size_buf) != 0) { *out = recovered; return -1; }
         block_size = read_le64(block_size_buf);
 
         /* Case 3: block already large enough for the new size.  Lock-free: the
@@ -1582,7 +1618,7 @@ static int ff_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
         if (block_size >= aligned_new_len) {
             if (new_len > slice.len) {
                 size_t zero_n = (size_t)(new_len - slice.len);
-                if (bstack_zero(a->bs, slice.offset + slice.len, zero_n) != 0) return -1;
+                if (bstack_zero(a->bs, slice.offset + slice.len, zero_n) != 0) { *out = recovered; return -1; }
             }
             out->allocator = self;
             out->offset    = slice.offset;
@@ -1598,13 +1634,13 @@ static int ff_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
         /* Case 4: try to merge with the free right neighbour in place */
         {
             uint64_t next_block = slice.offset + block_size + ALFF_BLOCK_OVERHEAD;
-            if (bstack_len(a->bs, &stack_len) != 0) { MUTEX_UNLOCK(a); return -1; }
+            if (bstack_len(a->bs, &stack_len) != 0) { MUTEX_UNLOCK(a); *out = recovered; return -1; }
             if (next_block <= stack_len - ALFF_BLOCK_FTR_SIZE - ALFF_MIN_PAYLOAD) {
                 uint8_t next_hdr[16];
                 uint64_t next_size;
                 if (bstack_get(a->bs, next_block - ALFF_BLOCK_HDR_SIZE,
                                next_block - ALFF_BLOCK_HDR_SIZE + 16,
-                               next_hdr) != 0) { MUTEX_UNLOCK(a); return -1; }
+                               next_hdr) != 0) { MUTEX_UNLOCK(a); *out = recovered; return -1; }
                 next_size = read_le64(next_hdr);
 
                 if ((next_hdr[8] & 1) != 0
@@ -1616,18 +1652,18 @@ static int ff_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
                     if (slice.len < block_size) {
                         size_t zero_n = (size_t)(block_size - slice.len);
                         if (bstack_zero(a->bs, slice.offset + slice.len,
-                                        zero_n) != 0) { MUTEX_UNLOCK(a); return -1; }
+                                        zero_n) != 0) { MUTEX_UNLOCK(a); *out = recovered; return -1; }
                     }
 
-                    if (alff_set_recovery_needed(a->bs) != 0) { MUTEX_UNLOCK(a); return -1; }
-                    if (alff_unlink_from_free_list(a->bs, next_block) != 0) { MUTEX_UNLOCK(a); return -1; }
+                    if (alff_set_recovery_needed(a->bs) != 0) { MUTEX_UNLOCK(a); *out = recovered; return -1; }
+                    if (alff_unlink_from_free_list(a->bs, next_block) != 0) { MUTEX_UNLOCK(a); *out = recovered; return -1; }
 
                     {
                         uint64_t merged_size = block_size + ALFF_BLOCK_OVERHEAD + next_size;
                         size_t   zero_buf_sz =
                             (size_t)(next_size + ALFF_BLOCK_OVERHEAD + ALFF_BLOCK_FTR_SIZE);
                         uint8_t *zero_buff = calloc(1, zero_buf_sz);
-                        if (!zero_buff) { MUTEX_UNLOCK(a); return -1; }
+                        if (!zero_buff) { MUTEX_UNLOCK(a); *out = recovered; return -1; }
 
                         if (merged_size >=
                             aligned_new_len + ALFF_BLOCK_OVERHEAD + ALFF_MIN_PAYLOAD) {
@@ -1650,7 +1686,7 @@ static int ff_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
 
                             if (bstack_get(a->bs, ALFF_FREE_HEAD_OFFSET,
                                            ALFF_FREE_HEAD_OFFSET + 8, head_buf) != 0) {
-                                free(zero_buff); MUTEX_UNLOCK(a); return -1;
+                                free(zero_buff); MUTEX_UNLOCK(a); *out = recovered; return -1;
                             }
                             old_head = read_le64(head_buf);
 
@@ -1664,28 +1700,28 @@ static int ff_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
                             write_le64(size_le, merged_size);
                             if (bstack_set(a->bs, slice.offset - ALFF_BLOCK_HDR_SIZE,
                                            size_le, 8) != 0) {
-                                free(zero_buff); MUTEX_UNLOCK(a); return -1;
+                                free(zero_buff); MUTEX_UNLOCK(a); *out = recovered; return -1;
                             }
                             if (bstack_set(a->bs, slice.offset + block_size,
                                            zero_buff, zero_buf_sz) != 0) {
-                                free(zero_buff); MUTEX_UNLOCK(a); return -1;
+                                free(zero_buff); MUTEX_UNLOCK(a); *out = recovered; return -1;
                             }
                             free(zero_buff);
 
                             /* Shrink allocated block header */
                             write_le64(size_le, aligned_new_len);
                             if (bstack_set(a->bs, slice.offset - ALFF_BLOCK_HDR_SIZE,
-                                           size_le, 8) != 0) { MUTEX_UNLOCK(a); return -1; }
+                                           size_le, 8) != 0) { MUTEX_UNLOCK(a); *out = recovered; return -1; }
 
                             /* Forward link: free_head → new free block */
                             {
                                 uint8_t nfs_le[8];
                                 write_le64(nfs_le, new_free_start);
                                 if (bstack_set(a->bs, ALFF_FREE_HEAD_OFFSET,
-                                               nfs_le, 8) != 0) { MUTEX_UNLOCK(a); return -1; }
+                                               nfs_le, 8) != 0) { MUTEX_UNLOCK(a); *out = recovered; return -1; }
                                 if (old_head != 0) {
                                     if (bstack_set(a->bs, old_head + 8,
-                                                   nfs_le, 8) != 0) { MUTEX_UNLOCK(a); return -1; }
+                                                   nfs_le, 8) != 0) { MUTEX_UNLOCK(a); *out = recovered; return -1; }
                                 }
                             }
                         } else {
@@ -1696,17 +1732,17 @@ static int ff_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
                             write_le64(size_le, merged_size);
                             if (bstack_set(a->bs, slice.offset - ALFF_BLOCK_HDR_SIZE,
                                            size_le, 8) != 0) {
-                                free(zero_buff); MUTEX_UNLOCK(a); return -1;
+                                free(zero_buff); MUTEX_UNLOCK(a); *out = recovered; return -1;
                             }
                             if (bstack_set(a->bs, slice.offset + block_size,
                                            zero_buff, zero_buf_sz) != 0) {
-                                free(zero_buff); MUTEX_UNLOCK(a); return -1;
+                                free(zero_buff); MUTEX_UNLOCK(a); *out = recovered; return -1;
                             }
                             free(zero_buff);
                         }
                     }
 
-                    if (alff_clear_recovery_needed(a->bs) != 0) { MUTEX_UNLOCK(a); return -1; }
+                    if (alff_clear_recovery_needed(a->bs) != 0) { MUTEX_UNLOCK(a); *out = recovered; return -1; }
                     out->allocator = self;
                     out->offset    = slice.offset;
                     out->len       = new_len;
@@ -1720,7 +1756,7 @@ static int ff_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
         {
             uint64_t found_start = 0, found_size = 0;
             if (alff_find_large_enough_block(a->bs, aligned_new_len,
-                                              &found_start, &found_size) != 0) { MUTEX_UNLOCK(a); return -1; }
+                                              &found_start, &found_size) != 0) { MUTEX_UNLOCK(a); *out = recovered; return -1; }
 
             if (found_start != 0) {
                 size_t   buf_sz;
@@ -1731,25 +1767,25 @@ static int ff_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
                 if (ALFF_BLOCK_OVERHEAD + aligned_new_len > (uint64_t)SIZE_MAX) {
                     MUTEX_UNLOCK(a);
                     errno = EINVAL;
-                    return -1;
+                    *out = recovered; return -1;
                 }
 #endif
                 buf_sz   = (size_t)(ALFF_BLOCK_OVERHEAD + aligned_new_len);
                 data_buf = calloc(1, buf_sz);
-                if (!data_buf) { MUTEX_UNLOCK(a); return -1; }
+                if (!data_buf) { MUTEX_UNLOCK(a); *out = recovered; return -1; }
 
                 copy_len = slice.len < aligned_new_len ? slice.len : aligned_new_len;
                 if (copy_len > 0) {
                     if (bstack_get(a->bs, slice.offset, slice.offset + copy_len,
                                    data_buf + ALFF_BLOCK_HDR_SIZE) != 0) {
-                        free(data_buf); MUTEX_UNLOCK(a); return -1;
+                        free(data_buf); MUTEX_UNLOCK(a); *out = recovered; return -1;
                     }
                 }
 
-                if (alff_set_recovery_needed(a->bs) != 0) { free(data_buf); MUTEX_UNLOCK(a); return -1; }
+                if (alff_set_recovery_needed(a->bs) != 0) { free(data_buf); MUTEX_UNLOCK(a); *out = recovered; return -1; }
                 if (alff_unlink_block(a->bs, found_start, found_size,
                                       aligned_new_len, data_buf) != 0) {
-                    free(data_buf); MUTEX_UNLOCK(a); return -1;
+                    free(data_buf); MUTEX_UNLOCK(a); *out = recovered; return -1;
                 }
                 free(data_buf);
 
@@ -1758,9 +1794,17 @@ static int ff_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
                     ? found_start + found_size - aligned_new_len
                     : found_start;
 
-                if (alff_add_to_free_list(a->bs, slice.offset) != 0) { MUTEX_UNLOCK(a); return -1; }
-                if (alff_cascade_discard_free_tail(a->bs) != 0) { MUTEX_UNLOCK(a); return -1; }
-                if (alff_clear_recovery_needed(a->bs) != 0) { MUTEX_UNLOCK(a); return -1; }
+                /* The new block is committed and populated; it is now the
+                 * survivor, so a failure freeing the old block still returns
+                 * a valid, fully-resized handle (the old block leaks until
+                 * crash recovery). */
+                recovered.allocator = self;
+                recovered.offset    = new_payload;
+                recovered.len       = new_len;
+
+                if (alff_add_to_free_list(a->bs, slice.offset) != 0) { MUTEX_UNLOCK(a); *out = recovered; return -1; }
+                if (alff_cascade_discard_free_tail(a->bs) != 0) { MUTEX_UNLOCK(a); *out = recovered; return -1; }
+                if (alff_clear_recovery_needed(a->bs) != 0) { MUTEX_UNLOCK(a); *out = recovered; return -1; }
 
                 out->allocator = self;
                 out->offset    = new_payload;
@@ -1782,12 +1826,12 @@ static int ff_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
         if (aligned_new_len + ALFF_BLOCK_OVERHEAD > (uint64_t)SIZE_MAX) {
             MUTEX_UNLOCK(a);
             errno = EINVAL;
-            return -1;
+            *out = recovered; return -1;
         }
 #endif
         block_sz  = (size_t)(aligned_new_len + ALFF_BLOCK_OVERHEAD);
         block_buf = calloc(1, block_sz);
-        if (!block_buf) { MUTEX_UNLOCK(a); return -1; }
+        if (!block_buf) { MUTEX_UNLOCK(a); *out = recovered; return -1; }
 
         write_le64(size_le, aligned_new_len);
         memcpy(block_buf, size_le, 8);
@@ -1798,7 +1842,7 @@ static int ff_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
             uint64_t bsz;
             if (bstack_get(a->bs, slice.offset - ALFF_BLOCK_HDR_SIZE,
                            slice.offset - ALFF_BLOCK_HDR_SIZE + 8,
-                           bsz_buf) != 0) { free(block_buf); MUTEX_UNLOCK(a); return -1; }
+                           bsz_buf) != 0) { free(block_buf); MUTEX_UNLOCK(a); *out = recovered; return -1; }
             bsz = read_le64(bsz_buf);
             copy_len = slice.len < aligned_new_len ? slice.len : aligned_new_len;
             (void)bsz;
@@ -1807,21 +1851,28 @@ static int ff_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
         if (copy_len > 0) {
             if (bstack_get(a->bs, slice.offset, slice.offset + copy_len,
                            block_buf + ALFF_BLOCK_HDR_SIZE) != 0) {
-                free(block_buf); MUTEX_UNLOCK(a); return -1;
+                free(block_buf); MUTEX_UNLOCK(a); *out = recovered; return -1;
             }
         }
         memcpy(block_buf + ALFF_BLOCK_HDR_SIZE + aligned_new_len, size_le, 8);
 
-        if (alff_set_recovery_needed(a->bs) != 0) { free(block_buf); MUTEX_UNLOCK(a); return -1; }
+        if (alff_set_recovery_needed(a->bs) != 0) { free(block_buf); MUTEX_UNLOCK(a); *out = recovered; return -1; }
         if (bstack_push(a->bs, block_buf, block_sz, &push_offset) != 0) {
-            free(block_buf); MUTEX_UNLOCK(a); return -1;
+            free(block_buf); MUTEX_UNLOCK(a); *out = recovered; return -1;
         }
         free(block_buf);
         new_ptr = push_offset + ALFF_BLOCK_HDR_SIZE;
 
-        if (alff_add_to_free_list(a->bs, slice.offset) != 0) { MUTEX_UNLOCK(a); return -1; }
-        if (alff_cascade_discard_free_tail(a->bs) != 0) { MUTEX_UNLOCK(a); return -1; }
-        if (alff_clear_recovery_needed(a->bs) != 0) { MUTEX_UNLOCK(a); return -1; }
+        /* The new block is committed and populated; it is now the survivor,
+         * so a failure freeing the old block still returns a valid,
+         * fully-resized handle (the old block leaks until crash recovery). */
+        recovered.allocator = self;
+        recovered.offset    = new_ptr;
+        recovered.len       = new_len;
+
+        if (alff_add_to_free_list(a->bs, slice.offset) != 0) { MUTEX_UNLOCK(a); *out = recovered; return -1; }
+        if (alff_cascade_discard_free_tail(a->bs) != 0) { MUTEX_UNLOCK(a); *out = recovered; return -1; }
+        if (alff_clear_recovery_needed(a->bs) != 0) { MUTEX_UNLOCK(a); *out = recovered; return -1; }
 
         out->allocator = self;
         out->offset    = new_ptr;
@@ -2728,26 +2779,35 @@ static int gt_vt_dealloc(bstack_allocator_t *self, bstack_slice_t slice)
                                (size_t)true_len, &ok) != 0) return -1;
         if (ok) return 0;
     }
-    /* Not at tail: zero block (caller owns it; no lock), then insert under lock. */
+    /* Not at tail: zero block (caller owns it; no lock), then insert under lock.
+     * The block is owned by the caller and untouched by other threads until it
+     * appears in the AVL tree, so a failed zero leaves it fully intact (-1). */
     if (bstack_zero(a->bs, slice.offset, (size_t)true_len) != 0) return -1;
     {
         int r;
         MUTEX_LOCK(a);
+        /* Past this point a torn (non-atomic) AVL insert cannot be safely
+         * retried — GhostTree has no is_free flag to repair it in-process, so
+         * a failure here can no longer hand the original back (-2). */
         r = algt_avl_insert(a->bs, slice.offset, true_len);
         MUTEX_UNLOCK(a);
-        return r;
+        return r == 0 ? 0 : -2;
     }
 #else
     {
         uint64_t stack_len;
         if (bstack_len(a->bs, &stack_len) != 0) return -1;
         if (slice.offset + true_len == stack_len) {
-            /* Tail block: truncate instead of recycling through the tree. */
-            return bstack_discard(a->bs, (size_t)true_len);
+            /* Tail block: truncate instead of recycling through the tree.
+             * A single atomic bstack call — on failure nothing changed. */
+            return bstack_discard(a->bs, (size_t)true_len) == 0 ? 0 : -1;
         }
-        /* Non-tail: zero entire block (upholds zeroed-memory invariant), insert. */
+        /* Non-tail: zero entire block (upholds zeroed-memory invariant), insert.
+         * The zero leaves the block intact on failure (-1); past that point a
+         * torn AVL insert cannot be safely retried (-2), same reasoning as the
+         * atomic path above. */
         if (bstack_zero(a->bs, slice.offset, (size_t)true_len) != 0) return -1;
-        return algt_avl_insert(a->bs, slice.offset, true_len);
+        return algt_avl_insert(a->bs, slice.offset, true_len) == 0 ? 0 : -2;
     }
 #endif
 }
@@ -2803,22 +2863,44 @@ static int gt_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
 {
     ghost_tree_bstack_allocator_t *a = (ghost_tree_bstack_allocator_t *)self;
     uint64_t old_len, aligned_old, aligned_new;
+    /*
+     * The surviving allocation to hand back on failure. Starts as the
+     * original block; on the grow-and-move path it becomes the new region
+     * once that region is committed and populated (copy done, before the old
+     * block is freed), so a later failure freeing the old block still
+     * returns a valid, fully-resized handle.
+     */
+    bstack_slice_t recovered = slice;
+    recovered.allocator = self;
 #ifndef BSTACK_FEATURE_ATOMIC
     uint64_t stack_len;
     int      is_tail;
 #endif
 
-    if (slice.len == 0)
-        return gt_vt_alloc(self, new_len, out);
+    if (slice.len == 0) {
+        if (gt_vt_alloc(self, new_len, out) != 0) {
+            out->allocator = self; out->offset = 0; out->len = 0;
+            return -1;
+        }
+        return 0;
+    }
 
     if (slice.offset < ALGT_ARENA_START ||
         slice.offset != algt_align_up_ptr(slice.offset)) {
+        /* Invalid address: the caller's handle is unchanged, hand it back. */
         errno = EINVAL;
+        *out = recovered;
         return -1;
     }
 
     if (new_len == 0) {
-        if (gt_vt_dealloc(self, slice) != 0) return -1;
+        /* dealloc consumes `slice`; propagate its own survivor signal
+         * unchanged — on -1 it hands back exactly the original slice. */
+        int dr = gt_vt_dealloc(self, slice);
+        if (dr != 0) {
+            if (dr == -1) *out = recovered;
+            return dr;
+        }
         out->allocator = self; out->offset = 0; out->len = 0;
         return 0;
     }
@@ -2832,10 +2914,12 @@ static int gt_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
         if (new_len < old_len) {
             uint64_t gap = old_len - new_len;
 #if UINT64_MAX > SIZE_MAX
-            if (gap > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
+            if (gap > (uint64_t)SIZE_MAX) { errno = EINVAL; *out = recovered; return -1; }
 #endif
-            if (bstack_zero(a->bs, slice.offset + new_len, (size_t)gap) != 0)
+            if (bstack_zero(a->bs, slice.offset + new_len, (size_t)gap) != 0) {
+                *out = recovered;
                 return -1;
+            }
         }
         out->allocator = self;
         out->offset    = slice.offset;
@@ -2844,7 +2928,7 @@ static int gt_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
     }
 
 #ifndef BSTACK_FEATURE_ATOMIC
-    if (bstack_len(a->bs, &stack_len) != 0) return -1;
+    if (bstack_len(a->bs, &stack_len) != 0) { *out = recovered; return -1; }
     is_tail = (slice.offset + aligned_old == stack_len);
 #endif
 
@@ -2858,12 +2942,12 @@ static int gt_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
          * crash-atomic splice. As two calls (try_discard then zero) a crash
          * between them shrinks the stack yet leaves the padding un-zeroed —
          * violating the zeroed-memory invariant. bstack_process_gen holds one
-         * write lock across the LEN tail-check and the SPLICE, so a crash leaves
-         * the block intact. */
+         * write lock across the LEN tail-check and the SPLICE, so a fault is
+         * consulted before any mutation and leaves the block fully intact. */
         {
             algt_shrink_ctx_t ctx;
 #if UINT64_MAX > SIZE_MAX
-            if (aligned_old - new_len > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
+            if (aligned_old - new_len > (uint64_t)SIZE_MAX) { errno = EINVAL; *out = recovered; return -1; }
 #endif
             ctx.phase         = 0;
             ctx.truncated     = 0;
@@ -2872,7 +2956,10 @@ static int gt_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
             ctx.cut           = (size_t)(aligned_old - new_len);
             ctx.pad_len       = (size_t)(aligned_new - new_len);
             memset(ctx.pad, 0, sizeof ctx.pad);
-            if (bstack_process_gen(a->bs, algt_shrink_gen, &ctx) != 0) return -1;
+            if (bstack_process_gen(a->bs, algt_shrink_gen, &ctx) != 0) {
+                *out = recovered;
+                return -1;
+            }
             if (ctx.truncated) {
                 out->allocator = self; out->offset = slice.offset; out->len = new_len;
                 return 0;
@@ -2881,39 +2968,51 @@ static int gt_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
         }
 #else
         if (is_tail) {
-            /* Zero [new_len..aligned_new] then discard the freed tail. */
+#if UINT64_MAX > SIZE_MAX
+            if (freed_tail > (uint64_t)SIZE_MAX) { errno = EINVAL; *out = recovered; return -1; }
+#endif
+            /* Discard the freed tail FIRST: a fault here fires before any
+             * mutation, so the original is fully intact (-1, survived). Only
+             * once the shrink is committed do we zero the retained block's
+             * padding — a fault there can no longer hand back the (now
+             * shorter) original, since the stack no longer covers old_len. */
+            if (bstack_discard(a->bs, (size_t)freed_tail) != 0) {
+                *out = recovered;
+                return -1;
+            }
             if (new_len < aligned_new) {
                 uint64_t gap = aligned_new - new_len;
 #if UINT64_MAX > SIZE_MAX
-                if (gap > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
+                if (gap > (uint64_t)SIZE_MAX) return -2;
 #endif
                 if (bstack_zero(a->bs, slice.offset + new_len, (size_t)gap) != 0)
-                    return -1;
+                    return -2;
             }
-#if UINT64_MAX > SIZE_MAX
-            if (freed_tail > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
-#endif
-            if (bstack_discard(a->bs, (size_t)freed_tail) != 0) return -1;
             out->allocator = self; out->offset = slice.offset; out->len = new_len;
             return 0;
         }
 #endif
 
-        /* Non-tail: zero gap + freed tail (no lock), insert freed tail under lock. */
+        /* Non-tail: zero gap + freed tail (no lock), insert freed tail under
+         * lock. The zero leaves the block intact on failure (-1); past that
+         * point a torn (non-atomic) AVL insert cannot be safely retried, so a
+         * failure there is a genuine loss (-2). */
         {
             uint64_t zero_n = aligned_old - new_len;
 #if UINT64_MAX > SIZE_MAX
-            if (zero_n > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
+            if (zero_n > (uint64_t)SIZE_MAX) { errno = EINVAL; *out = recovered; return -1; }
 #endif
-            if (bstack_zero(a->bs, slice.offset + new_len, (size_t)zero_n) != 0)
+            if (bstack_zero(a->bs, slice.offset + new_len, (size_t)zero_n) != 0) {
+                *out = recovered;
                 return -1;
+            }
         }
         {
             int r;
             MUTEX_LOCK(a);
             r = algt_avl_insert(a->bs, tail_ptr, freed_tail);
             MUTEX_UNLOCK(a);
-            if (r != 0) return -1;
+            if (r != 0) return -2;
         }
         out->allocator = self; out->offset = slice.offset; out->len = new_len;
         return 0;
@@ -2926,10 +3025,13 @@ static int gt_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
         int ok = 0;
         uint64_t delta = aligned_new - aligned_old;
 #if UINT64_MAX > SIZE_MAX
-        if (delta > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
+        if (delta > (uint64_t)SIZE_MAX) { errno = EINVAL; *out = recovered; return -1; }
 #endif
         if (bstack_try_extend_zeros(a->bs, slice.offset + aligned_old,
-                                    (size_t)delta, &ok) != 0) return -1;
+                                    (size_t)delta, &ok) != 0) {
+            *out = recovered;
+            return -1;
+        }
         if (ok) {
             out->allocator = self; out->offset = slice.offset; out->len = new_len;
             return 0;
@@ -2937,12 +3039,16 @@ static int gt_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
     }
 #else
     if (is_tail) {
-        /* Extend in place — no copy needed. */
+        /* Extend in place — no copy needed. A single atomic bstack call: on
+         * failure the tail is unchanged, so the original survives (-1). */
         uint64_t delta = aligned_new - aligned_old;
 #if UINT64_MAX > SIZE_MAX
-        if (delta > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
+        if (delta > (uint64_t)SIZE_MAX) { errno = EINVAL; *out = recovered; return -1; }
 #endif
-        if (bstack_extend(a->bs, (size_t)delta, NULL) != 0) return -1;
+        if (bstack_extend(a->bs, (size_t)delta, NULL) != 0) {
+            *out = recovered;
+            return -1;
+        }
         out->allocator = self;
         out->offset    = slice.offset;
         out->len       = new_len;
@@ -2953,20 +3059,46 @@ static int gt_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
     /* Grow (non-tail): alloc new block, copy old data, free old block. */
     {
         bstack_slice_t new_s;
-        if (gt_vt_alloc(self, new_len, &new_s) != 0) return -1;
+        if (gt_vt_alloc(self, new_len, &new_s) != 0) {
+            *out = recovered;
+            return -1;
+        }
 #if UINT64_MAX > SIZE_MAX
-        if (old_len > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
+        if (old_len > (uint64_t)SIZE_MAX) {
+            errno = EINVAL;
+            gt_vt_dealloc(self, new_s); /* best-effort rollback; original is untouched either way */
+            *out = recovered;
+            return -1;
+        }
 #endif
         {
             uint8_t *tmp = malloc((size_t)old_len);
-            if (!tmp) return -1;
+            if (!tmp) {
+                gt_vt_dealloc(self, new_s);
+                *out = recovered;
+                return -1;
+            }
             if (bstack_get(a->bs, slice.offset, slice.offset + old_len, tmp) != 0 ||
                 bstack_set(a->bs, new_s.offset, tmp, (size_t)old_len) != 0) {
-                free(tmp); return -1;
+                free(tmp);
+                /* The new region was allocated but the copy failed. Roll it back
+                 * (best-effort) so it is not leaked; the original still holds
+                 * the data untouched, so it remains the survivor regardless of
+                 * whether this rollback itself succeeds. */
+                gt_vt_dealloc(self, new_s);
+                *out = recovered;
+                return -1;
             }
             free(tmp);
         }
-        if (gt_vt_dealloc(self, slice) != 0) return -1;
+        /* Data copied and the new region is fully committed; it is now the
+         * survivor, so a failure freeing the old block still returns a
+         * valid, fully-resized handle (the old block leaks until recovery). */
+        recovered = new_s;
+        if (gt_vt_dealloc(self, slice) != 0) {
+            *out = recovered;
+            return -1;
+        }
         *out = new_s;
         return 0;
     }
@@ -3651,8 +3783,10 @@ static int slab_vtbl_dealloc(bstack_allocator_t *base, bstack_slice_t s)
     }
 
     /* Not at tail (or single-block): push to the free list (lock-free under
-     * atomic via cross_exchange; single-threaded otherwise). */
-    return slab_push_free_blocks(a->bs, s.offset, n_blocks, a->block_size);
+     * atomic via cross_exchange; single-threaded otherwise). This mutates
+     * multiple block links, so a mid-way failure may leave the blocks
+     * partially freed — the handle can no longer be safely returned (-2). */
+    return slab_push_free_blocks(a->bs, s.offset, n_blocks, a->block_size) == 0 ? 0 : -2;
 }
 
 static int slab_vtbl_realloc(bstack_allocator_t *base, bstack_slice_t s,
@@ -3660,12 +3794,33 @@ static int slab_vtbl_realloc(bstack_allocator_t *base, bstack_slice_t s,
 {
     slab_bstack_allocator_t *a = (slab_bstack_allocator_t *)base;
     uint64_t old_n, new_n, old_backing, new_backing;
+    /*
+     * The surviving allocation to hand back on failure. Starts as the
+     * original block; updated once a move commits a new region or a shrink
+     * commits the retained region (both distinct from any blocks being
+     * freed, so the handle is always safe to return). Every failure path in
+     * this function leaves `recovered` valid, so realloc here always fails
+     * with -1 (survived), never -2 (lost).
+     */
+    bstack_slice_t recovered = s;
+    recovered.allocator = base;
 
-    if (s.len == 0 && s.offset == SLAB_SENTINEL)
-        return slab_vtbl_alloc(base, new_len, out);
+    if (s.len == 0 && s.offset == SLAB_SENTINEL) {
+        if (slab_vtbl_alloc(base, new_len, out) != 0) {
+            out->allocator = base; out->offset = SLAB_SENTINEL; out->len = 0;
+            return -1;
+        }
+        return 0;
+    }
 
     if (new_len == 0) {
-        if (slab_vtbl_dealloc(base, s) != 0) return -1;
+        /* dealloc consumes `s`; propagate its own survivor signal unchanged
+         * — on -1 it hands back exactly the original slice. */
+        int dr = slab_vtbl_dealloc(base, s);
+        if (dr != 0) {
+            if (dr == -1) *out = recovered;
+            return dr;
+        }
         out->allocator = base; out->offset = SLAB_SENTINEL; out->len = 0;
         return 0;
     }
@@ -3681,20 +3836,22 @@ static int slab_vtbl_realloc(bstack_allocator_t *base, bstack_slice_t s,
         if (new_len > s.len) {
             uint64_t to_zero = new_len - s.len;
 #if UINT64_MAX > SIZE_MAX
-            if (to_zero > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
+            if (to_zero > (uint64_t)SIZE_MAX) { errno = EINVAL; *out = recovered; return -1; }
 #endif
-            if (bstack_zero(a->bs, s.offset + s.len, (size_t)to_zero) != 0)
+            if (bstack_zero(a->bs, s.offset + s.len, (size_t)to_zero) != 0) {
+                *out = recovered;
                 return -1;
+            }
         }
         out->allocator = base; out->offset = s.offset; out->len = new_len;
         return 0;
     }
 
-    if (old_n > UINT64_MAX / a->block_size) { errno = EINVAL; return -1; }
+    if (old_n > UINT64_MAX / a->block_size) { errno = EINVAL; *out = recovered; return -1; }
     old_backing = old_n * a->block_size;
-    if (new_n > UINT64_MAX / a->block_size) { errno = EINVAL; return -1; }
+    if (new_n > UINT64_MAX / a->block_size) { errno = EINVAL; *out = recovered; return -1; }
     new_backing = new_n * a->block_size;
-    if (s.offset > UINT64_MAX - old_backing) { errno = EINVAL; return -1; }
+    if (s.offset > UINT64_MAX - old_backing) { errno = EINVAL; *out = recovered; return -1; }
 
     if (new_n > old_n) {
         /* Grow path.
@@ -3705,35 +3862,47 @@ static int slab_vtbl_realloc(bstack_allocator_t *base, bstack_slice_t s,
         uint64_t sentinel  = s.offset + old_backing;
         int      tail_done = 0;
 #if UINT64_MAX > SIZE_MAX
-        if (to_extend > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
+        if (to_extend > (uint64_t)SIZE_MAX) { errno = EINVAL; *out = recovered; return -1; }
 #endif
 
 #ifdef BSTACK_FEATURE_ATOMIC
         {
             int ok = 0;
             if (bstack_try_extend_zeros(a->bs, sentinel,
-                                        (size_t)to_extend, &ok) != 0) return -1;
+                                        (size_t)to_extend, &ok) != 0) {
+                *out = recovered;
+                return -1;
+            }
             if (ok) tail_done = 1;
         }
 #else
         {
             uint64_t tail;
-            if (bstack_len(a->bs, &tail) != 0) return -1;
+            if (bstack_len(a->bs, &tail) != 0) { *out = recovered; return -1; }
             if (sentinel == tail) {
-                if (bstack_extend(a->bs, (size_t)to_extend, NULL) != 0) return -1;
+                if (bstack_extend(a->bs, (size_t)to_extend, NULL) != 0) {
+                    *out = recovered;
+                    return -1;
+                }
                 tail_done = 1;
             }
         }
 #endif
 
         if (tail_done) {
+            /* The extended bytes cover [old_backing, new_backing); this zero
+             * only fills [s.len, new_len), which lies at or past old_len and
+             * never touches the original's own bytes, so the original
+             * (s.offset, s.len) stays a safe fallback even if it fails. */
             if (new_len > s.len) {
                 uint64_t to_zero = new_len - s.len;
 #if UINT64_MAX > SIZE_MAX
-                if (to_zero > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
+                if (to_zero > (uint64_t)SIZE_MAX) { errno = EINVAL; *out = recovered; return -1; }
 #endif
-                if (bstack_zero(a->bs, s.offset + s.len, (size_t)to_zero) != 0)
+                if (bstack_zero(a->bs, s.offset + s.len, (size_t)to_zero) != 0) {
+                    *out = recovered;
                     return -1;
+                }
             }
             out->allocator = base; out->offset = s.offset; out->len = new_len;
             return 0;
@@ -3748,24 +3917,38 @@ static int slab_vtbl_realloc(bstack_allocator_t *base, bstack_slice_t s,
             uint64_t  push_offset;
 
 #if UINT64_MAX > SIZE_MAX
-            if (new_backing > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
+            if (new_backing > (uint64_t)SIZE_MAX) { errno = EINVAL; *out = recovered; return -1; }
 #endif
             buf = calloc(1, (size_t)new_backing);
-            if (!buf) return -1;
+            if (!buf) { *out = recovered; return -1; }
 
             if (s.len > 0) {
                 if (bstack_get(a->bs, s.offset, s.offset + s.len, buf) != 0) {
-                    free(buf); return -1;
+                    free(buf);
+                    *out = recovered;
+                    return -1;
                 }
             }
 
             if (bstack_push(a->bs, buf, (size_t)new_backing, &push_offset) != 0) {
-                free(buf); return -1;
+                free(buf);
+                *out = recovered;
+                return -1;
             }
             free(buf);
 
+            /* New region committed and populated; it is now the survivor, so
+             * a failure freeing the old blocks returns the new region
+             * instead (the old blocks leak until crash recovery). */
+            recovered.allocator = base;
+            recovered.offset    = push_offset;
+            recovered.len       = new_len;
+
             if (slab_push_free_blocks(a->bs, s.offset, old_n,
-                                      a->block_size) != 0) return -1;
+                                      a->block_size) != 0) {
+                *out = recovered;
+                return -1;
+            }
 
             out->allocator = base;
             out->offset    = push_offset;
@@ -3784,22 +3967,28 @@ static int slab_vtbl_realloc(bstack_allocator_t *base, bstack_slice_t s,
         uint64_t sentinel   = s.offset + old_backing;
         int      tail_done  = 0;
 #if UINT64_MAX > SIZE_MAX
-        if (to_discard > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
+        if (to_discard > (uint64_t)SIZE_MAX) { errno = EINVAL; *out = recovered; return -1; }
 #endif
 
 #ifdef BSTACK_FEATURE_ATOMIC
         {
             int ok = 0;
             if (bstack_try_discard(a->bs, sentinel,
-                                   (size_t)to_discard, &ok) != 0) return -1;
+                                   (size_t)to_discard, &ok) != 0) {
+                *out = recovered;
+                return -1;
+            }
             if (ok) tail_done = 1;
         }
 #else
         {
             uint64_t tail;
-            if (bstack_len(a->bs, &tail) != 0) return -1;
+            if (bstack_len(a->bs, &tail) != 0) { *out = recovered; return -1; }
             if (sentinel == tail) {
-                if (bstack_discard(a->bs, (size_t)to_discard) != 0) return -1;
+                if (bstack_discard(a->bs, (size_t)to_discard) != 0) {
+                    *out = recovered;
+                    return -1;
+                }
                 tail_done = 1;
             }
         }
@@ -3810,11 +3999,18 @@ static int slab_vtbl_realloc(bstack_allocator_t *base, bstack_slice_t s,
             return 0;
         }
 
-        /* Shrink non-tail: return excess blocks to free list (lock-free under
-         * atomic via cross_exchange). */
+        /* Shrink non-tail: the first new_n blocks are retained regardless of
+         * the outcome, so the resized region is the survivor if freeing the
+         * excess blocks fails. */
+        recovered.allocator = base;
+        recovered.offset    = s.offset;
+        recovered.len       = new_len;
         if (slab_push_free_blocks(a->bs,
                                   s.offset + new_n * a->block_size,
-                                  old_n - new_n, a->block_size) != 0) return -1;
+                                  old_n - new_n, a->block_size) != 0) {
+            *out = recovered;
+            return -1;
+        }
         out->allocator = base; out->offset = s.offset; out->len = new_len;
         return 0;
     }
@@ -5068,8 +5264,11 @@ static int alck_vt_dealloc(bstack_allocator_t *base, bstack_slice_t s)
 #endif
 
     /* Not at tail: push to the free list (lock-free under atomic via
-     * cross_exchange; single-threaded otherwise). */
-    return alck_push_free_blocks(a->bs, block_start, num_blocks, a->block_size);
+     * cross_exchange; single-threaded otherwise). This mutates the block
+     * overhead and multiple free-list links, so a mid-way failure may leave
+     * the blocks partially freed — the handle can no longer be safely
+     * returned (-2). */
+    return alck_push_free_blocks(a->bs, block_start, num_blocks, a->block_size) == 0 ? 0 : -2;
 }
 
 static int alck_vt_realloc(bstack_allocator_t *base, bstack_slice_t s,
@@ -5078,49 +5277,72 @@ static int alck_vt_realloc(bstack_allocator_t *base, bstack_slice_t s,
     checked_slab_bstack_allocator_t *a = (checked_slab_bstack_allocator_t *)base;
     uint64_t block_start, overhead, old_n, new_n, old_backing, new_backing;
     /* tail and is_tail are now computed per-path in inner scopes */
+    /*
+     * The surviving allocation to hand back on failure. Starts as the
+     * original block, becomes the new region once a non-tail grow commits
+     * it, and becomes the shrunk view once the overhead commit point is
+     * written (see below). Every failure path in this function leaves
+     * `recovered` valid, so realloc here always fails with -1 (survived),
+     * never -2 (lost).
+     */
+    bstack_slice_t recovered = s;
+    recovered.allocator = base;
 
-    if (s.len == 0 && s.offset == 0)
-        return alck_vt_alloc(base, new_len, out);
+    if (s.len == 0 && s.offset == 0) {
+        if (alck_vt_alloc(base, new_len, out) != 0) {
+            out->allocator = base; out->offset = 0; out->len = 0;
+            return -1;
+        }
+        return 0;
+    }
 
     if (new_len == 0) {
-        if (alck_vt_dealloc(base, s) != 0) return -1;
+        /* dealloc consumes `s`; propagate its own survivor signal unchanged
+         * — on -1 it hands back exactly the original slice. */
+        int dr = alck_vt_dealloc(base, s);
+        if (dr != 0) {
+            if (dr == -1) *out = recovered;
+            return dr;
+        }
         out->allocator = base; out->offset = 0; out->len = 0;
         return 0;
     }
 
     if (new_len == s.len) { *out = s; return 0; }
 
-    if (s.offset < ALCK_OVERHEAD) { errno = EINVAL; return -1; }
+    if (s.offset < ALCK_OVERHEAD) { errno = EINVAL; *out = recovered; return -1; }
     block_start = s.offset - ALCK_OVERHEAD;
 
-    if (alck_read_overhead(a->bs, block_start, &overhead) != 0) return -1;
-    if ((overhead & ALCK_IN_USE_BIT) == 0) { errno = EINVAL; return -1; }
+    if (alck_read_overhead(a->bs, block_start, &overhead) != 0) { *out = recovered; return -1; }
+    if ((overhead & ALCK_IN_USE_BIT) == 0) { errno = EINVAL; *out = recovered; return -1; }
 
     old_n = overhead & ALCK_BLOCKS_MASK;
-    if (old_n == 0) { errno = EINVAL; return -1; }
+    if (old_n == 0) { errno = EINVAL; *out = recovered; return -1; }
 
     new_n = alck_blocks_needed(new_len, a->block_size);
-    if (new_n == UINT64_MAX) { errno = EINVAL; return -1; }
+    if (new_n == UINT64_MAX) { errno = EINVAL; *out = recovered; return -1; }
 
     if (old_n == new_n) {
         /* Same backing blocks: zero newly-exposed bytes on grow */
         if (new_len > s.len) {
             uint64_t to_zero = new_len - s.len;
 #if UINT64_MAX > SIZE_MAX
-            if (to_zero > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
+            if (to_zero > (uint64_t)SIZE_MAX) { errno = EINVAL; *out = recovered; return -1; }
 #endif
-            if (bstack_zero(a->bs, s.offset + s.len, (size_t)to_zero) != 0)
+            if (bstack_zero(a->bs, s.offset + s.len, (size_t)to_zero) != 0) {
+                *out = recovered;
                 return -1;
+            }
         }
         out->allocator = base; out->offset = s.offset; out->len = new_len;
         return 0;
     }
 
-    if (old_n > UINT64_MAX / a->block_size) { errno = EINVAL; return -1; }
+    if (old_n > UINT64_MAX / a->block_size) { errno = EINVAL; *out = recovered; return -1; }
     old_backing = old_n * a->block_size;
-    if (new_n > UINT64_MAX / a->block_size) { errno = EINVAL; return -1; }
+    if (new_n > UINT64_MAX / a->block_size) { errno = EINVAL; *out = recovered; return -1; }
     new_backing = new_n * a->block_size;
-    if (block_start > UINT64_MAX - old_backing) { errno = EINVAL; return -1; }
+    if (block_start > UINT64_MAX - old_backing) { errno = EINVAL; *out = recovered; return -1; }
 
     /* Precompute the expected tail for this allocation (sentinel). */
     {
@@ -5138,22 +5360,28 @@ static int alck_vt_realloc(bstack_allocator_t *base, bstack_slice_t s,
             uint64_t delta = new_backing - old_backing;
             int tail_done = 0;
 #if UINT64_MAX > SIZE_MAX
-            if (delta > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
+            if (delta > (uint64_t)SIZE_MAX) { errno = EINVAL; *out = recovered; return -1; }
 #endif
 
 #ifdef BSTACK_FEATURE_ATOMIC
             {
                 int ok = 0;
                 if (bstack_try_extend_zeros(a->bs, sentinel,
-                                            (size_t)delta, &ok) != 0) return -1;
+                                            (size_t)delta, &ok) != 0) {
+                    *out = recovered;
+                    return -1;
+                }
                 if (ok) tail_done = 1;
             }
 #else
             {
                 uint64_t cur_tail;
-                if (bstack_len(a->bs, &cur_tail) != 0) return -1;
+                if (bstack_len(a->bs, &cur_tail) != 0) { *out = recovered; return -1; }
                 if (sentinel == cur_tail) {
-                    if (bstack_extend(a->bs, (size_t)delta, NULL) != 0) return -1;
+                    if (bstack_extend(a->bs, (size_t)delta, NULL) != 0) {
+                        *out = recovered;
+                        return -1;
+                    }
                     tail_done = 1;
                 }
             }
@@ -5163,13 +5391,19 @@ static int alck_vt_realloc(bstack_allocator_t *base, bstack_slice_t s,
                 if (new_len > s.len) {
                     uint64_t to_zero = new_len - s.len;
 #if UINT64_MAX > SIZE_MAX
-                    if (to_zero > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
+                    if (to_zero > (uint64_t)SIZE_MAX) { errno = EINVAL; *out = recovered; return -1; }
 #endif
                     if (bstack_zero(a->bs, s.offset + s.len,
-                                    (size_t)to_zero) != 0) return -1;
+                                    (size_t)to_zero) != 0) {
+                        *out = recovered;
+                        return -1;
+                    }
                 }
                 if (alck_write_overhead(a->bs, block_start,
-                                        ALCK_IN_USE_BIT | new_n) != 0) return -1;
+                                        ALCK_IN_USE_BIT | new_n) != 0) {
+                    *out = recovered;
+                    return -1;
+                }
                 out->allocator = base; out->offset = s.offset; out->len = new_len;
                 return 0;
             }
@@ -5182,24 +5416,51 @@ static int alck_vt_realloc(bstack_allocator_t *base, bstack_slice_t s,
                 uint8_t       *tmp;
                 uint64_t       copy_len;
 
-                if (alck_vt_alloc(base, new_len, &new_s) != 0) return -1;
+                if (alck_vt_alloc(base, new_len, &new_s) != 0) {
+                    *out = recovered;
+                    return -1;
+                }
 
                 copy_len = s.len < new_len ? s.len : new_len;
                 if (copy_len > 0) {
 #if UINT64_MAX > SIZE_MAX
-                    if (copy_len > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
+                    if (copy_len > (uint64_t)SIZE_MAX) {
+                        errno = EINVAL;
+                        alck_vt_dealloc(base, new_s); /* best-effort rollback; original untouched either way */
+                        *out = recovered;
+                        return -1;
+                    }
 #endif
                     tmp = malloc((size_t)copy_len);
-                    if (!tmp) return -1;
+                    if (!tmp) {
+                        alck_vt_dealloc(base, new_s);
+                        *out = recovered;
+                        return -1;
+                    }
                     if (bstack_get(a->bs, s.offset, s.offset + copy_len, tmp) != 0
                         || bstack_set(a->bs, new_s.offset, tmp,
                                       (size_t)copy_len) != 0) {
-                        free(tmp); return -1;
+                        free(tmp);
+                        /* The new region was allocated but the copy failed. Roll
+                         * it back (best-effort) so it is not leaked; the
+                         * original still holds the data untouched, so it
+                         * remains the survivor regardless of whether this
+                         * rollback itself succeeds. */
+                        alck_vt_dealloc(base, new_s);
+                        *out = recovered;
+                        return -1;
                     }
                     free(tmp);
                 }
 
-                if (alck_vt_dealloc(base, s) != 0) return -1;
+                /* New region committed and populated; it is now the survivor,
+                 * so a failure freeing the old block returns the new region
+                 * instead (the old block leaks until crash recovery). */
+                recovered = new_s;
+                if (alck_vt_dealloc(base, s) != 0) {
+                    *out = recovered;
+                    return -1;
+                }
                 *out = new_s;
                 return 0;
             }
@@ -5212,7 +5473,7 @@ static int alck_vt_realloc(bstack_allocator_t *base, bstack_slice_t s,
             uint64_t delta = old_backing - new_backing;
             uint64_t excess_start;
 #if UINT64_MAX > SIZE_MAX
-            if (delta > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
+            if (delta > (uint64_t)SIZE_MAX) { errno = EINVAL; *out = recovered; return -1; }
 #endif
 
             /* Overhead is the commit point for both tail and non-tail paths:
@@ -5221,7 +5482,16 @@ static int alck_vt_realloc(bstack_allocator_t *base, bstack_slice_t s,
              * recover() can reclaim, rather than an overhead that claims more
              * blocks than the file contains. */
             if (alck_write_overhead(a->bs, block_start,
-                                    ALCK_IN_USE_BIT | new_n) != 0) return -1;
+                                    ALCK_IN_USE_BIT | new_n) != 0) {
+                *out = recovered;
+                return -1;
+            }
+            /* This is the shrink commit point: the block now records new_n
+             * blocks, so the resized view is the survivor for any
+             * subsequent failure. */
+            recovered.allocator = base;
+            recovered.offset    = s.offset;
+            recovered.len       = new_len;
 
             /* Tail shrink: try_discard atomically checks tail == sentinel and
              * removes the excess under bstack's write lock, so no other thread
@@ -5231,7 +5501,10 @@ static int alck_vt_realloc(bstack_allocator_t *base, bstack_slice_t s,
             {
                 int ok = 0;
                 if (bstack_try_discard(a->bs, sentinel, (size_t)delta,
-                                       &ok) != 0) return -1;
+                                       &ok) != 0) {
+                    *out = recovered;
+                    return -1;
+                }
                 if (ok) {
                     out->allocator = base; out->offset = s.offset;
                     out->len = new_len;
@@ -5241,9 +5514,12 @@ static int alck_vt_realloc(bstack_allocator_t *base, bstack_slice_t s,
 #else
             {
                 uint64_t cur_tail;
-                if (bstack_len(a->bs, &cur_tail) != 0) return -1;
+                if (bstack_len(a->bs, &cur_tail) != 0) { *out = recovered; return -1; }
                 if (sentinel == cur_tail) {
-                    if (bstack_discard(a->bs, (size_t)delta) != 0) return -1;
+                    if (bstack_discard(a->bs, (size_t)delta) != 0) {
+                        *out = recovered;
+                        return -1;
+                    }
                     out->allocator = base; out->offset = s.offset;
                     out->len = new_len;
                     return 0;
@@ -5253,11 +5529,13 @@ static int alck_vt_realloc(bstack_allocator_t *base, bstack_slice_t s,
 
             /* Shrink non-tail: overhead already written (commit point); push the
              * excess blocks onto the free list (lock-free under atomic). */
-            if (new_n > UINT64_MAX / a->block_size) { errno = EINVAL; return -1; }
+            if (new_n > UINT64_MAX / a->block_size) { errno = EINVAL; *out = recovered; return -1; }
             excess_start = block_start + new_n * a->block_size;
             if (alck_push_free_blocks(a->bs, excess_start,
-                                      old_n - new_n, a->block_size) != 0)
+                                      old_n - new_n, a->block_size) != 0) {
+                *out = recovered;
                 return -1;
+            }
             out->allocator = base; out->offset = s.offset; out->len = new_len;
             return 0;
         }
