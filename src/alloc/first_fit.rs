@@ -1641,7 +1641,11 @@ mod fault_tests {
             );
             let mut r = alloc.alloc(240).unwrap();
             r.write([0x22u8; 240]).unwrap();
-            assert_eq!(r.read().unwrap(), vec![0x22u8; 240], "at={at}: reuse reads back");
+            assert_eq!(
+                r.read().unwrap(),
+                vec![0x22u8; 240],
+                "at={at}: reuse reads back"
+            );
             alloc.dealloc(r).unwrap();
             assert_arena_footers_match(&alloc, &format!("at={at} after reuse"));
         }
