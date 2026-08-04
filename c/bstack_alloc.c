@@ -2983,7 +2983,7 @@ static int gt_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
             if (new_len < aligned_new) {
                 uint64_t gap = aligned_new - new_len;
 #if UINT64_MAX > SIZE_MAX
-                if (gap > (uint64_t)SIZE_MAX) return -2;
+                if (gap > (uint64_t)SIZE_MAX) { errno = EINVAL; return -2; }
 #endif
                 if (bstack_zero(a->bs, slice.offset + new_len, (size_t)gap) != 0)
                     return -2;
