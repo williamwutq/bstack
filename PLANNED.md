@@ -70,34 +70,6 @@ Reference: https://github.com/williamwutq/bstack/pull/32
 
 ---
 
-## Restoring `DebugCheckingAllocator` (post-0.4.0)
-
-**Feature flag:** `alloc` (as before)
-**Breaking change:** No — additive; the type was withdrawn in 0.4.0 and returns as new API surface.
-
-### Motivation
-
-`DebugCheckingAllocator<A>` was a wrapping allocator that validated an inner allocator's behaviour at runtime: it tracked the set of live and freed regions, detected overlapping allocations, caught double-frees and use-after-free, and flagged any invariant violation — a drop-in checker for both the built-in allocators and third-party implementations. It was temporarily removed in 0.4.0 because its implementation predated the three-type handle redesign and the `BStackAllocError` / `BStackBulkAllocError` return types, and porting it under the pressure of a large breaking release would have shipped a messy, under-reviewed version. Rather than block the release, it was withdrawn with the intent to reintroduce it cleanly.
-
-The value it provides is hard to replicate ad hoc: allocator bugs — overlap, double-free, leaks, metadata corruption — are exactly the class that ordinary unit tests miss and that only surface under randomized or adversarial workloads. A maintained checking wrapper is the natural place to assert those invariants once and reuse them across every allocator and fuzz test.
-
-### Design
-
-Reintroduce `DebugCheckingAllocator<A: BStackAllocator>` as a transparent wrapper:
-
-- Wraps an inner `A`, forwards `alloc` / `realloc` / `dealloc` / bulk to it, and records the resulting `(offset, len)` regions in an in-memory tracking structure.
-- On each operation validates: no returned region overlaps a live region; no `dealloc` / `realloc` targets a region that is not currently live (double-free / use-after-free); bulk operations are all-or-nothing against the tracked set.
-- Its handle type carries the inner handle plus enough identity to map back to the tracking entry, and converts `Into<BStackOwnedSlice>` like any other handle.
-- Must thread through the new error types: on a failed `realloc` / `dealloc` the inner allocator now returns the surviving handle inside `BStackAllocError`, so the wrapper must **re-wrap that handle and update its tracking** rather than dropping it — otherwise the checker itself would introduce the very leak the 0.4.0 change set out to prevent. `dealloc_bulk` likewise re-wraps the un-freed handles from `BStackBulkAllocError`.
-
-### Open questions
-
-- **Panic vs. error on violation.** Panicking gives loud, immediate test failures but is unusable in `Result`-based property tests that want to *assert* an error was produced; a configurable mode (panic / return `Self::Error`) may be needed.
-- **Tracking under `None`-handle errors.** When an inner operation fails and reports `handle: None` (allocation genuinely lost — e.g. `ghost_tree`'s torn AVL insert), the wrapper must decide whether to keep the region "live," mark it "lost," or drop it from tracking; each choice changes which subsequent operations the checker flags.
-- **Overhead and gating.** Whether it lives behind a dedicated feature or is always available under `alloc`; the tracking set adds allocation and per-op cost that should not leak into production builds.
-
----
-
 ## `BStackInPlaceGuard` — ambient atomic-block guard over in-place writes
 
 **Feature flag:** `set` + `atomic` (same gate as `inplace_gen`/`process_gen`)

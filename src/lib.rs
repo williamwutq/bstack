@@ -396,11 +396,11 @@
 //!
 //! * **`alloc`** — Region-based sub-allocation over a `BStack` payload.
 //!   Adds the allocator traits, handle types ([`BStackRange`],
-//!   [`BStackOwnedSlice`], [`BStackSlice`]), and [`LinearBStackAllocator`] /
-//!   [`GhostTreeBstackAllocator`].  Combined with `set`, also enables
-//!   [`BStackSliceWriter`], [`FirstFitBStackAllocator`],
-//!   [`SlabBStackAllocator`], [`CheckedSlabBStackAllocator`], and
-//!   [`BStackByteVec`].
+//!   [`BStackOwnedSlice`], [`BStackSlice`]), [`LinearBStackAllocator`],
+//!   [`GhostTreeBstackAllocator`], and [`DebugCheckingAllocator`].
+//!   Combined with `set`, also enables [`BStackSliceWriter`],
+//!   [`FirstFitBStackAllocator`], [`SlabBStackAllocator`],
+//!   [`CheckedSlabBStackAllocator`], and [`BStackByteVec`].
 //!
 //! * **`atomic`** — Compound read-modify-write operations that hold the write
 //!   lock across what would otherwise be separate calls.  Combined with `set`,
@@ -509,6 +509,15 @@
 //!   [`recover`](CheckedSlabBStackAllocator::recover) automatically).
 //!   Requires both `alloc` and `set` features.
 //!
+//! * [`DebugCheckingAllocator<A>`](DebugCheckingAllocator) — transparent debug
+//!   wrapper.  Wraps any allocator whose `Allocated` type is [`BStackOwnedSlice`]
+//!   and whose `Error` is [`io::Error`].  Tracks allocated and freed regions in
+//!   memory and panics on overlapping allocations, double-frees, partial-frees,
+//!   and multi-span frees.  When the inner allocator reports a lost handle
+//!   (`handle: None` in [`BStackAllocError`]), the region is removed from
+//!   tracking entirely — its fate is unknown, so neither "live" nor "freed" would
+//!   be correct.  Intended for tests and debugging; O(n) per-operation overhead.
+//!   Requires `alloc` only.
 //!
 //! * [`BStackByteVec`]`<'a, A>` — a growable byte (`u8`) vector backed by a
 //!   [`BStack`] allocation (requires `alloc` + `set`).  Mirrors the core
@@ -621,7 +630,7 @@ mod alloc;
 pub use alloc::{
     BStackAllocError, BStackAllocator, BStackBulkAllocError, BStackBulkAllocator, BStackOwnedSlice,
     BStackOwnedSliceAllocator, BStackRange, BStackSlice, BStackSliceReader, BStackUninitAllocator,
-    LinearBStackAllocator,
+    DebugCheckingAllocator, LinearBStackAllocator,
 };
 #[cfg(all(feature = "alloc", feature = "set"))]
 pub use alloc::{

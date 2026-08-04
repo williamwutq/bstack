@@ -48,6 +48,9 @@
 //! * Standard allocator implementations: [`LinearBStackAllocator`], [`FirstFitBStackAllocator`],
 //!   [`GhostTreeBstackAllocator`], [`SlabBStackAllocator`], and [`CheckedSlabBStackAllocator`].
 //!
+//! * [`DebugCheckingAllocator`] — transparent debug wrapper that validates any
+//!   allocator's behaviour at runtime (overlap, double-free, partial-free detection).
+//!
 //! # Standard Allocators
 //!
 //! * [`LinearBStackAllocator`] — bump allocator that always appends to the tail.
@@ -66,6 +69,14 @@
 //!
 //! * [`CheckedSlabBStackAllocator`] — crash-recoverable slab variant (`alloc` + `set`).
 //!   8-byte per-block header tracks state; double-frees caught.
+//!
+//! # Debug wrapper
+//!
+//! * [`DebugCheckingAllocator<A>`](DebugCheckingAllocator) — wraps any allocator
+//!   (`alloc`).  Tracks allocated and freed regions in memory and panics on
+//!   overlapping allocations, double-frees, partial-frees, and multi-span frees.
+//!   Intended for tests and debugging only; the O(n) overlap checks add
+//!   significant per-operation overhead.
 //!
 //! # Region handle design
 //!
@@ -89,7 +100,8 @@
 //! # Feature flags
 //!
 //! The `alloc` Cargo feature enables this module, including all allocator traits,
-//! handle types, and [`LinearBStackAllocator`] / [`GhostTreeBstackAllocator`]:
+//! handle types, [`LinearBStackAllocator`], [`GhostTreeBstackAllocator`], and
+//! [`DebugCheckingAllocator`]:
 //!
 //! ```toml
 //! bstack = { version = "0.1", features = ["alloc"] }
@@ -654,6 +666,7 @@ macro_rules! read_bstack {
 
 #[cfg(feature = "set")]
 pub mod checked_slab;
+pub mod debug_checking;
 #[cfg(feature = "set")]
 pub mod first_fit;
 #[cfg(feature = "set")]
@@ -668,6 +681,7 @@ pub mod vec;
 
 #[cfg(feature = "set")]
 pub use checked_slab::CheckedSlabBStackAllocator;
+pub use debug_checking::DebugCheckingAllocator;
 #[cfg(feature = "set")]
 pub use first_fit::FirstFitBStackAllocator;
 #[cfg(feature = "set")]
