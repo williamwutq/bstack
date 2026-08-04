@@ -46,7 +46,7 @@
 //! ```no_run
 //! use bstack::{BStack, BStackAllocator, DebugCheckingAllocator, LinearBStackAllocator};
 //!
-//! # fn main() -> std::io::Result<()> {
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! let inner = LinearBStackAllocator::new(BStack::open("test.bstack")?);
 //! let alloc = DebugCheckingAllocator::new(inner);
 //!
