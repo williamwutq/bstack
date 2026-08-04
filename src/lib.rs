@@ -621,7 +621,7 @@ mod alloc;
 pub use alloc::{
     BStackAllocError, BStackAllocator, BStackBulkAllocError, BStackBulkAllocator, BStackOwnedSlice,
     BStackOwnedSliceAllocator, BStackRange, BStackSlice, BStackSliceReader, BStackUninitAllocator,
-    LinearBStackAllocator,
+    DebugCheckingAllocator, LinearBStackAllocator,
 };
 #[cfg(all(feature = "alloc", feature = "set"))]
 pub use alloc::{

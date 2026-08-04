@@ -654,6 +654,7 @@ macro_rules! read_bstack {
 
 #[cfg(feature = "set")]
 pub mod checked_slab;
+pub mod debug_checking;
 #[cfg(feature = "set")]
 pub mod first_fit;
 #[cfg(feature = "set")]
@@ -668,6 +669,7 @@ pub mod vec;
 
 #[cfg(feature = "set")]
 pub use checked_slab::CheckedSlabBStackAllocator;
+pub use debug_checking::DebugCheckingAllocator;
 #[cfg(feature = "set")]
 pub use first_fit::FirstFitBStackAllocator;
 #[cfg(feature = "set")]
