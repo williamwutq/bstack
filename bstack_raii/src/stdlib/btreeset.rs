@@ -397,6 +397,251 @@ impl<K: Pod + Ord> BStackBTreeSet<K> {
         Ok(false)
     }
 
+    /// The number of keys in the node at `off`.
+    fn child_nkeys(stack: &BStack, off: u64) -> io::Result<usize> {
+        let mut b = [0u8; 8];
+        stack.get_into(off + NKEYS_OFF as u64, &mut b)?;
+        Ok(get_u64(&b) as usize)
+    }
+
+    /// The rightmost / leftmost key bytes in the subtree at `off`.
+    fn edge_key(stack: &BStack, off: u64, rightmost: bool) -> io::Result<Vec<u8>> {
+        let mut nb = Self::read_node(stack, off)?;
+        while !nb.leaf {
+            let c = if rightmost {
+                *nb.children.last().unwrap()
+            } else {
+                nb.children[0]
+            };
+            nb = Self::read_node(stack, c)?;
+        }
+        let i = if rightmost { nb.keys.len() - 1 } else { 0 };
+        Ok(nb.keys[i].clone())
+    }
+
+    /// Path-copy delete of `key` from the subtree at `off`; returns the new
+    /// subtree offset and whether the key was found.
+    fn delete_off(
+        build: &mut Build<'_, impl BStackOwnedSliceAllocator>,
+        stack: &BStack,
+        off: u64,
+        key: &K,
+    ) -> io::Result<(u64, bool)> {
+        let nb = Self::read_node(stack, off)?;
+        build.freed.push(off);
+        let (nb2, found) = Self::delete_bnode(build, stack, nb, key)?;
+        Ok((build.emit(&nb2)?, found))
+    }
+
+    /// Delete `key` from the in-memory node `nb`, rebalancing children to keep the
+    /// B-tree invariant. Returns the modified node (not yet emitted) and found.
+    fn delete_bnode(
+        build: &mut Build<'_, impl BStackOwnedSliceAllocator>,
+        stack: &BStack,
+        mut nb: BNode,
+        key: &K,
+    ) -> io::Result<(BNode, bool)> {
+        let (i, found) = Self::search(&nb, key);
+
+        if found {
+            if nb.leaf {
+                nb.keys.remove(i);
+                return Ok((nb, true));
+            }
+            let yc = Self::child_nkeys(stack, nb.children[i])?;
+            let zc = Self::child_nkeys(stack, nb.children[i + 1])?;
+            if yc >= T {
+                let pk = Self::edge_key(stack, nb.children[i], true)?;
+                nb.keys[i] = pk.clone();
+                let (new_y, _) = Self::delete_off(build, stack, nb.children[i], &Self::read_key(&pk))?;
+                nb.children[i] = new_y;
+            } else if zc >= T {
+                let sk = Self::edge_key(stack, nb.children[i + 1], false)?;
+                nb.keys[i] = sk.clone();
+                let (new_z, _) =
+                    Self::delete_off(build, stack, nb.children[i + 1], &Self::read_key(&sk))?;
+                nb.children[i + 1] = new_z;
+            } else {
+                let y_off = nb.children[i];
+                let z_off = nb.children[i + 1];
+                let mut y = Self::read_node(stack, y_off)?;
+                build.freed.push(y_off);
+                let mut z = Self::read_node(stack, z_off)?;
+                build.freed.push(z_off);
+                let sk = nb.keys.remove(i);
+                nb.children.remove(i + 1);
+                y.keys.push(sk);
+                y.keys.append(&mut z.keys);
+                if !y.leaf {
+                    y.children.append(&mut z.children);
+                }
+                let (y2, _) = Self::delete_bnode(build, stack, y, key)?;
+                nb.children[i] = build.emit(&y2)?;
+            }
+            return Ok((nb, true));
+        }
+
+        if nb.leaf {
+            return Ok((nb, false));
+        }
+
+        if Self::child_nkeys(stack, nb.children[i])? >= T {
+            let (new_c, found) = Self::delete_off(build, stack, nb.children[i], key)?;
+            nb.children[i] = new_c;
+            return Ok((nb, found));
+        }
+
+        let n = nb.keys.len();
+        if i > 0 && Self::child_nkeys(stack, nb.children[i - 1])? >= T {
+            let ci_off = nb.children[i];
+            let ls_off = nb.children[i - 1];
+            let mut ci = Self::read_node(stack, ci_off)?;
+            build.freed.push(ci_off);
+            let mut ls = Self::read_node(stack, ls_off)?;
+            build.freed.push(ls_off);
+            ci.keys.insert(0, nb.keys[i - 1].clone());
+            if !ci.leaf {
+                ci.children.insert(0, ls.children.pop().unwrap());
+            }
+            nb.keys[i - 1] = ls.keys.pop().unwrap();
+            nb.children[i - 1] = build.emit(&ls)?;
+            let (ci2, found) = Self::delete_bnode(build, stack, ci, key)?;
+            nb.children[i] = build.emit(&ci2)?;
+            return Ok((nb, found));
+        }
+        if i < n && Self::child_nkeys(stack, nb.children[i + 1])? >= T {
+            let ci_off = nb.children[i];
+            let rs_off = nb.children[i + 1];
+            let mut ci = Self::read_node(stack, ci_off)?;
+            build.freed.push(ci_off);
+            let mut rs = Self::read_node(stack, rs_off)?;
+            build.freed.push(rs_off);
+            ci.keys.push(nb.keys[i].clone());
+            if !ci.leaf {
+                ci.children.push(rs.children.remove(0));
+            }
+            nb.keys[i] = rs.keys.remove(0);
+            nb.children[i + 1] = build.emit(&rs)?;
+            let (ci2, found) = Self::delete_bnode(build, stack, ci, key)?;
+            nb.children[i] = build.emit(&ci2)?;
+            return Ok((nb, found));
+        }
+
+        if i < n {
+            let ci_off = nb.children[i];
+            let rs_off = nb.children[i + 1];
+            let mut ci = Self::read_node(stack, ci_off)?;
+            build.freed.push(ci_off);
+            let mut rs = Self::read_node(stack, rs_off)?;
+            build.freed.push(rs_off);
+            let sk = nb.keys.remove(i);
+            nb.children.remove(i + 1);
+            ci.keys.push(sk);
+            ci.keys.append(&mut rs.keys);
+            if !ci.leaf {
+                ci.children.append(&mut rs.children);
+            }
+            let (ci2, found) = Self::delete_bnode(build, stack, ci, key)?;
+            nb.children[i] = build.emit(&ci2)?;
+            Ok((nb, found))
+        } else {
+            let ls_off = nb.children[i - 1];
+            let ci_off = nb.children[i];
+            let mut ls = Self::read_node(stack, ls_off)?;
+            build.freed.push(ls_off);
+            let mut ci = Self::read_node(stack, ci_off)?;
+            build.freed.push(ci_off);
+            let sk = nb.keys.remove(i - 1);
+            nb.children.remove(i);
+            ls.keys.push(sk);
+            ls.keys.append(&mut ci.keys);
+            if !ls.leaf {
+                ls.children.append(&mut ci.children);
+            }
+            let (ls2, found) = Self::delete_bnode(build, stack, ls, key)?;
+            nb.children[i - 1] = build.emit(&ls2)?;
+            Ok((nb, found))
+        }
+    }
+
+    /// Remove `key`; returns `true` if it was present. Deletes from the tree
+    /// first, then decrements the Bloom filter (see the module docs).
+    pub fn remove<A: BStackOwnedSliceAllocator>(
+        &self,
+        allocator: &A,
+        key: &K,
+    ) -> io::Result<bool> {
+        let handle = self.range.start();
+        let stack = allocator.stack();
+        let key_bytes = bytemuck::bytes_of(key).to_vec();
+        if !self.tree_contains(stack, key, &key_bytes)? {
+            return Ok(false);
+        }
+        let root = read_u64(stack, handle + ROOT_OFF)?;
+        let len = read_u64(stack, handle + LEN_OFF)?;
+
+        let mut build = Build {
+            allocator,
+            node_size: Self::node_size(),
+            ksize: Self::ksize(),
+            children_off: Self::children_off(),
+            writes: Vec::new(),
+            freed: Vec::new(),
+        };
+
+        let built: io::Result<u64> = (|| {
+            let nb = Self::read_node(stack, root)?;
+            build.freed.push(root);
+            let (root_nb, _) = Self::delete_bnode(&mut build, stack, nb, key)?;
+            let new_root = if root_nb.keys.is_empty() {
+                if root_nb.leaf {
+                    0
+                } else {
+                    root_nb.children[0]
+                }
+            } else {
+                build.emit(&root_nb)?
+            };
+            Ok(new_root)
+        })();
+
+        match built {
+            Ok(new_root) => {
+                let new_node_offs: Vec<u64> = build.writes.iter().map(|(o, _)| *o).collect();
+                let mut writes = core::mem::take(&mut build.writes);
+                writes.push((handle + ROOT_OFF, new_root.to_le_bytes().to_vec()));
+                writes.push((handle + LEN_OFF, (len - 1).to_le_bytes().to_vec()));
+                match stack.set_batched(writes) {
+                    Ok(()) => {
+                        for off in &build.freed {
+                            let _ = unsafe {
+                                dealloc_range(allocator, BStackRange::new(*off, build.node_size))
+                            };
+                        }
+                        // Tree updated; now decrement the filter.
+                        self.bloom(stack)?.remove(allocator, key)?;
+                        Ok(true)
+                    }
+                    Err(e) => {
+                        for off in new_node_offs {
+                            let _ = unsafe {
+                                dealloc_range(allocator, BStackRange::new(off, build.node_size))
+                            };
+                        }
+                        Err(e)
+                    }
+                }
+            }
+            Err(e) => {
+                for (off, _) in &build.writes {
+                    let _ =
+                        unsafe { dealloc_range(allocator, BStackRange::new(*off, build.node_size)) };
+                }
+                Err(e)
+            }
+        }
+    }
+
     /// The smallest key, or `None` if empty.
     pub fn first(&self, stack: &BStack) -> io::Result<Option<K>> {
         self.extreme(stack, true)

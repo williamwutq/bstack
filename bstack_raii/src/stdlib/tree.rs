@@ -463,6 +463,286 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBTreeMap<K, V> {
         Ok(self.get(stack, key)?.is_some())
     }
 
+    /// The number of keys in the node at `off` (reads just the count field).
+    fn child_nkeys(stack: &BStack, off: u64) -> io::Result<usize> {
+        Ok(get_u64(&{
+            let mut b = [0u8; 8];
+            stack.get_into(off + NKEYS_OFF as u64, &mut b)?;
+            b
+        }) as usize)
+    }
+
+    /// The rightmost (largest) `(key_bytes, value)` in the subtree at `off`.
+    fn max_entry(stack: &BStack, off: u64) -> io::Result<(Vec<u8>, u64)> {
+        let mut nb = Self::read_node(stack, off)?;
+        while !nb.leaf {
+            nb = Self::read_node(stack, *nb.children.last().unwrap())?;
+        }
+        let i = nb.keys.len() - 1;
+        Ok((nb.keys[i].clone(), nb.vals[i]))
+    }
+
+    /// The leftmost (smallest) `(key_bytes, value)` in the subtree at `off`.
+    fn min_entry(stack: &BStack, off: u64) -> io::Result<(Vec<u8>, u64)> {
+        let mut nb = Self::read_node(stack, off)?;
+        while !nb.leaf {
+            nb = Self::read_node(stack, nb.children[0])?;
+        }
+        Ok((nb.keys[0].clone(), nb.vals[0]))
+    }
+
+    /// Path-copy delete of `key` from the subtree at `off`; returns the new
+    /// subtree offset and the removed value (if the key was found).
+    fn delete_off(
+        build: &mut Build<'_, impl BStackOwnedSliceAllocator>,
+        stack: &BStack,
+        off: u64,
+        key: &K,
+    ) -> io::Result<(u64, Option<u64>)> {
+        let nb = Self::read_node(stack, off)?;
+        build.freed.push(off);
+        let (nb2, val) = Self::delete_bnode(build, stack, nb, key)?;
+        Ok((build.emit(&nb2)?, val))
+    }
+
+    /// Delete `key` from the in-memory node `nb` (its old block already recorded
+    /// for freeing), rebalancing children to keep the B-tree invariant. Returns
+    /// the modified node (not yet emitted) and the removed value.
+    fn delete_bnode(
+        build: &mut Build<'_, impl BStackOwnedSliceAllocator>,
+        stack: &BStack,
+        mut nb: BNode,
+        key: &K,
+    ) -> io::Result<(BNode, Option<u64>)> {
+        let (i, found) = Self::search(&nb, key);
+
+        if found {
+            if nb.leaf {
+                let v = nb.vals.remove(i);
+                nb.keys.remove(i);
+                return Ok((nb, Some(v)));
+            }
+            // Internal: the value at `i` is what we return.
+            let removed = nb.vals[i];
+            let yc = Self::child_nkeys(stack, nb.children[i])?;
+            let zc = Self::child_nkeys(stack, nb.children[i + 1])?;
+            if yc >= T {
+                // Replace with predecessor, then delete it from the left child.
+                let (pk, pv) = Self::max_entry(stack, nb.children[i])?;
+                nb.keys[i] = pk.clone();
+                nb.vals[i] = pv;
+                let (new_y, _) = Self::delete_off(build, stack, nb.children[i], &Self::read_key(&pk))?;
+                nb.children[i] = new_y;
+            } else if zc >= T {
+                // Replace with successor, then delete it from the right child.
+                let (sk, sv) = Self::min_entry(stack, nb.children[i + 1])?;
+                nb.keys[i] = sk.clone();
+                nb.vals[i] = sv;
+                let (new_z, _) =
+                    Self::delete_off(build, stack, nb.children[i + 1], &Self::read_key(&sk))?;
+                nb.children[i + 1] = new_z;
+            } else {
+                // Merge children[i] + separator + children[i+1], then delete from it.
+                let y_off = nb.children[i];
+                let z_off = nb.children[i + 1];
+                let mut y = Self::read_node(stack, y_off)?;
+                build.freed.push(y_off);
+                let mut z = Self::read_node(stack, z_off)?;
+                build.freed.push(z_off);
+                let sk = nb.keys.remove(i);
+                let sv = nb.vals.remove(i);
+                nb.children.remove(i + 1);
+                y.keys.push(sk);
+                y.vals.push(sv);
+                y.keys.append(&mut z.keys);
+                y.vals.append(&mut z.vals);
+                if !y.leaf {
+                    y.children.append(&mut z.children);
+                }
+                let (y2, _) = Self::delete_bnode(build, stack, y, key)?;
+                nb.children[i] = build.emit(&y2)?;
+            }
+            return Ok((nb, Some(removed)));
+        }
+
+        if nb.leaf {
+            return Ok((nb, None)); // key absent
+        }
+
+        // Key is in children[i]; ensure it has at least `T` keys before descending.
+        if Self::child_nkeys(stack, nb.children[i])? >= T {
+            let (new_c, val) = Self::delete_off(build, stack, nb.children[i], key)?;
+            nb.children[i] = new_c;
+            return Ok((nb, val));
+        }
+
+        let n = nb.keys.len();
+        if i > 0 && Self::child_nkeys(stack, nb.children[i - 1])? >= T {
+            // Borrow from the left sibling (rotate right through the parent).
+            let ci_off = nb.children[i];
+            let ls_off = nb.children[i - 1];
+            let mut ci = Self::read_node(stack, ci_off)?;
+            build.freed.push(ci_off);
+            let mut ls = Self::read_node(stack, ls_off)?;
+            build.freed.push(ls_off);
+            ci.keys.insert(0, nb.keys[i - 1].clone());
+            ci.vals.insert(0, nb.vals[i - 1]);
+            if !ci.leaf {
+                ci.children.insert(0, ls.children.pop().unwrap());
+            }
+            nb.keys[i - 1] = ls.keys.pop().unwrap();
+            nb.vals[i - 1] = ls.vals.pop().unwrap();
+            nb.children[i - 1] = build.emit(&ls)?;
+            let (ci2, val) = Self::delete_bnode(build, stack, ci, key)?;
+            nb.children[i] = build.emit(&ci2)?;
+            return Ok((nb, val));
+        }
+        if i < n && Self::child_nkeys(stack, nb.children[i + 1])? >= T {
+            // Borrow from the right sibling (rotate left through the parent).
+            let ci_off = nb.children[i];
+            let rs_off = nb.children[i + 1];
+            let mut ci = Self::read_node(stack, ci_off)?;
+            build.freed.push(ci_off);
+            let mut rs = Self::read_node(stack, rs_off)?;
+            build.freed.push(rs_off);
+            ci.keys.push(nb.keys[i].clone());
+            ci.vals.push(nb.vals[i]);
+            if !ci.leaf {
+                ci.children.push(rs.children.remove(0));
+            }
+            nb.keys[i] = rs.keys.remove(0);
+            nb.vals[i] = rs.vals.remove(0);
+            nb.children[i + 1] = build.emit(&rs)?;
+            let (ci2, val) = Self::delete_bnode(build, stack, ci, key)?;
+            nb.children[i] = build.emit(&ci2)?;
+            return Ok((nb, val));
+        }
+
+        // No lending sibling: merge with one (pulling a separator down).
+        if i < n {
+            let ci_off = nb.children[i];
+            let rs_off = nb.children[i + 1];
+            let mut ci = Self::read_node(stack, ci_off)?;
+            build.freed.push(ci_off);
+            let mut rs = Self::read_node(stack, rs_off)?;
+            build.freed.push(rs_off);
+            let sk = nb.keys.remove(i);
+            let sv = nb.vals.remove(i);
+            nb.children.remove(i + 1);
+            ci.keys.push(sk);
+            ci.vals.push(sv);
+            ci.keys.append(&mut rs.keys);
+            ci.vals.append(&mut rs.vals);
+            if !ci.leaf {
+                ci.children.append(&mut rs.children);
+            }
+            let (ci2, val) = Self::delete_bnode(build, stack, ci, key)?;
+            nb.children[i] = build.emit(&ci2)?;
+            Ok((nb, val))
+        } else {
+            let ls_off = nb.children[i - 1];
+            let ci_off = nb.children[i];
+            let mut ls = Self::read_node(stack, ls_off)?;
+            build.freed.push(ls_off);
+            let mut ci = Self::read_node(stack, ci_off)?;
+            build.freed.push(ci_off);
+            let sk = nb.keys.remove(i - 1);
+            let sv = nb.vals.remove(i - 1);
+            nb.children.remove(i);
+            ls.keys.push(sk);
+            ls.vals.push(sv);
+            ls.keys.append(&mut ci.keys);
+            ls.vals.append(&mut ci.vals);
+            if !ls.leaf {
+                ls.children.append(&mut ci.children);
+            }
+            let (ls2, val) = Self::delete_bnode(build, stack, ls, key)?;
+            nb.children[i - 1] = build.emit(&ls2)?;
+            Ok((nb, val))
+        }
+    }
+
+    /// Remove `key`, returning its value (owned) if present, else `None`.
+    /// Path-copies the affected path (rebalancing as needed) and commits the new
+    /// nodes plus the root update as one crash-atomic batch. **Single-writer.**
+    pub fn remove<A: BStackOwnedSliceAllocator>(
+        &self,
+        allocator: &A,
+        key: &K,
+    ) -> io::Result<Option<BStackOwned<V>>> {
+        let handle = self.range.start();
+        let stack = allocator.stack();
+        let root = read_u64(stack, handle + ROOT_OFF)?;
+        // Absent-key fast path avoids a wasted path copy.
+        if root == 0 || self.get(stack, key)?.is_none() {
+            return Ok(None);
+        }
+        let len = read_u64(stack, handle + LEN_OFF)?;
+
+        let mut build = Build {
+            allocator,
+            node_size: Self::node_size(),
+            ksize: Self::ksize(),
+            vals_off: Self::vals_off(),
+            children_off: Self::children_off(),
+            writes: Vec::new(),
+            freed: Vec::new(),
+        };
+
+        let built: io::Result<(u64, u64)> = (|| {
+            let nb = Self::read_node(stack, root)?;
+            build.freed.push(root);
+            let (root_nb, val) = Self::delete_bnode(&mut build, stack, nb, key)?;
+            let val = val.expect("key was present");
+            // Collapse an empty root: a leaf → empty tree; an internal → its child.
+            let new_root = if root_nb.keys.is_empty() {
+                if root_nb.leaf {
+                    0
+                } else {
+                    root_nb.children[0]
+                }
+            } else {
+                build.emit(&root_nb)?
+            };
+            Ok((new_root, val))
+        })();
+
+        match built {
+            Ok((new_root, val)) => {
+                let new_node_offs: Vec<u64> = build.writes.iter().map(|(o, _)| *o).collect();
+                let mut writes = core::mem::take(&mut build.writes);
+                writes.push((handle + ROOT_OFF, new_root.to_le_bytes().to_vec()));
+                writes.push((handle + LEN_OFF, (len - 1).to_le_bytes().to_vec()));
+                match stack.set_batched(writes) {
+                    Ok(()) => {
+                        for off in &build.freed {
+                            // SAFETY: replaced/merged away by the commit (single-writer).
+                            let _ = unsafe {
+                                dealloc_range(allocator, BStackRange::new(*off, build.node_size))
+                            };
+                        }
+                        Ok(Some(unsafe { BStackOwned::from_raw(Self::value_at(val)) }))
+                    }
+                    Err(e) => {
+                        for off in new_node_offs {
+                            let _ = unsafe {
+                                dealloc_range(allocator, BStackRange::new(off, build.node_size))
+                            };
+                        }
+                        Err(e)
+                    }
+                }
+            }
+            Err(e) => {
+                for (off, _) in &build.writes {
+                    let _ =
+                        unsafe { dealloc_range(allocator, BStackRange::new(*off, build.node_size)) };
+                }
+                Err(e)
+            }
+        }
+    }
+
     /// The smallest entry, or `None` if empty. Descends the leftmost path.
     pub fn first(&self, stack: &BStack) -> io::Result<Option<(K, V)>> {
         self.extreme(stack, true)

@@ -5744,3 +5744,53 @@ fn stdlib_btreeset_distinct_tags() {
         <BStackBTreeSet<u64> as BStackCast>::eightcc(),
     );
 }
+
+#[test]
+fn stdlib_tree_remove_rebalances() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let tree = BStackBTreeMap::<u32, MacroLeaf>::new(&alloc).unwrap();
+    for k in 0..200u32 {
+        tree.insert(&alloc, k, MacroLeaf::new(&alloc, k * 10).unwrap()).unwrap();
+    }
+    assert_eq!(tree.len(stack).unwrap(), 200);
+
+    // Remove-absent returns None.
+    assert!(tree.remove(&alloc, &1000).unwrap().is_none());
+
+    // Remove every even key (heavy borrow/merge across a multi-level tree).
+    for k in (0..200u32).step_by(2) {
+        let v = tree.remove(&alloc, &k).unwrap().unwrap();
+        assert_eq!(v.handle().val(stack).unwrap(), k * 10);
+        v.bstack_drop(&alloc).unwrap();
+    }
+    assert_eq!(tree.len(stack).unwrap(), 100);
+
+    // Evens gone, odds intact, iteration still sorted.
+    for k in 0..200u32 {
+        let g = tree.get(stack, &k).unwrap();
+        if k % 2 == 0 {
+            assert!(g.is_none());
+        } else {
+            assert_eq!(g.unwrap().val(stack).unwrap(), k * 10);
+        }
+    }
+    let keys: Vec<u32> = tree.to_vec(stack).unwrap().iter().map(|(k, _)| *k).collect();
+    assert_eq!(keys, (0..200u32).filter(|k| k % 2 == 1).collect::<Vec<_>>());
+
+    // Drain the rest → empty (root collapses to 0).
+    for k in (1..200u32).step_by(2) {
+        tree.remove(&alloc, &k).unwrap().unwrap().bstack_drop(&alloc).unwrap();
+    }
+    assert_eq!(tree.len(stack).unwrap(), 0);
+    assert!(tree.is_empty(stack).unwrap());
+    assert!(tree.first(stack).unwrap().is_none());
+
+    // Reinsert after collapse works.
+    tree.insert(&alloc, 42, MacroLeaf::new(&alloc, 420).unwrap()).unwrap();
+    assert_eq!(tree.get(stack, &42).unwrap().unwrap().val(stack).unwrap(), 420);
+
+    tree.bstack_drop(&alloc).unwrap();
+}
