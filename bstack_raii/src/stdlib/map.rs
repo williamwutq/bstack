@@ -40,10 +40,10 @@ use std::io;
 use bstack::{BStack, BStackGenOp, BStackOwnedSliceAllocator, BStackRange};
 use bytemuck::{Pod, Zeroable};
 
-use super::util::{Scratch, alloc_image, get_u64};
+use super::util::{Scratch, alloc_image, read_u64};
 use crate::block::{BStackBlock, BStackCast};
 use crate::clone::{ClonePlan, TryCloneIn};
-use crate::layout::{BlockHeader, EightCC, HEADER_SIZE};
+use crate::layout::{BlockHeader, EightCC, HEADER_SIZE, get_u64};
 use crate::owned::BStackOwned;
 use crate::teardown::{AutoDrop, BStackDrop, dealloc_range};
 
@@ -80,11 +80,6 @@ const MIN_CAP: u64 = 4;
 const EMPTY: u64 = 0;
 const OCCUPIED: u64 = 1;
 const TOMBSTONE: u64 = 2;
-
-/// Read a little-endian `u64` from the first 8 bytes of `b`.
-fn u64le(b: &[u8]) -> u64 {
-    u64::from_le_bytes(b[..8].try_into().unwrap())
-}
 
 /// 64-bit FNV-1a over `bytes`. Deterministic (so it is stable on disk).
 fn fnv1a(bytes: &[u8]) -> u64 {
@@ -163,10 +158,10 @@ where
         // 2. Parse it once.
         if meta.is_none() {
             let m = Meta {
-                table: u64le(&meta_buf[0..8]),
-                cap: u64le(&meta_buf[8..16]),
-                len: u64le(&meta_buf[16..24]),
-                used: u64le(&meta_buf[24..32]),
+                table: get_u64(&meta_buf[0..8]),
+                cap: get_u64(&meta_buf[8..16]),
+                len: get_u64(&meta_buf[16..24]),
+                used: get_u64(&meta_buf[24..32]),
             };
             mask = m.cap.wrapping_sub(1);
             cur = if m.cap == 0 { 0 } else { hash & mask };
@@ -197,7 +192,10 @@ where
                 // (and is inspected) before the next is issued.
                 let b: &mut [u8] =
                     unsafe { core::mem::transmute::<&mut [u8], _>(&mut bucket_buf[..]) };
-                return Some(BStackGenOp::Read { offset: off, buf: b });
+                return Some(BStackGenOp::Read {
+                    offset: off,
+                    buf: b,
+                });
             }
         }
         // 4. Commit the chosen writes together.
@@ -207,7 +205,10 @@ where
             let (off, ref bytes) = writes[i];
             // SAFETY: `writes` outlives the call and is not mutated after this point.
             let d: &[u8] = unsafe { core::mem::transmute::<&[u8], _>(bytes.as_slice()) };
-            return Some(BStackGenOp::Write { offset: off, data: d });
+            return Some(BStackGenOp::Write {
+                offset: off,
+                data: d,
+            });
         }
         None
     })
@@ -296,7 +297,7 @@ impl<K: Pod, V: BStackBlock> BStackHashMap<K, V> {
 
     /// Number of live entries.
     pub fn len(&self, stack: &BStack) -> io::Result<u64> {
-        get_u64(stack, self.range.start() + LEN_OFF)
+        read_u64(stack, self.range.start() + LEN_OFF)
     }
 
     /// Whether the map has no entries.
@@ -325,8 +326,8 @@ impl<K: Pod, V: BStackBlock> BStackHashMap<K, V> {
 
         loop {
             // Proactively keep the load factor under 3/4 (also clears tombstones).
-            let cap = get_u64(allocator.stack(), handle + CAP_OFF)?;
-            let used = get_u64(allocator.stack(), handle + USED_OFF)?;
+            let cap = read_u64(allocator.stack(), handle + CAP_OFF)?;
+            let used = read_u64(allocator.stack(), handle + USED_OFF)?;
             if cap == 0 || (used + 1) * 4 > cap * 3 {
                 self.grow(allocator)?;
                 continue;
@@ -343,7 +344,7 @@ impl<K: Pod, V: BStackBlock> BStackHashMap<K, V> {
                 stride,
                 hash,
                 |m, idx, buf| {
-                    let state = u64le(&buf[0..8]);
+                    let state = get_u64(&buf[0..8]);
                     if state == EMPTY {
                         let target = first_tomb.get().unwrap_or(idx);
                         let slot_was_empty = first_tomb.get().is_none();
@@ -360,7 +361,7 @@ impl<K: Pod, V: BStackBlock> BStackHashMap<K, V> {
                         ))
                     } else if state == OCCUPIED && buf[8..8 + ksz] == key_bytes[..] {
                         // Overwrite: replace the value ref, hand back the old one.
-                        old_value.set(u64le(&buf[8 + ksz..8 + ksz + 8]));
+                        old_value.set(get_u64(&buf[8 + ksz..8 + ksz + 8]));
                         is_new.set(false);
                         let value_off = m.table + idx * stride + 8 + ksz as u64;
                         ProbeStep::Stop(vec![(value_off, val_ref.to_le_bytes().to_vec())])
@@ -390,7 +391,9 @@ impl<K: Pod, V: BStackBlock> BStackHashMap<K, V> {
                 Ok(None)
             } else {
                 // SAFETY: the replaced value block's ownership transfers to the caller.
-                Ok(Some(unsafe { BStackOwned::from_raw(Self::value_at(old_value.get())) }))
+                Ok(Some(unsafe {
+                    BStackOwned::from_raw(Self::value_at(old_value.get()))
+                }))
             };
         }
     }
@@ -417,12 +420,12 @@ impl<K: Pod, V: BStackBlock> BStackHashMap<K, V> {
             stride,
             hash,
             |m, idx, buf| {
-                let state = u64le(&buf[0..8]);
+                let state = get_u64(&buf[0..8]);
                 if state == EMPTY {
                     ProbeStep::Stop(Vec::new()) // absent: commit nothing
                 } else if state == OCCUPIED && buf[8..8 + ksz] == key_bytes[..] {
                     found.set(true);
-                    old_value.set(u64le(&buf[8 + ksz..8 + ksz + 8]));
+                    old_value.set(get_u64(&buf[8 + ksz..8 + ksz + 8]));
                     ProbeStep::Stop(vec![
                         (m.table + idx * stride, TOMBSTONE.to_le_bytes().to_vec()),
                         (handle + LEN_OFF, (m.len - 1).to_le_bytes().to_vec()),
@@ -436,7 +439,9 @@ impl<K: Pod, V: BStackBlock> BStackHashMap<K, V> {
 
         if found.get() {
             // SAFETY: the removed value block's ownership transfers to the caller.
-            Ok(Some(unsafe { BStackOwned::from_raw(Self::value_at(old_value.get())) }))
+            Ok(Some(unsafe {
+                BStackOwned::from_raw(Self::value_at(old_value.get()))
+            }))
         } else {
             Ok(None)
         }
@@ -451,8 +456,8 @@ impl<K: Pod, V: BStackBlock> BStackHashMap<K, V> {
         let handle = self.range.start();
         let stride = Self::stride();
         let ksz = Self::ksize();
-        let table = get_u64(stack, handle + TABLE_OFF)?;
-        let cap = get_u64(stack, handle + CAP_OFF)?;
+        let table = read_u64(stack, handle + TABLE_OFF)?;
+        let cap = read_u64(stack, handle + CAP_OFF)?;
         if cap == 0 {
             return Ok(None);
         }
@@ -463,7 +468,7 @@ impl<K: Pod, V: BStackBlock> BStackHashMap<K, V> {
         let mut scratch = Scratch::new();
         for _ in 0..cap {
             let bucket = table + idx * stride;
-            let state = get_u64(stack, bucket)?;
+            let state = read_u64(stack, bucket)?;
             if state == EMPTY {
                 return Ok(None);
             }
@@ -471,7 +476,7 @@ impl<K: Pod, V: BStackBlock> BStackHashMap<K, V> {
                 let kb = scratch.buf(ksz);
                 stack.get_into(bucket + 8, kb)?;
                 if kb == key_bytes {
-                    let vref = get_u64(stack, bucket + 8 + ksz as u64)?;
+                    let vref = read_u64(stack, bucket + 8 + ksz as u64)?;
                     return Ok(Some(Self::value_at(vref)));
                 }
             }
@@ -492,7 +497,7 @@ impl<K: Pod, V: BStackBlock> BStackHashMap<K, V> {
         let handle = self.range.start();
         let stride = Self::stride();
         let ksz = Self::ksize();
-        let cap0 = get_u64(allocator.stack(), handle + CAP_OFF)?;
+        let cap0 = read_u64(allocator.stack(), handle + CAP_OFF)?;
         let newcap = if cap0 == 0 { MIN_CAP } else { cap0 * 2 };
         // Allocate the new bucket block up front (an orphan until the swap).
         let newtable = allocator.alloc(newcap * stride)?.as_range().start();
@@ -525,10 +530,10 @@ impl<K: Pod, V: BStackBlock> BStackHashMap<K, V> {
             }
             if meta.is_none() {
                 let m = Meta {
-                    table: u64le(&meta_buf[0..8]),
-                    cap: u64le(&meta_buf[8..16]),
-                    len: u64le(&meta_buf[16..24]),
-                    used: u64le(&meta_buf[24..32]),
+                    table: get_u64(&meta_buf[0..8]),
+                    cap: get_u64(&meta_buf[8..16]),
+                    len: get_u64(&meta_buf[16..24]),
+                    used: get_u64(&meta_buf[24..32]),
                 };
                 // Abort if someone already grew to at least this size.
                 if newcap <= m.cap {
@@ -567,7 +572,7 @@ impl<K: Pod, V: BStackBlock> BStackHashMap<K, V> {
                 let newmask = newcap - 1;
                 for j in 0..m.cap {
                     let lo = (j * stride) as usize;
-                    if u64le(&old_buf[lo..lo + 8]) != OCCUPIED {
+                    if get_u64(&old_buf[lo..lo + 8]) != OCCUPIED {
                         continue;
                     }
                     let kb = &old_buf[lo + 8..lo + 8 + ksz];
@@ -575,7 +580,7 @@ impl<K: Pod, V: BStackBlock> BStackHashMap<K, V> {
                     let mut idx = fnv1a(kb) & newmask;
                     loop {
                         let nlo = (idx * stride) as usize;
-                        if u64le(&new_image[nlo..nlo + 8]) == EMPTY {
+                        if get_u64(&new_image[nlo..nlo + 8]) == EMPTY {
                             new_image[nlo..nlo + 8].copy_from_slice(&OCCUPIED.to_le_bytes());
                             new_image[nlo + 8..nlo + 8 + ksz].copy_from_slice(kb);
                             new_image[nlo + 8 + ksz..nlo + 16 + ksz].copy_from_slice(vref);
@@ -596,7 +601,10 @@ impl<K: Pod, V: BStackBlock> BStackHashMap<K, V> {
                 let (off, ref bytes) = writes[i];
                 // SAFETY: `writes` outlives the call and is not mutated after build.
                 let d: &[u8] = unsafe { core::mem::transmute::<&[u8], _>(bytes.as_slice()) };
-                return Some(BStackGenOp::Write { offset: off, data: d });
+                return Some(BStackGenOp::Write {
+                    offset: off,
+                    data: d,
+                });
             }
             None
         })?;
@@ -613,7 +621,8 @@ impl<K: Pod, V: BStackBlock> BStackHashMap<K, V> {
             }
         } else {
             // SAFETY: `newtable` was never linked into the descriptor.
-            let _ = unsafe { dealloc_range(allocator, BStackRange::new(newtable, newcap * stride)) };
+            let _ =
+                unsafe { dealloc_range(allocator, BStackRange::new(newtable, newcap * stride)) };
         }
         Ok(())
     }
@@ -659,12 +668,12 @@ impl<K: Pod, V: BStackBlock> BStackBlock for BStackHashMap<K, V> {
         let stride = Self::stride();
         let ksz = Self::ksize() as u64;
         let handle = range.start();
-        let table = get_u64(allocator.stack(), handle + TABLE_OFF)?;
-        let cap = get_u64(allocator.stack(), handle + CAP_OFF)?;
+        let table = read_u64(allocator.stack(), handle + TABLE_OFF)?;
+        let cap = read_u64(allocator.stack(), handle + CAP_OFF)?;
         for j in 0..cap {
             let bucket = table + j * stride;
-            if get_u64(allocator.stack(), bucket)? == OCCUPIED {
-                let vref = get_u64(allocator.stack(), bucket + 8 + ksz)?;
+            if read_u64(allocator.stack(), bucket)? == OCCUPIED {
+                let vref = read_u64(allocator.stack(), bucket + 8 + ksz)?;
                 if vref != 0 {
                     // SAFETY: the map solely owns each value block.
                     let owned = unsafe { BStackOwned::from_raw(Self::value_at(vref)) };
@@ -691,10 +700,10 @@ impl<K: Pod, V: BStackBlock> BStackBlock for BStackHashMap<K, V> {
         let stride = Self::stride();
         let ksz = Self::ksize();
         let handle = self.range.start();
-        let table = get_u64(allocator.stack(), handle + TABLE_OFF)?;
-        let cap = get_u64(allocator.stack(), handle + CAP_OFF)?;
-        let len = get_u64(allocator.stack(), handle + LEN_OFF)?;
-        let used = get_u64(allocator.stack(), handle + USED_OFF)?;
+        let table = read_u64(allocator.stack(), handle + TABLE_OFF)?;
+        let cap = read_u64(allocator.stack(), handle + CAP_OFF)?;
+        let len = read_u64(allocator.stack(), handle + LEN_OFF)?;
+        let used = read_u64(allocator.stack(), handle + USED_OFF)?;
 
         let (new_table, new_cap, new_used) = if cap == 0 {
             (0, 0, 0)
@@ -704,10 +713,10 @@ impl<K: Pod, V: BStackBlock> BStackBlock for BStackHashMap<K, V> {
             allocator.stack().get_into(table, &mut image)?;
             for j in 0..cap as usize {
                 let lo = j * stride as usize;
-                if u64le(&image[lo..lo + 8]) != OCCUPIED {
+                if get_u64(&image[lo..lo + 8]) != OCCUPIED {
                     continue;
                 }
-                let vref = u64le(&image[lo + 8 + ksz..lo + 16 + ksz]);
+                let vref = get_u64(&image[lo + 8 + ksz..lo + 16 + ksz]);
                 let cloned = Self::value_at(vref)
                     .__bstack_clone_into(allocator, plan)?
                     .start();

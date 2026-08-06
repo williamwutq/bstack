@@ -10,7 +10,7 @@ use std::io;
 use bstack::{BStack, BStackGenOp, BStackOwnedSliceAllocator, BStackRange};
 
 /// Read a little-endian `u64` at absolute offset `off`.
-pub(super) fn get_u64(stack: &BStack, off: u64) -> io::Result<u64> {
+pub(super) fn read_u64(stack: &BStack, off: u64) -> io::Result<u64> {
     let mut b = [0u8; 8];
     stack.get_into(off, &mut b)?;
     Ok(u64::from_le_bytes(b))
@@ -163,7 +163,10 @@ where
             let (off, ref bytes) = writes[i];
             // SAFETY: `writes` outlives this call and is not mutated after Transition B.
             let d: &[u8] = unsafe { core::mem::transmute::<&[u8], _>(bytes.as_slice()) };
-            return Some(BStackGenOp::Write { offset: off, data: d });
+            return Some(BStackGenOp::Write {
+                offset: off,
+                data: d,
+            });
         }
         None
     })

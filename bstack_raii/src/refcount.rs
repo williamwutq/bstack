@@ -16,11 +16,8 @@
 
 use std::io;
 
+use crate::layout::get_u64;
 use bstack::BStack;
-
-fn read_u64(buf: &[u8]) -> u64 {
-    u64::from_le_bytes(buf[..8].try_into().unwrap())
-}
 
 fn overflow_err() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, "refcount overflow")
@@ -51,7 +48,7 @@ pub fn fetch_add(stack: &BStack, offset: u64, delta: u64) -> io::Result<u64> {
     let mut prev = 0u64;
     let mut overflow = false;
     stack.process(offset, offset + 8, |buf| {
-        let cur = read_u64(buf);
+        let cur = get_u64(buf);
         prev = cur;
         match cur.checked_add(delta) {
             Some(new) => buf.copy_from_slice(&new.to_le_bytes()),
@@ -70,7 +67,7 @@ pub fn fetch_sub(stack: &BStack, offset: u64, delta: u64) -> io::Result<u64> {
     let mut prev = 0u64;
     let mut underflow = false;
     stack.process(offset, offset + 8, |buf| {
-        let cur = read_u64(buf);
+        let cur = get_u64(buf);
         prev = cur;
         match cur.checked_sub(delta) {
             Some(new) => buf.copy_from_slice(&new.to_le_bytes()),
@@ -100,7 +97,7 @@ pub fn increment_if_nonzero(stack: &BStack, offset: u64) -> io::Result<Option<u6
     let mut result = None;
     let mut overflow = false;
     stack.process(offset, offset + 8, |buf| {
-        let cur = read_u64(buf);
+        let cur = get_u64(buf);
         if cur == 0 {
             return; // raced to zero after the fast-path read; leave unchanged
         }

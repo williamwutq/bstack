@@ -36,7 +36,7 @@ use bytemuck::{Pod, Zeroable};
 use crate::block::{BStackBlock, BStackShared, BStackWeakable};
 use crate::clone::ClonePlan;
 use crate::handle::WeakRef;
-use crate::layout::put_u64;
+use crate::layout::{get_u64, put_u64};
 use crate::owned::BStackOwned;
 use crate::reference::BStackRef;
 use crate::shared::{BStackRc, BStackWeak};
@@ -54,8 +54,8 @@ pub(crate) const BYTEVEC_HEADER: u64 = 16;
 /// [`push`](BStackVec::push).
 pub(crate) fn bytevec_image(len: u64, cap: u64, data: &[u8]) -> Vec<u8> {
     let mut img = vec![0u8; BYTEVEC_HEADER as usize + data.len()];
-    put_u64!(img, 0, len);
-    put_u64!(img, 8, cap);
+    put_u64(&mut img, 0, len);
+    put_u64(&mut img, 8, cap);
     img[BYTEVEC_HEADER as usize..].copy_from_slice(data);
     img
 }
@@ -91,8 +91,8 @@ fn read_vecdesc(stack: &BStack, loc: u64) -> io::Result<VecDesc> {
     let mut buf = [0u8; size_of::<VecDesc>()];
     stack.get_into(loc, &mut buf)?;
     Ok(VecDesc {
-        data_off: u64::from_le_bytes(buf[0..8].try_into().unwrap()),
-        data_size: u64::from_le_bytes(buf[8..16].try_into().unwrap()),
+        data_off: get_u64(&buf[0..8]),
+        data_size: get_u64(&buf[8..16]),
     })
 }
 

@@ -39,7 +39,7 @@ use std::io;
 use bstack::{BStack, BStackOwnedSliceAllocator, BStackRange};
 use bytemuck::{Pod, Zeroable};
 
-use super::util::{alloc_image, atomic_update, get_u64};
+use super::util::{alloc_image, atomic_update, read_u64};
 use crate::block::{BStackBlock, BStackCast};
 use crate::clone::{ClonePlan, TryCloneIn};
 use crate::layout::{BlockHeader, EightCC, HEADER_SIZE};
@@ -104,10 +104,10 @@ impl<T: BStackBlock> BStackDeque<T> {
     /// `handle`.
     fn read_meta(stack: &BStack, handle: u64) -> io::Result<(u64, u64, u64, u64)> {
         Ok((
-            get_u64(stack, handle + HEAD_OFF)?,
-            get_u64(stack, handle + LEN_OFF)?,
-            get_u64(stack, handle + CAP_OFF)?,
-            get_u64(stack, handle + DATA_OFF)?,
+            read_u64(stack, handle + HEAD_OFF)?,
+            read_u64(stack, handle + LEN_OFF)?,
+            read_u64(stack, handle + CAP_OFF)?,
+            read_u64(stack, handle + DATA_OFF)?,
         ))
     }
 
@@ -160,7 +160,7 @@ impl<T: BStackBlock> BStackDeque<T> {
 
     /// Number of elements.
     pub fn len(&self, stack: &BStack) -> io::Result<u64> {
-        get_u64(stack, self.range.start() + LEN_OFF)
+        read_u64(stack, self.range.start() + LEN_OFF)
     }
 
     /// Whether the deque has no elements.
@@ -170,7 +170,7 @@ impl<T: BStackBlock> BStackDeque<T> {
 
     /// Current ring capacity (elements storable before the next growth).
     pub fn capacity(&self, stack: &BStack) -> io::Result<u64> {
-        get_u64(stack, self.range.start() + CAP_OFF)
+        read_u64(stack, self.range.start() + CAP_OFF)
     }
 
     /// Append a value to the back, taking ownership of its block. Grows the ring
@@ -297,7 +297,9 @@ impl<T: BStackBlock> BStackDeque<T> {
             return Ok(None);
         }
         // SAFETY: the value block's ownership transfers to the caller.
-        Ok(Some(unsafe { BStackOwned::from_raw(Self::value_at(val.get())) }))
+        Ok(Some(unsafe {
+            BStackOwned::from_raw(Self::value_at(val.get()))
+        }))
     }
 
     /// Remove and return the first element (as an owned value block), or `None`
@@ -342,7 +344,9 @@ impl<T: BStackBlock> BStackDeque<T> {
             return Ok(None);
         }
         // SAFETY: the value block's ownership transfers to the caller.
-        Ok(Some(unsafe { BStackOwned::from_raw(Self::value_at(val.get())) }))
+        Ok(Some(unsafe {
+            BStackOwned::from_raw(Self::value_at(val.get()))
+        }))
     }
 
     /// Grow the ring to at least double its capacity, atomically snapshotting and
@@ -350,7 +354,7 @@ impl<T: BStackBlock> BStackDeque<T> {
     /// again) if another thread already made room.
     fn grow<A: BStackOwnedSliceAllocator>(&self, allocator: &A) -> io::Result<()> {
         let handle = self.range.start();
-        let cap0 = get_u64(allocator.stack(), handle + CAP_OFF)?;
+        let cap0 = read_u64(allocator.stack(), handle + CAP_OFF)?;
         let newcap = if cap0 == 0 { MIN_CAP } else { cap0 * 2 };
         // Allocate the new ring up front (an orphan until the commit swaps to it).
         let newring = allocator.alloc(newcap * 8)?.as_range().start();
@@ -426,7 +430,10 @@ impl<T: BStackBlock> BStackDeque<T> {
         if len == 0 {
             return Ok(None);
         }
-        Ok(Some(Self::value_at(get_u64(stack, data + (head % cap) * 8)?)))
+        Ok(Some(Self::value_at(read_u64(
+            stack,
+            data + (head % cap) * 8,
+        )?)))
     }
 
     /// A **borrowed** handle to the back value (no ownership), or `None` if empty.
@@ -435,9 +442,10 @@ impl<T: BStackBlock> BStackDeque<T> {
         if len == 0 {
             return Ok(None);
         }
-        Ok(Some(Self::value_at(
-            get_u64(stack, data + ((head + len - 1) % cap) * 8)?,
-        )))
+        Ok(Some(Self::value_at(read_u64(
+            stack,
+            data + ((head + len - 1) % cap) * 8,
+        )?)))
     }
 
     /// Collect **borrowed** handles to every value, front to back. The handles
@@ -447,7 +455,10 @@ impl<T: BStackBlock> BStackDeque<T> {
         let (head, len, cap, data) = Self::read_meta(stack, self.range.start())?;
         let mut out = Vec::with_capacity(len as usize);
         for i in 0..len {
-            out.push(Self::value_at(get_u64(stack, data + ((head + i) % cap) * 8)?));
+            out.push(Self::value_at(read_u64(
+                stack,
+                data + ((head + i) % cap) * 8,
+            )?));
         }
         Ok(out)
     }
@@ -491,7 +502,7 @@ impl<T: BStackBlock> BStackBlock for BStackDeque<T> {
     ) -> io::Result<()> {
         let (head, len, cap, data) = Self::read_meta(allocator.stack(), range.start())?;
         for i in 0..len {
-            let r = get_u64(allocator.stack(), data + ((head + i) % cap) * 8)?;
+            let r = read_u64(allocator.stack(), data + ((head + i) % cap) * 8)?;
             if r != 0 {
                 // SAFETY: the deque solely owns each element block.
                 let owned = unsafe { BStackOwned::from_raw(Self::value_at(r)) };
@@ -519,9 +530,11 @@ impl<T: BStackBlock> BStackBlock for BStackDeque<T> {
         // Deep-clone each element (in logical order) into the plan.
         let mut dsts = Vec::with_capacity(len as usize);
         for i in 0..len {
-            let r = get_u64(allocator.stack(), data + ((head + i) % cap) * 8)?;
+            let r = read_u64(allocator.stack(), data + ((head + i) % cap) * 8)?;
             let dst = if r != 0 {
-                Self::value_at(r).__bstack_clone_into(allocator, plan)?.start()
+                Self::value_at(r)
+                    .__bstack_clone_into(allocator, plan)?
+                    .start()
             } else {
                 0
             };

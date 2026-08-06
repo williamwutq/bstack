@@ -131,7 +131,8 @@ impl<T: BStackBlock> BStackCow<T> {
     {
         if let BStackCow::Borrowed(r) = self {
             // `BStackRef` is `Copy`; take the range out before we overwrite it.
-            let owned = <T as BStackBlock>::from_range((*r).into_range()).try_clone_in(allocator)?;
+            let owned =
+                <T as BStackBlock>::from_range((*r).into_range()).try_clone_in(allocator)?;
             *self = BStackCow::Owned(owned);
         }
         match self {

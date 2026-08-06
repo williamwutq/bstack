@@ -36,7 +36,7 @@ use std::io;
 use bstack::{BStack, BStackOwnedSliceAllocator, BStackRange};
 use bytemuck::{Pod, Zeroable};
 
-use super::util::{alloc_image, atomic_update, get_u64};
+use super::util::{alloc_image, atomic_update, read_u64};
 use crate::block::{BStackBlock, BStackCast};
 use crate::clone::{ClonePlan, TryCloneIn};
 use crate::layout::{BlockHeader, EightCC, HEADER_SIZE};
@@ -153,7 +153,7 @@ impl<T: BStackBlock> BStackLinkedList<T> {
 
     /// Number of elements.
     pub fn len(&self, stack: &BStack) -> io::Result<u64> {
-        get_u64(stack, self.range.start() + LEN_OFF)
+        read_u64(stack, self.range.start() + LEN_OFF)
     }
 
     /// Whether the list has no elements.
@@ -305,7 +305,9 @@ impl<T: BStackBlock> BStackLinkedList<T> {
         // SAFETY: the node is unlinked and solely ours.
         unsafe { dealloc_range(allocator, BStackRange::new(node.get(), NODE_SIZE))? };
         // SAFETY: the value block's ownership transfers to the caller.
-        Ok(Some(unsafe { BStackOwned::from_raw(Self::value_at(val.get())) }))
+        Ok(Some(unsafe {
+            BStackOwned::from_raw(Self::value_at(val.get()))
+        }))
     }
 
     /// Remove and return the first element (as an owned value block), or `None`
@@ -357,27 +359,29 @@ impl<T: BStackBlock> BStackLinkedList<T> {
         // SAFETY: the node is unlinked and solely ours.
         unsafe { dealloc_range(allocator, BStackRange::new(node.get(), NODE_SIZE))? };
         // SAFETY: the value block's ownership transfers to the caller.
-        Ok(Some(unsafe { BStackOwned::from_raw(Self::value_at(val.get())) }))
+        Ok(Some(unsafe {
+            BStackOwned::from_raw(Self::value_at(val.get()))
+        }))
     }
 
     /// A **borrowed** handle to the first value (no ownership; frees nothing), or
     /// `None` if empty.
     pub fn front(&self, stack: &BStack) -> io::Result<Option<T>> {
-        let head = get_u64(stack, self.range.start() + HEAD_OFF)?;
+        let head = read_u64(stack, self.range.start() + HEAD_OFF)?;
         if head == 0 {
             return Ok(None);
         }
-        Ok(Some(Self::value_at(get_u64(stack, head + NVAL_OFF)?)))
+        Ok(Some(Self::value_at(read_u64(stack, head + NVAL_OFF)?)))
     }
 
     /// A **borrowed** handle to the last value (no ownership; frees nothing), or
     /// `None` if empty.
     pub fn back(&self, stack: &BStack) -> io::Result<Option<T>> {
-        let tail = get_u64(stack, self.range.start() + TAIL_OFF)?;
+        let tail = read_u64(stack, self.range.start() + TAIL_OFF)?;
         if tail == 0 {
             return Ok(None);
         }
-        Ok(Some(Self::value_at(get_u64(stack, tail + NVAL_OFF)?)))
+        Ok(Some(Self::value_at(read_u64(stack, tail + NVAL_OFF)?)))
     }
 
     /// Collect **borrowed** handles to every value, front to back. The handles
@@ -385,10 +389,10 @@ impl<T: BStackBlock> BStackLinkedList<T> {
     /// list does.
     pub fn to_vec(&self, stack: &BStack) -> io::Result<Vec<T>> {
         let mut out = Vec::new();
-        let mut cur = get_u64(stack, self.range.start() + HEAD_OFF)?;
+        let mut cur = read_u64(stack, self.range.start() + HEAD_OFF)?;
         while cur != 0 {
-            out.push(Self::value_at(get_u64(stack, cur + NVAL_OFF)?));
-            cur = get_u64(stack, cur + NNEXT_OFF)?;
+            out.push(Self::value_at(read_u64(stack, cur + NVAL_OFF)?));
+            cur = read_u64(stack, cur + NNEXT_OFF)?;
         }
         Ok(out)
     }
@@ -434,10 +438,10 @@ impl<T: BStackBlock> BStackBlock for BStackLinkedList<T> {
         range: BStackRange,
         allocator: &A,
     ) -> io::Result<()> {
-        let mut cur = get_u64(allocator.stack(), range.start() + HEAD_OFF)?;
+        let mut cur = read_u64(allocator.stack(), range.start() + HEAD_OFF)?;
         while cur != 0 {
-            let next = get_u64(allocator.stack(), cur + NNEXT_OFF)?;
-            let val = get_u64(allocator.stack(), cur + NVAL_OFF)?;
+            let next = read_u64(allocator.stack(), cur + NNEXT_OFF)?;
+            let val = read_u64(allocator.stack(), cur + NVAL_OFF)?;
             if val != 0 {
                 // Recursively free the value block (its own children, then it).
                 // SAFETY: the list solely owns each value block.
@@ -463,10 +467,10 @@ impl<T: BStackBlock> BStackBlock for BStackLinkedList<T> {
 
         // 1. Gather the source value offsets in order.
         let mut vals = Vec::new();
-        let mut cur = get_u64(allocator.stack(), src + HEAD_OFF)?;
+        let mut cur = read_u64(allocator.stack(), src + HEAD_OFF)?;
         while cur != 0 {
-            vals.push(get_u64(allocator.stack(), cur + NVAL_OFF)?);
-            cur = get_u64(allocator.stack(), cur + NNEXT_OFF)?;
+            vals.push(read_u64(allocator.stack(), cur + NVAL_OFF)?);
+            cur = read_u64(allocator.stack(), cur + NNEXT_OFF)?;
         }
         let n = vals.len();
 
@@ -474,7 +478,9 @@ impl<T: BStackBlock> BStackBlock for BStackLinkedList<T> {
         let mut val_dsts = Vec::with_capacity(n);
         for &v in &vals {
             let dst = if v != 0 {
-                Self::value_at(v).__bstack_clone_into(allocator, plan)?.start()
+                Self::value_at(v)
+                    .__bstack_clone_into(allocator, plan)?
+                    .start()
             } else {
                 0
             };

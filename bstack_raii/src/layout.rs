@@ -5,17 +5,23 @@
 
 use bytemuck::{Pod, Zeroable};
 
-/// Write `$val` as a little-endian `u64` at byte offset `$off` in the slice
-/// `$buf`. The one place the crate builds on-disk integer fields by hand, instead
-/// of the ad-hoc `copy_from_slice(&x.to_le_bytes())` pattern repeated across the
-/// image builders (control payloads, byte-vec headers, WAL records).
-macro_rules! put_u64 {
-    ($buf:expr, $off:expr, $val:expr) => {{
-        let __o = ($off) as usize;
-        $buf[__o..__o + 8].copy_from_slice(&($val as u64).to_le_bytes());
-    }};
+/// Write `val` as a little-endian `u64` at byte offset `off` in `buf`.
+///
+/// The one place the crate builds on-disk integer fields by hand, instead of
+/// repeating `copy_from_slice(&x.to_le_bytes())` at every image builder.
+#[inline(always)]
+pub(crate) fn put_u64(buf: &mut [u8], off: u64, val: u64) {
+    let o = off as usize;
+    buf[o..o + 8].copy_from_slice(&val.to_le_bytes());
 }
-pub(crate) use put_u64;
+
+/// Read a little-endian `u64` from the first 8 bytes of `buf`.
+///
+/// This centralizes the crate's fixed-width on-disk `u64` decode pattern.
+#[inline(always)]
+pub fn get_u64(buf: &[u8]) -> u64 {
+    u64::from_le_bytes(buf[..8].try_into().unwrap())
+}
 
 /// An 8-byte type tag stored in every [`BlockHeader`].
 ///

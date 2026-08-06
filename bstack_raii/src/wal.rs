@@ -324,9 +324,8 @@ impl WalLog {
             _pad: [0; 7],
             count: self.entries.len() as u64,
         };
-        let mut img = Vec::with_capacity(
-            size_of::<WalHeader>() + self.entries.len() * size_of::<WalEntry>(),
-        );
+        let mut img =
+            Vec::with_capacity(size_of::<WalHeader>() + self.entries.len() * size_of::<WalEntry>());
         img.extend_from_slice(bytemuck::bytes_of(&header));
         img.extend_from_slice(bytemuck::cast_slice(&self.entries));
         img
@@ -388,7 +387,11 @@ fn load_at<A: BStackOwnedSliceAllocator>(
     stack.get_into(wal_off + size_of::<WalHeader>() as u64, &mut ebuf)?;
     let entries = WalLog::entries_from_bytes(&ebuf);
     let block_size = size_of::<WalHeader>() as u64 + ebytes as u64;
-    Ok(Some((BStackRange::new(wal_off, block_size), header, entries)))
+    Ok(Some((
+        BStackRange::new(wal_off, block_size),
+        header,
+        entries,
+    )))
 }
 
 /// **Complete** a crash-left transaction referenced by the anchor slot at
@@ -415,7 +418,9 @@ pub fn finish_at<A: BStackOwnedSliceAllocator>(allocator: &A, anchor: u64) -> io
         let base = wal_range.start() + size_of::<WalHeader>() as u64;
         for (i, e) in entries.iter().enumerate() {
             // `as_dealloc` is `Some` only for a `Dealloc` entry.
-            if e.status() == WalStatus::Pending && let Some(slice) = e.as_dealloc() {
+            if e.status() == WalStatus::Pending
+                && let Some(slice) = e.as_dealloc()
+            {
                 // Persist Complete for this entry (its status is byte 0), THEN
                 // free — so a second crash can't double-free it.
                 let entry_off = base + (i * size_of::<WalEntry>()) as u64;
@@ -472,8 +477,14 @@ mod tests {
     fn wal_entry_is_24_bytes_and_pod_roundtrips() {
         assert_eq!(size_of::<WalEntry>(), 24);
         let mut log = WalLog::with_capacity(2);
-        log.append(WalEntry::alloc(WalStatus::Pending, AllocReq { id: 0, len: 64 }));
-        log.append(WalEntry::dealloc(WalStatus::Pending, BStackRange::new(4096, 64)));
+        log.append(WalEntry::alloc(
+            WalStatus::Pending,
+            AllocReq { id: 0, len: 64 },
+        ));
+        log.append(WalEntry::dealloc(
+            WalStatus::Pending,
+            BStackRange::new(4096, 64),
+        ));
         let bytes = log.as_bytes().to_vec();
         let back = WalLog::entries_from_bytes(&bytes);
         assert_eq!(back.len(), 2);
@@ -494,10 +505,7 @@ mod tests {
     #[test]
     fn reduce_cancels_equal_length_pairs() {
         // (Alloc 256, Alloc 600, Dealloc 256) → reuse the 256 slice, Alloc 600 left.
-        let allocs = vec![
-            AllocReq { id: 0, len: 256 },
-            AllocReq { id: 1, len: 600 },
-        ];
+        let allocs = vec![AllocReq { id: 0, len: 256 }, AllocReq { id: 1, len: 600 }];
         let deallocs = vec![BStackRange::new(0x1FF0, 256)];
         let r = reduce(allocs, deallocs);
         assert_eq!(r.reused.len(), 1);

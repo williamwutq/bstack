@@ -19,7 +19,7 @@ use std::io;
 use bstack::{BStack, BStackOwnedSliceAllocator, BStackRange};
 use bytemuck::{Pod, Zeroable};
 
-use super::util::{alloc_image, get_u64};
+use super::util::{alloc_image, read_u64};
 use crate::block::{BStackBlock, BStackCast};
 use crate::clone::{ClonePlan, TryCloneIn};
 use crate::layout::{BlockHeader, EightCC, HEADER_SIZE};
@@ -57,10 +57,7 @@ pub struct BStackString {
 impl BStackString {
     /// Allocate a bytes block holding `bytes` (or return `0` for an empty slice),
     /// releasing it without leaking on write failure.
-    fn alloc_bytes<A: BStackOwnedSliceAllocator>(
-        allocator: &A,
-        bytes: &[u8],
-    ) -> io::Result<u64> {
+    fn alloc_bytes<A: BStackOwnedSliceAllocator>(allocator: &A, bytes: &[u8]) -> io::Result<u64> {
         if bytes.is_empty() {
             return Ok(0);
         }
@@ -102,7 +99,7 @@ impl BStackString {
 
     /// Length in bytes.
     pub fn len(&self, stack: &BStack) -> io::Result<u64> {
-        get_u64(stack, self.range.start() + LEN_OFF)
+        read_u64(stack, self.range.start() + LEN_OFF)
     }
 
     /// Whether the string is empty.
@@ -112,8 +109,8 @@ impl BStackString {
 
     /// Read the raw UTF-8 bytes.
     pub fn read_bytes(&self, stack: &BStack) -> io::Result<Vec<u8>> {
-        let data = get_u64(stack, self.range.start() + DATA_OFF)?;
-        let len = get_u64(stack, self.range.start() + LEN_OFF)? as usize;
+        let data = read_u64(stack, self.range.start() + DATA_OFF)?;
+        let len = read_u64(stack, self.range.start() + LEN_OFF)? as usize;
         let mut buf = vec![0u8; len];
         if len != 0 {
             stack.get_into(data, &mut buf)?;
@@ -140,8 +137,8 @@ impl BStackString {
         let newlen = s.len() as u64;
         let newdata = Self::alloc_bytes(allocator, s.as_bytes())?;
 
-        let old_data = get_u64(stack, handle + DATA_OFF)?;
-        let old_len = get_u64(stack, handle + LEN_OFF)?;
+        let old_data = read_u64(stack, handle + DATA_OFF)?;
+        let old_len = read_u64(stack, handle + LEN_OFF)?;
 
         // `data` and `len` are contiguous — swap both in one 16-byte write.
         let mut buf = [0u8; 16];
@@ -163,11 +160,7 @@ impl BStackString {
     }
 
     /// Append `s` to the string.
-    pub fn push_str<A: BStackOwnedSliceAllocator>(
-        &self,
-        allocator: &A,
-        s: &str,
-    ) -> io::Result<()> {
+    pub fn push_str<A: BStackOwnedSliceAllocator>(&self, allocator: &A, s: &str) -> io::Result<()> {
         let mut cur = self.to_string(allocator.stack())?;
         cur.push_str(s);
         self.set(allocator, &cur)
@@ -203,8 +196,8 @@ impl BStackBlock for BStackString {
         range: BStackRange,
         allocator: &A,
     ) -> io::Result<()> {
-        let data = get_u64(allocator.stack(), range.start() + DATA_OFF)?;
-        let len = get_u64(allocator.stack(), range.start() + LEN_OFF)?;
+        let data = read_u64(allocator.stack(), range.start() + DATA_OFF)?;
+        let len = read_u64(allocator.stack(), range.start() + LEN_OFF)?;
         if data != 0 {
             // SAFETY: the string solely owns its bytes block.
             unsafe { dealloc_range(allocator, BStackRange::new(data, len))? };
@@ -220,8 +213,8 @@ impl BStackBlock for BStackString {
         plan: &mut ClonePlan,
     ) -> io::Result<BStackRange> {
         let handle = self.range.start();
-        let data = get_u64(allocator.stack(), handle + DATA_OFF)?;
-        let len = get_u64(allocator.stack(), handle + LEN_OFF)?;
+        let data = read_u64(allocator.stack(), handle + DATA_OFF)?;
+        let len = read_u64(allocator.stack(), handle + LEN_OFF)?;
 
         let new_data = if len != 0 {
             let mut bytes = vec![0u8; len as usize];

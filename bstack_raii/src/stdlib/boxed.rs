@@ -101,7 +101,9 @@ impl<T: Pod> BStackBox<T> {
         // Copy the value out of the packed image without forming a reference to
         // the (alignment-1) `value` field.
         let off = HEADER_SIZE as usize;
-        Ok(bytemuck::pod_read_unaligned::<T>(&buf[off..off + size_of::<T>()]))
+        Ok(bytemuck::pod_read_unaligned::<T>(
+            &buf[off..off + size_of::<T>()],
+        ))
     }
 
     /// Overwrite the boxed value in place.
@@ -173,9 +175,9 @@ impl<T: Pod> BStackMove for BStackBox<T> {
     /// Moving a box out yields the plain value.
     type Fields<'a, A: BStackOwnedSliceAllocator> = T;
 
-    fn bstack_move<'a, A: BStackOwnedSliceAllocator>(
+    fn bstack_move<A: BStackOwnedSliceAllocator>(
         owned: BStackOwned<Self>,
-        allocator: &'a A,
+        allocator: &A,
     ) -> io::Result<T> {
         let me = owned.into_inner();
         let value = me.get(allocator.stack())?;

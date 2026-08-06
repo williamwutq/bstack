@@ -573,7 +573,10 @@ fn macro_clone_deep_owned() {
 
     // Freeing the clone frees only the clone's subtree; the original stays intact.
     clone.bstack_drop(&alloc).unwrap();
-    assert_eq!(parent.handle().child(stack).unwrap().val(stack).unwrap(), 42);
+    assert_eq!(
+        parent.handle().child(stack).unwrap().val(stack).unwrap(),
+        42
+    );
     parent.bstack_drop(&alloc).unwrap();
 }
 
@@ -591,8 +594,9 @@ fn macro_clone_bumps_shared_refcount() {
 
     // Resolve the child's strong-count offset: parent.s (first user field) ->
     // data block -> ctrl back-pointer -> strong counter.
-    let s_data = crate::refcount::load(stack, parent.handle().range().start() + layout::HEADER_SIZE)
-        .unwrap();
+    let s_data =
+        crate::refcount::load(stack, parent.handle().range().start() + layout::HEADER_SIZE)
+            .unwrap();
     let ctrl = crate::refcount::load(stack, s_data + layout::CTRL_BACKPTR_OFFSET).unwrap();
     let strong_off = ctrl + layout::CTRL_STRONG_OFFSET;
     assert_eq!(crate::refcount::load(stack, strong_off).unwrap(), 2);
@@ -2377,7 +2381,13 @@ fn macro_clone_embed() {
     // Freeing the clone frees only the clone's leaf; the original stays intact.
     clone.bstack_drop(&alloc).unwrap();
     assert_eq!(
-        holder.handle().child().leaf(stack).unwrap().val(stack).unwrap(),
+        holder
+            .handle()
+            .child()
+            .leaf(stack)
+            .unwrap()
+            .val(stack)
+            .unwrap(),
         42
     );
     holder.bstack_drop(&alloc).unwrap();
@@ -2653,8 +2663,12 @@ fn macro_weak_array() {
     assert!(arr[0].is_none() && arr[1].is_none());
 
     // Wire each element via the per-index setter.
-    h.handle().set_weaks(&alloc, 0, c0.downgrade().unwrap()).unwrap();
-    h.handle().set_weaks(&alloc, 1, c1.downgrade().unwrap()).unwrap();
+    h.handle()
+        .set_weaks(&alloc, 0, c0.downgrade().unwrap())
+        .unwrap();
+    h.handle()
+        .set_weaks(&alloc, 1, c1.downgrade().unwrap())
+        .unwrap();
 
     // The accessor upgrades each live element.
     let arr = h.handle().weaks(&alloc).unwrap();
@@ -2810,12 +2824,22 @@ fn macro_embed_array() {
         kids[0].leaf(stack).unwrap().range().start()
     );
     clone.bstack_drop(&alloc).unwrap();
-    assert_eq!(h.handle().kids()[1].leaf(stack).unwrap().val(stack).unwrap(), 20);
+    assert_eq!(
+        h.handle().kids()[1]
+            .leaf(stack)
+            .unwrap()
+            .val(stack)
+            .unwrap(),
+        20
+    );
 
     // Move re-homes each embedded child to a fresh standalone allocation.
     let (moved, tag) = bstack_move!(h, &alloc).unwrap();
     assert_eq!(tag, 99);
-    assert_eq!(moved[0].handle().leaf(stack).unwrap().val(stack).unwrap(), 10);
+    assert_eq!(
+        moved[0].handle().leaf(stack).unwrap().val(stack).unwrap(),
+        10
+    );
     for m in moved {
         m.bstack_drop(&alloc).unwrap();
     }
@@ -3001,12 +3025,7 @@ fn macro_owned_nested_array() {
     let stack = alloc.stack();
 
     let mk = |v| MacroLeaf::new(&alloc, v).unwrap();
-    let h = OwnedGrid::new(
-        &alloc,
-        [[mk(1), mk(2)], [mk(3), mk(4)]],
-        7,
-    )
-    .unwrap();
+    let h = OwnedGrid::new(&alloc, [[mk(1), mk(2)], [mk(3), mk(4)]], 7).unwrap();
 
     assert_eq!(h.handle().tag(stack).unwrap(), 7);
     let g = h.handle().grid(stack).unwrap(); // [[MacroLeaf; 2]; 2]
@@ -3096,7 +3115,15 @@ fn macro_embed_nested_array() {
 
     let (moved, tag) = bstack_move!(h, &alloc).unwrap();
     assert_eq!(tag, 5);
-    assert_eq!(moved[0][0].handle().leaf(stack).unwrap().val(stack).unwrap(), 10);
+    assert_eq!(
+        moved[0][0]
+            .handle()
+            .leaf(stack)
+            .unwrap()
+            .val(stack)
+            .unwrap(),
+        10
+    );
     for row in moved {
         for m in row {
             m.bstack_drop(&alloc).unwrap();
@@ -3151,7 +3178,10 @@ fn macro_enum_owned_option_array() {
 
     match bstack_move!(e, &alloc).unwrap() {
         OptArrEnumData::Slots(arr) => {
-            assert_eq!(arr[0].as_ref().map(|h| h.handle().val(stack).unwrap()), Some(10));
+            assert_eq!(
+                arr[0].as_ref().map(|h| h.handle().val(stack).unwrap()),
+                Some(10)
+            );
             assert!(arr[1].is_none());
             for slot in arr.into_iter().flatten() {
                 slot.bstack_drop(&alloc).unwrap();
@@ -3187,7 +3217,9 @@ fn macro_enum_embed_array() {
 
     let clone = e.try_clone_in(&alloc).unwrap();
     match clone.handle().read(&alloc).unwrap() {
-        EmbArrEnumView::Kids(arr) => assert_eq!(arr[1].leaf(stack).unwrap().val(stack).unwrap(), 20),
+        EmbArrEnumView::Kids(arr) => {
+            assert_eq!(arr[1].leaf(stack).unwrap().val(stack).unwrap(), 20)
+        }
         _ => panic!("expected Kids"),
     }
     clone.bstack_drop(&alloc).unwrap();
@@ -3272,15 +3304,24 @@ fn macro_pod_vec_array() {
     // Each slot is an independent, growable vector.
     let mut rows_mut = h.handle().rows(&alloc).unwrap();
     rows_mut[0].push(99).unwrap();
-    assert_eq!(h.handle().rows(&alloc).unwrap()[0].to_vec().unwrap(), vec![1u32, 2, 99]);
-    assert_eq!(h.handle().rows(&alloc).unwrap()[1].to_vec().unwrap(), vec![3u32, 4, 5]);
+    assert_eq!(
+        h.handle().rows(&alloc).unwrap()[0].to_vec().unwrap(),
+        vec![1u32, 2, 99]
+    );
+    assert_eq!(
+        h.handle().rows(&alloc).unwrap()[1].to_vec().unwrap(),
+        vec![3u32, 4, 5]
+    );
 
     // Clone deep-copies both data blocks.
     let clone = h.try_clone_in(&alloc).unwrap();
     let crows = clone.handle().rows(&alloc).unwrap();
     assert_eq!(crows[1].to_vec().unwrap(), vec![3u32, 4, 5]);
     clone.bstack_drop(&alloc).unwrap();
-    assert_eq!(h.handle().rows(&alloc).unwrap()[1].to_vec().unwrap(), vec![3u32, 4, 5]);
+    assert_eq!(
+        h.handle().rows(&alloc).unwrap()[1].to_vec().unwrap(),
+        vec![3u32, 4, 5]
+    );
 
     // Move yields the two vec handles.
     let (moved, tag) = bstack_move!(h, &alloc).unwrap();
@@ -3333,7 +3374,10 @@ fn macro_owned_vec_array() {
     let alloc = tmp.allocator();
     let stack = alloc.stack();
 
-    let g0 = vec![MacroLeaf::new(&alloc, 10).unwrap(), MacroLeaf::new(&alloc, 11).unwrap()];
+    let g0 = vec![
+        MacroLeaf::new(&alloc, 10).unwrap(),
+        MacroLeaf::new(&alloc, 11).unwrap(),
+    ];
     let g1 = vec![MacroLeaf::new(&alloc, 20).unwrap()];
     let h = OwnedVecArr::new(&alloc, [g0, g1], 7).unwrap();
     assert_eq!(h.handle().tag(stack).unwrap(), 7);
@@ -3352,7 +3396,15 @@ fn macro_owned_vec_array() {
         gs[0].get(0).unwrap().unwrap().range().start()
     );
     clone.bstack_drop(&alloc).unwrap();
-    assert_eq!(h.handle().groups(&alloc).unwrap()[1].get(0).unwrap().unwrap().val(stack).unwrap(), 20);
+    assert_eq!(
+        h.handle().groups(&alloc).unwrap()[1]
+            .get(0)
+            .unwrap()
+            .unwrap()
+            .val(stack)
+            .unwrap(),
+        20
+    );
 
     h.bstack_drop(&alloc).unwrap();
 }
@@ -3413,7 +3465,10 @@ fn macro_ref_vec_of_array() {
     );
     clone.bstack_drop(&alloc).unwrap();
     // Original + targets still alive after clone teardown.
-    assert_eq!(h.handle().rows(&alloc).unwrap()[0][1].val(stack).unwrap(), 1);
+    assert_eq!(
+        h.handle().rows(&alloc).unwrap()[0][1].val(stack).unwrap(),
+        1
+    );
 
     // Dropping the holder frees only the offset array, not the targets.
     h.bstack_drop(&alloc).unwrap();
@@ -3453,7 +3508,10 @@ fn macro_owned_vec_of_array() {
     assert_eq!(crows[1][1].val(stack).unwrap(), 4);
     assert_ne!(crows[0][0].range().start(), rows[0][0].range().start());
     clone.bstack_drop(&alloc).unwrap();
-    assert_eq!(h.handle().rows(&alloc).unwrap()[1][0].val(stack).unwrap(), 3);
+    assert_eq!(
+        h.handle().rows(&alloc).unwrap()[1][0].val(stack).unwrap(),
+        3
+    );
 
     h.bstack_drop(&alloc).unwrap();
 }
@@ -3549,7 +3607,10 @@ fn macro_enum_owned_vec() {
 
     let items = BStackBlockVec::from_handles(
         &alloc,
-        vec![MacroLeaf::new(&alloc, 10).unwrap(), MacroLeaf::new(&alloc, 20).unwrap()],
+        vec![
+            MacroLeaf::new(&alloc, 10).unwrap(),
+            MacroLeaf::new(&alloc, 20).unwrap(),
+        ],
     )
     .unwrap();
     let e = OwnedVecEnum::new(&alloc, OwnedVecEnumData::Items(items)).unwrap();
@@ -3566,7 +3627,9 @@ fn macro_enum_owned_vec() {
     // Clone deep-copies the vector + its children.
     let clone = e.try_clone_in(&alloc).unwrap();
     match clone.handle().read(&alloc).unwrap() {
-        OwnedVecEnumView::Items(v) => assert_eq!(v.get(1).unwrap().unwrap().val(stack).unwrap(), 20),
+        OwnedVecEnumView::Items(v) => {
+            assert_eq!(v.get(1).unwrap().unwrap().val(stack).unwrap(), 20)
+        }
         _ => panic!("expected Items"),
     }
     clone.bstack_drop(&alloc).unwrap();
@@ -3809,7 +3872,9 @@ fn macro_generic_move_cast() {
 
     // bstack_cast!: an untyped slice back to the typed generic block (tag checked).
     let sl = b.handle().as_slice(stack);
-    let back = bstack_cast!(sl as RefBox<MacroLeaf>).unwrap().expect("same tag");
+    let back = bstack_cast!(sl as RefBox<MacroLeaf>)
+        .unwrap()
+        .expect("same tag");
     assert_eq!(back.item(stack).unwrap().val(stack).unwrap(), 9);
 
     // bstack_move!: hand out the ref + pod fields, freeing the box shell.
@@ -3897,7 +3962,10 @@ fn macro_generic_owned_box() {
     let clone = b.try_clone_in(&alloc).unwrap();
     let citem = clone.handle().item(stack).unwrap();
     assert_eq!(citem.val(stack).unwrap(), 42);
-    assert_ne!(citem.range().start(), b.handle().item(stack).unwrap().range().start());
+    assert_ne!(
+        citem.range().start(),
+        b.handle().item(stack).unwrap().range().start()
+    );
     clone.bstack_drop(&alloc).unwrap();
     // Original child survives the clone's teardown.
     assert_eq!(b.handle().item(stack).unwrap().val(stack).unwrap(), 42);
@@ -4012,12 +4080,24 @@ fn macro_generic_emb_box() {
     let b = EmbBoxG::<EmbChild>::new(&alloc, child, 99).unwrap();
     assert_eq!(b.handle().tag(stack).unwrap(), 99);
     // Accessor: an EmbChild handle into the inline slot (pure offset math).
-    assert_eq!(b.handle().item().leaf(stack).unwrap().val(stack).unwrap(), 10);
+    assert_eq!(
+        b.handle().item().leaf(stack).unwrap().val(stack).unwrap(),
+        10
+    );
 
     // Clone folds the embedded child inline, deep-cloning its owned leaf — via the
     // generic `T`'s `BStackBlock` clone hook (a trait method, not inherent).
     let clone = b.try_clone_in(&alloc).unwrap();
-    assert_eq!(clone.handle().item().leaf(stack).unwrap().val(stack).unwrap(), 10);
+    assert_eq!(
+        clone
+            .handle()
+            .item()
+            .leaf(stack)
+            .unwrap()
+            .val(stack)
+            .unwrap(),
+        10
+    );
     assert_ne!(
         clone.handle().item().leaf(stack).unwrap().range().start(),
         b.handle().item().leaf(stack).unwrap().range().start()
@@ -4200,7 +4280,8 @@ fn stdlib_cow_borrowed_into_owned_deep_copies() {
     // A block owned elsewhere; the Cow only borrows it.
     let base = MacroLeaf::new(&alloc, 7).unwrap();
     let base_start = base.handle().range().start();
-    let cow = BStackCow::borrowed(unsafe { BStackRef::<MacroLeaf>::from_range(base.handle().range()) });
+    let cow =
+        BStackCow::borrowed(unsafe { BStackRef::<MacroLeaf>::from_range(base.handle().range()) });
 
     assert!(cow.is_borrowed());
     // Reads go through the borrowed block, at its address.
@@ -4244,7 +4325,8 @@ fn stdlib_cow_to_mut_copies_then_owns() {
 
     let base = MacroLeaf::new(&alloc, 9).unwrap();
     let base_start = base.handle().range().start();
-    let mut cow = BStackCow::borrowed(unsafe { BStackRef::<MacroLeaf>::from_range(base.handle().range()) });
+    let mut cow =
+        BStackCow::borrowed(unsafe { BStackRef::<MacroLeaf>::from_range(base.handle().range()) });
 
     // First write forces a private copy and flips to Owned.
     {
@@ -4272,7 +4354,8 @@ fn stdlib_cow_borrowed_drop_frees_nothing() {
     let stack = alloc.stack();
 
     let base = MacroLeaf::new(&alloc, 3).unwrap();
-    let cow = BStackCow::borrowed(unsafe { BStackRef::<MacroLeaf>::from_range(base.handle().range()) });
+    let cow =
+        BStackCow::borrowed(unsafe { BStackRef::<MacroLeaf>::from_range(base.handle().range()) });
 
     // Dropping a borrowed Cow has no claim on the target.
     cow.bstack_drop(&alloc).unwrap();
@@ -4332,10 +4415,7 @@ fn stdlib_box_clone_is_a_byte_copy() {
     let clone = b.try_clone_in(&alloc).unwrap();
 
     // Fresh, independent block, same value.
-    assert_ne!(
-        clone.handle().range().start(),
-        b.handle().range().start()
-    );
+    assert_ne!(clone.handle().range().start(), b.handle().range().start());
     assert_eq!(clone.handle().get(stack).unwrap(), 7);
 
     // Mutating the clone leaves the original untouched.
@@ -4384,7 +4464,10 @@ fn stdlib_box_composes_as_owned_field() {
 
     let inner = BStackBox::new(&alloc, 500u64).unwrap();
     let holder = BoxHolder::new(&alloc, inner, 9).unwrap();
-    assert_eq!(holder.handle().boxed(stack).unwrap().get(stack).unwrap(), 500);
+    assert_eq!(
+        holder.handle().boxed(stack).unwrap().get(stack).unwrap(),
+        500
+    );
     assert_eq!(holder.handle().tag(stack).unwrap(), 9);
 
     // Deep-cloning the parent recurses into the child box (fresh child block).
@@ -4393,7 +4476,10 @@ fn stdlib_box_composes_as_owned_field() {
         clone.handle().boxed(stack).unwrap().range().start(),
         holder.handle().boxed(stack).unwrap().range().start(),
     );
-    assert_eq!(clone.handle().boxed(stack).unwrap().get(stack).unwrap(), 500);
+    assert_eq!(
+        clone.handle().boxed(stack).unwrap().get(stack).unwrap(),
+        500
+    );
 
     clone.bstack_drop(&alloc).unwrap();
     holder.bstack_drop(&alloc).unwrap();
@@ -4407,8 +4493,9 @@ fn stdlib_box_in_cow() {
 
     // A borrowed Cow over a box; first write deep-copies the box.
     let base = BStackBox::new(&alloc, 11u64).unwrap();
-    let mut cow =
-        BStackCow::borrowed(unsafe { BStackRef::<BStackBox<u64>>::from_range(base.handle().range()) });
+    let mut cow = BStackCow::borrowed(unsafe {
+        BStackRef::<BStackBox<u64>>::from_range(base.handle().range())
+    });
     assert_eq!(cow.handle().get(stack).unwrap(), 11);
 
     let owned = cow.to_mut(&alloc).unwrap();
@@ -4442,7 +4529,8 @@ fn stdlib_list_push_back_pop_front() {
     assert!(list.is_empty(stack).unwrap());
 
     for v in [1u32, 2, 3] {
-        list.push_back(&alloc, MacroLeaf::new(&alloc, v).unwrap()).unwrap();
+        list.push_back(&alloc, MacroLeaf::new(&alloc, v).unwrap())
+            .unwrap();
     }
     assert_eq!(list.len(stack).unwrap(), 3);
     assert_eq!(list_values(&list, stack), vec![1, 2, 3]);
@@ -4466,9 +4554,12 @@ fn stdlib_list_both_ends() {
     let stack = alloc.stack();
 
     let list = BStackLinkedList::<MacroLeaf>::new(&alloc).unwrap();
-    list.push_front(&alloc, MacroLeaf::new(&alloc, 2).unwrap()).unwrap();
-    list.push_front(&alloc, MacroLeaf::new(&alloc, 1).unwrap()).unwrap();
-    list.push_back(&alloc, MacroLeaf::new(&alloc, 3).unwrap()).unwrap();
+    list.push_front(&alloc, MacroLeaf::new(&alloc, 2).unwrap())
+        .unwrap();
+    list.push_front(&alloc, MacroLeaf::new(&alloc, 1).unwrap())
+        .unwrap();
+    list.push_back(&alloc, MacroLeaf::new(&alloc, 3).unwrap())
+        .unwrap();
     assert_eq!(list_values(&list, stack), vec![1, 2, 3]);
 
     let back = list.pop_back(&alloc).unwrap().unwrap();
@@ -4516,7 +4607,8 @@ fn stdlib_list_deep_clone_is_independent() {
 
     let list = BStackLinkedList::<MacroLeaf>::new(&alloc).unwrap();
     for v in [1u32, 2, 3] {
-        list.push_back(&alloc, MacroLeaf::new(&alloc, v).unwrap()).unwrap();
+        list.push_back(&alloc, MacroLeaf::new(&alloc, v).unwrap())
+            .unwrap();
     }
 
     let clone = list.try_clone_in(&alloc).unwrap();
@@ -4629,7 +4721,8 @@ fn stdlib_deque_push_back_grows() {
 
     // Push past the initial capacity to force at least one growth.
     for v in 0..10u32 {
-        dq.push_back(&alloc, MacroLeaf::new(&alloc, v).unwrap()).unwrap();
+        dq.push_back(&alloc, MacroLeaf::new(&alloc, v).unwrap())
+            .unwrap();
     }
     assert_eq!(dq.len(stack).unwrap(), 10);
     assert!(dq.capacity(stack).unwrap() >= 10);
@@ -4657,15 +4750,22 @@ fn stdlib_deque_wraparound_no_growth() {
     // Fixed capacity 4; exercise circular indexing without any growth.
     let dq = BStackDeque::<MacroLeaf>::with_capacity(&alloc, 4).unwrap();
     for v in [1u32, 2, 3, 4] {
-        dq.push_back(&alloc, MacroLeaf::new(&alloc, v).unwrap()).unwrap();
+        dq.push_back(&alloc, MacroLeaf::new(&alloc, v).unwrap())
+            .unwrap();
     }
     // Drop the front two: head advances into the ring.
     for _ in 0..2 {
-        dq.pop_front(&alloc).unwrap().unwrap().bstack_drop(&alloc).unwrap();
+        dq.pop_front(&alloc)
+            .unwrap()
+            .unwrap()
+            .bstack_drop(&alloc)
+            .unwrap();
     }
     // Two more push_backs wrap around the physical slots 0,1.
-    dq.push_back(&alloc, MacroLeaf::new(&alloc, 5).unwrap()).unwrap();
-    dq.push_back(&alloc, MacroLeaf::new(&alloc, 6).unwrap()).unwrap();
+    dq.push_back(&alloc, MacroLeaf::new(&alloc, 5).unwrap())
+        .unwrap();
+    dq.push_back(&alloc, MacroLeaf::new(&alloc, 6).unwrap())
+        .unwrap();
     assert_eq!(dq.capacity(stack).unwrap(), 4); // never grew
     assert_eq!(deque_values(&dq, stack), vec![3, 4, 5, 6]);
 
@@ -4679,9 +4779,12 @@ fn stdlib_deque_both_ends() {
     let stack = alloc.stack();
 
     let dq = BStackDeque::<MacroLeaf>::new(&alloc).unwrap();
-    dq.push_back(&alloc, MacroLeaf::new(&alloc, 2).unwrap()).unwrap();
-    dq.push_front(&alloc, MacroLeaf::new(&alloc, 1).unwrap()).unwrap();
-    dq.push_back(&alloc, MacroLeaf::new(&alloc, 3).unwrap()).unwrap();
+    dq.push_back(&alloc, MacroLeaf::new(&alloc, 2).unwrap())
+        .unwrap();
+    dq.push_front(&alloc, MacroLeaf::new(&alloc, 1).unwrap())
+        .unwrap();
+    dq.push_back(&alloc, MacroLeaf::new(&alloc, 3).unwrap())
+        .unwrap();
     assert_eq!(deque_values(&dq, stack), vec![1, 2, 3]);
 
     let back = dq.pop_back(&alloc).unwrap().unwrap();
@@ -4723,7 +4826,8 @@ fn stdlib_deque_deep_clone_is_independent() {
 
     let dq = BStackDeque::<MacroLeaf>::new(&alloc).unwrap();
     for v in [1u32, 2, 3, 4, 5] {
-        dq.push_back(&alloc, MacroLeaf::new(&alloc, v).unwrap()).unwrap();
+        dq.push_back(&alloc, MacroLeaf::new(&alloc, v).unwrap())
+            .unwrap();
     }
 
     let clone = dq.try_clone_in(&alloc).unwrap();
@@ -4737,7 +4841,12 @@ fn stdlib_deque_deep_clone_is_independent() {
     );
 
     // Mutating the clone leaves the original intact.
-    clone.pop_back(&alloc).unwrap().unwrap().bstack_drop(&alloc).unwrap();
+    clone
+        .pop_back(&alloc)
+        .unwrap()
+        .unwrap()
+        .bstack_drop(&alloc)
+        .unwrap();
     assert_eq!(clone.len(stack).unwrap(), 4);
     assert_eq!(deque_values(&dq, stack), vec![1, 2, 3, 4, 5]);
 
@@ -4810,20 +4919,40 @@ fn stdlib_map_insert_get_remove() {
     assert!(map.get(stack, &7).unwrap().is_none());
 
     // Insert of a new key returns no previous value.
-    assert!(map.insert(&alloc, 7, MacroLeaf::new(&alloc, 700).unwrap()).unwrap().is_none());
-    assert!(map.insert(&alloc, 9, MacroLeaf::new(&alloc, 900).unwrap()).unwrap().is_none());
+    assert!(
+        map.insert(&alloc, 7, MacroLeaf::new(&alloc, 700).unwrap())
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        map.insert(&alloc, 9, MacroLeaf::new(&alloc, 900).unwrap())
+            .unwrap()
+            .is_none()
+    );
     assert_eq!(map.len(stack).unwrap(), 2);
-    assert_eq!(map.get(stack, &7).unwrap().unwrap().val(stack).unwrap(), 700);
-    assert_eq!(map.get(stack, &9).unwrap().unwrap().val(stack).unwrap(), 900);
+    assert_eq!(
+        map.get(stack, &7).unwrap().unwrap().val(stack).unwrap(),
+        700
+    );
+    assert_eq!(
+        map.get(stack, &9).unwrap().unwrap().val(stack).unwrap(),
+        900
+    );
     assert!(map.contains_key(stack, &7).unwrap());
     assert!(!map.contains_key(stack, &8).unwrap());
 
     // Overwrite returns the previous value (owned) and does not change len.
-    let old = map.insert(&alloc, 7, MacroLeaf::new(&alloc, 701).unwrap()).unwrap().unwrap();
+    let old = map
+        .insert(&alloc, 7, MacroLeaf::new(&alloc, 701).unwrap())
+        .unwrap()
+        .unwrap();
     assert_eq!(old.handle().val(stack).unwrap(), 700);
     old.bstack_drop(&alloc).unwrap();
     assert_eq!(map.len(stack).unwrap(), 2);
-    assert_eq!(map.get(stack, &7).unwrap().unwrap().val(stack).unwrap(), 701);
+    assert_eq!(
+        map.get(stack, &7).unwrap().unwrap().val(stack).unwrap(),
+        701
+    );
 
     // Remove returns the value (owned); the key is then absent.
     let removed = map.remove(&alloc, &9).unwrap().unwrap();
@@ -4845,17 +4974,28 @@ fn stdlib_map_grows_and_keeps_all() {
     let map = BStackHashMap::<u32, MacroLeaf>::new(&alloc).unwrap();
     // Enough entries to force several rehashes (cap 4 -> ... ).
     for k in 0..100u32 {
-        assert!(map.insert(&alloc, k, MacroLeaf::new(&alloc, k * 10).unwrap()).unwrap().is_none());
+        assert!(
+            map.insert(&alloc, k, MacroLeaf::new(&alloc, k * 10).unwrap())
+                .unwrap()
+                .is_none()
+        );
     }
     assert_eq!(map.len(stack).unwrap(), 100);
     // Every key survives the rehashes with its value.
     for k in 0..100u32 {
-        assert_eq!(map.get(stack, &k).unwrap().unwrap().val(stack).unwrap(), k * 10);
+        assert_eq!(
+            map.get(stack, &k).unwrap().unwrap().val(stack).unwrap(),
+            k * 10
+        );
     }
 
     // Remove the evens; odds remain (exercises tombstones + probing past them).
     for k in (0..100u32).step_by(2) {
-        map.remove(&alloc, &k).unwrap().unwrap().bstack_drop(&alloc).unwrap();
+        map.remove(&alloc, &k)
+            .unwrap()
+            .unwrap()
+            .bstack_drop(&alloc)
+            .unwrap();
     }
     assert_eq!(map.len(stack).unwrap(), 50);
     for k in 0..100u32 {
@@ -4880,11 +5020,17 @@ fn stdlib_map_pod_struct_key() {
     let map = BStackHashMap::<Point3, MacroLeaf>::new(&alloc).unwrap();
     let a = Point3 { x: 1, y: 2, z: 3 };
     let b = Point3 { x: 1, y: 2, z: 4 };
-    map.insert(&alloc, a, MacroLeaf::new(&alloc, 11).unwrap()).unwrap();
-    map.insert(&alloc, b, MacroLeaf::new(&alloc, 22).unwrap()).unwrap();
+    map.insert(&alloc, a, MacroLeaf::new(&alloc, 11).unwrap())
+        .unwrap();
+    map.insert(&alloc, b, MacroLeaf::new(&alloc, 22).unwrap())
+        .unwrap();
     assert_eq!(map.get(stack, &a).unwrap().unwrap().val(stack).unwrap(), 11);
     assert_eq!(map.get(stack, &b).unwrap().unwrap().val(stack).unwrap(), 22);
-    assert!(map.get(stack, &Point3 { x: 9, y: 9, z: 9 }).unwrap().is_none());
+    assert!(
+        map.get(stack, &Point3 { x: 9, y: 9, z: 9 })
+            .unwrap()
+            .is_none()
+    );
 
     map.bstack_drop(&alloc).unwrap();
 }
@@ -4928,12 +5074,16 @@ fn stdlib_map_deep_clone_is_independent() {
 
     let map = BStackHashMap::<u32, MacroLeaf>::new(&alloc).unwrap();
     for k in 0..8u32 {
-        map.insert(&alloc, k, MacroLeaf::new(&alloc, k + 100).unwrap()).unwrap();
+        map.insert(&alloc, k, MacroLeaf::new(&alloc, k + 100).unwrap())
+            .unwrap();
     }
 
     let clone = map.try_clone_in(&alloc).unwrap();
     for k in 0..8u32 {
-        assert_eq!(clone.get(stack, &k).unwrap().unwrap().val(stack).unwrap(), k + 100);
+        assert_eq!(
+            clone.get(stack, &k).unwrap().unwrap().val(stack).unwrap(),
+            k + 100
+        );
     }
     // Clone's value blocks are fresh, not aliases.
     assert_ne!(
@@ -4942,9 +5092,17 @@ fn stdlib_map_deep_clone_is_independent() {
     );
 
     // Mutating the clone leaves the original intact.
-    clone.remove(&alloc, &3).unwrap().unwrap().bstack_drop(&alloc).unwrap();
+    clone
+        .remove(&alloc, &3)
+        .unwrap()
+        .unwrap()
+        .bstack_drop(&alloc)
+        .unwrap();
     assert!(clone.get(stack, &3).unwrap().is_none());
-    assert_eq!(map.get(stack, &3).unwrap().unwrap().val(stack).unwrap(), 103);
+    assert_eq!(
+        map.get(stack, &3).unwrap().unwrap().val(stack).unwrap(),
+        103
+    );
 
     clone.bstack_drop(&alloc).unwrap();
     map.bstack_drop(&alloc).unwrap();
@@ -4976,13 +5134,20 @@ fn stdlib_tree_insert_get_ordered() {
     // Insert 0..50 in a scrambled (but bijective) order to exercise splits.
     for i in 0..50u32 {
         let k = (i * 17) % 50;
-        assert!(tree.insert(&alloc, k, MacroLeaf::new(&alloc, k * 10).unwrap()).unwrap().is_none());
+        assert!(
+            tree.insert(&alloc, k, MacroLeaf::new(&alloc, k * 10).unwrap())
+                .unwrap()
+                .is_none()
+        );
     }
     assert_eq!(tree.len(stack).unwrap(), 50);
 
     // Every key present with its value.
     for k in 0..50u32 {
-        assert_eq!(tree.get(stack, &k).unwrap().unwrap().val(stack).unwrap(), k * 10);
+        assert_eq!(
+            tree.get(stack, &k).unwrap().unwrap().val(stack).unwrap(),
+            k * 10
+        );
     }
     assert!(tree.get(stack, &999).unwrap().is_none());
 
@@ -4994,11 +5159,17 @@ fn stdlib_tree_insert_get_ordered() {
     assert_eq!(tree.last(stack).unwrap().unwrap().0, 49);
 
     // Overwrite returns the previous value; len unchanged; order preserved.
-    let old = tree.insert(&alloc, 25, MacroLeaf::new(&alloc, 9999).unwrap()).unwrap().unwrap();
+    let old = tree
+        .insert(&alloc, 25, MacroLeaf::new(&alloc, 9999).unwrap())
+        .unwrap()
+        .unwrap();
     assert_eq!(old.handle().val(stack).unwrap(), 250);
     old.bstack_drop(&alloc).unwrap();
     assert_eq!(tree.len(stack).unwrap(), 50);
-    assert_eq!(tree.get(stack, &25).unwrap().unwrap().val(stack).unwrap(), 9999);
+    assert_eq!(
+        tree.get(stack, &25).unwrap().unwrap().val(stack).unwrap(),
+        9999
+    );
 
     tree.bstack_drop(&alloc).unwrap();
 }
@@ -5019,13 +5190,18 @@ fn stdlib_tree_large_key_spills() {
     for i in 0..20u64 {
         let mut k = [0u64; 8];
         k[0] = i;
-        tree.insert(&alloc, BigKey(k), MacroLeaf::new(&alloc, i as u32).unwrap()).unwrap();
+        tree.insert(&alloc, BigKey(k), MacroLeaf::new(&alloc, i as u32).unwrap())
+            .unwrap();
     }
     for i in 0..20u64 {
         let mut k = [0u64; 8];
         k[0] = i;
         assert_eq!(
-            tree.get(stack, &BigKey(k)).unwrap().unwrap().val(stack).unwrap(),
+            tree.get(stack, &BigKey(k))
+                .unwrap()
+                .unwrap()
+                .val(stack)
+                .unwrap(),
             i as u32
         );
     }
@@ -5071,12 +5247,16 @@ fn stdlib_tree_deep_clone_is_independent() {
 
     let tree = BStackBTreeMap::<u32, MacroLeaf>::new(&alloc).unwrap();
     for k in 0..30u32 {
-        tree.insert(&alloc, k, MacroLeaf::new(&alloc, k + 100).unwrap()).unwrap();
+        tree.insert(&alloc, k, MacroLeaf::new(&alloc, k + 100).unwrap())
+            .unwrap();
     }
 
     let clone = tree.try_clone_in(&alloc).unwrap();
     for k in 0..30u32 {
-        assert_eq!(clone.get(stack, &k).unwrap().unwrap().val(stack).unwrap(), k + 100);
+        assert_eq!(
+            clone.get(stack, &k).unwrap().unwrap().val(stack).unwrap(),
+            k + 100
+        );
     }
     // Fresh value blocks, not aliases.
     assert_ne!(
@@ -5085,10 +5265,20 @@ fn stdlib_tree_deep_clone_is_independent() {
     );
 
     // Overwriting in the clone leaves the original intact.
-    tree.insert(&alloc, 10, MacroLeaf::new(&alloc, 7).unwrap()).unwrap().unwrap().bstack_drop(&alloc).unwrap();
+    tree.insert(&alloc, 10, MacroLeaf::new(&alloc, 7).unwrap())
+        .unwrap()
+        .unwrap()
+        .bstack_drop(&alloc)
+        .unwrap();
     // (`clone` and `tree` share no nodes: the clone deep-copied every node.)
-    assert_eq!(clone.get(stack, &10).unwrap().unwrap().val(stack).unwrap(), 110);
-    assert_eq!(tree.get(stack, &10).unwrap().unwrap().val(stack).unwrap(), 7);
+    assert_eq!(
+        clone.get(stack, &10).unwrap().unwrap().val(stack).unwrap(),
+        110
+    );
+    assert_eq!(
+        tree.get(stack, &10).unwrap().unwrap().val(stack).unwrap(),
+        7
+    );
 
     clone.bstack_drop(&alloc).unwrap();
     tree.bstack_drop(&alloc).unwrap();
@@ -5103,7 +5293,8 @@ fn stdlib_tree_concurrent_readers() {
 
     let tree = BStackBTreeMap::<u32, MacroLeaf>::new(&alloc).unwrap();
     for k in 0..64u32 {
-        tree.insert(&alloc, k, MacroLeaf::new(&alloc, k * 2).unwrap()).unwrap();
+        tree.insert(&alloc, k, MacroLeaf::new(&alloc, k * 2).unwrap())
+            .unwrap();
     }
 
     std::thread::scope(|s| {
@@ -5112,7 +5303,14 @@ fn stdlib_tree_concurrent_readers() {
             let alloc = &alloc;
             s.spawn(move || {
                 for k in 0..64u32 {
-                    assert_eq!(tree.get(alloc.stack(), &k).unwrap().unwrap().val(alloc.stack()).unwrap(), k * 2);
+                    assert_eq!(
+                        tree.get(alloc.stack(), &k)
+                            .unwrap()
+                            .unwrap()
+                            .val(alloc.stack())
+                            .unwrap(),
+                        k * 2
+                    );
                 }
             });
         }
@@ -5140,7 +5338,8 @@ fn stdlib_map_concurrent_insert() {
             s.spawn(move || {
                 for i in 0..ITERS {
                     let k = t * ITERS + i;
-                    map.insert(alloc, k, MacroLeaf::new(alloc, k).unwrap()).unwrap();
+                    map.insert(alloc, k, MacroLeaf::new(alloc, k).unwrap())
+                        .unwrap();
                 }
             });
         }
@@ -5148,7 +5347,14 @@ fn stdlib_map_concurrent_insert() {
 
     assert_eq!(map.len(alloc.stack()).unwrap(), total);
     for k in 0..(THREADS * ITERS) {
-        assert_eq!(map.get(alloc.stack(), &k).unwrap().unwrap().val(alloc.stack()).unwrap(), k);
+        assert_eq!(
+            map.get(alloc.stack(), &k)
+                .unwrap()
+                .unwrap()
+                .val(alloc.stack())
+                .unwrap(),
+            k
+        );
     }
 
     map.bstack_drop(&alloc).unwrap();
@@ -5227,16 +5433,42 @@ fn stdlib_string_as_map_value() {
 
     // The headline use: strings as owned map values.
     let map = BStackHashMap::<u32, BStackString>::new(&alloc).unwrap();
-    map.insert(&alloc, 1, BStackString::new(&alloc, "one").unwrap()).unwrap();
-    map.insert(&alloc, 2, BStackString::new(&alloc, "two").unwrap()).unwrap();
-    assert_eq!(map.get(stack, &1).unwrap().unwrap().to_string(stack).unwrap(), "one");
-    assert_eq!(map.get(stack, &2).unwrap().unwrap().to_string(stack).unwrap(), "two");
+    map.insert(&alloc, 1, BStackString::new(&alloc, "one").unwrap())
+        .unwrap();
+    map.insert(&alloc, 2, BStackString::new(&alloc, "two").unwrap())
+        .unwrap();
+    assert_eq!(
+        map.get(stack, &1)
+            .unwrap()
+            .unwrap()
+            .to_string(stack)
+            .unwrap(),
+        "one"
+    );
+    assert_eq!(
+        map.get(stack, &2)
+            .unwrap()
+            .unwrap()
+            .to_string(stack)
+            .unwrap(),
+        "two"
+    );
 
     // Overwrite returns the old string (owned), which we free.
-    let old = map.insert(&alloc, 1, BStackString::new(&alloc, "uno").unwrap()).unwrap().unwrap();
+    let old = map
+        .insert(&alloc, 1, BStackString::new(&alloc, "uno").unwrap())
+        .unwrap()
+        .unwrap();
     assert_eq!(old.handle().to_string(stack).unwrap(), "one");
     old.bstack_drop(&alloc).unwrap();
-    assert_eq!(map.get(stack, &1).unwrap().unwrap().to_string(stack).unwrap(), "uno");
+    assert_eq!(
+        map.get(stack, &1)
+            .unwrap()
+            .unwrap()
+            .to_string(stack)
+            .unwrap(),
+        "uno"
+    );
 
     // Dropping the map recursively frees every string value (and its bytes block).
     map.bstack_drop(&alloc).unwrap();

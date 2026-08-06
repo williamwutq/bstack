@@ -178,13 +178,16 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         if u.is_some_and(|u| u.pod) {
             tp.bounds.push(syn::parse_quote!(::bstack_raii::Pod));
         } else {
-            tp.bounds.push(syn::parse_quote!(::bstack_raii::BStackBlock));
+            tp.bounds
+                .push(syn::parse_quote!(::bstack_raii::BStackBlock));
             if let Some(u) = u {
                 if u.strong {
-                    tp.bounds.push(syn::parse_quote!(::bstack_raii::BStackShared));
+                    tp.bounds
+                        .push(syn::parse_quote!(::bstack_raii::BStackShared));
                 }
                 if u.weak {
-                    tp.bounds.push(syn::parse_quote!(::bstack_raii::BStackWeakable));
+                    tp.bounds
+                        .push(syn::parse_quote!(::bstack_raii::BStackWeakable));
                 }
             }
         }
@@ -251,19 +254,18 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
     } else {
         quote!(#on_disk::#od_ty_g)
     };
-    let (phantom_field, phantom_ctor): (TokenStream, TokenStream) = if type_params.is_empty()
-        && const_params.is_empty()
-    {
-        (quote!(), quote!())
-    } else {
-        // Const parameters are held via `[(); N]` so they count as "used".
-        let const_markers = const_params.iter().map(|c| quote!([(); #c]));
-        (
-            quote!(, ::core::marker::PhantomData<
+    let (phantom_field, phantom_ctor): (TokenStream, TokenStream) =
+        if type_params.is_empty() && const_params.is_empty() {
+            (quote!(), quote!())
+        } else {
+            // Const parameters are held via `[(); N]` so they count as "used".
+            let const_markers = const_params.iter().map(|c| quote!([(); #c]));
+            (
+                quote!(, ::core::marker::PhantomData<
                 fn() -> (#(#type_params,)* #(#const_markers,)*)>),
-            quote!(, ::core::marker::PhantomData),
-        )
-    };
+                quote!(, ::core::marker::PhantomData),
+            )
+        };
 
     // On-disk fields: header, then the injected refcount/ctrl (if any), then user
     // fields lowered per annotation.
@@ -543,10 +545,12 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                         ::bstack_raii::BStackRef::<#elem_ty>::from_range(
                             ::bstack_raii::BStackRange::new(__off, #size_elem))
                     }).bstack_drop(allocator)?;),
-                    Kind::Strong => quote!(<#elem_ty as ::bstack_raii::BStackShared>::drop_strong_ref(
+                    Kind::Strong => {
+                        quote!(<#elem_ty as ::bstack_raii::BStackShared>::drop_strong_ref(
                         unsafe { ::bstack_raii::BStackRef::<#elem_ty>::from_range(
                             ::bstack_raii::BStackRange::new(__off, #size_elem)) },
-                        allocator)?;),
+                        allocator)?;)
+                    }
                     Kind::Weak => quote!(::bstack_raii::WeakRef::<#elem_ty>(unsafe {
                         ::bstack_raii::BStackRef::<#ctrl_ty>::from_range(
                             ::bstack_raii::BStackRange::new(__off, #ctrl_size))
@@ -652,7 +656,14 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                 ),
                 Kind::Owned => (
                     block_vec_drop_stmt(fname, quote!(BStackBlockVec), elem, nullable),
-                    block_vec_accessor(vis, fname, elem, &on_disk_ty, quote!(BStackBlockVec), nullable),
+                    block_vec_accessor(
+                        vis,
+                        fname,
+                        elem,
+                        &on_disk_ty,
+                        quote!(BStackBlockVec),
+                        nullable,
+                    ),
                     block_vec_ctor(
                         fname,
                         elem,
@@ -664,7 +675,14 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                 ),
                 Kind::Strong => (
                     block_vec_drop_stmt(fname, quote!(BStackStrongVec), elem, nullable),
-                    block_vec_accessor(vis, fname, elem, &on_disk_ty, quote!(BStackStrongVec), nullable),
+                    block_vec_accessor(
+                        vis,
+                        fname,
+                        elem,
+                        &on_disk_ty,
+                        quote!(BStackStrongVec),
+                        nullable,
+                    ),
                     block_vec_ctor(
                         fname,
                         elem,
@@ -676,7 +694,14 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                 ),
                 Kind::Weak => (
                     block_vec_drop_stmt(fname, quote!(BStackWeakVec), elem, nullable),
-                    block_vec_accessor(vis, fname, elem, &on_disk_ty, quote!(BStackWeakVec), nullable),
+                    block_vec_accessor(
+                        vis,
+                        fname,
+                        elem,
+                        &on_disk_ty,
+                        quote!(BStackWeakVec),
+                        nullable,
+                    ),
                     block_vec_ctor(
                         fname,
                         elem,
@@ -688,7 +713,14 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                 ),
                 Kind::Ref => (
                     block_vec_drop_stmt(fname, quote!(BStackRefVec), elem, nullable),
-                    block_vec_accessor(vis, fname, elem, &on_disk_ty, quote!(BStackRefVec), nullable),
+                    block_vec_accessor(
+                        vis,
+                        fname,
+                        elem,
+                        &on_disk_ty,
+                        quote!(BStackRefVec),
+                        nullable,
+                    ),
                     block_vec_ctor(
                         fname,
                         elem,
@@ -942,7 +974,9 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         // array of `Pod` is `Pod`.) Stored **flat** as `[u64; N0*..*Nk]` inline
         // (no data block), one offset per leaf, with per-element ownership; the
         // accessor / ctor / move traffic in the nested `[[Handle; ..]; ..]` shape.
-        if kind != Kind::Pod && let Type::Array(_) = opt_inner {
+        if kind != Kind::Pod
+            && let Type::Array(_) = opt_inner
+        {
             if nullable {
                 return Err(Error::new_spanned(
                     &field.ty,
@@ -1040,7 +1074,10 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                 // Move: re-home each embedded child to a fresh standalone allocation.
                 let cap = format_ident!("__cap_{}", fname);
                 mv_caps.push(quote!(let #cap = __od.#fname;));
-                mv_types.push(nested_ty(&dims, &quote!(::bstack_raii::BStackOwned<#child>)));
+                mv_types.push(nested_ty(
+                    &dims,
+                    &quote!(::bstack_raii::BStackOwned<#child>),
+                ));
                 let mv_read = |k: &Ident| {
                     quote! {{
                         let __cod = #cap[#k];
@@ -1418,7 +1455,9 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         // packed struct of its (POD) elements is — alignment is irrelevant on disk
         // — so store it through a generated wrapper and rebuild the tuple on read.
         // `bstack_move!` hands back the tuple as one element (not flattened).
-        if kind == Kind::Pod && let Type::Tuple(tup) = inner_ty {
+        if kind == Kind::Pod
+            && let Type::Tuple(tup) = inner_ty
+        {
             let elems: Vec<&Type> = tup.elems.iter().collect();
             let wrapper = format_ident!("__BstackTup_{}_{}", name, fname);
             let idx: Vec<syn::Index> = (0..elems.len()).map(syn::Index::from).collect();
@@ -1662,9 +1701,9 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         });
         // A const parameter changes the array width (the layout), so fold its value
         // in — distinct `N` gives distinct tags.
-        let const_mixes = const_params.iter().map(|c| {
-            quote!(.mix(::bstack_raii::EightCC::new((#c as u64).to_le_bytes())))
-        });
+        let const_mixes = const_params
+            .iter()
+            .map(|c| quote!(.mix(::bstack_raii::EightCC::new((#c as u64).to_le_bytes()))));
         quote!(#data_eightcc #(#mixes)* #(#const_mixes)*)
     };
 
@@ -2129,7 +2168,9 @@ fn reject_nested_const_dims(
 ) -> syn::Result<()> {
     if dims.len() > 1
         && !const_params.is_empty()
-        && dims.iter().any(|d| tokens_mention(quote!(#d), const_params))
+        && dims
+            .iter()
+            .any(|d| tokens_mention(quote!(#d), const_params))
     {
         return Err(Error::new_spanned(
             span,
@@ -2333,7 +2374,11 @@ fn vec_accessor(
 /// Constructor `(param, prep, init)` for a `Vec<T>` / `String` field: allocate
 /// the data block and store its descriptor inline. A nullable field takes an
 /// `Option` (`None` => the `0` niche, no allocation).
-fn vec_ctor(fname: &Ident, vinfo: &VecInfo, nullable: bool) -> (TokenStream, TokenStream, TokenStream) {
+fn vec_ctor(
+    fname: &Ident,
+    vinfo: &VecInfo,
+    nullable: bool,
+) -> (TokenStream, TokenStream, TokenStream) {
     let elem = &vinfo.elem;
     let base_param: TokenStream = if vinfo.is_string {
         quote!(&str)
@@ -2957,7 +3002,12 @@ fn wrap_move(
 
 /// Generate the `set_<field>` method for a `#[bstack_weak]` field: point it at a
 /// weak target (consumed), releasing whatever it held before.
-fn weak_setter(vis: &syn::Visibility, fname: &Ident, fty: &Type, on_disk: &TokenStream) -> TokenStream {
+fn weak_setter(
+    vis: &syn::Visibility,
+    fname: &Ident,
+    fty: &Type,
+    on_disk: &TokenStream,
+) -> TokenStream {
     let setter = format_ident!("set_{}", fname);
     quote! {
         #vis fn #setter<'__s, __A: ::bstack_raii::BStackOwnedSliceAllocator>(
@@ -3655,13 +3705,16 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
     }
     let mut aug_generics = input.generics.clone();
     for tp in aug_generics.type_params_mut() {
-        tp.bounds.push(syn::parse_quote!(::bstack_raii::BStackBlock));
+        tp.bounds
+            .push(syn::parse_quote!(::bstack_raii::BStackBlock));
         if let Some((_, u)) = eusage.iter().find(|(p, _)| *p == tp.ident) {
             if u.strong {
-                tp.bounds.push(syn::parse_quote!(::bstack_raii::BStackShared));
+                tp.bounds
+                    .push(syn::parse_quote!(::bstack_raii::BStackShared));
             }
             if u.weak {
-                tp.bounds.push(syn::parse_quote!(::bstack_raii::BStackWeakable));
+                tp.bounds
+                    .push(syn::parse_quote!(::bstack_raii::BStackWeakable));
             }
         }
     }
@@ -3773,7 +3826,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
         let child_from_off = |ty: &Type| {
             quote! {
                 <#ty as ::bstack_raii::BStackBlock>::from_range(::bstack_raii::BStackRange::new(
-                    u64::from_le_bytes(__pl[..8].try_into().unwrap()),
+                    ::bstack_raii::get_u64(&__pl),
                     ::core::mem::size_of::<<#ty as ::bstack_raii::BStackBlock>::OnDisk>() as u64,
                 ))
             }
@@ -3782,7 +3835,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
         let child_ref = |ty: &Type| {
             quote! {
                 ::bstack_raii::BStackRef::<#ty>::from_range(::bstack_raii::BStackRange::new(
-                    u64::from_le_bytes(__pl[..8].try_into().unwrap()),
+                    ::bstack_raii::get_u64(&__pl),
                     ::core::mem::size_of::<<#ty as ::bstack_raii::BStackBlock>::OnDisk>() as u64,
                 ))
             }
@@ -3818,7 +3871,8 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                     needs_payload = true;
                     payload_sizes.push(quote!(::core::mem::size_of::<::bstack_raii::VecDesc>()));
                     let read_desc = quote!(::bstack_raii::bytemuck::pod_read_unaligned::<
-                        ::bstack_raii::VecDesc>(&__pl[..16]));
+                        ::bstack_raii::VecDesc,
+                    >(&__pl[..16]));
 
                     // A POD `V(Vec<Pod>)` / `V(String)` (un-annotated): a plain
                     // `BStackVec<elem>` (elem = the whole vec element type, itself
@@ -4180,10 +4234,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                     let (dims, elem, elem_nullable) = array_shape(ty)?;
                     let total = dims_prod(&dims);
                     // Flat byte read/write of leaf `#k`'s `u64` in the payload.
-                    let pl_off = |k: &Ident| {
-                        quote!(u64::from_le_bytes(
-                            __pl[(#k) * 8..(#k) * 8 + 8].try_into().unwrap()))
-                    };
+                    let pl_off = |k: &Ident| quote!(::bstack_raii::get_u64(&__pl[(#k) * 8..]));
                     let pl_put = |k: &Ident, off: TokenStream| {
                         quote!(__pl[(#k) * 8..(#k) * 8 + 8]
                             .copy_from_slice(&(#off).to_le_bytes());)
@@ -4313,8 +4364,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                         let data_leaf = quote!(::bstack_raii::BStackWeak<'__e, #elem, __A>);
                         let data_ty_nested = nested_ty(&dims, &data_leaf);
                         data_variants.push(quote!(#vname(#data_ty_nested),));
-                        let view_leaf =
-                            quote!(::core::option::Option<::bstack_raii::BStackRc<'__e, #elem, __A>>);
+                        let view_leaf = quote!(::core::option::Option<::bstack_raii::BStackRc<'__e, #elem, __A>>);
                         let view_ty_nested = nested_ty(&dims, &view_leaf);
                         view_variants.push(quote!(#vname(#view_ty_nested),));
 
@@ -4368,8 +4418,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                         drop_arms.push(quote! {
                             #disc => {
                                 for __k in 0usize..(#total) {
-                                    let __off = u64::from_le_bytes(
-                                        __pl[__k * 8..__k * 8 + 8].try_into().unwrap());
+                                    let __off = ::bstack_raii::get_u64(&__pl[__k * 8..]);
                                     let __ctrl = unsafe {
                                         ::bstack_raii::BStackRef::<#ctrl_ty>::from_range(
                                             ::bstack_raii::BStackRange::new(__off, #ctrl_size)) };
@@ -4381,8 +4430,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                         clone_arms.push(quote! {
                             #disc => {
                                 for __k in 0usize..(#total) {
-                                    let __off = u64::from_le_bytes(
-                                        __pl[__k * 8..__k * 8 + 8].try_into().unwrap());
+                                    let __off = ::bstack_raii::get_u64(&__pl[__k * 8..]);
                                     __plan.bump_weak(__off);
                                 }
                             }
@@ -4534,8 +4582,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                         drop_arms.push(quote! {
                             #disc => {
                                 for __k in 0usize..(#total) {
-                                    let __off = u64::from_le_bytes(
-                                        __pl[__k * 8..__k * 8 + 8].try_into().unwrap());
+                                    let __off = ::bstack_raii::get_u64(&__pl[__k * 8..]);
                                     if __off != 0 {
                                         let __child = unsafe {
                                             ::bstack_raii::BStackRef::<#elem>::from_range(
@@ -4552,8 +4599,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                         Kind::Owned => clone_arms.push(quote! {
                             #disc => {
                                 for __k in 0usize..(#total) {
-                                    let __off = u64::from_le_bytes(
-                                        __pl[__k * 8..__k * 8 + 8].try_into().unwrap());
+                                    let __off = ::bstack_raii::get_u64(&__pl[__k * 8..]);
                                     if __off != 0 {
                                         let __child =
                                             <#elem as ::bstack_raii::BStackBlock>::from_range(
@@ -4568,8 +4614,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                         Kind::Strong => clone_arms.push(quote! {
                             #disc => {
                                 for __k in 0usize..(#total) {
-                                    let __off = u64::from_le_bytes(
-                                        __pl[__k * 8..__k * 8 + 8].try_into().unwrap());
+                                    let __off = ::bstack_raii::get_u64(&__pl[__k * 8..]);
                                     if __off != 0 {
                                         let __data = unsafe {
                                             ::bstack_raii::BStackRef::<#elem>::from_range(
@@ -4612,7 +4657,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                                 let __child = unsafe {
                                     ::bstack_raii::BStackRef::<#ty>::from_range(
                                         ::bstack_raii::BStackRange::new(
-                                            u64::from_le_bytes(__pl[..8].try_into().unwrap()),
+                                            ::bstack_raii::get_u64(&__pl),
                                             ::core::mem::size_of::<
                                                 <#ty as ::bstack_raii::BStackBlock>::OnDisk
                                             >() as u64,
@@ -4624,7 +4669,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                         });
                         clone_arms.push(quote! {
                             #disc => {
-                                let __off = u64::from_le_bytes(__pl[..8].try_into().unwrap());
+                                let __off = ::bstack_raii::get_u64(&__pl);
                                 let __child = <#ty as ::bstack_raii::BStackBlock>::from_range(
                                     ::bstack_raii::BStackRange::new(
                                         __off,
@@ -4710,7 +4755,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                                 ::bstack_raii::BStackRef::<
                                     <#ty as ::bstack_raii::BStackWeakable>::Control
                                 >::from_range(::bstack_raii::BStackRange::new(
-                                    u64::from_le_bytes(__pl[..8].try_into().unwrap()),
+                                    ::bstack_raii::get_u64(&__pl),
                                     ::core::mem::size_of::<
                                         <#ty as ::bstack_raii::BStackWeakable>::Control
                                     >() as u64,
@@ -4761,7 +4806,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                         });
                         clone_arms.push(quote! {
                             #disc => {
-                                let __ctrl_off = u64::from_le_bytes(__pl[..8].try_into().unwrap());
+                                let __ctrl_off = ::bstack_raii::get_u64(&__pl);
                                 __plan.bump_weak(__ctrl_off);
                             }
                         });
@@ -4946,10 +4991,10 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
     let type_name = name.to_string();
     let crate_name = std::env::var("CARGO_PKG_NAME").unwrap_or_default();
     let hash = fnv1a64(&format!("{crate_name}\0{type_name}"));
-    let prefix = attr
-        .tag
-        .as_ref()
-        .map_or_else(|| auto_prefix(&type_name), |t| t.bytes().collect::<Vec<u8>>());
+    let prefix = attr.tag.as_ref().map_or_else(
+        || auto_prefix(&type_name),
+        |t| t.bytes().collect::<Vec<u8>>(),
+    );
     let tag = build_tag(hash, &prefix);
     let eightcc = eightcc_expr(&tag.bytes);
     // For a generic enum, fold each type argument's tag into the discriminant so
@@ -4966,7 +5011,12 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
     // Control-block tag (rc, weak): the data tag with its prefix lowercased, or a
     // `ctrl_tag` override.
     let ctrl_prefix = attr.ctrl_tag.as_ref().map_or_else(
-        || prefix.iter().map(u8::to_ascii_lowercase).collect::<Vec<u8>>(),
+        || {
+            prefix
+                .iter()
+                .map(u8::to_ascii_lowercase)
+                .collect::<Vec<u8>>()
+        },
         |t| t.bytes().collect::<Vec<u8>>(),
     );
     let ctrl_tag = build_tag(hash, &ctrl_prefix);

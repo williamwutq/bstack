@@ -43,10 +43,10 @@ use std::io;
 use bstack::{BStack, BStackOwnedSliceAllocator, BStackRange};
 use bytemuck::{Pod, Zeroable};
 
-use super::util::{Scratch, alloc_image, get_u64};
+use super::util::{Scratch, alloc_image, read_u64};
 use crate::block::{BStackBlock, BStackCast};
 use crate::clone::{ClonePlan, TryCloneIn};
-use crate::layout::{BlockHeader, EightCC, HEADER_SIZE};
+use crate::layout::{BlockHeader, EightCC, HEADER_SIZE, get_u64};
 use crate::owned::BStackOwned;
 use crate::teardown::{AutoDrop, BStackDrop, dealloc_range};
 
@@ -76,11 +76,6 @@ const MAXCHILDREN: usize = 2 * T; // 16
 const NKEYS_OFF: usize = HEADER_SIZE as usize; // 16
 const LEAF_OFF: usize = HEADER_SIZE as usize + 8; // 24
 const KEYS_OFF: usize = HEADER_SIZE as usize + 16; // 32
-
-/// Read a little-endian `u64` from the first 8 bytes of `b`.
-fn u64le(b: &[u8]) -> u64 {
-    u64::from_le_bytes(b[..8].try_into().unwrap())
-}
 
 /// A node decoded for building/mutation: keys as raw `K` bytes, value refs, and
 /// (for an internal node) child node offsets (`keys.len() + 1` of them).
@@ -190,7 +185,7 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBTreeMap<K, V> {
 
     /// Number of entries.
     pub fn len(&self, stack: &BStack) -> io::Result<u64> {
-        get_u64(stack, self.range.start() + LEN_OFF)
+        read_u64(stack, self.range.start() + LEN_OFF)
     }
 
     /// Whether the tree has no entries.
@@ -202,8 +197,8 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBTreeMap<K, V> {
     fn read_node(stack: &BStack, off: u64) -> io::Result<BNode> {
         let mut b = vec![0u8; Self::node_size() as usize];
         stack.get_into(off, &mut b)?;
-        let nkeys = u64le(&b[NKEYS_OFF..]) as usize;
-        let leaf = u64le(&b[LEAF_OFF..]) != 0;
+        let nkeys = get_u64(&b[NKEYS_OFF..]) as usize;
+        let leaf = get_u64(&b[LEAF_OFF..]) != 0;
         let ksize = Self::ksize();
         let vals_off = Self::vals_off();
         let children_off = Self::children_off();
@@ -212,12 +207,12 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBTreeMap<K, V> {
         for i in 0..nkeys {
             let ko = KEYS_OFF + i * ksize;
             keys.push(b[ko..ko + ksize].to_vec());
-            vals.push(u64le(&b[vals_off + i * 8..]));
+            vals.push(get_u64(&b[vals_off + i * 8..]));
         }
         let mut children = Vec::new();
         if !leaf {
             for i in 0..=nkeys {
-                children.push(u64le(&b[children_off + i * 8..]));
+                children.push(get_u64(&b[children_off + i * 8..]));
             }
         }
         Ok(BNode {
@@ -335,8 +330,8 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBTreeMap<K, V> {
         let key_bytes = bytemuck::bytes_of(&key).to_vec();
         let val_ref = value.into_inner().range().start();
 
-        let root = get_u64(stack, handle + ROOT_OFF)?;
-        let len = get_u64(stack, handle + LEN_OFF)?;
+        let root = read_u64(stack, handle + ROOT_OFF)?;
+        let len = read_u64(stack, handle + LEN_OFF)?;
 
         let mut build = Build {
             allocator,
@@ -395,8 +390,7 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBTreeMap<K, V> {
                                 dealloc_range(allocator, BStackRange::new(*off, build.node_size))
                             };
                         }
-                        Ok(old
-                            .map(|o| unsafe { BStackOwned::from_raw(Self::value_at(o)) }))
+                        Ok(old.map(|o| unsafe { BStackOwned::from_raw(Self::value_at(o)) }))
                     }
                     Err(e) => {
                         // Nothing committed: reclaim the new nodes we allocated.
@@ -411,8 +405,9 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBTreeMap<K, V> {
             }
             Err(e) => {
                 for (off, _) in &build.writes {
-                    let _ =
-                        unsafe { dealloc_range(allocator, BStackRange::new(*off, build.node_size)) };
+                    let _ = unsafe {
+                        dealloc_range(allocator, BStackRange::new(*off, build.node_size))
+                    };
                 }
                 Err(e)
             }
@@ -422,7 +417,7 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBTreeMap<K, V> {
     /// A **borrowed** handle to the value mapped by `key` (no ownership), or
     /// `None` if absent.
     pub fn get(&self, stack: &BStack, key: &K) -> io::Result<Option<V>> {
-        let mut off = get_u64(stack, self.range.start() + ROOT_OFF)?;
+        let mut off = read_u64(stack, self.range.start() + ROOT_OFF)?;
         let ksize = Self::ksize();
         let vals_off = Self::vals_off();
         let children_off = Self::children_off();
@@ -433,8 +428,8 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBTreeMap<K, V> {
         while off != 0 {
             let buf = scratch.buf(node_size);
             stack.get_into(off, buf)?;
-            let nkeys = u64le(&buf[NKEYS_OFF..]) as usize;
-            let leaf = u64le(&buf[LEAF_OFF..]) != 0;
+            let nkeys = get_u64(&buf[NKEYS_OFF..]) as usize;
+            let leaf = get_u64(&buf[LEAF_OFF..]) != 0;
             let mut i = nkeys;
             let mut exact = false;
             for j in 0..nkeys {
@@ -453,12 +448,12 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBTreeMap<K, V> {
                 }
             }
             if exact {
-                return Ok(Some(Self::value_at(u64le(&buf[vals_off + i * 8..]))));
+                return Ok(Some(Self::value_at(get_u64(&buf[vals_off + i * 8..]))));
             }
             if leaf {
                 return Ok(None);
             }
-            off = u64le(&buf[children_off + i * 8..]);
+            off = get_u64(&buf[children_off + i * 8..]);
         }
         Ok(None)
     }
@@ -479,7 +474,7 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBTreeMap<K, V> {
     }
 
     fn extreme(&self, stack: &BStack, leftmost: bool) -> io::Result<Option<(K, V)>> {
-        let mut off = get_u64(stack, self.range.start() + ROOT_OFF)?;
+        let mut off = read_u64(stack, self.range.start() + ROOT_OFF)?;
         if off == 0 {
             return Ok(None);
         }
@@ -487,7 +482,10 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBTreeMap<K, V> {
             let nb = Self::read_node(stack, off)?;
             if nb.leaf {
                 let i = if leftmost { 0 } else { nb.keys.len() - 1 };
-                return Ok(Some((Self::read_key(&nb.keys[i]), Self::value_at(nb.vals[i]))));
+                return Ok(Some((
+                    Self::read_key(&nb.keys[i]),
+                    Self::value_at(nb.vals[i]),
+                )));
             }
             off = if leftmost {
                 nb.children[0]
@@ -501,7 +499,7 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBTreeMap<K, V> {
     /// (do not free them; valid only while the tree does).
     pub fn to_vec(&self, stack: &BStack) -> io::Result<Vec<(K, V)>> {
         let mut out = Vec::new();
-        let root = get_u64(stack, self.range.start() + ROOT_OFF)?;
+        let root = read_u64(stack, self.range.start() + ROOT_OFF)?;
         Self::collect(stack, root, &mut out)?;
         Ok(out)
     }
@@ -569,15 +567,15 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBTreeMap<K, V> {
         }
         let mut buf = vec![0u8; Self::node_size() as usize];
         stack.get_into(off, &mut buf)?;
-        let nkeys = u64le(&buf[NKEYS_OFF..]) as usize;
-        let leaf = u64le(&buf[LEAF_OFF..]) != 0;
+        let nkeys = get_u64(&buf[NKEYS_OFF..]) as usize;
+        let leaf = get_u64(&buf[LEAF_OFF..]) != 0;
         let vals_off = Self::vals_off();
         let children_off = Self::children_off();
 
         // Deep-clone each value and repoint it in the copy.
         for i in 0..nkeys {
             let vo = vals_off + i * 8;
-            let vref = u64le(&buf[vo..]);
+            let vref = get_u64(&buf[vo..]);
             let cloned = Self::value_at(vref)
                 .__bstack_clone_into(allocator, plan)?
                 .start();
@@ -587,7 +585,7 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBTreeMap<K, V> {
         if !leaf {
             for i in 0..=nkeys {
                 let co = children_off + i * 8;
-                let child = u64le(&buf[co..]);
+                let child = get_u64(&buf[co..]);
                 let new_child = Self::clone_subtree(stack, child, allocator, plan)?;
                 buf[co..co + 8].copy_from_slice(&new_child.to_le_bytes());
             }
@@ -627,7 +625,7 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBlock for BStackBTreeMap<K, V> {
         range: BStackRange,
         allocator: &A,
     ) -> io::Result<()> {
-        let root = get_u64(allocator.stack(), range.start() + ROOT_OFF)?;
+        let root = read_u64(allocator.stack(), range.start() + ROOT_OFF)?;
         Self::drop_subtree(allocator.stack(), root, allocator)
     }
 
@@ -640,8 +638,8 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBlock for BStackBTreeMap<K, V> {
         plan: &mut ClonePlan,
     ) -> io::Result<BStackRange> {
         let handle = self.range.start();
-        let root = get_u64(allocator.stack(), handle + ROOT_OFF)?;
-        let len = get_u64(allocator.stack(), handle + LEN_OFF)?;
+        let root = read_u64(allocator.stack(), handle + ROOT_OFF)?;
+        let len = read_u64(allocator.stack(), handle + LEN_OFF)?;
         let new_root = Self::clone_subtree(allocator.stack(), root, allocator, plan)?;
 
         let handle_dst = plan.alloc_raw(allocator, TREE_SIZE)?;

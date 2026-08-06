@@ -11,7 +11,7 @@
 use core::mem::size_of;
 use std::io;
 
-use bstack::{BStackOwnedSliceAllocator, BStackRange};
+use bstack::{BStack, BStackOwnedSliceAllocator, BStackRange};
 
 use crate::block::BStackWeakable;
 use crate::handle::WeakRef;
@@ -19,6 +19,13 @@ use crate::layout::{self, BlockHeader, EightCC, put_u64};
 use crate::reference::BStackRef;
 use crate::shared::{BStackRc, BStackWeak};
 use crate::teardown::{BStackDrop, dealloc_range};
+
+#[inline(always)]
+fn read_u64_at(stack: &BStack, off: u64) -> io::Result<u64> {
+    let mut buf = [0u8; 8];
+    stack.get_into(off, &mut buf)?;
+    Ok(layout::get_u64(&buf))
+}
 
 /// Allocate a `size`-byte block and stamp its `BlockHeader { size, tag }`.
 ///
@@ -98,9 +105,9 @@ pub fn build_control_payload(ctrl_tag: EightCC, data_start: u64, control_size: u
         tag: ctrl_tag,
     };
     payload[..layout::HEADER_SIZE as usize].copy_from_slice(bytemuck::bytes_of(&header));
-    put_u64!(payload, layout::CTRL_STRONG_OFFSET, 1);
-    put_u64!(payload, layout::CTRL_WEAK_OFFSET, 1);
-    put_u64!(payload, layout::CTRL_DATA_OFFSET, data_start);
+    put_u64(&mut payload, layout::CTRL_STRONG_OFFSET, 1);
+    put_u64(&mut payload, layout::CTRL_WEAK_OFFSET, 1);
+    put_u64(&mut payload, layout::CTRL_DATA_OFFSET, data_start);
     payload
 }
 
@@ -121,9 +128,7 @@ pub fn set_weak_field<'w, T: BStackWeakable, A: BStackOwnedSliceAllocator>(
     let stack = allocator.stack();
 
     // Read the old target before overwriting it.
-    let mut buf = [0u8; 8];
-    stack.get_into(field_off, &mut buf)?;
-    let old = u64::from_le_bytes(buf);
+    let old = read_u64_at(stack, field_off)?;
 
     // Commit the new pointer FIRST, as a single atomic write: the live field
     // transitions directly from the old target to the new one and is never
@@ -155,9 +160,7 @@ pub fn upgrade_weak_field<'a, T: BStackWeakable, A: BStackOwnedSliceAllocator>(
     allocator: &'a A,
     field_off: u64,
 ) -> io::Result<Option<BStackRc<'a, T, A>>> {
-    let mut buf = [0u8; 8];
-    allocator.stack().get_into(field_off, &mut buf)?;
-    let off = u64::from_le_bytes(buf);
+    let off = read_u64_at(allocator.stack(), field_off)?;
     if off == 0 {
         return Ok(None);
     }
