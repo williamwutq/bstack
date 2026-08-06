@@ -40,7 +40,7 @@ use std::io;
 use bstack::{BStack, BStackGenOp, BStackOwnedSliceAllocator, BStackRange};
 use bytemuck::{Pod, Zeroable};
 
-use super::util::{alloc_image, get_u64};
+use super::util::{Scratch, alloc_image, get_u64};
 use crate::block::{BStackBlock, BStackCast};
 use crate::clone::{ClonePlan, TryCloneIn};
 use crate::layout::{BlockHeader, EightCC, HEADER_SIZE};
@@ -459,7 +459,8 @@ impl<K: Pod, V: BStackBlock> BStackHashMap<K, V> {
         let key_bytes = bytemuck::bytes_of(key);
         let mask = cap - 1;
         let mut idx = fnv1a(key_bytes) & mask;
-        let mut kb = vec![0u8; ksz];
+        // Stack buffer for the probed key (no heap alloc for typical key sizes).
+        let mut scratch = Scratch::new();
         for _ in 0..cap {
             let bucket = table + idx * stride;
             let state = get_u64(stack, bucket)?;
@@ -467,7 +468,8 @@ impl<K: Pod, V: BStackBlock> BStackHashMap<K, V> {
                 return Ok(None);
             }
             if state == OCCUPIED {
-                stack.get_into(bucket + 8, &mut kb)?;
+                let kb = scratch.buf(ksz);
+                stack.get_into(bucket + 8, kb)?;
                 if kb == key_bytes {
                     let vref = get_u64(stack, bucket + 8 + ksz as u64)?;
                     return Ok(Some(Self::value_at(vref)));

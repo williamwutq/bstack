@@ -5003,6 +5003,35 @@ fn stdlib_tree_insert_get_ordered() {
     tree.bstack_drop(&alloc).unwrap();
 }
 
+// A 64-byte Pod key: a B-tree node is 280 + 15*64 = 1240 bytes, past the 1024
+// inline `Scratch` buffer, so `get` exercises the heap-spill fallback.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, bytemuck::Pod, bytemuck::Zeroable)]
+struct BigKey([u64; 8]);
+
+#[test]
+fn stdlib_tree_large_key_spills() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let tree = BStackBTreeMap::<BigKey, MacroLeaf>::new(&alloc).unwrap();
+    for i in 0..20u64 {
+        let mut k = [0u64; 8];
+        k[0] = i;
+        tree.insert(&alloc, BigKey(k), MacroLeaf::new(&alloc, i as u32).unwrap()).unwrap();
+    }
+    for i in 0..20u64 {
+        let mut k = [0u64; 8];
+        k[0] = i;
+        assert_eq!(
+            tree.get(stack, &BigKey(k)).unwrap().unwrap().val(stack).unwrap(),
+            i as u32
+        );
+    }
+    tree.bstack_drop(&alloc).unwrap();
+}
+
 #[test]
 fn stdlib_tree_distinct_tags() {
     assert_ne!(

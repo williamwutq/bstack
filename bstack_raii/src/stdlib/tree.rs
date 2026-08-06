@@ -43,7 +43,7 @@ use std::io;
 use bstack::{BStack, BStackOwnedSliceAllocator, BStackRange};
 use bytemuck::{Pod, Zeroable};
 
-use super::util::{alloc_image, get_u64};
+use super::util::{Scratch, alloc_image, get_u64};
 use crate::block::{BStackBlock, BStackCast};
 use crate::clone::{ClonePlan, TryCloneIn};
 use crate::layout::{BlockHeader, EightCC, HEADER_SIZE};
@@ -426,9 +426,13 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBTreeMap<K, V> {
         let ksize = Self::ksize();
         let vals_off = Self::vals_off();
         let children_off = Self::children_off();
-        let mut buf = vec![0u8; Self::node_size() as usize];
+        // Stack buffer for the node (reused down the descent; no heap alloc for
+        // typical key sizes — see `Scratch`).
+        let mut scratch = Scratch::new();
+        let node_size = Self::node_size() as usize;
         while off != 0 {
-            stack.get_into(off, &mut buf)?;
+            let buf = scratch.buf(node_size);
+            stack.get_into(off, buf)?;
             let nkeys = u64le(&buf[NKEYS_OFF..]) as usize;
             let leaf = u64le(&buf[LEAF_OFF..]) != 0;
             let mut i = nkeys;

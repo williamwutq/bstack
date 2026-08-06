@@ -16,6 +16,49 @@ pub(super) fn get_u64(stack: &BStack, off: u64) -> io::Result<u64> {
     Ok(u64::from_le_bytes(b))
 }
 
+/// Inline capacity of a [`Scratch`] buffer. Sized to hold a B-tree node (or a
+/// map bucket / key) for any reasonably-small `Pod` key entirely on the stack;
+/// unusually large keys spill to the heap. A `BStackBTreeMap` node with minimum
+/// degree 8 is `280 + 15 * size_of::<K>()` bytes, so this covers keys up to
+/// ~49 bytes without a heap allocation.
+const SCRATCH_INLINE: usize = 1024;
+
+/// A reusable read buffer whose storage is **inline (stack)** for the common
+/// small case and spills to the heap only when a requested length exceeds
+/// [`SCRATCH_INLINE`].
+///
+/// This lets the hot lookup paths (`get`) read a whole node/bucket without a heap
+/// allocation for typical `Pod` keys, while imposing **no** compile-time cap on
+/// the key size — the generic-dependent buffer length rules out a plain stack
+/// array (`[u8; node_size()]` is rejected as "constant expression depends on a
+/// generic parameter"), so this hand-rolled small-buffer stands in for it.
+pub(super) struct Scratch {
+    inline: [u8; SCRATCH_INLINE],
+    spill: Vec<u8>,
+}
+
+impl Scratch {
+    pub(super) fn new() -> Self {
+        Scratch {
+            inline: [0u8; SCRATCH_INLINE],
+            spill: Vec::new(),
+        }
+    }
+
+    /// A `&mut [u8]` of length `n` to read into. The bytes are not cleared — the
+    /// caller overwrites the whole slice with a `get_into`.
+    pub(super) fn buf(&mut self, n: usize) -> &mut [u8] {
+        if n <= SCRATCH_INLINE {
+            &mut self.inline[..n]
+        } else {
+            if self.spill.len() < n {
+                self.spill.resize(n, 0);
+            }
+            &mut self.spill[..n]
+        }
+    }
+}
+
 /// Allocate a block and write `bytes` as its whole image (one write; released
 /// without leaking on write failure).
 pub(super) fn alloc_image<A: BStackOwnedSliceAllocator>(
