@@ -14,10 +14,10 @@ use bstack::{
 
 use crate::layout::{self, BlockHeader};
 use crate::{
-    AutoDrop, BStackBlock, BStackBlockVec, BStackBox, BStackCast, BStackCastAs, BStackCastInto,
-    BStackCow, BStackDeque, BStackDrop, BStackHashMap, BStackLinkedList, BStackOwned, BStackRc,
-    BStackRef, BStackShared, BStackWeakable, EightCC, TryClone, TryCloneIn, alloc_block,
-    alloc_control, bstack_block, bstack_cast, bstack_enum, bstack_move, dealloc_range,
+    AutoDrop, BStackBTreeMap, BStackBlock, BStackBlockVec, BStackBox, BStackCast, BStackCastAs,
+    BStackCastInto, BStackCow, BStackDeque, BStackDrop, BStackHashMap, BStackLinkedList,
+    BStackOwned, BStackRc, BStackRef, BStackShared, BStackWeakable, EightCC, TryClone, TryCloneIn,
+    alloc_block, alloc_control, bstack_block, bstack_cast, bstack_enum, bstack_move, dealloc_range,
 };
 
 // --------------------------------------------------------------------------
@@ -4947,6 +4947,148 @@ fn stdlib_map_deep_clone_is_independent() {
 
     clone.bstack_drop(&alloc).unwrap();
     map.bstack_drop(&alloc).unwrap();
+}
+
+// --------------------------------------------------------------------------
+// stdlib: BStackBTreeMap<K, V> — owned ordered map (copy-on-write B-tree)
+// --------------------------------------------------------------------------
+
+fn tree_pairs(tree: &BStackBTreeMap<u32, MacroLeaf>, stack: &BStack) -> Vec<(u32, u32)> {
+    tree.to_vec(stack)
+        .unwrap()
+        .iter()
+        .map(|(k, v)| (*k, v.val(stack).unwrap()))
+        .collect()
+}
+
+#[test]
+fn stdlib_tree_insert_get_ordered() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let tree = BStackBTreeMap::<u32, MacroLeaf>::new(&alloc).unwrap();
+    assert!(tree.is_empty(stack).unwrap());
+    assert!(tree.get(stack, &5).unwrap().is_none());
+    assert!(tree.first(stack).unwrap().is_none());
+
+    // Insert 0..50 in a scrambled (but bijective) order to exercise splits.
+    for i in 0..50u32 {
+        let k = (i * 17) % 50;
+        assert!(tree.insert(&alloc, k, MacroLeaf::new(&alloc, k * 10).unwrap()).unwrap().is_none());
+    }
+    assert_eq!(tree.len(stack).unwrap(), 50);
+
+    // Every key present with its value.
+    for k in 0..50u32 {
+        assert_eq!(tree.get(stack, &k).unwrap().unwrap().val(stack).unwrap(), k * 10);
+    }
+    assert!(tree.get(stack, &999).unwrap().is_none());
+
+    // Ordered iteration is sorted; first/last are the extremes.
+    let pairs = tree_pairs(&tree, stack);
+    let expected: Vec<(u32, u32)> = (0..50u32).map(|k| (k, k * 10)).collect();
+    assert_eq!(pairs, expected);
+    assert_eq!(tree.first(stack).unwrap().unwrap().0, 0);
+    assert_eq!(tree.last(stack).unwrap().unwrap().0, 49);
+
+    // Overwrite returns the previous value; len unchanged; order preserved.
+    let old = tree.insert(&alloc, 25, MacroLeaf::new(&alloc, 9999).unwrap()).unwrap().unwrap();
+    assert_eq!(old.handle().val(stack).unwrap(), 250);
+    old.bstack_drop(&alloc).unwrap();
+    assert_eq!(tree.len(stack).unwrap(), 50);
+    assert_eq!(tree.get(stack, &25).unwrap().unwrap().val(stack).unwrap(), 9999);
+
+    tree.bstack_drop(&alloc).unwrap();
+}
+
+#[test]
+fn stdlib_tree_distinct_tags() {
+    assert_ne!(
+        <BStackBTreeMap<u32, MacroLeaf> as BStackCast>::eightcc(),
+        <BStackBTreeMap<u64, MacroLeaf> as BStackCast>::eightcc(),
+    );
+    assert_ne!(
+        <BStackBTreeMap<u32, MacroLeaf> as BStackCast>::eightcc(),
+        <BStackBTreeMap<u32, MacroStrongChild> as BStackCast>::eightcc(),
+    );
+}
+
+#[test]
+fn stdlib_tree_drop_is_recursive() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+
+    let leaf = MacroLeaf::new(&alloc, 10).unwrap();
+    let leaf_start = leaf.handle().range().start();
+    let parent = MacroParent::new(&alloc, leaf, 1).unwrap();
+
+    let tree = BStackBTreeMap::<u32, MacroParent>::new(&alloc).unwrap();
+    tree.insert(&alloc, 42, parent).unwrap();
+    tree.bstack_drop(&alloc).unwrap();
+
+    // The leaf grandchild's slot is reclaimed — full recursion through a value.
+    let reused = MacroLeaf::new(&alloc, 0).unwrap();
+    assert_eq!(reused.handle().range().start(), leaf_start);
+    reused.bstack_drop(&alloc).unwrap();
+}
+
+#[test]
+fn stdlib_tree_deep_clone_is_independent() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let tree = BStackBTreeMap::<u32, MacroLeaf>::new(&alloc).unwrap();
+    for k in 0..30u32 {
+        tree.insert(&alloc, k, MacroLeaf::new(&alloc, k + 100).unwrap()).unwrap();
+    }
+
+    let clone = tree.try_clone_in(&alloc).unwrap();
+    for k in 0..30u32 {
+        assert_eq!(clone.get(stack, &k).unwrap().unwrap().val(stack).unwrap(), k + 100);
+    }
+    // Fresh value blocks, not aliases.
+    assert_ne!(
+        clone.get(stack, &10).unwrap().unwrap().range().start(),
+        tree.get(stack, &10).unwrap().unwrap().range().start(),
+    );
+
+    // Overwriting in the clone leaves the original intact.
+    tree.insert(&alloc, 10, MacroLeaf::new(&alloc, 7).unwrap()).unwrap().unwrap().bstack_drop(&alloc).unwrap();
+    // (`clone` and `tree` share no nodes: the clone deep-copied every node.)
+    assert_eq!(clone.get(stack, &10).unwrap().unwrap().val(stack).unwrap(), 110);
+    assert_eq!(tree.get(stack, &10).unwrap().unwrap().val(stack).unwrap(), 7);
+
+    clone.bstack_drop(&alloc).unwrap();
+    tree.bstack_drop(&alloc).unwrap();
+}
+
+/// Many threads reading one shared tree concurrently (the B-tree is
+/// single-writer / multi-reader: no writes race here, only lookups).
+#[test]
+fn stdlib_tree_concurrent_readers() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+
+    let tree = BStackBTreeMap::<u32, MacroLeaf>::new(&alloc).unwrap();
+    for k in 0..64u32 {
+        tree.insert(&alloc, k, MacroLeaf::new(&alloc, k * 2).unwrap()).unwrap();
+    }
+
+    std::thread::scope(|s| {
+        for _ in 0..8 {
+            let tree = &tree;
+            let alloc = &alloc;
+            s.spawn(move || {
+                for k in 0..64u32 {
+                    assert_eq!(tree.get(alloc.stack(), &k).unwrap().unwrap().val(alloc.stack()).unwrap(), k * 2);
+                }
+            });
+        }
+    });
+
+    tree.bstack_drop(&alloc).unwrap();
 }
 
 /// Many threads inserting distinct keys into one shared map, driving concurrent
