@@ -24,6 +24,7 @@
 mod boxed;
 mod cow;
 mod deque;
+mod hash;
 mod list;
 mod map;
 mod string;

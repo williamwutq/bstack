@@ -40,6 +40,7 @@ use std::io;
 use bstack::{BStack, BStackGenOp, BStackOwnedSliceAllocator, BStackRange};
 use bytemuck::{Pod, Zeroable};
 
+use super::hash::fnv1a;
 use super::util::{Scratch, alloc_image, read_u64};
 use crate::block::{BStackBlock, BStackCast};
 use crate::clone::{ClonePlan, TryCloneIn};
@@ -80,16 +81,6 @@ const MIN_CAP: u64 = 4;
 const EMPTY: u64 = 0;
 const OCCUPIED: u64 = 1;
 const TOMBSTONE: u64 = 2;
-
-/// 64-bit FNV-1a over `bytes`. Deterministic (so it is stable on disk).
-fn fnv1a(bytes: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for &b in bytes {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    h
-}
 
 /// A snapshot of the four handle metadata fields, read inside a generator.
 struct Meta {
