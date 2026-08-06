@@ -19,12 +19,14 @@
 //! | [`BStackDeque<T>`]  | [`std::collections::VecDeque`] | an owned double-ended queue: a contiguous ring of value refs (no per-element pointer chasing), O(1) amortized push/pop at both ends. |
 //! | [`BStackHashMap<K, V>`] | [`std::collections::HashMap`] | an owned open-addressing map from a [`Pod`](bytemuck::Pod) key to a block value — keyed lookup without a linear scan. |
 //! | [`BStackBTreeMap<K, V>`] | [`std::collections::BTreeMap`] | an owned **ordered** map: a copy-on-write B-tree (wide contiguous nodes, few seeks per lookup) with sorted iteration. Keys are `Pod + Ord`. |
+//! | [`BStackString`]    | [`std::string::String`] | a standalone owned, growable UTF-8 string block — the first-class way to own text (a deque element, a map value). |
 
 mod boxed;
 mod cow;
 mod deque;
 mod list;
 mod map;
+mod string;
 mod tree;
 mod util;
 
@@ -33,4 +35,5 @@ pub use cow::BStackCow;
 pub use deque::{BStackDeque, DequeOnDisk};
 pub use list::{BStackLinkedList, ListOnDisk, NodeOnDisk};
 pub use map::{BStackHashMap, MapOnDisk};
+pub use string::{BStackString, StringOnDisk};
 pub use tree::{BStackBTreeMap, TreeOnDisk};

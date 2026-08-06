@@ -16,8 +16,9 @@ use crate::layout::{self, BlockHeader};
 use crate::{
     AutoDrop, BStackBTreeMap, BStackBlock, BStackBlockVec, BStackBox, BStackCast, BStackCastAs,
     BStackCastInto, BStackCow, BStackDeque, BStackDrop, BStackHashMap, BStackLinkedList,
-    BStackOwned, BStackRc, BStackRef, BStackShared, BStackWeakable, EightCC, TryClone, TryCloneIn,
-    alloc_block, alloc_control, bstack_block, bstack_cast, bstack_enum, bstack_move, dealloc_range,
+    BStackOwned, BStackRc, BStackRef, BStackShared, BStackString, BStackWeakable, EightCC,
+    TryClone, TryCloneIn, alloc_block, alloc_control, bstack_block, bstack_cast, bstack_enum,
+    bstack_move, dealloc_range,
 };
 
 // --------------------------------------------------------------------------
@@ -5121,5 +5122,93 @@ fn stdlib_map_concurrent_insert() {
         assert_eq!(map.get(alloc.stack(), &k).unwrap().unwrap().val(alloc.stack()).unwrap(), k);
     }
 
+    map.bstack_drop(&alloc).unwrap();
+}
+
+// --------------------------------------------------------------------------
+// stdlib: BStackString — standalone owned UTF-8 string
+// --------------------------------------------------------------------------
+
+#[test]
+fn stdlib_string_roundtrip_set_push() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let s = BStackString::new(&alloc, "hello").unwrap();
+    assert_eq!(s.handle().len(stack).unwrap(), 5);
+    assert_eq!(s.handle().to_string(stack).unwrap(), "hello");
+
+    // Replace with something longer, then shorter.
+    s.handle().set(&alloc, "hello, world").unwrap();
+    assert_eq!(s.handle().to_string(stack).unwrap(), "hello, world");
+    s.handle().set(&alloc, "hi").unwrap();
+    assert_eq!(s.handle().to_string(stack).unwrap(), "hi");
+
+    // Append.
+    s.handle().push_str(&alloc, " there").unwrap();
+    assert_eq!(s.handle().to_string(stack).unwrap(), "hi there");
+
+    // Empty string has no bytes block.
+    let e = BStackString::new(&alloc, "").unwrap();
+    assert!(e.handle().is_empty(stack).unwrap());
+    assert_eq!(e.handle().to_string(stack).unwrap(), "");
+
+    s.bstack_drop(&alloc).unwrap();
+    e.bstack_drop(&alloc).unwrap();
+}
+
+#[test]
+fn stdlib_string_unicode() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let text = "héllo — 世界 🦀";
+    let s = BStackString::new(&alloc, text).unwrap();
+    assert_eq!(s.handle().len(stack).unwrap(), text.len() as u64); // byte length
+    assert_eq!(s.handle().to_string(stack).unwrap(), text);
+    s.bstack_drop(&alloc).unwrap();
+}
+
+#[test]
+fn stdlib_string_deep_clone_is_independent() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let s = BStackString::new(&alloc, "original").unwrap();
+    let clone = s.try_clone_in(&alloc).unwrap();
+    assert_eq!(clone.handle().to_string(stack).unwrap(), "original");
+
+    // Mutating the clone leaves the original intact.
+    clone.handle().set(&alloc, "changed").unwrap();
+    assert_eq!(clone.handle().to_string(stack).unwrap(), "changed");
+    assert_eq!(s.handle().to_string(stack).unwrap(), "original");
+
+    clone.bstack_drop(&alloc).unwrap();
+    s.bstack_drop(&alloc).unwrap();
+}
+
+#[test]
+fn stdlib_string_as_map_value() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    // The headline use: strings as owned map values.
+    let map = BStackHashMap::<u32, BStackString>::new(&alloc).unwrap();
+    map.insert(&alloc, 1, BStackString::new(&alloc, "one").unwrap()).unwrap();
+    map.insert(&alloc, 2, BStackString::new(&alloc, "two").unwrap()).unwrap();
+    assert_eq!(map.get(stack, &1).unwrap().unwrap().to_string(stack).unwrap(), "one");
+    assert_eq!(map.get(stack, &2).unwrap().unwrap().to_string(stack).unwrap(), "two");
+
+    // Overwrite returns the old string (owned), which we free.
+    let old = map.insert(&alloc, 1, BStackString::new(&alloc, "uno").unwrap()).unwrap().unwrap();
+    assert_eq!(old.handle().to_string(stack).unwrap(), "one");
+    old.bstack_drop(&alloc).unwrap();
+    assert_eq!(map.get(stack, &1).unwrap().unwrap().to_string(stack).unwrap(), "uno");
+
+    // Dropping the map recursively frees every string value (and its bytes block).
     map.bstack_drop(&alloc).unwrap();
 }
