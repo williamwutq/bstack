@@ -15,9 +15,9 @@ use bstack::{
 use crate::layout::{self, BlockHeader};
 use crate::{
     AutoDrop, BStackBlock, BStackBlockVec, BStackBox, BStackCast, BStackCastAs, BStackCastInto,
-    BStackCow, BStackDeque, BStackDrop, BStackLinkedList, BStackOwned, BStackRc, BStackRef,
-    BStackShared, BStackWeakable, EightCC, TryClone, TryCloneIn, alloc_block, alloc_control,
-    bstack_block, bstack_cast, bstack_enum, bstack_move, dealloc_range,
+    BStackCow, BStackDeque, BStackDrop, BStackHashMap, BStackLinkedList, BStackOwned, BStackRc,
+    BStackRef, BStackShared, BStackWeakable, EightCC, TryClone, TryCloneIn, alloc_block,
+    alloc_control, bstack_block, bstack_cast, bstack_enum, bstack_move, dealloc_range,
 };
 
 // --------------------------------------------------------------------------
@@ -4792,4 +4792,192 @@ fn stdlib_deque_concurrent_push_pop() {
 
     assert_eq!(dq.len(alloc.stack()).unwrap(), 0);
     dq.bstack_drop(&alloc).unwrap();
+}
+
+// --------------------------------------------------------------------------
+// stdlib: BStackHashMap<K, V> — owned open-addressing hash map
+// --------------------------------------------------------------------------
+
+#[test]
+fn stdlib_map_insert_get_remove() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let map = BStackHashMap::<u32, MacroLeaf>::new(&alloc).unwrap();
+    assert!(map.is_empty(stack).unwrap());
+    assert!(map.get(stack, &7).unwrap().is_none());
+
+    // Insert of a new key returns no previous value.
+    assert!(map.insert(&alloc, 7, MacroLeaf::new(&alloc, 700).unwrap()).unwrap().is_none());
+    assert!(map.insert(&alloc, 9, MacroLeaf::new(&alloc, 900).unwrap()).unwrap().is_none());
+    assert_eq!(map.len(stack).unwrap(), 2);
+    assert_eq!(map.get(stack, &7).unwrap().unwrap().val(stack).unwrap(), 700);
+    assert_eq!(map.get(stack, &9).unwrap().unwrap().val(stack).unwrap(), 900);
+    assert!(map.contains_key(stack, &7).unwrap());
+    assert!(!map.contains_key(stack, &8).unwrap());
+
+    // Overwrite returns the previous value (owned) and does not change len.
+    let old = map.insert(&alloc, 7, MacroLeaf::new(&alloc, 701).unwrap()).unwrap().unwrap();
+    assert_eq!(old.handle().val(stack).unwrap(), 700);
+    old.bstack_drop(&alloc).unwrap();
+    assert_eq!(map.len(stack).unwrap(), 2);
+    assert_eq!(map.get(stack, &7).unwrap().unwrap().val(stack).unwrap(), 701);
+
+    // Remove returns the value (owned); the key is then absent.
+    let removed = map.remove(&alloc, &9).unwrap().unwrap();
+    assert_eq!(removed.handle().val(stack).unwrap(), 900);
+    removed.bstack_drop(&alloc).unwrap();
+    assert!(map.get(stack, &9).unwrap().is_none());
+    assert!(map.remove(&alloc, &9).unwrap().is_none());
+    assert_eq!(map.len(stack).unwrap(), 1);
+
+    map.bstack_drop(&alloc).unwrap();
+}
+
+#[test]
+fn stdlib_map_grows_and_keeps_all() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let map = BStackHashMap::<u32, MacroLeaf>::new(&alloc).unwrap();
+    // Enough entries to force several rehashes (cap 4 -> ... ).
+    for k in 0..100u32 {
+        assert!(map.insert(&alloc, k, MacroLeaf::new(&alloc, k * 10).unwrap()).unwrap().is_none());
+    }
+    assert_eq!(map.len(stack).unwrap(), 100);
+    // Every key survives the rehashes with its value.
+    for k in 0..100u32 {
+        assert_eq!(map.get(stack, &k).unwrap().unwrap().val(stack).unwrap(), k * 10);
+    }
+
+    // Remove the evens; odds remain (exercises tombstones + probing past them).
+    for k in (0..100u32).step_by(2) {
+        map.remove(&alloc, &k).unwrap().unwrap().bstack_drop(&alloc).unwrap();
+    }
+    assert_eq!(map.len(stack).unwrap(), 50);
+    for k in 0..100u32 {
+        let got = map.get(stack, &k).unwrap();
+        if k % 2 == 0 {
+            assert!(got.is_none());
+        } else {
+            assert_eq!(got.unwrap().val(stack).unwrap(), k * 10);
+        }
+    }
+
+    map.bstack_drop(&alloc).unwrap();
+}
+
+#[test]
+fn stdlib_map_pod_struct_key() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    // A composite Pod key (see Point3, defined for the box tests).
+    let map = BStackHashMap::<Point3, MacroLeaf>::new(&alloc).unwrap();
+    let a = Point3 { x: 1, y: 2, z: 3 };
+    let b = Point3 { x: 1, y: 2, z: 4 };
+    map.insert(&alloc, a, MacroLeaf::new(&alloc, 11).unwrap()).unwrap();
+    map.insert(&alloc, b, MacroLeaf::new(&alloc, 22).unwrap()).unwrap();
+    assert_eq!(map.get(stack, &a).unwrap().unwrap().val(stack).unwrap(), 11);
+    assert_eq!(map.get(stack, &b).unwrap().unwrap().val(stack).unwrap(), 22);
+    assert!(map.get(stack, &Point3 { x: 9, y: 9, z: 9 }).unwrap().is_none());
+
+    map.bstack_drop(&alloc).unwrap();
+}
+
+#[test]
+fn stdlib_map_distinct_tags() {
+    assert_ne!(
+        <BStackHashMap<u32, MacroLeaf> as BStackCast>::eightcc(),
+        <BStackHashMap<u64, MacroLeaf> as BStackCast>::eightcc(),
+    );
+    assert_ne!(
+        <BStackHashMap<u32, MacroLeaf> as BStackCast>::eightcc(),
+        <BStackHashMap<u32, MacroStrongChild> as BStackCast>::eightcc(),
+    );
+}
+
+#[test]
+fn stdlib_map_drop_is_recursive() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+
+    let leaf = MacroLeaf::new(&alloc, 10).unwrap();
+    let leaf_start = leaf.handle().range().start();
+    let parent = MacroParent::new(&alloc, leaf, 1).unwrap();
+
+    let map = BStackHashMap::<u32, MacroParent>::new(&alloc).unwrap();
+    map.insert(&alloc, 42, parent).unwrap();
+    map.bstack_drop(&alloc).unwrap();
+
+    // The leaf grandchild's slot is reclaimed — full recursion through a value.
+    let reused = MacroLeaf::new(&alloc, 0).unwrap();
+    assert_eq!(reused.handle().range().start(), leaf_start);
+    reused.bstack_drop(&alloc).unwrap();
+}
+
+#[test]
+fn stdlib_map_deep_clone_is_independent() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let map = BStackHashMap::<u32, MacroLeaf>::new(&alloc).unwrap();
+    for k in 0..8u32 {
+        map.insert(&alloc, k, MacroLeaf::new(&alloc, k + 100).unwrap()).unwrap();
+    }
+
+    let clone = map.try_clone_in(&alloc).unwrap();
+    for k in 0..8u32 {
+        assert_eq!(clone.get(stack, &k).unwrap().unwrap().val(stack).unwrap(), k + 100);
+    }
+    // Clone's value blocks are fresh, not aliases.
+    assert_ne!(
+        clone.get(stack, &3).unwrap().unwrap().range().start(),
+        map.get(stack, &3).unwrap().unwrap().range().start(),
+    );
+
+    // Mutating the clone leaves the original intact.
+    clone.remove(&alloc, &3).unwrap().unwrap().bstack_drop(&alloc).unwrap();
+    assert!(clone.get(stack, &3).unwrap().is_none());
+    assert_eq!(map.get(stack, &3).unwrap().unwrap().val(stack).unwrap(), 103);
+
+    clone.bstack_drop(&alloc).unwrap();
+    map.bstack_drop(&alloc).unwrap();
+}
+
+/// Many threads inserting distinct keys into one shared map, driving concurrent
+/// growth/rehash. A non-atomic probe/write or a racy rehash would drop entries.
+#[test]
+fn stdlib_map_concurrent_insert() {
+    const THREADS: u32 = 8;
+    const ITERS: u32 = 8;
+
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let map = BStackHashMap::<u32, MacroLeaf>::new(&alloc).unwrap();
+    let total = (THREADS * ITERS) as u64;
+
+    std::thread::scope(|s| {
+        for t in 0..THREADS {
+            let map = &map;
+            let alloc = &alloc;
+            s.spawn(move || {
+                for i in 0..ITERS {
+                    let k = t * ITERS + i;
+                    map.insert(alloc, k, MacroLeaf::new(alloc, k).unwrap()).unwrap();
+                }
+            });
+        }
+    });
+
+    assert_eq!(map.len(alloc.stack()).unwrap(), total);
+    for k in 0..(THREADS * ITERS) {
+        assert_eq!(map.get(alloc.stack(), &k).unwrap().unwrap().val(alloc.stack()).unwrap(), k);
+    }
+
+    map.bstack_drop(&alloc).unwrap();
 }
