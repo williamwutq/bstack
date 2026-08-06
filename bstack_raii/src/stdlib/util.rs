@@ -9,6 +9,8 @@ use std::io;
 
 use bstack::{BStack, BStackGenOp, BStackOwnedSliceAllocator, BStackRange};
 
+use crate::layout::{HEADER_SIZE, get_u64};
+
 /// Read a little-endian `u64` at absolute offset `off`.
 pub(super) fn read_u64(stack: &BStack, off: u64) -> io::Result<u64> {
     let mut b = [0u8; 8];
@@ -162,6 +164,133 @@ where
             w += 1;
             let (off, ref bytes) = writes[i];
             // SAFETY: `writes` outlives this call and is not mutated after Transition B.
+            let d: &[u8] = unsafe { core::mem::transmute::<&[u8], _>(bytes.as_slice()) };
+            return Some(BStackGenOp::Write {
+                offset: off,
+                data: d,
+            });
+        }
+        None
+    })
+}
+
+/// A snapshot of an open-addressing table's four handle metadata fields
+/// (`table`, `cap`, `len`, `used`), read inside a generator. Both
+/// [`crate::BStackHashMap`] and [`crate::stdlib::BStackHashSet`] lay these out
+/// contiguously at `handle + HEADER_SIZE`.
+pub(super) struct Meta {
+    pub(super) table: u64,
+    pub(super) cap: u64,
+    pub(super) len: u64,
+    pub(super) used: u64,
+}
+
+/// A probe step returned by the `inspect` closure of [`probe_commit`].
+pub(super) enum ProbeStep {
+    /// This bucket isn't the target — keep probing.
+    Continue,
+    /// Stop here and commit these writes (empty = commit nothing).
+    Stop(Vec<(u64, Vec<u8>)>),
+}
+
+/// Run an atomic, external-lock-free linear probe over an open-addressing bucket
+/// table under one [`BStack::inplace_gen`].
+///
+/// Reads the four-`u64` handle metadata (at `handle + HEADER_SIZE`), then linearly
+/// probes buckets from `hash & (cap-1)`, reading the full `stride`-byte bucket
+/// each step and handing it to `inspect`. The first `inspect` returning
+/// [`ProbeStep::Stop`] commits its writes and ends; if all `cap` buckets are
+/// probed without a stop, `exhausted` produces the final writes. Every read and
+/// write rides the one generator, so the probe sees a consistent snapshot and the
+/// writes land as one crash-atomic batch. Shared by the hash map and hash set.
+pub(super) fn probe_commit<A, I, E>(
+    allocator: &A,
+    handle: u64,
+    stride: u64,
+    hash: u64,
+    mut inspect: I,
+    exhausted: E,
+) -> io::Result<()>
+where
+    A: BStackOwnedSliceAllocator,
+    I: FnMut(&Meta, u64, &[u8]) -> ProbeStep,
+    E: FnOnce(&Meta) -> Vec<(u64, Vec<u8>)>,
+{
+    let mut meta_buf = [0u8; 32];
+    let mut bucket_buf = vec![0u8; stride as usize];
+    let mut writes: Vec<(u64, Vec<u8>)> = Vec::new();
+
+    let mut meta_issued = false;
+    let mut meta: Option<Meta> = None;
+    let mut mask = 0u64;
+    let mut cur = 0u64;
+    let mut idx_at_read = 0u64;
+    let mut probe_pending = false;
+    let mut probed = 0u64;
+    let mut decided = false;
+    let mut exhausted = Some(exhausted);
+    let mut w = 0usize;
+
+    allocator.stack().inplace_gen(|_feedback| {
+        // 1. Read the 32-byte metadata block.
+        if !meta_issued {
+            meta_issued = true;
+            // SAFETY: `meta_buf` outlives the call; used by this one read.
+            let b: &mut [u8] = unsafe { core::mem::transmute::<&mut [u8], _>(&mut meta_buf[..]) };
+            return Some(BStackGenOp::Read {
+                offset: handle + HEADER_SIZE,
+                buf: b,
+            });
+        }
+        // 2. Parse it once.
+        if meta.is_none() {
+            let m = Meta {
+                table: get_u64(&meta_buf[0..8]),
+                cap: get_u64(&meta_buf[8..16]),
+                len: get_u64(&meta_buf[16..24]),
+                used: get_u64(&meta_buf[24..32]),
+            };
+            mask = m.cap.wrapping_sub(1);
+            cur = if m.cap == 0 { 0 } else { hash & mask };
+            meta = Some(m);
+        }
+        let m = meta.as_ref().unwrap();
+
+        // 3a. Inspect a completed bucket read.
+        if probe_pending {
+            probe_pending = false;
+            if let ProbeStep::Stop(ws) = inspect(m, idx_at_read, &bucket_buf) {
+                writes = ws;
+                decided = true;
+            }
+        }
+        // 3b. Issue the next probe, or finish by exhaustion.
+        if !decided {
+            if m.cap == 0 || probed >= m.cap {
+                writes = (exhausted.take().unwrap())(m);
+                decided = true;
+            } else {
+                idx_at_read = cur;
+                probe_pending = true;
+                probed += 1;
+                cur = (cur + 1) & mask;
+                let off = m.table + idx_at_read * stride;
+                // SAFETY: `bucket_buf` outlives the call; each read completes
+                // (and is inspected) before the next is issued.
+                let b: &mut [u8] =
+                    unsafe { core::mem::transmute::<&mut [u8], _>(&mut bucket_buf[..]) };
+                return Some(BStackGenOp::Read {
+                    offset: off,
+                    buf: b,
+                });
+            }
+        }
+        // 4. Commit the chosen writes together.
+        if w < writes.len() {
+            let i = w;
+            w += 1;
+            let (off, ref bytes) = writes[i];
+            // SAFETY: `writes` outlives the call and is not mutated after this point.
             let d: &[u8] = unsafe { core::mem::transmute::<&[u8], _>(bytes.as_slice()) };
             return Some(BStackGenOp::Write {
                 offset: off,

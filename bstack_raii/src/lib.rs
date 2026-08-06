@@ -82,9 +82,10 @@ pub use owned::BStackOwned;
 pub use reference::BStackRef;
 pub use shared::{BStackRc, BStackWeak};
 pub use stdlib::{
-    BStackBTreeMap, BStackBox, BStackCountingBloomFilter, BStackCow, BStackDeque, BStackHashMap,
-    BStackLinkedList, BStackString, BloomOnDisk, BoxOnDisk, DequeOnDisk, ListOnDisk, MapOnDisk,
-    NodeOnDisk, StringOnDisk, TreeOnDisk,
+    BStackBTreeMap, BStackBTreeSet, BStackBox, BStackCountingBloomFilter, BStackCow, BStackDeque,
+    BStackHashMap, BStackHashSet, BStackLinkedList, BStackString, BloomOnDisk, BoxOnDisk,
+    DequeOnDisk, HashSetOnDisk, ListOnDisk, MapOnDisk, NodeOnDisk, StringOnDisk, TreeOnDisk,
+    TreeSetOnDisk,
 };
 pub use teardown::{AutoDrop, BStackDrop, dealloc_range};
 pub use vec::{BStackBlockVec, BStackRefVec, BStackStrongVec, BStackVec, BStackWeakVec, VecDesc};

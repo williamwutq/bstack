@@ -14,11 +14,11 @@ use bstack::{
 
 use crate::layout::{self, BlockHeader};
 use crate::{
-    AutoDrop, BStackBTreeMap, BStackBlock, BStackBlockVec, BStackBox, BStackCast, BStackCastAs,
-    BStackCastInto, BStackCountingBloomFilter, BStackCow, BStackDeque, BStackDrop, BStackHashMap,
-    BStackLinkedList, BStackOwned, BStackRc, BStackRef, BStackShared, BStackString, BStackWeakable,
-    EightCC, TryClone, TryCloneIn, alloc_block, alloc_control, bstack_block, bstack_cast,
-    bstack_enum, bstack_move, dealloc_range,
+    AutoDrop, BStackBTreeMap, BStackBTreeSet, BStackBlock, BStackBlockVec, BStackBox, BStackCast,
+    BStackCastAs, BStackCastInto, BStackCountingBloomFilter, BStackCow, BStackDeque, BStackDrop,
+    BStackHashMap, BStackHashSet, BStackLinkedList, BStackOwned, BStackRc, BStackRef, BStackShared,
+    BStackString, BStackWeakable, EightCC, TryClone, TryCloneIn, alloc_block, alloc_control,
+    bstack_block, bstack_cast, bstack_enum, bstack_move, dealloc_range,
 };
 
 // --------------------------------------------------------------------------
@@ -5606,4 +5606,141 @@ fn stdlib_bloom_guards_a_map() {
 
     bloom.bstack_drop(&alloc).unwrap();
     map.bstack_drop(&alloc).unwrap();
+}
+
+// --------------------------------------------------------------------------
+// stdlib: BStackHashSet<K> — set with an embedded bloom filter
+// --------------------------------------------------------------------------
+
+#[test]
+fn stdlib_hashset_basic() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let set = BStackHashSet::<u32>::new(&alloc).unwrap();
+    assert!(set.is_empty(stack).unwrap());
+    assert!(!set.contains(stack, &5).unwrap());
+
+    // Insert many to force table growth; insert reports newness.
+    for k in 0..100u32 {
+        assert!(set.insert(&alloc, k).unwrap());
+    }
+    assert_eq!(set.len(stack).unwrap(), 100);
+    // Duplicate insert is a no-op returning false.
+    assert!(!set.insert(&alloc, 50).unwrap());
+    assert_eq!(set.len(stack).unwrap(), 100);
+
+    // No false negatives: every inserted key is present.
+    for k in 0..100u32 {
+        assert!(set.contains(stack, &k).unwrap());
+    }
+    assert!(!set.contains(stack, &10_000).unwrap());
+
+    // Remove and re-check.
+    assert!(set.remove(&alloc, &50).unwrap());
+    assert!(!set.remove(&alloc, &50).unwrap()); // already gone
+    assert!(!set.contains(stack, &50).unwrap());
+    assert_eq!(set.len(stack).unwrap(), 99);
+
+    set.bstack_drop(&alloc).unwrap();
+}
+
+#[test]
+fn stdlib_hashset_deep_clone_is_independent() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let set = BStackHashSet::<u32>::new(&alloc).unwrap();
+    for k in 0..20u32 {
+        set.insert(&alloc, k).unwrap();
+    }
+    let clone = set.try_clone_in(&alloc).unwrap();
+    for k in 0..20u32 {
+        assert!(clone.contains(stack, &k).unwrap());
+    }
+    // Mutating the clone (incl. its embedded bloom) leaves the original intact.
+    clone.remove(&alloc, &5).unwrap();
+    assert!(!clone.contains(stack, &5).unwrap());
+    assert!(set.contains(stack, &5).unwrap());
+    assert_eq!(set.len(stack).unwrap(), 20);
+    assert_eq!(clone.len(stack).unwrap(), 19);
+
+    clone.bstack_drop(&alloc).unwrap();
+    set.bstack_drop(&alloc).unwrap();
+}
+
+#[test]
+fn stdlib_hashset_distinct_tags() {
+    assert_ne!(
+        <BStackHashSet<u32> as BStackCast>::eightcc(),
+        <BStackHashSet<u64> as BStackCast>::eightcc(),
+    );
+}
+
+// --------------------------------------------------------------------------
+// stdlib: BStackBTreeSet<K> — ordered set with an embedded bloom filter
+// --------------------------------------------------------------------------
+
+#[test]
+fn stdlib_btreeset_ordered() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let set = BStackBTreeSet::<u32>::new(&alloc).unwrap();
+    assert!(set.first(stack).unwrap().is_none());
+
+    // Scrambled but bijective insertion order to force node splits.
+    for i in 0..60u32 {
+        let k = (i * 23) % 60;
+        assert!(set.insert(&alloc, k).unwrap());
+    }
+    assert_eq!(set.len(stack).unwrap(), 60);
+    assert!(!set.insert(&alloc, 30).unwrap()); // duplicate
+    assert_eq!(set.len(stack).unwrap(), 60);
+
+    // No false negatives; ordered iteration is sorted.
+    for k in 0..60u32 {
+        assert!(set.contains(stack, &k).unwrap());
+    }
+    assert!(!set.contains(stack, &999).unwrap());
+    assert_eq!(set.to_vec(stack).unwrap(), (0..60u32).collect::<Vec<_>>());
+    assert_eq!(set.first(stack).unwrap().unwrap(), 0);
+    assert_eq!(set.last(stack).unwrap().unwrap(), 59);
+
+    set.bstack_drop(&alloc).unwrap();
+}
+
+#[test]
+fn stdlib_btreeset_deep_clone_is_independent() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let set = BStackBTreeSet::<u32>::new(&alloc).unwrap();
+    for k in 0..30u32 {
+        set.insert(&alloc, k).unwrap();
+    }
+    let clone = set.try_clone_in(&alloc).unwrap();
+    for k in 0..30u32 {
+        assert!(clone.contains(stack, &k).unwrap());
+    }
+    // Inserting into the clone leaves the original unchanged.
+    assert!(clone.insert(&alloc, 100).unwrap());
+    assert!(clone.contains(stack, &100).unwrap());
+    assert!(!set.contains(stack, &100).unwrap());
+    assert_eq!(set.len(stack).unwrap(), 30);
+
+    clone.bstack_drop(&alloc).unwrap();
+    set.bstack_drop(&alloc).unwrap();
+}
+
+#[test]
+fn stdlib_btreeset_distinct_tags() {
+    assert_ne!(
+        <BStackBTreeSet<u32> as BStackCast>::eightcc(),
+        <BStackBTreeSet<u64> as BStackCast>::eightcc(),
+    );
 }

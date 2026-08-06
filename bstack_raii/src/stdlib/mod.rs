@@ -20,12 +20,17 @@
 //! | [`BStackHashMap<K, V>`] | [`std::collections::HashMap`] | an owned open-addressing map from a [`Pod`](bytemuck::Pod) key to a block value — keyed lookup without a linear scan. |
 //! | [`BStackBTreeMap<K, V>`] | [`std::collections::BTreeMap`] | an owned **ordered** map: a copy-on-write B-tree (wide contiguous nodes, few seeks per lookup) with sorted iteration. Keys are `Pod + Ord`. |
 //! | [`BStackString`]    | [`std::string::String`] | a standalone owned, growable UTF-8 string block — the first-class way to own text (a deque element, a map value). |
+//! | [`BStackCountingBloomFilter<K>`] | (Bloom filter) | a probabilistic set: no false negatives, supports removal; a cheap fast-reject front for exact lookups. |
+//! | [`BStackHashSet<K>`] | [`std::collections::HashSet`] | an owned open-addressing set of `Pod` keys, with an embedded Bloom-filter fast-reject front. |
+//! | [`BStackBTreeSet<K>`] | [`std::collections::BTreeSet`] | an owned **ordered** set (copy-on-write B-tree, sorted iteration), with an embedded Bloom-filter front. Keys are `Pod + Ord`. |
 
 mod bloom;
 mod boxed;
+mod btreeset;
 mod cow;
 mod deque;
 mod hash;
+mod hashset;
 mod list;
 mod map;
 mod string;
@@ -34,8 +39,10 @@ mod util;
 
 pub use bloom::{BStackCountingBloomFilter, BloomOnDisk};
 pub use boxed::{BStackBox, BoxOnDisk};
+pub use btreeset::{BStackBTreeSet, TreeSetOnDisk};
 pub use cow::BStackCow;
 pub use deque::{BStackDeque, DequeOnDisk};
+pub use hashset::{BStackHashSet, HashSetOnDisk};
 pub use list::{BStackLinkedList, ListOnDisk, NodeOnDisk};
 pub use map::{BStackHashMap, MapOnDisk};
 pub use string::{BStackString, StringOnDisk};
