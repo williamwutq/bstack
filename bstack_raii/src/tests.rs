@@ -15,10 +15,10 @@ use bstack::{
 use crate::layout::{self, BlockHeader};
 use crate::{
     AutoDrop, BStackBTreeMap, BStackBlock, BStackBlockVec, BStackBox, BStackCast, BStackCastAs,
-    BStackCastInto, BStackCow, BStackDeque, BStackDrop, BStackHashMap, BStackLinkedList,
-    BStackOwned, BStackRc, BStackRef, BStackShared, BStackString, BStackWeakable, EightCC,
-    TryClone, TryCloneIn, alloc_block, alloc_control, bstack_block, bstack_cast, bstack_enum,
-    bstack_move, dealloc_range,
+    BStackCastInto, BStackCountingBloomFilter, BStackCow, BStackDeque, BStackDrop, BStackHashMap,
+    BStackLinkedList, BStackOwned, BStackRc, BStackRef, BStackShared, BStackString, BStackWeakable,
+    EightCC, TryClone, TryCloneIn, alloc_block, alloc_control, bstack_block, bstack_cast,
+    bstack_enum, bstack_move, dealloc_range,
 };
 
 // --------------------------------------------------------------------------
@@ -5471,5 +5471,139 @@ fn stdlib_string_as_map_value() {
     );
 
     // Dropping the map recursively frees every string value (and its bytes block).
+    map.bstack_drop(&alloc).unwrap();
+}
+
+// --------------------------------------------------------------------------
+// stdlib: BStackCountingBloomFilter<K> — probabilistic set
+// --------------------------------------------------------------------------
+
+#[test]
+fn stdlib_bloom_no_false_negatives() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let bloom = BStackCountingBloomFilter::<u32>::with_capacity(&alloc, 1000, 0.001).unwrap();
+    assert!(bloom.is_empty(stack).unwrap());
+    assert!(!bloom.contains(stack, &7).unwrap()); // fresh: everything absent
+
+    for k in 0..50u32 {
+        bloom.insert(&alloc, &k).unwrap();
+    }
+    assert_eq!(bloom.count(stack).unwrap(), 50);
+
+    // No false negatives: every inserted key reports present.
+    for k in 0..50u32 {
+        assert!(bloom.contains(stack, &k).unwrap());
+    }
+
+    // Disjoint keys are (almost all) absent — allow a few false positives.
+    let absent = (1_000..1_050u32)
+        .filter(|k| !bloom.contains(stack, k).unwrap())
+        .count();
+    assert!(absent >= 45, "too many false positives: {}/50 absent", absent);
+
+    // A positive FP estimate in (0, 1).
+    let fp = bloom.estimated_fp_rate(stack).unwrap();
+    assert!(fp > 0.0 && fp < 1.0);
+
+    bloom.bstack_drop(&alloc).unwrap();
+}
+
+#[test]
+fn stdlib_bloom_remove_and_clear() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    // A single inserted key: removing it drives its counters back to zero (no
+    // sharing), so `contains` becomes definitively false.
+    let bloom = BStackCountingBloomFilter::<u32>::with_capacity(&alloc, 100, 0.01).unwrap();
+    bloom.insert(&alloc, &42).unwrap();
+    assert!(bloom.contains(stack, &42).unwrap());
+    assert_eq!(bloom.count(stack).unwrap(), 1);
+    bloom.remove(&alloc, &42).unwrap();
+    assert!(!bloom.contains(stack, &42).unwrap());
+    assert_eq!(bloom.count(stack).unwrap(), 0);
+
+    // clear() zeroes everything.
+    for k in 0..20u32 {
+        bloom.insert(&alloc, &k).unwrap();
+    }
+    assert_eq!(bloom.count(stack).unwrap(), 20);
+    bloom.clear(&alloc).unwrap();
+    assert_eq!(bloom.count(stack).unwrap(), 0);
+    for k in 0..20u32 {
+        assert!(!bloom.contains(stack, &k).unwrap());
+    }
+
+    bloom.bstack_drop(&alloc).unwrap();
+}
+
+#[test]
+fn stdlib_bloom_deep_clone_is_independent() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let bloom = BStackCountingBloomFilter::<u32>::with_capacity(&alloc, 100, 0.01).unwrap();
+    for k in 0..10u32 {
+        bloom.insert(&alloc, &k).unwrap();
+    }
+    let clone = bloom.try_clone_in(&alloc).unwrap();
+    for k in 0..10u32 {
+        assert!(clone.contains(stack, &k).unwrap());
+    }
+    // Clearing the clone leaves the original intact.
+    clone.clear(&alloc).unwrap();
+    assert_eq!(clone.count(stack).unwrap(), 0);
+    assert_eq!(bloom.count(stack).unwrap(), 10);
+    assert!(bloom.contains(stack, &5).unwrap());
+
+    clone.bstack_drop(&alloc).unwrap();
+    bloom.bstack_drop(&alloc).unwrap();
+}
+
+#[test]
+fn stdlib_bloom_distinct_tags() {
+    assert_ne!(
+        <BStackCountingBloomFilter<u32> as BStackCast>::eightcc(),
+        <BStackCountingBloomFilter<u64> as BStackCast>::eightcc(),
+    );
+}
+
+#[test]
+fn stdlib_bloom_guards_a_map() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    // The headline pattern: a bloom filter in front of a map skips the disk probe
+    // for keys that are definitely absent.
+    let bloom = BStackCountingBloomFilter::<u32>::with_capacity(&alloc, 1000, 0.001).unwrap();
+    let map = BStackHashMap::<u32, MacroLeaf>::new(&alloc).unwrap();
+    for k in 0..40u32 {
+        map.insert(&alloc, k, MacroLeaf::new(&alloc, k * 3).unwrap()).unwrap();
+        bloom.insert(&alloc, &k).unwrap();
+    }
+
+    let lookup = |k: u32| -> Option<u32> {
+        // Fast-reject via the filter before touching the map.
+        if !bloom.contains(stack, &k).unwrap() {
+            return None;
+        }
+        map.get(stack, &k).unwrap().map(|v| v.val(stack).unwrap())
+    };
+
+    for k in 0..40u32 {
+        assert_eq!(lookup(k), Some(k * 3));
+    }
+    // Absent keys: the filter short-circuits (and the map agrees).
+    for k in 500..540u32 {
+        assert_eq!(lookup(k), None);
+    }
+
+    bloom.bstack_drop(&alloc).unwrap();
     map.bstack_drop(&alloc).unwrap();
 }

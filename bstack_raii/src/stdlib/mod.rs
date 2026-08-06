@@ -21,6 +21,7 @@
 //! | [`BStackBTreeMap<K, V>`] | [`std::collections::BTreeMap`] | an owned **ordered** map: a copy-on-write B-tree (wide contiguous nodes, few seeks per lookup) with sorted iteration. Keys are `Pod + Ord`. |
 //! | [`BStackString`]    | [`std::string::String`] | a standalone owned, growable UTF-8 string block — the first-class way to own text (a deque element, a map value). |
 
+mod bloom;
 mod boxed;
 mod cow;
 mod deque;
@@ -31,6 +32,7 @@ mod string;
 mod tree;
 mod util;
 
+pub use bloom::{BStackCountingBloomFilter, BloomOnDisk};
 pub use boxed::{BStackBox, BoxOnDisk};
 pub use cow::BStackCow;
 pub use deque::{BStackDeque, DequeOnDisk};
