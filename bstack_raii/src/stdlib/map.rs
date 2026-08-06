@@ -205,29 +205,35 @@ where
     })
 }
 
-/// Build the writes that place a *new* entry (state, key, value) at bucket
-/// `target`, bumping `len` (and `used` when the slot was previously `EMPTY`).
-fn new_bucket_writes(
+/// The per-insert invariants shared by the probe closures that place the new
+/// entry: where the map lives, its bucket geometry, and the entry to write.
+struct NewEntry<'a> {
     handle: u64,
     stride: u64,
     ksz: usize,
+    key_bytes: &'a [u8],
+    val_ref: u64,
+}
+
+/// Build the writes that place a *new* entry (state, key, value) at bucket
+/// `target`, bumping `len` (and `used` when the slot was previously `EMPTY`).
+fn new_bucket_writes(
+    e: &NewEntry,
     m: &Meta,
     target: u64,
     slot_was_empty: bool,
-    key_bytes: &[u8],
-    val_ref: u64,
 ) -> Vec<(u64, Vec<u8>)> {
-    let mut img = Vec::with_capacity(16 + ksz);
+    let mut img = Vec::with_capacity(16 + e.ksz);
     img.extend_from_slice(&OCCUPIED.to_le_bytes());
-    img.extend_from_slice(key_bytes);
-    img.extend_from_slice(&val_ref.to_le_bytes());
+    img.extend_from_slice(e.key_bytes);
+    img.extend_from_slice(&e.val_ref.to_le_bytes());
 
     let mut w = vec![
-        (m.table + target * stride, img),
-        (handle + LEN_OFF, (m.len + 1).to_le_bytes().to_vec()),
+        (m.table + target * e.stride, img),
+        (e.handle + LEN_OFF, (m.len + 1).to_le_bytes().to_vec()),
     ];
     if slot_was_empty {
-        w.push((handle + USED_OFF, (m.used + 1).to_le_bytes().to_vec()));
+        w.push((e.handle + USED_OFF, (m.used + 1).to_le_bytes().to_vec()));
     }
     w
 }
@@ -314,6 +320,13 @@ impl<K: Pod, V: BStackBlock> BStackHashMap<K, V> {
         let key_bytes = bytemuck::bytes_of(&key).to_vec();
         let val_ref = value.into_inner().range().start();
         let hash = fnv1a(&key_bytes);
+        let entry = NewEntry {
+            handle,
+            stride,
+            ksz,
+            key_bytes: &key_bytes,
+            val_ref,
+        };
 
         loop {
             // Proactively keep the load factor under 3/4 (also clears tombstones).
@@ -340,16 +353,7 @@ impl<K: Pod, V: BStackBlock> BStackHashMap<K, V> {
                         let target = first_tomb.get().unwrap_or(idx);
                         let slot_was_empty = first_tomb.get().is_none();
                         is_new.set(true);
-                        ProbeStep::Stop(new_bucket_writes(
-                            handle,
-                            stride,
-                            ksz,
-                            m,
-                            target,
-                            slot_was_empty,
-                            &key_bytes,
-                            val_ref,
-                        ))
+                        ProbeStep::Stop(new_bucket_writes(&entry, m, target, slot_was_empty))
                     } else if state == OCCUPIED && buf[8..8 + ksz] == key_bytes[..] {
                         // Overwrite: replace the value ref, hand back the old one.
                         old_value.set(get_u64(&buf[8 + ksz..8 + ksz + 8]));
@@ -366,7 +370,7 @@ impl<K: Pod, V: BStackBlock> BStackHashMap<K, V> {
                 |m| {
                     if let Some(t) = first_tomb.get() {
                         is_new.set(true);
-                        new_bucket_writes(handle, stride, ksz, m, t, false, &key_bytes, val_ref)
+                        new_bucket_writes(&entry, m, t, false)
                     } else {
                         need_grow.set(true);
                         Vec::new()
