@@ -81,7 +81,10 @@ pub use layout::{BlockHeader, EightCC};
 pub use owned::BStackOwned;
 pub use reference::BStackRef;
 pub use shared::{BStackRc, BStackWeak};
-pub use stdlib::{BStackBox, BStackCow, BStackLinkedList, BoxOnDisk, ListOnDisk, NodeOnDisk};
+pub use stdlib::{
+    BStackBox, BStackCow, BStackDeque, BStackLinkedList, BoxOnDisk, DequeOnDisk, ListOnDisk,
+    NodeOnDisk,
+};
 pub use teardown::{AutoDrop, BStackDrop, dealloc_range};
 pub use vec::{BStackBlockVec, BStackRefVec, BStackStrongVec, BStackVec, BStackWeakVec, VecDesc};
 pub use wal::{

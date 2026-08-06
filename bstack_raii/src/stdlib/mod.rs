@@ -15,12 +15,16 @@
 //! |---------------------|----------------------|----------------------------------------|
 //! | [`BStackCow<T>`]    | [`std::borrow::Cow`] | either a borrowed [`crate::BStackRef`] or an owned [`crate::BStackOwned`] block, deep-copying on first write. |
 //! | [`BStackBox<T>`]    | [`std::boxed::Box`]  | a single owned [`Pod`](bytemuck::Pod) value in its own block — the macro-free way to own a bare scalar/POD struct. |
-//! | [`BStackLinkedList<T>`] | [`std::collections::LinkedList`] | an owned doubly-linked list of block values (non-intrusive, single-ref nodes). Prefer [`crate::BStackBlockVec`] unless you need O(1) end/splice ops. |
+//! | [`BStackLinkedList<T>`] | [`std::collections::LinkedList`] | an owned doubly-linked list of block values (non-intrusive, single-ref nodes). Prefer [`BStackDeque`] / [`crate::BStackBlockVec`] unless you need O(1) end/splice ops. |
+//! | [`BStackDeque<T>`]  | [`std::collections::VecDeque`] | an owned double-ended queue: a contiguous ring of value refs (no per-element pointer chasing), O(1) amortized push/pop at both ends. |
 
 mod boxed;
 mod cow;
+mod deque;
 mod list;
+mod util;
 
 pub use boxed::{BStackBox, BoxOnDisk};
 pub use cow::BStackCow;
+pub use deque::{BStackDeque, DequeOnDisk};
 pub use list::{BStackLinkedList, ListOnDisk, NodeOnDisk};

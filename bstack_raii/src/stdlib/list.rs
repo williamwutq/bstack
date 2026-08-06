@@ -33,9 +33,10 @@ use core::marker::PhantomData;
 use core::mem::size_of;
 use std::io;
 
-use bstack::{BStack, BStackGenOp, BStackOwnedSliceAllocator, BStackRange};
+use bstack::{BStack, BStackOwnedSliceAllocator, BStackRange};
 use bytemuck::{Pod, Zeroable};
 
+use super::util::{alloc_image, atomic_update, get_u64};
 use crate::block::{BStackBlock, BStackCast};
 use crate::clone::{ClonePlan, TryCloneIn};
 use crate::layout::{BlockHeader, EightCC, HEADER_SIZE};
@@ -86,117 +87,6 @@ const NVAL_OFF: u64 = HEADER_SIZE + 16; // 32
 
 const LIST_SIZE: u64 = size_of::<ListOnDisk>() as u64;
 const NODE_SIZE: u64 = size_of::<NodeOnDisk>() as u64;
-
-/// Read a little-endian `u64` at absolute offset `off`.
-fn get_u64(stack: &BStack, off: u64) -> io::Result<u64> {
-    let mut b = [0u8; 8];
-    stack.get_into(off, &mut b)?;
-    Ok(u64::from_le_bytes(b))
-}
-
-/// Commit an atomic, **external-lock-free** read-modify-write to the list's
-/// on-disk pointers via [`BStack::inplace_gen`].
-///
-/// `reads1` are absolute offsets of `u64` slots read in a first round; the values
-/// are handed to `reads2` to compute a second round of offsets that may *depend*
-/// on the first (e.g. the `prev`/`value` slots of the node found via the tail
-/// pointer). `plan` then turns both read rounds into the writes to commit.
-///
-/// The point of routing every mutator through this: all reads happen **inside**
-/// the generator, under bstack's single write lock, so the values reflect the
-/// committed state at the one commit point and no other thread can interleave
-/// between the reads and the dependent writes — no external lock, no torn
-/// structure. Every write lands as one crash-atomic batch (all-or-nothing).
-///
-/// Only in-place reads/writes ride the generator; allocations and frees, which
-/// change the stack's size, are done by the caller *around* it (a freshly
-/// allocated node is an orphan until the commit links it; a freed node is already
-/// unlinked), so a crash can at worst leak, never tear the list.
-fn atomic_update<A, R2, W>(allocator: &A, reads1: &[u64], reads2: R2, plan: W) -> io::Result<()>
-where
-    A: BStackOwnedSliceAllocator,
-    R2: FnOnce(&[u64]) -> Vec<u64>,
-    W: FnOnce(&[u64], &[u64]) -> Vec<(u64, Vec<u8>)>,
-{
-    // Buffers that must outlive the whole `inplace_gen` call (bstack's documented
-    // generator pattern): read-back values and the computed writes.
-    let mut buf1: Vec<[u8; 8]> = vec![[0u8; 8]; reads1.len()];
-    let mut vals1: Vec<u64> = Vec::new();
-    let mut offs2: Vec<u64> = Vec::new();
-    let mut buf2: Vec<[u8; 8]> = Vec::new();
-    let mut writes: Vec<(u64, Vec<u8>)> = Vec::new();
-
-    let mut reads2 = Some(reads2);
-    let mut plan = Some(plan);
-
-    let mut r1 = 0usize;
-    let mut did_a = false;
-    let mut r2 = 0usize;
-    let mut did_b = false;
-    let mut w = 0usize;
-
-    allocator.stack().inplace_gen(|_feedback| {
-        // Round 1 — read the fixed offsets.
-        if r1 < reads1.len() {
-            let i = r1;
-            r1 += 1;
-            // SAFETY: `buf1` outlives this call; one read op uses slot `i` at a time.
-            let b: &mut [u8] = unsafe { core::mem::transmute::<&mut [u8], _>(&mut buf1[i][..]) };
-            return Some(BStackGenOp::Read {
-                offset: reads1[i],
-                buf: b,
-            });
-        }
-        // Transition A — compute the (possibly dependent) round-2 offsets.
-        if !did_a {
-            did_a = true;
-            vals1 = buf1.iter().map(|x| u64::from_le_bytes(*x)).collect();
-            offs2 = (reads2.take().unwrap())(&vals1);
-            buf2 = vec![[0u8; 8]; offs2.len()];
-        }
-        // Round 2 — read the dependent offsets.
-        if r2 < offs2.len() {
-            let i = r2;
-            r2 += 1;
-            // SAFETY: `buf2` outlives this call and is not resized after Transition A.
-            let b: &mut [u8] = unsafe { core::mem::transmute::<&mut [u8], _>(&mut buf2[i][..]) };
-            return Some(BStackGenOp::Read {
-                offset: offs2[i],
-                buf: b,
-            });
-        }
-        // Transition B — compute the writes from both read rounds.
-        if !did_b {
-            did_b = true;
-            let vals2: Vec<u64> = buf2.iter().map(|x| u64::from_le_bytes(*x)).collect();
-            writes = (plan.take().unwrap())(&vals1, &vals2);
-        }
-        // Commit phase — emit every write; they land together atomically.
-        if w < writes.len() {
-            let i = w;
-            w += 1;
-            let (off, ref bytes) = writes[i];
-            // SAFETY: `writes` outlives this call and is not mutated after Transition B.
-            let d: &[u8] = unsafe { core::mem::transmute::<&[u8], _>(bytes.as_slice()) };
-            return Some(BStackGenOp::Write { offset: off, data: d });
-        }
-        None
-    })
-}
-
-/// Allocate a block and write `bytes` as its whole image (one write; released
-/// without leaking on write failure).
-fn alloc_image<A: BStackOwnedSliceAllocator>(
-    allocator: &A,
-    bytes: &[u8],
-) -> io::Result<BStackRange> {
-    let mut slice = allocator.alloc(bytes.len() as u64)?;
-    if let Err(e) = slice.write_range(0, bytes) {
-        let _ = allocator.dealloc(slice);
-        return Err(e);
-    }
-    Ok(slice.as_range())
-}
 
 /// An owned, doubly-linked list of `T` blocks.
 ///

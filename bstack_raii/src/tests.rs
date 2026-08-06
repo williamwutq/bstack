@@ -15,9 +15,9 @@ use bstack::{
 use crate::layout::{self, BlockHeader};
 use crate::{
     AutoDrop, BStackBlock, BStackBlockVec, BStackBox, BStackCast, BStackCastAs, BStackCastInto,
-    BStackCow, BStackDrop, BStackLinkedList, BStackOwned, BStackRc, BStackRef, BStackShared,
-    BStackWeakable, EightCC, TryClone, TryCloneIn, alloc_block, alloc_control, bstack_block,
-    bstack_cast, bstack_enum, bstack_move, dealloc_range,
+    BStackCow, BStackDeque, BStackDrop, BStackLinkedList, BStackOwned, BStackRc, BStackRef,
+    BStackShared, BStackWeakable, EightCC, TryClone, TryCloneIn, alloc_block, alloc_control,
+    bstack_block, bstack_cast, bstack_enum, bstack_move, dealloc_range,
 };
 
 // --------------------------------------------------------------------------
@@ -4603,4 +4603,193 @@ fn stdlib_list_concurrent_push_pop() {
     assert_eq!(list.len(alloc.stack()).unwrap(), 0);
     assert!(list.front(alloc.stack()).unwrap().is_none());
     list.bstack_drop(&alloc).unwrap();
+}
+
+// --------------------------------------------------------------------------
+// stdlib: BStackDeque<T> — owned double-ended queue over a contiguous ring
+// --------------------------------------------------------------------------
+
+fn deque_values(dq: &BStackDeque<MacroLeaf>, stack: &BStack) -> Vec<u32> {
+    dq.to_vec(stack)
+        .unwrap()
+        .iter()
+        .map(|h| h.val(stack).unwrap())
+        .collect()
+}
+
+#[test]
+fn stdlib_deque_push_back_grows() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let dq = BStackDeque::<MacroLeaf>::new(&alloc).unwrap();
+    assert!(dq.is_empty(stack).unwrap());
+
+    // Push past the initial capacity to force at least one growth.
+    for v in 0..10u32 {
+        dq.push_back(&alloc, MacroLeaf::new(&alloc, v).unwrap()).unwrap();
+    }
+    assert_eq!(dq.len(stack).unwrap(), 10);
+    assert!(dq.capacity(stack).unwrap() >= 10);
+    assert_eq!(deque_values(&dq, stack), (0..10).collect::<Vec<_>>());
+    assert_eq!(dq.front(stack).unwrap().unwrap().val(stack).unwrap(), 0);
+    assert_eq!(dq.back(stack).unwrap().unwrap().val(stack).unwrap(), 9);
+
+    // FIFO drain from the front.
+    for v in 0..10u32 {
+        let x = dq.pop_front(&alloc).unwrap().unwrap();
+        assert_eq!(x.handle().val(stack).unwrap(), v);
+        x.bstack_drop(&alloc).unwrap();
+    }
+    assert!(dq.is_empty(stack).unwrap());
+    assert!(dq.pop_front(&alloc).unwrap().is_none());
+    dq.bstack_drop(&alloc).unwrap();
+}
+
+#[test]
+fn stdlib_deque_wraparound_no_growth() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    // Fixed capacity 4; exercise circular indexing without any growth.
+    let dq = BStackDeque::<MacroLeaf>::with_capacity(&alloc, 4).unwrap();
+    for v in [1u32, 2, 3, 4] {
+        dq.push_back(&alloc, MacroLeaf::new(&alloc, v).unwrap()).unwrap();
+    }
+    // Drop the front two: head advances into the ring.
+    for _ in 0..2 {
+        dq.pop_front(&alloc).unwrap().unwrap().bstack_drop(&alloc).unwrap();
+    }
+    // Two more push_backs wrap around the physical slots 0,1.
+    dq.push_back(&alloc, MacroLeaf::new(&alloc, 5).unwrap()).unwrap();
+    dq.push_back(&alloc, MacroLeaf::new(&alloc, 6).unwrap()).unwrap();
+    assert_eq!(dq.capacity(stack).unwrap(), 4); // never grew
+    assert_eq!(deque_values(&dq, stack), vec![3, 4, 5, 6]);
+
+    dq.bstack_drop(&alloc).unwrap();
+}
+
+#[test]
+fn stdlib_deque_both_ends() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let dq = BStackDeque::<MacroLeaf>::new(&alloc).unwrap();
+    dq.push_back(&alloc, MacroLeaf::new(&alloc, 2).unwrap()).unwrap();
+    dq.push_front(&alloc, MacroLeaf::new(&alloc, 1).unwrap()).unwrap();
+    dq.push_back(&alloc, MacroLeaf::new(&alloc, 3).unwrap()).unwrap();
+    assert_eq!(deque_values(&dq, stack), vec![1, 2, 3]);
+
+    let back = dq.pop_back(&alloc).unwrap().unwrap();
+    assert_eq!(back.handle().val(stack).unwrap(), 3);
+    back.bstack_drop(&alloc).unwrap();
+
+    let front = dq.pop_front(&alloc).unwrap().unwrap();
+    assert_eq!(front.handle().val(stack).unwrap(), 1);
+    front.bstack_drop(&alloc).unwrap();
+
+    assert_eq!(deque_values(&dq, stack), vec![2]);
+    dq.bstack_drop(&alloc).unwrap();
+}
+
+#[test]
+fn stdlib_deque_drop_is_recursive() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+
+    let leaf = MacroLeaf::new(&alloc, 10).unwrap();
+    let leaf_start = leaf.handle().range().start();
+    let parent = MacroParent::new(&alloc, leaf, 1).unwrap();
+
+    let dq = BStackDeque::<MacroParent>::new(&alloc).unwrap();
+    dq.push_back(&alloc, parent).unwrap();
+    dq.bstack_drop(&alloc).unwrap();
+
+    // The leaf grandchild's slot is reclaimed — full recursion through the ring.
+    let reused = MacroLeaf::new(&alloc, 0).unwrap();
+    assert_eq!(reused.handle().range().start(), leaf_start);
+    reused.bstack_drop(&alloc).unwrap();
+}
+
+#[test]
+fn stdlib_deque_deep_clone_is_independent() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let dq = BStackDeque::<MacroLeaf>::new(&alloc).unwrap();
+    for v in [1u32, 2, 3, 4, 5] {
+        dq.push_back(&alloc, MacroLeaf::new(&alloc, v).unwrap()).unwrap();
+    }
+
+    let clone = dq.try_clone_in(&alloc).unwrap();
+    assert_eq!(deque_values(&clone, stack), vec![1, 2, 3, 4, 5]);
+    // Clone is compacted to exactly `len` slots.
+    assert_eq!(clone.capacity(stack).unwrap(), 5);
+    // Fresh element blocks, not aliases.
+    assert_ne!(
+        clone.front(stack).unwrap().unwrap().range().start(),
+        dq.front(stack).unwrap().unwrap().range().start(),
+    );
+
+    // Mutating the clone leaves the original intact.
+    clone.pop_back(&alloc).unwrap().unwrap().bstack_drop(&alloc).unwrap();
+    assert_eq!(clone.len(stack).unwrap(), 4);
+    assert_eq!(deque_values(&dq, stack), vec![1, 2, 3, 4, 5]);
+
+    clone.bstack_drop(&alloc).unwrap();
+    dq.bstack_drop(&alloc).unwrap();
+}
+
+/// Many threads hammering one shared deque, including concurrent growth. Phase 1
+/// is concurrent `push_back`; phase 2 is concurrent `pop_front`. A non-atomic
+/// slot/metadata RMW (or a racy growth) would drop or duplicate elements.
+#[test]
+fn stdlib_deque_concurrent_push_pop() {
+    const THREADS: u32 = 8;
+    const ITERS: u32 = 8;
+
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let dq = BStackDeque::<MacroLeaf>::new(&alloc).unwrap();
+    let total = (THREADS * ITERS) as u64;
+
+    std::thread::scope(|s| {
+        for t in 0..THREADS {
+            let dq = &dq;
+            let alloc = &alloc;
+            s.spawn(move || {
+                for i in 0..ITERS {
+                    let leaf = MacroLeaf::new(alloc, t * ITERS + i).unwrap();
+                    dq.push_back(alloc, leaf).unwrap();
+                }
+            });
+        }
+    });
+
+    assert_eq!(dq.len(alloc.stack()).unwrap(), total);
+    let mut seen = deque_values(&dq, alloc.stack());
+    seen.sort_unstable();
+    assert_eq!(seen.len() as u64, total);
+    seen.dedup();
+    assert_eq!(seen.len() as u64, total, "no lost/duplicated elements");
+
+    std::thread::scope(|s| {
+        for _ in 0..THREADS {
+            let dq = &dq;
+            let alloc = &alloc;
+            s.spawn(move || {
+                for _ in 0..ITERS {
+                    let v = dq.pop_front(alloc).unwrap().expect("deque non-empty");
+                    v.bstack_drop(alloc).unwrap();
+                }
+            });
+        }
+    });
+
+    assert_eq!(dq.len(alloc.stack()).unwrap(), 0);
+    dq.bstack_drop(&alloc).unwrap();
 }
