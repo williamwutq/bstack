@@ -166,6 +166,63 @@ impl BStackString {
         self.set(allocator, &cur)
     }
 
+    /// Append a single character.
+    pub fn push<A: BStackOwnedSliceAllocator>(&self, allocator: &A, ch: char) -> io::Result<()> {
+        let mut buf = [0u8; 4];
+        self.push_str(allocator, ch.encode_utf8(&mut buf))
+    }
+
+    /// Truncate to `new_len` **bytes**, which must be a UTF-8 char boundary and
+    /// not exceed the current length; longer values leave the string unchanged.
+    pub fn truncate<A: BStackOwnedSliceAllocator>(
+        &self,
+        allocator: &A,
+        new_len: usize,
+    ) -> io::Result<()> {
+        let mut cur = self.to_string(allocator.stack())?;
+        if new_len >= cur.len() {
+            return Ok(());
+        }
+        if !cur.is_char_boundary(new_len) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "truncate: byte index is not a UTF-8 char boundary",
+            ));
+        }
+        cur.truncate(new_len);
+        self.set(allocator, &cur)
+    }
+
+    /// Empty the string (frees its bytes block).
+    pub fn clear<A: BStackOwnedSliceAllocator>(&self, allocator: &A) -> io::Result<()> {
+        self.set(allocator, "")
+    }
+
+    /// The number of Unicode scalar values (`char`s), not bytes.
+    pub fn char_count(&self, stack: &BStack) -> io::Result<usize> {
+        Ok(self.to_string(stack)?.chars().count())
+    }
+
+    /// Whether the contents equal `s`, byte-for-byte (no UTF-8 validation).
+    pub fn eq_str(&self, stack: &BStack, s: &str) -> io::Result<bool> {
+        Ok(self.read_bytes(stack)? == s.as_bytes())
+    }
+
+    /// Whether the contents begin with `prefix`.
+    pub fn starts_with(&self, stack: &BStack, prefix: &str) -> io::Result<bool> {
+        Ok(self.read_bytes(stack)?.starts_with(prefix.as_bytes()))
+    }
+
+    /// Whether the contents end with `suffix`.
+    pub fn ends_with(&self, stack: &BStack, suffix: &str) -> io::Result<bool> {
+        Ok(self.read_bytes(stack)?.ends_with(suffix.as_bytes()))
+    }
+
+    /// Whether the contents contain `needle`.
+    pub fn contains(&self, stack: &BStack, needle: &str) -> io::Result<bool> {
+        Ok(self.to_string(stack)?.contains(needle))
+    }
+
     /// Attach an allocator to make an auto-freeing [`AutoDrop`] guard.
     pub fn auto<A: BStackOwnedSliceAllocator>(self, allocator: &A) -> AutoDrop<'_, Self, A> {
         // SAFETY: sole ownership was asserted when the string was created.

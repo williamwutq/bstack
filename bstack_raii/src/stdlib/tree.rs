@@ -531,7 +531,8 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBTreeMap<K, V> {
                 let (pk, pv) = Self::max_entry(stack, nb.children[i])?;
                 nb.keys[i] = pk.clone();
                 nb.vals[i] = pv;
-                let (new_y, _) = Self::delete_off(build, stack, nb.children[i], &Self::read_key(&pk))?;
+                let (new_y, _) =
+                    Self::delete_off(build, stack, nb.children[i], &Self::read_key(&pk))?;
                 nb.children[i] = new_y;
             } else if zc >= T {
                 // Replace with successor, then delete it from the right child.
@@ -696,11 +697,7 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBTreeMap<K, V> {
             let val = val.expect("key was present");
             // Collapse an empty root: a leaf → empty tree; an internal → its child.
             let new_root = if root_nb.keys.is_empty() {
-                if root_nb.leaf {
-                    0
-                } else {
-                    root_nb.children[0]
-                }
+                if root_nb.leaf { 0 } else { root_nb.children[0] }
             } else {
                 build.emit(&root_nb)?
             };
@@ -735,8 +732,9 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBTreeMap<K, V> {
             }
             Err(e) => {
                 for (off, _) in &build.writes {
-                    let _ =
-                        unsafe { dealloc_range(allocator, BStackRange::new(*off, build.node_size)) };
+                    let _ = unsafe {
+                        dealloc_range(allocator, BStackRange::new(*off, build.node_size))
+                    };
                 }
                 Err(e)
             }

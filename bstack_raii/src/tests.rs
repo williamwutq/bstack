@@ -5502,7 +5502,11 @@ fn stdlib_bloom_no_false_negatives() {
     let absent = (1_000..1_050u32)
         .filter(|k| !bloom.contains(stack, k).unwrap())
         .count();
-    assert!(absent >= 45, "too many false positives: {}/50 absent", absent);
+    assert!(
+        absent >= 45,
+        "too many false positives: {}/50 absent",
+        absent
+    );
 
     // A positive FP estimate in (0, 1).
     let fp = bloom.estimated_fp_rate(stack).unwrap();
@@ -5584,7 +5588,8 @@ fn stdlib_bloom_guards_a_map() {
     let bloom = BStackCountingBloomFilter::<u32>::with_capacity(&alloc, 1000, 0.001).unwrap();
     let map = BStackHashMap::<u32, MacroLeaf>::new(&alloc).unwrap();
     for k in 0..40u32 {
-        map.insert(&alloc, k, MacroLeaf::new(&alloc, k * 3).unwrap()).unwrap();
+        map.insert(&alloc, k, MacroLeaf::new(&alloc, k * 3).unwrap())
+            .unwrap();
         bloom.insert(&alloc, &k).unwrap();
     }
 
@@ -5753,7 +5758,8 @@ fn stdlib_tree_remove_rebalances() {
 
     let tree = BStackBTreeMap::<u32, MacroLeaf>::new(&alloc).unwrap();
     for k in 0..200u32 {
-        tree.insert(&alloc, k, MacroLeaf::new(&alloc, k * 10).unwrap()).unwrap();
+        tree.insert(&alloc, k, MacroLeaf::new(&alloc, k * 10).unwrap())
+            .unwrap();
     }
     assert_eq!(tree.len(stack).unwrap(), 200);
 
@@ -5777,20 +5783,104 @@ fn stdlib_tree_remove_rebalances() {
             assert_eq!(g.unwrap().val(stack).unwrap(), k * 10);
         }
     }
-    let keys: Vec<u32> = tree.to_vec(stack).unwrap().iter().map(|(k, _)| *k).collect();
+    let keys: Vec<u32> = tree
+        .to_vec(stack)
+        .unwrap()
+        .iter()
+        .map(|(k, _)| *k)
+        .collect();
     assert_eq!(keys, (0..200u32).filter(|k| k % 2 == 1).collect::<Vec<_>>());
 
     // Drain the rest → empty (root collapses to 0).
     for k in (1..200u32).step_by(2) {
-        tree.remove(&alloc, &k).unwrap().unwrap().bstack_drop(&alloc).unwrap();
+        tree.remove(&alloc, &k)
+            .unwrap()
+            .unwrap()
+            .bstack_drop(&alloc)
+            .unwrap();
     }
     assert_eq!(tree.len(stack).unwrap(), 0);
     assert!(tree.is_empty(stack).unwrap());
     assert!(tree.first(stack).unwrap().is_none());
 
     // Reinsert after collapse works.
-    tree.insert(&alloc, 42, MacroLeaf::new(&alloc, 420).unwrap()).unwrap();
-    assert_eq!(tree.get(stack, &42).unwrap().unwrap().val(stack).unwrap(), 420);
+    tree.insert(&alloc, 42, MacroLeaf::new(&alloc, 420).unwrap())
+        .unwrap();
+    assert_eq!(
+        tree.get(stack, &42).unwrap().unwrap().val(stack).unwrap(),
+        420
+    );
 
     tree.bstack_drop(&alloc).unwrap();
+}
+
+#[test]
+fn stdlib_btreeset_remove_rebalances() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let set = BStackBTreeSet::<u32>::new(&alloc).unwrap();
+    for k in 0..60u32 {
+        set.insert(&alloc, k).unwrap();
+    }
+    assert_eq!(set.len(stack).unwrap(), 60);
+    assert!(!set.remove(&alloc, &999).unwrap()); // absent
+
+    // Remove every even key (triggers borrow/merge across levels).
+    for k in (0..60u32).step_by(2) {
+        assert!(set.remove(&alloc, &k).unwrap());
+        assert!(!set.remove(&alloc, &k).unwrap()); // already gone
+    }
+    assert_eq!(set.len(stack).unwrap(), 30);
+    for k in 0..60u32 {
+        assert_eq!(set.contains(stack, &k).unwrap(), k % 2 == 1);
+    }
+    assert_eq!(
+        set.to_vec(stack).unwrap(),
+        (0..60u32).filter(|k| k % 2 == 1).collect::<Vec<_>>()
+    );
+
+    // Drain the rest → empty, then reinsert.
+    for k in (1..60u32).step_by(2) {
+        assert!(set.remove(&alloc, &k).unwrap());
+    }
+    assert_eq!(set.len(stack).unwrap(), 0);
+    assert!(set.first(stack).unwrap().is_none());
+    assert!(set.insert(&alloc, 7).unwrap());
+    assert!(set.contains(stack, &7).unwrap());
+
+    set.bstack_drop(&alloc).unwrap();
+}
+
+#[test]
+fn stdlib_string_extra_methods() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let s = BStackString::new(&alloc, "hello").unwrap();
+    s.handle().push(&alloc, '!').unwrap();
+    assert_eq!(s.handle().to_string(stack).unwrap(), "hello!");
+    assert!(s.handle().starts_with(stack, "hell").unwrap());
+    assert!(s.handle().ends_with(stack, "o!").unwrap());
+    assert!(s.handle().contains(stack, "ell").unwrap());
+    assert!(s.handle().eq_str(stack, "hello!").unwrap());
+    assert!(!s.handle().eq_str(stack, "nope").unwrap());
+
+    // truncate to a boundary; non-boundary is an error.
+    s.handle().truncate(&alloc, 5).unwrap();
+    assert_eq!(s.handle().to_string(stack).unwrap(), "hello");
+    let u = BStackString::new(&alloc, "héllo").unwrap(); // 'é' is 2 bytes at [1,2]
+    assert_eq!(u.handle().char_count(stack).unwrap(), 5);
+    assert_eq!(u.handle().len(stack).unwrap(), 6);
+    assert!(u.handle().truncate(&alloc, 2).is_err()); // splits 'é'
+    u.bstack_drop(&alloc).unwrap();
+
+    // clear empties it.
+    s.handle().clear(&alloc).unwrap();
+    assert!(s.handle().is_empty(stack).unwrap());
+    assert_eq!(s.handle().char_count(stack).unwrap(), 0);
+
+    s.bstack_drop(&alloc).unwrap();
 }

@@ -182,11 +182,7 @@ impl<K: Pod> BStackCountingBloomFilter<K> {
     }
 
     /// Insert `key`, bumping each of its `k` counters (saturating at 255).
-    pub fn insert<A: BStackOwnedSliceAllocator>(
-        &self,
-        allocator: &A,
-        key: &K,
-    ) -> io::Result<()> {
+    pub fn insert<A: BStackOwnedSliceAllocator>(&self, allocator: &A, key: &K) -> io::Result<()> {
         self.adjust(allocator, key, true)
     }
 
@@ -194,11 +190,7 @@ impl<K: Pod> BStackCountingBloomFilter<K> {
     ///
     /// Only call this for a key that was actually inserted (see the module docs) —
     /// removing an absent key can introduce false negatives.
-    pub fn remove<A: BStackOwnedSliceAllocator>(
-        &self,
-        allocator: &A,
-        key: &K,
-    ) -> io::Result<()> {
+    pub fn remove<A: BStackOwnedSliceAllocator>(&self, allocator: &A, key: &K) -> io::Result<()> {
         self.adjust(allocator, key, false)
     }
 

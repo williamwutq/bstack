@@ -236,7 +236,14 @@ impl<K: Pod + Ord> BStackBTreeSet<K> {
             keys: right_keys,
             children: right_children,
         };
-        (nb, Split { key: med_key, right: 0 }, right)
+        (
+            nb,
+            Split {
+                key: med_key,
+                right: 0,
+            },
+            right,
+        )
     }
 
     /// Path-copy the subtree at `off`, inserting a **new** `key` (assumed absent).
@@ -273,11 +280,7 @@ impl<K: Pod + Ord> BStackBTreeSet<K> {
     }
 
     /// Insert `key`; returns `true` if newly added, `false` if already present.
-    pub fn insert<A: BStackOwnedSliceAllocator>(
-        &self,
-        allocator: &A,
-        key: K,
-    ) -> io::Result<bool> {
+    pub fn insert<A: BStackOwnedSliceAllocator>(&self, allocator: &A, key: K) -> io::Result<bool> {
         // Exact check first, so the filter is only touched for genuinely new keys.
         let key_bytes = bytemuck::bytes_of(&key).to_vec();
         if self.tree_contains(allocator.stack(), &key, &key_bytes)? {
@@ -349,8 +352,9 @@ impl<K: Pod + Ord> BStackBTreeSet<K> {
             }
             Err(e) => {
                 for (off, _) in &build.writes {
-                    let _ =
-                        unsafe { dealloc_range(allocator, BStackRange::new(*off, build.node_size)) };
+                    let _ = unsafe {
+                        dealloc_range(allocator, BStackRange::new(*off, build.node_size))
+                    };
                 }
                 Err(e)
             }
@@ -453,7 +457,8 @@ impl<K: Pod + Ord> BStackBTreeSet<K> {
             if yc >= T {
                 let pk = Self::edge_key(stack, nb.children[i], true)?;
                 nb.keys[i] = pk.clone();
-                let (new_y, _) = Self::delete_off(build, stack, nb.children[i], &Self::read_key(&pk))?;
+                let (new_y, _) =
+                    Self::delete_off(build, stack, nb.children[i], &Self::read_key(&pk))?;
                 nb.children[i] = new_y;
             } else if zc >= T {
                 let sk = Self::edge_key(stack, nb.children[i + 1], false)?;
@@ -566,11 +571,7 @@ impl<K: Pod + Ord> BStackBTreeSet<K> {
 
     /// Remove `key`; returns `true` if it was present. Deletes from the tree
     /// first, then decrements the Bloom filter (see the module docs).
-    pub fn remove<A: BStackOwnedSliceAllocator>(
-        &self,
-        allocator: &A,
-        key: &K,
-    ) -> io::Result<bool> {
+    pub fn remove<A: BStackOwnedSliceAllocator>(&self, allocator: &A, key: &K) -> io::Result<bool> {
         let handle = self.range.start();
         let stack = allocator.stack();
         let key_bytes = bytemuck::bytes_of(key).to_vec();
@@ -594,11 +595,7 @@ impl<K: Pod + Ord> BStackBTreeSet<K> {
             build.freed.push(root);
             let (root_nb, _) = Self::delete_bnode(&mut build, stack, nb, key)?;
             let new_root = if root_nb.keys.is_empty() {
-                if root_nb.leaf {
-                    0
-                } else {
-                    root_nb.children[0]
-                }
+                if root_nb.leaf { 0 } else { root_nb.children[0] }
             } else {
                 build.emit(&root_nb)?
             };
@@ -634,8 +631,9 @@ impl<K: Pod + Ord> BStackBTreeSet<K> {
             }
             Err(e) => {
                 for (off, _) in &build.writes {
-                    let _ =
-                        unsafe { dealloc_range(allocator, BStackRange::new(*off, build.node_size)) };
+                    let _ = unsafe {
+                        dealloc_range(allocator, BStackRange::new(*off, build.node_size))
+                    };
                 }
                 Err(e)
             }

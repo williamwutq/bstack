@@ -180,11 +180,7 @@ impl<K: Pod> BStackHashSet<K> {
 
     /// Insert `key`; returns `true` if it was newly added, `false` if already
     /// present.
-    pub fn insert<A: BStackOwnedSliceAllocator>(
-        &self,
-        allocator: &A,
-        key: K,
-    ) -> io::Result<bool> {
+    pub fn insert<A: BStackOwnedSliceAllocator>(&self, allocator: &A, key: K) -> io::Result<bool> {
         let key_bytes = bytemuck::bytes_of(&key).to_vec();
         let hash = fnv1a(&key_bytes);
         let bloom = self.bloom(allocator.stack())?;
@@ -199,11 +195,7 @@ impl<K: Pod> BStackHashSet<K> {
     }
 
     /// Remove `key`; returns `true` if it was present.
-    pub fn remove<A: BStackOwnedSliceAllocator>(
-        &self,
-        allocator: &A,
-        key: &K,
-    ) -> io::Result<bool> {
+    pub fn remove<A: BStackOwnedSliceAllocator>(&self, allocator: &A, key: &K) -> io::Result<bool> {
         let key_bytes = bytemuck::bytes_of(key).to_vec();
         let hash = fnv1a(&key_bytes);
         // Remove from the table first; only then decrement the filter (and only
@@ -459,7 +451,10 @@ impl<K: Pod> BStackHashSet<K> {
                 let (off, ref bytes) = writes[i];
                 // SAFETY: `writes` outlives the call and is not mutated after build.
                 let d: &[u8] = unsafe { core::mem::transmute::<&[u8], _>(bytes.as_slice()) };
-                return Some(BStackGenOp::Write { offset: off, data: d });
+                return Some(BStackGenOp::Write {
+                    offset: off,
+                    data: d,
+                });
             }
             None
         })?;
@@ -476,7 +471,8 @@ impl<K: Pod> BStackHashSet<K> {
             }
         } else {
             // SAFETY: `newtable` was never linked into the descriptor.
-            let _ = unsafe { dealloc_range(allocator, BStackRange::new(newtable, newcap * stride)) };
+            let _ =
+                unsafe { dealloc_range(allocator, BStackRange::new(newtable, newcap * stride)) };
         }
         Ok(())
     }
