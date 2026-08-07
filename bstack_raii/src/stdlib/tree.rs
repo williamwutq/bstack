@@ -32,8 +32,9 @@
 //! it keeps each write atomic and crash-safe. (A path is short — a handful of
 //! nodes — so the copy cost is small.)
 //!
-//! Not yet implemented: `remove` (B-tree deletion with rebalancing is the natural
-//! next step; the path-copy + `set_batched` commit machinery here carries over).
+//! `remove` uses the same path-copying commit, rebalancing on the way down
+//! (borrow from a sibling, or merge) to keep every node at `≥ T-1` keys, and
+//! collapses the root when it empties.
 
 use core::cmp::Ordering;
 use core::marker::PhantomData;

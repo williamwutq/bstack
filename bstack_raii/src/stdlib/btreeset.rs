@@ -14,10 +14,9 @@
 //! the tree, so [`contains`](BStackBTreeSet::contains) fast-rejects definitely-
 //! absent keys without a tree descent. A key is added to the filter only when it
 //! is genuinely new (an exact-membership check precedes the insert), so the
-//! filter never over-counts and there are never false negatives.
-//!
-//! Not yet implemented: `remove` (B-tree deletion with rebalancing — the same gap
-//! as [`crate::BStackBTreeMap`]).
+//! filter never over-counts and there are never false negatives. `remove` deletes
+//! from the tree (rebalancing on the way down) and then decrements the filter,
+//! the same ordering [`crate::BStackHashSet`] uses.
 
 use core::cmp::Ordering;
 use core::marker::PhantomData;
