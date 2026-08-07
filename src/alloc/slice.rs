@@ -719,7 +719,6 @@ impl<'a> BStackSlice<'a> {
     /// reversed in memory, then committed in one write.
     ///
     /// Requires the `set` and `atomic` features.
-    // TODO: lower memory usage by reversing in chunks for large slices.
     #[cfg(all(feature = "set", feature = "atomic"))]
     #[inline]
     pub fn reverse(&mut self) -> io::Result<()> {
@@ -737,7 +736,6 @@ impl<'a> BStackSlice<'a> {
     /// # Panics
     ///
     /// Panics if `mid > self.len()`.
-    // TODO: lower memory usage for large slices
     #[cfg(all(feature = "set", feature = "atomic"))]
     pub fn rotate_left(&mut self, mid: u64) -> io::Result<()> {
         assert!(
@@ -759,7 +757,6 @@ impl<'a> BStackSlice<'a> {
     /// # Panics
     ///
     /// Panics if `k > self.len()`.
-    // TODO: lower memory usage for large slices
     #[cfg(all(feature = "set", feature = "atomic"))]
     pub fn rotate_right(&mut self, k: u64) -> io::Result<()> {
         assert!(k <= self.len(), "rotate_right: k must be <= slice length");
