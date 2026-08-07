@@ -844,6 +844,20 @@ impl<'a> Ord for BStackSlice<'a> {
     }
 }
 
+impl<'a> PartialEq<BStackRange> for BStackSlice<'a> {
+    #[inline]
+    fn eq(&self, other: &BStackRange) -> bool {
+        self.range == *other
+    }
+}
+
+impl<'a> PartialEq<BStackSlice<'a>> for BStackRange {
+    #[inline]
+    fn eq(&self, other: &BStackSlice<'a>) -> bool {
+        *self == other.range
+    }
+}
+
 impl<'a> From<BStackSlice<'a>> for BStackRange {
     #[inline]
     fn from(s: BStackSlice<'a>) -> BStackRange {
@@ -1447,6 +1461,34 @@ impl<'a, A: BStackAllocator> Ord for BStackOwnedSlice<'a, A> {
     #[inline]
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.range.cmp(&other.range)
+    }
+}
+
+impl<'a, A: BStackAllocator> PartialEq<BStackSlice<'a>> for BStackOwnedSlice<'a, A> {
+    #[inline]
+    fn eq(&self, other: &BStackSlice<'a>) -> bool {
+        self.range == other.range
+    }
+}
+
+impl<'a, A: BStackAllocator> PartialEq<BStackOwnedSlice<'a, A>> for BStackSlice<'a> {
+    #[inline]
+    fn eq(&self, other: &BStackOwnedSlice<'a, A>) -> bool {
+        self.range == other.range
+    }
+}
+
+impl<'a, A: BStackAllocator> PartialEq<BStackRange> for BStackOwnedSlice<'a, A> {
+    #[inline]
+    fn eq(&self, other: &BStackRange) -> bool {
+        self.range == *other
+    }
+}
+
+impl<'a, A: BStackAllocator> PartialEq<BStackOwnedSlice<'a, A>> for BStackRange {
+    #[inline]
+    fn eq(&self, other: &BStackOwnedSlice<'a, A>) -> bool {
+        *self == other.range
     }
 }
 

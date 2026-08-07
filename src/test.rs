@@ -3169,6 +3169,78 @@ mod alloc_tests {
         assert_eq!(b.len(), 3);
     }
 
+    // ---- Location equality: BStackSlice / BStackOwnedSlice ------------------
+
+    // 1. BStackSlice == BStackSlice compares coordinates, not identity of the
+    //    borrowed BStack reference.
+    #[test]
+    fn slice_eq_slice_by_location() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let a = alloc.alloc(4).unwrap();
+        let b = alloc.alloc(4).unwrap();
+        assert_eq!(a.as_slice(), a.as_slice());
+        assert_ne!(a.as_slice(), b.as_slice());
+    }
+
+    // 2. BStackOwnedSlice == BStackOwnedSlice compares coordinates, not
+    //    handle identity: a second handle built over the same range compares
+    //    equal, while a handle over a different range does not.
+    #[test]
+    fn owned_eq_owned_by_location() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let a = alloc.alloc(4).unwrap();
+        let b = alloc.alloc(4).unwrap();
+        let a_view =
+            unsafe { crate::alloc::BStackOwnedSlice::from_raw_range(&alloc, a.as_range()) };
+        assert_eq!(a, a_view);
+        assert_ne!(a, b);
+    }
+
+    // 3. BStackSlice == BStackOwnedSlice (both directions) compares coordinates.
+    #[test]
+    fn slice_eq_owned_cross_type() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let owned = alloc.alloc(4).unwrap();
+        let matching = owned.as_slice();
+        assert_eq!(owned, matching);
+        assert_eq!(matching, owned);
+        let other = alloc.alloc(4).unwrap();
+        assert_ne!(owned, other.as_slice());
+        assert_ne!(other.as_slice(), owned);
+    }
+
+    // 4. BStackRange == BStackSlice (both directions) compares coordinates.
+    #[test]
+    fn range_eq_slice_cross_type() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(4).unwrap();
+        let view = s.as_slice();
+        let range = view.as_range();
+        assert_eq!(range, view);
+        assert_eq!(view, range);
+        let other = alloc.alloc(4).unwrap();
+        assert_ne!(range, other.as_slice());
+        assert_ne!(other.as_slice(), range);
+    }
+
+    // 5. BStackRange == BStackOwnedSlice (both directions) compares coordinates.
+    #[test]
+    fn range_eq_owned_cross_type() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let owned = alloc.alloc(4).unwrap();
+        let range = owned.as_range();
+        assert_eq!(range, owned);
+        assert_eq!(owned, range);
+        let other = alloc.alloc(4).unwrap();
+        assert_ne!(range, other);
+        assert_ne!(other, range);
+    }
+
     // ---- BStackBulkAllocator: alloc_bulk ------------------------------------
 
     // 1. Empty lengths → empty Vec, stack unchanged.
