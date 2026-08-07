@@ -2831,6 +2831,344 @@ mod alloc_tests {
         assert!(r2 < r15);
     }
 
+    // ---- BStackSlice: ergonomic query methods -------------------------------
+
+    #[test]
+    fn slice_get_in_and_out_of_bounds() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        #[cfg_attr(not(feature = "set"), allow(unused_mut))]
+        let mut s = alloc.alloc(4).unwrap();
+        #[cfg(feature = "set")]
+        s.as_slice_mut().write([10u8, 20, 30, 40]).unwrap();
+        let view = s.as_slice();
+        #[cfg(feature = "set")]
+        {
+            assert_eq!(view.get(0).unwrap(), Some(10));
+            assert_eq!(view.get(3).unwrap(), Some(40));
+        }
+        assert_eq!(view.get(4).unwrap(), None);
+        assert_eq!(view.get(100).unwrap(), None);
+    }
+
+    #[test]
+    fn slice_head_caps_at_len() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(5).unwrap();
+        let view = s.as_slice();
+        assert_eq!(view.head(2).len(), 2);
+        assert_eq!(view.head(2).start(), view.start());
+        assert_eq!(view.head(100).len(), 5);
+    }
+
+    #[test]
+    fn slice_tail_caps_at_len() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(5).unwrap();
+        let view = s.as_slice();
+        let t = view.tail(2);
+        assert_eq!(t.len(), 2);
+        assert_eq!(t.start(), view.start() + 3);
+        assert_eq!(view.tail(100).len(), 5);
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn slice_contains() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut s = alloc.alloc(4).unwrap();
+        s.write([1u8, 2, 3, 4]).unwrap();
+        let view = s.as_slice();
+        assert!(view.contains(3).unwrap());
+        assert!(!view.contains(9).unwrap());
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn slice_starts_and_ends_with() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut s = alloc.alloc(4).unwrap();
+        s.write([1u8, 2, 3, 4]).unwrap();
+        let view = s.as_slice();
+        assert!(view.starts_with(&[1, 2]).unwrap());
+        assert!(!view.starts_with(&[2, 3]).unwrap());
+        assert!(view.ends_with(&[3, 4]).unwrap());
+        assert!(!view.ends_with(&[1, 2]).unwrap());
+        assert!(!view.starts_with(&[1, 2, 3, 4, 5]).unwrap());
+        assert!(!view.ends_with(&[1, 2, 3, 4, 5]).unwrap());
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn slice_find_and_rfind() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut s = alloc.alloc(5).unwrap();
+        s.write([1u8, 2, 3, 2, 1]).unwrap();
+        let view = s.as_slice();
+        assert_eq!(view.find(2).unwrap(), Some(1));
+        assert_eq!(view.rfind(2).unwrap(), Some(3));
+        assert_eq!(view.find(9).unwrap(), None);
+        assert_eq!(view.rfind(9).unwrap(), None);
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn slice_position_and_rposition() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut s = alloc.alloc(5).unwrap();
+        s.write([1u8, 2, 3, 4, 5]).unwrap();
+        let view = s.as_slice();
+        assert_eq!(view.position(|b| b > 2).unwrap(), Some(2));
+        assert_eq!(view.rposition(|b| b > 2).unwrap(), Some(4));
+        assert_eq!(view.position(|b| b > 10).unwrap(), None);
+    }
+
+    #[test]
+    fn slice_split_at() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(10).unwrap();
+        let (a, b) = s.as_slice().split_at(4);
+        assert_eq!(a.range(), 0..4);
+        assert_eq!(b.range(), 4..10);
+    }
+
+    #[test]
+    #[should_panic(expected = "mid must be <= slice length")]
+    fn slice_split_at_out_of_bounds() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(4).unwrap();
+        let _ = s.as_slice().split_at(5);
+    }
+
+    #[test]
+    fn slice_split_at_mut() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut s = alloc.alloc(10).unwrap();
+        let mut view = s.as_slice_mut();
+        let (a, b) = view.split_at_mut(4);
+        assert_eq!(a.range(), 0..4);
+        assert_eq!(b.range(), 4..10);
+    }
+
+    // ---- BStackSlice: ergonomic write methods (feature `set`) --------------
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn slice_fill() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut s = alloc.alloc(4).unwrap();
+        s.as_slice_mut().fill(7).unwrap();
+        assert_eq!(s.read().unwrap(), [7, 7, 7, 7]);
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn slice_fill_with() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut s = alloc.alloc(4).unwrap();
+        let mut next = 0u8;
+        s.as_slice_mut()
+            .fill_with(|| {
+                next += 1;
+                next
+            })
+            .unwrap();
+        assert_eq!(s.read().unwrap(), [1, 2, 3, 4]);
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn slice_copy_from_slice() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut s = alloc.alloc(3).unwrap();
+        s.as_slice_mut().copy_from_slice(&[9, 8, 7]).unwrap();
+        assert_eq!(s.read().unwrap(), [9, 8, 7]);
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    #[should_panic(expected = "length mismatch")]
+    fn slice_copy_from_slice_length_mismatch() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut s = alloc.alloc(3).unwrap();
+        let _ = s.as_slice_mut().copy_from_slice(&[9, 8]);
+    }
+
+    // ---- BStackSlice: atomic write methods (features `set` + `atomic`) -----
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn slice_copy_from_bstack_slice_same_stack() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut src = alloc.alloc(3).unwrap();
+        src.write([1u8, 2, 3]).unwrap();
+        let mut dst = alloc.alloc(3).unwrap();
+        dst.as_slice_mut()
+            .copy_from_bstack_slice(&src.as_slice())
+            .unwrap();
+        assert_eq!(dst.read().unwrap(), [1, 2, 3]);
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn slice_copy_from_bstack_slice_cross_stack_errors() {
+        let (alloc_a, path_a) = mk_alloc();
+        let _g_a = Guard(path_a);
+        let (alloc_b, path_b) = mk_alloc();
+        let _g_b = Guard(path_b);
+        let src = alloc_a.alloc(3).unwrap();
+        let mut dst = alloc_b.alloc(3).unwrap();
+        let err = dst
+            .as_slice_mut()
+            .copy_from_bstack_slice(&src.as_slice())
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn slice_copy_within_overlapping() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut s = alloc.alloc(5).unwrap();
+        s.write([1u8, 2, 3, 4, 5]).unwrap();
+        s.as_slice_mut().copy_within(0..3, 2).unwrap();
+        assert_eq!(s.read().unwrap(), [1, 2, 1, 2, 3]);
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn slice_swap_exchanges_contents() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut a = alloc.alloc(3).unwrap();
+        a.write([1u8, 2, 3]).unwrap();
+        let mut b = alloc.alloc(3).unwrap();
+        b.write([4u8, 5, 6]).unwrap();
+        let mut a_view = a.as_slice_mut();
+        let mut b_view = b.as_slice_mut();
+        a_view.swap(&mut b_view).unwrap();
+        assert_eq!(a.read().unwrap(), [4, 5, 6]);
+        assert_eq!(b.read().unwrap(), [1, 2, 3]);
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn slice_swap_cross_stack_errors() {
+        let (alloc_a, path_a) = mk_alloc();
+        let _g_a = Guard(path_a);
+        let (alloc_b, path_b) = mk_alloc();
+        let _g_b = Guard(path_b);
+        let mut a = alloc_a.alloc(3).unwrap();
+        let mut b = alloc_b.alloc(3).unwrap();
+        let mut a_view = a.as_slice_mut();
+        let mut b_view = b.as_slice_mut();
+        let err = a_view.swap(&mut b_view).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn slice_reverse() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut s = alloc.alloc(5).unwrap();
+        s.write([1u8, 2, 3, 4, 5]).unwrap();
+        s.as_slice_mut().reverse().unwrap();
+        assert_eq!(s.read().unwrap(), [5, 4, 3, 2, 1]);
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn slice_rotate_left() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut s = alloc.alloc(5).unwrap();
+        s.write([1u8, 2, 3, 4, 5]).unwrap();
+        s.as_slice_mut().rotate_left(2).unwrap();
+        assert_eq!(s.read().unwrap(), [3, 4, 5, 1, 2]);
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn slice_rotate_right() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut s = alloc.alloc(5).unwrap();
+        s.write([1u8, 2, 3, 4, 5]).unwrap();
+        s.as_slice_mut().rotate_right(2).unwrap();
+        assert_eq!(s.read().unwrap(), [4, 5, 1, 2, 3]);
+    }
+
+    // ---- BStackOwnedSlice: ergonomic method mirrors -------------------------
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn owned_slice_ergonomic_mirrors() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut s = alloc.alloc(5).unwrap();
+        s.write([1u8, 2, 3, 4, 5]).unwrap();
+        assert_eq!(s.get(0).unwrap(), Some(1));
+        assert!(s.contains(3).unwrap());
+        assert!(s.starts_with(&[1, 2]).unwrap());
+        assert!(s.ends_with(&[4, 5]).unwrap());
+        assert_eq!(s.find(3).unwrap(), Some(2));
+        assert_eq!(s.rfind(3).unwrap(), Some(2));
+        assert_eq!(s.position(|b| b == 4).unwrap(), Some(3));
+        assert_eq!(s.rposition(|b| b == 4).unwrap(), Some(3));
+        assert_eq!(s.head(2).len(), 2);
+        assert_eq!(s.tail(2).len(), 2);
+        let (a, b) = s.split_at(2);
+        assert_eq!(a.len(), 2);
+        assert_eq!(b.len(), 3);
+
+        s.fill(0).unwrap();
+        assert_eq!(s.read().unwrap(), [0, 0, 0, 0, 0]);
+        s.fill_with(|| 9).unwrap();
+        assert_eq!(s.read().unwrap(), [9, 9, 9, 9, 9]);
+        s.copy_from_slice(&[1, 2, 3, 4, 5]).unwrap();
+        assert_eq!(s.read().unwrap(), [1, 2, 3, 4, 5]);
+        s.reverse().unwrap();
+        assert_eq!(s.read().unwrap(), [5, 4, 3, 2, 1]);
+        s.rotate_left(1).unwrap();
+        assert_eq!(s.read().unwrap(), [4, 3, 2, 1, 5]);
+        s.rotate_right(1).unwrap();
+        assert_eq!(s.read().unwrap(), [5, 4, 3, 2, 1]);
+
+        let mut other = alloc.alloc(5).unwrap();
+        other.write([10u8, 20, 30, 40, 50]).unwrap();
+        s.copy_from_bstack_slice(&other.as_slice()).unwrap();
+        assert_eq!(s.read().unwrap(), [10, 20, 30, 40, 50]);
+        s.copy_within(0..2, 3).unwrap();
+        assert_eq!(s.read().unwrap(), [10, 20, 30, 10, 20]);
+
+        let mut third = alloc.alloc(5).unwrap();
+        third.write([1u8, 1, 1, 1, 1]).unwrap();
+        s.swap(&mut third.as_slice_mut()).unwrap();
+        assert_eq!(s.read().unwrap(), [1, 1, 1, 1, 1]);
+        assert_eq!(third.read().unwrap(), [10, 20, 30, 10, 20]);
+
+        let mut split_owned = alloc.alloc(4).unwrap();
+        let (a, b) = split_owned.split_at_mut(1);
+        assert_eq!(a.len(), 1);
+        assert_eq!(b.len(), 3);
+    }
+
     // ---- BStackBulkAllocator: alloc_bulk ------------------------------------
 
     // 1. Empty lengths → empty Vec, stack unchanged.
