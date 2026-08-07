@@ -459,6 +459,21 @@ impl<T: BStackBlock> BStackDeque<T> {
         Ok(out)
     }
 
+    /// A lazy iterator over the elements, front to back, yielding `io::Result`
+    /// value handles. A read snapshot: do not mutate the deque while iterating.
+    pub fn iter<'a>(&self, stack: &'a BStack) -> io::Result<DequeIter<'a, T>> {
+        let (head, len, cap, data) = Self::read_meta(stack, self.range.start())?;
+        Ok(DequeIter {
+            stack,
+            data,
+            cap,
+            head,
+            len,
+            pos: 0,
+            _marker: PhantomData,
+        })
+    }
+
     /// Attach an allocator to make an auto-freeing [`AutoDrop`] guard.
     pub fn auto<A: BStackOwnedSliceAllocator>(self, allocator: &A) -> AutoDrop<'_, Self, A> {
         // SAFETY: sole ownership was asserted when the deque was created.
@@ -590,5 +605,36 @@ impl<T: BStackBlock> TryCloneIn for BStackDeque<T> {
         plan.commit(allocator)?;
         // SAFETY: `dst` is a fresh block owned by nobody else.
         Ok(unsafe { BStackOwned::from_raw(Self::from_range(dst)) })
+    }
+}
+
+/// A front-to-back iterator over a [`BStackDeque`], yielding `io::Result<T>`
+/// value handles. Created by [`BStackDeque::iter`].
+pub struct DequeIter<'a, T: BStackBlock> {
+    stack: &'a BStack,
+    data: u64,
+    cap: u64,
+    head: u64,
+    len: u64,
+    pos: u64,
+    _marker: PhantomData<fn() -> T>,
+}
+
+impl<'a, T: BStackBlock> Iterator for DequeIter<'a, T> {
+    type Item = io::Result<T>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.pos >= self.len {
+            return None;
+        }
+        let slot = self.data + ((self.head + self.pos) % self.cap) * 8;
+        self.pos += 1;
+        match read_u64(self.stack, slot) {
+            Ok(vref) => Some(Ok(BStackDeque::<T>::value_at(vref))),
+            Err(e) => {
+                self.pos = self.len; // stop after an error
+                Some(Err(e))
+            }
+        }
     }
 }

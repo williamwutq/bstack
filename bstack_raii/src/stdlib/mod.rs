@@ -41,12 +41,12 @@ mod util;
 
 pub use bloom::{BStackCountingBloomFilter, BloomOnDisk};
 pub use boxed::{BStackBox, BoxOnDisk};
-pub use btreeset::{BStackBTreeSet, TreeSetOnDisk};
+pub use btreeset::{BStackBTreeSet, BTreeSetIter, TreeSetOnDisk};
 pub use cow::BStackCow;
-pub use deque::{BStackDeque, DequeOnDisk};
-pub use hashset::{BStackHashSet, HashSetOnDisk};
+pub use deque::{BStackDeque, DequeIter, DequeOnDisk};
+pub use hashset::{BStackHashSet, HashSetIter, HashSetOnDisk};
 pub use heap::{BStackBinaryHeap, HeapOnDisk};
-pub use list::{BStackLinkedList, ListOnDisk, NodeOnDisk};
-pub use map::{BStackHashMap, MapOnDisk};
+pub use list::{BStackLinkedList, ListIter, ListOnDisk, NodeOnDisk};
+pub use map::{BStackHashMap, HashMapIter, MapOnDisk};
 pub use string::{BStackString, StringOnDisk};
-pub use tree::{BStackBTreeMap, TreeOnDisk};
+pub use tree::{BStackBTreeMap, BTreeMapIter, TreeOnDisk};

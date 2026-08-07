@@ -27,6 +27,7 @@ pub(super) fn read_fields<const N: usize>(stack: &BStack, off: u64) -> io::Resul
     let buf = &mut [0u8; 64][..N * 8];
     stack.get_into(off, buf)?;
     let mut out = [0u64; N];
+    #[allow(clippy::chunks_exact_to_as_chunks)]
     for (dst, chunk) in out.iter_mut().zip(buf.chunks_exact(8)) {
         *dst = get_u64(chunk);
     }

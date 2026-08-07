@@ -84,8 +84,9 @@ pub use shared::{BStackRc, BStackWeak};
 pub use stdlib::{
     BStackBTreeMap, BStackBTreeSet, BStackBinaryHeap, BStackBox, BStackCountingBloomFilter,
     BStackCow, BStackDeque, BStackHashMap, BStackHashSet, BStackLinkedList, BStackString,
-    BloomOnDisk, BoxOnDisk, DequeOnDisk, HashSetOnDisk, HeapOnDisk, ListOnDisk, MapOnDisk,
-    NodeOnDisk, StringOnDisk, TreeOnDisk, TreeSetOnDisk,
+    BTreeMapIter, BTreeSetIter, BloomOnDisk, BoxOnDisk, DequeIter, DequeOnDisk, HashMapIter,
+    HashSetIter, HashSetOnDisk, HeapOnDisk, ListIter, ListOnDisk, MapOnDisk, NodeOnDisk,
+    StringOnDisk, TreeOnDisk, TreeSetOnDisk,
 };
 pub use teardown::{AutoDrop, BStackDrop, dealloc_range};
 pub use vec::{BStackBlockVec, BStackRefVec, BStackStrongVec, BStackVec, BStackWeakVec, VecDesc};

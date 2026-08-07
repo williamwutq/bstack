@@ -216,6 +216,22 @@ impl<K: Pod> BStackHashSet<K> {
         self.table_contains(stack, key_bytes, fnv1a(key_bytes))
     }
 
+    /// A lazy iterator over all keys in **unspecified** order, yielding
+    /// `io::Result`. A read snapshot: do not mutate the set while iterating.
+    pub fn iter<'a>(&self, stack: &'a BStack) -> io::Result<HashSetIter<'a, K>> {
+        let [table, cap] = read_fields::<2>(stack, self.range.start() + TABLE_OFF)?;
+        Ok(HashSetIter {
+            stack,
+            table,
+            cap,
+            stride: Self::stride(),
+            ksz: Self::ksize(),
+            idx: 0,
+            scratch: Scratch::new(),
+            _marker: PhantomData,
+        })
+    }
+
     /// Place `key` in the table if absent; returns whether it was newly added.
     fn table_insert<A: BStackOwnedSliceAllocator>(
         &self,
@@ -595,5 +611,38 @@ impl<K: Pod> TryCloneIn for BStackHashSet<K> {
         plan.commit(allocator)?;
         // SAFETY: `dst` is a fresh block owned by nobody else.
         Ok(unsafe { BStackOwned::from_raw(Self::from_range(dst)) })
+    }
+}
+
+/// An unordered iterator over a [`BStackHashSet`]'s keys, yielding
+/// `io::Result<K>`. Created by [`BStackHashSet::iter`]; scans the buckets.
+pub struct HashSetIter<'a, K: Pod> {
+    stack: &'a BStack,
+    table: u64,
+    cap: u64,
+    stride: u64,
+    ksz: usize,
+    idx: u64,
+    scratch: Scratch,
+    _marker: PhantomData<fn() -> K>,
+}
+
+impl<'a, K: Pod> Iterator for HashSetIter<'a, K> {
+    type Item = io::Result<K>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.idx < self.cap {
+            let i = self.idx;
+            self.idx += 1;
+            let buf = self.scratch.buf(self.stride as usize);
+            if let Err(e) = self.stack.get_into(self.table + i * self.stride, buf) {
+                self.idx = self.cap;
+                return Some(Err(e));
+            }
+            if get_u64(&buf[0..8]) == OCCUPIED {
+                return Some(Ok(bytemuck::pod_read_unaligned::<K>(&buf[8..8 + self.ksz])));
+            }
+        }
+        None
     }
 }

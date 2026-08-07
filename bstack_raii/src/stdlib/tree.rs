@@ -798,6 +798,73 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBTreeMap<K, V> {
         Ok(())
     }
 
+    /// A lazy in-order iterator over all `(key, value)` entries, ascending. Reads
+    /// nodes on demand (no full materialization); yields `io::Result` so a read
+    /// error surfaces per step. Do not mutate the tree's *structure* while
+    /// iterating (mutating a yielded value block is fine).
+    pub fn iter<'a>(&self, stack: &'a BStack) -> io::Result<BTreeMapIter<'a, K, V>> {
+        let root = read_u64(stack, self.range.start() + ROOT_OFF)?;
+        let frames = Self::descend_left(stack, root)?;
+        Ok(BTreeMapIter {
+            stack,
+            frames,
+            hi: None,
+            _marker: PhantomData,
+        })
+    }
+
+    /// A lazy in-order iterator over the entries with `lo <= key <= hi`, ascending.
+    pub fn range<'a>(&self, stack: &'a BStack, lo: K, hi: K) -> io::Result<BTreeMapIter<'a, K, V>> {
+        let root = read_u64(stack, self.range.start() + ROOT_OFF)?;
+        let frames = Self::seek(stack, root, &lo)?;
+        Ok(BTreeMapIter {
+            stack,
+            frames,
+            hi: Some(hi),
+            _marker: PhantomData,
+        })
+    }
+
+    /// Build the frame stack for the leftmost path from `root` (positions an
+    /// in-order iterator at the smallest key).
+    fn descend_left(stack: &BStack, mut cur: u64) -> io::Result<Vec<(BNode, usize)>> {
+        let mut frames = Vec::new();
+        while cur != 0 {
+            let n = Self::read_node(stack, cur)?;
+            let next = if n.leaf { 0 } else { n.children[0] };
+            let leaf = n.leaf;
+            frames.push((n, 0));
+            if leaf {
+                break;
+            }
+            cur = next;
+        }
+        Ok(frames)
+    }
+
+    /// Build the frame stack positioned at the first key `>= lo`.
+    fn seek(stack: &BStack, mut cur: u64, lo: &K) -> io::Result<Vec<(BNode, usize)>> {
+        let mut frames = Vec::new();
+        while cur != 0 {
+            let n = Self::read_node(stack, cur)?;
+            let (i, exact) = Self::search(&n, lo);
+            // Descend into child[i] only when it may hold keys `>= lo` — i.e. an
+            // internal node with no exact hit here (an exact hit means child[i] is
+            // entirely `< lo` and is skipped).
+            let descend = if n.leaf || exact {
+                None
+            } else {
+                Some(n.children[i])
+            };
+            frames.push((n, i));
+            match descend {
+                Some(c) => cur = c,
+                None => break,
+            }
+        }
+        Ok(frames)
+    }
+
     /// Attach an allocator to make an auto-freeing [`AutoDrop`] guard.
     pub fn auto<A: BStackOwnedSliceAllocator>(self, allocator: &A) -> AutoDrop<'_, Self, A> {
         // SAFETY: sole ownership was asserted when the tree was created.
@@ -956,5 +1023,59 @@ impl<K: Pod + Ord, V: BStackBlock> TryCloneIn for BStackBTreeMap<K, V> {
         plan.commit(allocator)?;
         // SAFETY: `dst` is a fresh block owned by nobody else.
         Ok(unsafe { BStackOwned::from_raw(Self::from_range(dst)) })
+    }
+}
+
+/// A lazy in-order iterator over a [`BStackBTreeMap`], yielding
+/// `io::Result<(K, V)>` in ascending key order. Created by
+/// [`BStackBTreeMap::iter`] / [`BStackBTreeMap::range`]; borrows the `BStack` for
+/// its lifetime and reads nodes on demand.
+///
+/// Each frame `(node, i)` on the stack means "`key[i]` is next; the subtree of
+/// `child[i]` has already been yielded" — the standard iterative in-order walk
+/// generalized to a B-tree.
+pub struct BTreeMapIter<'a, K: Pod + Ord, V: BStackBlock> {
+    stack: &'a BStack,
+    frames: Vec<(BNode, usize)>,
+    hi: Option<K>,
+    _marker: PhantomData<fn() -> (K, V)>,
+}
+
+impl<'a, K: Pod + Ord, V: BStackBlock> Iterator for BTreeMapIter<'a, K, V> {
+    type Item = io::Result<(K, V)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let (node, i) = self.frames.last()?;
+            let i = *i;
+            if i >= node.keys.len() {
+                self.frames.pop();
+                continue;
+            }
+            let key = BStackBTreeMap::<K, V>::read_key(&node.keys[i]);
+            let vref = node.vals[i];
+            let leaf = node.leaf;
+            let child = if leaf { 0 } else { node.children[i + 1] };
+
+            if let Some(ref hi) = self.hi
+                && key > *hi
+            {
+                self.frames.clear();
+                return None;
+            }
+            // Advance this frame past `key[i]`, then (if internal) descend the
+            // leftmost path of `child[i+1]` so `key[i+1]` comes after its subtree.
+            self.frames.last_mut().unwrap().1 = i + 1;
+            if !leaf {
+                match BStackBTreeMap::<K, V>::descend_left(self.stack, child) {
+                    Ok(mut f) => self.frames.append(&mut f),
+                    Err(e) => {
+                        self.frames.clear();
+                        return Some(Err(e));
+                    }
+                }
+            }
+            return Some(Ok((key, BStackBTreeMap::<K, V>::value_at(vref))));
+        }
     }
 }

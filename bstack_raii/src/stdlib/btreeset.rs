@@ -691,6 +691,67 @@ impl<K: Pod + Ord> BStackBTreeSet<K> {
         Ok(())
     }
 
+    /// A lazy in-order iterator over all keys, ascending. Reads nodes on demand;
+    /// yields `io::Result`. Do not mutate the set's structure while iterating.
+    pub fn iter<'a>(&self, stack: &'a BStack) -> io::Result<BTreeSetIter<'a, K>> {
+        let root = read_u64(stack, self.range.start() + ROOT_OFF)?;
+        let frames = Self::descend_left(stack, root)?;
+        Ok(BTreeSetIter {
+            stack,
+            frames,
+            hi: None,
+            _marker: PhantomData,
+        })
+    }
+
+    /// A lazy in-order iterator over the keys with `lo <= key <= hi`, ascending.
+    pub fn range<'a>(&self, stack: &'a BStack, lo: K, hi: K) -> io::Result<BTreeSetIter<'a, K>> {
+        let root = read_u64(stack, self.range.start() + ROOT_OFF)?;
+        let frames = Self::seek(stack, root, &lo)?;
+        Ok(BTreeSetIter {
+            stack,
+            frames,
+            hi: Some(hi),
+            _marker: PhantomData,
+        })
+    }
+
+    /// Build the frame stack for the leftmost path from `root`.
+    fn descend_left(stack: &BStack, mut cur: u64) -> io::Result<Vec<(BNode, usize)>> {
+        let mut frames = Vec::new();
+        while cur != 0 {
+            let n = Self::read_node(stack, cur)?;
+            let next = if n.leaf { 0 } else { n.children[0] };
+            let leaf = n.leaf;
+            frames.push((n, 0));
+            if leaf {
+                break;
+            }
+            cur = next;
+        }
+        Ok(frames)
+    }
+
+    /// Build the frame stack positioned at the first key `>= lo`.
+    fn seek(stack: &BStack, mut cur: u64, lo: &K) -> io::Result<Vec<(BNode, usize)>> {
+        let mut frames = Vec::new();
+        while cur != 0 {
+            let n = Self::read_node(stack, cur)?;
+            let (i, exact) = Self::search(&n, lo);
+            let descend = if n.leaf || exact {
+                None
+            } else {
+                Some(n.children[i])
+            };
+            frames.push((n, i));
+            match descend {
+                Some(c) => cur = c,
+                None => break,
+            }
+        }
+        Ok(frames)
+    }
+
     /// Attach an allocator to make an auto-freeing [`AutoDrop`] guard.
     pub fn auto<A: BStackOwnedSliceAllocator>(self, allocator: &A) -> AutoDrop<'_, Self, A> {
         // SAFETY: sole ownership was asserted when the set was created.
@@ -840,5 +901,51 @@ impl<K: Pod + Ord> TryCloneIn for BStackBTreeSet<K> {
         plan.commit(allocator)?;
         // SAFETY: `dst` is a fresh block owned by nobody else.
         Ok(unsafe { BStackOwned::from_raw(Self::from_range(dst)) })
+    }
+}
+
+/// A lazy in-order iterator over a [`BStackBTreeSet`], yielding `io::Result<K>`
+/// in ascending order. Created by [`BStackBTreeSet::iter`] /
+/// [`BStackBTreeSet::range`].
+pub struct BTreeSetIter<'a, K: Pod + Ord> {
+    stack: &'a BStack,
+    frames: Vec<(BNode, usize)>,
+    hi: Option<K>,
+    _marker: PhantomData<fn() -> K>,
+}
+
+impl<'a, K: Pod + Ord> Iterator for BTreeSetIter<'a, K> {
+    type Item = io::Result<K>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let (node, i) = self.frames.last()?;
+            let i = *i;
+            if i >= node.keys.len() {
+                self.frames.pop();
+                continue;
+            }
+            let key = BStackBTreeSet::<K>::read_key(&node.keys[i]);
+            let leaf = node.leaf;
+            let child = if leaf { 0 } else { node.children[i + 1] };
+
+            if let Some(ref hi) = self.hi
+                && key > *hi
+            {
+                self.frames.clear();
+                return None;
+            }
+            self.frames.last_mut().unwrap().1 = i + 1;
+            if !leaf {
+                match BStackBTreeSet::<K>::descend_left(self.stack, child) {
+                    Ok(mut f) => self.frames.append(&mut f),
+                    Err(e) => {
+                        self.frames.clear();
+                        return Some(Err(e));
+                    }
+                }
+            }
+            return Some(Ok(key));
+        }
     }
 }

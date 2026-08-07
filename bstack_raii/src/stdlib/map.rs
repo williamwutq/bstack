@@ -356,6 +356,23 @@ impl<K: Pod, V: BStackBlock> BStackHashMap<K, V> {
         Ok(self.get(stack, key)?.is_some())
     }
 
+    /// A lazy iterator over all `(key, value)` entries in **unspecified** order,
+    /// yielding `io::Result`. A read snapshot: do not mutate the map while
+    /// iterating (mutating a yielded value block is fine).
+    pub fn iter<'a>(&self, stack: &'a BStack) -> io::Result<HashMapIter<'a, K, V>> {
+        let [table, cap] = read_fields::<2>(stack, self.range.start() + TABLE_OFF)?;
+        Ok(HashMapIter {
+            stack,
+            table,
+            cap,
+            stride: Self::stride(),
+            ksz: Self::ksize(),
+            idx: 0,
+            scratch: Scratch::new(),
+            _marker: PhantomData,
+        })
+    }
+
     /// Grow the table to at least double its capacity, rehashing every live entry
     /// (and dropping tombstones) atomically. A no-op (beyond a freed spare block)
     /// if another thread already grew it.
@@ -633,5 +650,40 @@ impl<K: Pod, V: BStackBlock> TryCloneIn for BStackHashMap<K, V> {
         plan.commit(allocator)?;
         // SAFETY: `dst` is a fresh block owned by nobody else.
         Ok(unsafe { BStackOwned::from_raw(Self::from_range(dst)) })
+    }
+}
+
+/// An unordered iterator over a [`BStackHashMap`]'s live entries, yielding
+/// `io::Result<(K, V)>`. Created by [`BStackHashMap::iter`]; scans the buckets.
+pub struct HashMapIter<'a, K: Pod, V: BStackBlock> {
+    stack: &'a BStack,
+    table: u64,
+    cap: u64,
+    stride: u64,
+    ksz: usize,
+    idx: u64,
+    scratch: Scratch,
+    _marker: PhantomData<fn() -> (K, V)>,
+}
+
+impl<'a, K: Pod, V: BStackBlock> Iterator for HashMapIter<'a, K, V> {
+    type Item = io::Result<(K, V)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.idx < self.cap {
+            let i = self.idx;
+            self.idx += 1;
+            let buf = self.scratch.buf(self.stride as usize);
+            if let Err(e) = self.stack.get_into(self.table + i * self.stride, buf) {
+                self.idx = self.cap;
+                return Some(Err(e));
+            }
+            if get_u64(&buf[0..8]) == OCCUPIED {
+                let k = bytemuck::pod_read_unaligned::<K>(&buf[8..8 + self.ksz]);
+                let vref = get_u64(&buf[8 + self.ksz..8 + self.ksz + 8]);
+                return Some(Ok((k, BStackHashMap::<K, V>::value_at(vref))));
+            }
+        }
+        None
     }
 }

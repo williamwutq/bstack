@@ -6000,3 +6000,141 @@ fn stdlib_heap_distinct_tags() {
         <BStackBinaryHeap<u64, MacroLeaf> as BStackCast>::eightcc(),
     );
 }
+
+// --------------------------------------------------------------------------
+// stdlib: iterators
+// --------------------------------------------------------------------------
+
+#[test]
+fn stdlib_deque_iter() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+    let dq = BStackDeque::<MacroLeaf>::new(&alloc).unwrap();
+    for v in 0..10u32 {
+        dq.push_back(&alloc, MacroLeaf::new(&alloc, v).unwrap())
+            .unwrap();
+    }
+    let mut got = Vec::new();
+    for r in dq.iter(stack).unwrap() {
+        got.push(r.unwrap().val(stack).unwrap());
+    }
+    assert_eq!(got, (0..10u32).collect::<Vec<_>>());
+    dq.bstack_drop(&alloc).unwrap();
+}
+
+#[test]
+fn stdlib_list_iter() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+    let list = BStackLinkedList::<MacroLeaf>::new(&alloc).unwrap();
+    for v in 0..6u32 {
+        list.push_back(&alloc, MacroLeaf::new(&alloc, v).unwrap())
+            .unwrap();
+    }
+    let mut got = Vec::new();
+    for r in list.iter(stack).unwrap() {
+        got.push(r.unwrap().val(stack).unwrap());
+    }
+    assert_eq!(got, (0..6u32).collect::<Vec<_>>());
+    list.bstack_drop(&alloc).unwrap();
+}
+
+#[test]
+fn stdlib_map_iter() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+    let map = BStackHashMap::<u32, MacroLeaf>::new(&alloc).unwrap();
+    for k in 0..20u32 {
+        map.insert(&alloc, k, MacroLeaf::new(&alloc, k * 10).unwrap())
+            .unwrap();
+    }
+    let mut got = Vec::new();
+    for r in map.iter(stack).unwrap() {
+        let (k, v) = r.unwrap();
+        got.push((k, v.val(stack).unwrap()));
+    }
+    got.sort_unstable(); // unordered iteration
+    assert_eq!(got, (0..20u32).map(|k| (k, k * 10)).collect::<Vec<_>>());
+    map.bstack_drop(&alloc).unwrap();
+}
+
+#[test]
+fn stdlib_hashset_iter() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+    let set = BStackHashSet::<u32>::new(&alloc).unwrap();
+    for k in 0..20u32 {
+        set.insert(&alloc, k).unwrap();
+    }
+    let mut got = Vec::new();
+    for r in set.iter(stack).unwrap() {
+        got.push(r.unwrap());
+    }
+    got.sort_unstable();
+    assert_eq!(got, (0..20u32).collect::<Vec<_>>());
+    set.bstack_drop(&alloc).unwrap();
+}
+
+#[test]
+fn stdlib_tree_iter_and_range() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+    let tree = BStackBTreeMap::<u32, MacroLeaf>::new(&alloc).unwrap();
+    for i in 0..40u32 {
+        let k = (i * 13) % 40; // scrambled permutation
+        tree.insert(&alloc, k, MacroLeaf::new(&alloc, k * 10).unwrap())
+            .unwrap();
+    }
+    // Full iteration is sorted.
+    let mut got = Vec::new();
+    for r in tree.iter(stack).unwrap() {
+        let (k, v) = r.unwrap();
+        got.push((k, v.val(stack).unwrap()));
+    }
+    assert_eq!(got, (0..40u32).map(|k| (k, k * 10)).collect::<Vec<_>>());
+
+    // range(10, 20) is the inclusive sub-slice, still sorted.
+    let mut ranged = Vec::new();
+    for r in tree.range(stack, 10, 20).unwrap() {
+        ranged.push(r.unwrap().0);
+    }
+    assert_eq!(ranged, (10..=20u32).collect::<Vec<_>>());
+
+    // A range whose lo falls between keys and hi past the end.
+    let mut r2 = Vec::new();
+    for r in tree.range(stack, 37, 999).unwrap() {
+        r2.push(r.unwrap().0);
+    }
+    assert_eq!(r2, vec![37, 38, 39]);
+
+    tree.bstack_drop(&alloc).unwrap();
+}
+
+#[test]
+fn stdlib_btreeset_iter_and_range() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+    let set = BStackBTreeSet::<u32>::new(&alloc).unwrap();
+    for i in 0..40u32 {
+        set.insert(&alloc, (i * 13) % 40).unwrap();
+    }
+    let mut got = Vec::new();
+    for r in set.iter(stack).unwrap() {
+        got.push(r.unwrap());
+    }
+    assert_eq!(got, (0..40u32).collect::<Vec<_>>());
+
+    let mut ranged = Vec::new();
+    for r in set.range(stack, 15, 18).unwrap() {
+        ranged.push(r.unwrap());
+    }
+    assert_eq!(ranged, vec![15, 16, 17, 18]);
+
+    set.bstack_drop(&alloc).unwrap();
+}

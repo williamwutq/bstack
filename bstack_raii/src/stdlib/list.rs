@@ -36,7 +36,7 @@ use std::io;
 use bstack::{BStack, BStackOwnedSliceAllocator, BStackRange};
 use bytemuck::{Pod, Zeroable};
 
-use super::util::{alloc_image, atomic_update, read_u64};
+use super::util::{alloc_image, atomic_update, read_fields, read_u64};
 use crate::block::{BStackBlock, BStackCast};
 use crate::clone::{ClonePlan, TryCloneIn};
 use crate::layout::{BlockHeader, EightCC, HEADER_SIZE};
@@ -391,10 +391,23 @@ impl<T: BStackBlock> BStackLinkedList<T> {
         let mut out = Vec::new();
         let mut cur = read_u64(stack, self.range.start() + HEAD_OFF)?;
         while cur != 0 {
-            out.push(Self::value_at(read_u64(stack, cur + NVAL_OFF)?));
-            cur = read_u64(stack, cur + NNEXT_OFF)?;
+            // `next` (@24) and `value` (@32) are adjacent — one read per node.
+            let [next, value] = read_fields::<2>(stack, cur + NNEXT_OFF)?;
+            out.push(Self::value_at(value));
+            cur = next;
         }
         Ok(out)
+    }
+
+    /// A lazy iterator over the elements, front to back, yielding `io::Result`
+    /// value handles. A read snapshot: do not mutate the list while iterating.
+    pub fn iter<'a>(&self, stack: &'a BStack) -> io::Result<ListIter<'a, T>> {
+        let head = read_u64(stack, self.range.start() + HEAD_OFF)?;
+        Ok(ListIter {
+            stack,
+            cur: head,
+            _marker: PhantomData,
+        })
     }
 
     /// Attach an allocator to make an auto-freeing [`crate::AutoDrop`] guard.
@@ -541,5 +554,34 @@ impl<T: BStackBlock> TryCloneIn for BStackLinkedList<T> {
         plan.commit(allocator)?;
         // SAFETY: `dst` is a fresh block owned by nobody else.
         Ok(unsafe { BStackOwned::from_raw(Self::from_range(dst)) })
+    }
+}
+
+/// A front-to-back iterator over a [`BStackLinkedList`], yielding `io::Result<T>`
+/// value handles. Created by [`BStackLinkedList::iter`]; walks the `next` links.
+pub struct ListIter<'a, T: BStackBlock> {
+    stack: &'a BStack,
+    cur: u64,
+    _marker: PhantomData<fn() -> T>,
+}
+
+impl<'a, T: BStackBlock> Iterator for ListIter<'a, T> {
+    type Item = io::Result<T>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.cur == 0 {
+            return None;
+        }
+        // `next` (@24) and `value` (@32) are adjacent — one read per node.
+        match read_fields::<2>(self.stack, self.cur + NNEXT_OFF) {
+            Ok([next, value]) => {
+                self.cur = next;
+                Some(Ok(BStackLinkedList::<T>::value_at(value)))
+            }
+            Err(e) => {
+                self.cur = 0;
+                Some(Err(e))
+            }
+        }
     }
 }
