@@ -1649,5 +1649,4 @@ mod tests {
         assert_eq!(v.move_tail_into(&mut too_big).unwrap(), None);
         assert_eq!(v.read_bytes().unwrap(), [1, 2, 3]);
     }
-
 }
