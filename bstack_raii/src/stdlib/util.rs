@@ -18,6 +18,21 @@ pub(super) fn read_u64(stack: &BStack, off: u64) -> io::Result<u64> {
     Ok(u64::from_le_bytes(b))
 }
 
+/// Read `N` **contiguous** little-endian `u64` fields starting at `off` in a
+/// *single* I/O call, returning them as an array. Use this instead of several
+/// [`read_u64`] calls when the fields are adjacent (e.g. a handle's metadata) —
+/// one `get_into` is one lock/seek/read, not `N`.
+pub(super) fn read_fields<const N: usize>(stack: &BStack, off: u64) -> io::Result<[u64; N]> {
+    debug_assert!(N <= 8, "read_fields: at most 8 u64 fields");
+    let buf = &mut [0u8; 64][..N * 8];
+    stack.get_into(off, buf)?;
+    let mut out = [0u64; N];
+    for (dst, chunk) in out.iter_mut().zip(buf.chunks_exact(8)) {
+        *dst = get_u64(chunk);
+    }
+    Ok(out)
+}
+
 /// Inline capacity of a [`Scratch`] buffer. Sized to hold a B-tree node (or a
 /// map bucket / key) for any reasonably-small `Pod` key entirely on the stack;
 /// unusually large keys spill to the heap. A `BStackBTreeMap` node with minimum

@@ -33,7 +33,7 @@ use std::io;
 use bstack::{BStack, BStackOwnedSliceAllocator, BStackRange};
 use bytemuck::{Pod, Zeroable};
 
-use super::util::{alloc_image, read_u64};
+use super::util::{alloc_image, read_fields, read_u64};
 use crate::block::{BStackBlock, BStackCast};
 use crate::clone::{ClonePlan, TryCloneIn};
 use crate::layout::{BlockHeader, EightCC, HEADER_SIZE, get_u64};
@@ -89,12 +89,10 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBinaryHeap<K, V> {
         get_u64(&slot[Self::ksize()..Self::ksize() + 8])
     }
 
+    /// Read `(data, cap, len)` — the three contiguous handle fields — in one I/O.
     fn read_meta(stack: &BStack, handle: u64) -> io::Result<(u64, u64, u64)> {
-        Ok((
-            read_u64(stack, handle + DATA_OFF)?,
-            read_u64(stack, handle + CAP_OFF)?,
-            read_u64(stack, handle + LEN_OFF)?,
-        ))
+        let [data, cap, len] = read_fields::<3>(stack, handle + DATA_OFF)?;
+        Ok((data, cap, len))
     }
 
     /// Read the `stride` raw bytes of slot `i`.

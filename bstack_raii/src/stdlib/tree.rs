@@ -44,7 +44,7 @@ use std::io;
 use bstack::{BStack, BStackOwnedSliceAllocator, BStackRange};
 use bytemuck::{Pod, Zeroable};
 
-use super::util::{Scratch, alloc_image, read_u64};
+use super::util::{Scratch, alloc_image, read_fields, read_u64};
 use crate::block::{BStackBlock, BStackCast};
 use crate::clone::{ClonePlan, TryCloneIn};
 use crate::layout::{BlockHeader, EightCC, HEADER_SIZE, get_u64};
@@ -331,8 +331,7 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBTreeMap<K, V> {
         let key_bytes = bytemuck::bytes_of(&key).to_vec();
         let val_ref = value.into_inner().range().start();
 
-        let root = read_u64(stack, handle + ROOT_OFF)?;
-        let len = read_u64(stack, handle + LEN_OFF)?;
+        let [root, len] = read_fields::<2>(stack, handle + ROOT_OFF)?;
 
         let mut build = Build {
             allocator,
@@ -674,12 +673,11 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBTreeMap<K, V> {
     ) -> io::Result<Option<BStackOwned<V>>> {
         let handle = self.range.start();
         let stack = allocator.stack();
-        let root = read_u64(stack, handle + ROOT_OFF)?;
+        let [root, len] = read_fields::<2>(stack, handle + ROOT_OFF)?;
         // Absent-key fast path avoids a wasted path copy.
         if root == 0 || self.get(stack, key)?.is_none() {
             return Ok(None);
         }
-        let len = read_u64(stack, handle + LEN_OFF)?;
 
         let mut build = Build {
             allocator,
@@ -917,8 +915,7 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBlock for BStackBTreeMap<K, V> {
         plan: &mut ClonePlan,
     ) -> io::Result<BStackRange> {
         let handle = self.range.start();
-        let root = read_u64(allocator.stack(), handle + ROOT_OFF)?;
-        let len = read_u64(allocator.stack(), handle + LEN_OFF)?;
+        let [root, len] = read_fields::<2>(allocator.stack(), handle + ROOT_OFF)?;
         let new_root = Self::clone_subtree(allocator.stack(), root, allocator, plan)?;
 
         let handle_dst = plan.alloc_raw(allocator, TREE_SIZE)?;

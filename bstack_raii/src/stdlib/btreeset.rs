@@ -27,7 +27,7 @@ use bstack::{BStack, BStackOwnedSliceAllocator, BStackRange};
 use bytemuck::{Pod, Zeroable};
 
 use super::bloom::{BStackCountingBloomFilter, BloomOnDisk};
-use super::util::{Scratch, alloc_image, read_u64};
+use super::util::{Scratch, alloc_image, read_fields, read_u64};
 use crate::block::{BStackBlock, BStackCast};
 use crate::clone::{ClonePlan, TryCloneIn};
 use crate::layout::{BlockHeader, EightCC, HEADER_SIZE, get_u64};
@@ -289,8 +289,7 @@ impl<K: Pod + Ord> BStackBTreeSet<K> {
 
         let handle = self.range.start();
         let stack = allocator.stack();
-        let root = read_u64(stack, handle + ROOT_OFF)?;
-        let len = read_u64(stack, handle + LEN_OFF)?;
+        let [root, len] = read_fields::<2>(stack, handle + ROOT_OFF)?;
 
         let mut build = Build {
             allocator,
@@ -577,8 +576,7 @@ impl<K: Pod + Ord> BStackBTreeSet<K> {
         if !self.tree_contains(stack, key, &key_bytes)? {
             return Ok(false);
         }
-        let root = read_u64(stack, handle + ROOT_OFF)?;
-        let len = read_u64(stack, handle + LEN_OFF)?;
+        let [root, len] = read_fields::<2>(stack, handle + ROOT_OFF)?;
 
         let mut build = Build {
             allocator,
@@ -775,9 +773,8 @@ impl<K: Pod + Ord> BStackBlock for BStackBTreeSet<K> {
         allocator: &A,
     ) -> io::Result<()> {
         let handle = range.start();
-        let root = read_u64(allocator.stack(), handle + ROOT_OFF)?;
+        let [root, _len, bloom_off] = read_fields::<3>(allocator.stack(), handle + ROOT_OFF)?;
         Self::drop_subtree(allocator.stack(), root, allocator)?;
-        let bloom_off = read_u64(allocator.stack(), handle + BLOOM_OFF)?;
         if bloom_off != 0 {
             // SAFETY: the set solely owns its embedded Bloom filter.
             let bloom = <BStackCountingBloomFilter<K> as BStackBlock>::from_range(
@@ -796,9 +793,7 @@ impl<K: Pod + Ord> BStackBlock for BStackBTreeSet<K> {
         plan: &mut ClonePlan,
     ) -> io::Result<BStackRange> {
         let handle = self.range.start();
-        let root = read_u64(allocator.stack(), handle + ROOT_OFF)?;
-        let len = read_u64(allocator.stack(), handle + LEN_OFF)?;
-        let bloom_off = read_u64(allocator.stack(), handle + BLOOM_OFF)?;
+        let [root, len, bloom_off] = read_fields::<3>(allocator.stack(), handle + ROOT_OFF)?;
 
         let new_root = Self::clone_subtree(allocator.stack(), root, allocator, plan)?;
         let bloom = <BStackCountingBloomFilter<K> as BStackBlock>::from_range(BStackRange::new(

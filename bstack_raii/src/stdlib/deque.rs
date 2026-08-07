@@ -39,7 +39,7 @@ use std::io;
 use bstack::{BStack, BStackOwnedSliceAllocator, BStackRange};
 use bytemuck::{Pod, Zeroable};
 
-use super::util::{alloc_image, atomic_update, read_u64};
+use super::util::{alloc_image, atomic_update, read_fields, read_u64};
 use crate::block::{BStackBlock, BStackCast};
 use crate::clone::{ClonePlan, TryCloneIn};
 use crate::layout::{BlockHeader, EightCC, HEADER_SIZE};
@@ -101,14 +101,10 @@ impl<T: BStackBlock> BStackDeque<T> {
     }
 
     /// Read the four `(head, len, cap, data)` metadata fields of the handle at
-    /// `handle`.
+    /// `handle` in a single I/O (the on-disk order is `data, cap, head, len`).
     fn read_meta(stack: &BStack, handle: u64) -> io::Result<(u64, u64, u64, u64)> {
-        Ok((
-            read_u64(stack, handle + HEAD_OFF)?,
-            read_u64(stack, handle + LEN_OFF)?,
-            read_u64(stack, handle + CAP_OFF)?,
-            read_u64(stack, handle + DATA_OFF)?,
-        ))
+        let [data, cap, head, len] = read_fields::<4>(stack, handle + DATA_OFF)?;
+        Ok((head, len, cap, data))
     }
 
     /// Allocate an empty deque (no ring is allocated until the first push).

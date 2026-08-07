@@ -41,7 +41,7 @@ use bstack::{BStack, BStackGenOp, BStackOwnedSliceAllocator, BStackRange};
 use bytemuck::{Pod, Zeroable};
 
 use super::hash::double_hash;
-use super::util::{alloc_image, read_u64};
+use super::util::{alloc_image, read_fields, read_u64};
 use crate::block::{BStackBlock, BStackCast};
 use crate::clone::{ClonePlan, TryCloneIn};
 use crate::layout::{BlockHeader, EightCC, HEADER_SIZE};
@@ -175,9 +175,8 @@ impl<K: Pod> BStackCountingBloomFilter<K> {
     /// The current estimated false-positive probability, `(1 - e^{-k n / m})^k`.
     pub fn estimated_fp_rate(&self, stack: &BStack) -> io::Result<f64> {
         let handle = self.range.start();
-        let m = read_u64(stack, handle + M_OFF)? as f64;
-        let k = read_u64(stack, handle + K_OFF)? as f64;
-        let n = read_u64(stack, handle + N_OFF)? as f64;
+        let [m, k, n] = read_fields::<3>(stack, handle + M_OFF)?;
+        let (m, k, n) = (m as f64, k as f64, n as f64);
         Ok((1.0 - (-k * n / m).exp()).powf(k))
     }
 
@@ -199,9 +198,7 @@ impl<K: Pod> BStackCountingBloomFilter<K> {
     /// absent). A plain read.
     pub fn contains(&self, stack: &BStack, key: &K) -> io::Result<bool> {
         let handle = self.range.start();
-        let data = read_u64(stack, handle + DATA_OFF)?;
-        let m = read_u64(stack, handle + M_OFF)?;
-        let k = read_u64(stack, handle + K_OFF)?;
+        let [data, m, k] = read_fields::<3>(stack, handle + DATA_OFF)?;
         let key_bytes = bytemuck::bytes_of(key);
         for idx in Self::indices(m, k, key_bytes) {
             let mut b = [0u8; 1];
@@ -216,8 +213,7 @@ impl<K: Pod> BStackCountingBloomFilter<K> {
     /// Reset every counter and the item count to zero.
     pub fn clear<A: BStackOwnedSliceAllocator>(&self, allocator: &A) -> io::Result<()> {
         let handle = self.range.start();
-        let data = read_u64(allocator.stack(), handle + DATA_OFF)?;
-        let m = read_u64(allocator.stack(), handle + M_OFF)?;
+        let [data, m] = read_fields::<2>(allocator.stack(), handle + DATA_OFF)?;
         allocator.stack().set_batched([
             (data, vec![0u8; m as usize]),
             (handle + N_OFF, 0u64.to_le_bytes().to_vec()),
@@ -233,9 +229,7 @@ impl<K: Pod> BStackCountingBloomFilter<K> {
         add: bool,
     ) -> io::Result<()> {
         let handle = self.range.start();
-        let data = read_u64(allocator.stack(), handle + DATA_OFF)?;
-        let m = read_u64(allocator.stack(), handle + M_OFF)?;
-        let k = read_u64(allocator.stack(), handle + K_OFF)?;
+        let [data, m, k] = read_fields::<3>(allocator.stack(), handle + DATA_OFF)?;
         let agg = Self::aggregate(Self::indices(m, k, bytemuck::bytes_of(key)));
         let cn = agg.len();
 
@@ -352,8 +346,7 @@ impl<K: Pod> BStackBlock for BStackCountingBloomFilter<K> {
         range: BStackRange,
         allocator: &A,
     ) -> io::Result<()> {
-        let data = read_u64(allocator.stack(), range.start() + DATA_OFF)?;
-        let m = read_u64(allocator.stack(), range.start() + M_OFF)?;
+        let [data, m] = read_fields::<2>(allocator.stack(), range.start() + DATA_OFF)?;
         if data != 0 {
             // SAFETY: the filter solely owns its counter block.
             unsafe { dealloc_range(allocator, BStackRange::new(data, m))? };
@@ -369,10 +362,7 @@ impl<K: Pod> BStackBlock for BStackCountingBloomFilter<K> {
         plan: &mut ClonePlan,
     ) -> io::Result<BStackRange> {
         let handle = self.range.start();
-        let data = read_u64(allocator.stack(), handle + DATA_OFF)?;
-        let m = read_u64(allocator.stack(), handle + M_OFF)?;
-        let k = read_u64(allocator.stack(), handle + K_OFF)?;
-        let n = read_u64(allocator.stack(), handle + N_OFF)?;
+        let [data, m, k, n] = read_fields::<4>(allocator.stack(), handle + DATA_OFF)?;
 
         let new_data = if m != 0 {
             let mut bytes = vec![0u8; m as usize];

@@ -38,7 +38,7 @@ use bytemuck::{Pod, Zeroable};
 
 use super::bloom::{BStackCountingBloomFilter, BloomOnDisk};
 use super::hash::fnv1a;
-use super::util::{Meta, ProbeStep, Scratch, alloc_image, probe_commit, read_u64};
+use super::util::{Meta, ProbeStep, Scratch, alloc_image, probe_commit, read_fields, read_u64};
 use crate::block::{BStackBlock, BStackCast};
 use crate::clone::{ClonePlan, TryCloneIn};
 use crate::layout::{BlockHeader, EightCC, HEADER_SIZE, get_u64};
@@ -227,8 +227,7 @@ impl<K: Pod> BStackHashSet<K> {
         let stride = Self::stride();
         let ksz = Self::ksize();
         loop {
-            let cap = read_u64(allocator.stack(), handle + CAP_OFF)?;
-            let used = read_u64(allocator.stack(), handle + USED_OFF)?;
+            let [cap, _len, used] = read_fields::<3>(allocator.stack(), handle + CAP_OFF)?;
             if cap == 0 || (used + 1) * 4 > cap * 3 {
                 self.grow(allocator)?;
                 continue;
@@ -324,8 +323,7 @@ impl<K: Pod> BStackHashSet<K> {
         let handle = self.range.start();
         let stride = Self::stride();
         let ksz = Self::ksize();
-        let table = read_u64(stack, handle + TABLE_OFF)?;
-        let cap = read_u64(stack, handle + CAP_OFF)?;
+        let [table, cap] = read_fields::<2>(stack, handle + TABLE_OFF)?;
         if cap == 0 {
             return Ok(false);
         }
@@ -513,9 +511,8 @@ impl<K: Pod> BStackBlock for BStackHashSet<K> {
         allocator: &A,
     ) -> io::Result<()> {
         let handle = range.start();
-        let table = read_u64(allocator.stack(), handle + TABLE_OFF)?;
-        let cap = read_u64(allocator.stack(), handle + CAP_OFF)?;
-        let bloom_off = read_u64(allocator.stack(), handle + BLOOM_OFF)?;
+        let [table, cap, _len, _used, bloom_off] =
+            read_fields::<5>(allocator.stack(), handle + TABLE_OFF)?;
         if table != 0 {
             // SAFETY: the set solely owns its bucket block.
             unsafe { dealloc_range(allocator, BStackRange::new(table, cap * Self::stride()))? };
@@ -539,11 +536,8 @@ impl<K: Pod> BStackBlock for BStackHashSet<K> {
     ) -> io::Result<BStackRange> {
         let handle = self.range.start();
         let stride = Self::stride();
-        let table = read_u64(allocator.stack(), handle + TABLE_OFF)?;
-        let cap = read_u64(allocator.stack(), handle + CAP_OFF)?;
-        let len = read_u64(allocator.stack(), handle + LEN_OFF)?;
-        let used = read_u64(allocator.stack(), handle + USED_OFF)?;
-        let bloom_off = read_u64(allocator.stack(), handle + BLOOM_OFF)?;
+        let [table, cap, len, used, bloom_off] =
+            read_fields::<5>(allocator.stack(), handle + TABLE_OFF)?;
 
         let new_table = if cap != 0 {
             let mut image = vec![0u8; (cap * stride) as usize];

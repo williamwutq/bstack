@@ -19,7 +19,7 @@ use std::io;
 use bstack::{BStack, BStackOwnedSliceAllocator, BStackRange};
 use bytemuck::{Pod, Zeroable};
 
-use super::util::{alloc_image, read_u64};
+use super::util::{alloc_image, read_fields, read_u64};
 use crate::block::{BStackBlock, BStackCast};
 use crate::clone::{ClonePlan, TryCloneIn};
 use crate::layout::{BlockHeader, EightCC, HEADER_SIZE};
@@ -109,8 +109,8 @@ impl BStackString {
 
     /// Read the raw UTF-8 bytes.
     pub fn read_bytes(&self, stack: &BStack) -> io::Result<Vec<u8>> {
-        let data = read_u64(stack, self.range.start() + DATA_OFF)?;
-        let len = read_u64(stack, self.range.start() + LEN_OFF)? as usize;
+        let [data, len] = read_fields::<2>(stack, self.range.start() + DATA_OFF)?;
+        let len = len as usize;
         let mut buf = vec![0u8; len];
         if len != 0 {
             stack.get_into(data, &mut buf)?;
@@ -137,8 +137,7 @@ impl BStackString {
         let newlen = s.len() as u64;
         let newdata = Self::alloc_bytes(allocator, s.as_bytes())?;
 
-        let old_data = read_u64(stack, handle + DATA_OFF)?;
-        let old_len = read_u64(stack, handle + LEN_OFF)?;
+        let [old_data, old_len] = read_fields::<2>(stack, handle + DATA_OFF)?;
 
         // `data` and `len` are contiguous — swap both in one 16-byte write.
         let mut buf = [0u8; 16];
@@ -253,8 +252,7 @@ impl BStackBlock for BStackString {
         range: BStackRange,
         allocator: &A,
     ) -> io::Result<()> {
-        let data = read_u64(allocator.stack(), range.start() + DATA_OFF)?;
-        let len = read_u64(allocator.stack(), range.start() + LEN_OFF)?;
+        let [data, len] = read_fields::<2>(allocator.stack(), range.start() + DATA_OFF)?;
         if data != 0 {
             // SAFETY: the string solely owns its bytes block.
             unsafe { dealloc_range(allocator, BStackRange::new(data, len))? };
@@ -270,8 +268,7 @@ impl BStackBlock for BStackString {
         plan: &mut ClonePlan,
     ) -> io::Result<BStackRange> {
         let handle = self.range.start();
-        let data = read_u64(allocator.stack(), handle + DATA_OFF)?;
-        let len = read_u64(allocator.stack(), handle + LEN_OFF)?;
+        let [data, len] = read_fields::<2>(allocator.stack(), handle + DATA_OFF)?;
 
         let new_data = if len != 0 {
             let mut bytes = vec![0u8; len as usize];

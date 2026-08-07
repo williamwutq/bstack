@@ -41,7 +41,7 @@ use bstack::{BStack, BStackGenOp, BStackOwnedSliceAllocator, BStackRange};
 use bytemuck::{Pod, Zeroable};
 
 use super::hash::fnv1a;
-use super::util::{Meta, ProbeStep, Scratch, alloc_image, probe_commit, read_u64};
+use super::util::{Meta, ProbeStep, Scratch, alloc_image, probe_commit, read_fields, read_u64};
 use crate::block::{BStackBlock, BStackCast};
 use crate::clone::{ClonePlan, TryCloneIn};
 use crate::layout::{BlockHeader, EightCC, HEADER_SIZE, get_u64};
@@ -207,8 +207,7 @@ impl<K: Pod, V: BStackBlock> BStackHashMap<K, V> {
 
         loop {
             // Proactively keep the load factor under 3/4 (also clears tombstones).
-            let cap = read_u64(allocator.stack(), handle + CAP_OFF)?;
-            let used = read_u64(allocator.stack(), handle + USED_OFF)?;
+            let [cap, _len, used] = read_fields::<3>(allocator.stack(), handle + CAP_OFF)?;
             if cap == 0 || (used + 1) * 4 > cap * 3 {
                 self.grow(allocator)?;
                 continue;
@@ -328,29 +327,24 @@ impl<K: Pod, V: BStackBlock> BStackHashMap<K, V> {
         let handle = self.range.start();
         let stride = Self::stride();
         let ksz = Self::ksize();
-        let table = read_u64(stack, handle + TABLE_OFF)?;
-        let cap = read_u64(stack, handle + CAP_OFF)?;
+        let [table, cap] = read_fields::<2>(stack, handle + TABLE_OFF)?;
         if cap == 0 {
             return Ok(None);
         }
         let key_bytes = bytemuck::bytes_of(key);
         let mask = cap - 1;
         let mut idx = fnv1a(key_bytes) & mask;
-        // Stack buffer for the probed key (no heap alloc for typical key sizes).
+        // One read per probed bucket (state + key + value in a single get_into).
         let mut scratch = Scratch::new();
         for _ in 0..cap {
-            let bucket = table + idx * stride;
-            let state = read_u64(stack, bucket)?;
+            let buf = scratch.buf(stride as usize);
+            stack.get_into(table + idx * stride, buf)?;
+            let state = get_u64(&buf[0..8]);
             if state == EMPTY {
                 return Ok(None);
             }
-            if state == OCCUPIED {
-                let kb = scratch.buf(ksz);
-                stack.get_into(bucket + 8, kb)?;
-                if kb == key_bytes {
-                    let vref = read_u64(stack, bucket + 8 + ksz as u64)?;
-                    return Ok(Some(Self::value_at(vref)));
-                }
+            if state == OCCUPIED && buf[8..8 + ksz] == *key_bytes {
+                return Ok(Some(Self::value_at(get_u64(&buf[8 + ksz..8 + ksz + 8]))));
             }
             idx = (idx + 1) & mask;
         }
@@ -538,14 +532,19 @@ impl<K: Pod, V: BStackBlock> BStackBlock for BStackHashMap<K, V> {
         allocator: &A,
     ) -> io::Result<()> {
         let stride = Self::stride();
-        let ksz = Self::ksize() as u64;
+        let ksz = Self::ksize();
         let handle = range.start();
-        let table = read_u64(allocator.stack(), handle + TABLE_OFF)?;
-        let cap = read_u64(allocator.stack(), handle + CAP_OFF)?;
-        for j in 0..cap {
-            let bucket = table + j * stride;
-            if read_u64(allocator.stack(), bucket)? == OCCUPIED {
-                let vref = read_u64(allocator.stack(), bucket + 8 + ksz)?;
+        let [table, cap] = read_fields::<2>(allocator.stack(), handle + TABLE_OFF)?;
+        if table == 0 {
+            return Ok(());
+        }
+        // Read the whole bucket block once, then free values from memory.
+        let mut image = vec![0u8; (cap * stride) as usize];
+        allocator.stack().get_into(table, &mut image)?;
+        for j in 0..cap as usize {
+            let lo = j * stride as usize;
+            if get_u64(&image[lo..lo + 8]) == OCCUPIED {
+                let vref = get_u64(&image[lo + 8 + ksz..lo + 16 + ksz]);
                 if vref != 0 {
                     // SAFETY: the map solely owns each value block.
                     let owned = unsafe { BStackOwned::from_raw(Self::value_at(vref)) };
@@ -553,10 +552,8 @@ impl<K: Pod, V: BStackBlock> BStackBlock for BStackHashMap<K, V> {
                 }
             }
         }
-        if table != 0 {
-            // SAFETY: the map solely owns its bucket block.
-            unsafe { dealloc_range(allocator, BStackRange::new(table, cap * stride))? };
-        }
+        // SAFETY: the map solely owns its bucket block.
+        unsafe { dealloc_range(allocator, BStackRange::new(table, cap * stride))? };
         Ok(())
     }
 
@@ -572,10 +569,7 @@ impl<K: Pod, V: BStackBlock> BStackBlock for BStackHashMap<K, V> {
         let stride = Self::stride();
         let ksz = Self::ksize();
         let handle = self.range.start();
-        let table = read_u64(allocator.stack(), handle + TABLE_OFF)?;
-        let cap = read_u64(allocator.stack(), handle + CAP_OFF)?;
-        let len = read_u64(allocator.stack(), handle + LEN_OFF)?;
-        let used = read_u64(allocator.stack(), handle + USED_OFF)?;
+        let [table, cap, len, used] = read_fields::<4>(allocator.stack(), handle + TABLE_OFF)?;
 
         let (new_table, new_cap, new_used) = if cap == 0 {
             (0, 0, 0)
