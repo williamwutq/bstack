@@ -166,13 +166,50 @@ All methods follow crash-safety principles: read operations are side-effect-free
 ### Implementation notes
 
 - **Crash consistency:** All write operations are crash-atomic. Single-write operations (`fill`, `copy_from_slice`) use direct primitives. Multi-step operations (`swap`, `reverse`, `rotate`) require the `atomic` feature to ensure atomicity via `BStack::copy`, `inplace_gen`, or other crash-atomic primitives.
-- **Memory usage:** Methods that operate on the entire slice (`reverse`, `contains`) read the full slice into memory.
 - **`BStackOwnedSlice`:** Methods for `BStackOwnedSlice` should be thin wrappers around the corresponding `BStackSlice` methods via `as_slice()` and `as_slice_mut()`, since owned slices should not perform I/O directly.
 - **`BStackByteVec` unchanged:** `BStackByteVec` already has a comprehensive API. No changes proposed.
 
 ### Open questions
 
 - **Iterator API.** Whether `BStackSlice::iter()` is worth adding, or whether `read()` followed by in-memory iteration is sufficient.
-- **Windows and chunks.** Whether to add `windows` and `chunks` iterators to enable sliding-window and fixed-size-chunk patterns.
-- **Chunked operations.** Binary search and sorting operations would benefit from chunked I/O variants are suited for more realistic work. These are valuable for large slices but would significantly expand the scope of this feature. Deferred to future work.
+- **Windows.** Whether to add a `windows` iterator to enable sliding-window patterns.
 - **Comparison operators.** Whether to implement `PartialEq<[u8]>` for `BStackSlice` and `BStackByteVec`.
+
+Chunking and sorting are addressed separately below.
+
+## Chunked slice view, sorting, search, and selection
+
+**Feature flag:** `set` (mutating chunk operations: sort/select) or no flag (read-only chunking, search); chunk movement additionally requires `atomic`, per the `BStackSlice::swap`/`rotate_*`/`copy_within` primitives proposed above.
+**Breaking change:** No — purely additive; introduces new types rather than modifying existing ones.
+
+### Motivation
+
+Data stored in a `BStackSlice`/`BStackByteVec` is rarely a flat stream meant to be sorted byte-by-byte — it's much more commonly fixed-width records (keys, struct-like entries) packed contiguously, where the caller wants to reorder whole records while leaving each record's internal bytes untouched. Byte-level `sort` is therefore not the useful primitive; the useful primitive is `std`'s `chunks_exact` pattern — dividing a slice into fixed-size units — with sorting, searching, and selection defined over those units. This was flagged as an open question in "Additional slice and vector APIs" and is developed here as its own feature, since it needs a new type rather than a method added to `BStackSlice` directly.
+
+### Design
+
+- **`BStackSlice::chunks_exact(&self, chunk_len: u64) -> BStackChunks<'a>`** — divides the slice into `chunk_len`-byte records, mirroring `[T]::chunks_exact`. Only the exact form is offered — a variable-length final chunk (`[T]::chunks`) has no natural place in a record-oriented view, since a short trailing chunk isn't a record of the type being sorted/searched/selected. A short remainder is exposed via `.remainder() -> BStackSlice<'a>`, matching `[T]::chunks_exact`; iterating `BStackChunks` yields `BStackSlice` sub-slices. Read-only construction and iteration need no feature flag.
+
+- **Sorting**, gated on `set` (+ `atomic` for movement): `BStackChunks::sort_by(&mut self, cmp: impl FnMut(&[u8], &[u8]) -> Ordering)` and `sort_by_key(&mut self, key: impl FnMut(&[u8]) -> K) where K: Ord`. No comparator-free `sort()` on raw chunk bytes is proposed — sorting undifferentiated byte records by their own byte order is rarely the caller's intent. Movement is always whole-chunk (via `swap`/`copy_within`-style primitives), so a record's bytes are moved as a unit and never split.
+
+  Internally, the implementation picks a strategy by data size — the caller sees only `sort_by`/`sort_by_key`:
+  - **Small** (chunk data fits comfortably in memory): read every chunk into an in-memory buffer, sort there with ordinary in-memory sorting, then write the result back.
+  - **Medium**: split into sections that individually fit in memory, sort each section in place, then merge adjacent sorted sections.
+  - **Large**: classic external-merge-sort — same sort-section-then-merge idea as medium, generalized to multiple sections and multiple merge passes (k-way or repeated pairwise merge) so no single pass needs more than one section resident at once.
+
+  The medium/large split is the same algorithm at different scale (external sort is section-sort-then-merge applied recursively); "small" is just the degenerate one-section case. Thresholds are an implementation detail, not part of the public contract.
+
+  **Whole-sort atomicity.** `sort_by`/`sort_by_key` commit as a single crash-atomic transaction (journaled multi-write, extending the `inplace_gen` machinery to a batch computed ahead of time rather than issued live): a crash during sort leaves either the pre-sort order or the fully-sorted order, never an intermediate permutation. This is necessary because the small/medium/large strategies above write back in a different shape than a simple swap sequence (e.g. a full rewrite for "small"), so per-swap atomicity alone wouldn't give a caller a stable story across strategies.
+
+  **`sort_partial_by`/`sort_partial_by_key`** — a variant that is explicitly allowed to stop early and leave the data only partially sorted (e.g. after some bounded number of merge passes or sections, for a large slice where a full sort is prohibitively expensive but an approximately-sorted result is acceptable). "Partial" only ever means *not fully ordered*, never corrupted or lost data: every completed step (section sort, merge pass) is itself committed atomically, so the visible state after a partial sort is always some valid permutation of the original records.
+
+- **Binary search.** `BStackChunks::binary_search_by(&self, cmp: impl FnMut(&[u8]) -> Ordering) -> Result<u64, u64>` and `binary_search_by_key` — standard binary search over chunks, requiring the chunks already be ordered by the same key/comparator (caller's responsibility, as in `std`). Read-only, no feature flag.
+
+- **Quickselect.** `BStackChunks::select_nth_by(&mut self, n: u64, cmp: impl FnMut(&[u8], &[u8]) -> Ordering)` / `select_nth_by_key`, mirroring `[T]::select_nth_unstable_by(_key)`: partitions chunks so the `n`th is in its sorted position, with unspecified order on either side. Gated on `set` (+ `atomic`), same whole-operation atomicity guarantee as `sort_by` — a crash leaves either the original order or a valid completed partition, never a half-applied one.
+
+### Open questions
+
+- **Unstable variants.** Whether to also provide `sort_unstable_by`/`sort_unstable_by_key`, mirroring `std`'s stable/unstable split, given unstable sort does fewer chunk moves at the cost of stability.
+- **Section/threshold sizing.** How the small/medium/large boundary and section size are chosen — fixed constant, fraction of available memory, or caller-configurable — and how that interacts with `select_nth_by`'s partitioning for very large slices (quickselect also needs random access across the full range, so it may need its own out-of-core strategy rather than assuming in-memory partitioning).
+- **`chunks_mut`.** Whether mutable, non-sort chunk iteration (for per-chunk in-place editing without a full sort) is worth exposing alongside the sort/select-specific API.
+- **Naming.** `BStackChunks` is a working name.
