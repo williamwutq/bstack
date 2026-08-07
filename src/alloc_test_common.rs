@@ -223,10 +223,10 @@ pub(crate) fn make_payload<R: rand::RngExt>(
     cfg: &FuzzConfig,
     rng: &mut R,
 ) -> Payload {
-    if rng.random_range(0..100) < cfg.adversarial_pct {
-        if let Some(bytes) = adversarial_bytes(stack, len, rng) {
-            return Payload::Raw(bytes);
-        }
+    if rng.random_range(0..100) < cfg.adversarial_pct
+        && let Some(bytes) = adversarial_bytes(stack, len, rng)
+    {
+        return Payload::Raw(bytes);
     }
     Payload::Seeded(id)
 }

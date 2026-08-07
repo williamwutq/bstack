@@ -674,7 +674,11 @@ mod tests {
 
     #[test]
     fn test_untracked_disjoint_alloc_is_allowed() {
-        let c = DebugCheckingAllocator::with_state(MockAllocator, [0..100], [200..300]);
+        let c = DebugCheckingAllocator::with_state(
+            MockAllocator,
+            core::iter::once(0..100),
+            core::iter::once(200..300),
+        );
         c.record_allocation(120, 50);
 
         let state = c.state.lock().unwrap();
@@ -1029,7 +1033,7 @@ mod tests {
         let _guard = TestGuard(path);
         let config = Rc::new(RefCell::new(MockAllocatorConfig::default()));
         let inner = ControllableMockAllocator::new(stack, config.clone());
-        let alloc = DebugCheckingAllocator::with_state(inner, [], [150..300]);
+        let alloc = DebugCheckingAllocator::with_state(inner, [], core::iter::once(150..300));
 
         let handle = alloc.alloc(100)?;
         alloc.inner().next_offset.set(150);
@@ -1304,7 +1308,7 @@ mod tests {
         let inner = ControllableMockAllocator::new(stack, config);
         let alloc = DebugCheckingAllocator::new(inner);
 
-        let handles = alloc.alloc_bulk(&[100, 200, 300])?;
+        let handles = alloc.alloc_bulk([100, 200, 300])?;
         assert_eq!(handles.len(), 3);
 
         {
@@ -1327,7 +1331,7 @@ mod tests {
         let inner = ControllableMockAllocator::new(stack, config);
         let alloc = DebugCheckingAllocator::new(inner);
 
-        let handles = alloc.alloc_bulk(&[100, 200, 300])?;
+        let handles = alloc.alloc_bulk([100, 200, 300])?;
 
         alloc.dealloc_bulk(handles).map_err(|e| e.source)?;
 
@@ -1351,7 +1355,7 @@ mod tests {
         let inner = ControllableMockAllocator::new(stack, config.clone());
         let alloc = DebugCheckingAllocator::new(inner);
 
-        let handles = alloc.alloc_bulk(&[100, 200, 300])?;
+        let handles = alloc.alloc_bulk([100, 200, 300])?;
 
         config.borrow_mut().fail_dealloc_bulk = true;
 
@@ -1386,14 +1390,18 @@ mod tests {
         let inner = ControllableMockAllocator::new(stack, config);
         let alloc = DebugCheckingAllocator::new(inner);
 
-        let handles = alloc.alloc_bulk(&[100, 200]).unwrap();
+        let handles = alloc.alloc_bulk([100, 200]).unwrap();
         alloc.dealloc_bulk(handles).ok().unwrap();
         alloc.record_deallocation(0, 100);
     }
 
     #[test]
     fn test_with_state_valid_disjoint_ranges() {
-        let c = DebugCheckingAllocator::with_state(MockAllocator, [0..100, 200..300], [400..500]);
+        let c = DebugCheckingAllocator::with_state(
+            MockAllocator,
+            [0..100, 200..300],
+            core::iter::once(400..500),
+        );
         let state = c.state.lock().unwrap();
         assert_eq!(state.allocated.len(), 2);
         assert_eq!(state.freed.len(), 1);

@@ -1387,7 +1387,7 @@ mod tests {
         let mut a = alloc.alloc(64).unwrap();
         let b = alloc.alloc(64).unwrap();
         let a_start = a.start();
-        a.write(&[0xAAu8; 64]).unwrap();
+        a.write([0xAAu8; 64]).unwrap();
         alloc.dealloc(a).unwrap();
         // Read the raw bytes where a used to live.
         let raw = alloc.stack().get(a_start, a_start + 64).unwrap();
@@ -1405,7 +1405,7 @@ mod tests {
         let _g = Guard(path);
         let slices: Vec<_> = (0..16).map(|i| alloc.alloc(i * 7 + 1).unwrap()).collect();
         for s in &slices {
-            if s.len() > 0 {
+            if !s.is_empty() {
                 // Arena starts at payload offset 48; the 16-byte BStack header means
                 // all payload offsets ≡ 16 (mod 32) map to 32-byte-aligned disk addresses.
                 assert_eq!(
@@ -1473,7 +1473,7 @@ mod tests {
         let (alloc, path) = open_fresh();
         let _g = Guard(path);
         let mut s = alloc.alloc(32).unwrap();
-        s.write(&[0x5Au8; 32]).unwrap();
+        s.write([0x5Au8; 32]).unwrap();
         let start = s.start();
         // Realloc to a different len with the same aligned block size.
         let s2 = alloc.realloc(s, 16).unwrap();
@@ -1491,7 +1491,7 @@ mod tests {
         let _g = Guard(path);
         let mut s = alloc.alloc(128).unwrap();
         let start = s.start();
-        s.write(&[0xBBu8; 128]).unwrap();
+        s.write([0xBBu8; 128]).unwrap();
         let s2 = alloc.realloc(s, 32).unwrap();
         assert_eq!(s2.start(), start);
         assert_eq!(alloc.stack().len().unwrap(), start + 32);
@@ -1507,7 +1507,7 @@ mod tests {
         let mut s = alloc.alloc(128).unwrap();
         let anchor = alloc.alloc(32).unwrap();
         let start = s.start();
-        s.write(&[0xCCu8; 128]).unwrap();
+        s.write([0xCCu8; 128]).unwrap();
         let stack_len = alloc.stack().len().unwrap();
         let s2 = alloc.realloc(s, 32).unwrap();
         assert_eq!(s2.start(), start);
@@ -1527,7 +1527,7 @@ mod tests {
         let _g = Guard(path);
         let mut s = alloc.alloc(32).unwrap();
         let start = s.start();
-        s.write(&[0xDDu8; 32]).unwrap();
+        s.write([0xDDu8; 32]).unwrap();
         let s2 = alloc.realloc(s, 96).unwrap();
         assert_eq!(s2.start(), start);
         let buf = s2.read().unwrap();
@@ -1542,7 +1542,7 @@ mod tests {
         let _g = Guard(path);
         let mut s = alloc.alloc(32).unwrap();
         let anchor = alloc.alloc(32).unwrap();
-        s.write(&[0xEEu8; 32]).unwrap();
+        s.write([0xEEu8; 32]).unwrap();
         let s2 = alloc.realloc(s, 96).unwrap();
         // s2 is a new allocation (different address from anchor).
         assert_ne!(s2.start(), anchor.start());
@@ -1652,7 +1652,7 @@ mod tests {
         let _g = Guard(path.clone());
         let mut s = alloc.alloc(64).unwrap();
         let start = s.start();
-        s.write(&[0xABu8; 64]).unwrap();
+        s.write([0xABu8; 64]).unwrap();
         drop(alloc.into_stack());
 
         let alloc2 = reopen(&path);
@@ -1712,7 +1712,7 @@ mod tests {
                             let mut set = live.lock().unwrap();
                             assert!(set.insert(off), "duplicate live offset {off}");
                         }
-                        slice.write(&[tid as u8; 32]).unwrap();
+                        slice.write([tid as u8; 32]).unwrap();
                         let data = slice.read().unwrap();
                         assert_eq!(data, vec![tid as u8; 32]);
                         {
@@ -1762,7 +1762,7 @@ mod tests {
                     let mut slice = a.alloc(SMALL).unwrap();
                     slice
                         .as_slice_mut()
-                        .write(&[tid as u8; SMALL as usize])
+                        .write([tid as u8; SMALL as usize])
                         .unwrap();
 
                     for _ in 0..ROUNDS {
@@ -1837,7 +1837,7 @@ mod tests {
                         }
                         for (s, &sz) in slices.iter_mut().zip(SIZES.iter()) {
                             s.as_slice_mut()
-                                .write(&vec![tid as u8; sz as usize])
+                                .write(vec![tid as u8; sz as usize])
                                 .unwrap();
                             let data = s.read().unwrap();
                             assert_eq!(data, vec![tid as u8; sz as usize]);

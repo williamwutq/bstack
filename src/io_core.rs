@@ -201,7 +201,7 @@ pub(crate) fn durable_sync(file: &File) -> io::Result<()> {
     #[cfg(all(test, debug_assertions))]
     {
         let _ = file;
-        return Ok(());
+        Ok(())
     }
     #[cfg(not(all(test, debug_assertions)))]
     {

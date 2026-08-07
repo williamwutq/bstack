@@ -271,7 +271,7 @@ mod tests {
         let _g = Guard(p);
 
         let off0 = s.push(b"abc").unwrap();
-        let off1 = s.push(&[]).unwrap();
+        let off1 = s.push([]).unwrap();
         let off2 = s.push(b"def").unwrap();
 
         assert_eq!(off0, 0);
@@ -793,7 +793,7 @@ mod tests {
 
         let n = 100 * 1024usize; // > MOVE_CHUNK
         let mut payload = vec![b'A'; n];
-        payload.extend(std::iter::repeat(b'B').take(n));
+        payload.extend(std::iter::repeat_n(b'B', n));
         s.push(&payload).unwrap();
 
         s.cross_exchange(0, n as u64, n as u64).unwrap(); // swap [0,n) with [n,2n)
@@ -2132,7 +2132,7 @@ mod tests {
         for i in 0..RECORDS {
             let mut rec = [0u8; RSIZE as usize];
             rec[0] = i as u8;
-            s.push(&rec).unwrap();
+            s.push(rec).unwrap();
         }
 
         let s = Arc::new(s);
@@ -2184,7 +2184,7 @@ mod tests {
                             let mut data = [0u8; ITEM];
                             data[0] = t as u8;
                             data[1..9].copy_from_slice(&(i as u64).to_le_bytes());
-                            let off = s.push(&data).unwrap();
+                            let off = s.push(data).unwrap();
                             (off, t, i)
                         })
                         .collect::<Vec<_>>()
@@ -2234,7 +2234,7 @@ mod tests {
                 let s = Arc::clone(&s);
                 thread::spawn(move || {
                     for _ in 0..PUSHES_PER_THREAD {
-                        s.push(&[0xBEu8; ITEM as usize]).unwrap();
+                        s.push([0xBEu8; ITEM as usize]).unwrap();
                     }
                 })
             })
@@ -3521,7 +3521,7 @@ mod first_fit_tests {
             // Push 48 bytes with wrong magic
             let mut hdr = [0u8; 48];
             hdr[16..24].copy_from_slice(b"WRONGHDR");
-            stack.push(&hdr).unwrap();
+            stack.push(hdr).unwrap();
         }
         let stack = BStack::open(&path).unwrap();
         assert!(FirstFitBStackAllocator::new(stack).is_err());
@@ -3965,7 +3965,7 @@ mod first_fit_tests {
         let mut b = alloc.alloc(80).unwrap();
         let _c = alloc.alloc(16).unwrap();
         // Write garbage into B so the overlap area is dirty before freeing.
-        b.write(&vec![0xFFu8; 80]).unwrap();
+        b.write(vec![0xFFu8; 80]).unwrap();
         alloc.dealloc(b).unwrap();
         let _a2 = alloc.realloc(a, 32).unwrap(); // merge + split
         let rem = alloc.alloc(64).unwrap();
@@ -4055,12 +4055,12 @@ mod first_fit_tests {
             let mut alff = [0u8; 48];
             alff[16..24].copy_from_slice(b"ALFF\x00\x01\x01\x00");
             alff[24..28].copy_from_slice(&1u32.to_le_bytes()); // recovery_needed
-            stack.push(&alff).unwrap();
+            stack.push(alff).unwrap();
 
             // Block A header: size=80, flags=0 (allocated, but header not yet shrunk)
             let mut a_hdr = [0u8; 16];
             a_hdr[..8].copy_from_slice(&80u64.to_le_bytes());
-            stack.push(&a_hdr).unwrap();
+            stack.push(a_hdr).unwrap();
 
             // Block A payload (80 bytes): inner footer + second sub-block embedded
             let mut a_pay = [0u8; 80];
@@ -4071,16 +4071,16 @@ mod first_fit_tests {
             // [48..52): is_free = 1
             a_pay[48..52].copy_from_slice(&1u32.to_le_bytes());
             // [52..80): zeros (reserved + second sub-block payload)
-            stack.push(&a_pay).unwrap();
+            stack.push(a_pay).unwrap();
 
             // Outer footer: F=24
-            stack.push(&24u64.to_le_bytes()).unwrap();
+            stack.push(24u64.to_le_bytes()).unwrap();
 
             // Sentinel block: header(size=16,flags=0) + payload(16 zeros) + footer(16)
             let mut sent = [0u8; 40];
             sent[..8].copy_from_slice(&16u64.to_le_bytes());
             sent[32..40].copy_from_slice(&16u64.to_le_bytes());
-            stack.push(&sent).unwrap();
+            stack.push(sent).unwrap();
         }
 
         let alloc = FirstFitBStackAllocator::new(BStack::open(&path).unwrap()).unwrap();
@@ -4142,9 +4142,9 @@ mod first_fit_tests {
         let stack = alloc.into_stack();
 
         // Corrupt: set recovery_needed=1 and scramble free_head to garbage
-        stack.set(24, &1u32.to_le_bytes()).unwrap(); // flags byte → recovery_needed=1
+        stack.set(24, 1u32.to_le_bytes()).unwrap(); // flags byte → recovery_needed=1
         stack
-            .set(FREE_HEAD_OFFSET, &0xDEADBEEFu64.to_le_bytes())
+            .set(FREE_HEAD_OFFSET, 0xDEADBEEFu64.to_le_bytes())
             .unwrap();
         drop(stack);
 
@@ -4299,7 +4299,7 @@ mod first_fit_tests {
                 thread::spawn(move || {
                     let pat = (tid as u8).wrapping_add(0x40);
                     let mut slice = alloc.alloc(16).unwrap();
-                    slice.write(&vec![pat; 16]).unwrap();
+                    slice.write(vec![pat; 16]).unwrap();
                     let mut prev_len = 16u64;
 
                     // Sizes oscillate up and down to exercise both branches.
@@ -4322,7 +4322,7 @@ mod first_fit_tests {
 
                         // Re-stamp the full new length so the next iteration
                         // can re-verify against `pat`.
-                        slice.write(&vec![pat; new_len as usize]).unwrap();
+                        slice.write(vec![pat; new_len as usize]).unwrap();
                         prev_len = new_len;
                     }
 
@@ -4513,6 +4513,7 @@ mod first_fit_tests {
 // Atomic compound-operation tests
 
 #[cfg(all(test, feature = "atomic"))]
+#[allow(clippy::missing_transmute_annotations)]
 mod atomic_tests {
     use crate::BStack;
     use std::io::ErrorKind;
@@ -6331,7 +6332,7 @@ mod atomic_tests {
         // read the same value and one increment would be lost.
         let (s, p) = mk_stack();
         let _g = Guard(p);
-        s.push(&0u64.to_le_bytes()).unwrap();
+        s.push(0u64.to_le_bytes()).unwrap();
         let s = Arc::new(s);
 
         const THREADS: usize = 8;
@@ -6800,9 +6801,9 @@ mod atomic_tests {
         // Several disjoint edits with gaps between them; a later read across the
         // whole payload must reflect exactly the edited spans (binary search must
         // locate the contiguous intersecting run correctly).
-        let a = vec![b'A'; 4]; // [2, 6)
-        let b = vec![b'B'; 4]; // [10, 14)
-        let c = vec![b'C'; 4]; // [22, 26)
+        let a = [b'A'; 4]; // [2, 6)
+        let b = [b'B'; 4]; // [10, 14)
+        let c = [b'C'; 4]; // [22, 26)
         let mut rbuf = [0u8; 30];
         let mut step = 0usize;
         s.inplace_gen(|res| {
@@ -6850,8 +6851,8 @@ mod atomic_tests {
         s.push(vec![b'.'; 10]).unwrap();
 
         // a<b<c<d: write a..c then b..d — commits a..b (first), b..d (second).
-        let first = vec![b'1'; 6]; // [0, 6)
-        let second = vec![b'2'; 6]; // [3, 9)
+        let first = [b'1'; 6]; // [0, 6)
+        let second = [b'2'; 6]; // [3, 9)
         let mut step = 0usize;
         s.inplace_gen(|_res| {
             let r = match step {
@@ -6887,10 +6888,10 @@ mod atomic_tests {
         //   2. [14, 18) = '2'                          (a gap after it)
         //   3. [6, 8)   = '3'  -> old encloses new     (splits edit 1 in three)
         //   4. [2, 16)  = '4'  -> new encloses several (drops 3, trims 1 and 2)
-        let e1 = vec![b'1'; 8];
-        let e2 = vec![b'2'; 4];
-        let e3 = vec![b'3'; 2];
-        let e4 = vec![b'4'; 14];
+        let e1 = [b'1'; 8];
+        let e2 = [b'2'; 4];
+        let e3 = [b'3'; 2];
+        let e4 = [b'4'; 14];
         let mut step = 0usize;
         s.inplace_gen(|res| {
             assert!(res.is_ok());
@@ -7346,7 +7347,7 @@ mod atomic_tests {
         let (s, p) = mk_stack();
         let _g = Guard(p);
         s.push(b"hello").unwrap();
-        let results = s.get_batched([3..3]).unwrap();
+        let results = s.get_batched(core::iter::once(3..3)).unwrap();
         assert_eq!(results.len(), 1);
         assert!(results[0].is_empty());
     }
@@ -7357,7 +7358,7 @@ mod atomic_tests {
         let (s, p) = mk_stack();
         let _g = Guard(p);
         s.push(b"hello").unwrap();
-        let err = s.get_batched([0..10]).unwrap_err();
+        let err = s.get_batched(core::iter::once(0..10)).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
     }
 
@@ -7367,7 +7368,8 @@ mod atomic_tests {
         let (s, p) = mk_stack();
         let _g = Guard(p);
         s.push(b"helloworld").unwrap();
-        let err = s.get_batched([5..3]).unwrap_err();
+        #[allow(clippy::reversed_empty_ranges)]
+        let err = s.get_batched(core::iter::once(5..3)).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
     }
 

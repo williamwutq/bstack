@@ -1103,7 +1103,7 @@ mod tests {
                             let mut set = live.lock().unwrap();
                             assert!(set.insert(off), "duplicate live offset {off}");
                         }
-                        slice.write(&[tid as u8; 16]).unwrap();
+                        slice.write([tid as u8; 16]).unwrap();
                         let data = slice.read().unwrap();
                         assert_eq!(data, vec![tid as u8; 16]);
                         {
@@ -1152,7 +1152,7 @@ mod tests {
                     let mut slice = a.alloc(SMALL).unwrap();
                     slice
                         .as_slice_mut()
-                        .write(&[tid as u8; SMALL as usize])
+                        .write([tid as u8; SMALL as usize])
                         .unwrap();
 
                     for _ in 0..ROUNDS {
