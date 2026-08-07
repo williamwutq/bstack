@@ -23,6 +23,7 @@
 //! | [`BStackCountingBloomFilter<K>`] | (Bloom filter) | a probabilistic set: no false negatives, supports removal; a cheap fast-reject front for exact lookups. |
 //! | [`BStackHashSet<K>`] | [`std::collections::HashSet`] | an owned open-addressing set of `Pod` keys, with an embedded Bloom-filter fast-reject front. |
 //! | [`BStackBTreeSet<K>`] | [`std::collections::BTreeSet`] | an owned **ordered** set (copy-on-write B-tree, sorted iteration), with an embedded Bloom-filter front. Keys are `Pod + Ord`. |
+//! | [`BStackBinaryHeap<K, V>`] | [`std::collections::BinaryHeap`] | an owned priority queue (array-backed binary **min**-heap, pointer-free): `pop` returns the smallest-key entry. Keys are `Pod + Ord`. |
 
 mod bloom;
 mod boxed;
@@ -31,6 +32,7 @@ mod cow;
 mod deque;
 mod hash;
 mod hashset;
+mod heap;
 mod list;
 mod map;
 mod string;
@@ -43,6 +45,7 @@ pub use btreeset::{BStackBTreeSet, TreeSetOnDisk};
 pub use cow::BStackCow;
 pub use deque::{BStackDeque, DequeOnDisk};
 pub use hashset::{BStackHashSet, HashSetOnDisk};
+pub use heap::{BStackBinaryHeap, HeapOnDisk};
 pub use list::{BStackLinkedList, ListOnDisk, NodeOnDisk};
 pub use map::{BStackHashMap, MapOnDisk};
 pub use string::{BStackString, StringOnDisk};

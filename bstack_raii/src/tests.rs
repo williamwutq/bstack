@@ -14,11 +14,11 @@ use bstack::{
 
 use crate::layout::{self, BlockHeader};
 use crate::{
-    AutoDrop, BStackBTreeMap, BStackBTreeSet, BStackBlock, BStackBlockVec, BStackBox, BStackCast,
-    BStackCastAs, BStackCastInto, BStackCountingBloomFilter, BStackCow, BStackDeque, BStackDrop,
-    BStackHashMap, BStackHashSet, BStackLinkedList, BStackOwned, BStackRc, BStackRef, BStackShared,
-    BStackString, BStackWeakable, EightCC, TryClone, TryCloneIn, alloc_block, alloc_control,
-    bstack_block, bstack_cast, bstack_enum, bstack_move, dealloc_range,
+    AutoDrop, BStackBTreeMap, BStackBTreeSet, BStackBinaryHeap, BStackBlock, BStackBlockVec,
+    BStackBox, BStackCast, BStackCastAs, BStackCastInto, BStackCountingBloomFilter, BStackCow,
+    BStackDeque, BStackDrop, BStackHashMap, BStackHashSet, BStackLinkedList, BStackOwned, BStackRc,
+    BStackRef, BStackShared, BStackString, BStackWeakable, EightCC, TryClone, TryCloneIn,
+    alloc_block, alloc_control, bstack_block, bstack_cast, bstack_enum, bstack_move, dealloc_range,
 };
 
 // --------------------------------------------------------------------------
@@ -5883,4 +5883,120 @@ fn stdlib_string_extra_methods() {
     assert_eq!(s.handle().char_count(stack).unwrap(), 0);
 
     s.bstack_drop(&alloc).unwrap();
+}
+
+// --------------------------------------------------------------------------
+// stdlib: BStackBinaryHeap<K, V> — priority queue (binary min-heap)
+// --------------------------------------------------------------------------
+
+#[test]
+fn stdlib_heap_pop_ascending() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let heap = BStackBinaryHeap::<u32, MacroLeaf>::new(&alloc).unwrap();
+    assert!(heap.is_empty(stack).unwrap());
+    assert!(heap.peek(stack).unwrap().is_none());
+    assert!(heap.pop(&alloc).unwrap().is_none());
+
+    // Push 0..50 in a scrambled (bijective) order; forces growth.
+    for i in 0..50u32 {
+        let k = (i * 17) % 50;
+        heap.push(&alloc, k, MacroLeaf::new(&alloc, k * 10).unwrap())
+            .unwrap();
+    }
+    assert_eq!(heap.len(stack).unwrap(), 50);
+    assert_eq!(heap.peek(stack).unwrap().unwrap().0, 0); // min on top
+
+    // Pop drains in ascending key order, with the right values.
+    for expected in 0..50u32 {
+        let (k, v) = heap.pop(&alloc).unwrap().unwrap();
+        assert_eq!(k, expected);
+        assert_eq!(v.handle().val(stack).unwrap(), expected * 10);
+        v.bstack_drop(&alloc).unwrap();
+    }
+    assert!(heap.is_empty(stack).unwrap());
+    assert!(heap.pop(&alloc).unwrap().is_none());
+
+    heap.bstack_drop(&alloc).unwrap();
+}
+
+#[test]
+fn stdlib_heap_duplicate_keys() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let heap = BStackBinaryHeap::<u32, MacroLeaf>::new(&alloc).unwrap();
+    for (k, v) in [(3u32, 30u32), (1, 10), (3, 31), (1, 11), (2, 20)] {
+        heap.push(&alloc, k, MacroLeaf::new(&alloc, v).unwrap())
+            .unwrap();
+    }
+    // Keys come out sorted (values within equal keys unspecified).
+    let mut keys = Vec::new();
+    while let Some((k, v)) = heap.pop(&alloc).unwrap() {
+        keys.push(k);
+        v.bstack_drop(&alloc).unwrap();
+    }
+    assert_eq!(keys, vec![1, 1, 2, 3, 3]);
+
+    heap.bstack_drop(&alloc).unwrap();
+}
+
+#[test]
+fn stdlib_heap_drop_is_recursive() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+
+    let leaf = MacroLeaf::new(&alloc, 10).unwrap();
+    let leaf_start = leaf.handle().range().start();
+    let parent = MacroParent::new(&alloc, leaf, 1).unwrap();
+
+    let heap = BStackBinaryHeap::<u32, MacroParent>::new(&alloc).unwrap();
+    heap.push(&alloc, 5, parent).unwrap();
+    heap.bstack_drop(&alloc).unwrap();
+
+    // The leaf grandchild's slot is reclaimed — full recursion through a value.
+    let reused = MacroLeaf::new(&alloc, 0).unwrap();
+    assert_eq!(reused.handle().range().start(), leaf_start);
+    reused.bstack_drop(&alloc).unwrap();
+}
+
+#[test]
+fn stdlib_heap_deep_clone_is_independent() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let heap = BStackBinaryHeap::<u32, MacroLeaf>::new(&alloc).unwrap();
+    for k in [5u32, 1, 4, 2, 3] {
+        heap.push(&alloc, k, MacroLeaf::new(&alloc, k * 10).unwrap())
+            .unwrap();
+    }
+    let clone = heap.try_clone_in(&alloc).unwrap();
+    // Fresh value blocks.
+    assert_ne!(
+        clone.peek(stack).unwrap().unwrap().1.range().start(),
+        heap.peek(stack).unwrap().unwrap().1.range().start(),
+    );
+    // Draining the clone leaves the original intact.
+    for expected in 1..=5u32 {
+        let (k, v) = clone.pop(&alloc).unwrap().unwrap();
+        assert_eq!(k, expected);
+        v.bstack_drop(&alloc).unwrap();
+    }
+    assert_eq!(heap.len(stack).unwrap(), 5);
+    assert_eq!(heap.peek(stack).unwrap().unwrap().0, 1);
+
+    clone.bstack_drop(&alloc).unwrap();
+    heap.bstack_drop(&alloc).unwrap();
+}
+
+#[test]
+fn stdlib_heap_distinct_tags() {
+    assert_ne!(
+        <BStackBinaryHeap<u32, MacroLeaf> as BStackCast>::eightcc(),
+        <BStackBinaryHeap<u64, MacroLeaf> as BStackCast>::eightcc(),
+    );
 }
