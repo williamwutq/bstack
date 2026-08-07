@@ -123,35 +123,6 @@ impl<'a, A: BStackOwnedSliceAllocator> fmt::Debug for BStackByteVec<'a, A> {
     }
 }
 
-/// Location equality: whether two vecs occupy the same backing block.
-///
-/// Compares the backing allocation's coordinates (header included), not
-/// contents — a vec that has been reallocated (e.g. by [`push`](Self::push)
-/// triggering growth) is no longer equal to its former self even if the bytes
-/// are identical.
-impl<'a, A: BStackOwnedSliceAllocator> PartialEq for BStackByteVec<'a, A> {
-    #[inline]
-    fn eq(&self, other: &Self) -> bool {
-        self.slice.as_range() == other.slice.as_range()
-    }
-}
-
-/// Location equality against a [`BStackSlice`]: whether the vec's backing
-/// block and the slice refer to the same coordinates.
-impl<'a, A: BStackOwnedSliceAllocator> PartialEq<BStackSlice<'a>> for BStackByteVec<'a, A> {
-    #[inline]
-    fn eq(&self, other: &BStackSlice<'a>) -> bool {
-        self.slice.as_range() == other.as_range()
-    }
-}
-
-impl<'a, A: BStackOwnedSliceAllocator> PartialEq<BStackByteVec<'a, A>> for BStackSlice<'a> {
-    #[inline]
-    fn eq(&self, other: &BStackByteVec<'a, A>) -> bool {
-        other == self
-    }
-}
-
 impl<'a, A: BStackOwnedSliceAllocator> BStackByteVec<'a, A> {
     fn block_size(capacity: u64) -> io::Result<u64> {
         capacity.checked_add(HEADER_LEN).ok_or_else(|| {
@@ -1679,34 +1650,4 @@ mod tests {
         assert_eq!(v.read_bytes().unwrap(), [1, 2, 3]);
     }
 
-    #[test]
-    fn partial_eq_vec_vec_is_by_location_not_content() {
-        let (alloc, path) = make_alloc();
-        let _g = Guard(path);
-        let v1 = BStackByteVec::from_slice(&[1, 2, 3], &alloc).unwrap();
-        let v2 = BStackByteVec::from_slice(&[1, 2, 3], &alloc).unwrap();
-        // Identical content, distinct backing blocks: unequal by location.
-        assert_ne!(v1, v2);
-        // A reallocated vec no longer equals a slice snapshot of its old block.
-        let mut v3 = BStackByteVec::with_capacity(1, &alloc).unwrap();
-        let old_block = unsafe { v3.raw_block() };
-        v3.push(1).unwrap();
-        v3.push(2).unwrap(); // triggers growth: v3 now lives at a new block
-        assert_ne!(v3, old_block);
-    }
-
-    #[test]
-    fn partial_eq_vec_slice_same_location() {
-        let (alloc, path) = make_alloc();
-        let _g = Guard(path);
-        let v = BStackByteVec::from_slice(&[1, 2, 3], &alloc).unwrap();
-        // A vec is equal (by location) to a raw slice view of its own block.
-        let block = unsafe { v.raw_block() };
-        assert_eq!(v, block);
-        assert_eq!(block, v);
-        // But not to a slice over a different vec's block.
-        let other = BStackByteVec::from_slice(&[1, 2, 3], &alloc).unwrap();
-        let other_block = unsafe { other.raw_block() };
-        assert_ne!(v, other_block);
-    }
 }
