@@ -356,6 +356,54 @@ impl<K: Pod, V: BStackBlock> BStackHashMap<K, V> {
         Ok(self.get(stack, key)?.is_some())
     }
 
+    /// Get the value for `key`, inserting one produced by `f` if absent — the
+    /// fused entry operation. Returns `(value handle, was_newly_inserted)`.
+    ///
+    /// If `key` is already present this is a single probe: `f` is **not** called
+    /// and nothing is allocated. Existing values are never replaced (use
+    /// [`insert`](Self::insert) for that). The returned handle is mutable in
+    /// place, and the `bool` distinguishes a fresh insert from a hit (e.g. to
+    /// increment an existing counter). **Single-writer** — do not mutate the map
+    /// concurrently across this call.
+    pub fn get_or_insert_with<A, F>(&self, allocator: &A, key: K, f: F) -> io::Result<(V, bool)>
+    where
+        A: BStackOwnedSliceAllocator,
+        F: FnOnce() -> io::Result<BStackOwned<V>>,
+    {
+        if let Some(v) = self.get(allocator.stack(), &key)? {
+            return Ok((v, false));
+        }
+        let value = f()?;
+        let vref = value.handle().range().start();
+        // Absent per the probe above, so `insert` returns no prior value; reclaim
+        // one defensively if a race produced it.
+        if let Some(old) = self.insert(allocator, key, value)? {
+            old.bstack_drop(allocator)?;
+        }
+        Ok((Self::value_at(vref), true))
+    }
+
+    /// Like [`get_or_insert_with`](Self::get_or_insert_with) but with an eager
+    /// `default`. If `key` is present, `default` is **freed** (its block is
+    /// dropped) — prefer the `_with` form to avoid allocating a value you may not
+    /// use.
+    pub fn get_or_insert<A: BStackOwnedSliceAllocator>(
+        &self,
+        allocator: &A,
+        key: K,
+        default: BStackOwned<V>,
+    ) -> io::Result<(V, bool)> {
+        if let Some(v) = self.get(allocator.stack(), &key)? {
+            default.bstack_drop(allocator)?;
+            return Ok((v, false));
+        }
+        let vref = default.handle().range().start();
+        if let Some(old) = self.insert(allocator, key, default)? {
+            old.bstack_drop(allocator)?;
+        }
+        Ok((Self::value_at(vref), true))
+    }
+
     /// A lazy iterator over all `(key, value)` entries in **unspecified** order,
     /// yielding `io::Result`. A read snapshot: do not mutate the map while
     /// iterating (mutating a yielded value block is fine).

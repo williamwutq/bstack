@@ -6138,3 +6138,99 @@ fn stdlib_btreeset_iter_and_range() {
 
     set.bstack_drop(&alloc).unwrap();
 }
+
+// --------------------------------------------------------------------------
+// stdlib: entry API (get_or_insert_with / get_or_insert)
+// --------------------------------------------------------------------------
+
+#[test]
+fn stdlib_map_entry() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+    let map = BStackHashMap::<u32, MacroLeaf>::new(&alloc).unwrap();
+
+    // Absent: inserts, f produced the value.
+    let (v, inserted) = map
+        .get_or_insert_with(&alloc, 7, || MacroLeaf::new(&alloc, 70))
+        .unwrap();
+    assert!(inserted);
+    assert_eq!(v.val(stack).unwrap(), 70);
+
+    // Present: single probe, f NOT called, value unchanged.
+    map.insert(&alloc, 5, MacroLeaf::new(&alloc, 50).unwrap())
+        .unwrap();
+    let called = std::cell::Cell::new(false);
+    let (v, inserted) = map
+        .get_or_insert_with(&alloc, 5, || {
+            called.set(true);
+            MacroLeaf::new(&alloc, 999)
+        })
+        .unwrap();
+    assert!(!inserted);
+    assert!(!called.get(), "f must not run on a hit");
+    assert_eq!(v.val(stack).unwrap(), 50);
+
+    // Eager get_or_insert frees the unused default on a hit.
+    let (v, inserted) = map
+        .get_or_insert(&alloc, 5, MacroLeaf::new(&alloc, 111).unwrap())
+        .unwrap();
+    assert!(!inserted);
+    assert_eq!(v.val(stack).unwrap(), 50);
+
+    map.bstack_drop(&alloc).unwrap();
+}
+
+#[test]
+fn stdlib_map_entry_counter() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+    // The headline entry pattern: a counter map with in-place value mutation.
+    let counts = BStackHashMap::<u32, BStackBox<u64>>::new(&alloc).unwrap();
+    for k in [1u32, 1, 2, 1, 2, 1] {
+        let (v, inserted) = counts
+            .get_or_insert_with(&alloc, k, || BStackBox::new(&alloc, 1u64))
+            .unwrap();
+        if !inserted {
+            let cur = v.get(stack).unwrap();
+            v.set(&alloc, cur + 1).unwrap();
+        }
+    }
+    assert_eq!(
+        counts.get(stack, &1).unwrap().unwrap().get(stack).unwrap(),
+        4
+    );
+    assert_eq!(
+        counts.get(stack, &2).unwrap().unwrap().get(stack).unwrap(),
+        2
+    );
+    counts.bstack_drop(&alloc).unwrap();
+}
+
+#[test]
+fn stdlib_tree_entry() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+    let tree = BStackBTreeMap::<u32, MacroLeaf>::new(&alloc).unwrap();
+
+    let (v, inserted) = tree
+        .get_or_insert_with(&alloc, 7, || MacroLeaf::new(&alloc, 70))
+        .unwrap();
+    assert!(inserted);
+    assert_eq!(v.val(stack).unwrap(), 70);
+
+    let called = std::cell::Cell::new(false);
+    let (v, inserted) = tree
+        .get_or_insert_with(&alloc, 7, || {
+            called.set(true);
+            MacroLeaf::new(&alloc, 999)
+        })
+        .unwrap();
+    assert!(!inserted);
+    assert!(!called.get());
+    assert_eq!(v.val(stack).unwrap(), 70);
+
+    tree.bstack_drop(&alloc).unwrap();
+}

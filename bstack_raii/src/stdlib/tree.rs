@@ -463,6 +463,48 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBTreeMap<K, V> {
         Ok(self.get(stack, key)?.is_some())
     }
 
+    /// Get the value for `key`, inserting one produced by `f` if absent — the
+    /// fused entry operation. Returns `(value handle, was_newly_inserted)`.
+    ///
+    /// If `key` is present this is a single descent: `f` is **not** called and
+    /// nothing is allocated. Existing values are never replaced (use
+    /// [`insert`](Self::insert)). The returned handle is mutable in place, and the
+    /// `bool` distinguishes a fresh insert from a hit. **Single-writer.**
+    pub fn get_or_insert_with<A, F>(&self, allocator: &A, key: K, f: F) -> io::Result<(V, bool)>
+    where
+        A: BStackOwnedSliceAllocator,
+        F: FnOnce() -> io::Result<BStackOwned<V>>,
+    {
+        if let Some(v) = self.get(allocator.stack(), &key)? {
+            return Ok((v, false));
+        }
+        let value = f()?;
+        let vref = value.handle().range().start();
+        if let Some(old) = self.insert(allocator, key, value)? {
+            old.bstack_drop(allocator)?;
+        }
+        Ok((Self::value_at(vref), true))
+    }
+
+    /// Like [`get_or_insert_with`](Self::get_or_insert_with) but with an eager
+    /// `default`, which is **freed** if `key` is already present.
+    pub fn get_or_insert<A: BStackOwnedSliceAllocator>(
+        &self,
+        allocator: &A,
+        key: K,
+        default: BStackOwned<V>,
+    ) -> io::Result<(V, bool)> {
+        if let Some(v) = self.get(allocator.stack(), &key)? {
+            default.bstack_drop(allocator)?;
+            return Ok((v, false));
+        }
+        let vref = default.handle().range().start();
+        if let Some(old) = self.insert(allocator, key, default)? {
+            old.bstack_drop(allocator)?;
+        }
+        Ok((Self::value_at(vref), true))
+    }
+
     /// The number of keys in the node at `off` (reads just the count field).
     fn child_nkeys(stack: &BStack, off: u64) -> io::Result<usize> {
         Ok(get_u64(&{
