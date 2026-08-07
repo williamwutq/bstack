@@ -932,16 +932,33 @@ A borrowed I/O view carrying `&'a BStack` directly. Obtained from `BStackOwnedSl
 
 Key methods on `BStackSlice`:
 
-| Method                                              | Description                                 |
-|-----------------------------------------------------|---------------------------------------------|
-| `read()`                                            | Read the entire region into a new `Vec<u8>` |
-| `read_into(buf)`                                    | Read into a caller-supplied buffer          |
-| `read_range(start, end)`                            | Read a sub-range                            |
-| `subslice(start, end)`                              | Narrow to a sub-range                       |
-| `reader()` / `reader_at(offset)`                    | Cursor-based `BStackSliceReader`            |
-| `write(data)` *(feature `set`)*                     | Overwrite the beginning of the region       |
-| `write_range(start, data)` *(feature `set`)*        | Overwrite a sub-range                       |
-| `zero()` / `zero_range(start, n)` *(feature `set`)* | Zero the region or a sub-range              |
+| Method                                                               | Description                                             |
+|----------------------------------------------------------------------|---------------------------------------------------------|
+| `read()`                                                             | Read the entire region into a new `Vec<u8>`             |
+| `read_into(buf)`                                                     | Read into a caller-supplied buffer                      |
+| `read_range(start, end)`                                             | Read a sub-range                                        |
+| `subslice(start, end)`                                               | Narrow to a sub-range                                   |
+| `head(n)` / `tail(n)`                                                | Sub-view of the first/last `n` bytes (capped to length) |
+| `split_at(mid)` / `split_at_mut(mid)`                                | Split into two independent sub-views                    |
+| `get(index)`                                                         | Read a single byte, or `None` if out of bounds          |
+| `contains(byte)`                                                     | Whether the slice contains a byte                       |
+| `starts_with(prefix)` / `ends_with(suffix)`                          | Whether the slice starts/ends with a byte pattern       |
+| `find(byte)` / `rfind(byte)`                                         | Index of the first/last occurrence of a byte            |
+| `position(pred)` / `rposition(pred)`                                 | Index of the first/last byte matching a predicate       |
+| `reader()` / `reader_at(offset)`                                     | Cursor-based `BStackSliceReader`                        |
+| `write(data)` *(feature `set`)*                                      | Overwrite the beginning of the region                   |
+| `write_range(start, data)` *(feature `set`)*                         | Overwrite a sub-range                                   |
+| `zero()` / `zero_range(start, n)` *(feature `set`)*                  | Zero the region or a sub-range                          |
+| `fill(value)` *(feature `set`)*                                      | Overwrite the entire slice with one byte value          |
+| `fill_with(f)` *(feature `set`)*                                     | Overwrite the entire slice, generating each byte        |
+| `copy_from_slice(src)` *(feature `set`)*                             | Overwrite from a matching-length `&[u8]`                |
+| `copy_from_bstack_slice(src)` *(features `set` + `atomic`)*          | Overwrite from a matching-length `BStackSlice`          |
+| `copy_within(range, dest)` *(features `set` + `atomic`)*             | Copy a sub-range to another offset, in place            |
+| `swap(other)` *(features `set` + `atomic`)*                          | Exchange contents with another same-length slice        |
+| `reverse()` *(features `set` + `atomic`)*                            | Reverse the byte order in place                         |
+| `rotate_left(mid)` / `rotate_right(k)` *(features `set` + `atomic`)* | Rotate the slice in place                               |
+
+Every write method above is a single crash-atomic call. `BStackOwnedSlice` mirrors all of these (delegating through `as_slice()`/`as_slice_mut()`).
 
 ### `BStackRange`
 
@@ -950,6 +967,14 @@ A raw `(offset, len)` coordinate pair with no backing reference. `Copy`, seriali
 ### `BStackSliceReader`
 
 A cursor-based reader over a `BStackSlice`. Implements `io::Read` and `io::Seek`.
+
+### Slice Location Equality
+
+`BStackSlice`, `BStackOwnedSlice`, and `BStackRange` implement `PartialEq` against each other — every pairing, both directions (`BStackSlice == BStackSlice`, `BStackOwnedSlice == BStackOwnedSlice`, `BStackSlice == BStackOwnedSlice`, `BStackRange == BStackSlice`, `BStackRange == BStackOwnedSlice`).
+
+This is **location equality**: it compares coordinates (`offset`, `len`), not the bytes stored there. Two slices over disjoint regions that happen to hold identical bytes compare unequal; two handles over the exact same region compare equal even before anything has been written. The comparison is synchronous and infallible — no I/O is performed.
+
+To compare *contents* instead, read both sides (`read()`/`read_into()`) and compare the resulting `Vec<u8>`/`[u8]` directly. `BStackByteVec` deliberately does **not** implement `PartialEq` against any of these types, since a meaningful comparison for a vec would require reading its header to resolve `len` first — an I/O operation `==` should not perform silently.
 
 ### Lifetime model
 
@@ -1048,14 +1073,14 @@ As a general guideline (based on `benches/alloc.rs` mixed-workload results):
 
 **Configuration** — all knobs are environment variables read once at startup:
 
-| Variable                 | Meaning                                                        | Default     |
-|--------------------------|----------------------------------------------------------------|-------------|
-| `BSTACK_BENCH_OP`        | op mix: preset name or `alloc,realloc,dealloc` weight triple   | `mixed`     |
-| `BSTACK_BENCH_SIZE`      | size distribution preset                                       | `uniform`   |
-| `BSTACK_BENCH_MAX`       | maximum allocation length drawn                                | `1024`      |
-| `BSTACK_BENCH_THREADS`   | comma-separated thread counts                                  | `1,2,4,16`  |
-| `BSTACK_BENCH_PRE_ALLOC` | live allocations pre-populated per benchmark                   | `256`       |
-| `BSTACK_BENCH_SEED`      | seed for the decision stream                                   | `48`        |
+| Variable                 | Meaning                                                      | Default    |
+|--------------------------|--------------------------------------------------------------|------------|
+| `BSTACK_BENCH_OP`        | op mix: preset name or `alloc,realloc,dealloc` weight triple | `mixed`    |
+| `BSTACK_BENCH_SIZE`      | size distribution preset                                     | `uniform`  |
+| `BSTACK_BENCH_MAX`       | maximum allocation length drawn                              | `1024`     |
+| `BSTACK_BENCH_THREADS`   | comma-separated thread counts                                | `1,2,4,16` |
+| `BSTACK_BENCH_PRE_ALLOC` | live allocations pre-populated per benchmark                 | `256`      |
+| `BSTACK_BENCH_SEED`      | seed for the decision stream                                 | `48`       |
 
 Op-mix presets: `mixed`, `alloc-only`, `alloc-heavy`, `realloc-heavy`, `churn`.  
 Size presets: `uniform`, `fixed`, `gamma[:k:theta_frac]`, `bimodal[:small:p_large]`.
