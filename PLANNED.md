@@ -68,6 +68,14 @@ Reasons:
 
 Reference: https://github.com/williamwutq/bstack/pull/32
 
+### Implementing `PartialEq`, or any other trait, whose only implementation would perform I/O
+
+Reasons:
+
+Trait methods that callers invoke implicitly — `PartialEq::eq`, `Hash::hash`, `Ord::cmp` — are conventionally assumed cheap and infallible: no blocking I/O, no `Result`, no panicking on a failed read. That assumption is baked into `assert_eq!`, hash-map keys, `sort`/`dedup`, derived impls on a containing struct, and generic trait bounds. `BStack` keeps I/O explicit (`read()`/`get()`/`set()` and friends), so a trait whose only possible implementation must touch the file goes against that, whichever trait it is. `BStackByteVec` is the concrete case: it cannot compare content without first reading its header to resolve `len`, so a content-based `PartialEq` would silently issue disk I/O wherever `==` appears. Types that compare for free stay fair game — `BStackSlice`, `BStackOwnedSlice`, and `BStackRange` implement `PartialEq` against each other since `(offset, len)` comparison needs no I/O. 
+
+Reference: https://github.com/williamwutq/bstack/pull/37
+
 ---
 
 ## `BStackInPlaceGuard` — ambient atomic-block guard over in-place writes
