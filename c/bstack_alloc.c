@@ -2162,6 +2162,8 @@ typedef struct {
     uint64_t left;
     uint64_t right;
     int      went_left;
+    uint8_t  lh;         /* this node's cached child heights, read on the way   */
+    uint8_t  rh;         /* down; the sibling's is stable for the up-pass write */
 } algt_path_entry_t;
 
 /* ---- alignment helpers ------------------------------------------------- */
@@ -2204,9 +2206,14 @@ static int algt_write_root(bstack_t *bs, uint64_t root)
  *   [0..8)   size (u64 LE)
  *   [8]      balance_factor (i8)
  *   [9]      height (u8)
- *   [10..16) reserved / zero
+ *   [10]     cached height of left child (u8)   ─┐ denormalized so a parent read
+ *   [11]     cached height of right child (u8)  ─┘ on the way down yields its
+ *   [12..16) reserved / zero                       untouched sibling's height
  *   [16..24) left child ptr (u64 LE)
- *   [24..32) right child ptr (u64 LE) */
+ *   [24..32) right child ptr (u64 LE)
+ *
+ * The cache is rebuilt from scratch by algt_coalesce_and_rebalance on open, so
+ * old-format arenas (whose [10..16) were zero) self-upgrade transparently. */
 
 static int algt_read_node(bstack_t *bs, uint64_t ptr,
     uint64_t *out_size, int8_t *out_bf, uint8_t *out_height,
@@ -2219,6 +2226,23 @@ static int algt_read_node(bstack_t *bs, uint64_t ptr,
     *out_height = buf[9];
     *out_left   = read_le64(buf + 16);
     *out_right  = read_le64(buf + 24);
+    return 0;
+}
+
+/* Read the node at ptr for a down-pass: size, left, right, and the node's cached
+ * child heights (*out_lh, *out_rh).  Same single bstack_get as algt_read_node;
+ * the cache lets the up-pass skip re-reading the untouched sibling child. */
+static int algt_read_node_hc(bstack_t *bs, uint64_t ptr,
+    uint64_t *out_size, uint64_t *out_left, uint64_t *out_right,
+    uint8_t *out_lh, uint8_t *out_rh)
+{
+    uint8_t buf[32];
+    if (bstack_get(bs, ptr, ptr + 32, buf) != 0) return -1;
+    *out_size  = read_le64(buf);
+    *out_left  = read_le64(buf + 16);
+    *out_right = read_le64(buf + 24);
+    *out_lh    = buf[10];
+    *out_rh    = buf[11];
     return 0;
 }
 
@@ -2255,8 +2279,10 @@ static int algt_avl_write_h(bstack_t *bs, uint64_t ptr, uint64_t size,
         uint8_t buf[32];
         memset(buf, 0, 32);
         write_le64(buf,      size);
-        buf[8] = (uint8_t)bf;
-        buf[9] = height;
+        buf[8]  = (uint8_t)bf;
+        buf[9]  = height;
+        buf[10] = lh; /* cached left-child height  */
+        buf[11] = rh; /* cached right-child height */
         write_le64(buf + 16, left);
         write_le64(buf + 24, right);
         if (bstack_set(bs, ptr, buf, 32) != 0) return -1;
@@ -2282,12 +2308,18 @@ static int algt_avl_rotate_right(bstack_t *bs, uint64_t node,
     uint64_t *out_root, uint8_t *out_height)
 {
     uint64_t node_sz, node_r, pivot, pivot_sz, pivot_l, pivot_r;
-    int8_t bf; uint8_t height, node_h;
-    if (algt_read_node(bs, node,  &node_sz,  &bf, &height, &pivot,   &node_r)  != 0) return -1;
-    if (algt_read_node(bs, pivot, &pivot_sz, &bf, &height, &pivot_l, &pivot_r) != 0) return -1;
-    if (algt_avl_write_h(bs, node, node_sz, pivot_r, node_r, -1, -1, NULL, &node_h) != 0) return -1;
-    /* node is now pivot's right child, and its height was just computed. */
-    if (algt_avl_write_h(bs, pivot, pivot_sz, pivot_l, node, -1, (int)node_h, NULL, out_height) != 0) return -1;
+    uint8_t  node_lh, node_rh, pivot_lh, pivot_rh, node_h;
+    /* Read both nodes' cached child heights so neither rewrite re-reads a child.
+     * (node's left child is pivot, whose height node_lh is not needed.) */
+    if (algt_read_node_hc(bs, node,  &node_sz,  &pivot,   &node_r,  &node_lh, &node_rh) != 0) return -1;
+    if (algt_read_node_hc(bs, pivot, &pivot_sz, &pivot_l, &pivot_r, &pivot_lh, &pivot_rh) != 0) return -1;
+    (void)node_lh;
+    /* node's new children (pivot_r, node_r) → heights (pivot_rh, node_rh). */
+    if (algt_avl_write_h(bs, node, node_sz, pivot_r, node_r,
+                         (int)pivot_rh, (int)node_rh, NULL, &node_h) != 0) return -1;
+    /* pivot's new children (pivot_l, node) → heights (pivot_lh, node_h). */
+    if (algt_avl_write_h(bs, pivot, pivot_sz, pivot_l, node,
+                         (int)pivot_lh, (int)node_h, NULL, out_height) != 0) return -1;
     *out_root = pivot;
     return 0;
 }
@@ -2298,12 +2330,18 @@ static int algt_avl_rotate_left(bstack_t *bs, uint64_t node,
     uint64_t *out_root, uint8_t *out_height)
 {
     uint64_t node_sz, node_l, pivot, pivot_sz, pivot_l, pivot_r;
-    int8_t bf; uint8_t height, node_h;
-    if (algt_read_node(bs, node,  &node_sz,  &bf, &height, &node_l, &pivot)   != 0) return -1;
-    if (algt_read_node(bs, pivot, &pivot_sz, &bf, &height, &pivot_l, &pivot_r) != 0) return -1;
-    if (algt_avl_write_h(bs, node, node_sz, node_l, pivot_l, -1, -1, NULL, &node_h) != 0) return -1;
-    /* node is now pivot's left child, and its height was just computed. */
-    if (algt_avl_write_h(bs, pivot, pivot_sz, node, pivot_r, (int)node_h, -1, NULL, out_height) != 0) return -1;
+    uint8_t  node_lh, node_rh, pivot_lh, pivot_rh, node_h;
+    /* Read both nodes' cached child heights so neither rewrite re-reads a child.
+     * (node's right child is pivot, whose height node_rh is not needed.) */
+    if (algt_read_node_hc(bs, node,  &node_sz,  &node_l,  &pivot,   &node_lh, &node_rh) != 0) return -1;
+    if (algt_read_node_hc(bs, pivot, &pivot_sz, &pivot_l, &pivot_r, &pivot_lh, &pivot_rh) != 0) return -1;
+    (void)node_rh;
+    /* node's new children (node_l, pivot_l) → heights (node_lh, pivot_lh). */
+    if (algt_avl_write_h(bs, node, node_sz, node_l, pivot_l,
+                         (int)node_lh, (int)pivot_lh, NULL, &node_h) != 0) return -1;
+    /* pivot's new children (node, pivot_r) → heights (node_h, pivot_rh). */
+    if (algt_avl_write_h(bs, pivot, pivot_sz, node, pivot_r,
+                         (int)node_h, (int)pivot_rh, NULL, out_height) != 0) return -1;
     *out_root = pivot;
     return 0;
 }
@@ -2365,10 +2403,10 @@ static int algt_avl_insert(bstack_t *bs, uint64_t ptr, uint64_t size)
     current = root;
     while (current != ALGT_NULL_PTR) {
         uint64_t root_sz, left, right;
-        int8_t bf; uint8_t height;
+        uint8_t lh, rh;
         int went_left;
         if (path_len >= ALGT_MAX_AVL_DEPTH) { errno = EINVAL; return -1; }
-        if (algt_read_node(bs, current, &root_sz, &bf, &height, &left, &right) != 0)
+        if (algt_read_node_hc(bs, current, &root_sz, &left, &right, &lh, &rh) != 0)
             return -1;
         went_left = (size < root_sz || (size == root_sz && ptr < current));
         path[path_len].ptr       = current;
@@ -2376,22 +2414,26 @@ static int algt_avl_insert(bstack_t *bs, uint64_t ptr, uint64_t size)
         path[path_len].left      = left;
         path[path_len].right     = right;
         path[path_len].went_left = went_left;
+        path[path_len].lh        = lh;
+        path[path_len].rh        = rh;
         path_len++;
         current = went_left ? left : right;
     }
 
     {
         uint8_t buf[32];
-        memset(buf, 0, 32);
+        memset(buf, 0, 32); /* null children → cached child heights [10],[11] = 0 */
         write_le64(buf, size);
         buf[9] = 1;
         if (bstack_set(bs, ptr, buf, 32) != 0) return -1;
     }
 
     /* Up-pass: install the new child pointer in each ancestor and rebalance.
-     * The child written in the previous iteration has a known height, so its
-     * side needs no re-read; the (bf, height) from algt_avl_write_h is handed to
-     * algt_avl_rebalance, so the in-balance case does no further I/O. */
+     * Both child heights are known — the modified child from the previous
+     * iteration, the untouched sibling from this node's cache read on the way
+     * down — so algt_avl_write_h reads neither.  The (bf, height) it returns is
+     * handed to algt_avl_rebalance, so the in-balance case does no further I/O:
+     * one write per level, zero reads. */
     child = ptr;
     {
         uint8_t child_h = 1; /* leaf height */
@@ -2401,10 +2443,10 @@ static int algt_avl_insert(bstack_t *bs, uint64_t ptr, uint64_t size)
             int8_t   bf; uint8_t h, new_h;
             if (path[i].went_left) {
                 new_left  = child;          new_right = path[i].right;
-                known_lh  = (int)child_h;   known_rh  = -1;
+                known_lh  = (int)child_h;   known_rh  = (int)path[i].rh;
             } else {
                 new_left  = path[i].left;   new_right = child;
-                known_lh  = -1;             known_rh  = (int)child_h;
+                known_lh  = (int)path[i].lh; known_rh  = (int)child_h;
             }
             if (algt_avl_write_h(bs, path[i].ptr, path[i].size,
                                  new_left, new_right, known_lh, known_rh, &bf, &h) != 0)
@@ -2425,33 +2467,36 @@ static int algt_avl_insert(bstack_t *bs, uint64_t ptr, uint64_t size)
 static int algt_avl_remove_min(bstack_t *bs, uint64_t root,
     uint64_t *out_min_ptr, uint64_t *out_min_size, uint64_t *out_new_root)
 {
-    uint64_t stk_ptr  [ALGT_MAX_AVL_DEPTH];
-    uint64_t stk_size [ALGT_MAX_AVL_DEPTH];
-    uint64_t stk_right[ALGT_MAX_AVL_DEPTH];
+    uint64_t stk_ptr    [ALGT_MAX_AVL_DEPTH];
+    uint64_t stk_size   [ALGT_MAX_AVL_DEPTH];
+    uint64_t stk_right  [ALGT_MAX_AVL_DEPTH];
+    uint8_t  stk_right_h[ALGT_MAX_AVL_DEPTH]; /* cached right-child heights */
     size_t   stk_len  = 0;
     uint64_t current  = root;
 
     for (;;) {
         uint64_t size, left, right;
-        int8_t bf; uint8_t height;
-        if (algt_read_node(bs, current, &size, &bf, &height, &left, &right) != 0)
+        uint8_t lh, rh;
+        if (algt_read_node_hc(bs, current, &size, &left, &right, &lh, &rh) != 0)
             return -1;
+        (void)lh;
         if (left == ALGT_NULL_PTR) {
-            /* Replace current with its right child.  `child` is always the left
-             * side; its height is known after the first up-pass step (the right
-             * subtree height is unknown until then, hence -1 initially). */
+            /* Replace current with its right child, whose height is current's
+             * cached right height.  `child` is always the left side going up;
+             * both child heights are known each step, so write_h reads neither. */
             uint64_t child = right;
-            int      child_h = -1;
+            uint8_t  child_h = rh;
             int i;
             for (i = (int)stk_len - 1; i >= 0; i--) {
                 uint64_t new_child;
                 int8_t   bf; uint8_t h, new_h;
                 if (algt_avl_write_h(bs, stk_ptr[i], stk_size[i],
-                                     child, stk_right[i], child_h, -1, &bf, &h) != 0)
+                                     child, stk_right[i], (int)child_h, (int)stk_right_h[i],
+                                     &bf, &h) != 0)
                     return -1;
                 if (algt_avl_rebalance(bs, stk_ptr[i], bf, h, &new_child, &new_h) != 0) return -1;
                 child   = new_child;
-                child_h = (int)new_h;
+                child_h = new_h;
             }
             *out_min_ptr  = current;
             *out_min_size = size;
@@ -2459,9 +2504,10 @@ static int algt_avl_remove_min(bstack_t *bs, uint64_t root,
             return 0;
         }
         if (stk_len >= ALGT_MAX_AVL_DEPTH) { errno = EINVAL; return -1; }
-        stk_ptr  [stk_len] = current;
-        stk_size [stk_len] = size;
-        stk_right[stk_len] = right;
+        stk_ptr    [stk_len] = current;
+        stk_size   [stk_len] = size;
+        stk_right  [stk_len] = right;
+        stk_right_h[stk_len] = rh;
         stk_len++;
         current = left;
     }
@@ -2480,6 +2526,7 @@ static int algt_avl_find_best_fit_and_remove(bstack_t *bs, uint64_t min_size,
     size_t   last_fit_idx = 0;
     uint64_t root, current;
     uint64_t found_ptr, found_size, found_left, found_right;
+    uint8_t  found_lh, found_rh;
     uint64_t child;
     int      i, child_h;
 
@@ -2493,10 +2540,10 @@ static int algt_avl_find_best_fit_and_remove(bstack_t *bs, uint64_t min_size,
     current = root;
     while (current != ALGT_NULL_PTR) {
         uint64_t root_sz, left, right;
-        int8_t bf; uint8_t height;
+        uint8_t lh, rh;
         int went_left;
         if (path_len >= ALGT_MAX_AVL_DEPTH) { errno = EINVAL; return -1; }
-        if (algt_read_node(bs, current, &root_sz, &bf, &height, &left, &right) != 0)
+        if (algt_read_node_hc(bs, current, &root_sz, &left, &right, &lh, &rh) != 0)
             return -1;
         if (root_sz >= min_size) {
             last_fit_idx = path_len;
@@ -2510,6 +2557,8 @@ static int algt_avl_find_best_fit_and_remove(bstack_t *bs, uint64_t min_size,
         path[path_len].left      = left;
         path[path_len].right     = right;
         path[path_len].went_left = went_left;
+        path[path_len].lh        = lh;
+        path[path_len].rh        = rh;
         path_len++;
         current = went_left ? left : right;
     }
@@ -2524,15 +2573,18 @@ static int algt_avl_find_best_fit_and_remove(bstack_t *bs, uint64_t min_size,
     found_size  = path[last_fit_idx].size;
     found_left  = path[last_fit_idx].left;
     found_right = path[last_fit_idx].right;
+    found_lh    = path[last_fit_idx].lh; /* cached found_left  height */
+    found_rh    = path[last_fit_idx].rh; /* cached found_right height */
 
     /* Seed the up-pass directly with the best-fit node's replacement.  child_h
-     * is the replacement subtree's height when known (the successor case), -1
-     * otherwise (an untouched single child whose height we never read). */
-    child_h = -1;
+     * is the replacement subtree's height — known in every case now (single
+     * child from the cache, successor from its rebalance). */
     if (found_left == ALGT_NULL_PTR) {
-        child = found_right;
+        child   = found_right;
+        child_h = (int)found_rh;
     } else if (found_right == ALGT_NULL_PTR) {
-        child = found_left;
+        child   = found_left;
+        child_h = (int)found_lh;
     } else {
         uint64_t succ, succ_sz, new_right;
         int8_t   bf; uint8_t h, rh;
@@ -2544,18 +2596,19 @@ static int algt_avl_find_best_fit_and_remove(bstack_t *bs, uint64_t min_size,
         child_h = (int)rh;
     }
 
-    /* Up-pass: as in insert, the child written last has a known height, so its
-     * side is not re-read and the in-balance case does no further I/O. */
+    /* Up-pass: both child heights are known each step — the modified child
+     * threaded from below, the untouched sibling from this node's cache — so
+     * algt_avl_write_h reads neither and the in-balance case does no further I/O. */
     for (i = (int)last_fit_idx - 1; i >= 0; i--) {
         uint64_t new_left, new_right, new_child;
         int      known_lh, known_rh;
         int8_t   bf; uint8_t h, new_h;
         if (path[i].went_left) {
             new_left  = child;          new_right = path[i].right;
-            known_lh  = child_h;        known_rh  = -1;
+            known_lh  = child_h;        known_rh  = (int)path[i].rh;
         } else {
             new_left  = path[i].left;   new_right = child;
-            known_lh  = -1;             known_rh  = child_h;
+            known_lh  = (int)path[i].lh; known_rh  = child_h;
         }
         if (algt_avl_write_h(bs, path[i].ptr, path[i].size,
                              new_left, new_right, known_lh, known_rh, &bf, &h) != 0) return -1;
