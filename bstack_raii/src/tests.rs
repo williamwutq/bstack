@@ -2465,11 +2465,66 @@ fn wal_finish_abandons_uncommitted() {
     log.append(WalEntry::dealloc(WalStatus::Pending, v1));
     persist_at(&alloc, anchor, &log, WalStatus::Pending).unwrap();
 
-    // Abandoned: nothing freed, anchor cleared.
+    // Abandoned: the old slice v1 must NOT be freed (it's still live). Reclaiming
+    // an abandoned txn frees its *allocs*, and this txn logged only a dealloc.
     assert_eq!(finish_at(&alloc, anchor).unwrap(), 0);
     let mut buf = [0u8; 8];
     alloc.stack().get_into(anchor, &mut buf).unwrap();
     assert_eq!(u64::from_le_bytes(buf), 0);
+}
+
+#[test]
+fn wal_anchor_trait_reclaims_via_finish() {
+    use crate::BStackWalAnchor;
+    use crate::wal::{finish, persist_at};
+    use crate::{WalEntry, WalLog, WalStatus};
+
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator(); // FirstFitBStackAllocator: wal_anchor() == 8
+    let orphan = alloc.alloc(64).unwrap().as_range();
+
+    // Persist an abandoned (Pending) txn into the allocator's own anchor slot.
+    let mut log = WalLog::with_capacity(1);
+    log.append(WalEntry::alloc(WalStatus::Pending, orphan));
+    persist_at(&alloc, alloc.wal_anchor(), &log, WalStatus::Pending).unwrap();
+
+    // finish() uses the trait anchor and reclaims the orphan; the allocator is
+    // unharmed by our writes to its reserved slot (a fresh alloc reuses it).
+    assert_eq!(finish(&alloc).unwrap(), 1);
+    assert_eq!(alloc.alloc(64).unwrap().as_range().start(), orphan.start());
+}
+
+#[test]
+fn wal_finish_reclaims_abandoned_allocs() {
+    use crate::wal::{finish_at, persist_at};
+    use crate::{WalEntry, WalLog, WalStatus};
+
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let anchor = alloc.alloc(8).unwrap().as_range().start();
+    // Two blocks a crashed op allocated but never linked (orphans).
+    let a1 = alloc.alloc(64).unwrap().as_range();
+    let a2 = alloc.alloc(64).unwrap().as_range();
+
+    // An UNCOMMITTED (Pending) transaction that had allocated a1/a2.
+    let mut log = WalLog::with_capacity(2);
+    log.append(WalEntry::alloc(WalStatus::Pending, a1));
+    log.append(WalEntry::alloc(WalStatus::Pending, a2));
+    persist_at(&alloc, anchor, &log, WalStatus::Pending).unwrap();
+
+    // Reclaiming the abandoned txn frees both orphans.
+    assert_eq!(finish_at(&alloc, anchor).unwrap(), 2);
+    // Reclaimed: a fresh 64-byte alloc reuses one of the freed slots.
+    let reused = alloc.alloc(64).unwrap().as_range();
+    assert!(reused.start() == a1.start() || reused.start() == a2.start());
+
+    // A *committed* alloc-only txn keeps its allocs (frees nothing).
+    let anchor2 = alloc.alloc(8).unwrap().as_range().start();
+    let keep = alloc.alloc(64).unwrap().as_range();
+    let mut log2 = WalLog::with_capacity(1);
+    log2.append(WalEntry::alloc(WalStatus::Pending, keep));
+    persist_at(&alloc, anchor2, &log2, WalStatus::Complete).unwrap();
+    assert_eq!(finish_at(&alloc, anchor2).unwrap(), 0);
 }
 
 // --------------------------------------------------------------------------

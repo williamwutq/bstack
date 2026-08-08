@@ -91,8 +91,8 @@ pub use stdlib::{
 pub use teardown::{AutoDrop, BStackDrop, dealloc_range};
 pub use vec::{BStackBlockVec, BStackRefVec, BStackStrongVec, BStackVec, BStackWeakVec, VecDesc};
 pub use wal::{
-    AllocReq, BStackWalAnchor, Reduced, WalEntry, WalHeader, WalLog, WalOp, WalStatus, finish,
-    finish_at, persist_at, reduce,
+    AllocReq, BStackWalAnchor, Reduced, STD_WAL_ANCHOR, WalEntry, WalHeader, WalLog, WalOp,
+    WalStatus, finish, finish_at, persist_at, reduce,
 };
 
 // Re-exports for use by `#[bstack_block]`-generated code (and callers), so that

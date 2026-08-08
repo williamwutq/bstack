@@ -30,17 +30,23 @@
 //! * normal progress [`advance`](WalStatus::advance): `None → Pending → Complete`;
 //! * [`recover`](WalStatus::recover): `Pending → Abandon`, else identity.
 //!
-//! An operation is thus `(R', Alloc|Dealloc) × Status`, and the WAL is the functor
-//! `wal_append` mapping operations into disk state ([`WalLog`]). On disk an `Alloc`
-//! stores its `R' = (id, len)` and a `Dealloc` stores its `S = (ptr, len)`.
+//! An operation is thus `(slice, Alloc|Dealloc) × Status`, and the WAL is the
+//! functor `wal_append` mapping operations into disk state ([`WalLog`]). On disk
+//! **both** an `Alloc` and a `Dealloc` store their slice `S = (ptr, len)`; the
+//! `op` marks the *recovery polarity* (which outcome orphans the slice).
+//! ([`AllocReq`] / [`reduce`] are the pre-allocation planning form, `R' = (id,
+//! len)`, used before an address exists.)
 //!
-//! Recovery semantics (per operation): a `Pending` op was in flight at the crash,
-//! so it is **abandoned and its slice leaked** — never re-run (which would
-//! double-free) — while a `Complete` op stands. Each `Dealloc` self-brackets
-//! (`write Pending → run → write Complete`), so its own status is the progress
-//! marker; no separate cursor is needed. Leaks are accepted and minimised by the
-//! reduction; recovery's job is consistency (no double-free, no dangling), not
-//! reclamation.
+//! Recovery semantics ([`finish`]), driven by the transaction-level
+//! `txn_status`, **reclaims** rather than merely staying consistent:
+//!
+//! * **committed** → free each `Pending` `Dealloc` (the old blocks the op
+//!   unlinked) — roll forward;
+//! * **abandoned** → free each `Pending` `Alloc` (the new blocks a crashed op
+//!   allocated but never linked) — reclaim the orphans.
+//!
+//! Each entry self-brackets (`persist Complete → free`), so a second crash mid-
+//! completion never double-frees; no separate cursor is needed.
 
 use core::mem::size_of;
 use std::io;
@@ -137,14 +143,16 @@ pub struct WalEntry {
 }
 
 impl WalEntry {
-    /// An `Alloc` entry recording a requirement `R' = (id, len)`.
-    pub fn alloc(status: WalStatus, req: AllocReq) -> Self {
+    /// An `Alloc` entry recording a freshly allocated slice `S = (ptr, len)`.
+    /// Recovery frees it iff the transaction is **abandoned** (the block is an
+    /// orphan of a crashed op); a committed transaction keeps it.
+    pub fn alloc(status: WalStatus, slice: BStackRange) -> Self {
         WalEntry {
             status: status as u8,
             op: WalOp::Alloc as u8,
             _pad: [0; 6],
-            word_a: req.id,
-            word_b: req.len,
+            word_a: slice.start(),
+            word_b: slice.len(),
         }
     }
 
@@ -171,13 +179,10 @@ impl WalEntry {
         self.status = status as u8;
     }
 
-    /// The recorded `R'`, if this is an `Alloc` entry.
-    pub fn as_alloc(&self) -> Option<AllocReq> {
+    /// The recorded slice `S`, if this is an `Alloc` entry (to be freed on abandon).
+    pub fn as_alloc(&self) -> Option<BStackRange> {
         match self.op() {
-            WalOp::Alloc => Some(AllocReq {
-                id: self.word_a,
-                len: self.word_b,
-            }),
+            WalOp::Alloc => Some(BStackRange::new(self.word_a, self.word_b)),
             WalOp::Dealloc => None,
         }
     }
@@ -345,6 +350,39 @@ pub unsafe trait BStackWalAnchor: BStackOwnedSliceAllocator {
     fn wal_anchor(&self) -> u64;
 }
 
+/// Anchor offset for the bstack-provided freeing allocators: the second `u64`
+/// word of the user-reserved region every one of them keeps at payload offset 0
+/// and never hands out (FirstFit reserves 16 B there, GhostTree 32 B, Slab and
+/// CheckedSlab 24 B — all ≥ 16). Payload offset 0 is left as `bstack_raii`'s null
+/// niche, so the anchor is the *next* word, `[8, 16)`.
+pub const STD_WAL_ANCHOR: u64 = 8;
+
+// SAFETY: each of these allocators documents a user-reserved region at payload
+// offset 0 (≥ 16 bytes) that it never allocates from and never writes to; the
+// `[8, 16)` slot sits inside it and persists across open/close. `LinearBStack-
+// Allocator` is intentionally excluded — its `dealloc` is a no-op, so there is
+// nothing for the WAL to reclaim.
+unsafe impl BStackWalAnchor for bstack::FirstFitBStackAllocator {
+    fn wal_anchor(&self) -> u64 {
+        STD_WAL_ANCHOR
+    }
+}
+unsafe impl BStackWalAnchor for bstack::GhostTreeBstackAllocator {
+    fn wal_anchor(&self) -> u64 {
+        STD_WAL_ANCHOR
+    }
+}
+unsafe impl BStackWalAnchor for bstack::SlabBStackAllocator {
+    fn wal_anchor(&self) -> u64 {
+        STD_WAL_ANCHOR
+    }
+}
+unsafe impl BStackWalAnchor for bstack::CheckedSlabBStackAllocator {
+    fn wal_anchor(&self) -> u64 {
+        STD_WAL_ANCHOR
+    }
+}
+
 /// Write `log` as a WAL block with transaction status `txn_status`, allocate the
 /// block, and point the anchor slot at it. Returns the block's range.
 pub fn persist_at<A: BStackOwnedSliceAllocator>(
@@ -395,39 +433,46 @@ fn load_at<A: BStackOwnedSliceAllocator>(
 }
 
 /// **Complete** a crash-left transaction referenced by the anchor slot at
-/// `anchor`, or abandon it.
+/// `anchor` by reclaiming exactly the slices the transaction's outcome orphaned.
 ///
-/// * **Committed** (`txn_status == Complete`): roll forward — for each still-
-///   `Pending` `Dealloc`, persist its entry `Complete` **then** free the slice
-///   (so a re-`finish` after another crash skips it — no double-free).
-/// * **Uncommitted** (`txn_status == Pending`): abandon — free nothing (the old
-///   slices stay; any new allocations leak, since an `Alloc` records only `R'`).
+/// * **Committed** (`txn_status == Complete`): roll forward — free each still-
+///   `Pending` `Dealloc` (the old blocks the committed op unlinked).
+/// * **Uncommitted** (`txn_status == Pending`): abandon — free each still-
+///   `Pending` `Alloc` (the new blocks the crashed op allocated but never linked).
 ///
-/// Either way the WAL block is then cleared (anchor `:= 0`) and freed. Returns
-/// the number of deallocations completed. This is what a caller runs after
-/// `open` — a *completion*, not a leaky recovery.
+/// Each freed entry is persisted `Complete` **before** its slice is freed, so a
+/// second crash mid-completion never double-frees. Either way the WAL block is
+/// then cleared (anchor `:= 0`) and freed. Returns the number of slices
+/// reclaimed. This is what a caller runs once after `open` — a *completion*, not
+/// a leaky recovery.
 pub fn finish_at<A: BStackOwnedSliceAllocator>(allocator: &A, anchor: u64) -> io::Result<usize> {
     let (wal_range, header, entries) = match load_at(allocator, anchor)? {
         Some(x) => x,
         None => return Ok(0),
     };
     let stack = allocator.stack();
+    let committed = header.txn_status() == WalStatus::Complete;
+    let base = wal_range.start() + size_of::<WalHeader>() as u64;
     let mut completed = 0usize;
 
-    if header.txn_status() == WalStatus::Complete {
-        let base = wal_range.start() + size_of::<WalHeader>() as u64;
-        for (i, e) in entries.iter().enumerate() {
-            // `as_dealloc` is `Some` only for a `Dealloc` entry.
-            if e.status() == WalStatus::Pending
-                && let Some(slice) = e.as_dealloc()
-            {
-                // Persist Complete for this entry (its status is byte 0), THEN
-                // free — so a second crash can't double-free it.
-                let entry_off = base + (i * size_of::<WalEntry>()) as u64;
-                stack.set(entry_off, [WalStatus::Complete as u8])?;
-                unsafe { dealloc_range(allocator, slice)? };
-                completed += 1;
-            }
+    for (i, e) in entries.iter().enumerate() {
+        if e.status() != WalStatus::Pending {
+            continue;
+        }
+        // Committed: the `Dealloc`s (old blocks) must go. Abandoned: the `Alloc`s
+        // (new orphans) must go. Everything else is kept.
+        let slice = if committed {
+            e.as_dealloc()
+        } else {
+            e.as_alloc()
+        };
+        if let Some(slice) = slice {
+            // Persist Complete for this entry (its status is byte 0), THEN free —
+            // so a second crash can't double-free it.
+            let entry_off = base + (i * size_of::<WalEntry>()) as u64;
+            stack.set(entry_off, [WalStatus::Complete as u8])?;
+            unsafe { dealloc_range(allocator, slice)? };
+            completed += 1;
         }
     }
 
@@ -461,10 +506,10 @@ mod tests {
 
     #[test]
     fn wal_entry_roundtrip() {
-        let a = WalEntry::alloc(WalStatus::Pending, AllocReq { id: 7, len: 256 });
+        let a = WalEntry::alloc(WalStatus::Pending, BStackRange::new(0x1000, 256));
         assert_eq!(a.op(), WalOp::Alloc);
         assert_eq!(a.status(), WalStatus::Pending);
-        assert_eq!(a.as_alloc(), Some(AllocReq { id: 7, len: 256 }));
+        assert_eq!(a.as_alloc(), Some(BStackRange::new(0x1000, 256)));
         assert_eq!(a.as_dealloc(), None);
 
         let d = WalEntry::dealloc(WalStatus::Complete, BStackRange::new(0x6CD4, 256));
@@ -479,7 +524,7 @@ mod tests {
         let mut log = WalLog::with_capacity(2);
         log.append(WalEntry::alloc(
             WalStatus::Pending,
-            AllocReq { id: 0, len: 64 },
+            BStackRange::new(8192, 64),
         ));
         log.append(WalEntry::dealloc(
             WalStatus::Pending,
@@ -488,7 +533,7 @@ mod tests {
         let bytes = log.as_bytes().to_vec();
         let back = WalLog::entries_from_bytes(&bytes);
         assert_eq!(back.len(), 2);
-        assert_eq!(back[0].as_alloc(), Some(AllocReq { id: 0, len: 64 }));
+        assert_eq!(back[0].as_alloc(), Some(BStackRange::new(8192, 64)));
         assert_eq!(back[1].as_dealloc(), Some(BStackRange::new(4096, 64)));
     }
 
