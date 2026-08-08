@@ -31,7 +31,12 @@ use std::io;
 /// not evenly divide the source length) don't fit a whole chunk. The two
 /// constructors differ only in which end of the source they align from, and
 /// therefore which sub-region ends up in the chunk view versus the leftover
-/// slice.
+/// slice. A view can also be built directly from an already-aligned region
+/// via [`from_raw_parts`](Self::from_raw_parts) or
+/// [`from_raw_slice`](Self::from_raw_slice) (both `unsafe`), or
+/// [`from_slice`](Self::from_slice) (safe, checked) — none of these split
+/// off a remainder, so the input must already satisfy the alignment
+/// invariant.
 ///
 /// # Not `Copy`
 ///
@@ -105,6 +110,58 @@ impl<'a> Ord for BStackChunk<'a> {
 }
 
 impl<'a> BStackChunk<'a> {
+    /// Construct a `BStackChunk` from raw parts: a stack, byte offset, byte
+    /// length, and stride — no I/O, no validation.
+    ///
+    /// # Safety
+    ///
+    /// `offset + len` must not overflow `u64`. `[offset, offset + len)`
+    /// should lie within the current payload of `stack` for I/O to succeed
+    /// (out-of-bounds coordinates are not a memory-safety hazard by
+    /// themselves — I/O on them just returns `io::Error`). The caller must
+    /// additionally uphold `BStackChunk`'s "always fully aligned" invariant:
+    /// `chunk_len` must be nonzero and evenly divide `len`. Violating this
+    /// is not undefined behavior, but corrupts assumptions relied on by
+    /// [`chunk_count`](Self::chunk_count), [`get`](Self::get),
+    /// [`merge`](Self::merge), [`merge_adjacent`](Self::merge_adjacent), and
+    /// the phase logic in [`same_phase`](Self::same_phase) — e.g.
+    /// `chunk_count` silently truncates rather than panicking, so a
+    /// misaligned raw chunk quietly drops trailing bytes.
+    #[inline]
+    pub unsafe fn from_raw_parts(stack: &'a BStack, offset: u64, len: u64, chunk_len: u64) -> Self {
+        BStackChunk {
+            aligned: unsafe { BStackSlice::from_raw_parts(stack, offset, len) },
+            chunk_len,
+        }
+    }
+
+    /// Construct a `BStackChunk` from an existing [`BStackSlice`] and a
+    /// stride, without validating the "always fully aligned" invariant.
+    ///
+    /// # Safety
+    ///
+    /// `chunk_len` must be nonzero and evenly divide `aligned.len()`.
+    #[inline]
+    pub unsafe fn from_raw_slice(aligned: BStackSlice<'a>, chunk_len: u64) -> Self {
+        BStackChunk { aligned, chunk_len }
+    }
+
+    /// Construct a `BStackChunk` from an existing [`BStackSlice`] and a
+    /// stride, validating that the slice already satisfies the "always fully
+    /// aligned" invariant.
+    ///
+    /// Returns `None` if `chunk_len == 0` or if `aligned.len()` is not a
+    /// multiple of `chunk_len`. Unlike [`BStackSlice::chunks`]/[`rchunks`](BStackSlice::rchunks),
+    /// this never splits off a remainder — the whole slice must already fit
+    /// the stride exactly.
+    #[inline]
+    pub fn from_slice(aligned: BStackSlice<'a>, chunk_len: u64) -> Option<Self> {
+        if chunk_len == 0 || !aligned.len().is_multiple_of(chunk_len) {
+            return None;
+        }
+        Some(BStackChunk { aligned, chunk_len })
+    }
+
     /// Length, in bytes, of one chunk.
     #[inline]
     pub fn chunk_len(&self) -> u64 {

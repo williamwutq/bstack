@@ -997,6 +997,8 @@ A "slice with a stride": divides a region into `chunk_len`-byte records. Sits at
 
 Obtained from `BStackSlice::chunks(chunk_len)` / `BStackSlice::rchunks(chunk_len)` (mirrored on `BStackOwnedSlice`), each returning **`(BStackChunk<'a>, BStackSlice<'a>)`**: the aligned chunk view, plus whatever bytes are left over if `chunk_len` doesn't evenly divide the source length. `chunks` aligns from the start (leftover at the tail); `rchunks` aligns from the end (leftover at the head). No I/O — pure offset arithmetic, as cheap as `subslice`.
 
+Also constructible directly, without splitting off a remainder, via `BStackChunk::from_raw_parts(stack, offset, len, chunk_len)` (`unsafe`, mirrors `BStackSlice::from_raw_parts`), `BStackChunk::from_raw_slice(aligned, chunk_len)` (`unsafe`, wraps an existing `BStackSlice` as-is), or `BStackChunk::from_slice(aligned, chunk_len)` (safe, returns `None` unless `chunk_len` is nonzero and evenly divides `aligned.len()`). All three require the slice to already be exactly chunk-aligned — unlike `chunks`/`rchunks`, there is no remainder.
+
 | Method                                                                              | Description                                                                                                              |
 |-------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------|
 | `chunk_len()` / `chunk_count()` / `len()` / `is_empty()`                            | Stride, chunk count, and total aligned byte length                                                                       |

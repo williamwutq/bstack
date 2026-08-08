@@ -2273,7 +2273,8 @@ mod tests {
 mod alloc_tests {
     use crate::BStack;
     use crate::alloc::{
-        BStackAllocator, BStackBulkAllocator, BStackRange, BStackSlice, LinearBStackAllocator,
+        BStackAllocator, BStackBulkAllocator, BStackChunk, BStackRange, BStackSlice,
+        LinearBStackAllocator,
     };
     use std::io::{Read, Seek, SeekFrom};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -3777,6 +3778,76 @@ mod alloc_tests {
         s.write([1u8, 2, 3, 4, 5, 6]).unwrap();
         assert_eq!(s.chunks(2).0.chunk_count(), 3);
         assert_eq!(s.rchunks(4).1.len(), 2);
+    }
+
+    // ---- BStackChunk: raw construction ---------------------------------------
+
+    // 10. from_raw_parts builds a view matching what chunks() would produce
+    // from the same coordinates.
+    #[test]
+    fn from_raw_parts_matches_chunks() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(9).unwrap();
+        let view = unsafe { BStackChunk::from_raw_parts(alloc.stack(), s.start(), 9, 3) };
+        assert_eq!(view.chunk_len(), 3);
+        assert_eq!(view.chunk_count(), 3);
+        assert_eq!(view.as_slice(), s.as_slice());
+        assert_eq!(view, s.as_slice().chunks(3).0);
+    }
+
+    // 11. from_raw_slice builds a view matching what chunks() would produce
+    // from the same slice.
+    #[test]
+    fn from_raw_slice_matches_chunks() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(9).unwrap();
+        let view = unsafe { BStackChunk::from_raw_slice(s.as_slice(), 3) };
+        assert_eq!(view, s.as_slice().chunks(3).0);
+    }
+
+    // 12. from_slice succeeds when the slice length is an exact, nonzero
+    // multiple of chunk_len, and reads back correctly.
+    #[cfg(feature = "set")]
+    #[test]
+    fn from_slice_valid() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut s = alloc.alloc(6).unwrap();
+        s.as_slice_mut().write([1u8, 2, 3, 4, 5, 6]).unwrap();
+        let view = BStackChunk::from_slice(s.as_slice(), 2).unwrap();
+        assert_eq!(view.chunk_count(), 3);
+        assert_eq!(view.get(1).unwrap().read().unwrap(), [3, 4]);
+    }
+
+    // 13. from_slice rejects a chunk_len that doesn't evenly divide the
+    // slice's length.
+    #[test]
+    fn from_slice_rejects_uneven_length() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(10).unwrap();
+        assert!(BStackChunk::from_slice(s.as_slice(), 3).is_none());
+    }
+
+    // 14. from_slice rejects chunk_len == 0, even for an empty slice.
+    #[test]
+    fn from_slice_rejects_zero_chunk_len() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(4).unwrap();
+        assert!(BStackChunk::from_slice(s.as_slice(), 0).is_none());
+        assert!(BStackChunk::from_slice(BStackSlice::empty(alloc.stack()), 0).is_none());
+    }
+
+    // 15. from_slice accepts a zero-length slice with any nonzero chunk_len.
+    #[test]
+    fn from_slice_accepts_empty_slice() {
+        let (alloc, _path) = mk_alloc();
+        let view = BStackChunk::from_slice(BStackSlice::empty(alloc.stack()), 4).unwrap();
+        assert!(view.is_empty());
+        assert_eq!(view.chunk_count(), 0);
     }
 
     // ---- BStackChunk: same_stride / same_phase / adjacent_to / overlaps -----
