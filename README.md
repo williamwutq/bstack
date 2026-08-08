@@ -479,6 +479,12 @@ assert!(stack.pop(stack.len()? - 60).is_err()); // would shrink below locked
 | `Hash`               | Hashes `(offset, len)`.                                            |
 | `PartialOrd` / `Ord` | Ordered by `offset`, then `len`.                                   |
 
+`BStackRange`, `BStackOwnedSlice`, and `BStackSlice` are also **cross-comparable**: `PartialEq` and
+`PartialOrd` are defined between every pair of the three (both directions), all keyed on the same
+`(offset, len)`, so a raw token, an allocation handle, and a borrowed view can be compared or sorted
+together directly without an explicit conversion. See [Slice Location Equality](#slice-location-equality)
+below for what this comparison does and does not mean.
+
 ### `BStackSliceReader` and `BStackSliceWriter` (`alloc` / `alloc + set` features)
 
 | Trait                | Semantics                                                                            |
@@ -970,11 +976,11 @@ A cursor-based reader over a `BStackSlice`. Implements `io::Read` and `io::Seek`
 
 ### Slice Location Equality
 
-`BStackSlice`, `BStackOwnedSlice`, and `BStackRange` implement `PartialEq` against each other — every pairing, both directions (`BStackSlice == BStackSlice`, `BStackOwnedSlice == BStackOwnedSlice`, `BStackSlice == BStackOwnedSlice`, `BStackRange == BStackSlice`, `BStackRange == BStackOwnedSlice`).
+`BStackSlice`, `BStackOwnedSlice`, and `BStackRange` implement `PartialEq` **and** `PartialOrd` against each other — every pairing, both directions (`BStackSlice` ↔ `BStackSlice`, `BStackOwnedSlice` ↔ `BStackOwnedSlice`, `BStackSlice` ↔ `BStackOwnedSlice`, `BStackRange` ↔ `BStackSlice`, `BStackRange` ↔ `BStackOwnedSlice`).
 
-This is **location equality**: it compares coordinates (`offset`, `len`), not the bytes stored there. Two slices over disjoint regions that happen to hold identical bytes compare unequal; two handles over the exact same region compare equal even before anything has been written. The comparison is synchronous and infallible — no I/O is performed.
+This is **location equality/ordering**: it compares coordinates (`offset`, `len`), not the bytes stored there. Two slices over disjoint regions that happen to hold identical bytes compare unequal; two handles over the exact same region compare equal even before anything has been written. `<`/`>` order by `offset`, then `len`, matching each type's own `Ord`. The comparison is synchronous and infallible — no I/O is performed.
 
-To compare *contents* instead, read both sides (`read()`/`read_into()`) and compare the resulting `Vec<u8>`/`[u8]` directly. `BStackByteVec` deliberately does **not** implement `PartialEq` against any of these types, since a meaningful comparison for a vec would require reading its header to resolve `len` first — an I/O operation `==` should not perform silently.
+To compare *contents* instead, read both sides (`read()`/`read_into()`) and compare the resulting `Vec<u8>`/`[u8]` directly. `BStackByteVec` deliberately implements **neither** trait against any of these types, since a meaningful comparison for a vec would require reading its header to resolve `len` first — an I/O operation `==`/`<` should not perform silently.
 
 ### Lifetime model
 

@@ -3241,6 +3241,32 @@ mod alloc_tests {
         assert_ne!(other, range);
     }
 
+    // 6. PartialOrd is cross-type consistent among BStackSlice / BStackOwnedSlice
+    //    / BStackRange, ordered by (offset, len) same as each type's own Ord.
+    #[test]
+    fn partial_ord_cross_type_matches_offset_order() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let a = alloc.alloc(4).unwrap(); // offset 0..4
+        let b = alloc.alloc(4).unwrap(); // offset 4..8
+        assert!(a.start() < b.start());
+        let a_slice = a.as_slice();
+        let b_slice = b.as_slice();
+        let b_range = b.as_range();
+
+        // BStackSlice <-> BStackOwnedSlice
+        assert!(a_slice < b);
+        assert!(b > a_slice);
+        // BStackSlice <-> BStackRange
+        assert!(a_slice < b_range);
+        assert!(b_range > a_slice);
+        // BStackOwnedSlice <-> BStackRange
+        assert!(a < b_range);
+        assert!(b_range > a);
+        // BStackSlice <-> BStackSlice (existing, sanity)
+        assert!(a_slice < b_slice);
+    }
+
     // ---- BStackBulkAllocator: alloc_bulk ------------------------------------
 
     // 1. Empty lengths → empty Vec, stack unchanged.

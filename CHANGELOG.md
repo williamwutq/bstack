@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **`BStackSlice`, `BStackOwnedSlice`, and `BStackRange` — cross-type `PartialEq` (`alloc`).** Every pairing among the three, both directions, compares `(offset, len)` coordinates only — location equality, not content — and performs no I/O. `BStackByteVec` deliberately does not participate: a meaningful comparison would require reading its header to resolve `len`, and `==` should not perform I/O silently.
+- **`BStackSlice`, `BStackOwnedSlice`, and `BStackRange` — cross-type `PartialEq` and `PartialOrd` (`alloc`).** Every pairing among the three, both directions, compares/orders on `(offset, len)` coordinates only — location, not content — and performs no I/O. `PartialOrd` matches each type's own `Ord` (by `offset`, then `len`). `BStackByteVec` deliberately does not participate in either trait: a meaningful comparison would require reading its header to resolve `len`, and `==`/`<` should not perform I/O silently.
 - **`BStackSlice` — `std`-slice-style ergonomic methods (`alloc`).** Read-only, no extra feature: `get(index)`, `head(n)`/`tail(n)`, `contains(byte)`, `starts_with`/`ends_with`, `find`/`rfind`, `position`/`rposition`, `split_at`/`split_at_mut`. Write methods (`set`): `fill(value)` (single `BStack::repeat` call), `fill_with(f)`, `copy_from_slice(src)`. Atomic compound writes (`set` + `atomic`, each a single crash-atomic `BStack` call): `copy_from_bstack_slice`, `copy_within`, `swap` (via `cross_exchange`), `reverse`, `rotate_left`/`rotate_right` (via `process`). `BStackOwnedSlice` mirrors the full set, delegating through `as_slice()`/`as_slice_mut()`.
 
 ## [0.4.1] - 2026-08-03

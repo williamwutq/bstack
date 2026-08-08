@@ -855,6 +855,20 @@ impl<'a> PartialEq<BStackSlice<'a>> for BStackRange {
     }
 }
 
+impl<'a> PartialOrd<BStackRange> for BStackSlice<'a> {
+    #[inline]
+    fn partial_cmp(&self, other: &BStackRange) -> Option<std::cmp::Ordering> {
+        Some(self.range.cmp(other))
+    }
+}
+
+impl<'a> PartialOrd<BStackSlice<'a>> for BStackRange {
+    #[inline]
+    fn partial_cmp(&self, other: &BStackSlice<'a>) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(&other.range))
+    }
+}
+
 impl<'a> From<BStackSlice<'a>> for BStackRange {
     #[inline]
     fn from(s: BStackSlice<'a>) -> BStackRange {
@@ -1486,6 +1500,34 @@ impl<'a, A: BStackAllocator> PartialEq<BStackOwnedSlice<'a, A>> for BStackRange 
     #[inline]
     fn eq(&self, other: &BStackOwnedSlice<'a, A>) -> bool {
         *self == other.range
+    }
+}
+
+impl<'a, A: BStackAllocator> PartialOrd<BStackSlice<'a>> for BStackOwnedSlice<'a, A> {
+    #[inline]
+    fn partial_cmp(&self, other: &BStackSlice<'a>) -> Option<std::cmp::Ordering> {
+        Some(self.range.cmp(&other.range))
+    }
+}
+
+impl<'a, A: BStackAllocator> PartialOrd<BStackOwnedSlice<'a, A>> for BStackSlice<'a> {
+    #[inline]
+    fn partial_cmp(&self, other: &BStackOwnedSlice<'a, A>) -> Option<std::cmp::Ordering> {
+        Some(self.range.cmp(&other.range))
+    }
+}
+
+impl<'a, A: BStackAllocator> PartialOrd<BStackRange> for BStackOwnedSlice<'a, A> {
+    #[inline]
+    fn partial_cmp(&self, other: &BStackRange) -> Option<std::cmp::Ordering> {
+        Some(self.range.cmp(other))
+    }
+}
+
+impl<'a, A: BStackAllocator> PartialOrd<BStackOwnedSlice<'a, A>> for BStackRange {
+    #[inline]
+    fn partial_cmp(&self, other: &BStackOwnedSlice<'a, A>) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(&other.range))
     }
 }
 
