@@ -113,24 +113,6 @@ Reference: https://github.com/williamwutq/bstack/pull/37
 - **Recovery format.** Whether commit reuses the existing multi-write journal (`wip_aux = MultiWrite`) unchanged — the guard still reduces to a flat non-overlapping `[offset, data]` set — or needs its own `wip_aux` mode.
 - **Naming.** `BStackInPlaceGuard`/`inplace_guard()`/`commit()`/`is_inplace_guarded()` are working names.
 
-## GhostTree allocator: multithreaded performance improvement
-
-**Feature flag:** `alloc` (optionally `atomic` for the `Sync` path)
-**Breaking change:** No — internal implementation only.
-
-### Motivation
-
-`benches/alloc.rs` result shows `GhostTreeBstackAllocator` is already the fastest general-purpose allocator in the suite, but its scaling under concurrency has received less attention than its single-threaded design: throughput rises from 1t to 4t and then flattens through 16t. This is consistent with `GhostTreeBstackAllocator::lock` — the single mutex serializing all non-tail `alloc`/`dealloc`/`realloc` — capping throughput once contention saturates it. As the crate's best-performing allocator, it is also the one most likely to be used under concurrent load, so its scaling behavior warrants continued performance work, independent of any specific defect.
-
-The mutex's scope and implementation are not in question here (see the `NOT PLANNED` entry on `FirstFitBStackAllocator`'s mutex), and no tree-sharding or other data-structure redesign is intended — that would be a different allocator. The improvement surface is reducing the amount of work done per operation while the mutex is held. Two examples found by code inspection, illustrative rather than exhaustive:
-
-- `avl_insert`, `avl_find_best_fit_and_remove`, and `avl_remove_min` each allocate a `Vec::with_capacity(MAX_AVL_DEPTH)` path buffer under the mutex on every call, despite `MAX_AVL_DEPTH` being a fixed compile-time bound that a stack array could cover instead.
-- In the up-pass of `avl_insert` and `avl_find_best_fit_and_remove`, `avl_write_and_update` calls `avl_height` on a child subtree whose height was already computed and written in the previous loop iteration, issuing an avoidable `BStack::get_into` (lock + syscall) to re-fetch it.
-
-### Open questions
-
-- **Validation.** Whether `mixed/uniform` workload is sufficient to measure improvement, or whether a contention-specific microbenchmark (concurrent non-tail alloc/dealloc only) is needed to isolate the critical-section-size effect.
-
 ## External-merge-sort strategy and partial sort for `BStackChunk`
 
 **Feature flag:** `alloc` + `set` + `atomic`, same as the `BStackChunk::sort_by`/`select_nth_by` family it extends.
