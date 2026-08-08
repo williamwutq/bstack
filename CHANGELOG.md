@@ -14,6 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`BStackChunk<'a>`/`BStackChunkIter<'a>` — fixed-stride view over `BStackSlice` (`alloc`).** `BStackSlice::chunks`/`rchunks` (mirrored on `BStackOwnedSlice`) return `(BStackChunk, BStackSlice)`: aligned view + remainder, pure offset arithmetic, no I/O. `as_slice`/`into_slice`/`with_stride` recover or re-chunk the aligned region. `PartialEq`/`Eq`/`Hash`/`PartialOrd`/`Ord` on `(chunk_len, region)`; no cross-type comparison with `BStackSlice`. Not an iterator itself: `iter()`/`IntoIterator` yield a `BStackChunkIter` (`DoubleEndedIterator` + `ExactSizeIterator` + `FusedIterator`), zero I/O per step.
 - **`BStackChunk` search/sort/select.** `binary_search_by`/`binary_search_by_key` (`alloc`): O(log n) chunk reads. `sort_by`/`sort_by_key`/`select_nth_by`/`select_nth_by_key` (`set` + `atomic`): one crash-atomic `BStack::process` call, in-place cycle-following permutation (O(1) scratch chunks, stack-allocated ≤128 B); `select_nth_*` mirrors `[T]::select_nth_unstable_by`.
 
+### Changed
+
+- **`GhostTreeBstackAllocator` — smaller AVL critical section (Rust + C, `alloc`).** `alloc`/`dealloc`/`realloc` of non-tail blocks do less work while holding the allocator mutex. The rebalance up-pass no longer re-reads and re-writes each ancestor through a redundant balance-factor pass — the balance factor and height computed by the node write are threaded into `avl_rebalance` — and each node now caches its two child heights, so the up-pass and rotations write one node per level and read no children in the common in-balance case (down from ~2 writes plus several reads per level). Rust also swaps the per-op heap `Vec` path buffer for a stack array of the fixed `MAX_AVL_DEPTH` bound. Purely internal — no API or observable-behavior change beyond throughput (~25–33% lower per-op latency under real `F_FULLFSYNC`, `benches/alloc.rs`).
+- **`GhostTreeBstackAllocator` version bumped to 0.1.3** (`alloc` + `set` features): Magic number updated from `ALGT\x00\x01\x02\x00` to `ALGT\x00\x01\x03\x00`. Reflects the new per-node child-height cache stored in the AVL node header's previously-reserved bytes. Existing 0.1.x files remain fully compatible (only the first 6 bytes are checked on open).
+
 ## [0.4.1] - 2026-08-03
 
 ### Added
