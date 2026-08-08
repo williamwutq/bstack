@@ -23,6 +23,11 @@
 //! * [`BStackSliceWriter`] — a cursor-based writer ([`io::Write`] + [`io::Seek`],
 //!   `set` feature).
 //!
+//! * [`BStackChunk<'a>`](BStackChunk) — a fixed-stride **view**, not an
+//!   iterator, from [`BStackSlice::chunks`]/[`rchunks`](BStackSlice::rchunks).
+//!   [`iter`](BStackChunk::iter) gives a lazy [`BStackChunkIter`]; `sort_by`,
+//!   `binary_search_by`, and `select_nth_by` operate on the view directly.
+//!
 //! * [`BStackAllocator`] — allocator trait.  `alloc`/`realloc`/`dealloc`
 //!   take and return `Self::Allocated<'a>`, which must implement
 //!   `Into<BStackOwnedSlice<'a, Self>>`.  [`into_stack`](BStackAllocator::into_stack)
@@ -136,7 +141,9 @@ use crate::BStack;
 use std::fmt;
 use std::io;
 
+pub mod chunk;
 pub mod slice;
+pub use chunk::{BStackChunk, BStackChunkIter};
 #[cfg(feature = "set")]
 pub use slice::BStackSliceWriter;
 pub use slice::{BStackOwnedSlice, BStackRange, BStackSlice, BStackSliceReader};
