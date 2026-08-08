@@ -233,7 +233,9 @@ impl<'a> BStackChunk<'a> {
     /// `[T]::binary_search_by`.
     ///
     /// Reads only the probed chunks — O(log n) chunk reads, never the whole
-    /// region. No feature flag beyond `alloc`: read-only.
+    /// region — into one reused buffer (stack-allocated for `chunk_len <=
+    /// INLINE_SCRATCH_LEN`), not a fresh allocation per probe. No feature
+    /// flag beyond `alloc`: read-only.
     ///
     /// Returns `Ok(Ok(index))` naming a matching chunk, or `Ok(Err(index))`
     /// with the index a matching chunk would need to be inserted at to keep
@@ -243,6 +245,16 @@ impl<'a> BStackChunk<'a> {
         &self,
         mut cmp: impl FnMut(&[u8]) -> Ordering,
     ) -> io::Result<Result<u64, u64>> {
+        let chunk_len = self.chunk_len as usize;
+        let mut inline = [0u8; INLINE_SCRATCH_LEN];
+        let mut heap;
+        let buf: &mut [u8] = if chunk_len <= INLINE_SCRATCH_LEN {
+            &mut inline[..chunk_len]
+        } else {
+            heap = vec![0u8; chunk_len];
+            &mut heap[..]
+        };
+
         let mut size = self.chunk_count();
         let mut left = 0u64;
         while size > 0 {
@@ -251,8 +263,8 @@ impl<'a> BStackChunk<'a> {
             let chunk = self
                 .get(mid)
                 .expect("binary_search_by: mid computed within bounds");
-            let bytes = chunk.read()?;
-            match cmp(&bytes) {
+            chunk.read_into(buf)?;
+            match cmp(buf) {
                 Ordering::Less => {
                     left = mid + 1;
                     size -= half + 1;
@@ -387,9 +399,8 @@ fn sort_chunks_by(buf: &mut [u8], chunk_len: usize, cmp: &mut dyn FnMut(&[u8], &
 }
 
 /// Chunk-sized scratch buffers up to this many bytes live on the stack;
-/// larger ones fall back to a heap allocation. Covers the common case (short
-/// fixed-width records) without a per-call allocation.
-#[cfg(all(feature = "set", feature = "atomic"))]
+/// larger ones fall back to a single heap allocation. Covers the common case
+/// (short fixed-width records) without allocating at all.
 const INLINE_SCRATCH_LEN: usize = 128;
 
 /// Reorder `buf`'s `chunk_len`-byte records so record `order[dest]` ends up
