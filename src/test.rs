@@ -3812,6 +3812,26 @@ mod alloc_tests {
         let (second_view, _) = second.as_slice().chunks(2);
         assert!(first_view < second_view); // same stride, earlier offset sorts first
     }
+
+    // 22. size_hint()/len() must clamp a u64 chunk count to usize::MAX rather
+    //     than silently truncating it when usize is narrower than u64 (32-bit
+    //     targets). The slice is constructed with a coordinate far beyond the
+    //     real (tiny) backing file — safe because no I/O is performed here,
+    //     only arithmetic on the coordinate.
+    #[test]
+    fn chunk_iter_size_hint_clamps_to_usize_max() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(0).unwrap();
+        let huge_len = (usize::MAX as u64).saturating_add(2);
+        let huge_slice = unsafe { BStackSlice::from_raw_parts(alloc.stack(), s.start(), huge_len) };
+        let (view, _rem) = huge_slice.chunks(1);
+        // The true chunk count (u64, unclamped) can exceed usize::MAX.
+        assert!(view.chunk_count() >= usize::MAX as u64);
+        let iter = view.iter();
+        assert_eq!(iter.size_hint(), (usize::MAX, Some(usize::MAX)));
+        assert_eq!(iter.len(), usize::MAX);
+    }
 }
 
 // -------------------------------------------------------------------------

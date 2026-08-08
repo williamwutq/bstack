@@ -506,6 +506,13 @@ impl<'a, A: BStackAllocator> BStackOwnedSlice<'a, A> {
 /// materialized into memory as a whole by this iterator, regardless of how
 /// many chunks it spans.
 ///
+/// Implements [`ExactSizeIterator`]: the chunk count is tracked internally as
+/// `u64` and is exact on 64-bit targets. On targets where `usize` is
+/// narrower than `u64` (e.g. 32-bit), a chunk count that doesn't fit in
+/// `usize` is clamped to `usize::MAX` rather than silently truncated —
+/// `size_hint()`/`len()` then under-report, but never wrap to a smaller,
+/// wrong value.
+///
 /// Constructed by [`BStackChunk::iter`] or `IntoIterator`.
 pub struct BStackChunkIter<'a> {
     remaining: BStackSlice<'a>,
@@ -547,7 +554,7 @@ impl<'a> Iterator for BStackChunkIter<'a> {
 
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let n = (self.remaining.len() / self.chunk_len) as usize;
+        let n = (self.remaining.len() / self.chunk_len).min(usize::MAX as u64) as usize;
         (n, Some(n))
     }
 }
