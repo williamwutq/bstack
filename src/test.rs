@@ -3006,6 +3006,62 @@ mod alloc_tests {
         assert!(!a.adjacent_to(&gapped));
     }
 
+    // ---- BStackRange: merge / merge_adjacent ---------------------------------
+
+    #[test]
+    fn range_merge_overlapping_returns_union() {
+        let a = BStackRange::new(0, 6); // 0..6
+        let b = BStackRange::new(4, 6); // 4..10
+        let merged = a.merge(&b).unwrap();
+        assert_eq!(merged.start(), 0);
+        assert_eq!(merged.end(), 10);
+    }
+
+    #[test]
+    fn range_merge_disjoint_non_empty_returns_none() {
+        let a = BStackRange::new(0, 5);
+        let b = BStackRange::new(10, 5);
+        assert!(a.merge(&b).is_none());
+    }
+
+    #[test]
+    fn range_merge_touching_non_overlapping_returns_none() {
+        // merge() requires overlap, not mere adjacency.
+        let a = BStackRange::new(0, 5);
+        let b = BStackRange::new(5, 5);
+        assert!(a.merge(&b).is_none());
+    }
+
+    #[test]
+    fn range_merge_empty_is_identity() {
+        let empty = BStackRange::new(100, 0);
+        let other = BStackRange::new(0, 10);
+        assert_eq!(empty.merge(&other), Some(other));
+        assert_eq!(other.merge(&empty), Some(other));
+        let other_empty = BStackRange::new(50, 0);
+        assert_eq!(empty.merge(&other_empty), Some(other_empty));
+    }
+
+    #[test]
+    fn range_merge_adjacent_touching_ranges() {
+        let a = BStackRange::new(0, 5); // 0..5
+        let b = BStackRange::new(5, 5); // 5..10
+        let merged = a.merge_adjacent(&b).unwrap();
+        assert_eq!(merged.start(), 0);
+        assert_eq!(merged.end(), 10);
+    }
+
+    #[test]
+    fn range_merge_adjacent_rejects_overlap_gap_and_empty() {
+        let a = BStackRange::new(0, 5);
+        let overlapping = BStackRange::new(4, 5);
+        let gapped = BStackRange::new(6, 5);
+        let empty_touching = BStackRange::new(5, 0);
+        assert!(a.merge_adjacent(&overlapping).is_none());
+        assert!(a.merge_adjacent(&gapped).is_none());
+        assert!(a.merge_adjacent(&empty_touching).is_none());
+    }
+
     // ---- BStackSlice: overlaps / adjacent_to (wrap BStackRange) -------------
 
     #[test]
@@ -3020,6 +3076,36 @@ mod alloc_tests {
         let tail = a.as_slice().subslice(2, 4); // 2..4, shares bytes [2, 4) with a
         assert!(a.as_slice().overlaps(&tail));
         assert!(!a.as_slice().adjacent_to(&tail));
+    }
+
+    // ---- BStackSlice: merge / merge_adjacent (wrap BStackRange) -------------
+
+    #[test]
+    fn slice_merge_overlapping_and_touching() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let a = alloc.alloc(4).unwrap(); // 0..4
+        let b = alloc.alloc(4).unwrap(); // 4..8
+        // Touching, not overlapping: merge() requires an actual overlap.
+        assert!(a.as_slice().merge(&b.as_slice()).is_none());
+        let merged = a.as_slice().merge_adjacent(&b.as_slice()).unwrap();
+        assert_eq!(merged.range(), 0..8);
+
+        let tail = a.as_slice().subslice(2, 4); // 2..4, overlaps a
+        let merged_overlap = a.as_slice().merge(&tail).unwrap();
+        assert_eq!(merged_overlap.range(), 0..4);
+    }
+
+    #[test]
+    fn slice_merge_rejects_different_backing_stacks() {
+        let (alloc_a, path_a) = mk_alloc();
+        let _ga = Guard(path_a);
+        let (alloc_b, path_b) = mk_alloc();
+        let _gb = Guard(path_b);
+        let a = alloc_a.alloc(4).unwrap();
+        let b = alloc_b.alloc(4).unwrap();
+        assert!(a.as_slice().merge(&b.as_slice()).is_none());
+        assert!(a.as_slice().merge_adjacent(&b.as_slice()).is_none());
     }
 
     // ---- BStackSlice: ergonomic write methods (feature `set`) --------------
@@ -3757,6 +3843,102 @@ mod alloc_tests {
         assert!(chunk_a.as_slice().overlaps(&chunk_shifted.as_slice())); // raw byte ranges do overlap
         assert!(!chunk_a.overlaps(&chunk_shifted));
         assert!(!chunk_a.adjacent_to(&chunk_shifted));
+    }
+
+    // ---- BStackChunk: merge / merge_adjacent ---------------------------------
+
+    #[test]
+    fn chunk_merge_overlapping_same_phase() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let a = alloc.alloc(8).unwrap(); // 0..8
+        let (chunk_a, _) = a.as_slice().chunks(4); // aligned 0..8, phase 0
+        let (chunk_tail, _) = a.as_slice().subslice(4, 8).chunks(4); // aligned 4..8, phase 0
+        let merged = chunk_a.merge(&chunk_tail).unwrap();
+        assert_eq!(merged.as_slice().range(), 0..8);
+        assert_eq!(merged.chunk_len(), 4);
+    }
+
+    #[test]
+    fn chunk_merge_different_phase_overlap_returns_none() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let a = alloc.alloc(8).unwrap(); // 0..8
+        let (chunk_a, _) = a.as_slice().chunks(4); // aligned 0..8, phase 0
+        let (chunk_shifted, _) = a.as_slice().subslice(2, 8).chunks(4); // aligned 2..6, phase 2
+        assert!(chunk_a.merge(&chunk_shifted).is_none());
+    }
+
+    #[test]
+    fn chunk_merge_different_stride_returns_none() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let a = alloc.alloc(8).unwrap();
+        let (chunk_a, _) = a.as_slice().chunks(4);
+        let (chunk_b, _) = a.as_slice().chunks(2);
+        assert!(chunk_a.merge(&chunk_b).is_none());
+    }
+
+    #[test]
+    fn chunk_merge_empty_is_identity_regardless_of_phase() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let a = alloc.alloc(8).unwrap(); // 0..8
+        let (chunk_a, _) = a.as_slice().chunks(4); // aligned 0..8, phase 0
+        // An empty chunk built from an odd offset lands on a different phase.
+        let (empty_chunk, _) = a.as_slice().subslice(1, 1).chunks(4);
+        assert!(empty_chunk.is_empty());
+        assert!(!empty_chunk.same_phase(&chunk_a));
+        assert_eq!(chunk_a.merge(&empty_chunk).unwrap(), chunk_a);
+        assert_eq!(empty_chunk.merge(&chunk_a).unwrap(), chunk_a);
+    }
+
+    #[test]
+    fn chunk_merge_adjacent_touching_same_phase() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let a = alloc.alloc(8).unwrap(); // 0..8
+        let b = alloc.alloc(8).unwrap(); // 8..16
+        let (chunk_a, _) = a.as_slice().chunks(4);
+        let (chunk_b, _) = b.as_slice().chunks(4);
+        let merged = chunk_a.merge_adjacent(&chunk_b).unwrap();
+        assert_eq!(merged.as_slice().range(), 0..16);
+        assert_eq!(merged.chunk_len(), 4);
+        // merge() alone doesn't cover the touching-but-non-overlapping case.
+        assert!(chunk_a.merge(&chunk_b).is_none());
+    }
+
+    // Byte-adjacency alone is not enough: BStackSlice::merge_adjacent knows
+    // nothing about stride, so without the same_phase (same_stride) guard a
+    // byte-adjacent pair of differently-strided chunks would merge and
+    // silently keep self's chunk_len, discarding other's.
+    #[test]
+    fn chunk_merge_adjacent_rejects_different_stride() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let a = alloc.alloc(8).unwrap(); // 0..8
+        let b = alloc.alloc(6).unwrap(); // 8..14
+        let (chunk_a, _) = a.as_slice().chunks(4); // aligned 0..8, stride 4
+        let (chunk_b, _) = b.as_slice().chunks(3); // aligned 8..14, stride 3
+        assert!(chunk_a.as_slice().adjacent_to(&chunk_b.as_slice())); // byte-adjacent
+        assert!(chunk_a.merge_adjacent(&chunk_b).is_none()); // but strides differ
+    }
+
+    #[test]
+    fn chunk_merge_adjacent_rejects_overlap_gap_and_empty() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let a = alloc.alloc(8).unwrap(); // 0..8
+        let _b = alloc.alloc(4).unwrap(); // 8..12, leaves a gap before c
+        let c = alloc.alloc(4).unwrap(); // 12..16
+        let (chunk_a, _) = a.as_slice().chunks(4);
+        let (chunk_tail, _) = a.as_slice().subslice(4, 8).chunks(4); // overlaps chunk_a
+        let (chunk_c, _) = c.as_slice().chunks(4); // same phase, but gapped by _b
+        let (empty_chunk, _) = a.as_slice().subslice(0, 0).chunks(4);
+
+        assert!(chunk_a.merge_adjacent(&chunk_tail).is_none()); // overlap, not touch
+        assert!(chunk_a.merge_adjacent(&chunk_c).is_none()); // gap
+        assert!(chunk_a.merge_adjacent(&empty_chunk).is_none()); // empty operand
     }
 
     // ---- BStackChunk: sort / search / select ---------------------------------

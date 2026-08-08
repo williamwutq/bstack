@@ -97,6 +97,45 @@ impl BStackRange {
         self.end() == other.start() || other.end() == self.start()
     }
 
+    /// Merge this range with `other` into a single range covering both.
+    ///
+    /// Succeeds if the ranges [`overlaps`](Self::overlaps), or if either is
+    /// empty — an empty range acts as an identity element, so merging with
+    /// one returns the other range unchanged. Returns `None` if both ranges
+    /// are non-empty and disjoint (see [`merge_adjacent`](Self::merge_adjacent)
+    /// for the touching-but-not-overlapping case).
+    #[inline]
+    pub fn merge(&self, other: &Self) -> Option<Self> {
+        if self.is_empty() {
+            return Some(*other);
+        }
+        if other.is_empty() {
+            return Some(*self);
+        }
+        if !self.overlaps(other) {
+            return None;
+        }
+        let start = self.offset.min(other.offset);
+        let end = self.end().max(other.end());
+        Some(Self::new(start, end - start))
+    }
+
+    /// Merge this range with `other` into a single range covering both,
+    /// requiring them to be [`adjacent_to`](Self::adjacent_to) each other.
+    ///
+    /// Unlike [`merge`](Self::merge), an empty range never merges here: both
+    /// ranges must be non-empty, in addition to touching end-to-end with no
+    /// gap.
+    #[inline]
+    pub fn merge_adjacent(&self, other: &Self) -> Option<Self> {
+        if self.is_empty() || other.is_empty() || !self.adjacent_to(other) {
+            return None;
+        }
+        let start = self.offset.min(other.offset);
+        let end = self.end().max(other.end());
+        Some(Self::new(start, end - start))
+    }
+
     /// Returns the range as `start..end`.
     #[inline]
     pub fn range(&self) -> Range<u64> {
@@ -322,6 +361,39 @@ impl<'a> BStackSlice<'a> {
     #[inline]
     pub fn adjacent_to(&self, other: &Self) -> bool {
         self.range.adjacent_to(&other.range)
+    }
+
+    /// Merge this slice with `other` into a single slice covering both.
+    ///
+    /// Delegates to [`BStackRange::merge`] on the underlying coordinates.
+    /// Returns `None` if the ranges are non-empty and disjoint, or if `self`
+    /// and `other` are backed by different [`BStack`]s.
+    #[inline]
+    pub fn merge(&self, other: &Self) -> Option<Self> {
+        if !std::ptr::eq(self.stack, other.stack) {
+            return None;
+        }
+        self.range.merge(&other.range).map(|range| Self {
+            stack: self.stack,
+            range,
+        })
+    }
+
+    /// Merge this slice with `other` into a single slice covering both,
+    /// requiring them to be adjacent and both non-empty.
+    ///
+    /// Delegates to [`BStackRange::merge_adjacent`] on the underlying
+    /// coordinates. Returns `None` if the slices are not adjacent, either is
+    /// empty, or `self` and `other` are backed by different [`BStack`]s.
+    #[inline]
+    pub fn merge_adjacent(&self, other: &Self) -> Option<Self> {
+        if !std::ptr::eq(self.stack, other.stack) {
+            return None;
+        }
+        self.range.merge_adjacent(&other.range).map(|range| Self {
+            stack: self.stack,
+            range,
+        })
     }
 
     /// Serialize the coordinate pair to a 16-byte array: `offset` (8 bytes LE) then `len` (8 bytes LE).

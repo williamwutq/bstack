@@ -165,6 +165,59 @@ impl<'a> BStackChunk<'a> {
         self.aligned.overlaps(&other.aligned) && self.same_phase(other)
     }
 
+    /// Merge this view with `other` into a single view covering both.
+    ///
+    /// Succeeds if the views [`overlaps`](Self::overlaps) (implying same
+    /// stride and phase), or if either view [`is_empty`](Self::is_empty) and
+    /// they [`same_stride`](Self::same_stride) — an empty view acts as an
+    /// identity element, so merging with one returns the other, non-empty
+    /// view unchanged regardless of phase.
+    ///
+    /// Returns `None` if the views use different strides, or if both are
+    /// non-empty and their aligned regions don't overlap.
+    pub fn merge(&self, other: &Self) -> Option<Self> {
+        if !self.same_stride(other) {
+            return None;
+        }
+        if self.is_empty() {
+            return Some(other.clone());
+        }
+        if other.is_empty() {
+            return Some(self.clone());
+        }
+        if !self.overlaps(other) {
+            return None;
+        }
+        let aligned = self.aligned.merge(&other.aligned)?;
+        Some(BStackChunk {
+            aligned,
+            chunk_len: self.chunk_len,
+        })
+    }
+
+    /// Merge this view with `other` into a single view covering both,
+    /// requiring them to be [`same_stride`](Self::same_stride) and touching
+    /// end-to-end with both non-empty — the latter two are enforced by the
+    /// underlying [`BStackSlice::merge_adjacent`] call.
+    ///
+    /// Same stride is the only phase-related precondition needed: for two
+    /// non-empty, same-stride chunk views, byte-adjacency already forces the
+    /// same phase (each view's aligned length is a multiple of its stride,
+    /// so the touching endpoint is congruent to both starts mod stride), so
+    /// checking [`same_phase`](Self::same_phase) here would be redundant.
+    ///
+    /// Returns `None` if the views are not adjacent.
+    pub fn merge_adjacent(&self, other: &Self) -> Option<Self> {
+        if !self.same_stride(other) {
+            return None;
+        }
+        let aligned = self.aligned.merge_adjacent(&other.aligned)?;
+        Some(BStackChunk {
+            aligned,
+            chunk_len: self.chunk_len,
+        })
+    }
+
     /// The aligned region covered by whole chunks, as a plain [`BStackSlice`].
     #[inline]
     pub fn as_slice(&self) -> BStackSlice<'a> {

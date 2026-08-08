@@ -965,6 +965,10 @@ Key methods on `BStackSlice`:
 | `find(byte)` / `rfind(byte)`                                         | Index of the first/last occurrence of a byte            |
 | `position(pred)` / `rposition(pred)`                                 | Index of the first/last byte matching a predicate       |
 | `reader()` / `reader_at(offset)`                                     | Cursor-based `BStackSliceReader`                        |
+| `overlaps(other)`                                                    | Whether the two slices share at least one byte          |
+| `adjacent_to(other)`                                                 | Whether the two slices touch end-to-end with no gap     |
+| `merge(other)`                                                       | Union into one slice if they overlap or either is empty |
+| `merge_adjacent(other)`                                              | Union into one slice if they are adjacent and non-empty |
 | `write(data)` *(feature `set`)*                                      | Overwrite the beginning of the region                   |
 | `write_range(start, data)` *(feature `set`)*                         | Overwrite a sub-range                                   |
 | `zero()` / `zero_range(start, n)` *(feature `set`)*                  | Zero the region or a sub-range                          |
@@ -996,6 +1000,12 @@ Obtained from `BStackSlice::chunks(chunk_len)` / `BStackSlice::rchunks(chunk_len
 | Method                                                                              | Description                                                                                                              |
 |-------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------|
 | `chunk_len()` / `chunk_count()` / `len()` / `is_empty()`                            | Stride, chunk count, and total aligned byte length                                                                       |
+| `same_stride(other)`                                                                | Whether the two views use the same `chunk_len`                                                                           |
+| `same_phase(other)`                                                                 | Same stride *and* aligned-region start offsets congruent mod `chunk_len`                                                 |
+| `adjacent_to(other)`                                                                | Same-phase and the aligned regions touch end-to-end with no gap — `false` unless `same_phase`                            |
+| `overlaps(other)`                                                                   | Same-phase and the aligned regions share at least one byte — `false` unless `same_phase`                                 |
+| `merge(other)`                                                                      | `Some` union if the views `overlaps`, or if either is empty and they `same_stride`; `None` otherwise                     |
+| `merge_adjacent(other)`                                                             | `Some` union if `same_stride` and the regions are adjacent and non-empty, thus also `same_phase`; `None` otherwise       |
 | `get(index)`                                                                        | The chunk at `index` as a `BStackSlice`, or `None` — O(1), no I/O                                                        |
 | `as_slice()` / `into_slice()`                                                       | The whole aligned region as a plain `BStackSlice` — by clone, or by consuming `self`                                     |
 | `with_stride(new_stride)`                                                           | Consume `self`, re-dividing the aligned region with a different stride — `(BStackChunk, BStackSlice)`, same as `chunks`  |
