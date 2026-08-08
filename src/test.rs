@@ -3488,6 +3488,330 @@ mod alloc_tests {
         assert_eq!(new[1].start(), 12);
         let _ = slices; // keep the first slice alive
     }
+
+    // ---- BStackChunk: construction, remainder, iteration --------------------
+
+    // 1. chunks() aligns from the start; leftover bytes are the tail remainder.
+    #[test]
+    fn chunks_basic_and_remainder() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(10).unwrap(); // 10 bytes, chunk_len 3 -> 3 chunks + 1 remainder
+        let (view, rem) = s.as_slice().chunks(3);
+        assert_eq!(view.chunk_len(), 3);
+        assert_eq!(view.chunk_count(), 3);
+        assert_eq!(view.len(), 9);
+        assert!(!view.is_empty());
+        assert_eq!(rem.len(), 1);
+        assert_eq!(rem.start(), 9); // trailing remainder
+    }
+
+    // 2. rchunks() aligns from the end; leftover bytes are the head remainder.
+    #[test]
+    fn rchunks_basic_and_remainder() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(10).unwrap();
+        let (view, rem) = s.as_slice().rchunks(3);
+        assert_eq!(view.chunk_count(), 3);
+        assert_eq!(view.len(), 9);
+        assert_eq!(rem.len(), 1);
+        assert_eq!(rem.start(), 0); // leading remainder
+        assert_eq!(view.as_slice().start(), 1); // aligned region starts after remainder
+    }
+
+    // 3. An evenly-divisible length has an empty remainder either way.
+    #[test]
+    fn chunks_no_remainder_when_evenly_divisible() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(9).unwrap();
+        assert!(s.as_slice().chunks(3).1.is_empty());
+        assert!(s.as_slice().rchunks(3).1.is_empty());
+    }
+
+    // 4. chunk_len == 0 panics for both constructors.
+    #[test]
+    #[should_panic(expected = "chunk_len must be nonzero")]
+    fn chunks_zero_chunk_len_panics() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(4).unwrap();
+        let _ = s.as_slice().chunks(0);
+    }
+
+    #[test]
+    #[should_panic(expected = "chunk_len must be nonzero")]
+    fn rchunks_zero_chunk_len_panics() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(4).unwrap();
+        let _ = s.as_slice().rchunks(0);
+    }
+
+    // 5. get() returns the correct bytes at each index and None out of bounds.
+    #[cfg(feature = "set")]
+    #[test]
+    fn chunk_get_by_index() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut s = alloc.alloc(6).unwrap();
+        s.as_slice_mut().write([1u8, 2, 3, 4, 5, 6]).unwrap();
+        let (view, _rem) = s.as_slice().chunks(2);
+        assert_eq!(view.get(0).unwrap().read().unwrap(), [1, 2]);
+        assert_eq!(view.get(1).unwrap().read().unwrap(), [3, 4]);
+        assert_eq!(view.get(2).unwrap().read().unwrap(), [5, 6]);
+        assert!(view.get(3).is_none());
+    }
+
+    // 6. iter() yields chunks in order without reading anything until asked.
+    #[cfg(feature = "set")]
+    #[test]
+    fn chunk_iter_forward() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut s = alloc.alloc(6).unwrap();
+        s.as_slice_mut().write([1u8, 2, 3, 4, 5, 6]).unwrap();
+        let (view, _rem) = s.as_slice().chunks(2);
+        let collected: Vec<Vec<u8>> = view.iter().map(|c| c.read().unwrap()).collect();
+        assert_eq!(collected, vec![vec![1, 2], vec![3, 4], vec![5, 6]]);
+    }
+
+    // 7. The iterator is double-ended and exact-sized.
+    #[cfg(feature = "set")]
+    #[test]
+    fn chunk_iter_double_ended_and_sized() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut s = alloc.alloc(6).unwrap();
+        s.as_slice_mut().write([1u8, 2, 3, 4, 5, 6]).unwrap();
+        let (view, _rem) = s.as_slice().chunks(2);
+        let mut it = view.iter();
+        assert_eq!(it.len(), 3);
+        assert_eq!(it.next().unwrap().read().unwrap(), [1, 2]);
+        assert_eq!(it.next_back().unwrap().read().unwrap(), [5, 6]);
+        assert_eq!(it.len(), 1);
+        assert_eq!(it.next().unwrap().read().unwrap(), [3, 4]);
+        assert!(it.next().is_none());
+        assert!(it.next_back().is_none());
+    }
+
+    // 8. BStackChunk is usable directly in a `for` loop, by value and by
+    //    reference, via IntoIterator.
+    #[cfg(feature = "set")]
+    #[test]
+    fn chunk_into_iterator() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut s = alloc.alloc(4).unwrap();
+        s.as_slice_mut().write([1u8, 2, 3, 4]).unwrap();
+        let (view, _rem) = s.as_slice().chunks(2);
+        let mut total = 0u32;
+        for chunk in &view {
+            total += chunk.read().unwrap().iter().map(|&b| b as u32).sum::<u32>();
+        }
+        assert_eq!(total, 10);
+        let mut count = 0;
+        for _chunk in view {
+            count += 1;
+        }
+        assert_eq!(count, 2);
+    }
+
+    // 9. BStackOwnedSlice::chunks/rchunks mirror BStackSlice's.
+    #[cfg(feature = "set")]
+    #[test]
+    fn owned_slice_chunks_mirror() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut s = alloc.alloc(6).unwrap();
+        s.write([1u8, 2, 3, 4, 5, 6]).unwrap();
+        assert_eq!(s.chunks(2).0.chunk_count(), 3);
+        assert_eq!(s.rchunks(4).1.len(), 2);
+    }
+
+    // ---- BStackChunk: sort / search / select ---------------------------------
+
+    // 10. sort_by reorders whole 3-byte records by their first byte, leaving
+    //     each record's remaining bytes attached and the remainder untouched.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn chunk_sort_by_orders_records() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut s = alloc.alloc(10).unwrap(); // 3 records of 3 bytes + 1 remainder byte
+        s.as_slice_mut()
+            .write([3u8, b'c', b'C', 1, b'a', b'A', 2, b'b', b'B', 0xFF])
+            .unwrap();
+        let (mut view, _rem) = s.as_slice().chunks(3);
+        view.sort_by(|a, b| a[0].cmp(&b[0])).unwrap();
+        let sorted = s.as_slice().read().unwrap();
+        assert_eq!(sorted, [1, b'a', b'A', 2, b'b', b'B', 3, b'c', b'C', 0xFF]);
+    }
+
+    // 11. sort_by_key: same as sort_by but keyed, and stable on equal keys.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn chunk_sort_by_key_is_stable() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut s = alloc.alloc(8).unwrap(); // 4 records of 2 bytes: key, tag
+        s.as_slice_mut()
+            .write([1u8, b'x', 0, b'a', 1, b'y', 0, b'b'])
+            .unwrap();
+        let (mut view, _rem) = s.as_slice().chunks(2);
+        view.sort_by_key(|c| c[0]).unwrap();
+        let sorted = s.as_slice().read().unwrap();
+        // Both key-0 records keep their relative order (a before b), likewise key-1.
+        assert_eq!(sorted, [0, b'a', 0, b'b', 1, b'x', 1, b'y']);
+    }
+
+    // 12. binary_search_by finds a present chunk and reports an insertion
+    //     point for an absent one, over already-ordered chunks.
+    #[cfg(feature = "set")]
+    #[test]
+    fn chunk_binary_search_by_found_and_not_found() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut s = alloc.alloc(8).unwrap(); // 4 ordered 2-byte records: keys 1,3,5,7
+        s.as_slice_mut().write([1u8, 0, 3, 0, 5, 0, 7, 0]).unwrap();
+        let (view, _rem) = s.as_slice().chunks(2);
+        assert_eq!(view.binary_search_by(|c| c[0].cmp(&5)).unwrap(), Ok(2));
+        assert_eq!(view.binary_search_by(|c| c[0].cmp(&4)).unwrap(), Err(2));
+        assert_eq!(view.binary_search_by(|c| c[0].cmp(&0)).unwrap(), Err(0));
+        assert_eq!(view.binary_search_by(|c| c[0].cmp(&8)).unwrap(), Err(4));
+    }
+
+    // 13. binary_search_by_key delegates to binary_search_by via a key fn.
+    #[cfg(feature = "set")]
+    #[test]
+    fn chunk_binary_search_by_key_works() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut s = alloc.alloc(6).unwrap();
+        s.as_slice_mut().write([2u8, 4, 6, 8, 10, 12]).unwrap();
+        let (view, _rem) = s.as_slice().chunks(2);
+        assert_eq!(view.binary_search_by_key(&6, |c| c[0]).unwrap(), Ok(1));
+        assert_eq!(view.binary_search_by_key(&7, |c| c[0]).unwrap(), Err(2));
+    }
+
+    // 14. select_nth_by places the nth chunk where it would land in a full
+    //     sort; every chunk before it compares <=, every chunk after >=.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn chunk_select_nth_by_partitions() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut s = alloc.alloc(5).unwrap(); // 5 single-byte records
+        s.as_slice_mut().write([5u8, 1, 4, 2, 3]).unwrap();
+        let (mut view, _rem) = s.as_slice().chunks(1);
+        view.select_nth_by(2, |a, b| a[0].cmp(&b[0])).unwrap();
+        let buf = s.as_slice().read().unwrap();
+        assert_eq!(buf[2], 3); // the median of 1..=5 lands at index 2
+        assert!(buf[..2].iter().all(|&v| v <= 3));
+        assert!(buf[3..].iter().all(|&v| v >= 3));
+    }
+
+    // 15. select_nth_by_key mirrors select_nth_by with a key function.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn chunk_select_nth_by_key_partitions() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut s = alloc.alloc(5).unwrap();
+        s.as_slice_mut().write([5u8, 1, 4, 2, 3]).unwrap();
+        let (mut view, _rem) = s.as_slice().chunks(1);
+        view.select_nth_by_key(2, |c| c[0]).unwrap();
+        let buf = s.as_slice().read().unwrap();
+        assert_eq!(buf[2], 3);
+    }
+
+    // 16. select_nth_by panics when n is out of bounds.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    #[should_panic(expected = "n must be < chunk_count")]
+    fn chunk_select_nth_by_out_of_bounds_panics() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(3).unwrap();
+        let (mut view, _rem) = s.as_slice().chunks(1);
+        view.select_nth_by(3, |a, b| a.cmp(b)).unwrap();
+    }
+
+    // 17. sort_by correctly applies a permutation containing multiple
+    //     disjoint cycles (a 2-cycle and a 4-cycle), exercising the
+    //     in-place cycle-following permutation logic beyond a single cycle.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn chunk_sort_by_multiple_cycles() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut s = alloc.alloc(6).unwrap();
+        s.as_slice_mut().write([5u8, 3, 1, 4, 2, 0]).unwrap();
+        let (mut view, _rem) = s.as_slice().chunks(1);
+        view.sort_by(|a, b| a.cmp(b)).unwrap();
+        assert_eq!(s.as_slice().read().unwrap(), [0, 1, 2, 3, 4, 5]);
+    }
+
+    // 18. into_slice() consumes the view and returns the aligned region.
+    #[test]
+    fn chunk_into_slice_returns_aligned_region() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(10).unwrap();
+        let (view, _rem) = s.as_slice().chunks(3);
+        let aligned = view.into_slice();
+        assert_eq!(aligned.start(), 0);
+        assert_eq!(aligned.len(), 9);
+    }
+
+    // 19. with_stride() re-divides the aligned region with a new stride.
+    #[test]
+    fn chunk_with_stride_rechunks_aligned_region() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(10).unwrap();
+        let (view, _rem) = s.as_slice().chunks(3); // aligned: 9 bytes, 1-byte remainder
+        let (restrided, new_rem) = view.with_stride(4);
+        assert_eq!(restrided.chunk_len(), 4);
+        assert_eq!(restrided.chunk_count(), 2); // 9 / 4 = 2, with 1 byte left
+        assert_eq!(new_rem.len(), 1);
+    }
+
+    // 20. PartialEq/Eq: same underlying region and same stride compare
+    //     equal; a different stride or a different region does not.
+    #[test]
+    fn chunk_partial_eq_requires_same_slice_and_stride() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(8).unwrap();
+        let (a, _) = s.as_slice().chunks(2);
+        let (b, _) = s.as_slice().chunks(2);
+        assert_eq!(a, b); // same region, same stride
+        let (c, _) = s.as_slice().chunks(4);
+        assert_ne!(a, c); // same region, different stride
+        let other = alloc.alloc(8).unwrap();
+        let (d, _) = other.as_slice().chunks(2);
+        assert_ne!(a, d); // different region, same stride
+    }
+
+    // 21. PartialOrd/Ord: ordered first by stride, then by the underlying
+    //     region.
+    #[test]
+    fn chunk_partial_ord_orders_by_stride_then_slice() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(8).unwrap();
+        let (small_stride, _) = s.as_slice().chunks(2);
+        let (large_stride, _) = s.as_slice().chunks(4);
+        assert!(small_stride < large_stride); // stride 2 < stride 4, regardless of region
+
+        let first = alloc.alloc(4).unwrap();
+        let second = alloc.alloc(4).unwrap();
+        let (first_view, _) = first.as_slice().chunks(2);
+        let (second_view, _) = second.as_slice().chunks(2);
+        assert!(first_view < second_view); // same stride, earlier offset sorts first
+    }
 }
 
 // -------------------------------------------------------------------------
