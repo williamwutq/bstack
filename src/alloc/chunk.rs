@@ -129,6 +129,42 @@ impl<'a> BStackChunk<'a> {
         self.aligned.is_empty()
     }
 
+    /// Returns `true` if this view and `other` use the same stride
+    /// (`chunk_len`).
+    #[inline]
+    pub fn same_stride(&self, other: &Self) -> bool {
+        self.chunk_len == other.chunk_len
+    }
+
+    /// Returns `true` if this view and `other` share a stride *and* their
+    /// chunk boundaries fall on the same phase — i.e. their aligned regions'
+    /// start offsets are congruent modulo `chunk_len`, so a chunk boundary in
+    /// one view lines up with a chunk boundary in the other wherever the
+    /// regions coincide.
+    #[inline]
+    pub fn same_phase(&self, other: &Self) -> bool {
+        self.same_stride(other)
+            && self.aligned.start() % self.chunk_len == other.aligned.start() % self.chunk_len
+    }
+
+    /// Returns `true` if this view and `other` are same-phase and their
+    /// aligned regions touch end-to-end with no gap and no overlap.
+    ///
+    /// Always `false` if the views are not [`same_phase`](Self::same_phase).
+    #[inline]
+    pub fn adjacent_to(&self, other: &Self) -> bool {
+        self.aligned.adjacent_to(&other.aligned) && self.same_phase(other)
+    }
+
+    /// Returns `true` if this view and `other` are same-phase and their
+    /// aligned regions share at least one byte.
+    ///
+    /// Always `false` if the views are not [`same_phase`](Self::same_phase).
+    #[inline]
+    pub fn overlaps(&self, other: &Self) -> bool {
+        self.aligned.overlaps(&other.aligned) && self.same_phase(other)
+    }
+
     /// The aligned region covered by whole chunks, as a plain [`BStackSlice`].
     #[inline]
     pub fn as_slice(&self) -> BStackSlice<'a> {

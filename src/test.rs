@@ -2272,7 +2272,9 @@ mod tests {
 #[cfg(all(test, feature = "alloc"))]
 mod alloc_tests {
     use crate::BStack;
-    use crate::alloc::{BStackAllocator, BStackBulkAllocator, BStackSlice, LinearBStackAllocator};
+    use crate::alloc::{
+        BStackAllocator, BStackBulkAllocator, BStackRange, BStackSlice, LinearBStackAllocator,
+    };
     use std::io::{Read, Seek, SeekFrom};
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -2959,6 +2961,67 @@ mod alloc_tests {
         assert_eq!(b.range(), 4..10);
     }
 
+    // ---- BStackRange: overlaps / adjacent_to ---------------------------------
+
+    #[test]
+    fn range_overlaps_shared_bytes() {
+        let a = BStackRange::new(0, 10);
+        let b = BStackRange::new(5, 10);
+        assert!(a.overlaps(&b));
+        assert!(b.overlaps(&a));
+    }
+
+    #[test]
+    fn range_overlaps_false_when_touching_or_disjoint() {
+        let a = BStackRange::new(0, 5);
+        let touching = BStackRange::new(5, 5);
+        let disjoint = BStackRange::new(10, 5);
+        assert!(!a.overlaps(&touching));
+        assert!(!a.overlaps(&disjoint));
+    }
+
+    #[test]
+    fn range_overlaps_false_for_empty_ranges() {
+        let empty = BStackRange::new(5, 0);
+        let containing = BStackRange::new(0, 10);
+        assert!(!empty.overlaps(&containing));
+        assert!(!containing.overlaps(&empty));
+        assert!(!empty.overlaps(&empty));
+    }
+
+    #[test]
+    fn range_adjacent_to_touching_ranges() {
+        let a = BStackRange::new(0, 5);
+        let b = BStackRange::new(5, 5);
+        assert!(a.adjacent_to(&b));
+        assert!(b.adjacent_to(&a));
+    }
+
+    #[test]
+    fn range_adjacent_to_false_when_overlapping_or_gapped() {
+        let a = BStackRange::new(0, 5);
+        let overlapping = BStackRange::new(4, 5);
+        let gapped = BStackRange::new(6, 5);
+        assert!(!a.adjacent_to(&overlapping));
+        assert!(!a.adjacent_to(&gapped));
+    }
+
+    // ---- BStackSlice: overlaps / adjacent_to (wrap BStackRange) -------------
+
+    #[test]
+    fn slice_overlaps_and_adjacent_to() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let a = alloc.alloc(4).unwrap(); // 0..4
+        let b = alloc.alloc(4).unwrap(); // 4..8
+        assert!(!a.as_slice().overlaps(&b.as_slice()));
+        assert!(a.as_slice().adjacent_to(&b.as_slice()));
+
+        let tail = a.as_slice().subslice(2, 4); // 2..4, shares bytes [2, 4) with a
+        assert!(a.as_slice().overlaps(&tail));
+        assert!(!a.as_slice().adjacent_to(&tail));
+    }
+
     // ---- BStackSlice: ergonomic write methods (feature `set`) --------------
 
     #[cfg(feature = "set")]
@@ -3628,6 +3691,72 @@ mod alloc_tests {
         s.write([1u8, 2, 3, 4, 5, 6]).unwrap();
         assert_eq!(s.chunks(2).0.chunk_count(), 3);
         assert_eq!(s.rchunks(4).1.len(), 2);
+    }
+
+    // ---- BStackChunk: same_stride / same_phase / adjacent_to / overlaps -----
+
+    #[test]
+    fn chunk_same_stride_and_same_phase() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(16).unwrap(); // 0..16
+        let (a, _) = s.as_slice().chunks(4);
+        let (b, _) = s.as_slice().chunks(4);
+        let (c, _) = s.as_slice().chunks(8);
+        assert!(a.same_stride(&b));
+        assert!(a.same_phase(&b));
+        assert!(!a.same_stride(&c));
+        assert!(!a.same_phase(&c));
+    }
+
+    #[test]
+    fn chunk_same_phase_checks_offset_congruence() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(16).unwrap(); // 0..16
+        let full = s.as_slice();
+        let (aligned_at_0, _) = full.subslice(0, 8).chunks(4); // aligned start 0, phase 0
+        let (aligned_at_4, _) = full.subslice(4, 12).chunks(4); // aligned start 4, phase 0
+        let (aligned_at_2, _) = full.subslice(2, 10).chunks(4); // aligned start 2, phase 2
+        assert!(aligned_at_0.same_phase(&aligned_at_4));
+        assert!(!aligned_at_0.same_phase(&aligned_at_2));
+    }
+
+    #[test]
+    fn chunk_adjacent_to_touching_same_phase_views() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let a = alloc.alloc(8).unwrap(); // 0..8
+        let b = alloc.alloc(8).unwrap(); // 8..16
+        let (chunk_a, _) = a.as_slice().chunks(4);
+        let (chunk_b, _) = b.as_slice().chunks(4);
+        assert!(chunk_a.adjacent_to(&chunk_b));
+        assert!(!chunk_a.overlaps(&chunk_b));
+    }
+
+    #[test]
+    fn chunk_overlaps_same_phase_views() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let a = alloc.alloc(8).unwrap(); // 0..8
+        let (chunk_a, _) = a.as_slice().chunks(4); // aligned 0..8, phase 0
+        let (chunk_tail, _) = a.as_slice().subslice(4, 8).chunks(4); // aligned 4..8, phase 0
+        assert!(chunk_a.overlaps(&chunk_tail));
+        assert!(!chunk_a.adjacent_to(&chunk_tail));
+    }
+
+    // Byte ranges overlapping isn't enough on its own: a phase mismatch must
+    // still suppress both adjacent_to and overlaps.
+    #[test]
+    fn chunk_overlapping_bytes_but_different_phase_is_neither() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let a = alloc.alloc(8).unwrap(); // 0..8
+        let (chunk_a, _) = a.as_slice().chunks(4); // aligned 0..8, phase 0
+        let (chunk_shifted, _) = a.as_slice().subslice(2, 8).chunks(4); // aligned 2..6, phase 2
+        assert!(chunk_a.as_slice().overlaps(&chunk_shifted.as_slice())); // raw byte ranges do overlap
+        assert!(!chunk_a.overlaps(&chunk_shifted));
+        assert!(!chunk_a.adjacent_to(&chunk_shifted));
     }
 
     // ---- BStackChunk: sort / search / select ---------------------------------

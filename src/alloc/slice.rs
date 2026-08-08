@@ -77,6 +77,26 @@ impl BStackRange {
         self.len == 0
     }
 
+    /// Returns `true` if this range and `other` share at least one byte.
+    ///
+    /// A zero-length range never overlaps anything, including another
+    /// zero-length range at the same offset.
+    #[inline]
+    pub fn overlaps(&self, other: &Self) -> bool {
+        !self.is_empty()
+            && !other.is_empty()
+            && self.offset < other.end()
+            && other.offset < self.end()
+    }
+
+    /// Returns `true` if this range and `other` touch end-to-end with no gap
+    /// and no overlap: `self.end() == other.start()` or `other.end() ==
+    /// self.start()`.
+    #[inline]
+    pub fn adjacent_to(&self, other: &Self) -> bool {
+        self.end() == other.start() || other.end() == self.start()
+    }
+
     /// Returns the range as `start..end`.
     #[inline]
     pub fn range(&self) -> Range<u64> {
@@ -282,6 +302,26 @@ impl<'a> BStackSlice<'a> {
     #[inline]
     pub fn as_range(&self) -> BStackRange {
         self.range
+    }
+
+    /// Returns `true` if this slice and `other` share at least one byte.
+    ///
+    /// Delegates to [`BStackRange::overlaps`] on the underlying coordinates;
+    /// does not check that both slices are backed by the same [`BStack`].
+    #[inline]
+    pub fn overlaps(&self, other: &Self) -> bool {
+        self.range.overlaps(&other.range)
+    }
+
+    /// Returns `true` if this slice and `other` touch end-to-end with no gap
+    /// and no overlap.
+    ///
+    /// Delegates to [`BStackRange::adjacent_to`] on the underlying
+    /// coordinates; does not check that both slices are backed by the same
+    /// [`BStack`].
+    #[inline]
+    pub fn adjacent_to(&self, other: &Self) -> bool {
+        self.range.adjacent_to(&other.range)
     }
 
     /// Serialize the coordinate pair to a 16-byte array: `offset` (8 bytes LE) then `len` (8 bytes LE).
