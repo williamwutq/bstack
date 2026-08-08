@@ -231,7 +231,7 @@ mod tests {
     impl FaultPolicy for FailAll {
         fn next_fault(&self, op: &'static str, seq: u64) -> Option<io::Error> {
             self.seen.lock().unwrap().push((op, seq));
-            Some(io::Error::new(io::ErrorKind::Other, "always"))
+            Some(io::Error::other("always"))
         }
     }
 

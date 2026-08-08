@@ -479,6 +479,22 @@ assert!(stack.pop(stack.len()? - 60).is_err()); // would shrink below locked
 | `Hash`               | Hashes `(offset, len)`.                                            |
 | `PartialOrd` / `Ord` | Ordered by `offset`, then `len`.                                   |
 
+`BStackRange`, `BStackOwnedSlice`, and `BStackSlice` are also **cross-comparable**: `PartialEq` and
+`PartialOrd` are defined between every pair of the three (both directions), all keyed on the same
+`(offset, len)`, so a raw token, an allocation handle, and a borrowed view can be compared or sorted
+together directly without an explicit conversion. See [Slice Location Equality](#slice-location-equality)
+below for what this comparison does and does not mean.
+
+**`BStackChunk<'a>`** — fixed-stride view carrying `&'a BStack`. Non-`Copy`, `Clone`.
+
+| Trait                | Semantics                                                                                   |
+|----------------------|---------------------------------------------------------------------------------------------|
+| `PartialEq` / `Eq`   | Compares `(chunk_len, aligned region)` — same stride *and* same underlying `(offset, len)`. |
+| `Hash`               | Hashes `(chunk_len, aligned region)`.                                                       |
+| `PartialOrd` / `Ord` | Ordered by `chunk_len` first, then by the aligned region's own `Ord`.                       |
+
+Deliberately **not** cross-comparable with `BStackSlice`/`BStackOwnedSlice`/`BStackRange` — a chunk view's stride is part of its identity, and comparing it directly against a bare slice would silently discard that.
+
 ### `BStackSliceReader` and `BStackSliceWriter` (`alloc` / `alloc + set` features)
 
 | Trait                | Semantics                                                                            |
@@ -765,15 +781,18 @@ The `alloc` feature adds typed region management over a `BStack` payload.
 
 ### Region handle design
 
-The `alloc` feature provides three distinct handle types for different roles:
+The `alloc` feature provides four distinct handle types for different roles:
 
 | Type                      | Carries      | Copy | I/O      | Alloc ops |
 |---------------------------|--------------|------|----------|-----------|
 | `BStackRange`             | nothing      | yes  | no       | no        |
 | `BStackOwnedSlice<'a, A>` | `&'a A`      | no   | via view | yes       |
 | `BStackSlice<'a>`         | `&'a BStack` | no   | yes      | no        |
+| `BStackChunk<'a>`         | `&'a BStack` | no   | yes      | no        |
 
 `BStackOwnedSlice` is non-`Copy` and non-`Clone`: an allocation has exactly one owner.  Obtaining an I/O view via `as_slice()` or `as_slice_mut()` ties the view's lifetime to the borrow of the owned slice, preventing it from outliving the handle.  `BStackSlice` is non-`Copy` so that `write*(&mut self)` provides single-writer exclusivity; it is `Clone` for explicit second views.
+
+`BStackChunk` sits at the same semantic position as `BStackSlice` — same `Carries`/`Copy`/`I/O`/`Alloc ops` columns, same non-`Copy`-but-`Clone` rationale — it is simply a `BStackSlice` with a fixed stride layered on top (see "`BStackChunk<'a>` — fixed-stride chunked view" below). It is not an iterator itself and has no allocator operations of its own.
 
 ### `BStackAllocator` trait
 
@@ -932,16 +951,33 @@ A borrowed I/O view carrying `&'a BStack` directly. Obtained from `BStackOwnedSl
 
 Key methods on `BStackSlice`:
 
-| Method                                              | Description                                 |
-|-----------------------------------------------------|---------------------------------------------|
-| `read()`                                            | Read the entire region into a new `Vec<u8>` |
-| `read_into(buf)`                                    | Read into a caller-supplied buffer          |
-| `read_range(start, end)`                            | Read a sub-range                            |
-| `subslice(start, end)`                              | Narrow to a sub-range                       |
-| `reader()` / `reader_at(offset)`                    | Cursor-based `BStackSliceReader`            |
-| `write(data)` *(feature `set`)*                     | Overwrite the beginning of the region       |
-| `write_range(start, data)` *(feature `set`)*        | Overwrite a sub-range                       |
-| `zero()` / `zero_range(start, n)` *(feature `set`)* | Zero the region or a sub-range              |
+| Method                                                               | Description                                             |
+|----------------------------------------------------------------------|---------------------------------------------------------|
+| `read()`                                                             | Read the entire region into a new `Vec<u8>`             |
+| `read_into(buf)`                                                     | Read into a caller-supplied buffer                      |
+| `read_range(start, end)`                                             | Read a sub-range                                        |
+| `subslice(start, end)`                                               | Narrow to a sub-range                                   |
+| `head(n)` / `tail(n)`                                                | Sub-view of the first/last `n` bytes (capped to length) |
+| `split_at(mid)` / `split_at_mut(mid)`                                | Split into two independent sub-views                    |
+| `get(index)`                                                         | Read a single byte, or `None` if out of bounds          |
+| `contains(byte)`                                                     | Whether the slice contains a byte                       |
+| `starts_with(prefix)` / `ends_with(suffix)`                          | Whether the slice starts/ends with a byte pattern       |
+| `find(byte)` / `rfind(byte)`                                         | Index of the first/last occurrence of a byte            |
+| `position(pred)` / `rposition(pred)`                                 | Index of the first/last byte matching a predicate       |
+| `reader()` / `reader_at(offset)`                                     | Cursor-based `BStackSliceReader`                        |
+| `write(data)` *(feature `set`)*                                      | Overwrite the beginning of the region                   |
+| `write_range(start, data)` *(feature `set`)*                         | Overwrite a sub-range                                   |
+| `zero()` / `zero_range(start, n)` *(feature `set`)*                  | Zero the region or a sub-range                          |
+| `fill(value)` *(feature `set`)*                                      | Overwrite the entire slice with one byte value          |
+| `fill_with(f)` *(feature `set`)*                                     | Overwrite the entire slice, generating each byte        |
+| `copy_from_slice(src)` *(feature `set`)*                             | Overwrite from a matching-length `&[u8]`                |
+| `copy_from_bstack_slice(src)` *(features `set` + `atomic`)*          | Overwrite from a matching-length `BStackSlice`          |
+| `copy_within(range, dest)` *(features `set` + `atomic`)*             | Copy a sub-range to another offset, in place            |
+| `swap(other)` *(features `set` + `atomic`)*                          | Exchange contents with another same-length slice        |
+| `reverse()` *(features `set` + `atomic`)*                            | Reverse the byte order in place                         |
+| `rotate_left(mid)` / `rotate_right(k)` *(features `set` + `atomic`)* | Rotate the slice in place                               |
+
+Every write method above is a single crash-atomic call. `BStackOwnedSlice` mirrors all of these (delegating through `as_slice()`/`as_slice_mut()`).
 
 ### `BStackRange`
 
@@ -950,6 +986,35 @@ A raw `(offset, len)` coordinate pair with no backing reference. `Copy`, seriali
 ### `BStackSliceReader`
 
 A cursor-based reader over a `BStackSlice`. Implements `io::Read` and `io::Seek`.
+
+### `BStackChunk<'a>` — fixed-stride chunked view
+
+A "slice with a stride": divides a region into `chunk_len`-byte records. Sits at the same semantic position as `BStackSlice` — carries `&'a BStack` directly, no allocator operations — but is a **view**, not an iterator; it does not implement `Iterator`. Non-`Copy`, `Clone`, same rationale as `BStackSlice`.
+
+Obtained from `BStackSlice::chunks(chunk_len)` / `BStackSlice::rchunks(chunk_len)` (mirrored on `BStackOwnedSlice`), each returning **`(BStackChunk<'a>, BStackSlice<'a>)`**: the aligned chunk view, plus whatever bytes are left over if `chunk_len` doesn't evenly divide the source length. `chunks` aligns from the start (leftover at the tail); `rchunks` aligns from the end (leftover at the head). No I/O — pure offset arithmetic, as cheap as `subslice`.
+
+| Method                                                                              | Description                                                                                                              |
+|-------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------|
+| `chunk_len()` / `chunk_count()` / `len()` / `is_empty()`                            | Stride, chunk count, and total aligned byte length                                                                       |
+| `get(index)`                                                                        | The chunk at `index` as a `BStackSlice`, or `None` — O(1), no I/O                                                        |
+| `as_slice()` / `into_slice()`                                                       | The whole aligned region as a plain `BStackSlice` — by clone, or by consuming `self`                                     |
+| `with_stride(new_stride)`                                                           | Consume `self`, re-dividing the aligned region with a different stride — `(BStackChunk, BStackSlice)`, same as `chunks`  |
+| `iter()` / `IntoIterator`                                                           | A lazy `BStackChunkIter` (see below); usable directly in a `for` loop, by value or `&view`                               |
+| `binary_search_by(cmp)` / `binary_search_by_key(target, key)`                       | Binary search over already-ordered chunks — O(log n) chunk reads, never the whole region.                                |
+| `sort_by(cmp)` / `sort_by_key(key)` *(features `set` + `atomic`)*                   | Stable sort of whole chunks by their bytes/a key. One `BStack::process` call                                             |
+| `select_nth_by(n, cmp)` / `select_nth_by_key(n, key)` *(features `set` + `atomic`)* | Partition so chunk `n` lands where a full sort would place it (`[T]::select_nth_unstable_by`); single-transaction atomic |
+
+**`BStackChunkIter`** — the lazy iterator returned by `iter()`/`IntoIterator`. `Item = BStackSlice<'a>`. Each `next()`/`next_back()` (it's `DoubleEndedIterator` + `ExactSizeIterator` + `FusedIterator`) is pure offset arithmetic and performs **no I/O**; actual bytes are only read when the caller calls `.read()` on an individual yielded chunk, one at a time — the chunked region is never materialized into memory as a whole by the iterator itself, regardless of size. (`sort_by`/`select_nth_by` are the exception: they intentionally read the whole aligned region at once, to commit as one crash-atomic transaction — a different, opt-in tradeoff from plain iteration.) The chunk count is tracked as `u64` and `size_hint()`/`len()` are exact on 64-bit targets; on targets where `usize` is narrower than `u64`, a count that overflows `usize` clamps to `usize::MAX` rather than wrapping.
+
+**`PartialEq`/`Eq`/`Hash`/`PartialOrd`/`Ord` for `BStackChunk`** — location equality/ordering over `(chunk_len, aligned_region)`: equal only when both the stride *and* the underlying region match; ordered first by stride, then by the region's own `Ord`. Unlike `BStackSlice`/`BStackOwnedSlice`/`BStackRange`, there is deliberately **no** cross-type comparison against a bare `BStackSlice` — a chunk view's stride is part of its identity, and comparing it directly to a slice would silently discard that.
+
+### Slice Location Equality
+
+`BStackSlice`, `BStackOwnedSlice`, and `BStackRange` implement `PartialEq` **and** `PartialOrd` against each other — every pairing, both directions (`BStackSlice` ↔ `BStackSlice`, `BStackOwnedSlice` ↔ `BStackOwnedSlice`, `BStackSlice` ↔ `BStackOwnedSlice`, `BStackRange` ↔ `BStackSlice`, `BStackRange` ↔ `BStackOwnedSlice`).
+
+This is **location equality/ordering**: it compares coordinates (`offset`, `len`), not the bytes stored there. Two slices over disjoint regions that happen to hold identical bytes compare unequal; two handles over the exact same region compare equal even before anything has been written. `<`/`>` order by `offset`, then `len`, matching each type's own `Ord`. The comparison is synchronous and infallible — no I/O is performed.
+
+To compare *contents* instead, read both sides (`read()`/`read_into()`) and compare the resulting `Vec<u8>`/`[u8]` directly. `BStackByteVec` deliberately implements **neither** trait against any of these types, since a meaningful comparison for a vec would require reading its header to resolve `len` first — an I/O operation `==`/`<` should not perform silently.
 
 ### Lifetime model
 
@@ -1048,14 +1113,14 @@ As a general guideline (based on `benches/alloc.rs` mixed-workload results):
 
 **Configuration** — all knobs are environment variables read once at startup:
 
-| Variable                 | Meaning                                                        | Default     |
-|--------------------------|----------------------------------------------------------------|-------------|
-| `BSTACK_BENCH_OP`        | op mix: preset name or `alloc,realloc,dealloc` weight triple   | `mixed`     |
-| `BSTACK_BENCH_SIZE`      | size distribution preset                                       | `uniform`   |
-| `BSTACK_BENCH_MAX`       | maximum allocation length drawn                                | `1024`      |
-| `BSTACK_BENCH_THREADS`   | comma-separated thread counts                                  | `1,2,4,16`  |
-| `BSTACK_BENCH_PRE_ALLOC` | live allocations pre-populated per benchmark                   | `256`       |
-| `BSTACK_BENCH_SEED`      | seed for the decision stream                                   | `48`        |
+| Variable                 | Meaning                                                      | Default    |
+|--------------------------|--------------------------------------------------------------|------------|
+| `BSTACK_BENCH_OP`        | op mix: preset name or `alloc,realloc,dealloc` weight triple | `mixed`    |
+| `BSTACK_BENCH_SIZE`      | size distribution preset                                     | `uniform`  |
+| `BSTACK_BENCH_MAX`       | maximum allocation length drawn                              | `1024`     |
+| `BSTACK_BENCH_THREADS`   | comma-separated thread counts                                | `1,2,4,16` |
+| `BSTACK_BENCH_PRE_ALLOC` | live allocations pre-populated per benchmark                 | `256`      |
+| `BSTACK_BENCH_SEED`      | seed for the decision stream                                 | `48`       |
 
 Op-mix presets: `mixed`, `alloc-only`, `alloc-heavy`, `realloc-heavy`, `churn`.  
 Size presets: `uniform`, `fixed`, `gamma[:k:theta_frac]`, `bimodal[:small:p_large]`.

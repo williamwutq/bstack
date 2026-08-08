@@ -1,5 +1,5 @@
 #![cfg(all(test, feature = "alloc", feature = "set"))]
-
+#[allow(clippy::module_inception)]
 mod alloc_fuzz_tests {
     use crate::alloc::{
         BStackOwnedSlice, BStackOwnedSliceAllocator, BStackRange, FirstFitBStackAllocator,

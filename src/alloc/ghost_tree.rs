@@ -13,7 +13,7 @@ use std::marker::PhantomData;
 #[cfg(feature = "atomic")]
 use std::sync::Mutex;
 
-const ALGT_MAGIC: [u8; 8] = *b"ALGT\x00\x01\x02\x00";
+const ALGT_MAGIC: [u8; 8] = *b"ALGT\x00\x01\x03\x00";
 const ALGT_MAGIC_PREFIX: [u8; 6] = *b"ALGT\x00\x01";
 
 /// Payload offset of the magic number.
@@ -39,6 +39,13 @@ const MAX_AVL_DEPTH: u32 = 128;
 const NODE_SIZE_OFF: u64 = 0;
 const NODE_BF_OFF: u64 = 8; // i8 balance factor
 const NODE_HEIGHT_OFF: u64 = 9; // u8 height (max ~59 for balanced; slightly more tolerated)
+// Cached child heights, denormalized so a parent read during a down-pass yields
+// the height of its untouched (sibling) child without a separate read of that
+// child on the way back up.  Maintained by every node write; rebuilt from
+// scratch by `coalesce_and_rebalance` on open, so old-format arenas (whose
+// reserved bytes were zero) self-upgrade transparently.
+const NODE_LH_OFF: u64 = 10; // u8 cached height of the left child
+const NODE_RH_OFF: u64 = 11; // u8 cached height of the right child
 const NODE_LEFT_OFF: u64 = 16;
 const NODE_RIGHT_OFF: u64 = 24;
 
@@ -47,13 +54,21 @@ const NODE_RIGHT_OFF: u64 = 24;
 /// Used by [`avl_insert`](GhostTreeBstackAllocator::avl_insert) and
 /// [`avl_find_best_fit_and_remove`](GhostTreeBstackAllocator::avl_find_best_fit_and_remove)
 /// to record the path so that balance factors and heights can be updated on
-/// the way back up without recursion.
+/// the way back up without recursion.  Recorded on a fixed-size stack array of
+/// [`MAX_AVL_DEPTH`] entries, so it must be `Copy` and cheaply default-able.
+#[derive(Clone, Copy, Default)]
 struct PathEntry {
     ptr: u64,
     size: u64,
     left: u64,
     right: u64,
     went_left: bool,
+    /// This node's cached child heights, read from its denormalized cache during
+    /// the down-pass.  The sibling (untouched) child's height is stable across
+    /// the operation — nothing off the path is modified — so the up-pass writes
+    /// this node with both child heights known and reads neither.
+    lh: u8,
+    rh: u8,
 }
 
 /// A pure-AVL general-purpose allocator built on top of a [`BStack`].
@@ -278,13 +293,32 @@ impl GhostTreeBstackAllocator {
         Ok((size, bf, height, left, right))
     }
 
-    /// Write a complete AVL node at `ptr`.
+    /// Read the node at `ptr` for a down-pass, returning `(size, left, right,
+    /// lh, rh)` where `lh`/`rh` are the node's cached child heights.  Same single
+    /// `get` as [`read_node`](Self::read_node); the cache lets the up-pass skip
+    /// re-reading the untouched sibling child.
+    fn read_node_hc(&self, ptr: u64) -> io::Result<(u64, u64, u64, u8, u8)> {
+        let buf = &mut [0u8; 32];
+        self.stack.get_into(ptr, buf)?;
+        let size = read_buf_le!(buf, NODE_SIZE_OFF  => u64);
+        let left = read_buf_le!(buf, NODE_LEFT_OFF  => u64);
+        let right = read_buf_le!(buf, NODE_RIGHT_OFF => u64);
+        let lh = read_buf_le!(buf, NODE_LH_OFF     => u8);
+        let rh = read_buf_le!(buf, NODE_RH_OFF     => u8);
+        Ok((size, left, right, lh, rh))
+    }
+
+    /// Write a complete AVL node at `ptr`, including the denormalized child-height
+    /// cache (`lh`, `rh` = heights of `left`, `right`).
+    #[allow(clippy::too_many_arguments)] // one serialization site; grouping into a struct would not aid clarity
     fn write_node(
         &self,
         ptr: u64,
         size: u64,
         bf: i8,
         height: u8,
+        lh: u8,
+        rh: u8,
         left: u64,
         right: u64,
     ) -> io::Result<()> {
@@ -292,6 +326,8 @@ impl GhostTreeBstackAllocator {
         write_buf!(size   => buf, NODE_SIZE_OFF);
         write_buf!(bf     => buf, NODE_BF_OFF);
         write_buf!(height => buf, NODE_HEIGHT_OFF);
+        write_buf!(lh     => buf, NODE_LH_OFF);
+        write_buf!(rh     => buf, NODE_RH_OFF);
         write_buf!(left   => buf, NODE_LEFT_OFF);
         write_buf!(right  => buf, NODE_RIGHT_OFF);
         self.stack.set(ptr, buf)?;
@@ -322,30 +358,48 @@ impl GhostTreeBstackAllocator {
         Ok(height)
     }
 
-    /// Write `(size, left, right)` to `ptr`, computing bf and height from the
-    /// children's stored heights in one pass.  Returns the balance factor.
+    /// Write `(size, left, right)` to `ptr`, computing bf and height in one pass,
+    /// and return `(bf, height)`.
     ///
-    /// Replaces the `write_node(…, 0, 0, …) + avl_update_bf` pair: instead of
-    /// writing stale zeros and reading back, we read the two child heights once,
-    /// compute both fields, and write the node exactly once.
+    /// A child's height passed as `Some` is used directly — the caller already
+    /// knows it, e.g. from the node written in the previous up-pass step or from
+    /// a sibling untouched by a rotation — which avoids a `get_into` (lock +
+    /// syscall) to re-read that child.  `None` reads the height from the child.
     #[inline]
-    fn avl_write_and_update(&self, ptr: u64, size: u64, left: u64, right: u64) -> io::Result<i8> {
-        let lh = self.avl_height(left)? as i16;
-        let rh = self.avl_height(right)? as i16;
+    fn avl_write_h(
+        &self,
+        ptr: u64,
+        size: u64,
+        left: u64,
+        right: u64,
+        lh: Option<u8>,
+        rh: Option<u8>,
+    ) -> io::Result<(i8, u8)> {
+        let lh = match lh {
+            Some(h) => h as i16,
+            None => self.avl_height(left)? as i16,
+        };
+        let rh = match rh {
+            Some(h) => h as i16,
+            None => self.avl_height(right)? as i16,
+        };
         let bf = (rh - lh) as i8;
         let height = (1 + lh.max(rh)) as u8;
-        self.write_node(ptr, size, bf, height, left, right)?;
-        Ok(bf)
+        self.write_node(ptr, size, bf, height, lh as u8, rh as u8, left, right)?;
+        Ok((bf, height))
     }
 
-    /// Recompute bf and height for `node` from its children's stored heights,
-    /// write both back, and return the balance factor.
-    ///
-    /// O(1) — delegates to [`avl_write_and_update`](Self::avl_write_and_update).
+    /// Write `(size, left, right)` to `ptr`, reading both child heights, and
+    /// return `(bf, height)`.  Thin wrapper over [`avl_write_h`](Self::avl_write_h).
     #[inline]
-    fn avl_update_bf(&self, node: u64) -> io::Result<i8> {
-        let (size, _, _, left, right) = self.read_node(node)?;
-        self.avl_write_and_update(node, size, left, right)
+    fn avl_write_and_update(
+        &self,
+        ptr: u64,
+        size: u64,
+        left: u64,
+        right: u64,
+    ) -> io::Result<(i8, u8)> {
+        self.avl_write_h(ptr, size, left, right, None, None)
     }
 
     /// Right-rotate around `node`; return the new subtree root.
@@ -357,12 +411,24 @@ impl GhostTreeBstackAllocator {
     ///  / \                   /    \
     /// L   M                 M      R
     /// ```
-    fn avl_rotate_right(&self, node: u64) -> io::Result<u64> {
-        let (node_sz, _, _, pivot, node_r) = self.read_node(node)?;
-        let (pivot_sz, _, _, pivot_l, pivot_r) = self.read_node(pivot)?;
-        self.avl_write_and_update(node, node_sz, pivot_r, node_r)?;
-        self.avl_write_and_update(pivot, pivot_sz, pivot_l, node)?;
-        Ok(pivot)
+    fn avl_rotate_right(&self, node: u64) -> io::Result<(u64, u8)> {
+        // Read both nodes' cached child heights so neither rewrite re-reads a
+        // child.  (`node`'s left child is `pivot`, whose height is not needed.)
+        let (node_sz, pivot, node_r, _node_lh, node_rh) = self.read_node_hc(node)?;
+        let (pivot_sz, pivot_l, pivot_r, pivot_lh, pivot_rh) = self.read_node_hc(pivot)?;
+        // `node`'s new children (pivot_r, node_r) → heights (pivot_rh, node_rh).
+        let (_, node_h) = self.avl_write_h(
+            node,
+            node_sz,
+            pivot_r,
+            node_r,
+            Some(pivot_rh),
+            Some(node_rh),
+        )?;
+        // `pivot`'s new children (pivot_l, node) → heights (pivot_lh, node_h).
+        let (_, pivot_h) =
+            self.avl_write_h(pivot, pivot_sz, pivot_l, node, Some(pivot_lh), Some(node_h))?;
+        Ok((pivot, pivot_h))
     }
 
     /// Left-rotate around `node`; return the new subtree root.
@@ -374,28 +440,45 @@ impl GhostTreeBstackAllocator {
     ///     /  \        /  \
     ///    M    R      L    M
     /// ```
-    fn avl_rotate_left(&self, node: u64) -> io::Result<u64> {
-        let (node_sz, _, _, node_l, pivot) = self.read_node(node)?;
-        let (pivot_sz, _, _, pivot_l, pivot_r) = self.read_node(pivot)?;
-        self.avl_write_and_update(node, node_sz, node_l, pivot_l)?;
-        self.avl_write_and_update(pivot, pivot_sz, node, pivot_r)?;
-        Ok(pivot)
+    fn avl_rotate_left(&self, node: u64) -> io::Result<(u64, u8)> {
+        // Read both nodes' cached child heights so neither rewrite re-reads a
+        // child.  (`node`'s right child is `pivot`, whose height is not needed.)
+        let (node_sz, node_l, pivot, node_lh, _node_rh) = self.read_node_hc(node)?;
+        let (pivot_sz, pivot_l, pivot_r, pivot_lh, pivot_rh) = self.read_node_hc(pivot)?;
+        // `node`'s new children (node_l, pivot_l) → heights (node_lh, pivot_lh).
+        let (_, node_h) = self.avl_write_h(
+            node,
+            node_sz,
+            node_l,
+            pivot_l,
+            Some(node_lh),
+            Some(pivot_lh),
+        )?;
+        // `pivot`'s new children (node, pivot_r) → heights (node_h, pivot_rh).
+        let (_, pivot_h) =
+            self.avl_write_h(pivot, pivot_sz, node, pivot_r, Some(node_h), Some(pivot_rh))?;
+        Ok((pivot, pivot_h))
     }
 
     /// Fix imbalance at `node` after an insert or remove, then return the
-    /// (possibly new) subtree root.  Children must already be balanced.
+    /// (possibly new) subtree root and its height.  Children must already be
+    /// balanced.
+    ///
+    /// The caller passes the `bf` and `height` already computed by the
+    /// [`avl_write_h`](Self::avl_write_h) that installed `node`'s current
+    /// children, so the common in-balance case needs no further I/O — it just
+    /// returns `(node, height)`.
     ///
     /// Uses `< -1` / `> 1` rather than `== -2` / `== 2` so that a node whose
     /// balance factor exceeds ±2 (possible after crash recovery) still gets
     /// corrected instead of silently passed over.
-    fn avl_rebalance(&self, node: u64) -> io::Result<u64> {
-        let bf = self.avl_update_bf(node)?;
+    fn avl_rebalance(&self, node: u64, bf: i8, height: u8) -> io::Result<(u64, u8)> {
         if bf < -1 {
             let (_, _, _, left, _) = self.read_node(node)?;
             let (_, left_bf, _, _, _) = self.read_node(left)?;
             if left_bf > 0 {
                 // Left-right case: rotate left child left first.
-                let new_left = self.avl_rotate_left(left)?;
+                let (new_left, _) = self.avl_rotate_left(left)?;
                 let (node_sz, _, _, _, node_r) = self.read_node(node)?;
                 self.avl_write_and_update(node, node_sz, new_left, node_r)?;
             }
@@ -405,13 +488,13 @@ impl GhostTreeBstackAllocator {
             let (_, right_bf, _, _, _) = self.read_node(right)?;
             if right_bf < 0 {
                 // Right-left case: rotate right child right first.
-                let new_right = self.avl_rotate_right(right)?;
+                let (new_right, _) = self.avl_rotate_right(right)?;
                 let (node_sz, _, _, node_l, _) = self.read_node(node)?;
                 self.avl_write_and_update(node, node_sz, node_l, new_right)?;
             }
             self.avl_rotate_left(node)
         } else {
-            Ok(node)
+            Ok((node, height))
         }
     }
 
@@ -419,41 +502,55 @@ impl GhostTreeBstackAllocator {
     fn avl_insert(&self, ptr: u64, size: u64) -> io::Result<()> {
         let root = self.read_root()?;
 
-        // Down-pass: walk to the insertion position, recording the path.
-        let mut path: Vec<PathEntry> = Vec::with_capacity(MAX_AVL_DEPTH as usize);
+        // Down-pass: walk to the insertion position, recording the path on a
+        // fixed-size stack array.  `MAX_AVL_DEPTH` is a compile-time bound, so
+        // this avoids a heap allocation on every insert under the mutex.
+        let mut path = [PathEntry::default(); MAX_AVL_DEPTH as usize];
+        let mut path_len = 0usize;
         let mut current = root;
         while current != NULL_PTR {
-            if path.len() >= MAX_AVL_DEPTH as usize {
+            if path_len >= MAX_AVL_DEPTH as usize {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "AVL insert exceeded maximum depth: corrupted tree (possible cycle)",
                 ));
             }
-            let (root_sz, _, _, left, right) = self.read_node(current)?;
+            let (root_sz, left, right, lh, rh) = self.read_node_hc(current)?;
             let went_left = (size, ptr) < (root_sz, current);
-            path.push(PathEntry {
+            path[path_len] = PathEntry {
                 ptr: current,
                 size: root_sz,
                 left,
                 right,
                 went_left,
-            });
+                lh,
+                rh,
+            };
+            path_len += 1;
             current = if went_left { left } else { right };
         }
 
-        // Write the new leaf.
-        self.write_node(ptr, size, 0, 1, NULL_PTR, NULL_PTR)?;
+        // Write the new leaf (height 1, null children → cached child heights 0).
+        self.write_node(ptr, size, 0, 1, 0, 0, NULL_PTR, NULL_PTR)?;
 
-        // Up-pass: propagate the new child pointer and rebalance each ancestor.
+        // Up-pass: install the new child pointer in each ancestor and rebalance.
+        // Both child heights are known — the modified child from the previous
+        // iteration, the untouched sibling from this node's cache read on the
+        // way down — so `avl_write_h` reads neither.  The `(bf, height)` it
+        // returns is handed to `avl_rebalance`, so the in-balance case does no
+        // further I/O: one write per level, zero reads.
         let mut child = ptr;
-        for entry in path.iter().rev() {
-            let (new_left, new_right) = if entry.went_left {
-                (child, entry.right)
+        let mut child_h = 1u8; // leaf height
+        for entry in path[..path_len].iter().rev() {
+            let (new_left, new_right, lh, rh) = if entry.went_left {
+                (child, entry.right, Some(child_h), Some(entry.rh))
             } else {
-                (entry.left, child)
+                (entry.left, child, Some(entry.lh), Some(child_h))
             };
-            self.avl_write_and_update(entry.ptr, entry.size, new_left, new_right)?;
-            child = self.avl_rebalance(entry.ptr)?;
+            let (bf, h) = self.avl_write_h(entry.ptr, entry.size, new_left, new_right, lh, rh)?;
+            let (new_root, new_h) = self.avl_rebalance(entry.ptr, bf, h)?;
+            child = new_root;
+            child_h = new_h;
         }
         self.write_root(child)
     }
@@ -464,27 +561,45 @@ impl GhostTreeBstackAllocator {
     /// Returns `(min_ptr, min_size, new_subtree_root)`.  The minimum node always
     /// has no left child, so its replacement is its right child (or [`NULL_PTR`]).
     fn avl_remove_min(&self, root: u64) -> io::Result<(u64, u64, u64)> {
-        // Walk left, recording (ptr, size, right_child) for each ancestor.
-        let mut path: Vec<(u64, u64, u64)> = Vec::with_capacity(MAX_AVL_DEPTH as usize);
+        // Walk left, recording (ptr, size, right_child, right_child_height) for
+        // each ancestor on a fixed-size stack array (no heap allocation under the
+        // mutex).  The cached right-child height lets the up-pass write each
+        // ancestor with both child heights known.
+        let mut path = [(0u64, 0u64, 0u64, 0u8); MAX_AVL_DEPTH as usize];
+        let mut path_len = 0usize;
         let mut current = root;
         loop {
-            let (size, _, _, left, right) = self.read_node(current)?;
+            let (size, left, right, _lh, rh) = self.read_node_hc(current)?;
             if left == NULL_PTR {
-                // `current` is the minimum; replace it with its right child.
+                // `current` is the minimum; replace it with its right child, whose
+                // height is `current`'s cached right height.  `child` is always
+                // the left side going up; both child heights are known each step,
+                // so `avl_write_h` reads neither.
                 let mut child = right;
-                for &(anc_ptr, anc_sz, anc_right) in path.iter().rev() {
-                    self.avl_write_and_update(anc_ptr, anc_sz, child, anc_right)?;
-                    child = self.avl_rebalance(anc_ptr)?;
+                let mut child_h = rh;
+                for &(anc_ptr, anc_sz, anc_right, anc_right_h) in path[..path_len].iter().rev() {
+                    let (bf, h) = self.avl_write_h(
+                        anc_ptr,
+                        anc_sz,
+                        child,
+                        anc_right,
+                        Some(child_h),
+                        Some(anc_right_h),
+                    )?;
+                    let (new_root, new_h) = self.avl_rebalance(anc_ptr, bf, h)?;
+                    child = new_root;
+                    child_h = new_h;
                 }
                 return Ok((current, size, child));
             }
-            if path.len() >= MAX_AVL_DEPTH as usize {
+            if path_len >= MAX_AVL_DEPTH as usize {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "AVL min exceeded maximum depth: corrupted tree (possible cycle)",
                 ));
             }
-            path.push((current, size, right));
+            path[path_len] = (current, size, right, rh);
+            path_len += 1;
             current = left;
         }
     }
@@ -504,37 +619,45 @@ impl GhostTreeBstackAllocator {
             return Ok(None);
         }
 
-        // Down-pass: record the full traversal path and the index of the last
+        // Down-pass: record the full traversal path (on a fixed-size stack
+        // array, no heap allocation under the mutex) and the index of the last
         // node that satisfies size >= min_size (the best fit).
-        let mut path: Vec<PathEntry> = Vec::with_capacity(MAX_AVL_DEPTH as usize);
+        let mut path = [PathEntry::default(); MAX_AVL_DEPTH as usize];
+        let mut path_len = 0usize;
         let mut last_fit_idx: Option<usize> = None;
         let mut current = root;
         while current != NULL_PTR {
-            if path.len() >= MAX_AVL_DEPTH as usize {
+            if path_len >= MAX_AVL_DEPTH as usize {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "AVL find exceeded maximum depth: corrupted tree (possible cycle)",
                 ));
             }
-            let (root_sz, _, _, left, right) = self.read_node(current)?;
+            let (root_sz, left, right, lh, rh) = self.read_node_hc(current)?;
             if root_sz >= min_size {
-                last_fit_idx = Some(path.len());
-                path.push(PathEntry {
+                last_fit_idx = Some(path_len);
+                path[path_len] = PathEntry {
                     ptr: current,
                     size: root_sz,
                     left,
                     right,
                     went_left: true,
-                });
+                    lh,
+                    rh,
+                };
+                path_len += 1;
                 current = left;
             } else {
-                path.push(PathEntry {
+                path[path_len] = PathEntry {
                     ptr: current,
                     size: root_sz,
                     left,
                     right,
                     went_left: false,
-                });
+                    lh,
+                    rh,
+                };
+                path_len += 1;
                 current = right;
             }
         }
@@ -548,30 +671,45 @@ impl GhostTreeBstackAllocator {
         let found_size = path[fit_idx].size;
         let found_left = path[fit_idx].left;
         let found_right = path[fit_idx].right;
+        // The found node's cached child heights (it was reached via a left
+        // descent, so its right subtree — path[fit_idx+1..] — is what the search
+        // exhausted; both children are untouched by the removal of this node).
+        let found_lh = path[fit_idx].lh;
+        let found_rh = path[fit_idx].rh;
 
         // Remove the best-fit node.  The left subtree (path[fit_idx+1..]) was
         // searched and yielded nothing, so found_left is returned unchanged.
-        let replacement = if found_left == NULL_PTR {
-            found_right
+        // `repl_h` is the replacement subtree's height, seeding the up-pass —
+        // known in every case now (single child from the cache, successor from
+        // its rebalance).
+        let (replacement, repl_h): (u64, u8) = if found_left == NULL_PTR {
+            (found_right, found_rh)
         } else if found_right == NULL_PTR {
-            found_left
+            (found_left, found_lh)
         } else {
             // Two children: replace with in-order successor (min of right subtree).
             let (succ, succ_sz, new_right) = self.avl_remove_min(found_right)?;
-            self.avl_write_and_update(succ, succ_sz, found_left, new_right)?;
-            self.avl_rebalance(succ)?
+            let (bf, h) = self.avl_write_and_update(succ, succ_sz, found_left, new_right)?;
+            let (new_root, new_h) = self.avl_rebalance(succ, bf, h)?;
+            (new_root, new_h)
         };
 
-        // Up-pass: update path[0..fit_idx] (path[fit_idx] was removed).
+        // Up-pass: update path[0..fit_idx] (path[fit_idx] was removed).  Both
+        // child heights are known each step — the modified child threaded from
+        // below, the untouched sibling from this node's cache — so `avl_write_h`
+        // reads neither and the in-balance case does no further I/O.
         let mut child = replacement;
+        let mut child_h = repl_h;
         for entry in path[..fit_idx].iter().rev() {
-            let (new_left, new_right) = if entry.went_left {
-                (child, entry.right)
+            let (new_left, new_right, lh, rh) = if entry.went_left {
+                (child, entry.right, Some(child_h), Some(entry.rh))
             } else {
-                (entry.left, child)
+                (entry.left, child, Some(entry.lh), Some(child_h))
             };
-            self.avl_write_and_update(entry.ptr, entry.size, new_left, new_right)?;
-            child = self.avl_rebalance(entry.ptr)?;
+            let (bf, h) = self.avl_write_h(entry.ptr, entry.size, new_left, new_right, lh, rh)?;
+            let (new_root, new_h) = self.avl_rebalance(entry.ptr, bf, h)?;
+            child = new_root;
+            child_h = new_h;
         }
         self.write_root(child)?;
         Ok(Some((found_ptr, found_size)))
@@ -1387,7 +1525,7 @@ mod tests {
         let mut a = alloc.alloc(64).unwrap();
         let b = alloc.alloc(64).unwrap();
         let a_start = a.start();
-        a.write(&[0xAAu8; 64]).unwrap();
+        a.write([0xAAu8; 64]).unwrap();
         alloc.dealloc(a).unwrap();
         // Read the raw bytes where a used to live.
         let raw = alloc.stack().get(a_start, a_start + 64).unwrap();
@@ -1405,7 +1543,7 @@ mod tests {
         let _g = Guard(path);
         let slices: Vec<_> = (0..16).map(|i| alloc.alloc(i * 7 + 1).unwrap()).collect();
         for s in &slices {
-            if s.len() > 0 {
+            if !s.is_empty() {
                 // Arena starts at payload offset 48; the 16-byte BStack header means
                 // all payload offsets ≡ 16 (mod 32) map to 32-byte-aligned disk addresses.
                 assert_eq!(
@@ -1473,7 +1611,7 @@ mod tests {
         let (alloc, path) = open_fresh();
         let _g = Guard(path);
         let mut s = alloc.alloc(32).unwrap();
-        s.write(&[0x5Au8; 32]).unwrap();
+        s.write([0x5Au8; 32]).unwrap();
         let start = s.start();
         // Realloc to a different len with the same aligned block size.
         let s2 = alloc.realloc(s, 16).unwrap();
@@ -1491,7 +1629,7 @@ mod tests {
         let _g = Guard(path);
         let mut s = alloc.alloc(128).unwrap();
         let start = s.start();
-        s.write(&[0xBBu8; 128]).unwrap();
+        s.write([0xBBu8; 128]).unwrap();
         let s2 = alloc.realloc(s, 32).unwrap();
         assert_eq!(s2.start(), start);
         assert_eq!(alloc.stack().len().unwrap(), start + 32);
@@ -1507,7 +1645,7 @@ mod tests {
         let mut s = alloc.alloc(128).unwrap();
         let anchor = alloc.alloc(32).unwrap();
         let start = s.start();
-        s.write(&[0xCCu8; 128]).unwrap();
+        s.write([0xCCu8; 128]).unwrap();
         let stack_len = alloc.stack().len().unwrap();
         let s2 = alloc.realloc(s, 32).unwrap();
         assert_eq!(s2.start(), start);
@@ -1527,7 +1665,7 @@ mod tests {
         let _g = Guard(path);
         let mut s = alloc.alloc(32).unwrap();
         let start = s.start();
-        s.write(&[0xDDu8; 32]).unwrap();
+        s.write([0xDDu8; 32]).unwrap();
         let s2 = alloc.realloc(s, 96).unwrap();
         assert_eq!(s2.start(), start);
         let buf = s2.read().unwrap();
@@ -1542,7 +1680,7 @@ mod tests {
         let _g = Guard(path);
         let mut s = alloc.alloc(32).unwrap();
         let anchor = alloc.alloc(32).unwrap();
-        s.write(&[0xEEu8; 32]).unwrap();
+        s.write([0xEEu8; 32]).unwrap();
         let s2 = alloc.realloc(s, 96).unwrap();
         // s2 is a new allocation (different address from anchor).
         assert_ne!(s2.start(), anchor.start());
@@ -1652,7 +1790,7 @@ mod tests {
         let _g = Guard(path.clone());
         let mut s = alloc.alloc(64).unwrap();
         let start = s.start();
-        s.write(&[0xABu8; 64]).unwrap();
+        s.write([0xABu8; 64]).unwrap();
         drop(alloc.into_stack());
 
         let alloc2 = reopen(&path);
@@ -1712,7 +1850,7 @@ mod tests {
                             let mut set = live.lock().unwrap();
                             assert!(set.insert(off), "duplicate live offset {off}");
                         }
-                        slice.write(&[tid as u8; 32]).unwrap();
+                        slice.write([tid as u8; 32]).unwrap();
                         let data = slice.read().unwrap();
                         assert_eq!(data, vec![tid as u8; 32]);
                         {
@@ -1762,7 +1900,7 @@ mod tests {
                     let mut slice = a.alloc(SMALL).unwrap();
                     slice
                         .as_slice_mut()
-                        .write(&[tid as u8; SMALL as usize])
+                        .write([tid as u8; SMALL as usize])
                         .unwrap();
 
                     for _ in 0..ROUNDS {
@@ -1837,7 +1975,7 @@ mod tests {
                         }
                         for (s, &sz) in slices.iter_mut().zip(SIZES.iter()) {
                             s.as_slice_mut()
-                                .write(&vec![tid as u8; sz as usize])
+                                .write(vec![tid as u8; sz as usize])
                                 .unwrap();
                             let data = s.read().unwrap();
                             assert_eq!(data, vec![tid as u8; sz as usize]);

@@ -68,6 +68,14 @@ Reasons:
 
 Reference: https://github.com/williamwutq/bstack/pull/32
 
+### Implementing `PartialEq`, or any other trait, whose only implementation would perform I/O
+
+Reasons:
+
+Trait methods that callers invoke implicitly — `PartialEq::eq`, `Hash::hash`, `Ord::cmp` — are conventionally assumed cheap and infallible: no blocking I/O, no `Result`, no panicking on a failed read. That assumption is baked into `assert_eq!`, hash-map keys, `sort`/`dedup`, derived impls on a containing struct, and generic trait bounds. `BStack` keeps I/O explicit (`read()`/`get()`/`set()` and friends), so a trait whose only possible implementation must touch the file goes against that, whichever trait it is. `BStackByteVec` is the concrete case: it cannot compare content without first reading its header to resolve `len`, so a content-based `PartialEq` would silently issue disk I/O wherever `==` appears. Types that compare for free stay fair game — `BStackSlice`, `BStackOwnedSlice`, and `BStackRange` implement `PartialEq` against each other since `(offset, len)` comparison needs no I/O. 
+
+Reference: https://github.com/williamwutq/bstack/pull/37
+
 ---
 
 ## `BStackInPlaceGuard` — ambient atomic-block guard over in-place writes
@@ -105,20 +113,32 @@ Reference: https://github.com/williamwutq/bstack/pull/32
 - **Recovery format.** Whether commit reuses the existing multi-write journal (`wip_aux = MultiWrite`) unchanged — the guard still reduces to a flat non-overlapping `[offset, data]` set — or needs its own `wip_aux` mode.
 - **Naming.** `BStackInPlaceGuard`/`inplace_guard()`/`commit()`/`is_inplace_guarded()` are working names.
 
-## GhostTree allocator: multithreaded performance improvement
+## External-merge-sort strategy and partial sort for `BStackChunk`
 
-**Feature flag:** `alloc` (optionally `atomic` for the `Sync` path)
-**Breaking change:** No — internal implementation only.
+**Feature flag:** `alloc` + `set` + `atomic`, same as the `BStackChunk::sort_by`/`select_nth_by` family it extends.
+**Breaking change:** No — purely additive; the current single-transaction `sort_by`/`sort_by_key`/`select_nth_by`/`select_nth_by_key` keep their existing behavior and signatures.
 
 ### Motivation
 
-`benches/alloc.rs` result shows `GhostTreeBstackAllocator` is already the fastest general-purpose allocator in the suite, but its scaling under concurrency has received less attention than its single-threaded design: throughput rises from 1t to 4t and then flattens through 16t. This is consistent with `GhostTreeBstackAllocator::lock` — the single mutex serializing all non-tail `alloc`/`dealloc`/`realloc` — capping throughput once contention saturates it. As the crate's best-performing allocator, it is also the one most likely to be used under concurrent load, so its scaling behavior warrants continued performance work, independent of any specific defect.
+`BStackChunk::sort_by`/`sort_by_key`/`select_nth_by`/`select_nth_by_key` commit via a single `BStack::process` call: the aligned region is read whole, permuted in place (cycle-following, O(1) scratch chunks), and written back atomically. This is bounded by available memory — a region too large for one `Vec<u8>` can't be sorted this way. The staged small/medium/large strategy below would lift that bound; it was cut from the initial implementation as extra scope, not for lack of an atomicity primitive — `BStack::set_batched`/`inplace_gen` (`set` + `atomic`) already commit an arbitrary batch of non-overlapping writes as one crash-atomic multi-write-journal transaction, and are the natural fit for committing a multi-section sort's final output in one shot.
 
-The mutex's scope and implementation are not in question here (see the `NOT PLANNED` entry on `FirstFitBStackAllocator`'s mutex), and no tree-sharding or other data-structure redesign is intended — that would be a different allocator. The improvement surface is reducing the amount of work done per operation while the mutex is held. Two examples found by code inspection, illustrative rather than exhaustive:
+### Design
 
-- `avl_insert`, `avl_find_best_fit_and_remove`, and `avl_remove_min` each allocate a `Vec::with_capacity(MAX_AVL_DEPTH)` path buffer under the mutex on every call, despite `MAX_AVL_DEPTH` being a fixed compile-time bound that a stack array could cover instead.
-- In the up-pass of `avl_insert` and `avl_find_best_fit_and_remove`, `avl_write_and_update` calls `avl_height` on a child subtree whose height was already computed and written in the previous loop iteration, issuing an avoidable `BStack::get_into` (lock + syscall) to re-fetch it.
+- **Section sort + merge**, applied recursively (external sort is section-sort-then-merge at every scale — "medium" and "large" from the original sketch are the same algorithm, just more sections and more merge passes; "small," i.e. what's shipped today, is the degenerate one-section case):
+  1. Split the aligned region into sections that individually fit in memory.
+  2. Sort each section in place (today's `sort_by`/`sort_by_key`, applied per-section).
+  3. Merge adjacent sorted sections, repeating merge passes until one fully-sorted region remains.
+
+  Section size and the small/medium/large threshold are implementation details (fixed constant, fraction of available memory, or caller-configurable), not part of the public contract.
+
+- **Whole-sort atomicity across sections, via `BStack::set_batched`.** The final merge pass streams `(new_offset, chunk_bytes)` pairs — produced lazily while scanning the sorted sections, not all held in memory at once — into one `set_batched` call, so the whole multi-section sort commits as a single crash-atomic transaction: a crash leaves either the pre-sort order or the fully-sorted order, never an intermediate state. Only the final section-to-final-position write needs batching this way; each section's own in-place sort (step 2) stays on the existing per-section `process` call.
+
+- **`sort_partial_by`/`sort_partial_by_key`** — best-effort: pushes through as many sections/merge passes as it can rather than stopping early by choice, and returns `Err` only for a genuine I/O failure, never merely for running out of passes or budget. "Partial" only ever means *not fully ordered*, never corrupted or lost data: every completed step (section sort, merge pass) is itself committed atomically, so the visible state on return is always some valid permutation of the original records, however far the sort got.
+
+- **`select_nth_by`/`select_nth_by_key` for out-of-core data.** Quickselect's whole point is avoiding a full sort, so the section-and-merge strategy above doesn't directly apply — it needs its own out-of-core partitioning approach (e.g. section-local partitioning plus a pivot-selection pass across sections) rather than assuming in-memory partitioning over the whole range.
 
 ### Open questions
 
-- **Validation.** Whether `mixed/uniform` workload is sufficient to measure improvement, or whether a contention-specific microbenchmark (concurrent non-tail alloc/dealloc only) is needed to isolate the critical-section-size effect.
+- **Unstable sort.** Whether to also provide `sort_unstable_by`/`sort_unstable_by_key`, mirroring `std`'s stable/unstable split — unstable sort does fewer chunk moves at the cost of stability, which may matter more once movement is spread across multiple sections/passes.
+- **Threshold sizing.** How the small/medium/large boundary and section size are chosen, and whether it should be caller-configurable given the memory/atomicity tradeoff is now explicit.
+- **Batch staging cost.** `set_batched` still stages every block's bytes into the multi-write journal before committing, so the final pass's staging cost scales with the number and size of the (new_offset, chunk_bytes) pairs it's fed — worth measuring against the current single-`process` cost before committing to this as the merge-commit strategy.

@@ -28,6 +28,7 @@
 //! also on a fixed period. [`LinearBStackAllocator`](crate::LinearBStackAllocator)
 //! is intentionally excluded: it keeps no metadata and has no recovery path.
 
+#[allow(clippy::module_inception)]
 mod alloc_fault_tests {
     use crate::alloc::{
         BStackOwnedSlice, BStackOwnedSliceAllocator, BStackRange, FirstFitBStackAllocator,
