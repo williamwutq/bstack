@@ -2153,7 +2153,7 @@ static void bstack_alloc_lock_destroy(void *lock)
  * reliably detecting cycles created by a partial rotation crash. */
 #define ALGT_MAX_AVL_DEPTH   128u
 
-static const uint8_t algt_magic[8]        = {'A','L','G','T',0,1,2,0};
+static const uint8_t algt_magic[8]        = {'A','L','G','T',0,1,3,0};
 static const uint8_t algt_magic_prefix[6] = {'A','L','G','T',0,1};
 
 typedef struct {
@@ -2222,18 +2222,28 @@ static int algt_read_node(bstack_t *bs, uint64_t ptr,
     return 0;
 }
 
-/* Write (size, left, right) to ptr, computing bf and height from children's
- * stored heights in one pass.  Sets *out_bf if non-NULL.  Returns 0/-1. */
-static int algt_avl_write_and_update(bstack_t *bs, uint64_t ptr,
-    uint64_t size, uint64_t left, uint64_t right, int8_t *out_bf)
+/* Write (size, left, right) to ptr, computing bf and height in one pass.
+ *
+ * A child height passed as >= 0 (known_lh / known_rh) is used directly — the
+ * caller already knows it, e.g. from the node written in the previous up-pass
+ * step or from a sibling untouched by a rotation — which avoids a bstack_get
+ * (lock + syscall) to re-read that child.  A negative value reads the height
+ * from the child.  Sets *out_bf and *out_height when non-NULL.  Returns 0/-1. */
+static int algt_avl_write_h(bstack_t *bs, uint64_t ptr, uint64_t size,
+    uint64_t left, uint64_t right, int known_lh, int known_rh,
+    int8_t *out_bf, uint8_t *out_height)
 {
     uint8_t lh = 0, rh = 0;
-    if (left != ALGT_NULL_PTR) {
+    if (known_lh >= 0) {
+        lh = (uint8_t)known_lh;
+    } else if (left != ALGT_NULL_PTR) {
         uint8_t buf[32];
         if (bstack_get(bs, left, left + 32, buf) != 0) return -1;
         lh = buf[9];
     }
-    if (right != ALGT_NULL_PTR) {
+    if (known_rh >= 0) {
+        rh = (uint8_t)known_rh;
+    } else if (right != ALGT_NULL_PTR) {
         uint8_t buf[32];
         if (bstack_get(bs, right, right + 32, buf) != 0) return -1;
         rh = buf[9];
@@ -2250,76 +2260,94 @@ static int algt_avl_write_and_update(bstack_t *bs, uint64_t ptr,
         write_le64(buf + 16, left);
         write_le64(buf + 24, right);
         if (bstack_set(bs, ptr, buf, 32) != 0) return -1;
-        if (out_bf) *out_bf = bf;
+        if (out_bf)     *out_bf     = bf;
+        if (out_height) *out_height = height;
     }
     return 0;
 }
 
+/* Write (size, left, right) to ptr, reading both child heights.  Thin wrapper
+ * over algt_avl_write_h.  Sets *out_bf if non-NULL.  Returns 0/-1. */
+static int algt_avl_write_and_update(bstack_t *bs, uint64_t ptr,
+    uint64_t size, uint64_t left, uint64_t right, int8_t *out_bf)
+{
+    return algt_avl_write_h(bs, ptr, size, left, right, -1, -1, out_bf, NULL);
+}
+
 /* ---- AVL helpers ------------------------------------------------------- */
 
-/* Right-rotate around node; return the new subtree root. */
-static int algt_avl_rotate_right(bstack_t *bs, uint64_t node, uint64_t *out_root)
+/* Right-rotate around node; return the new subtree root and (if out_height is
+ * non-NULL) its height. */
+static int algt_avl_rotate_right(bstack_t *bs, uint64_t node,
+    uint64_t *out_root, uint8_t *out_height)
 {
     uint64_t node_sz, node_r, pivot, pivot_sz, pivot_l, pivot_r;
-    int8_t bf; uint8_t height;
+    int8_t bf; uint8_t height, node_h;
     if (algt_read_node(bs, node,  &node_sz,  &bf, &height, &pivot,   &node_r)  != 0) return -1;
     if (algt_read_node(bs, pivot, &pivot_sz, &bf, &height, &pivot_l, &pivot_r) != 0) return -1;
-    if (algt_avl_write_and_update(bs, node,  node_sz,  pivot_r, node_r,  NULL) != 0) return -1;
-    if (algt_avl_write_and_update(bs, pivot, pivot_sz, pivot_l, node,    NULL) != 0) return -1;
+    if (algt_avl_write_h(bs, node, node_sz, pivot_r, node_r, -1, -1, NULL, &node_h) != 0) return -1;
+    /* node is now pivot's right child, and its height was just computed. */
+    if (algt_avl_write_h(bs, pivot, pivot_sz, pivot_l, node, -1, (int)node_h, NULL, out_height) != 0) return -1;
     *out_root = pivot;
     return 0;
 }
 
-/* Left-rotate around node; return the new subtree root. */
-static int algt_avl_rotate_left(bstack_t *bs, uint64_t node, uint64_t *out_root)
+/* Left-rotate around node; return the new subtree root and (if out_height is
+ * non-NULL) its height. */
+static int algt_avl_rotate_left(bstack_t *bs, uint64_t node,
+    uint64_t *out_root, uint8_t *out_height)
 {
     uint64_t node_sz, node_l, pivot, pivot_sz, pivot_l, pivot_r;
-    int8_t bf; uint8_t height;
+    int8_t bf; uint8_t height, node_h;
     if (algt_read_node(bs, node,  &node_sz,  &bf, &height, &node_l, &pivot)   != 0) return -1;
     if (algt_read_node(bs, pivot, &pivot_sz, &bf, &height, &pivot_l, &pivot_r) != 0) return -1;
-    if (algt_avl_write_and_update(bs, node,  node_sz,  node_l,  pivot_l, NULL) != 0) return -1;
-    if (algt_avl_write_and_update(bs, pivot, pivot_sz, node,    pivot_r, NULL) != 0) return -1;
+    if (algt_avl_write_h(bs, node, node_sz, node_l, pivot_l, -1, -1, NULL, &node_h) != 0) return -1;
+    /* node is now pivot's left child, and its height was just computed. */
+    if (algt_avl_write_h(bs, pivot, pivot_sz, node, pivot_r, (int)node_h, -1, NULL, out_height) != 0) return -1;
     *out_root = pivot;
     return 0;
 }
 
-/* Fix imbalance at node (uses < -1 / > 1 to handle post-crash excess). */
-static int algt_avl_rebalance(bstack_t *bs, uint64_t node, uint64_t *out_root)
+/* Fix imbalance at node (uses < -1 / > 1 to handle post-crash excess).
+ *
+ * The caller passes the bf and height already computed by the algt_avl_write_h
+ * that installed node's current children, so the common in-balance case needs
+ * no further I/O.  Returns the (possibly new) subtree root and its height. */
+static int algt_avl_rebalance(bstack_t *bs, uint64_t node, int8_t bf, uint8_t height,
+    uint64_t *out_root, uint8_t *out_height)
 {
-    uint64_t size, left, right;
-    int8_t bf; uint8_t height;
-    if (algt_read_node(bs, node, &size, &bf, &height, &left, &right) != 0) return -1;
-    if (algt_avl_write_and_update(bs, node, size, left, right, &bf) != 0) return -1;
-
     if (bf < -1) {
-        uint64_t left_sz, left_l, left_r;
-        int8_t left_bf; uint8_t left_h;
+        uint64_t size, left, right, left_sz, left_l, left_r;
+        int8_t nbf, left_bf; uint8_t nh, left_h;
+        if (algt_read_node(bs, node, &size, &nbf, &nh, &left, &right) != 0) return -1;
         if (algt_read_node(bs, left, &left_sz, &left_bf, &left_h, &left_l, &left_r) != 0)
             return -1;
         if (left_bf > 0) {
             /* Left-right: rotate left child left first */
             uint64_t new_left;
-            if (algt_avl_rotate_left(bs, left, &new_left) != 0) return -1;
+            if (algt_avl_rotate_left(bs, left, &new_left, NULL) != 0) return -1;
             if (algt_avl_write_and_update(bs, node, size, new_left, right, NULL) != 0)
                 return -1;
         }
-        return algt_avl_rotate_right(bs, node, out_root);
+        return algt_avl_rotate_right(bs, node, out_root, out_height);
     }
     if (bf > 1) {
-        uint64_t right_sz, right_l, right_r;
-        int8_t right_bf; uint8_t right_h;
+        uint64_t size, left, right, right_sz, right_l, right_r;
+        int8_t nbf, right_bf; uint8_t nh, right_h;
+        if (algt_read_node(bs, node, &size, &nbf, &nh, &left, &right) != 0) return -1;
         if (algt_read_node(bs, right, &right_sz, &right_bf, &right_h, &right_l, &right_r) != 0)
             return -1;
         if (right_bf < 0) {
             /* Right-left: rotate right child right first */
             uint64_t new_right;
-            if (algt_avl_rotate_right(bs, right, &new_right) != 0) return -1;
+            if (algt_avl_rotate_right(bs, right, &new_right, NULL) != 0) return -1;
             if (algt_avl_write_and_update(bs, node, size, left, new_right, NULL) != 0)
                 return -1;
         }
-        return algt_avl_rotate_left(bs, node, out_root);
+        return algt_avl_rotate_left(bs, node, out_root, out_height);
     }
-    *out_root = node;
+    *out_root   = node;
+    *out_height = height;
     return 0;
 }
 
@@ -2360,20 +2388,31 @@ static int algt_avl_insert(bstack_t *bs, uint64_t ptr, uint64_t size)
         if (bstack_set(bs, ptr, buf, 32) != 0) return -1;
     }
 
+    /* Up-pass: install the new child pointer in each ancestor and rebalance.
+     * The child written in the previous iteration has a known height, so its
+     * side needs no re-read; the (bf, height) from algt_avl_write_h is handed to
+     * algt_avl_rebalance, so the in-balance case does no further I/O. */
     child = ptr;
-    for (i = (int)path_len - 1; i >= 0; i--) {
-        uint64_t new_left, new_right, new_child;
-        if (path[i].went_left) {
-            new_left  = child;
-            new_right = path[i].right;
-        } else {
-            new_left  = path[i].left;
-            new_right = child;
+    {
+        uint8_t child_h = 1; /* leaf height */
+        for (i = (int)path_len - 1; i >= 0; i--) {
+            uint64_t new_left, new_right, new_child;
+            int      known_lh, known_rh;
+            int8_t   bf; uint8_t h, new_h;
+            if (path[i].went_left) {
+                new_left  = child;          new_right = path[i].right;
+                known_lh  = (int)child_h;   known_rh  = -1;
+            } else {
+                new_left  = path[i].left;   new_right = child;
+                known_lh  = -1;             known_rh  = (int)child_h;
+            }
+            if (algt_avl_write_h(bs, path[i].ptr, path[i].size,
+                                 new_left, new_right, known_lh, known_rh, &bf, &h) != 0)
+                return -1;
+            if (algt_avl_rebalance(bs, path[i].ptr, bf, h, &new_child, &new_h) != 0) return -1;
+            child   = new_child;
+            child_h = new_h;
         }
-        if (algt_avl_write_and_update(bs, path[i].ptr, path[i].size,
-                                       new_left, new_right, NULL) != 0) return -1;
-        if (algt_avl_rebalance(bs, path[i].ptr, &new_child) != 0) return -1;
-        child = new_child;
     }
     return algt_write_root(bs, child);
 }
@@ -2398,15 +2437,21 @@ static int algt_avl_remove_min(bstack_t *bs, uint64_t root,
         if (algt_read_node(bs, current, &size, &bf, &height, &left, &right) != 0)
             return -1;
         if (left == ALGT_NULL_PTR) {
+            /* Replace current with its right child.  `child` is always the left
+             * side; its height is known after the first up-pass step (the right
+             * subtree height is unknown until then, hence -1 initially). */
             uint64_t child = right;
+            int      child_h = -1;
             int i;
             for (i = (int)stk_len - 1; i >= 0; i--) {
                 uint64_t new_child;
-                if (algt_avl_write_and_update(bs, stk_ptr[i], stk_size[i],
-                                               child, stk_right[i], NULL) != 0)
+                int8_t   bf; uint8_t h, new_h;
+                if (algt_avl_write_h(bs, stk_ptr[i], stk_size[i],
+                                     child, stk_right[i], child_h, -1, &bf, &h) != 0)
                     return -1;
-                if (algt_avl_rebalance(bs, stk_ptr[i], &new_child) != 0) return -1;
-                child = new_child;
+                if (algt_avl_rebalance(bs, stk_ptr[i], bf, h, &new_child, &new_h) != 0) return -1;
+                child   = new_child;
+                child_h = (int)new_h;
             }
             *out_min_ptr  = current;
             *out_min_size = size;
@@ -2435,8 +2480,8 @@ static int algt_avl_find_best_fit_and_remove(bstack_t *bs, uint64_t min_size,
     size_t   last_fit_idx = 0;
     uint64_t root, current;
     uint64_t found_ptr, found_size, found_left, found_right;
-    uint64_t replacement, child;
-    int      i;
+    uint64_t child;
+    int      i, child_h;
 
     if (algt_read_root(bs, &root) != 0) return -1;
     if (root == ALGT_NULL_PTR) {
@@ -2480,33 +2525,43 @@ static int algt_avl_find_best_fit_and_remove(bstack_t *bs, uint64_t min_size,
     found_left  = path[last_fit_idx].left;
     found_right = path[last_fit_idx].right;
 
+    /* Seed the up-pass directly with the best-fit node's replacement.  child_h
+     * is the replacement subtree's height when known (the successor case), -1
+     * otherwise (an untouched single child whose height we never read). */
+    child_h = -1;
     if (found_left == ALGT_NULL_PTR) {
-        replacement = found_right;
+        child = found_right;
     } else if (found_right == ALGT_NULL_PTR) {
-        replacement = found_left;
+        child = found_left;
     } else {
         uint64_t succ, succ_sz, new_right;
+        int8_t   bf; uint8_t h, rh;
         if (algt_avl_remove_min(bs, found_right, &succ, &succ_sz, &new_right) != 0)
             return -1;
-        if (algt_avl_write_and_update(bs, succ, succ_sz, found_left, new_right, NULL) != 0)
+        if (algt_avl_write_h(bs, succ, succ_sz, found_left, new_right, -1, -1, &bf, &h) != 0)
             return -1;
-        if (algt_avl_rebalance(bs, succ, &replacement) != 0) return -1;
+        if (algt_avl_rebalance(bs, succ, bf, h, &child, &rh) != 0) return -1;
+        child_h = (int)rh;
     }
 
-    child = replacement;
+    /* Up-pass: as in insert, the child written last has a known height, so its
+     * side is not re-read and the in-balance case does no further I/O. */
     for (i = (int)last_fit_idx - 1; i >= 0; i--) {
         uint64_t new_left, new_right, new_child;
+        int      known_lh, known_rh;
+        int8_t   bf; uint8_t h, new_h;
         if (path[i].went_left) {
-            new_left  = child;
-            new_right = path[i].right;
+            new_left  = child;          new_right = path[i].right;
+            known_lh  = child_h;        known_rh  = -1;
         } else {
-            new_left  = path[i].left;
-            new_right = child;
+            new_left  = path[i].left;   new_right = child;
+            known_lh  = -1;             known_rh  = child_h;
         }
-        if (algt_avl_write_and_update(bs, path[i].ptr, path[i].size,
-                                       new_left, new_right, NULL) != 0) return -1;
-        if (algt_avl_rebalance(bs, path[i].ptr, &new_child) != 0) return -1;
-        child = new_child;
+        if (algt_avl_write_h(bs, path[i].ptr, path[i].size,
+                             new_left, new_right, known_lh, known_rh, &bf, &h) != 0) return -1;
+        if (algt_avl_rebalance(bs, path[i].ptr, bf, h, &new_child, &new_h) != 0) return -1;
+        child   = new_child;
+        child_h = (int)new_h;
     }
     if (algt_write_root(bs, child) != 0) return -1;
 
