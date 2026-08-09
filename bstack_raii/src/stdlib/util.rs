@@ -7,8 +7,8 @@
 
 use std::io;
 
-use crate::wal::BStackWalAnchor;
-use bstack::{BStack, BStackGenOp, BStackOwnedSliceAllocator, BStackRange};
+use crate::BStackRaiiAllocator;
+use bstack::{BStack, BStackGenOp, BStackRange};
 
 use crate::layout::{HEADER_SIZE, get_u64};
 
@@ -80,7 +80,7 @@ impl Scratch {
 
 /// Allocate a block and write `bytes` as its whole image (one write; released
 /// without leaking on write failure).
-pub(super) fn alloc_image<A: BStackWalAnchor>(
+pub(super) fn alloc_image<A: BStackRaiiAllocator>(
     allocator: &A,
     bytes: &[u8],
 ) -> io::Result<BStackRange> {
@@ -118,7 +118,7 @@ pub(super) fn atomic_update<A, R2, W>(
     plan: W,
 ) -> io::Result<()>
 where
-    A: BStackWalAnchor,
+    A: BStackRaiiAllocator,
     R2: FnOnce(&[u64]) -> Vec<u64>,
     W: FnOnce(&[u64], &[u64]) -> Vec<(u64, Vec<u8>)>,
 {
@@ -229,7 +229,7 @@ pub(super) fn probe_commit<A, I, E>(
     exhausted: E,
 ) -> io::Result<()>
 where
-    A: BStackWalAnchor,
+    A: BStackRaiiAllocator,
     I: FnMut(&Meta, u64, &[u8]) -> ProbeStep,
     E: FnOnce(&Meta) -> Vec<(u64, Vec<u8>)>,
 {

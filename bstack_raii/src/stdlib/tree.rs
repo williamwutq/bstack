@@ -41,8 +41,8 @@ use core::marker::PhantomData;
 use core::mem::size_of;
 use std::io;
 
-use crate::wal::BStackWalAnchor;
-use bstack::{BStack, BStackOwnedSliceAllocator, BStackRange};
+use crate::BStackRaiiAllocator;
+use bstack::{BStack, BStackRange};
 use bytemuck::{Pod, Zeroable};
 
 use super::util::{Scratch, alloc_image, read_fields, read_u64};
@@ -97,7 +97,7 @@ struct Split {
 
 /// Accumulates a path-copy insert's new-node writes and the old path nodes to
 /// free, so the whole insert commits as one [`BStack::set_batched`] batch.
-struct Build<'a, A: BStackWalAnchor> {
+struct Build<'a, A: BStackRaiiAllocator> {
     allocator: &'a A,
     node_size: u64,
     ksize: usize,
@@ -109,7 +109,7 @@ struct Build<'a, A: BStackWalAnchor> {
     freed: Vec<u64>,
 }
 
-impl<'a, A: BStackWalAnchor> Build<'a, A> {
+impl<'a, A: BStackRaiiAllocator> Build<'a, A> {
     /// Serialize `nb` and allocate a fresh block for it (an orphan until the
     /// commit links it), returning its offset.
     fn emit(&mut self, nb: &BNode) -> io::Result<u64> {
@@ -171,7 +171,7 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBTreeMap<K, V> {
     }
 
     /// Allocate an empty tree.
-    pub fn new<A: BStackWalAnchor>(allocator: &A) -> io::Result<BStackOwned<Self>> {
+    pub fn new<A: BStackRaiiAllocator>(allocator: &A) -> io::Result<BStackOwned<Self>> {
         let od = TreeOnDisk {
             header: BlockHeader {
                 size: TREE_SIZE,
@@ -269,7 +269,7 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBTreeMap<K, V> {
     /// Returns the new subtree offset, an optional lifted split, whether a new
     /// entry was added, and any replaced value.
     fn insert_rec(
-        build: &mut Build<'_, impl BStackWalAnchor>,
+        build: &mut Build<'_, impl BStackRaiiAllocator>,
         stack: &BStack,
         off: u64,
         key: &K,
@@ -321,7 +321,7 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBTreeMap<K, V> {
     ///
     /// Path-copies the affected path and commits every new node plus the root
     /// swap as one crash-atomic batch. **Single-writer** (see the module docs).
-    pub fn insert<A: BStackWalAnchor>(
+    pub fn insert<A: BStackRaiiAllocator>(
         &self,
         allocator: &A,
         key: K,
@@ -473,7 +473,7 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBTreeMap<K, V> {
     /// `bool` distinguishes a fresh insert from a hit. **Single-writer.**
     pub fn get_or_insert_with<A, F>(&self, allocator: &A, key: K, f: F) -> io::Result<(V, bool)>
     where
-        A: BStackWalAnchor,
+        A: BStackRaiiAllocator,
         F: FnOnce() -> io::Result<BStackOwned<V>>,
     {
         if let Some(v) = self.get(allocator.stack(), &key)? {
@@ -489,7 +489,7 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBTreeMap<K, V> {
 
     /// Like [`get_or_insert_with`](Self::get_or_insert_with) but with an eager
     /// `default`, which is **freed** if `key` is already present.
-    pub fn get_or_insert<A: BStackWalAnchor>(
+    pub fn get_or_insert<A: BStackRaiiAllocator>(
         &self,
         allocator: &A,
         key: K,
@@ -537,7 +537,7 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBTreeMap<K, V> {
     /// Path-copy delete of `key` from the subtree at `off`; returns the new
     /// subtree offset and the removed value (if the key was found).
     fn delete_off(
-        build: &mut Build<'_, impl BStackWalAnchor>,
+        build: &mut Build<'_, impl BStackRaiiAllocator>,
         stack: &BStack,
         off: u64,
         key: &K,
@@ -552,7 +552,7 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBTreeMap<K, V> {
     /// for freeing), rebalancing children to keep the B-tree invariant. Returns
     /// the modified node (not yet emitted) and the removed value.
     fn delete_bnode(
-        build: &mut Build<'_, impl BStackWalAnchor>,
+        build: &mut Build<'_, impl BStackRaiiAllocator>,
         stack: &BStack,
         mut nb: BNode,
         key: &K,
@@ -709,7 +709,7 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBTreeMap<K, V> {
     /// Remove `key`, returning its value (owned) if present, else `None`.
     /// Path-copies the affected path (rebalancing as needed) and commits the new
     /// nodes plus the root update as one crash-atomic batch. **Single-writer.**
-    pub fn remove<A: BStackWalAnchor>(
+    pub fn remove<A: BStackRaiiAllocator>(
         &self,
         allocator: &A,
         key: &K,
@@ -909,13 +909,17 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBTreeMap<K, V> {
     }
 
     /// Attach an allocator to make an auto-freeing [`AutoDrop`] guard.
-    pub fn auto<A: BStackWalAnchor>(self, allocator: &A) -> AutoDrop<'_, Self, A> {
+    pub fn auto<A: BStackRaiiAllocator>(self, allocator: &A) -> AutoDrop<'_, Self, A> {
         // SAFETY: sole ownership was asserted when the tree was created.
         unsafe { AutoDrop::from_raw(self, allocator) }
     }
 
     /// Recursively free the subtree at `off` (values then nodes).
-    fn drop_subtree<A: BStackWalAnchor>(stack: &BStack, off: u64, allocator: &A) -> io::Result<()> {
+    fn drop_subtree<A: BStackRaiiAllocator>(
+        stack: &BStack,
+        off: u64,
+        allocator: &A,
+    ) -> io::Result<()> {
         if off == 0 {
             return Ok(());
         }
@@ -939,7 +943,7 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBTreeMap<K, V> {
 
     /// Recursively deep-clone the subtree at `off` into `plan`, returning the new
     /// subtree offset.
-    fn clone_subtree<A: BStackWalAnchor>(
+    fn clone_subtree<A: BStackRaiiAllocator>(
         stack: &BStack,
         off: u64,
         allocator: &A,
@@ -1004,7 +1008,7 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBlock for BStackBTreeMap<K, V> {
 
     /// Recursively free every value block and node, **without** freeing the
     /// handle block itself.
-    fn __bstack_drop_children<A: BStackWalAnchor>(
+    fn __bstack_drop_children<A: BStackRaiiAllocator>(
         range: BStackRange,
         allocator: &A,
     ) -> io::Result<()> {
@@ -1015,7 +1019,7 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBlock for BStackBTreeMap<K, V> {
     /// Deep-clone the whole tree into `plan`: every node copied, every value
     /// deep-cloned via `V`'s clone hook, the handle staged — all in the parent
     /// plan's single atomic commit.
-    fn __bstack_clone_into<A: BStackWalAnchor>(
+    fn __bstack_clone_into<A: BStackRaiiAllocator>(
         &self,
         allocator: &A,
         plan: &mut ClonePlan,
@@ -1039,7 +1043,7 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBlock for BStackBTreeMap<K, V> {
 }
 
 impl<K: Pod + Ord, V: BStackBlock> BStackDrop for BStackBTreeMap<K, V> {
-    fn bstack_drop<A: BStackWalAnchor>(self, allocator: &A) -> io::Result<()> {
+    fn bstack_drop<A: BStackRaiiAllocator>(self, allocator: &A) -> io::Result<()> {
         Self::__bstack_drop_children(self.range, allocator)?;
         // SAFETY: sole ownership of the handle block was asserted at construction.
         unsafe { dealloc_range(allocator, self.range) }
@@ -1047,7 +1051,7 @@ impl<K: Pod + Ord, V: BStackBlock> BStackDrop for BStackBTreeMap<K, V> {
 }
 
 impl<K: Pod + Ord, V: BStackBlock> TryCloneIn for BStackBTreeMap<K, V> {
-    fn try_clone_in<A: BStackWalAnchor>(&self, allocator: &A) -> io::Result<BStackOwned<Self>> {
+    fn try_clone_in<A: BStackRaiiAllocator>(&self, allocator: &A) -> io::Result<BStackOwned<Self>> {
         let mut plan = ClonePlan::new();
         let dst = match self.__bstack_clone_into(allocator, &mut plan) {
             Ok(range) => range,

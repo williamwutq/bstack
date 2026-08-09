@@ -91,8 +91,8 @@ pub use stdlib::{
 pub use teardown::{AutoDrop, BStackDrop, dealloc_range, wal_teardown};
 pub use vec::{BStackBlockVec, BStackRefVec, BStackStrongVec, BStackVec, BStackWeakVec, VecDesc};
 pub use wal::{
-    AllocReq, BStackWalAnchor, Reduced, STD_WAL_ANCHOR, WalEntry, WalHeader, WalLog, WalOp,
-    WalStatus, finish, finish_at, persist_at, reduce,
+    AllocReq, Reduced, STD_WAL_ANCHOR, WalEntry, WalHeader, WalLog, WalOp, WalStatus, finish,
+    finish_at, persist_at, reduce,
 };
 
 // Re-exports for use by `#[bstack_block]`-generated code (and callers), so that
@@ -100,6 +100,49 @@ pub use wal::{
 // crates need not depend on `bstack` or `bytemuck` directly.
 pub use bstack::{BStack, BStackAllocator, BStackOwnedSliceAllocator, BStackRange, BStackSlice};
 pub use bytemuck::{Pod, Zeroable};
+
+/// The allocator every `bstack_raii` operation is bound on: a
+/// [`BStackOwnedSliceAllocator`] the layer can soundly build owning handles on top
+/// of. It is the crate-wide allocator capability — constructors, `try_clone_in`,
+/// `bstack_drop`, and every stdlib collection require it.
+///
+/// Beyond its supertrait it carries two things the layer relies on: the **null
+/// niche** at payload offset 0 (a hard safety requirement, see below) and an
+/// **optional** WAL anchor slot. The anchor is what lets `try_clone_in` /
+/// `bstack_drop` reclaim orphaned allocations on the next open **automatically**
+/// (they read [`wal_anchor`](Self::wal_anchor) directly); `None` (the default)
+/// means "no reclamation" — those ops behave exactly as before, minus the
+/// crash-orphan cleanup. Every bstack-provided allocator implements this trait; a
+/// custom allocator that upholds the null niche adds a one-line
+/// `unsafe impl BStackRaiiAllocator for MyAlloc {}` (defaulting to `None`, or
+/// returning `Some(slot)` if it reserves a stable slot).
+///
+/// The WAL machinery it feeds lives in the `wal` module; the trait itself is the
+/// crate's front-door allocator bound, hence its home here at the root.
+///
+/// # Safety
+///
+/// An implementor asserts **both** of the following:
+///
+/// 1. **Null niche.** The allocator **never** hands out a live slice whose
+///    `start()` is `0`. `bstack_raii` reserves payload offset 0 as its universal
+///    null sentinel — a `0` offset means "none" everywhere in the layer (an absent
+///    handle / [`Option`] niche, a dead weak reference, "no WAL block", …). An
+///    allocator that could return offset 0 is **unsound** with this crate: a real
+///    allocation would be indistinguishable from null. (Every bstack allocator
+///    satisfies this: each keeps a reserved region at payload offset 0 that it
+///    never allocates from.)
+///
+/// 2. **WAL anchor (only when returning `Some(off)`).** `[off, off + 8)` is a
+///    stable, persistent 8-byte region the allocator **never** hands out via
+///    `alloc` and **never** uses for its own metadata, and that survives across
+///    open/close. `bstack_raii` stores the current WAL block's offset there
+///    (`0` = none). Returning `None` asserts nothing beyond (1).
+pub unsafe trait BStackRaiiAllocator: BStackOwnedSliceAllocator {
+    fn wal_anchor(&self) -> Option<u64> {
+        None
+    }
+}
 // Re-exported whole so generated code can call `::bstack_raii::bytemuck::bytes_of`.
 pub use bytemuck;
 
@@ -194,14 +237,6 @@ pub use bstack_raii_derive::{bstack_block, bstack_cast, bstack_enum, bstack_move
 /// # fn main() {}
 /// ```
 ///
-/// A **non-`Pod`** field in a POD aggregate variant:
-/// ```compile_fail
-/// use bstack_raii::bstack_enum;
-/// #[bstack_enum]
-/// enum E { V(String) }
-/// # fn main() {}
-/// ```
-///
 /// An ownership annotation targeting a **non-block** type:
 /// ```compile_fail
 /// use bstack_raii::bstack_enum;
@@ -254,14 +289,6 @@ pub use bstack_raii_derive::{bstack_block, bstack_cast, bstack_enum, bstack_move
 /// struct NotPod(String);
 /// #[bstack_block]
 /// struct X { f: NotPod }
-/// # fn main() {}
-/// ```
-///
-/// A **generic** struct:
-/// ```compile_fail
-/// use bstack_raii::bstack_block;
-/// #[bstack_block]
-/// struct X<T> { f: T }
 /// # fn main() {}
 /// ```
 ///

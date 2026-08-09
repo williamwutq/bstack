@@ -14,9 +14,9 @@
 use core::ops::Deref;
 use std::io;
 
+use crate::BStackRaiiAllocator;
 use crate::block::{BStackMove, BStackMoveExpr};
 use crate::teardown::{AutoDrop, BStackDrop, wal_teardown};
-use crate::wal::BStackWalAnchor;
 
 /// A uniquely-owned handle to a block: an ownership marker over an inner
 /// [`BStackDrop`] handle whose teardown recursively frees the block on disk.
@@ -51,7 +51,7 @@ impl<T: BStackDrop> BStackOwned<T> {
 
     /// Attach an allocator to make an auto-freeing [`AutoDrop`] guard: dropping
     /// the returned value runs this handle's recursive teardown.
-    pub fn auto<A: BStackWalAnchor>(self, allocator: &A) -> AutoDrop<'_, Self, A> {
+    pub fn auto<A: BStackRaiiAllocator>(self, allocator: &A) -> AutoDrop<'_, Self, A> {
         // SAFETY: a `BStackOwned` asserts sole ownership of a live block at
         // construction, exactly the invariant `AutoDrop::from_raw` requires.
         unsafe { AutoDrop::from_raw(self, allocator) }
@@ -66,7 +66,7 @@ impl<T: BStackDrop> Deref for BStackOwned<T> {
 }
 
 impl<T: BStackDrop> BStackDrop for BStackOwned<T> {
-    fn bstack_drop<A: BStackWalAnchor>(self, allocator: &A) -> io::Result<()> {
+    fn bstack_drop<A: BStackRaiiAllocator>(self, allocator: &A) -> io::Result<()> {
         // Recursively free the owned block (and its children) as one crash-atomic,
         // leak-reclaiming batch — automatically, whenever the allocator names a WAL
         // anchor. `wal_teardown` collects the whole subtree's frees and commits
@@ -81,7 +81,7 @@ impl<T: BStackDrop> BStackDrop for BStackOwned<T> {
 ///
 /// (A *bare* `BStackOwned<X>` carries no allocator, so it is moved with the
 /// explicit two-argument form `bstack_move!(owned, allocator)` instead.)
-impl<'a, X: BStackMove, A: BStackWalAnchor> BStackMoveExpr for AutoDrop<'a, BStackOwned<X>, A> {
+impl<'a, X: BStackMove, A: BStackRaiiAllocator> BStackMoveExpr for AutoDrop<'a, BStackOwned<X>, A> {
     type Output = io::Result<X::Fields<'a, A>>;
     fn bstack_move(self) -> Self::Output {
         let (owned, allocator) = self.into_raw_parts();

@@ -20,8 +20,8 @@ use core::marker::PhantomData;
 use core::mem::size_of;
 use std::io;
 
-use crate::wal::BStackWalAnchor;
-use bstack::{BStack, BStackOwnedSliceAllocator, BStackRange};
+use crate::BStackRaiiAllocator;
+use bstack::{BStack, BStackRange};
 use bytemuck::{Pod, Zeroable};
 
 use crate::block::{BStackBlock, BStackCast, BStackMove};
@@ -72,7 +72,7 @@ impl<T: Pod> BStackBox<T> {
     ///
     /// The header and payload are written as a single image, so the block is
     /// created with one write (and released without leaking on write failure).
-    pub fn new<A: BStackWalAnchor>(allocator: &A, value: T) -> io::Result<BStackOwned<Self>> {
+    pub fn new<A: BStackRaiiAllocator>(allocator: &A, value: T) -> io::Result<BStackOwned<Self>> {
         let od = BoxOnDisk {
             header: BlockHeader {
                 size: Self::SIZE,
@@ -105,7 +105,7 @@ impl<T: Pod> BStackBox<T> {
     }
 
     /// Overwrite the boxed value in place.
-    pub fn set<A: BStackWalAnchor>(&self, allocator: &A, value: T) -> io::Result<()> {
+    pub fn set<A: BStackRaiiAllocator>(&self, allocator: &A, value: T) -> io::Result<()> {
         allocator
             .stack()
             .set(self.range.start() + HEADER_SIZE, bytemuck::bytes_of(&value))
@@ -141,7 +141,7 @@ impl<T: Pod> BStackBlock for BStackBox<T> {
 }
 
 impl<T: Pod> BStackDrop for BStackBox<T> {
-    fn bstack_drop<A: BStackWalAnchor>(self, allocator: &A) -> io::Result<()> {
+    fn bstack_drop<A: BStackRaiiAllocator>(self, allocator: &A) -> io::Result<()> {
         // Childless: just free the block.
         // SAFETY: sole ownership was asserted when this handle was created.
         unsafe { dealloc_range(allocator, self.range) }
@@ -149,7 +149,7 @@ impl<T: Pod> BStackDrop for BStackBox<T> {
 }
 
 impl<T: Pod> TryCloneIn for BStackBox<T> {
-    fn try_clone_in<A: BStackWalAnchor>(&self, allocator: &A) -> io::Result<BStackOwned<Self>> {
+    fn try_clone_in<A: BStackRaiiAllocator>(&self, allocator: &A) -> io::Result<BStackOwned<Self>> {
         // Mirror the generated `try_clone_in`: build the plan (a byte copy, via
         // the childless `__bstack_clone_into` default), then commit atomically.
         let mut plan = ClonePlan::new();
@@ -168,9 +168,12 @@ impl<T: Pod> TryCloneIn for BStackBox<T> {
 
 impl<T: Pod> BStackMove for BStackBox<T> {
     /// Moving a box out yields the plain value.
-    type Fields<'a, A: BStackWalAnchor> = T;
+    type Fields<'a, A: BStackRaiiAllocator> = T;
 
-    fn bstack_move<A: BStackWalAnchor>(owned: BStackOwned<Self>, allocator: &A) -> io::Result<T> {
+    fn bstack_move<A: BStackRaiiAllocator>(
+        owned: BStackOwned<Self>,
+        allocator: &A,
+    ) -> io::Result<T> {
         let me = owned.into_inner();
         let value = me.get(allocator.stack())?;
         // Childless: free the shell after reading the value out.

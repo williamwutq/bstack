@@ -56,6 +56,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use bstack::{BStackAllocator, BStackOwnedSliceAllocator, BStackRange};
 use bytemuck::{Pod, Zeroable};
 
+use crate::BStackRaiiAllocator;
 use crate::teardown::dealloc_range;
 
 /// `R'`: an allocation requirement carrying identity — a length whose address has
@@ -297,7 +298,7 @@ pub fn reduce(allocs: Vec<AllocReq>, mut deallocs: Vec<BStackRange>) -> Reduced 
 //
 // The WAL block is **persistent and reused** (Vec-like), not allocated per
 // transaction: `[WalHeader | WalEntry × capacity]`, reached through a stable
-// anchor slot (see [`BStackWalAnchor`]) that holds the block's offset (`0` = not
+// anchor slot (see [`BStackRaiiAllocator`]) that holds the block's offset (`0` = not
 // yet created — lazily allocated on first use). The header's `txn_status` doubles
 // as the in-use flag:
 //
@@ -357,30 +358,9 @@ impl WalLog {
     }
 }
 
-/// The allocator capability the whole crate is bound on: a
-/// [`BStackOwnedSliceAllocator`] that names a stable on-disk slot for the WAL
-/// block pointer — or `None` to opt out of crash-reclamation.
-///
-/// Making this the uniform bound is what lets `try_clone_in` / `bstack_drop`
-/// reclaim orphaned allocations on the next open **automatically**, with no
-/// separate opt-in call: they read [`wal_anchor`](Self::wal_anchor) directly.
-/// `None` (the default) means "no reclamation" — the op behaves exactly as before.
-/// Every bstack-provided allocator implements this; a custom allocator adds a
-/// one-line `unsafe impl BStackWalAnchor for MyAlloc {}` (defaulting to `None`,
-/// or returning `Some(slot)` if it reserves one).
-///
-/// # Safety
-///
-/// An implementor returning `Some(off)` asserts that `[off, off + 8)` is a
-/// stable, persistent 8-byte region the allocator **never** hands out via `alloc`
-/// and **never** uses for its own metadata, and that survives across open/close.
-/// `bstack_raii` stores the current WAL block's offset there (`0` = none).
-/// Returning `None` asserts nothing.
-pub unsafe trait BStackWalAnchor: BStackOwnedSliceAllocator {
-    fn wal_anchor(&self) -> Option<u64> {
-        None
-    }
-}
+// `BStackRaiiAllocator` (the crate-wide allocator bound) is defined at the crate
+// root in `lib.rs`; the impls for bstack's own allocators live here, next to the
+// anchor constant and the WAL machinery they feed.
 
 /// Anchor offset for the bstack-provided freeing allocators: the second `u64`
 /// word of the user-reserved region every one of them keeps at payload offset 0
@@ -392,29 +372,29 @@ pub const STD_WAL_ANCHOR: u64 = 8;
 // SAFETY: each of these allocators documents a user-reserved region at payload
 // offset 0 (≥ 16 bytes) that it never allocates from and never writes to; the
 // `[8, 16)` slot sits inside it and persists across open/close.
-unsafe impl BStackWalAnchor for bstack::FirstFitBStackAllocator {
+unsafe impl BStackRaiiAllocator for bstack::FirstFitBStackAllocator {
     fn wal_anchor(&self) -> Option<u64> {
         Some(STD_WAL_ANCHOR)
     }
 }
-unsafe impl BStackWalAnchor for bstack::GhostTreeBstackAllocator {
+unsafe impl BStackRaiiAllocator for bstack::GhostTreeBstackAllocator {
     fn wal_anchor(&self) -> Option<u64> {
         Some(STD_WAL_ANCHOR)
     }
 }
-unsafe impl BStackWalAnchor for bstack::SlabBStackAllocator {
+unsafe impl BStackRaiiAllocator for bstack::SlabBStackAllocator {
     fn wal_anchor(&self) -> Option<u64> {
         Some(STD_WAL_ANCHOR)
     }
 }
-unsafe impl BStackWalAnchor for bstack::CheckedSlabBStackAllocator {
+unsafe impl BStackRaiiAllocator for bstack::CheckedSlabBStackAllocator {
     fn wal_anchor(&self) -> Option<u64> {
         Some(STD_WAL_ANCHOR)
     }
 }
 // `LinearBStackAllocator`'s `dealloc` is a no-op (nothing to reclaim), so it opts
 // out via the default `None` — but it still needs the impl to satisfy the bound.
-unsafe impl BStackWalAnchor for bstack::LinearBStackAllocator {}
+unsafe impl BStackRaiiAllocator for bstack::LinearBStackAllocator {}
 
 // ---------------------------------------------------------------------------
 // In-memory serialization of WAL transactions.
@@ -503,7 +483,7 @@ fn wal_ensure_block<A: BStackOwnedSliceAllocator>(
 
 /// Stage `log` into the persistent WAL block at transaction status `txn_status`,
 /// (lazily) creating or growing the block as needed. Returns the block's range.
-/// The caller must hold the file's WAL lock (see [`wal_lock_for`]).
+/// The caller must hold the file's WAL lock (the crate-internal `wal_lock_for`).
 pub fn persist_at<A: BStackOwnedSliceAllocator>(
     allocator: &A,
     anchor: u64,
@@ -625,10 +605,10 @@ pub fn finish_at<A: BStackOwnedSliceAllocator>(allocator: &A, anchor: u64) -> io
     finish_at_locked(allocator, anchor)
 }
 
-/// Like [`finish_at`], using the allocator's own [`BStackWalAnchor`] slot.
+/// Like [`finish_at`], using the allocator's own [`BStackRaiiAllocator`] slot.
 /// An allocator that opts out of reclamation (`wal_anchor() == None`) has no WAL
 /// to complete, so this is a no-op returning `0`.
-pub fn finish<A: BStackWalAnchor>(allocator: &A) -> io::Result<usize> {
+pub fn finish<A: BStackRaiiAllocator>(allocator: &A) -> io::Result<usize> {
     match allocator.wal_anchor() {
         Some(anchor) => finish_at(allocator, anchor),
         None => Ok(0),

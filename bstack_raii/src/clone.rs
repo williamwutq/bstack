@@ -37,8 +37,9 @@
 
 use std::io;
 
-use bstack::{BStackGenOp, BStackOwnedSliceAllocator, BStackRange};
+use bstack::{BStackGenOp, BStackRange};
 
+use crate::BStackRaiiAllocator;
 use crate::block::{BStackBlock, BStackShared};
 use crate::layout;
 use crate::owned::BStackOwned;
@@ -46,8 +47,7 @@ use crate::reference::BStackRef;
 use crate::teardown::{BStackDrop, dealloc_range};
 use crate::vec::{BYTEVEC_HEADER, VecDesc};
 use crate::wal::{
-    BStackWalAnchor, WalEntry, WalLog, WalStatus, finish_at_locked, persist_at, wal_lock_for,
-    wal_set_idle,
+    WalEntry, WalLog, WalStatus, finish_at_locked, persist_at, wal_lock_for, wal_set_idle,
 };
 
 /// Duplicate `self`, performing any fallible I/O the duplication requires,
@@ -87,7 +87,7 @@ pub trait TryClone: Sized {
 /// why (in particular, why a weak reference can only ever be cloned as another
 /// weak reference).
 pub trait TryCloneIn: BStackDrop + Sized {
-    fn try_clone_in<A: BStackWalAnchor>(&self, allocator: &A) -> io::Result<BStackOwned<Self>>;
+    fn try_clone_in<A: BStackRaiiAllocator>(&self, allocator: &A) -> io::Result<BStackOwned<Self>>;
 }
 
 /// Accumulates a deep clone's allocations, payload writes, and refcount bumps so
@@ -126,7 +126,7 @@ impl ClonePlan {
     /// for rollback. The caller supplies the block's bytes later via
     /// [`write`](Self::write). The allocator's owned-slice handle is not RAII, so
     /// letting it drop here does not free the block.
-    pub fn alloc_raw<A: BStackWalAnchor>(
+    pub fn alloc_raw<A: BStackRaiiAllocator>(
         &mut self,
         allocator: &A,
         size: u64,
@@ -156,7 +156,7 @@ impl ClonePlan {
     /// our machinery and its bytes ride the same `inplace_gen` as everything else,
     /// instead of the vector runtime writing it eagerly. `cap == len` (a fresh
     /// clone carries no spare capacity, matching `BStackByteVec::from_slice`).
-    pub fn stage_bytevec<A: BStackWalAnchor>(
+    pub fn stage_bytevec<A: BStackRaiiAllocator>(
         &mut self,
         allocator: &A,
         data: &[u8],
@@ -174,7 +174,7 @@ impl ClonePlan {
 
     /// Record that the strong count of a shared child at `data` must be bumped by
     /// one — the strong reference this clone's `#[bstack_strong]` field acquires.
-    pub fn bump_strong<T: BStackShared, A: BStackWalAnchor>(
+    pub fn bump_strong<T: BStackShared, A: BStackRaiiAllocator>(
         &mut self,
         data: BStackRef<T>,
         allocator: &A,
@@ -197,7 +197,7 @@ impl ClonePlan {
 
     /// Free everything allocated so far, in reverse order. The error path, taken
     /// when planning fails before [`commit`](Self::commit).
-    pub fn rollback<A: BStackWalAnchor>(self, allocator: &A) {
+    pub fn rollback<A: BStackRaiiAllocator>(self, allocator: &A) {
         Self::free_all(self.allocated, allocator);
     }
 
@@ -214,18 +214,18 @@ impl ClonePlan {
     /// before any write is emitted — and abort with nothing committed.
     ///
     /// **Crash reclamation is automatic**: when the allocator names a WAL anchor
-    /// ([`BStackWalAnchor::wal_anchor`] returns `Some`), the plan's fresh
+    /// ([`BStackRaiiAllocator::wal_anchor`] returns `Some`), the plan's fresh
     /// allocations are logged `Pending` before the commit and reclaimed by
     /// [`crate::wal::finish`] on the next open if the process dies mid-commit; the
     /// transaction is flipped `Complete` *inside* the commit batch, so "clone
     /// committed" and "WAL Complete" are the same atomic event. An allocator that
     /// returns `None` behaves exactly as before (mid-commit crash ⇒ orphan leak).
-    pub fn commit<A: BStackWalAnchor>(self, allocator: &A) -> io::Result<()> {
+    pub fn commit<A: BStackRaiiAllocator>(self, allocator: &A) -> io::Result<()> {
         let anchor = allocator.wal_anchor();
         self.commit_inner(allocator, anchor)
     }
 
-    fn commit_inner<A: BStackWalAnchor>(
+    fn commit_inner<A: BStackRaiiAllocator>(
         self,
         allocator: &A,
         anchor: Option<u64>,
@@ -395,7 +395,7 @@ impl ClonePlan {
     /// and marking the persistent block idle — matching exactly what `finish` would
     /// do after a real crash; without one, free them directly. The WAL lock is
     /// already held by the caller (`commit_inner`), so the *locked* variant is used.
-    fn reclaim<A: BStackWalAnchor>(
+    fn reclaim<A: BStackRaiiAllocator>(
         allocated: Vec<BStackRange>,
         wal: Option<(u64, BStackRange)>,
         allocator: &A,
@@ -408,7 +408,7 @@ impl ClonePlan {
         }
     }
 
-    fn free_all<A: BStackWalAnchor>(allocated: Vec<BStackRange>, allocator: &A) {
+    fn free_all<A: BStackRaiiAllocator>(allocated: Vec<BStackRange>, allocator: &A) {
         for r in allocated.into_iter().rev() {
             // SAFETY: each range was returned by our own `alloc_raw` and never
             // handed to another owner, so freeing it here is sound.

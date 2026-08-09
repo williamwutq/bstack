@@ -23,8 +23,8 @@ use core::marker::PhantomData;
 use core::mem::size_of;
 use std::io;
 
-use crate::wal::BStackWalAnchor;
-use bstack::{BStack, BStackOwnedSliceAllocator, BStackRange};
+use crate::BStackRaiiAllocator;
+use bstack::{BStack, BStackRange};
 use bytemuck::{Pod, Zeroable};
 
 use super::bloom::{BStackCountingBloomFilter, BloomOnDisk};
@@ -81,7 +81,7 @@ struct Split {
 }
 
 /// Accumulates a path-copy insert's new nodes and the old path nodes to free.
-struct Build<'a, A: BStackWalAnchor> {
+struct Build<'a, A: BStackRaiiAllocator> {
     allocator: &'a A,
     node_size: u64,
     ksize: usize,
@@ -90,7 +90,7 @@ struct Build<'a, A: BStackWalAnchor> {
     freed: Vec<u64>,
 }
 
-impl<'a, A: BStackWalAnchor> Build<'a, A> {
+impl<'a, A: BStackRaiiAllocator> Build<'a, A> {
     fn emit(&mut self, nb: &BNode) -> io::Result<u64> {
         let mut b = vec![0u8; self.node_size as usize];
         b[NKEYS_OFF..NKEYS_OFF + 8].copy_from_slice(&(nb.keys.len() as u64).to_le_bytes());
@@ -138,13 +138,13 @@ impl<K: Pod + Ord> BStackBTreeSet<K> {
     }
 
     /// Allocate an empty set with a default-sized Bloom filter.
-    pub fn new<A: BStackWalAnchor>(allocator: &A) -> io::Result<BStackOwned<Self>> {
+    pub fn new<A: BStackRaiiAllocator>(allocator: &A) -> io::Result<BStackOwned<Self>> {
         Self::with_capacity(allocator, DEFAULT_ITEMS, DEFAULT_FP)
     }
 
     /// Allocate an empty set whose Bloom filter is sized for `expected_items` at
     /// false-positive rate `fp_rate`.
-    pub fn with_capacity<A: BStackWalAnchor>(
+    pub fn with_capacity<A: BStackRaiiAllocator>(
         allocator: &A,
         expected_items: u64,
         fp_rate: f64,
@@ -248,7 +248,7 @@ impl<K: Pod + Ord> BStackBTreeSet<K> {
 
     /// Path-copy the subtree at `off`, inserting a **new** `key` (assumed absent).
     fn insert_rec(
-        build: &mut Build<'_, impl BStackWalAnchor>,
+        build: &mut Build<'_, impl BStackRaiiAllocator>,
         stack: &BStack,
         off: u64,
         key: &K,
@@ -280,7 +280,7 @@ impl<K: Pod + Ord> BStackBTreeSet<K> {
     }
 
     /// Insert `key`; returns `true` if newly added, `false` if already present.
-    pub fn insert<A: BStackWalAnchor>(&self, allocator: &A, key: K) -> io::Result<bool> {
+    pub fn insert<A: BStackRaiiAllocator>(&self, allocator: &A, key: K) -> io::Result<bool> {
         // Exact check first, so the filter is only touched for genuinely new keys.
         let key_bytes = bytemuck::bytes_of(&key).to_vec();
         if self.tree_contains(allocator.stack(), &key, &key_bytes)? {
@@ -425,7 +425,7 @@ impl<K: Pod + Ord> BStackBTreeSet<K> {
     /// Path-copy delete of `key` from the subtree at `off`; returns the new
     /// subtree offset and whether the key was found.
     fn delete_off(
-        build: &mut Build<'_, impl BStackWalAnchor>,
+        build: &mut Build<'_, impl BStackRaiiAllocator>,
         stack: &BStack,
         off: u64,
         key: &K,
@@ -439,7 +439,7 @@ impl<K: Pod + Ord> BStackBTreeSet<K> {
     /// Delete `key` from the in-memory node `nb`, rebalancing children to keep the
     /// B-tree invariant. Returns the modified node (not yet emitted) and found.
     fn delete_bnode(
-        build: &mut Build<'_, impl BStackWalAnchor>,
+        build: &mut Build<'_, impl BStackRaiiAllocator>,
         stack: &BStack,
         mut nb: BNode,
         key: &K,
@@ -570,7 +570,7 @@ impl<K: Pod + Ord> BStackBTreeSet<K> {
 
     /// Remove `key`; returns `true` if it was present. Deletes from the tree
     /// first, then decrements the Bloom filter (see the module docs).
-    pub fn remove<A: BStackWalAnchor>(&self, allocator: &A, key: &K) -> io::Result<bool> {
+    pub fn remove<A: BStackRaiiAllocator>(&self, allocator: &A, key: &K) -> io::Result<bool> {
         let handle = self.range.start();
         let stack = allocator.stack();
         let key_bytes = bytemuck::bytes_of(key).to_vec();
@@ -754,12 +754,16 @@ impl<K: Pod + Ord> BStackBTreeSet<K> {
     }
 
     /// Attach an allocator to make an auto-freeing [`AutoDrop`] guard.
-    pub fn auto<A: BStackWalAnchor>(self, allocator: &A) -> AutoDrop<'_, Self, A> {
+    pub fn auto<A: BStackRaiiAllocator>(self, allocator: &A) -> AutoDrop<'_, Self, A> {
         // SAFETY: sole ownership was asserted when the set was created.
         unsafe { AutoDrop::from_raw(self, allocator) }
     }
 
-    fn drop_subtree<A: BStackWalAnchor>(stack: &BStack, off: u64, allocator: &A) -> io::Result<()> {
+    fn drop_subtree<A: BStackRaiiAllocator>(
+        stack: &BStack,
+        off: u64,
+        allocator: &A,
+    ) -> io::Result<()> {
         if off == 0 {
             return Ok(());
         }
@@ -774,7 +778,7 @@ impl<K: Pod + Ord> BStackBTreeSet<K> {
         Ok(())
     }
 
-    fn clone_subtree<A: BStackWalAnchor>(
+    fn clone_subtree<A: BStackRaiiAllocator>(
         stack: &BStack,
         off: u64,
         allocator: &A,
@@ -826,7 +830,7 @@ impl<K: Pod + Ord> BStackBlock for BStackBTreeSet<K> {
 
     /// Recursively free every node and the embedded Bloom filter, **without**
     /// freeing the handle block itself.
-    fn __bstack_drop_children<A: BStackWalAnchor>(
+    fn __bstack_drop_children<A: BStackRaiiAllocator>(
         range: BStackRange,
         allocator: &A,
     ) -> io::Result<()> {
@@ -845,7 +849,7 @@ impl<K: Pod + Ord> BStackBlock for BStackBTreeSet<K> {
 
     /// Deep-clone every node and the Bloom filter into `plan`, then stage the
     /// handle.
-    fn __bstack_clone_into<A: BStackWalAnchor>(
+    fn __bstack_clone_into<A: BStackRaiiAllocator>(
         &self,
         allocator: &A,
         plan: &mut ClonePlan,
@@ -875,7 +879,7 @@ impl<K: Pod + Ord> BStackBlock for BStackBTreeSet<K> {
 }
 
 impl<K: Pod + Ord> BStackDrop for BStackBTreeSet<K> {
-    fn bstack_drop<A: BStackWalAnchor>(self, allocator: &A) -> io::Result<()> {
+    fn bstack_drop<A: BStackRaiiAllocator>(self, allocator: &A) -> io::Result<()> {
         Self::__bstack_drop_children(self.range, allocator)?;
         // SAFETY: sole ownership of the handle block was asserted at construction.
         unsafe { dealloc_range(allocator, self.range) }
@@ -883,7 +887,7 @@ impl<K: Pod + Ord> BStackDrop for BStackBTreeSet<K> {
 }
 
 impl<K: Pod + Ord> TryCloneIn for BStackBTreeSet<K> {
-    fn try_clone_in<A: BStackWalAnchor>(&self, allocator: &A) -> io::Result<BStackOwned<Self>> {
+    fn try_clone_in<A: BStackRaiiAllocator>(&self, allocator: &A) -> io::Result<BStackOwned<Self>> {
         let mut plan = ClonePlan::new();
         let dst = match self.__bstack_clone_into(allocator, &mut plan) {
             Ok(range) => range,

@@ -30,8 +30,8 @@ use core::marker::PhantomData;
 use core::mem::size_of;
 use std::io;
 
-use crate::wal::BStackWalAnchor;
-use bstack::{BStack, BStackOwnedSliceAllocator, BStackRange};
+use crate::BStackRaiiAllocator;
+use bstack::{BStack, BStackRange};
 use bytemuck::{Pod, Zeroable};
 
 use super::util::{alloc_image, read_fields, read_u64};
@@ -104,12 +104,12 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBinaryHeap<K, V> {
     }
 
     /// Allocate an empty heap (no array until the first push).
-    pub fn new<A: BStackWalAnchor>(allocator: &A) -> io::Result<BStackOwned<Self>> {
+    pub fn new<A: BStackRaiiAllocator>(allocator: &A) -> io::Result<BStackOwned<Self>> {
         Self::with_image(allocator, 0, 0)
     }
 
     /// Allocate an empty heap with room for `cap` elements pre-reserved.
-    pub fn with_capacity<A: BStackWalAnchor>(
+    pub fn with_capacity<A: BStackRaiiAllocator>(
         allocator: &A,
         cap: u64,
     ) -> io::Result<BStackOwned<Self>> {
@@ -129,7 +129,7 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBinaryHeap<K, V> {
         }
     }
 
-    fn with_image<A: BStackWalAnchor>(
+    fn with_image<A: BStackRaiiAllocator>(
         allocator: &A,
         data: u64,
         cap: u64,
@@ -180,7 +180,7 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBinaryHeap<K, V> {
     /// Insert `key -> value`, taking ownership of the value block.
     ///
     /// Sifts the new element up and commits the whole path atomically.
-    pub fn push<A: BStackWalAnchor>(
+    pub fn push<A: BStackRaiiAllocator>(
         &self,
         allocator: &A,
         key: K,
@@ -225,7 +225,7 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBinaryHeap<K, V> {
 
     /// Remove and return the minimum entry (its value block owned), or `None` if
     /// empty. Sifts the last element down and commits the whole path atomically.
-    pub fn pop<A: BStackWalAnchor>(
+    pub fn pop<A: BStackRaiiAllocator>(
         &self,
         allocator: &A,
     ) -> io::Result<Option<(K, BStackOwned<V>)>> {
@@ -290,7 +290,7 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBinaryHeap<K, V> {
 
     /// Grow the array to at least double its capacity, copying the elements and
     /// atomically swapping the descriptor.
-    fn grow<A: BStackWalAnchor>(&self, allocator: &A) -> io::Result<()> {
+    fn grow<A: BStackRaiiAllocator>(&self, allocator: &A) -> io::Result<()> {
         let handle = self.range.start();
         let stride = Self::stride();
         let (data, cap, len) = Self::read_meta(allocator.stack(), handle)?;
@@ -317,7 +317,7 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBinaryHeap<K, V> {
     }
 
     /// Attach an allocator to make an auto-freeing [`AutoDrop`] guard.
-    pub fn auto<A: BStackWalAnchor>(self, allocator: &A) -> AutoDrop<'_, Self, A> {
+    pub fn auto<A: BStackRaiiAllocator>(self, allocator: &A) -> AutoDrop<'_, Self, A> {
         // SAFETY: sole ownership was asserted when the heap was created.
         unsafe { AutoDrop::from_raw(self, allocator) }
     }
@@ -348,7 +348,7 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBlock for BStackBinaryHeap<K, V> {
 
     /// Recursively free every value block and the array, **without** freeing the
     /// handle block itself.
-    fn __bstack_drop_children<A: BStackWalAnchor>(
+    fn __bstack_drop_children<A: BStackRaiiAllocator>(
         range: BStackRange,
         allocator: &A,
     ) -> io::Result<()> {
@@ -372,7 +372,7 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBlock for BStackBinaryHeap<K, V> {
 
     /// Deep-clone: pack the elements into a fresh, exactly-sized array with each
     /// value deep-cloned, and stage the handle, in the parent plan's atomic commit.
-    fn __bstack_clone_into<A: BStackWalAnchor>(
+    fn __bstack_clone_into<A: BStackRaiiAllocator>(
         &self,
         allocator: &A,
         plan: &mut ClonePlan,
@@ -418,7 +418,7 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBlock for BStackBinaryHeap<K, V> {
 }
 
 impl<K: Pod + Ord, V: BStackBlock> BStackDrop for BStackBinaryHeap<K, V> {
-    fn bstack_drop<A: BStackWalAnchor>(self, allocator: &A) -> io::Result<()> {
+    fn bstack_drop<A: BStackRaiiAllocator>(self, allocator: &A) -> io::Result<()> {
         Self::__bstack_drop_children(self.range, allocator)?;
         // SAFETY: sole ownership of the handle block was asserted at construction.
         unsafe { dealloc_range(allocator, self.range) }
@@ -426,7 +426,7 @@ impl<K: Pod + Ord, V: BStackBlock> BStackDrop for BStackBinaryHeap<K, V> {
 }
 
 impl<K: Pod + Ord, V: BStackBlock> TryCloneIn for BStackBinaryHeap<K, V> {
-    fn try_clone_in<A: BStackWalAnchor>(&self, allocator: &A) -> io::Result<BStackOwned<Self>> {
+    fn try_clone_in<A: BStackRaiiAllocator>(&self, allocator: &A) -> io::Result<BStackOwned<Self>> {
         let mut plan = ClonePlan::new();
         let dst = match self.__bstack_clone_into(allocator, &mut plan) {
             Ok(range) => range,

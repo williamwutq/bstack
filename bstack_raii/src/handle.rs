@@ -16,8 +16,8 @@
 use core::mem::size_of;
 use std::io;
 
-use crate::wal::BStackWalAnchor;
-use bstack::{BStackOwnedSliceAllocator, BStackRange};
+use crate::BStackRaiiAllocator;
+use bstack::BStackRange;
 
 use crate::block::{BStackBlock, BStackWeakable};
 use crate::layout;
@@ -52,7 +52,7 @@ pub struct WeakRef<T: BStackWeakable>(pub BStackRef<T::Control>);
 /// Read a data block's `ctrl` back-pointer (a `u64` offset at
 /// [`layout::CTRL_BACKPTR_OFFSET`]) and resolve it to a typed control ref,
 /// recovering the control block's length from `size_of::<T::Control>()`.
-fn read_ctrl_ref<T: BStackWeakable, A: BStackWalAnchor>(
+fn read_ctrl_ref<T: BStackWeakable, A: BStackRaiiAllocator>(
     data_ref: BStackRef<T>,
     allocator: &A,
 ) -> io::Result<BStackRef<T::Control>> {
@@ -65,7 +65,7 @@ fn read_ctrl_ref<T: BStackWeakable, A: BStackWalAnchor>(
 }
 
 impl<T: BStackBlock> BStackDrop for OwnedRef<T> {
-    fn bstack_drop<A: BStackWalAnchor>(self, allocator: &A) -> io::Result<()> {
+    fn bstack_drop<A: BStackRaiiAllocator>(self, allocator: &A) -> io::Result<()> {
         // An owned child is freed by running the block's own recursive teardown,
         // which frees its children (post-order) and then deallocs the block.
         T::from_range(self.0.into_range()).bstack_drop(allocator)
@@ -73,7 +73,7 @@ impl<T: BStackBlock> BStackDrop for OwnedRef<T> {
 }
 
 impl<T: BStackBlock> BStackDrop for StrongRef<T> {
-    fn bstack_drop<A: BStackWalAnchor>(self, allocator: &A) -> io::Result<()> {
+    fn bstack_drop<A: BStackRaiiAllocator>(self, allocator: &A) -> io::Result<()> {
         let data_range = self.0.into_range();
         let off = data_range.start() + layout::RC_REFCOUNT_OFFSET;
         // Decrement the inline refcount; only the last owner frees the block.
@@ -87,7 +87,7 @@ impl<T: BStackBlock> BStackDrop for StrongRef<T> {
 impl<T: BStackWeakable> StrongWeakRef<T> {
     /// Resolve the control ref from the data block's `ctrl` back-pointer with a
     /// single read, then pair it with the data ref.
-    pub fn from_disk<A: BStackWalAnchor>(
+    pub fn from_disk<A: BStackRaiiAllocator>(
         data_ref: BStackRef<T>,
         allocator: &A,
     ) -> io::Result<Self> {
@@ -101,7 +101,7 @@ impl<T: BStackWeakable> StrongWeakRef<T> {
 /// recursive teardown), so it is shared by both [`StrongWeakRef::bstack_drop`]
 /// and [`crate::BStackRc`]'s `Drop` — the latter carries `T: BStackBlock` and so
 /// cannot construct a `StrongWeakRef<T>` (which needs `BStackWeakable`) itself.
-pub(crate) fn strong_release_ctrl<T: BStackBlock, A: BStackWalAnchor>(
+pub(crate) fn strong_release_ctrl<T: BStackBlock, A: BStackRaiiAllocator>(
     allocator: &A,
     data_range: BStackRange,
     ctrl_range: BStackRange,
@@ -123,14 +123,14 @@ pub(crate) fn strong_release_ctrl<T: BStackBlock, A: BStackWalAnchor>(
 }
 
 impl<T: BStackWeakable> BStackDrop for StrongWeakRef<T> {
-    fn bstack_drop<A: BStackWalAnchor>(self, allocator: &A) -> io::Result<()> {
+    fn bstack_drop<A: BStackRaiiAllocator>(self, allocator: &A) -> io::Result<()> {
         strong_release_ctrl::<T, A>(allocator, self.0.into_range(), self.1.into_range())
     }
 }
 
 impl<T: BStackWeakable> WeakRef<T> {
     /// Resolve the control ref from the data block's `ctrl` back-pointer.
-    pub fn from_disk<A: BStackWalAnchor>(
+    pub fn from_disk<A: BStackRaiiAllocator>(
         data_ref: BStackRef<T>,
         allocator: &A,
     ) -> io::Result<Self> {
@@ -139,7 +139,7 @@ impl<T: BStackWeakable> WeakRef<T> {
 }
 
 impl<T: BStackWeakable> BStackDrop for WeakRef<T> {
-    fn bstack_drop<A: BStackWalAnchor>(self, allocator: &A) -> io::Result<()> {
+    fn bstack_drop<A: BStackRaiiAllocator>(self, allocator: &A) -> io::Result<()> {
         let ctrl_range = self.0.into_range();
         let weak_off = ctrl_range.start() + layout::CTRL_WEAK_OFFSET;
         // Decrement ctrl.weak; free the control block when the last weak handle

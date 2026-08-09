@@ -18,8 +18,8 @@
 
 use std::io;
 
-use crate::wal::BStackWalAnchor;
-use bstack::{BStackOwnedSliceAllocator, BStackRange};
+use crate::BStackRaiiAllocator;
+use bstack::BStackRange;
 
 use crate::block::BStackBlock;
 use crate::clone::TryCloneIn;
@@ -101,7 +101,7 @@ impl<T: BStackBlock> BStackCow<T> {
     /// * `Owned` — returned as-is; no I/O.
     /// * `Borrowed` — the referenced block is deep-cloned into a fresh
     ///   independent [`BStackOwned<T>`] allocated with `allocator`.
-    pub fn into_owned<A: BStackWalAnchor>(self, allocator: &A) -> io::Result<BStackOwned<T>>
+    pub fn into_owned<A: BStackRaiiAllocator>(self, allocator: &A) -> io::Result<BStackOwned<T>>
     where
         T: TryCloneIn,
     {
@@ -120,7 +120,10 @@ impl<T: BStackBlock> BStackCow<T> {
     /// through the returned handle (the block's setters + `allocator`) never
     /// touch the originally borrowed block. A no-op (beyond the ownership
     /// check) when already owned.
-    pub fn to_mut<A: BStackWalAnchor>(&mut self, allocator: &A) -> io::Result<&mut BStackOwned<T>>
+    pub fn to_mut<A: BStackRaiiAllocator>(
+        &mut self,
+        allocator: &A,
+    ) -> io::Result<&mut BStackOwned<T>>
     where
         T: TryCloneIn,
     {
@@ -139,7 +142,7 @@ impl<T: BStackBlock> BStackCow<T> {
 
     /// Attach an allocator to make an auto-freeing [`AutoDrop`] guard: dropping
     /// the returned value runs this `Cow`'s teardown (a no-op when borrowed).
-    pub fn auto<A: BStackWalAnchor>(self, allocator: &A) -> AutoDrop<'_, Self, A> {
+    pub fn auto<A: BStackRaiiAllocator>(self, allocator: &A) -> AutoDrop<'_, Self, A> {
         // SAFETY: an `Owned` variant asserts sole ownership of a live block; a
         // `Borrowed` variant frees nothing, so the assertion is trivially met.
         unsafe { AutoDrop::from_raw(self, allocator) }
@@ -149,7 +152,7 @@ impl<T: BStackBlock> BStackCow<T> {
 impl<T: BStackBlock> BStackDrop for BStackCow<T> {
     /// Free the block **only** when owned; a borrowed `Cow` has no claim on its
     /// target and frees nothing.
-    fn bstack_drop<A: BStackWalAnchor>(self, allocator: &A) -> io::Result<()> {
+    fn bstack_drop<A: BStackRaiiAllocator>(self, allocator: &A) -> io::Result<()> {
         match self {
             BStackCow::Owned(o) => o.bstack_drop(allocator),
             BStackCow::Borrowed(_) => Ok(()),

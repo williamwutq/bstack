@@ -9,17 +9,17 @@ use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bstack::{
-    BStack, BStackAllocator, BStackOwnedSliceAllocator, BStackRange, FirstFitBStackAllocator,
+    BStack, BStackAllocator, BStackRange, FirstFitBStackAllocator,
 };
 
 use crate::layout::{self, BlockHeader};
 use crate::{
     AutoDrop, BStackBTreeMap, BStackBTreeSet, BStackBinaryHeap, BStackBlock, BStackBlockVec,
     BStackBox, BStackCast, BStackCastAs, BStackCastInto, BStackCountingBloomFilter, BStackCow,
-    BStackDeque, BStackDrop, BStackHashMap, BStackHashSet, BStackLinkedList, BStackOwned, BStackRc,
-    BStackRef, BStackShared, BStackString, BStackWalAnchor, BStackWeakable, EightCC, TryClone,
-    TryCloneIn, alloc_block, alloc_control, bstack_block, bstack_cast, bstack_enum, bstack_move,
-    dealloc_range,
+    BStackDeque, BStackDrop, BStackHashMap, BStackHashSet, BStackLinkedList, BStackOwned,
+    BStackRaiiAllocator, BStackRc, BStackRef, BStackShared, BStackString, BStackWeakable, EightCC,
+    TryClone, TryCloneIn, alloc_block, alloc_control, bstack_block, bstack_cast, bstack_enum,
+    bstack_move, dealloc_range,
 };
 
 // --------------------------------------------------------------------------
@@ -117,7 +117,7 @@ impl BStackCast for TestBlock {
 }
 
 impl BStackDrop for TestBlock {
-    fn bstack_drop<A: BStackWalAnchor>(self, allocator: &A) -> io::Result<()> {
+    fn bstack_drop<A: BStackRaiiAllocator>(self, allocator: &A) -> io::Result<()> {
         // No owned children: just free the data block itself.
         unsafe { dealloc_range(allocator, self.0) }
     }
@@ -2509,7 +2509,7 @@ fn wal_finish_abandons_uncommitted() {
 
 #[test]
 fn wal_anchor_trait_reclaims_via_finish() {
-    use crate::BStackWalAnchor;
+    use crate::BStackRaiiAllocator;
     use crate::wal::{finish, persist_at};
     use crate::{WalEntry, WalLog, WalStatus};
 
@@ -6338,7 +6338,7 @@ fn wal_clone_reclaims_orphans_on_commit_fault() {
     }
 
     let tmp = TempStack::new();
-    let alloc = tmp.allocator(); // FirstFit is a BStackWalAnchor
+    let alloc = tmp.allocator(); // FirstFit is a BStackRaiiAllocator
     let stack = alloc.stack();
 
     // Source owns a child, so each deep clone allocates two blocks (+ a WAL block).

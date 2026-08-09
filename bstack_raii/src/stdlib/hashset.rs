@@ -33,8 +33,8 @@ use core::marker::PhantomData;
 use core::mem::size_of;
 use std::io;
 
-use crate::wal::BStackWalAnchor;
-use bstack::{BStack, BStackGenOp, BStackOwnedSliceAllocator, BStackRange};
+use crate::BStackRaiiAllocator;
+use bstack::{BStack, BStackGenOp, BStackRange};
 use bytemuck::{Pod, Zeroable};
 
 use super::bloom::{BStackCountingBloomFilter, BloomOnDisk};
@@ -129,13 +129,13 @@ impl<K: Pod> BStackHashSet<K> {
     }
 
     /// Allocate an empty set with a default-sized Bloom filter.
-    pub fn new<A: BStackWalAnchor>(allocator: &A) -> io::Result<BStackOwned<Self>> {
+    pub fn new<A: BStackRaiiAllocator>(allocator: &A) -> io::Result<BStackOwned<Self>> {
         Self::with_capacity(allocator, DEFAULT_ITEMS, DEFAULT_FP)
     }
 
     /// Allocate an empty set whose Bloom filter is sized for `expected_items` at
     /// false-positive rate `fp_rate`.
-    pub fn with_capacity<A: BStackWalAnchor>(
+    pub fn with_capacity<A: BStackRaiiAllocator>(
         allocator: &A,
         expected_items: u64,
         fp_rate: f64,
@@ -181,7 +181,7 @@ impl<K: Pod> BStackHashSet<K> {
 
     /// Insert `key`; returns `true` if it was newly added, `false` if already
     /// present.
-    pub fn insert<A: BStackWalAnchor>(&self, allocator: &A, key: K) -> io::Result<bool> {
+    pub fn insert<A: BStackRaiiAllocator>(&self, allocator: &A, key: K) -> io::Result<bool> {
         let key_bytes = bytemuck::bytes_of(&key).to_vec();
         let hash = fnv1a(&key_bytes);
         let bloom = self.bloom(allocator.stack())?;
@@ -196,7 +196,7 @@ impl<K: Pod> BStackHashSet<K> {
     }
 
     /// Remove `key`; returns `true` if it was present.
-    pub fn remove<A: BStackWalAnchor>(&self, allocator: &A, key: &K) -> io::Result<bool> {
+    pub fn remove<A: BStackRaiiAllocator>(&self, allocator: &A, key: &K) -> io::Result<bool> {
         let key_bytes = bytemuck::bytes_of(key).to_vec();
         let hash = fnv1a(&key_bytes);
         // Remove from the table first; only then decrement the filter (and only
@@ -234,7 +234,7 @@ impl<K: Pod> BStackHashSet<K> {
     }
 
     /// Place `key` in the table if absent; returns whether it was newly added.
-    fn table_insert<A: BStackWalAnchor>(
+    fn table_insert<A: BStackRaiiAllocator>(
         &self,
         allocator: &A,
         key_bytes: &[u8],
@@ -301,7 +301,7 @@ impl<K: Pod> BStackHashSet<K> {
     }
 
     /// Tombstone `key` in the table if present; returns whether it was.
-    fn table_remove<A: BStackWalAnchor>(
+    fn table_remove<A: BStackRaiiAllocator>(
         &self,
         allocator: &A,
         key_bytes: &[u8],
@@ -365,7 +365,7 @@ impl<K: Pod> BStackHashSet<K> {
 
     /// Grow the table to at least double its capacity, rehashing every live key
     /// (and dropping tombstones) atomically.
-    fn grow<A: BStackWalAnchor>(&self, allocator: &A) -> io::Result<()> {
+    fn grow<A: BStackRaiiAllocator>(&self, allocator: &A) -> io::Result<()> {
         let handle = self.range.start();
         let stride = Self::stride();
         let ksz = Self::ksize();
@@ -493,7 +493,7 @@ impl<K: Pod> BStackHashSet<K> {
     }
 
     /// Attach an allocator to make an auto-freeing [`AutoDrop`] guard.
-    pub fn auto<A: BStackWalAnchor>(self, allocator: &A) -> AutoDrop<'_, Self, A> {
+    pub fn auto<A: BStackRaiiAllocator>(self, allocator: &A) -> AutoDrop<'_, Self, A> {
         // SAFETY: sole ownership was asserted when the set was created.
         unsafe { AutoDrop::from_raw(self, allocator) }
     }
@@ -523,7 +523,7 @@ impl<K: Pod> BStackBlock for BStackHashSet<K> {
 
     /// Free the bucket block and the embedded Bloom filter, **without** freeing
     /// the handle block itself.
-    fn __bstack_drop_children<A: BStackWalAnchor>(
+    fn __bstack_drop_children<A: BStackRaiiAllocator>(
         range: BStackRange,
         allocator: &A,
     ) -> io::Result<()> {
@@ -546,7 +546,7 @@ impl<K: Pod> BStackBlock for BStackHashSet<K> {
 
     /// Deep-clone: copy the bucket block, deep-clone the Bloom filter, and stage
     /// the handle, in the parent plan's single atomic commit.
-    fn __bstack_clone_into<A: BStackWalAnchor>(
+    fn __bstack_clone_into<A: BStackRaiiAllocator>(
         &self,
         allocator: &A,
         plan: &mut ClonePlan,
@@ -589,7 +589,7 @@ impl<K: Pod> BStackBlock for BStackHashSet<K> {
 }
 
 impl<K: Pod> BStackDrop for BStackHashSet<K> {
-    fn bstack_drop<A: BStackWalAnchor>(self, allocator: &A) -> io::Result<()> {
+    fn bstack_drop<A: BStackRaiiAllocator>(self, allocator: &A) -> io::Result<()> {
         Self::__bstack_drop_children(self.range, allocator)?;
         // SAFETY: sole ownership of the handle block was asserted at construction.
         unsafe { dealloc_range(allocator, self.range) }
@@ -597,7 +597,7 @@ impl<K: Pod> BStackDrop for BStackHashSet<K> {
 }
 
 impl<K: Pod> TryCloneIn for BStackHashSet<K> {
-    fn try_clone_in<A: BStackWalAnchor>(&self, allocator: &A) -> io::Result<BStackOwned<Self>> {
+    fn try_clone_in<A: BStackRaiiAllocator>(&self, allocator: &A) -> io::Result<BStackOwned<Self>> {
         let mut plan = ClonePlan::new();
         let dst = match self.__bstack_clone_into(allocator, &mut plan) {
             Ok(range) => range,

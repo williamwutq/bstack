@@ -12,9 +12,8 @@ use std::io;
 
 use bstack::{BStackGenOp, BStackOwnedSlice, BStackOwnedSliceAllocator, BStackRange};
 
-use crate::wal::{
-    BStackWalAnchor, WalEntry, WalLog, WalStatus, finish_at_locked, persist_at, wal_lock_for,
-};
+use crate::BStackRaiiAllocator;
+use crate::wal::{WalEntry, WalLog, WalStatus, finish_at_locked, persist_at, wal_lock_for};
 
 thread_local! {
     /// While a WAL-backed teardown is in progress, the collector that
@@ -30,7 +29,7 @@ thread_local! {
 /// so a crash mid-teardown is completed — not leaked — by `finish` on the next
 /// open. This is what [`BStackOwned::bstack_drop`](crate::BStackOwned) runs, so
 /// **every owned teardown is automatically WAL-backed** when the allocator names
-/// an anchor ([`BStackWalAnchor::wal_anchor`] returns `Some`); an allocator that
+/// an anchor ([`BStackRaiiAllocator::wal_anchor`] returns `Some`); an allocator that
 /// returns `None` falls straight through to a plain [`BStackDrop::bstack_drop`]
 /// and behaves exactly as before (mid-teardown crash ⇒ orphan leak).
 ///
@@ -41,7 +40,10 @@ thread_local! {
 /// (e.g. a collection freeing its values through `BStackOwned::bstack_drop`) see
 /// the sink already set and just collect, so exactly one transaction wraps the
 /// outermost teardown.
-pub fn wal_teardown<A: BStackWalAnchor, T: BStackDrop>(handle: T, allocator: &A) -> io::Result<()> {
+pub fn wal_teardown<A: BStackRaiiAllocator, T: BStackDrop>(
+    handle: T,
+    allocator: &A,
+) -> io::Result<()> {
     // Nested teardown: an outer driver already owns the sink; frees already
     // collect, so just recurse (exactly one transaction wraps the whole subtree).
     if TEARDOWN_SINK.with(|s| s.borrow().is_some()) {
@@ -68,7 +70,7 @@ pub fn wal_teardown<A: BStackWalAnchor, T: BStackDrop>(handle: T, allocator: &A)
 /// lock, so concurrent teardowns on the same file serialize here (they collect
 /// their subtrees independently first — that part stays concurrent) rather than
 /// racing the single shared anchor slot.
-fn wal_free_all<A: BStackWalAnchor>(
+fn wal_free_all<A: BStackRaiiAllocator>(
     allocator: &A,
     anchor: u64,
     slices: Vec<BStackRange>,
@@ -121,7 +123,7 @@ fn wal_free_all<A: BStackWalAnchor>(
 /// A>` (so a reconstructed owned slice is the accepted `dealloc` handle) and
 /// `Error = io::Error` (so the layer speaks [`io::Result`]).
 pub trait BStackDrop: Sized {
-    fn bstack_drop<A: BStackWalAnchor>(self, allocator: &A) -> io::Result<()>;
+    fn bstack_drop<A: BStackRaiiAllocator>(self, allocator: &A) -> io::Result<()>;
 }
 
 /// Free a raw block range by reconstructing an owned slice and delegating to the
@@ -165,12 +167,12 @@ pub unsafe fn dealloc_range<A: BStackOwnedSliceAllocator>(
 /// It is a newtype over `(ManuallyDrop<T>, &'a A)`; `bstack_move!` and the raw
 /// accessors defuse it via [`into_raw_parts`](Self::into_raw_parts) so no
 /// parallel destruction path exists.
-pub struct AutoDrop<'a, T: BStackDrop, A: BStackWalAnchor> {
+pub struct AutoDrop<'a, T: BStackDrop, A: BStackRaiiAllocator> {
     inner: ManuallyDrop<T>,
     allocator: &'a A,
 }
 
-impl<'a, T: BStackDrop, A: BStackWalAnchor> AutoDrop<'a, T, A> {
+impl<'a, T: BStackDrop, A: BStackRaiiAllocator> AutoDrop<'a, T, A> {
     /// Pair an inner handle with its allocator into an auto-dropping guard.
     ///
     /// # Safety
@@ -206,14 +208,14 @@ impl<'a, T: BStackDrop, A: BStackWalAnchor> AutoDrop<'a, T, A> {
     }
 }
 
-impl<'a, T: BStackDrop, A: BStackWalAnchor> Deref for AutoDrop<'a, T, A> {
+impl<'a, T: BStackDrop, A: BStackRaiiAllocator> Deref for AutoDrop<'a, T, A> {
     type Target = T;
     fn deref(&self) -> &T {
         &self.inner
     }
 }
 
-impl<'a, T: BStackDrop, A: BStackWalAnchor> Drop for AutoDrop<'a, T, A> {
+impl<'a, T: BStackDrop, A: BStackRaiiAllocator> Drop for AutoDrop<'a, T, A> {
     fn drop(&mut self) {
         let inner = unsafe { ManuallyDrop::take(&mut self.inner) };
         // Errors are swallowed, matching the contract of Rust's `Drop`.

@@ -6,8 +6,8 @@
 
 use std::io;
 
-use crate::wal::BStackWalAnchor;
-use bstack::{BStackOwnedSliceAllocator, BStackRange};
+use crate::BStackRaiiAllocator;
+use bstack::BStackRange;
 use bytemuck::Pod;
 
 use crate::clone::ClonePlan;
@@ -57,7 +57,7 @@ pub trait BStackBlock: BStackCast + BStackDrop + Sized {
     /// nothing. Exposed on the trait — rather than as a generated inherent method —
     /// so a generic parent can recurse into a type parameter. `#[doc(hidden)]`.
     #[doc(hidden)]
-    fn __bstack_drop_children<A: BStackWalAnchor>(
+    fn __bstack_drop_children<A: BStackRaiiAllocator>(
         range: BStackRange,
         allocator: &A,
     ) -> io::Result<()> {
@@ -74,7 +74,7 @@ pub trait BStackBlock: BStackCast + BStackDrop + Sized {
     /// rather than as a generated inherent method — so a generic parent can
     /// recurse into a type parameter's clone. `#[doc(hidden)]`: an impl detail.
     #[doc(hidden)]
-    fn __bstack_clone_children_inplace<A: BStackWalAnchor>(
+    fn __bstack_clone_children_inplace<A: BStackRaiiAllocator>(
         &self,
         allocator: &A,
         _plan: &mut ClonePlan,
@@ -91,7 +91,7 @@ pub trait BStackBlock: BStackCast + BStackDrop + Sized {
     /// caller). Overridden by the generated impl; the default suffices for a
     /// childless block. `#[doc(hidden)]`: an impl detail.
     #[doc(hidden)]
-    fn __bstack_clone_into<A: BStackWalAnchor>(
+    fn __bstack_clone_into<A: BStackRaiiAllocator>(
         &self,
         allocator: &A,
         plan: &mut ClonePlan,
@@ -118,8 +118,8 @@ pub trait BStackBlock: BStackCast + BStackDrop + Sized {
 /// allocator, since neither the owned handle nor the block type carries one.
 pub trait BStackMove: BStackBlock {
     /// The tuple of field handles produced, in field-declaration order.
-    type Fields<'a, A: BStackWalAnchor>;
-    fn bstack_move<'a, A: BStackWalAnchor>(
+    type Fields<'a, A: BStackRaiiAllocator>;
+    fn bstack_move<'a, A: BStackRaiiAllocator>(
         owned: BStackOwned<Self>,
         allocator: &'a A,
     ) -> io::Result<Self::Fields<'a, A>>;
@@ -158,13 +158,16 @@ pub trait BStackShared: BStackBlock {
     /// Drop one strong reference to a block of this type located at `data`,
     /// freeing it (and, for `(rc, weak)`, releasing the control block) when the
     /// strong count reaches zero.
-    fn drop_strong_ref<A: BStackWalAnchor>(data: BStackRef<Self>, allocator: &A) -> io::Result<()>;
+    fn drop_strong_ref<A: BStackRaiiAllocator>(
+        data: BStackRef<Self>,
+        allocator: &A,
+    ) -> io::Result<()>;
 
     /// Resolve the raw parts of a strong handle to a child of this type at
     /// `data`: the data ref, plus the control-block range for `(rc, weak)`
     /// blocks (`None` for plain `(rc)`). Used by `bstack_move!` to rebuild a
     /// `BStackRc` for a `#[bstack_strong]` field.
-    fn strong_parts<A: BStackWalAnchor>(
+    fn strong_parts<A: BStackRaiiAllocator>(
         data: BStackRef<Self>,
         allocator: &A,
     ) -> io::Result<(BStackRef<Self>, Option<BStackRange>)>;

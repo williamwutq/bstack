@@ -7,8 +7,8 @@
 
 use std::io;
 
-use crate::wal::BStackWalAnchor;
-use bstack::{BStackOwnedSlice, BStackOwnedSliceAllocator, BStackSlice};
+use crate::BStackRaiiAllocator;
+use bstack::{BStackOwnedSlice, BStackSlice};
 
 use crate::block::{BStackBlock, BStackCast};
 use crate::layout::EightCC;
@@ -18,7 +18,7 @@ use crate::teardown::AutoDrop;
 /// Byte offset of the `tag` within a [`crate::BlockHeader`] (`size: u64` first).
 const TAG_OFFSET: u64 = 8;
 
-impl<'a, T: BStackBlock, A: BStackWalAnchor> AutoDrop<'a, BStackOwned<T>, A> {
+impl<'a, T: BStackBlock, A: BStackRaiiAllocator> AutoDrop<'a, BStackOwned<T>, A> {
     /// Upcast an auto-freeing owned handle to the untyped owned slice, discarding
     /// type info (infallible).
     ///
@@ -35,14 +35,14 @@ impl<'a, T: BStackBlock, A: BStackWalAnchor> AutoDrop<'a, BStackOwned<T>, A> {
 /// Downcast an owned slice to a typed (bare) owned handle by checking the block
 /// tag. The result carries no allocator; free it with `owned.bstack_drop(alloc)`
 /// or wrap it via `owned.auto(alloc)`.
-pub trait BStackCastInto<'a, A: BStackWalAnchor>: Sized {
+pub trait BStackCastInto<'a, A: BStackRaiiAllocator>: Sized {
     /// `Ok(Ok(owned))` on a tag match; `Ok(Err(self))` on mismatch (ownership is
     /// handed back so the caller can try another type); `Err` on an I/O failure
     /// reading the header.
     fn cast_into<T: BStackBlock>(self) -> io::Result<Result<BStackOwned<T>, Self>>;
 }
 
-impl<'a, A: BStackWalAnchor> BStackCastInto<'a, A> for BStackOwnedSlice<'a, A> {
+impl<'a, A: BStackRaiiAllocator> BStackCastInto<'a, A> for BStackOwnedSlice<'a, A> {
     fn cast_into<T: BStackBlock>(self) -> io::Result<Result<BStackOwned<T>, Self>> {
         let mut tag = [0u8; 8];
         self.read_range_into(TAG_OFFSET, &mut tag)?;
