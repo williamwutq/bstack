@@ -4,9 +4,9 @@ version = 4
 
 [[package]]
 name = "bstack"
-version = "0.4.0"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b3d25282e16e90e033662b78e911d036da268c3b2a27e345d8feb677c80cd07"
+checksum = "5099c95e4494ce92b330ddc52d626a07195d7731975e42c1761c7f746ec98758"
 dependencies = [
  "libc",
  "windows-sys",
