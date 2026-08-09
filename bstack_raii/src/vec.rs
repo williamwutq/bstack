@@ -31,6 +31,7 @@ use core::mem::size_of;
 use std::io;
 
 use bstack::{BStack, BStackByteVec, BStackOwnedSlice, BStackOwnedSliceAllocator, BStackRange};
+use crate::wal::BStackWalAnchor;
 use bytemuck::{Pod, Zeroable};
 
 use crate::block::{BStackBlock, BStackShared, BStackWeakable};
@@ -63,7 +64,7 @@ pub(crate) fn bytevec_image(len: u64, cap: u64, data: &[u8]) -> Vec<u8> {
 /// Build a fresh data block holding `offs` (an offset array), register it in
 /// `plan` for rollback, and return its descriptor. The shared back end of the
 /// block-element vector clones, whose elements are all `u64` offsets.
-fn build_offset_desc<A: BStackOwnedSliceAllocator>(
+fn build_offset_desc<A: BStackWalAnchor>(
     allocator: &A,
     offs: &[u64],
     plan: &mut ClonePlan,
@@ -110,7 +111,7 @@ fn write_vecdesc(stack: &BStack, loc: u64, desc: VecDesc) -> io::Result<()> {
 /// The handle carries the descriptor in memory (`data`), plus the inline field
 /// location to persist it to (`writeback`) when field-resident — `None` for a
 /// detached vector (from [`from_slice`](Self::from_slice) or `bstack_move!`).
-pub struct BStackVec<'a, T, A: BStackOwnedSliceAllocator> {
+pub struct BStackVec<'a, T, A: BStackWalAnchor> {
     /// The current data block range (the live descriptor).
     data: BStackRange,
     /// Where to persist descriptor changes on realloc (the inline field). `None`
@@ -120,7 +121,7 @@ pub struct BStackVec<'a, T, A: BStackOwnedSliceAllocator> {
     _marker: PhantomData<fn() -> T>,
 }
 
-impl<'a, T, A: BStackOwnedSliceAllocator> BStackVec<'a, T, A> {
+impl<'a, T, A: BStackWalAnchor> BStackVec<'a, T, A> {
     /// Reconstruct a **field-resident** handle from its inline descriptor's
     /// absolute on-disk location (what a field accessor passes). Reads the
     /// current descriptor and remembers the location for write-back.
@@ -201,7 +202,7 @@ impl<'a, T, A: BStackOwnedSliceAllocator> BStackVec<'a, T, A> {
     }
 }
 
-impl<'a, T: Pod, A: BStackOwnedSliceAllocator> BStackVec<'a, T, A> {
+impl<'a, T: Pod, A: BStackWalAnchor> BStackVec<'a, T, A> {
     /// Create a **detached** vector holding `data`, allocating only the data
     /// block. It becomes persistent when written into a struct field.
     pub fn from_slice(allocator: &'a A, data: &[T]) -> io::Result<Self> {
@@ -328,12 +329,12 @@ impl<'a, T: Pod, A: BStackOwnedSliceAllocator> BStackVec<'a, T, A> {
 /// Each element is a `u64` offset to a separately-allocated `#[bstack_block]`
 /// child this vector *owns*; dropping the vector recursively frees every child
 /// (post-order) plus the offset array. Backs `#[bstack_owned] Vec<Thing>` fields.
-pub struct BStackBlockVec<'a, T: BStackBlock, A: BStackOwnedSliceAllocator> {
+pub struct BStackBlockVec<'a, T: BStackBlock, A: BStackWalAnchor> {
     offsets: BStackVec<'a, u64, A>,
     _marker: PhantomData<fn() -> T>,
 }
 
-impl<'a, T: BStackBlock, A: BStackOwnedSliceAllocator> BStackBlockVec<'a, T, A> {
+impl<'a, T: BStackBlock, A: BStackWalAnchor> BStackBlockVec<'a, T, A> {
     /// # Safety
     /// `loc` must be a live inline descriptor over an array of data offsets to
     /// live `T` blocks this vector owns.
@@ -461,12 +462,12 @@ impl<'a, T: BStackBlock, A: BStackOwnedSliceAllocator> BStackBlockVec<'a, T, A> 
 /// Each element holds one strong reference; dropping the vector releases every
 /// one (freeing a child when its count hits zero) and frees the offset array.
 /// Backs `#[bstack_strong] Vec<Thing>` fields.
-pub struct BStackStrongVec<'a, T: BStackShared, A: BStackOwnedSliceAllocator> {
+pub struct BStackStrongVec<'a, T: BStackShared, A: BStackWalAnchor> {
     offsets: BStackVec<'a, u64, A>,
     _marker: PhantomData<fn() -> T>,
 }
 
-impl<'a, T: BStackShared, A: BStackOwnedSliceAllocator> BStackStrongVec<'a, T, A> {
+impl<'a, T: BStackShared, A: BStackWalAnchor> BStackStrongVec<'a, T, A> {
     /// # Safety
     /// `loc` must be a live inline descriptor over an array of data offsets to
     /// live `T` blocks, each accounting for one strong reference this vector owns.
@@ -593,12 +594,12 @@ impl<'a, T: BStackShared, A: BStackOwnedSliceAllocator> BStackStrongVec<'a, T, A
 /// Dropping the vector releases every weak count (freeing a control block when
 /// it reaches zero) and frees the offset array. Backs `#[bstack_weak] Vec<Thing>`
 /// fields.
-pub struct BStackWeakVec<'a, T: BStackWeakable, A: BStackOwnedSliceAllocator> {
+pub struct BStackWeakVec<'a, T: BStackWeakable, A: BStackWalAnchor> {
     offsets: BStackVec<'a, u64, A>,
     _marker: PhantomData<fn() -> T>,
 }
 
-impl<'a, T: BStackWeakable, A: BStackOwnedSliceAllocator> BStackWeakVec<'a, T, A> {
+impl<'a, T: BStackWeakable, A: BStackWalAnchor> BStackWeakVec<'a, T, A> {
     /// # Safety
     /// `loc` must be a live inline descriptor over an array of control-block
     /// offsets, each accounting for one weak reference this vector owns.
@@ -712,12 +713,12 @@ impl<'a, T: BStackWeakable, A: BStackOwnedSliceAllocator> BStackWeakVec<'a, T, A
 ///
 /// Elements carry no ownership: dropping the vector frees only the offset array,
 /// never the targets. Backs `#[bstack_ref] Vec<Thing>` fields.
-pub struct BStackRefVec<'a, T: BStackBlock, A: BStackOwnedSliceAllocator> {
+pub struct BStackRefVec<'a, T: BStackBlock, A: BStackWalAnchor> {
     offsets: BStackVec<'a, u64, A>,
     _marker: PhantomData<fn() -> T>,
 }
 
-impl<'a, T: BStackBlock, A: BStackOwnedSliceAllocator> BStackRefVec<'a, T, A> {
+impl<'a, T: BStackBlock, A: BStackWalAnchor> BStackRefVec<'a, T, A> {
     /// # Safety
     /// `loc` must be a live inline descriptor over an array of offsets to `T`
     /// blocks (which this vector does not own).

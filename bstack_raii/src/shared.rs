@@ -9,6 +9,7 @@ use core::mem::size_of;
 use std::io;
 
 use bstack::{BStackOwnedSliceAllocator, BStackRange};
+use crate::wal::BStackWalAnchor;
 
 use crate::block::{BStackBlock, BStackMove, BStackMoveExpr, BStackWeakable};
 use crate::clone::TryClone;
@@ -33,7 +34,7 @@ pub(crate) struct StrongCore<T: BStackBlock> {
 }
 
 impl<T: BStackBlock> BStackDrop for StrongCore<T> {
-    fn bstack_drop<A: BStackOwnedSliceAllocator>(self, allocator: &A) -> io::Result<()> {
+    fn bstack_drop<A: BStackWalAnchor>(self, allocator: &A) -> io::Result<()> {
         match self.ctrl {
             None => StrongRef(self.data).bstack_drop(allocator),
             Some(ctrl) => strong_release_ctrl::<T, A>(allocator, self.data.into_range(), ctrl),
@@ -57,11 +58,11 @@ impl<T: BStackBlock> BStackDrop for StrongCore<T> {
 /// **Invariant:** for a `T: BStackWeakable` block, `ctrl` is always `Some` — such
 /// blocks are only ever constructed through the control-block paths
 /// ([`BStackWeak::upgrade`], `bstack_move!`). `downgrade` relies on this.
-pub struct BStackRc<'a, T: BStackBlock, A: BStackOwnedSliceAllocator> {
+pub struct BStackRc<'a, T: BStackBlock, A: BStackWalAnchor> {
     inner: AutoDrop<'a, StrongCore<T>, A>,
 }
 
-impl<'a, T: BStackBlock, A: BStackOwnedSliceAllocator> BStackRc<'a, T, A> {
+impl<'a, T: BStackBlock, A: BStackWalAnchor> BStackRc<'a, T, A> {
     /// Reconstruct a shared handle from its raw parts.
     ///
     /// # Safety
@@ -120,7 +121,7 @@ impl<'a, T: BStackBlock, A: BStackOwnedSliceAllocator> BStackRc<'a, T, A> {
 /// handle to the **same** block — sharing, not copying (like `Rc::clone`). This
 /// is the clone semantics for a shared block; there is deliberately no
 /// deep-copy-to-owned (`TryCloneIn`) for one.
-impl<'a, T: BStackBlock, A: BStackOwnedSliceAllocator> TryClone for BStackRc<'a, T, A> {
+impl<'a, T: BStackBlock, A: BStackWalAnchor> TryClone for BStackRc<'a, T, A> {
     fn try_clone(&self) -> io::Result<Self> {
         refcount::fetch_add(self.allocator().stack(), self.strong_offset(), 1)?;
         // SAFETY: the fetch_add above established the strong count this clone
@@ -129,7 +130,7 @@ impl<'a, T: BStackBlock, A: BStackOwnedSliceAllocator> TryClone for BStackRc<'a,
     }
 }
 
-impl<'a, T: BStackWeakable, A: BStackOwnedSliceAllocator> BStackRc<'a, T, A> {
+impl<'a, T: BStackWeakable, A: BStackWalAnchor> BStackRc<'a, T, A> {
     /// Create a weak handle to the same block by incrementing `ctrl.weak`.
     ///
     /// Available only for `(rc, weak)` blocks (`T: BStackWeakable`), so a plain
@@ -148,7 +149,7 @@ impl<'a, T: BStackWeakable, A: BStackOwnedSliceAllocator> BStackRc<'a, T, A> {
     }
 }
 
-impl<'a, T: BStackMove, A: BStackOwnedSliceAllocator> BStackRc<'a, T, A> {
+impl<'a, T: BStackMove, A: BStackWalAnchor> BStackRc<'a, T, A> {
     /// `Rc::try_unwrap` + destructure: if this handle is the **sole strong
     /// owner**, move every field out (freeing only the data shell) and return
     /// them; otherwise hand the handle back in `Err`.
@@ -187,7 +188,7 @@ impl<'a, T: BStackMove, A: BStackOwnedSliceAllocator> BStackRc<'a, T, A> {
     }
 }
 
-impl<'a, T: BStackMove, A: BStackOwnedSliceAllocator> BStackMoveExpr for BStackRc<'a, T, A> {
+impl<'a, T: BStackMove, A: BStackWalAnchor> BStackMoveExpr for BStackRc<'a, T, A> {
     type Output = io::Result<Result<T::Fields<'a, A>, Self>>;
     fn bstack_move(self) -> Self::Output {
         self.try_move()
@@ -200,11 +201,11 @@ impl<'a, T: BStackMove, A: BStackOwnedSliceAllocator> BStackMoveExpr for BStackR
 /// control block alive (so [`upgrade`](BStackWeak::upgrade) can check liveness)
 /// but never pins the data block. Its drop core is a [`WeakRef`], whose
 /// [`BStackDrop`] decrements `ctrl.weak` and frees the control block at zero.
-pub struct BStackWeak<'a, T: BStackWeakable, A: BStackOwnedSliceAllocator> {
+pub struct BStackWeak<'a, T: BStackWeakable, A: BStackWalAnchor> {
     inner: AutoDrop<'a, WeakRef<T>, A>,
 }
 
-impl<'a, T: BStackWeakable, A: BStackOwnedSliceAllocator> BStackWeak<'a, T, A> {
+impl<'a, T: BStackWeakable, A: BStackWalAnchor> BStackWeak<'a, T, A> {
     /// Reconstruct a weak handle from its raw control ref.
     ///
     /// # Safety
@@ -261,7 +262,7 @@ impl<'a, T: BStackWeakable, A: BStackOwnedSliceAllocator> BStackWeak<'a, T, A> {
 /// block, and a copy that observed anything else would not be observing what the
 /// original does. So a weak clone shares the observation (a count bump) rather
 /// than deep-copying — there is no `TryCloneIn` for a weak reference.
-impl<'a, T: BStackWeakable, A: BStackOwnedSliceAllocator> TryClone for BStackWeak<'a, T, A> {
+impl<'a, T: BStackWeakable, A: BStackWalAnchor> TryClone for BStackWeak<'a, T, A> {
     fn try_clone(&self) -> io::Result<Self> {
         let weak_off = self.ctrl().into_range().start() + layout::CTRL_WEAK_OFFSET;
         refcount::fetch_add(self.allocator().stack(), weak_off, 1)?;

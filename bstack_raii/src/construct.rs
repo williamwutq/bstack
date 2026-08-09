@@ -12,6 +12,7 @@ use core::mem::size_of;
 use std::io;
 
 use bstack::{BStack, BStackOwnedSliceAllocator, BStackRange};
+use crate::wal::BStackWalAnchor;
 
 use crate::block::BStackWeakable;
 use crate::handle::WeakRef;
@@ -32,7 +33,7 @@ fn read_u64_at(stack: &BStack, off: u64) -> io::Result<u64> {
 /// Returns the block's range. The bytes after the header are left as the
 /// allocator provided them; the caller fills in the payload. On a write failure
 /// the freshly allocated block is released so nothing leaks.
-pub fn alloc_block<A: BStackOwnedSliceAllocator>(
+pub fn alloc_block<A: BStackWalAnchor>(
     allocator: &A,
     tag: EightCC,
     size: u64,
@@ -50,7 +51,7 @@ pub fn alloc_block<A: BStackOwnedSliceAllocator>(
 ///
 /// Call once after [`alloc_block`] and after the payload is written. One is the
 /// count the single returned `BStackRc` accounts for.
-pub fn init_rc<A: BStackOwnedSliceAllocator>(allocator: &A, data: BStackRange) -> io::Result<()> {
+pub fn init_rc<A: BStackWalAnchor>(allocator: &A, data: BStackRange) -> io::Result<()> {
     let off = data.start() + layout::RC_REFCOUNT_OFFSET;
     allocator.stack().set(off, 1u64.to_le_bytes())
 }
@@ -65,7 +66,7 @@ pub fn init_rc<A: BStackOwnedSliceAllocator>(allocator: &A, data: BStackRange) -
 ///
 /// On failure the control block is released; the caller still owns (and must
 /// release) the data block.
-pub fn alloc_control<A: BStackOwnedSliceAllocator>(
+pub fn alloc_control<A: BStackWalAnchor>(
     allocator: &A,
     ctrl_tag: EightCC,
     data: BStackRange,
@@ -120,7 +121,7 @@ pub fn build_control_payload(ctrl_tag: EightCC, data_start: u64, control_size: u
 /// resolving it at teardown is sound even after the target's data has been
 /// freed. `new_weak` is consumed and the weak count it holds becomes the field's;
 /// a previous non-null target has its weak count decremented. 0 means "unset".
-pub fn set_weak_field<'w, T: BStackWeakable, A: BStackOwnedSliceAllocator>(
+pub fn set_weak_field<'w, T: BStackWeakable, A: BStackWalAnchor>(
     allocator: &A,
     field_off: u64,
     new_weak: BStackWeak<'w, T, A>,
@@ -156,7 +157,7 @@ pub fn set_weak_field<'w, T: BStackWeakable, A: BStackOwnedSliceAllocator>(
 /// `field_off`) to a strong handle. Returns `None` if the field is unset (0) or
 /// the target's strong count has already reached zero. What a generated weak
 /// field accessor calls.
-pub fn upgrade_weak_field<'a, T: BStackWeakable, A: BStackOwnedSliceAllocator>(
+pub fn upgrade_weak_field<'a, T: BStackWeakable, A: BStackWalAnchor>(
     allocator: &'a A,
     field_off: u64,
 ) -> io::Result<Option<BStackRc<'a, T, A>>> {

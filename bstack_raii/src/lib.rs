@@ -72,7 +72,7 @@ pub use block::{
 };
 pub use bulk::{alloc_many, free_many};
 pub use cast::{BStackCastAs, BStackCastInto};
-pub use clone::{ClonePlan, TryClone, TryCloneIn, wal_clone_in};
+pub use clone::{ClonePlan, TryClone, TryCloneIn};
 pub use construct::{
     alloc_block, alloc_control, build_control_payload, init_rc, set_weak_field, upgrade_weak_field,
 };
@@ -88,7 +88,7 @@ pub use stdlib::{
     HashSetIter, HashSetOnDisk, HeapOnDisk, ListIter, ListOnDisk, MapOnDisk, NodeOnDisk,
     StringOnDisk, TreeOnDisk, TreeSetOnDisk,
 };
-pub use teardown::{AutoDrop, BStackDrop, dealloc_range, wal_drop};
+pub use teardown::{AutoDrop, BStackDrop, dealloc_range, wal_teardown};
 pub use vec::{BStackBlockVec, BStackRefVec, BStackStrongVec, BStackVec, BStackWeakVec, VecDesc};
 pub use wal::{
     AllocReq, BStackWalAnchor, Reduced, STD_WAL_ANCHOR, WalEntry, WalHeader, WalLog, WalOp,
