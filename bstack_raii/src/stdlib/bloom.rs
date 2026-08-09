@@ -37,8 +37,8 @@ use core::marker::PhantomData;
 use core::mem::size_of;
 use std::io;
 
-use bstack::{BStack, BStackGenOp, BStackOwnedSliceAllocator, BStackRange};
 use crate::wal::BStackWalAnchor;
+use bstack::{BStack, BStackGenOp, BStackOwnedSliceAllocator, BStackRange};
 use bytemuck::{Pod, Zeroable};
 
 use super::hash::double_hash;
@@ -110,11 +110,7 @@ impl<K: Pod> BStackCountingBloomFilter<K> {
 
     /// Allocate a filter with `m` counters and `k` hash functions (both forced to
     /// at least 1). Prefer [`with_capacity`](Self::with_capacity) to size these.
-    pub fn new<A: BStackWalAnchor>(
-        allocator: &A,
-        m: u64,
-        k: u64,
-    ) -> io::Result<BStackOwned<Self>> {
+    pub fn new<A: BStackWalAnchor>(allocator: &A, m: u64, k: u64) -> io::Result<BStackOwned<Self>> {
         let m = m.max(1);
         let k = k.max(1);
         // Allocate and zero the counter block (an orphan until the handle links it).
@@ -223,12 +219,7 @@ impl<K: Pod> BStackCountingBloomFilter<K> {
 
     /// Atomically adjust the counters for `key` (and `n`) up or down, reading and
     /// writing every touched counter in one `inplace_gen` (external-lock-free).
-    fn adjust<A: BStackWalAnchor>(
-        &self,
-        allocator: &A,
-        key: &K,
-        add: bool,
-    ) -> io::Result<()> {
+    fn adjust<A: BStackWalAnchor>(&self, allocator: &A, key: &K, add: bool) -> io::Result<()> {
         let handle = self.range.start();
         let [data, m, k] = read_fields::<3>(allocator.stack(), handle + DATA_OFF)?;
         let agg = Self::aggregate(Self::indices(m, k, bytemuck::bytes_of(key)));
@@ -400,10 +391,7 @@ impl<K: Pod> BStackDrop for BStackCountingBloomFilter<K> {
 }
 
 impl<K: Pod> TryCloneIn for BStackCountingBloomFilter<K> {
-    fn try_clone_in<A: BStackWalAnchor>(
-        &self,
-        allocator: &A,
-    ) -> io::Result<BStackOwned<Self>> {
+    fn try_clone_in<A: BStackWalAnchor>(&self, allocator: &A) -> io::Result<BStackOwned<Self>> {
         let mut plan = ClonePlan::new();
         let dst = match self.__bstack_clone_into(allocator, &mut plan) {
             Ok(range) => range,

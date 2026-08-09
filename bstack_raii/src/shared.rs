@@ -8,8 +8,8 @@
 use core::mem::size_of;
 use std::io;
 
-use bstack::{BStackOwnedSliceAllocator, BStackRange};
 use crate::wal::BStackWalAnchor;
+use bstack::{BStackOwnedSliceAllocator, BStackRange};
 
 use crate::block::{BStackBlock, BStackMove, BStackMoveExpr, BStackWeakable};
 use crate::clone::TryClone;

@@ -2520,7 +2520,13 @@ fn wal_anchor_trait_reclaims_via_finish() {
     // Persist an abandoned (Pending) txn into the allocator's own anchor slot.
     let mut log = WalLog::with_capacity(1);
     log.append(WalEntry::alloc(WalStatus::Pending, orphan));
-    persist_at(&alloc, alloc.wal_anchor().unwrap(), &log, WalStatus::Pending).unwrap();
+    persist_at(
+        &alloc,
+        alloc.wal_anchor().unwrap(),
+        &log,
+        WalStatus::Pending,
+    )
+    .unwrap();
 
     // finish() uses the trait anchor and reclaims the orphan; the allocator is
     // unharmed by our writes to its reserved slot (a fresh alloc reuses it).
@@ -6441,4 +6447,3 @@ fn wal_teardown_reclaims_on_free_fault() {
     );
     list2.bstack_drop(&alloc).unwrap();
 }
-

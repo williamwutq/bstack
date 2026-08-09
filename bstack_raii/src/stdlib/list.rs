@@ -33,8 +33,8 @@ use core::marker::PhantomData;
 use core::mem::size_of;
 use std::io;
 
-use bstack::{BStack, BStackOwnedSliceAllocator, BStackRange};
 use crate::wal::BStackWalAnchor;
+use bstack::{BStack, BStackOwnedSliceAllocator, BStackRange};
 use bytemuck::{Pod, Zeroable};
 
 use super::util::{alloc_image, atomic_update, read_fields, read_u64};
@@ -412,10 +412,7 @@ impl<T: BStackBlock> BStackLinkedList<T> {
     }
 
     /// Attach an allocator to make an auto-freeing [`crate::AutoDrop`] guard.
-    pub fn auto<A: BStackWalAnchor>(
-        self,
-        allocator: &A,
-    ) -> crate::teardown::AutoDrop<'_, Self, A> {
+    pub fn auto<A: BStackWalAnchor>(self, allocator: &A) -> crate::teardown::AutoDrop<'_, Self, A> {
         // SAFETY: sole ownership was asserted when the list was created.
         unsafe { crate::teardown::AutoDrop::from_raw(self, allocator) }
     }
@@ -540,10 +537,7 @@ impl<T: BStackBlock> BStackDrop for BStackLinkedList<T> {
 }
 
 impl<T: BStackBlock> TryCloneIn for BStackLinkedList<T> {
-    fn try_clone_in<A: BStackWalAnchor>(
-        &self,
-        allocator: &A,
-    ) -> io::Result<BStackOwned<Self>> {
+    fn try_clone_in<A: BStackWalAnchor>(&self, allocator: &A) -> io::Result<BStackOwned<Self>> {
         let mut plan = ClonePlan::new();
         let dst = match self.__bstack_clone_into(allocator, &mut plan) {
             Ok(range) => range,

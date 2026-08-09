@@ -11,8 +11,8 @@
 use core::mem::size_of;
 use std::io;
 
-use bstack::{BStack, BStackOwnedSliceAllocator, BStackRange};
 use crate::wal::BStackWalAnchor;
+use bstack::{BStack, BStackOwnedSliceAllocator, BStackRange};
 
 use crate::block::BStackWeakable;
 use crate::handle::WeakRef;

@@ -18,8 +18,8 @@
 
 use std::io;
 
-use bstack::{BStackOwnedSliceAllocator, BStackRange};
 use crate::wal::BStackWalAnchor;
+use bstack::{BStackOwnedSliceAllocator, BStackRange};
 
 use crate::block::BStackBlock;
 use crate::clone::TryCloneIn;
@@ -101,10 +101,7 @@ impl<T: BStackBlock> BStackCow<T> {
     /// * `Owned` — returned as-is; no I/O.
     /// * `Borrowed` — the referenced block is deep-cloned into a fresh
     ///   independent [`BStackOwned<T>`] allocated with `allocator`.
-    pub fn into_owned<A: BStackWalAnchor>(
-        self,
-        allocator: &A,
-    ) -> io::Result<BStackOwned<T>>
+    pub fn into_owned<A: BStackWalAnchor>(self, allocator: &A) -> io::Result<BStackOwned<T>>
     where
         T: TryCloneIn,
     {
@@ -123,10 +120,7 @@ impl<T: BStackBlock> BStackCow<T> {
     /// through the returned handle (the block's setters + `allocator`) never
     /// touch the originally borrowed block. A no-op (beyond the ownership
     /// check) when already owned.
-    pub fn to_mut<A: BStackWalAnchor>(
-        &mut self,
-        allocator: &A,
-    ) -> io::Result<&mut BStackOwned<T>>
+    pub fn to_mut<A: BStackWalAnchor>(&mut self, allocator: &A) -> io::Result<&mut BStackOwned<T>>
     where
         T: TryCloneIn,
     {

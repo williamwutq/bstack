@@ -7,8 +7,8 @@
 
 use std::io;
 
-use bstack::{BStackOwnedSlice, BStackOwnedSliceAllocator, BStackSlice};
 use crate::wal::BStackWalAnchor;
+use bstack::{BStackOwnedSlice, BStackOwnedSliceAllocator, BStackSlice};
 
 use crate::block::{BStackBlock, BStackCast};
 use crate::layout::EightCC;

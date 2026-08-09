@@ -23,8 +23,8 @@ use core::marker::PhantomData;
 use core::mem::size_of;
 use std::io;
 
-use bstack::{BStack, BStackOwnedSliceAllocator, BStackRange};
 use crate::wal::BStackWalAnchor;
+use bstack::{BStack, BStackOwnedSliceAllocator, BStackRange};
 use bytemuck::{Pod, Zeroable};
 
 use super::bloom::{BStackCountingBloomFilter, BloomOnDisk};
@@ -759,11 +759,7 @@ impl<K: Pod + Ord> BStackBTreeSet<K> {
         unsafe { AutoDrop::from_raw(self, allocator) }
     }
 
-    fn drop_subtree<A: BStackWalAnchor>(
-        stack: &BStack,
-        off: u64,
-        allocator: &A,
-    ) -> io::Result<()> {
+    fn drop_subtree<A: BStackWalAnchor>(stack: &BStack, off: u64, allocator: &A) -> io::Result<()> {
         if off == 0 {
             return Ok(());
         }
@@ -887,10 +883,7 @@ impl<K: Pod + Ord> BStackDrop for BStackBTreeSet<K> {
 }
 
 impl<K: Pod + Ord> TryCloneIn for BStackBTreeSet<K> {
-    fn try_clone_in<A: BStackWalAnchor>(
-        &self,
-        allocator: &A,
-    ) -> io::Result<BStackOwned<Self>> {
+    fn try_clone_in<A: BStackWalAnchor>(&self, allocator: &A) -> io::Result<BStackOwned<Self>> {
         let mut plan = ClonePlan::new();
         let dst = match self.__bstack_clone_into(allocator, &mut plan) {
             Ok(range) => range,

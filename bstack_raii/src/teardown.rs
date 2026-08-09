@@ -41,10 +41,7 @@ thread_local! {
 /// (e.g. a collection freeing its values through `BStackOwned::bstack_drop`) see
 /// the sink already set and just collect, so exactly one transaction wraps the
 /// outermost teardown.
-pub fn wal_teardown<A: BStackWalAnchor, T: BStackDrop>(
-    handle: T,
-    allocator: &A,
-) -> io::Result<()> {
+pub fn wal_teardown<A: BStackWalAnchor, T: BStackDrop>(handle: T, allocator: &A) -> io::Result<()> {
     // Nested teardown: an outer driver already owns the sink; frees already
     // collect, so just recurse (exactly one transaction wraps the whole subtree).
     if TEARDOWN_SINK.with(|s| s.borrow().is_some()) {

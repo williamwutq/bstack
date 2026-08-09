@@ -81,9 +81,7 @@ impl<T: BStackDrop> BStackDrop for BStackOwned<T> {
 ///
 /// (A *bare* `BStackOwned<X>` carries no allocator, so it is moved with the
 /// explicit two-argument form `bstack_move!(owned, allocator)` instead.)
-impl<'a, X: BStackMove, A: BStackWalAnchor> BStackMoveExpr
-    for AutoDrop<'a, BStackOwned<X>, A>
-{
+impl<'a, X: BStackMove, A: BStackWalAnchor> BStackMoveExpr for AutoDrop<'a, BStackOwned<X>, A> {
     type Output = io::Result<X::Fields<'a, A>>;
     fn bstack_move(self) -> Self::Output {
         let (owned, allocator) = self.into_raw_parts();

@@ -33,8 +33,8 @@ use core::marker::PhantomData;
 use core::mem::size_of;
 use std::io;
 
-use bstack::{BStack, BStackGenOp, BStackOwnedSliceAllocator, BStackRange};
 use crate::wal::BStackWalAnchor;
+use bstack::{BStack, BStackGenOp, BStackOwnedSliceAllocator, BStackRange};
 use bytemuck::{Pod, Zeroable};
 
 use super::bloom::{BStackCountingBloomFilter, BloomOnDisk};
@@ -597,10 +597,7 @@ impl<K: Pod> BStackDrop for BStackHashSet<K> {
 }
 
 impl<K: Pod> TryCloneIn for BStackHashSet<K> {
-    fn try_clone_in<A: BStackWalAnchor>(
-        &self,
-        allocator: &A,
-    ) -> io::Result<BStackOwned<Self>> {
+    fn try_clone_in<A: BStackWalAnchor>(&self, allocator: &A) -> io::Result<BStackOwned<Self>> {
         let mut plan = ClonePlan::new();
         let dst = match self.__bstack_clone_into(allocator, &mut plan) {
             Ok(range) => range,

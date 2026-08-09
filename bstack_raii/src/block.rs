@@ -6,8 +6,8 @@
 
 use std::io;
 
-use bstack::{BStackOwnedSliceAllocator, BStackRange};
 use crate::wal::BStackWalAnchor;
+use bstack::{BStackOwnedSliceAllocator, BStackRange};
 use bytemuck::Pod;
 
 use crate::clone::ClonePlan;
@@ -158,10 +158,7 @@ pub trait BStackShared: BStackBlock {
     /// Drop one strong reference to a block of this type located at `data`,
     /// freeing it (and, for `(rc, weak)`, releasing the control block) when the
     /// strong count reaches zero.
-    fn drop_strong_ref<A: BStackWalAnchor>(
-        data: BStackRef<Self>,
-        allocator: &A,
-    ) -> io::Result<()>;
+    fn drop_strong_ref<A: BStackWalAnchor>(data: BStackRef<Self>, allocator: &A) -> io::Result<()>;
 
     /// Resolve the raw parts of a strong handle to a child of this type at
     /// `data`: the data ref, plus the control-block range for `(rc, weak)`

@@ -16,8 +16,8 @@
 use core::mem::size_of;
 use std::io;
 
-use bstack::{BStack, BStackOwnedSliceAllocator, BStackRange};
 use crate::wal::BStackWalAnchor;
+use bstack::{BStack, BStackOwnedSliceAllocator, BStackRange};
 use bytemuck::{Pod, Zeroable};
 
 use super::util::{alloc_image, read_fields, read_u64};
@@ -71,10 +71,7 @@ impl BStackString {
     }
 
     /// Create a string from `s`.
-    pub fn new<A: BStackWalAnchor>(
-        allocator: &A,
-        s: &str,
-    ) -> io::Result<BStackOwned<Self>> {
+    pub fn new<A: BStackWalAnchor>(allocator: &A, s: &str) -> io::Result<BStackOwned<Self>> {
         let len = s.len() as u64;
         let data = Self::alloc_bytes(allocator, s.as_bytes())?;
         let od = StringOnDisk {
@@ -174,11 +171,7 @@ impl BStackString {
 
     /// Truncate to `new_len` **bytes**, which must be a UTF-8 char boundary and
     /// not exceed the current length; longer values leave the string unchanged.
-    pub fn truncate<A: BStackWalAnchor>(
-        &self,
-        allocator: &A,
-        new_len: usize,
-    ) -> io::Result<()> {
+    pub fn truncate<A: BStackWalAnchor>(&self, allocator: &A, new_len: usize) -> io::Result<()> {
         let mut cur = self.to_string(allocator.stack())?;
         if new_len >= cur.len() {
             return Ok(());
@@ -304,10 +297,7 @@ impl BStackDrop for BStackString {
 }
 
 impl TryCloneIn for BStackString {
-    fn try_clone_in<A: BStackWalAnchor>(
-        &self,
-        allocator: &A,
-    ) -> io::Result<BStackOwned<Self>> {
+    fn try_clone_in<A: BStackWalAnchor>(&self, allocator: &A) -> io::Result<BStackOwned<Self>> {
         let mut plan = ClonePlan::new();
         let dst = match self.__bstack_clone_into(allocator, &mut plan) {
             Ok(range) => range,

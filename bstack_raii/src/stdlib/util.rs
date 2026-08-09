@@ -7,8 +7,8 @@
 
 use std::io;
 
-use bstack::{BStack, BStackGenOp, BStackOwnedSliceAllocator, BStackRange};
 use crate::wal::BStackWalAnchor;
+use bstack::{BStack, BStackGenOp, BStackOwnedSliceAllocator, BStackRange};
 
 use crate::layout::{HEADER_SIZE, get_u64};
 

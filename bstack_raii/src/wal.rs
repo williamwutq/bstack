@@ -444,7 +444,10 @@ pub(crate) fn wal_lock_for<A: BStackOwnedSliceAllocator>(allocator: &A) -> Arc<M
 
 /// Read the anchor slot: the persistent WAL block's offset, or `None` if one has
 /// not been created yet.
-fn read_anchor<A: BStackOwnedSliceAllocator>(allocator: &A, anchor: u64) -> io::Result<Option<u64>> {
+fn read_anchor<A: BStackOwnedSliceAllocator>(
+    allocator: &A,
+    anchor: u64,
+) -> io::Result<Option<u64>> {
     let mut buf = [0u8; 8];
     allocator.stack().get_into(anchor, &mut buf)?;
     let off = u64::from_le_bytes(buf);
@@ -551,7 +554,9 @@ pub(crate) fn wal_set_idle<A: BStackOwnedSliceAllocator>(
     block_off: u64,
 ) -> io::Result<()> {
     // `txn_status` is the byte right after the u64 magic (offset 8).
-    allocator.stack().set(block_off + 8, [WalStatus::None as u8])
+    allocator
+        .stack()
+        .set(block_off + 8, [WalStatus::None as u8])
 }
 
 /// **Complete** a staged transaction by reclaiming exactly the slices its outcome

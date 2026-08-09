@@ -30,8 +30,8 @@ use core::marker::PhantomData;
 use core::mem::size_of;
 use std::io;
 
-use bstack::{BStack, BStackByteVec, BStackOwnedSlice, BStackOwnedSliceAllocator, BStackRange};
 use crate::wal::BStackWalAnchor;
+use bstack::{BStack, BStackByteVec, BStackOwnedSlice, BStackOwnedSliceAllocator, BStackRange};
 use bytemuck::{Pod, Zeroable};
 
 use crate::block::{BStackBlock, BStackShared, BStackWeakable};

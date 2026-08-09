@@ -87,10 +87,7 @@ pub trait TryClone: Sized {
 /// why (in particular, why a weak reference can only ever be cloned as another
 /// weak reference).
 pub trait TryCloneIn: BStackDrop + Sized {
-    fn try_clone_in<A: BStackWalAnchor>(
-        &self,
-        allocator: &A,
-    ) -> io::Result<BStackOwned<Self>>;
+    fn try_clone_in<A: BStackWalAnchor>(&self, allocator: &A) -> io::Result<BStackOwned<Self>>;
 }
 
 /// Accumulates a deep clone's allocations, payload writes, and refcount bumps so
@@ -419,4 +416,3 @@ impl ClonePlan {
         }
     }
 }
-
