@@ -383,32 +383,13 @@ unsafe impl BStackWalAnchor for bstack::CheckedSlabBStackAllocator {
     }
 }
 
-// -- Autoref-specialization anchor probe -----------------------------------
-//
-// A compound op is generic over `A: BStackOwnedSliceAllocator`, but the WAL needs
-// `A: BStackWalAnchor`. These two traits, resolved by autoref (the "dtolnay
-// specialization" trick), let such an op ask `allocator.wal_anchor_opt()` and get
-// `Some(anchor)` when `A` is anchored, `None` otherwise — opting into the WAL with
-// no bound change and no break for plain allocators. Both must be in scope at the
-// call site; the value-receiver impl wins (fewer autorefs) when it applies.
-
-pub(crate) trait WalAnchorProbe {
-    fn wal_anchor_opt(&self) -> Option<u64>;
-}
-impl<A: BStackWalAnchor> WalAnchorProbe for A {
-    fn wal_anchor_opt(&self) -> Option<u64> {
-        Some(self.wal_anchor())
-    }
-}
-
-pub(crate) trait WalAnchorProbeFallback {
-    fn wal_anchor_opt(&self) -> Option<u64>;
-}
-impl<A: BStackOwnedSliceAllocator> WalAnchorProbeFallback for &A {
-    fn wal_anchor_opt(&self) -> Option<u64> {
-        None
-    }
-}
+// Note: WAL reclamation is **opt-in**, not automatic. A generic op bounded on
+// `BStackOwnedSliceAllocator` cannot detect at that call whether the concrete `A`
+// also implements `BStackWalAnchor` — autoref "specialization" only resolves at a
+// concrete call site, and stable Rust has no real specialization. So the WAL is
+// exposed through explicit entry points ([`crate::wal_clone_in`], [`crate::wal_drop`])
+// that take a concrete `A: BStackWalAnchor` and call [`wal_anchor`](BStackWalAnchor::wal_anchor)
+// directly; the plain generic `try_clone_in` / `bstack_drop` are unchanged.
 
 /// Write `log` as a WAL block with transaction status `txn_status`, allocate the
 /// block, and point the anchor slot at it. Returns the block's range.

@@ -5,11 +5,91 @@
 //! types in [`crate::handle`]. It takes `self` (a *without-allocator* handle)
 //! plus an explicit allocator, so it is generic over all handle-like types.
 
+use core::cell::RefCell;
 use core::mem::ManuallyDrop;
 use core::ops::Deref;
 use std::io;
 
-use bstack::{BStackOwnedSlice, BStackOwnedSliceAllocator, BStackRange};
+use bstack::{BStackGenOp, BStackOwnedSlice, BStackOwnedSliceAllocator, BStackRange};
+
+use crate::wal::{BStackWalAnchor, WalEntry, WalLog, WalStatus, finish_at, persist_at};
+
+thread_local! {
+    /// While a WAL-backed teardown is in progress, the collector that
+    /// [`dealloc_range`] funnels every subtree slice into *instead of* freeing it
+    /// eagerly. The root driver ([`wal_teardown`]) installs it; the generated
+    /// recursion and nested handle `bstack_drop`s see it transparently (they all
+    /// go through `dealloc_range`), so no allocator/sink parameter has to be
+    /// threaded through the whole teardown.
+    static TEARDOWN_SINK: RefCell<Option<Vec<BStackRange>>> = const { RefCell::new(None) };
+}
+
+/// Tear down `handle` (a whole owned subtree) as one crash-atomic batch of frees,
+/// so a crash mid-teardown is completed — not leaked — by `finish` on the next
+/// open. The WAL-backed, opt-in counterpart to [`BStackDrop::bstack_drop`];
+/// requires an anchored allocator ([`BStackWalAnchor`]).
+///
+/// While the sink is installed, every [`dealloc_range`] in the (ordinary,
+/// generic) teardown recursion *collects* its slice rather than freeing it;
+/// afterwards the whole set commits as one `Dealloc` transaction and is executed
+/// via [`finish_at`] (the same path crash recovery takes). Nested owned frees
+/// (e.g. a collection freeing its values through `BStackOwned::bstack_drop`) see
+/// the sink already set and just collect, so exactly one transaction wraps the
+/// outermost teardown.
+pub fn wal_drop<A: BStackWalAnchor, T: BStackDrop>(handle: T, allocator: &A) -> io::Result<()> {
+    // Nested (shouldn't happen at a public entry, but be safe): the outer driver
+    // owns the sink; frees already collect.
+    if TEARDOWN_SINK.with(|s| s.borrow().is_some()) {
+        return handle.bstack_drop(allocator);
+    }
+    let anchor = allocator.wal_anchor();
+    TEARDOWN_SINK.with(|s| *s.borrow_mut() = Some(Vec::new()));
+    let result = handle.bstack_drop(allocator);
+    let slices = TEARDOWN_SINK
+        .with(|s| s.borrow_mut().take())
+        .unwrap_or_default();
+    wal_free_all(allocator, anchor, slices)?;
+    result
+}
+
+/// Commit `slices` as one committed `Dealloc` transaction and execute the frees.
+/// A crash mid-free leaves a `Complete` WAL that `finish` rolls forward on reopen.
+fn wal_free_all<A: BStackOwnedSliceAllocator>(
+    allocator: &A,
+    anchor: u64,
+    slices: Vec<BStackRange>,
+) -> io::Result<()> {
+    if slices.is_empty() {
+        return Ok(());
+    }
+    let mut log = WalLog::with_capacity(slices.len());
+    for s in &slices {
+        log.append(WalEntry::dealloc(WalStatus::Pending, *s));
+    }
+    // Stage the transaction `Pending`, then commit it by flipping `txn_status` to
+    // `Complete` in one atomic `inplace_gen` — the single commit point (a crash
+    // before it abandons; after it, `finish` rolls the frees forward). With the
+    // sink now cleared, `finish_at` executes the frees + reclaims the WAL block.
+    let wal_range = persist_at(allocator, anchor, &log, WalStatus::Pending)?;
+    let flip = [WalStatus::Complete as u8];
+    let mut done = false;
+    allocator.stack().inplace_gen(|_feedback| {
+        if done {
+            None
+        } else {
+            done = true;
+            // SAFETY: `flip` outlives the call; the `txn_status` byte follows the
+            // u64 magic at offset 8 in `WalHeader`.
+            let data: &[u8] = unsafe { core::mem::transmute::<&[u8], _>(&flip[..]) };
+            Some(BStackGenOp::Write {
+                offset: wal_range.start() + 8,
+                data,
+            })
+        }
+    })?;
+    finish_at(allocator, anchor)?;
+    Ok(())
+}
 
 /// Recursively free a block and all of its owned children.
 ///
@@ -37,6 +117,18 @@ pub unsafe fn dealloc_range<A: BStackOwnedSliceAllocator>(
     allocator: &A,
     range: BStackRange,
 ) -> io::Result<()> {
+    // Inside a WAL-backed teardown, defer the free: collect the slice so the whole
+    // subtree commits (and frees) as one crash-atomic transaction.
+    let deferred = TEARDOWN_SINK.with(|s| match s.borrow_mut().as_mut() {
+        Some(sink) => {
+            sink.push(range);
+            true
+        }
+        None => false,
+    });
+    if deferred {
+        return Ok(());
+    }
     let owned: BStackOwnedSlice<'_, A> =
         unsafe { BStackOwnedSlice::from_raw_range(allocator, range) };
     allocator.dealloc(owned).map_err(|e| e.source)

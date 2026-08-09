@@ -69,7 +69,8 @@ impl<T: BStackDrop> Deref for BStackOwned<T> {
 impl<T: BStackDrop> BStackDrop for BStackOwned<T> {
     fn bstack_drop<A: BStackOwnedSliceAllocator>(self, allocator: &A) -> io::Result<()> {
         // Recursively free the owned block (and its children) via the inner
-        // handle's teardown.
+        // handle's teardown. For crash-atomic, leak-reclaiming teardown on an
+        // anchored allocator, use [`crate::wal_drop`] instead.
         self.0.bstack_drop(allocator)
     }
 }

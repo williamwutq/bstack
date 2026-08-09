@@ -6329,7 +6329,7 @@ fn wal_clone_reclaims_orphans_on_commit_fault() {
     let mut prev: Option<u64> = None;
     for i in 0..30 {
         stack.set_fault_policy(Some(Arc::new(FailFirstInplaceGen(AtomicBool::new(false)))));
-        let r = src.try_clone_in(&alloc);
+        let r = crate::wal_clone_in(src.handle(), &alloc);
         stack.set_fault_policy(None);
         assert!(r.is_err(), "injected fault must fail the clone commit");
         let len = stack.len().unwrap();
@@ -6344,4 +6344,76 @@ fn wal_clone_reclaims_orphans_on_commit_fault() {
     assert_eq!(cl.handle().child(stack).unwrap().val(stack).unwrap(), 7);
     cl.bstack_drop(&alloc).unwrap();
     src.bstack_drop(&alloc).unwrap();
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn wal_teardown_reclaims_on_free_fault() {
+    use bstack::fault::FaultPolicy;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    // The teardown WAL commits by flipping `txn_status` in one `inplace_gen`; the
+    // very next `set` is `finish_at`'s first entry-status write — just past the
+    // commit point, before any block is actually freed. Failing *that* set models
+    // a crash mid-teardown with the transaction already committed (so `finish`
+    // must roll every dealloc forward, with no half-freed block).
+    struct FailSetAfterCommit {
+        committed: AtomicBool,
+        fired: AtomicBool,
+    }
+    impl FaultPolicy for FailSetAfterCommit {
+        fn next_fault(&self, op: &'static str, _seq: u64) -> Option<io::Error> {
+            if op == "inplace_gen" {
+                self.committed.store(true, Ordering::SeqCst);
+                return None;
+            }
+            if op == "set"
+                && self.committed.load(Ordering::SeqCst)
+                && !self.fired.swap(true, Ordering::SeqCst)
+            {
+                return Some(io::Error::other("injected teardown free fault"));
+            }
+            None
+        }
+    }
+
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let build = |a: &_| {
+        let list = BStackLinkedList::<MacroLeaf>::new(a).unwrap();
+        for v in 0..5u32 {
+            list.push_back(a, MacroLeaf::new(a, v).unwrap()).unwrap();
+        }
+        list
+    };
+
+    let list1 = build(&alloc);
+    let peak = stack.len().unwrap();
+
+    // Crash the teardown just after its WAL commits; nothing gets freed inline.
+    stack.set_fault_policy(Some(Arc::new(FailSetAfterCommit {
+        committed: AtomicBool::new(false),
+        fired: AtomicBool::new(false),
+    })));
+    let r = crate::wal_drop(list1, &alloc);
+    stack.set_fault_policy(None);
+    assert!(r.is_err(), "the injected fault must interrupt the teardown");
+
+    // `finish` rolls the committed teardown forward, reclaiming the whole subtree.
+    assert!(
+        crate::wal::finish(&alloc).unwrap() > 0,
+        "finish should reclaim the committed teardown's slices"
+    );
+
+    // Reclaimed: rebuilding an identical tree reuses the freed space (no leak).
+    let list2 = build(&alloc);
+    let after = stack.len().unwrap();
+    assert!(
+        after <= peak,
+        "teardown crash leaked: file grew {peak} -> {after}"
+    );
+    list2.bstack_drop(&alloc).unwrap();
 }
