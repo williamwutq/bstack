@@ -34,6 +34,7 @@ use core::mem::size_of;
 use std::io;
 
 use bstack::{BStack, BStackOwnedSliceAllocator, BStackRange};
+use crate::wal::BStackWalAnchor;
 use bytemuck::{Pod, Zeroable};
 
 use super::util::{alloc_image, atomic_update, read_fields, read_u64};
@@ -136,7 +137,7 @@ impl<T: BStackBlock> BStackLinkedList<T> {
     }
 
     /// Allocate an empty list.
-    pub fn new<A: BStackOwnedSliceAllocator>(allocator: &A) -> io::Result<BStackOwned<Self>> {
+    pub fn new<A: BStackWalAnchor>(allocator: &A) -> io::Result<BStackOwned<Self>> {
         let od = ListOnDisk {
             header: BlockHeader {
                 size: LIST_SIZE,
@@ -167,7 +168,7 @@ impl<T: BStackBlock> BStackLinkedList<T> {
     /// then the tail read, node-image write, tail/`prev.next` relink and length
     /// bump all commit as one crash-atomic [`atomic_update`]. A crash before the
     /// commit leaks the orphan node; it never tears the list.
-    pub fn push_back<A: BStackOwnedSliceAllocator>(
+    pub fn push_back<A: BStackWalAnchor>(
         &self,
         allocator: &A,
         value: BStackOwned<T>,
@@ -211,7 +212,7 @@ impl<T: BStackBlock> BStackLinkedList<T> {
 
     /// Prepend a value to the front, taking ownership of its block. Atomic and
     /// external-lock-free (see [`push_back`](Self::push_back)).
-    pub fn push_front<A: BStackOwnedSliceAllocator>(
+    pub fn push_front<A: BStackWalAnchor>(
         &self,
         allocator: &A,
         value: BStackOwned<T>,
@@ -258,7 +259,7 @@ impl<T: BStackBlock> BStackLinkedList<T> {
     /// decrement commit as one [`atomic_update`]. Only *after* the node is
     /// unlinked is its shell freed — a crash between leaks the shell, never a
     /// dangling link.
-    pub fn pop_back<A: BStackOwnedSliceAllocator>(
+    pub fn pop_back<A: BStackWalAnchor>(
         &self,
         allocator: &A,
     ) -> io::Result<Option<BStackOwned<T>>> {
@@ -313,7 +314,7 @@ impl<T: BStackBlock> BStackLinkedList<T> {
     /// Remove and return the first element (as an owned value block), or `None`
     /// if the list is empty. Atomic and external-lock-free (see
     /// [`pop_back`](Self::pop_back)).
-    pub fn pop_front<A: BStackOwnedSliceAllocator>(
+    pub fn pop_front<A: BStackWalAnchor>(
         &self,
         allocator: &A,
     ) -> io::Result<Option<BStackOwned<T>>> {
@@ -411,7 +412,7 @@ impl<T: BStackBlock> BStackLinkedList<T> {
     }
 
     /// Attach an allocator to make an auto-freeing [`crate::AutoDrop`] guard.
-    pub fn auto<A: BStackOwnedSliceAllocator>(
+    pub fn auto<A: BStackWalAnchor>(
         self,
         allocator: &A,
     ) -> crate::teardown::AutoDrop<'_, Self, A> {
@@ -447,7 +448,7 @@ impl<T: BStackBlock> BStackBlock for BStackLinkedList<T> {
     /// Recursively free every value block and node, **without** freeing the list
     /// block itself (its embedding parent, or [`bstack_drop`](BStackDrop), does
     /// that).
-    fn __bstack_drop_children<A: BStackOwnedSliceAllocator>(
+    fn __bstack_drop_children<A: BStackWalAnchor>(
         range: BStackRange,
         allocator: &A,
     ) -> io::Result<()> {
@@ -471,7 +472,7 @@ impl<T: BStackBlock> BStackBlock for BStackLinkedList<T> {
     /// Deep-clone the whole chain into `plan`: every value is deep-cloned (via
     /// `T`'s own clone hook), fresh nodes are allocated and wired, and the list
     /// block is staged — all as part of the parent plan's single atomic commit.
-    fn __bstack_clone_into<A: BStackOwnedSliceAllocator>(
+    fn __bstack_clone_into<A: BStackWalAnchor>(
         &self,
         allocator: &A,
         plan: &mut ClonePlan,
@@ -531,7 +532,7 @@ impl<T: BStackBlock> BStackBlock for BStackLinkedList<T> {
 }
 
 impl<T: BStackBlock> BStackDrop for BStackLinkedList<T> {
-    fn bstack_drop<A: BStackOwnedSliceAllocator>(self, allocator: &A) -> io::Result<()> {
+    fn bstack_drop<A: BStackWalAnchor>(self, allocator: &A) -> io::Result<()> {
         Self::__bstack_drop_children(self.range, allocator)?;
         // SAFETY: sole ownership of the list block was asserted at construction.
         unsafe { dealloc_range(allocator, self.range) }
@@ -539,7 +540,7 @@ impl<T: BStackBlock> BStackDrop for BStackLinkedList<T> {
 }
 
 impl<T: BStackBlock> TryCloneIn for BStackLinkedList<T> {
-    fn try_clone_in<A: BStackOwnedSliceAllocator>(
+    fn try_clone_in<A: BStackWalAnchor>(
         &self,
         allocator: &A,
     ) -> io::Result<BStackOwned<Self>> {

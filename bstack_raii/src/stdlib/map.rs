@@ -38,6 +38,7 @@ use core::mem::size_of;
 use std::io;
 
 use bstack::{BStack, BStackGenOp, BStackOwnedSliceAllocator, BStackRange};
+use crate::wal::BStackWalAnchor;
 use bytemuck::{Pod, Zeroable};
 
 use super::hash::fnv1a;
@@ -153,7 +154,7 @@ impl<K: Pod, V: BStackBlock> BStackHashMap<K, V> {
     }
 
     /// Allocate an empty map (no bucket block until the first insert).
-    pub fn new<A: BStackOwnedSliceAllocator>(allocator: &A) -> io::Result<BStackOwned<Self>> {
+    pub fn new<A: BStackWalAnchor>(allocator: &A) -> io::Result<BStackOwned<Self>> {
         let od = MapOnDisk {
             header: BlockHeader {
                 size: MAP_SIZE,
@@ -185,7 +186,7 @@ impl<K: Pod, V: BStackBlock> BStackHashMap<K, V> {
     /// Atomic and external-lock-free: grows the table first if the load factor
     /// would be exceeded, then probes and commits the bucket + metadata writes in
     /// one [`probe_commit`].
-    pub fn insert<A: BStackOwnedSliceAllocator>(
+    pub fn insert<A: BStackWalAnchor>(
         &self,
         allocator: &A,
         key: K,
@@ -271,7 +272,7 @@ impl<K: Pod, V: BStackBlock> BStackHashMap<K, V> {
 
     /// Remove `key`, returning its value (owned) if present, else `None`. The
     /// bucket becomes a tombstone; the value block's ownership transfers out.
-    pub fn remove<A: BStackOwnedSliceAllocator>(
+    pub fn remove<A: BStackWalAnchor>(
         &self,
         allocator: &A,
         key: &K,
@@ -367,7 +368,7 @@ impl<K: Pod, V: BStackBlock> BStackHashMap<K, V> {
     /// concurrently across this call.
     pub fn get_or_insert_with<A, F>(&self, allocator: &A, key: K, f: F) -> io::Result<(V, bool)>
     where
-        A: BStackOwnedSliceAllocator,
+        A: BStackWalAnchor,
         F: FnOnce() -> io::Result<BStackOwned<V>>,
     {
         if let Some(v) = self.get(allocator.stack(), &key)? {
@@ -387,7 +388,7 @@ impl<K: Pod, V: BStackBlock> BStackHashMap<K, V> {
     /// `default`. If `key` is present, `default` is **freed** (its block is
     /// dropped) — prefer the `_with` form to avoid allocating a value you may not
     /// use.
-    pub fn get_or_insert<A: BStackOwnedSliceAllocator>(
+    pub fn get_or_insert<A: BStackWalAnchor>(
         &self,
         allocator: &A,
         key: K,
@@ -424,7 +425,7 @@ impl<K: Pod, V: BStackBlock> BStackHashMap<K, V> {
     /// Grow the table to at least double its capacity, rehashing every live entry
     /// (and dropping tombstones) atomically. A no-op (beyond a freed spare block)
     /// if another thread already grew it.
-    fn grow<A: BStackOwnedSliceAllocator>(&self, allocator: &A) -> io::Result<()> {
+    fn grow<A: BStackWalAnchor>(&self, allocator: &A) -> io::Result<()> {
         let handle = self.range.start();
         let stride = Self::stride();
         let ksz = Self::ksize();
@@ -559,7 +560,7 @@ impl<K: Pod, V: BStackBlock> BStackHashMap<K, V> {
     }
 
     /// Attach an allocator to make an auto-freeing [`AutoDrop`] guard.
-    pub fn auto<A: BStackOwnedSliceAllocator>(self, allocator: &A) -> AutoDrop<'_, Self, A> {
+    pub fn auto<A: BStackWalAnchor>(self, allocator: &A) -> AutoDrop<'_, Self, A> {
         // SAFETY: sole ownership was asserted when the map was created.
         unsafe { AutoDrop::from_raw(self, allocator) }
     }
@@ -592,7 +593,7 @@ impl<K: Pod, V: BStackBlock> BStackBlock for BStackHashMap<K, V> {
 
     /// Recursively free every value block and the bucket block, **without**
     /// freeing the handle block itself.
-    fn __bstack_drop_children<A: BStackOwnedSliceAllocator>(
+    fn __bstack_drop_children<A: BStackWalAnchor>(
         range: BStackRange,
         allocator: &A,
     ) -> io::Result<()> {
@@ -626,7 +627,7 @@ impl<K: Pod, V: BStackBlock> BStackBlock for BStackHashMap<K, V> {
     /// every key's position), deep-clone each occupied value (via `V`'s clone
     /// hook) and swap in the clone's ref; stage the handle — all in the parent
     /// plan's single atomic commit.
-    fn __bstack_clone_into<A: BStackOwnedSliceAllocator>(
+    fn __bstack_clone_into<A: BStackWalAnchor>(
         &self,
         allocator: &A,
         plan: &mut ClonePlan,
@@ -675,7 +676,7 @@ impl<K: Pod, V: BStackBlock> BStackBlock for BStackHashMap<K, V> {
 }
 
 impl<K: Pod, V: BStackBlock> BStackDrop for BStackHashMap<K, V> {
-    fn bstack_drop<A: BStackOwnedSliceAllocator>(self, allocator: &A) -> io::Result<()> {
+    fn bstack_drop<A: BStackWalAnchor>(self, allocator: &A) -> io::Result<()> {
         Self::__bstack_drop_children(self.range, allocator)?;
         // SAFETY: sole ownership of the handle block was asserted at construction.
         unsafe { dealloc_range(allocator, self.range) }
@@ -683,7 +684,7 @@ impl<K: Pod, V: BStackBlock> BStackDrop for BStackHashMap<K, V> {
 }
 
 impl<K: Pod, V: BStackBlock> TryCloneIn for BStackHashMap<K, V> {
-    fn try_clone_in<A: BStackOwnedSliceAllocator>(
+    fn try_clone_in<A: BStackWalAnchor>(
         &self,
         allocator: &A,
     ) -> io::Result<BStackOwned<Self>> {

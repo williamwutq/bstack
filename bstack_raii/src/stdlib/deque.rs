@@ -37,6 +37,7 @@ use core::mem::size_of;
 use std::io;
 
 use bstack::{BStack, BStackOwnedSliceAllocator, BStackRange};
+use crate::wal::BStackWalAnchor;
 use bytemuck::{Pod, Zeroable};
 
 use super::util::{alloc_image, atomic_update, read_fields, read_u64};
@@ -108,13 +109,13 @@ impl<T: BStackBlock> BStackDeque<T> {
     }
 
     /// Allocate an empty deque (no ring is allocated until the first push).
-    pub fn new<A: BStackOwnedSliceAllocator>(allocator: &A) -> io::Result<BStackOwned<Self>> {
+    pub fn new<A: BStackWalAnchor>(allocator: &A) -> io::Result<BStackOwned<Self>> {
         Self::with_image(allocator, 0, 0)
     }
 
     /// Allocate an empty deque with room for `cap` elements pre-reserved (so the
     /// first `cap` pushes never grow). `cap == 0` behaves like [`new`](Self::new).
-    pub fn with_capacity<A: BStackOwnedSliceAllocator>(
+    pub fn with_capacity<A: BStackWalAnchor>(
         allocator: &A,
         cap: u64,
     ) -> io::Result<BStackOwned<Self>> {
@@ -134,7 +135,7 @@ impl<T: BStackBlock> BStackDeque<T> {
         }
     }
 
-    fn with_image<A: BStackOwnedSliceAllocator>(
+    fn with_image<A: BStackWalAnchor>(
         allocator: &A,
         data: u64,
         cap: u64,
@@ -171,7 +172,7 @@ impl<T: BStackBlock> BStackDeque<T> {
 
     /// Append a value to the back, taking ownership of its block. Grows the ring
     /// (once) if it is full, then commits the slot write + length bump atomically.
-    pub fn push_back<A: BStackOwnedSliceAllocator>(
+    pub fn push_back<A: BStackWalAnchor>(
         &self,
         allocator: &A,
         value: BStackOwned<T>,
@@ -211,7 +212,7 @@ impl<T: BStackBlock> BStackDeque<T> {
     }
 
     /// Prepend a value to the front, taking ownership of its block.
-    pub fn push_front<A: BStackOwnedSliceAllocator>(
+    pub fn push_front<A: BStackWalAnchor>(
         &self,
         allocator: &A,
         value: BStackOwned<T>,
@@ -256,7 +257,7 @@ impl<T: BStackBlock> BStackDeque<T> {
     /// empty. Atomic: the slot is read and the length decremented in one commit;
     /// the value block's ownership transfers to the caller (its ring slot is left
     /// stale and reused by a later push).
-    pub fn pop_back<A: BStackOwnedSliceAllocator>(
+    pub fn pop_back<A: BStackWalAnchor>(
         &self,
         allocator: &A,
     ) -> io::Result<Option<BStackOwned<T>>> {
@@ -300,7 +301,7 @@ impl<T: BStackBlock> BStackDeque<T> {
 
     /// Remove and return the first element (as an owned value block), or `None`
     /// if empty.
-    pub fn pop_front<A: BStackOwnedSliceAllocator>(
+    pub fn pop_front<A: BStackWalAnchor>(
         &self,
         allocator: &A,
     ) -> io::Result<Option<BStackOwned<T>>> {
@@ -348,7 +349,7 @@ impl<T: BStackBlock> BStackDeque<T> {
     /// Grow the ring to at least double its capacity, atomically snapshotting and
     /// re-basing the live elements. A no-op (beyond a wasted allocation, freed
     /// again) if another thread already made room.
-    fn grow<A: BStackOwnedSliceAllocator>(&self, allocator: &A) -> io::Result<()> {
+    fn grow<A: BStackWalAnchor>(&self, allocator: &A) -> io::Result<()> {
         let handle = self.range.start();
         let cap0 = read_u64(allocator.stack(), handle + CAP_OFF)?;
         let newcap = if cap0 == 0 { MIN_CAP } else { cap0 * 2 };
@@ -475,7 +476,7 @@ impl<T: BStackBlock> BStackDeque<T> {
     }
 
     /// Attach an allocator to make an auto-freeing [`AutoDrop`] guard.
-    pub fn auto<A: BStackOwnedSliceAllocator>(self, allocator: &A) -> AutoDrop<'_, Self, A> {
+    pub fn auto<A: BStackWalAnchor>(self, allocator: &A) -> AutoDrop<'_, Self, A> {
         // SAFETY: sole ownership was asserted when the deque was created.
         unsafe { AutoDrop::from_raw(self, allocator) }
     }
@@ -507,7 +508,7 @@ impl<T: BStackBlock> BStackBlock for BStackDeque<T> {
 
     /// Recursively free every element block and the ring, **without** freeing the
     /// handle block itself.
-    fn __bstack_drop_children<A: BStackOwnedSliceAllocator>(
+    fn __bstack_drop_children<A: BStackWalAnchor>(
         range: BStackRange,
         allocator: &A,
     ) -> io::Result<()> {
@@ -531,7 +532,7 @@ impl<T: BStackBlock> BStackBlock for BStackDeque<T> {
     /// own clone hook) and packed into a fresh, compacted ring (`head = 0`,
     /// `cap = len`); the handle block is staged — all in the parent plan's single
     /// atomic commit.
-    fn __bstack_clone_into<A: BStackOwnedSliceAllocator>(
+    fn __bstack_clone_into<A: BStackWalAnchor>(
         &self,
         allocator: &A,
         plan: &mut ClonePlan,
@@ -582,7 +583,7 @@ impl<T: BStackBlock> BStackBlock for BStackDeque<T> {
 }
 
 impl<T: BStackBlock> BStackDrop for BStackDeque<T> {
-    fn bstack_drop<A: BStackOwnedSliceAllocator>(self, allocator: &A) -> io::Result<()> {
+    fn bstack_drop<A: BStackWalAnchor>(self, allocator: &A) -> io::Result<()> {
         Self::__bstack_drop_children(self.range, allocator)?;
         // SAFETY: sole ownership of the handle block was asserted at construction.
         unsafe { dealloc_range(allocator, self.range) }
@@ -590,7 +591,7 @@ impl<T: BStackBlock> BStackDrop for BStackDeque<T> {
 }
 
 impl<T: BStackBlock> TryCloneIn for BStackDeque<T> {
-    fn try_clone_in<A: BStackOwnedSliceAllocator>(
+    fn try_clone_in<A: BStackWalAnchor>(
         &self,
         allocator: &A,
     ) -> io::Result<BStackOwned<Self>> {

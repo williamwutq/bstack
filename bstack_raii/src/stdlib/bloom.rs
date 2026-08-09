@@ -38,6 +38,7 @@ use core::mem::size_of;
 use std::io;
 
 use bstack::{BStack, BStackGenOp, BStackOwnedSliceAllocator, BStackRange};
+use crate::wal::BStackWalAnchor;
 use bytemuck::{Pod, Zeroable};
 
 use super::hash::double_hash;
@@ -109,7 +110,7 @@ impl<K: Pod> BStackCountingBloomFilter<K> {
 
     /// Allocate a filter with `m` counters and `k` hash functions (both forced to
     /// at least 1). Prefer [`with_capacity`](Self::with_capacity) to size these.
-    pub fn new<A: BStackOwnedSliceAllocator>(
+    pub fn new<A: BStackWalAnchor>(
         allocator: &A,
         m: u64,
         k: u64,
@@ -149,7 +150,7 @@ impl<K: Pod> BStackCountingBloomFilter<K> {
     /// Allocate a filter sized for `expected_items` at target false-positive rate
     /// `fp_rate`, using the standard optimal `m = -n·ln p / (ln 2)²` and
     /// `k = (m/n)·ln 2`.
-    pub fn with_capacity<A: BStackOwnedSliceAllocator>(
+    pub fn with_capacity<A: BStackWalAnchor>(
         allocator: &A,
         expected_items: u64,
         fp_rate: f64,
@@ -181,7 +182,7 @@ impl<K: Pod> BStackCountingBloomFilter<K> {
     }
 
     /// Insert `key`, bumping each of its `k` counters (saturating at 255).
-    pub fn insert<A: BStackOwnedSliceAllocator>(&self, allocator: &A, key: &K) -> io::Result<()> {
+    pub fn insert<A: BStackWalAnchor>(&self, allocator: &A, key: &K) -> io::Result<()> {
         self.adjust(allocator, key, true)
     }
 
@@ -189,7 +190,7 @@ impl<K: Pod> BStackCountingBloomFilter<K> {
     ///
     /// Only call this for a key that was actually inserted (see the module docs) —
     /// removing an absent key can introduce false negatives.
-    pub fn remove<A: BStackOwnedSliceAllocator>(&self, allocator: &A, key: &K) -> io::Result<()> {
+    pub fn remove<A: BStackWalAnchor>(&self, allocator: &A, key: &K) -> io::Result<()> {
         self.adjust(allocator, key, false)
     }
 
@@ -211,7 +212,7 @@ impl<K: Pod> BStackCountingBloomFilter<K> {
     }
 
     /// Reset every counter and the item count to zero.
-    pub fn clear<A: BStackOwnedSliceAllocator>(&self, allocator: &A) -> io::Result<()> {
+    pub fn clear<A: BStackWalAnchor>(&self, allocator: &A) -> io::Result<()> {
         let handle = self.range.start();
         let [data, m] = read_fields::<2>(allocator.stack(), handle + DATA_OFF)?;
         allocator.stack().set_batched([
@@ -222,7 +223,7 @@ impl<K: Pod> BStackCountingBloomFilter<K> {
 
     /// Atomically adjust the counters for `key` (and `n`) up or down, reading and
     /// writing every touched counter in one `inplace_gen` (external-lock-free).
-    fn adjust<A: BStackOwnedSliceAllocator>(
+    fn adjust<A: BStackWalAnchor>(
         &self,
         allocator: &A,
         key: &K,
@@ -313,7 +314,7 @@ impl<K: Pod> BStackCountingBloomFilter<K> {
     }
 
     /// Attach an allocator to make an auto-freeing [`AutoDrop`] guard.
-    pub fn auto<A: BStackOwnedSliceAllocator>(self, allocator: &A) -> AutoDrop<'_, Self, A> {
+    pub fn auto<A: BStackWalAnchor>(self, allocator: &A) -> AutoDrop<'_, Self, A> {
         // SAFETY: sole ownership was asserted when the filter was created.
         unsafe { AutoDrop::from_raw(self, allocator) }
     }
@@ -342,7 +343,7 @@ impl<K: Pod> BStackBlock for BStackCountingBloomFilter<K> {
     }
 
     /// Free the counter block, **without** freeing the handle block itself.
-    fn __bstack_drop_children<A: BStackOwnedSliceAllocator>(
+    fn __bstack_drop_children<A: BStackWalAnchor>(
         range: BStackRange,
         allocator: &A,
     ) -> io::Result<()> {
@@ -356,7 +357,7 @@ impl<K: Pod> BStackBlock for BStackCountingBloomFilter<K> {
 
     /// Deep-clone: copy the counter block and stage the handle, in the parent
     /// plan's single atomic commit.
-    fn __bstack_clone_into<A: BStackOwnedSliceAllocator>(
+    fn __bstack_clone_into<A: BStackWalAnchor>(
         &self,
         allocator: &A,
         plan: &mut ClonePlan,
@@ -391,7 +392,7 @@ impl<K: Pod> BStackBlock for BStackCountingBloomFilter<K> {
 }
 
 impl<K: Pod> BStackDrop for BStackCountingBloomFilter<K> {
-    fn bstack_drop<A: BStackOwnedSliceAllocator>(self, allocator: &A) -> io::Result<()> {
+    fn bstack_drop<A: BStackWalAnchor>(self, allocator: &A) -> io::Result<()> {
         Self::__bstack_drop_children(self.range, allocator)?;
         // SAFETY: sole ownership of the handle block was asserted at construction.
         unsafe { dealloc_range(allocator, self.range) }
@@ -399,7 +400,7 @@ impl<K: Pod> BStackDrop for BStackCountingBloomFilter<K> {
 }
 
 impl<K: Pod> TryCloneIn for BStackCountingBloomFilter<K> {
-    fn try_clone_in<A: BStackOwnedSliceAllocator>(
+    fn try_clone_in<A: BStackWalAnchor>(
         &self,
         allocator: &A,
     ) -> io::Result<BStackOwned<Self>> {

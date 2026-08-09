@@ -21,6 +21,7 @@ use core::mem::size_of;
 use std::io;
 
 use bstack::{BStack, BStackOwnedSliceAllocator, BStackRange};
+use crate::wal::BStackWalAnchor;
 use bytemuck::{Pod, Zeroable};
 
 use crate::block::{BStackBlock, BStackCast, BStackMove};
@@ -71,7 +72,7 @@ impl<T: Pod> BStackBox<T> {
     ///
     /// The header and payload are written as a single image, so the block is
     /// created with one write (and released without leaking on write failure).
-    pub fn new<A: BStackOwnedSliceAllocator>(
+    pub fn new<A: BStackWalAnchor>(
         allocator: &A,
         value: T,
     ) -> io::Result<BStackOwned<Self>> {
@@ -107,7 +108,7 @@ impl<T: Pod> BStackBox<T> {
     }
 
     /// Overwrite the boxed value in place.
-    pub fn set<A: BStackOwnedSliceAllocator>(&self, allocator: &A, value: T) -> io::Result<()> {
+    pub fn set<A: BStackWalAnchor>(&self, allocator: &A, value: T) -> io::Result<()> {
         allocator
             .stack()
             .set(self.range.start() + HEADER_SIZE, bytemuck::bytes_of(&value))
@@ -143,7 +144,7 @@ impl<T: Pod> BStackBlock for BStackBox<T> {
 }
 
 impl<T: Pod> BStackDrop for BStackBox<T> {
-    fn bstack_drop<A: BStackOwnedSliceAllocator>(self, allocator: &A) -> io::Result<()> {
+    fn bstack_drop<A: BStackWalAnchor>(self, allocator: &A) -> io::Result<()> {
         // Childless: just free the block.
         // SAFETY: sole ownership was asserted when this handle was created.
         unsafe { dealloc_range(allocator, self.range) }
@@ -151,7 +152,7 @@ impl<T: Pod> BStackDrop for BStackBox<T> {
 }
 
 impl<T: Pod> TryCloneIn for BStackBox<T> {
-    fn try_clone_in<A: BStackOwnedSliceAllocator>(
+    fn try_clone_in<A: BStackWalAnchor>(
         &self,
         allocator: &A,
     ) -> io::Result<BStackOwned<Self>> {
@@ -173,9 +174,9 @@ impl<T: Pod> TryCloneIn for BStackBox<T> {
 
 impl<T: Pod> BStackMove for BStackBox<T> {
     /// Moving a box out yields the plain value.
-    type Fields<'a, A: BStackOwnedSliceAllocator> = T;
+    type Fields<'a, A: BStackWalAnchor> = T;
 
-    fn bstack_move<A: BStackOwnedSliceAllocator>(
+    fn bstack_move<A: BStackWalAnchor>(
         owned: BStackOwned<Self>,
         allocator: &A,
     ) -> io::Result<T> {

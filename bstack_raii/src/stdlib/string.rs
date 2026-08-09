@@ -17,6 +17,7 @@ use core::mem::size_of;
 use std::io;
 
 use bstack::{BStack, BStackOwnedSliceAllocator, BStackRange};
+use crate::wal::BStackWalAnchor;
 use bytemuck::{Pod, Zeroable};
 
 use super::util::{alloc_image, read_fields, read_u64};
@@ -57,7 +58,7 @@ pub struct BStackString {
 impl BStackString {
     /// Allocate a bytes block holding `bytes` (or return `0` for an empty slice),
     /// releasing it without leaking on write failure.
-    fn alloc_bytes<A: BStackOwnedSliceAllocator>(allocator: &A, bytes: &[u8]) -> io::Result<u64> {
+    fn alloc_bytes<A: BStackWalAnchor>(allocator: &A, bytes: &[u8]) -> io::Result<u64> {
         if bytes.is_empty() {
             return Ok(0);
         }
@@ -70,7 +71,7 @@ impl BStackString {
     }
 
     /// Create a string from `s`.
-    pub fn new<A: BStackOwnedSliceAllocator>(
+    pub fn new<A: BStackWalAnchor>(
         allocator: &A,
         s: &str,
     ) -> io::Result<BStackOwned<Self>> {
@@ -131,7 +132,7 @@ impl BStackString {
     /// `{data, len}` pair is updated in one atomic write (a crash before it leaves
     /// the old string intact; after it, the new). The old bytes block is then
     /// freed (leak-only on a crash in between).
-    pub fn set<A: BStackOwnedSliceAllocator>(&self, allocator: &A, s: &str) -> io::Result<()> {
+    pub fn set<A: BStackWalAnchor>(&self, allocator: &A, s: &str) -> io::Result<()> {
         let handle = self.range.start();
         let stack = allocator.stack();
         let newlen = s.len() as u64;
@@ -159,21 +160,21 @@ impl BStackString {
     }
 
     /// Append `s` to the string.
-    pub fn push_str<A: BStackOwnedSliceAllocator>(&self, allocator: &A, s: &str) -> io::Result<()> {
+    pub fn push_str<A: BStackWalAnchor>(&self, allocator: &A, s: &str) -> io::Result<()> {
         let mut cur = self.to_string(allocator.stack())?;
         cur.push_str(s);
         self.set(allocator, &cur)
     }
 
     /// Append a single character.
-    pub fn push<A: BStackOwnedSliceAllocator>(&self, allocator: &A, ch: char) -> io::Result<()> {
+    pub fn push<A: BStackWalAnchor>(&self, allocator: &A, ch: char) -> io::Result<()> {
         let mut buf = [0u8; 4];
         self.push_str(allocator, ch.encode_utf8(&mut buf))
     }
 
     /// Truncate to `new_len` **bytes**, which must be a UTF-8 char boundary and
     /// not exceed the current length; longer values leave the string unchanged.
-    pub fn truncate<A: BStackOwnedSliceAllocator>(
+    pub fn truncate<A: BStackWalAnchor>(
         &self,
         allocator: &A,
         new_len: usize,
@@ -193,7 +194,7 @@ impl BStackString {
     }
 
     /// Empty the string (frees its bytes block).
-    pub fn clear<A: BStackOwnedSliceAllocator>(&self, allocator: &A) -> io::Result<()> {
+    pub fn clear<A: BStackWalAnchor>(&self, allocator: &A) -> io::Result<()> {
         self.set(allocator, "")
     }
 
@@ -223,7 +224,7 @@ impl BStackString {
     }
 
     /// Attach an allocator to make an auto-freeing [`AutoDrop`] guard.
-    pub fn auto<A: BStackOwnedSliceAllocator>(self, allocator: &A) -> AutoDrop<'_, Self, A> {
+    pub fn auto<A: BStackWalAnchor>(self, allocator: &A) -> AutoDrop<'_, Self, A> {
         // SAFETY: sole ownership was asserted when the string was created.
         unsafe { AutoDrop::from_raw(self, allocator) }
     }
@@ -248,7 +249,7 @@ impl BStackBlock for BStackString {
     }
 
     /// Free the bytes block, **without** freeing the handle block itself.
-    fn __bstack_drop_children<A: BStackOwnedSliceAllocator>(
+    fn __bstack_drop_children<A: BStackWalAnchor>(
         range: BStackRange,
         allocator: &A,
     ) -> io::Result<()> {
@@ -262,7 +263,7 @@ impl BStackBlock for BStackString {
 
     /// Deep-clone: copy the bytes into a fresh block and stage the handle, in the
     /// parent plan's single atomic commit.
-    fn __bstack_clone_into<A: BStackOwnedSliceAllocator>(
+    fn __bstack_clone_into<A: BStackWalAnchor>(
         &self,
         allocator: &A,
         plan: &mut ClonePlan,
@@ -295,7 +296,7 @@ impl BStackBlock for BStackString {
 }
 
 impl BStackDrop for BStackString {
-    fn bstack_drop<A: BStackOwnedSliceAllocator>(self, allocator: &A) -> io::Result<()> {
+    fn bstack_drop<A: BStackWalAnchor>(self, allocator: &A) -> io::Result<()> {
         Self::__bstack_drop_children(self.range, allocator)?;
         // SAFETY: sole ownership of the handle block was asserted at construction.
         unsafe { dealloc_range(allocator, self.range) }
@@ -303,7 +304,7 @@ impl BStackDrop for BStackString {
 }
 
 impl TryCloneIn for BStackString {
-    fn try_clone_in<A: BStackOwnedSliceAllocator>(
+    fn try_clone_in<A: BStackWalAnchor>(
         &self,
         allocator: &A,
     ) -> io::Result<BStackOwned<Self>> {

@@ -458,7 +458,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                     )
                 };
                 accessors.push(quote! {
-                    #vis fn #fname<'__v, __A: ::bstack_raii::BStackOwnedSliceAllocator>(
+                    #vis fn #fname<'__v, __A: ::bstack_raii::BStackWalAnchor>(
                         &self,
                         allocator: &'__v __A,
                     ) -> ::std::io::Result<#acc_ret> {
@@ -820,7 +820,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                 };
                 let acc_body = nested_build(&dims, &acc_leaf, &acc_read);
                 accessors.push(quote! {
-                    #vis fn #fname<'__v, __A: ::bstack_raii::BStackOwnedSliceAllocator>(
+                    #vis fn #fname<'__v, __A: ::bstack_raii::BStackWalAnchor>(
                         &self,
                         allocator: &'__v __A,
                     ) -> ::std::io::Result<#acc_ret> {
@@ -1138,7 +1138,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
 
                 let setter = format_ident!("set_{}", fname);
                 setters.push(quote! {
-                    #vis fn #setter<'__s, __A: ::bstack_raii::BStackOwnedSliceAllocator>(
+                    #vis fn #setter<'__s, __A: ::bstack_raii::BStackWalAnchor>(
                         &self,
                         allocator: &'__s __A,
                         index: usize,
@@ -1160,7 +1160,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                 };
                 let acc_body = nested_build(&dims, &leaf_ty, &acc_read);
                 accessors.push(quote! {
-                    #vis fn #fname<'__u, __A: ::bstack_raii::BStackOwnedSliceAllocator>(
+                    #vis fn #fname<'__u, __A: ::bstack_raii::BStackWalAnchor>(
                         &self,
                         allocator: &'__u __A,
                     ) -> ::std::io::Result<#acc_ret> {
@@ -1759,14 +1759,14 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         Mode::Plain => quote!(),
         Mode::Rc => quote! {
             impl ::bstack_raii::BStackShared for #name {
-                fn drop_strong_ref<__A: ::bstack_raii::BStackOwnedSliceAllocator>(
+                fn drop_strong_ref<__A: ::bstack_raii::BStackWalAnchor>(
                     data: ::bstack_raii::BStackRef<Self>,
                     allocator: &__A,
                 ) -> ::std::io::Result<()> {
                     use ::bstack_raii::BStackDrop as _;
                     ::bstack_raii::StrongRef(data).bstack_drop(allocator)
                 }
-                fn strong_parts<__A: ::bstack_raii::BStackOwnedSliceAllocator>(
+                fn strong_parts<__A: ::bstack_raii::BStackWalAnchor>(
                     data: ::bstack_raii::BStackRef<Self>,
                     _allocator: &__A,
                 ) -> ::std::io::Result<(
@@ -1779,7 +1779,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         },
         Mode::RcWeak => quote! {
             impl ::bstack_raii::BStackShared for #name {
-                fn drop_strong_ref<__A: ::bstack_raii::BStackOwnedSliceAllocator>(
+                fn drop_strong_ref<__A: ::bstack_raii::BStackWalAnchor>(
                     data: ::bstack_raii::BStackRef<Self>,
                     allocator: &__A,
                 ) -> ::std::io::Result<()> {
@@ -1787,7 +1787,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                     ::bstack_raii::StrongWeakRef::from_disk(data, allocator)?
                         .bstack_drop(allocator)
                 }
-                fn strong_parts<__A: ::bstack_raii::BStackOwnedSliceAllocator>(
+                fn strong_parts<__A: ::bstack_raii::BStackWalAnchor>(
                     data: ::bstack_raii::BStackRef<Self>,
                     allocator: &__A,
                 ) -> ::std::io::Result<(
@@ -1844,9 +1844,9 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
             // Implemented on the block type (local downstream) so the orphan rule
             // is satisfied; `bstack_move!` selects it from the argument's type.
             impl #impl_g ::bstack_raii::BStackMove for #name #ty_g #where_g {
-                type Fields<'__mv, __A: ::bstack_raii::BStackOwnedSliceAllocator> =
+                type Fields<'__mv, __A: ::bstack_raii::BStackWalAnchor> =
                     ( #(#mv_types,)* );
-                fn bstack_move<'__mv, __A: ::bstack_raii::BStackOwnedSliceAllocator>(
+                fn bstack_move<'__mv, __A: ::bstack_raii::BStackWalAnchor>(
                     owned: ::bstack_raii::BStackOwned<Self>,
                     __alloc: &'__mv __A,
                 ) -> ::std::io::Result<Self::Fields<'__mv, __A>> {
@@ -1920,7 +1920,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
     let clone_trait_methods = quote! {
         #[doc(hidden)]
         #[allow(unused_variables, unused_imports)]
-        fn __bstack_clone_children_inplace<__A: ::bstack_raii::BStackOwnedSliceAllocator>(
+        fn __bstack_clone_children_inplace<__A: ::bstack_raii::BStackWalAnchor>(
             &self,
             allocator: &__A,
             __plan: &mut ::bstack_raii::ClonePlan,
@@ -1932,7 +1932,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         }
         #[doc(hidden)]
         #[allow(unused_variables)]
-        fn __bstack_clone_into<__A: ::bstack_raii::BStackOwnedSliceAllocator>(
+        fn __bstack_clone_into<__A: ::bstack_raii::BStackWalAnchor>(
             &self,
             allocator: &__A,
             __plan: &mut ::bstack_raii::ClonePlan,
@@ -1943,7 +1943,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
     let clone_impl = if mode == Mode::Plain {
         quote! {
             impl #impl_g ::bstack_raii::TryCloneIn for #name #ty_g #where_g {
-                fn try_clone_in<__A: ::bstack_raii::BStackOwnedSliceAllocator>(
+                fn try_clone_in<__A: ::bstack_raii::BStackWalAnchor>(
                     &self,
                     allocator: &__A,
                 ) -> ::std::io::Result<::bstack_raii::BStackOwned<Self>> {
@@ -2071,7 +2071,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
             /// `BStackBlock` default.
             #[doc(hidden)]
             #[allow(unused_imports)]
-            fn __bstack_drop_children<__A: ::bstack_raii::BStackOwnedSliceAllocator>(
+            fn __bstack_drop_children<__A: ::bstack_raii::BStackWalAnchor>(
                 __range: ::bstack_raii::BStackRange,
                 allocator: &__A,
             ) -> ::std::io::Result<()> {
@@ -2089,7 +2089,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         }
 
         impl #impl_g ::bstack_raii::BStackDrop for #name #ty_g #where_g {
-            fn bstack_drop<__A: ::bstack_raii::BStackOwnedSliceAllocator>(
+            fn bstack_drop<__A: ::bstack_raii::BStackWalAnchor>(
                 self,
                 allocator: &__A,
             ) -> ::std::io::Result<()> {
@@ -2350,7 +2350,7 @@ fn vec_accessor(
     let field = quote!(self.0.start() + ::core::mem::offset_of!(#on_disk, #fname) as u64);
     if nullable {
         quote! {
-            #vis fn #fname<'__v, __A: ::bstack_raii::BStackOwnedSliceAllocator>(
+            #vis fn #fname<'__v, __A: ::bstack_raii::BStackWalAnchor>(
                 &self,
                 allocator: &'__v __A,
             ) -> ::std::io::Result<
@@ -2361,7 +2361,7 @@ fn vec_accessor(
         }
     } else {
         quote! {
-            #vis fn #fname<'__v, __A: ::bstack_raii::BStackOwnedSliceAllocator>(
+            #vis fn #fname<'__v, __A: ::bstack_raii::BStackWalAnchor>(
                 &self,
                 allocator: &'__v __A,
             ) -> ::std::io::Result<::bstack_raii::BStackVec<'__v, #elem, __A>> {
@@ -2538,7 +2538,7 @@ fn block_vec_accessor(
     let field = quote!(self.0.start() + ::core::mem::offset_of!(#on_disk, #fname) as u64);
     if nullable {
         quote! {
-            #vis fn #fname<'__v, __A: ::bstack_raii::BStackOwnedSliceAllocator>(
+            #vis fn #fname<'__v, __A: ::bstack_raii::BStackWalAnchor>(
                 &self,
                 allocator: &'__v __A,
             ) -> ::std::io::Result<
@@ -2549,7 +2549,7 @@ fn block_vec_accessor(
         }
     } else {
         quote! {
-            #vis fn #fname<'__v, __A: ::bstack_raii::BStackOwnedSliceAllocator>(
+            #vis fn #fname<'__v, __A: ::bstack_raii::BStackWalAnchor>(
                 &self,
                 allocator: &'__v __A,
             ) -> ::std::io::Result<::bstack_raii::#vec_ty<'__v, #elem, __A>> {
@@ -2779,7 +2779,7 @@ fn accessor(
     // Weak fields hold a control offset; the accessor attempts a live upgrade.
     if kind == Kind::Weak {
         return quote! {
-            #vis fn #fname<'__u, __A: ::bstack_raii::BStackOwnedSliceAllocator>(
+            #vis fn #fname<'__u, __A: ::bstack_raii::BStackWalAnchor>(
                 &self,
                 allocator: &'__u __A,
             ) -> ::std::io::Result<
@@ -3010,7 +3010,7 @@ fn weak_setter(
 ) -> TokenStream {
     let setter = format_ident!("set_{}", fname);
     quote! {
-        #vis fn #setter<'__s, __A: ::bstack_raii::BStackOwnedSliceAllocator>(
+        #vis fn #setter<'__s, __A: ::bstack_raii::BStackWalAnchor>(
             &self,
             allocator: &'__s __A,
             weak: ::bstack_raii::BStackWeak<'__s, #fty, __A>,
@@ -3084,7 +3084,7 @@ fn constructor(
                 }
             };
             quote! {
-                #vis fn new<'__ctor, __A: ::bstack_raii::BStackOwnedSliceAllocator>(
+                #vis fn new<'__ctor, __A: ::bstack_raii::BStackWalAnchor>(
                     allocator: &'__ctor __A,
                     #(#params)*
                 ) -> ::std::io::Result<#ret> {
@@ -3117,7 +3117,7 @@ fn constructor(
                 ::core::mem::size_of::<<Self as ::bstack_raii::BStackWeakable>::Control>() as u64
             };
             quote! {
-                #vis fn new<'__ctor, __A: ::bstack_raii::BStackOwnedSliceAllocator>(
+                #vis fn new<'__ctor, __A: ::bstack_raii::BStackWalAnchor>(
                     allocator: &'__ctor __A,
                     #(#params)*
                 ) -> ::std::io::Result<::bstack_raii::BStackRc<'__ctor, Self, __A>> {
@@ -5058,7 +5058,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
         let mut parts: Vec<TokenStream> = Vec::new();
         if la {
             parts.push(lt.clone());
-            parts.push(quote!(__A: ::bstack_raii::BStackOwnedSliceAllocator));
+            parts.push(quote!(__A: ::bstack_raii::BStackWalAnchor));
         }
         parts.extend(etp_decl.iter().cloned());
         if parts.is_empty() {
@@ -5134,7 +5134,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                 }
             };
             quote! {
-                #vis fn new<'__e, __A: ::bstack_raii::BStackOwnedSliceAllocator>(
+                #vis fn new<'__e, __A: ::bstack_raii::BStackWalAnchor>(
                     allocator: &'__e __A,
                     data: #data_ty,
                 ) -> ::std::io::Result<#new_ret> {
@@ -5166,7 +5166,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                 ::core::mem::size_of::<<Self as ::bstack_raii::BStackWeakable>::Control>() as u64
             };
             quote! {
-                #vis fn new<'__e, __A: ::bstack_raii::BStackOwnedSliceAllocator>(
+                #vis fn new<'__e, __A: ::bstack_raii::BStackWalAnchor>(
                     allocator: &'__e __A,
                     data: #data_ty,
                 ) -> ::std::io::Result<::bstack_raii::BStackRc<'__e, Self, __A>> {
@@ -5217,14 +5217,14 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
         Mode::Plain => quote!(),
         Mode::Rc => quote! {
             impl ::bstack_raii::BStackShared for #name {
-                fn drop_strong_ref<__A: ::bstack_raii::BStackOwnedSliceAllocator>(
+                fn drop_strong_ref<__A: ::bstack_raii::BStackWalAnchor>(
                     data: ::bstack_raii::BStackRef<Self>,
                     allocator: &__A,
                 ) -> ::std::io::Result<()> {
                     use ::bstack_raii::BStackDrop as _;
                     ::bstack_raii::StrongRef(data).bstack_drop(allocator)
                 }
-                fn strong_parts<__A: ::bstack_raii::BStackOwnedSliceAllocator>(
+                fn strong_parts<__A: ::bstack_raii::BStackWalAnchor>(
                     data: ::bstack_raii::BStackRef<Self>,
                     _allocator: &__A,
                 ) -> ::std::io::Result<(
@@ -5237,7 +5237,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
         },
         Mode::RcWeak => quote! {
             impl ::bstack_raii::BStackShared for #name {
-                fn drop_strong_ref<__A: ::bstack_raii::BStackOwnedSliceAllocator>(
+                fn drop_strong_ref<__A: ::bstack_raii::BStackWalAnchor>(
                     data: ::bstack_raii::BStackRef<Self>,
                     allocator: &__A,
                 ) -> ::std::io::Result<()> {
@@ -5245,7 +5245,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                     ::bstack_raii::StrongWeakRef::from_disk(data, allocator)?
                         .bstack_drop(allocator)
                 }
-                fn strong_parts<__A: ::bstack_raii::BStackOwnedSliceAllocator>(
+                fn strong_parts<__A: ::bstack_raii::BStackWalAnchor>(
                     data: ::bstack_raii::BStackRef<Self>,
                     allocator: &__A,
                 ) -> ::std::io::Result<(
@@ -5382,7 +5382,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
     let enum_clone_trait = if mode == Mode::Plain {
         quote! {
             impl #enum_impl_g ::bstack_raii::TryCloneIn for #name #enum_ty_g #enum_where {
-                fn try_clone_in<__A: ::bstack_raii::BStackOwnedSliceAllocator>(
+                fn try_clone_in<__A: ::bstack_raii::BStackWalAnchor>(
                     &self,
                     allocator: &__A,
                 ) -> ::std::io::Result<::bstack_raii::BStackOwned<Self>> {
@@ -5521,7 +5521,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
             /// and by `__bstack_clone_into`.
             #[doc(hidden)]
             #[allow(unused_variables, unused_imports)]
-            fn __bstack_clone_children_inplace<__A: ::bstack_raii::BStackOwnedSliceAllocator>(
+            fn __bstack_clone_children_inplace<__A: ::bstack_raii::BStackWalAnchor>(
                 &self,
                 allocator: &__A,
                 __plan: &mut ::bstack_raii::ClonePlan,
@@ -5535,7 +5535,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
             /// an owned enum child of a struct be recursed into.
             #[doc(hidden)]
             #[allow(unused_variables)]
-            fn __bstack_clone_into<__A: ::bstack_raii::BStackOwnedSliceAllocator>(
+            fn __bstack_clone_into<__A: ::bstack_raii::BStackWalAnchor>(
                 &self,
                 allocator: &__A,
                 __plan: &mut ::bstack_raii::ClonePlan,
@@ -5549,7 +5549,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
             /// `BStackBlock` default.
             #[doc(hidden)]
             #[allow(unused_imports)]
-            fn __bstack_drop_children<__A: ::bstack_raii::BStackOwnedSliceAllocator>(
+            fn __bstack_drop_children<__A: ::bstack_raii::BStackWalAnchor>(
                 __range: ::bstack_raii::BStackRange,
                 allocator: &__A,
             ) -> ::std::io::Result<()> {
@@ -5561,7 +5561,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
         }
 
         impl #enum_impl_g ::bstack_raii::BStackDrop for #name #enum_ty_g #enum_where {
-            fn bstack_drop<__A: ::bstack_raii::BStackOwnedSliceAllocator>(
+            fn bstack_drop<__A: ::bstack_raii::BStackWalAnchor>(
                 self,
                 allocator: &__A,
             ) -> ::std::io::Result<()> {
@@ -5576,7 +5576,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
 
             /// Read the current variant. Takes the allocator (a weak variant's
             /// read upgrades through it; other variants just read the block).
-            #vis fn read<'__e, __A: ::bstack_raii::BStackOwnedSliceAllocator>(
+            #vis fn read<'__e, __A: ::bstack_raii::BStackWalAnchor>(
                 &self,
                 allocator: &'__e __A,
             ) -> ::std::io::Result<#view_ty> {
@@ -5614,8 +5614,8 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
         #weakable_items
 
         impl #enum_impl_g ::bstack_raii::BStackMove for #name #enum_ty_g #enum_where {
-            type Fields<'__mv, __A: ::bstack_raii::BStackOwnedSliceAllocator> = #move_fields_ty;
-            fn bstack_move<'__mv, __A: ::bstack_raii::BStackOwnedSliceAllocator>(
+            type Fields<'__mv, __A: ::bstack_raii::BStackWalAnchor> = #move_fields_ty;
+            fn bstack_move<'__mv, __A: ::bstack_raii::BStackWalAnchor>(
                 owned: ::bstack_raii::BStackOwned<Self>,
                 __alloc: &'__mv __A,
             ) -> ::std::io::Result<Self::Fields<'__mv, __A>> {
