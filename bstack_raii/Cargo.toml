@@ -30,3 +30,4 @@ bstack_raii_derive = { path = "derive", version = "0.0.0" }
 # Gate for POD (plain-old-data) inline fields: any `bytemuck::Pod` type is safe
 # to store inline in an on-disk block and receives the blanket no-op BStackDrop.
 bytemuck = { version = "=1.25", features = ["derive"] }
+parking_lot = "0.12.5"
