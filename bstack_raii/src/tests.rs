@@ -6430,3 +6430,73 @@ fn wal_teardown_reclaims_on_free_fault() {
     );
     list2.bstack_drop(&alloc).unwrap();
 }
+
+// --------------------------------------------------------------------------
+// Cross-file registry: path<->id persistence + live-host resolution
+// --------------------------------------------------------------------------
+
+#[test]
+fn registry_paths_persist_and_live_host_round_trips() {
+    use crate::registry::{FileId, FileRegistry};
+    use std::sync::Arc;
+
+    let reg_file = TempStack::new();
+    let foreign = TempStack::new();
+    // A path we only *register* (never open) — proves the table stores strings.
+    let ghost = std::env::temp_dir().join("bstack_raii_registry_ghost.bstack");
+
+    // --- "run 1": register paths, attach a live host, use it, detach ---
+    {
+        let reg = FileRegistry::open(&reg_file.path).unwrap();
+
+        let id_a = reg.register_path(&foreign.path).unwrap();
+        assert_eq!(id_a, FileId::from_u64(0).unwrap());
+        // Registration is idempotent (same path -> same id, no new slot).
+        assert_eq!(reg.register_path(&foreign.path).unwrap(), id_a);
+        // A distinct path gets the next id.
+        let id_g = reg.register_path(&ghost).unwrap();
+        assert_eq!(id_g.get(), 1);
+        assert_eq!(reg.id_of(&foreign.path), Some(id_a));
+        assert_eq!(reg.path_of(id_g).as_deref(), Some(ghost.as_path()));
+
+        // Attach the foreign file's own allocator as its live host (same path ->
+        // same id), then read/write/alloc through the type-erased facade.
+        let host: Arc<dyn crate::registry::ForeignHost> = Arc::new(foreign.allocator());
+        let id = reg.attach(&foreign.path, host).unwrap();
+        assert_eq!(id, id_a);
+        assert!(reg.is_live(id));
+
+        let block = reg
+            .with_host(id, |h| {
+                let r = h.alloc(64).unwrap();
+                h.stack().set(r.start(), [1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+                let mut buf = [0u8; 8];
+                h.stack().get_into(r.start(), &mut buf).unwrap();
+                assert_eq!(buf, [1, 2, 3, 4, 5, 6, 7, 8]);
+                r
+            })
+            .expect("host is live");
+        // Free it through the host (under the read lock).
+        reg.with_host(id, |h| unsafe { h.dealloc(block).unwrap() })
+            .expect("host is live");
+
+        reg.detach(id);
+        assert!(!reg.is_live(id));
+        assert!(reg.with_host(id, |_| ()).is_none());
+    }
+
+    // --- "run 2": reopen the same registry file; the path table persisted ---
+    {
+        let reg = FileRegistry::open(&reg_file.path).unwrap();
+        assert_eq!(reg.id_of(&foreign.path).map(FileId::get), Some(0));
+        assert_eq!(reg.id_of(&ghost).map(FileId::get), Some(1));
+        assert_eq!(
+            reg.path_of(FileId::from_u64(0).unwrap()).as_deref(),
+            Some(foreign.path.as_path())
+        );
+        // The live layer is in-memory only: nothing is live after a reopen.
+        assert!(!reg.is_live(FileId::from_u64(0).unwrap()));
+    }
+
+    let _ = std::fs::remove_file(&ghost);
+}

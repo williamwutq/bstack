@@ -58,6 +58,8 @@ mod layout;
 mod owned;
 mod refcount;
 mod reference;
+/// Cross-file `Foreign<T>` support: the process-wide path↔id file registry.
+pub mod registry;
 mod shared;
 mod stdlib;
 mod teardown;
