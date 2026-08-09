@@ -6289,3 +6289,59 @@ fn stdlib_tree_entry() {
 
     tree.bstack_drop(&alloc).unwrap();
 }
+
+// --------------------------------------------------------------------------
+// WAL: clone commit is crash-atomic — a crash mid-commit reclaims the orphans
+// (uses bstack's fault injection; requires --features fault-injection + debug)
+// --------------------------------------------------------------------------
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn wal_clone_reclaims_orphans_on_commit_fault() {
+    use bstack::fault::FaultPolicy;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    // Fail the first `inplace_gen` (the clone commit) exactly once; a real crash
+    // there would run no rollback, leaving the clone's fresh blocks orphaned.
+    struct FailFirstInplaceGen(AtomicBool);
+    impl FaultPolicy for FailFirstInplaceGen {
+        fn next_fault(&self, op: &'static str, _seq: u64) -> Option<io::Error> {
+            if op == "inplace_gen" && !self.0.swap(true, Ordering::SeqCst) {
+                Some(io::Error::other("injected clone-commit fault"))
+            } else {
+                None
+            }
+        }
+    }
+
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator(); // FirstFit is a BStackWalAnchor
+    let stack = alloc.stack();
+
+    // Source owns a child, so each deep clone allocates two blocks (+ a WAL block).
+    let leaf = MacroLeaf::new(&alloc, 7).unwrap();
+    let src = MacroParent::new(&alloc, leaf, 1).unwrap();
+
+    // Repeatedly crash the clone commit. If the orphans (and WAL block) were
+    // leaked, the committed length would climb every iteration; WAL reclamation
+    // frees them back to the free list, so growth flattens once it's warm.
+    let mut prev: Option<u64> = None;
+    for i in 0..30 {
+        stack.set_fault_policy(Some(Arc::new(FailFirstInplaceGen(AtomicBool::new(false)))));
+        let r = src.try_clone_in(&alloc);
+        stack.set_fault_policy(None);
+        assert!(r.is_err(), "injected fault must fail the clone commit");
+        let len = stack.len().unwrap();
+        if i >= 3 {
+            assert_eq!(len, prev.unwrap(), "faulted clone leaked at iter {i}");
+        }
+        prev = Some(len);
+    }
+
+    // Source intact; a real (unfaulted) clone still succeeds, reusing the space.
+    let cl = src.try_clone_in(&alloc).unwrap();
+    assert_eq!(cl.handle().child(stack).unwrap().val(stack).unwrap(), 7);
+    cl.bstack_drop(&alloc).unwrap();
+    src.bstack_drop(&alloc).unwrap();
+}

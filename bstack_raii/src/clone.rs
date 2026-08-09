@@ -45,6 +45,9 @@ use crate::owned::BStackOwned;
 use crate::reference::BStackRef;
 use crate::teardown::{BStackDrop, dealloc_range};
 use crate::vec::{BYTEVEC_HEADER, VecDesc};
+use crate::wal::{
+    WalAnchorProbe, WalAnchorProbeFallback, WalEntry, WalLog, WalStatus, finish_at, persist_at,
+};
 
 /// Duplicate `self`, performing any fallible I/O the duplication requires,
 /// **without** needing an allocator.
@@ -219,6 +222,29 @@ impl ClonePlan {
         } = self;
         let stack = allocator.stack();
 
+        // If the allocator provides a WAL anchor, protect this clone's fresh
+        // allocations: log them `Pending` before the commit, so a crash mid-commit
+        // is reclaimed by `finish` on the next open. The transaction is flipped
+        // `Complete` *inside* the commit batch below, so "clone committed" and
+        // "WAL Complete" are the same atomic event.
+        let wal: Option<(u64, BStackRange)> = match allocator.wal_anchor_opt() {
+            Some(anchor) if !allocated.is_empty() => {
+                let mut log = WalLog::with_capacity(allocated.len());
+                for &r in &allocated {
+                    log.append(WalEntry::alloc(WalStatus::Pending, r));
+                }
+                match persist_at(allocator, anchor, &log, WalStatus::Pending) {
+                    Ok(range) => Some((anchor, range)),
+                    Err(e) => {
+                        // Couldn't stage the WAL — fall back to an immediate rollback.
+                        Self::free_all(allocated, allocator);
+                        return Err(e);
+                    }
+                }
+            }
+            _ => None,
+        };
+
         // De-duplicate bump offsets into distinct `(counter, delta)`.
         bumps.sort_unstable();
         let mut counters: Vec<(u64, u64)> = Vec::new();
@@ -236,6 +262,12 @@ impl ClonePlan {
         let mut readbufs: Vec<[u8; 8]> = vec![[0u8; 8]; n];
         let mut newbufs: Vec<[u8; 8]> = vec![[0u8; 8]; n];
         let mut overflow = false;
+
+        // The WAL commit marker (`WalHeader.txn_status`, the byte after the u64
+        // magic). Written last, so it lands in the same atomic batch as the clone.
+        let flip = [WalStatus::Complete as u8];
+        let flip_off = wal.map(|(_, r)| r.start() + 8);
+        let mut flipped = flip_off.is_none();
 
         let mut read_i = 0usize;
         let mut computed = false;
@@ -292,24 +324,60 @@ impl ClonePlan {
                 let data: &[u8] = unsafe { core::mem::transmute::<&[u8], _>(bytes.as_slice()) };
                 return Some(BStackGenOp::Write { offset: off, data });
             }
+            // Phase 2c — flip the WAL transaction to `Complete`, last, so it commits
+            // atomically with the clone's writes (a no-op when there is no WAL).
+            if !flipped {
+                flipped = true;
+                // SAFETY: `flip` outlives this call and is only read here.
+                let data: &[u8] = unsafe { core::mem::transmute::<&[u8], _>(&flip[..]) };
+                return Some(BStackGenOp::Write {
+                    offset: flip_off.unwrap(),
+                    data,
+                });
+            }
             None
         });
 
         match result {
             Ok(()) if overflow => {
-                Self::free_all(allocated, allocator);
+                Self::reclaim(allocated, wal, allocator);
                 Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "refcount overflow while committing clone",
                 ))
             }
-            Ok(()) => Ok(()),
-            // `inplace_gen` is atomic: on error nothing committed, so just free
-            // the plan's allocations (no bumps to undo — none were applied).
+            Ok(()) => {
+                // Committed — the WAL was flipped `Complete` in the same batch.
+                // Best-effort cleanup (a crash here is finished on the next open).
+                if let Some((anchor, wal_range)) = wal {
+                    let _ = stack.set(anchor, 0u64.to_le_bytes());
+                    let _ = unsafe { dealloc_range(allocator, wal_range) };
+                }
+                Ok(())
+            }
+            // `inplace_gen` is atomic: on error nothing committed. Reclaim the
+            // plan's allocations (via the WAL if present, else directly).
             Err(e) => {
-                Self::free_all(allocated, allocator);
+                Self::reclaim(allocated, wal, allocator);
                 Err(e)
             }
+        }
+    }
+
+    /// Reclaim a failed commit's allocations. With a WAL, `finish_at` abandons the
+    /// still-`Pending` transaction — freeing the logged alloc orphans *and* the WAL
+    /// block — matching exactly what `finish` would do after a real crash; without
+    /// one, free them directly.
+    fn reclaim<A: BStackOwnedSliceAllocator>(
+        allocated: Vec<BStackRange>,
+        wal: Option<(u64, BStackRange)>,
+        allocator: &A,
+    ) {
+        match wal {
+            Some((anchor, _)) => {
+                let _ = finish_at(allocator, anchor);
+            }
+            None => Self::free_all(allocated, allocator),
         }
     }
 

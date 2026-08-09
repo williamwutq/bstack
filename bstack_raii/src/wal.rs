@@ -383,6 +383,33 @@ unsafe impl BStackWalAnchor for bstack::CheckedSlabBStackAllocator {
     }
 }
 
+// -- Autoref-specialization anchor probe -----------------------------------
+//
+// A compound op is generic over `A: BStackOwnedSliceAllocator`, but the WAL needs
+// `A: BStackWalAnchor`. These two traits, resolved by autoref (the "dtolnay
+// specialization" trick), let such an op ask `allocator.wal_anchor_opt()` and get
+// `Some(anchor)` when `A` is anchored, `None` otherwise — opting into the WAL with
+// no bound change and no break for plain allocators. Both must be in scope at the
+// call site; the value-receiver impl wins (fewer autorefs) when it applies.
+
+pub(crate) trait WalAnchorProbe {
+    fn wal_anchor_opt(&self) -> Option<u64>;
+}
+impl<A: BStackWalAnchor> WalAnchorProbe for A {
+    fn wal_anchor_opt(&self) -> Option<u64> {
+        Some(self.wal_anchor())
+    }
+}
+
+pub(crate) trait WalAnchorProbeFallback {
+    fn wal_anchor_opt(&self) -> Option<u64>;
+}
+impl<A: BStackOwnedSliceAllocator> WalAnchorProbeFallback for &A {
+    fn wal_anchor_opt(&self) -> Option<u64> {
+        None
+    }
+}
+
 /// Write `log` as a WAL block with transaction status `txn_status`, allocate the
 /// block, and point the anchor slot at it. Returns the block's range.
 pub fn persist_at<A: BStackOwnedSliceAllocator>(

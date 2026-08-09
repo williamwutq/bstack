@@ -15,6 +15,12 @@ publish = false
 [workspace]
 members = ["derive"]
 
+[features]
+# Dev/test only: forwards bstack's fault-injection so crash-recovery tests can arm
+# a fault at a chosen `BStack` op (e.g. the clone commit's `inplace_gen`). Off by
+# default; enable with `--features fault-injection`. Also requires a debug build.
+fault-injection = ["bstack/fault-injection"]
+
 [dependencies]
 # RAII requires `alloc` + `set`; `atomic` is needed for the on-disk refcount RMW
 # (control blocks, strong/weak counters).
