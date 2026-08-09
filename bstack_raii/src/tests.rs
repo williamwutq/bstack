@@ -8,9 +8,7 @@ use core::mem::size_of;
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use bstack::{
-    BStack, BStackAllocator, BStackRange, FirstFitBStackAllocator,
-};
+use bstack::{BStack, BStackAllocator, BStackRange, FirstFitBStackAllocator};
 
 use crate::layout::{self, BlockHeader};
 use crate::{
@@ -2456,15 +2454,12 @@ fn macro_clone_embed() {
 
 #[test]
 fn wal_finish_rolls_forward_committed() {
-    use crate::wal::{finish_at, persist_at};
+    use crate::wal::{finish, persist_at};
     use crate::{WalEntry, WalLog, WalStatus};
 
     let tmp = TempStack::new();
-    let alloc = tmp.allocator();
-    // A stable anchor slot (zeroed = "no WAL block yet"), plus two "old" slices
-    // the transaction was freeing.
-    let anchor = alloc.alloc(8).unwrap().as_range().start();
-    alloc.stack().set(anchor, 0u64.to_le_bytes()).unwrap();
+    let alloc = tmp.allocator(); // FirstFit: wal_anchor() == Some(8), zeroed on a fresh file
+    // Two "old" slices the transaction was freeing.
     let v1 = alloc.alloc(64).unwrap().as_range();
     let v2 = alloc.alloc(64).unwrap().as_range();
 
@@ -2472,63 +2467,54 @@ fn wal_finish_rolls_forward_committed() {
     let mut log = WalLog::with_capacity(2);
     log.append(WalEntry::dealloc(WalStatus::Pending, v1));
     log.append(WalEntry::dealloc(WalStatus::Pending, v2));
-    persist_at(&alloc, anchor, &log, WalStatus::Complete).unwrap();
+    persist_at(&alloc, &log, WalStatus::Complete).unwrap();
 
     // Completing it rolls both deallocs forward.
-    assert_eq!(finish_at(&alloc, anchor).unwrap(), 2);
+    assert_eq!(finish(&alloc).unwrap(), 2);
 
     // The persistent WAL block is now idle: re-completing finds nothing staged.
     // v1/v2 were reclaimed (a fresh 64-byte alloc reuses a freed slot).
-    assert_eq!(finish_at(&alloc, anchor).unwrap(), 0);
+    assert_eq!(finish(&alloc).unwrap(), 0);
     let reused = alloc.alloc(64).unwrap().as_range();
     assert!(reused.start() == v1.start() || reused.start() == v2.start());
 }
 
 #[test]
 fn wal_finish_abandons_uncommitted() {
-    use crate::wal::{finish_at, persist_at};
+    use crate::wal::{finish, persist_at};
     use crate::{WalEntry, WalLog, WalStatus};
 
     let tmp = TempStack::new();
     let alloc = tmp.allocator();
-    let anchor = alloc.alloc(8).unwrap().as_range().start();
-    alloc.stack().set(anchor, 0u64.to_le_bytes()).unwrap();
     let v1 = alloc.alloc(64).unwrap().as_range();
 
     // An UNCOMMITTED transaction: its dealloc must NOT be performed.
     let mut log = WalLog::with_capacity(1);
     log.append(WalEntry::dealloc(WalStatus::Pending, v1));
-    persist_at(&alloc, anchor, &log, WalStatus::Pending).unwrap();
+    persist_at(&alloc, &log, WalStatus::Pending).unwrap();
 
     // Abandoned: the old slice v1 must NOT be freed (it's still live). Reclaiming
     // an abandoned txn frees its *allocs*, and this txn logged only a dealloc.
-    assert_eq!(finish_at(&alloc, anchor).unwrap(), 0);
+    assert_eq!(finish(&alloc).unwrap(), 0);
     // Idle after completion: re-running finds nothing staged.
-    assert_eq!(finish_at(&alloc, anchor).unwrap(), 0);
+    assert_eq!(finish(&alloc).unwrap(), 0);
 }
 
 #[test]
 fn wal_anchor_trait_reclaims_via_finish() {
-    use crate::BStackRaiiAllocator;
     use crate::wal::{finish, persist_at};
     use crate::{WalEntry, WalLog, WalStatus};
 
     let tmp = TempStack::new();
-    let alloc = tmp.allocator(); // FirstFitBStackAllocator: wal_anchor() == 8
+    let alloc = tmp.allocator(); // FirstFitBStackAllocator: wal_anchor() == Some(8)
     let orphan = alloc.alloc(64).unwrap().as_range();
 
     // Persist an abandoned (Pending) txn into the allocator's own anchor slot.
     let mut log = WalLog::with_capacity(1);
     log.append(WalEntry::alloc(WalStatus::Pending, orphan));
-    persist_at(
-        &alloc,
-        alloc.wal_anchor().unwrap(),
-        &log,
-        WalStatus::Pending,
-    )
-    .unwrap();
+    persist_at(&alloc, &log, WalStatus::Pending).unwrap();
 
-    // finish() uses the trait anchor and reclaims the orphan; the allocator is
+    // finish() reclaims the orphan via the allocator's own anchor; the allocator is
     // unharmed by our writes to its reserved slot (a fresh alloc reuses it).
     assert_eq!(finish(&alloc).unwrap(), 1);
     assert_eq!(alloc.alloc(64).unwrap().as_range().start(), orphan.start());
@@ -2536,13 +2522,11 @@ fn wal_anchor_trait_reclaims_via_finish() {
 
 #[test]
 fn wal_finish_reclaims_abandoned_allocs() {
-    use crate::wal::{finish_at, persist_at};
+    use crate::wal::{finish, persist_at};
     use crate::{WalEntry, WalLog, WalStatus};
 
     let tmp = TempStack::new();
     let alloc = tmp.allocator();
-    let anchor = alloc.alloc(8).unwrap().as_range().start();
-    alloc.stack().set(anchor, 0u64.to_le_bytes()).unwrap();
     // Two blocks a crashed op allocated but never linked (orphans).
     let a1 = alloc.alloc(64).unwrap().as_range();
     let a2 = alloc.alloc(64).unwrap().as_range();
@@ -2551,22 +2535,21 @@ fn wal_finish_reclaims_abandoned_allocs() {
     let mut log = WalLog::with_capacity(2);
     log.append(WalEntry::alloc(WalStatus::Pending, a1));
     log.append(WalEntry::alloc(WalStatus::Pending, a2));
-    persist_at(&alloc, anchor, &log, WalStatus::Pending).unwrap();
+    persist_at(&alloc, &log, WalStatus::Pending).unwrap();
 
     // Reclaiming the abandoned txn frees both orphans.
-    assert_eq!(finish_at(&alloc, anchor).unwrap(), 2);
+    assert_eq!(finish(&alloc).unwrap(), 2);
     // Reclaimed: a fresh 64-byte alloc reuses one of the freed slots.
     let reused = alloc.alloc(64).unwrap().as_range();
     assert!(reused.start() == a1.start() || reused.start() == a2.start());
 
-    // A *committed* alloc-only txn keeps its allocs (frees nothing).
-    let anchor2 = alloc.alloc(8).unwrap().as_range().start();
-    alloc.stack().set(anchor2, 0u64.to_le_bytes()).unwrap();
+    // A *committed* alloc-only txn keeps its allocs (frees nothing); the persistent
+    // WAL block is reused for it.
     let keep = alloc.alloc(64).unwrap().as_range();
     let mut log2 = WalLog::with_capacity(1);
     log2.append(WalEntry::alloc(WalStatus::Pending, keep));
-    persist_at(&alloc, anchor2, &log2, WalStatus::Complete).unwrap();
-    assert_eq!(finish_at(&alloc, anchor2).unwrap(), 0);
+    persist_at(&alloc, &log2, WalStatus::Complete).unwrap();
+    assert_eq!(finish(&alloc).unwrap(), 0);
 }
 
 // --------------------------------------------------------------------------
@@ -6378,7 +6361,7 @@ fn wal_teardown_reclaims_on_free_fault() {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     // The teardown WAL commits by flipping `txn_status` in one `inplace_gen`; the
-    // very next `set` is `finish_at`'s first entry-status write — just past the
+    // very next `set` is `finish_at_locked`'s first entry-status write — just past the
     // commit point, before any block is actually freed. Failing *that* set models
     // a crash mid-teardown with the transaction already committed (so `finish`
     // must roll every dealloc forward, with no half-freed block).

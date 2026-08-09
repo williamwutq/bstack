@@ -251,14 +251,14 @@ impl ClonePlan {
         // `finish` on the next open. The transaction is flipped `Complete` *inside*
         // the commit batch below, so "clone committed" and "WAL Complete" are the
         // same atomic event.
-        let wal: Option<(u64, BStackRange)> = match anchor {
-            Some(anchor) if !allocated.is_empty() => {
+        let wal: Option<BStackRange> = match anchor {
+            Some(_) if !allocated.is_empty() => {
                 let mut log = WalLog::with_capacity(allocated.len());
                 for &r in &allocated {
                     log.append(WalEntry::alloc(WalStatus::Pending, r));
                 }
-                match persist_at(allocator, anchor, &log, WalStatus::Pending) {
-                    Ok(range) => Some((anchor, range)),
+                match persist_at(allocator, &log, WalStatus::Pending) {
+                    Ok(range) => Some(range),
                     Err(e) => {
                         // Couldn't stage the WAL — fall back to an immediate rollback.
                         Self::free_all(allocated, allocator);
@@ -290,7 +290,7 @@ impl ClonePlan {
         // The WAL commit marker (`WalHeader.txn_status`, the byte after the u64
         // magic). Written last, so it lands in the same atomic batch as the clone.
         let flip = [WalStatus::Complete as u8];
-        let flip_off = wal.map(|(_, r)| r.start() + 8);
+        let flip_off = wal.map(|r| r.start() + 8);
         let mut flipped = flip_off.is_none();
 
         let mut read_i = 0usize;
@@ -376,7 +376,7 @@ impl ClonePlan {
                 // nothing to roll forward: just mark the persistent block idle for
                 // reuse (a crash before this is harmlessly finished on the next open,
                 // freeing nothing). The block itself is never freed.
-                if let Some((_anchor, wal_range)) = wal {
+                if let Some(wal_range) = wal {
                     let _ = wal_set_idle(allocator, wal_range.start());
                 }
                 Ok(())
@@ -397,12 +397,14 @@ impl ClonePlan {
     /// already held by the caller (`commit_inner`), so the *locked* variant is used.
     fn reclaim<A: BStackRaiiAllocator>(
         allocated: Vec<BStackRange>,
-        wal: Option<(u64, BStackRange)>,
+        wal: Option<BStackRange>,
         allocator: &A,
     ) {
         match wal {
-            Some((anchor, _)) => {
-                let _ = finish_at_locked(allocator, anchor);
+            // A WAL block was staged: abandon its still-`Pending` transaction via
+            // the allocator's own anchor (same as a real crash's `finish`).
+            Some(_) => {
+                let _ = finish_at_locked(allocator);
             }
             None => Self::free_all(allocated, allocator),
         }

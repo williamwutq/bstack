@@ -6,7 +6,7 @@
 //! bstack provides atomic [`BStackBulkAllocator::alloc_bulk`] /
 //! [`dealloc_bulk`](bstack::BStackBulkAllocator::dealloc_bulk), but only some
 //! allocators implement it, and **all** of `bstack_raii` is generic over
-//! `A: BStackOwnedSliceAllocator`. On stable Rust a generic function cannot
+//! `A: BStackRaiiAllocator`. On stable Rust a generic function cannot
 //! dispatch on whether its concrete `A` *also* implements `BStackBulkAllocator`:
 //! trait-method selection happens once, at the generic definition site, where the
 //! extra bound is unprovable — so any "prefer bulk when available" shim (autoref
@@ -23,14 +23,15 @@
 
 use std::io;
 
-use bstack::{BStackAllocator, BStackOwnedSliceAllocator, BStackRange};
+use bstack::{BStackAllocator, BStackRange};
 
+use crate::BStackRaiiAllocator;
 use crate::teardown::dealloc_range;
 
 /// Allocate one block per entry in `sizes`, in order. On any failure the blocks
 /// already allocated are freed (reverse order) before the error is returned, so a
 /// partial allocation never leaks within the call.
-pub fn alloc_many<A: BStackOwnedSliceAllocator>(
+pub fn alloc_many<A: BStackRaiiAllocator>(
     allocator: &A,
     sizes: &[u64],
 ) -> io::Result<Vec<BStackRange>> {
@@ -52,7 +53,7 @@ pub fn alloc_many<A: BStackOwnedSliceAllocator>(
 
 /// Free every range in turn. Stops and propagates on the first error (the
 /// remaining ranges are left allocated for the caller to handle).
-pub fn free_many<A: BStackOwnedSliceAllocator>(
+pub fn free_many<A: BStackRaiiAllocator>(
     allocator: &A,
     ranges: impl IntoIterator<Item = BStackRange>,
 ) -> io::Result<()> {

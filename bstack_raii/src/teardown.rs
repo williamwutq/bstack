@@ -10,7 +10,7 @@ use core::mem::ManuallyDrop;
 use core::ops::Deref;
 use std::io;
 
-use bstack::{BStackGenOp, BStackOwnedSlice, BStackOwnedSliceAllocator, BStackRange};
+use bstack::{BStackGenOp, BStackOwnedSlice, BStackRange};
 
 use crate::BStackRaiiAllocator;
 use crate::wal::{WalEntry, WalLog, WalStatus, finish_at_locked, persist_at, wal_lock_for};
@@ -36,10 +36,10 @@ thread_local! {
 /// While the sink is installed, every [`dealloc_range`] in the (ordinary,
 /// generic) teardown recursion *collects* its slice rather than freeing it;
 /// afterwards the whole set commits as one `Dealloc` transaction and is executed
-/// via [`finish_at`] (the same path crash recovery takes). Nested owned frees
-/// (e.g. a collection freeing its values through `BStackOwned::bstack_drop`) see
-/// the sink already set and just collect, so exactly one transaction wraps the
-/// outermost teardown.
+/// via [`finish`](crate::wal::finish)'s completion path (the same path crash
+/// recovery takes). Nested owned frees (e.g. a collection freeing its values
+/// through `BStackOwned::bstack_drop`) see the sink already set and just collect,
+/// so exactly one transaction wraps the outermost teardown.
 pub fn wal_teardown<A: BStackRaiiAllocator, T: BStackDrop>(
     handle: T,
     allocator: &A,
@@ -50,16 +50,15 @@ pub fn wal_teardown<A: BStackRaiiAllocator, T: BStackDrop>(
         return handle.bstack_drop(allocator);
     }
     // No anchor → the allocator opts out of reclamation: plain teardown.
-    let anchor = match allocator.wal_anchor() {
-        Some(a) => a,
-        None => return handle.bstack_drop(allocator),
-    };
+    if allocator.wal_anchor().is_none() {
+        return handle.bstack_drop(allocator);
+    }
     TEARDOWN_SINK.with(|s| *s.borrow_mut() = Some(Vec::new()));
     let result = handle.bstack_drop(allocator);
     let slices = TEARDOWN_SINK
         .with(|s| s.borrow_mut().take())
         .unwrap_or_default();
-    wal_free_all(allocator, anchor, slices)?;
+    wal_free_all(allocator, slices)?;
     result
 }
 
@@ -70,11 +69,7 @@ pub fn wal_teardown<A: BStackRaiiAllocator, T: BStackDrop>(
 /// lock, so concurrent teardowns on the same file serialize here (they collect
 /// their subtrees independently first — that part stays concurrent) rather than
 /// racing the single shared anchor slot.
-fn wal_free_all<A: BStackRaiiAllocator>(
-    allocator: &A,
-    anchor: u64,
-    slices: Vec<BStackRange>,
-) -> io::Result<()> {
+fn wal_free_all<A: BStackRaiiAllocator>(allocator: &A, slices: Vec<BStackRange>) -> io::Result<()> {
     if slices.is_empty() {
         return Ok(());
     }
@@ -90,7 +85,7 @@ fn wal_free_all<A: BStackRaiiAllocator>(
     // before it abandons; after it, `finish` rolls the frees forward). With the
     // sink now cleared, `finish_at_locked` executes the frees and marks the
     // persistent WAL block idle for reuse.
-    let wal_range = persist_at(allocator, anchor, &log, WalStatus::Pending)?;
+    let wal_range = persist_at(allocator, &log, WalStatus::Pending)?;
     let flip = [WalStatus::Complete as u8];
     let mut done = false;
     allocator.stack().inplace_gen(|_feedback| {
@@ -107,7 +102,7 @@ fn wal_free_all<A: BStackRaiiAllocator>(
             })
         }
     })?;
-    finish_at_locked(allocator, anchor)?;
+    finish_at_locked(allocator)?;
     Ok(())
 }
 
@@ -118,10 +113,10 @@ fn wal_free_all<A: BStackRaiiAllocator>(
 /// `dealloc` — see [`dealloc_range`]. There is deliberately no `dealloc_range`
 /// method on the allocator trait itself.
 ///
-/// The allocator is bound to [`BStackOwnedSliceAllocator`] rather than the bare
-/// `BStackAllocator`: that supertrait pins `Allocated<'a> = BStackOwnedSlice<'a,
-/// A>` (so a reconstructed owned slice is the accepted `dealloc` handle) and
-/// `Error = io::Error` (so the layer speaks [`io::Result`]).
+/// The allocator is bound to the crate-wide [`BStackRaiiAllocator`], whose
+/// [`BStackOwnedSliceAllocator`] supertrait pins `Allocated<'a> =
+/// BStackOwnedSlice<'a, A>` (so a reconstructed owned slice is the accepted
+/// `dealloc` handle) and `Error = io::Error` (so the layer speaks [`io::Result`]).
 pub trait BStackDrop: Sized {
     fn bstack_drop<A: BStackRaiiAllocator>(self, allocator: &A) -> io::Result<()>;
 }
@@ -133,7 +128,7 @@ pub trait BStackDrop: Sized {
 /// # Safety
 /// `range` must be a live allocation owned by `allocator` that no other live
 /// handle will also free.
-pub unsafe fn dealloc_range<A: BStackOwnedSliceAllocator>(
+pub unsafe fn dealloc_range<A: BStackRaiiAllocator>(
     allocator: &A,
     range: BStackRange,
 ) -> io::Result<()> {

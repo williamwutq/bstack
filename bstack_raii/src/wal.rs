@@ -413,7 +413,7 @@ static WAL_LOCKS: OnceLock<Mutex<HashMap<usize, Arc<Mutex<()>>>>> = OnceLock::ne
 
 /// The WAL mutex for `allocator`'s file (created on first use). Hold its guard
 /// across a whole WAL transaction.
-pub(crate) fn wal_lock_for<A: BStackOwnedSliceAllocator>(allocator: &A) -> Arc<Mutex<()>> {
+pub(crate) fn wal_lock_for<A: BStackRaiiAllocator>(allocator: &A) -> Arc<Mutex<()>> {
     let key = core::ptr::from_ref(allocator.stack()) as usize;
     let reg = WAL_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut map = reg.lock().unwrap_or_else(|e| e.into_inner());
@@ -422,14 +422,16 @@ pub(crate) fn wal_lock_for<A: BStackOwnedSliceAllocator>(allocator: &A) -> Arc<M
         .clone()
 }
 
-/// Read the anchor slot: the persistent WAL block's offset, or `None` if one has
-/// not been created yet.
-fn read_anchor<A: BStackOwnedSliceAllocator>(
-    allocator: &A,
-    anchor: u64,
-) -> io::Result<Option<u64>> {
+/// Read the anchor slot: the persistent WAL block's offset, or `None` if the
+/// allocator opts out of reclamation ([`wal_anchor`](BStackRaiiAllocator::wal_anchor)
+/// is `None`) or no block has been created yet.
+fn read_anchor<A: BStackRaiiAllocator>(allocator: &A) -> io::Result<Option<u64>> {
+    let slot = match allocator.wal_anchor() {
+        Some(s) => s,
+        None => return Ok(None),
+    };
     let mut buf = [0u8; 8];
-    allocator.stack().get_into(anchor, &mut buf)?;
+    allocator.stack().get_into(slot, &mut buf)?;
     let off = u64::from_le_bytes(buf);
     Ok((off != 0).then_some(off))
 }
@@ -438,17 +440,17 @@ fn read_anchor<A: BStackOwnedSliceAllocator>(
 /// slots, returning `(block_offset, capacity)`. Lazily allocates it on first use;
 /// grows it (free old, allocate a larger one — its contents are transient between
 /// transactions) when a transaction needs more capacity. The header is
-/// (re)initialized `None` (idle) whenever the block is created or grown.
-fn wal_ensure_block<A: BStackOwnedSliceAllocator>(
-    allocator: &A,
-    anchor: u64,
-    needed: u64,
-) -> io::Result<(u64, u64)> {
+/// (re)initialized `None` (idle) whenever the block is created or grown. Errors if
+/// the allocator names no anchor slot (callers gate on `wal_anchor().is_some()`).
+fn wal_ensure_block<A: BStackRaiiAllocator>(allocator: &A, needed: u64) -> io::Result<(u64, u64)> {
+    let slot = allocator
+        .wal_anchor()
+        .ok_or_else(|| io::Error::other("allocator names no WAL anchor slot"))?;
     let stack = allocator.stack();
     let hsz = size_of::<WalHeader>() as u64;
     let esz = size_of::<WalEntry>() as u64;
 
-    if let Some(off) = read_anchor(allocator, anchor)? {
+    if let Some(off) = read_anchor(allocator)? {
         let mut hbuf = [0u8; size_of::<WalHeader>()];
         stack.get_into(off, &mut hbuf)?;
         let header: WalHeader = bytemuck::pod_read_unaligned(&hbuf);
@@ -477,20 +479,21 @@ fn wal_ensure_block<A: BStackOwnedSliceAllocator>(
         let _ = allocator.dealloc(slice);
         return Err(e);
     }
-    stack.set(anchor, off.to_le_bytes())?;
+    stack.set(slot, off.to_le_bytes())?;
     Ok((off, capacity))
 }
 
-/// Stage `log` into the persistent WAL block at transaction status `txn_status`,
-/// (lazily) creating or growing the block as needed. Returns the block's range.
-/// The caller must hold the file's WAL lock (the crate-internal `wal_lock_for`).
-pub fn persist_at<A: BStackOwnedSliceAllocator>(
+/// Stage `log` into the allocator's persistent WAL block at transaction status
+/// `txn_status`, (lazily) creating or growing the block as needed. Returns the
+/// block's range. The anchor slot comes from the allocator itself
+/// ([`wal_anchor`](BStackRaiiAllocator::wal_anchor)); the caller must hold the
+/// file's WAL lock (the crate-internal `wal_lock_for`).
+pub fn persist_at<A: BStackRaiiAllocator>(
     allocator: &A,
-    anchor: u64,
     log: &WalLog,
     txn_status: WalStatus,
 ) -> io::Result<BStackRange> {
-    let (off, capacity) = wal_ensure_block(allocator, anchor, log.entries().len() as u64)?;
+    let (off, capacity) = wal_ensure_block(allocator, log.entries().len() as u64)?;
     let image = log.block_image(txn_status, capacity);
     allocator.stack().set(off, &image)?;
     let hsz = size_of::<WalHeader>() as u64;
@@ -498,14 +501,14 @@ pub fn persist_at<A: BStackOwnedSliceAllocator>(
     Ok(BStackRange::new(off, hsz + capacity * esz))
 }
 
-/// Read the staged transaction in the persistent WAL block, if any. Returns the
-/// block range, header, and the `count` live entries; `None` if no block exists.
-fn load_at<A: BStackOwnedSliceAllocator>(
+/// Read the staged transaction in the allocator's persistent WAL block, if any.
+/// Returns the block range, header, and the `count` live entries; `None` if no
+/// block exists (or the allocator opts out of reclamation).
+fn load_at<A: BStackRaiiAllocator>(
     allocator: &A,
-    anchor: u64,
 ) -> io::Result<Option<(BStackRange, WalHeader, Vec<WalEntry>)>> {
     let stack = allocator.stack();
-    let wal_off = match read_anchor(allocator, anchor)? {
+    let wal_off = match read_anchor(allocator)? {
         Some(off) => off,
         None => return Ok(None),
     };
@@ -529,7 +532,7 @@ fn load_at<A: BStackOwnedSliceAllocator>(
 
 /// Mark the persistent WAL block idle (`txn_status := None`) — a transaction is
 /// complete and the block is free to reuse. The block itself is **not** freed.
-pub(crate) fn wal_set_idle<A: BStackOwnedSliceAllocator>(
+pub(crate) fn wal_set_idle<A: BStackRaiiAllocator>(
     allocator: &A,
     block_off: u64,
 ) -> io::Result<()> {
@@ -539,9 +542,10 @@ pub(crate) fn wal_set_idle<A: BStackOwnedSliceAllocator>(
         .set(block_off + 8, [WalStatus::None as u8])
 }
 
-/// **Complete** a staged transaction by reclaiming exactly the slices its outcome
-/// orphaned, then marking the block idle. Assumes the file's WAL lock is already
-/// held (used on the failure/recovery paths that run under the transaction lock).
+/// **Complete** the allocator's staged transaction by reclaiming exactly the
+/// slices its outcome orphaned, then marking the block idle. Assumes the file's
+/// WAL lock is already held (used on the failure/recovery paths that run under the
+/// transaction lock).
 ///
 /// * **Committed** (`txn_status == Complete`): roll forward — free each still-
 ///   `Pending` `Dealloc` (the old blocks the committed op unlinked).
@@ -551,11 +555,8 @@ pub(crate) fn wal_set_idle<A: BStackOwnedSliceAllocator>(
 /// Each freed entry is persisted `Complete` **before** its slice is freed, so a
 /// second crash mid-completion never double-frees. The persistent block is then
 /// marked idle (`None`) and kept for reuse. Returns the number of slices freed.
-pub(crate) fn finish_at_locked<A: BStackOwnedSliceAllocator>(
-    allocator: &A,
-    anchor: u64,
-) -> io::Result<usize> {
-    let (wal_range, header, entries) = match load_at(allocator, anchor)? {
+pub(crate) fn finish_at_locked<A: BStackRaiiAllocator>(allocator: &A) -> io::Result<usize> {
+    let (wal_range, header, entries) = match load_at(allocator)? {
         Some(x) => x,
         None => return Ok(0),
     };
@@ -595,24 +596,16 @@ pub(crate) fn finish_at_locked<A: BStackOwnedSliceAllocator>(
     Ok(completed)
 }
 
-/// **Complete** a crash-left transaction at `anchor`: reclaim the slices its
-/// outcome orphaned and mark the persistent block idle. Returns the number of
-/// slices reclaimed. This is what a caller runs once after `open` — a
-/// *completion*, not a leaky recovery. Acquires the file's WAL lock.
-pub fn finish_at<A: BStackOwnedSliceAllocator>(allocator: &A, anchor: u64) -> io::Result<usize> {
+/// **Complete** a crash-left transaction in the allocator's WAL block: reclaim the
+/// slices its outcome orphaned and mark the persistent block idle. Returns the
+/// number of slices reclaimed. This is what a caller runs once after `open` — a
+/// *completion*, not a leaky recovery. Acquires the file's WAL lock. An allocator
+/// that opts out of reclamation ([`wal_anchor`](BStackRaiiAllocator::wal_anchor)
+/// is `None`) has no WAL to complete, so this is a no-op returning `0`.
+pub fn finish<A: BStackRaiiAllocator>(allocator: &A) -> io::Result<usize> {
     let lock = wal_lock_for(allocator);
     let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-    finish_at_locked(allocator, anchor)
-}
-
-/// Like [`finish_at`], using the allocator's own [`BStackRaiiAllocator`] slot.
-/// An allocator that opts out of reclamation (`wal_anchor() == None`) has no WAL
-/// to complete, so this is a no-op returning `0`.
-pub fn finish<A: BStackRaiiAllocator>(allocator: &A) -> io::Result<usize> {
-    match allocator.wal_anchor() {
-        Some(anchor) => finish_at(allocator, anchor),
-        None => Ok(0),
-    }
+    finish_at_locked(allocator)
 }
 
 #[cfg(test)]
