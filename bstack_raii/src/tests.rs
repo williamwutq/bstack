@@ -17,8 +17,9 @@ use crate::{
     AutoDrop, BStackBTreeMap, BStackBTreeSet, BStackBinaryHeap, BStackBlock, BStackBlockVec,
     BStackBox, BStackCast, BStackCastAs, BStackCastInto, BStackCountingBloomFilter, BStackCow,
     BStackDeque, BStackDrop, BStackHashMap, BStackHashSet, BStackLinkedList, BStackOwned, BStackRc,
-    BStackRef, BStackShared, BStackString, BStackWeakable, EightCC, TryClone, TryCloneIn,
-    alloc_block, alloc_control, bstack_block, bstack_cast, bstack_enum, bstack_move, dealloc_range,
+    BStackRef, BStackShared, BStackString, BStackWalAnchor, BStackWeakable, EightCC, TryClone,
+    TryCloneIn, alloc_block, alloc_control, bstack_block, bstack_cast, bstack_enum, bstack_move,
+    dealloc_range,
 };
 
 // --------------------------------------------------------------------------
@@ -59,6 +60,29 @@ impl Drop for TempStack {
     }
 }
 
+/// Assert a WAL-backed teardown reclaims a whole structure with **no leak** —
+/// including any deeply-nested grandchildren, so it doubles as a recursion check
+/// (a non-recursive teardown would leak the grandchild's block).
+///
+/// `build` constructs the structure fresh each call. We build+tear down once to
+/// warm and size the persistent WAL block (which stays allocated by design), then
+/// measure the baseline, build+tear down the *identical* structure again, and
+/// assert the stack returned exactly to that baseline. Comparing two like cycles
+/// makes the constant WAL-block overhead cancel out, so only a real leak shows.
+fn assert_teardown_reclaims<T: BStackDrop>(
+    alloc: &FirstFitBStackAllocator,
+    mut build: impl FnMut() -> T,
+) {
+    build().bstack_drop(alloc).unwrap();
+    let base = alloc.stack().len().unwrap();
+    build().bstack_drop(alloc).unwrap();
+    assert_eq!(
+        alloc.stack().len().unwrap(),
+        base,
+        "teardown leaked (non-recursive?)"
+    );
+}
+
 // --------------------------------------------------------------------------
 // A hand-written `#[bstack_block(rc, weak)]`-shaped type with no children
 // --------------------------------------------------------------------------
@@ -93,7 +117,7 @@ impl BStackCast for TestBlock {
 }
 
 impl BStackDrop for TestBlock {
-    fn bstack_drop<A: BStackOwnedSliceAllocator>(self, allocator: &A) -> io::Result<()> {
+    fn bstack_drop<A: BStackWalAnchor>(self, allocator: &A) -> io::Result<()> {
         // No owned children: just free the data block itself.
         unsafe { dealloc_range(allocator, self.0) }
     }
@@ -325,26 +349,21 @@ fn macro_recursive_drop() {
     let leaf_size = size_of::<<MacroLeaf as BStackBlock>::OnDisk>() as u64;
     let parent_size = size_of::<<MacroParent as BStackBlock>::OnDisk>() as u64;
 
-    let leaf = alloc_block(&alloc, MacroLeaf::eightcc(), leaf_size).unwrap();
-    let parent = alloc_block(&alloc, MacroParent::eightcc(), parent_size).unwrap();
-    // Wire parent.child -> leaf (the first user field sits right after the header).
-    alloc
-        .stack()
-        .set(
-            parent.start() + layout::HEADER_SIZE,
-            leaf.start().to_le_bytes(),
-        )
-        .unwrap();
-
-    // Own the parent; freeing it must recursively free the child, then itself.
-    let owned = unsafe { BStackOwned::from_raw(<MacroParent as BStackBlock>::from_range(parent)) };
-    owned.bstack_drop(&alloc).unwrap();
-
-    // The child's slot (allocated first, so the lowest offset) is reclaimed —
-    // proof the generated `bstack_drop` recursed into the owned child.
-    let reused = alloc_block(&alloc, MacroLeaf::eightcc(), leaf_size).unwrap();
-    assert_eq!(reused.start(), leaf.start());
-    unsafe { dealloc_range(&alloc, reused).unwrap() };
+    // Freeing the owned parent must recursively free the wired child, then itself —
+    // proven by the whole structure being reclaimed with no leak.
+    assert_teardown_reclaims(&alloc, || {
+        let leaf = alloc_block(&alloc, MacroLeaf::eightcc(), leaf_size).unwrap();
+        let parent = alloc_block(&alloc, MacroParent::eightcc(), parent_size).unwrap();
+        // Wire parent.child -> leaf (the first user field sits right after the header).
+        alloc
+            .stack()
+            .set(
+                parent.start() + layout::HEADER_SIZE,
+                leaf.start().to_le_bytes(),
+            )
+            .unwrap();
+        unsafe { BStackOwned::from_raw(<MacroParent as BStackBlock>::from_range(parent)) }
+    });
 }
 
 // --------------------------------------------------------------------------
@@ -506,9 +525,23 @@ fn macro_strong_child() {
 
     // Release the keep-alive: strong -> 0 frees the child data + control block.
     MacroStrongChild::drop_strong_ref(unsafe { BStackRef::from_range(child) }, &alloc).unwrap();
-    let reused = alloc_block(&alloc, MacroStrongChild::eightcc(), child_data_size).unwrap();
-    assert_eq!(reused.start(), child.start());
-    unsafe { dealloc_range(&alloc, reused).unwrap() };
+    // The child's data slot is reclaimed. The parent teardown's persistent WAL
+    // block perturbs the free-list order, so the slot may not be handed back first;
+    // drain a few same-size allocations to confirm it reappears (all freed slots
+    // here are small, so none starves the batch).
+    let mut ranges = Vec::new();
+    let mut hit = false;
+    for _ in 0..8 {
+        let r = alloc_block(&alloc, MacroStrongChild::eightcc(), child_data_size).unwrap();
+        if r.start() == child.start() {
+            hit = true;
+        }
+        ranges.push(r);
+    }
+    for r in ranges {
+        unsafe { dealloc_range(&alloc, r).unwrap() };
+    }
+    assert!(hit, "child data slot was not reclaimed on strong -> 0");
 }
 
 // --------------------------------------------------------------------------
@@ -1209,7 +1242,6 @@ fn macro_owned_block_vec() {
         MacroLeaf::new(&alloc, 20).unwrap(),
         MacroLeaf::new(&alloc, 30).unwrap(),
     ];
-    let first_off = kids[0].handle().range().start(); // lowest allocation
     let tree = Tree::new(&alloc, kids, 7).unwrap();
     assert_eq!(tree.handle().label(stack).unwrap(), 7);
 
@@ -1226,17 +1258,17 @@ fn macro_owned_block_vec() {
     assert_eq!(v.get(1).unwrap().unwrap().val(stack).unwrap(), 20);
     assert!(v.get(3).unwrap().is_none());
 
-    // Freeing the tree recursively frees every owned child, plus the offset
-    // array and descriptor. The lowest child slot returns as proof.
+    // Freeing the tree recursively frees every owned child, plus the offset array
+    // and descriptor — reclaimed with no leak.
     tree.bstack_drop(&alloc).unwrap();
-    let reused = alloc_block(
-        &alloc,
-        MacroLeaf::eightcc(),
-        size_of::<<MacroLeaf as BStackBlock>::OnDisk>() as u64,
-    )
-    .unwrap();
-    assert_eq!(reused.start(), first_off);
-    unsafe { dealloc_range(&alloc, reused).unwrap() };
+    assert_teardown_reclaims(&alloc, || {
+        let kids = vec![
+            MacroLeaf::new(&alloc, 10).unwrap(),
+            MacroLeaf::new(&alloc, 20).unwrap(),
+            MacroLeaf::new(&alloc, 30).unwrap(),
+        ];
+        Tree::new(&alloc, kids, 7).unwrap()
+    });
 }
 
 #[test]
@@ -1646,10 +1678,8 @@ fn macro_enum_as_field() {
     let tmp = TempStack::new();
     let alloc = tmp.allocator();
     let stack = alloc.stack();
-    let leaf_size = size_of::<<MacroLeaf as BStackBlock>::OnDisk>() as u64;
 
     let leaf = MacroLeaf::new(&alloc, 5).unwrap();
-    let leaf_off = leaf.handle().range().start();
     let node = Node::new(&alloc, NodeData::Child(leaf)).unwrap();
     let holder = EnumHolder::new(&alloc, node, 3).unwrap();
     assert_eq!(holder.handle().tag(stack).unwrap(), 3);
@@ -1661,11 +1691,14 @@ fn macro_enum_as_field() {
         _ => panic!("expected Child"),
     }
 
-    // Freeing the struct recursively frees the enum and its owned child.
+    // Freeing the struct recursively frees the enum and its owned child —
+    // reclaimed with no leak.
     holder.bstack_drop(&alloc).unwrap();
-    let reused = alloc_block(&alloc, MacroLeaf::eightcc(), leaf_size).unwrap();
-    assert_eq!(reused.start(), leaf_off);
-    unsafe { dealloc_range(&alloc, reused).unwrap() };
+    assert_teardown_reclaims(&alloc, || {
+        let leaf = MacroLeaf::new(&alloc, 5).unwrap();
+        let node = Node::new(&alloc, NodeData::Child(leaf)).unwrap();
+        EnumHolder::new(&alloc, node, 3).unwrap()
+    });
 }
 
 // --------------------------------------------------------------------------
@@ -2311,11 +2344,9 @@ fn macro_embed_struct_and_enum() {
     let tmp = TempStack::new();
     let alloc = tmp.allocator();
     let stack = alloc.stack();
-    let leaf_size = size_of::<<MacroLeaf as BStackBlock>::OnDisk>() as u64;
 
     // Struct embed: parent -> embedded child -> the child's own owned leaf.
     let leaf = MacroLeaf::new(&alloc, 42).unwrap();
-    let leaf_off = leaf.handle().range().start();
     let child = EmbChild::new(&alloc, leaf, 7).unwrap();
     let holder = EmbHolder::new(&alloc, child, 99).unwrap();
     assert_eq!(holder.handle().tag(stack).unwrap(), 99);
@@ -2323,12 +2354,14 @@ fn macro_embed_struct_and_enum() {
     assert_eq!(c.n(stack).unwrap(), 7);
     assert_eq!(c.leaf(stack).unwrap().val(stack).unwrap(), 42);
 
-    // Teardown frees the embedded child's owned leaf *in place*, then the holder;
-    // the leaf's slot (lowest) is reclaimed — proof the embed recursed.
+    // Teardown frees the embedded child's owned leaf *in place*, then the holder —
+    // reclaimed with no leak (proof the embed recursed).
     holder.bstack_drop(&alloc).unwrap();
-    let reused = alloc_block(&alloc, MacroLeaf::eightcc(), leaf_size).unwrap();
-    assert_eq!(reused.start(), leaf_off);
-    unsafe { dealloc_range(&alloc, reused).unwrap() };
+    assert_teardown_reclaims(&alloc, || {
+        let leaf = MacroLeaf::new(&alloc, 42).unwrap();
+        let child = EmbChild::new(&alloc, leaf, 7).unwrap();
+        EmbHolder::new(&alloc, child, 99).unwrap()
+    });
 
     // bstack_move! re-homes the embedded child to a fresh standalone allocation.
     let leaf = MacroLeaf::new(&alloc, 5).unwrap();
@@ -2428,8 +2461,10 @@ fn wal_finish_rolls_forward_committed() {
 
     let tmp = TempStack::new();
     let alloc = tmp.allocator();
-    // A stable anchor slot, plus two "old" slices the transaction was freeing.
+    // A stable anchor slot (zeroed = "no WAL block yet"), plus two "old" slices
+    // the transaction was freeing.
     let anchor = alloc.alloc(8).unwrap().as_range().start();
+    alloc.stack().set(anchor, 0u64.to_le_bytes()).unwrap();
     let v1 = alloc.alloc(64).unwrap().as_range();
     let v2 = alloc.alloc(64).unwrap().as_range();
 
@@ -2442,10 +2477,9 @@ fn wal_finish_rolls_forward_committed() {
     // Completing it rolls both deallocs forward.
     assert_eq!(finish_at(&alloc, anchor).unwrap(), 2);
 
-    // Anchor cleared, and v1/v2 reclaimed (a fresh 64-byte alloc reuses a slot).
-    let mut buf = [0u8; 8];
-    alloc.stack().get_into(anchor, &mut buf).unwrap();
-    assert_eq!(u64::from_le_bytes(buf), 0);
+    // The persistent WAL block is now idle: re-completing finds nothing staged.
+    // v1/v2 were reclaimed (a fresh 64-byte alloc reuses a freed slot).
+    assert_eq!(finish_at(&alloc, anchor).unwrap(), 0);
     let reused = alloc.alloc(64).unwrap().as_range();
     assert!(reused.start() == v1.start() || reused.start() == v2.start());
 }
@@ -2458,6 +2492,7 @@ fn wal_finish_abandons_uncommitted() {
     let tmp = TempStack::new();
     let alloc = tmp.allocator();
     let anchor = alloc.alloc(8).unwrap().as_range().start();
+    alloc.stack().set(anchor, 0u64.to_le_bytes()).unwrap();
     let v1 = alloc.alloc(64).unwrap().as_range();
 
     // An UNCOMMITTED transaction: its dealloc must NOT be performed.
@@ -2468,9 +2503,8 @@ fn wal_finish_abandons_uncommitted() {
     // Abandoned: the old slice v1 must NOT be freed (it's still live). Reclaiming
     // an abandoned txn frees its *allocs*, and this txn logged only a dealloc.
     assert_eq!(finish_at(&alloc, anchor).unwrap(), 0);
-    let mut buf = [0u8; 8];
-    alloc.stack().get_into(anchor, &mut buf).unwrap();
-    assert_eq!(u64::from_le_bytes(buf), 0);
+    // Idle after completion: re-running finds nothing staged.
+    assert_eq!(finish_at(&alloc, anchor).unwrap(), 0);
 }
 
 #[test]
@@ -2486,7 +2520,7 @@ fn wal_anchor_trait_reclaims_via_finish() {
     // Persist an abandoned (Pending) txn into the allocator's own anchor slot.
     let mut log = WalLog::with_capacity(1);
     log.append(WalEntry::alloc(WalStatus::Pending, orphan));
-    persist_at(&alloc, alloc.wal_anchor(), &log, WalStatus::Pending).unwrap();
+    persist_at(&alloc, alloc.wal_anchor().unwrap(), &log, WalStatus::Pending).unwrap();
 
     // finish() uses the trait anchor and reclaims the orphan; the allocator is
     // unharmed by our writes to its reserved slot (a fresh alloc reuses it).
@@ -2502,6 +2536,7 @@ fn wal_finish_reclaims_abandoned_allocs() {
     let tmp = TempStack::new();
     let alloc = tmp.allocator();
     let anchor = alloc.alloc(8).unwrap().as_range().start();
+    alloc.stack().set(anchor, 0u64.to_le_bytes()).unwrap();
     // Two blocks a crashed op allocated but never linked (orphans).
     let a1 = alloc.alloc(64).unwrap().as_range();
     let a2 = alloc.alloc(64).unwrap().as_range();
@@ -2520,6 +2555,7 @@ fn wal_finish_reclaims_abandoned_allocs() {
 
     // A *committed* alloc-only txn keeps its allocs (frees nothing).
     let anchor2 = alloc.alloc(8).unwrap().as_range().start();
+    alloc.stack().set(anchor2, 0u64.to_le_bytes()).unwrap();
     let keep = alloc.alloc(64).unwrap().as_range();
     let mut log2 = WalLog::with_capacity(1);
     log2.append(WalEntry::alloc(WalStatus::Pending, keep));
@@ -2560,12 +2596,10 @@ fn macro_owned_array() {
     let tmp = TempStack::new();
     let alloc = tmp.allocator();
     let stack = alloc.stack();
-    let leaf_size = size_of::<<MacroLeaf as BStackBlock>::OnDisk>() as u64;
 
     let l0 = MacroLeaf::new(&alloc, 10).unwrap();
     let l1 = MacroLeaf::new(&alloc, 20).unwrap();
     let l2 = MacroLeaf::new(&alloc, 30).unwrap();
-    let off0 = l0.handle().range().start();
 
     let h = ArrHolder::new(&alloc, [l0, l1, l2], 7).unwrap();
     assert_eq!(h.handle().tag(stack).unwrap(), 7);
@@ -2574,11 +2608,14 @@ fn macro_owned_array() {
     assert_eq!(arr[1].val(stack).unwrap(), 20);
     assert_eq!(arr[2].val(stack).unwrap(), 30);
 
-    // Teardown frees all three inline children; the lowest slot (l0) is reclaimed.
+    // Teardown frees all three inline children — reclaimed with no leak.
     h.bstack_drop(&alloc).unwrap();
-    let reused = alloc_block(&alloc, MacroLeaf::eightcc(), leaf_size).unwrap();
-    assert_eq!(reused.start(), off0);
-    unsafe { dealloc_range(&alloc, reused).unwrap() };
+    assert_teardown_reclaims(&alloc, || {
+        let l0 = MacroLeaf::new(&alloc, 10).unwrap();
+        let l1 = MacroLeaf::new(&alloc, 20).unwrap();
+        let l2 = MacroLeaf::new(&alloc, 30).unwrap();
+        ArrHolder::new(&alloc, [l0, l1, l2], 7).unwrap()
+    });
 }
 
 #[test]
@@ -4008,7 +4045,6 @@ fn macro_generic_owned_box() {
     let stack = alloc.stack();
 
     let leaf = MacroLeaf::new(&alloc, 42).unwrap();
-    let leaf_off = leaf.handle().range().start();
     let b = OwnedBox::<MacroLeaf>::new(&alloc, leaf, 7).unwrap();
     assert_eq!(b.handle().tag(stack).unwrap(), 7);
     assert_eq!(b.handle().item(stack).unwrap().val(stack).unwrap(), 42);
@@ -4025,12 +4061,12 @@ fn macro_generic_owned_box() {
     // Original child survives the clone's teardown.
     assert_eq!(b.handle().item(stack).unwrap().val(stack).unwrap(), 42);
 
-    // Dropping the box frees its owned child; the slot is reclaimable.
+    // Dropping the box frees its owned child — reclaimed with no leak.
     b.bstack_drop(&alloc).unwrap();
-    let leaf_size = size_of::<<MacroLeaf as BStackBlock>::OnDisk>() as u64;
-    let reused = alloc_block(&alloc, MacroLeaf::eightcc(), leaf_size).unwrap();
-    assert_eq!(reused.start(), leaf_off);
-    unsafe { dealloc_range(&alloc, reused).unwrap() };
+    assert_teardown_reclaims(&alloc, || {
+        let leaf = MacroLeaf::new(&alloc, 42).unwrap();
+        OwnedBox::<MacroLeaf>::new(&alloc, leaf, 7).unwrap()
+    });
 }
 
 #[bstack_block]
@@ -4639,19 +4675,15 @@ fn stdlib_list_drop_is_recursive() {
     let alloc = tmp.allocator();
 
     // A value type that itself owns a child, to prove teardown recurses through
-    // the node's single value ref into the value's own children.
-    let leaf = MacroLeaf::new(&alloc, 10).unwrap();
-    let leaf_start = leaf.handle().range().start();
-    let parent = MacroParent::new(&alloc, leaf, 1).unwrap();
-
-    let list = BStackLinkedList::<MacroParent>::new(&alloc).unwrap();
-    list.push_back(&alloc, parent).unwrap();
-    list.bstack_drop(&alloc).unwrap();
-
-    // The leaf (a grandchild, freed only via full recursion) slot is reclaimed.
-    let reused = MacroLeaf::new(&alloc, 0).unwrap();
-    assert_eq!(reused.handle().range().start(), leaf_start);
-    reused.bstack_drop(&alloc).unwrap();
+    // the node's single value ref into the value's own children (a non-recursive
+    // teardown would leak the MacroLeaf grandchild).
+    assert_teardown_reclaims(&alloc, || {
+        let leaf = MacroLeaf::new(&alloc, 10).unwrap();
+        let parent = MacroParent::new(&alloc, leaf, 1).unwrap();
+        let list = BStackLinkedList::<MacroParent>::new(&alloc).unwrap();
+        list.push_back(&alloc, parent).unwrap();
+        list
+    });
 }
 
 #[test]
@@ -4859,18 +4891,14 @@ fn stdlib_deque_drop_is_recursive() {
     let tmp = TempStack::new();
     let alloc = tmp.allocator();
 
-    let leaf = MacroLeaf::new(&alloc, 10).unwrap();
-    let leaf_start = leaf.handle().range().start();
-    let parent = MacroParent::new(&alloc, leaf, 1).unwrap();
-
-    let dq = BStackDeque::<MacroParent>::new(&alloc).unwrap();
-    dq.push_back(&alloc, parent).unwrap();
-    dq.bstack_drop(&alloc).unwrap();
-
-    // The leaf grandchild's slot is reclaimed — full recursion through the ring.
-    let reused = MacroLeaf::new(&alloc, 0).unwrap();
-    assert_eq!(reused.handle().range().start(), leaf_start);
-    reused.bstack_drop(&alloc).unwrap();
+    // Full recursion through the ring must free the MacroLeaf grandchild too.
+    assert_teardown_reclaims(&alloc, || {
+        let leaf = MacroLeaf::new(&alloc, 10).unwrap();
+        let parent = MacroParent::new(&alloc, leaf, 1).unwrap();
+        let dq = BStackDeque::<MacroParent>::new(&alloc).unwrap();
+        dq.push_back(&alloc, parent).unwrap();
+        dq
+    });
 }
 
 #[test]
@@ -5107,18 +5135,14 @@ fn stdlib_map_drop_is_recursive() {
     let tmp = TempStack::new();
     let alloc = tmp.allocator();
 
-    let leaf = MacroLeaf::new(&alloc, 10).unwrap();
-    let leaf_start = leaf.handle().range().start();
-    let parent = MacroParent::new(&alloc, leaf, 1).unwrap();
-
-    let map = BStackHashMap::<u32, MacroParent>::new(&alloc).unwrap();
-    map.insert(&alloc, 42, parent).unwrap();
-    map.bstack_drop(&alloc).unwrap();
-
-    // The leaf grandchild's slot is reclaimed — full recursion through a value.
-    let reused = MacroLeaf::new(&alloc, 0).unwrap();
-    assert_eq!(reused.handle().range().start(), leaf_start);
-    reused.bstack_drop(&alloc).unwrap();
+    // Full recursion through a stored value must free the MacroLeaf grandchild.
+    assert_teardown_reclaims(&alloc, || {
+        let leaf = MacroLeaf::new(&alloc, 10).unwrap();
+        let parent = MacroParent::new(&alloc, leaf, 1).unwrap();
+        let map = BStackHashMap::<u32, MacroParent>::new(&alloc).unwrap();
+        map.insert(&alloc, 42, parent).unwrap();
+        map
+    });
 }
 
 #[test]
@@ -5280,18 +5304,14 @@ fn stdlib_tree_drop_is_recursive() {
     let tmp = TempStack::new();
     let alloc = tmp.allocator();
 
-    let leaf = MacroLeaf::new(&alloc, 10).unwrap();
-    let leaf_start = leaf.handle().range().start();
-    let parent = MacroParent::new(&alloc, leaf, 1).unwrap();
-
-    let tree = BStackBTreeMap::<u32, MacroParent>::new(&alloc).unwrap();
-    tree.insert(&alloc, 42, parent).unwrap();
-    tree.bstack_drop(&alloc).unwrap();
-
-    // The leaf grandchild's slot is reclaimed — full recursion through a value.
-    let reused = MacroLeaf::new(&alloc, 0).unwrap();
-    assert_eq!(reused.handle().range().start(), leaf_start);
-    reused.bstack_drop(&alloc).unwrap();
+    // Full recursion through a stored value must free the MacroLeaf grandchild.
+    assert_teardown_reclaims(&alloc, || {
+        let leaf = MacroLeaf::new(&alloc, 10).unwrap();
+        let parent = MacroParent::new(&alloc, leaf, 1).unwrap();
+        let tree = BStackBTreeMap::<u32, MacroParent>::new(&alloc).unwrap();
+        tree.insert(&alloc, 42, parent).unwrap();
+        tree
+    });
 }
 
 #[test]
@@ -6004,18 +6024,14 @@ fn stdlib_heap_drop_is_recursive() {
     let tmp = TempStack::new();
     let alloc = tmp.allocator();
 
-    let leaf = MacroLeaf::new(&alloc, 10).unwrap();
-    let leaf_start = leaf.handle().range().start();
-    let parent = MacroParent::new(&alloc, leaf, 1).unwrap();
-
-    let heap = BStackBinaryHeap::<u32, MacroParent>::new(&alloc).unwrap();
-    heap.push(&alloc, 5, parent).unwrap();
-    heap.bstack_drop(&alloc).unwrap();
-
-    // The leaf grandchild's slot is reclaimed — full recursion through a value.
-    let reused = MacroLeaf::new(&alloc, 0).unwrap();
-    assert_eq!(reused.handle().range().start(), leaf_start);
-    reused.bstack_drop(&alloc).unwrap();
+    // Full recursion through a stored value must free the MacroLeaf grandchild.
+    assert_teardown_reclaims(&alloc, || {
+        let leaf = MacroLeaf::new(&alloc, 10).unwrap();
+        let parent = MacroParent::new(&alloc, leaf, 1).unwrap();
+        let heap = BStackBinaryHeap::<u32, MacroParent>::new(&alloc).unwrap();
+        heap.push(&alloc, 5, parent).unwrap();
+        heap
+    });
 }
 
 #[test]
@@ -6329,7 +6345,9 @@ fn wal_clone_reclaims_orphans_on_commit_fault() {
     let mut prev: Option<u64> = None;
     for i in 0..30 {
         stack.set_fault_policy(Some(Arc::new(FailFirstInplaceGen(AtomicBool::new(false)))));
-        let r = crate::wal_clone_in(src.handle(), &alloc);
+        // Automatic WAL: `try_clone_in` on an anchored allocator (FirstFit) logs
+        // and reclaims its orphans with no separate opt-in call.
+        let r = src.try_clone_in(&alloc);
         stack.set_fault_policy(None);
         assert!(r.is_err(), "injected fault must fail the clone commit");
         let len = stack.len().unwrap();
@@ -6390,6 +6408,10 @@ fn wal_teardown_reclaims_on_free_fault() {
         list
     };
 
+    // Warm the persistent WAL block with one clean WAL-backed teardown, so `peak`
+    // already accounts for it (it is allocated once and reused, never per-txn).
+    build(&alloc).bstack_drop(&alloc).unwrap();
+
     let list1 = build(&alloc);
     let peak = stack.len().unwrap();
 
@@ -6398,7 +6420,9 @@ fn wal_teardown_reclaims_on_free_fault() {
         committed: AtomicBool::new(false),
         fired: AtomicBool::new(false),
     })));
-    let r = crate::wal_drop(list1, &alloc);
+    // Automatic WAL: `bstack_drop` on the owned handle runs the WAL-backed
+    // teardown (via `BStackOwned::bstack_drop` → `wal_teardown`) with no opt-in.
+    let r = list1.bstack_drop(&alloc);
     stack.set_fault_policy(None);
     assert!(r.is_err(), "the injected fault must interrupt the teardown");
 
@@ -6417,3 +6441,4 @@ fn wal_teardown_reclaims_on_free_fault() {
     );
     list2.bstack_drop(&alloc).unwrap();
 }
+
