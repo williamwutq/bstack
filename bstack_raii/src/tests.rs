@@ -7188,6 +7188,137 @@ fn macro_foreign_strong_teardown_frees_at_zero_across_files() {
 }
 
 #[test]
+fn macro_foreign_concurrent_ab_ba_teardown() {
+    // The AB-BA stress: objects on file A own targets on file B, objects on B own
+    // targets on A, and BOTH directions are torn down concurrently. This is the
+    // cross-file analogue of the same-file concurrent-teardown race that the WAL
+    // mutex was introduced to fix. It exercises the whole cross-file teardown
+    // locking story — each teardown's WAL transaction on its *home* file (per-file
+    // mutex) + the registry read lock + plain `dealloc`s into the *other* file — for
+    // deadlock, double-free, and FirstFit free-list corruption. Completion (no hang)
+    // ⇒ no deadlock; full reclamation each round ⇒ no leak / no double-free.
+    use crate::Foreign;
+    use crate::registry;
+    use std::sync::Arc;
+    use std::thread;
+
+    let fa = TempStack::new();
+    let fb = TempStack::new();
+    // One allocator per file, shared as an `Arc` between direct home teardowns
+    // (`&**arc`) and the registry's cross-file resolution — the SAME instance on both
+    // sides, so there is no illegal double-open of a file.
+    let arc_a = Arc::new(fa.allocator());
+    let arc_b = Arc::new(fb.allocator());
+
+    let reg_file = TempStack::new();
+    let _ = registry::init(&reg_file.path);
+    let reg = registry::get().unwrap();
+    let fid_a = reg.attach(&fa.path, arc_a.clone()).unwrap();
+    let fid_b = reg.attach(&fb.path, arc_b.clone()).unwrap();
+
+    // Warm + size both persistent WAL blocks (one holder each way), so the reclaimed
+    // baseline already accounts for them; then record it.
+    {
+        let bl = MacroLeaf::new(&*arc_b, 1).unwrap();
+        ForeignHolder::new(
+            &*arc_a,
+            0,
+            Foreign::<MacroLeaf>::new(fid_b, bl.handle().range().start()),
+            None,
+        )
+        .unwrap()
+        .bstack_drop(&*arc_a)
+        .unwrap();
+        let al = MacroLeaf::new(&*arc_a, 1).unwrap();
+        ForeignHolder::new(
+            &*arc_b,
+            0,
+            Foreign::<MacroLeaf>::new(fid_a, al.handle().range().start()),
+            None,
+        )
+        .unwrap()
+        .bstack_drop(&*arc_b)
+        .unwrap();
+    }
+    let base_a = arc_a.stack().len().unwrap();
+    let base_b = arc_b.stack().len().unwrap();
+
+    const N: usize = 48;
+    const ROUNDS: usize = 3;
+    const THREADS: usize = 4;
+    for _ in 0..ROUNDS {
+        // N A-holders (each owns a DISTINCT leaf on B) + N B-holders (each a distinct
+        // leaf on A). Distinct objects ⇒ disjoint free sets across the two directions.
+        let mut a_holders = Vec::with_capacity(N);
+        let mut b_holders = Vec::with_capacity(N);
+        for i in 0..N as u32 {
+            let bl = MacroLeaf::new(&*arc_b, i).unwrap();
+            a_holders.push(
+                ForeignHolder::new(
+                    &*arc_a,
+                    i,
+                    Foreign::<MacroLeaf>::new(fid_b, bl.handle().range().start()),
+                    None,
+                )
+                .unwrap()
+                .into_inner(),
+            );
+            let al = MacroLeaf::new(&*arc_a, i).unwrap();
+            b_holders.push(
+                ForeignHolder::new(
+                    &*arc_b,
+                    i,
+                    Foreign::<MacroLeaf>::new(fid_a, al.handle().range().start()),
+                    None,
+                )
+                .unwrap()
+                .into_inner(),
+            );
+        }
+
+        // Tear both directions down at once: A-holder threads free into B while
+        // B-holder threads free into A — the AB-BA contention.
+        let chunk = N.div_ceil(THREADS);
+        thread::scope(|s| {
+            let arc_a = &arc_a;
+            let arc_b = &arc_b;
+            for part in a_holders.chunks(chunk) {
+                let part = part.to_vec();
+                s.spawn(move || {
+                    for h in part {
+                        h.bstack_drop(&**arc_a).unwrap();
+                    }
+                });
+            }
+            for part in b_holders.chunks(chunk) {
+                let part = part.to_vec();
+                s.spawn(move || {
+                    for h in part {
+                        h.bstack_drop(&**arc_b).unwrap();
+                    }
+                });
+            }
+        });
+
+        // Both files returned exactly to baseline: every holder shell AND every
+        // cross-file target was reclaimed, with no leak and no corruption.
+        assert_eq!(
+            arc_a.stack().len().unwrap(),
+            base_a,
+            "file A not fully reclaimed after concurrent AB-BA teardown"
+        );
+        assert_eq!(
+            arc_b.stack().len().unwrap(),
+            base_b,
+            "file B not fully reclaimed after concurrent AB-BA teardown"
+        );
+    }
+
+    reg.detach(fid_a);
+    reg.detach(fid_b);
+}
+
+#[test]
 fn foreign_reverse_map_and_bstack_cast() {
     use crate::registry::{FileId, FileRegistry};
     use crate::{BStackRef, Foreign};
