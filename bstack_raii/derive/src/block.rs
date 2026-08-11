@@ -1640,13 +1640,47 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         }
 
         // Accessor: the `get_<field>` reader, the unsafe `raw_<field>_slice` place,
-        // and — for `#[bstack_mut]` POD / `#[bstack_ref]` fields — a `set_<field>`.
+        // and — for `#[bstack_mut]` fields — a `set_<field>` (POD/ref) and/or
+        // `replace_<field>` (owned/strong/ref).
         accessors.push(accessor(vis, fname, inner_ty, &on_disk_ty, kind, nullable));
         accessors.push(raw_slice_accessor(vis, fname, inner_ty, &on_disk_ty, kind));
         if is_bstack_mut(&field.attrs) {
             match kind {
-                Kind::Pod | Kind::Ref => {
+                // POD: overwrite in place.
+                Kind::Pod => {
                     accessors.push(set_accessor(
+                        vis,
+                        fname,
+                        inner_ty,
+                        &on_disk_ty,
+                        kind,
+                        nullable,
+                    ));
+                }
+                // Ref is the only kind with BOTH: `set_` (overwrite; a ref owns
+                // nothing) and `replace_` (swap, handing the old ref back).
+                Kind::Ref => {
+                    accessors.push(set_accessor(
+                        vis,
+                        fname,
+                        inner_ty,
+                        &on_disk_ty,
+                        kind,
+                        nullable,
+                    ));
+                    accessors.push(replace_accessor(
+                        vis,
+                        fname,
+                        inner_ty,
+                        &on_disk_ty,
+                        kind,
+                        nullable,
+                    ));
+                }
+                // Owned / strong: only `replace_` — a plain `set_` would strand the
+                // old owned block / strong count; `replace_` moves it out instead.
+                Kind::Owned | Kind::Strong => {
+                    accessors.push(replace_accessor(
                         vis,
                         fname,
                         inner_ty,
@@ -1657,10 +1691,10 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                 }
                 // Weak fields already have a `set_<field>` (the weak setter).
                 Kind::Weak => {}
-                Kind::Owned | Kind::Strong | Kind::Embed => {
+                Kind::Embed => {
                     return Err(Error::new_spanned(
                         field,
-                        "#[bstack_mut] is currently only supported on POD and #[bstack_ref] fields",
+                        "#[bstack_mut] is not yet supported on #[embed] fields",
                     ));
                 }
             }
@@ -2964,6 +2998,186 @@ fn set_accessor(
         },
         // Only POD / ref reach here (the caller filters).
         _ => quote!(),
+    }
+}
+
+/// The `replace_<field>` mutator for ownership-bearing fields: install `value` and
+/// **move the previous value out** to the caller (`mem::replace` semantics), so the
+/// old target is neither leaked nor silently freed — the caller owns it and decides
+/// its fate. The swap itself is one crash-atomic `set` of the field's `u64` offset
+/// slot; the old value is then reconstructed from the offset it held (exactly as
+/// `bstack_move!` does). Generated for `#[bstack_mut]`
+/// `#[bstack_owned]`/`#[bstack_strong]`/`#[bstack_ref]` fields (a ref *also* gets
+/// `set_<field>`; owned/strong get only `replace_<field>`, since their old value
+/// must not be dropped on the floor).
+fn replace_accessor(
+    vis: &syn::Visibility,
+    fname: &Ident,
+    inner_ty: &Type,
+    on_disk: &TokenStream,
+    kind: Kind,
+    nullable: bool,
+) -> TokenStream {
+    let name = format_ident!("replace_{}", fname);
+    let off = quote!(self.0.start() + ::core::mem::offset_of!(#on_disk, #fname) as u64);
+    let size_od =
+        quote!(::core::mem::size_of::<<#inner_ty as ::bstack_raii::BStackBlock>::OnDisk>() as u64);
+
+    match kind {
+        // Owned / ref reconstruct the old handle from just the offset — no allocator
+        // needed — so they take `&BStack` (like their getter/setter).
+        Kind::Owned => {
+            let handle_ty = quote!(::bstack_raii::BStackOwned<#inner_ty>);
+            let new_off = quote!({
+                let __h = __value.into_inner();
+                ::bstack_raii::BStackBlock::range(&__h).start()
+            });
+            let recon = quote!(unsafe {
+                ::bstack_raii::BStackOwned::from_raw(
+                    <#inner_ty as ::bstack_raii::BStackBlock>::from_range(
+                        ::bstack_raii::BStackRange::new(__old_off, #size_od),
+                    ),
+                )
+            });
+            replace_stack_method(vis, &name, &handle_ty, &off, &new_off, &recon, nullable)
+        }
+        Kind::Ref => {
+            let handle_ty = quote!(::bstack_raii::BStackRef<#inner_ty>);
+            let new_off = quote!(__value.into_range().start());
+            let recon = quote!(unsafe {
+                ::bstack_raii::BStackRef::<#inner_ty>::from_range(
+                    ::bstack_raii::BStackRange::new(__old_off, #size_od),
+                )
+            });
+            replace_stack_method(vis, &name, &handle_ty, &off, &new_off, &recon, nullable)
+        }
+        // Strong reconstructs a `BStackRc` (and the new value's count is transferred
+        // via `into_raw`), which needs the allocator — so it takes `&A`.
+        Kind::Strong => {
+            let handle_ty = quote!(::bstack_raii::BStackRc<'__r, #inner_ty, __A>);
+            let new_off = quote!({
+                let (__d, _) = __value.into_raw();
+                __d.into_range().start()
+            });
+            // Reconstruct the old strong ref from its data offset (transfers the
+            // existing count out; dropping the returned `BStackRc` decrements).
+            let recon = quote! {
+                {
+                    let __data = unsafe {
+                        ::bstack_raii::BStackRef::<#inner_ty>::from_range(
+                            ::bstack_raii::BStackRange::new(__old_off, #size_od),
+                        )
+                    };
+                    let (__d, __c) =
+                        <#inner_ty as ::bstack_raii::BStackShared>::strong_parts(__data, allocator)?;
+                    unsafe { ::bstack_raii::BStackRc::from_raw(__d, __c, allocator) }
+                }
+            };
+            if nullable {
+                quote! {
+                    /// Install `value` and move the previous value out (`None` = the
+                    /// `0` null niche).
+                    #vis fn #name<'__r, __A: ::bstack_raii::BStackRaiiAllocator>(
+                        &self,
+                        allocator: &'__r __A,
+                        value: ::core::option::Option<#handle_ty>,
+                    ) -> ::std::io::Result<::core::option::Option<#handle_ty>> {
+                        let __off = #off;
+                        let __new: u64 = match value {
+                            ::core::option::Option::Some(__value) => #new_off,
+                            ::core::option::Option::None => 0u64,
+                        };
+                        let __stack = allocator.stack();
+                        let mut __b = [0u8; 8];
+                        __stack.get_into(__off, &mut __b)?;
+                        let __old_off = u64::from_le_bytes(__b);
+                        __stack.set(__off, __new.to_le_bytes())?;
+                        if __old_off == 0 {
+                            ::std::result::Result::Ok(::core::option::Option::None)
+                        } else {
+                            ::std::result::Result::Ok(::core::option::Option::Some(#recon))
+                        }
+                    }
+                }
+            } else {
+                quote! {
+                    /// Install `value` and move the previous value out to the caller.
+                    #vis fn #name<'__r, __A: ::bstack_raii::BStackRaiiAllocator>(
+                        &self,
+                        allocator: &'__r __A,
+                        value: #handle_ty,
+                    ) -> ::std::io::Result<#handle_ty> {
+                        let __off = #off;
+                        let __new: u64 = { let __value = value; #new_off };
+                        let __stack = allocator.stack();
+                        let mut __b = [0u8; 8];
+                        __stack.get_into(__off, &mut __b)?;
+                        let __old_off = u64::from_le_bytes(__b);
+                        __stack.set(__off, __new.to_le_bytes())?;
+                        ::std::result::Result::Ok(#recon)
+                    }
+                }
+            }
+        }
+        // pod/weak/embed do not get `replace_<field>`.
+        _ => quote!(),
+    }
+}
+
+/// The `&BStack`-based body shared by owned/ref `replace_<field>`: read the old
+/// offset, commit the new one with a single atomic `set`, then reconstruct and
+/// return the old handle. `new_off`/`recon` reference `__value` / `__old_off`.
+fn replace_stack_method(
+    vis: &syn::Visibility,
+    name: &Ident,
+    handle_ty: &TokenStream,
+    off: &TokenStream,
+    new_off: &TokenStream,
+    recon: &TokenStream,
+    nullable: bool,
+) -> TokenStream {
+    if nullable {
+        quote! {
+            /// Install `value` and move the previous value out (`None` = the `0`
+            /// null niche).
+            #vis fn #name(
+                &self,
+                stack: &::bstack_raii::BStack,
+                value: ::core::option::Option<#handle_ty>,
+            ) -> ::std::io::Result<::core::option::Option<#handle_ty>> {
+                let __off = #off;
+                let __new: u64 = match value {
+                    ::core::option::Option::Some(__value) => #new_off,
+                    ::core::option::Option::None => 0u64,
+                };
+                let mut __b = [0u8; 8];
+                stack.get_into(__off, &mut __b)?;
+                let __old_off = u64::from_le_bytes(__b);
+                stack.set(__off, __new.to_le_bytes())?;
+                if __old_off == 0 {
+                    ::std::result::Result::Ok(::core::option::Option::None)
+                } else {
+                    ::std::result::Result::Ok(::core::option::Option::Some(#recon))
+                }
+            }
+        }
+    } else {
+        quote! {
+            /// Install `value` and move the previous value out to the caller.
+            #vis fn #name(
+                &self,
+                stack: &::bstack_raii::BStack,
+                value: #handle_ty,
+            ) -> ::std::io::Result<#handle_ty> {
+                let __off = #off;
+                let __new: u64 = { let __value = value; #new_off };
+                let mut __b = [0u8; 8];
+                stack.get_into(__off, &mut __b)?;
+                let __old_off = u64::from_le_bytes(__b);
+                stack.set(__off, __new.to_le_bytes())?;
+                ::std::result::Result::Ok(#recon)
+            }
+        }
     }
 }
 

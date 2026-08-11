@@ -6776,3 +6776,127 @@ fn macro_bstack_mut_ref_repoints() {
     a.bstack_drop(&alloc).unwrap();
     c.bstack_drop(&alloc).unwrap();
 }
+
+#[bstack_block]
+struct MutOwned {
+    #[bstack_mut]
+    #[bstack_owned]
+    child: MacroLeaf,
+}
+
+#[bstack_block]
+struct MutStrong {
+    #[bstack_mut]
+    #[bstack_strong]
+    s: MacroStrongChild,
+}
+
+#[test]
+fn macro_bstack_mut_ref_replace_returns_old() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let a = MacroLeaf::new(&alloc, 111).unwrap();
+    let c = MacroLeaf::new(&alloc, 222).unwrap();
+
+    let holder = MutRef::new(&alloc, unsafe { BStackRef::from_range(a.handle().range()) }).unwrap();
+
+    // `replace_` installs `c` and hands the old ref (→ a) back.
+    let old = holder
+        .handle()
+        .replace_target(stack, unsafe { BStackRef::from_range(c.handle().range()) })
+        .unwrap();
+    assert_eq!(
+        holder
+            .handle()
+            .get_target(stack)
+            .unwrap()
+            .get_val(stack)
+            .unwrap(),
+        222
+    );
+    let old_leaf = <MacroLeaf as BStackBlock>::from_range(old.into_range());
+    assert_eq!(old_leaf.get_val(stack).unwrap(), 111);
+
+    holder.bstack_drop(&alloc).unwrap();
+    a.bstack_drop(&alloc).unwrap();
+    c.bstack_drop(&alloc).unwrap();
+}
+
+#[test]
+fn macro_bstack_mut_owned_replace_moves_old_out() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let a = MacroLeaf::new(&alloc, 1).unwrap();
+    let holder = MutOwned::new(&alloc, a).unwrap();
+    assert_eq!(
+        holder
+            .handle()
+            .get_child(stack)
+            .unwrap()
+            .get_val(stack)
+            .unwrap(),
+        1
+    );
+
+    // Install `b`, move the old child (`a`) out — it is NOT freed.
+    let b = MacroLeaf::new(&alloc, 2).unwrap();
+    let old = holder.handle().replace_child(stack, b).unwrap();
+    assert_eq!(
+        holder
+            .handle()
+            .get_child(stack)
+            .unwrap()
+            .get_val(stack)
+            .unwrap(),
+        2
+    );
+    assert_eq!(old.handle().get_val(stack).unwrap(), 1); // moved-out old is still live
+
+    // The caller owns the old value and frees it explicitly.
+    old.bstack_drop(&alloc).unwrap();
+    // Tearing down the holder frees the current child (`b`) + the shell.
+    holder.bstack_drop(&alloc).unwrap();
+}
+
+#[test]
+fn macro_bstack_mut_strong_replace_moves_count_out() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let a = MacroStrongChild::new(&alloc, 1).unwrap(); // BStackRc, strong = 1
+    let holder = MutStrong::new(&alloc, a).unwrap(); // count transferred into the field
+    assert_eq!(
+        holder
+            .handle()
+            .get_s(stack)
+            .unwrap()
+            .get_val(stack)
+            .unwrap(),
+        1
+    );
+
+    // Install `b`; the old strong ref (`a`, still count 1) is handed back as a
+    // `BStackRc` — the field's count moves out rather than being decremented here.
+    let b = MacroStrongChild::new(&alloc, 2).unwrap();
+    let old_a = holder.handle().replace_s(&alloc, b).unwrap();
+    assert_eq!(
+        holder
+            .handle()
+            .get_s(stack)
+            .unwrap()
+            .get_val(stack)
+            .unwrap(),
+        2
+    );
+    assert_eq!(old_a.handle().get_val(stack).unwrap(), 1);
+
+    // Dropping the returned rc decrements `a` (1 -> 0) and frees it.
+    drop(old_a);
+    // Tearing down the holder decrements `b` (1 -> 0), freeing it + the shell.
+    holder.bstack_drop(&alloc).unwrap();
+}
