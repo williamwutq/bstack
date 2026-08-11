@@ -7053,7 +7053,6 @@ fn macro_foreign_field() {
         Some(88)
     );
     assert!(h.handle().get_maybe(stack).unwrap().is_none()); // the `None` niche
-    h.bstack_drop(&local).unwrap();
 
     // A present optional link resolves like any other Foreign.
     let h2 = ForeignHolder::new(
@@ -7068,7 +7067,124 @@ fn macro_foreign_field() {
         m.with_in(&reg, &local, |t, fs| t.get_val(fs).unwrap()),
         Some(88)
     );
-    h2.bstack_drop(&local).unwrap();
+
+    // NB: this test exercises construction / accessors / nullability against a
+    // *scoped* registry, and deliberately reuses one target `off` across `h` and
+    // `h2`. It does NOT tear the holders down: cross-file teardown resolves the
+    // *global* registry (the owning `Foreign` would free the shared target — twice),
+    // which is covered by the dedicated `macro_foreign_*_teardown_*` tests. The bare
+    // `BStackOwned` holders simply drop as inert handles here.
+    let _ = (h, h2);
+}
+
+// A home block holding a *strong* cross-file reference. `MacroStrongChild` is
+// `#[bstack_block(rc, weak)]`, so it is a shared target; the strong Foreign
+// participates in its refcount on the far side.
+#[bstack_block]
+struct ForeignStrongHolder {
+    tag: u32,
+    #[bstack_strong]
+    link: Foreign<MacroStrongChild>,
+}
+
+#[test]
+fn macro_foreign_owned_teardown_reclaims_across_files() {
+    // Cross-file teardown dispatch (option 1): tearing down a block with a
+    // `#[bstack_owned] Foreign<T>` field frees the target **in the target's own
+    // file**, resolved through the process-wide registry (adapter → home WAL →
+    // `free_recorded` → foreign host). Uses the global registry, like real code.
+    use crate::Foreign;
+    use crate::registry;
+
+    let home = TempStack::new();
+    let home_alloc = home.allocator();
+
+    let foreign = TempStack::new();
+    let foreign_alloc = foreign.allocator();
+
+    // Baseline foreign length, then allocate the owned target in the foreign file.
+    let base = foreign_alloc.stack().len().unwrap();
+    let leaf = MacroLeaf::new(&foreign_alloc, 88).unwrap();
+    let off = leaf.handle().range().start();
+    let grown = foreign_alloc.stack().len().unwrap();
+    assert!(grown > base, "target should have grown the foreign file");
+
+    // Global registry + attach the foreign file (tolerant of a prior init; several
+    // tests share the singleton, each attaching its own file → distinct ids).
+    let reg_file = TempStack::new();
+    let _ = registry::init(&reg_file.path);
+    let fid = registry::attach(&foreign.path, foreign_alloc).unwrap();
+    assert!(!fid.is_self());
+
+    // A home block owning the foreign target.
+    let h = ForeignHolder::new(&home_alloc, 7, Foreign::<MacroLeaf>::new(fid, off), None).unwrap();
+
+    // Tearing the home block down frees the target across the file boundary.
+    h.bstack_drop(&home_alloc).unwrap();
+
+    // The foreign file shrank back to its pre-target length: the target was
+    // reclaimed in its own file (a leak would leave it at `grown`).
+    let after = registry::with_host(fid, |host| host.stack().len().unwrap()).unwrap();
+    assert!(
+        after <= base,
+        "foreign owned target was not reclaimed on teardown: {after} > {base}"
+    );
+
+    registry::detach(fid);
+}
+
+#[test]
+fn macro_foreign_strong_teardown_frees_at_zero_across_files() {
+    // Cross-file RC teardown: a `#[bstack_strong] Foreign<T>` decrements the target's
+    // strong count *in the target's own file* (via the foreign host's stack + the
+    // atomic refcount primitives), and frees data + control when it hits zero.
+    use crate::Foreign;
+    use crate::registry;
+
+    let home = TempStack::new();
+    let home_alloc = home.allocator();
+
+    let foreign = TempStack::new();
+    let foreign_alloc = foreign.allocator();
+
+    let data_size = size_of::<<MacroStrongChild as BStackBlock>::OnDisk>() as u64;
+    let ctrl_size = size_of::<<MacroStrongChild as BStackWeakable>::Control>() as u64;
+
+    // A shared target in the foreign file: strong = 1, weak = 1, back-pointer wired.
+    let base = foreign_alloc.stack().len().unwrap();
+    let data = alloc_block(&foreign_alloc, MacroStrongChild::eightcc(), data_size).unwrap();
+    let ctrl = alloc_control(&foreign_alloc, ctrl_tag(), data, ctrl_size).unwrap();
+    let data_off = data.start();
+    let strong_off = ctrl.start() + layout::CTRL_STRONG_OFFSET;
+    assert_eq!(
+        crate::refcount::load(foreign_alloc.stack(), strong_off).unwrap(),
+        1
+    );
+    let grown = foreign_alloc.stack().len().unwrap();
+    assert!(grown > base);
+
+    let reg_file = TempStack::new();
+    let _ = registry::init(&reg_file.path);
+    let fid = registry::attach(&foreign.path, foreign_alloc).unwrap();
+
+    // The home block is the sole strong owner (count is 1) across the file boundary.
+    let h = ForeignStrongHolder::new(
+        &home_alloc,
+        1,
+        Foreign::<MacroStrongChild>::new(fid, data_off),
+    )
+    .unwrap();
+
+    // Teardown drives the far-side strong count 1 -> 0, freeing data + control there.
+    h.bstack_drop(&home_alloc).unwrap();
+
+    let after = registry::with_host(fid, |host| host.stack().len().unwrap()).unwrap();
+    assert!(
+        after <= base,
+        "foreign strong target not freed at zero: {after} > {base}"
+    );
+
+    registry::detach(fid);
 }
 
 #[test]

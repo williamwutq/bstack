@@ -439,8 +439,56 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                 mv_recon.push(quote!(::bstack_raii::Foreign::from_ptr(#cap)));
             }
 
-            // Clone / teardown: none yet (deferred). No `clone_stmts` / `drop_stmts`
-            // entry — the ForeignPtr is byte-copied verbatim (alias) and not freed.
+            // Teardown: an owning foreign pointer frees / decrements / releases its
+            // target *in the target's own file*. The kind picks a helper; all run the
+            // ordinary generic teardown against whichever allocator addresses the
+            // target — the local `allocator` for a `SELF` pointer, or a
+            // `ForeignHostAllocator` (over the live host) for a cross-file one. Frees
+            // are tagged (via `wal_file_id`) with the target's file so the home WAL
+            // reclaims them there. `#[bstack_ref]` owns nothing → no teardown.
+            let foreign_drop_helper = match kind {
+                Kind::Owned => Some(quote!(::bstack_raii::foreign_drop_owned)),
+                Kind::Strong => Some(quote!(::bstack_raii::foreign_drop_strong)),
+                Kind::Weak => Some(quote!(::bstack_raii::foreign_drop_weak)),
+                // Ref: non-owning. Pod / Embed: already rejected above.
+                Kind::Ref | Kind::Pod | Kind::Embed => None,
+            };
+            if let Some(helper) = foreign_drop_helper {
+                drop_stmts.push(quote! {
+                    {
+                        let __fp: ::bstack_raii::ForeignPtr = __on_disk.#fname;
+                        // A `0` offset is the null / unset niche (nullable field, or a
+                        // never-set pointer) — nothing to free.
+                        let __off = __fp.offset();
+                        if __off != 0 {
+                            let __fid = __fp.file_id();
+                            if __fid == 0 {
+                                // `SELF`: the target is in this same file.
+                                unsafe { #helper::<#ftarget, _>(allocator, __off)?; }
+                            } else if let ::core::option::Option::Some(__id) =
+                                ::bstack_raii::registry::FileId::from_u64(__fid)
+                            {
+                                // Foreign: adapt the live host to an allocator and run
+                                // the same teardown against the other file. If that
+                                // file isn't currently attached, the target is
+                                // unreachable and leaks (permitted).
+                                if let ::core::option::Option::Some(__host) =
+                                    ::bstack_raii::registry::host_arc(__id)
+                                {
+                                    let __adapter =
+                                        ::bstack_raii::ForeignHostAllocator::new(__host, __id);
+                                    unsafe { #helper::<#ftarget, _>(&__adapter, __off)?; }
+                                }
+                            }
+                            // A malformed id (does not fit the `FileId` space) is
+                            // unreachable → leak (skip), not an error.
+                        }
+                    }
+                });
+            }
+
+            // Deep clone across files is still DEFERRED — the `ForeignPtr` is
+            // byte-copied verbatim (an alias) on clone, regardless of annotation.
             continue;
         }
 

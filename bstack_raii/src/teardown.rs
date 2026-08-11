@@ -13,6 +13,7 @@ use std::io;
 use bstack::{BStackGenOp, BStackOwnedSlice, BStackRange};
 
 use crate::BStackRaiiAllocator;
+use crate::registry::FileId;
 use crate::wal::{WalEntry, WalLog, WalStatus, finish_at_locked, persist_at, wal_lock_for};
 
 thread_local! {
@@ -22,7 +23,14 @@ thread_local! {
     /// recursion and nested handle `bstack_drop`s see it transparently (they all
     /// go through `dealloc_range`), so no allocator/sink parameter has to be
     /// threaded through the whole teardown.
-    static TEARDOWN_SINK: RefCell<Option<Vec<BStackRange>>> = const { RefCell::new(None) };
+    ///
+    /// Each entry is `(file_id, range)`: the [`FileId`] the slice lives in — the
+    /// tearing allocator's [`wal_file_id`](BStackRaiiAllocator::wal_file_id), which is
+    /// [`SELF`](FileId::SELF) for the home file and the foreign id when a
+    /// `Foreign<T>` subtree is being torn down through a `ForeignHostAllocator`. The
+    /// WAL commits each entry against its own file so recovery reclaims it there.
+    static TEARDOWN_SINK: RefCell<Option<Vec<(FileId, BStackRange)>>> =
+        const { RefCell::new(None) };
 }
 
 /// Tear down `handle` (a whole owned subtree) as one crash-atomic batch of frees,
@@ -69,7 +77,10 @@ pub fn wal_teardown<A: BStackRaiiAllocator, T: BStackDrop>(
 /// lock, so concurrent teardowns on the same file serialize here (they collect
 /// their subtrees independently first — that part stays concurrent) rather than
 /// racing the single shared anchor slot.
-fn wal_free_all<A: BStackRaiiAllocator>(allocator: &A, slices: Vec<BStackRange>) -> io::Result<()> {
+fn wal_free_all<A: BStackRaiiAllocator>(
+    allocator: &A,
+    slices: Vec<(FileId, BStackRange)>,
+) -> io::Result<()> {
     if slices.is_empty() {
         return Ok(());
     }
@@ -77,8 +88,10 @@ fn wal_free_all<A: BStackRaiiAllocator>(allocator: &A, slices: Vec<BStackRange>)
     let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
 
     let mut log = WalLog::with_capacity(slices.len());
-    for s in &slices {
-        log.append(WalEntry::dealloc(WalStatus::Pending, *s));
+    for (fid, s) in &slices {
+        // `fid == SELF` ⇒ a local free (this file); a foreign id ⇒ reclaimed in that
+        // file through the registry on `finish` (see `wal::free_recorded`).
+        log.append(WalEntry::dealloc_in(WalStatus::Pending, *fid, *s));
     }
     // Stage the transaction `Pending`, then commit it by flipping `txn_status` to
     // `Complete` in one atomic `inplace_gen` — the single commit point (a crash
@@ -136,7 +149,10 @@ pub unsafe fn dealloc_range<A: BStackRaiiAllocator>(
     // subtree commits (and frees) as one crash-atomic transaction.
     let deferred = TEARDOWN_SINK.with(|s| match s.borrow_mut().as_mut() {
         Some(sink) => {
-            sink.push(range);
+            // Tag the slice with the file it lives in: the tearing allocator's
+            // `wal_file_id` — `SELF` for the home file, the foreign id for a
+            // `ForeignHostAllocator` tearing down a cross-file subtree.
+            sink.push((allocator.wal_file_id(), range));
             true
         }
         None => false,

@@ -79,11 +79,14 @@ pub use clone::{ClonePlan, TryClone, TryCloneIn};
 pub use construct::{
     alloc_block, alloc_control, build_control_payload, init_rc, set_weak_field, upgrade_weak_field,
 };
-pub use foreign::{Foreign, ForeignPtr};
+pub use foreign::{
+    Foreign, ForeignPtr, foreign_drop_owned, foreign_drop_strong, foreign_drop_weak,
+};
 pub use handle::{OwnedRef, StrongRef, StrongWeakRef, WeakRef};
 pub use layout::{BlockHeader, EightCC, get_u64};
 pub use owned::BStackOwned;
 pub use reference::BStackRef;
+pub use registry::ForeignHostAllocator;
 pub use shared::{BStackRc, BStackWeak};
 pub use stdlib::{
     BStackBTreeMap, BStackBTreeSet, BStackBinaryHeap, BStackBox, BStackCountingBloomFilter,
@@ -145,6 +148,19 @@ pub use bytemuck::{Pod, Zeroable};
 pub unsafe trait BStackRaiiAllocator: BStackOwnedSliceAllocator {
     fn wal_anchor(&self) -> Option<u64> {
         None
+    }
+
+    /// The [`FileId`](crate::registry::FileId) whose file this allocator's frees
+    /// belong to, used to **tag WAL teardown entries**. A normal file-owning
+    /// allocator represents *its own* file, so it returns [`FileId::SELF`](crate::registry::FileId::SELF)
+    /// (`0`) — its WAL entries mean "this file". The cross-file teardown adapter
+    /// [`ForeignHostAllocator`](crate::registry::ForeignHostAllocator) overrides this
+    /// with the foreign file's id, so a free collected while tearing down a foreign
+    /// subtree is recorded against — and, on recovery, reclaimed in — *that* file
+    /// (see [`crate::wal`]'s `free_recorded`). Callers other than the teardown WAL
+    /// have no reason to read this.
+    fn wal_file_id(&self) -> crate::registry::FileId {
+        crate::registry::FileId::SELF
     }
 }
 // Re-exported whole so generated code can call `::bstack_raii::bytemuck::bytes_of`.

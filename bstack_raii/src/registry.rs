@@ -41,7 +41,10 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
-use bstack::{BStack, BStackAllocator, BStackOwnedSlice, BStackOwnedSliceAllocator, BStackRange};
+use bstack::{
+    BStack, BStackAllocError, BStackAllocator, BStackOwnedSlice, BStackOwnedSliceAllocator,
+    BStackRange,
+};
 use parking_lot::RwLock;
 
 use crate::BStackRaiiAllocator;
@@ -312,6 +315,114 @@ impl<A: SyncBStackRaiiAllocator> ForeignHost for A {
     }
 }
 
+/// An **allocator adapter over a live foreign host** — the bridge that lets the
+/// crate's entirely generic teardown / clone machinery (`OwnedRef`, `StrongRef`,
+/// `WeakRef`, `dealloc_range`, `__bstack_drop_children`, …), all written against
+/// `A: BStackRaiiAllocator`, run **against another file** without duplicating any of
+/// it. A `Foreign<T>` field's teardown resolves the target file's host through the
+/// [registry](self), wraps it here, and runs the same `T` teardown it would run
+/// locally — every read/write lands in the foreign file (via [`stack`](BStackAllocator::stack)),
+/// and every free is [tagged](BStackRaiiAllocator::wal_file_id) with the foreign
+/// [`FileId`] so the home file's WAL reclaims it *there*.
+///
+/// It owns an `Arc<dyn ForeignHost>` (not a borrow) precisely so it can be
+/// `'static`, which [`BStackRaiiAllocator`]'s `'static` supertrait
+/// ([`BStackOwnedSliceAllocator`]) demands — and so the host stays alive for the
+/// whole teardown even if it is concurrently [`detach`](FileRegistry::detach)ed.
+///
+/// [`into_stack`](BStackAllocator::into_stack) is unsupported (the adapter does not
+/// own its `BStack` — the host does); it panics if ever called. The teardown path
+/// only ever uses `stack` / `dealloc` / the refcount primitives, never `into_stack`.
+pub struct ForeignHostAllocator {
+    host: Arc<dyn ForeignHost + 'static>,
+    file_id: FileId,
+}
+
+impl ForeignHostAllocator {
+    /// Adapt a live foreign `host` (as an owned `Arc`, e.g. from
+    /// [`host_arc`](FileRegistry::host_arc)) into an allocator whose frees are tagged
+    /// with `file_id`.
+    pub fn new(host: Arc<dyn ForeignHost + 'static>, file_id: FileId) -> Self {
+        Self { host, file_id }
+    }
+}
+
+impl BStackAllocator for ForeignHostAllocator {
+    type Error = io::Error;
+    type Allocated<'a> = BStackOwnedSlice<'a, Self>;
+
+    fn stack(&self) -> &BStack {
+        self.host.stack()
+    }
+
+    fn into_stack(self) -> BStack {
+        unreachable!(
+            "ForeignHostAllocator is a cross-file adapter over a shared host and cannot \
+             be consumed into its BStack"
+        )
+    }
+
+    fn alloc(&self, len: u64) -> io::Result<BStackOwnedSlice<'_, Self>> {
+        let r = self.host.alloc(len)?;
+        // SAFETY: `r` is a fresh live allocation in the host's file; we wrap it as the
+        // owned handle bound to this adapter, which forwards frees to the same host.
+        Ok(unsafe { BStackOwnedSlice::from_raw_range(self, r) })
+    }
+
+    fn realloc<'a>(
+        &'a self,
+        handle: BStackOwnedSlice<'a, Self>,
+        new_len: u64,
+    ) -> Result<BStackOwnedSlice<'a, Self>, BStackAllocError<'a, Self>> {
+        let r = handle.as_range();
+        // SAFETY: `handle` is a live allocation owned here; `r` names the same region.
+        match unsafe { self.host.realloc(r, new_len) } {
+            Ok(nr) => Ok(unsafe { BStackOwnedSlice::from_raw_range(self, nr) }),
+            Err(e) => Err(foreign_to_alloc_error(self, e)),
+        }
+    }
+
+    fn dealloc<'a>(
+        &'a self,
+        handle: BStackOwnedSlice<'a, Self>,
+    ) -> Result<(), BStackAllocError<'a, Self>> {
+        let r = handle.as_range();
+        // SAFETY: `handle` is a live allocation owned here; `r` names the same region.
+        match unsafe { self.host.dealloc(r) } {
+            Ok(()) => Ok(()),
+            Err(e) => Err(foreign_to_alloc_error(self, e)),
+        }
+    }
+}
+
+// SAFETY: (1) null niche — the adapter forwards to a real host allocator, which
+// upholds it. (2) `wal_anchor` mirrors the host's; `wal_file_id` names the foreign
+// file so its frees are reclaimed there.
+unsafe impl BStackRaiiAllocator for ForeignHostAllocator {
+    fn wal_anchor(&self) -> Option<u64> {
+        self.host.wal_anchor()
+    }
+    fn wal_file_id(&self) -> FileId {
+        self.file_id
+    }
+}
+
+/// Convert a host-level [`ForeignAllocError`] (range-based) into the allocator-level
+/// [`BStackAllocError`] the `BStackAllocator` trait speaks, re-wrapping any surviving
+/// range as an owned handle bound to `alloc`.
+fn foreign_to_alloc_error(
+    alloc: &ForeignHostAllocator,
+    e: ForeignAllocError,
+) -> BStackAllocError<'_, ForeignHostAllocator> {
+    match e.handle {
+        // SAFETY: `h` is the region the failed op left intact in the host's file.
+        Some(h) => BStackAllocError::with_handle(e.source, unsafe {
+            BStackOwnedSlice::from_raw_range(alloc, h)
+        }),
+        None => BStackAllocError::lost(e.source),
+    }
+}
+
 /// Persistent backing: an append-only log on the registry's own bstack file.
 ///
 /// No allocator needed — the path table is append-only, and a `BStack` *is* a
@@ -498,6 +609,17 @@ impl<'h> FileRegistry<'h> {
         Some(f(&**host))
     }
 
+    /// Clone out `id`'s live host as an owned [`Arc`], or `None` if `id` is unknown /
+    /// not currently live. Unlike [`with_host`](Self::with_host) (which lends a
+    /// `&dyn ForeignHost` only for the span of a closure), this hands back an owned
+    /// handle that keeps the host alive independently of the registry — the basis for
+    /// the `'static` [`ForeignHostAllocator`], which needs to outlive the lock and
+    /// survive a concurrent [`detach`](Self::detach) mid-teardown.
+    pub fn host_arc(&self, id: FileId) -> Option<Arc<dyn ForeignHost + 'h>> {
+        let idx = table_index(id)?;
+        self.inner.read_recursive().live.get(idx)?.clone()
+    }
+
     /// The path registered for `id`, if any (`None` for `SELF` / special ids).
     pub fn path_of(&self, id: FileId) -> Option<PathBuf> {
         let idx = table_index(id)?;
@@ -600,6 +722,12 @@ pub fn path_of(id: FileId) -> Option<PathBuf> {
 /// [`FileRegistry::id_of_host`] on the process-wide registry.
 pub fn id_of_host(stack: &BStack) -> Option<FileId> {
     REGISTRY.get()?.id_of_host(stack)
+}
+
+/// [`FileRegistry::host_arc`] on the process-wide registry — the owned-`Arc` host
+/// lookup that cross-file teardown/clone use to build a [`ForeignHostAllocator`].
+pub fn host_arc(id: FileId) -> Option<Arc<dyn ForeignHost + 'static>> {
+    REGISTRY.get()?.host_arc(id)
 }
 
 /// The id registered for `path`, if any.
