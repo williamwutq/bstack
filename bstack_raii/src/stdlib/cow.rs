@@ -90,7 +90,7 @@ impl<T: BStackBlock> BStackCow<T> {
 
     /// Materialize a fresh, bare `T` handle over the current block for calling
     /// the block's generated field accessors — e.g.
-    /// `cow.handle().field(stack)`. Works for both variants; carries no
+    /// `cow.handle().get_field(stack)`. Works for both variants; carries no
     /// ownership (dropping it frees nothing).
     pub fn handle(&self) -> T {
         <T as BStackBlock>::from_range(self.range())

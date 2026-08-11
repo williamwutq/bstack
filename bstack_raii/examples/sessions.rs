@@ -56,11 +56,11 @@ fn shared_ownership_demo(path: &std::path::Path) -> io::Result<()> {
     drop(config); // the three sessions still keep it alive
 
     // Read the shared config through any session's generated accessor.
-    let cfg = sessions[0].handle().config(stack)?;
+    let cfg = sessions[0].handle().get_config(stack)?;
     println!(
         "shared config: version {}, flags {:#06b} (held by {} sessions)",
-        cfg.version(stack)?,
-        cfg.flags(stack)?,
+        cfg.get_version(stack)?,
+        cfg.get_flags(stack)?,
         sessions.len(),
     );
 
@@ -103,7 +103,7 @@ fn durability_demo(path: &std::path::Path) -> io::Result<()> {
     let cfg = <Config as BStackBlock>::from_range(saved);
     println!(
         "after reopen: config version {} (persisted across the close/reopen)",
-        cfg.version(alloc.stack())?,
+        cfg.get_version(alloc.stack())?,
     );
     Ok(())
 }

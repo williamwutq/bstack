@@ -82,8 +82,8 @@ fn main() -> io::Result<()> {
     let session = Session::new(&alloc, 0, config.try_clone()?)?; // strong = 2
 
     // Read fields through generated accessors.
-    let cfg = session.handle().config(stack)?;         // -> a Config handle
-    println!("v{} flags {:#b}", cfg.version(stack)?, cfg.flags(stack)?);
+    let cfg = session.handle().get_config(stack)?;      // -> a Config handle
+    println!("v{} flags {:#b}", cfg.get_version(stack)?, cfg.get_flags(stack)?);
 
     drop(config);                  // strong = 1 — the session still owns it (Rc: auto-decrement)
     session.bstack_drop(&alloc)?;  // strong = 0 — Config freed automatically by its refcount
@@ -179,7 +179,7 @@ in an `AutoDrop` guard for RAII:
 
 ```rust
 let owned: BStackOwned<Node> = Node::new(&alloc, /* … */)?;
-let value = owned.handle().tag(stack)?;   // read a field (or `owned.tag(stack)?` via Deref)
+let value = owned.handle().get_tag(stack)?;   // read a field (or `owned.get_tag(stack)?` via Deref)
 
 owned.bstack_drop(&alloc)?;               // free it now, explicitly …
 // … or: let _guard = owned.auto(&alloc); // RAII — freed when `_guard` drops
@@ -255,7 +255,7 @@ enum Wrapper {
 It's still **exclusive ownership** (like `#[bstack_owned]`): `new` takes a
 `BStackOwned<Child>` — you build the child normally, and the parent folds its
 bytes in and frees the child's now-redundant shell (the child's *own* children
-stay live). The accessor (`holder.handle().child()`) hands back a borrowed
+stay live). The accessor (`holder.handle().get_child()`) hands back a borrowed
 `Child` handle into the inline region; teardown frees the embedded child's
 children in place; and `bstack_move!` re-homes the child to a fresh standalone
 `BStackOwned<Child>`. You can embed any block (`#[bstack_block]` /
@@ -281,14 +281,14 @@ methods:
   child handles it takes ownership of (`#[bstack_owned]` → `BStackOwned<T>`,
   `#[bstack_strong]` → `BStackRc<T>`, `#[bstack_ref]` → `BStackRef<T>`, POD by
   value; `#[bstack_weak]` fields are **not** parameters);
-- **accessors** — `node.field(stack)` for each field;
+- **accessors** — `node.get_field(stack)` for each field;
 - **`set_<field>`** setters for `#[bstack_weak]` fields (see below);
 - recursive teardown, [casting](#casting-bstack_cast), and
   [moving](#moving-out-bstack_move).
 
 A **tuple struct** works too, as long as every field is `Pod`: its positional
 fields get synthetic names, so `struct Rgb(u8, u8, u8)` is constructed
-`Rgb::new(&alloc, 10, 20, 30)`, read via `rgb.field0(stack)?` / `field1` / …, and
+`Rgb::new(&alloc, 10, 20, 30)`, read via `rgb.get_field0(stack)?` / `get_field1` / …, and
 `bstack_move!` hands the fields back in order. A **unit struct**
 (`#[bstack_block] struct Marker;`) is a valid **header-only** block — just the
 16-byte header, no payload.
@@ -318,8 +318,8 @@ let a = WNode::new(&alloc, 1)?;
 let b = WNode::new(&alloc, 2)?;
 b.handle().set_back(&alloc, a.downgrade()?)?;      // wire b.back -> a (weak)
 
-if let Some(a2) = b.handle().back(&alloc)? {       // accessor upgrades
-    println!("a still alive: {}", a2.handle().val(stack)?);
+if let Some(a2) = b.handle().get_back(&alloc)? {   // accessor upgrades
+    println!("a still alive: {}", a2.handle().get_val(stack)?);
 }
 ```
 
@@ -338,9 +338,9 @@ struct Record {
 }
 
 let rec = Record::new(&alloc, "hello", &[1u32, 2, 3], 42)?;  // &str / &[T] / value
-let mut tags = rec.handle().tags(&alloc)?;    // a BStackVec<u32> handle
-tags.push(4)?;                                // grows; rewrites the inline descriptor
-assert_eq!(rec.handle().tags(&alloc)?.to_vec()?, vec![1, 2, 3, 4]);
+let mut tags = rec.handle().get_tags(&alloc)?;    // a BStackVec<u32> handle
+tags.push(4)?;                                    // grows; rewrites the inline descriptor
+assert_eq!(rec.handle().get_tags(&alloc)?.to_vec()?, vec![1, 2, 3, 4]);
 ```
 
 The accessor returns a [`BStackVec<T>`] (`len` / `to_vec` / `push`); freeing the
@@ -395,7 +395,7 @@ struct Board {
 }
 
 let b = Board::new(&alloc, [0; 9], [a, b, c], [r0, r1], [k0, k1])?;
-let tiles: [Leaf; 3] = b.handle().tiles(stack)?;   // an array of block views
+let tiles: [Leaf; 3] = b.handle().get_tiles(stack)?;   // an array of block views
 ```
 
 A reference array stores `[u64; N]` inline (one offset per element). The
@@ -473,7 +473,7 @@ enum Node {
 
 let node = Node::new(&alloc, NodeData::Child(leaf))?;   // construct a variant
 match node.handle().read(&alloc)? {                     // read / match it
-    NodeView::Child(c) => assert_eq!(c.val(stack)?, 7),
+    NodeView::Child(c) => assert_eq!(c.get_val(stack)?, 7),
     _ => {}
 }
 node.bstack_drop(&alloc)?;                              // frees the owned child too

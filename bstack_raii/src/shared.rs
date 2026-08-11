@@ -94,7 +94,7 @@ impl<'a, T: BStackBlock, A: BStackRaiiAllocator> BStackRc<'a, T, A> {
     }
 
     /// The underlying typed handle, e.g. to call generated field accessors:
-    /// `rc.handle().field(stack)`. Cheap: it just re-wraps the data ref and does
+    /// `rc.handle().get_field(stack)`. Cheap: it just re-wraps the data ref and does
     /// not touch the refcount.
     pub fn handle(&self) -> T {
         <T as BStackBlock>::from_range(self.data().into_range())

@@ -301,6 +301,9 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
 
     for (fname, field) in &field_list {
         let kind = classify(field)?;
+        // The public accessor name (`get_<field>`); `#fname` itself stays the
+        // on-disk field / struct-literal name throughout.
+        let getter = format_ident!("get_{}", fname);
 
         // Ergonomic: `&T` is coerced to owned `T` (and `&str` to `String`), with
         // a warning. `eff_ty` is the type after stripping a leading `&`.
@@ -458,7 +461,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                     )
                 };
                 accessors.push(quote! {
-                    #vis fn #fname<'__v, __A: ::bstack_raii::BStackRaiiAllocator>(
+                    #vis fn #getter<'__v, __A: ::bstack_raii::BStackRaiiAllocator>(
                         &self,
                         allocator: &'__v __A,
                     ) -> ::std::io::Result<#acc_ret> {
@@ -820,7 +823,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                 };
                 let acc_body = nested_build(&dims, &acc_leaf, &acc_read);
                 accessors.push(quote! {
-                    #vis fn #fname<'__v, __A: ::bstack_raii::BStackRaiiAllocator>(
+                    #vis fn #getter<'__v, __A: ::bstack_raii::BStackRaiiAllocator>(
                         &self,
                         allocator: &'__v __A,
                     ) -> ::std::io::Result<#acc_ret> {
@@ -1024,7 +1027,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                 };
                 let acc_body = nested_build(&dims, &quote!(#child), &acc_read);
                 accessors.push(quote! {
-                    #vis fn #fname(&self) -> #acc_ret {
+                    #vis fn #getter(&self) -> #acc_ret {
                         let __base =
                             self.0.start() + ::core::mem::offset_of!(#on_disk_ty, #fname) as u64;
                         let __step = ::core::mem::size_of::<#child_od>() as u64;
@@ -1160,7 +1163,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                 };
                 let acc_body = nested_build(&dims, &leaf_ty, &acc_read);
                 accessors.push(quote! {
-                    #vis fn #fname<'__u, __A: ::bstack_raii::BStackRaiiAllocator>(
+                    #vis fn #getter<'__u, __A: ::bstack_raii::BStackRaiiAllocator>(
                         &self,
                         allocator: &'__u __A,
                     ) -> ::std::io::Result<#acc_ret> {
@@ -1252,7 +1255,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
             };
             let acc_body = nested_build(&dims, &leaf_view, &acc_read);
             accessors.push(quote! {
-                #vis fn #fname(
+                #vis fn #getter(
                     &self,
                     stack: &::bstack_raii::BStack,
                 ) -> ::std::io::Result<#acc_ret> {
@@ -1474,7 +1477,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
             pod_types.extend(elems.iter().copied());
             on_disk_fields.push(quote!(#fname: #wrapper,));
             accessors.push(quote! {
-                #vis fn #fname(
+                #vis fn #getter(
                     &self,
                     stack: &::bstack_raii::BStack,
                 ) -> ::std::io::Result<#inner_ty> {
@@ -1530,7 +1533,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
 
             // Accessor: a child handle at the embedded offset (pure offset math).
             accessors.push(quote! {
-                #vis fn #fname(&self) -> #child {
+                #vis fn #getter(&self) -> #child {
                     <#child as ::bstack_raii::BStackBlock>::from_range(
                         ::bstack_raii::BStackRange::new(
                             self.0.start() + ::core::mem::offset_of!(#on_disk_ty, #fname) as u64,
@@ -2347,10 +2350,11 @@ fn vec_accessor(
     on_disk: &TokenStream,
     nullable: bool,
 ) -> TokenStream {
+    let getter = format_ident!("get_{}", fname);
     let field = quote!(self.0.start() + ::core::mem::offset_of!(#on_disk, #fname) as u64);
     if nullable {
         quote! {
-            #vis fn #fname<'__v, __A: ::bstack_raii::BStackRaiiAllocator>(
+            #vis fn #getter<'__v, __A: ::bstack_raii::BStackRaiiAllocator>(
                 &self,
                 allocator: &'__v __A,
             ) -> ::std::io::Result<
@@ -2361,7 +2365,7 @@ fn vec_accessor(
         }
     } else {
         quote! {
-            #vis fn #fname<'__v, __A: ::bstack_raii::BStackRaiiAllocator>(
+            #vis fn #getter<'__v, __A: ::bstack_raii::BStackRaiiAllocator>(
                 &self,
                 allocator: &'__v __A,
             ) -> ::std::io::Result<::bstack_raii::BStackVec<'__v, #elem, __A>> {
@@ -2535,10 +2539,11 @@ fn block_vec_accessor(
     vec_ty: TokenStream,
     nullable: bool,
 ) -> TokenStream {
+    let getter = format_ident!("get_{}", fname);
     let field = quote!(self.0.start() + ::core::mem::offset_of!(#on_disk, #fname) as u64);
     if nullable {
         quote! {
-            #vis fn #fname<'__v, __A: ::bstack_raii::BStackRaiiAllocator>(
+            #vis fn #getter<'__v, __A: ::bstack_raii::BStackRaiiAllocator>(
                 &self,
                 allocator: &'__v __A,
             ) -> ::std::io::Result<
@@ -2549,7 +2554,7 @@ fn block_vec_accessor(
         }
     } else {
         quote! {
-            #vis fn #fname<'__v, __A: ::bstack_raii::BStackRaiiAllocator>(
+            #vis fn #getter<'__v, __A: ::bstack_raii::BStackRaiiAllocator>(
                 &self,
                 allocator: &'__v __A,
             ) -> ::std::io::Result<::bstack_raii::#vec_ty<'__v, #elem, __A>> {
@@ -2776,10 +2781,11 @@ fn accessor(
     kind: Kind,
     nullable: bool,
 ) -> TokenStream {
+    let getter = format_ident!("get_{}", fname);
     // Weak fields hold a control offset; the accessor attempts a live upgrade.
     if kind == Kind::Weak {
         return quote! {
-            #vis fn #fname<'__u, __A: ::bstack_raii::BStackRaiiAllocator>(
+            #vis fn #getter<'__u, __A: ::bstack_raii::BStackRaiiAllocator>(
                 &self,
                 allocator: &'__u __A,
             ) -> ::std::io::Result<
@@ -2797,7 +2803,7 @@ fn accessor(
     };
     if kind == Kind::Pod {
         return quote! {
-            #vis fn #fname(&self, stack: &::bstack_raii::BStack) -> ::std::io::Result<#inner_ty> {
+            #vis fn #getter(&self, stack: &::bstack_raii::BStack) -> ::std::io::Result<#inner_ty> {
                 #read
                 ::std::result::Result::Ok(__od.#fname)
             }
@@ -2812,7 +2818,7 @@ fn accessor(
     };
     if nullable {
         quote! {
-            #vis fn #fname(
+            #vis fn #getter(
                 &self,
                 stack: &::bstack_raii::BStack,
             ) -> ::std::io::Result<::core::option::Option<#inner_ty>> {
@@ -2826,7 +2832,7 @@ fn accessor(
         }
     } else {
         quote! {
-            #vis fn #fname(&self, stack: &::bstack_raii::BStack) -> ::std::io::Result<#inner_ty> {
+            #vis fn #getter(&self, stack: &::bstack_raii::BStack) -> ::std::io::Result<#inner_ty> {
                 #read
                 ::std::result::Result::Ok(#resolve)
             }

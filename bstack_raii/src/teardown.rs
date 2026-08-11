@@ -197,7 +197,7 @@ impl<'a, T: BStackDrop, A: BStackRaiiAllocator> AutoDrop<'a, T, A> {
     }
 
     /// Borrow the underlying handle, e.g. to call generated field accessors:
-    /// `owned.handle().field(stack)`.
+    /// `owned.handle().get_field(stack)`.
     pub fn handle(&self) -> &T {
         &self.inner
     }

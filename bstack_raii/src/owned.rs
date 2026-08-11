@@ -44,7 +44,7 @@ impl<T: BStackDrop> BStackOwned<T> {
     }
 
     /// Borrow the inner handle, e.g. to call generated field accessors:
-    /// `owned.handle().field(stack)`.
+    /// `owned.handle().get_field(stack)`.
     pub fn handle(&self) -> &T {
         &self.0
     }

@@ -554,16 +554,16 @@ fn macro_new_and_accessors() {
 
     // Plain-block constructor: allocates and writes the whole payload.
     let leaf = MacroLeaf::new(&alloc, 42).unwrap();
-    assert_eq!(leaf.handle().val(stack).unwrap(), 42);
+    assert_eq!(leaf.handle().get_val(stack).unwrap(), 42);
 
     // Owned child is consumed by the parent constructor (ownership transferred).
     let parent = MacroParent::new(&alloc, leaf, 7).unwrap();
-    assert_eq!(parent.handle().tag(stack).unwrap(), 7);
+    assert_eq!(parent.handle().get_tag(stack).unwrap(), 7);
 
     // Accessor resolves the owned-ref field to the child handle; reading its own
     // field proves the child pointer was wired correctly.
-    let child = parent.handle().child(stack).unwrap();
-    assert_eq!(child.val(stack).unwrap(), 42);
+    let child = parent.handle().get_child(stack).unwrap();
+    assert_eq!(child.get_val(stack).unwrap(), 42);
 
     // Freeing the parent recursively frees the child then itself; recursion
     // correctness is covered elsewhere.
@@ -582,14 +582,22 @@ fn macro_clone_deep_owned() {
 
     let leaf = MacroLeaf::new(&alloc, 42).unwrap();
     let parent = MacroParent::new(&alloc, leaf, 7).unwrap();
-    let orig_child = parent.handle().child(stack).unwrap();
+    let orig_child = parent.handle().get_child(stack).unwrap();
 
     // Deep clone -> a fresh, independent BStackOwned copy.
     let clone = parent.try_clone_in(&alloc).unwrap();
 
     // Same values read back through the clone.
-    assert_eq!(clone.handle().tag(stack).unwrap(), 7);
-    assert_eq!(clone.handle().child(stack).unwrap().val(stack).unwrap(), 42);
+    assert_eq!(clone.handle().get_tag(stack).unwrap(), 7);
+    assert_eq!(
+        clone
+            .handle()
+            .get_child(stack)
+            .unwrap()
+            .get_val(stack)
+            .unwrap(),
+        42
+    );
 
     // Independent storage: both the clone's block and its owned child are new
     // allocations, distinct from the originals (proves the recursion + repoint).
@@ -598,14 +606,19 @@ fn macro_clone_deep_owned() {
         parent.handle().range().start()
     );
     assert_ne!(
-        clone.handle().child(stack).unwrap().range().start(),
+        clone.handle().get_child(stack).unwrap().range().start(),
         orig_child.range().start()
     );
 
     // Freeing the clone frees only the clone's subtree; the original stays intact.
     clone.bstack_drop(&alloc).unwrap();
     assert_eq!(
-        parent.handle().child(stack).unwrap().val(stack).unwrap(),
+        parent
+            .handle()
+            .get_child(stack)
+            .unwrap()
+            .get_val(stack)
+            .unwrap(),
         42
     );
     parent.bstack_drop(&alloc).unwrap();
@@ -641,7 +654,7 @@ fn macro_clone_bumps_shared_refcount() {
     clone.bstack_drop(&alloc).unwrap();
     parent.bstack_drop(&alloc).unwrap();
     assert_eq!(crate::refcount::load(stack, strong_off).unwrap(), 1);
-    assert_eq!(rc_keep.handle().val(stack).unwrap(), 5);
+    assert_eq!(rc_keep.handle().get_val(stack).unwrap(), 5);
     drop(rc_keep);
 }
 
@@ -656,7 +669,14 @@ fn macro_new_rc_weak() {
     let rc = MacroShared::new(&alloc, leaf).unwrap();
 
     // Traverse through the shared handle to the owned child and read it.
-    assert_eq!(rc.handle().child(stack).unwrap().val(stack).unwrap(), 99);
+    assert_eq!(
+        rc.handle()
+            .get_child(stack)
+            .unwrap()
+            .get_val(stack)
+            .unwrap(),
+        99
+    );
 
     // Full shared lifecycle on a constructor-built block.
     let rc2 = rc.try_clone().unwrap();
@@ -693,8 +713,8 @@ fn macro_weak_field_cycle() {
     b.handle().set_back(&alloc, a.downgrade().unwrap()).unwrap();
 
     // Upgrade accessor resolves the live target.
-    let up = b.handle().back(&alloc).unwrap().expect("a is alive");
-    assert_eq!(up.handle().val(alloc.stack()).unwrap(), 1);
+    let up = b.handle().get_back(&alloc).unwrap().expect("a is alive");
+    assert_eq!(up.handle().get_val(alloc.stack()).unwrap(), 1);
     drop(up);
 
     // Drop the strong owner `a` first: its DATA block is freed, but its control
@@ -703,7 +723,7 @@ fn macro_weak_field_cycle() {
 
     // The weak field can no longer upgrade — and reaching this did NOT read a's
     // freed data block, because the field stores a's control offset.
-    assert!(b.handle().back(&alloc).unwrap().is_none());
+    assert!(b.handle().get_back(&alloc).unwrap().is_none());
 
     // Dropping `b` releases b.back's weak on a's control block (freeing it), then
     // frees b. No use-after-free of a's data.
@@ -743,7 +763,7 @@ fn macro_bstack_move() {
     // Ownership of the child transferred (same allocation), and it is still live
     // because bstack_move! frees only the parent shell.
     assert_eq!(child.handle().range().start(), leaf_off);
-    assert_eq!(child.handle().val(stack).unwrap(), 55);
+    assert_eq!(child.handle().get_val(stack).unwrap(), 55);
 
     // Freeing the moved-out child frees the leaf. With the parent shell already
     // freed, both slots coalesce and the lowest (leaf's) is reclaimed.
@@ -790,7 +810,7 @@ fn macro_bstack_move_shared() {
     assert_eq!(n, 5);
 
     // The strong field came back as a live BStackRc.
-    assert_eq!(moved_s.handle().val(stack).unwrap(), 88);
+    assert_eq!(moved_s.handle().get_val(stack).unwrap(), 88);
 
     // The weak field came back as Some(weak) and still upgrades (target alive).
     let up = moved_w
@@ -799,7 +819,7 @@ fn macro_bstack_move_shared() {
         .upgrade()
         .unwrap()
         .expect("wt alive");
-    assert_eq!(up.handle().val(stack).unwrap(), 3);
+    assert_eq!(up.handle().get_val(stack).unwrap(), 3);
     drop(up);
 
     // Clean teardown across the moved-out handles.
@@ -921,7 +941,7 @@ fn macro_cast() {
         sl.cast_as::<MacroLeaf>()
             .unwrap()
             .unwrap()
-            .val(stack)
+            .get_val(stack)
             .unwrap(),
         9
     );
@@ -942,7 +962,7 @@ fn macro_cast() {
         .unwrap()
         .ok()
         .unwrap();
-    assert_eq!(owned.handle().val(stack).unwrap(), 9);
+    assert_eq!(owned.handle().get_val(stack).unwrap(), 9);
     owned.bstack_drop(&alloc).unwrap(); // frees the leaf
 }
 
@@ -985,7 +1005,7 @@ fn macro_bstack_move_rc() {
     // Sole owner: the move succeeds and transfers the owned child out.
     let (moved_leaf, n) = bstack_move!(rc).unwrap().ok().expect("sole owner");
     assert_eq!(n, 7);
-    assert_eq!(moved_leaf.handle().val(stack).unwrap(), 5);
+    assert_eq!(moved_leaf.handle().get_val(stack).unwrap(), 5);
 
     // Only the RcHolder shell was freed; the child is still live. Freeing it
     // reclaims the last block, so the lowest slot (the leaf's) comes back.
@@ -1013,7 +1033,7 @@ fn macro_bstack_move_rc_weak() {
     // Sole *strong* owner: move succeeds even with a weak outstanding.
     let (moved_leaf, n) = bstack_move!(rc).unwrap().ok().expect("sole strong owner");
     assert_eq!(n, 3);
-    assert_eq!(moved_leaf.handle().val(stack).unwrap(), 9);
+    assert_eq!(moved_leaf.handle().get_val(stack).unwrap(), 9);
 
     // The data block is gone, so the weak can no longer upgrade.
     assert!(weak.upgrade().unwrap().is_none());
@@ -1043,15 +1063,20 @@ fn macro_option_owned() {
     let leaf = MacroLeaf::new(&alloc, 42).unwrap();
     let leaf_off = leaf.handle().range().start();
     let holder = OptHolder::new(&alloc, Some(leaf), 7).unwrap();
-    assert_eq!(holder.handle().n(stack).unwrap(), 7);
-    let got = holder.handle().child(stack).unwrap();
-    assert_eq!(got.unwrap().val(stack).unwrap(), 42);
+    assert_eq!(holder.handle().get_n(stack).unwrap(), 7);
+    let got = holder.handle().get_child(stack).unwrap();
+    assert_eq!(got.unwrap().get_val(stack).unwrap(), 42);
 
     // bstack_move! yields Option<BStackOwned<_>>.
     let (moved_child, n) = bstack_move!(holder, &alloc).unwrap();
     assert_eq!(n, 7);
     assert_eq!(
-        moved_child.as_ref().unwrap().handle().val(stack).unwrap(),
+        moved_child
+            .as_ref()
+            .unwrap()
+            .handle()
+            .get_val(stack)
+            .unwrap(),
         42
     );
     moved_child.unwrap().bstack_drop(&alloc).unwrap(); // frees the leaf
@@ -1068,8 +1093,8 @@ fn macro_option_owned() {
 
     // None: no child, accessor is None, teardown skips the null field cleanly.
     let empty = OptHolder::new(&alloc, None, 9).unwrap();
-    assert_eq!(empty.handle().n(stack).unwrap(), 9);
-    assert!(empty.handle().child(stack).unwrap().is_none());
+    assert_eq!(empty.handle().get_n(stack).unwrap(), 9);
+    assert!(empty.handle().get_child(stack).unwrap().is_none());
     empty.bstack_drop(&alloc).unwrap();
 }
 
@@ -1135,24 +1160,24 @@ fn macro_vec_string_fields() {
 
     // Constructor takes `&str` for String and `&[T]` for Vec<T>.
     let rec = Record::new(&alloc, "hello", &[1u32, 2, 3], 42).unwrap();
-    assert_eq!(rec.handle().id(stack).unwrap(), 42);
+    assert_eq!(rec.handle().get_id(stack).unwrap(), 42);
 
     // Accessors return BStackVec handles (take the allocator).
     assert_eq!(
-        rec.handle().name(&alloc).unwrap().to_vec().unwrap(),
+        rec.handle().get_name(&alloc).unwrap().to_vec().unwrap(),
         b"hello"
     );
     assert_eq!(
-        rec.handle().tags(&alloc).unwrap().to_vec().unwrap(),
+        rec.handle().get_tags(&alloc).unwrap().to_vec().unwrap(),
         vec![1u32, 2, 3]
     );
 
     // Mutate through the handle: the field points at the stable descriptor, so
     // growth (even if the data block moves) is visible on the next read.
-    let mut tags = rec.handle().tags(&alloc).unwrap();
+    let mut tags = rec.handle().get_tags(&alloc).unwrap();
     tags.push(4).unwrap();
     assert_eq!(
-        rec.handle().tags(&alloc).unwrap().to_vec().unwrap(),
+        rec.handle().get_tags(&alloc).unwrap().to_vec().unwrap(),
         vec![1u32, 2, 3, 4],
     );
 
@@ -1162,11 +1187,11 @@ fn macro_vec_string_fields() {
     // Allocator is healthy: a fresh record round-trips.
     let rec2 = Record::new(&alloc, "again", &[9u32], 1).unwrap();
     assert_eq!(
-        rec2.handle().name(&alloc).unwrap().to_vec().unwrap(),
+        rec2.handle().get_name(&alloc).unwrap().to_vec().unwrap(),
         b"again"
     );
     assert_eq!(
-        rec2.handle().tags(&alloc).unwrap().to_vec().unwrap(),
+        rec2.handle().get_tags(&alloc).unwrap().to_vec().unwrap(),
         vec![9u32]
     );
     rec2.bstack_drop(&alloc).unwrap();
@@ -1180,16 +1205,16 @@ fn macro_vec_field_push_growth_reclaims_old() {
     let alloc = tmp.allocator();
 
     let rec = Record::new(&alloc, "hi", &[1u32, 2, 3], 0).unwrap();
-    let old = rec.handle().tags(&alloc).unwrap().descriptor(); // cap == len == 12 B
+    let old = rec.handle().get_tags(&alloc).unwrap().descriptor(); // cap == len == 12 B
 
     // len 12 + elem 4 > cap 12 → field-resident growth → the reorder path.
-    let mut tags = rec.handle().tags(&alloc).unwrap();
+    let mut tags = rec.handle().get_tags(&alloc).unwrap();
     tags.push(4).unwrap();
 
-    let new = rec.handle().tags(&alloc).unwrap().descriptor();
+    let new = rec.handle().get_tags(&alloc).unwrap().descriptor();
     assert_ne!(new.data_off, old.data_off); // moved to a fresh block
     assert_eq!(
-        rec.handle().tags(&alloc).unwrap().to_vec().unwrap(),
+        rec.handle().get_tags(&alloc).unwrap().to_vec().unwrap(),
         vec![1u32, 2, 3, 4]
     );
 
@@ -1241,19 +1266,19 @@ fn macro_owned_block_vec() {
         MacroLeaf::new(&alloc, 30).unwrap(),
     ];
     let tree = Tree::new(&alloc, kids, 7).unwrap();
-    assert_eq!(tree.handle().label(stack).unwrap(), 7);
+    assert_eq!(tree.handle().get_label(stack).unwrap(), 7);
 
     // Accessor resolves to a BStackBlockVec; read the children back.
-    let v = tree.handle().kids(&alloc).unwrap();
+    let v = tree.handle().get_kids(&alloc).unwrap();
     assert_eq!(v.len().unwrap(), 3);
     let vals: Vec<u32> = v
         .to_vec()
         .unwrap()
         .iter()
-        .map(|k| k.val(stack).unwrap())
+        .map(|k| k.get_val(stack).unwrap())
         .collect();
     assert_eq!(vals, vec![10, 20, 30]);
-    assert_eq!(v.get(1).unwrap().unwrap().val(stack).unwrap(), 20);
+    assert_eq!(v.get(1).unwrap().unwrap().get_val(stack).unwrap(), 20);
     assert!(v.get(3).unwrap().is_none());
 
     // Freeing the tree recursively frees every owned child, plus the offset array
@@ -1286,7 +1311,7 @@ fn macro_owned_block_vec_move() {
     let (kids_vec, label) = bstack_move!(tree, &alloc).unwrap();
     assert_eq!(label, 9);
     assert_eq!(kids_vec.len().unwrap(), 2);
-    assert_eq!(kids_vec.get(0).unwrap().unwrap().val(stack).unwrap(), 1);
+    assert_eq!(kids_vec.get(0).unwrap().unwrap().get_val(stack).unwrap(), 1);
 
     // The moved-out vector is independently owned; free it (children + arrays).
     kids_vec.bstack_drop().unwrap();
@@ -1304,32 +1329,37 @@ fn macro_clone_pod_vec() {
     let stack = alloc.stack();
 
     let rec = Record::new(&alloc, "hello", &[1u32, 2, 3], 42).unwrap();
-    let orig_name_off = rec.handle().name(&alloc).unwrap().descriptor().data_off;
+    let orig_name_off = rec.handle().get_name(&alloc).unwrap().descriptor().data_off;
 
     let clone = rec.try_clone_in(&alloc).unwrap();
-    assert_eq!(clone.handle().id(stack).unwrap(), 42);
+    assert_eq!(clone.handle().get_id(stack).unwrap(), 42);
     assert_eq!(
-        clone.handle().name(&alloc).unwrap().to_vec().unwrap(),
+        clone.handle().get_name(&alloc).unwrap().to_vec().unwrap(),
         b"hello"
     );
     assert_eq!(
-        clone.handle().tags(&alloc).unwrap().to_vec().unwrap(),
+        clone.handle().get_tags(&alloc).unwrap().to_vec().unwrap(),
         vec![1u32, 2, 3]
     );
 
     // The clone's data blocks are fresh allocations, distinct from the original's.
-    let clone_name_off = clone.handle().name(&alloc).unwrap().descriptor().data_off;
+    let clone_name_off = clone
+        .handle()
+        .get_name(&alloc)
+        .unwrap()
+        .descriptor()
+        .data_off;
     assert_ne!(clone_name_off, orig_name_off);
 
     // Growing the clone's vector leaves the original untouched (independent data).
-    let mut ct = clone.handle().tags(&alloc).unwrap();
+    let mut ct = clone.handle().get_tags(&alloc).unwrap();
     ct.push(99).unwrap();
     assert_eq!(
-        clone.handle().tags(&alloc).unwrap().to_vec().unwrap(),
+        clone.handle().get_tags(&alloc).unwrap().to_vec().unwrap(),
         vec![1u32, 2, 3, 99]
     );
     assert_eq!(
-        rec.handle().tags(&alloc).unwrap().to_vec().unwrap(),
+        rec.handle().get_tags(&alloc).unwrap().to_vec().unwrap(),
         vec![1u32, 2, 3]
     );
 
@@ -1350,7 +1380,7 @@ fn macro_clone_owned_vec() {
     let tree = Tree::new(&alloc, kids, 7).unwrap();
     let orig_first = tree
         .handle()
-        .kids(&alloc)
+        .get_kids(&alloc)
         .unwrap()
         .get(0)
         .unwrap()
@@ -1359,13 +1389,13 @@ fn macro_clone_owned_vec() {
         .start();
 
     let clone = tree.try_clone_in(&alloc).unwrap();
-    let cv = clone.handle().kids(&alloc).unwrap();
+    let cv = clone.handle().get_kids(&alloc).unwrap();
     assert_eq!(cv.len().unwrap(), 2);
     let vals: Vec<u32> = cv
         .to_vec()
         .unwrap()
         .iter()
-        .map(|k| k.val(stack).unwrap())
+        .map(|k| k.get_val(stack).unwrap())
         .collect();
     assert_eq!(vals, vec![10, 20]);
 
@@ -1377,12 +1407,12 @@ fn macro_clone_owned_vec() {
     clone.bstack_drop(&alloc).unwrap();
     assert_eq!(
         tree.handle()
-            .kids(&alloc)
+            .get_kids(&alloc)
             .unwrap()
             .get(0)
             .unwrap()
             .unwrap()
-            .val(stack)
+            .get_val(stack)
             .unwrap(),
         10
     );
@@ -1416,7 +1446,7 @@ fn macro_clone_strong_vec() {
     list.bstack_drop(&alloc).unwrap();
     assert_eq!(strong_of(stack, a_data), 1);
     assert_eq!(strong_of(stack, b_data), 1);
-    assert_eq!(a_keep.handle().val(stack).unwrap(), 100);
+    assert_eq!(a_keep.handle().get_val(stack).unwrap(), 100);
     drop(a_keep);
     drop(b_keep);
 }
@@ -1458,16 +1488,16 @@ fn macro_strong_block_vec() {
     let list = StrongList::new(&alloc, vec![a, b], 3).unwrap();
     assert_eq!(strong_of(stack, a_data), 2); // list + a_clone
 
-    let v = list.handle().items(&alloc).unwrap();
+    let v = list.handle().get_items(&alloc).unwrap();
     assert_eq!(v.len().unwrap(), 2);
-    assert_eq!(v.get(0).unwrap().unwrap().val(stack).unwrap(), 100);
+    assert_eq!(v.get(0).unwrap().unwrap().get_val(stack).unwrap(), 100);
 
     // Freeing the list releases every element's strong ref: `b` (sole owner) is
     // freed; `a` survives via `a_clone`.
     list.bstack_drop(&alloc).unwrap();
     assert_eq!(strong_of(stack, a_data), 1); // a_clone only
 
-    assert_eq!(a_clone.handle().val(stack).unwrap(), 100);
+    assert_eq!(a_clone.handle().get_val(stack).unwrap(), 100);
     drop(a_clone); // a freed now
 }
 
@@ -1495,18 +1525,18 @@ fn macro_weak_block_vec() {
     )
     .unwrap();
 
-    let v = list.handle().watchers(&alloc).unwrap();
+    let v = list.handle().get_watchers(&alloc).unwrap();
     assert_eq!(v.len().unwrap(), 2);
 
     // Upgrade element 0 while `a` is alive.
     let up = v.upgrade(0).unwrap().expect("a alive");
-    assert_eq!(up.handle().val(stack).unwrap(), 1);
+    assert_eq!(up.handle().get_val(stack).unwrap(), 1);
     drop(up);
 
     // Drop `a`'s data block: element 0 can no longer upgrade (sound — the vector
     // stores control offsets, not freed data offsets).
     drop(a);
-    let v = list.handle().watchers(&alloc).unwrap();
+    let v = list.handle().get_watchers(&alloc).unwrap();
     assert!(v.upgrade(0).unwrap().is_none());
     assert!(v.upgrade(1).unwrap().is_some()); // b still alive
 
@@ -1537,14 +1567,14 @@ fn macro_ref_block_vec() {
     ];
     let list = RefList::new(&alloc, refs, 9).unwrap();
 
-    let v = list.handle().links(&alloc).unwrap();
+    let v = list.handle().get_links(&alloc).unwrap();
     assert_eq!(v.len().unwrap(), 2);
-    assert_eq!(v.get(1).unwrap().unwrap().val(stack).unwrap(), 8);
+    assert_eq!(v.get(1).unwrap().unwrap().get_val(stack).unwrap(), 8);
 
     // Freeing the list frees only the offset array + descriptor, not the targets.
     list.bstack_drop(&alloc).unwrap();
-    assert_eq!(a.handle().val(stack).unwrap(), 7); // still alive
-    assert_eq!(b.handle().val(stack).unwrap(), 8);
+    assert_eq!(a.handle().get_val(stack).unwrap(), 7); // still alive
+    assert_eq!(b.handle().get_val(stack).unwrap(), 8);
 
     a.bstack_drop(&alloc).unwrap();
     b.bstack_drop(&alloc).unwrap();
@@ -1569,10 +1599,10 @@ fn macro_option_vec() {
 
     // Some: constructor takes Option<&[T]> / Option<&str>; accessors resolve.
     let a = OptVec::new(&alloc, Some(&[1u32, 2, 3][..]), Some("hi"), 7).unwrap();
-    assert_eq!(a.handle().id(stack).unwrap(), 7);
+    assert_eq!(a.handle().get_id(stack).unwrap(), 7);
     assert_eq!(
         a.handle()
-            .tags(&alloc)
+            .get_tags(&alloc)
             .unwrap()
             .expect("some")
             .to_vec()
@@ -1581,7 +1611,7 @@ fn macro_option_vec() {
     );
     assert_eq!(
         a.handle()
-            .name(&alloc)
+            .get_name(&alloc)
             .unwrap()
             .expect("some")
             .to_vec()
@@ -1597,9 +1627,9 @@ fn macro_option_vec() {
 
     // None: `0` niche — accessors are None, teardown frees nothing extra.
     let b = OptVec::new(&alloc, None, None, 9).unwrap();
-    assert_eq!(b.handle().id(stack).unwrap(), 9);
-    assert!(b.handle().tags(&alloc).unwrap().is_none());
-    assert!(b.handle().name(&alloc).unwrap().is_none());
+    assert_eq!(b.handle().get_id(stack).unwrap(), 9);
+    assert!(b.handle().get_tags(&alloc).unwrap().is_none());
+    assert!(b.handle().get_name(&alloc).unwrap().is_none());
     b.bstack_drop(&alloc).unwrap();
 }
 
@@ -1642,7 +1672,7 @@ fn macro_enum_basic() {
     let leaf_off = leaf.handle().range().start();
     let e = Node::new(&alloc, NodeData::Child(leaf)).unwrap();
     match e.handle().read(&alloc).unwrap() {
-        NodeView::Child(c) => assert_eq!(c.val(stack).unwrap(), 7),
+        NodeView::Child(c) => assert_eq!(c.get_val(stack).unwrap(), 7),
         _ => panic!("expected Child"),
     }
     e.bstack_drop(&alloc).unwrap();
@@ -1655,11 +1685,11 @@ fn macro_enum_basic() {
     let link = unsafe { BStackRef::from_range(keep.handle().range()) };
     let e = Node::new(&alloc, NodeData::Link(link)).unwrap();
     match e.handle().read(&alloc).unwrap() {
-        NodeView::Link(l) => assert_eq!(l.val(stack).unwrap(), 9),
+        NodeView::Link(l) => assert_eq!(l.get_val(stack).unwrap(), 9),
         _ => panic!("expected Link"),
     }
     e.bstack_drop(&alloc).unwrap();
-    assert_eq!(keep.handle().val(stack).unwrap(), 9); // still alive
+    assert_eq!(keep.handle().get_val(stack).unwrap(), 9); // still alive
     keep.bstack_drop(&alloc).unwrap();
 }
 
@@ -1680,12 +1710,12 @@ fn macro_enum_as_field() {
     let leaf = MacroLeaf::new(&alloc, 5).unwrap();
     let node = Node::new(&alloc, NodeData::Child(leaf)).unwrap();
     let holder = EnumHolder::new(&alloc, node, 3).unwrap();
-    assert_eq!(holder.handle().tag(stack).unwrap(), 3);
+    assert_eq!(holder.handle().get_tag(stack).unwrap(), 3);
 
     // Traverse struct -> enum -> owned child.
-    let node = holder.handle().node(stack).unwrap();
+    let node = holder.handle().get_node(stack).unwrap();
     match node.read(&alloc).unwrap() {
-        NodeView::Child(c) => assert_eq!(c.val(stack).unwrap(), 5),
+        NodeView::Child(c) => assert_eq!(c.get_val(stack).unwrap(), 5),
         _ => panic!("expected Child"),
     }
 
@@ -1724,7 +1754,7 @@ fn macro_enum_rc() {
     let rc2 = rc.try_clone().unwrap(); // strong = 2
 
     match rc.handle().read(&alloc).unwrap() {
-        RcNodeView::Child(c) => assert_eq!(c.val(stack).unwrap(), 4),
+        RcNodeView::Child(c) => assert_eq!(c.get_val(stack).unwrap(), 4),
         _ => panic!("expected Child"),
     }
 
@@ -1754,7 +1784,7 @@ fn macro_enum_rc_weak() {
     let weak = rc.downgrade().unwrap();
 
     match rc.handle().read(&alloc).unwrap() {
-        RcwNodeView::One(c) => assert_eq!(c.val(stack).unwrap(), 8),
+        RcwNodeView::One(c) => assert_eq!(c.get_val(stack).unwrap(), 8),
         _ => panic!("expected One"),
     }
 
@@ -1798,18 +1828,18 @@ fn macro_enum_strong_weak_variants() {
     let keep = child.try_clone().unwrap(); // strong = 2 (observe after the enum drops)
     let cell = Cell::new(&alloc, CellData::Shared(child)).unwrap(); // consumes child's ref
     match cell.handle().read(&alloc).unwrap() {
-        CellView::Shared(c) => assert_eq!(c.val(stack).unwrap(), 11),
+        CellView::Shared(c) => assert_eq!(c.get_val(stack).unwrap(), 11),
         _ => panic!("expected Shared"),
     }
     cell.bstack_drop(&alloc).unwrap(); // releases the enum's strong ref (strong = 1)
-    assert_eq!(keep.handle().val(stack).unwrap(), 11); // still alive
+    assert_eq!(keep.handle().get_val(stack).unwrap(), 11); // still alive
     drop(keep); // strong = 0 — freed
 
     // Weak variant: consumes a BStackWeak; reading upgrades it.
     let owner = MacroStrongChild::new(&alloc, 22).unwrap(); // strong owner
     let cell = Cell::new(&alloc, CellData::Watch(owner.downgrade().unwrap())).unwrap();
     match cell.handle().read(&alloc).unwrap() {
-        CellView::Watch(Some(up)) => assert_eq!(up.handle().val(stack).unwrap(), 22),
+        CellView::Watch(Some(up)) => assert_eq!(up.handle().get_val(stack).unwrap(), 22),
         _ => panic!("expected a live Watch"),
     }
 
@@ -1859,7 +1889,7 @@ fn macro_clone_enum() {
     let c = e.try_clone_in(&alloc).unwrap();
     let clone_child_off = match c.handle().read(&alloc).unwrap() {
         NodeView::Child(ch) => {
-            assert_eq!(ch.val(stack).unwrap(), 7);
+            assert_eq!(ch.get_val(stack).unwrap(), 7);
             ch.range().start()
         }
         _ => panic!("expected Child"),
@@ -1867,7 +1897,7 @@ fn macro_clone_enum() {
     assert_ne!(clone_child_off, orig_child_off); // deep clone, not aliased
     c.bstack_drop(&alloc).unwrap();
     match e.handle().read(&alloc).unwrap() {
-        NodeView::Child(ch) => assert_eq!(ch.val(stack).unwrap(), 7), // original intact
+        NodeView::Child(ch) => assert_eq!(ch.get_val(stack).unwrap(), 7), // original intact
         _ => panic!("expected Child"),
     }
     e.bstack_drop(&alloc).unwrap();
@@ -1879,14 +1909,14 @@ fn macro_clone_enum() {
     let c = e.try_clone_in(&alloc).unwrap();
     match c.handle().read(&alloc).unwrap() {
         NodeView::Link(l) => {
-            assert_eq!(l.val(stack).unwrap(), 9);
+            assert_eq!(l.get_val(stack).unwrap(), 9);
             assert_eq!(l.range().start(), keep.handle().range().start()); // aliased
         }
         _ => panic!("expected Link"),
     }
     c.bstack_drop(&alloc).unwrap();
     e.bstack_drop(&alloc).unwrap();
-    assert_eq!(keep.handle().val(stack).unwrap(), 9); // target untouched
+    assert_eq!(keep.handle().get_val(stack).unwrap(), 9); // target untouched
     keep.bstack_drop(&alloc).unwrap();
 }
 
@@ -1909,7 +1939,7 @@ fn macro_clone_enum_shared() {
     clone.bstack_drop(&alloc).unwrap();
     cell.bstack_drop(&alloc).unwrap();
     assert_eq!(strong_of(stack, data), 1);
-    assert_eq!(keep.handle().val(stack).unwrap(), 11);
+    assert_eq!(keep.handle().get_val(stack).unwrap(), 11);
     drop(keep);
 }
 
@@ -1928,7 +1958,7 @@ fn macro_enum_move() {
     let node = Node::new(&alloc, NodeData::Child(leaf)).unwrap();
     match bstack_move!(node, &alloc).unwrap() {
         NodeData::Child(owned_leaf) => {
-            assert_eq!(owned_leaf.handle().val(stack).unwrap(), 5); // survived the move
+            assert_eq!(owned_leaf.handle().get_val(stack).unwrap(), 5); // survived the move
             owned_leaf.bstack_drop(&alloc).unwrap();
         }
         _ => panic!("expected Child"),
@@ -1956,7 +1986,7 @@ fn macro_enum_move() {
         }
         _ => panic!("expected Link"),
     }
-    assert_eq!(keep.handle().val(stack).unwrap(), 3); // untouched
+    assert_eq!(keep.handle().get_val(stack).unwrap(), 3); // untouched
     keep.bstack_drop(&alloc).unwrap();
 }
 
@@ -1972,12 +2002,12 @@ fn macro_enum_move_shared() {
     let cell = Cell::new(&alloc, CellData::Shared(child)).unwrap();
     match bstack_move!(cell, &alloc).unwrap() {
         CellData::Shared(rc) => {
-            assert_eq!(rc.handle().val(stack).unwrap(), 11);
+            assert_eq!(rc.handle().get_val(stack).unwrap(), 11);
             drop(rc); // releases the moved-out strong ref
         }
         _ => panic!("expected Shared"),
     }
-    assert_eq!(keep.handle().val(stack).unwrap(), 11); // still alive
+    assert_eq!(keep.handle().get_val(stack).unwrap(), 11); // still alive
     drop(keep);
 
     // Weak variant: the BStackWeak is moved out (transferring the weak ref).
@@ -1990,7 +2020,7 @@ fn macro_enum_move_shared() {
                     .unwrap()
                     .expect("alive")
                     .handle()
-                    .val(stack)
+                    .get_val(stack)
                     .unwrap(),
                 22
             );
@@ -2059,7 +2089,7 @@ fn macro_enum_repr_aligned() {
     let leaf = MacroLeaf::new(&alloc, 3).unwrap();
     let e = Aligned::new(&alloc, AlignedData::Y(leaf)).unwrap();
     match e.handle().read(&alloc).unwrap() {
-        AlignedView::Y(c) => assert_eq!(c.val(stack).unwrap(), 3),
+        AlignedView::Y(c) => assert_eq!(c.get_val(stack).unwrap(), 3),
         _ => panic!("expected Y"),
     }
     e.bstack_drop(&alloc).unwrap();
@@ -2250,13 +2280,16 @@ fn macro_pod_option_and_tuple_fields() {
     )
     .unwrap();
     assert_eq!(
-        f.handle().maybe(stack).unwrap(),
+        f.handle().get_maybe(stack).unwrap(),
         core::num::NonZeroU32::new(7)
     );
-    assert_eq!(f.handle().wrap(stack).unwrap(), core::num::Wrapping(42u32));
-    assert_eq!(f.handle().pair(stack).unwrap(), (1u8, 2u8));
-    assert_eq!(f.handle().mixed(stack).unwrap(), (300u16, -5i32));
-    assert_eq!(f.handle().n(stack).unwrap(), 99);
+    assert_eq!(
+        f.handle().get_wrap(stack).unwrap(),
+        core::num::Wrapping(42u32)
+    );
+    assert_eq!(f.handle().get_pair(stack).unwrap(), (1u8, 2u8));
+    assert_eq!(f.handle().get_mixed(stack).unwrap(), (300u16, -5i32));
+    assert_eq!(f.handle().get_n(stack).unwrap(), 99);
 
     // `bstack_move!` returns each tuple as ONE element (not flattened into
     // `(u8, u8, u16, i32, ..)`), so this exact type annotation must hold.
@@ -2275,7 +2308,7 @@ fn macro_pod_option_and_tuple_fields() {
 
     // `Option<A>` None round-trips too (the niche).
     let g = PodFeat::new(&alloc, None, core::num::Wrapping(0), (0, 0), (0, 0), 0).unwrap();
-    assert!(g.handle().maybe(stack).unwrap().is_none());
+    assert!(g.handle().get_maybe(stack).unwrap().is_none());
     g.bstack_drop(&alloc).unwrap();
 }
 
@@ -2302,9 +2335,9 @@ fn macro_unit_and_tuple_structs() {
 
     // Tuple struct: positional constructor, `.field0` / `.field1` / … accessors.
     let c = Rgb::new(&alloc, 10, 20, 30).unwrap();
-    assert_eq!(c.handle().field0(stack).unwrap(), 10);
-    assert_eq!(c.handle().field1(stack).unwrap(), 20);
-    assert_eq!(c.handle().field2(stack).unwrap(), 30);
+    assert_eq!(c.handle().get_field0(stack).unwrap(), 10);
+    assert_eq!(c.handle().get_field1(stack).unwrap(), 20);
+    assert_eq!(c.handle().get_field2(stack).unwrap(), 30);
 
     // bstack_move! yields the fields in order.
     let (r, g, b) = bstack_move!(c, &alloc).unwrap();
@@ -2347,10 +2380,10 @@ fn macro_embed_struct_and_enum() {
     let leaf = MacroLeaf::new(&alloc, 42).unwrap();
     let child = EmbChild::new(&alloc, leaf, 7).unwrap();
     let holder = EmbHolder::new(&alloc, child, 99).unwrap();
-    assert_eq!(holder.handle().tag(stack).unwrap(), 99);
-    let c = holder.handle().child(); // a handle into the inline region (no I/O)
-    assert_eq!(c.n(stack).unwrap(), 7);
-    assert_eq!(c.leaf(stack).unwrap().val(stack).unwrap(), 42);
+    assert_eq!(holder.handle().get_tag(stack).unwrap(), 99);
+    let c = holder.handle().get_child(); // a handle into the inline region (no I/O)
+    assert_eq!(c.get_n(stack).unwrap(), 7);
+    assert_eq!(c.get_leaf(stack).unwrap().get_val(stack).unwrap(), 42);
 
     // Teardown frees the embedded child's owned leaf *in place*, then the holder —
     // reclaimed with no leak (proof the embed recursed).
@@ -2367,7 +2400,15 @@ fn macro_embed_struct_and_enum() {
     let holder = EmbHolder::new(&alloc, child, 1).unwrap();
     let (moved, tag) = bstack_move!(holder, &alloc).unwrap();
     assert_eq!(tag, 1);
-    assert_eq!(moved.handle().leaf(stack).unwrap().val(stack).unwrap(), 5);
+    assert_eq!(
+        moved
+            .handle()
+            .get_leaf(stack)
+            .unwrap()
+            .get_val(stack)
+            .unwrap(),
+        5
+    );
     moved.bstack_drop(&alloc).unwrap();
 
     // Enum embed: construct, read (a borrowed child handle), move out.
@@ -2375,14 +2416,14 @@ fn macro_embed_struct_and_enum() {
     let child = EmbChild::new(&alloc, leaf, 9).unwrap();
     let e = EmbEnum::new(&alloc, EmbEnumData::Wrap(child)).unwrap();
     match e.handle().read(&alloc).unwrap() {
-        EmbEnumView::Wrap(c) => assert_eq!(c.leaf(stack).unwrap().val(stack).unwrap(), 3),
+        EmbEnumView::Wrap(c) => assert_eq!(c.get_leaf(stack).unwrap().get_val(stack).unwrap(), 3),
         _ => panic!("expected Wrap"),
     }
     let moved = match bstack_move!(e, &alloc).unwrap() {
         EmbEnumData::Wrap(c) => c,
         _ => panic!("expected Wrap"),
     };
-    assert_eq!(moved.handle().n(stack).unwrap(), 9);
+    assert_eq!(moved.handle().get_n(stack).unwrap(), 9);
     moved.bstack_drop(&alloc).unwrap();
 }
 
@@ -2396,17 +2437,23 @@ fn macro_clone_embed() {
     let leaf = MacroLeaf::new(&alloc, 42).unwrap();
     let child = EmbChild::new(&alloc, leaf, 7).unwrap();
     let holder = EmbHolder::new(&alloc, child, 99).unwrap();
-    let orig_leaf_off = holder.handle().child().leaf(stack).unwrap().range().start();
+    let orig_leaf_off = holder
+        .handle()
+        .get_child()
+        .get_leaf(stack)
+        .unwrap()
+        .range()
+        .start();
 
     let clone = holder.try_clone_in(&alloc).unwrap();
-    assert_eq!(clone.handle().tag(stack).unwrap(), 99);
-    let cc = clone.handle().child();
-    assert_eq!(cc.n(stack).unwrap(), 7);
-    assert_eq!(cc.leaf(stack).unwrap().val(stack).unwrap(), 42);
+    assert_eq!(clone.handle().get_tag(stack).unwrap(), 99);
+    let cc = clone.handle().get_child();
+    assert_eq!(cc.get_n(stack).unwrap(), 7);
+    assert_eq!(cc.get_leaf(stack).unwrap().get_val(stack).unwrap(), 42);
 
     // The embedded child's OWN owned leaf was deep-cloned into a fresh block
     // (the inline region was folded, not just byte-copied with an aliased offset).
-    let clone_leaf_off = cc.leaf(stack).unwrap().range().start();
+    let clone_leaf_off = cc.get_leaf(stack).unwrap().range().start();
     assert_ne!(clone_leaf_off, orig_leaf_off);
 
     // Freeing the clone frees only the clone's leaf; the original stays intact.
@@ -2414,10 +2461,10 @@ fn macro_clone_embed() {
     assert_eq!(
         holder
             .handle()
-            .child()
-            .leaf(stack)
+            .get_child()
+            .get_leaf(stack)
             .unwrap()
-            .val(stack)
+            .get_val(stack)
             .unwrap(),
         42
     );
@@ -2428,21 +2475,21 @@ fn macro_clone_embed() {
     let child = EmbChild::new(&alloc, leaf, 9).unwrap();
     let e = EmbEnum::new(&alloc, EmbEnumData::Wrap(child)).unwrap();
     let orig_off = match e.handle().read(&alloc).unwrap() {
-        EmbEnumView::Wrap(c) => c.leaf(stack).unwrap().range().start(),
+        EmbEnumView::Wrap(c) => c.get_leaf(stack).unwrap().range().start(),
         _ => panic!("expected Wrap"),
     };
     let ce = e.try_clone_in(&alloc).unwrap();
     let clone_off = match ce.handle().read(&alloc).unwrap() {
         EmbEnumView::Wrap(c) => {
-            assert_eq!(c.leaf(stack).unwrap().val(stack).unwrap(), 3);
-            c.leaf(stack).unwrap().range().start()
+            assert_eq!(c.get_leaf(stack).unwrap().get_val(stack).unwrap(), 3);
+            c.get_leaf(stack).unwrap().range().start()
         }
         _ => panic!("expected Wrap"),
     };
     assert_ne!(clone_off, orig_off); // deep-cloned, not aliased
     ce.bstack_drop(&alloc).unwrap();
     match e.handle().read(&alloc).unwrap() {
-        EmbEnumView::Wrap(c) => assert_eq!(c.leaf(stack).unwrap().val(stack).unwrap(), 3),
+        EmbEnumView::Wrap(c) => assert_eq!(c.get_leaf(stack).unwrap().get_val(stack).unwrap(), 3),
         _ => panic!("expected Wrap"),
     }
     e.bstack_drop(&alloc).unwrap();
@@ -2568,8 +2615,8 @@ fn macro_pod_array() {
     let alloc = tmp.allocator();
     let stack = alloc.stack();
     let p = PodArr::new(&alloc, [1u16, 2, 3, 4], 9).unwrap();
-    assert_eq!(p.handle().xs(stack).unwrap(), [1u16, 2, 3, 4]);
-    assert_eq!(p.handle().tag(stack).unwrap(), 9);
+    assert_eq!(p.handle().get_xs(stack).unwrap(), [1u16, 2, 3, 4]);
+    assert_eq!(p.handle().get_tag(stack).unwrap(), 9);
     p.bstack_drop(&alloc).unwrap();
 }
 
@@ -2591,11 +2638,11 @@ fn macro_owned_array() {
     let l2 = MacroLeaf::new(&alloc, 30).unwrap();
 
     let h = ArrHolder::new(&alloc, [l0, l1, l2], 7).unwrap();
-    assert_eq!(h.handle().tag(stack).unwrap(), 7);
-    let arr = h.handle().leaves(stack).unwrap(); // [MacroLeaf; 3]
-    assert_eq!(arr[0].val(stack).unwrap(), 10);
-    assert_eq!(arr[1].val(stack).unwrap(), 20);
-    assert_eq!(arr[2].val(stack).unwrap(), 30);
+    assert_eq!(h.handle().get_tag(stack).unwrap(), 7);
+    let arr = h.handle().get_leaves(stack).unwrap(); // [MacroLeaf; 3]
+    assert_eq!(arr[0].get_val(stack).unwrap(), 10);
+    assert_eq!(arr[1].get_val(stack).unwrap(), 20);
+    assert_eq!(arr[2].get_val(stack).unwrap(), 30);
 
     // Teardown frees all three inline children — reclaimed with no leak.
     h.bstack_drop(&alloc).unwrap();
@@ -2625,14 +2672,19 @@ fn macro_owned_array_clone() {
     .unwrap();
 
     let clone = h.try_clone_in(&alloc).unwrap();
-    let carr = clone.handle().leaves(stack).unwrap();
-    let oarr = h.handle().leaves(stack).unwrap();
-    assert_eq!(carr[1].val(stack).unwrap(), 2);
+    let carr = clone.handle().get_leaves(stack).unwrap();
+    let oarr = h.handle().get_leaves(stack).unwrap();
+    assert_eq!(carr[1].get_val(stack).unwrap(), 2);
     // Deep-cloned: each clone element is a fresh block, distinct from the original.
     assert_ne!(carr[0].range().start(), oarr[0].range().start());
 
     clone.bstack_drop(&alloc).unwrap();
-    assert_eq!(h.handle().leaves(stack).unwrap()[2].val(stack).unwrap(), 3);
+    assert_eq!(
+        h.handle().get_leaves(stack).unwrap()[2]
+            .get_val(stack)
+            .unwrap(),
+        3
+    );
     h.bstack_drop(&alloc).unwrap();
 }
 
@@ -2653,13 +2705,13 @@ fn macro_ref_array() {
     let r1 = unsafe { BStackRef::from_range(l1.handle().range()) };
 
     let h = RefArrHolder::new(&alloc, [r0, r1]).unwrap();
-    let arr = h.handle().refs(stack).unwrap();
-    assert_eq!(arr[0].val(stack).unwrap(), 1);
-    assert_eq!(arr[1].val(stack).unwrap(), 2);
+    let arr = h.handle().get_refs(stack).unwrap();
+    assert_eq!(arr[0].get_val(stack).unwrap(), 1);
+    assert_eq!(arr[1].get_val(stack).unwrap(), 2);
 
     // A ref array owns nothing: dropping the holder leaves the targets alive.
     h.bstack_drop(&alloc).unwrap();
-    assert_eq!(l0.handle().val(stack).unwrap(), 1);
+    assert_eq!(l0.handle().get_val(stack).unwrap(), 1);
     l0.bstack_drop(&alloc).unwrap();
     l1.bstack_drop(&alloc).unwrap();
 }
@@ -2681,8 +2733,8 @@ fn macro_strong_array() {
     let keep0 = c0.try_clone().unwrap();
 
     let h = StrongArrHolder::new(&alloc, [c0, c1]).unwrap();
-    let arr = h.handle().shared(stack).unwrap();
-    assert_eq!(arr[0].val(stack).unwrap(), 5);
+    let arr = h.handle().get_shared(stack).unwrap();
+    assert_eq!(arr[0].get_val(stack).unwrap(), 5);
 
     // Cloning the holder re-references each shared child: strong count +1.
     let d0 = arr[0].range().start();
@@ -2696,7 +2748,7 @@ fn macro_strong_array() {
     clone.bstack_drop(&alloc).unwrap();
     h.bstack_drop(&alloc).unwrap();
     assert_eq!(crate::refcount::load(stack, strong0).unwrap(), before - 1);
-    assert_eq!(keep0.handle().val(stack).unwrap(), 5);
+    assert_eq!(keep0.handle().get_val(stack).unwrap(), 5);
     drop(keep0);
 }
 
@@ -2717,8 +2769,8 @@ fn macro_owned_array_move() {
     .unwrap();
     let (leaves, tag) = bstack_move!(h, &alloc).unwrap();
     assert_eq!(tag, 7);
-    assert_eq!(leaves[0].handle().val(stack).unwrap(), 10);
-    assert_eq!(leaves[2].handle().val(stack).unwrap(), 30);
+    assert_eq!(leaves[0].handle().get_val(stack).unwrap(), 10);
+    assert_eq!(leaves[2].handle().get_val(stack).unwrap(), 30);
     for l in leaves {
         l.bstack_drop(&alloc).unwrap();
     }
@@ -2740,7 +2792,7 @@ fn macro_weak_array() {
 
     // Weak arrays start null (not a ctor parameter).
     let h = WeakArrHolder::new(&alloc).unwrap();
-    let arr = h.handle().weaks(&alloc).unwrap();
+    let arr = h.handle().get_weaks(&alloc).unwrap();
     assert!(arr[0].is_none() && arr[1].is_none());
 
     // Wire each element via the per-index setter.
@@ -2752,22 +2804,25 @@ fn macro_weak_array() {
         .unwrap();
 
     // The accessor upgrades each live element.
-    let arr = h.handle().weaks(&alloc).unwrap();
-    assert_eq!(arr[0].as_ref().unwrap().handle().val(stack).unwrap(), 5);
-    assert_eq!(arr[1].as_ref().unwrap().handle().val(stack).unwrap(), 6);
+    let arr = h.handle().get_weaks(&alloc).unwrap();
+    assert_eq!(arr[0].as_ref().unwrap().handle().get_val(stack).unwrap(), 5);
+    assert_eq!(arr[1].as_ref().unwrap().handle().get_val(stack).unwrap(), 6);
     drop(arr);
 
     // Cloning aliases the same control blocks (weak counts bumped).
     let clone = h.try_clone_in(&alloc).unwrap();
-    let carr = clone.handle().weaks(&alloc).unwrap();
-    assert_eq!(carr[0].as_ref().unwrap().handle().val(stack).unwrap(), 5);
+    let carr = clone.handle().get_weaks(&alloc).unwrap();
+    assert_eq!(
+        carr[0].as_ref().unwrap().handle().get_val(stack).unwrap(),
+        5
+    );
     drop(carr);
 
     // Both holders' teardown releases the weak refs (no underflow); c0/c1 live.
     clone.bstack_drop(&alloc).unwrap();
     h.bstack_drop(&alloc).unwrap();
-    assert_eq!(c0.handle().val(stack).unwrap(), 5);
-    assert_eq!(c1.handle().val(stack).unwrap(), 6);
+    assert_eq!(c0.handle().get_val(stack).unwrap(), 5);
+    assert_eq!(c1.handle().get_val(stack).unwrap(), 6);
     drop(c0);
     drop(c1);
 }
@@ -2791,15 +2846,15 @@ fn macro_owned_option_array() {
     let off0 = l0.handle().range().start();
     let h = OptArrHolder::new(&alloc, [Some(l0), None, Some(l2)]).unwrap();
 
-    let arr = h.handle().leaves(stack).unwrap(); // [Option<MacroLeaf>; 3]
-    assert_eq!(arr[0].as_ref().unwrap().val(stack).unwrap(), 10);
+    let arr = h.handle().get_leaves(stack).unwrap(); // [Option<MacroLeaf>; 3]
+    assert_eq!(arr[0].as_ref().unwrap().get_val(stack).unwrap(), 10);
     assert!(arr[1].is_none());
-    assert_eq!(arr[2].as_ref().unwrap().val(stack).unwrap(), 30);
+    assert_eq!(arr[2].as_ref().unwrap().get_val(stack).unwrap(), 30);
 
     // Clone deep-copies the present elements, keeps the hole.
     let clone = h.try_clone_in(&alloc).unwrap();
-    let carr = clone.handle().leaves(stack).unwrap();
-    assert_eq!(carr[0].as_ref().unwrap().val(stack).unwrap(), 10);
+    let carr = clone.handle().get_leaves(stack).unwrap();
+    assert_eq!(carr[0].as_ref().unwrap().get_val(stack).unwrap(), 10);
     assert!(carr[1].is_none());
     assert_ne!(
         carr[0].as_ref().unwrap().range().start(),
@@ -2809,7 +2864,10 @@ fn macro_owned_option_array() {
     // Move yields `[Option<BStackOwned<MacroLeaf>>; 3]`.
     clone.bstack_drop(&alloc).unwrap();
     let (moved,) = bstack_move!(h, &alloc).unwrap();
-    assert_eq!(moved[2].as_ref().unwrap().handle().val(stack).unwrap(), 30);
+    assert_eq!(
+        moved[2].as_ref().unwrap().handle().get_val(stack).unwrap(),
+        30
+    );
     assert!(moved[1].is_none());
     for o in moved.into_iter().flatten() {
         o.bstack_drop(&alloc).unwrap();
@@ -2836,12 +2894,12 @@ fn macro_ref_option_array() {
 
     // Element 1 is a null reference.
     let h = OptRefArrHolder::new(&alloc, [Some(r0), None]).unwrap();
-    let arr = h.handle().refs(stack).unwrap(); // [Option<MacroLeaf>; 2]
-    assert_eq!(arr[0].as_ref().unwrap().val(stack).unwrap(), 1);
+    let arr = h.handle().get_refs(stack).unwrap(); // [Option<MacroLeaf>; 2]
+    assert_eq!(arr[0].as_ref().unwrap().get_val(stack).unwrap(), 1);
     assert!(arr[1].is_none());
 
     h.bstack_drop(&alloc).unwrap(); // owns nothing
-    assert_eq!(l0.handle().val(stack).unwrap(), 1);
+    assert_eq!(l0.handle().get_val(stack).unwrap(), 1);
     l0.bstack_drop(&alloc).unwrap();
 }
 
@@ -2864,7 +2922,7 @@ fn macro_pod_option_array() {
         ],
     )
     .unwrap();
-    let arr = p.handle().xs(stack).unwrap(); // [Option<NonZeroU32>; 3]
+    let arr = p.handle().get_xs(stack).unwrap(); // [Option<NonZeroU32>; 3]
     assert_eq!(arr[0].map(|n| n.get()), Some(5));
     assert!(arr[1].is_none());
     assert_eq!(arr[2].map(|n| n.get()), Some(9));
@@ -2888,28 +2946,31 @@ fn macro_embed_array() {
     let k0 = EmbChild::new(&alloc, MacroLeaf::new(&alloc, 10).unwrap(), 1).unwrap();
     let k1 = EmbChild::new(&alloc, MacroLeaf::new(&alloc, 20).unwrap(), 2).unwrap();
     let h = EmbArrHolder::new(&alloc, [k0, k1], 99).unwrap();
-    assert_eq!(h.handle().tag(stack).unwrap(), 99);
+    assert_eq!(h.handle().get_tag(stack).unwrap(), 99);
 
     // Accessor: `[EmbChild; 2]` handles into the inline slots (pure offset math).
-    let kids = h.handle().kids();
-    assert_eq!(kids[0].n(stack).unwrap(), 1);
-    assert_eq!(kids[0].leaf(stack).unwrap().val(stack).unwrap(), 10);
-    assert_eq!(kids[1].leaf(stack).unwrap().val(stack).unwrap(), 20);
+    let kids = h.handle().get_kids();
+    assert_eq!(kids[0].get_n(stack).unwrap(), 1);
+    assert_eq!(kids[0].get_leaf(stack).unwrap().get_val(stack).unwrap(), 10);
+    assert_eq!(kids[1].get_leaf(stack).unwrap().get_val(stack).unwrap(), 20);
 
     // Clone folds each embedded child inline, deep-cloning its owned leaf.
     let clone = h.try_clone_in(&alloc).unwrap();
-    let ckids = clone.handle().kids();
-    assert_eq!(ckids[1].leaf(stack).unwrap().val(stack).unwrap(), 20);
+    let ckids = clone.handle().get_kids();
+    assert_eq!(
+        ckids[1].get_leaf(stack).unwrap().get_val(stack).unwrap(),
+        20
+    );
     assert_ne!(
-        ckids[0].leaf(stack).unwrap().range().start(),
-        kids[0].leaf(stack).unwrap().range().start()
+        ckids[0].get_leaf(stack).unwrap().range().start(),
+        kids[0].get_leaf(stack).unwrap().range().start()
     );
     clone.bstack_drop(&alloc).unwrap();
     assert_eq!(
-        h.handle().kids()[1]
-            .leaf(stack)
+        h.handle().get_kids()[1]
+            .get_leaf(stack)
             .unwrap()
-            .val(stack)
+            .get_val(stack)
             .unwrap(),
         20
     );
@@ -2918,7 +2979,12 @@ fn macro_embed_array() {
     let (moved, tag) = bstack_move!(h, &alloc).unwrap();
     assert_eq!(tag, 99);
     assert_eq!(
-        moved[0].handle().leaf(stack).unwrap().val(stack).unwrap(),
+        moved[0]
+            .handle()
+            .get_leaf(stack)
+            .unwrap()
+            .get_val(stack)
+            .unwrap(),
         10
     );
     for m in moved {
@@ -2949,8 +3015,8 @@ fn macro_enum_owned_array() {
     .unwrap();
     match e.handle().read(&alloc).unwrap() {
         ArrEnumView::Leaves(arr) => {
-            assert_eq!(arr[0].val(stack).unwrap(), 10);
-            assert_eq!(arr[1].val(stack).unwrap(), 20);
+            assert_eq!(arr[0].get_val(stack).unwrap(), 10);
+            assert_eq!(arr[1].get_val(stack).unwrap(), 20);
         }
         _ => panic!("expected Leaves"),
     }
@@ -2958,7 +3024,7 @@ fn macro_enum_owned_array() {
     // Clone deep-copies each element.
     let clone = e.try_clone_in(&alloc).unwrap();
     match clone.handle().read(&alloc).unwrap() {
-        ArrEnumView::Leaves(arr) => assert_eq!(arr[0].val(stack).unwrap(), 10),
+        ArrEnumView::Leaves(arr) => assert_eq!(arr[0].get_val(stack).unwrap(), 10),
         _ => panic!("expected Leaves"),
     }
     clone.bstack_drop(&alloc).unwrap();
@@ -2966,7 +3032,7 @@ fn macro_enum_owned_array() {
     // Move yields `[BStackOwned<MacroLeaf>; 2]`.
     match bstack_move!(e, &alloc).unwrap() {
         ArrEnumData::Leaves(arr) => {
-            assert_eq!(arr[1].handle().val(stack).unwrap(), 20);
+            assert_eq!(arr[1].handle().get_val(stack).unwrap(), 20);
             for l in arr {
                 l.bstack_drop(&alloc).unwrap();
             }
@@ -2999,13 +3065,13 @@ fn macro_enum_ref_array() {
     .unwrap();
     match e.handle().read(&alloc).unwrap() {
         RefArrEnumView::Refs(arr) => {
-            assert_eq!(arr[0].val(stack).unwrap(), 1);
-            assert_eq!(arr[1].val(stack).unwrap(), 2);
+            assert_eq!(arr[0].get_val(stack).unwrap(), 1);
+            assert_eq!(arr[1].get_val(stack).unwrap(), 2);
         }
         _ => panic!("expected Refs"),
     }
     e.bstack_drop(&alloc).unwrap(); // owns nothing
-    assert_eq!(l0.handle().val(stack).unwrap(), 1);
+    assert_eq!(l0.handle().get_val(stack).unwrap(), 1);
     l0.bstack_drop(&alloc).unwrap();
     l1.bstack_drop(&alloc).unwrap();
 }
@@ -3027,14 +3093,14 @@ fn macro_enum_strong_array() {
     let keep0 = c0.try_clone().unwrap();
     let e = StrongArrEnum::new(&alloc, StrongArrEnumData::Shared([c0, c1])).unwrap();
     match e.handle().read(&alloc).unwrap() {
-        StrongArrEnumView::Shared(arr) => assert_eq!(arr[0].val(stack).unwrap(), 5),
+        StrongArrEnumView::Shared(arr) => assert_eq!(arr[0].get_val(stack).unwrap(), 5),
         _ => panic!("expected Shared"),
     }
     // Clone re-references each; teardown of both holders returns to keep0's ref.
     let clone = e.try_clone_in(&alloc).unwrap();
     clone.bstack_drop(&alloc).unwrap();
     e.bstack_drop(&alloc).unwrap();
-    assert_eq!(keep0.handle().val(stack).unwrap(), 5);
+    assert_eq!(keep0.handle().get_val(stack).unwrap(), 5);
     drop(keep0);
 }
 
@@ -3059,13 +3125,13 @@ fn macro_enum_weak_array() {
     .unwrap();
     match e.handle().read(&alloc).unwrap() {
         WeakArrEnumView::Weaks(arr) => {
-            assert_eq!(arr[0].as_ref().unwrap().handle().val(stack).unwrap(), 5);
-            assert_eq!(arr[1].as_ref().unwrap().handle().val(stack).unwrap(), 6);
+            assert_eq!(arr[0].as_ref().unwrap().handle().get_val(stack).unwrap(), 5);
+            assert_eq!(arr[1].as_ref().unwrap().handle().get_val(stack).unwrap(), 6);
         }
         _ => panic!("expected Weaks"),
     }
     e.bstack_drop(&alloc).unwrap(); // releases the weak refs
-    assert_eq!(c0.handle().val(stack).unwrap(), 5);
+    assert_eq!(c0.handle().get_val(stack).unwrap(), 5);
     drop(c0);
     drop(c1);
 }
@@ -3108,25 +3174,30 @@ fn macro_owned_nested_array() {
     let mk = |v| MacroLeaf::new(&alloc, v).unwrap();
     let h = OwnedGrid::new(&alloc, [[mk(1), mk(2)], [mk(3), mk(4)]], 7).unwrap();
 
-    assert_eq!(h.handle().tag(stack).unwrap(), 7);
-    let g = h.handle().grid(stack).unwrap(); // [[MacroLeaf; 2]; 2]
-    assert_eq!(g[0][0].val(stack).unwrap(), 1);
-    assert_eq!(g[0][1].val(stack).unwrap(), 2);
-    assert_eq!(g[1][0].val(stack).unwrap(), 3);
-    assert_eq!(g[1][1].val(stack).unwrap(), 4);
+    assert_eq!(h.handle().get_tag(stack).unwrap(), 7);
+    let g = h.handle().get_grid(stack).unwrap(); // [[MacroLeaf; 2]; 2]
+    assert_eq!(g[0][0].get_val(stack).unwrap(), 1);
+    assert_eq!(g[0][1].get_val(stack).unwrap(), 2);
+    assert_eq!(g[1][0].get_val(stack).unwrap(), 3);
+    assert_eq!(g[1][1].get_val(stack).unwrap(), 4);
 
     // Deep clone: fresh blocks, same values.
     let clone = h.try_clone_in(&alloc).unwrap();
-    let cg = clone.handle().grid(stack).unwrap();
-    assert_eq!(cg[1][1].val(stack).unwrap(), 4);
+    let cg = clone.handle().get_grid(stack).unwrap();
+    assert_eq!(cg[1][1].get_val(stack).unwrap(), 4);
     assert_ne!(cg[0][0].range().start(), g[0][0].range().start());
     clone.bstack_drop(&alloc).unwrap();
-    assert_eq!(h.handle().grid(stack).unwrap()[1][0].val(stack).unwrap(), 3);
+    assert_eq!(
+        h.handle().get_grid(stack).unwrap()[1][0]
+            .get_val(stack)
+            .unwrap(),
+        3
+    );
 
     // Move: nested owning handles.
     let (moved, tag) = bstack_move!(h, &alloc).unwrap();
     assert_eq!(tag, 7);
-    assert_eq!(moved[1][1].handle().val(stack).unwrap(), 4);
+    assert_eq!(moved[1][1].handle().get_val(stack).unwrap(), 4);
     for row in moved {
         for m in row {
             m.bstack_drop(&alloc).unwrap();
@@ -3150,16 +3221,16 @@ fn macro_ref_nested3_array() {
     let r = |i: usize| unsafe { BStackRef::from_range(leaves[i].handle().range()) };
     let h = RefCube::new(&alloc, [[[r(0), r(1)]], [[r(2), r(3)]]]).unwrap();
 
-    let c = h.handle().cube(stack).unwrap(); // [[[MacroLeaf; 2]; 1]; 2]
-    assert_eq!(c[0][0][0].val(stack).unwrap(), 0);
-    assert_eq!(c[0][0][1].val(stack).unwrap(), 1);
-    assert_eq!(c[1][0][0].val(stack).unwrap(), 2);
-    assert_eq!(c[1][0][1].val(stack).unwrap(), 3);
+    let c = h.handle().get_cube(stack).unwrap(); // [[[MacroLeaf; 2]; 1]; 2]
+    assert_eq!(c[0][0][0].get_val(stack).unwrap(), 0);
+    assert_eq!(c[0][0][1].get_val(stack).unwrap(), 1);
+    assert_eq!(c[1][0][0].get_val(stack).unwrap(), 2);
+    assert_eq!(c[1][0][1].get_val(stack).unwrap(), 3);
 
     // A ref cube owns nothing: dropping leaves targets alive.
     h.bstack_drop(&alloc).unwrap();
     for l in leaves {
-        assert!(l.handle().val(stack).unwrap() < 4);
+        assert!(l.handle().get_val(stack).unwrap() < 4);
         l.bstack_drop(&alloc).unwrap();
     }
 }
@@ -3179,18 +3250,21 @@ fn macro_embed_nested_array() {
 
     let k = |v| EmbChild::new(&alloc, MacroLeaf::new(&alloc, v).unwrap(), v).unwrap();
     let h = EmbGrid::new(&alloc, [[k(10), k(20)]], 5).unwrap();
-    assert_eq!(h.handle().tag(stack).unwrap(), 5);
+    assert_eq!(h.handle().get_tag(stack).unwrap(), 5);
 
-    let g = h.handle().kids(); // [[EmbChild; 2]; 1]
-    assert_eq!(g[0][0].leaf(stack).unwrap().val(stack).unwrap(), 10);
-    assert_eq!(g[0][1].leaf(stack).unwrap().val(stack).unwrap(), 20);
+    let g = h.handle().get_kids(); // [[EmbChild; 2]; 1]
+    assert_eq!(g[0][0].get_leaf(stack).unwrap().get_val(stack).unwrap(), 10);
+    assert_eq!(g[0][1].get_leaf(stack).unwrap().get_val(stack).unwrap(), 20);
 
     let clone = h.try_clone_in(&alloc).unwrap();
-    let cg = clone.handle().kids();
-    assert_eq!(cg[0][1].leaf(stack).unwrap().val(stack).unwrap(), 20);
+    let cg = clone.handle().get_kids();
+    assert_eq!(
+        cg[0][1].get_leaf(stack).unwrap().get_val(stack).unwrap(),
+        20
+    );
     assert_ne!(
-        cg[0][0].leaf(stack).unwrap().range().start(),
-        g[0][0].leaf(stack).unwrap().range().start()
+        cg[0][0].get_leaf(stack).unwrap().range().start(),
+        g[0][0].get_leaf(stack).unwrap().range().start()
     );
     clone.bstack_drop(&alloc).unwrap();
 
@@ -3199,9 +3273,9 @@ fn macro_embed_nested_array() {
     assert_eq!(
         moved[0][0]
             .handle()
-            .leaf(stack)
+            .get_leaf(stack)
             .unwrap()
-            .val(stack)
+            .get_val(stack)
             .unwrap(),
         10
     );
@@ -3240,9 +3314,9 @@ fn macro_enum_owned_option_array() {
     .unwrap();
     match e.handle().read(&alloc).unwrap() {
         OptArrEnumView::Slots(arr) => {
-            assert_eq!(arr[0].map(|h| h.val(stack).unwrap()), Some(10));
+            assert_eq!(arr[0].map(|h| h.get_val(stack).unwrap()), Some(10));
             assert!(arr[1].is_none());
-            assert_eq!(arr[2].map(|h| h.val(stack).unwrap()), Some(30));
+            assert_eq!(arr[2].map(|h| h.get_val(stack).unwrap()), Some(30));
         }
         _ => panic!("expected Slots"),
     }
@@ -3250,7 +3324,7 @@ fn macro_enum_owned_option_array() {
     let clone = e.try_clone_in(&alloc).unwrap();
     match clone.handle().read(&alloc).unwrap() {
         OptArrEnumView::Slots(arr) => {
-            assert_eq!(arr[2].map(|h| h.val(stack).unwrap()), Some(30));
+            assert_eq!(arr[2].map(|h| h.get_val(stack).unwrap()), Some(30));
             assert!(arr[1].is_none());
         }
         _ => panic!("expected Slots"),
@@ -3260,7 +3334,7 @@ fn macro_enum_owned_option_array() {
     match bstack_move!(e, &alloc).unwrap() {
         OptArrEnumData::Slots(arr) => {
             assert_eq!(
-                arr[0].as_ref().map(|h| h.handle().val(stack).unwrap()),
+                arr[0].as_ref().map(|h| h.handle().get_val(stack).unwrap()),
                 Some(10)
             );
             assert!(arr[1].is_none());
@@ -3290,8 +3364,8 @@ fn macro_enum_embed_array() {
 
     match e.handle().read(&alloc).unwrap() {
         EmbArrEnumView::Kids(arr) => {
-            assert_eq!(arr[0].leaf(stack).unwrap().val(stack).unwrap(), 10);
-            assert_eq!(arr[1].leaf(stack).unwrap().val(stack).unwrap(), 20);
+            assert_eq!(arr[0].get_leaf(stack).unwrap().get_val(stack).unwrap(), 10);
+            assert_eq!(arr[1].get_leaf(stack).unwrap().get_val(stack).unwrap(), 20);
         }
         _ => panic!("expected Kids"),
     }
@@ -3299,7 +3373,7 @@ fn macro_enum_embed_array() {
     let clone = e.try_clone_in(&alloc).unwrap();
     match clone.handle().read(&alloc).unwrap() {
         EmbArrEnumView::Kids(arr) => {
-            assert_eq!(arr[1].leaf(stack).unwrap().val(stack).unwrap(), 20)
+            assert_eq!(arr[1].get_leaf(stack).unwrap().get_val(stack).unwrap(), 20)
         }
         _ => panic!("expected Kids"),
     }
@@ -3307,7 +3381,15 @@ fn macro_enum_embed_array() {
 
     match bstack_move!(e, &alloc).unwrap() {
         EmbArrEnumData::Kids(arr) => {
-            assert_eq!(arr[0].handle().leaf(stack).unwrap().val(stack).unwrap(), 10);
+            assert_eq!(
+                arr[0]
+                    .handle()
+                    .get_leaf(stack)
+                    .unwrap()
+                    .get_val(stack)
+                    .unwrap(),
+                10
+            );
             for m in arr {
                 m.bstack_drop(&alloc).unwrap();
             }
@@ -3337,8 +3419,8 @@ fn macro_enum_owned_nested_array() {
     .unwrap();
     match e.handle().read(&alloc).unwrap() {
         NestArrEnumView::Grid(g) => {
-            assert_eq!(g[0][0].val(stack).unwrap(), 1);
-            assert_eq!(g[1][1].val(stack).unwrap(), 4);
+            assert_eq!(g[0][0].get_val(stack).unwrap(), 1);
+            assert_eq!(g[1][1].get_val(stack).unwrap(), 4);
         }
         _ => panic!("expected Grid"),
     }
@@ -3348,7 +3430,7 @@ fn macro_enum_owned_nested_array() {
 
     match bstack_move!(e, &alloc).unwrap() {
         NestArrEnumData::Grid(g) => {
-            assert_eq!(g[1][0].handle().val(stack).unwrap(), 3);
+            assert_eq!(g[1][0].handle().get_val(stack).unwrap(), 3);
             for row in g {
                 for m in row {
                     m.bstack_drop(&alloc).unwrap();
@@ -3376,31 +3458,31 @@ fn macro_pod_vec_array() {
     let stack = alloc.stack();
 
     let h = PodVecArr::new(&alloc, [&[1u32, 2][..], &[3, 4, 5][..]], 9).unwrap();
-    assert_eq!(h.handle().tag(stack).unwrap(), 9);
+    assert_eq!(h.handle().get_tag(stack).unwrap(), 9);
 
-    let rows = h.handle().rows(&alloc).unwrap(); // [BStackVec<u32,_>; 2]
+    let rows = h.handle().get_rows(&alloc).unwrap(); // [BStackVec<u32,_>; 2]
     assert_eq!(rows[0].to_vec().unwrap(), vec![1u32, 2]);
     assert_eq!(rows[1].to_vec().unwrap(), vec![3u32, 4, 5]);
 
     // Each slot is an independent, growable vector.
-    let mut rows_mut = h.handle().rows(&alloc).unwrap();
+    let mut rows_mut = h.handle().get_rows(&alloc).unwrap();
     rows_mut[0].push(99).unwrap();
     assert_eq!(
-        h.handle().rows(&alloc).unwrap()[0].to_vec().unwrap(),
+        h.handle().get_rows(&alloc).unwrap()[0].to_vec().unwrap(),
         vec![1u32, 2, 99]
     );
     assert_eq!(
-        h.handle().rows(&alloc).unwrap()[1].to_vec().unwrap(),
+        h.handle().get_rows(&alloc).unwrap()[1].to_vec().unwrap(),
         vec![3u32, 4, 5]
     );
 
     // Clone deep-copies both data blocks.
     let clone = h.try_clone_in(&alloc).unwrap();
-    let crows = clone.handle().rows(&alloc).unwrap();
+    let crows = clone.handle().get_rows(&alloc).unwrap();
     assert_eq!(crows[1].to_vec().unwrap(), vec![3u32, 4, 5]);
     clone.bstack_drop(&alloc).unwrap();
     assert_eq!(
-        h.handle().rows(&alloc).unwrap()[1].to_vec().unwrap(),
+        h.handle().get_rows(&alloc).unwrap()[1].to_vec().unwrap(),
         vec![3u32, 4, 5]
     );
 
@@ -3429,15 +3511,15 @@ fn macro_ref_vec_array() {
     let r = |i: usize| unsafe { BStackRef::from_range(leaves[i].handle().range()) };
     let h = RefVecArr::new(&alloc, [vec![r(0), r(1)], vec![r(2), r(3)]]).unwrap();
 
-    let ls = h.handle().lists(&alloc).unwrap(); // [BStackRefVec<MacroLeaf,_>; 2]
+    let ls = h.handle().get_lists(&alloc).unwrap(); // [BStackRefVec<MacroLeaf,_>; 2]
     assert_eq!(ls[0].len().unwrap(), 2);
-    assert_eq!(ls[0].get(1).unwrap().unwrap().val(stack).unwrap(), 1);
-    assert_eq!(ls[1].get(0).unwrap().unwrap().val(stack).unwrap(), 2);
+    assert_eq!(ls[0].get(1).unwrap().unwrap().get_val(stack).unwrap(), 1);
+    assert_eq!(ls[1].get(0).unwrap().unwrap().get_val(stack).unwrap(), 2);
 
     // Ref vecs own the offset arrays but not the targets.
     h.bstack_drop(&alloc).unwrap();
     for l in leaves {
-        assert!(l.handle().val(stack).unwrap() < 4);
+        assert!(l.handle().get_val(stack).unwrap() < 4);
         l.bstack_drop(&alloc).unwrap();
     }
 }
@@ -3461,28 +3543,28 @@ fn macro_owned_vec_array() {
     ];
     let g1 = vec![MacroLeaf::new(&alloc, 20).unwrap()];
     let h = OwnedVecArr::new(&alloc, [g0, g1], 7).unwrap();
-    assert_eq!(h.handle().tag(stack).unwrap(), 7);
+    assert_eq!(h.handle().get_tag(stack).unwrap(), 7);
 
-    let gs = h.handle().groups(&alloc).unwrap();
+    let gs = h.handle().get_groups(&alloc).unwrap();
     assert_eq!(gs[0].len().unwrap(), 2);
-    assert_eq!(gs[0].get(0).unwrap().unwrap().val(stack).unwrap(), 10);
-    assert_eq!(gs[1].get(0).unwrap().unwrap().val(stack).unwrap(), 20);
+    assert_eq!(gs[0].get(0).unwrap().unwrap().get_val(stack).unwrap(), 10);
+    assert_eq!(gs[1].get(0).unwrap().unwrap().get_val(stack).unwrap(), 20);
 
     // Deep clone: distinct child blocks.
     let clone = h.try_clone_in(&alloc).unwrap();
-    let cgs = clone.handle().groups(&alloc).unwrap();
-    assert_eq!(cgs[0].get(1).unwrap().unwrap().val(stack).unwrap(), 11);
+    let cgs = clone.handle().get_groups(&alloc).unwrap();
+    assert_eq!(cgs[0].get(1).unwrap().unwrap().get_val(stack).unwrap(), 11);
     assert_ne!(
         cgs[0].get(0).unwrap().unwrap().range().start(),
         gs[0].get(0).unwrap().unwrap().range().start()
     );
     clone.bstack_drop(&alloc).unwrap();
     assert_eq!(
-        h.handle().groups(&alloc).unwrap()[1]
+        h.handle().get_groups(&alloc).unwrap()[1]
             .get(0)
             .unwrap()
             .unwrap()
-            .val(stack)
+            .get_val(stack)
             .unwrap(),
         20
     );
@@ -3501,7 +3583,7 @@ fn macro_option_vec_array() {
     let alloc = tmp.allocator();
 
     let h = OptVecArr::new(&alloc, [Some(&[1u32, 2][..]), None, Some(&[9][..])]).unwrap();
-    let s = h.handle().slots(&alloc).unwrap(); // [Option<BStackVec<u32,_>>; 3]
+    let s = h.handle().get_slots(&alloc).unwrap(); // [Option<BStackVec<u32,_>>; 3]
     assert_eq!(s[0].as_ref().unwrap().to_vec().unwrap(), vec![1u32, 2]);
     assert!(s[1].is_none());
     assert_eq!(s[2].as_ref().unwrap().to_vec().unwrap(), vec![9u32]);
@@ -3528,18 +3610,18 @@ fn macro_ref_vec_of_array() {
     let leaves: Vec<_> = (0..4).map(|v| MacroLeaf::new(&alloc, v).unwrap()).collect();
     let r = |i: usize| unsafe { BStackRef::from_range(leaves[i].handle().range()) };
     let h = RefVecOfArr::new(&alloc, vec![[r(0), r(1)], [r(2), r(3)]], 7).unwrap();
-    assert_eq!(h.handle().tag(stack).unwrap(), 7);
+    assert_eq!(h.handle().get_tag(stack).unwrap(), 7);
 
-    let rows = h.handle().rows(&alloc).unwrap(); // Vec<[MacroLeaf; 2]>
+    let rows = h.handle().get_rows(&alloc).unwrap(); // Vec<[MacroLeaf; 2]>
     assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0][0].val(stack).unwrap(), 0);
-    assert_eq!(rows[0][1].val(stack).unwrap(), 1);
-    assert_eq!(rows[1][0].val(stack).unwrap(), 2);
-    assert_eq!(rows[1][1].val(stack).unwrap(), 3);
+    assert_eq!(rows[0][0].get_val(stack).unwrap(), 0);
+    assert_eq!(rows[0][1].get_val(stack).unwrap(), 1);
+    assert_eq!(rows[1][0].get_val(stack).unwrap(), 2);
+    assert_eq!(rows[1][1].get_val(stack).unwrap(), 3);
 
     // Clone aliases: same target offsets, but a fresh offset-array data block.
     let clone = h.try_clone_in(&alloc).unwrap();
-    let crows = clone.handle().rows(&alloc).unwrap();
+    let crows = clone.handle().get_rows(&alloc).unwrap();
     assert_eq!(
         crows[1][0].range().start(),
         rows[1][0].range().start() // same target (aliased)
@@ -3547,14 +3629,16 @@ fn macro_ref_vec_of_array() {
     clone.bstack_drop(&alloc).unwrap();
     // Original + targets still alive after clone teardown.
     assert_eq!(
-        h.handle().rows(&alloc).unwrap()[0][1].val(stack).unwrap(),
+        h.handle().get_rows(&alloc).unwrap()[0][1]
+            .get_val(stack)
+            .unwrap(),
         1
     );
 
     // Dropping the holder frees only the offset array, not the targets.
     h.bstack_drop(&alloc).unwrap();
     for l in leaves {
-        assert!(l.handle().val(stack).unwrap() < 4);
+        assert!(l.handle().get_val(stack).unwrap() < 4);
         l.bstack_drop(&alloc).unwrap();
     }
 }
@@ -3574,23 +3658,25 @@ fn macro_owned_vec_of_array() {
 
     let mk = |v| MacroLeaf::new(&alloc, v).unwrap();
     let h = OwnedVecOfArr::new(&alloc, vec![[mk(1), mk(2)], [mk(3), mk(4)]], 7).unwrap();
-    assert_eq!(h.handle().tag(stack).unwrap(), 7);
+    assert_eq!(h.handle().get_tag(stack).unwrap(), 7);
 
-    let rows = h.handle().rows(&alloc).unwrap(); // Vec<[MacroLeaf; 2]>
+    let rows = h.handle().get_rows(&alloc).unwrap(); // Vec<[MacroLeaf; 2]>
     assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0][0].val(stack).unwrap(), 1);
-    assert_eq!(rows[0][1].val(stack).unwrap(), 2);
-    assert_eq!(rows[1][0].val(stack).unwrap(), 3);
-    assert_eq!(rows[1][1].val(stack).unwrap(), 4);
+    assert_eq!(rows[0][0].get_val(stack).unwrap(), 1);
+    assert_eq!(rows[0][1].get_val(stack).unwrap(), 2);
+    assert_eq!(rows[1][0].get_val(stack).unwrap(), 3);
+    assert_eq!(rows[1][1].get_val(stack).unwrap(), 4);
 
     // Deep clone: distinct child blocks.
     let clone = h.try_clone_in(&alloc).unwrap();
-    let crows = clone.handle().rows(&alloc).unwrap();
-    assert_eq!(crows[1][1].val(stack).unwrap(), 4);
+    let crows = clone.handle().get_rows(&alloc).unwrap();
+    assert_eq!(crows[1][1].get_val(stack).unwrap(), 4);
     assert_ne!(crows[0][0].range().start(), rows[0][0].range().start());
     clone.bstack_drop(&alloc).unwrap();
     assert_eq!(
-        h.handle().rows(&alloc).unwrap()[1][0].val(stack).unwrap(),
+        h.handle().get_rows(&alloc).unwrap()[1][0]
+            .get_val(stack)
+            .unwrap(),
         3
     );
 
@@ -3617,9 +3703,9 @@ fn macro_strong_vec_of_array() {
     let h = StrongVecOfArr::new(&alloc, vec![[a, b]]).unwrap();
     assert_eq!(strong_of(stack, a_data), 2); // h + a_keep
 
-    let g = h.handle().groups(&alloc).unwrap(); // Vec<[MacroStrongChild; 2]>
-    assert_eq!(g[0][0].val(stack).unwrap(), 10);
-    assert_eq!(g[0][1].val(stack).unwrap(), 20);
+    let g = h.handle().get_groups(&alloc).unwrap(); // Vec<[MacroStrongChild; 2]>
+    assert_eq!(g[0][0].get_val(stack).unwrap(), 10);
+    assert_eq!(g[0][1].get_val(stack).unwrap(), 20);
 
     // Clone bumps every element's strong count.
     let clone = h.try_clone_in(&alloc).unwrap();
@@ -3652,14 +3738,17 @@ fn macro_weak_vec_of_array() {
     )
     .unwrap();
 
-    let g = h.handle().groups(&alloc).unwrap(); // Vec<[Option<BStackRc>; 2]>
-    assert_eq!(g[0][0].as_ref().unwrap().handle().val(stack).unwrap(), 1);
+    let g = h.handle().get_groups(&alloc).unwrap(); // Vec<[Option<BStackRc>; 2]>
+    assert_eq!(
+        g[0][0].as_ref().unwrap().handle().get_val(stack).unwrap(),
+        1
+    );
     assert!(g[0][1].as_ref().is_some());
     drop(g); // release the upgraded strong refs so `a` can actually be freed
 
     // Drop `a`'s data: its slot no longer upgrades; `b` still does.
     drop(a);
-    let g = h.handle().groups(&alloc).unwrap();
+    let g = h.handle().get_groups(&alloc).unwrap();
     assert!(g[0][0].is_none());
     assert!(g[0][1].is_some());
     drop(g);
@@ -3699,8 +3788,8 @@ fn macro_enum_owned_vec() {
     match e.handle().read(&alloc).unwrap() {
         OwnedVecEnumView::Items(v) => {
             assert_eq!(v.len().unwrap(), 2);
-            assert_eq!(v.get(0).unwrap().unwrap().val(stack).unwrap(), 10);
-            assert_eq!(v.get(1).unwrap().unwrap().val(stack).unwrap(), 20);
+            assert_eq!(v.get(0).unwrap().unwrap().get_val(stack).unwrap(), 10);
+            assert_eq!(v.get(1).unwrap().unwrap().get_val(stack).unwrap(), 20);
         }
         _ => panic!("expected Items"),
     }
@@ -3709,7 +3798,7 @@ fn macro_enum_owned_vec() {
     let clone = e.try_clone_in(&alloc).unwrap();
     match clone.handle().read(&alloc).unwrap() {
         OwnedVecEnumView::Items(v) => {
-            assert_eq!(v.get(1).unwrap().unwrap().val(stack).unwrap(), 20)
+            assert_eq!(v.get(1).unwrap().unwrap().get_val(stack).unwrap(), 20)
         }
         _ => panic!("expected Items"),
     }
@@ -3718,7 +3807,7 @@ fn macro_enum_owned_vec() {
     // Move hands back the vector handle.
     match bstack_move!(e, &alloc).unwrap() {
         OwnedVecEnumData::Items(v) => {
-            assert_eq!(v.get(0).unwrap().unwrap().val(stack).unwrap(), 10);
+            assert_eq!(v.get(0).unwrap().unwrap().get_val(stack).unwrap(), 10);
             v.bstack_drop().unwrap();
         }
         _ => panic!("expected Items"),
@@ -3750,8 +3839,8 @@ fn macro_enum_ref_vec_of_array() {
         RefVecArrEnumView::Rows(v) => {
             // Vec<[MacroLeaf; 2]>
             assert_eq!(v.len(), 2);
-            assert_eq!(v[0][0].val(stack).unwrap(), 0);
-            assert_eq!(v[1][1].val(stack).unwrap(), 3);
+            assert_eq!(v[0][0].get_val(stack).unwrap(), 0);
+            assert_eq!(v[1][1].get_val(stack).unwrap(), 3);
         }
         _ => panic!("expected Rows"),
     }
@@ -3759,7 +3848,7 @@ fn macro_enum_ref_vec_of_array() {
     // A ref vec of arrays owns nothing: teardown leaves targets alive.
     e.bstack_drop(&alloc).unwrap();
     for l in leaves {
-        assert!(l.handle().val(stack).unwrap() < 4);
+        assert!(l.handle().get_val(stack).unwrap() < 4);
         l.bstack_drop(&alloc).unwrap();
     }
 }
@@ -3787,8 +3876,8 @@ fn macro_enum_owned_vec_of_array() {
     match e.handle().read(&alloc).unwrap() {
         OwnedVecArrEnumView::Grid(v) => {
             assert_eq!(v.len(), 2);
-            assert_eq!(v[0][0].val(stack).unwrap(), 1);
-            assert_eq!(v[1][1].val(stack).unwrap(), 4);
+            assert_eq!(v[0][0].get_val(stack).unwrap(), 1);
+            assert_eq!(v[1][1].get_val(stack).unwrap(), 4);
         }
         _ => panic!("expected Grid"),
     }
@@ -3799,7 +3888,7 @@ fn macro_enum_owned_vec_of_array() {
     // Move rebuilds Vec<[BStackOwned<MacroLeaf>; 2]> and frees the offset array.
     match bstack_move!(e, &alloc).unwrap() {
         OwnedVecArrEnumData::Grid(v) => {
-            assert_eq!(v[1][0].handle().val(stack).unwrap(), 3);
+            assert_eq!(v[1][0].handle().get_val(stack).unwrap(), 3);
             for row in v {
                 for m in row {
                     m.bstack_drop(&alloc).unwrap();
@@ -3909,21 +3998,24 @@ fn macro_generic_ref_box() {
     let leaf = MacroLeaf::new(&alloc, 42).unwrap();
     let r = unsafe { BStackRef::from_range(leaf.handle().range()) };
     let b = RefBox::<MacroLeaf>::new(&alloc, r, 7).unwrap();
-    assert_eq!(b.handle().tag(stack).unwrap(), 7);
-    assert_eq!(b.handle().item(stack).unwrap().val(stack).unwrap(), 42);
+    assert_eq!(b.handle().get_tag(stack).unwrap(), 7);
+    assert_eq!(
+        b.handle().get_item(stack).unwrap().get_val(stack).unwrap(),
+        42
+    );
 
     // Clone aliases the ref (same target block); the box itself is fresh.
     let clone = b.try_clone_in(&alloc).unwrap();
     assert_eq!(
-        clone.handle().item(stack).unwrap().range().start(),
-        b.handle().item(stack).unwrap().range().start()
+        clone.handle().get_item(stack).unwrap().range().start(),
+        b.handle().get_item(stack).unwrap().range().start()
     );
     assert_ne!(clone.handle().range().start(), b.handle().range().start());
     clone.bstack_drop(&alloc).unwrap();
 
     // The box references but does not own the leaf: dropping it leaves it alive.
     b.bstack_drop(&alloc).unwrap();
-    assert_eq!(leaf.handle().val(stack).unwrap(), 42);
+    assert_eq!(leaf.handle().get_val(stack).unwrap(), 42);
     leaf.bstack_drop(&alloc).unwrap();
 }
 
@@ -3956,7 +4048,7 @@ fn macro_generic_move_cast() {
     let back = bstack_cast!(sl as RefBox<MacroLeaf>)
         .unwrap()
         .expect("same tag");
-    assert_eq!(back.item(stack).unwrap().val(stack).unwrap(), 9);
+    assert_eq!(back.get_item(stack).unwrap().get_val(stack).unwrap(), 9);
 
     // bstack_move!: hand out the ref + pod fields, freeing the box shell.
     let (item, tag) = bstack_move!(b, &alloc).unwrap();
@@ -3983,7 +4075,7 @@ fn macro_generic_strong_box() {
 
     let b = StrongBox::<MacroStrongChild>::new(&alloc, c, 5).unwrap();
     assert_eq!(strong_of(stack, data), 2); // b + keep
-    assert_eq!(b.handle().tag(stack).unwrap(), 5);
+    assert_eq!(b.handle().get_tag(stack).unwrap(), 5);
 
     // Deep-cloning the box bumps the shared child's strong count.
     let clone = b.try_clone_in(&alloc).unwrap();
@@ -4011,12 +4103,12 @@ fn macro_generic_weak_box() {
     let b = WeakBox::<MacroStrongChild>::new(&alloc).unwrap();
     b.handle().set_item(&alloc, c.downgrade().unwrap()).unwrap();
 
-    let up = b.handle().item(&alloc).unwrap().expect("alive");
-    assert_eq!(up.handle().val(stack).unwrap(), 7);
+    let up = b.handle().get_item(&alloc).unwrap().expect("alive");
+    assert_eq!(up.handle().get_val(stack).unwrap(), 7);
     drop(up);
 
     drop(c); // sole strong owner gone → can't upgrade
-    assert!(b.handle().item(&alloc).unwrap().is_none());
+    assert!(b.handle().get_item(&alloc).unwrap().is_none());
     b.bstack_drop(&alloc).unwrap();
 }
 
@@ -4035,20 +4127,26 @@ fn macro_generic_owned_box() {
 
     let leaf = MacroLeaf::new(&alloc, 42).unwrap();
     let b = OwnedBox::<MacroLeaf>::new(&alloc, leaf, 7).unwrap();
-    assert_eq!(b.handle().tag(stack).unwrap(), 7);
-    assert_eq!(b.handle().item(stack).unwrap().val(stack).unwrap(), 42);
+    assert_eq!(b.handle().get_tag(stack).unwrap(), 7);
+    assert_eq!(
+        b.handle().get_item(stack).unwrap().get_val(stack).unwrap(),
+        42
+    );
 
     // Deep clone: the owned child is a FRESH block (distinct offset), same value.
     let clone = b.try_clone_in(&alloc).unwrap();
-    let citem = clone.handle().item(stack).unwrap();
-    assert_eq!(citem.val(stack).unwrap(), 42);
+    let citem = clone.handle().get_item(stack).unwrap();
+    assert_eq!(citem.get_val(stack).unwrap(), 42);
     assert_ne!(
         citem.range().start(),
-        b.handle().item(stack).unwrap().range().start()
+        b.handle().get_item(stack).unwrap().range().start()
     );
     clone.bstack_drop(&alloc).unwrap();
     // Original child survives the clone's teardown.
-    assert_eq!(b.handle().item(stack).unwrap().val(stack).unwrap(), 42);
+    assert_eq!(
+        b.handle().get_item(stack).unwrap().get_val(stack).unwrap(),
+        42
+    );
 
     // Dropping the box frees its owned child — reclaimed with no leak.
     b.bstack_drop(&alloc).unwrap();
@@ -4097,8 +4195,8 @@ fn macro_generic_owns_enum() {
     // works only because the enum's clone hook is a `BStackBlock` trait method
     // (reachable through the generic `T` bound), not a generated inherent method.
     let clone = b.try_clone_in(&alloc).unwrap();
-    match clone.handle().e(stack).unwrap().read(&alloc).unwrap() {
-        ArrEnumView::Leaves(a) => assert_eq!(a[1].val(stack).unwrap(), 2),
+    match clone.handle().get_e(stack).unwrap().read(&alloc).unwrap() {
+        ArrEnumView::Leaves(a) => assert_eq!(a[1].get_val(stack).unwrap(), 2),
         _ => panic!("expected Leaves"),
     }
     clone.bstack_drop(&alloc).unwrap();
@@ -4123,12 +4221,12 @@ fn macro_generic_pod_box() {
     let stack = alloc.stack();
 
     let b = PodBoxG::<u32>::new(&alloc, 42u32, 7).unwrap();
-    assert_eq!(b.handle().item(stack).unwrap(), 42);
-    assert_eq!(b.handle().tag(stack).unwrap(), 7);
+    assert_eq!(b.handle().get_item(stack).unwrap(), 42);
+    assert_eq!(b.handle().get_tag(stack).unwrap(), 7);
 
     // Clone byte-copies the POD value.
     let clone = b.try_clone_in(&alloc).unwrap();
-    assert_eq!(clone.handle().item(stack).unwrap(), 42);
+    assert_eq!(clone.handle().get_item(stack).unwrap(), 42);
     clone.bstack_drop(&alloc).unwrap();
 
     // Distinct type args → distinct on-disk layout → distinct tags.
@@ -4158,10 +4256,15 @@ fn macro_generic_emb_box() {
     // EmbChild owns a MacroLeaf; embedding inlines the whole child on disk.
     let child = EmbChild::new(&alloc, MacroLeaf::new(&alloc, 10).unwrap(), 1).unwrap();
     let b = EmbBoxG::<EmbChild>::new(&alloc, child, 99).unwrap();
-    assert_eq!(b.handle().tag(stack).unwrap(), 99);
+    assert_eq!(b.handle().get_tag(stack).unwrap(), 99);
     // Accessor: an EmbChild handle into the inline slot (pure offset math).
     assert_eq!(
-        b.handle().item().leaf(stack).unwrap().val(stack).unwrap(),
+        b.handle()
+            .get_item()
+            .get_leaf(stack)
+            .unwrap()
+            .get_val(stack)
+            .unwrap(),
         10
     );
 
@@ -4171,23 +4274,42 @@ fn macro_generic_emb_box() {
     assert_eq!(
         clone
             .handle()
-            .item()
-            .leaf(stack)
+            .get_item()
+            .get_leaf(stack)
             .unwrap()
-            .val(stack)
+            .get_val(stack)
             .unwrap(),
         10
     );
     assert_ne!(
-        clone.handle().item().leaf(stack).unwrap().range().start(),
-        b.handle().item().leaf(stack).unwrap().range().start()
+        clone
+            .handle()
+            .get_item()
+            .get_leaf(stack)
+            .unwrap()
+            .range()
+            .start(),
+        b.handle()
+            .get_item()
+            .get_leaf(stack)
+            .unwrap()
+            .range()
+            .start()
     );
     clone.bstack_drop(&alloc).unwrap();
 
     // Move re-homes the embedded child to a fresh standalone block.
     let (moved, tag) = bstack_move!(b, &alloc).unwrap();
     assert_eq!(tag, 99);
-    assert_eq!(moved.handle().leaf(stack).unwrap().val(stack).unwrap(), 10);
+    assert_eq!(
+        moved
+            .handle()
+            .get_leaf(stack)
+            .unwrap()
+            .get_val(stack)
+            .unwrap(),
+        10
+    );
     moved.bstack_drop(&alloc).unwrap();
 }
 
@@ -4212,14 +4334,14 @@ fn macro_generic_enum_owned() {
     let leaf = MacroLeaf::new(&alloc, 42).unwrap();
     let e = BoxEnumG::<MacroLeaf>::new(&alloc, BoxEnumGData::Item(leaf)).unwrap();
     match e.handle().read(&alloc).unwrap() {
-        BoxEnumGView::Item(l) => assert_eq!(l.val(stack).unwrap(), 42),
+        BoxEnumGView::Item(l) => assert_eq!(l.get_val(stack).unwrap(), 42),
         _ => panic!("expected Item"),
     }
 
     // Deep clone recurses into the owned child through T's BStackBlock hooks.
     let clone = e.try_clone_in(&alloc).unwrap();
     match clone.handle().read(&alloc).unwrap() {
-        BoxEnumGView::Item(l) => assert_eq!(l.val(stack).unwrap(), 42),
+        BoxEnumGView::Item(l) => assert_eq!(l.get_val(stack).unwrap(), 42),
         _ => panic!("expected Item"),
     }
     clone.bstack_drop(&alloc).unwrap();
@@ -4233,7 +4355,7 @@ fn macro_generic_enum_owned() {
     // Move yields the owned child.
     match bstack_move!(e, &alloc).unwrap() {
         BoxEnumGData::Item(owned) => {
-            assert_eq!(owned.handle().val(stack).unwrap(), 42);
+            assert_eq!(owned.handle().get_val(stack).unwrap(), 42);
             owned.bstack_drop(&alloc).unwrap();
         }
         _ => panic!("expected Item"),
@@ -4302,10 +4424,10 @@ fn macro_generic_const_ref_array() {
     let leaves: Vec<_> = (0..3).map(|v| MacroLeaf::new(&alloc, v).unwrap()).collect();
     let r = |i: usize| unsafe { BStackRef::from_range(leaves[i].handle().range()) };
     let b = RefArrN::<MacroLeaf, 3>::new(&alloc, [r(0), r(1), r(2)], 9).unwrap();
-    assert_eq!(b.handle().tag(stack).unwrap(), 9);
-    let arr = b.handle().arr(stack).unwrap(); // [MacroLeaf; 3]
-    assert_eq!(arr[0].val(stack).unwrap(), 0);
-    assert_eq!(arr[2].val(stack).unwrap(), 2);
+    assert_eq!(b.handle().get_tag(stack).unwrap(), 9);
+    let arr = b.handle().get_arr(stack).unwrap(); // [MacroLeaf; 3]
+    assert_eq!(arr[0].get_val(stack).unwrap(), 0);
+    assert_eq!(arr[2].get_val(stack).unwrap(), 2);
 
     // Distinct N → distinct on-disk layout → distinct tags.
     assert_ne!(
@@ -4316,7 +4438,7 @@ fn macro_generic_const_ref_array() {
     // A ref array owns nothing: dropping leaves the targets alive.
     b.bstack_drop(&alloc).unwrap();
     for l in leaves {
-        assert!(l.handle().val(stack).unwrap() < 3);
+        assert!(l.handle().get_val(stack).unwrap() < 3);
         l.bstack_drop(&alloc).unwrap();
     }
 }
@@ -4330,11 +4452,11 @@ fn macro_generic_const_owned_pod_array() {
     // Owned const array: deep-clone + teardown reuse the concrete paths.
     let mk = |v| MacroLeaf::new(&alloc, v).unwrap();
     let o = OwnArrN::<MacroLeaf, 2>::new(&alloc, [mk(10), mk(20)]).unwrap();
-    let a = o.handle().arr(stack).unwrap();
-    assert_eq!(a[1].val(stack).unwrap(), 20);
+    let a = o.handle().get_arr(stack).unwrap();
+    assert_eq!(a[1].get_val(stack).unwrap(), 20);
     let clone = o.try_clone_in(&alloc).unwrap();
     assert_ne!(
-        clone.handle().arr(stack).unwrap()[0].range().start(),
+        clone.handle().get_arr(stack).unwrap()[0].range().start(),
         a[0].range().start()
     );
     clone.bstack_drop(&alloc).unwrap();
@@ -4342,8 +4464,8 @@ fn macro_generic_const_owned_pod_array() {
 
     // POD const array.
     let p = PodArrN::<4>::new(&alloc, [1u16, 2, 3, 4], 7).unwrap();
-    assert_eq!(p.handle().xs(stack).unwrap(), [1u16, 2, 3, 4]);
-    assert_eq!(p.handle().tag(stack).unwrap(), 7);
+    assert_eq!(p.handle().get_xs(stack).unwrap(), [1u16, 2, 3, 4]);
+    assert_eq!(p.handle().get_tag(stack).unwrap(), 7);
     p.bstack_drop(&alloc).unwrap();
 }
 
@@ -4365,17 +4487,17 @@ fn stdlib_cow_borrowed_into_owned_deep_copies() {
 
     assert!(cow.is_borrowed());
     // Reads go through the borrowed block, at its address.
-    assert_eq!(cow.handle().val(stack).unwrap(), 7);
+    assert_eq!(cow.handle().get_val(stack).unwrap(), 7);
     assert_eq!(cow.range().start(), base_start);
 
     // into_owned deep-copies: a fresh block at a different address, same value.
     let owned = cow.into_owned(&alloc).unwrap();
     assert_ne!(owned.handle().range().start(), base_start);
-    assert_eq!(owned.handle().val(stack).unwrap(), 7);
+    assert_eq!(owned.handle().get_val(stack).unwrap(), 7);
     owned.bstack_drop(&alloc).unwrap();
 
     // The borrowed source is untouched.
-    assert_eq!(base.handle().val(stack).unwrap(), 7);
+    assert_eq!(base.handle().get_val(stack).unwrap(), 7);
     base.bstack_drop(&alloc).unwrap();
 }
 
@@ -4393,7 +4515,7 @@ fn stdlib_cow_owned_into_owned_is_free() {
     // Already owned: into_owned hands back the *same* block, no copy.
     let owned = cow.into_owned(&alloc).unwrap();
     assert_eq!(owned.handle().range().start(), start);
-    assert_eq!(owned.handle().val(stack).unwrap(), 5);
+    assert_eq!(owned.handle().get_val(stack).unwrap(), 5);
     owned.bstack_drop(&alloc).unwrap();
 }
 
@@ -4412,7 +4534,7 @@ fn stdlib_cow_to_mut_copies_then_owns() {
     {
         let m = cow.to_mut(&alloc).unwrap();
         assert_ne!(m.handle().range().start(), base_start);
-        assert_eq!(m.handle().val(stack).unwrap(), 9);
+        assert_eq!(m.handle().get_val(stack).unwrap(), 9);
     }
     assert!(cow.is_owned());
 
@@ -4423,7 +4545,7 @@ fn stdlib_cow_to_mut_copies_then_owns() {
 
     // Dropping the Cow frees only the copy; the borrowed source survives.
     cow.bstack_drop(&alloc).unwrap();
-    assert_eq!(base.handle().val(stack).unwrap(), 9);
+    assert_eq!(base.handle().get_val(stack).unwrap(), 9);
     base.bstack_drop(&alloc).unwrap();
 }
 
@@ -4439,7 +4561,7 @@ fn stdlib_cow_borrowed_drop_frees_nothing() {
 
     // Dropping a borrowed Cow has no claim on the target.
     cow.bstack_drop(&alloc).unwrap();
-    assert_eq!(base.handle().val(stack).unwrap(), 3);
+    assert_eq!(base.handle().get_val(stack).unwrap(), 3);
     base.bstack_drop(&alloc).unwrap();
 }
 
@@ -4545,19 +4667,24 @@ fn stdlib_box_composes_as_owned_field() {
     let inner = BStackBox::new(&alloc, 500u64).unwrap();
     let holder = BoxHolder::new(&alloc, inner, 9).unwrap();
     assert_eq!(
-        holder.handle().boxed(stack).unwrap().get(stack).unwrap(),
+        holder
+            .handle()
+            .get_boxed(stack)
+            .unwrap()
+            .get(stack)
+            .unwrap(),
         500
     );
-    assert_eq!(holder.handle().tag(stack).unwrap(), 9);
+    assert_eq!(holder.handle().get_tag(stack).unwrap(), 9);
 
     // Deep-cloning the parent recurses into the child box (fresh child block).
     let clone = holder.try_clone_in(&alloc).unwrap();
     assert_ne!(
-        clone.handle().boxed(stack).unwrap().range().start(),
-        holder.handle().boxed(stack).unwrap().range().start(),
+        clone.handle().get_boxed(stack).unwrap().range().start(),
+        holder.handle().get_boxed(stack).unwrap().range().start(),
     );
     assert_eq!(
-        clone.handle().boxed(stack).unwrap().get(stack).unwrap(),
+        clone.handle().get_boxed(stack).unwrap().get(stack).unwrap(),
         500
     );
 
@@ -4595,7 +4722,7 @@ fn list_values(list: &BStackLinkedList<MacroLeaf>, stack: &BStack) -> Vec<u32> {
     list.to_vec(stack)
         .unwrap()
         .iter()
-        .map(|h| h.val(stack).unwrap())
+        .map(|h| h.get_val(stack).unwrap())
         .collect()
 }
 
@@ -4614,12 +4741,18 @@ fn stdlib_list_push_back_pop_front() {
     }
     assert_eq!(list.len(stack).unwrap(), 3);
     assert_eq!(list_values(&list, stack), vec![1, 2, 3]);
-    assert_eq!(list.front(stack).unwrap().unwrap().val(stack).unwrap(), 1);
-    assert_eq!(list.back(stack).unwrap().unwrap().val(stack).unwrap(), 3);
+    assert_eq!(
+        list.front(stack).unwrap().unwrap().get_val(stack).unwrap(),
+        1
+    );
+    assert_eq!(
+        list.back(stack).unwrap().unwrap().get_val(stack).unwrap(),
+        3
+    );
 
     // FIFO drain from the front.
     let a = list.pop_front(&alloc).unwrap().unwrap();
-    assert_eq!(a.handle().val(stack).unwrap(), 1);
+    assert_eq!(a.handle().get_val(stack).unwrap(), 1);
     a.bstack_drop(&alloc).unwrap();
     assert_eq!(list.len(stack).unwrap(), 2);
     assert_eq!(list_values(&list, stack), vec![2, 3]);
@@ -4643,11 +4776,11 @@ fn stdlib_list_both_ends() {
     assert_eq!(list_values(&list, stack), vec![1, 2, 3]);
 
     let back = list.pop_back(&alloc).unwrap().unwrap();
-    assert_eq!(back.handle().val(stack).unwrap(), 3);
+    assert_eq!(back.handle().get_val(stack).unwrap(), 3);
     back.bstack_drop(&alloc).unwrap();
 
     let front = list.pop_front(&alloc).unwrap().unwrap();
-    assert_eq!(front.handle().val(stack).unwrap(), 1);
+    assert_eq!(front.handle().get_val(stack).unwrap(), 1);
     front.bstack_drop(&alloc).unwrap();
 
     assert_eq!(list_values(&list, stack), vec![2]);
@@ -4746,7 +4879,7 @@ fn stdlib_list_concurrent_push_pop() {
         .to_vec(alloc.stack())
         .unwrap()
         .iter()
-        .map(|h| h.val(alloc.stack()).unwrap())
+        .map(|h| h.get_val(alloc.stack()).unwrap())
         .collect();
     seen.sort_unstable();
     assert_eq!(seen.len() as u64, total);
@@ -4782,7 +4915,7 @@ fn deque_values(dq: &BStackDeque<MacroLeaf>, stack: &BStack) -> Vec<u32> {
     dq.to_vec(stack)
         .unwrap()
         .iter()
-        .map(|h| h.val(stack).unwrap())
+        .map(|h| h.get_val(stack).unwrap())
         .collect()
 }
 
@@ -4803,13 +4936,13 @@ fn stdlib_deque_push_back_grows() {
     assert_eq!(dq.len(stack).unwrap(), 10);
     assert!(dq.capacity(stack).unwrap() >= 10);
     assert_eq!(deque_values(&dq, stack), (0..10).collect::<Vec<_>>());
-    assert_eq!(dq.front(stack).unwrap().unwrap().val(stack).unwrap(), 0);
-    assert_eq!(dq.back(stack).unwrap().unwrap().val(stack).unwrap(), 9);
+    assert_eq!(dq.front(stack).unwrap().unwrap().get_val(stack).unwrap(), 0);
+    assert_eq!(dq.back(stack).unwrap().unwrap().get_val(stack).unwrap(), 9);
 
     // FIFO drain from the front.
     for v in 0..10u32 {
         let x = dq.pop_front(&alloc).unwrap().unwrap();
-        assert_eq!(x.handle().val(stack).unwrap(), v);
+        assert_eq!(x.handle().get_val(stack).unwrap(), v);
         x.bstack_drop(&alloc).unwrap();
     }
     assert!(dq.is_empty(stack).unwrap());
@@ -4864,11 +4997,11 @@ fn stdlib_deque_both_ends() {
     assert_eq!(deque_values(&dq, stack), vec![1, 2, 3]);
 
     let back = dq.pop_back(&alloc).unwrap().unwrap();
-    assert_eq!(back.handle().val(stack).unwrap(), 3);
+    assert_eq!(back.handle().get_val(stack).unwrap(), 3);
     back.bstack_drop(&alloc).unwrap();
 
     let front = dq.pop_front(&alloc).unwrap().unwrap();
-    assert_eq!(front.handle().val(stack).unwrap(), 1);
+    assert_eq!(front.handle().get_val(stack).unwrap(), 1);
     front.bstack_drop(&alloc).unwrap();
 
     assert_eq!(deque_values(&dq, stack), vec![2]);
@@ -5003,11 +5136,11 @@ fn stdlib_map_insert_get_remove() {
     );
     assert_eq!(map.len(stack).unwrap(), 2);
     assert_eq!(
-        map.get(stack, &7).unwrap().unwrap().val(stack).unwrap(),
+        map.get(stack, &7).unwrap().unwrap().get_val(stack).unwrap(),
         700
     );
     assert_eq!(
-        map.get(stack, &9).unwrap().unwrap().val(stack).unwrap(),
+        map.get(stack, &9).unwrap().unwrap().get_val(stack).unwrap(),
         900
     );
     assert!(map.contains_key(stack, &7).unwrap());
@@ -5018,17 +5151,17 @@ fn stdlib_map_insert_get_remove() {
         .insert(&alloc, 7, MacroLeaf::new(&alloc, 701).unwrap())
         .unwrap()
         .unwrap();
-    assert_eq!(old.handle().val(stack).unwrap(), 700);
+    assert_eq!(old.handle().get_val(stack).unwrap(), 700);
     old.bstack_drop(&alloc).unwrap();
     assert_eq!(map.len(stack).unwrap(), 2);
     assert_eq!(
-        map.get(stack, &7).unwrap().unwrap().val(stack).unwrap(),
+        map.get(stack, &7).unwrap().unwrap().get_val(stack).unwrap(),
         701
     );
 
     // Remove returns the value (owned); the key is then absent.
     let removed = map.remove(&alloc, &9).unwrap().unwrap();
-    assert_eq!(removed.handle().val(stack).unwrap(), 900);
+    assert_eq!(removed.handle().get_val(stack).unwrap(), 900);
     removed.bstack_drop(&alloc).unwrap();
     assert!(map.get(stack, &9).unwrap().is_none());
     assert!(map.remove(&alloc, &9).unwrap().is_none());
@@ -5056,7 +5189,7 @@ fn stdlib_map_grows_and_keeps_all() {
     // Every key survives the rehashes with its value.
     for k in 0..100u32 {
         assert_eq!(
-            map.get(stack, &k).unwrap().unwrap().val(stack).unwrap(),
+            map.get(stack, &k).unwrap().unwrap().get_val(stack).unwrap(),
             k * 10
         );
     }
@@ -5075,7 +5208,7 @@ fn stdlib_map_grows_and_keeps_all() {
         if k % 2 == 0 {
             assert!(got.is_none());
         } else {
-            assert_eq!(got.unwrap().val(stack).unwrap(), k * 10);
+            assert_eq!(got.unwrap().get_val(stack).unwrap(), k * 10);
         }
     }
 
@@ -5096,8 +5229,14 @@ fn stdlib_map_pod_struct_key() {
         .unwrap();
     map.insert(&alloc, b, MacroLeaf::new(&alloc, 22).unwrap())
         .unwrap();
-    assert_eq!(map.get(stack, &a).unwrap().unwrap().val(stack).unwrap(), 11);
-    assert_eq!(map.get(stack, &b).unwrap().unwrap().val(stack).unwrap(), 22);
+    assert_eq!(
+        map.get(stack, &a).unwrap().unwrap().get_val(stack).unwrap(),
+        11
+    );
+    assert_eq!(
+        map.get(stack, &b).unwrap().unwrap().get_val(stack).unwrap(),
+        22
+    );
     assert!(
         map.get(stack, &Point3 { x: 9, y: 9, z: 9 })
             .unwrap()
@@ -5149,7 +5288,12 @@ fn stdlib_map_deep_clone_is_independent() {
     let clone = map.try_clone_in(&alloc).unwrap();
     for k in 0..8u32 {
         assert_eq!(
-            clone.get(stack, &k).unwrap().unwrap().val(stack).unwrap(),
+            clone
+                .get(stack, &k)
+                .unwrap()
+                .unwrap()
+                .get_val(stack)
+                .unwrap(),
             k + 100
         );
     }
@@ -5168,7 +5312,7 @@ fn stdlib_map_deep_clone_is_independent() {
         .unwrap();
     assert!(clone.get(stack, &3).unwrap().is_none());
     assert_eq!(
-        map.get(stack, &3).unwrap().unwrap().val(stack).unwrap(),
+        map.get(stack, &3).unwrap().unwrap().get_val(stack).unwrap(),
         103
     );
 
@@ -5184,7 +5328,7 @@ fn tree_pairs(tree: &BStackBTreeMap<u32, MacroLeaf>, stack: &BStack) -> Vec<(u32
     tree.to_vec(stack)
         .unwrap()
         .iter()
-        .map(|(k, v)| (*k, v.val(stack).unwrap()))
+        .map(|(k, v)| (*k, v.get_val(stack).unwrap()))
         .collect()
 }
 
@@ -5213,7 +5357,11 @@ fn stdlib_tree_insert_get_ordered() {
     // Every key present with its value.
     for k in 0..50u32 {
         assert_eq!(
-            tree.get(stack, &k).unwrap().unwrap().val(stack).unwrap(),
+            tree.get(stack, &k)
+                .unwrap()
+                .unwrap()
+                .get_val(stack)
+                .unwrap(),
             k * 10
         );
     }
@@ -5231,11 +5379,15 @@ fn stdlib_tree_insert_get_ordered() {
         .insert(&alloc, 25, MacroLeaf::new(&alloc, 9999).unwrap())
         .unwrap()
         .unwrap();
-    assert_eq!(old.handle().val(stack).unwrap(), 250);
+    assert_eq!(old.handle().get_val(stack).unwrap(), 250);
     old.bstack_drop(&alloc).unwrap();
     assert_eq!(tree.len(stack).unwrap(), 50);
     assert_eq!(
-        tree.get(stack, &25).unwrap().unwrap().val(stack).unwrap(),
+        tree.get(stack, &25)
+            .unwrap()
+            .unwrap()
+            .get_val(stack)
+            .unwrap(),
         9999
     );
 
@@ -5268,7 +5420,7 @@ fn stdlib_tree_large_key_spills() {
             tree.get(stack, &BigKey(k))
                 .unwrap()
                 .unwrap()
-                .val(stack)
+                .get_val(stack)
                 .unwrap(),
             i as u32
         );
@@ -5318,7 +5470,12 @@ fn stdlib_tree_deep_clone_is_independent() {
     let clone = tree.try_clone_in(&alloc).unwrap();
     for k in 0..30u32 {
         assert_eq!(
-            clone.get(stack, &k).unwrap().unwrap().val(stack).unwrap(),
+            clone
+                .get(stack, &k)
+                .unwrap()
+                .unwrap()
+                .get_val(stack)
+                .unwrap(),
             k + 100
         );
     }
@@ -5336,11 +5493,20 @@ fn stdlib_tree_deep_clone_is_independent() {
         .unwrap();
     // (`clone` and `tree` share no nodes: the clone deep-copied every node.)
     assert_eq!(
-        clone.get(stack, &10).unwrap().unwrap().val(stack).unwrap(),
+        clone
+            .get(stack, &10)
+            .unwrap()
+            .unwrap()
+            .get_val(stack)
+            .unwrap(),
         110
     );
     assert_eq!(
-        tree.get(stack, &10).unwrap().unwrap().val(stack).unwrap(),
+        tree.get(stack, &10)
+            .unwrap()
+            .unwrap()
+            .get_val(stack)
+            .unwrap(),
         7
     );
 
@@ -5371,7 +5537,7 @@ fn stdlib_tree_concurrent_readers() {
                         tree.get(alloc.stack(), &k)
                             .unwrap()
                             .unwrap()
-                            .val(alloc.stack())
+                            .get_val(alloc.stack())
                             .unwrap(),
                         k * 2
                     );
@@ -5415,7 +5581,7 @@ fn stdlib_map_concurrent_insert() {
             map.get(alloc.stack(), &k)
                 .unwrap()
                 .unwrap()
-                .val(alloc.stack())
+                .get_val(alloc.stack())
                 .unwrap(),
             k
         );
@@ -5662,7 +5828,9 @@ fn stdlib_bloom_guards_a_map() {
         if !bloom.contains(stack, &k).unwrap() {
             return None;
         }
-        map.get(stack, &k).unwrap().map(|v| v.val(stack).unwrap())
+        map.get(stack, &k)
+            .unwrap()
+            .map(|v| v.get_val(stack).unwrap())
     };
 
     for k in 0..40u32 {
@@ -5833,7 +6001,7 @@ fn stdlib_tree_remove_rebalances() {
     // Remove every even key (heavy borrow/merge across a multi-level tree).
     for k in (0..200u32).step_by(2) {
         let v = tree.remove(&alloc, &k).unwrap().unwrap();
-        assert_eq!(v.handle().val(stack).unwrap(), k * 10);
+        assert_eq!(v.handle().get_val(stack).unwrap(), k * 10);
         v.bstack_drop(&alloc).unwrap();
     }
     assert_eq!(tree.len(stack).unwrap(), 100);
@@ -5844,7 +6012,7 @@ fn stdlib_tree_remove_rebalances() {
         if k % 2 == 0 {
             assert!(g.is_none());
         } else {
-            assert_eq!(g.unwrap().val(stack).unwrap(), k * 10);
+            assert_eq!(g.unwrap().get_val(stack).unwrap(), k * 10);
         }
     }
     let keys: Vec<u32> = tree
@@ -5871,7 +6039,11 @@ fn stdlib_tree_remove_rebalances() {
     tree.insert(&alloc, 42, MacroLeaf::new(&alloc, 420).unwrap())
         .unwrap();
     assert_eq!(
-        tree.get(stack, &42).unwrap().unwrap().val(stack).unwrap(),
+        tree.get(stack, &42)
+            .unwrap()
+            .unwrap()
+            .get_val(stack)
+            .unwrap(),
         420
     );
 
@@ -5977,7 +6149,7 @@ fn stdlib_heap_pop_ascending() {
     for expected in 0..50u32 {
         let (k, v) = heap.pop(&alloc).unwrap().unwrap();
         assert_eq!(k, expected);
-        assert_eq!(v.handle().val(stack).unwrap(), expected * 10);
+        assert_eq!(v.handle().get_val(stack).unwrap(), expected * 10);
         v.bstack_drop(&alloc).unwrap();
     }
     assert!(heap.is_empty(stack).unwrap());
@@ -6077,7 +6249,7 @@ fn stdlib_deque_iter() {
     }
     let mut got = Vec::new();
     for r in dq.iter(stack).unwrap() {
-        got.push(r.unwrap().val(stack).unwrap());
+        got.push(r.unwrap().get_val(stack).unwrap());
     }
     assert_eq!(got, (0..10u32).collect::<Vec<_>>());
     dq.bstack_drop(&alloc).unwrap();
@@ -6095,7 +6267,7 @@ fn stdlib_list_iter() {
     }
     let mut got = Vec::new();
     for r in list.iter(stack).unwrap() {
-        got.push(r.unwrap().val(stack).unwrap());
+        got.push(r.unwrap().get_val(stack).unwrap());
     }
     assert_eq!(got, (0..6u32).collect::<Vec<_>>());
     list.bstack_drop(&alloc).unwrap();
@@ -6114,7 +6286,7 @@ fn stdlib_map_iter() {
     let mut got = Vec::new();
     for r in map.iter(stack).unwrap() {
         let (k, v) = r.unwrap();
-        got.push((k, v.val(stack).unwrap()));
+        got.push((k, v.get_val(stack).unwrap()));
     }
     got.sort_unstable(); // unordered iteration
     assert_eq!(got, (0..20u32).map(|k| (k, k * 10)).collect::<Vec<_>>());
@@ -6154,7 +6326,7 @@ fn stdlib_tree_iter_and_range() {
     let mut got = Vec::new();
     for r in tree.iter(stack).unwrap() {
         let (k, v) = r.unwrap();
-        got.push((k, v.val(stack).unwrap()));
+        got.push((k, v.get_val(stack).unwrap()));
     }
     assert_eq!(got, (0..40u32).map(|k| (k, k * 10)).collect::<Vec<_>>());
 
@@ -6215,7 +6387,7 @@ fn stdlib_map_entry() {
         .get_or_insert_with(&alloc, 7, || MacroLeaf::new(&alloc, 70))
         .unwrap();
     assert!(inserted);
-    assert_eq!(v.val(stack).unwrap(), 70);
+    assert_eq!(v.get_val(stack).unwrap(), 70);
 
     // Present: single probe, f NOT called, value unchanged.
     map.insert(&alloc, 5, MacroLeaf::new(&alloc, 50).unwrap())
@@ -6229,14 +6401,14 @@ fn stdlib_map_entry() {
         .unwrap();
     assert!(!inserted);
     assert!(!called.get(), "f must not run on a hit");
-    assert_eq!(v.val(stack).unwrap(), 50);
+    assert_eq!(v.get_val(stack).unwrap(), 50);
 
     // Eager get_or_insert frees the unused default on a hit.
     let (v, inserted) = map
         .get_or_insert(&alloc, 5, MacroLeaf::new(&alloc, 111).unwrap())
         .unwrap();
     assert!(!inserted);
-    assert_eq!(v.val(stack).unwrap(), 50);
+    assert_eq!(v.get_val(stack).unwrap(), 50);
 
     map.bstack_drop(&alloc).unwrap();
 }
@@ -6279,7 +6451,7 @@ fn stdlib_tree_entry() {
         .get_or_insert_with(&alloc, 7, || MacroLeaf::new(&alloc, 70))
         .unwrap();
     assert!(inserted);
-    assert_eq!(v.val(stack).unwrap(), 70);
+    assert_eq!(v.get_val(stack).unwrap(), 70);
 
     let called = std::cell::Cell::new(false);
     let (v, inserted) = tree
@@ -6290,7 +6462,7 @@ fn stdlib_tree_entry() {
         .unwrap();
     assert!(!inserted);
     assert!(!called.get());
-    assert_eq!(v.val(stack).unwrap(), 70);
+    assert_eq!(v.get_val(stack).unwrap(), 70);
 
     tree.bstack_drop(&alloc).unwrap();
 }
@@ -6348,7 +6520,14 @@ fn wal_clone_reclaims_orphans_on_commit_fault() {
 
     // Source intact; a real (unfaulted) clone still succeeds, reusing the space.
     let cl = src.try_clone_in(&alloc).unwrap();
-    assert_eq!(cl.handle().child(stack).unwrap().val(stack).unwrap(), 7);
+    assert_eq!(
+        cl.handle()
+            .get_child(stack)
+            .unwrap()
+            .get_val(stack)
+            .unwrap(),
+        7
+    );
     cl.bstack_drop(&alloc).unwrap();
     src.bstack_drop(&alloc).unwrap();
 }
