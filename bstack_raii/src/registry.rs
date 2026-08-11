@@ -377,6 +377,11 @@ struct RegistryInner<'h> {
     /// `id -> live host` (the open allocator), or `None` when the file is not
     /// currently attached. In-memory only.
     live: Vec<Option<Arc<dyn ForeignHost + 'h>>>,
+    /// Reverse map `host BStack address -> id`, for turning a live handle back into
+    /// its [`FileId`] (`bstack_cast!(slice as Foreign<T>)`). In-memory only;
+    /// populated on [`attach`](FileRegistry::attach), pruned on
+    /// [`detach`](FileRegistry::detach).
+    by_stack: HashMap<usize, FileId>,
     store: RegistryStore,
 }
 
@@ -412,6 +417,7 @@ impl<'h> FileRegistry<'h> {
                 paths,
                 by_path,
                 live,
+                by_stack: HashMap::new(),
                 store,
             }),
         })
@@ -449,8 +455,10 @@ impl<'h> FileRegistry<'h> {
     /// [`detach`](Self::detach) — drops it), not `'static`.
     pub fn attach(&self, path: &Path, host: Arc<dyn ForeignHost + 'h>) -> io::Result<FileId> {
         let id = self.register_path(path)?;
+        let stack_key = core::ptr::from_ref(host.stack()) as usize;
         let mut g = self.inner.write();
         g.live[(id.0 - 1) as usize] = Some(host); // register_path returns a 1-based id
+        g.by_stack.insert(stack_key, id);
         Ok(id)
     }
 
@@ -460,8 +468,14 @@ impl<'h> FileRegistry<'h> {
     pub fn detach(&self, id: FileId) {
         let Some(idx) = table_index(id) else { return };
         let mut g = self.inner.write();
-        if let Some(slot) = g.live.get_mut(idx) {
-            *slot = None;
+        // Take the host out (this is the detach) and drop its reverse-map entry.
+        let stack_key = g
+            .live
+            .get_mut(idx)
+            .and_then(|slot| slot.take())
+            .map(|host| core::ptr::from_ref(host.stack()) as usize);
+        if let Some(k) = stack_key {
+            g.by_stack.remove(&k);
         }
     }
 
@@ -502,6 +516,14 @@ impl<'h> FileRegistry<'h> {
             return false;
         };
         self.inner.read().live.get(idx).is_some_and(Option::is_some)
+    }
+
+    /// The [`FileId`] of the currently-attached file whose backing stack is `stack`,
+    /// if any — the reverse of [`with_host`](Self::with_host). Lets a live handle be
+    /// turned back into a `Foreign` (`bstack_cast!(slice as Foreign<T>)`).
+    pub fn id_of_host(&self, stack: &BStack) -> Option<FileId> {
+        let key = core::ptr::from_ref(stack) as usize;
+        self.inner.read().by_stack.get(&key).copied()
     }
 }
 
@@ -573,6 +595,11 @@ pub fn with_host<R>(id: FileId, f: impl FnOnce(&dyn ForeignHost) -> R) -> Option
 /// The path registered for `id`, if any.
 pub fn path_of(id: FileId) -> Option<PathBuf> {
     REGISTRY.get()?.path_of(id)
+}
+
+/// [`FileRegistry::id_of_host`] on the process-wide registry.
+pub fn id_of_host(stack: &BStack) -> Option<FileId> {
+    REGISTRY.get()?.id_of_host(stack)
 }
 
 /// The id registered for `path`, if any.
