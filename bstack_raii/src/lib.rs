@@ -403,5 +403,88 @@ pub use bstack_raii_derive::{bstack_block, bstack_cast, bstack_enum, bstack_move
 /// struct Holder { #[bstack_owned] link: Foreign<Option<Leaf>> }
 /// # fn main() {}
 /// ```
+///
+/// **No double `Foreign`** (`Foreign<Foreign<T>>`) — a pointer to a pointer; bridge
+/// with a `#[bstack_block]` struct:
+/// ```compile_fail
+/// use bstack_raii::bstack_block;
+/// #[bstack_block] struct Leaf { v: u32 }
+/// #[bstack_block]
+/// struct Holder { #[bstack_owned] link: Foreign<Foreign<Leaf>> }
+/// # fn main() {}
+/// ```
+///
+/// **No double `Foreign` through `Option`** (`Foreign<Option<Foreign<T>>>`):
+/// ```compile_fail
+/// use bstack_raii::bstack_block;
+/// #[bstack_block] struct Leaf { v: u32 }
+/// #[bstack_block]
+/// struct Holder { #[bstack_owned] link: Foreign<Option<Foreign<Leaf>>> }
+/// # fn main() {}
+/// ```
+///
+/// **No pointer to a `Vec`** (`Foreign<Vec<T>>`) — `Vec<Foreign<T>>` is the allowed
+/// form (a vector OF pointers); a pointer TO a vector must be bridged:
+/// ```compile_fail
+/// use bstack_raii::bstack_block;
+/// #[bstack_block] struct Leaf { v: u32 }
+/// #[bstack_block]
+/// struct Holder { #[bstack_owned] link: Foreign<Vec<Leaf>> }
+/// # fn main() {}
+/// ```
+///
+/// **No pointer to an array** (`Foreign<[T; N]>`) — `[Foreign<T>; N]` is allowed:
+/// ```compile_fail
+/// use bstack_raii::bstack_block;
+/// #[bstack_block] struct Leaf { v: u32 }
+/// #[bstack_block]
+/// struct Holder { #[bstack_owned] link: Foreign<[Leaf; 4]> }
+/// # fn main() {}
+/// ```
+///
+/// **No pointer to a tuple** (`Foreign<(A, B)>`):
+/// ```compile_fail
+/// use bstack_raii::bstack_block;
+/// #[bstack_block] struct Leaf { v: u32 }
+/// #[bstack_block]
+/// struct Holder { #[bstack_owned] link: Foreign<(Leaf, Leaf)> }
+/// # fn main() {}
+/// ```
+///
+/// **No pointer to a `String`** (`Foreign<String>`):
+/// ```compile_fail
+/// use bstack_raii::bstack_block;
+/// #[bstack_block]
+/// struct Holder { #[bstack_owned] link: bstack_raii::Foreign<String> }
+/// # fn main() {}
+/// ```
+///
+/// The bad target also applies **inside a container** — e.g. a `Vec` of double
+/// foreigns (`Vec<Foreign<Foreign<T>>>`) is rejected the same way:
+/// ```compile_fail
+/// use bstack_raii::bstack_block;
+/// #[bstack_block] struct Leaf { v: u32 }
+/// #[bstack_block]
+/// struct Holder { #[bstack_owned] links: Vec<Foreign<Foreign<Leaf>>> }
+/// # fn main() {}
+/// ```
+///
+/// **`Foreign` inside a tuple** — unsupported position; bridge with a struct:
+/// ```compile_fail
+/// use bstack_raii::bstack_block;
+/// #[bstack_block] struct Leaf { v: u32 }
+/// #[bstack_block]
+/// struct Holder { #[bstack_owned] t: (u32, Foreign<Leaf>) }
+/// # fn main() {}
+/// ```
+///
+/// **`Foreign` inside a tuple inside a `Vec`** (`Vec<(_, Foreign<T>)>`):
+/// ```compile_fail
+/// use bstack_raii::bstack_block;
+/// #[bstack_block] struct Leaf { v: u32 }
+/// #[bstack_block]
+/// struct Holder { #[bstack_owned] v: Vec<(u32, Foreign<Leaf>)> }
+/// # fn main() {}
+/// ```
 #[doc(hidden)]
 pub mod __macro_compile_fail_tests {}

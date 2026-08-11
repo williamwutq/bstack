@@ -7096,6 +7096,86 @@ struct ForeignWeakHolder {
     link: Foreign<MacroStrongChild>,
 }
 
+// A home block owning a *vector* of cross-file pointers.
+#[bstack_block]
+struct ForeignVecHolder {
+    tag: u32,
+    #[bstack_owned]
+    links: Vec<Foreign<MacroLeaf>>,
+}
+
+// A home block owning a fixed-size *array* of cross-file pointers.
+#[bstack_block]
+struct ForeignArrHolder {
+    tag: u32,
+    #[bstack_owned]
+    links: [Foreign<MacroLeaf>; 3],
+}
+
+// A home block holding a vector of *strong* cross-file references.
+#[bstack_block]
+struct ForeignStrongVecHolder {
+    tag: u32,
+    #[bstack_strong]
+    links: Vec<Foreign<MacroStrongChild>>,
+}
+
+// -------- Generic foreign: the target is a struct type parameter --------
+
+#[bstack_block]
+struct GenForeign<T> {
+    tag: u32,
+    #[bstack_owned]
+    link: Foreign<T>,
+}
+
+#[bstack_block]
+struct GenForeignVec<T> {
+    #[bstack_owned]
+    links: Vec<Foreign<T>>,
+}
+
+// -------- Cursed-but-VALID foreign container combinations (must compile) --------
+
+// Per-element-`Option` array of 8 owning pointers.
+#[bstack_block]
+struct CursedArr8 {
+    tag: u32,
+    #[bstack_owned]
+    slots: [Option<Foreign<MacroLeaf>>; 8],
+}
+
+// A *nested* array of strong pointers.
+#[bstack_block]
+struct CursedNestedArr {
+    #[bstack_strong]
+    grid: [[Foreign<MacroStrongChild>; 2]; 3],
+}
+
+// A single block mixing a nullable owned vector-of-pointers, a ref vector-of-pointers,
+// a nullable weak scalar pointer, and a plain owned scalar pointer.
+#[bstack_block]
+struct CursedMix {
+    #[bstack_owned]
+    maybe_owned: Option<Vec<Foreign<MacroLeaf>>>,
+    #[bstack_ref]
+    refs: Vec<Foreign<MacroLeaf>>,
+    #[bstack_weak]
+    maybe_weak: Option<Foreign<MacroStrongChild>>,
+    #[bstack_owned]
+    one: Foreign<MacroLeaf>,
+    // The deep one: a nullable vector of nullable foreign pointers.
+    #[bstack_owned]
+    deep: Option<Vec<Option<Foreign<MacroLeaf>>>>,
+}
+
+// A vector whose elements are *nullable* foreign pointers.
+#[bstack_block]
+struct OptForeignVecHolder {
+    #[bstack_owned]
+    links: Vec<Option<Foreign<MacroLeaf>>>,
+}
+
 #[test]
 fn macro_foreign_owned_teardown_reclaims_across_files() {
     // Cross-file teardown dispatch (option 1): tearing down a block with a
@@ -7651,6 +7731,394 @@ fn macro_foreign_concurrent_ab_ba_clone() {
 }
 
 #[test]
+fn macro_foreign_vec_owned_across_files() {
+    // `#[bstack_owned] Vec<Foreign<T>>`: each element owns a cross-file target.
+    // Construction/access map to `Foreign<T>`; clone deep-copies EVERY element on the
+    // far side; teardown frees every element there.
+    use crate::registry;
+    use crate::{Foreign, TryCloneIn};
+    use std::sync::Arc;
+
+    let home = TempStack::new();
+    let home_alloc = home.allocator();
+
+    let foreign = TempStack::new();
+    let arc_b = Arc::new(foreign.allocator());
+
+    let reg_file = TempStack::new();
+    let _ = registry::init(&reg_file.path);
+    let reg = registry::get().unwrap();
+    let fid = reg.attach(&foreign.path, arc_b.clone()).unwrap();
+
+    // Warm the owned-vec clone path (creates B's WAL block), then baseline.
+    {
+        let l = MacroLeaf::new(&*arc_b, 0).unwrap();
+        let h = ForeignVecHolder::new(
+            &home_alloc,
+            0,
+            vec![Foreign::<MacroLeaf>::new(fid, l.handle().range().start())],
+        )
+        .unwrap();
+        let c = h.handle().try_clone_in(&home_alloc).unwrap();
+        c.bstack_drop(&home_alloc).unwrap();
+        h.bstack_drop(&home_alloc).unwrap();
+    }
+    let base = arc_b.stack().len().unwrap();
+
+    // N owned foreign targets on B.
+    const N: u32 = 5;
+    let mut links = Vec::new();
+    for i in 0..N {
+        let l = MacroLeaf::new(&*arc_b, 100 + i).unwrap();
+        links.push(Foreign::<MacroLeaf>::new(fid, l.handle().range().start()));
+    }
+    let h = ForeignVecHolder::new(&home_alloc, 7, links).unwrap();
+
+    // Accessor yields N `Foreign`s resolving to the right values.
+    let got = h.handle().get_links(&home_alloc).unwrap();
+    assert_eq!(got.len(), N as usize);
+    for (i, f) in got.iter().enumerate() {
+        assert_eq!(
+            f.with(&home_alloc, |t, fs| t.get_val(fs).unwrap()).unwrap(),
+            100 + i as u32
+        );
+    }
+
+    // Deep clone: every element is copied to a fresh block on B (different offsets),
+    // same values.
+    let c = h.handle().try_clone_in(&home_alloc).unwrap();
+    let clinks = c.handle().get_links(&home_alloc).unwrap();
+    assert_eq!(clinks.len(), N as usize);
+    for (o, n) in got.iter().zip(clinks.iter()) {
+        assert_ne!(o.offset(), n.offset(), "each element must be a fresh copy");
+        assert_eq!(
+            n.with(&home_alloc, |t, fs| t.get_val(fs).unwrap()).unwrap(),
+            o.with(&home_alloc, |t, fs| t.get_val(fs).unwrap()).unwrap()
+        );
+    }
+
+    // Tearing both down frees all 2N targets on B → back to baseline.
+    h.bstack_drop(&home_alloc).unwrap();
+    c.bstack_drop(&home_alloc).unwrap();
+    assert_eq!(
+        arc_b.stack().len().unwrap(),
+        base,
+        "foreign-vec clone/teardown leaked or double-freed on B"
+    );
+
+    reg.detach(fid);
+}
+
+#[test]
+fn macro_foreign_array_owned_across_files() {
+    // `#[bstack_owned] [Foreign<T>; N]`: an inline fixed array of owning cross-file
+    // pointers. Same per-element teardown / clone as the vector, but stored inline.
+    use crate::registry;
+    use crate::{Foreign, TryCloneIn};
+    use std::sync::Arc;
+
+    let home = TempStack::new();
+    let home_alloc = home.allocator();
+    let hstack = home_alloc.stack();
+
+    let foreign = TempStack::new();
+    let arc_b = Arc::new(foreign.allocator());
+
+    let reg_file = TempStack::new();
+    let _ = registry::init(&reg_file.path);
+    let reg = registry::get().unwrap();
+    let fid = reg.attach(&foreign.path, arc_b.clone()).unwrap();
+
+    let mk = |v: u32| {
+        let l = MacroLeaf::new(&*arc_b, v).unwrap();
+        Foreign::<MacroLeaf>::new(fid, l.handle().range().start())
+    };
+
+    // Warm the owned-array clone path (creates B's WAL block), baseline.
+    {
+        let h = ForeignArrHolder::new(&home_alloc, 0, [mk(0), mk(0), mk(0)]).unwrap();
+        let c = h.handle().try_clone_in(&home_alloc).unwrap();
+        c.bstack_drop(&home_alloc).unwrap();
+        h.bstack_drop(&home_alloc).unwrap();
+    }
+    let base = arc_b.stack().len().unwrap();
+
+    let h = ForeignArrHolder::new(&home_alloc, 7, [mk(10), mk(20), mk(30)]).unwrap();
+    let got = h.handle().get_links(hstack).unwrap();
+    let vals: Vec<u32> = got
+        .iter()
+        .map(|f| f.with(&home_alloc, |t, fs| t.get_val(fs).unwrap()).unwrap())
+        .collect();
+    assert_eq!(vals, vec![10, 20, 30]);
+
+    // Deep clone: every slot copied to a fresh block on B, same values.
+    let c = h.handle().try_clone_in(&home_alloc).unwrap();
+    let clinks = c.handle().get_links(hstack).unwrap();
+    for (o, n) in got.iter().zip(clinks.iter()) {
+        assert_ne!(o.offset(), n.offset(), "each slot must be a fresh copy");
+    }
+    let cvals: Vec<u32> = clinks
+        .iter()
+        .map(|f| f.with(&home_alloc, |t, fs| t.get_val(fs).unwrap()).unwrap())
+        .collect();
+    assert_eq!(cvals, vec![10, 20, 30]);
+
+    h.bstack_drop(&home_alloc).unwrap();
+    c.bstack_drop(&home_alloc).unwrap();
+    assert_eq!(
+        arc_b.stack().len().unwrap(),
+        base,
+        "foreign-array clone/teardown leaked or double-freed on B"
+    );
+
+    reg.detach(fid);
+}
+
+#[test]
+fn macro_foreign_strong_vec_across_files() {
+    // `#[bstack_strong] Vec<Foreign<T>>`: cloning bumps EVERY element's strong count
+    // on the far side; teardown decrements each. (Counts checked directly.)
+    use crate::registry;
+    use crate::{Foreign, TryCloneIn};
+    use std::sync::Arc;
+
+    let home = TempStack::new();
+    let home_alloc = home.allocator();
+
+    let foreign = TempStack::new();
+    let arc_b = Arc::new(foreign.allocator());
+
+    let ds = size_of::<<MacroStrongChild as BStackBlock>::OnDisk>() as u64;
+    let cs = size_of::<<MacroStrongChild as BStackWeakable>::Control>() as u64;
+
+    let reg_file = TempStack::new();
+    let _ = registry::init(&reg_file.path);
+    let reg = registry::get().unwrap();
+    let fid = reg.attach(&foreign.path, arc_b.clone()).unwrap();
+
+    // 3 shared targets on B, strong = 1 each.
+    let mut links = Vec::new();
+    let mut strong_offs = Vec::new();
+    for _ in 0..3 {
+        let d = alloc_block(&*arc_b, MacroStrongChild::eightcc(), ds).unwrap();
+        let c = alloc_control(&*arc_b, ctrl_tag(), d, cs).unwrap();
+        strong_offs.push(c.start() + layout::CTRL_STRONG_OFFSET);
+        links.push(Foreign::<MacroStrongChild>::new(fid, d.start()));
+    }
+    let load = |o: u64| crate::refcount::load(arc_b.stack(), o).unwrap();
+    for &o in &strong_offs {
+        assert_eq!(load(o), 1);
+    }
+
+    let h = ForeignStrongVecHolder::new(&home_alloc, 1, links).unwrap();
+    let c = h.handle().try_clone_in(&home_alloc).unwrap();
+    for &o in &strong_offs {
+        assert_eq!(load(o), 2, "each strong vec element should bump on clone");
+    }
+
+    // h releases one ref per element; the clone still holds the other.
+    h.bstack_drop(&home_alloc).unwrap();
+    for &o in &strong_offs {
+        assert_eq!(
+            load(o),
+            1,
+            "each element should drop to 1 after one owner tears down"
+        );
+    }
+    // The clone releasing drives each to zero and frees the targets (no panic).
+    c.bstack_drop(&home_alloc).unwrap();
+
+    reg.detach(fid);
+}
+
+#[test]
+fn macro_foreign_generic_across_files() {
+    // A `Foreign<T>` over a struct type parameter `T`: the macro derives `T:
+    // BStackBlock (+ TryCloneIn for owned)` on the generated impls, so a generic block
+    // deep-clones / tears down its foreign target exactly like a concrete one.
+    use crate::registry;
+    use crate::{Foreign, TryCloneIn};
+    use std::sync::Arc;
+
+    let home = TempStack::new();
+    let home_alloc = home.allocator();
+    let hstack = home_alloc.stack();
+
+    let foreign = TempStack::new();
+    let arc_b = Arc::new(foreign.allocator());
+    let reg_file = TempStack::new();
+    let _ = registry::init(&reg_file.path);
+    let reg = registry::get().unwrap();
+    let fid = reg.attach(&foreign.path, arc_b.clone()).unwrap();
+
+    // Warm B's WAL block via one owned-clone cycle, then baseline.
+    {
+        let l = MacroLeaf::new(&*arc_b, 0).unwrap();
+        let h = GenForeign::<MacroLeaf>::new(
+            &home_alloc,
+            0,
+            Foreign::new(fid, l.handle().range().start()),
+        )
+        .unwrap();
+        let c = h.handle().try_clone_in(&home_alloc).unwrap();
+        c.bstack_drop(&home_alloc).unwrap();
+        h.bstack_drop(&home_alloc).unwrap();
+    }
+    let base = arc_b.stack().len().unwrap();
+
+    let l = MacroLeaf::new(&*arc_b, 55).unwrap();
+    let off = l.handle().range().start();
+    let h = GenForeign::<MacroLeaf>::new(&home_alloc, 7, Foreign::new(fid, off)).unwrap();
+
+    // Access resolves the generic foreign target.
+    let link = h.handle().get_link(hstack).unwrap();
+    assert_eq!(
+        link.with(&home_alloc, |t, fs| t.get_val(fs).unwrap())
+            .unwrap(),
+        55
+    );
+
+    // Deep clone copies the target on B (fresh offset, same value).
+    let c = h.handle().try_clone_in(&home_alloc).unwrap();
+    let clink = c.handle().get_link(hstack).unwrap();
+    assert_ne!(clink.offset(), off);
+    assert_eq!(
+        clink
+            .with(&home_alloc, |t, fs| t.get_val(fs).unwrap())
+            .unwrap(),
+        55
+    );
+
+    // Teardown both → both leaves reclaimed → baseline.
+    h.bstack_drop(&home_alloc).unwrap();
+    c.bstack_drop(&home_alloc).unwrap();
+    assert_eq!(arc_b.stack().len().unwrap(), base);
+
+    // The generic vector form compiles + tears down (empty ⇒ self-contained).
+    let gv = GenForeignVec::<MacroLeaf>::new(&home_alloc, vec![]).unwrap();
+    assert!(gv.handle().get_links(&home_alloc).unwrap().is_empty());
+    gv.bstack_drop(&home_alloc).unwrap();
+
+    reg.detach(fid);
+}
+
+#[test]
+fn macro_foreign_cursed_valid_combos_compile_and_run() {
+    // The cursed-but-valid combinations above must compile; here we also construct /
+    // access / clone / tear them down. Everything is null / empty so no registry is
+    // needed (teardown & clone skip offset-0 elements and empty vectors).
+    use crate::Foreign;
+    use crate::TryCloneIn;
+    use crate::registry::FileId;
+
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    // [Option<Foreign>; 8] all None.
+    let a = CursedArr8::new(&alloc, 9, [None, None, None, None, None, None, None, None]).unwrap();
+    assert_eq!(a.handle().get_tag(stack).unwrap(), 9);
+    let slots = a.handle().get_slots(stack).unwrap();
+    assert_eq!(slots.len(), 8);
+    assert!(slots.iter().all(::core::option::Option::is_none));
+    a.handle()
+        .try_clone_in(&alloc)
+        .unwrap()
+        .bstack_drop(&alloc)
+        .unwrap();
+    a.bstack_drop(&alloc).unwrap();
+
+    // [[Foreign; 2]; 3] all null (offset-0) strong pointers.
+    let null = Foreign::<MacroStrongChild>::new(FileId::SELF, 0);
+    let n = CursedNestedArr::new(&alloc, [[null, null], [null, null], [null, null]]).unwrap();
+    let grid = n.handle().get_grid(stack).unwrap();
+    assert_eq!(grid.len(), 3);
+    assert_eq!(grid[0].len(), 2);
+    n.handle()
+        .try_clone_in(&alloc)
+        .unwrap()
+        .bstack_drop(&alloc)
+        .unwrap();
+    n.bstack_drop(&alloc).unwrap();
+
+    // The grand mix: null / empty everywhere.
+    let m = CursedMix::new(
+        &alloc,
+        None,
+        vec![],
+        None,
+        Foreign::<MacroLeaf>::new(FileId::SELF, 0),
+        None,
+    )
+    .unwrap();
+    assert!(m.handle().get_maybe_owned(&alloc).unwrap().is_none());
+    assert!(m.handle().get_refs(&alloc).unwrap().is_empty());
+    assert!(m.handle().get_maybe_weak(stack).unwrap().is_none());
+    assert!(m.handle().get_deep(&alloc).unwrap().is_none());
+    m.handle()
+        .try_clone_in(&alloc)
+        .unwrap()
+        .bstack_drop(&alloc)
+        .unwrap();
+    m.bstack_drop(&alloc).unwrap();
+}
+
+#[test]
+fn macro_foreign_vec_of_option_roundtrips() {
+    // `Vec<Option<Foreign<T>>>`: a null element (offset 0) reads back as `None`; a
+    // present one resolves. Teardown / clone skip the `None`s.
+    use crate::registry;
+    use crate::{Foreign, TryCloneIn};
+    use std::sync::Arc;
+
+    let home = TempStack::new();
+    let home_alloc = home.allocator();
+    let hstack = home_alloc.stack();
+
+    let foreign = TempStack::new();
+    let arc_b = Arc::new(foreign.allocator());
+    let reg_file = TempStack::new();
+    let _ = registry::init(&reg_file.path);
+    let reg = registry::get().unwrap();
+    let fid = reg.attach(&foreign.path, arc_b.clone()).unwrap();
+
+    let f = |v: u32| {
+        let l = MacroLeaf::new(&*arc_b, v).unwrap();
+        Some(Foreign::<MacroLeaf>::new(fid, l.handle().range().start()))
+    };
+    // [Some, None, Some].
+    let h = OptForeignVecHolder::new(&home_alloc, vec![f(11), None, f(22)]).unwrap();
+    let got = h.handle().get_links(&home_alloc).unwrap();
+    assert_eq!(got.len(), 3);
+    assert!(got[1].is_none());
+    assert_eq!(
+        got[0]
+            .unwrap()
+            .with(&home_alloc, |t, fs| t.get_val(fs).unwrap())
+            .unwrap(),
+        11
+    );
+    assert_eq!(
+        got[2]
+            .unwrap()
+            .with(&home_alloc, |t, fs| t.get_val(fs).unwrap())
+            .unwrap(),
+        22
+    );
+
+    // Clone: the two present elements are deep-copied, the `None` stays `None`.
+    let c = h.handle().try_clone_in(&home_alloc).unwrap();
+    let cgot = c.handle().get_links(&home_alloc).unwrap();
+    assert!(cgot[1].is_none());
+    assert_ne!(cgot[0].unwrap().offset(), got[0].unwrap().offset());
+
+    h.bstack_drop(&home_alloc).unwrap();
+    c.bstack_drop(&home_alloc).unwrap();
+    let _ = hstack;
+    reg.detach(fid);
+}
+
+#[test]
 fn macro_foreign_owned_clone_errors_when_target_file_detached() {
     // Cloning an owning `Foreign<T>` whose target file is not attached must ERROR (not
     // silently alias — that would create a second owner and later double-free).
@@ -7708,15 +8176,22 @@ fn foreign_reverse_map_and_bstack_cast() {
     );
 
     // foreign -> normal (`bstack_cast!(foreign as BStackRef<T>)`): a SELF pointer is
-    // always resolvable-in-place; a foreign id is None here (the GLOBAL registry
-    // that `as_local_ref` consults is uninitialized in tests).
+    // always resolvable-in-place; a foreign id that is not live-in-the-GLOBAL-registry
+    // is `None`. Use a high id no test ever attaches, so this holds regardless of what
+    // other (global-registry) tests are doing concurrently.
     let selfp = Foreign::<MacroLeaf>::new(FileId::SELF, off);
     let r: Option<BStackRef<MacroLeaf>> = bstack_cast!(selfp as BStackRef<MacroLeaf>);
     assert!(r.is_some());
-    assert!(Foreign::<MacroLeaf>::new(id, off).as_local_ref().is_none());
+    let dead = FileId::from_u64(60_000).unwrap();
+    assert!(
+        Foreign::<MacroLeaf>::new(dead, off)
+            .as_local_ref()
+            .is_none()
+    );
 
-    // normal -> foreign (`bstack_cast!(slice as Foreign<T>)`): needs the GLOBAL
-    // registry (uninitialized in tests) → None, but the macro arm type-checks.
+    // normal -> foreign (`bstack_cast!(slice as Foreign<T>)`): the local file is never
+    // attached to the GLOBAL registry, so its stack has no id → `None`, but the macro
+    // arm type-checks.
     let la = local_file.allocator();
     let s = la.alloc(16).unwrap().as_range();
     let slice = unsafe { BStackSlice::from_raw_range(la.stack(), s) };

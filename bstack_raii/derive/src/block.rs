@@ -122,6 +122,11 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         strong: bool,
         weak: bool,
         in_ondisk: bool,
+        /// The parameter is the target of a `#[bstack_owned] Foreign<T>` (scalar or in
+        /// a container). Unlike a plain owned child (cloned via `__bstack_clone_into`,
+        /// needing only `BStackBlock`), an owned foreign deep-clone runs a self-
+        /// contained `try_clone_in` on the target's file, so it needs `TryCloneIn`.
+        foreign_owned: bool,
     }
     let mut usage: Vec<(Ident, Usage)> = type_params
         .iter()
@@ -132,8 +137,26 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         if !type_mentions_any(&field.ty, &type_params) {
             continue;
         }
+        // A foreign field lowers to a `ForeignPtr` (its target `T` is never stored
+        // inline), so the target parameter is a *block reference*, not a POD/embed —
+        // regardless of the container it sits in. Detect it up front so the bounds are
+        // `BStackBlock` (+ `TryCloneIn` for owned, and the usual strong/weak) rather
+        // than the `Pod`/`in_ondisk` a bare `Foreign<T>` field would otherwise imply.
+        let foreign_target = field_foreign_target(&field.ty);
         for (p, u) in usage.iter_mut() {
             if !type_mentions_any(&field.ty, &[&*p]) {
+                continue;
+            }
+            if foreign_target.is_some_and(|t| type_mentions_any(t, &[&*p])) {
+                // The parameter is a foreign *target*: a block reference in its own
+                // file. Kind names the ownership of that target.
+                u.blockish = true;
+                match kind {
+                    Kind::Owned => u.foreign_owned = true,
+                    Kind::Strong => u.strong = true,
+                    Kind::Weak => u.weak = true,
+                    _ => {}
+                }
                 continue;
             }
             match kind {
@@ -188,6 +211,10 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                 if u.weak {
                     tp.bounds
                         .push(syn::parse_quote!(::bstack_raii::BStackWeakable));
+                }
+                if u.foreign_owned {
+                    // An owned foreign target is deep-cloned via its own `try_clone_in`.
+                    tp.bounds.push(syn::parse_quote!(::bstack_raii::TryCloneIn));
                 }
             }
         }
@@ -329,6 +356,24 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         // offending construct. Valid mixes (`Option<Vec<Option<T>>>`, …) pass.
         check_container_nesting(eff_ty)?;
 
+        // `Foreign` is supported only in a handful of shapes — a scalar `Foreign<T>` /
+        // `Option<Foreign<T>>`, a `Vec<Foreign<T>>` / `Vec<Option<Foreign<T>>>`, or a
+        // `[Foreign<T>; N]` (nested / per-element `Option`). If it appears anywhere
+        // else (inside a tuple, a POD aggregate, a `Vec` of tuples, …) `field_foreign_target`
+        // can't reach it, yet the type still mentions it — reject with a directed message
+        // rather than leaking a bare, unresolved `Foreign` type into the output.
+        if tokens_mention(quote!(#eff_ty), &[&format_ident!("Foreign")])
+            && field_foreign_target(eff_ty).is_none()
+        {
+            return Err(Error::new_spanned(
+                &field.ty,
+                "`Foreign` is nested in an unsupported position (e.g. inside a tuple or another \
+                 POD aggregate). It is supported as a scalar `Foreign<T>` / `Option<Foreign<T>>`, \
+                 a `Vec<Foreign<T>>` / `Vec<Option<Foreign<T>>>`, or a `[Foreign<T>; N]` — \
+                 anywhere else, wrap the `Foreign` inside a `#[bstack_block]` struct and use that.",
+            ));
+        }
+
         // `Foreign<T>`: a cross-file wide pointer, stored inline as a 16-byte
         // `ForeignPtr` `(file_id, offset)` and resolved through the registry (length
         // recovered from `size_of::<T::OnDisk>()`, so it is not stored). The field's
@@ -340,47 +385,19 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         // clone (an alias) and freed by nobody on teardown, whatever the annotation;
         // the annotation is recorded for the eventual per-kind dispatch.
         if let Some(ftarget) = foreign_inner(opt_inner) {
-            // A `Foreign` points at a *block* in another file, so it must carry an
-            // ownership annotation naming the target's kind — never bare (POD is an
-            // inline value, not a pointer) and never `#[embed]` (can't inline a
-            // cross-file pointer). The annotation's dispatch (teardown/clone) is
-            // deferred, but the kind is required now.
-            match kind {
-                Kind::Owned | Kind::Strong | Kind::Weak | Kind::Ref => {}
-                Kind::Pod => {
-                    return Err(Error::new_spanned(
-                        &field.ty,
-                        "`Foreign<T>` needs an ownership annotation naming the target's \
-                         kind in its own file (`#[bstack_owned/strong/weak/ref]`); a bare \
-                         `Foreign<T>` (POD) is not allowed — a foreign pointer targets a block",
-                    ));
-                }
-                Kind::Embed => {
-                    return Err(Error::new_spanned(
-                        &field.ty,
-                        "`Foreign<T>` is a pointer and cannot be `#[embed]`ed",
-                    ));
-                }
-            }
-            // `Foreign<Option<T>>` is almost always a mistake: a nullable foreign
-            // *pointer* is `Option<Foreign<T>>` (the pointer is absent), not a pointer
-            // to a nullable field.
-            if option_inner(ftarget).is_some() {
-                return Err(Error::new_spanned(
-                    &field.ty,
-                    "use `Option<Foreign<T>>` for a nullable foreign pointer, not \
-                     `Foreign<Option<T>>` (a foreign pointer targets a block, not a nullable field)",
-                ));
-            }
-            // The target must be a bstack block (ref-able) — reject `Foreign<Pod>`.
-            let assert_fn = format_ident!("__bstack_foreign_target_{}", fname);
-            wrapper_defs.push(quote! {
-                #[doc(hidden)]
-                const _: fn() = {
-                    fn #assert_fn<__T: ::bstack_raii::BStackBlock>() {}
-                    #assert_fn::<#ftarget>
-                };
-            });
+            // A `Foreign` points at a *block* in another file: it must carry an
+            // ownership annotation, and its target must be a bstack block — not a
+            // pointer, a container, or a tuple (see `validate_foreign_target`).
+            // Nullable at the *field* level via `Option<Foreign<T>>` (handled below).
+            validate_foreign_target(
+                kind,
+                ftarget,
+                &field.ty,
+                "`Foreign<T>`",
+                format_ident!("__bstack_foreign_target_{}", fname),
+                !type_mentions_any(ftarget, &type_params),
+                &mut wrapper_defs,
+            )?;
             on_disk_fields.push(quote!(#fname: ::bstack_raii::ForeignPtr,));
             let field_ty = quote!(::bstack_raii::Foreign<#ftarget>);
             let cap = format_ident!("__cap_{}", fname);
@@ -645,6 +662,167 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                     &field.ty,
                     "`String` is always POD; remove the ownership annotation",
                 ));
+            }
+
+            // `#[ann] Vec<Foreign<T>>` — a growable vector of cross-file wide
+            // pointers, each an owning foreign reference per the annotation. Stored as
+            // a POD-style vector of `ForeignPtr` (16 B each); construction / access map
+            // to `Foreign<T>`, and teardown / clone dispatch each element cross-file
+            // exactly like a scalar `Foreign` field. A null/unset element is a
+            // `Foreign` whose offset is `0` (skipped by teardown / clone).
+            if let Some(velem) = vec_inner(opt_inner)
+                && let Some(ftarget) = foreign_inner(option_inner(velem).unwrap_or(velem))
+            {
+                // `Vec<Option<Foreign<T>>>`: a per-element-nullable vector (a stored
+                // offset of `0` reads as `None`); `Vec<Foreign<T>>` is the plain form.
+                let elem_nullable = option_inner(velem).is_some();
+                validate_foreign_target(
+                    kind,
+                    ftarget,
+                    &field.ty,
+                    "`Vec<Foreign<T>>`",
+                    format_ident!("__bstack_foreign_vec_target_{}", fname),
+                    !type_mentions_any(ftarget, &type_params),
+                    &mut wrapper_defs,
+                )?;
+
+                let store = quote!(::bstack_raii::BStackVec::<::bstack_raii::ForeignPtr, __A>);
+                let field_loc =
+                    quote!(self.0.start() + ::core::mem::offset_of!(#on_disk_ty, #fname) as u64);
+                let field_ty = if elem_nullable {
+                    quote!(::core::option::Option<::bstack_raii::Foreign<#ftarget>>)
+                } else {
+                    quote!(::bstack_raii::Foreign<#ftarget>)
+                };
+                // Map a stored `ForeignPtr` ↔ the element type (offset 0 ⇒ `None` when
+                // the element is `Option`-wrapped).
+                let from_ptr = if elem_nullable {
+                    quote!(|__p: ::bstack_raii::ForeignPtr| if __p.offset() == 0 {
+                        ::core::option::Option::None
+                    } else {
+                        ::core::option::Option::Some(
+                            ::bstack_raii::Foreign::<#ftarget>::from_ptr(__p))
+                    })
+                } else {
+                    quote!(::bstack_raii::Foreign::<#ftarget>::from_ptr)
+                };
+                let to_ptr = if elem_nullable {
+                    quote!(|__f: #field_ty| match __f {
+                        ::core::option::Option::Some(__ff) => __ff.ptr(),
+                        ::core::option::Option::None => ::bstack_raii::ForeignPtr::new(0, 0),
+                    })
+                } else {
+                    quote!(|__f: #field_ty| __f.ptr())
+                };
+
+                // ---- Accessor: `Vec<Foreign<T>>` / `Vec<Option<Foreign<T>>>` (or `Option<..>`) ----
+                let (acc_ret, acc_body) = if nullable {
+                    (
+                        quote!(::core::option::Option<::std::vec::Vec<#field_ty>>),
+                        quote!(match unsafe { #store::from_field_opt(#field_loc, allocator) }? {
+                            ::core::option::Option::Some(__v) => ::core::option::Option::Some(
+                                __v.to_vec()?
+                                    .into_iter()
+                                    .map(#from_ptr)
+                                    .collect()),
+                            ::core::option::Option::None => ::core::option::Option::None,
+                        }),
+                    )
+                } else {
+                    (
+                        quote!(::std::vec::Vec<#field_ty>),
+                        quote!(unsafe { #store::from_field(#field_loc, allocator)? }
+                            .to_vec()?
+                            .into_iter()
+                            .map(#from_ptr)
+                            .collect()),
+                    )
+                };
+                accessors.push(quote! {
+                    #vis fn #getter<'__v, __A: ::bstack_raii::BStackRaiiAllocator>(
+                        &self,
+                        allocator: &'__v __A,
+                    ) -> ::std::io::Result<#acc_ret> {
+                        ::std::result::Result::Ok(#acc_body)
+                    }
+                });
+
+                // ---- Constructor: `Vec<Foreign<T>>` → a `ForeignPtr` data block ----
+                let build = quote! {
+                    let __ptrs: ::std::vec::Vec<::bstack_raii::ForeignPtr> =
+                        __list.into_iter().map(#to_ptr).collect();
+                    #store::from_slice(allocator, &__ptrs)?.descriptor()
+                };
+                let (param, prep) = if nullable {
+                    (
+                        quote!(#fname: ::core::option::Option<::std::vec::Vec<#field_ty>>,),
+                        quote! {
+                            let #fname: ::bstack_raii::VecDesc = match #fname {
+                                ::core::option::Option::Some(__list) => { #build }
+                                ::core::option::Option::None => ::core::default::Default::default(),
+                            };
+                        },
+                    )
+                } else {
+                    (
+                        quote!(#fname: ::std::vec::Vec<#field_ty>,),
+                        quote! {
+                            let #fname: ::bstack_raii::VecDesc = { let __list = #fname; #build };
+                        },
+                    )
+                };
+                ctor_params.push(param);
+                ctor_preps.push(prep);
+                ctor_inits.push(quote!(#fname: #fname,));
+
+                // ---- Teardown: dispatch each element, then free the data block ----
+                let elem_drop = foreign_elem_drop(kind, ftarget);
+                let drop_loop = if matches!(kind, Kind::Ref) {
+                    quote!()
+                } else {
+                    quote! {
+                        for __fp in #store::from_desc(__desc, allocator).to_vec()? { #elem_drop }
+                    }
+                };
+                drop_stmts.push(quote! {
+                    {
+                        let __desc: ::bstack_raii::VecDesc = __on_disk.#fname;
+                        if __desc.data_off != 0 {
+                            #drop_loop
+                            #store::from_desc(__desc, allocator).bstack_drop()?;
+                        }
+                    }
+                });
+
+                // ---- Clone: dispatch each element into a fresh `ForeignPtr` block ----
+                let elem_clone = foreign_elem_clone(kind, ftarget);
+                clone_stmts.push(quote! {
+                    {
+                        let __srcdesc: ::bstack_raii::VecDesc = __od.#fname;
+                        if __srcdesc.data_off != 0 {
+                            let __src = #store::from_desc(__srcdesc, allocator).to_vec()?;
+                            let mut __new: ::std::vec::Vec<::bstack_raii::ForeignPtr> =
+                                ::std::vec::Vec::with_capacity(__src.len());
+                            for __fp in __src {
+                                #elem_clone
+                                __new.push(__newfp);
+                            }
+                            __od.#fname = __plan.stage_bytevec(
+                                allocator, ::bstack_raii::bytemuck::cast_slice(&__new))?;
+                        }
+                    }
+                });
+
+                // ---- Move: the raw `ForeignPtr` vector handle ----
+                let (mvt, mvr) = wrap_vec_move(
+                    quote!(::bstack_raii::BStackVec<'__mv, ::bstack_raii::ForeignPtr, __A>),
+                    quote!(::bstack_raii::BStackVec::from_desc(#cap, __alloc)),
+                    &cap,
+                    nullable,
+                );
+                mv_types.push(mvt);
+                mv_recon.push(mvr);
+                continue;
             }
 
             // `#[bstack_owned/strong/weak/ref] Vec<[T; N]>` — a vector whose
@@ -1260,6 +1438,154 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                     }
                 };
                 mv_recon.push(nested_build(&dims, &mv_leaf, &mv_read));
+                continue;
+            }
+        }
+
+        // `#[ann] [Foreign<T>; N]` — an inline array of cross-file wide pointers
+        // (possibly nested `[[Foreign<T>; A]; B]` / per-element `[Option<Foreign<T>>; N]`).
+        // Stored flat as `[ForeignPtr; TOTAL]` inline (16 B each, no data block); each
+        // slot's teardown / clone dispatches cross-file exactly like a scalar `Foreign`.
+        // A null/unset slot is a `Foreign` whose offset is `0`. Must be annotated.
+        if let Type::Array(_) = opt_inner {
+            let (adims, aleaf, aleaf_nullable) = array_shape(opt_inner)?;
+            if let Some(ftarget) = foreign_inner(aleaf) {
+                reject_nested_const_dims(&adims, &const_params, &field.ty)?;
+                validate_foreign_target(
+                    kind,
+                    ftarget,
+                    &field.ty,
+                    "`[Foreign<T>; N]`",
+                    format_ident!("__bstack_foreign_arr_target_{}", fname),
+                    !type_mentions_any(ftarget, &type_params),
+                    &mut wrapper_defs,
+                )?;
+                if nullable {
+                    return Err(Error::new_spanned(
+                        &field.ty,
+                        "a whole-array `Option<[Foreign<T>; N]>` is not supported; a null foreign \
+                         element is a `Foreign` with offset 0, or use `[Option<Foreign<T>>; N]`",
+                    ));
+                }
+                let total = dims_prod(&adims);
+                let field_ty = quote!(::bstack_raii::Foreign<#ftarget>);
+                on_disk_fields.push(quote!(#fname: [::bstack_raii::ForeignPtr; #total],));
+
+                // ---- Accessor: nested `[[Foreign<T>; ..]; ..]` (Option per slot) ----
+                let leaf_ty = if aleaf_nullable {
+                    quote!(::core::option::Option<#field_ty>)
+                } else {
+                    field_ty.clone()
+                };
+                let acc_ret = nested_ty(&adims, &leaf_ty);
+                let acc_read = |k: &Ident| {
+                    if aleaf_nullable {
+                        quote!({
+                            let __p = __arr[#k];
+                            if __p.offset() == 0 {
+                                ::core::option::Option::None
+                            } else {
+                                ::core::option::Option::Some(
+                                    ::bstack_raii::Foreign::<#ftarget>::from_ptr(__p))
+                            }
+                        })
+                    } else {
+                        quote!(::bstack_raii::Foreign::<#ftarget>::from_ptr(__arr[#k]))
+                    }
+                };
+                let acc_body = nested_build(&adims, &leaf_ty, &acc_read);
+                accessors.push(quote! {
+                    #vis fn #getter(
+                        &self,
+                        stack: &::bstack_raii::BStack,
+                    ) -> ::std::io::Result<#acc_ret> {
+                        let mut __buf = ::std::vec![0u8; ::core::mem::size_of::<#on_disk_ty>()];
+                        let __r = unsafe { ::bstack_raii::BStackRef::<Self>::from_range(self.0) };
+                        let __od: #on_disk_ty = *__r.read_on_disk(stack, &mut __buf)?;
+                        let __arr: [::bstack_raii::ForeignPtr; #total] = __od.#fname;
+                        ::std::result::Result::Ok(#acc_body)
+                    }
+                });
+
+                // ---- Constructor: nested `[[Foreign<T>; ..]; ..]` → flat `[ForeignPtr; TOTAL]` ----
+                let param_leaf = if aleaf_nullable {
+                    quote!(::core::option::Option<#field_ty>)
+                } else {
+                    field_ty.clone()
+                };
+                let param_ty = nested_ty(&adims, &param_leaf);
+                ctor_params.push(quote!(#fname: #param_ty,));
+                let ctor_write = |k: &Ident, leaf: &Ident| {
+                    if aleaf_nullable {
+                        quote!(__slots[#k] = match #leaf {
+                            ::core::option::Option::Some(__f) => __f.ptr(),
+                            ::core::option::Option::None => ::bstack_raii::ForeignPtr::new(0, 0),
+                        };)
+                    } else {
+                        quote!(__slots[#k] = #leaf.ptr();)
+                    }
+                };
+                let flatten = nested_consume(&adims, &quote!(#fname), &ctor_write);
+                ctor_preps.push(quote! {
+                    let #fname: [::bstack_raii::ForeignPtr; #total] = {
+                        let mut __slots = [::bstack_raii::ForeignPtr::new(0, 0); #total];
+                        #flatten
+                        __slots
+                    };
+                });
+                ctor_inits.push(quote!(#fname: #fname,));
+
+                // ---- Teardown: dispatch each slot (inline; nothing else to free) ----
+                let elem_drop = foreign_elem_drop(kind, ftarget);
+                let drop_body = if matches!(kind, Kind::Ref) {
+                    quote!()
+                } else {
+                    quote! {
+                        let __arr: [::bstack_raii::ForeignPtr; #total] = __on_disk.#fname;
+                        for __k in 0usize..(#total) {
+                            let __fp = __arr[__k];
+                            #elem_drop
+                        }
+                    }
+                };
+                drop_stmts.push(quote! { { #drop_body } });
+
+                // ---- Clone: dispatch each slot into a fresh `[ForeignPtr; TOTAL]` ----
+                let elem_clone = foreign_elem_clone(kind, ftarget);
+                clone_stmts.push(quote! {
+                    {
+                        let __arr: [::bstack_raii::ForeignPtr; #total] = __od.#fname;
+                        let mut __narr: [::bstack_raii::ForeignPtr; #total] = __arr;
+                        for __k in 0usize..(#total) {
+                            let __fp = __arr[__k];
+                            #elem_clone
+                            __narr[__k] = __newfp;
+                        }
+                        __od.#fname = __narr;
+                    }
+                });
+
+                // ---- Move: materialize the nested `[[Foreign<T>; ..]; ..]` values ----
+                let cap = format_ident!("__cap_{}", fname);
+                mv_caps.push(quote!(let #cap = __od.#fname;));
+                let mv_leaf = leaf_ty.clone();
+                mv_types.push(nested_ty(&adims, &mv_leaf));
+                let mv_read = |k: &Ident| {
+                    if aleaf_nullable {
+                        quote!({
+                            let __p = #cap[#k];
+                            if __p.offset() == 0 {
+                                ::core::option::Option::None
+                            } else {
+                                ::core::option::Option::Some(
+                                    ::bstack_raii::Foreign::<#ftarget>::from_ptr(__p))
+                            }
+                        })
+                    } else {
+                        quote!(::bstack_raii::Foreign::<#ftarget>::from_ptr(#cap[#k]))
+                    }
+                };
+                mv_recon.push(nested_build(&adims, &mv_leaf, &mv_read));
                 continue;
             }
         }
@@ -2979,6 +3305,312 @@ fn option_inner(ty: &Type) -> Option<&Type> {
         GenericArgument::Type(inner) => Some(inner),
         _ => None,
     }
+}
+
+/// Per-element cross-file **teardown** dispatch, given `__fp: ForeignPtr` and
+/// `allocator` in scope. Frees / decrements / releases the target in its own file:
+/// `SELF` (`file_id == 0`) via the local `allocator`, a foreign id via a
+/// [`ForeignHostAllocator`] over the resolved host (skipped — a permitted leak — if
+/// that file is not attached). `offset == 0` (null / unset) is skipped.
+/// `#[bstack_ref]` owns nothing → empty. Shared with the scalar `Foreign` field.
+fn foreign_elem_drop(kind: Kind, ftarget: &Type) -> TokenStream {
+    let helper = match kind {
+        Kind::Owned => quote!(::bstack_raii::foreign_drop_owned),
+        Kind::Strong => quote!(::bstack_raii::foreign_drop_strong),
+        Kind::Weak => quote!(::bstack_raii::foreign_drop_weak),
+        _ => return quote!(),
+    };
+    quote! {
+        let __off = __fp.offset();
+        if __off != 0 {
+            let __fid = __fp.file_id();
+            if __fid == 0 {
+                unsafe { #helper::<#ftarget, _>(allocator, __off)?; }
+            } else if let ::core::option::Option::Some(__id) =
+                ::bstack_raii::registry::FileId::from_u64(__fid)
+            {
+                if let ::core::option::Option::Some(__host) =
+                    ::bstack_raii::registry::host_arc(__id)
+                {
+                    let __adapter = ::bstack_raii::ForeignHostAllocator::new(__host, __id);
+                    unsafe { #helper::<#ftarget, _>(&__adapter, __off)?; }
+                }
+            }
+        }
+    }
+}
+
+/// Per-element cross-file **clone** dispatch, given `__fp: ForeignPtr`, `allocator`,
+/// and `__plan` in scope. Binds `__newfp: ForeignPtr` — `#[bstack_owned]` deep-copies
+/// the target (repointing the pointer), `#[bstack_strong]` / `#[bstack_weak]` share it
+/// and bump its count (pointer unchanged), `#[bstack_ref]` aliases. `SELF` folds into
+/// the home `__plan`; a foreign target goes through a [`ForeignHostAllocator`], and a
+/// detached target file **errors** (aliasing an owner would double-free later).
+fn foreign_elem_clone(kind: Kind, ftarget: &Type) -> TokenStream {
+    let od_size = quote! {
+        ::core::mem::size_of::<<#ftarget as ::bstack_raii::BStackBlock>::OnDisk>() as u64
+    };
+    let not_attached = |ann: &str| {
+        let msg = format!("cannot clone `{ann} Foreign<T>` element: target file not attached");
+        quote! {
+            ::std::io::Error::new(::std::io::ErrorKind::NotFound, #msg)
+        }
+    };
+    let malformed = quote! {
+        return ::std::result::Result::Err(::std::io::Error::new(
+            ::std::io::ErrorKind::InvalidData, "cannot clone `Foreign<T>`: malformed file id"));
+    };
+    match kind {
+        Kind::Owned => {
+            let err = not_attached("#[bstack_owned]");
+            quote! {
+                let __newfp: ::bstack_raii::ForeignPtr = {
+                    let __off = __fp.offset();
+                    if __off == 0 {
+                        __fp
+                    } else {
+                        let __fid = __fp.file_id();
+                        if __fid == 0 {
+                            let __child = <#ftarget as ::bstack_raii::BStackBlock>::from_range(
+                                ::bstack_raii::BStackRange::new(__off, #od_size));
+                            let __new = __child.__bstack_clone_into(allocator, __plan)?;
+                            ::bstack_raii::ForeignPtr::new(0, __new.start())
+                        } else if let ::core::option::Option::Some(__id) =
+                            ::bstack_raii::registry::FileId::from_u64(__fid)
+                        {
+                            let __host = ::bstack_raii::registry::host_arc(__id)
+                                .ok_or_else(|| #err)?;
+                            let __adapter =
+                                ::bstack_raii::ForeignHostAllocator::new(__host, __id);
+                            let __new_off = unsafe {
+                                ::bstack_raii::foreign_clone_owned::<#ftarget, _>(&__adapter, __off)? };
+                            ::bstack_raii::ForeignPtr::new(__fid, __new_off)
+                        } else {
+                            #malformed
+                        }
+                    }
+                };
+            }
+        }
+        Kind::Strong => {
+            let err = not_attached("#[bstack_strong]");
+            quote! {
+                let __newfp: ::bstack_raii::ForeignPtr = {
+                    let __off = __fp.offset();
+                    if __off != 0 {
+                        let __fid = __fp.file_id();
+                        if __fid == 0 {
+                            let __data = unsafe { ::bstack_raii::BStackRef::<#ftarget>::from_range(
+                                ::bstack_raii::BStackRange::new(__off, #od_size)) };
+                            __plan.bump_strong(__data, allocator)?;
+                        } else if let ::core::option::Option::Some(__id) =
+                            ::bstack_raii::registry::FileId::from_u64(__fid)
+                        {
+                            let __host = ::bstack_raii::registry::host_arc(__id)
+                                .ok_or_else(|| #err)?;
+                            let __adapter =
+                                ::bstack_raii::ForeignHostAllocator::new(__host, __id);
+                            unsafe { ::bstack_raii::foreign_clone_strong::<#ftarget, _>(&__adapter, __off)?; }
+                        } else {
+                            #malformed
+                        }
+                    }
+                    __fp
+                };
+            }
+        }
+        Kind::Weak => {
+            let err = not_attached("#[bstack_weak]");
+            quote! {
+                let __newfp: ::bstack_raii::ForeignPtr = {
+                    let __off = __fp.offset();
+                    if __off != 0 {
+                        let __fid = __fp.file_id();
+                        if __fid == 0 {
+                            __plan.bump_weak(__off);
+                        } else if let ::core::option::Option::Some(__id) =
+                            ::bstack_raii::registry::FileId::from_u64(__fid)
+                        {
+                            let __host = ::bstack_raii::registry::host_arc(__id)
+                                .ok_or_else(|| #err)?;
+                            let __adapter =
+                                ::bstack_raii::ForeignHostAllocator::new(__host, __id);
+                            unsafe { ::bstack_raii::foreign_clone_weak::<#ftarget, _>(&__adapter, __off)?; }
+                        } else {
+                            #malformed
+                        }
+                    }
+                    __fp
+                };
+            }
+        }
+        // Ref aliases the pointer verbatim.
+        _ => quote! { let __newfp: ::bstack_raii::ForeignPtr = __fp; },
+    }
+}
+
+/// Validate a `Foreign<T>` element/field's annotation + target: annotation required
+/// (`owned/strong/weak/ref`, not POD/embed), target must be a bstack block (assertion
+/// pushed into `wrapper_defs`), and `Foreign<Option<T>>` rejected. `what` names the
+/// construct for error messages (e.g. "`Vec<Foreign<T>>`"). Shared by the vector and
+/// array Foreign branches.
+fn validate_foreign_target(
+    kind: Kind,
+    ftarget: &Type,
+    span: &Type,
+    what: &str,
+    assert_name: Ident,
+    emit_assert: bool,
+    wrapper_defs: &mut Vec<TokenStream>,
+) -> syn::Result<()> {
+    match kind {
+        Kind::Owned | Kind::Strong | Kind::Weak | Kind::Ref => {}
+        Kind::Pod => {
+            return Err(Error::new_spanned(
+                span,
+                format!(
+                    "{what} needs an ownership annotation naming the target's kind \
+                     (`#[bstack_owned/strong/weak/ref]`); a bare foreign pointer targets a block"
+                ),
+            ));
+        }
+        Kind::Embed => {
+            return Err(Error::new_spanned(
+                span,
+                "`Foreign<T>` is a pointer and cannot be `#[embed]`ed",
+            ));
+        }
+    }
+    reject_bad_foreign_target(ftarget, span, what)?;
+    // The `T: BStackBlock` check is a non-generic `const`, which can't name a struct
+    // type parameter. For a generic target the bound is enforced instead through the
+    // generated impls' where-clauses (see the `Usage`/`aug_generics` machinery), so
+    // the caller passes `emit_assert = false`.
+    if emit_assert {
+        wrapper_defs.push(quote! {
+            #[doc(hidden)]
+            const _: fn() = {
+                fn #assert_name<__T: ::bstack_raii::BStackBlock>() {}
+                #assert_name::<#ftarget>
+            };
+        });
+    }
+    Ok(())
+}
+
+/// Reject a `Foreign<T>` whose target `T` is not a plain bstack block — the
+/// **"no double bstack pointer"** rule. A `Foreign` is a cross-file *pointer to a
+/// block*, so `T` must be a `#[bstack_block]`, never:
+///
+/// * **another `Foreign`** (`Foreign<Foreign<U>>`) — a pointer to a pointer;
+/// * a **nullable pointer** (`Foreign<Option<Foreign<U>>>`) — a double pointer via
+///   `Option`; or a plain `Foreign<Option<U>>` (nullability belongs on the *field*
+///   as `Option<Foreign<U>>`);
+/// * a **container** (`Foreign<Vec<U>>` / `Foreign<String>` / `Foreign<[U; N]>`) — a
+///   pointer to a collection;
+/// * a **tuple**.
+///
+/// This is deliberately **not** the `Vec<Vec<T>>`-style container-nesting rule: a
+/// `Foreign` is a pointer, so a collection *of* pointers is fine — `Vec<Foreign<T>>`
+/// and `[Foreign<T>; N]` are allowed. It is a pointer *to* a collection/pointer that
+/// is barred. In every rejected case the fix is to bridge with an explicit
+/// `#[bstack_block]` struct wrapping the offending inner type and point a `Foreign` at
+/// *that*.
+fn reject_bad_foreign_target(ftarget: &Type, span: &Type, what: &str) -> syn::Result<()> {
+    let bridge = "bridge it inside an explicit `#[bstack_block]` struct and point the \
+                  `Foreign` at that struct";
+    if foreign_inner(ftarget).is_some() {
+        return Err(Error::new_spanned(
+            span,
+            format!(
+                "{what}: a `Foreign` cannot point at another `Foreign` — a pointer to a \
+                 pointer is not allowed. {bridge}. (A collection OF pointers such as \
+                 `Vec<Foreign<T>>` / `[Foreign<T>; N]` IS allowed; it is a pointer TO a \
+                 pointer/collection that is not.)"
+            ),
+        ));
+    }
+    if let Some(inner) = option_inner(ftarget) {
+        if foreign_inner(inner).is_some() {
+            return Err(Error::new_spanned(
+                span,
+                format!(
+                    "{what}: `Foreign<Option<Foreign<T>>>` is a double `Foreign` (a pointer to a \
+                     nullable pointer). {bridge}."
+                ),
+            ));
+        }
+        return Err(Error::new_spanned(
+            span,
+            format!(
+                "{what}: use `Option<Foreign<T>>` for a nullable foreign pointer, not \
+                 `Foreign<Option<T>>` — nullability belongs on the field/element, and a null \
+                 element is a `Foreign` with offset 0, not a pointer to a nullable value."
+            ),
+        ));
+    }
+    if vec_field(ftarget).is_some() || is_str(ftarget) {
+        return Err(Error::new_spanned(
+            span,
+            format!(
+                "{what}: a `Foreign` target must be a `#[bstack_block]`, not a `Vec` / `String`. \
+                 `Vec<Foreign<T>>` (a vector OF pointers) is allowed, but `Foreign<Vec<T>>` (a \
+                 pointer TO a vector) is not — {bridge}."
+            ),
+        ));
+    }
+    if let Type::Array(_) = ftarget {
+        return Err(Error::new_spanned(
+            span,
+            format!(
+                "{what}: a `Foreign` target must be a `#[bstack_block]`, not an array. \
+                 `[Foreign<T>; N]` (an array OF pointers) is allowed, but `Foreign<[T; N]>` is \
+                 not — {bridge}."
+            ),
+        ));
+    }
+    if let Type::Tuple(_) = ftarget {
+        return Err(Error::new_spanned(
+            span,
+            format!(
+                "{what}: a `Foreign` target must be a `#[bstack_block]`, not a tuple — {bridge}."
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Find the `Foreign<T>` **target** `T` inside a field type, digging through the
+/// field-level `Option`, a `Vec` (and its per-element `Option`), and an array (nested,
+/// with per-element `Option`) — the shapes the foreign scalar / vec / array branches
+/// accept. `None` if the field holds no `Foreign`. Used to compute generic bounds for
+/// a foreign field's target parameter.
+fn field_foreign_target(ty: &Type) -> Option<&Type> {
+    // Field-level `Option<..>`.
+    let t = option_inner(ty).unwrap_or(ty);
+    // Scalar `Foreign<X>`.
+    if let Some(x) = foreign_inner(t) {
+        return Some(x);
+    }
+    // `Vec<Foreign<X>>` / `Vec<Option<Foreign<X>>>`.
+    if let Some(ve) = vec_inner(t) {
+        let ve = option_inner(ve).unwrap_or(ve);
+        if let Some(x) = foreign_inner(ve) {
+            return Some(x);
+        }
+    }
+    // `[Foreign<X>; N]` (nested / per-element `Option`).
+    if let Type::Array(_) = t {
+        let mut cur = t;
+        while let Type::Array(a) = cur {
+            cur = &a.elem;
+        }
+        let cur = option_inner(cur).unwrap_or(cur);
+        if let Some(x) = foreign_inner(cur) {
+            return Some(x);
+        }
+    }
+    None
 }
 
 /// Peek `Foreign<T>` → `T`: a cross-file wide-pointer field.
