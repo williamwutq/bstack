@@ -138,16 +138,16 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
             continue;
         }
         // A foreign field lowers to a `ForeignPtr` (its target `T` is never stored
-        // inline), so the target parameter is a *block reference*, not a POD/embed —
-        // regardless of the container it sits in. Detect it up front so the bounds are
-        // `BStackBlock` (+ `TryCloneIn` for owned, and the usual strong/weak) rather
-        // than the `Pod`/`in_ondisk` a bare `Foreign<T>` field would otherwise imply.
-        let foreign_target = field_foreign_target(&field.ty);
+        // inline), so a target parameter is a *block reference*, not a POD/embed —
+        // regardless of the container it sits in. Detect every foreign target up front
+        // so the bounds are `BStackBlock` (+ `TryCloneIn` for owned, and the usual
+        // strong/weak) rather than the `Pod`/`in_ondisk` a bare field would imply.
+        let ftargets = foreign_targets_in(&field.ty);
         for (p, u) in usage.iter_mut() {
             if !type_mentions_any(&field.ty, &[&*p]) {
                 continue;
             }
-            if foreign_target.is_some_and(|t| type_mentions_any(t, &[&*p])) {
+            if ftargets.iter().any(|t| type_mentions_any(t, &[&*p])) {
                 // The parameter is a foreign *target*: a block reference in its own
                 // file. Kind names the ownership of that target.
                 u.blockish = true;
@@ -158,6 +158,17 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                     _ => {}
                 }
                 continue;
+            }
+            // The param is in this field but NOT as a foreign target. If the field
+            // *also* holds a `Foreign`, the param sits in a non-foreign position of it
+            // (e.g. a POD element of a foreign tuple), which the per-field lowering
+            // can't classify generically — require concrete types there.
+            if !ftargets.is_empty() {
+                return Err(Error::new_spanned(
+                    &field.ty,
+                    "a generic type parameter in a non-`Foreign` position of a field that also \
+                     holds a `Foreign` is not supported; use concrete types for the non-foreign parts",
+                ));
             }
             match kind {
                 Kind::Pod => {
@@ -2072,6 +2083,232 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
             (opt_inner, nullable)
         };
 
+        // A **tuple with ≥1 `Foreign` element**: `#[ann] (A, Foreign<T>, Option<Foreign<U>>, ..)`.
+        // POD elements store inline; each foreign element stores as a `ForeignPtr` (so
+        // the packed wrapper stays `Pod`). The field annotation names the ownership of
+        // *all* the foreign elements — they are freed / decremented / deep-cloned in
+        // their own files at teardown / clone. `Option<Foreign<T>>` elements use the
+        // offset-0 niche. (Concrete element types only for now — no generic params.)
+        if let Type::Tuple(tup) = inner_ty
+            && tup
+                .elems
+                .iter()
+                .any(|e| foreign_inner(option_inner(e).unwrap_or(e)).is_some())
+        {
+            // Generic foreign *targets* are allowed (bounds are inferred above); a
+            // generic param in a POD element was already rejected in the usage pass.
+            match kind {
+                Kind::Owned | Kind::Strong | Kind::Weak | Kind::Ref => {}
+                Kind::Pod => {
+                    return Err(Error::new_spanned(
+                        &field.ty,
+                        "a tuple containing a `Foreign` needs an ownership annotation \
+                         (`#[bstack_owned/strong/weak/ref]`) naming the foreign elements' kind",
+                    ));
+                }
+                Kind::Embed => {
+                    return Err(Error::new_spanned(&field.ty, "cannot #[embed] a tuple"));
+                }
+            }
+            if nullable {
+                return Err(Error::new_spanned(
+                    &field.ty,
+                    "a whole-tuple `Option<(..)>` is not supported; make the individual \
+                     elements nullable instead",
+                ));
+            }
+
+            // Per-element: is it foreign (and null-wrapped), and its target.
+            let mut is_foreign = Vec::with_capacity(tup.elems.len());
+            let mut ftargets: Vec<Option<&Type>> = Vec::with_capacity(tup.elems.len());
+            let mut nulls = Vec::with_capacity(tup.elems.len());
+            for e in &tup.elems {
+                let inner = option_inner(e).unwrap_or(e);
+                if let Some(ft) = foreign_inner(inner) {
+                    reject_bad_foreign_target(ft, &field.ty, "a `Foreign` tuple element")?;
+                    is_foreign.push(true);
+                    ftargets.push(Some(ft));
+                    nulls.push(option_inner(e).is_some());
+                } else {
+                    is_foreign.push(false);
+                    ftargets.push(None);
+                    nulls.push(false);
+                    pod_types.push(e);
+                }
+            }
+
+            let n = tup.elems.len();
+            let idx: Vec<syn::Index> = (0..n).map(syn::Index::from).collect();
+            // The PUBLIC tuple type (accessor / ctor / move): `Foreign` is a token, so
+            // rewrite each foreign element to the real `::bstack_raii::Foreign<T>` (the
+            // user's bare `Foreign` isn't in scope in the generated impls).
+            let pub_elems: Vec<TokenStream> = (0..n)
+                .map(|i| {
+                    if is_foreign[i] {
+                        let ft = ftargets[i].unwrap();
+                        if nulls[i] {
+                            quote!(::core::option::Option<::bstack_raii::Foreign<#ft>>)
+                        } else {
+                            quote!(::bstack_raii::Foreign<#ft>)
+                        }
+                    } else {
+                        let e = &tup.elems[i];
+                        quote!(#e)
+                    }
+                })
+                .collect();
+            let pub_tuple_ty = quote!(( #(#pub_elems,)* ));
+            let wrapper = format_ident!("__BstackFTup_{}_{}", name, fname);
+            // Wrapper element types: POD verbatim, foreign → `ForeignPtr`.
+            let welem: Vec<TokenStream> = tup
+                .elems
+                .iter()
+                .enumerate()
+                .map(|(i, e)| {
+                    if is_foreign[i] {
+                        quote!(::bstack_raii::ForeignPtr)
+                    } else {
+                        quote!(#e)
+                    }
+                })
+                .collect();
+            wrapper_defs.push(quote! {
+                #[repr(C, packed)]
+                #[derive(::core::clone::Clone, ::core::marker::Copy)]
+                #[doc(hidden)]
+                #vis struct #wrapper( #(#welem),* );
+                // SAFETY: `#[repr(C, packed)]` => no padding; every element is `Pod`
+                // (POD elements asserted via `pod_types`; `ForeignPtr` is `Pod`).
+                unsafe impl ::bstack_raii::Zeroable for #wrapper {}
+                unsafe impl ::bstack_raii::Pod for #wrapper {}
+            });
+            on_disk_fields.push(quote!(#fname: #wrapper,));
+
+            // Accessor: rebuild the tuple, mapping each `ForeignPtr` back to a `Foreign`.
+            let acc_elems: Vec<TokenStream> = (0..n)
+                .map(|i| {
+                    let ix = &idx[i];
+                    if is_foreign[i] {
+                        let ft = ftargets[i].unwrap();
+                        if nulls[i] {
+                            quote!(if __w.#ix.offset() == 0 {
+                                ::core::option::Option::None
+                            } else {
+                                ::core::option::Option::Some(
+                                    ::bstack_raii::Foreign::<#ft>::from_ptr(__w.#ix))
+                            })
+                        } else {
+                            quote!(::bstack_raii::Foreign::<#ft>::from_ptr(__w.#ix))
+                        }
+                    } else {
+                        quote!(__w.#ix)
+                    }
+                })
+                .collect();
+            accessors.push(quote! {
+                #vis fn #getter(
+                    &self,
+                    stack: &::bstack_raii::BStack,
+                ) -> ::std::io::Result<#pub_tuple_ty> {
+                    let mut __buf = ::std::vec![0u8; ::core::mem::size_of::<#on_disk_ty>()];
+                    let __r = unsafe { ::bstack_raii::BStackRef::<Self>::from_range(self.0) };
+                    let __od: #on_disk_ty = *__r.read_on_disk(stack, &mut __buf)?;
+                    let __w = __od.#fname;
+                    ::std::result::Result::Ok(( #(#acc_elems,)* ))
+                }
+            });
+
+            // Constructor: map each foreign element to a `ForeignPtr`, POD verbatim.
+            let ctor_elems: Vec<TokenStream> = (0..n)
+                .map(|i| {
+                    let ix = &idx[i];
+                    if is_foreign[i] {
+                        if nulls[i] {
+                            quote!(match #fname.#ix {
+                                ::core::option::Option::Some(__f) => __f.ptr(),
+                                ::core::option::Option::None => ::bstack_raii::ForeignPtr::new(0, 0),
+                            })
+                        } else {
+                            quote!(#fname.#ix.ptr())
+                        }
+                    } else {
+                        quote!(#fname.#ix)
+                    }
+                })
+                .collect();
+            ctor_params.push(quote!(#fname: #pub_tuple_ty,));
+            ctor_preps.push(quote!(let #fname: #wrapper = #wrapper( #(#ctor_elems),* );));
+            ctor_inits.push(quote!(#fname: #fname,));
+
+            // Teardown / clone: dispatch each foreign element from the on-disk wrapper.
+            let mut tup_drops = Vec::new();
+            let mut tup_clones = Vec::new();
+            for i in 0..n {
+                if !is_foreign[i] {
+                    continue;
+                }
+                let ix = &idx[i];
+                let ft = ftargets[i].unwrap();
+                let elem_drop = foreign_elem_drop(kind, ft);
+                tup_drops.push(quote! {
+                    {
+                        let __fp: ::bstack_raii::ForeignPtr = __w.#ix;
+                        #elem_drop
+                    }
+                });
+                let elem_clone = foreign_elem_clone(kind, ft);
+                tup_clones.push(quote! {
+                    {
+                        let __fp: ::bstack_raii::ForeignPtr = __w.#ix;
+                        #elem_clone
+                        __w.#ix = __newfp;
+                    }
+                });
+            }
+            if !matches!(kind, Kind::Ref) {
+                drop_stmts.push(quote! {
+                    {
+                        let __w = __on_disk.#fname;
+                        #(#tup_drops)*
+                    }
+                });
+                clone_stmts.push(quote! {
+                    {
+                        let mut __w = __od.#fname;
+                        #(#tup_clones)*
+                        __od.#fname = __w;
+                    }
+                });
+            }
+
+            // Move: rebuild the tuple (same mapping as the accessor).
+            let cap = format_ident!("__cap_{}", fname);
+            mv_caps.push(quote!(let #cap = __od.#fname;));
+            mv_types.push(quote!(#pub_tuple_ty));
+            let mv_elems: Vec<TokenStream> = (0..n)
+                .map(|i| {
+                    let ix = &idx[i];
+                    if is_foreign[i] {
+                        let ft = ftargets[i].unwrap();
+                        if nulls[i] {
+                            quote!(if #cap.#ix.offset() == 0 {
+                                ::core::option::Option::None
+                            } else {
+                                ::core::option::Option::Some(
+                                    ::bstack_raii::Foreign::<#ft>::from_ptr(#cap.#ix))
+                            })
+                        } else {
+                            quote!(::bstack_raii::Foreign::<#ft>::from_ptr(#cap.#ix))
+                        }
+                    } else {
+                        quote!(#cap.#ix)
+                    }
+                })
+                .collect();
+            mv_recon.push(quote!(( #(#mv_elems,)* )));
+            continue;
+        }
+
         // A POD **tuple** field `a: (A, B, ..)`: a Rust tuple is not `Pod`, but a
         // packed struct of its (POD) elements is — alignment is irrelevant on disk
         // — so store it through a generated wrapper and rebuild the tuple on read.
@@ -3610,7 +3847,54 @@ fn field_foreign_target(ty: &Type) -> Option<&Type> {
             return Some(x);
         }
     }
+    // `(.., Foreign<X>, ..)` — a tuple element (POD / Foreign mix). Returns the first
+    // foreign element's target (used for the "supported position" guard; the tuple
+    // branch validates every foreign element and requires concrete targets).
+    if let Type::Tuple(tup) = t {
+        for e in &tup.elems {
+            let e = option_inner(e).unwrap_or(e);
+            if let Some(x) = foreign_inner(e) {
+                return Some(x);
+            }
+        }
+    }
     None
+}
+
+/// Every `Foreign<T>` **target** `T` reachable in a field type — digging through the
+/// field-level `Option`, `Vec` (+ element `Option`), array (nested + element
+/// `Option`), and tuple (each element). Used to infer generic bounds: a type param
+/// that is a foreign target is a *block reference in its own file*, and every foreign
+/// target's kind bound follows the field annotation.
+fn foreign_targets_in(ty: &Type) -> Vec<&Type> {
+    let mut out = Vec::new();
+    collect_foreign_targets(ty, &mut out);
+    out
+}
+
+fn collect_foreign_targets<'a>(ty: &'a Type, out: &mut Vec<&'a Type>) {
+    let t = option_inner(ty).unwrap_or(ty);
+    if let Some(x) = foreign_inner(t) {
+        out.push(x);
+        return;
+    }
+    if let Some(ve) = vec_inner(t) {
+        collect_foreign_targets(ve, out);
+        return;
+    }
+    if let Type::Array(_) = t {
+        let mut cur = t;
+        while let Type::Array(a) = cur {
+            cur = &a.elem;
+        }
+        collect_foreign_targets(cur, out);
+        return;
+    }
+    if let Type::Tuple(tup) = t {
+        for e in &tup.elems {
+            collect_foreign_targets(e, out);
+        }
+    }
 }
 
 /// Peek `Foreign<T>` → `T`: a cross-file wide-pointer field.
@@ -4973,6 +5257,9 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
     struct EUsage {
         strong: bool,
         weak: bool,
+        /// The param is the target of a `#[bstack_owned] V(Foreign<T>)` variant (an
+        /// owned foreign deep-clone runs `try_clone_in`, needing `TryCloneIn`).
+        foreign_owned: bool,
     }
     let mut eusage: Vec<(Ident, EUsage)> = type_params
         .iter()
@@ -4984,7 +5271,8 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
             if !type_mentions_any(&f.ty, &type_params) {
                 continue;
             }
-            if kind == Kind::Pod || kind == Kind::Embed {
+            let ftargets = foreign_targets_in(&f.ty);
+            if ftargets.is_empty() && (kind == Kind::Pod || kind == Kind::Embed) {
                 return Err(Error::new_spanned(
                     &f.ty,
                     "a generic type parameter in a `#[bstack_enum]` variant must be a reference \
@@ -4994,10 +5282,20 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                 ));
             }
             for (p, u) in eusage.iter_mut() {
-                if type_mentions_any(&f.ty, &[&*p]) {
-                    u.strong |= kind == Kind::Strong;
-                    u.weak |= kind == Kind::Weak;
+                if !type_mentions_any(&f.ty, &[&*p]) {
+                    continue;
                 }
+                let is_ftarget = ftargets.iter().any(|t| type_mentions_any(t, &[&*p]));
+                if !ftargets.is_empty() && !is_ftarget {
+                    return Err(Error::new_spanned(
+                        &f.ty,
+                        "a generic type parameter in a non-`Foreign` position of a `Foreign` \
+                         variant is not supported; use concrete types for the non-foreign parts",
+                    ));
+                }
+                u.strong |= kind == Kind::Strong;
+                u.weak |= kind == Kind::Weak;
+                u.foreign_owned |= is_ftarget && kind == Kind::Owned;
             }
         }
     }
@@ -5013,6 +5311,9 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
             if u.weak {
                 tp.bounds
                     .push(syn::parse_quote!(::bstack_raii::BStackWeakable));
+            }
+            if u.foreign_owned {
+                tp.bounds.push(syn::parse_quote!(::bstack_raii::TryCloneIn));
             }
         }
     }
@@ -5148,7 +5449,8 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
             Fields::Unnamed(f)
                 if f.unnamed.len() == 1
                     && (kind != Kind::Pod
-                        || vec_field(&f.unnamed.first().unwrap().ty).is_some()) =>
+                        || vec_field(&f.unnamed.first().unwrap().ty).is_some()
+                        || foreign_inner(&f.unnamed.first().unwrap().ty).is_some()) =>
             {
                 needs_payload = true;
                 let ty = &f.unnamed.first().unwrap().ty;
@@ -5171,6 +5473,117 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                     let read_desc = quote!(::bstack_raii::bytemuck::pod_read_unaligned::<
                         ::bstack_raii::VecDesc,
                     >(&__pl[..16]));
+
+                    // Annotated **foreign vector** variant `#[..] V(Vec<Foreign<T>>)`
+                    // (+ `Vec<Option<Foreign<T>>>`): a `VecDesc` naming a `ForeignPtr`
+                    // data block, the per-variant mirror of a `Vec<Foreign>` field.
+                    if let Some(velem) = vec_inner(ty)
+                        && let Some(ftarget) = foreign_inner(option_inner(velem).unwrap_or(velem))
+                    {
+                        match kind {
+                            Kind::Owned | Kind::Strong | Kind::Weak | Kind::Ref => {}
+                            Kind::Pod => {
+                                return Err(Error::new_spanned(
+                                    ty,
+                                    "a `Vec<Foreign<T>>` enum variant needs an ownership \
+                                     annotation (`#[bstack_owned/strong/weak/ref]`)",
+                                ));
+                            }
+                            Kind::Embed => {
+                                return Err(Error::new_spanned(
+                                    ty,
+                                    "`Foreign` is a pointer and cannot be `#[embed]`ed",
+                                ));
+                            }
+                        }
+                        reject_bad_foreign_target(ftarget, ty, "a `Foreign` vec variant")?;
+                        let elem_nullable = option_inner(velem).is_some();
+                        let store =
+                            quote!(::bstack_raii::BStackVec::<::bstack_raii::ForeignPtr, __A>);
+                        let fty = if elem_nullable {
+                            quote!(::core::option::Option<::bstack_raii::Foreign<#ftarget>>)
+                        } else {
+                            quote!(::bstack_raii::Foreign<#ftarget>)
+                        };
+                        let from_ptr = if elem_nullable {
+                            quote!(|__p: ::bstack_raii::ForeignPtr| if __p.offset() == 0 {
+                                ::core::option::Option::None
+                            } else {
+                                ::core::option::Option::Some(
+                                    ::bstack_raii::Foreign::<#ftarget>::from_ptr(__p))
+                            })
+                        } else {
+                            quote!(::bstack_raii::Foreign::<#ftarget>::from_ptr)
+                        };
+                        let to_ptr = if elem_nullable {
+                            quote!(|__f: #fty| match __f {
+                                ::core::option::Option::Some(__ff) => __ff.ptr(),
+                                ::core::option::Option::None => ::bstack_raii::ForeignPtr::new(0, 0),
+                            })
+                        } else {
+                            quote!(|__f: #fty| __f.ptr())
+                        };
+                        data_variants.push(quote!(#vname(::std::vec::Vec<#fty>),));
+                        view_variants.push(quote!(#vname(::std::vec::Vec<#fty>),));
+                        new_arms.push(quote! {
+                            #data::#vname(__list) => {
+                                let __ptrs: ::std::vec::Vec<::bstack_raii::ForeignPtr> =
+                                    __list.into_iter().map(#to_ptr).collect();
+                                let __desc = #store::from_slice(allocator, &__ptrs)?.descriptor();
+                                let mut __pl = [0u8; #payload_const];
+                                __pl[..16].copy_from_slice(
+                                    ::bstack_raii::bytemuck::bytes_of(&__desc));
+                                (#disc, __pl)
+                            }
+                        });
+                        read_arms.push(quote! {
+                            #disc => #view::#vname(
+                                #store::from_desc(#read_desc, allocator)
+                                    .to_vec()?.into_iter().map(#from_ptr).collect()),
+                        });
+                        move_arms.push(quote! {
+                            #disc => {
+                                let __out: ::std::vec::Vec<#fty> =
+                                    #store::from_desc(#read_desc, __alloc)
+                                        .to_vec()?.into_iter().map(#from_ptr).collect();
+                                #store::from_desc(#read_desc, __alloc).bstack_drop()?;
+                                #data::#vname(__out)
+                            }
+                        });
+                        // Teardown: dispatch each element (non-ref), then free the data
+                        // block (owned by the enum even for `ref`).
+                        let elem_drop = foreign_elem_drop(kind, ftarget);
+                        let drop_loop = if matches!(kind, Kind::Ref) {
+                            quote!()
+                        } else {
+                            quote!(for __fp in #store::from_desc(#read_desc, allocator).to_vec()? {
+                                #elem_drop
+                            })
+                        };
+                        drop_arms.push(quote! {
+                            #disc => {
+                                #drop_loop
+                                #store::from_desc(#read_desc, allocator).bstack_drop()?;
+                            }
+                        });
+                        let elem_clone = foreign_elem_clone(kind, ftarget);
+                        clone_arms.push(quote! {
+                            #disc => {
+                                let __src = #store::from_desc(#read_desc, allocator).to_vec()?;
+                                let mut __new: ::std::vec::Vec<::bstack_raii::ForeignPtr> =
+                                    ::std::vec::Vec::with_capacity(__src.len());
+                                for __fp in __src {
+                                    #elem_clone
+                                    __new.push(__newfp);
+                                }
+                                let __newdesc = __plan.stage_bytevec(
+                                    allocator, ::bstack_raii::bytemuck::cast_slice(&__new))?;
+                                __pl[..16].copy_from_slice(
+                                    ::bstack_raii::bytemuck::bytes_of(&__newdesc));
+                            }
+                        });
+                        continue;
+                    }
 
                     // A POD `V(Vec<Pod>)` / `V(String)` (un-annotated): a plain
                     // `BStackVec<elem>` (elem = the whole vec element type, itself
@@ -5531,6 +5944,115 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                 if let Type::Array(_) = ty {
                     let (dims, elem, elem_nullable) = array_shape(ty)?;
                     let total = dims_prod(&dims);
+
+                    // Annotated **foreign array** variant `#[..] V([Foreign<T>; N])`
+                    // (nested / per-element `Option`): a flat `[ForeignPtr; TOTAL]`
+                    // (TOTAL*16 bytes) stored INLINE in the payload — the per-variant
+                    // mirror of a `[Foreign<T>; N]` struct field.
+                    if let Some(ftarget) = foreign_inner(elem) {
+                        match kind {
+                            Kind::Owned | Kind::Strong | Kind::Weak | Kind::Ref => {}
+                            Kind::Pod => {
+                                return Err(Error::new_spanned(
+                                    ty,
+                                    "a `[Foreign<T>; N]` enum variant needs an ownership \
+                                     annotation (`#[bstack_owned/strong/weak/ref]`)",
+                                ));
+                            }
+                            Kind::Embed => {
+                                return Err(Error::new_spanned(
+                                    ty,
+                                    "`Foreign` is a pointer and cannot be `#[embed]`ed",
+                                ));
+                            }
+                        }
+                        reject_bad_foreign_target(ftarget, ty, "a `Foreign` array variant")?;
+                        payload_sizes.push(quote!((#total) * 16));
+                        let fty = if elem_nullable {
+                            quote!(::core::option::Option<::bstack_raii::Foreign<#ftarget>>)
+                        } else {
+                            quote!(::bstack_raii::Foreign<#ftarget>)
+                        };
+                        let nested = nested_ty(&dims, &fty);
+                        data_variants.push(quote!(#vname(#nested),));
+                        view_variants.push(quote!(#vname(#nested),));
+
+                        // new: flatten nested handles → `[ForeignPtr; TOTAL]` in `__pl`.
+                        let leaf_write = |k: &Ident, leaf: &Ident| {
+                            let to_fp = if elem_nullable {
+                                quote!(match #leaf {
+                                    ::core::option::Option::Some(__f) => __f.ptr(),
+                                    ::core::option::Option::None =>
+                                        ::bstack_raii::ForeignPtr::new(0, 0),
+                                })
+                            } else {
+                                quote!(#leaf.ptr())
+                            };
+                            quote!(__pl[(#k) * 16..(#k) * 16 + 16].copy_from_slice(
+                                ::bstack_raii::bytemuck::bytes_of(&(#to_fp)));)
+                        };
+                        let flatten = nested_consume(&dims, &quote!(__list), &leaf_write);
+                        new_arms.push(quote! {
+                            #data::#vname(__list) => {
+                                let mut __pl = [0u8; #payload_const];
+                                #flatten
+                                (#disc, __pl)
+                            }
+                        });
+
+                        // read / move: reshape `[ForeignPtr; TOTAL]` → nested handles.
+                        let leaf_read = |k: &Ident| {
+                            let fp = quote!(::bstack_raii::bytemuck::pod_read_unaligned::<
+                                ::bstack_raii::ForeignPtr,
+                            >(&__pl[(#k) * 16..(#k) * 16 + 16]));
+                            if elem_nullable {
+                                quote!({
+                                    let __p = #fp;
+                                    if __p.offset() == 0 {
+                                        ::core::option::Option::None
+                                    } else {
+                                        ::core::option::Option::Some(
+                                            ::bstack_raii::Foreign::<#ftarget>::from_ptr(__p))
+                                    }
+                                })
+                            } else {
+                                quote!(::bstack_raii::Foreign::<#ftarget>::from_ptr(#fp))
+                            }
+                        };
+                        let build = nested_build(&dims, &fty, &leaf_read);
+                        read_arms.push(quote!(#disc => #view::#vname(#build),));
+                        move_arms.push(quote!(#disc => #data::#vname(#build),));
+
+                        // Teardown / clone: iterate the flat slots (inline — no block).
+                        if !matches!(kind, Kind::Ref) {
+                            let elem_drop = foreign_elem_drop(kind, ftarget);
+                            drop_arms.push(quote! {
+                                #disc => {
+                                    for __k in 0usize..(#total) {
+                                        let __fp = ::bstack_raii::bytemuck::pod_read_unaligned::<
+                                            ::bstack_raii::ForeignPtr,
+                                        >(&__pl[__k * 16..__k * 16 + 16]);
+                                        #elem_drop
+                                    }
+                                }
+                            });
+                            let elem_clone = foreign_elem_clone(kind, ftarget);
+                            clone_arms.push(quote! {
+                                #disc => {
+                                    for __k in 0usize..(#total) {
+                                        let __fp = ::bstack_raii::bytemuck::pod_read_unaligned::<
+                                            ::bstack_raii::ForeignPtr,
+                                        >(&__pl[__k * 16..__k * 16 + 16]);
+                                        #elem_clone
+                                        __pl[__k * 16..__k * 16 + 16].copy_from_slice(
+                                            ::bstack_raii::bytemuck::bytes_of(&__newfp));
+                                    }
+                                }
+                            });
+                        }
+                        continue;
+                    }
+
                     // Flat byte read/write of leaf `#k`'s `u64` in the payload.
                     let pl_off = |k: &Ident| quote!(::bstack_raii::get_u64(&__pl[(#k) * 8..]));
                     let pl_put = |k: &Ident, off: TokenStream| {
@@ -5924,6 +6446,243 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                         }),
                         // Ref: aliased — payload offsets copied verbatim.
                         _ => {}
+                    }
+                    continue;
+                }
+
+                // Annotated **foreign** variant `#[..] V(Foreign<T>)`: a cross-file
+                // wide pointer stored as a 16-byte `ForeignPtr` in the payload. The
+                // annotation names the target's ownership in its own file (teardown /
+                // clone dispatch cross-file, like a scalar `Foreign` struct field).
+                // Concrete target only for now; container-in-variant is not handled.
+                if let Some(ftarget) = foreign_inner(ty) {
+                    match kind {
+                        Kind::Owned | Kind::Strong | Kind::Weak | Kind::Ref => {}
+                        Kind::Pod => {
+                            return Err(Error::new_spanned(
+                                ty,
+                                "a `Foreign` enum variant needs an ownership annotation \
+                                 (`#[bstack_owned/strong/weak/ref]`) naming the target's kind",
+                            ));
+                        }
+                        Kind::Embed => {
+                            return Err(Error::new_spanned(
+                                ty,
+                                "`Foreign` is a pointer and cannot be `#[embed]`ed",
+                            ));
+                        }
+                    }
+                    // Generic foreign targets are allowed (bounds inferred above).
+                    reject_bad_foreign_target(ftarget, ty, "a `Foreign` enum variant")?;
+
+                    payload_sizes.push(quote!(16usize));
+                    let fty = quote!(::bstack_raii::Foreign<#ftarget>);
+                    let read_fp = quote!(::bstack_raii::bytemuck::pod_read_unaligned::<
+                        ::bstack_raii::ForeignPtr,
+                    >(&__pl[..16]));
+                    data_variants.push(quote!(#vname(#fty),));
+                    view_variants.push(quote!(#vname(#fty),));
+                    new_arms.push(quote! {
+                        #data::#vname(__f) => {
+                            let mut __pl = [0u8; #payload_const];
+                            __pl[..16].copy_from_slice(
+                                ::bstack_raii::bytemuck::bytes_of(&__f.ptr()));
+                            (#disc, __pl)
+                        }
+                    });
+                    read_arms.push(
+                        quote!(#disc => #view::#vname(::bstack_raii::Foreign::from_ptr(#read_fp)),),
+                    );
+                    move_arms.push(
+                        quote!(#disc => #data::#vname(::bstack_raii::Foreign::from_ptr(#read_fp)),),
+                    );
+                    // Teardown / clone dispatch (a `#[bstack_ref]` owns nothing → none;
+                    // its `ForeignPtr` is byte-copied by the payload catch-all).
+                    if !matches!(kind, Kind::Ref) {
+                        let elem_drop = foreign_elem_drop(kind, ftarget);
+                        drop_arms.push(quote! {
+                            #disc => {
+                                let __fp: ::bstack_raii::ForeignPtr = #read_fp;
+                                #elem_drop
+                            }
+                        });
+                        let elem_clone = foreign_elem_clone(kind, ftarget);
+                        clone_arms.push(quote! {
+                            #disc => {
+                                let __fp: ::bstack_raii::ForeignPtr = #read_fp;
+                                #elem_clone
+                                __pl[..16].copy_from_slice(
+                                    ::bstack_raii::bytemuck::bytes_of(&__newfp));
+                            }
+                        });
+                    }
+                    continue;
+                }
+
+                // Annotated **foreign tuple** variant `#[..] V((A, Foreign<T>, ..))`:
+                // POD elements packed inline, each foreign element a 16-byte
+                // `ForeignPtr`, all at cumulative byte offsets in the payload (the
+                // per-variant mirror of a `#[ann] (A, Foreign<T>)` struct field). The
+                // annotation names the foreign elements' ownership.
+                if let Type::Tuple(tup) = ty
+                    && tup
+                        .elems
+                        .iter()
+                        .any(|e| foreign_inner(option_inner(e).unwrap_or(e)).is_some())
+                {
+                    if kind == Kind::Embed {
+                        return Err(Error::new_spanned(ty, "cannot #[embed] a tuple"));
+                    }
+                    let nelem = tup.elems.len();
+                    let mut is_foreign = Vec::with_capacity(nelem);
+                    let mut ftargets: Vec<Option<&Type>> = Vec::with_capacity(nelem);
+                    let mut nulls = Vec::with_capacity(nelem);
+                    for e in &tup.elems {
+                        let inner = option_inner(e).unwrap_or(e);
+                        if let Some(ft) = foreign_inner(inner) {
+                            reject_bad_foreign_target(ft, ty, "a `Foreign` tuple element")?;
+                            is_foreign.push(true);
+                            ftargets.push(Some(ft));
+                            nulls.push(option_inner(e).is_some());
+                        } else {
+                            is_foreign.push(false);
+                            ftargets.push(None);
+                            nulls.push(false);
+                            pod_types.push(e.clone());
+                        }
+                    }
+
+                    // Element byte offsets + the total payload size.
+                    let mut offsets = Vec::with_capacity(nelem);
+                    let mut acc = quote!(0usize);
+                    let mut sizes = Vec::with_capacity(nelem);
+                    for (&frn, e) in is_foreign.iter().zip(&tup.elems) {
+                        offsets.push(acc.clone());
+                        let sz = if frn {
+                            quote!(16usize)
+                        } else {
+                            quote!(::core::mem::size_of::<#e>())
+                        };
+                        sizes.push(sz.clone());
+                        acc = quote!(#acc + #sz);
+                    }
+                    payload_sizes.push(acc);
+
+                    // Public tuple type: `Foreign` → `::bstack_raii::Foreign` (+ Option).
+                    let pub_elems: Vec<TokenStream> = (0..nelem)
+                        .map(|i| {
+                            if is_foreign[i] {
+                                let ft = ftargets[i].unwrap();
+                                if nulls[i] {
+                                    quote!(::core::option::Option<::bstack_raii::Foreign<#ft>>)
+                                } else {
+                                    quote!(::bstack_raii::Foreign<#ft>)
+                                }
+                            } else {
+                                let e = &tup.elems[i];
+                                quote!(#e)
+                            }
+                        })
+                        .collect();
+                    let pub_tuple_ty = quote!(( #(#pub_elems,)* ));
+                    data_variants.push(quote!(#vname(#pub_tuple_ty),));
+                    view_variants.push(quote!(#vname(#pub_tuple_ty),));
+
+                    // new: destructure the tuple, write each element into the payload.
+                    let binds: Vec<Ident> = (0..nelem).map(|i| format_ident!("__f{}", i)).collect();
+                    let writes: Vec<TokenStream> = (0..nelem)
+                        .map(|i| {
+                            let b = &binds[i];
+                            let off = &offsets[i];
+                            let sz = &sizes[i];
+                            if is_foreign[i] {
+                                let to_fp = if nulls[i] {
+                                    quote!(match #b {
+                                        ::core::option::Option::Some(__x) => __x.ptr(),
+                                        ::core::option::Option::None =>
+                                            ::bstack_raii::ForeignPtr::new(0, 0),
+                                    })
+                                } else {
+                                    quote!(#b.ptr())
+                                };
+                                quote!(__pl[(#off)..(#off) + 16].copy_from_slice(
+                                    ::bstack_raii::bytemuck::bytes_of(&(#to_fp)));)
+                            } else {
+                                quote!(__pl[(#off)..(#off) + #sz].copy_from_slice(
+                                    ::bstack_raii::bytemuck::bytes_of(&#b));)
+                            }
+                        })
+                        .collect();
+                    new_arms.push(quote! {
+                        #data::#vname(( #(#binds,)* )) => {
+                            let mut __pl = [0u8; #payload_const];
+                            #(#writes)*
+                            (#disc, __pl)
+                        }
+                    });
+
+                    // read / move: rebuild the tuple from the payload.
+                    let reads: Vec<TokenStream> = (0..nelem)
+                        .map(|i| {
+                            let off = &offsets[i];
+                            let sz = &sizes[i];
+                            if is_foreign[i] {
+                                let ft = ftargets[i].unwrap();
+                                let fp = quote!(::bstack_raii::bytemuck::pod_read_unaligned::<
+                                    ::bstack_raii::ForeignPtr,
+                                >(&__pl[(#off)..(#off) + 16]));
+                                if nulls[i] {
+                                    quote!({
+                                        let __p = #fp;
+                                        if __p.offset() == 0 {
+                                            ::core::option::Option::None
+                                        } else {
+                                            ::core::option::Option::Some(
+                                                ::bstack_raii::Foreign::<#ft>::from_ptr(__p))
+                                        }
+                                    })
+                                } else {
+                                    quote!(::bstack_raii::Foreign::<#ft>::from_ptr(#fp))
+                                }
+                            } else {
+                                let e = &tup.elems[i];
+                                quote!(::bstack_raii::bytemuck::pod_read_unaligned::<#e>(
+                                    &__pl[(#off)..(#off) + #sz]))
+                            }
+                        })
+                        .collect();
+                    read_arms.push(quote!(#disc => #view::#vname(( #(#reads,)* )),));
+                    move_arms.push(quote!(#disc => #data::#vname(( #(#reads,)* )),));
+
+                    // Teardown / clone: dispatch each foreign element (ref = none).
+                    if !matches!(kind, Kind::Ref) {
+                        let mut drops = Vec::new();
+                        let mut clones = Vec::new();
+                        for i in 0..nelem {
+                            if !is_foreign[i] {
+                                continue;
+                            }
+                            let off = &offsets[i];
+                            let ft = ftargets[i].unwrap();
+                            let read_fp = quote!(::bstack_raii::bytemuck::pod_read_unaligned::<
+                                ::bstack_raii::ForeignPtr,
+                            >(&__pl[(#off)..(#off) + 16]));
+                            let ed = foreign_elem_drop(kind, ft);
+                            drops.push(
+                                quote! { { let __fp: ::bstack_raii::ForeignPtr = #read_fp; #ed } },
+                            );
+                            let ec = foreign_elem_clone(kind, ft);
+                            clones.push(quote! {
+                                {
+                                    let __fp: ::bstack_raii::ForeignPtr = #read_fp;
+                                    #ec
+                                    __pl[(#off)..(#off) + 16].copy_from_slice(
+                                        ::bstack_raii::bytemuck::bytes_of(&__newfp));
+                                }
+                            });
+                        }
+                        drop_arms.push(quote!(#disc => { #(#drops)* }));
+                        clone_arms.push(quote!(#disc => { #(#clones)* }));
                     }
                     continue;
                 }

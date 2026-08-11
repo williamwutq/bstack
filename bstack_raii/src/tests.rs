@@ -7135,6 +7135,22 @@ struct GenForeignVec<T> {
     links: Vec<Foreign<T>>,
 }
 
+// Generic foreign target inside a tuple (POD element is concrete).
+#[bstack_block]
+struct GenForeignTup<T> {
+    tag: u32,
+    #[bstack_owned]
+    pair: (u32, Foreign<T>),
+}
+
+// Generic foreign target inside an enum variant.
+#[bstack_enum]
+enum GenForeignEnum<T> {
+    Empty,
+    #[bstack_owned]
+    Far(Foreign<T>),
+}
+
 // -------- Cursed-but-VALID foreign container combinations (must compile) --------
 
 // Per-element-`Option` array of 8 owning pointers.
@@ -7174,6 +7190,52 @@ struct CursedMix {
 struct OptForeignVecHolder {
     #[bstack_owned]
     links: Vec<Option<Foreign<MacroLeaf>>>,
+}
+
+// An enum with POD variants and an owning cross-file variant.
+#[bstack_enum]
+enum ForeignEnum {
+    Nothing,
+    Local(u32),
+    #[bstack_owned]
+    Far(Foreign<MacroLeaf>),
+}
+
+// An enum variant holding a *strong* cross-file reference.
+#[bstack_enum]
+enum ForeignStrongEnum {
+    Empty,
+    #[bstack_strong]
+    S(Foreign<MacroStrongChild>),
+}
+
+// Enum variants holding foreign *containers*.
+#[bstack_enum]
+enum ForeignContainerEnum {
+    Empty,
+    #[bstack_owned]
+    Many(Vec<Foreign<MacroLeaf>>),
+    #[bstack_owned]
+    Fixed([Foreign<MacroLeaf>; 2]),
+}
+
+// An enum variant holding a tuple that mixes POD and (nullable) foreign elements.
+#[bstack_enum]
+enum ForeignTupEnum {
+    Empty,
+    #[bstack_owned]
+    Pair((u32, Foreign<MacroLeaf>, Option<Foreign<MacroLeaf>>)),
+}
+
+// Tuples that mix POD and (nullable) foreign elements. The annotation names the
+// foreign elements' ownership.
+#[bstack_block]
+struct ForeignTupHolder {
+    tag: u32,
+    #[bstack_owned]
+    pair: (u32, Foreign<MacroLeaf>),
+    #[bstack_owned]
+    maybe: (u16, Option<Foreign<MacroLeaf>>, u8),
 }
 
 #[test]
@@ -8115,6 +8177,435 @@ fn macro_foreign_vec_of_option_roundtrips() {
     h.bstack_drop(&home_alloc).unwrap();
     c.bstack_drop(&home_alloc).unwrap();
     let _ = hstack;
+    reg.detach(fid);
+}
+
+#[test]
+fn macro_foreign_in_enum_across_files() {
+    // A `#[bstack_owned] V(Foreign<T>)` enum variant: constructed, read, deep-cloned,
+    // and torn down cross-file — alongside plain POD variants.
+    use crate::registry;
+    use crate::{Foreign, TryCloneIn};
+    use std::sync::Arc;
+
+    let home = TempStack::new();
+    let home_alloc = home.allocator();
+    let foreign = TempStack::new();
+    let arc_b = Arc::new(foreign.allocator());
+    let reg_file = TempStack::new();
+    let _ = registry::init(&reg_file.path);
+    let reg = registry::get().unwrap();
+    let fid = reg.attach(&foreign.path, arc_b.clone()).unwrap();
+
+    let mk = |v: u32| {
+        let l = MacroLeaf::new(&*arc_b, v).unwrap();
+        Foreign::<MacroLeaf>::new(fid, l.handle().range().start())
+    };
+
+    // A plain POD variant still works.
+    let n = ForeignEnum::new(&home_alloc, ForeignEnumData::Local(42)).unwrap();
+    match n.handle().read(&home_alloc).unwrap() {
+        ForeignEnumView::Local(x) => assert_eq!(x, 42),
+        _ => panic!("wrong variant"),
+    }
+    n.bstack_drop(&home_alloc).unwrap();
+
+    // Warm B's WAL block via the foreign variant, baseline.
+    {
+        let e = ForeignEnum::new(&home_alloc, ForeignEnumData::Far(mk(0))).unwrap();
+        let c = e.handle().try_clone_in(&home_alloc).unwrap();
+        c.bstack_drop(&home_alloc).unwrap();
+        e.bstack_drop(&home_alloc).unwrap();
+    }
+    let base = arc_b.stack().len().unwrap();
+
+    let e = ForeignEnum::new(&home_alloc, ForeignEnumData::Far(mk(77))).unwrap();
+    let off = match e.handle().read(&home_alloc).unwrap() {
+        ForeignEnumView::Far(f) => {
+            assert_eq!(
+                f.with(&home_alloc, |t, fs| t.get_val(fs).unwrap()).unwrap(),
+                77
+            );
+            f.offset()
+        }
+        _ => panic!("wrong variant"),
+    };
+
+    // Deep clone copies the target on B (fresh offset, same value).
+    let c = e.handle().try_clone_in(&home_alloc).unwrap();
+    match c.handle().read(&home_alloc).unwrap() {
+        ForeignEnumView::Far(f) => {
+            assert_ne!(f.offset(), off);
+            assert_eq!(
+                f.with(&home_alloc, |t, fs| t.get_val(fs).unwrap()).unwrap(),
+                77
+            );
+        }
+        _ => panic!("wrong variant"),
+    }
+
+    // Teardown both → both leaves reclaimed → baseline.
+    e.bstack_drop(&home_alloc).unwrap();
+    c.bstack_drop(&home_alloc).unwrap();
+    assert_eq!(
+        arc_b.stack().len().unwrap(),
+        base,
+        "foreign enum variant leaked or double-freed on B"
+    );
+    reg.detach(fid);
+}
+
+#[test]
+fn macro_foreign_generic_tuple_and_enum() {
+    // Generic foreign target inside a tuple field AND inside an enum variant.
+    use crate::registry;
+    use crate::{Foreign, TryCloneIn};
+    use std::sync::Arc;
+
+    let home = TempStack::new();
+    let home_alloc = home.allocator();
+    let hstack = home_alloc.stack();
+    let foreign = TempStack::new();
+    let arc_b = Arc::new(foreign.allocator());
+    let reg_file = TempStack::new();
+    let _ = registry::init(&reg_file.path);
+    let reg = registry::get().unwrap();
+    let fid = reg.attach(&foreign.path, arc_b.clone()).unwrap();
+    let mk = |v: u32| {
+        let l = MacroLeaf::new(&*arc_b, v).unwrap();
+        Foreign::<MacroLeaf>::new(fid, l.handle().range().start())
+    };
+
+    // Generic foreign tuple.
+    let t = GenForeignTup::<MacroLeaf>::new(&home_alloc, 1, (9, mk(11))).unwrap();
+    let pair = t.handle().get_pair(hstack).unwrap();
+    assert_eq!(pair.0, 9);
+    assert_eq!(
+        pair.1
+            .with(&home_alloc, |x, fs| x.get_val(fs).unwrap())
+            .unwrap(),
+        11
+    );
+    let tc = t.handle().try_clone_in(&home_alloc).unwrap();
+    assert_ne!(
+        tc.handle().get_pair(hstack).unwrap().1.offset(),
+        pair.1.offset()
+    );
+    t.bstack_drop(&home_alloc).unwrap();
+    tc.bstack_drop(&home_alloc).unwrap();
+
+    // Generic foreign enum variant.
+    let e = GenForeignEnum::<MacroLeaf>::new(&home_alloc, GenForeignEnumData::Far(mk(22))).unwrap();
+    let off = match e.handle().read(&home_alloc).unwrap() {
+        GenForeignEnumView::Far(f) => {
+            assert_eq!(
+                f.with(&home_alloc, |x, fs| x.get_val(fs).unwrap()).unwrap(),
+                22
+            );
+            f.offset()
+        }
+        _ => panic!("wrong variant"),
+    };
+    let ec = e.handle().try_clone_in(&home_alloc).unwrap();
+    match ec.handle().read(&home_alloc).unwrap() {
+        GenForeignEnumView::Far(f) => assert_ne!(f.offset(), off),
+        _ => panic!("wrong variant"),
+    }
+    e.bstack_drop(&home_alloc).unwrap();
+    ec.bstack_drop(&home_alloc).unwrap();
+    reg.detach(fid);
+}
+
+#[test]
+fn macro_foreign_strong_enum_variant() {
+    // A `#[bstack_strong] V(Foreign<T>)` enum variant: cloning bumps the far strong
+    // count, teardown decrements it.
+    use crate::registry;
+    use crate::{Foreign, TryCloneIn};
+    use std::sync::Arc;
+
+    let home = TempStack::new();
+    let home_alloc = home.allocator();
+    let foreign = TempStack::new();
+    let arc_b = Arc::new(foreign.allocator());
+    let ds = size_of::<<MacroStrongChild as BStackBlock>::OnDisk>() as u64;
+    let cs = size_of::<<MacroStrongChild as BStackWeakable>::Control>() as u64;
+    let reg_file = TempStack::new();
+    let _ = registry::init(&reg_file.path);
+    let reg = registry::get().unwrap();
+    let fid = reg.attach(&foreign.path, arc_b.clone()).unwrap();
+
+    let d = alloc_block(&*arc_b, MacroStrongChild::eightcc(), ds).unwrap();
+    let ctrl = alloc_control(&*arc_b, ctrl_tag(), d, cs).unwrap();
+    let strong_off = ctrl.start() + layout::CTRL_STRONG_OFFSET;
+    let load = |o: u64| crate::refcount::load(arc_b.stack(), o).unwrap();
+    assert_eq!(load(strong_off), 1);
+
+    let e = ForeignStrongEnum::new(
+        &home_alloc,
+        ForeignStrongEnumData::S(Foreign::<MacroStrongChild>::new(fid, d.start())),
+    )
+    .unwrap();
+    let cl = e.handle().try_clone_in(&home_alloc).unwrap();
+    assert_eq!(
+        load(strong_off),
+        2,
+        "strong enum variant should bump on clone"
+    );
+    e.bstack_drop(&home_alloc).unwrap();
+    assert_eq!(load(strong_off), 1);
+    cl.bstack_drop(&home_alloc).unwrap();
+    reg.detach(fid);
+}
+
+#[test]
+fn macro_foreign_tuple_in_enum_variant() {
+    // A `#[bstack_owned] V((A, Foreign<T>, Option<Foreign<T>>))` variant: POD packed
+    // inline, foreign elements resolve / deep-clone / tear down cross-file.
+    use crate::registry;
+    use crate::{Foreign, TryCloneIn};
+    use std::sync::Arc;
+
+    let home = TempStack::new();
+    let home_alloc = home.allocator();
+    let foreign = TempStack::new();
+    let arc_b = Arc::new(foreign.allocator());
+    let reg_file = TempStack::new();
+    let _ = registry::init(&reg_file.path);
+    let reg = registry::get().unwrap();
+    let fid = reg.attach(&foreign.path, arc_b.clone()).unwrap();
+    let mk = |v: u32| {
+        let l = MacroLeaf::new(&*arc_b, v).unwrap();
+        Foreign::<MacroLeaf>::new(fid, l.handle().range().start())
+    };
+
+    // Warm, baseline.
+    {
+        let e = ForeignTupEnum::new(
+            &home_alloc,
+            ForeignTupEnumData::Pair((0, mk(0), Some(mk(0)))),
+        )
+        .unwrap();
+        e.handle()
+            .try_clone_in(&home_alloc)
+            .unwrap()
+            .bstack_drop(&home_alloc)
+            .unwrap();
+        e.bstack_drop(&home_alloc).unwrap();
+    }
+    let base = arc_b.stack().len().unwrap();
+
+    let e = ForeignTupEnum::new(
+        &home_alloc,
+        ForeignTupEnumData::Pair((100, mk(11), Some(mk(22)))),
+    )
+    .unwrap();
+    let (off1, off2) = match e.handle().read(&home_alloc).unwrap() {
+        ForeignTupEnumView::Pair((a, f1, f2)) => {
+            assert_eq!(a, 100);
+            assert_eq!(
+                f1.with(&home_alloc, |x, fs| x.get_val(fs).unwrap())
+                    .unwrap(),
+                11
+            );
+            let f2 = f2.expect("Some");
+            assert_eq!(
+                f2.with(&home_alloc, |x, fs| x.get_val(fs).unwrap())
+                    .unwrap(),
+                22
+            );
+            (f1.offset(), f2.offset())
+        }
+        _ => panic!("wrong variant"),
+    };
+
+    // Deep clone copies both foreign elements (fresh offsets).
+    let c = e.handle().try_clone_in(&home_alloc).unwrap();
+    match c.handle().read(&home_alloc).unwrap() {
+        ForeignTupEnumView::Pair((_, f1, f2)) => {
+            assert_ne!(f1.offset(), off1);
+            assert_ne!(f2.expect("Some").offset(), off2);
+        }
+        _ => panic!("wrong variant"),
+    }
+
+    e.bstack_drop(&home_alloc).unwrap();
+    c.bstack_drop(&home_alloc).unwrap();
+    assert_eq!(
+        arc_b.stack().len().unwrap(),
+        base,
+        "foreign tuple-in-enum variant leaked"
+    );
+    reg.detach(fid);
+}
+
+#[test]
+fn macro_foreign_enum_container_variants() {
+    // Enum variants holding foreign containers: `V(Vec<Foreign<T>>)` and
+    // `V([Foreign<T>; N])` — constructed, read, deep-cloned, torn down cross-file.
+    use crate::registry;
+    use crate::{Foreign, TryCloneIn};
+    use std::sync::Arc;
+
+    let home = TempStack::new();
+    let home_alloc = home.allocator();
+    let foreign = TempStack::new();
+    let arc_b = Arc::new(foreign.allocator());
+    let reg_file = TempStack::new();
+    let _ = registry::init(&reg_file.path);
+    let reg = registry::get().unwrap();
+    let fid = reg.attach(&foreign.path, arc_b.clone()).unwrap();
+    let mk = |v: u32| {
+        let l = MacroLeaf::new(&*arc_b, v).unwrap();
+        Foreign::<MacroLeaf>::new(fid, l.handle().range().start())
+    };
+
+    // Warm both variants' clone paths (B's WAL block), baseline.
+    {
+        let e = ForeignContainerEnum::new(&home_alloc, ForeignContainerEnumData::Many(vec![mk(0)]))
+            .unwrap();
+        e.handle()
+            .try_clone_in(&home_alloc)
+            .unwrap()
+            .bstack_drop(&home_alloc)
+            .unwrap();
+        e.bstack_drop(&home_alloc).unwrap();
+        let e =
+            ForeignContainerEnum::new(&home_alloc, ForeignContainerEnumData::Fixed([mk(0), mk(0)]))
+                .unwrap();
+        e.handle()
+            .try_clone_in(&home_alloc)
+            .unwrap()
+            .bstack_drop(&home_alloc)
+            .unwrap();
+        e.bstack_drop(&home_alloc).unwrap();
+    }
+    let base = arc_b.stack().len().unwrap();
+
+    // Vec variant.
+    let e = ForeignContainerEnum::new(
+        &home_alloc,
+        ForeignContainerEnumData::Many(vec![mk(1), mk(2), mk(3)]),
+    )
+    .unwrap();
+    match e.handle().read(&home_alloc).unwrap() {
+        ForeignContainerEnumView::Many(v) => {
+            assert_eq!(v.len(), 3);
+            assert_eq!(
+                v[1].with(&home_alloc, |x, fs| x.get_val(fs).unwrap())
+                    .unwrap(),
+                2
+            );
+        }
+        _ => panic!("wrong variant"),
+    }
+    let c = e.handle().try_clone_in(&home_alloc).unwrap();
+    e.bstack_drop(&home_alloc).unwrap();
+    c.bstack_drop(&home_alloc).unwrap();
+
+    // Array variant.
+    let e = ForeignContainerEnum::new(&home_alloc, ForeignContainerEnumData::Fixed([mk(7), mk(8)]))
+        .unwrap();
+    match e.handle().read(&home_alloc).unwrap() {
+        ForeignContainerEnumView::Fixed(a) => {
+            assert_eq!(
+                a[0].with(&home_alloc, |x, fs| x.get_val(fs).unwrap())
+                    .unwrap(),
+                7
+            );
+            assert_eq!(
+                a[1].with(&home_alloc, |x, fs| x.get_val(fs).unwrap())
+                    .unwrap(),
+                8
+            );
+        }
+        _ => panic!("wrong variant"),
+    }
+    let c = e.handle().try_clone_in(&home_alloc).unwrap();
+    e.bstack_drop(&home_alloc).unwrap();
+    c.bstack_drop(&home_alloc).unwrap();
+
+    assert_eq!(
+        arc_b.stack().len().unwrap(),
+        base,
+        "enum foreign container variant leaked"
+    );
+    reg.detach(fid);
+}
+
+#[test]
+fn macro_foreign_in_tuple_across_files() {
+    // A tuple field mixing POD and (nullable) foreign elements: the POD parts store
+    // inline, the foreign parts resolve / deep-clone / tear down cross-file.
+    use crate::registry;
+    use crate::{Foreign, TryCloneIn};
+    use std::sync::Arc;
+
+    let home = TempStack::new();
+    let home_alloc = home.allocator();
+    let hstack = home_alloc.stack();
+    let foreign = TempStack::new();
+    let arc_b = Arc::new(foreign.allocator());
+    let reg_file = TempStack::new();
+    let _ = registry::init(&reg_file.path);
+    let reg = registry::get().unwrap();
+    let fid = reg.attach(&foreign.path, arc_b.clone()).unwrap();
+
+    let mk = |v: u32| {
+        let l = MacroLeaf::new(&*arc_b, v).unwrap();
+        Foreign::<MacroLeaf>::new(fid, l.handle().range().start())
+    };
+
+    // Warm B's WAL block, baseline.
+    {
+        let h = ForeignTupHolder::new(&home_alloc, 0, (0, mk(0)), (0, Some(mk(0)), 0)).unwrap();
+        let c = h.handle().try_clone_in(&home_alloc).unwrap();
+        c.bstack_drop(&home_alloc).unwrap();
+        h.bstack_drop(&home_alloc).unwrap();
+    }
+    let base = arc_b.stack().len().unwrap();
+
+    let h = ForeignTupHolder::new(&home_alloc, 5, (100, mk(11)), (7, Some(mk(22)), 9)).unwrap();
+
+    // POD parts preserved; foreign parts resolve.
+    let pair = h.handle().get_pair(hstack).unwrap();
+    assert_eq!(pair.0, 100);
+    assert_eq!(
+        pair.1
+            .with(&home_alloc, |t, fs| t.get_val(fs).unwrap())
+            .unwrap(),
+        11
+    );
+    let maybe = h.handle().get_maybe(hstack).unwrap();
+    assert_eq!((maybe.0, maybe.2), (7, 9));
+    assert_eq!(
+        maybe
+            .1
+            .unwrap()
+            .with(&home_alloc, |t, fs| t.get_val(fs).unwrap())
+            .unwrap(),
+        22
+    );
+
+    // Deep clone copies both foreign elements (fresh offsets, same values).
+    let c = h.handle().try_clone_in(&home_alloc).unwrap();
+    let cpair = c.handle().get_pair(hstack).unwrap();
+    assert_ne!(cpair.1.offset(), pair.1.offset());
+    assert_eq!(
+        cpair
+            .1
+            .with(&home_alloc, |t, fs| t.get_val(fs).unwrap())
+            .unwrap(),
+        11
+    );
+
+    h.bstack_drop(&home_alloc).unwrap();
+    c.bstack_drop(&home_alloc).unwrap();
+    assert_eq!(
+        arc_b.stack().len().unwrap(),
+        base,
+        "foreign-in-tuple leaked"
+    );
     reg.detach(fid);
 }
 

@@ -469,16 +469,8 @@ pub use bstack_raii_derive::{bstack_block, bstack_cast, bstack_enum, bstack_move
 /// # fn main() {}
 /// ```
 ///
-/// **`Foreign` inside a tuple** — unsupported position; bridge with a struct:
-/// ```compile_fail
-/// use bstack_raii::bstack_block;
-/// #[bstack_block] struct Leaf { v: u32 }
-/// #[bstack_block]
-/// struct Holder { #[bstack_owned] t: (u32, Foreign<Leaf>) }
-/// # fn main() {}
-/// ```
-///
-/// **`Foreign` inside a tuple inside a `Vec`** (`Vec<(_, Foreign<T>)>`):
+/// **`Foreign` inside a tuple inside a `Vec`** (`Vec<(_, Foreign<T>)>`) — a foreign
+/// *tuple* field is allowed, but not as a `Vec` element:
 /// ```compile_fail
 /// use bstack_raii::bstack_block;
 /// #[bstack_block] struct Leaf { v: u32 }
