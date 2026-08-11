@@ -53,6 +53,7 @@ mod bulk;
 mod cast;
 mod clone;
 mod construct;
+mod foreign;
 mod handle;
 mod layout;
 mod owned;
@@ -75,6 +76,7 @@ pub use block::{
 pub use bulk::{alloc_many, free_many};
 pub use cast::{BStackCastAs, BStackCastInto};
 pub use clone::{ClonePlan, TryClone, TryCloneIn};
+pub use foreign::{Foreign, ForeignPtr};
 pub use construct::{
     alloc_block, alloc_control, build_control_payload, init_rc, set_weak_field, upgrade_weak_field,
 };
@@ -353,6 +355,35 @@ pub use bstack_raii_derive::{bstack_block, bstack_cast, bstack_enum, bstack_move
 /// fn f<A: BStackOwnedSliceAllocator>(s: &S, a: &A) {
 ///     let _ = s.try_clone_in(a); // no such method on a shared block
 /// }
+/// # fn main() {}
+/// ```
+///
+/// ---
+///
+/// A **bare** `Foreign<T>` field (no ownership annotation): a foreign pointer must
+/// name its target's kind, like an in-file reference:
+/// ```compile_fail
+/// use bstack_raii::bstack_block;
+/// #[bstack_block] struct Leaf { v: u32 }
+/// #[bstack_block]
+/// struct Holder { link: Foreign<Leaf> }
+/// # fn main() {}
+/// ```
+///
+/// `Foreign<T>` where `T` is **not a bstack block** (`Foreign<Pod>`):
+/// ```compile_fail
+/// use bstack_raii::bstack_block;
+/// #[bstack_block]
+/// struct Holder { #[bstack_owned] link: bstack_raii::Foreign<u32> }
+/// # fn main() {}
+/// ```
+///
+/// `Foreign<Option<T>>` — a nullable foreign pointer is `Option<Foreign<T>>`:
+/// ```compile_fail
+/// use bstack_raii::bstack_block;
+/// #[bstack_block] struct Leaf { v: u32 }
+/// #[bstack_block]
+/// struct Holder { #[bstack_owned] link: Foreign<Option<Leaf>> }
 /// # fn main() {}
 /// ```
 #[doc(hidden)]

@@ -6900,3 +6900,117 @@ fn macro_bstack_mut_strong_replace_moves_count_out() {
     // Tearing down the holder decrements `b` (1 -> 0), freeing it + the shell.
     holder.bstack_drop(&alloc).unwrap();
 }
+
+// --------------------------------------------------------------------------
+// Foreign<T>: cross-file wide pointer resolved through the registry
+// --------------------------------------------------------------------------
+
+#[test]
+fn foreign_resolves_across_files_and_self() {
+    use crate::Foreign;
+    use crate::registry::{FileId, FileRegistry};
+    use std::sync::Arc;
+
+    let reg_file = TempStack::new();
+    let foreign_file = TempStack::new();
+    let local_file = TempStack::new();
+
+    let reg = FileRegistry::open(&reg_file.path).unwrap();
+    let local = local_file.allocator();
+
+    // Place a MacroLeaf in the *foreign* file and remember its offset, then hand
+    // that file's allocator to the registry as the live host.
+    let foreign_alloc = foreign_file.allocator();
+    let leaf = MacroLeaf::new(&foreign_alloc, 77).unwrap();
+    let off = leaf.handle().range().start();
+    let id = reg
+        .attach(&foreign_file.path, Arc::new(foreign_alloc))
+        .unwrap();
+
+    // A Foreign pointing at that leaf resolves + reads through the registry.
+    let fp = Foreign::<MacroLeaf>::new(id, off);
+    assert_eq!(
+        fp.with_in(&reg, &local, |t, stack| t.get_val(stack).unwrap()),
+        Some(77)
+    );
+
+    // Detaching the host makes resolution fail (None), not panic.
+    reg.detach(id);
+    assert_eq!(
+        fp.with_in(&reg, &local, |t, stack| t.get_val(stack).unwrap()),
+        None
+    );
+
+    // SELF resolves against `local` directly — no registry entry needed.
+    let lleaf = MacroLeaf::new(&local, 9).unwrap();
+    let selfp = Foreign::<MacroLeaf>::new(FileId::SELF, lleaf.handle().range().start());
+    assert!(selfp.is_self());
+    assert_eq!(
+        selfp.with_in(&reg, &local, |t, stack| t.get_val(stack).unwrap()),
+        Some(9)
+    );
+    lleaf.bstack_drop(&local).unwrap();
+}
+
+#[bstack_block]
+struct ForeignHolder {
+    tag: u32,
+    // A cross-file link to an owned block on the other side. `Foreign` is parsed as
+    // a token (like `Option`), so the field type needs no `use` of `Foreign` here.
+    #[bstack_owned]
+    owned_link: Foreign<MacroLeaf>,
+    // Nullable cross-file link (`offset == 0` niche); a *ref* target on the far side.
+    #[bstack_ref]
+    maybe: Option<Foreign<MacroLeaf>>,
+}
+
+#[test]
+fn macro_foreign_field() {
+    use crate::Foreign;
+    use crate::registry::FileRegistry;
+    use std::sync::Arc;
+
+    let reg_file = TempStack::new();
+    let foreign_file = TempStack::new();
+    let local_file = TempStack::new();
+
+    let reg = FileRegistry::open(&reg_file.path).unwrap();
+    let local = local_file.allocator();
+    let stack = local.stack();
+
+    // Target lives in the foreign file; attach that file as its live host.
+    let foreign_alloc = foreign_file.allocator();
+    let leaf = MacroLeaf::new(&foreign_alloc, 88).unwrap();
+    let off = leaf.handle().range().start();
+    let id = reg
+        .attach(&foreign_file.path, Arc::new(foreign_alloc))
+        .unwrap();
+
+    // POD field + an owned cross-file link + a null optional link.
+    let h = ForeignHolder::new(&local, 5, Foreign::<MacroLeaf>::new(id, off), None).unwrap();
+    assert_eq!(h.handle().get_tag(stack).unwrap(), 5);
+    assert_eq!(
+        h.handle()
+            .get_owned_link(stack)
+            .unwrap()
+            .with_in(&reg, &local, |t, fs| t.get_val(fs).unwrap()),
+        Some(88)
+    );
+    assert!(h.handle().get_maybe(stack).unwrap().is_none()); // the `None` niche
+    h.bstack_drop(&local).unwrap();
+
+    // A present optional link resolves like any other Foreign.
+    let h2 = ForeignHolder::new(
+        &local,
+        5,
+        Foreign::<MacroLeaf>::new(id, off),
+        Some(Foreign::<MacroLeaf>::new(id, off)),
+    )
+    .unwrap();
+    let m = h2.handle().get_maybe(stack).unwrap().expect("Some link");
+    assert_eq!(
+        m.with_in(&reg, &local, |t, fs| t.get_val(fs).unwrap()),
+        Some(88)
+    );
+    h2.bstack_drop(&local).unwrap();
+}
