@@ -487,8 +487,137 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                 });
             }
 
-            // Deep clone across files is still DEFERRED — the `ForeignPtr` is
-            // byte-copied verbatim (an alias) on clone, regardless of annotation.
+            // Deep clone: per-kind, acting on the target *in its own file*. `owned`
+            // deep-copies the target (a fresh block, the pointer repointed); `strong`
+            // / `weak` share it and bump its count; `ref` aliases (byte-copied — no
+            // clone_stmt). A `SELF` pointer folds into the *home* plan (atomic with the
+            // home commit); a foreign one acts eagerly via the adapter (best-effort,
+            // over-provisioning ⇒ leak, never under ⇒ double-free). A detached target
+            // file makes the clone error (aliasing an owner would double-free later).
+            let target_od_size = quote! {
+                ::core::mem::size_of::<<#ftarget as ::bstack_raii::BStackBlock>::OnDisk>() as u64
+            };
+            let foreign_clone_stmt = match kind {
+                Kind::Owned => Some(quote! {
+                    {
+                        let __fp: ::bstack_raii::ForeignPtr = __od.#fname;
+                        let __off = __fp.offset();
+                        if __off != 0 {
+                            let __fid = __fp.file_id();
+                            if __fid == 0 {
+                                // SELF: deep-clone into the home plan (one atomic commit).
+                                let __child = <#ftarget as ::bstack_raii::BStackBlock>::from_range(
+                                    ::bstack_raii::BStackRange::new(__off, #target_od_size),
+                                );
+                                let __new = __child.__bstack_clone_into(allocator, __plan)?;
+                                __od.#fname = ::bstack_raii::ForeignPtr::new(0, __new.start());
+                            } else if let ::core::option::Option::Some(__id) =
+                                ::bstack_raii::registry::FileId::from_u64(__fid)
+                            {
+                                let __host = ::bstack_raii::registry::host_arc(__id)
+                                    .ok_or_else(|| ::std::io::Error::new(
+                                        ::std::io::ErrorKind::NotFound,
+                                        "cannot deep-clone `#[bstack_owned] Foreign<T>`: \
+                                         target file not attached",
+                                    ))?;
+                                let __adapter =
+                                    ::bstack_raii::ForeignHostAllocator::new(__host, __id);
+                                let __new_off = unsafe {
+                                    ::bstack_raii::foreign_clone_owned::<#ftarget, _>(
+                                        &__adapter, __off,
+                                    )?
+                                };
+                                __od.#fname = ::bstack_raii::ForeignPtr::new(__fid, __new_off);
+                            } else {
+                                return ::std::result::Result::Err(::std::io::Error::new(
+                                    ::std::io::ErrorKind::InvalidData,
+                                    "cannot clone `Foreign<T>`: malformed file id",
+                                ));
+                            }
+                        }
+                    }
+                }),
+                Kind::Strong => Some(quote! {
+                    {
+                        let __fp: ::bstack_raii::ForeignPtr = __od.#fname;
+                        let __off = __fp.offset();
+                        if __off != 0 {
+                            let __fid = __fp.file_id();
+                            if __fid == 0 {
+                                // SELF: bump the strong count via the home plan (atomic).
+                                let __data = unsafe {
+                                    ::bstack_raii::BStackRef::<#ftarget>::from_range(
+                                        ::bstack_raii::BStackRange::new(__off, #target_od_size),
+                                    )
+                                };
+                                __plan.bump_strong(__data, allocator)?;
+                            } else if let ::core::option::Option::Some(__id) =
+                                ::bstack_raii::registry::FileId::from_u64(__fid)
+                            {
+                                let __host = ::bstack_raii::registry::host_arc(__id)
+                                    .ok_or_else(|| ::std::io::Error::new(
+                                        ::std::io::ErrorKind::NotFound,
+                                        "cannot clone `#[bstack_strong] Foreign<T>`: \
+                                         target file not attached",
+                                    ))?;
+                                let __adapter =
+                                    ::bstack_raii::ForeignHostAllocator::new(__host, __id);
+                                unsafe {
+                                    ::bstack_raii::foreign_clone_strong::<#ftarget, _>(
+                                        &__adapter, __off,
+                                    )?;
+                                }
+                                // The pointer is unchanged (shares the same target).
+                            } else {
+                                return ::std::result::Result::Err(::std::io::Error::new(
+                                    ::std::io::ErrorKind::InvalidData,
+                                    "cannot clone `Foreign<T>`: malformed file id",
+                                ));
+                            }
+                        }
+                    }
+                }),
+                Kind::Weak => Some(quote! {
+                    {
+                        let __fp: ::bstack_raii::ForeignPtr = __od.#fname;
+                        // For a weak pointer, the offset is the target's control block.
+                        let __off = __fp.offset();
+                        if __off != 0 {
+                            let __fid = __fp.file_id();
+                            if __fid == 0 {
+                                // SELF: bump the weak count via the home plan (atomic).
+                                __plan.bump_weak(__off);
+                            } else if let ::core::option::Option::Some(__id) =
+                                ::bstack_raii::registry::FileId::from_u64(__fid)
+                            {
+                                let __host = ::bstack_raii::registry::host_arc(__id)
+                                    .ok_or_else(|| ::std::io::Error::new(
+                                        ::std::io::ErrorKind::NotFound,
+                                        "cannot clone `#[bstack_weak] Foreign<T>`: \
+                                         target file not attached",
+                                    ))?;
+                                let __adapter =
+                                    ::bstack_raii::ForeignHostAllocator::new(__host, __id);
+                                unsafe {
+                                    ::bstack_raii::foreign_clone_weak::<#ftarget, _>(
+                                        &__adapter, __off,
+                                    )?;
+                                }
+                            } else {
+                                return ::std::result::Result::Err(::std::io::Error::new(
+                                    ::std::io::ErrorKind::InvalidData,
+                                    "cannot clone `Foreign<T>`: malformed file id",
+                                ));
+                            }
+                        }
+                    }
+                }),
+                // Ref aliases (byte-copied verbatim); Pod / Embed already rejected.
+                Kind::Ref | Kind::Pod | Kind::Embed => None,
+            };
+            if let Some(cs) = foreign_clone_stmt {
+                clone_stmts.push(cs);
+            }
             continue;
         }
 

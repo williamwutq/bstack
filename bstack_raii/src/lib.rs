@@ -80,7 +80,8 @@ pub use construct::{
     alloc_block, alloc_control, build_control_payload, init_rc, set_weak_field, upgrade_weak_field,
 };
 pub use foreign::{
-    Foreign, ForeignPtr, foreign_drop_owned, foreign_drop_strong, foreign_drop_weak,
+    Foreign, ForeignPtr, foreign_clone_owned, foreign_clone_strong, foreign_clone_weak,
+    foreign_drop_owned, foreign_drop_strong, foreign_drop_weak,
 };
 pub use handle::{OwnedRef, StrongRef, StrongWeakRef, WeakRef};
 pub use layout::{BlockHeader, EightCC, get_u64};

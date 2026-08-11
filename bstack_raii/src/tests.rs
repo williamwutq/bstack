@@ -7087,6 +7087,15 @@ struct ForeignStrongHolder {
     link: Foreign<MacroStrongChild>,
 }
 
+// A home block holding a *weak* cross-file reference. The stored offset is the
+// target's CONTROL block (as an in-file weak field stores).
+#[bstack_block]
+struct ForeignWeakHolder {
+    tag: u32,
+    #[bstack_weak]
+    link: Foreign<MacroStrongChild>,
+}
+
 #[test]
 fn macro_foreign_owned_teardown_reclaims_across_files() {
     // Cross-file teardown dispatch (option 1): tearing down a block with a
@@ -7316,6 +7325,360 @@ fn macro_foreign_concurrent_ab_ba_teardown() {
 
     reg.detach(fid_a);
     reg.detach(fid_b);
+}
+
+#[test]
+fn macro_foreign_owned_clone_deep_copies_across_files() {
+    // Cross-file deep clone: cloning a block with a `#[bstack_owned] Foreign<T>` field
+    // deep-copies the target INTO ITS OWN FILE (a fresh block, the pointer repointed),
+    // so the clone is independent — tearing both down frees both copies, no double-free.
+    use crate::registry;
+    use crate::{Foreign, TryCloneIn};
+    use std::sync::Arc;
+
+    let home = TempStack::new();
+    let home_alloc = home.allocator();
+    let hstack = home_alloc.stack();
+
+    let foreign = TempStack::new();
+    // Keep the foreign allocator as an Arc so we can both build typed leaves on it
+    // (`&*arc_b`) and attach it for cross-file resolution (same instance).
+    let arc_b = Arc::new(foreign.allocator());
+
+    let reg_file = TempStack::new();
+    let _ = registry::init(&reg_file.path);
+    let reg = registry::get().unwrap();
+    let fid = reg.attach(&foreign.path, arc_b.clone()).unwrap();
+
+    // Warm the owned-clone path once (this creates B's persistent WAL block, since the
+    // cross-file deep copy runs a WAL-backed clone on B); then record the baseline.
+    {
+        let l0 = MacroLeaf::new(&*arc_b, 0).unwrap();
+        let h0 = ForeignHolder::new(
+            &home_alloc,
+            0,
+            Foreign::<MacroLeaf>::new(fid, l0.handle().range().start()),
+            None,
+        )
+        .unwrap();
+        let c0 = h0.handle().try_clone_in(&home_alloc).unwrap();
+        h0.bstack_drop(&home_alloc).unwrap();
+        c0.bstack_drop(&home_alloc).unwrap();
+    }
+    let base_b = arc_b.stack().len().unwrap();
+
+    // The real target + home holder owning it.
+    let leaf = MacroLeaf::new(&*arc_b, 42).unwrap();
+    let off = leaf.handle().range().start();
+    let h = ForeignHolder::new(&home_alloc, 7, Foreign::<MacroLeaf>::new(fid, off), None).unwrap();
+
+    // Deep clone the home holder: its owned foreign target is copied on B.
+    let c = h.handle().try_clone_in(&home_alloc).unwrap();
+
+    // The clone points at a DIFFERENT block on B (a fresh copy, not an alias)…
+    let clone_link = c.handle().get_owned_link(hstack).unwrap();
+    assert_eq!(clone_link.file_id(), fid);
+    assert_ne!(
+        clone_link.offset(),
+        off,
+        "owned clone must be a fresh copy, not an alias"
+    );
+    // …carrying the same value (a genuine deep copy).
+    assert_eq!(
+        clone_link
+            .with(&home_alloc, |t, fs| t.get_val(fs).unwrap())
+            .unwrap(),
+        42
+    );
+
+    // Independence: tearing both holders down frees BOTH leaves on B (no double-free,
+    // no leak) — the file returns exactly to the warmed baseline.
+    h.bstack_drop(&home_alloc).unwrap();
+    c.bstack_drop(&home_alloc).unwrap();
+    assert_eq!(
+        arc_b.stack().len().unwrap(),
+        base_b,
+        "clone+teardown leaked or double-freed on the foreign file"
+    );
+
+    reg.detach(fid);
+}
+
+#[test]
+fn macro_foreign_strong_clone_bumps_count_across_files() {
+    // Cross-file strong clone: cloning a `#[bstack_strong] Foreign<T>` shares the same
+    // target and bumps its strong count on the far side; both clones releasing it
+    // (teardown) drive it back to zero and free it.
+    use crate::registry;
+    use crate::{Foreign, TryCloneIn};
+    use std::sync::Arc;
+
+    let home = TempStack::new();
+    let home_alloc = home.allocator();
+
+    let foreign = TempStack::new();
+    let arc_b = Arc::new(foreign.allocator());
+
+    let data_size = size_of::<<MacroStrongChild as BStackBlock>::OnDisk>() as u64;
+    let ctrl_size = size_of::<<MacroStrongChild as BStackWeakable>::Control>() as u64;
+
+    let base = arc_b.stack().len().unwrap();
+    let data = alloc_block(&*arc_b, MacroStrongChild::eightcc(), data_size).unwrap();
+    let ctrl = alloc_control(&*arc_b, ctrl_tag(), data, ctrl_size).unwrap();
+    let data_off = data.start();
+    let strong_off = ctrl.start() + layout::CTRL_STRONG_OFFSET;
+
+    let reg_file = TempStack::new();
+    let _ = registry::init(&reg_file.path);
+    let reg = registry::get().unwrap();
+    let fid = reg.attach(&foreign.path, arc_b.clone()).unwrap();
+
+    let load = |o: u64| crate::refcount::load(arc_b.stack(), o).unwrap();
+    assert_eq!(load(strong_off), 1);
+
+    // One strong owner across the boundary; cloning it makes two.
+    let h = ForeignStrongHolder::new(
+        &home_alloc,
+        1,
+        Foreign::<MacroStrongChild>::new(fid, data_off),
+    )
+    .unwrap();
+    let c = h.handle().try_clone_in(&home_alloc).unwrap();
+    assert_eq!(
+        load(strong_off),
+        2,
+        "strong clone should bump the far count"
+    );
+
+    // Both owners releasing drives the count to zero and frees the target.
+    h.bstack_drop(&home_alloc).unwrap();
+    assert_eq!(load(strong_off), 1);
+    c.bstack_drop(&home_alloc).unwrap();
+    assert_eq!(
+        arc_b.stack().len().unwrap(),
+        base,
+        "target should be reclaimed once both strong owners drop"
+    );
+
+    reg.detach(fid);
+}
+
+#[test]
+fn macro_foreign_weak_clone_bumps_count_across_files() {
+    // Cross-file weak clone: cloning a `#[bstack_weak] Foreign<T>` shares the same
+    // control block and bumps its weak count on the far side; teardown decrements it.
+    use crate::registry;
+    use crate::{Foreign, TryCloneIn};
+    use std::sync::Arc;
+
+    let home = TempStack::new();
+    let home_alloc = home.allocator();
+
+    let foreign = TempStack::new();
+    let arc_b = Arc::new(foreign.allocator());
+
+    let data_size = size_of::<<MacroStrongChild as BStackBlock>::OnDisk>() as u64;
+    let ctrl_size = size_of::<<MacroStrongChild as BStackWeakable>::Control>() as u64;
+    let data = alloc_block(&*arc_b, MacroStrongChild::eightcc(), data_size).unwrap();
+    let ctrl = alloc_control(&*arc_b, ctrl_tag(), data, ctrl_size).unwrap();
+    let ctrl_off = ctrl.start();
+    let weak_off = ctrl_off + layout::CTRL_WEAK_OFFSET;
+    // alloc_control leaves strong=1, weak=1 (the phantom the strong owners hold). Add
+    // one weak for the holder we are about to create (construction does not bump).
+    crate::refcount::fetch_add(arc_b.stack(), weak_off, 1).unwrap();
+
+    let reg_file = TempStack::new();
+    let _ = registry::init(&reg_file.path);
+    let reg = registry::get().unwrap();
+    let fid = reg.attach(&foreign.path, arc_b.clone()).unwrap();
+
+    let load = |o: u64| crate::refcount::load(arc_b.stack(), o).unwrap();
+    assert_eq!(load(weak_off), 2); // phantom + holder
+
+    // A weak foreign holder points at the CONTROL block; cloning it bumps weak.
+    let h = ForeignWeakHolder::new(
+        &home_alloc,
+        1,
+        Foreign::<MacroStrongChild>::new(fid, ctrl_off),
+    )
+    .unwrap();
+    let c = h.handle().try_clone_in(&home_alloc).unwrap();
+    assert_eq!(
+        load(weak_off),
+        3,
+        "weak clone should bump the far weak count"
+    );
+
+    // Both weak owners releasing brings it back down (the phantom keeps it alive).
+    h.bstack_drop(&home_alloc).unwrap();
+    c.bstack_drop(&home_alloc).unwrap();
+    assert_eq!(
+        load(weak_off),
+        1,
+        "weak teardown should decrement the far count"
+    );
+
+    reg.detach(fid);
+}
+
+#[test]
+fn macro_foreign_concurrent_ab_ba_clone() {
+    // AB-BA stress for CLONE. Unlike teardown (whose cross-file frees are plain
+    // deallocs), a cross-file owned clone runs a WAL-backed `try_clone_in` on the
+    // TARGET file — so it takes the *target's* WAL mutex, then its *home* file's WAL
+    // mutex on commit. This drives clones both ways concurrently to confirm those two
+    // acquisitions never cycle (they're sequential, not nested) and that every deep
+    // copy is independent (no double-free / leak on the ensuing teardown).
+    use crate::registry;
+    use crate::{Foreign, TryCloneIn};
+    use std::sync::Arc;
+    use std::thread;
+
+    let fa = TempStack::new();
+    let fb = TempStack::new();
+    let arc_a = Arc::new(fa.allocator());
+    let arc_b = Arc::new(fb.allocator());
+
+    let reg_file = TempStack::new();
+    let _ = registry::init(&reg_file.path);
+    let reg = registry::get().unwrap();
+    let fid_a = reg.attach(&fa.path, arc_a.clone()).unwrap();
+    let fid_b = reg.attach(&fb.path, arc_b.clone()).unwrap();
+
+    // Warm both files' WAL blocks (each is a clone home AND a cross-file clone target),
+    // then baseline.
+    for (ha, hb, tgt) in [(&arc_a, &arc_b, fid_b), (&arc_b, &arc_a, fid_a)] {
+        let l = MacroLeaf::new(&**hb, 0).unwrap();
+        let h = ForeignHolder::new(
+            &**ha,
+            0,
+            Foreign::<MacroLeaf>::new(tgt, l.handle().range().start()),
+            None,
+        )
+        .unwrap();
+        h.handle()
+            .try_clone_in(&**ha)
+            .unwrap()
+            .bstack_drop(&**ha)
+            .unwrap();
+        h.bstack_drop(&**ha).unwrap();
+    }
+    let base_a = arc_a.stack().len().unwrap();
+    let base_b = arc_b.stack().len().unwrap();
+
+    const N: usize = 32;
+    const THREADS: usize = 4;
+    let mut a_orig = Vec::with_capacity(N);
+    let mut b_orig = Vec::with_capacity(N);
+    for i in 0..N as u32 {
+        let bl = MacroLeaf::new(&*arc_b, i).unwrap();
+        a_orig.push(
+            ForeignHolder::new(
+                &*arc_a,
+                i,
+                Foreign::<MacroLeaf>::new(fid_b, bl.handle().range().start()),
+                None,
+            )
+            .unwrap()
+            .into_inner(),
+        );
+        let al = MacroLeaf::new(&*arc_a, i).unwrap();
+        b_orig.push(
+            ForeignHolder::new(
+                &*arc_b,
+                i,
+                Foreign::<MacroLeaf>::new(fid_a, al.handle().range().start()),
+                None,
+            )
+            .unwrap()
+            .into_inner(),
+        );
+    }
+
+    // Clone both directions at once: A-holder clones deep-copy into B (taking B's WAL
+    // mutex) while B-holder clones deep-copy into A.
+    let chunk = N.div_ceil(THREADS);
+    let (a_clones, b_clones) = thread::scope(|s| {
+        let arc_a = &arc_a;
+        let arc_b = &arc_b;
+        let mut ja = Vec::new();
+        let mut jb = Vec::new();
+        for part in a_orig.chunks(chunk) {
+            let part = part.to_vec();
+            ja.push(s.spawn(move || {
+                part.iter()
+                    .map(|h| h.try_clone_in(&**arc_a).unwrap().into_inner())
+                    .collect::<Vec<_>>()
+            }));
+        }
+        for part in b_orig.chunks(chunk) {
+            let part = part.to_vec();
+            jb.push(s.spawn(move || {
+                part.iter()
+                    .map(|h| h.try_clone_in(&**arc_b).unwrap().into_inner())
+                    .collect::<Vec<_>>()
+            }));
+        }
+        let a_clones: Vec<_> = ja.into_iter().flat_map(|j| j.join().unwrap()).collect();
+        let b_clones: Vec<_> = jb.into_iter().flat_map(|j| j.join().unwrap()).collect();
+        (a_clones, b_clones)
+    });
+    assert_eq!(a_clones.len(), N);
+    assert_eq!(b_clones.len(), N);
+
+    // Tear down originals + clones. Every original leaf AND every independent deep copy
+    // is reclaimed ⇒ both files return exactly to baseline (no leak, no double-free);
+    // completion ⇒ no deadlock across the two WAL mutexes.
+    for h in a_orig.into_iter().chain(a_clones) {
+        h.bstack_drop(&*arc_a).unwrap();
+    }
+    for h in b_orig.into_iter().chain(b_clones) {
+        h.bstack_drop(&*arc_b).unwrap();
+    }
+    assert_eq!(
+        arc_a.stack().len().unwrap(),
+        base_a,
+        "file A not fully reclaimed after concurrent AB-BA clone"
+    );
+    assert_eq!(
+        arc_b.stack().len().unwrap(),
+        base_b,
+        "file B not fully reclaimed after concurrent AB-BA clone"
+    );
+
+    reg.detach(fid_a);
+    reg.detach(fid_b);
+}
+
+#[test]
+fn macro_foreign_owned_clone_errors_when_target_file_detached() {
+    // Cloning an owning `Foreign<T>` whose target file is not attached must ERROR (not
+    // silently alias — that would create a second owner and later double-free).
+    use crate::registry;
+    use crate::{Foreign, TryCloneIn};
+    use std::sync::Arc;
+
+    let home = TempStack::new();
+    let home_alloc = home.allocator();
+
+    let foreign = TempStack::new();
+    let arc_b = Arc::new(foreign.allocator());
+    let leaf = MacroLeaf::new(&*arc_b, 5).unwrap();
+    let off = leaf.handle().range().start();
+
+    let reg_file = TempStack::new();
+    let _ = registry::init(&reg_file.path);
+    let reg = registry::get().unwrap();
+    let fid = reg.attach(&foreign.path, arc_b.clone()).unwrap();
+
+    let h = ForeignHolder::new(&home_alloc, 1, Foreign::<MacroLeaf>::new(fid, off), None).unwrap();
+
+    // Detach the target file → the deep clone cannot copy the target → error.
+    reg.detach(fid);
+    assert!(
+        h.handle().try_clone_in(&home_alloc).is_err(),
+        "cloning an owned Foreign with a detached target file must error, not alias"
+    );
 }
 
 #[test]

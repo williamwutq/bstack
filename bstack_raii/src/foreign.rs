@@ -27,7 +27,10 @@ use bytemuck::{Pod, Zeroable};
 
 use crate::BStackRaiiAllocator;
 use crate::block::{BStackBlock, BStackShared, BStackWeakable};
+use crate::clone::TryCloneIn;
 use crate::handle::{OwnedRef, WeakRef};
+use crate::layout;
+use crate::refcount;
 use crate::reference::BStackRef;
 use crate::registry::{self, FileId, FileRegistry};
 use crate::teardown::BStackDrop;
@@ -262,4 +265,78 @@ pub unsafe fn foreign_drop_weak<T: BStackWeakable, A: BStackRaiiAllocator>(
     // SAFETY: `range` is the caller-asserted live control block of a weakable `T`.
     let ctrl = unsafe { BStackRef::<T::Control>::from_range(range) };
     WeakRef::<T>(ctrl).bstack_drop(alloc)
+}
+
+// ---------------------------------------------------------------------------
+// Cross-file deep-clone helpers (the mirror of the teardown helpers above).
+//
+// A `Foreign<T>` field's clone acts on the target *in the target's own file* per its
+// annotation: `#[bstack_owned]` deep-copies the target (a fresh block on that file,
+// the pointer repointed); `#[bstack_strong]` / `#[bstack_weak]` share the same target
+// and bump its count; `#[bstack_ref]` aliases (byte-copied — no helper). A `SELF`
+// pointer instead folds into the *home* clone plan (atomic with the home commit); the
+// generated code picks that path. These helpers cover the cross-file case.
+//
+// **Atomicity across files is best-effort (option-1):** the foreign side is touched
+// eagerly (its own commit for `owned`, an atomic increment for `strong`/`weak`) BEFORE
+// the home clone commits, and a home failure afterwards does not undo it. That always
+// errs toward **over-provisioning** — an orphaned fresh block, or an over-count — which
+// leaks, never toward an under-count (which would be a premature free / double-free).
+// A target file that is not currently attached makes the clone **error** (aliasing an
+// owning pointer would create a second owner ⇒ later double-free); the generated code
+// enforces that before calling these.
+// ---------------------------------------------------------------------------
+
+/// Deep-clone an `#[bstack_owned] Foreign<T>` target at `offset` in the file `alloc`
+/// addresses; returns the new copy's offset. Self-contained atomic commit on that
+/// file; eager (a later home-clone failure leaks the new block).
+///
+/// # Safety
+/// `offset` names a live `T` block, in the file `alloc` addresses, owned by this
+/// foreign pointer.
+pub unsafe fn foreign_clone_owned<T: TryCloneIn + BStackBlock, A: BStackRaiiAllocator>(
+    alloc: &A,
+    offset: u64,
+) -> io::Result<u64> {
+    let range = BStackRange::new(offset, core::mem::size_of::<T::OnDisk>() as u64);
+    let src = T::from_range(range);
+    let new = src.try_clone_in(alloc)?;
+    Ok(new.handle().range().start())
+}
+
+/// Bump the strong count of an `#[bstack_strong] Foreign<T>` target at `offset` (its
+/// data block) in the file `alloc` addresses — the strong reference the clone
+/// acquires. Eager atomic increment.
+///
+/// # Safety
+/// `offset` names a live shared `T` data block in the file `alloc` addresses.
+pub unsafe fn foreign_clone_strong<T: BStackShared, A: BStackRaiiAllocator>(
+    alloc: &A,
+    offset: u64,
+) -> io::Result<()> {
+    let range = BStackRange::new(offset, core::mem::size_of::<T::OnDisk>() as u64);
+    // SAFETY: `range` is the caller-asserted live data block of a shared `T`.
+    let data = unsafe { BStackRef::<T>::from_range(range) };
+    let (data_ref, ctrl) = <T as BStackShared>::strong_parts(data, alloc)?;
+    let off = match ctrl {
+        None => data_ref.into_range().start() + layout::RC_REFCOUNT_OFFSET,
+        Some(c) => c.start() + layout::CTRL_STRONG_OFFSET,
+    };
+    refcount::fetch_add(alloc.stack(), off, 1)?;
+    Ok(())
+}
+
+/// Bump the weak count of a `#[bstack_weak] Foreign<T>` target's control block at
+/// `ctrl_offset` in the file `alloc` addresses — the weak reference the clone
+/// acquires. Eager atomic increment. (`T` documents the intended weakable target; the
+/// increment needs only the offset.)
+///
+/// # Safety
+/// `ctrl_offset` names a live `T::Control` block in the file `alloc` addresses.
+pub unsafe fn foreign_clone_weak<T: BStackWeakable, A: BStackRaiiAllocator>(
+    alloc: &A,
+    ctrl_offset: u64,
+) -> io::Result<()> {
+    refcount::fetch_add(alloc.stack(), ctrl_offset + layout::CTRL_WEAK_OFFSET, 1)?;
+    Ok(())
 }
