@@ -6450,14 +6450,20 @@ fn registry_paths_persist_and_live_host_round_trips() {
         let reg = FileRegistry::open(&reg_file.path).unwrap();
 
         let id_a = reg.register_path(&foreign.path).unwrap();
-        assert_eq!(id_a, FileId::from_u64(0).unwrap());
+        // Ordinary ids are 1-based (0 is reserved for `SELF`).
+        assert_eq!(id_a, FileId::from_u64(1).unwrap());
+        assert!(!id_a.is_self());
         // Registration is idempotent (same path -> same id, no new slot).
         assert_eq!(reg.register_path(&foreign.path).unwrap(), id_a);
         // A distinct path gets the next id.
         let id_g = reg.register_path(&ghost).unwrap();
-        assert_eq!(id_g.get(), 1);
+        assert_eq!(id_g.get(), 2);
         assert_eq!(reg.id_of(&foreign.path), Some(id_a));
         assert_eq!(reg.path_of(id_g).as_deref(), Some(ghost.as_path()));
+        // `SELF` is never a registry entry and never takes the lock.
+        assert!(FileId::SELF.is_self());
+        assert!(reg.path_of(FileId::SELF).is_none());
+        assert!(reg.with_host(FileId::SELF, |_| ()).is_none());
 
         // Attach the foreign file's own allocator as its live host (same path ->
         // same id), then read/write/alloc through the type-erased facade.
@@ -6488,14 +6494,14 @@ fn registry_paths_persist_and_live_host_round_trips() {
     // --- "run 2": reopen the same registry file; the path table persisted ---
     {
         let reg = FileRegistry::open(&reg_file.path).unwrap();
-        assert_eq!(reg.id_of(&foreign.path).map(FileId::get), Some(0));
-        assert_eq!(reg.id_of(&ghost).map(FileId::get), Some(1));
+        assert_eq!(reg.id_of(&foreign.path).map(FileId::get), Some(1));
+        assert_eq!(reg.id_of(&ghost).map(FileId::get), Some(2));
         assert_eq!(
-            reg.path_of(FileId::from_u64(0).unwrap()).as_deref(),
+            reg.path_of(FileId::from_u64(1).unwrap()).as_deref(),
             Some(foreign.path.as_path())
         );
         // The live layer is in-memory only: nothing is live after a reopen.
-        assert!(!reg.is_live(FileId::from_u64(0).unwrap()));
+        assert!(!reg.is_live(FileId::from_u64(1).unwrap()));
     }
 
     let _ = std::fs::remove_file(&ghost);

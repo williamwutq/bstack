@@ -46,18 +46,53 @@ use parking_lot::RwLock;
 
 use crate::BStackRaiiAllocator;
 
-/// A small, stable identity for a registered bstack file: an index into the
-/// registry's append-only path table.
+/// A small, stable identity for a registered bstack file.
 ///
 /// Backed by a `u32` (a sane program opens far fewer than `u16::MAX` files, so
 /// this is generous headroom), but a `Foreign` pointer stores it **widened to a
 /// `u64`** — for alignment next to a [`BStackRange`], and to leave room for future
 /// RTTI. [`as_u64`](Self::as_u64) / [`from_u64`](Self::from_u64) bridge the two.
+///
+/// # Id-space layout
+///
+/// * **`0` = [`SELF`](Self::SELF)** — the *current* file. A `Foreign` with this id
+///   points into whatever file it itself lives in, resolved directly against the
+///   local allocator the caller already holds. Registry lookup (and its lock) is
+///   never consulted for `SELF`. Never assigned to a registered path.
+/// * **`1, 2, 3, …` (ascending) = ordinary registered files** — assigned in order
+///   of registration; the id is `1 + ` the file's index in the append-only path
+///   table.
+/// * **`u32::MAX, u32::MAX - 1, …` (descending) = reserved "special" meanings** —
+///   sentinels beyond a single concrete file, allocated from the top down so they
+///   never collide with the ascending ordinary ids (`SELF` is the sole exception
+///   at the bottom). Only `SELF` is defined so far; the descending region is
+///   reserved for future use (see [`is_special`](Self::is_special)).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct FileId(u32);
 
 impl FileId {
-    /// The raw `u32` index.
+    /// The self-referential id (`0`): a `Foreign` bearing it points into the
+    /// *current* file and is resolved against the local allocator **without**
+    /// touching the registry or its lock. Never assigned to a registered path.
+    pub const SELF: FileId = FileId(0);
+
+    /// Whether this is [`SELF`](Self::SELF) (the current file).
+    pub const fn is_self(self) -> bool {
+        self.0 == 0
+    }
+
+    /// Whether this id is in the reserved descending "special" region (top of the
+    /// `u32` space). Ordinary registered files and `SELF` are **not** special.
+    /// The boundary is generous — far above any realistic file count.
+    pub const fn is_special(self) -> bool {
+        self.0 >= Self::SPECIAL_FLOOR
+    }
+
+    /// Lowest id treated as a reserved special sentinel (special ids grow *down*
+    /// from `u32::MAX`). Chosen far above any plausible number of open files.
+    pub const SPECIAL_FLOOR: u32 = u32::MAX - 0xFFFF;
+
+    /// The raw `u32` value.
     pub const fn get(self) -> u32 {
         self.0
     }
@@ -75,6 +110,17 @@ impl FileId {
         } else {
             None
         }
+    }
+}
+
+/// Map a `FileId` to its index in the append-only path table, or `None` for
+/// [`SELF`](FileId::SELF) and reserved special ids (neither of which is a concrete
+/// registered file). Ordinary ids are 1-based, so the index is `id - 1`.
+fn table_index(id: FileId) -> Option<usize> {
+    if id.0 >= 1 && !id.is_special() {
+        Some((id.0 - 1) as usize)
+    } else {
+        None
     }
 }
 
@@ -358,7 +404,7 @@ impl<'h> FileRegistry<'h> {
         let by_path = paths
             .iter()
             .enumerate()
-            .map(|(i, p)| (p.clone(), FileId(i as u32)))
+            .map(|(i, p)| (p.clone(), FileId(i as u32 + 1))) // ids are 1-based (0 = SELF)
             .collect();
         let live = (0..paths.len()).map(|_| None).collect();
         Ok(FileRegistry {
@@ -379,7 +425,14 @@ impl<'h> FileRegistry<'h> {
         if let Some(&id) = g.by_path.get(path) {
             return Ok(id);
         }
-        let id = FileId(g.paths.len() as u32);
+        let next = g.paths.len() as u32 + 1; // ids are 1-based; 0 is reserved for SELF
+        if next >= FileId::SPECIAL_FLOOR {
+            return Err(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "file registry exhausted the ordinary id space",
+            ));
+        }
+        let id = FileId(next);
         // Persist first (append the record); only mutate memory once the disk write
         // succeeds, so a failed append leaves us consistent.
         g.store.append(path)?;
@@ -397,7 +450,7 @@ impl<'h> FileRegistry<'h> {
     pub fn attach(&self, path: &Path, host: Arc<dyn ForeignHost + 'h>) -> io::Result<FileId> {
         let id = self.register_path(path)?;
         let mut g = self.inner.write();
-        g.live[id.0 as usize] = Some(host);
+        g.live[(id.0 - 1) as usize] = Some(host); // register_path returns a 1-based id
         Ok(id)
     }
 
@@ -405,8 +458,9 @@ impl<'h> FileRegistry<'h> {
     /// Takes the write lock, so it waits for any in-flight [`with_host`] op to
     /// finish and cannot run *during* one.
     pub fn detach(&self, id: FileId) {
+        let Some(idx) = table_index(id) else { return };
         let mut g = self.inner.write();
-        if let Some(slot) = g.live.get_mut(id.0 as usize) {
+        if let Some(slot) = g.live.get_mut(idx) {
             *slot = None;
         }
     }
@@ -422,14 +476,18 @@ impl<'h> FileRegistry<'h> {
     /// detaching is cold and a perpetually-in-use file cannot be safely detached
     /// anyway.
     pub fn with_host<R>(&self, id: FileId, f: impl FnOnce(&dyn ForeignHost) -> R) -> Option<R> {
+        // `SELF` / special ids name no registry entry, so return without ever taking
+        // the lock — the caller resolves `SELF` against its own local allocator.
+        let idx = table_index(id)?;
         let g = self.inner.read_recursive();
-        let host = g.live.get(id.0 as usize)?.as_ref()?;
+        let host = g.live.get(idx)?.as_ref()?;
         Some(f(&**host))
     }
 
-    /// The path registered for `id`, if any.
+    /// The path registered for `id`, if any (`None` for `SELF` / special ids).
     pub fn path_of(&self, id: FileId) -> Option<PathBuf> {
-        self.inner.read().paths.get(id.0 as usize).cloned()
+        let idx = table_index(id)?;
+        self.inner.read().paths.get(idx).cloned()
     }
 
     /// The id registered for `path`, if any.
@@ -437,13 +495,13 @@ impl<'h> FileRegistry<'h> {
         self.inner.read().by_path.get(path).copied()
     }
 
-    /// Whether `id` currently has a live host attached.
+    /// Whether `id` currently has a live host attached (always `false` for `SELF` /
+    /// special ids).
     pub fn is_live(&self, id: FileId) -> bool {
-        self.inner
-            .read()
-            .live
-            .get(id.0 as usize)
-            .is_some_and(Option::is_some)
+        let Some(idx) = table_index(id) else {
+            return false;
+        };
+        self.inner.read().live.get(idx).is_some_and(Option::is_some)
     }
 }
 
