@@ -1639,8 +1639,32 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
             clone_stmts.push(cs);
         }
 
-        // Accessor.
+        // Accessor: the `get_<field>` reader, the unsafe `raw_<field>_slice` place,
+        // and — for `#[bstack_mut]` POD / `#[bstack_ref]` fields — a `set_<field>`.
         accessors.push(accessor(vis, fname, inner_ty, &on_disk_ty, kind, nullable));
+        accessors.push(raw_slice_accessor(vis, fname, inner_ty, &on_disk_ty, kind));
+        if is_bstack_mut(&field.attrs) {
+            match kind {
+                Kind::Pod | Kind::Ref => {
+                    accessors.push(set_accessor(
+                        vis,
+                        fname,
+                        inner_ty,
+                        &on_disk_ty,
+                        kind,
+                        nullable,
+                    ));
+                }
+                // Weak fields already have a `set_<field>` (the weak setter).
+                Kind::Weak => {}
+                Kind::Owned | Kind::Strong | Kind::Embed => {
+                    return Err(Error::new_spanned(
+                        field,
+                        "#[bstack_mut] is currently only supported on POD and #[bstack_ref] fields",
+                    ));
+                }
+            }
+        }
 
         // Constructor. Weak fields are not parameters — they start null and are
         // wired afterwards via the generated `set_<field>`.
@@ -2840,6 +2864,109 @@ fn accessor(
     }
 }
 
+/// The unsafe raw-place accessor `raw_<field>_slice`: a [`BStackSlice`] over the
+/// field's **inline** storage within the record — the value's own bytes for a POD
+/// field, or the `u64` offset slot for a pointer field
+/// (`#[bstack_owned/strong/weak/ref]`; `#[embed]` yields the inline child's bytes).
+///
+/// It bypasses the typed [`accessor`]/setter, so writing through the returned slice
+/// can violate the field's invariants (a bogus/aliased offset for a pointer field,
+/// an un-freed owned target); it is therefore `unsafe`. Reads are always valid.
+fn raw_slice_accessor(
+    vis: &syn::Visibility,
+    fname: &Ident,
+    inner_ty: &Type,
+    on_disk: &TokenStream,
+    kind: Kind,
+) -> TokenStream {
+    let raw = format_ident!("raw_{}_slice", fname);
+    // The field's inline byte length: a POD value, an `#[embed]` child's on-disk
+    // form, or a single `u64` offset slot for the pointer kinds.
+    let len = match kind {
+        Kind::Pod => quote!(::core::mem::size_of::<#inner_ty>() as u64),
+        Kind::Embed => {
+            quote!(::core::mem::size_of::<<#inner_ty as ::bstack_raii::BStackBlock>::OnDisk>() as u64)
+        }
+        Kind::Owned | Kind::Strong | Kind::Weak | Kind::Ref => quote!(8u64),
+    };
+    quote! {
+        /// Raw [`BStackSlice`] over this field's inline storage.
+        ///
+        /// # Safety
+        /// Bypasses the field's typed invariants: writing bytes through the returned
+        /// slice can corrupt a pointer field (a bogus or aliased offset) or leak an
+        /// owned target. Reads are always valid.
+        #vis unsafe fn #raw<'__s>(
+            &self,
+            stack: &'__s ::bstack_raii::BStack,
+        ) -> ::bstack_raii::BStackSlice<'__s> {
+            let __off = self.0.start() + ::core::mem::offset_of!(#on_disk, #fname) as u64;
+            // SAFETY: `[__off, __off + #len)` is exactly this field's inline region
+            // within the record, which is a live allocation of the backing stack.
+            unsafe {
+                ::bstack_raii::BStackSlice::from_raw_range(
+                    stack,
+                    ::bstack_raii::BStackRange::new(__off, #len),
+                )
+            }
+        }
+    }
+}
+
+/// The `set_<field>` mutator, generated only for `#[bstack_mut]` POD and
+/// `#[bstack_ref]` fields (both a single atomic `set` of the field's inline
+/// storage — a POD field owns no children, and a ref does not own its target, so
+/// neither frees anything). Ownership-bearing kinds (`owned`/`strong`/`embed`) are
+/// rejected upstream, since their setter must free/refcount the old target.
+fn set_accessor(
+    vis: &syn::Visibility,
+    fname: &Ident,
+    inner_ty: &Type,
+    on_disk: &TokenStream,
+    kind: Kind,
+    nullable: bool,
+) -> TokenStream {
+    let setter = format_ident!("set_{}", fname);
+    let off = quote!(self.0.start() + ::core::mem::offset_of!(#on_disk, #fname) as u64);
+    match kind {
+        Kind::Pod => quote! {
+            /// Overwrite this POD field, as one crash-atomic `set`.
+            #vis fn #setter(
+                &self,
+                stack: &::bstack_raii::BStack,
+                value: #inner_ty,
+            ) -> ::std::io::Result<()> {
+                stack.set(#off, ::bstack_raii::bytemuck::bytes_of(&value))
+            }
+        },
+        Kind::Ref if nullable => quote! {
+            /// Repoint this `#[bstack_ref]` field (`None` writes the `0` null niche).
+            /// The ref borrows — it does not own — its target, so nothing is freed.
+            #vis fn #setter(
+                &self,
+                stack: &::bstack_raii::BStack,
+                value: ::core::option::Option<::bstack_raii::BStackRef<#inner_ty>>,
+            ) -> ::std::io::Result<()> {
+                let __ptr = value.map_or(0u64, |__r| __r.into_range().start());
+                stack.set(#off, __ptr.to_le_bytes())
+            }
+        },
+        Kind::Ref => quote! {
+            /// Repoint this `#[bstack_ref]` field. The ref borrows — it does not own
+            /// — its target, so nothing is freed.
+            #vis fn #setter(
+                &self,
+                stack: &::bstack_raii::BStack,
+                value: ::bstack_raii::BStackRef<#inner_ty>,
+            ) -> ::std::io::Result<()> {
+                stack.set(#off, value.into_range().start().to_le_bytes())
+            }
+        },
+        // Only POD / ref reach here (the caller filters).
+        _ => quote!(),
+    }
+}
+
 /// Generate `(param, prep, init)` for one constructor field. Not called for
 /// `#[bstack_weak]` fields. `nullable` fields take an `Option<Handle>` (None => 0).
 fn ctor_field(
@@ -3573,6 +3700,15 @@ fn classify_attrs(attrs: &[syn::Attribute]) -> syn::Result<Kind> {
 /// Classify a struct field by its ownership annotation.
 fn classify(field: &syn::Field) -> syn::Result<Kind> {
     classify_attrs(&field.attrs)
+}
+
+/// Whether a field is annotated `#[bstack_mut]`, opting it into a generated
+/// `set_<field>` (currently honoured for POD and `#[bstack_ref]` fields).
+fn is_bstack_mut(attrs: &[syn::Attribute]) -> bool {
+    attrs
+        .iter()
+        .filter_map(|a| a.path().get_ident())
+        .any(|id| id == "bstack_mut")
 }
 
 // ===========================================================================

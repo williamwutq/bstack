@@ -6685,3 +6685,94 @@ fn registry_paths_persist_and_live_host_round_trips() {
 
     let _ = std::fs::remove_file(&ghost);
 }
+
+// --------------------------------------------------------------------------
+// #[bstack_mut]: generated set_<field> + raw_<field>_slice (POD and ref)
+// --------------------------------------------------------------------------
+
+#[bstack_block]
+struct MutPod {
+    #[bstack_mut]
+    n: u64,
+    tag: u32, // not mutable — no set_tag generated
+}
+
+#[bstack_block]
+struct MutRef {
+    #[bstack_mut]
+    #[bstack_ref]
+    target: MacroLeaf,
+}
+
+#[test]
+fn macro_bstack_mut_pod_set_and_raw_slice() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let b = MutPod::new(&alloc, 10, 7).unwrap();
+    assert_eq!(b.handle().get_n(stack).unwrap(), 10);
+    assert_eq!(b.handle().get_tag(stack).unwrap(), 7);
+
+    // Generated setter: one atomic overwrite.
+    b.handle().set_n(stack, 42).unwrap();
+    assert_eq!(b.handle().get_n(stack).unwrap(), 42);
+    // `tag` (no #[bstack_mut]) is untouched — and there is no `set_tag` to call.
+    assert_eq!(b.handle().get_tag(stack).unwrap(), 7);
+
+    // Raw place: read the field's inline bytes back.
+    let slice = unsafe { b.handle().raw_n_slice(stack) };
+    assert_eq!(slice.len(), 8);
+    let bytes = slice.read().unwrap();
+    assert_eq!(u64::from_le_bytes(bytes[..8].try_into().unwrap()), 42);
+
+    // Raw place: a write through it is observed by the typed getter.
+    let mut w = unsafe { b.handle().raw_n_slice(stack) };
+    w.write(99u64.to_le_bytes()).unwrap();
+    assert_eq!(b.handle().get_n(stack).unwrap(), 99);
+
+    b.bstack_drop(&alloc).unwrap();
+}
+
+#[test]
+fn macro_bstack_mut_ref_repoints() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let a = MacroLeaf::new(&alloc, 111).unwrap();
+    let c = MacroLeaf::new(&alloc, 222).unwrap();
+
+    let holder = MutRef::new(&alloc, unsafe { BStackRef::from_range(a.handle().range()) }).unwrap();
+    assert_eq!(
+        holder
+            .handle()
+            .get_target(stack)
+            .unwrap()
+            .get_val(stack)
+            .unwrap(),
+        111
+    );
+
+    // Generated ref setter: repoint to `c` (a ref owns nothing, so nothing frees).
+    holder
+        .handle()
+        .set_target(stack, unsafe { BStackRef::from_range(c.handle().range()) })
+        .unwrap();
+    assert_eq!(
+        holder
+            .handle()
+            .get_target(stack)
+            .unwrap()
+            .get_val(stack)
+            .unwrap(),
+        222
+    );
+
+    // Both targets are still independently live (the ref borrowed them).
+    holder.bstack_drop(&alloc).unwrap();
+    assert_eq!(a.handle().get_val(stack).unwrap(), 111);
+    assert_eq!(c.handle().get_val(stack).unwrap(), 222);
+    a.bstack_drop(&alloc).unwrap();
+    c.bstack_drop(&alloc).unwrap();
+}
