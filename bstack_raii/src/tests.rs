@@ -2599,6 +2599,62 @@ fn wal_finish_reclaims_abandoned_allocs() {
     assert_eq!(finish(&alloc).unwrap(), 0);
 }
 
+#[test]
+fn wal_finish_reclaims_foreign_orphan_via_registry() {
+    // Option-1 cross-file reclamation: the WAL lives on the op's HOME file, but a
+    // recorded slice can name a FOREIGN file (`file_id != 0`). Recovery resolves that
+    // id through the process-wide registry and frees the orphan on the other side.
+    // This is the only test that uses the global registry — `finish`'s recovery path
+    // (`free_recorded`) resolves foreign frees through it, exactly as real teardown /
+    // clone will.
+    use crate::registry;
+    use crate::wal::{finish, persist_at};
+    use crate::{WalEntry, WalLog, WalStatus};
+
+    // The op's home file (where the WAL is staged) and a separate foreign file.
+    let home = TempStack::new();
+    let home_alloc = home.allocator();
+
+    let foreign = TempStack::new();
+    let foreign_alloc = foreign.allocator();
+    // An orphan a crashed cross-file op left behind in the foreign file.
+    let orphan = foreign_alloc.alloc(64).unwrap().as_range();
+
+    // Bring up the global registry and attach the foreign file, learning its id.
+    // Tolerant of a prior init (only this test touches the singleton).
+    let reg_file = TempStack::new();
+    let _ = registry::init(&reg_file.path);
+    let fid = registry::attach(&foreign.path, foreign_alloc).unwrap();
+    assert!(!fid.is_self());
+
+    // A COMMITTED cross-file free staged in the HOME file's WAL: a `Dealloc` tagged
+    // with the foreign file's id (the option-1 shape).
+    let mut log = WalLog::with_capacity(1);
+    log.append(WalEntry::dealloc_in(WalStatus::Pending, fid, orphan));
+    persist_at(&home_alloc, &log, WalStatus::Complete).unwrap();
+
+    // Completing the home WAL rolls the foreign free forward *in the foreign file*.
+    assert_eq!(finish(&home_alloc).unwrap(), 1);
+
+    // Reclaim confirmed on the foreign side: a fresh 64-byte alloc reuses the slot.
+    let reused = registry::with_host(fid, |host| host.alloc(64).unwrap().start()).unwrap();
+    assert_eq!(reused, orphan.start());
+
+    // An unresolvable foreign entry (file detached) degrades to a leak, not an error.
+    let orphan2 = registry::with_host(fid, |host| host.alloc(64).unwrap().start()).unwrap();
+    registry::detach(fid);
+    let mut log2 = WalLog::with_capacity(1);
+    log2.append(WalEntry::dealloc_in(
+        WalStatus::Pending,
+        fid,
+        BStackRange::new(orphan2, 64),
+    ));
+    persist_at(&home_alloc, &log2, WalStatus::Complete).unwrap();
+    // The detached file can't be freed here — `finish` completes the entry (leaking
+    // it) and returns success, counting it as handled rather than erroring.
+    assert_eq!(finish(&home_alloc).unwrap(), 1);
+}
+
 // --------------------------------------------------------------------------
 // Inline fixed-size arrays [T; N]
 // --------------------------------------------------------------------------

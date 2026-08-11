@@ -33,7 +33,11 @@
 //! An operation is thus `(slice, Alloc|Dealloc) × Status`, and the WAL is the
 //! functor `wal_append` mapping operations into disk state ([`WalLog`]). On disk
 //! **both** an `Alloc` and a `Dealloc` store their slice `S = (ptr, len)`; the
-//! `op` marks the *recovery polarity* (which outcome orphans the slice).
+//! `op` marks the *recovery polarity* (which outcome orphans the slice). Each slice
+//! also carries a **file identity** (`file_id`): `0` = the WAL's own file
+//! ([`FileId::SELF`](crate::registry::FileId::SELF), the common case), non-zero = a
+//! foreign file whose orphan is reclaimed through the [registry](crate::registry) on
+//! recovery — the on-disk half of the cross-file (`Foreign<T>`) atomicity story.
 //! ([`AllocReq`] / [`reduce`] are the pre-allocation planning form, `R' = (id,
 //! len)`, used before an address exists.)
 //!
@@ -57,15 +61,29 @@ use bstack::{BStackAllocator, BStackOwnedSliceAllocator, BStackRange};
 use bytemuck::{Pod, Zeroable};
 
 use crate::BStackRaiiAllocator;
+use crate::registry::{self, FileId, ForeignHost};
 use crate::teardown::dealloc_range;
 
 /// `R'`: an allocation requirement carrying identity — a length whose address has
 /// been "forgotten", plus an `id` that keeps equal-length requirements distinct.
 /// The `id` is a wrapping autoincrement (see [`WalLog::fresh_id`]).
+///
+/// `file_id` names the file the allocation targets — `0` = the local file
+/// ([`FileId::SELF`], the common case), non-zero = a foreign file. [`reduce`] only
+/// repurposes a freed slice for a requirement in the **same** file, so a foreign
+/// requirement never reuses local storage (or vice versa).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AllocReq {
     pub id: u64,
     pub len: u64,
+    /// Target file: `0` = local ([`FileId::SELF`]), non-zero = a foreign [`FileId`]
+    /// (a `FileId` *is* a `u32`). Split from `_obj_id` to mirror [`WalEntry`]'s
+    /// on-disk `(file_id, _obj_id)` word, so the planning form and the log form share
+    /// one file-identity shape.
+    pub file_id: u32,
+    /// Reserved companion to `file_id` (a future intra-file object id / RTTI);
+    /// currently always `0` and unused, mirroring [`WalEntry`].
+    pub _obj_id: u32,
 }
 
 /// The status lifecycle of a WAL operation: the ordered set
@@ -128,17 +146,32 @@ impl WalOp {
     }
 }
 
-/// One on-disk WAL entry: `(status, op, payload)`.
+/// One on-disk WAL entry: `(status, op, file_id, payload)`.
 ///
 /// `status` and `op` are **separate** fields — never packed into one byte. The two
 /// payload words are `R' = (id, len)` for an [`Alloc`](WalOp::Alloc) and
-/// `S = (ptr, len)` for a [`Dealloc`](WalOp::Dealloc). 24 bytes, 8-aligned, `Pod`.
+/// `S = (ptr, len)` for a [`Dealloc`](WalOp::Dealloc). `file_id` names the file the
+/// slice lives in — `0` = the WAL's own file ([`FileId::SELF`], the common case),
+/// non-zero = a foreign [`FileId`] reclaimed through the [registry](crate::registry)
+/// on recovery. 32 bytes, 8-aligned, `Pod`.
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 #[repr(C)]
 pub struct WalEntry {
     status: u8,
     op: u8,
     _pad: [u8; 6],
+    /// The file the recorded slice lives in: `0` = this file ([`FileId::SELF`]),
+    /// non-zero = a foreign [`FileId`] resolved through the registry on recovery.
+    ///
+    /// A `u32` (a [`FileId`] *is* a `u32`) paired with the reserved `_obj_id` word
+    /// below, so the two together fill the same 8 bytes the field used to be a single
+    /// `u64`. On little-endian `file_id` keeps its offset (it was the `u64`'s low
+    /// word), so the on-disk image is unchanged.
+    file_id: u32,
+    /// Reserved for a future intra-file object id (e.g. RTTI / sub-object
+    /// addressing). Currently always `0` and unread — split out now so the split is
+    /// a no-op on disk rather than a later breaking widening.
+    _obj_id: u32,
     /// `Alloc`: requirement `id`. `Dealloc`: slice `ptr` (start offset).
     word_a: u64,
     /// `Alloc` / `Dealloc`: `len`.
@@ -146,25 +179,44 @@ pub struct WalEntry {
 }
 
 impl WalEntry {
-    /// An `Alloc` entry recording a freshly allocated slice `S = (ptr, len)`.
-    /// Recovery frees it iff the transaction is **abandoned** (the block is an
-    /// orphan of a crashed op); a committed transaction keeps it.
+    /// An `Alloc` entry recording a freshly allocated **local** slice `S = (ptr, len)`
+    /// (`file_id 0`, [`FileId::SELF`]). Recovery frees it iff the transaction is
+    /// **abandoned** (the block is an orphan of a crashed op); a committed
+    /// transaction keeps it. See [`alloc_in`](Self::alloc_in) for a foreign slice.
     pub fn alloc(status: WalStatus, slice: BStackRange) -> Self {
+        Self::alloc_in(status, FileId::SELF, slice)
+    }
+
+    /// An `Alloc` entry for a slice in file `file` (foreign-aware). `file = `
+    /// [`FileId::SELF`] is the WAL's own file; any other id names a foreign file
+    /// whose orphan is reclaimed through the [registry](crate::registry) on recovery.
+    pub fn alloc_in(status: WalStatus, file: FileId, slice: BStackRange) -> Self {
         WalEntry {
             status: status as u8,
             op: WalOp::Alloc as u8,
             _pad: [0; 6],
+            file_id: file.get(),
+            _obj_id: 0,
             word_a: slice.start(),
             word_b: slice.len(),
         }
     }
 
-    /// A `Dealloc` entry recording a concrete slice `S = (ptr, len)`.
+    /// A `Dealloc` entry recording a concrete **local** slice `S = (ptr, len)`
+    /// (`file_id 0`, [`FileId::SELF`]). See [`dealloc_in`](Self::dealloc_in) for a
+    /// slice in a foreign file.
     pub fn dealloc(status: WalStatus, slice: BStackRange) -> Self {
+        Self::dealloc_in(status, FileId::SELF, slice)
+    }
+
+    /// A `Dealloc` entry for a slice in file `file` (foreign-aware).
+    pub fn dealloc_in(status: WalStatus, file: FileId, slice: BStackRange) -> Self {
         WalEntry {
             status: status as u8,
             op: WalOp::Dealloc as u8,
             _pad: [0; 6],
+            file_id: file.get(),
+            _obj_id: 0,
             word_a: slice.start(),
             word_b: slice.len(),
         }
@@ -176,6 +228,14 @@ impl WalEntry {
 
     pub fn op(&self) -> WalOp {
         WalOp::from_u8(self.op)
+    }
+
+    /// The file the recorded slice lives in: `0` = this file ([`FileId::SELF`]),
+    /// non-zero = a foreign [`FileId`] reclaimed through the registry on recovery.
+    /// Widened to `u64` for the recovery path (`FileId::from_u64`); the stored field
+    /// is a `u32`.
+    pub fn file_id(&self) -> u64 {
+        self.file_id as u64
     }
 
     pub fn set_status(&mut self, status: WalStatus) {
@@ -265,23 +325,30 @@ impl WalLog {
 #[derive(Debug, Default)]
 pub struct Reduced {
     /// `(requirement, repurposed slice)` — no physical alloc *or* dealloc needed.
+    /// The slice lives in `requirement.file_id` (reuse is always same-file).
     pub reused: Vec<(AllocReq, BStackRange)>,
     /// Requirements still needing a physical `Alloc`.
     pub allocs: Vec<AllocReq>,
-    /// Slices still needing a physical `Dealloc`.
-    pub deallocs: Vec<BStackRange>,
+    /// Slices still needing a physical `Dealloc`, each tagged with the file it lives
+    /// in (`0` = local [`FileId::SELF`], non-zero = a foreign [`FileId`], a `u32`).
+    pub deallocs: Vec<(u32, BStackRange)>,
 }
 
 /// The groupoid reduction: cancel each allocation requirement against a to-be-freed
-/// slice of **equal length**, handing that slice's storage straight to the new
-/// allocation (`ForgetAddress ∘ Dealloc ∘ Alloc ∘ Choice = id`). Only the unpaired
-/// remainder becomes physical work.
-pub fn reduce(allocs: Vec<AllocReq>, mut deallocs: Vec<BStackRange>) -> Reduced {
+/// slice **of equal length in the same file**, handing that slice's storage straight
+/// to the new allocation (`ForgetAddress ∘ Dealloc ∘ Alloc ∘ Choice = id`). A slice
+/// in one file can never satisfy a requirement in another (a cross-file `Foreign`
+/// alloc and a local free do not cancel), so the `file_id`s must match. Only the
+/// unpaired remainder becomes physical work.
+pub fn reduce(allocs: Vec<AllocReq>, mut deallocs: Vec<(u32, BStackRange)>) -> Reduced {
     let mut reused = Vec::new();
     let mut rem_allocs = Vec::new();
     for req in allocs {
-        if let Some(pos) = deallocs.iter().position(|d| d.len() == req.len) {
-            reused.push((req, deallocs.remove(pos)));
+        if let Some(pos) = deallocs
+            .iter()
+            .position(|(fid, d)| *fid == req.file_id && d.len() == req.len)
+        {
+            reused.push((req, deallocs.remove(pos).1));
         } else {
             rem_allocs.push(req);
         }
@@ -542,6 +609,35 @@ pub(crate) fn wal_set_idle<A: BStackRaiiAllocator>(
         .set(block_off + 8, [WalStatus::None as u8])
 }
 
+/// Free one WAL-recorded slice during recovery, in whichever file it lives in.
+///
+/// * `file_id == 0` ([`FileId::SELF`]) — the WAL's own file: free through the local
+///   `allocator` (the overwhelmingly common path).
+/// * `file_id != 0` — a foreign file: resolve it through the [registry](crate::registry)
+///   and free via its live [`ForeignHost`]. If that file is **not currently attached**
+///   (or the registry is not up), the orphan cannot be reclaimed here — it is *left to
+///   leak*, which the crate's atomicity contract explicitly permits (a cross-file
+///   orphan whose file is unavailable at recovery degrades to a leak, exactly as if
+///   the WAL did not cover it). A malformed id is likewise ignored (leak, not error).
+///
+/// Errors only propagate a genuine I/O failure from an *attempted* free.
+fn free_recorded<A: BStackRaiiAllocator>(
+    allocator: &A,
+    file_id: u64,
+    slice: BStackRange,
+) -> io::Result<()> {
+    if file_id == 0 {
+        return unsafe { dealloc_range(allocator, slice) };
+    }
+    let Some(id) = FileId::from_u64(file_id) else {
+        return Ok(()); // malformed id: cannot resolve → leak (permitted)
+    };
+    match registry::with_host(id, |host| unsafe { host.dealloc(slice) }) {
+        Some(res) => res.map_err(|e| e.source),
+        None => Ok(()), // file not attached / registry down → leak (permitted)
+    }
+}
+
 /// **Complete** the allocator's staged transaction by reclaiming exactly the
 /// slices its outcome orphaned, then marking the block idle. Assumes the file's
 /// WAL lock is already held (used on the failure/recovery paths that run under the
@@ -586,7 +682,7 @@ pub(crate) fn finish_at_locked<A: BStackRaiiAllocator>(allocator: &A) -> io::Res
             // so a second crash can't double-free it.
             let entry_off = base + (i * size_of::<WalEntry>()) as u64;
             stack.set(entry_off, [WalStatus::Complete as u8])?;
-            unsafe { dealloc_range(allocator, slice)? };
+            free_recorded(allocator, e.file_id(), slice)?;
             completed += 1;
         }
     }
@@ -632,30 +728,51 @@ mod tests {
         assert_eq!(a.status(), WalStatus::Pending);
         assert_eq!(a.as_alloc(), Some(BStackRange::new(0x1000, 256)));
         assert_eq!(a.as_dealloc(), None);
+        assert_eq!(a.file_id(), 0); // local convenience ctor ⇒ SELF
 
         let d = WalEntry::dealloc(WalStatus::Complete, BStackRange::new(0x6CD4, 256));
         assert_eq!(d.op(), WalOp::Dealloc);
         assert_eq!(d.as_dealloc(), Some(BStackRange::new(0x6CD4, 256)));
         assert_eq!(d.as_alloc(), None);
+        assert_eq!(d.file_id(), 0);
+
+        // Foreign-aware ctors carry the file id.
+        let fa = WalEntry::alloc_in(
+            WalStatus::Pending,
+            FileId::from_u64(7).unwrap(),
+            BStackRange::new(0x20, 48),
+        );
+        assert_eq!(fa.file_id(), 7);
+        assert_eq!(fa.as_alloc(), Some(BStackRange::new(0x20, 48)));
+        let fd = WalEntry::dealloc_in(
+            WalStatus::Pending,
+            FileId::from_u64(3).unwrap(),
+            BStackRange::new(0x40, 16),
+        );
+        assert_eq!(fd.file_id(), 3);
+        assert_eq!(fd.as_dealloc(), Some(BStackRange::new(0x40, 16)));
     }
 
     #[test]
-    fn wal_entry_is_24_bytes_and_pod_roundtrips() {
-        assert_eq!(size_of::<WalEntry>(), 24);
+    fn wal_entry_is_32_bytes_and_pod_roundtrips() {
+        assert_eq!(size_of::<WalEntry>(), 32);
         let mut log = WalLog::with_capacity(2);
         log.append(WalEntry::alloc(
             WalStatus::Pending,
             BStackRange::new(8192, 64),
         ));
-        log.append(WalEntry::dealloc(
+        log.append(WalEntry::dealloc_in(
             WalStatus::Pending,
+            FileId::from_u64(9).unwrap(),
             BStackRange::new(4096, 64),
         ));
         let bytes = log.as_bytes().to_vec();
         let back = WalLog::entries_from_bytes(&bytes);
         assert_eq!(back.len(), 2);
         assert_eq!(back[0].as_alloc(), Some(BStackRange::new(8192, 64)));
+        assert_eq!(back[0].file_id(), 0);
         assert_eq!(back[1].as_dealloc(), Some(BStackRange::new(4096, 64)));
+        assert_eq!(back[1].file_id(), 9); // file id survives the on-disk round trip
     }
 
     #[test]
@@ -671,20 +788,71 @@ mod tests {
     #[test]
     fn reduce_cancels_equal_length_pairs() {
         // (Alloc 256, Alloc 600, Dealloc 256) → reuse the 256 slice, Alloc 600 left.
-        let allocs = vec![AllocReq { id: 0, len: 256 }, AllocReq { id: 1, len: 600 }];
-        let deallocs = vec![BStackRange::new(0x1FF0, 256)];
+        let allocs = vec![
+            AllocReq {
+                id: 0,
+                len: 256,
+                file_id: 0,
+                _obj_id: 0,
+            },
+            AllocReq {
+                id: 1,
+                len: 600,
+                file_id: 0,
+                _obj_id: 0,
+            },
+        ];
+        let deallocs = vec![(0, BStackRange::new(0x1FF0, 256))];
         let r = reduce(allocs, deallocs);
         assert_eq!(r.reused.len(), 1);
-        assert_eq!(r.reused[0].0, AllocReq { id: 0, len: 256 });
+        assert_eq!(
+            r.reused[0].0,
+            AllocReq {
+                id: 0,
+                len: 256,
+                file_id: 0,
+                _obj_id: 0,
+            }
+        );
         assert_eq!(r.reused[0].1, BStackRange::new(0x1FF0, 256));
-        assert_eq!(r.allocs, vec![AllocReq { id: 1, len: 600 }]);
+        assert_eq!(
+            r.allocs,
+            vec![AllocReq {
+                id: 1,
+                len: 600,
+                file_id: 0,
+                _obj_id: 0,
+            }]
+        );
         assert!(r.deallocs.is_empty());
     }
 
     #[test]
     fn reduce_leaves_unpaired_on_both_sides() {
-        let allocs = vec![AllocReq { id: 0, len: 100 }];
-        let deallocs = vec![BStackRange::new(8, 200)];
+        let allocs = vec![AllocReq {
+            id: 0,
+            len: 100,
+            file_id: 0,
+            _obj_id: 0,
+        }];
+        let deallocs = vec![(0, BStackRange::new(8, 200))];
+        let r = reduce(allocs, deallocs);
+        assert!(r.reused.is_empty());
+        assert_eq!(r.allocs.len(), 1);
+        assert_eq!(r.deallocs.len(), 1);
+    }
+
+    #[test]
+    fn reduce_does_not_cancel_across_files() {
+        // Same length, different file ⇒ no reuse (a foreign alloc can't repurpose a
+        // local free, and vice versa): both sides remain as physical work.
+        let allocs = vec![AllocReq {
+            id: 0,
+            len: 128,
+            file_id: 4,
+            _obj_id: 0,
+        }];
+        let deallocs = vec![(0, BStackRange::new(0x100, 128))];
         let r = reduce(allocs, deallocs);
         assert!(r.reused.is_empty());
         assert_eq!(r.allocs.len(), 1);
