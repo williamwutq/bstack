@@ -7014,3 +7014,51 @@ fn macro_foreign_field() {
     );
     h2.bstack_drop(&local).unwrap();
 }
+
+#[test]
+fn foreign_reverse_map_and_bstack_cast() {
+    use crate::registry::{FileId, FileRegistry};
+    use crate::{BStackRef, Foreign};
+    use bstack::BStackSlice;
+    use std::sync::Arc;
+
+    let reg_file = TempStack::new();
+    let foreign_file = TempStack::new();
+    let local_file = TempStack::new();
+
+    let reg = FileRegistry::open(&reg_file.path).unwrap();
+
+    let foreign_alloc = foreign_file.allocator();
+    let leaf = MacroLeaf::new(&foreign_alloc, 3).unwrap();
+    let off = leaf.handle().range().start();
+    let id = reg
+        .attach(&foreign_file.path, Arc::new(foreign_alloc))
+        .unwrap();
+
+    // Reverse map: a live host's stack resolves back to its FileId.
+    assert_eq!(
+        reg.with_host(id, |host| reg.id_of_host(host.stack())),
+        Some(Some(id))
+    );
+
+    // foreign -> normal (`bstack_cast!(foreign as BStackRef<T>)`): a SELF pointer is
+    // always resolvable-in-place; a foreign id is None here (the GLOBAL registry
+    // that `as_local_ref` consults is uninitialized in tests).
+    let selfp = Foreign::<MacroLeaf>::new(FileId::SELF, off);
+    let r: Option<BStackRef<MacroLeaf>> = bstack_cast!(selfp as BStackRef<MacroLeaf>);
+    assert!(r.is_some());
+    assert!(Foreign::<MacroLeaf>::new(id, off).as_local_ref().is_none());
+
+    // normal -> foreign (`bstack_cast!(slice as Foreign<T>)`): needs the GLOBAL
+    // registry (uninitialized in tests) → None, but the macro arm type-checks.
+    let la = local_file.allocator();
+    let s = la.alloc(16).unwrap().as_range();
+    let slice = unsafe { BStackSlice::from_raw_range(la.stack(), s) };
+    let f: Option<Foreign<MacroLeaf>> = bstack_cast!(slice as Foreign<MacroLeaf>);
+    assert!(f.is_none());
+
+    // Detach prunes the reverse-map entry.
+    reg.detach(id);
+    assert!(!reg.is_live(id));
+    assert_eq!(reg.id_of_host(la.stack()), None);
+}

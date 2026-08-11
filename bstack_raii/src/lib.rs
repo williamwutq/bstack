@@ -76,10 +76,10 @@ pub use block::{
 pub use bulk::{alloc_many, free_many};
 pub use cast::{BStackCastAs, BStackCastInto};
 pub use clone::{ClonePlan, TryClone, TryCloneIn};
-pub use foreign::{Foreign, ForeignPtr};
 pub use construct::{
     alloc_block, alloc_control, build_control_payload, init_rc, set_weak_field, upgrade_weak_field,
 };
+pub use foreign::{Foreign, ForeignPtr};
 pub use handle::{OwnedRef, StrongRef, StrongWeakRef, WeakRef};
 pub use layout::{BlockHeader, EightCC, get_u64};
 pub use owned::BStackOwned;

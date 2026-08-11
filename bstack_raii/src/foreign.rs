@@ -21,10 +21,11 @@
 
 use core::marker::PhantomData;
 
-use bstack::{BStack, BStackAllocator, BStackRange};
+use bstack::{BStack, BStackAllocator, BStackRange, BStackSlice};
 use bytemuck::{Pod, Zeroable};
 
 use crate::block::BStackBlock;
+use crate::reference::BStackRef;
 use crate::registry::{self, FileId, FileRegistry};
 
 /// The on-disk form of a [`Foreign`] pointer: a file identity plus an offset in
@@ -120,10 +121,7 @@ impl<T: BStackBlock> Foreign<T> {
 
     /// The target's range in its file (`offset` + `size_of::<T::OnDisk>()`).
     pub fn range(self) -> BStackRange {
-        BStackRange::new(
-            self.ptr.offset,
-            core::mem::size_of::<T::OnDisk>() as u64,
-        )
+        BStackRange::new(self.ptr.offset, core::mem::size_of::<T::OnDisk>() as u64)
     }
 
     /// Resolve the pointer and run `f` with a `T` handle at the target plus the
@@ -146,6 +144,30 @@ impl<T: BStackBlock> Foreign<T> {
             let id = FileId::from_u64(self.ptr.file_id)?;
             registry::with_host(id, |host| f(t, host.stack()))
         }
+    }
+
+    /// **normal → foreign** (`bstack_cast!(slice as Foreign<T>)`): name the block a
+    /// `BStackSlice` points at as a `Foreign`, resolving the slice's file to its
+    /// [`FileId`] via the registry's reverse map. `None` if that file is not
+    /// currently attached (so it has no id to name). Does no I/O.
+    pub fn from_local(slice: &BStackSlice<'_>) -> Option<Self> {
+        let id = registry::id_of_host(slice.stack())?;
+        Some(Self::new(id, slice.start()))
+    }
+
+    /// **foreign → normal** (`bstack_cast!(foreign as BStackRef<T>)`): the offset-only
+    /// [`BStackRef`] to the target, valid **in the target's own file**. `Some` iff
+    /// that file is [`SELF`](FileId::SELF) or currently attached (so the ref is
+    /// resolvable); `None` otherwise. Does no I/O — pair the ref with the target
+    /// file's stack (e.g. via [`with`](Self::with)) to read it.
+    pub fn as_local_ref(self) -> Option<BStackRef<T>> {
+        let resolvable = self.ptr.file_id == 0
+            || FileId::from_u64(self.ptr.file_id)
+                .and_then(|id| registry::get().map(|r| r.is_live(id)))
+                .unwrap_or(false);
+        // SAFETY: `range()` is this pointer's target region; the returned ref is a
+        // plain offset handle (no aliasing/liveness claim beyond the caller's).
+        resolvable.then(|| unsafe { BStackRef::from_range(self.range()) })
     }
 
     /// Like [`with`](Self::with) but against an explicit `registry` — crate-internal,

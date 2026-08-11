@@ -46,6 +46,15 @@ pub fn expand(input: TokenStream) -> syn::Result<TokenStream> {
             let inner = first_type_arg(seg)?;
             quote!(::bstack_raii::BStackCastInto::cast_into::<#inner>(#expr))
         }
+        // normal → foreign: a `BStackSlice` into some registered file → `Foreign<T>`
+        // naming it (`None` if the file isn't attached). No I/O.
+        "Foreign" => {
+            let inner = first_type_arg(seg)?;
+            quote!(::bstack_raii::Foreign::<#inner>::from_local(&#expr))
+        }
+        // foreign → normal: a `Foreign<T>` → its offset-only `BStackRef<T>` in the
+        // target file (`None` unless that file is `SELF`/attached). No I/O.
+        "BStackRef" => quote!((#expr).as_local_ref()),
         // A concrete block type: borrowed downcast off a `BStackSlice`.
         _ => quote!(::bstack_raii::BStackCastAs::cast_as::<#ty>(&#expr)),
     };
