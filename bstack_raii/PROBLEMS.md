@@ -42,11 +42,13 @@ omitted except where trivial.
   a fresh 8-byte heap `Vec<u8>` to feed the `set_batched` / `ClonePlan::write`
   batch APIs (dozens per operation in `list`/`deque`/`map`). A small-buffer /
   inline representation for batch entries would remove most of these allocations.
-- **Stale crate-level docs** ([lib.rs](src/lib.rs) module comment): "Status:
+- [FIXED] **Stale crate-level docs** ([lib.rs](src/lib.rs) module comment): "Status:
   method bodies marked `todo!()` are the work ahead" and "procedural macros come
   after the runtime is filled in" describe a half-built crate; it is now
   feature-complete. The module-map table also omits `construct`, `vec`, `wal`,
-  `registry`, `foreign`, `stdlib`, `bulk`, `cast`, `replace`.
+  `registry`, `foreign`, `stdlib`, `bulk`, `cast`, `replace`. Status rewritten to
+  reflect feature-completeness (naming the one real open gap, `Foreign<T>`
+  cross-file teardown/deep-clone); module-map table now lists all 18 modules.
 
 ## 3. Atomicity / crash safety
 
