@@ -95,15 +95,17 @@ fn main() -> io::Result<()> {
 
     // Resolve the foreign pointer and read the far-side document. `with` takes
     // the *local* allocator (used only for a same-file `Foreign`) and a closure
-    // run against the target and its file's stack; it returns `None` if the
-    // target file is not currently live.
+    // run against the target and its file's stack. It returns `Ok(None)` for a
+    // null pointer (not this field — it's `#[bstack_owned]`, never null) and
+    // `Err` if the target file isn't currently attached — propagate that with
+    // `?`, same as any other I/O failure.
     let (size, sum) = card
         .handle()
         .get_body(catalog.stack())?
         .with(&catalog, |d, fs| {
             (d.get_size(fs).unwrap(), d.get_checksum(fs).unwrap())
-        })
-        .expect("store is live");
+        })?
+        .expect("owned Foreign is never null");
     println!("card 'annual-report' -> document size {size}, checksum {sum:#x}");
 
     // Deep-clone the card. The clone gets its *own* fresh copy of the document,
@@ -129,7 +131,11 @@ fn main() -> io::Result<()> {
         .handle()
         .get_parts(&catalog)?
         .into_iter()
-        .map(|f| f.with(&catalog, |d, fs| d.get_size(fs).unwrap()).unwrap())
+        .map(|f| {
+            f.with(&catalog, |d, fs| d.get_size(fs).unwrap())
+                .unwrap()
+                .expect("owned Foreign is never null")
+        })
         .collect();
     println!(
         "bundle 'q3-batch' -> {} documents, sizes {bundle_sizes:?}",

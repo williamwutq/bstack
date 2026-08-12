@@ -136,23 +136,37 @@ impl<T: BStackBlock> Foreign<T> {
     /// Resolve the pointer and run `f` with a `T` handle at the target plus the
     /// [`BStack`] of the file it lives in.
     ///
-    /// There is exactly one registry — the process-wide one ([`crate::registry`]) —
-    /// so resolution never takes a registry argument: a `Foreign` (e.g. one moved
-    /// out via `bstack_move!`) is always resolvable on its own. [`SELF`](FileId::SELF)
-    /// resolves against `local` directly (no registry, no lock); a foreign id
-    /// resolves via the global registry, yielding `None` if it is uninitialized, or
-    /// the target file is unknown / not currently attached / the id is malformed.
-    pub fn with<A, R>(self, local: &A, f: impl FnOnce(T, &BStack) -> R) -> Option<R>
+    /// The two failure modes are kept apart rather than conflated into one
+    /// `Option`: `Ok(None)` is the [null niche](self) (`offset == 0`, a genuinely
+    /// absent pointer — not an error, same as reading a null `#[bstack_ref]`
+    /// field); `Err` is an I/O-shaped [`io::ErrorKind::NotFound`] meaning the
+    /// pointer is non-null but its target file can't currently be reached (a
+    /// malformed / out-of-range file id, or a file that is unknown / not
+    /// currently attached to the [registry](crate::registry)).
+    ///
+    /// There is exactly one registry — the process-wide one — so resolution never
+    /// takes a registry argument: a `Foreign` (e.g. one moved out via
+    /// `bstack_move!`) is always resolvable on its own. [`SELF`](FileId::SELF)
+    /// resolves against `local` directly (no registry, no lock).
+    pub fn with<A, R>(self, local: &A, f: impl FnOnce(T, &BStack) -> R) -> io::Result<Option<R>>
     where
         A: BStackAllocator,
     {
+        if self.ptr.offset == 0 {
+            return Ok(None);
+        }
         let t = T::from_range(self.range());
         if self.ptr.file_id == 0 {
-            Some(f(t, local.stack()))
-        } else {
-            let id = FileId::from_u64(self.ptr.file_id)?;
-            registry::with_host(id, |host| f(t, host.stack()))
+            return Ok(Some(f(t, local.stack())));
         }
+        let id = FileId::from_u64(self.ptr.file_id).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "Foreign: file id out of range")
+        })?;
+        registry::with_host(id, |host| f(t, host.stack()))
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "Foreign: target file not attached")
+            })
+            .map(Some)
     }
 
     /// **normal → foreign** (`bstack_cast!(slice as Foreign<T>)`): name the block a
@@ -188,17 +202,26 @@ impl<T: BStackBlock> Foreign<T> {
         registry: &FileRegistry,
         local: &A,
         f: impl FnOnce(T, &BStack) -> R,
-    ) -> Option<R>
+    ) -> io::Result<Option<R>>
     where
         A: BStackAllocator,
     {
+        if self.ptr.offset == 0 {
+            return Ok(None);
+        }
         let t = T::from_range(self.range());
         if self.ptr.file_id == 0 {
-            Some(f(t, local.stack()))
-        } else {
-            let id = FileId::from_u64(self.ptr.file_id)?;
-            registry.with_host(id, |host| f(t, host.stack()))
+            return Ok(Some(f(t, local.stack())));
         }
+        let id = FileId::from_u64(self.ptr.file_id).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "Foreign: file id out of range")
+        })?;
+        registry
+            .with_host(id, |host| f(t, host.stack()))
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "Foreign: target file not attached")
+            })
+            .map(Some)
     }
 }
 

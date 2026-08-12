@@ -894,9 +894,12 @@ struct Card {
 let card = Card::new(&catalog, "report", Foreign::<Document>::new(store_id, doc_off))?;
 
 // … and resolve it to read across the boundary. `with` runs a closure against
-// the target and *its* file's stack, returning `None` if that file isn't live.
+// the target and *its* file's stack: `Ok(None)` for a null pointer, `Err` if
+// that file isn't currently live — the two failure modes are kept apart rather
+// than conflated into one `Option`.
 let size = card.handle().get_body(catalog.stack())?
-    .with(&catalog, |doc, fs| doc.get_size(fs).unwrap());   // Option<u64>
+    .with(&catalog, |doc, fs| doc.get_size(fs).unwrap())?  // io::Result<Option<u64>>
+    .expect("owned Foreign is never null");
 ```
 
 The annotation decides what teardown and clone do **in the target's own file**:

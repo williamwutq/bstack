@@ -7160,15 +7160,18 @@ fn foreign_resolves_across_files_and_self() {
     // A Foreign pointing at that leaf resolves + reads through the registry.
     let fp = Foreign::<MacroLeaf>::new(id, off);
     assert_eq!(
-        fp.with_in(&reg, &local, |t, stack| t.get_val(stack).unwrap()),
+        fp.with_in(&reg, &local, |t, stack| t.get_val(stack).unwrap())
+            .unwrap(),
         Some(77)
     );
 
-    // Detaching the host makes resolution fail (None), not panic.
+    // Detaching the host makes resolution fail (not-attached I/O error), not panic.
     reg.detach(id);
     assert_eq!(
-        fp.with_in(&reg, &local, |t, stack| t.get_val(stack).unwrap()),
-        None
+        fp.with_in(&reg, &local, |t, stack| t.get_val(stack).unwrap())
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::NotFound
     );
 
     // SELF resolves against `local` directly — no registry entry needed.
@@ -7176,7 +7179,9 @@ fn foreign_resolves_across_files_and_self() {
     let selfp = Foreign::<MacroLeaf>::new(FileId::SELF, lleaf.handle().range().start());
     assert!(selfp.is_self());
     assert_eq!(
-        selfp.with_in(&reg, &local, |t, stack| t.get_val(stack).unwrap()),
+        selfp
+            .with_in(&reg, &local, |t, stack| t.get_val(stack).unwrap())
+            .unwrap(),
         Some(9)
     );
     lleaf.bstack_drop(&local).unwrap();
@@ -7223,7 +7228,8 @@ fn macro_foreign_field() {
         h.handle()
             .get_owned_link(stack)
             .unwrap()
-            .with_in(&reg, &local, |t, fs| t.get_val(fs).unwrap()),
+            .with_in(&reg, &local, |t, fs| t.get_val(fs).unwrap())
+            .unwrap(),
         Some(88)
     );
     assert!(h.handle().get_maybe(stack).unwrap().is_none()); // the `None` niche
@@ -7238,7 +7244,8 @@ fn macro_foreign_field() {
     .unwrap();
     let m = h2.handle().get_maybe(stack).unwrap().expect("Some link");
     assert_eq!(
-        m.with_in(&reg, &local, |t, fs| t.get_val(fs).unwrap()),
+        m.with_in(&reg, &local, |t, fs| t.get_val(fs).unwrap())
+            .unwrap(),
         Some(88)
     );
 
@@ -7703,6 +7710,7 @@ fn macro_foreign_owned_clone_deep_copies_across_files() {
     assert_eq!(
         clone_link
             .with(&home_alloc, |t, fs| t.get_val(fs).unwrap())
+            .unwrap()
             .unwrap(),
         42
     );
@@ -8015,7 +8023,9 @@ fn macro_foreign_vec_owned_across_files() {
     assert_eq!(got.len(), N as usize);
     for (i, f) in got.iter().enumerate() {
         assert_eq!(
-            f.with(&home_alloc, |t, fs| t.get_val(fs).unwrap()).unwrap(),
+            f.with(&home_alloc, |t, fs| t.get_val(fs).unwrap())
+                .unwrap()
+                .unwrap(),
             100 + i as u32
         );
     }
@@ -8028,8 +8038,12 @@ fn macro_foreign_vec_owned_across_files() {
     for (o, n) in got.iter().zip(clinks.iter()) {
         assert_ne!(o.offset(), n.offset(), "each element must be a fresh copy");
         assert_eq!(
-            n.with(&home_alloc, |t, fs| t.get_val(fs).unwrap()).unwrap(),
-            o.with(&home_alloc, |t, fs| t.get_val(fs).unwrap()).unwrap()
+            n.with(&home_alloc, |t, fs| t.get_val(fs).unwrap())
+                .unwrap()
+                .unwrap(),
+            o.with(&home_alloc, |t, fs| t.get_val(fs).unwrap())
+                .unwrap()
+                .unwrap()
         );
     }
 
@@ -8083,7 +8097,11 @@ fn macro_foreign_array_owned_across_files() {
     let got = h.handle().get_links(hstack).unwrap();
     let vals: Vec<u32> = got
         .iter()
-        .map(|f| f.with(&home_alloc, |t, fs| t.get_val(fs).unwrap()).unwrap())
+        .map(|f| {
+            f.with(&home_alloc, |t, fs| t.get_val(fs).unwrap())
+                .unwrap()
+                .unwrap()
+        })
         .collect();
     assert_eq!(vals, vec![10, 20, 30]);
 
@@ -8095,7 +8113,11 @@ fn macro_foreign_array_owned_across_files() {
     }
     let cvals: Vec<u32> = clinks
         .iter()
-        .map(|f| f.with(&home_alloc, |t, fs| t.get_val(fs).unwrap()).unwrap())
+        .map(|f| {
+            f.with(&home_alloc, |t, fs| t.get_val(fs).unwrap())
+                .unwrap()
+                .unwrap()
+        })
         .collect();
     assert_eq!(cvals, vec![10, 20, 30]);
 
@@ -8210,6 +8232,7 @@ fn macro_foreign_generic_across_files() {
     let link = h.handle().get_link(hstack).unwrap();
     assert_eq!(
         link.with(&home_alloc, |t, fs| t.get_val(fs).unwrap())
+            .unwrap()
             .unwrap(),
         55
     );
@@ -8221,6 +8244,7 @@ fn macro_foreign_generic_across_files() {
     assert_eq!(
         clink
             .with(&home_alloc, |t, fs| t.get_val(fs).unwrap())
+            .unwrap()
             .unwrap(),
         55
     );
@@ -8331,6 +8355,7 @@ fn macro_foreign_vec_of_option_roundtrips() {
         got[0]
             .unwrap()
             .with(&home_alloc, |t, fs| t.get_val(fs).unwrap())
+            .unwrap()
             .unwrap(),
         11
     );
@@ -8338,6 +8363,7 @@ fn macro_foreign_vec_of_option_roundtrips() {
         got[2]
             .unwrap()
             .with(&home_alloc, |t, fs| t.get_val(fs).unwrap())
+            .unwrap()
             .unwrap(),
         22
     );
@@ -8397,7 +8423,9 @@ fn macro_foreign_in_enum_across_files() {
     let off = match e.handle().read(&home_alloc).unwrap() {
         ForeignEnumView::Far(f) => {
             assert_eq!(
-                f.with(&home_alloc, |t, fs| t.get_val(fs).unwrap()).unwrap(),
+                f.with(&home_alloc, |t, fs| t.get_val(fs).unwrap())
+                    .unwrap()
+                    .unwrap(),
                 77
             );
             f.offset()
@@ -8411,7 +8439,9 @@ fn macro_foreign_in_enum_across_files() {
         ForeignEnumView::Far(f) => {
             assert_ne!(f.offset(), off);
             assert_eq!(
-                f.with(&home_alloc, |t, fs| t.get_val(fs).unwrap()).unwrap(),
+                f.with(&home_alloc, |t, fs| t.get_val(fs).unwrap())
+                    .unwrap()
+                    .unwrap(),
                 77
             );
         }
@@ -8457,6 +8487,7 @@ fn macro_foreign_generic_tuple_and_enum() {
     assert_eq!(
         pair.1
             .with(&home_alloc, |x, fs| x.get_val(fs).unwrap())
+            .unwrap()
             .unwrap(),
         11
     );
@@ -8473,7 +8504,9 @@ fn macro_foreign_generic_tuple_and_enum() {
     let off = match e.handle().read(&home_alloc).unwrap() {
         GenForeignEnumView::Far(f) => {
             assert_eq!(
-                f.with(&home_alloc, |x, fs| x.get_val(fs).unwrap()).unwrap(),
+                f.with(&home_alloc, |x, fs| x.get_val(fs).unwrap())
+                    .unwrap()
+                    .unwrap(),
                 22
             );
             f.offset()
@@ -8579,12 +8612,14 @@ fn macro_foreign_tuple_in_enum_variant() {
             assert_eq!(a, 100);
             assert_eq!(
                 f1.with(&home_alloc, |x, fs| x.get_val(fs).unwrap())
+                    .unwrap()
                     .unwrap(),
                 11
             );
             let f2 = f2.expect("Some");
             assert_eq!(
                 f2.with(&home_alloc, |x, fs| x.get_val(fs).unwrap())
+                    .unwrap()
                     .unwrap(),
                 22
             );
@@ -8667,6 +8702,7 @@ fn macro_foreign_enum_container_variants() {
             assert_eq!(v.len(), 3);
             assert_eq!(
                 v[1].with(&home_alloc, |x, fs| x.get_val(fs).unwrap())
+                    .unwrap()
                     .unwrap(),
                 2
             );
@@ -8684,11 +8720,13 @@ fn macro_foreign_enum_container_variants() {
         ForeignContainerEnumView::Fixed(a) => {
             assert_eq!(
                 a[0].with(&home_alloc, |x, fs| x.get_val(fs).unwrap())
+                    .unwrap()
                     .unwrap(),
                 7
             );
             assert_eq!(
                 a[1].with(&home_alloc, |x, fs| x.get_val(fs).unwrap())
+                    .unwrap()
                     .unwrap(),
                 8
             );
@@ -8747,6 +8785,7 @@ fn macro_foreign_in_tuple_across_files() {
     assert_eq!(
         pair.1
             .with(&home_alloc, |t, fs| t.get_val(fs).unwrap())
+            .unwrap()
             .unwrap(),
         11
     );
@@ -8757,6 +8796,7 @@ fn macro_foreign_in_tuple_across_files() {
             .1
             .unwrap()
             .with(&home_alloc, |t, fs| t.get_val(fs).unwrap())
+            .unwrap()
             .unwrap(),
         22
     );
@@ -8769,6 +8809,7 @@ fn macro_foreign_in_tuple_across_files() {
         cpair
             .1
             .with(&home_alloc, |t, fs| t.get_val(fs).unwrap())
+            .unwrap()
             .unwrap(),
         11
     );

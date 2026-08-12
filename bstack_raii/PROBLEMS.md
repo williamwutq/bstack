@@ -145,9 +145,14 @@ Residual points, all *leak-only* (permitted) but worth recording:
   left without `Deref` — like `std::rc::Weak`, it may not observe a live block
   (the target can be gone), so derefing it isn't sound; `upgrade()` to a
   `BStackRc` first, same as `std::rc::Weak`.
-- **`Foreign::with` returns `Option`** (None conflates "null pointer" and "target
+- [FIXED] **`Foreign::with` returns `Option`** (None conflates "null pointer" and "target
   file not attached"); a `Result` (or distinct sentinel) would let callers tell a
-  missing file from a genuinely null `Foreign`.
+  missing file from a genuinely null `Foreign`. Changed `with` (and its
+  crate-internal test twin `with_in`) to `io::Result<Option<R>>`: `Ok(None)` is
+  the null-pointer niche (`offset == 0`), `Err(io::ErrorKind::NotFound)` covers
+  both a malformed/out-of-range file id and a file that isn't currently attached.
+  Updated every call site (~24, mostly `tests.rs` plus `examples/crossfile.rs`)
+  and the README snippet.
 
 ## 8. Performance potentials
 
