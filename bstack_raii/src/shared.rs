@@ -6,6 +6,7 @@
 //! scope exit.
 
 use core::mem::size_of;
+use core::ops::Deref;
 use std::io;
 
 use crate::BStackRaiiAllocator;
@@ -60,6 +61,11 @@ impl<T: BStackBlock> BStackDrop for StrongCore<T> {
 /// ([`BStackWeak::upgrade`], `bstack_move!`). `downgrade` relies on this.
 pub struct BStackRc<'a, T: BStackBlock, A: BStackRaiiAllocator> {
     inner: AutoDrop<'a, StrongCore<T>, A>,
+    /// A standing copy of the typed handle, purely so [`Deref`] can hand back
+    /// `&T` — [`Deref::deref`] can't construct a temporary and return a
+    /// reference to it. Reconstructed once in [`from_raw`](Self::from_raw), same
+    /// as [`handle`](Self::handle) computes on demand; doesn't touch the refcount.
+    handle: T,
 }
 
 impl<'a, T: BStackBlock, A: BStackRaiiAllocator> BStackRc<'a, T, A> {
@@ -76,8 +82,10 @@ impl<'a, T: BStackBlock, A: BStackRaiiAllocator> BStackRc<'a, T, A> {
         ctrl: Option<BStackRange>,
         allocator: &'a A,
     ) -> Self {
+        let handle = <T as BStackBlock>::from_range(data.into_range());
         Self {
             inner: unsafe { AutoDrop::from_raw(StrongCore { data, ctrl }, allocator) },
+            handle,
         }
     }
 
@@ -94,10 +102,11 @@ impl<'a, T: BStackBlock, A: BStackRaiiAllocator> BStackRc<'a, T, A> {
     }
 
     /// The underlying typed handle, e.g. to call generated field accessors:
-    /// `rc.handle().get_field(stack)`. Cheap: it just re-wraps the data ref and does
+    /// `rc.handle().get_field(stack)` (or just `rc.get_field(stack)` via
+    /// [`Deref`]). Cheap: it just re-wraps the cached handle's range and does
     /// not touch the refcount.
     pub fn handle(&self) -> T {
-        <T as BStackBlock>::from_range(self.data().into_range())
+        <T as BStackBlock>::from_range(self.handle.range())
     }
 
     /// Consume the handle into its raw parts **without** decrementing the strong
@@ -114,6 +123,17 @@ impl<'a, T: BStackBlock, A: BStackRaiiAllocator> BStackRc<'a, T, A> {
             None => self.data().into_range().start() + layout::RC_REFCOUNT_OFFSET,
             Some(ctrl) => ctrl.start() + layout::CTRL_STRONG_OFFSET,
         }
+    }
+}
+
+/// Field access without the `.handle()` indirection: `rc.get_field(stack)`
+/// instead of `rc.handle().get_field(stack)`, matching [`BStackOwned`]'s
+/// `Deref`. Same handle [`handle`](Self::handle) returns, just borrowed rather
+/// than re-wrapped fresh each call.
+impl<'a, T: BStackBlock, A: BStackRaiiAllocator> Deref for BStackRc<'a, T, A> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.handle
     }
 }
 

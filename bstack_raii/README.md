@@ -211,7 +211,10 @@ owned.bstack_drop(&alloc)?;               // free it now, explicitly …
 
 Shared handles (`BStackRc` / `BStackWeak`) *do* manage their counts on `Drop`,
 like `std::rc`. Because duplicating one bumps an on-disk counter (fallible I/O),
-cloning is the [`TryClone`] trait, not `Clone`.
+cloning is the [`TryClone`] trait, not `Clone`. `BStackRc` also derefs to `X`
+(`rc.get_field(stack)?`, no `.handle()` needed), same as `BStackOwned`; a
+`BStackWeak` doesn't — like `std::rc::Weak`, it may not observe a live block, so
+`upgrade` to a `BStackRc` first.
 
 ## Generated types
 

@@ -136,9 +136,15 @@ Residual points, all *leak-only* (permitted) but worth recording:
   requires it to be passed explicitly. The design choice was deliberate to avoid storing
   the allocator in the handle, but it does make the ergonomics worse. Note that multi-
   file (Foreign) access does not have this concern.
-- **`BStackRc` / `BStackWeak` have no `Deref`** (only `BStackOwned` does), so a
+- [FIXED] **`BStackRc` / `BStackWeak` have no `Deref`** (only `BStackOwned` does), so a
   shared handle needs `rc.handle().get_field(...)` while an owned one allows
-  `owned.get_field(...)` — inconsistent ergonomics for the same operation.
+  `owned.get_field(...)` — inconsistent ergonomics for the same operation. Added
+  `Deref<Target = T>` to `BStackRc` (a cached `T` handle, populated once in
+  `from_raw`, since `deref` can't construct-and-return a temporary); verified
+  `rc.get_field(stack)` compiles without `.handle()`. `BStackWeak` intentionally
+  left without `Deref` — like `std::rc::Weak`, it may not observe a live block
+  (the target can be gone), so derefing it isn't sound; `upgrade()` to a
+  `BStackRc` first, same as `std::rc::Weak`.
 - **`Foreign::with` returns `Option`** (None conflates "null pointer" and "target
   file not attached"); a `Result` (or distinct sentinel) would let callers tell a
   missing file from a genuinely null `Foreign`.
