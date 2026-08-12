@@ -68,36 +68,37 @@ Residual points, all *leak-only* (permitted) but worth recording:
   registry — but only if the foreign file is *attached at recovery time*. A crash
   where the foreign file isn't re-attached on the next open loses those frees
   (leak). Worth documenting as a recovery precondition.
-- **`alloc_control`** (public, non-codegen): transient half-wired window where the
-  data block's `ctrl == 0` between its two writes (see §2).
+- [WONTFIX] **`alloc_control`** (public, non-codegen): transient half-wired window where the
+  data block's `ctrl == 0` between its two writes (see §2). `alloc_control` has been removed from the crate and replaced in `tests.rs`.
 
 ## 4. General bugs
 
-- **Fragile lifetime `transmute`** ([teardown.rs:111](src/teardown.rs#L111)):
+- [WONTFIX] **Fragile lifetime `transmute`** ([teardown.rs:111](src/teardown.rs#L111)):
   `transmute::<&[u8], _>(&flip[..])` launders the lifetime of a 1-byte stack local
   so the `inplace_gen` closure can capture it; sound only because `flip` outlives
   the call. A refactor that moves/reorders `flip` would silently make it UB — it
   relies on an invariant the compiler no longer checks.
-- No concrete logic defect surfaced in the sampled runtime paths; the atomic
-  counter ops (`refcount.rs`) and the map/list/deque algorithms look correct.
+  This is the desired workaround for the `inplace_gen` lifetime problem. See `inplace_gen` usage example.
 
 ## 5. Semantics violations (safe code → UB)
 
-- No path found where a *safe* public API leads to UB (the risky constructors are
-  all `unsafe fn from_raw` / `from_range`, correctly marked).
-- **21 lifetime-laundering `transmute::<&[u8], _>` / `<&mut [u8], _>`** calls
+- [WONTFIX] **21 lifetime-laundering `transmute::<&[u8], _>` / `<&mut [u8], _>`** calls
   across `teardown`, `clone`, and the stdlib collections (the `inplace_gen`
   buffers-outlive-the-call pattern) are the crate's main UB exposure: each is sound
   only while its buffer provably outlives the generator call. They should be
   funneled through a single audited helper rather than open-coded 21 times (see §9).
+  See previous comment for `inplace_gen`.
 
 ## 6. Missing documentation
 
-- **The entire `stdlib` collection suite is absent from the README** (0 mentions):
-  `BStackHashMap`, `BStackBTreeMap`, `BStackHashSet`, `BStackBTreeSet`,
+- [FIXED] **The entire `stdlib` collection suite is absent from the README** (0
+  mentions): `BStackHashMap`, `BStackBTreeMap`, `BStackHashSet`, `BStackBTreeSet`,
   `BStackDeque`, `BStackLinkedList`, `BStackBinaryHeap`, `BStackBox`, `BStackCow`,
   `BStackString`, `BStackCountingBloomFilter` and their iterators — a large,
-  user-facing feature with no README presence.
+  user-facing feature with no README presence. Added a "Standard library
+  collections" section (TOC entry, type table, two compile-checked usage
+  snippets, a sharing/`bstack_move!` limitations note) between "Type tags" and
+  "Examples".
 - **Large WAL surface exported with unclear audience**: `AllocReq`, `Reduced`,
   `WalEntry`, `WalHeader`, `WalLog`, `WalOp`, `WalStatus`, `finish`, `persist_at`,
   `reduce`, `STD_WAL_ANCHOR` are all `pub use`d at the crate root. If they are
@@ -108,10 +109,14 @@ Residual points, all *leak-only* (permitted) but worth recording:
 
 ## 7. Bad use experience
 
-- **Field reads always require an explicit `stack` / allocator argument**
+- [WONTFIX] **Field reads always require an explicit `stack` / allocator argument**
   (`h.get_field(alloc.stack())`). Callers almost always hold the allocator, so
   `.stack()` is constant boilerplate; accessor forms taking `&A` directly would cut
   it.
+  This is the classic "Zig Problem" - the allocator is always in scope, but the API
+  requires it to be passed explicitly. The design choice was deliberate to avoid storing
+  the allocator in the handle, but it does make the ergonomics worse. Note that multi-
+  file (Foreign) access does not have this concern.
 - **`BStackRc` / `BStackWeak` have no `Deref`** (only `BStackOwned` does), so a
   shared handle needs `rc.handle().get_field(...)` while an owned one allows
   `owned.get_field(...)` — inconsistent ergonomics for the same operation.
@@ -132,7 +137,7 @@ Residual points, all *leak-only* (permitted) but worth recording:
 
 ## 9. Duplicated code
 
-- **The `inplace_gen` commit pattern is open-coded repeatedly** — buffers hoisted
+- [WONTFIX] **The `inplace_gen` commit pattern is open-coded repeatedly** — buffers hoisted
   to outlive the call, a phased read→compute→write generator, and the lifetime
   `transmute`s — in `teardown::wal_free_all`, `clone::commit_inner`, and each
   stdlib collection's commit path. A single `batched_commit` helper would remove
@@ -207,18 +212,18 @@ so they are not re-flagged).
 
 ### Limitation (by construction)
 
-- **A collection cannot be shared (`#[bstack_strong]`/`#[bstack_weak]`).**
+- [WONTFIX] **A collection cannot be shared (`#[bstack_strong]`/`#[bstack_weak]`).**
   Collections aren't `(rc)`/`(rc, weak)` blocks, so they don't implement
   `BStackShared`/`BStackWeakable`; two structs cannot share one collection the way
   they share an rc block. The only path is hand-rolling an rc wrapper block around
   it. Worth documenting so users don't expect a shared collection.
-- **`bstack_move!` works only on `BStackBox`, not the other collections.** Only
+- [WONTFIX] **`bstack_move!` works only on `BStackBox`, not the other collections.** Only
   `BStackBox` implements `BStackMove` ([boxed.rs:169](src/stdlib/boxed.rs#L169));
   `map`/`deque`/`list`/`set`/`tree`/`string` do not, so `bstack_move!(collection)`
   won't compile. Probably intended (a map has no meaningful field-destructure), but
   it is an undocumented asymmetry. (It does *not* block a collection from being a
   moved-out `#[bstack_owned]` field — that path needs only `BStackBlock`.)
-- **stdlib grow/realloc multi-block atomicity unverified.** `hashmap`/`deque`/`tree`
+- [WONTFIX] **stdlib grow/realloc multi-block atomicity unverified.** `hashmap`/`deque`/`tree`
   growth allocates a fresh backing block, copies into it, flips the descriptor, and
   frees the old block. Whether each is a single atomic descriptor flip (leak-only on
   crash) or has a torn window was not checked — a category to verify, likely

@@ -43,6 +43,7 @@ object model on top.
 - [Casting: `bstack_cast!`](#casting-bstack_cast)
 - [Cross-file pointers: `Foreign<T>`](#cross-file-pointers-foreignt)
 - [Type tags (`EightCC`)](#type-tags-eightcc)
+- [Standard library collections](#standard-library-collections)
 - [Examples](#examples)
 - [Limitations](#limitations)
 
@@ -975,6 +976,63 @@ for the coercion warning, or a real `#[allow(deprecated)]` on the item).
 
 This also works for `#[bstack_enum]` — e.g. `#[bstack_enum(rc, tag = "ENMTAG")] enum Mode { Unit, Val(u32) }`.
 
+## Standard library collections
+
+Built entirely on the primitives above — nothing here has privileged access, so
+each type doubles as a worked example of composing the ownership model. Every
+collection is itself a plain [`BStackBlock`] (`BStackDrop` + `TryCloneIn`), so it
+can be used bare — a top-level `BStackOwned<...>`, freed with `bstack_drop` — or
+composed as a `#[bstack_owned]` field inside another block, nested inside
+another collection, or held in a `#[bstack_enum]` variant.
+
+| Type                              | Rust analogue                    | What it holds |
+|------------------------------------|-----------------------------------|----------------|
+| [`BStackCow<T>`]                  | `std::borrow::Cow`                | either a borrowed reference or an owned block, deep-copying on first write. |
+| [`BStackBox<T>`]                  | `std::boxed::Box`                 | a single owned `Pod` value in its own block — the macro-free way to own a bare scalar/POD struct. |
+| [`BStackLinkedList<T>`]           | `std::collections::LinkedList`    | an owned doubly-linked list of block values. Prefer `BStackDeque` / `BStackBlockVec` unless you need O(1) end/splice ops. |
+| [`BStackDeque<T>`]                | `std::collections::VecDeque`      | an owned double-ended queue: a contiguous ring, O(1) amortized push/pop at both ends. |
+| [`BStackHashMap<K, V>`]           | `std::collections::HashMap`       | an owned open-addressing map from a `Pod` key to a block value. |
+| [`BStackBTreeMap<K, V>`]          | `std::collections::BTreeMap`      | an owned **ordered** map (copy-on-write B-tree) with sorted iteration. Keys are `Pod + Ord`. |
+| [`BStackString`]                  | `std::string::String`             | a standalone owned, growable UTF-8 string block — the first-class way to own text (a deque element, a map value). |
+| [`BStackCountingBloomFilter<K>`]  | (Bloom filter)                    | a probabilistic set: no false negatives, supports removal — a cheap fast-reject front for exact lookups. |
+| [`BStackHashSet<K>`]              | `std::collections::HashSet`       | an owned open-addressing set of `Pod` keys, with an embedded Bloom-filter fast-reject front. |
+| [`BStackBTreeSet<K>`]             | `std::collections::BTreeSet`      | an owned **ordered** set (copy-on-write B-tree), with an embedded Bloom-filter front. Keys are `Pod + Ord`. |
+| [`BStackBinaryHeap<K, V>`]        | `std::collections::BinaryHeap`    | an owned priority queue (array-backed binary **min**-heap): `pop` returns the smallest-key entry. Keys are `Pod + Ord`. |
+
+Each is constructed with `new` (or `with_capacity` where it applies), torn down
+with `bstack_drop`, and deep-cloned with `try_clone_in` — same as any other
+owned handle:
+
+```rust
+use bstack_raii::{BStackDrop, BStackHashMap, BStackString};
+
+let map = BStackHashMap::<u32, BStackString>::new(&alloc)?;
+map.insert(&alloc, 1, BStackString::new(&alloc, "one")?)?;
+map.insert(&alloc, 2, BStackString::new(&alloc, "two")?)?;
+
+let v = map.get(alloc.stack(), &1)?.unwrap();  // -> a BStackString handle
+assert_eq!(v.to_string(alloc.stack())?, "one");
+
+map.bstack_drop(&alloc)?;  // frees the map AND every owned BStackString value
+```
+
+Composing one into a block field works like any other owned type — deep clone
+and teardown recurse through it automatically:
+
+```rust
+#[bstack_block]
+struct Session {
+    id: u64,
+    #[bstack_owned]
+    log: BStackDeque<BStackString>,
+}
+```
+
+Each collection's iterator (`HashMapIter`, `DequeIter`, `ListIter`,
+`BTreeMapIter`, `BTreeSetIter`, `HashSetIter`, …) borrows the allocator's
+[`BStack`] and yields owned element handles — see the type's own docs for the
+exact borrow shape.
+
 ## Examples
 
 Runnable end-to-end programs live in [`examples/`](examples/):
@@ -1011,6 +1069,11 @@ Runnable end-to-end programs live in [`examples/`](examples/):
   their cross-file operations are *best-effort atomic* — a failure over-provisions
   (a reclaimable leak) rather than under-counts. Resolution requires the target
   file to be `attach`ed to the process registry.
+- **[Standard library collections](#standard-library-collections)** can't be
+  shared (`#[bstack_strong]` / `#[bstack_weak]`) — they aren't `(rc)` /
+  `(rc, weak)` blocks, so two structs can't share one collection the way they
+  share an `rc` block. `bstack_move!` only works on `BStackBox`; the others have
+  no meaningful field-destructure.
 - The on-disk **ABI is not yet stable**.
 
 ## License
@@ -1023,3 +1086,16 @@ MIT (same as `bstack`).
 [`BStackVec<T>`]: src/vec.rs
 [`FileId`]: src/registry.rs
 [`BStackRaiiAllocator`]: src/lib.rs
+[`BStackBlock`]: src/block.rs
+[`BStack`]: https://docs.rs/bstack
+[`BStackCow<T>`]: src/stdlib/cow.rs
+[`BStackBox<T>`]: src/stdlib/boxed.rs
+[`BStackLinkedList<T>`]: src/stdlib/list.rs
+[`BStackDeque<T>`]: src/stdlib/deque.rs
+[`BStackHashMap<K, V>`]: src/stdlib/map.rs
+[`BStackBTreeMap<K, V>`]: src/stdlib/tree.rs
+[`BStackString`]: src/stdlib/string.rs
+[`BStackCountingBloomFilter<K>`]: src/stdlib/bloom.rs
+[`BStackHashSet<K>`]: src/stdlib/hashset.rs
+[`BStackBTreeSet<K>`]: src/stdlib/btreeset.rs
+[`BStackBinaryHeap<K, V>`]: src/stdlib/heap.rs
