@@ -37,10 +37,13 @@ object model on top.
   - [Enums: `#[bstack_enum]`](#enums-bstack_enum)
   - [Field types](#field-types)
   - [Generic blocks](#generic-blocks)
+- [Mutating fields: `#[bstack_mut]`](#mutating-fields-bstack_mut)
 - [Moving out: `bstack_move!`](#moving-out-bstack_move)
 - [Cloning: `TryCloneIn` / `TryClone`](#cloning-tryclonein--tryclone)
 - [Casting: `bstack_cast!`](#casting-bstack_cast)
+- [Cross-file pointers: `Foreign<T>`](#cross-file-pointers-foreignt)
 - [Type tags (`EightCC`)](#type-tags-eightcc)
+- [Examples](#examples)
 - [Limitations](#limitations)
 
 ## Quick start
@@ -124,13 +127,24 @@ Every non-POD field carries an [ownership annotation](#field-ownership) deciding
 how it is torn down. Plain-old-data fields (anything `Pod` — integers, `[u8; N]`,
 …) are stored inline and copied by value.
 
-> **Requires a real allocator.** This layer needs a `bstack` allocator that
-> actually frees (`dealloc`) and reserves offset 0 for its own metadata — e.g.
-> `FirstFitBStackAllocator`, `SlabBStackAllocator`, `GhostTreeBstackAllocator`.
+> **The allocator bound: [`BStackRaiiAllocator`].** Every operation in this crate
+> — constructors, `try_clone_in`, `bstack_drop`, the stdlib collections — is
+> generic over [`BStackRaiiAllocator`], the crate's front-door allocator
+> capability. It is an `unsafe` trait over a freeing `bstack` allocator asserting
+> the **null niche**: offset 0 is never handed out, so a `0` offset reads as
+> "none" everywhere in the layer (the [`Option`](#nullable-fields-option) niche, a
+> dead weak reference, an absent [`Foreign`](#cross-file-pointers-foreignt), …). It
+> also exposes an *optional* WAL anchor — a stable reserved slot that lets teardown
+> and clone automatically reclaim crash-orphaned allocations on the next open.
+>
+> **Every bstack-provided allocator implements it** — `FirstFitBStackAllocator`,
+> `SlabBStackAllocator`, `GhostTreeBstackAllocator`, … — and a custom allocator
+> that upholds the null niche opts in with a one-line
+> `unsafe impl BStackRaiiAllocator for MyAlloc {}` (the anchor defaults to `None`).
 > **Not `LinearBStackAllocator`**: its `dealloc` is a no-op (teardown would free
-> nothing) and it can hand out offset 0 (breaking the `Option` niche). For
-> growable fields, use a **realloc-safe** allocator (growth reallocates the
-> backing block); `FirstFitBStackAllocator` is realloc-safe.
+> nothing) and it can hand out offset 0, so it does *not* implement the trait. For
+> growable fields, use a **realloc-safe** allocator (growth reallocates the backing
+> block); `FirstFitBStackAllocator` is realloc-safe.
 
 ## How it works on disk
 
@@ -193,11 +207,11 @@ cloning is the [`TryClone`] trait, not `Clone`.
 
 Each macro generates a small, fixed set of types (for a block named `X` / `E`):
 
-| Source                                | Types generated                                                                                                   |
-|---------------------------------------|-------------------------------------------------------------------------------------------------------------------|
-| `#[bstack_block] struct X`            | `X` — the [handle](#handles--lifetimes); `XOnDisk` — the `#[repr(C, packed)]` on-disk payload                      |
-| `#[bstack_block(rc, weak)] struct X`  | the above, plus `XOnDiskRef` — the [control block](#how-it-works-on-disk) (`strong`/`weak` counters)               |
-| `#[bstack_enum] enum E`               | `E`, `EOnDisk` (plus `EOnDiskRef` for `(rc, weak)`), and two companion enums — see [Enums](#enums-bstack_enum): `EData` (owned form) and `EView` (read result) |
+| Source                               | Types generated                                                                                                                                                |
+|--------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `#[bstack_block] struct X`           | `X` — the [handle](#handles--lifetimes); `XOnDisk` — the `#[repr(C, packed)]` on-disk payload                                                                  |
+| `#[bstack_block(rc, weak)] struct X` | the above, plus `XOnDiskRef` — the [control block](#how-it-works-on-disk) (`strong`/`weak` counters)                                                           |
+| `#[bstack_enum] enum E`              | `E`, `EOnDisk` (plus `EOnDiskRef` for `(rc, weak)`), and two companion enums — see [Enums](#enums-bstack_enum): `EData` (owned form) and `EView` (read result) |
 
 Alongside the types come the trait impls (`BStackBlock`, `BStackDrop`,
 `BStackCast`, `BStackMove`, and for rc modes `BStackShared` / `BStackWeakable`)
@@ -216,14 +230,14 @@ declared and what you can put in them.
 Every non-POD field carries exactly one annotation, which decides its teardown
 and what [`bstack_move!`](#moving-out-bstack_move) yields:
 
-| Annotation         | Child kind required    | On teardown                        | `bstack_move!` yields   |
-|--------------------|------------------------|------------------------------------|-------------------------|
-| `#[bstack_owned]`  | any block              | recursively frees the child        | `BStackOwned<T>`        |
+| Annotation         | Child kind required    | On teardown                         | `bstack_move!` yields       |
+|--------------------|------------------------|-------------------------------------|-----------------------------|
+| `#[bstack_owned]`  | any block              | recursively frees the child         | `BStackOwned<T>`            |
 | `#[embed]`         | any block              | frees the child's children in place | `BStackOwned<T>` (re-homed) |
-| `#[bstack_strong]` | `(rc)` or `(rc, weak)` | decrements refcount; frees at zero | `BStackRc<T>`           |
-| `#[bstack_weak]`   | `(rc, weak)`           | decrements weak count only         | `Option<BStackWeak<T>>` |
-| `#[bstack_ref]`    | any block              | nothing                            | `BStackRef<T>`          |
-| *(none)* — POD     | `Pod` type             | nothing (inline)                   | the value               |
+| `#[bstack_strong]` | `(rc)` or `(rc, weak)` | decrements refcount; frees at zero  | `BStackRc<T>`               |
+| `#[bstack_weak]`   | `(rc, weak)`           | decrements weak count only          | `Option<BStackWeak<T>>`     |
+| `#[bstack_ref]`    | any block              | nothing                             | `BStackRef<T>`              |
+| *(none)* — POD     | `Pod` type             | nothing (inline)                    | the value                   |
 
 Rules are enforced at compile time: a `#[bstack_weak]` field whose target isn't
 `(rc, weak)`, or a non-`Pod` field with no annotation, is a compile error.
@@ -281,8 +295,11 @@ methods:
   child handles it takes ownership of (`#[bstack_owned]` → `BStackOwned<T>`,
   `#[bstack_strong]` → `BStackRc<T>`, `#[bstack_ref]` → `BStackRef<T>`, POD by
   value; `#[bstack_weak]` fields are **not** parameters);
-- **accessors** — `node.get_field(stack)` for each field;
-- **`set_<field>`** setters for `#[bstack_weak]` fields (see below);
+- **accessors** — `node.get_field(stack)` reads each field;
+- **mutators** — writing a field is opt-in per
+  [`#[bstack_mut]`](#mutating-fields-bstack_mut) (`set_<field>` / `replace_<field>`),
+  plus a `set_<field>` for wiring each `#[bstack_weak]`
+  [back-pointer](#reference-counted-blocks) after construction;
 - recursive teardown, [casting](#casting-bstack_cast), and
   [moving](#moving-out-bstack_move).
 
@@ -641,6 +658,46 @@ a directed message (`` `Vec<u32>` is not a `#[bstack_block]` type … a nested
 Currently unsupported (a clear compile error): lifetime parameters, a generic
 block in `rc` / `rc, weak` mode, and const parameters in a generic *enum*.
 
+## Mutating fields: `#[bstack_mut]`
+
+Every scalar field gets a reader (`get_<field>`). *Writing* one is opt-in: mark
+it `#[bstack_mut]` and the macro adds the mutator appropriate to its kind. This
+keeps immutability the default — a field is read-only unless you say otherwise —
+while each generated write is a single crash-atomic `set`.
+
+```rust
+#[bstack_block]
+struct Counter {
+    #[bstack_mut] hits: u64,   // writable
+    created_at: u64,           // read-only (no setter generated)
+}
+
+let c = Counter::new(&alloc, 0, now)?;
+c.handle().set_hits(stack, 42)?;             // atomic overwrite
+assert_eq!(c.handle().get_hits(stack)?, 42);
+```
+
+The mutator depends on the field's ownership:
+
+| Field kind         | Mutator                              | Semantics                                                                     |
+|--------------------|--------------------------------------|-------------------------------------------------------------------------------|
+| POD                | `set_<field>(stack, value)`          | overwrite the inline bytes                                                    |
+| `#[bstack_ref]`    | `set_<field>(stack, ref)`            | repoint the offset (nullable → `Option<BStackRef>`, `None` writes `0`)        |
+| `#[bstack_owned]`  | `replace_<field>(stack, new)`        | install `new`, **return the old** `BStackOwned<T>` (neither leaked nor freed) |
+| `#[bstack_strong]` | `replace_<field>(&alloc, new)`       | install `new`, return the old `BStackRc<T>` (dropping it decrements)          |
+| `#[bstack_ref]`    | *(also)* `replace_<field>(stack, r)` | ref is the only kind with **both** `set_` and `replace_`                      |
+
+`replace_` is a persistent `mem::replace`: an owned or strong field can't just be
+overwritten (that would strand the old child / leak a strong count), so it hands
+the old value back for you to reuse or free. `#[bstack_weak]` fields already have
+their own [`set_<field>`](#reference-counted-blocks) wiring; `#[bstack_mut]` on a
+weak field is a no-op, and on an `#[embed]` field a compile error.
+
+There is also a raw escape hatch on **every** scalar field —
+`unsafe fn raw_<field>_slice(stack) -> BStackSlice` — a view over the field's
+inline storage (`.read()` / `.write()`). Reads are always valid; writing bypasses
+the typed invariants, hence `unsafe`.
+
 ## Moving out: `bstack_move!`
 
 `bstack_move!` destructures a handle, transferring each field/variant out and
@@ -697,13 +754,13 @@ let copy: BStackOwned<Node> = node.try_clone_in(&alloc)?;
 
 Each field is duplicated according to its ownership — the mirror of teardown:
 
-| Field                 | On clone                                                          |
-|-----------------------|-------------------------------------------------------------------|
-| POD / `#[bstack_ref]` | byte-copied (a ref clone **aliases** the same target)             |
-| `#[bstack_owned]`     | the child is recursively deep-cloned into a fresh block           |
-| `#[embed]`            | the inline child is folded — its own children deep-cloned in place |
-| `#[bstack_strong]`    | the shared child stays shared; its strong count is bumped         |
-| `#[bstack_weak]`      | stays weak to the same target; its weak count is bumped           |
+| Field                 | On clone                                                                                                               |
+|-----------------------|------------------------------------------------------------------------------------------------------------------------|
+| POD / `#[bstack_ref]` | byte-copied (a ref clone **aliases** the same target)                                                                  |
+| `#[bstack_owned]`     | the child is recursively deep-cloned into a fresh block                                                                |
+| `#[embed]`            | the inline child is folded — its own children deep-cloned in place                                                     |
+| `#[bstack_strong]`    | the shared child stays shared; its strong count is bumped                                                              |
+| `#[bstack_weak]`      | stays weak to the same target; its weak count is bumped                                                                |
 | `Vec<Thing>`          | per element, by the vector's annotation (POD data copied; owned elements deep-cloned; strong/weak bumped; ref aliased) |
 
 So an owned subtree is copied into independent storage while shared children are
@@ -762,6 +819,116 @@ let maybe: Option<Node> = bstack_cast!(view as Node)?;              // borrowed 
 The equivalent methods (`into_slice`, `cast_into::<T>`, `cast_as::<T>`,
 `as_slice`) can also be called directly. Casting works the same for enums.
 
+## Cross-file pointers: `Foreign<T>`
+
+Every reference covered so far points *within one file*. A `Foreign<T>` crosses
+the boundary: it is a **wide pointer** naming both a target **file** and an
+offset inside it, so an object graph can span many `bstack` files — a sharded
+store, an index file pointing at a data file, cross-document links — while each
+file stays an independent, crash-safe unit.
+
+### The file registry
+
+Paths are long and awkward to store on disk, so a process-wide **registry** maps
+each file's persistent path ↔ a small, stable numeric [`FileId`]. A `Foreign`
+stores `(FileId, offset)`; the id is resolved to a live file through the
+registry. It is entirely opt-in — a single-file program never touches it and pays
+nothing.
+
+```rust
+use bstack_raii::registry;
+
+registry::init("registry.bstack")?;                  // once, at startup
+let store_id = registry::attach("store.bstack", store_alloc)?;  // hand a file to the registry
+```
+
+`init` brings up the registry (itself a tiny append-only `bstack` file mapping
+paths to ids, so ids survive a restart). `attach` registers a file's path and
+installs its allocator as the **live host** for that id — the thing a `Foreign`
+into that file resolves through. The host is shared process-wide, so `attach`
+takes a [`SyncBStackRaiiAllocator`](src/registry.rs) (a
+[`BStackRaiiAllocator`] that is also `Send + Sync`) — every bstack allocator
+qualifies. `FileId::SELF` (id `0`) is the current file, resolved against your
+local allocator with no registry lookup at all.
+
+### Declaring a foreign field
+
+A `Foreign<T>` field **must** carry an [ownership annotation](#field-ownership),
+exactly like an in-file reference — it just means the same thing *across* files.
+The target `T` must be a `#[bstack_block]` (a foreign pointer targets a block,
+never inline data, so an un-annotated / POD / `#[embed]` `Foreign` is a compile
+error):
+
+```rust
+#[bstack_block]
+struct Card {
+    title: String,
+    #[bstack_owned] body: Foreign<Document>,   // owns a Document in another file
+}
+
+// Construct with an explicit (file, offset) pointer …
+let card = Card::new(&catalog, "report", Foreign::<Document>::new(store_id, doc_off))?;
+
+// … and resolve it to read across the boundary. `with` runs a closure against
+// the target and *its* file's stack, returning `None` if that file isn't live.
+let size = card.handle().get_body(catalog.stack())?
+    .with(&catalog, |doc, fs| doc.get_size(fs).unwrap());   // Option<u64>
+```
+
+The annotation decides what teardown and clone do **in the target's own file**:
+
+| Annotation         | Cross-file teardown                       | Cross-file clone                                  |
+|--------------------|-------------------------------------------|---------------------------------------------------|
+| `#[bstack_owned]`  | frees the target in its file              | deep-clones it into a fresh block in that file    |
+| `#[bstack_strong]` | decrements its refcount there (free at 0) | bumps its refcount there (stays shared)           |
+| `#[bstack_weak]`   | decrements its weak count there           | bumps its weak count there                        |
+| `#[bstack_ref]`    | nothing                                   | byte-copies the pointer (aliases the same target) |
+
+So tearing down a `Card` reclaims its `Document` in the store file, and
+deep-cloning a `Card` gives the copy its own independent `Document` there — the
+catalog file never touches the store's bytes directly. (`#[bstack_owned]` needs a
+deep-cloneable target, so `#[bstack_owned] Foreign<SharedBlock>` — a target that
+is itself `(rc)` — is a compile error; use `#[bstack_strong]`.)
+
+> **Nullable & atomicity.** `Option<Foreign<T>>` is nullable on the usual offset-0
+> niche. Cross-file operations are *best-effort atomic*: the far side is committed
+> before the home side, so a mid-op failure errs toward an over-provision (a
+> leaked block or an over-count — reclaimable) and never an under-count (a
+> premature free). If the target file is detached, teardown leaks (never
+> corrupts) and a clone returns an error rather than aliasing an owner.
+
+### Containers and shapes
+
+A `Foreign<T>` composes everywhere an in-file reference does — because a foreign
+pointer is itself `Pod`, the container storage is reused and only the per-element
+cross-file dispatch is added:
+
+```rust
+#[bstack_owned] parts: Vec<Foreign<Document>>,          // a growable list of pointers
+#[bstack_owned] shards: [Foreign<Document>; 4],          // an inline fixed array
+#[bstack_ref]   pair: (u32, Foreign<Document>),          // a foreign element in a tuple
+```
+
+`Vec<Option<Foreign<T>>>`, nested arrays, and generic targets (`Foreign<T>` over a
+type parameter) all work, in both struct fields and `#[bstack_enum]` variants —
+scalar, `Vec`, array, and tuple variants alike.
+
+The one firm rule is **no double pointer**: a `Foreign` must target a plain block,
+not another pointer or a container — `Foreign<Vec<T>>`, `Foreign<Foreign<T>>`,
+`Foreign<[T; N]>`, `Foreign<(A, B)>` are rejected with a directed error (bridge
+through a named `#[bstack_block]`). This is distinct from the `Vec<Vec>` nesting
+rule: a *collection of pointers* (`Vec<Foreign<T>>`) is fine; only a *pointer to a
+collection* (`Foreign<Vec<T>>`) is barred.
+
+Finally, [`bstack_cast!`](#casting-bstack_cast) bridges a `Foreign` and a local
+handle: `slice as Foreign<T>` tags a local slice with its file identity (via the
+reverse registry map), and `foreign as BStackRef<T>` recovers a same-file
+reference when the target is local. Both return `Option` (no I/O).
+
+A full two-file walk-through — resolution, cross-file ownership, deep clone, and
+reclamation — is in [`examples/crossfile.rs`](examples/crossfile.rs):
+`cargo run --example crossfile`.
+
 ## Type tags (`EightCC`)
 
 Each block's header carries an 8-byte tag — the discriminant a
@@ -797,6 +964,16 @@ for the coercion warning, or a real `#[allow(deprecated)]` on the item).
 
 This also works for `#[bstack_enum]` — e.g. `#[bstack_enum(rc, tag = "ENMTAG")] enum Mode { Unit, Val(u32) }`.
 
+## Examples
+
+Runnable end-to-end programs live in [`examples/`](examples/):
+
+| Example                                 | Run                             | Shows                                                                                                          |
+|-----------------------------------------|---------------------------------|----------------------------------------------------------------------------------------------------------------|
+| [`sessions.rs`](examples/sessions.rs)   | `cargo run --example sessions`  | shared `(rc, weak)` ownership, refcount-driven cleanup, durability across a reopen                             |
+| [`expr.rs`](examples/expr.rs)           | `cargo run --example expr`      | a recursive `#[bstack_enum]` tree — evaluation, deep clone (`TryCloneIn`), `bstack_move!`                      |
+| [`crossfile.rs`](examples/crossfile.rs) | `cargo run --example crossfile` | [`Foreign<T>`](#cross-file-pointers-foreignt) across two files — resolution, cross-file ownership, reclamation |
+
 ## Limitations
 
 - **Fixed-size block payloads.** Fixed-size [arrays](#fixed-size-arrays-t-n)
@@ -804,8 +981,9 @@ This also works for `#[bstack_enum]` — e.g. `#[bstack_enum(rc, tag = "ENMTAG")
   sequence lives out-of-line via an inline descriptor: `Vec<T>` / `String`,
   `#[bstack_owned/strong/weak/ref] Vec<Thing>`, `Vec<[Thing; N]>`, and their
   `Option<…>` forms.
-- **Requires a freeing allocator** that reserves offset 0 — not
-  `LinearBStackAllocator` (see [Concepts](#concepts)).
+- **Requires a [`BStackRaiiAllocator`]** — a freeing allocator that reserves
+  offset 0 (the null niche); not `LinearBStackAllocator` (see
+  [Concepts](#concepts)).
 - **[Generic blocks](#generic-blocks)** work over type parameters (in every field
   kind — reference, POD, and `#[embed]`) and `const` array lengths; the exceptions
   are lifetime parameters, `rc` / `rc, weak` mode, and const parameters in a
@@ -817,6 +995,11 @@ This also works for `#[bstack_enum]` — e.g. `#[bstack_enum(rc, tag = "ENMTAG")
   arrays `V([T; N])`, and vectors `V(Vec<…>)` — in all three modes, plus
   `bstack_move!` / `bstack_cast!`; struct and multi-field tuple variants aren't
   supported, and a variant can't be `#[embed]`ed.
+- **[Cross-file pointers](#cross-file-pointers-foreignt)** (`Foreign<T>`) must
+  target a plain block, never a pointer or a container (no "double pointer"), and
+  their cross-file operations are *best-effort atomic* — a failure over-provisions
+  (a reclaimable leak) rather than under-counts. Resolution requires the target
+  file to be `attach`ed to the process registry.
 - The on-disk **ABI is not yet stable**.
 
 ## License
@@ -827,3 +1010,5 @@ MIT (same as `bstack`).
 [`std::io::Result`]: https://doc.rust-lang.org/std/io/type.Result.html
 [`TryClone`]: src/clone.rs
 [`BStackVec<T>`]: src/vec.rs
+[`FileId`]: src/registry.rs
+[`BStackRaiiAllocator`]: src/lib.rs
