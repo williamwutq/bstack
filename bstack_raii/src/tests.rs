@@ -6918,6 +6918,71 @@ fn macro_bstack_mut_owned_replace_moves_old_out() {
     holder.bstack_drop(&alloc).unwrap();
 }
 
+// A failed `replace_` commit must hand the *consumed* new value back through
+// `ReplaceError`, never leak it (the realloc-style hand-back contract). Uses
+// bstack's fault injection; requires --features fault-injection + debug.
+#[cfg(feature = "fault-injection")]
+#[test]
+fn macro_bstack_mut_replace_hands_new_value_back_on_commit_fault() {
+    use bstack::fault::FaultPolicy;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    // Fail the first `set` (the replace commit) exactly once. `replace_` reads the
+    // old offset with `get_into` *before* consuming `value`, so the only `set` in
+    // the window is the commit itself.
+    struct FailFirstSet(AtomicBool);
+    impl FaultPolicy for FailFirstSet {
+        fn next_fault(&self, op: &'static str, _seq: u64) -> Option<io::Error> {
+            if op == "set" && !self.0.swap(true, Ordering::SeqCst) {
+                Some(io::Error::other("injected replace-commit fault"))
+            } else {
+                None
+            }
+        }
+    }
+
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let a = MacroLeaf::new(&alloc, 1).unwrap();
+    let holder = MutOwned::new(&alloc, a).unwrap();
+    let b = MacroLeaf::new(&alloc, 2).unwrap();
+    let b_off = b.handle().range().start();
+
+    stack.set_fault_policy(Some(Arc::new(FailFirstSet(AtomicBool::new(false)))));
+    let r = holder.handle().replace_child(stack, b);
+    stack.set_fault_policy(None);
+
+    // The commit failed, and the NEW value came back intact — same block, readable,
+    // not an orphan.
+    let err = match r {
+        Ok(_) => panic!("injected fault must fail the replace commit"),
+        Err(e) => e,
+    };
+    let back = err.value.expect("new value must be handed back, not lost");
+    assert_eq!(back.handle().range().start(), b_off);
+    assert_eq!(back.handle().get_val(stack).unwrap(), 2);
+
+    // The OLD child is untouched — still linked in the field (the swap never
+    // committed).
+    assert_eq!(
+        holder
+            .handle()
+            .get_child(stack)
+            .unwrap()
+            .get_val(stack)
+            .unwrap(),
+        1
+    );
+
+    // No leak / no double-free: free the handed-back value, then the holder (which
+    // frees the still-linked old child `a`).
+    back.bstack_drop(&alloc).unwrap();
+    holder.bstack_drop(&alloc).unwrap();
+}
+
 #[test]
 fn macro_bstack_mut_strong_replace_moves_count_out() {
     let tmp = TempStack::new();

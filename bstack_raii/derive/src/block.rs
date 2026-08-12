@@ -4249,99 +4249,146 @@ fn replace_accessor(
     let size_od =
         quote!(::core::mem::size_of::<<#inner_ty as ::bstack_raii::BStackBlock>::OnDisk>() as u64);
 
+    // The old value's on-disk range (from the offset stored in the field slot).
+    let old_range = quote!(::bstack_raii::BStackRange::new(__old_off, #size_od));
+
     match kind {
-        // Owned / ref reconstruct the old handle from just the offset — no allocator
-        // needed — so they take `&BStack` (like their getter/setter).
+        // Owned / ref reconstruct handles from just an offset — no allocator, no
+        // I/O — so they take `&BStack` and their reconstructions are infallible.
+        // `rebuild(range)` rebuilds a handle over a known range, used both for the
+        // old value (on success) and to hand the new value back (on a failed commit).
         Kind::Owned => {
             let handle_ty = quote!(::bstack_raii::BStackOwned<#inner_ty>);
-            let new_off = quote!({
+            // Consume `value` into the new block's range (its block persists on disk).
+            let new_range = quote!({
                 let __h = __value.into_inner();
-                ::bstack_raii::BStackBlock::range(&__h).start()
+                ::bstack_raii::BStackBlock::range(&__h)
             });
-            let recon = quote!(unsafe {
-                ::bstack_raii::BStackOwned::from_raw(
-                    <#inner_ty as ::bstack_raii::BStackBlock>::from_range(
-                        ::bstack_raii::BStackRange::new(__old_off, #size_od),
-                    ),
-                )
-            });
-            replace_stack_method(vis, &name, &handle_ty, &off, &new_off, &recon, nullable)
+            let rebuild = |range: TokenStream| {
+                quote!(unsafe {
+                    ::bstack_raii::BStackOwned::from_raw(
+                        <#inner_ty as ::bstack_raii::BStackBlock>::from_range(#range),
+                    )
+                })
+            };
+            let recon_old = rebuild(old_range.clone());
+            let rebuild_new = rebuild(quote!(__new_range));
+            replace_stack_method(vis, &name, &handle_ty, &off, &new_range, &recon_old, &rebuild_new, nullable)
         }
         Kind::Ref => {
             let handle_ty = quote!(::bstack_raii::BStackRef<#inner_ty>);
-            let new_off = quote!(__value.into_range().start());
-            let recon = quote!(unsafe {
-                ::bstack_raii::BStackRef::<#inner_ty>::from_range(
-                    ::bstack_raii::BStackRange::new(__old_off, #size_od),
-                )
-            });
-            replace_stack_method(vis, &name, &handle_ty, &off, &new_off, &recon, nullable)
+            let new_range = quote!(__value.into_range());
+            let rebuild =
+                |range: TokenStream| quote!(unsafe { ::bstack_raii::BStackRef::<#inner_ty>::from_range(#range) });
+            let recon_old = rebuild(old_range.clone());
+            let rebuild_new = rebuild(quote!(__new_range));
+            replace_stack_method(vis, &name, &handle_ty, &off, &new_range, &recon_old, &rebuild_new, nullable)
         }
-        // Strong reconstructs a `BStackRc` (and the new value's count is transferred
-        // via `into_raw`), which needs the allocator — so it takes `&A`.
+        // Strong reconstructs a `BStackRc`, which needs the allocator — so it takes
+        // `&A`. The NEW value hands back with no I/O (its raw parts are already in
+        // hand); only reconstructing the OLD value reads the block (`strong_parts`),
+        // the one step that can leave `value: None` on failure.
         Kind::Strong => {
-            let handle_ty = quote!(::bstack_raii::BStackRc<'__r, #inner_ty, __A>);
-            let new_off = quote!({
-                let (__d, _) = __value.into_raw();
-                __d.into_range().start()
-            });
+            let rc_ty = quote!(::bstack_raii::BStackRc<'__r, #inner_ty, __A>);
+            let ret_ty = if nullable {
+                quote!(::core::option::Option<#rc_ty>)
+            } else {
+                quote!(#rc_ty)
+            };
             // Reconstruct the old strong ref from its data offset (transfers the
             // existing count out; dropping the returned `BStackRc` decrements).
-            let recon = quote! {
+            let recon_old = quote! {
                 {
-                    let __data = unsafe {
-                        ::bstack_raii::BStackRef::<#inner_ty>::from_range(
-                            ::bstack_raii::BStackRange::new(__old_off, #size_od),
-                        )
+                    let __old_data = unsafe {
+                        ::bstack_raii::BStackRef::<#inner_ty>::from_range(#old_range)
                     };
-                    let (__d, __c) =
-                        <#inner_ty as ::bstack_raii::BStackShared>::strong_parts(__data, allocator)?;
-                    unsafe { ::bstack_raii::BStackRc::from_raw(__d, __c, allocator) }
+                    match <#inner_ty as ::bstack_raii::BStackShared>::strong_parts(__old_data, allocator) {
+                        ::std::result::Result::Ok((__d, __c)) => {
+                            unsafe { ::bstack_raii::BStackRc::from_raw(__d, __c, allocator) }
+                        }
+                        // The new value is safely installed; the OLD block is now
+                        // reachable only via crash-recovery. Hand back nothing.
+                        ::std::result::Result::Err(__e) => {
+                            return ::core::result::Result::Err(::bstack_raii::ReplaceError::lost(__e));
+                        }
+                    }
                 }
             };
-            if nullable {
+            // Consume `value` into `(new_range, ctrl)`; rebuild is infallible.
+            let (consume_new, rebuild_new): (TokenStream, TokenStream) = (
+                quote!({ let (__nd, __nc) = __value.into_raw(); (__nd.into_range(), __nc) }),
+                quote!(unsafe {
+                    ::bstack_raii::BStackRc::from_raw(
+                        ::bstack_raii::BStackRef::<#inner_ty>::from_range(__new_range),
+                        __nc,
+                        allocator,
+                    )
+                }),
+            );
+
+            let body = if nullable {
                 quote! {
-                    /// Install `value` and move the previous value out (`None` = the
-                    /// `0` null niche).
-                    #vis fn #name<'__r, __A: ::bstack_raii::BStackRaiiAllocator>(
-                        &self,
-                        allocator: &'__r __A,
-                        value: ::core::option::Option<#handle_ty>,
-                    ) -> ::std::io::Result<::core::option::Option<#handle_ty>> {
-                        let __off = #off;
-                        let __new: u64 = match value {
-                            ::core::option::Option::Some(__value) => #new_off,
-                            ::core::option::Option::None => 0u64,
+                    let __off = #off;
+                    let __stack = allocator.stack();
+                    let mut __b = [0u8; 8];
+                    if let ::std::result::Result::Err(__e) = __stack.get_into(__off, &mut __b) {
+                        return ::core::result::Result::Err(::bstack_raii::ReplaceError::recovered(__e, value));
+                    }
+                    let __old_off = u64::from_le_bytes(__b);
+                    let (__new, __back): (u64, ::core::option::Option<(::bstack_raii::BStackRange, ::core::option::Option<::bstack_raii::BStackRange>)>) =
+                        match value {
+                            ::core::option::Option::Some(__value) => {
+                                let (__new_range, __nc) = #consume_new;
+                                (__new_range.start(), ::core::option::Option::Some((__new_range, __nc)))
+                            }
+                            ::core::option::Option::None => (0u64, ::core::option::Option::None),
                         };
-                        let __stack = allocator.stack();
-                        let mut __b = [0u8; 8];
-                        __stack.get_into(__off, &mut __b)?;
-                        let __old_off = u64::from_le_bytes(__b);
-                        __stack.set(__off, __new.to_le_bytes())?;
-                        if __old_off == 0 {
-                            ::std::result::Result::Ok(::core::option::Option::None)
-                        } else {
-                            ::std::result::Result::Ok(::core::option::Option::Some(#recon))
-                        }
+                    if let ::std::result::Result::Err(__e) = __stack.set(__off, __new.to_le_bytes()) {
+                        let __handback: #ret_ty = match __back {
+                            ::core::option::Option::Some((__new_range, __nc)) => {
+                                ::core::option::Option::Some(#rebuild_new)
+                            }
+                            ::core::option::Option::None => ::core::option::Option::None,
+                        };
+                        return ::core::result::Result::Err(::bstack_raii::ReplaceError::recovered(__e, __handback));
+                    }
+                    if __old_off == 0 {
+                        ::core::result::Result::Ok(::core::option::Option::None)
+                    } else {
+                        ::core::result::Result::Ok(::core::option::Option::Some(#recon_old))
                     }
                 }
             } else {
                 quote! {
-                    /// Install `value` and move the previous value out to the caller.
-                    #vis fn #name<'__r, __A: ::bstack_raii::BStackRaiiAllocator>(
-                        &self,
-                        allocator: &'__r __A,
-                        value: #handle_ty,
-                    ) -> ::std::io::Result<#handle_ty> {
-                        let __off = #off;
-                        let __new: u64 = { let __value = value; #new_off };
-                        let __stack = allocator.stack();
-                        let mut __b = [0u8; 8];
-                        __stack.get_into(__off, &mut __b)?;
-                        let __old_off = u64::from_le_bytes(__b);
-                        __stack.set(__off, __new.to_le_bytes())?;
-                        ::std::result::Result::Ok(#recon)
+                    let __off = #off;
+                    let __stack = allocator.stack();
+                    let mut __b = [0u8; 8];
+                    if let ::std::result::Result::Err(__e) = __stack.get_into(__off, &mut __b) {
+                        return ::core::result::Result::Err(::bstack_raii::ReplaceError::recovered(__e, value));
                     }
+                    let __old_off = u64::from_le_bytes(__b);
+                    let (__new_range, __nc) = { let __value = value; #consume_new };
+                    let __new = __new_range.start();
+                    if let ::std::result::Result::Err(__e) = __stack.set(__off, __new.to_le_bytes()) {
+                        return ::core::result::Result::Err(
+                            ::bstack_raii::ReplaceError::recovered(__e, #rebuild_new),
+                        );
+                    }
+                    ::core::result::Result::Ok(#recon_old)
+                }
+            };
+
+            quote! {
+                /// Install `value` and move the previous value out to the caller. On
+                /// an I/O failure the *new* value is handed back through
+                /// [`ReplaceError`](::bstack_raii::ReplaceError) (never lost); the old
+                /// value is never at risk.
+                #vis fn #name<'__r, __A: ::bstack_raii::BStackRaiiAllocator>(
+                    &self,
+                    allocator: &'__r __A,
+                    value: #ret_ty,
+                ) -> ::core::result::Result<#ret_ty, ::bstack_raii::ReplaceError<#ret_ty>> {
+                    #body
                 }
             }
         }
@@ -4350,62 +4397,93 @@ fn replace_accessor(
     }
 }
 
-/// The `&BStack`-based body shared by owned/ref `replace_<field>`: read the old
-/// offset, commit the new one with a single atomic `set`, then reconstruct and
-/// return the old handle. `new_off`/`recon` reference `__value` / `__old_off`.
+/// The `&BStack`-based body shared by owned/ref `replace_<field>` (both have an
+/// infallible reconstruction). The swap never loses the *new* value: the old
+/// offset is read **before** `value` is consumed (a read failure hands `value`
+/// straight back), and a failed commit rebuilds the new value from its known
+/// range. `new_range` references `__value`; `recon_old` returns the old value on
+/// success; `rebuild_new` references `__new_range` for the failed-commit handback.
+#[allow(clippy::too_many_arguments)]
 fn replace_stack_method(
     vis: &syn::Visibility,
     name: &Ident,
     handle_ty: &TokenStream,
     off: &TokenStream,
-    new_off: &TokenStream,
-    recon: &TokenStream,
+    new_range: &TokenStream,
+    recon_old: &TokenStream,
+    rebuild_new: &TokenStream,
     nullable: bool,
 ) -> TokenStream {
     if nullable {
         quote! {
             /// Install `value` and move the previous value out (`None` = the `0`
-            /// null niche).
+            /// null niche). On an I/O failure the *new* value is handed back through
+            /// [`ReplaceError`](::bstack_raii::ReplaceError), never lost.
             #vis fn #name(
                 &self,
                 stack: &::bstack_raii::BStack,
                 value: ::core::option::Option<#handle_ty>,
-            ) -> ::std::io::Result<::core::option::Option<#handle_ty>> {
+            ) -> ::core::result::Result<
+                ::core::option::Option<#handle_ty>,
+                ::bstack_raii::ReplaceError<::core::option::Option<#handle_ty>>,
+            > {
                 let __off = #off;
-                let __new: u64 = match value {
-                    ::core::option::Option::Some(__value) => #new_off,
-                    ::core::option::Option::None => 0u64,
-                };
                 let mut __b = [0u8; 8];
-                stack.get_into(__off, &mut __b)?;
+                if let ::std::result::Result::Err(__e) = stack.get_into(__off, &mut __b) {
+                    return ::core::result::Result::Err(::bstack_raii::ReplaceError::recovered(__e, value));
+                }
                 let __old_off = u64::from_le_bytes(__b);
-                stack.set(__off, __new.to_le_bytes())?;
+                let (__new, __new_range_opt): (u64, ::core::option::Option<::bstack_raii::BStackRange>) =
+                    match value {
+                        ::core::option::Option::Some(__value) => {
+                            let __new_range: ::bstack_raii::BStackRange = #new_range;
+                            (__new_range.start(), ::core::option::Option::Some(__new_range))
+                        }
+                        ::core::option::Option::None => (0u64, ::core::option::Option::None),
+                    };
+                if let ::std::result::Result::Err(__e) = stack.set(__off, __new.to_le_bytes()) {
+                    let __handback: ::core::option::Option<#handle_ty> = match __new_range_opt {
+                        ::core::option::Option::Some(__new_range) => ::core::option::Option::Some(#rebuild_new),
+                        ::core::option::Option::None => ::core::option::Option::None,
+                    };
+                    return ::core::result::Result::Err(::bstack_raii::ReplaceError::recovered(__e, __handback));
+                }
                 if __old_off == 0 {
-                    ::std::result::Result::Ok(::core::option::Option::None)
+                    ::core::result::Result::Ok(::core::option::Option::None)
                 } else {
-                    ::std::result::Result::Ok(::core::option::Option::Some(#recon))
+                    ::core::result::Result::Ok(::core::option::Option::Some(#recon_old))
                 }
             }
         }
     } else {
         quote! {
-            /// Install `value` and move the previous value out to the caller.
+            /// Install `value` and move the previous value out to the caller. On an
+            /// I/O failure the *new* value is handed back through
+            /// [`ReplaceError`](::bstack_raii::ReplaceError), never lost.
             #vis fn #name(
                 &self,
                 stack: &::bstack_raii::BStack,
                 value: #handle_ty,
-            ) -> ::std::io::Result<#handle_ty> {
+            ) -> ::core::result::Result<#handle_ty, ::bstack_raii::ReplaceError<#handle_ty>> {
                 let __off = #off;
-                let __new: u64 = { let __value = value; #new_off };
                 let mut __b = [0u8; 8];
-                stack.get_into(__off, &mut __b)?;
+                if let ::std::result::Result::Err(__e) = stack.get_into(__off, &mut __b) {
+                    return ::core::result::Result::Err(::bstack_raii::ReplaceError::recovered(__e, value));
+                }
                 let __old_off = u64::from_le_bytes(__b);
-                stack.set(__off, __new.to_le_bytes())?;
-                ::std::result::Result::Ok(#recon)
+                let __new_range: ::bstack_raii::BStackRange = { let __value = value; #new_range };
+                let __new = __new_range.start();
+                if let ::std::result::Result::Err(__e) = stack.set(__off, __new.to_le_bytes()) {
+                    return ::core::result::Result::Err(
+                        ::bstack_raii::ReplaceError::recovered(__e, #rebuild_new),
+                    );
+                }
+                ::core::result::Result::Ok(#recon_old)
             }
         }
     }
 }
+
 
 /// Generate `(param, prep, init)` for one constructor field. Not called for
 /// `#[bstack_weak]` fields. `nullable` fields take an `Option<Handle>` (None => 0).

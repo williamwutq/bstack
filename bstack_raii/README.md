@@ -689,9 +689,20 @@ The mutator depends on the field's ownership:
 
 `replace_` is a persistent `mem::replace`: an owned or strong field can't just be
 overwritten (that would strand the old child / leak a strong count), so it hands
-the old value back for you to reuse or free. `#[bstack_weak]` fields already have
-their own [`set_<field>`](#reference-counted-blocks) wiring; `#[bstack_mut]` on a
-weak field is a no-op, and on an `#[embed]` field a compile error.
+the old value back for you to reuse or free.
+
+Because it **consumes** the new value, `replace_` returns `Result<Old,
+ReplaceError<New>>` (not a bare `io::Result`): on an I/O failure it hands the
+consumed value back in `ReplaceError.value`, rather than dropping it into an
+unreachable orphan — the same region-hand-back contract as bstack's
+`BStackAllocError`. The *old* value is never at risk (the swap is a single atomic
+`set`, so on failure the field still holds it). The one `value: None` case is a
+strong field whose old handle fails to reconstruct *after* the commit already
+landed — then it's the old block that is reclaimable only via crash-recovery.
+
+`#[bstack_weak]` fields already have their own
+[`set_<field>`](#reference-counted-blocks) wiring; `#[bstack_mut]` on a weak field
+is a no-op, and on an `#[embed]` field a compile error.
 
 There is also a raw escape hatch on **every** scalar field —
 `unsafe fn raw_<field>_slice(stack) -> BStackSlice` — a view over the field's

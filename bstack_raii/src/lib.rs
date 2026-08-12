@@ -59,6 +59,7 @@ mod layout;
 mod owned;
 mod refcount;
 mod reference;
+mod replace;
 /// Cross-file `Foreign<T>` support: the process-wide path↔id file registry.
 pub mod registry;
 mod shared;
@@ -88,6 +89,7 @@ pub use layout::{BlockHeader, EightCC, get_u64};
 pub use owned::BStackOwned;
 pub use reference::BStackRef;
 pub use registry::ForeignHostAllocator;
+pub use replace::ReplaceError;
 pub use shared::{BStackRc, BStackWeak};
 pub use stdlib::{
     BStackBTreeMap, BStackBTreeSet, BStackBinaryHeap, BStackBox, BStackCountingBloomFilter,
