@@ -16,8 +16,8 @@ use crate::{
     BStackBox, BStackCast, BStackCastAs, BStackCastInto, BStackCountingBloomFilter, BStackCow,
     BStackDeque, BStackDrop, BStackHashMap, BStackHashSet, BStackLinkedList, BStackOwned,
     BStackRaiiAllocator, BStackRc, BStackRef, BStackShared, BStackString, BStackWeakable, EightCC,
-    TryClone, TryCloneIn, alloc_block, alloc_control, bstack_block, bstack_cast, bstack_enum,
-    bstack_move, dealloc_range,
+    TryClone, TryCloneIn, alloc_block, bstack_block, bstack_cast, bstack_enum, bstack_move,
+    build_control_payload, dealloc_range,
 };
 
 // --------------------------------------------------------------------------
@@ -137,6 +137,32 @@ impl BStackWeakable for TestBlock {
 
 fn ctrl_tag() -> EightCC {
     EightCC::from_name("TESTCTRL")
+}
+
+/// Allocate and wire the control block for an already-allocated `(rc, weak)`
+/// data block, mirroring the atomic path the macro's `RcWeak` constructor
+/// uses: the control payload write and the data block's `ctrl` back-pointer
+/// write commit together in one [`bstack::BStack::set_batched`], so there is
+/// no transient state where one is written and not the other.
+fn alloc_control<A: BStackRaiiAllocator>(
+    allocator: &A,
+    ctrl_tag: EightCC,
+    data: BStackRange,
+    control_size: u64,
+) -> io::Result<BStackRange> {
+    let slice = allocator.alloc(control_size)?;
+    let ctrl = slice.as_range();
+    let payload = build_control_payload(ctrl_tag, data.start(), control_size);
+    let backptr_off = data.start() + layout::CTRL_BACKPTR_OFFSET;
+    let writes: [(u64, Vec<u8>); 2] = [
+        (ctrl.start(), payload),
+        (backptr_off, ctrl.start().to_le_bytes().to_vec()),
+    ];
+    if let Err(e) = allocator.stack().set_batched(writes) {
+        let _ = allocator.dealloc(slice);
+        return Err(e);
+    }
+    Ok(ctrl)
 }
 
 /// Allocate and fully wire an `(rc, weak)` `TestBlock` (data + control),

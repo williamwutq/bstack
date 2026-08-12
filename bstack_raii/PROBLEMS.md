@@ -25,16 +25,19 @@ omitted except where trivial.
 
 ## 2. Code quality
 
-- **Crate-wide `#![allow(dead_code, unused_imports, unused_variables)]`**
+- [FIXED] **Crate-wide `#![allow(dead_code, unused_imports, unused_variables)]`**
   ([lib.rs:45](src/lib.rs#L45)) suppresses three whole warning classes across the
   entire crate — it hides real dead code (below) and would mask unused-variable
   bugs. Should be removed and warnings addressed per-item.
-- **Dead / superseded public helpers.** `init_rc` and `alloc_control`
+- [FIXED] **Dead / superseded public helpers.** `init_rc` and `alloc_control`
   ([construct.rs](src/construct.rs)) are unused by codegen (the batched
   constructor path replaced them) yet still `pub use`d. `alloc_control` is also
   **non-atomic** (allocates + writes payload, then a separate `set` of the data
   block's back-pointer) — a public primitive whose behavior contradicts the atomic
-  path that superseded it.
+  path that superseded it. `init_rc` removed (truly dead); `alloc_control` removed
+  from `construct.rs` and replaced in `tests.rs` with a test-local equivalent that
+  commits the control payload and the data block's back-pointer in one
+  `set_batched`, matching the atomic path.
 - **Pervasive `.to_le_bytes().to_vec()`** — every counter/pointer write allocates
   a fresh 8-byte heap `Vec<u8>` to feed the `set_batched` / `ClonePlan::write`
   batch APIs (dozens per operation in `list`/`deque`/`map`). A small-buffer /

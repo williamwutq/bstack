@@ -19,7 +19,7 @@ use crate::handle::WeakRef;
 use crate::layout::{self, BlockHeader, EightCC, put_u64};
 use crate::reference::BStackRef;
 use crate::shared::{BStackRc, BStackWeak};
-use crate::teardown::{BStackDrop, dealloc_range};
+use crate::teardown::BStackDrop;
 
 #[inline(always)]
 fn read_u64_at(stack: &BStack, off: u64) -> io::Result<u64> {
@@ -45,49 +45,6 @@ pub fn alloc_block<A: BStackRaiiAllocator>(
         return Err(e);
     }
     Ok(slice.as_range())
-}
-
-/// Initialize a plain `#[bstack_block(rc)]` block's inline refcount to 1.
-///
-/// Call once after [`alloc_block`] and after the payload is written. One is the
-/// count the single returned `BStackRc` accounts for.
-pub fn init_rc<A: BStackRaiiAllocator>(allocator: &A, data: BStackRange) -> io::Result<()> {
-    let off = data.start() + layout::RC_REFCOUNT_OFFSET;
-    allocator.stack().set(off, 1u64.to_le_bytes())
-}
-
-/// Allocate and wire the control block for an already-allocated
-/// `#[bstack_block(rc, weak)]` data block.
-///
-/// Writes the control header, `strong = 1`, `weak = 1` (the phantom weak held by
-/// the strong owners), and the `x` forward pointer to the data block; then
-/// writes the data block's `ctrl` back-pointer. Returns the control block's
-/// range. `control_size` is `size_of::<T::Control>()`.
-///
-/// On failure the control block is released; the caller still owns (and must
-/// release) the data block.
-pub fn alloc_control<A: BStackRaiiAllocator>(
-    allocator: &A,
-    ctrl_tag: EightCC,
-    data: BStackRange,
-    control_size: u64,
-) -> io::Result<BStackRange> {
-    let payload = build_control_payload(ctrl_tag, data.start(), control_size);
-    let mut slice = allocator.alloc(control_size)?;
-    let ctrl = slice.as_range();
-    if let Err(e) = slice.write_range(0, &payload) {
-        let _ = allocator.dealloc(slice);
-        return Err(e);
-    }
-
-    // The data block's `ctrl` back-pointer lives in a different block, so it is
-    // one more (unavoidable) write into that region.
-    let backptr = data.start() + layout::CTRL_BACKPTR_OFFSET;
-    if let Err(e) = allocator.stack().set(backptr, ctrl.start().to_le_bytes()) {
-        let _ = unsafe { dealloc_range(allocator, ctrl) };
-        return Err(e);
-    }
-    Ok(ctrl)
 }
 
 /// Build a `(rc, weak)` control-block payload image in memory (no allocation, no
