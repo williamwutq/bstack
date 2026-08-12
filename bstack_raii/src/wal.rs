@@ -72,8 +72,15 @@ use crate::teardown::dealloc_range;
 /// ([`FileId::SELF`], the common case), non-zero = a foreign file. [`reduce`] only
 /// repurposes a freed slice for a requirement in the **same** file, so a foreign
 /// requirement never reuses local storage (or vice versa).
+// `reduce` (and the `AllocReq` / `Reduced` shapes it operates on) implements the
+// groupoid-reduction optimisation described above, but nothing in the crate
+// currently calls it — no commit path (`bulk`, `clone`, `teardown`) reuses a
+// freed slice for a same-length allocation. Kept `#[cfg(test)]` (exercised by
+// the unit tests below) rather than deleted, since wiring it in is tracked
+// separately (see PROBLEMS.md §1).
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct AllocReq {
+pub(crate) struct AllocReq {
     pub id: u64,
     pub len: u64,
     /// Target file: `0` = local ([`FileId::SELF`]), non-zero = a foreign [`FileId`]
@@ -90,7 +97,7 @@ pub struct AllocReq {
 /// `{None < Pending < Complete}` plus the recovery sink `Abandon`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
-pub enum WalStatus {
+pub(crate) enum WalStatus {
     None = 0,
     Pending = 1,
     Complete = 2,
@@ -100,6 +107,7 @@ pub enum WalStatus {
 impl WalStatus {
     /// Normal monotonic progress: `None → Pending → Complete` (idempotent at
     /// `Complete`; `Abandon` is terminal).
+    #[cfg(test)]
     pub fn advance(self) -> Self {
         match self {
             WalStatus::None => WalStatus::Pending,
@@ -110,6 +118,7 @@ impl WalStatus {
 
     /// Recovery monotonic map: `Pending → Abandon` (an in-flight op is abandoned,
     /// its slice leaked rather than re-run); `None` and `Complete` are unchanged.
+    #[cfg(test)]
     pub fn recover(self) -> Self {
         match self {
             WalStatus::Pending => WalStatus::Abandon,
@@ -132,7 +141,7 @@ impl WalStatus {
 /// The two morphisms of the slice groupoid, as recorded in the log.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
-pub enum WalOp {
+pub(crate) enum WalOp {
     Alloc = 0,
     Dealloc = 1,
 }
@@ -156,7 +165,7 @@ impl WalOp {
 /// on recovery. 32 bytes, 8-aligned, `Pod`.
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 #[repr(C)]
-pub struct WalEntry {
+pub(crate) struct WalEntry {
     status: u8,
     op: u8,
     _pad: [u8; 6],
@@ -205,6 +214,7 @@ impl WalEntry {
     /// A `Dealloc` entry recording a concrete **local** slice `S = (ptr, len)`
     /// (`file_id 0`, [`FileId::SELF`]). See [`dealloc_in`](Self::dealloc_in) for a
     /// slice in a foreign file.
+    #[cfg(test)]
     pub fn dealloc(status: WalStatus, slice: BStackRange) -> Self {
         Self::dealloc_in(status, FileId::SELF, slice)
     }
@@ -238,10 +248,6 @@ impl WalEntry {
         self.file_id as u64
     }
 
-    pub fn set_status(&mut self, status: WalStatus) {
-        self.status = status as u8;
-    }
-
     /// The recorded slice `S`, if this is an `Alloc` entry (to be freed on abandon).
     pub fn as_alloc(&self) -> Option<BStackRange> {
         match self.op() {
@@ -264,8 +270,9 @@ impl WalEntry {
 /// [`with_capacity`](Self::with_capacity) pre-reserves to the known operation
 /// count (a transaction knows how many allocs/deallocs it will log up front), so
 /// [`append`](Self::append) never reallocates mid-transaction.
-pub struct WalLog {
+pub(crate) struct WalLog {
     entries: Vec<WalEntry>,
+    #[cfg(test)]
     next_id: u64,
 }
 
@@ -274,11 +281,13 @@ impl WalLog {
     pub fn with_capacity(ops: usize) -> Self {
         WalLog {
             entries: Vec::with_capacity(ops),
+            #[cfg(test)]
             next_id: 0,
         }
     }
 
     /// The next `R'` identity — a wrapping autoincrement.
+    #[cfg(test)]
     pub fn fresh_id(&mut self) -> u64 {
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
@@ -294,15 +303,8 @@ impl WalLog {
         &self.entries
     }
 
-    pub fn entries_mut(&mut self) -> &mut [WalEntry] {
-        &mut self.entries
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
     /// The log's on-disk image (a packed array of [`WalEntry`]).
+    #[cfg(test)]
     pub fn as_bytes(&self) -> &[u8] {
         bytemuck::cast_slice(&self.entries)
     }
@@ -322,8 +324,9 @@ impl WalLog {
 
 /// The result of [`reduce`]: allocation requirements that were satisfied by
 /// repurposing a freed slice (`reused`), and the physical operations that remain.
+#[cfg(test)]
 #[derive(Debug, Default)]
-pub struct Reduced {
+pub(crate) struct Reduced {
     /// `(requirement, repurposed slice)` — no physical alloc *or* dealloc needed.
     /// The slice lives in `requirement.file_id` (reuse is always same-file).
     pub reused: Vec<(AllocReq, BStackRange)>,
@@ -340,7 +343,8 @@ pub struct Reduced {
 /// in one file can never satisfy a requirement in another (a cross-file `Foreign`
 /// alloc and a local free do not cancel), so the `file_id`s must match. Only the
 /// unpaired remainder becomes physical work.
-pub fn reduce(allocs: Vec<AllocReq>, mut deallocs: Vec<(u32, BStackRange)>) -> Reduced {
+#[cfg(test)]
+pub(crate) fn reduce(allocs: Vec<AllocReq>, mut deallocs: Vec<(u32, BStackRange)>) -> Reduced {
     let mut reused = Vec::new();
     let mut rem_allocs = Vec::new();
     for req in allocs {
@@ -391,7 +395,7 @@ const WAL_MIN_CAP: u64 = 8;
 /// `capacity` is the number of [`WalEntry`] slots the block was allocated for.
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 #[repr(C)]
-pub struct WalHeader {
+pub(crate) struct WalHeader {
     magic: u64,
     txn_status: u8,
     _pad: [u8; 7],
@@ -555,7 +559,7 @@ fn wal_ensure_block<A: BStackRaiiAllocator>(allocator: &A, needed: u64) -> io::R
 /// block's range. The anchor slot comes from the allocator itself
 /// ([`wal_anchor`](BStackRaiiAllocator::wal_anchor)); the caller must hold the
 /// file's WAL lock (the crate-internal `wal_lock_for`).
-pub fn persist_at<A: BStackRaiiAllocator>(
+pub(crate) fn persist_at<A: BStackRaiiAllocator>(
     allocator: &A,
     log: &WalLog,
     txn_status: WalStatus,

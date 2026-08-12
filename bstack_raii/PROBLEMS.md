@@ -22,6 +22,11 @@ omitted except where trivial.
   path source).
 - **`ForeignHost` lacks batched/generator ops**, so a cross-file clone's home
   commit and foreign side cannot be one atomic unit (best-effort only — see §3).
+- **`wal::reduce`'s groupoid slice-reuse optimization is unwired.** Fully
+  implemented and unit-tested (`AllocReq` / `Reduced` / `reduce`, now
+  `#[cfg(test)]` — see §6), but nothing in `bulk`/`clone`/`teardown` calls it:
+  no commit path currently repurposes a same-length freed slice for a fresh
+  allocation instead of freeing then reallocating.
 
 ## 2. Code quality
 
@@ -99,11 +104,25 @@ Residual points, all *leak-only* (permitted) but worth recording:
   collections" section (TOC entry, type table, two compile-checked usage
   snippets, a sharing/`bstack_move!` limitations note) between "Type tags" and
   "Examples".
-- **Large WAL surface exported with unclear audience**: `AllocReq`, `Reduced`,
+- [FIXED] **Large WAL surface exported with unclear audience**: `AllocReq`, `Reduced`,
   `WalEntry`, `WalHeader`, `WalLog`, `WalOp`, `WalStatus`, `finish`, `persist_at`,
   `reduce`, `STD_WAL_ANCHOR` are all `pub use`d at the crate root. If they are
   internal machinery they should be `pub(crate)`; if public, they need docs on how
-  a user is meant to use them.
+  a user is meant to use them. `finish` and `STD_WAL_ANCHOR` are the only two a
+  caller ever needs (call `finish` once after `open`; `STD_WAL_ANCHOR` for a custom
+  `wal_anchor()` impl) — kept public and documented in the README's allocator-bound
+  callout. Everything else (`AllocReq`, `Reduced`, `WalEntry`, `WalHeader`,
+  `WalLog`, `WalOp`, `WalStatus`, `persist_at`, `reduce`) is internal transaction
+  machinery, moved to `pub(crate)`. That surfaced real dead code masked by the old
+  public re-export: `WalStatus::advance`/`recover`, `WalEntry::dealloc` (the bare,
+  non-`_in` form), and `WalLog::fresh_id`/`as_bytes` are exercised only by `wal.rs`'s
+  own unit tests (now `#[cfg(test)]`); `WalEntry::set_status` and
+  `WalLog::entries_mut`/`is_empty` were unused even there (deleted). Separately,
+  `AllocReq`/`Reduced`/`reduce` — the groupoid-reduction slice-reuse optimization —
+  turned out to be fully implemented and unit-tested but **never wired into any
+  real commit path** (`bulk`/`clone`/`teardown` don't call it); kept `#[cfg(test)]`
+  rather than deleted, noted here as a distinct §1-adjacent gap for whoever wires
+  it in.
 - README does not mention `alloc_many` / `free_many` or the `foreign_*` runtime
   helpers (acceptable if intentionally internal, but they are publicly exported).
 

@@ -108,10 +108,7 @@ pub use stdlib::{
 };
 pub use teardown::{AutoDrop, BStackDrop, dealloc_range, wal_teardown};
 pub use vec::{BStackBlockVec, BStackRefVec, BStackStrongVec, BStackVec, BStackWeakVec, VecDesc};
-pub use wal::{
-    AllocReq, Reduced, STD_WAL_ANCHOR, WalEntry, WalHeader, WalLog, WalOp, WalStatus, finish,
-    persist_at, reduce,
-};
+pub use wal::{STD_WAL_ANCHOR, finish};
 
 // Re-exports for use by `#[bstack_block]`-generated code (and callers), so that
 // generated code can name everything through `::bstack_raii::…` and downstream

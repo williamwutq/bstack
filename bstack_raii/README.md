@@ -146,6 +146,15 @@ how it is torn down. Plain-old-data fields (anything `Pod` — integers, `[u8; N
 > nothing) and it can hand out offset 0, so it does *not* implement the trait. For
 > growable fields, use a **realloc-safe** allocator (growth reallocates the backing
 > block); `FirstFitBStackAllocator` is realloc-safe.
+>
+> **The WAL anchor in practice.** Two items are public because a caller may need
+> them; everything else in the WAL's internal transaction log is crate-private.
+> Call [`wal::finish`]`(&allocator)` once after `open` to complete any transaction
+> a prior crash left in flight (reclaiming the slices it orphaned) —
+> `try_clone_in` and `bstack_drop` also call it opportunistically, so this is a
+> deterministic point to do it, not the only one. [`STD_WAL_ANCHOR`] is the anchor
+> offset every bstack-provided allocator reserves; a custom `wal_anchor()` impl
+> returns it (or its own, if it reserves a different user region).
 
 ## How it works on disk
 
@@ -1087,6 +1096,8 @@ MIT (same as `bstack`).
 [`FileId`]: src/registry.rs
 [`BStackRaiiAllocator`]: src/lib.rs
 [`BStackBlock`]: src/block.rs
+[`wal::finish`]: src/wal.rs
+[`STD_WAL_ANCHOR`]: src/wal.rs
 [`BStack`]: https://docs.rs/bstack
 [`BStackCow<T>`]: src/stdlib/cow.rs
 [`BStackBox<T>`]: src/stdlib/boxed.rs

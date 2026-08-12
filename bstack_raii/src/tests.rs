@@ -2540,8 +2540,8 @@ fn macro_clone_embed() {
 
 #[test]
 fn wal_finish_rolls_forward_committed() {
+    use crate::wal::{WalEntry, WalLog, WalStatus};
     use crate::wal::{finish, persist_at};
-    use crate::{WalEntry, WalLog, WalStatus};
 
     let tmp = TempStack::new();
     let alloc = tmp.allocator(); // FirstFit: wal_anchor() == Some(8), zeroed on a fresh file
@@ -2567,8 +2567,8 @@ fn wal_finish_rolls_forward_committed() {
 
 #[test]
 fn wal_finish_abandons_uncommitted() {
+    use crate::wal::{WalEntry, WalLog, WalStatus};
     use crate::wal::{finish, persist_at};
-    use crate::{WalEntry, WalLog, WalStatus};
 
     let tmp = TempStack::new();
     let alloc = tmp.allocator();
@@ -2588,8 +2588,8 @@ fn wal_finish_abandons_uncommitted() {
 
 #[test]
 fn wal_anchor_trait_reclaims_via_finish() {
+    use crate::wal::{WalEntry, WalLog, WalStatus};
     use crate::wal::{finish, persist_at};
-    use crate::{WalEntry, WalLog, WalStatus};
 
     let tmp = TempStack::new();
     let alloc = tmp.allocator(); // FirstFitBStackAllocator: wal_anchor() == Some(8)
@@ -2608,8 +2608,8 @@ fn wal_anchor_trait_reclaims_via_finish() {
 
 #[test]
 fn wal_finish_reclaims_abandoned_allocs() {
+    use crate::wal::{WalEntry, WalLog, WalStatus};
     use crate::wal::{finish, persist_at};
-    use crate::{WalEntry, WalLog, WalStatus};
 
     let tmp = TempStack::new();
     let alloc = tmp.allocator();
@@ -2647,8 +2647,8 @@ fn wal_finish_reclaims_foreign_orphan_via_registry() {
     // (`free_recorded`) resolves foreign frees through it, exactly as real teardown /
     // clone will.
     use crate::registry;
+    use crate::wal::{WalEntry, WalLog, WalStatus};
     use crate::wal::{finish, persist_at};
-    use crate::{WalEntry, WalLog, WalStatus};
 
     // The op's home file (where the WAL is staged) and a separate foreign file.
     let home = TempStack::new();
