@@ -41,10 +41,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
-use bstack::{
-    BStack, BStackAllocError, BStackAllocator, BStackOwnedSlice, BStackOwnedSliceAllocator,
-    BStackRange,
-};
+use bstack::{BStack, BStackAllocError, BStackAllocator, BStackOwnedSlice, BStackRange};
 use parking_lot::RwLock;
 
 use crate::BStackRaiiAllocator;

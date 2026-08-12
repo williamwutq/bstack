@@ -362,7 +362,7 @@ impl<T: BStackBlock> BStackDeque<T> {
 
         // Abort if, at commit time, the ring already has room or is already at
         // least this big (another thread grew it) — then our `newring` is wasted.
-        let abort = |head: u64, len: u64, cap: u64| (cap != 0 && len < cap) || newcap <= cap;
+        let abort = |_head: u64, len: u64, cap: u64| (cap != 0 && len < cap) || newcap <= cap;
 
         atomic_update(
             allocator,

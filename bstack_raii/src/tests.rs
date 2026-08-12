@@ -1766,6 +1766,19 @@ fn macro_enum_rc() {
     unsafe { dealloc_range(&alloc, reused).unwrap() };
 }
 
+#[test]
+fn macro_enum_rc_val_variant() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+
+    let rc = RcNode::new(&alloc, RcNodeData::Val(7)).unwrap();
+    match rc.handle().read(&alloc).unwrap() {
+        RcNodeView::Val(v) => assert_eq!(v, 7),
+        _ => panic!("expected Val"),
+    }
+    drop(rc);
+}
+
 #[bstack_enum(rc, weak)]
 enum RcwNode {
     Nil,
@@ -4418,6 +4431,19 @@ fn macro_generic_enum_owned() {
     }
 }
 
+#[test]
+fn macro_generic_enum_tag_variant() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+
+    let e = BoxEnumG::<MacroLeaf>::new(&alloc, BoxEnumGData::Tag(99)).unwrap();
+    match e.handle().read(&alloc).unwrap() {
+        BoxEnumGView::Tag(t) => assert_eq!(t, 99),
+        _ => panic!("expected Tag"),
+    }
+    e.bstack_drop(&alloc).unwrap();
+}
+
 #[bstack_enum]
 enum StrongEnumG<T> {
     Empty,
@@ -6218,7 +6244,6 @@ fn stdlib_heap_pop_ascending() {
 fn stdlib_heap_duplicate_keys() {
     let tmp = TempStack::new();
     let alloc = tmp.allocator();
-    let stack = alloc.stack();
 
     let heap = BStackBinaryHeap::<u32, MacroLeaf>::new(&alloc).unwrap();
     for (k, v) in [(3u32, 30u32), (1, 10), (3, 31), (1, 11), (2, 20)] {

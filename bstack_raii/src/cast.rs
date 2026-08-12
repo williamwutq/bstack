@@ -10,7 +10,7 @@ use std::io;
 use crate::BStackRaiiAllocator;
 use bstack::{BStackOwnedSlice, BStackSlice};
 
-use crate::block::{BStackBlock, BStackCast};
+use crate::block::BStackBlock;
 use crate::layout::EightCC;
 use crate::owned::BStackOwned;
 use crate::teardown::AutoDrop;

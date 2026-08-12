@@ -32,7 +32,9 @@ use crate::handle::{OwnedRef, WeakRef};
 use crate::layout;
 use crate::refcount;
 use crate::reference::BStackRef;
-use crate::registry::{self, FileId, FileRegistry};
+#[cfg(test)]
+use crate::registry::FileRegistry;
+use crate::registry::{self, FileId};
 use crate::teardown::BStackDrop;
 
 /// The on-disk form of a [`Foreign`] pointer: a file identity plus an offset in
@@ -180,6 +182,7 @@ impl<T: BStackBlock> Foreign<T> {
     /// Like [`with`](Self::with) but against an explicit `registry` — crate-internal,
     /// for tests (the global is a one-shot `OnceLock`, awkward to exercise in unit
     /// tests). Production code uses [`with`](Self::with) against the sole registry.
+    #[cfg(test)]
     pub(crate) fn with_in<A, R>(
         self,
         registry: &FileRegistry,

@@ -40,7 +40,7 @@ use std::io;
 use bstack::{BStackGenOp, BStackRange};
 
 use crate::BStackRaiiAllocator;
-use crate::block::{BStackBlock, BStackShared};
+use crate::block::BStackShared;
 use crate::layout;
 use crate::owned::BStackOwned;
 use crate::reference::BStackRef;

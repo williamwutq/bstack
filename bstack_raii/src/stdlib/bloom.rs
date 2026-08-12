@@ -38,7 +38,7 @@ use core::mem::size_of;
 use std::io;
 
 use crate::BStackRaiiAllocator;
-use bstack::{BStack, BStackGenOp, BStackOwnedSliceAllocator, BStackRange};
+use bstack::{BStack, BStackGenOp, BStackRange};
 use bytemuck::{Pod, Zeroable};
 
 use super::hash::double_hash;
@@ -69,7 +69,6 @@ pub struct BloomOnDisk {
 
 const DATA_OFF: u64 = HEADER_SIZE; // 16
 const M_OFF: u64 = HEADER_SIZE + 8; // 24
-const K_OFF: u64 = HEADER_SIZE + 16; // 32
 const N_OFF: u64 = HEADER_SIZE + 24; // 40
 const BLOOM_SIZE: u64 = size_of::<BloomOnDisk>() as u64;
 

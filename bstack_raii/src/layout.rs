@@ -108,12 +108,6 @@ pub struct BlockHeader {
 /// begins.
 pub const HEADER_SIZE: u64 = core::mem::size_of::<BlockHeader>() as u64;
 
-/// On-disk width of a reference. Per RAII.md, an on-disk `BStackRef<T>` stores
-/// only the `u64` offset; the length is recovered at resolve time from the
-/// target type's fixed `size_of::<T::OnDisk>()`. (This is why the RAII layer is,
-/// for now, a fixed-size-block model.)
-pub const REF_SIZE: u64 = 8;
-
 // -- Injected-field offsets ------------------------------------------------
 //
 // RAII.md injects the refcount / control back-pointer / control counters

@@ -57,11 +57,11 @@ use std::collections::HashMap;
 use std::io;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use bstack::{BStackAllocator, BStackOwnedSliceAllocator, BStackRange};
+use bstack::BStackRange;
 use bytemuck::{Pod, Zeroable};
 
 use crate::BStackRaiiAllocator;
-use crate::registry::{self, FileId, ForeignHost};
+use crate::registry::{self, FileId};
 use crate::teardown::dealloc_range;
 
 /// `R'`: an allocation requirement carrying identity — a length whose address has

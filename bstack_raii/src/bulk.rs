@@ -23,7 +23,7 @@
 
 use std::io;
 
-use bstack::{BStackAllocator, BStackRange};
+use bstack::BStackRange;
 
 use crate::BStackRaiiAllocator;
 use crate::teardown::dealloc_range;
