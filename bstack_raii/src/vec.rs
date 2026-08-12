@@ -675,15 +675,34 @@ impl<'a, T: BStackWeakable, A: BStackRaiiAllocator> BStackWeakVec<'a, T, A> {
             .into_iter()
             .map(|w| w.into_raw().into_range().start())
             .collect();
-        Ok(Self {
-            offsets: BStackVec::from_slice(allocator, &offs)?,
-            _marker: PhantomData,
-        })
+        match BStackVec::from_slice(allocator, &offs) {
+            Ok(offsets) => Ok(Self {
+                offsets,
+                _marker: PhantomData,
+            }),
+            Err(e) => {
+                // Building the offset array failed *after* every weak was consumed
+                // (`into_raw` defused each decrement, moving the count in). Release
+                // each so none is orphaned. Best-effort — a nested failure leaves at
+                // most the one-too-high count teardown already tolerates.
+                for off in offs {
+                    let _ = WeakRef::<T>(Self::ctrl_ref(off)).bstack_drop(allocator);
+                }
+                Err(e)
+            }
+        }
     }
 
     /// Append a weak reference (consumed, its count moved into the vector).
     pub fn push_weak(&mut self, elem: BStackWeak<'a, T, A>) -> io::Result<()> {
-        self.offsets.push(elem.into_raw().into_range().start())
+        let ctrl = elem.into_raw();
+        if let Err(e) = self.offsets.push(ctrl.into_range().start()) {
+            // Push failed after `elem` was consumed (its decrement defused by
+            // `into_raw`). Release its transferred weak count rather than orphan it.
+            let _ = WeakRef::<T>(ctrl).bstack_drop(self.offsets.allocator());
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// Release every weak reference (freeing control blocks that reach zero),

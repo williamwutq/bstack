@@ -4273,16 +4273,33 @@ fn replace_accessor(
             };
             let recon_old = rebuild(old_range.clone());
             let rebuild_new = rebuild(quote!(__new_range));
-            replace_stack_method(vis, &name, &handle_ty, &off, &new_range, &recon_old, &rebuild_new, nullable)
+            replace_stack_method(
+                vis,
+                &name,
+                &handle_ty,
+                &off,
+                &new_range,
+                &recon_old,
+                &rebuild_new,
+                nullable,
+            )
         }
         Kind::Ref => {
             let handle_ty = quote!(::bstack_raii::BStackRef<#inner_ty>);
             let new_range = quote!(__value.into_range());
-            let rebuild =
-                |range: TokenStream| quote!(unsafe { ::bstack_raii::BStackRef::<#inner_ty>::from_range(#range) });
+            let rebuild = |range: TokenStream| quote!(unsafe { ::bstack_raii::BStackRef::<#inner_ty>::from_range(#range) });
             let recon_old = rebuild(old_range.clone());
             let rebuild_new = rebuild(quote!(__new_range));
-            replace_stack_method(vis, &name, &handle_ty, &off, &new_range, &recon_old, &rebuild_new, nullable)
+            replace_stack_method(
+                vis,
+                &name,
+                &handle_ty,
+                &off,
+                &new_range,
+                &recon_old,
+                &rebuild_new,
+                nullable,
+            )
         }
         // Strong reconstructs a `BStackRc`, which needs the allocator — so it takes
         // `&A`. The NEW value hands back with no I/O (its raw parts are already in
@@ -4316,7 +4333,10 @@ fn replace_accessor(
             };
             // Consume `value` into `(new_range, ctrl)`; rebuild is infallible.
             let (consume_new, rebuild_new): (TokenStream, TokenStream) = (
-                quote!({ let (__nd, __nc) = __value.into_raw(); (__nd.into_range(), __nc) }),
+                quote!({
+                    let (__nd, __nc) = __value.into_raw();
+                    (__nd.into_range(), __nc)
+                }),
                 quote!(unsafe {
                     ::bstack_raii::BStackRc::from_raw(
                         ::bstack_raii::BStackRef::<#inner_ty>::from_range(__new_range),
@@ -4483,7 +4503,6 @@ fn replace_stack_method(
         }
     }
 }
-
 
 /// Generate `(param, prep, init)` for one constructor field. Not called for
 /// `#[bstack_weak]` fields. `nullable` fields take an `Option<Handle>` (None => 0).

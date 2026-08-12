@@ -6983,6 +6983,64 @@ fn macro_bstack_mut_replace_hands_new_value_back_on_commit_fault() {
     holder.bstack_drop(&alloc).unwrap();
 }
 
+// The weak setter consumes a `BStackWeak` (its decrement defused, count moved into
+// the field). On a commit fault it must RELEASE that count (balancing drop), not
+// orphan it — the `io::Result<()>` analogue of the `replace_` hand-back.
+#[cfg(feature = "fault-injection")]
+#[test]
+fn macro_weak_setter_releases_new_weak_on_commit_fault() {
+    use bstack::fault::FaultPolicy;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct FailFirstSet(AtomicBool);
+    impl FaultPolicy for FailFirstSet {
+        fn next_fault(&self, op: &'static str, _seq: u64) -> Option<io::Error> {
+            if op == "set" && !self.0.swap(true, Ordering::SeqCst) {
+                Some(io::Error::other("injected weak-setter commit fault"))
+            } else {
+                None
+            }
+        }
+    }
+
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+    let load = |o: u64| crate::refcount::load(stack, o).unwrap();
+
+    let a = WNode::new(&alloc, 1).unwrap(); // strong = 1, weak = 1
+    let b = WNode::new(&alloc, 2).unwrap();
+    let a_ctrl = load(a.handle().range().start() + layout::CTRL_BACKPTR_OFFSET);
+    let weak_off = a_ctrl + layout::CTRL_WEAK_OFFSET;
+    assert_eq!(load(weak_off), 1);
+
+    // `downgrade` bumps a's weak count; the setter would move that count into the
+    // field. The `set` fault fires on the commit (the read/decrement use `get`/RMW).
+    let w = a.downgrade().unwrap();
+    assert_eq!(load(weak_off), 2);
+
+    stack.set_fault_policy(Some(Arc::new(FailFirstSet(AtomicBool::new(false)))));
+    let r = b.handle().set_back(&alloc, w);
+    stack.set_fault_policy(None);
+    assert!(
+        r.is_err(),
+        "injected fault must fail the weak-setter commit"
+    );
+
+    // The consumed weak was released, not orphaned: a's weak count is back to 1 …
+    assert_eq!(
+        load(weak_off),
+        1,
+        "weak-setter leaked the consumed weak count on a failed commit"
+    );
+    // … and the field never committed, so it stays unset.
+    assert!(b.handle().get_back(&alloc).unwrap().is_none());
+
+    drop(a); // strong 1->0 frees data; weak 1->0 frees control — nothing leaked
+    drop(b);
+}
+
 #[test]
 fn macro_bstack_mut_strong_replace_moves_count_out() {
     let tmp = TempStack::new();

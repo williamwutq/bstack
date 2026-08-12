@@ -136,7 +136,15 @@ pub fn set_weak_field<'w, T: BStackWeakable, A: BStackRaiiAllocator>(
     // observed pointing at a released control block. `new_weak` is consumed
     // without decrementing — its weak count becomes the field's.
     let ctrl = new_weak.into_raw();
-    stack.set(field_off, ctrl.into_range().start().to_le_bytes())?;
+    if let Err(e) = stack.set(field_off, ctrl.into_range().start().to_le_bytes()) {
+        // Commit failed: the field still points at `old`, and `new_weak` was
+        // already consumed (`into_raw` defused its decrement). Release it now — a
+        // balancing `WeakRef` drop — so its just-transferred weak count is not
+        // orphaned. Best-effort: a failure here can leave at most the same
+        // one-too-high count teardown always tolerates, so keep the original error.
+        let _ = WeakRef::<T>(ctrl).bstack_drop(allocator);
+        return Err(e);
+    }
 
     // Only now release the old target — pure reclamation, since the field no
     // longer refers to it. A crash before this leaks at most the old control
