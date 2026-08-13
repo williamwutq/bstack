@@ -3,7 +3,7 @@
 mod alloc_fuzz_tests {
     use crate::alloc::{
         BStackOwnedSlice, BStackOwnedSliceAllocator, BStackRange, FirstFitBStackAllocator,
-        GhostTreeBstackAllocator, SlabBStackAllocator,
+        GhostTreeBstackAllocator, SegregatedBStackAllocator, SlabBStackAllocator,
     };
     use crate::alloc_test_common::{
         FuzzConfig, Guard, Operation, Payload, check_is_zero, gen_op, make_allocator, make_payload,
@@ -371,6 +371,7 @@ mod alloc_fuzz_tests {
         check_slab_64,
         make_allocator!(CheckedSlabBStackAllocator, 64)
     );
+    fuzz_suite!(segregated, make_allocator!(SegregatedBStackAllocator));
 
     mod double_free {
         use super::*;
@@ -382,6 +383,11 @@ mod alloc_fuzz_tests {
         #[test]
         fn check_slab_16() {
             super::run_double_free_error(make_allocator!(CheckedSlabBStackAllocator, 16));
+        }
+
+        #[test]
+        fn segregated() {
+            super::run_double_free_error(make_allocator!(SegregatedBStackAllocator));
         }
     }
 }

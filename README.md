@@ -551,7 +551,7 @@ bstack = { version = "0.4", features = ["set"] }
 
 ### `alloc`
 
-Enables the region-management layer on top of `BStack`: `BStackAllocator`, `BStackBulkAllocator`, `BStackUninitAllocator`, `BStackOwnedSliceAllocator`, `BStackAllocError`, `BStackBulkAllocError`, `BStackRange`, `BStackOwnedSlice`, `BStackSlice`, `BStackSliceReader`, `LinearBStackAllocator`, `GhostTreeBstackAllocator`, and `DebugCheckingAllocator`.  Combined with `set`, also enables `BStackSliceWriter`, `FirstFitBStackAllocator`, `SlabBStackAllocator`, `CheckedSlabBStackAllocator`, `BStackByteVec`, and `BStackByteVecIter`.
+Enables the region-management layer on top of `BStack`: `BStackAllocator`, `BStackBulkAllocator`, `BStackUninitAllocator`, `BStackOwnedSliceAllocator`, `BStackAllocError`, `BStackBulkAllocError`, `BStackRange`, `BStackOwnedSlice`, `BStackSlice`, `BStackSliceReader`, `LinearBStackAllocator`, `GhostTreeBstackAllocator`, and `DebugCheckingAllocator`.  Combined with `set`, also enables `BStackSliceWriter`, `FirstFitBStackAllocator`, `SlabBStackAllocator`, `CheckedSlabBStackAllocator`, `SegregatedBStackAllocator` (experimental), `BStackByteVec`, and `BStackByteVecIter`.
 
 ```toml
 [dependencies]
@@ -1086,6 +1086,21 @@ catches double-frees immediately and allows full recovery after a crash.
 Constructor takes `data_size` (usable bytes per block; physical = `data_size + 8`).
 `open` runs `recover()` automatically.  Without `atomic`: `Send` only.  With
 `atomic`: `Send + Sync` (same lock-free strategy as `SlabBStackAllocator`).
+
+### `SegregatedBStackAllocator` (**experimental**, `alloc + set`)
+
+Segregated (binned) free-list allocator: the checked slab generalised to 33 size
+classes (16 linear 16‥256 B, 16 geometric 320‥4096 B, one oversized bucket)
+sharing one arena.  Class computed by register arithmetic; O(1) classed
+alloc/dealloc; 8-byte overhead tag per block.  Single `new(stack)` constructor
+(runs recovery automatically).  Without `atomic`: `Send` only.  With `atomic`:
+`Send + Sync`, no allocator-level lock.
+
+> **Experimental.**  The on-disk format and API are not yet stable, some resize
+> paths differ between the `atomic` and non-`atomic` builds (in-place non-tail
+> carve is `atomic`-only; the non-`atomic` build moves instead), and the
+> background coalescer and deep in-use-leak GC are not yet implemented.  See
+> [`algos/ALLOCATOR.md`](algos/ALLOCATOR.md) for the full design.
 
 ### `DebugCheckingAllocator` (`alloc`)
 
