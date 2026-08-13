@@ -216,9 +216,9 @@ impl SegregatedBStackAllocator {
     /// # Errors
     ///
     /// * [`io::ErrorKind::UnexpectedEof`] if the stack is too short to contain
-    ///     the header or the arena is not a multiple of the block quantum.
+    ///   the header or the arena is not a multiple of the block quantum.
     /// * [`io::ErrorKind::InvalidData`] if the magic is wrong (not a Segregated
-    ///    allocator of the expected version).
+    ///   allocator of the expected version).
     /// * Any [`io::Error`] from the underlying [`BStack`] operations.
     pub fn new(stack: BStack) -> io::Result<Self> {
         if stack.is_empty()? {
@@ -227,7 +227,7 @@ impl SegregatedBStackAllocator {
             let mut hdr = [0u8; OFFSET_OFFSET + 8];
             hdr[OFFSET_OFFSET..].copy_from_slice(&ALSG_MAGIC);
             // flags, reserved, and every free_head remain 0.
-            let _ = stack.extend_sparse(&hdr, Self::ARENA_START)?;
+            let _ = stack.extend_sparse(hdr, Self::ARENA_START)?;
             return Ok(Self {
                 stack,
                 lock: Mutex::new(()),
