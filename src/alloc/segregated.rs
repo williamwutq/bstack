@@ -39,8 +39,6 @@ use crate::BStackGenOp;
 use std::cell::Cell;
 #[cfg(not(feature = "atomic"))]
 use std::marker::PhantomData;
-#[cfg(feature = "atomic")]
-use std::sync::Mutex;
 use std::{fmt, io};
 
 /// Magic: `ALSG` + major 0 + minor 1; the version encodes the fixed class scheme.
@@ -56,8 +54,7 @@ const ALSG_MAGIC_PREFIX: [u8; 6] = *b"ALSG\x00\x01";
 /// ```text
 /// offset  0  reserved (user)                24 B
 /// offset 24  magic  "ALSG\x00\x01\x00\x00"   8 B
-/// offset 32  flags                           4 B   # bit0 = recovery_needed
-/// offset 36  _reserved                       4 B
+/// offset 32  _reserved                       8 B
 /// offset 40  free_head[NUM_CLASSES] : u64          # last entry = oversized list
 /// arena start (16-B aligned; header ends 16-aligned already)
 /// ```
@@ -81,11 +78,12 @@ const ALSG_MAGIC_PREFIX: [u8; 6] = *b"ALSG\x00\x01";
 ///
 /// Under `atomic`, it is also `Sync`: `alloc`/`dealloc` drive [`BStack::process_gen`] /
 /// [`BStack::inplace_gen`] sequences that hold `BStack`'s write lock across the
-/// dependent read/modify/write, so no allocator-level lock is taken. The
-/// internal [`Mutex`] serialises [`recover`](Self::recover) against itself only.
+/// dependent read/modify/write, so no allocator-level lock is taken.
+/// [`recover`](Self::recover) is the one exception — it is `unsafe` and shifts the
+/// no-concurrent-access obligation to the caller (see its `# Safety`).
 ///
 /// Without `atomic` the type is `!Sync` (this fails to compile); with `atomic`
-/// the internal `Mutex` makes it `Sync` (this compiles):
+/// it is `Sync` via its [`BStack`] (this compiles):
 ///
 #[cfg_attr(not(feature = "atomic"), doc = "```compile_fail")]
 #[cfg_attr(feature = "atomic", doc = "```")]
@@ -95,10 +93,6 @@ const ALSG_MAGIC_PREFIX: [u8; 6] = *b"ALSG\x00\x01";
 #[cfg(feature = "set")]
 pub struct SegregatedBStackAllocator {
     stack: BStack,
-    /// Serialises [`recover`](Self::recover) against itself; ordinary
-    /// alloc/dealloc never take it.
-    #[cfg(feature = "atomic")]
-    lock: Mutex<()>,
     #[cfg(not(feature = "atomic"))]
     _not_sync: PhantomData<Cell<()>>,
 }
@@ -134,10 +128,7 @@ impl SegregatedBStackAllocator {
     // Header layout (compile-time, fixed offsets)
     /// Bytes before the allocator header reserved for caller use.
     const OFFSET_SIZE: u64 = 24;
-    /// Offset of the flags word (bit0 = recovery_needed). Written by the
-    /// multi-transaction paths (realloc, coalescer) added in a later pass.
-    #[allow(dead_code)]
-    const FLAGS_OFFSET: u64 = 32;
+    // offset 32: 8 reserved bytes (see the on-disk layout) — no field yet.
     /// Offset of `free_head[0]`.
     const FREE_HEAD_BASE: u64 = 40;
     /// Payload offset of the first arena block: header rounded up to the 16-B
@@ -261,12 +252,10 @@ impl SegregatedBStackAllocator {
             const OFFSET_OFFSET: usize = SegregatedBStackAllocator::OFFSET_SIZE as usize;
             let mut hdr = [0u8; OFFSET_OFFSET + 8];
             hdr[OFFSET_OFFSET..].copy_from_slice(&ALSG_MAGIC);
-            // flags, reserved, and every free_head remain 0.
+            // the reserved words and every free_head remain 0.
             let _ = stack.extend_sparse(hdr, Self::ARENA_START)?;
             return Ok(Self {
                 stack,
-                #[cfg(feature = "atomic")]
-                lock: Mutex::new(()),
                 #[cfg(not(feature = "atomic"))]
                 _not_sync: PhantomData,
             });
@@ -302,12 +291,12 @@ impl SegregatedBStackAllocator {
         }
         let allocator = Self {
             stack,
-            #[cfg(feature = "atomic")]
-            lock: Mutex::new(()),
             #[cfg(not(feature = "atomic"))]
             _not_sync: PhantomData,
         };
-        allocator.recover()?;
+        // SAFETY: `allocator` was just constructed and has not yet escaped this
+        // function, so no other thread can hold it — it is trivially quiescent.
+        unsafe { allocator.recover()? };
         Ok(allocator)
     }
 
@@ -328,17 +317,26 @@ impl SegregatedBStackAllocator {
     /// operation, it is **idempotent and crash-safe by re-running**: a crash
     /// mid-rebuild leaves half-written links that the next `open`'s scan simply
     /// rebuilds again. Blocks orphaned *in-use* (e.g. the old block of a crashed
-    /// realloc move) are not reclaimable by a bare scan and are left live; that
-    /// is the `recovery_needed`-bracketed work deferred to a later pass.
+    /// realloc move) are not reclaimable by a bare scan and are left live; a deep
+    /// reachability GC that could reclaim them (needing a per-op journal of the
+    /// affected block, not just a dirty bit) is deferred to a later pass.
     ///
-    /// This pass assumes a quiescent allocator (as at `open`); a fully concurrent
-    /// variant is future work, but the rebuilt head table is already published as
-    /// a single crash-atomic contiguous [`BStack::set`] so the table never becomes
-    /// half-updated. Stops at the first unclassifiable overhead, counting the
-    /// remaining arena as unsure.
-    pub fn recover(&self) -> io::Result<u64> {
-        #[cfg(feature = "atomic")]
-        let _guard = self.lock.lock().unwrap();
+    /// The rebuilt head table is published as a single crash-atomic contiguous
+    /// [`BStack::set`], so the table never becomes half-updated. Stops at the first
+    /// unclassifiable overhead, counting the remaining arena as unsure.
+    ///
+    /// # Safety
+    ///
+    /// The caller must guarantee the allocator is **quiescent** for the duration
+    /// of the call: no other thread may run any `alloc`/`dealloc`/`realloc` (or
+    /// another `recover`) on this allocator concurrently. `recover` rebuilds every
+    /// free list from a single linear snapshot and then replaces the whole head
+    /// table wholesale; a concurrent operation between the snapshot and the flip
+    /// would be clobbered — resurrecting a just-allocated block onto a free list,
+    /// or dropping a just-freed one — which is memory-unsafe for the allocator's
+    /// consumers. Construction ([`new`](Self::new)) satisfies this trivially by
+    /// running it before the allocator handle escapes.
+    pub unsafe fn recover(&self) -> io::Result<u64> {
         let stack_len = self.stack.len()?;
         if stack_len <= Self::ARENA_START {
             return Ok(0);
@@ -1362,7 +1360,11 @@ mod tests {
         a.dealloc(a1).unwrap(); // head[6] → a1
         // Simulate a leak: clear head[6] so a1 is free-tagged but unreachable.
         a.stack().set(Seg::head_off(6), 0u64.to_le_bytes()).unwrap();
-        assert_eq!(a.recover().unwrap(), 0, "arena fully accounted for");
+        assert_eq!(
+            unsafe { a.recover() }.unwrap(),
+            0,
+            "arena fully accounted for"
+        );
         // a1 is relinked, so the next same-class alloc reuses it.
         let r = a.alloc(90).unwrap();
         assert_eq!(r.start(), off1, "recover relinked the leaked block");
@@ -1377,7 +1379,7 @@ mod tests {
         // write never landed (word == 0 at `base`).
         a.stack().extend(128).unwrap();
         assert_eq!(a.stack().len().unwrap(), base + 128);
-        assert_eq!(a.recover().unwrap(), 0);
+        assert_eq!(unsafe { a.recover() }.unwrap(), 0);
         assert_eq!(
             a.stack().len().unwrap(),
             base,
@@ -1393,7 +1395,7 @@ mod tests {
         let freed = a.alloc(64).unwrap();
         let freed_off = freed.start();
         a.dealloc(freed).unwrap();
-        assert_eq!(a.recover().unwrap(), 0);
+        assert_eq!(unsafe { a.recover() }.unwrap(), 0);
         assert_eq!(&keep.read().unwrap()[..16], b"survives recover");
         // The free list still works: the freed block is reused.
         let r = a.alloc(60).unwrap();
@@ -1432,7 +1434,7 @@ mod tests {
         let r64 = a.alloc(56).unwrap(); // class 3
         assert_eq!(r64.start(), base + 960 + Seg::OVERHEAD);
         assert_eq!(
-            a.recover().unwrap(),
+            unsafe { a.recover() }.unwrap(),
             0,
             "arena fully accounted for after carve"
         );
@@ -1452,7 +1454,7 @@ mod tests {
         // The 896 excess is itself class 22 (greedy → one block, not 7×128).
         let z = a.alloc(888).unwrap(); // class 22 (block 896)
         assert_eq!(z.start(), base + 4112 + Seg::OVERHEAD);
-        assert_eq!(a.recover().unwrap(), 0);
+        assert_eq!(unsafe { a.recover() }.unwrap(), 0);
     }
 
     #[test]
