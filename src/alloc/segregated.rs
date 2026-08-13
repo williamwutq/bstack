@@ -974,10 +974,19 @@ impl BStackAllocator for SegregatedBStackAllocator {
                 }
             }
 
-            // Non-tail shrink: keep the block at the new class and free the excess
-            // tail *in place*, committing the length change and the greedy carve
-            // (≤ 3 pieces) as one crash-atomic transaction — no move, no copy, and
-            // no mid-arena gap for `recover` to puzzle over.
+            // Non-tail shrink: under `atomic`, keep the block at the new class and
+            // free the excess tail *in place* as one crash-atomic carve — no move,
+            // no copy, no mid-arena gap for `recover`, and `recovered` stays the
+            // untouched original (a fault leaves the block un-shrunk).
+            //
+            // Without `atomic` an in-place carve cannot be made fault-safe: shrinking
+            // the header and validating the freed tail are two non-adjacent writes,
+            // and with no journal to commit them together any fault between them
+            // either corrupts the caller's tail data (header still reads `old_len`)
+            // or leaves `recover` a garbage-headed tail to desync on. So the
+            // non-atomic build falls through to the move below, fault-safe step by
+            // step (each op atomic, a mid-move failure only ever leaks).
+            #[cfg(feature = "atomic")]
             if new_size < old_size {
                 let prefix = (Self::IN_USE_BIT | new_len).to_le_bytes();
                 self.commit_carve(
@@ -990,10 +999,12 @@ impl BStackAllocator for SegregatedBStackAllocator {
                 return Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, start, new_len) });
             }
 
-            // Non-tail grow: allocate the new class, having it read the surviving
-            // prefix straight from the old block into its claim buffer (no separate
-            // copy buffer or write), then free the old block. Each step is
-            // individually atomic; a mid-move failure leaks (never corrupts).
+            // Move: allocate the new class, having it read the surviving prefix
+            // straight from the old block into its claim buffer (no separate copy
+            // buffer or write), then free the old block. Handles the non-tail grow
+            // (both builds) and, without `atomic`, the non-tail shrink that fell
+            // through above. Each step is individually atomic; a mid-move failure
+            // leaks (never corrupts).
             let copy_len = old_len.min(new_len);
             let new_ptr = self.alloc_raw(new_len, Some((start, copy_len)))?;
             // New region committed and populated; it is now the survivor.
