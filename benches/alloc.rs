@@ -46,7 +46,8 @@
 
 use bstack::{
     BStack, BStackOwnedSlice, BStackOwnedSliceAllocator, CheckedSlabBStackAllocator,
-    FirstFitBStackAllocator, GhostTreeBstackAllocator, SlabBStackAllocator,
+    FirstFitBStackAllocator, GhostTreeBstackAllocator, SegregatedBStackAllocator,
+    SlabBStackAllocator,
 };
 use criterion::{Criterion, criterion_group, criterion_main};
 use rand::{RngExt, SeedableRng, rngs::StdRng};
@@ -598,6 +599,14 @@ fn bench_ghost_tree(c: &mut Criterion) {
     );
 }
 
+fn bench_segregated(c: &mut Criterion) {
+    register!(
+        c,
+        "alloc/segregated",
+        make_allocator!(SegregatedBStackAllocator)
+    );
+}
+
 fn bench_slab_16(c: &mut Criterion) {
     register!(c, "alloc/slab_16", make_allocator!(SlabBStackAllocator, 16));
 }
@@ -668,6 +677,7 @@ criterion_group! {
     targets =
         bench_first_fit,
         bench_ghost_tree,
+        bench_segregated,
         bench_slab_16,
         bench_slab_24,
         bench_slab_32,
