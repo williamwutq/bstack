@@ -638,6 +638,8 @@ pub use alloc::{
     FirstFitBStackAllocator, GhostTreeBstackAllocator, SlabBStackAllocator,
 };
 
+#[cfg(all(feature = "alloc", feature = "set", feature = "atomic"))]
+pub use alloc::SegregatedBStackAllocator;
 #[cfg(all(feature = "guarded", feature = "atomic"))]
 pub use alloc::{BStackAtomicGuardedSlice, BStackAtomicGuardedSliceSubview};
 #[cfg(feature = "guarded")]

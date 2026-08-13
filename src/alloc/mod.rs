@@ -681,6 +681,8 @@ pub mod ghost_tree;
 #[cfg(feature = "guarded")]
 pub mod guarded;
 pub mod linear;
+#[cfg(all(feature = "set", feature = "atomic"))]
+pub mod segregated;
 #[cfg(feature = "set")]
 pub mod slab;
 #[cfg(feature = "set")]
@@ -698,6 +700,8 @@ pub use guarded::{BStackAtomicGuardedSlice, BStackAtomicGuardedSliceSubview};
 #[cfg(feature = "guarded")]
 pub use guarded::{BStackGuardedSlice, BStackGuardedSliceSubview};
 pub use linear::LinearBStackAllocator;
+#[cfg(all(feature = "set", feature = "atomic"))]
+pub use segregated::SegregatedBStackAllocator;
 #[cfg(feature = "set")]
 pub use slab::SlabBStackAllocator;
 #[cfg(feature = "set")]
