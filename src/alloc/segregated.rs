@@ -709,25 +709,30 @@ impl SegregatedBStackAllocator {
             k += 1;
         }
 
-        // Non-atomic path
+        // Non-atomic path: lay down every freed piece *before* the prefix. Until
+        // the prefix is written the carved region is not yet exposed as separate
+        // blocks — it still sits inside the block whose header `prefix_off` will
+        // change (a free block for the sole non-atomic caller, oversized non-exact
+        // reuse) — so these writes are invisible to `recover`, and the single
+        // prefix write is the commit point that exposes the already-valid pieces
+        // atomically. A fault before it leaves the whole region reclaimable as it
+        // was. This ordering is only fault-safe because that region is free excess,
+        // never live caller data (non-tail shrink, which owns its tail, takes the
+        // move path without `atomic`).
         #[cfg(not(feature = "atomic"))]
         {
-            // Write the prefix, then each piece's overhead, next_free, and head.
-            self.stack.set(prefix_off, prefix)?;
-            // A crash between these leaves the unlinked region unrecoverable.
             for i in 0..k {
                 // Copy the prefilled overhead into a local buffer, then read the
                 // old head directly into the latter half before writing both.
                 let mut shared = overhead_next[i];
-                // get head directly into shared[8..]
+                // next_free ← current head of this class (read straight in).
                 self.stack.get_into(head_offs[i], &mut shared[8..])?;
-                // Use shared to write overhead and next_free
+                // overhead || next_free, then head ← this block.
                 self.stack.set(block_offs[i], shared)?;
-                // Write head ← block_start
-                // A crash between these two writes leaves the block free-tagged
-                // so it is recoverable by `recover`.
                 self.stack.set(head_offs[i], blockoff_bytes[i])?;
             }
+            // Commit: expose the pieces (and, for a claim, mark the block in use).
+            self.stack.set(prefix_off, prefix)?;
             Ok(())
         }
 
@@ -1296,6 +1301,9 @@ mod tests {
         assert_eq!(&data[100..], &[0u8; 200]);
     }
 
+    // In-place non-tail-shrink carve is atomic-only; without `atomic` the same
+    // realloc takes the fault-safe move path (covered by the round-trip/fault tests).
+    #[cfg(feature = "atomic")]
     #[test]
     fn seg_realloc_cross_class_shrink_non_tail_carves_in_place() {
         let (a, _g) = new_alloc();
@@ -1424,6 +1432,8 @@ mod tests {
         assert_eq!(Seg::largest_class_le(4096), 4096);
     }
 
+    // In-place non-tail-shrink carve is atomic-only (see the sibling test above).
+    #[cfg(feature = "atomic")]
     #[test]
     fn seg_realloc_non_tail_shrink_carves_reusable_blocks() {
         let (a, _g) = new_alloc();
