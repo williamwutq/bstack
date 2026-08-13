@@ -632,16 +632,14 @@ pub use alloc::{
     BStackChunkIter, BStackOwnedSlice, BStackOwnedSliceAllocator, BStackRange, BStackSlice,
     BStackSliceReader, BStackUninitAllocator, DebugCheckingAllocator, LinearBStackAllocator,
 };
+#[cfg(all(feature = "guarded", feature = "atomic"))]
+pub use alloc::{BStackAtomicGuardedSlice, BStackAtomicGuardedSliceSubview};
 #[cfg(all(feature = "alloc", feature = "set"))]
 pub use alloc::{
     BStackByteVec, BStackByteVecIter, BStackSliceWriter, CheckedSlabBStackAllocator,
-    FirstFitBStackAllocator, GhostTreeBstackAllocator, SlabBStackAllocator,
+    FirstFitBStackAllocator, GhostTreeBstackAllocator, SegregatedBStackAllocator,
+    SlabBStackAllocator,
 };
-
-#[cfg(all(feature = "alloc", feature = "set", feature = "atomic"))]
-pub use alloc::SegregatedBStackAllocator;
-#[cfg(all(feature = "guarded", feature = "atomic"))]
-pub use alloc::{BStackAtomicGuardedSlice, BStackAtomicGuardedSliceSubview};
 #[cfg(feature = "guarded")]
 pub use alloc::{BStackGuardedSlice, BStackGuardedSliceSubview};
 

@@ -16,15 +16,30 @@
 //! excess carve), `dealloc`, `realloc` (in-place same-class, tail grow/shrink,
 //! non-tail shrink via greedy carve, non-tail grow via move), and `recover`
 //! (linear-scan free-list rebuild + leak reclaim). Still pending: the background
-//! coalescer and the non-`atomic` degraded path.
+//! coalescer.
 //!
 //! # Feature flags
 //!
-//! Requires `set` + `atomic` (the type is `Send + Sync`). The non-`atomic`
-//! degraded path is deferred to a later pass.
+//! Requires `set`; `atomic` is optional. The module compiles and is fully
+//! functional under both. With `atomic`, free-list splices ride
+//! `process_gen`/`inplace_gen` (write lock held across the dependent read →
+//! modify → write), and the tail grow/shrink/oversized-discard paths use the
+//! size-guarded `try_extend_zeros`/`try_discard` — one locked critical section
+//! that fuses the tail check with the mutation — which also makes the allocator
+//! `Sync`. Without `atomic`, those become a plain read-then-write / `len`-check
+//! then `extend`/`discard`: still crash-safe (each issues a single `bstack`
+//! write, and multi-write splices are leak-preferring), but the allocator is
+//! `Send` and **not** `Sync`, so concurrent use must be externally synchronised.
 
 use super::{BStackAllocError, BStackAllocator, BStackOwnedSlice};
-use crate::{BStack, BStackGenOp};
+use crate::BStack;
+#[cfg(feature = "atomic")]
+use crate::BStackGenOp;
+#[cfg(not(feature = "atomic"))]
+use std::cell::Cell;
+#[cfg(not(feature = "atomic"))]
+use std::marker::PhantomData;
+#[cfg(feature = "atomic")]
 use std::sync::Mutex;
 use std::{fmt, io};
 
@@ -56,19 +71,39 @@ const ALSG_MAGIC_PREFIX: [u8; 6] = *b"ALSG\x00\x01";
 ///
 /// # Thread safety
 ///
-/// Always `Send + Sync`: `alloc`/`dealloc` drive [`BStack::process_gen`] /
+/// `SegregatedBStackAllocator` is always **`Send`** — ownership can be transferred
+/// to another thread safely.
+///
+/// ```
+/// fn assert_send<T: Send>() {}
+/// assert_send::<bstack::SegregatedBStackAllocator>();
+/// ```
+///
+/// Under `atomic`, it is also `Sync`: `alloc`/`dealloc` drive [`BStack::process_gen`] /
 /// [`BStack::inplace_gen`] sequences that hold `BStack`'s write lock across the
 /// dependent read/modify/write, so no allocator-level lock is taken. The
 /// internal [`Mutex`] serialises [`recover`](Self::recover) against itself only.
-#[cfg(all(feature = "set", feature = "atomic"))]
+///
+/// Without `atomic` the type is `!Sync` (this fails to compile); with `atomic`
+/// the internal `Mutex` makes it `Sync` (this compiles):
+///
+#[cfg_attr(not(feature = "atomic"), doc = "```compile_fail")]
+#[cfg_attr(feature = "atomic", doc = "```")]
+/// fn assert_sync<T: Sync>() {}
+/// assert_sync::<bstack::SegregatedBStackAllocator>();
+/// ```
+#[cfg(feature = "set")]
 pub struct SegregatedBStackAllocator {
     stack: BStack,
     /// Serialises [`recover`](Self::recover) against itself; ordinary
     /// alloc/dealloc never take it.
+    #[cfg(feature = "atomic")]
     lock: Mutex<()>,
+    #[cfg(not(feature = "atomic"))]
+    _not_sync: PhantomData<Cell<()>>,
 }
 
-#[cfg(all(feature = "set", feature = "atomic"))]
+#[cfg(feature = "set")]
 impl SegregatedBStackAllocator {
     // Class scheme (compile-time, encoded by the magic version)
     /// Minimum physical block size and the size quantum; every block is a
@@ -230,7 +265,10 @@ impl SegregatedBStackAllocator {
             let _ = stack.extend_sparse(hdr, Self::ARENA_START)?;
             return Ok(Self {
                 stack,
+                #[cfg(feature = "atomic")]
                 lock: Mutex::new(()),
+                #[cfg(not(feature = "atomic"))]
+                _not_sync: PhantomData,
             });
         }
 
@@ -264,7 +302,10 @@ impl SegregatedBStackAllocator {
         }
         let allocator = Self {
             stack,
+            #[cfg(feature = "atomic")]
             lock: Mutex::new(()),
+            #[cfg(not(feature = "atomic"))]
+            _not_sync: PhantomData,
         };
         allocator.recover()?;
         Ok(allocator)
@@ -294,6 +335,7 @@ impl SegregatedBStackAllocator {
     /// `process_gen`-serialised variant is future work. Stops at the first
     /// unclassifiable overhead, counting the remaining arena as unsure.
     pub fn recover(&self) -> io::Result<u64> {
+        #[cfg(feature = "atomic")]
         let _guard = self.lock.lock().unwrap();
         let stack_len = self.stack.len()?;
         if stack_len <= Self::ARENA_START {
@@ -347,10 +389,28 @@ impl SegregatedBStackAllocator {
 
     /// Pop the head of `class`, returning its block-start offset or `None`.
     ///
+    /// The method is **not** thread-safe and must be externally synchronised if the
+    /// allocator is used concurrently. However, since it only issues one `bstack`
+    /// write, it is trivially crash-safe.
+    #[cfg(not(feature = "atomic"))]
+    fn pop_class(&self, class: u64) -> io::Result<Option<u64>> {
+        let head_off = Self::head_off(class);
+        let head = u64::from_le_bytes(read_bstack!(self.stack, head_off => u64));
+        if head == Self::SENTINEL {
+            return Ok(None);
+        }
+        let next = u64::from_le_bytes(read_bstack!(self.stack, head + Self::OVERHEAD => u64));
+        self.stack.set(head_off, next.to_le_bytes())?;
+        Ok(Some(head))
+    }
+
+    /// Pop the head of `class`, returning its block-start offset or `None`.
+    ///
     /// Drives one [`BStack::process_gen`] holding the write lock across
     /// read-head → read-next → advance-head, closing the ABA window. The claim
     /// (overhead flip + data scrub) is a separate write on the now-detached
     /// block; a crash between leaks ≤ 1 block, reclaimed by `recover`.
+    #[cfg(feature = "atomic")]
     fn pop_class(&self, class: u64) -> io::Result<Option<u64>> {
         let head_off = Self::head_off(class);
         let mut head_buf = [0u8; 8];
@@ -396,6 +456,36 @@ impl SegregatedBStackAllocator {
     /// returning `(block_start, actual_size)`; a head smaller than `need` is left
     /// in place (the O(1) pop-if-head-fits rule — no search). The caller uses the
     /// first `need` bytes and carves any excess (`actual_size − need`).
+    ///
+    /// The method is **not** thread-safe and must be externally synchronised if the
+    /// allocator is used concurrently. Since this only issues one `bstack` write, it
+    /// is trivially crash-safe.
+    #[cfg(not(feature = "atomic"))]
+    fn pop_oversized(&self, need: u64) -> io::Result<Option<(u64, u64)>> {
+        let head_off = Self::head_off(Self::OVERSIZED_CLASS);
+        let head = u64::from_le_bytes(read_bstack!(self.stack, head_off => u64));
+        if head == Self::SENTINEL {
+            return Ok(None);
+        }
+        let word = u64::from_le_bytes(read_bstack!(self.stack, head => u64));
+        // Free head must have the high bit clear; its size is word << 4.
+        let size = word << 4;
+        if word & Self::IN_USE_BIT != 0 || size < need {
+            return Ok(None);
+        }
+        let next = u64::from_le_bytes(read_bstack!(self.stack, head + Self::OVERHEAD => u64));
+        self.stack.set(head_off, next.to_le_bytes())?;
+        Ok(Some((head, size)))
+    }
+
+    /// Pop the oversized head if its stored physical size is **≥ `need`**,
+    /// returning `(block_start, actual_size)`; a head smaller than `need` is left
+    /// in place (the O(1) pop-if-head-fits rule — no search). The caller uses the
+    /// first `need` bytes and carves any excess (`actual_size − need`).
+    ///
+    /// A single [`BStack::process_gen`] holds the write lock across read-head →
+    /// read-overhead → read-next → advance-head, removing any ABA window.
+    #[cfg(feature = "atomic")]
     fn pop_oversized(&self, need: u64) -> io::Result<Option<(u64, u64)>> {
         let head_off = Self::head_off(Self::OVERSIZED_CLASS);
         let mut head_buf = [0u8; 8];
@@ -460,6 +550,8 @@ impl SegregatedBStackAllocator {
 
     /// Build the `block`-byte claim buffer (`in_use | len` overhead, `copy_from`
     /// prefix read straight in, rest zero) without writing it.
+    ///
+    /// Shared by both `atomic` and non-`atomic` paths.
     fn claim_buf(
         &self,
         block: u64,
@@ -467,7 +559,7 @@ impl SegregatedBStackAllocator {
         copy_from: Option<(u64, u64)>,
     ) -> io::Result<Vec<u8>> {
         let mut buf = vec![0u8; block as usize];
-        buf[..8].copy_from_slice(&(Self::IN_USE_BIT | len).to_le_bytes());
+        write_buf!(Self::IN_USE_BIT | len => buf, 0);
         if let Some((src, n)) = copy_from {
             self.stack.get_into(src, &mut buf[8..8 + n as usize])?;
         }
@@ -487,6 +579,9 @@ impl SegregatedBStackAllocator {
         if block <= Self::MAX_CLASS {
             let class = Self::classify(block);
             if let Some(bs) = self.pop_class(class)? {
+                // In both atomic and non-atomic paths, a failure between the pop
+                // and the claim leaves the block free-tagged and reachable from
+                // the head, so a crash is recoverable by `recover`.
                 let buf = self.claim_buf(block, len, copy_from)?;
                 self.stack.set(bs, buf)?;
                 return Ok(bs + Self::OVERHEAD);
@@ -494,6 +589,7 @@ impl SegregatedBStackAllocator {
         } else if let Some((bs, actual)) = self.pop_oversized(block)? {
             let buf = self.claim_buf(block, len, copy_from)?;
             if actual == block {
+                // See the same reasoning for crash recovery above.
                 self.stack.set(bs, buf)?;
             } else {
                 // Non-exact reuse: claim `block` bytes and carve the excess, all
@@ -511,37 +607,47 @@ impl SegregatedBStackAllocator {
     }
 
     /// Push `block_start` (physical size `size`, head index `class`) onto its
-    /// free list, bundling the overhead flip, `next_free`, and head-slot write
-    /// into one crash-atomic [`BStack::inplace_gen`] transaction.
+    /// free list, bundling the overhead flip.
     fn push(&self, block_start: u64, size: u64, class: u64) -> io::Result<()> {
         let head_off = Self::head_off(class);
-        let free_word = (size >> 4).to_le_bytes(); // free tag: high bit clear
         let start_bytes = block_start.to_le_bytes();
-        let mut head_buf = [0u8; 8];
+        // overhead || next_free: contiguous fields (OVERHEAD == 8 == size_of head),
+        // so both are staged in one 16-byte buffer and written in a single op.
+        let mut overhead_buf = [0u8; 16];
+        write_buf!(size >> 4 => overhead_buf, 0); // free tag: high bit clear
+        #[cfg(not(feature = "atomic"))]
+        {
+            // Non-atomic path: read head, write overhead+next_free, write head.
+            let head = u64::from_le_bytes(read_bstack!(self.stack, head_off => u64));
+            write_buf!(head => overhead_buf, 8);
+            self.stack.set(block_start, overhead_buf)?;
+            // A crash between these two writes leaves the block free-tagged so it is
+            // recoverable by `recover`.
+            self.stack.set(head_off, start_bytes)
+        }
+        #[cfg(feature = "atomic")]
         let mut step = 0u32;
+        #[cfg(feature = "atomic")]
         self.stack.inplace_gen(|_res| {
             let op = match step {
-                // Read the current head (no writes staged yet ⇒ committed value).
+                // Read the current head into next_free's half (no writes staged
+                // yet ⇒ committed value).
                 0 => Some(BStackGenOp::Read {
                     offset: head_off,
-                    // SAFETY: `head_buf` outlives this call.
-                    buf: unsafe { core::mem::transmute::<&mut [u8], &mut [u8]>(&mut head_buf[..]) },
+                    // SAFETY: `overhead_buf` outlives this call.
+                    buf: unsafe {
+                        core::mem::transmute::<&mut [u8], &mut [u8]>(&mut overhead_buf[8..])
+                    },
                 }),
-                // overhead ← free | size
+                // overhead ← free | size; next_free ← old head
                 1 => Some(BStackGenOp::Write {
                     offset: block_start,
-                    // SAFETY: `free_word` outlives this call.
-                    data: unsafe { core::mem::transmute::<&[u8], &[u8]>(&free_word[..]) },
-                }),
-                // next_free ← old head
-                2 => Some(BStackGenOp::Write {
-                    offset: block_start + Self::OVERHEAD,
-                    // SAFETY: `head_buf` outlives this call and is not mutated
-                    // after step 0's read resolved.
-                    data: unsafe { core::mem::transmute::<&[u8], &[u8]>(&head_buf[..]) },
+                    // SAFETY: `overhead_buf` outlives this call and is not
+                    // mutated after step 0's read resolved.
+                    data: unsafe { core::mem::transmute::<&[u8], &[u8]>(&overhead_buf[..]) },
                 }),
                 // head[class] ← block_start
-                3 => Some(BStackGenOp::Write {
+                2 => Some(BStackGenOp::Write {
                     offset: head_off,
                     // SAFETY: `start_bytes` outlives this call.
                     data: unsafe { core::mem::transmute::<&[u8], &[u8]>(&start_bytes[..]) },
@@ -580,9 +686,9 @@ impl SegregatedBStackAllocator {
         const N: usize = SegregatedBStackAllocator::MAX_CARVE_PIECES;
         let mut block_offs = [0u64; N]; // piece block starts
         let mut head_offs = [0u64; N]; // free-list head slot per piece
-        let mut overheads = [[0u8; 8]; N]; // free | size tag per piece
         let mut blockoff_bytes = [[0u8; 8]; N]; // block start LE, for head writes
-        let mut nexts = [[0u8; 8]; N]; // old head per piece, filled by reads
+        // Per-piece 16-byte buffer: [0..8]=overhead (free|size), [8..16]=next_free (old head)
+        let mut overhead_next = [[0u8; 16]; N];
         let mut k = 0usize;
         let mut off = region_start;
         let mut rem = region_size;
@@ -595,69 +701,98 @@ impl SegregatedBStackAllocator {
             debug_assert!(k < N, "greedy carve exceeded MAX_CARVE_PIECES");
             block_offs[k] = off;
             head_offs[k] = Self::head_off(Self::classify(ps));
-            overheads[k] = (ps >> 4).to_le_bytes();
+            write_buf!(ps >> 4 => overhead_next[k], 0);
             blockoff_bytes[k] = off.to_le_bytes();
             off += ps;
             rem -= ps;
             k += 1;
         }
 
+        // Non-atomic path
+        #[cfg(not(feature = "atomic"))]
+        {
+            // Write the prefix, then each piece's overhead, next_free, and head.
+            self.stack.set(prefix_off, prefix)?;
+            // A crash between these leaves the unlinked region unrecoverable.
+            for i in 0..k {
+                // Copy the prefilled overhead into a local buffer, then read the
+                // old head directly into the latter half before writing both.
+                let mut shared = overhead_next[i];
+                // get head directly into shared[8..]
+                self.stack.get_into(head_offs[i], &mut shared[8..])?;
+                // Use shared to write overhead and next_free
+                self.stack.set(block_offs[i], shared)?;
+                // Write head ← block_start
+                // A crash between these two writes leaves the block free-tagged
+                // so it is recoverable by `recover`.
+                self.stack.set(head_offs[i], blockoff_bytes[i])?;
+            }
+            Ok(())
+        }
+
+        // Atomic path with `inplace_gen` transaction: read each head, write the prefix,
+        // then write each piece's overhead, next_free, and head. A crash leaves the
+        // block either wholly un-shrunk or fully shrunk-and-freed, never a mid-arena gap.
         // Steps: [0, k) read each head; k writes the prefix; then 3 writes per
         // piece (overhead, next_free, head); then None commits the batch.
-        let mut step = 0usize;
-        self.stack.inplace_gen(|_res| {
-            let op = if step < k {
-                // Read the committed head of piece `step`'s class (no head writes
-                // staged yet ⇒ this is the current head, captured as next_free).
-                Some(BStackGenOp::Read {
-                    offset: head_offs[step],
-                    // SAFETY: `nexts` outlives this call; each slot is read then
-                    // written at distinct steps, never aliased simultaneously.
-                    buf: unsafe {
-                        core::mem::transmute::<&mut [u8], &mut [u8]>(&mut nexts[step][..])
-                    },
-                })
-            } else if step == k {
-                Some(BStackGenOp::Write {
-                    offset: prefix_off,
-                    // SAFETY: `prefix` outlives this call.
-                    data: unsafe { core::mem::transmute::<&[u8], &[u8]>(prefix) },
-                })
-            } else if step < k + 1 + 3 * k {
-                let j = step - (k + 1);
-                let i = j / 3;
-                Some(match j % 3 {
-                    // overhead ← free | size
-                    0 => BStackGenOp::Write {
-                        offset: block_offs[i],
-                        // SAFETY: `overheads` outlives this call.
-                        data: unsafe { core::mem::transmute::<&[u8], &[u8]>(&overheads[i][..]) },
-                    },
-                    // next_free ← this class's old head (read above)
-                    1 => BStackGenOp::Write {
-                        offset: block_offs[i] + Self::OVERHEAD,
-                        // SAFETY: `nexts` outlives this call.
-                        data: unsafe { core::mem::transmute::<&[u8], &[u8]>(&nexts[i][..]) },
-                    },
-                    // head[class] ← this block
-                    _ => BStackGenOp::Write {
-                        offset: head_offs[i],
-                        // SAFETY: `blockoff_bytes` outlives this call.
-                        data: unsafe {
-                            core::mem::transmute::<&[u8], &[u8]>(&blockoff_bytes[i][..])
+        #[cfg(feature = "atomic")]
+        {
+            let mut step = 0usize;
+            // `overhead_next` already holds the per-piece overhead in its first
+            // 8 bytes; we will read each head directly into its second half.
+            self.stack.inplace_gen(|_res| {
+                let op = if step < k {
+                    // Read the committed head of piece `step`'s class (no head writes
+                    // staged yet ⇒ this is the current head, captured as next_free).
+                    Some(BStackGenOp::Read {
+                        offset: head_offs[step],
+                        // SAFETY: `overhead_next` outlives this call; we read the
+                        // old head straight into its upper 8 bytes so a later write
+                        // can emit both overhead and next_free together.
+                        buf: unsafe {
+                            core::mem::transmute::<&mut [u8], &mut [u8]>(
+                                &mut overhead_next[step][8..],
+                            )
                         },
-                    },
-                })
-            } else {
-                None
-            };
-            step += 1;
-            op
-        })
+                    })
+                } else if step == k {
+                    Some(BStackGenOp::Write {
+                        offset: prefix_off,
+                        // SAFETY: `prefix` outlives this call.
+                        data: unsafe { core::mem::transmute::<&[u8], &[u8]>(prefix) },
+                    })
+                } else if step < k + 1 + 2 * k {
+                    let j = step - (k + 1);
+                    let i = j / 2;
+                    Some(match j % 2 {
+                        // overhead || next_free (combined 16-byte write)
+                        0 => BStackGenOp::Write {
+                            offset: block_offs[i],
+                            // SAFETY: `overhead_next` outlives this call.
+                            data: unsafe {
+                                core::mem::transmute::<&[u8], &[u8]>(&overhead_next[i][..])
+                            },
+                        },
+                        // head[class] ← this block
+                        _ => BStackGenOp::Write {
+                            offset: head_offs[i],
+                            // SAFETY: `blockoff_bytes` outlives this call.
+                            data: unsafe {
+                                core::mem::transmute::<&[u8], &[u8]>(&blockoff_bytes[i][..])
+                            },
+                        },
+                    })
+                } else {
+                    None
+                };
+                step += 1;
+                op
+            })
+        }
     }
 }
 
-#[cfg(all(feature = "set", feature = "atomic"))]
+#[cfg(feature = "set")]
 impl fmt::Debug for SegregatedBStackAllocator {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SegregatedBStackAllocator")
@@ -666,7 +801,7 @@ impl fmt::Debug for SegregatedBStackAllocator {
     }
 }
 
-#[cfg(all(feature = "set", feature = "atomic"))]
+#[cfg(feature = "set")]
 impl BStackAllocator for SegregatedBStackAllocator {
     type Error = io::Error;
     type Allocated<'a> = BStackOwnedSlice<'a, Self>;
@@ -698,8 +833,8 @@ impl BStackAllocator for SegregatedBStackAllocator {
     /// | Case | Strategy |
     /// |------|----------|
     /// | Same class (`new_len` maps to this block) | rewrite overhead `len`; zero the grown tail on grow |
-    /// | Grow at tail | `try_extend_zeros` in place, then rewrite `len` |
-    /// | Shrink at tail | rewrite `len`, then `try_discard` the excess in place |
+    /// | Grow at tail | extend the tail in place (zero-filled), then rewrite `len` |
+    /// | Shrink at tail | rewrite `len`, then discard the excess tail in place |
     /// | Non-tail shrink | rewrite `len` + greedy-carve the freed tail into free blocks — one crash-atomic [`commit_carve`](Self::commit_carve) |
     /// | Non-tail grow | alloc new class, copy, dealloc old |
     ///
@@ -775,11 +910,28 @@ impl BStackAllocator for SegregatedBStackAllocator {
                 return Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, start, new_len) });
             }
 
-            // Grow at the tail: extend the physical block in place. Extend first
-            // (leak-preferring: a failure after it only leaks the extension, not
-            // corrupts), then zero the old slack, then commit the new length.
+            // Grow at the tail: extend the physical block in place, only when the
+            // block ends at the payload tail. Extend first (leak-preferring: a
+            // failure after it only leaks the extension, not corrupts), then zero
+            // the old slack, then commit the new length. Under `atomic`,
+            // `try_extend_zeros` fuses the tail check and the grow into one locked
+            // critical section; otherwise we check `len` then `extend` (which
+            // zero-fills the new region via `set_len`).
             let old_end = block_start + old_size; // block exists ⇒ ≤ stack_len
-            if new_size > old_size && self.stack.try_extend_zeros(old_end, new_size - old_size)? {
+            let grew = new_size > old_size && {
+                #[cfg(feature = "atomic")]
+                {
+                    self.stack.try_extend_zeros(old_end, new_size - old_size)?
+                }
+                #[cfg(not(feature = "atomic"))]
+                {
+                    old_end == self.stack.len()? && {
+                        self.stack.extend(new_size - old_size)?;
+                        true
+                    }
+                }
+            };
+            if grew {
                 // Old block's slack [start+old_len, old_end) may hold stale bytes
                 // from a prior shrink; the extension past old_end is already zero.
                 let slack = (old_size - Self::OVERHEAD) - old_len;
@@ -794,17 +946,31 @@ impl BStackAllocator for SegregatedBStackAllocator {
 
             // Shrink at the tail: drop the excess physically in place. Commit the
             // new length first (leak-preferring: a crash before the discard leaves
-            // an orphaned zero tail that `recover` reclaims, never corruption). A
-            // lost race (concurrent tail extension) reverts and falls to the move.
+            // an orphaned zero tail that `recover` reclaims, never corruption).
             if new_size < old_size && old_end == self.stack.len()? {
                 self.stack
                     .set(block_start, (Self::IN_USE_BIT | new_len).to_le_bytes())?;
-                if self.stack.try_discard(old_end, old_size - new_size)? {
+                // Under `atomic`, `try_discard` re-checks the tail atomically; a
+                // lost race (concurrent tail extension) reverts the length and
+                // falls through to the carve/move paths. Without `atomic` the
+                // `len` guard above already established the tail, so discard plainly.
+                #[cfg(feature = "atomic")]
+                {
+                    if self.stack.try_discard(old_end, old_size - new_size)? {
+                        // SAFETY: block shrunk in place to the new class at the tail.
+                        return Ok(unsafe {
+                            BStackOwnedSlice::from_raw_parts(self, start, new_len)
+                        });
+                    }
+                    self.stack
+                        .set(block_start, (Self::IN_USE_BIT | old_len).to_le_bytes())?;
+                }
+                #[cfg(not(feature = "atomic"))]
+                {
+                    self.stack.discard(old_size - new_size)?;
                     // SAFETY: block shrunk in place to the new class at the tail.
                     return Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, start, new_len) });
                 }
-                self.stack
-                    .set(block_start, (Self::IN_USE_BIT | old_len).to_le_bytes())?;
             }
 
             // Non-tail shrink: keep the block at the new class and free the excess
@@ -887,7 +1053,16 @@ impl BStackAllocator for SegregatedBStackAllocator {
                 let end = block_start.checked_add(size).ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidInput, "block end overflows u64")
                 })?;
+                // Oversized tail block: hand its bytes back to the stack instead of
+                // the free list. Under `atomic`, `try_discard` fuses the tail check
+                // and the drop; otherwise check `len` then `discard`.
+                #[cfg(feature = "atomic")]
                 if self.stack.try_discard(end, size)? {
+                    return Ok(());
+                }
+                #[cfg(not(feature = "atomic"))]
+                if end == self.stack.len()? {
+                    self.stack.discard(size)?;
                     return Ok(());
                 }
             }
@@ -906,7 +1081,7 @@ impl BStackAllocator for SegregatedBStackAllocator {
     }
 }
 
-#[cfg(all(test, feature = "set", feature = "atomic"))]
+#[cfg(all(test, feature = "set"))]
 mod _assertions {
     use super::SegregatedBStackAllocator;
     fn _send()
@@ -914,6 +1089,7 @@ mod _assertions {
         SegregatedBStackAllocator: Send,
     {
     }
+    #[cfg(feature = "atomic")]
     fn _sync()
     where
         SegregatedBStackAllocator: Sync,
@@ -921,7 +1097,7 @@ mod _assertions {
     }
 }
 
-#[cfg(all(test, feature = "set", feature = "atomic"))]
+#[cfg(all(test, feature = "set"))]
 mod tests {
     use super::SegregatedBStackAllocator as Seg;
     use crate::BStack;
@@ -1054,7 +1230,7 @@ mod tests {
         let (a, _g) = new_alloc();
         // 90 and 100 both map to block 112 (class 6): a same-class resize.
         let mut s = a.alloc(90).unwrap();
-        s.write(&[0xABu8; 90]).unwrap();
+        s.write([0xABu8; 90]).unwrap();
         let off = s.start();
         let s = a.realloc(s, 100).unwrap();
         assert_eq!(s.start(), off, "same-class grow stays in place");
@@ -1067,7 +1243,7 @@ mod tests {
     fn seg_realloc_same_class_shrink_then_grow_has_no_stale_bytes() {
         let (a, _g) = new_alloc();
         let mut s = a.alloc(100).unwrap(); // block 112
-        s.write(&[0xCDu8; 100]).unwrap();
+        s.write([0xCDu8; 100]).unwrap();
         let s = a.realloc(s, 90).unwrap(); // same class, shrink (stale [90,100))
         let s = a.realloc(s, 100).unwrap(); // same class, grow back
         let data = s.read().unwrap();
@@ -1083,7 +1259,7 @@ mod tests {
     fn seg_realloc_tail_grow_in_place() {
         let (a, _g) = new_alloc();
         let mut s = a.alloc(100).unwrap(); // block 112, at the tail
-        s.write(&[7u8; 100]).unwrap();
+        s.write([7u8; 100]).unwrap();
         let off = s.start();
         let len_before = a.stack().len().unwrap();
         let s = a.realloc(s, 200).unwrap(); // need 208 (class 12) > 112: cross-class
@@ -1098,7 +1274,7 @@ mod tests {
     fn seg_realloc_cross_class_grow_non_tail_moves() {
         let (a, _g) = new_alloc();
         let mut s = a.alloc(100).unwrap(); // block 112
-        s.write(&[9u8; 100]).unwrap();
+        s.write([9u8; 100]).unwrap();
         let off = s.start();
         let _pin = a.alloc(100).unwrap(); // pins the tail so `s` is interior
         let s = a.realloc(s, 300).unwrap(); // cross-class, non-tail → move
@@ -1112,7 +1288,7 @@ mod tests {
     fn seg_realloc_cross_class_shrink_non_tail_carves_in_place() {
         let (a, _g) = new_alloc();
         let mut s = a.alloc(200).unwrap(); // block 208 (class 12)
-        s.write(&[0x5Au8; 200]).unwrap();
+        s.write([0x5Au8; 200]).unwrap();
         let off = s.start();
         let base = off - Seg::OVERHEAD;
         let _pin = a.alloc(100).unwrap(); // pins the tail so `s` is interior
@@ -1160,7 +1336,7 @@ mod tests {
     fn seg_realloc_tail_shrink_in_place() {
         let (a, _g) = new_alloc();
         let mut s = a.alloc(200).unwrap(); // block 208, at the tail
-        s.write(&[0x3Cu8; 200]).unwrap();
+        s.write([0x3Cu8; 200]).unwrap();
         let off = s.start();
         let len_before = a.stack().len().unwrap();
         let s = a.realloc(s, 100).unwrap(); // new class 112 < 208, at tail → discard
@@ -1236,7 +1412,7 @@ mod tests {
     fn seg_realloc_non_tail_shrink_carves_reusable_blocks() {
         let (a, _g) = new_alloc();
         let mut s = a.alloc(1000).unwrap(); // block 1024 (class 23)
-        s.write(&[0x77u8; 1000]).unwrap();
+        s.write([0x77u8; 1000]).unwrap();
         let off = s.start();
         let base = off - Seg::OVERHEAD;
         let _pin = a.alloc(200).unwrap(); // class 12 — pins the tail, s is interior
