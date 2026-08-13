@@ -142,3 +142,110 @@ Reference: https://github.com/williamwutq/bstack/pull/37
 - **Unstable sort.** Whether to also provide `sort_unstable_by`/`sort_unstable_by_key`, mirroring `std`'s stable/unstable split — unstable sort does fewer chunk moves at the cost of stability, which may matter more once movement is spread across multiple sections/passes.
 - **Threshold sizing.** How the small/medium/large boundary and section size are chosen, and whether it should be caller-configurable given the memory/atomicity tradeoff is now explicit.
 - **Batch staging cost.** `set_batched` still stages every block's bytes into the multi-write journal before committing, so the final pass's staging cost scales with the number and size of the (new_offset, chunk_bytes) pairs it's fed — worth measuring against the current single-`process` cost before committing to this as the merge-commit strategy.
+
+## Lifetime ergonomics for `process_gen` / `inplace_gen` (local-buffer ops)
+
+**Feature flag:** none required for the macro path; the parallel API is available on the same feature surface as today's `process_gen` / `inplace_gen` (core + whatever gates the underlying journal / atomic primitives).
+**Breaking change:** No for the additive paths (macro + parallel API). The existing `process_gen` / `inplace_gen` signatures remain; deprecation of the old form is opt-in and deferred until the parallel API is stablized and widely adopted.
+
+### Motivation
+
+`BStack::process_gen` and `BStack::inplace_gen` take a higher-order closure that returns `Option<BStackGenOp<'a>>`:
+
+```rust
+pub fn process_gen<'a, F>(&self, mut f: F) -> io::Result<()>
+where
+    F: FnMut() -> Option<BStackGenOp<'a>>;
+
+fn inplace_gen<'a, F>(&self, mut f: F) -> io::Result<()>
+where
+    F: FnMut(io::Result<()>) -> Option<BStackGenOp<'a>>;
+```
+
+Call sites that need to hand the generated op a short-lived scratch buffer (e.g. an 8-byte head/next pointer) must today write:
+
+```rust
+buf: unsafe { core::mem::transmute::<&mut [u8], &mut [u8]>(&mut head_buf[..]) },
+```
+
+The transmute is sound — the buffers are stack-allocated outside the `process_gen` / `inplace_gen` call and therefore outlive every invocation of the closure and every use of the returned `BStackGenOp` — but the current borrow checker cannot see it. The same pattern is rejected under Polonius Alpha (`-Zpolonius` / `-Zpolonius=next` on current nightly) and is outside the stated scope of Full Polonius (which targets additional flow-sensitivity for linked-list / cursor patterns, not the `FnMut` + named-lifetime escape rule).
+
+Relevant references:
+
+- NLL / Polonius background and the limits of Alpha: https://blog.rust-lang.org/2026/08/04/enabling-polonius-alpha-on-nightly/
+- Project goal “Stabilize and model Polonius Alpha”: https://rust-lang.github.io/goals/2026/polonius.html
+- “The Borrow Checker Within” roadmap (Full Polonius = more flow-sensitivity for linked-list reborrowing; not this closure-escape case): https://rust-lang.github.io/rust-project-goals/2026/roadmap-borrow-checker-within.html
+- Classic diagnostic: “captured variable cannot escape `FnMut` closure body”
+
+The three options below standardise the sound workaround, offer a long-term safe API, and (optionally) provide a heavier macro that can prove the common “stack buffer outlives the call” pattern without an explicit transmute at the call site.
+
+### Design
+
+#### 1. Standardised unsafe macro (immediate, zero-cost)
+
+Introduce a small declarative macro whose name contains `unsafe` so that every use is visibly unsafe, yet the caller does not need to write an `unsafe` block themselves:
+
+```rust
+// Suggested name (bikeshed-friendly)
+bstack_unsafe_reborrow_mut!(head_buf[..] as &mut [u8])
+bstack_unsafe_reborrow!(next_buf[..] as &[u8])
+```
+
+- Accepts an expression and a target type (or infers the target from context).
+- Expands to the `transmute` (or an equivalent `ptr::from_ref` / `from_mut` + cast) that strips the short local lifetime and reattaches the longer `'a` demanded by `BStackGenOp<'a>`.
+- Documented invariant: the referent must outlive the entire enclosing `process_gen` / `inplace_gen` call; the macro does not and cannot check this.
+- Applies identically to both `process_gen` and `inplace_gen` call sites.
+
+This is purely a readability / auditability win: the same sound transmute, written once, greppable, and clearly marked.
+
+#### 2. Parallel “out-parameter” API (safe, preferred long-term)
+
+Add a second pair of methods that invert the data flow:
+
+```rust
+pub fn process_gen_with<'a, F>(&self, mut f: F) -> io::Result<()>
+where
+    F: for<'b> FnMut(Option<&'b mut BStackGenOp<'a>>) -> ControlFlow<()>;
+// or a simpler form that always passes a slot:
+// F: FnMut(&mut Option<BStackGenOp<'a>>) -> bool  // true = continue
+```
+
+(and the analogous `inplace_gen_with`).
+
+- The closure receives a mutable slot (`&mut Option<BStackGenOp<'a>>` or `Option<&mut BStackGenOp<'a>>`).
+- It fills the slot with the next op (or leaves it `None` to terminate).
+- Because the `BStackGenOp` value is constructed *inside* the callee’s stack frame for the duration of one iteration, the short-lived buffers can be borrowed with ordinary reborrows; no named lifetime needs to escape the closure.
+- The old `process_gen` / `inplace_gen` remain supported. After at least one minor-version cycle of the new API being available, the old forms are soft-deprecated with a migration note pointing at `*_with` and at the unsafe macro for callers that cannot yet switch.
+
+This solves the root cause for new code while keeping the existing surface stable.
+
+#### 3. Analysing macro (`bstack_process_gen_expr!` / `bstack_inplace_gen_expr!`)
+
+A heavier macro that accepts a block containing both the buffer allocations and the generator body:
+
+```rust
+bstack_process_gen_expr! {
+    let mut head_buf = [0u8; 8];
+    let mut next_buf = [0u8; 8];
+    let mut step = 0usize;
+    // process_gen call is implicit
+    || {
+        let op = match step { /* ... */ };
+        step += 1;
+        op   // may borrow head_buf / next_buf
+    }
+}
+```
+
+- The macro parses the leading `let` bindings that are simple array / slice allocations (or `Vec` with a known capacity that stays on the stack for the duration of the expansion).
+- It rewrites the body so that the generated `BStackGenOp`s use the standardised unsafe reborrow (option 1) under the hood, or, when the pattern is simple enough, emits the out-parameter form (option 2) instead.
+- Static assertions (or a small const-eval helper) document the intended invariant; the macro never claims to be a full borrow-checker replacement.
+- The same shape is provided for `inplace_gen` (`bstack_inplace_gen_expr!`).
+
+This is the highest-ergonomics option for the common “scratch buffers + step-machine generator” pattern, at the cost of macro complexity and the usual hygiene / diagnostics trade-offs.
+
+### Open questions
+
+- Exact spelling of the unsafe macro (`bstack_unsafe_reborrow_mut!` vs `bstack_reborrow_mut_unchecked!` etc.).
+- Whether the out-parameter API uses `ControlFlow`, a `bool` continue flag, or an iterator-style `next`-like trait object for maximum flexibility.
+- How aggressively the analysing macro should accept `Vec` / `SmallVec` scratch space versus restricting itself to fixed-size arrays.
