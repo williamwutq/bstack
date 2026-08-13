@@ -17,16 +17,17 @@ omitted except where trivial.
   struct with a `Foreign` field, and casting for the wide-pointer relationship,
   were flagged as still-open in the project notes; needs confirmation that
   `bstack_move!` yields the right typed value at the foreign location.
-- **Registry lazy-init not implemented** — only explicit `registry::init(path)`;
+- [WONTFIX] **Registry lazy-init not implemented** — only explicit `registry::init(path)`;
   the intended "init on first live attach" path was left unresolved (no registry
-  path source).
+  path source). This is an explicit limitation since we do not know the path to the registry file at first attach, so it is not a bug.
 - **`ForeignHost` lacks batched/generator ops**, so a cross-file clone's home
   commit and foreign side cannot be one atomic unit (best-effort only — see §3).
-- **`wal::reduce`'s groupoid slice-reuse optimization is unwired.** Fully
+- [WONTFIX] **`wal::reduce`'s groupoid slice-reuse optimization is unwired.** Fully
   implemented and unit-tested (`AllocReq` / `Reduced` / `reduce`, now
   `#[cfg(test)]` — see §6), but nothing in `bulk`/`clone`/`teardown` calls it:
   no commit path currently repurposes a same-length freed slice for a fresh
   allocation instead of freeing then reallocating.
+  This plan seems nice, but cloning only allocates, teardown only frees, and resizing never reuses a freed slice, so in practice there is no case where this optimization would be used. If such a path exists in the future, it can be wired in then.
 
 ## 2. Code quality
 
@@ -170,10 +171,18 @@ Residual points, all *leak-only* (permitted) but worth recording:
   `stdlib/*` (no-length inline `Buf8`/`Buf40`, `Heap` fallback).
 - No bulk alloc/free in clone/teardown (§1) even when the concrete allocator
   implements `BStackBulkAllocator`.
-- **Double read per strong child in clone**: `ClonePlan::bump_strong` calls
-  `strong_parts` (a read to find the control offset) during planning, then the
-  commit's `inplace_gen` reads the same counter again.
-- Reads are buffer-copy based (no mmap zero-copy) — documented inherent limitation.
+- [WONTFIX] **Two round trips per `(rc, weak)` strong child in clone**: `ClonePlan::bump_strong`
+  reads the child's back-pointer field during planning (`strong_parts` →
+  `read_ctrl_ref`, to locate the control block), then the commit's `inplace_gen`
+  separately reads the strong *counter* field at that location (to compute the
+  increment and check overflow before any write). Two different fields, not a
+  redundant re-read of the same one, but two lock acquisitions where one might
+  theoretically suffice via a dependent-read round (as `atomic_update` does).
+  Not worth it: the saving is dwarfed by the clone's already-unbatched
+  `alloc()` calls per new block, and merging the reads means threading a
+  direct/indirect distinction through `ClonePlan.bumps` and re-verifying the
+  overflow-before-write guarantee in the crate's most crash-sensitive commit
+  path — real risk for an unmeasurable win.
 
 ## 9. Duplicated code
 
@@ -182,12 +191,22 @@ Residual points, all *leak-only* (permitted) but worth recording:
   `transmute`s — in `teardown::wal_free_all`, `clone::commit_inner`, and each
   stdlib collection's commit path. A single `batched_commit` helper would remove
   the duplication *and* shrink the unsafe surface in §5.
-- **`(offset, value.to_le_bytes().to_vec())` write-tuple construction** is repeated
+- [FIXED] **`(offset, value.to_le_bytes().to_vec())` write-tuple construction** is repeated
   hundreds of times across `stdlib/*` and the codegen; a tiny constructor helper
   (`w8(off, val)`) would compress it.
-- Every stdlib collection repeats a "read `OnDisk` header → mutate counters →
+- [FIXED] Every stdlib collection repeats a "read `OnDisk` header → mutate counters →
   `set_batched`" shape; some of it could share a helper (this is runtime code, not
   the struct-vs-enum codegen that was explicitly excluded).
+  The fixed-metadata push/pop shape (`deque`/`list`) and the probe-based
+  insert/remove shape (`map`/`hashset`/`btreeset`/`tree`) were already unified via
+  `atomic_update`/`probe_commit` (`stdlib/util.rs`). The remaining bespoke sites
+  (`heap` sift, `bloom` counters, B-tree split/merge) are structurally too
+  different to unify without over-abstracting. But `BStackHashMap::grow` and
+  `BStackHashSet::grow` were near line-for-line duplicates of the same
+  rehash-into-bigger-table algorithm (differing only in whether a bucket carries
+  a trailing value ref) — extracted into a shared `grow_table` in `stdlib/util.rs`
+  that treats the trailing bytes as opaque payload copied alongside the key.
+  Both `grow` methods are now thin wrappers.
 
 ## 10. Feature interactions
 
@@ -263,7 +282,7 @@ so they are not re-flagged).
   won't compile. Probably intended (a map has no meaningful field-destructure), but
   it is an undocumented asymmetry. (It does *not* block a collection from being a
   moved-out `#[bstack_owned]` field — that path needs only `BStackBlock`.)
-- [WONTFIX] **stdlib grow/realloc multi-block atomicity unverified.** `hashmap`/`deque`/`tree`
+- **stdlib grow/realloc multi-block atomicity unverified.** `hashmap`/`deque`/`tree`
   growth allocates a fresh backing block, copies into it, flips the descriptor, and
   frees the old block. Whether each is a single atomic descriptor flip (leak-only on
   crash) or has a torn window was not checked — a category to verify, likely

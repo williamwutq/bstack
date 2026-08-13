@@ -34,13 +34,14 @@ use core::mem::size_of;
 use std::io;
 
 use crate::BStackRaiiAllocator;
-use bstack::{BStack, BStackGenOp, BStackRange};
+use bstack::{BStack, BStackRange};
 use bytemuck::{Pod, Zeroable};
 
 use super::bloom::{BStackCountingBloomFilter, BloomOnDisk};
 use super::hash::fnv1a;
 use super::util::{
-    Meta, ProbeStep, Scratch, SmallBuf, alloc_image, probe_commit, read_fields, read_u64, w8,
+    Meta, ProbeStep, Scratch, SmallBuf, alloc_image, grow_table, probe_commit, read_fields,
+    read_u64, w8,
 };
 use crate::block::{BStackBlock, BStackCast};
 use crate::clone::{ClonePlan, TryCloneIn};
@@ -371,133 +372,14 @@ impl<K: Pod> BStackHashSet<K> {
     /// Grow the table to at least double its capacity, rehashing every live key
     /// (and dropping tombstones) atomically.
     fn grow<A: BStackRaiiAllocator>(&self, allocator: &A) -> io::Result<()> {
-        let handle = self.range.start();
-        let stride = Self::stride();
-        let ksz = Self::ksize();
-        let cap0 = read_u64(allocator.stack(), handle + CAP_OFF)?;
-        let newcap = if cap0 == 0 { MIN_CAP } else { cap0 * 2 };
-        let newtable = allocator.alloc(newcap * stride)?.as_range().start();
-
-        let mut meta_buf = [0u8; 32];
-        let mut old_buf = vec![0u8; (cap0 * stride) as usize];
-        let mut new_image: Vec<u8> = Vec::new();
-        let grown = Cell::new(false);
-        let old_table = Cell::new(0u64);
-        let old_cap = Cell::new(0u64);
-
-        let mut meta_issued = false;
-        let mut meta: Option<Meta> = None;
-        let mut abort = false;
-        let mut read_i = 0u64;
-        let mut built = false;
-        let mut writes: Vec<(u64, SmallBuf)> = Vec::new();
-        let mut w = 0usize;
-
-        allocator.stack().inplace_gen(|_feedback| {
-            if !meta_issued {
-                meta_issued = true;
-                // SAFETY: `meta_buf` outlives the call.
-                let b: &mut [u8] =
-                    unsafe { core::mem::transmute::<&mut [u8], _>(&mut meta_buf[..]) };
-                return Some(BStackGenOp::Read {
-                    offset: handle + TABLE_OFF,
-                    buf: b,
-                });
-            }
-            if meta.is_none() {
-                let m = Meta {
-                    table: get_u64(&meta_buf[0..8]),
-                    cap: get_u64(&meta_buf[8..16]),
-                    len: get_u64(&meta_buf[16..24]),
-                    used: get_u64(&meta_buf[24..32]),
-                };
-                if newcap <= m.cap {
-                    abort = true;
-                }
-                meta = Some(m);
-            }
-            if abort {
-                return None;
-            }
-            let m = meta.as_ref().unwrap();
-
-            if read_i < m.cap {
-                let i = read_i;
-                read_i += 1;
-                let lo = (i * stride) as usize;
-                let hi = lo + stride as usize;
-                // SAFETY: `old_buf` outlives the call; each slice read once.
-                let b: &mut [u8] =
-                    unsafe { core::mem::transmute::<&mut [u8], _>(&mut old_buf[lo..hi]) };
-                return Some(BStackGenOp::Read {
-                    offset: m.table + i * stride,
-                    buf: b,
-                });
-            }
-
-            if !built {
-                built = true;
-                grown.set(true);
-                old_table.set(m.table);
-                old_cap.set(m.cap);
-
-                new_image = vec![0u8; (newcap * stride) as usize];
-                let newmask = newcap - 1;
-                for j in 0..m.cap {
-                    let lo = (j * stride) as usize;
-                    if get_u64(&old_buf[lo..lo + 8]) != OCCUPIED {
-                        continue;
-                    }
-                    let kb = &old_buf[lo + 8..lo + 8 + ksz];
-                    let mut idx = fnv1a(kb) & newmask;
-                    loop {
-                        let nlo = (idx * stride) as usize;
-                        if get_u64(&new_image[nlo..nlo + 8]) == EMPTY {
-                            new_image[nlo..nlo + 8].copy_from_slice(&OCCUPIED.to_le_bytes());
-                            new_image[nlo + 8..nlo + 8 + ksz].copy_from_slice(kb);
-                            break;
-                        }
-                        idx = (idx + 1) & newmask;
-                    }
-                }
-                writes.push((
-                    newtable,
-                    SmallBuf::Heap(std::mem::take(&mut new_image).into_boxed_slice()),
-                ));
-                writes.push(w8(handle + TABLE_OFF, newtable));
-                writes.push(w8(handle + CAP_OFF, newcap));
-                writes.push(w8(handle + USED_OFF, m.len));
-            }
-            if w < writes.len() {
-                let i = w;
-                w += 1;
-                let (off, ref bytes) = writes[i];
-                // SAFETY: `writes` outlives the call and is not mutated after build.
-                let d: &[u8] = unsafe { core::mem::transmute::<&[u8], _>(bytes.as_slice()) };
-                return Some(BStackGenOp::Write {
-                    offset: off,
-                    data: d,
-                });
-            }
-            None
-        })?;
-
-        if grown.get() {
-            if old_cap.get() > 0 {
-                // SAFETY: the descriptor no longer points at the old table.
-                let _ = unsafe {
-                    dealloc_range(
-                        allocator,
-                        BStackRange::new(old_table.get(), old_cap.get() * stride),
-                    )
-                };
-            }
-        } else {
-            // SAFETY: `newtable` was never linked into the descriptor.
-            let _ =
-                unsafe { dealloc_range(allocator, BStackRange::new(newtable, newcap * stride)) };
-        }
-        Ok(())
+        grow_table(
+            allocator,
+            self.range.start(),
+            Self::stride(),
+            Self::ksize(),
+            OCCUPIED,
+            MIN_CAP,
+        )
     }
 
     /// Attach an allocator to make an auto-freeing [`AutoDrop`] guard.
