@@ -331,9 +331,11 @@ impl SegregatedBStackAllocator {
     /// realloc move) are not reclaimable by a bare scan and are left live; that
     /// is the `recovery_needed`-bracketed work deferred to a later pass.
     ///
-    /// This pass assumes a quiescent allocator (as at `open`); the concurrent,
-    /// `process_gen`-serialised variant is future work. Stops at the first
-    /// unclassifiable overhead, counting the remaining arena as unsure.
+    /// This pass assumes a quiescent allocator (as at `open`); a fully concurrent
+    /// variant is future work, but the rebuilt head table is already published as
+    /// a single crash-atomic contiguous [`BStack::set`] so the table never becomes
+    /// half-updated. Stops at the first unclassifiable overhead, counting the
+    /// remaining arena as unsure.
     pub fn recover(&self) -> io::Result<u64> {
         #[cfg(feature = "atomic")]
         let _guard = self.lock.lock().unwrap();
@@ -380,10 +382,12 @@ impl SegregatedBStackAllocator {
                 p += size;
             }
         }
-        // Publish the rebuilt heads, clearing any stale/garbage head words.
+        // Publish the rebuilt head table.
+        let mut head_bytes = [0u8; Self::NUM_CLASSES as usize * 8];
         for (c, &h) in heads.iter().enumerate() {
-            self.stack.set(Self::head_off(c as u64), h.to_le_bytes())?;
+            write_buf!(h => head_bytes, c * 8);
         }
+        self.stack.set(Self::FREE_HEAD_BASE, head_bytes)?;
         Ok(unsure)
     }
 
@@ -467,13 +471,15 @@ impl SegregatedBStackAllocator {
         if head == Self::SENTINEL {
             return Ok(None);
         }
-        let word = u64::from_le_bytes(read_bstack!(self.stack, head => u64));
+        // overhead ‖ next_free are contiguous: fetch both in one 16-byte read.
+        let buf = read_bstack!(self.stack, head => 16);
+        let word = read_buf_le!(buf, 0 => u64);
         // Free head must have the high bit clear; its size is word << 4.
         let size = word << 4;
         if word & Self::IN_USE_BIT != 0 || size < need {
             return Ok(None);
         }
-        let next = u64::from_le_bytes(read_bstack!(self.stack, head + Self::OVERHEAD => u64));
+        let next = read_buf_le!(buf, 8 => u64);
         self.stack.set(head_off, next.to_le_bytes())?;
         Ok(Some((head, size)))
     }
@@ -484,13 +490,15 @@ impl SegregatedBStackAllocator {
     /// first `need` bytes and carves any excess (`actual_size − need`).
     ///
     /// A single [`BStack::process_gen`] holds the write lock across read-head →
-    /// read-overhead → read-next → advance-head, removing any ABA window.
+    /// read-(overhead‖next) → advance-head, removing any ABA window. The head
+    /// block's overhead word and inline `next_free` are contiguous, so they are
+    /// fetched in one 16-byte read.
     #[cfg(feature = "atomic")]
     fn pop_oversized(&self, need: u64) -> io::Result<Option<(u64, u64)>> {
         let head_off = Self::head_off(Self::OVERSIZED_CLASS);
         let mut head_buf = [0u8; 8];
-        let mut oh_buf = [0u8; 8];
-        let mut next_buf = [0u8; 8];
+        // overhead ‖ next_free of the head block, read as one 16-byte op.
+        let mut oh_next_buf = [0u8; 16];
         let mut step = 0usize;
         let mut head = 0u64;
         let mut size = 0u64;
@@ -509,36 +517,31 @@ impl SegregatedBStackAllocator {
                     } else {
                         Some(BStackGenOp::Read {
                             offset: head,
-                            // SAFETY: `oh_buf` outlives this call.
+                            // SAFETY: `oh_next_buf` outlives this call.
                             buf: unsafe {
-                                core::mem::transmute::<&mut [u8], &mut [u8]>(&mut oh_buf[..])
+                                core::mem::transmute::<&mut [u8], &mut [u8]>(&mut oh_next_buf[..])
                             },
                         })
                     }
                 }
                 2 => {
-                    let word = u64::from_le_bytes(oh_buf);
+                    let word = read_buf_le!(oh_next_buf, 0 => u64);
                     // Free head must have the high bit clear; its size is word << 4.
                     size = word << 4;
                     if word & Self::IN_USE_BIT != 0 || size < need {
                         None
                     } else {
-                        Some(BStackGenOp::Read {
-                            offset: head + Self::OVERHEAD,
-                            // SAFETY: `next_buf` outlives this call.
-                            buf: unsafe {
-                                core::mem::transmute::<&mut [u8], &mut [u8]>(&mut next_buf[..])
+                        popped = Some((head, size));
+                        // head[oversized] ← next_free (the second half of the read).
+                        Some(BStackGenOp::Write {
+                            offset: head_off,
+                            // SAFETY: `oh_next_buf` outlives this call; its [8..16]
+                            // half is untouched after step 1's read resolved.
+                            data: unsafe {
+                                core::mem::transmute::<&[u8], &[u8]>(&oh_next_buf[8..])
                             },
                         })
                     }
-                }
-                3 => {
-                    popped = Some((head, size));
-                    Some(BStackGenOp::Write {
-                        offset: head_off,
-                        // SAFETY: `next_buf` outlives this call.
-                        data: unsafe { core::mem::transmute::<&[u8], &[u8]>(&next_buf[..]) },
-                    })
                 }
                 _ => None,
             };
