@@ -400,7 +400,8 @@
 //!   [`GhostTreeBstackAllocator`], and [`DebugCheckingAllocator`].
 //!   Combined with `set`, also enables [`BStackSliceWriter`],
 //!   [`FirstFitBStackAllocator`], [`SlabBStackAllocator`],
-//!   [`CheckedSlabBStackAllocator`], and [`BStackByteVec`].
+//!   [`CheckedSlabBStackAllocator`], [`SegregatedBStackAllocator`]
+//!   (experimental), and [`BStackByteVec`].
 //!
 //! * **`atomic`** — Compound read-modify-write operations that hold the write
 //!   lock across what would otherwise be separate calls.  Combined with `set`,
@@ -508,6 +509,23 @@
 //!   ([`open`](CheckedSlabBStackAllocator::open) runs
 //!   [`recover`](CheckedSlabBStackAllocator::recover) automatically).
 //!   Requires both `alloc` and `set` features.
+//!
+//! * [`SegregatedBStackAllocator`] — **experimental** segregated (binned)
+//!   free-list allocator.  Generalises [`CheckedSlabBStackAllocator`] from one
+//!   block size to 33 size classes sharing a single arena: 16 linear classes
+//!   (16‥256 B, step 16), 16 geometric classes (320‥4096 B, 4 per octave), and
+//!   one shared oversized bucket.  Each class is an independent intrusive free
+//!   list; the class is computed from the request with register arithmetic (no
+//!   tables), giving O(1) classed alloc/dealloc.  Every block carries the same
+//!   8-byte overhead tag as the checked slab, so leaked blocks are reclaimable by
+//!   a linear scan and double-frees are caught.  A single [`new`](SegregatedBStackAllocator::new)
+//!   constructor initialises an empty stack or reopens one (running recovery
+//!   automatically). Requires both `alloc` and `set`; `Send` in all
+//!   configurations, `Send + Sync` with `atomic` (no allocator-level lock —
+//!   free-list splices ride [`BStack::process_gen`]/[`BStack::inplace_gen`]).
+//!   **Experimental:** the on-disk format and API may change, some resize paths
+//!   differ between the `atomic` and non-`atomic` builds, and the background
+//!   coalescer / deep in-use-leak GC are not yet implemented.
 //!
 //! * [`DebugCheckingAllocator<A>`](DebugCheckingAllocator) — transparent debug
 //!   wrapper.  Wraps any allocator whose `Allocated` type is [`BStackOwnedSlice`]

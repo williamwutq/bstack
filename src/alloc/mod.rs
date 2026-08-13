@@ -75,6 +75,12 @@
 //! * [`CheckedSlabBStackAllocator`] — crash-recoverable slab variant (`alloc` + `set`).
 //!   8-byte per-block header tracks state; double-frees caught.
 //!
+//! * [`SegregatedBStackAllocator`] — **experimental** segregated (binned)
+//!   free-list allocator (`alloc` + `set`).  Generalises the checked slab to 33
+//!   size classes sharing one arena; 8-byte per-block header, O(1) classed
+//!   alloc/dealloc, crash-recoverable by linear scan.  `Send` in all
+//!   configurations; `Send + Sync` with `atomic`.
+//!
 //! # Debug wrapper
 //!
 //! * [`DebugCheckingAllocator<A>`](DebugCheckingAllocator) — wraps any allocator
@@ -113,7 +119,8 @@
 //! ```
 //!
 //! [`BStackSliceWriter`], [`FirstFitBStackAllocator`], [`SlabBStackAllocator`],
-//! [`CheckedSlabBStackAllocator`], and [`BStackByteVec`] additionally require `set`:
+//! [`CheckedSlabBStackAllocator`], [`SegregatedBStackAllocator`] (experimental),
+//! and [`BStackByteVec`] additionally require `set`:
 //!
 //! ```toml
 //! bstack = { version = "0.1", features = ["alloc", "set"] }

@@ -313,7 +313,7 @@ impl SegregatedBStackAllocator {
     /// an orphaned tail.
     ///
     /// Because the scan trusts only the overhead words (never the stored
-    /// `next_free` links) and [`open`](Self::open) runs it before any live
+    /// `next_free` links) and [`new`](Self::new) runs it before any live
     /// operation, it is **idempotent and crash-safe by re-running**: a crash
     /// mid-rebuild leaves half-written links that the next `open`'s scan simply
     /// rebuilds again. Blocks orphaned *in-use* (e.g. the old block of a crashed
@@ -841,7 +841,7 @@ impl BStackAllocator for SegregatedBStackAllocator {
     /// | Same class (`new_len` maps to this block) | rewrite overhead `len`; zero the grown tail on grow |
     /// | Grow at tail | extend the tail in place (zero-filled), then rewrite `len` |
     /// | Shrink at tail | rewrite `len`, then discard the excess tail in place |
-    /// | Non-tail shrink | rewrite `len` + greedy-carve the freed tail into free blocks — one crash-atomic [`commit_carve`](Self::commit_carve) |
+    /// | Non-tail shrink | rewrite `len` + greedy-carve the freed tail into free blocks — one crash-atomic transaction (`atomic`); a move without `atomic` |
     /// | Non-tail grow | alloc new class, copy, dealloc old |
     ///
     /// Every path only ever *leaks* on a mid-op failure (never corrupts): the
