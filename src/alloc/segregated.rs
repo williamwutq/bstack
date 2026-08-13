@@ -458,27 +458,8 @@ impl SegregatedBStackAllocator {
         Ok(popped)
     }
 
-    /// Scrub a freshly popped block in one `set` of `block` bytes: `in_use | len`
-    /// overhead, then—if `copy_from` is `Some((src, n))`—`n` bytes read straight
-    /// from payload offset `src` into the payload start, then zeros (which also
-    /// clear the free block's stale bytes, including its old `next_free`). The
-    /// source is read directly into the block buffer, so no intermediate copy
-    /// buffer is allocated. `n` must not exceed the payload capacity `block − OVERHEAD`.
-    fn claim(
-        &self,
-        block_start: u64,
-        block: u64,
-        len: u64,
-        copy_from: Option<(u64, u64)>,
-    ) -> io::Result<()> {
-        let buf = self.claim_buf(block, len, copy_from)?;
-        self.stack.set(block_start, buf)
-    }
-
     /// Build the `block`-byte claim buffer (`in_use | len` overhead, `copy_from`
-    /// prefix read straight in, rest zero) without writing it — used both by
-    /// [`claim`](Self::claim) and, as the atomic prefix, by oversized non-exact
-    /// reuse in [`commit_carve`](Self::commit_carve).
+    /// prefix read straight in, rest zero) without writing it.
     fn claim_buf(
         &self,
         block: u64,
@@ -506,32 +487,26 @@ impl SegregatedBStackAllocator {
         if block <= Self::MAX_CLASS {
             let class = Self::classify(block);
             if let Some(bs) = self.pop_class(class)? {
-                self.claim(bs, block, len, copy_from)?;
+                let buf = self.claim_buf(block, len, copy_from)?;
+                self.stack.set(bs, buf)?;
                 return Ok(bs + Self::OVERHEAD);
             }
         } else if let Some((bs, actual)) = self.pop_oversized(block)? {
+            let buf = self.claim_buf(block, len, copy_from)?;
             if actual == block {
-                self.claim(bs, block, len, copy_from)?;
+                self.stack.set(bs, buf)?;
             } else {
                 // Non-exact reuse: claim `block` bytes and carve the excess, all
-                // as one crash-atomic transaction (claim buffer as the prefix).
-                let prefix = self.claim_buf(block, len, copy_from)?;
-                self.commit_carve(bs, &prefix, bs + block, actual - block)?;
+                // as one crash-atomic transaction (claim buffer as the prefix)
+                self.commit_carve(bs, &buf, bs + block, actual - block)?;
             }
             return Ok(bs + Self::OVERHEAD);
         }
-        // Miss: extend a zero-filled block; write overhead, plus the copied
-        // prefix read straight into the write buffer when present.
-        let bs = self.stack.extend(block)?;
-        match copy_from {
-            None => self.stack.set(bs, (Self::IN_USE_BIT | len).to_le_bytes())?,
-            Some((src, n)) => {
-                let mut buf = vec![0u8; 8 + n as usize];
-                buf[..8].copy_from_slice(&(Self::IN_USE_BIT | len).to_le_bytes());
-                self.stack.get_into(src, &mut buf[8..])?;
-                self.stack.set(bs, buf)?;
-            }
-        }
+        // Miss: eagerly grow the whole zero-filled block in one sparse write.
+        // The write prefix is copied in before the tail is left zero by the
+        // sparse grow, so we do not need a separate `set` for the remainder.
+        let buf = self.claim_buf(block, len, copy_from)?;
+        let bs = self.stack.extend_sparse(&buf, block)?;
         Ok(bs + Self::OVERHEAD)
     }
 
@@ -708,6 +683,7 @@ impl BStackAllocator for SegregatedBStackAllocator {
 
     /// Allocate `len` bytes. Computes the class, pops its head, else extends a
     /// fresh class block; oversized requests reuse an exact-size head or extend.
+    #[inline]
     fn alloc(&self, len: u64) -> io::Result<BStackOwnedSlice<'_, Self>> {
         if len == 0 {
             return Ok(BStackOwnedSlice::empty(self));
