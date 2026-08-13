@@ -19,6 +19,45 @@ pub(super) fn read_u64(stack: &BStack, off: u64) -> io::Result<u64> {
     Ok(u64::from_le_bytes(b))
 }
 
+/// A write payload for the `Vec<(u64, SmallBuf)>` batches [`atomic_update`] /
+/// [`probe_commit`] / `BStack::set_batched` take. Two on-disk shapes recur
+/// often enough in the stdlib collections to inline without a heap allocation:
+/// a single `u64` field (every counter/offset/length bump — the overwhelming
+/// majority of writes) and a [`crate::stdlib::list`] node's whole image (the
+/// 16-byte [`crate::layout::BlockHeader`] plus `prev`/`next`/`val`, 3 `u64`s —
+/// 40 bytes). Deliberately **no length field** — each inline variant is
+/// exact-size-only (never "up to N bytes"), so there is nothing to track;
+/// anything that isn't exactly 8 or 40 bytes (a B-tree node, a bucket-table
+/// image, a generic-`K`-sized heap slot, …) goes through [`SmallBuf::Heap`].
+pub(super) enum SmallBuf {
+    Buf8([u8; 8]),
+    Buf40([u8; 40]),
+    Heap(Box<[u8]>),
+}
+
+impl SmallBuf {
+    pub(super) fn as_slice(&self) -> &[u8] {
+        match self {
+            SmallBuf::Buf8(b) => b.as_slice(),
+            SmallBuf::Buf40(b) => b.as_slice(),
+            SmallBuf::Heap(b) => b.as_ref(),
+        }
+    }
+}
+
+impl AsRef<[u8]> for SmallBuf {
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+/// Build a `(offset, value)` write-tuple for a `u64` field: little-endian into
+/// an inline [`SmallBuf::Buf8`], no allocation. Replaces the repeated
+/// `(off, val.to_le_bytes().to_vec())` shape.
+pub(super) fn w8(off: u64, val: u64) -> (u64, SmallBuf) {
+    (off, SmallBuf::Buf8(val.to_le_bytes()))
+}
+
 /// Read `N` **contiguous** little-endian `u64` fields starting at `off` in a
 /// *single* I/O call, returning them as an array. Use this instead of several
 /// [`read_u64`] calls when the fields are adjacent (e.g. a handle's metadata) —
@@ -99,7 +138,9 @@ pub(super) fn alloc_image<A: BStackRaiiAllocator>(
 /// are handed to `reads2` to compute a second round of offsets that may *depend*
 /// on the first (e.g. the `prev`/`value` slots of a node found via a pointer, or
 /// the live element slots of a ring found via `head`/`cap`). `plan` then turns
-/// both read rounds into the writes to commit.
+/// both read rounds into the writes to commit, returned as a borrow of a buffer
+/// the caller owns (typically declared just above the [`atomic_update`] call) —
+/// `plan` is `FnOnce`, so that buffer only needs to outlive this one call.
 ///
 /// The point of routing every mutator through this: all reads happen **inside**
 /// the generator, under bstack's single write lock, so the values reflect the
@@ -111,7 +152,7 @@ pub(super) fn alloc_image<A: BStackRaiiAllocator>(
 /// change the stack's size, are done by the caller *around* it (a freshly
 /// allocated block is an orphan until the commit links it; a freed block is
 /// already unlinked), so a crash can at worst leak, never tear the structure.
-pub(super) fn atomic_update<A, R2, W>(
+pub(super) fn atomic_update<'w, A, R2, W>(
     allocator: &A,
     reads1: &[u64],
     reads2: R2,
@@ -120,7 +161,7 @@ pub(super) fn atomic_update<A, R2, W>(
 where
     A: BStackRaiiAllocator,
     R2: FnOnce(&[u64]) -> Vec<u64>,
-    W: FnOnce(&[u64], &[u64]) -> Vec<(u64, Vec<u8>)>,
+    W: FnOnce(&[u64], &[u64]) -> &'w [(u64, SmallBuf)],
 {
     // Buffers that must outlive the whole `inplace_gen` call (bstack's documented
     // generator pattern): read-back values and the computed writes.
@@ -128,7 +169,7 @@ where
     let mut vals1: Vec<u64> = Vec::new();
     let mut offs2: Vec<u64> = Vec::new();
     let mut buf2: Vec<[u8; 8]> = Vec::new();
-    let mut writes: Vec<(u64, Vec<u8>)> = Vec::new();
+    let mut writes: &'w [(u64, SmallBuf)] = &[];
 
     let mut reads2 = Some(reads2);
     let mut plan = Some(plan);
@@ -207,7 +248,7 @@ pub(super) enum ProbeStep {
     /// This bucket isn't the target — keep probing.
     Continue,
     /// Stop here and commit these writes (empty = commit nothing).
-    Stop(Vec<(u64, Vec<u8>)>),
+    Stop(Vec<(u64, SmallBuf)>),
 }
 
 /// Run an atomic, external-lock-free linear probe over an open-addressing bucket
@@ -231,11 +272,11 @@ pub(super) fn probe_commit<A, I, E>(
 where
     A: BStackRaiiAllocator,
     I: FnMut(&Meta, u64, &[u8]) -> ProbeStep,
-    E: FnOnce(&Meta) -> Vec<(u64, Vec<u8>)>,
+    E: FnOnce(&Meta) -> Vec<(u64, SmallBuf)>,
 {
     let mut meta_buf = [0u8; 32];
     let mut bucket_buf = vec![0u8; stride as usize];
-    let mut writes: Vec<(u64, Vec<u8>)> = Vec::new();
+    let mut writes: Vec<(u64, SmallBuf)> = Vec::new();
 
     let mut meta_issued = false;
     let mut meta: Option<Meta> = None;
