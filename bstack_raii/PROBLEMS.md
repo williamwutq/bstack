@@ -71,11 +71,15 @@ Core paths are sound (constructors commit via one `write_range` / `set_batched`;
 deep clone is two-phase allocate-then-atomic-commit; owned teardown is WAL-backed).
 Residual points, all *leak-only* (permitted) but worth recording:
 
-- **`BStackWeak::upgrade`** ([shared.rs:238](src/shared.rs#L238)) increments the
+- [FIXED] **`BStackWeak::upgrade`** ([shared.rs:238](src/shared.rs#L238)) increments the
   strong count, then reads the data forward-pointer; if that read fails the strong
   increment is orphaned (over-count → the block can never reach zero). Same class
-  as the weak-setter leak just fixed; could reuse the release-on-failure idea.
-- **`BStackRc::try_move`** ([shared.rs:162](src/shared.rs#L162)): after the CAS
+  as the weak-setter leak just fixed; reused the release-on-failure idea: on a
+  failed read, `fetch_sub` the claimed strong count back, and if that lands on the
+  last-owner case, re-read the forward pointer once more just to run
+  `strong_release_ctrl`'s teardown (tolerating a second failure there as a bounded,
+  already-permitted leak, unlike the unbounded over-count this replaces).
+- [WONTFIX] **`BStackRc::try_move`** ([shared.rs:162](src/shared.rs#L162)): after the CAS
   `strong 1→0`, a failure inside `T::bstack_move` leaves the block unwrapped with
   the shell possibly unfreed — an error-path leak.
 - **Cross-file teardown frees are not WAL-protected on the *target* file.** The

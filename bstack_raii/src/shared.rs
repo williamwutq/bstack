@@ -266,7 +266,24 @@ impl<'a, T: BStackWeakable, A: BStackRaiiAllocator> BStackWeak<'a, T, A> {
         // Strong is now claimed; recover the data ref from the forward pointer.
         let data_pos = ctrl_range.start() + layout::CTRL_DATA_OFFSET;
         let mut bytes = [0u8; 8];
-        stack.get_into(data_pos, &mut bytes)?;
+        if let Err(e) = stack.get_into(data_pos, &mut bytes) {
+            // The claim above already landed; release it here rather than
+            // orphan it (same release-on-failure idea as the weak-setter fix) —
+            // otherwise the strong count is permanently one too high and the
+            // block can never reach zero. `strong_release_ctrl` needs the data
+            // range only on the last-owner path; re-read it just for that case,
+            // tolerating a second failure there (a bounded, already-permitted
+            // leak, unlike the unbounded over-count this guards against).
+            if refcount::fetch_sub(stack, strong_off, 1)? == 1 {
+                let mut retry = [0u8; 8];
+                if stack.get_into(data_pos, &mut retry).is_ok() {
+                    let data_range =
+                        BStackRange::new(u64::from_le_bytes(retry), size_of::<T::OnDisk>() as u64);
+                    let _ = strong_release_ctrl::<T, A>(allocator, data_range, ctrl_range);
+                }
+            }
+            return Err(e);
+        }
         let data_range = BStackRange::new(u64::from_le_bytes(bytes), size_of::<T::OnDisk>() as u64);
         let data = unsafe { BStackRef::<T>::from_range(data_range) };
         // SAFETY: the increment above claimed the strong count this handle holds.
