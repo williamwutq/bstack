@@ -166,6 +166,25 @@ impl SegregatedBStackAllocator {
         Self::FREE_HEAD_BASE + class * core::mem::size_of::<u64>() as u64
     }
 
+    /// Validate a caller data pointer and return its block start. A valid
+    /// `block_start` is `>= ARENA_START` and `QUANTUM`-aligned (ARENA_START is
+    /// itself 16-aligned and every block is a multiple of 16). Rejects a
+    /// header-range, underflowing, or mid-block pointer, so a crafted `start`
+    /// can never make an operation reinterpret interior bytes as an overhead
+    /// word.
+    #[inline]
+    fn block_start_of(start: u64) -> io::Result<u64> {
+        start
+            .checked_sub(Self::OVERHEAD)
+            .filter(|bs| *bs >= Self::ARENA_START && *bs % Self::QUANTUM == 0)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "slice start is not a valid block pointer",
+                )
+            })
+    }
+
     /// Initialise a new allocator over an empty `stack`, writing the header.
     ///
     /// # Errors
@@ -360,13 +379,60 @@ impl SegregatedBStackAllocator {
         Ok(popped)
     }
 
-    /// Scrub a freshly popped block: write `in_use | len` overhead and zero the
-    /// rest of the data (which still holds the free block's stale bytes). One
-    /// `set` of `block` bytes.
-    fn claim(&self, block_start: u64, block: u64, len: u64) -> io::Result<()> {
+    /// Scrub a freshly popped block in one `set` of `block` bytes: `in_use | len`
+    /// overhead, then—if `copy_from` is `Some((src, n))`—`n` bytes read straight
+    /// from payload offset `src` into the payload start, then zeros (which also
+    /// clear the free block's stale bytes, including its old `next_free`). The
+    /// source is read directly into the block buffer, so no intermediate copy
+    /// buffer is allocated. `n` must not exceed the payload capacity `block − OVERHEAD`.
+    fn claim(
+        &self,
+        block_start: u64,
+        block: u64,
+        len: u64,
+        copy_from: Option<(u64, u64)>,
+    ) -> io::Result<()> {
         let mut buf = vec![0u8; block as usize];
         buf[..8].copy_from_slice(&(Self::IN_USE_BIT | len).to_le_bytes());
+        if let Some((src, n)) = copy_from {
+            self.stack.get_into(src, &mut buf[8..8 + n as usize])?;
+        }
         self.stack.set(block_start, buf)
+    }
+
+    /// Core allocation: place a `len`-byte block whose payload begins with `n`
+    /// bytes copied from payload offset `src` (`copy_from = Some((src, n))`, rest
+    /// zeroed) and return its data pointer (`block_start + OVERHEAD`). A free-list
+    /// hit reads the source straight into the single claim buffer; a miss extends
+    /// a zero-filled block and writes overhead (plus the copied prefix), relying
+    /// on `extend`'s zero-fill for the tail. `n` must not exceed the class payload
+    /// capacity for `len` (callers pass a prefix `≤ len`).
+    fn alloc_raw(&self, len: u64, copy_from: Option<(u64, u64)>) -> io::Result<u64> {
+        let need = Self::phys_need(len)?;
+        let block = Self::class_blocksize(need);
+        if block <= Self::MAX_CLASS {
+            let class = Self::classify(block);
+            if let Some(bs) = self.pop_class(class)? {
+                self.claim(bs, block, len, copy_from)?;
+                return Ok(bs + Self::OVERHEAD);
+            }
+        } else if let Some(bs) = self.pop_oversized(block)? {
+            self.claim(bs, block, len, copy_from)?;
+            return Ok(bs + Self::OVERHEAD);
+        }
+        // Miss: extend a zero-filled block; write overhead, plus the copied
+        // prefix read straight into the write buffer when present.
+        let bs = self.stack.extend(block)?;
+        match copy_from {
+            None => self.stack.set(bs, (Self::IN_USE_BIT | len).to_le_bytes())?,
+            Some((src, n)) => {
+                let mut buf = vec![0u8; 8 + n as usize];
+                buf[..8].copy_from_slice(&(Self::IN_USE_BIT | len).to_le_bytes());
+                self.stack.get_into(src, &mut buf[8..])?;
+                self.stack.set(bs, buf)?;
+            }
+        }
+        Ok(bs + Self::OVERHEAD)
     }
 
     /// Push `block_start` (physical size `size`, head index `class`) onto its
@@ -443,48 +509,129 @@ impl BStackAllocator for SegregatedBStackAllocator {
         if len == 0 {
             return Ok(BStackOwnedSlice::empty(self));
         }
-        let need = Self::phys_need(len)?;
-        let block = Self::class_blocksize(need);
-
-        if block <= Self::MAX_CLASS {
-            let class = Self::classify(block);
-            if let Some(bs) = self.pop_class(class)? {
-                self.claim(bs, block, len)?;
-                // SAFETY: `bs` is a freshly claimed class-`block` region.
-                return Ok(unsafe {
-                    BStackOwnedSlice::from_raw_parts(self, bs + Self::OVERHEAD, len)
-                });
-            }
-        } else if let Some(bs) = self.pop_oversized(block)? {
-            self.claim(bs, block, len)?;
-            // SAFETY: `bs` is an exact-size oversized block from the free list.
-            return Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, bs + Self::OVERHEAD, len) });
-        }
-
-        // Miss: extend a fresh block. `extend` zero-fills, so only the overhead
-        // word needs writing.
-        let bs = self.stack.extend(block)?;
-        self.stack.set(bs, (Self::IN_USE_BIT | len).to_le_bytes())?;
-        // SAFETY: `bs` is a fresh tail extension of exactly `block` bytes.
-        Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, bs + Self::OVERHEAD, len) })
+        let ptr = self.alloc_raw(len, None)?;
+        // SAFETY: `ptr` is the data start of a freshly allocated `len`-byte block.
+        Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, ptr, len) })
     }
 
-    /// `realloc` is not yet implemented in the core pass; returns
-    /// [`io::ErrorKind::Unsupported`] with the original handle intact.
+    /// Resize the region described by `slice` to `new_len` bytes.
+    ///
+    /// | Case | Strategy |
+    /// |------|----------|
+    /// | Same class (`new_len` maps to this block) | rewrite overhead `len`; zero the grown tail on grow |
+    /// | Grow at tail | `try_extend_zeros` in place, then rewrite `len` |
+    /// | Everything else (non-tail grow, any cross-class shrink) | alloc new class, copy, dealloc old |
+    ///
+    /// The move path and the tail grow only ever *leak* on a mid-op failure
+    /// (never corrupt): the in-place tail *shrink* and the shrink-carve from the
+    /// design need `recovery_needed` bracketing to be failure-safe, so they land
+    /// with [`recover`](Self::recover) in a later pass and shrink uses the move
+    /// path here.
     fn realloc<'a>(
         &'a self,
         slice: BStackOwnedSlice<'a, Self>,
-        _new_len: u64,
+        new_len: u64,
     ) -> Result<BStackOwnedSlice<'a, Self>, BStackAllocError<'a, Self>> {
-        let (start, len) = (slice.start(), slice.len());
-        Err(BStackAllocError::with_handle(
-            io::Error::new(
-                io::ErrorKind::Unsupported,
-                "realloc not yet implemented for SegregatedBStackAllocator",
-            ),
-            // SAFETY: the region is untouched and still owned by the caller.
-            unsafe { BStackOwnedSlice::from_raw_parts(self, start, len) },
-        ))
+        if slice.is_empty() {
+            // Nothing backs an empty handle: realloc is just a fresh alloc.
+            return self.alloc(new_len).map_err(|source| {
+                BStackAllocError::with_handle(source, BStackOwnedSlice::empty(self))
+            });
+        }
+        if new_len == 0 {
+            // dealloc consumes `slice`; its BStackAllocError propagates unchanged.
+            self.dealloc(slice)?;
+            return Ok(BStackOwnedSlice::empty(self));
+        }
+        let start = slice.start();
+        let old_len = slice.len();
+        // Validate the pointer up front so every path below (including the
+        // no-op resize) trusts a real block start.
+        let block_start = match Self::block_start_of(start) {
+            Ok(bs) => bs,
+            Err(source) => {
+                // SAFETY: the region is untouched and still owned by the caller.
+                let handle = unsafe { BStackOwnedSlice::from_raw_parts(self, start, old_len) };
+                return Err(BStackAllocError::with_handle(source, handle));
+            }
+        };
+        if new_len == old_len {
+            // SAFETY: unchanged region.
+            return Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, start, old_len) });
+        }
+
+        // The allocation to hand back on failure. Starts as the original block;
+        // becomes the new region once a move has committed and copied it (both
+        // are always distinct live regions safe to return).
+        let mut recovered = (start, old_len);
+        let result = (|| -> io::Result<BStackOwnedSlice<'a, Self>> {
+            let word = u64::from_le_bytes(read_bstack!(self.stack, block_start => u64));
+            if word & Self::IN_USE_BIT == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "cannot realloc a freed block",
+                ));
+            }
+            if word & !Self::IN_USE_BIT != old_len {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "cannot realloc a partial or mismatched slice",
+                ));
+            }
+            let old_size = Self::class_blocksize(Self::phys_need(old_len)?);
+            let new_size = Self::class_blocksize(Self::phys_need(new_len)?);
+
+            if new_size == old_size {
+                // Same class: the block already fits. Zero the newly-exposed
+                // bytes on grow (a prior shrink may have left stale data there),
+                // ordered before the length commit so a crash never exposes them.
+                if new_len > old_len {
+                    self.stack.zero(start + old_len, new_len - old_len)?;
+                }
+                self.stack
+                    .set(block_start, (Self::IN_USE_BIT | new_len).to_le_bytes())?;
+                // SAFETY: same physical block, new visible length.
+                return Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, start, new_len) });
+            }
+
+            // Grow at the tail: extend the physical block in place. Extend first
+            // (leak-preferring: a failure after it only leaks the extension, not
+            // corrupts), then zero the old slack, then commit the new length.
+            let old_end = block_start + old_size; // block exists ⇒ ≤ stack_len
+            if new_size > old_size && self.stack.try_extend_zeros(old_end, new_size - old_size)? {
+                // Old block's slack [start+old_len, old_end) may hold stale bytes
+                // from a prior shrink; the extension past old_end is already zero.
+                let slack = (old_size - Self::OVERHEAD) - old_len;
+                if slack > 0 {
+                    self.stack.zero(start + old_len, slack)?;
+                }
+                self.stack
+                    .set(block_start, (Self::IN_USE_BIT | new_len).to_le_bytes())?;
+                // SAFETY: block extended in place to the new class at the tail.
+                return Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, start, new_len) });
+            }
+
+            // Move: allocate the new class, having it read the surviving prefix
+            // straight from the old block into its claim buffer (no separate copy
+            // buffer or write), then free the old block. Each step is individually
+            // atomic; a mid-move failure leaks (never corrupts), reclaimed later.
+            let copy_len = old_len.min(new_len);
+            let new_ptr = self.alloc_raw(new_len, Some((start, copy_len)))?;
+            // New region committed and populated; it is now the survivor.
+            recovered = (new_ptr, new_len);
+            // SAFETY: (start, old_len) still names the caller's live old block.
+            let old = unsafe { BStackOwnedSlice::from_raw_parts(self, start, old_len) };
+            self.dealloc(old).map_err(|e| e.source)?;
+            // SAFETY: `new_ptr` is the data start of the freshly populated block.
+            Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, new_ptr, new_len) })
+        })();
+        result.map_err(|source| BStackAllocError {
+            source,
+            // SAFETY: `recovered` names a live region owned by the caller.
+            handle: Some(unsafe {
+                BStackOwnedSlice::from_raw_parts(self, recovered.0, recovered.1)
+            }),
+        })
     }
 
     /// Release the region described by `slice`.
@@ -507,21 +654,7 @@ impl BStackAllocator for SegregatedBStackAllocator {
         // must not hand back a handle that could double-free.
         let mut lost = false;
         let result = (|| -> io::Result<()> {
-            // `start` is the data pointer (block_start + OVERHEAD); a valid
-            // block_start is >= ARENA_START and QUANTUM-aligned (ARENA_START is
-            // itself 16-aligned and every block is a multiple of 16). Reject a
-            // header-range, underflowing, or mid-block pointer — otherwise a
-            // crafted `start` would let dealloc reinterpret interior bytes as an
-            // overhead word.
-            let block_start = start
-                .checked_sub(Self::OVERHEAD)
-                .filter(|bs| *bs >= Self::ARENA_START && *bs % Self::QUANTUM == 0)
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "slice start is not a valid block pointer",
-                    )
-                })?;
+            let block_start = Self::block_start_of(start)?;
             let word = u64::from_le_bytes(read_bstack!(self.stack, block_start => u64));
             if word & Self::IN_USE_BIT == 0 {
                 return Err(io::Error::new(
@@ -702,6 +835,105 @@ mod tests {
         assert_eq!(s.read().unwrap(), b"segregated allocator payload");
     }
 
+    // ── realloc ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn seg_realloc_same_class_grow_zeros_and_preserves() {
+        let (a, _g) = new_alloc();
+        // 90 and 100 both map to block 112 (class 6): a same-class resize.
+        let mut s = a.alloc(90).unwrap();
+        s.write(&[0xABu8; 90]).unwrap();
+        let off = s.start();
+        let s = a.realloc(s, 100).unwrap();
+        assert_eq!(s.start(), off, "same-class grow stays in place");
+        let data = s.read().unwrap();
+        assert_eq!(&data[..90], &[0xABu8; 90], "prefix preserved");
+        assert_eq!(&data[90..], &[0u8; 10], "grown tail zeroed");
+    }
+
+    #[test]
+    fn seg_realloc_same_class_shrink_then_grow_has_no_stale_bytes() {
+        let (a, _g) = new_alloc();
+        let mut s = a.alloc(100).unwrap(); // block 112
+        s.write(&[0xCDu8; 100]).unwrap();
+        let s = a.realloc(s, 90).unwrap(); // same class, shrink (stale [90,100))
+        let s = a.realloc(s, 100).unwrap(); // same class, grow back
+        let data = s.read().unwrap();
+        assert_eq!(&data[..90], &[0xCDu8; 90]);
+        assert_eq!(
+            &data[90..],
+            &[0u8; 10],
+            "re-grown bytes must be zero, not stale"
+        );
+    }
+
+    #[test]
+    fn seg_realloc_tail_grow_in_place() {
+        let (a, _g) = new_alloc();
+        let mut s = a.alloc(100).unwrap(); // block 112, at the tail
+        s.write(&[7u8; 100]).unwrap();
+        let off = s.start();
+        let len_before = a.stack().len().unwrap();
+        let s = a.realloc(s, 200).unwrap(); // need 208 (class 12) > 112: cross-class
+        assert_eq!(s.start(), off, "tail grow extends in place");
+        assert!(a.stack().len().unwrap() > len_before);
+        let data = s.read().unwrap();
+        assert_eq!(&data[..100], &[7u8; 100]);
+        assert_eq!(&data[100..], &[0u8; 100], "grown region zeroed");
+    }
+
+    #[test]
+    fn seg_realloc_cross_class_grow_non_tail_moves() {
+        let (a, _g) = new_alloc();
+        let mut s = a.alloc(100).unwrap(); // block 112
+        s.write(&[9u8; 100]).unwrap();
+        let off = s.start();
+        let _pin = a.alloc(100).unwrap(); // pins the tail so `s` is interior
+        let s = a.realloc(s, 300).unwrap(); // cross-class, non-tail → move
+        assert_ne!(s.start(), off, "interior grow moves to a new block");
+        let data = s.read().unwrap();
+        assert_eq!(&data[..100], &[9u8; 100]);
+        assert_eq!(&data[100..], &[0u8; 200]);
+    }
+
+    #[test]
+    fn seg_realloc_cross_class_shrink_moves_and_preserves() {
+        let (a, _g) = new_alloc();
+        let mut s = a.alloc(200).unwrap(); // block 208 (class 12)
+        s.write(&[0x5Au8; 200]).unwrap();
+        let s = a.realloc(s, 100).unwrap(); // new class 112 → move
+        let data = s.read().unwrap();
+        assert_eq!(data, vec![0x5Au8; 100], "surviving prefix preserved");
+    }
+
+    #[test]
+    fn seg_realloc_to_zero_frees_and_from_empty_allocs() {
+        let (a, _g) = new_alloc();
+        let s = a.alloc(64).unwrap();
+        let empty = a.realloc(s, 0).unwrap();
+        assert!(empty.is_empty());
+        let grown = a.realloc(empty, 48).unwrap();
+        assert_eq!(grown.len(), 48);
+        assert!(!grown.is_empty());
+    }
+
+    #[test]
+    fn seg_realloc_rejects_malformed_pointer_even_on_noop() {
+        let (a, _g) = new_alloc();
+        // A misaligned pointer with new_len == old_len must still be rejected
+        // (the no-op path validates), handle returned intact.
+        let bad = unsafe {
+            crate::alloc::BStackOwnedSlice::from_raw_parts(
+                &a,
+                Seg::ARENA_START + Seg::OVERHEAD + 1,
+                16,
+            )
+        };
+        let err = a.realloc(bad, 16).unwrap_err();
+        assert_eq!(err.source.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.handle.is_some());
+    }
+
     #[test]
     fn seg_double_free_detected() {
         let (a, _g) = new_alloc();
@@ -723,7 +955,10 @@ mod tests {
             let bogus = unsafe { crate::alloc::BStackOwnedSlice::from_raw_parts(&a, start, 16) };
             let err = a.dealloc(bogus).unwrap_err();
             assert_eq!(err.source.kind(), std::io::ErrorKind::InvalidInput);
-            assert!(err.handle.is_some(), "malformed free must return the handle");
+            assert!(
+                err.handle.is_some(),
+                "malformed free must return the handle"
+            );
         }
     }
 
