@@ -34,7 +34,7 @@ use crate::BStackRaiiAllocator;
 use bstack::{BStack, BStackRange};
 use bytemuck::{Pod, Zeroable};
 
-use super::util::{alloc_image, read_fields, read_u64};
+use super::util::{SmallBuf, alloc_image, read_fields, read_u64, w8};
 use crate::block::{BStackBlock, BStackCast};
 use crate::clone::{ClonePlan, TryCloneIn};
 use crate::layout::{BlockHeader, EightCC, HEADER_SIZE, get_u64};
@@ -205,19 +205,25 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBinaryHeap<K, V> {
             // Sift up: walk toward the root, moving greater parents down into the
             // hole, until the new key is `>=` its parent.
             let mut hole = len;
-            let mut writes: Vec<(u64, Vec<u8>)> = Vec::new();
+            let mut writes: Vec<(u64, SmallBuf)> = Vec::new();
             while hole > 0 {
                 let parent = (hole - 1) / 2;
                 let parent_slot = Self::read_slot(allocator.stack(), data, parent)?;
                 if Self::read_key(&parent_slot) > key {
-                    writes.push((data + hole * stride, parent_slot));
+                    writes.push((
+                        data + hole * stride,
+                        SmallBuf::Heap(parent_slot.into_boxed_slice()),
+                    ));
                     hole = parent;
                 } else {
                     break;
                 }
             }
-            writes.push((data + hole * stride, new_slot));
-            writes.push((handle + LEN_OFF, (len + 1).to_le_bytes().to_vec()));
+            writes.push((
+                data + hole * stride,
+                SmallBuf::Heap(new_slot.into_boxed_slice()),
+            ));
+            writes.push(w8(handle + LEN_OFF, len + 1));
             allocator.stack().set_batched(writes)?;
             return Ok(());
         }
@@ -254,7 +260,7 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBinaryHeap<K, V> {
         let last_key = Self::read_key(&last_slot);
         let newlen = len - 1;
         let mut hole = 0u64;
-        let mut writes: Vec<(u64, Vec<u8>)> = Vec::new();
+        let mut writes: Vec<(u64, SmallBuf)> = Vec::new();
         loop {
             let mut child = 2 * hole + 1;
             if child >= newlen {
@@ -272,14 +278,20 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBinaryHeap<K, V> {
                 }
             }
             if smaller_key < last_key {
-                writes.push((data + hole * stride, smaller));
+                writes.push((
+                    data + hole * stride,
+                    SmallBuf::Heap(smaller.into_boxed_slice()),
+                ));
                 hole = child;
             } else {
                 break;
             }
         }
-        writes.push((data + hole * stride, last_slot));
-        writes.push((handle + LEN_OFF, newlen.to_le_bytes().to_vec()));
+        writes.push((
+            data + hole * stride,
+            SmallBuf::Heap(last_slot.into_boxed_slice()),
+        ));
+        writes.push(w8(handle + LEN_OFF, newlen));
         allocator.stack().set_batched(writes)?;
 
         // SAFETY: the value block's ownership transfers to the caller.

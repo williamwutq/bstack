@@ -43,10 +43,19 @@ omitted except where trivial.
   from `construct.rs` and replaced in `tests.rs` with a test-local equivalent that
   commits the control payload and the data block's back-pointer in one
   `set_batched`, matching the atomic path.
-- **Pervasive `.to_le_bytes().to_vec()`** — every counter/pointer write allocates
+- [FIXED] **Pervasive `.to_le_bytes().to_vec()`** — every counter/pointer write allocates
   a fresh 8-byte heap `Vec<u8>` to feed the `set_batched` / `ClonePlan::write`
   batch APIs (dozens per operation in `list`/`deque`/`map`). A small-buffer /
   inline representation for batch entries would remove most of these allocations.
+  `w8(off, val)` in `stdlib::util` replaced the `(off, val.to_le_bytes().to_vec())`
+  literal at all 54 `stdlib/*` call sites. `atomic_update`/`probe_commit`/`w8`'s
+  write-tuple value type is now `SmallBuf` (`stdlib::util`, `AsRef<[u8]>`):
+  `Buf8([u8;8])` and `Buf40([u8;40])` no-length inline variants for the two exact
+  sizes that recur (a `u64` field; a `stdlib::list` node image — 16B header +
+  3×`u64`), `Heap(Box<[u8]>)` otherwise (B-tree nodes, bucket-table images,
+  `K`-sized heap slots). `ClonePlan::write` / derive codegen untouched: its one
+  call site always writes a whole on-disk image (over 24B), so it's `Heap`
+  either way — no allocation to remove there.
 - [FIXED] **Stale crate-level docs** ([lib.rs](src/lib.rs) module comment): "Status:
   method bodies marked `todo!()` are the work ahead" and "procedural macros come
   after the runtime is filled in" describe a half-built crate; it is now
@@ -156,8 +165,9 @@ Residual points, all *leak-only* (permitted) but worth recording:
 
 ## 8. Performance potentials
 
-- Thousands of tiny `Vec<u8>` allocations for 8-byte writes (§2) — the single most
-  pervasive avoidable allocation.
+- [FIXED] Thousands of tiny `Vec<u8>` allocations for 8-byte writes (§2) — the single
+  most pervasive avoidable allocation. See §2 — replaced with `SmallBuf` in
+  `stdlib/*` (no-length inline `Buf8`/`Buf40`, `Heap` fallback).
 - No bulk alloc/free in clone/teardown (§1) even when the concrete allocator
   implements `BStackBulkAllocator`.
 - **Double read per strong child in clone**: `ClonePlan::bump_strong` calls

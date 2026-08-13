@@ -28,7 +28,7 @@ use bstack::{BStack, BStackRange};
 use bytemuck::{Pod, Zeroable};
 
 use super::bloom::{BStackCountingBloomFilter, BloomOnDisk};
-use super::util::{Scratch, alloc_image, read_fields, read_u64};
+use super::util::{Scratch, SmallBuf, alloc_image, read_fields, read_u64, w8};
 use crate::block::{BStackBlock, BStackCast};
 use crate::clone::{ClonePlan, TryCloneIn};
 use crate::layout::{BlockHeader, EightCC, HEADER_SIZE, get_u64};
@@ -86,7 +86,7 @@ struct Build<'a, A: BStackRaiiAllocator> {
     node_size: u64,
     ksize: usize,
     children_off: usize,
-    writes: Vec<(u64, Vec<u8>)>,
+    writes: Vec<(u64, SmallBuf)>,
     freed: Vec<u64>,
 }
 
@@ -104,7 +104,8 @@ impl<'a, A: BStackRaiiAllocator> Build<'a, A> {
             b[co..co + 8].copy_from_slice(&c.to_le_bytes());
         }
         let off = self.allocator.alloc(self.node_size)?.as_range().start();
-        self.writes.push((off, b));
+        self.writes
+            .push((off, SmallBuf::Heap(b.into_boxed_slice())));
         Ok(off)
     }
 }
@@ -327,8 +328,8 @@ impl<K: Pod + Ord> BStackBTreeSet<K> {
             Ok(new_root) => {
                 let new_node_offs: Vec<u64> = build.writes.iter().map(|(o, _)| *o).collect();
                 let mut writes = core::mem::take(&mut build.writes);
-                writes.push((handle + ROOT_OFF, new_root.to_le_bytes().to_vec()));
-                writes.push((handle + LEN_OFF, (len + 1).to_le_bytes().to_vec()));
+                writes.push(w8(handle + ROOT_OFF, new_root));
+                writes.push(w8(handle + LEN_OFF, len + 1));
                 match stack.set_batched(writes) {
                     Ok(()) => {
                         for off in &build.freed {
@@ -604,8 +605,8 @@ impl<K: Pod + Ord> BStackBTreeSet<K> {
             Ok(new_root) => {
                 let new_node_offs: Vec<u64> = build.writes.iter().map(|(o, _)| *o).collect();
                 let mut writes = core::mem::take(&mut build.writes);
-                writes.push((handle + ROOT_OFF, new_root.to_le_bytes().to_vec()));
-                writes.push((handle + LEN_OFF, (len - 1).to_le_bytes().to_vec()));
+                writes.push(w8(handle + ROOT_OFF, new_root));
+                writes.push(w8(handle + LEN_OFF, len - 1));
                 match stack.set_batched(writes) {
                     Ok(()) => {
                         for off in &build.freed {

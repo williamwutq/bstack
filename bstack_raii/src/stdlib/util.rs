@@ -58,6 +58,37 @@ pub(super) fn w8(off: u64, val: u64) -> (u64, SmallBuf) {
     (off, SmallBuf::Buf8(val.to_le_bytes()))
 }
 
+/// A `Vec<(u64, SmallBuf)>` substitute for [`atomic_update`] `plan` closures
+/// whose write count is a small compile-time constant (metadata bumps, a
+/// single slot write) — the array sits on the stack, so building the batch
+/// takes no heap allocation. `push` panics past `N`; callers size `N` to the
+/// closure's exact, statically-known maximum. Not for batches whose size
+/// depends on runtime data (e.g. copying every live element on a resize) —
+/// those still need `Vec`.
+pub(super) struct WriteBuf<const N: usize> {
+    buf: [(u64, SmallBuf); N],
+    len: usize,
+}
+
+impl<const N: usize> WriteBuf<N> {
+    pub(super) fn new() -> Self {
+        Self {
+            buf: core::array::from_fn(|_| (0, SmallBuf::Buf8([0; 8]))),
+            len: 0,
+        }
+    }
+    pub(super) fn push(&mut self, item: (u64, SmallBuf)) {
+        self.buf[self.len] = item;
+        self.len += 1;
+    }
+    pub(super) fn len(&self) -> usize {
+        self.len
+    }
+    pub(super) fn as_slice(&self) -> &[(u64, SmallBuf)] {
+        &self.buf[..self.len]
+    }
+}
+
 /// Read `N` **contiguous** little-endian `u64` fields starting at `off` in a
 /// *single* I/O call, returning them as an array. Use this instead of several
 /// [`read_u64`] calls when the fields are adjacent (e.g. a handle's metadata) —

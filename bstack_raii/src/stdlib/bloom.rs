@@ -42,7 +42,7 @@ use bstack::{BStack, BStackGenOp, BStackRange};
 use bytemuck::{Pod, Zeroable};
 
 use super::hash::double_hash;
-use super::util::{alloc_image, read_fields, read_u64};
+use super::util::{SmallBuf, alloc_image, read_fields, read_u64, w8};
 use crate::block::{BStackBlock, BStackCast};
 use crate::clone::{ClonePlan, TryCloneIn};
 use crate::layout::{BlockHeader, EightCC, HEADER_SIZE};
@@ -215,8 +215,11 @@ impl<K: Pod> BStackCountingBloomFilter<K> {
         let handle = self.range.start();
         let [data, m] = read_fields::<2>(allocator.stack(), handle + DATA_OFF)?;
         allocator.stack().set_batched([
-            (data, vec![0u8; m as usize]),
-            (handle + N_OFF, 0u64.to_le_bytes().to_vec()),
+            (
+                data,
+                SmallBuf::Heap(vec![0u8; m as usize].into_boxed_slice()),
+            ),
+            w8(handle + N_OFF, 0u64),
         ])
     }
 

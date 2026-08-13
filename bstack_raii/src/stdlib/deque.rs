@@ -40,7 +40,7 @@ use crate::BStackRaiiAllocator;
 use bstack::{BStack, BStackRange};
 use bytemuck::{Pod, Zeroable};
 
-use super::util::{alloc_image, atomic_update, read_fields, read_u64};
+use super::util::{SmallBuf, WriteBuf, alloc_image, atomic_update, read_fields, read_u64, w8};
 use crate::block::{BStackBlock, BStackCast};
 use crate::clone::{ClonePlan, TryCloneIn};
 use crate::layout::{BlockHeader, EightCC, HEADER_SIZE};
@@ -181,6 +181,7 @@ impl<T: BStackBlock> BStackDeque<T> {
         let val_off = value.into_inner().range().start();
         loop {
             let full = Cell::new(false);
+            let mut w: WriteBuf<2> = WriteBuf::new();
             atomic_update(
                 allocator,
                 &[
@@ -194,14 +195,12 @@ impl<T: BStackBlock> BStackDeque<T> {
                     let (head, len, cap, data) = (v1[0], v1[1], v1[2], v1[3]);
                     if len < cap {
                         let slot = data + ((head + len) % cap) * 8;
-                        vec![
-                            (slot, val_off.to_le_bytes().to_vec()),
-                            (handle + LEN_OFF, (len + 1).to_le_bytes().to_vec()),
-                        ]
+                        w.push(w8(slot, val_off));
+                        w.push(w8(handle + LEN_OFF, len + 1));
                     } else {
                         full.set(true);
-                        Vec::new()
                     }
+                    w.as_slice()
                 },
             )?;
             if !full.get() {
@@ -221,6 +220,7 @@ impl<T: BStackBlock> BStackDeque<T> {
         let val_off = value.into_inner().range().start();
         loop {
             let full = Cell::new(false);
+            let mut w: WriteBuf<3> = WriteBuf::new();
             atomic_update(
                 allocator,
                 &[
@@ -235,15 +235,13 @@ impl<T: BStackBlock> BStackDeque<T> {
                     if len < cap {
                         let idx = (head + cap - 1) % cap;
                         let slot = data + idx * 8;
-                        vec![
-                            (slot, val_off.to_le_bytes().to_vec()),
-                            (handle + HEAD_OFF, idx.to_le_bytes().to_vec()),
-                            (handle + LEN_OFF, (len + 1).to_le_bytes().to_vec()),
-                        ]
+                        w.push(w8(slot, val_off));
+                        w.push(w8(handle + HEAD_OFF, idx));
+                        w.push(w8(handle + LEN_OFF, len + 1));
                     } else {
                         full.set(true);
-                        Vec::new()
                     }
+                    w.as_slice()
                 },
             )?;
             if !full.get() {
@@ -264,6 +262,7 @@ impl<T: BStackBlock> BStackDeque<T> {
         let handle = self.range.start();
         let got = Cell::new(false);
         let val = Cell::new(0u64);
+        let mut w: WriteBuf<1> = WriteBuf::new();
         atomic_update(
             allocator,
             &[
@@ -282,12 +281,12 @@ impl<T: BStackBlock> BStackDeque<T> {
             },
             |v1, v2| {
                 let len = v1[1];
-                if len == 0 {
-                    return Vec::new();
+                if len != 0 {
+                    got.set(true);
+                    val.set(v2[0]);
+                    w.push(w8(handle + LEN_OFF, len - 1));
                 }
-                got.set(true);
-                val.set(v2[0]);
-                vec![(handle + LEN_OFF, (len - 1).to_le_bytes().to_vec())]
+                w.as_slice()
             },
         )?;
         if !got.get() {
@@ -308,6 +307,7 @@ impl<T: BStackBlock> BStackDeque<T> {
         let handle = self.range.start();
         let got = Cell::new(false);
         let val = Cell::new(0u64);
+        let mut w: WriteBuf<2> = WriteBuf::new();
         atomic_update(
             allocator,
             &[
@@ -326,15 +326,13 @@ impl<T: BStackBlock> BStackDeque<T> {
             },
             |v1, v2| {
                 let (head, len, cap) = (v1[0], v1[1], v1[2]);
-                if len == 0 {
-                    return Vec::new();
+                if len != 0 {
+                    got.set(true);
+                    val.set(v2[0]);
+                    w.push(w8(handle + HEAD_OFF, (head + 1) % cap));
+                    w.push(w8(handle + LEN_OFF, len - 1));
                 }
-                got.set(true);
-                val.set(v2[0]);
-                vec![
-                    (handle + HEAD_OFF, ((head + 1) % cap).to_le_bytes().to_vec()),
-                    (handle + LEN_OFF, (len - 1).to_le_bytes().to_vec()),
-                ]
+                w.as_slice()
             },
         )?;
         if !got.get() {
@@ -363,6 +361,7 @@ impl<T: BStackBlock> BStackDeque<T> {
         // Abort if, at commit time, the ring already has room or is already at
         // least this big (another thread grew it) — then our `newring` is wasted.
         let abort = |_head: u64, len: u64, cap: u64| (cap != 0 && len < cap) || newcap <= cap;
+        let mut w: Vec<(u64, SmallBuf)> = Vec::new();
 
         atomic_update(
             allocator,
@@ -383,22 +382,21 @@ impl<T: BStackBlock> BStackDeque<T> {
             },
             |v1, v2| {
                 let (head, len, cap, data) = (v1[0], v1[1], v1[2], v1[3]);
-                if abort(head, len, cap) {
-                    return Vec::new();
+                if !abort(head, len, cap) {
+                    grown.set(true);
+                    old_ring.set(data);
+                    old_cap.set(cap);
+                    w.reserve(v2.len() + 3);
+                    // Copy every live element to the front of the new ring.
+                    for (i, &r) in v2.iter().enumerate() {
+                        w.push(w8(newring + (i as u64) * 8, r));
+                    }
+                    // Swap the descriptor to the new ring, re-based at head 0.
+                    w.push(w8(handle + DATA_OFF, newring));
+                    w.push(w8(handle + CAP_OFF, newcap));
+                    w.push(w8(handle + HEAD_OFF, 0u64));
                 }
-                grown.set(true);
-                old_ring.set(data);
-                old_cap.set(cap);
-                let mut w = Vec::with_capacity(v2.len() + 3);
-                // Copy every live element to the front of the new ring.
-                for (i, &r) in v2.iter().enumerate() {
-                    w.push((newring + (i as u64) * 8, r.to_le_bytes().to_vec()));
-                }
-                // Swap the descriptor to the new ring, re-based at head 0.
-                w.push((handle + DATA_OFF, newring.to_le_bytes().to_vec()));
-                w.push((handle + CAP_OFF, newcap.to_le_bytes().to_vec()));
-                w.push((handle + HEAD_OFF, 0u64.to_le_bytes().to_vec()));
-                w
+                w.as_slice()
             },
         )?;
 

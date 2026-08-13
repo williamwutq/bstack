@@ -39,7 +39,9 @@ use bytemuck::{Pod, Zeroable};
 
 use super::bloom::{BStackCountingBloomFilter, BloomOnDisk};
 use super::hash::fnv1a;
-use super::util::{Meta, ProbeStep, Scratch, alloc_image, probe_commit, read_fields, read_u64};
+use super::util::{
+    Meta, ProbeStep, Scratch, SmallBuf, alloc_image, probe_commit, read_fields, read_u64, w8,
+};
 use crate::block::{BStackBlock, BStackCast};
 use crate::clone::{ClonePlan, TryCloneIn};
 use crate::layout::{BlockHeader, EightCC, HEADER_SIZE, get_u64};
@@ -92,16 +94,19 @@ fn place_writes(
     target: u64,
     slot_was_empty: bool,
     key_bytes: &[u8],
-) -> Vec<(u64, Vec<u8>)> {
+) -> Vec<(u64, SmallBuf)> {
     let mut img = Vec::with_capacity(8 + key_bytes.len());
     img.extend_from_slice(&OCCUPIED.to_le_bytes());
     img.extend_from_slice(key_bytes);
     let mut w = vec![
-        (m.table + target * stride, img),
-        (handle + LEN_OFF, (m.len + 1).to_le_bytes().to_vec()),
+        (
+            m.table + target * stride,
+            SmallBuf::Heap(img.into_boxed_slice()),
+        ),
+        w8(handle + LEN_OFF, m.len + 1),
     ];
     if slot_was_empty {
-        w.push((handle + USED_OFF, (m.used + 1).to_le_bytes().to_vec()));
+        w.push(w8(handle + USED_OFF, m.used + 1));
     }
     w
 }
@@ -323,8 +328,8 @@ impl<K: Pod> BStackHashSet<K> {
                 } else if state == OCCUPIED && buf[8..8 + ksz] == *key_bytes {
                     found.set(true);
                     ProbeStep::Stop(vec![
-                        (m.table + idx * stride, TOMBSTONE.to_le_bytes().to_vec()),
-                        (handle + LEN_OFF, (m.len - 1).to_le_bytes().to_vec()),
+                        w8(m.table + idx * stride, TOMBSTONE),
+                        w8(handle + LEN_OFF, m.len - 1),
                     ])
                 } else {
                     ProbeStep::Continue
@@ -385,7 +390,7 @@ impl<K: Pod> BStackHashSet<K> {
         let mut abort = false;
         let mut read_i = 0u64;
         let mut built = false;
-        let mut writes: Vec<(u64, Vec<u8>)> = Vec::new();
+        let mut writes: Vec<(u64, SmallBuf)> = Vec::new();
         let mut w = 0usize;
 
         allocator.stack().inplace_gen(|_feedback| {
@@ -455,10 +460,13 @@ impl<K: Pod> BStackHashSet<K> {
                         idx = (idx + 1) & newmask;
                     }
                 }
-                writes.push((newtable, std::mem::take(&mut new_image)));
-                writes.push((handle + TABLE_OFF, newtable.to_le_bytes().to_vec()));
-                writes.push((handle + CAP_OFF, newcap.to_le_bytes().to_vec()));
-                writes.push((handle + USED_OFF, m.len.to_le_bytes().to_vec()));
+                writes.push((
+                    newtable,
+                    SmallBuf::Heap(std::mem::take(&mut new_image).into_boxed_slice()),
+                ));
+                writes.push(w8(handle + TABLE_OFF, newtable));
+                writes.push(w8(handle + CAP_OFF, newcap));
+                writes.push(w8(handle + USED_OFF, m.len));
             }
             if w < writes.len() {
                 let i = w;

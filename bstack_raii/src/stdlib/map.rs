@@ -42,7 +42,10 @@ use bstack::{BStack, BStackGenOp, BStackRange};
 use bytemuck::{Pod, Zeroable};
 
 use super::hash::fnv1a;
-use super::util::{Meta, ProbeStep, Scratch, alloc_image, probe_commit, read_fields, read_u64};
+use super::util::{
+    Meta, ProbeStep, Scratch, SmallBuf, WriteBuf, alloc_image, probe_commit, read_fields, read_u64,
+    w8,
+};
 use crate::block::{BStackBlock, BStackCast};
 use crate::clone::{ClonePlan, TryCloneIn};
 use crate::layout::{BlockHeader, EightCC, HEADER_SIZE, get_u64};
@@ -100,18 +103,21 @@ fn new_bucket_writes(
     m: &Meta,
     target: u64,
     slot_was_empty: bool,
-) -> Vec<(u64, Vec<u8>)> {
+) -> Vec<(u64, SmallBuf)> {
     let mut img = Vec::with_capacity(16 + e.ksz);
     img.extend_from_slice(&OCCUPIED.to_le_bytes());
     img.extend_from_slice(e.key_bytes);
     img.extend_from_slice(&e.val_ref.to_le_bytes());
 
     let mut w = vec![
-        (m.table + target * e.stride, img),
-        (e.handle + LEN_OFF, (m.len + 1).to_le_bytes().to_vec()),
+        (
+            m.table + target * e.stride,
+            SmallBuf::Heap(img.into_boxed_slice()),
+        ),
+        w8(e.handle + LEN_OFF, m.len + 1),
     ];
     if slot_was_empty {
-        w.push((e.handle + USED_OFF, (m.used + 1).to_le_bytes().to_vec()));
+        w.push(w8(e.handle + USED_OFF, m.used + 1));
     }
     w
 }
@@ -236,7 +242,7 @@ impl<K: Pod, V: BStackBlock> BStackHashMap<K, V> {
                         old_value.set(get_u64(&buf[8 + ksz..8 + ksz + 8]));
                         is_new.set(false);
                         let value_off = m.table + idx * stride + 8 + ksz as u64;
-                        ProbeStep::Stop(vec![(value_off, val_ref.to_le_bytes().to_vec())])
+                        ProbeStep::Stop(vec![w8(value_off, val_ref)])
                     } else {
                         if state == TOMBSTONE && first_tomb.get().is_none() {
                             first_tomb.set(Some(idx));
@@ -299,8 +305,8 @@ impl<K: Pod, V: BStackBlock> BStackHashMap<K, V> {
                     found.set(true);
                     old_value.set(get_u64(&buf[8 + ksz..8 + ksz + 8]));
                     ProbeStep::Stop(vec![
-                        (m.table + idx * stride, TOMBSTONE.to_le_bytes().to_vec()),
-                        (handle + LEN_OFF, (m.len - 1).to_le_bytes().to_vec()),
+                        w8(m.table + idx * stride, TOMBSTONE),
+                        w8(handle + LEN_OFF, m.len - 1),
                     ])
                 } else {
                     ProbeStep::Continue
@@ -446,7 +452,7 @@ impl<K: Pod, V: BStackBlock> BStackHashMap<K, V> {
         let mut abort = false;
         let mut read_i = 0u64;
         let mut built = false;
-        let mut writes: Vec<(u64, Vec<u8>)> = Vec::new();
+        let mut writes: WriteBuf<4> = WriteBuf::new();
         let mut w = 0usize;
 
         allocator.stack().inplace_gen(|_feedback| {
@@ -521,16 +527,19 @@ impl<K: Pod, V: BStackBlock> BStackHashMap<K, V> {
                         idx = (idx + 1) & newmask;
                     }
                 }
-                writes.push((newtable, std::mem::take(&mut new_image)));
-                writes.push((handle + TABLE_OFF, newtable.to_le_bytes().to_vec()));
-                writes.push((handle + CAP_OFF, newcap.to_le_bytes().to_vec()));
+                writes.push((
+                    newtable,
+                    SmallBuf::Heap(std::mem::take(&mut new_image).into_boxed_slice()),
+                ));
+                writes.push(w8(handle + TABLE_OFF, newtable));
+                writes.push(w8(handle + CAP_OFF, newcap));
                 // Tombstones dropped: used == len now.
-                writes.push((handle + USED_OFF, m.len.to_le_bytes().to_vec()));
+                writes.push(w8(handle + USED_OFF, m.len));
             }
             if w < writes.len() {
                 let i = w;
                 w += 1;
-                let (off, ref bytes) = writes[i];
+                let (off, ref bytes) = writes.as_slice()[i];
                 // SAFETY: `writes` outlives the call and is not mutated after build.
                 let d: &[u8] = unsafe { core::mem::transmute::<&[u8], _>(bytes.as_slice()) };
                 return Some(BStackGenOp::Write {
