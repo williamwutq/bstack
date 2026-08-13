@@ -8,7 +8,9 @@ use core::mem::size_of;
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use bstack::{BStack, BStackAllocator, BStackRange, FirstFitBStackAllocator};
+use bstack::{
+    BStack, BStackAllocator, BStackRange, FirstFitBStackAllocator, GhostTreeBstackAllocator,
+};
 
 use crate::layout::{self, BlockHeader};
 use crate::{
@@ -49,6 +51,14 @@ impl TempStack {
 
     fn allocator(&self) -> FirstFitBStackAllocator {
         FirstFitBStackAllocator::new(self.open()).unwrap()
+    }
+
+    /// A `GhostTree` allocator — the one bstack-provided allocator that both
+    /// anchors a WAL and implements `BStackBulkAllocator`, so it exercises the
+    /// atomic-bulk override of `alloc_many` / `free_many` (FirstFit hits the
+    /// sequential fallback).
+    fn ghost_allocator(&self) -> GhostTreeBstackAllocator {
+        GhostTreeBstackAllocator::new(self.open()).unwrap()
     }
 }
 
@@ -390,6 +400,28 @@ fn macro_recursive_drop() {
     });
 }
 
+// Same recursive teardown, but on a `GhostTree` allocator (`atomic_bulk() == true`):
+// `wal_teardown` frees the whole same-file subtree with one atomic `dealloc_bulk`,
+// skipping the WAL. Build + tear down twice and assert the stack returns to baseline
+// — a leak (e.g. the child not freed by the bulk path) would show as growth.
+#[test]
+fn macro_recursive_drop_on_bulk_allocator() {
+    let tmp = TempStack::new();
+    let alloc = tmp.ghost_allocator();
+    let build = || {
+        let leaf = MacroLeaf::new(&alloc, 42).unwrap();
+        MacroParent::new(&alloc, leaf, 7).unwrap()
+    };
+    build().bstack_drop(&alloc).unwrap();
+    let base = alloc.stack().len().unwrap();
+    build().bstack_drop(&alloc).unwrap();
+    assert_eq!(
+        alloc.stack().len().unwrap(),
+        base,
+        "bulk teardown leaked (child not freed by dealloc_bulk?)"
+    );
+}
+
 // --------------------------------------------------------------------------
 // AutoDrop: the RAII guard vs. bare / manual teardown
 // --------------------------------------------------------------------------
@@ -705,6 +737,38 @@ fn macro_new_rc_weak() {
     );
 
     // Full shared lifecycle on a constructor-built block.
+    let rc2 = rc.try_clone().unwrap();
+    let weak = rc.downgrade().unwrap();
+    drop(rc2);
+    drop(rc);
+    assert!(weak.upgrade().unwrap().is_none());
+    drop(weak);
+}
+
+// The same (rc, weak) constructor/clone/teardown lifecycle, but on a `GhostTree`
+// allocator — which implements `BStackBulkAllocator`, so the two-block constructor
+// routes through the atomic `alloc_bulk` override of `alloc_many` (and the rollback
+// path through `dealloc_bulk`). This is the only test that exercises the bulk
+// branch at runtime; every other test uses FirstFit's sequential fallback.
+#[test]
+fn macro_new_rc_weak_on_bulk_allocator() {
+    let tmp = TempStack::new();
+    let alloc = tmp.ghost_allocator();
+    let stack = alloc.stack();
+
+    // Two-block (data + control) constructor via the bulk `alloc_many` override.
+    let leaf = MacroLeaf::new(&alloc, 7).unwrap();
+    let rc = MacroShared::new(&alloc, leaf).unwrap();
+    assert_eq!(
+        rc.handle()
+            .get_child(stack)
+            .unwrap()
+            .get_val(stack)
+            .unwrap(),
+        7
+    );
+
+    // Full shared lifecycle, so the strong/weak release + block frees run too.
     let rc2 = rc.try_clone().unwrap();
     let weak = rc.downgrade().unwrap();
     drop(rc2);

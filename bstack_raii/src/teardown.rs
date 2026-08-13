@@ -66,7 +66,18 @@ pub fn wal_teardown<A: BStackRaiiAllocator, T: BStackDrop>(
     let slices = TEARDOWN_SINK
         .with(|s| s.borrow_mut().take())
         .unwrap_or_default();
-    wal_free_all(allocator, slices)?;
+    // Bulk-capable allocator, same-file subtree: `dealloc_bulk` is itself atomic and
+    // self-recovering, so free the whole subtree as one atomic batch and **skip the
+    // WAL** — wrapping an already-atomic bulk free in the WAL is redundant and
+    // unsound (the allocator's recovery direction is opaque, so a WAL retry could
+    // double-free). A crash mid-bulk is reclaimed by the allocator's own recovery.
+    // A cross-file (mixed `FileId`) teardown still routes through the WAL so its
+    // foreign frees are replayed via the registry on recovery.
+    if allocator.atomic_bulk() && slices.iter().all(|(fid, _)| *fid == FileId::SELF) {
+        allocator.free_many(slices.into_iter().map(|(_, r)| r))?;
+    } else {
+        wal_free_all(allocator, slices)?;
+    }
     result
 }
 

@@ -1,25 +1,27 @@
-//! [`alloc_many`] / [`free_many`]: multi-block allocation and free with
-//! all-or-nothing rollback on the allocation side.
+//! Sequential fallbacks for [`BStackRaiiAllocator::alloc_many`] /
+//! [`BStackRaiiAllocator::free_many`].
 //!
-//! ## Why these are sequential, not atomic bulk
+//! ## How bulk dispatch works
 //!
 //! bstack provides atomic [`BStackBulkAllocator::alloc_bulk`] /
 //! [`dealloc_bulk`](bstack::BStackBulkAllocator::dealloc_bulk), but only some
 //! allocators implement it, and **all** of `bstack_raii` is generic over
-//! `A: BStackRaiiAllocator`. On stable Rust a generic function cannot
-//! dispatch on whether its concrete `A` *also* implements `BStackBulkAllocator`:
-//! trait-method selection happens once, at the generic definition site, where the
-//! extra bound is unprovable — so any "prefer bulk when available" shim (autoref
-//! specialization included) collapses to the sequential path in generic code, and
-//! `min_specialization` is nightly-only. Requiring the bulk bound instead would
-//! exclude `FirstFit` (and every current test), so these helpers stay sequential:
+//! `A: BStackRaiiAllocator`. On stable Rust a generic function cannot dispatch on
+//! whether its concrete `A` *also* implements `BStackBulkAllocator` (that needs the
+//! nightly `specialization` feature; autoref specialization collapses to the
+//! fallback in generic code), so we don't try. Instead `alloc_many` / `free_many`
+//! are **provided methods on [`BStackRaiiAllocator`]**: the default bodies are these
+//! sequential helpers, and each bulk-capable allocator *overrides* them to call
+//! `alloc_bulk` / `dealloc_bulk` (see the impls in [`crate::wal`]). Ordinary trait
+//! dispatch then picks the override at monomorphization — the fast path flows
+//! through generic code, and non-bulk allocators (e.g. `FirstFit`) keep the
+//! sequential path — with no bound leaking onto the public API.
+//!
+//! Atomicity of the fallback:
 //!
 //! * each individual `alloc` / `dealloc` **is** crash-atomic (allocator contract);
 //! * the *set* is not — a crash mid-sequence orphans the blocks done so far (a
 //!   leak, never a torn structure), which the WAL layer reclaims.
-//!
-//! A caller that statically knows its allocator is bulk-capable can still call
-//! `alloc_bulk` / `dealloc_bulk` directly for atomicity.
 
 use std::io;
 
@@ -28,10 +30,11 @@ use bstack::BStackRange;
 use crate::BStackRaiiAllocator;
 use crate::teardown::dealloc_range;
 
-/// Allocate one block per entry in `sizes`, in order. On any failure the blocks
-/// already allocated are freed (reverse order) before the error is returned, so a
-/// partial allocation never leaks within the call.
-pub fn alloc_many<A: BStackRaiiAllocator>(
+/// Sequential fallback for [`BStackRaiiAllocator::alloc_many`]: allocate one block
+/// per entry in `sizes`, in order. On any failure the blocks already allocated are
+/// freed (reverse order) before the error is returned, so a partial allocation
+/// never leaks within the call.
+pub(crate) fn seq_alloc_many<A: BStackRaiiAllocator>(
     allocator: &A,
     sizes: &[u64],
 ) -> io::Result<Vec<BStackRange>> {
@@ -51,9 +54,10 @@ pub fn alloc_many<A: BStackRaiiAllocator>(
     Ok(out)
 }
 
-/// Free every range in turn. Stops and propagates on the first error (the
-/// remaining ranges are left allocated for the caller to handle).
-pub fn free_many<A: BStackRaiiAllocator>(
+/// Sequential fallback for [`BStackRaiiAllocator::free_many`]: free every range in
+/// turn. Stops and propagates on the first error (the remaining ranges are left
+/// allocated for the caller to handle).
+pub(crate) fn seq_free_many<A: BStackRaiiAllocator>(
     allocator: &A,
     ranges: impl IntoIterator<Item = BStackRange>,
 ) -> io::Result<()> {

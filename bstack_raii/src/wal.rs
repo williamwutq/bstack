@@ -57,7 +57,7 @@ use std::collections::HashMap;
 use std::io;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use bstack::BStackRange;
+use bstack::{BStackBulkAllocator, BStackOwnedSlice, BStackRange};
 use bytemuck::{Pod, Zeroable};
 
 use crate::BStackRaiiAllocator;
@@ -452,6 +452,17 @@ unsafe impl BStackRaiiAllocator for bstack::GhostTreeBstackAllocator {
     fn wal_anchor(&self) -> Option<u64> {
         Some(STD_WAL_ANCHOR)
     }
+    // GhostTree implements `BStackBulkAllocator`, so route the multi-block helpers
+    // through the atomic bulk ops (see [`bulk_alloc_many`] / [`bulk_free_many`]).
+    fn alloc_many(&self, sizes: &[u64]) -> io::Result<Vec<BStackRange>> {
+        bulk_alloc_many(self, sizes)
+    }
+    fn free_many(&self, ranges: impl IntoIterator<Item = BStackRange>) -> io::Result<()> {
+        bulk_free_many(self, ranges)
+    }
+    fn atomic_bulk(&self) -> bool {
+        true
+    }
 }
 unsafe impl BStackRaiiAllocator for bstack::SlabBStackAllocator {
     fn wal_anchor(&self) -> Option<u64> {
@@ -464,8 +475,50 @@ unsafe impl BStackRaiiAllocator for bstack::CheckedSlabBStackAllocator {
     }
 }
 // `LinearBStackAllocator`'s `dealloc` is a no-op (nothing to reclaim), so it opts
-// out via the default `None` — but it still needs the impl to satisfy the bound.
-unsafe impl BStackRaiiAllocator for bstack::LinearBStackAllocator {}
+// out of WAL reclamation via the default `None` — but it still implements
+// `BStackBulkAllocator`, so it can still route the multi-block helpers through the
+// atomic bulk ops.
+unsafe impl BStackRaiiAllocator for bstack::LinearBStackAllocator {
+    fn alloc_many(&self, sizes: &[u64]) -> io::Result<Vec<BStackRange>> {
+        bulk_alloc_many(self, sizes)
+    }
+    fn free_many(&self, ranges: impl IntoIterator<Item = BStackRange>) -> io::Result<()> {
+        bulk_free_many(self, ranges)
+    }
+    fn atomic_bulk(&self) -> bool {
+        true
+    }
+}
+
+/// The bulk override shared by every [`BStackBulkAllocator`]: allocate all `sizes`
+/// as one atomic [`alloc_bulk`](BStackBulkAllocator::alloc_bulk) and hand back their
+/// ranges. Either all blocks are allocated or none is (and the store is unchanged);
+/// a crash mid-op is reclaimed by the allocator's own recovery, so this needs no WAL.
+fn bulk_alloc_many<A>(allocator: &A, sizes: &[u64]) -> io::Result<Vec<BStackRange>>
+where
+    A: BStackRaiiAllocator + BStackBulkAllocator,
+{
+    let slices = allocator.alloc_bulk(sizes)?;
+    Ok(slices.into_iter().map(|s| s.as_range()).collect())
+}
+
+/// The bulk override shared by every [`BStackBulkAllocator`]: free all `ranges` as
+/// one atomic [`dealloc_bulk`](BStackBulkAllocator::dealloc_bulk). Reconstructs an
+/// owned slice per range (as [`crate::teardown::dealloc_range`] does) and frees them
+/// together; on failure the error's `source` is surfaced (the un-freed handles it
+/// carries back are dropped — they are non-RAII, so dropping does not double-free).
+fn bulk_free_many<A>(allocator: &A, ranges: impl IntoIterator<Item = BStackRange>) -> io::Result<()>
+where
+    A: BStackRaiiAllocator + BStackBulkAllocator,
+{
+    let handles = ranges
+        .into_iter()
+        // SAFETY: each range is a live allocation owned by `allocator` that no other
+        // live handle will also free (the `free_many` contract).
+        .map(|r| unsafe { BStackOwnedSlice::from_raw_range(allocator, r) })
+        .collect::<Vec<_>>();
+    allocator.dealloc_bulk(handles).map_err(|e| e.source)
+}
 
 // ---------------------------------------------------------------------------
 // In-memory serialization of WAL transactions.

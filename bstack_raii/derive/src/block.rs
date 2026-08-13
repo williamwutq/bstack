@@ -4794,7 +4794,7 @@ fn constructor(
                     #(#preps)*
                     // Allocate data + control up front (atomically when the
                     // allocator supports bulk); both are orphans until the commit.
-                    let __blocks = ::bstack_raii::__private::alloc_many(allocator, &[#size, #ctrl_size])?;
+                    let __blocks = ::bstack_raii::BStackRaiiAllocator::alloc_many(allocator, &[#size, #ctrl_size])?;
                     let __data = __blocks[0];
                     let __ctrl = __blocks[1];
                     let __on_disk = #on_disk_ctor {
@@ -4817,7 +4817,7 @@ fn constructor(
                     if let ::std::result::Result::Err(__e) =
                         allocator.stack().set_batched(__writes)
                     {
-                        let _ = ::bstack_raii::__private::free_many(allocator, [__data, __ctrl]);
+                        let _ = ::bstack_raii::BStackRaiiAllocator::free_many(allocator, [__data, __ctrl]);
                         return ::std::result::Result::Err(__e);
                     }
                     #(#post)*
@@ -7328,7 +7328,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                     let (__disc, __payload): (#disc_ty, [u8; #payload_const]) = match data {
                         #(#new_arms)*
                     };
-                    let __blocks = ::bstack_raii::__private::alloc_many(allocator, &[#enum_size, #ctrl_size])?;
+                    let __blocks = ::bstack_raii::BStackRaiiAllocator::alloc_many(allocator, &[#enum_size, #ctrl_size])?;
                     let __data = __blocks[0];
                     let __ctrl = __blocks[1];
                     let __on_disk = #on_disk {
@@ -7352,7 +7352,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                     if let ::std::result::Result::Err(__e) =
                         allocator.stack().set_batched(__writes)
                     {
-                        let _ = ::bstack_raii::__private::free_many(allocator, [__data, __ctrl]);
+                        let _ = ::bstack_raii::BStackRaiiAllocator::free_many(allocator, [__data, __ctrl]);
                         return ::std::result::Result::Err(__e);
                     }
                     #embed_post

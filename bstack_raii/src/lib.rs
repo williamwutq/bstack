@@ -21,7 +21,7 @@
 //! | `construct`    | Block creation: allocate, stamp the header, wire refcounts / control blocks — the build-side counterpart to `teardown`. |
 //! | [`block`]      | Block-type contracts: [`BStackCast`], [`BStackBlock`], [`BStackWeakable`]. |
 //! | [`refcount`]   | Little-endian atomic CAS ops over on-disk `u64` counters.    |
-//! | `bulk`         | `alloc_many` / `free_many`: multi-block alloc with all-or-nothing rollback (internal; called by generated code). |
+//! | `bulk`         | Sequential fallbacks for [`BStackRaiiAllocator::alloc_many`] / [`free_many`](BStackRaiiAllocator::free_many); bulk allocators override those trait methods. |
 //! | [`clone`]      | [`TryClone`] / [`TryCloneIn`]: fallible clone for handles that touch disk. |
 //! | [`handle`]     | Without-allocator inner handles: [`OwnedRef`], [`StrongRef`], [`StrongWeakRef`], [`WeakRef`]. |
 //! | [`owned`]      | [`BStackOwned`]: the without-allocator, uniquely-owned block handle. |
@@ -166,6 +166,52 @@ pub unsafe trait BStackRaiiAllocator: BStackOwnedSliceAllocator {
     fn wal_file_id(&self) -> crate::registry::FileId {
         crate::registry::FileId::SELF
     }
+
+    /// Allocate one block per length in `sizes`, returning their ranges in order.
+    ///
+    /// The default is a **sequential** fallback: each `alloc` is individually
+    /// crash-atomic, but the set is not (a crash mid-sequence orphans the blocks
+    /// done so far — a leak the WAL layer reclaims, never a torn structure). It
+    /// unwinds already-allocated blocks on any failure, so a partial allocation
+    /// never leaks *within* the call.
+    ///
+    /// A bulk-capable allocator ([`bstack::BStackBulkAllocator`]) **overrides** this
+    /// to route through the atomic [`alloc_bulk`](bstack::BStackBulkAllocator::alloc_bulk),
+    /// so the whole set becomes one crash-atomic operation recovered by the
+    /// allocator's own machinery. Ordinary trait dispatch picks the override at
+    /// monomorphization, so compound ops generic over `A` get the fast path for free.
+    fn alloc_many(&self, sizes: &[u64]) -> std::io::Result<Vec<BStackRange>> {
+        crate::bulk::seq_alloc_many(self, sizes)
+    }
+
+    /// Free every range in `ranges`. The default is a **sequential** fallback
+    /// (each `dealloc` individually atomic); a bulk-capable allocator overrides it
+    /// to route through the atomic [`dealloc_bulk`](bstack::BStackBulkAllocator::dealloc_bulk).
+    ///
+    /// # Safety-adjacent contract
+    /// Each range must be a live allocation owned by `self` that no other live
+    /// handle will also free (as for [`crate::teardown`]'s `dealloc_range`).
+    fn free_many(&self, ranges: impl IntoIterator<Item = BStackRange>) -> std::io::Result<()> {
+        crate::bulk::seq_free_many(self, ranges)
+    }
+
+    /// Whether this allocator provides **atomic, self-recovering** bulk
+    /// alloc/free — i.e. it implements [`bstack::BStackBulkAllocator`] and
+    /// overrides [`alloc_many`](Self::alloc_many) / [`free_many`](Self::free_many)
+    /// to route through it. Default `false`.
+    ///
+    /// When `true`, a compound op whose blocks all live in **this** file can free
+    /// (or allocate) them as one atomic `dealloc_bulk` / `alloc_bulk` and **skip the
+    /// WAL** entirely: the WAL exists to emulate atomic batch alloc/free for
+    /// allocators that lack it, and wrapping an already-atomic bulk op in it is both
+    /// redundant and unsound (the allocator's crash-recovery direction is opaque, so
+    /// a WAL retry on reopen could double-free). A crash mid-bulk is left to the
+    /// allocator's own recovery — consistent, leak-at-worst, exactly the guarantee
+    /// the WAL would have provided. Cross-file (mixed [`FileId`](crate::registry::FileId))
+    /// batches fall back to the WAL for its registry routing.
+    fn atomic_bulk(&self) -> bool {
+        false
+    }
 }
 // Re-exported whole so generated code can call `::bstack_raii::bytemuck::bytes_of`.
 pub use bytemuck;
@@ -178,7 +224,6 @@ pub use bstack_raii_derive::{bstack_block, bstack_cast, bstack_enum, bstack_move
 /// no stability guarantee, use directly at your own risk.
 #[doc(hidden)]
 pub mod __private {
-    pub use crate::bulk::{alloc_many, free_many};
     pub use crate::foreign::{
         foreign_clone_owned, foreign_clone_strong, foreign_clone_weak, foreign_drop_owned,
         foreign_drop_strong, foreign_drop_weak,

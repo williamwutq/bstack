@@ -7,12 +7,21 @@ omitted except where trivial.
 
 ## 1. Missing / incomplete features
 
-- **Deep clone / teardown never use bulk alloc/free.** `alloc_many`/`free_many`
-  are wired **only** into the 2-block `(rc, weak)` constructor. `ClonePlan`
-  allocates each new block via sequential `alloc_raw`, and teardown frees
-  sequentially — the "prefer `alloc_bulk`/`dealloc_bulk` when the allocator
-  supports it" design is unrealized for exactly the N-alloc / N-free paths it was
-  meant for.
+- **Deep clone / teardown never use bulk alloc/free.** *(Foundation laid
+  2026-08-12: `alloc_many`/`free_many` are now provided methods on
+  `BStackRaiiAllocator`, overridden by the bulk-capable allocators — GhostTree,
+  Linear — to route through atomic `alloc_bulk`/`dealloc_bulk`; ordinary trait
+  dispatch picks the override through generic code, so the "prefer bulk when
+  available" design is finally realizable.)* **Teardown DONE 2026-08-12:**
+  `wal_teardown` now frees a same-file subtree with one atomic `dealloc_bulk` when
+  `allocator.atomic_bulk()` (GhostTree/Linear), skipping the WAL entirely — since
+  `dealloc_bulk` is itself atomic + self-recovering, the WAL would be redundant and
+  can't compose safely with it (opaque recovery direction → double-free risk).
+  Cross-file (mixed `FileId`) still uses the WAL path for registry routing. The
+  **alloc side** remains: `ClonePlan` still allocates each new block via sequential
+  `alloc_raw`. Wiring `alloc_many` into it (the intention-first `AllocReq`/`fresh_id`
+  path — bulk allocators skip the alloc-WAL entirely, non-bulk backfill each address
+  per op) is the clone-WAL round, still to be done.
 - **`Foreign` ↔ `bstack_move` / `bstack_cast` semantics incomplete.** Moving a
   struct with a `Foreign` field, and casting for the wide-pointer relationship,
   were flagged as still-open in the project notes; needs confirmation that
