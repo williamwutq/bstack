@@ -475,9 +475,9 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
             // are tagged (via `wal_file_id`) with the target's file so the home WAL
             // reclaims them there. `#[bstack_ref]` owns nothing → no teardown.
             let foreign_drop_helper = match kind {
-                Kind::Owned => Some(quote!(::bstack_raii::foreign_drop_owned)),
-                Kind::Strong => Some(quote!(::bstack_raii::foreign_drop_strong)),
-                Kind::Weak => Some(quote!(::bstack_raii::foreign_drop_weak)),
+                Kind::Owned => Some(quote!(::bstack_raii::__private::foreign_drop_owned)),
+                Kind::Strong => Some(quote!(::bstack_raii::__private::foreign_drop_strong)),
+                Kind::Weak => Some(quote!(::bstack_raii::__private::foreign_drop_weak)),
                 // Ref: non-owning. Pod / Embed: already rejected above.
                 Kind::Ref | Kind::Pod | Kind::Embed => None,
             };
@@ -551,7 +551,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                                 let __adapter =
                                     ::bstack_raii::ForeignHostAllocator::new(__host, __id);
                                 let __new_off = unsafe {
-                                    ::bstack_raii::foreign_clone_owned::<#ftarget, _>(
+                                    ::bstack_raii::__private::foreign_clone_owned::<#ftarget, _>(
                                         &__adapter, __off,
                                     )?
                                 };
@@ -591,7 +591,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                                 let __adapter =
                                     ::bstack_raii::ForeignHostAllocator::new(__host, __id);
                                 unsafe {
-                                    ::bstack_raii::foreign_clone_strong::<#ftarget, _>(
+                                    ::bstack_raii::__private::foreign_clone_strong::<#ftarget, _>(
                                         &__adapter, __off,
                                     )?;
                                 }
@@ -627,7 +627,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                                 let __adapter =
                                     ::bstack_raii::ForeignHostAllocator::new(__host, __id);
                                 unsafe {
-                                    ::bstack_raii::foreign_clone_weak::<#ftarget, _>(
+                                    ::bstack_raii::__private::foreign_clone_weak::<#ftarget, _>(
                                         &__adapter, __off,
                                     )?;
                                 }
@@ -3552,9 +3552,9 @@ fn option_inner(ty: &Type) -> Option<&Type> {
 /// `#[bstack_ref]` owns nothing → empty. Shared with the scalar `Foreign` field.
 fn foreign_elem_drop(kind: Kind, ftarget: &Type) -> TokenStream {
     let helper = match kind {
-        Kind::Owned => quote!(::bstack_raii::foreign_drop_owned),
-        Kind::Strong => quote!(::bstack_raii::foreign_drop_strong),
-        Kind::Weak => quote!(::bstack_raii::foreign_drop_weak),
+        Kind::Owned => quote!(::bstack_raii::__private::foreign_drop_owned),
+        Kind::Strong => quote!(::bstack_raii::__private::foreign_drop_strong),
+        Kind::Weak => quote!(::bstack_raii::__private::foreign_drop_weak),
         _ => return quote!(),
     };
     quote! {
@@ -3620,7 +3620,7 @@ fn foreign_elem_clone(kind: Kind, ftarget: &Type) -> TokenStream {
                             let __adapter =
                                 ::bstack_raii::ForeignHostAllocator::new(__host, __id);
                             let __new_off = unsafe {
-                                ::bstack_raii::foreign_clone_owned::<#ftarget, _>(&__adapter, __off)? };
+                                ::bstack_raii::__private::foreign_clone_owned::<#ftarget, _>(&__adapter, __off)? };
                             ::bstack_raii::ForeignPtr::new(__fid, __new_off)
                         } else {
                             #malformed
@@ -3647,7 +3647,7 @@ fn foreign_elem_clone(kind: Kind, ftarget: &Type) -> TokenStream {
                                 .ok_or_else(|| #err)?;
                             let __adapter =
                                 ::bstack_raii::ForeignHostAllocator::new(__host, __id);
-                            unsafe { ::bstack_raii::foreign_clone_strong::<#ftarget, _>(&__adapter, __off)?; }
+                            unsafe { ::bstack_raii::__private::foreign_clone_strong::<#ftarget, _>(&__adapter, __off)?; }
                         } else {
                             #malformed
                         }
@@ -3672,7 +3672,7 @@ fn foreign_elem_clone(kind: Kind, ftarget: &Type) -> TokenStream {
                                 .ok_or_else(|| #err)?;
                             let __adapter =
                                 ::bstack_raii::ForeignHostAllocator::new(__host, __id);
-                            unsafe { ::bstack_raii::foreign_clone_weak::<#ftarget, _>(&__adapter, __off)?; }
+                            unsafe { ::bstack_raii::__private::foreign_clone_weak::<#ftarget, _>(&__adapter, __off)?; }
                         } else {
                             #malformed
                         }
@@ -4794,7 +4794,7 @@ fn constructor(
                     #(#preps)*
                     // Allocate data + control up front (atomically when the
                     // allocator supports bulk); both are orphans until the commit.
-                    let __blocks = ::bstack_raii::alloc_many(allocator, &[#size, #ctrl_size])?;
+                    let __blocks = ::bstack_raii::__private::alloc_many(allocator, &[#size, #ctrl_size])?;
                     let __data = __blocks[0];
                     let __ctrl = __blocks[1];
                     let __on_disk = #on_disk_ctor {
@@ -4817,7 +4817,7 @@ fn constructor(
                     if let ::std::result::Result::Err(__e) =
                         allocator.stack().set_batched(__writes)
                     {
-                        let _ = ::bstack_raii::free_many(allocator, [__data, __ctrl]);
+                        let _ = ::bstack_raii::__private::free_many(allocator, [__data, __ctrl]);
                         return ::std::result::Result::Err(__e);
                     }
                     #(#post)*
@@ -7328,7 +7328,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                     let (__disc, __payload): (#disc_ty, [u8; #payload_const]) = match data {
                         #(#new_arms)*
                     };
-                    let __blocks = ::bstack_raii::alloc_many(allocator, &[#enum_size, #ctrl_size])?;
+                    let __blocks = ::bstack_raii::__private::alloc_many(allocator, &[#enum_size, #ctrl_size])?;
                     let __data = __blocks[0];
                     let __ctrl = __blocks[1];
                     let __on_disk = #on_disk {
@@ -7352,7 +7352,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                     if let ::std::result::Result::Err(__e) =
                         allocator.stack().set_batched(__writes)
                     {
-                        let _ = ::bstack_raii::free_many(allocator, [__data, __ctrl]);
+                        let _ = ::bstack_raii::__private::free_many(allocator, [__data, __ctrl]);
                         return ::std::result::Result::Err(__e);
                     }
                     #embed_post

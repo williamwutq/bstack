@@ -137,8 +137,14 @@ Residual points, all *leak-only* (permitted) but worth recording:
   real commit path** (`bulk`/`clone`/`teardown` don't call it); kept `#[cfg(test)]`
   rather than deleted, noted here as a distinct §1-adjacent gap for whoever wires
   it in.
-- README does not mention `alloc_many` / `free_many` or the `foreign_*` runtime
-  helpers (acceptable if intentionally internal, but they are publicly exported).
+- [FIXED] **`alloc_many` / `free_many` and the `foreign_*` runtime helpers were
+  publicly exported with no README mention**: they exist only for
+  `#[bstack_block]`/`#[bstack_enum]`-generated code to call via a
+  fully-qualified path from downstream crates, not for direct use. Moved off
+  the crate-root `pub use` into `#[doc(hidden)] pub mod __private`, and
+  repointed the derive macro's generated `::bstack_raii::…` paths at
+  `::bstack_raii::__private::…`. `Foreign<T>` / `ForeignPtr` (the types users
+  actually write) stay public at the root.
 
 ## 7. Bad use experience
 

@@ -21,7 +21,7 @@
 //! | `construct`    | Block creation: allocate, stamp the header, wire refcounts / control blocks — the build-side counterpart to `teardown`. |
 //! | [`block`]      | Block-type contracts: [`BStackCast`], [`BStackBlock`], [`BStackWeakable`]. |
 //! | [`refcount`]   | Little-endian atomic CAS ops over on-disk `u64` counters.    |
-//! | `bulk`         | [`alloc_many`] / [`free_many`]: multi-block alloc with all-or-nothing rollback. |
+//! | `bulk`         | `alloc_many` / `free_many`: multi-block alloc with all-or-nothing rollback (internal; called by generated code). |
 //! | [`clone`]      | [`TryClone`] / [`TryCloneIn`]: fallible clone for handles that touch disk. |
 //! | [`handle`]     | Without-allocator inner handles: [`OwnedRef`], [`StrongRef`], [`StrongWeakRef`], [`WeakRef`]. |
 //! | [`owned`]      | [`BStackOwned`]: the without-allocator, uniquely-owned block handle. |
@@ -84,14 +84,10 @@ mod tests;
 pub use block::{
     BStackBlock, BStackCast, BStackMove, BStackMoveExpr, BStackShared, BStackWeakable,
 };
-pub use bulk::{alloc_many, free_many};
 pub use cast::{BStackCastAs, BStackCastInto};
 pub use clone::{ClonePlan, TryClone, TryCloneIn};
 pub use construct::{alloc_block, build_control_payload, set_weak_field, upgrade_weak_field};
-pub use foreign::{
-    Foreign, ForeignPtr, foreign_clone_owned, foreign_clone_strong, foreign_clone_weak,
-    foreign_drop_owned, foreign_drop_strong, foreign_drop_weak,
-};
+pub use foreign::{Foreign, ForeignPtr};
 pub use handle::{OwnedRef, StrongRef, StrongWeakRef, WeakRef};
 pub use layout::{BlockHeader, EightCC, get_u64};
 pub use owned::BStackOwned;
@@ -176,6 +172,18 @@ pub use bytemuck;
 
 // Procedural macros, re-exported so downstream depends only on `bstack_raii`.
 pub use bstack_raii_derive::{bstack_block, bstack_cast, bstack_enum, bstack_move};
+
+/// Runtime support called by `#[bstack_block]` / `#[bstack_enum]`-generated code via
+/// fully-qualified `::bstack_raii::__private::…` paths. Not part of the public API —
+/// no stability guarantee, use directly at your own risk.
+#[doc(hidden)]
+pub mod __private {
+    pub use crate::bulk::{alloc_many, free_many};
+    pub use crate::foreign::{
+        foreign_clone_owned, foreign_clone_strong, foreign_clone_weak, foreign_drop_owned,
+        foreign_drop_strong, foreign_drop_weak,
+    };
+}
 
 /// `compile_fail` checks for illegal macro inputs. Each block must **fail** to
 /// compile; the accompanying comment says why.
