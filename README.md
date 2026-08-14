@@ -106,6 +106,24 @@ impl BStack {
     pub fn extend_sparse_batched<I, D>(&self, writes: I, length: u64) -> io::Result<u64>
     where I: IntoIterator<Item = (u64, D)>, D: AsRef<[u8]>;
 
+    /// Grow or shrink the payload to exactly `target` bytes (new region zero-filled),
+    /// then durable-sync.  Returns the payload size before the resize.
+    /// Errors if shrinking would cut into the locked region.
+    pub fn resize(&self, target: u64) -> io::Result<u64>;
+
+    /// Grow the payload to at least `target` bytes (zero-filled), then durable-sync.
+    /// A no-op if already `target` bytes or longer.  Returns the payload size
+    /// before the call.  The grow-only, unconditional counterpart of `resize`.
+    pub fn ensure(&self, target: u64) -> io::Result<u64>;
+
+    /// Grow the payload to at least `target` bytes only if it is currently shorter,
+    /// handing the freshly allocated tail to `f` for initialization before it is
+    /// committed.  A no-op (with `f` not called) if already `target` bytes or longer.
+    /// Returns the payload size before the call.  Requires the `atomic` feature.
+    #[cfg(feature = "atomic")]
+    pub fn ensure_with<F>(&self, target: u64, f: F) -> io::Result<u64>
+    where F: FnOnce(&mut [u8]);
+
     /// Remove and return the last `n` bytes, then durable-sync.
     /// `n = 0` is valid.  Errors if `n` exceeds the current payload size.
     pub fn pop(&self, n: u64) -> io::Result<Vec<u8>>;
@@ -528,6 +546,7 @@ bstack = { version = "0.4", features = ["set", "atomic"] }
 - **`atrunc`**, **`splice`**, **`splice_into`** — atomic discard+push / pop+push tail replacement.
 - **`try_extend`**, **`try_discard`**, **`try_extend_zeros`** — size-checked, optimistic append/discard.
 - **`try_extend_sparse`**, **`try_extend_sparse_batched`** — size-checked, optimistic sparse tail growth.
+- **`ensure_with(target, f)`** — grow-if-short with the new tail handed to `f` for initialization before commit.
 - **`replace(n, f)`** — pop `n` bytes, pass to `f`, push back the returned tail.
 - **`get_batched`**, **`get_batched_into`**, **`get_batched_gen`** — read multiple (possibly dependent) ranges under one read lock.
 - **`swap`**, **`swap_into`**, **`cas`** *(requires `set`)* — atomic read-modify-write / compare-and-swap of a single region.
@@ -629,6 +648,9 @@ before it is read/compare/callback work under the lock.
 | `extend_sparse`, `extend_sparse_batched` | `set_len(new_end)` → `write` each buffer into the grown region (gaps left zero) → `lseek(8)` → `write(clen)` → sync |
 | `pop`, `pop_into`                      | `lseek` → `read` → `ftruncate` → `lseek(8)` → `write(clen)` → sync                        |
 | `discard`                              | `ftruncate` → `lseek(8)` → `write(clen)` → sync                                           |
+| `resize`                               | dispatches to the `extend` sequence (growth) or the `discard` sequence (shrinkage); a no-op if already `target` bytes |
+| `ensure`                               | growth-only `extend` sequence, applied only if the payload is shorter than `target`       |
+| `ensure_with` *(atomic)*               | *(callback)* → `write(buf)` → `lseek(8)` → `write(clen)` → sync; applied only if the payload is shorter than `target` |
 | `set` *(feature)*                      | *commit* `data`                                                                           |
 | `zero`, `repeat` *(feature)*           | *commit* the repeated pattern (the journal stages only `[count \| pattern]`)              |
 | `atrunc` *(atomic)*                    | dispatch on shape: truncation → `ftruncate` → *commit* `clen`; append → `set_len(new_end)` → `write(buf)` → sync → *commit* `clen`; same-length → *commit* `buf` in place; length change → **splice journal** (stage new tail past the payload → arm `SpliceGrow`/`SpliceShrink` → replay into place → atomically commit `clen'` + disarm → truncate, sync at each barrier) |
@@ -718,6 +740,8 @@ lock without any `File::metadata` syscall.
 |-----------------------------------------------------------------|-----------------------|--------------|
 | `push`, `extend`, `pop`, `pop_into`, `discard`                  | write                 | write        |
 | `extend_sparse`, `extend_sparse_batched`                        | write                 | write        |
+| `resize`, `ensure`                                              | write                 | write        |
+| `ensure_with` *(atomic)*                                        | write                 | write        |
 | `set`, `zero`, `repeat` *(feature)*                             | write                 | write        |
 | `atrunc`, `splice`, `splice_into`, `try_extend` *(atomic)*      | write                 | write        |
 | `try_discard(s, n > 0)` *(atomic)*                              | write                 | write        |
