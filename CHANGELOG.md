@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-08-13
+
 ### Added
 
 - **`BStackSlice`, `BStackOwnedSlice`, and `BStackRange` — cross-type `PartialEq` and `PartialOrd` (`alloc`).** Every pairing among the three, both directions, compares/orders on `(offset, len)` coordinates only — location, not content — and performs no I/O. `PartialOrd` matches each type's own `Ord` (by `offset`, then `len`). `BStackByteVec` deliberately does not participate in either trait: a meaningful comparison would require reading its header to resolve `len`, and `==`/`<` should not perform I/O silently.
