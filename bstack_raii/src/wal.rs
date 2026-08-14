@@ -752,26 +752,63 @@ pub(crate) fn finish_at_locked<A: BStackRaiiAllocator>(allocator: &A) -> io::Res
     }
     let committed = txn == WalStatus::Complete;
     let base = wal_range.start() + size_of::<WalHeader>() as u64;
+    let esz = size_of::<WalEntry>() as u64;
     let mut completed = 0usize;
 
-    for (i, e) in entries.iter().enumerate() {
-        if e.status() != WalStatus::Pending {
-            continue;
+    // Each orphan entry (committed ⇒ its `Dealloc`, abandoned ⇒ its `Alloc`) is
+    // persisted `Complete` *before* its slice is freed, so a second crash can never
+    // re-free it.
+    if allocator.atomic_bulk() {
+        // Bulk allocator: reverse the whole batch of local orphans with one atomic
+        // `dealloc_bulk` (a clone's `alloc_bulk`'d region is *not* reclaimed cleanly by
+        // freeing its split slices one at a time). Mark every entry `Complete` first,
+        // then bulk-free the local slices; foreign slices still go one by one through
+        // the registry.
+        let mut local: Vec<BStackRange> = Vec::new();
+        let mut foreign: Vec<(u64, BStackRange)> = Vec::new();
+        for (i, e) in entries.iter().enumerate() {
+            if e.status() != WalStatus::Pending {
+                continue;
+            }
+            let slice = if committed {
+                e.as_dealloc()
+            } else {
+                e.as_alloc()
+            };
+            if let Some(slice) = slice {
+                stack.set(base + i as u64 * esz, [WalStatus::Complete as u8])?;
+                if e.file_id() == 0 {
+                    local.push(slice);
+                } else {
+                    foreign.push((e.file_id(), slice));
+                }
+                completed += 1;
+            }
         }
-        // Committed: the `Dealloc`s (old blocks) must go. Abandoned: the `Alloc`s
-        // (new orphans) must go. Everything else is kept.
-        let slice = if committed {
-            e.as_dealloc()
-        } else {
-            e.as_alloc()
-        };
-        if let Some(slice) = slice {
-            // Persist Complete for this entry (its status is byte 0), THEN free —
-            // so a second crash can't double-free it.
-            let entry_off = base + (i * size_of::<WalEntry>()) as u64;
-            stack.set(entry_off, [WalStatus::Complete as u8])?;
-            free_recorded(allocator, e.file_id(), slice)?;
-            completed += 1;
+        if !local.is_empty() {
+            allocator.free_many(local)?;
+        }
+        for (fid, s) in foreign {
+            free_recorded(allocator, fid, s)?;
+        }
+    } else {
+        for (i, e) in entries.iter().enumerate() {
+            if e.status() != WalStatus::Pending {
+                continue;
+            }
+            // Committed: the `Dealloc`s (old blocks) must go. Abandoned: the `Alloc`s
+            // (new orphans) must go. Everything else is kept.
+            let slice = if committed {
+                e.as_dealloc()
+            } else {
+                e.as_alloc()
+            };
+            if let Some(slice) = slice {
+                let entry_off = base + i as u64 * esz;
+                stack.set(entry_off, [WalStatus::Complete as u8])?;
+                free_recorded(allocator, e.file_id(), slice)?;
+                completed += 1;
+            }
         }
     }
 

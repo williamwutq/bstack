@@ -110,21 +110,51 @@ pub trait TryCloneIn: BStackDrop + Sized {
 /// by the generated `__bstack_clone_into` methods during the recursive descent,
 /// then either [`commit`](Self::commit)ted or [`rollback`](Self::rollback)ed.
 pub struct ClonePlan {
-    /// New blocks allocated during planning; freed in reverse on rollback.
+    /// Which allocation strategy this plan is running (see [`Mode`]).
+    mode: Mode,
+    /// New blocks the clone will occupy. In [`Direct`](Mode::Direct) these are the
+    /// eagerly-allocated blocks (freed in reverse on rollback); in [`Build`](Mode::Build)
+    /// this is the pre-allocated pool handed out in order by [`cursor`](Self::cursor).
     allocated: Vec<BStackRange>,
+    /// [`Measure`](Mode::Measure) phase only: the size of every block the descent
+    /// wants, in descent order — allocated together by [`allocate`](Self::allocate).
+    sizes: Vec<u64>,
+    /// [`Build`](Mode::Build) phase only: index of the next pre-allocated range in
+    /// [`allocated`](Self::allocated) to hand back from [`alloc_raw`](Self::alloc_raw).
+    cursor: usize,
+    /// [`Measure`](Mode::Measure) phase only: a monotonic, non-zero placeholder
+    /// offset handed back for each measured block. Its bytes are never committed
+    /// (measure discards all writes), so any distinct non-zero value is sound.
+    fake_next: u64,
     /// Pending in-place payload writes `(offset, bytes)`, flushed as one batch.
     writes: Vec<(u64, Vec<u8>)>,
     /// Absolute offsets of `u64` counters to increment by 1 at commit (the
     /// strong/weak counts a `#[bstack_strong]` / `#[bstack_weak]` clone acquires).
     bumps: Vec<u64>,
-    /// The intention-first WAL transaction, lazily begun on the first allocation
-    /// through [`alloc_raw`](Self::alloc_raw) when the allocator names a WAL anchor
-    /// (`None` until then, or forever if the allocator opts out of reclamation). Its
-    /// [`HeldLock`] pins the file's WAL lock for the whole descent + commit; the
-    /// invariant is that its logged `Pending` `Alloc` entries are *exactly*
+    /// The WAL transaction protecting the fresh allocations' alloc→commit orphan
+    /// window: in [`Direct`](Mode::Direct) it is begun intention-first on the first
+    /// [`alloc_raw`](Self::alloc_raw); in [`Build`](Mode::Build) it is staged in one
+    /// shot by [`allocate`](Self::allocate) after the atomic bulk alloc. `None` when
+    /// the allocator opts out of reclamation ([`wal_anchor`](BStackRaiiAllocator::wal_anchor)
+    /// is `None`) or nothing was allocated. Its [`HeldLock`] pins the file's WAL lock
+    /// through commit; its logged `Pending` `Alloc` entries are *exactly*
     /// [`allocated`](Self::allocated), so [`finish`](crate::wal::finish) reclaims
     /// precisely those on abandon.
     wal: Option<CloneWal>,
+}
+
+/// How a [`ClonePlan`] turns the descent's allocation requests into real blocks.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// Single pass: allocate each block eagerly and log it intention-first (the
+    /// non-bulk allocators — one descent, a one-block crash window).
+    Direct,
+    /// Two-pass phase 1 (bulk allocators): gather every block's *size*, allocate
+    /// nothing, and discard all writes / skip all cross-file work.
+    Measure,
+    /// Two-pass phase 2 (bulk allocators): hand out the pre-allocated ranges in
+    /// descent order and record writes / refcount bumps as usual.
+    Build,
 }
 
 /// The in-flight intention-first WAL transaction of a [`ClonePlan`]: the file's
@@ -180,14 +210,29 @@ impl Default for ClonePlan {
 }
 
 impl ClonePlan {
-    /// A fresh, empty plan.
+    /// A fresh, empty plan in the single-pass [`Direct`](Mode::Direct) mode (the
+    /// two-pass driver [`run_clone`](Self::run_clone) flips it to measure/build).
     pub fn new() -> Self {
         ClonePlan {
+            mode: Mode::Direct,
             allocated: Vec::new(),
+            sizes: Vec::new(),
+            cursor: 0,
+            // Non-zero: `0` is the crate's null niche, and a measured payload may
+            // embed a child's placeholder offset (harmlessly, since it is discarded).
+            fake_next: 1,
             writes: Vec::new(),
             bumps: Vec::new(),
             wal: None,
         }
+    }
+
+    /// Whether the plan is in the measure phase of the two-pass bulk clone. Generated
+    /// clone code checks this to make eager cross-file (`Foreign`) work **build-only**,
+    /// so re-running the descent to measure the home file's sizes never
+    /// double-executes a foreign deep-clone or refcount bump.
+    pub fn is_measuring(&self) -> bool {
+        matches!(self.mode, Mode::Measure)
     }
 
     /// Allocate a `size`-byte block **without writing anything**, recording it
@@ -208,17 +253,43 @@ impl ClonePlan {
         allocator: &A,
         size: u64,
     ) -> io::Result<BStackRange> {
-        let slice = allocator.alloc(size)?;
-        let range = slice.as_range();
-        if allocator.wal_anchor().is_some()
-            && let Err(e) = self.wal_log_alloc(allocator, range)
-        {
-            // Keep `allocated`/logged in sync: undo this alloc, log nothing.
-            let _ = allocator.dealloc(slice);
-            return Err(e);
+        match self.mode {
+            // Two-pass phase 1: just record the size; hand back a placeholder range
+            // (never allocated, never written) so the descent can proceed.
+            Mode::Measure => {
+                self.sizes.push(size);
+                let off = self.fake_next;
+                self.fake_next = self.fake_next.saturating_add(size.max(1));
+                Ok(BStackRange::new(off, size))
+            }
+            // Two-pass phase 2: hand back the next pre-allocated range (allocated in
+            // one atomic bulk by `allocate`), in the same order it was measured.
+            Mode::Build => {
+                let range = self.allocated[self.cursor];
+                self.cursor += 1;
+                debug_assert_eq!(
+                    range.len(),
+                    size,
+                    "clone build/measure size mismatch (source mutated mid-clone?)"
+                );
+                Ok(range)
+            }
+            // Single pass: allocate eagerly and log it intention-first, keeping the
+            // allocation and its WAL entry in lockstep with `allocated`.
+            Mode::Direct => {
+                let slice = allocator.alloc(size)?;
+                let range = slice.as_range();
+                if allocator.wal_anchor().is_some()
+                    && let Err(e) = self.wal_log_alloc(allocator, range)
+                {
+                    // Keep `allocated`/logged in sync: undo this alloc, log nothing.
+                    let _ = allocator.dealloc(slice);
+                    return Err(e);
+                }
+                self.allocated.push(range);
+                Ok(range)
+            }
         }
-        self.allocated.push(range);
-        Ok(range)
     }
 
     /// Log a just-made allocation to the intention-first WAL, (lazily) beginning
@@ -270,15 +341,22 @@ impl ClonePlan {
         }
     }
 
-    /// Record a pending in-place write of `bytes` at absolute `offset`.
+    /// Record a pending in-place write of `bytes` at absolute `offset`. A no-op in
+    /// the [`Measure`](Mode::Measure) phase (the destination does not exist yet).
     pub fn write(&mut self, offset: u64, bytes: Vec<u8>) {
-        self.writes.push((offset, bytes));
+        if self.mode != Mode::Measure {
+            self.writes.push((offset, bytes));
+        }
     }
 
     /// Register an already-allocated range for rollback — for allocations made
-    /// outside [`alloc_raw`](Self::alloc_raw).
+    /// outside [`alloc_raw`](Self::alloc_raw). Only meaningful in the single-pass
+    /// [`Direct`](Mode::Direct) mode; the two-pass path allocates everything through
+    /// [`alloc_raw`](Self::alloc_raw). (Currently unused by generated code.)
     pub fn track_alloc(&mut self, range: BStackRange) {
-        self.allocated.push(range);
+        if matches!(self.mode, Mode::Direct) {
+            self.allocated.push(range);
+        }
     }
 
     /// Stage a fresh `BStackByteVec` data block holding `data` into the plan:
@@ -297,8 +375,11 @@ impl ClonePlan {
         let len = data.len() as u64;
         let size = BYTEVEC_HEADER + len;
         let range = self.alloc_raw(allocator, size)?;
-        // cap == len: a fresh clone carries no spare capacity.
-        self.write(range.start(), crate::vec::bytevec_image(len, len, data));
+        // cap == len: a fresh clone carries no spare capacity. Skip building the
+        // image in the measure phase (the write would be discarded anyway).
+        if self.mode != Mode::Measure {
+            self.write(range.start(), crate::vec::bytevec_image(len, len, data));
+        }
         Ok(VecDesc {
             data_off: range.start(),
             data_size: size,
@@ -312,6 +393,11 @@ impl ClonePlan {
         data: BStackRef<T>,
         allocator: &A,
     ) -> io::Result<()> {
+        // Measure gathers only home-file allocation sizes; the bump (and its locating
+        // read) is done for real in the build phase.
+        if self.mode == Mode::Measure {
+            return Ok(());
+        }
         let (data_ref, ctrl) = T::strong_parts(data, allocator)?;
         let off = match ctrl {
             None => data_ref.into_range().start() + layout::RC_REFCOUNT_OFFSET,
@@ -325,7 +411,102 @@ impl ClonePlan {
     /// bumped by one — the weak reference this clone's `#[bstack_weak]` field
     /// acquires.
     pub fn bump_weak(&mut self, ctrl_off: u64) {
-        self.bumps.push(ctrl_off + layout::CTRL_WEAK_OFFSET);
+        if self.mode != Mode::Measure {
+            self.bumps.push(ctrl_off + layout::CTRL_WEAK_OFFSET);
+        }
+    }
+
+    /// Drive a whole deep clone: run the `descend` closure (a call to the block's
+    /// generated `__bstack_clone_into`) under the right allocation strategy, then
+    /// commit. Returns the root copy's range.
+    ///
+    /// * **Bulk allocator** ([`atomic_bulk`](BStackRaiiAllocator::atomic_bulk)) — the
+    ///   two-pass path: descend once in [`Measure`](Mode::Measure) to gather every
+    ///   home-file block size (allocating nothing, doing no cross-file work), allocate
+    ///   them all in one atomic [`alloc_bulk`](bstack::BStackBulkAllocator::alloc_bulk)
+    ///   via [`allocate`](Self::allocate), then descend again in [`Build`](Mode::Build)
+    ///   against the real addresses and commit. The whole alloc→commit orphan window is
+    ///   covered by a single WAL transaction. `descend` must be deterministic on the
+    ///   (unmutated) source, since the two passes must agree on the allocation sequence.
+    /// * **Non-bulk allocator** — the single-pass [`Direct`](Mode::Direct) path:
+    ///   descend once, allocating eagerly and logging each block intention-first (a
+    ///   one-block crash window, strictly better than a sequential allocator would get
+    ///   from a post-hoc bulk log).
+    pub fn run_clone<A, F>(allocator: &A, mut descend: F) -> io::Result<BStackRange>
+    where
+        A: BStackRaiiAllocator,
+        F: FnMut(&mut ClonePlan) -> io::Result<BStackRange>,
+    {
+        if allocator.atomic_bulk() {
+            let mut plan = ClonePlan::new();
+            plan.mode = Mode::Measure;
+            // Phase 1: gather sizes. Nothing is allocated, so a failure here needs no
+            // cleanup (the placeholder ranges are pure bookkeeping).
+            descend(&mut plan)?;
+            // Allocate every measured block atomically and stage the WAL.
+            plan.allocate(allocator)?;
+            // Phase 2: build the payloads against the real addresses.
+            plan.mode = Mode::Build;
+            match descend(&mut plan) {
+                Ok(dst) => {
+                    plan.commit(allocator)?;
+                    Ok(dst)
+                }
+                Err(e) => {
+                    plan.rollback(allocator);
+                    Err(e)
+                }
+            }
+        } else {
+            let mut plan = ClonePlan::new();
+            match descend(&mut plan) {
+                Ok(dst) => {
+                    plan.commit(allocator)?;
+                    Ok(dst)
+                }
+                Err(e) => {
+                    plan.rollback(allocator);
+                    Err(e)
+                }
+            }
+        }
+    }
+
+    /// Two-pass phase transition: allocate every [`Measure`](Mode::Measure)-gathered
+    /// size as one atomic bulk allocation and stage the fresh blocks `Pending` in the
+    /// WAL (one `persist_at`, covering the whole alloc→commit orphan window; the
+    /// commit flips it `Complete`). On a WAL-staging failure the just-allocated blocks
+    /// are freed and the error propagates. Leaves the plan ready for the build phase
+    /// (`allocated` = the pool, `cursor` = 0).
+    fn allocate<A: BStackRaiiAllocator>(&mut self, allocator: &A) -> io::Result<()> {
+        let ranges = allocator.alloc_many(&self.sizes)?;
+        if allocator.wal_anchor().is_some() && !ranges.is_empty() {
+            let held = HeldLock::acquire(wal_lock_for(allocator));
+            let mut log = WalLog::with_capacity(ranges.len());
+            for &r in &ranges {
+                log.append(WalEntry::alloc(WalStatus::Pending, r));
+            }
+            match persist_at(allocator, &log, WalStatus::Pending) {
+                Ok(block) => {
+                    self.wal = Some(CloneWal {
+                        _held: held,
+                        block_off: block.start(),
+                        capacity: wal_capacity_of(block),
+                        logged: ranges.len() as u64,
+                    });
+                }
+                Err(e) => {
+                    // Couldn't stage the WAL: free the fresh blocks and abort. Release
+                    // the lock first — `free_many` does no WAL work.
+                    drop(held);
+                    let _ = allocator.free_many(ranges);
+                    return Err(e);
+                }
+            }
+        }
+        self.allocated = ranges;
+        self.cursor = 0;
+        Ok(())
     }
 
     /// Free everything allocated so far. The error path, taken when planning fails
@@ -372,6 +553,7 @@ impl ClonePlan {
             writes,
             mut bumps,
             wal,
+            ..
         } = self;
         let stack = allocator.stack();
 

@@ -7,8 +7,9 @@ omitted except where trivial.
 
 ## 1. Missing / incomplete features
 
-- **Deep clone / teardown never use bulk alloc/free.** *(Foundation laid
-  2026-08-12: `alloc_many`/`free_many` are now provided methods on
+- [DONE 2026-08-14] **Deep clone / teardown never use bulk alloc/free.** Both sides
+  now use bulk when the concrete allocator supports it; history below.
+  *(Foundation laid 2026-08-12: `alloc_many`/`free_many` are now provided methods on
   `BStackRaiiAllocator`, overridden by the bulk-capable allocators — GhostTree,
   Linear — to route through atomic `alloc_bulk`/`dealloc_bulk`; ordinary trait
   dispatch picks the override through generic code, so the "prefer bulk when
@@ -25,12 +26,26 @@ omitted except where trivial.
   batch. So a crash mid-descent is reclaimed by `finish` on reopen down to a one-block
   window (was: whole partially-built subtree leaked, since the WAL was only written at
   commit). No codegen change — every clone allocation funnels through `alloc_raw`.
-  Trade-off (deliberate, per user choice of option A over a two-pass): clone still does
-  **sequential** per-op `alloc`, not `alloc_bulk` — clone's descent needs each block's
-  real address immediately (the parent payload embeds the child offset), so gather-then-
-  `alloc_bulk` would require a second measure pass. That bulk-for-clone two-pass is the
-  only remaining alloc-side item, and is a leak/atomicity *optimization*, not correctness
-  (intention-first already makes a descent crash reclaimable).
+  **Bulk-for-clone (two-pass) DONE 2026-08-14:** `ClonePlan::run_clone` now drives the
+  whole clone. On a bulk allocator (`atomic_bulk()`) it takes a **two-pass** path —
+  descend once in `Mode::Measure` (gather every home-block size, allocate nothing, do
+  no cross-file work), allocate them all in one atomic `alloc_bulk` (`allocate`, staging
+  the whole alloc→commit window `Pending` in one `persist_at`), then descend again in
+  `Mode::Build` against the real addresses and commit. Non-bulk allocators keep the
+  single-pass intention-first `Mode::Direct` path (1-block window; a sequential allocator
+  gains nothing from a post-hoc bulk log). The descent needs each block's real address
+  immediately (parent payload embeds the child offset), which is why measure/build is
+  needed rather than deferring allocation in one pass. Codegen change: both `try_clone_in`
+  wrappers now call `run_clone(allocator, |p| self.__bstack_clone_into(allocator, p))`
+  (the closure may run twice); the eager cross-file (`Foreign`) arms are gated
+  `!__plan.is_measuring()` so a foreign deep-clone / refcount bump runs exactly once (in
+  build) — the mode is global to the pass, so this holds at any nesting depth. Assumes the
+  source is not concurrently mutated between the two passes (already unsupported for clone;
+  a divergence trips a `debug_assert` in build). `finish_at_locked` was made **bulk-aware**
+  (reverse a clone's bulk orphans with one `dealloc_bulk`; individual frees don't reclaim a
+  split `alloc_bulk` region — this fixed a real leak the bulk commit-fault test caught).
+  Tests: `macro_deep_clone_on_bulk_allocator`(+`_no_leak`), `macro_clone_pod_vec_on_bulk_allocator`,
+  `macro_foreign_owned_clone_on_bulk_home_copies_once` (the guard), `wal_clone_reclaims_bulk_orphans_on_commit_fault`.
 - **`Foreign` ↔ `bstack_move` / `bstack_cast` semantics incomplete.** Moving a
   struct with a `Foreign` field, and casting for the wide-pointer relationship,
   were flagged as still-open in the project notes; needs confirmation that
@@ -197,10 +212,10 @@ Residual points, all *leak-only* (permitted) but worth recording:
 - [FIXED] Thousands of tiny `Vec<u8>` allocations for 8-byte writes (§2) — the single
   most pervasive avoidable allocation. See §2 — replaced with `SmallBuf` in
   `stdlib/*` (no-length inline `Buf8`/`Buf40`, `Heap` fallback).
-- No bulk alloc/free in **clone** (§1) even when the concrete allocator implements
-  `BStackBulkAllocator` — clone's descent needs each block's real address up front, so
-  bulk needs a two-pass measure/build (deferred). Teardown already uses bulk (§1);
-  clone is intention-first WAL'd but still per-op `alloc`.
+- [DONE 2026-08-14] Bulk alloc/free in clone + teardown (§1): both now use the atomic
+  bulk ops when the concrete allocator implements `BStackBulkAllocator` (clone via the
+  two-pass measure/build in `run_clone`; teardown via `dealloc_bulk`). Non-bulk
+  allocators keep the intention-first single-pass clone.
 - [WONTFIX] **Two round trips per `(rc, weak)` strong child in clone**: `ClonePlan::bump_strong`
   reads the child's back-pointer field during planning (`strong_parts` →
   `read_ctrl_ref`, to locate the control block), then the commit's `inplace_gen`

@@ -683,6 +683,95 @@ fn macro_clone_deep_owned() {
 }
 
 #[test]
+fn macro_deep_clone_on_bulk_allocator() {
+    // Exercises the two-pass clone path (measure sizes -> one atomic `alloc_bulk` ->
+    // build against real addresses): a bulk allocator (GhostTree) takes `run_clone`'s
+    // bulk branch. A parent with an owned child means two home blocks are measured,
+    // allocated together, then built — the child's real address must land in the
+    // parent payload during the build pass exactly as the single-pass path does.
+    let tmp = TempStack::new();
+    let alloc = tmp.ghost_allocator();
+    let stack = alloc.stack();
+
+    let leaf = MacroLeaf::new(&alloc, 42).unwrap();
+    let parent = MacroParent::new(&alloc, leaf, 7).unwrap();
+    let orig_child = parent.handle().get_child(stack).unwrap();
+
+    let clone = parent.try_clone_in(&alloc).unwrap();
+
+    // Deep copy read back through the clone.
+    assert_eq!(clone.handle().get_tag(stack).unwrap(), 7);
+    assert_eq!(
+        clone
+            .handle()
+            .get_child(stack)
+            .unwrap()
+            .get_val(stack)
+            .unwrap(),
+        42
+    );
+    // Independent storage (fresh blocks, distinct from the originals) — proves the
+    // build pass repointed the parent at the newly bulk-allocated child.
+    assert_ne!(
+        clone.handle().range().start(),
+        parent.handle().range().start()
+    );
+    assert_ne!(
+        clone.handle().get_child(stack).unwrap().range().start(),
+        orig_child.range().start()
+    );
+
+    clone.bstack_drop(&alloc).unwrap();
+    // Original intact after the clone's subtree is freed.
+    assert_eq!(
+        parent
+            .handle()
+            .get_child(stack)
+            .unwrap()
+            .get_val(stack)
+            .unwrap(),
+        42
+    );
+    parent.bstack_drop(&alloc).unwrap();
+}
+
+#[test]
+fn macro_deep_clone_on_bulk_allocator_no_leak() {
+    // The two-pass bulk clone must allocate each block *exactly once* — the measure
+    // pass counts, the build pass consumes the pre-allocated pool. A divergence (or a
+    // block allocated but not handed out) would over-allocate and leak. Warm the
+    // allocator + WAL block once, then assert a clone+drop cycle returns to a steady
+    // length.
+    let tmp = TempStack::new();
+    let alloc = tmp.ghost_allocator();
+    let stack = alloc.stack();
+
+    let build = || {
+        let leaf = MacroLeaf::new(&alloc, 1).unwrap();
+        MacroParent::new(&alloc, leaf, 2).unwrap()
+    };
+
+    // Warm: the first clone lazily allocates the persistent WAL block (kept for reuse).
+    let p0 = build();
+    p0.try_clone_in(&alloc)
+        .unwrap()
+        .bstack_drop(&alloc)
+        .unwrap();
+    p0.bstack_drop(&alloc).unwrap();
+
+    let base = stack.len().unwrap();
+    let p = build();
+    let c = p.try_clone_in(&alloc).unwrap();
+    c.bstack_drop(&alloc).unwrap();
+    p.bstack_drop(&alloc).unwrap();
+    assert_eq!(
+        stack.len().unwrap(),
+        base,
+        "two-pass bulk clone leaked or double-allocated"
+    );
+}
+
+#[test]
 fn macro_clone_bumps_shared_refcount() {
     let tmp = TempStack::new();
     let alloc = tmp.allocator();
@@ -1455,6 +1544,54 @@ fn macro_clone_pod_vec() {
 
     clone.bstack_drop(&alloc).unwrap();
     rec.bstack_drop(&alloc).unwrap();
+}
+
+#[test]
+fn macro_clone_pod_vec_on_bulk_allocator() {
+    // Two-pass bulk clone through vec data blocks: `stage_bytevec` routes each string
+    // / POD-vec block through `alloc_raw`, so it is measured (size only, image skipped)
+    // then built (real address, image written). A `Record` has both a string and a
+    // POD `u32` vec, plus its own block — three home blocks bulk-allocated as one.
+    let tmp = TempStack::new();
+    let alloc = tmp.ghost_allocator();
+    let stack = alloc.stack();
+
+    let rec = Record::new(&alloc, "hello", &[1u32, 2, 3], 42).unwrap();
+    let orig_name_off = rec.handle().get_name(&alloc).unwrap().descriptor().data_off;
+
+    let clone = rec.try_clone_in(&alloc).unwrap();
+    assert_eq!(clone.handle().get_id(stack).unwrap(), 42);
+    assert_eq!(
+        clone.handle().get_name(&alloc).unwrap().to_vec().unwrap(),
+        b"hello"
+    );
+    assert_eq!(
+        clone.handle().get_tags(&alloc).unwrap().to_vec().unwrap(),
+        vec![1u32, 2, 3]
+    );
+    // Fresh, independent data block (built against a real bulk-allocated address).
+    let clone_name_off = clone
+        .handle()
+        .get_name(&alloc)
+        .unwrap()
+        .descriptor()
+        .data_off;
+    assert_ne!(clone_name_off, orig_name_off);
+
+    clone.bstack_drop(&alloc).unwrap();
+    rec.bstack_drop(&alloc).unwrap();
+
+    // No leak / double-alloc across a warmed clone+drop cycle.
+    let base = stack.len().unwrap();
+    let r = Record::new(&alloc, "world", &[7u32, 8], 1).unwrap();
+    let c = r.try_clone_in(&alloc).unwrap();
+    c.bstack_drop(&alloc).unwrap();
+    r.bstack_drop(&alloc).unwrap();
+    assert_eq!(
+        stack.len().unwrap(),
+        base,
+        "two-pass bulk vec clone leaked or double-allocated"
+    );
 }
 
 #[test]
@@ -6744,6 +6881,63 @@ fn wal_clone_reclaims_orphans_on_commit_fault() {
 
 #[cfg(feature = "fault-injection")]
 #[test]
+fn wal_clone_reclaims_bulk_orphans_on_commit_fault() {
+    use bstack::fault::FaultPolicy;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    // Same crash as the FirstFit test, but on a BULK allocator (GhostTree): the clone
+    // takes the two-pass path, so its blocks are `alloc_bulk`'d and staged `Pending`
+    // in the WAL by `allocate` *before* the commit's `inplace_gen`. GhostTree's
+    // `alloc_bulk` uses no `inplace_gen`, so failing the first one hits the commit,
+    // after the bulk alloc + WAL staging — the WAL must then reclaim the whole bulk.
+    struct FailFirstInplaceGen(AtomicBool);
+    impl FaultPolicy for FailFirstInplaceGen {
+        fn next_fault(&self, op: &'static str, _seq: u64) -> Option<io::Error> {
+            if op == "inplace_gen" && !self.0.swap(true, Ordering::SeqCst) {
+                Some(io::Error::other("injected bulk clone-commit fault"))
+            } else {
+                None
+            }
+        }
+    }
+
+    let tmp = TempStack::new();
+    let alloc = tmp.ghost_allocator();
+    let stack = alloc.stack();
+
+    let leaf = MacroLeaf::new(&alloc, 7).unwrap();
+    let src = MacroParent::new(&alloc, leaf, 1).unwrap();
+
+    let mut prev: Option<u64> = None;
+    for i in 0..30 {
+        stack.set_fault_policy(Some(Arc::new(FailFirstInplaceGen(AtomicBool::new(false)))));
+        let r = src.try_clone_in(&alloc);
+        stack.set_fault_policy(None);
+        assert!(r.is_err(), "injected fault must fail the bulk clone commit");
+        let len = stack.len().unwrap();
+        if i >= 3 {
+            assert_eq!(len, prev.unwrap(), "faulted bulk clone leaked at iter {i}");
+        }
+        prev = Some(len);
+    }
+
+    // A real (unfaulted) clone still succeeds, reusing the reclaimed space.
+    let cl = src.try_clone_in(&alloc).unwrap();
+    assert_eq!(
+        cl.handle()
+            .get_child(stack)
+            .unwrap()
+            .get_val(stack)
+            .unwrap(),
+        7
+    );
+    cl.bstack_drop(&alloc).unwrap();
+    src.bstack_drop(&alloc).unwrap();
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
 fn wal_teardown_reclaims_on_free_fault() {
     use bstack::fault::FaultPolicy;
     use std::sync::Arc;
@@ -7826,6 +8020,82 @@ fn macro_foreign_owned_clone_deep_copies_across_files() {
         arc_b.stack().len().unwrap(),
         base_b,
         "clone+teardown leaked or double-freed on the foreign file"
+    );
+
+    reg.detach(fid);
+}
+
+#[test]
+fn macro_foreign_owned_clone_on_bulk_home_copies_once() {
+    // The foreign guard under the two-pass clone: when the HOME allocator is bulk
+    // (GhostTree), cloning a `#[bstack_owned] Foreign<T>` runs the measure->build
+    // descent twice. The cross-file deep-copy is eager and must be BUILD-ONLY — if
+    // the measure pass also ran it, the foreign file would get TWO copies (a leak).
+    // Assert the foreign file returns exactly to baseline, proving it was copied once.
+    use crate::registry;
+    use crate::{Foreign, TryCloneIn};
+    use std::sync::Arc;
+
+    let home = TempStack::new();
+    let home_alloc = home.ghost_allocator(); // bulk => two-pass clone
+    let hstack = home_alloc.stack();
+
+    let foreign = TempStack::new();
+    let arc_b = Arc::new(foreign.allocator());
+
+    let reg_file = TempStack::new();
+    let _ = registry::init(&reg_file.path);
+    let reg = registry::get().unwrap();
+    let fid = reg.attach(&foreign.path, arc_b.clone()).unwrap();
+
+    // Warm B's WAL block via one owned-clone cycle, then record B's baseline length.
+    {
+        let l0 = MacroLeaf::new(&*arc_b, 0).unwrap();
+        let h0 = ForeignHolder::new(
+            &home_alloc,
+            0,
+            Foreign::<MacroLeaf>::new(fid, l0.handle().range().start()),
+            None,
+        )
+        .unwrap();
+        h0.handle()
+            .try_clone_in(&home_alloc)
+            .unwrap()
+            .bstack_drop(&home_alloc)
+            .unwrap();
+        h0.bstack_drop(&home_alloc).unwrap();
+    }
+    let base_b = arc_b.stack().len().unwrap();
+
+    let leaf = MacroLeaf::new(&*arc_b, 42).unwrap();
+    let off = leaf.handle().range().start();
+    let h = ForeignHolder::new(&home_alloc, 7, Foreign::<MacroLeaf>::new(fid, off), None).unwrap();
+
+    // Two-pass clone on the bulk home allocator.
+    let c = h.handle().try_clone_in(&home_alloc).unwrap();
+
+    // A single fresh copy on B, carrying the value.
+    let clone_link = c.handle().get_owned_link(hstack).unwrap();
+    assert_eq!(clone_link.file_id(), fid);
+    assert_ne!(
+        clone_link.offset(),
+        off,
+        "must be a fresh copy, not an alias"
+    );
+    assert_eq!(
+        clone_link
+            .with(&home_alloc, |t, fs| t.get_val(fs).unwrap())
+            .unwrap()
+            .unwrap(),
+        42
+    );
+
+    h.bstack_drop(&home_alloc).unwrap();
+    c.bstack_drop(&home_alloc).unwrap();
+    assert_eq!(
+        arc_b.stack().len().unwrap(),
+        base_b,
+        "measure pass double-cloned the foreign target (guard missing/broken)"
     );
 
     reg.detach(fid);

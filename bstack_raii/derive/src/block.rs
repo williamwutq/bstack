@@ -539,6 +539,10 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                                 );
                                 let __new = __child.__bstack_clone_into(allocator, __plan)?;
                                 __od.#fname = ::bstack_raii::ForeignPtr::new(0, __new.start());
+                            } else if __plan.is_measuring() {
+                                // Foreign deep-clone is eager cross-file work; the
+                                // measure pass (home-file sizes only) skips it, so it
+                                // runs exactly once in the build pass.
                             } else if let ::core::option::Option::Some(__id) =
                                 ::bstack_raii::registry::FileId::from_u64(__fid)
                             {
@@ -579,6 +583,9 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                                     )
                                 };
                                 __plan.bump_strong(__data, allocator)?;
+                            } else if __plan.is_measuring() {
+                                // Foreign refcount bump is eager cross-file work; done
+                                // once, in the build pass (measure skips it).
                             } else if let ::core::option::Option::Some(__id) =
                                 ::bstack_raii::registry::FileId::from_u64(__fid)
                             {
@@ -615,6 +622,9 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                             if __fid == 0 {
                                 // SELF: bump the weak count via the home plan (atomic).
                                 __plan.bump_weak(__off);
+                            } else if __plan.is_measuring() {
+                                // Foreign refcount bump is eager cross-file work; done
+                                // once, in the build pass (measure skips it).
                             } else if let ::core::option::Option::Some(__id) =
                                 ::bstack_raii::registry::FileId::from_u64(__fid)
                             {
@@ -2864,15 +2874,12 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                     allocator: &__A,
                 ) -> ::std::io::Result<::bstack_raii::BStackOwned<Self>> {
                     use ::bstack_raii::BStackBlock as _;
-                    let mut __plan = ::bstack_raii::ClonePlan::new();
-                    let __dst = match self.__bstack_clone_into(allocator, &mut __plan) {
-                        ::std::result::Result::Ok(__d) => __d,
-                        ::std::result::Result::Err(__e) => {
-                            __plan.rollback(allocator);
-                            return ::std::result::Result::Err(__e);
-                        }
-                    };
-                    __plan.commit(allocator)?;
+                    // The clone strategy (single-pass intention-first, or two-pass
+                    // atomic bulk on a `BStackBulkAllocator`) is chosen inside
+                    // `run_clone`, which may run this descent twice (measure + build).
+                    let __dst = ::bstack_raii::ClonePlan::run_clone(allocator, |__plan| {
+                        self.__bstack_clone_into(allocator, __plan)
+                    })?;
                     ::std::result::Result::Ok(unsafe {
                         ::bstack_raii::BStackOwned::from_raw(
                             <Self as ::bstack_raii::BStackBlock>::from_range(__dst),
@@ -3612,6 +3619,10 @@ fn foreign_elem_clone(kind: Kind, ftarget: &Type) -> TokenStream {
                                 ::bstack_raii::BStackRange::new(__off, #od_size));
                             let __new = __child.__bstack_clone_into(allocator, __plan)?;
                             ::bstack_raii::ForeignPtr::new(0, __new.start())
+                        } else if __plan.is_measuring() {
+                            // Foreign deep-clone is build-only; this value is discarded
+                            // in the measure pass (home-file sizes only).
+                            __fp
                         } else if let ::core::option::Option::Some(__id) =
                             ::bstack_raii::registry::FileId::from_u64(__fid)
                         {
@@ -3640,6 +3651,8 @@ fn foreign_elem_clone(kind: Kind, ftarget: &Type) -> TokenStream {
                             let __data = unsafe { ::bstack_raii::BStackRef::<#ftarget>::from_range(
                                 ::bstack_raii::BStackRange::new(__off, #od_size)) };
                             __plan.bump_strong(__data, allocator)?;
+                        } else if __plan.is_measuring() {
+                            // Foreign refcount bump is build-only (measure skips it).
                         } else if let ::core::option::Option::Some(__id) =
                             ::bstack_raii::registry::FileId::from_u64(__fid)
                         {
@@ -3665,6 +3678,8 @@ fn foreign_elem_clone(kind: Kind, ftarget: &Type) -> TokenStream {
                         let __fid = __fp.file_id();
                         if __fid == 0 {
                             __plan.bump_weak(__off);
+                        } else if __plan.is_measuring() {
+                            // Foreign refcount bump is build-only (measure skips it).
                         } else if let ::core::option::Option::Some(__id) =
                             ::bstack_raii::registry::FileId::from_u64(__fid)
                         {
@@ -7541,15 +7556,12 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                     allocator: &__A,
                 ) -> ::std::io::Result<::bstack_raii::BStackOwned<Self>> {
                     use ::bstack_raii::BStackBlock as _;
-                    let mut __plan = ::bstack_raii::ClonePlan::new();
-                    let __dst = match self.__bstack_clone_into(allocator, &mut __plan) {
-                        ::std::result::Result::Ok(__d) => __d,
-                        ::std::result::Result::Err(__e) => {
-                            __plan.rollback(allocator);
-                            return ::std::result::Result::Err(__e);
-                        }
-                    };
-                    __plan.commit(allocator)?;
+                    // The clone strategy (single-pass intention-first, or two-pass
+                    // atomic bulk on a `BStackBulkAllocator`) is chosen inside
+                    // `run_clone`, which may run this descent twice (measure + build).
+                    let __dst = ::bstack_raii::ClonePlan::run_clone(allocator, |__plan| {
+                        self.__bstack_clone_into(allocator, __plan)
+                    })?;
                     ::std::result::Result::Ok(unsafe {
                         ::bstack_raii::BStackOwned::from_raw(
                             <Self as ::bstack_raii::BStackBlock>::from_range(__dst),
