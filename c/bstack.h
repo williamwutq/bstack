@@ -8,7 +8,7 @@
  * bstack — persistent, fsync-durable binary stack backed by a single file.
  *
  * File format (32-byte header followed by payload):
- *   [0..8)   magic: "BSTK" + major(0) + minor(4) + patch(1) + reserved(0)
+ *   [0..8)   magic: "BSTK" + major(0) + minor(4) + patch(2) + reserved(0)
  *   [8..16)  committed payload length (clen), little-endian uint64
  *   [16..24) wip_ptr: write-in-progress journal target (0 when idle), LE uint64
  *   [24..32) wip_aux: write-in-progress journal mode, LE uint64
@@ -34,10 +34,11 @@
  * Thread safety
  * -------------
  * On Unix a pthread_rwlock protects each handle; on Windows an SRWLOCK is
- * used.  bstack_push / bstack_extend / bstack_pop / bstack_discard /
+ * used.  bstack_push / bstack_extend / bstack_resize / bstack_ensure /
+ * bstack_pop / bstack_discard /
  * bstack_set / bstack_zero / bstack_repeat / bstack_atrunc / bstack_splice /
  * bstack_try_extend / bstack_try_extend_zeros / bstack_try_discard(s, n>0) /
- * bstack_swap / bstack_cas / bstack_replace / bstack_process /
+ * bstack_ensure_with / bstack_swap / bstack_cas / bstack_replace / bstack_process /
  * bstack_process_gen / bstack_set_batched / bstack_inplace_gen /
  * bstack_cross_exchange / bstack_copy /
  * bstack_eq_crds / bstack_ne_crds /
@@ -60,6 +61,7 @@
  *   bstack_repeat.
  * Compile with -DBSTACK_FEATURE_ATOMIC to enable bstack_atrunc, bstack_splice,
  *   bstack_try_extend, bstack_try_extend_zeros, bstack_try_discard,
+ *   bstack_try_extend_sparse, bstack_try_extend_sparse_batched, bstack_ensure_with,
  *   bstack_replace, bstack_get_batched, and bstack_get_batched_gen.  Both
  *   flags together also enable bstack_swap, bstack_cas, bstack_process,
  *   bstack_process_gen, bstack_set_batched, bstack_inplace_gen, bstack_gen_op_t,
@@ -165,6 +167,24 @@ int bstack_extend_sparse(bstack_t *bs, const uint8_t *buf, size_t buf_len,
 int bstack_extend_sparse_batched(bstack_t *bs,
                                  const bstack_iovec_t *writes, size_t count,
                                  uint64_t length, uint64_t *out_offset);
+
+/*
+ * Grow or shrink the payload to exactly target bytes.  Any newly grown region
+ * is filled with zeros.  If out_initial_len is non-NULL it receives the
+ * payload size before the resize.  target equal to the current payload size
+ * is a valid no-op.
+ * Returns EINVAL if shrinking would cut into the locked region
+ * [0, bstack_locked_len).
+ */
+int bstack_resize(bstack_t *bs, uint64_t target, uint64_t *out_initial_len);
+
+/*
+ * Grow the payload to at least target bytes, filling the new region with
+ * zeros.  A no-op if the payload is already target bytes or longer.
+ * If out_initial_len is non-NULL it receives the payload size before the
+ * call.  The grow-only, unconditional counterpart of bstack_resize.
+ */
+int bstack_ensure(bstack_t *bs, uint64_t target, uint64_t *out_initial_len);
 
 /*
  * Remove and copy the last n bytes of the stack into buf.
@@ -454,6 +474,30 @@ int bstack_try_extend_sparse(bstack_t *bs, uint64_t s,
 int bstack_try_extend_sparse_batched(bstack_t *bs, uint64_t s,
                                      const bstack_iovec_t *writes, size_t count,
                                      uint64_t length, int *ok);
+
+/*
+ * Grow the payload to at least target bytes, only if it is currently
+ * shorter, handing the freshly allocated tail to the callback for
+ * initialization before it is committed.
+ *
+ * The callback signature is:
+ *   int cb(uint8_t *buf, size_t len, void *ctx)
+ *
+ * If the payload is already target bytes or longer, cb is not called and
+ * nothing changes.  Otherwise cb receives a zero-filled buffer of length
+ * target - old_len — exactly the region bstack_ensure would have appended —
+ * mutates it in place, and returns 0 on success or -1 on failure (errno set
+ * by the callback), which aborts the call before anything is written.
+ *
+ * If out_initial_len is non-NULL it receives the payload size before the
+ * call.  Returns ENOMEM if target - old_len exceeds SIZE_MAX on this
+ * platform (only reachable where size_t is narrower than uint64_t).
+ *
+ * Only available when compiled with -DBSTACK_FEATURE_ATOMIC.
+ */
+int bstack_ensure_with(bstack_t *bs, uint64_t target,
+                       int (*cb)(uint8_t *buf, size_t len, void *ctx),
+                       void *ctx, uint64_t *out_initial_len);
 
 /*
  * Read multiple logical ranges into caller-provided buffers in a single

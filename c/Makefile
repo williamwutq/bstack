@@ -76,6 +76,15 @@ TEST_CSL_OBJ = test_checked_slab.o
 TEST_CSL_ATOMIC_OBJ = test_checked_slab-atomic.o
 TEST_CSL_ATOMIC_BIN = test_checked_slab-atomic$(EXE_EXT)
 
+# Segregated allocator test (requires BSTACK_FEATURE_SET).
+TEST_SG_BIN = test_segregated$(EXE_EXT)
+TEST_SG_OBJ = test_segregated.o
+
+# Segregated allocator test compiled with SET+ATOMIC, exercising the
+# process_gen / inplace_gen free-list paths and try_* tail paths.
+TEST_SG_ATOMIC_OBJ = test_segregated-atomic.o
+TEST_SG_ATOMIC_BIN = test_segregated-atomic$(EXE_EXT)
+
 # ByteVec — requires BSTACK_FEATURE_SET.
 OBJ_BYTEVEC     = bstack_bytevec.o
 LIB_BYTEVEC_SET = libbstack-bytevec-set.a
@@ -91,7 +100,7 @@ LINKED_LIST_BIN        = ../examples/linked_list$(EXE_EXT)
 CHECKSUMMED_CACHE_BIN  = ../examples/checksummed_cache$(EXE_EXT)
 ATOMIC_LINKED_LIST_BIN = ../examples/atomic_linked_list$(EXE_EXT)
 
-.PHONY: all test test-set test-atomic test-set-atomic test-first-fit test-first-fit-atomic test-ghost-tree test-ghost-tree-atomic test-slab test-slab-atomic test-checked-slab test-checked-slab-atomic test-bytevec leaks clean alloc \
+.PHONY: all test test-set test-atomic test-set-atomic test-first-fit test-first-fit-atomic test-ghost-tree test-ghost-tree-atomic test-slab test-slab-atomic test-checked-slab test-checked-slab-atomic test-segregated test-segregated-atomic test-bytevec leaks clean alloc \
         example example-basic example-buffer_reuse example-journal \
         example-reading example-vec_store example-hashmap example-atomic_ops example-move_and_cow \
         example-linked_list example-checksummed_cache example-atomic_linked_list
@@ -215,6 +224,22 @@ test-checked-slab-atomic: $(LIB_ALLOC_SET_ATOMIC)
 	$(CC) $(CFLAGS) -DBSTACK_FEATURE_SET -DBSTACK_FEATURE_ATOMIC -c -o $(TEST_CSL_ATOMIC_OBJ) test_checked_slab.c
 	$(CC) $(CFLAGS) -DBSTACK_FEATURE_SET -DBSTACK_FEATURE_ATOMIC -o $(TEST_CSL_ATOMIC_BIN) $(TEST_CSL_ATOMIC_OBJ) -L. -lbstack-alloc-set-atomic -lpthread
 	$(RUN)$(TEST_CSL_ATOMIC_BIN)
+
+$(TEST_SG_OBJ): test_segregated.c bstack_alloc.h bstack.h
+	$(CC) $(CFLAGS) -DBSTACK_FEATURE_SET -c -o $@ $<
+
+$(TEST_SG_BIN): $(TEST_SG_OBJ) $(LIB_ALLOC_SET)
+	$(CC) $(CFLAGS) -DBSTACK_FEATURE_SET -o $@ $< -L. -lbstack-alloc-set -lpthread
+
+test-segregated: $(TEST_SG_BIN)
+	$(RUN)$(TEST_SG_BIN)
+
+# Same segregated test compiled against the SET+ATOMIC alloc lib, exercising the
+# process_gen / inplace_gen free-list paths and the try_* tail paths.
+test-segregated-atomic: $(LIB_ALLOC_SET_ATOMIC)
+	$(CC) $(CFLAGS) -DBSTACK_FEATURE_SET -DBSTACK_FEATURE_ATOMIC -c -o $(TEST_SG_ATOMIC_OBJ) test_segregated.c
+	$(CC) $(CFLAGS) -DBSTACK_FEATURE_SET -DBSTACK_FEATURE_ATOMIC -o $(TEST_SG_ATOMIC_BIN) $(TEST_SG_ATOMIC_OBJ) -L. -lbstack-alloc-set-atomic -lpthread
+	$(RUN)$(TEST_SG_ATOMIC_BIN)
 
 $(OBJ_BYTEVEC): bstack_bytevec.c bstack_bytevec.h bstack_alloc.h bstack.h
 	$(CC) $(CFLAGS) -DBSTACK_FEATURE_SET -c -o $@ $<
@@ -358,5 +383,7 @@ clean:
 	      $(TEST_SL_ATOMIC_OBJ) $(TEST_SL_ATOMIC_BIN) \
 	      $(TEST_CSL_OBJ) $(TEST_CSL_BIN) \
 	      $(TEST_CSL_ATOMIC_OBJ) $(TEST_CSL_ATOMIC_BIN) \
+	      $(TEST_SG_OBJ) $(TEST_SG_BIN) \
+	      $(TEST_SG_ATOMIC_OBJ) $(TEST_SG_ATOMIC_BIN) \
 	      $(OBJ_BYTEVEC) $(LIB_BYTEVEC_SET) $(TEST_BV_OBJ) $(TEST_BV_BIN) \
 	      $(EXAMPLE_BINS) $(HASHMAP_BIN) $(ATOMIC_BIN) $(MOVE_COW_BIN) $(LINKED_LIST_BIN) $(CHECKSUMMED_CACHE_BIN) $(ATOMIC_LINKED_LIST_BIN)

@@ -56,9 +56,9 @@
  * Constants
  * ---------------------------------------------------------------------- */
 
-/* On-disk format 0.4.1. The first 6 bytes (BSTK + major + minor) are the
+/* On-disk format 0.4.2. The first 6 bytes (BSTK + major + minor) are the
  * compatibility prefix checked on open; the patch byte is informational. */
-static const uint8_t  MAGIC[8]        = {'B','S','T','K', 0, 4, 1, 0};
+static const uint8_t  MAGIC[8]        = {'B','S','T','K', 0, 4, 2, 0};
 static const uint8_t  MAGIC_PREFIX[6] = {'B','S','T','K', 0, 4};
 static const uint64_t HEADER_SIZE     = 32;
 
@@ -1356,6 +1356,123 @@ fail:
 }
 
 /* -------------------------------------------------------------------------
+ * bstack_resize
+ * ---------------------------------------------------------------------- */
+
+int bstack_resize(bstack_t *bs, uint64_t target, uint64_t *out_initial_len)
+{
+    BS_WRLOCK(bs);
+
+    uint64_t raw_size;
+    if (file_size(bs->fd, &raw_size) != 0)
+        goto fail_unlock;
+
+    uint64_t data_size = raw_size - HEADER_SIZE;
+
+    if (target == data_size) {
+        BS_WRUNLOCK(bs);
+        if (out_initial_len) *out_initial_len = data_size;
+        return 0;
+    }
+
+    if (target < data_size) {
+        uint64_t locked = ATOMIC_LOAD_ACQUIRE(&bs->locked);
+        if (target < locked) {
+            BS_WRUNLOCK(bs);
+            errno = EINVAL;
+            return -1;
+        }
+
+        if (plat_ftruncate(bs->fd, HEADER_SIZE + target) != 0)
+            goto fail_unlock;
+        /* Truncation is the commit point: update the cache now, before the
+         * header write, which can fail and skip it (matching bstack_discard). */
+        bs->clen = target;
+        if (write_committed_len(bs->fd, &bs->clen, target) != 0 ||
+            plat_durable_sync(bs->fd) != 0)
+            goto fail_unlock;
+
+        BS_WRUNLOCK(bs);
+        if (out_initial_len) *out_initial_len = data_size;
+        return 0;
+    }
+
+    /* Grow: the OS zero-fills the new space. */
+    if (plat_ftruncate(bs->fd, HEADER_SIZE + target) != 0)
+        goto fail_unlock;
+
+    if (write_committed_len(bs->fd, &bs->clen, target) != 0 ||
+        plat_durable_sync(bs->fd) != 0)
+    {
+        /* Best-effort rollback. The cache is reset up front so it reflects
+         * the rolled-back file even if the header rewrite below fails. */
+        plat_ftruncate(bs->fd, raw_size);
+        bs->clen = data_size;
+        write_committed_len(bs->fd, &bs->clen, data_size);
+        plat_durable_sync(bs->fd);
+        goto fail_unlock;
+    }
+
+    BS_WRUNLOCK(bs);
+    if (out_initial_len) *out_initial_len = data_size;
+    return 0;
+
+fail_unlock:
+    {
+        int saved = errno;
+        BS_WRUNLOCK(bs);
+        errno = saved;
+    }
+    return -1;
+}
+
+/* -------------------------------------------------------------------------
+ * bstack_ensure
+ * ---------------------------------------------------------------------- */
+
+int bstack_ensure(bstack_t *bs, uint64_t target, uint64_t *out_initial_len)
+{
+    BS_WRLOCK(bs);
+
+    uint64_t raw_size;
+    if (file_size(bs->fd, &raw_size) != 0)
+        goto fail_unlock;
+
+    uint64_t data_size = raw_size - HEADER_SIZE;
+
+    if (target <= data_size) {
+        BS_WRUNLOCK(bs);
+        if (out_initial_len) *out_initial_len = data_size;
+        return 0;
+    }
+
+    if (plat_ftruncate(bs->fd, HEADER_SIZE + target) != 0)
+        goto fail_unlock;
+
+    if (write_committed_len(bs->fd, &bs->clen, target) != 0 ||
+        plat_durable_sync(bs->fd) != 0)
+    {
+        plat_ftruncate(bs->fd, raw_size);
+        bs->clen = data_size;
+        write_committed_len(bs->fd, &bs->clen, data_size);
+        plat_durable_sync(bs->fd);
+        goto fail_unlock;
+    }
+
+    BS_WRUNLOCK(bs);
+    if (out_initial_len) *out_initial_len = data_size;
+    return 0;
+
+fail_unlock:
+    {
+        int saved = errno;
+        BS_WRUNLOCK(bs);
+        errno = saved;
+    }
+    return -1;
+}
+
+/* -------------------------------------------------------------------------
  * bstack_pop
  * ---------------------------------------------------------------------- */
 
@@ -2592,6 +2709,79 @@ int bstack_try_extend_sparse_batched(bstack_t *bs, uint64_t s,
 fail:
     { int sv = errno; BS_WRUNLOCK(bs); errno = sv; }
     free(w);
+    return -1;
+}
+
+/* -------------------------------------------------------------------------
+ * bstack_ensure_with
+ * ---------------------------------------------------------------------- */
+
+int bstack_ensure_with(bstack_t *bs, uint64_t target,
+                       int (*cb)(uint8_t *buf, size_t len, void *ctx),
+                       void *ctx, uint64_t *out_initial_len)
+{
+    BS_WRLOCK(bs);
+
+    uint64_t raw_size;
+    if (file_size(bs->fd, &raw_size) != 0)
+        goto fail_unlock;
+
+    uint64_t data_size = raw_size - HEADER_SIZE;
+
+    if (target <= data_size) {
+        BS_WRUNLOCK(bs);
+        if (out_initial_len) *out_initial_len = data_size;
+        return 0;
+    }
+
+    uint64_t growth64 = target - data_size;
+#if UINT64_MAX > SIZE_MAX
+    if (growth64 > (uint64_t)SIZE_MAX) {
+        BS_WRUNLOCK(bs);
+        errno = ENOMEM;
+        return -1;
+    }
+#endif
+    size_t growth = (size_t)growth64;
+
+    uint8_t *buf = (uint8_t *)calloc(1, growth);
+    if (buf == NULL)
+        goto fail_unlock;
+
+    if (cb(buf, growth, ctx) != 0) {
+        free(buf);
+        goto fail_unlock;
+    }
+
+    if (plat_pwrite(bs->fd, buf, growth, raw_size) != 0) {
+        free(buf);
+        plat_ftruncate(bs->fd, raw_size);
+        goto fail_unlock;
+    }
+    free(buf);
+
+    if (write_committed_len(bs->fd, &bs->clen, target) != 0 ||
+        plat_durable_sync(bs->fd) != 0)
+    {
+        /* Best-effort rollback. The cache is reset up front so it reflects
+         * the rolled-back file even if the header rewrite below fails. */
+        plat_ftruncate(bs->fd, raw_size);
+        bs->clen = data_size;
+        write_committed_len(bs->fd, &bs->clen, data_size);
+        plat_durable_sync(bs->fd);
+        goto fail_unlock;
+    }
+
+    BS_WRUNLOCK(bs);
+    if (out_initial_len) *out_initial_len = data_size;
+    return 0;
+
+fail_unlock:
+    {
+        int saved = errno;
+        BS_WRUNLOCK(bs);
+        errno = saved;
+    }
     return -1;
 }
 

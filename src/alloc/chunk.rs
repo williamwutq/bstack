@@ -31,7 +31,12 @@ use std::io;
 /// not evenly divide the source length) don't fit a whole chunk. The two
 /// constructors differ only in which end of the source they align from, and
 /// therefore which sub-region ends up in the chunk view versus the leftover
-/// slice.
+/// slice. A view can also be built directly from an already-aligned region
+/// via [`from_raw_parts`](Self::from_raw_parts) or
+/// [`from_raw_slice`](Self::from_raw_slice) (both `unsafe`), or
+/// [`from_slice`](Self::from_slice) (safe, checked) — none of these split
+/// off a remainder, so the input must already satisfy the alignment
+/// invariant.
 ///
 /// # Not `Copy`
 ///
@@ -105,6 +110,58 @@ impl<'a> Ord for BStackChunk<'a> {
 }
 
 impl<'a> BStackChunk<'a> {
+    /// Construct a `BStackChunk` from raw parts: a stack, byte offset, byte
+    /// length, and stride — no I/O, no validation.
+    ///
+    /// # Safety
+    ///
+    /// `offset + len` must not overflow `u64`. `[offset, offset + len)`
+    /// should lie within the current payload of `stack` for I/O to succeed
+    /// (out-of-bounds coordinates are not a memory-safety hazard by
+    /// themselves — I/O on them just returns `io::Error`). The caller must
+    /// additionally uphold `BStackChunk`'s "always fully aligned" invariant:
+    /// `chunk_len` must be nonzero and evenly divide `len`. Violating this
+    /// is not undefined behavior, but corrupts assumptions relied on by
+    /// [`chunk_count`](Self::chunk_count), [`get`](Self::get),
+    /// [`merge`](Self::merge), [`merge_adjacent`](Self::merge_adjacent), and
+    /// the phase logic in [`same_phase`](Self::same_phase) — e.g.
+    /// `chunk_count` silently truncates rather than panicking, so a
+    /// misaligned raw chunk quietly drops trailing bytes.
+    #[inline]
+    pub unsafe fn from_raw_parts(stack: &'a BStack, offset: u64, len: u64, chunk_len: u64) -> Self {
+        BStackChunk {
+            aligned: unsafe { BStackSlice::from_raw_parts(stack, offset, len) },
+            chunk_len,
+        }
+    }
+
+    /// Construct a `BStackChunk` from an existing [`BStackSlice`] and a
+    /// stride, without validating the "always fully aligned" invariant.
+    ///
+    /// # Safety
+    ///
+    /// `chunk_len` must be nonzero and evenly divide `aligned.len()`.
+    #[inline]
+    pub unsafe fn from_raw_slice(aligned: BStackSlice<'a>, chunk_len: u64) -> Self {
+        BStackChunk { aligned, chunk_len }
+    }
+
+    /// Construct a `BStackChunk` from an existing [`BStackSlice`] and a
+    /// stride, validating that the slice already satisfies the "always fully
+    /// aligned" invariant.
+    ///
+    /// Returns `None` if `chunk_len == 0` or if `aligned.len()` is not a
+    /// multiple of `chunk_len`. Unlike [`BStackSlice::chunks`]/[`rchunks`](BStackSlice::rchunks),
+    /// this never splits off a remainder — the whole slice must already fit
+    /// the stride exactly.
+    #[inline]
+    pub fn from_slice(aligned: BStackSlice<'a>, chunk_len: u64) -> Option<Self> {
+        if chunk_len == 0 || !aligned.len().is_multiple_of(chunk_len) {
+            return None;
+        }
+        Some(BStackChunk { aligned, chunk_len })
+    }
+
     /// Length, in bytes, of one chunk.
     #[inline]
     pub fn chunk_len(&self) -> u64 {
@@ -127,6 +184,95 @@ impl<'a> BStackChunk<'a> {
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.aligned.is_empty()
+    }
+
+    /// Returns `true` if this view and `other` use the same stride
+    /// (`chunk_len`).
+    #[inline]
+    pub fn same_stride(&self, other: &Self) -> bool {
+        self.chunk_len == other.chunk_len
+    }
+
+    /// Returns `true` if this view and `other` share a stride *and* their
+    /// chunk boundaries fall on the same phase — i.e. their aligned regions'
+    /// start offsets are congruent modulo `chunk_len`, so a chunk boundary in
+    /// one view lines up with a chunk boundary in the other wherever the
+    /// regions coincide.
+    #[inline]
+    pub fn same_phase(&self, other: &Self) -> bool {
+        self.same_stride(other)
+            && self.aligned.start() % self.chunk_len == other.aligned.start() % self.chunk_len
+    }
+
+    /// Returns `true` if this view and `other` are same-phase and their
+    /// aligned regions touch end-to-end with no gap and no overlap.
+    ///
+    /// Always `false` if the views are not [`same_phase`](Self::same_phase).
+    #[inline]
+    pub fn adjacent_to(&self, other: &Self) -> bool {
+        self.aligned.adjacent_to(&other.aligned) && self.same_phase(other)
+    }
+
+    /// Returns `true` if this view and `other` are same-phase and their
+    /// aligned regions share at least one byte.
+    ///
+    /// Always `false` if the views are not [`same_phase`](Self::same_phase).
+    #[inline]
+    pub fn overlaps(&self, other: &Self) -> bool {
+        self.aligned.overlaps(&other.aligned) && self.same_phase(other)
+    }
+
+    /// Merge this view with `other` into a single view covering both.
+    ///
+    /// Succeeds if the views [`overlaps`](Self::overlaps) (implying same
+    /// stride and phase), or if either view [`is_empty`](Self::is_empty) and
+    /// they [`same_stride`](Self::same_stride) — an empty view acts as an
+    /// identity element, so merging with one returns the other, non-empty
+    /// view unchanged regardless of phase.
+    ///
+    /// Returns `None` if the views use different strides, or if both are
+    /// non-empty and their aligned regions don't overlap.
+    pub fn merge(&self, other: &Self) -> Option<Self> {
+        if !self.same_stride(other) {
+            return None;
+        }
+        if self.is_empty() {
+            return Some(other.clone());
+        }
+        if other.is_empty() {
+            return Some(self.clone());
+        }
+        if !self.overlaps(other) {
+            return None;
+        }
+        let aligned = self.aligned.merge(&other.aligned)?;
+        Some(BStackChunk {
+            aligned,
+            chunk_len: self.chunk_len,
+        })
+    }
+
+    /// Merge this view with `other` into a single view covering both,
+    /// requiring them to be [`same_stride`](Self::same_stride) and touching
+    /// end-to-end with both non-empty — the latter two are enforced by the
+    /// underlying [`BStackSlice::merge_adjacent`] call.
+    ///
+    /// Same stride is the only phase-related precondition needed: for two
+    /// non-empty, same-stride chunk views, byte-adjacency already forces the
+    /// same phase (each view's aligned length is a multiple of its stride,
+    /// so the touching endpoint is congruent to both starts mod stride), so
+    /// checking [`same_phase`](Self::same_phase) here would be redundant.
+    ///
+    /// Returns `None` if the views are not adjacent.
+    pub fn merge_adjacent(&self, other: &Self) -> Option<Self> {
+        if !self.same_stride(other) {
+            return None;
+        }
+        let aligned = self.aligned.merge_adjacent(&other.aligned)?;
+        Some(BStackChunk {
+            aligned,
+            chunk_len: self.chunk_len,
+        })
     }
 
     /// The aligned region covered by whole chunks, as a plain [`BStackSlice`].

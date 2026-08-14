@@ -326,3 +326,115 @@ With the `atomic` feature it **is `Sync`**. `alloc` / `dealloc` / `realloc` take
 | `CheckedSlabBStackAllocator::new(stack, data_size)` | **empty**     | Writes the 48-byte allocator header; fails with `InvalidInput` if the stack already has data or `data_size < 8`.                                                                                                                                                 |
 | `CheckedSlabBStackAllocator::open(stack)`           | **non-empty** | Reads and validates the stored header, then runs `recover()` automatically. Fails with `InvalidData` on magic mismatch, invalid block size, or misaligned arena.                                                                                                 |
 | `CheckedSlabBStackAllocator::recover()`             | any           | Reclaims leaked blocks and discards orphaned tails left by an unclean shutdown. Returns the count of blocks that could not be classified with certainty (`0` = fully accounted for). Called automatically by `open`; exposed for explicit inspection or re-runs. |
+
+---
+
+## `SegregatedBStackAllocator` (**experimental**, `alloc + set` features)
+
+> **Experimental.** The on-disk format and API are not yet stable, a few resize
+> paths behave differently between the `atomic` and non-`atomic` builds, and the
+> background coalescer and deep in-use-leak reclamation are not yet implemented.
+
+[`CheckedSlabBStackAllocator`] generalised from one block size to **33 size
+classes** sharing one arena. Each class is an independent intrusive free list;
+the class is derived from the request with register arithmetic (no tables), so
+classed alloc/dealloc are O(1). Every block carries the same 8-byte overhead tag
+as the checked slab.
+
+### Size-class scheme
+
+Fixed at compile time (encoded by the magic version), quantum 16:
+
+* **16 linear classes** — 16, 32, …, 256 (step 16).
+* **16 geometric classes** — octaves `[256, 4096)`, 4 subclasses each: 320, 384,
+  448, 512; 640, 768, 896, 1024; 1280, 1536, 1792, 2048; 2560, 3072, 3584, 4096.
+* **1 shared oversized bucket** — above 4096 B.
+
+Sizes are physical block sizes (payload + 8) and multiples of 16; **33 free-list
+heads** total (`NUM_CLASSES`), the last oversized. Helpers: `phys_need(len) =
+round_up(len + 8, 16)`; `class_blocksize(need)` snaps up to the enclosing class;
+`largest_class_le(v)` snaps down (for the carve).
+
+### On-disk layout
+
+```text
+offset  0  reserved (user)                24 B
+offset 24  magic  "ALSG\x00\x01\x00\x00"   8 B
+offset 32  _reserved                       8 B
+offset 40  free_head[33] : u64           264 B   # last entry = oversized list
+offset 304 arena start (16-B aligned)
+```
+
+Each block is `[ overhead(8) | data(block − 8) ]`; the caller pointer is the data
+start (`block_start + 8`, always `16n + 8`). The overhead is one tagged word:
+**high bit set ⇒ in use**, low 63 bits = the caller's exact length; **high bit
+clear ⇒ free**, low 63 bits = physical size `>> 4` (also the class tag). A free
+block stores `next_free` inline at the data start; live blocks carry no overhead
+beyond the word.
+
+### Allocation policy
+
+1. Compute `class_blocksize(phys_need(len))` and the class index.
+2. **Classed** (`≤ 4096`): pop the class head, claiming the block by writing
+   overhead and any copied prefix as one buffer; on a miss, grow a zero-filled
+   block at the tail with one sparse `extend`.
+3. **Oversized** (`> 4096`): pop the head if its stored size is `≥ need`. If
+   exact, claim it; else claim `block` bytes and carve the excess into ≤ 3 class
+   free blocks. On a miss, extend.
+
+### Deallocation policy
+
+Read the overhead at `ptr − 8`; reject a clear high bit (double-free) or a stored
+length disagreeing with the freed slice (partial free). An oversized block at the
+tail is `discard`ed back to the stack; every other block is spliced onto its
+class head.
+
+### Realloc
+
+| Case            | Strategy                                                                                                 |
+|-----------------|----------------------------------------------------------------------------------------------------------|
+| Same class      | rewrite the overhead length; zero the grown tail on grow                                                 |
+| Grow at tail    | extend in place (zero-filled), then rewrite the length                                                   |
+| Shrink at tail  | rewrite the length, then discard the excess tail in place                                                |
+| Non-tail shrink | `atomic`: rewrite length + greedy-carve the freed tail as one in-place transaction. non-`atomic`: *move* |
+| Non-tail grow   | *move* — allocate the new class (reading the prefix into its claim buffer), then free the old block      |
+
+The **greedy carve** takes the largest class `≤` the remainder, repeated: a region
+`> 4096` becomes one oversized block; a classed region splits into ≤ 3
+distinct-class pieces. Fixed stack buffers, no heap.
+
+### Crash consistency
+
+Every path either commits atomically or leaves an orphaned-but-recoverable block.
+
+* **With `atomic`**: pops use `BStack::process_gen`; pushes and the in-place
+  non-tail carve use `BStack::inplace_gen` (multiple writes, one journalled
+  commit); tail grow/shrink use `try_extend_zeros` / `try_discard`.
+* **Without `atomic`**: plain read-then-write / `len`-check-then-`extend`/`discard`
+  (each one durable write). The in-place non-tail carve is not fault-safe, so
+  non-tail shrink uses the *move*, and the oversized-reuse carve writes all freed
+  pieces first and the claiming header last.
+
+`recover()` rebuilds every free list with one linear scan of the overhead words:
+a live block is strided by its class size; a free block is relinked onto
+`head[classify(size)]` (reclaiming leaked blocks); a fully-zeroed tail is
+discarded. The rebuilt head table is published as one crash-atomic contiguous
+write. The scan trusts only the overhead words and is idempotent. In-use orphans
+(e.g. the old block of a crashed *move*) are left live; a deep GC to reclaim them
+is future work. `recover` requires a quiescent allocator and is `unsafe`; `new`
+runs it before the handle escapes.
+
+### Thread safety
+
+Always **`Send`**. With `atomic`, also **`Send + Sync`** with no allocator-level
+lock — operations drive `process_gen`/`inplace_gen` under `BStack`'s write lock;
+no retained `Mutex`. Without `atomic`, **not `Sync`** (pops/pushes read a head
+then write without holding a lock across the pair).
+
+### Constructors
+
+| Constructor                                   | Stack         | Effect                                                                                                                                                                                                                                                                     |
+|-----------------------------------------------|---------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `SegregatedBStackAllocator::new(stack)`       | **empty**     | Writes the header (magic + 33 zeroed heads) with one sparse extend to the arena start.                                                                                                                                                                                     |
+| `SegregatedBStackAllocator::new(stack)`       | **non-empty** | Validates the magic prefix and arena alignment, then runs `recover()` automatically before returning. Fails with `InvalidData`/`UnexpectedEof` on mismatch or misalignment.                                                                                                |
+| `unsafe SegregatedBStackAllocator::recover()` | any           | Reclaims leaks and discards orphaned tails. Returns the count of blocks that could not be classified with certainty (`0` = fully accounted for). `unsafe`: the caller must guarantee the allocator is quiescent (no concurrent operations). Called automatically by `new`. |

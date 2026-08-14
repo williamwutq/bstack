@@ -106,6 +106,24 @@ impl BStack {
     pub fn extend_sparse_batched<I, D>(&self, writes: I, length: u64) -> io::Result<u64>
     where I: IntoIterator<Item = (u64, D)>, D: AsRef<[u8]>;
 
+    /// Grow or shrink the payload to exactly `target` bytes (new region zero-filled),
+    /// then durable-sync.  Returns the payload size before the resize.
+    /// Errors if shrinking would cut into the locked region.
+    pub fn resize(&self, target: u64) -> io::Result<u64>;
+
+    /// Grow the payload to at least `target` bytes (zero-filled), then durable-sync.
+    /// A no-op if already `target` bytes or longer.  Returns the payload size
+    /// before the call.  The grow-only, unconditional counterpart of `resize`.
+    pub fn ensure(&self, target: u64) -> io::Result<u64>;
+
+    /// Grow the payload to at least `target` bytes only if it is currently shorter,
+    /// handing the freshly allocated tail to `f` for initialization before it is
+    /// committed.  A no-op (with `f` not called) if already `target` bytes or longer.
+    /// Returns the payload size before the call.  Requires the `atomic` feature.
+    #[cfg(feature = "atomic")]
+    pub fn ensure_with<F>(&self, target: u64, f: F) -> io::Result<u64>
+    where F: FnOnce(&mut [u8]);
+
     /// Remove and return the last `n` bytes, then durable-sync.
     /// `n = 0` is valid.  Errors if `n` exceeds the current payload size.
     pub fn pop(&self, n: u64) -> io::Result<Vec<u8>>;
@@ -528,6 +546,7 @@ bstack = { version = "0.4", features = ["set", "atomic"] }
 - **`atrunc`**, **`splice`**, **`splice_into`** — atomic discard+push / pop+push tail replacement.
 - **`try_extend`**, **`try_discard`**, **`try_extend_zeros`** — size-checked, optimistic append/discard.
 - **`try_extend_sparse`**, **`try_extend_sparse_batched`** — size-checked, optimistic sparse tail growth.
+- **`ensure_with(target, f)`** — grow-if-short with the new tail handed to `f` for initialization before commit.
 - **`replace(n, f)`** — pop `n` bytes, pass to `f`, push back the returned tail.
 - **`get_batched`**, **`get_batched_into`**, **`get_batched_gen`** — read multiple (possibly dependent) ranges under one read lock.
 - **`swap`**, **`swap_into`**, **`cas`** *(requires `set`)* — atomic read-modify-write / compare-and-swap of a single region.
@@ -551,7 +570,7 @@ bstack = { version = "0.4", features = ["set"] }
 
 ### `alloc`
 
-Enables the region-management layer on top of `BStack`: `BStackAllocator`, `BStackBulkAllocator`, `BStackUninitAllocator`, `BStackOwnedSliceAllocator`, `BStackAllocError`, `BStackBulkAllocError`, `BStackRange`, `BStackOwnedSlice`, `BStackSlice`, `BStackSliceReader`, `LinearBStackAllocator`, `GhostTreeBstackAllocator`, and `DebugCheckingAllocator`.  Combined with `set`, also enables `BStackSliceWriter`, `FirstFitBStackAllocator`, `SlabBStackAllocator`, `CheckedSlabBStackAllocator`, `BStackByteVec`, and `BStackByteVecIter`.
+Enables the region-management layer on top of `BStack`: `BStackAllocator`, `BStackBulkAllocator`, `BStackUninitAllocator`, `BStackOwnedSliceAllocator`, `BStackAllocError`, `BStackBulkAllocError`, `BStackRange`, `BStackOwnedSlice`, `BStackSlice`, `BStackSliceReader`, `LinearBStackAllocator`, `GhostTreeBstackAllocator`, and `DebugCheckingAllocator`.  Combined with `set`, also enables `BStackSliceWriter`, `FirstFitBStackAllocator`, `SlabBStackAllocator`, `CheckedSlabBStackAllocator`, `SegregatedBStackAllocator` (experimental), `BStackByteVec`, and `BStackByteVecIter`.
 
 ```toml
 [dependencies]
@@ -577,7 +596,7 @@ A fixed 32-byte header precedes the payload:
 ```
 
 * **`magic`** — 8 bytes: `BSTK` + major(1 B) + minor(1 B) + patch(1 B) + reserved(1 B).
-  This version writes `BSTK\x00\x04\x01\x00` (0.4.1).  `open` accepts any
+  This version writes `BSTK\x00\x04\x02\x00` (0.4.2).  `open` accepts any
   0.4.x file (first 6 bytes `BSTK\x00\x04`) and rejects a different major or
   minor as incompatible.  Legacy `0.1.x` files can be upgraded in place with
   `BStack::migrate`.
@@ -629,6 +648,9 @@ before it is read/compare/callback work under the lock.
 | `extend_sparse`, `extend_sparse_batched` | `set_len(new_end)` → `write` each buffer into the grown region (gaps left zero) → `lseek(8)` → `write(clen)` → sync |
 | `pop`, `pop_into`                      | `lseek` → `read` → `ftruncate` → `lseek(8)` → `write(clen)` → sync                        |
 | `discard`                              | `ftruncate` → `lseek(8)` → `write(clen)` → sync                                           |
+| `resize`                               | dispatches to the `extend` sequence (growth) or the `discard` sequence (shrinkage); a no-op if already `target` bytes |
+| `ensure`                               | growth-only `extend` sequence, applied only if the payload is shorter than `target`       |
+| `ensure_with` *(atomic)*               | *(callback)* → `write(buf)` → `lseek(8)` → `write(clen)` → sync; applied only if the payload is shorter than `target` |
 | `set` *(feature)*                      | *commit* `data`                                                                           |
 | `zero`, `repeat` *(feature)*           | *commit* the repeated pattern (the journal stages only `[count \| pattern]`)              |
 | `atrunc` *(atomic)*                    | dispatch on shape: truncation → `ftruncate` → *commit* `clen`; append → `set_len(new_end)` → `write(buf)` → sync → *commit* `clen`; same-length → *commit* `buf` in place; length change → **splice journal** (stage new tail past the payload → arm `SpliceGrow`/`SpliceShrink` → replay into place → atomically commit `clen'` + disarm → truncate, sync at each barrier) |
@@ -718,6 +740,8 @@ lock without any `File::metadata` syscall.
 |-----------------------------------------------------------------|-----------------------|--------------|
 | `push`, `extend`, `pop`, `pop_into`, `discard`                  | write                 | write        |
 | `extend_sparse`, `extend_sparse_batched`                        | write                 | write        |
+| `resize`, `ensure`                                              | write                 | write        |
+| `ensure_with` *(atomic)*                                        | write                 | write        |
 | `set`, `zero`, `repeat` *(feature)*                             | write                 | write        |
 | `atrunc`, `splice`, `splice_into`, `try_extend` *(atomic)*      | write                 | write        |
 | `try_discard(s, n > 0)` *(atomic)*                              | write                 | write        |
@@ -965,6 +989,10 @@ Key methods on `BStackSlice`:
 | `find(byte)` / `rfind(byte)`                                         | Index of the first/last occurrence of a byte            |
 | `position(pred)` / `rposition(pred)`                                 | Index of the first/last byte matching a predicate       |
 | `reader()` / `reader_at(offset)`                                     | Cursor-based `BStackSliceReader`                        |
+| `overlaps(other)`                                                    | Whether the two slices share at least one byte          |
+| `adjacent_to(other)`                                                 | Whether the two slices touch end-to-end with no gap     |
+| `merge(other)`                                                       | Union into one slice if they overlap or either is empty |
+| `merge_adjacent(other)`                                              | Union into one slice if they are adjacent and non-empty |
 | `write(data)` *(feature `set`)*                                      | Overwrite the beginning of the region                   |
 | `write_range(start, data)` *(feature `set`)*                         | Overwrite a sub-range                                   |
 | `zero()` / `zero_range(start, n)` *(feature `set`)*                  | Zero the region or a sub-range                          |
@@ -993,9 +1021,17 @@ A "slice with a stride": divides a region into `chunk_len`-byte records. Sits at
 
 Obtained from `BStackSlice::chunks(chunk_len)` / `BStackSlice::rchunks(chunk_len)` (mirrored on `BStackOwnedSlice`), each returning **`(BStackChunk<'a>, BStackSlice<'a>)`**: the aligned chunk view, plus whatever bytes are left over if `chunk_len` doesn't evenly divide the source length. `chunks` aligns from the start (leftover at the tail); `rchunks` aligns from the end (leftover at the head). No I/O — pure offset arithmetic, as cheap as `subslice`.
 
+Also constructible directly, without splitting off a remainder, via `BStackChunk::from_raw_parts(stack, offset, len, chunk_len)` (`unsafe`, mirrors `BStackSlice::from_raw_parts`), `BStackChunk::from_raw_slice(aligned, chunk_len)` (`unsafe`, wraps an existing `BStackSlice` as-is), or `BStackChunk::from_slice(aligned, chunk_len)` (safe, returns `None` unless `chunk_len` is nonzero and evenly divides `aligned.len()`). All three require the slice to already be exactly chunk-aligned — unlike `chunks`/`rchunks`, there is no remainder.
+
 | Method                                                                              | Description                                                                                                              |
 |-------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------|
 | `chunk_len()` / `chunk_count()` / `len()` / `is_empty()`                            | Stride, chunk count, and total aligned byte length                                                                       |
+| `same_stride(other)`                                                                | Whether the two views use the same `chunk_len`                                                                           |
+| `same_phase(other)`                                                                 | Same stride *and* aligned-region start offsets congruent mod `chunk_len`                                                 |
+| `adjacent_to(other)`                                                                | Same-phase and the aligned regions touch end-to-end with no gap — `false` unless `same_phase`                            |
+| `overlaps(other)`                                                                   | Same-phase and the aligned regions share at least one byte — `false` unless `same_phase`                                 |
+| `merge(other)`                                                                      | `Some` union if the views `overlaps`, or if either is empty and they `same_stride`; `None` otherwise                     |
+| `merge_adjacent(other)`                                                             | `Some` union if `same_stride` and the regions are adjacent and non-empty, thus also `same_phase`; `None` otherwise       |
 | `get(index)`                                                                        | The chunk at `index` as a `BStackSlice`, or `None` — O(1), no I/O                                                        |
 | `as_slice()` / `into_slice()`                                                       | The whole aligned region as a plain `BStackSlice` — by clone, or by consuming `self`                                     |
 | `with_stride(new_stride)`                                                           | Consume `self`, re-dividing the aligned region with a different stride — `(BStackChunk, BStackSlice)`, same as `chunks`  |
@@ -1074,6 +1110,21 @@ catches double-frees immediately and allows full recovery after a crash.
 Constructor takes `data_size` (usable bytes per block; physical = `data_size + 8`).
 `open` runs `recover()` automatically.  Without `atomic`: `Send` only.  With
 `atomic`: `Send + Sync` (same lock-free strategy as `SlabBStackAllocator`).
+
+### `SegregatedBStackAllocator` (**experimental**, `alloc + set`)
+
+Segregated (binned) free-list allocator: the checked slab generalised to 33 size
+classes (16 linear 16‥256 B, 16 geometric 320‥4096 B, one oversized bucket)
+sharing one arena.  Class computed by register arithmetic; O(1) classed
+alloc/dealloc; 8-byte overhead tag per block.  Single `new(stack)` constructor
+(runs recovery automatically).  Without `atomic`: `Send` only.  With `atomic`:
+`Send + Sync`, no allocator-level lock.
+
+> **Experimental.**  The on-disk format and API are not yet stable, some resize
+> paths differ between the `atomic` and non-`atomic` builds (in-place non-tail
+> carve is `atomic`-only; the non-`atomic` build moves instead), and the
+> background coalescer and deep in-use-leak GC are not yet implemented.  See
+> [`algos/ALLOCATOR.md`](algos/ALLOCATOR.md) for the full design.
 
 ### `DebugCheckingAllocator` (`alloc`)
 

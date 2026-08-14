@@ -32,7 +32,7 @@
 mod alloc_fault_tests {
     use crate::alloc::{
         BStackOwnedSlice, BStackOwnedSliceAllocator, BStackRange, FirstFitBStackAllocator,
-        GhostTreeBstackAllocator, SlabBStackAllocator,
+        GhostTreeBstackAllocator, SegregatedBStackAllocator, SlabBStackAllocator,
     };
     use crate::alloc_test_common::{
         FuzzConfig, Guard, Operation, Payload, check_is_zero, gen_op, make_allocator, make_payload,
@@ -312,5 +312,10 @@ mod alloc_fault_tests {
         check_slab_64,
         make_allocator!(CheckedSlabBStackAllocator, 64),
         0x6666
+    );
+    fault_suite!(
+        segregated,
+        make_allocator!(SegregatedBStackAllocator),
+        0x7777
     );
 }

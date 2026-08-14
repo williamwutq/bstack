@@ -39,7 +39,7 @@
 //! ```
 //!
 //! * **`magic`** — 8 bytes: `BSTK` + major(1 B) + minor(1 B) + patch(1 B) + reserved(1 B).
-//!   This version writes `BSTK\x00\x04\x01\x00` (0.4.1).  [`open`](BStack::open)
+//!   This version writes `BSTK\x00\x04\x02\x00` (0.4.2).  [`open`](BStack::open)
 //!   accepts any file whose first 6 bytes match `BSTK\x00\x04` (any 0.4.x) and
 //!   rejects anything with a different major or minor.
 //! * **`clen`** — little-endian `u64` recording the *committed* payload length.
@@ -377,7 +377,7 @@
 //!
 //! | Trait | Semantics |
 //! |-------|-----------|
-//! | `Debug` | Shows `version` (semver string from the magic header, e.g. `"0.4.1"`) and `len` (`Option<u64>`, `None` on I/O failure). |
+//! | `Debug` | Shows `version` (semver string from the magic header, e.g. `"0.4.2"`) and `len` (`Option<u64>`, `None` on I/O failure). |
 //! | `PartialEq` / `Eq` | **Pointer identity.** Two values are equal iff they are the same instance. No two distinct `BStack` values in one process can refer to the same file. |
 //! | `Hash` | Hashes the instance address — consistent with pointer-identity `PartialEq`. |
 //!
@@ -400,7 +400,8 @@
 //!   [`GhostTreeBstackAllocator`], and [`DebugCheckingAllocator`].
 //!   Combined with `set`, also enables [`BStackSliceWriter`],
 //!   [`FirstFitBStackAllocator`], [`SlabBStackAllocator`],
-//!   [`CheckedSlabBStackAllocator`], and [`BStackByteVec`].
+//!   [`CheckedSlabBStackAllocator`], [`SegregatedBStackAllocator`]
+//!   (experimental), and [`BStackByteVec`].
 //!
 //! * **`atomic`** — Compound read-modify-write operations that hold the write
 //!   lock across what would otherwise be separate calls.  Combined with `set`,
@@ -508,6 +509,23 @@
 //!   ([`open`](CheckedSlabBStackAllocator::open) runs
 //!   [`recover`](CheckedSlabBStackAllocator::recover) automatically).
 //!   Requires both `alloc` and `set` features.
+//!
+//! * [`SegregatedBStackAllocator`] — **experimental** segregated (binned)
+//!   free-list allocator.  Generalises [`CheckedSlabBStackAllocator`] from one
+//!   block size to 33 size classes sharing a single arena: 16 linear classes
+//!   (16‥256 B, step 16), 16 geometric classes (320‥4096 B, 4 per octave), and
+//!   one shared oversized bucket.  Each class is an independent intrusive free
+//!   list; the class is computed from the request with register arithmetic (no
+//!   tables), giving O(1) classed alloc/dealloc.  Every block carries the same
+//!   8-byte overhead tag as the checked slab, so leaked blocks are reclaimable by
+//!   a linear scan and double-frees are caught.  A single [`new`](SegregatedBStackAllocator::new)
+//!   constructor initialises an empty stack or reopens one (running recovery
+//!   automatically). Requires both `alloc` and `set`; `Send` in all
+//!   configurations, `Send + Sync` with `atomic` (no allocator-level lock —
+//!   free-list splices ride [`BStack::process_gen`]/[`BStack::inplace_gen`]).
+//!   **Experimental:** the on-disk format and API may change, some resize paths
+//!   differ between the `atomic` and non-`atomic` builds, and the background
+//!   coalescer / deep in-use-leak GC are not yet implemented.
 //!
 //! * [`DebugCheckingAllocator<A>`](DebugCheckingAllocator) — transparent debug
 //!   wrapper.  Wraps any allocator whose `Allocated` type is [`BStackOwnedSlice`]
@@ -632,14 +650,14 @@ pub use alloc::{
     BStackChunkIter, BStackOwnedSlice, BStackOwnedSliceAllocator, BStackRange, BStackSlice,
     BStackSliceReader, BStackUninitAllocator, DebugCheckingAllocator, LinearBStackAllocator,
 };
+#[cfg(all(feature = "guarded", feature = "atomic"))]
+pub use alloc::{BStackAtomicGuardedSlice, BStackAtomicGuardedSliceSubview};
 #[cfg(all(feature = "alloc", feature = "set"))]
 pub use alloc::{
     BStackByteVec, BStackByteVecIter, BStackSliceWriter, CheckedSlabBStackAllocator,
-    FirstFitBStackAllocator, GhostTreeBstackAllocator, SlabBStackAllocator,
+    FirstFitBStackAllocator, GhostTreeBstackAllocator, SegregatedBStackAllocator,
+    SlabBStackAllocator,
 };
-
-#[cfg(all(feature = "guarded", feature = "atomic"))]
-pub use alloc::{BStackAtomicGuardedSlice, BStackAtomicGuardedSliceSubview};
 #[cfg(feature = "guarded")]
 pub use alloc::{BStackGuardedSlice, BStackGuardedSliceSubview};
 
@@ -674,7 +692,7 @@ use windows_sys::Win32::System::IO::OVERLAPPED;
 /// reject the new files loudly instead of misreading them.
 const FORMAT_MAJOR: u8 = 0;
 const FORMAT_MINOR: u8 = 4;
-const FORMAT_PATCH: u8 = 1;
+const FORMAT_PATCH: u8 = 2;
 
 /// Full magic for files written by this version
 /// (`BSTK` + major + minor + patch + reserved(0)).
@@ -1241,6 +1259,152 @@ impl BStack {
         fault_point!(self, "extend_sparse_batched");
         commit_sparse_extend(file, clen, logical_offset, file_end, new_len, &blocks)?;
         Ok(logical_offset)
+    }
+
+    /// Grow or shrink the payload to exactly `target` bytes and durable-sync.
+    /// Any newly grown region is filled with zeros.
+    ///
+    /// Returns the payload size immediately before the resize. `target` equal
+    /// to the current payload size is a valid no-op.
+    ///
+    /// # Atomicity
+    ///
+    /// Growth follows [`extend`](Self::extend)'s guarantees; shrinkage follows
+    /// [`discard`](Self::discard)'s. Either the resize completes, the header
+    /// committed-length is updated, and the whole thing is durably synced, or
+    /// the file is left unchanged (best-effort rollback via `ftruncate` +
+    /// header reset on a growth failure).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] if shrinking would cut into the
+    /// locked region `[0, locked_len())`. Propagates any I/O error from
+    /// `set_len`, `write_committed_len`, or `durable_sync`.
+    pub fn resize(&self, target: u64) -> io::Result<u64> {
+        let mut guard = self.lock.write().unwrap();
+        let (file, clen) = &mut *guard;
+        let file_end = file.seek(SeekFrom::End(0))?;
+        let data_size = file_end - HEADER_SIZE;
+
+        if target == data_size {
+            return Ok(data_size);
+        }
+        if target < data_size {
+            let locked = self.locked.load(Ordering::Acquire);
+            if target < locked {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("resize({target}) would shrink payload below locked length ({locked})"),
+                ));
+            }
+            fault_point!(self, "resize");
+            commit_shrink(file, clen, target)?;
+            return Ok(data_size);
+        }
+
+        fault_point!(self, "resize");
+        file.set_len(HEADER_SIZE + target)?;
+        commit_grow(file, clen, target, data_size, file_end)?;
+        Ok(data_size)
+    }
+
+    /// Grow the payload to at least `target` bytes, filling the new region
+    /// with zeros, and durable-sync. A no-op if the payload is already
+    /// `target` bytes or longer.
+    ///
+    /// Returns the payload size immediately before the call — the grow-only,
+    /// unconditional counterpart of [`resize`](Self::resize).
+    ///
+    /// # Atomicity
+    ///
+    /// Same guarantees as [`extend`](Self::extend).
+    ///
+    /// # Errors
+    ///
+    /// Propagates any I/O error from `set_len`, `write_committed_len`, or
+    /// `durable_sync`.
+    pub fn ensure(&self, target: u64) -> io::Result<u64> {
+        let mut guard = self.lock.write().unwrap();
+        let (file, clen) = &mut *guard;
+        let file_end = file.seek(SeekFrom::End(0))?;
+        let data_size = file_end - HEADER_SIZE;
+
+        if target <= data_size {
+            return Ok(data_size);
+        }
+
+        fault_point!(self, "ensure");
+        file.set_len(HEADER_SIZE + target)?;
+        commit_grow(file, clen, target, data_size, file_end)?;
+        Ok(data_size)
+    }
+
+    /// Grow the payload to at least `target` bytes, only if it is currently
+    /// shorter, handing the freshly allocated tail to `f` for initialization
+    /// before it is committed.
+    ///
+    /// If the payload is already `target` bytes or longer, `f` is not called
+    /// and nothing changes. Otherwise `f` is called with a zero-filled
+    /// `&mut [u8]` of length `target - old_len` — exactly the region
+    /// [`ensure`](Self::ensure) would have appended — and whatever `f` leaves
+    /// in that buffer is what lands on disk; the callback is the only way to
+    /// populate the grown tail with anything but zeros.
+    ///
+    /// Returns the payload size immediately before the call.
+    ///
+    /// # Feature flag
+    ///
+    /// Only available when the `atomic` Cargo feature is enabled.
+    ///
+    /// # Atomicity
+    ///
+    /// Crash-atomic on the same terms as [`extend`](Self::extend): `f` runs in
+    /// memory, under the write lock, before any of its output reaches disk, so
+    /// a crash never observes a partially initialized tail. Either the grown
+    /// region — with `f`'s edits applied — is committed and durably synced, or
+    /// the file is left unchanged (best-effort rollback via `ftruncate` on a
+    /// write failure).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::OutOfMemory`] if `target - old_len` exceeds
+    /// `isize::MAX` bytes — the maximum size of a single allocation.
+    /// Propagates any I/O error from `set_len`, `write_all`, or
+    /// `durable_sync`.
+    #[cfg(feature = "atomic")]
+    pub fn ensure_with<F>(&self, target: u64, f: F) -> io::Result<u64>
+    where
+        F: FnOnce(&mut [u8]),
+    {
+        let mut guard = self.lock.write().unwrap();
+        let (file, clen) = &mut *guard;
+        let file_end = file.seek(SeekFrom::End(0))?;
+        let data_size = file_end - HEADER_SIZE;
+
+        if target <= data_size {
+            return Ok(data_size);
+        }
+
+        // A single allocation can never exceed `isize::MAX` bytes (Rust's own
+        // allocator limit — `Vec` panics with "capacity overflow" past it),
+        // which is stricter than `usize::MAX` and also covers 32-bit targets
+        // where `usize` is narrower than `u64`.
+        let growth = target - data_size;
+        if growth > isize::MAX as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "ensure_with: growth too large to buffer on this platform",
+            ));
+        }
+        let mut buf = vec![0u8; growth as usize];
+        f(&mut buf);
+        fault_point!(self, "ensure_with");
+        if let Err(e) = file.write_all(&buf) {
+            let _ = file.set_len(file_end);
+            return Err(e);
+        }
+        commit_grow(file, clen, target, data_size, file_end)?;
+        Ok(data_size)
     }
 
     /// Remove and return the last `n` bytes of the file.
