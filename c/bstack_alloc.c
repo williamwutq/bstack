@@ -5849,6 +5849,888 @@ uint64_t checked_slab_bstack_allocator_data_size(
     return alloc->block_size - ALCK_OVERHEAD;
 }
 
+/* =========================================================================
+ * segregated_bstack_allocator_t — segregated (binned) free-list allocator
+ * Requires -DBSTACK_FEATURE_SET (depends on bstack_set / bstack_zero and, under
+ * BSTACK_FEATURE_ATOMIC, bstack_process_gen / bstack_inplace_gen).
+ *
+ * Port of the Rust SegregatedBStackAllocator; see bstack_alloc.h for the layout,
+ * class scheme, and thread-safety contract.
+ * ====================================================================== */
+
+/* ---- class scheme (compile-time, encoded by the magic version) --------- */
+
+#define ALSG_QUANTUM         UINT64_C(16)
+#define ALSG_OVERHEAD        UINT64_C(8)
+#define ALSG_LINEAR_MAX      UINT64_C(256)
+#define ALSG_LINEAR_OCTAVE   8u                              /* log2(LINEAR_MAX) */
+#define ALSG_MAX_OCTAVE      12u                             /* log2(MAX_CLASS)  */
+#define ALSG_MAX_CLASS       (UINT64_C(1) << ALSG_MAX_OCTAVE)             /* 4096 */
+#define ALSG_SUBCLASS_BITS   2u
+#define ALSG_SUBCLASSES      (UINT64_C(1) << ALSG_SUBCLASS_BITS)         /* 4 */
+#define ALSG_LINEAR_CLASSES  (ALSG_LINEAR_MAX / ALSG_QUANTUM)           /* 16 */
+#define ALSG_GEO_CLASSES     ((uint64_t)(ALSG_MAX_OCTAVE - ALSG_LINEAR_OCTAVE) \
+                              * ALSG_SUBCLASSES)                         /* 16 */
+#define ALSG_NUM_CLASSES     (ALSG_LINEAR_CLASSES + ALSG_GEO_CLASSES + 1) /* 33 */
+#define ALSG_OVERSIZED_CLASS (ALSG_NUM_CLASSES - 1)                     /* 32 */
+
+/* ---- header layout (compile-time, fixed offsets) ----------------------- */
+
+#define ALSG_OFFSET_SIZE     UINT64_C(24)
+/* offset 32: 8 reserved bytes — no field yet. */
+#define ALSG_FREE_HEAD_BASE  UINT64_C(40)
+/* header rounded up to the 16-B quantum: 40 + 33*8 = 304 (already aligned). */
+#define ALSG_ARENA_START     ((ALSG_FREE_HEAD_BASE + ALSG_NUM_CLASSES * 8 + 15) \
+                              & ~UINT64_C(15))                          /* 304 */
+#define ALSG_MAX_CARVE_PIECES 3
+#define ALSG_SENTINEL        UINT64_C(0)
+#define ALSG_IN_USE_BIT      UINT64_C(0x8000000000000000)
+
+static const uint8_t alsg_magic[8]        = {'A','L','S','G',0,1,0,0};
+static const uint8_t alsg_magic_prefix[6] = {'A','L','S','G',0,1};
+
+#define alsg_head_off(cls) (ALSG_FREE_HEAD_BASE + (uint64_t)(cls) * 8)
+
+/* ---- classification math (no tables, no recursion) --------------------- */
+
+/* floor(log2(v)) for v >= 1 — the register form of 63 - v.leading_zeros(). */
+static uint32_t alsg_ilog2_u64(uint64_t v)
+{
+    uint32_t r = 0;
+    while (v >>= 1) r++;
+    return r;
+}
+
+/* Round a caller len up to the physical need round_up(len + 8, 16).
+ * Returns 0 to signal overflow (a valid need is always >= 16). */
+static uint64_t alsg_phys_need(uint64_t len)
+{
+    uint64_t n;
+    if (len > UINT64_MAX - (ALSG_OVERHEAD + ALSG_QUANTUM - 1)) return 0;
+    n = len + (ALSG_OVERHEAD + ALSG_QUANTUM - 1);
+    return n & ~(ALSG_QUANTUM - 1);
+}
+
+/* Snap a physical need up to its class block size. */
+static uint64_t alsg_class_blocksize(uint64_t need)
+{
+    if (need <= ALSG_LINEAR_MAX) return need;
+    if (need <= ALSG_MAX_CLASS) {
+        uint32_t k = alsg_ilog2_u64(need - 1);      /* need in (2^k, 2^{k+1}] */
+        uint64_t w = UINT64_C(1) << (k - ALSG_SUBCLASS_BITS);
+        return (need + w - 1) & ~(w - 1);
+    }
+    return need;
+}
+
+/* Map a physical block size (multiple of 16, >= 16) to its free-list head. */
+static uint64_t alsg_classify(uint64_t size)
+{
+    if (size <= ALSG_LINEAR_MAX) return (size >> 4) - 1;
+    if (size <= ALSG_MAX_CLASS) {
+        uint32_t k   = alsg_ilog2_u64(size - 1);
+        uint64_t sub = (size - 1 - (UINT64_C(1) << k)) >> (k - ALSG_SUBCLASS_BITS);
+        return ALSG_LINEAR_CLASSES
+             + ((uint64_t)k - ALSG_LINEAR_OCTAVE) * ALSG_SUBCLASSES + sub;
+    }
+    return ALSG_OVERSIZED_CLASS;
+}
+
+/* Largest class block size <= v (16 <= v <= MAX_CLASS, v a multiple of 16). */
+static uint64_t alsg_largest_class_le(uint64_t v)
+{
+    uint32_t k;
+    uint64_t w;
+    if (v <= ALSG_LINEAR_MAX) return v;
+    k = alsg_ilog2_u64(v);                           /* 2^k <= v < 2^{k+1} */
+    w = UINT64_C(1) << (k - ALSG_SUBCLASS_BITS);
+    return v & ~(w - 1);
+}
+
+/* Validate a caller data pointer and return its block base offset. */
+static int alsg_block_start_of(uint64_t ptr, uint64_t *out)
+{
+    if (ptr < ALSG_ARENA_START + ALSG_OVERHEAD || ptr % ALSG_QUANTUM != ALSG_OVERHEAD) {
+        errno = EINVAL; return -1;
+    }
+    *out = ptr - ALSG_OVERHEAD;
+    return 0;
+}
+
+/* ---- claim buffer ------------------------------------------------------ */
+
+/* Build the block-byte claim buffer: overhead = IN_USE|len, an optional prefix
+ * of n bytes read straight from payload offset src, the rest zero.  Returns a
+ * malloc'd buffer (caller frees) or NULL on failure. */
+static uint8_t *alsg_claim_buf(bstack_t *bs, uint64_t block, uint64_t len,
+                               int has_copy, uint64_t src, uint64_t n)
+{
+    uint8_t *buf;
+#if UINT64_MAX > SIZE_MAX
+    if (block > (uint64_t)SIZE_MAX) { errno = EINVAL; return NULL; }
+#endif
+    buf = calloc(1, (size_t)block);
+    if (!buf) return NULL;
+    write_le64(buf, ALSG_IN_USE_BIT | len);
+    if (has_copy && n > 0) {
+        if (bstack_get(bs, src, src + n, buf + 8)) { free(buf); return NULL; }
+    }
+    return buf;
+}
+
+/* ---- free-list pop ----------------------------------------------------- */
+
+#ifdef BSTACK_FEATURE_ATOMIC
+/* Pop the head of `class`: read head, read its next_free, advance head — one
+ * process_gen sequence under a held write lock, closing the ABA window. */
+struct alsg_pop_ctx {
+    uint64_t head_off;
+    uint8_t  head_buf[8];
+    uint8_t  next_buf[8];
+    uint64_t popped;
+    int      have;
+    int      step;
+};
+
+static int alsg_pop_class_gen(bstack_gen_op_t *op, void *userctx)
+{
+    struct alsg_pop_ctx *c = userctx;
+    switch (c->step++) {
+    case 0:
+        op->kind = BSTACK_GEN_READ;
+        op->u.read.offset = c->head_off;
+        op->u.read.buf = c->head_buf; op->u.read.len = 8; return 1;
+    case 1: {
+        uint64_t head = read_le64(c->head_buf);
+        if (head == ALSG_SENTINEL) return 0;
+        c->popped = head; c->have = 1;
+        // Despite looking similar, this is not the same as the last read
+        op->kind = BSTACK_GEN_READ;
+        op->u.read.offset = head + ALSG_OVERHEAD;
+        op->u.read.buf = c->next_buf; op->u.read.len = 8; return 1;
+    }
+    case 2:
+        op->kind = BSTACK_GEN_WRITE; op->u.write.offset = c->head_off;
+        op->u.write.data = c->next_buf; op->u.write.len = 8; return 1;
+    default:
+        return 0;
+    }
+}
+
+static int alsg_pop_class(bstack_t *bs, uint64_t class,
+                          int *out_have, uint64_t *out_block)
+{
+    struct alsg_pop_ctx c;
+    memset(&c, 0, sizeof c);
+    c.head_off = alsg_head_off(class);
+    if (bstack_process_gen(bs, alsg_pop_class_gen, &c)) return -1;
+    *out_have = c.have;
+    if (c.have) *out_block = c.popped;
+    return 0;
+}
+
+/* Pop the oversized head if its stored size >= need; the overhead word and
+ * inline next_free are contiguous, fetched in one 16-byte read. */
+struct alsg_pop_ovs_ctx {
+    uint64_t head_off, need, head, size;
+    uint8_t  head_buf[8];
+    uint8_t  oh_next[16];
+    int      have, step;
+};
+
+static int alsg_pop_ovs_gen(bstack_gen_op_t *op, void *userctx)
+{
+    struct alsg_pop_ovs_ctx *c = userctx;
+    switch (c->step++) {
+    case 0:
+        op->kind = BSTACK_GEN_READ; op->u.read.offset = c->head_off;
+        op->u.read.buf = c->head_buf; op->u.read.len = 8; return 1;
+    case 1: {
+        uint64_t head = read_le64(c->head_buf);
+        if (head == ALSG_SENTINEL) return 0;
+        c->head = head;
+        op->kind = BSTACK_GEN_READ; op->u.read.offset = head;
+        op->u.read.buf = c->oh_next; op->u.read.len = 16; return 1;
+    }
+    case 2: {
+        uint64_t word = read_le64(c->oh_next);
+        c->size = word << 4;
+        if ((word & ALSG_IN_USE_BIT) != 0 || c->size < c->need) return 0;
+        c->have = 1;
+        op->kind = BSTACK_GEN_WRITE; op->u.write.offset = c->head_off;
+        op->u.write.data = c->oh_next + 8; op->u.write.len = 8; return 1;
+    }
+    default:
+        return 0;
+    }
+}
+
+static int alsg_pop_oversized(bstack_t *bs, uint64_t need, int *out_have,
+                              uint64_t *out_block, uint64_t *out_size)
+{
+    struct alsg_pop_ovs_ctx c;
+    memset(&c, 0, sizeof c);
+    c.head_off = alsg_head_off(ALSG_OVERSIZED_CLASS);
+    c.need     = need;
+    if (bstack_process_gen(bs, alsg_pop_ovs_gen, &c)) return -1;
+    *out_have = c.have;
+    if (c.have) { *out_block = c.head; *out_size = c.size; }
+    return 0;
+}
+#else /* !BSTACK_FEATURE_ATOMIC */
+static int alsg_pop_class(bstack_t *bs, uint64_t class,
+                          int *out_have, uint64_t *out_block)
+{
+    uint64_t head_off = alsg_head_off(class);
+    uint8_t  buf[8];
+    uint64_t head, next;
+    if (bstack_get(bs, head_off, head_off + 8, buf)) return -1;
+    head = read_le64(buf);
+    if (head == ALSG_SENTINEL) { *out_have = 0; return 0; }
+    if (bstack_get(bs, head + ALSG_OVERHEAD, head + ALSG_OVERHEAD + 8, buf)) return -1;
+    next = read_le64(buf);
+    write_le64(buf, next);
+    if (bstack_set(bs, head_off, buf, 8)) return -1;
+    *out_have = 1; *out_block = head;
+    return 0;
+}
+
+static int alsg_pop_oversized(bstack_t *bs, uint64_t need, int *out_have,
+                              uint64_t *out_block, uint64_t *out_size)
+{
+    uint64_t head_off = alsg_head_off(ALSG_OVERSIZED_CLASS);
+    uint8_t  buf8[8], buf16[16];
+    uint64_t head, word, size, next;
+    if (bstack_get(bs, head_off, head_off + 8, buf8)) return -1;
+    head = read_le64(buf8);
+    if (head == ALSG_SENTINEL) { *out_have = 0; return 0; }
+    /* overhead || next_free are contiguous: one 16-byte read. */
+    if (bstack_get(bs, head, head + 16, buf16)) return -1;
+    word = read_le64(buf16);
+    size = word << 4;
+    if ((word & ALSG_IN_USE_BIT) || size < need) { *out_have = 0; return 0; }
+    next = read_le64(buf16 + 8);
+    write_le64(buf8, next);
+    if (bstack_set(bs, head_off, buf8, 8)) return -1;
+    *out_have = 1; *out_block = head; *out_size = size;
+    return 0;
+}
+#endif /* BSTACK_FEATURE_ATOMIC */
+
+/* ---- free-list push ---------------------------------------------------- */
+
+#ifdef BSTACK_FEATURE_ATOMIC
+/* Push block_start onto head[class] via one inplace_gen transaction: read the
+ * old head into next_free's half, write overhead||next_free, repoint the head. */
+struct alsg_push_ctx {
+    uint64_t head_off, block_start;
+    uint8_t  start_bytes[8];
+    uint8_t  overhead_buf[16]; /* [0..8]=free|size, [8..16]=old head (read in) */
+    int      step;
+};
+
+static int alsg_push_gen(bstack_gen_op_t *op, void *userctx)
+{
+    struct alsg_push_ctx *c = userctx;
+    switch (c->step++) {
+    case 0: /* read current head into the next_free half */
+        op->kind = BSTACK_GEN_READ; op->u.read.offset = c->head_off;
+        op->u.read.buf = c->overhead_buf + 8; op->u.read.len = 8; return 1;
+    case 1: /* overhead || next_free */
+        op->kind = BSTACK_GEN_WRITE; op->u.write.offset = c->block_start;
+        op->u.write.data = c->overhead_buf; op->u.write.len = 16; return 1;
+    case 2: /* head[class] <- block_start */
+        op->kind = BSTACK_GEN_WRITE; op->u.write.offset = c->head_off;
+        op->u.write.data = c->start_bytes; op->u.write.len = 8; return 1;
+    default:
+        return 0;
+    }
+}
+
+static int alsg_push(bstack_t *bs, uint64_t block_start, uint64_t size,
+                     uint64_t class)
+{
+    struct alsg_push_ctx c;
+    c.head_off    = alsg_head_off(class);
+    c.block_start = block_start;
+    write_le64(c.overhead_buf, size >> 4);
+    write_le64(c.overhead_buf + 8, 0); /* next_free half will be filled in by read */
+    write_le64(c.start_bytes, block_start);
+    c.step = 0;
+    return bstack_inplace_gen(bs, alsg_push_gen, &c, NULL);
+}
+#else /* !BSTACK_FEATURE_ATOMIC */
+static int alsg_push(bstack_t *bs, uint64_t block_start, uint64_t size,
+                     uint64_t class)
+{
+    uint64_t head_off = alsg_head_off(class);
+    uint8_t  overhead_buf[16], head_buf[8];
+    uint64_t head;
+    write_le64(overhead_buf, size >> 4);      /* free tag: high bit clear */
+    if (bstack_get(bs, head_off, head_off + 8, head_buf)) return -1;
+    head = read_le64(head_buf);
+    write_le64(overhead_buf + 8, head);
+    if (bstack_set(bs, block_start, overhead_buf, 16)) return -1;
+    write_le64(head_buf, block_start);
+    return bstack_set(bs, head_off, head_buf, 8);
+}
+#endif /* BSTACK_FEATURE_ATOMIC */
+
+/* ---- commit_carve ------------------------------------------------------ */
+
+/* Shared scratch for carving up to ALSG_MAX_CARVE_PIECES free blocks out of a
+ * region; also doubles as the userctx for alsg_carve_gen() under
+ * BSTACK_FEATURE_ATOMIC. prefix_off/k/prefix/prefix_len/step are unused (and
+ * left uninitialized) outside that build. */
+struct alsg_carve_ctx {
+    uint64_t       prefix_off;
+    size_t         k;
+    const uint8_t *prefix;
+    size_t         prefix_len;
+    size_t         step;
+    uint64_t       block_offs[ALSG_MAX_CARVE_PIECES];
+    uint64_t       head_offs[ALSG_MAX_CARVE_PIECES];
+    uint8_t        blockoff_bytes[ALSG_MAX_CARVE_PIECES][8];
+    uint8_t        overhead_next[ALSG_MAX_CARVE_PIECES][16];
+};
+
+#ifdef BSTACK_FEATURE_ATOMIC
+/* Steps: [0, k) read each head into that piece's next_free half; k writes the
+ * prefix (the commit point); then 2 writes per piece (overhead||next, head);
+ * then 0 commits the batch. */
+static int alsg_carve_gen(bstack_gen_op_t *op, void *userctx)
+{
+    struct alsg_carve_ctx *c = userctx;
+    size_t step = c->step++;
+    if (step < c->k) {
+        op->kind = BSTACK_GEN_READ;
+        op->u.read.offset = c->head_offs[step];
+        op->u.read.buf    = c->overhead_next[step] + 8;
+        op->u.read.len    = 8;
+        return 1;
+    }
+    if (step == c->k) {
+        op->kind = BSTACK_GEN_WRITE;
+        op->u.write.offset = c->prefix_off;
+        op->u.write.data   = c->prefix;
+        op->u.write.len    = c->prefix_len;
+        return 1;
+    }
+    if (step < c->k + 1 + 2 * c->k) {
+        size_t j = step - (c->k + 1);
+        size_t i = j / 2;
+        op->kind = BSTACK_GEN_WRITE;
+        if (j % 2 == 0) {                 /* overhead || next_free */
+            op->u.write.offset = c->block_offs[i];
+            op->u.write.data   = c->overhead_next[i];
+            op->u.write.len    = 16;
+        } else {                          /* head[class] <- this block */
+            op->u.write.offset = c->head_offs[i];
+            op->u.write.data   = c->blockoff_bytes[i];
+            op->u.write.len    = 8;
+        }
+        return 1;
+    }
+    return 0;
+}
+#endif /* BSTACK_FEATURE_ATOMIC */
+
+/* Commit a `prefix` write and free a contiguous `region` together.  The region
+ * is greedily decomposed into class free blocks (largest class <= remainder,
+ * repeated; a region > MAX_CLASS becomes one oversized block), each a distinct
+ * class, so <= MAX_CARVE_PIECES pieces.  With atomic the prefix + carve ride one
+ * inplace_gen transaction; without atomic the pieces are laid down first and the
+ * single prefix write is the commit point that exposes them.  region_size may be
+ * 0 (a plain prefix write). */
+static int alsg_commit_carve(bstack_t *bs, uint64_t prefix_off,
+                             const uint8_t *prefix, size_t prefix_len,
+                             uint64_t region_start, uint64_t region_size)
+{
+    struct alsg_carve_ctx c;
+    uint64_t off = region_start, rem = region_size;
+    size_t   k = 0;
+
+#ifdef BSTACK_FEATURE_ATOMIC
+    c.step       = 0;
+    c.prefix_off = prefix_off;
+    c.prefix     = prefix;
+    c.prefix_len = prefix_len;
+#endif
+
+    while (rem > 0) {
+        uint64_t ps = (rem > ALSG_MAX_CLASS) ? rem : alsg_largest_class_le(rem);
+        if (k >= ALSG_MAX_CARVE_PIECES) { errno = EINVAL; return -1; }
+        c.block_offs[k] = off;
+        c.head_offs[k]  = alsg_head_off(alsg_classify(ps));
+        write_le64(c.overhead_next[k], ps >> 4);
+        write_le64(c.overhead_next[k] + 8, 0); /* next_free half will be filled in by read */
+        write_le64(c.blockoff_bytes[k], off);
+        off += ps; rem -= ps; k++;
+    }
+
+#ifndef BSTACK_FEATURE_ATOMIC
+    {
+        size_t i;
+        for (i = 0; i < k; i++) {
+            uint8_t shared[16];
+            memcpy(shared, c.overhead_next[i], 16);
+            /* next_free <- current head of this class (read straight in). */
+            if (bstack_get(bs, c.head_offs[i], c.head_offs[i] + 8, shared + 8)) return -1;
+            if (bstack_set(bs, c.block_offs[i], shared, 16)) return -1;
+            if (bstack_set(bs, c.head_offs[i], c.blockoff_bytes[i], 8)) return -1;
+        }
+        return bstack_set(bs, prefix_off, prefix, prefix_len);
+    }
+#else
+    c.k = k;
+    return bstack_inplace_gen(bs, alsg_carve_gen, &c, NULL);
+#endif
+}
+
+/* ---- alloc_raw --------------------------------------------------------- */
+
+/* Place a `len`-byte block whose payload begins with `copy_n` bytes copied from
+ * payload offset `src` (has_copy != 0; rest zeroed) and return its data pointer
+ * (block_start + OVERHEAD) in *out_ptr. */
+static int alsg_alloc_raw(bstack_t *bs, uint64_t len, int has_copy,
+                          uint64_t src, uint64_t copy_n, uint64_t *out_ptr)
+{
+    uint64_t need = alsg_phys_need(len);
+    uint64_t block;
+    uint8_t *buf;
+    uint64_t bs_off;
+
+    if (need == 0) { errno = EINVAL; return -1; }
+    block = alsg_class_blocksize(need);
+
+    if (block <= ALSG_MAX_CLASS) {
+        int have = 0;
+        if (alsg_pop_class(bs, alsg_classify(block), &have, &bs_off)) return -1;
+        if (have) {
+            buf = alsg_claim_buf(bs, block, len, has_copy, src, copy_n);
+            if (!buf) return -1;
+            if (bstack_set(bs, bs_off, buf, (size_t)block)) goto cleanup;
+            goto success;
+        }
+    } else {
+        int have = 0;
+        uint64_t actual = 0;
+        if (alsg_pop_oversized(bs, block, &have, &bs_off, &actual))
+            return -1;
+        if (have) {
+            buf = alsg_claim_buf(bs, block, len, has_copy, src, copy_n);
+            if (!buf) return -1;
+            if (actual == block) {
+                if (bstack_set(bs, bs_off, buf, (size_t)block)) goto cleanup;
+            } else {
+                /* Non-exact reuse: claim `block` bytes (the claim buffer is the
+                 * prefix) and carve the excess as one crash-atomic transaction. */
+                if (alsg_commit_carve(bs, bs_off, buf, (size_t)block,
+                                      bs_off + block, actual - block))
+                goto cleanup;
+            }
+            goto success;
+        }
+    }
+
+    /* Miss: grow the whole zero-filled block in one sparse write. */
+    buf = alsg_claim_buf(bs, block, len, has_copy, src, copy_n);
+    if (!buf) return -1;
+    if (bstack_extend_sparse(bs, buf, (size_t)block, block, &bs_off)) {
+cleanup:
+        free(buf); return -1;
+    }
+success:
+    free(buf);
+    *out_ptr = bs_off + ALSG_OVERHEAD;
+    return 0;
+}
+
+/* ---- recover ----------------------------------------------------------- */
+
+int segregated_bstack_allocator_recover(segregated_bstack_allocator_t *alloc,
+                                        uint64_t *out_unsure)
+{
+    bstack_t *bs = alloc->bs;
+    uint64_t  stack_len, unsure = 0, p;
+    uint64_t  heads[ALSG_NUM_CLASSES];
+    uint8_t   head_bytes[ALSG_NUM_CLASSES * 8];
+    uint8_t   wbuf[8];
+    size_t    c;
+
+    memset(heads, 0, sizeof heads);
+    if (bstack_len(bs, &stack_len)) return -1;
+    if (stack_len <= ALSG_ARENA_START) {
+        if (out_unsure) *out_unsure = 0;
+        return 0;
+    }
+
+    p = ALSG_ARENA_START;
+    while (p < stack_len) {
+        uint64_t word;
+        if (bstack_get(bs, p, p + 8, wbuf)) return -1;
+        word = read_le64(wbuf);
+        if (word & ALSG_IN_USE_BIT) {
+            /* Live: stride by the physical size implied by the stored len. */
+            uint64_t ulen = word & ~ALSG_IN_USE_BIT;
+            uint64_t need = alsg_phys_need(ulen);
+            uint64_t size;
+            if (need == 0) { unsure += (stack_len - p) / ALSG_QUANTUM; break; }
+            size = alsg_class_blocksize(need);
+            if (size == 0 || size > stack_len - p) {
+                unsure += (stack_len - p) / ALSG_QUANTUM; break;
+            }
+            p += size;
+        } else if (word == 0) {
+            /* Zeroed tail from a crashed extend: discard it. */
+            uint64_t dn = stack_len - p;
+#if UINT64_MAX > SIZE_MAX
+            if (dn > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
+#endif
+            if (bstack_discard(bs, (size_t)dn)) return -1;
+            break;
+        } else {
+            /* Free: relink by the stored physical size (reclaims leaks too). */
+            uint64_t size = word << 4;
+            uint64_t cc;
+            if (size < ALSG_QUANTUM || size % ALSG_QUANTUM || size > stack_len - p) {
+                unsure += (stack_len - p) / ALSG_QUANTUM; break;
+            }
+            cc = alsg_classify(size);
+            /* Prepend: next_free <- current head of this class, head <- p. */
+            write_le64(wbuf, heads[cc]);
+            if (bstack_set(bs, p + ALSG_OVERHEAD, wbuf, 8)) return -1;
+            heads[cc] = p;
+            p += size;
+        }
+    }
+
+    /* Publish the rebuilt head table as a single crash-atomic set. */
+    for (c = 0; c < ALSG_NUM_CLASSES; c++)
+        write_le64(head_bytes + c * 8, heads[c]);
+    if (bstack_set(bs, ALSG_FREE_HEAD_BASE, head_bytes, sizeof head_bytes)) return -1;
+    if (out_unsure) *out_unsure = unsure;
+    return 0;
+}
+
+/* ---- vtable implementations -------------------------------------------- */
+
+static bstack_t *alsg_vt_stack(bstack_allocator_t *base)
+{
+    return ((segregated_bstack_allocator_t *)base)->bs;
+}
+
+static int alsg_vt_alloc(bstack_allocator_t *base, uint64_t len,
+                         bstack_slice_t *out)
+{
+    segregated_bstack_allocator_t *a = (segregated_bstack_allocator_t *)base;
+    uint64_t ptr;
+    if (len == 0) {
+        out->offset = 0; out->len = 0; goto success;
+    }
+    if (alsg_alloc_raw(a->bs, len, 0, 0, 0, &ptr)) return -1;
+    out->offset = ptr; out->len = len;
+success:
+    out->allocator = base; return 0;
+}
+
+static int alsg_vt_dealloc(bstack_allocator_t *base, bstack_slice_t s)
+{
+    segregated_bstack_allocator_t *a = (segregated_bstack_allocator_t *)base;
+    bstack_t *bs = a->bs;
+    uint64_t block_start, word, need, size, class, end;
+    uint8_t  buf[8];
+#define RETURN_INVALID do { errno = EINVAL; return -1; } while (0)
+
+    if (s.len == 0) return 0;                       /* empty handle */
+
+    /* Validation errors leave the caller's block untouched (survived, -1). */
+    if (alsg_block_start_of(s.offset, &block_start)) return -1;
+    if (bstack_get(bs, block_start, block_start + 8, buf)) return -1;
+    word = read_le64(buf);
+    if (!(word & ALSG_IN_USE_BIT)) RETURN_INVALID;  /* double free */
+    if ((word & ~ALSG_IN_USE_BIT) != s.len) RETURN_INVALID; /* mismatch */
+
+    need = alsg_phys_need(s.len);
+    if (!need) RETURN_INVALID;
+    size  = alsg_class_blocksize(need);
+    class = alsg_classify(size);
+
+    if (size > ALSG_MAX_CLASS) {
+        if (block_start > UINT64_MAX - size) RETURN_INVALID;
+        end = block_start + size;
+#if UINT64_MAX > SIZE_MAX
+        if (size > (uint64_t)SIZE_MAX) RETURN_INVALID;
+#endif
+#undef RETURN_INVALID
+        /* Oversized tail block: hand its bytes back to the stack. */
+#ifdef BSTACK_FEATURE_ATOMIC
+        {
+            int ok = 0;
+            if (bstack_try_discard(bs, end, (size_t)size, &ok)) return -1;
+            if (ok) return 0;
+        }
+#else
+        {
+            uint64_t tail;
+            if (bstack_len(bs, &tail)) return -1;
+            if (end == tail)
+                return bstack_discard(bs, (size_t)size) == 0 ? 0 : -1;
+        }
+#endif /* BSTACK_FEATURE_ATOMIC */
+    }
+
+    /* Free-list splice: a mid-way failure may leave the block partially
+     * spliced, so the handle can no longer be safely returned (-2). */
+    return alsg_push(bs, block_start, size, class) == 0 ? 0 : -2;
+}
+
+static int alsg_vt_realloc(bstack_allocator_t *base, bstack_slice_t s,
+                           uint64_t new_len, bstack_slice_t *out)
+{
+    segregated_bstack_allocator_t *a = (segregated_bstack_allocator_t *)base;
+    bstack_t      *bs = a->bs;
+    bstack_slice_t recovered, result;
+    uint64_t       start = s.offset, old_len = s.len;
+    uint64_t       block_start, word, old_size, new_size, old_end, need_o, need_n;
+    uint8_t        buf[8];
+
+    /* Empty handle: realloc is a fresh alloc. */
+    if (s.len == 0 && s.offset == 0) {
+        if (alsg_vt_alloc(base, new_len, out)) {
+            out->allocator = base; out->offset = 0; out->len = 0;
+            return -1;
+        }
+        return 0;
+    }
+    /* new_len == 0: dealloc consumes s; propagate its survivor signal. */
+    if (new_len == 0) {
+        int dr = alsg_vt_dealloc(base, s);
+        if (dr) {
+            if (dr == -1) { out->allocator = base; out->offset = start; out->len = old_len; }
+            return dr;
+        }
+        out->allocator = base; out->offset = 0; out->len = 0;
+        return 0;
+    }
+
+    /* The surviving allocation to hand back on failure — the original block,
+     * updated to the new region only once a move has committed it.  Every path
+     * below leaves it valid, so `goto fail_recover` always fails -1 (survived).
+     * `result` is the region to hand back on success (`goto success`). */
+    recovered.allocator = base; recovered.offset = start; recovered.len = old_len;
+
+    if (alsg_block_start_of(start, &block_start)) goto fail_recover;
+    if (new_len == old_len) {
+        result.offset = start; result.len = old_len; goto success;
+    }
+
+    if (bstack_get(bs, block_start, block_start + 8, buf)) goto fail_recover;
+    word = read_le64(buf);
+    if ((word & ALSG_IN_USE_BIT) == 0) goto fail_invalid;
+    if ((word & ~ALSG_IN_USE_BIT) != old_len) goto fail_invalid;
+
+    need_o = alsg_phys_need(old_len);
+    need_n = alsg_phys_need(new_len);
+    if (need_o == 0 || need_n == 0) goto fail_invalid;
+    old_size = alsg_class_blocksize(need_o);
+    new_size = alsg_class_blocksize(need_n);
+
+    /* Same class: the block already fits.  Zero the newly-exposed bytes on grow
+     * before the length commit so a crash never exposes them. */
+    if (new_size == old_size) {
+        if (new_len > old_len) {
+            uint64_t z = new_len - old_len;
+#if UINT64_MAX > SIZE_MAX
+            if (z > (uint64_t)SIZE_MAX) goto fail_invalid;
+#endif
+            if (bstack_zero(bs, start + old_len, (size_t)z)) goto fail_recover;
+        }
+        write_le64(buf, ALSG_IN_USE_BIT | new_len);
+        if (bstack_set(bs, block_start, buf, 8)) goto fail_recover;
+        result.offset = start; result.len = new_len; goto success;
+    }
+
+    old_end = block_start + old_size;
+
+    /* Grow at the tail: extend in place, zero the old slack, commit the length. */
+    if (new_size > old_size) {
+        uint64_t delta = new_size - old_size;
+        int grew = 0;
+#if UINT64_MAX > SIZE_MAX
+        if (delta > (uint64_t)SIZE_MAX) goto fail_invalid;
+#endif
+#ifdef BSTACK_FEATURE_ATOMIC
+        {
+            int ok = 0;
+            if (bstack_try_extend_zeros(bs, old_end, (size_t)delta, &ok)) goto fail_recover;
+            grew = ok;
+        }
+#else
+        {
+            uint64_t tail;
+            if (bstack_len(bs, &tail)) goto fail_recover;
+            if (old_end == tail) {
+                if (bstack_extend(bs, (size_t)delta, NULL)) goto fail_recover;
+                grew = 1;
+            }
+        }
+#endif
+        if (grew) {
+            uint64_t slack = (old_size - ALSG_OVERHEAD) - old_len;
+            if (slack > 0) {
+#if UINT64_MAX > SIZE_MAX
+                if (slack > (uint64_t)SIZE_MAX) goto fail_invalid;
+#endif
+                if (bstack_zero(bs, start + old_len, (size_t)slack)) goto fail_recover;
+            }
+            write_le64(buf, ALSG_IN_USE_BIT | new_len);
+            if (bstack_set(bs, block_start, buf, 8)) goto fail_recover;
+            result.offset = start; result.len = new_len; goto success;
+        }
+        /* Not at tail: fall through to the move. */
+    }
+
+    /* Shrink at the tail: commit the new length first (leak-preferring), then
+     * drop the excess in place. */
+    if (new_size < old_size) {
+        uint64_t tail;
+        if (bstack_len(bs, &tail)) goto fail_recover;
+        if (old_end == tail) {
+            uint64_t delta = old_size - new_size;
+#if UINT64_MAX > SIZE_MAX
+            if (delta > (uint64_t)SIZE_MAX) goto fail_invalid;
+#endif
+            write_le64(buf, ALSG_IN_USE_BIT | new_len);
+            if (bstack_set(bs, block_start, buf, 8)) goto fail_recover;
+#ifdef BSTACK_FEATURE_ATOMIC
+            {
+                int ok = 0;
+                if (bstack_try_discard(bs, old_end, (size_t)delta, &ok)) goto fail_recover;
+                if (ok) { result.offset = start; result.len = new_len; goto success; }
+                /* Lost race (concurrent tail extension): revert the length and
+                 * fall through to the in-place carve. */
+                write_le64(buf, ALSG_IN_USE_BIT | old_len);
+                if (bstack_set(bs, block_start, buf, 8)) goto fail_recover;
+            }
+#else
+            if (bstack_discard(bs, (size_t)delta)) goto fail_recover;
+            result.offset = start; result.len = new_len; goto success;
+#endif
+        }
+    }
+
+#ifdef BSTACK_FEATURE_ATOMIC
+    /* Non-tail shrink: keep the block at the new class and free the excess tail
+     * in place as one crash-atomic carve. */
+    if (new_size < old_size) {
+        uint8_t prefix[8];
+        write_le64(prefix, ALSG_IN_USE_BIT | new_len);
+        if (alsg_commit_carve(bs, block_start, prefix, 8,
+            block_start + new_size, old_size - new_size))
+            goto fail_recover;
+        result.offset = start; result.len = new_len; goto success;
+    }
+#endif
+
+    /* Move: alloc the new class, having it read the surviving prefix straight
+     * from the old block into its claim buffer, then free the old block.
+     * Handles non-tail grow (both builds) and, without atomic, the non-tail
+     * shrink that fell through above. */
+    {
+        uint64_t copy_len = old_len < new_len ? old_len : new_len;
+        uint64_t new_ptr;
+        bstack_slice_t old_s;
+        if (alsg_alloc_raw(bs, new_len, 1, start, copy_len, &new_ptr)) goto fail_recover;
+        /* New region committed and populated; it is now the survivor. */
+        recovered.allocator = base; recovered.offset = new_ptr; recovered.len = new_len;
+        old_s.allocator = base; old_s.offset = start; old_s.len = old_len;
+        if (alsg_vt_dealloc(base, old_s)) goto fail_recover;
+        result.offset = new_ptr; result.len = new_len; goto success;
+    }
+
+success:
+    result.allocator = base;
+    *out = result;
+    return 0;
+fail_invalid:
+    errno = EINVAL;
+fail_recover:
+    *out = recovered;
+    return -1;
+}
+
+static const bstack_allocator_vtbl_t alsg_allocator_vtbl = {
+    alsg_vt_stack,
+    alsg_vt_alloc,
+    alsg_vt_realloc,
+    alsg_vt_dealloc,
+};
+
+/* ---- public API -------------------------------------------------------- */
+
+segregated_bstack_allocator_t *segregated_bstack_allocator_new(bstack_t *bs)
+{
+    segregated_bstack_allocator_t *a;
+    int is_empty;
+
+    if (bstack_is_empty(bs, &is_empty)) return NULL;
+
+    a = malloc(sizeof *a);
+    if (!a) { errno = ENOMEM; return NULL; }
+    a->base.vtbl      = &alsg_allocator_vtbl;
+    a->base.bulk_vtbl = NULL;
+    a->bs             = bs;
+
+    if (is_empty) {
+        /* Fresh: write the header (reserved + magic) and a zeroed free_head
+         * table, growing straight to the arena start in one sparse write. */
+        uint8_t hdr[ALSG_OFFSET_SIZE + 8];
+        memset(hdr, 0, sizeof hdr);
+        memcpy(hdr + (size_t)ALSG_OFFSET_SIZE, alsg_magic, 8);
+        if (bstack_extend_sparse(bs, hdr, sizeof hdr, ALSG_ARENA_START, NULL)) goto fail_free;
+        return a;
+    }
+
+    /* Reopen: validate the header, pad a short table region, then recover. */
+    {
+        uint64_t stack_len;
+        uint8_t  magic[8];
+        if (bstack_len(bs, &stack_len)) goto fail_free;
+        if (stack_len < ALSG_FREE_HEAD_BASE) goto fail_invalid;
+        if (bstack_get(bs, ALSG_OFFSET_SIZE, ALSG_OFFSET_SIZE + 8, magic)) goto fail_free;
+        if (memcmp(magic, alsg_magic_prefix, sizeof alsg_magic_prefix)) goto fail_invalid;
+        if (stack_len < ALSG_ARENA_START) {
+            uint64_t needed = ALSG_ARENA_START - stack_len;
+#if UINT64_MAX > SIZE_MAX
+            if (needed > (uint64_t)SIZE_MAX) goto fail_invalid;
+#endif
+            if (bstack_extend(bs, (size_t)needed, NULL)) goto fail_free;
+        } else if ((stack_len - ALSG_ARENA_START) % ALSG_QUANTUM) {
+fail_invalid:
+            errno = EINVAL; free(a); return NULL;
+        }
+        /* Quiescent: `a` has not escaped this function. */
+        if (segregated_bstack_allocator_recover(a, NULL)) {
+fail_free:
+            free(a); return NULL;
+        }
+        return a;
+    }
+}
+
+void segregated_bstack_allocator_free(segregated_bstack_allocator_t *alloc)
+{
+    free(alloc);
+}
+
+bstack_t *segregated_bstack_allocator_into_stack(
+    segregated_bstack_allocator_t *alloc)
+{
+    bstack_t *bs = alloc->bs; free(alloc);
+    return bs;
+}
+
 #endif /* BSTACK_FEATURE_SET */
 
 #ifdef __cplusplus
