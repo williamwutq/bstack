@@ -939,6 +939,124 @@ bstack_t *checked_slab_bstack_allocator_into_stack(
 uint64_t checked_slab_bstack_allocator_data_size(
     const checked_slab_bstack_allocator_t *alloc);
 
+/* =========================================================================
+ * segregated_bstack_allocator_t — segregated (binned) free-list allocator
+ *   **experimental**
+ *
+ * Generalises the fixed-block checked slab to 33 size classes sharing one
+ * arena: 16 linear (16‥256 B, step 16), 16 geometric (320‥4096 B, 4 per
+ * octave), and one shared oversized bucket.  Each class is an independent
+ * intrusive free list; the class is derived from the request by register
+ * arithmetic (no tables) for O(1) classed alloc/dealloc.  The size→class
+ * policy is a compile-time constant encoded by the magic version, not stored
+ * per-file — a format change bumps the magic.
+ *
+ * On-disk layout (all within the bstack payload):
+ *   [0..24)  — reserved (OFFSET_SIZE; available for caller use)
+ *   [24..32) — magic: "ALSG\x00\x01\x00\x00"
+ *   [32..40) — reserved (no field yet)
+ *   [40..40+NUM_CLASSES*8) — free_head[NUM_CLASSES] (last entry = oversized list)
+ *   [ARENA_START..) — block arena (16-byte aligned; ARENA_START = 304)
+ *
+ * Every arena block is [ overhead(8) | data(block − 8) ]; the caller pointer is
+ * the data start (block_start + 8, always of the form 16n + 8).  The overhead is
+ * a single tagged word: high bit set ⇒ in use, low 63 bits = the caller's exact
+ * slice length; high bit clear ⇒ free, low 63 bits = physical block size >> 4
+ * (which doubles as the class tag).  A free block stores its next_free offset
+ * inline at the data start, so live allocations carry no overhead beyond the
+ * 8-byte word.  Leaked blocks are reclaimable by a linear scan and double-frees
+ * are caught.
+ *
+ * Allocation:
+ *   len == 0           → null sentinel slice (offset = 0, len = 0)
+ *   classed request    → pop the class head, else extend a fresh class block
+ *   oversized request  → reuse an exact/large-enough oversized head (carving any
+ *                        excess), else extend
+ *
+ * Reallocation:
+ *   same class         → rewrite overhead len; zero the grown tail on grow
+ *   grow at tail       → extend in place (zero-filled), then rewrite len
+ *   shrink at tail     → rewrite len, then discard the excess tail
+ *   non-tail shrink    → rewrite len + greedy-carve the freed tail into free
+ *                        blocks — one crash-atomic transaction (atomic); a move
+ *                        without atomic
+ *   non-tail grow      → alloc new class, copy, dealloc old
+ *
+ * Crash consistency: every path only ever *leaks* on a mid-op failure, never
+ * corrupts — leak-preferring tail ops leave an orphaned tail that recover()
+ * reclaims, and the atomic non-tail carve commits length + carve as one
+ * transaction.  segregated_bstack_allocator_recover rebuilds every free list
+ * from a single linear arena scan and reclaims leaked blocks.
+ *
+ * Thread safety: without -DBSTACK_FEATURE_ATOMIC an allocator handle must be
+ * used from one thread at a time — free-list mutations read then write a head as
+ * separate bstack calls.  With -DBSTACK_FEATURE_ATOMIC alloc/dealloc/realloc take
+ * no allocator-level lock: free-list pops ride a single bstack_process_gen
+ * sequence, pushes and the non-tail carve ride bstack_inplace_gen, and the tail
+ * grow/shrink/oversized-discard paths use bstack_try_extend_zeros /
+ * bstack_try_discard (check-and-act atomically under bstack's own write lock).
+ * The handle carries no mutex at all; recover() is the sole exception and
+ * requires a quiescent allocator (see its contract).
+ *
+ * Experimental: the on-disk format (ALSG magic) and API are not yet stable, and
+ * the background coalescer and deep in-use-leak GC are unimplemented.
+ *
+ * Requires -DBSTACK_FEATURE_SET.
+ * ====================================================================== */
+
+typedef struct {
+    bstack_allocator_t base; /* must be first — safe cast to bstack_allocator_t * */
+    bstack_t          *bs;
+} segregated_bstack_allocator_t;
+
+/*
+ * Open or initialise a segregated_bstack_allocator_t over bs.
+ *
+ * - Empty stack: writes the allocator header (reserved + magic + zeroed
+ *   free_head table) and returns a fresh allocator.
+ * - Non-empty stack: validates the ALSG 0.1 magic prefix and arena alignment,
+ *   pads a short header region with zeros, then runs recovery (rebuild every
+ *   free list from a linear scan, reclaim leaks, discard any orphaned tail)
+ *   before returning.
+ *
+ * Returns NULL on failure (errno = EINVAL for bad magic/misaligned arena,
+ * ENOMEM on allocation failure, or the errno from any failing bstack op).
+ * Cast the result to bstack_allocator_t * to use the generic interface.
+ */
+segregated_bstack_allocator_t *segregated_bstack_allocator_new(bstack_t *bs);
+
+/*
+ * Repair the allocator after an unclean shutdown: rebuild every free list from a
+ * single linear scan of the arena's overhead words (reclaiming any block leaked
+ * by a crashed alloc pop/claim), discard a fully-zeroed orphaned tail, and
+ * publish the rebuilt head table as one crash-atomic bstack_set.  Idempotent and
+ * crash-safe by re-running.  Writes *out_unsure (if non-NULL) with the count of
+ * blocks that could not be classified with certainty (0 = fully recovered).
+ *
+ * The caller must guarantee the allocator is QUIESCENT for the call: no other
+ * thread may run any alloc/dealloc/realloc (or another recover) concurrently —
+ * recover snapshots the arena then replaces the whole head table wholesale, and
+ * a concurrent operation between the snapshot and the flip would be clobbered.
+ * segregated_bstack_allocator_new satisfies this by running it before the handle
+ * escapes.
+ *
+ * Returns 0 on success, -1 on I/O error (errno set).
+ */
+int segregated_bstack_allocator_recover(segregated_bstack_allocator_t *alloc,
+                                         uint64_t *out_unsure);
+
+/*
+ * Free the allocator wrapper without closing the underlying bstack.
+ */
+void segregated_bstack_allocator_free(segregated_bstack_allocator_t *alloc);
+
+/*
+ * Consume the allocator: free the wrapper and return the underlying bstack.
+ * The returned bstack_t * must eventually be passed to bstack_close.
+ */
+bstack_t *segregated_bstack_allocator_into_stack(
+    segregated_bstack_allocator_t *alloc);
+
 #endif /* BSTACK_FEATURE_SET */
 
 #ifdef __cplusplus
