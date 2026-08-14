@@ -443,6 +443,31 @@ pub const STD_WAL_ANCHOR: u64 = 8;
 // SAFETY: each of these allocators documents a user-reserved region at payload
 // offset 0 (≥ 16 bytes) that it never allocates from and never writes to; the
 // `[8, 16)` slot sits inside it and persists across open/close.
+/// Emit the three `BStackRaiiAllocator` bulk overrides — `alloc_many` / `free_many`
+/// routed through the atomic [`alloc_bulk`](BStackBulkAllocator::alloc_bulk) /
+/// [`dealloc_bulk`](BStackBulkAllocator::dealloc_bulk), and `atomic_bulk` returning
+/// `true` — for a concrete allocator that also implements [`BStackBulkAllocator`].
+///
+/// Invoked inside an `unsafe impl BStackRaiiAllocator` body; the rest of the impl
+/// (e.g. `wal_anchor`) is still written per type. This is a macro rather than a
+/// blanket `impl<A: BStackBulkAllocator>` because that impl can't exist: it would
+/// collide with the per-type `unsafe impl`s (coherence), can't vary `wal_anchor` by
+/// type, and can't blanket-assert each allocator's null-niche safety — and stable
+/// Rust has no specialization to say "override only when also bulk".
+macro_rules! bulk_raii_methods {
+    () => {
+        fn alloc_many(&self, sizes: &[u64]) -> io::Result<Vec<BStackRange>> {
+            bulk_alloc_many(self, sizes)
+        }
+        fn free_many(&self, ranges: impl IntoIterator<Item = BStackRange>) -> io::Result<()> {
+            bulk_free_many(self, ranges)
+        }
+        fn atomic_bulk(&self) -> bool {
+            true
+        }
+    };
+}
+
 unsafe impl BStackRaiiAllocator for bstack::FirstFitBStackAllocator {
     fn wal_anchor(&self) -> Option<u64> {
         Some(STD_WAL_ANCHOR)
@@ -452,17 +477,9 @@ unsafe impl BStackRaiiAllocator for bstack::GhostTreeBstackAllocator {
     fn wal_anchor(&self) -> Option<u64> {
         Some(STD_WAL_ANCHOR)
     }
-    // GhostTree implements `BStackBulkAllocator`, so route the multi-block helpers
-    // through the atomic bulk ops (see [`bulk_alloc_many`] / [`bulk_free_many`]).
-    fn alloc_many(&self, sizes: &[u64]) -> io::Result<Vec<BStackRange>> {
-        bulk_alloc_many(self, sizes)
-    }
-    fn free_many(&self, ranges: impl IntoIterator<Item = BStackRange>) -> io::Result<()> {
-        bulk_free_many(self, ranges)
-    }
-    fn atomic_bulk(&self) -> bool {
-        true
-    }
+    // GhostTree implements `BStackBulkAllocator` — route the multi-block helpers
+    // through the atomic bulk ops.
+    bulk_raii_methods!();
 }
 unsafe impl BStackRaiiAllocator for bstack::SlabBStackAllocator {
     fn wal_anchor(&self) -> Option<u64> {
@@ -479,15 +496,7 @@ unsafe impl BStackRaiiAllocator for bstack::CheckedSlabBStackAllocator {
 // `BStackBulkAllocator`, so it can still route the multi-block helpers through the
 // atomic bulk ops.
 unsafe impl BStackRaiiAllocator for bstack::LinearBStackAllocator {
-    fn alloc_many(&self, sizes: &[u64]) -> io::Result<Vec<BStackRange>> {
-        bulk_alloc_many(self, sizes)
-    }
-    fn free_many(&self, ranges: impl IntoIterator<Item = BStackRange>) -> io::Result<()> {
-        bulk_free_many(self, ranges)
-    }
-    fn atomic_bulk(&self) -> bool {
-        true
-    }
+    bulk_raii_methods!();
 }
 
 /// The bulk override shared by every [`BStackBulkAllocator`]: allocate all `sizes`
