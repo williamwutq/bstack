@@ -31,11 +31,23 @@
 //!    and flush every payload write as one crash-atomic [`BStack::set_batched`]
 //!    batch (the new blocks are distinct ranges, so the writes never overlap).
 //!
-//! A crash *between* the phases leaks the allocated-but-uncommitted blocks (a
-//! recoverable leak, since the clone result is not yet reachable from any
-//! persistent root) but never a torn write.
+//! A crash *between* the phases would leak the allocated-but-uncommitted blocks,
+//! never a torn write (the clone result is not yet reachable from any persistent
+//! root). When the allocator names a WAL anchor ([`BStackRaiiAllocator::wal_anchor`]
+//! returns `Some`), phase 1 is additionally **intention-first**: each allocation is
+//! logged `Pending` to the persistent WAL block the instant it is made
+//! ([`ClonePlan::alloc_raw`]), so a crash mid-descent is *reclaimed* by
+//! [`crate::wal::finish`] on the next open — down to a one-block window (the block
+//! allocated but not yet logged). The phase-2 commit flips that transaction
+//! `Complete` inside the same atomic batch, so "clone committed" and "WAL Complete"
+//! are one event. Because the WAL block is a single-writer-per-file singleton, the
+//! plan holds the file's WAL lock for the whole descent; concurrent deep clones on
+//! the *same* file therefore serialize (they still run fully concurrently across
+//! different files). An allocator that names no anchor keeps the plain two-phase
+//! behaviour (mid-descent crash ⇒ orphan leak).
 
 use std::io;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use bstack::{BStackGenOp, BStackRange};
 
@@ -47,7 +59,8 @@ use crate::reference::BStackRef;
 use crate::teardown::{BStackDrop, dealloc_range};
 use crate::vec::{BYTEVEC_HEADER, VecDesc};
 use crate::wal::{
-    WalEntry, WalLog, WalStatus, finish_at_locked, persist_at, wal_lock_for, wal_set_idle,
+    WalEntry, WalLog, WalStatus, finish_at_locked, persist_at, wal_append_alloc, wal_capacity_of,
+    wal_lock_for, wal_set_idle,
 };
 
 /// Duplicate `self`, performing any fallible I/O the duplication requires,
@@ -104,6 +117,60 @@ pub struct ClonePlan {
     /// Absolute offsets of `u64` counters to increment by 1 at commit (the
     /// strong/weak counts a `#[bstack_strong]` / `#[bstack_weak]` clone acquires).
     bumps: Vec<u64>,
+    /// The intention-first WAL transaction, lazily begun on the first allocation
+    /// through [`alloc_raw`](Self::alloc_raw) when the allocator names a WAL anchor
+    /// (`None` until then, or forever if the allocator opts out of reclamation). Its
+    /// [`HeldLock`] pins the file's WAL lock for the whole descent + commit; the
+    /// invariant is that its logged `Pending` `Alloc` entries are *exactly*
+    /// [`allocated`](Self::allocated), so [`finish`](crate::wal::finish) reclaims
+    /// precisely those on abandon.
+    wal: Option<CloneWal>,
+}
+
+/// The in-flight intention-first WAL transaction of a [`ClonePlan`]: the file's
+/// WAL lock held for the descent, plus the persistent block's offset, entry-slot
+/// capacity, and how many entries have been published so far.
+struct CloneWal {
+    /// Holds the file's WAL lock until the plan is committed / rolled back.
+    _held: HeldLock,
+    /// Offset of the persistent WAL block (moves if a grow reallocates it).
+    block_off: u64,
+    /// Entry slots the block currently has.
+    capacity: u64,
+    /// Entries published so far (== `ClonePlan::allocated.len()`).
+    logged: u64,
+}
+
+/// The file's WAL [`Mutex`] held across a whole clone transaction. It owns the
+/// `Arc` so the lifetime-extended guard can never outlive the mutex it borrows;
+/// `Drop` releases the guard *before* the `Arc` is dropped.
+struct HeldLock {
+    /// `Some` while held; taken in `Drop` so the guard releases before `_arc`.
+    guard: Option<MutexGuard<'static, ()>>,
+    /// Keeps the mutex alive for as long as `guard` borrows it.
+    _arc: Arc<Mutex<()>>,
+}
+
+impl HeldLock {
+    fn acquire(arc: Arc<Mutex<()>>) -> Self {
+        let guard = arc.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: the guard borrows the `Mutex` owned by `arc`, which this struct
+        // keeps alive; `Drop` releases the guard before `arc` is dropped, so the
+        // borrow never dangles. The transmute only extends the guard's lifetime to
+        // `'static` to store it alongside its owning `Arc`.
+        let guard: MutexGuard<'static, ()> = unsafe { core::mem::transmute(guard) };
+        HeldLock {
+            guard: Some(guard),
+            _arc: arc,
+        }
+    }
+}
+
+impl Drop for HeldLock {
+    fn drop(&mut self) {
+        // Release the guard before `_arc` drops (which would free the `Mutex`).
+        self.guard = None;
+    }
 }
 
 impl Default for ClonePlan {
@@ -119,6 +186,7 @@ impl ClonePlan {
             allocated: Vec::new(),
             writes: Vec::new(),
             bumps: Vec::new(),
+            wal: None,
         }
     }
 
@@ -126,6 +194,15 @@ impl ClonePlan {
     /// for rollback. The caller supplies the block's bytes later via
     /// [`write`](Self::write). The allocator's owned-slice handle is not RAII, so
     /// letting it drop here does not free the block.
+    ///
+    /// This is the single funnel for every deep-clone allocation (plain child
+    /// blocks and, via [`stage_bytevec`](Self::stage_bytevec), vec data blocks), so
+    /// it is also where the **intention-first WAL** hooks in: when the allocator
+    /// names a WAL anchor, the freshly allocated block is logged `Pending` before
+    /// this returns, so a crash mid-descent is reclaimed on the next open. The
+    /// allocation and its log entry are kept in lockstep — if logging fails the
+    /// block is freed again before returning the error — so the WAL's live entries
+    /// always equal [`allocated`](Self::allocated).
     pub fn alloc_raw<A: BStackRaiiAllocator>(
         &mut self,
         allocator: &A,
@@ -133,8 +210,64 @@ impl ClonePlan {
     ) -> io::Result<BStackRange> {
         let slice = allocator.alloc(size)?;
         let range = slice.as_range();
+        if allocator.wal_anchor().is_some()
+            && let Err(e) = self.wal_log_alloc(allocator, range)
+        {
+            // Keep `allocated`/logged in sync: undo this alloc, log nothing.
+            let _ = allocator.dealloc(slice);
+            return Err(e);
+        }
         self.allocated.push(range);
         Ok(range)
+    }
+
+    /// Log a just-made allocation to the intention-first WAL, (lazily) beginning
+    /// the transaction on the first call. Cheap append (one entry + a `count` bump)
+    /// while the block has spare slots; a full re-[`persist_at`] — which grows the
+    /// block — when it is full. `self.allocated` does **not** yet contain `range`
+    /// (the caller pushes it only after this succeeds), so the grow path logs the
+    /// whole of `allocated` *plus* `range`.
+    fn wal_log_alloc<A: BStackRaiiAllocator>(
+        &mut self,
+        allocator: &A,
+        range: BStackRange,
+    ) -> io::Result<()> {
+        match &mut self.wal {
+            None => {
+                // First allocation: take the file's WAL lock for the whole descent
+                // and stage a `Pending` block holding this one entry.
+                let held = HeldLock::acquire(wal_lock_for(allocator));
+                let mut log = WalLog::with_capacity(1);
+                log.append(WalEntry::alloc(WalStatus::Pending, range));
+                let block = persist_at(allocator, &log, WalStatus::Pending)?;
+                self.wal = Some(CloneWal {
+                    _held: held,
+                    block_off: block.start(),
+                    capacity: wal_capacity_of(block),
+                    logged: 1,
+                });
+                Ok(())
+            }
+            Some(w) if w.logged < w.capacity => {
+                wal_append_alloc(allocator, w.block_off, w.logged, range)?;
+                w.logged += 1;
+                Ok(())
+            }
+            Some(w) => {
+                // Block full: re-persist the whole log (all of `allocated` plus this
+                // new entry), which grows the block to the next power of two.
+                let mut log = WalLog::with_capacity(self.allocated.len() + 1);
+                for &r in &self.allocated {
+                    log.append(WalEntry::alloc(WalStatus::Pending, r));
+                }
+                log.append(WalEntry::alloc(WalStatus::Pending, range));
+                let block = persist_at(allocator, &log, WalStatus::Pending)?;
+                w.block_off = block.start();
+                w.capacity = wal_capacity_of(block);
+                w.logged = self.allocated.len() as u64 + 1;
+                Ok(())
+            }
+        }
     }
 
     /// Record a pending in-place write of `bytes` at absolute `offset`.
@@ -195,10 +328,22 @@ impl ClonePlan {
         self.bumps.push(ctrl_off + layout::CTRL_WEAK_OFFSET);
     }
 
-    /// Free everything allocated so far, in reverse order. The error path, taken
-    /// when planning fails before [`commit`](Self::commit).
+    /// Free everything allocated so far. The error path, taken when planning fails
+    /// before [`commit`](Self::commit).
+    ///
+    /// With an intention-first WAL in flight, the fresh allocations are logged
+    /// `Pending`, so this abandons that transaction via [`finish`](crate::wal::finish)
+    /// (freeing exactly the logged allocs — which equal `allocated` — and marking the
+    /// persistent block idle), the same path a real crash takes; the WAL lock is held
+    /// by `self` and released as it drops. Without a WAL the ranges are freed directly.
     pub fn rollback<A: BStackRaiiAllocator>(self, allocator: &A) {
-        Self::free_all(self.allocated, allocator);
+        if self.wal.is_some() {
+            // Abandon the still-`Pending` transaction; `self` (and its held WAL lock)
+            // drops at the end of this call, after the reclamation has run.
+            let _ = finish_at_locked(allocator);
+        } else {
+            Self::free_all(self.allocated, allocator);
+        }
     }
 
     /// Commit the whole plan as **one** crash-atomic unit: every refcount bump
@@ -215,59 +360,25 @@ impl ClonePlan {
     ///
     /// **Crash reclamation is automatic**: when the allocator names a WAL anchor
     /// ([`BStackRaiiAllocator::wal_anchor`] returns `Some`), the plan's fresh
-    /// allocations are logged `Pending` before the commit and reclaimed by
-    /// [`crate::wal::finish`] on the next open if the process dies mid-commit; the
+    /// allocations were already logged `Pending` *during the descent*
+    /// ([`alloc_raw`](Self::alloc_raw)) and are reclaimed by [`crate::wal::finish`]
+    /// on the next open if the process dies before the commit lands; here that
     /// transaction is flipped `Complete` *inside* the commit batch, so "clone
     /// committed" and "WAL Complete" are the same atomic event. An allocator that
     /// returns `None` behaves exactly as before (mid-commit crash ⇒ orphan leak).
     pub fn commit<A: BStackRaiiAllocator>(self, allocator: &A) -> io::Result<()> {
-        let anchor = allocator.wal_anchor();
-        self.commit_inner(allocator, anchor)
-    }
-
-    fn commit_inner<A: BStackRaiiAllocator>(
-        self,
-        allocator: &A,
-        anchor: Option<u64>,
-    ) -> io::Result<()> {
         let ClonePlan {
             allocated,
             writes,
             mut bumps,
+            wal,
         } = self;
         let stack = allocator.stack();
 
-        // Serialize the WAL transaction against other WAL-backed ops on this file
-        // (the persistent block + anchor are single-writer). Held for the whole
-        // commit; `None` when this clone isn't WAL-backed. `_wal_lock` must outlive
-        // `_wal_guard`, so it is bound first.
-        let _wal_lock = anchor.map(|_| wal_lock_for(allocator));
-        let _wal_guard = _wal_lock
-            .as_ref()
-            .map(|l| l.lock().unwrap_or_else(|e| e.into_inner()));
-
-        // With a WAL anchor, protect this clone's fresh allocations: log them
-        // `Pending` before the commit, so a crash mid-commit is reclaimed by
-        // `finish` on the next open. The transaction is flipped `Complete` *inside*
-        // the commit batch below, so "clone committed" and "WAL Complete" are the
-        // same atomic event.
-        let wal: Option<BStackRange> = match anchor {
-            Some(_) if !allocated.is_empty() => {
-                let mut log = WalLog::with_capacity(allocated.len());
-                for &r in &allocated {
-                    log.append(WalEntry::alloc(WalStatus::Pending, r));
-                }
-                match persist_at(allocator, &log, WalStatus::Pending) {
-                    Ok(range) => Some(range),
-                    Err(e) => {
-                        // Couldn't stage the WAL — fall back to an immediate rollback.
-                        Self::free_all(allocated, allocator);
-                        return Err(e);
-                    }
-                }
-            }
-            _ => None,
-        };
+        // The WAL transaction (if any) was staged `Pending` incrementally during the
+        // descent and its file lock is held by `wal._held`; here we only flip it
+        // `Complete` inside the commit batch. A clone with no allocations has no WAL
+        // (and needs no lock — the bumps ride bstack's own per-op atomicity).
 
         // De-duplicate bump offsets into distinct `(counter, delta)`.
         bumps.sort_unstable();
@@ -290,7 +401,7 @@ impl ClonePlan {
         // The WAL commit marker (`WalHeader.txn_status`, the byte after the u64
         // magic). Written last, so it lands in the same atomic batch as the clone.
         let flip = [WalStatus::Complete as u8];
-        let flip_off = wal.map(|r| r.start() + 8);
+        let flip_off = wal.as_ref().map(|w| w.block_off + 8);
         let mut flipped = flip_off.is_none();
 
         let mut read_i = 0usize;
@@ -364,7 +475,7 @@ impl ClonePlan {
 
         match result {
             Ok(()) if overflow => {
-                Self::reclaim(allocated, wal, allocator);
+                Self::reclaim(&wal, allocated, allocator);
                 Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "refcount overflow while committing clone",
@@ -376,33 +487,35 @@ impl ClonePlan {
                 // nothing to roll forward: just mark the persistent block idle for
                 // reuse (a crash before this is harmlessly finished on the next open,
                 // freeing nothing). The block itself is never freed.
-                if let Some(wal_range) = wal {
-                    let _ = wal_set_idle(allocator, wal_range.start());
+                if let Some(w) = &wal {
+                    let _ = wal_set_idle(allocator, w.block_off);
                 }
                 Ok(())
             }
             // `inplace_gen` is atomic: on error nothing committed. Reclaim the
             // plan's allocations (via the WAL if present, else directly).
             Err(e) => {
-                Self::reclaim(allocated, wal, allocator);
+                Self::reclaim(&wal, allocated, allocator);
                 Err(e)
             }
         }
+        // `wal` (holding the file's WAL lock) drops here, after reclamation.
     }
 
     /// Reclaim a failed commit's allocations. With a WAL, `finish_at_locked`
     /// abandons the still-`Pending` transaction — freeing the logged alloc orphans
-    /// and marking the persistent block idle — matching exactly what `finish` would
-    /// do after a real crash; without one, free them directly. The WAL lock is
-    /// already held by the caller (`commit_inner`), so the *locked* variant is used.
+    /// (exactly `allocated`) and marking the persistent block idle — matching what
+    /// `finish` does after a real crash; without one, free them directly. The WAL
+    /// lock is held by the still-live `wal` in the caller, so the *locked* variant
+    /// is used.
     fn reclaim<A: BStackRaiiAllocator>(
+        wal: &Option<CloneWal>,
         allocated: Vec<BStackRange>,
-        wal: Option<BStackRange>,
         allocator: &A,
     ) {
         match wal {
-            // A WAL block was staged: abandon its still-`Pending` transaction via
-            // the allocator's own anchor (same as a real crash's `finish`).
+            // A WAL transaction is in flight: abandon it via the allocator's own
+            // anchor (same as a real crash's `finish`); it frees the logged allocs.
             Some(_) => {
                 let _ = finish_at_locked(allocator);
             }

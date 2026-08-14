@@ -666,6 +666,37 @@ pub(crate) fn wal_set_idle<A: BStackRaiiAllocator>(
         .set(block_off + 8, [WalStatus::None as u8])
 }
 
+/// Offset of the header `count` field (the `u64` after the magic + `txn_status`).
+const WAL_COUNT_OFFSET: u64 = 16;
+
+/// Entry-slot capacity of a persistent WAL block, from its full range.
+pub(crate) fn wal_capacity_of(block: BStackRange) -> u64 {
+    (block.len() - size_of::<WalHeader>() as u64) / size_of::<WalEntry>() as u64
+}
+
+/// Append one `Pending` `Alloc` entry to an already-`Pending` WAL block at slot
+/// `index` (0-based, `< capacity`), then **publish** it by bumping the header
+/// `count` to `index + 1`. The entry payload is written *before* the count bump,
+/// so a crash between the two leaves the new entry unseen (recovery reads only the
+/// `count` live entries) — the incremental, intention-first form of [`persist_at`]
+/// used by a deep clone to log each allocation the instant it is made. The caller
+/// holds the file's WAL lock and guarantees the block has a slot free at `index`.
+pub(crate) fn wal_append_alloc<A: BStackRaiiAllocator>(
+    allocator: &A,
+    block_off: u64,
+    index: u64,
+    slice: BStackRange,
+) -> io::Result<()> {
+    let stack = allocator.stack();
+    let hsz = size_of::<WalHeader>() as u64;
+    let esz = size_of::<WalEntry>() as u64;
+    let entry = WalEntry::alloc(WalStatus::Pending, slice);
+    // Write the entry first; only then advance `count` to make it live.
+    stack.set(block_off + hsz + index * esz, bytemuck::bytes_of(&entry))?;
+    stack.set(block_off + WAL_COUNT_OFFSET, (index + 1).to_le_bytes())?;
+    Ok(())
+}
+
 /// Free one WAL-recorded slice during recovery, in whichever file it lives in.
 ///
 /// * `file_id == 0` ([`FileId::SELF`]) — the WAL's own file: free through the local

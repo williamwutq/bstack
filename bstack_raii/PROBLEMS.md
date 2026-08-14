@@ -17,11 +17,20 @@ omitted except where trivial.
   `allocator.atomic_bulk()` (GhostTree/Linear), skipping the WAL entirely — since
   `dealloc_bulk` is itself atomic + self-recovering, the WAL would be redundant and
   can't compose safely with it (opaque recovery direction → double-free risk).
-  Cross-file (mixed `FileId`) still uses the WAL path for registry routing. The
-  **alloc side** remains: `ClonePlan` still allocates each new block via sequential
-  `alloc_raw`. Wiring `alloc_many` into it (the intention-first `AllocReq`/`fresh_id`
-  path — bulk allocators skip the alloc-WAL entirely, non-bulk backfill each address
-  per op) is the clone-WAL round, still to be done.
+  Cross-file (mixed `FileId`) still uses the WAL path for registry routing.
+  **Alloc side (intention-first WAL) DONE 2026-08-14:** `ClonePlan::alloc_raw` now
+  logs each allocation to the persistent WAL `Pending` *during the descent* (a cheap
+  append; a full re-`persist_at` only when the block grows), holding the file's WAL
+  lock for the whole clone; the commit flips that txn `Complete` in the same atomic
+  batch. So a crash mid-descent is reclaimed by `finish` on reopen down to a one-block
+  window (was: whole partially-built subtree leaked, since the WAL was only written at
+  commit). No codegen change — every clone allocation funnels through `alloc_raw`.
+  Trade-off (deliberate, per user choice of option A over a two-pass): clone still does
+  **sequential** per-op `alloc`, not `alloc_bulk` — clone's descent needs each block's
+  real address immediately (the parent payload embeds the child offset), so gather-then-
+  `alloc_bulk` would require a second measure pass. That bulk-for-clone two-pass is the
+  only remaining alloc-side item, and is a leak/atomicity *optimization*, not correctness
+  (intention-first already makes a descent crash reclaimable).
 - **`Foreign` ↔ `bstack_move` / `bstack_cast` semantics incomplete.** Moving a
   struct with a `Foreign` field, and casting for the wide-pointer relationship,
   were flagged as still-open in the project notes; needs confirmation that
@@ -188,8 +197,10 @@ Residual points, all *leak-only* (permitted) but worth recording:
 - [FIXED] Thousands of tiny `Vec<u8>` allocations for 8-byte writes (§2) — the single
   most pervasive avoidable allocation. See §2 — replaced with `SmallBuf` in
   `stdlib/*` (no-length inline `Buf8`/`Buf40`, `Heap` fallback).
-- No bulk alloc/free in clone/teardown (§1) even when the concrete allocator
-  implements `BStackBulkAllocator`.
+- No bulk alloc/free in **clone** (§1) even when the concrete allocator implements
+  `BStackBulkAllocator` — clone's descent needs each block's real address up front, so
+  bulk needs a two-pass measure/build (deferred). Teardown already uses bulk (§1);
+  clone is intention-first WAL'd but still per-op `alloc`.
 - [WONTFIX] **Two round trips per `(rc, weak)` strong child in clone**: `ClonePlan::bump_strong`
   reads the child's back-pointer field during planning (`strong_parts` →
   `read_ctrl_ref`, to locate the control block), then the commit's `inplace_gen`

@@ -2703,6 +2703,45 @@ fn wal_finish_reclaims_abandoned_allocs() {
 }
 
 #[test]
+fn wal_clone_descent_orphans_reclaimed_by_finish() {
+    // Intention-first clone WAL: `ClonePlan::alloc_raw` logs every allocation to the
+    // persistent WAL *during the descent*, before any commit. Model a hard crash
+    // mid-descent by dropping the plan without `commit` or `rollback` — `ClonePlan`
+    // has no freeing `Drop`, so the two blocks stay allocated and logged `Pending`,
+    // exactly as a crashed process would leave them. `finish` on reopen must then
+    // reclaim both — the window this closes (before, a mid-descent crash leaked the
+    // whole partially-built subtree, since the WAL was only written at commit time).
+    use crate::ClonePlan;
+    use crate::wal::finish;
+
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator(); // FirstFit names a WAL anchor
+    let base = alloc.stack().len().unwrap();
+
+    {
+        let mut plan = ClonePlan::new();
+        let _a = plan.alloc_raw(&alloc, 48).unwrap();
+        let _b = plan.alloc_raw(&alloc, 64).unwrap();
+        // Drop `plan` here without committing: a crash mid-descent. The held WAL lock
+        // releases as the plan drops; the two orphans remain logged `Pending`.
+    }
+    assert!(
+        alloc.stack().len().unwrap() > base,
+        "descent allocated its blocks (+ the WAL block)"
+    );
+
+    // Recovery abandons the still-`Pending` transaction, freeing exactly the two
+    // descent-logged orphans (the persistent WAL block itself stays, idle).
+    assert_eq!(
+        finish(&alloc).unwrap(),
+        2,
+        "both mid-descent orphans reclaimed"
+    );
+    // Idempotent: nothing left to reclaim.
+    assert_eq!(finish(&alloc).unwrap(), 0);
+}
+
+#[test]
 fn wal_finish_reclaims_foreign_orphan_via_registry() {
     // Option-1 cross-file reclamation: the WAL lives on the op's HOME file, but a
     // recorded slice can name a FOREIGN file (`file_id != 0`). Recovery resolves that
