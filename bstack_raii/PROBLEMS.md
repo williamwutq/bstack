@@ -5,30 +5,21 @@ are observations to triage, not verified defects unless marked; each is brief an
 shallow by design (flagged on suspicion, not deeply investigated). Solutions are
 omitted except where trivial.
 
-## 1. Missing / incomplete features
-
-- **`Foreign` ↔ `bstack_move` / `bstack_cast` semantics incomplete.** Moving a
-  struct with a `Foreign` field, and casting for the wide-pointer relationship,
-  were flagged as still-open in the project notes; needs confirmation that
-  `bstack_move!` yields the right typed value at the foreign location.
-- **`ForeignHost` lacks batched/generator ops**, so a cross-file clone's home
-  commit and foreign side cannot be one atomic unit (best-effort only — see §3).
-
-## 3. Atomicity / crash safety
-
-- **Cross-file teardown frees are not WAL-protected on the *target* file.** The
-  home WAL logs `(foreign_id, range)` and `free_recorded` replays them via the
-  registry — but only if the foreign file is *attached at recovery time*. A crash
-  where the foreign file isn't re-attached on the next open loses those frees
-  (leak). Worth documenting as a recovery precondition.
-
-## 10. Feature interactions
+## Feature interactions
 
 Cross-feature combinations, both the undesirable and the confirmed-sound (recorded
 so they are not re-flagged).
 
 ### Undesirable / risky
 
+- **`bstack_move!` of an `#[bstack_owned] Foreign` hands back a non-RAII pointer.**
+  Moving an owned *in-file* field out yields a `BStackOwned<Child>` (a typed owning
+  handle with `.bstack_drop`); moving an owned *foreign* field out yields a bare
+  `Foreign<T>` — a `Copy` wide pointer with no owning-drop method — so the caller must
+  re-store it or free it via the `unsafe foreign_drop_*` helpers, and simply dropping
+  it leaks the target. Consistent with `Foreign` being a non-RAII pointer (and with
+  `BStackOwned` also freeing nothing on `Drop`), but an ergonomic asymmetry; there is
+  no `BStackOwned`-equivalent RAII wrapper for a moved-out cross-file owner.
 - **Raw `ForeignPtr` bypasses cross-file ownership.** `Foreign<T>` is deliberately
   **not `Pod`** (only `Copy`), so it is correctly rejected from every `T: Pod`
   container (`BStackBox<Foreign>`, `BStackVec<Foreign>`, a `Foreign` map/set/heap

@@ -7555,6 +7555,66 @@ fn macro_foreign_field() {
     let _ = (h, h2);
 }
 
+#[test]
+fn macro_foreign_field_bstack_move() {
+    // `bstack_move!` on a block with `Foreign` fields: it frees only the holder shell
+    // and hands each field back by value — a foreign link comes out as a resolvable
+    // `Foreign<T>` (or `Option<Foreign<T>>`) still pointing at its far-file target. It
+    // does NOT run the owning link's cross-file teardown (move defuses teardown), so the
+    // target stays live and ownership transfers to the returned pointer.
+    use crate::Foreign;
+    use crate::registry::FileRegistry;
+    use std::sync::Arc;
+
+    let reg_file = TempStack::new();
+    let foreign_file = TempStack::new();
+    let local_file = TempStack::new();
+
+    let reg = FileRegistry::open(&reg_file.path).unwrap();
+    let local = local_file.allocator();
+
+    let foreign_alloc = foreign_file.allocator();
+    let leaf = MacroLeaf::new(&foreign_alloc, 88).unwrap();
+    let off = leaf.handle().range().start();
+    let id = reg
+        .attach(&foreign_file.path, Arc::new(foreign_alloc))
+        .unwrap();
+
+    let h = ForeignHolder::new(
+        &local,
+        5,
+        Foreign::<MacroLeaf>::new(id, off),
+        Some(Foreign::<MacroLeaf>::new(id, off)),
+    )
+    .unwrap();
+
+    // Fields come back in declaration order: POD, owned link, optional ref link.
+    let (tag, owned_link, maybe): (u32, Foreign<MacroLeaf>, Option<Foreign<MacroLeaf>>) =
+        bstack_move!(h, &local).unwrap();
+
+    assert_eq!(tag, 5);
+    // The moved-out owned link is the right typed value at the far-file location: it
+    // resolves through the registry to the live target.
+    assert_eq!(
+        owned_link
+            .with_in(&reg, &local, |t, fs| t.get_val(fs).unwrap())
+            .unwrap(),
+        Some(88)
+    );
+    // The optional ref link too.
+    assert_eq!(
+        maybe
+            .expect("Some link")
+            .with_in(&reg, &local, |t, fs| t.get_val(fs).unwrap())
+            .unwrap(),
+        Some(88)
+    );
+
+    // The move did not free the target — `leaf` is still the live block on the foreign
+    // file (inert handle; the temp foreign file is cleaned up at end of test).
+    let _ = leaf;
+}
+
 // A home block holding a *strong* cross-file reference. `MacroStrongChild` is
 // `#[bstack_block(rc, weak)]`, so it is a shared target; the strong Foreign
 // participates in its refcount on the far side.

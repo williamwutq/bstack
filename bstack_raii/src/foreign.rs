@@ -12,12 +12,22 @@
 //! annotations as an in-file field — `#[bstack_owned/strong/weak/ref]` (or none) —
 //! but applied to the target `T` **in its own file**: an owning foreign pointer
 //! frees / decrements / releases the target *on the other side* at teardown, and a
-//! deep clone copies it across files. Those cross-file **teardown** and **deep
-//! clone** dispatches are still deferred; today the field is byte-copied on clone
-//! (an alias) and freed by nobody on teardown, regardless of annotation. The
-//! annotation is recorded so the eventual dispatch is per-kind. Construction,
-//! nullability (`Option<Foreign<T>>`, `offset == 0` niche), and resolution are
-//! implemented here.
+//! deep clone copies (owned) or re-references (strong/weak) it across files. Those
+//! cross-file **teardown** ([`foreign_drop_owned`]/`_strong`/`_weak`) and **deep
+//! clone** ([`foreign_clone_owned`]/`_strong`/`_weak`) dispatches run the ordinary
+//! generic machinery against a [`ForeignHostAllocator`](crate::registry::ForeignHostAllocator)
+//! over the target's live host, selected per-annotation by the generated field code;
+//! `#[bstack_ref]` aliases (byte-copied, owns nothing). Construction, nullability
+//! (`Option<Foreign<T>>`, `offset == 0` niche), and resolution are here.
+//!
+//! **Cross-file atomicity is best-effort**, and inherently so: two independent
+//! bstack files have no shared commit, so a deep clone / teardown that spans the home
+//! file and a foreign file cannot be one atomic unit. Each *file's own* commit is
+//! atomic (the foreign side runs its own crash-safe `try_clone_in` / teardown through
+//! the adapter), and the ordering always errs toward **over-provisioning** — an
+//! orphaned fresh block or an over-count, which leaks — never toward an under-count
+//! (a premature free / double-free). A target file not attached at the time makes an
+//! owning clone *error* rather than silently alias.
 
 use core::marker::PhantomData;
 use std::io;
