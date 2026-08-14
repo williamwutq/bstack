@@ -491,13 +491,11 @@ unsafe impl BStackRaiiAllocator for bstack::CheckedSlabBStackAllocator {
         Some(STD_WAL_ANCHOR)
     }
 }
-// `LinearBStackAllocator`'s `dealloc` is a no-op (nothing to reclaim), so it opts
-// out of WAL reclamation via the default `None` — but it still implements
-// `BStackBulkAllocator`, so it can still route the multi-block helpers through the
-// atomic bulk ops.
-unsafe impl BStackRaiiAllocator for bstack::LinearBStackAllocator {
-    bulk_raii_methods!();
-}
+// `LinearBStackAllocator` deliberately does **not** implement `BStackRaiiAllocator`:
+// its `alloc` is a bare `BStack::extend`, so its first allocation hands out payload
+// offset 0 — the crate's null niche — and its `dealloc` is a no-op (teardown would
+// free nothing). Both violate the trait's safety contract, so it stays out (even
+// though it implements `BStackBulkAllocator`).
 
 /// The bulk override shared by every [`BStackBulkAllocator`]: allocate all `sizes`
 /// as one atomic [`alloc_bulk`](BStackBulkAllocator::alloc_bulk) and hand back their

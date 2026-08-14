@@ -792,10 +792,16 @@ So an owned subtree is copied into independent storage while shared children are
 original's owned data, and a shared target stays live as long as either handle
 holds it.
 
-> **Atomicity.** A clone allocates the whole new subtree up front, then commits
-> every payload write as one crash-atomic batch (`BStack::set_batched`): a
-> mid-clone allocation failure rolls back with nothing written, and a crash can
-> leak the fresh allocations but never leaves a torn copy.
+> **Atomicity & crash-safety.** A clone allocates the whole new subtree up front,
+> then commits every payload write *and* refcount bump as one crash-atomic batch
+> (`BStack::inplace_gen`): a mid-clone allocation failure rolls back with nothing
+> written, and a crash never leaves a torn copy. When the allocator names a WAL
+> anchor, the fresh allocations are logged as they are made, so a crash *mid-clone*
+> is reclaimed on the next open rather than leaked (down to a one-block window) —
+> you don't opt in, and [`wal::finish`] completes it deterministically after `open`.
+> On a bulk-capable allocator (one that also implements `BStackBulkAllocator`, such
+> as `GhostTreeBstackAllocator`) the whole subtree is allocated in a single atomic
+> `alloc_bulk` instead of block by block.
 
 ### Duplicate a shared handle: `TryClone`
 
