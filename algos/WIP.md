@@ -119,9 +119,9 @@ match wins:
 
 1. **Derived atomicity.** `is_atomic_write(offset, len)` → plain `write_at` +
    sync. No journal, no `clen` change, no file-size change.
-2. **Already safe by construction.** `push`/`pop`/`extend`/`discard` commit
-   through a single atomic `clen` write. A crash rolls back by truncation.
-   Never arm `wip`.
+2. **Already safe by construction.** `push`/`pop`/`extend`/`discard` (and
+   `resize`/`ensure`/`ensure_with`, which dispatch to these) commit through a
+   single atomic `clen` write. A crash rolls back by truncation. Never arm `wip`.
 3. **Compact-journal mode.** The preconditions for `Repeat` or `Copy` hold
    (repeating pattern, or disjoint source) → use those modes; the tail is
    `O(1)` metadata, not `O(n)` bytes.
