@@ -9342,3 +9342,583 @@ fn foreign_reverse_map_and_bstack_cast() {
     assert!(!reg.is_live(id));
     assert_eq!(reg.id_of_host(la.stack()), None);
 }
+
+// --------------------------------------------------------------------------
+// Stdlib collections composed into `#[bstack_block]` / `#[bstack_enum]` types.
+// Collections are `BStackBlock + TryCloneIn` and override the `__bstack_*`
+// hooks, so they should compose anywhere a scalar block can; these tests verify
+// the compositions actually build, read back, deep-clone (independent copies),
+// and tear down (leak-free) — on both the sequential (FirstFit) and the
+// bulk/WAL (GhostTree) allocators, plus cross-file `Foreign<Collection>`
+// clone/teardown.
+// --------------------------------------------------------------------------
+
+fn deque_offsets(dq: &BStackDeque<MacroLeaf>, stack: &BStack) -> Vec<u64> {
+    dq.to_vec(stack)
+        .unwrap()
+        .into_iter()
+        .map(|h| h.range().start())
+        .collect()
+}
+
+// A block whose fields ARE stdlib collections: an owned deque and a nullable
+// owned map. Each lowers to a `u64` offset on disk, exactly like a scalar owned
+// child — the collection's own `__bstack_*` hooks do the recursive work.
+#[bstack_block]
+struct CollectionFields {
+    tag: u32,
+    #[bstack_owned]
+    dq: BStackDeque<MacroLeaf>,
+    #[bstack_owned]
+    maybe_map: Option<BStackHashMap<u32, MacroLeaf>>,
+}
+
+fn build_collection_fields<A: BStackRaiiAllocator>(alloc: &A) -> BStackOwned<CollectionFields> {
+    let dq = BStackDeque::<MacroLeaf>::new(alloc).unwrap();
+    for v in [10u32, 20, 30] {
+        dq.push_back(alloc, MacroLeaf::new(alloc, v).unwrap())
+            .unwrap();
+    }
+    let map = BStackHashMap::<u32, MacroLeaf>::new(alloc).unwrap();
+    map.insert(alloc, 1, MacroLeaf::new(alloc, 100).unwrap())
+        .unwrap();
+    map.insert(alloc, 2, MacroLeaf::new(alloc, 200).unwrap())
+        .unwrap();
+    CollectionFields::new(alloc, 7, dq, Some(map)).unwrap()
+}
+
+#[test]
+fn stdlib_in_block_fields_build_read_clone_teardown() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let h = build_collection_fields(&alloc);
+    assert_eq!(h.handle().get_tag(stack).unwrap(), 7);
+
+    // Read the collections back through the generated accessors.
+    let got_dq = h.handle().get_dq(stack).unwrap();
+    assert_eq!(deque_values(&got_dq, stack), vec![10, 20, 30]);
+    let got_map = h.handle().get_maybe_map(stack).unwrap().expect("Some map");
+    assert_eq!(got_map.len(stack).unwrap(), 2);
+    assert_eq!(
+        got_map
+            .get(stack, &1)
+            .unwrap()
+            .unwrap()
+            .get_val(stack)
+            .unwrap(),
+        100
+    );
+    assert_eq!(
+        got_map
+            .get(stack, &2)
+            .unwrap()
+            .unwrap()
+            .get_val(stack)
+            .unwrap(),
+        200
+    );
+
+    // A `None` map round-trips through the offset-0 niche.
+    let dq0 = BStackDeque::<MacroLeaf>::new(&alloc).unwrap();
+    let h_none = CollectionFields::new(&alloc, 0, dq0, None).unwrap();
+    assert!(h_none.handle().get_maybe_map(stack).unwrap().is_none());
+    h_none.bstack_drop(&alloc).unwrap();
+
+    // Deep clone: the clone carries independent copies of BOTH collections.
+    let c = h.handle().try_clone_in(&alloc).unwrap();
+    let cdq = c.handle().get_dq(stack).unwrap();
+    let cmap = c.handle().get_maybe_map(stack).unwrap().unwrap();
+    assert_ne!(cdq.range().start(), got_dq.range().start());
+    assert_ne!(c.handle().range().start(), h.handle().range().start());
+    assert_eq!(deque_values(&cdq, stack), vec![10, 20, 30]);
+    // Every deque element is a fresh block, not an alias (the deep clone
+    // recursed into the collection's ring, not just the handle).
+    assert_eq!(deque_offsets(&got_dq, stack).len(), 3);
+    assert!(
+        deque_offsets(&got_dq, stack)
+            .iter()
+            .zip(deque_offsets(&cdq, stack).iter())
+            .all(|(a, b)| a != b),
+        "clone must deep-copy the deque's elements"
+    );
+    assert_eq!(
+        cmap.get(stack, &1)
+            .unwrap()
+            .unwrap()
+            .get_val(stack)
+            .unwrap(),
+        100
+    );
+    assert_eq!(
+        cmap.get(stack, &2)
+            .unwrap()
+            .unwrap()
+            .get_val(stack)
+            .unwrap(),
+        200
+    );
+
+    // Freeing the clone frees only the clone's subtree; the original is intact.
+    c.bstack_drop(&alloc).unwrap();
+    assert_eq!(deque_values(&got_dq, stack), vec![10, 20, 30]);
+    assert_eq!(got_map.len(stack).unwrap(), 2);
+    h.bstack_drop(&alloc).unwrap();
+
+    // Teardown must reclaim the whole structure — deque handle, ring, elements,
+    // map handle, bucket blocks, and value blocks — with no leak. Build + tear
+    // twice and assert the stack returns exactly to baseline.
+    assert_teardown_reclaims(&alloc, || build_collection_fields(&alloc));
+}
+
+#[test]
+fn stdlib_in_block_fields_on_bulk_allocator() {
+    // The same composition on GhostTree (`atomic_bulk() == true`): teardown frees
+    // the whole multi-block subtree with one atomic `dealloc_bulk`, and the
+    // two-pass (measure -> build) clone must measure every block the collections
+    // own — ring, bucket arrays, elements — so the clone is exact-sized.
+    let tmp = TempStack::new();
+    let alloc = tmp.ghost_allocator();
+    let stack = alloc.stack();
+
+    let h = build_collection_fields(&alloc);
+    let c = h.handle().try_clone_in(&alloc).unwrap();
+
+    assert_eq!(
+        deque_values(&c.handle().get_dq(stack).unwrap(), stack),
+        vec![10, 20, 30]
+    );
+    assert_eq!(
+        c.handle()
+            .get_maybe_map(stack)
+            .unwrap()
+            .unwrap()
+            .get(stack, &2)
+            .unwrap()
+            .unwrap()
+            .get_val(stack)
+            .unwrap(),
+        200
+    );
+
+    // Warm, baseline, then build + tear the identical structure twice.
+    build_collection_fields(&alloc).bstack_drop(&alloc).unwrap();
+    let base = alloc.stack().len().unwrap();
+    build_collection_fields(&alloc).bstack_drop(&alloc).unwrap();
+    assert_eq!(
+        alloc.stack().len().unwrap(),
+        base,
+        "bulk teardown leaked a collection's block"
+    );
+
+    h.bstack_drop(&alloc).unwrap();
+    c.bstack_drop(&alloc).unwrap();
+}
+
+// A block whose Vec / array ELEMENTS are collections — the container's own
+// machinery (`BStackBlockVec`, the fixed-array path) recurses per element.
+#[bstack_block]
+struct CollectionContainer {
+    tag: u32,
+    #[bstack_owned]
+    deques: Vec<BStackDeque<MacroLeaf>>,
+    #[bstack_owned]
+    fixed: [BStackDeque<MacroLeaf>; 2],
+}
+
+#[test]
+fn stdlib_collections_in_vec_and_array_elements() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let make_dq = |vals: &[u32]| {
+        let dq = BStackDeque::<MacroLeaf>::new(&alloc).unwrap();
+        for v in vals {
+            dq.push_back(&alloc, MacroLeaf::new(&alloc, *v).unwrap())
+                .unwrap();
+        }
+        dq
+    };
+
+    let h = CollectionContainer::new(
+        &alloc,
+        7,
+        vec![make_dq(&[1, 2]), make_dq(&[3, 4, 5])],
+        [make_dq(&[6]), make_dq(&[7, 8])],
+    )
+    .unwrap();
+
+    // Read the Vec<..> and [..; 2] back through the accessors.
+    let got_vec = h.handle().get_deques(&alloc).unwrap().to_vec().unwrap();
+    assert_eq!(got_vec.len(), 2);
+    assert_eq!(deque_values(&got_vec[0], stack), vec![1, 2]);
+    assert_eq!(deque_values(&got_vec[1], stack), vec![3, 4, 5]);
+    let got_arr = h.handle().get_fixed(stack).unwrap();
+    assert_eq!(deque_values(&got_arr[0], stack), vec![6]);
+    assert_eq!(deque_values(&got_arr[1], stack), vec![7, 8]);
+
+    // Deep clone recurses through each element of each container.
+    let c = h.handle().try_clone_in(&alloc).unwrap();
+    let cvec = c.handle().get_deques(&alloc).unwrap().to_vec().unwrap();
+    let carr = c.handle().get_fixed(stack).unwrap();
+    for i in 0..2 {
+        assert_ne!(
+            cvec[i].range().start(),
+            got_vec[i].range().start(),
+            "cloned Vec element must be a fresh block"
+        );
+        assert_ne!(
+            carr[i].range().start(),
+            got_arr[i].range().start(),
+            "cloned array element must be a fresh block"
+        );
+    }
+    assert_eq!(deque_values(&cvec[0], stack), vec![1, 2]);
+    assert_eq!(deque_values(&cvec[1], stack), vec![3, 4, 5]);
+    assert_eq!(deque_values(&carr[0], stack), vec![6]);
+    assert_eq!(deque_values(&carr[1], stack), vec![7, 8]);
+
+    // Independent teardown + full reclamation (a leak here means a nested
+    // element was never freed).
+    c.bstack_drop(&alloc).unwrap();
+    assert_eq!(deque_values(&got_vec[0], stack), vec![1, 2]);
+    assert_eq!(deque_values(&got_arr[1], stack), vec![7, 8]);
+    assert_teardown_reclaims(&alloc, || {
+        CollectionContainer::new(
+            &alloc,
+            0,
+            vec![make_dq(&[1, 2]), make_dq(&[3])],
+            [make_dq(&[4]), make_dq(&[5, 6])],
+        )
+        .unwrap()
+    });
+}
+
+// A collection as an OWNED ENUM VARIANT payload — the enum's per-variant
+// teardown / clone dispatch calls the collection's `__bstack_*` hooks.
+#[bstack_enum]
+enum CollectionEnum {
+    Empty,
+    #[bstack_owned]
+    Deq(BStackDeque<MacroLeaf>),
+    #[bstack_owned]
+    Map(BStackHashMap<u32, MacroLeaf>),
+}
+
+#[test]
+fn stdlib_collection_in_enum_variant() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    // Build a `Deq` variant, read the deque back through the view, clone it
+    // (independent), and tear it down — reclaiming deque + ring + elements.
+    let dq = BStackDeque::<MacroLeaf>::new(&alloc).unwrap();
+    dq.push_back(&alloc, MacroLeaf::new(&alloc, 1).unwrap())
+        .unwrap();
+    dq.push_back(&alloc, MacroLeaf::new(&alloc, 2).unwrap())
+        .unwrap();
+    let e = CollectionEnum::new(&alloc, CollectionEnumData::Deq(dq)).unwrap();
+    let got = match e.handle().read(&alloc).unwrap() {
+        CollectionEnumView::Deq(d) => d,
+        _ => panic!("expected Deq variant"),
+    };
+    assert_eq!(deque_values(&got, stack), vec![1, 2]);
+
+    let c = e.handle().try_clone_in(&alloc).unwrap();
+    let cgot = match c.handle().read(&alloc).unwrap() {
+        CollectionEnumView::Deq(d) => d,
+        _ => panic!("expected Deq variant"),
+    };
+    assert_ne!(cgot.range().start(), got.range().start());
+    assert_eq!(deque_values(&cgot, stack), vec![1, 2]);
+    assert!(
+        deque_offsets(&got, stack)
+            .iter()
+            .zip(deque_offsets(&cgot, stack).iter())
+            .all(|(a, b)| a != b),
+        "cloned enum deque must deep-copy its elements"
+    );
+
+    // `bstack_move!` hands the owned collection back as a `BStackOwned`.
+    let mv = bstack_move!(e, &alloc).unwrap();
+    match mv {
+        CollectionEnumData::Deq(dq) => {
+            assert_eq!(deque_values(&dq, stack), vec![1, 2]);
+            dq.bstack_drop(&alloc).unwrap();
+        }
+        _ => panic!("expected Deq variant from bstack_move"),
+    }
+    c.bstack_drop(&alloc).unwrap();
+
+    // A `Map` variant round-trips, reads back, clones independently, and
+    // reclaims too.
+    let map = BStackHashMap::<u32, MacroLeaf>::new(&alloc).unwrap();
+    map.insert(&alloc, 1, MacroLeaf::new(&alloc, 10).unwrap())
+        .unwrap();
+    map.insert(&alloc, 2, MacroLeaf::new(&alloc, 20).unwrap())
+        .unwrap();
+    let em = CollectionEnum::new(&alloc, CollectionEnumData::Map(map)).unwrap();
+    let mgot = match em.handle().read(&alloc).unwrap() {
+        CollectionEnumView::Map(m) => m,
+        _ => panic!("expected Map variant"),
+    };
+    assert_eq!(mgot.len(stack).unwrap(), 2);
+    assert_eq!(
+        mgot.get(stack, &2)
+            .unwrap()
+            .unwrap()
+            .get_val(stack)
+            .unwrap(),
+        20
+    );
+    let mclone = em.handle().try_clone_in(&alloc).unwrap();
+    let mc = match mclone.handle().read(&alloc).unwrap() {
+        CollectionEnumView::Map(m) => m,
+        _ => panic!("expected Map variant from clone"),
+    };
+    assert_ne!(mc.range().start(), mgot.range().start());
+    assert_eq!(mc.len(stack).unwrap(), 2);
+    em.bstack_drop(&alloc).unwrap();
+    mclone.bstack_drop(&alloc).unwrap();
+
+    assert_teardown_reclaims(&alloc, || {
+        let map = BStackHashMap::<u32, MacroLeaf>::new(&alloc).unwrap();
+        map.insert(&alloc, 1, MacroLeaf::new(&alloc, 10).unwrap())
+            .unwrap();
+        CollectionEnum::new(&alloc, CollectionEnumData::Map(map)).unwrap()
+    });
+
+    // The `Empty` variant still works alongside the collection variants.
+    let empty = CollectionEnum::new(&alloc, CollectionEnumData::Empty).unwrap();
+    assert!(matches!(
+        empty.handle().read(&alloc).unwrap(),
+        CollectionEnumView::Empty
+    ));
+    empty.bstack_drop(&alloc).unwrap();
+}
+
+// A `Foreign<Collection>` target: the home block owns a deque living in ANOTHER
+// file. Cross-file deep clone must copy the whole collection into its own file,
+// and teardown must free it there recursively.
+#[bstack_block]
+struct ForeignCollectionHolder {
+    tag: u32,
+    #[bstack_owned]
+    dq: Foreign<BStackDeque<MacroLeaf>>,
+}
+
+#[test]
+fn stdlib_foreign_collection_target_clone_and_teardown() {
+    use crate::Foreign;
+    use crate::registry;
+    use std::sync::Arc;
+
+    let home = TempStack::new();
+    let home_alloc = home.allocator();
+    let hstack = home_alloc.stack();
+
+    let foreign = TempStack::new();
+    let arc_b = Arc::new(foreign.allocator());
+
+    let reg_file = TempStack::new();
+    let _ = registry::init(&reg_file.path);
+    let reg = registry::get().unwrap();
+    let fid = reg.attach(&foreign.path, arc_b.clone()).unwrap();
+
+    // Build a deque in the FOREIGN file: handle + ring + two element blocks.
+    let dq = BStackDeque::<MacroLeaf>::new(&*arc_b).unwrap();
+    dq.push_back(&*arc_b, MacroLeaf::new(&*arc_b, 1).unwrap())
+        .unwrap();
+    dq.push_back(&*arc_b, MacroLeaf::new(&*arc_b, 2).unwrap())
+        .unwrap();
+    let dq_off = dq.handle().range().start();
+
+    // Warm the cross-file owned-clone path (creates B's persistent WAL block),
+    // then record the foreign baseline.
+    {
+        let warm_dq = BStackDeque::<MacroLeaf>::new(&*arc_b).unwrap();
+        warm_dq
+            .push_back(&*arc_b, MacroLeaf::new(&*arc_b, 99).unwrap())
+            .unwrap();
+        let h0 = ForeignCollectionHolder::new(
+            &home_alloc,
+            0,
+            Foreign::<BStackDeque<MacroLeaf>>::new(fid, warm_dq.handle().range().start()),
+        )
+        .unwrap();
+        let c0 = h0.handle().try_clone_in(&home_alloc).unwrap();
+        h0.bstack_drop(&home_alloc).unwrap();
+        c0.bstack_drop(&home_alloc).unwrap();
+    }
+    let base_b = arc_b.stack().len().unwrap();
+
+    // A home block owning the foreign deque.
+    let h = ForeignCollectionHolder::new(
+        &home_alloc,
+        7,
+        Foreign::<BStackDeque<MacroLeaf>>::new(fid, dq_off),
+    )
+    .unwrap();
+
+    // Deep clone: the whole deque (handle + ring + elements) is copied into the
+    // foreign file; the clone points at a DIFFERENT block there.
+    let c = h.handle().try_clone_in(&home_alloc).unwrap();
+    let clone_link = c.handle().get_dq(hstack).unwrap();
+    assert_eq!(clone_link.file_id(), fid);
+    assert_ne!(
+        clone_link.offset(),
+        dq_off,
+        "owned clone must be a fresh copy"
+    );
+    let clone_vals = clone_link
+        .with(&home_alloc, |d, fs| {
+            Ok::<_, std::io::Error>(deque_values(&d, fs))
+        })
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(clone_vals, vec![1, 2]);
+
+    // The clone's elements are distinct blocks in the foreign file too.
+    let orig_offsets = dq.to_vec(arc_b.stack()).unwrap();
+    let cloned_offsets = clone_link
+        .with(&home_alloc, |d, fs| {
+            Ok::<_, std::io::Error>(d.to_vec(fs).unwrap())
+        })
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(
+        orig_offsets
+            .iter()
+            .zip(cloned_offsets.iter())
+            .all(|(a, b)| a.range().start() != b.range().start()),
+        "cross-file clone must deep-copy the deque's elements"
+    );
+
+    // Tearing both holders down frees BOTH full deques on the foreign file (no
+    // double-free, no leak) — the file returns exactly to the warmed baseline.
+    h.bstack_drop(&home_alloc).unwrap();
+    c.bstack_drop(&home_alloc).unwrap();
+    assert_eq!(
+        arc_b.stack().len().unwrap(),
+        base_b,
+        "foreign collection clone+teardown leaked or double-freed"
+    );
+
+    reg.detach(fid);
+}
+
+// --------------------------------------------------------------------------
+// Generic struct owning a generic collection. `struct S<T> {
+// #[bstack_owned] d: BStackDeque<T> }`: a `T` used INSIDE a generic collection
+// field needs the macro to propagate `T: BStackBlock` (+ `TryCloneIn` for
+// owned) to its generated impls. These tests verify a concrete instantiation
+// builds / reads / deep-clones / tears down exactly like the non-generic
+// composition.
+// --------------------------------------------------------------------------
+
+#[bstack_block]
+struct GenericCollectionHolder<T> {
+    tag: u32,
+    #[bstack_owned]
+    dq: BStackDeque<T>,
+    #[bstack_owned]
+    map: Option<BStackHashMap<u32, T>>,
+}
+
+#[bstack_block]
+struct GenericCollectionVec<T> {
+    #[bstack_owned]
+    deques: Vec<BStackDeque<T>>,
+}
+
+#[test]
+fn generic_collection_bound_inference_and_composition() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    // Concrete instantiation with `T = MacroLeaf`.
+    let dq = BStackDeque::<MacroLeaf>::new(&alloc).unwrap();
+    for v in [1u32, 2, 3] {
+        dq.push_back(&alloc, MacroLeaf::new(&alloc, v).unwrap())
+            .unwrap();
+    }
+    let map = BStackHashMap::<u32, MacroLeaf>::new(&alloc).unwrap();
+    map.insert(&alloc, 1, MacroLeaf::new(&alloc, 10).unwrap())
+        .unwrap();
+    let h = GenericCollectionHolder::<MacroLeaf>::new(&alloc, 7, dq, Some(map)).unwrap();
+
+    // Accessors resolve through the generic collection field types.
+    assert_eq!(h.handle().get_tag(stack).unwrap(), 7);
+    let got_dq = h.handle().get_dq(stack).unwrap();
+    assert_eq!(deque_values(&got_dq, stack), vec![1, 2, 3]);
+    let got_map = h.handle().get_map(stack).unwrap().expect("Some");
+    assert_eq!(got_map.len(stack).unwrap(), 1);
+    assert_eq!(
+        got_map
+            .get(stack, &1)
+            .unwrap()
+            .unwrap()
+            .get_val(stack)
+            .unwrap(),
+        10
+    );
+
+    // Deep clone recurses through the generic collection fields.
+    let c = h.handle().try_clone_in(&alloc).unwrap();
+    assert_ne!(c.handle().range().start(), h.handle().range().start());
+    let cdq = c.handle().get_dq(stack).unwrap();
+    assert_ne!(cdq.range().start(), got_dq.range().start());
+    assert_eq!(deque_values(&cdq, stack), vec![1, 2, 3]);
+    assert_eq!(
+        c.handle()
+            .get_map(stack)
+            .unwrap()
+            .unwrap()
+            .get(stack, &1)
+            .unwrap()
+            .unwrap()
+            .get_val(stack)
+            .unwrap(),
+        10
+    );
+
+    // Independent teardown of both, then leak-check the whole composition.
+    c.bstack_drop(&alloc).unwrap();
+    assert_eq!(deque_values(&got_dq, stack), vec![1, 2, 3]);
+    h.bstack_drop(&alloc).unwrap();
+    assert_teardown_reclaims(&alloc, || {
+        let dq = BStackDeque::<MacroLeaf>::new(&alloc).unwrap();
+        dq.push_back(&alloc, MacroLeaf::new(&alloc, 5).unwrap())
+            .unwrap();
+        let map = BStackHashMap::<u32, MacroLeaf>::new(&alloc).unwrap();
+        map.insert(&alloc, 1, MacroLeaf::new(&alloc, 50).unwrap())
+            .unwrap();
+        GenericCollectionHolder::<MacroLeaf>::new(&alloc, 0, dq, Some(map)).unwrap()
+    });
+
+    // A second instantiation `T = MacroLeaf` with different leaf values works,
+    // and the Vec-of-generic-collection form compiles + tears down too.
+    let vh = GenericCollectionVec::<MacroLeaf>::new(
+        &alloc,
+        vec![
+            BStackDeque::<MacroLeaf>::new(&alloc).unwrap(),
+            BStackDeque::<MacroLeaf>::new(&alloc).unwrap(),
+        ],
+    )
+    .unwrap();
+    assert_eq!(vh.handle().get_deques(&alloc).unwrap().len().unwrap(), 2);
+    vh.bstack_drop(&alloc).unwrap();
+    assert_teardown_reclaims(&alloc, || {
+        GenericCollectionVec::<MacroLeaf>::new(
+            &alloc,
+            vec![BStackDeque::<MacroLeaf>::new(&alloc).unwrap()],
+        )
+        .unwrap()
+    });
+}
