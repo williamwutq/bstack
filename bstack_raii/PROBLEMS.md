@@ -30,24 +30,6 @@ so they are not re-flagged).
   "a `Foreign` field must carry an annotation" guard has no analogue here. Low
   severity (raw form), but it is a hole in the "a foreign pointer always carries
   ownership dispatch" invariant.
-- [TESTS-ADDED] **Stdlib collections composed into blocks are entirely untested.** No test puts a
-  collection in a `#[bstack_block]` field (`#[bstack_owned] d: BStackDeque<Leaf>`,
-  `Option<BStackHashMap<..>>`), an enum variant, a `Vec`/array element, or a
-  `Foreign<Collection>` target. The bounds line up (collections are
-  `BStackBlock + TryCloneIn` and override the nested `__bstack_*` hooks, so it
-  *should* work), but deep-clone/teardown of these compositions is unverified — a
-  large, plausible-but-unexercised surface.
-- [TESTS-ADDED] **Generic struct owning a generic collection may not infer bounds.** For
-  `struct S<T: BStackBlock> { #[bstack_owned] d: BStackDeque<T> }`, the macro's
-  generic-bound inference is built around direct type params and `Foreign<T>`
-  targets; whether it propagates the needed `T`-bounds for a field typed
-  `BStackDeque<T>` (an arbitrary generic block type) is unverified and may surface a
-  confusing trait-bound error. (Tests `generic_collection_bound_inference_and_composition`
-  and `generic_collection_with_explicit_bound` verify `BStackDeque<T>`,
-  `Option<BStackHashMap<u32, T>>`, and `Vec<BStackDeque<T>>` fields with both the
-  inferred and the explicit `T: BStackBlock` bound: bounds propagate correctly and
-  build/read/deep-clone/teardown are leak-free — the feared bound error did not
-  materialize.)
 - [CONFIRMED-DEFECT] **`#[embed]` of a collection is semantically dubious.** `#[embed] BStackDeque<T>`
   would inline only the fixed descriptor while the ring/nodes stay out-of-line;
   whether embed teardown/move handle a block whose `OnDisk` is a descriptor (not a
