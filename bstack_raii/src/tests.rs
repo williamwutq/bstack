@@ -9922,3 +9922,121 @@ fn generic_collection_bound_inference_and_composition() {
         .unwrap()
     });
 }
+
+// --------------------------------------------------------------------------
+// `#[embed]` of a collection: only the collection's fixed descriptor is folded
+// inline (the ring / element blocks stay out-of-line). Teardown and move both
+// reason purely from the descriptor's absolute offsets, so they should work;
+// deep clone folds the child's `OnDisk` in place via
+// `__bstack_clone_children_inplace` — which the hand-written collection impls
+// do NOT override (they override only `__bstack_drop_children` /
+// `__bstack_clone_into`), so the clone may alias the source's out-of-line ring
+// and elements instead of deep-copying them.
+// --------------------------------------------------------------------------
+
+#[bstack_block]
+struct EmbCollectionHolder {
+    #[embed]
+    dq: BStackDeque<MacroLeaf>,
+    tag: u32,
+}
+
+fn build_emb_collection_holder(
+    alloc: &FirstFitBStackAllocator,
+) -> BStackOwned<EmbCollectionHolder> {
+    let dq = BStackDeque::<MacroLeaf>::new(alloc).unwrap();
+    dq.push_back(alloc, MacroLeaf::new(alloc, 1).unwrap())
+        .unwrap();
+    dq.push_back(alloc, MacroLeaf::new(alloc, 2).unwrap())
+        .unwrap();
+    EmbCollectionHolder::new(alloc, dq, 7).unwrap()
+}
+
+#[test]
+fn embed_collection_build_read_teardown() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    // Build: the deque descriptor is folded inline; ring + elements stay out
+    // of line and keep their absolute offsets.
+    let h = build_emb_collection_holder(&alloc);
+    assert_eq!(h.handle().get_tag(stack).unwrap(), 7);
+
+    // Read: the accessor yields a deque handle into the inline region.
+    let got = h.handle().get_dq();
+    assert_eq!(deque_values(&got, stack), vec![1, 2]);
+
+    // Teardown: frees the ring + both elements *in place* via
+    // `__bstack_drop_children`, then the holder shell — no leak.
+    h.bstack_drop(&alloc).unwrap();
+    assert_teardown_reclaims(&alloc, || build_emb_collection_holder(&alloc));
+}
+
+#[test]
+fn embed_collection_move_rehomes() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    // Warm the persistent WAL anchor with one full cycle, then baseline (a
+    // WAL-backed teardown's anchor is a one-time per-file allocation).
+    {
+        let (m, _) = bstack_move!(build_emb_collection_holder(&alloc), &alloc).unwrap();
+        m.bstack_drop(&alloc).unwrap();
+    }
+    let base = alloc.stack().len().unwrap();
+
+    // bstack_move! re-homes the descriptor to a fresh standalone deque block;
+    // the parent shell is freed, so nothing is double-freed later.
+    let (moved, tag) = bstack_move!(build_emb_collection_holder(&alloc), &alloc).unwrap();
+    assert_eq!(tag, 7);
+    assert_eq!(deque_values(&moved, stack), vec![1, 2]);
+    // The re-homed deque owns its ring + elements; dropping it reclaims all of
+    // them (build -> move -> drop the moved child must return to baseline).
+    moved.bstack_drop(&alloc).unwrap();
+    assert_eq!(
+        alloc.stack().len().unwrap(),
+        base,
+        "move re-homed the embedded deque but leaked its ring or elements"
+    );
+}
+
+#[test]
+fn embed_collection_clone_is_independent() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let h = build_emb_collection_holder(&alloc);
+    let got = h.handle().get_dq();
+
+    // A deep clone of the holder must carry an INDEPENDENT copy of the embedded
+    // deque — a fresh ring and fresh element blocks, not aliases of the
+    // original's out-of-line storage.
+    let c = h.handle().try_clone_in(&alloc).unwrap();
+    let cdq = c.handle().get_dq();
+    assert_ne!(
+        c.handle().range().start(),
+        h.handle().range().start(),
+        "cloned holder must be a fresh block"
+    );
+    assert_ne!(
+        cdq.range().start(),
+        got.range().start(),
+        "embedded deque must not alias the source descriptor"
+    );
+    assert_eq!(deque_values(&cdq, stack), vec![1, 2]);
+    assert!(
+        deque_offsets(&got, stack)
+            .iter()
+            .zip(deque_offsets(&cdq, stack).iter())
+            .all(|(a, b)| a != b),
+        "embedded collection clone must deep-copy its ring elements"
+    );
+
+    // Tearing the clone down must not touch the original's ring / elements.
+    c.bstack_drop(&alloc).unwrap();
+    assert_eq!(deque_values(&got, stack), vec![1, 2]);
+    h.bstack_drop(&alloc).unwrap();
+}

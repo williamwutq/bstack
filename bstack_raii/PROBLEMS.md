@@ -48,11 +48,18 @@ so they are not re-flagged).
   inferred and the explicit `T: BStackBlock` bound: bounds propagate correctly and
   build/read/deep-clone/teardown are leak-free — the feared bound error did not
   materialize.)
-- **`#[embed]` of a collection is semantically dubious.** `#[embed] BStackDeque<T>`
+- [CONFIRMED-DEFECT] **`#[embed]` of a collection is semantically dubious.** `#[embed] BStackDeque<T>`
   would inline only the fixed descriptor while the ring/nodes stay out-of-line;
   whether embed teardown/move handle a block whose `OnDisk` is a descriptor (not a
   self-contained payload) is unverified — embed was designed for self-contained
-  blocks.
+  blocks. Tests (`embed_collection_build_read_teardown`, `embed_collection_move_rehomes`,
+  `embed_collection_clone_is_independent`) show build/read/teardown and `bstack_move!`
+  re-home are **correct** (the descriptor's absolute ring/element offsets survive), but
+  deep clone is **broken**: the collections' hand-written impls do not override
+  `__bstack_clone_children_inplace`, whose default returns the descriptor *verbatim*, so a
+  cloned embedded deque aliases the source's out-of-line ring and elements — tearing the
+  clone down frees the source's children (double-free). The fix is per-collection
+  `__bstack_clone_children_inplace` = `__bstack_clone_into` without the handle allocation.
 - **`#[bstack_mut]` is silently ignored on Vec / array / tuple / `Foreign` fields.**
   The mutator injection ([block.rs:2501](derive/src/block.rs#L2501)) runs *after*
   those field branches `continue` (e.g. the `Foreign` branch at
@@ -75,6 +82,18 @@ so they are not re-flagged).
 - **No explicit guard against `#[embed]` of an `(rc)` / `(rc, weak)` block.** Embed
   folds the child's data inline and frees its shell; an `(rc, weak)` child's
   *separate* control block would then keep a stale forward pointer to the freed data
-  offset → corruption. It is currently prevented only incidentally (an rc block
-  yields `BStackRc`, not the `BStackOwned<Child>` that embed's `new` requires), not
-  by an explicit rejection.
+  offset → corruption. Verified current behavior: there is **no guard at expansion
+  time** — `#[bstack_block] struct X { #[embed] r: RcChild, .. }` compiles cleanly, the
+  derive never inspects the child's ownership mode. The only obstruction is
+  incidental and surfaces at the constructor call site as a raw type mismatch:
+  ```
+  error[E0308]: mismatched types
+     |     let _ = X::new(&alloc, c, ..);
+     |             -------        ^^ expected `BStackOwned<RcChild>`, found `BStackRc<'_, RcChild, ...>`
+  ```
+  because an rc block's `new` yields `BStackRc`, not the `BStackOwned<Child>` the
+  generated embed constructor requires. Not a trait-bounds message, but also not a
+  directed diagnostic, and the derive admits the composition, so the guard is
+  bypassable via `unsafe { BStackOwned::from_raw(RcChild::from_range(..)) }` — after
+  which the stale-forward-pointer corruption would occur. A proper fix is an explicit
+  rejection in the derive (error on `#[embed]` of a block whose mode is not plain).
