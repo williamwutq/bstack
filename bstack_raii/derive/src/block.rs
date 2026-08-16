@@ -409,7 +409,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                 !type_mentions_any(ftarget, &type_params),
                 &mut wrapper_defs,
             )?;
-            on_disk_fields.push(quote!(#fname: ::bstack_raii::ForeignPtr,));
+            on_disk_fields.push(quote!(#fname: ::bstack_raii::ForeignRepr,));
             let field_ty = quote!(::bstack_raii::Foreign<#ftarget>);
             let cap = format_ident!("__cap_{}", fname);
             mv_caps.push(quote!(let #cap = __od.#fname;));
@@ -417,10 +417,12 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
             if nullable {
                 // Niche: a stored `offset == 0` is `None` (no target sits at 0).
                 accessors.push(quote! {
-                    #vis fn #getter(
+                    #vis fn #getter<'__f>(
                         &self,
-                        stack: &::bstack_raii::BStack,
-                    ) -> ::std::io::Result<::core::option::Option<#field_ty>> {
+                        stack: &'__f ::bstack_raii::BStack,
+                    ) -> ::std::io::Result<
+                        ::core::option::Option<::bstack_raii::Foreign<'__f, #ftarget>>,
+                    > {
                         let mut __buf = ::std::vec![0u8; ::core::mem::size_of::<#on_disk_ty>()];
                         let __r = unsafe { ::bstack_raii::BStackRef::<Self>::from_range(self.0) };
                         let __od: #on_disk_ty = *__r.read_on_disk(stack, &mut __buf)?;
@@ -428,43 +430,55 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                         ::std::result::Result::Ok(if __p.offset() == 0 {
                             ::core::option::Option::None
                         } else {
-                            ::core::option::Option::Some(::bstack_raii::Foreign::from_ptr(__p))
+                            // SAFETY: `__p` was stored into this file; the returned
+                            // `Foreign`'s lifetime is bound to `stack` by the signature.
+                            ::core::option::Option::Some(unsafe {
+                                ::bstack_raii::Foreign::from_repr(__p)
+                            })
                         })
                     }
                 });
                 ctor_params.push(quote!(#fname: ::core::option::Option<#field_ty>,));
                 ctor_preps.push(quote! {
-                    let #fname: ::bstack_raii::ForeignPtr = match #fname {
-                        ::core::option::Option::Some(__f) => __f.ptr(),
-                        ::core::option::Option::None => ::bstack_raii::ForeignPtr::new(0, 0),
+                    let #fname: ::bstack_raii::ForeignRepr = match #fname {
+                        ::core::option::Option::Some(__f) => __f.repr(),
+                        ::core::option::Option::None => ::bstack_raii::ForeignRepr::new(0, 0),
                     };
                 });
                 ctor_inits.push(quote!(#fname: #fname,));
-                mv_types.push(quote!(::core::option::Option<#field_ty>));
+                mv_types.push(quote!(
+                    ::core::option::Option<::bstack_raii::Foreign<'__mv, #ftarget>>
+                ));
                 mv_recon.push(quote! {
                     if #cap.offset() == 0 {
                         ::core::option::Option::None
                     } else {
-                        ::core::option::Option::Some(::bstack_raii::Foreign::from_ptr(#cap))
+                        // SAFETY: `#cap` was stored into this file; bound to `'__mv`.
+                        ::core::option::Option::Some(unsafe {
+                            ::bstack_raii::Foreign::from_repr(#cap)
+                        })
                     }
                 });
             } else {
                 accessors.push(quote! {
-                    #vis fn #getter(
+                    #vis fn #getter<'__f>(
                         &self,
-                        stack: &::bstack_raii::BStack,
-                    ) -> ::std::io::Result<#field_ty> {
+                        stack: &'__f ::bstack_raii::BStack,
+                    ) -> ::std::io::Result<::bstack_raii::Foreign<'__f, #ftarget>> {
                         let mut __buf = ::std::vec![0u8; ::core::mem::size_of::<#on_disk_ty>()];
                         let __r = unsafe { ::bstack_raii::BStackRef::<Self>::from_range(self.0) };
                         let __od: #on_disk_ty = *__r.read_on_disk(stack, &mut __buf)?;
-                        ::std::result::Result::Ok(::bstack_raii::Foreign::from_ptr(__od.#fname))
+                        // SAFETY: stored into this file; bound to `stack` by the signature.
+                        ::std::result::Result::Ok(unsafe {
+                            ::bstack_raii::Foreign::from_repr(__od.#fname)
+                        })
                     }
                 });
                 ctor_params.push(quote!(#fname: #field_ty,));
-                ctor_preps.push(quote!(let #fname: ::bstack_raii::ForeignPtr = #fname.ptr();));
+                ctor_preps.push(quote!(let #fname: ::bstack_raii::ForeignRepr = #fname.repr();));
                 ctor_inits.push(quote!(#fname: #fname,));
-                mv_types.push(quote!(#field_ty));
-                mv_recon.push(quote!(::bstack_raii::Foreign::from_ptr(#cap)));
+                mv_types.push(quote!(::bstack_raii::Foreign<'__mv, #ftarget>));
+                mv_recon.push(quote!(unsafe { ::bstack_raii::Foreign::from_repr(#cap) }));
             }
 
             // Teardown: an owning foreign pointer frees / decrements / releases its
@@ -484,7 +498,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
             if let Some(helper) = foreign_drop_helper {
                 drop_stmts.push(quote! {
                     {
-                        let __fp: ::bstack_raii::ForeignPtr = __on_disk.#fname;
+                        let __fp: ::bstack_raii::ForeignRepr = __on_disk.#fname;
                         // A `0` offset is the null / unset niche (nullable field, or a
                         // never-set pointer) — nothing to free.
                         let __off = __fp.offset();
@@ -528,7 +542,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
             let foreign_clone_stmt = match kind {
                 Kind::Owned => Some(quote! {
                     {
-                        let __fp: ::bstack_raii::ForeignPtr = __od.#fname;
+                        let __fp: ::bstack_raii::ForeignRepr = __od.#fname;
                         let __off = __fp.offset();
                         if __off != 0 {
                             let __fid = __fp.file_id();
@@ -538,7 +552,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                                     ::bstack_raii::BStackRange::new(__off, #target_od_size),
                                 );
                                 let __new = __child.__bstack_clone_into(allocator, __plan)?;
-                                __od.#fname = ::bstack_raii::ForeignPtr::new(0, __new.start());
+                                __od.#fname = ::bstack_raii::ForeignRepr::new(0, __new.start());
                             } else if __plan.is_measuring() {
                                 // Foreign deep-clone is eager cross-file work; the
                                 // measure pass (home-file sizes only) skips it, so it
@@ -559,7 +573,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                                         &__adapter, __off,
                                     )?
                                 };
-                                __od.#fname = ::bstack_raii::ForeignPtr::new(__fid, __new_off);
+                                __od.#fname = ::bstack_raii::ForeignRepr::new(__fid, __new_off);
                             } else {
                                 return ::std::result::Result::Err(::std::io::Error::new(
                                     ::std::io::ErrorKind::InvalidData,
@@ -571,7 +585,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                 }),
                 Kind::Strong => Some(quote! {
                     {
-                        let __fp: ::bstack_raii::ForeignPtr = __od.#fname;
+                        let __fp: ::bstack_raii::ForeignRepr = __od.#fname;
                         let __off = __fp.offset();
                         if __off != 0 {
                             let __fid = __fp.file_id();
@@ -614,7 +628,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                 }),
                 Kind::Weak => Some(quote! {
                     {
-                        let __fp: ::bstack_raii::ForeignPtr = __od.#fname;
+                        let __fp: ::bstack_raii::ForeignRepr = __od.#fname;
                         // For a weak pointer, the offset is the target's control block.
                         let __off = __fp.offset();
                         if __off != 0 {
@@ -707,7 +721,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                     &mut wrapper_defs,
                 )?;
 
-                let store = quote!(::bstack_raii::BStackVec::<::bstack_raii::ForeignPtr, __A>);
+                let store = quote!(::bstack_raii::BStackVec::<::bstack_raii::ForeignRepr, __A>);
                 let field_loc =
                     quote!(self.0.start() + ::core::mem::offset_of!(#on_disk_ty, #fname) as u64);
                 let field_ty = if elem_nullable {
@@ -718,7 +732,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                 // Map a stored `ForeignPtr` ↔ the element type (offset 0 ⇒ `None` when
                 // the element is `Option`-wrapped).
                 let from_ptr = if elem_nullable {
-                    quote!(|__p: ::bstack_raii::ForeignPtr| if __p.offset() == 0 {
+                    quote!(|__p: ::bstack_raii::ForeignRepr| if __p.offset() == 0 {
                         ::core::option::Option::None
                     } else {
                         ::core::option::Option::Some(
@@ -729,11 +743,11 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                 };
                 let to_ptr = if elem_nullable {
                     quote!(|__f: #field_ty| match __f {
-                        ::core::option::Option::Some(__ff) => __ff.ptr(),
-                        ::core::option::Option::None => ::bstack_raii::ForeignPtr::new(0, 0),
+                        ::core::option::Option::Some(__ff) => __ff.repr(),
+                        ::core::option::Option::None => ::bstack_raii::ForeignRepr::new(0, 0),
                     })
                 } else {
-                    quote!(|__f: #field_ty| __f.ptr())
+                    quote!(|__f: #field_ty| __f.repr())
                 };
 
                 // ---- Accessor: `Vec<Foreign<T>>` / `Vec<Option<Foreign<T>>>` (or `Option<..>`) ----
@@ -770,7 +784,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
 
                 // ---- Constructor: `Vec<Foreign<T>>` → a `ForeignPtr` data block ----
                 let build = quote! {
-                    let __ptrs: ::std::vec::Vec<::bstack_raii::ForeignPtr> =
+                    let __ptrs: ::std::vec::Vec<::bstack_raii::ForeignRepr> =
                         __list.into_iter().map(#to_ptr).collect();
                     #store::from_slice(allocator, &__ptrs)?.descriptor()
                 };
@@ -822,7 +836,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                         let __srcdesc: ::bstack_raii::VecDesc = __od.#fname;
                         if __srcdesc.data_off != 0 {
                             let __src = #store::from_desc(__srcdesc, allocator).to_vec()?;
-                            let mut __new: ::std::vec::Vec<::bstack_raii::ForeignPtr> =
+                            let mut __new: ::std::vec::Vec<::bstack_raii::ForeignRepr> =
                                 ::std::vec::Vec::with_capacity(__src.len());
                             for __fp in __src {
                                 #elem_clone
@@ -836,7 +850,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
 
                 // ---- Move: the raw `ForeignPtr` vector handle ----
                 let (mvt, mvr) = wrap_vec_move(
-                    quote!(::bstack_raii::BStackVec<'__mv, ::bstack_raii::ForeignPtr, __A>),
+                    quote!(::bstack_raii::BStackVec<'__mv, ::bstack_raii::ForeignRepr, __A>),
                     quote!(::bstack_raii::BStackVec::from_desc(#cap, __alloc)),
                     &cap,
                     nullable,
@@ -1490,7 +1504,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                 }
                 let total = dims_prod(&adims);
                 let field_ty = quote!(::bstack_raii::Foreign<#ftarget>);
-                on_disk_fields.push(quote!(#fname: [::bstack_raii::ForeignPtr; #total],));
+                on_disk_fields.push(quote!(#fname: [::bstack_raii::ForeignRepr; #total],));
 
                 // ---- Accessor: nested `[[Foreign<T>; ..]; ..]` (Option per slot) ----
                 let leaf_ty = if aleaf_nullable {
@@ -1523,7 +1537,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                         let mut __buf = ::std::vec![0u8; ::core::mem::size_of::<#on_disk_ty>()];
                         let __r = unsafe { ::bstack_raii::BStackRef::<Self>::from_range(self.0) };
                         let __od: #on_disk_ty = *__r.read_on_disk(stack, &mut __buf)?;
-                        let __arr: [::bstack_raii::ForeignPtr; #total] = __od.#fname;
+                        let __arr: [::bstack_raii::ForeignRepr; #total] = __od.#fname;
                         ::std::result::Result::Ok(#acc_body)
                     }
                 });
@@ -1539,17 +1553,17 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                 let ctor_write = |k: &Ident, leaf: &Ident| {
                     if aleaf_nullable {
                         quote!(__slots[#k] = match #leaf {
-                            ::core::option::Option::Some(__f) => __f.ptr(),
-                            ::core::option::Option::None => ::bstack_raii::ForeignPtr::new(0, 0),
+                            ::core::option::Option::Some(__f) => __f.repr(),
+                            ::core::option::Option::None => ::bstack_raii::ForeignRepr::new(0, 0),
                         };)
                     } else {
-                        quote!(__slots[#k] = #leaf.ptr();)
+                        quote!(__slots[#k] = #leaf.repr();)
                     }
                 };
                 let flatten = nested_consume(&adims, &quote!(#fname), &ctor_write);
                 ctor_preps.push(quote! {
-                    let #fname: [::bstack_raii::ForeignPtr; #total] = {
-                        let mut __slots = [::bstack_raii::ForeignPtr::new(0, 0); #total];
+                    let #fname: [::bstack_raii::ForeignRepr; #total] = {
+                        let mut __slots = [::bstack_raii::ForeignRepr::new(0, 0); #total];
                         #flatten
                         __slots
                     };
@@ -1562,7 +1576,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                     quote!()
                 } else {
                     quote! {
-                        let __arr: [::bstack_raii::ForeignPtr; #total] = __on_disk.#fname;
+                        let __arr: [::bstack_raii::ForeignRepr; #total] = __on_disk.#fname;
                         for __k in 0usize..(#total) {
                             let __fp = __arr[__k];
                             #elem_drop
@@ -1575,8 +1589,8 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                 let elem_clone = foreign_elem_clone(kind, ftarget);
                 clone_stmts.push(quote! {
                     {
-                        let __arr: [::bstack_raii::ForeignPtr; #total] = __od.#fname;
-                        let mut __narr: [::bstack_raii::ForeignPtr; #total] = __arr;
+                        let __arr: [::bstack_raii::ForeignRepr; #total] = __od.#fname;
+                        let mut __narr: [::bstack_raii::ForeignRepr; #total] = __arr;
                         for __k in 0usize..(#total) {
                             let __fp = __arr[__k];
                             #elem_clone
@@ -2176,7 +2190,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                 .enumerate()
                 .map(|(i, e)| {
                     if is_foreign[i] {
-                        quote!(::bstack_raii::ForeignPtr)
+                        quote!(::bstack_raii::ForeignRepr)
                     } else {
                         quote!(#e)
                     }
@@ -2235,11 +2249,11 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                     if is_foreign[i] {
                         if nulls[i] {
                             quote!(match #fname.#ix {
-                                ::core::option::Option::Some(__f) => __f.ptr(),
-                                ::core::option::Option::None => ::bstack_raii::ForeignPtr::new(0, 0),
+                                ::core::option::Option::Some(__f) => __f.repr(),
+                                ::core::option::Option::None => ::bstack_raii::ForeignRepr::new(0, 0),
                             })
                         } else {
-                            quote!(#fname.#ix.ptr())
+                            quote!(#fname.#ix.repr())
                         }
                     } else {
                         quote!(#fname.#ix)
@@ -2262,14 +2276,14 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                 let elem_drop = foreign_elem_drop(kind, ft);
                 tup_drops.push(quote! {
                     {
-                        let __fp: ::bstack_raii::ForeignPtr = __w.#ix;
+                        let __fp: ::bstack_raii::ForeignRepr = __w.#ix;
                         #elem_drop
                     }
                 });
                 let elem_clone = foreign_elem_clone(kind, ft);
                 tup_clones.push(quote! {
                     {
-                        let __fp: ::bstack_raii::ForeignPtr = __w.#ix;
+                        let __fp: ::bstack_raii::ForeignRepr = __w.#ix;
                         #elem_clone
                         __w.#ix = __newfp;
                     }
@@ -3608,7 +3622,7 @@ fn foreign_elem_clone(kind: Kind, ftarget: &Type) -> TokenStream {
         Kind::Owned => {
             let err = not_attached("#[bstack_owned]");
             quote! {
-                let __newfp: ::bstack_raii::ForeignPtr = {
+                let __newfp: ::bstack_raii::ForeignRepr = {
                     let __off = __fp.offset();
                     if __off == 0 {
                         __fp
@@ -3618,7 +3632,7 @@ fn foreign_elem_clone(kind: Kind, ftarget: &Type) -> TokenStream {
                             let __child = <#ftarget as ::bstack_raii::BStackBlock>::from_range(
                                 ::bstack_raii::BStackRange::new(__off, #od_size));
                             let __new = __child.__bstack_clone_into(allocator, __plan)?;
-                            ::bstack_raii::ForeignPtr::new(0, __new.start())
+                            ::bstack_raii::ForeignRepr::new(0, __new.start())
                         } else if __plan.is_measuring() {
                             // Foreign deep-clone is build-only; this value is discarded
                             // in the measure pass (home-file sizes only).
@@ -3632,7 +3646,7 @@ fn foreign_elem_clone(kind: Kind, ftarget: &Type) -> TokenStream {
                                 ::bstack_raii::ForeignHostAllocator::new(__host, __id);
                             let __new_off = unsafe {
                                 ::bstack_raii::__private::foreign_clone_owned::<#ftarget, _>(&__adapter, __off)? };
-                            ::bstack_raii::ForeignPtr::new(__fid, __new_off)
+                            ::bstack_raii::ForeignRepr::new(__fid, __new_off)
                         } else {
                             #malformed
                         }
@@ -3643,7 +3657,7 @@ fn foreign_elem_clone(kind: Kind, ftarget: &Type) -> TokenStream {
         Kind::Strong => {
             let err = not_attached("#[bstack_strong]");
             quote! {
-                let __newfp: ::bstack_raii::ForeignPtr = {
+                let __newfp: ::bstack_raii::ForeignRepr = {
                     let __off = __fp.offset();
                     if __off != 0 {
                         let __fid = __fp.file_id();
@@ -3672,7 +3686,7 @@ fn foreign_elem_clone(kind: Kind, ftarget: &Type) -> TokenStream {
         Kind::Weak => {
             let err = not_attached("#[bstack_weak]");
             quote! {
-                let __newfp: ::bstack_raii::ForeignPtr = {
+                let __newfp: ::bstack_raii::ForeignRepr = {
                     let __off = __fp.offset();
                     if __off != 0 {
                         let __fid = __fp.file_id();
@@ -3697,7 +3711,7 @@ fn foreign_elem_clone(kind: Kind, ftarget: &Type) -> TokenStream {
             }
         }
         // Ref aliases the pointer verbatim.
-        _ => quote! { let __newfp: ::bstack_raii::ForeignPtr = __fp; },
+        _ => quote! { let __newfp: ::bstack_raii::ForeignRepr = __fp; },
     }
 }
 
@@ -5611,14 +5625,14 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                         reject_bad_foreign_target(ftarget, ty, "a `Foreign` vec variant")?;
                         let elem_nullable = option_inner(velem).is_some();
                         let store =
-                            quote!(::bstack_raii::BStackVec::<::bstack_raii::ForeignPtr, __A>);
+                            quote!(::bstack_raii::BStackVec::<::bstack_raii::ForeignRepr, __A>);
                         let fty = if elem_nullable {
                             quote!(::core::option::Option<::bstack_raii::Foreign<#ftarget>>)
                         } else {
                             quote!(::bstack_raii::Foreign<#ftarget>)
                         };
                         let from_ptr = if elem_nullable {
-                            quote!(|__p: ::bstack_raii::ForeignPtr| if __p.offset() == 0 {
+                            quote!(|__p: ::bstack_raii::ForeignRepr| if __p.offset() == 0 {
                                 ::core::option::Option::None
                             } else {
                                 ::core::option::Option::Some(
@@ -5629,17 +5643,17 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                         };
                         let to_ptr = if elem_nullable {
                             quote!(|__f: #fty| match __f {
-                                ::core::option::Option::Some(__ff) => __ff.ptr(),
-                                ::core::option::Option::None => ::bstack_raii::ForeignPtr::new(0, 0),
+                                ::core::option::Option::Some(__ff) => __ff.repr(),
+                                ::core::option::Option::None => ::bstack_raii::ForeignRepr::new(0, 0),
                             })
                         } else {
-                            quote!(|__f: #fty| __f.ptr())
+                            quote!(|__f: #fty| __f.repr())
                         };
                         data_variants.push(quote!(#vname(::std::vec::Vec<#fty>),));
                         view_variants.push(quote!(#vname(::std::vec::Vec<#fty>),));
                         new_arms.push(quote! {
                             #data::#vname(__list) => {
-                                let __ptrs: ::std::vec::Vec<::bstack_raii::ForeignPtr> =
+                                let __ptrs: ::std::vec::Vec<::bstack_raii::ForeignRepr> =
                                     __list.into_iter().map(#to_ptr).collect();
                                 let __desc = #store::from_slice(allocator, &__ptrs)?.descriptor();
                                 let mut __pl = [0u8; #payload_const];
@@ -5682,7 +5696,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                         clone_arms.push(quote! {
                             #disc => {
                                 let __src = #store::from_desc(#read_desc, allocator).to_vec()?;
-                                let mut __new: ::std::vec::Vec<::bstack_raii::ForeignPtr> =
+                                let mut __new: ::std::vec::Vec<::bstack_raii::ForeignRepr> =
                                     ::std::vec::Vec::with_capacity(__src.len());
                                 for __fp in __src {
                                     #elem_clone
@@ -6093,12 +6107,12 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                         let leaf_write = |k: &Ident, leaf: &Ident| {
                             let to_fp = if elem_nullable {
                                 quote!(match #leaf {
-                                    ::core::option::Option::Some(__f) => __f.ptr(),
+                                    ::core::option::Option::Some(__f) => __f.repr(),
                                     ::core::option::Option::None =>
-                                        ::bstack_raii::ForeignPtr::new(0, 0),
+                                        ::bstack_raii::ForeignRepr::new(0, 0),
                                 })
                             } else {
-                                quote!(#leaf.ptr())
+                                quote!(#leaf.repr())
                             };
                             quote!(__pl[(#k) * 16..(#k) * 16 + 16].copy_from_slice(
                                 ::bstack_raii::bytemuck::bytes_of(&(#to_fp)));)
@@ -6115,7 +6129,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                         // read / move: reshape `[ForeignPtr; TOTAL]` → nested handles.
                         let leaf_read = |k: &Ident| {
                             let fp = quote!(::bstack_raii::bytemuck::pod_read_unaligned::<
-                                ::bstack_raii::ForeignPtr,
+                                ::bstack_raii::ForeignRepr,
                             >(&__pl[(#k) * 16..(#k) * 16 + 16]));
                             if elem_nullable {
                                 quote!({
@@ -6142,7 +6156,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                                 #disc => {
                                     for __k in 0usize..(#total) {
                                         let __fp = ::bstack_raii::bytemuck::pod_read_unaligned::<
-                                            ::bstack_raii::ForeignPtr,
+                                            ::bstack_raii::ForeignRepr,
                                         >(&__pl[__k * 16..__k * 16 + 16]);
                                         #elem_drop
                                     }
@@ -6153,7 +6167,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                                 #disc => {
                                     for __k in 0usize..(#total) {
                                         let __fp = ::bstack_raii::bytemuck::pod_read_unaligned::<
-                                            ::bstack_raii::ForeignPtr,
+                                            ::bstack_raii::ForeignRepr,
                                         >(&__pl[__k * 16..__k * 16 + 16]);
                                         #elem_clone
                                         __pl[__k * 16..__k * 16 + 16].copy_from_slice(
@@ -6590,7 +6604,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                     payload_sizes.push(quote!(16usize));
                     let fty = quote!(::bstack_raii::Foreign<#ftarget>);
                     let read_fp = quote!(::bstack_raii::bytemuck::pod_read_unaligned::<
-                        ::bstack_raii::ForeignPtr,
+                        ::bstack_raii::ForeignRepr,
                     >(&__pl[..16]));
                     data_variants.push(quote!(#vname(#fty),));
                     view_variants.push(quote!(#vname(#fty),));
@@ -6598,7 +6612,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                         #data::#vname(__f) => {
                             let mut __pl = [0u8; #payload_const];
                             __pl[..16].copy_from_slice(
-                                ::bstack_raii::bytemuck::bytes_of(&__f.ptr()));
+                                ::bstack_raii::bytemuck::bytes_of(&__f.repr()));
                             (#disc, __pl)
                         }
                     });
@@ -6614,14 +6628,14 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                         let elem_drop = foreign_elem_drop(kind, ftarget);
                         drop_arms.push(quote! {
                             #disc => {
-                                let __fp: ::bstack_raii::ForeignPtr = #read_fp;
+                                let __fp: ::bstack_raii::ForeignRepr = #read_fp;
                                 #elem_drop
                             }
                         });
                         let elem_clone = foreign_elem_clone(kind, ftarget);
                         clone_arms.push(quote! {
                             #disc => {
-                                let __fp: ::bstack_raii::ForeignPtr = #read_fp;
+                                let __fp: ::bstack_raii::ForeignRepr = #read_fp;
                                 #elem_clone
                                 __pl[..16].copy_from_slice(
                                     ::bstack_raii::bytemuck::bytes_of(&__newfp));
@@ -6710,12 +6724,12 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                             if is_foreign[i] {
                                 let to_fp = if nulls[i] {
                                     quote!(match #b {
-                                        ::core::option::Option::Some(__x) => __x.ptr(),
+                                        ::core::option::Option::Some(__x) => __x.repr(),
                                         ::core::option::Option::None =>
-                                            ::bstack_raii::ForeignPtr::new(0, 0),
+                                            ::bstack_raii::ForeignRepr::new(0, 0),
                                     })
                                 } else {
-                                    quote!(#b.ptr())
+                                    quote!(#b.repr())
                                 };
                                 quote!(__pl[(#off)..(#off) + 16].copy_from_slice(
                                     ::bstack_raii::bytemuck::bytes_of(&(#to_fp)));)
@@ -6741,7 +6755,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                             if is_foreign[i] {
                                 let ft = ftargets[i].unwrap();
                                 let fp = quote!(::bstack_raii::bytemuck::pod_read_unaligned::<
-                                    ::bstack_raii::ForeignPtr,
+                                    ::bstack_raii::ForeignRepr,
                                 >(&__pl[(#off)..(#off) + 16]));
                                 if nulls[i] {
                                     quote!({
@@ -6777,16 +6791,16 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                             let off = &offsets[i];
                             let ft = ftargets[i].unwrap();
                             let read_fp = quote!(::bstack_raii::bytemuck::pod_read_unaligned::<
-                                ::bstack_raii::ForeignPtr,
+                                ::bstack_raii::ForeignRepr,
                             >(&__pl[(#off)..(#off) + 16]));
                             let ed = foreign_elem_drop(kind, ft);
                             drops.push(
-                                quote! { { let __fp: ::bstack_raii::ForeignPtr = #read_fp; #ed } },
+                                quote! { { let __fp: ::bstack_raii::ForeignRepr = #read_fp; #ed } },
                             );
                             let ec = foreign_elem_clone(kind, ft);
                             clones.push(quote! {
                                 {
-                                    let __fp: ::bstack_raii::ForeignPtr = #read_fp;
+                                    let __fp: ::bstack_raii::ForeignRepr = #read_fp;
                                     #ec
                                     __pl[(#off)..(#off) + 16].copy_from_slice(
                                         ::bstack_raii::bytemuck::bytes_of(&__newfp));
