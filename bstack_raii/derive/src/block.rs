@@ -5923,14 +5923,16 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
         .collect();
     for variant in &input.variants {
         let kind = classify_attrs(&variant.attrs)?;
-        // `#[bstack_mut]` generates a `set_`/`replace_` mutator only for struct
-        // fields; a `#[bstack_enum]` variant has no generated mutator at all, so the
-        // annotation would be a *silent* no-op. Reject it rather than ignoring it.
+        // A `#[bstack_mut]` mutator on an enum is *whole-value* (the payload's
+        // meaning depends on the discriminant, so there is no per-variant field to
+        // set). Put `#[bstack_mut]` on the enum itself — it is a no-op / error on a
+        // variant.
         if is_bstack_mut(&variant.attrs) {
             return Err(Error::new_spanned(
                 variant,
-                "#[bstack_mut] is not supported on `#[bstack_enum]` variants — no field \
-                 mutator is generated for an enum; mutate by rebuilding the value",
+                "#[bstack_mut] on a `#[bstack_enum]` goes on the enum itself (a whole-value \
+                 `set` / `replace`), not on a variant — a variant has no separately \
+                 mutable field",
             ));
         }
         for f in &variant.fields {
@@ -8203,6 +8205,126 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
         quote!()
     };
 
+    // Whole-value `#[bstack_mut]` on the enum itself: `set` when no variant owns
+    // anything (a wholesale overwrite is safe), else `replace` (hand the old value
+    // out). Both are one crash-atomic `set` of the same-size record. Only for a
+    // plain enum (an `rc` / `rc, weak` block's injected refcount / control must not
+    // be clobbered) and not with `#[embed]` variants (their post-write copy / re-home
+    // makes in-place replacement a separate problem).
+    let enum_mut_methods = if is_bstack_mut(&input.attrs) {
+        if mode != Mode::Plain {
+            return Err(Error::new_spanned(
+                &input.ident,
+                "#[bstack_mut] on a `#[bstack_enum]` is only supported for a plain enum — a \
+                 shared (`rc` / `rc, weak`) enum's refcount / control block can't be \
+                 overwritten in place; rebuild the value instead",
+            ));
+        }
+        if enum_has_embed {
+            return Err(Error::new_spanned(
+                &input.ident,
+                "#[bstack_mut] is not yet supported on a `#[bstack_enum]` with an `#[embed]` \
+                 variant",
+            ));
+        }
+        let build_image = quote! {
+            let (__disc, __payload): (#disc_ty, [u8; #payload_const]) = match data {
+                #(#new_arms)*
+            };
+            let __on_disk = #on_disk {
+                #enum_header
+                __bstack_disc: __disc,
+                __bstack_payload: __payload,
+            };
+        };
+        if drop_arms.is_empty() {
+            // No variant owns anything (pure POD / ref / foreign-ref): a wholesale
+            // overwrite frees nothing and needs no hand-back.
+            quote! {
+                /// Overwrite the whole enum value (variant + payload) in place, as
+                /// one crash-atomic `set`. Available because no variant owns
+                /// anything, so nothing is stranded.
+                #[allow(unused_variables)]
+                #vis fn set<'__e, __A: ::bstack_raii::BStackRaiiAllocator>(
+                    &self,
+                    allocator: &'__e __A,
+                    data: #data_ty,
+                ) -> ::std::io::Result<()> {
+                    #build_image
+                    allocator
+                        .stack()
+                        .set(self.0.start(), ::bstack_raii::bytemuck::bytes_of(&__on_disk))
+                }
+            }
+        } else {
+            // Some variant owns children: install the new value and move the old
+            // one out (`bstack_move!`'s per-variant reconstruction), upholding the
+            // `ReplaceError` "never lose the new value" contract.
+            quote! {
+                /// Replace the whole enum value (variant + payload), moving the old
+                /// value out. One crash-atomic `set`; on I/O failure the *new* value
+                /// is handed back through [`ReplaceError`](::bstack_raii::ReplaceError).
+                #[allow(unused_variables)]
+                #vis fn replace<'__e, __A: ::bstack_raii::BStackRaiiAllocator>(
+                    &self,
+                    allocator: &'__e __A,
+                    data: #data_ty,
+                ) -> ::core::result::Result<#data_ty, ::bstack_raii::ReplaceError<#data_ty>> {
+                    let __alloc = allocator;
+                    // Reconstruct an owned `EData` from a (disc, payload) pair — the
+                    // same per-variant logic as `bstack_move!`, transferring children
+                    // out (nothing freed).
+                    let __reconstruct = |__disc: #disc_ty, __pl: [u8; #payload_const]|
+                        -> ::std::io::Result<#data_ty>
+                    {
+                        ::std::result::Result::Ok(match __disc {
+                            #(#move_arms)*
+                            _ => return ::std::result::Result::Err(::std::io::Error::new(
+                                ::std::io::ErrorKind::InvalidData,
+                                "bstack_enum: invalid discriminant",
+                            )),
+                        })
+                    };
+                    // 1. Read the old disc + payload before consuming `data`.
+                    let mut __buf = [0u8; ::core::mem::size_of::<#on_disk>()];
+                    let __r = unsafe { ::bstack_raii::BStackRef::<Self>::from_range(self.0) };
+                    let (__old_disc, __old_pl) =
+                        match __r.read_on_disk(allocator.stack(), &mut __buf) {
+                            ::std::result::Result::Ok(__od) =>
+                                (__od.__bstack_disc, __od.__bstack_payload),
+                            ::std::result::Result::Err(__e) =>
+                                return ::core::result::Result::Err(
+                                    ::bstack_raii::ReplaceError::recovered(__e, data)),
+                        };
+                    // 2. Consume the new value into its on-disk image.
+                    #build_image
+                    // 3. Commit (single atomic write of the same-size record).
+                    if let ::std::result::Result::Err(__e) = allocator
+                        .stack()
+                        .set(self.0.start(), ::bstack_raii::bytemuck::bytes_of(&__on_disk))
+                    {
+                        return ::core::result::Result::Err(
+                            match __reconstruct(__disc, __payload) {
+                                ::std::result::Result::Ok(__hb) =>
+                                    ::bstack_raii::ReplaceError::recovered(__e, __hb),
+                                ::std::result::Result::Err(_) =>
+                                    ::bstack_raii::ReplaceError::lost(__e),
+                            },
+                        );
+                    }
+                    // 4. Reconstruct + return the old value (now overwritten on disk).
+                    match __reconstruct(__old_disc, __old_pl) {
+                        ::std::result::Result::Ok(__old) => ::core::result::Result::Ok(__old),
+                        ::std::result::Result::Err(__e) =>
+                            ::core::result::Result::Err(::bstack_raii::ReplaceError::lost(__e)),
+                    }
+                }
+            }
+        }
+    } else {
+        quote!()
+    };
+
     let enum_handle_def = if type_params.is_empty() {
         quote! {
             #[derive(::core::clone::Clone, ::core::marker::Copy)]
@@ -8391,6 +8513,8 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                     )
                 }
             }
+
+            #enum_mut_methods
         }
 
         #shared_impl

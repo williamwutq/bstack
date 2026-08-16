@@ -336,12 +336,22 @@ pub mod __private {
 /// # fn main() {}
 /// ```
 ///
-/// `#[bstack_mut]` on a **variant** — an enum generates no field mutator, so the
-/// annotation is rejected rather than silently ignored:
+/// `#[bstack_mut]` on a **variant** — an enum mutator is whole-value, so the
+/// annotation goes on the enum itself (below), not a variant:
 /// ```compile_fail
 /// use bstack_raii::bstack_enum;
 /// #[bstack_enum]
 /// enum E { #[bstack_mut] A(u32) }
+/// # fn main() {}
+/// ```
+///
+/// Whole-value `#[bstack_mut]` on a **shared** (`rc`) enum — its refcount can't be
+/// overwritten in place:
+/// ```compile_fail
+/// use bstack_raii::bstack_enum;
+/// #[bstack_enum(rc)]
+/// #[bstack_mut]
+/// enum E { A, B(u32) }
 /// # fn main() {}
 /// ```
 ///

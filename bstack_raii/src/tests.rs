@@ -7752,6 +7752,163 @@ fn macro_bstack_mut_vec_annotation_is_accepted_noop() {
 }
 
 // --------------------------------------------------------------------------
+// #[bstack_mut] on a whole `#[bstack_enum]`: `set` (own-nothing) / `replace`
+// (owns children). The annotation goes on the enum itself.
+// --------------------------------------------------------------------------
+
+#[bstack_enum]
+#[bstack_mut]
+enum MutPodState {
+    Idle,
+    Active(u32),
+    Failed(i64),
+}
+
+#[test]
+fn macro_bstack_mut_enum_pod_set() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+
+    let e = MutPodState::new(&alloc, MutPodStateData::Idle).unwrap();
+    assert!(matches!(
+        e.handle().read(&alloc).unwrap(),
+        MutPodStateView::Idle
+    ));
+
+    // Whole-value overwrite — including changing the active variant.
+    e.handle().set(&alloc, MutPodStateData::Active(7)).unwrap();
+    match e.handle().read(&alloc).unwrap() {
+        MutPodStateView::Active(n) => assert_eq!(n, 7),
+        _ => panic!("expected Active"),
+    }
+    e.handle().set(&alloc, MutPodStateData::Failed(-3)).unwrap();
+    match e.handle().read(&alloc).unwrap() {
+        MutPodStateView::Failed(n) => assert_eq!(n, -3),
+        _ => panic!("expected Failed"),
+    }
+
+    e.bstack_drop(&alloc).unwrap();
+}
+
+#[bstack_enum]
+#[bstack_mut]
+enum MutOwnedNode {
+    Empty,
+    Num(u32),
+    #[bstack_owned]
+    Child(MacroLeaf),
+}
+
+#[test]
+fn macro_bstack_mut_enum_owned_replace_moves_old_out() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let e = MutOwnedNode::new(
+        &alloc,
+        MutOwnedNodeData::Child(MacroLeaf::new(&alloc, 7).unwrap()),
+    )
+    .unwrap();
+
+    // Replace Child(7) with Child(70): the old Child(7) is moved out, still live.
+    let old = e
+        .handle()
+        .replace(
+            &alloc,
+            MutOwnedNodeData::Child(MacroLeaf::new(&alloc, 70).unwrap()),
+        )
+        .unwrap();
+    match old {
+        MutOwnedNodeData::Child(o) => {
+            assert_eq!(o.handle().get_val(stack).unwrap(), 7);
+            o.bstack_drop(&alloc).unwrap(); // caller owns it
+        }
+        _ => panic!("expected old Child"),
+    }
+    match e.handle().read(&alloc).unwrap() {
+        MutOwnedNodeView::Child(c) => assert_eq!(c.get_val(stack).unwrap(), 70),
+        _ => panic!("expected Child"),
+    }
+
+    // Replace the owned variant with a POD one: the old Child(70) moves out.
+    let old2 = e
+        .handle()
+        .replace(&alloc, MutOwnedNodeData::Num(5))
+        .unwrap();
+    match old2 {
+        MutOwnedNodeData::Child(o) => o.bstack_drop(&alloc).unwrap(),
+        _ => panic!("expected old Child"),
+    }
+    assert!(matches!(
+        e.handle().read(&alloc).unwrap(),
+        MutOwnedNodeView::Num(5)
+    ));
+
+    // The enum now owns nothing; teardown reclaims just the shell, no leak.
+    e.bstack_drop(&alloc).unwrap();
+    assert_teardown_reclaims(&alloc, || {
+        MutOwnedNode::new(
+            &alloc,
+            MutOwnedNodeData::Child(MacroLeaf::new(&alloc, 1).unwrap()),
+        )
+        .unwrap()
+    });
+}
+
+#[bstack_enum]
+#[bstack_mut]
+enum MutStrongNode {
+    Empty,
+    #[bstack_strong]
+    Shared(MacroStrongChild),
+}
+
+#[test]
+fn macro_bstack_mut_enum_strong_replace_moves_count_out() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let c = MacroStrongChild::new(&alloc, 5).unwrap(); // strong = 1
+    let e = MutStrongNode::new(&alloc, MutStrongNodeData::Shared(c)).unwrap();
+    match e.handle().read(&alloc).unwrap() {
+        MutStrongNodeView::Shared(child) => assert_eq!(child.get_val(stack).unwrap(), 5),
+        _ => panic!("expected Shared"),
+    }
+
+    // Replace with a fresh shared child: the old strong ref (count 1) moves out.
+    let b = MacroStrongChild::new(&alloc, 50).unwrap();
+    let old = e
+        .handle()
+        .replace(&alloc, MutStrongNodeData::Shared(b))
+        .unwrap();
+    match old {
+        MutStrongNodeData::Shared(rc) => {
+            assert_eq!(rc.handle().get_val(stack).unwrap(), 5);
+            drop(rc); // decrements the old child (1 -> 0), frees it
+        }
+        _ => panic!("expected old Shared"),
+    }
+
+    // Replace the strong variant with Empty: the current child's count moves out.
+    let old2 = e
+        .handle()
+        .replace(&alloc, MutStrongNodeData::Empty)
+        .unwrap();
+    match old2 {
+        MutStrongNodeData::Shared(rc) => drop(rc),
+        _ => panic!("expected old Shared"),
+    }
+    assert!(matches!(
+        e.handle().read(&alloc).unwrap(),
+        MutStrongNodeView::Empty
+    ));
+
+    e.bstack_drop(&alloc).unwrap();
+}
+
+// --------------------------------------------------------------------------
 // Foreign<T>: cross-file wide pointer resolved through the registry
 // --------------------------------------------------------------------------
 

@@ -739,6 +739,31 @@ its accessor returns *is* mutating the field; `#[bstack_mut]` on a `Vec` is an
 accepted no-op. `Foreign` shapes have no mutator yet (`#[bstack_mut]` on one is a
 compile error).
 
+### Enums
+
+An enum's payload has no stable "field" to set — its meaning depends on the active
+variant — so `#[bstack_mut]` on the **enum itself** generates a *whole-value*
+mutator that overwrites the discriminant + payload together, as one crash-atomic
+`set`:
+
+```rust
+#[bstack_enum]
+#[bstack_mut]
+enum State { Idle, Active(u32), #[bstack_owned] Holding(Child) }
+
+// owns nothing → `set` (wholesale overwrite):
+// e.handle().set(&alloc, StateData::Active(7))?;
+// owns children → `replace` (moves the old value out, ReplaceError contract):
+let old = e.handle().replace(&alloc, StateData::Idle)?; // old: StateData::Holding(BStackOwned<Child>)
+```
+
+`set` is generated when no variant owns anything (pure POD / `ref` / foreign-`ref`);
+`replace` when some variant owns children (owned / strong / weak / foreign) — it
+hands the old value back as the enum's owned form (`EData`), so nothing is stranded.
+`#[bstack_mut]` on a **variant** is an error (it goes on the enum), as is
+`#[bstack_mut]` on a shared (`rc` / `rc, weak`) enum or one with an `#[embed]`
+variant.
+
 There is also a raw escape hatch on **every** scalar field —
 `unsafe fn raw_<field>_slice(stack) -> BStackSlice` — a view over the field's
 inline storage (`.read()` / `.write()`). Reads are always valid; writing bypasses
