@@ -122,6 +122,9 @@ impl<T: Pod> BStackCast for BStackBox<T> {
     }
 }
 
+// Self-contained (no separate control block): may be `#[embed]`ded.
+impl<T: Pod> crate::block::BStackEmbeddable for BStackBox<T> {}
+
 impl<T: Pod> BStackBlock for BStackBox<T> {
     type OnDisk = BoxOnDisk<T>;
 

@@ -490,6 +490,9 @@ impl<T: BStackBlock> BStackCast for BStackDeque<T> {
     }
 }
 
+// Self-contained (no separate control block): may be `#[embed]`ded.
+impl<T: BStackBlock> crate::block::BStackEmbeddable for BStackDeque<T> {}
+
 impl<T: BStackBlock> BStackBlock for BStackDeque<T> {
     type OnDisk = DequeOnDisk;
 

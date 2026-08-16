@@ -460,6 +460,9 @@ impl<K: Pod, V: BStackBlock> BStackCast for BStackHashMap<K, V> {
     }
 }
 
+// Self-contained (no separate control block): may be `#[embed]`ded.
+impl<K: Pod, V: BStackBlock> crate::block::BStackEmbeddable for BStackHashMap<K, V> {}
+
 impl<K: Pod, V: BStackBlock> BStackBlock for BStackHashMap<K, V> {
     type OnDisk = MapOnDisk;
 

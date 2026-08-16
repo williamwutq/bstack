@@ -397,6 +397,9 @@ impl<K: Pod> BStackCast for BStackHashSet<K> {
     }
 }
 
+// Self-contained (no separate control block): may be `#[embed]`ded.
+impl<K: Pod> crate::block::BStackEmbeddable for BStackHashSet<K> {}
+
 impl<K: Pod> BStackBlock for BStackHashSet<K> {
     type OnDisk = HashSetOnDisk;
 

@@ -234,6 +234,9 @@ impl BStackCast for BStackString {
     }
 }
 
+// Self-contained (no separate control block): may be `#[embed]`ded.
+impl crate::block::BStackEmbeddable for BStackString {}
+
 impl BStackBlock for BStackString {
     type OnDisk = StringOnDisk;
 

@@ -993,6 +993,9 @@ impl<K: Pod + Ord, V: BStackBlock> BStackCast for BStackBTreeMap<K, V> {
     }
 }
 
+// Self-contained (no separate control block): may be `#[embed]`ded.
+impl<K: Pod + Ord, V: BStackBlock> crate::block::BStackEmbeddable for BStackBTreeMap<K, V> {}
+
 impl<K: Pod + Ord, V: BStackBlock> BStackBlock for BStackBTreeMap<K, V> {
     type OnDisk = TreeOnDisk;
 

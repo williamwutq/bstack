@@ -815,6 +815,9 @@ impl<K: Pod + Ord> BStackCast for BStackBTreeSet<K> {
     }
 }
 
+// Self-contained (no separate control block): may be `#[embed]`ded.
+impl<K: Pod + Ord> crate::block::BStackEmbeddable for BStackBTreeSet<K> {}
+
 impl<K: Pod + Ord> BStackBlock for BStackBTreeSet<K> {
     type OnDisk = TreeSetOnDisk;
 

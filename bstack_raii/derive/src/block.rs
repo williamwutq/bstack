@@ -131,6 +131,9 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         /// requires `T: 'static`, so such a parameter needs the `'static` bound even
         /// though a foreign target is never stored inline (so `in_ondisk` is not set).
         foreign: bool,
+        /// The parameter is `#[embed]`ded (inlined). `#[embed]` targets must be
+        /// self-contained (`BStackEmbeddable`) — never `(rc)` / `(rc, weak)`.
+        embed: bool,
     }
     let mut usage: Vec<(Ident, Usage)> = type_params
         .iter()
@@ -183,6 +186,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                 Kind::Embed => {
                     u.blockish = true;
                     u.in_ondisk = true;
+                    u.embed = true;
                 }
                 Kind::Ref | Kind::Owned => u.blockish = true,
                 Kind::Strong => {
@@ -231,6 +235,13 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                 if u.foreign_owned {
                     // An owned foreign target is deep-cloned via its own `try_clone_in`.
                     tp.bounds.push(syn::parse_quote!(::bstack_raii::TryCloneIn));
+                }
+                if u.embed {
+                    // An `#[embed]`ded param must be a plain, self-contained block —
+                    // never `(rc)` / `(rc, weak)` (its control block would be stranded).
+                    tp.bounds.push(syn::parse_quote!(
+                        ::bstack_raii::__private::BStackEmbeddable
+                    ));
                 }
             }
         }
@@ -1705,6 +1716,15 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                     ));
                 }
                 let child = elem;
+                // Guard: `#[embed]` target must be a plain, self-contained block.
+                if !type_mentions_any(child, &type_params) {
+                    wrapper_defs.push(quote! {
+                        const _: fn() = || {
+                            fn __assert_embeddable<__T: ::bstack_raii::__private::BStackEmbeddable>() {}
+                            __assert_embeddable::<#child>();
+                        };
+                    });
+                }
                 let child_od = quote!(<#child as ::bstack_raii::BStackBlock>::OnDisk);
                 on_disk_fields.push(quote!(#fname: [#child_od; #total],));
 
@@ -2462,6 +2482,18 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                 ));
             }
             let child = inner_ty;
+            // Guard: an `#[embed]` target must be a plain, self-contained block
+            // (`BStackEmbeddable`) — never `(rc)` / `(rc, weak)`, whose refcount /
+            // separate control block embedding would strand. A concrete target gets a
+            // direct assertion here; a generic one is bounded via `Usage` above.
+            if !type_mentions_any(child, &type_params) {
+                wrapper_defs.push(quote! {
+                    const _: fn() = || {
+                        fn __assert_embeddable<__T: ::bstack_raii::__private::BStackEmbeddable>() {}
+                        __assert_embeddable::<#child>();
+                    };
+                });
+            }
             let child_od = quote!(<#child as ::bstack_raii::BStackBlock>::OnDisk);
             on_disk_fields.push(quote!(#fname: #child_od,));
 
@@ -2812,6 +2844,16 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         },
     };
 
+    // A plain block is self-contained (no separate control block), so it may be
+    // `#[embed]`ded; `(rc)` / `(rc, weak)` blocks are deliberately not `BStackEmbeddable`.
+    let embeddable_impl = if mode == Mode::Plain {
+        quote! {
+            impl #impl_g ::bstack_raii::__private::BStackEmbeddable for #name #ty_g #where_g {}
+        }
+    } else {
+        quote!()
+    };
+
     let weakable_items = if mode == Mode::RcWeak {
         quote! {
             #[repr(C, packed)]
@@ -3124,6 +3166,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         }
 
         #shared_impl
+        #embeddable_impl
         #weakable_items
         #move_impl
         #clone_impl
@@ -5611,6 +5654,10 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
     let mut clone_arms = Vec::new();
     let mut payload_sizes = Vec::new();
     let mut pod_types: Vec<Type> = Vec::new();
+    // `#[embed]`ded variant children — asserted `BStackEmbeddable` (plain, self-contained)
+    // so an `(rc)` / `(rc, weak)` child cannot be inlined and strand its control block.
+    // Enum embed is always concrete (a generic embed variant is rejected in `EUsage`).
+    let mut embed_types: Vec<TokenStream> = Vec::new();
     let mut needs_payload = false;
     // A strong/weak variant makes `EData` generic over `<'e, A>`; a weak variant
     // also makes `EView` generic (its read upgrades to a `BStackRc`).
@@ -6296,6 +6343,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                         }
                         enum_has_embed = true;
                         let child = elem;
+                        embed_types.push(quote!(#child));
                         let co = quote!(<#child as ::bstack_raii::BStackBlock>::OnDisk);
                         payload_sizes.push(quote!((#total) * ::core::mem::size_of::<#co>()));
 
@@ -7103,6 +7151,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                     // `#[embed] V(Child)`: the child's whole on-disk form is stored
                     // INLINE in the payload (header and all).
                     Kind::Embed => {
+                        embed_types.push(quote!(#ty));
                         let co = quote!(<#ty as ::bstack_raii::BStackBlock>::OnDisk);
                         payload_sizes.push(quote!(::core::mem::size_of::<#co>()));
                         data_variants.push(quote!(#vname(::bstack_raii::BStackOwned<#ty>),));
@@ -7559,6 +7608,14 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
             }
         },
     };
+    // A plain enum is self-contained, so it may be `#[embed]`ded; an `rc` enum is not.
+    let embeddable_impl = if mode == Mode::Plain {
+        quote! {
+            impl #enum_impl_g ::bstack_raii::__private::BStackEmbeddable for #name #enum_ty_g #enum_where {}
+        }
+    } else {
+        quote!()
+    };
     let weakable_items = if mode == Mode::RcWeak {
         quote! {
             #[repr(C, packed)]
@@ -7776,6 +7833,11 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
             #( __assert_pod::<#pod_types>(); )*
         };
 
+        const _: fn() = || {
+            fn __assert_embeddable<__T: ::bstack_raii::__private::BStackEmbeddable>() {}
+            #( __assert_embeddable::<#embed_types>(); )*
+        };
+
         /// The in-memory owned form of the enum's payload — POD by value and
         /// each child/reference as an owned handle (owned → `BStackOwned`,
         /// strong → `BStackRc`, weak → `BStackWeak`, ref → `BStackRef`).
@@ -7906,6 +7968,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
         }
 
         #shared_impl
+        #embeddable_impl
         #weakable_items
 
         impl #enum_impl_g ::bstack_raii::BStackMove for #name #enum_ty_g #enum_where {

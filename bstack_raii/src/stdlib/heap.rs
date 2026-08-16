@@ -344,6 +344,9 @@ impl<K: Pod + Ord, V: BStackBlock> BStackCast for BStackBinaryHeap<K, V> {
     }
 }
 
+// Self-contained (no separate control block): may be `#[embed]`ded.
+impl<K: Pod + Ord, V: BStackBlock> crate::block::BStackEmbeddable for BStackBinaryHeap<K, V> {}
+
 impl<K: Pod + Ord, V: BStackBlock> BStackBlock for BStackBinaryHeap<K, V> {
     type OnDisk = HeapOnDisk;
 

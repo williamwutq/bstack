@@ -325,6 +325,9 @@ impl<K: Pod> BStackCast for BStackCountingBloomFilter<K> {
     }
 }
 
+// Self-contained (no separate control block): may be `#[embed]`ded.
+impl<K: Pod> crate::block::BStackEmbeddable for BStackCountingBloomFilter<K> {}
+
 impl<K: Pod> BStackBlock for BStackCountingBloomFilter<K> {
     type OnDisk = BloomOnDisk;
 

@@ -435,6 +435,9 @@ impl<T: BStackBlock> BStackCast for BStackLinkedList<T> {
     }
 }
 
+// Self-contained (no separate control block): may be `#[embed]`ded.
+impl<T: BStackBlock> crate::block::BStackEmbeddable for BStackLinkedList<T> {}
+
 impl<T: BStackBlock> BStackBlock for BStackLinkedList<T> {
     type OnDisk = ListOnDisk;
 

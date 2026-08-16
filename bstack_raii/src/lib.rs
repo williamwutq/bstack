@@ -229,6 +229,11 @@ pub use bstack_raii_derive::{bstack_block, bstack_cast, bstack_enum, bstack_move
 /// no stability guarantee, use directly at your own risk.
 #[doc(hidden)]
 pub mod __private {
+    // A macro-only marker: `#[embed]` targets must be plain, self-contained blocks.
+    // Only `#[bstack_block]`/`#[bstack_enum]`-generated code (and the stdlib) implement
+    // it; no downstream code names it, so it lives here rather than in the prelude — the
+    // `on_unimplemented` message fires regardless of visibility.
+    pub use crate::block::BStackEmbeddable;
     pub use crate::foreign::{
         foreign_clone_owned, foreign_clone_strong, foreign_clone_weak, foreign_drop_owned,
         foreign_drop_strong, foreign_drop_weak,
@@ -419,6 +424,18 @@ pub mod __private {
 /// use bstack_raii::bstack_block;
 /// #[bstack_block]
 /// struct X { #[embed] #[bstack_owned] f: u32 }
+/// # fn main() {}
+/// ```
+///
+/// `#[embed]` of a reference-counted (`rc`) block — its refcount / separate control
+/// block would be stranded by inlining, so the derive rejects it (`BStackEmbeddable`
+/// is not implemented for `rc` / `(rc, weak)` blocks):
+/// ```compile_fail
+/// use bstack_raii::bstack_block;
+/// #[bstack_block(rc)]
+/// struct RcChild { v: u32 }
+/// #[bstack_block]
+/// struct Holder { #[embed] r: RcChild }
 /// # fn main() {}
 /// ```
 ///
