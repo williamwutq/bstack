@@ -304,6 +304,7 @@ where
     /// The allocator starts with empty tracking sets. If you're reopening
     /// a file from a previous session and want to pre-populate those sets,
     /// use [`Self::with_state`] instead.
+    #[must_use]
     pub fn new(inner: A) -> Self {
         Self {
             inner,
@@ -325,6 +326,7 @@ where
     /// - Any two ranges within `allocated` overlap
     /// - Any two ranges within `freed` overlap
     /// - Any range in `allocated` overlaps with any range in `freed`
+    #[must_use]
     pub fn with_state(
         inner: A,
         allocated: impl IntoIterator<Item = Range<u64>>,
@@ -343,11 +345,13 @@ where
     }
 
     /// Return a reference to the inner allocator.
+    #[must_use]
     pub fn inner(&self) -> &A {
         &self.inner
     }
 
     /// Consume this allocator and return the inner allocator.
+    #[must_use]
     pub fn into_inner(self) -> A {
         self.inner
     }
@@ -1424,19 +1428,23 @@ mod tests {
     #[test]
     #[should_panic(expected = "Initial allocated set contains overlapping ranges")]
     fn test_with_state_panics_on_overlapping_allocated() {
-        DebugCheckingAllocator::with_state(MockAllocator, [0..100, 50..150], []);
+        let _ = DebugCheckingAllocator::with_state(MockAllocator, [0..100, 50..150], []);
     }
 
     #[test]
     #[should_panic(expected = "Initial freed set contains overlapping ranges")]
     fn test_with_state_panics_on_overlapping_freed() {
-        DebugCheckingAllocator::with_state(MockAllocator, [], [0..100, 50..150]);
+        let _ = DebugCheckingAllocator::with_state(MockAllocator, [], [0..100, 50..150]);
     }
 
     #[test]
     #[should_panic(expected = "allocated range")]
     fn test_with_state_panics_on_allocated_freed_overlap() {
-        DebugCheckingAllocator::with_state(MockAllocator, [0..100, 200..300], [50..150, 400..500]);
+        let _ = DebugCheckingAllocator::with_state(
+            MockAllocator,
+            [0..100, 200..300],
+            [50..150, 400..500],
+        );
     }
 
     #[test]

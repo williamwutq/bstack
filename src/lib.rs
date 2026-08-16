@@ -4294,6 +4294,7 @@ impl BStack {
     /// [`get`](Self::get) and [`get_into`](Self::get_into), reads to ranges
     /// entirely within it skip the rwlock.
     #[inline]
+    #[must_use]
     pub fn locked_len(&self) -> u64 {
         self.locked.load(Ordering::Acquire)
     }
@@ -4506,6 +4507,7 @@ impl BStack {
     /// [`set_fault_policy`](Self::set_fault_policy)`(Some(policy))`; the operation
     /// sequence counter starts at 0.
     #[inline]
+    #[must_use]
     pub fn with_fault_policy(self, policy: std::sync::Arc<dyn fault::FaultPolicy>) -> Self {
         self.fault.set(Some(policy));
         self
@@ -4524,6 +4526,7 @@ impl BStack {
     /// Return the currently armed [`FaultPolicy`], or `None` if the stack is
     /// unarmed.
     #[inline]
+    #[must_use]
     pub fn fault_policy(&self) -> Option<std::sync::Arc<dyn fault::FaultPolicy>> {
         self.fault.get()
     }
@@ -4650,6 +4653,7 @@ pub struct BStackReader<'a> {
 impl BStack {
     /// Create a [`BStackReader`] positioned at the start of the payload.
     #[inline]
+    #[must_use]
     pub fn reader(&self) -> BStackReader<'_> {
         BStackReader {
             stack: self,
@@ -4662,6 +4666,7 @@ impl BStack {
     /// Seeking past the current end is allowed; [`read`](io::Read::read) will
     /// return `Ok(0)` until new data is pushed past that point.
     #[inline]
+    #[must_use]
     pub fn reader_at(&self, offset: u64) -> BStackReader<'_> {
         BStackReader {
             stack: self,
@@ -4673,6 +4678,7 @@ impl BStack {
 impl<'a> BStackReader<'a> {
     /// Return the current logical read offset within the payload.
     #[inline]
+    #[must_use]
     pub fn position(&self) -> u64 {
         self.offset
     }

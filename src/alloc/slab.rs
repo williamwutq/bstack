@@ -289,6 +289,7 @@ impl SlabBStackAllocator {
 
     /// Return the `block_size` this allocator was created with.
     #[inline]
+    #[must_use]
     pub fn block_size(&self) -> u64 {
         self.block_size
     }

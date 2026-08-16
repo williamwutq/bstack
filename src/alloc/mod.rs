@@ -200,6 +200,7 @@ impl<'a, A: BStackAllocator + 'a> BStackAllocError<'a, A> {
     /// Construct an error that hands the still-valid original handle back to
     /// the caller.
     #[inline]
+    #[must_use]
     pub fn with_handle(source: A::Error, handle: A::Allocated<'a>) -> Self {
         Self {
             source,
@@ -210,6 +211,7 @@ impl<'a, A: BStackAllocator + 'a> BStackAllocError<'a, A> {
     /// Construct an error whose allocation was consumed or lost by the failed
     /// operation and cannot be returned.
     #[inline]
+    #[must_use]
     pub fn lost(source: A::Error) -> Self {
         Self {
             source,
@@ -219,6 +221,7 @@ impl<'a, A: BStackAllocator + 'a> BStackAllocError<'a, A> {
 
     /// Consume the error and return the recovered handle, if any.
     #[inline]
+    #[must_use]
     pub fn into_handle(self) -> Option<A::Allocated<'a>> {
         self.handle
     }
@@ -274,12 +277,14 @@ pub struct BStackBulkAllocError<'a, A: BStackAllocator + 'a> {
 impl<'a, A: BStackAllocator + 'a> BStackBulkAllocError<'a, A> {
     /// Construct an error carrying the handles still owned by the caller.
     #[inline]
+    #[must_use]
     pub fn with_handles(source: A::Error, handles: Vec<A::Allocated<'a>>) -> Self {
         Self { source, handles }
     }
 
     /// Consume the error and return the recovered handles.
     #[inline]
+    #[must_use]
     pub fn into_handles(self) -> Vec<A::Allocated<'a>> {
         self.handles
     }

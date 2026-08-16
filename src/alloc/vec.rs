@@ -284,6 +284,7 @@ impl<'a, A: BStackOwnedSliceAllocator> BStackByteVec<'a, A> {
     /// must have been written by a `BStackByteVec<A>`.  Passing an unrelated
     /// handle is undefined behaviour.
     #[inline]
+    #[must_use]
     pub unsafe fn from_raw_block(slice: BStackOwnedSlice<'a, A>) -> Self {
         Self { slice }
     }
@@ -580,6 +581,7 @@ impl<'a, A: BStackOwnedSliceAllocator> BStackByteVec<'a, A> {
     /// original region on disk, which may no longer be the vec's live block.
     /// Re-fetch with `raw_block()` after any call that may reallocate.
     #[inline]
+    #[must_use]
     pub unsafe fn raw_block(&self) -> BStackSlice<'a> {
         let alloc: &'a A = self.slice.allocator();
         unsafe { BStackSlice::from_raw_range(alloc.stack(), self.slice.range().into()) }
@@ -590,6 +592,7 @@ impl<'a, A: BStackOwnedSliceAllocator> BStackByteVec<'a, A> {
     /// The caller takes responsibility for the allocation.  Reconstruct with
     /// [`BStackByteVec::from_raw_block`].
     #[inline]
+    #[must_use]
     pub fn into_raw_block(self) -> BStackOwnedSlice<'a, A> {
         self.slice
     }

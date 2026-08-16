@@ -128,6 +128,7 @@ impl<'a> BStackChunk<'a> {
     /// `chunk_count` silently truncates rather than panicking, so a
     /// misaligned raw chunk quietly drops trailing bytes.
     #[inline]
+    #[must_use]
     pub unsafe fn from_raw_parts(stack: &'a BStack, offset: u64, len: u64, chunk_len: u64) -> Self {
         BStackChunk {
             aligned: unsafe { BStackSlice::from_raw_parts(stack, offset, len) },
@@ -142,6 +143,7 @@ impl<'a> BStackChunk<'a> {
     ///
     /// `chunk_len` must be nonzero and evenly divide `aligned.len()`.
     #[inline]
+    #[must_use]
     pub unsafe fn from_raw_slice(aligned: BStackSlice<'a>, chunk_len: u64) -> Self {
         BStackChunk { aligned, chunk_len }
     }
@@ -155,6 +157,7 @@ impl<'a> BStackChunk<'a> {
     /// this never splits off a remainder — the whole slice must already fit
     /// the stride exactly.
     #[inline]
+    #[must_use]
     pub fn from_slice(aligned: BStackSlice<'a>, chunk_len: u64) -> Option<Self> {
         if chunk_len == 0 || !aligned.len().is_multiple_of(chunk_len) {
             return None;
@@ -164,24 +167,28 @@ impl<'a> BStackChunk<'a> {
 
     /// Length, in bytes, of one chunk.
     #[inline]
+    #[must_use]
     pub fn chunk_len(&self) -> u64 {
         self.chunk_len
     }
 
     /// Number of complete chunks in the view.
     #[inline]
+    #[must_use]
     pub fn chunk_count(&self) -> u64 {
         self.aligned.len() / self.chunk_len
     }
 
     /// Total bytes covered by complete chunks.
     #[inline]
+    #[must_use]
     pub fn len(&self) -> u64 {
         self.aligned.len()
     }
 
     /// Returns `true` if there are no complete chunks.
     #[inline]
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.aligned.is_empty()
     }
@@ -189,6 +196,7 @@ impl<'a> BStackChunk<'a> {
     /// Returns `true` if this view and `other` use the same stride
     /// (`chunk_len`).
     #[inline]
+    #[must_use]
     pub fn same_stride(&self, other: &Self) -> bool {
         self.chunk_len == other.chunk_len
     }
@@ -199,6 +207,7 @@ impl<'a> BStackChunk<'a> {
     /// one view lines up with a chunk boundary in the other wherever the
     /// regions coincide.
     #[inline]
+    #[must_use]
     pub fn same_phase(&self, other: &Self) -> bool {
         self.same_stride(other)
             && self.aligned.start() % self.chunk_len == other.aligned.start() % self.chunk_len
@@ -209,6 +218,7 @@ impl<'a> BStackChunk<'a> {
     ///
     /// Always `false` if the views are not [`same_phase`](Self::same_phase).
     #[inline]
+    #[must_use]
     pub fn adjacent_to(&self, other: &Self) -> bool {
         self.aligned.adjacent_to(&other.aligned) && self.same_phase(other)
     }
@@ -218,6 +228,7 @@ impl<'a> BStackChunk<'a> {
     ///
     /// Always `false` if the views are not [`same_phase`](Self::same_phase).
     #[inline]
+    #[must_use]
     pub fn overlaps(&self, other: &Self) -> bool {
         self.aligned.overlaps(&other.aligned) && self.same_phase(other)
     }
@@ -232,6 +243,7 @@ impl<'a> BStackChunk<'a> {
     ///
     /// Returns `None` if the views use different strides, or if both are
     /// non-empty and their aligned regions don't overlap.
+    #[must_use]
     pub fn merge(&self, other: &Self) -> Option<Self> {
         if !self.same_stride(other) {
             return None;
@@ -264,6 +276,7 @@ impl<'a> BStackChunk<'a> {
     /// checking [`same_phase`](Self::same_phase) here would be redundant.
     ///
     /// Returns `None` if the views are not adjacent.
+    #[must_use]
     pub fn merge_adjacent(&self, other: &Self) -> Option<Self> {
         if !self.same_stride(other) {
             return None;
@@ -277,6 +290,7 @@ impl<'a> BStackChunk<'a> {
 
     /// The aligned region covered by whole chunks, as a plain [`BStackSlice`].
     #[inline]
+    #[must_use]
     pub fn as_slice(&self) -> BStackSlice<'a> {
         self.aligned.clone()
     }
@@ -284,6 +298,7 @@ impl<'a> BStackChunk<'a> {
     /// Consume this view, returning the aligned region as a plain
     /// [`BStackSlice`] without cloning.
     #[inline]
+    #[must_use]
     pub fn into_slice(self) -> BStackSlice<'a> {
         self.aligned
     }
@@ -296,12 +311,14 @@ impl<'a> BStackChunk<'a> {
     ///
     /// Panics if `new_stride == 0`.
     #[inline]
+    #[must_use]
     pub fn with_stride(self, new_stride: u64) -> (BStackChunk<'a>, BStackSlice<'a>) {
         self.aligned.chunks(new_stride)
     }
 
     /// Return the underlying [`BStack`].
     #[inline]
+    #[must_use]
     pub fn stack(&self) -> &'a BStack {
         self.aligned.stack()
     }
@@ -310,6 +327,7 @@ impl<'a> BStackChunk<'a> {
     ///
     /// O(1), pure offset arithmetic — no I/O.
     #[inline]
+    #[must_use]
     pub fn get(&self, index: u64) -> Option<BStackSlice<'a>> {
         if index >= self.chunk_count() {
             return None;
@@ -323,6 +341,7 @@ impl<'a> BStackChunk<'a> {
     /// This clones the view; the iterator and `self` are independent. See
     /// [`BStackChunkIter`] for the laziness guarantee.
     #[inline]
+    #[must_use]
     pub fn iter(&self) -> BStackChunkIter<'a> {
         BStackChunkIter {
             remaining: self.aligned.clone(),
@@ -598,6 +617,7 @@ impl<'a> BStackSlice<'a> {
     /// # Panics
     ///
     /// Panics if `chunk_len == 0`.
+    #[must_use]
     pub fn chunks(&self, chunk_len: u64) -> (BStackChunk<'a>, BStackSlice<'a>) {
         assert!(chunk_len > 0, "chunks: chunk_len must be nonzero");
         let len = self.len();
@@ -622,6 +642,7 @@ impl<'a> BStackSlice<'a> {
     /// # Panics
     ///
     /// Panics if `chunk_len == 0`.
+    #[must_use]
     pub fn rchunks(&self, chunk_len: u64) -> (BStackChunk<'a>, BStackSlice<'a>) {
         assert!(chunk_len > 0, "rchunks: chunk_len must be nonzero");
         let len = self.len();
@@ -640,6 +661,7 @@ impl<'a, A: BStackAllocator> BStackOwnedSlice<'a, A> {
     /// Internally borrows a [`BStackSlice`] via [`as_slice`](Self::as_slice);
     /// the returned view and remainder's lifetime is tied to `&self`.
     #[inline]
+    #[must_use]
     pub fn chunks<'s>(&'s self, chunk_len: u64) -> (BStackChunk<'s>, BStackSlice<'s>) {
         self.as_slice().chunks(chunk_len)
     }
@@ -649,6 +671,7 @@ impl<'a, A: BStackAllocator> BStackOwnedSlice<'a, A> {
     /// Internally borrows a [`BStackSlice`] via [`as_slice`](Self::as_slice);
     /// the returned view and remainder's lifetime is tied to `&self`.
     #[inline]
+    #[must_use]
     pub fn rchunks<'s>(&'s self, chunk_len: u64) -> (BStackChunk<'s>, BStackSlice<'s>) {
         self.as_slice().rchunks(chunk_len)
     }

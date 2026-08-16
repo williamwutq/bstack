@@ -30,6 +30,7 @@ impl BStackRange {
     /// `offset + len` must not overflow `u64`. The caller is responsible
     /// for ensuring that the range describes a valid region within the payload.
     #[inline]
+    #[must_use]
     pub unsafe fn from_raw_parts(offset: u64, len: u64) -> Self {
         Self { offset, len }
     }
@@ -39,6 +40,7 @@ impl BStackRange {
     ///
     /// Silently caps `len` to avoid overflow of `offset + len`.
     #[inline]
+    #[must_use]
     pub fn new(offset: u64, len: u64) -> Self {
         // Cap len
         Self {
@@ -49,30 +51,35 @@ impl BStackRange {
 
     /// Construct a zero-length range anchored at offset 0.
     #[inline]
+    #[must_use]
     pub fn empty() -> Self {
         Self { offset: 0, len: 0 }
     }
 
     /// The inclusive start offset within the [`BStack`] payload.
     #[inline]
+    #[must_use]
     pub fn start(&self) -> u64 {
         self.offset
     }
 
     /// The exclusive end offset (`start + len`).
     #[inline]
+    #[must_use]
     pub fn end(&self) -> u64 {
         self.offset + self.len
     }
 
     /// Length of the region in bytes.
     #[inline]
+    #[must_use]
     pub fn len(&self) -> u64 {
         self.len
     }
 
     /// Returns `true` if the region spans zero bytes.
     #[inline]
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -82,6 +89,7 @@ impl BStackRange {
     /// A zero-length range never overlaps anything, including another
     /// zero-length range at the same offset.
     #[inline]
+    #[must_use]
     pub fn overlaps(&self, other: &Self) -> bool {
         !self.is_empty()
             && !other.is_empty()
@@ -93,6 +101,7 @@ impl BStackRange {
     /// and no overlap: `self.end() == other.start()` or `other.end() ==
     /// self.start()`.
     #[inline]
+    #[must_use]
     pub fn adjacent_to(&self, other: &Self) -> bool {
         self.end() == other.start() || other.end() == self.start()
     }
@@ -105,6 +114,7 @@ impl BStackRange {
     /// are non-empty and disjoint (see [`merge_adjacent`](Self::merge_adjacent)
     /// for the touching-but-not-overlapping case).
     #[inline]
+    #[must_use]
     pub fn merge(&self, other: &Self) -> Option<Self> {
         if self.is_empty() {
             return Some(*other);
@@ -127,6 +137,7 @@ impl BStackRange {
     /// ranges must be non-empty, in addition to touching end-to-end with no
     /// gap.
     #[inline]
+    #[must_use]
     pub fn merge_adjacent(&self, other: &Self) -> Option<Self> {
         if self.is_empty() || other.is_empty() || !self.adjacent_to(other) {
             return None;
@@ -138,12 +149,14 @@ impl BStackRange {
 
     /// Returns the range as `start..end`.
     #[inline]
+    #[must_use]
     pub fn range(&self) -> Range<u64> {
         self.offset..self.offset + self.len
     }
 
     /// Serialize to a 16-byte array: `offset` (8 bytes LE) then `len` (8 bytes LE).
     #[inline]
+    #[must_use]
     pub fn to_bytes(self) -> [u8; 16] {
         let mut out = [0u8; 16];
         out[..8].copy_from_slice(&self.offset.to_le_bytes());
@@ -155,6 +168,7 @@ impl BStackRange {
     ///
     /// Silently caps `len` to avoid overflow of `offset + len`.
     #[inline]
+    #[must_use]
     pub fn from_bytes(bytes: [u8; 16]) -> Self {
         let offset = u64::from_le_bytes(bytes[..8].try_into().unwrap());
         let len = u64::from_le_bytes(bytes[8..].try_into().unwrap());
@@ -277,6 +291,7 @@ impl<'a> BStackSlice<'a> {
     /// I/O returns `io::Error`, thus the caller is responsible for passing
     /// a meaningful coordinate).
     #[inline]
+    #[must_use]
     pub unsafe fn from_raw_parts(stack: &'a BStack, offset: u64, len: u64) -> Self {
         Self {
             stack,
@@ -292,6 +307,7 @@ impl<'a> BStackSlice<'a> {
     /// for I/O to succeed (out-of-bounds I/O returns `io::Error`, thus the caller
     /// is responsible for passing a meaningful coordinate).
     #[inline]
+    #[must_use]
     pub unsafe fn from_raw_range(stack: &'a BStack, range: BStackRange) -> Self {
         Self { stack, range }
     }
@@ -300,6 +316,7 @@ impl<'a> BStackSlice<'a> {
     ///
     /// All I/O on an empty slice is a no-op or returns an empty result.
     #[inline]
+    #[must_use]
     pub fn empty(stack: &'a BStack) -> Self {
         Self {
             stack,
@@ -309,36 +326,42 @@ impl<'a> BStackSlice<'a> {
 
     /// Start offset of this slice within the payload.
     #[inline]
+    #[must_use]
     pub fn start(&self) -> u64 {
         self.range.start()
     }
 
     /// Exclusive end offset (`start + len`).
     #[inline]
+    #[must_use]
     pub fn end(&self) -> u64 {
         self.range.end()
     }
 
     /// Length of the slice in bytes.
     #[inline]
+    #[must_use]
     pub fn len(&self) -> u64 {
         self.range.len()
     }
 
     /// Returns `true` if the slice spans zero bytes.
     #[inline]
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.range.is_empty()
     }
 
     /// Half-open byte range `start..end` of this slice.
     #[inline]
+    #[must_use]
     pub fn range(&self) -> Range<u64> {
         self.range.range()
     }
 
     /// Return the raw coordinate pair as a [`BStackRange`].
     #[inline]
+    #[must_use]
     pub fn as_range(&self) -> BStackRange {
         self.range
     }
@@ -348,6 +371,7 @@ impl<'a> BStackSlice<'a> {
     /// Delegates to [`BStackRange::overlaps`] on the underlying coordinates;
     /// does not check that both slices are backed by the same [`BStack`].
     #[inline]
+    #[must_use]
     pub fn overlaps(&self, other: &Self) -> bool {
         self.range.overlaps(&other.range)
     }
@@ -359,6 +383,7 @@ impl<'a> BStackSlice<'a> {
     /// coordinates; does not check that both slices are backed by the same
     /// [`BStack`].
     #[inline]
+    #[must_use]
     pub fn adjacent_to(&self, other: &Self) -> bool {
         self.range.adjacent_to(&other.range)
     }
@@ -369,6 +394,7 @@ impl<'a> BStackSlice<'a> {
     /// Returns `None` if the ranges are non-empty and disjoint, or if `self`
     /// and `other` are backed by different [`BStack`]s.
     #[inline]
+    #[must_use]
     pub fn merge(&self, other: &Self) -> Option<Self> {
         if !std::ptr::eq(self.stack, other.stack) {
             return None;
@@ -386,6 +412,7 @@ impl<'a> BStackSlice<'a> {
     /// coordinates. Returns `None` if the slices are not adjacent, either is
     /// empty, or `self` and `other` are backed by different [`BStack`]s.
     #[inline]
+    #[must_use]
     pub fn merge_adjacent(&self, other: &Self) -> Option<Self> {
         if !std::ptr::eq(self.stack, other.stack) {
             return None;
@@ -401,6 +428,7 @@ impl<'a> BStackSlice<'a> {
     /// Delegates to [`BStackRange::to_bytes`]. The result can be stored on disk
     /// and later reconstructed with [`from_bytes`](Self::from_bytes).
     #[inline]
+    #[must_use]
     pub fn to_bytes(&self) -> [u8; 16] {
         self.range.to_bytes()
     }
@@ -412,6 +440,7 @@ impl<'a> BStackSlice<'a> {
     /// `[offset, offset + len)` should lie within the current payload of `stack`
     /// for I/O to succeed.
     #[inline]
+    #[must_use]
     pub unsafe fn from_bytes(stack: &'a BStack, bytes: [u8; 16]) -> Self {
         Self {
             stack,
@@ -421,6 +450,7 @@ impl<'a> BStackSlice<'a> {
 
     /// Return the underlying [`BStack`].
     #[inline]
+    #[must_use]
     pub fn stack(&self) -> &'a BStack {
         self.stack
     }
@@ -434,6 +464,7 @@ impl<'a> BStackSlice<'a> {
     ///
     /// Panics if `start > end` or `end > self.len()`.
     #[inline]
+    #[must_use]
     pub fn subslice(&self, start: u64, end: u64) -> BStackSlice<'a> {
         self.subslice_range(start..end)
     }
@@ -443,6 +474,7 @@ impl<'a> BStackSlice<'a> {
     /// # Panics
     ///
     /// Panics if `range.start > range.end` or `range.end > self.len()`.
+    #[must_use]
     pub fn subslice_range(&self, range: Range<u64>) -> BStackSlice<'a> {
         assert!(range.start <= range.end, "range start must be <= end");
         assert!(range.end <= self.len(), "range end must be <= slice length");
@@ -465,6 +497,7 @@ impl<'a> BStackSlice<'a> {
     ///
     /// Panics if `mid > self.len()`.
     #[inline]
+    #[must_use]
     pub fn split_at(&self, mid: u64) -> (BStackSlice<'a>, BStackSlice<'a>) {
         assert!(mid <= self.len(), "split_at: mid must be <= slice length");
         (self.subslice(0, mid), self.subslice(mid, self.len()))
@@ -481,6 +514,7 @@ impl<'a> BStackSlice<'a> {
     ///
     /// Panics if `mid > self.len()`.
     #[inline]
+    #[must_use]
     pub fn split_at_mut(&mut self, mid: u64) -> (BStackSlice<'a>, BStackSlice<'a>) {
         assert!(
             mid <= self.len(),
@@ -493,6 +527,7 @@ impl<'a> BStackSlice<'a> {
     ///
     /// The returned slice has length `min(n, self.len())`.
     #[inline]
+    #[must_use]
     pub fn head(&self, n: u64) -> BStackSlice<'a> {
         let n = n.min(self.len());
         self.subslice(0, n)
@@ -502,6 +537,7 @@ impl<'a> BStackSlice<'a> {
     ///
     /// The returned slice has length `min(n, self.len())`.
     #[inline]
+    #[must_use]
     pub fn tail(&self, n: u64) -> BStackSlice<'a> {
         let n = n.min(self.len());
         self.subslice(self.len() - n, self.len())
@@ -880,6 +916,7 @@ impl<'a> BStackSlice<'a> {
     ///
     /// This clones the slice; the reader and the original slice are independent.
     #[inline]
+    #[must_use]
     pub fn reader(&self) -> BStackSliceReader<'a> {
         BStackSliceReader {
             slice: self.clone(),
@@ -891,6 +928,7 @@ impl<'a> BStackSlice<'a> {
     ///
     /// This clones the slice; the reader and the original slice are independent.
     #[inline]
+    #[must_use]
     pub fn reader_at(&self, offset: u64) -> BStackSliceReader<'a> {
         BStackSliceReader {
             slice: self.clone(),
@@ -903,6 +941,7 @@ impl<'a> BStackSlice<'a> {
     /// Requires the `set` feature.
     #[cfg(feature = "set")]
     #[inline]
+    #[must_use]
     pub fn writer(self) -> BStackSliceWriter<'a> {
         BStackSliceWriter {
             slice: self,
@@ -915,6 +954,7 @@ impl<'a> BStackSlice<'a> {
     /// Requires the `set` feature.
     #[cfg(feature = "set")]
     #[inline]
+    #[must_use]
     pub fn writer_at(self, offset: u64) -> BStackSliceWriter<'a> {
         BStackSliceWriter {
             slice: self,
@@ -1071,6 +1111,7 @@ impl<'a, A: BStackAllocator> BStackOwnedSlice<'a, A> {
     /// or sub-slice coordinate and then passing it to `realloc` or `dealloc`
     /// may silently corrupt allocator metadata.
     #[inline]
+    #[must_use]
     pub unsafe fn from_raw_parts(allocator: &'a A, offset: u64, len: u64) -> Self {
         Self {
             allocator,
@@ -1087,6 +1128,7 @@ impl<'a, A: BStackAllocator> BStackOwnedSlice<'a, A> {
     /// Passing an arbitrary or sub-slice coordinate and then passing it to `realloc`
     /// or `dealloc` may silently corrupt allocator metadata.
     #[inline]
+    #[must_use]
     pub unsafe fn from_raw_range(allocator: &'a A, range: BStackRange) -> Self {
         Self { allocator, range }
     }
@@ -1096,6 +1138,7 @@ impl<'a, A: BStackAllocator> BStackOwnedSlice<'a, A> {
     /// Used as a sentinel. `dealloc` of an empty handle at offset 0 is a no-op
     /// in all library allocators.
     #[inline]
+    #[must_use]
     pub fn empty(allocator: &'a A) -> Self {
         Self {
             allocator,
@@ -1105,36 +1148,42 @@ impl<'a, A: BStackAllocator> BStackOwnedSlice<'a, A> {
 
     /// Start offset of the allocation within the payload.
     #[inline]
+    #[must_use]
     pub fn start(&self) -> u64 {
         self.range.start()
     }
 
     /// Exclusive end offset (`start + len`).
     #[inline]
+    #[must_use]
     pub fn end(&self) -> u64 {
         self.range.end()
     }
 
     /// Length of the allocation in bytes.
     #[inline]
+    #[must_use]
     pub fn len(&self) -> u64 {
         self.range.len()
     }
 
     /// Returns `true` if the allocation spans zero bytes.
     #[inline]
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.range.is_empty()
     }
 
     /// Half-open byte range `start..end` of this allocation.
     #[inline]
+    #[must_use]
     pub fn range(&self) -> Range<u64> {
         self.range.range()
     }
 
     /// Return the raw coordinate pair as a [`BStackRange`].
     #[inline]
+    #[must_use]
     pub fn as_range(&self) -> BStackRange {
         self.range
     }
@@ -1144,6 +1193,7 @@ impl<'a, A: BStackAllocator> BStackOwnedSlice<'a, A> {
     /// Delegates to [`BStackRange::to_bytes`]. The result can be stored on disk
     /// and later reconstructed with [`from_bytes`](Self::from_bytes).
     #[inline]
+    #[must_use]
     pub fn to_bytes(&self) -> [u8; 16] {
         self.range.to_bytes()
     }
@@ -1157,6 +1207,7 @@ impl<'a, A: BStackAllocator> BStackOwnedSlice<'a, A> {
     /// freed. Passing a stale, forged, or sub-slice coordinate and then passing
     /// the handle to `realloc` or `dealloc` may silently corrupt allocator metadata.
     #[inline]
+    #[must_use]
     pub unsafe fn from_bytes(allocator: &'a A, bytes: [u8; 16]) -> Self {
         Self {
             allocator,
@@ -1166,6 +1217,7 @@ impl<'a, A: BStackAllocator> BStackOwnedSlice<'a, A> {
 
     /// Return the allocator that owns this handle.
     #[inline]
+    #[must_use]
     pub fn allocator(&self) -> &'a A {
         self.allocator
     }
@@ -1176,6 +1228,7 @@ impl<'a, A: BStackAllocator> BStackOwnedSlice<'a, A> {
     /// this handle. This prevents a view from surviving `dealloc` or `realloc`,
     /// which both consume the handle by value.
     #[inline]
+    #[must_use]
     pub fn as_slice<'s>(&'s self) -> BStackSlice<'s> {
         BStackSlice {
             stack: self.allocator.stack(),
@@ -1189,6 +1242,7 @@ impl<'a, A: BStackAllocator> BStackOwnedSlice<'a, A> {
     /// this allocation can be obtained while the returned slice is live. Within
     /// safe code this enforces single-writer access.
     #[inline]
+    #[must_use]
     pub fn as_slice_mut<'s>(&'s mut self) -> BStackSlice<'s> {
         BStackSlice {
             stack: self.allocator.stack(),
@@ -1237,6 +1291,7 @@ impl<'a, A: BStackAllocator> BStackOwnedSlice<'a, A> {
     /// Internally borrows a [`BStackSlice`] via [`as_slice`](Self::as_slice)
     /// and delegates to [`BStackSlice::head`].
     #[inline]
+    #[must_use]
     pub fn head<'s>(&'s self, n: u64) -> BStackSlice<'s> {
         self.as_slice().head(n)
     }
@@ -1246,6 +1301,7 @@ impl<'a, A: BStackAllocator> BStackOwnedSlice<'a, A> {
     /// Internally borrows a [`BStackSlice`] via [`as_slice`](Self::as_slice)
     /// and delegates to [`BStackSlice::tail`].
     #[inline]
+    #[must_use]
     pub fn tail<'s>(&'s self, n: u64) -> BStackSlice<'s> {
         self.as_slice().tail(n)
     }
@@ -1255,6 +1311,7 @@ impl<'a, A: BStackAllocator> BStackOwnedSlice<'a, A> {
     /// Internally borrows a [`BStackSlice`] via [`as_slice`](Self::as_slice)
     /// and delegates to [`BStackSlice::split_at`].
     #[inline]
+    #[must_use]
     pub fn split_at<'s>(&'s self, mid: u64) -> (BStackSlice<'s>, BStackSlice<'s>) {
         self.as_slice().split_at(mid)
     }
@@ -1264,6 +1321,7 @@ impl<'a, A: BStackAllocator> BStackOwnedSlice<'a, A> {
     /// Internally borrows a [`BStackSlice`] via [`as_slice_mut`](Self::as_slice_mut)
     /// and delegates to [`BStackSlice::split_at_mut`].
     #[inline]
+    #[must_use]
     pub fn split_at_mut<'s>(&'s mut self, mid: u64) -> (BStackSlice<'s>, BStackSlice<'s>) {
         let mut view = self.as_slice_mut();
         view.split_at_mut(mid)
@@ -1519,6 +1577,7 @@ impl<'a, A: BStackAllocator> BStackOwnedSlice<'a, A> {
     /// Internally borrows a [`BStackSlice`] via [`as_slice`](Self::as_slice)
     /// and delegates to [`BStackSlice::reader`].
     #[inline]
+    #[must_use]
     pub fn reader<'s>(&'s self) -> BStackSliceReader<'s> {
         self.as_slice().reader()
     }
@@ -1528,6 +1587,7 @@ impl<'a, A: BStackAllocator> BStackOwnedSlice<'a, A> {
     /// Internally borrows a [`BStackSlice`] via [`as_slice`](Self::as_slice)
     /// and delegates to [`BStackSlice::reader_at`].
     #[inline]
+    #[must_use]
     pub fn reader_at<'s>(&'s self, offset: u64) -> BStackSliceReader<'s> {
         self.as_slice().reader_at(offset)
     }
@@ -1540,6 +1600,7 @@ impl<'a, A: BStackAllocator> BStackOwnedSlice<'a, A> {
     /// Requires the `set` feature.
     #[cfg(feature = "set")]
     #[inline]
+    #[must_use]
     pub fn writer<'s>(&'s mut self) -> BStackSliceWriter<'s> {
         self.as_slice_mut().writer()
     }
@@ -1552,6 +1613,7 @@ impl<'a, A: BStackAllocator> BStackOwnedSlice<'a, A> {
     /// Requires the `set` feature.
     #[cfg(feature = "set")]
     #[inline]
+    #[must_use]
     pub fn writer_at<'s>(&'s mut self, offset: u64) -> BStackSliceWriter<'s> {
         self.as_slice_mut().writer_at(offset)
     }
@@ -1696,18 +1758,21 @@ impl<'a> fmt::Debug for BStackSliceReader<'a> {
 impl<'a> BStackSliceReader<'a> {
     /// Return the current cursor position within the slice (not the payload).
     #[inline]
+    #[must_use]
     pub fn position(&self) -> u64 {
         self.cursor
     }
 
     /// Consume the reader and return the underlying [`BStackSlice`].
     #[inline]
+    #[must_use]
     pub fn into_slice(self) -> BStackSlice<'a> {
         self.slice
     }
 
     /// Return a reference to the underlying [`BStackSlice`].
     #[inline]
+    #[must_use]
     pub fn slice(&self) -> &BStackSlice<'a> {
         &self.slice
     }
@@ -1848,18 +1913,21 @@ impl<'a> fmt::Debug for BStackSliceWriter<'a> {
 impl<'a> BStackSliceWriter<'a> {
     /// Return the current cursor position within the slice (not the payload).
     #[inline]
+    #[must_use]
     pub fn position(&self) -> u64 {
         self.cursor
     }
 
     /// Consume the writer and return the underlying [`BStackSlice`].
     #[inline]
+    #[must_use]
     pub fn into_slice(self) -> BStackSlice<'a> {
         self.slice
     }
 
     /// Return a reference to the underlying [`BStackSlice`].
     #[inline]
+    #[must_use]
     pub fn slice(&self) -> &BStackSlice<'a> {
         &self.slice
     }

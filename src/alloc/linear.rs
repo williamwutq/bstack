@@ -86,6 +86,7 @@ pub struct LinearBStackAllocator {
 impl LinearBStackAllocator {
     /// Create a new `LinearBStackAllocator` that takes ownership of `stack`.
     #[inline]
+    #[must_use]
     pub fn new(stack: BStack) -> Self {
         Self {
             stack,

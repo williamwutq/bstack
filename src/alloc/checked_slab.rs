@@ -396,6 +396,7 @@ impl CheckedSlabBStackAllocator {
 
     /// Return the usable bytes per slab block (the `data_size` passed to [`new`](Self::new)).
     #[inline]
+    #[must_use]
     pub fn data_size(&self) -> u64 {
         self.block_size - Self::OVERHEAD
     }
