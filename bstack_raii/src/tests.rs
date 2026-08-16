@@ -7429,6 +7429,329 @@ fn macro_bstack_mut_strong_replace_moves_count_out() {
 }
 
 // --------------------------------------------------------------------------
+// #[bstack_mut] on containers: POD tuple `set_`, array element/whole replace,
+// and the redundant-but-accepted annotation on a (handle-mutable) `Vec`.
+// --------------------------------------------------------------------------
+
+#[bstack_block]
+struct MutTup {
+    #[bstack_mut]
+    t: (u32, u64),
+    tag: u32,
+}
+
+#[test]
+fn macro_bstack_mut_pod_tuple_set() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let b = MutTup::new(&alloc, (1u32, 2u64), 7).unwrap();
+    assert_eq!(b.handle().get_t(stack).unwrap(), (1, 2));
+
+    // One atomic overwrite of the whole inline tuple; `tag` is untouched.
+    b.handle().set_t(stack, (9, 99)).unwrap();
+    assert_eq!(b.handle().get_t(stack).unwrap(), (9, 99));
+    assert_eq!(b.handle().get_tag(stack).unwrap(), 7);
+
+    b.bstack_drop(&alloc).unwrap();
+}
+
+#[bstack_block]
+struct MutOwnedArr {
+    #[bstack_mut]
+    #[bstack_owned]
+    xs: [MacroLeaf; 3],
+}
+
+#[test]
+fn macro_bstack_mut_owned_array_replace_at_moves_old_out() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let h = MutOwnedArr::new(
+        &alloc,
+        [
+            MacroLeaf::new(&alloc, 10).unwrap(),
+            MacroLeaf::new(&alloc, 20).unwrap(),
+            MacroLeaf::new(&alloc, 30).unwrap(),
+        ],
+    )
+    .unwrap();
+
+    // Element replace: install a new child at index 1, move the old (=20) out.
+    let newc = MacroLeaf::new(&alloc, 200).unwrap();
+    let old = h.handle().replace_xs_at(&alloc, 1, newc).unwrap();
+    assert_eq!(old.handle().get_val(stack).unwrap(), 20); // moved out, still live
+    old.bstack_drop(&alloc).unwrap(); // caller owns it
+
+    let arr = h.handle().get_xs(stack).unwrap();
+    assert_eq!(arr[0].get_val(stack).unwrap(), 10);
+    assert_eq!(arr[1].get_val(stack).unwrap(), 200);
+    assert_eq!(arr[2].get_val(stack).unwrap(), 30);
+
+    // Out-of-bounds hands the value straight back (never installed).
+    let stray = MacroLeaf::new(&alloc, 0).unwrap();
+    match h.handle().replace_xs_at(&alloc, 3, stray) {
+        Ok(_) => panic!("expected an out-of-bounds error"),
+        Err(e) => e.value.unwrap().bstack_drop(&alloc).unwrap(),
+    }
+
+    // Teardown reclaims all three current children with no leak.
+    h.bstack_drop(&alloc).unwrap();
+    assert_teardown_reclaims(&alloc, || {
+        MutOwnedArr::new(
+            &alloc,
+            [
+                MacroLeaf::new(&alloc, 1).unwrap(),
+                MacroLeaf::new(&alloc, 2).unwrap(),
+                MacroLeaf::new(&alloc, 3).unwrap(),
+            ],
+        )
+        .unwrap()
+    });
+}
+
+#[test]
+fn macro_bstack_mut_owned_array_replace_whole_moves_old_out() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let h = MutOwnedArr::new(
+        &alloc,
+        [
+            MacroLeaf::new(&alloc, 10).unwrap(),
+            MacroLeaf::new(&alloc, 20).unwrap(),
+            MacroLeaf::new(&alloc, 30).unwrap(),
+        ],
+    )
+    .unwrap();
+
+    // Whole-array swap: the old array (10,20,30) is handed back as owned handles.
+    let old = h
+        .handle()
+        .replace_xs(
+            &alloc,
+            [
+                MacroLeaf::new(&alloc, 1).unwrap(),
+                MacroLeaf::new(&alloc, 2).unwrap(),
+                MacroLeaf::new(&alloc, 3).unwrap(),
+            ],
+        )
+        .unwrap();
+    assert_eq!(old[0].handle().get_val(stack).unwrap(), 10);
+    assert_eq!(old[2].handle().get_val(stack).unwrap(), 30);
+    for o in old {
+        o.bstack_drop(&alloc).unwrap();
+    }
+
+    let arr = h.handle().get_xs(stack).unwrap();
+    assert_eq!(arr[0].get_val(stack).unwrap(), 1);
+    assert_eq!(arr[2].get_val(stack).unwrap(), 3);
+
+    h.bstack_drop(&alloc).unwrap();
+}
+
+#[bstack_block]
+struct MutRefArr {
+    #[bstack_mut]
+    #[bstack_ref]
+    xs: [MacroLeaf; 2],
+}
+
+#[test]
+fn macro_bstack_mut_ref_array_set_and_replace() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let l0 = MacroLeaf::new(&alloc, 1).unwrap();
+    let l1 = MacroLeaf::new(&alloc, 2).unwrap();
+    let l2 = MacroLeaf::new(&alloc, 3).unwrap();
+    let rng = |l: &BStackOwned<MacroLeaf>| unsafe { BStackRef::from_range(l.handle().range()) };
+
+    let h = MutRefArr::new(&alloc, [rng(&l0), rng(&l1)]).unwrap();
+
+    // set_at: repoint element 0 to l2 (a ref owns nothing → nothing freed).
+    h.handle().set_xs_at(&alloc, 0, rng(&l2)).unwrap();
+    assert_eq!(
+        h.handle().get_xs(stack).unwrap()[0].get_val(stack).unwrap(),
+        3
+    );
+
+    // replace_at: hand the old ref (→ l1) back.
+    let old = h.handle().replace_xs_at(&alloc, 1, rng(&l0)).unwrap();
+    let old_leaf = <MacroLeaf as BStackBlock>::from_range(old.into_range());
+    assert_eq!(old_leaf.get_val(stack).unwrap(), 2);
+    assert_eq!(
+        h.handle().get_xs(stack).unwrap()[1].get_val(stack).unwrap(),
+        1
+    );
+
+    // set_ (whole): repoint both slots at once.
+    h.handle().set_xs(&alloc, [rng(&l1), rng(&l2)]).unwrap();
+    let arr = h.handle().get_xs(stack).unwrap();
+    assert_eq!(arr[0].get_val(stack).unwrap(), 2);
+    assert_eq!(arr[1].get_val(stack).unwrap(), 3);
+
+    // The ref array owns nothing: every target is still live after teardown.
+    h.bstack_drop(&alloc).unwrap();
+    for (l, v) in [(&l0, 1), (&l1, 2), (&l2, 3)] {
+        assert_eq!(l.handle().get_val(stack).unwrap(), v);
+    }
+    l0.bstack_drop(&alloc).unwrap();
+    l1.bstack_drop(&alloc).unwrap();
+    l2.bstack_drop(&alloc).unwrap();
+}
+
+#[bstack_block]
+struct MutStrongArr {
+    #[bstack_mut]
+    #[bstack_strong]
+    xs: [MacroStrongChild; 2],
+}
+
+#[test]
+fn macro_bstack_mut_strong_array_replace_at_moves_count_out() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let c0 = MacroStrongChild::new(&alloc, 5).unwrap(); // strong = 1
+    let c1 = MacroStrongChild::new(&alloc, 6).unwrap();
+    let h = MutStrongArr::new(&alloc, [c0, c1]).unwrap(); // counts moved into field
+
+    // Replace element 0: the old strong ref (count 1) moves out as a BStackRc.
+    let b = MacroStrongChild::new(&alloc, 50).unwrap();
+    let old = h.handle().replace_xs_at(&alloc, 0, b).unwrap();
+    assert_eq!(old.handle().get_val(stack).unwrap(), 5);
+    assert_eq!(
+        h.handle().get_xs(stack).unwrap()[0].get_val(stack).unwrap(),
+        50
+    );
+
+    // Dropping the returned rc decrements the old child (1 -> 0) and frees it.
+    drop(old);
+    // Teardown decrements the current element 0 (`b`) and element 1 (`c1`).
+    h.bstack_drop(&alloc).unwrap();
+}
+
+#[bstack_block]
+struct MutOptArr {
+    #[bstack_mut]
+    #[bstack_owned]
+    xs: [Option<MacroLeaf>; 2],
+}
+
+#[test]
+fn macro_bstack_mut_owned_option_array_replace_at() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let h = MutOptArr::new(&alloc, [Some(MacroLeaf::new(&alloc, 10).unwrap()), None]).unwrap();
+
+    // Replace a present slot with a new child; old (=10) moves out.
+    let old = h
+        .handle()
+        .replace_xs_at(&alloc, 0, Some(MacroLeaf::new(&alloc, 100).unwrap()))
+        .unwrap();
+    assert_eq!(old.unwrap().handle().get_val(stack).unwrap(), 10);
+
+    // Fill the empty slot (old is None — nothing handed back).
+    let was_none = h
+        .handle()
+        .replace_xs_at(&alloc, 1, Some(MacroLeaf::new(&alloc, 200).unwrap()))
+        .unwrap();
+    assert!(was_none.is_none());
+
+    // Clear a slot back to None; the old child moves out to be freed.
+    let old0 = h.handle().replace_xs_at(&alloc, 0, None).unwrap();
+    old0.unwrap().bstack_drop(&alloc).unwrap();
+
+    let arr = h.handle().get_xs(stack).unwrap();
+    assert!(arr[0].is_none());
+    assert_eq!(arr[1].as_ref().unwrap().get_val(stack).unwrap(), 200);
+
+    h.bstack_drop(&alloc).unwrap();
+}
+
+#[bstack_block]
+struct MutNestedArr {
+    #[bstack_mut]
+    #[bstack_owned]
+    grid: [[MacroLeaf; 2]; 2],
+}
+
+#[test]
+fn macro_bstack_mut_owned_nested_array_replace() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let mk = |v: u32| MacroLeaf::new(&alloc, v).unwrap();
+    let h = MutNestedArr::new(&alloc, [[mk(1), mk(2)], [mk(3), mk(4)]]).unwrap();
+
+    // Element replace by *flat*, row-major index: slot 3 is grid[1][1] (=4).
+    let old = h.handle().replace_grid_at(&alloc, 3, mk(40)).unwrap();
+    assert_eq!(old.handle().get_val(stack).unwrap(), 4);
+    old.bstack_drop(&alloc).unwrap();
+    let g = h.handle().get_grid(stack).unwrap();
+    assert_eq!(g[1][1].get_val(stack).unwrap(), 40);
+    assert_eq!(g[0][0].get_val(stack).unwrap(), 1);
+
+    // Whole-array swap of the nested shape; old grid handed back row-major.
+    let old_grid = h
+        .handle()
+        .replace_grid(&alloc, [[mk(5), mk(6)], [mk(7), mk(8)]])
+        .unwrap();
+    assert_eq!(old_grid[0][0].handle().get_val(stack).unwrap(), 1);
+    assert_eq!(old_grid[1][1].handle().get_val(stack).unwrap(), 40);
+    for row in old_grid {
+        for o in row {
+            o.bstack_drop(&alloc).unwrap();
+        }
+    }
+    assert_eq!(
+        h.handle().get_grid(stack).unwrap()[1][0]
+            .get_val(stack)
+            .unwrap(),
+        7
+    );
+
+    h.bstack_drop(&alloc).unwrap();
+}
+
+#[bstack_block]
+struct MutVecHolder {
+    // `#[bstack_mut]` on a `Vec` is a redundant no-op — accepted, not an error —
+    // because the `Vec` is already mutable in place through its handle.
+    #[bstack_mut]
+    #[bstack_owned]
+    xs: Vec<MacroLeaf>,
+}
+
+#[test]
+fn macro_bstack_mut_vec_annotation_is_accepted_noop() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let h = MutVecHolder::new(&alloc, vec![MacroLeaf::new(&alloc, 1).unwrap()]).unwrap();
+    // Mutation happens through the handle (which persists its descriptor back).
+    let mut v = h.handle().get_xs(&alloc).unwrap();
+    v.push_owned(MacroLeaf::new(&alloc, 2).unwrap()).unwrap();
+    assert_eq!(v.len().unwrap(), 2);
+    let reread = h.handle().get_xs(&alloc).unwrap();
+    assert_eq!(reread.len().unwrap(), 2);
+    assert_eq!(reread.get(1).unwrap().unwrap().get_val(stack).unwrap(), 2);
+
+    h.bstack_drop(&alloc).unwrap();
+}
+
+// --------------------------------------------------------------------------
 // Foreign<T>: cross-file wide pointer resolved through the registry
 // --------------------------------------------------------------------------
 

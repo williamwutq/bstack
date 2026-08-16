@@ -336,6 +336,15 @@ pub mod __private {
 /// # fn main() {}
 /// ```
 ///
+/// `#[bstack_mut]` on a **variant** — an enum generates no field mutator, so the
+/// annotation is rejected rather than silently ignored:
+/// ```compile_fail
+/// use bstack_raii::bstack_enum;
+/// #[bstack_enum]
+/// enum E { #[bstack_mut] A(u32) }
+/// # fn main() {}
+/// ```
+///
 /// `repr(..)` on a **struct** (it selects an enum discriminant width):
 /// ```compile_fail
 /// use bstack_raii::bstack_block;
@@ -558,6 +567,33 @@ pub mod __private {
 /// #[bstack_block] struct Leaf { v: u32 }
 /// #[bstack_block]
 /// struct Holder { #[bstack_owned] v: Vec<(u32, Foreign<Leaf>)> }
+/// # fn main() {}
+/// ```
+///
+/// ---
+///
+/// `#[bstack_mut]` is honored on scalar POD / block-reference fields (`set_` /
+/// `replace_`), POD tuples (`set_`), and block-reference arrays (element
+/// `replace_<f>_at` + whole-array `replace_<f>`, plus `set_` for `ref`). A `Vec` is
+/// always mutable in place through its `get_<f>()` handle, so the annotation is a
+/// redundant no-op there (accepted, not an error). Cross-file `Foreign` shapes have
+/// no mutator yet and are rejected rather than silently ignored.
+///
+/// `#[bstack_mut]` on a scalar `Foreign` field:
+/// ```compile_fail
+/// use bstack_raii::bstack_block;
+/// #[bstack_block] struct Leaf { v: u32 }
+/// #[bstack_block]
+/// struct Holder { #[bstack_mut] #[bstack_owned] link: bstack_raii::Foreign<Leaf> }
+/// # fn main() {}
+/// ```
+///
+/// `#[bstack_mut]` on a `Vec<Foreign>` field (foreign in a container):
+/// ```compile_fail
+/// use bstack_raii::bstack_block;
+/// #[bstack_block] struct Leaf { v: u32 }
+/// #[bstack_block]
+/// struct Holder { #[bstack_mut] #[bstack_owned] links: Vec<bstack_raii::Foreign<Leaf>> }
 /// # fn main() {}
 /// ```
 #[doc(hidden)]

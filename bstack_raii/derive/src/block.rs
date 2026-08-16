@@ -401,6 +401,24 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
             ));
         }
 
+        // `#[bstack_mut]` is honored on scalar POD / block references (`set_` /
+        // `replace_`), POD tuples (`set_`), and block-reference arrays (element
+        // `replace_<f>_at` + whole-array `replace_<f>`, plus `set_` for `ref`); a
+        // `Vec` is *always* mutable in place through its `get_<f>()` handle (which
+        // writes its descriptor back), so the annotation is a redundant no-op there.
+        // Cross-file `Foreign` shapes have no mutator yet — reject `#[bstack_mut]` on
+        // anything that mentions `Foreign` (scalar, `Vec<Foreign>`, `[Foreign; N]`,
+        // or a foreign tuple) rather than silently ignoring it.
+        if is_bstack_mut(&field.attrs)
+            && tokens_mention(quote!(#eff_ty), &[&format_ident!("Foreign")])
+        {
+            return Err(Error::new_spanned(
+                field,
+                "#[bstack_mut] is not yet supported on `Foreign` fields (cross-file \
+                 pointers) — mutate by rebuilding the containing value",
+            ));
+        }
+
         // `Foreign<T>`: a cross-file wide pointer, stored inline as a 16-byte
         // `ForeignPtr` `(file_id, offset)` and resolved through the registry (length
         // recovered from `size_of::<T::OnDisk>()`, so it is not stored). The field's
@@ -1715,6 +1733,12 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                         "#[embed] does not support `Option`",
                     ));
                 }
+                if is_bstack_mut(&field.attrs) {
+                    return Err(Error::new_spanned(
+                        field,
+                        "#[bstack_mut] is not yet supported on #[embed] fields",
+                    ));
+                }
                 let child = elem;
                 // Guard: `#[embed]` target must be a plain, self-contained block.
                 if !type_mentions_any(child, &type_params) {
@@ -2160,6 +2184,25 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                 }
             };
             mv_recon.push(nested_build(&dims, &mv_leaf_ty, &mv_read));
+
+            // `#[bstack_mut]`: element `replace_<f>_at` + whole-array `replace_<f>`
+            // (and `set_` for `ref`). Weak arrays already have a `set_<f>` element
+            // setter unconditionally; embed arrays are rejected above.
+            if is_bstack_mut(&field.attrs) {
+                for m in array_mut_methods(
+                    vis,
+                    fname,
+                    &quote!(#elem),
+                    &on_disk_ty,
+                    kind,
+                    &dims,
+                    &total,
+                    &size_elem,
+                    elem_nullable,
+                ) {
+                    accessors.push(m);
+                }
+            }
             continue;
         }
 
@@ -2462,6 +2505,25 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
             mv_caps.push(quote!(let #cap = __od.#fname;));
             mv_types.push(quote!(#inner_ty));
             mv_recon.push(quote!(( #(#cap.#idx,)* )));
+            // `#[bstack_mut]`: overwrite the whole inline POD tuple, one atomic `set`
+            // (a POD tuple owns no children, so nothing is freed — like a POD scalar).
+            if is_bstack_mut(&field.attrs) {
+                let setter = format_ident!("set_{}", fname);
+                let idx2 = idx.clone();
+                accessors.push(quote! {
+                    /// Overwrite this POD tuple field, as one crash-atomic `set`.
+                    #vis fn #setter(
+                        &self,
+                        stack: &::bstack_raii::BStack,
+                        value: #inner_ty,
+                    ) -> ::std::io::Result<()> {
+                        let __w: #wrapper = #wrapper( #(value.#idx2),* );
+                        let __off = self.0.start()
+                            + ::core::mem::offset_of!(#on_disk_ty, #fname) as u64;
+                        stack.set(__off, ::bstack_raii::bytemuck::bytes_of(&__w))
+                    }
+                });
+            }
             continue;
         }
 
@@ -4644,6 +4706,360 @@ fn replace_stack_method(
     }
 }
 
+/// Generated `#[bstack_mut]` mutators for a block-reference array field
+/// (`#[bstack_owned/strong/ref] [T; N]`, nested and per-element `Option` allowed).
+/// Arrays are fixed-size, so there is no push/pop — only in-place change:
+///
+/// * `replace_<field>_at(index, value) -> old` swaps one element by **flat**,
+///   row-major `index`, moving the old element out (never dropped on the floor);
+///   one crash-atomic 8-byte `set`.
+/// * `replace_<field>(array) -> old_array` swaps the whole array as one crash-atomic
+///   write of the inline `[u64; N]` region.
+/// * `#[bstack_ref]` also gets `set_<field>_at` / `set_<field>` — a ref owns nothing,
+///   so it overwrites without handing the old value back.
+///
+/// Every `replace_` upholds the crate's "never lose the *new* value" invariant: on
+/// an I/O failure the value being installed is handed back through [`ReplaceError`].
+/// All mutators take `&A` (owned/ref need only the stack, but one signature is
+/// simpler and matches the array accessors, which already take `&A`).
+#[allow(clippy::too_many_arguments)]
+fn array_mut_methods(
+    vis: &syn::Visibility,
+    fname: &Ident,
+    elem: &TokenStream,
+    on_disk: &TokenStream,
+    kind: Kind,
+    dims: &[&syn::Expr],
+    total: &TokenStream,
+    size_elem: &TokenStream,
+    elem_nullable: bool,
+) -> Vec<TokenStream> {
+    let base = quote!(self.0.start() + ::core::mem::offset_of!(#on_disk, #fname) as u64);
+    let is_strong = kind == Kind::Strong;
+    let is_ref = kind == Kind::Ref;
+    let oob = quote!(::std::io::Error::new(
+        ::std::io::ErrorKind::InvalidInput,
+        "array index out of bounds",
+    ));
+
+    // The leaf handle type over the method's `'__m` / `__A`, and the value/return
+    // type (`Option`-wrapped for a per-element `[Option<T>; N]`).
+    let leaf_handle = match kind {
+        Kind::Owned => quote!(::bstack_raii::BStackOwned<#elem>),
+        Kind::Strong => quote!(::bstack_raii::BStackRc<'__m, #elem, __A>),
+        Kind::Ref => quote!(::bstack_raii::BStackRef<#elem>),
+        _ => unreachable!(),
+    };
+    let elem_leaf = if elem_nullable {
+        quote!(::core::option::Option<#leaf_handle>)
+    } else {
+        leaf_handle.clone()
+    };
+    let whole_ty = nested_ty(dims, &elem_leaf);
+
+    // Consume a leaf handle `v` into `(offset: u64, ctrl: Option<BStackRange>)`
+    // (`ctrl` is `None` except for a strong ref, whose control range is kept so the
+    // new value can be rebuilt on a failed commit).
+    let consume = |v: TokenStream| match kind {
+        Kind::Owned => quote!({
+            let __h = (#v).into_inner();
+            (
+                ::bstack_raii::BStackBlock::range(&__h).start(),
+                ::core::option::Option::<::bstack_raii::BStackRange>::None,
+            )
+        }),
+        Kind::Ref => quote!((
+            (#v).into_range().start(),
+            ::core::option::Option::<::bstack_raii::BStackRange>::None,
+        )),
+        Kind::Strong => quote!({
+            let (__d, __c) = (#v).into_raw();
+            (__d.into_range().start(), __c)
+        }),
+        _ => unreachable!(),
+    };
+    // Rebuild a leaf handle from `(off, ctrl)` for the new-value handback.
+    let rebuild = |off: TokenStream, ctrl: TokenStream| match kind {
+        Kind::Owned => quote!(unsafe {
+            ::bstack_raii::BStackOwned::from_raw(
+                <#elem as ::bstack_raii::BStackBlock>::from_range(
+                    ::bstack_raii::BStackRange::new(#off, #size_elem)))
+        }),
+        Kind::Ref => quote!(unsafe {
+            ::bstack_raii::BStackRef::<#elem>::from_range(
+                ::bstack_raii::BStackRange::new(#off, #size_elem))
+        }),
+        Kind::Strong => quote!(unsafe {
+            ::bstack_raii::BStackRc::from_raw(
+                ::bstack_raii::BStackRef::<#elem>::from_range(
+                    ::bstack_raii::BStackRange::new(#off, #size_elem)),
+                #ctrl,
+                allocator,
+            )
+        }),
+        _ => unreachable!(),
+    };
+    // Reconstruct the OLD leaf from its offset (moves it out). Owned/ref are
+    // infallible; strong reads the control block and may early-return `lost` — so it
+    // must be used only where the enclosing fn returns `Result<_, ReplaceError<_>>`.
+    let recon_old = |off: TokenStream| match kind {
+        Kind::Owned => quote!(unsafe {
+            ::bstack_raii::BStackOwned::from_raw(
+                <#elem as ::bstack_raii::BStackBlock>::from_range(
+                    ::bstack_raii::BStackRange::new(#off, #size_elem)))
+        }),
+        Kind::Ref => quote!(unsafe {
+            ::bstack_raii::BStackRef::<#elem>::from_range(
+                ::bstack_raii::BStackRange::new(#off, #size_elem))
+        }),
+        Kind::Strong => quote!({
+            let __old_data = unsafe {
+                ::bstack_raii::BStackRef::<#elem>::from_range(
+                    ::bstack_raii::BStackRange::new(#off, #size_elem))
+            };
+            match <#elem as ::bstack_raii::BStackShared>::strong_parts(__old_data, allocator) {
+                ::std::result::Result::Ok((__od2, __oc2)) =>
+                    unsafe { ::bstack_raii::BStackRc::from_raw(__od2, __oc2, allocator) },
+                ::std::result::Result::Err(__e) =>
+                    return ::core::result::Result::Err(::bstack_raii::ReplaceError::lost(__e)),
+            }
+        }),
+        _ => unreachable!(),
+    };
+    // Ctrl-hold pattern: bind the control range only for strong (avoids an unused
+    // binding for owned/ref, whose `rebuild` ignores it).
+    let cpat = if is_strong { quote!(__c) } else { quote!(_) };
+
+    let mut out: Vec<TokenStream> = Vec::new();
+
+    // ---- element `replace_<field>_at(index, value) -> old` ----
+    let replace_at = format_ident!("replace_{}_at", fname);
+    let elem_body = if elem_nullable {
+        let consume_some = consume(quote!(__v));
+        let rb = rebuild(quote!(__o), quote!(__c));
+        let old = recon_old(quote!(__old_off));
+        quote! {
+            let mut __b = [0u8; 8];
+            if let ::std::result::Result::Err(__e) = __stack.get_into(__off, &mut __b) {
+                return ::core::result::Result::Err(::bstack_raii::ReplaceError::recovered(__e, value));
+            }
+            let __old_off = u64::from_le_bytes(__b);
+            let (__new, __back): (
+                u64,
+                ::core::option::Option<(u64, ::core::option::Option<::bstack_raii::BStackRange>)>,
+            ) = match value {
+                ::core::option::Option::Some(__v) => {
+                    let (__o, __c) = #consume_some;
+                    (__o, ::core::option::Option::Some((__o, __c)))
+                }
+                ::core::option::Option::None => (0u64, ::core::option::Option::None),
+            };
+            if let ::std::result::Result::Err(__e) = __stack.set(__off, __new.to_le_bytes()) {
+                let __hb: #elem_leaf = match __back {
+                    ::core::option::Option::Some((__o, #cpat)) => ::core::option::Option::Some(#rb),
+                    ::core::option::Option::None => ::core::option::Option::None,
+                };
+                return ::core::result::Result::Err(::bstack_raii::ReplaceError::recovered(__e, __hb));
+            }
+            if __old_off == 0 {
+                ::core::result::Result::Ok(::core::option::Option::None)
+            } else {
+                ::core::result::Result::Ok(::core::option::Option::Some(#old))
+            }
+        }
+    } else {
+        let consume_v = consume(quote!(value));
+        let rb = rebuild(quote!(__new), quote!(__c));
+        let old = recon_old(quote!(__old_off));
+        quote! {
+            let mut __b = [0u8; 8];
+            if let ::std::result::Result::Err(__e) = __stack.get_into(__off, &mut __b) {
+                return ::core::result::Result::Err(::bstack_raii::ReplaceError::recovered(__e, value));
+            }
+            let __old_off = u64::from_le_bytes(__b);
+            let (__new, #cpat): (u64, ::core::option::Option<::bstack_raii::BStackRange>) = #consume_v;
+            if let ::std::result::Result::Err(__e) = __stack.set(__off, __new.to_le_bytes()) {
+                return ::core::result::Result::Err(::bstack_raii::ReplaceError::recovered(__e, #rb));
+            }
+            ::core::result::Result::Ok(#old)
+        }
+    };
+    out.push(quote! {
+        /// Swap the element at the row-major flat `index`, moving the old element
+        /// out. One crash-atomic 8-byte `set`; on I/O failure the *new* value is
+        /// handed back through [`ReplaceError`](::bstack_raii::ReplaceError).
+        #vis fn #replace_at<'__m, __A: ::bstack_raii::BStackRaiiAllocator>(
+            &self,
+            allocator: &'__m __A,
+            index: usize,
+            value: #elem_leaf,
+        ) -> ::core::result::Result<#elem_leaf, ::bstack_raii::ReplaceError<#elem_leaf>> {
+            if index >= (#total) {
+                return ::core::result::Result::Err(
+                    ::bstack_raii::ReplaceError::recovered(#oob, value));
+            }
+            let __stack = allocator.stack();
+            let __off = #base + (index as u64) * 8;
+            #elem_body
+        }
+    });
+
+    // ---- whole-array `replace_<field>(array) -> old_array` ----
+    // Consume the nested `value` into `__news[k]` (+ `__ncs[k]` for strong).
+    let decl_ncs = if is_strong {
+        quote!(let mut __ncs =
+            [::core::option::Option::<::bstack_raii::BStackRange>::None; #total];)
+    } else {
+        quote!()
+    };
+    let consume_write = |k: &Ident, leaf: &Ident| {
+        let store_ctrl = if is_strong { quote!(__ncs[#k] = __c;) } else { quote!() };
+        if elem_nullable {
+            let cs = consume(quote!(__v));
+            quote! {
+                match #leaf {
+                    ::core::option::Option::Some(__v) => {
+                        let (__o, #cpat) = #cs;
+                        __news[#k] = __o;
+                        #store_ctrl
+                    }
+                    ::core::option::Option::None => { __news[#k] = 0u64; }
+                }
+            }
+        } else {
+            let cs = consume(quote!(#leaf));
+            quote! {
+                let (__o, #cpat) = #cs;
+                __news[#k] = __o;
+                #store_ctrl
+            }
+        }
+    };
+    let consume_all = nested_consume(dims, &quote!(value), &consume_write);
+    // Rebuild the new array (handback) from `__news` / `__ncs`.
+    let new_read = |k: &Ident| {
+        let rb = rebuild(quote!(__news[#k]), quote!(__ncs[#k]));
+        if elem_nullable {
+            quote!(if __news[#k] == 0u64 {
+                ::core::option::Option::None
+            } else {
+                ::core::option::Option::Some(#rb)
+            })
+        } else {
+            rb
+        }
+    };
+    let new_nested = nested_build(dims, &elem_leaf, &new_read);
+    // Rebuild the old array from the previously-read `__oldoffs`.
+    let old_read = |k: &Ident| {
+        let ro = recon_old(quote!(__oldoffs[#k]));
+        if elem_nullable {
+            quote!(if __oldoffs[#k] == 0u64 {
+                ::core::option::Option::None
+            } else {
+                ::core::option::Option::Some(#ro)
+            })
+        } else {
+            ro
+        }
+    };
+    let old_nested = nested_build(dims, &elem_leaf, &old_read);
+    let replace_whole = format_ident!("replace_{}", fname);
+    out.push(quote! {
+        /// Swap the whole array, moving the old array out. One crash-atomic write of
+        /// the inline `[u64; N]` slot region; on I/O failure the *new* array is
+        /// handed back through [`ReplaceError`](::bstack_raii::ReplaceError).
+        #vis fn #replace_whole<'__m, __A: ::bstack_raii::BStackRaiiAllocator>(
+            &self,
+            allocator: &'__m __A,
+            value: #whole_ty,
+        ) -> ::core::result::Result<#whole_ty, ::bstack_raii::ReplaceError<#whole_ty>> {
+            let __stack = allocator.stack();
+            let __base = #base;
+            let mut __buf = ::std::vec![0u8; ::core::mem::size_of::<#on_disk>()];
+            let __r = unsafe { ::bstack_raii::BStackRef::<Self>::from_range(self.0) };
+            let __oldoffs: [u64; #total] = match __r.read_on_disk(__stack, &mut __buf) {
+                ::std::result::Result::Ok(__od) => __od.#fname,
+                ::std::result::Result::Err(__e) =>
+                    return ::core::result::Result::Err(
+                        ::bstack_raii::ReplaceError::recovered(__e, value)),
+            };
+            let mut __news = [0u64; #total];
+            #decl_ncs
+            #consume_all
+            if let ::std::result::Result::Err(__e) =
+                __stack.set(__base, ::bstack_raii::bytemuck::bytes_of(&__news))
+            {
+                let __hb: #whole_ty = #new_nested;
+                return ::core::result::Result::Err(
+                    ::bstack_raii::ReplaceError::recovered(__e, __hb));
+            }
+            let __old: #whole_ty = #old_nested;
+            ::core::result::Result::Ok(__old)
+        }
+    });
+
+    // ---- `set_` mutators for `#[bstack_ref]` (a ref owns nothing) ----
+    if is_ref {
+        let set_at = format_ident!("set_{}_at", fname);
+        let new_off = if elem_nullable {
+            quote!(match value {
+                ::core::option::Option::Some(__v) => __v.into_range().start(),
+                ::core::option::Option::None => 0u64,
+            })
+        } else {
+            quote!(value.into_range().start())
+        };
+        out.push(quote! {
+            /// Repoint the element at the row-major flat `index` (a ref owns nothing,
+            /// so the old ref is simply overwritten). One crash-atomic 8-byte `set`.
+            #vis fn #set_at<'__m, __A: ::bstack_raii::BStackRaiiAllocator>(
+                &self,
+                allocator: &'__m __A,
+                index: usize,
+                value: #elem_leaf,
+            ) -> ::std::io::Result<()> {
+                if index >= (#total) {
+                    return ::std::result::Result::Err(#oob);
+                }
+                let __off = #base + (index as u64) * 8;
+                let __new: u64 = #new_off;
+                allocator.stack().set(__off, __new.to_le_bytes())
+            }
+        });
+
+        let set_whole = format_ident!("set_{}", fname);
+        let set_write = |k: &Ident, leaf: &Ident| {
+            if elem_nullable {
+                quote! {
+                    __news[#k] = match #leaf {
+                        ::core::option::Option::Some(__v) => __v.into_range().start(),
+                        ::core::option::Option::None => 0u64,
+                    };
+                }
+            } else {
+                quote!(__news[#k] = #leaf.into_range().start();)
+            }
+        };
+        let set_consume = nested_consume(dims, &quote!(value), &set_write);
+        out.push(quote! {
+            /// Repoint the whole array (a ref owns nothing, so the old refs are
+            /// overwritten). One crash-atomic write of the inline `[u64; N]` region.
+            #vis fn #set_whole<'__m, __A: ::bstack_raii::BStackRaiiAllocator>(
+                &self,
+                allocator: &'__m __A,
+                value: #whole_ty,
+            ) -> ::std::io::Result<()> {
+                let mut __news = [0u64; #total];
+                #set_consume
+                allocator.stack().set(#base, ::bstack_raii::bytemuck::bytes_of(&__news))
+            }
+        });
+    }
+
+    out
+}
+
 /// Generate `(param, prep, init)` for one constructor field. Not called for
 /// `#[bstack_weak]` fields. `nullable` fields take an `Option<Handle>` (None => 0).
 fn ctor_field(
@@ -5507,6 +5923,16 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
         .collect();
     for variant in &input.variants {
         let kind = classify_attrs(&variant.attrs)?;
+        // `#[bstack_mut]` generates a `set_`/`replace_` mutator only for struct
+        // fields; a `#[bstack_enum]` variant has no generated mutator at all, so the
+        // annotation would be a *silent* no-op. Reject it rather than ignoring it.
+        if is_bstack_mut(&variant.attrs) {
+            return Err(Error::new_spanned(
+                variant,
+                "#[bstack_mut] is not supported on `#[bstack_enum]` variants — no field \
+                 mutator is generated for an enum; mutate by rebuilding the value",
+            ));
+        }
         for f in &variant.fields {
             if !type_mentions_any(&f.ty, &type_params) {
                 continue;

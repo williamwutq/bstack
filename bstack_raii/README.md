@@ -717,6 +717,28 @@ landed — then it's the old block that is reclaimable only via crash-recovery.
 [`set_<field>`](#reference-counted-blocks) wiring; `#[bstack_mut]` on a weak field
 is a no-op, and on an `#[embed]` field a compile error.
 
+### Containers
+
+`#[bstack_mut]` also works on POD tuples and block-reference arrays; a `Vec` is
+already mutable and needs no annotation:
+
+| Field shape                          | Mutator(s)                                                                 |
+|--------------------------------------|----------------------------------------------------------------------------|
+| POD tuple `(A, B, …)`                | `set_<field>(stack, tuple)` — one atomic overwrite (owns no children)       |
+| `#[bstack_owned/strong] [T; N]`      | `replace_<field>_at(&alloc, i, new) -> old` and `replace_<field>(&alloc, arr) -> old_arr` |
+| `#[bstack_ref] [T; N]`               | *(also)* `set_<field>_at` / `set_<field>` (a ref owns nothing)              |
+| `Vec<T>` (any kind)                  | *none needed* — mutate in place via the `get_<field>()` handle (`push_*`, …) |
+
+Arrays are fixed-size, so there is no push/pop — only in-place change. The element
+mutators use a **row-major flat** `index` (for a nested `[[T; M]; N]`, slot `i*M + j`
+is `grid[i][j]`). Both `replace_` forms are one crash-atomic `set` — a single 8-byte
+slot for `_at`, the whole inline `[u64; N]` region for the whole-array form — and
+uphold the same `ReplaceError` hand-back contract as the scalar `replace_`. A `Vec`
+persists its descriptor back to the field on every mutation, so mutating the handle
+its accessor returns *is* mutating the field; `#[bstack_mut]` on a `Vec` is an
+accepted no-op. `Foreign` shapes have no mutator yet (`#[bstack_mut]` on one is a
+compile error).
+
 There is also a raw escape hatch on **every** scalar field —
 `unsafe fn raw_<field>_slice(stack) -> BStackSlice` — a view over the field's
 inline storage (`.read()` / `.write()`). Reads are always valid; writing bypasses
