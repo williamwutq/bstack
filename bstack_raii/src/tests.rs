@@ -10182,6 +10182,13 @@ struct EmbCollectionHolder {
     tag: u32,
 }
 
+#[bstack_block]
+struct EmbListHolder {
+    #[embed]
+    l: BStackLinkedList<MacroLeaf>,
+    tag: u32,
+}
+
 fn build_emb_collection_holder(
     alloc: &FirstFitBStackAllocator,
 ) -> BStackOwned<EmbCollectionHolder> {
@@ -10280,4 +10287,41 @@ fn embed_collection_clone_is_independent() {
     c.bstack_drop(&alloc).unwrap();
     assert_eq!(deque_values(&got, stack), vec![1, 2]);
     h.bstack_drop(&alloc).unwrap();
+}
+
+#[test]
+fn embed_list_clone_is_independent() {
+    // A second embedded collection (nodes AND element blocks out-of-line) confirms the
+    // clone fix generalizes beyond deque: deep-cloning an embedded collection deep-copies
+    // its out-of-line storage, so dropping the source and then the clone returns exactly
+    // to baseline — an aliasing (verbatim-descriptor) clone would double-free the shared
+    // nodes/elements on the second drop.
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+
+    // Warm the WAL anchor for a stable baseline.
+    {
+        let g = MacroLeaf::new(&alloc, 0).unwrap();
+        g.bstack_drop(&alloc).unwrap();
+    }
+    let base = alloc.stack().len().unwrap();
+
+    let h = {
+        let l = BStackLinkedList::<MacroLeaf>::new(&alloc).unwrap();
+        l.push_back(&alloc, MacroLeaf::new(&alloc, 1).unwrap())
+            .unwrap();
+        l.push_back(&alloc, MacroLeaf::new(&alloc, 2).unwrap())
+            .unwrap();
+        EmbListHolder::new(&alloc, l, 9).unwrap()
+    };
+    let c = h.handle().try_clone_in(&alloc).unwrap();
+
+    // Independent copies: dropping both returns to baseline (aliasing ⇒ double-free).
+    h.bstack_drop(&alloc).unwrap();
+    c.bstack_drop(&alloc).unwrap();
+    assert_eq!(
+        alloc.stack().len().unwrap(),
+        base,
+        "embedded list clone aliased the source's out-of-line nodes/elements"
+    );
 }

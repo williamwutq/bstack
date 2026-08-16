@@ -533,11 +533,11 @@ impl<T: BStackBlock> BStackBlock for BStackDeque<T> {
     /// own clone hook) and packed into a fresh, compacted ring (`head = 0`,
     /// `cap = len`); the handle block is staged — all in the parent plan's single
     /// atomic commit.
-    fn __bstack_clone_into<A: BStackRaiiAllocator>(
+    fn __bstack_clone_children_inplace<A: BStackRaiiAllocator>(
         &self,
         allocator: &A,
         plan: &mut ClonePlan,
-    ) -> io::Result<BStackRange> {
+    ) -> io::Result<Self::OnDisk> {
         let (head, len, cap, data) = Self::read_meta(allocator.stack(), self.range.start())?;
 
         // Deep-clone each element (in logical order) into the plan.
@@ -567,8 +567,12 @@ impl<T: BStackBlock> BStackBlock for BStackDeque<T> {
             (0, 0)
         };
 
-        let handle_dst = plan.alloc_raw(allocator, DEQUE_SIZE)?;
-        let od = DequeOnDisk {
+        // Return the descriptor pointing at the freshly-cloned ring; the caller
+        // places it — the default `__bstack_clone_into` in its own fresh block, or an
+        // `#[embed]`ding parent inline in its payload. (Returning the descriptor
+        // *verbatim* — the trait default — would alias the source's ring, so an
+        // embedded collection MUST override this.)
+        Ok(DequeOnDisk {
             header: BlockHeader {
                 size: DEQUE_SIZE,
                 tag: Self::eightcc(),
@@ -577,9 +581,7 @@ impl<T: BStackBlock> BStackBlock for BStackDeque<T> {
             cap: new_cap,
             head: 0,
             len,
-        };
-        plan.write(handle_dst.start(), bytemuck::bytes_of(&od).to_vec());
-        Ok(handle_dst)
+        })
     }
 }
 

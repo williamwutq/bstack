@@ -357,11 +357,11 @@ impl<K: Pod> BStackBlock for BStackCountingBloomFilter<K> {
 
     /// Deep-clone: copy the counter block and stage the handle, in the parent
     /// plan's single atomic commit.
-    fn __bstack_clone_into<A: BStackRaiiAllocator>(
+    fn __bstack_clone_children_inplace<A: BStackRaiiAllocator>(
         &self,
         allocator: &A,
         plan: &mut ClonePlan,
-    ) -> io::Result<BStackRange> {
+    ) -> io::Result<Self::OnDisk> {
         let handle = self.range.start();
         let [data, m, k, n] = read_fields::<4>(allocator.stack(), handle + DATA_OFF)?;
 
@@ -375,7 +375,6 @@ impl<K: Pod> BStackBlock for BStackCountingBloomFilter<K> {
             0
         };
 
-        let handle_dst = plan.alloc_raw(allocator, BLOOM_SIZE)?;
         let od = BloomOnDisk {
             header: BlockHeader {
                 size: BLOOM_SIZE,
@@ -386,8 +385,7 @@ impl<K: Pod> BStackBlock for BStackCountingBloomFilter<K> {
             k,
             n,
         };
-        plan.write(handle_dst.start(), bytemuck::bytes_of(&od).to_vec());
-        Ok(handle_dst)
+        Ok(od)
     }
 }
 

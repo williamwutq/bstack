@@ -387,11 +387,11 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBlock for BStackBinaryHeap<K, V> {
 
     /// Deep-clone: pack the elements into a fresh, exactly-sized array with each
     /// value deep-cloned, and stage the handle, in the parent plan's atomic commit.
-    fn __bstack_clone_into<A: BStackRaiiAllocator>(
+    fn __bstack_clone_children_inplace<A: BStackRaiiAllocator>(
         &self,
         allocator: &A,
         plan: &mut ClonePlan,
-    ) -> io::Result<BStackRange> {
+    ) -> io::Result<Self::OnDisk> {
         let handle = self.range.start();
         let stride = Self::stride();
         let ksize = Self::ksize();
@@ -417,7 +417,6 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBlock for BStackBinaryHeap<K, V> {
             (0, 0)
         };
 
-        let handle_dst = plan.alloc_raw(allocator, HEAP_SIZE)?;
         let od = HeapOnDisk {
             header: BlockHeader {
                 size: HEAP_SIZE,
@@ -427,8 +426,7 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBlock for BStackBinaryHeap<K, V> {
             cap: new_cap,
             len,
         };
-        plan.write(handle_dst.start(), bytemuck::bytes_of(&od).to_vec());
-        Ok(handle_dst)
+        Ok(od)
     }
 }
 

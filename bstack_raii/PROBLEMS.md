@@ -12,18 +12,6 @@ so they are not re-flagged).
 
 ### Undesirable / risky
 
-- [CONFIRMED-DEFECT] **`#[embed]` of a collection is semantically dubious.** `#[embed] BStackDeque<T>`
-  would inline only the fixed descriptor while the ring/nodes stay out-of-line;
-  whether embed teardown/move handle a block whose `OnDisk` is a descriptor (not a
-  self-contained payload) is unverified — embed was designed for self-contained
-  blocks. Tests (`embed_collection_build_read_teardown`, `embed_collection_move_rehomes`,
-  `embed_collection_clone_is_independent`) show build/read/teardown and `bstack_move!`
-  re-home are **correct** (the descriptor's absolute ring/element offsets survive), but
-  deep clone is **broken**: the collections' hand-written impls do not override
-  `__bstack_clone_children_inplace`, whose default returns the descriptor *verbatim*, so a
-  cloned embedded deque aliases the source's out-of-line ring and elements — tearing the
-  clone down frees the source's children (double-free). The fix is per-collection
-  `__bstack_clone_children_inplace` = `__bstack_clone_into` without the handle allocation.
 - **`#[bstack_mut]` is silently ignored on Vec / array / tuple / `Foreign` fields.**
   The mutator injection ([block.rs:2501](derive/src/block.rs#L2501)) runs *after*
   those field branches `continue` (e.g. the `Foreign` branch at

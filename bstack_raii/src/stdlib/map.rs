@@ -513,11 +513,11 @@ impl<K: Pod, V: BStackBlock> BStackBlock for BStackHashMap<K, V> {
     /// every key's position), deep-clone each occupied value (via `V`'s clone
     /// hook) and swap in the clone's ref; stage the handle — all in the parent
     /// plan's single atomic commit.
-    fn __bstack_clone_into<A: BStackRaiiAllocator>(
+    fn __bstack_clone_children_inplace<A: BStackRaiiAllocator>(
         &self,
         allocator: &A,
         plan: &mut ClonePlan,
-    ) -> io::Result<BStackRange> {
+    ) -> io::Result<Self::OnDisk> {
         let stride = Self::stride();
         let ksz = Self::ksize();
         let handle = self.range.start();
@@ -545,7 +545,6 @@ impl<K: Pod, V: BStackBlock> BStackBlock for BStackHashMap<K, V> {
             (dst.start(), cap, used)
         };
 
-        let handle_dst = plan.alloc_raw(allocator, MAP_SIZE)?;
         let od = MapOnDisk {
             header: BlockHeader {
                 size: MAP_SIZE,
@@ -556,8 +555,7 @@ impl<K: Pod, V: BStackBlock> BStackBlock for BStackHashMap<K, V> {
             len,
             used: new_used,
         };
-        plan.write(handle_dst.start(), bytemuck::bytes_of(&od).to_vec());
-        Ok(handle_dst)
+        Ok(od)
     }
 }
 

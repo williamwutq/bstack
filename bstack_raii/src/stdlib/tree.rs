@@ -1023,16 +1023,15 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBlock for BStackBTreeMap<K, V> {
     /// Deep-clone the whole tree into `plan`: every node copied, every value
     /// deep-cloned via `V`'s clone hook, the handle staged — all in the parent
     /// plan's single atomic commit.
-    fn __bstack_clone_into<A: BStackRaiiAllocator>(
+    fn __bstack_clone_children_inplace<A: BStackRaiiAllocator>(
         &self,
         allocator: &A,
         plan: &mut ClonePlan,
-    ) -> io::Result<BStackRange> {
+    ) -> io::Result<Self::OnDisk> {
         let handle = self.range.start();
         let [root, len] = read_fields::<2>(allocator.stack(), handle + ROOT_OFF)?;
         let new_root = Self::clone_subtree(allocator.stack(), root, allocator, plan)?;
 
-        let handle_dst = plan.alloc_raw(allocator, TREE_SIZE)?;
         let od = TreeOnDisk {
             header: BlockHeader {
                 size: TREE_SIZE,
@@ -1041,8 +1040,7 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBlock for BStackBTreeMap<K, V> {
             root: new_root,
             len,
         };
-        plan.write(handle_dst.start(), bytemuck::bytes_of(&od).to_vec());
-        Ok(handle_dst)
+        Ok(od)
     }
 }
 

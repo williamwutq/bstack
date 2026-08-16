@@ -263,11 +263,11 @@ impl BStackBlock for BStackString {
 
     /// Deep-clone: copy the bytes into a fresh block and stage the handle, in the
     /// parent plan's single atomic commit.
-    fn __bstack_clone_into<A: BStackRaiiAllocator>(
+    fn __bstack_clone_children_inplace<A: BStackRaiiAllocator>(
         &self,
         allocator: &A,
         plan: &mut ClonePlan,
-    ) -> io::Result<BStackRange> {
+    ) -> io::Result<Self::OnDisk> {
         let handle = self.range.start();
         let [data, len] = read_fields::<2>(allocator.stack(), handle + DATA_OFF)?;
 
@@ -281,7 +281,6 @@ impl BStackBlock for BStackString {
             0
         };
 
-        let handle_dst = plan.alloc_raw(allocator, STRING_SIZE)?;
         let od = StringOnDisk {
             header: BlockHeader {
                 size: STRING_SIZE,
@@ -290,8 +289,7 @@ impl BStackBlock for BStackString {
             data: new_data,
             len,
         };
-        plan.write(handle_dst.start(), bytemuck::bytes_of(&od).to_vec());
-        Ok(handle_dst)
+        Ok(od)
     }
 }
 

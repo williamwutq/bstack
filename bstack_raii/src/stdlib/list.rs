@@ -479,11 +479,11 @@ impl<T: BStackBlock> BStackBlock for BStackLinkedList<T> {
     /// Deep-clone the whole chain into `plan`: every value is deep-cloned (via
     /// `T`'s own clone hook), fresh nodes are allocated and wired, and the list
     /// block is staged — all as part of the parent plan's single atomic commit.
-    fn __bstack_clone_into<A: BStackRaiiAllocator>(
+    fn __bstack_clone_children_inplace<A: BStackRaiiAllocator>(
         &self,
         allocator: &A,
         plan: &mut ClonePlan,
-    ) -> io::Result<BStackRange> {
+    ) -> io::Result<Self::OnDisk> {
         let src = self.range.start();
 
         // 1. Gather the source value offsets in order.
@@ -522,8 +522,8 @@ impl<T: BStackBlock> BStackBlock for BStackLinkedList<T> {
             plan.write(node_dsts[i], bytemuck::bytes_of(&od).to_vec());
         }
 
-        // 5. Stage the list block.
-        let list_dst = plan.alloc_raw(allocator, LIST_SIZE)?;
+        // 5. Return the list descriptor (the caller places it — in a fresh block for
+        // an owned clone, or inline for an `#[embed]`ded one).
         let od = ListOnDisk {
             header: BlockHeader {
                 size: LIST_SIZE,
@@ -533,8 +533,7 @@ impl<T: BStackBlock> BStackBlock for BStackLinkedList<T> {
             tail: node_dsts.last().copied().unwrap_or(0),
             len: n as u64,
         };
-        plan.write(list_dst.start(), bytemuck::bytes_of(&od).to_vec());
-        Ok(list_dst)
+        Ok(od)
     }
 }
 

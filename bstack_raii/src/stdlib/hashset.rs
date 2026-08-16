@@ -439,11 +439,11 @@ impl<K: Pod> BStackBlock for BStackHashSet<K> {
 
     /// Deep-clone: copy the bucket block, deep-clone the Bloom filter, and stage
     /// the handle, in the parent plan's single atomic commit.
-    fn __bstack_clone_into<A: BStackRaiiAllocator>(
+    fn __bstack_clone_children_inplace<A: BStackRaiiAllocator>(
         &self,
         allocator: &A,
         plan: &mut ClonePlan,
-    ) -> io::Result<BStackRange> {
+    ) -> io::Result<Self::OnDisk> {
         let handle = self.range.start();
         let stride = Self::stride();
         let [table, cap, len, used, bloom_off] =
@@ -464,7 +464,6 @@ impl<K: Pod> BStackBlock for BStackHashSet<K> {
         ));
         let new_bloom = bloom.__bstack_clone_into(allocator, plan)?.start();
 
-        let handle_dst = plan.alloc_raw(allocator, SET_SIZE)?;
         let od = HashSetOnDisk {
             header: BlockHeader {
                 size: SET_SIZE,
@@ -476,8 +475,7 @@ impl<K: Pod> BStackBlock for BStackHashSet<K> {
             used,
             bloom: new_bloom,
         };
-        plan.write(handle_dst.start(), bytemuck::bytes_of(&od).to_vec());
-        Ok(handle_dst)
+        Ok(od)
     }
 }
 

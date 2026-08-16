@@ -853,11 +853,11 @@ impl<K: Pod + Ord> BStackBlock for BStackBTreeSet<K> {
 
     /// Deep-clone every node and the Bloom filter into `plan`, then stage the
     /// handle.
-    fn __bstack_clone_into<A: BStackRaiiAllocator>(
+    fn __bstack_clone_children_inplace<A: BStackRaiiAllocator>(
         &self,
         allocator: &A,
         plan: &mut ClonePlan,
-    ) -> io::Result<BStackRange> {
+    ) -> io::Result<Self::OnDisk> {
         let handle = self.range.start();
         let [root, len, bloom_off] = read_fields::<3>(allocator.stack(), handle + ROOT_OFF)?;
 
@@ -867,7 +867,6 @@ impl<K: Pod + Ord> BStackBlock for BStackBTreeSet<K> {
         ));
         let new_bloom = bloom.__bstack_clone_into(allocator, plan)?.start();
 
-        let handle_dst = plan.alloc_raw(allocator, TREESET_SIZE)?;
         let od = TreeSetOnDisk {
             header: BlockHeader {
                 size: TREESET_SIZE,
@@ -877,8 +876,7 @@ impl<K: Pod + Ord> BStackBlock for BStackBTreeSet<K> {
             len,
             bloom: new_bloom,
         };
-        plan.write(handle_dst.start(), bytemuck::bytes_of(&od).to_vec());
-        Ok(handle_dst)
+        Ok(od)
     }
 }
 
