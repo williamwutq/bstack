@@ -7433,6 +7433,29 @@ fn macro_bstack_mut_strong_replace_moves_count_out() {
 // --------------------------------------------------------------------------
 
 #[test]
+fn foreign_is_zero_cost_16_bytes_and_detach_semantics() {
+    use crate::Foreign;
+    use crate::registry::FileId;
+
+    // Zero-cost: the `NonZeroU64` file-id niche in the explicit variant encodes the
+    // SELF/explicit discriminant for free, so the in-memory form is exactly the 16-byte
+    // on-disk wire size.
+    assert_eq!(core::mem::size_of::<Foreign<'static, MacroLeaf>>(), 16);
+
+    // An explicit pointer is registry-resolved and borrow-free: it `detach`es to a
+    // `'static` `Foreign` that can be stored / moved anywhere.
+    let ext = unsafe { Foreign::<MacroLeaf>::new(FileId::from_u64(3).unwrap(), 64) };
+    assert!(!ext.is_self());
+    assert!(ext.detach().is_some());
+
+    // A SELF pointer is borrow-bound and cannot `detach` (it is only valid within the
+    // scope of the file it was read from).
+    let selfp = unsafe { Foreign::<MacroLeaf>::new(FileId::SELF, 64) };
+    assert!(selfp.is_self());
+    assert!(selfp.detach().is_none());
+}
+
+#[test]
 fn foreign_resolves_across_files_and_self() {
     use crate::Foreign;
     use crate::registry::{FileId, FileRegistry};
@@ -7455,7 +7478,7 @@ fn foreign_resolves_across_files_and_self() {
         .unwrap();
 
     // A Foreign pointing at that leaf resolves + reads through the registry.
-    let fp = Foreign::<MacroLeaf>::new(id, off);
+    let fp = unsafe { Foreign::<MacroLeaf>::new(id, off) };
     assert_eq!(
         fp.with_in(&reg, &local, |t, stack| t.get_val(stack).unwrap())
             .unwrap(),
@@ -7473,7 +7496,7 @@ fn foreign_resolves_across_files_and_self() {
 
     // SELF resolves against `local` directly — no registry entry needed.
     let lleaf = MacroLeaf::new(&local, 9).unwrap();
-    let selfp = Foreign::<MacroLeaf>::new(FileId::SELF, lleaf.handle().range().start());
+    let selfp = unsafe { Foreign::<MacroLeaf>::new(FileId::SELF, lleaf.handle().range().start()) };
     assert!(selfp.is_self());
     assert_eq!(
         selfp
@@ -7519,7 +7542,13 @@ fn macro_foreign_field() {
         .unwrap();
 
     // POD field + an owned cross-file link + a null optional link.
-    let h = ForeignHolder::new(&local, 5, Foreign::<MacroLeaf>::new(id, off), None).unwrap();
+    let h = ForeignHolder::new(
+        &local,
+        5,
+        unsafe { Foreign::<MacroLeaf>::new(id, off) },
+        None,
+    )
+    .unwrap();
     assert_eq!(h.handle().get_tag(stack).unwrap(), 5);
     assert_eq!(
         h.handle()
@@ -7535,8 +7564,8 @@ fn macro_foreign_field() {
     let h2 = ForeignHolder::new(
         &local,
         5,
-        Foreign::<MacroLeaf>::new(id, off),
-        Some(Foreign::<MacroLeaf>::new(id, off)),
+        unsafe { Foreign::<MacroLeaf>::new(id, off) },
+        Some(unsafe { Foreign::<MacroLeaf>::new(id, off) }),
     )
     .unwrap();
     let m = h2.handle().get_maybe(stack).unwrap().expect("Some link");
@@ -7583,8 +7612,8 @@ fn macro_foreign_field_bstack_move() {
     let h = ForeignHolder::new(
         &local,
         5,
-        Foreign::<MacroLeaf>::new(id, off),
-        Some(Foreign::<MacroLeaf>::new(id, off)),
+        unsafe { Foreign::<MacroLeaf>::new(id, off) },
+        Some(unsafe { Foreign::<MacroLeaf>::new(id, off) }),
     )
     .unwrap();
 
@@ -7806,7 +7835,13 @@ fn macro_foreign_owned_teardown_reclaims_across_files() {
     assert!(!fid.is_self());
 
     // A home block owning the foreign target.
-    let h = ForeignHolder::new(&home_alloc, 7, Foreign::<MacroLeaf>::new(fid, off), None).unwrap();
+    let h = ForeignHolder::new(
+        &home_alloc,
+        7,
+        unsafe { Foreign::<MacroLeaf>::new(fid, off) },
+        None,
+    )
+    .unwrap();
 
     // Tearing the home block down frees the target across the file boundary.
     h.bstack_drop(&home_alloc).unwrap();
@@ -7857,11 +7892,9 @@ fn macro_foreign_strong_teardown_frees_at_zero_across_files() {
     let fid = registry::attach(&foreign.path, foreign_alloc).unwrap();
 
     // The home block is the sole strong owner (count is 1) across the file boundary.
-    let h = ForeignStrongHolder::new(
-        &home_alloc,
-        1,
-        Foreign::<MacroStrongChild>::new(fid, data_off),
-    )
+    let h = ForeignStrongHolder::new(&home_alloc, 1, unsafe {
+        Foreign::<MacroStrongChild>::new(fid, data_off)
+    })
     .unwrap();
 
     // Teardown drives the far-side strong count 1 -> 0, freeing data + control there.
@@ -7912,7 +7945,7 @@ fn macro_foreign_concurrent_ab_ba_teardown() {
         ForeignHolder::new(
             &*arc_a,
             0,
-            Foreign::<MacroLeaf>::new(fid_b, bl.handle().range().start()),
+            unsafe { Foreign::<MacroLeaf>::new(fid_b, bl.handle().range().start()) },
             None,
         )
         .unwrap()
@@ -7922,7 +7955,7 @@ fn macro_foreign_concurrent_ab_ba_teardown() {
         ForeignHolder::new(
             &*arc_b,
             0,
-            Foreign::<MacroLeaf>::new(fid_a, al.handle().range().start()),
+            unsafe { Foreign::<MacroLeaf>::new(fid_a, al.handle().range().start()) },
             None,
         )
         .unwrap()
@@ -7946,7 +7979,7 @@ fn macro_foreign_concurrent_ab_ba_teardown() {
                 ForeignHolder::new(
                     &*arc_a,
                     i,
-                    Foreign::<MacroLeaf>::new(fid_b, bl.handle().range().start()),
+                    unsafe { Foreign::<MacroLeaf>::new(fid_b, bl.handle().range().start()) },
                     None,
                 )
                 .unwrap()
@@ -7957,7 +7990,7 @@ fn macro_foreign_concurrent_ab_ba_teardown() {
                 ForeignHolder::new(
                     &*arc_b,
                     i,
-                    Foreign::<MacroLeaf>::new(fid_a, al.handle().range().start()),
+                    unsafe { Foreign::<MacroLeaf>::new(fid_a, al.handle().range().start()) },
                     None,
                 )
                 .unwrap()
@@ -8037,7 +8070,7 @@ fn macro_foreign_owned_clone_deep_copies_across_files() {
         let h0 = ForeignHolder::new(
             &home_alloc,
             0,
-            Foreign::<MacroLeaf>::new(fid, l0.handle().range().start()),
+            unsafe { Foreign::<MacroLeaf>::new(fid, l0.handle().range().start()) },
             None,
         )
         .unwrap();
@@ -8050,7 +8083,13 @@ fn macro_foreign_owned_clone_deep_copies_across_files() {
     // The real target + home holder owning it.
     let leaf = MacroLeaf::new(&*arc_b, 42).unwrap();
     let off = leaf.handle().range().start();
-    let h = ForeignHolder::new(&home_alloc, 7, Foreign::<MacroLeaf>::new(fid, off), None).unwrap();
+    let h = ForeignHolder::new(
+        &home_alloc,
+        7,
+        unsafe { Foreign::<MacroLeaf>::new(fid, off) },
+        None,
+    )
+    .unwrap();
 
     // Deep clone the home holder: its owned foreign target is copied on B.
     let c = h.handle().try_clone_in(&home_alloc).unwrap();
@@ -8114,7 +8153,7 @@ fn macro_foreign_owned_clone_on_bulk_home_copies_once() {
         let h0 = ForeignHolder::new(
             &home_alloc,
             0,
-            Foreign::<MacroLeaf>::new(fid, l0.handle().range().start()),
+            unsafe { Foreign::<MacroLeaf>::new(fid, l0.handle().range().start()) },
             None,
         )
         .unwrap();
@@ -8129,7 +8168,13 @@ fn macro_foreign_owned_clone_on_bulk_home_copies_once() {
 
     let leaf = MacroLeaf::new(&*arc_b, 42).unwrap();
     let off = leaf.handle().range().start();
-    let h = ForeignHolder::new(&home_alloc, 7, Foreign::<MacroLeaf>::new(fid, off), None).unwrap();
+    let h = ForeignHolder::new(
+        &home_alloc,
+        7,
+        unsafe { Foreign::<MacroLeaf>::new(fid, off) },
+        None,
+    )
+    .unwrap();
 
     // Two-pass clone on the bulk home allocator.
     let c = h.handle().try_clone_in(&home_alloc).unwrap();
@@ -8194,11 +8239,9 @@ fn macro_foreign_strong_clone_bumps_count_across_files() {
     assert_eq!(load(strong_off), 1);
 
     // One strong owner across the boundary; cloning it makes two.
-    let h = ForeignStrongHolder::new(
-        &home_alloc,
-        1,
-        Foreign::<MacroStrongChild>::new(fid, data_off),
-    )
+    let h = ForeignStrongHolder::new(&home_alloc, 1, unsafe {
+        Foreign::<MacroStrongChild>::new(fid, data_off)
+    })
     .unwrap();
     let c = h.handle().try_clone_in(&home_alloc).unwrap();
     assert_eq!(
@@ -8253,11 +8296,9 @@ fn macro_foreign_weak_clone_bumps_count_across_files() {
     assert_eq!(load(weak_off), 2); // phantom + holder
 
     // A weak foreign holder points at the CONTROL block; cloning it bumps weak.
-    let h = ForeignWeakHolder::new(
-        &home_alloc,
-        1,
-        Foreign::<MacroStrongChild>::new(fid, ctrl_off),
-    )
+    let h = ForeignWeakHolder::new(&home_alloc, 1, unsafe {
+        Foreign::<MacroStrongChild>::new(fid, ctrl_off)
+    })
     .unwrap();
     let c = h.handle().try_clone_in(&home_alloc).unwrap();
     assert_eq!(
@@ -8309,7 +8350,7 @@ fn macro_foreign_concurrent_ab_ba_clone() {
         let h = ForeignHolder::new(
             &**ha,
             0,
-            Foreign::<MacroLeaf>::new(tgt, l.handle().range().start()),
+            unsafe { Foreign::<MacroLeaf>::new(tgt, l.handle().range().start()) },
             None,
         )
         .unwrap();
@@ -8333,7 +8374,7 @@ fn macro_foreign_concurrent_ab_ba_clone() {
             ForeignHolder::new(
                 &*arc_a,
                 i,
-                Foreign::<MacroLeaf>::new(fid_b, bl.handle().range().start()),
+                unsafe { Foreign::<MacroLeaf>::new(fid_b, bl.handle().range().start()) },
                 None,
             )
             .unwrap()
@@ -8344,7 +8385,7 @@ fn macro_foreign_concurrent_ab_ba_clone() {
             ForeignHolder::new(
                 &*arc_b,
                 i,
-                Foreign::<MacroLeaf>::new(fid_a, al.handle().range().start()),
+                unsafe { Foreign::<MacroLeaf>::new(fid_a, al.handle().range().start()) },
                 None,
             )
             .unwrap()
@@ -8433,7 +8474,7 @@ fn macro_foreign_vec_owned_across_files() {
         let h = ForeignVecHolder::new(
             &home_alloc,
             0,
-            vec![Foreign::<MacroLeaf>::new(fid, l.handle().range().start())],
+            vec![unsafe { Foreign::<MacroLeaf>::new(fid, l.handle().range().start()) }],
         )
         .unwrap();
         let c = h.handle().try_clone_in(&home_alloc).unwrap();
@@ -8447,7 +8488,7 @@ fn macro_foreign_vec_owned_across_files() {
     let mut links = Vec::new();
     for i in 0..N {
         let l = MacroLeaf::new(&*arc_b, 100 + i).unwrap();
-        links.push(Foreign::<MacroLeaf>::new(fid, l.handle().range().start()));
+        links.push(unsafe { Foreign::<MacroLeaf>::new(fid, l.handle().range().start()) });
     }
     let h = ForeignVecHolder::new(&home_alloc, 7, links).unwrap();
 
@@ -8514,7 +8555,7 @@ fn macro_foreign_array_owned_across_files() {
 
     let mk = |v: u32| {
         let l = MacroLeaf::new(&*arc_b, v).unwrap();
-        Foreign::<MacroLeaf>::new(fid, l.handle().range().start())
+        unsafe { Foreign::<MacroLeaf>::new(fid, l.handle().range().start()) }
     };
 
     // Warm the owned-array clone path (creates B's WAL block), baseline.
@@ -8594,7 +8635,7 @@ fn macro_foreign_strong_vec_across_files() {
         let d = alloc_block(&*arc_b, MacroStrongChild::eightcc(), ds).unwrap();
         let c = alloc_control(&*arc_b, ctrl_tag(), d, cs).unwrap();
         strong_offs.push(c.start() + layout::CTRL_STRONG_OFFSET);
-        links.push(Foreign::<MacroStrongChild>::new(fid, d.start()));
+        links.push(unsafe { Foreign::<MacroStrongChild>::new(fid, d.start()) });
     }
     let load = |o: u64| crate::refcount::load(arc_b.stack(), o).unwrap();
     for &o in &strong_offs {
@@ -8645,11 +8686,9 @@ fn macro_foreign_generic_across_files() {
     // Warm B's WAL block via one owned-clone cycle, then baseline.
     {
         let l = MacroLeaf::new(&*arc_b, 0).unwrap();
-        let h = GenForeign::<MacroLeaf>::new(
-            &home_alloc,
-            0,
-            Foreign::new(fid, l.handle().range().start()),
-        )
+        let h = GenForeign::<MacroLeaf>::new(&home_alloc, 0, unsafe {
+            Foreign::new(fid, l.handle().range().start())
+        })
         .unwrap();
         let c = h.handle().try_clone_in(&home_alloc).unwrap();
         c.bstack_drop(&home_alloc).unwrap();
@@ -8659,7 +8698,8 @@ fn macro_foreign_generic_across_files() {
 
     let l = MacroLeaf::new(&*arc_b, 55).unwrap();
     let off = l.handle().range().start();
-    let h = GenForeign::<MacroLeaf>::new(&home_alloc, 7, Foreign::new(fid, off)).unwrap();
+    let h =
+        GenForeign::<MacroLeaf>::new(&home_alloc, 7, unsafe { Foreign::new(fid, off) }).unwrap();
 
     // Access resolves the generic foreign target.
     let link = h.handle().get_link(hstack).unwrap();
@@ -8722,7 +8762,7 @@ fn macro_foreign_cursed_valid_combos_compile_and_run() {
     a.bstack_drop(&alloc).unwrap();
 
     // [[Foreign; 2]; 3] all null (offset-0) strong pointers.
-    let null = Foreign::<MacroStrongChild>::new(FileId::SELF, 0);
+    let null = unsafe { Foreign::<MacroStrongChild>::new(FileId::SELF, 0) };
     let n = CursedNestedArr::new(&alloc, [[null, null], [null, null], [null, null]]).unwrap();
     let grid = n.handle().get_grid(stack).unwrap();
     assert_eq!(grid.len(), 3);
@@ -8740,7 +8780,7 @@ fn macro_foreign_cursed_valid_combos_compile_and_run() {
         None,
         vec![],
         None,
-        Foreign::<MacroLeaf>::new(FileId::SELF, 0),
+        unsafe { Foreign::<MacroLeaf>::new(FileId::SELF, 0) },
         None,
     )
     .unwrap();
@@ -8777,7 +8817,7 @@ fn macro_foreign_vec_of_option_roundtrips() {
 
     let f = |v: u32| {
         let l = MacroLeaf::new(&*arc_b, v).unwrap();
-        Some(Foreign::<MacroLeaf>::new(fid, l.handle().range().start()))
+        Some(unsafe { Foreign::<MacroLeaf>::new(fid, l.handle().range().start()) })
     };
     // [Some, None, Some].
     let h = OptForeignVecHolder::new(&home_alloc, vec![f(11), None, f(22)]).unwrap();
@@ -8832,7 +8872,7 @@ fn macro_foreign_in_enum_across_files() {
 
     let mk = |v: u32| {
         let l = MacroLeaf::new(&*arc_b, v).unwrap();
-        Foreign::<MacroLeaf>::new(fid, l.handle().range().start())
+        unsafe { Foreign::<MacroLeaf>::new(fid, l.handle().range().start()) }
     };
 
     // A plain POD variant still works.
@@ -8910,7 +8950,7 @@ fn macro_foreign_generic_tuple_and_enum() {
     let fid = reg.attach(&foreign.path, arc_b.clone()).unwrap();
     let mk = |v: u32| {
         let l = MacroLeaf::new(&*arc_b, v).unwrap();
-        Foreign::<MacroLeaf>::new(fid, l.handle().range().start())
+        unsafe { Foreign::<MacroLeaf>::new(fid, l.handle().range().start()) }
     };
 
     // Generic foreign tuple.
@@ -8983,7 +9023,7 @@ fn macro_foreign_strong_enum_variant() {
 
     let e = ForeignStrongEnum::new(
         &home_alloc,
-        ForeignStrongEnumData::S(Foreign::<MacroStrongChild>::new(fid, d.start())),
+        ForeignStrongEnumData::S(unsafe { Foreign::<MacroStrongChild>::new(fid, d.start()) }),
     )
     .unwrap();
     let cl = e.handle().try_clone_in(&home_alloc).unwrap();
@@ -9016,7 +9056,7 @@ fn macro_foreign_tuple_in_enum_variant() {
     let fid = reg.attach(&foreign.path, arc_b.clone()).unwrap();
     let mk = |v: u32| {
         let l = MacroLeaf::new(&*arc_b, v).unwrap();
-        Foreign::<MacroLeaf>::new(fid, l.handle().range().start())
+        unsafe { Foreign::<MacroLeaf>::new(fid, l.handle().range().start()) }
     };
 
     // Warm, baseline.
@@ -9099,7 +9139,7 @@ fn macro_foreign_enum_container_variants() {
     let fid = reg.attach(&foreign.path, arc_b.clone()).unwrap();
     let mk = |v: u32| {
         let l = MacroLeaf::new(&*arc_b, v).unwrap();
-        Foreign::<MacroLeaf>::new(fid, l.handle().range().start())
+        unsafe { Foreign::<MacroLeaf>::new(fid, l.handle().range().start()) }
     };
 
     // Warm both variants' clone paths (B's WAL block), baseline.
@@ -9198,7 +9238,7 @@ fn macro_foreign_in_tuple_across_files() {
 
     let mk = |v: u32| {
         let l = MacroLeaf::new(&*arc_b, v).unwrap();
-        Foreign::<MacroLeaf>::new(fid, l.handle().range().start())
+        unsafe { Foreign::<MacroLeaf>::new(fid, l.handle().range().start()) }
     };
 
     // Warm B's WAL block, baseline.
@@ -9278,7 +9318,13 @@ fn macro_foreign_owned_clone_errors_when_target_file_detached() {
     let reg = registry::get().unwrap();
     let fid = reg.attach(&foreign.path, arc_b.clone()).unwrap();
 
-    let h = ForeignHolder::new(&home_alloc, 1, Foreign::<MacroLeaf>::new(fid, off), None).unwrap();
+    let h = ForeignHolder::new(
+        &home_alloc,
+        1,
+        unsafe { Foreign::<MacroLeaf>::new(fid, off) },
+        None,
+    )
+    .unwrap();
 
     // Detach the target file → the deep clone cannot copy the target → error.
     reg.detach(fid);
@@ -9318,12 +9364,12 @@ fn foreign_reverse_map_and_bstack_cast() {
     // always resolvable-in-place; a foreign id that is not live-in-the-GLOBAL-registry
     // is `None`. Use a high id no test ever attaches, so this holds regardless of what
     // other (global-registry) tests are doing concurrently.
-    let selfp = Foreign::<MacroLeaf>::new(FileId::SELF, off);
+    let selfp = unsafe { Foreign::<MacroLeaf>::new(FileId::SELF, off) };
     let r: Option<BStackRef<MacroLeaf>> = bstack_cast!(selfp as BStackRef<MacroLeaf>);
     assert!(r.is_some());
     let dead = FileId::from_u64(60_000).unwrap();
     assert!(
-        Foreign::<MacroLeaf>::new(dead, off)
+        unsafe { Foreign::<MacroLeaf>::new(dead, off) }
             .as_local_ref()
             .is_none()
     );
@@ -9743,11 +9789,9 @@ fn stdlib_foreign_collection_target_clone_and_teardown() {
         warm_dq
             .push_back(&*arc_b, MacroLeaf::new(&*arc_b, 99).unwrap())
             .unwrap();
-        let h0 = ForeignCollectionHolder::new(
-            &home_alloc,
-            0,
-            Foreign::<BStackDeque<MacroLeaf>>::new(fid, warm_dq.handle().range().start()),
-        )
+        let h0 = ForeignCollectionHolder::new(&home_alloc, 0, unsafe {
+            Foreign::<BStackDeque<MacroLeaf>>::new(fid, warm_dq.handle().range().start())
+        })
         .unwrap();
         let c0 = h0.handle().try_clone_in(&home_alloc).unwrap();
         h0.bstack_drop(&home_alloc).unwrap();
@@ -9756,11 +9800,9 @@ fn stdlib_foreign_collection_target_clone_and_teardown() {
     let base_b = arc_b.stack().len().unwrap();
 
     // A home block owning the foreign deque.
-    let h = ForeignCollectionHolder::new(
-        &home_alloc,
-        7,
-        Foreign::<BStackDeque<MacroLeaf>>::new(fid, dq_off),
-    )
+    let h = ForeignCollectionHolder::new(&home_alloc, 7, unsafe {
+        Foreign::<BStackDeque<MacroLeaf>>::new(fid, dq_off)
+    })
     .unwrap();
 
     // Deep clone: the whole deque (handle + ring + elements) is copied into the

@@ -20,16 +20,16 @@ so they are not re-flagged).
   it leaks the target. Consistent with `Foreign` being a non-RAII pointer (and with
   `BStackOwned` also freeing nothing on `Drop`), but an ergonomic asymmetry; there is
   no `BStackOwned`-equivalent RAII wrapper for a moved-out cross-file owner.
-- **Raw `ForeignPtr` bypasses cross-file ownership.** `Foreign<T>` is deliberately
-  **not `Pod`** (only `Copy`), so it is correctly rejected from every `T: Pod`
-  container (`BStackBox<Foreign>`, `BStackVec<Foreign>`, a `Foreign` map/set/heap
-  key all fail to compile — good). But `ForeignPtr` **is** `Pod` and is publicly
-  re-exported, so `BStackBox<ForeignPtr>` / `BStackVec<ForeignPtr>` / a `ForeignPtr`
-  Pod-key compile and store a cross-file pointer as opaque bytes with **no** owning
-  dispatch → the target is leaked on teardown and aliased on clone. The macro's
-  "a `Foreign` field must carry an annotation" guard has no analogue here. Low
-  severity (raw form), but it is a hole in the "a foreign pointer always carries
-  ownership dispatch" invariant.
+- **[MITIGATED 2026-08-15] Raw wire pointer bypasses cross-file ownership.**
+  `Foreign<T>` is deliberately **not `Pod`** (only `Copy`), so it is correctly rejected
+  from every `T: Pod` container. The old public `Pod` `ForeignPtr` was a hole (it could
+  be stored in a `BStackBox`/`BStackVec` as opaque bytes with no owning dispatch). It has
+  been renamed to `ForeignRepr`, made `#[doc(hidden)]`, and dropped from the public
+  prelude, and it now carries **no resolution API** — there is no safe way to turn a
+  stored `ForeignRepr` back into a `Foreign` (only the `unsafe fn from_repr`, called by
+  generated code). So `BStackVec<ForeignRepr>` still compiles (it is `pub` for macro
+  output) but stores inert bytes that reach no target without an explicit `unsafe`,
+  which is the correct boundary. User code never names the type.
 - [CONFIRMED-DEFECT] **`#[embed]` of a collection is semantically dubious.** `#[embed] BStackDeque<T>`
   would inline only the fixed descriptor while the ring/nodes stay out-of-line;
   whether embed teardown/move handle a block whose `OnDisk` is a descriptor (not a
@@ -50,14 +50,18 @@ so they are not re-flagged).
   user marking such a field `#[bstack_mut]` gets a silent no-op. (When the container
   mutator gap is eventually filled, a `Foreign` `replace_` must also free/repoint
   the *old cross-file target*, or it leaks — like the scalar owned `replace_`.)
-- **`Foreign(SELF)` resolution trusts the caller's `local` with no check.**
-  `Foreign::with(local, f)` resolves a `FileId::SELF` pointer against `local.stack()`
-  unconditionally ([foreign.rs:148](src/foreign.rs#L148)) — nothing verifies `local`
-  is the file the block actually lives in. A SELF `Foreign` read out of a
-  foreign-resident block and resolved with the *home* allocator silently reads the
-  wrong file. Relatedly, byte-copying a SELF `Foreign` across files (a plain clone
-  of a field holding one) rebinds it to the destination file — a position-dependent
-  pointer that silently changes meaning when it moves.
+- **[MOSTLY CLOSED 2026-08-15] `Foreign(SELF)` position-dependence.** `Foreign<T>` is
+  now `Foreign<'a, T>`, and a field accessor binds `'a` to the `&'a BStack` it read
+  through (an enum variant to the read/move borrow). A SELF pointer is therefore
+  **borrow-bound to its home file** and can no longer be *stored into another file* — the
+  byte-copy-rebind footgun is closed for the safe (generated-accessor) path, and an
+  explicit pointer resolves through the registry regardless. Two residuals remain, both
+  now behind `unsafe` or a documented caveat: (a) the raw `unsafe fn Foreign::new` can
+  fabricate a `'static` SELF whose deref against a wrong-but-co-live `local` reads the
+  wrong file (the lifetime pins *scope*, not value identity — its safety contract says
+  "resolve only against its home"); (b) a persisted SELF is still position-dependent on
+  disk (allowed by design — persisted SELF is legal), so migrating the *containing*
+  block to another file rebinds it. Both are `unsafe`/contract-level, not safe-API holes.
 - **`bstack_cast!(foreign as BStackRef<T>)` yields an offset-only ref** valid only
   in the target's *own* file; resolving it against the local stack reads garbage
   (documented internally, not UB, but an easy silent-wrong-data footgun).

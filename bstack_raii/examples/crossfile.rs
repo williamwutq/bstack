@@ -87,11 +87,9 @@ fn main() -> io::Result<()> {
     // --- a single owned foreign pointer -------------------------------------
 
     // A card in the catalog file that owns `doc` over in the store file.
-    let card = Card::new(
-        &catalog,
-        "annual-report",
-        Foreign::<Document>::new(store_id, doc_off),
-    )?;
+    let card = Card::new(&catalog, "annual-report", unsafe {
+        Foreign::<Document>::new(store_id, doc_off)
+    })?;
 
     // Resolve the foreign pointer and read the far-side document. `with` takes
     // the *local* allocator (used only for a same-file `Foreign`) and a closure
@@ -124,7 +122,7 @@ fn main() -> io::Result<()> {
 
     let ptrs: Vec<Foreign<Document>> = extra
         .iter()
-        .map(|&off| Foreign::<Document>::new(store_id, off))
+        .map(|&off| unsafe { Foreign::<Document>::new(store_id, off) })
         .collect();
     let bundle = Bundle::new(&catalog, "q3-batch", ptrs)?;
     let bundle_sizes: Vec<u64> = bundle

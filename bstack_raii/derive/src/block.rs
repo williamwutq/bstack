@@ -127,6 +127,10 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         /// needing only `BStackBlock`), an owned foreign deep-clone runs a self-
         /// contained `try_clone_in` on the target's file, so it needs `TryCloneIn`.
         foreign_owned: bool,
+        /// The parameter is the target of *any* `Foreign<T>` (any kind). `Foreign<'a, T>`
+        /// requires `T: 'static`, so such a parameter needs the `'static` bound even
+        /// though a foreign target is never stored inline (so `in_ondisk` is not set).
+        foreign: bool,
     }
     let mut usage: Vec<(Ident, Usage)> = type_params
         .iter()
@@ -151,6 +155,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                 // The parameter is a foreign *target*: a block reference in its own
                 // file. Kind names the ownership of that target.
                 u.blockish = true;
+                u.foreign = true;
                 match kind {
                     Kind::Owned => u.foreign_owned = true,
                     Kind::Strong => u.strong = true,
@@ -233,7 +238,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         // `bytemuck::Pod` requires `'static`. A stored parameter is a `Pod` value or
         // a block handle (a `BStackRange` newtype) — both `'static` — so the block's
         // own impls need the bound too, to use `Self::OnDisk: Pod`.
-        if u.is_some_and(|u| u.in_ondisk) {
+        if u.is_some_and(|u| u.in_ondisk || u.foreign) {
             tp.bounds.push(syn::parse_quote!('static));
         }
     }
@@ -729,17 +734,26 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                 } else {
                     quote!(::bstack_raii::Foreign<#ftarget>)
                 };
-                // Map a stored `ForeignPtr` ↔ the element type (offset 0 ⇒ `None` when
-                // the element is `Option`-wrapped).
+                // The accessor binds each returned `Foreign`'s lifetime to `'__v` (the
+                // allocator borrow it read through), so a `SELF` element cannot escape it.
+                let acc_elem_ty = if elem_nullable {
+                    quote!(::core::option::Option<::bstack_raii::Foreign<'__v, #ftarget>>)
+                } else {
+                    quote!(::bstack_raii::Foreign<'__v, #ftarget>)
+                };
+                // Map a stored `ForeignRepr` ↔ the element type (offset 0 ⇒ `None` when
+                // the element is `Option`-wrapped). SAFETY: each repr was stored into
+                // this file; the returned `Foreign`s are `'__v`-bound by the accessor.
                 let from_ptr = if elem_nullable {
                     quote!(|__p: ::bstack_raii::ForeignRepr| if __p.offset() == 0 {
                         ::core::option::Option::None
                     } else {
                         ::core::option::Option::Some(
-                            ::bstack_raii::Foreign::<#ftarget>::from_ptr(__p))
+                            unsafe { ::bstack_raii::Foreign::<#ftarget>::from_repr(__p) })
                     })
                 } else {
-                    quote!(::bstack_raii::Foreign::<#ftarget>::from_ptr)
+                    quote!(|__p: ::bstack_raii::ForeignRepr|
+                        unsafe { ::bstack_raii::Foreign::<#ftarget>::from_repr(__p) })
                 };
                 let to_ptr = if elem_nullable {
                     quote!(|__f: #field_ty| match __f {
@@ -753,7 +767,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                 // ---- Accessor: `Vec<Foreign<T>>` / `Vec<Option<Foreign<T>>>` (or `Option<..>`) ----
                 let (acc_ret, acc_body) = if nullable {
                     (
-                        quote!(::core::option::Option<::std::vec::Vec<#field_ty>>),
+                        quote!(::core::option::Option<::std::vec::Vec<#acc_elem_ty>>),
                         quote!(match unsafe { #store::from_field_opt(#field_loc, allocator) }? {
                             ::core::option::Option::Some(__v) => ::core::option::Option::Some(
                                 __v.to_vec()?
@@ -765,7 +779,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                     )
                 } else {
                     (
-                        quote!(::std::vec::Vec<#field_ty>),
+                        quote!(::std::vec::Vec<#acc_elem_ty>),
                         quote!(unsafe { #store::from_field(#field_loc, allocator)? }
                             .to_vec()?
                             .into_iter()
@@ -1507,13 +1521,16 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                 on_disk_fields.push(quote!(#fname: [::bstack_raii::ForeignRepr; #total],));
 
                 // ---- Accessor: nested `[[Foreign<T>; ..]; ..]` (Option per slot) ----
+                // Each returned `Foreign`'s lifetime is bound to `'__f` (the `stack`
+                // borrow), so a `SELF` slot cannot escape the file it was read from.
                 let leaf_ty = if aleaf_nullable {
-                    quote!(::core::option::Option<#field_ty>)
+                    quote!(::core::option::Option<::bstack_raii::Foreign<'__f, #ftarget>>)
                 } else {
-                    field_ty.clone()
+                    quote!(::bstack_raii::Foreign<'__f, #ftarget>)
                 };
                 let acc_ret = nested_ty(&adims, &leaf_ty);
                 let acc_read = |k: &Ident| {
+                    // SAFETY: each slot repr was stored into this file; bound to `'__f`.
                     if aleaf_nullable {
                         quote!({
                             let __p = __arr[#k];
@@ -1521,18 +1538,18 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                                 ::core::option::Option::None
                             } else {
                                 ::core::option::Option::Some(
-                                    ::bstack_raii::Foreign::<#ftarget>::from_ptr(__p))
+                                    unsafe { ::bstack_raii::Foreign::<#ftarget>::from_repr(__p) })
                             }
                         })
                     } else {
-                        quote!(::bstack_raii::Foreign::<#ftarget>::from_ptr(__arr[#k]))
+                        quote!(unsafe { ::bstack_raii::Foreign::<#ftarget>::from_repr(__arr[#k]) })
                     }
                 };
                 let acc_body = nested_build(&adims, &leaf_ty, &acc_read);
                 accessors.push(quote! {
-                    #vis fn #getter(
+                    #vis fn #getter<'__f>(
                         &self,
-                        stack: &::bstack_raii::BStack,
+                        stack: &'__f ::bstack_raii::BStack,
                     ) -> ::std::io::Result<#acc_ret> {
                         let mut __buf = ::std::vec![0u8; ::core::mem::size_of::<#on_disk_ty>()];
                         let __r = unsafe { ::bstack_raii::BStackRef::<Self>::from_range(self.0) };
@@ -1603,9 +1620,14 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                 // ---- Move: materialize the nested `[[Foreign<T>; ..]; ..]` values ----
                 let cap = format_ident!("__cap_{}", fname);
                 mv_caps.push(quote!(let #cap = __od.#fname;));
-                let mv_leaf = leaf_ty.clone();
+                let mv_leaf = if aleaf_nullable {
+                    quote!(::core::option::Option<::bstack_raii::Foreign<'__mv, #ftarget>>)
+                } else {
+                    quote!(::bstack_raii::Foreign<'__mv, #ftarget>)
+                };
                 mv_types.push(nested_ty(&adims, &mv_leaf));
                 let mv_read = |k: &Ident| {
+                    // SAFETY: each slot repr was stored into this file; bound to `'__mv`.
                     if aleaf_nullable {
                         quote!({
                             let __p = #cap[#k];
@@ -1613,11 +1635,11 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                                 ::core::option::Option::None
                             } else {
                                 ::core::option::Option::Some(
-                                    ::bstack_raii::Foreign::<#ftarget>::from_ptr(__p))
+                                    unsafe { ::bstack_raii::Foreign::<#ftarget>::from_repr(__p) })
                             }
                         })
                     } else {
-                        quote!(::bstack_raii::Foreign::<#ftarget>::from_ptr(#cap[#k]))
+                        quote!(unsafe { ::bstack_raii::Foreign::<#ftarget>::from_repr(#cap[#k]) })
                     }
                 };
                 mv_recon.push(nested_build(&adims, &mv_leaf, &mv_read));
@@ -2166,22 +2188,37 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
             // The PUBLIC tuple type (accessor / ctor / move): `Foreign` is a token, so
             // rewrite each foreign element to the real `::bstack_raii::Foreign<T>` (the
             // user's bare `Foreign` isn't in scope in the generated impls).
-            let pub_elems: Vec<TokenStream> = (0..n)
-                .map(|i| {
-                    if is_foreign[i] {
-                        let ft = ftargets[i].unwrap();
-                        if nulls[i] {
-                            quote!(::core::option::Option<::bstack_raii::Foreign<#ft>>)
+            // Build the public tuple type with a given lifetime on each `Foreign`
+            // element (`None` ⇒ elided, for the by-value ctor param). The accessor binds
+            // `'__f` (its `stack` borrow) and the move binds `'__mv`, so a `SELF` element
+            // cannot escape the file / block it came from.
+            let mk_tuple_ty = |lt: Option<&syn::Lifetime>| -> TokenStream {
+                let elems: Vec<TokenStream> = (0..n)
+                    .map(|i| {
+                        if is_foreign[i] {
+                            let ft = ftargets[i].unwrap();
+                            let f = match lt {
+                                Some(l) => quote!(::bstack_raii::Foreign<#l, #ft>),
+                                None => quote!(::bstack_raii::Foreign<#ft>),
+                            };
+                            if nulls[i] {
+                                quote!(::core::option::Option<#f>)
+                            } else {
+                                f
+                            }
                         } else {
-                            quote!(::bstack_raii::Foreign<#ft>)
+                            let e = &tup.elems[i];
+                            quote!(#e)
                         }
-                    } else {
-                        let e = &tup.elems[i];
-                        quote!(#e)
-                    }
-                })
-                .collect();
-            let pub_tuple_ty = quote!(( #(#pub_elems,)* ));
+                    })
+                    .collect();
+                quote!(( #(#elems,)* ))
+            };
+            let lt_f = syn::Lifetime::new("'__f", Span::call_site());
+            let lt_mv = syn::Lifetime::new("'__mv", Span::call_site());
+            let pub_tuple_ty = mk_tuple_ty(None);
+            let acc_tuple_ty = mk_tuple_ty(Some(&lt_f));
+            let mv_tuple_ty = mk_tuple_ty(Some(&lt_mv));
             let wrapper = format_ident!("__BstackFTup_{}_{}", name, fname);
             // Wrapper element types: POD verbatim, foreign → `ForeignPtr`.
             let welem: Vec<TokenStream> = tup
@@ -2208,7 +2245,9 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
             });
             on_disk_fields.push(quote!(#fname: #wrapper,));
 
-            // Accessor: rebuild the tuple, mapping each `ForeignPtr` back to a `Foreign`.
+            // Accessor: rebuild the tuple, mapping each `ForeignRepr` back to a `Foreign`.
+            // SAFETY: each element repr was stored into this file; the returned
+            // `Foreign`s are `'__f`-bound to `stack` by the accessor signature.
             let acc_elems: Vec<TokenStream> = (0..n)
                 .map(|i| {
                     let ix = &idx[i];
@@ -2219,10 +2258,10 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                                 ::core::option::Option::None
                             } else {
                                 ::core::option::Option::Some(
-                                    ::bstack_raii::Foreign::<#ft>::from_ptr(__w.#ix))
+                                    unsafe { ::bstack_raii::Foreign::<#ft>::from_repr(__w.#ix) })
                             })
                         } else {
-                            quote!(::bstack_raii::Foreign::<#ft>::from_ptr(__w.#ix))
+                            quote!(unsafe { ::bstack_raii::Foreign::<#ft>::from_repr(__w.#ix) })
                         }
                     } else {
                         quote!(__w.#ix)
@@ -2230,10 +2269,10 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                 })
                 .collect();
             accessors.push(quote! {
-                #vis fn #getter(
+                #vis fn #getter<'__f>(
                     &self,
-                    stack: &::bstack_raii::BStack,
-                ) -> ::std::io::Result<#pub_tuple_ty> {
+                    stack: &'__f ::bstack_raii::BStack,
+                ) -> ::std::io::Result<#acc_tuple_ty> {
                     let mut __buf = ::std::vec![0u8; ::core::mem::size_of::<#on_disk_ty>()];
                     let __r = unsafe { ::bstack_raii::BStackRef::<Self>::from_range(self.0) };
                     let __od: #on_disk_ty = *__r.read_on_disk(stack, &mut __buf)?;
@@ -2305,10 +2344,11 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                 });
             }
 
-            // Move: rebuild the tuple (same mapping as the accessor).
+            // Move: rebuild the tuple (same mapping as the accessor), `'__mv`-bound.
+            // SAFETY: each element repr was stored into this file; bound to `'__mv`.
             let cap = format_ident!("__cap_{}", fname);
             mv_caps.push(quote!(let #cap = __od.#fname;));
-            mv_types.push(quote!(#pub_tuple_ty));
+            mv_types.push(quote!(#mv_tuple_ty));
             let mv_elems: Vec<TokenStream> = (0..n)
                 .map(|i| {
                     let ix = &idx[i];
@@ -2319,10 +2359,10 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                                 ::core::option::Option::None
                             } else {
                                 ::core::option::Option::Some(
-                                    ::bstack_raii::Foreign::<#ft>::from_ptr(#cap.#ix))
+                                    unsafe { ::bstack_raii::Foreign::<#ft>::from_repr(#cap.#ix) })
                             })
                         } else {
-                            quote!(::bstack_raii::Foreign::<#ft>::from_ptr(#cap.#ix))
+                            quote!(unsafe { ::bstack_raii::Foreign::<#ft>::from_repr(#cap.#ix) })
                         }
                     } else {
                         quote!(#cap.#ix)
@@ -5386,6 +5426,9 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
         /// The param is the target of a `#[bstack_owned] V(Foreign<T>)` variant (an
         /// owned foreign deep-clone runs `try_clone_in`, needing `TryCloneIn`).
         foreign_owned: bool,
+        /// The param is the target of *any* `Foreign<T>` variant; `Foreign<'a, T>`
+        /// requires `T: 'static`.
+        foreign: bool,
     }
     let mut eusage: Vec<(Ident, EUsage)> = type_params
         .iter()
@@ -5422,6 +5465,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                 u.strong |= kind == Kind::Strong;
                 u.weak |= kind == Kind::Weak;
                 u.foreign_owned |= is_ftarget && kind == Kind::Owned;
+                u.foreign |= is_ftarget;
             }
         }
     }
@@ -5440,6 +5484,9 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
             }
             if u.foreign_owned {
                 tp.bounds.push(syn::parse_quote!(::bstack_raii::TryCloneIn));
+            }
+            if u.foreign {
+                tp.bounds.push(syn::parse_quote!('static));
             }
         }
     }
@@ -5541,6 +5588,9 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
     // also makes `EView` generic (its read upgrades to a `BStackRc`).
     let mut has_shared = false;
     let mut has_weak = false;
+    // A `Foreign` variant (scalar / vec / array / tuple) makes both `EData` and `EView`
+    // carry the `'__e` lifetime so a `SELF` pointer is bound to the read / move borrow.
+    let mut has_foreign = false;
 
     for (i, variant) in input.variants.iter().enumerate() {
         let disc = &disc_pats[i];
@@ -5623,23 +5673,34 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                             }
                         }
                         reject_bad_foreign_target(ftarget, ty, "a `Foreign` vec variant")?;
+                        has_foreign = true;
                         let elem_nullable = option_inner(velem).is_some();
                         let store =
                             quote!(::bstack_raii::BStackVec::<::bstack_raii::ForeignRepr, __A>);
+                        // Variant type uses the enum's `'__e`; the move local uses `'__mv`
+                        // (the move borrow), since `'__e` is not in scope in `bstack_move`.
                         let fty = if elem_nullable {
-                            quote!(::core::option::Option<::bstack_raii::Foreign<#ftarget>>)
+                            quote!(::core::option::Option<::bstack_raii::Foreign<'__e, #ftarget>>)
                         } else {
-                            quote!(::bstack_raii::Foreign<#ftarget>)
+                            quote!(::bstack_raii::Foreign<'__e, #ftarget>)
                         };
+                        let fty_mv = if elem_nullable {
+                            quote!(::core::option::Option<::bstack_raii::Foreign<'__mv, #ftarget>>)
+                        } else {
+                            quote!(::bstack_raii::Foreign<'__mv, #ftarget>)
+                        };
+                        // SAFETY: each repr was stored into this file; the returned
+                        // `Foreign`s are lifetime-bound by the read / move signature.
                         let from_ptr = if elem_nullable {
                             quote!(|__p: ::bstack_raii::ForeignRepr| if __p.offset() == 0 {
                                 ::core::option::Option::None
                             } else {
                                 ::core::option::Option::Some(
-                                    ::bstack_raii::Foreign::<#ftarget>::from_ptr(__p))
+                                    unsafe { ::bstack_raii::Foreign::<#ftarget>::from_repr(__p) })
                             })
                         } else {
-                            quote!(::bstack_raii::Foreign::<#ftarget>::from_ptr)
+                            quote!(|__p: ::bstack_raii::ForeignRepr|
+                                unsafe { ::bstack_raii::Foreign::<#ftarget>::from_repr(__p) })
                         };
                         let to_ptr = if elem_nullable {
                             quote!(|__f: #fty| match __f {
@@ -5669,7 +5730,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                         });
                         move_arms.push(quote! {
                             #disc => {
-                                let __out: ::std::vec::Vec<#fty> =
+                                let __out: ::std::vec::Vec<#fty_mv> =
                                     #store::from_desc(#read_desc, __alloc)
                                         .to_vec()?.into_iter().map(#from_ptr).collect();
                                 #store::from_desc(#read_desc, __alloc).bstack_drop()?;
@@ -6093,11 +6154,18 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                             }
                         }
                         reject_bad_foreign_target(ftarget, ty, "a `Foreign` array variant")?;
+                        has_foreign = true;
                         payload_sizes.push(quote!((#total) * 16));
+                        // Variant type uses the enum's `'__e`; the move build uses `'__mv`.
                         let fty = if elem_nullable {
-                            quote!(::core::option::Option<::bstack_raii::Foreign<#ftarget>>)
+                            quote!(::core::option::Option<::bstack_raii::Foreign<'__e, #ftarget>>)
                         } else {
-                            quote!(::bstack_raii::Foreign<#ftarget>)
+                            quote!(::bstack_raii::Foreign<'__e, #ftarget>)
+                        };
+                        let fty_mv = if elem_nullable {
+                            quote!(::core::option::Option<::bstack_raii::Foreign<'__mv, #ftarget>>)
+                        } else {
+                            quote!(::bstack_raii::Foreign<'__mv, #ftarget>)
                         };
                         let nested = nested_ty(&dims, &fty);
                         data_variants.push(quote!(#vname(#nested),));
@@ -6126,7 +6194,10 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                             }
                         });
 
-                        // read / move: reshape `[ForeignPtr; TOTAL]` → nested handles.
+                        // read / move: reshape `[ForeignRepr; TOTAL]` → nested handles.
+                        // SAFETY: each repr was stored into this file; the returned
+                        // `Foreign`s are lifetime-bound by the read (`'__e`) / move
+                        // (`'__mv`) signature via the variant type.
                         let leaf_read = |k: &Ident| {
                             let fp = quote!(::bstack_raii::bytemuck::pod_read_unaligned::<
                                 ::bstack_raii::ForeignRepr,
@@ -6138,16 +6209,17 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                                         ::core::option::Option::None
                                     } else {
                                         ::core::option::Option::Some(
-                                            ::bstack_raii::Foreign::<#ftarget>::from_ptr(__p))
+                                            unsafe { ::bstack_raii::Foreign::<#ftarget>::from_repr(__p) })
                                     }
                                 })
                             } else {
-                                quote!(::bstack_raii::Foreign::<#ftarget>::from_ptr(#fp))
+                                quote!(unsafe { ::bstack_raii::Foreign::<#ftarget>::from_repr(#fp) })
                             }
                         };
-                        let build = nested_build(&dims, &fty, &leaf_read);
-                        read_arms.push(quote!(#disc => #view::#vname(#build),));
-                        move_arms.push(quote!(#disc => #data::#vname(#build),));
+                        let build_e = nested_build(&dims, &fty, &leaf_read);
+                        let build_mv = nested_build(&dims, &fty_mv, &leaf_read);
+                        read_arms.push(quote!(#disc => #view::#vname(#build_e),));
+                        move_arms.push(quote!(#disc => #data::#vname(#build_mv),));
 
                         // Teardown / clone: iterate the flat slots (inline — no block).
                         if !matches!(kind, Kind::Ref) {
@@ -6601,8 +6673,11 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                     // Generic foreign targets are allowed (bounds inferred above).
                     reject_bad_foreign_target(ftarget, ty, "a `Foreign` enum variant")?;
 
+                    has_foreign = true;
                     payload_sizes.push(quote!(16usize));
-                    let fty = quote!(::bstack_raii::Foreign<#ftarget>);
+                    // `'__e` is the enum's read / move borrow (see `has_foreign`), so a
+                    // `SELF` pointer in this variant cannot escape it.
+                    let fty = quote!(::bstack_raii::Foreign<'__e, #ftarget>);
                     let read_fp = quote!(::bstack_raii::bytemuck::pod_read_unaligned::<
                         ::bstack_raii::ForeignRepr,
                     >(&__pl[..16]));
@@ -6616,12 +6691,11 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                             (#disc, __pl)
                         }
                     });
-                    read_arms.push(
-                        quote!(#disc => #view::#vname(::bstack_raii::Foreign::from_ptr(#read_fp)),),
-                    );
-                    move_arms.push(
-                        quote!(#disc => #data::#vname(::bstack_raii::Foreign::from_ptr(#read_fp)),),
-                    );
+                    // SAFETY: the repr was stored into this file; bound to `'__e`.
+                    read_arms.push(quote!(#disc => #view::#vname(
+                        unsafe { ::bstack_raii::Foreign::from_repr(#read_fp) }),));
+                    move_arms.push(quote!(#disc => #data::#vname(
+                        unsafe { ::bstack_raii::Foreign::from_repr(#read_fp) }),));
                     // Teardown / clone dispatch (a `#[bstack_ref]` owns nothing → none;
                     // its `ForeignPtr` is byte-copied by the payload catch-all).
                     if !matches!(kind, Kind::Ref) {
@@ -6694,15 +6768,17 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                     }
                     payload_sizes.push(acc);
 
-                    // Public tuple type: `Foreign` → `::bstack_raii::Foreign` (+ Option).
+                    has_foreign = true;
+                    // Public tuple type: `Foreign` → `::bstack_raii::Foreign<'__e, _>` so a
+                    // `SELF` element is bound to the enum's read / move borrow (+ Option).
                     let pub_elems: Vec<TokenStream> = (0..nelem)
                         .map(|i| {
                             if is_foreign[i] {
                                 let ft = ftargets[i].unwrap();
                                 if nulls[i] {
-                                    quote!(::core::option::Option<::bstack_raii::Foreign<#ft>>)
+                                    quote!(::core::option::Option<::bstack_raii::Foreign<'__e, #ft>>)
                                 } else {
-                                    quote!(::bstack_raii::Foreign<#ft>)
+                                    quote!(::bstack_raii::Foreign<'__e, #ft>)
                                 }
                             } else {
                                 let e = &tup.elems[i];
@@ -6757,6 +6833,8 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                                 let fp = quote!(::bstack_raii::bytemuck::pod_read_unaligned::<
                                     ::bstack_raii::ForeignRepr,
                                 >(&__pl[(#off)..(#off) + 16]));
+                                // SAFETY: repr stored into this file; bound by the
+                                // variant type (read `'__e` / move `'__mv`).
                                 if nulls[i] {
                                     quote!({
                                         let __p = #fp;
@@ -6764,11 +6842,11 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                                             ::core::option::Option::None
                                         } else {
                                             ::core::option::Option::Some(
-                                                ::bstack_raii::Foreign::<#ft>::from_ptr(__p))
+                                                unsafe { ::bstack_raii::Foreign::<#ft>::from_repr(__p) })
                                         }
                                     })
                                 } else {
-                                    quote!(::bstack_raii::Foreign::<#ft>::from_ptr(#fp))
+                                    quote!(unsafe { ::bstack_raii::Foreign::<#ft>::from_repr(#fp) })
                                 }
                             } else {
                                 let e = &tup.elems[i];
@@ -7224,10 +7302,17 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
     // with the right subset present.
     let etp_args: Vec<TokenStream> = type_params.iter().map(|p| quote!(#p)).collect();
     let etp_decl: Vec<TokenStream> = aug_generics.type_params().map(|tp| quote!(#tp)).collect();
-    let comp_ty = |id: &Ident, lt: &TokenStream, la: bool| -> TokenStream {
+    // `want_lt` and `want_a` are decoupled: a strong/weak variant needs *both* the
+    // lifetime and `__A` (`BStackRc<'__e, T, __A>`), but a `Foreign` variant needs only
+    // the lifetime (`Foreign<'__e, T>` binds a `SELF` pointer to the read/move borrow,
+    // carrying no allocator) — so an enum with a `Foreign` variant but no shared/weak
+    // one gets `'__e` without an unused `__A` param.
+    let comp_ty = |id: &Ident, lt: &TokenStream, want_lt: bool, want_a: bool| -> TokenStream {
         let mut args: Vec<TokenStream> = Vec::new();
-        if la {
+        if want_lt {
             args.push(lt.clone());
+        }
+        if want_a {
             args.push(quote!(__A));
         }
         args.extend(etp_args.iter().cloned());
@@ -7237,10 +7322,12 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
             quote!(#id < #(#args),* >)
         }
     };
-    let comp_decl = |lt: &TokenStream, la: bool| -> TokenStream {
+    let comp_decl = |lt: &TokenStream, want_lt: bool, want_a: bool| -> TokenStream {
         let mut parts: Vec<TokenStream> = Vec::new();
-        if la {
+        if want_lt {
             parts.push(lt.clone());
+        }
+        if want_a {
             parts.push(quote!(__A: ::bstack_raii::BStackRaiiAllocator));
         }
         parts.extend(etp_decl.iter().cloned());
@@ -7250,7 +7337,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
             quote!(< #(#parts),* >)
         }
     };
-    let data_ty = comp_ty(&data, &quote!('__e), has_shared);
+    let data_ty = comp_ty(&data, &quote!('__e), has_shared || has_foreign, has_shared);
     // The `new` constructor. Plain / `rc` are one atomic write (the injected
     // refcount is baked into the image); `(rc, weak)` allocates data + control and
     // commits both images in one `set_batched`, with the control back-pointer
@@ -7591,12 +7678,12 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
     // `EData` is generic over `<'e, A>` when a variant holds a strong/weak
     // reference; `EView` only when a weak variant makes `read` upgrade; both are
     // also generic over the enum's own type parameters.
-    let data_generics = comp_decl(&quote!('__e), has_shared);
-    let view_generics = comp_decl(&quote!('__e), has_weak);
-    let view_ty = comp_ty(&view, &quote!('__e), has_weak);
+    let data_generics = comp_decl(&quote!('__e), has_shared || has_foreign, has_shared);
+    let view_generics = comp_decl(&quote!('__e), has_weak || has_foreign, has_weak);
+    let view_ty = comp_ty(&view, &quote!('__e), has_weak || has_foreign, has_weak);
     // `bstack_move!` yields the same `EData` (owned handles); `Fields` just names
     // it with the move lifetime.
-    let move_fields_ty = comp_ty(&data, &quote!('__mv), has_shared);
+    let move_fields_ty = comp_ty(&data, &quote!('__mv), has_shared || has_foreign, has_shared);
     // `bstack_move!` frees the enum shell, then rebuilds the active variant's
     // payload as an owned handle.
     let move_payload = if needs_payload {

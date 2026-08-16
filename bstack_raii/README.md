@@ -896,8 +896,12 @@ struct Card {
     #[bstack_owned] body: Foreign<Document>,   // owns a Document in another file
 }
 
-// Construct with an explicit (file, offset) pointer …
-let card = Card::new(&catalog, "report", Foreign::<Document>::new(store_id, doc_off))?;
+// Construct with an explicit (file, offset) pointer. `Foreign::new` is `unsafe`
+// (it asserts the offset names a valid `T`); the safe ways to obtain one are
+// `bstack_cast!(slice as Foreign<T>)`, `Foreign::at(file, &handle)`, or simply
+// reading a field.
+let ptr = unsafe { Foreign::<Document>::new(store_id, doc_off) };
+let card = Card::new(&catalog, "report", ptr)?;
 
 // … and resolve it to read across the boundary. `with` runs a closure against
 // the target and *its* file's stack: `Ok(None)` for a null pointer, `Err` if
@@ -907,6 +911,15 @@ let size = card.handle().get_body(catalog.stack())?
     .with(&catalog, |doc, fs| doc.get_size(fs).unwrap())?  // io::Result<Option<u64>>
     .expect("owned Foreign is never null");
 ```
+
+`Foreign<'a, T>` is a 16-byte, zero-cost enum: an **explicit** pointer (a real
+`FileId` + offset, registry-resolved, borrow-free) or a [`SELF`] pointer (an offset
+in the current file). A field accessor returns `Foreign<'a, T>` with `'a` **bound to
+the `&'a BStack` it read through**, so a `SELF` pointer can never be stored into — or
+outlive — the file it came from; an explicit pointer ignores the borrow and can be
+[`detach`]ed to a `'static`, freely-movable `Foreign` (a `SELF` one cannot detach).
+The `NonZeroU64` file-id niche encodes the explicit/`SELF` tag for free, so the
+in-memory form is exactly the on-disk wire size.
 
 The annotation decides what teardown and clone do **in the target's own file**:
 
@@ -932,9 +945,9 @@ is itself `(rc)` — is a compile error; use `#[bstack_strong]`.)
 
 ### Containers and shapes
 
-A `Foreign<T>` composes everywhere an in-file reference does — because a foreign
-pointer is itself `Pod`, the container storage is reused and only the per-element
-cross-file dispatch is added:
+A `Foreign<T>` composes everywhere an in-file reference does — its inert 16-byte
+wire form (`ForeignRepr`) is `Pod`, so the container storage is reused and only the
+per-element cross-file dispatch (and the read-side lifetime binding) is added:
 
 ```rust
 #[bstack_owned] parts: Vec<Foreign<Document>>,          // a growable list of pointers

@@ -275,10 +275,7 @@ impl<'a, T: BStackBlock + 'static> Foreign<'a, T> {
                 })?;
                 registry::with_host(id, |host| f(t, host.stack()))
                     .ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::NotFound,
-                            "Foreign: target file not attached",
-                        )
+                        io::Error::new(io::ErrorKind::NotFound, "Foreign: target file not attached")
                     })
                     .map(Some)
             }
@@ -328,10 +325,7 @@ impl<'a, T: BStackBlock + 'static> Foreign<'a, T> {
                 registry
                     .with_host(id, |host| f(t, host.stack()))
                     .ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::NotFound,
-                            "Foreign: target file not attached",
-                        )
+                        io::Error::new(io::ErrorKind::NotFound, "Foreign: target file not attached")
                     })
                     .map(Some)
             }
