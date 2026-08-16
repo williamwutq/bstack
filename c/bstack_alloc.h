@@ -82,12 +82,14 @@ bstack_slice_t bstack_slice_empty(bstack_allocator_t *a);
  * buf must have room for at least s.len bytes; no overflow check is done.
  * Returns 0 on success, -1 on failure (errno set).
  */
+BSTACK_WARN_UNUSED_RESULT
 int bstack_slice_read(bstack_slice_t s, uint8_t *buf);
 
 /*
  * Read min(buf_len, s.len) bytes from the start of the slice into buf.
  * Returns 0 on success, -1 on failure (errno set).
  */
+BSTACK_WARN_UNUSED_RESULT
 int bstack_slice_read_into(bstack_slice_t s, uint8_t *buf, size_t buf_len);
 
 /*
@@ -95,6 +97,7 @@ int bstack_slice_read_into(bstack_slice_t s, uint8_t *buf, size_t buf_len);
  * Returns -1 with errno = EINVAL if start + buf_len exceeds s.len or would
  * overflow uint64_t.
  */
+BSTACK_WARN_UNUSED_RESULT
 int bstack_slice_read_range_into(bstack_slice_t s, uint64_t start,
                                   uint8_t *buf, size_t buf_len);
 
@@ -103,6 +106,7 @@ int bstack_slice_read_range_into(bstack_slice_t s, uint64_t start,
  * buf must have room for (end - start) bytes; no overflow check is done.
  * Returns -1 with errno = EINVAL if start > end or end exceeds s.len.
  */
+BSTACK_WARN_UNUSED_RESULT
 int bstack_slice_read_range(bstack_slice_t s, uint64_t start, uint64_t end,
                              uint8_t *buf);
 
@@ -111,6 +115,7 @@ int bstack_slice_read_range(bstack_slice_t s, uint64_t start, uint64_t end,
  * start and end are 0-based within the slice (not the payload).
  * Returns -1 with errno = EINVAL if start > end or end > s.len.
  */
+BSTACK_WARN_UNUSED_RESULT
 int bstack_slice_subslice(bstack_slice_t s, uint64_t start, uint64_t end,
                            bstack_slice_t *out);
 
@@ -119,6 +124,7 @@ int bstack_slice_subslice(bstack_slice_t s, uint64_t start, uint64_t end,
  * Overwrite the first min(data_len, s.len) bytes of the slice in place.
  * Requires -DBSTACK_FEATURE_SET.
  */
+BSTACK_WARN_UNUSED_RESULT
 int bstack_slice_write(bstack_slice_t s,
                         const uint8_t *data, size_t data_len);
 
@@ -128,6 +134,7 @@ int bstack_slice_write(bstack_slice_t s,
  * Returns -1 with errno = EINVAL if start + data_len exceeds s.len.
  * Requires -DBSTACK_FEATURE_SET.
  */
+BSTACK_WARN_UNUSED_RESULT
 int bstack_slice_write_range(bstack_slice_t s, uint64_t start,
                               const uint8_t *data, size_t data_len);
 
@@ -135,6 +142,7 @@ int bstack_slice_write_range(bstack_slice_t s, uint64_t start,
  * Zero the entire slice in place.
  * Requires -DBSTACK_FEATURE_SET.
  */
+BSTACK_WARN_UNUSED_RESULT
 int bstack_slice_zero(bstack_slice_t s);
 
 /*
@@ -143,6 +151,7 @@ int bstack_slice_zero(bstack_slice_t s);
  * Returns -1 with errno = EINVAL if start + n exceeds s.len.
  * Requires -DBSTACK_FEATURE_SET.
  */
+BSTACK_WARN_UNUSED_RESULT
 int bstack_slice_zero_range(bstack_slice_t s, uint64_t start, uint64_t n);
 #endif /* BSTACK_FEATURE_SET */
 
@@ -239,12 +248,14 @@ bstack_guarded_slice(bstack_slice_t slice,
  * buf must have room for at least gs.slice.len bytes.
  * Returns 0 on success, -1 on failure (errno set).
  */
+BSTACK_WARN_UNUSED_RESULT
 int bstack_guarded_slice_read(bstack_guarded_slice_t gs, uint8_t *buf);
 
 /*
  * Read min(buf_len, gs.slice.len) bytes from the start of the slice.
  * Returns 0 on success, -1 on failure (errno set).
  */
+BSTACK_WARN_UNUSED_RESULT
 int bstack_guarded_slice_read_into(bstack_guarded_slice_t gs,
                                     uint8_t *buf, size_t buf_len);
 
@@ -252,6 +263,7 @@ int bstack_guarded_slice_read_into(bstack_guarded_slice_t gs,
  * Read buf_len bytes starting at slice-relative offset start into buf.
  * Returns -1 with errno = EINVAL if start + buf_len exceeds gs.slice.len.
  */
+BSTACK_WARN_UNUSED_RESULT
 int bstack_guarded_slice_read_range_into(bstack_guarded_slice_t gs,
                                           uint64_t start,
                                           uint8_t *buf, size_t buf_len);
@@ -261,6 +273,7 @@ int bstack_guarded_slice_read_range_into(bstack_guarded_slice_t gs,
  * buf must have room for (end - start) bytes.
  * Returns -1 with errno = EINVAL if start > end or end > gs.slice.len.
  */
+BSTACK_WARN_UNUSED_RESULT
 int bstack_guarded_slice_read_range(bstack_guarded_slice_t gs,
                                      uint64_t start, uint64_t end,
                                      uint8_t *buf);
@@ -270,6 +283,7 @@ int bstack_guarded_slice_read_range(bstack_guarded_slice_t gs,
  * same vtbl/ctx.  start and end are 0-based within the slice.
  * Returns -1 with errno = EINVAL if start > end or end > gs.slice.len.
  */
+BSTACK_WARN_UNUSED_RESULT
 int bstack_guarded_slice_subslice(bstack_guarded_slice_t gs,
                                    uint64_t start, uint64_t end,
                                    bstack_guarded_slice_t *out);
@@ -279,6 +293,7 @@ int bstack_guarded_slice_subslice(bstack_guarded_slice_t gs,
  * Write min(data_len, gs.slice.len) bytes into the slice via the guard.
  * Requires -DBSTACK_FEATURE_SET.
  */
+BSTACK_WARN_UNUSED_RESULT
 int bstack_guarded_slice_write(bstack_guarded_slice_t gs,
                                 const uint8_t *data, size_t data_len);
 
@@ -287,6 +302,7 @@ int bstack_guarded_slice_write(bstack_guarded_slice_t gs,
  * Returns -1 with errno = EINVAL if start + data_len exceeds gs.slice.len.
  * Requires -DBSTACK_FEATURE_SET.
  */
+BSTACK_WARN_UNUSED_RESULT
 int bstack_guarded_slice_write_range(bstack_guarded_slice_t gs,
                                       uint64_t start,
                                       const uint8_t *data, size_t data_len);
@@ -295,6 +311,7 @@ int bstack_guarded_slice_write_range(bstack_guarded_slice_t gs,
  * Zero the entire slice via the guard.
  * Requires -DBSTACK_FEATURE_SET.
  */
+BSTACK_WARN_UNUSED_RESULT
 int bstack_guarded_slice_zero(bstack_guarded_slice_t gs);
 
 /*
@@ -302,6 +319,7 @@ int bstack_guarded_slice_zero(bstack_guarded_slice_t gs);
  * Returns -1 with errno = EINVAL if start + n exceeds gs.slice.len.
  * Requires -DBSTACK_FEATURE_SET.
  */
+BSTACK_WARN_UNUSED_RESULT
 int bstack_guarded_slice_zero_range(bstack_guarded_slice_t gs,
                                      uint64_t start, uint64_t n);
 #endif /* BSTACK_FEATURE_SET */
@@ -336,6 +354,7 @@ bstack_slice_reader_t bstack_slice_reader_at(bstack_slice_t s, uint64_t offset);
  * Returns 0 on success (including end-of-slice where *n_read = 0).
  * Returns -1 on I/O failure (errno set).
  */
+BSTACK_WARN_UNUSED_RESULT
 int bstack_slice_reader_read(bstack_slice_reader_t *r,
                               uint8_t *buf, size_t buf_len, size_t *n_read);
 
@@ -352,6 +371,7 @@ int bstack_slice_reader_seek_start(bstack_slice_reader_t *r, uint64_t offset,
  * Returns -1 with errno = EINVAL if the resulting position would be negative.
  * If out_pos is non-NULL it receives the new cursor position.
  */
+BSTACK_WARN_UNUSED_RESULT
 int bstack_slice_reader_seek_cur(bstack_slice_reader_t *r, int64_t delta,
                                   uint64_t *out_pos);
 
@@ -360,6 +380,7 @@ int bstack_slice_reader_seek_cur(bstack_slice_reader_t *r, int64_t delta,
  * Returns -1 with errno = EINVAL if the resulting position would be negative.
  * If out_pos is non-NULL it receives the new cursor position.
  */
+BSTACK_WARN_UNUSED_RESULT
 int bstack_slice_reader_seek_end(bstack_slice_reader_t *r, int64_t delta,
                                   uint64_t *out_pos);
 
@@ -463,12 +484,14 @@ bstack_allocator_stack(bstack_allocator_t *a)
     return a->vtbl->stack(a);
 }
 
+BSTACK_WARN_UNUSED_RESULT
 static inline int
 bstack_allocator_alloc(bstack_allocator_t *a, uint64_t len, bstack_slice_t *out)
 {
     return a->vtbl->alloc(a, len, out);
 }
 
+BSTACK_WARN_UNUSED_RESULT
 static inline int
 bstack_allocator_realloc(bstack_allocator_t *a, bstack_slice_t s,
                           uint64_t new_len, bstack_slice_t *out)
@@ -480,6 +503,7 @@ bstack_allocator_realloc(bstack_allocator_t *a, bstack_slice_t s,
  * Dispatch dealloc through the vtable.  If the vtable entry is NULL the call
  * is a no-op and returns 0 (equivalent to a default no-op dealloc).
  */
+BSTACK_WARN_UNUSED_RESULT
 static inline int
 bstack_allocator_dealloc(bstack_allocator_t *a, bstack_slice_t s)
 {
@@ -492,6 +516,7 @@ bstack_allocator_dealloc(bstack_allocator_t *a, bstack_slice_t s)
  * Return the current logical payload size via the allocator's stack.
  * Delegates to bstack_len; returns 0 on success, -1 on failure (errno set).
  */
+BSTACK_WARN_UNUSED_RESULT
 static inline int
 bstack_allocator_len(bstack_allocator_t *a, uint64_t *out_len)
 {
@@ -502,6 +527,7 @@ bstack_allocator_len(bstack_allocator_t *a, uint64_t *out_len)
  * Set *out_empty to 1 if the backing stack is empty, 0 otherwise.
  * Delegates to bstack_len; returns 0 on success, -1 on failure (errno set).
  */
+BSTACK_WARN_UNUSED_RESULT
 static inline int
 bstack_allocator_is_empty(bstack_allocator_t *a, int *out_empty)
 {
@@ -523,6 +549,7 @@ bstack_allocator_bulk_vtbl(bstack_allocator_t *a)
  * Allocate n slices in bulk.  Returns -1 with errno = ENOTSUP when the
  * allocator has no bulk vtable.
  */
+BSTACK_WARN_UNUSED_RESULT
 static inline int
 bstack_allocator_alloc_bulk(bstack_allocator_t *a, const uint64_t *lens,
                              size_t n, bstack_slice_t *out_slices)
@@ -535,6 +562,7 @@ bstack_allocator_alloc_bulk(bstack_allocator_t *a, const uint64_t *lens,
  * Free n slices in bulk.  Returns -1 with errno = ENOTSUP when the allocator
  * has no bulk vtable.
  */
+BSTACK_WARN_UNUSED_RESULT
 static inline int
 bstack_allocator_dealloc_bulk(bstack_allocator_t *a,
                                const bstack_slice_t *slices, size_t n)
@@ -568,6 +596,7 @@ typedef struct {
  * Returns NULL on allocation failure (errno = ENOMEM).
  * Cast the result to bstack_allocator_t * to use the generic allocator interface.
  */
+BSTACK_WARN_UNUSED_RESULT
 linear_bstack_allocator_t *linear_bstack_allocator_new(bstack_t *bs);
 
 /*
@@ -641,6 +670,7 @@ typedef struct {
  * allocation failure, or the errno from any failing bstack operation).
  * Cast the result to bstack_allocator_t * to use the generic interface.
  */
+BSTACK_WARN_UNUSED_RESULT
 first_fit_bstack_allocator_t *first_fit_bstack_allocator_new(bstack_t *bs);
 
 /*
@@ -701,6 +731,7 @@ typedef struct {
  *
  * Returns NULL on failure (errno set).
  */
+BSTACK_WARN_UNUSED_RESULT
 ghost_tree_bstack_allocator_t *ghost_tree_bstack_allocator_new(bstack_t *bs);
 
 /*
@@ -779,6 +810,7 @@ typedef struct {
  * ENOMEM on allocation failure, or the errno from any failing bstack operation).
  * Cast the result to bstack_allocator_t * to use the generic interface.
  */
+BSTACK_WARN_UNUSED_RESULT
 slab_bstack_allocator_t *slab_bstack_allocator_new(bstack_t *bs,
                                                     uint64_t block_size);
 
@@ -793,6 +825,7 @@ slab_bstack_allocator_t *slab_bstack_allocator_new(bstack_t *bs,
  * allocation failure; or the errno from any failing bstack operation).
  * Cast the result to bstack_allocator_t * to use the generic interface.
  */
+BSTACK_WARN_UNUSED_RESULT
 slab_bstack_allocator_t *slab_bstack_allocator_open(bstack_t *bs);
 
 /*
@@ -889,6 +922,7 @@ typedef struct {
  * Returns NULL on failure (errno = EINVAL if bs non-empty or data_size < 8,
  * ENOMEM on allocation failure, or the errno from any failing bstack op).
  */
+BSTACK_WARN_UNUSED_RESULT
 checked_slab_bstack_allocator_t *checked_slab_bstack_allocator_new(
     bstack_t *bs, uint64_t data_size);
 
@@ -904,6 +938,7 @@ checked_slab_bstack_allocator_t *checked_slab_bstack_allocator_new(
  * bad magic, invalid stored values, or misaligned tail; ENOMEM on allocation
  * failure; or the errno from any failing bstack op).
  */
+BSTACK_WARN_UNUSED_RESULT
 checked_slab_bstack_allocator_t *checked_slab_bstack_allocator_open(
     bstack_t *bs);
 
@@ -918,6 +953,7 @@ checked_slab_bstack_allocator_t *checked_slab_bstack_allocator_open(
  * Returns 0 on success, -1 on I/O error (errno set).
  * checked_slab_bstack_allocator_open calls this automatically.
  */
+BSTACK_WARN_UNUSED_RESULT
 int checked_slab_bstack_allocator_recover(checked_slab_bstack_allocator_t *alloc,
                                            uint64_t *out_unsure);
 
@@ -1023,6 +1059,7 @@ typedef struct {
  * ENOMEM on allocation failure, or the errno from any failing bstack op).
  * Cast the result to bstack_allocator_t * to use the generic interface.
  */
+BSTACK_WARN_UNUSED_RESULT
 segregated_bstack_allocator_t *segregated_bstack_allocator_new(bstack_t *bs);
 
 /*
@@ -1042,6 +1079,7 @@ segregated_bstack_allocator_t *segregated_bstack_allocator_new(bstack_t *bs);
  *
  * Returns 0 on success, -1 on I/O error (errno set).
  */
+BSTACK_WARN_UNUSED_RESULT
 int segregated_bstack_allocator_recover(segregated_bstack_allocator_t *alloc,
                                          uint64_t *out_unsure);
 
