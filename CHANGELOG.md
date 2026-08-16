@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`#[must_use]` (Rust) / `BSTACK_WARN_UNUSED_RESULT` (C) added across the public API.** Functions whose return value reports success/failure or hands back a result that shouldn't be silently discarded now warn at compile time if the caller ignores them; `Result`-returning Rust functions are untouched, since `Result` is already `#[must_use]` at the type level. No behaviour change.
+- **`#[track_caller]` added to `BStackSlice`/`BStackOwnedSlice`/`BStackChunk`/`BStackByteVec` methods with a documented panic precondition** A panic from one of these (or a wrapper that forwards to one) now reports the caller's source location instead of the internal `assert!`/`panic!` line. No behaviour change beyond the reported panic location.
+
 ## [0.4.2] - 2026-08-13
 
 ### Added
