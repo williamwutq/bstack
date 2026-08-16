@@ -1,0 +1,5 @@
+error: `Foreign<T>`: a `Foreign` target must be a `#[bstack_block]`, not a `Vec` / `String`. `Vec<Foreign<T>>` (a vector OF pointers) is allowed, but `Foreign<Vec<T>>` (a pointer TO a vector) is not — bridge it inside an explicit `#[bstack_block]` struct and point the `Foreign` at that struct.
+  --> tests/hypercube/ui/foreign_to_vec.rs:10:11
+   |
+10 |     link: bstack_raii::Foreign<Vec<Leaf>>,
+   |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

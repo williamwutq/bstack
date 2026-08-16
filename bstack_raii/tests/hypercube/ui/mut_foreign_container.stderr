@@ -1,0 +1,7 @@
+error: #[bstack_mut] is not yet supported on `Foreign` inside a container or tuple (`Vec<Foreign>`, `[Foreign; N]`, a foreign tuple) — only a scalar `Foreign<T>` / `Option<Foreign<T>>` field is mutable
+  --> tests/hypercube/ui/mut_foreign_container.rs:9:5
+   |
+ 9 | /     #[bstack_mut]
+10 | |     #[bstack_owned]
+11 | |     links: Vec<bstack_raii::Foreign<Leaf>>,
+   | |__________________________________________^

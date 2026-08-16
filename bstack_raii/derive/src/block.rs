@@ -742,7 +742,8 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
             // purely local (no registry / host access), the cross-file free/decrement
             // travelling with the returned handle.
             if is_bstack_mut(&field.attrs) {
-                for m in foreign_mut_methods(vis, fname, &quote!(#ftarget), &on_disk_ty, kind, nullable)
+                for m in
+                    foreign_mut_methods(vis, fname, &quote!(#ftarget), &on_disk_ty, kind, nullable)
                 {
                     accessors.push(m);
                 }
@@ -2556,6 +2557,14 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                 return Err(Error::new_spanned(
                     &field.ty,
                     "#[embed] does not support `Option`",
+                ));
+            }
+            // `#[embed]` fields `continue` before the scalar mutator injection, so a
+            // `#[bstack_mut]` here would be silently ignored — reject it explicitly.
+            if is_bstack_mut(&field.attrs) {
+                return Err(Error::new_spanned(
+                    field,
+                    "#[bstack_mut] is not yet supported on #[embed] fields",
                 ));
             }
             let child = inner_ty;
@@ -4928,7 +4937,11 @@ fn array_mut_methods(
         quote!()
     };
     let consume_write = |k: &Ident, leaf: &Ident| {
-        let store_ctrl = if is_strong { quote!(__ncs[#k] = __c;) } else { quote!() };
+        let store_ctrl = if is_strong {
+            quote!(__ncs[#k] = __c;)
+        } else {
+            quote!()
+        };
         if elem_nullable {
             let cs = consume(quote!(__v));
             quote! {
@@ -5492,6 +5505,8 @@ fn constructor(
                 }
             };
             quote! {
+                // A block with many fields yields a many-arg `new`; that is expected.
+                #[allow(clippy::too_many_arguments)]
                 #vis fn new<'__ctor, __A: ::bstack_raii::BStackRaiiAllocator>(
                     allocator: &'__ctor __A,
                     #(#params)*
@@ -5525,6 +5540,8 @@ fn constructor(
                 ::core::mem::size_of::<<Self as ::bstack_raii::BStackWeakable>::Control>() as u64
             };
             quote! {
+                // A block with many fields yields a many-arg `new`; that is expected.
+                #[allow(clippy::too_many_arguments)]
                 #vis fn new<'__ctor, __A: ::bstack_raii::BStackRaiiAllocator>(
                     allocator: &'__ctor __A,
                     #(#params)*

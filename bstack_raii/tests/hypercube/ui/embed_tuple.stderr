@@ -1,0 +1,5 @@
+error: cannot #[embed] a tuple — embed a `#[bstack_block]` / `#[bstack_enum]` type
+ --> tests/hypercube/ui/embed_tuple.rs:6:8
+  |
+6 |     f: (u8, u8),
+  |        ^^^^^^^^

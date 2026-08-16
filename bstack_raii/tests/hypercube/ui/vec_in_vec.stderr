@@ -1,0 +1,5 @@
+error: nested `Vec<Vec<T>>` / `Vec<String>` is not supported: a `Vec` field stores one inline descriptor whose elements are a single leaf (POD or a block reference), not another dynamically-sized region. Wrap the inner vector in an explicit `#[bstack_block]` struct and store `Vec<ThatStruct>` (annotating the element per its ownership).
+  --> tests/hypercube/ui/vec_in_vec.rs:10:13
+   |
+10 |     xs: Vec<Vec<Leaf>>,
+   |             ^^^^^^^^^

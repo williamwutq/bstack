@@ -31,3 +31,8 @@ bstack_raii_derive = { path = "derive", version = "0.0.0" }
 # to store inline in an on-disk block and receives the blanket no-op BStackDrop.
 bytemuck = { version = "=1.25", features = ["derive"] }
 parking_lot = "0.12.5"
+
+[dev-dependencies]
+# Compile-fail (`tests/hypercube/ui/*.rs`): asserts each illegal macro input fails
+# with the *right* error, keeping the negative cases out of lib.rs doctests.
+trybuild = "1"

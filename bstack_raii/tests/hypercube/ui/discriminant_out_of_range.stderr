@@ -1,0 +1,5 @@
+error: a discriminant value is out of range for `repr(u8)` (values span 300..=300)
+ --> tests/hypercube/ui/discriminant_out_of_range.rs:5:5
+  |
+5 |     A = 300,
+  |     ^^^^^^^^

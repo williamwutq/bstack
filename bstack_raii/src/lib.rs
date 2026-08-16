@@ -240,144 +240,14 @@ pub mod __private {
     };
 }
 
-/// `compile_fail` checks for illegal macro inputs. Each block must **fail** to
-/// compile; the accompanying comment says why.
+/// `compile_fail` residual for the **trait-bound** illegal inputs — where the error
+/// is a rustc trait-resolution failure, not one of our `#[proc_macro]` span errors.
+/// Doctests only assert *that* compilation fails (no message match), so they stay
+/// robust across compiler versions; the (message-checked) *macro-error* cells live in
+/// `tests/hypercube/ui/` under `trybuild`.
 ///
-/// An ownership annotation is only allowed on a **single-field tuple** variant; a
-/// unit, struct, or multi-field tuple variant is a POD aggregate that rejects
-/// annotations.
-///
-/// `#[bstack_ref]` on a **unit** variant:
-/// ```compile_fail
-/// use bstack_raii::bstack_enum;
-/// #[bstack_enum]
-/// enum E { #[bstack_ref] Unit }
-/// # fn main() {}
-/// ```
-///
-/// `#[bstack_ref]` on a **struct** variant:
-/// ```compile_fail
-/// use bstack_raii::bstack_enum;
-/// #[bstack_enum]
-/// enum E { #[bstack_ref] S { a: u32, b: u32 } }
-/// # fn main() {}
-/// ```
-///
-/// `#[bstack_strong]` on a **multi-field tuple** variant:
-/// ```compile_fail
-/// use bstack_raii::bstack_enum;
-/// #[bstack_enum]
-/// enum E { #[bstack_strong] T(u32, i8) }
-/// # fn main() {}
-/// ```
-///
-/// **Two** ownership annotations on one variant:
-/// ```compile_fail
-/// use bstack_raii::bstack_enum;
-/// #[bstack_enum]
-/// enum E { #[bstack_owned] #[bstack_ref] V(u32) }
-/// # fn main() {}
-/// ```
-///
-/// **Duplicate discriminant** values (rustc's `E0081` can't fire — the macro
-/// replaces the enum — so the macro rejects it itself):
-/// ```compile_fail
-/// use bstack_raii::bstack_enum;
-/// #[bstack_enum]
-/// enum E { A = 1, B = 1 }
-/// # fn main() {}
-/// ```
-///
-/// A discriminant **out of range** for the chosen `repr`:
-/// ```compile_fail
-/// use bstack_raii::bstack_enum;
-/// #[bstack_enum(repr(u8))]
-/// enum E { A = 300 }
-/// # fn main() {}
-/// ```
-///
-/// `repr(usize)` / `repr(isize)` (bstack offsets are 64-bit):
-/// ```compile_fail
-/// use bstack_raii::bstack_enum;
-/// #[bstack_enum(repr(usize))]
-/// enum E { A }
-/// # fn main() {}
-/// ```
-///
-/// An unsupported `repr` width:
-/// ```compile_fail
-/// use bstack_raii::bstack_enum;
-/// #[bstack_enum(repr(u128))]
-/// enum E { A }
-/// # fn main() {}
-/// ```
-///
-/// A **generic** enum:
-/// ```compile_fail
-/// use bstack_raii::bstack_enum;
-/// #[bstack_enum]
-/// enum E<T> { A(T) }
-/// # fn main() {}
-/// ```
-///
-/// `weak` without `rc`:
-/// ```compile_fail
-/// use bstack_raii::bstack_enum;
-/// #[bstack_enum(weak)]
-/// enum E { A }
-/// # fn main() {}
-/// ```
-///
-/// An ownership annotation targeting a **non-block** type:
-/// ```compile_fail
-/// use bstack_raii::bstack_enum;
-/// #[bstack_enum]
-/// enum E { #[bstack_owned] V(u32) }
-/// # fn main() {}
-/// ```
-///
-/// `#[bstack_mut]` on a **variant** — an enum mutator is whole-value, so the
-/// annotation goes on the enum itself (below), not a variant:
-/// ```compile_fail
-/// use bstack_raii::bstack_enum;
-/// #[bstack_enum]
-/// enum E { #[bstack_mut] A(u32) }
-/// # fn main() {}
-/// ```
-///
-/// Whole-value `#[bstack_mut]` on a **shared** (`rc`) enum — its refcount can't be
-/// overwritten in place:
-/// ```compile_fail
-/// use bstack_raii::bstack_enum;
-/// #[bstack_enum(rc)]
-/// #[bstack_mut]
-/// enum E { A, B(u32) }
-/// # fn main() {}
-/// ```
-///
-/// `repr(..)` on a **struct** (it selects an enum discriminant width):
-/// ```compile_fail
-/// use bstack_raii::bstack_block;
-/// #[bstack_block(repr(u64))]
-/// struct X { a: u32 }
-/// # fn main() {}
-/// ```
-///
-/// ---
-///
-/// The same shapes on `#[bstack_block]` **structs**.
-///
-/// **Two** ownership annotations on one field:
-/// ```compile_fail
-/// use bstack_raii::bstack_block;
-/// #[bstack_block]
-/// struct X { #[bstack_owned] #[bstack_ref] f: u32 }
-/// # fn main() {}
-/// ```
-///
-/// An ownership annotation targeting a **non-block** type — including a generic
-/// wrapper like `Wrapper<Foo<Bar>>` (an on-disk ref is not generic), even when
-/// the type would be fine stored inline as POD *without* the annotation:
+/// An ownership annotation targeting a **non-block** type (an on-disk ref is not
+/// generic), even when the type would be fine stored inline as POD *without* it:
 /// ```compile_fail
 /// use bstack_raii::bstack_block;
 /// #[bstack_block]
@@ -385,7 +255,7 @@ pub mod __private {
 /// # fn main() {}
 /// ```
 ///
-/// A `#[bstack_weak]` field whose target isn't weak-observable:
+/// A `#[bstack_weak]` field whose target isn't weak-observable (`rc, weak`):
 /// ```compile_fail
 /// use bstack_raii::bstack_block;
 /// #[bstack_block]
@@ -402,70 +272,8 @@ pub mod __private {
 /// # fn main() {}
 /// ```
 ///
-/// `weak` without `rc`:
-/// ```compile_fail
-/// use bstack_raii::bstack_block;
-/// #[bstack_block(weak)]
-/// struct X { f: u32 }
-/// # fn main() {}
-/// ```
-///
-/// ---
-///
-/// Misuse of `#[embed]` (which inlines a whole child *block*).
-///
-/// `#[embed]` on a **non-block** type:
-/// ```compile_fail
-/// use bstack_raii::bstack_block;
-/// #[bstack_block]
-/// struct X { #[embed] f: u32 }
-/// # fn main() {}
-/// ```
-///
-/// `#[embed]` on a **tuple**:
-/// ```compile_fail
-/// use bstack_raii::bstack_block;
-/// #[bstack_block]
-/// struct X { #[embed] f: (u8, u8) }
-/// # fn main() {}
-/// ```
-///
-/// `#[embed]` wrapped in `Option`:
-/// ```compile_fail
-/// use bstack_raii::bstack_block;
-/// #[bstack_block]
-/// struct X { #[embed] f: Option<u32> }
-/// # fn main() {}
-/// ```
-///
-/// `#[embed]` combined with another ownership annotation:
-/// ```compile_fail
-/// use bstack_raii::bstack_block;
-/// #[bstack_block]
-/// struct X { #[embed] #[bstack_owned] f: u32 }
-/// # fn main() {}
-/// ```
-///
-/// `#[embed]` of a reference-counted (`rc`) block — its refcount / separate control
-/// block would be stranded by inlining, so the derive rejects it (`BStackEmbeddable`
-/// is not implemented for `rc` / `(rc, weak)` blocks):
-/// ```compile_fail
-/// use bstack_raii::bstack_block;
-/// #[bstack_block(rc)]
-/// struct RcChild { v: u32 }
-/// #[bstack_block]
-/// struct Holder { #[embed] r: RcChild }
-/// # fn main() {}
-/// ```
-///
-/// (Tuple structs of POD fields and unit structs are **valid**, not errors — see
-/// the tests.)
-///
-/// ---
-///
-/// A **shared** (`rc` / `rc, weak`) block has no `TryCloneIn`: it is cloned by
-/// duplicating its handle (a refcount bump) via `BStackRc::try_clone`, not
-/// deep-copied to an owned block, so `try_clone_in` on one is a compile error:
+/// A **shared** (`rc` / `rc, weak`) block has no `TryCloneIn` — duplicate its handle
+/// with `BStackRc::try_clone` instead:
 /// ```compile_fail
 /// use bstack_raii::{bstack_block, BStackOwnedSliceAllocator, TryCloneIn};
 /// #[bstack_block(rc)]
@@ -476,127 +284,11 @@ pub mod __private {
 /// # fn main() {}
 /// ```
 ///
-/// ---
-///
-/// A **bare** `Foreign<T>` field (no ownership annotation): a foreign pointer must
-/// name its target's kind, like an in-file reference:
-/// ```compile_fail
-/// use bstack_raii::bstack_block;
-/// #[bstack_block] struct Leaf { v: u32 }
-/// #[bstack_block]
-/// struct Holder { link: Foreign<Leaf> }
-/// # fn main() {}
-/// ```
-///
-/// `Foreign<T>` where `T` is **not a bstack block** (`Foreign<Pod>`):
+/// `Foreign<T>` where `T` is **not a bstack block** (`Foreign<u32>` / `Foreign<String>`):
 /// ```compile_fail
 /// use bstack_raii::bstack_block;
 /// #[bstack_block]
 /// struct Holder { #[bstack_owned] link: bstack_raii::Foreign<u32> }
-/// # fn main() {}
-/// ```
-///
-/// `Foreign<Option<T>>` — a nullable foreign pointer is `Option<Foreign<T>>`:
-/// ```compile_fail
-/// use bstack_raii::bstack_block;
-/// #[bstack_block] struct Leaf { v: u32 }
-/// #[bstack_block]
-/// struct Holder { #[bstack_owned] link: Foreign<Option<Leaf>> }
-/// # fn main() {}
-/// ```
-///
-/// **No double `Foreign`** (`Foreign<Foreign<T>>`) — a pointer to a pointer; bridge
-/// with a `#[bstack_block]` struct:
-/// ```compile_fail
-/// use bstack_raii::bstack_block;
-/// #[bstack_block] struct Leaf { v: u32 }
-/// #[bstack_block]
-/// struct Holder { #[bstack_owned] link: Foreign<Foreign<Leaf>> }
-/// # fn main() {}
-/// ```
-///
-/// **No double `Foreign` through `Option`** (`Foreign<Option<Foreign<T>>>`):
-/// ```compile_fail
-/// use bstack_raii::bstack_block;
-/// #[bstack_block] struct Leaf { v: u32 }
-/// #[bstack_block]
-/// struct Holder { #[bstack_owned] link: Foreign<Option<Foreign<Leaf>>> }
-/// # fn main() {}
-/// ```
-///
-/// **No pointer to a `Vec`** (`Foreign<Vec<T>>`) — `Vec<Foreign<T>>` is the allowed
-/// form (a vector OF pointers); a pointer TO a vector must be bridged:
-/// ```compile_fail
-/// use bstack_raii::bstack_block;
-/// #[bstack_block] struct Leaf { v: u32 }
-/// #[bstack_block]
-/// struct Holder { #[bstack_owned] link: Foreign<Vec<Leaf>> }
-/// # fn main() {}
-/// ```
-///
-/// **No pointer to an array** (`Foreign<[T; N]>`) — `[Foreign<T>; N]` is allowed:
-/// ```compile_fail
-/// use bstack_raii::bstack_block;
-/// #[bstack_block] struct Leaf { v: u32 }
-/// #[bstack_block]
-/// struct Holder { #[bstack_owned] link: Foreign<[Leaf; 4]> }
-/// # fn main() {}
-/// ```
-///
-/// **No pointer to a tuple** (`Foreign<(A, B)>`):
-/// ```compile_fail
-/// use bstack_raii::bstack_block;
-/// #[bstack_block] struct Leaf { v: u32 }
-/// #[bstack_block]
-/// struct Holder { #[bstack_owned] link: Foreign<(Leaf, Leaf)> }
-/// # fn main() {}
-/// ```
-///
-/// **No pointer to a `String`** (`Foreign<String>`):
-/// ```compile_fail
-/// use bstack_raii::bstack_block;
-/// #[bstack_block]
-/// struct Holder { #[bstack_owned] link: bstack_raii::Foreign<String> }
-/// # fn main() {}
-/// ```
-///
-/// The bad target also applies **inside a container** — e.g. a `Vec` of double
-/// foreigns (`Vec<Foreign<Foreign<T>>>`) is rejected the same way:
-/// ```compile_fail
-/// use bstack_raii::bstack_block;
-/// #[bstack_block] struct Leaf { v: u32 }
-/// #[bstack_block]
-/// struct Holder { #[bstack_owned] links: Vec<Foreign<Foreign<Leaf>>> }
-/// # fn main() {}
-/// ```
-///
-/// **`Foreign` inside a tuple inside a `Vec`** (`Vec<(_, Foreign<T>)>`) — a foreign
-/// *tuple* field is allowed, but not as a `Vec` element:
-/// ```compile_fail
-/// use bstack_raii::bstack_block;
-/// #[bstack_block] struct Leaf { v: u32 }
-/// #[bstack_block]
-/// struct Holder { #[bstack_owned] v: Vec<(u32, Foreign<Leaf>)> }
-/// # fn main() {}
-/// ```
-///
-/// ---
-///
-/// `#[bstack_mut]` is honored on scalar POD / block-reference fields (`set_` /
-/// `replace_`), POD tuples (`set_`), block-reference arrays (element
-/// `replace_<f>_at` + whole-array `replace_<f>`, plus `set_` for `ref`), and a scalar
-/// `Foreign<T>` / `Option<Foreign<T>>` (`replace_`, plus `set_` for a foreign `ref`).
-/// A `Vec` is always mutable in place through its `get_<f>()` handle, so the
-/// annotation is a redundant no-op there (accepted, not an error). A `Foreign` inside
-/// a *container / tuple* has no mutator yet and is rejected rather than silently
-/// ignored.
-///
-/// `#[bstack_mut]` on a `Vec<Foreign>` field (foreign in a container):
-/// ```compile_fail
-/// use bstack_raii::bstack_block;
-/// #[bstack_block] struct Leaf { v: u32 }
-/// #[bstack_block]
-/// struct Holder { #[bstack_mut] #[bstack_owned] links: Vec<bstack_raii::Foreign<Leaf>> }
 /// # fn main() {}
 /// ```
 #[doc(hidden)]

@@ -1,0 +1,5 @@
+error: at most one bstack ownership annotation is allowed here
+ --> tests/hypercube/ui/double_annotation.rs:6:5
+  |
+6 |     #[bstack_ref]
+  |     ^^^^^^^^^^^^^

@@ -1,0 +1,5 @@
+error: discriminant value `1` assigned more than once
+ --> tests/hypercube/ui/duplicate_discriminant.rs:6:5
+  |
+6 |     B = 1,
+  |     ^^^^^

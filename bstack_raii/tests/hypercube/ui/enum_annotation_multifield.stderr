@@ -1,0 +1,6 @@
+error: an ownership annotation is only allowed on a single-field tuple variant, e.g. `#[bstack_owned] V(T)`
+ --> tests/hypercube/ui/enum_annotation_multifield.rs:5:5
+  |
+5 | /     #[bstack_strong]
+6 | |     T(u32, i8),
+  | |______________^

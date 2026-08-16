@@ -1,0 +1,5 @@
+error: `Foreign<T>`: a `Foreign` cannot point at another `Foreign` — a pointer to a pointer is not allowed. bridge it inside an explicit `#[bstack_block]` struct and point the `Foreign` at that struct. (A collection OF pointers such as `Vec<Foreign<T>>` / `[Foreign<T>; N]` IS allowed; it is a pointer TO a pointer/collection that is not.)
+  --> tests/hypercube/ui/foreign_double.rs:10:11
+   |
+10 |     link: bstack_raii::Foreign<bstack_raii::Foreign<Leaf>>,
+   |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
