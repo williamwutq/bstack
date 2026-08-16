@@ -728,6 +728,8 @@ already mutable and needs no annotation:
 | `#[bstack_owned/strong] [T; N]`      | `replace_<field>_at(&alloc, i, new) -> old` and `replace_<field>(&alloc, arr) -> old_arr` |
 | `#[bstack_ref] [T; N]`               | *(also)* `set_<field>_at` / `set_<field>` (a ref owns nothing)              |
 | `Vec<T>` (any kind)                  | *none needed* — mutate in place via the `get_<field>()` handle (`push_*`, …) |
+| `#[bstack_owned/strong/weak] Foreign<T>` | `replace_<field>(&alloc, new) -> old` — moves the old cross-file target out as `ForeignOwned`/`ForeignRc`/`ForeignWeak` |
+| `#[bstack_ref] Foreign<T>`           | *(also)* `set_<field>` / `replace_<field>` trafficking in plain `Foreign`   |
 
 Arrays are fixed-size, so there is no push/pop — only in-place change. The element
 mutators use a **row-major flat** `index` (for a nested `[[T; M]; N]`, slot `i*M + j`
@@ -736,8 +738,17 @@ slot for `_at`, the whole inline `[u64; N]` region for the whole-array form — 
 uphold the same `ReplaceError` hand-back contract as the scalar `replace_`. A `Vec`
 persists its descriptor back to the field on every mutation, so mutating the handle
 its accessor returns *is* mutating the field; `#[bstack_mut]` on a `Vec` is an
-accepted no-op. `Foreign` shapes have no mutator yet (`#[bstack_mut]` on one is a
-compile error).
+accepted no-op.
+
+A **scalar `Foreign<T>` / `Option<Foreign<T>>`** field is mutable, and its swap is
+notably *purely local* — one crash-atomic 16-byte `ForeignRepr` write — because the
+cross-file responsibility travels with the returned handle: `replace_` hands the old
+target back as its RAII dual, which you later `bstack_drop(&home)` (freeing it in its
+own file) or re-store. So `replace_` needs no registry / host access and works even
+if the target file is detached. Owning kinds get **only** `replace_` (a bare `set_`
+would strand the old cross-file target); a foreign `ref` also gets `set_`. `Foreign`
+inside a container or tuple (`Vec<Foreign>`, `[Foreign; N]`, a foreign tuple) has no
+mutator yet (`#[bstack_mut]` there is a compile error).
 
 ### Enums
 

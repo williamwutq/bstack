@@ -7909,6 +7909,288 @@ fn macro_bstack_mut_enum_strong_replace_moves_count_out() {
 }
 
 // --------------------------------------------------------------------------
+// #[bstack_mut] on a scalar `Foreign` field: `replace_` (owned/strong/weak, moving
+// the old cross-file target out as its RAII dual) + `set_` for a foreign `ref`.
+// These use SELF targets, so the swap needs no registry — the point being that the
+// swap itself is purely local (the cross-file responsibility rides the returned
+// handle). Cross-file resolution is covered by the other `macro_foreign_*` tests.
+// --------------------------------------------------------------------------
+
+#[bstack_block]
+struct MutFornOwned {
+    #[bstack_mut]
+    #[bstack_owned]
+    link: Foreign<MacroLeaf>,
+}
+
+#[test]
+fn macro_bstack_mut_foreign_owned_replace_moves_target_out() {
+    use crate::registry::FileId;
+    use crate::{Foreign, ForeignOwned};
+
+    let tmp = TempStack::new();
+    let local = tmp.allocator();
+    let stack = local.stack();
+
+    // SELF targets, ownership relinquished so only the foreign field owns them.
+    let self_leaf = |v: u32| {
+        let l = MacroLeaf::new(&local, v).unwrap();
+        let off = l.handle().range().start();
+        let _ = l.into_inner();
+        off
+    };
+    let a_off = self_leaf(10);
+    let b_off = self_leaf(20);
+
+    let h = MutFornOwned::new(&local, unsafe {
+        Foreign::<MacroLeaf>::new(FileId::SELF, a_off)
+    })
+    .unwrap();
+    assert_eq!(
+        h.handle()
+            .get_link(stack)
+            .unwrap()
+            .with(&local, |t, fs| t.get_val(fs).unwrap())
+            .unwrap(),
+        Some(10)
+    );
+
+    // Replace: install b, move the old target (a) out as a `ForeignOwned`.
+    let new = unsafe { ForeignOwned::from_foreign(Foreign::<MacroLeaf>::new(FileId::SELF, b_off)) };
+    let old = h.handle().replace_link(&local, new).unwrap();
+    assert!(old.is_self());
+    assert_eq!(
+        old.as_foreign()
+            .with(&local, |t, fs| t.get_val(fs).unwrap())
+            .unwrap(),
+        Some(10)
+    );
+    old.bstack_drop(&local).unwrap(); // frees a (SELF => local)
+
+    // The field now owns b.
+    assert_eq!(
+        h.handle()
+            .get_link(stack)
+            .unwrap()
+            .with(&local, |t, fs| t.get_val(fs).unwrap())
+            .unwrap(),
+        Some(20)
+    );
+    h.bstack_drop(&local).unwrap(); // frees b
+}
+
+#[bstack_block]
+struct MutFornRef {
+    #[bstack_mut]
+    #[bstack_ref]
+    r: Foreign<MacroLeaf>,
+}
+
+#[test]
+fn macro_bstack_mut_foreign_ref_set_and_replace() {
+    use crate::Foreign;
+    use crate::registry::FileId;
+
+    let tmp = TempStack::new();
+    let local = tmp.allocator();
+    let stack = local.stack();
+
+    let a = MacroLeaf::new(&local, 1).unwrap();
+    let b = MacroLeaf::new(&local, 2).unwrap();
+    let c = MacroLeaf::new(&local, 3).unwrap();
+    let fr = |l: &BStackOwned<MacroLeaf>| unsafe {
+        Foreign::<MacroLeaf>::new(FileId::SELF, l.handle().range().start())
+    };
+
+    let h = MutFornRef::new(&local, fr(&a)).unwrap();
+    assert_eq!(
+        h.handle()
+            .get_r(stack)
+            .unwrap()
+            .with(&local, |t, fs| t.get_val(fs).unwrap())
+            .unwrap(),
+        Some(1)
+    );
+
+    // set_: repoint to b (a foreign ref owns nothing → nothing freed).
+    h.handle().set_r(&local, fr(&b)).unwrap();
+    assert_eq!(
+        h.handle()
+            .get_r(stack)
+            .unwrap()
+            .with(&local, |t, fs| t.get_val(fs).unwrap())
+            .unwrap(),
+        Some(2)
+    );
+
+    // replace_: install c, hand the old pointer (→ b) back as a plain Foreign.
+    let old = h.handle().replace_r(&local, fr(&c)).unwrap();
+    assert_eq!(
+        old.with(&local, |t, fs| t.get_val(fs).unwrap()).unwrap(),
+        Some(2)
+    );
+    assert_eq!(
+        h.handle()
+            .get_r(stack)
+            .unwrap()
+            .with(&local, |t, fs| t.get_val(fs).unwrap())
+            .unwrap(),
+        Some(3)
+    );
+
+    // A foreign ref array owns nothing: every target is still live after teardown.
+    h.bstack_drop(&local).unwrap();
+    for (l, v) in [(&a, 1), (&b, 2), (&c, 3)] {
+        assert_eq!(l.handle().get_val(stack).unwrap(), v);
+    }
+    a.bstack_drop(&local).unwrap();
+    b.bstack_drop(&local).unwrap();
+    c.bstack_drop(&local).unwrap();
+}
+
+#[bstack_block]
+struct MutFornOpt {
+    #[bstack_mut]
+    #[bstack_owned]
+    link: Option<Foreign<MacroLeaf>>,
+}
+
+#[test]
+fn macro_bstack_mut_foreign_owned_option_replace() {
+    use crate::registry::FileId;
+    use crate::{Foreign, ForeignOwned};
+
+    let tmp = TempStack::new();
+    let local = tmp.allocator();
+    let stack = local.stack();
+
+    let self_leaf = |v: u32| {
+        let l = MacroLeaf::new(&local, v).unwrap();
+        let off = l.handle().range().start();
+        let _ = l.into_inner();
+        off
+    };
+    let some_owned = |off: u64| unsafe {
+        ForeignOwned::from_foreign(Foreign::<MacroLeaf>::new(FileId::SELF, off))
+    };
+
+    // Start `None`.
+    let h = MutFornOpt::new(&local, None).unwrap();
+    assert!(h.handle().get_link(stack).unwrap().is_none());
+
+    // None -> Some(a): the old value is `None`.
+    let was = h
+        .handle()
+        .replace_link(&local, Some(some_owned(self_leaf(10))))
+        .unwrap();
+    assert!(was.is_none());
+    assert_eq!(
+        h.handle()
+            .get_link(stack)
+            .unwrap()
+            .unwrap()
+            .with(&local, |t, fs| t.get_val(fs).unwrap())
+            .unwrap(),
+        Some(10)
+    );
+
+    // Some(a) -> Some(b): the old target (a) moves out; free it.
+    let old = h
+        .handle()
+        .replace_link(&local, Some(some_owned(self_leaf(20))))
+        .unwrap();
+    old.expect("old Some").bstack_drop(&local).unwrap();
+
+    // Some(b) -> None: the old target (b) moves out; free it.
+    let old2 = h.handle().replace_link(&local, None).unwrap();
+    old2.expect("old Some").bstack_drop(&local).unwrap();
+    assert!(h.handle().get_link(stack).unwrap().is_none());
+
+    h.bstack_drop(&local).unwrap(); // owns nothing now
+}
+
+#[bstack_block]
+struct MutFornStrong {
+    #[bstack_mut]
+    #[bstack_strong]
+    link: Foreign<MacroStrongChild>,
+}
+
+#[test]
+fn macro_bstack_mut_foreign_strong_replace_moves_count_out() {
+    use crate::registry::FileId;
+    use crate::{Foreign, ForeignRc};
+
+    let tmp = TempStack::new();
+    let local = tmp.allocator();
+
+    // A SELF strong target with its count relinquished into a `Foreign`.
+    let self_strong = |v: u32| {
+        let c = MacroStrongChild::new(&local, v).unwrap(); // strong = 1
+        let (d, _c) = c.into_raw();
+        d.into_range().start()
+    };
+    let a_off = self_strong(5);
+    let b_off = self_strong(50);
+
+    let h = MutFornStrong::new(&local, unsafe {
+        Foreign::<MacroStrongChild>::new(FileId::SELF, a_off)
+    })
+    .unwrap();
+
+    // Replace: the old strong ref (count 1) moves out as a `ForeignRc`.
+    let new =
+        unsafe { ForeignRc::from_foreign(Foreign::<MacroStrongChild>::new(FileId::SELF, b_off)) };
+    let old = h.handle().replace_link(&local, new).unwrap();
+    assert!(old.is_self());
+    old.bstack_drop(&local).unwrap(); // decrements a (1 -> 0), frees it
+
+    // Teardown decrements the current target (b).
+    h.bstack_drop(&local).unwrap();
+}
+
+#[bstack_block]
+struct MutFornWeak {
+    #[bstack_mut]
+    #[bstack_weak]
+    link: Foreign<MacroStrongChild>,
+}
+
+#[test]
+fn macro_bstack_mut_foreign_weak_replace_moves_weak_out() {
+    use crate::registry::FileId;
+    use crate::{Foreign, ForeignWeak};
+
+    let tmp = TempStack::new();
+    let local = tmp.allocator();
+
+    // A live `rc, weak` target; keep a strong ref so its block stays alive.
+    let c = MacroStrongChild::new(&local, 5).unwrap();
+    // A SELF weak foreign stores the control-block offset; each `downgrade` bumps the
+    // weak count and `into_raw` relinquishes that weak into the field.
+    let self_weak = || {
+        let w = c.downgrade().unwrap();
+        w.into_raw().into_range().start()
+    };
+
+    let h = MutFornWeak::new(&local, unsafe {
+        Foreign::<MacroStrongChild>::new(FileId::SELF, self_weak())
+    })
+    .unwrap();
+
+    // Replace: the old weak ref moves out as a `ForeignWeak`.
+    let new = unsafe {
+        ForeignWeak::from_foreign(Foreign::<MacroStrongChild>::new(FileId::SELF, self_weak()))
+    };
+    let old = h.handle().replace_link(&local, new).unwrap();
+    assert!(old.is_self());
+    old.bstack_drop(&local).unwrap(); // releases the old weak count
+
+    h.bstack_drop(&local).unwrap(); // releases the current weak count
+    c.bstack_drop(&local).unwrap(); // releases the strong ref (frees the block)
+}
+
+// --------------------------------------------------------------------------
 // Foreign<T>: cross-file wide pointer resolved through the registry
 // --------------------------------------------------------------------------
 

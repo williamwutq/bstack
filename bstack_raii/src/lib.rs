@@ -583,20 +583,13 @@ pub mod __private {
 /// ---
 ///
 /// `#[bstack_mut]` is honored on scalar POD / block-reference fields (`set_` /
-/// `replace_`), POD tuples (`set_`), and block-reference arrays (element
-/// `replace_<f>_at` + whole-array `replace_<f>`, plus `set_` for `ref`). A `Vec` is
-/// always mutable in place through its `get_<f>()` handle, so the annotation is a
-/// redundant no-op there (accepted, not an error). Cross-file `Foreign` shapes have
-/// no mutator yet and are rejected rather than silently ignored.
-///
-/// `#[bstack_mut]` on a scalar `Foreign` field:
-/// ```compile_fail
-/// use bstack_raii::bstack_block;
-/// #[bstack_block] struct Leaf { v: u32 }
-/// #[bstack_block]
-/// struct Holder { #[bstack_mut] #[bstack_owned] link: bstack_raii::Foreign<Leaf> }
-/// # fn main() {}
-/// ```
+/// `replace_`), POD tuples (`set_`), block-reference arrays (element
+/// `replace_<f>_at` + whole-array `replace_<f>`, plus `set_` for `ref`), and a scalar
+/// `Foreign<T>` / `Option<Foreign<T>>` (`replace_`, plus `set_` for a foreign `ref`).
+/// A `Vec` is always mutable in place through its `get_<f>()` handle, so the
+/// annotation is a redundant no-op there (accepted, not an error). A `Foreign` inside
+/// a *container / tuple* has no mutator yet and is rejected rather than silently
+/// ignored.
 ///
 /// `#[bstack_mut]` on a `Vec<Foreign>` field (foreign in a container):
 /// ```compile_fail

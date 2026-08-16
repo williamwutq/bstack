@@ -402,20 +402,23 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         }
 
         // `#[bstack_mut]` is honored on scalar POD / block references (`set_` /
-        // `replace_`), POD tuples (`set_`), and block-reference arrays (element
-        // `replace_<f>_at` + whole-array `replace_<f>`, plus `set_` for `ref`); a
-        // `Vec` is *always* mutable in place through its `get_<f>()` handle (which
-        // writes its descriptor back), so the annotation is a redundant no-op there.
-        // Cross-file `Foreign` shapes have no mutator yet — reject `#[bstack_mut]` on
-        // anything that mentions `Foreign` (scalar, `Vec<Foreign>`, `[Foreign; N]`,
-        // or a foreign tuple) rather than silently ignoring it.
+        // `replace_`), POD tuples (`set_`), block-reference arrays (element
+        // `replace_<f>_at` + whole-array `replace_<f>`, plus `set_` for `ref`), and a
+        // scalar `Foreign<T>` / `Option<Foreign<T>>` (`replace_`, plus `set_` for a
+        // foreign `ref`). A `Vec` is *always* mutable in place through its `get_<f>()`
+        // handle (which writes its descriptor back), so the annotation is a redundant
+        // no-op there. A `Foreign` in a *container / tuple* (`Vec<Foreign>`,
+        // `[Foreign; N]`, a foreign tuple) has no mutator yet — reject it rather than
+        // silently ignoring it.
         if is_bstack_mut(&field.attrs)
             && tokens_mention(quote!(#eff_ty), &[&format_ident!("Foreign")])
+            && foreign_inner(opt_inner).is_none()
         {
             return Err(Error::new_spanned(
                 field,
-                "#[bstack_mut] is not yet supported on `Foreign` fields (cross-file \
-                 pointers) — mutate by rebuilding the containing value",
+                "#[bstack_mut] is not yet supported on `Foreign` inside a container or \
+                 tuple (`Vec<Foreign>`, `[Foreign; N]`, a foreign tuple) — only a scalar \
+                 `Foreign<T>` / `Option<Foreign<T>>` field is mutable",
             ));
         }
 
@@ -731,6 +734,18 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
             };
             if let Some(cs) = foreign_clone_stmt {
                 clone_stmts.push(cs);
+            }
+
+            // `#[bstack_mut]`: `replace_<f>` (owned/strong/weak — moves the old
+            // cross-file target out as its RAII dual) and, for a foreign `ref`, also
+            // `set_<f>`. One crash-atomic 16-byte `ForeignRepr` write; the swap is
+            // purely local (no registry / host access), the cross-file free/decrement
+            // travelling with the returned handle.
+            if is_bstack_mut(&field.attrs) {
+                for m in foreign_mut_methods(vis, fname, &quote!(#ftarget), &on_disk_ty, kind, nullable)
+                {
+                    accessors.push(m);
+                }
             }
             continue;
         }
@@ -5053,6 +5068,173 @@ fn array_mut_methods(
                 let mut __news = [0u64; #total];
                 #set_consume
                 allocator.stack().set(#base, ::bstack_raii::bytemuck::bytes_of(&__news))
+            }
+        });
+    }
+
+    out
+}
+
+/// Generated `#[bstack_mut]` mutators for a scalar `Foreign<T>` /
+/// `Option<Foreign<T>>` field. Unlike teardown / clone, the swap is **purely local**
+/// — one crash-atomic 16-byte `ForeignRepr` write — because the cross-file
+/// responsibility (free / decrement in the target's own file) travels with the
+/// returned RAII dual, discharged later by the caller's `bstack_drop(&home)`:
+///
+/// * `#[bstack_owned/strong/weak]` — `replace_<field>(&alloc, new) -> old`, taking /
+///   returning `ForeignOwned` / `ForeignRc` / `ForeignWeak` (never a bare `set_`,
+///   which would strand the old cross-file target).
+/// * `#[bstack_ref]` — `set_<field>` (a foreign ref owns nothing) and
+///   `replace_<field>`, both trafficking in plain `Foreign`.
+///
+/// Every reconstruction is an infallible `from_repr` wrap, so a failed commit always
+/// hands the *new* value back through [`ReplaceError`] (there is no `lost` case).
+fn foreign_mut_methods(
+    vis: &syn::Visibility,
+    fname: &Ident,
+    ftarget: &TokenStream,
+    on_disk: &TokenStream,
+    kind: Kind,
+    nullable: bool,
+) -> Vec<TokenStream> {
+    let off = quote!(self.0.start() + ::core::mem::offset_of!(#on_disk, #fname) as u64);
+    // The RAII dual over the method's `'__m` (a `SELF` pointer stays bound to the
+    // allocator borrow, mirroring `bstack_move!`).
+    let dual = match kind {
+        Kind::Owned => quote!(::bstack_raii::ForeignOwned<'__m, #ftarget>),
+        Kind::Strong => quote!(::bstack_raii::ForeignRc<'__m, #ftarget>),
+        Kind::Weak => quote!(::bstack_raii::ForeignWeak<'__m, #ftarget>),
+        Kind::Ref => quote!(::bstack_raii::Foreign<'__m, #ftarget>),
+        _ => unreachable!(),
+    };
+    let val_ty = if nullable {
+        quote!(::core::option::Option<#dual>)
+    } else {
+        dual.clone()
+    };
+    // Consume a dual `v` (by value) into its stored `ForeignRepr`.
+    let consume = |v: TokenStream| match kind {
+        Kind::Owned | Kind::Strong | Kind::Weak => quote!((#v).into_foreign().repr()),
+        Kind::Ref => quote!((#v).repr()),
+        _ => unreachable!(),
+    };
+    // Rebuild the dual from a `ForeignRepr` (infallible). `unsafe`: the repr was
+    // stored into this file, and the returned handle is bound to `'__m`.
+    let rebuild = |r: TokenStream| match kind {
+        Kind::Owned => quote!(unsafe {
+            ::bstack_raii::ForeignOwned::from_foreign(
+                ::bstack_raii::Foreign::<#ftarget>::from_repr(#r))
+        }),
+        Kind::Strong => quote!(unsafe {
+            ::bstack_raii::ForeignRc::from_foreign(
+                ::bstack_raii::Foreign::<#ftarget>::from_repr(#r))
+        }),
+        Kind::Weak => quote!(unsafe {
+            ::bstack_raii::ForeignWeak::from_foreign(
+                ::bstack_raii::Foreign::<#ftarget>::from_repr(#r))
+        }),
+        Kind::Ref => quote!(unsafe { ::bstack_raii::Foreign::<#ftarget>::from_repr(#r) }),
+        _ => unreachable!(),
+    };
+
+    let mut out: Vec<TokenStream> = Vec::new();
+
+    // ---- replace_<field>(&alloc, new) -> old ----
+    let replace = format_ident!("replace_{}", fname);
+    let read_old = quote! {
+        let __stack = allocator.stack();
+        let __off = #off;
+        let mut __b = [0u8; 16];
+        if let ::std::result::Result::Err(__e) = __stack.get_into(__off, &mut __b) {
+            return ::core::result::Result::Err(::bstack_raii::ReplaceError::recovered(__e, value));
+        }
+        let __old: ::bstack_raii::ForeignRepr =
+            ::bstack_raii::bytemuck::pod_read_unaligned(&__b);
+    };
+    let replace_body = if nullable {
+        let consume_some = consume(quote!(__v));
+        let rb_new = rebuild(quote!(__r));
+        let rb_old = rebuild(quote!(__old));
+        quote! {
+            #read_old
+            let (__new, __back): (
+                ::bstack_raii::ForeignRepr,
+                ::core::option::Option<::bstack_raii::ForeignRepr>,
+            ) = match value {
+                ::core::option::Option::Some(__v) => {
+                    let __r = #consume_some;
+                    (__r, ::core::option::Option::Some(__r))
+                }
+                ::core::option::Option::None =>
+                    (::bstack_raii::ForeignRepr::new(0, 0), ::core::option::Option::None),
+            };
+            if let ::std::result::Result::Err(__e) =
+                __stack.set(__off, ::bstack_raii::bytemuck::bytes_of(&__new))
+            {
+                let __hb: #val_ty = match __back {
+                    ::core::option::Option::Some(__r) => ::core::option::Option::Some(#rb_new),
+                    ::core::option::Option::None => ::core::option::Option::None,
+                };
+                return ::core::result::Result::Err(::bstack_raii::ReplaceError::recovered(__e, __hb));
+            }
+            if __old.offset() == 0 {
+                ::core::result::Result::Ok(::core::option::Option::None)
+            } else {
+                ::core::result::Result::Ok(::core::option::Option::Some(#rb_old))
+            }
+        }
+    } else {
+        let consume_v = consume(quote!(value));
+        let rb_new = rebuild(quote!(__new));
+        let rb_old = rebuild(quote!(__old));
+        quote! {
+            #read_old
+            let __new: ::bstack_raii::ForeignRepr = #consume_v;
+            if let ::std::result::Result::Err(__e) =
+                __stack.set(__off, ::bstack_raii::bytemuck::bytes_of(&__new))
+            {
+                return ::core::result::Result::Err(::bstack_raii::ReplaceError::recovered(__e, #rb_new));
+            }
+            ::core::result::Result::Ok(#rb_old)
+        }
+    };
+    out.push(quote! {
+        /// Install `value` and move the previous cross-file target out as its RAII
+        /// handle (free / decrement it with `bstack_drop(&home)`, or re-store it).
+        /// One crash-atomic 16-byte `set`; on I/O failure the *new* value is handed
+        /// back through [`ReplaceError`](::bstack_raii::ReplaceError).
+        #vis fn #replace<'__m, __A: ::bstack_raii::BStackRaiiAllocator>(
+            &self,
+            allocator: &'__m __A,
+            value: #val_ty,
+        ) -> ::core::result::Result<#val_ty, ::bstack_raii::ReplaceError<#val_ty>> {
+            #replace_body
+        }
+    });
+
+    // ---- set_<field> (foreign `ref` only — owns nothing) ----
+    if kind == Kind::Ref {
+        let setter = format_ident!("set_{}", fname);
+        let new_repr = if nullable {
+            quote!(match value {
+                ::core::option::Option::Some(__v) => __v.repr(),
+                ::core::option::Option::None => ::bstack_raii::ForeignRepr::new(0, 0),
+            })
+        } else {
+            quote!(value.repr())
+        };
+        out.push(quote! {
+            /// Repoint this foreign `#[bstack_ref]` (a ref owns nothing, so the old
+            /// pointer is simply overwritten). One crash-atomic 16-byte `set`.
+            #vis fn #setter<'__m, __A: ::bstack_raii::BStackRaiiAllocator>(
+                &self,
+                allocator: &'__m __A,
+                value: #val_ty,
+            ) -> ::std::io::Result<()> {
+                let __new: ::bstack_raii::ForeignRepr = #new_repr;
+                allocator
+                    .stack()
+                    .set(#off, ::bstack_raii::bytemuck::bytes_of(&__new))
             }
         });
     }
