@@ -87,12 +87,12 @@ pub use block::{
 pub use cast::{BStackCastAs, BStackCastInto};
 pub use clone::{ClonePlan, TryClone, TryCloneIn};
 pub use construct::{alloc_block, build_control_payload, set_weak_field, upgrade_weak_field};
-pub use foreign::Foreign;
 /// The inert on-disk wire form of a [`Foreign`] pointer. Not part of the public API —
 /// generated `#[bstack_block]` code names it through `::bstack_raii::ForeignRepr`; user
 /// code should never use it directly.
 #[doc(hidden)]
 pub use foreign::ForeignRepr;
+pub use foreign::{Foreign, ForeignOwned, ForeignRc, ForeignWeak};
 pub use handle::{OwnedRef, StrongRef, StrongWeakRef, WeakRef};
 pub use layout::{BlockHeader, EightCC, get_u64};
 pub use owned::BStackOwned;

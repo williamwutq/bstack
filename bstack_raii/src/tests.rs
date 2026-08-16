@@ -7617,15 +7617,21 @@ fn macro_foreign_field_bstack_move() {
     )
     .unwrap();
 
-    // Fields come back in declaration order: POD, owned link, optional ref link.
-    let (tag, owned_link, maybe): (u32, Foreign<MacroLeaf>, Option<Foreign<MacroLeaf>>) =
-        bstack_move!(h, &local).unwrap();
+    // Fields come back in declaration order: POD, owned link, optional ref link. The
+    // `#[bstack_owned]` field yields a `ForeignOwned` (the RAII dual — it owns the
+    // target and carries `bstack_drop`/`into_foreign`); the `#[bstack_ref]` field yields
+    // a plain `Foreign` (owns nothing).
+    let (tag, owned_link, maybe): (
+        u32,
+        crate::ForeignOwned<MacroLeaf>,
+        Option<Foreign<MacroLeaf>>,
+    ) = bstack_move!(h, &local).unwrap();
 
     assert_eq!(tag, 5);
-    // The moved-out owned link is the right typed value at the far-file location: it
-    // resolves through the registry to the live target.
+    // The moved-out owned handle resolves (via its pointer) to the live far target.
     assert_eq!(
         owned_link
+            .as_foreign()
             .with_in(&reg, &local, |t, fs| t.get_val(fs).unwrap())
             .unwrap(),
         Some(88)
@@ -7634,6 +7640,16 @@ fn macro_foreign_field_bstack_move() {
     assert_eq!(
         maybe
             .expect("Some link")
+            .with_in(&reg, &local, |t, fs| t.get_val(fs).unwrap())
+            .unwrap(),
+        Some(88)
+    );
+
+    // `into_foreign` relinquishes ownership, handing back a plain `Foreign` that still
+    // resolves — the value to re-store into another owning field.
+    let relinquished = owned_link.into_foreign();
+    assert_eq!(
+        relinquished
             .with_in(&reg, &local, |t, fs| t.get_val(fs).unwrap())
             .unwrap(),
         Some(88)
@@ -7855,6 +7871,189 @@ fn macro_foreign_owned_teardown_reclaims_across_files() {
     );
 
     registry::detach(fid);
+}
+
+#[test]
+fn foreign_owned_move_then_bstack_drop_reclaims_across_files() {
+    // The RAII dual in action: `bstack_move!` of a `#[bstack_owned] Foreign` hands back
+    // a `ForeignOwned`, and its `bstack_drop` frees the target in its own file
+    // (registry-resolved) — the safe replacement for the raw `foreign_drop_*` helpers,
+    // and the fix for "moving out an owned foreign leaks / needs unsafe".
+    use crate::Foreign;
+    use crate::registry;
+
+    let home = TempStack::new();
+    let home_alloc = home.allocator();
+    let foreign = TempStack::new();
+    let foreign_alloc = foreign.allocator();
+
+    let base = foreign_alloc.stack().len().unwrap();
+    let leaf = MacroLeaf::new(&foreign_alloc, 88).unwrap();
+    let off = leaf.handle().range().start();
+    let grown = foreign_alloc.stack().len().unwrap();
+    assert!(grown > base, "target should have grown the foreign file");
+
+    let reg_file = TempStack::new();
+    let _ = registry::init(&reg_file.path);
+    let fid = registry::attach(&foreign.path, foreign_alloc).unwrap();
+
+    let h = ForeignHolder::new(
+        &home_alloc,
+        7,
+        unsafe { Foreign::<MacroLeaf>::new(fid, off) },
+        None,
+    )
+    .unwrap();
+
+    // Move the fields out; the `#[bstack_owned]` link returns as a `ForeignOwned`.
+    let (_, owned_link, _maybe): (
+        u32,
+        crate::ForeignOwned<MacroLeaf>,
+        Option<Foreign<MacroLeaf>>,
+    ) = bstack_move!(h, &home_alloc).unwrap();
+
+    // Dropping the owning handle reclaims the target in its own file — safe, no leak.
+    owned_link.bstack_drop(&home_alloc).unwrap();
+
+    let after = registry::with_host(fid, |host| host.stack().len().unwrap()).unwrap();
+    assert!(
+        after <= base,
+        "ForeignOwned::bstack_drop did not reclaim the target: {after} > {base}"
+    );
+
+    registry::detach(fid);
+    let _ = leaf;
+}
+
+#[test]
+fn foreign_owned_into_local_owned_self_resolves_and_frees() {
+    // A SELF `ForeignOwned` resolves to a plain `BStackOwned` in the same file, which
+    // reads and frees against the local allocator — the owning analogue of
+    // `Foreign::into_local`, no registry involved.
+    use crate::Foreign;
+    use crate::registry::FileId;
+
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+
+    // Warm the WAL anchor (a one-time per-file allocation) for a stable baseline.
+    {
+        let g = MacroLeaf::new(&alloc, 0).unwrap();
+        g.bstack_drop(&alloc).unwrap();
+    }
+    let base = alloc.stack().len().unwrap();
+
+    // Allocate the target and hand its ownership to the holder via a SELF foreign
+    // (`into_inner` relinquishes the `BStackOwned`, so there is a single owner).
+    let leaf = MacroLeaf::new(&alloc, 88).unwrap().into_inner();
+    let off = leaf.range().start();
+    let h = ForeignHolder::new(
+        &alloc,
+        3,
+        unsafe { Foreign::<MacroLeaf>::new(FileId::SELF, off) },
+        None,
+    )
+    .unwrap();
+
+    // Move out → `ForeignOwned` (SELF) → a plain `BStackOwned` in this file.
+    let (_, owned, _): (
+        u32,
+        crate::ForeignOwned<MacroLeaf>,
+        Option<Foreign<MacroLeaf>>,
+    ) = bstack_move!(h, &alloc).unwrap();
+    assert!(owned.is_self());
+    let local = owned.into_local();
+
+    // It reads against the local stack and frees against the local allocator.
+    assert_eq!(local.handle().get_val(alloc.stack()).unwrap(), 88);
+    local.bstack_drop(&alloc).unwrap();
+
+    assert!(
+        alloc.stack().len().unwrap() <= base,
+        "into_local + bstack_drop must reclaim the target"
+    );
+}
+
+#[test]
+fn foreign_rc_into_local_rc_self_resolves_and_frees() {
+    // A SELF `ForeignRc` resolves (via `strong_parts`) to a live `BStackRc` bound to the
+    // local allocator; dropping it drives strong 1 -> 0 and frees the shared block.
+    use crate::Foreign;
+    use crate::registry::FileId;
+
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    {
+        let g = MacroLeaf::new(&alloc, 0).unwrap();
+        g.bstack_drop(&alloc).unwrap();
+    }
+    let base = alloc.stack().len().unwrap();
+
+    let data_size = size_of::<<MacroStrongChild as BStackBlock>::OnDisk>() as u64;
+    let ctrl_size = size_of::<<MacroStrongChild as BStackWeakable>::Control>() as u64;
+    let data = alloc_block(&alloc, MacroStrongChild::eightcc(), data_size).unwrap();
+    let ctrl = alloc_control(&alloc, ctrl_tag(), data, ctrl_size).unwrap();
+    let data_off = data.start();
+    let strong_off = ctrl.start() + layout::CTRL_STRONG_OFFSET;
+    assert_eq!(crate::refcount::load(alloc.stack(), strong_off).unwrap(), 1);
+
+    // The holder adopts the initial strong = 1 via a SELF foreign.
+    let h = ForeignStrongHolder::new(&alloc, 1, unsafe {
+        Foreign::<MacroStrongChild>::new(FileId::SELF, data_off)
+    })
+    .unwrap();
+
+    let (_, rc): (u32, crate::ForeignRc<MacroStrongChild>) = bstack_move!(h, &alloc).unwrap();
+    assert!(rc.is_self());
+    // Resolve to a live in-file `BStackRc`; dropping it (it auto-frees) drives
+    // strong 1 -> 0 and reclaims data + control.
+    let local = rc.into_local(&alloc).unwrap();
+    drop(local);
+
+    assert!(
+        alloc.stack().len().unwrap() <= base,
+        "into_local + drop must reclaim the shared target"
+    );
+}
+
+#[test]
+fn foreign_weak_into_local_weak_self_decrements() {
+    // A SELF `ForeignWeak` resolves to a live `BStackWeak`; dropping it (auto-free)
+    // decrements the target's weak count in the local file.
+    use crate::Foreign;
+    use crate::registry::FileId;
+
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+
+    let data_size = size_of::<<MacroStrongChild as BStackBlock>::OnDisk>() as u64;
+    let ctrl_size = size_of::<<MacroStrongChild as BStackWeakable>::Control>() as u64;
+    let data = alloc_block(&alloc, MacroStrongChild::eightcc(), data_size).unwrap();
+    let ctrl = alloc_control(&alloc, ctrl_tag(), data, ctrl_size).unwrap();
+    let ctrl_off = ctrl.start();
+    let weak_off = ctrl_off + layout::CTRL_WEAK_OFFSET;
+    // `alloc_control` leaves weak = 1 (the strong owners' phantom); add one for the
+    // holder we are about to create (construction does not bump).
+    crate::refcount::fetch_add(alloc.stack(), weak_off, 1).unwrap();
+    let load = |o: u64| crate::refcount::load(alloc.stack(), o).unwrap();
+    assert_eq!(load(weak_off), 2);
+
+    // A weak foreign holder points at the CONTROL block.
+    let h = ForeignWeakHolder::new(&alloc, 1, unsafe {
+        Foreign::<MacroStrongChild>::new(FileId::SELF, ctrl_off)
+    })
+    .unwrap();
+
+    let (_, weak): (u32, crate::ForeignWeak<MacroStrongChild>) = bstack_move!(h, &alloc).unwrap();
+    assert!(weak.is_self());
+    // Resolve to a live in-file `BStackWeak`; dropping it decrements weak 2 -> 1.
+    let local = weak.into_local(&alloc);
+    drop(local);
+    assert_eq!(
+        load(weak_off),
+        1,
+        "into_local + drop must decrement the weak count"
+    );
 }
 
 #[test]
@@ -9370,7 +9569,7 @@ fn foreign_reverse_map_and_bstack_cast() {
     let dead = FileId::from_u64(60_000).unwrap();
     assert!(
         unsafe { Foreign::<MacroLeaf>::new(dead, off) }
-            .as_local_ref()
+            .into_local()
             .is_none()
     );
 

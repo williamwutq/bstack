@@ -419,6 +419,37 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
             let cap = format_ident!("__cap_{}", fname);
             mv_caps.push(quote!(let #cap = __od.#fname;));
 
+            // `bstack_move!` hands an owning foreign field back as its RAII dual
+            // (`ForeignOwned` / `ForeignRc` / `ForeignWeak`, each with `bstack_drop` +
+            // `into_foreign`); a `#[bstack_ref]` yields a plain `Foreign` (owns nothing).
+            let (mv_leaf_ty, mv_leaf_expr) = match kind {
+                Kind::Owned => (
+                    quote!(::bstack_raii::ForeignOwned<'__mv, #ftarget>),
+                    quote!(unsafe {
+                        ::bstack_raii::ForeignOwned::from_foreign(
+                            ::bstack_raii::Foreign::from_repr(#cap))
+                    }),
+                ),
+                Kind::Strong => (
+                    quote!(::bstack_raii::ForeignRc<'__mv, #ftarget>),
+                    quote!(unsafe {
+                        ::bstack_raii::ForeignRc::from_foreign(
+                            ::bstack_raii::Foreign::from_repr(#cap))
+                    }),
+                ),
+                Kind::Weak => (
+                    quote!(::bstack_raii::ForeignWeak<'__mv, #ftarget>),
+                    quote!(unsafe {
+                        ::bstack_raii::ForeignWeak::from_foreign(
+                            ::bstack_raii::Foreign::from_repr(#cap))
+                    }),
+                ),
+                _ => (
+                    quote!(::bstack_raii::Foreign<'__mv, #ftarget>),
+                    quote!(unsafe { ::bstack_raii::Foreign::from_repr(#cap) }),
+                ),
+            };
+
             if nullable {
                 // Niche: a stored `offset == 0` is `None` (no target sits at 0).
                 accessors.push(quote! {
@@ -451,17 +482,14 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                     };
                 });
                 ctor_inits.push(quote!(#fname: #fname,));
-                mv_types.push(quote!(
-                    ::core::option::Option<::bstack_raii::Foreign<'__mv, #ftarget>>
-                ));
+                mv_types.push(quote!(::core::option::Option<#mv_leaf_ty>));
                 mv_recon.push(quote! {
                     if #cap.offset() == 0 {
                         ::core::option::Option::None
                     } else {
-                        // SAFETY: `#cap` was stored into this file; bound to `'__mv`.
-                        ::core::option::Option::Some(unsafe {
-                            ::bstack_raii::Foreign::from_repr(#cap)
-                        })
+                        // SAFETY: `#cap` was stored into this file; the handle is bound
+                        // to `'__mv` and owns the target per the field annotation.
+                        ::core::option::Option::Some(#mv_leaf_expr)
                     }
                 });
             } else {
@@ -482,8 +510,8 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                 ctor_params.push(quote!(#fname: #field_ty,));
                 ctor_preps.push(quote!(let #fname: ::bstack_raii::ForeignRepr = #fname.repr();));
                 ctor_inits.push(quote!(#fname: #fname,));
-                mv_types.push(quote!(::bstack_raii::Foreign<'__mv, #ftarget>));
-                mv_recon.push(quote!(unsafe { ::bstack_raii::Foreign::from_repr(#cap) }));
+                mv_types.push(quote!(#mv_leaf_ty));
+                mv_recon.push(quote!(#mv_leaf_expr));
             }
 
             // Teardown: an owning foreign pointer frees / decrements / releases its

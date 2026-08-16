@@ -12,14 +12,20 @@ so they are not re-flagged).
 
 ### Undesirable / risky
 
-- **`bstack_move!` of an `#[bstack_owned] Foreign` hands back a non-RAII pointer.**
-  Moving an owned *in-file* field out yields a `BStackOwned<Child>` (a typed owning
-  handle with `.bstack_drop`); moving an owned *foreign* field out yields a bare
-  `Foreign<T>` — a `Copy` wide pointer with no owning-drop method — so the caller must
-  re-store it or free it via the `unsafe foreign_drop_*` helpers, and simply dropping
-  it leaks the target. Consistent with `Foreign` being a non-RAII pointer (and with
-  `BStackOwned` also freeing nothing on `Drop`), but an ergonomic asymmetry; there is
-  no `BStackOwned`-equivalent RAII wrapper for a moved-out cross-file owner.
+- **[RESOLVED (scalar) 2026-08-15] `bstack_move!` of an owning `Foreign` now yields a
+  RAII handle.** Added `ForeignOwned<'a,T>` / `ForeignRc<'a,T>` / `ForeignWeak<'a,T>` —
+  the cross-file duals of `BStackOwned` / `BStackRc` / `BStackWeak`. Moving out a
+  `#[bstack_owned/strong/weak] Foreign<T>` **scalar** field (or `Option<..>`) now returns
+  the matching handle; `#[bstack_ref]` still returns a plain `Foreign` (owns nothing —
+  correct). Each handle is **non-`Copy`** (an owner is used once), carries
+  `bstack_drop(&home)` (registry-resolved cross-file free, same dispatch as the field
+  teardown — the safe replacement for the `unsafe foreign_drop_*` helpers) and
+  `into_foreign()` (relinquish → re-store into another owning field). Like `BStackOwned`,
+  they don't free on `Drop`, so a forgotten handle still leaks (identical to in-file).
+  **Residual:** only *scalar* foreign fields are wired — an owning `Foreign` inside a
+  `Vec` / array / tuple / enum variant still moves out as a bare `Foreign` (the `Vec`
+  case is partly covered because the moved-out `BStackVec<ForeignRepr>` handle itself
+  owns the block; per-*element* owning handles for containers are a follow-up).
 - **[MITIGATED 2026-08-15] Raw wire pointer bypasses cross-file ownership.**
   `Foreign<T>` is deliberately **not `Pod`** (only `Copy`), so it is correctly rejected
   from every `T: Pod` container. The old public `Pod` `ForeignPtr` was a hole (it could

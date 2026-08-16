@@ -54,7 +54,7 @@ pub fn expand(input: TokenStream) -> syn::Result<TokenStream> {
         }
         // foreign → normal: a `Foreign<T>` → its offset-only `BStackRef<T>` in the
         // target file (`None` unless that file is `SELF`/attached). No I/O.
-        "BStackRef" => quote!((#expr).as_local_ref()),
+        "BStackRef" => quote!((#expr).into_local()),
         // A concrete block type: borrowed downcast off a `BStackSlice`.
         _ => quote!(::bstack_raii::BStackCastAs::cast_as::<#ty>(&#expr)),
     };

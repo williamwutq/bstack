@@ -923,18 +923,34 @@ in-memory form is exactly the on-disk wire size.
 
 The annotation decides what teardown and clone do **in the target's own file**:
 
-| Annotation         | Cross-file teardown                       | Cross-file clone                                  |
-|--------------------|-------------------------------------------|---------------------------------------------------|
-| `#[bstack_owned]`  | frees the target in its file              | deep-clones it into a fresh block in that file    |
-| `#[bstack_strong]` | decrements its refcount there (free at 0) | bumps its refcount there (stays shared)           |
-| `#[bstack_weak]`   | decrements its weak count there           | bumps its weak count there                        |
-| `#[bstack_ref]`    | nothing                                   | byte-copies the pointer (aliases the same target) |
+| Annotation         | Cross-file teardown                       | Cross-file clone                                  | `bstack_move!` yields    |
+|--------------------|-------------------------------------------|---------------------------------------------------|--------------------------|
+| `#[bstack_owned]`  | frees the target in its file              | deep-clones it into a fresh block in that file    | `ForeignOwned<T>`        |
+| `#[bstack_strong]` | decrements its refcount there (free at 0) | bumps its refcount there (stays shared)           | `ForeignRc<T>`           |
+| `#[bstack_weak]`   | decrements its weak count there           | bumps its weak count there                        | `ForeignWeak<T>`         |
+| `#[bstack_ref]`    | nothing                                   | byte-copies the pointer (aliases the same target) | `Foreign<T>`             |
 
 So tearing down a `Card` reclaims its `Document` in the store file, and
 deep-cloning a `Card` gives the copy its own independent `Document` there — the
 catalog file never touches the store's bytes directly. (`#[bstack_owned]` needs a
 deep-cloneable target, so `#[bstack_owned] Foreign<SharedBlock>` — a target that
 is itself `(rc)` — is a compile error; use `#[bstack_strong]`.)
+
+Moving an owning foreign field out with `bstack_move!` hands back its **RAII dual** —
+`ForeignOwned` / `ForeignRc` / `ForeignWeak`, the cross-file analogues of
+`BStackOwned` / `BStackRc` / `BStackWeak`. Each is non-`Copy` and carries
+`.bstack_drop(&home)` (frees the target in its own file, resolved through the
+registry) and `.into_foreign()` (relinquish ownership, handing back a plain `Foreign`
+to re-store into another owning field). A `#[bstack_ref]` field moves out as a plain
+`Foreign` (it owns nothing). Each also **resolves to its in-file handle** with
+`.into_local(..)` in the target's own file — `ForeignOwned::into_local() →
+BStackOwned<T>`, `ForeignRc::into_local(&target) → BStackRc<T>`,
+`ForeignWeak::into_local(&target) → BStackWeak<T>` (rc/weak take the target file's
+allocator, since those handles carry one) — the owning analogues of
+`bstack_cast!(foreign as BStackRef<T>)`. Like `BStackOwned`, these don't free on `Drop` — a
+forgotten handle leaks the target, exactly as in-file. *(Currently wired for scalar
+foreign fields; an owning `Foreign` inside a `Vec`/array/tuple/enum still moves out as
+a bare `Foreign`.)*
 
 > **Nullable & atomicity.** `Option<Foreign<T>>` is nullable on the usual offset-0
 > niche. Cross-file operations are *best-effort atomic*: the far side is committed
