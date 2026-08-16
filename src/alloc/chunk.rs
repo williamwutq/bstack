@@ -312,6 +312,7 @@ impl<'a> BStackChunk<'a> {
     /// Panics if `new_stride == 0`.
     #[inline]
     #[must_use]
+    #[track_caller]
     pub fn with_stride(self, new_stride: u64) -> (BStackChunk<'a>, BStackSlice<'a>) {
         self.aligned.chunks(new_stride)
     }
@@ -466,6 +467,7 @@ impl<'a> BStackChunk<'a> {
     ///
     /// Panics if `n >= self.chunk_count()`.
     #[cfg(all(feature = "set", feature = "atomic"))]
+    #[track_caller]
     pub fn select_nth_by(
         &mut self,
         n: u64,
@@ -499,6 +501,7 @@ impl<'a> BStackChunk<'a> {
     ///
     /// Panics if `n >= self.chunk_count()`.
     #[cfg(all(feature = "set", feature = "atomic"))]
+    #[track_caller]
     pub fn select_nth_by_key<K: Ord>(
         &mut self,
         n: u64,
@@ -618,6 +621,7 @@ impl<'a> BStackSlice<'a> {
     ///
     /// Panics if `chunk_len == 0`.
     #[must_use]
+    #[track_caller]
     pub fn chunks(&self, chunk_len: u64) -> (BStackChunk<'a>, BStackSlice<'a>) {
         assert!(chunk_len > 0, "chunks: chunk_len must be nonzero");
         let len = self.len();
@@ -643,6 +647,7 @@ impl<'a> BStackSlice<'a> {
     ///
     /// Panics if `chunk_len == 0`.
     #[must_use]
+    #[track_caller]
     pub fn rchunks(&self, chunk_len: u64) -> (BStackChunk<'a>, BStackSlice<'a>) {
         assert!(chunk_len > 0, "rchunks: chunk_len must be nonzero");
         let len = self.len();
@@ -662,6 +667,7 @@ impl<'a, A: BStackAllocator> BStackOwnedSlice<'a, A> {
     /// the returned view and remainder's lifetime is tied to `&self`.
     #[inline]
     #[must_use]
+    #[track_caller]
     pub fn chunks<'s>(&'s self, chunk_len: u64) -> (BStackChunk<'s>, BStackSlice<'s>) {
         self.as_slice().chunks(chunk_len)
     }
@@ -672,6 +678,7 @@ impl<'a, A: BStackAllocator> BStackOwnedSlice<'a, A> {
     /// the returned view and remainder's lifetime is tied to `&self`.
     #[inline]
     #[must_use]
+    #[track_caller]
     pub fn rchunks<'s>(&'s self, chunk_len: u64) -> (BStackChunk<'s>, BStackSlice<'s>) {
         self.as_slice().rchunks(chunk_len)
     }

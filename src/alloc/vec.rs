@@ -347,6 +347,7 @@ impl<'a, A: BStackOwnedSliceAllocator> BStackByteVec<'a, A> {
     /// Panics if the `len` read from the block header is corrupt (larger than
     /// the block can hold), causing the computed end offset to exceed the
     /// block's length.  Corruption is not a recoverable condition here.
+    #[track_caller]
     pub fn as_slice(&self) -> io::Result<BStackSlice<'_>> {
         let (len, _) = self.read_header()?;
         Ok(self.slice.as_slice().subslice(HEADER_LEN, HEADER_LEN + len))

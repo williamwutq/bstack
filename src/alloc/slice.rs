@@ -465,6 +465,7 @@ impl<'a> BStackSlice<'a> {
     /// Panics if `start > end` or `end > self.len()`.
     #[inline]
     #[must_use]
+    #[track_caller]
     pub fn subslice(&self, start: u64, end: u64) -> BStackSlice<'a> {
         self.subslice_range(start..end)
     }
@@ -475,6 +476,7 @@ impl<'a> BStackSlice<'a> {
     ///
     /// Panics if `range.start > range.end` or `range.end > self.len()`.
     #[must_use]
+    #[track_caller]
     pub fn subslice_range(&self, range: Range<u64>) -> BStackSlice<'a> {
         assert!(range.start <= range.end, "range start must be <= end");
         assert!(range.end <= self.len(), "range end must be <= slice length");
@@ -498,6 +500,7 @@ impl<'a> BStackSlice<'a> {
     /// Panics if `mid > self.len()`.
     #[inline]
     #[must_use]
+    #[track_caller]
     pub fn split_at(&self, mid: u64) -> (BStackSlice<'a>, BStackSlice<'a>) {
         assert!(mid <= self.len(), "split_at: mid must be <= slice length");
         (self.subslice(0, mid), self.subslice(mid, self.len()))
@@ -515,6 +518,7 @@ impl<'a> BStackSlice<'a> {
     /// Panics if `mid > self.len()`.
     #[inline]
     #[must_use]
+    #[track_caller]
     pub fn split_at_mut(&mut self, mid: u64) -> (BStackSlice<'a>, BStackSlice<'a>) {
         assert!(
             mid <= self.len(),
@@ -750,6 +754,7 @@ impl<'a> BStackSlice<'a> {
     /// Panics if `src.len() != self.len()`.
     #[cfg(feature = "set")]
     #[inline]
+    #[track_caller]
     pub fn copy_from_slice(&mut self, src: &[u8]) -> io::Result<()> {
         assert_eq!(
             src.len() as u64,
@@ -775,6 +780,7 @@ impl<'a> BStackSlice<'a> {
     /// Returns [`io::ErrorKind::InvalidInput`] if `src` is backed by a
     /// different [`BStack`].
     #[cfg(all(feature = "set", feature = "atomic"))]
+    #[track_caller]
     pub fn copy_from_bstack_slice(&mut self, src: &BStackSlice<'_>) -> io::Result<()> {
         assert_eq!(
             src.len(),
@@ -807,6 +813,7 @@ impl<'a> BStackSlice<'a> {
     /// self.len()`, or if `dest + src_range.len()` overflows `u64` or exceeds
     /// `self.len()`.
     #[cfg(all(feature = "set", feature = "atomic"))]
+    #[track_caller]
     pub fn copy_within(&mut self, src_range: Range<u64>, dest: u64) -> io::Result<()> {
         assert!(
             src_range.start <= src_range.end,
@@ -846,6 +853,7 @@ impl<'a> BStackSlice<'a> {
     /// Returns [`io::ErrorKind::InvalidInput`] if `other` is backed by a
     /// different [`BStack`].
     #[cfg(all(feature = "set", feature = "atomic"))]
+    #[track_caller]
     pub fn swap(&mut self, other: &mut BStackSlice<'_>) -> io::Result<()> {
         assert_eq!(self.len(), other.len(), "swap: length mismatch");
         if !std::ptr::eq(self.stack, other.stack()) {
@@ -885,6 +893,7 @@ impl<'a> BStackSlice<'a> {
     ///
     /// Panics if `mid > self.len()`.
     #[cfg(all(feature = "set", feature = "atomic"))]
+    #[track_caller]
     pub fn rotate_left(&mut self, mid: u64) -> io::Result<()> {
         assert!(
             mid <= self.len(),
@@ -906,6 +915,7 @@ impl<'a> BStackSlice<'a> {
     ///
     /// Panics if `k > self.len()`.
     #[cfg(all(feature = "set", feature = "atomic"))]
+    #[track_caller]
     pub fn rotate_right(&mut self, k: u64) -> io::Result<()> {
         assert!(k <= self.len(), "rotate_right: k must be <= slice length");
         self.stack
@@ -1312,6 +1322,7 @@ impl<'a, A: BStackAllocator> BStackOwnedSlice<'a, A> {
     /// and delegates to [`BStackSlice::split_at`].
     #[inline]
     #[must_use]
+    #[track_caller]
     pub fn split_at<'s>(&'s self, mid: u64) -> (BStackSlice<'s>, BStackSlice<'s>) {
         self.as_slice().split_at(mid)
     }
@@ -1322,6 +1333,7 @@ impl<'a, A: BStackAllocator> BStackOwnedSlice<'a, A> {
     /// and delegates to [`BStackSlice::split_at_mut`].
     #[inline]
     #[must_use]
+    #[track_caller]
     pub fn split_at_mut<'s>(&'s mut self, mid: u64) -> (BStackSlice<'s>, BStackSlice<'s>) {
         let mut view = self.as_slice_mut();
         view.split_at_mut(mid)
@@ -1485,6 +1497,7 @@ impl<'a, A: BStackAllocator> BStackOwnedSlice<'a, A> {
     /// Panics if `src.len() != self.len()`.
     #[cfg(feature = "set")]
     #[inline]
+    #[track_caller]
     pub fn copy_from_slice(&mut self, src: &[u8]) -> io::Result<()> {
         self.as_slice_mut().copy_from_slice(src)
     }
@@ -1501,6 +1514,7 @@ impl<'a, A: BStackAllocator> BStackOwnedSlice<'a, A> {
     /// Panics if `src.len() != self.len()`.
     #[cfg(all(feature = "set", feature = "atomic"))]
     #[inline]
+    #[track_caller]
     pub fn copy_from_bstack_slice(&mut self, src: &BStackSlice<'_>) -> io::Result<()> {
         self.as_slice_mut().copy_from_bstack_slice(src)
     }
@@ -1514,6 +1528,7 @@ impl<'a, A: BStackAllocator> BStackOwnedSlice<'a, A> {
     /// Requires the `set` and `atomic` features.
     #[cfg(all(feature = "set", feature = "atomic"))]
     #[inline]
+    #[track_caller]
     pub fn copy_within(&mut self, src_range: Range<u64>, dest: u64) -> io::Result<()> {
         self.as_slice_mut().copy_within(src_range, dest)
     }
@@ -1530,6 +1545,7 @@ impl<'a, A: BStackAllocator> BStackOwnedSlice<'a, A> {
     /// Panics if `self.len() != other.len()`.
     #[cfg(all(feature = "set", feature = "atomic"))]
     #[inline]
+    #[track_caller]
     pub fn swap(&mut self, other: &mut BStackSlice<'_>) -> io::Result<()> {
         self.as_slice_mut().swap(other)
     }
@@ -1555,6 +1571,7 @@ impl<'a, A: BStackAllocator> BStackOwnedSlice<'a, A> {
     /// Requires the `set` and `atomic` features.
     #[cfg(all(feature = "set", feature = "atomic"))]
     #[inline]
+    #[track_caller]
     pub fn rotate_left(&mut self, mid: u64) -> io::Result<()> {
         self.as_slice_mut().rotate_left(mid)
     }
@@ -1568,6 +1585,7 @@ impl<'a, A: BStackAllocator> BStackOwnedSlice<'a, A> {
     /// Requires the `set` and `atomic` features.
     #[cfg(all(feature = "set", feature = "atomic"))]
     #[inline]
+    #[track_caller]
     pub fn rotate_right(&mut self, k: u64) -> io::Result<()> {
         self.as_slice_mut().rotate_right(k)
     }

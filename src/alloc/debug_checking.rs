@@ -194,6 +194,7 @@ fn record_freed_region(state: &mut DebugState, region: Range<u64>) {
 /// - Any two ranges within `allocated` overlap
 /// - Any two ranges within `freed` overlap
 /// - Any range in `allocated` overlaps with any range in `freed`
+#[track_caller]
 fn validate_initial_state(allocated: &mut HashSet<Range<u64>>, freed: &mut HashSet<Range<u64>>) {
     allocated.retain(|r| !r.is_empty());
     freed.retain(|r| !r.is_empty());
@@ -327,6 +328,7 @@ where
     /// - Any two ranges within `freed` overlap
     /// - Any range in `allocated` overlaps with any range in `freed`
     #[must_use]
+    #[track_caller]
     pub fn with_state(
         inner: A,
         allocated: impl IntoIterator<Item = Range<u64>>,
