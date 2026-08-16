@@ -12,30 +12,6 @@ so they are not re-flagged).
 
 ### Undesirable / risky
 
-- **[RESOLVED (scalar) 2026-08-15] `bstack_move!` of an owning `Foreign` now yields a
-  RAII handle.** Added `ForeignOwned<'a,T>` / `ForeignRc<'a,T>` / `ForeignWeak<'a,T>` —
-  the cross-file duals of `BStackOwned` / `BStackRc` / `BStackWeak`. Moving out a
-  `#[bstack_owned/strong/weak] Foreign<T>` **scalar** field (or `Option<..>`) now returns
-  the matching handle; `#[bstack_ref]` still returns a plain `Foreign` (owns nothing —
-  correct). Each handle is **non-`Copy`** (an owner is used once), carries
-  `bstack_drop(&home)` (registry-resolved cross-file free, same dispatch as the field
-  teardown — the safe replacement for the `unsafe foreign_drop_*` helpers) and
-  `into_foreign()` (relinquish → re-store into another owning field). Like `BStackOwned`,
-  they don't free on `Drop`, so a forgotten handle still leaks (identical to in-file).
-  **Residual:** only *scalar* foreign fields are wired — an owning `Foreign` inside a
-  `Vec` / array / tuple / enum variant still moves out as a bare `Foreign` (the `Vec`
-  case is partly covered because the moved-out `BStackVec<ForeignRepr>` handle itself
-  owns the block; per-*element* owning handles for containers are a follow-up).
-- **[MITIGATED 2026-08-15] Raw wire pointer bypasses cross-file ownership.**
-  `Foreign<T>` is deliberately **not `Pod`** (only `Copy`), so it is correctly rejected
-  from every `T: Pod` container. The old public `Pod` `ForeignPtr` was a hole (it could
-  be stored in a `BStackBox`/`BStackVec` as opaque bytes with no owning dispatch). It has
-  been renamed to `ForeignRepr`, made `#[doc(hidden)]`, and dropped from the public
-  prelude, and it now carries **no resolution API** — there is no safe way to turn a
-  stored `ForeignRepr` back into a `Foreign` (only the `unsafe fn from_repr`, called by
-  generated code). So `BStackVec<ForeignRepr>` still compiles (it is `pub` for macro
-  output) but stores inert bytes that reach no target without an explicit `unsafe`,
-  which is the correct boundary. User code never names the type.
 - [CONFIRMED-DEFECT] **`#[embed]` of a collection is semantically dubious.** `#[embed] BStackDeque<T>`
   would inline only the fixed descriptor while the ring/nodes stay out-of-line;
   whether embed teardown/move handle a block whose `OnDisk` is a descriptor (not a
@@ -56,21 +32,6 @@ so they are not re-flagged).
   user marking such a field `#[bstack_mut]` gets a silent no-op. (When the container
   mutator gap is eventually filled, a `Foreign` `replace_` must also free/repoint
   the *old cross-file target*, or it leaks — like the scalar owned `replace_`.)
-- **[MOSTLY CLOSED 2026-08-15] `Foreign(SELF)` position-dependence.** `Foreign<T>` is
-  now `Foreign<'a, T>`, and a field accessor binds `'a` to the `&'a BStack` it read
-  through (an enum variant to the read/move borrow). A SELF pointer is therefore
-  **borrow-bound to its home file** and can no longer be *stored into another file* — the
-  byte-copy-rebind footgun is closed for the safe (generated-accessor) path, and an
-  explicit pointer resolves through the registry regardless. Two residuals remain, both
-  now behind `unsafe` or a documented caveat: (a) the raw `unsafe fn Foreign::new` can
-  fabricate a `'static` SELF whose deref against a wrong-but-co-live `local` reads the
-  wrong file (the lifetime pins *scope*, not value identity — its safety contract says
-  "resolve only against its home"); (b) a persisted SELF is still position-dependent on
-  disk (allowed by design — persisted SELF is legal), so migrating the *containing*
-  block to another file rebinds it. Both are `unsafe`/contract-level, not safe-API holes.
-- **`bstack_cast!(foreign as BStackRef<T>)` yields an offset-only ref** valid only
-  in the target's *own* file; resolving it against the local stack reads garbage
-  (documented internally, not UB, but an easy silent-wrong-data footgun).
 - **No explicit guard against `#[embed]` of an `(rc)` / `(rc, weak)` block.** Embed
   folds the child's data inline and frees its shell; an `(rc, weak)` child's
   *separate* control block would then keep a stale forward pointer to the freed data

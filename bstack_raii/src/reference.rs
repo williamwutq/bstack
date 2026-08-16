@@ -18,6 +18,23 @@ use crate::block::BStackBlock;
 /// (little-endian, fixed width) is a separate `Pod` representation the macro
 /// emits inside `XOnDisk`; it is not this type, because `BStackRange` is not
 /// itself `bytemuck::Pod`.
+///
+/// # Not fully qualified: pair it with its own file
+///
+/// A `BStackRef` names only a **location** (an offset within *some* file) — never a
+/// file identity. Resolving it ([`read_on_disk`](Self::read_on_disk), or a generated
+/// field accessor) supplies the file as the `stack`/allocator argument, and nothing
+/// checks that the file you pass is the one this ref actually lives in. Reading it
+/// against the wrong file returns wrong data or an [`io::Error`] (out-of-bounds I/O is
+/// bounds-checked) — never undefined behaviour, so this stays a safe API — but it is a
+/// silent-wrong-data footgun: **always pair a `BStackRef` with the file it came from.**
+/// For a *self-qualifying* pointer that carries its own file identity and resolves
+/// through the registry, use [`Foreign<T>`](crate::Foreign) instead.
+///
+/// A `BStackRef` is **read-only** (only [`read_on_disk`](Self::read_on_disk)); writes go
+/// through a file — the generated `set_<field>`/`replace_<field>` mutators (which take
+/// the `stack`) or the `unsafe raw_<field>_slice` place — so an unqualified ref can
+/// never *corrupt* a file, only read the wrong one.
 #[repr(transparent)]
 pub struct BStackRef<T> {
     range: BStackRange,
