@@ -443,7 +443,8 @@
 //!   write for callers that overwrite the region before reading it.  Existing
 //!   bytes are preserved exactly as `realloc`.  Implementing it is optional and
 //!   signals that the allocator actually has a cheaper uninitialised path.
-//!   Implemented by [`SlabBStackAllocator`] and [`GhostTreeBstackAllocator`].
+//!   Implemented by [`SlabBStackAllocator`], [`GhostTreeBstackAllocator`] and
+//!   [`CheckedSlabBStackAllocator`].
 //!   [`LinearBStackAllocator`] deliberately does not: a bump allocator only ever
 //!   hands out freshly extended tail, whose zeroes cost no write I/O.
 //!
