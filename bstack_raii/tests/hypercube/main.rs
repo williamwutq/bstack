@@ -23,6 +23,7 @@ mod fixtures;
 mod atomicity;
 mod cast;
 mod clone;
+mod collections;
 mod compile_fail;
 mod construct;
 mod foreign;
