@@ -76,6 +76,7 @@ mod replace;
 /// interpreting `bstack_raii` structures on disk with no compiled-in types.
 pub mod rtti;
 mod shared;
+mod small_map;
 mod stdlib;
 mod teardown;
 mod vec;
@@ -103,6 +104,7 @@ pub use reference::BStackRef;
 pub use registry::ForeignHostAllocator;
 pub use replace::ReplaceError;
 pub use shared::{BStackRc, BStackWeak};
+pub use small_map::{Entry, OccupiedEntry, SmallStringMap, VacantEntry};
 pub use stdlib::{
     BStackBTreeMap, BStackBTreeSet, BStackBinaryHeap, BStackBox, BStackCountingBloomFilter,
     BStackCow, BStackDeque, BStackHashMap, BStackHashSet, BStackLinkedList, BStackString,

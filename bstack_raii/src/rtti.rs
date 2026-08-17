@@ -44,6 +44,11 @@
 //! interpreter** (owned deep-copied, shared refcount-bumped). Still TODO: cross-file
 //! `foreign` teardown / clone, and live mutable-class-variable writes.
 //!
+//! Individual fields are reached by a **path** (`["outer", "inner", …]`):
+//! [`get`](RttiRegistry::get) reads one field, [`set`](RttiRegistry::set) overwrites
+//! a POD / `ref` leaf, and [`swap`](RttiRegistry::swap) exchanges an owning reference
+//! for another (eightcc-checked), handing the old target back.
+//!
 //! [`AnyRef`] bridges back to compiled-in types: it is the RTTI `&dyn Any`, whose
 //! [`downcast`](AnyRef::downcast) hands back a real typed handle on an eightcc match,
 //! falling back to generic interpretation ([`RttiRegistry::read_any`]) otherwise.
@@ -116,6 +121,24 @@ fn corrupt(msg: impl Into<String>) -> io::Error {
 /// from the target block header on deref) use [`ForeignRepr::new`] directly.
 pub fn typed_ptr(file_id: u64, offset: u64, ordinal: RttiOrdinal) -> ForeignRepr {
     ForeignRepr::new(file_id, offset).with_type_index(ordinal + 1)
+}
+
+/// Build an RTTI field path from **dotted field names** for
+/// [`get`](RttiRegistry::get) / [`set`](RttiRegistry::set) / [`swap`](RttiRegistry::swap):
+/// `rtti_path!(outer.inner.leaf)` expands to `&["outer", "inner", "leaf"]`, and a
+/// single name `rtti_path!(field)` to `&["field"]`. The result is a `&[&str]`, so it
+/// drops straight into the path argument.
+///
+/// ```
+/// # use bstack_raii::rtti_path;
+/// let p: &[&str] = rtti_path!(inner.x);
+/// assert_eq!(p, &["inner", "x"]);
+/// ```
+#[macro_export]
+macro_rules! rtti_path {
+    ($($seg:ident).+) => {
+        &[$(::core::stringify!($seg)),+]
+    };
 }
 
 /// A **runtime-typed reference** — an `(EightCC, offset)` into a data file, the RTTI
@@ -998,11 +1021,21 @@ impl RttiRegistry {
         ordinal: RttiOrdinal,
         block_off: u64,
     ) -> io::Result<Value> {
+        self.run_read(
+            data,
+            vec![Op::Block {
+                ord: ordinal,
+                block_off,
+            }],
+        )
+    }
+
+    /// The read machine: run a `work` stack of [`Op`]s to a single [`Value`]. Seeded
+    /// with a `Block` op by [`read_value`](Self::read_value) (a whole block) or a
+    /// `Shape` op by [`get`](Self::get) (one field).
+    fn run_read(&self, data: &BStack, initial: Vec<Op>) -> io::Result<Value> {
         let mut cache: HashMap<RttiOrdinal, RttiType> = HashMap::new();
-        let mut work: Vec<Op> = vec![Op::Block {
-            ord: ordinal,
-            block_off,
-        }];
+        let mut work: Vec<Op> = initial;
         let mut results: Vec<Value> = Vec::new();
         // Bounds the total nodes visited: a corrupt schema/data pair (or a strong
         // cycle) can otherwise loop forever.
@@ -1504,43 +1537,175 @@ impl RttiRegistry {
         Ok(())
     }
 
-    /// Overwrite a top-level **POD** field of the struct at `block_off` with `value`
-    /// (the field's exact-width little-endian bytes) — the interpreted `set_<field>`,
-    /// one atomic write. The mirror of a POD read.
+    /// Resolve a **field path** (`["outer", "inner", …]`) from the root of type
+    /// `ordinal` at `block_off` to its target field's absolute offset and shape.
     ///
-    /// Errors if the type is an enum, the field is absent or not POD, or `value` is
-    /// the wrong width. (Reference / owned fields are not overwritten here — that is
-    /// replace = teardown-old + clone-new, a separate operation.)
-    pub fn set_pod(
+    /// Navigation descends through **block references** — `owned` / `strong` / `ref`
+    /// (follow the stored offset into the child) and `embed` (inline, same offset
+    /// base) — and through a struct's fields or an enum's active variant. A `pod` /
+    /// `vec` / array / tuple / `weak` / `foreign` field is a leaf: it may be the last
+    /// segment, but the path cannot continue *through* it. An empty path, an unknown
+    /// field, or a null reference on the way is an error.
+    fn resolve_field(
         &self,
         data: &BStack,
         ordinal: RttiOrdinal,
-        field_name: &str,
         block_off: u64,
+        path: &[&str],
+    ) -> io::Result<(u64, Shape)> {
+        if path.is_empty() {
+            return Err(set_error("empty field path"));
+        }
+        let mut ord = ordinal;
+        let mut base = block_off;
+        for (i, seg) in path.iter().enumerate() {
+            let ty = self.load_type(ord)?;
+            // A struct's fields are block-relative; an enum's active variant's fields
+            // are payload-relative.
+            let (fields, field_base): (&[RttiField], u64) = match &ty.body {
+                RttiBody::Struct(f) => (f, base),
+                RttiBody::Enum(e) => {
+                    let raw = read_disc(data, base + e.disc_off as u64, e.disc_width)?;
+                    let mask = disc_mask(e.disc_width);
+                    let variant = e
+                        .variants
+                        .iter()
+                        .find(|v| (v.disc_value as u64) & mask == raw)
+                        .ok_or_else(|| set_error(format!("no variant for discriminant {raw}")))?;
+                    (&variant.fields, base + e.payload_off as u64)
+                }
+            };
+            let field = fields
+                .iter()
+                .find(|f| &f.name == seg)
+                .ok_or_else(|| set_error(format!("no field named `{seg}`")))?;
+            let field_off = field_base + field.offset as u64;
+
+            if i + 1 == path.len() {
+                return Ok((field_off, field.shape.clone()));
+            }
+            // Descend into a block reference for the next segment.
+            match &field.shape {
+                Shape::Owned(tag) | Shape::Strong(tag) | Shape::Ref(tag) => {
+                    let child = read_u64_at(data, field_off)?;
+                    if child == 0 {
+                        return Err(set_error(format!("null reference at `{seg}`")));
+                    }
+                    ord = self.ordinal_of(*tag).ok_or_else(unknown_tag)?;
+                    base = child;
+                }
+                Shape::Embed(tag) => {
+                    ord = self.ordinal_of(*tag).ok_or_else(unknown_tag)?;
+                    base = field_off;
+                }
+                _ => {
+                    return Err(set_error(format!(
+                        "cannot descend through non-block field `{seg}`"
+                    )));
+                }
+            }
+        }
+        unreachable!("the last segment returns inside the loop")
+    }
+
+    /// Read a single field named by `path` into a [`Value`] — a targeted `get`
+    /// (`read_value` scoped to one field). Follows an owning reference into its
+    /// child, exactly as a full read would.
+    pub fn get(
+        &self,
+        data: &BStack,
+        ordinal: RttiOrdinal,
+        block_off: u64,
+        path: &[&str],
+    ) -> io::Result<Value> {
+        let (offset, shape) = self.resolve_field(data, ordinal, block_off, path)?;
+        self.run_read(data, vec![Op::Shape { shape, offset }])
+    }
+
+    /// Overwrite the **POD** or **`ref`** field named by `path` with `value` — the
+    /// interpreted `set_<field>`, one atomic write. The mirror of a POD read, now
+    /// reaching any depth.
+    ///
+    /// Only a POD field (exact-width bytes) or a `ref` field (an 8-byte target
+    /// offset — a non-owning alias) may be `set`; an `owned` / `strong` / `weak`
+    /// field is *replaced*, not overwritten — that is [`swap`](Self::swap). Errors on
+    /// a non-POD/ref target or a wrong-width value.
+    pub fn set(
+        &self,
+        data: &BStack,
+        ordinal: RttiOrdinal,
+        block_off: u64,
+        path: &[&str],
         value: &[u8],
     ) -> io::Result<()> {
-        let ty = self.load_type(ordinal)?;
-        let RttiBody::Struct(fields) = &ty.body else {
-            return Err(set_error(
-                "cannot set a field of an enum (it is whole-value)",
-            ));
-        };
-        let field = fields
-            .iter()
-            .find(|f| f.name == field_name)
-            .ok_or_else(|| set_error(format!("no field named `{field_name}`")))?;
-        let Shape::Pod { width } = field.shape else {
-            return Err(set_error(format!(
-                "field `{field_name}` is not a POD field"
-            )));
-        };
-        if value.len() != width as usize {
-            return Err(set_error(format!(
-                "field `{field_name}` is {width} bytes, got {}",
-                value.len()
-            )));
+        let (offset, shape) = self.resolve_field(data, ordinal, block_off, path)?;
+        match shape {
+            Shape::Pod { width } => {
+                if value.len() != width as usize {
+                    return Err(set_error(format!(
+                        "field is {width} bytes, got {}",
+                        value.len()
+                    )));
+                }
+            }
+            // A `ref` is a bare `u64` target offset (a non-owning alias).
+            Shape::Ref(_) => {
+                if value.len() != 8 {
+                    return Err(set_error(format!(
+                        "a `ref` field is an 8-byte offset, got {}",
+                        value.len()
+                    )));
+                }
+            }
+            _ => {
+                return Err(set_error(
+                    "field is not POD or `ref`; an owning reference is `swap`ped, not set",
+                ));
+            }
         }
-        data.set(block_off + field.offset as u64, value)
+        data.set(offset, value)
+    }
+
+    /// **Swap** the reference field named by `path` to point at `new`, returning the
+    /// previous target as an [`AnyRef`] (`None` if it was null). A pointer exchange:
+    /// the field takes ownership of `new`, and the old reference is handed back for
+    /// the caller to reuse or tear down — no refcount changes (ownership moves, it is
+    /// not duplicated).
+    ///
+    /// `new`'s [`tag`](AnyRef::tag) **must equal the field's declared type** (an
+    /// eightcc mismatch is rejected), and the target must be a data-block reference
+    /// (`owned` / `strong` / `ref`, optionally `Option`-wrapped). A POD field, a
+    /// container, or a `weak` / `foreign` field is rejected.
+    pub fn swap(
+        &self,
+        data: &BStack,
+        ordinal: RttiOrdinal,
+        block_off: u64,
+        path: &[&str],
+        new: AnyRef,
+    ) -> io::Result<Option<AnyRef>> {
+        let (offset, mut shape) = self.resolve_field(data, ordinal, block_off, path)?;
+        // A nullable reference swaps its inner target.
+        if let Shape::Option(inner) = shape {
+            shape = *inner;
+        }
+        let tag = match shape {
+            Shape::Owned(t) | Shape::Strong(t) | Shape::Ref(t) => t,
+            Shape::Weak(_) | Shape::Foreign(_) => {
+                return Err(swap_error(
+                    "swapping a `weak` / `foreign` reference is not yet supported",
+                ));
+            }
+            _ => return Err(swap_error("field is not a swappable reference")),
+        };
+        if new.tag() != tag {
+            return Err(swap_error(
+                "eightcc mismatch: `new` is not the field's type",
+            ));
+        }
+        let old = read_u64_at(data, offset)?;
+        data.set(offset, new.offset().to_le_bytes())?;
+        Ok((old != 0).then(|| AnyRef::new(tag, old)))
     }
 
     /// Deep-clone the structure of type `ordinal` at `src_off` in `alloc`'s file,
@@ -1919,6 +2084,13 @@ fn set_error(msg: impl std::fmt::Display) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
         format!("[BSTACK080D] RTTI set: {msg}"),
+    )
+}
+
+fn swap_error(msg: impl std::fmt::Display) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("[BSTACK0810] RTTI swap: {msg}"),
     )
 }
 

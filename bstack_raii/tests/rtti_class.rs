@@ -8,7 +8,9 @@
 
 use bstack::{BStack, BStackAllocator, FirstFitBStackAllocator};
 use bstack_raii::rtti::{self, AnyRef, RttiBody, Shape, Value};
-use bstack_raii::{BStackBlock, BStackCast, BStackDrop, BStackOwned, ForeignRepr, bstack_class};
+use bstack_raii::{
+    BStackBlock, BStackCast, BStackDrop, BStackOwned, ForeignRepr, bstack_class, rtti_path,
+};
 
 #[bstack_class]
 struct Point {
@@ -597,15 +599,15 @@ fn interpret_set_pod_field() {
     let off = BStackBlock::range(p.handle()).start();
 
     // Overwrite `x`; `y` is untouched.
-    reg.set_pod(alloc.stack(), ord, "x", off, &42u32.to_le_bytes())
+    reg.set(alloc.stack(), ord, off, &["x"], &42u32.to_le_bytes())
         .unwrap();
     assert_eq!(p.handle().get_x(alloc.stack()).unwrap(), 42);
     assert_eq!(p.handle().get_y(alloc.stack()).unwrap(), 9);
 
     // Wrong width and unknown field are rejected.
-    assert!(reg.set_pod(alloc.stack(), ord, "x", off, &[1, 2]).is_err());
+    assert!(reg.set(alloc.stack(), ord, off, &["x"], &[1, 2]).is_err());
     assert!(
-        reg.set_pod(alloc.stack(), ord, "z", off, &0u32.to_le_bytes())
+        reg.set(alloc.stack(), ord, off, &["z"], &0u32.to_le_bytes())
             .is_err()
     );
 
@@ -633,7 +635,7 @@ fn interpret_clone_equal_and_independent() {
     assert_eq!(reg.read_value(alloc.stack(), ord, dst).unwrap(), src_val);
 
     // The owned child was deep-copied: mutating the source leaves the clone intact.
-    reg.set_pod(alloc.stack(), ord, "n", src, &99u32.to_le_bytes())
+    reg.set(alloc.stack(), ord, src, &["n"], &99u32.to_le_bytes())
         .unwrap();
     assert_eq!(reg.read_value(alloc.stack(), ord, dst).unwrap(), src_val);
     assert_ne!(reg.read_value(alloc.stack(), ord, src).unwrap(), src_val);
@@ -755,4 +757,135 @@ fn any_ref_downcast_and_generic_fallback() {
     drop(reg);
     std::fs::remove_file(&schema).ok();
     std::fs::remove_file(&dpath).ok();
+}
+
+#[test]
+fn interpret_path_get_and_set_nested() {
+    let schema = temp_path("path_schema");
+    let reg = rtti::sync(&schema).unwrap();
+    let (alloc, dpath) = data_alloc("path_data");
+    let ord = reg.ordinal_of(<Wrap as BStackCast>::eightcc()).unwrap();
+
+    let w = Wrap::new(&alloc, Point::new(&alloc, 1, 2).unwrap(), 5).unwrap();
+    let off = BStackBlock::range(w.handle()).start();
+
+    // Navigate through the owned child with the path macro: `inner.x`, and read
+    // `inner` as a whole block.
+    assert_eq!(
+        reg.get(alloc.stack(), ord, off, rtti_path!(inner.x))
+            .unwrap(),
+        pod(&1u32.to_le_bytes())
+    );
+    let Value::Block { tag, .. } = reg.get(alloc.stack(), ord, off, rtti_path!(inner)).unwrap()
+    else {
+        panic!("inner should be a block");
+    };
+    assert_eq!(tag, <Point as BStackCast>::eightcc());
+
+    // Set a nested POD field, then a top-level one.
+    reg.set(
+        alloc.stack(),
+        ord,
+        off,
+        rtti_path!(inner.x),
+        &42u32.to_le_bytes(),
+    )
+    .unwrap();
+    assert_eq!(
+        reg.get(alloc.stack(), ord, off, rtti_path!(inner.x))
+            .unwrap(),
+        pod(&42u32.to_le_bytes())
+    );
+    reg.set(alloc.stack(), ord, off, rtti_path!(n), &7u32.to_le_bytes())
+        .unwrap();
+    assert_eq!(
+        reg.get(alloc.stack(), ord, off, rtti_path!(n)).unwrap(),
+        pod(&7u32.to_le_bytes())
+    );
+
+    // Cannot descend through a POD leaf, and cannot `set` an owning reference.
+    assert!(reg.get(alloc.stack(), ord, off, rtti_path!(n.x)).is_err());
+    assert!(
+        reg.set(alloc.stack(), ord, off, rtti_path!(inner), &[0u8; 8])
+            .is_err()
+    );
+
+    reg.teardown(&alloc, ord, off).unwrap();
+    drop(reg);
+    std::fs::remove_file(&schema).ok();
+    std::fs::remove_file(&dpath).ok();
+}
+
+#[test]
+fn interpret_swap_reference() {
+    let schema = temp_path("swap_schema");
+    let reg = rtti::sync(&schema).unwrap();
+    let (alloc, dpath) = data_alloc("swap_data");
+    let ord = reg.ordinal_of(<Wrap as BStackCast>::eightcc()).unwrap();
+    let pord = reg.ordinal_of(<Point as BStackCast>::eightcc()).unwrap();
+    let point_tag = <Point as BStackCast>::eightcc();
+
+    let w = Wrap::new(&alloc, Point::new(&alloc, 1, 2).unwrap(), 5).unwrap();
+    let off = BStackBlock::range(w.handle()).start();
+
+    // A fresh Point to install; swapping hands back the old one.
+    let np = Point::new(&alloc, 8, 9).unwrap();
+    let np_off = BStackBlock::range(np.handle()).start();
+    let old = reg
+        .swap(
+            alloc.stack(),
+            ord,
+            off,
+            &["inner"],
+            AnyRef::new(point_tag, np_off),
+        )
+        .unwrap()
+        .expect("field was non-null");
+    assert_eq!(old.tag(), point_tag);
+
+    // `inner` now reads as the installed Point.
+    assert_eq!(
+        reg.get(alloc.stack(), ord, off, &["inner", "x"]).unwrap(),
+        pod(&8u32.to_le_bytes())
+    );
+
+    // Rejections: wrong eightcc, and a POD target.
+    let wrap_tag = <Wrap as BStackCast>::eightcc();
+    assert!(
+        reg.swap(
+            alloc.stack(),
+            ord,
+            off,
+            &["inner"],
+            AnyRef::new(wrap_tag, off)
+        )
+        .is_err()
+    );
+    assert!(
+        reg.swap(
+            alloc.stack(),
+            ord,
+            off,
+            &["n"],
+            AnyRef::new(point_tag, np_off)
+        )
+        .is_err()
+    );
+
+    // The old target and the wrap (now owning the new target) both reclaim cleanly.
+    reg.teardown(&alloc, pord, old.offset()).unwrap();
+    reg.teardown(&alloc, ord, off).unwrap();
+    drop(reg);
+    std::fs::remove_file(&schema).ok();
+    std::fs::remove_file(&dpath).ok();
+}
+
+#[test]
+fn rtti_path_macro_expands() {
+    let two: &[&str] = rtti_path!(inner.x);
+    assert_eq!(two, &["inner", "x"]);
+    let one: &[&str] = rtti_path!(n);
+    assert_eq!(one, &["n"]);
+    let deep: &[&str] = rtti_path!(a.b.c.d);
+    assert_eq!(deep, &["a", "b", "c", "d"]);
 }

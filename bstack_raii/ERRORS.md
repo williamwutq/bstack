@@ -398,12 +398,22 @@ teardown yet. **Fix:** tear a structure with `foreign` fields down through its
 compiled-in handle for now. (In-file `owned` / `embed` / `strong` / `weak` / `ref` /
 `vec` / array / tuple / `option` are all handled.)
 
-### BSTACK080D — invalid RTTI `set_pod` target
-`set_pod` was given a field that is not a writable top-level POD field: the type is
-an enum (whole-value, no per-field set), the field name is unknown, the field is not
-POD (an owning / reference field is replaced, not overwritten), or the value's byte
-length does not match the field width. **Fix:** name a POD field of the struct and
-pass exactly its width in bytes.
+### BSTACK080D — invalid RTTI `get` / `set` field path
+A `get` / `set` field path could not be resolved or written: the path is empty, a
+segment names no field (or no variant matches the discriminant), the path tries to
+descend *through* a non-block leaf (POD / vec / array / tuple / weak), a reference on
+the path is null, or — for `set` — the target is not POD or `ref`, or the value is
+the wrong width (a POD field takes its exact width; a `ref` takes an 8-byte offset).
+**Fix:** name a valid path whose interior segments are `owned` / `strong` / `ref` /
+`embed` references; `set` only a POD or `ref` leaf (`swap` an owning reference).
+
+### BSTACK0810 — invalid RTTI `swap`
+A `swap` target is not a swappable reference, or the replacement does not match: the
+field is POD / a container (only `owned` / `strong` / `ref`, optionally
+`Option`-wrapped, may be swapped), it is a `weak` / `foreign` reference (not yet
+supported), or `new`'s eightcc does not equal the field's declared type. **Fix:**
+`swap` an owning data-reference field with an `AnyRef` of the *same* type; use `set`
+for a POD/`ref` field.
 
 ### BSTACK080E — RTTI clone internal invariant
 A clone finished the walk but a child block (or the root) was not recorded in the
