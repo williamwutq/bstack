@@ -33,9 +33,12 @@
 //!
 //! Read + write of struct and enum records is in place; the on-disk RTTI-typed
 //! pointer is the existing [`ForeignRepr`] (its `type_index` is the ordinal `+ 1`).
-//! Compiled-in types register their descriptor builder into [`RTTI_TYPES`] at link
-//! time, and [`sync`] appends every missing schema to a file. The `#[bstack_class]`
-//! emitter (which fills [`RTTI_TYPES`]) and the interpreter itself are still TODO.
+//! The `#[bstack_class]` macro fills [`RTTI_TYPES`] at link time, and [`sync`]
+//! appends every missing schema to a file. [`RttiRegistry::read_value`] /
+//! [`RttiRegistry::read_ptr`] are the non-recursive **read interpreter** — they walk
+//! the schema over a live data file into a [`Value`] tree with no compiled-in types.
+//! Still TODO: the *mutating* interpreter (set / teardown / clone) and live
+//! mutable-class-variable writes.
 
 use std::collections::HashMap;
 use std::io;
@@ -754,6 +757,411 @@ impl RttiRegistry {
             .get_into(rec.offset + RECORD_HEADER_LEN, &mut body)?;
         decode_type(rec.tag, &body)
     }
+}
+
+// -- The read interpreter --------------------------------------------------
+
+/// A structured value read out of a data file **with no compiled-in Rust type** —
+/// the interpreter's output. Mirrors the [`Shape`] grammar. A reader (debugger,
+/// generic serializer, repair tool) matches on this instead of a concrete type.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Value {
+    /// Raw POD bytes (a leaf): the on-disk little-endian bytes, undecoded.
+    Pod(Box<[u8]>),
+    /// A followed child block (`owned` / `strong` / `embed`): its tag and named
+    /// fields, in declaration order.
+    Block {
+        tag: EightCC,
+        fields: Box<[(String, Value)]>,
+    },
+    /// A followed enum block: its tag, the active variant's name, and that variant's
+    /// named fields.
+    Enum {
+        tag: EightCC,
+        variant: String,
+        fields: Box<[(String, Value)]>,
+    },
+    /// A reference that is **not** followed (`weak` / `ref` / cross-file `foreign`):
+    /// the target's tag and the raw stored offset (`0` == null).
+    Ref { tag: EightCC, offset: u64 },
+    /// An absent nullable (`Option` niche `0`, or an empty/absent vector slot).
+    Null,
+    /// A present `Option`, wrapping its inner value.
+    Some(Box<Value>),
+    /// A fixed `[T; N]` array of elements.
+    Array(Box<[Value]>),
+    /// A dynamic `Vec<T>` / `String` of elements.
+    Vec(Box<[Value]>),
+    /// A tuple of elements.
+    Tuple(Box<[Value]>),
+    /// A class variable's value bytes (read from the **schema** record, not an
+    /// instance — a class variable is not per-instance).
+    Class(Box<[u8]>),
+}
+
+/// One step of the non-recursive walk. The interpreter runs a `work` stack of these
+/// against a `results` value stack: leaf steps push a [`Value`]; an `Assemble*` step
+/// pops the `n` values its children pushed and combines them into one.
+enum Op {
+    /// Read the block of type `ord` at `block_off` (its whole `OnDisk`, header + fields).
+    Block {
+        ord: RttiOrdinal,
+        block_off: u64,
+    },
+    /// Interpret one shape at an absolute data offset.
+    Shape {
+        shape: Shape,
+        offset: u64,
+    },
+    /// Pop `n` field values (child-first order) and assemble a struct block.
+    MakeBlock {
+        tag: EightCC,
+        names: Vec<String>,
+    },
+    /// Pop `n` field values and assemble an enum block.
+    MakeEnum {
+        tag: EightCC,
+        variant: String,
+        names: Vec<String>,
+    },
+    /// Pop `n` values into an array / vec / tuple.
+    MakeArray(usize),
+    MakeVec(usize),
+    MakeTuple(usize),
+    /// Pop one value and wrap it in `Some`.
+    MakeSome,
+}
+
+/// Bytes of a `VecDesc` (`data_off:u64` @0, `data_size:u64` @8) — the inline
+/// descriptor of a persistent vector.
+const VECDESC_LEN: u64 = 16;
+/// A byte-vec data block's header (`len:u64` @0, `cap:u64` @8, elements from 16).
+const BYTEVEC_HEADER: u64 = 16;
+/// Bytes of a `ForeignRepr` on the wire.
+const FOREIGN_REPR_LEN: u64 = 16;
+
+fn read_u64_at(data: &BStack, off: u64) -> io::Result<u64> {
+    let mut b = [0u8; 8];
+    data.get_into(off, &mut b)?;
+    Ok(u64::from_le_bytes(b))
+}
+
+impl RttiRegistry {
+    /// Read a structure of type `ordinal` at `block_off` in `data` into a [`Value`]
+    /// tree — the core RTTI operation: interpret an on-disk structure with no
+    /// compiled-in Rust type.
+    ///
+    /// The walk is **non-recursive** (an explicit `work` stack), so arbitrarily deep
+    /// or self-referential data cannot blow the call stack. It **follows** owning
+    /// edges (`owned` / `strong` / `embed`) into child blocks, and **stops** at
+    /// non-owning ones (`weak` / `ref` / `foreign`), recording just their offset —
+    /// which also breaks any reference cycle. A node budget guards against a corrupt
+    /// file describing an unterminated walk.
+    pub fn read_value(
+        &self,
+        data: &BStack,
+        ordinal: RttiOrdinal,
+        block_off: u64,
+    ) -> io::Result<Value> {
+        let mut cache: HashMap<RttiOrdinal, RttiType> = HashMap::new();
+        let mut work: Vec<Op> = vec![Op::Block {
+            ord: ordinal,
+            block_off,
+        }];
+        let mut results: Vec<Value> = Vec::new();
+        // Bounds the total nodes visited: a corrupt schema/data pair (or a strong
+        // cycle) can otherwise loop forever.
+        let mut budget: u64 = 4_000_000;
+
+        while let Some(op) = work.pop() {
+            budget = budget.checked_sub(1).ok_or_else(|| {
+                corrupt("[BSTACK0807] RTTI interpret budget exceeded (corrupt data or a cycle?)")
+            })?;
+            match op {
+                Op::Block { ord, block_off } => {
+                    if let std::collections::hash_map::Entry::Vacant(e) = cache.entry(ord) {
+                        e.insert(self.load_type(ord)?);
+                    }
+                    let ty = &cache[&ord];
+                    match &ty.body {
+                        RttiBody::Struct(fields) => {
+                            let names = fields.iter().map(|f| f.name.clone()).collect();
+                            // Assemble marker first (popped last), then fields in
+                            // order (so they pop child-first into the marker).
+                            let field_ops: Vec<Op> = fields
+                                .iter()
+                                .map(|f| Op::Shape {
+                                    shape: f.shape.clone(),
+                                    offset: block_off + f.offset as u64,
+                                })
+                                .collect();
+                            work.push(Op::MakeBlock { tag: ty.tag, names });
+                            work.extend(field_ops);
+                        }
+                        RttiBody::Enum(e) => {
+                            let raw = read_disc(data, block_off + e.disc_off as u64, e.disc_width)?;
+                            let mask = disc_mask(e.disc_width);
+                            let variant = e
+                                .variants
+                                .iter()
+                                .find(|v| (v.disc_value as u64) & mask == raw)
+                                .ok_or_else(|| {
+                                    corrupt(format!(
+                                        "[BSTACK0808] no RTTI variant for discriminant {raw}"
+                                    ))
+                                })?;
+                            let names = variant.fields.iter().map(|f| f.name.clone()).collect();
+                            let payload_base = block_off + e.payload_off as u64;
+                            let field_ops: Vec<Op> = variant
+                                .fields
+                                .iter()
+                                .map(|f| Op::Shape {
+                                    shape: f.shape.clone(),
+                                    offset: payload_base + f.offset as u64,
+                                })
+                                .collect();
+                            work.push(Op::MakeEnum {
+                                tag: ty.tag,
+                                variant: variant.name.clone(),
+                                names,
+                            });
+                            work.extend(field_ops);
+                        }
+                    }
+                }
+
+                Op::Shape { shape, offset } => match shape {
+                    Shape::Pod { width } => {
+                        let mut buf = vec![0u8; width as usize];
+                        data.get_into(offset, &mut buf)?;
+                        results.push(Value::Pod(buf.into()));
+                    }
+                    Shape::Class { value, .. } => {
+                        // A class variable's value is schema-side, not per-instance.
+                        results.push(Value::Class(value.into()));
+                    }
+                    Shape::Owned(tag) | Shape::Strong(tag) => {
+                        let child = read_u64_at(data, offset)?;
+                        if child == 0 {
+                            results.push(Value::Null);
+                        } else {
+                            let ord = self.ordinal_of(tag).ok_or_else(unknown_tag)?;
+                            work.push(Op::Block {
+                                ord,
+                                block_off: child,
+                            });
+                        }
+                    }
+                    Shape::Embed(tag) => {
+                        // The child's whole OnDisk is inline at this slot (no pointer).
+                        let ord = self.ordinal_of(tag).ok_or_else(unknown_tag)?;
+                        work.push(Op::Block {
+                            ord,
+                            block_off: offset,
+                        });
+                    }
+                    Shape::Weak(tag) | Shape::Ref(tag) => {
+                        results.push(Value::Ref {
+                            tag,
+                            offset: read_u64_at(data, offset)?,
+                        });
+                    }
+                    Shape::Foreign(tag) => {
+                        // ForeignRepr { file_id:u32, type_index:u32, offset:u64 } — the
+                        // address is the trailing u64; cross-file targets are not
+                        // followed here.
+                        let off = read_u64_at(data, offset + (FOREIGN_REPR_LEN - 8))?;
+                        results.push(Value::Ref { tag, offset: off });
+                    }
+                    Shape::Option(inner) => {
+                        // The niche: a `0` in the leading u64 of the slot is `None`.
+                        if read_u64_at(data, offset)? == 0 {
+                            results.push(Value::Null);
+                        } else {
+                            work.push(Op::MakeSome);
+                            work.push(Op::Shape {
+                                shape: *inner,
+                                offset,
+                            });
+                        }
+                    }
+                    Shape::Array { n, inner } => {
+                        let stride = self.shape_stride(&inner, &mut cache)?;
+                        let elem_ops: Vec<Op> = (0..n as u64)
+                            .map(|i| Op::Shape {
+                                shape: (*inner).clone(),
+                                offset: offset + i * stride,
+                            })
+                            .collect();
+                        work.push(Op::MakeArray(n as usize));
+                        work.extend(elem_ops);
+                    }
+                    Shape::Vec(inner) => {
+                        let data_off = read_u64_at(data, offset)?; // VecDesc.data_off @0
+                        if data_off == 0 {
+                            results.push(Value::Vec(Box::default()));
+                        } else {
+                            let len = read_u64_at(data, data_off)?; // element count @0
+                            let base = data_off + BYTEVEC_HEADER;
+                            let stride = self.shape_stride(&inner, &mut cache)?;
+                            let elem_ops: Vec<Op> = (0..len)
+                                .map(|i| Op::Shape {
+                                    shape: (*inner).clone(),
+                                    offset: base + i * stride,
+                                })
+                                .collect();
+                            work.push(Op::MakeVec(len as usize));
+                            work.extend(elem_ops);
+                        }
+                    }
+                    Shape::Tuple(items) => {
+                        let mut elem_ops: Vec<Op> = Vec::with_capacity(items.len());
+                        let mut off = offset;
+                        for it in &items {
+                            elem_ops.push(Op::Shape {
+                                shape: it.clone(),
+                                offset: off,
+                            });
+                            off += self.shape_stride(it, &mut cache)?;
+                        }
+                        work.push(Op::MakeTuple(items.len()));
+                        work.extend(elem_ops);
+                    }
+                },
+
+                Op::MakeBlock { tag, names } => {
+                    let fields = pop_named(&mut results, &names)?;
+                    results.push(Value::Block {
+                        tag,
+                        fields: fields.into(),
+                    });
+                }
+                Op::MakeEnum {
+                    tag,
+                    variant,
+                    names,
+                } => {
+                    let fields = pop_named(&mut results, &names)?;
+                    results.push(Value::Enum {
+                        tag,
+                        variant,
+                        fields: fields.into(),
+                    });
+                }
+                Op::MakeArray(n) => {
+                    let v = pop_n(&mut results, n)?;
+                    results.push(Value::Array(v.into()));
+                }
+                Op::MakeVec(n) => {
+                    let v = pop_n(&mut results, n)?;
+                    results.push(Value::Vec(v.into()));
+                }
+                Op::MakeTuple(n) => {
+                    let v = pop_n(&mut results, n)?;
+                    results.push(Value::Tuple(v.into()));
+                }
+                Op::MakeSome => {
+                    let inner = results
+                        .pop()
+                        .ok_or_else(|| corrupt("[BSTACK0809] RTTI interpret stack underflow"))?;
+                    results.push(Value::Some(Box::new(inner)));
+                }
+            }
+        }
+
+        match results.len() {
+            1 => Ok(results.pop().unwrap()),
+            n => Err(corrupt(format!(
+                "[BSTACK0809] RTTI interpret produced {n} values (expected 1)"
+            ))),
+        }
+    }
+
+    /// Read the structure a typed [`ForeignRepr`] points at, within `data`. The
+    /// pointer must be **typed** (carry an RTTI ordinal) and refer to the current
+    /// file (`file_id == 0`); cross-file resolution is a later phase.
+    pub fn read_ptr(&self, data: &BStack, ptr: ForeignRepr) -> io::Result<Value> {
+        let ord = self.resolve_ptr(ptr).ok_or_else(|| {
+            corrupt("[BSTACK080A] cannot read an untyped / out-of-range RTTI pointer")
+        })?;
+        self.read_value(data, ord, ptr.offset())
+    }
+
+    /// The on-disk byte width of one element of `shape` — the stride for array / vec /
+    /// tuple element addressing. References are a `u64` offset; a foreign is a
+    /// `ForeignRepr`; an embedded child is its whole block; a vector is its inline
+    /// `VecDesc`.
+    fn shape_stride(
+        &self,
+        shape: &Shape,
+        cache: &mut HashMap<RttiOrdinal, RttiType>,
+    ) -> io::Result<u64> {
+        Ok(match shape {
+            Shape::Pod { width } => *width as u64,
+            Shape::Owned(_) | Shape::Strong(_) | Shape::Weak(_) | Shape::Ref(_) => 8,
+            Shape::Foreign(_) => FOREIGN_REPR_LEN,
+            Shape::Vec(_) => VECDESC_LEN,
+            Shape::Option(inner) => self.shape_stride(inner, cache)?,
+            Shape::Array { n, inner } => *n as u64 * self.shape_stride(inner, cache)?,
+            Shape::Tuple(items) => {
+                let mut sum = 0u64;
+                for it in items {
+                    sum += self.shape_stride(it, cache)?;
+                }
+                sum
+            }
+            Shape::Embed(tag) => {
+                let ord = self.ordinal_of(*tag).ok_or_else(unknown_tag)?;
+                if let std::collections::hash_map::Entry::Vacant(e) = cache.entry(ord) {
+                    e.insert(self.load_type(ord)?);
+                }
+                cache[&ord].ondisk_size
+            }
+            // A class variable is not part of the instance layout.
+            Shape::Class { .. } => 0,
+        })
+    }
+}
+
+fn unknown_tag() -> io::Error {
+    corrupt("[BSTACK080B] RTTI pointer/field references an unregistered type tag")
+}
+
+/// The low-`width`-byte mask for comparing a stored discriminant against a variant's
+/// (sign-extended) value.
+fn disc_mask(width: u8) -> u64 {
+    if width >= 8 {
+        u64::MAX
+    } else {
+        (1u64 << (width * 8)) - 1
+    }
+}
+
+/// Read a `width`-byte discriminant at `off`, zero-extended to `u64`.
+fn read_disc(data: &BStack, off: u64, width: u8) -> io::Result<u64> {
+    let mut b = [0u8; 8];
+    let w = width as usize;
+    data.get_into(off, &mut b[..w])?;
+    Ok(u64::from_le_bytes(b))
+}
+
+/// Pop the `n` values a container's children pushed, restoring declaration order.
+/// Children are pushed onto `work` in forward order, so they execute (and land on
+/// `results`) in reverse — this hands back `[c0, c1, …]`.
+fn pop_n(results: &mut Vec<Value>, n: usize) -> io::Result<Vec<Value>> {
+    let start = results
+        .len()
+        .checked_sub(n)
+        .ok_or_else(|| corrupt("[BSTACK0809] RTTI interpret stack underflow"))?;
+    let mut v = results.split_off(start);
+    v.reverse();
+    Ok(v)
+}
+
+/// Pop `names.len()` values and pair them with the field names, in order.
+fn pop_named(results: &mut Vec<Value>, names: &[String]) -> io::Result<Vec<(String, Value)>> {
+    let vals = pop_n(results, names.len())?;
+    Ok(names.iter().cloned().zip(vals).collect())
 }
 
 #[cfg(test)]

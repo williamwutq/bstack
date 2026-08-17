@@ -7,8 +7,8 @@
 #![allow(dead_code)] // some fixtures are inspected only via RTTI, never instantiated
 
 use bstack::{BStack, BStackAllocator, FirstFitBStackAllocator};
-use bstack_raii::rtti::{self, RttiBody, Shape};
-use bstack_raii::{BStackCast, BStackDrop, BStackOwned, bstack_class};
+use bstack_raii::rtti::{self, RttiBody, Shape, Value};
+use bstack_raii::{BStackBlock, BStackCast, BStackDrop, BStackOwned, bstack_class};
 
 #[bstack_class]
 struct Point {
@@ -34,6 +34,21 @@ enum Kind2 {
     Pair(u32, u16),
     #[bstack_owned]
     Owns(Point),
+}
+
+#[bstack_class]
+struct Wrap {
+    #[bstack_owned]
+    inner: Point,
+    n: u32,
+}
+
+#[bstack_class]
+struct VecArr {
+    labels: Vec<u8>,
+    coords: [u32; 3],
+    #[bstack_owned]
+    maybe: Option<Point>,
 }
 
 #[bstack_class]
@@ -213,4 +228,165 @@ fn bstack_class_static_class_variables() {
 
     drop(reg);
     std::fs::remove_file(&path).ok();
+}
+
+/// A `Value::Pod` from raw bytes.
+fn pod(bytes: &[u8]) -> Value {
+    Value::Pod(bytes.into())
+}
+
+/// A fresh data-file allocator (separate from the schema file).
+fn data_alloc(tag: &str) -> (FirstFitBStackAllocator, std::path::PathBuf) {
+    let path = temp_path(tag);
+    let alloc = FirstFitBStackAllocator::new(BStack::open(&path).unwrap()).unwrap();
+    (alloc, path)
+}
+
+#[test]
+fn interpret_reads_pod_struct() {
+    let schema = temp_path("read1_schema");
+    let reg = rtti::sync(&schema).unwrap();
+    let (alloc, dpath) = data_alloc("read1_data");
+
+    let p = Point::new(&alloc, 7, 9).unwrap();
+    let off = BStackBlock::range(p.handle()).start();
+    let ord = reg.ordinal_of(<Point as BStackCast>::eightcc()).unwrap();
+
+    let Value::Block { tag, fields } = reg.read_value(alloc.stack(), ord, off).unwrap() else {
+        panic!("expected a block");
+    };
+    assert_eq!(tag, <Point as BStackCast>::eightcc());
+    assert_eq!(fields.len(), 2);
+    assert_eq!(fields[0].0, "x");
+    assert_eq!(fields[0].1, pod(&7u32.to_le_bytes()));
+    assert_eq!(fields[1].0, "y");
+    assert_eq!(fields[1].1, pod(&9u32.to_le_bytes()));
+
+    p.bstack_drop(&alloc).unwrap();
+    drop(reg);
+    std::fs::remove_file(&schema).ok();
+    std::fs::remove_file(&dpath).ok();
+}
+
+#[test]
+fn interpret_reads_nested_and_via_pointer() {
+    let schema = temp_path("read2_schema");
+    let reg = rtti::sync(&schema).unwrap();
+    let (alloc, dpath) = data_alloc("read2_data");
+
+    let inner = Point::new(&alloc, 1, 2).unwrap();
+    let w = Wrap::new(&alloc, inner, 5).unwrap();
+    let off = BStackBlock::range(w.handle()).start();
+    let ord = reg.ordinal_of(<Wrap as BStackCast>::eightcc()).unwrap();
+
+    // Direct read: the owned child is *followed* into a nested block.
+    let v = reg.read_value(alloc.stack(), ord, off).unwrap();
+    let Value::Block { fields, .. } = &v else {
+        panic!("expected a block");
+    };
+    assert_eq!(fields[0].0, "inner");
+    let Value::Block {
+        fields: inner_fields,
+        ..
+    } = &fields[0].1
+    else {
+        panic!("owned child should be a followed block");
+    };
+    assert_eq!(inner_fields[0].1, pod(&1u32.to_le_bytes()));
+    assert_eq!(inner_fields[1].1, pod(&2u32.to_le_bytes()));
+    assert_eq!(fields[1].1, pod(&5u32.to_le_bytes()));
+
+    // The same read through a typed pointer (ordinal recovered from the pointer).
+    let ptr = rtti::typed_ptr(0, off, ord);
+    assert_eq!(&reg.read_ptr(alloc.stack(), ptr).unwrap(), &v);
+
+    w.bstack_drop(&alloc).unwrap();
+    drop(reg);
+    std::fs::remove_file(&schema).ok();
+    std::fs::remove_file(&dpath).ok();
+}
+
+#[test]
+fn interpret_reads_enum_variant() {
+    let schema = temp_path("read3_schema");
+    let reg = rtti::sync(&schema).unwrap();
+    let (alloc, dpath) = data_alloc("read3_data");
+
+    let k = Kind2::new(&alloc, Kind2Data::Pair(3, 4)).unwrap();
+    let off = BStackBlock::range(k.handle()).start();
+    let ord = reg.ordinal_of(<Kind2 as BStackCast>::eightcc()).unwrap();
+
+    let Value::Enum {
+        variant, fields, ..
+    } = reg.read_value(alloc.stack(), ord, off).unwrap()
+    else {
+        panic!("expected an enum");
+    };
+    assert_eq!(variant, "Pair");
+    assert_eq!(fields.len(), 2);
+    assert_eq!(fields[0].1, pod(&3u32.to_le_bytes()));
+    assert_eq!(fields[1].1, pod(&4u16.to_le_bytes()));
+
+    k.bstack_drop(&alloc).unwrap();
+    drop(reg);
+    std::fs::remove_file(&schema).ok();
+    std::fs::remove_file(&dpath).ok();
+}
+
+#[test]
+fn interpret_reads_vec_array_and_option() {
+    let schema = temp_path("read4_schema");
+    let reg = rtti::sync(&schema).unwrap();
+    let (alloc, dpath) = data_alloc("read4_data");
+
+    let v = VecArr::new(
+        &alloc,
+        &[10, 20],
+        [1, 2, 3],
+        Some(Point::new(&alloc, 8, 9).unwrap()),
+    )
+    .unwrap();
+    let off = BStackBlock::range(v.handle()).start();
+    let ord = reg.ordinal_of(<VecArr as BStackCast>::eightcc()).unwrap();
+
+    let Value::Block { fields, .. } = reg.read_value(alloc.stack(), ord, off).unwrap() else {
+        panic!("expected a block");
+    };
+
+    // Vec<u8> → a vector of 1-byte pod leaves.
+    assert_eq!(fields[0].0, "labels");
+    assert_eq!(fields[0].1, Value::Vec(vec![pod(&[10]), pod(&[20])].into()));
+
+    // [u32; 3] → a fixed array of 4-byte pod leaves.
+    assert_eq!(fields[1].0, "coords");
+    assert_eq!(
+        fields[1].1,
+        Value::Array(
+            vec![
+                pod(&1u32.to_le_bytes()),
+                pod(&2u32.to_le_bytes()),
+                pod(&3u32.to_le_bytes()),
+            ]
+            .into()
+        )
+    );
+
+    // Option<owned Point> present → Some(followed block).
+    assert_eq!(fields[2].0, "maybe");
+    let Value::Some(boxed) = &fields[2].1 else {
+        panic!("expected Some");
+    };
+    let Value::Block {
+        fields: pt_fields, ..
+    } = boxed.as_ref()
+    else {
+        panic!("expected a followed Point block");
+    };
+    assert_eq!(pt_fields[0].1, pod(&8u32.to_le_bytes()));
+    assert_eq!(pt_fields[1].1, pod(&9u32.to_le_bytes()));
+
+    v.bstack_drop(&alloc).unwrap();
+    drop(reg);
+    std::fs::remove_file(&schema).ok();
+    std::fs::remove_file(&dpath).ok();
 }

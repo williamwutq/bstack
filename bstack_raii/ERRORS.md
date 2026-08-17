@@ -363,3 +363,30 @@ compiled-in type and one already on disk. Unlike the static macro path (where a
 collision is a mere failed check), here the tag *is* the identity, so this is a hard
 error rather than silent overwrite. **Fix:** rename one of the colliding types, or
 give it an explicit distinct `tag = "..."`.
+
+### BSTACK0807 — RTTI interpret budget exceeded
+The read interpreter visited more nodes than its budget while walking a structure —
+almost always a **strong-reference cycle** or a corrupt file describing an
+unterminated walk. **Fix:** verify the data file is intact and the schema matches the
+file that wrote it; a genuine cycle should be modelled with `weak` / `ref` edges
+(which the interpreter does not follow).
+
+### BSTACK0808 — no RTTI variant for discriminant
+An enum block's stored discriminant matches no variant in its schema. **Fix:** the
+data and schema disagree (mismatched versions) or the file is corrupt — re-`sync` the
+schema from the code that wrote the data.
+
+### BSTACK0809 — RTTI interpret stack underflow
+Internal invariant: assembling a value found fewer results than expected. This only
+occurs on a corrupt schema (e.g. a field count that disagrees with the field list).
+**Fix:** regenerate the schema file.
+
+### BSTACK080A — untyped or out-of-range RTTI pointer
+`read_ptr` was given a pointer with no RTTI type index (`type_index == 0`) or one out
+of range for this schema stack. **Fix:** read with `read_value` and an explicit
+ordinal, or `sync` the schema so the pointer's type is present.
+
+### BSTACK080B — RTTI field references an unregistered type
+A followed field (`owned` / `strong` / `embed`) names a target eightcc that is not in
+this RTTI stack. **Fix:** `sync` the producer's full compiled-in schema so every
+referenced type is appended before reading.
