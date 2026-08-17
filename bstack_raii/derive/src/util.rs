@@ -942,6 +942,15 @@ pub(crate) fn is_bstack_static(attrs: &[syn::Attribute]) -> bool {
         .any(|id| id == "bstack_static")
 }
 
+/// The initial-value expression of a `#[bstack_static(EXPR)]` class variable, if the
+/// field carries one. `Some(Err(..))` for a malformed / value-less `#[bstack_static]`.
+pub(crate) fn bstack_static_expr(attrs: &[syn::Attribute]) -> Option<syn::Result<syn::Expr>> {
+    attrs
+        .iter()
+        .find(|a| a.path().is_ident("bstack_static"))
+        .map(|a| a.parse_args::<syn::Expr>())
+}
+
 // ===========================================================================
 // #[bstack_enum] — a tagged union block
 // ===========================================================================

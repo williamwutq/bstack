@@ -10,11 +10,15 @@ use syn::{Error, Ident, Token, Variant, Visibility};
 
 use crate::util::{infer_disc_ty, int_bounds, parse_disc_expr};
 
-/// The enum's on-disk discriminant: its integer type (tokens) and the typed literal
-/// pattern for each variant (e.g. `300u16`), in declaration order.
+/// The enum's on-disk discriminant: its integer type (tokens), the typed literal
+/// pattern for each variant (e.g. `300u16`), and the raw discriminant values, all in
+/// declaration order.
 pub(crate) struct Discriminants {
     pub ty: TokenStream,
     pub pats: Vec<TokenStream>,
+    /// Raw resolved discriminant values (explicit `= N`, else previous + 1), used by
+    /// `#[bstack_class]` to record each variant's discriminant in its RTTI schema.
+    pub values: Vec<i128>,
 }
 
 /// Assign each variant its discriminant (explicit `= N`, else previous + 1),
@@ -76,7 +80,11 @@ pub(crate) fn discriminants(
                 .expect("valid integer literal")
         })
         .collect();
-    Ok(Discriminants { ty, pats })
+    Ok(Discriminants {
+        ty,
+        pats,
+        values: disc_values,
+    })
 }
 
 /// The `const <name>: usize = max(payload_sizes)` definition — the payload area is

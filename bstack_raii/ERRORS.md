@@ -61,15 +61,16 @@ An unrecognized name was passed to `allow(...)`. **Fix:** use `overlong_tag`,
 `#[bstack_enum]`. **Fix:** remove it from the struct.
 
 ### BSTACK0009 — `#[bstack_class]` on an unsupported item
-`#[bstack_class]` currently generates RTTI for **structs** only; it was applied to
-an `enum` (enum RTTI is a later phase) or to something that is neither a struct nor
-an enum. **Fix:** use `#[bstack_class]` on a struct, or `#[bstack_enum]` for the
-enum block machinery without RTTI.
+`#[bstack_class]` generates RTTI for a **struct** or an **enum**; it was applied to
+something else (e.g. a `union` or a non-item). **Fix:** use `#[bstack_class]` on a
+struct or enum.
 
-### BSTACK0010 — `#[bstack_static]` not yet supported by `#[bstack_class]`
-A field carries `#[bstack_static]` (a class variable — stored once in the schema
-record, not per instance), which `#[bstack_class]` does not emit yet. **Fix:** drop
-`#[bstack_static]` and store the field per-instance, or omit the field for now.
+### BSTACK0010 — invalid `#[bstack_static]` class variable
+A `#[bstack_static]` class variable is malformed: it has no initial value
+(`#[bstack_static(EXPR)]` is required), it is on a non-named struct field, or it also
+carries an ownership annotation (a class variable must be POD — it cannot own a
+block). **Fix:** give it a value, put it on a named field, and drop any
+`#[bstack_owned/strong/weak/ref]` / `#[embed]`.
 
 ### BSTACK0011 — `#[bstack_block]` applied to a non-struct
 `#[bstack_block]` generates a struct block; it was placed on an `enum` (or `union`).
@@ -158,6 +159,14 @@ A `= <expr>` discriminant is not an integer literal (or negated integer literal)
 An ownership annotation was placed on a unit, multi-field tuple, or struct variant.
 Only a single-field tuple variant may be annotated. **Fix:** e.g. `#[bstack_owned] V(T)`;
 unit / multi-field / struct variants are POD aggregates and take no annotation.
+
+### BSTACK0206 — enum variant payload not describable by `#[bstack_class]`
+A `#[bstack_class]` enum has a variant whose payload is a vec / array / foreign /
+tuple reference, which RTTI does not model yet (a plain `#[bstack_enum]` accepts it).
+Unit, POD-aggregate (`V(A, B)` / `V { .. }`), and scalar reference (`#[bstack_owned]
+V(T)`, optionally `Option<T>`) variants are supported. **Fix:** use `#[bstack_enum]`
+for such a type, or reshape the variant (e.g. wrap the payload in a named
+`#[bstack_class]` block).
 
 ---
 

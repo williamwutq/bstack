@@ -139,6 +139,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
     let layout::Discriminants {
         ty: disc_ty,
         pats: disc_pats,
+        ..
     } = layout::discriminants(&input.variants, &attr.repr)?;
 
     let name = &input.ident;

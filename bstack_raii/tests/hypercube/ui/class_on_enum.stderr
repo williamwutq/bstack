@@ -1,5 +1,0 @@
-error: [BSTACK0009] #[bstack_class] on an enum is not yet supported (enum RTTI is a later phase). Use #[bstack_enum] for the block machinery in the meantime.
- --> tests/hypercube/ui/class_on_enum.rs:4:6
-  |
-4 | enum X {
-  |      ^
