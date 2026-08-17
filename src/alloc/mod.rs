@@ -42,8 +42,10 @@
 //!   [`realloc_uninit`](BStackUninitAllocator::realloc_uninit) skip the
 //!   zero-fill of newly allocated or grown bytes, returning **unspecified**
 //!   (but always valid-to-read) contents for callers that overwrite the region
-//!   immediately.  Implemented by [`SlabBStackAllocator`] and
-//!   [`GhostTreeBstackAllocator`]; see
+//!   immediately.  Implemented by [`SlabBStackAllocator`],
+//!   [`GhostTreeBstackAllocator`], [`CheckedSlabBStackAllocator`],
+//!   [`SegregatedBStackAllocator`] and [`FirstFitBStackAllocator`], and
+//!   forwarded by [`DebugCheckingAllocator`]; see
 //!   [Uninitialised allocation](#uninitialised-allocation).
 //!
 //! * [`BStackOwnedSliceAllocator`] — convenience supertrait:
@@ -85,24 +87,39 @@
 //!
 //! # Uninitialised allocation
 //!
-//! [`SlabBStackAllocator`] and [`GhostTreeBstackAllocator`] implement
-//! [`BStackUninitAllocator`], because for both of them the caller-facing zero
-//! guarantee costs a write that a caller overwriting the region has no use for.
-//! What that write is, and therefore what is saved, differs:
+//! [`SlabBStackAllocator`], [`GhostTreeBstackAllocator`],
+//! [`CheckedSlabBStackAllocator`], [`SegregatedBStackAllocator`] and
+//! [`FirstFitBStackAllocator`] implement [`BStackUninitAllocator`], because for
+//! each of them the caller-facing zero guarantee costs a write that a caller
+//! overwriting the region has no use for.  What that write is, and therefore
+//! what is saved, differs:
 //!
 //! | Allocator | What `alloc` writes to guarantee zeroes | What `alloc_uninit` saves |
 //! |-----------|------------------------------------------|---------------------------|
 //! | [`SlabBStackAllocator`]      | a whole-block `zero` after popping the free list           | the entire call — one durable sync per reused block |
 //! | [`GhostTreeBstackAllocator`] | a 32-byte `zero` over the reclaimed block's stale AVL node | the entire call for requests of 32 bytes or more    |
+//! | [`CheckedSlabBStackAllocator`] | a full block-sized claim buffer                         | everything past the 8-byte overhead word            |
+//! | [`SegregatedBStackAllocator`] | a full block-sized claim buffer                          | everything past the overhead (and any copied prefix) |
+//! | [`FirstFitBStackAllocator`]  | a full block image fused into the metadata write          | block-sized bytes and the staging buffer; the tail path also drops to a sparse extend |
 //! | [`LinearBStackAllocator`]    | nothing — `extend` is a sparse `set_len`                  | *not implemented*: there is nothing to skip         |
 //!
 //! [`realloc_uninit`](BStackUninitAllocator::realloc_uninit) additionally drops
 //! the `zero` calls that scrub bytes newly exposed inside a block the caller
-//! already owns.  Neither allocator drops a write it needs for its own metadata
+//! already owns.  No allocator drops a write it needs for its own metadata
 //! or free-space invariants, so crash consistency, recovery, and the `handle`
 //! contract on failure are identical to the initialised methods.
 //!
-//! The remaining built-in allocators do not implement the trait yet.
+//! Because the saving is sometimes in bytes written and journalled rather than
+//! in calls, a returned region may still read back as zero — notably for
+//! [`CheckedSlabBStackAllocator`], which scrubs on free rather than on claim.
+//! That is never something to rely on; the trait promises only unspecified
+//! contents.
+//!
+//! [`DebugCheckingAllocator<A>`](DebugCheckingAllocator) forwards both methods,
+//! with the same overlap and double-free tracking as `alloc`/`realloc`, but only
+//! when `A` implements the trait itself — it never fabricates the trait for an
+//! allocator that has no cheaper uninitialised path.
+//!
 //!
 //! # Debug wrapper
 //!
