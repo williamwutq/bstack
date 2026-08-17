@@ -1,4 +1,4 @@
-use super::{BStackAllocError, BStackAllocator, BStackOwnedSlice};
+use super::{BStackAllocError, BStackAllocator, BStackOwnedSlice, BStackUninitAllocator};
 use crate::BStack;
 #[cfg(not(feature = "atomic"))]
 use std::cell::Cell;
@@ -564,14 +564,24 @@ impl FirstFitBStackAllocator {
         Ok((block_found, found_size))
     }
 
+    /// Detach `found_start` from the free list and mark it allocated.
+    ///
+    /// `content_buffer` is the payload image to lay down over the reclaimed
+    /// block: `Self::BLOCK_OVERHEAD_SIZE + requested_size` bytes, whose
+    /// `[BLOCK_HEADER_SIZE, len - BLOCK_FOOTER_SIZE)` window is the content.
+    /// Passing it lets the block's metadata write and the payload scrub (or a
+    /// copied payload) land in a single `set`.
+    ///
+    /// `None` means the caller wants the payload left alone — the reclaimed
+    /// block keeps whatever its previous occupant wrote. The same writes are
+    /// issued in the same order, each covering only the metadata words, so the
+    /// crash-consistency reasoning below is unchanged.
     fn unlink_block(
         &self,
         found_start: u64,
         found_size: u64,
         requested_size: u64,
-        // Need to be Self::BLOCK_OVERHEAD_SIZE + data size
-        // Where from Self::BLOCK_HEADER_SIZE to end - Self::BLOCK_FOOTER_SIZE is the content
-        content_buffer: &mut [u8],
+        content_buffer: Option<&mut [u8]>,
     ) -> io::Result<()> {
         if found_size >= requested_size + Self::BLOCK_OVERHEAD_SIZE + Self::MIN_BLOCK_PAYLOAD_SIZE {
             // The found block is big enough to split. Split it into an allocated block of the requested size
@@ -590,11 +600,6 @@ impl FirstFitBStackAllocator {
 
             let remaining_size = found_size - requested_size - Self::BLOCK_OVERHEAD_SIZE;
 
-            // Write the footer of the allocated block to content buffer
-            content_buffer[(requested_size + Self::BLOCK_HEADER_SIZE) as usize
-                ..(requested_size + Self::BLOCK_OVERHEAD_SIZE) as usize]
-                .copy_from_slice(&requested_size.to_le_bytes());
-
             // Update 1
             // Update the footer of the free block and write the header of the allocated block together
             // Flag and reserved bytes are already 0, so the new block is marked as allocated.
@@ -607,10 +612,25 @@ impl FirstFitBStackAllocator {
             // Update the footer of the allocated block and zero out
             // If this step fails and middle is already updated, nothing bad happens since
             // the middle of a free block is just garbage data
-            self.stack.set(
-                found_start + remaining_size + Self::BLOCK_OVERHEAD_SIZE,
-                &content_buffer[Self::BLOCK_HEADER_SIZE as usize..],
-            )?;
+            let payload_start = found_start + remaining_size + Self::BLOCK_OVERHEAD_SIZE;
+            match content_buffer {
+                Some(content_buffer) => {
+                    // Write the footer of the allocated block into the content
+                    // buffer so payload and footer land in one call.
+                    content_buffer[(requested_size + Self::BLOCK_HEADER_SIZE) as usize
+                        ..(requested_size + Self::BLOCK_OVERHEAD_SIZE) as usize]
+                        .copy_from_slice(&requested_size.to_le_bytes());
+                    self.stack.set(
+                        payload_start,
+                        &content_buffer[Self::BLOCK_HEADER_SIZE as usize..],
+                    )?;
+                }
+                // Payload left as-is: only the footer has to be written.
+                None => {
+                    self.stack
+                        .set(payload_start + requested_size, requested_size.to_le_bytes())?;
+                }
+            }
 
             // Update the size of the free block in the header.
             // If this steps fails, the header is corrupted and should be repaired in recovery
@@ -648,11 +668,21 @@ impl FirstFitBStackAllocator {
 
             // Clear is_free flag + reserved and write user data in one call by modifying content_buffer
             // Failure cause: orphaned block
-            content_buffer[8..16].copy_from_slice(&[0u8; 8]);
-            self.stack.set(
-                found_start - Self::BLOCK_HEADER_SIZE + 8,
-                &content_buffer[8..Self::BLOCK_HEADER_SIZE as usize + requested_size as usize],
-            )?;
+            let flags_offset = found_start - Self::BLOCK_HEADER_SIZE + 8;
+            match content_buffer {
+                Some(content_buffer) => {
+                    content_buffer[8..16].copy_from_slice(&[0u8; 8]);
+                    self.stack.set(
+                        flags_offset,
+                        &content_buffer
+                            [8..Self::BLOCK_HEADER_SIZE as usize + requested_size as usize],
+                    )?;
+                }
+                // Payload left as-is: only the flag and reserved words are cleared.
+                None => {
+                    self.stack.set(flags_offset, [0u8; 8])?;
+                }
+            }
 
             Ok(())
         }
@@ -876,60 +906,9 @@ impl BStackAllocator for FirstFitBStackAllocator {
         self.stack
     }
 
+    #[inline]
     fn alloc(&self, len: u64) -> io::Result<BStackOwnedSlice<'_, Self>> {
-        if len == 0 {
-            return Ok(BStackOwnedSlice::empty(self));
-        }
-
-        // Make len aligned to 8 bytes and at least 16
-        let aligned_len = self.align_len(len);
-
-        // Heap allocate zero buffer; both branches below need a buffer of this exact size.
-        let mut buf = vec![0u8; (Self::BLOCK_OVERHEAD_SIZE + aligned_len) as usize];
-
-        // Hold the lock across the free-list search and the mutation/extension that follows,
-        // so the read-modify-write of the free list (and any tail push) is atomic w.r.t. other
-        // threads. recovery_needed is set only around the actual mutation below.
-        #[cfg(feature = "atomic")]
-        let _guard = self.lock.lock().unwrap();
-
-        let block_found = self.find_large_enough_block(aligned_len)?;
-        if block_found.0 != 0 {
-            // Found a big enough block at offset block_found. Remove it from the free list and return it.
-            // If the block is much bigger than needed, split it and add the remainder back to the free list.
-
-            // Set recovery needed before modifying the free list and clear it after,
-            // so that if a crash happens in the middle, the allocator can detect it and recover the free list in the next run.
-            self.set_recovery_needed()?;
-            self.unlink_block(
-                block_found.0,
-                block_found.1,
-                aligned_len,
-                buf.as_mut_slice(),
-            )?;
-            self.clear_recovery_needed()?;
-            // Split puts the allocated block at the back of the found block;
-            // no-split uses the found block in full from the front.
-            // Must mirror unlink_block's split threshold exactly.
-            let payload = if block_found.1
-                >= aligned_len + Self::BLOCK_OVERHEAD_SIZE + Self::MIN_BLOCK_PAYLOAD_SIZE
-            {
-                block_found.0 + block_found.1 - aligned_len
-            } else {
-                block_found.0
-            };
-            Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, payload, len) })
-        } else {
-            // No free block fits; push the full block (header + zero payload + footer) in one call.
-            buf[..8].copy_from_slice(&aligned_len.to_le_bytes());
-            buf[(aligned_len + Self::BLOCK_HEADER_SIZE) as usize..]
-                .copy_from_slice(&aligned_len.to_le_bytes());
-            // push is a single atomic BStack call, so no recovery_needed marking is required;
-            // the lock above already excludes concurrent tail modification.
-            let ptr = self.stack.push(&buf)? + Self::BLOCK_HEADER_SIZE;
-            // SAFETY: ptr and len from fresh allocation via self.stack.push
-            Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, ptr, len) })
-        }
+        self.alloc_impl(len, true)
     }
 
     fn dealloc<'a>(
@@ -1010,10 +989,149 @@ impl BStackAllocator for FirstFitBStackAllocator {
         })
     }
 
+    #[inline]
     fn realloc<'a>(
         &'a self,
         slice: BStackOwnedSlice<'a, Self>,
         new_len: u64,
+    ) -> Result<BStackOwnedSlice<'a, Self>, BStackAllocError<'a, Self>> {
+        self.realloc_impl(slice, new_len, true)
+    }
+}
+
+/// Reclaiming a free block without scrubbing its payload.
+///
+/// A freed block keeps its previous occupant's bytes: `dealloc` rewrites the
+/// header, footer and free-list links and nothing else. `alloc` therefore stages
+/// a whole `24 + aligned_len` block image and writes it, so that clearing the
+/// block's flags word (or writing the split block's footer) also scrubs the
+/// payload in the same `set`.
+///
+/// [`alloc_uninit`](BStackUninitAllocator::alloc_uninit) drops the image: the
+/// reuse path writes only the 8-byte flags word (no split) or the 8-byte footer
+/// (split), and the tail path replaces the full-block `push` with one
+/// [`BStack::extend_sparse_batched`] carrying just the header and footer size
+/// words. The call count is identical — the saving is in bytes written and
+/// journalled, and in the staging allocation, both of which scale with the
+/// request.
+///
+/// [`realloc_uninit`](BStackUninitAllocator::realloc_uninit) drops the four
+/// `zero` calls that scrub bytes newly exposed inside the caller's own block —
+/// each a whole durable sync — and shortens the merge path's single large write
+/// down to the metadata it has to place. Its move paths are byte-for-byte the
+/// zeroing ones: there the payload scrub rides along with a copy that has to be
+/// written anyway, so skipping it would buy nothing and splitting it out would
+/// cost an extra sync.
+///
+/// Crash consistency is unchanged throughout. Every path issues the same
+/// [`BStack`] calls in the same order under the same `recovery_needed`
+/// bracketing, and the bytes left unscrubbed are always interior to a live
+/// block, which the recovery scan never reads — it walks block headers from the
+/// arena start and strides by their recorded sizes.
+#[cfg(feature = "set")]
+impl FirstFitBStackAllocator {
+    /// Shared body of [`alloc`](BStackAllocator::alloc) and
+    /// [`alloc_uninit`](BStackUninitAllocator::alloc_uninit).
+    ///
+    /// [`true`] stages a full block image so the block's metadata and a
+    /// scrub of its payload land in one `set`; [`false`] drops the image
+    /// and writes the metadata words alone. Both branches issue the same
+    /// [`BStack`] calls in the same order — a reuse still writes the free-list
+    /// links, the flags word and the footer, and a miss still creates the block
+    /// at the tail in one call — so `recovery_needed` bracketing and the recovery
+    /// scan are unaffected.
+    fn alloc_impl(&self, len: u64, init: bool) -> io::Result<BStackOwnedSlice<'_, Self>> {
+        if len == 0 {
+            return Ok(BStackOwnedSlice::empty(self));
+        }
+
+        // Make len aligned to 8 bytes and at least 16
+        let aligned_len = self.align_len(len);
+
+        // Heap allocate zero buffer; both branches below need a buffer of this exact
+        // size to fuse their metadata write with the payload scrub. `false`
+        // scrubs nothing, so it writes the metadata words alone and skips the
+        // allocation entirely.
+        let mut buf = init.then(|| vec![0u8; (Self::BLOCK_OVERHEAD_SIZE + aligned_len) as usize]);
+
+        // Hold the lock across the free-list search and the mutation/extension that follows,
+        // so the read-modify-write of the free list (and any tail push) is atomic w.r.t. other
+        // threads. recovery_needed is set only around the actual mutation below.
+        #[cfg(feature = "atomic")]
+        let _guard = self.lock.lock().unwrap();
+
+        let block_found = self.find_large_enough_block(aligned_len)?;
+        if block_found.0 != 0 {
+            // Found a big enough block at offset block_found. Remove it from the free list and return it.
+            // If the block is much bigger than needed, split it and add the remainder back to the free list.
+
+            // Set recovery needed before modifying the free list and clear it after,
+            // so that if a crash happens in the middle, the allocator can detect it and recover the free list in the next run.
+            self.set_recovery_needed()?;
+            self.unlink_block(
+                block_found.0,
+                block_found.1,
+                aligned_len,
+                buf.as_deref_mut(),
+            )?;
+            self.clear_recovery_needed()?;
+            // Split puts the allocated block at the back of the found block;
+            // no-split uses the found block in full from the front.
+            // Must mirror unlink_block's split threshold exactly.
+            let payload = if block_found.1
+                >= aligned_len + Self::BLOCK_OVERHEAD_SIZE + Self::MIN_BLOCK_PAYLOAD_SIZE
+            {
+                block_found.0 + block_found.1 - aligned_len
+            } else {
+                block_found.0
+            };
+            Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, payload, len) })
+        } else {
+            // No free block fits; create the block at the tail in one call. Both
+            // forms are a single atomic BStack call, so no recovery_needed marking
+            // is required; the lock above already excludes concurrent tail
+            // modification.
+            let block_len = Self::BLOCK_OVERHEAD_SIZE + aligned_len;
+            let ptr = match buf.as_mut() {
+                // Push the full block: header + zero payload + footer.
+                Some(buf) => {
+                    buf[..8].copy_from_slice(&aligned_len.to_le_bytes());
+                    buf[(aligned_len + Self::BLOCK_HEADER_SIZE) as usize..]
+                        .copy_from_slice(&aligned_len.to_le_bytes());
+                    self.stack.push(&*buf)?
+                }
+                // Only the header and footer size words have to be written: one
+                // sparse extend realises the whole block with a single `set_len`
+                // and writes just those two, so the payload between them costs no
+                // write I/O. It reads back as zero — a permitted "unspecified"
+                // value — and needs no staging buffer.
+                None => {
+                    let size = aligned_len.to_le_bytes();
+                    self.stack.extend_sparse_batched(
+                        [(0, size), (Self::BLOCK_HEADER_SIZE + aligned_len, size)],
+                        block_len,
+                    )?
+                }
+            } + Self::BLOCK_HEADER_SIZE;
+            // SAFETY: ptr and len from a fresh tail allocation of `block_len` bytes
+            Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, ptr, len) })
+        }
+    }
+
+    /// Shared body of [`realloc`](BStackAllocator::realloc) and
+    /// [`realloc_uninit`](BStackUninitAllocator::realloc_uninit).
+    ///
+    /// [`false`] drops the four `zero` calls that exist purely to scrub
+    /// bytes newly exposed inside a block the caller already owns, and shortens
+    /// (never splits) the merge path's single big write. The move paths keep
+    /// their full-size fused write: separating the copied prefix from the block
+    /// metadata would turn one durable sync into two, which costs more than the
+    /// bytes it saves.
+    fn realloc_impl<'a>(
+        &'a self,
+        slice: BStackOwnedSlice<'a, Self>,
+        new_len: u64,
+        init: bool,
     ) -> Result<BStackOwnedSlice<'a, Self>, BStackAllocError<'a, Self>> {
         if slice.is_empty() && slice.start() == 0 {
             // Original is an empty handle; hand it back on failure.
@@ -1056,7 +1174,7 @@ impl BStackAllocator for FirstFitBStackAllocator {
             // bucket (e.g. 17 → 20, both align to 24), bytes [slice.len(), new_len) may still
             // hold stale data from a previous larger slice, so zero them in a single atomic write.
             if aligned_new_len == aligned_current_len {
-                if new_len > slice.len() {
+                if new_len > slice.len() && init {
                     // Atomic safety:
                     // We do not need to set recovery_needed here because the write is atomic
                     // and since this is not a free block, it should not be in the free list and thus
@@ -1099,10 +1217,12 @@ impl BStackAllocator for FirstFitBStackAllocator {
                             // (8 bytes at aligned_current_len) is now absorbed into the new payload,
                             // and bytes [slice.len(), aligned_current_len) may hold stale data from
                             // a prior larger slice — both must be cleared in one atomic write.
-                            self.stack.zero(
-                                slice.start() + slice.len(),
-                                aligned_current_len + Self::BLOCK_FOOTER_SIZE - slice.len(),
-                            )?;
+                            if init {
+                                self.stack.zero(
+                                    slice.start() + slice.len(),
+                                    aligned_current_len + Self::BLOCK_FOOTER_SIZE - slice.len(),
+                                )?;
+                            }
                             self.stack.set(
                                 slice.start() - Self::BLOCK_HEADER_SIZE,
                                 aligned_new_len.to_le_bytes(),
@@ -1147,7 +1267,7 @@ impl BStackAllocator for FirstFitBStackAllocator {
                 // len, zero bytes [slice.len(), new_len) in one atomic write — this covers both
                 // the gap [slice.len(), aligned_current_len) (potentially stale) and the
                 // newly-exposed range [aligned_current_len, new_len).
-                if new_len > slice.len() {
+                if new_len > slice.len() && init {
                     self.stack
                         .zero(slice.start() + slice.len(), new_len - slice.len())?;
                 }
@@ -1190,7 +1310,7 @@ impl BStackAllocator for FirstFitBStackAllocator {
                     // state (the bytes are not part of the input slice's len), so a crash here
                     // leaves the file in a fully consistent allocator state with no recovery
                     // needed.
-                    if slice.len() < block_size {
+                    if slice.len() < block_size && init {
                         self.stack
                             .zero(slice.start() + slice.len(), block_size - slice.len())?;
                     }
@@ -1256,7 +1376,15 @@ impl BStackAllocator for FirstFitBStackAllocator {
                         )?;
                         // Single write: zeroes the inter-block overhead, writes the allocated
                         // block's new footer, the complete free block, and the free block's footer.
-                        self.stack.set(slice.start() + block_size, &zero_buff)?;
+                        // `false` starts the same write at the allocated block's
+                        // footer instead, dropping only the leading scrub — the bytes it
+                        // would have cleared are all payload of the caller's own resized
+                        // block, and every metadata word still lands in this one call.
+                        let write_from = if init { 0 } else { alloc_footer_off };
+                        self.stack.set(
+                            slice.start() + block_size + write_from as u64,
+                            &zero_buff[write_from..],
+                        )?;
                         // Shrink the allocated block's header to the used size.
                         self.stack.set(
                             slice.start() - Self::BLOCK_HEADER_SIZE,
@@ -1277,9 +1405,17 @@ impl BStackAllocator for FirstFitBStackAllocator {
                             slice.start() - Self::BLOCK_HEADER_SIZE,
                             merged_size.to_le_bytes(),
                         )?;
-                        zero_buff[(next_block_size + Self::BLOCK_OVERHEAD_SIZE) as usize..]
-                            .copy_from_slice(&merged_size.to_le_bytes());
-                        self.stack.set(slice.start() + block_size, &zero_buff)?;
+                        let footer_off = (next_block_size + Self::BLOCK_OVERHEAD_SIZE) as usize;
+                        if init {
+                            zero_buff[footer_off..].copy_from_slice(&merged_size.to_le_bytes());
+                            self.stack.set(slice.start() + block_size, &zero_buff)?;
+                        } else {
+                            // Everything before the footer is absorbed overhead and
+                            // payload of the caller's own block, so the same single
+                            // call need only place the merged footer.
+                            self.stack
+                                .set(slice.start() + merged_size, merged_size.to_le_bytes())?;
+                        }
                     }
                     self.clear_recovery_needed()?;
                     // SAFETY: slice resized by merging with adjacent free block
@@ -1313,7 +1449,7 @@ impl BStackAllocator for FirstFitBStackAllocator {
                     block_found.0,
                     block_found.1,
                     aligned_new_len,
-                    block_buf.as_mut_slice(),
+                    Some(block_buf.as_mut_slice()),
                 )?;
                 // Must mirror unlink_block's split threshold exactly.  The split puts the
                 // allocated block at the back of the found block; without a split, the found
@@ -1367,6 +1503,23 @@ impl BStackAllocator for FirstFitBStackAllocator {
                 BStackOwnedSlice::from_raw_parts(self, recovered.0, recovered.1)
             }),
         })
+    }
+}
+
+#[cfg(feature = "set")]
+impl BStackUninitAllocator for FirstFitBStackAllocator {
+    #[inline]
+    fn alloc_uninit(&self, len: u64) -> io::Result<BStackOwnedSlice<'_, Self>> {
+        self.alloc_impl(len, false)
+    }
+
+    #[inline]
+    fn realloc_uninit<'a>(
+        &'a self,
+        slice: BStackOwnedSlice<'a, Self>,
+        new_len: u64,
+    ) -> Result<BStackOwnedSlice<'a, Self>, BStackAllocError<'a, Self>> {
+        self.realloc_impl(slice, new_len, false)
     }
 }
 
