@@ -71,6 +71,16 @@ A field carries `#[bstack_static]` (a class variable — stored once in the sche
 record, not per instance), which `#[bstack_class]` does not emit yet. **Fix:** drop
 `#[bstack_static]` and store the field per-instance, or omit the field for now.
 
+### BSTACK0011 — `#[bstack_block]` applied to a non-struct
+`#[bstack_block]` generates a struct block; it was placed on an `enum` (or `union`).
+**Fix:** use `#[bstack_enum]` (or `#[bstack_class]` for RTTI) on an enum; unions are
+not supported.
+
+### BSTACK0012 — `#[bstack_enum]` applied to a non-enum
+`#[bstack_enum]` generates a tagged-union block from an `enum`; it was placed on a
+`struct` (or `union`). **Fix:** use `#[bstack_block]` (or `#[bstack_class]` for RTTI)
+on a struct; unions are not supported.
+
 ---
 
 ## Field / type shapes (`01xx`)

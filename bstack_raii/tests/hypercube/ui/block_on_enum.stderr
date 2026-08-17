@@ -1,0 +1,7 @@
+error: [BSTACK0011] #[bstack_block] applies to a struct; this is an enum — use #[bstack_enum] (or #[bstack_class] for RTTI) instead
+ --> tests/hypercube/ui/block_on_enum.rs:3:1
+  |
+3 | #[bstack_block]
+  | ^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `bstack_block` (in Nightly builds, run with -Z macro-backtrace for more info)

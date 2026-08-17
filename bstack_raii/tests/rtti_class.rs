@@ -84,10 +84,7 @@ fn bstack_class_syncs_rtti_schema() {
     assert_eq!(lf[0].name, "a");
     assert_eq!(lf[0].shape, Shape::Owned(point_tag));
     assert_eq!(lf[1].shape, Shape::Owned(point_tag));
-    assert_eq!(
-        lf[2].shape,
-        Shape::Vec(Box::new(Shape::Pod { width: 1 }))
-    );
+    assert_eq!(lf[2].shape, Shape::Vec(Box::new(Shape::Pod { width: 1 })));
     assert_eq!(
         lf[3].shape,
         Shape::Array {

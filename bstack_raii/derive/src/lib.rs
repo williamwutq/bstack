@@ -22,6 +22,44 @@ mod layout;
 mod model;
 mod util;
 
+/// Build a directed "wrong item kind" error when a struct-only / enum-only attribute
+/// macro is applied to the other item kind (or a union), instead of leaking rustc's
+/// bare `expected `struct`` parse error. For genuinely malformed input (not any
+/// recognizable item) it falls back to the real span-accurate parse error.
+///
+/// `wants_struct` is `true` for `#[bstack_block]` (wants a struct), `false` for
+/// `#[bstack_enum]` (wants an enum). `code` is the `BSTACKxxxx` number.
+fn misapplied_item(
+    item: TokenStream,
+    fallback: syn::Error,
+    code: &str,
+    this_macro: &str,
+    wants_struct: bool,
+) -> TokenStream {
+    let ts: proc_macro2::TokenStream = item.into();
+    let wants = if wants_struct { "a struct" } else { "an enum" };
+    let msg = if wants_struct && syn::parse2::<syn::ItemEnum>(ts.clone()).is_ok() {
+        format!(
+            "[BSTACK{code}] #[{this_macro}] applies to a struct; this is an enum — use \
+             #[bstack_enum] (or #[bstack_class] for RTTI) instead"
+        )
+    } else if !wants_struct && syn::parse2::<syn::ItemStruct>(ts.clone()).is_ok() {
+        format!(
+            "[BSTACK{code}] #[{this_macro}] applies to an enum; this is a struct — use \
+             #[bstack_block] (or #[bstack_class] for RTTI) instead"
+        )
+    } else if syn::parse2::<syn::ItemUnion>(ts.clone()).is_ok() {
+        format!("[BSTACK{code}] #[{this_macro}] applies to {wants}; a `union` is not supported")
+    } else {
+        // Not a struct/enum/union at all (or a malformed one) — surface the real,
+        // span-accurate parse error rather than a misleading "wrong kind" message.
+        return fallback.to_compile_error().into();
+    };
+    syn::Error::new(proc_macro2::Span::call_site(), msg)
+        .to_compile_error()
+        .into()
+}
+
 /// `#[bstack_block]` — generate the on-disk layout and typed handle machinery.
 ///
 /// # Arguments
@@ -64,7 +102,10 @@ mod util;
 /// is the data tag with its prefix **lowercased**, or an explicit `ctrl_tag`.
 #[proc_macro_attribute]
 pub fn bstack_block(args: TokenStream, item: TokenStream) -> TokenStream {
-    let input = syn::parse_macro_input!(item as syn::ItemStruct);
+    let input = match syn::parse::<syn::ItemStruct>(item.clone()) {
+        Ok(s) => s,
+        Err(e) => return misapplied_item(item, e, "0011", "bstack_block", true),
+    };
     match block::expand(args.into(), input) {
         Ok(ts) => ts.into(),
         Err(e) => e.to_compile_error().into(),
@@ -114,7 +155,10 @@ pub fn bstack_block(args: TokenStream, item: TokenStream) -> TokenStream {
 /// struct — inline embedding is not supported).
 #[proc_macro_attribute]
 pub fn bstack_enum(args: TokenStream, item: TokenStream) -> TokenStream {
-    let input = syn::parse_macro_input!(item as syn::ItemEnum);
+    let input = match syn::parse::<syn::ItemEnum>(item.clone()) {
+        Ok(e) => e,
+        Err(e) => return misapplied_item(item, e, "0012", "bstack_enum", false),
+    };
     match enum_::expand_enum(args.into(), input) {
         Ok(ts) => ts.into(),
         Err(e) => e.to_compile_error().into(),
