@@ -990,6 +990,9 @@ Allocators for which zero-fill is already free — an always-extend bump allocat
 one that scrubs blocks eagerly on free — gain nothing and may either implement
 the trait as a thin wrapper around `alloc`/`realloc` or not implement it at all.
 
+`SlabBStackAllocator` and `GhostTreeBstackAllocator` implement it;
+`LinearBStackAllocator` does not, since its zero-fill is already free.
+
 ### `BStackOwnedSlice<'a, A>`
 
 The ownership handle for one allocation. Returned by `alloc`, consumed by `realloc` and `dealloc`. Non-`Copy`, non-`Clone` — exactly one owner per region.

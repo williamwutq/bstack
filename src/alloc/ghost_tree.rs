@@ -1,5 +1,6 @@
 use super::{
     BStackAllocError, BStackAllocator, BStackBulkAllocError, BStackBulkAllocator, BStackOwnedSlice,
+    BStackUninitAllocator,
 };
 use crate::BStack;
 #[cfg(feature = "atomic")]
@@ -849,32 +850,14 @@ impl GhostTreeBstackAllocator {
     }
 }
 
-impl BStackAllocator for GhostTreeBstackAllocator {
-    type Error = io::Error;
-    type Allocated<'a> = BStackOwnedSlice<'a, Self>;
-
-    #[inline]
-    fn stack(&self) -> &BStack {
-        &self.stack
-    }
-
-    #[inline]
-    fn into_stack(self) -> BStack {
-        self.stack
-    }
-
-    /// Allocate `len` zeroed bytes using best-fit from the AVL tree.
+impl GhostTreeBstackAllocator {
+    /// Shared body of [`alloc`](BStackAllocator::alloc) and
+    /// [`alloc_uninit`](BStackUninitAllocator::alloc_uninit).
     ///
-    /// The returned slice length is `align_up_len(len)` (≥ 32) in the split
-    /// case, or the full reclaimed block size when the remainder is too small
-    /// to split (< 32 bytes, transparently absorbed into the caller's slice).
-    ///
-    /// # Crash safety
-    ///
-    /// Multi-call.  A crash between AVL remove and the split-insert permanently
-    /// loses the remainder fragment; a crash between AVL remove and return
-    /// loses the entire block.
-    fn alloc(&self, len: u64) -> io::Result<BStackOwnedSlice<'_, Self>> {
+    /// Only the no-split reuse branch differs; see the
+    /// [`BStackUninitAllocator`] impl for why a clear `init` still scrubs the
+    /// part of the stale AVL node that lies beyond the caller's visible length.
+    fn alloc_impl(&self, len: u64, init: bool) -> io::Result<BStackOwnedSlice<'_, Self>> {
         if len == 0 {
             return Ok(BStackOwnedSlice::empty(self));
         }
@@ -896,11 +879,23 @@ impl BStackAllocator for GhostTreeBstackAllocator {
                 } else {
                     #[cfg(feature = "atomic")]
                     drop(guard);
-                    // No split: give the whole block.  The stale AVL node in the
-                    // first 32 bytes must be zeroed; the rest is already zeroed.
+                    // No split: give the whole block.  The stale AVL node occupies
+                    // the first 32 bytes; the rest of the block is already zeroed.
                     // Any bytes beyond `len` (up to `block_size`) are internal
                     // padding and will be recovered on dealloc by re-aligning.
-                    self.stack.zero(ptr, MIN_ALLOC)?;
+                    //
+                    // A set `init` scrubs the whole node.  A clear one may
+                    // leave the caller's own bytes dirty, but must still restore
+                    // the allocator's invariant that a live block reads zero at
+                    // and beyond its visible length: `realloc`'s in-place grow
+                    // paths hand those bytes straight to the caller without
+                    // zeroing them, and would otherwise leak node bytes out of a
+                    // call that promises zeros.  For `len >= MIN_ALLOC` nothing is
+                    // left to scrub and the write disappears entirely.
+                    let scrub_from = if init { 0 } else { len.min(MIN_ALLOC) };
+                    if scrub_from < MIN_ALLOC {
+                        self.stack.zero(ptr + scrub_from, MIN_ALLOC - scrub_from)?;
+                    }
                     // SAFETY: ptr from allocated block via avl_find_best_fit_and_remove
                     return Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, ptr, len) });
                 }
@@ -912,25 +907,23 @@ impl BStackAllocator for GhostTreeBstackAllocator {
         Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, start, len) })
     }
 
-    /// Resize `slice` to `new_len` bytes.
+    /// Shared body of [`realloc`](BStackAllocator::realloc) and
+    /// [`realloc_uninit`](BStackUninitAllocator::realloc_uninit).
     ///
-    /// **Shrink:** if the freed tail ≥ 32 bytes, zero it and insert it into the
-    /// tree.  If the tail < 32, it is absorbed into the returned slice — the
-    /// allocation cannot be shrunk below the next 32-byte boundary.
-    ///
-    /// **Grow:** allocate a new block, copy contents, free the old block.
-    ///
-    /// # Crash safety
-    ///
-    /// Shrink with a splittable tail: multi-call (zero + AVL insert).
-    /// Grow: multi-call (alloc + copy + dealloc).
-    fn realloc<'a>(
+    /// The in-place paths are identical in both modes: every `zero` they issue
+    /// upholds the allocator's own zeroed-memory invariant rather than the
+    /// caller-facing guarantee, and skipping one would either corrupt the free
+    /// tree or leak stale bytes into a later `realloc` that promises zeros.
+    /// `init` therefore only reaches the move path, whose fresh block comes from
+    /// [`alloc_impl`](Self::alloc_impl).
+    fn realloc_impl<'a>(
         &'a self,
         slice: BStackOwnedSlice<'a, Self>,
         new_len: u64,
+        init: bool,
     ) -> Result<BStackOwnedSlice<'a, Self>, BStackAllocError<'a, Self>> {
         if slice.is_empty() {
-            return self.alloc(new_len).map_err(|source| {
+            return self.alloc_impl(new_len, init).map_err(|source| {
                 BStackAllocError::with_handle(source, BStackOwnedSlice::empty(self))
             });
         }
@@ -1107,12 +1100,14 @@ impl BStackAllocator for GhostTreeBstackAllocator {
         }
 
         // Grow (non-tail): allocate new region, copy old data, free old region.
-        let new_slice = self.alloc(new_len).map_err(|source| BStackAllocError {
-            source,
-            // Allocation of the new region failed; the original is untouched.
-            // SAFETY: (start, old_len) still describes the live original block.
-            handle: Some(unsafe { BStackOwnedSlice::from_raw_parts(self, start, old_len) }),
-        })?;
+        let new_slice = self
+            .alloc_impl(new_len, init)
+            .map_err(|source| BStackAllocError {
+                source,
+                // Allocation of the new region failed; the original is untouched.
+                // SAFETY: (start, old_len) still describes the live original block.
+                handle: Some(unsafe { BStackOwnedSlice::from_raw_parts(self, start, old_len) }),
+            })?;
         let new_start = new_slice.start();
         // Move the old payload into the freshly-allocated region. With `atomic`
         // this is a single crash-atomic `BStack::copy` — the source and
@@ -1152,6 +1147,58 @@ impl BStackAllocator for GhostTreeBstackAllocator {
                 Err(e)
             }
         }
+    }
+}
+
+impl BStackAllocator for GhostTreeBstackAllocator {
+    type Error = io::Error;
+    type Allocated<'a> = BStackOwnedSlice<'a, Self>;
+
+    #[inline]
+    fn stack(&self) -> &BStack {
+        &self.stack
+    }
+
+    #[inline]
+    fn into_stack(self) -> BStack {
+        self.stack
+    }
+
+    /// Allocate `len` zeroed bytes using best-fit from the AVL tree.
+    ///
+    /// The returned slice length is `align_up_len(len)` (≥ 32) in the split
+    /// case, or the full reclaimed block size when the remainder is too small
+    /// to split (< 32 bytes, transparently absorbed into the caller's slice).
+    ///
+    /// # Crash safety
+    ///
+    /// Multi-call.  A crash between AVL remove and the split-insert permanently
+    /// loses the remainder fragment; a crash between AVL remove and return
+    /// loses the entire block.
+    #[inline]
+    fn alloc(&self, len: u64) -> io::Result<BStackOwnedSlice<'_, Self>> {
+        self.alloc_impl(len, true)
+    }
+
+    /// Resize `slice` to `new_len` bytes.
+    ///
+    /// **Shrink:** if the freed tail ≥ 32 bytes, zero it and insert it into the
+    /// tree.  If the tail < 32, it is absorbed into the returned slice — the
+    /// allocation cannot be shrunk below the next 32-byte boundary.
+    ///
+    /// **Grow:** allocate a new block, copy contents, free the old block.
+    ///
+    /// # Crash safety
+    ///
+    /// Shrink with a splittable tail: multi-call (zero + AVL insert).
+    /// Grow: multi-call (alloc + copy + dealloc).
+    #[inline]
+    fn realloc<'a>(
+        &'a self,
+        slice: BStackOwnedSlice<'a, Self>,
+        new_len: u64,
+    ) -> Result<BStackOwnedSlice<'a, Self>, BStackAllocError<'a, Self>> {
+        self.realloc_impl(slice, new_len, true)
     }
 
     /// Release `slice` back to the free pool.
@@ -1227,6 +1274,47 @@ impl BStackAllocator for GhostTreeBstackAllocator {
                 Some(unsafe { BStackOwnedSlice::from_raw_parts(self, start, len) })
             },
         })
+    }
+}
+
+/// Reusing a free block without scrubbing its stale AVL node.
+///
+/// GhostTree is a zero-on-free allocator: [`dealloc`](BStackAllocator::dealloc)
+/// zeroes the whole region before inserting it into the tree, and
+/// [`BStack::extend`] zeroes fresh tail growth for free.  A reused block is
+/// therefore already zero everywhere except the 32 bytes holding its AVL node —
+/// and even those only when the block is handed out whole, since a split hands
+/// back the tail while the node stays in the retained head.  So the entire
+/// caller-facing zero guarantee costs exactly one [`BStack::zero`] of
+/// `MIN_ALLOC` bytes, on one branch.
+///
+/// [`alloc_uninit`](BStackUninitAllocator::alloc_uninit) removes that call — a
+/// whole durable sync — for every request of `MIN_ALLOC` bytes or more.  Below
+/// `MIN_ALLOC` it narrows the scrub to `[len, MIN_ALLOC)` rather than dropping
+/// it: GhostTree relies on a live block reading zero at and beyond its visible
+/// length, because [`realloc`](BStackAllocator::realloc)'s in-place grow paths
+/// expose those bytes to the caller without zeroing them.  Leaving node bytes
+/// there would let a later plain `realloc` return non-zero "newly added" bytes,
+/// breaking a guarantee the caller never opted out of.
+///
+/// [`realloc_uninit`](BStackUninitAllocator::realloc_uninit) differs from
+/// [`realloc`](BStackAllocator::realloc) only in the non-tail grow, which takes
+/// its fresh block from `alloc_uninit`.  Its in-place paths issue no
+/// caller-facing zero-fill at all — every `zero` there maintains the free-tree
+/// invariant — so there is nothing else to skip.
+impl BStackUninitAllocator for GhostTreeBstackAllocator {
+    #[inline]
+    fn alloc_uninit(&self, len: u64) -> io::Result<BStackOwnedSlice<'_, Self>> {
+        self.alloc_impl(len, false)
+    }
+
+    #[inline]
+    fn realloc_uninit<'a>(
+        &'a self,
+        slice: BStackOwnedSlice<'a, Self>,
+        new_len: u64,
+    ) -> Result<BStackOwnedSlice<'a, Self>, BStackAllocError<'a, Self>> {
+        self.realloc_impl(slice, new_len, false)
     }
 }
 
@@ -1434,7 +1522,9 @@ impl BStackBulkAllocator for GhostTreeBstackAllocator {
 mod tests {
     use super::*;
     use crate::BStack;
-    use crate::alloc::{BStackAllocator, BStackBulkAllocator, BStackOwnedSlice};
+    use crate::alloc::{
+        BStackAllocator, BStackBulkAllocator, BStackOwnedSlice, BStackUninitAllocator,
+    };
     use std::sync::atomic::{AtomicU64, Ordering};
 
     fn open_fresh() -> (GhostTreeBstackAllocator, std::path::PathBuf) {
@@ -1455,6 +1545,121 @@ mod tests {
 
     fn reopen(path: &std::path::Path) -> GhostTreeBstackAllocator {
         GhostTreeBstackAllocator::new(BStack::open(path).unwrap()).unwrap()
+    }
+
+    // ── alloc_uninit / realloc_uninit ─────────────────────────────────────────
+
+    #[test]
+    fn alloc_uninit_returns_a_usable_region() {
+        let (alloc, path) = open_fresh();
+        let _g = Guard(path);
+        let mut s = alloc.alloc_uninit(64).unwrap();
+        assert_eq!(s.len(), 64);
+        s.write([0xABu8; 64]).unwrap();
+        assert_eq!(s.read().unwrap(), vec![0xABu8; 64]);
+    }
+
+    #[test]
+    fn alloc_uninit_of_fresh_tail_growth_still_reads_zero() {
+        let (alloc, path) = open_fresh();
+        let _g = Guard(path);
+        let s = alloc.alloc_uninit(64).unwrap();
+        assert_eq!(s.read().unwrap(), vec![0u8; 64]);
+    }
+
+    #[test]
+    fn alloc_uninit_leaves_the_stale_avl_node_in_a_whole_reused_block() {
+        // White-box: proves the 32-byte scrub really is skipped on the no-split
+        // reuse path. The trait's contract is only that the bytes are
+        // unspecified — here they are the freed block's AVL node.
+        let (alloc, path) = open_fresh();
+        let _g = Guard(path);
+
+        // Two blocks, so freeing the first inserts it into the tree instead of
+        // truncating the tail.
+        let a = alloc.alloc(64).unwrap();
+        let _pin = alloc.alloc(64).unwrap();
+        let start = a.start();
+        alloc.dealloc(a).unwrap();
+
+        let b = alloc.alloc_uninit(64).unwrap();
+        assert_eq!(b.start(), start, "the freed block must be the one reused");
+        let data = b.read().unwrap();
+        assert!(
+            data[..MIN_ALLOC as usize].iter().any(|&x| x != 0),
+            "the stale AVL node must survive into the uninitialised allocation"
+        );
+        assert_eq!(
+            &data[MIN_ALLOC as usize..],
+            &[0u8; 32],
+            "the rest is zeroed on free"
+        );
+    }
+
+    #[test]
+    fn alloc_still_scrubs_a_whole_reused_block() {
+        let (alloc, path) = open_fresh();
+        let _g = Guard(path);
+
+        let a = alloc.alloc(64).unwrap();
+        let _pin = alloc.alloc(64).unwrap();
+        let start = a.start();
+        alloc.dealloc(a).unwrap();
+
+        let b = alloc.alloc(64).unwrap();
+        assert_eq!(b.start(), start);
+        assert_eq!(b.read().unwrap(), vec![0u8; 64]);
+    }
+
+    #[test]
+    fn alloc_uninit_below_min_alloc_keeps_the_block_tail_zeroed() {
+        // GhostTree's in-place `realloc` grow hands out bytes past the visible
+        // length without zeroing them, trusting that a live block reads zero
+        // there. `alloc_uninit` must uphold that even though it skips the scrub
+        // of the caller's own bytes, or a later plain `realloc` would return
+        // non-zero "newly added" bytes.
+        let (alloc, path) = open_fresh();
+        let _g = Guard(path);
+
+        let a = alloc.alloc(64).unwrap();
+        let _pin = alloc.alloc(64).unwrap();
+        alloc.dealloc(a).unwrap();
+
+        // 8 < MIN_ALLOC, so the AVL node overlaps bytes beyond the visible length.
+        let small = alloc.alloc_uninit(8).unwrap();
+        let grown = alloc.realloc(small, 24).unwrap();
+        assert_eq!(
+            &grown.read().unwrap()[8..],
+            &[0u8; 16],
+            "realloc must still hand back zeroed newly-added bytes"
+        );
+    }
+
+    #[test]
+    fn realloc_uninit_preserves_existing_bytes_on_grow() {
+        let (alloc, path) = open_fresh();
+        let _g = Guard(path);
+
+        let mut a = alloc.alloc(64).unwrap();
+        a.write([0x11u8; 64]).unwrap();
+        // Keep `a` off the tail so the grow has to move it.
+        let _pin = alloc.alloc(64).unwrap();
+
+        let grown = alloc.realloc_uninit(a, 200).unwrap();
+        assert_eq!(grown.len(), 200);
+        assert_eq!(&grown.read().unwrap()[..64], &[0x11u8; 64]);
+    }
+
+    #[test]
+    fn realloc_uninit_preserves_existing_bytes_on_shrink() {
+        let (alloc, path) = open_fresh();
+        let _g = Guard(path);
+
+        let mut a = alloc.alloc(200).unwrap();
+        a.write([0x22u8; 200]).unwrap();
+        let shrunk = alloc.realloc_uninit(a, 64).unwrap();
+        assert_eq!(shrunk.len(), 64);
+        assert_eq!(shrunk.read().unwrap(), vec![0x22u8; 64]);
     }
 
     // ── basic alloc/dealloc ────────────────────────────────────────────────────
