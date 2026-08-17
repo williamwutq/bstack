@@ -359,6 +359,40 @@ impl BStack {
 
 ---
 
+## Scratch buffers in generators — `bstack_unsafe_reborrow!`
+
+A `process_gen` / `inplace_gen` closure that hands an op a scratch buffer needs
+a `&'a mut [u8]` derived from one of its own captures, which the borrow checker
+rejects (`E0521: borrowed data escapes outside of closure`) — a limitation of
+the `FnMut` model, not a real hazard, and one Polonius Alpha does not lift.
+`bstack_unsafe_reborrow!` / `bstack_unsafe_reborrow_mut!` package the
+workaround, changing the borrow's lifetime and nothing else (the referent type
+is fixed by the helper's signature).  The `unsafe` in the name carries the
+marking, so the call site writes no `unsafe` block:
+
+```rust
+// SAFETY: `head_buf` outlives the whole call; each op is consumed before the
+// closure runs again, so nothing else touches it meanwhile.
+0 => Some(BStackGenOp::Read {
+    offset: head_off,
+    buf: bstack_unsafe_reborrow_mut!(&mut head_buf[..]),
+}),
+```
+
+An optional second argument ascribes the reference type:
+`bstack_unsafe_reborrow_mut!(&mut head_buf[..], &mut [u8])`.
+
+Neither macro can check its obligations.  The caller must guarantee that the
+referent outlives the whole call (a local declared before it, never moved or
+reallocated) and that nothing else touches the referent while the callee holds
+it.  For `process_gen` the second rule is automatic in the common shape — each
+op is consumed before the closure runs again, so inspecting a buffer at a later
+step is fine.  For `inplace_gen` it is stricter: `Write` payloads are staged
+until the batch commits, so a buffer handed to a `Write` stays frozen for the
+rest of the call.  See the `reborrow` module docs for the full contract.
+
+---
+
 ## Standard I/O adapters
 
 ### Writing — `impl Write for BStack` / `impl Write for &BStack`

@@ -21,7 +21,9 @@
 //!
 //! The crate depends on **`libc`** (Unix) and **`windows-sys`** (Windows) for
 //! platform-specific syscalls, and uses **no `unsafe` code beyond the required
-//! FFI calls**.
+//! FFI calls** and the two lifetime-extending reborrow helpers behind
+//! [`bstack_unsafe_reborrow!`] / [`bstack_unsafe_reborrow_mut!`] (see the
+//! [`reborrow`] module).
 //!
 //! # File format
 //!
@@ -623,6 +625,8 @@
 
 mod io_core;
 use io_core::*;
+
+pub mod reborrow;
 
 pub mod fault;
 use fault::fault_point;

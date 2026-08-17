@@ -8,6 +8,8 @@ use super::{BStackAllocError, BStackAllocator, BStackOwnedSlice};
 use crate::BStack;
 #[cfg(feature = "atomic")]
 use crate::BStackGenOp;
+#[cfg(feature = "atomic")]
+use crate::{bstack_unsafe_reborrow, bstack_unsafe_reborrow_mut};
 #[cfg(not(feature = "atomic"))]
 use core::cell::Cell;
 #[cfg(not(feature = "atomic"))]
@@ -317,7 +319,7 @@ impl SlabBStackAllocator {
                 0 => Some(BStackGenOp::Read {
                     offset: Self::FREE_HEAD_OFFSET,
                     // SAFETY: `head_buf` outlives this `process_gen` call.
-                    buf: unsafe { core::mem::transmute::<&mut [u8], &mut [u8]>(&mut head_buf[..]) },
+                    buf: bstack_unsafe_reborrow_mut!(&mut head_buf[..]),
                 }),
                 // Step 1: an empty list ends the sequence with no write;
                 // otherwise read the head block's next-pointer.
@@ -330,9 +332,7 @@ impl SlabBStackAllocator {
                         Some(BStackGenOp::Read {
                             offset: head,
                             // SAFETY: `next_buf` outlives this `process_gen` call.
-                            buf: unsafe {
-                                core::mem::transmute::<&mut [u8], &mut [u8]>(&mut next_buf[..])
-                            },
+                            buf: bstack_unsafe_reborrow_mut!(&mut next_buf[..]),
                         })
                     }
                 }
@@ -341,7 +341,7 @@ impl SlabBStackAllocator {
                 2 => Some(BStackGenOp::Write {
                     offset: Self::FREE_HEAD_OFFSET,
                     // SAFETY: `next_buf` outlives this `process_gen` call.
-                    data: unsafe { core::mem::transmute::<&[u8], &[u8]>(&next_buf[..]) },
+                    data: bstack_unsafe_reborrow!(&next_buf[..]),
                 }),
                 _ => None,
             };

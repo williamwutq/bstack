@@ -5441,9 +5441,9 @@ mod first_fit_tests {
 // Atomic compound-operation tests
 
 #[cfg(all(test, feature = "atomic"))]
-#[allow(clippy::missing_transmute_annotations)]
 mod atomic_tests {
     use crate::BStack;
+    use crate::{bstack_unsafe_reborrow, bstack_unsafe_reborrow_mut};
     use std::io::ErrorKind;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -6361,11 +6361,11 @@ mod atomic_tests {
             let r = match step {
                 0 => Some(BStackGenOp::Read {
                     offset: 0,
-                    buf: unsafe { core::mem::transmute::<&mut [u8], _>(&mut buf[..]) },
+                    buf: bstack_unsafe_reborrow_mut!(&mut buf[..]),
                 }),
                 1 => Some(BStackGenOp::Write {
                     offset: 5,
-                    data: unsafe { core::mem::transmute::<&[u8], _>(&buf[..]) },
+                    data: bstack_unsafe_reborrow!(&buf[..]),
                 }),
                 _ => None,
             };
@@ -6398,7 +6398,7 @@ mod atomic_tests {
             let r = match step {
                 0 => Some(BStackGenOp::Read {
                     offset: 0,
-                    buf: unsafe { core::mem::transmute::<&mut [u8], _>(&mut ptr_buf[..]) },
+                    buf: bstack_unsafe_reborrow_mut!(&mut ptr_buf[..]),
                 }),
                 1 => {
                     // The previous read has already filled `ptr_buf` by the
@@ -6406,7 +6406,7 @@ mod atomic_tests {
                     let target = u64::from_le_bytes(ptr_buf);
                     Some(BStackGenOp::Read {
                         offset: target,
-                        buf: unsafe { core::mem::transmute::<&mut [u8], _>(&mut node_buf[..]) },
+                        buf: bstack_unsafe_reborrow_mut!(&mut node_buf[..]),
                     })
                 }
                 _ => None,
@@ -6507,7 +6507,7 @@ mod atomic_tests {
                 0 => Some(BStackGenOp::Read {
                     offset: 0,
                     // SAFETY: `ptr_buf` outlives this whole `process_gen` call.
-                    buf: unsafe { core::mem::transmute::<&mut [u8], _>(&mut ptr_buf[..]) },
+                    buf: bstack_unsafe_reborrow_mut!(&mut ptr_buf[..]),
                 }),
                 1 => {
                     let target = u64::from_le_bytes(ptr_buf);
@@ -6602,7 +6602,7 @@ mod atomic_tests {
                 // SAFETY: `buf` outlives this whole `process_gen` call.
                 Some(BStackGenOp::Read {
                     offset: 0,
-                    buf: unsafe { core::mem::transmute::<&mut [u8], _>(&mut buf[..]) },
+                    buf: bstack_unsafe_reborrow_mut!(&mut buf[..]),
                 })
             })
             .unwrap_err();
@@ -6667,7 +6667,7 @@ mod atomic_tests {
             // SAFETY: `buf` outlives this whole `process_gen` call.
             Some(BStackGenOp::Read {
                 offset: 0,
-                buf: unsafe { core::mem::transmute::<&mut [u8], _>(&mut buf[..]) },
+                buf: bstack_unsafe_reborrow_mut!(&mut buf[..]),
             })
         })
         .unwrap();
@@ -6722,7 +6722,7 @@ mod atomic_tests {
             match calls {
                 // SAFETY: `buf` outlives this whole `process_gen` call.
                 1 => Some(BStackGenOp::Pop {
-                    buf: unsafe { core::mem::transmute::<&mut [u8], _>(&mut buf[..]) },
+                    buf: bstack_unsafe_reborrow_mut!(&mut buf[..]),
                 }),
                 _ => Some(BStackGenOp::Write {
                     offset: 0,
@@ -6762,7 +6762,7 @@ mod atomic_tests {
             .process_gen(|| {
                 // SAFETY: `buf` outlives this whole `process_gen` call.
                 Some(BStackGenOp::Pop {
-                    buf: unsafe { core::mem::transmute::<&mut [u8], _>(&mut buf[..]) },
+                    buf: bstack_unsafe_reborrow_mut!(&mut buf[..]),
                 })
             })
             .unwrap_err();
@@ -6784,7 +6784,7 @@ mod atomic_tests {
             .process_gen(|| {
                 // SAFETY: `buf` outlives this whole `process_gen` call.
                 Some(BStackGenOp::Pop {
-                    buf: unsafe { core::mem::transmute::<&mut [u8], _>(&mut buf[..]) },
+                    buf: bstack_unsafe_reborrow_mut!(&mut buf[..]),
                 })
             })
             .unwrap_err();
@@ -6945,7 +6945,7 @@ mod atomic_tests {
             match calls {
                 // SAFETY: `old` outlives this whole `process_gen` call.
                 1 => Some(BStackGenOp::Splice {
-                    old: unsafe { core::mem::transmute::<&mut [u8], _>(&mut old[..]) },
+                    old: bstack_unsafe_reborrow_mut!(&mut old[..]),
                     new: b"THERE!",
                 }),
                 _ => Some(BStackGenOp::Write {
@@ -6974,7 +6974,7 @@ mod atomic_tests {
             .process_gen(|| {
                 // SAFETY: `old` outlives this whole `process_gen` call.
                 Some(BStackGenOp::Splice {
-                    old: unsafe { core::mem::transmute::<&mut [u8], _>(&mut old[..]) },
+                    old: bstack_unsafe_reborrow_mut!(&mut old[..]),
                     new: b"x",
                 })
             })
@@ -7030,7 +7030,7 @@ mod atomic_tests {
             match calls {
                 // SAFETY: `size` outlives this whole `process_gen` call.
                 1 => Some(BStackGenOp::Len {
-                    out: unsafe { core::mem::transmute::<&mut u64, _>(&mut size) },
+                    out: bstack_unsafe_reborrow_mut!(&mut size),
                 }),
                 _ => Some(BStackGenOp::Sparse {
                     writes: &writes,
@@ -7140,7 +7140,7 @@ mod atomic_tests {
             match calls {
                 // SAFETY: `size` outlives this whole `process_gen` call.
                 1 => Some(BStackGenOp::Len {
-                    out: unsafe { core::mem::transmute::<&mut u64, _>(&mut size) },
+                    out: bstack_unsafe_reborrow_mut!(&mut size),
                 }),
                 _ => Some(BStackGenOp::Discard { len: size - 4 }),
             }
@@ -7165,7 +7165,7 @@ mod atomic_tests {
             match calls {
                 // SAFETY: `size` outlives this whole `process_gen` call.
                 1 => Some(BStackGenOp::Len {
-                    out: unsafe { core::mem::transmute::<&mut u64, _>(&mut size) },
+                    out: bstack_unsafe_reborrow_mut!(&mut size),
                 }),
                 _ => None,
             }
@@ -7197,14 +7197,14 @@ mod atomic_tests {
             let r = match step {
                 // SAFETY: `size` outlives this whole `process_gen` call.
                 0 => Some(BStackGenOp::Len {
-                    out: unsafe { core::mem::transmute::<&mut u64, _>(&mut size) },
+                    out: bstack_unsafe_reborrow_mut!(&mut size),
                 }),
                 1 => {
                     let n = (size - 8) as usize;
                     buf = vec![0u8; n];
                     // SAFETY: `buf` outlives this whole `process_gen` call.
                     Some(BStackGenOp::Pop {
-                        buf: unsafe { core::mem::transmute::<&mut [u8], _>(&mut buf[..]) },
+                        buf: bstack_unsafe_reborrow_mut!(&mut buf[..]),
                     })
                 }
                 _ => None,
@@ -7278,9 +7278,7 @@ mod atomic_tests {
                                 0 => Some(BStackGenOp::Read {
                                     offset: 0,
                                     // SAFETY: `buf` outlives this whole `process_gen` call.
-                                    buf: unsafe {
-                                        core::mem::transmute::<&mut [u8], _>(&mut buf[..])
-                                    },
+                                    buf: bstack_unsafe_reborrow_mut!(&mut buf[..]),
                                 }),
                                 1 => {
                                     let v = u64::from_le_bytes(buf) + 1;
@@ -7288,7 +7286,7 @@ mod atomic_tests {
                                     Some(BStackGenOp::Write {
                                         offset: 0,
                                         // SAFETY: `buf` outlives this whole `process_gen` call.
-                                        data: unsafe { core::mem::transmute::<&[u8], _>(&buf[..]) },
+                                        data: bstack_unsafe_reborrow!(&buf[..]),
                                     })
                                 }
                                 _ => None,
@@ -7369,9 +7367,7 @@ mod atomic_tests {
                             0 => Some(BStackGenOp::Read {
                                 offset: 0,
                                 // SAFETY: `head_buf` outlives this whole `process_gen` call.
-                                buf: unsafe {
-                                    core::mem::transmute::<&mut [u8], _>(&mut head_buf[..])
-                                },
+                                buf: bstack_unsafe_reborrow_mut!(&mut head_buf[..]),
                             }),
                             1 => {
                                 let head = u64::from_le_bytes(head_buf);
@@ -7383,16 +7379,14 @@ mod atomic_tests {
                                     Some(BStackGenOp::Read {
                                         offset: head,
                                         // SAFETY: `next_buf` outlives this whole `process_gen` call.
-                                        buf: unsafe {
-                                            core::mem::transmute::<&mut [u8], _>(&mut next_buf[..])
-                                        },
+                                        buf: bstack_unsafe_reborrow_mut!(&mut next_buf[..]),
                                     })
                                 }
                             }
                             2 => Some(BStackGenOp::Write {
                                 offset: 0,
                                 // SAFETY: `next_buf` outlives this whole `process_gen` call.
-                                data: unsafe { core::mem::transmute::<&[u8], _>(&next_buf[..]) },
+                                data: bstack_unsafe_reborrow!(&next_buf[..]),
                             }),
                             _ => None,
                         };
@@ -7478,7 +7472,7 @@ mod atomic_tests {
                             // SAFETY: `buf` outlives this whole `process_gen` call.
                             Some(BStackGenOp::Read {
                                 offset: 0,
-                                buf: unsafe { core::mem::transmute::<&mut [u8], _>(&mut buf[..]) },
+                                buf: bstack_unsafe_reborrow_mut!(&mut buf[..]),
                             })
                         }
                         1 => {
@@ -7701,11 +7695,11 @@ mod atomic_tests {
             let r = match step {
                 0 => Some(BStackGenOp::Write {
                     offset: 0,
-                    data: unsafe { core::mem::transmute::<&[u8], _>(&src[..]) },
+                    data: bstack_unsafe_reborrow!(&src[..]),
                 }),
                 1 => Some(BStackGenOp::Read {
                     offset: 0,
-                    buf: unsafe { core::mem::transmute::<&mut [u8], _>(&mut rbuf[..]) },
+                    buf: bstack_unsafe_reborrow_mut!(&mut rbuf[..]),
                 }),
                 _ => None,
             };
@@ -7739,21 +7733,21 @@ mod atomic_tests {
             let r = match step {
                 0 => Some(BStackGenOp::Write {
                     offset: 2,
-                    data: unsafe { core::mem::transmute::<&[u8], _>(&a[..]) },
+                    data: bstack_unsafe_reborrow!(&a[..]),
                 }),
                 1 => Some(BStackGenOp::Write {
                     offset: 10,
-                    data: unsafe { core::mem::transmute::<&[u8], _>(&b[..]) },
+                    data: bstack_unsafe_reborrow!(&b[..]),
                 }),
                 2 => Some(BStackGenOp::Write {
                     offset: 22,
-                    data: unsafe { core::mem::transmute::<&[u8], _>(&c[..]) },
+                    data: bstack_unsafe_reborrow!(&c[..]),
                 }),
                 // Read a middle window [4, 24) that clips edit A on its left,
                 // fully contains B, and clips C on its right.
                 3 => Some(BStackGenOp::Read {
                     offset: 4,
-                    buf: unsafe { core::mem::transmute::<&mut [u8], _>(&mut rbuf[..20]) },
+                    buf: bstack_unsafe_reborrow_mut!(&mut rbuf[..20]),
                 }),
                 _ => None,
             };
@@ -7786,11 +7780,11 @@ mod atomic_tests {
             let r = match step {
                 0 => Some(BStackGenOp::Write {
                     offset: 0,
-                    data: unsafe { core::mem::transmute::<&[u8], _>(&first[..]) },
+                    data: bstack_unsafe_reborrow!(&first[..]),
                 }),
                 1 => Some(BStackGenOp::Write {
                     offset: 3,
-                    data: unsafe { core::mem::transmute::<&[u8], _>(&second[..]) },
+                    data: bstack_unsafe_reborrow!(&second[..]),
                 }),
                 _ => None,
             };
@@ -7826,19 +7820,19 @@ mod atomic_tests {
             let r = match step {
                 0 => Some(BStackGenOp::Write {
                     offset: 4,
-                    data: unsafe { core::mem::transmute::<&[u8], _>(&e1[..]) },
+                    data: bstack_unsafe_reborrow!(&e1[..]),
                 }),
                 1 => Some(BStackGenOp::Write {
                     offset: 14,
-                    data: unsafe { core::mem::transmute::<&[u8], _>(&e2[..]) },
+                    data: bstack_unsafe_reborrow!(&e2[..]),
                 }),
                 2 => Some(BStackGenOp::Write {
                     offset: 6,
-                    data: unsafe { core::mem::transmute::<&[u8], _>(&e3[..]) },
+                    data: bstack_unsafe_reborrow!(&e3[..]),
                 }),
                 3 => Some(BStackGenOp::Write {
                     offset: 2,
-                    data: unsafe { core::mem::transmute::<&[u8], _>(&e4[..]) },
+                    data: bstack_unsafe_reborrow!(&e4[..]),
                 }),
                 _ => None,
             };
@@ -7886,7 +7880,7 @@ mod atomic_tests {
             let r = match step {
                 0 => Some(BStackGenOp::Write {
                     offset: 0,
-                    data: unsafe { core::mem::transmute::<&[u8], _>(&data[..]) },
+                    data: bstack_unsafe_reborrow!(&data[..]),
                 }),
                 1 => Some(BStackGenOp::Push { data: b"!!!" }),
                 2 => Some(BStackGenOp::Sparse {

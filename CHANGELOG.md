@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`bstack_unsafe_reborrow!` / `bstack_unsafe_reborrow_mut!` and the `reborrow` module (base API): standardised lifetime-extending reborrows for `process_gen` / `inplace_gen` generators.** Replaces the `core::mem::transmute` that call sites previously open-coded to hand an op a scratch buffer captured by the closure (`E0521: borrowed data escapes outside of closure`). The macros change the borrow's lifetime and nothing else — the referent type is fixed by the underlying helper's signature, where an inferred-target `transmute` could silently reinterpret the pointee — and need no `unsafe` block at the call site, the `unsafe` in the name carrying the marking. The safety obligations, including `inplace_gen`'s stricter one (staged `Write` payloads are retained, so their buffers stay frozen until the batch commits), are documented on the module. No feature gate; no behaviour change.
+
 ### Changed
 
 - **`#[must_use]` (Rust) / `BSTACK_WARN_UNUSED_RESULT` (C) added across the public API.** Functions whose return value reports success/failure or hands back a result that shouldn't be silently discarded now warn at compile time if the caller ignores them; `Result`-returning Rust functions are untouched, since `Result` is already `#[must_use]` at the type level. No behaviour change.
