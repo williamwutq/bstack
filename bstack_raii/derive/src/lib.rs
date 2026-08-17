@@ -18,6 +18,7 @@ mod cast;
 mod emit;
 mod util;
 mod enum_;
+mod layout;
 
 /// `#[bstack_block]` — generate the on-disk layout and typed handle machinery.
 ///

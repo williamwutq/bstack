@@ -6,6 +6,7 @@ use quote::{format_ident, quote};
 use syn::{Error, Fields, Ident, Type};
 
 use crate::emit::*;
+use crate::layout;
 use crate::util::*;
 
 /// Implementation of the `#[bstack_enum]` attribute macro.
@@ -133,61 +134,11 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
             )
         };
 
-    // The on-disk discriminant. Each variant's value follows Rust's rules
-    // (explicit `= N`, else previous + 1); the width is an explicit `repr(..)`
-    // or, absent that, the smallest integer type that fits every value.
-    let disc_values: Vec<i128> = {
-        let mut next: i128 = 0;
-        let mut out: Vec<i128> = Vec::with_capacity(input.variants.len());
-        for v in &input.variants {
-            let d = match &v.discriminant {
-                Some((_, expr)) => parse_disc_expr(expr)?,
-                None => next,
-            };
-            // The macro replaces the enum, so rustc's E0081 never fires; a
-            // duplicate would only surface as an `unreachable_patterns` warning on
-            // the generated match (and read the wrong variant). Reject it clearly.
-            if out.contains(&d) {
-                return Err(Error::new_spanned(
-                    v,
-                    format!("discriminant value `{d}` assigned more than once"),
-                ));
-            }
-            out.push(d);
-            next = d
-                .checked_add(1)
-                .ok_or_else(|| Error::new_spanned(v, "#[bstack_enum] discriminant overflow"))?;
-        }
-        out
-    };
-    let dmin = disc_values.iter().copied().min().unwrap_or(0);
-    let dmax = disc_values.iter().copied().max().unwrap_or(0);
-    let disc_ty_name: String = match &attr.repr {
-        Some(r) => {
-            let (lo, hi) = int_bounds(r);
-            if dmin < lo || dmax > hi {
-                return Err(Error::new_spanned(
-                    &input.variants,
-                    format!(
-                        "a discriminant value is out of range for `repr({r})` \
-                         (values span {dmin}..={dmax})"
-                    ),
-                ));
-            }
-            r.clone()
-        }
-        None => infer_disc_ty(dmin, dmax).to_string(),
-    };
-    let disc_ty: TokenStream = disc_ty_name.parse().expect("valid integer type name");
-    // Typed literal patterns for the match arms / stored value (e.g. `300u16`).
-    let disc_pats: Vec<TokenStream> = disc_values
-        .iter()
-        .map(|v| {
-            format!("{v}{disc_ty_name}")
-                .parse()
-                .expect("valid integer literal")
-        })
-        .collect();
+    // The on-disk discriminant width + per-variant literal patterns.
+    let layout::Discriminants {
+        ty: disc_ty,
+        pats: disc_pats,
+    } = layout::discriminants(&input.variants, &attr.repr)?;
 
     let name = &input.ident;
     let vis = &input.vis;
@@ -2473,23 +2424,12 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
             impl #enum_decl_g ::core::marker::Copy for #name #enum_decl_ty_g #enum_decl_where {}
         }
     };
+    // The payload area size const (max over all variants), folded at const-eval.
+    let payload_const_def = layout::payload_const_def(vis, &payload_const, &payload_sizes);
     Ok(quote! {
         #enum_handle_def
 
-        #[doc(hidden)]
-        #[allow(non_upper_case_globals)]
-        #vis const #payload_const: usize = {
-            let __s = [0usize #(, #payload_sizes)*];
-            let mut __m = 0usize;
-            let mut __i = 0usize;
-            while __i < __s.len() {
-                if __s[__i] > __m {
-                    __m = __s[__i];
-                }
-                __i += 1;
-            }
-            __m
-        };
+        #payload_const_def
 
         impl #enum_impl_g #name #enum_ty_g #enum_where {
             /// The payload area size (bytes) — the max over all variants.
