@@ -15,6 +15,8 @@ use proc_macro::TokenStream;
 
 mod block;
 mod cast;
+mod common;
+mod enum_;
 
 /// `#[bstack_block]` — generate the on-disk layout and typed handle machinery.
 ///
@@ -109,7 +111,7 @@ pub fn bstack_block(args: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn bstack_enum(args: TokenStream, item: TokenStream) -> TokenStream {
     let input = syn::parse_macro_input!(item as syn::ItemEnum);
-    match block::expand_enum(args.into(), input) {
+    match enum_::expand_enum(args.into(), input) {
         Ok(ts) => ts.into(),
         Err(e) => e.to_compile_error().into(),
     }
