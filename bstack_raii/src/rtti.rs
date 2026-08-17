@@ -48,6 +48,8 @@
 //! [`get`](RttiRegistry::get) reads one field, [`set`](RttiRegistry::set) overwrites
 //! a POD / `ref` leaf, and [`swap`](RttiRegistry::swap) exchanges an owning reference
 //! for another (eightcc-checked), handing the old target back.
+//! [`move_out`](RttiRegistry::move_out) disassembles a block into its owned parts (a
+//! [`SmallStringMap`]`<`[`Moved`]`>`), freeing only the shell — the RTTI `bstack_move!`.
 //!
 //! [`AnyRef`] bridges back to compiled-in types: it is the RTTI `&dyn Any`, whose
 //! [`downcast`](AnyRef::downcast) hands back a real typed handle on an eightcc match,
@@ -68,6 +70,7 @@ use crate::layout::{
     RC_REFCOUNT_OFFSET,
 };
 use crate::refcount;
+use crate::small_map::SmallStringMap;
 
 /// Re-exports so the `#[bstack_class]` macro's generated registration code can name
 /// `linkme` without the downstream crate depending on it directly. The generated
@@ -902,6 +905,44 @@ pub enum Value {
     Class(Box<[u8]>),
 }
 
+/// A whole vector moved out of a block by [`RttiRegistry::move_out`]: ownership of its
+/// data block and every element, transferred as a unit — the RTTI analog of a
+/// detached `BStackVec` handle. (A vec data block has no eightcc, so [`AnyRef`] can't
+/// represent it.) The caller owns it: free the data block (and its owned elements) to
+/// discard, or re-attach it to another vector field.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VecRef {
+    /// The vector's data block start (a `BStackByteVec`: `len` @0, `cap` @8, elements
+    /// from 16).
+    pub data_off: u64,
+    /// The data block's allocated byte size (for reclaiming it).
+    pub data_size: u64,
+    /// The element shape (POD width, or a reference kind carrying the element tag).
+    pub elem: Shape,
+}
+
+/// One immediate field moved out of a block by [`RttiRegistry::move_out`], with its
+/// **ownership transferred to the caller** — the RTTI analog of a `bstack_move!` tuple
+/// element. POD comes out by value; references come out as [`AnyRef`]s the caller now
+/// owns (downcast / tear down / `swap` elsewhere).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Moved {
+    /// A POD field — or an inline POD array / tuple — copied out by value.
+    Pod(Box<[u8]>),
+    /// A single `owned` / `strong` / `ref` / (materialized) `embed` reference.
+    /// `None` if the field was null.
+    Ref(Option<AnyRef>),
+    /// A `weak` reference (its control block). `None` if unset.
+    Weak(Option<AnyRef>),
+    /// A whole vector, transferred as a unit (see [`VecRef`]). `None` if the vec slot
+    /// was empty / null.
+    Vec(Option<VecRef>),
+    /// A fixed reference **array**, moved element-by-element — its inline offset
+    /// storage lives in the freed shell, so unlike a vector there is no block to hand
+    /// back whole. `None` per null element.
+    List(Vec<Option<AnyRef>>),
+}
+
 /// One step of the non-recursive walk. The interpreter runs a `work` stack of these
 /// against a `results` value stack: leaf steps push a [`Value`]; an `Assemble*` step
 /// pops the `n` values its children pushed and combines them into one.
@@ -1708,6 +1749,203 @@ impl RttiRegistry {
         Ok((old != 0).then(|| AnyRef::new(tag, old)))
     }
 
+    /// **Disassemble** the block of type `ordinal` at `block_off`: hand back its
+    /// immediate fields as owned [`Moved`] parts, freeing **only the parent shell** —
+    /// the interpreted `bstack_move!`, the inverse of construction.
+    ///
+    /// Each field's ownership transfers to the returned [`SmallStringMap`] entry: POD
+    /// (and inline POD arrays / tuples) come out by value; `owned` / `strong` / `ref`
+    /// children come out as [`AnyRef`]s (the child block stays alive); a `weak` comes
+    /// out as its control [`AnyRef`]; a whole **vector** transfers as a [`VecRef`]
+    /// (its data block untouched, exactly like a detached `BStackVec`); a reference
+    /// **array** is handed out element-by-element (its inline storage dies with the
+    /// shell). An **`#[embed]`** child is *materialized* — copied into a fresh block
+    /// (so its grandchildren transfer with it) and returned as an `AnyRef`. Class
+    /// variables are skipped (schema-side). `foreign` is not yet supported.
+    ///
+    /// After this the block itself is gone; the caller owns every returned part and
+    /// must reuse or tear each down. On any error nothing is freed *except* orphaned
+    /// embed copies, so the object is left intact.
+    pub fn move_out<A: BStackRaiiAllocator>(
+        &self,
+        alloc: &A,
+        ordinal: RttiOrdinal,
+        block_off: u64,
+    ) -> io::Result<SmallStringMap<Moved>> {
+        let data = alloc.stack();
+        let mut cache: HashMap<RttiOrdinal, RttiType> = HashMap::new();
+        let mut materialized: Vec<BStackRange> = Vec::new();
+
+        let map = match self.move_fields(
+            alloc,
+            data,
+            ordinal,
+            block_off,
+            &mut cache,
+            &mut materialized,
+        ) {
+            Ok(m) => m,
+            Err(e) => {
+                // Object untouched; only orphaned embed copies (if any) are reclaimed.
+                let _ = alloc.free_many(std::mem::take(&mut materialized));
+                return Err(e);
+            }
+        };
+        // Free the shell only — children / vec data / embed copies are all transferred.
+        let shell = BStackRange::new(block_off, cache[&ordinal].ondisk_size);
+        if let Err(e) = alloc.free_many([shell]) {
+            let _ = alloc.free_many(std::mem::take(&mut materialized));
+            return Err(e);
+        }
+        Ok(map)
+    }
+
+    /// Read the root's immediate fields into a [`Moved`] map (the shell is freed by
+    /// the caller). Loads the root type into `cache`.
+    fn move_fields<A: BStackRaiiAllocator>(
+        &self,
+        alloc: &A,
+        data: &BStack,
+        ordinal: RttiOrdinal,
+        block_off: u64,
+        cache: &mut HashMap<RttiOrdinal, RttiType>,
+        materialized: &mut Vec<BStackRange>,
+    ) -> io::Result<SmallStringMap<Moved>> {
+        if let std::collections::hash_map::Entry::Vacant(e) = cache.entry(ordinal) {
+            e.insert(self.load_type(ordinal)?);
+        }
+        // Own the (fields, base) so the `cache` borrow is released before `move_field`
+        // needs it mutably (for embed / stride lookups).
+        let (fields, base): (Vec<RttiField>, u64) = {
+            let ty = &cache[&ordinal];
+            match &ty.body {
+                RttiBody::Struct(f) => (f.clone(), block_off),
+                RttiBody::Enum(e) => {
+                    let raw = read_disc(data, block_off + e.disc_off as u64, e.disc_width)?;
+                    let mask = disc_mask(e.disc_width);
+                    let variant = e
+                        .variants
+                        .iter()
+                        .find(|v| (v.disc_value as u64) & mask == raw)
+                        .ok_or_else(|| {
+                            corrupt(format!(
+                                "[BSTACK0808] no RTTI variant for discriminant {raw}"
+                            ))
+                        })?;
+                    (variant.fields.clone(), block_off + e.payload_off as u64)
+                }
+            }
+        };
+
+        let mut map = SmallStringMap::with_capacity(fields.len());
+        for f in &fields {
+            // Class variables live in the schema, not the instance — nothing to move.
+            if matches!(f.shape, Shape::Class { .. }) {
+                continue;
+            }
+            let moved = self.move_field(
+                alloc,
+                data,
+                &f.shape,
+                base + f.offset as u64,
+                cache,
+                materialized,
+            )?;
+            map.insert(f.name.clone(), moved);
+        }
+        Ok(map)
+    }
+
+    /// Move one field out: read its value / capture its reference, transferring
+    /// ownership. `#[embed]` allocates a materialized copy (recorded in `materialized`
+    /// so a later failure can reclaim it).
+    fn move_field<A: BStackRaiiAllocator>(
+        &self,
+        alloc: &A,
+        data: &BStack,
+        shape: &Shape,
+        off: u64,
+        cache: &mut HashMap<RttiOrdinal, RttiType>,
+        materialized: &mut Vec<BStackRange>,
+    ) -> io::Result<Moved> {
+        Ok(match shape {
+            Shape::Pod { width } => {
+                let mut buf = vec![0u8; *width as usize];
+                data.get_into(off, &mut buf)?;
+                Moved::Pod(buf.into())
+            }
+            Shape::Owned(tag) | Shape::Strong(tag) | Shape::Ref(tag) => {
+                let child = read_u64_at(data, off)?;
+                Moved::Ref((child != 0).then(|| AnyRef::new(*tag, child)))
+            }
+            Shape::Weak(tag) => {
+                let ctrl = read_u64_at(data, off)?;
+                Moved::Weak((ctrl != 0).then(|| AnyRef::new(*tag, ctrl)))
+            }
+            Shape::Embed(tag) => {
+                // Materialize the inline child into a standalone block (its offsets are
+                // byte-copied, so its grandchildren transfer with it).
+                let ord = self.ordinal_of(*tag).ok_or_else(unknown_tag)?;
+                if let std::collections::hash_map::Entry::Vacant(e) = cache.entry(ord) {
+                    e.insert(self.load_type(ord)?);
+                }
+                let size = cache[&ord].ondisk_size;
+                let slice = alloc.alloc(size)?;
+                let range = slice.as_range();
+                materialized.push(range);
+                data.copy(off, range.start(), size)?;
+                Moved::Ref(Some(AnyRef::new(*tag, range.start())))
+            }
+            Shape::Foreign(_) => return Err(move_unsupported()),
+            // The niche's `0` is handled by the inner leaf (which reads the same slot).
+            Shape::Option(inner) => {
+                self.move_field(alloc, data, inner, off, cache, materialized)?
+            }
+            Shape::Vec(inner) => {
+                let data_off = read_u64_at(data, off)?; // VecDesc.data_off @0
+                if data_off == 0 {
+                    Moved::Vec(None)
+                } else {
+                    Moved::Vec(Some(VecRef {
+                        data_off,
+                        data_size: read_u64_at(data, off + 8)?,
+                        elem: (**inner).clone(),
+                    }))
+                }
+            }
+            Shape::Array { n, inner } => {
+                if shape_has_reference(inner) {
+                    // A reference array: each element is a `u64` at `off + i*8`.
+                    let tag = element_ref_tag(inner).ok_or_else(move_unsupported)?;
+                    let mut list = Vec::with_capacity(*n as usize);
+                    for i in 0..*n as u64 {
+                        let e = read_u64_at(data, off + i * 8)?;
+                        list.push((e != 0).then(|| AnyRef::new(tag, e)));
+                    }
+                    Moved::List(list)
+                } else {
+                    // A POD array: the whole inline run of bytes.
+                    let total = *n as u64 * self.shape_stride(inner, cache)?;
+                    let mut buf = vec![0u8; total as usize];
+                    data.get_into(off, &mut buf)?;
+                    Moved::Pod(buf.into())
+                }
+            }
+            Shape::Tuple(items) => {
+                // A POD aggregate: its inline bytes (sum of element strides).
+                let mut total = 0u64;
+                for it in items {
+                    total += self.shape_stride(it, cache)?;
+                }
+                let mut buf = vec![0u8; total as usize];
+                data.get_into(off, &mut buf)?;
+                Moved::Pod(buf.into())
+            }
+            // Filtered out before this call, but keep the match total.
+            Shape::Class { .. } => Moved::Pod(Box::default()),
+        })
+    }
+
     /// Deep-clone the structure of type `ordinal` at `src_off` in `alloc`'s file,
     /// returning the **detached** clone's root offset (the caller links it) — the
     /// inverse of [`teardown`](Self::teardown).
@@ -2092,6 +2330,42 @@ fn swap_error(msg: impl std::fmt::Display) -> io::Error {
         io::ErrorKind::InvalidInput,
         format!("[BSTACK0810] RTTI swap: {msg}"),
     )
+}
+
+fn move_unsupported() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        "[BSTACK0811] RTTI move_out of a `foreign` reference (or an array of embedded / foreign / \
+         nested elements) is not yet supported",
+    )
+}
+
+/// Whether `shape` contains any block reference anywhere (so it is not pure POD).
+fn shape_has_reference(shape: &Shape) -> bool {
+    match shape {
+        Shape::Pod { .. } | Shape::Class { .. } => false,
+        Shape::Owned(_)
+        | Shape::Strong(_)
+        | Shape::Weak(_)
+        | Shape::Ref(_)
+        | Shape::Embed(_)
+        | Shape::Foreign(_) => true,
+        Shape::Option(inner) | Shape::Vec(inner) | Shape::Array { inner, .. } => {
+            shape_has_reference(inner)
+        }
+        Shape::Tuple(items) => items.iter().any(shape_has_reference),
+    }
+}
+
+/// The element tag of a reference-array element (`owned` / `strong` / `weak` / `ref`,
+/// optionally `Option`-wrapped) — its slot is a single `u64` offset. `None` for an
+/// element the move interpreter can't hand out one-per-`u64` (embed / foreign / nested).
+fn element_ref_tag(shape: &Shape) -> Option<EightCC> {
+    match shape {
+        Shape::Owned(t) | Shape::Strong(t) | Shape::Weak(t) | Shape::Ref(t) => Some(*t),
+        Shape::Option(inner) => element_ref_tag(inner),
+        _ => None,
+    }
 }
 
 fn clone_unsupported() -> io::Error {

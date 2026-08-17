@@ -7,7 +7,7 @@
 #![allow(dead_code)] // some fixtures are inspected only via RTTI, never instantiated
 
 use bstack::{BStack, BStackAllocator, FirstFitBStackAllocator};
-use bstack_raii::rtti::{self, AnyRef, RttiBody, Shape, Value};
+use bstack_raii::rtti::{self, AnyRef, Moved, RttiBody, Shape, Value};
 use bstack_raii::{
     BStackBlock, BStackCast, BStackDrop, BStackOwned, ForeignRepr, bstack_class, rtti_path,
 };
@@ -51,6 +51,13 @@ struct VecArr {
     coords: [u32; 3],
     #[bstack_owned]
     maybe: Option<Point>,
+}
+
+#[bstack_class]
+struct Embedder {
+    #[embed]
+    e: Point,
+    k: u32,
 }
 
 #[bstack_class(rc)]
@@ -888,4 +895,157 @@ fn rtti_path_macro_expands() {
     assert_eq!(one, &["n"]);
     let deep: &[&str] = rtti_path!(a.b.c.d);
     assert_eq!(deep, &["a", "b", "c", "d"]);
+}
+
+#[test]
+fn interpret_move_out_owned() {
+    let schema = temp_path("mv1_schema");
+    let reg = rtti::sync(&schema).unwrap();
+    let (alloc, dpath) = data_alloc("mv1_data");
+    let ord = reg.ordinal_of(<Wrap as BStackCast>::eightcc()).unwrap();
+    let pord = reg.ordinal_of(<Point as BStackCast>::eightcc()).unwrap();
+
+    let w = Wrap::new(&alloc, Point::new(&alloc, 1, 2).unwrap(), 5).unwrap();
+    let off = BStackBlock::range(w.handle()).start();
+
+    // Disassemble: the Wrap shell is freed; `n` comes out by value, `inner` as an
+    // AnyRef the caller now owns (the Point block survives).
+    let moved = reg.move_out(&alloc, ord, off).unwrap();
+    assert_eq!(moved.len(), 2);
+    let Moved::Pod(n) = &moved["n"] else {
+        panic!("n should be POD");
+    };
+    assert_eq!(&n[..], &5u32.to_le_bytes());
+    let Moved::Ref(Some(inner)) = &moved["inner"] else {
+        panic!("inner should be a moved reference");
+    };
+    assert_eq!(inner.tag(), <Point as BStackCast>::eightcc());
+    // The moved child is a live, downcastable Point.
+    let pt = inner.downcast::<Point>().expect("downcast");
+    assert_eq!(pt.get_x(alloc.stack()).unwrap(), 1);
+    assert_eq!(pt.get_y(alloc.stack()).unwrap(), 2);
+    // The caller owns it: tear it down.
+    reg.teardown(&alloc, pord, inner.offset()).unwrap();
+
+    // Leak oracle: a full build → move_out (frees shell) → teardown-child cycle
+    // returns to baseline (shell reclaimed, child reclaimed, nothing leaked).
+    let cycle = || {
+        let w = Wrap::new(&alloc, Point::new(&alloc, 1, 2).unwrap(), 5).unwrap();
+        let off = BStackBlock::range(w.handle()).start();
+        let moved = reg.move_out(&alloc, ord, off).unwrap();
+        let Moved::Ref(Some(inner)) = &moved["inner"] else {
+            panic!()
+        };
+        reg.teardown(&alloc, pord, inner.offset()).unwrap();
+    };
+    cycle();
+    let base = alloc.stack().len().unwrap();
+    cycle();
+    assert_eq!(alloc.stack().len().unwrap(), base, "move_out leaked");
+
+    drop(reg);
+    std::fs::remove_file(&schema).ok();
+    std::fs::remove_file(&dpath).ok();
+}
+
+#[test]
+fn interpret_move_out_embed_materializes() {
+    let schema = temp_path("mv2_schema");
+    let reg = rtti::sync(&schema).unwrap();
+    let (alloc, dpath) = data_alloc("mv2_data");
+    let ord = reg.ordinal_of(<Embedder as BStackCast>::eightcc()).unwrap();
+    let pord = reg.ordinal_of(<Point as BStackCast>::eightcc()).unwrap();
+
+    let em = Embedder::new(&alloc, Point::new(&alloc, 3, 4).unwrap(), 9).unwrap();
+    let off = BStackBlock::range(em.handle()).start();
+    let embed_inline = off + field_offset(&reg, ord, "e");
+
+    let moved = reg.move_out(&alloc, ord, off).unwrap();
+    let Moved::Ref(Some(e)) = &moved["e"] else {
+        panic!("embed should materialize into a reference");
+    };
+    // Materialized into a *fresh* block (not the original inline location).
+    assert_ne!(e.offset(), embed_inline);
+    let pt = e.downcast::<Point>().expect("downcast");
+    assert_eq!(pt.get_x(alloc.stack()).unwrap(), 3);
+    assert_eq!(pt.get_y(alloc.stack()).unwrap(), 4);
+    reg.teardown(&alloc, pord, e.offset()).unwrap();
+
+    // Leak oracle over the whole cycle (materialized copy + shell both reclaimed).
+    let cycle = || {
+        let em = Embedder::new(&alloc, Point::new(&alloc, 3, 4).unwrap(), 9).unwrap();
+        let off = BStackBlock::range(em.handle()).start();
+        let moved = reg.move_out(&alloc, ord, off).unwrap();
+        let Moved::Ref(Some(e)) = &moved["e"] else {
+            panic!()
+        };
+        reg.teardown(&alloc, pord, e.offset()).unwrap();
+    };
+    cycle();
+    let base = alloc.stack().len().unwrap();
+    cycle();
+    assert_eq!(alloc.stack().len().unwrap(), base, "embed move_out leaked");
+
+    drop(reg);
+    std::fs::remove_file(&schema).ok();
+    std::fs::remove_file(&dpath).ok();
+}
+
+#[test]
+fn interpret_move_out_vec_array_option() {
+    let schema = temp_path("mv3_schema");
+    let reg = rtti::sync(&schema).unwrap();
+    let (alloc, dpath) = data_alloc("mv3_data");
+    let ord = reg.ordinal_of(<VecArr as BStackCast>::eightcc()).unwrap();
+    let pord = reg.ordinal_of(<Point as BStackCast>::eightcc()).unwrap();
+
+    let v = VecArr::new(
+        &alloc,
+        &[10, 20, 30],
+        [1, 2, 3],
+        Some(Point::new(&alloc, 8, 9).unwrap()),
+    )
+    .unwrap();
+    let off = BStackBlock::range(v.handle()).start();
+
+    let moved = reg.move_out(&alloc, ord, off).unwrap();
+
+    // The whole POD vector transfers as one VecRef (its data block untouched).
+    let Moved::Vec(Some(vr)) = &moved["labels"] else {
+        panic!("labels should be a whole vec");
+    };
+    assert_eq!(vr.elem, Shape::Pod { width: 1 });
+    assert_eq!(read_u64(alloc.stack(), vr.data_off), 3); // len @0
+    let mut bytes = [0u8; 3];
+    alloc
+        .stack()
+        .get_into(vr.data_off + 16, &mut bytes)
+        .unwrap();
+    assert_eq!(bytes, [10, 20, 30]);
+
+    // The inline POD array comes out by value.
+    let Moved::Pod(coords) = &moved["coords"] else {
+        panic!("coords should be POD");
+    };
+    assert_eq!(coords.len(), 12); // [u32; 3]
+
+    // The optional owned child comes out as a reference.
+    let Moved::Ref(Some(maybe)) = &moved["maybe"] else {
+        panic!("maybe should be a moved reference");
+    };
+    assert_eq!(
+        maybe
+            .downcast::<Point>()
+            .unwrap()
+            .get_x(alloc.stack())
+            .unwrap(),
+        8
+    );
+
+    // Reclaim the transferred parts (the shell is already gone).
+    reg.teardown(&alloc, pord, maybe.offset()).unwrap();
+
+    drop(reg);
+    std::fs::remove_file(&schema).ok();
+    std::fs::remove_file(&dpath).ok();
 }

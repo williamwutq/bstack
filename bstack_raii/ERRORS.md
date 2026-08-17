@@ -415,6 +415,13 @@ supported), or `new`'s eightcc does not equal the field's declared type. **Fix:*
 `swap` an owning data-reference field with an `AnyRef` of the *same* type; use `set`
 for a POD/`ref` field.
 
+### BSTACK0811 — RTTI `move_out` of an unsupported field
+`move_out` reached a `foreign` reference, or a reference **array** whose element is an
+`embed` / `foreign` / nested-array shape (there is no single `u64` slot per element to
+hand out). **Fix:** move a structure with `foreign` fields through its compiled-in
+`bstack_move!` for now, and prefer a `Vec` (handed back whole) or a flat
+`[owned/strong/weak/ref; N]` array (handed out element-by-element).
+
 ### BSTACK080E — RTTI clone internal invariant
 A clone finished the walk but a child block (or the root) was not recorded in the
 source→clone map — only possible if the source structure was mutated concurrently
