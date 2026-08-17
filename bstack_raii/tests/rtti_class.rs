@@ -572,3 +572,146 @@ fn interpret_teardown_reclaims_vec_array_and_option() {
     std::fs::remove_file(&schema).ok();
     std::fs::remove_file(&dpath).ok();
 }
+
+fn read_u64(data: &BStack, off: u64) -> u64 {
+    let mut b = [0u8; 8];
+    data.get_into(off, &mut b).unwrap();
+    u64::from_le_bytes(b)
+}
+
+fn field_offset(reg: &rtti::RttiRegistry, ord: u32, name: &str) -> u64 {
+    match reg.load_type(ord).unwrap().body {
+        RttiBody::Struct(f) => f.iter().find(|x| x.name == name).unwrap().offset as u64,
+        _ => panic!("not a struct"),
+    }
+}
+
+#[test]
+fn interpret_set_pod_field() {
+    let schema = temp_path("set_schema");
+    let reg = rtti::sync(&schema).unwrap();
+    let (alloc, dpath) = data_alloc("set_data");
+    let ord = reg.ordinal_of(<Point as BStackCast>::eightcc()).unwrap();
+
+    let p = Point::new(&alloc, 7, 9).unwrap();
+    let off = BStackBlock::range(p.handle()).start();
+
+    // Overwrite `x`; `y` is untouched.
+    reg.set_pod(alloc.stack(), ord, "x", off, &42u32.to_le_bytes())
+        .unwrap();
+    assert_eq!(p.handle().get_x(alloc.stack()).unwrap(), 42);
+    assert_eq!(p.handle().get_y(alloc.stack()).unwrap(), 9);
+
+    // Wrong width and unknown field are rejected.
+    assert!(reg.set_pod(alloc.stack(), ord, "x", off, &[1, 2]).is_err());
+    assert!(
+        reg.set_pod(alloc.stack(), ord, "z", off, &0u32.to_le_bytes())
+            .is_err()
+    );
+
+    p.bstack_drop(&alloc).unwrap();
+    drop(reg);
+    std::fs::remove_file(&schema).ok();
+    std::fs::remove_file(&dpath).ok();
+}
+
+#[test]
+fn interpret_clone_equal_and_independent() {
+    let schema = temp_path("cl1_schema");
+    let reg = rtti::sync(&schema).unwrap();
+    let (alloc, dpath) = data_alloc("cl1_data");
+    let ord = reg.ordinal_of(<Wrap as BStackCast>::eightcc()).unwrap();
+
+    let inner = Point::new(&alloc, 1, 2).unwrap();
+    let w = Wrap::new(&alloc, inner, 5).unwrap();
+    let src = BStackBlock::range(w.handle()).start();
+
+    // Clone → a distinct, detached root whose Value tree equals the source's.
+    let dst = reg.clone_value(&alloc, ord, src).unwrap();
+    assert_ne!(dst, src);
+    let src_val = reg.read_value(alloc.stack(), ord, src).unwrap();
+    assert_eq!(reg.read_value(alloc.stack(), ord, dst).unwrap(), src_val);
+
+    // The owned child was deep-copied: mutating the source leaves the clone intact.
+    reg.set_pod(alloc.stack(), ord, "n", src, &99u32.to_le_bytes())
+        .unwrap();
+    assert_eq!(reg.read_value(alloc.stack(), ord, dst).unwrap(), src_val);
+    assert_ne!(reg.read_value(alloc.stack(), ord, src).unwrap(), src_val);
+
+    // Both trees tear down independently (no shared blocks, no double free).
+    reg.teardown(&alloc, ord, src).unwrap();
+    reg.teardown(&alloc, ord, dst).unwrap();
+
+    drop(reg);
+    std::fs::remove_file(&schema).ok();
+    std::fs::remove_file(&dpath).ok();
+}
+
+#[test]
+fn interpret_clone_then_teardown_reclaims() {
+    let schema = temp_path("cl2_schema");
+    let reg = rtti::sync(&schema).unwrap();
+    let (alloc, dpath) = data_alloc("cl2_data");
+    let ord = reg.ordinal_of(<VecArr as BStackCast>::eightcc()).unwrap();
+
+    // A full build → clone → teardown-both cycle must return to baseline: the clone
+    // reproduces every owned block (vec data, option child) and both are reclaimed.
+    let cycle = || {
+        let v = VecArr::new(
+            &alloc,
+            &[10, 20, 30],
+            [1, 2, 3],
+            Some(Point::new(&alloc, 8, 9).unwrap()),
+        )
+        .unwrap();
+        let src = BStackBlock::range(v.handle()).start();
+        let dst = reg.clone_value(&alloc, ord, src).unwrap();
+        reg.teardown(&alloc, ord, src).unwrap();
+        reg.teardown(&alloc, ord, dst).unwrap();
+    };
+
+    cycle();
+    let base = alloc.stack().len().unwrap();
+    cycle();
+    assert_eq!(alloc.stack().len().unwrap(), base, "clone/teardown leaked");
+
+    drop(reg);
+    std::fs::remove_file(&schema).ok();
+    std::fs::remove_file(&dpath).ok();
+}
+
+#[test]
+fn interpret_clone_shares_strong() {
+    let schema = temp_path("cl3_schema");
+    let reg = rtti::sync(&schema).unwrap();
+    let (alloc, dpath) = data_alloc("cl3_data");
+    let ord = reg.ordinal_of(<RcHolder as BStackCast>::eightcc()).unwrap();
+    let soff = field_offset(&reg, ord, "s");
+
+    // The leak oracle also proves sharing: a *copy* of the rc cell would need two
+    // frees, but a shared clone bumps the refcount to 2 and both holders tearing
+    // down reclaim the single cell exactly once.
+    let cycle = || {
+        let cell = RCell::new(&alloc, 5).unwrap();
+        let h = RcHolder::new(&alloc, cell).unwrap();
+        let src = BStackBlock::range(h.handle()).start();
+        let dst = reg.clone_value(&alloc, ord, src).unwrap();
+        // The strong field points at the *same* cell in both holders (shared).
+        assert_eq!(
+            read_u64(alloc.stack(), src + soff),
+            read_u64(alloc.stack(), dst + soff),
+            "strong clone must share the target, not copy it"
+        );
+        reg.teardown(&alloc, ord, src).unwrap(); // refcount 2 -> 1 (cell alive)
+        reg.teardown(&alloc, ord, dst).unwrap(); // refcount 1 -> 0 (cell freed)
+    };
+
+    cycle();
+    let base = alloc.stack().len().unwrap();
+    cycle();
+    assert_eq!(alloc.stack().len().unwrap(), base, "strong clone leaked");
+
+    drop(reg);
+    std::fs::remove_file(&schema).ok();
+    std::fs::remove_file(&dpath).ok();
+}

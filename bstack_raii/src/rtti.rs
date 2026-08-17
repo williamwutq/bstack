@@ -37,11 +37,12 @@
 //! appends every missing schema to a file. [`RttiRegistry::read_value`] /
 //! [`RttiRegistry::read_ptr`] are the non-recursive **read interpreter** (schema over
 //! a live data file → a [`Value`] tree, no compiled-in types), and
-//! [`RttiRegistry::teardown`] is the non-recursive **free interpreter** — it reclaims
-//! `owned` / `embed` / `strong` / `weak` / `ref` / `vec` / array / tuple / option
-//! structures (refcount decrements and all). Still TODO: cross-file `foreign`
-//! teardown, the *writing* interpreter (set / clone), and live mutable-class-variable
-//! writes.
+//! [`RttiRegistry::teardown`] is the non-recursive **free interpreter** (reclaims
+//! `owned` / `embed` / `strong` / `weak` / `ref` / `vec` / array / tuple / option,
+//! refcount decrements and all), [`RttiRegistry::set_pod`] overwrites a POD field in
+//! place, and [`RttiRegistry::clone_value`] is the non-recursive **deep-clone
+//! interpreter** (owned deep-copied, shared refcount-bumped). Still TODO: cross-file
+//! `foreign` teardown / clone, and live mutable-class-variable writes.
 
 use std::collections::HashMap;
 use std::io;
@@ -853,6 +854,42 @@ enum TdOp {
     Shape { shape: Shape, offset: u64 },
 }
 
+/// One step of the non-recursive clone walk (see [`RttiRegistry::clone_value`]).
+enum CloneOp {
+    /// Allocate + byte-copy a fresh block of type `ord` from `src_off`, then walk its
+    /// fields to clone owned sub-structure and record shared-target bumps.
+    Block { src_off: u64, ord: RttiOrdinal },
+    /// Walk an inline `#[embed]` region's fields (no allocation — its bytes are part
+    /// of the already-copied parent block), fixing up owned grandchildren.
+    Inline {
+        src_base: u64,
+        new_base: u64,
+        ord: RttiOrdinal,
+    },
+    /// Interpret one shape given its source and (already-copied) destination offsets.
+    Field {
+        shape: Shape,
+        src_off: u64,
+        new_off: u64,
+    },
+}
+
+/// The accumulating state of one deep clone (see [`RttiRegistry::clone_value`]).
+#[derive(Default)]
+struct CloneState {
+    /// Decoded-type cache, shared with [`RttiRegistry::shape_stride`].
+    cache: HashMap<RttiOrdinal, RttiType>,
+    /// `source block offset → fresh clone offset`, for repointing owned children.
+    map: HashMap<u64, u64>,
+    /// Deferred child-pointer patches: `(new slot offset, source child offset)` — the
+    /// slot is set to `map[source child]` once every block has been cloned.
+    patches: Vec<(u64, u64)>,
+    /// Refcount counters to bump (shared `strong` / `weak` targets), applied last.
+    bumps: Vec<u64>,
+    /// Every freshly allocated range, so a failed clone frees its orphans.
+    allocated: Vec<BStackRange>,
+}
+
 /// Bytes of a `VecDesc` (`data_off:u64` @0, `data_size:u64` @8) — the inline
 /// descriptor of a persistent vector.
 const VECDESC_LEN: u64 = 16;
@@ -1375,6 +1412,369 @@ impl RttiRegistry {
         Ok(())
     }
 
+    /// Overwrite a top-level **POD** field of the struct at `block_off` with `value`
+    /// (the field's exact-width little-endian bytes) — the interpreted `set_<field>`,
+    /// one atomic write. The mirror of a POD read.
+    ///
+    /// Errors if the type is an enum, the field is absent or not POD, or `value` is
+    /// the wrong width. (Reference / owned fields are not overwritten here — that is
+    /// replace = teardown-old + clone-new, a separate operation.)
+    pub fn set_pod(
+        &self,
+        data: &BStack,
+        ordinal: RttiOrdinal,
+        field_name: &str,
+        block_off: u64,
+        value: &[u8],
+    ) -> io::Result<()> {
+        let ty = self.load_type(ordinal)?;
+        let RttiBody::Struct(fields) = &ty.body else {
+            return Err(set_error(
+                "cannot set a field of an enum (it is whole-value)",
+            ));
+        };
+        let field = fields
+            .iter()
+            .find(|f| f.name == field_name)
+            .ok_or_else(|| set_error(format!("no field named `{field_name}`")))?;
+        let Shape::Pod { width } = field.shape else {
+            return Err(set_error(format!(
+                "field `{field_name}` is not a POD field"
+            )));
+        };
+        if value.len() != width as usize {
+            return Err(set_error(format!(
+                "field `{field_name}` is {width} bytes, got {}",
+                value.len()
+            )));
+        }
+        data.set(block_off + field.offset as u64, value)
+    }
+
+    /// Deep-clone the structure of type `ordinal` at `src_off` in `alloc`'s file,
+    /// returning the **detached** clone's root offset (the caller links it) — the
+    /// inverse of [`teardown`](Self::teardown).
+    ///
+    /// The walk is **non-recursive**. Owned (`owned` / `embed`) sub-structure is
+    /// byte-copied into fresh blocks and repointed; shared references stay shared —
+    /// a `strong` bumps the target's strong count, a `weak` bumps its weak count,
+    /// a `ref` is a byte-copied alias; POD is copied verbatim. Vectors get a fresh
+    /// data block (and cloned owned elements). Every allocation is orphaned until the
+    /// caller links the root, so a crash mid-clone leaks but never corrupts; on any
+    /// error the partial clone's blocks are freed. Cross-file `foreign` references
+    /// are not yet supported (they error).
+    pub fn clone_value<A: BStackRaiiAllocator>(
+        &self,
+        alloc: &A,
+        ordinal: RttiOrdinal,
+        src_off: u64,
+    ) -> io::Result<u64> {
+        let data = alloc.stack();
+        let mut st = CloneState::default();
+        match self.clone_build(alloc, data, ordinal, src_off, &mut st) {
+            Ok(new_root) => Ok(new_root),
+            Err(e) => {
+                // Reclaim the orphaned partial clone (leak-free error path).
+                let _ = alloc.free_many(std::mem::take(&mut st.allocated));
+                Err(e)
+            }
+        }
+    }
+
+    /// The clone walk + the deferred child-repointing and refcount bumps. Split out
+    /// so [`clone_value`](Self::clone_value) can free `st.allocated` on any error.
+    fn clone_build<A: BStackRaiiAllocator>(
+        &self,
+        alloc: &A,
+        data: &BStack,
+        ordinal: RttiOrdinal,
+        root_src: u64,
+        st: &mut CloneState,
+    ) -> io::Result<u64> {
+        let mut work: Vec<CloneOp> = vec![CloneOp::Block {
+            src_off: root_src,
+            ord: ordinal,
+        }];
+        let mut budget: u64 = 4_000_000;
+
+        while let Some(op) = work.pop() {
+            budget = budget.checked_sub(1).ok_or_else(|| {
+                corrupt("[BSTACK0807] RTTI clone budget exceeded (corrupt data or a cycle?)")
+            })?;
+            match op {
+                CloneOp::Block { src_off, ord } => {
+                    self.ensure_type(ord, st)?;
+                    let size = st.cache[&ord].ondisk_size;
+                    let new_off = self.alloc_copy(alloc, data, src_off, size, st)?;
+                    st.map.insert(src_off, new_off);
+                    // Walk the fields at matching source / destination offsets.
+                    let ty = &st.cache[&ord];
+                    match &ty.body {
+                        RttiBody::Struct(fields) => {
+                            for f in fields {
+                                work.push(CloneOp::Field {
+                                    shape: f.shape.clone(),
+                                    src_off: src_off + f.offset as u64,
+                                    new_off: new_off + f.offset as u64,
+                                });
+                            }
+                        }
+                        RttiBody::Enum(e) => {
+                            let raw = read_disc(data, src_off + e.disc_off as u64, e.disc_width)?;
+                            let mask = disc_mask(e.disc_width);
+                            let variant = e
+                                .variants
+                                .iter()
+                                .find(|v| (v.disc_value as u64) & mask == raw)
+                                .ok_or_else(|| {
+                                    corrupt(format!(
+                                        "[BSTACK0808] no RTTI variant for discriminant {raw}"
+                                    ))
+                                })?;
+                            let sp = src_off + e.payload_off as u64;
+                            let np = new_off + e.payload_off as u64;
+                            for f in &variant.fields {
+                                work.push(CloneOp::Field {
+                                    shape: f.shape.clone(),
+                                    src_off: sp + f.offset as u64,
+                                    new_off: np + f.offset as u64,
+                                });
+                            }
+                        }
+                    }
+                }
+
+                CloneOp::Inline {
+                    src_base,
+                    new_base,
+                    ord,
+                } => {
+                    self.ensure_type(ord, st)?;
+                    let ty = &st.cache[&ord];
+                    match &ty.body {
+                        RttiBody::Struct(fields) => {
+                            for f in fields {
+                                work.push(CloneOp::Field {
+                                    shape: f.shape.clone(),
+                                    src_off: src_base + f.offset as u64,
+                                    new_off: new_base + f.offset as u64,
+                                });
+                            }
+                        }
+                        RttiBody::Enum(e) => {
+                            let raw = read_disc(data, src_base + e.disc_off as u64, e.disc_width)?;
+                            let mask = disc_mask(e.disc_width);
+                            let variant = e
+                                .variants
+                                .iter()
+                                .find(|v| (v.disc_value as u64) & mask == raw)
+                                .ok_or_else(|| {
+                                    corrupt(format!(
+                                        "[BSTACK0808] no RTTI variant for discriminant {raw}"
+                                    ))
+                                })?;
+                            let sp = src_base + e.payload_off as u64;
+                            let np = new_base + e.payload_off as u64;
+                            for f in &variant.fields {
+                                work.push(CloneOp::Field {
+                                    shape: f.shape.clone(),
+                                    src_off: sp + f.offset as u64,
+                                    new_off: np + f.offset as u64,
+                                });
+                            }
+                        }
+                    }
+                }
+
+                CloneOp::Field {
+                    shape,
+                    src_off,
+                    new_off,
+                } => match shape {
+                    // Copied verbatim: inline bytes, a schema value, or a `ref` alias.
+                    Shape::Pod { .. } | Shape::Class { .. } | Shape::Ref(_) => {}
+                    Shape::Owned(tag) => {
+                        let child = read_u64_at(data, src_off)?;
+                        if child != 0 {
+                            let ord = self.ordinal_of(tag).ok_or_else(unknown_tag)?;
+                            st.patches.push((new_off, child));
+                            work.push(CloneOp::Block {
+                                src_off: child,
+                                ord,
+                            });
+                        }
+                    }
+                    Shape::Embed(tag) => {
+                        let ord = self.ordinal_of(tag).ok_or_else(unknown_tag)?;
+                        work.push(CloneOp::Inline {
+                            src_base: src_off,
+                            new_base: new_off,
+                            ord,
+                        });
+                    }
+                    Shape::Strong(tag) => {
+                        let child = read_u64_at(data, src_off)?;
+                        if child != 0 {
+                            let off = self.strong_bump_off(data, tag, child, st)?;
+                            st.bumps.push(off);
+                        }
+                    }
+                    Shape::Weak(_) => {
+                        let ctrl = read_u64_at(data, src_off)?;
+                        if ctrl != 0 {
+                            st.bumps.push(ctrl + CTRL_WEAK_OFFSET);
+                        }
+                    }
+                    Shape::Foreign(_) => return Err(clone_unsupported()),
+                    Shape::Option(inner) => {
+                        // The slot (and its `0` niche) is already copied; only a
+                        // present reference needs its child cloned / bumped.
+                        if read_u64_at(data, src_off)? != 0 {
+                            work.push(CloneOp::Field {
+                                shape: *inner,
+                                src_off,
+                                new_off,
+                            });
+                        }
+                    }
+                    Shape::Array { n, inner } => {
+                        let stride = self.shape_stride(&inner, &mut st.cache)?;
+                        for i in 0..n as u64 {
+                            work.push(CloneOp::Field {
+                                shape: (*inner).clone(),
+                                src_off: src_off + i * stride,
+                                new_off: new_off + i * stride,
+                            });
+                        }
+                    }
+                    Shape::Tuple(items) => {
+                        let mut so = src_off;
+                        let mut no = new_off;
+                        for it in &items {
+                            work.push(CloneOp::Field {
+                                shape: it.clone(),
+                                src_off: so,
+                                new_off: no,
+                            });
+                            let s = self.shape_stride(it, &mut st.cache)?;
+                            so += s;
+                            no += s;
+                        }
+                    }
+                    Shape::Vec(inner) => {
+                        let src_data = read_u64_at(data, src_off)?; // VecDesc.data_off
+                        if src_data != 0 {
+                            let data_size = read_u64_at(data, src_off + 8)?;
+                            let new_data = self.alloc_copy(alloc, data, src_data, data_size, st)?;
+                            // Repoint the (freshly-copied) descriptor's data pointer;
+                            // its size word was copied verbatim.
+                            data.set(new_off, new_data.to_le_bytes())?;
+                            let len = read_u64_at(data, src_data)?;
+                            let sbase = src_data + BYTEVEC_HEADER;
+                            let nbase = new_data + BYTEVEC_HEADER;
+                            match &*inner {
+                                Shape::Owned(tag) => {
+                                    let ord = self.ordinal_of(*tag).ok_or_else(unknown_tag)?;
+                                    for i in 0..len {
+                                        let e = read_u64_at(data, sbase + i * 8)?;
+                                        if e != 0 {
+                                            st.patches.push((nbase + i * 8, e));
+                                            work.push(CloneOp::Block { src_off: e, ord });
+                                        }
+                                    }
+                                }
+                                Shape::Strong(tag) => {
+                                    for i in 0..len {
+                                        let e = read_u64_at(data, sbase + i * 8)?;
+                                        if e != 0 {
+                                            let off = self.strong_bump_off(data, *tag, e, st)?;
+                                            st.bumps.push(off);
+                                        }
+                                    }
+                                }
+                                Shape::Weak(_) => {
+                                    for i in 0..len {
+                                        let c = read_u64_at(data, sbase + i * 8)?;
+                                        if c != 0 {
+                                            st.bumps.push(c + CTRL_WEAK_OFFSET);
+                                        }
+                                    }
+                                }
+                                Shape::Foreign(_) => return Err(clone_unsupported()),
+                                // POD / `ref` elements are copied verbatim.
+                                _ => {}
+                            }
+                        }
+                    }
+                },
+            }
+        }
+
+        // Every block is cloned and in `map`; repoint owned child pointers.
+        for &(new_slot, src_child) in &st.patches {
+            let new_child = *st
+                .map
+                .get(&src_child)
+                .ok_or_else(|| corrupt("[BSTACK080E] RTTI clone: an owned child was not cloned"))?;
+            data.set(new_slot, new_child.to_le_bytes())?;
+        }
+        // Then bump every shared target's refcount (over-count-safe, never under).
+        for &off in &st.bumps {
+            refcount::fetch_add(data, off, 1)?;
+        }
+
+        st.map
+            .get(&root_src)
+            .copied()
+            .ok_or_else(|| corrupt("[BSTACK080E] RTTI clone: the root was not cloned"))
+    }
+
+    /// Allocate a `size`-byte block and byte-copy `[src_off, src_off+size)` into it,
+    /// recording it in `st.allocated`. Returns the new block's start offset.
+    fn alloc_copy<A: BStackRaiiAllocator>(
+        &self,
+        alloc: &A,
+        data: &BStack,
+        src_off: u64,
+        size: u64,
+        st: &mut CloneState,
+    ) -> io::Result<u64> {
+        let slice = alloc.alloc(size)?;
+        let range = slice.as_range();
+        st.allocated.push(range);
+        data.copy(src_off, range.start(), size)?;
+        Ok(range.start())
+    }
+
+    /// The counter offset to bump when cloning a `strong` reference to `data_child`
+    /// of type `tag`: an `rc` block's inline refcount, or an `(rc, weak)` block's
+    /// `ctrl.strong` (reached via the data block's `ctrl` back-pointer). Strong only —
+    /// a strong clone never adds a phantom weak.
+    fn strong_bump_off(
+        &self,
+        data: &BStack,
+        tag: EightCC,
+        data_child: u64,
+        st: &mut CloneState,
+    ) -> io::Result<u64> {
+        let ord = self.ordinal_of(tag).ok_or_else(unknown_tag)?;
+        self.ensure_type(ord, st)?;
+        if st.cache[&ord].weak {
+            let ctrl = read_u64_at(data, data_child + CTRL_BACKPTR_OFFSET)?;
+            Ok(ctrl + CTRL_STRONG_OFFSET)
+        } else {
+            Ok(data_child + RC_REFCOUNT_OFFSET)
+        }
+    }
+
+    /// Load + cache a type descriptor if not already present.
+    fn ensure_type(&self, ord: RttiOrdinal, st: &mut CloneState) -> io::Result<()> {
+        if let std::collections::hash_map::Entry::Vacant(e) = st.cache.entry(ord) {
+            e.insert(self.load_type(ord)?);
+        }
+        Ok(())
+    }
+
     /// The on-disk byte width of one element of `shape` — the stride for array / vec /
     /// tuple element addressing. References are a `u64` offset; a foreign is a
     /// `ForeignRepr`; an embedded child is its whole block; a vector is its inline
@@ -1420,6 +1820,20 @@ fn teardown_unsupported() -> io::Error {
         io::ErrorKind::Unsupported,
         "[BSTACK080C] RTTI teardown of a `foreign` reference is not yet supported (cross-file \
          reclamation)",
+    )
+}
+
+fn set_error(msg: impl std::fmt::Display) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("[BSTACK080D] RTTI set: {msg}"),
+    )
+}
+
+fn clone_unsupported() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        "[BSTACK080F] RTTI clone of a `foreign` reference is not yet supported (cross-file copy)",
     )
 }
 

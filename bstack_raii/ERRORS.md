@@ -397,3 +397,23 @@ registry routing the generated path does; the interpreter does not do cross-file
 teardown yet. **Fix:** tear a structure with `foreign` fields down through its
 compiled-in handle for now. (In-file `owned` / `embed` / `strong` / `weak` / `ref` /
 `vec` / array / tuple / `option` are all handled.)
+
+### BSTACK080D — invalid RTTI `set_pod` target
+`set_pod` was given a field that is not a writable top-level POD field: the type is
+an enum (whole-value, no per-field set), the field name is unknown, the field is not
+POD (an owning / reference field is replaced, not overwritten), or the value's byte
+length does not match the field width. **Fix:** name a POD field of the struct and
+pass exactly its width in bytes.
+
+### BSTACK080E — RTTI clone internal invariant
+A clone finished the walk but a child block (or the root) was not recorded in the
+source→clone map — only possible if the source structure was mutated concurrently
+mid-clone, or the schema and data disagree. **Fix:** do not mutate a structure while
+it is being cloned; verify the schema matches the data file.
+
+### BSTACK080F — RTTI clone of a foreign reference
+`clone_value` reached a `foreign` (cross-file) reference, whose copy needs the
+cross-file allocation routing the generated path does. **Fix:** clone a structure
+with `foreign` fields through its compiled-in handle for now. (In-file `owned` /
+`embed` / `strong` / `weak` / `ref` / `vec` / array / tuple / `option` are handled —
+owned is deep-copied, shared is refcount-bumped.)
