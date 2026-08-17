@@ -78,37 +78,6 @@ Reference: https://github.com/williamwutq/bstack/pull/37
 
 ---
 
-## Trimming redundant zero-fill writes on the initialised allocator paths
-
-**Feature flag:** `alloc` + `set`
-**Breaking change:** No — no observable behaviour change, no on-disk format change.
-
-### Motivation
-
-Implementing `BStackUninitAllocator` surfaced places where the *initialised*
-path pays for zeroes it is already guaranteed. Neither is a correctness problem,
-and neither was changed as part of that work, since each touches a path with its
-own documented crash-consistency reasoning. (`LinearBStackAllocator::realloc`'s
-`atomic` grow was the other one; it now uses `try_extend_zeros` and is done.)
-
-### Candidate
-
-1. **`CheckedSlabBStackAllocator::pop_and_claim_block` scrubs a block that is already zero.**
-   Every route into the free list writes a fully-zeroed image over the freed run —
-   `write_free_run` (used by `dealloc`, by `realloc`'s non-tail shrink, and by
-   `recover`'s reclaim of leaked blocks) zeroes all `count * block_size` bytes. A
-   free block is therefore invariably zero, yet claiming one stages and writes a
-   whole `block_size` buffer to scrub it again. Writing just the 8-byte overhead
-   word — exactly what `alloc_uninit` does today — would be observably identical
-   while dropping a block-sized write and its journal on every free-list hit. The
-   trade-off is losing a defence-in-depth scrub: if the zero-on-free invariant
-   were ever broken by a bug elsewhere, `alloc`'s guarantee would break with it.
-   If adopted, `CheckedSlabBStackAllocator` would then have no cheaper
-   uninitialised path left and should stop implementing `BStackUninitAllocator`.
-
-More candidates of this kind exist in the allocators that have not adopted
-`BStackUninitAllocator` yet, and belong with that work rather than here.
-
 ## `BStackInPlaceGuard` — ambient atomic-block guard over in-place writes
 
 **Feature flag:** `set` + `atomic` (same gate as `inplace_gen`/`process_gen`)
