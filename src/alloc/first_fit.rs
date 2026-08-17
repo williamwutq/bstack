@@ -999,6 +999,23 @@ impl BStackAllocator for FirstFitBStackAllocator {
     }
 }
 
+#[cfg(feature = "set")]
+impl BStackUninitAllocator for FirstFitBStackAllocator {
+    #[inline]
+    fn alloc_uninit(&self, len: u64) -> io::Result<BStackOwnedSlice<'_, Self>> {
+        self.alloc_impl(len, false)
+    }
+
+    #[inline]
+    fn realloc_uninit<'a>(
+        &'a self,
+        slice: BStackOwnedSlice<'a, Self>,
+        new_len: u64,
+    ) -> Result<BStackOwnedSlice<'a, Self>, BStackAllocError<'a, Self>> {
+        self.realloc_impl(slice, new_len, false)
+    }
+}
+
 /// Reclaiming a free block without scrubbing its payload.
 ///
 /// A freed block keeps its previous occupant's bytes: `dealloc` rewrites the
@@ -1503,23 +1520,6 @@ impl FirstFitBStackAllocator {
                 BStackOwnedSlice::from_raw_parts(self, recovered.0, recovered.1)
             }),
         })
-    }
-}
-
-#[cfg(feature = "set")]
-impl BStackUninitAllocator for FirstFitBStackAllocator {
-    #[inline]
-    fn alloc_uninit(&self, len: u64) -> io::Result<BStackOwnedSlice<'_, Self>> {
-        self.alloc_impl(len, false)
-    }
-
-    #[inline]
-    fn realloc_uninit<'a>(
-        &'a self,
-        slice: BStackOwnedSlice<'a, Self>,
-        new_len: u64,
-    ) -> Result<BStackOwnedSlice<'a, Self>, BStackAllocError<'a, Self>> {
-        self.realloc_impl(slice, new_len, false)
     }
 }
 
