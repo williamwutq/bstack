@@ -225,7 +225,7 @@ pub unsafe trait BStackRaiiAllocator: BStackOwnedSliceAllocator {
 pub use bytemuck;
 
 // Procedural macros, re-exported so downstream depends only on `bstack_raii`.
-pub use bstack_raii_derive::{bstack_block, bstack_cast, bstack_enum, bstack_move};
+pub use bstack_raii_derive::{bstack_block, bstack_cast, bstack_class, bstack_enum, bstack_move};
 
 /// Runtime support called by `#[bstack_block]` / `#[bstack_enum]`-generated code via
 /// fully-qualified `::bstack_raii::__private::…` paths. Not part of the public API —

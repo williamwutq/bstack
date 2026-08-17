@@ -60,6 +60,17 @@ An unrecognized name was passed to `allow(...)`. **Fix:** use `overlong_tag`,
 `repr(...)` selects an *enum* discriminant width and is only meaningful on
 `#[bstack_enum]`. **Fix:** remove it from the struct.
 
+### BSTACK0009 — `#[bstack_class]` on an unsupported item
+`#[bstack_class]` currently generates RTTI for **structs** only; it was applied to
+an `enum` (enum RTTI is a later phase) or to something that is neither a struct nor
+an enum. **Fix:** use `#[bstack_class]` on a struct, or `#[bstack_enum]` for the
+enum block machinery without RTTI.
+
+### BSTACK0010 — `#[bstack_static]` not yet supported by `#[bstack_class]`
+A field carries `#[bstack_static]` (a class variable — stored once in the schema
+record, not per instance), which `#[bstack_class]` does not emit yet. **Fix:** drop
+`#[bstack_static]` and store the field per-instance, or omit the field for now.
+
 ---
 
 ## Field / type shapes (`01xx`)
@@ -106,6 +117,11 @@ A whole array-of-vectors can't be nullable. **Fix:** make each element nullable 
 ### BSTACK0111 — whole-array `Option<[Foreign<T>; N]>`
 A whole foreign-array can't be nullable (a null foreign is already `offset 0`). **Fix:**
 use `[Option<Foreign<T>>; N]`.
+
+### BSTACK0112 — tuple field not describable by `#[bstack_class]`
+A `#[bstack_class]` struct has a tuple field, which RTTI has no single-tag shape for
+yet (a plain `#[bstack_block]` stores it as a POD aggregate). **Fix:** wrap it in a
+named `#[bstack_class]` struct and store that.
 
 ---
 
@@ -169,6 +185,12 @@ A `Foreign` must target a block, not an array. (`[Foreign<T>; N]` is fine;
 A `Foreign` must target a `#[bstack_block]`, not a tuple. **Fix:** bridge with a
 `#[bstack_block]` struct.
 
+### BSTACK0309 — `Foreign` not yet supported by `#[bstack_class]`
+A `#[bstack_class]` struct has a `Foreign` field. Cross-file RTTI is a later phase
+(its schema shape must carry the target's ownership kind, which the current wire
+form doesn't yet). **Fix:** use `#[bstack_block]` for a type with `Foreign` fields
+for now, or drop the field.
+
 ---
 
 ## Generic blocks (`04xx`)
@@ -204,6 +226,11 @@ depend on the parameter. **Fix:** annotate the variant with a reference kind.
 A nested array `[[T; N]; M]` with a const-parameter dimension would need a const
 expression (`N * M`) for its flattened length, which stable Rust forbids from using a
 generic parameter. **Fix:** use a single `[T; N]`, or make the dimensions concrete.
+
+### BSTACK0408 — generic `#[bstack_class]`
+A `#[bstack_class]` is generic. RTTI describes a **single concrete on-disk layout**
+(it reads `size_of` / `offset_of!` of one `XOnDisk`), which a generic type does not
+have. **Fix:** use a concrete type, or `#[bstack_block]` without RTTI.
 
 ---
 

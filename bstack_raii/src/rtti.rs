@@ -47,6 +47,15 @@ use linkme::distributed_slice;
 use crate::foreign::ForeignRepr;
 use crate::layout::EightCC;
 
+/// Re-exports so the `#[bstack_class]` macro's generated registration code can name
+/// `linkme` without the downstream crate depending on it directly. The generated
+/// element uses `#[linkme(crate = ::bstack_raii::rtti::linkme)]` to override
+/// linkme's hard-coded `::linkme` path against this re-export.
+#[doc(hidden)]
+pub use linkme;
+#[doc(hidden)]
+pub use linkme::distributed_slice as distributed_slice_reexport;
+
 /// A type's stable identity within the one RTTI stack: its 0-based ordinal (the
 /// order it was appended). Append-only ⇒ never renumbered.
 pub type RttiOrdinal = u32;

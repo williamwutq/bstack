@@ -933,6 +933,15 @@ pub(crate) fn is_bstack_mut(attrs: &[syn::Attribute]) -> bool {
         .any(|id| id == "bstack_mut")
 }
 
+/// Whether a field is annotated `#[bstack_static]`, marking it a class variable
+/// (RTTI-only, stored inline in the schema record, not a per-instance field).
+pub(crate) fn is_bstack_static(attrs: &[syn::Attribute]) -> bool {
+    attrs
+        .iter()
+        .filter_map(|a| a.path().get_ident())
+        .any(|id| id == "bstack_static")
+}
+
 // ===========================================================================
 // #[bstack_enum] — a tagged union block
 // ===========================================================================

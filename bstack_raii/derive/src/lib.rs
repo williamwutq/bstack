@@ -15,6 +15,7 @@ use proc_macro::TokenStream;
 
 mod block;
 mod cast;
+mod class;
 mod emit;
 mod enum_;
 mod layout;
@@ -115,6 +116,41 @@ pub fn bstack_block(args: TokenStream, item: TokenStream) -> TokenStream {
 pub fn bstack_enum(args: TokenStream, item: TokenStream) -> TokenStream {
     let input = syn::parse_macro_input!(item as syn::ItemEnum);
     match enum_::expand_enum(args.into(), input) {
+        Ok(ts) => ts.into(),
+        Err(e) => e.to_compile_error().into(),
+    }
+}
+
+/// `#[bstack_class]` — a `#[bstack_block]` that also persists RTTI.
+///
+/// A **drop-in replacement** for [`macro@bstack_block]` (on a struct): it emits
+/// the identical block machinery (handle, `XOnDisk`, accessors, teardown, clone,
+/// `new`) **and** a self-describing schema. The macro registers a descriptor
+/// builder into `bstack_raii::rtti::RTTI_TYPES` (via `linkme`, at link time), and
+/// `bstack_raii::rtti::sync(file)` walks that set to persist every compiled-in
+/// type's schema — letting a general program read the type's structures off disk
+/// with no compiled-in Rust types.
+///
+/// Accepts the same arguments as [`macro@bstack_block]` (`rc` / `rc, weak` /
+/// `tag = "…"` / `ctrl_tag = "…"` / `allow(…)`). Not yet supported (a clear
+/// compile error, never a partial schema): `#[bstack_class]` on an `enum`, generic
+/// blocks, `Foreign` fields, tuple fields, and `#[bstack_static]` class variables.
+#[proc_macro_attribute]
+pub fn bstack_class(args: TokenStream, item: TokenStream) -> TokenStream {
+    let args: proc_macro2::TokenStream = args.into();
+    // Dispatch on the item shape: a struct gets full block + RTTI codegen; an enum
+    // is (for now) a directed error out of `class::expand_enum`.
+    let expanded = if let Ok(s) = syn::parse::<syn::ItemStruct>(item.clone()) {
+        class::expand_struct(args, s)
+    } else if let Ok(e) = syn::parse::<syn::ItemEnum>(item) {
+        class::expand_enum(args, e)
+    } else {
+        Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "[BSTACK0009] #[bstack_class] expects a struct or enum",
+        ))
+    };
+    match expanded {
         Ok(ts) => ts.into(),
         Err(e) => e.to_compile_error().into(),
     }
