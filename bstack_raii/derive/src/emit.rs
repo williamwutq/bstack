@@ -1860,3 +1860,87 @@ pub(crate) fn clone_field_stmt(fname: &Ident, inner_ty: &Type, kind: Kind) -> Op
     }
 }
 
+
+/// `impl BStackShared for #name` for `rc` / `(rc, weak)` blocks — identical for
+/// structs and enums (it depends only on the block name and mode). Plain blocks
+/// own no strong count, so they get nothing.
+pub(crate) fn shared_impl(mode: Mode, name: &Ident) -> TokenStream {
+    match mode {
+        Mode::Plain => quote!(),
+        Mode::Rc => quote! {
+            impl ::bstack_raii::BStackShared for #name {
+                fn drop_strong_ref<__A: ::bstack_raii::BStackRaiiAllocator>(
+                    data: ::bstack_raii::BStackRef<Self>,
+                    allocator: &__A,
+                ) -> ::std::io::Result<()> {
+                    use ::bstack_raii::BStackDrop as _;
+                    ::bstack_raii::StrongRef(data).bstack_drop(allocator)
+                }
+                fn strong_parts<__A: ::bstack_raii::BStackRaiiAllocator>(
+                    data: ::bstack_raii::BStackRef<Self>,
+                    _allocator: &__A,
+                ) -> ::std::io::Result<(
+                    ::bstack_raii::BStackRef<Self>,
+                    ::core::option::Option<::bstack_raii::BStackRange>,
+                )> {
+                    ::std::result::Result::Ok((data, ::core::option::Option::None))
+                }
+            }
+        },
+        Mode::RcWeak => quote! {
+            impl ::bstack_raii::BStackShared for #name {
+                fn drop_strong_ref<__A: ::bstack_raii::BStackRaiiAllocator>(
+                    data: ::bstack_raii::BStackRef<Self>,
+                    allocator: &__A,
+                ) -> ::std::io::Result<()> {
+                    use ::bstack_raii::BStackDrop as _;
+                    ::bstack_raii::StrongWeakRef::from_disk(data, allocator)?
+                        .bstack_drop(allocator)
+                }
+                fn strong_parts<__A: ::bstack_raii::BStackRaiiAllocator>(
+                    data: ::bstack_raii::BStackRef<Self>,
+                    allocator: &__A,
+                ) -> ::std::io::Result<(
+                    ::bstack_raii::BStackRef<Self>,
+                    ::core::option::Option<::bstack_raii::BStackRange>,
+                )> {
+                    let __swr = ::bstack_raii::StrongWeakRef::from_disk(data, allocator)?;
+                    ::std::result::Result::Ok((
+                        __swr.0,
+                        ::core::option::Option::Some(__swr.1.into_range()),
+                    ))
+                }
+            }
+        },
+    }
+}
+
+/// The `(rc, weak)` control-block struct (`#control`) + its `impl BStackWeakable`
+/// — identical for structs and enums. Empty for other modes.
+pub(crate) fn weakable_items(
+    mode: Mode,
+    name: &Ident,
+    control: &Ident,
+    vis: &syn::Visibility,
+) -> TokenStream {
+    if mode == Mode::RcWeak {
+        quote! {
+            #[repr(C, packed)]
+            #[derive(::core::clone::Clone, ::core::marker::Copy)]
+            #vis struct #control {
+                __bstack_header: ::bstack_raii::BlockHeader,
+                __bstack_strong: u64,
+                __bstack_weak: u64,
+                __bstack_x: u64,
+            }
+            unsafe impl ::bstack_raii::Zeroable for #control {}
+            unsafe impl ::bstack_raii::Pod for #control {}
+
+            impl ::bstack_raii::BStackWeakable for #name {
+                type Control = #control;
+            }
+        }
+    } else {
+        quote!()
+    }
+}

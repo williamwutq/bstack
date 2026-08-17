@@ -2071,54 +2071,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
             }
         }
     };
-    let shared_impl = match mode {
-        Mode::Plain => quote!(),
-        Mode::Rc => quote! {
-            impl ::bstack_raii::BStackShared for #name {
-                fn drop_strong_ref<__A: ::bstack_raii::BStackRaiiAllocator>(
-                    data: ::bstack_raii::BStackRef<Self>,
-                    allocator: &__A,
-                ) -> ::std::io::Result<()> {
-                    use ::bstack_raii::BStackDrop as _;
-                    ::bstack_raii::StrongRef(data).bstack_drop(allocator)
-                }
-                fn strong_parts<__A: ::bstack_raii::BStackRaiiAllocator>(
-                    data: ::bstack_raii::BStackRef<Self>,
-                    _allocator: &__A,
-                ) -> ::std::io::Result<(
-                    ::bstack_raii::BStackRef<Self>,
-                    ::core::option::Option<::bstack_raii::BStackRange>,
-                )> {
-                    ::std::result::Result::Ok((data, ::core::option::Option::None))
-                }
-            }
-        },
-        Mode::RcWeak => quote! {
-            impl ::bstack_raii::BStackShared for #name {
-                fn drop_strong_ref<__A: ::bstack_raii::BStackRaiiAllocator>(
-                    data: ::bstack_raii::BStackRef<Self>,
-                    allocator: &__A,
-                ) -> ::std::io::Result<()> {
-                    use ::bstack_raii::BStackDrop as _;
-                    ::bstack_raii::StrongWeakRef::from_disk(data, allocator)?
-                        .bstack_drop(allocator)
-                }
-                fn strong_parts<__A: ::bstack_raii::BStackRaiiAllocator>(
-                    data: ::bstack_raii::BStackRef<Self>,
-                    allocator: &__A,
-                ) -> ::std::io::Result<(
-                    ::bstack_raii::BStackRef<Self>,
-                    ::core::option::Option<::bstack_raii::BStackRange>,
-                )> {
-                    let __swr = ::bstack_raii::StrongWeakRef::from_disk(data, allocator)?;
-                    ::std::result::Result::Ok((
-                        __swr.0,
-                        ::core::option::Option::Some(__swr.1.into_range()),
-                    ))
-                }
-            }
-        },
-    };
+    let shared_impl = shared_impl(mode, name);
     // A plain enum is self-contained, so it may be `#[embed]`ded; an `rc` enum is not.
     let embeddable_impl = if mode == Mode::Plain {
         quote! {
@@ -2127,26 +2080,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
     } else {
         quote!()
     };
-    let weakable_items = if mode == Mode::RcWeak {
-        quote! {
-            #[repr(C, packed)]
-            #[derive(::core::clone::Clone, ::core::marker::Copy)]
-            #vis struct #control {
-                __bstack_header: ::bstack_raii::BlockHeader,
-                __bstack_strong: u64,
-                __bstack_weak: u64,
-                __bstack_x: u64,
-            }
-            unsafe impl ::bstack_raii::Zeroable for #control {}
-            unsafe impl ::bstack_raii::Pod for #control {}
-
-            impl ::bstack_raii::BStackWeakable for #name {
-                type Control = #control;
-            }
-        }
-    } else {
-        quote!()
-    };
+    let weakable_items = weakable_items(mode, name, &control, vis);
 
     let allow_deprecated = input.attrs.iter().any(is_allow_deprecated);
     let ctrl_truncated = mode == Mode::RcWeak && ctrl_tag.truncated;
