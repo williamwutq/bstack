@@ -406,6 +406,50 @@ static int test_realloc_paths(void)
     sg_unlink(tmp); return 0;
 }
 
+/* Tail shrink.  With atomic it is one LEN + SPLICE transaction: the block is
+ * replaced by its shrunk self at the same offset and the excess goes back to the
+ * stack.  Without atomic the length commit and the truncation cannot be fused —
+ * either ordering leaves a crash window recover() mis-parses — so the shrink
+ * takes the move path and the block relocates, its old block recycled. */
+static int test_realloc_tail_shrink(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    segregated_bstack_allocator_t *a = segregated_bstack_allocator_new(bs);
+    CHECK(a);
+    bstack_allocator_t *base = (bstack_allocator_t *)a;
+
+    bstack_slice_t s, out;
+    uint64_t before, after, off;
+    CHECK(bstack_allocator_alloc(base, 200, &s) == 0);  /* block 208, at the tail */
+    CHECK(slice_fill(s, 0x3C3C) == 0);
+    off = s.offset;
+    CHECK(bstack_len(bs, &before) == 0);
+    CHECK(bstack_allocator_realloc(base, s, 100, &out) == 0); /* class 112 < 208 */
+    CHECK(out.len == 100);
+    CHECK(slice_verify(out, 100, 0x3C3C, "tail-shrink") == 0);
+    CHECK(bstack_len(bs, &after) == 0);
+
+#ifdef BSTACK_FEATURE_ATOMIC
+    CHECK(out.offset == off);       /* replaced in place */
+    CHECK(after < before);          /* excess returned to the stack */
+#else
+    {
+        bstack_slice_t reused;
+        CHECK(out.offset != off);   /* moved */
+        /* The vacated 208-byte block is back on its free list and gets reused. */
+        CHECK(bstack_allocator_alloc(base, 200, &reused) == 0);
+        CHECK(reused.offset == off);
+        CHECK(bstack_allocator_dealloc(base, reused) == 0);
+    }
+    (void)before; (void)after;
+#endif
+
+    CHECK(bstack_allocator_dealloc(base, out) == 0);
+    bstack_close(segregated_bstack_allocator_into_stack(a));
+    sg_unlink(tmp); return 0;
+}
+
 static int test_reopen_preserves_live_and_free(void)
 {
     char tmp[64]; make_tmp(tmp, sizeof tmp);
@@ -565,6 +609,7 @@ int main(void)
     T(test_dealloc_reuses_block);
     T(test_double_free_and_mismatch_detected);
     T(test_realloc_paths);
+    T(test_realloc_tail_shrink);
     T(test_reopen_preserves_live_and_free);
     T(test_fuzz_mixed);
 
