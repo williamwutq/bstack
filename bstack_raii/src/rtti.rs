@@ -43,6 +43,10 @@
 //! place, and [`RttiRegistry::clone_value`] is the non-recursive **deep-clone
 //! interpreter** (owned deep-copied, shared refcount-bumped). Still TODO: cross-file
 //! `foreign` teardown / clone, and live mutable-class-variable writes.
+//!
+//! [`AnyRef`] bridges back to compiled-in types: it is the RTTI `&dyn Any`, whose
+//! [`downcast`](AnyRef::downcast) hands back a real typed handle on an eightcc match,
+//! falling back to generic interpretation ([`RttiRegistry::read_any`]) otherwise.
 
 use std::collections::HashMap;
 use std::io;
@@ -52,6 +56,7 @@ use bstack::{BStack, BStackRange};
 use linkme::distributed_slice;
 
 use crate::BStackRaiiAllocator;
+use crate::block::{BStackBlock, BStackCast};
 use crate::foreign::ForeignRepr;
 use crate::layout::{
     CTRL_BACKPTR_OFFSET, CTRL_DATA_OFFSET, CTRL_STRONG_OFFSET, CTRL_WEAK_OFFSET, EightCC,
@@ -111,6 +116,72 @@ fn corrupt(msg: impl Into<String>) -> io::Error {
 /// from the target block header on deref) use [`ForeignRepr::new`] directly.
 pub fn typed_ptr(file_id: u64, offset: u64, ordinal: RttiOrdinal) -> ForeignRepr {
     ForeignRepr::new(file_id, offset).with_type_index(ordinal + 1)
+}
+
+/// A **runtime-typed reference** — an `(EightCC, offset)` into a data file, the RTTI
+/// analog of `&dyn Any`. It bridges the interpreted world back to compiled-in types:
+/// [`downcast`](Self::downcast) hands back a real typed block handle when the
+/// reference's tag matches a type's compile-time [`eightcc`](BStackCast::eightcc),
+/// otherwise the structure can be read generically (via [`RttiRegistry::read_any`]).
+///
+/// Obtain one from a typed pointer with [`RttiRegistry::any_ref`] (its tag is then
+/// registry-authoritative — a stray pointer resolves to `None`), or straight from a
+/// block's on-disk header with [`AnyRef::from_block`].
+///
+/// The match is an eightcc (hash) equality, so it is only as sound as tag
+/// uniqueness. Within a program whose types were registered by
+/// [`sync`](RttiRegistry::sync_compiled) that holds — sync rejects colliding types
+/// (`[BSTACK0806]`) — so a successful `downcast` truly is that type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AnyRef {
+    tag: EightCC,
+    offset: u64,
+}
+
+impl AnyRef {
+    /// Construct from a known tag + offset. Prefer [`RttiRegistry::any_ref`] (which
+    /// resolves the tag through the registry) or [`AnyRef::from_block`].
+    pub fn new(tag: EightCC, offset: u64) -> Self {
+        Self { tag, offset }
+    }
+
+    /// Recover the type tag from the target block's on-disk [`BlockHeader`](crate::layout::BlockHeader)
+    /// (`tag` at offset 8) — the no-registry path, one small read.
+    pub fn from_block(data: &BStack, offset: u64) -> io::Result<Self> {
+        let mut tag = [0u8; 8];
+        data.get_into(offset + HEADER_TAG_OFFSET, &mut tag)?;
+        Ok(Self {
+            tag: EightCC(tag),
+            offset,
+        })
+    }
+
+    /// The reference's RTTI type tag.
+    pub fn tag(&self) -> EightCC {
+        self.tag
+    }
+
+    /// The reference's block offset.
+    pub fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    /// Whether this reference is of the compiled-in type `T` (eightcc match).
+    pub fn is<T: BStackBlock>(&self) -> bool {
+        self.tag == <T as BStackCast>::eightcc()
+    }
+
+    /// Downcast to a `T` handle when the tag matches `T`'s compile-time eightcc,
+    /// else `None` — the RTTI `Any::downcast`. The handle borrows the block at this
+    /// reference's offset (length recovered from `size_of::<T::OnDisk>()`).
+    pub fn downcast<T: BStackBlock>(&self) -> Option<T> {
+        self.is::<T>().then(|| {
+            T::from_range(BStackRange::new(
+                self.offset,
+                core::mem::size_of::<T::OnDisk>() as u64,
+            ))
+        })
+    }
 }
 
 // -- Little-endian cursor codec --------------------------------------------
@@ -897,6 +968,8 @@ const VECDESC_LEN: u64 = 16;
 const BYTEVEC_HEADER: u64 = 16;
 /// Bytes of a `ForeignRepr` on the wire.
 const FOREIGN_REPR_LEN: u64 = 16;
+/// Offset of the `tag: EightCC` within a block's `BlockHeader` (`size: u64` @0).
+const HEADER_TAG_OFFSET: u64 = 8;
 /// Bytes of an `(rc, weak)` control block (`XOnDiskRef`): a 16-byte header, then the
 /// `strong`, `weak`, and data-back-pointer `u64`s. Fixed for every weakable type (the
 /// control layout does not depend on `T`).
@@ -1147,6 +1220,25 @@ impl RttiRegistry {
             corrupt("[BSTACK080A] cannot read an untyped / out-of-range RTTI pointer")
         })?;
         self.read_value(data, ord, ptr.offset())
+    }
+
+    /// The runtime-typed [`AnyRef`] a **typed** pointer denotes — its registry tag
+    /// (resolved from the pointer's `type_index`) plus offset. `None` for an untyped
+    /// (`type_index == 0`) or out-of-range pointer, so a stray pointer can never
+    /// masquerade as a registered type. Downcast the result with
+    /// [`AnyRef::downcast`], or read it generically with [`read_any`](Self::read_any).
+    pub fn any_ref(&self, ptr: ForeignRepr) -> Option<AnyRef> {
+        let ord = self.resolve_ptr(ptr)?;
+        let tag = self.tag_of(ord)?;
+        Some(AnyRef::new(tag, ptr.offset()))
+    }
+
+    /// Interpret the structure an [`AnyRef`] points at into a [`Value`] tree — the
+    /// generic fallback when [`AnyRef::downcast`] does not match a compiled-in type.
+    /// Errors if the reference's tag is not a registered type.
+    pub fn read_any(&self, data: &BStack, any: &AnyRef) -> io::Result<Value> {
+        let ord = self.ordinal_of(any.tag()).ok_or_else(unknown_tag)?;
+        self.read_value(data, ord, any.offset())
     }
 
     /// Tear down (free) the structure of type `ordinal` at `block_off` in `alloc`'s

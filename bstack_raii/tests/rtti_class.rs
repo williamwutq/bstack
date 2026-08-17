@@ -7,8 +7,8 @@
 #![allow(dead_code)] // some fixtures are inspected only via RTTI, never instantiated
 
 use bstack::{BStack, BStackAllocator, FirstFitBStackAllocator};
-use bstack_raii::rtti::{self, RttiBody, Shape, Value};
-use bstack_raii::{BStackBlock, BStackCast, BStackDrop, BStackOwned, bstack_class};
+use bstack_raii::rtti::{self, AnyRef, RttiBody, Shape, Value};
+use bstack_raii::{BStackBlock, BStackCast, BStackDrop, BStackOwned, ForeignRepr, bstack_class};
 
 #[bstack_class]
 struct Point {
@@ -711,6 +711,47 @@ fn interpret_clone_shares_strong() {
     cycle();
     assert_eq!(alloc.stack().len().unwrap(), base, "strong clone leaked");
 
+    drop(reg);
+    std::fs::remove_file(&schema).ok();
+    std::fs::remove_file(&dpath).ok();
+}
+
+#[test]
+fn any_ref_downcast_and_generic_fallback() {
+    let schema = temp_path("any_schema");
+    let reg = rtti::sync(&schema).unwrap();
+    let (alloc, dpath) = data_alloc("any_data");
+    let pord = reg.ordinal_of(<Point as BStackCast>::eightcc()).unwrap();
+
+    let p = Point::new(&alloc, 7, 9).unwrap();
+    let off = BStackBlock::range(p.handle()).start();
+
+    // A typed pointer resolves to an AnyRef with a registry-authoritative tag.
+    let any = reg.any_ref(rtti::typed_ptr(0, off, pord)).unwrap();
+    assert_eq!(any.tag(), <Point as BStackCast>::eightcc());
+    assert_eq!(any.offset(), off);
+
+    // Downcast to the matching compiled-in type → a live typed handle.
+    assert!(any.is::<Point>());
+    let pt = any.downcast::<Point>().expect("downcast to Point");
+    assert_eq!(pt.get_x(alloc.stack()).unwrap(), 7);
+    assert_eq!(pt.get_y(alloc.stack()).unwrap(), 9);
+
+    // A non-matching type → None; fall back to generic interpretation.
+    assert!(!any.is::<Wrap>());
+    assert!(any.downcast::<Wrap>().is_none());
+    let Value::Block { tag, .. } = reg.read_any(alloc.stack(), &any).unwrap() else {
+        panic!("expected a block");
+    };
+    assert_eq!(tag, <Point as BStackCast>::eightcc());
+
+    // The no-registry path recovers the same tag from the block header.
+    assert_eq!(AnyRef::from_block(alloc.stack(), off).unwrap(), any);
+
+    // An untyped pointer resolves to no AnyRef (never masquerades as a type).
+    assert!(reg.any_ref(ForeignRepr::new(0, off)).is_none());
+
+    p.bstack_drop(&alloc).unwrap();
     drop(reg);
     std::fs::remove_file(&schema).ok();
     std::fs::remove_file(&dpath).ok();
