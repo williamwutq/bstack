@@ -42,12 +42,10 @@
 //!   [`realloc_uninit`](BStackUninitAllocator::realloc_uninit) skip the
 //!   zero-fill of newly allocated or grown bytes, returning **unspecified**
 //!   (but always valid-to-read) contents for callers that overwrite the region
-//!   immediately.  Implemented by [`SlabBStackAllocator`] and
-//!   [`GhostTreeBstackAllocator`], and forwarded by [`DebugCheckingAllocator`];
-//!   see
 //!   immediately.  Implemented by [`SlabBStackAllocator`],
-//!   [`GhostTreeBstackAllocator`] and [`CheckedSlabBStackAllocator`], and forwarded by
-//!   [`DebugCheckingAllocator`]; see [Uninitialised allocation](#uninitialised-allocation).
+//!   [`GhostTreeBstackAllocator`], [`CheckedSlabBStackAllocator`] and
+//!   [`SegregatedBStackAllocator`], and forwarded by [`DebugCheckingAllocator`];
+//!   see [Uninitialised allocation](#uninitialised-allocation).
 //!
 //! * [`BStackOwnedSliceAllocator`] — convenience supertrait:
 //!   `BStackAllocator<Error = io::Error, Allocated<'a> = BStackOwnedSlice<'a, Self>>`.
@@ -89,8 +87,11 @@
 //! # Uninitialised allocation
 //!
 //! [`SlabBStackAllocator`], [`GhostTreeBstackAllocator`] and
-//! [`CheckedSlabBStackAllocator`] implement [`BStackUninitAllocator`], because
-//! for each of them the caller-facing zero guarantee costs a write that a caller
+//! [`SlabBStackAllocator`], [`GhostTreeBstackAllocator`],
+//! [`CheckedSlabBStackAllocator`] and [`SegregatedBStackAllocator`] implement
+//! [`BStackUninitAllocator`], because for each of them the caller-facing zero
+//! guarantee costs a write that a caller overwriting the region has no use for.
+//! What that write is, and therefore what is saved, differs:
 //! overwriting the region has no use for.  What that write is, and therefore
 //! what is saved, differs:
 //!
@@ -99,6 +100,7 @@
 //! | [`SlabBStackAllocator`]      | a whole-block `zero` after popping the free list           | the entire call — one durable sync per reused block |
 //! | [`GhostTreeBstackAllocator`] | a 32-byte `zero` over the reclaimed block's stale AVL node | the entire call for requests of 32 bytes or more    |
 //! | [`CheckedSlabBStackAllocator`] | a full block-sized claim buffer                         | everything past the 8-byte overhead word            |
+//! | [`SegregatedBStackAllocator`] | a full block-sized claim buffer                          | everything past the overhead (and any copied prefix) |
 //! | [`LinearBStackAllocator`]    | nothing — `extend` is a sparse `set_len`                  | *not implemented*: there is nothing to skip         |
 //!
 //! [`realloc_uninit`](BStackUninitAllocator::realloc_uninit) additionally drops

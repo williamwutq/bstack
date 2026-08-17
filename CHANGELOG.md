@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`BStackUninitAllocator` implemented for `SegregatedBStackAllocator`** (`alloc` + `set`, experimental). Provides `alloc_uninit`/`realloc_uninit`, skipping the zero-fill of newly allocated or newly grown bytes. Rust only.
 - **`DebugCheckingAllocator<A>` forwards `BStackUninitAllocator`** (`alloc`). When the wrapped allocator implements the trait, the wrapper does too, with the same overlap and double-free tracking as `alloc`/`realloc`.
 - **`BStackUninitAllocator` implemented for `CheckedSlabBStackAllocator`** (`alloc` + `set`). Provides `alloc_uninit`/`realloc_uninit`, skipping the zero-fill of newly allocated or newly grown bytes. Rust only.
 - **`BStackUninitAllocator` implemented for `SlabBStackAllocator` and `GhostTreeBstackAllocator`** (`alloc` + `set`). Both now provide `alloc_uninit`/`realloc_uninit`, skipping the zero-fill of newly allocated or newly grown bytes. `LinearBStackAllocator` does not implement it: its zero-fill is already free. Rust only.
