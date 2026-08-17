@@ -5,7 +5,8 @@ use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::{Error, Fields, Ident, Type};
 
-use crate::common::*;
+use crate::emit::*;
+use crate::util::*;
 
 /// Implementation of the `#[bstack_enum]` attribute macro.
 pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<TokenStream> {

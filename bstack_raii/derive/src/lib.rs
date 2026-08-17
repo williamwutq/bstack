@@ -15,7 +15,8 @@ use proc_macro::TokenStream;
 
 mod block;
 mod cast;
-mod common;
+mod emit;
+mod util;
 mod enum_;
 
 /// `#[bstack_block]` — generate the on-disk layout and typed handle machinery.

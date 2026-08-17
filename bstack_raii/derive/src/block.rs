@@ -14,7 +14,8 @@ use proc_macro2::{Span, TokenStream};
 use quote::{format_ident, quote};
 use syn::{Error, Fields, Ident, ItemStruct, Type};
 
-use crate::common::*;
+use crate::emit::*;
+use crate::util::*;
 
 pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> {
     let attr = parse_attr(attr)?;
