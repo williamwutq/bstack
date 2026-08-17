@@ -42,9 +42,9 @@ pub(crate) fn discriminants(
                 ));
             }
             out.push(d);
-            next = d
-                .checked_add(1)
-                .ok_or_else(|| Error::new_spanned(v, "[BSTACK0202] #[bstack_enum] discriminant overflow"))?;
+            next = d.checked_add(1).ok_or_else(|| {
+                Error::new_spanned(v, "[BSTACK0202] #[bstack_enum] discriminant overflow")
+            })?;
         }
         out
     };

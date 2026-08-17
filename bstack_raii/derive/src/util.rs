@@ -664,7 +664,10 @@ pub(crate) fn parse_attr(attr: TokenStream) -> syn::Result<Attr> {
                             lit: Lit::Str(s), ..
                         }) => s.value(),
                         other => {
-                            return Err(Error::new_spanned(other, "[BSTACK0004] expected a string literal"));
+                            return Err(Error::new_spanned(
+                                other,
+                                "[BSTACK0004] expected a string literal",
+                            ));
                         }
                     };
                     match ident_of(&nv.path).as_deref() {

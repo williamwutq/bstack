@@ -3854,7 +3854,10 @@ pub(crate) fn foreign_tuple_field(
             ));
         }
         Kind::Embed => {
-            return Err(Error::new_spanned(&field.ty, "[BSTACK0502] cannot #[embed] a tuple"));
+            return Err(Error::new_spanned(
+                &field.ty,
+                "[BSTACK0502] cannot #[embed] a tuple",
+            ));
         }
     }
     if nullable {
@@ -4951,7 +4954,10 @@ pub(crate) fn foreign_tuple_variant(
     }
     let mut parts = VariantParts::default();
     if kind == Kind::Embed {
-        return Err(Error::new_spanned(ty, "[BSTACK0502] cannot #[embed] a tuple"));
+        return Err(Error::new_spanned(
+            ty,
+            "[BSTACK0502] cannot #[embed] a tuple",
+        ));
     }
     let nelem = tup.elems.len();
     let mut is_foreign = Vec::with_capacity(nelem);
@@ -5269,7 +5275,10 @@ pub(crate) fn array_variant(
     // ---- #[embed] array: verbatim child on-disk forms ----
     if kind == Kind::Embed {
         if elem_nullable {
-            return Err(Error::new_spanned(ty, "[BSTACK0503] #[embed] does not support `Option`"));
+            return Err(Error::new_spanned(
+                ty,
+                "[BSTACK0503] #[embed] does not support `Option`",
+            ));
         }
         parts.has_embed = true;
         let child = elem;
