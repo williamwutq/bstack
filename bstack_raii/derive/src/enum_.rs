@@ -211,7 +211,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
             Fields::Unnamed(f)
                 if f.unnamed.len() == 1
                     && (kind != Kind::Pod
-                        || vec_field(&f.unnamed.first().unwrap().ty).is_some()
+                        || vec_info(&f.unnamed.first().unwrap().ty).is_some()
                         || foreign_inner(&f.unnamed.first().unwrap().ty).is_some()) =>
             {
                 needs_payload = true;
@@ -222,7 +222,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                 // per-variant mirror of a `#[bstack_owned/strong/weak/ref] Vec<..>`
                 // struct field. A `Vec<[T; N]>` stores its offsets FLAT (like the
                 // struct case), reshaped to `Vec<[[T;..];..]>` on read.
-                if vec_field(ty).is_some() {
+                if vec_info(ty).is_some() {
                     check_container_nesting(ty)?;
                     if kind == Kind::Embed {
                         return Err(Error::new_spanned(
@@ -363,7 +363,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                     // `Pod` — arrays included — or `u8` for `String`). No block
                     // lifecycle, so clone is a verbatim byte copy.
                     if kind == Kind::Pod {
-                        let elem: TokenStream = if vec_field(ty).is_some_and(|vi| vi.is_string) {
+                        let elem: TokenStream = if vec_info(ty).is_some_and(|vi| vi.is_string) {
                             quote!(u8)
                         } else {
                             let vi = vec_inner(ty).unwrap();
@@ -412,7 +412,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                         });
                         continue;
                     }
-                    if vec_field(ty).is_some_and(|vi| vi.is_string) {
+                    if vec_info(ty).is_some_and(|vi| vi.is_string) {
                         return Err(Error::new_spanned(
                             ty,
                             "`String` is always POD; drop the ownership annotation to store \

@@ -3,10 +3,11 @@
 //! `bstack_move!` pieces, and the vector/`block_vec` machinery. Built on the
 //! analysis primitives in [`crate::util`].
 
-use proc_macro2::TokenStream;
+use proc_macro2::{Span, TokenStream};
 use quote::{format_ident, quote};
-use syn::{Ident, Type};
+use syn::{Error, Ident, Type};
 
+use crate::model::FieldParts;
 use crate::util::*;
 
 /// Teardown for a POD `Vec<T>` / `String` field: free the vector's data block
@@ -1943,4 +1944,2469 @@ pub(crate) fn weakable_items(
     } else {
         quote!()
     }
+}
+
+/// Lower a scalar `Foreign<T>` / `Option<Foreign<T>>` field to its [`FieldParts`]:
+/// the inline `ForeignRepr` slot, the lifetime-bound accessor, ctor wiring,
+/// per-kind cross-file teardown / deep-clone, `bstack_move!` RAII-dual pieces, and
+/// (for `#[bstack_mut]`) the `replace_` / `set_` mutators.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn foreign_field(
+    vis: &syn::Visibility,
+    fname: &Ident,
+    field: &syn::Field,
+    ftarget: &Type,
+    kind: Kind,
+    nullable: bool,
+    on_disk_ty: &TokenStream,
+    type_params: &[&Ident],
+) -> syn::Result<FieldParts> {
+    let mut parts = FieldParts::default();
+    let getter = format_ident!("get_{}", fname);
+            validate_foreign_target(
+                kind,
+                ftarget,
+                &field.ty,
+                "`Foreign<T>`",
+                format_ident!("__bstack_foreign_target_{}", fname),
+                !type_mentions_any(ftarget, type_params),
+                &mut parts.wrapper_defs,
+            )?;
+            parts.on_disk_fields.push(quote!(#fname: ::bstack_raii::ForeignRepr,));
+            let field_ty = quote!(::bstack_raii::Foreign<#ftarget>);
+            let cap = format_ident!("__cap_{}", fname);
+            parts.mv_caps.push(quote!(let #cap = __od.#fname;));
+
+            // `bstack_move!` hands an owning foreign field back as its RAII dual
+            // (`ForeignOwned` / `ForeignRc` / `ForeignWeak`, each with `bstack_drop` +
+            // `into_foreign`); a `#[bstack_ref]` yields a plain `Foreign` (owns nothing).
+            let (mv_leaf_ty, mv_leaf_expr) = match kind {
+                Kind::Owned => (
+                    quote!(::bstack_raii::ForeignOwned<'__mv, #ftarget>),
+                    quote!(unsafe {
+                        ::bstack_raii::ForeignOwned::from_foreign(
+                            ::bstack_raii::Foreign::from_repr(#cap))
+                    }),
+                ),
+                Kind::Strong => (
+                    quote!(::bstack_raii::ForeignRc<'__mv, #ftarget>),
+                    quote!(unsafe {
+                        ::bstack_raii::ForeignRc::from_foreign(
+                            ::bstack_raii::Foreign::from_repr(#cap))
+                    }),
+                ),
+                Kind::Weak => (
+                    quote!(::bstack_raii::ForeignWeak<'__mv, #ftarget>),
+                    quote!(unsafe {
+                        ::bstack_raii::ForeignWeak::from_foreign(
+                            ::bstack_raii::Foreign::from_repr(#cap))
+                    }),
+                ),
+                _ => (
+                    quote!(::bstack_raii::Foreign<'__mv, #ftarget>),
+                    quote!(unsafe { ::bstack_raii::Foreign::from_repr(#cap) }),
+                ),
+            };
+
+            if nullable {
+                // Niche: a stored `offset == 0` is `None` (no target sits at 0).
+                parts.accessors.push(quote! {
+                    #vis fn #getter<'__f>(
+                        &self,
+                        stack: &'__f ::bstack_raii::BStack,
+                    ) -> ::std::io::Result<
+                        ::core::option::Option<::bstack_raii::Foreign<'__f, #ftarget>>,
+                    > {
+                        let mut __buf = ::std::vec![0u8; ::core::mem::size_of::<#on_disk_ty>()];
+                        let __r = unsafe { ::bstack_raii::BStackRef::<Self>::from_range(self.0) };
+                        let __od: #on_disk_ty = *__r.read_on_disk(stack, &mut __buf)?;
+                        let __p = __od.#fname;
+                        ::std::result::Result::Ok(if __p.offset() == 0 {
+                            ::core::option::Option::None
+                        } else {
+                            // SAFETY: `__p` was stored into this file; the returned
+                            // `Foreign`'s lifetime is bound to `stack` by the signature.
+                            ::core::option::Option::Some(unsafe {
+                                ::bstack_raii::Foreign::from_repr(__p)
+                            })
+                        })
+                    }
+                });
+                parts.ctor_params.push(quote!(#fname: ::core::option::Option<#field_ty>,));
+                parts.ctor_preps.push(quote! {
+                    let #fname: ::bstack_raii::ForeignRepr = match #fname {
+                        ::core::option::Option::Some(__f) => __f.repr(),
+                        ::core::option::Option::None => ::bstack_raii::ForeignRepr::new(0, 0),
+                    };
+                });
+                parts.ctor_inits.push(quote!(#fname: #fname,));
+                parts.mv_types.push(quote!(::core::option::Option<#mv_leaf_ty>));
+                parts.mv_recon.push(quote! {
+                    if #cap.offset() == 0 {
+                        ::core::option::Option::None
+                    } else {
+                        // SAFETY: `#cap` was stored into this file; the handle is bound
+                        // to `'__mv` and owns the target per the field annotation.
+                        ::core::option::Option::Some(#mv_leaf_expr)
+                    }
+                });
+            } else {
+                parts.accessors.push(quote! {
+                    #vis fn #getter<'__f>(
+                        &self,
+                        stack: &'__f ::bstack_raii::BStack,
+                    ) -> ::std::io::Result<::bstack_raii::Foreign<'__f, #ftarget>> {
+                        let mut __buf = ::std::vec![0u8; ::core::mem::size_of::<#on_disk_ty>()];
+                        let __r = unsafe { ::bstack_raii::BStackRef::<Self>::from_range(self.0) };
+                        let __od: #on_disk_ty = *__r.read_on_disk(stack, &mut __buf)?;
+                        // SAFETY: stored into this file; bound to `stack` by the signature.
+                        ::std::result::Result::Ok(unsafe {
+                            ::bstack_raii::Foreign::from_repr(__od.#fname)
+                        })
+                    }
+                });
+                parts.ctor_params.push(quote!(#fname: #field_ty,));
+                parts.ctor_preps.push(quote!(let #fname: ::bstack_raii::ForeignRepr = #fname.repr();));
+                parts.ctor_inits.push(quote!(#fname: #fname,));
+                parts.mv_types.push(quote!(#mv_leaf_ty));
+                parts.mv_recon.push(quote!(#mv_leaf_expr));
+            }
+
+            // Teardown: an owning foreign pointer frees / decrements / releases its
+            // target *in the target's own file*. The kind picks a helper; all run the
+            // ordinary generic teardown against whichever allocator addresses the
+            // target — the local `allocator` for a `SELF` pointer, or a
+            // `ForeignHostAllocator` (over the live host) for a cross-file one. Frees
+            // are tagged (via `wal_file_id`) with the target's file so the home WAL
+            // reclaims them there. `#[bstack_ref]` owns nothing → no teardown.
+            let foreign_drop_helper = match kind {
+                Kind::Owned => Some(quote!(::bstack_raii::__private::foreign_drop_owned)),
+                Kind::Strong => Some(quote!(::bstack_raii::__private::foreign_drop_strong)),
+                Kind::Weak => Some(quote!(::bstack_raii::__private::foreign_drop_weak)),
+                // Ref: non-owning. Pod / Embed: already rejected above.
+                Kind::Ref | Kind::Pod | Kind::Embed => None,
+            };
+            if let Some(helper) = foreign_drop_helper {
+                parts.drop_stmts.push(quote! {
+                    {
+                        let __fp: ::bstack_raii::ForeignRepr = __on_disk.#fname;
+                        // A `0` offset is the null / unset niche (nullable field, or a
+                        // never-set pointer) — nothing to free.
+                        let __off = __fp.offset();
+                        if __off != 0 {
+                            let __fid = __fp.file_id();
+                            if __fid == 0 {
+                                // `SELF`: the target is in this same file.
+                                unsafe { #helper::<#ftarget, _>(allocator, __off)?; }
+                            } else if let ::core::option::Option::Some(__id) =
+                                ::bstack_raii::registry::FileId::from_u64(__fid)
+                            {
+                                // Foreign: adapt the live host to an allocator and run
+                                // the same teardown against the other file. If that
+                                // file isn't currently attached, the target is
+                                // unreachable and leaks (permitted).
+                                if let ::core::option::Option::Some(__host) =
+                                    ::bstack_raii::registry::host_arc(__id)
+                                {
+                                    let __adapter =
+                                        ::bstack_raii::ForeignHostAllocator::new(__host, __id);
+                                    unsafe { #helper::<#ftarget, _>(&__adapter, __off)?; }
+                                }
+                            }
+                            // A malformed id (does not fit the `FileId` space) is
+                            // unreachable → leak (skip), not an error.
+                        }
+                    }
+                });
+            }
+
+            // Deep clone: per-kind, acting on the target *in its own file*. `owned`
+            // deep-copies the target (a fresh block, the pointer repointed); `strong`
+            // / `weak` share it and bump its count; `ref` aliases (byte-copied — no
+            // clone_stmt). A `SELF` pointer folds into the *home* plan (atomic with the
+            // home commit); a foreign one acts eagerly via the adapter (best-effort,
+            // over-provisioning ⇒ leak, never under ⇒ double-free). A detached target
+            // file makes the clone error (aliasing an owner would double-free later).
+            let target_od_size = quote! {
+                ::core::mem::size_of::<<#ftarget as ::bstack_raii::BStackBlock>::OnDisk>() as u64
+            };
+            let foreign_clone_stmt = match kind {
+                Kind::Owned => Some(quote! {
+                    {
+                        let __fp: ::bstack_raii::ForeignRepr = __od.#fname;
+                        let __off = __fp.offset();
+                        if __off != 0 {
+                            let __fid = __fp.file_id();
+                            if __fid == 0 {
+                                // SELF: deep-clone into the home plan (one atomic commit).
+                                let __child = <#ftarget as ::bstack_raii::BStackBlock>::from_range(
+                                    ::bstack_raii::BStackRange::new(__off, #target_od_size),
+                                );
+                                let __new = __child.__bstack_clone_into(allocator, __plan)?;
+                                __od.#fname = ::bstack_raii::ForeignRepr::new(0, __new.start());
+                            } else if __plan.is_measuring() {
+                                // Foreign deep-clone is eager cross-file work; the
+                                // measure pass (home-file sizes only) skips it, so it
+                                // runs exactly once in the build pass.
+                            } else if let ::core::option::Option::Some(__id) =
+                                ::bstack_raii::registry::FileId::from_u64(__fid)
+                            {
+                                let __host = ::bstack_raii::registry::host_arc(__id)
+                                    .ok_or_else(|| ::std::io::Error::new(
+                                        ::std::io::ErrorKind::NotFound,
+                                        "cannot deep-clone `#[bstack_owned] Foreign<T>`: \
+                                         target file not attached",
+                                    ))?;
+                                let __adapter =
+                                    ::bstack_raii::ForeignHostAllocator::new(__host, __id);
+                                let __new_off = unsafe {
+                                    ::bstack_raii::__private::foreign_clone_owned::<#ftarget, _>(
+                                        &__adapter, __off,
+                                    )?
+                                };
+                                __od.#fname = ::bstack_raii::ForeignRepr::new(__fid, __new_off);
+                            } else {
+                                return ::std::result::Result::Err(::std::io::Error::new(
+                                    ::std::io::ErrorKind::InvalidData,
+                                    "cannot clone `Foreign<T>`: malformed file id",
+                                ));
+                            }
+                        }
+                    }
+                }),
+                Kind::Strong => Some(quote! {
+                    {
+                        let __fp: ::bstack_raii::ForeignRepr = __od.#fname;
+                        let __off = __fp.offset();
+                        if __off != 0 {
+                            let __fid = __fp.file_id();
+                            if __fid == 0 {
+                                // SELF: bump the strong count via the home plan (atomic).
+                                let __data = unsafe {
+                                    ::bstack_raii::BStackRef::<#ftarget>::from_range(
+                                        ::bstack_raii::BStackRange::new(__off, #target_od_size),
+                                    )
+                                };
+                                __plan.bump_strong(__data, allocator)?;
+                            } else if __plan.is_measuring() {
+                                // Foreign refcount bump is eager cross-file work; done
+                                // once, in the build pass (measure skips it).
+                            } else if let ::core::option::Option::Some(__id) =
+                                ::bstack_raii::registry::FileId::from_u64(__fid)
+                            {
+                                let __host = ::bstack_raii::registry::host_arc(__id)
+                                    .ok_or_else(|| ::std::io::Error::new(
+                                        ::std::io::ErrorKind::NotFound,
+                                        "cannot clone `#[bstack_strong] Foreign<T>`: \
+                                         target file not attached",
+                                    ))?;
+                                let __adapter =
+                                    ::bstack_raii::ForeignHostAllocator::new(__host, __id);
+                                unsafe {
+                                    ::bstack_raii::__private::foreign_clone_strong::<#ftarget, _>(
+                                        &__adapter, __off,
+                                    )?;
+                                }
+                                // The pointer is unchanged (shares the same target).
+                            } else {
+                                return ::std::result::Result::Err(::std::io::Error::new(
+                                    ::std::io::ErrorKind::InvalidData,
+                                    "cannot clone `Foreign<T>`: malformed file id",
+                                ));
+                            }
+                        }
+                    }
+                }),
+                Kind::Weak => Some(quote! {
+                    {
+                        let __fp: ::bstack_raii::ForeignRepr = __od.#fname;
+                        // For a weak pointer, the offset is the target's control block.
+                        let __off = __fp.offset();
+                        if __off != 0 {
+                            let __fid = __fp.file_id();
+                            if __fid == 0 {
+                                // SELF: bump the weak count via the home plan (atomic).
+                                __plan.bump_weak(__off);
+                            } else if __plan.is_measuring() {
+                                // Foreign refcount bump is eager cross-file work; done
+                                // once, in the build pass (measure skips it).
+                            } else if let ::core::option::Option::Some(__id) =
+                                ::bstack_raii::registry::FileId::from_u64(__fid)
+                            {
+                                let __host = ::bstack_raii::registry::host_arc(__id)
+                                    .ok_or_else(|| ::std::io::Error::new(
+                                        ::std::io::ErrorKind::NotFound,
+                                        "cannot clone `#[bstack_weak] Foreign<T>`: \
+                                         target file not attached",
+                                    ))?;
+                                let __adapter =
+                                    ::bstack_raii::ForeignHostAllocator::new(__host, __id);
+                                unsafe {
+                                    ::bstack_raii::__private::foreign_clone_weak::<#ftarget, _>(
+                                        &__adapter, __off,
+                                    )?;
+                                }
+                            } else {
+                                return ::std::result::Result::Err(::std::io::Error::new(
+                                    ::std::io::ErrorKind::InvalidData,
+                                    "cannot clone `Foreign<T>`: malformed file id",
+                                ));
+                            }
+                        }
+                    }
+                }),
+                // Ref aliases (byte-copied verbatim); Pod / Embed already rejected.
+                Kind::Ref | Kind::Pod | Kind::Embed => None,
+            };
+            if let Some(cs) = foreign_clone_stmt {
+                parts.clone_stmts.push(cs);
+            }
+
+            // `#[bstack_mut]`: `replace_<f>` (owned/strong/weak — moves the old
+            // cross-file target out as its RAII dual) and, for a foreign `ref`, also
+            // `set_<f>`. One crash-atomic 16-byte `ForeignRepr` write; the swap is
+            // purely local (no registry / host access), the cross-file free/decrement
+            // travelling with the returned handle.
+            if is_bstack_mut(&field.attrs) {
+                for m in
+                    foreign_mut_methods(vis, fname, &quote!(#ftarget), on_disk_ty, kind, nullable)
+                {
+                    parts.accessors.push(m);
+                }
+            }
+    Ok(parts)
+}
+
+/// Lower a `Vec<T>` / `String` (and their `Option`, `Vec<Foreign>`, `Vec<[T; N]>`
+/// forms) field to its [`FieldParts`]: the inline `VecDesc` slot, the `BStackVec`-
+/// family accessor, ctor wiring, per-kind teardown / deep-clone, and `bstack_move!`
+/// pieces. `vinfo` is the element/`is_string` classification from `util::vec_info`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn vec_field(
+    vis: &syn::Visibility,
+    fname: &Ident,
+    field: &syn::Field,
+    opt_inner: &Type,
+    vinfo: VecInfo,
+    kind: Kind,
+    nullable: bool,
+    on_disk_ty: &TokenStream,
+    type_params: &[&Ident],
+    const_params: &[&Ident],
+) -> syn::Result<FieldParts> {
+    let mut parts = FieldParts::default();
+    let getter = format_ident!("get_{}", fname);
+            let elem = &vinfo.elem;
+            // The descriptor lives inline in the field (no descriptor block).
+            parts.on_disk_fields.push(quote!(#fname: ::bstack_raii::VecDesc,));
+            let cap = format_ident!("__cap_{}", fname);
+            parts.mv_caps.push(quote!(let #cap = __od.#fname;));
+
+            // `String` is always POD bytes; a block annotation on it is meaningless.
+            if vinfo.is_string && kind != Kind::Pod {
+                return Err(Error::new_spanned(
+                    &field.ty,
+                    "`String` is always POD; remove the ownership annotation",
+                ));
+            }
+
+            // `#[ann] Vec<Foreign<T>>` — a growable vector of cross-file wide
+            // pointers, each an owning foreign reference per the annotation. Stored as
+            // a POD-style vector of `ForeignPtr` (16 B each); construction / access map
+            // to `Foreign<T>`, and teardown / clone dispatch each element cross-file
+            // exactly like a scalar `Foreign` field. A null/unset element is a
+            // `Foreign` whose offset is `0` (skipped by teardown / clone).
+            if let Some(velem) = vec_inner(opt_inner)
+                && let Some(ftarget) = foreign_inner(option_inner(velem).unwrap_or(velem))
+            {
+                // `Vec<Option<Foreign<T>>>`: a per-element-nullable vector (a stored
+                // offset of `0` reads as `None`); `Vec<Foreign<T>>` is the plain form.
+                let elem_nullable = option_inner(velem).is_some();
+                validate_foreign_target(
+                    kind,
+                    ftarget,
+                    &field.ty,
+                    "`Vec<Foreign<T>>`",
+                    format_ident!("__bstack_foreign_vec_target_{}", fname),
+                    !type_mentions_any(ftarget, type_params),
+                    &mut parts.wrapper_defs,
+                )?;
+
+                let store = quote!(::bstack_raii::BStackVec::<::bstack_raii::ForeignRepr, __A>);
+                let field_loc =
+                    quote!(self.0.start() + ::core::mem::offset_of!(#on_disk_ty, #fname) as u64);
+                let field_ty = if elem_nullable {
+                    quote!(::core::option::Option<::bstack_raii::Foreign<#ftarget>>)
+                } else {
+                    quote!(::bstack_raii::Foreign<#ftarget>)
+                };
+                // The accessor binds each returned `Foreign`'s lifetime to `'__v` (the
+                // allocator borrow it read through), so a `SELF` element cannot escape it.
+                let acc_elem_ty = if elem_nullable {
+                    quote!(::core::option::Option<::bstack_raii::Foreign<'__v, #ftarget>>)
+                } else {
+                    quote!(::bstack_raii::Foreign<'__v, #ftarget>)
+                };
+                // Map a stored `ForeignRepr` ↔ the element type (offset 0 ⇒ `None` when
+                // the element is `Option`-wrapped). SAFETY: each repr was stored into
+                // this file; the returned `Foreign`s are `'__v`-bound by the accessor.
+                let from_ptr = if elem_nullable {
+                    quote!(|__p: ::bstack_raii::ForeignRepr| if __p.offset() == 0 {
+                        ::core::option::Option::None
+                    } else {
+                        ::core::option::Option::Some(
+                            unsafe { ::bstack_raii::Foreign::<#ftarget>::from_repr(__p) })
+                    })
+                } else {
+                    quote!(|__p: ::bstack_raii::ForeignRepr|
+                        unsafe { ::bstack_raii::Foreign::<#ftarget>::from_repr(__p) })
+                };
+                let to_ptr = if elem_nullable {
+                    quote!(|__f: #field_ty| match __f {
+                        ::core::option::Option::Some(__ff) => __ff.repr(),
+                        ::core::option::Option::None => ::bstack_raii::ForeignRepr::new(0, 0),
+                    })
+                } else {
+                    quote!(|__f: #field_ty| __f.repr())
+                };
+
+                // ---- Accessor: `Vec<Foreign<T>>` / `Vec<Option<Foreign<T>>>` (or `Option<..>`) ----
+                let (acc_ret, acc_body) = if nullable {
+                    (
+                        quote!(::core::option::Option<::std::vec::Vec<#acc_elem_ty>>),
+                        quote!(match unsafe { #store::from_field_opt(#field_loc, allocator) }? {
+                            ::core::option::Option::Some(__v) => ::core::option::Option::Some(
+                                __v.to_vec()?
+                                    .into_iter()
+                                    .map(#from_ptr)
+                                    .collect()),
+                            ::core::option::Option::None => ::core::option::Option::None,
+                        }),
+                    )
+                } else {
+                    (
+                        quote!(::std::vec::Vec<#acc_elem_ty>),
+                        quote!(unsafe { #store::from_field(#field_loc, allocator)? }
+                            .to_vec()?
+                            .into_iter()
+                            .map(#from_ptr)
+                            .collect()),
+                    )
+                };
+                parts.accessors.push(quote! {
+                    #vis fn #getter<'__v, __A: ::bstack_raii::BStackRaiiAllocator>(
+                        &self,
+                        allocator: &'__v __A,
+                    ) -> ::std::io::Result<#acc_ret> {
+                        ::std::result::Result::Ok(#acc_body)
+                    }
+                });
+
+                // ---- Constructor: `Vec<Foreign<T>>` → a `ForeignPtr` data block ----
+                let build = quote! {
+                    let __ptrs: ::std::vec::Vec<::bstack_raii::ForeignRepr> =
+                        __list.into_iter().map(#to_ptr).collect();
+                    #store::from_slice(allocator, &__ptrs)?.descriptor()
+                };
+                let (param, prep) = if nullable {
+                    (
+                        quote!(#fname: ::core::option::Option<::std::vec::Vec<#field_ty>>,),
+                        quote! {
+                            let #fname: ::bstack_raii::VecDesc = match #fname {
+                                ::core::option::Option::Some(__list) => { #build }
+                                ::core::option::Option::None => ::core::default::Default::default(),
+                            };
+                        },
+                    )
+                } else {
+                    (
+                        quote!(#fname: ::std::vec::Vec<#field_ty>,),
+                        quote! {
+                            let #fname: ::bstack_raii::VecDesc = { let __list = #fname; #build };
+                        },
+                    )
+                };
+                parts.ctor_params.push(param);
+                parts.ctor_preps.push(prep);
+                parts.ctor_inits.push(quote!(#fname: #fname,));
+
+                // ---- Teardown: dispatch each element, then free the data block ----
+                let elem_drop = foreign_elem_drop(kind, ftarget);
+                let drop_loop = if matches!(kind, Kind::Ref) {
+                    quote!()
+                } else {
+                    quote! {
+                        for __fp in #store::from_desc(__desc, allocator).to_vec()? { #elem_drop }
+                    }
+                };
+                parts.drop_stmts.push(quote! {
+                    {
+                        let __desc: ::bstack_raii::VecDesc = __on_disk.#fname;
+                        if __desc.data_off != 0 {
+                            #drop_loop
+                            #store::from_desc(__desc, allocator).bstack_drop()?;
+                        }
+                    }
+                });
+
+                // ---- Clone: dispatch each element into a fresh `ForeignPtr` block ----
+                let elem_clone = foreign_elem_clone(kind, ftarget);
+                parts.clone_stmts.push(quote! {
+                    {
+                        let __srcdesc: ::bstack_raii::VecDesc = __od.#fname;
+                        if __srcdesc.data_off != 0 {
+                            let __src = #store::from_desc(__srcdesc, allocator).to_vec()?;
+                            let mut __new: ::std::vec::Vec<::bstack_raii::ForeignRepr> =
+                                ::std::vec::Vec::with_capacity(__src.len());
+                            for __fp in __src {
+                                #elem_clone
+                                __new.push(__newfp);
+                            }
+                            __od.#fname = __plan.stage_bytevec(
+                                allocator, ::bstack_raii::bytemuck::cast_slice(&__new))?;
+                        }
+                    }
+                });
+
+                // ---- Move: the raw `ForeignPtr` vector handle ----
+                let (mvt, mvr) = wrap_vec_move(
+                    quote!(::bstack_raii::BStackVec<'__mv, ::bstack_raii::ForeignRepr, __A>),
+                    quote!(::bstack_raii::BStackVec::from_desc(#cap, __alloc)),
+                    &cap,
+                    nullable,
+                );
+                parts.mv_types.push(mvt);
+                parts.mv_recon.push(mvr);
+                return Ok(parts);
+            }
+
+            // `#[bstack_owned/strong/weak/ref] Vec<[T; N]>` — a vector whose
+            // elements are fixed-size arrays of block references (nested `[[T;N];M]`
+            // and per-element `[Option<T>; N]` allowed). The offsets are stored
+            // **flat** as a `BStackVec<u64>` (one per leaf, row-major), exactly like
+            // a scalar block-element vector — so per-offset teardown / clone are the
+            // same; only the accessor (reshape to `[[T;..];..]`) and constructor
+            // (flatten) differ. POD `Vec<[Pod; N]>` rides the normal POD vec path.
+            if kind != Kind::Pod
+                && let Some(velem) = vec_inner(opt_inner)
+                && let Type::Array(_) = velem
+            {
+                let (dims, elem_ty, leaf_nullable) = array_shape(velem)?;
+                reject_nested_const_dims(&dims, const_params, &field.ty)?;
+                let total = dims_prod(&dims);
+                let elem_ts = quote!(#elem_ty);
+                let size_elem = quote!(::core::mem::size_of::<
+                    <#elem_ty as ::bstack_raii::BStackBlock>::OnDisk>() as u64);
+                let store = quote!(::bstack_raii::BStackVec::<u64, __A>);
+                let field_loc =
+                    quote!(self.0.start() + ::core::mem::offset_of!(#on_disk_ty, #fname) as u64);
+                let is_weak = kind == Kind::Weak;
+                let (ctrl_ty, ctrl_size) = (
+                    quote!(<#elem_ty as ::bstack_raii::BStackWeakable>::Control),
+                    quote!(::core::mem::size_of::<
+                        <#elem_ty as ::bstack_raii::BStackWeakable>::Control>() as u64),
+                );
+                let vec_ty = match kind {
+                    Kind::Owned => quote!(BStackBlockVec),
+                    Kind::Strong => quote!(BStackStrongVec),
+                    Kind::Weak => quote!(BStackWeakVec),
+                    Kind::Ref => quote!(BStackRefVec),
+                    _ => unreachable!(),
+                };
+
+                // ---- Accessor: materialize `Vec<[[View; ..]; ..]>` ----
+                let view_leaf = if is_weak {
+                    quote!(::core::option::Option<::bstack_raii::BStackRc<'__v, #elem_ty, __A>>)
+                } else if leaf_nullable {
+                    quote!(::core::option::Option<#elem_ty>)
+                } else {
+                    quote!(#elem_ty)
+                };
+                let view_ret = nested_ty(&dims, &view_leaf);
+                let view_read = |k: &Ident| {
+                    if is_weak {
+                        quote!({
+                            let __o = __grp[#k];
+                            if __o == 0 {
+                                ::core::option::Option::None
+                            } else {
+                                let __ctrl = unsafe {
+                                    ::bstack_raii::BStackRef::<#ctrl_ty>::from_range(
+                                        ::bstack_raii::BStackRange::new(__o, #ctrl_size)) };
+                                let __wk = unsafe {
+                                    ::bstack_raii::BStackWeak::<#elem_ty, __A>::from_raw(
+                                        __ctrl, allocator) };
+                                let __up = __wk.upgrade()?;
+                                let _ = __wk.into_raw();
+                                __up
+                            }
+                        })
+                    } else if leaf_nullable {
+                        quote!({
+                            let __o = __grp[#k];
+                            if __o == 0 {
+                                ::core::option::Option::None
+                            } else {
+                                ::core::option::Option::Some(
+                                    <#elem_ty as ::bstack_raii::BStackBlock>::from_range(
+                                        ::bstack_raii::BStackRange::new(__o, #size_elem)))
+                            }
+                        })
+                    } else {
+                        quote!(<#elem_ty as ::bstack_raii::BStackBlock>::from_range(
+                            ::bstack_raii::BStackRange::new(__grp[#k], #size_elem)))
+                    }
+                };
+                let build_body = nested_build(&dims, &view_leaf, &view_read);
+                let reshape = quote! {
+                    let mut __out = ::std::vec::Vec::with_capacity(__flat.len() / (#total));
+                    for __grp in __flat.chunks(#total) {
+                        __out.push(#build_body);
+                    }
+                    __out
+                };
+                let (acc_ret, acc_map): (TokenStream, TokenStream) = if nullable {
+                    (
+                        quote!(::core::option::Option<::std::vec::Vec<#view_ret>>),
+                        quote!(match unsafe { #store::from_field_opt(#field_loc, allocator) }? {
+                            ::core::option::Option::Some(__v) => {
+                                let __flat = __v.to_vec()?;
+                                ::core::option::Option::Some({ #reshape })
+                            }
+                            ::core::option::Option::None => ::core::option::Option::None,
+                        }),
+                    )
+                } else {
+                    (
+                        quote!(::std::vec::Vec<#view_ret>),
+                        quote!({
+                            let __flat = unsafe { #store::from_field(#field_loc, allocator)? }.to_vec()?;
+                            #reshape
+                        }),
+                    )
+                };
+                parts.accessors.push(quote! {
+                    #vis fn #getter<'__v, __A: ::bstack_raii::BStackRaiiAllocator>(
+                        &self,
+                        allocator: &'__v __A,
+                    ) -> ::std::io::Result<#acc_ret> {
+                        ::std::result::Result::Ok(#acc_map)
+                    }
+                });
+
+                // ---- Constructor: flatten `Vec<[[Handle; ..]; ..]>` → flat offsets ----
+                let handle_base = match kind {
+                    Kind::Owned => quote!(::bstack_raii::BStackOwned<#elem_ty>),
+                    Kind::Strong => quote!(::bstack_raii::BStackRc<'__ctor, #elem_ty, __A>),
+                    Kind::Weak => quote!(::bstack_raii::BStackWeak<'__ctor, #elem_ty, __A>),
+                    Kind::Ref => quote!(::bstack_raii::BStackRef<#elem_ty>),
+                    _ => unreachable!(),
+                };
+                let handle_leaf = if leaf_nullable {
+                    quote!(::core::option::Option<#handle_base>)
+                } else {
+                    handle_base.clone()
+                };
+                let param_ty = nested_ty(&dims, &handle_leaf);
+                let off_of = |h: &Ident| match kind {
+                    Kind::Owned => quote!({
+                        let __h = #h.into_inner();
+                        ::bstack_raii::BStackBlock::range(&__h).start()
+                    }),
+                    Kind::Strong => quote!({
+                        let (__d, _c) = #h.into_raw();
+                        __d.into_range().start()
+                    }),
+                    Kind::Weak => quote!(#h.into_raw().into_range().start()),
+                    Kind::Ref => quote!(#h.into_range().start()),
+                    _ => unreachable!(),
+                };
+                let leaf_write = |_k: &Ident, leaf: &Ident| {
+                    if leaf_nullable {
+                        let hh = format_ident!("__h");
+                        let off = off_of(&hh);
+                        quote!(__flat.push(match #leaf {
+                            ::core::option::Option::Some(#hh) => #off,
+                            ::core::option::Option::None => 0u64,
+                        });)
+                    } else {
+                        let off = off_of(leaf);
+                        quote!(__flat.push(#off);)
+                    }
+                };
+                let consume_one = nested_consume(&dims, &quote!(__a), &leaf_write);
+                let build_flat = quote! {
+                    let mut __flat: ::std::vec::Vec<u64> = ::std::vec::Vec::new();
+                    for __a in __list {
+                        #consume_one
+                    }
+                    #store::from_slice(allocator, &__flat)?.descriptor()
+                };
+                let (param, prep) = if nullable {
+                    (
+                        quote!(#fname: ::core::option::Option<::std::vec::Vec<#param_ty>>,),
+                        quote! {
+                            let #fname: ::bstack_raii::VecDesc = match #fname {
+                                ::core::option::Option::Some(__list) => { #build_flat }
+                                ::core::option::Option::None => ::core::default::Default::default(),
+                            };
+                        },
+                    )
+                } else {
+                    (
+                        quote!(#fname: ::std::vec::Vec<#param_ty>,),
+                        quote! {
+                            let #fname: ::bstack_raii::VecDesc = {
+                                let __list = #fname;
+                                #build_flat
+                            };
+                        },
+                    )
+                };
+                parts.ctor_params.push(param);
+                parts.ctor_preps.push(prep);
+                parts.ctor_inits.push(quote!(#fname: #fname,));
+
+                // ---- Teardown: free each child per kind, then the offset block ----
+                let free_child = match kind {
+                    Kind::Owned => quote!(::bstack_raii::OwnedRef(unsafe {
+                        ::bstack_raii::BStackRef::<#elem_ty>::from_range(
+                            ::bstack_raii::BStackRange::new(__off, #size_elem))
+                    }).bstack_drop(allocator)?;),
+                    Kind::Strong => {
+                        quote!(<#elem_ty as ::bstack_raii::BStackShared>::drop_strong_ref(
+                        unsafe { ::bstack_raii::BStackRef::<#elem_ty>::from_range(
+                            ::bstack_raii::BStackRange::new(__off, #size_elem)) },
+                        allocator)?;)
+                    }
+                    Kind::Weak => quote!(::bstack_raii::WeakRef::<#elem_ty>(unsafe {
+                        ::bstack_raii::BStackRef::<#ctrl_ty>::from_range(
+                            ::bstack_raii::BStackRange::new(__off, #ctrl_size))
+                    }).bstack_drop(allocator)?;),
+                    Kind::Ref => quote!(),
+                    _ => unreachable!(),
+                };
+                let free_children = if matches!(kind, Kind::Ref) {
+                    quote!()
+                } else {
+                    quote! {
+                        for __off in #store::from_desc(__desc, allocator).to_vec()? {
+                            if __off != 0 { #free_child }
+                        }
+                    }
+                };
+                parts.drop_stmts.push(quote! {
+                    {
+                        let __desc: ::bstack_raii::VecDesc = __on_disk.#fname;
+                        if __desc.data_off != 0 {
+                            #free_children
+                            #store::from_desc(__desc, allocator).bstack_drop()?;
+                        }
+                    }
+                });
+
+                // ---- Clone: owned deep-clones offsets; strong/weak bump + copy;
+                //      ref copies verbatim (all staged into the plan) ----
+                let clone_body = match kind {
+                    Kind::Owned => quote! {
+                        let __flat = #store::from_desc(__srcdesc, allocator).to_vec()?;
+                        let mut __new: ::std::vec::Vec<u64> =
+                            ::std::vec::Vec::with_capacity(__flat.len());
+                        for __off in __flat {
+                            if __off != 0 {
+                                __new.push(
+                                    <#elem_ty as ::bstack_raii::BStackBlock>::from_range(
+                                        ::bstack_raii::BStackRange::new(__off, #size_elem))
+                                        .__bstack_clone_into(allocator, __plan)?.start());
+                            } else {
+                                __new.push(0u64);
+                            }
+                        }
+                        __od.#fname = __plan.stage_bytevec(
+                            allocator, ::bstack_raii::bytemuck::cast_slice(&__new))?;
+                    },
+                    Kind::Strong => quote! {
+                        for __off in #store::from_desc(__srcdesc, allocator).to_vec()? {
+                            if __off != 0 {
+                                __plan.bump_strong(unsafe {
+                                    ::bstack_raii::BStackRef::<#elem_ty>::from_range(
+                                        ::bstack_raii::BStackRange::new(__off, #size_elem))
+                                }, allocator)?;
+                            }
+                        }
+                        __od.#fname = #store::from_desc(__srcdesc, allocator)
+                            .clone_data_into(__plan)?;
+                    },
+                    Kind::Weak => quote! {
+                        for __off in #store::from_desc(__srcdesc, allocator).to_vec()? {
+                            if __off != 0 { __plan.bump_weak(__off); }
+                        }
+                        __od.#fname = #store::from_desc(__srcdesc, allocator)
+                            .clone_data_into(__plan)?;
+                    },
+                    Kind::Ref => quote! {
+                        __od.#fname = #store::from_desc(__srcdesc, allocator)
+                            .clone_data_into(__plan)?;
+                    },
+                    _ => unreachable!(),
+                };
+                parts.clone_stmts.push(quote! {
+                    {
+                        let __srcdesc: ::bstack_raii::VecDesc = __od.#fname;
+                        if __srcdesc.data_off != 0 {
+                            #clone_body
+                        }
+                    }
+                });
+
+                // ---- Move: yield the flat block-vector handle (loses `[T; N]` shape) ----
+                let (mvt, mvr) = block_vec_move(&cap, &elem_ts, vec_ty, nullable);
+                parts.mv_types.push(mvt);
+                parts.mv_recon.push(mvr);
+                return Ok(parts);
+            }
+
+            // The annotation states the *elements'* relationship (the descriptor
+            // + array is always owned by this struct regardless). No annotation =>
+            // POD elements (byte storage, requiring `T: Pod`).
+            let (drop_s, acc, ctor, mv) = match kind {
+                Kind::Embed => {
+                    return Err(Error::new_spanned(
+                        &field.ty,
+                        "cannot #[embed] a `Vec` / `String`; embed a `#[bstack_block]` type",
+                    ));
+                }
+                Kind::Pod => (
+                    vec_drop_stmt(fname, elem, nullable),
+                    vec_accessor(vis, fname, elem, on_disk_ty, nullable),
+                    vec_ctor(fname, &vinfo, nullable),
+                    vec_move(&cap, elem, nullable),
+                ),
+                Kind::Owned => (
+                    block_vec_drop_stmt(fname, quote!(BStackBlockVec), elem, nullable),
+                    block_vec_accessor(
+                        vis,
+                        fname,
+                        elem,
+                        on_disk_ty,
+                        quote!(BStackBlockVec),
+                        nullable,
+                    ),
+                    block_vec_ctor(
+                        fname,
+                        elem,
+                        quote!(BStackBlockVec),
+                        quote!(::bstack_raii::BStackOwned<#elem>),
+                        nullable,
+                    ),
+                    block_vec_move(&cap, elem, quote!(BStackBlockVec), nullable),
+                ),
+                Kind::Strong => (
+                    block_vec_drop_stmt(fname, quote!(BStackStrongVec), elem, nullable),
+                    block_vec_accessor(
+                        vis,
+                        fname,
+                        elem,
+                        on_disk_ty,
+                        quote!(BStackStrongVec),
+                        nullable,
+                    ),
+                    block_vec_ctor(
+                        fname,
+                        elem,
+                        quote!(BStackStrongVec),
+                        quote!(::bstack_raii::BStackRc<'__ctor, #elem, __A>),
+                        nullable,
+                    ),
+                    block_vec_move(&cap, elem, quote!(BStackStrongVec), nullable),
+                ),
+                Kind::Weak => (
+                    block_vec_drop_stmt(fname, quote!(BStackWeakVec), elem, nullable),
+                    block_vec_accessor(
+                        vis,
+                        fname,
+                        elem,
+                        on_disk_ty,
+                        quote!(BStackWeakVec),
+                        nullable,
+                    ),
+                    block_vec_ctor(
+                        fname,
+                        elem,
+                        quote!(BStackWeakVec),
+                        quote!(::bstack_raii::BStackWeak<'__ctor, #elem, __A>),
+                        nullable,
+                    ),
+                    block_vec_move(&cap, elem, quote!(BStackWeakVec), nullable),
+                ),
+                Kind::Ref => (
+                    block_vec_drop_stmt(fname, quote!(BStackRefVec), elem, nullable),
+                    block_vec_accessor(
+                        vis,
+                        fname,
+                        elem,
+                        on_disk_ty,
+                        quote!(BStackRefVec),
+                        nullable,
+                    ),
+                    block_vec_ctor(
+                        fname,
+                        elem,
+                        quote!(BStackRefVec),
+                        quote!(::bstack_raii::BStackRef<#elem>),
+                        nullable,
+                    ),
+                    block_vec_move(&cap, elem, quote!(BStackRefVec), nullable),
+                ),
+            };
+            parts.drop_stmts.push(drop_s);
+            parts.clone_stmts.push(vec_clone_stmt(fname, kind, elem));
+            parts.accessors.push(acc);
+            let (param, prep, init) = ctor;
+            parts.ctor_params.push(param);
+            parts.ctor_preps.push(prep);
+            parts.ctor_inits.push(init);
+            let (mv_ty, mv_rc) = mv;
+            parts.mv_types.push(mv_ty);
+            parts.mv_recon.push(mv_rc);
+    Ok(parts)
+}
+
+/// Lower an inline **array of vectors** `[Vec<T>; N]` (nested / per-element
+/// `Option` included) to its [`FieldParts`] — N independent inline `VecDesc`s,
+/// each owning its own data block. Returns `Ok(None)` if the field isn't an array
+/// whose leaf is a `Vec` / `String` (so the caller falls through to the next shape).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn vec_array_field(
+    vis: &syn::Visibility,
+    fname: &Ident,
+    field: &syn::Field,
+    opt_inner: &Type,
+    kind: Kind,
+    nullable: bool,
+    on_disk_ty: &TokenStream,
+    const_params: &[&Ident],
+) -> syn::Result<Option<FieldParts>> {
+    let Type::Array(_) = opt_inner else {
+        return Ok(None);
+    };
+    let mut parts = FieldParts::default();
+    let getter = format_ident!("get_{}", fname);
+            let (dims, leaf, leaf_nullable) = array_shape(opt_inner)?;
+            reject_nested_const_dims(&dims, const_params, &field.ty)?;
+            let leaf_vinfo = if is_str(leaf) {
+                Some(VecInfo {
+                    elem: quote!(u8),
+                    is_string: true,
+                })
+            } else {
+                vec_info(leaf)
+            };
+            if let Some(leaf_vinfo) = leaf_vinfo {
+                // Validate the leaf vector's own element nesting (`Vec<Vec<..>>`).
+                check_container_nesting(leaf)?;
+                if nullable {
+                    return Err(Error::new_spanned(
+                        &field.ty,
+                        "a whole-array `Option<[Vec<T>; N]>` is not supported; use \
+                         `[Option<Vec<T>>; N]` for per-element nullability",
+                    ));
+                }
+                if leaf_vinfo.is_string && kind != Kind::Pod {
+                    return Err(Error::new_spanned(
+                        &field.ty,
+                        "`String` is always POD; remove the ownership annotation",
+                    ));
+                }
+                if kind == Kind::Embed {
+                    return Err(Error::new_spanned(
+                        &field.ty,
+                        "cannot #[embed] a `Vec` / `String`; embed a `#[bstack_block]` type",
+                    ));
+                }
+                let total = dims_prod(&dims);
+                let elem = &leaf_vinfo.elem;
+                let is_string = leaf_vinfo.is_string;
+                let vec_ty = match kind {
+                    Kind::Pod => quote!(BStackVec),
+                    Kind::Owned => quote!(BStackBlockVec),
+                    Kind::Strong => quote!(BStackStrongVec),
+                    Kind::Weak => quote!(BStackWeakVec),
+                    Kind::Ref => quote!(BStackRefVec),
+                    Kind::Embed => unreachable!(),
+                };
+                parts.on_disk_fields.push(quote!(#fname: [::bstack_raii::VecDesc; #total],));
+
+                // Accessor: nested `[[VecHandle; ..]; ..]` (or `Option` per slot),
+                // reading each `VecDesc` from the on-disk field once.
+                let handle_lt = quote!(::bstack_raii::#vec_ty<'__v, #elem, __A>);
+                let acc_leaf = if leaf_nullable {
+                    quote!(::core::option::Option<#handle_lt>)
+                } else {
+                    handle_lt.clone()
+                };
+                let acc_ret = nested_ty(&dims, &acc_leaf);
+                // Each slot resolves through `from_field` so descriptor updates
+                // (growth / realloc) persist back to its OWN inline `VecDesc` — like
+                // a scalar `Vec` field, but at `base + k * size_of::<VecDesc>()`.
+                let acc_read = |k: &Ident| {
+                    let slot = quote!(
+                        __base + (#k as u64) * (::core::mem::size_of::<::bstack_raii::VecDesc>() as u64));
+                    if leaf_nullable {
+                        quote!(unsafe { ::bstack_raii::#vec_ty::from_field_opt(#slot, allocator) }?)
+                    } else {
+                        quote!(unsafe { ::bstack_raii::#vec_ty::from_field(#slot, allocator) }?)
+                    }
+                };
+                let acc_body = nested_build(&dims, &acc_leaf, &acc_read);
+                parts.accessors.push(quote! {
+                    #vis fn #getter<'__v, __A: ::bstack_raii::BStackRaiiAllocator>(
+                        &self,
+                        allocator: &'__v __A,
+                    ) -> ::std::io::Result<#acc_ret> {
+                        let __base =
+                            self.0.start() + ::core::mem::offset_of!(#on_disk_ty, #fname) as u64;
+                        ::std::result::Result::Ok(#acc_body)
+                    }
+                });
+
+                // Constructor: allocate a data block per slot, store its descriptor.
+                // POD slots take `&[T]` / `&str` (`from_slice`); block slots take
+                // `Vec<Handle>` (`from_handles`).
+                let handle_ctor = match kind {
+                    Kind::Owned => quote!(::bstack_raii::BStackOwned<#elem>),
+                    Kind::Strong => quote!(::bstack_raii::BStackRc<'__ctor, #elem, __A>),
+                    Kind::Weak => quote!(::bstack_raii::BStackWeak<'__ctor, #elem, __A>),
+                    Kind::Ref => quote!(::bstack_raii::BStackRef<#elem>),
+                    _ => quote!(),
+                };
+                let ctor_leaf = match kind {
+                    Kind::Pod if is_string => quote!(&str),
+                    Kind::Pod => quote!(&[#elem]),
+                    _ => quote!(::std::vec::Vec<#handle_ctor>),
+                };
+                let param_leaf = if leaf_nullable {
+                    quote!(::core::option::Option<#ctor_leaf>)
+                } else {
+                    ctor_leaf.clone()
+                };
+                let ctor_param_ty = nested_ty(&dims, &param_leaf);
+                parts.ctor_params.push(quote!(#fname: #ctor_param_ty,));
+                let desc_of = |b: &Ident| -> TokenStream {
+                    match kind {
+                        Kind::Pod => {
+                            let data = if is_string {
+                                quote!(#b.as_bytes())
+                            } else {
+                                quote!(#b)
+                            };
+                            quote!(::bstack_raii::BStackVec::<#elem, __A>::from_slice(
+                                allocator, #data)?.descriptor())
+                        }
+                        _ => quote!(::bstack_raii::#vec_ty::<#elem, __A>::from_handles(
+                            allocator, #b)?.descriptor()),
+                    }
+                };
+                let ctor_write = |k: &Ident, leaf: &Ident| {
+                    if leaf_nullable {
+                        let inner = format_ident!("__vd");
+                        let d = desc_of(&inner);
+                        quote!({
+                            __slots[#k] = match #leaf {
+                                ::core::option::Option::Some(#inner) => #d,
+                                ::core::option::Option::None =>
+                                    ::core::default::Default::default(),
+                            };
+                        })
+                    } else {
+                        let d = desc_of(leaf);
+                        quote!(__slots[#k] = #d;)
+                    }
+                };
+                let flatten = nested_consume(&dims, &quote!(#fname), &ctor_write);
+                parts.ctor_preps.push(quote! {
+                    let #fname: [::bstack_raii::VecDesc; #total] = {
+                        let mut __slots =
+                            [<::bstack_raii::VecDesc as ::core::default::Default>::default();
+                                #total];
+                        #flatten
+                        __slots
+                    };
+                });
+                parts.ctor_inits.push(quote!(#fname: #fname,));
+
+                // Teardown: free each vector's data block.
+                parts.drop_stmts.push(quote! {
+                    {
+                        let __descs: [::bstack_raii::VecDesc; #total] = __on_disk.#fname;
+                        for __k in 0usize..(#total) {
+                            if __descs[__k].data_off != 0 {
+                                ::bstack_raii::#vec_ty::<#elem, __A>::from_desc(
+                                    __descs[__k], allocator).bstack_drop()?;
+                            }
+                        }
+                    }
+                });
+
+                // Clone: deep-clone each vector's data block per the element
+                // relationship, repointing the slot descriptor (a `0` niche is kept).
+                let clone_expr = match kind {
+                    Kind::Pod => quote!(::bstack_raii::BStackVec::<#elem, __A>::from_desc(
+                        __sd, allocator).clone_data_into(__plan)?),
+                    Kind::Owned => quote!(::bstack_raii::BStackBlockVec::<#elem, __A>::from_desc(
+                        __sd, allocator).clone_into(__plan, |__er, __p| {
+                            <#elem as ::bstack_raii::BStackBlock>::from_range(__er)
+                                .__bstack_clone_into(allocator, __p)
+                        })?),
+                    Kind::Strong => quote!(::bstack_raii::BStackStrongVec::<#elem, __A>::from_desc(
+                        __sd, allocator).clone_into(__plan)?),
+                    Kind::Weak => quote!(::bstack_raii::BStackWeakVec::<#elem, __A>::from_desc(
+                        __sd, allocator).clone_into(__plan)?),
+                    Kind::Ref => quote!(::bstack_raii::BStackRefVec::<#elem, __A>::from_desc(
+                        __sd, allocator).clone_into(__plan)?),
+                    Kind::Embed => unreachable!(),
+                };
+                parts.clone_stmts.push(quote! {
+                    {
+                        let mut __descs: [::bstack_raii::VecDesc; #total] = __od.#fname;
+                        for __k in 0usize..(#total) {
+                            let __sd: ::bstack_raii::VecDesc = __descs[__k];
+                            if __sd.data_off != 0 {
+                                __descs[__k] = #clone_expr;
+                            }
+                        }
+                        __od.#fname = __descs;
+                    }
+                });
+
+                // Move: nested `[[VecHandle; ..]; ..]` from the captured descriptors.
+                let cap = format_ident!("__cap_{}", fname);
+                parts.mv_caps.push(quote!(let #cap = __od.#fname;));
+                let mv_handle = quote!(::bstack_raii::#vec_ty<'__mv, #elem, __A>);
+                let mv_leaf = if leaf_nullable {
+                    quote!(::core::option::Option<#mv_handle>)
+                } else {
+                    mv_handle.clone()
+                };
+                parts.mv_types.push(nested_ty(&dims, &mv_leaf));
+                let mv_read = |k: &Ident| {
+                    if leaf_nullable {
+                        quote!({
+                            let __d = #cap[#k];
+                            if __d.data_off != 0 {
+                                ::core::option::Option::Some(
+                                    ::bstack_raii::#vec_ty::from_desc(__d, __alloc))
+                            } else {
+                                ::core::option::Option::None
+                            }
+                        })
+                    } else {
+                        quote!(::bstack_raii::#vec_ty::from_desc(#cap[#k], __alloc))
+                    }
+                };
+                parts.mv_recon.push(nested_build(&dims, &mv_leaf, &mv_read));
+                return Ok(Some(parts));
+            }
+    Ok(None)
+}
+
+/// Lower an inline **array of `Foreign`** `[Foreign<T>; N]` (nested / per-element
+/// `Option`) to its [`FieldParts`] — a flat `[ForeignRepr; TOTAL]` inline, each
+/// slot's teardown / deep-clone dispatching cross-file like a scalar `Foreign`.
+/// Returns `Ok(None)` if the field isn't an array whose leaf is a `Foreign`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn foreign_array_field(
+    vis: &syn::Visibility,
+    fname: &Ident,
+    field: &syn::Field,
+    opt_inner: &Type,
+    kind: Kind,
+    nullable: bool,
+    on_disk_ty: &TokenStream,
+    type_params: &[&Ident],
+    const_params: &[&Ident],
+) -> syn::Result<Option<FieldParts>> {
+    let Type::Array(_) = opt_inner else {
+        return Ok(None);
+    };
+    let mut parts = FieldParts::default();
+    let getter = format_ident!("get_{}", fname);
+            let (adims, aleaf, aleaf_nullable) = array_shape(opt_inner)?;
+            if let Some(ftarget) = foreign_inner(aleaf) {
+                reject_nested_const_dims(&adims, const_params, &field.ty)?;
+                validate_foreign_target(
+                    kind,
+                    ftarget,
+                    &field.ty,
+                    "`[Foreign<T>; N]`",
+                    format_ident!("__bstack_foreign_arr_target_{}", fname),
+                    !type_mentions_any(ftarget, type_params),
+                    &mut parts.wrapper_defs,
+                )?;
+                if nullable {
+                    return Err(Error::new_spanned(
+                        &field.ty,
+                        "a whole-array `Option<[Foreign<T>; N]>` is not supported; a null foreign \
+                         element is a `Foreign` with offset 0, or use `[Option<Foreign<T>>; N]`",
+                    ));
+                }
+                let total = dims_prod(&adims);
+                let field_ty = quote!(::bstack_raii::Foreign<#ftarget>);
+                parts.on_disk_fields.push(quote!(#fname: [::bstack_raii::ForeignRepr; #total],));
+
+                // ---- Accessor: nested `[[Foreign<T>; ..]; ..]` (Option per slot) ----
+                // Each returned `Foreign`'s lifetime is bound to `'__f` (the `stack`
+                // borrow), so a `SELF` slot cannot escape the file it was read from.
+                let leaf_ty = if aleaf_nullable {
+                    quote!(::core::option::Option<::bstack_raii::Foreign<'__f, #ftarget>>)
+                } else {
+                    quote!(::bstack_raii::Foreign<'__f, #ftarget>)
+                };
+                let acc_ret = nested_ty(&adims, &leaf_ty);
+                let acc_read = |k: &Ident| {
+                    // SAFETY: each slot repr was stored into this file; bound to `'__f`.
+                    if aleaf_nullable {
+                        quote!({
+                            let __p = __arr[#k];
+                            if __p.offset() == 0 {
+                                ::core::option::Option::None
+                            } else {
+                                ::core::option::Option::Some(
+                                    unsafe { ::bstack_raii::Foreign::<#ftarget>::from_repr(__p) })
+                            }
+                        })
+                    } else {
+                        quote!(unsafe { ::bstack_raii::Foreign::<#ftarget>::from_repr(__arr[#k]) })
+                    }
+                };
+                let acc_body = nested_build(&adims, &leaf_ty, &acc_read);
+                parts.accessors.push(quote! {
+                    #vis fn #getter<'__f>(
+                        &self,
+                        stack: &'__f ::bstack_raii::BStack,
+                    ) -> ::std::io::Result<#acc_ret> {
+                        let mut __buf = ::std::vec![0u8; ::core::mem::size_of::<#on_disk_ty>()];
+                        let __r = unsafe { ::bstack_raii::BStackRef::<Self>::from_range(self.0) };
+                        let __od: #on_disk_ty = *__r.read_on_disk(stack, &mut __buf)?;
+                        let __arr: [::bstack_raii::ForeignRepr; #total] = __od.#fname;
+                        ::std::result::Result::Ok(#acc_body)
+                    }
+                });
+
+                // ---- Constructor: nested `[[Foreign<T>; ..]; ..]` → flat `[ForeignPtr; TOTAL]` ----
+                let param_leaf = if aleaf_nullable {
+                    quote!(::core::option::Option<#field_ty>)
+                } else {
+                    field_ty.clone()
+                };
+                let param_ty = nested_ty(&adims, &param_leaf);
+                parts.ctor_params.push(quote!(#fname: #param_ty,));
+                let ctor_write = |k: &Ident, leaf: &Ident| {
+                    if aleaf_nullable {
+                        quote!(__slots[#k] = match #leaf {
+                            ::core::option::Option::Some(__f) => __f.repr(),
+                            ::core::option::Option::None => ::bstack_raii::ForeignRepr::new(0, 0),
+                        };)
+                    } else {
+                        quote!(__slots[#k] = #leaf.repr();)
+                    }
+                };
+                let flatten = nested_consume(&adims, &quote!(#fname), &ctor_write);
+                parts.ctor_preps.push(quote! {
+                    let #fname: [::bstack_raii::ForeignRepr; #total] = {
+                        let mut __slots = [::bstack_raii::ForeignRepr::new(0, 0); #total];
+                        #flatten
+                        __slots
+                    };
+                });
+                parts.ctor_inits.push(quote!(#fname: #fname,));
+
+                // ---- Teardown: dispatch each slot (inline; nothing else to free) ----
+                let elem_drop = foreign_elem_drop(kind, ftarget);
+                let drop_body = if matches!(kind, Kind::Ref) {
+                    quote!()
+                } else {
+                    quote! {
+                        let __arr: [::bstack_raii::ForeignRepr; #total] = __on_disk.#fname;
+                        for __k in 0usize..(#total) {
+                            let __fp = __arr[__k];
+                            #elem_drop
+                        }
+                    }
+                };
+                parts.drop_stmts.push(quote! { { #drop_body } });
+
+                // ---- Clone: dispatch each slot into a fresh `[ForeignPtr; TOTAL]` ----
+                let elem_clone = foreign_elem_clone(kind, ftarget);
+                parts.clone_stmts.push(quote! {
+                    {
+                        let __arr: [::bstack_raii::ForeignRepr; #total] = __od.#fname;
+                        let mut __narr: [::bstack_raii::ForeignRepr; #total] = __arr;
+                        for __k in 0usize..(#total) {
+                            let __fp = __arr[__k];
+                            #elem_clone
+                            __narr[__k] = __newfp;
+                        }
+                        __od.#fname = __narr;
+                    }
+                });
+
+                // ---- Move: materialize the nested `[[Foreign<T>; ..]; ..]` values ----
+                let cap = format_ident!("__cap_{}", fname);
+                parts.mv_caps.push(quote!(let #cap = __od.#fname;));
+                let mv_leaf = if aleaf_nullable {
+                    quote!(::core::option::Option<::bstack_raii::Foreign<'__mv, #ftarget>>)
+                } else {
+                    quote!(::bstack_raii::Foreign<'__mv, #ftarget>)
+                };
+                parts.mv_types.push(nested_ty(&adims, &mv_leaf));
+                let mv_read = |k: &Ident| {
+                    // SAFETY: each slot repr was stored into this file; bound to `'__mv`.
+                    if aleaf_nullable {
+                        quote!({
+                            let __p = #cap[#k];
+                            if __p.offset() == 0 {
+                                ::core::option::Option::None
+                            } else {
+                                ::core::option::Option::Some(
+                                    unsafe { ::bstack_raii::Foreign::<#ftarget>::from_repr(__p) })
+                            }
+                        })
+                    } else {
+                        quote!(unsafe { ::bstack_raii::Foreign::<#ftarget>::from_repr(#cap[#k]) })
+                    }
+                };
+                parts.mv_recon.push(nested_build(&adims, &mv_leaf, &mv_read));
+                return Ok(Some(parts));
+            }
+    Ok(None)
+}
+
+/// Lower an inline **array of block references** `[T; N]` (nested `[[..]; ..]`,
+/// per-element `Option`, and the `#[embed]` / weak variants) to its [`FieldParts`]
+/// — a flat `[u64; N0*..*Nk]` (or inline embed) with per-element ownership. Returns
+/// `Ok(None)` for a POD array or a non-array (fall through to the POD scalar path).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn block_array_field(
+    vis: &syn::Visibility,
+    fname: &Ident,
+    field: &syn::Field,
+    opt_inner: &Type,
+    kind: Kind,
+    nullable: bool,
+    on_disk_ty: &TokenStream,
+    type_params: &[&Ident],
+    const_params: &[&Ident],
+) -> syn::Result<Option<FieldParts>> {
+    if kind == Kind::Pod {
+        return Ok(None);
+    }
+    let Type::Array(_) = opt_inner else {
+        return Ok(None);
+    };
+    let mut parts = FieldParts::default();
+    let getter = format_ident!("get_{}", fname);
+            if nullable {
+                return Err(Error::new_spanned(
+                    &field.ty,
+                    "a whole-array `Option<[T; N]>` is not supported; use `[Option<T>; N]` \
+                     for per-element nullability",
+                ));
+            }
+            let (dims, elem, elem_nullable) = array_shape(opt_inner)?;
+            reject_nested_const_dims(&dims, const_params, &field.ty)?;
+            let total = dims_prod(&dims);
+
+            // `#[embed] [Child; N]` (or nested): N verbatim child on-disk forms
+            // inline (`[<Child as BStackBlock>::OnDisk; TOTAL]`, flat). Construction
+            // folds each `BStackOwned<Child>` in (read OnDisk, copy, free shell).
+            if kind == Kind::Embed {
+                if elem_nullable {
+                    return Err(Error::new_spanned(
+                        &field.ty,
+                        "#[embed] does not support `Option`",
+                    ));
+                }
+                if is_bstack_mut(&field.attrs) {
+                    return Err(Error::new_spanned(
+                        field,
+                        "#[bstack_mut] is not yet supported on #[embed] fields",
+                    ));
+                }
+                let child = elem;
+                // Guard: `#[embed]` target must be a plain, self-contained block.
+                if !type_mentions_any(child, type_params) {
+                    parts.wrapper_defs.push(quote! {
+                        const _: fn() = || {
+                            fn __assert_embeddable<__T: ::bstack_raii::__private::BStackEmbeddable>() {}
+                            __assert_embeddable::<#child>();
+                        };
+                    });
+                }
+                let child_od = quote!(<#child as ::bstack_raii::BStackBlock>::OnDisk);
+                parts.on_disk_fields.push(quote!(#fname: [#child_od; #total],));
+
+                // Teardown: free each embedded child's children in place.
+                parts.drop_stmts.push(quote! {
+                    {
+                        let __base =
+                            __range.start() + ::core::mem::offset_of!(#on_disk_ty, #fname) as u64;
+                        let __step = ::core::mem::size_of::<#child_od>() as u64;
+                        for __k in 0usize..(#total) {
+                            let __embed = ::bstack_raii::BStackRange::new(
+                                __base + (__k as u64) * __step, __step);
+                            <#child>::__bstack_drop_children(__embed, allocator)?;
+                        }
+                    }
+                });
+
+                // Accessor: nested `[[Child; ..]; ..]`, each a handle into its slot.
+                let acc_ret = nested_ty(&dims, &quote!(#child));
+                let acc_read = |k: &Ident| {
+                    quote!(<#child as ::bstack_raii::BStackBlock>::from_range(
+                        ::bstack_raii::BStackRange::new(__base + (#k as u64) * __step, __step)))
+                };
+                let acc_body = nested_build(&dims, &quote!(#child), &acc_read);
+                parts.accessors.push(quote! {
+                    #vis fn #getter(&self) -> #acc_ret {
+                        let __base =
+                            self.0.start() + ::core::mem::offset_of!(#on_disk_ty, #fname) as u64;
+                        let __step = ::core::mem::size_of::<#child_od>() as u64;
+                        #acc_body
+                    }
+                });
+
+                // Constructor: flatten the nested owned array to `[BStackRange; TOTAL]`
+                // (each child's source block), zero the slots, and `copy` each child
+                // into place post-write (then free the shell) — no materialising.
+                let src_id = format_ident!("__embed_src_{}", fname);
+                let param_ty = nested_ty(&dims, &quote!(::bstack_raii::BStackOwned<#child>));
+                parts.ctor_params.push(quote!(#fname: #param_ty,));
+                let cap_write = |k: &Ident, leaf: &Ident| {
+                    quote! {
+                        #src_id[#k] = {
+                            let __h = #leaf.into_inner();
+                            ::bstack_raii::BStackBlock::range(&__h)
+                        };
+                    }
+                };
+                let flatten = nested_consume(&dims, &quote!(#fname), &cap_write);
+                parts.ctor_preps.push(quote! {
+                    let #src_id: [::bstack_raii::BStackRange; #total] = {
+                        let mut #src_id = [::bstack_raii::BStackRange::new(0, 0); #total];
+                        #flatten
+                        #src_id
+                    };
+                });
+                parts.ctor_inits.push(
+                    quote!(#fname: [<#child_od as ::bstack_raii::Zeroable>::zeroed(); #total],),
+                );
+                parts.ctor_post.push(quote! {
+                    {
+                        let __base =
+                            __data.start() + ::core::mem::offset_of!(#on_disk_ty, #fname) as u64;
+                        let __step = ::core::mem::size_of::<#child_od>() as u64;
+                        for __k in 0usize..(#total) {
+                            let __src = #src_id[__k];
+                            allocator.stack().copy(
+                                __src.start(), __base + (__k as u64) * __step, __step)?;
+                            unsafe { ::bstack_raii::dealloc_range(allocator, __src)?; }
+                        }
+                    }
+                });
+
+                // Move: re-home each embedded child to a fresh standalone allocation.
+                let cap = format_ident!("__cap_{}", fname);
+                parts.mv_caps.push(quote!(let #cap = __od.#fname;));
+                parts.mv_types.push(nested_ty(
+                    &dims,
+                    &quote!(::bstack_raii::BStackOwned<#child>),
+                ));
+                let mv_read = |k: &Ident| {
+                    quote! {{
+                        let __cod = #cap[#k];
+                        let mut __slice =
+                            __alloc.alloc(::core::mem::size_of::<#child_od>() as u64)?;
+                        let __r = __slice.as_range();
+                        if let ::std::result::Result::Err(__e) =
+                            __slice.write_range(0, ::bstack_raii::bytemuck::bytes_of(&__cod))
+                        {
+                            let _ = __alloc.dealloc(__slice);
+                            return ::std::result::Result::Err(__e);
+                        }
+                        unsafe {
+                            ::bstack_raii::BStackOwned::from_raw(
+                                <#child as ::bstack_raii::BStackBlock>::from_range(__r))
+                        }
+                    }}
+                };
+                parts.mv_recon.push(nested_build(
+                    &dims,
+                    &quote!(::bstack_raii::BStackOwned<#child>),
+                    &mv_read,
+                ));
+
+                // Clone: fold each embedded child's clone inline (flat; copy the
+                // array out, mutate, write back — packed fields can't be `&mut`'d).
+                parts.clone_stmts.push(quote! {
+                    {
+                        let __base =
+                            __src.start() + ::core::mem::offset_of!(#on_disk_ty, #fname) as u64;
+                        let __step = ::core::mem::size_of::<#child_od>() as u64;
+                        let mut __arr: [#child_od; #total] = __od.#fname;
+                        for __k in 0usize..(#total) {
+                            let __child = <#child as ::bstack_raii::BStackBlock>::from_range(
+                                ::bstack_raii::BStackRange::new(
+                                    __base + (__k as u64) * __step, __step));
+                            __arr[__k] =
+                                __child.__bstack_clone_children_inplace(allocator, __plan)?;
+                        }
+                        __od.#fname = __arr;
+                    }
+                });
+                return Ok(Some(parts));
+            }
+
+            parts.on_disk_fields.push(quote!(#fname: [u64; #total],));
+            let size_elem = quote! {
+                ::core::mem::size_of::<<#elem as ::bstack_raii::BStackBlock>::OnDisk>() as u64
+            };
+
+            // A weak array stores control offsets (`0` = unset), is not a ctor
+            // parameter (starts null, wired per flat index via a setter), and its
+            // accessor upgrades each element (address-based).
+            if kind == Kind::Weak {
+                let ctrl_ty = quote!(<#elem as ::bstack_raii::BStackWeakable>::Control);
+                let ctrl_size = quote!(::core::mem::size_of::<#ctrl_ty>() as u64);
+                parts.ctor_inits.push(quote!(#fname: [0u64; #total],));
+
+                let setter = format_ident!("set_{}", fname);
+                parts.setters.push(quote! {
+                    #vis fn #setter<'__s, __A: ::bstack_raii::BStackRaiiAllocator>(
+                        &self,
+                        allocator: &'__s __A,
+                        index: usize,
+                        weak: ::bstack_raii::BStackWeak<'__s, #elem, __A>,
+                    ) -> ::std::io::Result<()> {
+                        let __field = self.0.start()
+                            + ::core::mem::offset_of!(#on_disk_ty, #fname) as u64
+                            + (index as u64) * 8;
+                        ::bstack_raii::set_weak_field(allocator, __field, weak)
+                    }
+                });
+
+                let leaf_ty =
+                    quote!(::core::option::Option<::bstack_raii::BStackRc<'__u, #elem, __A>>);
+                let acc_ret = nested_ty(&dims, &leaf_ty);
+                let acc_read = |k: &Ident| {
+                    quote!(::bstack_raii::upgrade_weak_field(
+                        allocator, __base + (#k as u64) * 8)?)
+                };
+                let acc_body = nested_build(&dims, &leaf_ty, &acc_read);
+                parts.accessors.push(quote! {
+                    #vis fn #getter<'__u, __A: ::bstack_raii::BStackRaiiAllocator>(
+                        &self,
+                        allocator: &'__u __A,
+                    ) -> ::std::io::Result<#acc_ret> {
+                        let __base =
+                            self.0.start() + ::core::mem::offset_of!(#on_disk_ty, #fname) as u64;
+                        ::std::result::Result::Ok(#acc_body)
+                    }
+                });
+
+                // Teardown: release each non-null weak reference.
+                parts.drop_stmts.push(quote! {
+                    {
+                        let __offs: [u64; #total] = __on_disk.#fname;
+                        for __off in __offs {
+                            if __off != 0 {
+                                let __ctrl = unsafe {
+                                    ::bstack_raii::BStackRef::<#ctrl_ty>::from_range(
+                                        ::bstack_raii::BStackRange::new(__off, #ctrl_size))
+                                };
+                                ::bstack_raii::WeakRef::<#elem>(__ctrl).bstack_drop(allocator)?;
+                            }
+                        }
+                    }
+                });
+
+                // Clone: bump each non-null weak count (offsets kept — a weak clone
+                // aliases the same control block).
+                parts.clone_stmts.push(quote! {
+                    {
+                        let __offs: [u64; #total] = __od.#fname;
+                        for __off in __offs {
+                            if __off != 0 {
+                                __plan.bump_weak(__off);
+                            }
+                        }
+                    }
+                });
+
+                // Move: nested `[[Option<BStackWeak>; ..]; ..]` from flat offsets.
+                let cap = format_ident!("__cap_{}", fname);
+                parts.mv_caps.push(quote!(let #cap = __od.#fname;));
+                let mv_leaf_ty =
+                    quote!(::core::option::Option<::bstack_raii::BStackWeak<'__mv, #elem, __A>>);
+                parts.mv_types.push(nested_ty(&dims, &mv_leaf_ty));
+                let mv_read = |k: &Ident| {
+                    quote! {{
+                        let __off = #cap[#k];
+                        if __off == 0 {
+                            ::core::option::Option::None
+                        } else {
+                            let __ctrl = unsafe {
+                                ::bstack_raii::BStackRef::<#ctrl_ty>::from_range(
+                                    ::bstack_raii::BStackRange::new(__off, #ctrl_size))
+                            };
+                            ::core::option::Option::Some(unsafe {
+                                ::bstack_raii::BStackWeak::from_raw(__ctrl, __alloc)
+                            })
+                        }
+                    }}
+                };
+                parts.mv_recon.push(nested_build(&dims, &mv_leaf_ty, &mv_read));
+                return Ok(Some(parts));
+            }
+
+            // Owned / strong / ref: nested `[[Handle; ..]; ..]`, value-based from
+            // the flat offsets. A `0` slot is `None` for an `Option`-element array.
+            let leaf_view = if elem_nullable {
+                quote!(::core::option::Option<#elem>)
+            } else {
+                quote!(#elem)
+            };
+            let acc_ret = nested_ty(&dims, &leaf_view);
+            let acc_read = |k: &Ident| {
+                if elem_nullable {
+                    quote!({
+                        let __o = __offs[#k];
+                        if __o == 0 {
+                            ::core::option::Option::None
+                        } else {
+                            ::core::option::Option::Some(
+                                <#elem as ::bstack_raii::BStackBlock>::from_range(
+                                    ::bstack_raii::BStackRange::new(__o, #size_elem)))
+                        }
+                    })
+                } else {
+                    quote!(<#elem as ::bstack_raii::BStackBlock>::from_range(
+                        ::bstack_raii::BStackRange::new(__offs[#k], #size_elem)))
+                }
+            };
+            let acc_body = nested_build(&dims, &leaf_view, &acc_read);
+            parts.accessors.push(quote! {
+                #vis fn #getter(
+                    &self,
+                    stack: &::bstack_raii::BStack,
+                ) -> ::std::io::Result<#acc_ret> {
+                    let mut __buf = ::std::vec![0u8; ::core::mem::size_of::<#on_disk_ty>()];
+                    let __r = unsafe { ::bstack_raii::BStackRef::<Self>::from_range(self.0) };
+                    let __od: #on_disk_ty = *__r.read_on_disk(stack, &mut __buf)?;
+                    let __offs: [u64; #total] = __od.#fname;
+                    ::std::result::Result::Ok(#acc_body)
+                }
+            });
+
+            // Constructor: nested `[[Handle; ..]; ..]` → flat `[u64; TOTAL]`.
+            let handle_ty = match kind {
+                Kind::Owned => quote!(::bstack_raii::BStackOwned<#elem>),
+                Kind::Strong => quote!(::bstack_raii::BStackRc<'__ctor, #elem, __A>),
+                Kind::Ref => quote!(::bstack_raii::BStackRef<#elem>),
+                _ => unreachable!(),
+            };
+            let off_of = |h: &Ident| match kind {
+                Kind::Owned => quote!({
+                    let __h = #h.into_inner();
+                    ::bstack_raii::BStackBlock::range(&__h).start()
+                }),
+                Kind::Strong => quote!({
+                    let (__d, _) = #h.into_raw();
+                    __d.into_range().start()
+                }),
+                Kind::Ref => quote!(#h.into_range().start()),
+                _ => unreachable!(),
+            };
+            let ctor_leaf_ty = if elem_nullable {
+                quote!(::core::option::Option<#handle_ty>)
+            } else {
+                quote!(#handle_ty)
+            };
+            let ctor_param_ty = nested_ty(&dims, &ctor_leaf_ty);
+            parts.ctor_params.push(quote!(#fname: #ctor_param_ty,));
+            let ctor_write = |k: &Ident, leaf: &Ident| {
+                if elem_nullable {
+                    let h = format_ident!("__handle");
+                    let off = off_of(&h);
+                    quote! {
+                        __a[#k] = match #leaf {
+                            ::core::option::Option::Some(#h) => #off,
+                            ::core::option::Option::None => 0u64,
+                        };
+                    }
+                } else {
+                    let off = off_of(leaf);
+                    quote!(__a[#k] = #off;)
+                }
+            };
+            let flatten = nested_consume(&dims, &quote!(#fname), &ctor_write);
+            parts.ctor_preps.push(quote! {
+                let #fname: [u64; #total] = {
+                    let mut __a = [0u64; #total];
+                    #flatten
+                    __a
+                };
+            });
+            parts.ctor_inits.push(quote!(#fname: #fname,));
+
+            // Teardown: free / release each non-null element (a ref owns nothing).
+            let per_teardown = match kind {
+                Kind::Owned => quote! {
+                    ::bstack_raii::OwnedRef(unsafe {
+                        ::bstack_raii::BStackRef::<#elem>::from_range(
+                            ::bstack_raii::BStackRange::new(__off, #size_elem))
+                    }).bstack_drop(allocator)?;
+                },
+                Kind::Strong => quote! {
+                    <#elem as ::bstack_raii::BStackShared>::drop_strong_ref(unsafe {
+                        ::bstack_raii::BStackRef::<#elem>::from_range(
+                            ::bstack_raii::BStackRange::new(__off, #size_elem))
+                    }, allocator)?;
+                },
+                _ => quote!(),
+            };
+            if kind != Kind::Ref {
+                parts.drop_stmts.push(quote! {
+                    {
+                        let __offs: [u64; #total] = __on_disk.#fname;
+                        for __off in __offs {
+                            if __off != 0 { #per_teardown }
+                        }
+                    }
+                });
+            }
+
+            // Clone: owned deep-clones each; strong bumps each; ref aliases.
+            match kind {
+                Kind::Owned => parts.clone_stmts.push(quote! {
+                    {
+                        let mut __arr: [u64; #total] = __od.#fname;
+                        for __k in 0usize..(#total) {
+                            let __off = __arr[__k];
+                            if __off != 0 {
+                                let __child = <#elem as ::bstack_raii::BStackBlock>::from_range(
+                                    ::bstack_raii::BStackRange::new(__off, #size_elem));
+                                __arr[__k] =
+                                    __child.__bstack_clone_into(allocator, __plan)?.start();
+                            }
+                        }
+                        __od.#fname = __arr;
+                    }
+                }),
+                Kind::Strong => parts.clone_stmts.push(quote! {
+                    {
+                        let __offs: [u64; #total] = __od.#fname;
+                        for __off in __offs {
+                            if __off != 0 {
+                                let __child = unsafe {
+                                    ::bstack_raii::BStackRef::<#elem>::from_range(
+                                        ::bstack_raii::BStackRange::new(__off, #size_elem))
+                                };
+                                __plan.bump_strong(__child, allocator)?;
+                            }
+                        }
+                    }
+                }),
+                // Ref: aliased — the copied `[u64; TOTAL]` is kept verbatim.
+                _ => {}
+            }
+
+            // Move: nested `[[Handle; ..]; ..]` from flat offsets.
+            let cap = format_ident!("__cap_{}", fname);
+            parts.mv_caps.push(quote!(let #cap = __od.#fname;));
+            let (mv_leaf, build_one): (TokenStream, TokenStream) = match kind {
+                Kind::Owned => (
+                    quote!(::bstack_raii::BStackOwned<#elem>),
+                    quote!(unsafe {
+                        ::bstack_raii::BStackOwned::from_raw(
+                            <#elem as ::bstack_raii::BStackBlock>::from_range(
+                                ::bstack_raii::BStackRange::new(__off, #size_elem)))
+                    }),
+                ),
+                Kind::Ref => (
+                    quote!(::bstack_raii::BStackRef<#elem>),
+                    quote!(unsafe {
+                        ::bstack_raii::BStackRef::<#elem>::from_range(
+                            ::bstack_raii::BStackRange::new(__off, #size_elem))
+                    }),
+                ),
+                Kind::Strong => (
+                    quote!(::bstack_raii::BStackRc<'__mv, #elem, __A>),
+                    quote!({
+                        let __data = unsafe {
+                            ::bstack_raii::BStackRef::<#elem>::from_range(
+                                ::bstack_raii::BStackRange::new(__off, #size_elem))
+                        };
+                        let (__d, __c) =
+                            <#elem as ::bstack_raii::BStackShared>::strong_parts(__data, __alloc)?;
+                        unsafe { ::bstack_raii::BStackRc::from_raw(__d, __c, __alloc) }
+                    }),
+                ),
+                _ => unreachable!(),
+            };
+            let mv_leaf_ty = if elem_nullable {
+                quote!(::core::option::Option<#mv_leaf>)
+            } else {
+                mv_leaf.clone()
+            };
+            parts.mv_types.push(nested_ty(&dims, &mv_leaf_ty));
+            let mv_read = |k: &Ident| {
+                if elem_nullable {
+                    quote! {{
+                        let __off = #cap[#k];
+                        if __off == 0 {
+                            ::core::option::Option::None
+                        } else {
+                            ::core::option::Option::Some(#build_one)
+                        }
+                    }}
+                } else {
+                    quote! {{
+                        let __off = #cap[#k];
+                        #build_one
+                    }}
+                }
+            };
+            parts.mv_recon.push(nested_build(&dims, &mv_leaf_ty, &mv_read));
+
+            // `#[bstack_mut]`: element `replace_<f>_at` + whole-array `replace_<f>`
+            // (and `set_` for `ref`). Weak arrays already have a `set_<f>` element
+            // setter unconditionally; embed arrays are rejected above.
+            if is_bstack_mut(&field.attrs) {
+                for m in array_mut_methods(
+                    vis,
+                    fname,
+                    &quote!(#elem),
+                    on_disk_ty,
+                    kind,
+                    &dims,
+                    &total,
+                    &size_elem,
+                    elem_nullable,
+                ) {
+                    parts.accessors.push(m);
+                }
+            }
+    Ok(Some(parts))
+}
+
+/// Lower a **tuple with ≥1 `Foreign` element** `(A, Foreign<T>, ..)` to its
+/// [`FieldParts`]: POD elements packed inline, each foreign element a `ForeignRepr`,
+/// all at cumulative payload offsets. Returns `Ok(None)` if the field isn't a tuple
+/// containing a `Foreign` (fall through to the POD-tuple / scalar path).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn foreign_tuple_field(
+    vis: &syn::Visibility,
+    name: &Ident,
+    fname: &Ident,
+    field: &syn::Field,
+    inner_ty: &Type,
+    kind: Kind,
+    nullable: bool,
+    on_disk_ty: &TokenStream,
+) -> syn::Result<Option<FieldParts>> {
+    let Type::Tuple(tup) = inner_ty else {
+        return Ok(None);
+    };
+    if !tup
+        .elems
+        .iter()
+        .any(|e| foreign_inner(option_inner(e).unwrap_or(e)).is_some())
+    {
+        return Ok(None);
+    }
+    let mut parts = FieldParts::default();
+    let getter = format_ident!("get_{}", fname);
+            // Generic foreign *targets* are allowed (bounds are inferred above); a
+            // generic param in a POD element was already rejected in the usage pass.
+            match kind {
+                Kind::Owned | Kind::Strong | Kind::Weak | Kind::Ref => {}
+                Kind::Pod => {
+                    return Err(Error::new_spanned(
+                        &field.ty,
+                        "a tuple containing a `Foreign` needs an ownership annotation \
+                         (`#[bstack_owned/strong/weak/ref]`) naming the foreign elements' kind",
+                    ));
+                }
+                Kind::Embed => {
+                    return Err(Error::new_spanned(&field.ty, "cannot #[embed] a tuple"));
+                }
+            }
+            if nullable {
+                return Err(Error::new_spanned(
+                    &field.ty,
+                    "a whole-tuple `Option<(..)>` is not supported; make the individual \
+                     elements nullable instead",
+                ));
+            }
+
+            // Per-element: is it foreign (and null-wrapped), and its target.
+            let mut is_foreign = Vec::with_capacity(tup.elems.len());
+            let mut ftargets: Vec<Option<&Type>> = Vec::with_capacity(tup.elems.len());
+            let mut nulls = Vec::with_capacity(tup.elems.len());
+            for e in &tup.elems {
+                let inner = option_inner(e).unwrap_or(e);
+                if let Some(ft) = foreign_inner(inner) {
+                    reject_bad_foreign_target(ft, &field.ty, "a `Foreign` tuple element")?;
+                    is_foreign.push(true);
+                    ftargets.push(Some(ft));
+                    nulls.push(option_inner(e).is_some());
+                } else {
+                    is_foreign.push(false);
+                    ftargets.push(None);
+                    nulls.push(false);
+                    parts.pod_types.push(e.clone());
+                }
+            }
+
+            let n = tup.elems.len();
+            let idx: Vec<syn::Index> = (0..n).map(syn::Index::from).collect();
+            // The PUBLIC tuple type (accessor / ctor / move): `Foreign` is a token, so
+            // rewrite each foreign element to the real `::bstack_raii::Foreign<T>` (the
+            // user's bare `Foreign` isn't in scope in the generated impls).
+            // Build the public tuple type with a given lifetime on each `Foreign`
+            // element (`None` ⇒ elided, for the by-value ctor param). The accessor binds
+            // `'__f` (its `stack` borrow) and the move binds `'__mv`, so a `SELF` element
+            // cannot escape the file / block it came from.
+            let mk_tuple_ty = |lt: Option<&syn::Lifetime>| -> TokenStream {
+                let elems: Vec<TokenStream> = (0..n)
+                    .map(|i| {
+                        if is_foreign[i] {
+                            let ft = ftargets[i].unwrap();
+                            let f = match lt {
+                                Some(l) => quote!(::bstack_raii::Foreign<#l, #ft>),
+                                None => quote!(::bstack_raii::Foreign<#ft>),
+                            };
+                            if nulls[i] {
+                                quote!(::core::option::Option<#f>)
+                            } else {
+                                f
+                            }
+                        } else {
+                            let e = &tup.elems[i];
+                            quote!(#e)
+                        }
+                    })
+                    .collect();
+                quote!(( #(#elems,)* ))
+            };
+            let lt_f = syn::Lifetime::new("'__f", Span::call_site());
+            let lt_mv = syn::Lifetime::new("'__mv", Span::call_site());
+            let pub_tuple_ty = mk_tuple_ty(None);
+            let acc_tuple_ty = mk_tuple_ty(Some(&lt_f));
+            let mv_tuple_ty = mk_tuple_ty(Some(&lt_mv));
+            let wrapper = format_ident!("__BstackFTup_{}_{}", name, fname);
+            // Wrapper element types: POD verbatim, foreign → `ForeignPtr`.
+            let welem: Vec<TokenStream> = tup
+                .elems
+                .iter()
+                .enumerate()
+                .map(|(i, e)| {
+                    if is_foreign[i] {
+                        quote!(::bstack_raii::ForeignRepr)
+                    } else {
+                        quote!(#e)
+                    }
+                })
+                .collect();
+            parts.wrapper_defs.push(quote! {
+                #[repr(C, packed)]
+                #[derive(::core::clone::Clone, ::core::marker::Copy)]
+                #[doc(hidden)]
+                #vis struct #wrapper( #(#welem),* );
+                // SAFETY: `#[repr(C, packed)]` => no padding; every element is `Pod`
+                // (POD elements asserted via `pod_types`; `ForeignPtr` is `Pod`).
+                unsafe impl ::bstack_raii::Zeroable for #wrapper {}
+                unsafe impl ::bstack_raii::Pod for #wrapper {}
+            });
+            parts.on_disk_fields.push(quote!(#fname: #wrapper,));
+
+            // Accessor: rebuild the tuple, mapping each `ForeignRepr` back to a `Foreign`.
+            // SAFETY: each element repr was stored into this file; the returned
+            // `Foreign`s are `'__f`-bound to `stack` by the accessor signature.
+            let acc_elems: Vec<TokenStream> = (0..n)
+                .map(|i| {
+                    let ix = &idx[i];
+                    if is_foreign[i] {
+                        let ft = ftargets[i].unwrap();
+                        if nulls[i] {
+                            quote!(if __w.#ix.offset() == 0 {
+                                ::core::option::Option::None
+                            } else {
+                                ::core::option::Option::Some(
+                                    unsafe { ::bstack_raii::Foreign::<#ft>::from_repr(__w.#ix) })
+                            })
+                        } else {
+                            quote!(unsafe { ::bstack_raii::Foreign::<#ft>::from_repr(__w.#ix) })
+                        }
+                    } else {
+                        quote!(__w.#ix)
+                    }
+                })
+                .collect();
+            parts.accessors.push(quote! {
+                #vis fn #getter<'__f>(
+                    &self,
+                    stack: &'__f ::bstack_raii::BStack,
+                ) -> ::std::io::Result<#acc_tuple_ty> {
+                    let mut __buf = ::std::vec![0u8; ::core::mem::size_of::<#on_disk_ty>()];
+                    let __r = unsafe { ::bstack_raii::BStackRef::<Self>::from_range(self.0) };
+                    let __od: #on_disk_ty = *__r.read_on_disk(stack, &mut __buf)?;
+                    let __w = __od.#fname;
+                    ::std::result::Result::Ok(( #(#acc_elems,)* ))
+                }
+            });
+
+            // Constructor: map each foreign element to a `ForeignPtr`, POD verbatim.
+            let ctor_elems: Vec<TokenStream> = (0..n)
+                .map(|i| {
+                    let ix = &idx[i];
+                    if is_foreign[i] {
+                        if nulls[i] {
+                            quote!(match #fname.#ix {
+                                ::core::option::Option::Some(__f) => __f.repr(),
+                                ::core::option::Option::None => ::bstack_raii::ForeignRepr::new(0, 0),
+                            })
+                        } else {
+                            quote!(#fname.#ix.repr())
+                        }
+                    } else {
+                        quote!(#fname.#ix)
+                    }
+                })
+                .collect();
+            parts.ctor_params.push(quote!(#fname: #pub_tuple_ty,));
+            parts.ctor_preps.push(quote!(let #fname: #wrapper = #wrapper( #(#ctor_elems),* );));
+            parts.ctor_inits.push(quote!(#fname: #fname,));
+
+            // Teardown / clone: dispatch each foreign element from the on-disk wrapper.
+            let mut tup_drops = Vec::new();
+            let mut tup_clones = Vec::new();
+            for i in 0..n {
+                if !is_foreign[i] {
+                    continue;
+                }
+                let ix = &idx[i];
+                let ft = ftargets[i].unwrap();
+                let elem_drop = foreign_elem_drop(kind, ft);
+                tup_drops.push(quote! {
+                    {
+                        let __fp: ::bstack_raii::ForeignRepr = __w.#ix;
+                        #elem_drop
+                    }
+                });
+                let elem_clone = foreign_elem_clone(kind, ft);
+                tup_clones.push(quote! {
+                    {
+                        let __fp: ::bstack_raii::ForeignRepr = __w.#ix;
+                        #elem_clone
+                        __w.#ix = __newfp;
+                    }
+                });
+            }
+            if !matches!(kind, Kind::Ref) {
+                parts.drop_stmts.push(quote! {
+                    {
+                        let __w = __on_disk.#fname;
+                        #(#tup_drops)*
+                    }
+                });
+                parts.clone_stmts.push(quote! {
+                    {
+                        let mut __w = __od.#fname;
+                        #(#tup_clones)*
+                        __od.#fname = __w;
+                    }
+                });
+            }
+
+            // Move: rebuild the tuple (same mapping as the accessor), `'__mv`-bound.
+            // SAFETY: each element repr was stored into this file; bound to `'__mv`.
+            let cap = format_ident!("__cap_{}", fname);
+            parts.mv_caps.push(quote!(let #cap = __od.#fname;));
+            parts.mv_types.push(quote!(#mv_tuple_ty));
+            let mv_elems: Vec<TokenStream> = (0..n)
+                .map(|i| {
+                    let ix = &idx[i];
+                    if is_foreign[i] {
+                        let ft = ftargets[i].unwrap();
+                        if nulls[i] {
+                            quote!(if #cap.#ix.offset() == 0 {
+                                ::core::option::Option::None
+                            } else {
+                                ::core::option::Option::Some(
+                                    unsafe { ::bstack_raii::Foreign::<#ft>::from_repr(#cap.#ix) })
+                            })
+                        } else {
+                            quote!(unsafe { ::bstack_raii::Foreign::<#ft>::from_repr(#cap.#ix) })
+                        }
+                    } else {
+                        quote!(#cap.#ix)
+                    }
+                })
+                .collect();
+            parts.mv_recon.push(quote!(( #(#mv_elems,)* )));
+    Ok(Some(parts))
+}
+
+/// Lower a **POD tuple** field `(A, B, ..)` to its [`FieldParts`]: a generated
+/// `#[repr(C, packed)]` `Pod` wrapper stored inline, rebuilt into the tuple on read
+/// (+ a `set_` mutator for `#[bstack_mut]`). Returns `Ok(None)` unless the field is a
+/// POD (un-annotated) tuple.
+pub(crate) fn pod_tuple_field(
+    vis: &syn::Visibility,
+    name: &Ident,
+    fname: &Ident,
+    field: &syn::Field,
+    inner_ty: &Type,
+    kind: Kind,
+    on_disk_ty: &TokenStream,
+) -> syn::Result<Option<FieldParts>> {
+    if kind != Kind::Pod {
+        return Ok(None);
+    }
+    let Type::Tuple(tup) = inner_ty else {
+        return Ok(None);
+    };
+    let mut parts = FieldParts::default();
+    let getter = format_ident!("get_{}", fname);
+            let elems: Vec<&Type> = tup.elems.iter().collect();
+            let wrapper = format_ident!("__BstackTup_{}_{}", name, fname);
+            let idx: Vec<syn::Index> = (0..elems.len()).map(syn::Index::from).collect();
+            parts.wrapper_defs.push(quote! {
+                #[repr(C, packed)]
+                #[derive(::core::clone::Clone, ::core::marker::Copy)]
+                #[doc(hidden)]
+                #vis struct #wrapper( #(#elems),* );
+                // SAFETY: `#[repr(C, packed)]` => no padding; every element is
+                // `Pod` (asserted below), so all bit patterns are valid.
+                unsafe impl ::bstack_raii::Zeroable for #wrapper {}
+                unsafe impl ::bstack_raii::Pod for #wrapper {}
+            });
+            parts.pod_types.extend(elems.iter().map(|t| (*t).clone()));
+            parts.on_disk_fields.push(quote!(#fname: #wrapper,));
+            parts.accessors.push(quote! {
+                #vis fn #getter(
+                    &self,
+                    stack: &::bstack_raii::BStack,
+                ) -> ::std::io::Result<#inner_ty> {
+                    let mut __buf = ::std::vec![0u8; ::core::mem::size_of::<#on_disk_ty>()];
+                    let __r = unsafe { ::bstack_raii::BStackRef::<Self>::from_range(self.0) };
+                    let __od: #on_disk_ty = *__r.read_on_disk(stack, &mut __buf)?;
+                    let __w = __od.#fname;
+                    ::std::result::Result::Ok(( #(__w.#idx,)* ))
+                }
+            });
+            parts.ctor_params.push(quote!(#fname: #inner_ty,));
+            parts.ctor_preps.push(quote!(let #fname: #wrapper = #wrapper( #(#fname.#idx),* );));
+            parts.ctor_inits.push(quote!(#fname: #fname,));
+            let cap = format_ident!("__cap_{}", fname);
+            parts.mv_caps.push(quote!(let #cap = __od.#fname;));
+            parts.mv_types.push(quote!(#inner_ty));
+            parts.mv_recon.push(quote!(( #(#cap.#idx,)* )));
+            // `#[bstack_mut]`: overwrite the whole inline POD tuple, one atomic `set`
+            // (a POD tuple owns no children, so nothing is freed — like a POD scalar).
+            if is_bstack_mut(&field.attrs) {
+                let setter = format_ident!("set_{}", fname);
+                let idx2 = idx.clone();
+                parts.accessors.push(quote! {
+                    /// Overwrite this POD tuple field, as one crash-atomic `set`.
+                    #vis fn #setter(
+                        &self,
+                        stack: &::bstack_raii::BStack,
+                        value: #inner_ty,
+                    ) -> ::std::io::Result<()> {
+                        let __w: #wrapper = #wrapper( #(value.#idx2),* );
+                        let __off = self.0.start()
+                            + ::core::mem::offset_of!(#on_disk_ty, #fname) as u64;
+                        stack.set(__off, ::bstack_raii::bytemuck::bytes_of(&__w))
+                    }
+                });
+            }
+    Ok(Some(parts))
+}
+
+/// Lower an `#[embed] child: Block` field to its [`FieldParts`]: the child's whole
+/// on-disk form stored INLINE (`<Child as BStackBlock>::OnDisk`), copied in
+/// post-write and freed/cloned in place. Returns `Ok(None)` unless the field is
+/// `#[embed]`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn embed_field(
+    vis: &syn::Visibility,
+    fname: &Ident,
+    field: &syn::Field,
+    inner_ty: &Type,
+    kind: Kind,
+    nullable: bool,
+    on_disk_ty: &TokenStream,
+    type_params: &[&Ident],
+) -> syn::Result<Option<FieldParts>> {
+    if kind != Kind::Embed {
+        return Ok(None);
+    }
+    let mut parts = FieldParts::default();
+    let getter = format_ident!("get_{}", fname);
+            if let Type::Tuple(_) = inner_ty {
+                return Err(Error::new_spanned(
+                    &field.ty,
+                    "cannot #[embed] a tuple — embed a `#[bstack_block]` / `#[bstack_enum]` type",
+                ));
+            }
+            if nullable {
+                return Err(Error::new_spanned(
+                    &field.ty,
+                    "#[embed] does not support `Option`",
+                ));
+            }
+            // `#[embed]` fields `continue` before the scalar mutator injection, so a
+            // `#[bstack_mut]` here would be silently ignored — reject it explicitly.
+            if is_bstack_mut(&field.attrs) {
+                return Err(Error::new_spanned(
+                    field,
+                    "#[bstack_mut] is not yet supported on #[embed] fields",
+                ));
+            }
+            let child = inner_ty;
+            // Guard: an `#[embed]` target must be a plain, self-contained block
+            // (`BStackEmbeddable`) — never `(rc)` / `(rc, weak)`, whose refcount /
+            // separate control block embedding would strand. A concrete target gets a
+            // direct assertion here; a generic one is bounded via `Usage` above.
+            if !type_mentions_any(child, type_params) {
+                parts.wrapper_defs.push(quote! {
+                    const _: fn() = || {
+                        fn __assert_embeddable<__T: ::bstack_raii::__private::BStackEmbeddable>() {}
+                        __assert_embeddable::<#child>();
+                    };
+                });
+            }
+            let child_od = quote!(<#child as ::bstack_raii::BStackBlock>::OnDisk);
+            parts.on_disk_fields.push(quote!(#fname: #child_od,));
+
+            // Teardown: free the embedded child's own children *in place* (its
+            // storage is part of this block, so no separate dealloc). `__range` is
+            // this block's range, bound by `__bstack_drop_children`.
+            parts.drop_stmts.push(quote! {
+                {
+                    let __embed = ::bstack_raii::BStackRange::new(
+                        __range.start() + ::core::mem::offset_of!(#on_disk_ty, #fname) as u64,
+                        ::core::mem::size_of::<#child_od>() as u64,
+                    );
+                    <#child>::__bstack_drop_children(__embed, allocator)?;
+                }
+            });
+
+            // Accessor: a child handle at the embedded offset (pure offset math).
+            parts.accessors.push(quote! {
+                #vis fn #getter(&self) -> #child {
+                    <#child as ::bstack_raii::BStackBlock>::from_range(
+                        ::bstack_raii::BStackRange::new(
+                            self.0.start() + ::core::mem::offset_of!(#on_disk_ty, #fname) as u64,
+                            ::core::mem::size_of::<#child_od>() as u64,
+                        ),
+                    )
+                }
+            });
+
+            // Constructor: capture the child's block range; the OnDisk slot is a
+            // zeroed placeholder, and a post-write step `BStack::copy`s the child
+            // into it (then frees the child shell) — no materialising the OnDisk.
+            let src_id = format_ident!("__embed_src_{}", fname);
+            parts.ctor_params.push(quote!(#fname: ::bstack_raii::BStackOwned<#child>,));
+            parts.ctor_preps.push(quote! {
+                let #src_id = {
+                    let __h = #fname.into_inner();
+                    ::bstack_raii::BStackBlock::range(&__h)
+                };
+            });
+            parts.ctor_inits.push(quote!(#fname: <#child_od as ::bstack_raii::Zeroable>::zeroed(),));
+            parts.ctor_post.push(quote! {
+                {
+                    allocator.stack().copy(
+                        #src_id.start(),
+                        __data.start() + ::core::mem::offset_of!(#on_disk_ty, #fname) as u64,
+                        ::core::mem::size_of::<#child_od>() as u64,
+                    )?;
+                    unsafe { ::bstack_raii::dealloc_range(allocator, #src_id)?; }
+                }
+            });
+
+            // Move: re-home the embedded child to a fresh standalone allocation.
+            let cap = format_ident!("__cap_{}", fname);
+            parts.mv_caps.push(quote!(let #cap = __od.#fname;));
+            parts.mv_types.push(quote!(::bstack_raii::BStackOwned<#child>));
+            parts.mv_recon.push(quote! {
+                {
+                    let mut __slice =
+                        __alloc.alloc(::core::mem::size_of::<#child_od>() as u64)?;
+                    let __r = __slice.as_range();
+                    if let ::std::result::Result::Err(__e) =
+                        __slice.write_range(0, ::bstack_raii::bytemuck::bytes_of(&#cap))
+                    {
+                        let _ = __alloc.dealloc(__slice);
+                        return ::std::result::Result::Err(__e);
+                    }
+                    unsafe {
+                        ::bstack_raii::BStackOwned::from_raw(
+                            <#child as ::bstack_raii::BStackBlock>::from_range(__r),
+                        )
+                    }
+                }
+            });
+            // Clone: fold the embedded child's clone inline — deep-clone its own
+            // children into the plan and store the fixed-up child OnDisk in place
+            // (no separate child allocation, mirroring the in-place teardown).
+            parts.clone_stmts.push(quote! {
+                {
+                    let __child = <#child as ::bstack_raii::BStackBlock>::from_range(
+                        ::bstack_raii::BStackRange::new(
+                            __src.start() + ::core::mem::offset_of!(#on_disk_ty, #fname) as u64,
+                            ::core::mem::size_of::<#child_od>() as u64,
+                        ),
+                    );
+                    __od.#fname =
+                        __child.__bstack_clone_children_inplace(allocator, __plan)?;
+                }
+            });
+            Ok(Some(parts))
+}
+
+/// Lower a **scalar** field (the fall-through: POD inline, or a single
+/// `#[bstack_owned/strong/weak/ref]` / `#[embed]`... no — embed handled earlier)
+/// block reference) to its [`FieldParts`]: on-disk slot, `get_`/`raw_`_slice
+/// accessor, `#[bstack_mut]` `set_`/`replace_` mutators, ctor wiring (or a weak
+/// setter), teardown, clone, and `bstack_move!` pieces. Always applies.
+pub(crate) fn scalar_field(
+    vis: &syn::Visibility,
+    fname: &Ident,
+    field: &syn::Field,
+    inner_ty: &Type,
+    kind: Kind,
+    nullable: bool,
+    on_disk_ty: &TokenStream,
+) -> syn::Result<FieldParts> {
+    let mut parts = FieldParts::default();
+        // On-disk lowering.
+        match kind {
+            Kind::Pod => {
+                parts.on_disk_fields.push(quote!(#fname: #inner_ty,));
+                parts.pod_types.push(inner_ty.clone());
+            }
+            _ => parts.on_disk_fields.push(quote!(#fname: u64,)),
+        }
+
+        // Teardown.
+        match kind {
+            Kind::Owned => parts.drop_stmts.push(child_range_stmt(
+                fname,
+                inner_ty,
+                nullable,
+                quote!(::bstack_raii::OwnedRef(__child).bstack_drop(allocator)?;),
+            )),
+            Kind::Strong => parts.drop_stmts.push(child_range_stmt(
+                fname,
+                inner_ty,
+                nullable,
+                quote!(<#inner_ty as ::bstack_raii::BStackShared>::drop_strong_ref(__child, allocator)?;),
+            )),
+            Kind::Weak => parts.drop_stmts.push(weak_drop_stmt(fname, inner_ty)),
+            // `#[embed]` is fully handled above (it `continue`s).
+            Kind::Ref | Kind::Pod | Kind::Embed => {}
+        }
+
+        // Deep clone (mirror of teardown; POD / ref are copied verbatim).
+        if let Some(cs) = clone_field_stmt(fname, inner_ty, kind) {
+            parts.clone_stmts.push(cs);
+        }
+
+        // Accessor: the `get_<field>` reader, the unsafe `raw_<field>_slice` place,
+        // and — for `#[bstack_mut]` fields — a `set_<field>` (POD/ref) and/or
+        // `replace_<field>` (owned/strong/ref).
+        parts.accessors.push(accessor(vis, fname, inner_ty, on_disk_ty, kind, nullable));
+        parts.accessors.push(raw_slice_accessor(vis, fname, inner_ty, on_disk_ty, kind));
+        if is_bstack_mut(&field.attrs) {
+            match kind {
+                // POD: overwrite in place.
+                Kind::Pod => {
+                    parts.accessors.push(set_accessor(
+                        vis,
+                        fname,
+                        inner_ty,
+                        on_disk_ty,
+                        kind,
+                        nullable,
+                    ));
+                }
+                // Ref is the only kind with BOTH: `set_` (overwrite; a ref owns
+                // nothing) and `replace_` (swap, handing the old ref back).
+                Kind::Ref => {
+                    parts.accessors.push(set_accessor(
+                        vis,
+                        fname,
+                        inner_ty,
+                        on_disk_ty,
+                        kind,
+                        nullable,
+                    ));
+                    parts.accessors.push(replace_accessor(
+                        vis,
+                        fname,
+                        inner_ty,
+                        on_disk_ty,
+                        kind,
+                        nullable,
+                    ));
+                }
+                // Owned / strong: only `replace_` — a plain `set_` would strand the
+                // old owned block / strong count; `replace_` moves it out instead.
+                Kind::Owned | Kind::Strong => {
+                    parts.accessors.push(replace_accessor(
+                        vis,
+                        fname,
+                        inner_ty,
+                        on_disk_ty,
+                        kind,
+                        nullable,
+                    ));
+                }
+                // Weak fields already have a `set_<field>` (the weak setter).
+                Kind::Weak => {}
+                Kind::Embed => {
+                    return Err(Error::new_spanned(
+                        field,
+                        "#[bstack_mut] is not yet supported on #[embed] fields",
+                    ));
+                }
+            }
+        }
+
+        // Constructor. Weak fields are not parameters — they start null and are
+        // wired afterwards via the generated `set_<field>`.
+        if kind == Kind::Weak {
+            parts.ctor_inits.push(quote!(#fname: 0u64,));
+            parts.setters.push(weak_setter(vis, fname, inner_ty, on_disk_ty));
+        } else {
+            let (param, prep, init) = ctor_field(fname, inner_ty, kind, nullable);
+            parts.ctor_params.push(param);
+            parts.ctor_preps.push(prep);
+            parts.ctor_inits.push(init);
+        }
+
+        // `bstack_move!` pieces: capture the field before the parent is freed,
+        // then reconstruct the transferred handle after.
+        let cap = format_ident!("__cap_{}", fname);
+        parts.mv_caps.push(quote!(let #cap = __od.#fname;));
+        let (mv_ty, mv_rc) = move_field(&cap, inner_ty, kind, nullable);
+        parts.mv_types.push(mv_ty);
+        parts.mv_recon.push(mv_rc);
+    Ok(parts)
 }

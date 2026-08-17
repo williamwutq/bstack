@@ -192,7 +192,7 @@ pub(crate) fn check_vec_elem(ty: &Type) -> syn::Result<()> {
         if option_inner(inner).is_some() {
             return Err(err_double_option(ty));
         }
-        if vec_field(inner).is_some() {
+        if vec_info(inner).is_some() {
             return Err(err_vec_in_vec(ty));
         }
         if let Type::Tuple(_) = inner {
@@ -200,7 +200,7 @@ pub(crate) fn check_vec_elem(ty: &Type) -> syn::Result<()> {
         }
         return Ok(());
     }
-    if vec_field(ty).is_some() {
+    if vec_info(ty).is_some() {
         return Err(err_vec_in_vec(ty));
     }
     if let Type::Tuple(_) = ty {
@@ -210,7 +210,7 @@ pub(crate) fn check_vec_elem(ty: &Type) -> syn::Result<()> {
 }
 
 /// Detect `Vec<T>` / `String` field types.
-pub(crate) fn vec_field(ty: &Type) -> Option<VecInfo> {
+pub(crate) fn vec_info(ty: &Type) -> Option<VecInfo> {
     let Type::Path(tp) = ty else {
         return None;
     };
@@ -351,7 +351,7 @@ pub(crate) fn reject_bad_foreign_target(ftarget: &Type, span: &Type, what: &str)
             ),
         ));
     }
-    if vec_field(ftarget).is_some() || is_str(ftarget) {
+    if vec_info(ftarget).is_some() || is_str(ftarget) {
         return Err(Error::new_spanned(
             span,
             format!(
