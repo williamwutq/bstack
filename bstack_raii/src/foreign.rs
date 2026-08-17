@@ -50,38 +50,69 @@ use crate::registry::{self, FileId};
 use crate::shared::{BStackRc, BStackWeak};
 use crate::teardown::BStackDrop;
 
-/// The on-disk **wire** form of a [`Foreign`] pointer: a file identity plus an address
-/// in that file. 16 bytes, `Pod`. `file_id == 0` is [`SELF`](FileId::SELF) (a pointer
-/// into the current file); the target's length is **not** stored — it is recovered from
-/// `size_of::<T::OnDisk>()`, exactly like an in-file `#[bstack_ref]`.
+/// The on-disk **wire** form of a [`Foreign`] pointer: a file identity, an optional
+/// RTTI type index, and an address in that file. 16 bytes, `Pod`. `file_id == 0` is
+/// [`SELF`](FileId::SELF) (a pointer into the current file); the target's length is
+/// **not** stored — it is recovered from `size_of::<T::OnDisk>()`, exactly like an
+/// in-file `#[bstack_ref]`.
 ///
-/// This is the inert wire form only: it carries no type and no resolution API, and is
-/// not part of the public prelude (it is `#[doc(hidden)]`). The in-memory reference is
-/// [`Foreign<T>`], which carries the target type and — for a `SELF` pointer — a borrow
-/// of the file it was read from. The macro converts between the two at the load/store
-/// boundary; user code should never name this type.
+/// The `file_id` is a [`FileId`], which is a `u32`, so the pointer stores it in 4
+/// bytes and spends the other 4 on `type_index` — the pointee's RTTI ordinal `+ 1`
+/// (`0` = untyped; see [`crate::rtti`]). The static `#[bstack_block]` path leaves
+/// `type_index == 0` (the schema already knows the target type); only RTTI-aware
+/// writers fill it. This layout is byte-compatible with the previous
+/// `{file_id: u64, offset: u64}` form: an old pointer's zero high file-id word
+/// simply reads back as `type_index == 0`.
+///
+/// This is the inert wire form only: the resolution API and target type live on the
+/// in-memory [`Foreign<T>`] (which the macro converts to/from at the load/store
+/// boundary). Not part of the public prelude (`#[doc(hidden)]`); user code should
+/// never name it.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
 #[repr(C)]
 pub struct ForeignRepr {
-    /// The target file's [`FileId`] as a `u64` (`0` = [`FileId::SELF`]).
-    file_id: u64,
+    /// The target file's [`FileId`] (`0` = [`FileId::SELF`]).
+    file_id: u32,
+    /// The pointee's RTTI ordinal `+ 1`, or `0` for an untyped pointer.
+    type_index: u32,
     /// The target's address within that file.
     offset: u64,
 }
 
 impl ForeignRepr {
-    /// A wire pointer from a raw `(file_id, offset)`.
+    /// A wire pointer from a raw `(file_id, offset)`, untyped (`type_index == 0`).
+    /// `file_id` is a [`FileId`] (`u32` range); its high bits are unused.
     pub const fn new(file_id: u64, offset: u64) -> Self {
-        Self { file_id, offset }
+        Self {
+            file_id: file_id as u32,
+            type_index: 0,
+            offset,
+        }
     }
-    /// The raw file-id word.
+    /// The file-id word, widened to `u64` for the callers that compare it as one.
     pub const fn file_id(self) -> u64 {
-        self.file_id
+        self.file_id as u64
     }
     /// The target address.
     pub const fn offset(self) -> u64 {
         self.offset
+    }
+    /// The raw RTTI type index (`0` = untyped; otherwise ordinal `+ 1`).
+    pub const fn type_index(self) -> u32 {
+        self.type_index
+    }
+    /// This pointer with its RTTI type index set (ordinal `+ 1`; `0` = untyped).
+    pub const fn with_type_index(mut self, type_index: u32) -> Self {
+        self.type_index = type_index;
+        self
+    }
+    /// The pointee's RTTI ordinal, or `None` if the pointer is untyped.
+    pub const fn rtti_ordinal(self) -> Option<u32> {
+        match self.type_index {
+            0 => None,
+            n => Some(n - 1),
+        }
     }
 }
 
@@ -151,13 +182,13 @@ impl<'a, T: 'static> Foreign<'a, T> {
     ///   file's borrow (a generated field accessor does this by tying `'a` to the
     ///   `&'a BStack` / `&'a A` it read through), so a `SELF` pointer cannot escape it.
     pub unsafe fn from_repr(repr: ForeignRepr) -> Self {
-        let inner = match NonZeroU64::new(repr.file_id) {
+        let inner = match NonZeroU64::new(repr.file_id()) {
             Some(file_id) => FilePtr::Ext(ExternalPtr {
                 file_id,
-                address: repr.offset,
+                address: repr.offset(),
             }),
             None => FilePtr::SelfRef(SelfPtr {
-                address: repr.offset,
+                address: repr.offset(),
                 _brand: PhantomData,
             }),
         };

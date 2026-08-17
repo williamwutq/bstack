@@ -72,6 +72,9 @@ mod reference;
 /// Cross-file `Foreign<T>` support: the process-wide path↔id file registry.
 pub mod registry;
 mod replace;
+/// Runtime Type Information: a persisted, self-describing schema stack for
+/// interpreting `bstack_raii` structures on disk with no compiled-in types.
+pub mod rtti;
 mod shared;
 mod stdlib;
 mod teardown;

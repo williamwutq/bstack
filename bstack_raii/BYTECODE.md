@@ -89,7 +89,7 @@ interpreter dispatches on for get/set/clone/teardown. Depth is bounded by the
 | 0x03 | WEAK    | eightcc:[u8;8]                                   | u64 offset; copy offset + **stop** (don't follow)                            |
 | 0x04 | REF     | eightcc:[u8;8]                                   | u64 offset; **alias** on clone (design-ref-clone-alias)                      |
 | 0x05 | EMBED   | eightcc:[u8;8]                                   | child `OnDisk` inlined (no offset); recurse in place                         |
-| 0x06 | FOREIGN | eightcc:[u8;8]                                   | inline `ForeignRepr{file_id:u64, offset:u64}`; resolve                       |
+| 0x06 | FOREIGN | eightcc:[u8;8]                                   | inline `ForeignRepr{file_id:u32, type_index:u32, offset:u64}` (16B); resolve |
 | 0x10 | OPTION  | inner:Shape                                      | 0-niche None over an offset-bearing inner                                    |
 | 0x11 | ARRAY   | n:u32, inner                                     | `[inner; n]`, contiguous                                                     |
 | 0x12 | VEC     | inner:Shape                                      | inline `VecDesc{data_off:u64, data_size:u64}`; elems = `inner`               |
