@@ -4525,6 +4525,7 @@ pub(crate) fn pod_aggregate_variant(
 /// or `#[embed] V(Child)`, where the child is stored as a `u64` offset (owned / ref /
 /// strong / weak) or its whole on-disk form inline (`#[embed]`). The trailing case of
 /// the annotated single-field arm (vec / array / foreign shapes handled before it).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn single_block_variant(
     ty: &Type,
     vname: &Ident,
@@ -5117,6 +5118,7 @@ pub(crate) fn foreign_tuple_variant(
 /// foreign array `V([Foreign<T>; N])`, or an `#[embed] V([Child; N])`. Block refs are
 /// stored **flat** in the payload as `[u64; TOTAL]` (foreign: `[ForeignPtr; TOTAL]`;
 /// embed: each child's whole on-disk form). `None` = not an array (fall through).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn array_variant(
     ty: &Type,
     vname: &Ident,
