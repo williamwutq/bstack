@@ -28,9 +28,10 @@ use std::{fmt, io};
 /// `LinearBStackAllocator` deliberately does **not** implement
 /// [`BStackUninitAllocator`](crate::BStackUninitAllocator): it has no cheaper
 /// uninitialised path to offer.  A bump allocator never reuses a region, so
-/// every byte it hands out comes from fresh tail growth, and
-/// [`BStack::extend`] realises that growth with a single `set_len` on a sparse
-/// file — the zeroes cost no write I/O at all.  There is nothing for
+/// every byte it hands out comes from fresh tail growth, and both routes to it
+/// — [`BStack::extend`], and [`BStack::try_extend_zeros`] for an `atomic`
+/// `realloc` grow — realise that growth with a single `set_len` on a sparse
+/// file, so the zeroes cost no write I/O at all.  There is nothing for
 /// `alloc_uninit` to skip, and implementing the trait as a pass-through would
 /// falsely advertise a saving (see the trait's own guidance).
 ///
@@ -42,7 +43,7 @@ use std::{fmt, io};
 /// | Operation            | Without `atomic`    | With `atomic`           |
 /// |----------------------|---------------------|-------------------------|
 /// | `alloc`              | [`BStack::extend`]  | [`BStack::extend`]      |
-/// | `realloc` grow       | [`BStack::extend`]  | [`BStack::try_extend`]  |
+/// | `realloc` grow       | [`BStack::extend`]  | [`BStack::try_extend_zeros`] |
 /// | `realloc` shrink     | [`BStack::discard`] | [`BStack::try_discard`] |
 /// | `dealloc` (tail)     | [`BStack::discard`] | [`BStack::try_discard`] |
 /// | `dealloc` (non-tail) | no-op               | no-op                   |
@@ -59,7 +60,7 @@ use std::{fmt, io};
 ///
 /// * **`alloc`** / **`alloc_bulk`**: a single [`BStack::extend`] returns a
 ///   distinct region to every caller regardless of concurrency.
-/// * **`realloc`**: uses [`BStack::try_extend`] / [`BStack::try_discard`]
+/// * **`realloc`**: uses [`BStack::try_extend_zeros`] / [`BStack::try_discard`]
 ///   with `slice.end()` as the sentinel.  If the tail has moved (another
 ///   thread raced), the call returns [`io::ErrorKind::Unsupported`] — the
 ///   same error as a non-tail realloc on a single thread.
@@ -195,7 +196,7 @@ impl BStackAllocator for LinearBStackAllocator {
     }
 
     // With the `atomic` feature the tail check and the modification are a
-    // single locked step (`try_extend`/`try_discard`), eliminating the TOCTOU
+    // single locked step (`try_extend_zeros`/`try_discard`), eliminating the TOCTOU
     // race that exists in the non-atomic version.  A `false` return means
     // another thread moved the tail first; we surface this as `Unsupported`.
     #[cfg(feature = "atomic")]
@@ -214,9 +215,11 @@ impl BStackAllocator for LinearBStackAllocator {
                     Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, start, old_len) })
                 }
                 std::cmp::Ordering::Greater => {
-                    let delta = new_len - old_len;
-                    let zeros = vec![0u8; delta as usize];
-                    if !self.stack.try_extend(end, zeros)? {
+                    // `try_extend_zeros` rather than `try_extend` of a zero
+                    // buffer: same tail guard and same result, but the growth is
+                    // realised by one `set_len` on a sparse file, so the zeros
+                    // cost no write I/O and no heap staging.
+                    if !self.stack.try_extend_zeros(end, new_len - old_len)? {
                         return Err(io::Error::new(
                             io::ErrorKind::Unsupported,
                             "LinearBStackAllocator does not support reallocation of non-tail slices; \
@@ -440,7 +443,7 @@ mod _assertions {
 // Fault-injection failure tests. These are white-box: they target the exact
 // `BStack` op each path issues in the non-`atomic` build (`extend`/`discard`),
 // so they are gated off under `atomic` (which routes through
-// `try_extend`/`try_discard`). The op-agnostic fault fuzz covers both builds.
+// `try_extend_zeros`/`try_discard`). The op-agnostic fault fuzz covers both builds.
 #[cfg(all(
     test,
     debug_assertions,

@@ -85,12 +85,13 @@ Reference: https://github.com/williamwutq/bstack/pull/37
 
 ### Motivation
 
-Implementing `BStackUninitAllocator` for the slab and ghost-tree allocators surfaced places
-where the *initialised* path pays for zeroes it is already guaranteed. None is a
-correctness problem, and none was changed as part of that work, since each
-touches a path with its own documented crash-consistency reasoning.
+Implementing `BStackUninitAllocator` surfaced places where the *initialised*
+path pays for zeroes it is already guaranteed. Neither is a correctness problem,
+and neither was changed as part of that work, since each touches a path with its
+own documented crash-consistency reasoning. (`LinearBStackAllocator::realloc`'s
+`atomic` grow was the other one; it now uses `try_extend_zeros` and is done.)
 
-### Candidates
+### Candidate
 
 1. **`CheckedSlabBStackAllocator::pop_and_claim_block` scrubs a block that is already zero.**
    Every route into the free list writes a fully-zeroed image over the freed run —
@@ -104,16 +105,6 @@ touches a path with its own documented crash-consistency reasoning.
    were ever broken by a bug elsewhere, `alloc`'s guarantee would break with it.
    If adopted, `CheckedSlabBStackAllocator` would then have no cheaper
    uninitialised path left and should stop implementing `BStackUninitAllocator`.
-
-2. **`LinearBStackAllocator::realloc` materialises a zero buffer to grow under `atomic`.**
-   The grow branch allocates `vec![0u8; delta]` and calls `try_extend(end, zeros)`,
-   writing `delta` bytes. `try_extend_zeros(end, delta)` has the identical guard
-   and result but realises the growth with one `set_len`, so the zeroes cost no
-   write I/O — the same primitive the other allocators' tail-grow paths already
-   use. The non-`atomic` branch already takes the cheap route via `extend`. This is
-   the only write standing between `LinearBStackAllocator` and "zero-fill is
-   entirely free", which is the stated reason it does not implement
-   `BStackUninitAllocator`.
 
 More candidates of this kind exist in the allocators that have not adopted
 `BStackUninitAllocator` yet, and belong with that work rather than here.

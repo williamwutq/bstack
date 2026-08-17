@@ -2587,6 +2587,25 @@ mod alloc_tests {
         assert_eq!(alloc.len().unwrap(), 16);
     }
 
+    // A tail grow must preserve the existing bytes and zero the newly added
+    // ones. Both builds realise the growth with a single sparse `set_len`
+    // (`extend`, or `try_extend_zeros` under `atomic`) rather than writing a
+    // zero buffer, so this pins the contract that makes that legal.
+    #[cfg(feature = "set")]
+    #[test]
+    fn realloc_tail_grow_preserves_data_and_zeroes_new_bytes() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut s = alloc.alloc(8).unwrap();
+        s.write([0xABu8; 8]).unwrap();
+
+        let grown = alloc.realloc(s, 24).unwrap();
+        assert_eq!(grown.len(), 24);
+        let data = grown.read().unwrap();
+        assert_eq!(&data[..8], &[0xABu8; 8], "existing bytes must survive");
+        assert_eq!(&data[8..], &[0u8; 16], "newly added bytes must read zero");
+    }
+
     // 10. realloc tail-shrink decreases len
     #[test]
     fn realloc_tail_shrink() {

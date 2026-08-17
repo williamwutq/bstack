@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`#[must_use]` (Rust) / `BSTACK_WARN_UNUSED_RESULT` (C) added across the public API.** Functions whose return value reports success/failure or hands back a result that shouldn't be silently discarded now warn at compile time if the caller ignores them; `Result`-returning Rust functions are untouched, since `Result` is already `#[must_use]` at the type level. No behaviour change.
 - **`#[track_caller]` added to `BStackSlice`/`BStackOwnedSlice`/`BStackChunk`/`BStackByteVec` methods with a documented panic precondition** A panic from one of these (or a wrapper that forwards to one) now reports the caller's source location instead of the internal `assert!`/`panic!` line. No behaviour change beyond the reported panic location.
+- **`LinearBStackAllocator::realloc` grows the tail with `BStack::try_extend_zeros` under `atomic`.** The grow branch previously staged a `vec![0u8; delta]` and appended it with `try_extend`, writing `delta` bytes for a region that is guaranteed zero anyway; `try_extend_zeros` applies the identical tail guard and realises the growth with a single `set_len` on a sparse file, so the zeroes cost no write I/O and no heap staging. The documented `BStack` op for that path changes accordingly (`try_extend` → `try_extend_zeros`). No behaviour change: same guard semantics, same crash consistency, same zero-filled result.
 
 ### Fixed
 
