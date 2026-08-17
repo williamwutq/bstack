@@ -1019,20 +1019,30 @@ uint64_t checked_slab_bstack_allocator_data_size(
  *   non-tail grow      → alloc new class, copy, dealloc old
  *
  * Crash consistency: every path only ever *leaks* on a mid-op failure, never
- * corrupts — leak-preferring tail ops leave an orphaned tail that recover()
- * reclaims, and the atomic non-tail carve commits length + carve as one
- * transaction.  segregated_bstack_allocator_recover rebuilds every free list
- * from a single linear arena scan and reclaims leaked blocks.
+ * corrupts — the leak-preferring tail grow leaves an orphaned zero tail that
+ * recover() reclaims, and the atomic shrinks commit the length change together
+ * with the truncation (tail) or the carve (non-tail) as one transaction, so a
+ * crash leaves the block wholly un-shrunk or fully shrunk — never a committed
+ * length whose class stride disagrees with the block's physical extent, which
+ * would make the recovery scan read live payload bytes as an overhead word.
+ * segregated_bstack_allocator_recover rebuilds every free list from a single
+ * linear arena scan and reclaims leaked blocks.
  *
  * Thread safety: without -DBSTACK_FEATURE_ATOMIC an allocator handle must be
  * used from one thread at a time — free-list mutations read then write a head as
  * separate bstack calls.  With -DBSTACK_FEATURE_ATOMIC alloc/dealloc/realloc take
  * no allocator-level lock: free-list pops ride a single bstack_process_gen
- * sequence, pushes and the non-tail carve ride bstack_inplace_gen, and the tail
- * grow/shrink/oversized-discard paths use bstack_try_extend_zeros /
+ * sequence, pushes and the non-tail carve ride bstack_inplace_gen, the tail
+ * shrink rides a BSTACK_GEN_LEN + BSTACK_GEN_SPLICE bstack_process_gen, and the
+ * tail grow / oversized-discard paths use bstack_try_extend_zeros /
  * bstack_try_discard (check-and-act atomically under bstack's own write lock).
  * The handle carries no mutex at all; recover() is the sole exception and
  * requires a quiescent allocator (see its contract).
+ *
+ * Without -DBSTACK_FEATURE_ATOMIC the in-place tail shrink is unavailable — its
+ * length commit and truncation cannot be fused without a transaction, and either
+ * ordering leaves a crash window recover() mis-parses — so that build's realloc
+ * takes a move instead, as the non-tail shrink already does.
  *
  * Experimental: the on-disk format (ALSG magic) and API are not yet stable, and
  * the background coalescer and deep in-use-leak GC are unimplemented.

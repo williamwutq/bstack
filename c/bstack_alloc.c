@@ -2137,6 +2137,57 @@ static void bstack_alloc_lock_destroy(void *lock)
 #endif /* BSTACK_FEATURE_ATOMIC */
 
 /* =========================================================================
+ * Crash-atomic tail shrink, shared by the ghost_tree and segregated reallocs.
+ * ====================================================================== */
+
+#ifdef BSTACK_FEATURE_ATOMIC
+/*
+ * BSTACK_GEN_LEN confirms the block is still the tail under
+ * bstack_process_gen's single held write lock (so no concurrent push/discard
+ * can move it between the check and the cut), then a NULL-`removed`
+ * BSTACK_GEN_SPLICE (the atrunc form) cuts `cut` bytes off the tail and
+ * re-appends `new_len` bytes from `new_buf` in their place — fusing the
+ * truncation with whatever must land alongside it (sub-block padding zeros for
+ * ghost_tree, the rewritten block for segregated) into one crash-atomic
+ * transaction.  If the block is no longer the tail the sequence ends without
+ * mutating and `truncated` stays 0, so the caller falls through to its non-tail
+ * path.
+ */
+typedef struct {
+    int            phase;
+    int            truncated;     /* set once the splice is issued */
+    uint64_t       expected_tail; /* stack length the block must still end at */
+    uint64_t       cur;           /* BSTACK_GEN_LEN output */
+    size_t         cut;           /* bytes to cut off the tail */
+    const uint8_t *new_buf;       /* bytes to re-append in their place */
+    size_t         new_len;
+} bstack_alloc_tail_shrink_ctx_t;
+
+static int bstack_alloc_tail_shrink_gen(bstack_gen_op_t *out_op, void *ctx_)
+{
+    bstack_alloc_tail_shrink_ctx_t *c = (bstack_alloc_tail_shrink_ctx_t *)ctx_;
+    if (c->phase == 0) {
+        c->phase = 1;
+        out_op->kind = BSTACK_GEN_LEN;
+        out_op->u.len.out = &c->cur;
+        return 1;
+    }
+    if (c->phase == 1) {
+        c->phase = 2;
+        if (c->expected_tail != c->cur) return 0;  /* not the tail — change nothing */
+        c->truncated = 1;
+        out_op->kind = BSTACK_GEN_SPLICE;
+        out_op->u.splice.removed = NULL;   /* atrunc form: discard the cut bytes */
+        out_op->u.splice.n = c->cut;
+        out_op->u.splice.new_buf = c->new_buf;
+        out_op->u.splice.new_len = c->new_len;
+        return 1;
+    }
+    return 0;
+}
+#endif /* BSTACK_FEATURE_ATOMIC */
+
+/* =========================================================================
  * ghost_tree_bstack_allocator_t — best-fit AVL tree allocator
  * Requires -DBSTACK_FEATURE_SET (depends on bstack_set and bstack_zero).
  * ====================================================================== */
@@ -2971,52 +3022,6 @@ static int gt_vt_dealloc(bstack_allocator_t *self, bstack_slice_t slice)
 #endif
 }
 
-#ifdef BSTACK_FEATURE_ATOMIC
-/*
- * Context + generator for gt_vt_realloc's crash-atomic tail shrink.
- *
- * BSTACK_GEN_LEN confirms this block is still the tail under bstack_process_gen's
- * single held write lock (so no concurrent push/discard can move it between the
- * check and the cut), then a NULL-`removed` BSTACK_GEN_SPLICE (the atrunc form)
- * cuts `cut` bytes off the tail and re-appends `pad_len` zero bytes — fusing the
- * tail truncation and the sub-block padding zeroing into one crash-atomic splice.
- */
-typedef struct {
-    int      phase;
-    int      truncated;
-    uint64_t expected_tail;   /* slice.offset + aligned_old */
-    uint64_t cur;             /* BSTACK_GEN_LEN output */
-    size_t   cut;             /* bytes to cut off the tail */
-    size_t   pad_len;         /* zero bytes to re-append (< ALGT_MIN_ALLOC) */
-    uint8_t  pad[ALGT_MIN_ALLOC];
-} algt_shrink_ctx_t;
-
-static int algt_shrink_gen(bstack_gen_op_t *out_op, void *ctx_)
-{
-    algt_shrink_ctx_t *c = (algt_shrink_ctx_t *)ctx_;
-    if (c->phase == 0) {
-        c->phase = 1;
-        out_op->kind = BSTACK_GEN_LEN;
-        out_op->u.len.out = &c->cur;
-        return 1;
-    }
-    if (c->phase == 1) {
-        c->phase = 2;
-        if (c->expected_tail == c->cur) {
-            c->truncated = 1;
-            out_op->kind = BSTACK_GEN_SPLICE;
-            out_op->u.splice.removed = NULL;   /* atrunc form: discard the cut bytes */
-            out_op->u.splice.n = c->cut;
-            out_op->u.splice.new_buf = c->pad;
-            out_op->u.splice.new_len = c->pad_len;
-            return 1;
-        }
-        return 0;   /* not the tail — change nothing, fall through to non-tail */
-    }
-    return 0;
-}
-#endif /* BSTACK_FEATURE_ATOMIC */
-
 static int gt_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
     uint64_t new_len, bstack_slice_t *out)
 {
@@ -3104,18 +3109,20 @@ static int gt_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
          * write lock across the LEN tail-check and the SPLICE, so a fault is
          * consulted before any mutation and leaves the block fully intact. */
         {
-            algt_shrink_ctx_t ctx;
+            bstack_alloc_tail_shrink_ctx_t ctx;
+            uint8_t pad[ALGT_MIN_ALLOC];   /* zeros re-appended in the cut's place */
 #if UINT64_MAX > SIZE_MAX
             if (aligned_old - new_len > (uint64_t)SIZE_MAX) { errno = EINVAL; *out = recovered; return -1; }
 #endif
+            memset(pad, 0, sizeof pad);
             ctx.phase         = 0;
             ctx.truncated     = 0;
             ctx.expected_tail = slice.offset + aligned_old;
             ctx.cur           = 0;
             ctx.cut           = (size_t)(aligned_old - new_len);
-            ctx.pad_len       = (size_t)(aligned_new - new_len);
-            memset(ctx.pad, 0, sizeof ctx.pad);
-            if (bstack_process_gen(a->bs, algt_shrink_gen, &ctx) != 0) {
+            ctx.new_buf       = pad;
+            ctx.new_len       = (size_t)(aligned_new - new_len);
+            if (bstack_process_gen(a->bs, bstack_alloc_tail_shrink_gen, &ctx) != 0) {
                 *out = recovered;
                 return -1;
             }
@@ -6591,36 +6598,47 @@ static int alsg_vt_realloc(bstack_allocator_t *base, bstack_slice_t s,
         /* Not at tail: fall through to the move. */
     }
 
-    /* Shrink at the tail: commit the new length first (leak-preferring), then
-     * drop the excess in place. */
-    if (new_size < old_size) {
-        uint64_t tail;
-        if (bstack_len(bs, &tail)) goto fail_recover;
-        if (old_end == tail) {
-            uint64_t delta = old_size - new_size;
-#if UINT64_MAX > SIZE_MAX
-            if (delta > (uint64_t)SIZE_MAX) goto fail_invalid;
-#endif
-            write_le64(buf, ALSG_IN_USE_BIT | new_len);
-            if (bstack_set(bs, block_start, buf, 8)) goto fail_recover;
+    /* Shrink at the tail: replace the whole block with its shrunk self in ONE
+     * crash-atomic transaction.  The length commit and the truncation must not
+     * be separate calls: committing new_len first makes the recovery scan stride
+     * new_size, so a failure before the discard lands leaves the caller's still
+     * live tail bytes being read as an overhead word — a zero run there (ordinary
+     * data) looks like a crashed extend and recovery discards the whole arena
+     * behind it.  Truncating first is no better: the header would still read
+     * old_len, whose stride overruns the payload end.  So LEN confirms the tail
+     * under the held write lock and one SPLICE cuts the old block and re-appends
+     * the new one at the same offset.
+     *
+     * Without atomic there is no way to fuse them, so that build falls through to
+     * the move below — as the non-tail shrink already does. */
 #ifdef BSTACK_FEATURE_ATOMIC
-            {
-                int ok = 0;
-                if (bstack_try_discard(bs, old_end, (size_t)delta, &ok)) goto fail_recover;
-                if (ok) { result.offset = start; result.len = new_len; goto success; }
-                /* Lost race (concurrent tail extension): revert the length and
-                 * fall through to the in-place carve. */
-                write_le64(buf, ALSG_IN_USE_BIT | old_len);
-                if (bstack_set(bs, block_start, buf, 8)) goto fail_recover;
-            }
-#else
-            if (bstack_discard(bs, (size_t)delta)) goto fail_recover;
-            result.offset = start; result.len = new_len; goto success;
+    if (new_size < old_size) {
+        bstack_alloc_tail_shrink_ctx_t c;
+        uint8_t *nb;
+        int rc;
+#if UINT64_MAX > SIZE_MAX
+        if (old_size > (uint64_t)SIZE_MAX || new_size > (uint64_t)SIZE_MAX)
+            goto fail_invalid;
 #endif
-        }
+        /* The replacement block, built exactly as a fresh claim would be:
+         * overhead(IN_USE|new_len), the surviving prefix read straight out of the
+         * old block, then zero padding to the class size. */
+        nb = alsg_claim_buf(bs, new_size, new_len, 1, start, new_len);
+        if (!nb) goto fail_recover;
+        c.phase         = 0;
+        c.truncated     = 0;
+        c.expected_tail = old_end;
+        c.cur           = 0;
+        c.cut           = (size_t)old_size;
+        c.new_buf       = nb;
+        c.new_len       = (size_t)new_size;
+        rc = bstack_process_gen(bs, bstack_alloc_tail_shrink_gen, &c);
+        free(nb);
+        if (rc) goto fail_recover;
+        if (c.truncated) { result.offset = start; result.len = new_len; goto success; }
+        /* Not the tail — fall through to the in-place carve. */
     }
 
-#ifdef BSTACK_FEATURE_ATOMIC
     /* Non-tail shrink: keep the block at the new class and free the excess tail
      * in place as one crash-atomic carve. */
     if (new_size < old_size) {
@@ -6631,12 +6649,12 @@ static int alsg_vt_realloc(bstack_allocator_t *base, bstack_slice_t s,
             goto fail_recover;
         result.offset = start; result.len = new_len; goto success;
     }
-#endif
+#endif /* BSTACK_FEATURE_ATOMIC */
 
     /* Move: alloc the new class, having it read the surviving prefix straight
      * from the old block into its claim buffer, then free the old block.
-     * Handles non-tail grow (both builds) and, without atomic, the non-tail
-     * shrink that fell through above. */
+     * Handles non-tail grow (both builds) and, without atomic, every shrink
+     * that fell through above. */
     {
         uint64_t copy_len = old_len < new_len ? old_len : new_len;
         uint64_t new_ptr;
