@@ -51,6 +51,35 @@ struct VecArr {
     maybe: Option<Point>,
 }
 
+#[bstack_class(rc)]
+struct RCell {
+    v: u32,
+}
+
+#[bstack_class(rc, weak)]
+struct WCell {
+    v: u32,
+}
+
+#[bstack_class]
+struct RcHolder {
+    #[bstack_strong]
+    s: RCell,
+}
+
+#[bstack_class]
+struct WHolder {
+    #[bstack_strong]
+    s: WCell,
+}
+
+#[bstack_class]
+struct WeakHolder {
+    tag: u32,
+    #[bstack_weak]
+    w: WCell,
+}
+
 #[bstack_class]
 struct Config {
     /// A constant class variable.
@@ -386,6 +415,159 @@ fn interpret_reads_vec_array_and_option() {
     assert_eq!(pt_fields[1].1, pod(&9u32.to_le_bytes()));
 
     v.bstack_drop(&alloc).unwrap();
+    drop(reg);
+    std::fs::remove_file(&schema).ok();
+    std::fs::remove_file(&dpath).ok();
+}
+
+#[test]
+fn interpret_teardown_reclaims_owned_tree() {
+    let schema = temp_path("td1_schema");
+    let reg = rtti::sync(&schema).unwrap();
+    let (alloc, dpath) = data_alloc("td1_data");
+    let ord = reg.ordinal_of(<Wrap as BStackCast>::eightcc()).unwrap();
+
+    // Build a Wrap owning a Point, return its (detached) root offset.
+    let build = || {
+        let inner = Point::new(&alloc, 1, 2).unwrap();
+        let w = Wrap::new(&alloc, inner, 5).unwrap();
+        BStackBlock::range(w.handle()).start()
+    };
+
+    // Leak oracle: warm once (allocator high-water settles), snapshot, then do an
+    // identical build + RTTI teardown and assert the stack returned to baseline —
+    // so teardown reclaimed the root *and* the owned child, with nothing leaked.
+    reg.teardown(&alloc, ord, build()).unwrap();
+    let base = alloc.stack().len().unwrap();
+    reg.teardown(&alloc, ord, build()).unwrap();
+    assert_eq!(alloc.stack().len().unwrap(), base, "RTTI teardown leaked");
+
+    drop(reg);
+    std::fs::remove_file(&schema).ok();
+    std::fs::remove_file(&dpath).ok();
+}
+
+#[test]
+fn interpret_teardown_strong_rc() {
+    let schema = temp_path("tds1_schema");
+    let reg = rtti::sync(&schema).unwrap();
+    let (alloc, dpath) = data_alloc("tds1_data");
+    let ord = reg.ordinal_of(<RcHolder as BStackCast>::eightcc()).unwrap();
+
+    // A holder that is the sole strong owner of an `rc` cell. Teardown must
+    // decrement the inline refcount to zero and free the cell (+ the root).
+    let build = || {
+        let cell = RCell::new(&alloc, 5).unwrap();
+        let h = RcHolder::new(&alloc, cell).unwrap();
+        BStackBlock::range(h.handle()).start()
+    };
+
+    reg.teardown(&alloc, ord, build()).unwrap();
+    let base = alloc.stack().len().unwrap();
+    reg.teardown(&alloc, ord, build()).unwrap();
+    assert_eq!(
+        alloc.stack().len().unwrap(),
+        base,
+        "strong(rc) teardown leaked"
+    );
+
+    drop(reg);
+    std::fs::remove_file(&schema).ok();
+    std::fs::remove_file(&dpath).ok();
+}
+
+#[test]
+fn interpret_teardown_strong_rc_weak() {
+    let schema = temp_path("tds2_schema");
+    let reg = rtti::sync(&schema).unwrap();
+    let (alloc, dpath) = data_alloc("tds2_data");
+    let ord = reg.ordinal_of(<WHolder as BStackCast>::eightcc()).unwrap();
+
+    // Sole strong owner of an `(rc, weak)` cell: teardown decrements `ctrl.strong`
+    // to zero (frees the data block), then the phantom weak to zero (frees control).
+    let build = || {
+        let cell = WCell::new(&alloc, 5).unwrap();
+        let h = WHolder::new(&alloc, cell).unwrap();
+        BStackBlock::range(h.handle()).start()
+    };
+
+    reg.teardown(&alloc, ord, build()).unwrap();
+    let base = alloc.stack().len().unwrap();
+    reg.teardown(&alloc, ord, build()).unwrap();
+    assert_eq!(
+        alloc.stack().len().unwrap(),
+        base,
+        "strong(rc,weak) teardown leaked"
+    );
+
+    drop(reg);
+    std::fs::remove_file(&schema).ok();
+    std::fs::remove_file(&dpath).ok();
+}
+
+#[test]
+fn interpret_teardown_weak_field() {
+    let schema = temp_path("tds3_schema");
+    let reg = rtti::sync(&schema).unwrap();
+    let (alloc, dpath) = data_alloc("tds3_data");
+    let ord = reg
+        .ordinal_of(<WeakHolder as BStackCast>::eightcc())
+        .unwrap();
+
+    // A holder with a *weak* reference to an externally-owned cell. Tearing the
+    // holder down must release only the weak (never the still-strong-alive cell);
+    // dropping the cell's strong owner afterward reclaims the cell + control. A full
+    // cycle must return to baseline — no leak, no premature free.
+    let cycle = || {
+        let cell = WCell::new(&alloc, 5).unwrap(); // BStackRc: strong=1, weak=1 (phantom)
+        let h = WeakHolder::new(&alloc, 7).unwrap();
+        h.handle().set_w(&alloc, cell.downgrade().unwrap()).unwrap(); // weak 1 -> 2
+        let off = BStackBlock::range(h.handle()).start();
+        // Frees the holder root and decrements the cell's weak (2 -> 1); the cell
+        // and its control survive because a strong owner is still live.
+        reg.teardown(&alloc, ord, off).unwrap();
+        // `cell` (BStackRc) drops here: strong 1 -> 0 frees the data, weak 1 -> 0
+        // frees the control.
+    };
+
+    cycle();
+    let base = alloc.stack().len().unwrap();
+    cycle();
+    assert_eq!(
+        alloc.stack().len().unwrap(),
+        base,
+        "weak-field teardown leaked"
+    );
+
+    drop(reg);
+    std::fs::remove_file(&schema).ok();
+    std::fs::remove_file(&dpath).ok();
+}
+
+#[test]
+fn interpret_teardown_reclaims_vec_array_and_option() {
+    let schema = temp_path("td2_schema");
+    let reg = rtti::sync(&schema).unwrap();
+    let (alloc, dpath) = data_alloc("td2_data");
+    let ord = reg.ordinal_of(<VecArr as BStackCast>::eightcc()).unwrap();
+
+    // A VecArr owns a data-block-backed Vec and an Option<owned Point>.
+    let build = || {
+        let v = VecArr::new(
+            &alloc,
+            &[10, 20, 30],
+            [1, 2, 3],
+            Some(Point::new(&alloc, 8, 9).unwrap()),
+        )
+        .unwrap();
+        BStackBlock::range(v.handle()).start()
+    };
+
+    reg.teardown(&alloc, ord, build()).unwrap();
+    let base = alloc.stack().len().unwrap();
+    reg.teardown(&alloc, ord, build()).unwrap();
+    assert_eq!(alloc.stack().len().unwrap(), base, "RTTI teardown leaked");
+
     drop(reg);
     std::fs::remove_file(&schema).ok();
     std::fs::remove_file(&dpath).ok();

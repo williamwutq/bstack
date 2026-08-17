@@ -390,3 +390,10 @@ ordinal, or `sync` the schema so the pointer's type is present.
 A followed field (`owned` / `strong` / `embed`) names a target eightcc that is not in
 this RTTI stack. **Fix:** `sync` the producer's full compiled-in schema so every
 referenced type is appended before reading.
+
+### BSTACK080C — RTTI teardown of a foreign reference
+`teardown` reached a `foreign` (cross-file) reference, whose reclamation needs the
+registry routing the generated path does; the interpreter does not do cross-file
+teardown yet. **Fix:** tear a structure with `foreign` fields down through its
+compiled-in handle for now. (In-file `owned` / `embed` / `strong` / `weak` / `ref` /
+`vec` / array / tuple / `option` are all handled.)

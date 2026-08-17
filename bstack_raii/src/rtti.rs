@@ -35,20 +35,28 @@
 //! pointer is the existing [`ForeignRepr`] (its `type_index` is the ordinal `+ 1`).
 //! The `#[bstack_class]` macro fills [`RTTI_TYPES`] at link time, and [`sync`]
 //! appends every missing schema to a file. [`RttiRegistry::read_value`] /
-//! [`RttiRegistry::read_ptr`] are the non-recursive **read interpreter** — they walk
-//! the schema over a live data file into a [`Value`] tree with no compiled-in types.
-//! Still TODO: the *mutating* interpreter (set / teardown / clone) and live
-//! mutable-class-variable writes.
+//! [`RttiRegistry::read_ptr`] are the non-recursive **read interpreter** (schema over
+//! a live data file → a [`Value`] tree, no compiled-in types), and
+//! [`RttiRegistry::teardown`] is the non-recursive **free interpreter** — it reclaims
+//! `owned` / `embed` / `strong` / `weak` / `ref` / `vec` / array / tuple / option
+//! structures (refcount decrements and all). Still TODO: cross-file `foreign`
+//! teardown, the *writing* interpreter (set / clone), and live mutable-class-variable
+//! writes.
 
 use std::collections::HashMap;
 use std::io;
 use std::path::Path;
 
-use bstack::BStack;
+use bstack::{BStack, BStackRange};
 use linkme::distributed_slice;
 
+use crate::BStackRaiiAllocator;
 use crate::foreign::ForeignRepr;
-use crate::layout::EightCC;
+use crate::layout::{
+    CTRL_BACKPTR_OFFSET, CTRL_DATA_OFFSET, CTRL_STRONG_OFFSET, CTRL_WEAK_OFFSET, EightCC,
+    RC_REFCOUNT_OFFSET,
+};
+use crate::refcount;
 
 /// Re-exports so the `#[bstack_class]` macro's generated registration code can name
 /// `linkme` without the downstream crate depending on it directly. The generated
@@ -832,6 +840,19 @@ enum Op {
     MakeSome,
 }
 
+/// One step of the non-recursive teardown walk (see [`RttiRegistry::teardown`]).
+enum TdOp {
+    /// Visit the block of type `ord` at `block_off`: free its range (unless `emit`
+    /// is false, for an inline `#[embed]` child) and walk its fields.
+    Block {
+        ord: RttiOrdinal,
+        block_off: u64,
+        emit: bool,
+    },
+    /// Interpret one shape at an absolute data offset, freeing what it owns.
+    Shape { shape: Shape, offset: u64 },
+}
+
 /// Bytes of a `VecDesc` (`data_off:u64` @0, `data_size:u64` @8) — the inline
 /// descriptor of a persistent vector.
 const VECDESC_LEN: u64 = 16;
@@ -839,6 +860,10 @@ const VECDESC_LEN: u64 = 16;
 const BYTEVEC_HEADER: u64 = 16;
 /// Bytes of a `ForeignRepr` on the wire.
 const FOREIGN_REPR_LEN: u64 = 16;
+/// Bytes of an `(rc, weak)` control block (`XOnDiskRef`): a 16-byte header, then the
+/// `strong`, `weak`, and data-back-pointer `u64`s. Fixed for every weakable type (the
+/// control layout does not depend on `T`).
+const CONTROL_SIZE: u64 = CTRL_DATA_OFFSET + 8;
 
 fn read_u64_at(data: &BStack, off: u64) -> io::Result<u64> {
     let mut b = [0u8; 8];
@@ -1087,6 +1112,269 @@ impl RttiRegistry {
         self.read_value(data, ord, ptr.offset())
     }
 
+    /// Tear down (free) the structure of type `ordinal` at `block_off` in `alloc`'s
+    /// file — the interpreted equivalent of a generated `bstack_drop`.
+    ///
+    /// The root **must already be detached** (unlinked from any parent): this frees
+    /// it unconditionally, so a still-linked root would corrupt its parent. The walk
+    /// is **non-recursive**; it collects every block to reclaim then frees them all in
+    /// one [`free_many`](BStackRaiiAllocator::free_many) (bulk when the allocator
+    /// supports it, else sequential — orphan-only on a crash, never a torn structure).
+    ///
+    /// Per RAII kind: `owned` / `embed` recurse-free the child subtree; a **`strong`**
+    /// reference decrements the target's refcount (inline for `rc`, or the control
+    /// block's `strong` for `rc, weak`) and frees the data (and, when the phantom weak
+    /// then hits zero, the control) block only when the **last** owner drops; a
+    /// **`weak`** reference decrements the control block's `weak` and frees the control
+    /// block alone when last; `ref` is non-owning and left alone; `pod` / class own
+    /// nothing. Vectors free their data block plus any owning/shared element blocks.
+    /// Only cross-file `foreign` references are unsupported (they error).
+    pub fn teardown<A: BStackRaiiAllocator>(
+        &self,
+        alloc: &A,
+        ordinal: RttiOrdinal,
+        block_off: u64,
+    ) -> io::Result<()> {
+        let data = alloc.stack();
+        let mut cache: HashMap<RttiOrdinal, RttiType> = HashMap::new();
+        let mut work: Vec<TdOp> = vec![TdOp::Block {
+            ord: ordinal,
+            block_off,
+            emit: true,
+        }];
+        let mut to_free: Vec<BStackRange> = Vec::new();
+        let mut budget: u64 = 4_000_000;
+
+        while let Some(op) = work.pop() {
+            budget = budget.checked_sub(1).ok_or_else(|| {
+                corrupt("[BSTACK0807] RTTI teardown budget exceeded (corrupt data or a cycle?)")
+            })?;
+            match op {
+                TdOp::Block {
+                    ord,
+                    block_off,
+                    emit,
+                } => {
+                    if let std::collections::hash_map::Entry::Vacant(e) = cache.entry(ord) {
+                        e.insert(self.load_type(ord)?);
+                    }
+                    let ty = &cache[&ord];
+                    // An embedded child (`emit == false`) has no block of its own — its
+                    // storage is part of the parent — but its owned sub-blocks are still
+                    // freed by walking its fields.
+                    if emit {
+                        to_free.push(BStackRange::new(block_off, ty.ondisk_size));
+                    }
+                    match &ty.body {
+                        RttiBody::Struct(fields) => {
+                            for f in fields {
+                                work.push(TdOp::Shape {
+                                    shape: f.shape.clone(),
+                                    offset: block_off + f.offset as u64,
+                                });
+                            }
+                        }
+                        RttiBody::Enum(e) => {
+                            let raw = read_disc(data, block_off + e.disc_off as u64, e.disc_width)?;
+                            let mask = disc_mask(e.disc_width);
+                            let variant = e
+                                .variants
+                                .iter()
+                                .find(|v| (v.disc_value as u64) & mask == raw)
+                                .ok_or_else(|| {
+                                    corrupt(format!(
+                                        "[BSTACK0808] no RTTI variant for discriminant {raw}"
+                                    ))
+                                })?;
+                            let payload_base = block_off + e.payload_off as u64;
+                            for f in &variant.fields {
+                                work.push(TdOp::Shape {
+                                    shape: f.shape.clone(),
+                                    offset: payload_base + f.offset as u64,
+                                });
+                            }
+                        }
+                    }
+                }
+
+                TdOp::Shape { shape, offset } => match shape {
+                    // Nothing to free: inline bytes, an alias, or a schema-side value.
+                    Shape::Pod { .. } | Shape::Ref(_) | Shape::Class { .. } => {}
+                    Shape::Owned(tag) => {
+                        let child = read_u64_at(data, offset)?;
+                        if child != 0 {
+                            work.push(TdOp::Block {
+                                ord: self.ordinal_of(tag).ok_or_else(unknown_tag)?,
+                                block_off: child,
+                                emit: true,
+                            });
+                        }
+                    }
+                    Shape::Embed(tag) => {
+                        // Inline child: walk its fields (freeing its sub-blocks) but do
+                        // not free the slot itself — it is part of this block.
+                        work.push(TdOp::Block {
+                            ord: self.ordinal_of(tag).ok_or_else(unknown_tag)?,
+                            block_off: offset,
+                            emit: false,
+                        });
+                    }
+                    Shape::Strong(tag) => {
+                        let data_off = read_u64_at(data, offset)?;
+                        if data_off != 0 {
+                            self.release_strong(
+                                data,
+                                tag,
+                                data_off,
+                                &mut work,
+                                &mut to_free,
+                                &mut cache,
+                            )?;
+                        }
+                    }
+                    Shape::Weak(_) => {
+                        // A weak field's slot holds the *control* offset directly.
+                        let ctrl_off = read_u64_at(data, offset)?;
+                        if ctrl_off != 0 {
+                            release_weak(data, ctrl_off, &mut to_free)?;
+                        }
+                    }
+                    Shape::Foreign(_) => return Err(teardown_unsupported()),
+                    Shape::Option(inner) => {
+                        if read_u64_at(data, offset)? != 0 {
+                            work.push(TdOp::Shape {
+                                shape: *inner,
+                                offset,
+                            });
+                        }
+                    }
+                    Shape::Array { n, inner } => {
+                        let stride = self.shape_stride(&inner, &mut cache)?;
+                        for i in 0..n as u64 {
+                            work.push(TdOp::Shape {
+                                shape: (*inner).clone(),
+                                offset: offset + i * stride,
+                            });
+                        }
+                    }
+                    Shape::Tuple(items) => {
+                        let mut off = offset;
+                        for it in &items {
+                            work.push(TdOp::Shape {
+                                shape: it.clone(),
+                                offset: off,
+                            });
+                            off += self.shape_stride(it, &mut cache)?;
+                        }
+                    }
+                    Shape::Vec(inner) => {
+                        let data_off = read_u64_at(data, offset)?; // VecDesc.data_off @0
+                        if data_off != 0 {
+                            let data_size = read_u64_at(data, offset + 8)?; // .data_size @8
+                            // A vector of owning/shared elements releases each element
+                            // (`u64` offsets from the data block's element area) too.
+                            let base = data_off + BYTEVEC_HEADER;
+                            let len = read_u64_at(data, data_off)?; // element count @0
+                            match &*inner {
+                                Shape::Owned(tag) => {
+                                    let ord = self.ordinal_of(*tag).ok_or_else(unknown_tag)?;
+                                    for i in 0..len {
+                                        let e = read_u64_at(data, base + i * 8)?;
+                                        if e != 0 {
+                                            work.push(TdOp::Block {
+                                                ord,
+                                                block_off: e,
+                                                emit: true,
+                                            });
+                                        }
+                                    }
+                                }
+                                Shape::Strong(tag) => {
+                                    for i in 0..len {
+                                        let e = read_u64_at(data, base + i * 8)?;
+                                        if e != 0 {
+                                            self.release_strong(
+                                                data,
+                                                *tag,
+                                                e,
+                                                &mut work,
+                                                &mut to_free,
+                                                &mut cache,
+                                            )?;
+                                        }
+                                    }
+                                }
+                                Shape::Weak(_) => {
+                                    for i in 0..len {
+                                        let c = read_u64_at(data, base + i * 8)?;
+                                        if c != 0 {
+                                            release_weak(data, c, &mut to_free)?;
+                                        }
+                                    }
+                                }
+                                Shape::Foreign(_) => return Err(teardown_unsupported()),
+                                // POD / `ref` elements own no sub-blocks.
+                                _ => {}
+                            }
+                            to_free.push(BStackRange::new(data_off, data_size));
+                        }
+                    }
+                },
+            }
+        }
+
+        // Everything collected is orphaned (the root was detached), so free order is
+        // immaterial; one `free_many` reclaims the whole subtree.
+        alloc.free_many(to_free)
+    }
+
+    /// Release one `strong` reference to the block at `data_off` of type `tag`. The
+    /// target's `weak` flag selects the release: an `rc` block's **inline refcount**,
+    /// or an `(rc, weak)` block's **control block** (reached through the data block's
+    /// `ctrl` back-pointer). Only when the last strong owner drops is the data block
+    /// scheduled to free (by pushing a `Block` op that walks + frees its subtree); a
+    /// control block frees when its own count (phantom weak included) hits zero.
+    fn release_strong(
+        &self,
+        data: &BStack,
+        tag: EightCC,
+        data_off: u64,
+        work: &mut Vec<TdOp>,
+        to_free: &mut Vec<BStackRange>,
+        cache: &mut HashMap<RttiOrdinal, RttiType>,
+    ) -> io::Result<()> {
+        let ord = self.ordinal_of(tag).ok_or_else(unknown_tag)?;
+        if let std::collections::hash_map::Entry::Vacant(e) = cache.entry(ord) {
+            e.insert(self.load_type(ord)?);
+        }
+        if cache[&ord].weak {
+            // `(rc, weak)`: decrement `ctrl.strong`; the last strong owner frees the
+            // data subtree and releases the phantom weak, freeing the control block if
+            // no real weak handles remain.
+            let ctrl_off = read_u64_at(data, data_off + CTRL_BACKPTR_OFFSET)?;
+            if refcount::fetch_sub(data, ctrl_off + CTRL_STRONG_OFFSET, 1)? == 1 {
+                work.push(TdOp::Block {
+                    ord,
+                    block_off: data_off,
+                    emit: true,
+                });
+                if refcount::fetch_sub(data, ctrl_off + CTRL_WEAK_OFFSET, 1)? == 1 {
+                    to_free.push(BStackRange::new(ctrl_off, CONTROL_SIZE));
+                }
+            }
+        } else {
+            // `rc`: decrement the inline refcount; the last owner frees the block.
+            if refcount::fetch_sub(data, data_off + RC_REFCOUNT_OFFSET, 1)? == 1 {
+                work.push(TdOp::Block {
+                    ord,
+                    block_off: data_off,
+                    emit: true,
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// The on-disk byte width of one element of `shape` — the stride for array / vec /
     /// tuple element addressing. References are a `u64` offset; a foreign is a
     /// `ForeignRepr`; an embedded child is its whole block; a vector is its inline
@@ -1125,6 +1413,24 @@ impl RttiRegistry {
 
 fn unknown_tag() -> io::Error {
     corrupt("[BSTACK080B] RTTI pointer/field references an unregistered type tag")
+}
+
+fn teardown_unsupported() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        "[BSTACK080C] RTTI teardown of a `foreign` reference is not yet supported (cross-file \
+         reclamation)",
+    )
+}
+
+/// Release one `weak` reference whose control block is at `ctrl_off`: decrement
+/// `ctrl.weak`; the last weak handle (or phantom) frees the control block. The data
+/// block is never touched by a weak drop.
+fn release_weak(data: &BStack, ctrl_off: u64, to_free: &mut Vec<BStackRange>) -> io::Result<()> {
+    if refcount::fetch_sub(data, ctrl_off + CTRL_WEAK_OFFSET, 1)? == 1 {
+        to_free.push(BStackRange::new(ctrl_off, CONTROL_SIZE));
+    }
+    Ok(())
 }
 
 /// The low-`width`-byte mask for comparing a stored discriminant against a variant's
