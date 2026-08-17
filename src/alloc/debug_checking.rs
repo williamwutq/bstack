@@ -63,6 +63,7 @@
 
 use super::{
     BStackAllocError, BStackAllocator, BStackBulkAllocError, BStackBulkAllocator, BStackOwnedSlice,
+    BStackUninitAllocator,
 };
 use crate::BStack;
 use std::collections::HashSet;
@@ -394,29 +395,21 @@ where
     }
 }
 
-impl<A> BStackAllocator for DebugCheckingAllocator<A>
+impl<A> DebugCheckingAllocator<A>
 where
     A: 'static + BStackAllocator<Error = io::Error>,
     for<'b> A: BStackAllocator<Allocated<'b> = BStackOwnedSlice<'b, A>>,
 {
-    type Error = io::Error;
-    type Allocated<'a>
-        = BStackOwnedSlice<'a, Self>
-    where
-        Self: 'a;
-
-    fn stack(&self) -> &BStack {
-        self.inner.stack()
-    }
-
-    fn into_stack(self) -> BStack {
-        self.inner.into_stack()
-    }
-
-    fn alloc(&self, len: u64) -> io::Result<Self::Allocated<'_>> {
-        let inner_handle = self.inner.alloc(len)?;
-
-        let inner_slice: BStackOwnedSlice<'_, A> = inner_handle;
+    /// Run an inner allocation and record the region it returns.
+    ///
+    /// Shared by [`alloc`](BStackAllocator::alloc) and
+    /// [`alloc_uninit`](BStackUninitAllocator::alloc_uninit): the tracking is
+    /// identical, only the inner call differs.
+    fn alloc_with<'a>(
+        &'a self,
+        inner_op: impl FnOnce(&'a A) -> io::Result<BStackOwnedSlice<'a, A>>,
+    ) -> io::Result<BStackOwnedSlice<'a, Self>> {
+        let inner_slice = inner_op(&self.inner)?;
         let offset = inner_slice.start();
         let len = inner_slice.len();
 
@@ -426,11 +419,25 @@ where
         Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, offset, len) })
     }
 
-    fn realloc<'a>(
+    /// Run an inner resize and re-check/re-record the regions involved.
+    ///
+    /// Shared by [`realloc`](BStackAllocator::realloc) and
+    /// [`realloc_uninit`](BStackUninitAllocator::realloc_uninit). Both consume
+    /// the caller's handle, so the inner handle is rebuilt from its coordinates
+    /// and handed to `inner_op`.
+    fn realloc_with<'a, F>(
         &'a self,
         handle: BStackOwnedSlice<'a, Self>,
         new_len: u64,
-    ) -> Result<BStackOwnedSlice<'a, Self>, BStackAllocError<'a, Self>> {
+        inner_op: F,
+    ) -> Result<BStackOwnedSlice<'a, Self>, BStackAllocError<'a, Self>>
+    where
+        F: FnOnce(
+            &'a A,
+            BStackOwnedSlice<'a, A>,
+            u64,
+        ) -> Result<BStackOwnedSlice<'a, A>, BStackAllocError<'a, A>>,
+    {
         let old_offset = handle.start();
         let old_len = handle.len();
         let old_region = old_offset..old_offset + old_len;
@@ -440,7 +447,7 @@ where
         let inner_handle =
             unsafe { BStackOwnedSlice::from_raw_parts(&self.inner, old_offset, old_len) };
 
-        let new_inner_handle = match self.inner.realloc(inner_handle, new_len) {
+        let new_inner_handle = match inner_op(&self.inner, inner_handle, new_len) {
             Ok(h) => h,
             Err(inner_err) => {
                 // Re-wrap any surviving inner handle as a wrapper handle.
@@ -492,6 +499,38 @@ where
         // SAFETY: The inner allocator successfully returned this region via realloc.
         Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, new_offset, new_len) })
     }
+}
+
+impl<A> BStackAllocator for DebugCheckingAllocator<A>
+where
+    A: 'static + BStackAllocator<Error = io::Error>,
+    for<'b> A: BStackAllocator<Allocated<'b> = BStackOwnedSlice<'b, A>>,
+{
+    type Error = io::Error;
+    type Allocated<'a>
+        = BStackOwnedSlice<'a, Self>
+    where
+        Self: 'a;
+
+    fn stack(&self) -> &BStack {
+        self.inner.stack()
+    }
+
+    fn into_stack(self) -> BStack {
+        self.inner.into_stack()
+    }
+
+    fn alloc(&self, len: u64) -> io::Result<Self::Allocated<'_>> {
+        self.alloc_with(|inner| inner.alloc(len))
+    }
+
+    fn realloc<'a>(
+        &'a self,
+        handle: BStackOwnedSlice<'a, Self>,
+        new_len: u64,
+    ) -> Result<BStackOwnedSlice<'a, Self>, BStackAllocError<'a, Self>> {
+        self.realloc_with(handle, new_len, |inner, h, n| inner.realloc(h, n))
+    }
 
     fn dealloc<'a>(
         &'a self,
@@ -530,6 +569,39 @@ where
 
         self.record_deallocation(offset, len);
         Ok(())
+    }
+}
+
+/// Forwards to the inner allocator's uninitialised path, with the same
+/// bookkeeping as [`alloc`](BStackAllocator::alloc) /
+/// [`realloc`](BStackAllocator::realloc).
+///
+/// Only available when the wrapped allocator implements
+/// [`BStackUninitAllocator`] itself — the wrapper never fabricates the trait for
+/// an allocator that has no cheaper uninitialised path, so
+/// `DebugCheckingAllocator<A>: BStackUninitAllocator` is exactly as truthful a
+/// signal as `A: BStackUninitAllocator`.
+///
+/// The overlap, double-free and partial-free checks are unaffected: they are
+/// driven by allocation *coordinates*, which the uninitialised path produces
+/// exactly as the initialised one does. The wrapper does not (and cannot) verify
+/// region contents, so it makes no assertion about whether returned bytes are
+/// zero.
+impl<A> BStackUninitAllocator for DebugCheckingAllocator<A>
+where
+    A: 'static + BStackUninitAllocator<Error = io::Error>,
+    for<'b> A: BStackAllocator<Allocated<'b> = BStackOwnedSlice<'b, A>>,
+{
+    fn alloc_uninit(&self, len: u64) -> io::Result<Self::Allocated<'_>> {
+        self.alloc_with(|inner| inner.alloc_uninit(len))
+    }
+
+    fn realloc_uninit<'a>(
+        &'a self,
+        handle: BStackOwnedSlice<'a, Self>,
+        new_len: u64,
+    ) -> Result<BStackOwnedSlice<'a, Self>, BStackAllocError<'a, Self>> {
+        self.realloc_with(handle, new_len, |inner, h, n| inner.realloc_uninit(h, n))
     }
 }
 
@@ -634,7 +706,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::alloc::BStackAllocator;
+    use crate::alloc::{BStackAllocator, BStackUninitAllocator};
 
     struct MockAllocator;
 
@@ -836,6 +908,9 @@ mod tests {
         next_offset: Cell<u64>,
         allocated: RefCell<HashSet<Range<u64>>>,
         config: Rc<RefCell<MockAllocatorConfig>>,
+        /// Counts calls that arrived through the uninitialised path, so tests can
+        /// tell that the wrapper forwarded to it rather than to `alloc`/`realloc`.
+        uninit_calls: Cell<u64>,
     }
 
     impl ControllableMockAllocator {
@@ -845,7 +920,27 @@ mod tests {
                 next_offset: Cell::new(0),
                 allocated: RefCell::new(HashSet::new()),
                 config,
+                uninit_calls: Cell::new(0),
             }
+        }
+    }
+
+    // The mock has no real storage to scrub, so its uninitialised path is the
+    // initialised one plus a counter; what is under test is the wrapper's
+    // forwarding and bookkeeping, not the inner allocator's byte behaviour.
+    impl BStackUninitAllocator for ControllableMockAllocator {
+        fn alloc_uninit(&self, len: u64) -> io::Result<Self::Allocated<'_>> {
+            self.uninit_calls.set(self.uninit_calls.get() + 1);
+            self.alloc(len)
+        }
+
+        fn realloc_uninit<'a>(
+            &'a self,
+            handle: Self::Allocated<'a>,
+            new_len: u64,
+        ) -> Result<Self::Allocated<'a>, BStackAllocError<'a, Self>> {
+            self.uninit_calls.set(self.uninit_calls.get() + 1);
+            self.realloc(handle, new_len)
         }
     }
 
@@ -1005,6 +1100,79 @@ mod tests {
         alloc.dealloc(handle1).map_err(|e| e.source)?;
         alloc.dealloc(handle2).map_err(|e| e.source)?;
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_alloc_uninit_forwards_and_tracks() -> io::Result<()> {
+        let (stack, path) = create_test_stack()?;
+        let _guard = TestGuard(path);
+        let config = Rc::new(RefCell::new(MockAllocatorConfig::default()));
+        let inner = ControllableMockAllocator::new(stack, config.clone());
+        let alloc = DebugCheckingAllocator::new(inner);
+
+        let handle = alloc.alloc_uninit(100)?;
+        assert_eq!(
+            alloc.inner().uninit_calls.get(),
+            1,
+            "must reach alloc_uninit"
+        );
+        {
+            let state = alloc.state.lock().unwrap();
+            assert!(state.allocated.contains(&(0..100)));
+        }
+
+        // The region is tracked exactly as an `alloc` one, so freeing it clears it.
+        alloc.dealloc(handle).map_err(|e| e.source)?;
+        let state = alloc.state.lock().unwrap();
+        assert!(!state.allocated.contains(&(0..100)));
+        assert!(state.freed.contains(&(0..100)));
+        Ok(())
+    }
+
+    #[test]
+    fn test_realloc_uninit_forwards_and_tracks() -> io::Result<()> {
+        let (stack, path) = create_test_stack()?;
+        let _guard = TestGuard(path);
+        let config = Rc::new(RefCell::new(MockAllocatorConfig::default()));
+        let inner = ControllableMockAllocator::new(stack, config.clone());
+        let alloc = DebugCheckingAllocator::new(inner);
+
+        let handle = alloc.alloc(100)?;
+        let new_handle = alloc.realloc_uninit(handle, 200).map_err(|e| e.source)?;
+        assert_eq!(
+            alloc.inner().uninit_calls.get(),
+            1,
+            "must reach realloc_uninit"
+        );
+
+        let state = alloc.state.lock().unwrap();
+        assert!(!state.allocated.contains(&(0..100)), "old region retired");
+        assert!(state.allocated.contains(&(100..300)), "new region tracked");
+        drop(state);
+        alloc.dealloc(new_handle).map_err(|e| e.source)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_realloc_uninit_failure_returns_surviving_handle() -> io::Result<()> {
+        let (stack, path) = create_test_stack()?;
+        let _guard = TestGuard(path);
+        let config = Rc::new(RefCell::new(MockAllocatorConfig::default()));
+        let inner = ControllableMockAllocator::new(stack, config.clone());
+        let alloc = DebugCheckingAllocator::new(inner);
+
+        let handle = alloc.alloc(100)?;
+        config.borrow_mut().fail_realloc = true;
+        let err = alloc
+            .realloc_uninit(handle, 200)
+            .expect_err("mock realloc must fail");
+        let recovered = err.handle.expect("the original region survives");
+        assert_eq!((recovered.start(), recovered.len()), (0, 100));
+
+        // Still tracked as live, so a later free is not reported as a double-free.
+        let state = alloc.state.lock().unwrap();
+        assert!(state.allocated.contains(&(0..100)));
         Ok(())
     }
 

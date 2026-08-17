@@ -992,6 +992,7 @@ the trait as a thin wrapper around `alloc`/`realloc` or not implement it at all.
 
 `SlabBStackAllocator` and `GhostTreeBstackAllocator` implement it;
 `LinearBStackAllocator` does not, since its zero-fill is already free.
+`DebugCheckingAllocator<A>` forwards both methods when `A` implements them.
 
 ### `BStackOwnedSlice<'a, A>`
 

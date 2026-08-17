@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`DebugCheckingAllocator<A>` forwards `BStackUninitAllocator`** (`alloc`). When the wrapped allocator implements the trait, the wrapper does too, with the same overlap and double-free tracking as `alloc`/`realloc`.
 - **`BStackUninitAllocator` implemented for `SlabBStackAllocator` and `GhostTreeBstackAllocator`** (`alloc` + `set`). Both now provide `alloc_uninit`/`realloc_uninit`, skipping the zero-fill of newly allocated or newly grown bytes. `LinearBStackAllocator` does not implement it: its zero-fill is already free. Rust only.
 - **`bstack_unsafe_reborrow!` / `bstack_unsafe_reborrow_mut!` and the `reborrow` module (base API): standardised lifetime-extending reborrows for `process_gen` / `inplace_gen` generators.** Replaces the `core::mem::transmute` that call sites previously open-coded to hand an op a scratch buffer captured by the closure (`E0521: borrowed data escapes outside of closure`). The macros change the borrow's lifetime and nothing else — the referent type is fixed by the underlying helper's signature, where an inferred-target `transmute` could silently reinterpret the pointee — and need no `unsafe` block at the call site, the `unsafe` in the name carrying the marking. The safety obligations, including `inplace_gen`'s stricter one (staged `Write` payloads are retained, so their buffers stay frozen until the batch commits), are documented on the module. No feature gate; no behaviour change.
 

@@ -43,7 +43,8 @@
 //!   zero-fill of newly allocated or grown bytes, returning **unspecified**
 //!   (but always valid-to-read) contents for callers that overwrite the region
 //!   immediately.  Implemented by [`SlabBStackAllocator`] and
-//!   [`GhostTreeBstackAllocator`]; see
+//!   [`GhostTreeBstackAllocator`], and forwarded by [`DebugCheckingAllocator`];
+//!   see
 //!   [Uninitialised allocation](#uninitialised-allocation).
 //!
 //! * [`BStackOwnedSliceAllocator`] — convenience supertrait:
@@ -101,6 +102,11 @@
 //! already owns.  Neither allocator drops a write it needs for its own metadata
 //! or free-space invariants, so crash consistency, recovery, and the `handle`
 //! contract on failure are identical to the initialised methods.
+//!
+//! [`DebugCheckingAllocator<A>`](DebugCheckingAllocator) forwards both methods,
+//! with the same overlap and double-free tracking as `alloc`/`realloc`, but only
+//! when `A` implements the trait itself — it never fabricates the trait for an
+//! allocator that has no cheaper uninitialised path.
 //!
 //! The remaining built-in allocators do not implement the trait yet.
 //!
