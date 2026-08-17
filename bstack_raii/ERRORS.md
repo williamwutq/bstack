@@ -1,23 +1,26 @@
 # `bstack_raii` macro error codes
 
-Every compile-time error reported by the `#[bstack_block]`, `#[bstack_enum]`,
-`bstack_move!`, and `bstack_cast!` macros carries a stable `[BSTACKxxxx]` code.
-This file explains each one — what triggers it and how to fix it. The message text
+Most errors reported by the `#[bstack_block]`, `#[bstack_enum]`, `bstack_move!`,
+and `bstack_cast!` macros are **compile-time** and carry a stable `[BSTACKxxxx]`
+code. The one exception is the `08xx` domain, which is **runtime** — `io::Error`s
+raised by the RTTI subsystem when reading, writing, or syncing a schema file.
+This file explains each code — what triggers it and how to fix it. The message text
 itself always states the fix too; this is the longer-form reference.
 
 Codes are grouped by domain (the ranges are permanent; individual numbers never
 change meaning):
 
-| Range        | Domain                             |
-|--------------|------------------------------------|
-| `BSTACK00xx` | Attributes & macro arguments       |
-| `BSTACK01xx` | Field / type shapes                |
-| `BSTACK02xx` | Enum variants & discriminants      |
-| `BSTACK03xx` | Cross-file pointers (`Foreign<T>`) |
-| `BSTACK04xx` | Generic blocks                     |
-| `BSTACK05xx` | `#[embed]`                         |
-| `BSTACK06xx` | `#[bstack_mut]`                    |
-| `BSTACK07xx` | `bstack_cast!` / `bstack_move!`    |
+| Range        | Domain                             | When    |
+|--------------|------------------------------------|---------|
+| `BSTACK00xx` | Attributes & macro arguments       | compile |
+| `BSTACK01xx` | Field / type shapes                | compile |
+| `BSTACK02xx` | Enum variants & discriminants      | compile |
+| `BSTACK03xx` | Cross-file pointers (`Foreign<T>`) | compile |
+| `BSTACK04xx` | Generic blocks                     | compile |
+| `BSTACK05xx` | `#[embed]`                         | compile |
+| `BSTACK06xx` | `#[bstack_mut]`                    | compile |
+| `BSTACK07xx` | `bstack_cast!` / `bstack_move!`    | compile |
+| `BSTACK08xx` | RTTI schema I/O (`rtti`)           | runtime |
 
 ---
 
@@ -266,3 +269,51 @@ An owned downcast needs `BStackOwned<BlockType, _>`. **Fix:** name the block typ
 ### BSTACK0705 — malformed `bstack_move!` invocation
 `bstack_move!` takes either `handle` or `owned, allocator`. **Fix:** call it as
 `bstack_move!(handle)` or `bstack_move!(owned, &alloc)`.
+
+---
+
+## RTTI schema I/O — `rtti` (`08xx`)
+
+Unlike every domain above, these are **runtime** `io::Error`s (not compile
+errors): they come out of `rtti::sync` / `RttiRegistry` while reading, writing, or
+syncing a persisted schema file. A code in the `08xx` range is either a corrupt /
+truncated file (`InvalidData`) or a lookup miss (`NotFound`).
+
+### BSTACK0800 — duplicate RTTI eightcc in the file
+Scanning or appending found the **same eightcc twice** in one RTTI stack. Because a
+tag is the resolution key, a stack may hold each type at most once. **Fix:** the file
+is corrupt (or two types were force-appended under one tag) — rebuild it from the
+compiled-in schema via `rtti::sync` against a fresh path. (Distinct *types* colliding
+on one tag is [`BSTACK0806`](#bstack0806--rtti-eightcc-collision) instead.)
+
+### BSTACK0801 — RTTI ordinal out of range
+A `type_index` / ordinal was resolved against a stack that has no record at that
+position (e.g. a pointer typed by a file that carried more types than this one).
+**Fix:** `sync` the schema file so every referenced type is present, or verify the
+pointer was written against the same schema stack you are resolving it against.
+
+### BSTACK0802 — RTTI name is not valid UTF-8
+A type or field name in a record body is not valid UTF-8. **Fix:** the record is
+corrupt; re-`sync` from the compiled-in schema (names are always written as UTF-8).
+
+### BSTACK0803 — unknown RTTI shape tag
+A field's shape byte is not one of the defined `Shape` tags (see `BYTECODE.md`).
+**Fix:** the file was written by a newer/other producer or is corrupt — regenerate
+it with a matching `bstack_raii` version.
+
+### BSTACK0804 — truncated RTTI record
+A read ran past the end of a record body (a length field claims more bytes than the
+body holds, or an alignment skip overran). **Fix:** the file is corrupt or partially
+written; rebuild it via `rtti::sync`.
+
+### BSTACK0805 — RTTI field shape length mismatch
+A field's stored `shape_len` disagrees with the bytes its shape actually decoded to.
+**Fix:** the record framing is corrupt; regenerate the file.
+
+### BSTACK0806 — RTTI eightcc collision
+Two **distinct** types (different names) hash to the **same eightcc** — detected on
+the write side by `rtti::sync`, either between two compiled-in types or between a
+compiled-in type and one already on disk. Unlike the static macro path (where a
+collision is a mere failed check), here the tag *is* the identity, so this is a hard
+error rather than silent overwrite. **Fix:** rename one of the colliding types, or
+give it an explicit distinct `tag = "..."`.
