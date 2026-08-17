@@ -1,4 +1,4 @@
-error: a tuple is not supported as a `Vec` element: a `Vec` element must be a single leaf — POD, or a block reference — and a tuple (a POD one has no `Vec` layout, a `(ref, pod)` one cannot be split into offset + inline bytes) is neither. Wrap it in a named `#[bstack_block]` struct and store `Vec<ThatStruct>` (annotating each reference field inside it, leaving POD fields plain).
+error: [BSTACK0103] a tuple is not supported as a `Vec` element: a `Vec` element must be a single leaf — POD, or a block reference — and a tuple (a POD one has no `Vec` layout, a `(ref, pod)` one cannot be split into offset + inline bytes) is neither. Wrap it in a named `#[bstack_block]` struct and store `Vec<ThatStruct>` (annotating each reference field inside it, leaving POD fields plain).
   --> tests/hypercube/ui/foreign_in_tuple_in_vec.rs:10:12
    |
 10 |     v: Vec<(u32, bstack_raii::Foreign<Leaf>)>,

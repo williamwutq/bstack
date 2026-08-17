@@ -1,4 +1,4 @@
-error: #[embed] does not support `Option`
+error: [BSTACK0503] #[embed] does not support `Option`
  --> tests/hypercube/ui/embed_option.rs:6:8
   |
 6 |     f: Option<u32>,

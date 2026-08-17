@@ -161,7 +161,7 @@ pub fn bstack_move(input: TokenStream) -> TokenStream {
         _ => {
             return syn::Error::new(
                 proc_macro2::Span::call_site(),
-                "bstack_move! takes `handle` or `owned, allocator`",
+                "[BSTACK0705] bstack_move! takes `handle` or `owned, allocator`",
             )
             .to_compile_error()
             .into();

@@ -82,7 +82,7 @@ pub(crate) fn reject_nested_const_dims(
     {
         return Err(Error::new_spanned(
             span,
-            "a nested array `[[T; N]; M]` with a const-parameter dimension is not supported: \
+            "[BSTACK0407] a nested array `[[T; N]; M]` with a const-parameter dimension is not supported: \
              its flattened length would be a const expression (`N * M`), which stable Rust \
              forbids from using a generic parameter. Use a single `[T; N]`, or make the \
              dimensions concrete.",
@@ -115,7 +115,7 @@ pub(crate) fn vec_inner(ty: &Type) -> Option<&Type> {
 pub(crate) fn err_double_option(ty: &Type) -> Error {
     Error::new_spanned(
         ty,
-        "nested `Option<Option<T>>` is not supported: a field / `Vec` slot lowers a \
+        "[BSTACK0101] nested `Option<Option<T>>` is not supported: a field / `Vec` slot lowers a \
          single `Option` to the absent/`0` niche, and a second layer has nowhere to \
          live on disk. Model the states explicitly with a `#[bstack_enum]`, e.g. \
          `enum Slot { Missing, Empty, Present(T) }`.",
@@ -127,7 +127,7 @@ pub(crate) fn err_double_option(ty: &Type) -> Error {
 pub(crate) fn err_vec_in_vec(ty: &Type) -> Error {
     Error::new_spanned(
         ty,
-        "nested `Vec<Vec<T>>` / `Vec<String>` is not supported: a `Vec` field stores one \
+        "[BSTACK0102] nested `Vec<Vec<T>>` / `Vec<String>` is not supported: a `Vec` field stores one \
          inline descriptor whose elements are a single leaf (POD or a block reference), \
          not another dynamically-sized region. Wrap the inner vector in an explicit \
          `#[bstack_block]` struct and store `Vec<ThatStruct>` (annotating the element \
@@ -140,7 +140,7 @@ pub(crate) fn err_vec_in_vec(ty: &Type) -> Error {
 pub(crate) fn err_tuple_in_vec(ty: &Type) -> Error {
     Error::new_spanned(
         ty,
-        "a tuple is not supported as a `Vec` element: a `Vec` element must be a single \
+        "[BSTACK0103] a tuple is not supported as a `Vec` element: a `Vec` element must be a single \
          leaf — POD, or a block reference — and a tuple (a POD one has no `Vec` layout, \
          a `(ref, pod)` one cannot be split into offset + inline bytes) is neither. Wrap \
          it in a named `#[bstack_block]` struct and store `Vec<ThatStruct>` (annotating \
@@ -268,7 +268,7 @@ pub(crate) fn validate_foreign_target(
             return Err(Error::new_spanned(
                 span,
                 format!(
-                    "{what} needs an ownership annotation naming the target's kind \
+                    "[BSTACK0302] {what} needs an ownership annotation naming the target's kind \
                      (`#[bstack_owned/strong/weak/ref]`); a bare foreign pointer targets a block"
                 ),
             ));
@@ -276,7 +276,7 @@ pub(crate) fn validate_foreign_target(
         Kind::Embed => {
             return Err(Error::new_spanned(
                 span,
-                "`Foreign<T>` is a pointer and cannot be `#[embed]`ed",
+                "[BSTACK0301] `Foreign<T>` is a pointer and cannot be `#[embed]`ed",
             ));
         }
     }
@@ -326,7 +326,7 @@ pub(crate) fn reject_bad_foreign_target(
         return Err(Error::new_spanned(
             span,
             format!(
-                "{what}: a `Foreign` cannot point at another `Foreign` — a pointer to a \
+                "[BSTACK0303] {what}: a `Foreign` cannot point at another `Foreign` — a pointer to a \
                  pointer is not allowed. {bridge}. (A collection OF pointers such as \
                  `Vec<Foreign<T>>` / `[Foreign<T>; N]` IS allowed; it is a pointer TO a \
                  pointer/collection that is not.)"
@@ -338,7 +338,7 @@ pub(crate) fn reject_bad_foreign_target(
             return Err(Error::new_spanned(
                 span,
                 format!(
-                    "{what}: `Foreign<Option<Foreign<T>>>` is a double `Foreign` (a pointer to a \
+                    "[BSTACK0304] {what}: `Foreign<Option<Foreign<T>>>` is a double `Foreign` (a pointer to a \
                      nullable pointer). {bridge}."
                 ),
             ));
@@ -346,7 +346,7 @@ pub(crate) fn reject_bad_foreign_target(
         return Err(Error::new_spanned(
             span,
             format!(
-                "{what}: use `Option<Foreign<T>>` for a nullable foreign pointer, not \
+                "[BSTACK0305] {what}: use `Option<Foreign<T>>` for a nullable foreign pointer, not \
                  `Foreign<Option<T>>` — nullability belongs on the field/element, and a null \
                  element is a `Foreign` with offset 0, not a pointer to a nullable value."
             ),
@@ -356,7 +356,7 @@ pub(crate) fn reject_bad_foreign_target(
         return Err(Error::new_spanned(
             span,
             format!(
-                "{what}: a `Foreign` target must be a `#[bstack_block]`, not a `Vec` / `String`. \
+                "[BSTACK0306] {what}: a `Foreign` target must be a `#[bstack_block]`, not a `Vec` / `String`. \
                  `Vec<Foreign<T>>` (a vector OF pointers) is allowed, but `Foreign<Vec<T>>` (a \
                  pointer TO a vector) is not — {bridge}."
             ),
@@ -366,7 +366,7 @@ pub(crate) fn reject_bad_foreign_target(
         return Err(Error::new_spanned(
             span,
             format!(
-                "{what}: a `Foreign` target must be a `#[bstack_block]`, not an array. \
+                "[BSTACK0307] {what}: a `Foreign` target must be a `#[bstack_block]`, not an array. \
                  `[Foreign<T>; N]` (an array OF pointers) is allowed, but `Foreign<[T; N]>` is \
                  not — {bridge}."
             ),
@@ -376,7 +376,7 @@ pub(crate) fn reject_bad_foreign_target(
         return Err(Error::new_spanned(
             span,
             format!(
-                "{what}: a `Foreign` target must be a `#[bstack_block]`, not a tuple — {bridge}."
+                "[BSTACK0308] {what}: a `Foreign` target must be a `#[bstack_block]`, not a tuple — {bridge}."
             ),
         ));
     }
@@ -510,7 +510,7 @@ pub(crate) fn array_shape(ty: &Type) -> syn::Result<(Vec<&Expr>, &Type, bool)> {
     if let Type::Array(_) = leaf {
         return Err(Error::new_spanned(
             cur,
-            "`Option` wrapping a whole sub-array is not supported; move the \
+            "[BSTACK0104] `Option` wrapping a whole sub-array is not supported; move the \
              `Option` onto the leaf element, e.g. `[[Option<T>; N]; M]`",
         ));
     }
@@ -664,7 +664,7 @@ pub(crate) fn parse_attr(attr: TokenStream) -> syn::Result<Attr> {
                             lit: Lit::Str(s), ..
                         }) => s.value(),
                         other => {
-                            return Err(Error::new_spanned(other, "expected a string literal"));
+                            return Err(Error::new_spanned(other, "[BSTACK0004] expected a string literal"));
                         }
                     };
                     match ident_of(&nv.path).as_deref() {
@@ -678,7 +678,7 @@ pub(crate) fn parse_attr(attr: TokenStream) -> syn::Result<Attr> {
                     let r: Ident = list.parse_args().map_err(|_| {
                         Error::new_spanned(
                             list,
-                            "expected `repr(u8|u16|u32|u64|i8|i16|i32|i64|aligned)`",
+                            "[BSTACK0005] expected `repr(u8|u16|u32|u64|i8|i16|i32|i64|aligned)`",
                         )
                     })?;
                     repr = Some(match r.to_string().as_str() {
@@ -691,14 +691,14 @@ pub(crate) fn parse_attr(attr: TokenStream) -> syn::Result<Attr> {
                         "usize" | "isize" => {
                             return Err(Error::new_spanned(
                                 &r,
-                                "`repr(usize)` / `repr(isize)` are not allowed — bstack offsets \
+                                "[BSTACK0006] `repr(usize)` / `repr(isize)` are not allowed — bstack offsets \
                                  are 64-bit, so pick an explicit width (e.g. `repr(u64)`)",
                             ));
                         }
                         _ => {
                             return Err(Error::new_spanned(
                                 &r,
-                                "expected `u8|u16|u32|u64|i8|i16|i32|i64|aligned`",
+                                "[BSTACK0005] expected `u8|u16|u32|u64|i8|i16|i32|i64|aligned`",
                             ));
                         }
                     });
@@ -720,7 +720,7 @@ pub(crate) fn parse_attr(attr: TokenStream) -> syn::Result<Attr> {
                             _ => {
                                 return Err(Error::new_spanned(
                                     &lint,
-                                    "expected `overlong_tag`, `coerced_ref`, or `deprecated`",
+                                    "[BSTACK0007] expected `overlong_tag`, `coerced_ref`, or `deprecated`",
                                 ));
                             }
                         }
@@ -738,7 +738,7 @@ pub(crate) fn parse_attr(attr: TokenStream) -> syn::Result<Attr> {
         (false, true) => {
             return Err(Error::new(
                 Span::call_site(),
-                "`weak` requires `rc` (use `rc, weak`)",
+                "[BSTACK0002] `weak` requires `rc` (use `rc, weak`)",
             ));
         }
     };
@@ -765,7 +765,7 @@ pub(crate) fn is_allow_deprecated(attr: &syn::Attribute) -> bool {
 }
 
 pub(crate) fn unknown_opt() -> &'static str {
-    "expected `rc`, `weak`, `tag = \"...\"`, `ctrl_tag = \"...\"`, `allow(...)`, or (enums) `repr(...)`"
+    "[BSTACK0003] expected `rc`, `weak`, `tag = \"...\"`, `ctrl_tag = \"...\"`, `allow(...)`, or (enums) `repr(...)`"
 }
 
 // ---------------------------------------------------------------------------
@@ -908,7 +908,7 @@ pub(crate) fn classify_attrs(attrs: &[syn::Attribute]) -> syn::Result<Kind> {
         if found.is_some() {
             return Err(Error::new_spanned(
                 attr,
-                "at most one bstack ownership annotation is allowed here",
+                "[BSTACK0001] at most one bstack ownership annotation is allowed here",
             ));
         }
         found = Some(kind);
@@ -959,12 +959,12 @@ pub(crate) fn parse_disc_expr(expr: &Expr) -> syn::Result<i128> {
             }) => Ok(-li.base10_parse::<i128>()?),
             other => Err(Error::new_spanned(
                 other,
-                "expected an integer literal discriminant",
+                "[BSTACK0204] expected an integer literal discriminant",
             )),
         },
         other => Err(Error::new_spanned(
             other,
-            "expected an integer literal discriminant",
+            "[BSTACK0204] expected an integer literal discriminant",
         )),
     }
 }

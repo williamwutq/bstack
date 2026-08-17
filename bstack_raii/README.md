@@ -46,6 +46,7 @@ object model on top.
 - [Standard library collections](#standard-library-collections)
 - [Examples](#examples)
 - [Limitations](#limitations)
+- [Error codes](#error-codes)
 
 ## Quick start
 
@@ -1183,6 +1184,20 @@ Runnable end-to-end programs live in [`examples/`](examples/):
   share an `rc` block. `bstack_move!` only works on `BStackBox`; the others have
   no meaningful field-destructure.
 - The on-disk **ABI is not yet stable**.
+
+## Error codes
+
+Every compile-time error from the `#[bstack_block]`, `#[bstack_enum]`,
+`bstack_move!`, and `bstack_cast!` macros carries a stable `[BSTACKxxxx]` code, e.g.:
+
+```text
+error: [BSTACK0301] `Foreign` is a pointer and cannot be `#[embed]`ed
+```
+
+The message states the fix inline; **[ERRORS.md](ERRORS.md)** is the full reference,
+with one entry per code (grouped by domain — attributes `00xx`, field shapes `01xx`,
+enums `02xx`, `Foreign` `03xx`, generics `04xx`, `#[embed]` `05xx`, `#[bstack_mut]`
+`06xx`, cast/move macros `07xx`).
 
 ## License
 

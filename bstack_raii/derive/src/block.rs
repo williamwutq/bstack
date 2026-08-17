@@ -24,7 +24,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
     if attr.repr.is_some() {
         return Err(Error::new(
             Span::call_site(),
-            "`repr(..)` selects an enum discriminant width; it is only for #[bstack_enum]",
+            "[BSTACK0008] `repr(..)` selects an enum discriminant width; it is only for #[bstack_enum]",
         ));
     }
 
@@ -43,7 +43,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
             if matches!(p, syn::GenericParam::Lifetime(_)) {
                 return Err(Error::new_spanned(
                     p,
-                    "a generic #[bstack_block] currently supports type and const parameters, \
+                    "[BSTACK0401] a generic #[bstack_block] currently supports type and const parameters, \
                      not lifetimes",
                 ));
             }
@@ -51,7 +51,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         if mode != Mode::Plain {
             return Err(Error::new_spanned(
                 &input.generics,
-                "a generic #[bstack_block] currently supports plain mode only (not `rc` / \
+                "[BSTACK0402] a generic #[bstack_block] currently supports plain mode only (not `rc` / \
                  `rc, weak`)",
             ));
         }
@@ -147,7 +147,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
             if !ftargets.is_empty() {
                 return Err(Error::new_spanned(
                     &field.ty,
-                    "a generic type parameter in a non-`Foreign` position of a field that also \
+                    "[BSTACK0405] a generic type parameter in a non-`Foreign` position of a field that also \
                      holds a `Foreign` is not supported; use concrete types for the non-foreign parts",
                 ));
             }
@@ -177,7 +177,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         if u.pod && u.blockish {
             return Err(Error::new_spanned(
                 p,
-                "a generic type parameter cannot be used both as a POD field and as a \
+                "[BSTACK0404] a generic type parameter cannot be used both as a POD field and as a \
                  reference / embed field — a `Pod` value and a `#[bstack_block]` reference are \
                  different kinds of thing, with incompatible bounds",
             ));
@@ -366,7 +366,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         {
             return Err(Error::new_spanned(
                 &field.ty,
-                "`Foreign` is nested in an unsupported position (e.g. inside a tuple or another \
+                "[BSTACK0108] `Foreign` is nested in an unsupported position (e.g. inside a tuple or another \
                  POD aggregate). It is supported as a scalar `Foreign<T>` / `Option<Foreign<T>>`, \
                  a `Vec<Foreign<T>>` / `Vec<Option<Foreign<T>>>`, or a `[Foreign<T>; N]` — \
                  anywhere else, wrap the `Foreign` inside a `#[bstack_block]` struct and use that.",
@@ -388,7 +388,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         {
             return Err(Error::new_spanned(
                 field,
-                "#[bstack_mut] is not yet supported on `Foreign` inside a container or \
+                "[BSTACK0602] #[bstack_mut] is not yet supported on `Foreign` inside a container or \
                  tuple (`Vec<Foreign>`, `[Foreign; N]`, a foreign tuple) — only a scalar \
                  `Foreign<T>` / `Option<Foreign<T>>` field is mutable",
             ));

@@ -27,7 +27,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
             if !matches!(p, syn::GenericParam::Type(_)) {
                 return Err(Error::new_spanned(
                     p,
-                    "a generic #[bstack_enum] currently supports only type parameters (no \
+                    "[BSTACK0403] a generic #[bstack_enum] currently supports only type parameters (no \
                      lifetime or const generics)",
                 ));
             }
@@ -35,7 +35,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
         if mode != Mode::Plain {
             return Err(Error::new_spanned(
                 &input.generics,
-                "a generic #[bstack_enum] currently supports plain mode only (not `rc` / \
+                "[BSTACK0402] a generic #[bstack_enum] currently supports plain mode only (not `rc` / \
                  `rc, weak`)",
             ));
         }
@@ -64,7 +64,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
         if is_bstack_mut(&variant.attrs) {
             return Err(Error::new_spanned(
                 variant,
-                "#[bstack_mut] on a `#[bstack_enum]` goes on the enum itself (a whole-value \
+                "[BSTACK0603] #[bstack_mut] on a `#[bstack_enum]` goes on the enum itself (a whole-value \
                  `set` / `replace`), not on a variant — a variant has no separately \
                  mutable field",
             ));
@@ -77,7 +77,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
             if ftargets.is_empty() && (kind == Kind::Pod || kind == Kind::Embed) {
                 return Err(Error::new_spanned(
                     &f.ty,
-                    "a generic type parameter in a `#[bstack_enum]` variant must be a reference \
+                    "[BSTACK0406] a generic type parameter in a `#[bstack_enum]` variant must be a reference \
                      (`#[bstack_owned]` / `#[bstack_strong]` / `#[bstack_weak]` / `#[bstack_ref]`), \
                      not stored inline — a POD or `#[embed]` variant's payload width would depend \
                      on the parameter",
@@ -91,7 +91,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                 if !ftargets.is_empty() && !is_ftarget {
                     return Err(Error::new_spanned(
                         &f.ty,
-                        "a generic type parameter in a non-`Foreign` position of a `Foreign` \
+                        "[BSTACK0405] a generic type parameter in a non-`Foreign` position of a `Foreign` \
                          variant is not supported; use concrete types for the non-foreign parts",
                     ));
                 }
@@ -684,7 +684,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
         if mode != Mode::Plain {
             return Err(Error::new_spanned(
                 &input.ident,
-                "#[bstack_mut] on a `#[bstack_enum]` is only supported for a plain enum — a \
+                "[BSTACK0604] #[bstack_mut] on a `#[bstack_enum]` is only supported for a plain enum — a \
                  shared (`rc` / `rc, weak`) enum's refcount / control block can't be \
                  overwritten in place; rebuild the value instead",
             ));
@@ -692,7 +692,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
         if enum_has_embed {
             return Err(Error::new_spanned(
                 &input.ident,
-                "#[bstack_mut] is not yet supported on a `#[bstack_enum]` with an `#[embed]` \
+                "[BSTACK0605] #[bstack_mut] is not yet supported on a `#[bstack_enum]` with an `#[embed]` \
                  variant",
             ));
         }

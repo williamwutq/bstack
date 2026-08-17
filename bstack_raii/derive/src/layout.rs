@@ -38,13 +38,13 @@ pub(crate) fn discriminants(
             if out.contains(&d) {
                 return Err(Error::new_spanned(
                     v,
-                    format!("discriminant value `{d}` assigned more than once"),
+                    format!("[BSTACK0201] discriminant value `{d}` assigned more than once"),
                 ));
             }
             out.push(d);
             next = d
                 .checked_add(1)
-                .ok_or_else(|| Error::new_spanned(v, "#[bstack_enum] discriminant overflow"))?;
+                .ok_or_else(|| Error::new_spanned(v, "[BSTACK0202] #[bstack_enum] discriminant overflow"))?;
         }
         out
     };
@@ -57,7 +57,7 @@ pub(crate) fn discriminants(
                 return Err(Error::new_spanned(
                     variants,
                     format!(
-                        "a discriminant value is out of range for `repr({r})` \
+                        "[BSTACK0203] a discriminant value is out of range for `repr({r})` \
                          (values span {dmin}..={dmax})"
                     ),
                 ));

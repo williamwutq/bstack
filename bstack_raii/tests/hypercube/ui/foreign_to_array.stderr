@@ -1,4 +1,4 @@
-error: `Foreign<T>`: a `Foreign` target must be a `#[bstack_block]`, not an array. `[Foreign<T>; N]` (an array OF pointers) is allowed, but `Foreign<[T; N]>` is not — bridge it inside an explicit `#[bstack_block]` struct and point the `Foreign` at that struct.
+error: [BSTACK0307] `Foreign<T>`: a `Foreign` target must be a `#[bstack_block]`, not an array. `[Foreign<T>; N]` (an array OF pointers) is allowed, but `Foreign<[T; N]>` is not — bridge it inside an explicit `#[bstack_block]` struct and point the `Foreign` at that struct.
   --> tests/hypercube/ui/foreign_to_array.rs:10:11
    |
 10 |     link: bstack_raii::Foreign<[Leaf; 4]>,

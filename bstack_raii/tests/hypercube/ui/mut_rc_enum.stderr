@@ -1,4 +1,4 @@
-error: #[bstack_mut] on a `#[bstack_enum]` is only supported for a plain enum — a shared (`rc` / `rc, weak`) enum's refcount / control block can't be overwritten in place; rebuild the value instead
+error: [BSTACK0604] #[bstack_mut] on a `#[bstack_enum]` is only supported for a plain enum — a shared (`rc` / `rc, weak`) enum's refcount / control block can't be overwritten in place; rebuild the value instead
  --> tests/hypercube/ui/mut_rc_enum.rs:5:6
   |
 5 | enum E {

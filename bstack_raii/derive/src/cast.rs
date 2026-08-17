@@ -19,7 +19,7 @@ pub fn expand(input: TokenStream) -> syn::Result<TokenStream> {
     let cast: ExprCast = syn::parse2(input).map_err(|_| {
         Error::new(
             proc_macro2::Span::call_site(),
-            "bstack_cast! expects `expr as Target` (e.g. `bstack_cast!(slice as BStackOwned<X, _>)`)",
+            "[BSTACK0701] bstack_cast! expects `expr as Target` (e.g. `bstack_cast!(slice as BStackOwned<X, _>)`)",
         )
     })?;
     let expr = &cast.expr;
@@ -28,7 +28,7 @@ pub fn expand(input: TokenStream) -> syn::Result<TokenStream> {
     let Type::Path(tp) = ty else {
         return Err(Error::new_spanned(
             ty,
-            "bstack_cast!: target must be a type path",
+            "[BSTACK0702] bstack_cast!: target must be a type path",
         ));
     };
     let seg = tp.path.segments.last().expect("non-empty path");
@@ -38,7 +38,7 @@ pub fn expand(input: TokenStream) -> syn::Result<TokenStream> {
         "BStackSlice" => {
             return Err(Error::new_spanned(
                 ty,
-                "bstack_cast! can't build a borrowed slice (it needs a stack); \
+                "[BSTACK0703] bstack_cast! can't build a borrowed slice (it needs a stack); \
                  use `handle.as_slice(stack)` instead",
             ));
         }
@@ -72,6 +72,6 @@ fn first_type_arg(seg: &syn::PathSegment) -> syn::Result<&Type> {
     }
     Err(Error::new_spanned(
         seg,
-        "expected `BStackOwned<BlockType, _>` for an owned downcast",
+        "[BSTACK0704] expected `BStackOwned<BlockType, _>` for an owned downcast",
     ))
 }

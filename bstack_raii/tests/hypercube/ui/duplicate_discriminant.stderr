@@ -1,4 +1,4 @@
-error: discriminant value `1` assigned more than once
+error: [BSTACK0201] discriminant value `1` assigned more than once
  --> tests/hypercube/ui/duplicate_discriminant.rs:6:5
   |
 6 |     B = 1,

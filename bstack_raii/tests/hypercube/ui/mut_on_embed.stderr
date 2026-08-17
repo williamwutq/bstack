@@ -1,4 +1,4 @@
-error: #[bstack_mut] is not yet supported on #[embed] fields
+error: [BSTACK0601] #[bstack_mut] is not yet supported on #[embed] fields
   --> tests/hypercube/ui/mut_on_embed.rs:9:5
    |
  9 | /     #[bstack_mut]

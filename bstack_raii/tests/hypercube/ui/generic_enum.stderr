@@ -1,4 +1,4 @@
-error: a generic type parameter in a `#[bstack_enum]` variant must be a reference (`#[bstack_owned]` / `#[bstack_strong]` / `#[bstack_weak]` / `#[bstack_ref]`), not stored inline — a POD or `#[embed]` variant's payload width would depend on the parameter
+error: [BSTACK0406] a generic type parameter in a `#[bstack_enum]` variant must be a reference (`#[bstack_owned]` / `#[bstack_strong]` / `#[bstack_weak]` / `#[bstack_ref]`), not stored inline — a POD or `#[embed]` variant's payload width would depend on the parameter
  --> tests/hypercube/ui/generic_enum.rs:5:7
   |
 5 |     A(T),

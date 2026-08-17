@@ -1,4 +1,4 @@
-error: #[bstack_mut] on a `#[bstack_enum]` goes on the enum itself (a whole-value `set` / `replace`), not on a variant — a variant has no separately mutable field
+error: [BSTACK0603] #[bstack_mut] on a `#[bstack_enum]` goes on the enum itself (a whole-value `set` / `replace`), not on a variant — a variant has no separately mutable field
  --> tests/hypercube/ui/mut_enum_variant.rs:5:5
   |
 5 | /     #[bstack_mut]

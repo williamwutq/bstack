@@ -1,4 +1,4 @@
-error: `Foreign<T>` needs an ownership annotation naming the target's kind (`#[bstack_owned/strong/weak/ref]`); a bare foreign pointer targets a block
+error: [BSTACK0302] `Foreign<T>` needs an ownership annotation naming the target's kind (`#[bstack_owned/strong/weak/ref]`); a bare foreign pointer targets a block
  --> tests/hypercube/ui/foreign_bare.rs:9:11
   |
 9 |     link: bstack_raii::Foreign<Leaf>,

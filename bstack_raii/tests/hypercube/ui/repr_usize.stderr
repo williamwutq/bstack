@@ -1,4 +1,4 @@
-error: `repr(usize)` / `repr(isize)` are not allowed — bstack offsets are 64-bit, so pick an explicit width (e.g. `repr(u64)`)
+error: [BSTACK0006] `repr(usize)` / `repr(isize)` are not allowed — bstack offsets are 64-bit, so pick an explicit width (e.g. `repr(u64)`)
  --> tests/hypercube/ui/repr_usize.rs:3:20
   |
 3 | #[bstack_enum(repr(usize))]

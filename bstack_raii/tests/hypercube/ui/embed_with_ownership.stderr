@@ -1,4 +1,4 @@
-error: at most one bstack ownership annotation is allowed here
+error: [BSTACK0001] at most one bstack ownership annotation is allowed here
  --> tests/hypercube/ui/embed_with_ownership.rs:6:5
   |
 6 |     #[bstack_owned]

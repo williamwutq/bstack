@@ -2317,7 +2317,7 @@ pub(crate) fn vec_field(
     if vinfo.is_string && kind != Kind::Pod {
         return Err(Error::new_spanned(
             &field.ty,
-            "`String` is always POD; remove the ownership annotation",
+            "[BSTACK0107] `String` is always POD; remove the ownership annotation",
         ));
     }
 
@@ -2784,7 +2784,7 @@ pub(crate) fn vec_field(
         Kind::Embed => {
             return Err(Error::new_spanned(
                 &field.ty,
-                "cannot #[embed] a `Vec` / `String`; embed a `#[bstack_block]` type",
+                "[BSTACK0501] cannot #[embed] a `Vec` / `String`; embed a `#[bstack_block]` type",
             ));
         }
         Kind::Pod => (
@@ -2912,20 +2912,20 @@ pub(crate) fn vec_array_field(
         if nullable {
             return Err(Error::new_spanned(
                 &field.ty,
-                "a whole-array `Option<[Vec<T>; N]>` is not supported; use \
+                "[BSTACK0110] a whole-array `Option<[Vec<T>; N]>` is not supported; use \
                          `[Option<Vec<T>>; N]` for per-element nullability",
             ));
         }
         if leaf_vinfo.is_string && kind != Kind::Pod {
             return Err(Error::new_spanned(
                 &field.ty,
-                "`String` is always POD; remove the ownership annotation",
+                "[BSTACK0107] `String` is always POD; remove the ownership annotation",
             ));
         }
         if kind == Kind::Embed {
             return Err(Error::new_spanned(
                 &field.ty,
-                "cannot #[embed] a `Vec` / `String`; embed a `#[bstack_block]` type",
+                "[BSTACK0501] cannot #[embed] a `Vec` / `String`; embed a `#[bstack_block]` type",
             ));
         }
         let total = dims_prod(&dims);
@@ -3152,7 +3152,7 @@ pub(crate) fn foreign_array_field(
         if nullable {
             return Err(Error::new_spanned(
                 &field.ty,
-                "a whole-array `Option<[Foreign<T>; N]>` is not supported; a null foreign \
+                "[BSTACK0111] a whole-array `Option<[Foreign<T>; N]>` is not supported; a null foreign \
                          element is a `Foreign` with offset 0, or use `[Option<Foreign<T>>; N]`",
             ));
         }
@@ -3319,7 +3319,7 @@ pub(crate) fn block_array_field(
     if nullable {
         return Err(Error::new_spanned(
             &field.ty,
-            "a whole-array `Option<[T; N]>` is not supported; use `[Option<T>; N]` \
+            "[BSTACK0105] a whole-array `Option<[T; N]>` is not supported; use `[Option<T>; N]` \
                      for per-element nullability",
         ));
     }
@@ -3334,13 +3334,13 @@ pub(crate) fn block_array_field(
         if elem_nullable {
             return Err(Error::new_spanned(
                 &field.ty,
-                "#[embed] does not support `Option`",
+                "[BSTACK0503] #[embed] does not support `Option`",
             ));
         }
         if is_bstack_mut(&field.attrs) {
             return Err(Error::new_spanned(
                 field,
-                "#[bstack_mut] is not yet supported on #[embed] fields",
+                "[BSTACK0601] #[bstack_mut] is not yet supported on #[embed] fields",
             ));
         }
         let child = elem;
@@ -3849,18 +3849,18 @@ pub(crate) fn foreign_tuple_field(
         Kind::Pod => {
             return Err(Error::new_spanned(
                 &field.ty,
-                "a tuple containing a `Foreign` needs an ownership annotation \
+                "[BSTACK0302] a tuple containing a `Foreign` needs an ownership annotation \
                          (`#[bstack_owned/strong/weak/ref]`) naming the foreign elements' kind",
             ));
         }
         Kind::Embed => {
-            return Err(Error::new_spanned(&field.ty, "cannot #[embed] a tuple"));
+            return Err(Error::new_spanned(&field.ty, "[BSTACK0502] cannot #[embed] a tuple"));
         }
     }
     if nullable {
         return Err(Error::new_spanned(
             &field.ty,
-            "a whole-tuple `Option<(..)>` is not supported; make the individual \
+            "[BSTACK0106] a whole-tuple `Option<(..)>` is not supported; make the individual \
                      elements nullable instead",
         ));
     }
@@ -4178,13 +4178,13 @@ pub(crate) fn embed_field(
     if let Type::Tuple(_) = inner_ty {
         return Err(Error::new_spanned(
             &field.ty,
-            "cannot #[embed] a tuple — embed a `#[bstack_block]` / `#[bstack_enum]` type",
+            "[BSTACK0502] cannot #[embed] a tuple — embed a `#[bstack_block]` / `#[bstack_enum]` type",
         ));
     }
     if nullable {
         return Err(Error::new_spanned(
             &field.ty,
-            "#[embed] does not support `Option`",
+            "[BSTACK0503] #[embed] does not support `Option`",
         ));
     }
     // `#[embed]` fields `continue` before the scalar mutator injection, so a
@@ -4192,7 +4192,7 @@ pub(crate) fn embed_field(
     if is_bstack_mut(&field.attrs) {
         return Err(Error::new_spanned(
             field,
-            "#[bstack_mut] is not yet supported on #[embed] fields",
+            "[BSTACK0601] #[bstack_mut] is not yet supported on #[embed] fields",
         ));
     }
     let child = inner_ty;
@@ -4392,7 +4392,7 @@ pub(crate) fn scalar_field(
             Kind::Embed => {
                 return Err(Error::new_spanned(
                     field,
-                    "#[bstack_mut] is not yet supported on #[embed] fields",
+                    "[BSTACK0601] #[bstack_mut] is not yet supported on #[embed] fields",
                 ));
             }
         }
@@ -4440,7 +4440,7 @@ pub(crate) fn pod_aggregate_variant(
     if kind != Kind::Pod {
         return Err(Error::new_spanned(
             variant,
-            "an ownership annotation is only allowed on a single-field tuple \
+            "[BSTACK0205] an ownership annotation is only allowed on a single-field tuple \
              variant, e.g. `#[bstack_owned] V(T)`",
         ));
     }
@@ -4865,14 +4865,14 @@ pub(crate) fn foreign_variant(
         Kind::Pod => {
             return Err(Error::new_spanned(
                 ty,
-                "a `Foreign` enum variant needs an ownership annotation \
+                "[BSTACK0302] a `Foreign` enum variant needs an ownership annotation \
                                  (`#[bstack_owned/strong/weak/ref]`) naming the target's kind",
             ));
         }
         Kind::Embed => {
             return Err(Error::new_spanned(
                 ty,
-                "`Foreign` is a pointer and cannot be `#[embed]`ed",
+                "[BSTACK0301] `Foreign` is a pointer and cannot be `#[embed]`ed",
             ));
         }
     }
@@ -4951,7 +4951,7 @@ pub(crate) fn foreign_tuple_variant(
     }
     let mut parts = VariantParts::default();
     if kind == Kind::Embed {
-        return Err(Error::new_spanned(ty, "cannot #[embed] a tuple"));
+        return Err(Error::new_spanned(ty, "[BSTACK0502] cannot #[embed] a tuple"));
     }
     let nelem = tup.elems.len();
     let mut is_foreign = Vec::with_capacity(nelem);
@@ -5146,14 +5146,14 @@ pub(crate) fn array_variant(
             Kind::Pod => {
                 return Err(Error::new_spanned(
                     ty,
-                    "a `[Foreign<T>; N]` enum variant needs an ownership \
+                    "[BSTACK0302] a `[Foreign<T>; N]` enum variant needs an ownership \
                                      annotation (`#[bstack_owned/strong/weak/ref]`)",
                 ));
             }
             Kind::Embed => {
                 return Err(Error::new_spanned(
                     ty,
-                    "`Foreign` is a pointer and cannot be `#[embed]`ed",
+                    "[BSTACK0301] `Foreign` is a pointer and cannot be `#[embed]`ed",
                 ));
             }
         }
@@ -5269,7 +5269,7 @@ pub(crate) fn array_variant(
     // ---- #[embed] array: verbatim child on-disk forms ----
     if kind == Kind::Embed {
         if elem_nullable {
-            return Err(Error::new_spanned(ty, "#[embed] does not support `Option`"));
+            return Err(Error::new_spanned(ty, "[BSTACK0503] #[embed] does not support `Option`"));
         }
         parts.has_embed = true;
         let child = elem;
@@ -5688,7 +5688,7 @@ pub(crate) fn vec_variant(
     if kind == Kind::Embed {
         return Err(Error::new_spanned(
             ty,
-            "cannot #[embed] a `Vec`; embed a `#[bstack_block]` type",
+            "[BSTACK0501] cannot #[embed] a `Vec`; embed a `#[bstack_block]` type",
         ));
     }
     parts.needs_payload = true;
@@ -5710,14 +5710,14 @@ pub(crate) fn vec_variant(
             Kind::Pod => {
                 return Err(Error::new_spanned(
                     ty,
-                    "a `Vec<Foreign<T>>` enum variant needs an ownership \
+                    "[BSTACK0302] a `Vec<Foreign<T>>` enum variant needs an ownership \
                                      annotation (`#[bstack_owned/strong/weak/ref]`)",
                 ));
             }
             Kind::Embed => {
                 return Err(Error::new_spanned(
                     ty,
-                    "`Foreign` is a pointer and cannot be `#[embed]`ed",
+                    "[BSTACK0301] `Foreign` is a pointer and cannot be `#[embed]`ed",
                 ));
             }
         }
@@ -5883,7 +5883,7 @@ pub(crate) fn vec_variant(
     if vec_info(ty).is_some_and(|vi| vi.is_string) {
         return Err(Error::new_spanned(
             ty,
-            "`String` is always POD; drop the ownership annotation to store \
+            "[BSTACK0107] `String` is always POD; drop the ownership annotation to store \
                              it as a POD `V(String)` variant",
         ));
     }
