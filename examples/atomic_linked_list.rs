@@ -50,7 +50,7 @@
 //! ```
 
 #[cfg(all(feature = "set", feature = "atomic"))]
-use bstack::{BStack, BStackGenOp};
+use bstack::{BStack, BStackGenOp, bstack_unsafe_reborrow, bstack_unsafe_reborrow_mut};
 #[cfg(all(feature = "set", feature = "atomic"))]
 use std::collections::HashSet;
 #[cfg(all(feature = "set", feature = "atomic"))]
@@ -204,7 +204,7 @@ fn pop(stack: &BStack) -> io::Result<Option<u64>> {
             0 => Some(BStackGenOp::Read {
                 offset: FREE_HEAD_OFFSET,
                 // SAFETY: `head_buf` outlives this whole `process_gen` call.
-                buf: unsafe { core::mem::transmute::<&mut [u8], _>(&mut head_buf[..]) },
+                buf: bstack_unsafe_reborrow_mut!(&mut head_buf[..]),
             }),
             // Step 1: `head_buf` now holds `free_head`. Sentinel means the
             // list is empty — end the sequence with no write. Otherwise read
@@ -218,7 +218,7 @@ fn pop(stack: &BStack) -> io::Result<Option<u64>> {
                     Some(BStackGenOp::Read {
                         offset: head,
                         // SAFETY: `next_buf` outlives this whole `process_gen` call.
-                        buf: unsafe { core::mem::transmute::<&mut [u8], _>(&mut next_buf[..]) },
+                        buf: bstack_unsafe_reborrow_mut!(&mut next_buf[..]),
                     })
                 }
             }
@@ -228,7 +228,7 @@ fn pop(stack: &BStack) -> io::Result<Option<u64>> {
             2 => Some(BStackGenOp::Write {
                 offset: FREE_HEAD_OFFSET,
                 // SAFETY: `next_buf` outlives this whole `process_gen` call.
-                data: unsafe { core::mem::transmute::<&[u8], _>(&next_buf[..]) },
+                data: bstack_unsafe_reborrow!(&next_buf[..]),
             }),
             _ => None,
         };

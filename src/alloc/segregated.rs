@@ -40,6 +40,8 @@ use super::{BStackAllocError, BStackAllocator, BStackOwnedSlice};
 use crate::BStack;
 #[cfg(feature = "atomic")]
 use crate::BStackGenOp;
+#[cfg(feature = "atomic")]
+use crate::{bstack_unsafe_reborrow, bstack_unsafe_reborrow_mut};
 #[cfg(not(feature = "atomic"))]
 use std::cell::Cell;
 #[cfg(not(feature = "atomic"))]
@@ -429,7 +431,7 @@ impl SegregatedBStackAllocator {
                 0 => Some(BStackGenOp::Read {
                     offset: head_off,
                     // SAFETY: `head_buf` outlives this `process_gen` call.
-                    buf: unsafe { core::mem::transmute::<&mut [u8], &mut [u8]>(&mut head_buf[..]) },
+                    buf: bstack_unsafe_reborrow_mut!(&mut head_buf[..]),
                 }),
                 1 => {
                     let head = u64::from_le_bytes(head_buf);
@@ -440,16 +442,14 @@ impl SegregatedBStackAllocator {
                         Some(BStackGenOp::Read {
                             offset: head + Self::OVERHEAD,
                             // SAFETY: `next_buf` outlives this `process_gen` call.
-                            buf: unsafe {
-                                core::mem::transmute::<&mut [u8], &mut [u8]>(&mut next_buf[..])
-                            },
+                            buf: bstack_unsafe_reborrow_mut!(&mut next_buf[..]),
                         })
                     }
                 }
                 2 => Some(BStackGenOp::Write {
                     offset: head_off,
                     // SAFETY: `next_buf` outlives this `process_gen` call.
-                    data: unsafe { core::mem::transmute::<&[u8], &[u8]>(&next_buf[..]) },
+                    data: bstack_unsafe_reborrow!(&next_buf[..]),
                 }),
                 _ => None,
             };
@@ -511,7 +511,7 @@ impl SegregatedBStackAllocator {
                 0 => Some(BStackGenOp::Read {
                     offset: head_off,
                     // SAFETY: `head_buf` outlives this call.
-                    buf: unsafe { core::mem::transmute::<&mut [u8], &mut [u8]>(&mut head_buf[..]) },
+                    buf: bstack_unsafe_reborrow_mut!(&mut head_buf[..]),
                 }),
                 1 => {
                     head = u64::from_le_bytes(head_buf);
@@ -521,9 +521,7 @@ impl SegregatedBStackAllocator {
                         Some(BStackGenOp::Read {
                             offset: head,
                             // SAFETY: `oh_next_buf` outlives this call.
-                            buf: unsafe {
-                                core::mem::transmute::<&mut [u8], &mut [u8]>(&mut oh_next_buf[..])
-                            },
+                            buf: bstack_unsafe_reborrow_mut!(&mut oh_next_buf[..]),
                         })
                     }
                 }
@@ -540,9 +538,7 @@ impl SegregatedBStackAllocator {
                             offset: head_off,
                             // SAFETY: `oh_next_buf` outlives this call; its [8..16]
                             // half is untouched after step 1's read resolved.
-                            data: unsafe {
-                                core::mem::transmute::<&[u8], &[u8]>(&oh_next_buf[8..])
-                            },
+                            data: bstack_unsafe_reborrow!(&oh_next_buf[8..]),
                         })
                     }
                 }
@@ -641,22 +637,20 @@ impl SegregatedBStackAllocator {
                 0 => Some(BStackGenOp::Read {
                     offset: head_off,
                     // SAFETY: `overhead_buf` outlives this call.
-                    buf: unsafe {
-                        core::mem::transmute::<&mut [u8], &mut [u8]>(&mut overhead_buf[8..])
-                    },
+                    buf: bstack_unsafe_reborrow_mut!(&mut overhead_buf[8..]),
                 }),
                 // overhead ← free | size; next_free ← old head
                 1 => Some(BStackGenOp::Write {
                     offset: block_start,
                     // SAFETY: `overhead_buf` outlives this call and is not
                     // mutated after step 0's read resolved.
-                    data: unsafe { core::mem::transmute::<&[u8], &[u8]>(&overhead_buf[..]) },
+                    data: bstack_unsafe_reborrow!(&overhead_buf[..]),
                 }),
                 // head[class] ← block_start
                 2 => Some(BStackGenOp::Write {
                     offset: head_off,
                     // SAFETY: `start_bytes` outlives this call.
-                    data: unsafe { core::mem::transmute::<&[u8], &[u8]>(&start_bytes[..]) },
+                    data: bstack_unsafe_reborrow!(&start_bytes[..]),
                 }),
                 _ => None,
             };
@@ -760,17 +754,13 @@ impl SegregatedBStackAllocator {
                         // SAFETY: `overhead_next` outlives this call; we read the
                         // old head straight into its upper 8 bytes so a later write
                         // can emit both overhead and next_free together.
-                        buf: unsafe {
-                            core::mem::transmute::<&mut [u8], &mut [u8]>(
-                                &mut overhead_next[step][8..],
-                            )
-                        },
+                        buf: bstack_unsafe_reborrow_mut!(&mut overhead_next[step][8..]),
                     })
                 } else if step == k {
                     Some(BStackGenOp::Write {
                         offset: prefix_off,
                         // SAFETY: `prefix` outlives this call.
-                        data: unsafe { core::mem::transmute::<&[u8], &[u8]>(prefix) },
+                        data: bstack_unsafe_reborrow!(prefix),
                     })
                 } else if step < k + 1 + 2 * k {
                     let j = step - (k + 1);
@@ -780,17 +770,13 @@ impl SegregatedBStackAllocator {
                         0 => BStackGenOp::Write {
                             offset: block_offs[i],
                             // SAFETY: `overhead_next` outlives this call.
-                            data: unsafe {
-                                core::mem::transmute::<&[u8], &[u8]>(&overhead_next[i][..])
-                            },
+                            data: bstack_unsafe_reborrow!(&overhead_next[i][..]),
                         },
                         // head[class] ← this block
                         _ => BStackGenOp::Write {
                             offset: head_offs[i],
                             // SAFETY: `blockoff_bytes` outlives this call.
-                            data: unsafe {
-                                core::mem::transmute::<&[u8], &[u8]>(&blockoff_bytes[i][..])
-                            },
+                            data: bstack_unsafe_reborrow!(&blockoff_bytes[i][..]),
                         },
                     })
                 } else {

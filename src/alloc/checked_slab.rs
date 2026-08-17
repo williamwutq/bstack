@@ -11,6 +11,8 @@ use super::{BStackAllocError, BStackAllocator, BStackOwnedSlice};
 use crate::BStack;
 #[cfg(feature = "atomic")]
 use crate::BStackGenOp;
+#[cfg(feature = "atomic")]
+use crate::{bstack_unsafe_reborrow, bstack_unsafe_reborrow_mut};
 #[cfg(not(feature = "atomic"))]
 use core::cell::Cell;
 #[cfg(not(feature = "atomic"))]
@@ -513,7 +515,7 @@ impl CheckedSlabBStackAllocator {
         let mut rj: usize = 0;
 
         // Buffers filled by `Len`/`Read`; declared here so they outlive the
-        // `process_gen` borrow. The transmutes detach the borrow from these
+        // `process_gen` borrow. The reborrows detach the borrow from these
         // locals (see `pop_and_claim_block` for the same idiom); each is safe
         // because the local outlives the call and is never aliased while an op
         // holds the reference — `process_gen` resolves each op fully before it
@@ -531,9 +533,7 @@ impl CheckedSlabBStackAllocator {
                         st = St::ReadFreeHead;
                         return Some(BStackGenOp::Len {
                             // SAFETY: `len_out` outlives this `process_gen` call.
-                            out: unsafe {
-                                core::mem::transmute::<&mut u64, &mut u64>(&mut len_out)
-                            },
+                            out: bstack_unsafe_reborrow_mut!(&mut len_out),
                         });
                     }
                     St::ReadFreeHead => {
@@ -546,9 +546,7 @@ impl CheckedSlabBStackAllocator {
                         return Some(BStackGenOp::Read {
                             offset: Self::FREE_HEAD_OFFSET,
                             // SAFETY: `head_buf` outlives this `process_gen` call.
-                            buf: unsafe {
-                                core::mem::transmute::<&mut [u8], &mut [u8]>(&mut head_buf[..])
-                            },
+                            buf: bstack_unsafe_reborrow_mut!(&mut head_buf[..]),
                         });
                     }
                     St::ConsumeFreeHead => {
@@ -576,9 +574,7 @@ impl CheckedSlabBStackAllocator {
                         return Some(BStackGenOp::Read {
                             offset: head,
                             // SAFETY: `node_buf` outlives this `process_gen` call.
-                            buf: unsafe {
-                                core::mem::transmute::<&mut [u8], &mut [u8]>(&mut node_buf[..])
-                            },
+                            buf: bstack_unsafe_reborrow_mut!(&mut node_buf[..]),
                         });
                     }
                     St::ConsumeNode(head) => {
@@ -604,9 +600,7 @@ impl CheckedSlabBStackAllocator {
                         return Some(BStackGenOp::Read {
                             offset: p,
                             // SAFETY: `oh_buf` outlives this `process_gen` call.
-                            buf: unsafe {
-                                core::mem::transmute::<&mut [u8], &mut [u8]>(&mut oh_buf[..])
-                            },
+                            buf: bstack_unsafe_reborrow_mut!(&mut oh_buf[..]),
                         });
                     }
                     St::ConsumeArena(p) => {
@@ -651,11 +645,7 @@ impl CheckedSlabBStackAllocator {
                                 return Some(BStackGenOp::Read {
                                     offset: resync_p + (rj as u64) * bs,
                                     // SAFETY: `oh_buf` outlives this call.
-                                    buf: unsafe {
-                                        core::mem::transmute::<&mut [u8], &mut [u8]>(
-                                            &mut oh_buf[..],
-                                        )
-                                    },
+                                    buf: bstack_unsafe_reborrow_mut!(&mut oh_buf[..]),
                                 });
                             }
                             // Region too large to analyse safely: leave leaked.
@@ -683,9 +673,7 @@ impl CheckedSlabBStackAllocator {
                             return Some(BStackGenOp::Read {
                                 offset: resync_p + (rj as u64) * bs,
                                 // SAFETY: `oh_buf` outlives this call.
-                                buf: unsafe {
-                                    core::mem::transmute::<&mut [u8], &mut [u8]>(&mut oh_buf[..])
-                                },
+                                buf: bstack_unsafe_reborrow_mut!(&mut oh_buf[..]),
                             });
                         }
                         // DP complete. The smallest interior boundary that tiles
@@ -998,7 +986,7 @@ impl CheckedSlabBStackAllocator {
                 0 => Some(BStackGenOp::Read {
                     offset: Self::FREE_HEAD_OFFSET,
                     // SAFETY: `head_buf` outlives this `process_gen` call.
-                    buf: unsafe { core::mem::transmute::<&mut [u8], &mut [u8]>(&mut head_buf[..]) },
+                    buf: bstack_unsafe_reborrow_mut!(&mut head_buf[..]),
                 }),
                 // Step 1: an empty list ends the sequence with no write;
                 // otherwise read the head block's overhead and next-pointer.
@@ -1011,9 +999,7 @@ impl CheckedSlabBStackAllocator {
                         Some(BStackGenOp::Read {
                             offset: head,
                             // SAFETY: `prefix_buf` outlives this `process_gen` call.
-                            buf: unsafe {
-                                core::mem::transmute::<&mut [u8], &mut [u8]>(&mut prefix_buf[..])
-                            },
+                            buf: bstack_unsafe_reborrow_mut!(&mut prefix_buf[..]),
                         })
                     }
                 }
@@ -1030,9 +1016,7 @@ impl CheckedSlabBStackAllocator {
                         Some(BStackGenOp::Write {
                             offset: Self::FREE_HEAD_OFFSET,
                             // SAFETY: `prefix_buf` outlives this `process_gen` call.
-                            data: unsafe {
-                                core::mem::transmute::<&[u8], &[u8]>(&prefix_buf[8..16])
-                            },
+                            data: bstack_unsafe_reborrow!(&prefix_buf[8..16]),
                         })
                     }
                 }
