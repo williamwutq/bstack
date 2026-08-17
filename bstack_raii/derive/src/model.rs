@@ -10,6 +10,71 @@
 use proc_macro2::TokenStream;
 use syn::Type;
 
+/// Everything one enum **variant** contributes to the generated block, grouped by
+/// the match arm / helper enum it lands in. The parallel of [`FieldParts`] for the
+/// `#[bstack_enum]` path: a shape-lowering `emit::*_variant` fills the relevant
+/// fields, and [`expand_enum`](crate::enum_::expand_enum) [`merge`](VariantParts::merge)s
+/// them across all variants.
+///
+/// Storage differs from a struct field (a variant packs into the shared payload area
+/// at discriminant-dispatched offsets, not its own `OnDisk` field), so this is a
+/// distinct bundle — but the *leaf* logic (`foreign_elem_*`, nested arrays, per-kind
+/// reconstruction) is the same machinery the field emitters use.
+#[derive(Default)]
+pub(crate) struct VariantParts {
+    /// `EData` enum variant decl(s).
+    pub data_variants: Vec<TokenStream>,
+    /// `EView` enum variant decl(s).
+    pub view_variants: Vec<TokenStream>,
+    /// `new` match arm (`EData::V(..) => (disc, payload)`).
+    pub new_arms: Vec<TokenStream>,
+    /// `read` match arm (`disc => EView::V(..)`).
+    pub read_arms: Vec<TokenStream>,
+    /// `bstack_move!` / `replace` match arm (`disc => EData::V(..)`).
+    pub move_arms: Vec<TokenStream>,
+    /// Teardown (`__bstack_drop_children`) match arm.
+    pub drop_arms: Vec<TokenStream>,
+    /// Deep-clone (`__bstack_clone_children_inplace`) match arm.
+    pub clone_arms: Vec<TokenStream>,
+    /// This variant's payload size (folded into the max-over-variants const).
+    pub payload_sizes: Vec<TokenStream>,
+    /// POD element types to `__assert_pod` on.
+    pub pod_types: Vec<Type>,
+    /// `#[embed]`ded child types to `__assert_embeddable` on.
+    pub embed_types: Vec<TokenStream>,
+    /// This variant is `#[embed]` (its `new` folds the child in post-write).
+    pub has_embed: bool,
+    /// This variant carries a payload (drives the `read` / `move` payload read).
+    pub needs_payload: bool,
+    /// This variant holds a strong reference (`EData` becomes `<'e, A>`).
+    pub has_shared: bool,
+    /// This variant holds a weak reference (`EView` also becomes `<'e, A>`).
+    pub has_weak: bool,
+    /// This variant holds a `Foreign` (both enums carry the `'__e` lifetime).
+    pub has_foreign: bool,
+}
+
+impl VariantParts {
+    /// Fold another variant's parts into this accumulator.
+    pub fn merge(&mut self, other: VariantParts) {
+        self.data_variants.extend(other.data_variants);
+        self.view_variants.extend(other.view_variants);
+        self.new_arms.extend(other.new_arms);
+        self.read_arms.extend(other.read_arms);
+        self.move_arms.extend(other.move_arms);
+        self.drop_arms.extend(other.drop_arms);
+        self.clone_arms.extend(other.clone_arms);
+        self.payload_sizes.extend(other.payload_sizes);
+        self.pod_types.extend(other.pod_types);
+        self.embed_types.extend(other.embed_types);
+        self.has_embed |= other.has_embed;
+        self.needs_payload |= other.needs_payload;
+        self.has_shared |= other.has_shared;
+        self.has_weak |= other.has_weak;
+        self.has_foreign |= other.has_foreign;
+    }
+}
+
 /// Everything one field contributes to the generated block, grouped by the section
 /// it lands in. A shape-lowering `emit::*` function fills the relevant fields and
 /// leaves the rest empty; the orchestrator [`merge`](FieldParts::merge)s them.

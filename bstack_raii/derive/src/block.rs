@@ -468,9 +468,16 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         // `VecDesc`s are Pod bytes, but the data blocks need a real lifecycle, so it
         // must NOT fall through to the plain POD path. The element annotation names
         // the inner vectors' element ownership, exactly like a scalar `Vec<T>`.
-        if let Some(fp) =
-            vec_array_field(vis, fname, field, opt_inner, kind, nullable, &on_disk_ty, &const_params)?
-        {
+        if let Some(fp) = vec_array_field(
+            vis,
+            fname,
+            field,
+            opt_inner,
+            kind,
+            nullable,
+            &on_disk_ty,
+            &const_params,
+        )? {
             on_disk_fields.extend(fp.on_disk_fields);
             accessors.extend(fp.accessors);
             ctor_params.extend(fp.ctor_params);
@@ -566,9 +573,16 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         // *all* the foreign elements — they are freed / decremented / deep-cloned in
         // their own files at teardown / clone. `Option<Foreign<T>>` elements use the
         // offset-0 niche. (Concrete element types only for now — no generic params.)
-        if let Some(fp) =
-            foreign_tuple_field(vis, name, fname, field, inner_ty, kind, nullable, &on_disk_ty)?
-        {
+        if let Some(fp) = foreign_tuple_field(
+            vis,
+            name,
+            fname,
+            field,
+            inner_ty,
+            kind,
+            nullable,
+            &on_disk_ty,
+        )? {
             on_disk_fields.extend(fp.on_disk_fields);
             accessors.extend(fp.accessors);
             ctor_params.extend(fp.ctor_params);
@@ -605,9 +619,16 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         // `#[embed] child: Block`: store the child's whole on-disk form INLINE
         // (`<Child as BStackBlock>::OnDisk`, header and all) instead of a `u64`
         // offset — an exclusively-owned inline block.
-        if let Some(fp) =
-            embed_field(vis, fname, field, inner_ty, kind, nullable, &on_disk_ty, &type_params)?
-        {
+        if let Some(fp) = embed_field(
+            vis,
+            fname,
+            field,
+            inner_ty,
+            kind,
+            nullable,
+            &on_disk_ty,
+            &type_params,
+        )? {
             on_disk_fields.extend(fp.on_disk_fields);
             accessors.extend(fp.accessors);
             ctor_params.extend(fp.ctor_params);

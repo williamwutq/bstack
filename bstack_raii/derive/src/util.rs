@@ -8,9 +8,7 @@ use proc_macro2::{Span, TokenStream};
 use quote::{format_ident, quote};
 use syn::parse::Parser;
 use syn::punctuated::Punctuated;
-use syn::{
-    Error, Expr, ExprLit, GenericArgument, Ident, Lit, Meta, PathArguments, Token, Type,
-};
+use syn::{Error, Expr, ExprLit, GenericArgument, Ident, Lit, Meta, PathArguments, Token, Type};
 
 /// The block mode from the attribute arguments.
 #[derive(Clone, Copy, PartialEq)]
@@ -36,7 +34,6 @@ pub(crate) enum Kind {
     /// POD field stored inline.
     Pod,
 }
-
 
 /// A `Vec<T>` / `String` field: its element type (tokens) and whether it's a
 /// `String` (so the constructor takes `&str`). Whether the elements are POD
@@ -318,7 +315,11 @@ pub(crate) fn validate_foreign_target(
 /// is barred. In every rejected case the fix is to bridge with an explicit
 /// `#[bstack_block]` struct wrapping the offending inner type and point a `Foreign` at
 /// *that*.
-pub(crate) fn reject_bad_foreign_target(ftarget: &Type, span: &Type, what: &str) -> syn::Result<()> {
+pub(crate) fn reject_bad_foreign_target(
+    ftarget: &Type,
+    span: &Type,
+    what: &str,
+) -> syn::Result<()> {
     let bridge = "bridge it inside an explicit `#[bstack_block]` struct and point the \
                   `Foreign` at that struct";
     if foreign_inner(ftarget).is_some() {
