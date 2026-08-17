@@ -4398,7 +4398,9 @@ mod alloc_tests {
 #[cfg(all(test, feature = "alloc", feature = "set"))]
 mod first_fit_tests {
     use crate::BStack;
-    use crate::alloc::{BStackAllocator, FirstFitBStackAllocator};
+    use crate::alloc::{
+        BStackAllocator, BStackSlice, BStackUninitAllocator, FirstFitBStackAllocator,
+    };
     use std::sync::atomic::{AtomicU64, Ordering};
 
     // Layout constants mirrored from the allocator (kept local to tests).
@@ -4610,6 +4612,136 @@ mod first_fit_tests {
         alloc.dealloc(a).unwrap();
         let c = alloc.alloc(32).unwrap();
         assert_eq!(c.read().unwrap(), vec![0u8; 32]);
+    }
+
+    // ── alloc_uninit / realloc_uninit ────────────────────────────────────────
+
+    #[test]
+    fn alloc_uninit_returns_a_usable_region() {
+        let (alloc, path) = mk_ff("uninit_usable");
+        let _g = Guard(path);
+        let mut s = alloc.alloc_uninit(32).unwrap();
+        assert_eq!(s.len(), 32);
+        s.write([0xABu8; 32]).unwrap();
+        assert_eq!(s.read().unwrap(), vec![0xABu8; 32]);
+    }
+
+    #[test]
+    fn alloc_uninit_of_a_fresh_block_still_reads_zero() {
+        // A miss creates the block with one sparse extend that writes only the
+        // header and footer, so the payload between them reads back as zero.
+        let (alloc, path) = mk_ff("uninit_fresh");
+        let _g = Guard(path);
+        let s = alloc.alloc_uninit(32).unwrap();
+        assert_eq!(s.read().unwrap(), vec![0u8; 32]);
+    }
+
+    #[test]
+    fn alloc_uninit_hands_back_a_recycled_block_unscrubbed() {
+        // White-box counterpart to `reused_block_is_zero_initialised`: proves the
+        // payload scrub really is skipped. The trait's contract is only that the
+        // bytes are unspecified.
+        let (alloc, path) = mk_ff("uninit_reuse");
+        let _g = Guard(path);
+        let mut a = alloc.alloc(32).unwrap();
+        let _b = alloc.alloc(16).unwrap(); // keeps `a` off the tail
+        a.write(b"dirty data from previous use!!!!").unwrap();
+        let a_start = a.start();
+        alloc.dealloc(a).unwrap();
+
+        let c = alloc.alloc_uninit(32).unwrap();
+        assert_eq!(c.start(), a_start, "the freed block must be the one reused");
+        // dealloc writes the free-list next/prev pointers into the first 16 bytes;
+        // everything after them is the previous occupant's data, untouched.
+        assert_eq!(&c.read().unwrap()[16..], b"previous use!!!!");
+    }
+
+    #[test]
+    fn alloc_uninit_block_survives_a_reopen() {
+        // The header, flags and footer are still written, so the recovery scan
+        // walks the arena cleanly and the data is intact after reopening.
+        let (alloc, path) = mk_ff("uninit_reopen");
+        let _g = Guard(path.clone());
+        let a = alloc.alloc(32).unwrap();
+        let _b = alloc.alloc(16).unwrap();
+        alloc.dealloc(a).unwrap();
+        let mut c = alloc.alloc_uninit(32).unwrap();
+        c.write([0x77u8; 32]).unwrap();
+        let (start, len) = (c.start(), c.len());
+        drop(alloc);
+
+        let reopened = FirstFitBStackAllocator::new(BStack::open(&path).unwrap()).unwrap();
+        let view = unsafe { BStackSlice::from_raw_parts(reopened.stack(), start, len) };
+        assert_eq!(view.read().unwrap(), vec![0x77u8; 32]);
+    }
+
+    #[test]
+    fn realloc_uninit_preserves_existing_bytes_on_grow() {
+        let (alloc, path) = mk_ff("uninit_grow");
+        let _g = Guard(path);
+        let mut a = alloc.alloc(32).unwrap();
+        a.write([0x11u8; 32]).unwrap();
+        let _pin = alloc.alloc(16).unwrap(); // keeps `a` off the tail
+
+        let grown = alloc.realloc_uninit(a, 200).unwrap();
+        assert_eq!(grown.len(), 200);
+        assert_eq!(&grown.read().unwrap()[..32], &[0x11u8; 32]);
+    }
+
+    #[test]
+    fn realloc_uninit_preserves_existing_bytes_on_shrink() {
+        let (alloc, path) = mk_ff("uninit_shrink");
+        let _g = Guard(path);
+        let mut a = alloc.alloc(200).unwrap();
+        a.write([0x22u8; 200]).unwrap();
+        let _pin = alloc.alloc(16).unwrap();
+
+        let shrunk = alloc.realloc_uninit(a, 32).unwrap();
+        assert_eq!(shrunk.len(), 32);
+        assert_eq!(shrunk.read().unwrap(), vec![0x22u8; 32]);
+    }
+
+    #[test]
+    fn realloc_uninit_merges_with_the_next_free_block_in_place() {
+        // Exercises the merge path, whose big staged write shrinks to just the
+        // metadata when `init` is clear.
+        let (alloc, path) = mk_ff("uninit_merge");
+        let _g = Guard(path);
+        let mut a = alloc.alloc(32).unwrap();
+        a.write([0x33u8; 32]).unwrap();
+        let b = alloc.alloc(64).unwrap();
+        let _pin = alloc.alloc(16).unwrap(); // keeps `b` off the tail
+        let a_start = a.start();
+        alloc.dealloc(b).unwrap();
+
+        let grown = alloc.realloc_uninit(a, 80).unwrap();
+        assert_eq!(grown.start(), a_start, "must grow in place by merging");
+        assert_eq!(grown.len(), 80);
+        assert_eq!(&grown.read().unwrap()[..32], &[0x33u8; 32]);
+        // The merged block must still be a well-formed allocation.
+        alloc.dealloc(grown).unwrap();
+    }
+
+    #[test]
+    fn realloc_uninit_merges_without_splitting_the_remainder() {
+        // The no-split arm of the merge path, whose staged write shrinks to the
+        // merged footer alone when `init` is clear.
+        let (alloc, path) = mk_ff("uninit_merge_nosplit");
+        let _g = Guard(path);
+        let mut a = alloc.alloc(32).unwrap();
+        a.write([0x44u8; 32]).unwrap();
+        let b = alloc.alloc(64).unwrap();
+        let _pin = alloc.alloc(16).unwrap(); // keeps `b` off the tail
+        let a_start = a.start();
+        alloc.dealloc(b).unwrap();
+
+        // merged payload = 32 + 24 + 64 = 120; 96 + 24 + 16 > 120, so no split.
+        let grown = alloc.realloc_uninit(a, 96).unwrap();
+        assert_eq!(grown.start(), a_start, "must grow in place by merging");
+        assert_eq!(grown.len(), 96);
+        assert_eq!(&grown.read().unwrap()[..32], &[0x44u8; 32]);
+        // The merged block must still be a well-formed allocation.
+        alloc.dealloc(grown).unwrap();
     }
 
     #[test]

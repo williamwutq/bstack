@@ -43,9 +43,10 @@
 //!   zero-fill of newly allocated or grown bytes, returning **unspecified**
 //!   (but always valid-to-read) contents for callers that overwrite the region
 //!   immediately.  Implemented by [`SlabBStackAllocator`],
-//!   [`GhostTreeBstackAllocator`], [`CheckedSlabBStackAllocator`] and
-//!   [`SegregatedBStackAllocator`], and forwarded by [`DebugCheckingAllocator`];
-//!   see [Uninitialised allocation](#uninitialised-allocation).
+//!   [`GhostTreeBstackAllocator`], [`CheckedSlabBStackAllocator`],
+//!   [`SegregatedBStackAllocator`] and [`FirstFitBStackAllocator`], and
+//!   forwarded by [`DebugCheckingAllocator`]; see
+//!   [Uninitialised allocation](#uninitialised-allocation).
 //!
 //! * [`BStackOwnedSliceAllocator`] — convenience supertrait:
 //!   `BStackAllocator<Error = io::Error, Allocated<'a> = BStackOwnedSlice<'a, Self>>`.
@@ -86,12 +87,10 @@
 //!
 //! # Uninitialised allocation
 //!
-//! [`SlabBStackAllocator`], [`GhostTreeBstackAllocator`] and
 //! [`SlabBStackAllocator`], [`GhostTreeBstackAllocator`],
-//! [`CheckedSlabBStackAllocator`] and [`SegregatedBStackAllocator`] implement
-//! [`BStackUninitAllocator`], because for each of them the caller-facing zero
-//! guarantee costs a write that a caller overwriting the region has no use for.
-//! What that write is, and therefore what is saved, differs:
+//! [`CheckedSlabBStackAllocator`], [`SegregatedBStackAllocator`] and
+//! [`FirstFitBStackAllocator`] implement [`BStackUninitAllocator`], because for
+//! each of them the caller-facing zero guarantee costs a write that a caller
 //! overwriting the region has no use for.  What that write is, and therefore
 //! what is saved, differs:
 //!
@@ -101,6 +100,7 @@
 //! | [`GhostTreeBstackAllocator`] | a 32-byte `zero` over the reclaimed block's stale AVL node | the entire call for requests of 32 bytes or more    |
 //! | [`CheckedSlabBStackAllocator`] | a full block-sized claim buffer                         | everything past the 8-byte overhead word            |
 //! | [`SegregatedBStackAllocator`] | a full block-sized claim buffer                          | everything past the overhead (and any copied prefix) |
+//! | [`FirstFitBStackAllocator`]  | a full block image fused into the metadata write          | block-sized bytes and the staging buffer; the tail path also drops to a sparse extend |
 //! | [`LinearBStackAllocator`]    | nothing — `extend` is a sparse `set_len`                  | *not implemented*: there is nothing to skip         |
 //!
 //! [`realloc_uninit`](BStackUninitAllocator::realloc_uninit) additionally drops
