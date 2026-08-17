@@ -42,9 +42,12 @@
 //!   [`realloc_uninit`](BStackUninitAllocator::realloc_uninit) skip the
 //!   zero-fill of newly allocated or grown bytes, returning **unspecified**
 //!   (but always valid-to-read) contents for callers that overwrite the region
+//!   immediately.  Implemented by [`SlabBStackAllocator`] and
+//!   [`GhostTreeBstackAllocator`], and forwarded by [`DebugCheckingAllocator`];
+//!   see
 //!   immediately.  Implemented by [`SlabBStackAllocator`],
-//!   [`GhostTreeBstackAllocator`] and [`CheckedSlabBStackAllocator`]; see
-//!   [Uninitialised allocation](#uninitialised-allocation).
+//!   [`GhostTreeBstackAllocator`] and [`CheckedSlabBStackAllocator`], and forwarded by
+//!   [`DebugCheckingAllocator`]; see [Uninitialised allocation](#uninitialised-allocation).
 //!
 //! * [`BStackOwnedSliceAllocator`] — convenience supertrait:
 //!   `BStackAllocator<Error = io::Error, Allocated<'a> = BStackOwnedSlice<'a, Self>>`.
@@ -110,7 +113,11 @@
 //! That is never something to rely on; the trait promises only unspecified
 //! contents.
 //!
-//! The remaining built-in allocators do not implement the trait yet.
+//! [`DebugCheckingAllocator<A>`](DebugCheckingAllocator) forwards both methods,
+//! with the same overlap and double-free tracking as `alloc`/`realloc`, but only
+//! when `A` implements the trait itself — it never fabricates the trait for an
+//! allocator that has no cheaper uninitialised path.
+//!
 //!
 //! # Debug wrapper
 //!
