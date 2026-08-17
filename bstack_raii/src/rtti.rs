@@ -33,14 +33,16 @@
 //!
 //! Read + write of struct and enum records is in place; the on-disk RTTI-typed
 //! pointer is the existing [`ForeignRepr`] (its `type_index` is the ordinal `+ 1`).
-//! The `#[bstack_class]` emitter, `linkme` registration, `sync()`, and the
-//! interpreter itself are still TODO.
+//! Compiled-in types register their descriptor builder into [`RTTI_TYPES`] at link
+//! time, and [`sync`] appends every missing schema to a file. The `#[bstack_class]`
+//! emitter (which fills [`RTTI_TYPES`]) and the interpreter itself are still TODO.
 
 use std::collections::HashMap;
 use std::io;
 use std::path::Path;
 
 use bstack::BStack;
+use linkme::distributed_slice;
 
 use crate::foreign::ForeignRepr;
 use crate::layout::EightCC;
@@ -143,7 +145,7 @@ impl<'a> Reader<'a> {
             .pos
             .checked_add(n)
             .filter(|&e| e <= self.buf.len())
-            .ok_or_else(|| corrupt("[BSTACK0704] truncated RTTI record"))?;
+            .ok_or_else(|| corrupt("[BSTACK0804] truncated RTTI record"))?;
         let s = &self.buf[self.pos..end];
         self.pos = end;
         Ok(s)
@@ -168,13 +170,13 @@ impl<'a> Reader<'a> {
     }
     fn string(&mut self, n: usize) -> io::Result<String> {
         String::from_utf8(self.take(n)?.to_vec())
-            .map_err(|_| corrupt("[BSTACK0702] RTTI name is not valid UTF-8"))
+            .map_err(|_| corrupt("[BSTACK0802] RTTI name is not valid UTF-8"))
     }
     /// Skip zero-padding up to the next `a`-byte boundary.
     fn align(&mut self, a: usize) -> io::Result<()> {
         let aligned = (self.pos + a - 1) & !(a - 1);
         if aligned > self.buf.len() {
-            return Err(corrupt("[BSTACK0704] truncated RTTI record (alignment)"));
+            return Err(corrupt("[BSTACK0804] truncated RTTI record (alignment)"));
         }
         self.pos = aligned;
         Ok(())
@@ -320,7 +322,7 @@ impl Shape {
             }
             other => {
                 return Err(corrupt(format!(
-                    "[BSTACK0703] unknown RTTI shape tag {other:#04x}"
+                    "[BSTACK0803] unknown RTTI shape tag {other:#04x}"
                 )));
             }
         })
@@ -359,7 +361,7 @@ impl RttiField {
         let shape_start = r.pos;
         let shape = Shape::decode(r)?;
         if r.pos - shape_start != shape_len {
-            return Err(corrupt("[BSTACK0705] RTTI field shape length mismatch"));
+            return Err(corrupt("[BSTACK0805] RTTI field shape length mismatch"));
         }
         r.align(4)?;
         Ok(RttiField {
@@ -548,6 +550,35 @@ fn encode_record(ty: &RttiType) -> Vec<u8> {
     w.buf
 }
 
+// -- Compile-time registration (linkme) ------------------------------------
+
+/// One compiled-in type's link-time registration: a builder for its parsed
+/// schema descriptor. The `#[bstack_class]` macro emits exactly one of these per
+/// type into [`RTTI_TYPES`]; [`sync`] walks the slice and appends any missing
+/// schema to the file.
+pub struct RttiRegistration {
+    /// Builds the type's descriptor. Allocates (`String`/`Vec`); called once per
+    /// type at [`sync`] time, never on a hot path.
+    pub build: fn() -> RttiType,
+}
+
+/// The set of every `#[bstack_class]` type compiled into this binary, collected
+/// at **link time** via `linkme` — no life-before-main (unlike `inventory`'s
+/// `ctor`), no instantiation required, no hand-enumeration. Each entry is emitted
+/// by the macro. [`sync`] is the sole consumer.
+#[distributed_slice]
+pub static RTTI_TYPES: [RttiRegistration];
+
+/// Open (creating if absent) the RTTI file at `path`, append every compiled-in
+/// schema it does not already carry, and return the loaded registry. Idempotent
+/// and safe to call on every open. Runs eightcc-collision detection. This is the
+/// producer-side entry point; see [`RttiRegistry::sync_compiled`] for the details.
+pub fn sync(path: impl AsRef<Path>) -> io::Result<RttiRegistry> {
+    let mut reg = RttiRegistry::open(path)?;
+    reg.sync_compiled()?;
+    Ok(reg)
+}
+
 // -- The in-memory registry ------------------------------------------------
 
 /// A scanned RTTI record: its tag, where its framing header begins in the stack,
@@ -602,7 +633,7 @@ impl RttiRegistry {
         let ordinal = self.records.len() as RttiOrdinal;
         if self.by_tag.insert(tag, ordinal).is_some() {
             return Err(corrupt(
-                "[BSTACK0700] duplicate RTTI eightcc — two types share one tag",
+                "[BSTACK0800] duplicate RTTI eightcc — two types share one tag",
             ));
         }
         self.records.push(RecordRef {
@@ -618,13 +649,60 @@ impl RttiRegistry {
     pub fn append(&mut self, ty: &RttiType) -> io::Result<RttiOrdinal> {
         if self.by_tag.contains_key(&ty.tag) {
             return Err(corrupt(
-                "[BSTACK0700] duplicate RTTI eightcc — type already registered",
+                "[BSTACK0800] duplicate RTTI eightcc — type already registered",
             ));
         }
         let body_len = encode_type(ty).len() as u32;
         let record = encode_record(ty);
         let offset = self.stack.push(&record)?;
         self.index(ty.tag, offset, body_len)
+    }
+
+    /// Append every compiled-in [`RTTI_TYPES`] descriptor this file is missing, in
+    /// registration order. Idempotent: a type already present (matched by tag) is
+    /// skipped. Returns the number of newly appended types.
+    ///
+    /// Runs **eightcc-collision detection** — the write-side guard: because a tag
+    /// is the resolution key, two *distinct* types (different names) hashing to one
+    /// eightcc is corruption, caught here rather than silently overwriting. A tag
+    /// that is already on disk under the *same* name is a benign re-sync.
+    pub fn sync_compiled(&mut self) -> io::Result<usize> {
+        let mut appended = 0;
+        // Guards a collision *within* the compiled-in set (two builders, one tag).
+        let mut seen: HashMap<EightCC, String> = HashMap::new();
+        for reg in RTTI_TYPES.iter() {
+            let ty = (reg.build)();
+            if let Some(prev) = seen.get(&ty.tag) {
+                if *prev != ty.name {
+                    return Err(corrupt(format!(
+                        "[BSTACK0806] RTTI eightcc collision: '{prev}' and '{}' \
+                         hash to one tag",
+                        ty.name
+                    )));
+                }
+                continue; // same type registered twice — nothing to do
+            }
+            seen.insert(ty.tag, ty.name.clone());
+
+            match self.ordinal_of(ty.tag) {
+                Some(ord) => {
+                    // Already on disk: verify it is the same type, else collision.
+                    let existing = self.load_type(ord)?;
+                    if existing.name != ty.name {
+                        return Err(corrupt(format!(
+                            "[BSTACK0806] RTTI eightcc collision: on-disk '{}' vs \
+                             compiled '{}' share one tag",
+                            existing.name, ty.name
+                        )));
+                    }
+                }
+                None => {
+                    self.append(&ty)?;
+                    appended += 1;
+                }
+            }
+        }
+        Ok(appended)
     }
 
     /// Number of registered types.
@@ -659,7 +737,7 @@ impl RttiRegistry {
         let rec = self.records.get(ordinal as usize).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
-                "[BSTACK0701] RTTI ordinal out of range",
+                "[BSTACK0801] RTTI ordinal out of range",
             )
         })?;
         let mut body = vec![0u8; rec.body_len as usize];
@@ -769,6 +847,85 @@ mod tests {
         let body = encode_type(&ty);
         let back = decode_type(ty.tag, &body).unwrap();
         assert_eq!(ty, back);
+    }
+
+    // Two types registered into the global slice via linkme, standing in for what
+    // the `#[bstack_class]` macro will emit. `sync_compiled` must discover both.
+    fn reg_pair_a() -> RttiType {
+        RttiType {
+            tag: cc("SyncRegA"),
+            name: "sync_reg_a".to_string(),
+            rc: false,
+            weak: false,
+            ondisk_size: 16,
+            body: RttiBody::Struct(vec![RttiField {
+                name: "x".to_string(),
+                offset: 0,
+                shape: Shape::Pod { width: 8 },
+            }]),
+        }
+    }
+
+    fn reg_pair_b() -> RttiType {
+        RttiType {
+            tag: cc("SyncRegB"),
+            name: "sync_reg_b".to_string(),
+            rc: false,
+            weak: false,
+            ondisk_size: 24,
+            body: RttiBody::Struct(vec![RttiField {
+                name: "child".to_string(),
+                offset: 0,
+                shape: Shape::Owned(cc("SyncRegA")),
+            }]),
+        }
+    }
+
+    #[distributed_slice(RTTI_TYPES)]
+    static REG_A: RttiRegistration = RttiRegistration { build: reg_pair_a };
+    #[distributed_slice(RTTI_TYPES)]
+    static REG_B: RttiRegistration = RttiRegistration { build: reg_pair_b };
+
+    #[test]
+    fn rtti_sync_registers_compiled_types() {
+        let path = std::env::temp_dir().join(format!(
+            "bstack_raii_rtti_sync_{}.stack",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        {
+            let mut reg = RttiRegistry::open(&path).unwrap();
+            // First sync appends at least our two registered types.
+            let n = reg.sync_compiled().unwrap();
+            assert!(n >= 2, "expected the two registered types, appended {n}");
+            assert!(reg.ordinal_of(cc("SyncRegA")).is_some());
+            assert!(reg.ordinal_of(cc("SyncRegB")).is_some());
+            assert_eq!(
+                reg.load_type(reg.ordinal_of(cc("SyncRegA")).unwrap())
+                    .unwrap(),
+                reg_pair_a()
+            );
+            // Idempotent: a second sync appends nothing.
+            assert_eq!(reg.sync_compiled().unwrap(), 0);
+        }
+
+        // Reopen and re-sync: the on-disk types are recognized, nothing re-appended.
+        {
+            let mut reg = RttiRegistry::open(&path).unwrap();
+            assert_eq!(reg.sync_compiled().unwrap(), 0);
+            assert!(reg.ordinal_of(cc("SyncRegB")).is_some());
+        }
+
+        // The free `sync(path)` entry point is equivalent.
+        {
+            let reg = sync(&path).unwrap();
+            assert!(reg.ordinal_of(cc("SyncRegA")).is_some());
+        }
+
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

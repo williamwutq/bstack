@@ -32,6 +32,11 @@ bstack_raii_derive = { path = "derive", version = "0.0.0" }
 bytemuck = { version = "=1.25", features = ["derive"] }
 parking_lot = "0.12.5"
 
+# RTTI type registration: `#[bstack_class]` emits a link-time entry per type into
+# a distributed slice, so `rtti::sync` can enumerate every compiled-in schema with
+# no life-before-main (unlike `inventory`'s `ctor`) and no instantiation required.
+linkme = "0.3"
+
 [dev-dependencies]
 # Compile-fail (`tests/hypercube/ui/*.rs`): asserts each illegal macro input fails
 # with the *right* error, keeping the negative cases out of lib.rs doctests.
