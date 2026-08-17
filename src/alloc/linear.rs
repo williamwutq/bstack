@@ -23,6 +23,17 @@ use std::{fmt, io};
 /// allocations it is a no-op — the bytes remain on disk but are logically
 /// unreachable through this allocator.
 ///
+/// # Uninitialised allocation
+///
+/// `LinearBStackAllocator` deliberately does **not** implement
+/// [`BStackUninitAllocator`](crate::BStackUninitAllocator): it has no cheaper
+/// uninitialised path to offer.  A bump allocator never reuses a region, so
+/// every byte it hands out comes from fresh tail growth, and
+/// [`BStack::extend`] realises that growth with a single `set_len` on a sparse
+/// file — the zeroes cost no write I/O at all.  There is nothing for
+/// `alloc_uninit` to skip, and implementing the trait as a pass-through would
+/// falsely advertise a saving (see the trait's own guidance).
+///
 /// # Crash consistency
 ///
 /// Every operation maps to exactly one [`BStack`] call and is therefore

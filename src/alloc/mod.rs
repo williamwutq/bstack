@@ -42,7 +42,9 @@
 //!   [`realloc_uninit`](BStackUninitAllocator::realloc_uninit) skip the
 //!   zero-fill of newly allocated or grown bytes, returning **unspecified**
 //!   (but always valid-to-read) contents for callers that overwrite the region
-//!   immediately.
+//!   immediately.  Implemented by [`SlabBStackAllocator`] and
+//!   [`GhostTreeBstackAllocator`]; see
+//!   [Uninitialised allocation](#uninitialised-allocation).
 //!
 //! * [`BStackOwnedSliceAllocator`] — convenience supertrait:
 //!   `BStackAllocator<Error = io::Error, Allocated<'a> = BStackOwnedSlice<'a, Self>>`.
@@ -80,6 +82,27 @@
 //!   size classes sharing one arena; 8-byte per-block header, O(1) classed
 //!   alloc/dealloc, crash-recoverable by linear scan.  `Send` in all
 //!   configurations; `Send + Sync` with `atomic`.
+//!
+//! # Uninitialised allocation
+//!
+//! [`SlabBStackAllocator`] and [`GhostTreeBstackAllocator`] implement
+//! [`BStackUninitAllocator`], because for both of them the caller-facing zero
+//! guarantee costs a write that a caller overwriting the region has no use for.
+//! What that write is, and therefore what is saved, differs:
+//!
+//! | Allocator | What `alloc` writes to guarantee zeroes | What `alloc_uninit` saves |
+//! |-----------|------------------------------------------|---------------------------|
+//! | [`SlabBStackAllocator`]      | a whole-block `zero` after popping the free list           | the entire call — one durable sync per reused block |
+//! | [`GhostTreeBstackAllocator`] | a 32-byte `zero` over the reclaimed block's stale AVL node | the entire call for requests of 32 bytes or more    |
+//! | [`LinearBStackAllocator`]    | nothing — `extend` is a sparse `set_len`                  | *not implemented*: there is nothing to skip         |
+//!
+//! [`realloc_uninit`](BStackUninitAllocator::realloc_uninit) additionally drops
+//! the `zero` calls that scrub bytes newly exposed inside a block the caller
+//! already owns.  Neither allocator drops a write it needs for its own metadata
+//! or free-space invariants, so crash consistency, recovery, and the `handle`
+//! contract on failure are identical to the initialised methods.
+//!
+//! The remaining built-in allocators do not implement the trait yet.
 //!
 //! # Debug wrapper
 //!

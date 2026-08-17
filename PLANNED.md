@@ -78,6 +78,33 @@ Reference: https://github.com/williamwutq/bstack/pull/37
 
 ---
 
+## Trimming redundant zero-fill writes on the initialised allocator paths
+
+**Feature flag:** `alloc` + `set`
+**Breaking change:** No — no observable behaviour change, no on-disk format change.
+
+### Motivation
+
+Implementing `BStackUninitAllocator` for the slab and ghost-tree allocators surfaced places
+where the *initialised* path pays for zeroes it is already guaranteed. None is a
+correctness problem, and none was changed as part of that work, since each
+touches a path with its own documented crash-consistency reasoning.
+
+### Candidate
+
+1. **`LinearBStackAllocator::realloc` materialises a zero buffer to grow under `atomic`.**
+   The grow branch allocates `vec![0u8; delta]` and calls `try_extend(end, zeros)`,
+   writing `delta` bytes. `try_extend_zeros(end, delta)` has the identical guard
+   and result but realises the growth with one `set_len`, so the zeroes cost no
+   write I/O — the same primitive the other allocators' tail-grow paths already
+   use. The non-`atomic` branch already takes the cheap route via `extend`. This is
+   the only write standing between `LinearBStackAllocator` and "zero-fill is
+   entirely free", which is the stated reason it does not implement
+   `BStackUninitAllocator`.
+
+More candidates of this kind exist in the allocators that have not adopted
+`BStackUninitAllocator` yet, and belong with that work rather than here.
+
 ## `BStackInPlaceGuard` — ambient atomic-block guard over in-place writes
 
 **Feature flag:** `set` + `atomic` (same gate as `inplace_gen`/`process_gen`)
