@@ -213,19 +213,25 @@ to `dealloc_bulk`, adjacent slices are merged and freed as a single operation
 
 ### In-place resize (`realloc_inplace`)
 
-Only **pure front shrink** (`prepend < 0`, `append == 0`) and the identity are
-supported; all back resizes, front grow, and mixed edges return `Unsupported`.
-The reason is the zero-overhead layout: a block has no header, so its size is
-derived from the handle length (`align_up_len`). A resize that left an
-unaccounted region would leak it, and there is no boundary tag to find a left
-neighbour to grow into.
+**Shrinking** either or both edges (`prepend ≤ 0`, `append ≤ 0`) and the
+identity are supported; any **grow** returns `Unsupported`. The zero-overhead
+layout is why: a block has no header, so its size is derived from the handle
+length (`align_up_len`), and there is no boundary tag to find a neighbour to grow
+into — a grow would have to move.
 
-Front shrink requires a `MIN_ALLOC`-aligned `pf ≥ MIN_ALLOC`; because `pf` is a
-`MIN_ALLOC` multiple, the retained tail `align_up_len(old_len) − pf` exactly
-backs the new length with no residue. It mirrors the non-tail tail-shrink: the
-freed front is zeroed (a fault here keeps the original, `handle: Some`) then
-AVL-inserted under the lock (a torn insert is `handle: None`, the block lost —
-same contract as `dealloc`). The retained tail's bytes are never touched.
+A shrink carves the block into up to three pieces: the front residue `[start,
+start + pf)`, the retained window `[start + pf, start + pf + align_up_len(new_len))`,
+and the back residue after it. `pf` (the front trim) must be `MIN_ALLOC`-aligned;
+since it, `align_up_len`, and the block size are all `MIN_ALLOC` multiples, each
+residue is `0` or `≥ MIN_ALLOC` — never a sub-block sliver. Each nonzero residue
+is zeroed then AVL-inserted as its own free block (the same per-region insert
+`dealloc`/`dealloc_bulk` use); `pf == 0` is a pure back shrink.
+
+Crash safety mirrors the non-tail tail-shrink: both residues are zeroed first (a
+fault there keeps the original, `handle: Some`), then inserted under the lock.
+Once the first insert begins a torn insert is `handle: None` (the block lost,
+same contract as `dealloc`); a crash between the two inserts frees one residue
+and leaks the other, never touching the retained window's bytes.
 
 ### Crash consistency
 

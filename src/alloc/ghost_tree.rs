@@ -1151,24 +1151,29 @@ impl GhostTreeBstackAllocator {
         }
     }
 
-    /// Trim `pf` bytes off the front of the block at `start`, inserting the
-    /// freed front `[start, start + pf)` into the AVL tree and returning a handle
-    /// at `start + pf` with visible length `new_len`. The retained tail never
-    /// moves.
+    /// Shrink the block at `start` by trimming `pf` bytes off the front and/or
+    /// narrowing the back, returning a handle at `start + pf` with visible length
+    /// `new_len`. The retained window never moves; each residue — the front
+    /// `[start, start + pf)` and the back `[new_start + retained, start +
+    /// aligned_old)` — is zeroed and inserted into the AVL tree as its own free
+    /// block, exactly as freeing them one-by-one would (the same per-region
+    /// insert `dealloc`/`dealloc_bulk` use).
     ///
-    /// `pf` must be `MIN_ALLOC`-aligned and at least `MIN_ALLOC` (so the freed
-    /// front is a valid node-bearing block), and the retained block
-    /// `align_up_len(old_len) - pf` must stay a valid block that exactly backs
-    /// `new_len` — otherwise the residue would leak, so the call returns
-    /// [`io::ErrorKind::Unsupported`].
+    /// `pf` must be `MIN_ALLOC`-aligned; a nonzero `pf` and each nonzero residue
+    /// is therefore a full block. Because blocks are exact-size (no header), the
+    /// residues are computed as `align_up_len` differences and are always a
+    /// `MIN_ALLOC` multiple — `0` (nothing to free) or `>= MIN_ALLOC`. A
+    /// misaligned `pf` returns [`io::ErrorKind::Unsupported`].
     ///
     /// # Crash safety
     ///
-    /// Mirrors the non-tail shrink: the freed front is zeroed (a fault there
-    /// leaves the original intact, `handle: Some`), then AVL-inserted under the
-    /// lock. A torn insert cannot be retried, so it reports `handle: None`; the
-    /// retained tail's bytes are never touched by either step.
-    fn shrink_front_inplace<'a>(
+    /// Both residues are zeroed first (a fault there leaves the original block
+    /// intact, `handle: Some`), then AVL-inserted under the lock. Once the first
+    /// insert begins a torn insert cannot be retried, so it reports
+    /// `handle: None`; the retained window's bytes are never touched. A crash
+    /// between the two inserts frees one residue and leaks the other (reclaimable
+    /// on reopen), never corrupting the retained window.
+    fn shrink_inplace<'a>(
         &'a self,
         start: u64,
         old_len: u64,
@@ -1177,37 +1182,52 @@ impl GhostTreeBstackAllocator {
     ) -> Result<BStackOwnedSlice<'a, Self>, BStackAllocError<'a, Self>> {
         let mut lost = false;
         let result = (|| -> io::Result<BStackOwnedSlice<'a, Self>> {
-            if pf < MIN_ALLOC || !pf.is_multiple_of(MIN_ALLOC) {
+            // A nonzero front trim must land the retained window on a valid,
+            // aligned block boundary. `pf == 0` (pure back shrink) is allowed.
+            if !pf.is_multiple_of(MIN_ALLOC) {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
-                    "realloc_inplace: front trim too small or misaligned to carve in place",
+                    "realloc_inplace: front trim misaligned to carve in place",
                 ));
             }
             let aligned_old = Self::align_up_len(old_len);
-            // Retained block after the carve. `pf` is a MIN_ALLOC multiple, so
-            // this equals `align_up_len(old_len) - pf`; it must be a valid block
-            // that exactly backs `new_len` (no residue to leak).
-            match aligned_old.checked_sub(pf) {
-                Some(r) if r >= MIN_ALLOC && r == Self::align_up_len(new_len) => {}
-                _ => {
+            let retained = Self::align_up_len(new_len); // >= MIN_ALLOC
+            let new_start = start + pf;
+            let back_start = new_start + retained;
+            // Back residue. `pf`, `retained`, `aligned_old` are MIN_ALLOC
+            // multiples, so this is one too; `new_len <= old_len - pf` guarantees
+            // it is non-negative. A `checked_sub` failure would mean a caller
+            // passed a length larger than the block, which cannot be done here.
+            let back_size = match aligned_old.checked_sub(pf + retained) {
+                Some(b) => b,
+                None => {
                     return Err(io::Error::new(
                         io::ErrorKind::Unsupported,
-                        "realloc_inplace: front trim leaves an unaccounted or too-small block",
+                        "realloc_inplace: shrink leaves an unaccounted block",
                     ));
                 }
-            }
-            let new_start = start + pf;
+            };
 
-            // Zero the freed front (upholds the zeroed-memory invariant). A fault
-            // here fires before the tree mutation, so the original is intact.
-            self.stack.zero(start, pf)?;
+            // Zero both residues before any tree mutation. Faults here fire
+            // before the `lost` point, so the original block is handed back.
+            if pf > 0 {
+                self.stack.zero(start, pf)?;
+            }
+            if back_size > 0 {
+                self.stack.zero(back_start, back_size)?;
+            }
 
             #[cfg(feature = "atomic")]
             let _guard = self.lock.lock().unwrap();
             // Past this point a torn AVL insert cannot be safely retried.
             lost = true;
-            self.avl_insert(start, pf)?;
-            // SAFETY: retained tail at new_start backs exactly `new_len` bytes.
+            if pf > 0 {
+                self.avl_insert(start, pf)?;
+            }
+            if back_size > 0 {
+                self.avl_insert(back_start, back_size)?;
+            }
+            // SAFETY: retained window at new_start backs exactly `new_len` bytes.
             Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, new_start, new_len) })
         })();
         result.map_err(|source| BStackAllocError {
@@ -1226,18 +1246,20 @@ impl BStackInPlaceResizeAllocator for GhostTreeBstackAllocator {
     /// In-place resize for the zero-overhead AVL arena.
     ///
     /// Because blocks carry no header, their size is derived from the handle
-    /// length (`align_up_len`), so a resize that leaves an unaccounted region
-    /// would leak it. Only two combinations avoid that without relocating:
+    /// length (`align_up_len`), so a *grow* would need a move (there is no
+    /// neighbour tag to grow into) and is `Unsupported`. **Shrinking** either or
+    /// both edges is supported: the trimmed front and/or back residue is each
+    /// inserted into the AVL tree as its own free block, and the retained window
+    /// — an exact-size block — never moves. Supported combinations:
     ///
     /// * identity (`prepend == 0 && append == 0`);
-    /// * **pure front shrink** (`prepend < 0 && append == 0`): the trimmed front
-    ///   is inserted into the AVL tree and the retained tail — an exact-size
-    ///   block — never moves.
+    /// * pure front shrink (`prepend < 0 && append == 0`);
+    /// * pure back shrink (`prepend == 0 && append < 0`);
+    /// * front + back shrink together (`prepend < 0 && append < 0`).
     ///
-    /// Everything else (back resize, front grow, mixed edges) returns
-    /// [`io::ErrorKind::Unsupported`]. Front trim requires an
-    /// `MIN_ALLOC`-aligned `prepend` of at least `MIN_ALLOC` that leaves a valid
-    /// retained block.
+    /// Any grow (`prepend > 0` or `append > 0`) returns
+    /// [`io::ErrorKind::Unsupported`]. A front trim requires a `MIN_ALLOC`-aligned
+    /// `prepend`; a misaligned one falls back to a copy in `try_subslice`.
     fn realloc_inplace<'a>(
         &'a self,
         slice: BStackOwnedSlice<'a, Self>,
@@ -1299,25 +1321,20 @@ impl BStackInPlaceResizeAllocator for GhostTreeBstackAllocator {
             })
         };
 
-        if prepend == 0 {
-            if append == 0 {
-                // SAFETY: same region, unchanged length.
-                return Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, start, new_len) });
-            }
-            // A back resize would leave an unaccounted region (shrink) or need a
-            // move (non-tail grow); neither is done here.
+        if prepend == 0 && append == 0 {
+            // SAFETY: same region, unchanged length.
+            return Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, start, new_len) });
+        }
+        // A grow at either edge would need a move (no header/neighbour tag).
+        if prepend > 0 || append > 0 {
             return Err(unsupported(
-                "realloc_inplace: back resize not supported by GhostTreeBstackAllocator",
+                "realloc_inplace: grow not supported by GhostTreeBstackAllocator",
             ));
         }
-        if prepend > 0 || append != 0 {
-            return Err(unsupported(
-                "realloc_inplace: only pure front shrink is supported by GhostTreeBstackAllocator",
-            ));
-        }
-        // prepend < 0, append == 0: pure front shrink.
+        // prepend <= 0 and append <= 0 (at least one negative): shrink the front
+        // by `pf` and/or the back, freeing each residue into the tree.
         let pf = prepend.unsigned_abs();
-        self.shrink_front_inplace(start, old_len, pf, new_len)
+        self.shrink_inplace(start, old_len, pf, new_len)
     }
 }
 
@@ -2460,7 +2477,7 @@ mod tests {
     }
 
     #[test]
-    fn front_shrink_inplace_rejects_misaligned_or_small_or_back() {
+    fn realloc_inplace_rejects_misaligned_front_or_any_grow() {
         let (alloc, path) = open_fresh();
         let _g = Guard(path);
         let make = || {
@@ -2469,12 +2486,12 @@ mod tests {
             h
         };
         for (pp, ap, what) in [
-            (-16i64, 0i64, "sub-MIN_ALLOC trim"),
+            (-16i64, 0i64, "sub-MIN_ALLOC (misaligned) trim"),
             (-48, 0, "misaligned trim"),
-            (0, -8, "back shrink"),
+            (-16, -8, "misaligned front + back shrink"),
             (0, 8, "back grow"),
             (32, 0, "front grow"),
-            (-32, -8, "front shrink + back shrink"),
+            (-32, 8, "front shrink + back grow"),
         ] {
             let h = make();
             let err = alloc.realloc_inplace(h, pp, ap).unwrap_err();
@@ -2482,6 +2499,84 @@ mod tests {
             let back = err.handle.expect(what);
             alloc.dealloc(back).map_err(|e| e.source).unwrap();
         }
+    }
+
+    #[test]
+    fn back_shrink_inplace_frees_back_residue() {
+        let (alloc, path) = open_fresh();
+        let _g = Guard(path);
+        let pat: Vec<u8> = (0..100).map(|i| (i % 251) as u8).collect();
+        let mut h = alloc.alloc(100).unwrap(); // block = 128
+        h.write(&pat).unwrap();
+        let start = h.start();
+
+        // Pure back shrink: retained window stays at `start`, back residue freed.
+        let r = alloc.realloc_inplace(h, 0, -40).unwrap();
+        assert_eq!(r.start(), start);
+        assert_eq!(r.len(), 60);
+        assert_eq!(r.read().unwrap(), pat[..60].to_vec());
+
+        // The 64-byte back residue (128 - align_up_len(60)=64) returns to the tree.
+        let reused = alloc.alloc(64).unwrap();
+        assert_eq!(reused.start(), start + 64);
+        alloc.dealloc(reused).map_err(|e| e.source).unwrap();
+        alloc.dealloc(r).map_err(|e| e.source).unwrap();
+    }
+
+    #[test]
+    fn front_and_back_shrink_inplace_together() {
+        let (alloc, path) = open_fresh();
+        let _g = Guard(path);
+        let pat: Vec<u8> = (0..100).map(|i| (i % 251) as u8).collect();
+        let mut h = alloc.alloc(100).unwrap(); // block = 128
+        h.write(&pat).unwrap();
+        let start = h.start();
+
+        // Trim 32 off the front and narrow to a 58-byte window: front residue 32,
+        // retained block 64, back residue 32 (all freed / kept as exact blocks).
+        let r = alloc.realloc_inplace(h, -32, -10).unwrap();
+        assert_eq!(r.start(), start + 32);
+        assert_eq!(r.len(), 58);
+        assert_eq!(r.read().unwrap(), pat[32..90].to_vec());
+
+        // Both residues are back in the tree and reusable.
+        let a = alloc.alloc(32).unwrap();
+        let b = alloc.alloc(32).unwrap();
+        assert_eq!(
+            [a.start(), b.start()]
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>(),
+            [start, start + 96]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>()
+        );
+        alloc.dealloc(a).map_err(|e| e.source).unwrap();
+        alloc.dealloc(b).map_err(|e| e.source).unwrap();
+        alloc.dealloc(r).map_err(|e| e.source).unwrap();
+    }
+
+    #[test]
+    fn front_and_back_shrink_survives_reopen() {
+        let (alloc, path) = open_fresh();
+        let _g = Guard(path.clone());
+        let pat: Vec<u8> = (0..100).map(|i| (i % 251) as u8).collect();
+        let mut h = alloc.alloc(100).unwrap();
+        h.write(&pat).unwrap();
+        let r = alloc.realloc_inplace(h, -32, -10).unwrap();
+        let (r_start, r_len) = (r.start(), r.len());
+        drop(alloc);
+
+        // Reopen (coalesce/rebalance walks both freed residues). The retained
+        // middle window survives at its carved offset and the allocator works.
+        let alloc = reopen(&path);
+        assert_eq!(
+            alloc.stack().get(r_start, r_start + r_len).unwrap(),
+            pat[32..90].to_vec()
+        );
+        let mut d = alloc.alloc(64).unwrap();
+        d.write([9u8; 64]).unwrap();
+        assert_eq!(d.read().unwrap(), vec![9u8; 64]);
     }
 
     #[test]
@@ -2508,22 +2603,25 @@ mod tests {
 
     #[cfg(feature = "atomic")]
     #[test]
-    fn try_subslice_front_trim_is_inplace_then_falls_back() {
+    fn try_subslice_inplace_for_aligned_front_then_falls_back_for_misaligned() {
         let (alloc, path) = open_fresh();
         let _g = Guard(path);
         let pat: Vec<u8> = (0..100).map(|i| (i % 251) as u8).collect();
 
+        // Aligned front (32) with a back trim: fully in place now.
         let mut a = alloc.alloc(100).unwrap();
         a.write(&pat).unwrap();
-        // Pure front trim: in place (front is MIN_ALLOC-aligned).
-        let sub = a.try_subslice_inplace(32, 100).unwrap();
-        assert_eq!(sub.read().unwrap(), pat[32..100].to_vec());
+        let sub = a.try_subslice_inplace(32, 90).unwrap();
+        assert_eq!(sub.read().unwrap(), pat[32..90].to_vec());
 
+        // Misaligned front (10): the in-place carve can't; the fallback copies.
         let mut b = alloc.alloc(100).unwrap();
         b.write(&pat).unwrap();
-        // Front + back trim: front shrink alone can't; fallback copies.
-        let sub2 = b.try_subslice(32, 90).unwrap();
-        assert_eq!(sub2.read().unwrap(), pat[32..90].to_vec());
+        let err = b.try_subslice_inplace(10, 90).unwrap_err();
+        assert_eq!(err.source.kind(), ErrorKind::Unsupported);
+        let b = err.handle.unwrap();
+        let sub2 = b.try_subslice(10, 90).unwrap();
+        assert_eq!(sub2.read().unwrap(), pat[10..90].to_vec());
     }
 }
 
@@ -2705,6 +2803,45 @@ mod fault_tests {
         assert_eq!(
             alloc.stack().get(r_start, r_start + 68).unwrap(),
             vec![0x3Cu8; 68]
+        );
+        let mut c = alloc.alloc(96).unwrap();
+        c.write([6u8; 96]).unwrap();
+        assert_eq!(c.read().unwrap(), vec![6u8; 96]);
+    }
+
+    // A front+back shrink frees two residues with two AVL inserts. Faulting the
+    // first insert's first `set` (after both residues are zeroed, past the `lost`
+    // point) reports the block lost; a reopen must still recover a consistent
+    // tree with the retained middle window intact.
+    #[test]
+    fn front_and_back_shrink_avl_insert_fault_is_lost() {
+        let path = temp_path("gt_fbshrink_lost");
+        let _g = Guard(path.clone());
+
+        let r_start = {
+            let alloc = GhostTreeBstackAllocator::new(BStack::open(&path).unwrap()).unwrap();
+            let mut h = alloc.alloc(100).unwrap();
+            h.write([0x3Cu8; 100]).unwrap();
+            let start = h.start();
+
+            arm(&alloc, FailOpAt::new("set", 0, ErrorKind::Other));
+            let err = alloc
+                .realloc_inplace(h, -32, -10)
+                .expect_err("shrink must fail when the AVL insert faults");
+            disarm(&alloc);
+            assert!(
+                err.handle.is_none(),
+                "a torn AVL insert reports the block lost"
+            );
+            drop(alloc);
+            start + 32
+        };
+
+        let alloc = GhostTreeBstackAllocator::new(BStack::open(&path).unwrap()).unwrap();
+        // Retained middle window [32, 90) survives at the carved offset.
+        assert_eq!(
+            alloc.stack().get(r_start, r_start + 58).unwrap(),
+            vec![0x3Cu8; 58]
         );
         let mut c = alloc.alloc(96).unwrap();
         c.write([6u8; 96]).unwrap();

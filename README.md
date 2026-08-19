@@ -1026,10 +1026,10 @@ aligned bytes, carving the front into a free block), front grow (≥ 24 aligned
 bytes, consuming a free left neighbour), back grow (same-block, tail-extend, or
 merging a free right neighbour), and back shrink; mixed grow/shrink across the
 two edges is `Unsupported`.
-`GhostTreeBstackAllocator` implements pure front shrink (`MIN_ALLOC`-aligned,
-inserting the trimmed front into its tree); its other combinations are
-`Unsupported`. This bounds a front trim at the bytes removed rather than the
-retained payload.
+`GhostTreeBstackAllocator` implements front shrink, back shrink, and both
+together (`MIN_ALLOC`-aligned front), inserting each trimmed residue into its
+tree as a free block; any grow is `Unsupported`. This bounds a trim at the bytes
+removed rather than the retained payload.
 
 #### Subslicing and joining on `BStackOwnedSlice`
 
@@ -1197,9 +1197,10 @@ Without `atomic`: `Send` only.  With `atomic`: `Send + Sync` via an internal
 ### `GhostTreeBstackAllocator` (`alloc`)
 
 AVL tree keyed on `(size, address)`; best-fit; zero per-allocation overhead.
-Also implements `BStackBulkAllocator` and `BStackInPlaceResizeAllocator` (pure
-front shrink only — a headerless, exact-size block cannot resize the back or
-grow the front without leaking or moving).  Without `atomic`: `Send` only.
+Also implements `BStackBulkAllocator` and `BStackInPlaceResizeAllocator` (front
+and/or back shrink, `MIN_ALLOC`-aligned front — each trimmed residue becomes a
+free block; grows are `Unsupported`, as a headerless exact-size block has no
+neighbour tag to grow into without moving).  Without `atomic`: `Send` only.
 With `atomic`: `Send + Sync` via an internal `Mutex`.
 
 ### `SlabBStackAllocator` (`alloc + set`)

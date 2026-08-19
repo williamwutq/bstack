@@ -140,10 +140,11 @@ Implemented:
   free right neighbour via the shared `try_grow_into_next_free` helper), back
   shrink. Mixed cross-edge grow/shrink → `Unsupported`. Torn-write recovery is
   fault-tested.
-- `GhostTreeBstackAllocator`: pure front shrink (`MIN_ALLOC`-aligned; inserts the
-  trimmed front into the AVL, mirroring the non-tail tail-shrink). Everything else
-  → `Unsupported` (a headerless, exact-size block cannot resize the back or grow
-  the front without leaking or moving). Fault-tested.
+- `GhostTreeBstackAllocator`: front shrink, back shrink, and both together
+  (`MIN_ALLOC`-aligned front); each trimmed residue is inserted into the AVL as its
+  own free block, the retained window never moves. Any grow → `Unsupported` (a
+  headerless, exact-size block has no neighbour tag to grow into without moving).
+  Fault-tested (incl. the two-insert torn-write path).
 - Owned-slice methods with the always-succeeds `alloc`+copy fallbacks.
 
 Resolved design questions:
@@ -156,7 +157,8 @@ Resolved design questions:
   methods; the fallbacks stay available because every trait impl is allowed to
   answer `Unsupported`.
 - **Join attempt order.** Fixed order: extend `self`'s tail first, then `other`'s
-  front. (Longer-side-first — copy the smaller side — remains a possible refinement.)
+  front. (Longer-side-first is deliberately *not* pursued — the extra feasibility
+  probe is not worth the marginal copy-volume win.)
 - **Recovery contract.** `try_subslice_inplace` is a single `realloc_inplace` call and
   inherits its atomicity. `try_join*` compose calls: every intermediate state keeps
   each byte inside exactly one valid or crash-recoverable allocation; on a
@@ -167,19 +169,10 @@ Resolved design questions:
 
 ### Remaining follow-ups
 
-- **`GhostTree` front shrink + back shrink together.** Only *pure* front shrink is in
-  place today; a simultaneous back trim (the general `try_subslice`) needs the back
-  residue freed too — a second AVL insert (or tail discard) with its own torn-insert
-  `handle: None` window. Front grow stays `Unsupported` (no boundary tags / ends-at
-  index). Back-only resize on GhostTree could also be added (delegating to the
-  existing `realloc` shrink/tail-grow paths, guarded to reject the move case).
-- **Small / misaligned front trim.** `FirstFit` trims `< 40` bytes (or `< 24` for
-  grow), or non-8-aligned, and `GhostTree` trims not `MIN_ALLOC`-aligned, fall back to
-  copy in `try_subslice`; a coalesce-into-free-left-neighbour path could serve some of
-  these in place.
-- **Join order / `try_join` refinement.** Fixed order (extend `self`'s tail, then
-  `other`'s front); longer-side-first (copy the smaller side) remains a possible
-  refinement now that both in-place directions exist for `FirstFit`.
-- **`to_owned_uninit_in` / `try_clone_uninit`** and relaxing the copy fallbacks to
-  `alloc_uninit` where `A: BStackUninitAllocator` (also a `realloc_inplace_uninit`
-  that skips zeroing newly exposed bytes).
+- **`realloc_inplace_uninit` and uninit fallbacks.** A `realloc_inplace_uninit`
+  variant that skips zeroing newly exposed bytes, and relaxing `try_subslice`/
+  `try_join`'s copy fallbacks to `alloc_uninit` where `A: BStackUninitAllocator`
+  (the destination is overwritten immediately, so the zero-fill is wasted).
+
+*(Not pursued: sub-threshold / misaligned front trims served in place — the
+`try_subslice` copy fallback covers them; and longer-side-first join ordering.)*
