@@ -831,6 +831,8 @@ The `fault-injection` feature lets tests make `BStack` I/O fail on demand, to ex
 
 The whole mechanism is gated on `all(debug_assertions, feature = "fault-injection")`: it is off by default, and a `--release` build carries none of it — no struct field, no per-call branch — so release performance is unaffected.
 
+The `debug-no-sync` feature (also `debug_assertions`-gated, off by default) skips the durable sync call on every write to speed up fault-injection test runs; writes still happen, just unsynced, so it gives up durability and is debug/testing only.
+
 ---
 
 ## Allocators (`alloc` feature)
