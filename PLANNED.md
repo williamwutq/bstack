@@ -130,3 +130,46 @@ The underlying need — straight-line atomic blocks instead of the generator pro
 ### Motivation
 
 Downstream crash-safety and fault-injection tests spend most of their wall-clock time paying for real durable sync on every write, even when the test only cares about post-crash state correctness, not actual durability. A feature-gated flag that skips the durable sync call (writes still happen, just without the sync) would let downstream fault-injection harnesses iterate much faster, at the cost of no longer guaranteeing durability — so it must be clearly scoped to debug/testing use only.
+
+---
+
+## `to_owned_in`/`try_clone`: copying a borrowed view into a fresh on-disk allocation
+
+**Feature flag:** `alloc` + `set` + `atomic` (same gate as `copy_from_bstack_slice`, which the fast path uses).
+**Breaking change:** No
+
+### Motivation
+
+`BStackSlice`/`BStackChunk` only reborrow (`subslice`, `split_at`, `head`, `tail`, `chunks`, ...) — never an independent on-disk copy. `BStackOwnedSlice` is deliberately non-`Copy`/non-`Clone` (single owner) and has no way to duplicate its contents at all, even via `as_slice()`. Both gaps require hand-rolling `allocator.alloc(len)` + `copy_from_bstack_slice` at each call site today.
+
+### Design
+
+```rust
+impl<'a> BStackSlice<'a> {
+    fn to_owned_in<'b, A: BStackAllocator<Error = io::Error>>(
+        &self, allocator: &'b A,
+    ) -> io::Result<BStackOwnedSlice<'b, A>>;
+}
+impl<'a> BStackChunk<'a> {
+    fn to_owned_in<'b, A: BStackAllocator<Error = io::Error>>(
+        &self, allocator: &'b A,
+    ) -> io::Result<BStackOwnedSlice<'b, A>>;
+}
+impl<'a, A: BStackAllocator<Error = io::Error>> BStackOwnedSlice<'a, A> {
+    fn try_clone(&self) -> io::Result<BStackOwnedSlice<'a, A>>;
+}
+```
+
+- `BStackSlice::to_owned_in`: `allocator.alloc(self.len())`, then one crash-atomic `copy_from_bstack_slice` — no bytes read into process memory.
+- `BStackChunk::to_owned_in`: `self.as_slice().to_owned_in(allocator)`. Returns a plain `BStackOwnedSlice`, not a new owned-chunk type — `BStackChunk` already has no allocator ops of its own, just a stride over a byte range. Re-chunk with `BStackChunk::from_slice(owned.as_slice(), chunk_len)` (safe, O(1); can't return `None` since length and alignment are preserved by the copy).
+- `BStackOwnedSlice::try_clone`: `self.as_slice().to_owned_in(self.allocator())`. No allocator parameter — the handle already carries one.
+
+Notes common to all three:
+
+- **Same `BStack` only.** `copy_from_bstack_slice`, the sole crash-atomic in-file copy primitive, rejects a cross-stack source with `InvalidInput`; these methods just propagate that instead of adding a `read()` + `copy_from_slice` fallback for a different stack. `try_clone` can't hit this case — `self.allocator()` is by construction on the same stack as `self`.
+- **Bound.** `A: BStackAllocator<Error = io::Error>`, not the stricter `BStackOwnedSliceAllocator` — only `Error = io::Error` is needed for the `io::Result` return; the `Allocated<'_> → BStackOwnedSlice` conversion is already guaranteed by base `BStackAllocator`. The stricter bound would also pin `Allocated<'a>` to exactly `BStackOwnedSlice<'a, Self>`, excluding allocators with a richer handle type that merely `Into`-converts.
+- **Naming.** `to_owned_in` mirrors nightly `Box::clone_in`/`Vec::clone_in` (allocator-parameterized construction). `try_clone`, not `clone_in`/`Clone::clone` — no allocator argument to justify `_in`, and an infallible `Clone::clone` would hide disk I/O behind an operator expected to be free (cf. NOT PLANNED: no I/O in `PartialEq`); mirrors `std::fs::File::try_clone` instead.
+
+### Open questions
+
+- **`_uninit` counterpart.** The destination region is always fully overwritten immediately after allocation, so `alloc`'s zero-fill is wasted work whenever `A: BStackUninitAllocator` also holds — worth a parallel `to_owned_uninit_in`/`try_clone_uninit` using `alloc_uninit`, mirroring the crate's existing `alloc`/`alloc_uninit` split, rather than one method that silently branches on an extra trait bound.
