@@ -122,17 +122,6 @@ The underlying need — straight-line atomic blocks instead of the generator pro
 
 ---
 
-## Debug feature flag to skip durable sync for faster fault-injection testing
-
-**Feature flag:** new debug-only flag (e.g. `debug-no-sync`), off by default and not for production use.
-**Breaking change:** No — purely additive, gated behind an opt-in flag.
-
-### Motivation
-
-Downstream crash-safety and fault-injection tests spend most of their wall-clock time paying for real durable sync on every write, even when the test only cares about post-crash state correctness, not actual durability. A feature-gated flag that skips the durable sync call (writes still happen, just without the sync) would let downstream fault-injection harnesses iterate much faster, at the cost of no longer guaranteeing durability — so it must be clearly scoped to debug/testing use only.
-
----
-
 ## `BStackInPlaceResizeAllocator`: front/back in-place resize, and owned-slice subslicing/joining built on it
 
 **Feature flag:** `alloc` + `set` + `atomic`.
