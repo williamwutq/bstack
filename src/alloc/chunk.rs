@@ -4,6 +4,8 @@
 //! `set` + `atomic`; construction, iteration, and binary search need no flag
 //! beyond `alloc`.
 
+#[cfg(all(feature = "set", feature = "atomic"))]
+use super::BStackOwnedSliceAllocator;
 use super::{BStackAllocator, BStackOwnedSlice, BStackSlice};
 use crate::BStack;
 use std::cmp::Ordering;
@@ -301,6 +303,44 @@ impl<'a> BStackChunk<'a> {
     #[must_use]
     pub fn into_slice(self) -> BStackSlice<'a> {
         self.aligned
+    }
+
+    /// Copy this view's aligned region into a fresh allocation from
+    /// `allocator`, returning a plain [`BStackOwnedSlice`].
+    ///
+    /// Delegates to [`BStackSlice::to_owned_in`] on [`as_slice`](Self::as_slice).
+    /// The result is a plain owned slice, not an owned chunk — re-chunk it with
+    /// [`from_slice`](Self::from_slice)`(owned.as_slice(), self.chunk_len())`,
+    /// which cannot fail since the copy preserves length and alignment.
+    ///
+    /// Requires the `set` and `atomic` features.
+    ///
+    /// # Errors
+    ///
+    /// As [`BStackSlice::to_owned_in`].
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    pub fn to_owned_in<'b, A: BStackOwnedSliceAllocator>(
+        &self,
+        allocator: &'b A,
+    ) -> io::Result<BStackOwnedSlice<'b, A>> {
+        self.as_slice().to_owned_in(allocator)
+    }
+
+    /// Like [`to_owned_in`](Self::to_owned_in), but skips the destination's
+    /// zero-fill via [`BStackSlice::to_owned_uninit_in`].
+    ///
+    /// Requires the `set` and `atomic` features, and an allocator implementing
+    /// [`BStackUninitAllocator`](super::BStackUninitAllocator).
+    ///
+    /// # Errors
+    ///
+    /// As [`BStackSlice::to_owned_in`].
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    pub fn to_owned_uninit_in<'b, A>(&self, allocator: &'b A) -> io::Result<BStackOwnedSlice<'b, A>>
+    where
+        A: super::BStackUninitAllocator + BStackOwnedSliceAllocator,
+    {
+        self.as_slice().to_owned_uninit_in(allocator)
     }
 
     /// Re-divide this view's aligned region with a different stride,

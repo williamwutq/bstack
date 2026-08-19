@@ -1,4 +1,6 @@
 use super::BStackAllocator;
+#[cfg(all(feature = "set", feature = "atomic"))]
+use super::BStackOwnedSliceAllocator;
 use crate::BStack;
 use std::fmt;
 use std::hash::{Hash, Hasher};
@@ -797,6 +799,68 @@ impl<'a> BStackSlice<'a> {
             return Ok(());
         }
         self.stack.copy(src.start(), self.start(), self.len())
+    }
+
+    /// Copy this view's contents into a fresh allocation from `allocator`.
+    ///
+    /// Allocates `self.len()` bytes via [`BStackAllocator::alloc`], then issues
+    /// one crash-atomic
+    /// [`copy_from_bstack_slice`](Self::copy_from_bstack_slice) — no bytes are
+    /// read into process memory, and the source is left unchanged. The returned
+    /// [`BStackOwnedSlice`] is tied to `allocator`'s borrow, independent of this
+    /// view's own lifetime.
+    ///
+    /// Requires the `set` and `atomic` features.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] if `allocator` is backed by a
+    /// different [`BStack`] than this view — the copy primitive cannot cross
+    /// stacks — or any [`io::Error`] from the allocation or copy. If the copy
+    /// fails after the allocation succeeds, the fresh region is freed on a
+    /// best-effort basis before returning the copy error; if that free itself
+    /// fails, the region is left allocated but unreferenced (reclaimable by the
+    /// allocator's recovery), exactly as a crash between the two steps would
+    /// leave it.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    pub fn to_owned_in<'b, A: BStackOwnedSliceAllocator>(
+        &self,
+        allocator: &'b A,
+    ) -> io::Result<BStackOwnedSlice<'b, A>> {
+        let mut dest = allocator.alloc(self.len())?;
+        if let Err(e) = dest.as_slice_mut().copy_from_bstack_slice(self) {
+            let _ = allocator.dealloc(dest);
+            return Err(e);
+        }
+        Ok(dest)
+    }
+
+    /// Like [`to_owned_in`](Self::to_owned_in), but skips the destination's
+    /// zero-fill via [`alloc_uninit`](super::BStackUninitAllocator::alloc_uninit).
+    ///
+    /// The fresh region is fully overwritten by the copy, so the zero-fill
+    /// `alloc` would perform is pure waste here. Unlike a bare `alloc_uninit`,
+    /// the returned handle carries fully-defined data (a copy of this view) with
+    /// no caller-side overwrite obligation; the only difference from
+    /// [`to_owned_in`](Self::to_owned_in) is the elided fill.
+    ///
+    /// Requires the `set` and `atomic` features, and an allocator implementing
+    /// [`BStackUninitAllocator`](super::BStackUninitAllocator).
+    ///
+    /// # Errors
+    ///
+    /// As [`to_owned_in`](Self::to_owned_in).
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    pub fn to_owned_uninit_in<'b, A>(&self, allocator: &'b A) -> io::Result<BStackOwnedSlice<'b, A>>
+    where
+        A: super::BStackUninitAllocator + BStackOwnedSliceAllocator,
+    {
+        let mut dest = allocator.alloc_uninit(self.len())?;
+        if let Err(e) = dest.as_slice_mut().copy_from_bstack_slice(self) {
+            let _ = allocator.dealloc(dest);
+            return Err(e);
+        }
+        Ok(dest)
     }
 
     /// Copy `src_range` (relative to this slice) to `dest` (relative to this
@@ -1634,6 +1698,48 @@ impl<'a, A: BStackAllocator> BStackOwnedSlice<'a, A> {
     #[must_use]
     pub fn writer_at<'s>(&'s mut self, offset: u64) -> BStackSliceWriter<'s> {
         self.as_slice_mut().writer_at(offset)
+    }
+}
+
+#[cfg(all(feature = "set", feature = "atomic"))]
+impl<'a, A: BStackOwnedSliceAllocator> BStackOwnedSlice<'a, A> {
+    /// Copy this allocation's contents into a second, independent allocation
+    /// from the same allocator.
+    ///
+    /// `BStackOwnedSlice` is deliberately non-`Clone` — duplicating it would
+    /// silently issue disk I/O behind an operator expected to be free. This
+    /// explicit, fallible method makes the copy visible, mirroring
+    /// [`std::fs::File::try_clone`]. Equivalent to
+    /// [`self.as_slice().to_owned_in(self.allocator())`](BStackSlice::to_owned_in);
+    /// no allocator argument, as the handle already carries one.
+    ///
+    /// Requires the `set` and `atomic` features.
+    ///
+    /// # Errors
+    ///
+    /// Any [`io::Error`] from the allocation or copy. Cannot fail cross-stack —
+    /// the clone reuses this handle's own allocator.
+    pub fn try_clone(&self) -> io::Result<BStackOwnedSlice<'a, A>> {
+        self.as_slice().to_owned_in(self.allocator())
+    }
+}
+
+#[cfg(all(feature = "set", feature = "atomic"))]
+impl<'a, A> BStackOwnedSlice<'a, A>
+where
+    A: super::BStackUninitAllocator + BStackOwnedSliceAllocator,
+{
+    /// Like [`try_clone`](Self::try_clone), but skips the destination's
+    /// zero-fill via [`to_owned_uninit_in`](BStackSlice::to_owned_uninit_in).
+    ///
+    /// Requires the `set` and `atomic` features, and an allocator implementing
+    /// [`BStackUninitAllocator`](super::BStackUninitAllocator).
+    ///
+    /// # Errors
+    ///
+    /// As [`try_clone`](Self::try_clone).
+    pub fn try_clone_uninit(&self) -> io::Result<BStackOwnedSlice<'a, A>> {
+        self.as_slice().to_owned_uninit_in(self.allocator())
     }
 }
 
