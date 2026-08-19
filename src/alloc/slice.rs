@@ -1,4 +1,6 @@
 use super::BStackAllocator;
+#[cfg(all(feature = "set", feature = "atomic"))]
+use super::BStackOwnedSliceAllocator;
 use crate::BStack;
 use std::fmt;
 use std::hash::{Hash, Hasher};
@@ -815,16 +817,21 @@ impl<'a> BStackSlice<'a> {
     /// Returns [`io::ErrorKind::InvalidInput`] if `allocator` is backed by a
     /// different [`BStack`] than this view — the copy primitive cannot cross
     /// stacks — or any [`io::Error`] from the allocation or copy. If the copy
-    /// fails after the allocation succeeds, the fresh region is left allocated
-    /// but unreferenced (reclaimable by the allocator's recovery), exactly as a
-    /// crash between the two steps would leave it.
+    /// fails after the allocation succeeds, the fresh region is freed on a
+    /// best-effort basis before returning the copy error; if that free itself
+    /// fails, the region is left allocated but unreferenced (reclaimable by the
+    /// allocator's recovery), exactly as a crash between the two steps would
+    /// leave it.
     #[cfg(all(feature = "set", feature = "atomic"))]
-    pub fn to_owned_in<'b, A: BStackAllocator<Error = io::Error>>(
+    pub fn to_owned_in<'b, A: BStackOwnedSliceAllocator>(
         &self,
         allocator: &'b A,
     ) -> io::Result<BStackOwnedSlice<'b, A>> {
-        let mut dest: BStackOwnedSlice<'b, A> = allocator.alloc(self.len())?.into();
-        dest.as_slice_mut().copy_from_bstack_slice(self)?;
+        let mut dest = allocator.alloc(self.len())?;
+        if let Err(e) = dest.as_slice_mut().copy_from_bstack_slice(self) {
+            let _ = allocator.dealloc(dest);
+            return Err(e);
+        }
         Ok(dest)
     }
 
@@ -846,10 +853,13 @@ impl<'a> BStackSlice<'a> {
     #[cfg(all(feature = "set", feature = "atomic"))]
     pub fn to_owned_uninit_in<'b, A>(&self, allocator: &'b A) -> io::Result<BStackOwnedSlice<'b, A>>
     where
-        A: super::BStackUninitAllocator + BStackAllocator<Error = io::Error>,
+        A: super::BStackUninitAllocator + BStackOwnedSliceAllocator,
     {
-        let mut dest: BStackOwnedSlice<'b, A> = allocator.alloc_uninit(self.len())?.into();
-        dest.as_slice_mut().copy_from_bstack_slice(self)?;
+        let mut dest = allocator.alloc_uninit(self.len())?;
+        if let Err(e) = dest.as_slice_mut().copy_from_bstack_slice(self) {
+            let _ = allocator.dealloc(dest);
+            return Err(e);
+        }
         Ok(dest)
     }
 
@@ -1692,7 +1702,7 @@ impl<'a, A: BStackAllocator> BStackOwnedSlice<'a, A> {
 }
 
 #[cfg(all(feature = "set", feature = "atomic"))]
-impl<'a, A: BStackAllocator<Error = io::Error>> BStackOwnedSlice<'a, A> {
+impl<'a, A: BStackOwnedSliceAllocator> BStackOwnedSlice<'a, A> {
     /// Copy this allocation's contents into a second, independent allocation
     /// from the same allocator.
     ///
@@ -1717,7 +1727,7 @@ impl<'a, A: BStackAllocator<Error = io::Error>> BStackOwnedSlice<'a, A> {
 #[cfg(all(feature = "set", feature = "atomic"))]
 impl<'a, A> BStackOwnedSlice<'a, A>
 where
-    A: super::BStackUninitAllocator + BStackAllocator<Error = io::Error>,
+    A: super::BStackUninitAllocator + BStackOwnedSliceAllocator,
 {
     /// Like [`try_clone`](Self::try_clone), but skips the destination's
     /// zero-fill via [`to_owned_uninit_in`](BStackSlice::to_owned_uninit_in).

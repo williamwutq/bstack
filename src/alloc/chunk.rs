@@ -4,6 +4,8 @@
 //! `set` + `atomic`; construction, iteration, and binary search need no flag
 //! beyond `alloc`.
 
+#[cfg(all(feature = "set", feature = "atomic"))]
+use super::BStackOwnedSliceAllocator;
 use super::{BStackAllocator, BStackOwnedSlice, BStackSlice};
 use crate::BStack;
 use std::cmp::Ordering;
@@ -317,7 +319,7 @@ impl<'a> BStackChunk<'a> {
     ///
     /// As [`BStackSlice::to_owned_in`].
     #[cfg(all(feature = "set", feature = "atomic"))]
-    pub fn to_owned_in<'b, A: BStackAllocator<Error = io::Error>>(
+    pub fn to_owned_in<'b, A: BStackOwnedSliceAllocator>(
         &self,
         allocator: &'b A,
     ) -> io::Result<BStackOwnedSlice<'b, A>> {
@@ -336,7 +338,7 @@ impl<'a> BStackChunk<'a> {
     #[cfg(all(feature = "set", feature = "atomic"))]
     pub fn to_owned_uninit_in<'b, A>(&self, allocator: &'b A) -> io::Result<BStackOwnedSlice<'b, A>>
     where
-        A: super::BStackUninitAllocator + BStackAllocator<Error = io::Error>,
+        A: super::BStackUninitAllocator + BStackOwnedSliceAllocator,
     {
         self.as_slice().to_owned_uninit_in(allocator)
     }
