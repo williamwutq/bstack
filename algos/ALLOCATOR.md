@@ -100,7 +100,7 @@ either edge without relocating the retained bytes; the returned range is exactly
 | `(prepend, append)`            | Path                                                                  |
 |--------------------------------|-----------------------------------------------------------------------|
 | `append <= 0`, `prepend == 0`  | narrow the visible length within the block (no I/O)                    |
-| `append > 0`, `prepend == 0`   | same-block if it already fits, else tail-extend, else `Unsupported`   |
+| `append > 0`, `prepend == 0`   | same-block if it already fits, else tail-extend, else merge the following free block (shared with `realloc`), else `Unsupported` |
 | `prepend < 0`, `append <= 0`   | carve the front into a free block (add-to-free-list), narrow the back  |
 | `prepend > 0`, `append == 0`   | grow the front from a free left neighbour (shrink it, or absorb it)    |
 | mixed grow/shrink across edges | `Unsupported`                                                          |

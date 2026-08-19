@@ -1023,8 +1023,9 @@ carried back, so a caller bug never leaks the region.
 `LinearBStackAllocator` implements it (tail-only: `prepend != 0` is
 `Unsupported`). `FirstFitBStackAllocator` implements front shrink (trim ≥ 40
 aligned bytes, carving the front into a free block), front grow (≥ 24 aligned
-bytes, consuming a free left neighbour), back grow (same-block or tail-extend),
-and back shrink; mixed grow/shrink across the two edges is `Unsupported`.
+bytes, consuming a free left neighbour), back grow (same-block, tail-extend, or
+merging a free right neighbour), and back shrink; mixed grow/shrink across the
+two edges is `Unsupported`.
 `GhostTreeBstackAllocator` implements pure front shrink (`MIN_ALLOC`-aligned,
 inserting the trimmed front into its tree); its other combinations are
 `Unsupported`. This bounds a front trim at the bytes removed rather than the
@@ -1187,8 +1188,9 @@ Doubly-linked intrusive free list with first-fit placement and immediate
 coalescing.  On-disk header flags trigger a linear recovery scan on the next
 open after an unclean shutdown.  Implements `BStackInPlaceResizeAllocator`:
 front shrink (≥ 40 aligned bytes, carved into a free block), front grow (≥ 24
-aligned bytes, consuming a free left neighbour), back grow (same-block or
-tail-extend), and back shrink; mixed cross-edge grow/shrink is `Unsupported`.
+aligned bytes, consuming a free left neighbour), back grow (same-block,
+tail-extend, or merging a free right neighbour), and back shrink; mixed
+cross-edge grow/shrink is `Unsupported`.
 Without `atomic`: `Send` only.  With `atomic`: `Send + Sync` via an internal
 `Mutex` serialising free-list mutations.
 

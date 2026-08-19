@@ -1581,12 +1581,14 @@ impl FirstFitBStackAllocator {
     }
 
     /// Grow the back edge of the block at `start` to `new_len` bytes **in
-    /// place** (`new_len > old_len`). Supports the two non-moving paths — the
-    /// block is already large enough, or it is the tail block and can be
-    /// extended — and returns [`io::ErrorKind::Unsupported`] otherwise (which
-    /// would require relocating the payload). The untouched original handle is
-    /// always recoverable on failure; the tail-extend path may return `None`
-    /// once its multi-write commit has begun.
+    /// place** (`new_len > old_len`). Supports the three non-moving paths — the
+    /// block is already large enough, it is the tail block and can be extended,
+    /// or the immediately following block is free and large enough to merge into
+    /// (via [`try_grow_into_next_free`](Self::try_grow_into_next_free)) — and
+    /// returns [`io::ErrorKind::Unsupported`] otherwise (which would require
+    /// relocating the payload). The untouched original handle is recoverable on
+    /// failure; the tail-extend path may return `None` once its multi-write
+    /// commit has begun.
     fn grow_back_inplace<'a>(
         &'a self,
         start: u64,
@@ -1631,6 +1633,17 @@ impl FirstFitBStackAllocator {
                     .set(start + aligned_new, aligned_new.to_le_bytes())?;
                 self.clear_recovery_needed()?;
                 // SAFETY: block extended in place at the tail.
+                return Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, start, new_len) });
+            }
+
+            // Not the tail: absorb the immediately following free block if it is
+            // free and large enough — the same in-place merge `realloc` performs.
+            // The lock is held above; the helper manages `recovery_needed`. On a
+            // mid-merge failure it propagates and the original handle is returned,
+            // matching `realloc`'s merge-path contract (the block is left mid-merge
+            // with `recovery_needed` set for the next reopen).
+            if self.try_grow_into_next_free(start, block_size, aligned_new, old_len, true)? {
+                // SAFETY: block grown in place by merging the next free block.
                 return Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, start, new_len) });
             }
             Err(io::Error::new(
@@ -1911,7 +1924,7 @@ impl BStackInPlaceResizeAllocator for FirstFitBStackAllocator {
     /// | `(prepend, append)`                | Behaviour                                              |
     /// |------------------------------------|--------------------------------------------------------|
     /// | `append <= 0`, `prepend == 0`      | narrow the visible length within the block (no I/O)     |
-    /// | `append > 0`, `prepend == 0`       | back grow: same-block, else tail-extend, else `Unsupported` |
+    /// | `append > 0`, `prepend == 0`       | back grow: same-block, else tail-extend, else merge next free block, else `Unsupported` |
     /// | `prepend < 0`, `append <= 0`       | carve the front into a free block, narrow the back      |
     /// | `prepend > 0`, `append == 0`       | grow the front from a free left neighbour               |
     /// | mixed grow/shrink across edges     | `Unsupported`                                           |
@@ -2490,6 +2503,25 @@ mod inplace_resize_tests {
         let got = r.read().unwrap();
         assert_eq!(&got[..50], &pattern(50)[..]);
         assert_eq!(&got[50..], &vec![0u8; 40][..]);
+    }
+
+    #[test]
+    fn back_grow_merges_next_free_block() {
+        let (alloc, _g) = open_fresh();
+        let mut a = alloc.alloc(50).unwrap();
+        a.write(pattern(50)).unwrap();
+        let a_start = a.start();
+        let b = alloc.alloc(50).unwrap();
+        let _c = alloc.alloc(10).unwrap(); // keep `b` non-tail so it stays on the free list
+        alloc.dealloc(b).map_err(|e| e.source).unwrap(); // `b` is now a's free right neighbour
+
+        // Non-tail, block too small: grows by absorbing the free right neighbour.
+        let r = alloc.realloc_inplace(a, 0, 50).unwrap();
+        assert_eq!(r.start(), a_start);
+        assert_eq!(r.len(), 100);
+        let got = r.read().unwrap();
+        assert_eq!(&got[..50], &pattern(50)[..]);
+        assert_eq!(&got[50..], &vec![0u8; 50][..]);
     }
 
     #[test]

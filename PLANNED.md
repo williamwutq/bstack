@@ -136,7 +136,8 @@ Implemented:
 - `LinearBStackAllocator`: tail-only (`prepend != 0` → `Unsupported`).
 - `FirstFitBStackAllocator`: front shrink (trim ≥ 40 aligned bytes, carved into a
   free block), front grow (≥ 24 aligned bytes, consuming a free left neighbour —
-  shrink-remainder or full-absorb), back grow (same-block / tail-extend), back
+  shrink-remainder or full-absorb), back grow (same-block / tail-extend / merge a
+  free right neighbour via the shared `try_grow_into_next_free` helper), back
   shrink. Mixed cross-edge grow/shrink → `Unsupported`. Torn-write recovery is
   fault-tested.
 - `GhostTreeBstackAllocator`: pure front shrink (`MIN_ALLOC`-aligned; inserts the
@@ -166,11 +167,6 @@ Resolved design questions:
 
 ### Remaining follow-ups
 
-- **`FirstFit` back grow via next-free merge.** Back grow currently supports
-  same-block and tail-extend only; the non-tail next-free-block merge that `realloc`
-  already performs could be reused here (returning `Unsupported` only when it would
-  truly move). Best done by factoring `realloc`'s merge into a shared in-place-only
-  helper rather than duplicating it.
 - **`GhostTree` front shrink + back shrink together.** Only *pure* front shrink is in
   place today; a simultaneous back trim (the general `try_subslice`) needs the back
   residue freed too — a second AVL insert (or tail discard) with its own torn-insert
