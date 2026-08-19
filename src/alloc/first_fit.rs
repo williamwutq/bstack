@@ -1928,6 +1928,9 @@ impl BStackInPlaceResizeAllocator for FirstFitBStackAllocator {
         prepend: i64,
         append: i64,
     ) -> Result<BStackOwnedSlice<'a, Self>, BStackAllocError<'a, Self>> {
+        // Reject a handle from another allocator instance before any logic runs
+        // (see the module's "Foreign handles" section).
+        let slice = ensure_own_handle(self, slice, "FirstFitBStackAllocator::realloc_inplace")?;
         let start = slice.start();
         let old_len = slice.len();
 
@@ -2650,6 +2653,19 @@ mod inplace_resize_tests {
         s.write([7u8; 64]).unwrap();
         assert_eq!(s.read().unwrap(), vec![7u8; 64]);
     }
+
+    #[test]
+    fn realloc_inplace_rejects_foreign_handle() {
+        let (a1, _g1) = open_fresh();
+        let (a2, _g2) = open_fresh();
+        let h = a1.alloc(64).unwrap();
+        let err = a2.realloc_inplace(h, 0, 8).unwrap_err();
+        assert_eq!(err.source.kind(), ErrorKind::InvalidInput);
+        let h = err
+            .handle
+            .expect("a refused handle is returned, not leaked");
+        a1.dealloc(h).map_err(|e| e.source).unwrap();
+    }
 }
 
 // Owned-slice subslice/join built on in-place resize (needs `set` + `atomic`).
@@ -2771,5 +2787,23 @@ mod owned_slice_subslice_join_tests {
         let got = joined.read().unwrap();
         assert_eq!(&got[..40], &vec![0xEE; 40][..]); // self, copied into other's grown front
         assert_eq!(&got[40..], &pattern(50)[..]); // other, never moved
+    }
+
+    #[test]
+    fn try_join_rejects_other_from_another_allocator() {
+        let (a1, _g1) = open_fresh();
+        let (a2, _g2) = open_fresh();
+        let s = a1.alloc(30).unwrap();
+        let o = a2.alloc(20).unwrap(); // foreign to a1
+        let err = s
+            .try_join(o)
+            .expect_err("join must refuse a foreign `other`");
+        assert_eq!(err.source.kind(), ErrorKind::InvalidInput);
+        assert_eq!(err.handles.len(), 2, "both inputs are returned, not leaked");
+        let mut it = err.handles.into_iter();
+        let s = it.next().unwrap();
+        let o = it.next().unwrap();
+        a1.dealloc(s).map_err(|e| e.source).unwrap();
+        a2.dealloc(o).map_err(|e| e.source).unwrap();
     }
 }

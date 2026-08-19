@@ -162,9 +162,11 @@
 //!
 //! Rejecting a foreign handle is therefore the *allocator's* job, at run time.
 //! Every allocator here checks ownership at the top of `realloc`,
-//! `realloc_uninit`, `dealloc`, and `dealloc_bulk` — before touching any
-//! metadata — and returns [`io::ErrorKind::InvalidInput`] with the handle
-//! carried back intact.  Custom implementors should do the same;
+//! `realloc_uninit`, `dealloc`, `dealloc_bulk`, and (where implemented)
+//! `realloc_inplace` — before touching any metadata — and returns
+//! [`io::ErrorKind::InvalidInput`] with the handle carried back intact.  The
+//! owned-slice `try_join`/`try_join_inplace` likewise reject an `other` handle
+//! from a different allocator.  Custom implementors should do the same;
 //! [`BStackOwnedSlice::is_from`] is the check.
 //!
 //! # Feature flags
@@ -781,10 +783,11 @@ pub trait BStackInPlaceResizeAllocator: BStackAllocator {
     /// * [`io::ErrorKind::Unsupported`] — the allocator cannot satisfy this
     ///   `(prepend, append)` combination without relocating the retained bytes.
     /// * [`io::ErrorKind::InvalidInput`] — the resulting length
-    ///   `handle.len() as i64 + prepend + append` is negative, or the handle
-    ///   does not describe a valid allocation. (This is deliberately a
-    ///   recoverable error rather than a panic, so a caller bug does not drop the
-    ///   handle — whose `Drop` is a no-op — and leak the region.)
+    ///   `handle.len() as i64 + prepend + append` is negative, the handle does
+    ///   not describe a valid allocation, or it was issued by a different
+    ///   allocator instance (see the module's "Foreign handles" section). (This
+    ///   is deliberately a recoverable error rather than a panic, so a caller bug
+    ///   does not drop the handle — whose `Drop` is a no-op — and leak the region.)
     /// * Any other error propagated from the underlying [`BStack`] operations.
     ///
     /// A failure *after* the operation began mutating on-disk structure (rather

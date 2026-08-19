@@ -1244,6 +1244,9 @@ impl BStackInPlaceResizeAllocator for GhostTreeBstackAllocator {
         prepend: i64,
         append: i64,
     ) -> Result<BStackOwnedSlice<'a, Self>, BStackAllocError<'a, Self>> {
+        // Reject a handle from another allocator instance before any logic runs
+        // (see the module's "Foreign handles" section).
+        let slice = ensure_own_handle(self, slice, "GhostTreeBstackAllocator::realloc_inplace")?;
         let start = slice.start();
         let old_len = slice.len();
 

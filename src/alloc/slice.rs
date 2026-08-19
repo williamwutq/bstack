@@ -1935,6 +1935,19 @@ where
         if other.is_empty() {
             return Ok(self);
         }
+        // `other` must belong to the same allocator as `self`: the join
+        // allocates, copies, and frees through `self`'s allocator, so a foreign
+        // `other` would corrupt it. Reject before any mutation. (`self` is its
+        // own allocator's by construction.)
+        if !other.is_from(self.allocator()) {
+            return Err(BStackBulkAllocError::with_handles(
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "try_join: `other` was issued by a different allocator",
+                ),
+                vec![self, other],
+            ));
+        }
         let alloc = self.allocator();
         let sl = self.len();
         let ol = other.len();

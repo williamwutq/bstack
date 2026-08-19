@@ -317,6 +317,9 @@ impl BStackInPlaceResizeAllocator for LinearBStackAllocator {
         prepend: i64,
         append: i64,
     ) -> Result<BStackOwnedSlice<'a, Self>, BStackAllocError<'a, Self>> {
+        // Reject a handle from another allocator instance before any logic runs
+        // (see the module's "Foreign handles" section).
+        let handle = ensure_own_handle(self, handle, "LinearBStackAllocator::realloc_inplace")?;
         let old_len = handle.len();
         // Resulting length, checked before any mutation. `old_len` fits in i64
         // for any real allocation; guard the cast and the two additions so a
