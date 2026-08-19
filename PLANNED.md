@@ -173,3 +173,69 @@ Notes common to all three:
 ### Open questions
 
 - **`_uninit` counterpart.** The destination region is always fully overwritten immediately after allocation, so `alloc`'s zero-fill is wasted work whenever `A: BStackUninitAllocator` also holds — worth a parallel `to_owned_uninit_in`/`try_clone_uninit` using `alloc_uninit`, mirroring the crate's existing `alloc`/`alloc_uninit` split, rather than one method that silently branches on an extra trait bound.
+
+---
+
+## `BStackInPlaceResizeAllocator`: front/back in-place resize, and owned-slice subslicing/joining built on it
+
+**Feature flag:** `alloc` + `set` + `atomic`.
+**Breaking change:** No — new trait, new methods gated behind it.
+
+### Motivation
+
+Tail resize is already cheap: `realloc` grows/shrinks at the end in O(|old_len − new_len|) with no data movement (see the "Uninitialised allocation" table — extend/truncate, never a full-region copy). Removing or adding bytes at the *front* has no such path today — the only option is `alloc` a new region, copy the retained bytes over, and `dealloc` the old one, moving the entire retained payload regardless of how few bytes actually changed. An on-disk string that trims from the front (a log/ring-buffer style workload) pays this full-payload-move cost on every trim.
+
+### Design
+
+```rust
+pub trait BStackInPlaceResizeAllocator: BStackAllocator {
+    /// Resize `handle` in place by `prepend` bytes at the front and `append`
+    /// bytes at the back in one call. Positive grows that side, negative
+    /// shrinks it (by the given magnitude); either may be zero. New length is
+    /// `handle.len() as i64 + prepend + append`.
+    ///
+    /// Either both edges move as specified, or the call fails and the
+    /// original handle is returned untouched — never a partial edit.
+    ///
+    /// On success, if the original handle's range was `(start, end)`, the
+    /// returned handle's range is *exactly* `(start - prepend, end +
+    /// append)` — never a region chosen anywhere else in the file, even one
+    /// that would otherwise be a valid, correctly-sized result. An
+    /// implementation that would have to relocate the retained bytes to
+    /// satisfy the request must fail with `Unsupported` instead of
+    /// returning a correctly-sized but repositioned handle. This means even
+    /// if the allocator can determine that there are no data movements in
+    /// practice, it should not prematurely optimise away the reallocation.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `handle.len() as i64 + prepend + append < 0`.
+    fn realloc_inplace<'a>(
+        &'a self, handle: Self::Allocated<'a>, prepend: i64, append: i64,
+    ) -> Result<Self::Allocated<'a>, BStackAllocError<'a, Self>>;
+}
+```
+
+One method, not two: `shrink_front`/`grow_front` and even plain tail `realloc` are all special cases of one signed two-edge move (`append`-only reproduces `realloc`; `prepend`-only reproduces front resize; nonzero on both edges shifts the window while resizing both ends in whatever is, for an allocator that can do it, a single in-place operation rather than two separate ones — relevant to `try_subslice_inplace` below, which needs exactly that). Same failure contract as `realloc`: `BStackAllocError::handle` carries the untouched original back whenever it survives. An allocator that can't do a requested combination returns `io::ErrorKind::Unsupported` (the convention `LinearBStackAllocator::realloc` already uses for non-tail resize) rather than needing a bespoke "unimplemented" variant — it is not required to succeed on `prepend`/`append` individually only because it can do one of them alone.
+
+The exact-position postcondition is part of the method's definition, not an optional guarantee: it is what distinguishes "in place" from "resized, to some valid region." Without it, an implementation could satisfy the signature with an ordinary `alloc` + copy + `dealloc` to a disjoint region whenever that is simpler to write, returning a correctly-sized handle that violates the purpose of the method. Callers (`try_subslice_inplace`/`try_join_inplace`) depend on a successful return meaning the retained bytes were not copied: `try_subslice_inplace` to bound its cost at O(|prepend| + |append|) rather than O(new length), and `try_join_inplace` to know which of the two input handles' bytes were the ones actually copied.
+
+Built on it, four methods on `BStackOwnedSlice<'a, A: BStackInPlaceResizeAllocator>`:
+
+```rust
+fn try_subslice_inplace(self, start: u64, end: u64) -> Result<Self, BStackAllocError<'a, A>>;
+fn try_subslice(self, start: u64, end: u64) -> Result<Self, BStackAllocError<'a, A>>;
+fn try_join_inplace(self, other: Self) -> Result<Self, BStackBulkAllocError<'a, A>>;
+fn try_join(self, other: Self) -> Result<Self, BStackBulkAllocError<'a, A>>;
+```
+
+- `try_subslice_inplace`: one call, `realloc_inplace(self, -(start as i64), end as i64 - self.len() as i64)` — shrinks the front by `start` and the back to `end` together; propagates whatever `realloc_inplace` returns, `Unsupported` included.
+- `try_subslice`: same, but on failure/`Unsupported` falls back to `alloc(end - start)` + `copy_from_bstack_slice` + `dealloc` the original — so it never surfaces `Unsupported`, only genuine I/O failure.
+- `try_join_inplace`/`try_join`: concatenate `self` then `other`. In-place attempt: `realloc_inplace(self, 0, other.len() as i64)` to grow `self`'s tail, copy `other`'s bytes into the grown tail, `dealloc` `other`; if that fails, try the mirror — `realloc_inplace(other, self.len() as i64, 0)` to grow `other`'s front, copy `self`'s bytes into the grown head, `dealloc` `self`. Only the *moved* side's bytes are ever copied; whichever side got extended never moves. `try_join_inplace` fails if neither direction works; `try_join` falls back to a fresh `alloc(self.len() + other.len())` + two `copy_from_bstack_slice` calls + `dealloc` of both.
+- Join failures use `BStackBulkAllocError<'a, A>` (reusing the existing bulk-dealloc error shape instead of a new tuple-shaped type), since a partial join can plausibly recover 0, 1, or 2 of the two input handles depending how far it got.
+
+### Open questions
+
+- **Join attempt order.** Fixed order (always try extending `self`'s tail before `other`'s front, as above) vs. always attempting to extend whichever of the two is longer first, which guarantees the smaller side is the one actually copied whenever any in-place path exists — at the cost of checking both feasibility and length before picking a direction, instead of the simpler fixed order.
+- **Bound on the non-`_inplace` methods.** `try_subslice`/`try_join` never actually need the fast path to succeed — only the `_inplace` variants do. Worth deciding whether to relax their bound to bare `BStackAllocator<Error = io::Error>`, so allocators without `BStackInPlaceResizeAllocator` still get the always-succeeds fallback versions, versus keeping one uniform bound across all four methods in a single `impl` block.
+- **Recovery contract on partial in-place failure.** `try_subslice_inplace`/`try_join_inplace` chain multiple allocator calls against handles the caller already holds elsewhere, unlike `to_owned_in`/`try_clone` above, which only ever produce a fresh allocation the caller has not yet observed. The exact recovery guarantee — what's returned, and whether any intermediate step can leave a to-be-freed byte range unrecoverable — needs a firmer contract before implementation. If no such contract can be made to satisfy `bstack`'s per-method crash-atomicity requirement, `try_subslice_inplace`/`try_join_inplace` must not be implemented.
