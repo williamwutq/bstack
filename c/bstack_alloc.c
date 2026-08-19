@@ -4314,7 +4314,7 @@ uint64_t slab_bstack_allocator_block_size(const slab_bstack_allocator_t *alloc)
 /* Maximum number of suspect blocks analysed in resync_tail before giving up. */
 #define ALCK_MAX_RECOVER_REGION ((size_t)(1u << 26))
 
-static const uint8_t alck_magic[8]        = {'A','L','C','K',0,1,1,0};
+static const uint8_t alck_magic[8]        = {'A','L','C','K',0,1,2,0};
 static const uint8_t alck_magic_prefix[6] = {'A','L','C','K',0,1};
 
 /* ---- LE helpers (reuse read_le64 / write_le64 already defined above) --- */
@@ -5447,9 +5447,11 @@ static int alck_vt_realloc(bstack_allocator_t *base, bstack_slice_t s,
      * The surviving allocation to hand back on failure. Starts as the
      * original block, becomes the new region once a non-tail grow commits
      * it, and becomes the shrunk view once the overhead commit point is
-     * written (see below). Every failure path in this function leaves
-     * `recovered` valid, so realloc here always fails with -1 (survived),
-     * never -2 (lost).
+     * written (see below). Almost every failure path leaves `recovered`
+     * valid and fails with -1 (survived); the sole exception is the non-tail
+     * shrink window after the excess has been scrubbed but before the smaller
+     * count is committed, where the region is neither cleanly old nor new and
+     * is reported lost (-2).
      */
     bstack_slice_t recovered = s;
     recovered.allocator = base;
@@ -5634,54 +5636,34 @@ static int alck_vt_realloc(bstack_allocator_t *base, bstack_slice_t s,
 
         /* Shrink path (new_n < old_n).  Lock-free under atomic: the overhead
          * write is the commit point, try_discard is atomic, and the non-tail
-         * push splices via cross_exchange.  Single-threaded otherwise. */
+         * splice rides cross_exchange.  Single-threaded otherwise. */
         {
             uint64_t delta = old_backing - new_backing;
-            uint64_t excess_start;
+            uint64_t excess_start, excess_count = old_n - new_n;
 #if UINT64_MAX > SIZE_MAX
             if (delta > (uint64_t)SIZE_MAX) { errno = EINVAL; *out = recovered; return -1; }
 #endif
+            if (new_n > UINT64_MAX / a->block_size) { errno = EINVAL; *out = recovered; return -1; }
+            excess_start = block_start + new_n * a->block_size;
 
-            /* Overhead is the commit point for both tail and non-tail paths:
-             * write it first so a crash after this point leaves an orphaned
-             * (but safely unreferenced) tail region or leaked blocks that
-             * recover() can reclaim, rather than an overhead that claims more
-             * blocks than the file contains. */
-            if (alck_write_overhead(a->bs, block_start,
-                                    ALCK_IN_USE_BIT | new_n) != 0) {
-                *out = recovered;
-                return -1;
-            }
-            /* This is the shrink commit point: the block now records new_n
-             * blocks, so the resized view is the survivor for any
-             * subsequent failure. */
-            recovered.allocator = base;
-            recovered.offset    = s.offset;
-            recovered.len       = new_len;
-
-            /* Tail shrink: try_discard atomically checks tail == sentinel and
-             * removes the excess under bstack's write lock, so no other thread
-             * can race between the check and the truncation.  On failure the
-             * slice is not at the tail; fall through to recycle excess blocks. */
-#ifdef BSTACK_FEATURE_ATOMIC
-            {
-                int ok = 0;
-                if (bstack_try_discard(a->bs, sentinel, (size_t)delta,
-                                       &ok) != 0) {
-                    *out = recovered;
-                    return -1;
-                }
-                if (ok) {
-                    out->allocator = base; out->offset = s.offset;
-                    out->len = new_len;
-                    return 0;
-                }
-            }
-#else
+            /* Non-atomic tail fast path: commit the smaller count, then discard
+             * the tail.  Commit-first is safe here — a crash before the discard
+             * leaves an orphaned tail past new_n that recover() reclaims, and
+             * nothing live follows the arena tail — and it avoids scrubbing
+             * bytes that are about to be truncated away. */
+#ifndef BSTACK_FEATURE_ATOMIC
             {
                 uint64_t cur_tail;
                 if (bstack_len(a->bs, &cur_tail) != 0) { *out = recovered; return -1; }
                 if (sentinel == cur_tail) {
+                    if (alck_write_overhead(a->bs, block_start,
+                                            ALCK_IN_USE_BIT | new_n) != 0) {
+                        *out = recovered;
+                        return -1;
+                    }
+                    recovered.allocator = base;
+                    recovered.offset    = s.offset;
+                    recovered.len       = new_len;
                     if (bstack_discard(a->bs, (size_t)delta) != 0) {
                         *out = recovered;
                         return -1;
@@ -5693,15 +5675,72 @@ static int alck_vt_realloc(bstack_allocator_t *base, bstack_slice_t s,
             }
 #endif
 
-            /* Shrink non-tail: overhead already written (commit point); push the
-             * excess blocks onto the free list (lock-free under atomic). */
-            if (new_n > UINT64_MAX / a->block_size) { errno = EINVAL; *out = recovered; return -1; }
-            excess_start = block_start + new_n * a->block_size;
-            if (alck_push_free_blocks(a->bs, excess_start,
-                                      old_n - new_n, a->block_size) != 0) {
+            /* General shrink (non-tail, and every atomic shrink).
+             *
+             * Crash-order matters: the excess blocks must never be left holding
+             * the allocation's stale payload once the header records the smaller
+             * count.  Such bytes can mimic in-use overhead words and desync
+             * recover()'s linear scan, which would then stride over and reclaim
+             * an unrelated live allocation, corrupting it.  So the excess is
+             * scrubbed to a clean, zero-overhead free run BEFORE the header is
+             * shrunk:
+             *
+             *   1. write_free_run clears every excess overhead + payload byte and
+             *      links the run internally (free_head untouched).  A fault here
+             *      leaves the excess untouched and the original allocation whole,
+             *      so it survives with the intact original (-1).
+             *   2. Between the scrub and the commit the region is neither cleanly
+             *      old (tail scrubbed) nor cleanly new (header still old_n); a
+             *      fault here reports the region lost (-2).  The old header still
+             *      tiles cleanly for recovery, so it is a leak, never corruption.
+             *   3. write_overhead commits the smaller count — the shrunk view is
+             *      now the survivor.  A fault before the splice leaves the
+             *      scrubbed excess as zero-overhead leaked blocks that recover()
+             *      reclaims one by one, staying aligned.
+             *   4. Publish the run onto free_head (or discard it when it is the
+             *      arena tail, on the atomic path). */
+            if (alck_write_free_run(a->bs, excess_start, excess_count,
+                                    a->block_size) != 0) {
                 *out = recovered;
                 return -1;
             }
+            /* Excess scrubbed, count not yet shrunk: a failure now loses the
+             * region (-2) rather than handing back torn contents. */
+            if (alck_write_overhead(a->bs, block_start,
+                                    ALCK_IN_USE_BIT | new_n) != 0) {
+                return -2;
+            }
+            recovered.allocator = base;
+            recovered.offset    = s.offset;
+            recovered.len       = new_len;
+
+#ifdef BSTACK_FEATURE_ATOMIC
+            {
+                /* Discard when the scrubbed excess is the tail; otherwise splice
+                 * the pre-built run onto free_head with one cross_exchange. */
+                int ok = 0;
+                if (bstack_try_discard(a->bs, sentinel, (size_t)delta, &ok) != 0) {
+                    *out = recovered;
+                    return -1;
+                }
+                if (!ok) {
+                    uint64_t last_block =
+                        excess_start + (excess_count - 1) * a->block_size;
+                    if (bstack_cross_exchange(a->bs, last_block + ALCK_OVERHEAD,
+                                              ALCK_FREE_HEAD_OFFSET, 8) != 0) {
+                        *out = recovered;
+                        return -1;
+                    }
+                }
+            }
+#else
+            /* Non-tail (tail handled above): the run already points at the old
+             * head, so publishing its first block as the new head splices it. */
+            if (alck_write_free_head(a->bs, excess_start) != 0) {
+                *out = recovered;
+                return -1;
+            }
+#endif
             out->allocator = base; out->offset = s.offset; out->len = new_len;
             return 0;
         }
