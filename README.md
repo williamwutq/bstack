@@ -1006,6 +1006,7 @@ Key methods on `BStackOwnedSlice`:
 | `start()` / `end()` / `len()`                       | Coordinate accessors                         |
 | `as_slice<'s>(&'s self) -> BStackSlice<'s>`         | Shared read view (lifetime tied to `&self`)  |
 | `as_slice_mut<'s>(&'s mut self) -> BStackSlice<'s>` | Exclusive write view                         |
+| `try_clone()` / `try_clone_uninit()` *(features `set` + `atomic`)* | Copy into a second independent allocation (non-`Clone`); `_uninit` skips the destination zero-fill |
 | `to_range()`                                        | Convert to a `BStackRange` for serialisation |
 
 ### `BStackSlice<'a>`
@@ -1043,8 +1044,9 @@ Key methods on `BStackSlice`:
 | `swap(other)` *(features `set` + `atomic`)*                          | Exchange contents with another same-length slice        |
 | `reverse()` *(features `set` + `atomic`)*                            | Reverse the byte order in place                         |
 | `rotate_left(mid)` / `rotate_right(k)` *(features `set` + `atomic`)* | Rotate the slice in place                               |
+| `to_owned_in(alloc)` / `to_owned_uninit_in(alloc)` *(features `set` + `atomic`)* | Copy into a fresh owned allocation from `alloc`; `_uninit` skips the destination zero-fill |
 
-Every write method above is a single crash-atomic call. `BStackOwnedSlice` mirrors all of these (delegating through `as_slice()`/`as_slice_mut()`).
+Every write method above is a single crash-atomic call. `BStackOwnedSlice` mirrors all of these (delegating through `as_slice()`/`as_slice_mut()`), and adds `try_clone()`/`try_clone_uninit()` — its own explicit, fallible copy into a second independent allocation, since it is deliberately non-`Clone`.
 
 ### `BStackRange`
 
@@ -1073,6 +1075,7 @@ Also constructible directly, without splitting off a remainder, via `BStackChunk
 | `merge_adjacent(other)`                                                             | `Some` union if `same_stride` and the regions are adjacent and non-empty, thus also `same_phase`; `None` otherwise       |
 | `get(index)`                                                                        | The chunk at `index` as a `BStackSlice`, or `None` — O(1), no I/O                                                        |
 | `as_slice()` / `into_slice()`                                                       | The whole aligned region as a plain `BStackSlice` — by clone, or by consuming `self`                                     |
+| `to_owned_in(alloc)` / `to_owned_uninit_in(alloc)` *(features `set` + `atomic`)*    | Copy the aligned region into a fresh owned `BStackOwnedSlice`; re-chunk it with `from_slice`; `_uninit` skips zero-fill  |
 | `with_stride(new_stride)`                                                           | Consume `self`, re-dividing the aligned region with a different stride — `(BStackChunk, BStackSlice)`, same as `chunks`  |
 | `iter()` / `IntoIterator`                                                           | A lazy `BStackChunkIter` (see below); usable directly in a `for` loop, by value or `&view`                               |
 | `binary_search_by(cmp)` / `binary_search_by_key(target, key)`                       | Binary search over already-ordered chunks — O(log n) chunk reads, never the whole region.                                |

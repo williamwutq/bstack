@@ -334,10 +334,7 @@ impl<'a> BStackChunk<'a> {
     ///
     /// As [`BStackSlice::to_owned_in`].
     #[cfg(all(feature = "set", feature = "atomic"))]
-    pub fn to_owned_uninit_in<'b, A>(
-        &self,
-        allocator: &'b A,
-    ) -> io::Result<BStackOwnedSlice<'b, A>>
+    pub fn to_owned_uninit_in<'b, A>(&self, allocator: &'b A) -> io::Result<BStackOwnedSlice<'b, A>>
     where
         A: super::BStackUninitAllocator + BStackAllocator<Error = io::Error>,
     {
