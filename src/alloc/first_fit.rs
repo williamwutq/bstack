@@ -1138,6 +1138,157 @@ impl FirstFitBStackAllocator {
         }
     }
 
+    /// Try to satisfy a grow to `aligned_new_len` **in place** by absorbing the
+    /// immediately following block when it is free and large enough (splitting
+    /// off any remainder back onto the free list). Returns `true` if the block
+    /// was grown in place at `start`, `false` if the next block is unavailable
+    /// and the caller must relocate instead.
+    ///
+    /// `block_size` is the current physical payload size, `user_len` the
+    /// caller-visible length (for scrubbing stale bytes), and `init` whether
+    /// newly exposed bytes must be zeroed. The caller must hold the lock (under
+    /// `atomic`); this method sets and clears `recovery_needed` around its own
+    /// mutations. On an I/O failure mid-merge the error propagates with
+    /// `recovery_needed` left set for the next reopen.
+    fn try_grow_into_next_free(
+        &self,
+        start: u64,
+        block_size: u64,
+        aligned_new_len: u64,
+        user_len: u64,
+        init: bool,
+    ) -> io::Result<bool> {
+        // Special case: next block is free and can be merged in place to accommodate the new size.
+        // This avoids copying data.
+
+        let next_block = start + block_size + Self::BLOCK_OVERHEAD_SIZE;
+        if next_block <= self.stack.len()? - Self::BLOCK_FOOTER_SIZE - Self::MIN_BLOCK_PAYLOAD_SIZE
+        {
+            let mut next_hdr_buf = [0u8; 16];
+            self.stack
+                .get_into(next_block - Self::BLOCK_HEADER_SIZE, &mut next_hdr_buf)?;
+            let next_block_size = u64::from_le_bytes(next_hdr_buf[0..8].try_into().unwrap());
+            let next_block_is_free = next_hdr_buf[8] & 1 != 0;
+
+            // Validate: next_block_size must be ≥ minimum, 8-aligned, and large enough to hold
+            // the new size when merged with the current block, and free
+            if next_block_is_free
+                && next_block_size >= Self::MIN_BLOCK_PAYLOAD_SIZE
+                && next_block_size % 8 == 0
+                && block_size + Self::BLOCK_OVERHEAD_SIZE + next_block_size >= aligned_new_len
+            {
+                // Pre-zero the stale bytes between the user-visible len and the existing
+                // block's payload end.  After the merge, those bytes become part of the
+                // larger user-visible slice and must be zero.  Done before set_recovery_needed
+                // because it is an idempotent single-write that doesn't change user-visible
+                // state (the bytes are not part of the input slice's len), so a crash here
+                // leaves the file in a fully consistent allocator state with no recovery
+                // needed.
+                if user_len < block_size && init {
+                    self.stack.zero(start + user_len, block_size - user_len)?;
+                }
+
+                // Unlink the next block from the free list, then merge it into the current block.
+                self.set_recovery_needed()?;
+                self.unlink_from_free_list(next_block)?;
+                // merged_size includes the overhead bytes absorbed from between the two blocks
+                let merged_size = block_size + Self::BLOCK_OVERHEAD_SIZE + next_block_size;
+
+                // Buffer covering [start+block_size, start+merged_size+FOOTER).
+                // Used for both the no-split and split paths.
+                let mut zero_buff = vec![
+                    0u8;
+                    (next_block_size + Self::BLOCK_OVERHEAD_SIZE + Self::BLOCK_FOOTER_SIZE)
+                        as usize
+                ];
+
+                if merged_size
+                    >= aligned_new_len + Self::BLOCK_OVERHEAD_SIZE + Self::MIN_BLOCK_PAYLOAD_SIZE
+                {
+                    // The merged block is much larger than needed — split it.
+                    // Pack the allocated-block footer, free-block header (size + is_free flag),
+                    // free-list next/prev pointers, and free-block footer into zero_buff so
+                    // they all land in one write.
+                    let remainder_size = merged_size - aligned_new_len - Self::BLOCK_OVERHEAD_SIZE;
+                    let new_free_start = start + aligned_new_len + Self::BLOCK_OVERHEAD_SIZE;
+                    let mut head_buf = [0u8; 8];
+                    self.stack.get_into(Self::FREE_HEAD_OFFSET, &mut head_buf)?;
+                    let old_head = u64::from_le_bytes(head_buf);
+
+                    // All offsets are relative to zero_buff[0] = start + block_size.
+                    let alloc_footer_off = (aligned_new_len - block_size) as usize;
+                    let free_hdr_off = alloc_footer_off + Self::BLOCK_FOOTER_SIZE as usize;
+                    let free_payload_off = alloc_footer_off + Self::BLOCK_OVERHEAD_SIZE as usize;
+                    let free_footer_off = (next_block_size + Self::BLOCK_OVERHEAD_SIZE) as usize;
+
+                    zero_buff[alloc_footer_off..alloc_footer_off + 8]
+                        .copy_from_slice(&aligned_new_len.to_le_bytes());
+                    zero_buff[free_hdr_off..free_hdr_off + 8]
+                        .copy_from_slice(&remainder_size.to_le_bytes());
+                    zero_buff[free_hdr_off + 8..free_hdr_off + 12]
+                        .copy_from_slice(&1u32.to_le_bytes()); // is_free = 1
+                    zero_buff[free_payload_off..free_payload_off + 8]
+                        .copy_from_slice(&old_head.to_le_bytes()); // next_free = old head
+                    // prev_free stays 0
+                    zero_buff[free_footer_off..free_footer_off + 8]
+                        .copy_from_slice(&remainder_size.to_le_bytes());
+
+                    // Set the header to merged_size first so that if we crash after the
+                    // big write but before the aligned_new_len update, recovery sees a
+                    // header/footer mismatch (merged_size vs. remainder_size) and can
+                    // detect and repair the partial split.
+                    self.stack
+                        .set(start - Self::BLOCK_HEADER_SIZE, merged_size.to_le_bytes())?;
+                    // Single write: zeroes the inter-block overhead, writes the allocated
+                    // block's new footer, the complete free block, and the free block's footer.
+                    // `false` starts the same write at the allocated block's
+                    // footer instead, dropping only the leading scrub — the bytes it
+                    // would have cleared are all payload of the caller's own resized
+                    // block, and every metadata word still lands in this one call.
+                    let write_from = if init { 0 } else { alloc_footer_off };
+                    self.stack.set(
+                        start + block_size + write_from as u64,
+                        &zero_buff[write_from..],
+                    )?;
+                    // Shrink the allocated block's header to the used size.
+                    self.stack.set(
+                        start - Self::BLOCK_HEADER_SIZE,
+                        aligned_new_len.to_le_bytes(),
+                    )?;
+                    // Link forward: free_head → new free block
+                    // Failure cause: orphaned block
+                    self.stack
+                        .set(Self::FREE_HEAD_OFFSET, new_free_start.to_le_bytes())?;
+                    // Link backward: old head's prev_free → new free block
+                    // Failure cause: orphaned block with stale forward link from old head (detectable in recovery) but no backward link
+                    if old_head != 0 {
+                        self.stack.set(old_head + 8, new_free_start.to_le_bytes())?;
+                    }
+                } else {
+                    // No split: write the merged block's header and footer.
+                    self.stack
+                        .set(start - Self::BLOCK_HEADER_SIZE, merged_size.to_le_bytes())?;
+                    let footer_off = (next_block_size + Self::BLOCK_OVERHEAD_SIZE) as usize;
+                    if init {
+                        zero_buff[footer_off..].copy_from_slice(&merged_size.to_le_bytes());
+                        self.stack.set(start + block_size, &zero_buff)?;
+                    } else {
+                        // Everything before the footer is absorbed overhead and
+                        // payload of the caller's own block, so the same single
+                        // call need only place the merged footer.
+                        self.stack
+                            .set(start + merged_size, merged_size.to_le_bytes())?;
+                    }
+                }
+                self.clear_recovery_needed()?;
+                // SAFETY: slice resized by merging with adjacent free block
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
+
     /// Shared body of [`realloc`](BStackAllocator::realloc) and
     /// [`realloc_uninit`](BStackUninitAllocator::realloc_uninit).
     ///
@@ -1304,146 +1455,19 @@ impl FirstFitBStackAllocator {
             #[cfg(feature = "atomic")]
             let _guard = self.lock.lock().unwrap();
 
-            // Special case: next block is free and can be merged in place to accommodate the new size.
-            // This avoids copying data.
-
-            let next_block = slice.start() + block_size + Self::BLOCK_OVERHEAD_SIZE;
-            if next_block
-                <= self.stack.len()? - Self::BLOCK_FOOTER_SIZE - Self::MIN_BLOCK_PAYLOAD_SIZE
-            {
-                let mut next_hdr_buf = [0u8; 16];
-                self.stack
-                    .get_into(next_block - Self::BLOCK_HEADER_SIZE, &mut next_hdr_buf)?;
-                let next_block_size = u64::from_le_bytes(next_hdr_buf[0..8].try_into().unwrap());
-                let next_block_is_free = next_hdr_buf[8] & 1 != 0;
-
-                // Validate: next_block_size must be ≥ minimum, 8-aligned, and large enough to hold
-                // the new size when merged with the current block, and free
-                if next_block_is_free
-                    && next_block_size >= Self::MIN_BLOCK_PAYLOAD_SIZE
-                    && next_block_size % 8 == 0
-                    && block_size + Self::BLOCK_OVERHEAD_SIZE + next_block_size >= aligned_new_len
-                {
-                    // Pre-zero the stale bytes between the user-visible len and the existing
-                    // block's payload end.  After the merge, those bytes become part of the
-                    // larger user-visible slice and must be zero.  Done before set_recovery_needed
-                    // because it is an idempotent single-write that doesn't change user-visible
-                    // state (the bytes are not part of the input slice's len), so a crash here
-                    // leaves the file in a fully consistent allocator state with no recovery
-                    // needed.
-                    if slice.len() < block_size && init {
-                        self.stack
-                            .zero(slice.start() + slice.len(), block_size - slice.len())?;
-                    }
-
-                    // Unlink the next block from the free list, then merge it into the current block.
-                    self.set_recovery_needed()?;
-                    self.unlink_from_free_list(next_block)?;
-                    // merged_size includes the overhead bytes absorbed from between the two blocks
-                    let merged_size = block_size + Self::BLOCK_OVERHEAD_SIZE + next_block_size;
-
-                    // Buffer covering [slice.start()+block_size, slice.start()+merged_size+FOOTER).
-                    // Used for both the no-split and split paths.
-                    let mut zero_buff = vec![
-                        0u8;
-                        (next_block_size + Self::BLOCK_OVERHEAD_SIZE + Self::BLOCK_FOOTER_SIZE)
-                            as usize
-                    ];
-
-                    if merged_size
-                        >= aligned_new_len
-                            + Self::BLOCK_OVERHEAD_SIZE
-                            + Self::MIN_BLOCK_PAYLOAD_SIZE
-                    {
-                        // The merged block is much larger than needed — split it.
-                        // Pack the allocated-block footer, free-block header (size + is_free flag),
-                        // free-list next/prev pointers, and free-block footer into zero_buff so
-                        // they all land in one write.
-                        let remainder_size =
-                            merged_size - aligned_new_len - Self::BLOCK_OVERHEAD_SIZE;
-                        let new_free_start =
-                            slice.start() + aligned_new_len + Self::BLOCK_OVERHEAD_SIZE;
-                        let mut head_buf = [0u8; 8];
-                        self.stack.get_into(Self::FREE_HEAD_OFFSET, &mut head_buf)?;
-                        let old_head = u64::from_le_bytes(head_buf);
-
-                        // All offsets are relative to zero_buff[0] = slice.start() + block_size.
-                        let alloc_footer_off = (aligned_new_len - block_size) as usize;
-                        let free_hdr_off = alloc_footer_off + Self::BLOCK_FOOTER_SIZE as usize;
-                        let free_payload_off =
-                            alloc_footer_off + Self::BLOCK_OVERHEAD_SIZE as usize;
-                        let free_footer_off =
-                            (next_block_size + Self::BLOCK_OVERHEAD_SIZE) as usize;
-
-                        zero_buff[alloc_footer_off..alloc_footer_off + 8]
-                            .copy_from_slice(&aligned_new_len.to_le_bytes());
-                        zero_buff[free_hdr_off..free_hdr_off + 8]
-                            .copy_from_slice(&remainder_size.to_le_bytes());
-                        zero_buff[free_hdr_off + 8..free_hdr_off + 12]
-                            .copy_from_slice(&1u32.to_le_bytes()); // is_free = 1
-                        zero_buff[free_payload_off..free_payload_off + 8]
-                            .copy_from_slice(&old_head.to_le_bytes()); // next_free = old head
-                        // prev_free stays 0
-                        zero_buff[free_footer_off..free_footer_off + 8]
-                            .copy_from_slice(&remainder_size.to_le_bytes());
-
-                        // Set the header to merged_size first so that if we crash after the
-                        // big write but before the aligned_new_len update, recovery sees a
-                        // header/footer mismatch (merged_size vs. remainder_size) and can
-                        // detect and repair the partial split.
-                        self.stack.set(
-                            slice.start() - Self::BLOCK_HEADER_SIZE,
-                            merged_size.to_le_bytes(),
-                        )?;
-                        // Single write: zeroes the inter-block overhead, writes the allocated
-                        // block's new footer, the complete free block, and the free block's footer.
-                        // `false` starts the same write at the allocated block's
-                        // footer instead, dropping only the leading scrub — the bytes it
-                        // would have cleared are all payload of the caller's own resized
-                        // block, and every metadata word still lands in this one call.
-                        let write_from = if init { 0 } else { alloc_footer_off };
-                        self.stack.set(
-                            slice.start() + block_size + write_from as u64,
-                            &zero_buff[write_from..],
-                        )?;
-                        // Shrink the allocated block's header to the used size.
-                        self.stack.set(
-                            slice.start() - Self::BLOCK_HEADER_SIZE,
-                            aligned_new_len.to_le_bytes(),
-                        )?;
-                        // Link forward: free_head → new free block
-                        // Failure cause: orphaned block
-                        self.stack
-                            .set(Self::FREE_HEAD_OFFSET, new_free_start.to_le_bytes())?;
-                        // Link backward: old head's prev_free → new free block
-                        // Failure cause: orphaned block with stale forward link from old head (detectable in recovery) but no backward link
-                        if old_head != 0 {
-                            self.stack.set(old_head + 8, new_free_start.to_le_bytes())?;
-                        }
-                    } else {
-                        // No split: write the merged block's header and footer.
-                        self.stack.set(
-                            slice.start() - Self::BLOCK_HEADER_SIZE,
-                            merged_size.to_le_bytes(),
-                        )?;
-                        let footer_off = (next_block_size + Self::BLOCK_OVERHEAD_SIZE) as usize;
-                        if init {
-                            zero_buff[footer_off..].copy_from_slice(&merged_size.to_le_bytes());
-                            self.stack.set(slice.start() + block_size, &zero_buff)?;
-                        } else {
-                            // Everything before the footer is absorbed overhead and
-                            // payload of the caller's own block, so the same single
-                            // call need only place the merged footer.
-                            self.stack
-                                .set(slice.start() + merged_size, merged_size.to_le_bytes())?;
-                        }
-                    }
-                    self.clear_recovery_needed()?;
-                    // SAFETY: slice resized by merging with adjacent free block
-                    return Ok(unsafe {
-                        BStackOwnedSlice::from_raw_parts(self, slice.start(), new_len)
-                    });
-                }
+            // Grow in place by absorbing the immediately following free block
+            // if it is free and large enough. Runs under the lock held above.
+            if self.try_grow_into_next_free(
+                slice.start(),
+                block_size,
+                aligned_new_len,
+                slice.len(),
+                init,
+            )? {
+                // SAFETY: block resized in place by merging the next free block.
+                return Ok(unsafe {
+                    BStackOwnedSlice::from_raw_parts(self, slice.start(), new_len)
+                });
             }
 
             // For non-tail blocks, we need to find a new block for the new size, copy the data, and free the old block.
