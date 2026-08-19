@@ -119,3 +119,14 @@ The underlying need — straight-line atomic blocks instead of the generator pro
 - **Unstable sort.** Whether to also provide `sort_unstable_by`/`sort_unstable_by_key`, mirroring `std`'s stable/unstable split — unstable sort does fewer chunk moves at the cost of stability, which may matter more once movement is spread across multiple sections/passes.
 - **Threshold sizing.** How the small/medium/large boundary and section size are chosen, and whether it should be caller-configurable given the memory/atomicity tradeoff is now explicit.
 - **Batch staging cost.** `set_batched` still stages every block's bytes into the multi-write journal before committing, so the final pass's staging cost scales with the number and size of the (new_offset, chunk_bytes) pairs it's fed — worth measuring against the current single-`process` cost before committing to this as the merge-commit strategy.
+
+---
+
+## Debug feature flag to skip durable sync for faster fault-injection testing
+
+**Feature flag:** new debug-only flag (e.g. `debug-no-sync`), off by default and not for production use.
+**Breaking change:** No — purely additive, gated behind an opt-in flag.
+
+### Motivation
+
+Downstream crash-safety and fault-injection tests spend most of their wall-clock time paying for real durable sync on every write, even when the test only cares about post-crash state correctness, not actual durability. A feature-gated flag that skips the durable sync call (writes still happen, just without the sync) would let downstream fault-injection harnesses iterate much faster, at the cost of no longer guaranteeing durability — so it must be clearly scoped to debug/testing use only.
