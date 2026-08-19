@@ -197,13 +197,19 @@ pub(crate) fn pread_exact_raw_handle(handle: isize, offset: u64, buf: &mut [u8])
 /// `F_FULLFSYNC` dominates their runtime (it takes the allocator fault fuzz from
 /// minutes to seconds).  This applies only to `cfg(test)` debug builds of this
 /// crate; release builds and any dependent crate always issue the real sync.
+///
+/// **Downstream `debug-no-sync` feature.**  A dependent crate can opt into the
+/// same skip for its own fault-injection tests by enabling the `debug-no-sync`
+/// feature; like above this only takes effect with `debug_assertions` on, so a
+/// `--release` build always issues the real sync regardless. Durability is not
+/// guaranteed while this is active — debug/testing use only.
 pub(crate) fn durable_sync(file: &File) -> io::Result<()> {
-    #[cfg(all(test, debug_assertions))]
+    #[cfg(all(debug_assertions, any(test, feature = "debug-no-sync")))]
     {
         let _ = file;
         Ok(())
     }
-    #[cfg(not(all(test, debug_assertions)))]
+    #[cfg(not(all(debug_assertions, any(test, feature = "debug-no-sync"))))]
     {
         #[cfg(target_os = "macos")]
         {

@@ -27,6 +27,12 @@ guarded = ["alloc"]
 # `debug_assertions` on (dev/test); release builds are completely unaffected even
 # with the feature enabled. See the `fault` module. Not enabled by default.
 fault-injection = []
+# Skips the durable fsync/F_FULLFSYNC call on every write, for fast crash/fault-
+# injection test iteration. Writes still happen, just without the sync, so
+# durability is NOT guaranteed while this is active. Only takes effect in builds
+# with `debug_assertions` on (dev/test); release builds always sync for real,
+# even with the feature enabled. Debug-only; not for production use.
+debug-no-sync = []
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

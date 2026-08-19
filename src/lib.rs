@@ -158,6 +158,10 @@
 //! `FlushFileBuffers`.  This flushes the kernel write-back cache and waits for
 //! the drive to acknowledge, providing equivalent durability to `fdatasync`.
 //!
+//! The debug-only `debug-no-sync` Cargo feature skips `durable_sync` entirely
+//! (writes still happen, just unsynced) for faster fault-injection test
+//! iteration. Not for production use.
+//!
 //! # Multi-process safety
 //!
 //! On Unix, [`open`](BStack::open) acquires an **exclusive advisory `flock`**
