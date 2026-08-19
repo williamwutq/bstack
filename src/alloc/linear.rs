@@ -1,6 +1,6 @@
 use super::{
-    BStackAllocError, BStackAllocator, BStackBulkAllocError, BStackBulkAllocator, BStackOwnedSlice,
-    ensure_own_handle, ensure_own_handles,
+    BStackAllocError, BStackAllocator, BStackBulkAllocError, BStackBulkAllocator,
+    BStackInPlaceResizeAllocator, BStackOwnedSlice, ensure_own_handle, ensure_own_handles,
 };
 use crate::BStack;
 #[cfg(not(feature = "atomic"))]
@@ -301,6 +301,56 @@ impl BStackAllocator for LinearBStackAllocator {
     }
 }
 
+impl BStackInPlaceResizeAllocator for LinearBStackAllocator {
+    /// A bump allocator can only move its tail, so any `prepend != 0` fails with
+    /// [`io::ErrorKind::Unsupported`]; the front bytes cannot shift without
+    /// relocating the whole payload, which the position guarantee forbids.
+    ///
+    /// With `prepend == 0` this is exactly a non-moving tail
+    /// [`realloc`](BStackAllocator::realloc): it succeeds when `handle` is the
+    /// tail slice (grow via `extend`, shrink via `discard`) and returns
+    /// `Unsupported` otherwise, inheriting `realloc`'s crash-safety and its
+    /// handle-return contract verbatim.
+    fn realloc_inplace<'a>(
+        &'a self,
+        handle: BStackOwnedSlice<'a, Self>,
+        prepend: i64,
+        append: i64,
+    ) -> Result<BStackOwnedSlice<'a, Self>, BStackAllocError<'a, Self>> {
+        let old_len = handle.len();
+        // Resulting length, checked before any mutation. `old_len` fits in i64
+        // for any real allocation; guard the cast and the two additions so a
+        // pathological handle or delta cannot wrap into a bogus length.
+        let new_len = i64::try_from(old_len)
+            .ok()
+            .and_then(|l| l.checked_add(prepend))
+            .and_then(|l| l.checked_add(append));
+        match new_len {
+            Some(n) if n >= 0 => {
+                if prepend != 0 {
+                    return Err(BStackAllocError::with_handle(
+                        io::Error::new(
+                            io::ErrorKind::Unsupported,
+                            "LinearBStackAllocator cannot resize the front edge in place",
+                        ),
+                        handle,
+                    ));
+                }
+                // prepend == 0: pure tail resize, delegate to realloc. `n as u64`
+                // is exact because `0 <= n <= old_len + append <= u64::MAX`.
+                self.realloc(handle, n as u64)
+            }
+            _ => Err(BStackAllocError::with_handle(
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "realloc_inplace: resulting length is negative or overflows",
+                ),
+                handle,
+            )),
+        }
+    }
+}
+
 impl BStackBulkAllocator for LinearBStackAllocator {
     /// Allocate all slices with a single [`BStack::extend`] call.
     ///
@@ -523,5 +573,70 @@ mod fault_tests {
 
         // Retrying the free (unarmed) reclaims the tail cleanly.
         alloc.dealloc(handle).unwrap();
+    }
+}
+
+// In-place resize (`BStackInPlaceResizeAllocator`): tail-only for a bump allocator.
+#[cfg(all(test, feature = "alloc"))]
+mod inplace_resize_tests {
+    use super::LinearBStackAllocator;
+    use crate::BStack;
+    use crate::alloc::{BStackAllocator, BStackInPlaceResizeAllocator};
+    use std::io::ErrorKind;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct Guard(std::path::PathBuf);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn open_fresh() -> (LinearBStackAllocator, Guard) {
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let id = CTR.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        let path = std::env::temp_dir().join(format!("bstack_lin_ipr_{pid}_{id}.bin"));
+        let alloc = LinearBStackAllocator::new(BStack::open(&path).unwrap());
+        (alloc, Guard(path))
+    }
+
+    #[test]
+    fn tail_back_grow_and_shrink() {
+        let (alloc, _g) = open_fresh();
+        let h = alloc.alloc(50).unwrap();
+        let start = h.start();
+        let h = alloc.realloc_inplace(h, 0, 10).unwrap();
+        assert_eq!((h.start(), h.len()), (start, 60));
+        let h = alloc.realloc_inplace(h, 0, -20).unwrap();
+        assert_eq!((h.start(), h.len()), (start, 40));
+    }
+
+    #[test]
+    fn front_move_is_unsupported() {
+        let (alloc, _g) = open_fresh();
+        let h = alloc.alloc(50).unwrap();
+        let err = alloc.realloc_inplace(h, -8, 0).unwrap_err();
+        assert_eq!(err.source.kind(), ErrorKind::Unsupported);
+        assert!(err.handle.is_some());
+    }
+
+    #[test]
+    fn non_tail_back_grow_is_unsupported() {
+        let (alloc, _g) = open_fresh();
+        let h = alloc.alloc(50).unwrap();
+        let _tail = alloc.alloc(10).unwrap(); // push h off the tail
+        let err = alloc.realloc_inplace(h, 0, 10).unwrap_err();
+        assert_eq!(err.source.kind(), ErrorKind::Unsupported);
+        assert!(err.handle.is_some());
+    }
+
+    #[test]
+    fn negative_result_is_invalid_input() {
+        let (alloc, _g) = open_fresh();
+        let h = alloc.alloc(50).unwrap();
+        let err = alloc.realloc_inplace(h, 0, -60).unwrap_err();
+        assert_eq!(err.source.kind(), ErrorKind::InvalidInput);
+        assert!(err.handle.is_some());
     }
 }

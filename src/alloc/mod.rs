@@ -731,6 +731,76 @@ pub trait BStackUninitAllocator: BStackAllocator {
     ) -> Result<Self::Allocated<'a>, BStackAllocError<'a, Self>>;
 }
 
+/// Extension trait for allocators that can resize a region *at either edge*
+/// without relocating its retained bytes.
+///
+/// [`realloc`](BStackAllocator::realloc) only ever moves the tail edge, and is
+/// free to satisfy a request by copying the whole payload to a fresh region.
+/// [`realloc_inplace`](Self::realloc_inplace) instead moves the front edge, the
+/// back edge, or both in a single call, and **guarantees no relocation**: on
+/// success the retained bytes occupy the same physical offsets they did before.
+/// This bounds a front trim (log / ring-buffer workloads) at the number of
+/// bytes actually added or removed rather than the size of the retained payload.
+///
+/// # The exact-position guarantee is the contract
+///
+/// A successful call returns a handle whose range is *exactly*
+/// `(start - prepend, end + append)` for the input handle's `(start, end)`.
+/// This is not an optimisation hint but the definition of the method: an
+/// implementation that would have to relocate the retained bytes to satisfy the
+/// request **must** fail with [`io::ErrorKind::Unsupported`] rather than return
+/// a correctly-sized handle at a different offset. Callers built on this method
+/// rely on a success meaning the retained bytes were not copied.
+///
+/// An allocator that cannot perform a given `(prepend, append)` combination in
+/// place returns `Unsupported` (the same convention
+/// [`LinearBStackAllocator::realloc`] uses for non-tail resize); supporting one
+/// edge does not obligate it to support the other, or to support both at once.
+pub trait BStackInPlaceResizeAllocator: BStackAllocator {
+    /// Resize `handle` in place by `prepend` bytes at the front and `append`
+    /// bytes at the back in one call.
+    ///
+    /// Positive grows that edge, negative shrinks it by the given magnitude;
+    /// either may be zero. The new length is `handle.len() as i64 + prepend +
+    /// append`. `append`-only reproduces a non-moving [`realloc`](BStackAllocator::realloc);
+    /// `prepend`-only resizes the front; nonzero on both edges shifts the window
+    /// while resizing it.
+    ///
+    /// # Position guarantee
+    ///
+    /// On success, if the input handle's range was `(start, end)`, the returned
+    /// handle's range is *exactly* `(start - prepend, end + append)` — never a
+    /// correctly-sized region chosen elsewhere. See the trait docs.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`BStackAllocError`] carrying the untouched original handle
+    /// (`handle: Some`) on failure, under the same recovery contract as
+    /// [`realloc`](BStackAllocator::realloc):
+    ///
+    /// * [`io::ErrorKind::Unsupported`] — the allocator cannot satisfy this
+    ///   `(prepend, append)` combination without relocating the retained bytes.
+    /// * [`io::ErrorKind::InvalidInput`] — the resulting length
+    ///   `handle.len() as i64 + prepend + append` is negative, or the handle
+    ///   does not describe a valid allocation. (This is deliberately a
+    ///   recoverable error rather than a panic, so a caller bug does not drop the
+    ///   handle — whose `Drop` is a no-op — and leak the region.)
+    /// * Any other error propagated from the underlying [`BStack`] operations.
+    ///
+    /// A failure *after* the operation began mutating on-disk structure (rather
+    /// than a clean pre-mutation rejection) may return `handle: None`; the bytes
+    /// are then recoverable only through the allocator's crash-recovery
+    /// procedure. Implementations must document which paths can do this.
+    ///
+    /// [`LinearBStackAllocator::realloc`]: crate::LinearBStackAllocator
+    fn realloc_inplace<'a>(
+        &'a self,
+        handle: Self::Allocated<'a>,
+        prepend: i64,
+        append: i64,
+    ) -> Result<Self::Allocated<'a>, BStackAllocError<'a, Self>>;
+}
+
 /// Convenience supertrait for the common case of a [`BStackAllocator`] whose
 /// handle type is [`BStackOwnedSlice`] and whose error type is [`io::Error`].
 ///
