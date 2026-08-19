@@ -1,4 +1,6 @@
-use super::{BStackAllocError, BStackAllocator, BStackOwnedSlice, BStackUninitAllocator};
+use super::{
+    BStackAllocError, BStackAllocator, BStackOwnedSlice, BStackUninitAllocator, ensure_own_handle,
+};
 use crate::BStack;
 #[cfg(not(feature = "atomic"))]
 use std::cell::Cell;
@@ -915,6 +917,7 @@ impl BStackAllocator for FirstFitBStackAllocator {
         &'a self,
         slice: BStackOwnedSlice<'a, Self>,
     ) -> Result<(), BStackAllocError<'a, Self>> {
+        let slice = ensure_own_handle(self, slice, "FirstFitBStackAllocator::dealloc")?;
         let start = slice.start();
         let len = slice.len();
         // Set to true once the block is being physically reclaimed and can no
@@ -1150,6 +1153,7 @@ impl FirstFitBStackAllocator {
         new_len: u64,
         init: bool,
     ) -> Result<BStackOwnedSlice<'a, Self>, BStackAllocError<'a, Self>> {
+        let slice = ensure_own_handle(self, slice, "FirstFitBStackAllocator::realloc")?;
         if slice.is_empty() && slice.start() == 0 {
             // Original is an empty handle; hand it back on failure.
             return self.alloc(new_len).map_err(|source| {

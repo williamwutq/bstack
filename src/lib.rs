@@ -572,6 +572,15 @@
 //! via `as_slice[_mut]()` have a shorter lifetime tied to the borrow of the
 //! owned slice, preventing them from outliving the handle that owns the region.
 //!
+//! What lifetimes cannot express is that a handle goes back to the allocator
+//! that issued it: two allocators of the same type are the same type, so
+//! `a2.dealloc(h1)` compiles.  That is not a soundness problem — handles are
+//! `(offset, len)` coordinates into a file, not pointers — but it would corrupt
+//! `a2`'s bookkeeping, so every allocator rejects a foreign handle at run time
+//! with [`io::ErrorKind::InvalidInput`], returning the handle intact and its own
+//! metadata untouched.  [`BStackOwnedSlice::is_from`] is the check, for custom
+//! allocators that need it.
+//!
 //! ## Quick example
 //!
 //! ```skip

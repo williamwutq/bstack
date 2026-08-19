@@ -1,5 +1,6 @@
 use super::{
     BStackAllocError, BStackAllocator, BStackBulkAllocError, BStackBulkAllocator, BStackOwnedSlice,
+    ensure_own_handle, ensure_own_handles,
 };
 use crate::BStack;
 #[cfg(not(feature = "atomic"))]
@@ -156,6 +157,7 @@ impl BStackAllocator for LinearBStackAllocator {
         handle: BStackOwnedSlice<'a, Self>,
         new_len: u64,
     ) -> Result<BStackOwnedSlice<'a, Self>, BStackAllocError<'a, Self>> {
+        let handle = ensure_own_handle(self, handle, "LinearBStackAllocator::realloc")?;
         let start = handle.start();
         let old_len = handle.len();
         let end = handle.end();
@@ -205,6 +207,7 @@ impl BStackAllocator for LinearBStackAllocator {
         handle: BStackOwnedSlice<'a, Self>,
         new_len: u64,
     ) -> Result<BStackOwnedSlice<'a, Self>, BStackAllocError<'a, Self>> {
+        let handle = ensure_own_handle(self, handle, "LinearBStackAllocator::realloc")?;
         let start = handle.start();
         let old_len = handle.len();
         let end = handle.end();
@@ -257,6 +260,7 @@ impl BStackAllocator for LinearBStackAllocator {
         &'a self,
         handle: BStackOwnedSlice<'a, Self>,
     ) -> Result<(), BStackAllocError<'a, Self>> {
+        let handle = ensure_own_handle(self, handle, "LinearBStackAllocator::dealloc")?;
         let start = handle.start();
         let end = handle.end();
         let len = handle.len();
@@ -280,6 +284,7 @@ impl BStackAllocator for LinearBStackAllocator {
         &'a self,
         handle: BStackOwnedSlice<'a, Self>,
     ) -> Result<(), BStackAllocError<'a, Self>> {
+        let handle = ensure_own_handle(self, handle, "LinearBStackAllocator::dealloc")?;
         let start = handle.start();
         let end = handle.end();
         let len = handle.len();
@@ -358,10 +363,11 @@ impl BStackBulkAllocator for LinearBStackAllocator {
         &'a self,
         handles: impl IntoIterator<Item = Self::Allocated<'a>>,
     ) -> Result<(), BStackBulkAllocError<'a, Self>> {
-        let mut sorted: Vec<BStackOwnedSlice<'a, Self>> = handles.into_iter().collect();
-        if sorted.is_empty() {
+        let owned: Vec<BStackOwnedSlice<'a, Self>> = handles.into_iter().collect();
+        if owned.is_empty() {
             return Ok(());
         }
+        let mut sorted = ensure_own_handles(self, owned, "LinearBStackAllocator::dealloc_bulk")?;
         sorted.sort_by_key(|s| std::cmp::Reverse(s.end()));
         let result = (|| -> io::Result<()> {
             let current_tail = self.stack.len()?;
@@ -394,10 +400,11 @@ impl BStackBulkAllocator for LinearBStackAllocator {
         &'a self,
         handles: impl IntoIterator<Item = Self::Allocated<'a>>,
     ) -> Result<(), BStackBulkAllocError<'a, Self>> {
-        let mut sorted: Vec<BStackOwnedSlice<'a, Self>> = handles.into_iter().collect();
-        if sorted.is_empty() {
+        let owned: Vec<BStackOwnedSlice<'a, Self>> = handles.into_iter().collect();
+        if owned.is_empty() {
             return Ok(());
         }
+        let mut sorted = ensure_own_handles(self, owned, "LinearBStackAllocator::dealloc_bulk")?;
         sorted.sort_by_key(|s| std::cmp::Reverse(s.end()));
         let result = (|| -> io::Result<()> {
             let current_tail = self.stack.len()?;

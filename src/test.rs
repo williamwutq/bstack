@@ -4409,6 +4409,65 @@ mod alloc_tests {
         assert_eq!(iter.size_hint(), (usize::MAX, Some(usize::MAX)));
         assert_eq!(iter.len(), usize::MAX);
     }
+
+    // ── Foreign handles ───────────────────────────────────────────────────
+
+    #[test]
+    fn dealloc_and_realloc_reject_a_handle_from_another_instance() {
+        let (a1, p1) = mk_alloc();
+        let _g1 = Guard(p1);
+        let (a2, p2) = mk_alloc();
+        let _g2 = Guard(p2);
+
+        let h = a1.alloc(64).unwrap();
+        assert!(h.is_from(&a1));
+        assert!(!h.is_from(&a2));
+        let range = h.as_range();
+
+        let err = a2.dealloc(h).expect_err("a2 must refuse a1's handle");
+        assert_eq!(err.source.kind(), std::io::ErrorKind::InvalidInput);
+        let h = err
+            .handle
+            .expect("a refused handle is returned, not leaked");
+        assert_eq!(h.as_range(), range);
+
+        let err = a2.realloc(h, 128).expect_err("a2 must refuse a1's handle");
+        assert_eq!(err.source.kind(), std::io::ErrorKind::InvalidInput);
+        let h = err
+            .handle
+            .expect("a refused handle is returned, not leaked");
+        assert_eq!(h.as_range(), range);
+
+        // Both allocators are untouched by the refusals.
+        let own = a2.alloc(64).unwrap();
+        a2.dealloc(own).map_err(|e| e.source).unwrap();
+        a1.dealloc(h).map_err(|e| e.source).unwrap();
+    }
+
+    #[test]
+    fn dealloc_bulk_rejects_a_batch_containing_a_foreign_handle() {
+        let (a1, p1) = mk_alloc();
+        let _g1 = Guard(p1);
+        let (a2, p2) = mk_alloc();
+        let _g2 = Guard(p2);
+
+        let own = a2.alloc(32).unwrap();
+        let foreign = a1.alloc(32).unwrap();
+
+        // One foreign handle poisons the batch: nothing is freed, and every
+        // handle comes back — including the one that did belong to `a2`.
+        let err = a2
+            .dealloc_bulk([own, foreign])
+            .expect_err("a2 must refuse a batch holding a1's handle");
+        assert_eq!(err.source.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(err.handles.len(), 2);
+
+        let mut handles = err.handles.into_iter();
+        let own = handles.next().unwrap();
+        let foreign = handles.next().unwrap();
+        a2.dealloc(own).map_err(|e| e.source).unwrap();
+        a1.dealloc(foreign).map_err(|e| e.source).unwrap();
+    }
 }
 
 // -------------------------------------------------------------------------
@@ -5585,6 +5644,41 @@ mod first_fit_tests {
         let reopened = FirstFitBStackAllocator::new(BStack::open(&path).unwrap()).unwrap();
         // The recovered allocator should still be able to satisfy an alloc.
         let _ = reopened.alloc(16).unwrap();
+    }
+
+    // ── Foreign handles ───────────────────────────────────────────────────
+
+    #[test]
+    fn ff_dealloc_and_realloc_reject_a_handle_from_another_instance() {
+        let (a1, p1) = mk_ff("foreign1");
+        let _g1 = Guard(p1);
+        let (a2, p2) = mk_ff("foreign2");
+        let _g2 = Guard(p2);
+
+        let h = a1.alloc(64).unwrap();
+        assert!(h.is_from(&a1));
+        assert!(!h.is_from(&a2));
+        let range = h.as_range();
+
+        let err = a2.dealloc(h).expect_err("a2 must refuse a1's handle");
+        assert_eq!(err.source.kind(), std::io::ErrorKind::InvalidInput);
+        let h = err
+            .handle
+            .expect("a refused handle is returned, not leaked");
+        assert_eq!(h.as_range(), range);
+
+        let err = a2.realloc(h, 128).expect_err("a2 must refuse a1's handle");
+        assert_eq!(err.source.kind(), std::io::ErrorKind::InvalidInput);
+        let h = err
+            .handle
+            .expect("a refused handle is returned, not leaked");
+        assert_eq!(h.as_range(), range);
+
+        // `a2`'s free list never saw the foreign block, so it still round-trips
+        // its own allocations, and `a1` can still free the original region.
+        let own = a2.alloc(64).unwrap();
+        a2.dealloc(own).map_err(|e| e.source).unwrap();
+        a1.dealloc(h).map_err(|e| e.source).unwrap();
     }
 }
 

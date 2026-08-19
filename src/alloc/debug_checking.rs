@@ -63,7 +63,7 @@
 
 use super::{
     BStackAllocError, BStackAllocator, BStackBulkAllocError, BStackBulkAllocator, BStackOwnedSlice,
-    BStackUninitAllocator,
+    BStackUninitAllocator, ensure_own_handle, ensure_own_handles,
 };
 use crate::BStack;
 use std::collections::HashSet;
@@ -438,6 +438,7 @@ where
             u64,
         ) -> Result<BStackOwnedSlice<'a, A>, BStackAllocError<'a, A>>,
     {
+        let handle = ensure_own_handle(self, handle, "DebugCheckingAllocator::realloc")?;
         let old_offset = handle.start();
         let old_len = handle.len();
         let old_region = old_offset..old_offset + old_len;
@@ -536,6 +537,7 @@ where
         &'a self,
         handle: BStackOwnedSlice<'a, Self>,
     ) -> Result<(), BStackAllocError<'a, Self>> {
+        let handle = ensure_own_handle(self, handle, "DebugCheckingAllocator::dealloc")?;
         let offset = handle.start();
         let len = handle.len();
 
@@ -633,6 +635,7 @@ where
         handles: impl IntoIterator<Item = BStackOwnedSlice<'a, Self>>,
     ) -> Result<(), BStackBulkAllocError<'a, Self>> {
         let handles: Vec<_> = handles.into_iter().collect();
+        let handles = ensure_own_handles(self, handles, "DebugCheckingAllocator::dealloc_bulk")?;
 
         // Pass 1: extract coordinates and validate all handles.
         let mut coords: Vec<(u64, u64)> = Vec::with_capacity(handles.len());
@@ -1627,5 +1630,71 @@ mod tests {
         let state = c.state.lock().unwrap();
         assert_eq!(state.allocated.len(), 2);
         assert_eq!(state.freed.len(), 2);
+    }
+
+    // ── Foreign handles ───────────────────────────────────────────────────
+
+    #[test]
+    fn checker_dealloc_and_realloc_reject_a_handle_from_another_instance() {
+        let (s1, p1) = create_test_stack().unwrap();
+        let _g1 = TestGuard(p1);
+        let (s2, p2) = create_test_stack().unwrap();
+        let _g2 = TestGuard(p2);
+        let cfg = Rc::new(RefCell::new(MockAllocatorConfig::default()));
+        let a1 = DebugCheckingAllocator::new(ControllableMockAllocator::new(s1, cfg.clone()));
+        let a2 = DebugCheckingAllocator::new(ControllableMockAllocator::new(s2, cfg));
+
+        let h = a1.alloc(64).unwrap();
+        assert!(h.is_from(&a1));
+        assert!(!h.is_from(&a2));
+        let range = h.as_range();
+
+        let err = a2.dealloc(h).expect_err("a2 must refuse a1's handle");
+        assert_eq!(err.source.kind(), std::io::ErrorKind::InvalidInput);
+        let h = err
+            .handle
+            .expect("a refused handle is returned, not leaked");
+        assert_eq!(h.as_range(), range);
+
+        let err = a2.realloc(h, 128).expect_err("a2 must refuse a1's handle");
+        assert_eq!(err.source.kind(), std::io::ErrorKind::InvalidInput);
+        let h = err
+            .handle
+            .expect("a refused handle is returned, not leaked");
+        assert_eq!(h.as_range(), range);
+
+        // `a2`'s bookkeeping never saw the foreign block, so it still
+        // round-trips its own allocations, and `a1` can still free the region.
+        let own = a2.alloc(64).unwrap();
+        a2.dealloc(own).map_err(|e| e.source).unwrap();
+        a1.dealloc(h).map_err(|e| e.source).unwrap();
+    }
+
+    #[test]
+    fn checker_dealloc_bulk_rejects_a_batch_containing_a_foreign_handle() {
+        let (s1, p1) = create_test_stack().unwrap();
+        let _g1 = TestGuard(p1);
+        let (s2, p2) = create_test_stack().unwrap();
+        let _g2 = TestGuard(p2);
+        let cfg = Rc::new(RefCell::new(MockAllocatorConfig::default()));
+        let a1 = DebugCheckingAllocator::new(ControllableMockAllocator::new(s1, cfg.clone()));
+        let a2 = DebugCheckingAllocator::new(ControllableMockAllocator::new(s2, cfg));
+
+        let own = a2.alloc(64).unwrap();
+        let foreign = a1.alloc(64).unwrap();
+
+        // One foreign handle poisons the batch: nothing is freed, and every
+        // handle comes back — including the one that did belong to `a2`.
+        let err = a2
+            .dealloc_bulk([own, foreign])
+            .expect_err("a2 must refuse a batch holding a1's handle");
+        assert_eq!(err.source.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(err.handles.len(), 2);
+
+        let mut handles = err.handles.into_iter();
+        let own = handles.next().unwrap();
+        let foreign = handles.next().unwrap();
+        a2.dealloc(own).map_err(|e| e.source).unwrap();
+        a1.dealloc(foreign).map_err(|e| e.source).unwrap();
     }
 }

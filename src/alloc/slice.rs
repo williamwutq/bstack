@@ -1296,6 +1296,19 @@ impl<'a, A: BStackAllocator> BStackOwnedSlice<'a, A> {
         self.allocator
     }
 
+    /// Returns `true` if this handle was issued by `allocator`.
+    ///
+    /// A handle records which allocator produced it, but the type system cannot
+    /// enforce that it is only ever handed back to *that* instance — two
+    /// allocators of the same type are the same type, so `a2.dealloc(h1)`
+    /// type-checks. Allocators use this to reject foreign handles at run time;
+    /// see [the crate-level lifetime model](crate#lifetime-model).
+    #[inline]
+    #[must_use]
+    pub fn is_from(&self, allocator: &A) -> bool {
+        std::ptr::eq(self.allocator, allocator)
+    }
+
     /// Borrow this allocation as a shared [`BStackSlice`] for reads.
     ///
     /// The returned slice's lifetime is tied to `&self` — it cannot outlive

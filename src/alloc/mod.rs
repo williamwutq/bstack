@@ -148,6 +148,25 @@
 //! single-writer exclusivity within safe code: a slice cannot be silently
 //! duplicated out of a `&mut` borrow.  It is `Clone` for explicit second views.
 //!
+//! # Foreign handles
+//!
+//! What the borrow checker does *not* prove is that a handle goes back to the
+//! allocator that issued it.  Two allocators of the same type are the same
+//! type, and `BStackOwnedSlice<'a, A>` is covariant in `'a`, so for `a1` and
+//! `a2` of type `A` outliving `'a`, `a2.dealloc(h1)` compiles.  No lifetime or
+//! type discipline rules that out.  It is also not a soundness problem: handles
+//! are `(offset, len)` coordinates into a file, not pointers, and reach the
+//! payload only through [`BStack`]'s bounds-checked I/O — the damage is `a2`
+//! recording a free block it never owned, which is corruption, not undefined
+//! behaviour.
+//!
+//! Rejecting a foreign handle is therefore the *allocator's* job, at run time.
+//! Every allocator here checks ownership at the top of `realloc`,
+//! `realloc_uninit`, `dealloc`, and `dealloc_bulk` — before touching any
+//! metadata — and returns [`io::ErrorKind::InvalidInput`] with the handle
+//! carried back intact.  Custom implementors should do the same;
+//! [`BStackOwnedSlice::is_from`] is the check.
+//!
 //! # Feature flags
 //!
 //! The `alloc` Cargo feature enables this module, including all allocator traits,
@@ -350,6 +369,62 @@ impl<'a, A: BStackAllocator + 'a> fmt::Display for BStackBulkAllocError<'a, A> {
 
 impl<'a, A: BStackAllocator + 'a> std::error::Error for BStackBulkAllocError<'a, A> {}
 
+/// Reject a handle that was not issued by `allocator`, handing it straight back.
+///
+/// The guard every allocator runs before a `realloc`/`dealloc` touches its
+/// metadata. Passing a handle to the wrong allocator instance is a safe-code
+/// programming error the type system cannot catch — see
+/// [the module documentation](self#foreign-handles) for why it must be a
+/// run-time check and why it is not a soundness issue.
+///
+/// `op` names the calling method for the error message.
+#[inline]
+pub(crate) fn ensure_own_handle<'a, A>(
+    allocator: &'a A,
+    handle: BStackOwnedSlice<'a, A>,
+    op: &'static str,
+) -> Result<BStackOwnedSlice<'a, A>, BStackAllocError<'a, A>>
+where
+    A: BStackAllocator<Error = io::Error, Allocated<'a> = BStackOwnedSlice<'a, A>> + 'a,
+{
+    if handle.is_from(allocator) {
+        Ok(handle)
+    } else {
+        // The region is untouched and still owned by whoever holds it, so the
+        // handle goes back with the error rather than being dropped (leaked).
+        Err(BStackAllocError::with_handle(
+            io::Error::new(io::ErrorKind::InvalidInput, foreign_handle_message(op)),
+            handle,
+        ))
+    }
+}
+
+/// Bulk analogue of [`ensure_own_handle`]: rejects the whole batch if any handle
+/// is foreign, returning every handle so none is leaked.
+#[inline]
+pub(crate) fn ensure_own_handles<'a, A>(
+    allocator: &'a A,
+    handles: Vec<BStackOwnedSlice<'a, A>>,
+    op: &'static str,
+) -> Result<Vec<BStackOwnedSlice<'a, A>>, BStackBulkAllocError<'a, A>>
+where
+    A: BStackAllocator<Error = io::Error, Allocated<'a> = BStackOwnedSlice<'a, A>> + 'a,
+{
+    if handles.iter().all(|h| h.is_from(allocator)) {
+        Ok(handles)
+    } else {
+        Err(BStackBulkAllocError::with_handles(
+            io::Error::new(io::ErrorKind::InvalidInput, foreign_handle_message(op)),
+            handles,
+        ))
+    }
+}
+
+/// Shared message body for the two guards above.
+fn foreign_handle_message(op: &'static str) -> String {
+    format!("{op}: handle was issued by a different allocator instance")
+}
+
 /// A trait for types that own a [`BStack`] and manage contiguous byte regions
 /// within its payload.
 ///
@@ -458,6 +533,12 @@ pub trait BStackAllocator: Sized {
     /// The lifetime `'a` ties the returned handle to the same borrow as the
     /// input handle and the allocator.
     ///
+    /// `handle` must have been issued by *this* allocator instance. That cannot
+    /// be checked at compile time (see
+    /// [Lifetime model](crate#lifetime-model)); implementations should reject a
+    /// foreign handle with [`io::ErrorKind::InvalidInput`], using
+    /// [`BStackOwnedSlice::is_from`], before touching any metadata.
+    ///
     /// # Errors
     ///
     /// Returns a [`BStackAllocError`] on failure, including when the
@@ -480,7 +561,11 @@ pub trait BStackAllocator: Sized {
     ///
     /// `handle` is consumed by value; the owned handle ceases to exist and
     /// no outstanding views (`BStackSlice`) tied to it can remain live (the
-    /// borrow checker enforces this).
+    /// borrow checker enforces this).  What the borrow checker cannot enforce is
+    /// that `handle` came from *this* allocator instance — see
+    /// [Lifetime model](crate#lifetime-model); overriding implementations
+    /// should reject a foreign handle with [`io::ErrorKind::InvalidInput`],
+    /// using [`BStackOwnedSlice::is_from`], before touching any metadata.
     ///
     /// # Errors
     ///
@@ -557,7 +642,9 @@ pub trait BStackBulkAllocator: BStackAllocator {
     ///
     /// Handles may be supplied in any order.  An empty iterator is a valid
     /// no-op.  Handles are consumed by the iterator, consistent with the
-    /// single-ownership requirement.
+    /// single-ownership requirement.  Every handle must have been issued by
+    /// *this* allocator instance; a batch containing a foreign handle should be
+    /// rejected whole (see [Lifetime model](crate#lifetime-model)).
     ///
     /// # Atomicity
     ///

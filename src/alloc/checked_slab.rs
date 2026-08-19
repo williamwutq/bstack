@@ -7,7 +7,9 @@
 //! and lets `dealloc` detect double-free at runtime before the free list can be
 //! corrupted.
 
-use super::{BStackAllocError, BStackAllocator, BStackOwnedSlice, BStackUninitAllocator};
+use super::{
+    BStackAllocError, BStackAllocator, BStackOwnedSlice, BStackUninitAllocator, ensure_own_handle,
+};
 use crate::BStack;
 #[cfg(feature = "atomic")]
 use crate::BStackGenOp;
@@ -1297,6 +1299,7 @@ impl CheckedSlabBStackAllocator {
         new_len: u64,
         init: bool,
     ) -> Result<BStackOwnedSlice<'a, Self>, BStackAllocError<'a, Self>> {
+        let slice = ensure_own_handle(self, slice, "CheckedSlabBStackAllocator::realloc")?;
         if slice.is_empty() && slice.start() == 0 {
             return self.alloc_impl(new_len, init).map_err(|source| {
                 BStackAllocError::with_handle(source, BStackOwnedSlice::empty(self))
@@ -1624,6 +1627,7 @@ impl BStackAllocator for CheckedSlabBStackAllocator {
         &'a self,
         slice: BStackOwnedSlice<'a, Self>,
     ) -> Result<(), BStackAllocError<'a, Self>> {
+        let slice = ensure_own_handle(self, slice, "CheckedSlabBStackAllocator::dealloc")?;
         let start = slice.start();
         let len = slice.len();
         // Set once the caller's blocks may have been partially freed, after
@@ -2474,6 +2478,43 @@ mod tests {
         }
 
         assert_eq!(alloc.recover().unwrap(), 0);
+    }
+
+    // ── Foreign handles ───────────────────────────────────────────────────
+
+    #[test]
+    fn dealloc_and_realloc_reject_a_handle_from_another_instance() {
+        let (s1, p1) = empty_stack();
+        let _g1 = Guard(p1);
+        let (s2, p2) = empty_stack();
+        let _g2 = Guard(p2);
+        let a1 = CheckedSlabBStackAllocator::new(s1, 64).unwrap();
+        let a2 = CheckedSlabBStackAllocator::new(s2, 64).unwrap();
+
+        let h = a1.alloc(64).unwrap();
+        assert!(h.is_from(&a1));
+        assert!(!h.is_from(&a2));
+        let range = h.as_range();
+
+        let err = a2.dealloc(h).expect_err("a2 must refuse a1's handle");
+        assert_eq!(err.source.kind(), std::io::ErrorKind::InvalidInput);
+        let h = err
+            .handle
+            .expect("a refused handle is returned, not leaked");
+        assert_eq!(h.as_range(), range);
+
+        let err = a2.realloc(h, 128).expect_err("a2 must refuse a1's handle");
+        assert_eq!(err.source.kind(), std::io::ErrorKind::InvalidInput);
+        let h = err
+            .handle
+            .expect("a refused handle is returned, not leaked");
+        assert_eq!(h.as_range(), range);
+
+        // `a2`'s bookkeeping never saw the foreign block, so it still
+        // round-trips its own allocations, and `a1` can still free the region.
+        let own = a2.alloc(64).unwrap();
+        a2.dealloc(own).map_err(|e| e.source).unwrap();
+        a1.dealloc(h).map_err(|e| e.source).unwrap();
     }
 }
 
