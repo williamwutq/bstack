@@ -53,6 +53,42 @@ static inline bstack_t *slice_stack(bstack_slice_t s)
     return s.allocator->vtbl->stack(s.allocator);
 }
 
+/* -------------------------------------------------------------------------
+ * Internal helper — foreign-slice guard.
+ *
+ * Run at the top of every realloc/dealloc, before any metadata is touched.
+ * A slice handed to an allocator that did not issue it is a caller error the
+ * language cannot catch (see "Foreign slices" in bstack_alloc.h); acting on it
+ * would make the receiving allocator record a free block it never owned.
+ *
+ * Returns 0 when s belongs to self; otherwise sets errno = EINVAL and returns
+ * -1, the "original survived" code — nothing was modified.
+ * ---------------------------------------------------------------------- */
+
+static inline int check_own_slice(const bstack_allocator_t *self,
+                                  bstack_slice_t s)
+{
+    if (bstack_slice_is_from(s, self))
+        return 0;
+    errno = EINVAL;
+    return -1;
+}
+
+/* Bulk analogue: rejects the whole batch if any slice is foreign, so a bad
+ * batch frees nothing rather than stopping part-way through. */
+static inline int check_own_slices(const bstack_allocator_t *self,
+                                   const bstack_slice_t *slices, size_t n)
+{
+    size_t i;
+    for (i = 0; i < n; i++) {
+        if (!bstack_slice_is_from(slices[i], self)) {
+            errno = EINVAL;
+            return -1;
+        }
+    }
+    return 0;
+}
+
 /* =========================================================================
  * bstack_slice_t — serialization
  * ====================================================================== */
@@ -590,6 +626,9 @@ static int linear_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
 {
     linear_bstack_allocator_t *a = (linear_bstack_allocator_t *)self;
     uint64_t cur_tail, extra, shrink, dummy;
+
+    if (check_own_slice(self, slice) != 0) { *out = slice; return -1; }
+
     /*
      * Every failure path below leaves the original region untouched: the
      * validation checks reject before any mutation, and the extend/discard
@@ -647,6 +686,9 @@ static int linear_vt_dealloc(bstack_allocator_t *self, bstack_slice_t slice)
 {
     linear_bstack_allocator_t *a = (linear_bstack_allocator_t *)self;
     uint64_t cur_tail;
+
+    if (check_own_slice(self, slice) != 0) return -1;
+
     /*
      * discard is a single bstack operation: on failure the stack is
      * unchanged, so slice always survives a failed dealloc here (-1),
@@ -689,6 +731,9 @@ linear_vt_dealloc_bulk(bstack_allocator_t *self, const bstack_slice_t *slices,
                        size_t n)
 {
     size_t i;
+
+    if (check_own_slices(self, slices, n) != 0) return -1;
+
     for (i = 0; i < n; i++) {
         if (linear_vt_dealloc(self, slices[i]) != 0)
             return -1;
@@ -1492,6 +1537,8 @@ static int ff_vt_dealloc(bstack_allocator_t *self, bstack_slice_t slice)
     uint64_t stack_len;
     int      r;
 
+    if (check_own_slice(self, slice) != 0) return -1;
+
     /* Hold the lock across the tail check and the free-list mutation / tail
      * discard, so the read of the tail and the write that follows are atomic
      * w.r.t. other threads.  The validation reads below are harmless to do
@@ -1578,6 +1625,8 @@ static int ff_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
      */
     bstack_slice_t recovered = slice;
     recovered.allocator = self;
+
+    if (check_own_slice(self, slice) != 0) { *out = slice; return -1; }
 
     /* Validation reads stack_len once.  No lock yet — only caller-owned bytes
      * are touched by the lock-free fast paths (cases 1 and 3). */
@@ -1955,6 +2004,9 @@ ff_vt_dealloc_bulk(bstack_allocator_t *self, const bstack_slice_t *slices,
                    size_t n)
 {
     size_t i;
+
+    if (check_own_slices(self, slices, n) != 0) return -1;
+
     for (i = 0; i < n; i++) {
         if (ff_vt_dealloc(self, slices[i]) != 0)
             return -1;
@@ -2968,6 +3020,8 @@ static int gt_vt_dealloc(bstack_allocator_t *self, bstack_slice_t slice)
     ghost_tree_bstack_allocator_t *a = (ghost_tree_bstack_allocator_t *)self;
     uint64_t true_len;
 
+    if (check_own_slice(self, slice) != 0) return -1;
+
     if (slice.len == 0) return 0;
 
     if (slice.offset < ALGT_ARENA_START ||
@@ -3040,6 +3094,8 @@ static int gt_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
     uint64_t stack_len;
     int      is_tail;
 #endif
+
+    if (check_own_slice(self, slice) != 0) { *out = slice; return -1; }
 
     if (slice.len == 0) {
         if (gt_vt_alloc(self, new_len, out) != 0) {
@@ -3388,6 +3444,8 @@ gt_vt_dealloc_bulk(bstack_allocator_t *self, const bstack_slice_t *slices,
     size_t pairs_n, i;
 
     if (n == 0) return 0;
+
+    if (check_own_slices(self, slices, n) != 0) return -1;
 
     pairs = (algt_block_t *)malloc(n * sizeof *pairs);
     if (!pairs) return -1;
@@ -3917,6 +3975,8 @@ static int slab_vtbl_dealloc(bstack_allocator_t *base, bstack_slice_t s)
     slab_bstack_allocator_t *a = (slab_bstack_allocator_t *)base;
     uint64_t n_blocks, backing_size;
 
+    if (check_own_slice(base, s) != 0) return -1;
+
     if (s.len == 0 && s.offset == SLAB_SENTINEL) return 0;
 
     n_blocks = slab_blocks_needed(s.len, a->block_size);
@@ -3970,6 +4030,8 @@ static int slab_vtbl_realloc(bstack_allocator_t *base, bstack_slice_t s,
      */
     bstack_slice_t recovered = s;
     recovered.allocator = base;
+
+    if (check_own_slice(base, s) != 0) { *out = s; return -1; }
 
     if (s.len == 0 && s.offset == SLAB_SENTINEL) {
         if (slab_vtbl_alloc(base, new_len, out) != 0) {
@@ -5388,6 +5450,8 @@ static int alck_vt_dealloc(bstack_allocator_t *base, bstack_slice_t s)
     checked_slab_bstack_allocator_t *a = (checked_slab_bstack_allocator_t *)base;
     uint64_t block_start, overhead, num_blocks, backing, slice_end;
 
+    if (check_own_slice(base, s) != 0) return -1;
+
     if (s.len == 0 && s.offset == 0) return 0;
 
     if (s.offset < ALCK_OVERHEAD) { errno = EINVAL; return -1; }
@@ -5455,6 +5519,8 @@ static int alck_vt_realloc(bstack_allocator_t *base, bstack_slice_t s,
      */
     bstack_slice_t recovered = s;
     recovered.allocator = base;
+
+    if (check_own_slice(base, s) != 0) { *out = s; return -1; }
 
     if (s.len == 0 && s.offset == 0) {
         if (alck_vt_alloc(base, new_len, out) != 0) {
@@ -6488,6 +6554,8 @@ static int alsg_vt_dealloc(bstack_allocator_t *base, bstack_slice_t s)
     uint8_t  buf[8];
 #define RETURN_INVALID do { errno = EINVAL; return -1; } while (0)
 
+    if (check_own_slice(base, s) != 0) return -1;
+
     if (s.len == 0) return 0;                       /* empty handle */
 
     /* Validation errors leave the caller's block untouched (survived, -1). */
@@ -6540,6 +6608,8 @@ static int alsg_vt_realloc(bstack_allocator_t *base, bstack_slice_t s,
     uint64_t       start = s.offset, old_len = s.len;
     uint64_t       block_start, word, old_size, new_size, old_end, need_o, need_n;
     uint8_t        buf[8];
+
+    if (check_own_slice(base, s) != 0) { *out = s; return -1; }
 
     /* Empty handle: realloc is a fresh alloc. */
     if (s.len == 0 && s.offset == 0) {
