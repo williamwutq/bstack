@@ -604,7 +604,7 @@ bstack = { version = "0.4", features = ["set"] }
 
 ### `alloc`
 
-Enables the region-management layer on top of `BStack`: `BStackAllocator`, `BStackBulkAllocator`, `BStackUninitAllocator`, `BStackOwnedSliceAllocator`, `BStackAllocError`, `BStackBulkAllocError`, `BStackRange`, `BStackOwnedSlice`, `BStackSlice`, `BStackSliceReader`, `LinearBStackAllocator`, `GhostTreeBstackAllocator`, and `DebugCheckingAllocator`.  Combined with `set`, also enables `BStackSliceWriter`, `FirstFitBStackAllocator`, `SlabBStackAllocator`, `CheckedSlabBStackAllocator`, `SegregatedBStackAllocator` (experimental), `BStackByteVec`, and `BStackByteVecIter`.
+Enables the region-management layer on top of `BStack`: `BStackAllocator`, `BStackBulkAllocator`, `BStackUninitAllocator`, `BStackInPlaceResizeAllocator`, `BStackOwnedSliceAllocator`, `BStackAllocError`, `BStackBulkAllocError`, `BStackSliceError`, `BStackJoinError`, `BStackRange`, `BStackOwnedSlice`, `BStackSlice`, `BStackSliceReader`, `LinearBStackAllocator`, `GhostTreeBstackAllocator`, and `DebugCheckingAllocator`.  Combined with `set`, also enables `BStackSliceWriter`, `FirstFitBStackAllocator`, `SlabBStackAllocator`, `CheckedSlabBStackAllocator`, `SegregatedBStackAllocator` (experimental), `BStackByteVec`, and `BStackByteVecIter`.
 
 ```toml
 [dependencies]
@@ -997,6 +997,64 @@ the trait as a thin wrapper around `alloc`/`realloc` or not implement it at all.
 `LinearBStackAllocator` does not, since its zero-fill is already free.
 `DebugCheckingAllocator<A>` forwards both methods when `A` implements them.
 
+### `BStackInPlaceResizeAllocator` trait
+
+An opt-in extension trait that resizes a region at *either* edge without
+relocating its retained bytes. `realloc` only moves the tail and may satisfy a
+request by copying the whole payload elsewhere; `realloc_inplace` moves the
+front edge, the back edge, or both in one call and **never relocates** — on
+success the retained bytes keep their exact physical offsets.
+
+```rust
+pub trait BStackInPlaceResizeAllocator: BStackAllocator {
+    fn realloc_inplace<'a>(&'a self, handle: Self::Allocated<'a>, prepend: i64, append: i64)
+        -> Result<Self::Allocated<'a>, BStackAllocError<'a, Self>>;
+}
+```
+
+Positive `prepend`/`append` grows that edge, negative shrinks it; the new length
+is `handle.len() as i64 + prepend + append`. On success the returned handle's
+range is *exactly* `(start - prepend, end + append)` — this position guarantee is
+the contract, not a hint: an allocator that would have to relocate the retained
+bytes returns `io::ErrorKind::Unsupported` instead. A negative resulting length
+returns `io::ErrorKind::InvalidInput` (rather than panicking) with the handle
+carried back, so a caller bug never leaks the region. An empty handle
+(`len == 0`) anchors no region, so it is always `Unsupported` for every
+`(prepend, append)` — the no-op included; growing from empty is a fresh `alloc`.
+
+`LinearBStackAllocator` implements it (tail-only: `prepend != 0` is
+`Unsupported`). `FirstFitBStackAllocator` implements front shrink (trim ≥ 40
+aligned bytes, carving the front into a free block), front grow (≥ 24 aligned
+bytes, consuming a free left neighbour), back grow (same-block, tail-extend, or
+merging a free right neighbour), and back shrink; mixed grow/shrink across the
+two edges is `Unsupported`.
+`GhostTreeBstackAllocator` implements front shrink, back shrink, and both
+together (`MIN_ALLOC`-aligned front), inserting each trimmed residue into its
+tree as a free block; any grow is `Unsupported`. This bounds a trim at the bytes
+removed rather than the retained payload.
+
+#### Subslicing and joining on `BStackOwnedSlice`
+
+Built on the trait:
+
+| Method                              | Feature         | Description                                                             |
+|-------------------------------------|-----------------|-------------------------------------------------------------------------|
+| `try_subslice_inplace(start, end)`  | `alloc`         | Narrow to `[start, end)` in place; propagates `Unsupported`             |
+| `try_subslice(start, end)`          | `set + atomic`  | Same, with an `alloc` + copy + `dealloc` fallback — never `Unsupported` |
+| `try_join_inplace(other)`           | `set + atomic`  | Concatenate `self ++ other`, extending one side in place                |
+| `try_join(other)`                   | `set + atomic`  | Same, with a fresh-allocation copy fallback — never `Unsupported`       |
+
+`try_subslice_inplace` copies nothing, so it needs only the resize trait and is
+available under `alloc` alone; the copying paths need the crash-atomic copy and
+stay gated on `set + atomic`. The `_inplace` variants never copy the retained
+payload. The fallback variants never surface `Unsupported`, only genuine I/O
+failure, and carry the intact inputs back in the error on any pre-commit
+failure; a failure only at the final `dealloc` of a consumed input returns the
+finished result and leaks that input (reclaimable through crash-recovery).
+Failures use dedicated error types — `BStackSliceError` (one recovered handle)
+for subslice, and `BStackJoinError` for join, whose two inline `Option`
+survivors (`first`/`second`) recover 0, 1, or 2 inputs without a `Vec`.
+
 ### `BStackOwnedSlice<'a, A>`
 
 The ownership handle for one allocation. Returned by `alloc`, consumed by `realloc` and `dealloc`. Non-`Copy`, non-`Clone` — exactly one owner per region.
@@ -1010,6 +1068,8 @@ Key methods on `BStackOwnedSlice`:
 | `as_slice_mut<'s>(&'s mut self) -> BStackSlice<'s>` | Exclusive write view                         |
 | `try_clone()` / `try_clone_uninit()` *(features `set` + `atomic`)* | Copy into a second independent allocation (non-`Clone`); `_uninit` skips the destination zero-fill |
 | `to_range()`                                        | Convert to a `BStackRange` for serialisation |
+| `try_subslice_inplace(start, end)` *(`alloc`, `BStackInPlaceResizeAllocator`)* / `try_subslice(start, end)` *(`set + atomic`)* | Narrow to a sub-range (see trait above) |
+| `try_join[_inplace](other)` *(`set + atomic`, `BStackInPlaceResizeAllocator`)*          | Concatenate two allocations (see trait above) |
 
 ### `BStackSlice<'a>`
 
@@ -1124,21 +1184,30 @@ consistency guarantees, and thread safety analysis for each allocator, see
 
 Bump allocator — regions appended sequentially to the tail.  `dealloc` on a
 non-tail slice is a no-op; `realloc` returns `Unsupported` for non-tail slices.
-Without `atomic`: `Send` only.  With `atomic`: `Send + Sync` via
+Implements `BStackInPlaceResizeAllocator` (tail-only; `prepend != 0` is
+`Unsupported`).  Without `atomic`: `Send` only.  With `atomic`: `Send + Sync` via
 `try_extend`/`try_discard`.
 
 ### `FirstFitBStackAllocator` (`alloc + set`)
 
 Doubly-linked intrusive free list with first-fit placement and immediate
 coalescing.  On-disk header flags trigger a linear recovery scan on the next
-open after an unclean shutdown.  Without `atomic`: `Send` only.  With
-`atomic`: `Send + Sync` via an internal `Mutex` serialising free-list mutations.
+open after an unclean shutdown.  Implements `BStackInPlaceResizeAllocator`:
+front shrink (≥ 40 aligned bytes, carved into a free block), front grow (≥ 24
+aligned bytes, consuming a free left neighbour), back grow (same-block,
+tail-extend, or merging a free right neighbour), and back shrink; mixed
+cross-edge grow/shrink is `Unsupported`.
+Without `atomic`: `Send` only.  With `atomic`: `Send + Sync` via an internal
+`Mutex` serialising free-list mutations.
 
 ### `GhostTreeBstackAllocator` (`alloc`)
 
 AVL tree keyed on `(size, address)`; best-fit; zero per-allocation overhead.
-Also implements `BStackBulkAllocator`.  Without `atomic`: `Send` only.  With
-`atomic`: `Send + Sync` via an internal `Mutex`.
+Also implements `BStackBulkAllocator` and `BStackInPlaceResizeAllocator` (front
+and/or back shrink, `MIN_ALLOC`-aligned front — each trimmed residue becomes a
+free block; grows are `Unsupported`, as a headerless exact-size block has no
+neighbour tag to grow into without moving).  Without `atomic`: `Send` only.
+With `atomic`: `Send + Sync` via an internal `Mutex`.
 
 ### `SlabBStackAllocator` (`alloc + set`)
 

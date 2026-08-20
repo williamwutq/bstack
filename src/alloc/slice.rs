@@ -1756,6 +1756,384 @@ where
     }
 }
 
+/// Compute the `(prepend, append)` deltas that narrow a `len`-byte allocation
+/// to its `[start, end)` window for
+/// [`realloc_inplace`](crate::alloc::BStackInPlaceResizeAllocator::realloc_inplace),
+/// or `None` if a length does not fit `i64`. Assumes `start <= end <= len`; the
+/// callers check bounds first so they can report an out-of-bounds range and an
+/// overflow with distinct messages.
+#[inline]
+fn subslice_deltas(len: u64, start: u64, end: u64) -> Option<(i64, i64)> {
+    let len_i = i64::try_from(len).ok()?;
+    let start_i = i64::try_from(start).ok()?;
+    let end_i = i64::try_from(end).ok()?;
+    Some((-start_i, end_i - len_i))
+}
+
+/// In-place narrowing built on
+/// [`BStackInPlaceResizeAllocator`](crate::alloc::BStackInPlaceResizeAllocator).
+///
+/// [`try_subslice_inplace`](Self::try_subslice_inplace) uses only the
+/// allocator's in-place resize and never copies the payload, so it needs no
+/// `set`/`atomic` feature and surfaces [`io::ErrorKind::Unsupported`] when the
+/// allocator cannot honour the request in place. The copying variants
+/// ([`try_subslice`](Self::try_subslice), [`try_join`](Self::try_join),
+/// [`try_join_inplace`](Self::try_join_inplace)) live in the `set + atomic`
+/// impl below.
+impl<'a, A> BStackOwnedSlice<'a, A>
+where
+    A: crate::alloc::BStackInPlaceResizeAllocator + crate::alloc::BStackOwnedSliceAllocator,
+{
+    /// Narrow this allocation to its `[start, end)` byte range **in place**,
+    /// without copying the retained bytes.
+    ///
+    /// One [`realloc_inplace`](crate::alloc::BStackInPlaceResizeAllocator::realloc_inplace)
+    /// call trims the front by `start` and the back to `end` together. Whatever
+    /// that returns — including [`io::ErrorKind::Unsupported`] when the allocator
+    /// cannot do it in place — is propagated as a
+    /// [`BStackSliceError`](crate::alloc::BStackSliceError), with the original
+    /// handle carried in the error on any recoverable failure.
+    ///
+    /// # Errors
+    ///
+    /// [`io::ErrorKind::InvalidInput`] (carrying the untouched handle) if
+    /// `start > end` or `end > self.len()`, or if a length does not fit `i64`.
+    pub fn try_subslice_inplace(
+        self,
+        start: u64,
+        end: u64,
+    ) -> Result<Self, crate::alloc::BStackSliceError<'a, A>> {
+        // Validate the window before any I/O; hand the handle back on a bad one.
+        // Bounds and overflow are reported separately.
+        let len = self.len();
+        if start > end || end > len {
+            return Err(crate::alloc::BStackSliceError::with_handle(
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "try_subslice_inplace: range out of bounds",
+                ),
+                self,
+            ));
+        }
+        let (prepend, append) = match subslice_deltas(len, start, end) {
+            Some(d) => d,
+            None => {
+                return Err(crate::alloc::BStackSliceError::with_handle(
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "try_subslice_inplace: length overflows i64",
+                    ),
+                    self,
+                ));
+            }
+        };
+        self.allocator()
+            .realloc_inplace(self, prepend, append)
+            .map_err(|e| crate::alloc::BStackSliceError {
+                source: e.source,
+                handle: e.handle,
+            })
+    }
+}
+
+/// Copying subslice/join built on
+/// [`BStackInPlaceResizeAllocator`](crate::alloc::BStackInPlaceResizeAllocator).
+///
+/// `try_subslice`/`try_join` add an `alloc` + copy + `dealloc` fallback to the
+/// in-place path, so they never surface [`io::ErrorKind::Unsupported`] — only
+/// genuine I/O failure. `try_join_inplace` keeps the in-place-only contract but
+/// still copies the *moved* side, so it too needs the `set` + `atomic` copy.
+///
+/// # Post-commit cleanup
+///
+/// The copying methods produce their result before releasing the consumed
+/// input(s). If every step through the result succeeds but a final `dealloc` of
+/// a consumed input then fails, the method still returns the finished result
+/// `Ok(...)` and the unfreed input is leaked (reclaimable through the
+/// allocator's crash-recovery). Failures *before* the result is committed
+/// instead return the intact inputs in the error for the caller to retry or
+/// free.
+#[cfg(all(feature = "set", feature = "atomic"))]
+impl<'a, A> BStackOwnedSlice<'a, A>
+where
+    A: crate::alloc::BStackInPlaceResizeAllocator + crate::alloc::BStackOwnedSliceAllocator,
+{
+    /// Copy `src` (a view within the same `BStack`) into `[at, at + src.len())`
+    /// of this allocation in one crash-atomic write. Caller guarantees the
+    /// destination region is within bounds.
+    #[inline]
+    fn copy_from_at(&mut self, at: u64, src: &BStackSlice<'_>) -> io::Result<()> {
+        let mut dst = self.as_slice_mut().subslice(at, at + src.len());
+        dst.copy_from_bstack_slice(src)
+    }
+
+    /// Narrow this allocation to its `[start, end)` byte range, in place when the
+    /// allocator supports it and otherwise by allocating a fresh region, copying
+    /// the range, and freeing the original.
+    ///
+    /// Unlike [`try_subslice_inplace`](Self::try_subslice_inplace) this never
+    /// surfaces [`io::ErrorKind::Unsupported`].
+    ///
+    /// # Errors
+    ///
+    /// [`io::ErrorKind::InvalidInput`] if `start > end` or `end > self.len()`;
+    /// any I/O error from the underlying operations.
+    pub fn try_subslice(
+        self,
+        start: u64,
+        end: u64,
+    ) -> Result<Self, crate::alloc::BStackSliceError<'a, A>> {
+        let len = self.len();
+        if start > end || end > len {
+            return Err(crate::alloc::BStackSliceError::with_handle(
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "try_subslice: range out of bounds",
+                ),
+                self,
+            ));
+        }
+        // Fast path. On any failure that returns the handle (Unsupported or a
+        // clean I/O error), fall back to alloc + copy + dealloc. A lost handle
+        // (None) cannot be retried, so propagate it.
+        let original = match self.try_subslice_inplace(start, end) {
+            Ok(h) => return Ok(h),
+            Err(e) => match e.handle {
+                Some(h) => h,
+                None => return Err(e),
+            },
+        };
+
+        let sub_len = end - start;
+        let alloc = original.allocator();
+        let mut dst = match alloc.alloc(sub_len) {
+            Ok(d) => d,
+            Err(source) => {
+                return Err(crate::alloc::BStackSliceError::with_handle(
+                    source, original,
+                ));
+            }
+        };
+        // Copy the [start, end) window of `original` — a read-only view, no
+        // temporary handle needed.
+        let src = original.as_slice().subslice(start, end);
+        if let Err(source) = dst.copy_from_at(0, &src) {
+            // Copy failed: `original` untouched, drop the fresh region.
+            let _ = alloc.dealloc(dst);
+            return Err(crate::alloc::BStackSliceError::with_handle(
+                source, original,
+            ));
+        }
+        // Result committed; free the original. A failed free leaks it (see the
+        // impl-level "Post-commit cleanup" note) but the subslice still succeeds.
+        let _ = alloc.dealloc(original);
+        Ok(dst)
+    }
+
+    /// Concatenate `self` followed by `other` into a single allocation **in
+    /// place**, without copying whichever side is extended.
+    ///
+    /// Tries to grow `self`'s tail to hold `other`; failing that, tries to grow
+    /// `other`'s front to hold `self`. Only the *moved* side's bytes are copied;
+    /// the extended side never moves. Fails with the inputs recovered when
+    /// neither direction is supported.
+    ///
+    /// # Errors
+    ///
+    /// A [`BStackJoinError`](crate::alloc::BStackJoinError) whose `first`/`second`
+    /// fields carry back whichever inputs survived; includes
+    /// [`io::ErrorKind::Unsupported`] when no in-place direction works.
+    pub fn try_join_inplace(
+        self,
+        other: Self,
+    ) -> Result<Self, crate::alloc::BStackJoinError<'a, A>> {
+        self.join_core(other, false, "try_join_inplace")
+    }
+
+    /// Concatenate `self` followed by `other`, in place when possible and
+    /// otherwise by allocating a fresh combined region and copying both inputs.
+    ///
+    /// Never surfaces [`io::ErrorKind::Unsupported`].
+    ///
+    /// # Errors
+    ///
+    /// A [`BStackJoinError`](crate::alloc::BStackJoinError) on genuine I/O
+    /// failure, carrying back whichever inputs survived.
+    pub fn try_join(self, other: Self) -> Result<Self, crate::alloc::BStackJoinError<'a, A>> {
+        self.join_core(other, true, "try_join")
+    }
+
+    /// Shared body of [`try_join_inplace`](Self::try_join_inplace) (`fallback =
+    /// false`) and [`try_join`](Self::try_join) (`fallback = true`). `op` names
+    /// the calling method for error messages.
+    ///
+    /// The in-place directions are attempted first regardless of `fallback`;
+    /// `fallback` only decides what happens when *both* directions decline while
+    /// both inputs remain intact — a fresh `alloc` + two copies + two frees, or
+    /// an error carrying both inputs.
+    ///
+    /// On failure the survivors are returned in the error's `first`/`second`
+    /// fields: both `Some` when neither region was touched; a single survivor
+    /// (the joined result in `first`, or the one input that could not be freed)
+    /// when one was consumed or merged; `None` for a region lost mid-mutation
+    /// (recoverable only through the allocator's crash-recovery).
+    fn join_core(
+        self,
+        other: Self,
+        fallback: bool,
+        op: &'static str,
+    ) -> Result<Self, crate::alloc::BStackJoinError<'a, A>> {
+        use crate::alloc::BStackJoinError;
+        // Empty inputs: concatenation is just the other side.
+        if self.is_empty() {
+            return Ok(other);
+        }
+        if other.is_empty() {
+            return Ok(self);
+        }
+        // `other` must belong to the same allocator as `self`: the join
+        // allocates, copies, and frees through `self`'s allocator, so a foreign
+        // `other` would corrupt it. Reject before any mutation. (`self` is its
+        // own allocator's by construction.)
+        if !other.is_from(self.allocator()) {
+            return Err(BStackJoinError::both(
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{op}: `other` was issued by a different allocator"),
+                ),
+                self,
+                other,
+            ));
+        }
+        let alloc = self.allocator();
+        let sl = self.len();
+        let ol = other.len();
+        let (sl_i, ol_i) = match (i64::try_from(sl), i64::try_from(ol)) {
+            (Ok(s), Ok(o)) => (s, o),
+            _ => {
+                return Err(BStackJoinError::both(
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("{op}: length overflows i64"),
+                    ),
+                    self,
+                    other,
+                ));
+            }
+        };
+
+        // Attempt A: extend self's tail by `ol`, then copy `other` into it.
+        match alloc.realloc_inplace(self, 0, ol_i) {
+            Ok(mut grown) => {
+                if let Err(source) = grown.copy_from_at(sl, &other.as_slice()) {
+                    // Undo the grow to restore `self`; return both intact.
+                    return Err(match alloc.realloc_inplace(grown, 0, -ol_i) {
+                        Ok(self_again) => BStackJoinError::both(source, self_again, other),
+                        // Undo failed: `self`'s region is `undo.handle` (or lost).
+                        Err(undo) => BStackJoinError::new(source, undo.handle, Some(other)),
+                    });
+                }
+                match alloc.dealloc(other) {
+                    Ok(()) => Ok(grown),
+                    // Join committed in `grown`; `other` could not be freed.
+                    Err(e) => Err(BStackJoinError::new(e.source, Some(grown), None)),
+                }
+            }
+            Err(ea) => {
+                let self_back = match ea.handle {
+                    Some(h) => h,
+                    // `self` lost mid-grow: cannot retry or fall back.
+                    None => return Err(BStackJoinError::new(ea.source, None, Some(other))),
+                };
+                // Attempt B: extend other's front by `sl`, then copy `self` in.
+                match alloc.realloc_inplace(other, sl_i, 0) {
+                    Ok(mut grown2) => {
+                        if let Err(source) = grown2.copy_from_at(0, &self_back.as_slice()) {
+                            return Err(match alloc.realloc_inplace(grown2, -sl_i, 0) {
+                                Ok(other_again) => {
+                                    BStackJoinError::both(source, self_back, other_again)
+                                }
+                                // Undo failed: `other`'s region is `undo.handle`.
+                                Err(undo) => {
+                                    BStackJoinError::new(source, Some(self_back), undo.handle)
+                                }
+                            });
+                        }
+                        match alloc.dealloc(self_back) {
+                            // Join committed in `grown2` (the result).
+                            Ok(()) => Ok(grown2),
+                            Err(e) => Err(BStackJoinError::new(e.source, Some(grown2), None)),
+                        }
+                    }
+                    Err(eb) => {
+                        let other_back = match eb.handle {
+                            Some(h) => h,
+                            None => {
+                                return Err(BStackJoinError::new(eb.source, Some(self_back), None));
+                            }
+                        };
+                        // Both directions declined; both inputs intact.
+                        if fallback {
+                            fresh_join(alloc, self_back, other_back, sl, ol, op)
+                        } else {
+                            Err(BStackJoinError::both(eb.source, self_back, other_back))
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Fresh-allocation join used by [`BStackOwnedSlice::try_join`]: allocate the
+/// combined region, copy both inputs, then free them. A failed copy leaves both
+/// inputs intact; a failed final free leaks that input but still returns the
+/// joined result (see the impl-level "Post-commit cleanup" note). `op` names the
+/// calling method for the overflow message.
+#[cfg(all(feature = "set", feature = "atomic"))]
+fn fresh_join<'a, A>(
+    alloc: &'a A,
+    a: BStackOwnedSlice<'a, A>,
+    b: BStackOwnedSlice<'a, A>,
+    al: u64,
+    bl: u64,
+    op: &'static str,
+) -> Result<BStackOwnedSlice<'a, A>, crate::alloc::BStackJoinError<'a, A>>
+where
+    A: crate::alloc::BStackInPlaceResizeAllocator + crate::alloc::BStackOwnedSliceAllocator,
+{
+    use crate::alloc::BStackJoinError;
+    let total = match al.checked_add(bl) {
+        Some(t) => t,
+        None => {
+            return Err(BStackJoinError::both(
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{op}: combined length overflows"),
+                ),
+                a,
+                b,
+            ));
+        }
+    };
+    let mut dst = match alloc.alloc(total) {
+        Ok(d) => d,
+        Err(source) => return Err(BStackJoinError::both(source, a, b)),
+    };
+    if let Err(source) = dst.copy_from_at(0, &a.as_slice()) {
+        let _ = alloc.dealloc(dst);
+        return Err(BStackJoinError::both(source, a, b));
+    }
+    if let Err(source) = dst.copy_from_at(al, &b.as_slice()) {
+        let _ = alloc.dealloc(dst);
+        return Err(BStackJoinError::both(source, a, b));
+    }
+    // Result committed; free both inputs best-effort.
+    let _ = alloc.dealloc(a);
+    let _ = alloc.dealloc(b);
+    Ok(dst)
+}
+
 impl<'a, A: BStackAllocator> PartialEq for BStackOwnedSlice<'a, A> {
     #[inline]
     fn eq(&self, other: &Self) -> bool {

@@ -162,9 +162,11 @@
 //!
 //! Rejecting a foreign handle is therefore the *allocator's* job, at run time.
 //! Every allocator here checks ownership at the top of `realloc`,
-//! `realloc_uninit`, `dealloc`, and `dealloc_bulk` — before touching any
-//! metadata — and returns [`io::ErrorKind::InvalidInput`] with the handle
-//! carried back intact.  Custom implementors should do the same;
+//! `realloc_uninit`, `dealloc`, `dealloc_bulk`, and (where implemented)
+//! `realloc_inplace` — before touching any metadata — and returns
+//! [`io::ErrorKind::InvalidInput`] with the handle carried back intact.  The
+//! owned-slice `try_join`/`try_join_inplace` likewise reject an `other` handle
+//! from a different allocator.  Custom implementors should do the same;
 //! [`BStackOwnedSlice::is_from`] is the check.
 //!
 //! # Feature flags
@@ -368,6 +370,166 @@ impl<'a, A: BStackAllocator + 'a> fmt::Display for BStackBulkAllocError<'a, A> {
 }
 
 impl<'a, A: BStackAllocator + 'a> std::error::Error for BStackBulkAllocError<'a, A> {}
+
+/// Error returned by [`BStackOwnedSlice::try_subslice`] and
+/// [`try_subslice_inplace`](BStackOwnedSlice::try_subslice_inplace) when the
+/// narrowing fails.
+///
+/// Distinct from [`BStackAllocError`] — which reports a failed
+/// [`realloc`](BStackAllocator::realloc)/[`dealloc`](BStackAllocator::dealloc)
+/// — because a subslice is not an allocation request; it carries back the
+/// still-valid allocation so the caller can retry, fall back, or free it rather
+/// than leak it ([`BStackOwnedSlice`]'s `Drop` is a no-op).
+///
+/// It implements [`std::error::Error`] (delegating [`Display`](fmt::Display) to
+/// [`source`](Self::source)), so `?` works within functions that return it.
+///
+/// [`BStackOwnedSlice::try_subslice`]: crate::alloc::BStackOwnedSlice::try_subslice
+pub struct BStackSliceError<'a, A: BStackAllocator + 'a> {
+    /// The underlying error that caused the operation to fail.
+    pub source: A::Error,
+    /// The recovered ownership handle, if the region survived the failure.
+    ///
+    /// * `Some` — the original allocation is intact and owned by the caller
+    ///   again (the common case: every pre-mutation rejection and the
+    ///   `Unsupported` fast-path decline).
+    /// * `None` — the region was lost mid-mutation (e.g. an interrupted
+    ///   in-place resize), recoverable only through crash-recovery.
+    pub handle: Option<A::Allocated<'a>>,
+}
+
+impl<'a, A: BStackAllocator + 'a> BStackSliceError<'a, A> {
+    /// Construct an error that hands the still-valid handle back to the caller.
+    #[inline]
+    #[must_use]
+    pub fn with_handle(source: A::Error, handle: A::Allocated<'a>) -> Self {
+        Self {
+            source,
+            handle: Some(handle),
+        }
+    }
+
+    /// Construct an error whose allocation was lost by the failed operation.
+    #[inline]
+    #[must_use]
+    pub fn lost(source: A::Error) -> Self {
+        Self {
+            source,
+            handle: None,
+        }
+    }
+
+    /// Consume the error and return the recovered handle, if any.
+    #[inline]
+    #[must_use]
+    pub fn into_handle(self) -> Option<A::Allocated<'a>> {
+        self.handle
+    }
+}
+
+impl<'a, A: BStackAllocator + 'a> fmt::Debug for BStackSliceError<'a, A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BStackSliceError")
+            .field("source", &self.source)
+            .field("handle_recovered", &self.handle.is_some())
+            .finish()
+    }
+}
+
+impl<'a, A: BStackAllocator + 'a> fmt::Display for BStackSliceError<'a, A> {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.source, f)
+    }
+}
+
+impl<'a, A: BStackAllocator + 'a> std::error::Error for BStackSliceError<'a, A> {}
+
+/// Error returned by [`BStackOwnedSlice::try_join`] and
+/// [`try_join_inplace`](BStackOwnedSlice::try_join_inplace) when the
+/// concatenation fails.
+///
+/// A join operates on exactly two inputs, so — unlike the general
+/// [`BStackBulkAllocError`] — it carries its survivors in two inline `Option`
+/// fields rather than a heap [`Vec`], and every failure path is total at the
+/// type level. Whichever inputs survive are returned so they are not leaked
+/// ([`BStackOwnedSlice`]'s `Drop` is a no-op).
+///
+/// It implements [`std::error::Error`] (delegating [`Display`](fmt::Display) to
+/// [`source`](Self::source)), so `?` works within functions that return it.
+///
+/// [`BStackOwnedSlice::try_join`]: crate::alloc::BStackOwnedSlice::try_join
+pub struct BStackJoinError<'a, A: BStackAllocator + 'a> {
+    /// The underlying error that caused the join to fail.
+    pub source: A::Error,
+    /// The first survivor: the `self`-side input, or — once the join has
+    /// committed into it — the joined result. `None` if that region was
+    /// consumed or lost.
+    pub first: Option<A::Allocated<'a>>,
+    /// The second survivor: the `other`-side input. `None` if it was consumed,
+    /// merged into `first`, or lost.
+    pub second: Option<A::Allocated<'a>>,
+}
+
+impl<'a, A: BStackAllocator + 'a> BStackJoinError<'a, A> {
+    /// Construct an error carrying whichever survivors remain (each may be
+    /// `None` if that region was consumed or lost).
+    #[inline]
+    #[must_use]
+    pub fn new(
+        source: A::Error,
+        first: Option<A::Allocated<'a>>,
+        second: Option<A::Allocated<'a>>,
+    ) -> Self {
+        Self {
+            source,
+            first,
+            second,
+        }
+    }
+
+    /// Construct an error carrying both inputs intact — a clean pre-mutation
+    /// rejection where neither region was touched.
+    #[inline]
+    #[must_use]
+    pub fn both(source: A::Error, first: A::Allocated<'a>, second: A::Allocated<'a>) -> Self {
+        Self::new(source, Some(first), Some(second))
+    }
+
+    /// Consume the error and return the surviving handles (`first` then
+    /// `second`, skipping any that was lost).
+    #[inline]
+    #[must_use]
+    pub fn into_handles(self) -> Vec<A::Allocated<'a>> {
+        let mut v = Vec::new();
+        if let Some(h) = self.first {
+            v.push(h);
+        }
+        if let Some(h) = self.second {
+            v.push(h);
+        }
+        v
+    }
+}
+
+impl<'a, A: BStackAllocator + 'a> fmt::Debug for BStackJoinError<'a, A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BStackJoinError")
+            .field("source", &self.source)
+            .field("first_recovered", &self.first.is_some())
+            .field("second_recovered", &self.second.is_some())
+            .finish()
+    }
+}
+
+impl<'a, A: BStackAllocator + 'a> fmt::Display for BStackJoinError<'a, A> {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.source, f)
+    }
+}
+
+impl<'a, A: BStackAllocator + 'a> std::error::Error for BStackJoinError<'a, A> {}
 
 /// Reject a handle that was not issued by `allocator`, handing it straight back.
 ///
@@ -728,6 +890,87 @@ pub trait BStackUninitAllocator: BStackAllocator {
         &'a self,
         handle: Self::Allocated<'a>,
         new_len: u64,
+    ) -> Result<Self::Allocated<'a>, BStackAllocError<'a, Self>>;
+}
+
+/// Extension trait for allocators that can resize a region *at either edge*
+/// without relocating its retained bytes.
+///
+/// [`realloc`](BStackAllocator::realloc) only ever moves the tail edge, and is
+/// free to satisfy a request by copying the whole payload to a fresh region.
+/// [`realloc_inplace`](Self::realloc_inplace) instead moves the front edge, the
+/// back edge, or both in a single call, and **guarantees no relocation**: on
+/// success the retained bytes occupy the same physical offsets they did before.
+/// This bounds a front trim (log / ring-buffer workloads) at the number of
+/// bytes actually added or removed rather than the size of the retained payload.
+///
+/// # The exact-position guarantee is the contract
+///
+/// A successful call returns a handle whose range is *exactly*
+/// `(start - prepend, end + append)` for the input handle's `(start, end)`.
+/// This is not an optimisation hint but the definition of the method: an
+/// implementation that would have to relocate the retained bytes to satisfy the
+/// request **must** fail with [`io::ErrorKind::Unsupported`] rather than return
+/// a correctly-sized handle at a different offset. Callers built on this method
+/// rely on a success meaning the retained bytes were not copied.
+///
+/// An allocator that cannot perform a given `(prepend, append)` combination in
+/// place returns `Unsupported` (the same convention
+/// [`LinearBStackAllocator::realloc`] uses for non-tail resize); supporting one
+/// edge does not obligate it to support the other, or to support both at once.
+pub trait BStackInPlaceResizeAllocator: BStackAllocator {
+    /// Resize `handle` in place by `prepend` bytes at the front and `append`
+    /// bytes at the back in one call.
+    ///
+    /// Positive grows that edge, negative shrinks it by the given magnitude;
+    /// either may be zero. The new length is `handle.len() as i64 + prepend +
+    /// append`. `append`-only reproduces a non-moving [`realloc`](BStackAllocator::realloc);
+    /// `prepend`-only resizes the front; nonzero on both edges shifts the window
+    /// while resizing it.
+    ///
+    /// # Empty handles
+    ///
+    /// An empty handle (`handle.len() == 0`) names no on-disk region, so there is
+    /// no anchored position for the guarantee below to honor. Resizing one in
+    /// place is therefore always [`io::ErrorKind::Unsupported`], for *every*
+    /// `(prepend, append)` — including the `(0, 0)` no-op. Growing from empty is
+    /// a fresh [`alloc`](BStackAllocator::alloc), not a resize; a caller holding
+    /// an empty handle that wants it to stay empty simply keeps it.
+    ///
+    /// # Position guarantee
+    ///
+    /// On success, if the input handle's range was `(start, end)`, the returned
+    /// handle's range is *exactly* `(start - prepend, end + append)` — never a
+    /// correctly-sized region chosen elsewhere. See the trait docs.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`BStackAllocError`] carrying the untouched original handle
+    /// (`handle: Some`) on failure, under the same recovery contract as
+    /// [`realloc`](BStackAllocator::realloc):
+    ///
+    /// * [`io::ErrorKind::Unsupported`] — the allocator cannot satisfy this
+    ///   `(prepend, append)` combination without relocating the retained bytes,
+    ///   or the handle is empty (see "Empty handles" above).
+    /// * [`io::ErrorKind::InvalidInput`] — the resulting length
+    ///   `handle.len() as i64 + prepend + append` is negative, the handle does
+    ///   not describe a valid allocation, or it was issued by a different
+    ///   allocator instance (see the module's "Foreign handles" section). (This
+    ///   is deliberately a recoverable error rather than a panic, so a caller bug
+    ///   does not drop the handle — whose `Drop` is a no-op — and leak the region.)
+    /// * Any other error propagated from the underlying [`BStack`] operations.
+    ///
+    /// A failure *after* the operation began mutating on-disk structure (rather
+    /// than a clean pre-mutation rejection) may return `handle: None`; the bytes
+    /// are then recoverable only through the allocator's crash-recovery
+    /// procedure. Implementations must document which paths can do this.
+    ///
+    /// [`LinearBStackAllocator::realloc`]: crate::LinearBStackAllocator
+    fn realloc_inplace<'a>(
+        &'a self,
+        handle: Self::Allocated<'a>,
+        prepend: i64,
+        append: i64,
     ) -> Result<Self::Allocated<'a>, BStackAllocError<'a, Self>>;
 }
 

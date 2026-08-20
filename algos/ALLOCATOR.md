@@ -23,6 +23,10 @@ The reference bump allocator.  Regions are appended sequentially to the tail.
 `atomic` feature, `realloc` also returns `Unsupported` when another thread
 races to move the tail first — identical semantics to the non-tail case.
 
+`realloc_inplace` (via `BStackInPlaceResizeAllocator`) delegates to `realloc`
+when `prepend == 0` and returns `Unsupported` for any `prepend != 0`: a bump
+allocator cannot move the front edge without relocating the whole payload.
+
 ### Thread safety
 
 Without the `atomic` feature, `LinearBStackAllocator` is **`Send`** but **not
@@ -86,6 +90,49 @@ free block fits, the arena is extended by pushing a new block onto the stack.
 left).  If the merged block reaches the stack tail it is discarded immediately.
 A cascade check removes any further free blocks newly exposed at the tail,
 maintaining the invariant that the tail block is always allocated.
+
+### In-place resize (`realloc_inplace`)
+
+`BStackInPlaceResizeAllocator::realloc_inplace(handle, prepend, append)` moves
+either edge without relocating the retained bytes; the returned range is exactly
+`(start - prepend, end + append)`.
+
+An **empty handle** (`len == 0`) anchors no on-disk region, so it has no position
+for that guarantee to honor: every `(prepend, append)` on it — the no-op
+included — is `Unsupported`, uniformly across all allocators. Growing from empty
+is a fresh `alloc`, not a resize. This is a pre-mutation rejection, so the handle
+is always returned intact.
+
+| `(prepend, append)`            | Path                                                                  |
+|--------------------------------|-----------------------------------------------------------------------|
+| `append <= 0`, `prepend == 0`  | narrow the visible length within the block (no I/O)                    |
+| `append > 0`, `prepend == 0`   | same-block if it already fits, else tail-extend, else merge the following free block (shared with `realloc`), else `Unsupported` |
+| `prepend < 0`, `append <= 0`   | carve the front into a free block (add-to-free-list), narrow the back  |
+| `prepend > 0`, `append == 0`   | grow the front from a free left neighbour (shrink it, or absorb it)    |
+| mixed grow/shrink across edges | `Unsupported`                                                          |
+
+Front shrink requires a trim `pf ≥ BLOCK_OVERHEAD_SIZE + MIN_BLOCK_PAYLOAD_SIZE`
+(40) that is 8-aligned, so the carved-off front `[start, start + pf)` is a valid
+free block (payload `pf − 24`); a smaller or misaligned trim is `Unsupported`.
+The carve writes the inner footer + retained header, then the retained footer,
+then shrinks the front header **last**, reproducing the split shape that
+`unlink_block` produces — so a torn write is repaired by recovery's partial-split
+detection.
+
+Front grow requires `pg ≥ BLOCK_OVERHEAD_SIZE` (24), 8-aligned, and a free left
+neighbour found via its footer tag that either keeps a valid remainder (`pg ≤
+lsize − MIN_BLOCK_PAYLOAD_SIZE`) or is fully absorbed (`pg == lsize + 24`). The
+shrink-remainder path uses the mirror three-write shape (neighbour footer + our
+header, our footer, shrink neighbour header last) with the free block on the
+left; the `pg ≥ 24` floor keeps those writes clear of the old boundary tags, so
+a torn write walks back to the original pair or forward to the merged result.
+The absorb path unlinks the neighbour then overwrites its header; a crash before
+that leaves it marked free for recovery to relink.
+
+Once mutation begins the original handle can no longer be returned: a mid-op I/O
+failure yields `handle: None` and leaves `recovery_needed` set (reopen to
+recover). Negative resulting length returns `InvalidInput` (not a panic) with the
+handle intact.
 
 ### Crash consistency
 
@@ -169,6 +216,28 @@ them, and allocates one contiguous block (one AVL remove or one `extend`). The
 block is sliced into per-request regions. When all slices are returned together
 to `dealloc_bulk`, adjacent slices are merged and freed as a single operation
 — typically one `discard` if they are at the tail.
+
+### In-place resize (`realloc_inplace`)
+
+**Shrinking** either or both edges (`prepend ≤ 0`, `append ≤ 0`) and the
+identity are supported; any **grow** returns `Unsupported`. The zero-overhead
+layout is why: a block has no header, so its size is derived from the handle
+length (`align_up_len`), and there is no boundary tag to find a neighbour to grow
+into — a grow would have to move.
+
+A shrink carves the block into up to three pieces: the front residue `[start,
+start + pf)`, the retained window `[start + pf, start + pf + align_up_len(new_len))`,
+and the back residue after it. `pf` (the front trim) must be `MIN_ALLOC`-aligned;
+since it, `align_up_len`, and the block size are all `MIN_ALLOC` multiples, each
+residue is `0` or `≥ MIN_ALLOC` — never a sub-block sliver. Each nonzero residue
+is zeroed then AVL-inserted as its own free block (the same per-region insert
+`dealloc`/`dealloc_bulk` use); `pf == 0` is a pure back shrink.
+
+Crash safety mirrors the non-tail tail-shrink: both residues are zeroed first (a
+fault there keeps the original, `handle: Some`), then inserted under the lock.
+Once the first insert begins a torn insert is `handle: None` (the block lost,
+same contract as `dealloc`); a crash between the two inserts frees one residue
+and leaks the other, never touching the retained window's bytes.
 
 ### Crash consistency
 

@@ -1,5 +1,6 @@
 use super::{
-    BStackAllocError, BStackAllocator, BStackOwnedSlice, BStackUninitAllocator, ensure_own_handle,
+    BStackAllocError, BStackAllocator, BStackInPlaceResizeAllocator, BStackOwnedSlice,
+    BStackUninitAllocator, ensure_own_handle,
 };
 use crate::BStack;
 #[cfg(not(feature = "atomic"))]
@@ -1549,6 +1550,506 @@ impl FirstFitBStackAllocator {
             }),
         })
     }
+
+    /// Minimum front trim, in bytes, that `realloc_inplace` can perform: the
+    /// carved-off front must be a valid standalone free block, whose payload is
+    /// `pf - BLOCK_OVERHEAD_SIZE` and must reach `MIN_BLOCK_PAYLOAD_SIZE`.
+    const MIN_FRONT_TRIM: u64 = Self::BLOCK_OVERHEAD_SIZE + Self::MIN_BLOCK_PAYLOAD_SIZE; // 40
+
+    /// Read and sanity-check the physical block size from the header at
+    /// `start - BLOCK_HEADER_SIZE`. Returns the stored payload size, or an error
+    /// if it is not a well-formed, in-bounds block size.
+    fn read_block_size(&self, start: u64) -> io::Result<u64> {
+        let mut buf = [0u8; 8];
+        self.stack
+            .get_into(start - Self::BLOCK_HEADER_SIZE, &mut buf)?;
+        let size = u64::from_le_bytes(buf);
+        let tail = self.stack.len()?;
+        // size must be aligned, at least the minimum, and the whole block
+        // (header + payload + footer) must fit within the stack.
+        let end_ok = start
+            .checked_add(size)
+            .and_then(|e| e.checked_add(Self::BLOCK_FOOTER_SIZE))
+            .is_some_and(|e| e <= tail);
+        if size < Self::MIN_BLOCK_PAYLOAD_SIZE || !size.is_multiple_of(8) || !end_ok {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "realloc_inplace: block header reports an invalid size",
+            ));
+        }
+        Ok(size)
+    }
+
+    /// One `BLOCK_OVERHEAD_SIZE` boundary write: a free block's footer
+    /// (`footer_size`) immediately followed by an *allocated* block's header
+    /// (`header_size`, flags word left zero). Written at the shared boundary of
+    /// the two blocks (`allocated_header_start − BLOCK_FOOTER_SIZE`) by the
+    /// front-shrink and front-grow-shrink paths, which both place a free block
+    /// directly before the retained allocation.
+    #[inline]
+    fn boundary_footer_then_alloc_header(
+        footer_size: u64,
+        header_size: u64,
+    ) -> [u8; Self::BLOCK_OVERHEAD_SIZE as usize] {
+        let mut buf = [0u8; Self::BLOCK_OVERHEAD_SIZE as usize];
+        buf[0..8].copy_from_slice(&footer_size.to_le_bytes());
+        buf[8..16].copy_from_slice(&header_size.to_le_bytes());
+        // buf[16..24] stays zero: the allocated block's flags + reserved words.
+        buf
+    }
+
+    /// Grow the back edge of the block at `start` to `new_len` bytes **in
+    /// place** (`new_len > old_len`). Supports the three non-moving paths — the
+    /// block is already large enough, it is the tail block and can be extended,
+    /// or the immediately following block is free and large enough to merge into
+    /// (via [`try_grow_into_next_free`](Self::try_grow_into_next_free)) — and
+    /// returns [`io::ErrorKind::Unsupported`] otherwise (which would require
+    /// relocating the payload). The untouched original handle is recoverable on
+    /// failure; the tail-extend path may return `None` once its multi-write
+    /// commit has begun.
+    fn grow_back_inplace<'a>(
+        &'a self,
+        start: u64,
+        old_len: u64,
+        new_len: u64,
+    ) -> Result<BStackOwnedSlice<'a, Self>, BStackAllocError<'a, Self>> {
+        let mut lost = false;
+        let result = (|| -> io::Result<BStackOwnedSlice<'a, Self>> {
+            let block_size = self.read_block_size(start)?;
+            let aligned_new = self.align_len(new_len);
+
+            // Already big enough: only the visible length grows. Zero the gap
+            // [old_len, new_len) — it may hold stale bytes from a prior occupant
+            // — in one atomic write. No structural change, no recovery flag.
+            if block_size >= aligned_new {
+                if new_len > old_len {
+                    self.stack.zero(start + old_len, new_len - old_len)?;
+                }
+                // SAFETY: new_len fits within the existing block.
+                return Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, start, new_len) });
+            }
+
+            // Physical growth. Only the tail block can grow without moving.
+            #[cfg(feature = "atomic")]
+            let _guard = self.lock.lock().unwrap();
+            let tail = self.stack.len()?;
+            if start + block_size == tail - Self::BLOCK_FOOTER_SIZE {
+                self.set_recovery_needed()?;
+                lost = true;
+                // Extend the payload by the delta; the old footer is absorbed.
+                self.stack.extend(aligned_new - block_size)?;
+                // Zero [old_len, block_size + FOOTER): the old gap plus the old
+                // footer bytes now inside the payload. `extend` already zeroed
+                // everything past the old footer.
+                self.stack.zero(
+                    start + old_len,
+                    block_size + Self::BLOCK_FOOTER_SIZE - old_len,
+                )?;
+                self.stack
+                    .set(start - Self::BLOCK_HEADER_SIZE, aligned_new.to_le_bytes())?;
+                self.stack
+                    .set(start + aligned_new, aligned_new.to_le_bytes())?;
+                self.clear_recovery_needed()?;
+                // SAFETY: block extended in place at the tail.
+                return Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, start, new_len) });
+            }
+
+            // Not the tail: absorb the immediately following free block if it is
+            // free and large enough — the same in-place merge `realloc` performs.
+            // The lock is held above; the helper manages `recovery_needed`. On a
+            // mid-merge failure it propagates and the original handle is returned,
+            // matching `realloc`'s merge-path contract (the block is left mid-merge
+            // with `recovery_needed` set for the next reopen).
+            if self.try_grow_into_next_free(start, block_size, aligned_new, old_len, true)? {
+                // SAFETY: block grown in place by merging the next free block.
+                return Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, start, new_len) });
+            }
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "realloc_inplace: back grow would relocate a non-tail block",
+            ))
+        })();
+        result.map_err(|source| BStackAllocError {
+            source,
+            handle: if lost {
+                None
+            } else {
+                // SAFETY: (start, old_len) still names the live, unmodified block.
+                Some(unsafe { BStackOwnedSlice::from_raw_parts(self, start, old_len) })
+            },
+        })
+    }
+
+    /// Shrink the front edge of the block at `start` by `pf` bytes **in place**,
+    /// yielding a handle at `start + pf` with visible length `new_len`.
+    ///
+    /// The carved-off front `[start, start + pf)` becomes a free block (coalesced
+    /// into a free left neighbour if one exists). Requires `pf >=
+    /// MIN_FRONT_TRIM` and `pf % 8 == 0` — a smaller or misaligned trim cannot
+    /// form a valid, aligned free block and returns
+    /// [`io::ErrorKind::Unsupported`]. The retained tail `[start + pf, start +
+    /// block_size)` never moves.
+    ///
+    /// The carve reuses the split shape that [`unlink_block`](Self::unlink_block)
+    /// produces, so a torn write is repaired by [`recovery`](Self::recovery)'s
+    /// partial-split detection. Once the multi-write carve begins the original
+    /// handle can no longer be safely returned, so a mid-carve failure yields
+    /// `handle: None` and leaves `recovery_needed` set for the next reopen.
+    fn shrink_front_inplace<'a>(
+        &'a self,
+        start: u64,
+        old_len: u64,
+        pf: u64,
+        new_len: u64,
+    ) -> Result<BStackOwnedSlice<'a, Self>, BStackAllocError<'a, Self>> {
+        let mut lost = false;
+        let result = (|| -> io::Result<BStackOwnedSlice<'a, Self>> {
+            // A front trim below the minimum, or one that would misalign the
+            // retained block, cannot be done in place.
+            if pf < Self::MIN_FRONT_TRIM || !pf.is_multiple_of(8) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "realloc_inplace: front trim too small or misaligned to carve in place",
+                ));
+            }
+            let block_size = self.read_block_size(start)?;
+            // Retained block payload size after the carve. It must stay a valid
+            // block and still cover the requested visible length.
+            let retained = match block_size.checked_sub(pf) {
+                Some(r) if r >= Self::MIN_BLOCK_PAYLOAD_SIZE && r >= new_len => r,
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "realloc_inplace: front trim leaves too small a retained block",
+                    ));
+                }
+            };
+            let front_payload = pf - Self::BLOCK_OVERHEAD_SIZE; // >= MIN_BLOCK_PAYLOAD_SIZE
+            let new_start = start + pf;
+
+            #[cfg(feature = "atomic")]
+            let _guard = self.lock.lock().unwrap();
+            self.set_recovery_needed()?;
+            // The carve is committed from here: the block structure changes and
+            // the original (start, old_len) can no longer be handed back.
+            lost = true;
+
+            // W1: front block footer (front_payload) + retained block header
+            // (size `retained`, flags = allocated) in one write at new_start-24.
+            let w1 = Self::boundary_footer_then_alloc_header(front_payload, retained);
+            self.stack.set(new_start - Self::BLOCK_OVERHEAD_SIZE, w1)?;
+
+            // W2: retained block footer. This is where the original block's
+            // footer sat; overwriting it to `retained` is the point past which
+            // recovery must reconstruct the split rather than the whole block.
+            self.stack.set(start + block_size, retained.to_le_bytes())?;
+
+            // W3: shrink the front header to `front_payload`, keeping its
+            // allocated flag (only the 8-byte size word is rewritten). Committed
+            // last so recovery's partial-split check can fire on a torn W2->W3.
+            self.stack
+                .set(start - Self::BLOCK_HEADER_SIZE, front_payload.to_le_bytes())?;
+
+            // Free the now-allocated front block: marks it free, coalesces a free
+            // left neighbour, and prepends it to the free list. It can never be
+            // the tail (the retained block follows it), so the cascade is a
+            // no-op but is issued for consistency with the free-list contract.
+            self.add_to_free_list(start)?;
+            self.cascade_discard_free_tail()?;
+            self.clear_recovery_needed()?;
+            // SAFETY: retained block at new_start with capacity `retained` >= new_len.
+            Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, new_start, new_len) })
+        })();
+        result.map_err(|source| BStackAllocError {
+            source,
+            handle: if lost {
+                None
+            } else {
+                // SAFETY: (start, old_len) still names the live, unmodified block.
+                Some(unsafe { BStackOwnedSlice::from_raw_parts(self, start, old_len) })
+            },
+        })
+    }
+
+    /// Minimum front growth, in bytes, that `realloc_inplace` can perform: below
+    /// this the carve's metadata write would overlap the old boundary tags, so
+    /// a torn write could not be walked back to the original two blocks.
+    const MIN_FRONT_GROW: u64 = Self::BLOCK_OVERHEAD_SIZE; // 24
+
+    /// Grow the front edge of the block at `start` by `pg` bytes **in place**,
+    /// consuming `pg` bytes from a free *left* neighbour, and yielding a handle
+    /// at `start - pg` with visible length `new_len`. The retained bytes never
+    /// move; the `pg` newly exposed front bytes are zeroed.
+    ///
+    /// Requires a free left neighbour of payload `lsize` that either keeps a
+    /// valid remainder (`pg <= lsize - MIN_BLOCK_PAYLOAD_SIZE`) or is fully
+    /// absorbed (`pg == lsize + BLOCK_OVERHEAD_SIZE`), plus `pg >= MIN_FRONT_GROW`
+    /// and `pg % 8 == 0`; anything else returns [`io::ErrorKind::Unsupported`].
+    ///
+    /// The shrink-remainder path writes the neighbour's new footer + our new
+    /// header, then our footer, then shrinks the neighbour header **last** — the
+    /// same three-write shape as [`shrink_front_inplace`](Self::shrink_front_inplace)
+    /// with the free block on the left, so a torn write walks back to the
+    /// original pair (before the last write) or forward to the merged result
+    /// (after it). The absorb path unlinks the neighbour, then overwrites its
+    /// header with our grown header; a crash before that overwrite leaves the
+    /// neighbour marked free for recovery to relink. Once mutation begins the
+    /// original handle can no longer be returned (`handle: None`).
+    fn grow_front_inplace<'a>(
+        &'a self,
+        start: u64,
+        old_len: u64,
+        pg: u64,
+        new_len: u64,
+    ) -> Result<BStackOwnedSlice<'a, Self>, BStackAllocError<'a, Self>> {
+        let mut lost = false;
+        let result = (|| -> io::Result<BStackOwnedSlice<'a, Self>> {
+            if pg < Self::MIN_FRONT_GROW || !pg.is_multiple_of(8) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "realloc_inplace: front growth too small or misaligned to carve in place",
+                ));
+            }
+            let arena_start = Self::OFFSET_SIZE + Self::HEADER_SIZE;
+            let our_header = start - Self::BLOCK_HEADER_SIZE;
+            if our_header <= arena_start {
+                // No room for a left neighbour: this is the first arena block.
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "realloc_inplace: front growth has no left neighbour",
+                ));
+            }
+
+            // Under the lock so the neighbour read and the free-list mutation are
+            // atomic w.r.t. concurrent alloc/dealloc (which pop free blocks).
+            #[cfg(feature = "atomic")]
+            let _guard = self.lock.lock().unwrap();
+
+            let block_size = self.read_block_size(start)?;
+            let our_new_size = match block_size.checked_add(pg) {
+                Some(s) => s,
+                None => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "realloc_inplace: grown block size overflows",
+                    ));
+                }
+            };
+
+            // Locate and validate the free left neighbour via its footer tag.
+            let mut fbuf = [0u8; 8];
+            self.stack
+                .get_into(our_header - Self::BLOCK_FOOTER_SIZE, &mut fbuf)?;
+            let lsize = u64::from_le_bytes(fbuf);
+            let unsupported = || {
+                Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "realloc_inplace: front growth needs a large-enough free left neighbour",
+                ))
+            };
+            if lsize < Self::MIN_BLOCK_PAYLOAD_SIZE || !lsize.is_multiple_of(8) {
+                return unsupported();
+            }
+            let l_header = match our_header
+                .checked_sub(lsize + Self::BLOCK_OVERHEAD_SIZE)
+                .filter(|&h| h >= arena_start)
+            {
+                Some(h) => h,
+                None => return unsupported(),
+            };
+            let mut lhbuf = [0u8; 16];
+            self.stack.get_into(l_header, &mut lhbuf)?;
+            let l_hdr_size = u64::from_le_bytes(lhbuf[0..8].try_into().unwrap());
+            let l_is_free = lhbuf[8] & 1 != 0;
+            if !l_is_free || l_hdr_size != lsize {
+                return unsupported();
+            }
+
+            // Decide the path before touching anything (both keep the retained
+            // block anchored and end with our header at `new_header`).
+            let new_start = start - pg;
+            let new_header = new_start - Self::BLOCK_HEADER_SIZE; // start - pg - 16
+            enum Mode {
+                Shrink(u64), // neighbour's new payload size
+                Absorb,
+            }
+            let mode = if pg <= lsize.saturating_sub(Self::MIN_BLOCK_PAYLOAD_SIZE) {
+                Mode::Shrink(lsize - pg)
+            } else if pg == lsize + Self::BLOCK_OVERHEAD_SIZE {
+                Mode::Absorb
+            } else {
+                return unsupported();
+            };
+
+            self.set_recovery_needed()?;
+            lost = true;
+
+            match mode {
+                Mode::Shrink(l_new_size) => {
+                    // W1: neighbour's new footer + our new header, one write at
+                    // new_header - FOOTER. pg >= 24 keeps this clear of the old
+                    // boundary tags at start-24 / start-16.
+                    let w1 = Self::boundary_footer_then_alloc_header(l_new_size, our_new_size);
+                    self.stack.set(new_header - Self::BLOCK_FOOTER_SIZE, w1)?;
+                    // W2: our footer at its (unchanged) position, new size.
+                    self.stack
+                        .set(start + block_size, our_new_size.to_le_bytes())?;
+                    // W3: shrink the neighbour header last (size word only; keeps
+                    // its free flag and its intact free-list pointers).
+                    self.stack.set(l_header, l_new_size.to_le_bytes())?;
+                }
+                Mode::Absorb => {
+                    // Consume the whole neighbour: unlink it, then overwrite its
+                    // header with our grown allocated header and rewrite our footer.
+                    self.unlink_from_free_list(l_header + Self::BLOCK_HEADER_SIZE)?;
+                    let mut hdr = [0u8; Self::BLOCK_HEADER_SIZE as usize];
+                    hdr[0..8].copy_from_slice(&our_new_size.to_le_bytes());
+                    // hdr[8..16] = flags(0)+reserved(0) => allocated.
+                    self.stack.set(new_header, hdr)?;
+                    self.stack
+                        .set(start + block_size, our_new_size.to_le_bytes())?;
+                }
+            }
+
+            // Zero the newly exposed front bytes [new_start, start). They held
+            // the neighbour's (now-consumed) tail and the old boundary tags.
+            self.stack.zero(new_start, pg)?;
+            self.clear_recovery_needed()?;
+            // SAFETY: block now spans new_start with capacity our_new_size >= new_len.
+            Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, new_start, new_len) })
+        })();
+        result.map_err(|source| BStackAllocError {
+            source,
+            handle: if lost {
+                None
+            } else {
+                // SAFETY: (start, old_len) still names the live, unmodified block.
+                Some(unsafe { BStackOwnedSlice::from_raw_parts(self, start, old_len) })
+            },
+        })
+    }
+}
+
+impl BStackInPlaceResizeAllocator for FirstFitBStackAllocator {
+    /// Front and back in-place resize for the first-fit arena.
+    ///
+    /// | `(prepend, append)`                | Behaviour                                              |
+    /// |------------------------------------|--------------------------------------------------------|
+    /// | `append <= 0`, `prepend == 0`      | narrow the visible length within the block (no I/O)     |
+    /// | `append > 0`, `prepend == 0`       | back grow: same-block, else tail-extend, else merge next free block, else `Unsupported` |
+    /// | `prepend < 0`, `append <= 0`       | carve the front into a free block, narrow the back      |
+    /// | `prepend > 0`, `append == 0`       | grow the front from a free left neighbour               |
+    /// | mixed grow/shrink across edges     | `Unsupported`                                           |
+    ///
+    /// Front shrink requires an 8-aligned trim of at least
+    /// `BLOCK_OVERHEAD_SIZE + MIN_BLOCK_PAYLOAD_SIZE` (40) bytes so the carved-off
+    /// front is a valid free block; smaller or misaligned trims return
+    /// `Unsupported`. The structural paths (front carve, tail extend) bracket
+    /// their writes with `recovery_needed` and reproduce the split shape recovery
+    /// already repairs; a mid-mutation I/O failure returns `handle: None`.
+    fn realloc_inplace<'a>(
+        &'a self,
+        slice: BStackOwnedSlice<'a, Self>,
+        prepend: i64,
+        append: i64,
+    ) -> Result<BStackOwnedSlice<'a, Self>, BStackAllocError<'a, Self>> {
+        // Reject a handle from another allocator instance before any logic runs
+        // (see the module's "Foreign handles" section).
+        let slice = ensure_own_handle(self, slice, "FirstFitBStackAllocator::realloc_inplace")?;
+        // An empty handle anchors no block; resizing it in place is never
+        // supported for any `(prepend, append)` (see the trait's "Empty handles").
+        if slice.is_empty() {
+            return Err(BStackAllocError::with_handle(
+                io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "realloc_inplace: cannot resize an empty handle in place",
+                ),
+                slice,
+            ));
+        }
+        let start = slice.start();
+        let old_len = slice.len();
+
+        // Resulting length, validated before any I/O. Guard the cast and both
+        // additions so a hostile handle or delta cannot wrap into a bogus length.
+        let new_len = match i64::try_from(old_len)
+            .ok()
+            .and_then(|l| l.checked_add(prepend))
+            .and_then(|l| l.checked_add(append))
+        {
+            Some(n) if n >= 0 => n as u64,
+            _ => {
+                return Err(BStackAllocError::with_handle(
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "realloc_inplace: resulting length is negative or overflows",
+                    ),
+                    slice,
+                ));
+            }
+        };
+
+        // Shrinking to nothing frees the region; delegate to dealloc, which owns
+        // the handle-return contract on failure.
+        if new_len == 0 {
+            return self.dealloc(slice).map(|()| BStackOwnedSlice::empty(self));
+        }
+
+        // Validate the handle addresses a real block (mirrors dealloc/realloc).
+        let aligned_old = self.align_len(old_len);
+        if self.is_impossible_block_start(start)
+            || self.is_impossible_block_end(start + aligned_old)
+            || self.is_impossible_block_size(aligned_old)
+        {
+            return Err(BStackAllocError::with_handle(
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "realloc_inplace: slice does not describe a valid block",
+                ),
+                slice,
+            ));
+        }
+
+        // `slice` is consumed by the branches below; reconstruct the original
+        // handle for the Unsupported paths that never touch the block.
+        // SAFETY: (start, old_len) still names the live, unmodified block.
+        let unsupported = |msg: &'static str| {
+            BStackAllocError::with_handle(io::Error::new(io::ErrorKind::Unsupported, msg), unsafe {
+                BStackOwnedSlice::from_raw_parts(self, start, old_len)
+            })
+        };
+
+        if prepend == 0 {
+            if append <= 0 {
+                // Identity or back shrink: the block is untouched, only the
+                // visible length changes. new_len <= old_len <= block size.
+                // SAFETY: (start, new_len) lies within the existing block.
+                return Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, start, new_len) });
+            }
+            return self.grow_back_inplace(start, old_len, new_len);
+        }
+
+        if prepend < 0 {
+            if append > 0 {
+                return Err(unsupported(
+                    "realloc_inplace: simultaneous front shrink and back grow not supported",
+                ));
+            }
+            // prepend < 0, so `-prepend > 0` fits in u64.
+            let pf = prepend.unsigned_abs();
+            return self.shrink_front_inplace(start, old_len, pf, new_len);
+        }
+
+        // prepend > 0: front grow, consuming a free left neighbour.
+        if append != 0 {
+            return Err(unsupported(
+                "realloc_inplace: simultaneous front grow and back resize not supported",
+            ));
+        }
+        // prepend > 0 fits in u64.
+        let pg = prepend as u64;
+        self.grow_front_inplace(start, old_len, pg, new_len)
+    }
 }
 
 // Fault-injection failure tests (non-`atomic` white-box; op-agnostic fuzz covers
@@ -1566,7 +2067,7 @@ impl FirstFitBStackAllocator {
 mod fault_tests {
     use super::FirstFitBStackAllocator;
     use crate::BStack;
-    use crate::alloc::BStackAllocator;
+    use crate::alloc::{BStackAllocator, BStackInPlaceResizeAllocator};
     use crate::alloc_test_common::{Guard, policies::FailOpAt, temp_path};
     use crate::fault::FaultPolicy;
     use std::io::ErrorKind;
@@ -1830,5 +2331,533 @@ mod fault_tests {
             alloc.dealloc(r).unwrap();
             assert_arena_footers_match(&alloc, &format!("at={at} after reuse"));
         }
+    }
+
+    // Front shrink writes are: set_recovery_needed (set #0), W1 inner footer +
+    // retained header (#1), W2 retained footer (#2), W3 shrink front header (#3).
+    // Faulting W1 (before the split commits) must leave the original block whole;
+    // faulting W3 (after W1+W2, the partial-split state) must let recovery
+    // reconstruct the [free front | retained] pair with the retained bytes intact.
+    #[test]
+    fn front_shrink_fault_before_commit_recovers() {
+        let path = temp_path("ff_fshrink_pre");
+        let _g = Guard(path.clone());
+        let start = {
+            let alloc = FirstFitBStackAllocator::new(BStack::open(&path).unwrap()).unwrap();
+            let mut h = alloc.alloc(100).unwrap();
+            h.write([0xC3u8; 100]).unwrap();
+            let start = h.start();
+            arm(&alloc, FailOpAt::new("set", 1, ErrorKind::Other)); // fault W1
+            let err = alloc
+                .realloc_inplace(h, -40, 0)
+                .expect_err("front shrink must report the fault");
+            disarm(&alloc);
+            assert!(err.handle.is_none(), "past the lost point: handle is None");
+            drop(alloc);
+            start
+        };
+        let alloc = FirstFitBStackAllocator::new(BStack::open(&path).unwrap()).unwrap();
+        assert_arena_footers_match(&alloc, "front shrink W1 fault");
+        // The whole original block survived untouched.
+        assert_eq!(
+            alloc.stack().get(start, start + 100).unwrap(),
+            vec![0xC3u8; 100]
+        );
+        let mut d = alloc.alloc(64).unwrap();
+        d.write([5u8; 64]).unwrap();
+        assert_eq!(d.read().unwrap(), vec![5u8; 64]);
+    }
+
+    #[test]
+    fn front_shrink_fault_after_split_recovers() {
+        let path = temp_path("ff_fshrink_split");
+        let _g = Guard(path.clone());
+        let start = {
+            let alloc = FirstFitBStackAllocator::new(BStack::open(&path).unwrap()).unwrap();
+            let mut h = alloc.alloc(100).unwrap();
+            h.write([0xC3u8; 100]).unwrap();
+            let start = h.start();
+            arm(&alloc, FailOpAt::new("set", 3, ErrorKind::Other)); // fault W3
+            let err = alloc
+                .realloc_inplace(h, -40, 0)
+                .expect_err("front shrink must report the fault");
+            disarm(&alloc);
+            assert!(err.handle.is_none());
+            drop(alloc);
+            start
+        };
+        let alloc = FirstFitBStackAllocator::new(BStack::open(&path).unwrap()).unwrap();
+        assert_arena_footers_match(&alloc, "front shrink W3 fault");
+        // Retained bytes [40, 100) live on at the carved offset start+40.
+        assert_eq!(
+            alloc.stack().get(start + 40, start + 100).unwrap(),
+            vec![0xC3u8; 60]
+        );
+        let mut d = alloc.alloc(64).unwrap();
+        d.write([6u8; 64]).unwrap();
+        assert_eq!(d.read().unwrap(), vec![6u8; 64]);
+    }
+
+    // Front grow (shrink-neighbour) writes: set_recovery_needed (#0), W1 neighbour
+    // footer + our header (#1), W2 our footer (#2), W3 shrink neighbour header (#3).
+    // Faulting W3 leaves the partial state that recovery rolls back to the original
+    // [free neighbour | our block] pair; our bytes must be intact.
+    #[test]
+    fn front_grow_fault_recovers() {
+        let path = temp_path("ff_fgrow");
+        let _g = Guard(path.clone());
+        let b_start = {
+            let alloc = FirstFitBStackAllocator::new(BStack::open(&path).unwrap()).unwrap();
+            let a = alloc.alloc(100).unwrap();
+            let mut b = alloc.alloc(50).unwrap();
+            b.write([0x9Bu8; 50]).unwrap();
+            let b_start = b.start();
+            alloc.dealloc(a).map_err(|e| e.source).unwrap();
+            arm(&alloc, FailOpAt::new("set", 3, ErrorKind::Other)); // fault W3
+            let err = alloc
+                .realloc_inplace(b, 32, 0)
+                .expect_err("front grow must report the fault");
+            disarm(&alloc);
+            assert!(err.handle.is_none());
+            drop(alloc);
+            b_start
+        };
+        let alloc = FirstFitBStackAllocator::new(BStack::open(&path).unwrap()).unwrap();
+        assert_arena_footers_match(&alloc, "front grow W3 fault");
+        // Our block rolled back in place; its bytes survive at the original offset.
+        assert_eq!(
+            alloc.stack().get(b_start, b_start + 50).unwrap(),
+            vec![0x9Bu8; 50]
+        );
+        let mut d = alloc.alloc(64).unwrap();
+        d.write([8u8; 64]).unwrap();
+        assert_eq!(d.read().unwrap(), vec![8u8; 64]);
+    }
+}
+
+// In-place resize (`BStackInPlaceResizeAllocator`) and owned-slice subslice/join.
+#[cfg(all(test, feature = "set"))]
+mod inplace_resize_tests {
+    use super::FirstFitBStackAllocator;
+    use crate::BStack;
+    use crate::alloc::{BStackAllocator, BStackInPlaceResizeAllocator};
+    use std::io::ErrorKind;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct Guard(std::path::PathBuf);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn open_fresh() -> (FirstFitBStackAllocator, Guard) {
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let id = CTR.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        let path = std::env::temp_dir().join(format!("bstack_ff_ipr_{pid}_{id}.bin"));
+        let alloc = FirstFitBStackAllocator::new(BStack::open(&path).unwrap()).unwrap();
+        (alloc, Guard(path))
+    }
+
+    fn pattern(n: usize) -> Vec<u8> {
+        (0..n).map(|i| (i % 251) as u8).collect()
+    }
+
+    #[test]
+    fn front_shrink_preserves_retained_bytes_and_frees_front() {
+        let (alloc, _g) = open_fresh();
+        let mut h = alloc.alloc(100).unwrap();
+        h.write(pattern(100)).unwrap();
+        let (orig_start, orig_len) = (h.start(), h.len());
+
+        // Trim 40 bytes off the front (pf = 40 = MIN_FRONT_TRIM).
+        let r = alloc.realloc_inplace(h, -40, 0).unwrap();
+        assert_eq!(r.start(), orig_start + 40);
+        assert_eq!(r.len(), orig_len - 40);
+        assert_eq!(r.read().unwrap(), pattern(100)[40..100].to_vec());
+
+        // The carved-off front (payload 16) is a free block reusable at its
+        // original offset.
+        let reused = alloc.alloc(16).unwrap();
+        assert_eq!(reused.start(), orig_start);
+        alloc.dealloc(reused).map_err(|e| e.source).unwrap();
+        alloc.dealloc(r).map_err(|e| e.source).unwrap();
+    }
+
+    #[test]
+    fn front_and_back_shrink_together() {
+        let (alloc, _g) = open_fresh();
+        let mut h = alloc.alloc(100).unwrap();
+        h.write(pattern(100)).unwrap();
+        let orig_start = h.start();
+
+        let r = alloc.realloc_inplace(h, -40, -8).unwrap();
+        assert_eq!(r.start(), orig_start + 40);
+        assert_eq!(r.len(), 52);
+        assert_eq!(r.read().unwrap(), pattern(100)[40..92].to_vec());
+    }
+
+    #[test]
+    fn empty_handle_is_always_unsupported() {
+        let (alloc, _g) = open_fresh();
+        // Every (prepend, append) on an empty handle, including the no-op, is
+        // Unsupported and returns the handle untouched.
+        for (p, a) in [(0, 0), (0, 16), (16, 0), (-16, 16)] {
+            let h = alloc.alloc(0).unwrap();
+            assert!(h.is_empty());
+            let err = alloc.realloc_inplace(h, p, a).unwrap_err();
+            assert_eq!(err.source.kind(), ErrorKind::Unsupported);
+            assert!(err.handle.is_some());
+        }
+    }
+
+    #[test]
+    fn back_grow_tail_extends_in_place() {
+        let (alloc, _g) = open_fresh();
+        let mut h = alloc.alloc(50).unwrap();
+        h.write(pattern(50)).unwrap();
+        let orig_start = h.start();
+
+        let r = alloc.realloc_inplace(h, 0, 40).unwrap();
+        assert_eq!(r.start(), orig_start);
+        assert_eq!(r.len(), 90);
+        let got = r.read().unwrap();
+        assert_eq!(&got[..50], &pattern(50)[..]);
+        assert_eq!(&got[50..], &vec![0u8; 40][..]);
+    }
+
+    #[test]
+    fn back_grow_merges_next_free_block() {
+        let (alloc, _g) = open_fresh();
+        let mut a = alloc.alloc(50).unwrap();
+        a.write(pattern(50)).unwrap();
+        let a_start = a.start();
+        let b = alloc.alloc(50).unwrap();
+        let _c = alloc.alloc(10).unwrap(); // keep `b` non-tail so it stays on the free list
+        alloc.dealloc(b).map_err(|e| e.source).unwrap(); // `b` is now a's free right neighbour
+
+        // Non-tail, block too small: grows by absorbing the free right neighbour.
+        let r = alloc.realloc_inplace(a, 0, 50).unwrap();
+        assert_eq!(r.start(), a_start);
+        assert_eq!(r.len(), 100);
+        let got = r.read().unwrap();
+        assert_eq!(&got[..50], &pattern(50)[..]);
+        assert_eq!(&got[50..], &vec![0u8; 50][..]);
+    }
+
+    #[test]
+    fn back_grow_within_block_is_inplace() {
+        let (alloc, _g) = open_fresh();
+        let mut h = alloc.alloc(5).unwrap(); // 16-byte block backs a 5-byte slice
+        h.write(pattern(5)).unwrap();
+        let r = alloc.realloc_inplace(h, 0, 3).unwrap();
+        assert_eq!(r.len(), 8);
+        let got = r.read().unwrap();
+        assert_eq!(&got[..5], &pattern(5)[..]);
+        assert_eq!(&got[5..], &[0u8, 0, 0]);
+    }
+
+    #[test]
+    fn back_shrink_narrows_visible_len() {
+        let (alloc, _g) = open_fresh();
+        let mut h = alloc.alloc(100).unwrap();
+        h.write(pattern(100)).unwrap();
+        let orig_start = h.start();
+        let r = alloc.realloc_inplace(h, 0, -40).unwrap();
+        assert_eq!(r.start(), orig_start);
+        assert_eq!(r.len(), 60);
+        assert_eq!(r.read().unwrap(), pattern(100)[..60].to_vec());
+    }
+
+    #[test]
+    fn front_grow_is_unsupported_and_returns_handle() {
+        let (alloc, _g) = open_fresh();
+        let h = alloc.alloc(50).unwrap();
+        let err = alloc.realloc_inplace(h, 8, 0).unwrap_err();
+        assert_eq!(err.source.kind(), ErrorKind::Unsupported);
+        let back = err.handle.expect("front grow must return the handle");
+        assert_eq!(back.len(), 50);
+    }
+
+    #[test]
+    fn small_front_trim_is_unsupported() {
+        let (alloc, _g) = open_fresh();
+        let h = alloc.alloc(100).unwrap();
+        // pf = 8 < MIN_FRONT_TRIM (40): cannot carve a valid free block.
+        let err = alloc.realloc_inplace(h, -8, 0).unwrap_err();
+        assert_eq!(err.source.kind(), ErrorKind::Unsupported);
+        assert!(err.handle.is_some());
+    }
+
+    #[test]
+    fn negative_result_length_is_invalid_input() {
+        let (alloc, _g) = open_fresh();
+        let h = alloc.alloc(50).unwrap();
+        let err = alloc.realloc_inplace(h, 0, -60).unwrap_err();
+        assert_eq!(err.source.kind(), ErrorKind::InvalidInput);
+        assert!(err.handle.is_some());
+    }
+
+    #[test]
+    fn front_shrink_survives_reopen() {
+        let path = {
+            let (alloc, g) = open_fresh();
+            let p = g.0.clone();
+            std::mem::forget(g); // keep the file for reopen
+            let mut h = alloc.alloc(100).unwrap();
+            h.write(pattern(100)).unwrap();
+            let r = alloc.realloc_inplace(h, -40, 0).unwrap();
+            alloc.dealloc(r).map_err(|e| e.source).unwrap();
+            drop(alloc);
+            p
+        };
+        let _g = Guard(path.clone());
+        // Reopen: recovery must accept the arena and the allocator stays usable.
+        let alloc = FirstFitBStackAllocator::new(BStack::open(&path).unwrap()).unwrap();
+        let mut s = alloc.alloc(64).unwrap();
+        s.write([9u8; 64]).unwrap();
+        assert_eq!(s.read().unwrap(), vec![9u8; 64]);
+    }
+
+    #[test]
+    fn front_grow_shrinks_free_left_neighbour() {
+        let (alloc, _g) = open_fresh();
+        let a = alloc.alloc(100).unwrap();
+        let mut b = alloc.alloc(50).unwrap();
+        b.write(pattern(50)).unwrap();
+        let b_start = b.start();
+        alloc.dealloc(a).map_err(|e| e.source).unwrap(); // `a` is now b's free left neighbour
+
+        let r = alloc.realloc_inplace(b, 32, 0).unwrap();
+        assert_eq!(r.start(), b_start - 32);
+        assert_eq!(r.len(), 82);
+        let got = r.read().unwrap();
+        assert_eq!(&got[..32], &vec![0u8; 32][..]); // newly exposed front, zeroed
+        assert_eq!(&got[32..], &pattern(50)[..]); // retained bytes, unmoved
+    }
+
+    #[test]
+    fn front_grow_absorbs_whole_free_left_neighbour() {
+        let (alloc, _g) = open_fresh();
+        let a = alloc.alloc(100).unwrap(); // aligned block payload = 104
+        let mut b = alloc.alloc(50).unwrap();
+        b.write(pattern(50)).unwrap();
+        let b_start = b.start();
+        alloc.dealloc(a).map_err(|e| e.source).unwrap();
+
+        // pg = lsize + BLOCK_OVERHEAD_SIZE = 104 + 24 = 128 fully absorbs `a`.
+        let r = alloc.realloc_inplace(b, 128, 0).unwrap();
+        assert_eq!(r.start(), b_start - 128);
+        assert_eq!(r.len(), 178);
+        let got = r.read().unwrap();
+        assert_eq!(&got[..128], &vec![0u8; 128][..]);
+        assert_eq!(&got[128..], &pattern(50)[..]);
+    }
+
+    #[test]
+    fn front_grow_without_left_neighbour_is_unsupported() {
+        let (alloc, _g) = open_fresh();
+        let b = alloc.alloc(50).unwrap(); // first arena block: no left neighbour
+        let err = alloc.realloc_inplace(b, 32, 0).unwrap_err();
+        assert_eq!(err.source.kind(), ErrorKind::Unsupported);
+        assert!(err.handle.is_some());
+    }
+
+    #[test]
+    fn front_grow_with_allocated_left_neighbour_is_unsupported() {
+        let (alloc, _g) = open_fresh();
+        let _a = alloc.alloc(100).unwrap(); // allocated, not freed
+        let b = alloc.alloc(50).unwrap();
+        let err = alloc.realloc_inplace(b, 32, 0).unwrap_err();
+        assert_eq!(err.source.kind(), ErrorKind::Unsupported);
+        assert!(err.handle.is_some());
+    }
+
+    #[test]
+    fn small_front_grow_is_unsupported() {
+        let (alloc, _g) = open_fresh();
+        let a = alloc.alloc(100).unwrap();
+        let b = alloc.alloc(50).unwrap();
+        alloc.dealloc(a).map_err(|e| e.source).unwrap();
+        // pg = 8 < MIN_FRONT_GROW (24).
+        let err = alloc.realloc_inplace(b, 8, 0).unwrap_err();
+        assert_eq!(err.source.kind(), ErrorKind::Unsupported);
+        assert!(err.handle.is_some());
+    }
+
+    #[test]
+    fn front_grow_survives_reopen() {
+        let path = {
+            let (alloc, g) = open_fresh();
+            let p = g.0.clone();
+            std::mem::forget(g);
+            let a = alloc.alloc(100).unwrap();
+            let mut b = alloc.alloc(50).unwrap();
+            b.write(pattern(50)).unwrap();
+            alloc.dealloc(a).map_err(|e| e.source).unwrap();
+            let r = alloc.realloc_inplace(b, 32, 0).unwrap();
+            alloc.dealloc(r).map_err(|e| e.source).unwrap();
+            drop(alloc);
+            p
+        };
+        let _g = Guard(path.clone());
+        let alloc = FirstFitBStackAllocator::new(BStack::open(&path).unwrap()).unwrap();
+        let mut s = alloc.alloc(64).unwrap();
+        s.write([7u8; 64]).unwrap();
+        assert_eq!(s.read().unwrap(), vec![7u8; 64]);
+    }
+
+    #[test]
+    fn realloc_inplace_rejects_foreign_handle() {
+        let (a1, _g1) = open_fresh();
+        let (a2, _g2) = open_fresh();
+        let h = a1.alloc(64).unwrap();
+        let err = a2.realloc_inplace(h, 0, 8).unwrap_err();
+        assert_eq!(err.source.kind(), ErrorKind::InvalidInput);
+        let h = err
+            .handle
+            .expect("a refused handle is returned, not leaked");
+        a1.dealloc(h).map_err(|e| e.source).unwrap();
+    }
+}
+
+// Owned-slice subslice/join built on in-place resize (needs `set` + `atomic`).
+#[cfg(all(test, feature = "set", feature = "atomic"))]
+mod owned_slice_subslice_join_tests {
+    use super::FirstFitBStackAllocator;
+    use crate::BStack;
+    use crate::alloc::BStackAllocator;
+    use std::io::ErrorKind;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct Guard(std::path::PathBuf);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn open_fresh() -> (FirstFitBStackAllocator, Guard) {
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let id = CTR.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        let path = std::env::temp_dir().join(format!("bstack_ff_join_{pid}_{id}.bin"));
+        let alloc = FirstFitBStackAllocator::new(BStack::open(&path).unwrap()).unwrap();
+        (alloc, Guard(path))
+    }
+
+    fn pattern(n: usize) -> Vec<u8> {
+        (0..n).map(|i| (i % 251) as u8).collect()
+    }
+
+    #[test]
+    fn try_subslice_inplace_returns_window() {
+        let (alloc, _g) = open_fresh();
+        let mut h = alloc.alloc(100).unwrap();
+        h.write(pattern(100)).unwrap();
+        let r = h.try_subslice_inplace(40, 90).unwrap();
+        assert_eq!(r.len(), 50);
+        assert_eq!(r.read().unwrap(), pattern(100)[40..90].to_vec());
+    }
+
+    #[test]
+    fn try_subslice_inplace_small_front_is_unsupported() {
+        let (alloc, _g) = open_fresh();
+        let mut h = alloc.alloc(100).unwrap();
+        h.write(pattern(100)).unwrap();
+        let err = h.try_subslice_inplace(10, 50).unwrap_err();
+        assert_eq!(err.source.kind(), ErrorKind::Unsupported);
+        assert!(err.handle.is_some());
+    }
+
+    #[test]
+    fn try_subslice_falls_back_when_inplace_unsupported() {
+        let (alloc, _g) = open_fresh();
+        let mut h = alloc.alloc(100).unwrap();
+        h.write(pattern(100)).unwrap();
+        // start = 10 (< MIN_FRONT_TRIM) forces the alloc+copy fallback.
+        let r = h.try_subslice(10, 50).unwrap();
+        assert_eq!(r.len(), 40);
+        assert_eq!(r.read().unwrap(), pattern(100)[10..50].to_vec());
+    }
+
+    #[test]
+    fn try_join_inplace_grows_self_tail() {
+        let (alloc, _g) = open_fresh();
+        let mut other = alloc.alloc(30).unwrap();
+        other.write(pattern(30)).unwrap();
+        let mut selfh = alloc.alloc(20).unwrap(); // tail block
+        selfh.write(vec![0xEE; 20]).unwrap();
+
+        let joined = selfh.try_join_inplace(other).map_err(|e| e.source).unwrap();
+        assert_eq!(joined.len(), 50);
+        let got = joined.read().unwrap();
+        assert_eq!(&got[..20], &vec![0xEE; 20][..]);
+        assert_eq!(&got[20..], &pattern(30)[..]);
+    }
+
+    #[test]
+    fn try_join_falls_back_when_no_inplace_direction() {
+        let (alloc, _g) = open_fresh();
+        let mut other = alloc.alloc(30).unwrap();
+        other.write(pattern(30)).unwrap();
+        let mut selfh = alloc.alloc(20).unwrap();
+        selfh.write(vec![0xEE; 20]).unwrap();
+        let _keep_tail = alloc.alloc(10).unwrap(); // make selfh non-tail
+
+        let joined = selfh.try_join(other).map_err(|e| e.source).unwrap();
+        assert_eq!(joined.len(), 50);
+        let got = joined.read().unwrap();
+        assert_eq!(&got[..20], &vec![0xEE; 20][..]);
+        assert_eq!(&got[20..], &pattern(30)[..]);
+    }
+
+    #[test]
+    fn try_join_with_empty_returns_other() {
+        let (alloc, _g) = open_fresh();
+        let mut a = alloc.alloc(16).unwrap();
+        a.write(pattern(16)).unwrap();
+        let empty = crate::alloc::BStackOwnedSlice::empty(&alloc);
+        let joined = a.try_join_inplace(empty).map_err(|e| e.source).unwrap();
+        assert_eq!(joined.read().unwrap(), pattern(16));
+    }
+
+    #[test]
+    fn try_join_inplace_uses_front_grow_mirror() {
+        let (alloc, _g) = open_fresh();
+        // `x` becomes a free left neighbour of `other`; `self` is non-tail and
+        // its block cannot grow, so the join must extend `other`'s front.
+        let x = alloc.alloc(100).unwrap();
+        let mut other = alloc.alloc(50).unwrap();
+        other.write(pattern(50)).unwrap();
+        let mut selfh = alloc.alloc(40).unwrap();
+        selfh.write(vec![0xEE; 40]).unwrap();
+        let _keep_tail = alloc.alloc(10).unwrap(); // selfh is non-tail
+        alloc.dealloc(x).map_err(|e| e.source).unwrap(); // free left neighbour of `other`
+
+        let joined = selfh.try_join_inplace(other).map_err(|e| e.source).unwrap();
+        assert_eq!(joined.len(), 90);
+        let got = joined.read().unwrap();
+        assert_eq!(&got[..40], &vec![0xEE; 40][..]); // self, copied into other's grown front
+        assert_eq!(&got[40..], &pattern(50)[..]); // other, never moved
+    }
+
+    #[test]
+    fn try_join_rejects_other_from_another_allocator() {
+        let (a1, _g1) = open_fresh();
+        let (a2, _g2) = open_fresh();
+        let s = a1.alloc(30).unwrap();
+        let o = a2.alloc(20).unwrap(); // foreign to a1
+        let err = s
+            .try_join(o)
+            .expect_err("join must refuse a foreign `other`");
+        assert_eq!(err.source.kind(), ErrorKind::InvalidInput);
+        // Both inputs are returned, not leaked: `self` in `first`, `other` in
+        // `second`.
+        let s = err.first.expect("`self` returned in `first`");
+        let o = err.second.expect("`other` returned in `second`");
+        a1.dealloc(s).map_err(|e| e.source).unwrap();
+        a2.dealloc(o).map_err(|e| e.source).unwrap();
     }
 }
