@@ -88,6 +88,12 @@ The mechanism also has real holes. Routing adds a check ahead of every lock acqu
 
 The underlying need — straight-line atomic blocks instead of the generator protocol — is real but modest: downstream callers already unroll recursion to drive the generators, as performance and atomicity demand that anyway. It is better served by an explicit transaction object (`stack.transaction()` exposing the mirrored in-place API over an overlay; explicit `commit`, drop = discard) reusing the same journal — worthwhile future work alongside the public journaling primitive planned for 0.5.0. Nor is ambient interception a stepping stone to cross-crate atomicity, which multiplies the same implicit-durability problems; the conventional answers remain caller-side buffering or per-method atomicity as `bstack` already provides.
 
+### Adding `.dealloc() -> io::Result<()>` and `.realloc(new_len) -> io::Result<Self>` to `BStackOwnedSlice`, generic over any allocator
+
+Reasons:
+
+`BStackOwnedSlice` cannot generically call back into an arbitrary `BStackAllocator`. The conversion from an allocator's handle to `BStackOwnedSlice` is one-directional by trait design: `BStackAllocator::Allocated<'a>` need only satisfy `Into<BStackOwnedSlice<'a, Self>>`, and a custom allocator may embed extra metadata in a newtype handle that `BStackOwnedSlice` alone cannot reconstruct — so `dealloc`/`realloc`, which take `Self::Allocated<'a>`, cannot be driven from a bare `BStackOwnedSlice`. Separately, `BStackAllocator::Error` is an associated type, not necessarily `io::Error` — third-party allocators are free to use a richer error type. Fixing the return type to `io::Result<_>` would only be correct for allocators that happen to set `Error = io::Error`. Both conditions together require `BStackOwnedSliceAllocator` (the convenience supertrait that already fixes `Error = io::Error` and `Allocated<'a> = BStackOwnedSlice<'a, Self>`), so the method cannot apply to the general `BStackAllocator` case. Reaching for `unsafe` transmutes or a bespoke trait just to paper over this asymmetry is unnecessary — the caller already holds the allocator reference used to obtain the handle and can call `allocator.dealloc(handle)` / `allocator.realloc(handle, new_len)` directly.
+
 ---
 
 ## External-merge-sort strategy and partial sort for `BStackChunk`
@@ -185,3 +191,35 @@ fn try_join(self, other: Self) -> Result<Self, BStackBulkAllocError<'a, A>>;
 - **Join attempt order.** Fixed order (always try extending `self`'s tail before `other`'s front, as above) vs. always attempting to extend whichever of the two is longer first, which guarantees the smaller side is the one actually copied whenever any in-place path exists — at the cost of checking both feasibility and length before picking a direction, instead of the simpler fixed order.
 - **Bound on the non-`_inplace` methods.** `try_subslice`/`try_join` never actually need the fast path to succeed — only the `_inplace` variants do. Worth deciding whether to relax their bound to bare `BStackAllocator<Error = io::Error>`, so allocators without `BStackInPlaceResizeAllocator` still get the always-succeeds fallback versions, versus keeping one uniform bound across all four methods in a single `impl` block.
 - **Recovery contract on partial in-place failure.** `try_subslice_inplace`/`try_join_inplace` chain multiple allocator calls against handles the caller already holds elsewhere, unlike `to_owned_in`/`try_clone` above, which only ever produce a fresh allocation the caller has not yet observed. The exact recovery guarantee — what's returned, and whether any intermediate step can leave a to-be-freed byte range unrecoverable — needs a firmer contract before implementation. If no such contract can be made to satisfy `bstack`'s per-method crash-atomicity requirement, `try_subslice_inplace`/`try_join_inplace` must not be implemented.
+
+---
+
+## `.dealloc()`/`.realloc(new_len)` on `BStackOwnedSlice<'a, A: BStackOwnedSliceAllocator>`
+
+**Feature flag:** `alloc`.
+**Breaking change:** No — new inherent methods, gated behind the `BStackOwnedSliceAllocator` bound.
+
+### Motivation
+
+Freeing or resizing an owned handle today requires the caller to separately hold the allocator and call `allocator.dealloc(handle)`/`allocator.realloc(handle, new_len)`. This is unavoidable in general (see the NOT PLANNED entry above), but under `BStackOwnedSliceAllocator` — the bound `try_clone`/`try_clone_uninit` already use — the handle carries `A::Error = io::Error` and its own `allocator()`, so `dealloc`/`realloc` can be forwarded as inherent methods on the handle itself.
+
+### Design
+
+```rust
+impl<'a, A: BStackOwnedSliceAllocator> BStackOwnedSlice<'a, A> {
+    pub fn dealloc(self) -> Result<(), BStackAllocError<'a, A>> {
+        self.allocator().dealloc(self)
+    }
+
+    pub fn realloc(self, new_len: u64) -> Result<Self, BStackAllocError<'a, A>> {
+        let allocator = self.allocator();
+        allocator.realloc(self, new_len)
+    }
+}
+```
+
+Both are pure forwarding: `allocator()` returns `&'a A`, independent of `&self`, so it can be read before `self` is consumed by the call. No new behavior, error type, or crash-consistency class is introduced — each method has exactly the semantics of `BStackAllocator::dealloc`/`realloc` on the handle's own allocator.
+
+### Open questions
+
+- **Necessity.** The allocator is already at hand wherever a `BStackOwnedSlice` was obtained (it was needed to call `alloc`/`realloc` in the first place), so the caller can always reach `allocator.dealloc(handle)` directly. Whether the convenience of dropping that extra reference at call sites justifies the added inherent-method surface on `BStackOwnedSlice` is not yet decided.
