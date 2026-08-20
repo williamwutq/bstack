@@ -371,6 +371,166 @@ impl<'a, A: BStackAllocator + 'a> fmt::Display for BStackBulkAllocError<'a, A> {
 
 impl<'a, A: BStackAllocator + 'a> std::error::Error for BStackBulkAllocError<'a, A> {}
 
+/// Error returned by [`BStackOwnedSlice::try_subslice`] and
+/// [`try_subslice_inplace`](BStackOwnedSlice::try_subslice_inplace) when the
+/// narrowing fails.
+///
+/// Distinct from [`BStackAllocError`] — which reports a failed
+/// [`realloc`](BStackAllocator::realloc)/[`dealloc`](BStackAllocator::dealloc)
+/// — because a subslice is not an allocation request; it carries back the
+/// still-valid allocation so the caller can retry, fall back, or free it rather
+/// than leak it ([`BStackOwnedSlice`]'s `Drop` is a no-op).
+///
+/// It implements [`std::error::Error`] (delegating [`Display`](fmt::Display) to
+/// [`source`](Self::source)), so `?` works within functions that return it.
+///
+/// [`BStackOwnedSlice::try_subslice`]: crate::alloc::BStackOwnedSlice::try_subslice
+pub struct BStackSliceError<'a, A: BStackAllocator + 'a> {
+    /// The underlying error that caused the operation to fail.
+    pub source: A::Error,
+    /// The recovered ownership handle, if the region survived the failure.
+    ///
+    /// * `Some` — the original allocation is intact and owned by the caller
+    ///   again (the common case: every pre-mutation rejection and the
+    ///   `Unsupported` fast-path decline).
+    /// * `None` — the region was lost mid-mutation (e.g. an interrupted
+    ///   in-place resize), recoverable only through crash-recovery.
+    pub handle: Option<A::Allocated<'a>>,
+}
+
+impl<'a, A: BStackAllocator + 'a> BStackSliceError<'a, A> {
+    /// Construct an error that hands the still-valid handle back to the caller.
+    #[inline]
+    #[must_use]
+    pub fn with_handle(source: A::Error, handle: A::Allocated<'a>) -> Self {
+        Self {
+            source,
+            handle: Some(handle),
+        }
+    }
+
+    /// Construct an error whose allocation was lost by the failed operation.
+    #[inline]
+    #[must_use]
+    pub fn lost(source: A::Error) -> Self {
+        Self {
+            source,
+            handle: None,
+        }
+    }
+
+    /// Consume the error and return the recovered handle, if any.
+    #[inline]
+    #[must_use]
+    pub fn into_handle(self) -> Option<A::Allocated<'a>> {
+        self.handle
+    }
+}
+
+impl<'a, A: BStackAllocator + 'a> fmt::Debug for BStackSliceError<'a, A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BStackSliceError")
+            .field("source", &self.source)
+            .field("handle_recovered", &self.handle.is_some())
+            .finish()
+    }
+}
+
+impl<'a, A: BStackAllocator + 'a> fmt::Display for BStackSliceError<'a, A> {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.source, f)
+    }
+}
+
+impl<'a, A: BStackAllocator + 'a> std::error::Error for BStackSliceError<'a, A> {}
+
+/// Error returned by [`BStackOwnedSlice::try_join`] and
+/// [`try_join_inplace`](BStackOwnedSlice::try_join_inplace) when the
+/// concatenation fails.
+///
+/// A join operates on exactly two inputs, so — unlike the general
+/// [`BStackBulkAllocError`] — it carries its survivors in two inline `Option`
+/// fields rather than a heap [`Vec`], and every failure path is total at the
+/// type level. Whichever inputs survive are returned so they are not leaked
+/// ([`BStackOwnedSlice`]'s `Drop` is a no-op).
+///
+/// It implements [`std::error::Error`] (delegating [`Display`](fmt::Display) to
+/// [`source`](Self::source)), so `?` works within functions that return it.
+///
+/// [`BStackOwnedSlice::try_join`]: crate::alloc::BStackOwnedSlice::try_join
+pub struct BStackJoinError<'a, A: BStackAllocator + 'a> {
+    /// The underlying error that caused the join to fail.
+    pub source: A::Error,
+    /// The first survivor: the `self`-side input, or — once the join has
+    /// committed into it — the joined result. `None` if that region was
+    /// consumed or lost.
+    pub first: Option<A::Allocated<'a>>,
+    /// The second survivor: the `other`-side input. `None` if it was consumed,
+    /// merged into `first`, or lost.
+    pub second: Option<A::Allocated<'a>>,
+}
+
+impl<'a, A: BStackAllocator + 'a> BStackJoinError<'a, A> {
+    /// Construct an error carrying whichever survivors remain (each may be
+    /// `None` if that region was consumed or lost).
+    #[inline]
+    #[must_use]
+    pub fn new(
+        source: A::Error,
+        first: Option<A::Allocated<'a>>,
+        second: Option<A::Allocated<'a>>,
+    ) -> Self {
+        Self {
+            source,
+            first,
+            second,
+        }
+    }
+
+    /// Construct an error carrying both inputs intact — a clean pre-mutation
+    /// rejection where neither region was touched.
+    #[inline]
+    #[must_use]
+    pub fn both(source: A::Error, first: A::Allocated<'a>, second: A::Allocated<'a>) -> Self {
+        Self::new(source, Some(first), Some(second))
+    }
+
+    /// Consume the error and return the surviving handles (`first` then
+    /// `second`, skipping any that was lost).
+    #[inline]
+    #[must_use]
+    pub fn into_handles(self) -> Vec<A::Allocated<'a>> {
+        let mut v = Vec::new();
+        if let Some(h) = self.first {
+            v.push(h);
+        }
+        if let Some(h) = self.second {
+            v.push(h);
+        }
+        v
+    }
+}
+
+impl<'a, A: BStackAllocator + 'a> fmt::Debug for BStackJoinError<'a, A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BStackJoinError")
+            .field("source", &self.source)
+            .field("first_recovered", &self.first.is_some())
+            .field("second_recovered", &self.second.is_some())
+            .finish()
+    }
+}
+
+impl<'a, A: BStackAllocator + 'a> fmt::Display for BStackJoinError<'a, A> {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.source, f)
+    }
+}
+
+impl<'a, A: BStackAllocator + 'a> std::error::Error for BStackJoinError<'a, A> {}
+
 /// Reject a handle that was not issued by `allocator`, handing it straight back.
 ///
 /// The guard every allocator runs before a `realloc`/`dealloc` touches its

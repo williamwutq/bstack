@@ -1580,6 +1580,24 @@ impl FirstFitBStackAllocator {
         Ok(size)
     }
 
+    /// One `BLOCK_OVERHEAD_SIZE` boundary write: a free block's footer
+    /// (`footer_size`) immediately followed by an *allocated* block's header
+    /// (`header_size`, flags word left zero). Written at the shared boundary of
+    /// the two blocks (`allocated_header_start − BLOCK_FOOTER_SIZE`) by the
+    /// front-shrink and front-grow-shrink paths, which both place a free block
+    /// directly before the retained allocation.
+    #[inline]
+    fn boundary_footer_then_alloc_header(
+        footer_size: u64,
+        header_size: u64,
+    ) -> [u8; Self::BLOCK_OVERHEAD_SIZE as usize] {
+        let mut buf = [0u8; Self::BLOCK_OVERHEAD_SIZE as usize];
+        buf[0..8].copy_from_slice(&footer_size.to_le_bytes());
+        buf[8..16].copy_from_slice(&header_size.to_le_bytes());
+        // buf[16..24] stays zero: the allocated block's flags + reserved words.
+        buf
+    }
+
     /// Grow the back edge of the block at `start` to `new_len` bytes **in
     /// place** (`new_len > old_len`). Supports the three non-moving paths — the
     /// block is already large enough, it is the tail block and can be extended,
@@ -1718,10 +1736,7 @@ impl FirstFitBStackAllocator {
 
             // W1: front block footer (front_payload) + retained block header
             // (size `retained`, flags = allocated) in one write at new_start-24.
-            let mut w1 = [0u8; Self::BLOCK_OVERHEAD_SIZE as usize];
-            w1[0..8].copy_from_slice(&front_payload.to_le_bytes());
-            w1[8..16].copy_from_slice(&retained.to_le_bytes());
-            // w1[16..24] = flags(0) + reserved(0) => retained block is allocated.
+            let w1 = Self::boundary_footer_then_alloc_header(front_payload, retained);
             self.stack.set(new_start - Self::BLOCK_OVERHEAD_SIZE, w1)?;
 
             // W2: retained block footer. This is where the original block's
@@ -1874,10 +1889,7 @@ impl FirstFitBStackAllocator {
                     // W1: neighbour's new footer + our new header, one write at
                     // new_header - FOOTER. pg >= 24 keeps this clear of the old
                     // boundary tags at start-24 / start-16.
-                    let mut w1 = [0u8; Self::BLOCK_OVERHEAD_SIZE as usize];
-                    w1[0..8].copy_from_slice(&l_new_size.to_le_bytes());
-                    w1[8..16].copy_from_slice(&our_new_size.to_le_bytes());
-                    // w1[16..24] = flags(0) => our block stays allocated.
+                    let w1 = Self::boundary_footer_then_alloc_header(l_new_size, our_new_size);
                     self.stack.set(new_header - Self::BLOCK_FOOTER_SIZE, w1)?;
                     // W2: our footer at its (unchanged) position, new size.
                     self.stack
@@ -2841,10 +2853,10 @@ mod owned_slice_subslice_join_tests {
             .try_join(o)
             .expect_err("join must refuse a foreign `other`");
         assert_eq!(err.source.kind(), ErrorKind::InvalidInput);
-        assert_eq!(err.handles.len(), 2, "both inputs are returned, not leaked");
-        let mut it = err.handles.into_iter();
-        let s = it.next().unwrap();
-        let o = it.next().unwrap();
+        // Both inputs are returned, not leaked: `self` in `first`, `other` in
+        // `second`.
+        let s = err.first.expect("`self` returned in `first`");
+        let o = err.second.expect("`other` returned in `second`");
         a1.dealloc(s).map_err(|e| e.source).unwrap();
         a2.dealloc(o).map_err(|e| e.source).unwrap();
     }

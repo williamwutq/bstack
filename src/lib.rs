@@ -670,9 +670,9 @@ mod alloc;
 #[cfg(feature = "alloc")]
 pub use alloc::{
     BStackAllocError, BStackAllocator, BStackBulkAllocError, BStackBulkAllocator, BStackChunk,
-    BStackChunkIter, BStackInPlaceResizeAllocator, BStackOwnedSlice, BStackOwnedSliceAllocator,
-    BStackRange, BStackSlice, BStackSliceReader, BStackUninitAllocator, DebugCheckingAllocator,
-    LinearBStackAllocator,
+    BStackChunkIter, BStackInPlaceResizeAllocator, BStackJoinError, BStackOwnedSlice,
+    BStackOwnedSliceAllocator, BStackRange, BStackSlice, BStackSliceError, BStackSliceReader,
+    BStackUninitAllocator, DebugCheckingAllocator, LinearBStackAllocator,
 };
 #[cfg(all(feature = "guarded", feature = "atomic"))]
 pub use alloc::{BStackAtomicGuardedSlice, BStackAtomicGuardedSliceSubview};
