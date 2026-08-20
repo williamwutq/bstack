@@ -97,6 +97,12 @@ maintaining the invariant that the tail block is always allocated.
 either edge without relocating the retained bytes; the returned range is exactly
 `(start - prepend, end + append)`.
 
+An **empty handle** (`len == 0`) anchors no on-disk region, so it has no position
+for that guarantee to honor: every `(prepend, append)` on it — the no-op
+included — is `Unsupported`, uniformly across all allocators. Growing from empty
+is a fresh `alloc`, not a resize. This is a pre-mutation rejection, so the handle
+is always returned intact.
+
 | `(prepend, append)`            | Path                                                                  |
 |--------------------------------|-----------------------------------------------------------------------|
 | `append <= 0`, `prepend == 0`  | narrow the visible length within the block (no I/O)                    |

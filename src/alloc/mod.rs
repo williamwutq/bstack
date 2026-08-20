@@ -768,6 +768,15 @@ pub trait BStackInPlaceResizeAllocator: BStackAllocator {
     /// `prepend`-only resizes the front; nonzero on both edges shifts the window
     /// while resizing it.
     ///
+    /// # Empty handles
+    ///
+    /// An empty handle (`handle.len() == 0`) names no on-disk region, so there is
+    /// no anchored position for the guarantee below to honor. Resizing one in
+    /// place is therefore always [`io::ErrorKind::Unsupported`], for *every*
+    /// `(prepend, append)` — including the `(0, 0)` no-op. Growing from empty is
+    /// a fresh [`alloc`](BStackAllocator::alloc), not a resize; a caller holding
+    /// an empty handle that wants it to stay empty simply keeps it.
+    ///
     /// # Position guarantee
     ///
     /// On success, if the input handle's range was `(start, end)`, the returned
@@ -781,7 +790,8 @@ pub trait BStackInPlaceResizeAllocator: BStackAllocator {
     /// [`realloc`](BStackAllocator::realloc):
     ///
     /// * [`io::ErrorKind::Unsupported`] — the allocator cannot satisfy this
-    ///   `(prepend, append)` combination without relocating the retained bytes.
+    ///   `(prepend, append)` combination without relocating the retained bytes,
+    ///   or the handle is empty (see "Empty handles" above).
     /// * [`io::ErrorKind::InvalidInput`] — the resulting length
     ///   `handle.len() as i64 + prepend + append` is negative, the handle does
     ///   not describe a valid allocation, or it was issued by a different

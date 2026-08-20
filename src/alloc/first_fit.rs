@@ -1944,6 +1944,17 @@ impl BStackInPlaceResizeAllocator for FirstFitBStackAllocator {
         // Reject a handle from another allocator instance before any logic runs
         // (see the module's "Foreign handles" section).
         let slice = ensure_own_handle(self, slice, "FirstFitBStackAllocator::realloc_inplace")?;
+        // An empty handle anchors no block; resizing it in place is never
+        // supported for any `(prepend, append)` (see the trait's "Empty handles").
+        if slice.is_empty() {
+            return Err(BStackAllocError::with_handle(
+                io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "realloc_inplace: cannot resize an empty handle in place",
+                ),
+                slice,
+            ));
+        }
         let start = slice.start();
         let old_len = slice.len();
 
@@ -1965,21 +1976,6 @@ impl BStackInPlaceResizeAllocator for FirstFitBStackAllocator {
                 ));
             }
         };
-
-        // Empty original: no anchored region. Shrinking to empty is a no-op;
-        // growing has no fixed position, so it must relocate.
-        if slice.is_empty() && start == 0 {
-            if new_len == 0 {
-                return Ok(BStackOwnedSlice::empty(self));
-            }
-            return Err(BStackAllocError::with_handle(
-                io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "realloc_inplace: cannot grow an empty handle in place",
-                ),
-                slice,
-            ));
-        }
 
         // Shrinking to nothing frees the region; delegate to dealloc, which owns
         // the handle-return contract on failure.
@@ -2488,6 +2484,20 @@ mod inplace_resize_tests {
         assert_eq!(r.start(), orig_start + 40);
         assert_eq!(r.len(), 52);
         assert_eq!(r.read().unwrap(), pattern(100)[40..92].to_vec());
+    }
+
+    #[test]
+    fn empty_handle_is_always_unsupported() {
+        let (alloc, _g) = open_fresh();
+        // Every (prepend, append) on an empty handle, including the no-op, is
+        // Unsupported and returns the handle untouched.
+        for (p, a) in [(0, 0), (0, 16), (16, 0), (-16, 16)] {
+            let h = alloc.alloc(0).unwrap();
+            assert!(h.is_empty());
+            let err = alloc.realloc_inplace(h, p, a).unwrap_err();
+            assert_eq!(err.source.kind(), ErrorKind::Unsupported);
+            assert!(err.handle.is_some());
+        }
     }
 
     #[test]

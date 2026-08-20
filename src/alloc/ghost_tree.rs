@@ -1269,6 +1269,17 @@ impl BStackInPlaceResizeAllocator for GhostTreeBstackAllocator {
         // Reject a handle from another allocator instance before any logic runs
         // (see the module's "Foreign handles" section).
         let slice = ensure_own_handle(self, slice, "GhostTreeBstackAllocator::realloc_inplace")?;
+        // An empty handle anchors no block; resizing it in place is never
+        // supported for any `(prepend, append)` (see the trait's "Empty handles").
+        if slice.is_empty() {
+            return Err(BStackAllocError::with_handle(
+                io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "realloc_inplace: cannot resize an empty handle in place",
+                ),
+                slice,
+            ));
+        }
         let start = slice.start();
         let old_len = slice.len();
 
@@ -1289,18 +1300,6 @@ impl BStackInPlaceResizeAllocator for GhostTreeBstackAllocator {
             }
         };
 
-        if slice.is_empty() && start == 0 {
-            if new_len == 0 {
-                return Ok(BStackOwnedSlice::empty(self));
-            }
-            return Err(BStackAllocError::with_handle(
-                io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "realloc_inplace: cannot grow an empty handle in place",
-                ),
-                slice,
-            ));
-        }
         if new_len == 0 {
             return self.dealloc(slice).map(|()| BStackOwnedSlice::empty(self));
         }
@@ -2498,6 +2497,21 @@ mod tests {
             assert_eq!(err.source.kind(), ErrorKind::Unsupported, "{what}");
             let back = err.handle.expect(what);
             alloc.dealloc(back).map_err(|e| e.source).unwrap();
+        }
+    }
+
+    #[test]
+    fn realloc_inplace_empty_handle_is_always_unsupported() {
+        let (alloc, path) = open_fresh();
+        let _g = Guard(path);
+        // Every (prepend, append) on an empty handle, including the no-op, is
+        // Unsupported and returns the handle untouched.
+        for (p, a) in [(0i64, 0i64), (0, 32), (32, 0), (-32, 32)] {
+            let h = alloc.alloc(0).unwrap();
+            assert!(h.is_empty());
+            let err = alloc.realloc_inplace(h, p, a).unwrap_err();
+            assert_eq!(err.source.kind(), ErrorKind::Unsupported);
+            assert!(err.handle.is_some());
         }
     }
 

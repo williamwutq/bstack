@@ -320,6 +320,17 @@ impl BStackInPlaceResizeAllocator for LinearBStackAllocator {
         // Reject a handle from another allocator instance before any logic runs
         // (see the module's "Foreign handles" section).
         let handle = ensure_own_handle(self, handle, "LinearBStackAllocator::realloc_inplace")?;
+        // An empty handle anchors no region; resizing it in place is never
+        // supported for any `(prepend, append)` (see the trait's "Empty handles").
+        if handle.is_empty() {
+            return Err(BStackAllocError::with_handle(
+                io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "realloc_inplace: cannot resize an empty handle in place",
+                ),
+                handle,
+            ));
+        }
         let old_len = handle.len();
         // Resulting length, checked before any mutation. `old_len` fits in i64
         // for any real allocation; guard the cast and the two additions so a
@@ -641,5 +652,19 @@ mod inplace_resize_tests {
         let err = alloc.realloc_inplace(h, 0, -60).unwrap_err();
         assert_eq!(err.source.kind(), ErrorKind::InvalidInput);
         assert!(err.handle.is_some());
+    }
+
+    #[test]
+    fn empty_handle_is_always_unsupported() {
+        let (alloc, _g) = open_fresh();
+        // Every (prepend, append) on an empty handle, including the no-op, is
+        // Unsupported and returns the handle untouched.
+        for (p, a) in [(0, 0), (0, 8), (8, 0), (-8, 8)] {
+            let h = alloc.alloc(0).unwrap();
+            assert!(h.is_empty());
+            let err = alloc.realloc_inplace(h, p, a).unwrap_err();
+            assert_eq!(err.source.kind(), ErrorKind::Unsupported);
+            assert!(err.handle.is_some());
+        }
     }
 }
