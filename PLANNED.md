@@ -96,6 +96,31 @@ Reasons:
 
 ---
 
+## Enabling the `atomic` feature by default
+
+**Feature flag:** N/A — this changes which features are enabled by default, not a new one.
+**Breaking change:** Yes (0.5.0) — a plain `bstack = "0.5"` dependency (anything without `default-features = false`) now compiles in the `atomic`-gated API surface: `atrunc`, `splice`/`splice_into`, `try_extend`/`try_extend_zeros`/`try_extend_sparse`/`try_extend_sparse_batched`, `try_discard`, and `get_batched_gen`. The larger set gated on `set` *and* `atomic` together — `cross_exchange`, `copy`, `process_gen`, `set_batched`/`inplace_gen`, `swap`/`swap_into`/`cas` — only newly compiles in for consumers who *also* already enable `set`, since `set` itself stays opt-in (see Design below). Consumers who already pin an explicit `features = [...]` list without `atomic` are unaffected; `default-features = false` still builds the bare push/pop/get/peek stack with none of it.
+
+### Motivation
+
+- **No on-disk format change.** The write-in-progress journal that `atomic`'s compound ops use — `wip_ptr`/`wip_aux` in the 32-byte header, the splice/exchange/multi-write/copy journal modes documented in `lib.rs`'s format table and implemented by `io_core.rs`'s `journaled_*` helpers — is already unconditional: every `bstack` file carries it regardless of which features are compiled in. Enabling `atomic` by default changes no format byte and persists no new state; it only exposes machinery that is already there.
+- **Does not compromise plain-stack use.** `atomic` only adds methods; it changes no existing `push`/`pop`/`get`/`peek` behavior. `alloc`, by contrast, adds real state — sub-allocator bookkeeping, handle types, `BStackSlice` provenance — which is why it stays opt-in even for a caller who only wants compound atomicity. `atomic` carries none of that cost.
+- **Already required by most of what ships.** `alloc`, `set`, and `atomic` are gated together across `guarded`'s hook-based slices, the external-merge-sort strategy above, `BStackInPlaceResizeAllocator`, and the public journal primitive planned for 0.5.0 that `bllist` depends on. 7 of the 12 examples already require `atomic`. A caller reaching for any of these already hand-adds the flag; defaulting it removes that step.
+- **Matches how the crate is already documented.** README's dependency snippets already list `atomic` in nearly every example (`features = ["atomic"]`, `features = ["set", "atomic"]`, …) — it's optional in name only.
+
+### Design
+
+- Add `default = ["atomic"]` to `[features]` in `Cargo.toml`.
+- `set` and `alloc` stay opt-in — both add real new semantics (in-place byte-mutation history, sub-allocation) that a stack-only consumer may not want, unlike `atomic`.
+- `docs.rs` already builds with `all-features = true`, so its output is unaffected.
+- The 0.5.0 migration guide should note this briefly: it affects only consumers on default features who don't want `atomic` — an uncommon but real case (e.g. minimizing compiled surface, or auditing exactly which journal codepaths are reachable) — who now need `default-features = false` plus an explicit `features = [...]` list to keep it out.
+
+### Open questions
+
+- Whether to also drop the now-redundant `atomic` entry from example `required-features` lists that pair it with `set`/`alloc` — cosmetic only, since `required-features` checks additively against whatever is enabled regardless of default status, so leaving them as-is is also fine.
+
+---
+
 ## External-merge-sort strategy and partial sort for `BStackChunk`
 
 **Feature flag:** `alloc` + `set` + `atomic`, same as the `BStackChunk::sort_by`/`select_nth_by` family it extends.
