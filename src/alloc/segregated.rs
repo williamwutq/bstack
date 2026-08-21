@@ -12,9 +12,13 @@
 //! encoded by the magic version, not per-file state — a format change bumps the
 //! magic rather than reinterpreting a stored field.
 //!
-//! Implemented: `new`/`open`, `alloc` (incl. oversized non-exact reuse with
-//! excess carve), `dealloc`, `realloc` (in-place same-class, tail grow/shrink,
-//! non-tail shrink via greedy carve, non-tail grow via move), and `recover`
+//! The in-use overhead word records the block's **physical size** (not the
+//! caller's length, which lives in the returned handle), so a live block may be
+//! retained larger than its request needs. Excess below
+//! [`SPLIT_MIN`](SegregatedBStackAllocator::SPLIT_MIN) stays as internal slack
+//! (zero extra `BStack` writes); at or above it, the excess is carved off.
+//!
+//! Implemented: `new`/`open`, `alloc`, `dealloc`, `realloc`, and `recover`
 //! (linear-scan free-list rebuild + leak reclaim). Still pending: the background
 //! coalescer.
 //!
@@ -32,9 +36,11 @@
 //! `len`-check then `extend`: still crash-safe (each issues a single `bstack`
 //! write, and multi-write splices are leak-preferring), but the allocator is
 //! `Send` and **not** `Sync`, so concurrent use must be externally synchronised.
-//! The in-place tail *shrink* has no non-`atomic` form — its length commit and
-//! truncation cannot be fused without a transaction, and either ordering leaves
-//! a crash window `recover` mis-parses — so that build takes the move path.
+//! A *shrink* reclaims its freed excess (tail `Atrunc` or an in-place carve) only
+//! under `atomic`, where the transaction fuses recording the new physical size
+//! with dropping the excess; the non-`atomic` build cannot fuse them without a
+//! crash window `recover` mis-parses, so it simply **retains** the excess inside
+//! the still-recorded larger block (zero extra writes, no move).
 
 use super::{
     BStackAllocError, BStackAllocator, BStackOwnedSlice, BStackUninitAllocator, ensure_own_handle,
@@ -50,10 +56,12 @@ use std::cell::Cell;
 use std::marker::PhantomData;
 use std::{fmt, io};
 
-/// Magic: `ALSG` + major 0 + minor 1; the version encodes the fixed class scheme.
-const ALSG_MAGIC: [u8; 8] = *b"ALSG\x00\x01\x00\x00";
-/// Compatibility prefix checked on open (`ALSG` + major 0 + minor 1).
-const ALSG_MAGIC_PREFIX: [u8; 6] = *b"ALSG\x00\x01";
+/// Magic: `ALSG` + major 0 + minor 2; the version encodes the fixed class scheme
+/// and the in-use overhead recording the block's physical size (minor 1 recorded
+/// the caller's length instead — a `\x01` file fails `new` with `InvalidData`).
+const ALSG_MAGIC: [u8; 8] = *b"ALSG\x00\x02\x00\x00";
+/// Compatibility prefix checked on open (`ALSG` + major 0 + minor 2).
+const ALSG_MAGIC_PREFIX: [u8; 6] = *b"ALSG\x00\x02";
 
 /// A segregated free-list allocator implementing [`BStackAllocator`] on top of a
 /// [`BStack`].
@@ -62,18 +70,21 @@ const ALSG_MAGIC_PREFIX: [u8; 6] = *b"ALSG\x00\x01";
 ///
 /// ```text
 /// offset  0  reserved (user)                24 B
-/// offset 24  magic  "ALSG\x00\x01\x00\x00"   8 B
+/// offset 24  magic  "ALSG\x00\x02\x00\x00"   8 B
 /// offset 32  _reserved                       8 B
 /// offset 40  free_head[NUM_CLASSES] : u64          # last entry = oversized list
 /// arena start (16-B aligned; header ends 16-aligned already)
 /// ```
 ///
 /// Every arena block is `[ overhead(8) | data(block − 8) ]`; the caller pointer
-/// is the data start (`block_start + 8`). The overhead is a single tagged word:
-/// high bit set ⇒ in use, low 63 bits = the caller's exact slice length; high
-/// bit clear ⇒ free, low 63 bits = physical block size `>> 4` (which doubles as
-/// the class tag). A free block stores its `next_free` offset inline at the data
-/// start, so live allocations carry no space overhead beyond the 8-byte word.
+/// is the data start (`block_start + 8`). The overhead is a single tagged word,
+/// carrying the **physical block size `>> 4`** in its low 63 bits under both
+/// tags: high bit set ⇒ in use, high bit clear ⇒ free (the size then doubling as
+/// the class tag). The caller's visible length is *not* recorded on disk — it
+/// lives in the returned [`BStackOwnedSlice`] — so a live block may be physically
+/// larger than its request needs (retained excess). A free block stores its
+/// `next_free` offset inline at the data start, so live allocations carry no
+/// space overhead beyond the 8-byte word.
 ///
 /// # Thread safety
 ///
@@ -151,6 +162,18 @@ impl SegregatedBStackAllocator {
     /// 16 up to `MAX_CLASS`). Lets [`commit_carve`](Self::commit_carve) stay
     /// heap-free with fixed stack buffers.
     const MAX_CARVE_PIECES: usize = 3;
+
+    /// Minimum excess (bytes) worth reclaiming into free blocks instead of
+    /// retaining inside the live allocation. Excess below this stays as internal
+    /// slack — zero extra `BStack` writes and the block records its own larger
+    /// physical size — while excess at or above it is carved off (oversized
+    /// non-exact reuse and `atomic` shrinks).
+    ///
+    /// The on-disk format constrains none of this: a block records its physical
+    /// size under either policy, so `SPLIT_MIN` is a pure tuning dial, adjustable
+    /// later against a fragmentation-versus-calls benchmark without a format
+    /// change. Set conservatively to `LINEAR_MAX` (256 B) for the initial cut.
+    const SPLIT_MIN: u64 = Self::LINEAR_MAX;
 
     /// Free-list sentinel: `0` (offset 0 is the header, never a block).
     const SENTINEL: u64 = 0;
@@ -314,12 +337,16 @@ impl SegregatedBStackAllocator {
     ///
     /// Rebuilds **every** free list from scratch by a single linear scan of the
     /// arena's overhead words: a live block (high bit set) is strided over by its
-    /// physical size derived from the stored `len`; a free block (high bit clear,
-    /// non-zero) is relinked onto `head[classify(size)]` by its stored physical
-    /// `size`, which reclaims any block leaked by a crashed `alloc` pop/claim
-    /// (still free-tagged but reachable from no head). A fully-zeroed region — a
-    /// crashed tail `extend` whose overhead write never landed — is discarded as
-    /// an orphaned tail.
+    /// **recorded physical size** (the word's low 63 bits `<< 4`), read directly
+    /// with no length-to-class derivation; a free block (high bit clear, non-zero)
+    /// is relinked by its stored physical `size` onto the head of the largest
+    /// class `≤ size` (`classify(largest_class_le(size))`, or the oversized head
+    /// above `MAX_CLASS`), which reclaims any block leaked by a crashed `alloc`
+    /// pop/claim (still free-tagged but reachable from no head) and degrades a
+    /// malformed non-class size to a leak rather than a head that would hand out
+    /// more bytes than the block holds. A fully-zeroed region — a crashed tail
+    /// `extend` whose overhead write never landed — is discarded as an orphaned
+    /// tail.
     ///
     /// Because the scan trusts only the overhead words (never the stored
     /// `next_free` links) and [`new`](Self::new) runs it before any live
@@ -356,16 +383,9 @@ impl SegregatedBStackAllocator {
         while p < stack_len {
             let word = u64::from_le_bytes(read_bstack!(self.stack, p => u64));
             if word & Self::IN_USE_BIT != 0 {
-                // Live: stride by the physical size implied by the stored len.
-                let len = word & !Self::IN_USE_BIT;
-                let size = match Self::phys_need(len) {
-                    Ok(need) => Self::class_blocksize(need),
-                    Err(_) => {
-                        unsure += (stack_len - p) / Self::QUANTUM;
-                        break;
-                    }
-                };
-                if size == 0 || p + size > stack_len {
+                // Live: stride by the recorded physical size (no derivation).
+                let size = (word & !Self::IN_USE_BIT) << 4;
+                if size < Self::QUANTUM || size % Self::QUANTUM != 0 || p + size > stack_len {
                     unsure += (stack_len - p) / Self::QUANTUM;
                     break;
                 }
@@ -382,7 +402,13 @@ impl SegregatedBStackAllocator {
                     unsure += (stack_len - p) / Self::QUANTUM;
                     break;
                 }
-                let c = Self::classify(size) as usize;
+                // Relink by the largest class ≤ size so a malformed non-class
+                // size degrades to a leak, never a head that overruns the block.
+                let c = if size > Self::MAX_CLASS {
+                    Self::OVERSIZED_CLASS
+                } else {
+                    Self::classify(Self::largest_class_le(size))
+                } as usize;
                 // Prepend: next_free ← current head of this class, then head ← p.
                 self.stack.set(p + Self::OVERHEAD, heads[c].to_le_bytes())?;
                 heads[c] = p;
@@ -552,8 +578,10 @@ impl SegregatedBStackAllocator {
         Ok(popped)
     }
 
-    /// Build the claim buffer (`in_use | len` overhead, `copy_from` prefix read
-    /// straight in) without writing it.
+    /// Build the claim buffer (`in_use | (block >> 4)` overhead recording the
+    /// block's physical size, `copy_from` prefix read straight in) without
+    /// writing it. `block` is the physical extent being claimed and the size the
+    /// overhead word records — the caller's visible length is never stored here.
     ///
     /// With [`true`] the buffer is the full `block` bytes, so writing it
     /// also scrubs everything past the copied prefix. With [`false`] it
@@ -568,14 +596,13 @@ impl SegregatedBStackAllocator {
     fn claim_buf(
         &self,
         block: u64,
-        len: u64,
         copy_from: Option<(u64, u64)>,
         init: bool,
     ) -> io::Result<Vec<u8>> {
         let copied = copy_from.map_or(0, |(_, n)| n);
-        let size = if init { block } else { Self::OVERHEAD + copied };
-        let mut buf = vec![0u8; size as usize];
-        write_buf!(Self::IN_USE_BIT | len => buf, 0);
+        let buf_len = if init { block } else { Self::OVERHEAD + copied };
+        let mut buf = vec![0u8; buf_len as usize];
+        write_buf!(Self::IN_USE_BIT | (block >> 4) => buf, 0);
         if let Some((src, n)) = copy_from {
             self.stack.get_into(src, &mut buf[8..8 + n as usize])?;
         }
@@ -604,26 +631,33 @@ impl SegregatedBStackAllocator {
                 // In both atomic and non-atomic paths, a failure between the pop
                 // and the claim leaves the block free-tagged and reachable from
                 // the head, so a crash is recoverable by `recover`.
-                let buf = self.claim_buf(block, len, copy_from, init)?;
+                let buf = self.claim_buf(block, copy_from, init)?;
                 self.stack.set(bs, buf)?;
                 return Ok(bs + Self::OVERHEAD);
             }
         } else if let Some((bs, actual)) = self.pop_oversized(block)? {
-            let buf = self.claim_buf(block, len, copy_from, init)?;
-            if actual == block {
-                // See the same reasoning for crash recovery above.
+            let excess = actual - block;
+            if excess < Self::SPLIT_MIN {
+                // Retain the whole popped block: claim `actual` bytes and record
+                // `actual` as the physical size. One `set`, no carve. The block
+                // stays in the (heterogeneous) oversized bucket, so retaining a
+                // non-class size is sound. A crash before the claim lands leaves
+                // it free-tagged and reachable, so `recover` reclaims it.
+                let buf = self.claim_buf(actual, copy_from, init)?;
                 self.stack.set(bs, buf)?;
             } else {
-                // Non-exact reuse: claim `block` bytes and carve the excess, all
-                // as one crash-atomic transaction (claim buffer as the prefix)
-                self.commit_carve(bs, &buf, bs + block, actual - block)?;
+                // Reclaim the excess above the threshold: claim `block` bytes and
+                // carve the rest, all as one crash-atomic transaction (claim
+                // buffer as the prefix).
+                let buf = self.claim_buf(block, copy_from, init)?;
+                self.commit_carve(bs, &buf, bs + block, excess)?;
             }
             return Ok(bs + Self::OVERHEAD);
         }
         // Miss: eagerly grow the whole zero-filled block in one sparse write.
         // The write prefix is copied in before the tail is left zero by the
         // sparse grow, so we do not need a separate `set` for the remainder.
-        let buf = self.claim_buf(block, len, copy_from, init)?;
+        let buf = self.claim_buf(block, copy_from, init)?;
         let bs = self.stack.extend_sparse(&buf, block)?;
         Ok(bs + Self::OVERHEAD)
     }
@@ -844,20 +878,21 @@ impl BStackAllocator for SegregatedBStackAllocator {
     ///
     /// | Case | Strategy |
     /// |------|----------|
-    /// | Same class (`new_len` maps to this block) | rewrite overhead `len`; zero the grown tail on grow |
-    /// | Grow at tail | extend the tail in place (zero-filled), then rewrite `len` |
-    /// | Shrink at tail | replace the whole block with its shrunk self — one crash-atomic `Len` + `Atrunc` transaction (`atomic`); a move without `atomic` |
-    /// | Non-tail shrink | rewrite `len` + greedy-carve the freed tail into free blocks — one crash-atomic transaction (`atomic`); a move without `atomic` |
-    /// | Non-tail grow | alloc new class, copy, dealloc old |
+    /// | Fits the current block (`phys_need(new_len) ≤ size`) | retain in place — no metadata write; zero the newly-exposed tail on a visible grow |
+    /// | Grow past the block, at the tail | extend the tail in place (zero-filled), then record the new physical size |
+    /// | Shrink, reclaimable excess (`≥ SPLIT_MIN`) | `atomic`: drop the excess — tail `Len` + `Atrunc`, else an in-place carve — recording the new size in one transaction; without `atomic`, retain the excess in place |
+    /// | Shrink, excess below `SPLIT_MIN` | retain in place — no write |
+    /// | Non-tail grow past the block | alloc new class, copy, dealloc old |
     ///
-    /// Every path only ever *leaks* on a mid-op failure (never corrupts): the
-    /// tail grow commits the physical size change leak-preferring so a crash
-    /// leaves an orphaned zero tail that [`recover`](Self::recover) reclaims, and
-    /// the tail and non-tail shrinks commit their length change together with the
-    /// truncation (resp. the carve) as a single transaction, so a crash leaves the
-    /// block wholly un-shrunk or fully shrunk — never a committed length whose
-    /// class stride disagrees with the block's physical extent, which would make
-    /// the recovery scan read live payload bytes as an overhead word.
+    /// The visible length lives in the returned handle, not on disk, so a resize
+    /// that fits (or a shrink whose excess is retained) touches no metadata at
+    /// all. Every path only ever *leaks* on a mid-op failure (never corrupts): the
+    /// tail grow records the new physical size leak-preferring so a crash leaves
+    /// an orphaned zero tail that [`recover`](Self::recover) reclaims, and an
+    /// `atomic` shrink commits the new size together with the truncation (resp.
+    /// the carve) as a single transaction, so a crash leaves the block wholly
+    /// un-shrunk or fully shrunk — never a recorded size disagreeing with the
+    /// block's physical extent, which would make the recovery scan mis-stride.
     #[inline]
     fn realloc<'a>(
         &'a self,
@@ -870,10 +905,11 @@ impl BStackAllocator for SegregatedBStackAllocator {
     /// Release the region described by `slice`.
     ///
     /// Reads the overhead at `slice.start() − 8`: a clear high bit is a
-    /// double-free; a stored length that disagrees with `slice.len()` is a
-    /// partial/erroneous free. Otherwise an oversized block at the tail is
-    /// discarded in one call, and every other block is spliced onto its class
-    /// head via one crash-atomic [`BStack::inplace_gen`] transaction.
+    /// double-free. The block's physical size comes straight from the word; the
+    /// handle's length is trusted (rejecting only a length too large for the
+    /// block). Otherwise an oversized block at the tail is discarded in one call,
+    /// and every other block is spliced onto its class head via one crash-atomic
+    /// [`BStack::inplace_gen`] transaction.
     fn dealloc<'a>(
         &'a self,
         slice: BStackOwnedSlice<'a, Self>,
@@ -896,13 +932,17 @@ impl BStackAllocator for SegregatedBStackAllocator {
                     "double free: block is already free",
                 ));
             }
-            if word & !Self::IN_USE_BIT != len {
+            // The block records its own physical size; the handle's length is
+            // trusted (a retained block is deliberately larger than its request
+            // needs), so exact equality no longer holds. Reject only a length the
+            // block could never have held.
+            let size = (word & !Self::IN_USE_BIT) << 4;
+            if Self::phys_need(len)? > size {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "cannot free a partial or mismatched slice",
+                    "cannot free a mismatched slice",
                 ));
             }
-            let size = Self::class_blocksize(Self::phys_need(len)?);
             let class = Self::classify(size);
 
             if size > Self::MAX_CLASS {
@@ -1034,37 +1074,128 @@ impl SegregatedBStackAllocator {
                     "cannot realloc a freed block",
                 ));
             }
-            if word & !Self::IN_USE_BIT != old_len {
+            // The block records its own physical size; the handle's length is
+            // trusted, so reject only a length the block could never have held.
+            let old_size = (word & !Self::IN_USE_BIT) << 4;
+            if Self::phys_need(old_len)? > old_size {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "cannot realloc a partial or mismatched slice",
+                    "cannot realloc a mismatched slice",
                 ));
             }
-            let old_size = Self::class_blocksize(Self::phys_need(old_len)?);
-            let new_size = Self::class_blocksize(Self::phys_need(new_len)?);
+            let new_need = Self::phys_need(new_len)?;
+            let new_size = Self::class_blocksize(new_need);
 
-            if new_size == old_size {
-                // Same class: the block already fits. Zero the newly-exposed
-                // bytes on grow (a prior shrink may have left stale data there),
-                // ordered before the length commit so a crash never exposes them.
-                if new_len > old_len && init {
-                    self.stack.zero(start + old_len, new_len - old_len)?;
+            if new_need <= old_size {
+                // The request fits the current physical block — no bigger block
+                // needed.
+                if new_len > old_len {
+                    // Visible grow within the block: zero the newly-exposed bytes
+                    // (a prior shrink may have left stale data there) and retain.
+                    // The length lives in the handle, so there is no metadata
+                    // write and nothing to order the zero against for `recover`.
+                    if init {
+                        self.stack.zero(start + old_len, new_len - old_len)?;
+                    }
+                    // SAFETY: same physical block, larger visible length.
+                    return Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, start, new_len) });
                 }
-                self.stack
-                    .set(block_start, (Self::IN_USE_BIT | new_len).to_le_bytes())?;
-                // SAFETY: same physical block, new visible length.
+
+                // Visible shrink (`new_len < old_len`; the `==` case returned
+                // early above). No new bytes are exposed. Reclaim the excess only
+                // above the split threshold, and only under `atomic`: a shrink's
+                // freed tail overlaps still-live caller bytes, so recording the
+                // smaller size and dropping the excess must commit together in one
+                // transaction — the non-`atomic` build cannot fuse them (either
+                // ordering leaves a window `recover` mis-parses, and a rollback
+                // would hand back a block whose tail the carve already clobbered),
+                // so it retains the excess in place (zero writes, no move).
+                #[cfg(feature = "atomic")]
+                if new_size < old_size && old_size - new_size >= Self::SPLIT_MIN {
+                    let old_end = block_start + old_size; // block exists ⇒ ≤ stack_len
+
+                    // Tail shrink: replace the whole block with its shrunk self in
+                    // ONE crash-atomic transaction. `Len` confirms the tail under
+                    // `process_gen`'s held write lock and a single `Atrunc` cuts
+                    // the old block and re-appends the new one (overhead recording
+                    // `new_size`, surviving prefix, zero pad) at the same offset.
+                    // Recording the size and dropping the excess as separate calls
+                    // would leave a crash window where the recorded size disagrees
+                    // with the physical extent and `recover` mis-strides.
+                    //
+                    // The replacement buffer is always full-length regardless of
+                    // `init`: `Atrunc` re-appends exactly these bytes, so their
+                    // count *is* the new block's physical extent. A shrink adds no
+                    // new bytes, so there is no uninitialised region to hand back.
+                    let buf = self.claim_buf(new_size, Some((start, new_len)), true)?;
+                    let mut cur_len = 0u64;
+                    let cur_ptr: *mut u64 = &mut cur_len;
+                    let mut phase = 0u8;
+                    let mut truncated = false;
+                    self.stack.process_gen(|| match phase {
+                        0 => {
+                            phase = 1;
+                            // SAFETY: `process_gen` invokes this closure strictly
+                            // sequentially and finishes writing `out` before the
+                            // next call, so the `&mut` never aliases the read below.
+                            Some(BStackGenOp::Len {
+                                out: unsafe { &mut *cur_ptr },
+                            })
+                        }
+                        1 => {
+                            phase = 2;
+                            // SAFETY: the `Len` write above has completed.
+                            if old_end == unsafe { *cur_ptr } {
+                                truncated = true;
+                                Some(BStackGenOp::Atrunc {
+                                    n: old_size,
+                                    data: &buf[..],
+                                })
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    })?;
+                    if truncated {
+                        // SAFETY: block replaced in place at the same offset,
+                        // shrunk to the new class with its prefix preserved.
+                        return Ok(unsafe {
+                            BStackOwnedSlice::from_raw_parts(self, start, new_len)
+                        });
+                    }
+
+                    // Non-tail: keep the block at the new class and free the excess
+                    // tail *in place* as one crash-atomic carve — no move, no copy,
+                    // and `recovered` stays the untouched original (a fault leaves
+                    // the block un-shrunk). The prefix commit records `new_size`.
+                    let prefix = (Self::IN_USE_BIT | (new_size >> 4)).to_le_bytes();
+                    self.commit_carve(
+                        block_start,
+                        &prefix,
+                        block_start + new_size,
+                        old_size - new_size,
+                    )?;
+                    // SAFETY: block shrunk in place; the freed tail is now free.
+                    return Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, start, new_len) });
+                }
+
+                // Retain in place: the block records its own size and a shrink
+                // exposes no new bytes, so this is zero `BStack` writes.
+                // SAFETY: same physical block, smaller visible length.
                 return Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, start, new_len) });
             }
 
-            // Grow at the tail: extend the physical block in place, only when the
-            // block ends at the payload tail. Extend first (leak-preferring: a
-            // failure after it only leaks the extension, not corrupts), then zero
-            // the old slack, then commit the new length. Under `atomic`,
-            // `try_extend_zeros` fuses the tail check and the grow into one locked
-            // critical section; otherwise we check `len` then `extend` (which
-            // zero-fills the new region via `set_len`).
+            // The request needs a physically larger block (`new_need > old_size`,
+            // so also `new_size > old_size`). Grow at the tail: extend the block in
+            // place, only when it ends at the payload tail. Extend first
+            // (leak-preferring: a failure after it only leaks the extension, never
+            // corrupts), then zero the old slack, then record the new size. Under
+            // `atomic`, `try_extend_zeros` fuses the tail check and the grow into
+            // one locked critical section; otherwise we check `len` then `extend`
+            // (which zero-fills the new region via `set_len`).
             let old_end = block_start + old_size; // block exists ⇒ ≤ stack_len
-            let grew = new_size > old_size && {
+            let grew = {
                 #[cfg(feature = "atomic")]
                 {
                     self.stack.try_extend_zeros(old_end, new_size - old_size)?
@@ -1085,106 +1216,17 @@ impl SegregatedBStackAllocator {
                     self.stack.zero(start + old_len, slack)?;
                 }
                 self.stack
-                    .set(block_start, (Self::IN_USE_BIT | new_len).to_le_bytes())?;
+                    .set(block_start, (Self::IN_USE_BIT | (new_size >> 4)).to_le_bytes())?;
                 // SAFETY: block extended in place to the new class at the tail.
-                return Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, start, new_len) });
-            }
-
-            // Shrink at the tail: replace the whole block with its shrunk self in
-            // ONE crash-atomic transaction. The header commit and the truncation
-            // must not be separate calls: committing `new_len` first makes the
-            // scan stride `new_size`, so a fault before the discard lands leaves
-            // the caller's still-live tail bytes being read as an overhead word —
-            // `recover` then mis-parses them (a zero there truncates the whole
-            // arena behind it). Truncating first is no better: the header would
-            // still read `old_len`, whose stride overruns the payload end.
-            //
-            // So `Len` confirms the tail under `process_gen`'s held write lock and
-            // a single `Atrunc` cuts the entire old block and re-appends the new
-            // one (header + surviving prefix, zero-padded) at the same offset. The
-            // fault policy is consulted before any mutation, so a fault leaves the
-            // block wholly intact and `recovered` stays the untouched original.
-            #[cfg(feature = "atomic")]
-            if new_size < old_size {
-                // The replacement block, built exactly as a fresh claim would be:
-                // overhead(in_use | new_len), the surviving prefix read straight
-                // out of the old block, then zero padding to the class size.
-                //
-                // Always full-length, regardless of `init`: `Atrunc` cuts the old
-                // block and re-appends exactly these bytes, so the buffer's length
-                // *is* the new block's physical extent. A short one would leave a
-                // block smaller than the class stride `recover` strides by. It
-                // costs the caller nothing either way — a shrink adds no new
-                // bytes, so there is no uninitialised region to hand back here.
-                let buf = self.claim_buf(new_size, new_len, Some((start, new_len)), true)?;
-                let mut cur_len = 0u64;
-                let cur_ptr: *mut u64 = &mut cur_len;
-                let mut phase = 0u8;
-                let mut truncated = false;
-                self.stack.process_gen(|| match phase {
-                    0 => {
-                        phase = 1;
-                        // SAFETY: `process_gen` invokes this closure strictly
-                        // sequentially and finishes writing `out` before the next
-                        // call, so the `&mut` never aliases the read below.
-                        Some(BStackGenOp::Len {
-                            out: unsafe { &mut *cur_ptr },
-                        })
-                    }
-                    1 => {
-                        phase = 2;
-                        // SAFETY: the `Len` write above has completed.
-                        if old_end == unsafe { *cur_ptr } {
-                            truncated = true;
-                            Some(BStackGenOp::Atrunc {
-                                n: old_size,
-                                data: &buf[..],
-                            })
-                        } else {
-                            None
-                        }
-                    }
-                    _ => None,
-                })?;
-                if truncated {
-                    // SAFETY: the block was replaced in place at the same offset,
-                    // shrunk to the new class with its prefix preserved.
-                    return Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, start, new_len) });
-                }
-                // Not the tail — fall through to the in-place carve below.
-            }
-
-            // Non-tail shrink: under `atomic`, keep the block at the new class and
-            // free the excess tail *in place* as one crash-atomic carve — no move,
-            // no copy, no mid-arena gap for `recover`, and `recovered` stays the
-            // untouched original (a fault leaves the block un-shrunk).
-            //
-            // Without `atomic` an in-place carve cannot be made fault-safe: shrinking
-            // the header and validating the freed tail are two non-adjacent writes,
-            // and with no journal to commit them together any fault between them
-            // either corrupts the caller's tail data (header still reads `old_len`)
-            // or leaves `recover` a garbage-headed tail to desync on. So the
-            // non-atomic build falls through to the move below, fault-safe step by
-            // step (each op atomic, a mid-move failure only ever leaks).
-            #[cfg(feature = "atomic")]
-            if new_size < old_size {
-                let prefix = (Self::IN_USE_BIT | new_len).to_le_bytes();
-                self.commit_carve(
-                    block_start,
-                    &prefix,
-                    block_start + new_size,
-                    old_size - new_size,
-                )?;
-                // SAFETY: block shrunk in place; the freed tail is now free blocks.
                 return Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, start, new_len) });
             }
 
             // Move: allocate the new class, having it read the surviving prefix
             // straight from the old block into its claim buffer (no separate copy
-            // buffer or write), then free the old block. Handles the non-tail grow
-            // (both builds) and, without `atomic`, the non-tail shrink that fell
-            // through above. Each step is individually atomic; a mid-move failure
-            // leaks (never corrupts).
+            // buffer or write), then free the old block. Reached only by a grow
+            // past the current block that is not at the tail (a shrink always fits
+            // the block, so it never moves). Each step is individually atomic; a
+            // mid-move failure leaks (never corrupts).
             let copy_len = old_len.min(new_len);
             let new_ptr = self.alloc_raw(new_len, Some((start, copy_len)), init)?;
             // New region committed and populated; it is now the survivor.
@@ -1511,27 +1553,31 @@ mod tests {
         assert_eq!(&data[100..], &[0u8; 200]);
     }
 
-    // In-place non-tail-shrink carve is atomic-only; without `atomic` the same
-    // realloc takes the fault-safe move path (covered by the round-trip/fault tests).
-    #[cfg(feature = "atomic")]
+    // A shrink whose excess is below `SPLIT_MIN` is retained inside the live
+    // block (in either build): no metadata write, no move, and the block keeps
+    // its larger physical size so a later grow back fits in place.
     #[test]
-    fn seg_realloc_cross_class_shrink_non_tail_carves_in_place() {
+    fn seg_realloc_small_shrink_excess_retained_in_place() {
         let (a, _g) = new_alloc();
         let mut s = a.alloc(200).unwrap(); // block 208 (class 12)
         s.write([0x5Au8; 200]).unwrap();
         let off = s.start();
-        let base = off - Seg::OVERHEAD;
         let _pin = a.alloc(100).unwrap(); // pins the tail so `s` is interior
-        let s = a.realloc(s, 100).unwrap(); // block 112; gap 96 → carve one 96 block
-        assert_eq!(s.start(), off, "non-tail shrink carves in place, no move");
+        let s = a.realloc(s, 100).unwrap(); // block 112 needed; excess 96 < SPLIT_MIN → retain
+        assert_eq!(s.start(), off, "small shrink retains in place, no move");
         assert_eq!(
             s.read().unwrap(),
             vec![0x5Au8; 100],
             "surviving prefix preserved"
         );
-        // The 96 excess (class 5) at base+112 is reusable.
-        let r = a.alloc(88).unwrap(); // class 5 (block 96)
-        assert_eq!(r.start(), base + 112 + Seg::OVERHEAD);
+        // The block still physically spans 208 bytes, so growing back to 200 fits
+        // in place (no move) with the re-exposed tail zeroed.
+        let s = a.realloc(s, 200).unwrap();
+        assert_eq!(s.start(), off, "grow back into the retained block, no move");
+        let data = s.read().unwrap();
+        assert_eq!(&data[..100], &[0x5Au8; 100], "prefix preserved");
+        assert_eq!(&data[100..], &[0u8; 100], "re-exposed tail zeroed");
+        assert_eq!(unsafe { a.recover() }.unwrap(), 0, "arena accounted for");
     }
 
     #[test]
@@ -1562,18 +1608,18 @@ mod tests {
         assert!(err.handle.is_some());
     }
 
-    /// With `atomic` a tail shrink is one `Len` + `Atrunc` transaction: the block
-    /// is replaced by its shrunk self at the same offset and the excess goes back
-    /// to the stack.
+    /// With `atomic` a tail shrink whose excess reaches `SPLIT_MIN` is one
+    /// `Len` + `Atrunc` transaction: the block is replaced by its shrunk self at
+    /// the same offset and the excess goes back to the stack.
     #[cfg(feature = "atomic")]
     #[test]
     fn seg_realloc_tail_shrink_in_place() {
         let (a, _g) = new_alloc();
-        let mut s = a.alloc(200).unwrap(); // block 208, at the tail
-        s.write([0x3Cu8; 200]).unwrap();
+        let mut s = a.alloc(500).unwrap(); // block 512, at the tail
+        s.write([0x3Cu8; 500]).unwrap();
         let off = s.start();
         let len_before = a.stack().len().unwrap();
-        let s = a.realloc(s, 100).unwrap(); // new class 112 < 208, at tail → atrunc
+        let s = a.realloc(s, 100).unwrap(); // new class 112 < 512, excess 400 ≥ SPLIT_MIN, at tail → atrunc
         assert_eq!(s.start(), off, "tail shrink stays in place");
         assert!(
             a.stack().len().unwrap() < len_before,
@@ -1582,23 +1628,31 @@ mod tests {
         assert_eq!(s.read().unwrap(), vec![0x3Cu8; 100]);
     }
 
-    /// Without `atomic` the length commit and the truncation cannot be fused, and
-    /// either ordering leaves a crash window that desyncs `recover` (see the
-    /// `realloc` docs), so a tail shrink takes the move path instead: the data
-    /// survives at a new offset and the old block returns to its free list.
+    /// Without `atomic`, recording the smaller size and dropping the excess
+    /// cannot be fused, and either ordering leaves a crash window that desyncs
+    /// `recover` (see the `realloc` docs), so a shrink retains the excess in place
+    /// instead: the block keeps its physical size and offset with no move, and a
+    /// later grow back into that retained span fits without moving.
     #[cfg(not(feature = "atomic"))]
     #[test]
-    fn seg_realloc_tail_shrink_moves() {
+    fn seg_realloc_tail_shrink_retains_in_place() {
         let (a, _g) = new_alloc();
-        let mut s = a.alloc(200).unwrap(); // block 208, at the tail
-        s.write([0x3Cu8; 200]).unwrap();
+        let mut s = a.alloc(500).unwrap(); // block 512, at the tail
+        s.write([0x3Cu8; 500]).unwrap();
         let off = s.start();
-        let s = a.realloc(s, 100).unwrap(); // new class 112 < 208 → move
-        assert_ne!(s.start(), off, "non-atomic tail shrink moves the block");
+        let len_before = a.stack().len().unwrap();
+        let s = a.realloc(s, 100).unwrap(); // new class 112 < 512 → retain, no move
+        assert_eq!(s.start(), off, "non-atomic shrink retains the block in place");
+        assert_eq!(
+            a.stack().len().unwrap(),
+            len_before,
+            "nothing discarded: the excess is retained"
+        );
         assert_eq!(s.read().unwrap(), vec![0x3Cu8; 100]);
-        // The vacated 208-byte block is back on its free list and gets reused.
-        let reused = a.alloc(200).unwrap();
-        assert_eq!(reused.start(), off, "old block recycled");
+        // The retained 512-byte block absorbs a grow back to 400 with no move.
+        let s = a.realloc(s, 400).unwrap();
+        assert_eq!(s.start(), off, "grow back into the retained block, no move");
+        assert_eq!(&s.read().unwrap()[..100], &[0x3Cu8; 100]);
     }
 
     // ── recover ──────────────────────────────────────────────────────────────
@@ -1709,6 +1763,23 @@ mod tests {
         let z = a.alloc(888).unwrap(); // class 22 (block 896)
         assert_eq!(z.start(), base + 4112 + Seg::OVERHEAD);
         assert_eq!(unsafe { a.recover() }.unwrap(), 0);
+    }
+
+    #[test]
+    fn seg_oversized_reuse_retains_small_excess_whole() {
+        let (a, _g) = new_alloc();
+        let x = a.alloc(5000).unwrap(); // oversized, block 5008
+        let off_x = x.start();
+        let _pin = a.alloc(50).unwrap(); // pins the tail so X is interior
+        a.dealloc(x).unwrap(); // X → oversized free list (size 5008)
+        // Y needs block 4864 (oversized); reuses X whole (excess 144 < SPLIT_MIN).
+        let y = a.alloc(4850).unwrap();
+        assert_eq!(y.start(), off_x, "oversized reuse hands back X's block");
+        assert_eq!(unsafe { a.recover() }.unwrap(), 0, "block strides its full size");
+        // Freed, the retained block returns to the oversized list at its full size.
+        a.dealloc(y).unwrap();
+        let z = a.alloc(5000).unwrap();
+        assert_eq!(z.start(), off_x, "retained 5008 block recycled");
     }
 
     #[test]
