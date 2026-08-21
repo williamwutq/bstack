@@ -8,7 +8,7 @@
  * bstack — persistent, fsync-durable binary stack backed by a single file.
  *
  * File format (32-byte header followed by payload):
- *   [0..8)   magic: "BSTK" + major(0) + minor(4) + patch(2) + reserved(0)
+ *   [0..8)   magic: "BSTK" + major(0) + minor(4) + patch(3) + reserved(0)
  *   [8..16)  committed payload length (clen), little-endian uint64
  *   [16..24) wip_ptr: write-in-progress journal target (0 when idle), LE uint64
  *   [24..32) wip_aux: write-in-progress journal mode, LE uint64

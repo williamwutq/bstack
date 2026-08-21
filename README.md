@@ -630,7 +630,7 @@ A fixed 32-byte header precedes the payload:
 ```
 
 * **`magic`** — 8 bytes: `BSTK` + major(1 B) + minor(1 B) + patch(1 B) + reserved(1 B).
-  This version writes `BSTK\x00\x04\x02\x00` (0.4.2).  `open` accepts any
+  This version writes `BSTK\x00\x04\x03\x00` (0.4.3).  `open` accepts any
   0.4.x file (first 6 bytes `BSTK\x00\x04`) and rejects a different major or
   minor as incompatible.  Legacy `0.1.x` files can be upgraded in place with
   `BStack::migrate`.

@@ -56,9 +56,9 @@
  * Constants
  * ---------------------------------------------------------------------- */
 
-/* On-disk format 0.4.2. The first 6 bytes (BSTK + major + minor) are the
+/* On-disk format 0.4.3. The first 6 bytes (BSTK + major + minor) are the
  * compatibility prefix checked on open; the patch byte is informational. */
-static const uint8_t  MAGIC[8]        = {'B','S','T','K', 0, 4, 2, 0};
+static const uint8_t  MAGIC[8]        = {'B','S','T','K', 0, 4, 3, 0};
 static const uint8_t  MAGIC_PREFIX[6] = {'B','S','T','K', 0, 4};
 static const uint64_t HEADER_SIZE     = 32;
 
