@@ -182,3 +182,58 @@ Both are pure forwarding: `allocator()` returns `&'a A`, independent of `&self`,
 ### Open questions
 
 - **Necessity.** The allocator is already at hand wherever a `BStackOwnedSlice` was obtained (it was needed to call `alloc`/`realloc` in the first place), so the caller can always reach `allocator.dealloc(handle)` directly. Whether the convenience of dropping that extra reference at call sites justifies the added inherent-method surface on `BStackOwnedSlice` is not yet decided.
+
+---
+
+## Segregated allocator: record the block's **physical size** in the in-use overhead word
+
+**Feature flag:** `alloc` + `set`, same as `SegregatedBStackAllocator` itself.
+**Breaking change:** On-disk only, and only for the **experimental** allocator — the `ALSG` magic bumps to `ALSG\x00\x02`, so existing `ALSG\x00\x01` files fail `new` with `InvalidData`. No crate API, trait, or type signature changes, and no other allocator's format is touched; the bump falls under the allocator's standing "format is not yet stable" caveat (`README.md` and `algos/ALLOCATOR.md`, §`SegregatedBStackAllocator`).
+
+### Motivation
+
+A live block's overhead word stores the **caller's visible length** (`IN_USE_BIT | len`); a free block stores its **physical size** (`size >> 4`, which doubles as the class tag) — `algos/ALLOCATOR.md` §"On-disk layout". `recover` therefore cannot read a live block's extent and must derive it as `class_blocksize(phys_need(len))`. That derivation is sound only under a strict invariant: **a live block's physical size equals the class size implied by its stored length**. Maintaining that invariant is what makes the expensive paths expensive:
+
+- **Oversized non-exact reuse.** `pop_oversized` returns `actual ≥ need`, and the excess cannot be retained, so every inexact large `alloc` runs `commit_carve` — a greedy split into ≤ `MAX_CARVE_PIECES` (3) blocks, committed as one `inplace_gen` that reads and rewrites up to three free-list heads.
+- **Non-tail shrink.** Must carve the freed tail (`atomic`) or, with no journal to fuse the length commit with the carve, take a **full move**: alloc, copy, free.
+- **Tail shrink.** Must replace the block via `Len` + `Atrunc`, with no fault-safe non-`atomic` form (it moves instead) — the same coupling behind the recovery bug fixed under `[Unreleased]` in the CHANGELOG, where a committed length whose class stride disagreed with the block's physical extent let `recover` read live payload as an overhead word.
+- **In-block resize.** A resize that changes nothing physical still costs one durable `set`, purely to keep the recorded length exact.
+
+Recording the physical size severs the derivation. The extent stops being a function of the visible length, so a live block may be **larger than its request needs**. The visible length stays where it already is — in the caller's `BStackOwnedSlice` — and `realloc`/`dealloc` trust the length handed back on the same footing as the slice-origin obligation they already document.
+
+### Design
+
+#### Encoding
+
+Both candidates are equally breaking on disk, so the choice is internal:
+
+1. **`IN_USE_BIT | (size >> 4)`** — *recommended*: identical low-63 semantics to the free encoding.
+2. **`IN_USE_BIT | size`** — raw size; live and free words then carry different units.
+
+Prefer **1**. `recover` decodes one way for both tags (`size = (word & !IN_USE_BIT) << 4`) and consults the tag only to decide whether to relink; the claim and `push` paths share one word builder; and a misread tag still yields the correct stride, where **2** yields one wrong by 16×. The zeroed-tail sentinel (`word == 0` ⇒ crashed `extend`) holds under either: a live word has the high bit set, a free word has `size >> 4 ≥ 1`.
+
+#### Changes to code paths
+
+| Path                          | Today                                                                 | Under the new ABI                                                                                            |
+|-------------------------------|-----------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------|
+| `alloc`, oversized non-exact  | claim `block` + `commit_carve` the excess (≤ 3-piece `inplace_gen`)   | claim the **whole** popped block in one `set`; carve only above the split threshold                          |
+| `realloc`, fits current block | rewrite the overhead word (one durable `set`)                         | **no metadata write** — only the `init` zero-fill of newly exposed bytes                                     |
+| `realloc`, grow at tail       | `try_extend_zeros`, then rewrite the length                           | same shape, rewriting the size instead; still leak-preferring                                                |
+| `realloc`, shrink at tail     | `Len` + `Atrunc` transaction (`atomic`); **move** without `atomic`    | `Len` + `Atrunc` as today, recording the new size (`atomic`); retained in place, not moved, without `atomic` |
+| `realloc`, non-tail shrink    | carve transaction (`atomic`); **move** without `atomic`               | retained in place; carve only above the split threshold, in either build                                     |
+| `dealloc`                     | recompute `size` from the stored length, then splice or `try_discard` | read `size` from the word; splice or `try_discard` unchanged                                                 |
+| `recover`                     | stride live blocks by `class_blocksize(phys_need(len))`               | stride by the recorded size; the derivation and its overflow branch disappear                                |
+
+The most significant improvements will be in-block resize dropping to **zero `BStack` calls**, oversized reuse losing its carve transaction, and the non-`atomic` build no longer moving on a shrink. Retention becomes a policy dial (`SPLIT_MIN` — retain excess below it, carve above) rather than a format constraint, since the block records its own extent either way.
+
+#### Invariant that must survive
+
+Classed free lists are **size-homogeneous**: `pop_class` claims the class size sight-unseen, and `classify` rounds *up* (`classify(336)` returns the 384-byte head), so a non-class-sized block linked into the classed range would hand out 384 bytes from a 336-byte block and overrun its neighbour. Retention must never create a classed-range block whose size is not an exact class size — and it does not: an uncarved oversized block stays oversized (that bucket is heterogeneous by design and `pop_oversized` checks `size ≥ need`), a retained-after-shrink block keeps the class size it already had, and carve pieces come from `largest_class_le`. Worth hardening regardless: have `recover` relink by `largest_class_le(size)` rather than `classify(size)`, so a malformed size degrades to a leak instead of an overlap.
+
+#### Changes to slice validation
+
+`dealloc`/`realloc` lose the `word & !IN_USE_BIT != len` comparison ("cannot free a partial or mismatched slice"): a retained block is deliberately larger than its request needs, so exact equality no longer holds. The handle's length is trusted from there on — the same trust `SlabBStackAllocator` and `FirstFitBStackAllocator` already place in it when they derive their zero and copy ranges from `slice.len()`. What remains is `ensure_own_handle`, `block_start_of` (pointer `≡ OVERHEAD (mod QUANTUM)` and `≥ ARENA_START + OVERHEAD`), exact double-free detection from the in-use bit, and `phys_need(len) ≤ size` in place of the equality — a bound that holds under retention and still rejects a length the block could never have held.
+
+### Open questions
+
+- **Split threshold.** Where `SPLIT_MIN` sits — retain always, carve above `LINEAR_MAX` (256 B), or carve once the excess exceeds a fraction of the block. Retention trades I/O against internal fragmentation, worst in the oversized bucket where the size spread is unbounded; `benches/alloc.rs` should grow a fragmentation-versus-calls measurement before the constant is fixed. The format constrains none of it, so a conservative initial value can be tuned later without another magic bump.
