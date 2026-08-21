@@ -1215,8 +1215,10 @@ impl SegregatedBStackAllocator {
                 if slack > 0 && init {
                     self.stack.zero(start + old_len, slack)?;
                 }
-                self.stack
-                    .set(block_start, (Self::IN_USE_BIT | (new_size >> 4)).to_le_bytes())?;
+                self.stack.set(
+                    block_start,
+                    (Self::IN_USE_BIT | (new_size >> 4)).to_le_bytes(),
+                )?;
                 // SAFETY: block extended in place to the new class at the tail.
                 return Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, start, new_len) });
             }
@@ -1642,7 +1644,11 @@ mod tests {
         let off = s.start();
         let len_before = a.stack().len().unwrap();
         let s = a.realloc(s, 100).unwrap(); // new class 112 < 512 → retain, no move
-        assert_eq!(s.start(), off, "non-atomic shrink retains the block in place");
+        assert_eq!(
+            s.start(),
+            off,
+            "non-atomic shrink retains the block in place"
+        );
         assert_eq!(
             a.stack().len().unwrap(),
             len_before,
@@ -1775,7 +1781,11 @@ mod tests {
         // Y needs block 4864 (oversized); reuses X whole (excess 144 < SPLIT_MIN).
         let y = a.alloc(4850).unwrap();
         assert_eq!(y.start(), off_x, "oversized reuse hands back X's block");
-        assert_eq!(unsafe { a.recover() }.unwrap(), 0, "block strides its full size");
+        assert_eq!(
+            unsafe { a.recover() }.unwrap(),
+            0,
+            "block strides its full size"
+        );
         // Freed, the retained block returns to the oversized list at its full size.
         a.dealloc(y).unwrap();
         let z = a.alloc(5000).unwrap();
