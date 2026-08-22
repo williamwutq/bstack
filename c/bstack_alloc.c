@@ -5998,8 +5998,16 @@ uint64_t checked_slab_bstack_allocator_data_size(
 #define ALSG_SENTINEL        UINT64_C(0)
 #define ALSG_IN_USE_BIT      UINT64_C(0x8000000000000000)
 
-static const uint8_t alsg_magic[8]        = {'A','L','S','G',0,1,0,0};
-static const uint8_t alsg_magic_prefix[6] = {'A','L','S','G',0,1};
+/* Minimum excess (bytes) worth reclaiming into free blocks instead of retaining
+ * as internal slack.  Not part of the on-disk format, so tuning it is not a
+ * breaking change. */
+#define ALSG_SPLIT_MIN       ALSG_LINEAR_MAX
+
+/* Magic: "ALSG" + major 0 + minor 2; the version encodes the fixed class scheme
+ * and the in-use overhead recording the block's physical size (minor 1 recorded
+ * the caller's length instead — a \x01 file fails new() with EINVAL). */
+static const uint8_t alsg_magic[8]        = {'A','L','S','G',0,2,0,0};
+static const uint8_t alsg_magic_prefix[6] = {'A','L','S','G',0,2};
 
 #define alsg_head_off(cls) (ALSG_FREE_HEAD_BASE + (uint64_t)(cls) * 8)
 
@@ -6071,10 +6079,13 @@ static int alsg_block_start_of(uint64_t ptr, uint64_t *out)
 
 /* ---- claim buffer ------------------------------------------------------ */
 
-/* Build the block-byte claim buffer: overhead = IN_USE|len, an optional prefix
- * of n bytes read straight from payload offset src, the rest zero.  Returns a
- * malloc'd buffer (caller frees) or NULL on failure. */
-static uint8_t *alsg_claim_buf(bstack_t *bs, uint64_t block, uint64_t len,
+/* Build the block-byte claim buffer: overhead = IN_USE|(block >> 4) recording
+ * the block's physical size, an optional prefix of n bytes read straight from
+ * payload offset src, the rest zero.  `block` is the physical extent being
+ * claimed and the size the overhead records — the caller's visible length is
+ * never stored here.  Returns a malloc'd buffer (caller frees) or NULL on
+ * failure. */
+static uint8_t *alsg_claim_buf(bstack_t *bs, uint64_t block,
                                int has_copy, uint64_t src, uint64_t n)
 {
     uint8_t *buf;
@@ -6083,7 +6094,7 @@ static uint8_t *alsg_claim_buf(bstack_t *bs, uint64_t block, uint64_t len,
 #endif
     buf = calloc(1, (size_t)block);
     if (!buf) return NULL;
-    write_le64(buf, ALSG_IN_USE_BIT | len);
+    write_le64(buf, ALSG_IN_USE_BIT | (block >> 4));
     if (has_copy && n > 0) {
         if (bstack_get(bs, src, src + n, buf + 8)) { free(buf); return NULL; }
     }
@@ -6419,7 +6430,7 @@ static int alsg_alloc_raw(bstack_t *bs, uint64_t len, int has_copy,
         int have = 0;
         if (alsg_pop_class(bs, alsg_classify(block), &have, &bs_off)) return -1;
         if (have) {
-            buf = alsg_claim_buf(bs, block, len, has_copy, src, copy_n);
+            buf = alsg_claim_buf(bs, block, has_copy, src, copy_n);
             if (!buf) return -1;
             if (bstack_set(bs, bs_off, buf, (size_t)block)) goto cleanup;
             goto success;
@@ -6430,15 +6441,23 @@ static int alsg_alloc_raw(bstack_t *bs, uint64_t len, int has_copy,
         if (alsg_pop_oversized(bs, block, &have, &bs_off, &actual))
             return -1;
         if (have) {
-            buf = alsg_claim_buf(bs, block, len, has_copy, src, copy_n);
-            if (!buf) return -1;
-            if (actual == block) {
-                if (bstack_set(bs, bs_off, buf, (size_t)block)) goto cleanup;
+            uint64_t excess = actual - block;
+            if (excess < ALSG_SPLIT_MIN) {
+                /* Retain the whole popped block: claim `actual` bytes and record
+                 * `actual` as the physical size.  One set, no carve.  The block
+                 * stays in the (heterogeneous) oversized bucket, so retaining a
+                 * non-class size is sound. */
+                buf = alsg_claim_buf(bs, actual, has_copy, src, copy_n);
+                if (!buf) return -1;
+                if (bstack_set(bs, bs_off, buf, (size_t)actual)) goto cleanup;
             } else {
-                /* Non-exact reuse: claim `block` bytes (the claim buffer is the
-                 * prefix) and carve the excess as one crash-atomic transaction. */
+                /* Reclaim the excess above the threshold: claim `block` bytes
+                 * (the claim buffer is the prefix) and carve the rest, all as one
+                 * crash-atomic transaction. */
+                buf = alsg_claim_buf(bs, block, has_copy, src, copy_n);
+                if (!buf) return -1;
                 if (alsg_commit_carve(bs, bs_off, buf, (size_t)block,
-                                      bs_off + block, actual - block))
+                                      bs_off + block, excess))
                 goto cleanup;
             }
             goto success;
@@ -6446,7 +6465,7 @@ static int alsg_alloc_raw(bstack_t *bs, uint64_t len, int has_copy,
     }
 
     /* Miss: grow the whole zero-filled block in one sparse write. */
-    buf = alsg_claim_buf(bs, block, len, has_copy, src, copy_n);
+    buf = alsg_claim_buf(bs, block, has_copy, src, copy_n);
     if (!buf) return -1;
     if (bstack_extend_sparse(bs, buf, (size_t)block, block, &bs_off)) {
 cleanup:
@@ -6483,13 +6502,9 @@ int segregated_bstack_allocator_recover(segregated_bstack_allocator_t *alloc,
         if (bstack_get(bs, p, p + 8, wbuf)) return -1;
         word = read_le64(wbuf);
         if (word & ALSG_IN_USE_BIT) {
-            /* Live: stride by the physical size implied by the stored len. */
-            uint64_t ulen = word & ~ALSG_IN_USE_BIT;
-            uint64_t need = alsg_phys_need(ulen);
-            uint64_t size;
-            if (need == 0) { unsure += (stack_len - p) / ALSG_QUANTUM; break; }
-            size = alsg_class_blocksize(need);
-            if (size == 0 || size > stack_len - p) {
+            /* Live: stride by the recorded physical size (no derivation). */
+            uint64_t size = (word & ~ALSG_IN_USE_BIT) << 4;
+            if (size < ALSG_QUANTUM || size % ALSG_QUANTUM || size > stack_len - p) {
                 unsure += (stack_len - p) / ALSG_QUANTUM; break;
             }
             p += size;
@@ -6508,7 +6523,11 @@ int segregated_bstack_allocator_recover(segregated_bstack_allocator_t *alloc,
             if (size < ALSG_QUANTUM || size % ALSG_QUANTUM || size > stack_len - p) {
                 unsure += (stack_len - p) / ALSG_QUANTUM; break;
             }
-            cc = alsg_classify(size);
+            /* Relink by the largest class <= size so a malformed non-class size
+             * degrades to a leak, never a head that overruns the block. */
+            cc = (size > ALSG_MAX_CLASS)
+                 ? ALSG_OVERSIZED_CLASS
+                 : alsg_classify(alsg_largest_class_le(size));
             /* Prepend: next_free <- current head of this class, head <- p. */
             write_le64(wbuf, heads[cc]);
             if (bstack_set(bs, p + ALSG_OVERHEAD, wbuf, 8)) return -1;
@@ -6563,11 +6582,11 @@ static int alsg_vt_dealloc(bstack_allocator_t *base, bstack_slice_t s)
     if (bstack_get(bs, block_start, block_start + 8, buf)) return -1;
     word = read_le64(buf);
     if (!(word & ALSG_IN_USE_BIT)) RETURN_INVALID;  /* double free */
-    if ((word & ~ALSG_IN_USE_BIT) != s.len) RETURN_INVALID; /* mismatch */
-
+    /* Physical size comes straight from the word; the handle's length is trusted
+     * (rejecting only a length too large for the block). */
+    size = (word & ~ALSG_IN_USE_BIT) << 4;
     need = alsg_phys_need(s.len);
-    if (!need) RETURN_INVALID;
-    size  = alsg_class_blocksize(need);
+    if (!need || need > size) RETURN_INVALID;        /* mismatch */
     class = alsg_classify(size);
 
     if (size > ALSG_MAX_CLASS) {
@@ -6644,33 +6663,94 @@ static int alsg_vt_realloc(bstack_allocator_t *base, bstack_slice_t s,
     if (bstack_get(bs, block_start, block_start + 8, buf)) goto fail_recover;
     word = read_le64(buf);
     if ((word & ALSG_IN_USE_BIT) == 0) goto fail_invalid;
-    if ((word & ~ALSG_IN_USE_BIT) != old_len) goto fail_invalid;
-
+    /* Physical size comes straight from the word; the handle's length is trusted
+     * (rejecting only a length too large for the block). */
+    old_size = (word & ~ALSG_IN_USE_BIT) << 4;
     need_o = alsg_phys_need(old_len);
     need_n = alsg_phys_need(new_len);
-    if (need_o == 0 || need_n == 0) goto fail_invalid;
-    old_size = alsg_class_blocksize(need_o);
+    if (need_o == 0 || need_n == 0 || need_o > old_size) goto fail_invalid;
     new_size = alsg_class_blocksize(need_n);
+    old_end = block_start + old_size;
 
-    /* Same class: the block already fits.  Zero the newly-exposed bytes on grow
-     * before the length commit so a crash never exposes them. */
-    if (new_size == old_size) {
+    if (need_n <= old_size) {
+        /* The request fits the current physical block — no bigger block needed. */
         if (new_len > old_len) {
+            /* Visible grow within the block: zero the newly-exposed bytes (a
+             * prior shrink may have left stale data there) and retain.  The
+             * length lives in the handle, so there is no metadata write and
+             * nothing to order the zero against for recover. */
             uint64_t z = new_len - old_len;
 #if UINT64_MAX > SIZE_MAX
             if (z > (uint64_t)SIZE_MAX) goto fail_invalid;
 #endif
             if (bstack_zero(bs, start + old_len, (size_t)z)) goto fail_recover;
+            result.offset = start; result.len = new_len; goto success;
         }
-        write_le64(buf, ALSG_IN_USE_BIT | new_len);
-        if (bstack_set(bs, block_start, buf, 8)) goto fail_recover;
+
+        /* Visible shrink (new_len < old_len; the == case returned early above).
+         * Reclaim the excess only above the split threshold, and only under
+         * atomic: a shrink's freed tail overlaps still-live caller bytes, so
+         * recording the smaller size and dropping the excess must commit together
+         * in one transaction — the non-atomic build cannot fuse them (either
+         * ordering leaves a window recover mis-parses), so it retains the excess
+         * in place (zero writes, no move). */
+#ifdef BSTACK_FEATURE_ATOMIC
+        if (new_size < old_size && old_size - new_size >= ALSG_SPLIT_MIN) {
+            bstack_alloc_tail_shrink_ctx_t c;
+            uint8_t *nb;
+            uint8_t prefix[8];
+            int rc;
+#if UINT64_MAX > SIZE_MAX
+            if (old_size > (uint64_t)SIZE_MAX || new_size > (uint64_t)SIZE_MAX)
+                goto fail_invalid;
+#endif
+            /* Tail shrink: replace the whole block with its shrunk self in ONE
+             * crash-atomic transaction.  LEN confirms the tail under the held
+             * write lock and one SPLICE cuts the old block and re-appends the new
+             * one (overhead recording new_size, surviving prefix, zero pad) at the
+             * same offset.  Recording the size and dropping the excess as separate
+             * calls would leave a crash window where the recorded size disagrees
+             * with the physical extent and recover mis-strides.
+             *
+             * The replacement buffer is always full-length: SPLICE re-appends
+             * exactly these bytes, so their count is the new block's physical
+             * extent.  A shrink adds no new bytes, so there is nothing
+             * uninitialised to hand back. */
+            nb = alsg_claim_buf(bs, new_size, 1, start, new_len);
+            if (!nb) goto fail_recover;
+            c.phase         = 0;
+            c.truncated     = 0;
+            c.expected_tail = old_end;
+            c.cur           = 0;
+            c.cut           = (size_t)old_size;
+            c.new_buf       = nb;
+            c.new_len       = (size_t)new_size;
+            rc = bstack_process_gen(bs, bstack_alloc_tail_shrink_gen, &c);
+            free(nb);
+            if (rc) goto fail_recover;
+            if (c.truncated) { result.offset = start; result.len = new_len; goto success; }
+
+            /* Non-tail: keep the block at the new class and free the excess tail
+             * in place as one crash-atomic carve — no move, no copy, and
+             * recovered stays the untouched original (a fault leaves the block
+             * un-shrunk).  The prefix commit records new_size. */
+            write_le64(prefix, ALSG_IN_USE_BIT | (new_size >> 4));
+            if (alsg_commit_carve(bs, block_start, prefix, 8,
+                block_start + new_size, old_size - new_size))
+                goto fail_recover;
+            result.offset = start; result.len = new_len; goto success;
+        }
+#endif /* BSTACK_FEATURE_ATOMIC */
+
+        /* Retain in place: the block records its own size and a shrink exposes no
+         * new bytes, so this is zero bstack writes. */
         result.offset = start; result.len = new_len; goto success;
     }
 
-    old_end = block_start + old_size;
-
-    /* Grow at the tail: extend in place, zero the old slack, commit the length. */
-    if (new_size > old_size) {
+    /* The request needs a physically larger block (need_n > old_size, so also
+     * new_size > old_size).  Grow at the tail: extend in place, zero the old
+     * slack, then record the new physical size. */
+    {
         uint64_t delta = new_size - old_size;
         int grew = 0;
 #if UINT64_MAX > SIZE_MAX
@@ -6700,70 +6780,17 @@ static int alsg_vt_realloc(bstack_allocator_t *base, bstack_slice_t s,
 #endif
                 if (bstack_zero(bs, start + old_len, (size_t)slack)) goto fail_recover;
             }
-            write_le64(buf, ALSG_IN_USE_BIT | new_len);
+            write_le64(buf, ALSG_IN_USE_BIT | (new_size >> 4));
             if (bstack_set(bs, block_start, buf, 8)) goto fail_recover;
             result.offset = start; result.len = new_len; goto success;
         }
         /* Not at tail: fall through to the move. */
     }
 
-    /* Shrink at the tail: replace the whole block with its shrunk self in ONE
-     * crash-atomic transaction.  The length commit and the truncation must not
-     * be separate calls: committing new_len first makes the recovery scan stride
-     * new_size, so a failure before the discard lands leaves the caller's still
-     * live tail bytes being read as an overhead word — a zero run there (ordinary
-     * data) looks like a crashed extend and recovery discards the whole arena
-     * behind it.  Truncating first is no better: the header would still read
-     * old_len, whose stride overruns the payload end.  So LEN confirms the tail
-     * under the held write lock and one SPLICE cuts the old block and re-appends
-     * the new one at the same offset.
-     *
-     * Without atomic there is no way to fuse them, so that build falls through to
-     * the move below — as the non-tail shrink already does. */
-#ifdef BSTACK_FEATURE_ATOMIC
-    if (new_size < old_size) {
-        bstack_alloc_tail_shrink_ctx_t c;
-        uint8_t *nb;
-        int rc;
-#if UINT64_MAX > SIZE_MAX
-        if (old_size > (uint64_t)SIZE_MAX || new_size > (uint64_t)SIZE_MAX)
-            goto fail_invalid;
-#endif
-        /* The replacement block, built exactly as a fresh claim would be:
-         * overhead(IN_USE|new_len), the surviving prefix read straight out of the
-         * old block, then zero padding to the class size. */
-        nb = alsg_claim_buf(bs, new_size, new_len, 1, start, new_len);
-        if (!nb) goto fail_recover;
-        c.phase         = 0;
-        c.truncated     = 0;
-        c.expected_tail = old_end;
-        c.cur           = 0;
-        c.cut           = (size_t)old_size;
-        c.new_buf       = nb;
-        c.new_len       = (size_t)new_size;
-        rc = bstack_process_gen(bs, bstack_alloc_tail_shrink_gen, &c);
-        free(nb);
-        if (rc) goto fail_recover;
-        if (c.truncated) { result.offset = start; result.len = new_len; goto success; }
-        /* Not the tail — fall through to the in-place carve. */
-    }
-
-    /* Non-tail shrink: keep the block at the new class and free the excess tail
-     * in place as one crash-atomic carve. */
-    if (new_size < old_size) {
-        uint8_t prefix[8];
-        write_le64(prefix, ALSG_IN_USE_BIT | new_len);
-        if (alsg_commit_carve(bs, block_start, prefix, 8,
-            block_start + new_size, old_size - new_size))
-            goto fail_recover;
-        result.offset = start; result.len = new_len; goto success;
-    }
-#endif /* BSTACK_FEATURE_ATOMIC */
-
     /* Move: alloc the new class, having it read the surviving prefix straight
-     * from the old block into its claim buffer, then free the old block.
-     * Handles non-tail grow (both builds) and, without atomic, every shrink
-     * that fell through above. */
+     * from the old block into its claim buffer, then free the old block.  Reached
+     * only by a grow past the current block that is not at the tail (a shrink
+     * always fits the block, so it never moves). */
     {
         uint64_t copy_len = old_len < new_len ? old_len : new_len;
         uint64_t new_ptr;
