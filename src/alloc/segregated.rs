@@ -12,12 +12,6 @@
 //! encoded by the magic version, not per-file state — a format change bumps the
 //! magic rather than reinterpreting a stored field.
 //!
-//! The in-use overhead word records the block's **physical size** (not the
-//! caller's length, which lives in the returned handle), so a live block may be
-//! retained larger than its request needs. Excess below
-//! [`SPLIT_MIN`](SegregatedBStackAllocator::SPLIT_MIN) stays as internal slack
-//! (zero extra `BStack` writes); at or above it, the excess is carved off.
-//!
 //! Implemented: `new`/`open`, `alloc`, `dealloc`, `realloc`, and `recover`
 //! (linear-scan free-list rebuild + leak reclaim). Still pending: the background
 //! coalescer.
@@ -164,15 +158,8 @@ impl SegregatedBStackAllocator {
     const MAX_CARVE_PIECES: usize = 3;
 
     /// Minimum excess (bytes) worth reclaiming into free blocks instead of
-    /// retaining inside the live allocation. Excess below this stays as internal
-    /// slack — zero extra `BStack` writes and the block records its own larger
-    /// physical size — while excess at or above it is carved off (oversized
-    /// non-exact reuse and `atomic` shrinks).
-    ///
-    /// The on-disk format constrains none of this: a block records its physical
-    /// size under either policy, so `SPLIT_MIN` is a pure tuning dial, adjustable
-    /// later against a fragmentation-versus-calls benchmark without a format
-    /// change. Set conservatively to `LINEAR_MAX` (256 B) for the initial cut.
+    /// retaining as internal slack. Since this value does not affect on-disk
+    /// format, fine-tuning it is not a breaking change.
     const SPLIT_MIN: u64 = Self::LINEAR_MAX;
 
     /// Free-list sentinel: `0` (offset 0 is the header, never a block).
@@ -932,10 +919,6 @@ impl BStackAllocator for SegregatedBStackAllocator {
                     "double free: block is already free",
                 ));
             }
-            // The block records its own physical size; the handle's length is
-            // trusted (a retained block is deliberately larger than its request
-            // needs), so exact equality no longer holds. Reject only a length the
-            // block could never have held.
             let size = (word & !Self::IN_USE_BIT) << 4;
             if Self::phys_need(len)? > size {
                 return Err(io::Error::new(
@@ -1074,8 +1057,6 @@ impl SegregatedBStackAllocator {
                     "cannot realloc a freed block",
                 ));
             }
-            // The block records its own physical size; the handle's length is
-            // trusted, so reject only a length the block could never have held.
             let old_size = (word & !Self::IN_USE_BIT) << 4;
             if Self::phys_need(old_len)? > old_size {
                 return Err(io::Error::new(

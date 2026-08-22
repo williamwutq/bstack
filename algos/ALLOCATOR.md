@@ -472,13 +472,13 @@ The caller's length lives in the returned handle, not on disk, so a resize that
 fits the current block — or a shrink whose excess is retained — touches no
 metadata at all.
 
-| Case                                    | Strategy                                                                                                              |
-|-----------------------------------------|-----------------------------------------------------------------------------------------------------------------------|
-| Fits the block (`phys_need ≤ size`)     | retain — no metadata write; zero the newly-exposed tail on a visible grow                                             |
-| Grow past the block, at tail            | extend in place (zero-filled), then record the new physical size                                                     |
-| Shrink, excess `≥ SPLIT_MIN`            | `atomic`: drop the excess (tail `Len`+`Atrunc`, else in-place carve), recording the new size in one transaction. non-`atomic`: retain in place |
-| Shrink, excess `< SPLIT_MIN`            | retain in place — no write                                                                                            |
-| Non-tail grow past the block            | *move* — allocate the new class (reading the prefix into its claim buffer), then free the old block                  |
+| Case                                | Strategy                                                                 |
+|-------------------------------------|--------------------------------------------------------------------------|
+| Fits the block (`phys_need ≤ size`) | retain; no write (zero the new tail on grow)                             |
+| Grow past block, at tail            | extend in place, record new size                                         |
+| Shrink, excess `≥ SPLIT_MIN`        | `atomic`: drop excess (`Atrunc` or carve), one txn; non-`atomic`: retain |
+| Shrink, excess `< SPLIT_MIN`        | retain; no write                                                         |
+| Non-tail grow                       | *move*: alloc new class, copy prefix, free old                           |
 
 The **greedy carve** takes the largest class `≤` the remainder, repeated: a region
 `> 4096` becomes one oversized block; a classed region splits into ≤ 3

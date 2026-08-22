@@ -1233,13 +1233,11 @@ alloc/dealloc; 8-byte overhead tag per block.  Single `new(stack)` constructor
 (runs recovery automatically).  Without `atomic`: `Send` only.  With `atomic`:
 `Send + Sync`, no allocator-level lock.
 
-> **Experimental.**  The on-disk format and API are not yet stable — the in-use
-> overhead records the block's physical size (excess below `SPLIT_MIN` retained
-> as slack).  Some resize paths differ between the `atomic` and non-`atomic`
-> builds (a shrink reclaims its freed excess only under `atomic`; the non-`atomic`
-> build retains it in place), and the background coalescer and deep in-use-leak GC
-> are not yet implemented.  See [`algos/ALLOCATOR.md`](algos/ALLOCATOR.md) for the
-> full design.
+> **Experimental.**  The on-disk format and API are not yet stable — some resize
+> paths differ between the `atomic` and non-`atomic` builds (a shrink reclaims its
+> freed excess only under `atomic`; the non-`atomic` build retains it in place),
+> and the background coalescer and deep in-use-leak GC are not yet implemented.
+> See [`algos/ALLOCATOR.md`](algos/ALLOCATOR.md) for the full design.
 
 ### `DebugCheckingAllocator` (`alloc`)
 
