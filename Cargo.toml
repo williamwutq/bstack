@@ -101,5 +101,10 @@ name = "alloc"
 harness = false
 required-features = ["alloc", "set", "atomic"]
 
+[[bench]]
+name = "alloc_non_atomic"
+harness = false
+required-features = ["alloc", "set"]
+
 [package.metadata.docs.rs]
 all-features = true
