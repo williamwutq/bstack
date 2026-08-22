@@ -428,16 +428,18 @@ round_up(len + 8, 16)`; `class_blocksize(need)` snaps up to the enclosing class;
 
 ```text
 offset  0  reserved (user)                24 B
-offset 24  magic  "ALSG\x00\x01\x00\x00"   8 B
+offset 24  magic  "ALSG\x00\x02\x00\x00"   8 B
 offset 32  _reserved                       8 B
 offset 40  free_head[33] : u64           264 B   # last entry = oversized list
 offset 304 arena start (16-B aligned)
 ```
 
 Each block is `[ overhead(8) | data(block − 8) ]`; the caller pointer is the data
-start (`block_start + 8`, always `16n + 8`). The overhead is one tagged word:
-**high bit set ⇒ in use**, low 63 bits = the caller's exact length; **high bit
-clear ⇒ free**, low 63 bits = physical size `>> 4` (also the class tag). A free
+start (`block_start + 8`, always `16n + 8`). The overhead is one tagged word
+carrying the **physical block size `>> 4`** (also the class tag) in its low 63
+bits under **both** tags: **high bit set ⇒ in use**, **high bit clear ⇒ free**.
+The caller's visible length is *not* stored on disk — it lives in the returned
+handle — so a live block may be physically larger than its request needs. A free
 block stores `next_free` inline at the data start; live blocks carry no overhead
 beyond the word.
 
@@ -447,26 +449,36 @@ beyond the word.
 2. **Classed** (`≤ 4096`): pop the class head, claiming the block by writing
    overhead and any copied prefix as one buffer; on a miss, grow a zero-filled
    block at the tail with one sparse `extend`.
-3. **Oversized** (`> 4096`): pop the head if its stored size is `≥ need`. If
-   exact, claim it; else claim `block` bytes and carve the excess into ≤ 3 class
-   free blocks. On a miss, extend.
+3. **Oversized** (`> 4096`): pop the head if its stored size is `≥ need`. If the
+   excess (`actual − block`) is below `SPLIT_MIN`, claim the **whole** popped
+   block in one write, recording its full size; otherwise claim `block` bytes and
+   carve the excess into ≤ 3 class free blocks. On a miss, extend.
+
+`SPLIT_MIN` (minimum excess worth reclaiming vs. retaining as slack) is a tuning
+dial, not a format constraint — a block records its own size either way. Initially
+`LINEAR_MAX` = 256 B.
 
 ### Deallocation policy
 
-Read the overhead at `ptr − 8`; reject a clear high bit (double-free) or a stored
-length disagreeing with the freed slice (partial free). An oversized block at the
-tail is `discard`ed back to the stack; every other block is spliced onto its
+Read the overhead at `ptr − 8`; reject a clear high bit (double-free). The block's
+physical size comes straight from the word; the handle's length is trusted
+(rejecting only a length too large to have fit the block). An oversized block at
+the tail is `discard`ed back to the stack; every other block is spliced onto its
 class head.
 
 ### Realloc
 
-| Case            | Strategy                                                                                                 |
-|-----------------|----------------------------------------------------------------------------------------------------------|
-| Same class      | rewrite the overhead length; zero the grown tail on grow                                                 |
-| Grow at tail    | extend in place (zero-filled), then rewrite the length                                                   |
-| Shrink at tail  | rewrite the length, then discard the excess tail in place                                                |
-| Non-tail shrink | `atomic`: rewrite length + greedy-carve the freed tail as one in-place transaction. non-`atomic`: *move* |
-| Non-tail grow   | *move* — allocate the new class (reading the prefix into its claim buffer), then free the old block      |
+The caller's length lives in the returned handle, not on disk, so a resize that
+fits the current block — or a shrink whose excess is retained — touches no
+metadata at all.
+
+| Case                                | Strategy                                                                 |
+|-------------------------------------|--------------------------------------------------------------------------|
+| Fits the block (`phys_need ≤ size`) | retain; no write (zero the new tail on grow)                             |
+| Grow past block, at tail            | extend in place, record new size                                         |
+| Shrink, excess `≥ SPLIT_MIN`        | `atomic`: drop excess (`Atrunc` or carve), one txn; non-`atomic`: retain |
+| Shrink, excess `< SPLIT_MIN`        | retain; no write                                                         |
+| Non-tail grow                       | *move*: alloc new class, copy prefix, free old                           |
 
 The **greedy carve** takes the largest class `≤` the remainder, repeated: a region
 `> 4096` becomes one oversized block; a classed region splits into ≤ 3
@@ -479,15 +491,19 @@ Every path either commits atomically or leaves an orphaned-but-recoverable block
 * **With `atomic`**: pops use `BStack::process_gen`; pushes and the in-place
   non-tail carve use `BStack::inplace_gen` (multiple writes, one journalled
   commit); tail grow/shrink use `try_extend_zeros` / `try_discard`.
-* **Without `atomic`**: plain read-then-write / `len`-check-then-`extend`/`discard`
-  (each one durable write). The in-place non-tail carve is not fault-safe, so
-  non-tail shrink uses the *move*, and the oversized-reuse carve writes all freed
-  pieces first and the claiming header last.
+* **Without `atomic`**: plain read-then-write / `len`-check-then-`extend`
+  (each one durable write). A shrink's freed tail overlaps still-live caller
+  bytes and cannot be dropped fault-safely without a transaction, so a shrink
+  simply **retains** the excess in place (zero writes); the oversized-reuse carve
+  (over free excess only) writes all freed pieces first and the claiming header
+  last.
 
 `recover()` rebuilds every free list with one linear scan of the overhead words:
-a live block is strided by its class size; a free block is relinked onto
-`head[classify(size)]` (reclaiming leaked blocks); a fully-zeroed tail is
-discarded. The rebuilt head table is published as one crash-atomic contiguous
+a live block is strided by its **recorded physical size** (no length-to-class
+derivation); a free block is relinked onto the head of the largest class `≤ size`
+(`classify(largest_class_le(size))`, or the oversized head above 4096), which
+reclaims leaked blocks and degrades a malformed non-class size to a leak rather
+than a head that would overrun the block; a fully-zeroed tail is discarded. The rebuilt head table is published as one crash-atomic contiguous
 write. The scan trusts only the overhead words and is idempotent. In-use orphans
 (e.g. the old block of a crashed *move*) are left live; a deep GC to reclaim them
 is future work. `recover` requires a quiescent allocator and is `unsafe`; `new`
