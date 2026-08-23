@@ -4699,6 +4699,28 @@ mod alloc_tests {
         }
     }
 
+    // 34. Records wider than the sort/select budget (8192 > 6144) must not
+    //     overflow the pivot-sample buffer; selection still works out-of-core.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn chunk_select_nth_partial_by_record_wider_than_budget() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let keys: Vec<u16> = [4u16, 1, 3, 0, 2].to_vec();
+        let mut sorted = keys.clone();
+        sorted.sort_unstable();
+        let data = keyed_records(&keys, 8192); // 8192 > budget (6144)
+        let mut s = alloc.alloc(data.len() as u64).unwrap();
+        s.as_slice_mut().write(&data).unwrap();
+        let (mut view, _rem) = s.as_slice().chunks(8192);
+        view.select_nth_partial_by(2, |a, b| {
+            u16::from_le_bytes([a[0], a[1]]).cmp(&u16::from_le_bytes([b[0], b[1]]))
+        })
+        .unwrap();
+        let got = read_keys(&s.as_slice().read().unwrap(), 8192, 5);
+        assert_selected(&got, 2, &sorted);
+    }
+
     // ── Foreign handles ───────────────────────────────────────────────────
 
     #[test]

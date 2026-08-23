@@ -898,8 +898,11 @@ fn upper_bound(
 ///
 /// Iterative, not recursive: the deferred half of each split is pushed onto
 /// `stack` (cleared on entry, reused across calls) and the smaller half is
-/// continued in place, so `stack` never holds more than `O(log(hi - lo))`
-/// entries and there is no call-stack recursion to overflow.
+/// continued in place. Since the two halves partition the range exactly
+/// (`l_size + r_size = hi - lo`), the continued half is always `<= (hi - lo) / 2`,
+/// so `stack` holds at most `⌈log2(hi - lo)⌉` entries — at most 63 for any region
+/// a u64-addressed file can hold (`hi - lo <= count <= 2^63`). There is no
+/// call-stack recursion to overflow.
 #[cfg(all(feature = "set", feature = "atomic"))]
 #[allow(clippy::too_many_arguments)]
 fn imerge(
@@ -998,6 +1001,11 @@ fn merge_sort(
     let run0 = SORT_WINDOWS * k;
     let mut bi = vec![0u8; cu];
     let mut bj = vec![0u8; cu];
+    // Reused `imerge` work stack of deferred (larger) halves. Its depth is
+    // bounded — ⌈log2(hi - lo)⌉ entries, at most 63 for any region a u64-addressed
+    // file can hold (`count <= region_bytes <= 2^63`). Even at that bound a fixed
+    // `[(u64, u64, u64); 64]` is ~1.5 KiB — too large to want on the call stack —
+    // so this is a lazily-allocated heap `Vec`, reused across every merge.
     let mut stack: Vec<(u64, u64, u64)> = Vec::new();
     // Phase 1: run formation — sort each `run0`-record window.
     let mut p = 0u64;
@@ -1048,7 +1056,9 @@ fn merge_sort(
 
 /// Choose a pivot record index in `[lo, hi)`: read a strided sample into
 /// `samp` (a budget-sized scratch buffer) and return the index of its median.
+/// `order` is a caller-owned scratch index vector, reused across rounds.
 #[cfg(all(feature = "set", feature = "atomic"))]
+#[allow(clippy::too_many_arguments)]
 fn sample_pivot_index(
     aligned: &BStackSlice<'_>,
     c: u64,
@@ -1056,6 +1066,7 @@ fn sample_pivot_index(
     lo: u64,
     hi: u64,
     samp: &mut [u8],
+    order: &mut Vec<usize>,
     cmp: &mut dyn FnMut(&[u8], &[u8]) -> Ordering,
 ) -> io::Result<u64> {
     let range = hi - lo;
@@ -1071,7 +1082,8 @@ fn sample_pivot_index(
             &mut samp[(t as usize) * cu..(t as usize + 1) * cu],
         )?;
     }
-    let mut order: Vec<usize> = (0..s as usize).collect();
+    order.clear();
+    order.extend(0..s as usize);
     order.sort_by(|&a, &b| cmp(&samp[a * cu..(a + 1) * cu], &samp[b * cu..(b + 1) * cu]));
     let med = order[order.len() / 2] as u64;
     Ok(lo + stride * med)
@@ -1142,9 +1154,12 @@ fn select_nth(
     }
     let cu = c as usize;
     let budget = SORT_WINDOWS * SORT_BLOCK_BYTES;
-    let mut samp = vec![0u8; budget as usize];
+    // Sized to hold at least one record even when a record exceeds the budget
+    // (`chunk_len > budget`), so the pivot sample can always read one in.
+    let mut samp = vec![0u8; (budget as usize).max(cu)];
     let mut pbuf = vec![0u8; cu];
     let mut one = vec![0u8; cu];
+    let mut order: Vec<usize> = Vec::new(); // reused pivot-sample scratch
     let mut lo = 0u64;
     let mut hi = count;
     loop {
@@ -1167,7 +1182,7 @@ fn select_nth(
                 apply_chunk_permutation(buf, cu, &order);
             });
         }
-        let piv_idx = sample_pivot_index(aligned, c, cu, lo, hi, &mut samp, cmp)?;
+        let piv_idx = sample_pivot_index(aligned, c, cu, lo, hi, &mut samp, &mut order, cmp)?;
         let p = partition_select(aligned, c, lo, hi, piv_idx, &mut pbuf, &mut one, cmp)?;
         // Recurse into the side holding `n`, excluding the fixed pivot at `p`
         // (strict progress → termination).
