@@ -1359,6 +1359,181 @@ static int test_extend_persists_across_reopen(void)
     return 0;
 }
 
+/* =========================================================================
+ * bstack_extend_sparse / bstack_extend_sparse_batched
+ * ====================================================================== */
+
+static int test_extend_sparse_writes_prefix_and_zeros_rest(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"abc", 3, NULL) == 0);
+    uint64_t off;
+    CHECK(bstack_extend_sparse(bs, (uint8_t *)"XY", 2, 6, &off) == 0);
+    CHECK(off == 3);
+
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 9);
+    uint8_t buf[9]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(w == 9);
+    CHECK(memcmp(buf, "abcXY\x00\x00\x00\x00", 9) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_extend_sparse_empty_buf_is_pure_extend(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"ab", 2, NULL) == 0);
+    uint64_t off;
+    CHECK(bstack_extend_sparse(bs, NULL, 0, 4, &off) == 0);
+    CHECK(off == 2);
+
+    uint8_t buf[6]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(memcmp(buf, "ab\x00\x00\x00\x00", 6) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_extend_sparse_zero_length_is_noop(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"data", 4, NULL) == 0);
+    uint64_t off;
+    CHECK(bstack_extend_sparse(bs, NULL, 0, 0, &off) == 0);
+    CHECK(off == 4);
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 4);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_extend_sparse_buf_longer_than_length_errors(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    errno = 0;
+    CHECK(bstack_extend_sparse(bs, (uint8_t *)"toolong", 7, 3, NULL) == -1);
+    CHECK(errno == EINVAL);
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_extend_sparse_batched_scatters_buffers(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"..", 2, NULL) == 0);
+    bstack_iovec_t writes[2] = {
+        { 0, (uint8_t *)"AA", 2 },
+        { 5, (uint8_t *)"BB", 2 },
+    };
+    uint64_t off;
+    CHECK(bstack_extend_sparse_batched(bs, writes, 2, 8, &off) == 0);
+    CHECK(off == 2);
+
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 10);
+    uint8_t buf[10]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(memcmp(buf, "..AA\x00\x00\x00" "BB" "\x00", 10) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_extend_sparse_batched_empty_is_pure_extend(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    uint64_t off;
+    CHECK(bstack_extend_sparse_batched(bs, NULL, 0, 4, &off) == 0);
+    CHECK(off == 0);
+    uint8_t buf[4]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(memcmp(buf, "\x00\x00\x00\x00", 4) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_extend_sparse_batched_overlap_errors(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    bstack_iovec_t writes[2] = {
+        { 0, (uint8_t *)"aaa", 3 },
+        { 2, (uint8_t *)"bb", 2 },
+    };
+    errno = 0;
+    CHECK(bstack_extend_sparse_batched(bs, writes, 2, 8, NULL) == -1);
+    CHECK(errno == EINVAL);
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_extend_sparse_batched_out_of_range_errors(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    bstack_iovec_t writes[1] = { { 3, (uint8_t *)"zzz", 3 } };
+    errno = 0;
+    CHECK(bstack_extend_sparse_batched(bs, writes, 1, 5, NULL) == -1);
+    CHECK(errno == EINVAL);
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_extend_sparse_persists_across_reopen(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+
+    {
+        bstack_t *bs = bstack_open(tmp);
+        CHECK(bs != NULL);
+        CHECK(bstack_push(bs, (uint8_t *)"hi", 2, NULL) == 0);
+        CHECK(bstack_extend_sparse(bs, (uint8_t *)"Z", 1, 4, NULL) == 0);
+        bstack_close(bs);
+    }
+    {
+        bstack_t *bs = bstack_open(tmp);
+        CHECK(bs != NULL);
+        uint8_t buf[6]; size_t w;
+        CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+        CHECK(memcmp(buf, "hiZ\x00\x00\x00", 6) == 0);
+        bstack_close(bs);
+    }
+
+    unlink(tmp);
+    return 0;
+}
+
 #ifdef BSTACK_FEATURE_SET
 
 /* =========================================================================
@@ -1875,6 +2050,146 @@ static int test_try_extend_persists_across_reopen(void)
     }
 
     unlink(tmp);
+    return 0;
+}
+
+/* ---- bstack_try_extend_sparse --------------------------------------------- */
+
+static int test_try_extend_sparse_matching_writes(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"hello", 5, NULL) == 0);
+    int ok = -1;
+    CHECK(bstack_try_extend_sparse(bs, 5, (uint8_t *)"XY", 2, 6, &ok) == 0);
+    CHECK(ok == 1);
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 11);
+    uint8_t buf[11]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(memcmp(buf, "helloXY\x00\x00\x00\x00", 11) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_try_extend_sparse_mismatching_returns_false(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"hello", 5, NULL) == 0);
+    int ok = -1;
+    CHECK(bstack_try_extend_sparse(bs, 3, (uint8_t *)"XY", 2, 6, &ok) == 0);
+    CHECK(ok == 0);
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 5);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_try_extend_sparse_malformed_errors_even_on_mismatch(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"hello", 5, NULL) == 0);
+    /* Size does not match (3 != 5), but the malformed request still errors. */
+    errno = 0;
+    CHECK(bstack_try_extend_sparse(bs, 3, (uint8_t *)"toolong", 7, 2, NULL) == -1);
+    CHECK(errno == EINVAL);
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 5);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_try_extend_sparse_persists_across_reopen(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+
+    {
+        bstack_t *bs = bstack_open(tmp);
+        CHECK(bs != NULL);
+        CHECK(bstack_push(bs, (uint8_t *)"hi", 2, NULL) == 0);
+        int ok = -1;
+        CHECK(bstack_try_extend_sparse(bs, 2, (uint8_t *)"Z", 1, 4, &ok) == 0);
+        CHECK(ok == 1);
+        bstack_close(bs);
+    }
+    {
+        bstack_t *bs = bstack_open(tmp);
+        CHECK(bs != NULL);
+        uint8_t buf[6]; size_t w;
+        CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+        CHECK(memcmp(buf, "hiZ\x00\x00\x00", 6) == 0);
+        bstack_close(bs);
+    }
+
+    unlink(tmp);
+    return 0;
+}
+
+static int test_try_extend_sparse_batched_matching_scatters(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"..", 2, NULL) == 0);
+    bstack_iovec_t writes[2] = {
+        { 0, (uint8_t *)"AA", 2 },
+        { 5, (uint8_t *)"BB", 2 },
+    };
+    int ok = -1;
+    CHECK(bstack_try_extend_sparse_batched(bs, 2, writes, 2, 8, &ok) == 0);
+    CHECK(ok == 1);
+    uint8_t buf[10]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(memcmp(buf, "..AA\x00\x00\x00" "BB" "\x00", 10) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_try_extend_sparse_batched_mismatching_returns_false(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"..", 2, NULL) == 0);
+    bstack_iovec_t writes[1] = { { 0, (uint8_t *)"AA", 2 } };
+    int ok = -1;
+    CHECK(bstack_try_extend_sparse_batched(bs, 99, writes, 1, 8, &ok) == 0);
+    CHECK(ok == 0);
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 2);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_try_extend_sparse_batched_overlap_errors_even_on_mismatch(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"..", 2, NULL) == 0);
+    bstack_iovec_t writes[2] = {
+        { 0, (uint8_t *)"aaa", 3 },
+        { 2, (uint8_t *)"bb", 2 },
+    };
+    /* Size does not match (99 != 2), but the malformed batch still errors. */
+    errno = 0;
+    CHECK(bstack_try_extend_sparse_batched(bs, 99, writes, 2, 8, NULL) == -1);
+    CHECK(errno == EINVAL);
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 2);
+
+    bstack_close(bs); unlink(tmp);
     return 0;
 }
 
@@ -4278,6 +4593,17 @@ int main(void)
     T(test_extend_zero_is_noop);
     T(test_extend_persists_across_reopen);
 
+    /* bstack_extend_sparse / bstack_extend_sparse_batched */
+    T(test_extend_sparse_writes_prefix_and_zeros_rest);
+    T(test_extend_sparse_empty_buf_is_pure_extend);
+    T(test_extend_sparse_zero_length_is_noop);
+    T(test_extend_sparse_buf_longer_than_length_errors);
+    T(test_extend_sparse_batched_scatters_buffers);
+    T(test_extend_sparse_batched_empty_is_pure_extend);
+    T(test_extend_sparse_batched_overlap_errors);
+    T(test_extend_sparse_batched_out_of_range_errors);
+    T(test_extend_sparse_persists_across_reopen);
+
     /* bstack_lock_up_to / bstack_locked_len / bstack_open_locked_up_to */
     T(test_locked_len_is_zero_by_default);
     T(test_lock_up_to_sets_boundary);
@@ -4350,6 +4676,15 @@ int main(void)
     T(test_try_extend_mismatching_returns_false);
     T(test_try_extend_empty_buf_matching);
     T(test_try_extend_persists_across_reopen);
+
+    /* bstack_try_extend_sparse / bstack_try_extend_sparse_batched */
+    T(test_try_extend_sparse_matching_writes);
+    T(test_try_extend_sparse_mismatching_returns_false);
+    T(test_try_extend_sparse_malformed_errors_even_on_mismatch);
+    T(test_try_extend_sparse_persists_across_reopen);
+    T(test_try_extend_sparse_batched_matching_scatters);
+    T(test_try_extend_sparse_batched_mismatching_returns_false);
+    T(test_try_extend_sparse_batched_overlap_errors_even_on_mismatch);
 
     /* bstack_try_discard */
     T(test_try_discard_matching_returns_true);

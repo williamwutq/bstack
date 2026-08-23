@@ -970,6 +970,210 @@ fail_unlock:
 }
 
 /* -------------------------------------------------------------------------
+ * Sparse-extend helpers
+ *
+ * Shared by bstack_extend_sparse[_batched] and their try_ variants.
+ * ---------------------------------------------------------------------- */
+
+/* qsort comparator: order iovec descriptors by ascending offset. */
+static int cmp_iovec_offset(const void *pa, const void *pb)
+{
+    uint64_t a = ((const bstack_iovec_t *)pa)->offset;
+    uint64_t b = ((const bstack_iovec_t *)pb)->offset;
+    return (a < b) ? -1 : (a > b) ? 1 : 0;
+}
+
+/* Validate and compact a batch of sparse-extend blocks against a declared
+ * extension of length bytes. Drops empty (len == 0) entries in place, then
+ * rejects any block whose [offset, offset + len) overflows uint64_t or runs past
+ * length, sorts the survivors by offset, and rejects any overlapping pair. The
+ * compacted, sorted count is written to *out_n on success. Returns 0, or -1 with
+ * errno = EINVAL on a validation failure. w is modified in place. */
+static int validate_sparse_blocks(bstack_iovec_t *w, size_t count,
+                                  uint64_t length, size_t *out_n)
+{
+    size_t n = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (w[i].len != 0)
+            w[n++] = w[i];
+    }
+    for (size_t i = 0; i < n; i++) {
+        if ((uint64_t)w[i].len > UINT64_MAX - w[i].offset) { errno = EINVAL; return -1; }
+        uint64_t end = w[i].offset + (uint64_t)w[i].len;
+        if (end > length) { errno = EINVAL; return -1; }
+    }
+    qsort(w, n, sizeof(bstack_iovec_t), cmp_iovec_offset);
+    for (size_t i = 0; i + 1 < n; i++) {
+        uint64_t a_end = w[i].offset + (uint64_t)w[i].len;
+        if (a_end > w[i + 1].offset) { errno = EINVAL; return -1; }
+    }
+    *out_n = n;
+    return 0;
+}
+
+/* Commit a sparse payload growth to new_len (== logical_offset + length): extend
+ * the file with one ftruncate (the OS zero-fills the new space), write each block
+ * into the grown region, then commit the header length and durable-sync. blocks[]
+ * holds (relative offset, source buf, len) with offsets measured from
+ * logical_offset; callers guarantee each block fits within [logical_offset,
+ * new_len) and blocks do not overlap. raw_size (== HEADER_SIZE + logical_offset)
+ * is the pre-op file size, the rollback anchor.
+ *
+ * No journal is needed: the whole grown region sits beyond clen, so a crash
+ * before the header commit rolls back by truncation, exactly like bstack_push. On
+ * failure the file is rolled back (best effort) to raw_size and the cache/header
+ * reset to logical_offset before returning -1 (the triggering errno preserved). */
+static int commit_sparse_extend(bstack_t *bs, uint64_t logical_offset,
+                                uint64_t raw_size, uint64_t new_len,
+                                const bstack_iovec_t *blocks, size_t n_blocks)
+{
+    if (plat_ftruncate(bs->fd, HEADER_SIZE + new_len) != 0)
+        return -1;
+    for (size_t i = 0; i < n_blocks; i++) {
+        if (plat_pwrite(bs->fd, blocks[i].buf, blocks[i].len,
+                        HEADER_SIZE + logical_offset + blocks[i].offset) != 0) {
+            int saved = errno;
+            plat_ftruncate(bs->fd, raw_size);
+            errno = saved;
+            return -1;
+        }
+    }
+    if (write_committed_len(bs->fd, &bs->clen, new_len) != 0 ||
+        plat_durable_sync(bs->fd) != 0)
+    {
+        /* Rollback: truncate away the growth and reset the committed length. The
+         * cache is reset up front so it reflects the rolled-back file even if the
+         * best-effort header rewrite below fails. */
+        int saved = errno;
+        plat_ftruncate(bs->fd, raw_size);
+        bs->clen = logical_offset;
+        write_committed_len(bs->fd, &bs->clen, logical_offset);
+        plat_durable_sync(bs->fd);
+        errno = saved;
+        return -1;
+    }
+    return 0;
+}
+
+/* -------------------------------------------------------------------------
+ * bstack_extend_sparse
+ * ---------------------------------------------------------------------- */
+
+int bstack_extend_sparse(bstack_t *bs, const uint8_t *buf, size_t buf_len,
+                         uint64_t length, uint64_t *out_offset)
+{
+    if ((uint64_t)buf_len > length) { errno = EINVAL; return -1; }
+
+    BS_WRLOCK(bs);
+
+    uint64_t raw_size;
+    if (file_size(bs->fd, &raw_size) != 0)
+        goto fail_unlock;
+
+    uint64_t logical_offset = raw_size - HEADER_SIZE;
+
+    if (length == 0) {
+        BS_WRUNLOCK(bs);
+        if (out_offset)
+            *out_offset = logical_offset;
+        return 0;
+    }
+    if (length > UINT64_MAX - logical_offset) {
+        BS_WRUNLOCK(bs); errno = EINVAL; return -1;
+    }
+    uint64_t new_len = logical_offset + length;
+
+    /* Single block at the start; empty buf means a pure sparse extend. */
+    bstack_iovec_t one;
+    size_t n_blocks = 0;
+    if (buf_len != 0) {
+        one.offset = 0;
+        one.buf    = (uint8_t *)(uintptr_t)buf;
+        one.len    = buf_len;
+        n_blocks   = 1;
+    }
+    if (commit_sparse_extend(bs, logical_offset, raw_size, new_len,
+                             n_blocks ? &one : NULL, n_blocks) != 0)
+        goto fail_unlock;
+
+    BS_WRUNLOCK(bs);
+    if (out_offset)
+        *out_offset = logical_offset;
+    return 0;
+
+fail_unlock:
+    {
+        int saved = errno;
+        BS_WRUNLOCK(bs);
+        errno = saved;
+    }
+    return -1;
+}
+
+/* -------------------------------------------------------------------------
+ * bstack_extend_sparse_batched
+ * ---------------------------------------------------------------------- */
+
+int bstack_extend_sparse_batched(bstack_t *bs,
+                                 const bstack_iovec_t *writes, size_t count,
+                                 uint64_t length, uint64_t *out_offset)
+{
+    /* Materialise into a working array so it can be compacted, sorted, and
+     * validated (before the lock). */
+    bstack_iovec_t *w = NULL;
+    size_t n = 0;
+    if (count != 0) {
+        if (writes == NULL) { errno = EINVAL; return -1; }
+        if (count > SIZE_MAX / sizeof(bstack_iovec_t)) { errno = EINVAL; return -1; }
+        w = malloc(count * sizeof(bstack_iovec_t));
+        if (!w) return -1;
+        memcpy(w, writes, count * sizeof(bstack_iovec_t));
+        if (validate_sparse_blocks(w, count, length, &n) != 0) {
+            int saved = errno; free(w); errno = saved; return -1;
+        }
+    }
+
+    BS_WRLOCK(bs);
+
+    uint64_t raw_size;
+    if (file_size(bs->fd, &raw_size) != 0)
+        goto fail;
+
+    uint64_t logical_offset = raw_size - HEADER_SIZE;
+
+    if (length == 0) {
+        /* Every block was validated to fit within [0, 0), so n == 0. */
+        BS_WRUNLOCK(bs);
+        free(w);
+        if (out_offset)
+            *out_offset = logical_offset;
+        return 0;
+    }
+    if (length > UINT64_MAX - logical_offset) {
+        BS_WRUNLOCK(bs); free(w); errno = EINVAL; return -1;
+    }
+    uint64_t new_len = logical_offset + length;
+
+    if (commit_sparse_extend(bs, logical_offset, raw_size, new_len, w, n) != 0)
+        goto fail;
+
+    BS_WRUNLOCK(bs);
+    free(w);
+    if (out_offset)
+        *out_offset = logical_offset;
+    return 0;
+
+fail:
+    {
+        int saved = errno;
+        BS_WRUNLOCK(bs);
+        errno = saved;
+    }
+    free(w);
+    return -1;
+}
+
+/* -------------------------------------------------------------------------
  * bstack_len
  * ---------------------------------------------------------------------- */
 
@@ -1635,6 +1839,110 @@ int bstack_try_extend_zeros(bstack_t *bs, uint64_t s, size_t n, int *ok)
 
 fail_unlock:
     { int sv = errno; BS_WRUNLOCK(bs); errno = sv; }
+    return -1;
+}
+
+int bstack_try_extend_sparse(bstack_t *bs, uint64_t s,
+                             const uint8_t *buf, size_t buf_len,
+                             uint64_t length, int *ok)
+{
+    /* Reject a malformed request before the lock, regardless of the size guard. */
+    if ((uint64_t)buf_len > length) { errno = EINVAL; return -1; }
+
+    BS_WRLOCK(bs);
+
+    uint64_t raw_size;
+    if (file_size(bs->fd, &raw_size) != 0)
+        goto fail_unlock;
+
+    uint64_t data_size = raw_size - HEADER_SIZE;
+    if (data_size != s) {
+        BS_WRUNLOCK(bs);
+        if (ok) *ok = 0;
+        return 0;
+    }
+    if (length == 0) {
+        BS_WRUNLOCK(bs);
+        if (ok) *ok = 1;
+        return 0;
+    }
+    if (length > UINT64_MAX - data_size) {
+        BS_WRUNLOCK(bs); errno = EINVAL; return -1;
+    }
+    uint64_t new_len = data_size + length;
+
+    bstack_iovec_t one;
+    size_t n_blocks = 0;
+    if (buf_len != 0) {
+        one.offset = 0;
+        one.buf    = (uint8_t *)(uintptr_t)buf;
+        one.len    = buf_len;
+        n_blocks   = 1;
+    }
+    if (commit_sparse_extend(bs, data_size, raw_size, new_len,
+                             n_blocks ? &one : NULL, n_blocks) != 0)
+        goto fail_unlock;
+
+    BS_WRUNLOCK(bs);
+    if (ok) *ok = 1;
+    return 0;
+
+fail_unlock:
+    { int sv = errno; BS_WRUNLOCK(bs); errno = sv; }
+    return -1;
+}
+
+int bstack_try_extend_sparse_batched(bstack_t *bs, uint64_t s,
+                                     const bstack_iovec_t *writes, size_t count,
+                                     uint64_t length, int *ok)
+{
+    /* Validate the batch up front (before the lock and the size guard), so a
+     * malformed request always surfaces rather than being masked by a mismatch. */
+    bstack_iovec_t *w = NULL;
+    size_t n = 0;
+    if (count != 0) {
+        if (writes == NULL) { errno = EINVAL; return -1; }
+        if (count > SIZE_MAX / sizeof(bstack_iovec_t)) { errno = EINVAL; return -1; }
+        w = malloc(count * sizeof(bstack_iovec_t));
+        if (!w) return -1;
+        memcpy(w, writes, count * sizeof(bstack_iovec_t));
+        if (validate_sparse_blocks(w, count, length, &n) != 0) {
+            int saved = errno; free(w); errno = saved; return -1;
+        }
+    }
+
+    BS_WRLOCK(bs);
+
+    uint64_t raw_size;
+    if (file_size(bs->fd, &raw_size) != 0)
+        goto fail;
+
+    uint64_t data_size = raw_size - HEADER_SIZE;
+    if (data_size != s) {
+        BS_WRUNLOCK(bs); free(w);
+        if (ok) *ok = 0;
+        return 0;
+    }
+    if (length == 0) {
+        BS_WRUNLOCK(bs); free(w);
+        if (ok) *ok = 1;
+        return 0;
+    }
+    if (length > UINT64_MAX - data_size) {
+        BS_WRUNLOCK(bs); free(w); errno = EINVAL; return -1;
+    }
+    uint64_t new_len = data_size + length;
+
+    if (commit_sparse_extend(bs, data_size, raw_size, new_len, w, n) != 0)
+        goto fail;
+
+    BS_WRUNLOCK(bs); free(w);
+    if (ok) *ok = 1;
+    return 0;
+
+fail:
+    { int sv = errno; BS_WRUNLOCK(bs); errno = sv; }
+    free(w);
     return -1;
 }
 
