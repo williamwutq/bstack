@@ -259,6 +259,138 @@ impl<'a, A: BStackAllocator> BStackSlice<'a, A> {
         }
     }
 
+    /// Split into two sub-views at `mid`, relative to this slice's start.
+    ///
+    /// Equivalent to `(self.subslice(0, mid), self.subslice(mid, self.len()))`,
+    /// following `std` slice naming.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `mid > self.len()`.
+    #[inline]
+    #[track_caller]
+    pub fn split_at(&self, mid: u64) -> (BStackSlice<'a, A>, BStackSlice<'a, A>) {
+        assert!(mid <= self.len(), "split_at: mid must be <= slice length");
+        (self.subslice(0, mid), self.subslice(mid, self.len()))
+    }
+
+    /// Split into two independent sub-views at `mid`, relative to this slice's
+    /// start.
+    ///
+    /// The returned slices are independent — like [`subslice`](Self::subslice),
+    /// they carry the original `&'a A` allocator lifetime rather than borrowing
+    /// from `self`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `mid > self.len()`.
+    #[inline]
+    #[track_caller]
+    pub fn split_at_mut(&mut self, mid: u64) -> (BStackSlice<'a, A>, BStackSlice<'a, A>) {
+        assert!(
+            mid <= self.len(),
+            "split_at_mut: mid must be <= slice length"
+        );
+        (self.subslice(0, mid), self.subslice(mid, self.len()))
+    }
+
+    /// Return a sub-view of the first `n` bytes.
+    ///
+    /// The returned slice has length `min(n, self.len())`.
+    #[inline]
+    #[must_use]
+    pub fn head(&self, n: u64) -> BStackSlice<'a, A> {
+        let n = n.min(self.len());
+        self.subslice(0, n)
+    }
+
+    /// Return a sub-view of the last `n` bytes.
+    ///
+    /// The returned slice has length `min(n, self.len())`.
+    #[inline]
+    #[must_use]
+    pub fn tail(&self, n: u64) -> BStackSlice<'a, A> {
+        let n = n.min(self.len());
+        self.subslice(self.len() - n, self.len())
+    }
+
+    /// Read the byte at `index`, or `None` if out of bounds.
+    #[inline]
+    pub fn get(&self, index: u64) -> io::Result<Option<u8>> {
+        if index >= self.len() {
+            return Ok(None);
+        }
+        let mut buf = [0u8; 1];
+        self.stack().get_into(self.start() + index, &mut buf)?;
+        Ok(Some(buf[0]))
+    }
+
+    /// Returns `true` if the slice contains `needle`.
+    #[inline]
+    pub fn contains(&self, needle: u8) -> io::Result<bool> {
+        Ok(self.read()?.contains(&needle))
+    }
+
+    /// Returns `true` if the slice begins with `prefix`.
+    pub fn starts_with(&self, prefix: &[u8]) -> io::Result<bool> {
+        let n = prefix.len() as u64;
+        if n > self.len() {
+            return Ok(false);
+        }
+        Ok(self.head(n).read()? == prefix)
+    }
+
+    /// Returns `true` if the slice ends with `suffix`.
+    pub fn ends_with(&self, suffix: &[u8]) -> io::Result<bool> {
+        let n = suffix.len() as u64;
+        if n > self.len() {
+            return Ok(false);
+        }
+        Ok(self.tail(n).read()? == suffix)
+    }
+
+    /// Returns the index of the first occurrence of `needle`, or `None` if not
+    /// found.
+    #[inline]
+    pub fn find(&self, needle: u8) -> io::Result<Option<u64>> {
+        Ok(self
+            .read()?
+            .iter()
+            .position(|&b| b == needle)
+            .map(|i| i as u64))
+    }
+
+    /// Returns the index of the last occurrence of `needle`, or `None` if not
+    /// found.
+    #[inline]
+    pub fn rfind(&self, needle: u8) -> io::Result<Option<u64>> {
+        Ok(self
+            .read()?
+            .iter()
+            .rposition(|&b| b == needle)
+            .map(|i| i as u64))
+    }
+
+    /// Returns the index of the first byte satisfying `predicate`, or `None`.
+    #[inline]
+    pub fn position(&self, predicate: impl Fn(u8) -> bool) -> io::Result<Option<u64>> {
+        Ok(self
+            .read()?
+            .iter()
+            .position(|&b| predicate(b))
+            .map(|i| i as u64))
+    }
+
+    /// Returns the index of the last byte satisfying `predicate`, or `None`.
+    #[inline]
+    pub fn rposition(&self, predicate: impl Fn(u8) -> bool) -> io::Result<Option<u64>> {
+        Ok(self
+            .read()?
+            .iter()
+            .rposition(|&b| predicate(b))
+            .map(|i| i as u64))
+    }
+
     /// Read the entire slice into a newly allocated `Vec<u8>`.
     ///
     /// Delegates to [`BStack::get`].
@@ -395,6 +527,209 @@ impl<'a, A: BStackAllocator> BStackSlice<'a, A> {
             ));
         }
         self.stack().zero(self.start() + start, n)
+    }
+
+    /// Fill the entire slice with `value`.
+    ///
+    /// A single crash-atomic [`BStack::repeat`] call.
+    ///
+    /// Requires the `set` feature.
+    #[cfg(feature = "set")]
+    #[inline]
+    pub fn fill(&mut self, value: u8) -> io::Result<()> {
+        self.stack().repeat(self.start(), [value], self.len())
+    }
+
+    /// Fill the slice by calling `f` once per byte.
+    ///
+    /// The generated bytes are staged in memory and committed with a single
+    /// crash-atomic [`write`](Self::write) call.
+    ///
+    /// Requires the `set` feature.
+    #[cfg(feature = "set")]
+    #[inline]
+    pub fn fill_with(&mut self, mut f: impl FnMut() -> u8) -> io::Result<()> {
+        let buf: Vec<u8> = (0..self.len()).map(|_| f()).collect();
+        self.write(buf)
+    }
+
+    /// Copy `src` into this slice.
+    ///
+    /// A single crash-atomic [`BStack::set`] call.
+    ///
+    /// Requires the `set` feature.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `src.len() != self.len()`.
+    #[cfg(feature = "set")]
+    #[inline]
+    #[track_caller]
+    pub fn copy_from_slice(&mut self, src: &[u8]) -> io::Result<()> {
+        assert_eq!(
+            src.len() as u64,
+            self.len(),
+            "copy_from_slice: length mismatch"
+        );
+        self.stack().set(self.start(), src)
+    }
+
+    /// Copy the contents of `src` into this slice.
+    ///
+    /// A single crash-atomic [`BStack::copy`] call. `src` and `self` may
+    /// overlap or refer to the same region.
+    ///
+    /// Requires the `set` and `atomic` features.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `src.len() != self.len()`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] if `src` is backed by a
+    /// different [`BStack`].
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[track_caller]
+    pub fn copy_from_bstack_slice(&mut self, src: &BStackSlice<'_, A>) -> io::Result<()> {
+        assert_eq!(
+            src.len(),
+            self.len(),
+            "copy_from_bstack_slice: length mismatch"
+        );
+        if !std::ptr::eq(src.stack(), self.stack()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "BStackSlice::copy_from_bstack_slice: source belongs to a different BStack",
+            ));
+        }
+        if self.is_empty() {
+            return Ok(());
+        }
+        self.stack().copy(src.start(), self.start(), self.len())
+    }
+
+    /// Copy `src_range` (relative to this slice) to `dest` (relative to this
+    /// slice), within this slice.
+    ///
+    /// A single crash-atomic [`BStack::copy`] call; overlapping source and
+    /// destination are handled correctly.
+    ///
+    /// Requires the `set` and `atomic` features.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `src_range.start > src_range.end`, if `src_range.end >
+    /// self.len()`, or if `dest + src_range.len()` overflows `u64` or exceeds
+    /// `self.len()`.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[track_caller]
+    pub fn copy_within(&mut self, src_range: Range<u64>, dest: u64) -> io::Result<()> {
+        assert!(
+            src_range.start <= src_range.end,
+            "copy_within: range start must be <= end"
+        );
+        assert!(
+            src_range.end <= self.len(),
+            "copy_within: range end must be <= slice length"
+        );
+        let n = src_range.end - src_range.start;
+        let dest_end = dest
+            .checked_add(n)
+            .expect("copy_within: dest + len overflows u64");
+        assert!(
+            dest_end <= self.len(),
+            "copy_within: dest range exceeds slice length"
+        );
+        if n == 0 {
+            return Ok(());
+        }
+        self.stack()
+            .copy(self.start() + src_range.start, self.start() + dest, n)
+    }
+
+    /// Swap the contents of this slice with `other`.
+    ///
+    /// A single crash-atomic [`BStack::cross_exchange`] call.
+    ///
+    /// Requires the `set` and `atomic` features.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `self.len() != other.len()`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] if `other` is backed by a
+    /// different [`BStack`].
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[track_caller]
+    pub fn swap(&mut self, other: &mut BStackSlice<'_, A>) -> io::Result<()> {
+        assert_eq!(self.len(), other.len(), "swap: length mismatch");
+        if !std::ptr::eq(self.stack(), other.stack()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "BStackSlice::swap: slices belong to different BStacks",
+            ));
+        }
+        if self.is_empty() || self.start() == other.start() {
+            return Ok(());
+        }
+        self.stack()
+            .cross_exchange(self.start(), other.start(), self.len())
+    }
+
+    /// Reverse the byte order of this slice in place.
+    ///
+    /// A single crash-atomic [`BStack::process`] call: the bytes are read,
+    /// reversed in memory, then committed in one write.
+    ///
+    /// Requires the `set` and `atomic` features.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[inline]
+    pub fn reverse(&mut self) -> io::Result<()> {
+        self.stack()
+            .process(self.start(), self.end(), |buf| buf.reverse())
+    }
+
+    /// Rotate the slice in place such that the bytes at `[mid, len)` move to
+    /// the front.
+    ///
+    /// A single crash-atomic [`BStack::process`] call.
+    ///
+    /// Requires the `set` and `atomic` features.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `mid > self.len()`.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[track_caller]
+    pub fn rotate_left(&mut self, mid: u64) -> io::Result<()> {
+        assert!(
+            mid <= self.len(),
+            "rotate_left: mid must be <= slice length"
+        );
+        self.stack().process(self.start(), self.end(), |buf| {
+            buf.rotate_left(mid as usize)
+        })
+    }
+
+    /// Rotate the slice in place such that the last `k` bytes move to the
+    /// front.
+    ///
+    /// A single crash-atomic [`BStack::process`] call.
+    ///
+    /// Requires the `set` and `atomic` features.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `k > self.len()`.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[track_caller]
+    pub fn rotate_right(&mut self, k: u64) -> io::Result<()> {
+        assert!(k <= self.len(), "rotate_right: k must be <= slice length");
+        self.stack()
+            .process(self.start(), self.end(), |buf| buf.rotate_right(k as usize))
     }
 
     /// Create a cursor-based reader positioned at the start of this slice.

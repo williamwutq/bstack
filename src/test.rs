@@ -2809,6 +2809,322 @@ mod alloc_tests {
         assert_eq!(new[1].start(), 12);
         let _ = head; // keep the borrow alive
     }
+
+    // -------------------------------------------------------------------------
+    // std-slice-style ergonomic methods on BStackSlice (ported from master)
+    // -------------------------------------------------------------------------
+
+    // ---- read-only (no extra feature) ---------------------------------------
+
+    #[test]
+    fn slice_get_in_and_out_of_bounds() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(4).unwrap();
+        assert_eq!(s.get(0).unwrap(), Some(0)); // fresh region is zeroed
+        assert_eq!(s.get(3).unwrap(), Some(0));
+        assert_eq!(s.get(4).unwrap(), None); // out of bounds
+    }
+
+    #[test]
+    fn slice_head_and_tail() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(10).unwrap();
+        let h = s.head(3);
+        assert_eq!(h.start(), s.start());
+        assert_eq!(h.len(), 3);
+        // over-long request is clamped
+        assert_eq!(s.head(100).len(), 10);
+
+        let t = s.tail(3);
+        assert_eq!(t.start(), s.start() + 7);
+        assert_eq!(t.len(), 3);
+        assert_eq!(s.tail(100).len(), 10);
+        assert_eq!(s.tail(100).start(), s.start());
+    }
+
+    #[test]
+    fn slice_split_at() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(10).unwrap();
+        let (l, r) = s.split_at(3);
+        assert_eq!(l.start(), s.start());
+        assert_eq!(l.len(), 3);
+        assert_eq!(r.start(), s.start() + 3);
+        assert_eq!(r.len(), 7);
+        // boundary: mid == len
+        let (l, r) = s.split_at(10);
+        assert_eq!(l.len(), 10);
+        assert_eq!(r.len(), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "split_at: mid must be <= slice length")]
+    fn slice_split_at_out_of_bounds() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(4).unwrap();
+        let _ = s.split_at(5);
+    }
+
+    #[test]
+    fn slice_split_at_mut() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut s = alloc.alloc(10).unwrap();
+        let (l, r) = s.split_at_mut(4);
+        assert_eq!(l.len(), 4);
+        assert_eq!(r.len(), 6);
+        assert_eq!(r.start(), s.start() + 4);
+        // boundary: mid == 0
+        let (l, r) = s.split_at_mut(0);
+        assert_eq!(l.len(), 0);
+        assert_eq!(r.len(), 10);
+    }
+
+    #[test]
+    fn slice_contains_zeroed() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(4).unwrap();
+        assert!(s.contains(0).unwrap());
+        assert!(!s.contains(1).unwrap());
+    }
+
+    #[test]
+    fn slice_starts_and_ends_with_zeroed() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(4).unwrap();
+        assert!(s.starts_with(&[0, 0]).unwrap());
+        assert!(!s.starts_with(&[1]).unwrap());
+        assert!(!s.starts_with(&[0, 0, 0, 0, 0]).unwrap()); // longer than slice
+        assert!(s.ends_with(&[0, 0]).unwrap());
+        assert!(!s.ends_with(&[1]).unwrap());
+        assert!(!s.ends_with(&[0, 0, 0, 0, 0]).unwrap());
+    }
+
+    #[test]
+    fn slice_find_and_rfind_zeroed() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(4).unwrap();
+        assert_eq!(s.find(0).unwrap(), Some(0));
+        assert_eq!(s.find(9).unwrap(), None);
+        assert_eq!(s.rfind(0).unwrap(), Some(3));
+        assert_eq!(s.rfind(9).unwrap(), None);
+    }
+
+    #[test]
+    fn slice_position_and_rposition_zeroed() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(4).unwrap();
+        assert_eq!(s.position(|b| b == 0).unwrap(), Some(0));
+        assert_eq!(s.position(|b| b == 7).unwrap(), None);
+        assert_eq!(s.rposition(|b| b == 0).unwrap(), Some(3));
+        assert_eq!(s.rposition(|b| b == 7).unwrap(), None);
+    }
+
+    // Stronger read-only coverage over non-trivial written data.
+    #[cfg(feature = "set")]
+    #[test]
+    fn slice_search_over_written_data() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(6).unwrap();
+        s.write(b"abcabc").unwrap();
+        assert!(s.contains(b'c').unwrap());
+        assert!(!s.contains(b'z').unwrap());
+        assert!(s.starts_with(b"abc").unwrap());
+        assert!(!s.starts_with(b"abd").unwrap());
+        assert!(s.ends_with(b"abc").unwrap());
+        assert!(!s.ends_with(b"abd").unwrap());
+        assert_eq!(s.find(b'b').unwrap(), Some(1));
+        assert_eq!(s.rfind(b'b').unwrap(), Some(4));
+        assert_eq!(s.find(b'z').unwrap(), None);
+        assert_eq!(s.position(|x| x == b'c').unwrap(), Some(2));
+        assert_eq!(s.rposition(|x| x == b'c').unwrap(), Some(5));
+    }
+
+    // ---- write (needs `set`) ------------------------------------------------
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn slice_fill() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut s = alloc.alloc(6).unwrap();
+        s.fill(0xAB).unwrap();
+        assert_eq!(s.read().unwrap(), vec![0xAB; 6]);
+        // boundary: empty slice fill is a no-op
+        let mut e = alloc.alloc(0).unwrap();
+        e.fill(0xFF).unwrap();
+        assert_eq!(e.read().unwrap(), Vec::<u8>::new());
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn slice_fill_with() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut s = alloc.alloc(5).unwrap();
+        let mut n = 0u8;
+        s.fill_with(|| {
+            let v = n;
+            n += 1;
+            v
+        })
+        .unwrap();
+        assert_eq!(s.read().unwrap(), vec![0, 1, 2, 3, 4]);
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn slice_copy_from_slice() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut s = alloc.alloc(4).unwrap();
+        s.copy_from_slice(b"WXYZ").unwrap();
+        assert_eq!(s.read().unwrap(), b"WXYZ");
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    #[should_panic(expected = "copy_from_slice: length mismatch")]
+    fn slice_copy_from_slice_length_mismatch() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut s = alloc.alloc(4).unwrap();
+        s.copy_from_slice(b"TOOLONG").unwrap();
+    }
+
+    // ---- atomic compound (needs `set` + `atomic`) ---------------------------
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn slice_copy_from_bstack_slice() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let src = alloc.alloc(4).unwrap();
+        src.write(b"DATA").unwrap();
+        let mut dst = alloc.alloc(4).unwrap();
+        dst.copy_from_bstack_slice(&src).unwrap();
+        assert_eq!(dst.read().unwrap(), b"DATA");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn slice_copy_from_bstack_slice_different_stack_errors() {
+        let (alloc1, path1) = mk_alloc();
+        let _g1 = Guard(path1);
+        let (alloc2, path2) = mk_alloc();
+        let _g2 = Guard(path2);
+        let src = alloc1.alloc(4).unwrap();
+        let mut dst = alloc2.alloc(4).unwrap();
+        let err = dst.copy_from_bstack_slice(&src).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn slice_copy_within() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut s = alloc.alloc(6).unwrap();
+        s.write(b"ABCDEF").unwrap();
+        // copy [0,2) -> dest 4
+        s.copy_within(0..2, 4).unwrap();
+        assert_eq!(s.read().unwrap(), b"ABCDAB");
+        // boundary: empty range is a no-op
+        s.copy_within(2..2, 0).unwrap();
+        assert_eq!(s.read().unwrap(), b"ABCDAB");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn slice_swap() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut a = alloc.alloc(3).unwrap();
+        let mut b = alloc.alloc(3).unwrap();
+        a.write(b"AAA").unwrap();
+        b.write(b"BBB").unwrap();
+        a.swap(&mut b).unwrap();
+        assert_eq!(a.read().unwrap(), b"BBB");
+        assert_eq!(b.read().unwrap(), b"AAA");
+        // boundary: swapping a slice with itself (same start) is a no-op
+        let mut c = a;
+        a.swap(&mut c).unwrap();
+        assert_eq!(a.read().unwrap(), b"BBB");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn slice_swap_different_stack_errors() {
+        let (alloc1, path1) = mk_alloc();
+        let _g1 = Guard(path1);
+        let (alloc2, path2) = mk_alloc();
+        let _g2 = Guard(path2);
+        let mut a = alloc1.alloc(3).unwrap();
+        let mut b = alloc2.alloc(3).unwrap();
+        let err = a.swap(&mut b).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn slice_reverse() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut s = alloc.alloc(5).unwrap();
+        s.write(b"abcde").unwrap();
+        s.reverse().unwrap();
+        assert_eq!(s.read().unwrap(), b"edcba");
+        // boundary: reversing an empty slice is a no-op
+        let mut e = alloc.alloc(0).unwrap();
+        e.reverse().unwrap();
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn slice_rotate_left() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut s = alloc.alloc(5).unwrap();
+        s.write(b"abcde").unwrap();
+        s.rotate_left(2).unwrap();
+        assert_eq!(s.read().unwrap(), b"cdeab");
+        // boundary: mid == len is a full rotation (identity)
+        s.rotate_left(5).unwrap();
+        assert_eq!(s.read().unwrap(), b"cdeab");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn slice_rotate_right() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut s = alloc.alloc(5).unwrap();
+        s.write(b"abcde").unwrap();
+        s.rotate_right(2).unwrap();
+        assert_eq!(s.read().unwrap(), b"deabc");
+        // boundary: k == 0 is the identity
+        s.rotate_right(0).unwrap();
+        assert_eq!(s.read().unwrap(), b"deabc");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    #[should_panic(expected = "rotate_left: mid must be <= slice length")]
+    fn slice_rotate_left_out_of_bounds() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut s = alloc.alloc(4).unwrap();
+        let _ = s.rotate_left(5);
+    }
 }
 
 // -------------------------------------------------------------------------
