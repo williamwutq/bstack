@@ -125,10 +125,22 @@ static void win_set_errno(void)
     }
 }
 
+/* When BSTACK_TEST_NO_DURABLE_SYNC is defined at compile time, plat_durable_sync
+ * becomes a no-op.  An in-process test or fuzz run tears the store down logically
+ * and reopens it in-process rather than surviving a real power loss, so skipping
+ * the physical sync changes neither the exercised logic nor the on-disk bytes,
+ * yet on macOS F_FULLFSYNC otherwise dominates runtime (minutes -> seconds).
+ * The define is never set by the default build; opt in only for test/fuzz runs.
+ * UNSAFE for any build that must survive a real crash — never production. */
 static int plat_durable_sync(bstack_fd_t h)
 {
+#ifdef BSTACK_TEST_NO_DURABLE_SYNC
+    (void)h;
+    return 0;
+#else
     if (!FlushFileBuffers(h)) { win_set_errno(); return -1; }
     return 0;
+#endif
 }
 
 static int plat_file_size(bstack_fd_t h, uint64_t *out)
@@ -190,14 +202,21 @@ static int plat_ftruncate(bstack_fd_t h, uint64_t size)
 
 #else /* !_WIN32 */
 
+/* No-op under BSTACK_TEST_NO_DURABLE_SYNC — see the note on the Windows
+ * definition above.  Test/fuzz builds only, never production. */
 static int plat_durable_sync(bstack_fd_t fd)
 {
+#ifdef BSTACK_TEST_NO_DURABLE_SYNC
+    (void)fd;
+    return 0;
+#else
 #  ifdef __APPLE__
     if (fcntl(fd, F_FULLFSYNC) == 0)
         return 0;
     /* Device does not support F_FULLFSYNC — fall back to fdatasync. */
 #  endif
     return fdatasync(fd);
+#endif
 }
 
 static int plat_file_size(bstack_fd_t fd, uint64_t *out)
