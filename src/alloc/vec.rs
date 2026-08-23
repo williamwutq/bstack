@@ -75,7 +75,10 @@ const HEADER_LEN: u64 = 16;
 /// | `truncate` | write `len` → zero removed slots | Crash after `len` write but before zero: stale bytes may remain in now out-of-range slots, but reads never include them because they are beyond `len`. |
 /// | `resize` (grow) | `reserve` → write elements → write `len` | Elements between the old and new `len` may be partially written. |
 /// | `clear` | (delegates to `truncate(0)`) | See `truncate`. |
-/// | `reserve` | `realloc` → write `cap` | Crash between the two: cap field may reflect the old value; the block is larger than cap indicates. Harmless — the next `push` re-checks and may realloc again unnecessarily. |
+/// | `reserve`, `reserve_exact` | `realloc` → write `cap` | Crash between the two: cap field may reflect the old value; the block is larger than cap indicates. Harmless — the next `push` re-checks and may realloc again unnecessarily. |
+/// | `shrink_to`, `shrink_to_fit` | `realloc` (shrink) → write `cap` | Crash between the two: block is smaller than the stale `cap` claims; the next `push` re-checks and grows as needed. |
+/// | `set` | write element | Single crash-atomic write; no torn state. |
+/// | `fill` | one `repeat` | Single crash-atomic fill of the whole `len`; no torn state. |
 ///
 /// In all cases the header is re-read from disk on the next call, so the
 /// on-disk `(len, cap)` always reflects the last fully committed step.  The
@@ -177,7 +180,12 @@ impl<'a, A: BStackSliceAllocator> BStackByteVec<'a, A> {
     }
 
     /// Reallocate the block to hold `new_cap` bytes, updating `self.slice`.
-    fn grow_to(&mut self, new_cap: u64) -> io::Result<()> {
+    ///
+    /// Handles both growth (`push`, `reserve`, `reserve_exact`) and shrink
+    /// (`shrink_to`, `shrink_to_fit`): the underlying allocator `realloc`
+    /// reallocates in either direction, so a `new_cap` below the current
+    /// capacity shrinks the backing block.
+    fn realloc_to(&mut self, new_cap: u64) -> io::Result<()> {
         let new_size = Self::block_size(new_cap)?;
         // SAFETY: Slice origin requirement is upheld because `self.slice` is
         // the original allocation handle returned by the constructor, and
@@ -309,7 +317,7 @@ impl<'a, A: BStackSliceAllocator> BStackByteVec<'a, A> {
         let (len, cap) = self.read_header()?;
         if len == cap {
             let new_cap = cap.saturating_mul(2).max(4);
-            self.grow_to(new_cap)?;
+            self.realloc_to(new_cap)?;
             self.write_cap_field(new_cap)?;
         }
         self.write_byte_at(len, value)?;
@@ -370,9 +378,87 @@ impl<'a, A: BStackSliceAllocator> BStackByteVec<'a, A> {
             return Ok(());
         }
         let new_cap = needed.max(cap.saturating_mul(2));
-        self.grow_to(new_cap)?;
+        self.realloc_to(new_cap)?;
         self.write_cap_field(new_cap)?;
         Ok(())
+    }
+
+    /// Reserve capacity for exactly `additional` more bytes, without the
+    /// amortising over-allocation of [`reserve`](Self::reserve).
+    ///
+    /// After this call `capacity() >= len() + additional`, growing the block to
+    /// exactly `len + additional` when it is currently too small.  Does nothing
+    /// if the current capacity is already sufficient.  Prefer [`reserve`](Self::reserve)
+    /// when more insertions are expected; use this when the final size is known.
+    pub fn reserve_exact(&mut self, additional: u64) -> io::Result<()> {
+        let (len, cap) = self.read_header()?;
+        let needed = len.checked_add(additional).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "BStackByteVec::reserve_exact: capacity overflow",
+            )
+        })?;
+        if needed <= cap {
+            return Ok(());
+        }
+        self.realloc_to(needed)?;
+        self.write_cap_field(needed)
+    }
+
+    /// Shrink the capacity to `min_capacity`, but never below the current `len`.
+    ///
+    /// No-op if the current capacity is already `<= min_capacity` (so it never
+    /// grows).  Mirrors the reallocation path used for growth, reallocating the
+    /// block to `max(len, min_capacity)` bytes.
+    pub fn shrink_to(&mut self, min_capacity: u64) -> io::Result<()> {
+        let (len, cap) = self.read_header()?;
+        let target = min_capacity.max(len);
+        if target >= cap {
+            return Ok(());
+        }
+        self.realloc_to(target)?;
+        self.write_cap_field(target)
+    }
+
+    /// Shrink the capacity to match `len`, releasing all spare capacity.
+    ///
+    /// Equivalent to `shrink_to(0)`.
+    pub fn shrink_to_fit(&mut self) -> io::Result<()> {
+        self.shrink_to(0)
+    }
+
+    /// Overwrite the byte at `index` with `value`.
+    ///
+    /// A single in-place, crash-atomic write to an existing slot; capacity and
+    /// `len` are unchanged.
+    ///
+    /// Returns `Ok(None)` if `index >= len` (nothing is written), mirroring
+    /// [`get`](Self::get); `Ok(Some(()))` on success.  `Err` is reserved for I/O
+    /// failures.
+    pub fn set(&mut self, index: u64, value: u8) -> io::Result<Option<()>> {
+        let (len, _) = self.read_header()?;
+        if index >= len {
+            return Ok(None);
+        }
+        self.write_byte_at(index, value)?;
+        Ok(Some(()))
+    }
+
+    /// Overwrite every logical byte with `value`.
+    ///
+    /// Backed by a single [`crate::BStack::repeat`] over the populated region,
+    /// with the same durability as `set` (on this line `repeat` writes the whole
+    /// region directly — it has no write-in-progress journal).  A no-op on an
+    /// empty vec; capacity and `len` are unchanged.
+    pub fn fill(&mut self, value: u8) -> io::Result<()> {
+        let (len, _) = self.read_header()?;
+        if len == 0 {
+            return Ok(());
+        }
+        // Fill only the populated region `[0, len)` with a single `repeat`,
+        // mirroring `BStackSlice::fill`.
+        let mut region = self.slice.subslice(HEADER_LEN, HEADER_LEN + len);
+        region.fill(value)
     }
 
     /// Set the length to `new_len`, filling any new slots with `value`.
@@ -986,5 +1072,124 @@ mod tests {
         assert_eq!(v.as_slice().unwrap().len(), 2);
         v.pop().unwrap();
         assert_eq!(v.as_slice().unwrap().len(), 1);
+    }
+
+    // ── set / fill / reserve_exact / shrink_to / shrink_to_fit ────────────────
+
+    #[test]
+    fn set_overwrites_existing_byte() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let mut v = BStackByteVec::from_slice(&[1, 2, 3], &alloc).unwrap();
+        assert_eq!(v.set(1, 99).unwrap(), Some(()));
+        assert_eq!(v.read_bytes().unwrap(), [1, 99, 3]);
+        // Out of bounds → None, not an error, and nothing is written.
+        assert_eq!(v.set(3, 0).unwrap(), None);
+        assert_eq!(v.set(u64::MAX, 0).unwrap(), None);
+        assert_eq!(v.read_bytes().unwrap(), [1, 99, 3]);
+    }
+
+    #[test]
+    fn fill_overwrites_all_bytes() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let mut v = BStackByteVec::from_slice(&[1, 2, 3, 4], &alloc).unwrap();
+        v.fill(0xEE).unwrap();
+        assert_eq!(v.read_bytes().unwrap(), [0xEE; 4]);
+        assert_eq!(v.len().unwrap(), 4);
+    }
+
+    #[test]
+    fn fill_on_empty_vec_is_noop() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let mut v = BStackByteVec::new(&alloc).unwrap();
+        v.fill(0x55).unwrap();
+        assert_eq!(v.len().unwrap(), 0);
+        assert!(v.read_bytes().unwrap().is_empty());
+    }
+
+    #[test]
+    fn reserve_exact_grows_to_exact_capacity() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let mut v = BStackByteVec::new(&alloc).unwrap();
+        v.push(1).unwrap(); // len=1, cap>=4
+        v.reserve_exact(9).unwrap(); // needs exactly len+9 = 10
+        assert_eq!(v.capacity().unwrap(), 10);
+        assert_eq!(v.len().unwrap(), 1);
+        assert_eq!(v.get(0).unwrap(), Some(1u8)); // data preserved
+    }
+
+    #[test]
+    fn reserve_exact_noop_when_sufficient() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let mut v = BStackByteVec::with_capacity(10, &alloc).unwrap();
+        v.push(7).unwrap(); // len=1, cap=10
+        v.reserve_exact(5).unwrap(); // needs 6 <= 10 → no-op
+        assert_eq!(v.capacity().unwrap(), 10);
+    }
+
+    #[test]
+    fn reserve_exact_overflow_returns_error() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let mut v = BStackByteVec::new(&alloc).unwrap();
+        v.push(1).unwrap(); // len=1
+        let err = v.reserve_exact(u64::MAX).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn shrink_to_fit_releases_spare_capacity() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let mut v = BStackByteVec::with_capacity(16, &alloc).unwrap();
+        v.push(1).unwrap();
+        v.push(2).unwrap();
+        v.push(3).unwrap();
+        assert_eq!(v.capacity().unwrap(), 16);
+        v.shrink_to_fit().unwrap();
+        assert_eq!(v.capacity().unwrap(), 3); // now exactly len
+        assert_eq!(v.read_bytes().unwrap(), [1, 2, 3]); // data preserved
+    }
+
+    #[test]
+    fn shrink_to_respects_len_lower_bound_and_never_grows() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let mut v = BStackByteVec::with_capacity(20, &alloc).unwrap();
+        for b in [1u8, 2, 3, 4, 5] {
+            v.push(b).unwrap(); // len=5, cap=20
+        }
+        v.shrink_to(2).unwrap(); // below len → clamps up to len (5)
+        assert_eq!(v.capacity().unwrap(), 5);
+        v.shrink_to(100).unwrap(); // above cap → no-op
+        assert_eq!(v.capacity().unwrap(), 5);
+        assert_eq!(v.read_bytes().unwrap(), [1, 2, 3, 4, 5]); // data preserved
+    }
+
+    #[test]
+    fn set_and_capacity_persist_across_reopen() {
+        // set + reserve_exact must survive a drop-and-reopen via from_raw_block.
+        let path = temp_path();
+        let _g = Guard(path.clone());
+
+        let block_bytes = {
+            let alloc = LinearBStackAllocator::new(BStack::open(&path).unwrap());
+            let mut v = BStackByteVec::from_slice(&[10u8, 20, 30], &alloc).unwrap();
+            v.set(1, 200).unwrap();
+            v.reserve_exact(5).unwrap(); // cap becomes exactly 8
+            let bytes: [u8; 16] = v.into_raw_block().into();
+            bytes
+        };
+
+        let alloc = LinearBStackAllocator::new(BStack::open(&path).unwrap());
+        let block = unsafe { crate::alloc::BStackSlice::from_bytes(&alloc, block_bytes) };
+        let v = unsafe { BStackByteVec::from_raw_block(block) };
+        assert_eq!(v.len().unwrap(), 3);
+        assert_eq!(v.capacity().unwrap(), 8);
+        assert_eq!(v.read_bytes().unwrap(), [10, 200, 30]);
     }
 }
