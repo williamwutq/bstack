@@ -13,6 +13,20 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::io;
 
+/// One window / block for the out-of-core partial sort, in bytes. The sort
+/// keeps at most [`SORT_WINDOWS`] windows resident, so its peak buffer is
+/// `SORT_WINDOWS * SORT_BLOCK_BYTES` regardless of the region's total size.
+/// This is the partial sort's own budget — not tied to any streaming buffer
+/// elsewhere in the crate, and may be tuned independently.
+#[cfg(all(feature = "set", feature = "atomic"))]
+const SORT_BLOCK_BYTES: u64 = 2048;
+
+/// Windows held resident at once by the out-of-core partial sort: two merge
+/// inputs plus one carry/output window (equivalently, a three-block
+/// run-formation load). See [`SORT_BLOCK_BYTES`].
+#[cfg(all(feature = "set", feature = "atomic"))]
+const SORT_WINDOWS: u64 = 3;
+
 /// A fixed-size-record view over a [`BStackSlice`] — a slice with a stride.
 ///
 /// Divides an underlying region into `chunk_len`-byte records. `BStackChunk`
@@ -561,6 +575,60 @@ impl<'a> BStackChunk<'a> {
             apply_chunk_permutation(buf, chunk_len, &order);
         })
     }
+
+    /// Best-effort, bounded-memory, out-of-core sort of the chunks in place.
+    ///
+    /// Unlike [`sort_by`](Self::sort_by), which reads the whole region into one
+    /// `Vec<u8>` and commits it in a single [`BStack::process`] transaction —
+    /// bounded by available memory, so a region too large for one `Vec<u8>`
+    /// cannot be sorted that way — this runs an **in-place bottom-up merge
+    /// sort** that never holds more than a fixed budget of bytes resident
+    /// (`SORT_WINDOWS * SORT_BLOCK_BYTES`, chosen internally — no knob), so peak
+    /// memory is O(1) in the region's total size. Runs are formed with
+    /// [`BStack::process`] and merged in place by a recursive rotation merge —
+    /// [`BStack::process`] for sub-ranges that fit the budget, plus
+    /// [`BStack::cross_exchange`] record swaps to rotate larger ranges; no
+    /// scratch region is used.
+    ///
+    /// # "Partial" / convergence
+    ///
+    /// On success the region is **fully sorted**. Every step — each run-forming
+    /// sort, each block swap, each merge window — is an independent crash-atomic
+    /// operation that only permutes the bytes it touches, so a crash mid-run or
+    /// an early return on I/O error leaves the region as some *valid
+    /// permutation* of the original records (never lost or duplicated data),
+    /// just not fully ordered. "Partial" names that interruptible middle state:
+    /// re-running from any such permutation completes the sort, so as long as
+    /// I/O eventually succeeds, repeated calls converge to fully sorted.
+    ///
+    /// Returns `Err` only on a genuine [`BStack::process`]/[`BStack::cross_exchange`]
+    /// I/O failure. Not guaranteed stable — the out-of-core merge may reorder
+    /// records that compare equal (use [`sort_by`](Self::sort_by) when the whole
+    /// region fits memory and stability is required).
+    ///
+    /// Requires the `set` and `atomic` features.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[inline]
+    pub fn sort_partial_by(
+        &mut self,
+        mut cmp: impl FnMut(&[u8], &[u8]) -> Ordering,
+    ) -> io::Result<()> {
+        merge_sort(&self.aligned, self.chunk_len, &mut cmp)
+    }
+
+    /// Key-extracting variant of [`sort_partial_by`](Self::sort_partial_by).
+    ///
+    /// Same bounded-memory, out-of-core, converging, per-step-atomic behavior;
+    /// the key is derived from each chunk's bytes per comparison. Requires the
+    /// `set` and `atomic` features.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[inline]
+    pub fn sort_partial_by_key<K: Ord>(
+        &mut self,
+        mut key: impl FnMut(&[u8]) -> K,
+    ) -> io::Result<()> {
+        merge_sort(&self.aligned, self.chunk_len, &mut |a, b| key(a).cmp(&key(b)))
+    }
 }
 
 impl<'a> IntoIterator for BStackChunk<'a> {
@@ -646,6 +714,210 @@ fn apply_chunk_permutation(buf: &mut [u8], chunk_len: usize, order: &[usize]) {
         buf[cur * chunk_len..(cur + 1) * chunk_len].copy_from_slice(temp);
         visited[cur] = true;
     }
+}
+
+// ===================== Out-of-core in-place merge sort ======================
+//
+// Engine for `BStackChunk::sort_partial_by`/`sort_partial_by_key`. Bottom-up
+// 2-way merge sort that never holds more than `SORT_WINDOWS * SORT_BLOCK_BYTES`
+// bytes resident: runs are formed with `BStack::process`, and adjacent runs are
+// merged in place by a recursive rotation merge (`imerge`) — sub-ranges that
+// fit the budget are sorted by one atomic `BStack::process`, and larger ranges
+// are split and rotated past each other with atomic `BStack::cross_exchange`
+// record swaps. Every remote op is individually crash-atomic and
+// permutation-preserving, so any crash or early I/O-error return leaves a valid
+// permutation of the records, and re-running completes the sort.
+
+/// Absolute byte offset of record `rec` within `aligned`.
+#[cfg(all(feature = "set", feature = "atomic"))]
+#[inline(always)]
+fn rec_off(aligned: &BStackSlice<'_>, rec: u64, c: u64) -> u64 {
+    aligned.start() + rec * c
+}
+
+/// Read record `rec` into `buf` (`buf.len() == c`).
+#[cfg(all(feature = "set", feature = "atomic"))]
+#[inline(always)]
+fn read_record(aligned: &BStackSlice<'_>, rec: u64, c: u64, buf: &mut [u8]) -> io::Result<()> {
+    let s = rec * c;
+    aligned.subslice(s, s + c).read_into(buf)
+}
+
+/// Reverse the records in `[x, y)` in place via single-record atomic swaps.
+#[cfg(all(feature = "set", feature = "atomic"))]
+#[inline(always)] // Inline because only used in `rotate_records`
+fn reverse_records(aligned: &BStackSlice<'_>, c: u64, mut x: u64, mut y: u64) -> io::Result<()> {
+    while y > x + 1 {
+        let b = y - 1;
+        aligned
+            .stack()
+            .cross_exchange(rec_off(aligned, x, c), rec_off(aligned, b, c), c)?;
+        x += 1;
+        y = b;
+    }
+    Ok(())
+}
+
+/// Swap the two adjacent record blocks `[a, b)` and `[b, d)` (rotation) via
+/// three reversals. Crash-safe: each underlying swap is atomic, so any crash
+/// leaves a valid permutation.
+#[cfg(all(feature = "set", feature = "atomic"))]
+#[inline]
+fn rotate_records(aligned: &BStackSlice<'_>, c: u64, a: u64, b: u64, d: u64) -> io::Result<()> {
+    reverse_records(aligned, c, a, b)?;
+    reverse_records(aligned, c, b, d)?;
+    reverse_records(aligned, c, a, d)?;
+    Ok(())
+}
+
+/// First index in `[lo, hi)` whose record is *not less than* `key` (lower bound).
+#[cfg(all(feature = "set", feature = "atomic"))]
+#[inline(always)] // Inline because only used in `imerge`
+fn lower_bound(
+    aligned: &BStackSlice<'_>,
+    c: u64,
+    mut lo: u64,
+    mut hi: u64,
+    key: &[u8],
+    scratch: &mut [u8],
+    cmp: &mut dyn FnMut(&[u8], &[u8]) -> Ordering,
+) -> io::Result<u64> {
+    while lo < hi {
+        let m = lo + (hi - lo) / 2;
+        read_record(aligned, m, c, scratch)?;
+        if cmp(scratch, key) == Ordering::Less {
+            lo = m + 1;
+        } else {
+            hi = m;
+        }
+    }
+    Ok(lo)
+}
+
+/// First index in `[lo, hi)` whose record is *greater than* `key` (upper bound).
+#[cfg(all(feature = "set", feature = "atomic"))]
+#[inline(always)] // Inline because only used in `imerge`
+fn upper_bound(
+    aligned: &BStackSlice<'_>,
+    c: u64,
+    mut lo: u64,
+    mut hi: u64,
+    key: &[u8],
+    scratch: &mut [u8],
+    cmp: &mut dyn FnMut(&[u8], &[u8]) -> Ordering,
+) -> io::Result<u64> {
+    while lo < hi {
+        let m = lo + (hi - lo) / 2;
+        read_record(aligned, m, c, scratch)?;
+        if cmp(scratch, key) == Ordering::Greater {
+            hi = m;
+        } else {
+            lo = m + 1;
+        }
+    }
+    Ok(lo)
+}
+
+/// Merge the adjacent sorted runs `[lo, mid)` and `[mid, hi)` in place.
+///
+/// A recursive rotation merge (SymMerge): sub-ranges that fit the memory budget
+/// are merged by one atomic [`BStack::process`] sort; larger ranges are split
+/// by binary-searching a pivot from the larger run and rotating the two middle
+/// blocks past each other with [`BStack::cross_exchange`], then recursing on the
+/// two halves. Every rotation is a sequence of atomic single-record swaps and
+/// every base case is one atomic `process`, so O(1) memory beyond the two
+/// scratch records and any crash leaves a valid permutation. Handles arbitrary
+/// (including ragged) run lengths.
+#[cfg(all(feature = "set", feature = "atomic"))]
+#[allow(clippy::too_many_arguments)]
+fn imerge(
+    aligned: &BStackSlice<'_>,
+    c: u64,
+    cu: usize,
+    budget: u64,
+    lo: u64,
+    mid: u64,
+    hi: u64,
+    bi: &mut [u8],
+    bj: &mut [u8],
+    cmp: &mut dyn FnMut(&[u8], &[u8]) -> Ordering,
+) -> io::Result<()> {
+    if lo >= mid || mid >= hi {
+        return Ok(());
+    }
+    // Base case: the whole range fits the budget — sort it in one atomic pass.
+    // This bounds the recursion depth and keeps small merges fast. (`sort` here
+    // is correct because `[lo, hi)` is two already-sorted runs.)
+    if (hi - lo) * c <= budget {
+        let s = rec_off(aligned, lo, c);
+        let e = rec_off(aligned, hi, c);
+        return aligned
+            .stack()
+            .process(s, e, |buf| sort_chunks_by(buf, cu, &mut *cmp));
+    }
+    let (llen, rlen) = (mid - lo, hi - mid);
+    // Pivot in the middle of the *larger* run so it halves each recursion.
+    let (i, j);
+    if llen >= rlen {
+        i = lo + llen / 2;
+        read_record(aligned, i, c, bi)?; // pivot bytes held in `bi`
+        j = lower_bound(aligned, c, mid, hi, bi, bj, cmp)?;
+    } else {
+        j = mid + rlen / 2;
+        read_record(aligned, j, c, bj)?; // pivot bytes held in `bj`
+        i = upper_bound(aligned, c, lo, mid, bj, bi, cmp)?;
+    }
+    rotate_records(aligned, c, i, mid, j)?;
+    let new_mid = i + (j - mid);
+    imerge(aligned, c, cu, budget, lo, i, new_mid, bi, bj, cmp)?;
+    imerge(aligned, c, cu, budget, new_mid, j, hi, bi, bj, cmp)?;
+    Ok(())
+}
+
+/// Out-of-core in-place bottom-up merge sort of `aligned`, viewed as records of
+/// `c` bytes. See the module-level note above and `BStackChunk::sort_partial_by`.
+#[cfg(all(feature = "set", feature = "atomic"))]
+fn merge_sort(
+    aligned: &BStackSlice<'_>,
+    c: u64,
+    cmp: &mut dyn FnMut(&[u8], &[u8]) -> Ordering,
+) -> io::Result<()> {
+    let count = aligned.len() / c;
+    if count <= 1 {
+        return Ok(());
+    }
+    let cu = c as usize;
+    let k = (SORT_BLOCK_BYTES / c).max(1);
+    let budget = SORT_WINDOWS * SORT_BLOCK_BYTES;
+    let run0 = SORT_WINDOWS * k;
+    let mut bi = vec![0u8; cu];
+    let mut bj = vec![0u8; cu];
+    // Phase 1: run formation — sort each `run0`-record window.
+    let mut p = 0u64;
+    while p < count {
+        let q = (p + run0).min(count);
+        if q - p > 1 {
+            let s = rec_off(aligned, p, c);
+            let e = rec_off(aligned, q, c);
+            aligned
+                .stack()
+                .process(s, e, |buf| sort_chunks_by(buf, cu, &mut *cmp))?;
+        }
+        p = q;
+    }
+    // Phase 2: bottom-up merge passes.
+    let mut width = run0;
+    while width < count {
+        let mut lo = 0u64;
+        while lo + width < count {
+            let mid = lo + width;
+            let hi = (lo + 2 * width).min(count);
+            imerge(aligned, c, cu, budget, lo, mid, hi, &mut bi, &mut bj, cmp)?;
+            lo += 2 * width;
+        }
+        width = width.saturating_mul(2);
+    }
+    Ok(())
 }
 
 impl<'a> BStackSlice<'a> {
