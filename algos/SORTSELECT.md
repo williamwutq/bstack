@@ -4,10 +4,11 @@ This advisory covers the record-level ordering operations on `BStackChunk`
 (feature `alloc`, plus `set` + `atomic` for the mutating ones): the
 single-transaction `sort_by` / `sort_by_key` / `select_nth_by` /
 `select_nth_by_key`, the read-only `binary_search_by[_key]`, and the
-bounded-memory out-of-core `sort_partial_by` / `sort_partial_by_key`. The focus
-is the out-of-core sort: the model it is built on, how it maps onto `BStack`'s
-crash-atomic primitives, why it converges, and one tempting block-merge shortcut
-that is *unsound* and must not be used.
+bounded-memory out-of-core `sort_partial_by` / `sort_partial_by_key` and
+`select_nth_partial_by` / `select_nth_partial_by_key`. The focus is the
+out-of-core operations: the model they build on, how they map onto `BStack`'s
+crash-atomic primitives, why they converge, and one tempting block-merge
+shortcut that is *unsound* and must not be used.
 
 A `BStackChunk` views an aligned region as `n` fixed-stride records of
 `chunk_len` bytes. All coordinates below are record indices in `[0, n)`; a byte
@@ -15,12 +16,13 @@ offset is `region_start + index * chunk_len`.
 
 ## The two regimes
 
-| Operation                 | Memory                  | Atomicity          | Notes                                                                           |
-|---------------------------|-------------------------|--------------------|---------------------------------------------------------------------------------|
-| `sort_by` / `sort_by_key` | O(region)               | single transaction | reads the whole region into one `Vec<u8>`, permutes, commits with one `process` |
-| `select_nth_by[_key]`     | O(region)               | single transaction | `select_nth_unstable` on an in-memory proxy index, one `process`                |
-| `binary_search_by[_key]`  | O(chunk_len)            | read-only          | O(log n) probed-chunk reads, never the whole region                             |
-| `sort_partial_by[_key]`   | **O(1) in region size** | **per-step**       | in-place out-of-core merge sort; converges to fully sorted                      |
+| Operation                     | Memory                  | Atomicity          | Notes                                                                           |
+|-------------------------------|-------------------------|--------------------|---------------------------------------------------------------------------------|
+| `sort_by` / `sort_by_key`     | O(region)               | single transaction | reads the whole region into one `Vec<u8>`, permutes, commits with one `process` |
+| `select_nth_by[_key]`         | O(region)               | single transaction | `select_nth_unstable` on an in-memory proxy index, one `process`                |
+| `binary_search_by[_key]`      | O(chunk_len)            | read-only          | O(log n) probed-chunk reads, never the whole region                             |
+| `sort_partial_by[_key]`       | **O(1) in region size** | **per-step**       | in-place out-of-core merge sort; converges to fully sorted                      |
+| `select_nth_partial_by[_key]` | **O(1) in region size** | **per-step**       | in-place out-of-core quickselect; converges to the selected partition           |
 
 `sort_by` is optimal when the region fits memory: one region-sized read, one
 crash-atomic write. Its bound is memory — a region too large for a single
@@ -147,8 +149,102 @@ genuinely exceed memory; prefer `sort_by` whenever the region fits.
 
 `select_nth_by[_key]` is single-transaction: it runs `select_nth_unstable_by`
 on an in-memory proxy index under one `process`, so it inherits `sort_by`'s
-memory bound. An out-of-core selection is a distinct problem — quickselect's
-whole point is avoiding a full sort, so the run-and-merge structure above does
-not apply; it needs section-local partitioning with a cross-section pivot pass.
-That is not yet implemented; for out-of-core data, `sort_partial_by` followed by
-`get(nth)` is the available fallback.
+memory bound. `select_nth_partial_by[_key]` (see `select_nth` /
+`partition_select` / `sample_pivot_index` in `src/alloc/chunk.rs`) is the
+bounded-memory version, with the same budget and per-step crash-atomicity as
+`sort_partial_by`. It does **not** reuse the run-and-merge machinery —
+quickselect's whole point is to avoid sorting — so it is a distinct engine:
+bounded-memory quickselect with a cross-region pivot sample.
+
+### Rank-band invariant
+
+Selection narrows an active record range `[lo, hi)` known to contain global rank
+`n`, holding a **rank-band invariant**: every record left of `lo` is ≤ every
+record in `[lo, hi)`, which is ≤ every record right of `hi`. It starts at
+`[0, count)`; each round partitions `[lo, hi)` and discards the side that cannot
+contain `n`, shrinking the band while the invariant holds. When the band fits
+the budget, one `process` finishes it exactly.
+
+### The loop
+
+```text
+lo, hi = 0, count
+loop:
+    if (hi - lo) * chunk_len <= budget:
+        process([lo, hi)): select_nth_unstable_by(n - lo, cmp)   // exact, atomic
+        return
+    pivot = sample_median(lo, hi)          // bounded read (below)
+    p     = partition(lo, hi, pivot)       // in-place, bounded, atomic per step
+    if n < p { hi = p } else { lo = p + 1 }   // p is a fixed pivot record; exclude it
+```
+
+The base case is the sort's trick reused: a range that fits the budget is
+settled by one in-memory `select_nth_unstable_by`. It is correct because the
+band invariant makes `[lo, hi)` a contiguous rank slice, so its local
+`(n − lo)`-th record is the global `n`-th. Only ranges larger than the budget
+need out-of-core partitioning.
+
+### Pivot selection — the cross-section pass
+
+A good pivot keeps the band shrinking geometrically. Read a bounded **sample**
+spread across `[lo, hi)` — one record every `(hi − lo) / S` positions for
+`S = budget / chunk_len` samples, a single strided pass — hold it in one window,
+and take its median as the pivot value (copied into a one-record pivot buffer).
+This is the "pivot-selection pass across sections": the sample straddles every
+section, so the median is representative without loading any section whole, and
+median-of-sample makes catastrophic imbalance vanishingly unlikely on real data.
+
+### Partition — bounded, in place, crash-safe
+
+Partition `[lo, hi)` around the pivot **value** with a two-pointer scan:
+
+- Scan from both ends for an out-of-place pair — a left record ≥ pivot and a
+  right record < pivot — and swap it with one `cross_exchange` (atomic,
+  permutation-preserving). Reads are block-buffered (load a `K`-record block,
+  scan it in memory), so scanning costs `O((hi − lo) / K)` reads rather than one
+  per record.
+- Each swap is its own crash-atomic step, so a crash mid-partition leaves a
+  valid permutation — never lost or duplicated data — and re-running from scratch
+  completes (the goal is idempotent). `Err` only on a genuine
+  `cross_exchange`/`process` I/O failure.
+
+Memory stays within budget: a pivot record, one or two `K`-record scan blocks,
+`O(1)` cursors — no scratch region, no allocator.
+
+### Termination and equal keys
+
+To guarantee progress, fix one pivot **record** at its final split position each
+round (swap the chosen pivot to the end, partition, swap it to `p`) and recurse
+into `[lo, p)` or `[p + 1, hi)`, excluding `p`. Each round then removes at least
+the pivot, so the band strictly shrinks; with a sample-median pivot the shrink is
+geometric (expected `O(log)` rounds), and the budget base case means any residual
+imbalance only matters while the band still exceeds the budget.
+
+Many equal keys are the one pathological case for two-way partitioning (each
+round peels off only the pivot). A three-way (Dutch-flag / Bentley–McIlroy)
+partition — `< pivot | == pivot | > pivot` — settles it: if `n` lands in the
+equal zone, any record there is the answer; otherwise recurse into `<` or `>`,
+dropping the whole equal run. Its out-of-core form keeps three cursors instead
+of two, same atomic-swap discipline.
+
+### Cost
+
+| Phase                    | Reads                     | Swaps                                       |
+|--------------------------|---------------------------|---------------------------------------------|
+| Pivot sample (per round) | `S = budget / chunk_len`  | —                                           |
+| Partition (per round)    | `O((hi − lo) / K)` blocks | `O(hi − lo)` single-record `cross_exchange` |
+| Base case                | one `process`             | —                                           |
+
+Rounds shrink the band geometrically in expectation, so summed reads are
+`O(count / K)` and swaps `O(count)` — linear, like in-memory quickselect, with
+the same fsync-per-swap caveat as the sort's rotation merge. The single-record
+swaps are the natural target for the same `set_batched` two-block batching
+optimization noted for the merge, deferred for the same reason.
+
+### Surface
+
+The split mirrors the sort: `select_nth_by[_key]` stays single-transaction for
+regions that fit memory, and `select_nth_partial_by[_key]` is the shipped
+bounded-memory variant. The current implementation uses the two-way (Lomuto)
+partition above; the three-way partition for heavy-duplicate regions remains the
+open optimization, alongside the shared `set_batched` block-batched-swap idea.
