@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`BStack::resize`/`ensure` (Rust, base API) / `bstack_resize`/`bstack_ensure` (C, base API) and `ensure_with` (Rust, `atomic`) / `bstack_ensure_with` (C, `BSTACK_FEATURE_ATOMIC`): grow-or-shrink and grow-to-at-least helpers.** `resize(target)` grows (zero-filled) or shrinks the payload to exactly `target` bytes; `ensure(target)` is the grow-only, no-op-if-already-long-enough counterpart. Both return the size before the call. `ensure_with(target, f)` additionally hands the freshly grown tail to `f` (`FnOnce(&mut [u8])` in Rust; `int cb(uint8_t *buf, size_t len, void *ctx)` in C, aborting the call on a nonzero return) for initialization before it commits — no `set` dependency, since it only touches bytes beyond the previously committed length. Growth follows `extend`'s crash-consistency, shrinkage follows `discard`'s. Ported from the 0.4.x line.
+
 ### Fixed
 
 - **`CheckedSlabBStackAllocator` (Rust) / `checked_slab_bstack_allocator_realloc` (C): an interrupted non-tail-shrink `realloc` could make recovery corrupt an *unrelated* live allocation.** The shrink committed the block's smaller count *before* scrubbing the excess blocks into the free list, so a fault in between left the excess holding stale payload while the header already claimed the smaller span. `recover`'s linear scan then read those orphaned bytes as a valid multi-block in-use marker, strode past a neighbouring live allocation's header, and reclaimed *its* interior as leaked blocks — writing free-list links over live data. The excess is now scrubbed to a zero-overhead free run *before* the count is committed, so every crash window leaves either the intact original, zero-overhead leaked blocks `recover` reclaims cleanly, or a region left with zeroed tail bytes (never a corrupted neighbour). On-disk format unchanged; allocator magic bumped `ALCK\x00\x01\x01\x00` → `ALCK\x00\x01\x02\x00` (patch byte only, so existing 0.1.x files stay compatible). Backported from the 0.4.x line. Surfaced by the allocator fault-injection fuzz.

@@ -4026,6 +4026,172 @@ static int test_is_empty_consistent_with_len(void)
  * main
  * ====================================================================== */
 
+/* -------------------------------------------------------------------------
+ * bstack_resize / bstack_ensure / bstack_ensure_with
+ * ---------------------------------------------------------------------- */
+
+static int test_resize_grows_with_zeros(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    CHECK(bstack_push(bs, (uint8_t *)"abc", 3, NULL) == 0);
+    uint64_t initial;
+    CHECK(bstack_resize(bs, 6, &initial) == 0);
+    CHECK(initial == 3);
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 6);
+    uint8_t buf[6]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(w == 6);
+    CHECK(memcmp(buf, "abc\0\0\0", 6) == 0);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_resize_shrinks(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    CHECK(bstack_push(bs, (uint8_t *)"helloworld", 10, NULL) == 0);
+    uint64_t initial;
+    CHECK(bstack_resize(bs, 5, &initial) == 0);
+    CHECK(initial == 10);
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 5);
+    uint8_t buf[5]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(memcmp(buf, "hello", 5) == 0);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_resize_same_size_is_noop(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    CHECK(bstack_push(bs, (uint8_t *)"hello", 5, NULL) == 0);
+    uint64_t initial;
+    CHECK(bstack_resize(bs, 5, &initial) == 0);
+    CHECK(initial == 5);
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 5);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_resize_shrink_below_locked_errors(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    CHECK(bstack_push(bs, (uint8_t *)"helloworld", 10, NULL) == 0);
+    CHECK(bstack_lock_up_to(bs, 5) == 0);
+    errno = 0;
+    CHECK(bstack_resize(bs, 3, NULL) == -1);
+    CHECK(errno == EINVAL);
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 10);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_resize_persists_across_reopen(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    CHECK(bstack_push(bs, (uint8_t *)"hi", 2, NULL) == 0);
+    CHECK(bstack_resize(bs, 4, NULL) == 0);
+    bstack_close(bs);
+    bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    uint8_t buf[4]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(w == 4);
+    CHECK(memcmp(buf, "hi\0\0", 4) == 0);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_ensure_grows_short_payload_with_zeros(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    CHECK(bstack_push(bs, (uint8_t *)"abc", 3, NULL) == 0);
+    uint64_t initial;
+    CHECK(bstack_ensure(bs, 6, &initial) == 0);
+    CHECK(initial == 3);
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 6);
+    uint8_t buf[6]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(memcmp(buf, "abc\0\0\0", 6) == 0);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_ensure_noop_when_already_long_enough(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    CHECK(bstack_push(bs, (uint8_t *)"helloworld", 10, NULL) == 0);
+    uint64_t initial;
+    CHECK(bstack_ensure(bs, 5, &initial) == 0);
+    CHECK(initial == 10);
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 10);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+#ifdef BSTACK_FEATURE_ATOMIC
+static int fill_xyz_cb(uint8_t *buf, size_t len, void *ctx)
+{
+    (void)ctx;
+    /* The region arrives zero-filled; overwrite it with a visible pattern. */
+    for (size_t i = 0; i < len; i++)
+        buf[i] = (uint8_t)('X' + (i % 3));
+    return 0;
+}
+
+static int abort_cb(uint8_t *buf, size_t len, void *ctx)
+{
+    (void)buf; (void)len; (void)ctx;
+    return -1;
+}
+
+static int test_ensure_with_grows_and_calls_callback(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    CHECK(bstack_push(bs, (uint8_t *)"abc", 3, NULL) == 0);
+    uint64_t initial;
+    CHECK(bstack_ensure_with(bs, 6, fill_xyz_cb, NULL, &initial) == 0);
+    CHECK(initial == 3);
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 6);
+    uint8_t buf[6]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(memcmp(buf, "abcXYZ", 6) == 0);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_ensure_with_noop_when_long_enough(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    CHECK(bstack_push(bs, (uint8_t *)"helloworld", 10, NULL) == 0);
+    uint64_t initial;
+    /* Callback would abort, but it must not be called since no growth is needed. */
+    CHECK(bstack_ensure_with(bs, 5, abort_cb, NULL, &initial) == 0);
+    CHECK(initial == 10);
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 10);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+#endif /* BSTACK_FEATURE_ATOMIC */
+
 int main(void)
 {
     /* Functional */
@@ -4093,6 +4259,19 @@ int main(void)
     T(test_discard_on_empty_returns_error);
     T(test_discard_leaves_correct_tail);
     T(test_discard_persists_across_reopen);
+
+    /* bstack_resize / bstack_ensure / bstack_ensure_with */
+    T(test_resize_grows_with_zeros);
+    T(test_resize_shrinks);
+    T(test_resize_same_size_is_noop);
+    T(test_resize_shrink_below_locked_errors);
+    T(test_resize_persists_across_reopen);
+    T(test_ensure_grows_short_payload_with_zeros);
+    T(test_ensure_noop_when_already_long_enough);
+#ifdef BSTACK_FEATURE_ATOMIC
+    T(test_ensure_with_grows_and_calls_callback);
+    T(test_ensure_with_noop_when_long_enough);
+#endif
 
     /* bstack_extend */
     T(test_extend_appends_zeros);

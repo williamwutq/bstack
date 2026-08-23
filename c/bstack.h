@@ -142,6 +142,26 @@ BSTACK_WARN_UNUSED_RESULT
 int bstack_discard(bstack_t *bs, size_t n);
 
 /*
+ * Grow or shrink the payload to exactly `target` bytes and durable-sync; any
+ * newly grown region is zero-filled.  If out_initial_len is non-NULL it
+ * receives the payload size before the call.  target == current size is a
+ * valid no-op.  Growth follows bstack_extend's guarantees, shrinkage
+ * bstack_discard's.  Returns EINVAL if shrinking would cut into the locked
+ * region [0, bstack_locked_len); otherwise -1 (errno set) on I/O error.
+ */
+BSTACK_WARN_UNUSED_RESULT
+int bstack_resize(bstack_t *bs, uint64_t target, uint64_t *out_initial_len);
+
+/*
+ * Grow the payload to at least `target` bytes (zero-filling the new region)
+ * and durable-sync; a no-op if it is already that long.  If out_initial_len is
+ * non-NULL it receives the payload size before the call.  The grow-only,
+ * unconditional counterpart of bstack_resize.
+ */
+BSTACK_WARN_UNUSED_RESULT
+int bstack_ensure(bstack_t *bs, uint64_t target, uint64_t *out_initial_len);
+
+/*
  * Write the current logical payload size (excluding the 16-byte header)
  * into *out_len.  This value is cached in memory, so no syscall is made;
  * it takes the read lock, so it can run concurrently with other readers
@@ -318,6 +338,25 @@ int bstack_try_extend(bstack_t *bs, uint64_t s,
  */
 BSTACK_WARN_UNUSED_RESULT
 int bstack_try_discard(bstack_t *bs, uint64_t s, size_t n, int *ok);
+
+/*
+ * Grow the payload to at least `target` bytes, only if it is currently shorter,
+ * handing the freshly allocated tail to `cb` for initialization before it is
+ * committed.  `cb` receives a zero-filled buffer of `target - old_len` bytes
+ * (exactly the region bstack_ensure would have appended) plus the caller's
+ * `ctx`; whatever it leaves in the buffer is what lands on disk.  A nonzero
+ * return from `cb` aborts the call (nothing is changed).  If out_initial_len is
+ * non-NULL it receives the payload size before the call.  Crash-atomic on the
+ * same terms as bstack_extend: the grown region sits beyond the committed
+ * length until the final header write.  Returns ENOMEM if the growth exceeds
+ * SIZE_MAX; otherwise -1 (errno set) on I/O error.
+ *
+ * Only available when compiled with -DBSTACK_FEATURE_ATOMIC.
+ */
+BSTACK_WARN_UNUSED_RESULT
+int bstack_ensure_with(bstack_t *bs, uint64_t target,
+                       int (*cb)(uint8_t *buf, size_t len, void *ctx),
+                       void *ctx, uint64_t *out_initial_len);
 
 /*
  * Pop n bytes from the tail, pass them read-only to the callback, then write

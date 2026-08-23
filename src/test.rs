@@ -861,6 +861,166 @@ mod tests {
         assert_eq!(s2.peek(0).unwrap(), b"hi\x00\x00");
     }
 
+    // ---- resize ---------------------------------------------------------
+
+    #[test]
+    fn resize_grows_with_zeros() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"abc").unwrap();
+        let initial = s.resize(6).unwrap();
+        assert_eq!(initial, 3);
+        assert_eq!(s.len().unwrap(), 6);
+        assert_eq!(s.peek(0).unwrap(), b"abc\x00\x00\x00");
+    }
+
+    #[test]
+    fn resize_shrinks() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        let initial = s.resize(5).unwrap();
+        assert_eq!(initial, 10);
+        assert_eq!(s.len().unwrap(), 5);
+        assert_eq!(s.peek(0).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn resize_same_size_is_noop() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        let initial = s.resize(5).unwrap();
+        assert_eq!(initial, 5);
+        assert_eq!(s.peek(0).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn resize_to_zero_truncates() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        let initial = s.resize(0).unwrap();
+        assert_eq!(initial, 5);
+        assert_eq!(s.len().unwrap(), 0);
+    }
+
+    #[test]
+    fn resize_shrink_below_locked_errors() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        s.lock_up_to(5).unwrap();
+        let err = s.resize(3).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(s.len().unwrap(), 10);
+    }
+
+    #[test]
+    fn resize_persists_across_reopen() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+        s.push(b"hi").unwrap();
+        s.resize(4).unwrap();
+        drop(s);
+        let s2 = BStack::open(&p).unwrap();
+        assert_eq!(s2.peek(0).unwrap(), b"hi\x00\x00");
+    }
+
+    // ---- ensure ---------------------------------------------------------
+
+    #[test]
+    fn ensure_grows_short_payload_with_zeros() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"abc").unwrap();
+        let initial = s.ensure(6).unwrap();
+        assert_eq!(initial, 3);
+        assert_eq!(s.len().unwrap(), 6);
+        assert_eq!(s.peek(0).unwrap(), b"abc\x00\x00\x00");
+    }
+
+    #[test]
+    fn ensure_noop_when_already_long_enough() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        let initial = s.ensure(5).unwrap();
+        assert_eq!(initial, 10);
+        assert_eq!(s.len().unwrap(), 10);
+        assert_eq!(s.peek(0).unwrap(), b"helloworld");
+    }
+
+    #[test]
+    fn ensure_noop_when_exact_size() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        let initial = s.ensure(5).unwrap();
+        assert_eq!(initial, 5);
+        assert_eq!(s.len().unwrap(), 5);
+    }
+
+    #[test]
+    fn ensure_persists_across_reopen() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+        s.push(b"hi").unwrap();
+        s.ensure(4).unwrap();
+        drop(s);
+        let s2 = BStack::open(&p).unwrap();
+        assert_eq!(s2.peek(0).unwrap(), b"hi\x00\x00");
+    }
+
+    // ---- ensure_with (feature-gated) -----------------------------------
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn ensure_with_grows_and_calls_callback_on_new_region() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"abc").unwrap();
+        let initial = s
+            .ensure_with(6, |buf| {
+                assert_eq!(buf.len(), 3);
+                assert_eq!(buf, &[0u8, 0, 0]);
+                buf.copy_from_slice(b"XYZ");
+            })
+            .unwrap();
+        assert_eq!(initial, 3);
+        assert_eq!(s.len().unwrap(), 6);
+        assert_eq!(s.peek(0).unwrap(), b"abcXYZ");
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn ensure_with_skips_callback_when_already_long_enough() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        let mut called = false;
+        let initial = s
+            .ensure_with(5, |_| {
+                called = true;
+            })
+            .unwrap();
+        assert_eq!(initial, 10);
+        assert!(!called);
+        assert_eq!(s.peek(0).unwrap(), b"helloworld");
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn ensure_with_persists_across_reopen() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+        s.push(b"hi").unwrap();
+        s.ensure_with(5, |buf| buf.copy_from_slice(b"ZZZ")).unwrap();
+        drop(s);
+        let s2 = BStack::open(&p).unwrap();
+        assert_eq!(s2.peek(0).unwrap(), b"hiZZZ");
+    }
+
     // ---- zero (feature-gated) -----------------------------------------------
 
     #[cfg(feature = "set")]
