@@ -20,7 +20,7 @@ use std::sync::Mutex;
 use std::{collections::HashSet, fmt, io};
 
 #[cfg(feature = "set")]
-const ALCK_MAGIC: [u8; 8] = *b"ALCK\x00\x01\x01\x00";
+const ALCK_MAGIC: [u8; 8] = *b"ALCK\x00\x01\x02\x00";
 
 /// Compatibility prefix checked on open: `ALCK` + major 0 + minor 1.
 /// Any file whose first 6 bytes match is considered compatible.
@@ -1556,32 +1556,21 @@ impl BStackAllocator for CheckedSlabBStackAllocator {
         }
 
         // Shrink path (new_n < old_n).
-        // Overhead is the commit point for both tail and non-tail paths: write
-        // it first so a crash after this point leaves an orphaned (but safely
-        // unreferenced) tail region or leaked blocks that recover() can reclaim,
-        // rather than an overhead that claims more blocks than the file contains.
-        self.write_overhead(block_start, Self::IN_USE_BIT | new_n)?;
+        let excess_backing = old_backing - new_backing;
+        let excess_count = old_n - new_n;
+        let excess_start = block_start.checked_add(new_backing).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "excess start overflows u64")
+        })?;
 
-        // Tail shrink: try_discard atomically checks tail == sentinel and
-        // removes the excess under bstack's write lock, so no other thread can
-        // race between the check and the truncation. On failure the slice is
-        // not at the tail; fall through to recycle the excess blocks.
-        #[cfg(feature = "atomic")]
-        if self
-            .stack
-            .try_discard(sentinel, old_backing - new_backing)?
-        {
-            // SAFETY:
-            // 1. No overflow: slice.start() + new_len ≤ block_start + OVERHEAD + new_n * block_size − OVERHEAD ≤ u64::MAX
-            //    because new_n * block_size ≤ new_backing ≤ stack_len.
-            // 2. In bounds: tail discarded down to new_backing.
-            // 3. Alloc origin: slice.start() is unchanged; overhead records new_n.
-            return Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) });
-        }
-
+        // Non-atomic tail shrink fast path: commit the smaller count, then
+        // discard the tail. Commit-first is safe here — a crash before the
+        // discard leaves an orphaned tail past `new_n` that `recover` reclaims,
+        // and nothing live follows the arena tail — and it avoids scrubbing
+        // bytes that are about to be truncated away.
         #[cfg(not(feature = "atomic"))]
         if sentinel == self.stack.len()? {
-            self.stack.discard(old_backing - new_backing)?;
+            self.write_overhead(block_start, Self::IN_USE_BIT | new_n)?;
+            self.stack.discard(excess_backing)?;
             // SAFETY:
             // 1. No overflow: slice.start() + new_len ≤ block_start + OVERHEAD + new_n * block_size − OVERHEAD ≤ u64::MAX
             //    because new_n * block_size ≤ new_backing ≤ stack_len.
@@ -1590,32 +1579,66 @@ impl BStackAllocator for CheckedSlabBStackAllocator {
             return Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) });
         }
 
-        // Shrink non-tail: recycle the excess blocks into the free list.
+        // General shrink (non-tail, and every atomic shrink).
         //
-        // Ordering matters, and the commit must come first. Shrinking the
-        // first block's count is the commit point: before it the old view
-        // (old_n blocks, original payload) is fully intact; after it the new
-        // view (new_n blocks) is in force. Only once committed do we write
-        // free-list metadata into the excess blocks (which clobbers their old
-        // payload) and repoint free_head. A crash before the commit leaves
-        // the original allocation untouched; a crash after it leaks the
-        // excess blocks but never corrupts a live allocation. Writing the
-        // free run first would shred the tail payload while the header still
-        // claims old_n, leaving a recovered allocation that is neither
-        // cleanly old nor cleanly new.
+        // Crash-order matters: the excess blocks must never be left holding the
+        // allocation's stale payload once the header records the smaller count.
+        // Such bytes can mimic in-use overhead words and desynchronise
+        // `recover`'s linear scan — which would then stride over and reclaim an
+        // unrelated live allocation, corrupting it. So the excess is scrubbed to
+        // a clean, zero-overhead free run *before* the header is shrunk:
         //
-        // Overhead was already written above (the commit point).
-        let excess_start = block_start
-            .checked_add(new_n.checked_mul(self.block_size).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "free start multiplication overflows u64",
-                )
-            })?)
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "free start overflows u64")
-            })?;
-        self.push_free_blocks(excess_start, old_n - new_n)?;
+        //   1. `write_free_run` clears every excess overhead + payload byte and
+        //      links the run internally (`free_head` untouched). A fault here
+        //      leaves the excess untouched and the original allocation whole.
+        //   2. `write_overhead` commits the smaller count — the shrunk view is
+        //      now in force. A fault before the splice leaves the scrubbed excess
+        //      as zero-overhead leaked blocks that `recover` reclaims one by one,
+        //      staying aligned; it never strides into a live allocation.
+        //   3. Publish the run onto `free_head` (or discard it when it is the
+        //      arena tail, on the atomic path).
+        //
+        // (The previous order — commit the count first, scrub second — left a
+        // crash window in which the header claimed `new_n` while the excess still
+        // held the caller's stale payload, which is exactly what desynced
+        // `recover`.)
+        self.write_free_run(excess_start, excess_count)?;
+        self.write_overhead(block_start, Self::IN_USE_BIT | new_n)?;
+
+        #[cfg(feature = "atomic")]
+        {
+            // Discard when the scrubbed excess is the tail; otherwise splice the
+            // pre-built run onto free_head with one cross_exchange.
+            if !self.stack.try_discard(sentinel, excess_backing)? {
+                let last_block = excess_start
+                    .checked_add((excess_count - 1).checked_mul(self.block_size).ok_or_else(
+                        || {
+                            io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "last free-list offset overflows u64",
+                            )
+                        },
+                    )?)
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "last block offset overflows u64",
+                        )
+                    })?;
+                self.stack.cross_exchange(
+                    last_block + Self::OVERHEAD,
+                    Self::FREE_HEAD_OFFSET,
+                    8,
+                )?;
+            }
+        }
+        #[cfg(not(feature = "atomic"))]
+        {
+            // Non-tail (tail handled above): the run already points at the old
+            // head, so publishing its first block as the new head splices it.
+            self.stack
+                .set(Self::FREE_HEAD_OFFSET, excess_start.to_le_bytes())?;
+        }
         // SAFETY:
         // 1. No overflow: slice.start() + new_len ≤ block_start + OVERHEAD + new_n * block_size − OVERHEAD ≤ u64::MAX
         //    because new_n * block_size ≤ old_backing ≤ stack_len.
