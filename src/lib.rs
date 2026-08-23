@@ -1654,9 +1654,7 @@ impl BStack {
             if target < locked {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    format!(
-                        "resize({target}) would shrink payload below locked length ({locked})"
-                    ),
+                    format!("resize({target}) would shrink payload below locked length ({locked})"),
                 ));
             }
             file.set_len(HEADER_SIZE + target)?;

@@ -552,6 +552,334 @@ impl<'a, A: BStackSliceAllocator> BStackByteVec<'a, A> {
     }
 }
 
+// ── atomic bulk / positional operations (requires the `atomic` feature) ─────────
+
+/// Operations built on the crash-atomic in-file byte movers
+/// [`crate::BStack::copy`] and [`crate::BStack::cross_exchange`].
+///
+/// These need the `atomic` Cargo feature **in addition** to the `alloc` + `set`
+/// features the rest of the type requires, so they are compiled only when
+/// `atomic` is enabled; the base API is unaffected.
+///
+/// ## Crash-consistency classes
+///
+/// The append-only movers ([`extend_from_within`](Self::extend_from_within),
+/// [`extend_from_bstack_slice`](Self::extend_from_bstack_slice),
+/// [`append_from_owned`](Self::append_from_owned)) copy into spare capacity and
+/// commit `len` last, so a crash before the commit leaves the extra bytes
+/// invisible — the same benign, re-runnable model as [`push`](Self::push).
+///
+/// The in-place movers ([`insert`](Self::insert), [`remove`](Self::remove),
+/// [`swap_remove`](Self::swap_remove), [`move_tail_into`](Self::move_tail_into))
+/// mutate the live region before committing the new `len`.  Every individual
+/// `BStack` call is still crash-atomic, so the on-disk `(len, cap)` header is
+/// never left invalid, but the multi-step method is not atomic: a crash between
+/// the byte move and the `len` commit leaves a *logically torn* (but
+/// structurally valid) vec that is not automatically recovered.  Callers needing
+/// all-or-nothing semantics for these must layer their own journaling.
+#[cfg(feature = "atomic")]
+impl<'a, A: BStackSliceAllocator> BStackByteVec<'a, A> {
+    /// Absolute payload offset of logical byte `index` within the backing
+    /// [`crate::BStack`], i.e. the coordinate accepted by [`crate::BStack::copy`],
+    /// [`crate::BStack::cross_exchange`], and [`crate::BStack::repeat`].
+    ///
+    /// Equal to the block's start plus the 16-byte header plus `index`.  Must be
+    /// recomputed after any reallocation, since the block's start may move.
+    fn abs_offset(&self, index: u64) -> u64 {
+        self.slice
+            .start()
+            .saturating_add(HEADER_LEN)
+            .saturating_add(index)
+    }
+
+    /// Append a copy of the existing bytes `[start, start + count)` to the end of
+    /// the vec.
+    ///
+    /// The source range must lie within the current `len`.  Backed by a single
+    /// crash-atomic [`crate::BStack::copy`] into spare capacity; benign crash
+    /// model identical to [`push`](Self::push) (`reserve` → copy → write `len`, so
+    /// a crash before the commit leaves the copied bytes invisible and re-running
+    /// recovers).
+    ///
+    /// Returns `Ok(None)` if the source range is out of bounds — `start + count`
+    /// overflows `u64` or exceeds `len` — and `Ok(Some(()))` on success (an empty
+    /// range is a successful no-op).  `Err` is reserved for I/O failures.
+    pub fn extend_from_within(&mut self, start: u64, count: u64) -> io::Result<Option<()>> {
+        if count == 0 {
+            return Ok(Some(()));
+        }
+        let (len, _) = self.read_header()?;
+        // Out of bounds (overflow or past `len`) → None, per the get()-style contract.
+        match start.checked_add(count) {
+            Some(end) if end <= len => {}
+            _ => return Ok(None),
+        }
+        let alloc: &'a A = self.slice.allocator();
+        let stack = alloc.stack();
+        self.reserve(count)?;
+        // Recompute offsets after `reserve`: a realloc may have moved the block.
+        let src = self.abs_offset(start);
+        let dst = self.abs_offset(len);
+        stack.copy(src, dst, count)?;
+        self.write_len_field(len + count)?;
+        Ok(Some(()))
+    }
+
+    /// Insert `value` at `index`, shifting every byte at or after `index` one slot
+    /// to the right.
+    ///
+    /// The shift is a single crash-atomic [`crate::BStack::copy`] (an overlapping
+    /// move, handled internally by the write-in-progress journal).  In-place
+    /// mover: see the impl-level note — a crash between the shift and the `len`
+    /// commit leaves a logically torn but structurally valid vec.
+    ///
+    /// Returns `Ok(None)` if `index > len` (out of bounds; nothing is inserted)
+    /// and `Ok(Some(()))` on success.  `Err` is reserved for I/O failures.
+    pub fn insert(&mut self, index: u64, value: u8) -> io::Result<Option<()>> {
+        let (len, _) = self.read_header()?;
+        if index > len {
+            return Ok(None);
+        }
+        let alloc: &'a A = self.slice.allocator();
+        let stack = alloc.stack();
+        self.reserve(1)?;
+        if index < len {
+            let n = len - index;
+            stack.copy(self.abs_offset(index), self.abs_offset(index + 1), n)?;
+        }
+        self.write_byte_at(index, value)?;
+        self.write_len_field(len + 1)?;
+        Ok(Some(()))
+    }
+
+    /// Remove and return the byte at `index`, shifting every later byte one slot
+    /// to the left (preserves order).
+    ///
+    /// The shift is a single crash-atomic [`crate::BStack::copy`]; the vacated
+    /// tail slot is then zeroed as in [`pop`](Self::pop).  In-place mover: a crash
+    /// between the shift and the `len` commit leaves a logically torn but
+    /// structurally valid vec (see the impl-level note).
+    ///
+    /// Returns `Ok(None)` if `index >= len` (out of bounds; nothing is removed)
+    /// and `Ok(Some(byte))` with the removed byte on success.  `Err` is reserved
+    /// for I/O failures.
+    pub fn remove(&mut self, index: u64) -> io::Result<Option<u8>> {
+        let (len, _) = self.read_header()?;
+        if index >= len {
+            return Ok(None);
+        }
+        let value = self.read_byte_at(index)?;
+        let tail = len - index - 1;
+        if tail > 0 {
+            let alloc: &'a A = self.slice.allocator();
+            let stack = alloc.stack();
+            stack.copy(self.abs_offset(index + 1), self.abs_offset(index), tail)?;
+        }
+        self.write_len_field(len - 1)?;
+        self.zero_byte_at(len - 1)?;
+        Ok(Some(value))
+    }
+
+    /// Remove the byte at `index` and return it, replacing the hole with the last
+    /// byte (O(1), does **not** preserve order).
+    ///
+    /// Uses a single crash-atomic [`crate::BStack::cross_exchange`] to swap the
+    /// element into the tail slot, which is then dropped as in [`pop`](Self::pop).
+    /// In-place mover: a crash after the exchange but before the `len` commit
+    /// leaves the element at `index` and the last element swapped — a reordering,
+    /// not corruption; the vec stays structurally valid (see the impl-level note).
+    ///
+    /// Returns `Ok(None)` if `index >= len` (out of bounds; nothing is removed)
+    /// and `Ok(Some(byte))` with the removed byte on success.  `Err` is reserved
+    /// for I/O failures.
+    pub fn swap_remove(&mut self, index: u64) -> io::Result<Option<u8>> {
+        let (len, _) = self.read_header()?;
+        if index >= len {
+            return Ok(None);
+        }
+        let value = self.read_byte_at(index)?;
+        let last = len - 1;
+        if index != last {
+            let alloc: &'a A = self.slice.allocator();
+            let stack = alloc.stack();
+            stack.cross_exchange(self.abs_offset(index), self.abs_offset(last), 1)?;
+        }
+        self.write_len_field(last)?;
+        self.zero_byte_at(last)?;
+        Ok(Some(value))
+    }
+
+    /// Append the bytes of an on-disk [`BStackSlice`] to the end of the vec.
+    ///
+    /// `src` must be backed by the same [`crate::BStack`] as this vec (the bytes
+    /// are copied within one file).  Backed by a single crash-atomic
+    /// [`crate::BStack::copy`] into spare capacity; benign crash model identical
+    /// to [`push`](Self::push).
+    ///
+    /// # Errors
+    ///
+    /// [`io::ErrorKind::InvalidInput`] if `src` is backed by a different `BStack`.
+    pub fn extend_from_bstack_slice(&mut self, src: &BStackSlice<'_, A>) -> io::Result<()> {
+        let alloc: &'a A = self.slice.allocator();
+        let stack = alloc.stack();
+        if !std::ptr::eq(src.stack(), stack) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "BStackByteVec::extend_from_bstack_slice: source belongs to a different BStack",
+            ));
+        }
+        let n = src.len();
+        if n == 0 {
+            return Ok(());
+        }
+        let src_start = src.start();
+        let (len, _) = self.read_header()?;
+        self.reserve(n)?;
+        let dst = self.abs_offset(len);
+        stack.copy(src_start, dst, n)?;
+        self.write_len_field(len + n)
+    }
+
+    /// Copy `dst.len()` bytes from the vec, starting at logical `start`, into the
+    /// destination [`BStackSlice`] (overwriting it).
+    ///
+    /// The number of bytes copied is the destination's length.  `dst` must be
+    /// backed by the same [`crate::BStack`] as this vec.  A single crash-atomic
+    /// [`crate::BStack::copy`]; the vec itself is not modified.
+    ///
+    /// Returns `Ok(None)` if the source range is out of bounds — `start +
+    /// dst.len()` overflows `u64` or exceeds `len` — and `Ok(Some(()))` on success
+    /// (an empty destination is a successful no-op).
+    ///
+    /// # Errors
+    ///
+    /// [`io::ErrorKind::InvalidInput`] if `dst` is backed by a different `BStack`
+    /// (a misuse, distinct from an out-of-range request); otherwise `Err` is
+    /// reserved for I/O failures.
+    pub fn copy_into_bstack_slice(
+        &self,
+        start: u64,
+        dst: &mut BStackSlice<'_, A>,
+    ) -> io::Result<Option<()>> {
+        let alloc: &'a A = self.slice.allocator();
+        let stack = alloc.stack();
+        if !std::ptr::eq(dst.stack(), stack) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "BStackByteVec::copy_into_bstack_slice: destination belongs to a different BStack",
+            ));
+        }
+        let n = dst.len();
+        if n == 0 {
+            return Ok(Some(()));
+        }
+        let (len, _) = self.read_header()?;
+        // Out of bounds (overflow or past `len`) → None.
+        match start.checked_add(n) {
+            Some(end) if end <= len => {}
+            _ => return Ok(None),
+        }
+        stack.copy(self.abs_offset(start), dst.start(), n)?;
+        Ok(Some(()))
+    }
+
+    /// Append the bytes of `other` to the vec, then deallocate `other` — a move
+    /// that consumes the handle.
+    ///
+    /// `other`'s bytes are copied into spare capacity with a single crash-atomic
+    /// [`crate::BStack::copy`], `len` is committed, and `other` is freed through
+    /// its allocator.  `other` must be backed by the same [`crate::BStack`] as
+    /// this vec.  The copy targets invisible spare capacity and `len` is committed
+    /// before the free, so a crash before the free leaves the vec correct with
+    /// `other` merely still allocated (recoverable), never data loss.
+    ///
+    /// # Errors
+    ///
+    /// [`io::ErrorKind::InvalidInput`] if `other` is backed by a different
+    /// `BStack`; otherwise propagates the append or dealloc I/O error.  `other` is
+    /// consumed — and, wherever possible, freed — on every path, so it is never
+    /// leaked silently.
+    pub fn append_from_owned(&mut self, other: BStackSlice<'a, A>) -> io::Result<()> {
+        let alloc: &'a A = self.slice.allocator();
+        let stack = alloc.stack();
+        let other_alloc: &'a A = other.allocator();
+        if !std::ptr::eq(other_alloc.stack(), stack) {
+            // `other` belongs to a different BStack (a misuse). Free it through its
+            // own allocator so the call is not a leak; if that free itself fails,
+            // surface the I/O error rather than swallowing it — either way the
+            // dealloc result is not discarded.
+            other_alloc.dealloc(other)?;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "BStackByteVec::append_from_owned: source belongs to a different BStack",
+            ));
+        }
+        // Append first, capturing any error, but always fall through to the free
+        // so `other` is never leaked on an append failure.
+        let appended = (|| -> io::Result<()> {
+            let n = other.len();
+            if n == 0 {
+                return Ok(());
+            }
+            let src = other.start();
+            let (len, _) = self.read_header()?;
+            self.reserve(n)?;
+            let dst = self.abs_offset(len);
+            stack.copy(src, dst, n)?;
+            self.write_len_field(len + n)
+        })();
+        let freed = other_alloc.dealloc(other);
+        appended.and(freed)
+    }
+
+    /// Move the last `dest.len()` bytes of the vec into `dest`, shrinking the vec
+    /// by that many bytes.
+    ///
+    /// The tail is swapped into `dest` with a single crash-atomic
+    /// [`crate::BStack::cross_exchange`] (so the moved bytes exist in exactly one
+    /// place afterward), and the vacated tail — now holding `dest`'s former
+    /// contents — is dropped and zeroed by shrinking `len` via
+    /// [`truncate`](Self::truncate).  `dest` must be backed by the same
+    /// [`crate::BStack`] and sized to exactly the tail being moved.
+    ///
+    /// In-place mover: a crash after the exchange but before the truncate leaves
+    /// the vec's still-visible tail holding `dest`'s former bytes — a logically
+    /// torn but structurally valid state (see the impl-level note).  `dest` holds
+    /// the moved bytes once the exchange commits.
+    ///
+    /// Returns `Ok(None)` if `dest.len() > len` (out of bounds; the vec is
+    /// unchanged) and `Ok(Some(()))` on success (a zero-length `dest` is a
+    /// successful no-op).
+    ///
+    /// # Errors
+    ///
+    /// [`io::ErrorKind::InvalidInput`] if `dest` is backed by a different `BStack`
+    /// (a misuse, distinct from an out-of-range request); otherwise `Err` is
+    /// reserved for I/O failures.
+    pub fn move_tail_into(&mut self, dest: &mut BStackSlice<'a, A>) -> io::Result<Option<()>> {
+        let alloc: &'a A = self.slice.allocator();
+        let stack = alloc.stack();
+        if !std::ptr::eq(dest.stack(), stack) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "BStackByteVec::move_tail_into: destination belongs to a different BStack",
+            ));
+        }
+        let n = dest.len();
+        if n == 0 {
+            return Ok(Some(()));
+        }
+        let (len, _) = self.read_header()?;
+        if n > len {
+            return Ok(None);
+        }
+        let start = len - n;
+        stack.cross_exchange(self.abs_offset(start), dest.start(), n)?;
+        self.truncate(start)?;
+        Ok(Some(()))
+    }
+}
+
 // ── iterator ──────────────────────────────────────────────────────────────────
 
 /// An iterator over the bytes of a [`BStackByteVec`].
@@ -1191,5 +1519,222 @@ mod tests {
         assert_eq!(v.len().unwrap(), 3);
         assert_eq!(v.capacity().unwrap(), 8);
         assert_eq!(v.read_bytes().unwrap(), [10, 200, 30]);
+    }
+
+    // ── atomic movers: extend_from_within / insert / remove / swap_remove ─────
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn extend_from_within_appends_copy() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let mut v = BStackByteVec::from_slice(&[1, 2, 3, 4], &alloc).unwrap();
+        assert_eq!(v.extend_from_within(1, 2).unwrap(), Some(())); // copies [2, 3]
+        assert_eq!(v.read_bytes().unwrap(), [1, 2, 3, 4, 2, 3]);
+        // Empty range is a successful no-op.
+        assert_eq!(v.extend_from_within(0, 0).unwrap(), Some(()));
+        assert_eq!(v.read_bytes().unwrap(), [1, 2, 3, 4, 2, 3]);
+        // Source range out of bounds → None (overflow or past len), vec untouched.
+        assert_eq!(v.extend_from_within(4, 5).unwrap(), None);
+        assert_eq!(v.extend_from_within(u64::MAX, 1).unwrap(), None);
+        assert_eq!(v.read_bytes().unwrap(), [1, 2, 3, 4, 2, 3]);
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn insert_shifts_bytes_right() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let mut v = BStackByteVec::from_slice(&[10, 20, 30], &alloc).unwrap();
+        assert_eq!(v.insert(1, 99).unwrap(), Some(()));
+        assert_eq!(v.read_bytes().unwrap(), [10, 99, 20, 30]);
+        assert_eq!(v.insert(4, 40).unwrap(), Some(())); // at the end
+        assert_eq!(v.read_bytes().unwrap(), [10, 99, 20, 30, 40]);
+        // Index past len → None, vec untouched.
+        assert_eq!(v.insert(10, 0).unwrap(), None);
+        assert_eq!(v.read_bytes().unwrap(), [10, 99, 20, 30, 40]);
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn remove_shifts_bytes_left() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let mut v = BStackByteVec::from_slice(&[10, 20, 30, 40], &alloc).unwrap();
+        assert_eq!(v.remove(1).unwrap(), Some(20));
+        assert_eq!(v.read_bytes().unwrap(), [10, 30, 40]);
+        assert_eq!(v.remove(2).unwrap(), Some(40)); // last element
+        assert_eq!(v.read_bytes().unwrap(), [10, 30]);
+        // Index out of bounds → None, vec untouched.
+        assert_eq!(v.remove(5).unwrap(), None);
+        assert_eq!(v.read_bytes().unwrap(), [10, 30]);
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn swap_remove_replaces_with_last() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let mut v = BStackByteVec::from_slice(&[10, 20, 30, 40], &alloc).unwrap();
+        assert_eq!(v.swap_remove(1).unwrap(), Some(20));
+        // slot 1 now holds the former last element (40); order is not preserved.
+        assert_eq!(v.read_bytes().unwrap(), [10, 40, 30]);
+        assert_eq!(v.swap_remove(2).unwrap(), Some(30)); // removing the last element
+        assert_eq!(v.read_bytes().unwrap(), [10, 40]);
+        // Index out of bounds → None, vec untouched.
+        assert_eq!(v.swap_remove(9).unwrap(), None);
+        assert_eq!(v.read_bytes().unwrap(), [10, 40]);
+    }
+
+    // ── atomic cross-slice movers ─────────────────────────────────────────────
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn extend_from_bstack_slice_appends() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        // Pre-size so the vec never reallocs once `src` becomes the tail
+        // (LinearBStackAllocator can only grow the tail allocation).
+        let mut v = BStackByteVec::with_capacity(16, &alloc).unwrap();
+        v.push(1).unwrap();
+        v.push(2).unwrap();
+        let src = alloc.alloc(3).unwrap();
+        src.write([7u8, 8, 9]).unwrap();
+        v.extend_from_bstack_slice(&src).unwrap();
+        assert_eq!(v.read_bytes().unwrap(), [1, 2, 7, 8, 9]);
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn extend_from_bstack_slice_rejects_foreign_stack() {
+        let (alloc2, path2) = make_alloc();
+        let _g2 = Guard(path2);
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let mut v = BStackByteVec::with_capacity(16, &alloc).unwrap();
+        v.push(1).unwrap();
+        // `foreign` is backed by a different BStack → misuse Err.
+        let foreign = alloc2.alloc(2).unwrap();
+        foreign.write([5u8, 6]).unwrap();
+        let err = v.extend_from_bstack_slice(&foreign).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(v.read_bytes().unwrap(), [1]); // vec untouched
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn copy_into_bstack_slice_writes_destination() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let v = BStackByteVec::from_slice(&[10, 20, 30, 40, 50], &alloc).unwrap();
+        let mut dst = alloc.alloc(3).unwrap();
+        assert_eq!(v.copy_into_bstack_slice(1, &mut dst).unwrap(), Some(()));
+        assert_eq!(dst.read().unwrap(), [20, 30, 40]);
+        // start + dst.len() beyond the vec's len → None.
+        assert_eq!(v.copy_into_bstack_slice(4, &mut dst).unwrap(), None);
+        // Overflow of start + dst.len() → None.
+        assert_eq!(v.copy_into_bstack_slice(u64::MAX, &mut dst).unwrap(), None);
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn copy_into_bstack_slice_rejects_foreign_stack() {
+        let (alloc2, path2) = make_alloc();
+        let _g2 = Guard(path2);
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let v = BStackByteVec::from_slice(&[1, 2, 3], &alloc).unwrap();
+        let mut foreign = alloc2.alloc(2).unwrap();
+        let err = v.copy_into_bstack_slice(0, &mut foreign).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn append_from_owned_moves_and_frees() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let mut v = BStackByteVec::with_capacity(16, &alloc).unwrap();
+        v.push(1).unwrap();
+        v.push(2).unwrap();
+        v.push(3).unwrap();
+        let owned = alloc.alloc(2).unwrap();
+        owned.write([8u8, 9]).unwrap();
+        v.append_from_owned(owned).unwrap();
+        assert_eq!(v.read_bytes().unwrap(), [1, 2, 3, 8, 9]);
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn append_from_owned_rejects_and_frees_foreign_stack() {
+        let (alloc2, path2) = make_alloc();
+        let _g2 = Guard(path2);
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let mut v = BStackByteVec::from_slice(&[1, 2], &alloc).unwrap();
+        // `foreign` belongs to a different BStack → misuse Err, and it must be
+        // freed (consumed) rather than leaked; the stack shrinks back on dealloc.
+        let size_before = alloc2.stack().len().unwrap();
+        let foreign = alloc2.alloc(4).unwrap();
+        assert!(alloc2.stack().len().unwrap() > size_before);
+        let err = v.append_from_owned(foreign).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        // Tail slice freed through its own allocator: stack reclaimed.
+        assert_eq!(alloc2.stack().len().unwrap(), size_before);
+        assert_eq!(v.read_bytes().unwrap(), [1, 2]); // vec untouched
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn move_tail_into_transfers_tail_bytes() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let mut v = BStackByteVec::from_slice(&[1, 2, 3, 4, 5], &alloc).unwrap();
+        let mut dest = alloc.alloc(2).unwrap();
+        assert_eq!(v.move_tail_into(&mut dest).unwrap(), Some(()));
+        assert_eq!(dest.read().unwrap(), [4, 5]);
+        assert_eq!(v.read_bytes().unwrap(), [1, 2, 3]);
+        assert_eq!(v.len().unwrap(), 3);
+        // A tail larger than len → None, vec unchanged.
+        let mut too_big = alloc.alloc(9).unwrap();
+        assert_eq!(v.move_tail_into(&mut too_big).unwrap(), None);
+        assert_eq!(v.read_bytes().unwrap(), [1, 2, 3]);
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn move_tail_into_rejects_foreign_stack() {
+        let (alloc2, path2) = make_alloc();
+        let _g2 = Guard(path2);
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let mut v = BStackByteVec::from_slice(&[1, 2, 3], &alloc).unwrap();
+        let mut foreign = alloc2.alloc(1).unwrap();
+        let err = v.move_tail_into(&mut foreign).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(v.read_bytes().unwrap(), [1, 2, 3]); // vec untouched
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn insert_persists_across_reopen() {
+        // An insert + remove must survive a drop-and-reopen via from_raw_block.
+        let path = temp_path();
+        let _g = Guard(path.clone());
+
+        let block_bytes = {
+            let alloc = LinearBStackAllocator::new(BStack::open(&path).unwrap());
+            let mut v = BStackByteVec::from_slice(&[10u8, 20, 30], &alloc).unwrap();
+            v.insert(1, 99).unwrap(); // [10, 99, 20, 30]
+            v.remove(3).unwrap(); // [10, 99, 20]
+            let bytes: [u8; 16] = v.into_raw_block().into();
+            bytes
+        };
+
+        let alloc = LinearBStackAllocator::new(BStack::open(&path).unwrap());
+        let block = unsafe { crate::alloc::BStackSlice::from_bytes(&alloc, block_bytes) };
+        let v = unsafe { BStackByteVec::from_raw_block(block) };
+        assert_eq!(v.len().unwrap(), 3);
+        assert_eq!(v.read_bytes().unwrap(), [10, 99, 20]);
     }
 }
