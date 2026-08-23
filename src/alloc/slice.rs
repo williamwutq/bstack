@@ -107,6 +107,7 @@ impl<'a, A: BStackAllocator> BStackSlice<'a, A> {
     ///   the allocator's persistent metadata in a way that is difficult or
     ///   impossible to recover from.
     #[inline]
+    #[must_use]
     pub unsafe fn from_raw_parts(allocator: &'a A, offset: u64, len: u64) -> Self {
         Self {
             allocator,
@@ -125,6 +126,7 @@ impl<'a, A: BStackAllocator> BStackSlice<'a, A> {
     /// Useful as a sentinel or default value when a slice field must be
     /// initialized before a real allocation is available.
     #[inline]
+    #[must_use]
     pub fn empty(allocator: &'a A) -> Self {
         Self {
             allocator,
@@ -138,6 +140,7 @@ impl<'a, A: BStackAllocator> BStackSlice<'a, A> {
     /// Layout: `offset` as 8 bytes little-endian, then `len` as 8 bytes
     /// little-endian.  Reconstruct with [`BStackSlice::from_bytes`].
     #[inline]
+    #[must_use]
     pub fn to_bytes(&self) -> [u8; 16] {
         let mut out = [0u8; 16];
         out[..8].copy_from_slice(&self.offset.to_le_bytes());
@@ -154,6 +157,7 @@ impl<'a, A: BStackAllocator> BStackSlice<'a, A> {
     /// that lie within the bounds of the underlying allocator's payload.
     /// Passing an arbitrary or corrupted byte array is undefined behaviour.
     #[inline]
+    #[must_use]
     pub unsafe fn from_bytes(allocator: &'a A, bytes: [u8; 16]) -> Self {
         let offset = u64::from_le_bytes(bytes[..8].try_into().unwrap());
         let len = u64::from_le_bytes(bytes[8..].try_into().unwrap());
@@ -166,6 +170,7 @@ impl<'a, A: BStackAllocator> BStackSlice<'a, A> {
 
     /// Returns the start offset of this slice within the payload.
     #[inline]
+    #[must_use]
     pub fn start(&self) -> u64 {
         self.offset
     }
@@ -173,30 +178,35 @@ impl<'a, A: BStackAllocator> BStackSlice<'a, A> {
     /// The exclusive end offset of this slice within the payload
     /// (`self.start() + self.len()`).
     #[inline]
+    #[must_use]
     pub fn end(&self) -> u64 {
         self.offset + self.len
     }
 
     /// Returns the range of this slice as `start..end` within the payload.
     #[inline]
+    #[must_use]
     pub fn range(&self) -> Range<u64> {
         self.start()..self.end()
     }
 
     /// Returns the length of this slice in bytes.
     #[inline]
+    #[must_use]
     pub fn len(&self) -> u64 {
         self.len
     }
 
     /// Returns `true` if this slice spans zero bytes.
     #[inline]
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 
     /// Return the underlying allocator.
     #[inline]
+    #[must_use]
     pub fn allocator(&self) -> &'a A {
         self.allocator
     }
@@ -209,6 +219,7 @@ impl<'a, A: BStackAllocator> BStackSlice<'a, A> {
     /// and prefer methods on [`BStackSlice`] such as [`read`](BStackSlice::read) and
     /// [`write`](BStackSlice::write) that delegate to the stack internally.
     #[inline]
+    #[must_use]
     pub fn stack(&self) -> &BStack {
         self.allocator.stack()
     }
@@ -222,6 +233,8 @@ impl<'a, A: BStackAllocator> BStackSlice<'a, A> {
     ///
     /// Panics if `start > end` or `end > self.len()`.
     #[inline]
+    #[must_use]
+    #[track_caller]
     pub fn subslice(&self, start: u64, end: u64) -> BStackSlice<'a, A> {
         self.subslice_range(start..end)
     }
@@ -234,6 +247,8 @@ impl<'a, A: BStackAllocator> BStackSlice<'a, A> {
     /// # Panics
     ///
     /// Panics if `range.start > range.end` or `range.end > self.len()`.
+    #[must_use]
+    #[track_caller]
     pub fn subslice_range(&self, range: Range<u64>) -> BStackSlice<'a, A> {
         assert!(range.start <= range.end, "range start must be <= end");
         assert!(range.end <= self.len, "range end must be <= slice length");
@@ -386,6 +401,8 @@ impl<'a, A: BStackAllocator> BStackSlice<'a, A> {
     ///
     /// The reader implements [`io::Read`] and [`io::Seek`] in the coordinate
     /// space `[0, self.len())`.
+    #[inline]
+    #[must_use]
     pub fn reader(&self) -> BStackSliceReader<'a, A> {
         BStackSliceReader {
             slice: *self,
@@ -397,6 +414,8 @@ impl<'a, A: BStackAllocator> BStackSlice<'a, A> {
     ///
     /// `offset` is relative to `self.start()`.  Seeking past `self.len()` is
     /// allowed; subsequent reads return `Ok(0)`.
+    #[inline]
+    #[must_use]
     pub fn reader_at(&self, offset: u64) -> BStackSliceReader<'a, A> {
         BStackSliceReader {
             slice: *self,
@@ -408,6 +427,8 @@ impl<'a, A: BStackAllocator> BStackSlice<'a, A> {
     ///
     /// Requires the `set` feature.
     #[cfg(feature = "set")]
+    #[inline]
+    #[must_use]
     pub fn writer(&self) -> BStackSliceWriter<'a, A> {
         BStackSliceWriter {
             slice: *self,
@@ -422,6 +443,8 @@ impl<'a, A: BStackAllocator> BStackSlice<'a, A> {
     ///
     /// Requires the `set` feature.
     #[cfg(feature = "set")]
+    #[inline]
+    #[must_use]
     pub fn writer_at(&self, offset: u64) -> BStackSliceWriter<'a, A> {
         BStackSliceWriter {
             slice: *self,
@@ -436,6 +459,7 @@ impl<'a, A: BStackAllocator> BStackSlice<'a, A> {
 /// compare [`start`](BStackSlice::start) and [`len`](BStackSlice::len)
 /// explicitly if allocator identity matters.
 impl<'a, A: BStackAllocator> PartialEq for BStackSlice<'a, A> {
+    #[inline]
     fn eq(&self, other: &Self) -> bool {
         self.offset == other.offset && self.len == other.len
     }
@@ -497,6 +521,7 @@ pub struct BStackSliceReader<'a, A: BStackAllocator> {
 }
 
 impl<'a, A: BStackAllocator> Clone for BStackSliceReader<'a, A> {
+    #[inline]
     fn clone(&self) -> Self {
         *self
     }
@@ -518,12 +543,14 @@ impl<'a, A: BStackAllocator> fmt::Debug for BStackSliceReader<'a, A> {
 impl<'a, A: BStackAllocator> BStackSliceReader<'a, A> {
     /// Return the current cursor position within the slice (not the payload).
     #[inline]
+    #[must_use]
     pub fn position(&self) -> u64 {
         self.cursor
     }
 
     /// Return the underlying [`BStackSlice`].
     #[inline]
+    #[must_use]
     pub fn slice(&self) -> BStackSlice<'a, A> {
         self.slice
     }
@@ -654,12 +681,14 @@ impl<'a, A: BStackAllocator> fmt::Debug for BStackSliceWriter<'a, A> {
 impl<'a, A: BStackAllocator> BStackSliceWriter<'a, A> {
     /// Return the current cursor position within the slice (not the payload).
     #[inline]
+    #[must_use]
     pub fn position(&self) -> u64 {
         self.cursor
     }
 
     /// Return the underlying [`BStackSlice`].
     #[inline]
+    #[must_use]
     pub fn slice(&self) -> BStackSlice<'a, A> {
         self.slice
     }
@@ -685,6 +714,7 @@ impl<'a, A: BStackAllocator> io::Write for BStackSliceWriter<'a, A> {
     }
 
     /// No-op: every [`write`](io::Write::write) is already durably synced.
+    #[inline]
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }

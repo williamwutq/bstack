@@ -356,6 +356,7 @@ pub trait BStackAllocator: Sized {
     ///
     /// The default never errors.  Overriding implementations may return
     /// `Self::Error` from underlying operations.
+    #[inline]
     fn dealloc(&self, _handle: Self::Allocated<'_>) -> Result<(), Self::Error> {
         Ok(())
     }
@@ -363,6 +364,7 @@ pub trait BStackAllocator: Sized {
     /// Return the current logical length of the backing stack payload.
     ///
     /// Delegates to [`BStack::len`].
+    #[inline]
     fn len(&self) -> io::Result<u64> {
         self.stack().len()
     }
@@ -370,6 +372,7 @@ pub trait BStackAllocator: Sized {
     /// Return `true` if the backing stack is empty.
     ///
     /// Delegates to [`BStack::is_empty`].
+    #[inline]
     fn is_empty(&self) -> io::Result<bool> {
         self.stack().is_empty()
     }

@@ -135,7 +135,7 @@ int bstack_bytevec_with_capacity(bstack_allocator_t *a, uint64_t capacity,
         return -1;
     /* len is already 0 (zeroed by alloc); write the non-zero cap field. */
     if (bytevec_write_cap(out, capacity) != 0) {
-        bstack_allocator_dealloc(a, out->slice);
+        (void)bstack_allocator_dealloc(a, out->slice);
         return -1;
     }
     return 0;
@@ -159,7 +159,7 @@ int bstack_bytevec_from_data(bstack_allocator_t *a,
         if (bytevec_write_header(out, len, len) != 0 ||
             bstack_slice_write_range(out->slice, BYTEVEC_HEADER_LEN,
                                      data, data_len) != 0) {
-            bstack_allocator_dealloc(a, out->slice);
+            (void)bstack_allocator_dealloc(a, out->slice);
             return -1;
         }
     }

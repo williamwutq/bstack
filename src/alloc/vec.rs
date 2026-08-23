@@ -195,6 +195,7 @@ impl<'a, A: BStackSliceAllocator> BStackByteVec<'a, A> {
     ///
     /// Allocates a 16-byte block for the header only.  The first
     /// [`push`](Self::push) will trigger a reallocation to 4 bytes.
+    #[inline]
     pub fn new(alloc: &'a A) -> io::Result<Self> {
         let slice = alloc.alloc(HEADER_LEN)?;
         // Header is zero-initialised by the allocator: len=0, cap=0.
@@ -202,6 +203,7 @@ impl<'a, A: BStackSliceAllocator> BStackByteVec<'a, A> {
     }
 
     /// Create an empty `BStackByteVec` pre-sized for at least `capacity` bytes.
+    #[inline]
     pub fn with_capacity(capacity: u64, alloc: &'a A) -> io::Result<Self> {
         let slice = alloc.alloc(Self::block_size(capacity)?)?;
         let vec = Self { slice };
@@ -232,6 +234,8 @@ impl<'a, A: BStackSliceAllocator> BStackByteVec<'a, A> {
     /// by one of the `BStackByteVec` constructors on the same allocator, and the
     /// block header must have been written by a `BStackByteVec<A>`.  Passing an
     /// unrelated slice is undefined behaviour.
+    #[inline]
+    #[must_use]
     pub unsafe fn from_raw_block(slice: BStackSlice<'a, A>) -> Self {
         Self { slice }
     }
@@ -239,6 +243,7 @@ impl<'a, A: BStackSliceAllocator> BStackByteVec<'a, A> {
     /// Return the number of bytes currently stored.
     ///
     /// Re-reads `len` from the block header on every call.
+    #[inline]
     pub fn len(&self) -> io::Result<u64> {
         Ok(self.read_header()?.0)
     }
@@ -247,11 +252,13 @@ impl<'a, A: BStackSliceAllocator> BStackByteVec<'a, A> {
     /// reallocation.
     ///
     /// Re-reads `cap` from the block header on every call.
+    #[inline]
     pub fn capacity(&self) -> io::Result<u64> {
         Ok(self.read_header()?.1)
     }
 
     /// Return `true` if the vec contains no bytes.
+    #[inline]
     pub fn is_empty(&self) -> io::Result<bool> {
         Ok(self.len()? == 0)
     }
@@ -288,6 +295,7 @@ impl<'a, A: BStackSliceAllocator> BStackByteVec<'a, A> {
     /// Panics if the `len` read from the block header is corrupt (larger than
     /// the block can hold), causing the computed end offset to exceed the
     /// block's length.  Corruption is not a recoverable condition here.
+    #[track_caller]
     pub fn as_slice(&self) -> io::Result<BStackSlice<'a, A>> {
         let (len, _) = self.read_header()?;
         Ok(self.slice.subslice(HEADER_LEN, HEADER_LEN + len))
@@ -341,6 +349,7 @@ impl<'a, A: BStackSliceAllocator> BStackByteVec<'a, A> {
     /// Remove all bytes without releasing the allocation.
     ///
     /// Equivalent to `truncate(0)`.
+    #[inline]
     pub fn clear(&mut self) -> io::Result<()> {
         self.truncate(0)
     }
@@ -394,6 +403,7 @@ impl<'a, A: BStackSliceAllocator> BStackByteVec<'a, A> {
     /// immutably for the iterator's lifetime, preventing concurrent mutation.
     /// Each byte is read from disk on demand; errors surface as
     /// `io::Result::Err` items.
+    #[inline]
     pub fn iter(&self) -> io::Result<BStackByteVecIter<'_, 'a, A>> {
         let (len, _) = self.read_header()?;
         Ok(BStackByteVecIter {
@@ -424,6 +434,8 @@ impl<'a, A: BStackSliceAllocator> BStackByteVec<'a, A> {
     /// using a stale handle with `realloc` or `dealloc` can corrupt allocator
     /// state or lose data. Re-fetch with `raw_block()` after any mutation that
     /// may reallocate.
+    #[inline]
+    #[must_use]
     pub unsafe fn raw_block(&self) -> BStackSlice<'a, A> {
         self.slice
     }
@@ -432,6 +444,8 @@ impl<'a, A: BStackSliceAllocator> BStackByteVec<'a, A> {
     ///
     /// The caller takes responsibility for the allocation.  Reconstruct with
     /// [`BStackByteVec::from_raw_block`].
+    #[inline]
+    #[must_use]
     pub fn into_raw_block(self) -> BStackSlice<'a, A> {
         self.slice
     }
@@ -446,6 +460,7 @@ impl<'a, A: BStackSliceAllocator> BStackByteVec<'a, A> {
     /// After this call the backing storage is released; no further I/O on any
     /// handle derived from this vec (e.g. a prior [`raw_block`](Self::raw_block)
     /// copy) is valid.
+    #[inline]
     pub fn dealloc(self) -> io::Result<()> {
         self.slice.allocator().dealloc(self.slice)
     }
@@ -476,6 +491,7 @@ impl<'b, 'a: 'b, A: BStackSliceAllocator> fmt::Debug for BStackByteVecIter<'b, '
 impl<'b, 'a: 'b, A: BStackSliceAllocator> Iterator for BStackByteVecIter<'b, 'a, A> {
     type Item = io::Result<u8>;
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         if self.index >= self.len {
             return None;
@@ -485,6 +501,7 @@ impl<'b, 'a: 'b, A: BStackSliceAllocator> Iterator for BStackByteVecIter<'b, 'a,
         Some(result)
     }
 
+    #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
         // `self.index <= self.len` is invariant; subtraction cannot underflow.
         // On 32-bit platforms the cast saturates to usize::MAX, which is a

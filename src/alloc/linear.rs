@@ -81,6 +81,8 @@ pub struct LinearBStackAllocator {
 
 impl LinearBStackAllocator {
     /// Create a new `LinearBStackAllocator` that takes ownership of `stack`.
+    #[inline]
+    #[must_use]
     pub fn new(stack: BStack) -> Self {
         Self {
             stack,
@@ -98,12 +100,14 @@ impl fmt::Debug for LinearBStackAllocator {
 }
 
 impl From<BStack> for LinearBStackAllocator {
+    #[inline]
     fn from(stack: BStack) -> Self {
         Self::new(stack)
     }
 }
 
 impl From<LinearBStackAllocator> for BStack {
+    #[inline]
     fn from(alloc: LinearBStackAllocator) -> Self {
         alloc.into_stack()
     }
@@ -113,14 +117,17 @@ impl BStackAllocator for LinearBStackAllocator {
     type Error = io::Error;
     type Allocated<'a> = BStackSlice<'a, Self>;
 
+    #[inline]
     fn stack(&self) -> &BStack {
         &self.stack
     }
 
+    #[inline]
     fn into_stack(self) -> BStack {
         self.stack
     }
 
+    #[inline]
     fn alloc(&self, len: u64) -> io::Result<BStackSlice<'_, Self>> {
         let offset = self.stack.extend(len)?;
         // SAFETY: offset and len come from a fresh allocation via self.stack.extend(len)

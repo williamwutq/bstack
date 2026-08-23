@@ -862,10 +862,12 @@ impl BStackAllocator for FirstFitBStackAllocator {
     type Error = io::Error;
     type Allocated<'a> = BStackSlice<'a, Self>;
 
+    #[inline]
     fn stack(&self) -> &BStack {
         &self.stack
     }
 
+    #[inline]
     fn into_stack(self) -> BStack {
         self.stack
     }

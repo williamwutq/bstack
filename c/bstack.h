@@ -55,6 +55,22 @@
  *   bstack_masked_ne_crds.
  */
 
+/*
+ * BSTACK_WARN_UNUSED_RESULT — marks a function whose return value reports
+ * success/failure (0/-1, an error code, or NULL) so the compiler warns if a
+ * caller discards it without checking.  Prefixed before the declaration so
+ * it works identically under MSVC's SAL annotations and GCC/Clang's
+ * attribute syntax.
+ */
+#if defined(_MSC_VER)
+#include <sal.h>
+#define BSTACK_WARN_UNUSED_RESULT _Check_return_
+#elif defined(__GNUC__) || defined(__clang__)
+#define BSTACK_WARN_UNUSED_RESULT __attribute__((warn_unused_result))
+#else
+#define BSTACK_WARN_UNUSED_RESULT
+#endif
+
 typedef struct bstack bstack_t;
 
 #ifdef __cplusplus
@@ -62,6 +78,7 @@ extern "C" {
 #endif
 
 /* Open or create a stack file at path.  Returns NULL on failure (errno set). */
+BSTACK_WARN_UNUSED_RESULT
 bstack_t *bstack_open(const char *path);
 
 /* Close the handle and release all resources (flock, rwlock, fd, memory). */
@@ -73,6 +90,7 @@ void bstack_close(bstack_t *bs);
  * begins (i.e. the payload size before the write).
  * An empty slice (len == 0) is valid and returns the current end offset.
  */
+BSTACK_WARN_UNUSED_RESULT
 int bstack_push(bstack_t *bs, const uint8_t *data, size_t len,
                 uint64_t *out_offset);
 
@@ -82,6 +100,7 @@ int bstack_push(bstack_t *bs, const uint8_t *data, size_t len,
  * zeros begin (i.e. the payload size before the write).
  * n = 0 is valid and returns the current end offset.
  */
+BSTACK_WARN_UNUSED_RESULT
 int bstack_extend(bstack_t *bs, size_t n, uint64_t *out_offset);
 
 /*
@@ -90,6 +109,7 @@ int bstack_extend(bstack_t *bs, size_t n, uint64_t *out_offset);
  * If written is non-NULL it receives n on success.
  * Returns EINVAL if n exceeds the current payload size.
  */
+BSTACK_WARN_UNUSED_RESULT
 int bstack_pop(bstack_t *bs, size_t n,
                uint8_t *buf, size_t *written);
 
@@ -100,6 +120,7 @@ int bstack_pop(bstack_t *bs, size_t n,
  * offset == bstack_len is valid and copies 0 bytes.
  * Returns EINVAL if offset exceeds the payload size.
  */
+BSTACK_WARN_UNUSED_RESULT
 int bstack_peek(bstack_t *bs, uint64_t offset,
                 uint8_t *buf, size_t *written);
 
@@ -108,6 +129,7 @@ int bstack_peek(bstack_t *bs, uint64_t offset,
  * The caller must ensure buf has room for (end - start) bytes.
  * Returns EINVAL if end < start or end exceeds the payload size.
  */
+BSTACK_WARN_UNUSED_RESULT
 int bstack_get(bstack_t *bs, uint64_t start, uint64_t end,
                uint8_t *buf);
 
@@ -116,6 +138,7 @@ int bstack_get(bstack_t *bs, uint64_t start, uint64_t end,
  * Equivalent to bstack_pop but skips the read; n = 0 is a no-op.
  * Returns EINVAL if n exceeds the current payload size.
  */
+BSTACK_WARN_UNUSED_RESULT
 int bstack_discard(bstack_t *bs, size_t n);
 
 /*
@@ -124,6 +147,7 @@ int bstack_discard(bstack_t *bs, size_t n);
  * it takes the read lock, so it can run concurrently with other readers
  * but blocks while a writer is in progress.
  */
+BSTACK_WARN_UNUSED_RESULT
 int bstack_len(bstack_t *bs, uint64_t *out_len);
 
 /*
@@ -131,6 +155,7 @@ int bstack_len(bstack_t *bs, uint64_t *out_len);
  * Like bstack_len, this is a cached read under the read lock and makes
  * no syscall.
  */
+BSTACK_WARN_UNUSED_RESULT
 int bstack_is_empty(bstack_t *bs, int *out_empty);
 
 /*
@@ -154,6 +179,7 @@ uint64_t bstack_locked_len(bstack_t *bs);
  * Returns EINVAL if n is less than the current locked length (partition can
  * only grow) or if n exceeds the current payload length.
  */
+BSTACK_WARN_UNUSED_RESULT
 int bstack_lock_up_to(bstack_t *bs, uint64_t n);
 
 /*
@@ -165,6 +191,7 @@ int bstack_lock_up_to(bstack_t *bs, uint64_t n);
  * Returns NULL on failure (errno set); EINVAL if n exceeds the payload
  * length of the opened file.
  */
+BSTACK_WARN_UNUSED_RESULT
 bstack_t *bstack_open_locked_up_to(const char *path, uint64_t n);
 
 /*
@@ -181,6 +208,7 @@ bstack_t *bstack_open_locked_up_to(const char *path, uint64_t n);
  *
  * Returns NULL on failure (errno set).
  */
+BSTACK_WARN_UNUSED_RESULT
 bstack_t *bstack_open_cached(const char *path);
 
 /*
@@ -189,6 +217,7 @@ bstack_t *bstack_open_cached(const char *path);
  * Returns NULL on failure (errno set); EINVAL if n exceeds the payload
  * length of the opened file.
  */
+BSTACK_WARN_UNUSED_RESULT
 bstack_t *bstack_open_locked_up_to_cached(const char *path, uint64_t n);
 
 #ifdef BSTACK_FEATURE_SET
@@ -200,6 +229,7 @@ bstack_t *bstack_open_locked_up_to_cached(const char *path, uint64_t n);
  *
  * Only available when compiled with -DBSTACK_FEATURE_SET.
  */
+BSTACK_WARN_UNUSED_RESULT
 int bstack_set(bstack_t *bs, uint64_t offset,
                const uint8_t *data, size_t len);
 
@@ -211,6 +241,7 @@ int bstack_set(bstack_t *bs, uint64_t offset,
  *
  * Only available when compiled with -DBSTACK_FEATURE_SET.
  */
+BSTACK_WARN_UNUSED_RESULT
 int bstack_zero(bstack_t *bs, uint64_t offset, size_t n);
 #endif /* BSTACK_FEATURE_SET */
 
@@ -239,6 +270,7 @@ typedef struct {
  *
  * Only available when compiled with -DBSTACK_FEATURE_ATOMIC.
  */
+BSTACK_WARN_UNUSED_RESULT
 int bstack_atrunc(bstack_t *bs, size_t n,
                   const uint8_t *buf, size_t buf_len);
 
@@ -254,6 +286,7 @@ int bstack_atrunc(bstack_t *bs, size_t n,
  *
  * Only available when compiled with -DBSTACK_FEATURE_ATOMIC.
  */
+BSTACK_WARN_UNUSED_RESULT
 int bstack_splice(bstack_t *bs,
                   uint8_t *removed, size_t n,
                   const uint8_t *new_buf, size_t new_len);
@@ -268,6 +301,7 @@ int bstack_splice(bstack_t *bs,
  *
  * Only available when compiled with -DBSTACK_FEATURE_ATOMIC.
  */
+BSTACK_WARN_UNUSED_RESULT
 int bstack_try_extend(bstack_t *bs, uint64_t s,
                       const uint8_t *buf, size_t buf_len, int *ok);
 
@@ -282,6 +316,7 @@ int bstack_try_extend(bstack_t *bs, uint64_t s,
  *
  * Only available when compiled with -DBSTACK_FEATURE_ATOMIC.
  */
+BSTACK_WARN_UNUSED_RESULT
 int bstack_try_discard(bstack_t *bs, uint64_t s, size_t n, int *ok);
 
 /*
@@ -304,6 +339,7 @@ int bstack_try_discard(bstack_t *bs, uint64_t s, size_t n, int *ok);
  *
  * Only available when compiled with -DBSTACK_FEATURE_ATOMIC.
  */
+BSTACK_WARN_UNUSED_RESULT
 int bstack_replace(bstack_t *bs, size_t n,
                    int (*cb)(const uint8_t *old, size_t old_len,
                               uint8_t **new_buf, size_t *new_len,
@@ -320,6 +356,7 @@ int bstack_replace(bstack_t *bs, size_t n,
  *
  * Only available when compiled with -DBSTACK_FEATURE_ATOMIC.
  */
+BSTACK_WARN_UNUSED_RESULT
 int bstack_try_extend_zeros(bstack_t *bs, uint64_t s, size_t n, int *ok);
 
 /*
@@ -338,6 +375,7 @@ int bstack_try_extend_zeros(bstack_t *bs, uint64_t s, size_t n, int *ok);
  *
  * Only available when compiled with -DBSTACK_FEATURE_ATOMIC.
  */
+BSTACK_WARN_UNUSED_RESULT
 int bstack_get_batched(bstack_t *bs,
                        const bstack_iovec_t *entries, size_t n_entries);
 
@@ -361,6 +399,7 @@ int bstack_get_batched(bstack_t *bs,
  *
  * Only available when compiled with -DBSTACK_FEATURE_ATOMIC.
  */
+BSTACK_WARN_UNUSED_RESULT
 int bstack_get_batched_gen(bstack_t *bs,
                            int (*gen)(uint64_t *out_offset, uint8_t **out_buf,
                                       size_t *out_len, void *ctx),
@@ -473,6 +512,7 @@ typedef struct {
  * Only available when compiled with both -DBSTACK_FEATURE_SET and
  * -DBSTACK_FEATURE_ATOMIC.
  */
+BSTACK_WARN_UNUSED_RESULT
 int bstack_swap(bstack_t *bs, uint64_t offset,
                 uint8_t *old_buf, const uint8_t *new_buf, size_t len);
 
@@ -489,6 +529,7 @@ int bstack_swap(bstack_t *bs, uint64_t offset,
  * Only available when compiled with both -DBSTACK_FEATURE_SET and
  * -DBSTACK_FEATURE_ATOMIC.
  */
+BSTACK_WARN_UNUSED_RESULT
 int bstack_cas(bstack_t *bs, uint64_t offset,
                const uint8_t *old_buf, const uint8_t *new_buf,
                size_t len, int *ok);
@@ -509,6 +550,7 @@ int bstack_cas(bstack_t *bs, uint64_t offset,
  * Only available when compiled with both -DBSTACK_FEATURE_SET and
  * -DBSTACK_FEATURE_ATOMIC.
  */
+BSTACK_WARN_UNUSED_RESULT
 int bstack_process(bstack_t *bs, uint64_t start, uint64_t end,
                    int (*cb)(uint8_t *buf, size_t len, void *ctx),
                    void *ctx);
@@ -573,6 +615,7 @@ int bstack_process(bstack_t *bs, uint64_t start, uint64_t end,
  * Only available when compiled with both -DBSTACK_FEATURE_SET and
  * -DBSTACK_FEATURE_ATOMIC.
  */
+BSTACK_WARN_UNUSED_RESULT
 int bstack_process_gen(bstack_t *bs,
                        int (*gen)(bstack_gen_op_t *out_op, void *ctx),
                        void *ctx);
@@ -591,6 +634,7 @@ int bstack_process_gen(bstack_t *bs,
  * Only available when compiled with both -DBSTACK_FEATURE_SET and
  * -DBSTACK_FEATURE_ATOMIC.
  */
+BSTACK_WARN_UNUSED_RESULT
 int bstack_cross_exchange(bstack_t *bs, uint64_t a, uint64_t b, uint64_t n);
 
 /*
@@ -606,6 +650,7 @@ int bstack_cross_exchange(bstack_t *bs, uint64_t a, uint64_t b, uint64_t n);
  * Only available when compiled with both -DBSTACK_FEATURE_SET and
  * -DBSTACK_FEATURE_ATOMIC.
  */
+BSTACK_WARN_UNUSED_RESULT
 int bstack_copy(bstack_t *bs, uint64_t from, uint64_t to, uint64_t n);
 
 /*
@@ -625,6 +670,7 @@ int bstack_copy(bstack_t *bs, uint64_t from, uint64_t to, uint64_t n);
  * Only available when compiled with both -DBSTACK_FEATURE_SET and
  * -DBSTACK_FEATURE_ATOMIC.
  */
+BSTACK_WARN_UNUSED_RESULT
 int bstack_eq_crds(bstack_t *bs,
                    uint64_t a_offset, const uint8_t *a_expected, size_t a_len,
                    uint64_t b_offset, uint8_t *b_old_buf,
@@ -641,6 +687,7 @@ int bstack_eq_crds(bstack_t *bs,
  * Only available when compiled with both -DBSTACK_FEATURE_SET and
  * -DBSTACK_FEATURE_ATOMIC.
  */
+BSTACK_WARN_UNUSED_RESULT
 int bstack_ne_crds(bstack_t *bs,
                    uint64_t a_offset, const uint8_t *a_expected, size_t a_len,
                    uint64_t b_offset, uint8_t *b_old_buf,
@@ -659,6 +706,7 @@ int bstack_ne_crds(bstack_t *bs,
  * Only available when compiled with both -DBSTACK_FEATURE_SET and
  * -DBSTACK_FEATURE_ATOMIC.
  */
+BSTACK_WARN_UNUSED_RESULT
 int bstack_masked_eq_crds(bstack_t *bs,
                           uint64_t a_offset, const uint8_t *mask,
                           const uint8_t *a_expected, size_t a_len,
@@ -676,6 +724,7 @@ int bstack_masked_eq_crds(bstack_t *bs,
  * Only available when compiled with both -DBSTACK_FEATURE_SET and
  * -DBSTACK_FEATURE_ATOMIC.
  */
+BSTACK_WARN_UNUSED_RESULT
 int bstack_masked_ne_crds(bstack_t *bs,
                           uint64_t a_offset, const uint8_t *mask,
                           const uint8_t *a_expected, size_t a_len,

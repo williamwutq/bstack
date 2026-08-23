@@ -79,6 +79,7 @@ where
     /// allows mutation, it must ensure that all hooks are properly fired on
     /// subsequent reads and writes, and that any necessary synchronization is
     /// performed to prevent data races or undefined behavior.
+    #[inline]
     fn as_slice(&self) -> Result<BStackSlice<'a, A>, io::Error> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -95,6 +96,7 @@ where
     /// Returns `true` if this guarded view contains no data.
     ///
     /// This is a convenience method that defaults to `self.len() == 0`.
+    #[inline]
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -124,6 +126,7 @@ where
     /// `offset` is absolute to the [`crate::BStack`], and `len` is the number of
     /// bytes of the raw block to be read (before any `post_read` transformation).
     /// Return `Err` to deny the operation.
+    #[inline]
     fn pre_read(&self, _offset: u64, _len: u64) -> io::Result<()> {
         Ok(())
     }
@@ -138,6 +141,7 @@ where
     ///
     /// Callers that need a fixed output size should check the returned slice length
     /// and return `InvalidData` if it differs from the expected length.
+    #[inline]
     fn post_read<'d>(&self, data: &'d [u8]) -> io::Result<Cow<'d, [u8]>> {
         Ok(Cow::Borrowed(data))
     }
@@ -149,6 +153,7 @@ where
     ///
     /// Return `Cow::Borrowed` to pass through without allocation; return
     /// `Cow::Owned` for encryption, compression, or other transformations.
+    #[inline]
     fn pre_write<'d>(&self, data: &'d [u8]) -> io::Result<Cow<'d, [u8]>> {
         Ok(Cow::Borrowed(data))
     }
@@ -161,6 +166,7 @@ where
     /// `offset` is absolute offset within the [`crate::BStack`], and `len` is the length of the
     /// original data passed to `pre_write` (not the transformed length returned by `pre_write`).
     /// (before any `pre_write` transformation).
+    #[inline]
     fn post_write(&self, _offset: u64, _len: u64) -> io::Result<()> {
         Ok(())
     }
@@ -276,6 +282,7 @@ where
     /// # Panics
     ///
     /// Panics if the specified range is out of bounds of the apparent slice.
+    #[inline]
     fn subview_range(
         &self,
         range: std::ops::Range<u64>,

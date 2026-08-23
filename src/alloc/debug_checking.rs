@@ -192,6 +192,7 @@ fn record_freed_region(state: &mut DebugState, region: Range<u64>) {
 /// - Any two ranges within `allocated` overlap
 /// - Any two ranges within `freed` overlap
 /// - Any range in `allocated` overlaps with any range in `freed`
+#[track_caller]
 fn validate_initial_state(allocated: &mut HashSet<Range<u64>>, freed: &mut HashSet<Range<u64>>) {
     // Filter out empty ranges
     allocated.retain(|r| !r.is_empty());
@@ -290,6 +291,7 @@ where
     /// Return the inner allocator's handle.
     ///
     /// To inspect the region (offset, length), convert it with `.try_into::<BStackSlice<_>>()`.
+    #[must_use]
     pub fn inner(&self) -> &A::Allocated<'a> {
         &self.inner
     }
@@ -392,6 +394,7 @@ where
     /// The allocator starts with empty tracking sets. If you're reopening
     /// a file from a previous session and want to pre-populate those sets,
     /// use [`Self::with_state`] instead.
+    #[must_use]
     pub fn new(inner: A) -> Self {
         Self {
             inner,
@@ -413,6 +416,8 @@ where
     /// - Any two ranges within `allocated` overlap
     /// - Any two ranges within `freed` overlap
     /// - Any range in `allocated` overlaps with any range in `freed`
+    #[must_use]
+    #[track_caller]
     pub fn with_state(
         inner: A,
         allocated: impl IntoIterator<Item = Range<u64>>,
@@ -431,11 +436,13 @@ where
     }
 
     /// Return a reference to the inner allocator.
+    #[must_use]
     pub fn inner(&self) -> &A {
         &self.inner
     }
 
     /// Consume this allocator and return the inner allocator.
+    #[must_use]
     pub fn into_inner(self) -> A {
         self.inner
     }

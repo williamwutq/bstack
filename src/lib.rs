@@ -3495,6 +3495,7 @@ impl BStack {
     /// # Errors
     ///
     /// Never actually fails; returns [`io::Result`] for source compatibility.
+    #[inline]
     pub fn len(&self) -> io::Result<u64> {
         Ok(self.lock.read().unwrap().1)
     }
@@ -3504,6 +3505,7 @@ impl BStack {
     /// # Errors
     ///
     /// Never actually fails; returns [`io::Result`] for source compatibility.
+    #[inline]
     pub fn is_empty(&self) -> io::Result<bool> {
         Ok(self.lock.read().unwrap().1 == 0)
     }
@@ -3515,6 +3517,8 @@ impl BStack {
     /// touch them return [`io::ErrorKind::InvalidInput`]. For
     /// [`get`](Self::get) and [`get_into`](Self::get_into), reads to ranges
     /// entirely within it skip the rwlock.
+    #[inline]
+    #[must_use]
     pub fn locked_len(&self) -> u64 {
         self.locked.load(Ordering::Acquire)
     }
@@ -3663,6 +3667,7 @@ impl BStack {
     /// Propagates all errors from [`open`](Self::open).  Returns
     /// [`io::ErrorKind::InvalidInput`] if `n` exceeds the payload length of
     /// the opened file.
+    #[inline]
     pub fn open_locked_up_to(path: impl AsRef<Path>, n: u64) -> io::Result<Self> {
         let stack = Self::open(path)?;
         stack.lock_up_to(n)?;
@@ -3681,6 +3686,7 @@ impl BStack {
     /// # Errors
     ///
     /// Propagates all errors from [`open`](Self::open).
+    #[inline]
     pub fn open_cached(path: impl AsRef<Path>) -> io::Result<Self> {
         let mut stack = Self::open(path)?;
         stack.cache_enabled = true;
@@ -3698,6 +3704,7 @@ impl BStack {
     /// [`lock_up_to`](Self::lock_up_to).
     /// Returns [`io::ErrorKind::InvalidInput`] if `n` exceeds the payload
     /// length of the opened file.
+    #[inline]
     pub fn open_locked_up_to_cached(path: impl AsRef<Path>, n: u64) -> io::Result<Self> {
         let stack = Self::open_cached(path)?;
         stack.lock_up_to(n)?;
@@ -3719,11 +3726,13 @@ impl BStack {
 /// [`flush`](io::Write::flush) is a no-op because every `write` is already
 /// durable.
 impl io::Write for BStack {
+    #[inline]
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.push(buf)?;
         Ok(buf.len())
     }
 
+    #[inline]
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
@@ -3735,11 +3744,13 @@ impl io::Write for BStack {
 /// `RwLock`), the `Write` implementation is also available on `&BStack`,
 /// mirroring the standard library's `impl Write for &File`.
 impl io::Write for &BStack {
+    #[inline]
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.push(buf)?;
         Ok(buf.len())
     }
 
+    #[inline]
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
@@ -3766,6 +3777,7 @@ impl Eq for BStack {}
 /// time.  Pointer identity is therefore the only meaningful equality: a stack
 /// is equal to itself and to nothing else.
 impl PartialEq for BStack {
+    #[inline]
     fn eq(&self, other: &Self) -> bool {
         std::ptr::eq(self, other)
     }
@@ -3773,6 +3785,7 @@ impl PartialEq for BStack {
 
 /// Hashes the instance address, consistent with the pointer-identity [`PartialEq`].
 impl Hash for BStack {
+    #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
         (self as *const BStack).hash(state);
     }
@@ -3819,6 +3832,8 @@ pub struct BStackReader<'a> {
 
 impl BStack {
     /// Create a [`BStackReader`] positioned at the start of the payload.
+    #[inline]
+    #[must_use]
     pub fn reader(&self) -> BStackReader<'_> {
         BStackReader {
             stack: self,
@@ -3830,6 +3845,8 @@ impl BStack {
     ///
     /// Seeking past the current end is allowed; [`read`](io::Read::read) will
     /// return `Ok(0)` until new data is pushed past that point.
+    #[inline]
+    #[must_use]
     pub fn reader_at(&self, offset: u64) -> BStackReader<'_> {
         BStackReader {
             stack: self,
@@ -3840,24 +3857,29 @@ impl BStack {
 
 impl<'a> BStackReader<'a> {
     /// Return the current logical read offset within the payload.
+    #[inline]
+    #[must_use]
     pub fn position(&self) -> u64 {
         self.offset
     }
 }
 
 impl<'a> From<&'a BStack> for BStackReader<'a> {
+    #[inline]
     fn from(stack: &'a BStack) -> Self {
         stack.reader()
     }
 }
 
 impl<'a> From<BStackReader<'a>> for &'a BStack {
+    #[inline]
     fn from(val: BStackReader<'a>) -> Self {
         val.stack
     }
 }
 
 impl<'a> PartialOrd for BStackReader<'a> {
+    #[inline]
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
@@ -3869,6 +3891,7 @@ impl<'a> PartialOrd for BStackReader<'a> {
 /// and within that group the natural read order (smaller offset first) applies.
 /// This ordering is consistent with the pointer-identity [`PartialEq`].
 impl<'a> Ord for BStackReader<'a> {
+    #[inline]
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         let self_ptr = self.stack as *const BStack as usize;
         let other_ptr = other.stack as *const BStack as usize;

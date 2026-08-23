@@ -97,6 +97,7 @@ typedef struct {
  * Returns 0 on success, -1 on failure (errno set).
  * Writes the initialised vec into *out.
  */
+BSTACK_WARN_UNUSED_RESULT
 int bstack_bytevec_new(bstack_allocator_t *a, bstack_bytevec_t *out);
 
 /*
@@ -108,6 +109,7 @@ int bstack_bytevec_new(bstack_allocator_t *a, bstack_bytevec_t *out);
  * Returns 0 on success, -1 on failure (errno set).  Sets errno=EINVAL if
  * capacity would overflow uint64_t when adding the 16-byte header.
  */
+BSTACK_WARN_UNUSED_RESULT
 int bstack_bytevec_with_capacity(bstack_allocator_t *a, uint64_t capacity,
                                   bstack_bytevec_t *out);
 
@@ -119,6 +121,7 @@ int bstack_bytevec_with_capacity(bstack_allocator_t *a, uint64_t capacity,
  * Returns 0 on success, -1 on failure (errno set).  Sets errno=EINVAL if
  * data_len would overflow uint64_t when adding the 16-byte header.
  */
+BSTACK_WARN_UNUSED_RESULT
 int bstack_bytevec_from_data(bstack_allocator_t *a,
                               const uint8_t *data, size_t data_len,
                               bstack_bytevec_t *out);
@@ -145,6 +148,7 @@ bstack_bytevec_t bstack_bytevec_from_raw_block(bstack_slice_t slice);
  * Re-reads len from the block header on every call.
  * Returns 0 on success, -1 on failure (errno set).
  */
+BSTACK_WARN_UNUSED_RESULT
 int bstack_bytevec_len(const bstack_bytevec_t *v, uint64_t *out_len);
 
 /*
@@ -154,12 +158,14 @@ int bstack_bytevec_len(const bstack_bytevec_t *v, uint64_t *out_len);
  * Re-reads cap from the block header on every call.
  * Returns 0 on success, -1 on failure (errno set).
  */
+BSTACK_WARN_UNUSED_RESULT
 int bstack_bytevec_capacity(const bstack_bytevec_t *v, uint64_t *out_cap);
 
 /*
  * Set *out_empty to 1 if the vec contains no bytes, 0 otherwise.
  * Returns 0 on success, -1 on failure (errno set).
  */
+BSTACK_WARN_UNUSED_RESULT
 int bstack_bytevec_is_empty(const bstack_bytevec_t *v, int *out_empty);
 
 /*
@@ -171,6 +177,7 @@ int bstack_bytevec_is_empty(const bstack_bytevec_t *v, int *out_empty);
  *
  * Returns -1 on I/O failure (errno set).
  */
+BSTACK_WARN_UNUSED_RESULT
 int bstack_bytevec_get(const bstack_bytevec_t *v, uint64_t index,
                         uint8_t *out_byte, int *out_found);
 
@@ -185,6 +192,7 @@ int bstack_bytevec_get(const bstack_bytevec_t *v, uint64_t index,
  * Returns 0 on success, -1 on failure (errno set; errno=ENOMEM on allocation
  * failure, errno=EINVAL if len exceeds SIZE_MAX).
  */
+BSTACK_WARN_UNUSED_RESULT
 int bstack_bytevec_read_bytes(const bstack_bytevec_t *v,
                                uint8_t **out_buf, uint64_t *out_len);
 
@@ -228,6 +236,7 @@ bstack_slice_t bstack_bytevec_into_raw_block(bstack_bytevec_t v);
  *
  * Returns 0 on success, -1 on failure (errno set).
  */
+BSTACK_WARN_UNUSED_RESULT
 int bstack_bytevec_push(bstack_bytevec_t *v, uint8_t value);
 
 /*
@@ -240,6 +249,7 @@ int bstack_bytevec_push(bstack_bytevec_t *v, uint8_t value);
  *
  * Returns -1 on I/O failure (errno set).
  */
+BSTACK_WARN_UNUSED_RESULT
 int bstack_bytevec_pop(bstack_bytevec_t *v, uint8_t *out_byte, int *out_popped);
 
 /*
@@ -250,6 +260,7 @@ int bstack_bytevec_pop(bstack_bytevec_t *v, uint8_t *out_byte, int *out_popped);
  *
  * Returns 0 on success, -1 on failure (errno set).
  */
+BSTACK_WARN_UNUSED_RESULT
 int bstack_bytevec_truncate(bstack_bytevec_t *v, uint64_t new_len);
 
 /*
@@ -258,6 +269,7 @@ int bstack_bytevec_truncate(bstack_bytevec_t *v, uint64_t new_len);
  * Equivalent to bstack_bytevec_truncate(v, 0).
  * Returns 0 on success, -1 on failure (errno set).
  */
+BSTACK_WARN_UNUSED_RESULT
 int bstack_bytevec_clear(bstack_bytevec_t *v);
 
 /*
@@ -270,6 +282,7 @@ int bstack_bytevec_clear(bstack_bytevec_t *v);
  * len + additional overflows uint64_t.  Returns -1 with errno from the
  * failing bstack call on I/O error.
  */
+BSTACK_WARN_UNUSED_RESULT
 int bstack_bytevec_reserve(bstack_bytevec_t *v, uint64_t additional);
 
 /*
@@ -283,6 +296,7 @@ int bstack_bytevec_reserve(bstack_bytevec_t *v, uint64_t additional);
  * exceeds SIZE_MAX.  Returns -1 with errno=ENOMEM on allocation failure.
  * Returns -1 with errno from the failing bstack call on I/O error.
  */
+BSTACK_WARN_UNUSED_RESULT
 int bstack_bytevec_resize(bstack_bytevec_t *v, uint64_t new_len, uint8_t value);
 
 /* =========================================================================
@@ -297,6 +311,7 @@ int bstack_bytevec_resize(bstack_bytevec_t *v, uint64_t new_len, uint8_t value);
  *
  * Returns 0 on success, -1 on failure (errno set).
  */
+BSTACK_WARN_UNUSED_RESULT
 int bstack_bytevec_dealloc(bstack_bytevec_t v);
 
 #ifdef __cplusplus
