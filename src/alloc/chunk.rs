@@ -631,6 +631,71 @@ impl<'a> BStackChunk<'a> {
             key(a).cmp(&key(b))
         })
     }
+
+    /// Best-effort, bounded-memory, out-of-core selection: partition the chunks
+    /// in place so the chunk at `n` is the one a full sort by `cmp` would put
+    /// there, with every earlier chunk `<=` it and every later chunk `>=` it —
+    /// the same result as [`select_nth_by`](Self::select_nth_by), computed
+    /// without holding the whole region in memory.
+    ///
+    /// Unlike [`select_nth_by`](Self::select_nth_by), which runs
+    /// `select_nth_unstable_by` on an in-memory copy under one
+    /// [`BStack::process`], this is a bounded-memory quickselect: it narrows an
+    /// active record range around `n`, choosing each pivot from a cross-region
+    /// sample and partitioning in place with atomic [`BStack::cross_exchange`]
+    /// swaps, until the range fits the budget and one `process` settles it
+    /// exactly. Peak memory is O(1) in the region's total size; no scratch
+    /// region is used.
+    ///
+    /// Every step is crash-atomic and permutation-preserving, so a crash or an
+    /// early I/O-error return leaves the region as a valid permutation (never
+    /// lost or duplicated data) and re-running completes the selection. Returns
+    /// `Err` only on a genuine [`BStack::process`]/[`BStack::cross_exchange`]
+    /// I/O failure. See `algos/SORTSELECT.md`.
+    ///
+    /// Requires the `set` and `atomic` features.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `n >= self.chunk_count()`.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[track_caller]
+    pub fn select_nth_partial_by(
+        &mut self,
+        n: u64,
+        mut cmp: impl FnMut(&[u8], &[u8]) -> Ordering,
+    ) -> io::Result<()> {
+        assert!(
+            n < self.chunk_count(),
+            "select_nth_partial_by: n must be < chunk_count"
+        );
+        select_nth(&self.aligned, self.chunk_len, n, &mut cmp)
+    }
+
+    /// Key-extracting variant of
+    /// [`select_nth_partial_by`](Self::select_nth_partial_by). Same
+    /// bounded-memory, out-of-core, per-step-atomic behavior; the key is derived
+    /// from each chunk's bytes per comparison. Requires the `set` and `atomic`
+    /// features.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `n >= self.chunk_count()`.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[track_caller]
+    pub fn select_nth_partial_by_key<K: Ord>(
+        &mut self,
+        n: u64,
+        mut key: impl FnMut(&[u8]) -> K,
+    ) -> io::Result<()> {
+        assert!(
+            n < self.chunk_count(),
+            "select_nth_partial_by_key: n must be < chunk_count"
+        );
+        select_nth(&self.aligned, self.chunk_len, n, &mut |a, b| {
+            key(a).cmp(&key(b))
+        })
+    }
 }
 
 impl<'a> IntoIterator for BStackChunk<'a> {
@@ -970,6 +1035,150 @@ fn merge_sort(
         width = width.saturating_mul(2);
     }
     Ok(())
+}
+
+// ===================== Out-of-core in-place quickselect =====================
+//
+// Engine for `BStackChunk::select_nth_partial_by`/`select_nth_partial_by_key`.
+// Bounded-memory quickselect: narrow an active range `[lo, hi)` that holds rank
+// `n` (every record left of `lo` <= it <= every record right of `hi`), picking
+// each pivot from a cross-region sample and partitioning in place with atomic
+// `cross_exchange` swaps, until the range fits the budget and one `process`
+// settles it. Every step is crash-atomic and permutation-preserving.
+
+/// Choose a pivot record index in `[lo, hi)`: read a strided sample into
+/// `samp` (a budget-sized scratch buffer) and return the index of its median.
+#[cfg(all(feature = "set", feature = "atomic"))]
+fn sample_pivot_index(
+    aligned: &BStackSlice<'_>,
+    c: u64,
+    cu: usize,
+    lo: u64,
+    hi: u64,
+    samp: &mut [u8],
+    cmp: &mut dyn FnMut(&[u8], &[u8]) -> Ordering,
+) -> io::Result<u64> {
+    let range = hi - lo;
+    // As many samples as fit `samp`, but never more than the range holds.
+    let s = ((samp.len() / cu) as u64).clamp(1, range);
+    let stride = range / s; // >= 1: partition runs only when range > s
+    for t in 0..s {
+        let pos = lo + stride * t;
+        read_record(
+            aligned,
+            pos,
+            c,
+            &mut samp[(t as usize) * cu..(t as usize + 1) * cu],
+        )?;
+    }
+    let mut order: Vec<usize> = (0..s as usize).collect();
+    order.sort_by(|&a, &b| cmp(&samp[a * cu..(a + 1) * cu], &samp[b * cu..(b + 1) * cu]));
+    let med = order[order.len() / 2] as u64;
+    Ok(lo + stride * med)
+}
+
+/// Lomuto partition of `[lo, hi)` around the record at `piv_idx`, in place via
+/// atomic single-record `cross_exchange` swaps. Returns the pivot's final index
+/// `p`: `[lo, p)` compare `< pivot`, `[p + 1, hi)` compare `>= pivot`, and the
+/// pivot record sits at `p` in its final position. Requires `hi - lo >= 2`.
+#[cfg(all(feature = "set", feature = "atomic"))]
+#[allow(clippy::too_many_arguments)]
+fn partition_select(
+    aligned: &BStackSlice<'_>,
+    c: u64,
+    lo: u64,
+    hi: u64,
+    piv_idx: u64,
+    pbuf: &mut [u8],
+    one: &mut [u8],
+    cmp: &mut dyn FnMut(&[u8], &[u8]) -> Ordering,
+) -> io::Result<u64> {
+    let last = hi - 1;
+    read_record(aligned, piv_idx, c, pbuf)?; // pivot bytes captured before moving
+    if piv_idx != last {
+        aligned.stack().cross_exchange(
+            rec_off(aligned, piv_idx, c),
+            rec_off(aligned, last, c),
+            c,
+        )?;
+    }
+    let mut store = lo;
+    let mut k = lo;
+    while k < last {
+        read_record(aligned, k, c, one)?;
+        if cmp(one, pbuf) == Ordering::Less {
+            if k != store {
+                aligned.stack().cross_exchange(
+                    rec_off(aligned, store, c),
+                    rec_off(aligned, k, c),
+                    c,
+                )?;
+            }
+            store += 1;
+        }
+        k += 1;
+    }
+    if store != last {
+        aligned
+            .stack()
+            .cross_exchange(rec_off(aligned, store, c), rec_off(aligned, last, c), c)?;
+    }
+    Ok(store)
+}
+
+/// Out-of-core in-place selection of rank `n` over `aligned`, viewed as records
+/// of `c` bytes. `n < count` is the caller's precondition (asserted in the
+/// public methods). See the module note above and `BStackChunk::select_nth_partial_by`.
+#[cfg(all(feature = "set", feature = "atomic"))]
+fn select_nth(
+    aligned: &BStackSlice<'_>,
+    c: u64,
+    n: u64,
+    cmp: &mut dyn FnMut(&[u8], &[u8]) -> Ordering,
+) -> io::Result<()> {
+    let count = aligned.len() / c;
+    if count <= 1 {
+        return Ok(());
+    }
+    let cu = c as usize;
+    let budget = SORT_WINDOWS * SORT_BLOCK_BYTES;
+    let mut samp = vec![0u8; budget as usize];
+    let mut pbuf = vec![0u8; cu];
+    let mut one = vec![0u8; cu];
+    let mut lo = 0u64;
+    let mut hi = count;
+    loop {
+        // A single-record band already holds the answer (rank-band invariant).
+        if hi - lo <= 1 {
+            return Ok(());
+        }
+        // Band fits the budget: settle it exactly in one atomic pass. The band
+        // invariant makes the local (n - lo)-th record the global n-th.
+        if (hi - lo) * c <= budget {
+            let s = rec_off(aligned, lo, c);
+            let e = rec_off(aligned, hi, c);
+            let local = (n - lo) as usize;
+            return aligned.stack().process(s, e, |buf| {
+                let cnt = buf.len() / cu;
+                let mut order: Vec<usize> = (0..cnt).collect();
+                order.select_nth_unstable_by(local, |&i, &j| {
+                    cmp(&buf[i * cu..(i + 1) * cu], &buf[j * cu..(j + 1) * cu])
+                });
+                apply_chunk_permutation(buf, cu, &order);
+            });
+        }
+        let piv_idx = sample_pivot_index(aligned, c, cu, lo, hi, &mut samp, cmp)?;
+        let p = partition_select(aligned, c, lo, hi, piv_idx, &mut pbuf, &mut one, cmp)?;
+        // Recurse into the side holding `n`, excluding the fixed pivot at `p`
+        // (strict progress → termination).
+        if n < p {
+            hi = p;
+        } else if n > p {
+            lo = p + 1;
+        } else {
+            return Ok(());
+        }
+    }
 }
 
 impl<'a> BStackSlice<'a> {
