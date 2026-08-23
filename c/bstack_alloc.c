@@ -1213,11 +1213,38 @@ static int alff_recovery(bstack_t *bs)
         size    = read_le64(hdr_buf);
         is_free = hdr_buf[8] & 1;
 
-        /* Invalid size (below minimum, unaligned, or overflows u64) means
-         * mid-arena corruption rather than a partial tail write — refuse to
-         * silently discard all data that follows. */
+        /* The header does not describe a valid block (size below minimum,
+         * unaligned, or overflowing u64). Two cases:
+         *   * All-zero trailing region -> an interrupted tail-grow realloc,
+         *     which extends (zero-filling) the payload before rewriting the
+         *     header/footer to cover it. The valid block ends at pos and the
+         *     zeros beyond it carry no header (size reads 0). A real block is
+         *     never all-zero (size >= ALFF_MIN_PAYLOAD), so roll the extension
+         *     back by truncating to pos — restoring the pre-grow tail the failed
+         *     realloc already handed back to the caller.
+         *   * Anything else -> genuine mid-arena corruption; fail loudly rather
+         *     than silently discard the data that follows. */
         if (size < ALFF_MIN_PAYLOAD || size % 8 != 0
             || size > UINT64_MAX - ALFF_BLOCK_OVERHEAD) {
+            uint8_t *trailing;
+            int      all_zero = 1;
+            uint64_t k;
+#if UINT64_MAX > SIZE_MAX
+            if (remaining > (uint64_t)SIZE_MAX) { errno = EINVAL; ret = -1; goto done; }
+#endif
+            trailing = malloc((size_t)remaining);
+            if (!trailing) { ret = -1; goto done; }
+            if (bstack_get(bs, pos, pos + remaining, trailing) != 0) {
+                free(trailing); ret = -1; goto done;
+            }
+            for (k = 0; k < remaining; k++) {
+                if (trailing[k] != 0) { all_zero = 0; break; }
+            }
+            free(trailing);
+            if (all_zero) {
+                if (bstack_discard(bs, (size_t)remaining) != 0) { ret = -1; goto done; }
+                break;
+            }
             errno = EINVAL;
             ret = -1;
             goto done;
@@ -1265,6 +1292,30 @@ static int alff_recovery(bstack_t *bs)
                             block_total = r + ALFF_BLOCK_OVERHEAD;
                         }
                     }
+                }
+            }
+        }
+
+        /* Normalize the footer to the (authoritative) header size. Every
+         * block-resizing operation commits its new size to the header before the
+         * matching footer (a coalescing free writes header then footer, a tail
+         * grow writes header then footer, a split's header is fixed above), so a
+         * crash between those two writes leaves the header correct and the footer
+         * stale. The walk follows headers, so a stale footer slips through here
+         * yet corrupts a later neighbour's coalesce (which reads this footer) and
+         * eventually desyncs the walk. Rewriting the footer to match makes the
+         * block whole; healthy blocks already agree, so this is a no-op. */
+        {
+            uint64_t footer_pos = pos + ALFF_BLOCK_HDR_SIZE + size;
+            uint8_t  cur_ftr[8];
+            if (bstack_get(bs, footer_pos, footer_pos + 8, cur_ftr) != 0) {
+                ret = -1; goto done;
+            }
+            if (read_le64(cur_ftr) != size) {
+                uint8_t size_le[8];
+                write_le64(size_le, size);
+                if (bstack_set(bs, footer_pos, size_le, 8) != 0) {
+                    ret = -1; goto done;
                 }
             }
         }
@@ -1552,19 +1603,14 @@ static int ff_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
                            size_le, 8) != 0) { MUTEX_UNLOCK(a); return -1; }
             if (alff_clear_recovery_needed(a->bs) != 0) { MUTEX_UNLOCK(a); return -1; }
         } else {
-            uint64_t delta = aligned_current_len - aligned_new_len;
-#if UINT64_MAX > SIZE_MAX
-            if (delta > (uint64_t)SIZE_MAX) { MUTEX_UNLOCK(a); errno = EINVAL; return -1; }
-#endif
-            /* Tail-shrink touches only this block's header/footer and the tail.
-             * The lock above excludes concurrent tail modification; within that,
-             * the discard is a single atomic bstack call, so no recovery flag. */
-            write_le64(size_le, aligned_new_len);
-            if (bstack_set(a->bs, slice.offset + aligned_new_len,
-                           size_le, 8) != 0) { MUTEX_UNLOCK(a); return -1; }
-            if (bstack_set(a->bs, slice.offset - ALFF_BLOCK_HDR_SIZE,
-                           size_le, 8) != 0) { MUTEX_UNLOCK(a); return -1; }
-            if (bstack_discard(a->bs, (size_t)delta) != 0) { MUTEX_UNLOCK(a); return -1; }
+            /* Tail shrink: keep the block; don't reclaim the tail in place. A
+             * physical shrink needs a header write plus a discard (metadata +
+             * size change) that cannot be one crash-atomic call, and the
+             * block-walking recovery cannot parse the torn intermediate (a fault
+             * between the header rewrite and the discard leaves header, footer,
+             * and physical size disagreeing). Narrowing only the user-visible
+             * length (an oversized block, as a non-tail shrink does) needs no
+             * writes; the tail is reclaimed when the block is freed. */
         }
         out->allocator = self;
         out->offset    = slice.offset;

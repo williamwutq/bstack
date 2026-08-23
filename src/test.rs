@@ -2715,10 +2715,16 @@ mod first_fit_tests {
         let (alloc, path) = mk_ff("realloc_tail_shrink");
         let _g = Guard(path);
         let s = alloc.alloc(32).unwrap();
+        let s_start = s.start();
+        let before_len = alloc.len().unwrap();
         let s2 = alloc.realloc(s, 16).unwrap();
-        assert_eq!(s2.start(), s.start());
+        assert_eq!(s2.start(), s_start);
         assert_eq!(s2.len(), 16);
-        assert_eq!(alloc.len().unwrap(), ALFF_HDR_OFFSET + 16 + BLOCK_OVERHEAD);
+        // A tail shrink keeps the block at its physical size (an oversized block,
+        // exactly as a non-tail shrink does) rather than rewriting the header and
+        // discarding the tail as separate, non-crash-atomic steps. The stack
+        // length is therefore unchanged; the excess is reclaimed on free.
+        assert_eq!(alloc.len().unwrap(), before_len);
     }
 
     #[test]
@@ -3089,6 +3095,81 @@ mod first_fit_tests {
         let alloc2 = FirstFitBStackAllocator::new(stack2).unwrap();
         // After recovery, partial bytes should be discarded
         assert_eq!(alloc2.len().unwrap(), before_len);
+    }
+
+    #[test]
+    fn recovery_rolls_back_interrupted_tail_grow() {
+        // A tail-block-grow `realloc` `extend`s (zero-filling) the payload before
+        // rewriting the header/footer to cover it. A crash in that window leaves a
+        // valid block followed by an all-zero region with no block header — which
+        // the recovery scan used to read as a size-0 block and reject the whole
+        // file. Recovery now rolls the extension back by truncation.
+        let (alloc, path) = mk_ff("recovery_tailgrow");
+        let _g = Guard(path.clone());
+        let a = alloc.alloc(32).unwrap();
+        a.write(&[0xA7u8; 32]).unwrap();
+        let a_start = a.start();
+        let stack = alloc.into_stack();
+        let before_len = stack.len().unwrap();
+
+        // Reproduce the stranded state: a zero-filled tail region past the block
+        // with no header of its own, plus recovery_needed set.
+        stack.extend(64).unwrap();
+        stack.set(24, &1u32.to_le_bytes()).unwrap(); // recovery_needed = 1
+        drop(stack);
+
+        let stack2 = BStack::open(&path).unwrap();
+        let alloc2 = FirstFitBStackAllocator::new(stack2)
+            .expect("recovery must roll back the interrupted tail grow, not error");
+        // The interrupted extension is rolled back...
+        assert_eq!(alloc2.len().unwrap(), before_len);
+        // ...and the block's bytes survive.
+        assert_eq!(
+            alloc2.stack().get(a_start, a_start + 32).unwrap(),
+            vec![0xA7u8; 32]
+        );
+    }
+
+    #[test]
+    fn recovery_normalizes_stale_footer() {
+        // Every block-resizing operation commits its new size to the header
+        // before the matching footer, so a crash between the two writes leaves a
+        // correct header and a stale footer. The walk follows headers, so the
+        // mismatch slips through undetected yet corrupts a later neighbour's
+        // coalesce (which reads this footer). Recovery now normalizes every
+        // block's footer to its authoritative header size.
+        let (alloc, path) = mk_ff("recovery_footer");
+        let _g = Guard(path.clone());
+        let a = alloc.alloc(32).unwrap();
+        let _b = alloc.alloc(16).unwrap(); // keeps A a non-tail block
+        let a_start = a.start();
+        let stack = alloc.into_stack();
+
+        // block_start = payload - BLOCK_HEADER_SIZE(16); header size at
+        // block_start; footer at block_start + 16 + size. Corrupt the footer to a
+        // clearly-bogus, non-8-aligned value (so the partial-split check ignores
+        // it), leaving header/footer disagreeing.
+        let block_start = a_start - 16;
+        let size = u64::from_le_bytes(
+            <[u8; 8]>::try_from(stack.get(block_start, block_start + 8).unwrap()).unwrap(),
+        );
+        let footer_pos = block_start + 16 + size;
+        stack.set(footer_pos, &0xDEADu64.to_le_bytes()).unwrap();
+        stack.set(24, &1u32.to_le_bytes()).unwrap(); // recovery_needed = 1
+        drop(stack);
+
+        let stack2 = BStack::open(&path).unwrap();
+        let alloc2 = FirstFitBStackAllocator::new(stack2)
+            .expect("recovery must heal the stale footer, not error");
+        // Recovery restored the footer to the authoritative header size.
+        let footer = u64::from_le_bytes(
+            <[u8; 8]>::try_from(alloc2.stack().get(footer_pos, footer_pos + 8).unwrap()).unwrap(),
+        );
+        assert_eq!(footer, size, "recovery normalizes footer to header size");
+        // The allocator remains usable.
+        let r = alloc2.alloc(16).unwrap();
+        r.write(&[0x22u8; 16]).unwrap();
+        assert_eq!(r.read().unwrap(), vec![0x22u8; 16]);
     }
 
     // -----------------------------------------------------------------------

@@ -738,8 +738,21 @@ impl FirstFitBStackAllocator {
                         || size % 8 != 0
                         || size.checked_add(Self::BLOCK_OVERHEAD_SIZE).is_none()
                     {
-                        // Invalid size: this is mid-arena corruption, not a partial tail write.
-                        // Refuse to silently discard all data that follows.
+                        // The header does not describe a valid block. Two cases:
+                        //   * All-zero trailing region → an interrupted tail-grow
+                        //     `realloc`, which `extend`s (zero-filling) the payload
+                        //     before rewriting the header/footer to cover it. The
+                        //     valid block ends at `pos` and the zeros beyond it have
+                        //     no header (`size` reads 0). A real block is never
+                        //     all-zero (size ≥ MIN_BLOCK_PAYLOAD_SIZE), so roll the
+                        //     extension back by truncating to `pos` — restoring the
+                        //     pre-grow tail the failed `realloc` handed back.
+                        //   * Anything else → genuine mid-arena corruption; fail
+                        //     loudly rather than discard the data that follows.
+                        if self.stack.get(pos, stack_len)?.iter().all(|&b| b == 0) {
+                            self.stack.discard(remaining)?;
+                            break;
+                        }
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
                             format!(
@@ -794,6 +807,23 @@ impl FirstFitBStackAllocator {
                         }
                     }
                 }
+            }
+
+            // Normalize the footer to the (authoritative) header size. Every
+            // block-resizing operation commits its new size to the header before
+            // the matching footer — a coalescing free writes header then footer,
+            // a tail grow writes header then footer, a split's header is fixed by
+            // the partial-split check above — so on a crash between those two
+            // writes the header is correct and the footer is stale. The walk
+            // follows headers, so a stale footer slips through undetected here yet
+            // corrupts a later neighbour's coalesce (which reads this footer) and
+            // eventually desyncs the walk. Rewriting the footer to match makes the
+            // block whole. Healthy blocks already agree, so this is a no-op for them.
+            let footer_pos = pos + Self::BLOCK_HEADER_SIZE + size;
+            let mut footer_buf = [0u8; 8];
+            self.stack.get_into(footer_pos, &mut footer_buf)?;
+            if u64::from_le_bytes(footer_buf) != size {
+                self.stack.set(footer_pos, size.to_le_bytes().as_slice())?;
             }
 
             if is_free {
@@ -1038,21 +1068,17 @@ impl BStackAllocator for FirstFitBStackAllocator {
                         });
                     }
                     std::cmp::Ordering::Less => {
-                        // No recovery_needed: the header/footer writes and the discard touch
-                        // only this tail block, not the free list. The lock held above excludes
-                        // concurrent tail modification; within that, the discard is a single
-                        // atomic BStack call.
-                        // Write new footer before discarding so it lands at the right position
-                        self.stack.set(
-                            slice.start() + aligned_new_len,
-                            aligned_new_len.to_le_bytes(),
-                        )?;
-                        self.stack.set(
-                            slice.start() - Self::BLOCK_HEADER_SIZE,
-                            aligned_new_len.to_le_bytes(),
-                        )?;
-                        self.stack.discard(aligned_current_len - aligned_new_len)?;
-                        // SAFETY: slice shrunk in place at tail
+                        // Keep the block; don't reclaim the tail in place. A
+                        // physical shrink needs a header write plus a discard
+                        // (metadata + size change) that cannot be one
+                        // crash-atomic call, and the block-walking recovery
+                        // cannot parse the torn intermediate (a fault between the
+                        // header rewrite and the discard leaves header, footer,
+                        // and physical size disagreeing). Narrowing only the
+                        // user-visible length (an oversized block, exactly as a
+                        // non-tail shrink already does) needs no writes; the tail
+                        // is reclaimed when the block is freed.
+                        // SAFETY: same block, new_len ≤ old len ≤ block size.
                         return Ok(unsafe {
                             BStackSlice::from_raw_parts(self, slice.start(), new_len)
                         });
