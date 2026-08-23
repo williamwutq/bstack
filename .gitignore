@@ -23,3 +23,12 @@ test_*
 
 # VSCode
 .vscode/
+
+# GitHub
+.github/
+
+# Data
+.data/
+
+# Claude
+.claude/
