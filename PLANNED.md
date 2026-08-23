@@ -150,3 +150,147 @@ Both are pure forwarding: `allocator()` returns `&'a A`, independent of `&self`,
 ### Open questions
 
 - **Necessity.** The allocator is already at hand wherever a `BStackOwnedSlice` was obtained (it was needed to call `alloc`/`realloc` in the first place), so the caller can always reach `allocator.dealloc(handle)` directly. Whether the convenience of dropping that extra reference at call sites justifies the added inherent-method surface on `BStackOwnedSlice` is not yet decided.
+
+---
+
+## `BStackTransaction` — a buffered, crash-atomic transaction object (0.5.0)
+
+**Feature flag:** `transaction` (implies `set` + `atomic`) for the public API. The recovery path in `io_core` is ungated, like all recovery.
+**Breaking change:** Yes (0.5.0) — the on-disk magic bumps. The header layout is unchanged and there is no data migration; the only change is a new `wip_aux` mode. A 0.4 file and a 0.5 file differ in their first eight bytes and nothing else. See *Format and versioning*.
+
+### Motivation
+
+The only way to run several dependent operations under one held lock today is the generator protocol (`process_gen`, `inplace_gen`). It has three limits.
+
+- **The caller must write a state machine.** `SegregatedBStackAllocator::carve_and_free` contains the same algorithm twice: a straight-line sequence of `set` calls for builds without `atomic`, and, for the atomic path, a dispatch over `step < k`, `step == k`, `step < k + 1 + 2 * k` where each arm recomputes which piece it is handling. The generator's shape requires this.
+- **A sequence cannot span functions or crates.** Every op carries one caller-chosen `'a` that must outlive the whole call, so every buffer must be a local declared before the call and passed through `bstack_unsafe_reborrow!`. A callee cannot yield an op holding its own stack data, so a sequence cannot be built by recursion, by a helper, or by a downstream crate.
+- **Size cannot change.** `inplace_gen` rejects all size-changing ops: the multi-write journal uses `clen` as the staging base and `file_size` as its end. Allocate-a-block-then-link-it — what `bllist` needs for crash-atomic `append`/`split_off` — cannot be expressed.
+
+`algos/ATOMICLIST.md` requires a pointer-structure mutation to keep its reads and its dependent write in one critical section. The generator is currently the only construct that provides one.
+
+The NOT PLANNED entry on `BStackInPlaceGuard` rejected ambient interception and named the alternative: an explicit transaction object with a mirrored API over a buffered image, an explicit `commit`, and drop-discards. This entry is that object, plus size changes.
+
+### Design
+
+#### Shape
+
+A guard that holds the write lock for its lifetime and mirrors `BStack`'s surface:
+
+```rust
+impl BStack {
+    pub fn transaction(&self) -> io::Result<BStackTransaction<'_>>;
+    pub fn try_transaction(&self) -> io::Result<Option<BStackTransaction<'_>>>;
+}
+
+impl<'a> BStackTransaction<'a> {
+    // Mirrors BStack, modulo Rust-level type differences: len, get, get_into,
+    // peek, peek_into, set, zero, repeat, push, pop, pop_into, discard, extend,
+    // extend_sparse, resize, ensure, atrunc, splice, splice_into, copy, swap,
+    // swap_into, cas, cross_exchange, process, ...
+    pub fn commit(self) -> io::Result<()>;
+    pub fn abort(self);          // == drop; named for intent
+}
+```
+
+Methods take data by short borrow and return owned results. Nothing escapes a call, so the transactional path needs no reborrow macros, and a `&mut BStackTransaction<'_>` can be passed through recursion and across crate boundaries.
+
+`Drop` discards; `commit` is explicit and consuming. Same reasoning as the `BStackInPlaceGuard` entry: commit-on-drop would durably commit a partial transaction during panic unwind, and has no way to report an I/O error. Drop-discards also means `?` inside a transaction body rolls back.
+
+`BStackTransaction` holds the `RwLockWriteGuard`, so it is `!Send`.
+
+#### Ops are not journaled; the image is
+
+The transaction keeps no op log. It maintains one flat logical image of the payload — content plus length — and every method mutates that image in memory. Commit journals the difference between the committed state and the final image, not the sequence that produced it.
+
+Consequences:
+
+- `push(A); pop(n); push(B)`, where the pop cuts past the original committed end, makes the second push overwrite originally-committed bytes rather than append. Whether a dirty range is an in-place edit or an append is decided at commit, by comparing it against `min(base_len, final_len)`. An op log cannot represent this; an image can.
+- Bytes written and then popped, or written and then overwritten, cost no I/O.
+- `copy(a, b)` then `copy(b, a)` has one answer: the second reads the image the first left, which is what the two statements mean in ordinary code.
+- Reads see the buffered image, and a read fully covered by buffered content does no I/O. Later writes win on overlapping bytes. Both rules come from `inplace_gen`.
+
+An op that fails validation is not recorded and does not poison the transaction; the caller gets the `io::Result` and decides. This matches `inplace_gen`, and differs from a database transaction, where a failed statement usually aborts.
+
+This does not reverse the NOT PLANNED entry on `BStackGenOp::Copy`. That entry rejects a journal-level op whose source is read at replay time, after earlier copies have landed — chained copies then have no single answer, and individually non-overlapping copies can compose into an effective overlap. A transaction resolves `copy` at issue time against the image, and the journal only ever sees literal staged bytes.
+
+#### The buffer
+
+The image is a chunk list over `[0, cur_len)`; gaps are untouched committed bytes. Variants:
+
+| Variant                     | Holds               | Purpose                                   |
+|-----------------------------|---------------------|-------------------------------------------|
+| `Arena(Range<usize>)`       | arena range         | literal bytes, copied in at issue time    |
+| `Repeat { pattern, count }` | pattern, count      | pattern fill; memory is O(pattern)        |
+| `Copy { src, len }`         | committed reference | in-file copy, no arena bytes              |
+| `Move { src, len }`         | committed reference | in-file move; source vacated, may overlap |
+| `Extend { len }`            | length              | sparse zero growth via one `set_len`      |
+| `Discard { len }`           | length              | tail removal                              |
+
+`zero` is `Repeat` of one zero byte, and a transaction whose only dirty range is a `Repeat` commits through the existing O(1)-staging `Repeat` mode. `Move` has `memmove` semantics without materialising the region. `Extend`'s zeros cost no write I/O, and `Discard` is recorded as a length change rather than a rewrite.
+
+`Copy` and `Move` references need no dependency tracking. A later buffered write to the referenced source never reaches the disk, so the committed bytes still hold the issue-time content at commit; and the reference is materialised during staging, which runs before any destructive in-place write.
+
+`Repeat`, `Extend`, `Copy`, and `Move` keep the common cases out of memory: growing by a gigabyte of zeros costs a few bytes, and moving a gigabyte within the file costs none. Literal pushed bytes are what remains buffered.
+
+Arena garbage is the cost. Bytes superseded by a later write stay in the arena, so peak memory is the sum of all writes rather than the merged footprint, and a loop rewriting one offset grows without bound. Mitigations: reuse in place when the superseded chunk is the arena's tail, and compact above a live/total ratio.
+
+#### Commit planner
+
+Commit reduces the image to a set of dirty ranges plus a final length, then picks the cheapest journal mode that expresses it. Exactly one journal arm per transaction — the arm is the commit point in every existing mode.
+
+| Final state                                         | Plan                                                    |
+|-----------------------------------------------------|---------------------------------------------------------|
+| no dirty ranges, length unchanged                   | no-op; no write, no sync                                |
+| length unchanged, one dirty range                   | single-write path (derived atomicity, or `Set`)         |
+| length unchanged, one pattern or disjoint reference | `Repeat` / `Copy` — O(1) staging                        |
+| length unchanged, several dirty ranges              | `MultiWrite`                                            |
+| length changed, suffix rewrite from `a` acceptable  | one `SpliceGrow` / `SpliceShrink` over `[a, final_len)` |
+| length changed, otherwise                           | `MultiAtrunc` (new; see below)                          |
+
+The planner can recognise `Repeat` and `Copy` from the chunk variants. Through the direct API those modes are reached only when the caller names the matching method.
+
+The fifth row is the problem case. `a` is the lowest dirty offset, so a single splice rewrites everything from `a` to the end. In the motivating case — allocate a node at the tail, then update the previous tail's `next` pointer — `a` is wherever the previous node happens to sit, so a list whose last node is near offset zero of a large file would rewrite the file on every append. `MultiAtrunc` exists to remove that case.
+
+#### New journal mode: `MultiAtrunc`
+
+A general transaction is an `atrunc` fused with a multi-write, and there is no existing encoding for that. `MultiWrite` cannot be stretched to cover it: recovery pins block targets to `e <= committed_len` and always finalises with `clen` unchanged.
+
+Sketch, following the conventions of the existing modes:
+
+- `wip_aux = u64::MAX - 6`, continuing the decrementing sequence. `wip_ptr = 32 + clen'`, non-zero — unambiguous against `MultiWrite` (always armed with `wip_ptr == 0`) and against the single-region modes (each keyed by its own aux value).
+- Staging base `S = max(clen, clen')`, as the splice modes already use, so staging is disjoint from both the old payload and the new one.
+- The staged tail is the existing back-to-back `[s | e | data]` block sequence from `32 + S` to `file_size`, with validation relaxed from `e <= clen` to `e <= clen'`. On a grow, the new tail content is one more block, whose target sits above the old `clen`.
+- Protocol: `set_len` to fit staging → stage → sync → arm → sync → replay in tail order → sync → `write_header_commit(clen', 0, Set)` → sync → truncate to `32 + clen'`.
+- Recovery reads `clen'` from `wip_ptr` instead of deriving it from the file size. That is what allows an arbitrary block count; the splice modes can derive `clen'` only because they stage exactly one region.
+
+The mode overwrites committed bytes before its commit point, so WIP.md's Rule 2 applies: a reader that does not recognise the aux value rolls it back and leaves a torn region. That is the reason for the format change.
+
+#### Format and versioning
+
+The magic bumps, `0.5.x` becomes the current line, and `0.4.x` is maintained with backports, as `0.2.x` already is for allocator fixes. There is no data migration: the header stays 32 bytes, no field moves, no existing mode changes, and only a new mode is added.
+
+The upgrade mechanism is the one already in the crate. `FORMAT_MINOR` goes 4 → 5, so `MAGIC_PREFIX` changes and `open` rejects a 0.4 file loudly rather than silently upgrading it; `LEGACY_MAGIC_PREFIX` becomes the 0.4 prefix, and `BStack::migrate` converts a file explicitly, exactly as it does today for 0.1.x → 0.4. The conversion is smaller than the one already shipped: since the header layout does not change, `migrate` rewrites the eight magic bytes instead of rebuilding a 16-byte header into a 32-byte one.
+
+The alternative — gate the new mode's recovery behind the feature flag and keep the magic — does not work. A file armed by a build with the feature must still recover when reopened by a build without it, which is why `recover_multi_write` is already ungated. Gating recovery would make the on-disk format depend on which features a consumer compiled.
+
+#### Feature flag
+
+`transaction`, implying `set` + `atomic`. The machinery is large enough that it should be possible not to compile it. `cas`, `process`, `set_batched`, `process_gen`, and `inplace_gen` already cover sequences that fit in one closure, which is most of them; the transaction is for sequences that cross a function or crate boundary.
+
+Only the API is gated. `MultiAtrunc` recovery is ungated in `io_core`, and the magic bump is unconditional — an on-disk format that varies with compiled features would defeat the purpose.
+
+#### Hazards to document
+
+- **Re-entrancy deadlocks.** A callee holding `&BStack` that calls any method while a transaction is open blocks on the non-reentrant `RwLock`, and mirroring `BStack`'s full API makes such a callee more likely. A debug-only owning-`ThreadId` assertion at lock acquisition catches it in tests at no release cost. `lock_up_to` has the same problem, and would additionally move the immutable boundary over buffered content.
+- **Lock hold time is caller-controlled.** A long transaction blocks all writers and all non-locked-region readers. `try_transaction` is for callers that must not block. Holding a transaction across an `await` or across user input is misuse.
+- **Memory.** The chunk variants cover the common cases, but literal pushed bytes stay buffered until commit.
+
+### Open questions
+
+- **Consuming the `BStack` instead of borrowing it.** `into_transaction(self)`, with `commit` and `abort` handing the stack back, would make the re-entrancy deadlock a compile error rather than a debug-only assertion — no `&BStack` exists for a callee to call through. Exclusive ownership also removes the reason to hold the write lock for the transaction's lifetime, which would make the transaction `Send`. Both endings must return the stack unconditionally rather than an `io::Result<BStack>`: a failed commit hands back a recovered `BStack` (or the raw `File`) paired with the outcome, never nothing at all. It needs sole ownership, so an `Arc<BStack>` is out, and it does not compose with `BStackAllocator`, whose `&self` methods cannot move their owned `BStack` out — so probably a second constructor alongside the borrowing one.
+- **Nesting and joining.** A callee handed a transaction that wants to begin one must join instead, and an inner commit must not commit. Savepoints with partial rollback need an undo log or a per-savepoint image clone, and are likely out of scope for a first version.
+- **`guarded` interaction.** `BStackGuardedSlice` hooks fire on write, and a transactional write defers the write. Whether hooks fire at issue time, at commit time, or whether the transaction is simply not hook-integrated in the first version, has to be decided.
+- **State after a failed commit.** A commit that fails mid-journal leaves the file for recovery on the next open, and the in-memory handle in an unclear state. `journaled_multi_set` has the same property today; a transaction makes it easier to hit.
+- **Inspectable plans.** Exposing the chosen plan, publicly or in debug builds, would make the planner testable, and would let a caller see that a transaction is about to rewrite a suffix rather than a few blocks.
+- **Spilling.** Staging into the file tail as writes arrive would make transaction size independent of memory. It is harder here than in an in-place-only design, because a later grow can invalidate a staging base chosen earlier.
+- **C parity.** Required by the checklist. An opaque `bstack_txn_t` with `begin`/`read`/`write`/`commit`/`abort` fits C better than the generator callback.
