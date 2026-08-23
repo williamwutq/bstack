@@ -13,6 +13,25 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::io;
 
+/// One window / block for the out-of-core partial sort, in bytes. The sort
+/// keeps at most [`SORT_WINDOWS`] windows resident, so its peak buffer is
+/// `SORT_WINDOWS * SORT_BLOCK_BYTES` regardless of the region's total size.
+/// This is the partial sort's own budget — not tied to any streaming buffer
+/// elsewhere in the crate, and may be tuned independently.
+#[cfg(all(feature = "set", feature = "atomic"))]
+const SORT_BLOCK_BYTES: u64 = 2048;
+
+/// Windows held resident at once by the out-of-core partial sort: two merge
+/// inputs plus one carry/output window (equivalently, a three-block
+/// run-formation load). See [`SORT_BLOCK_BYTES`].
+#[cfg(all(feature = "set", feature = "atomic"))]
+const SORT_WINDOWS: u64 = 3;
+
+/// Total resident byte budget for the out-of-core sort and select engines:
+/// [`SORT_WINDOWS`] windows of [`SORT_BLOCK_BYTES`]. No step holds more than this.
+#[cfg(all(feature = "set", feature = "atomic"))]
+const SORT_BUDGET: u64 = SORT_WINDOWS * SORT_BLOCK_BYTES;
+
 /// A fixed-size-record view over a [`BStackSlice`] — a slice with a stride.
 ///
 /// Divides an underlying region into `chunk_len`-byte records. `BStackChunk`
@@ -561,6 +580,127 @@ impl<'a> BStackChunk<'a> {
             apply_chunk_permutation(buf, chunk_len, &order);
         })
     }
+
+    /// Best-effort, bounded-memory, out-of-core sort of the chunks in place.
+    ///
+    /// Unlike [`sort_by`](Self::sort_by), which reads the whole region into one
+    /// `Vec<u8>` and commits it in a single [`BStack::process`] transaction —
+    /// bounded by available memory, so a region too large for one `Vec<u8>`
+    /// cannot be sorted that way — this runs an **in-place bottom-up merge
+    /// sort** that never holds more than a fixed budget of bytes resident
+    /// (`SORT_WINDOWS * SORT_BLOCK_BYTES`, chosen internally — no knob), so peak
+    /// memory is O(1) in the region's total size. Runs are formed with
+    /// [`BStack::process`] and merged in place by a recursive rotation merge —
+    /// [`BStack::process`] for sub-ranges that fit the budget, plus
+    /// [`BStack::cross_exchange`] record swaps to rotate larger ranges; no
+    /// scratch region is used.
+    ///
+    /// # "Partial" / convergence
+    ///
+    /// On success the region is **fully sorted**. Every step — each run-forming
+    /// sort, each block swap, each merge window — is an independent crash-atomic
+    /// operation that only permutes the bytes it touches, so a crash mid-run or
+    /// an early return on I/O error leaves the region as some *valid
+    /// permutation* of the original records (never lost or duplicated data),
+    /// just not fully ordered. "Partial" names that interruptible middle state:
+    /// re-running from any such permutation completes the sort, so as long as
+    /// I/O eventually succeeds, repeated calls converge to fully sorted.
+    ///
+    /// Returns `Err` only on a genuine [`BStack::process`]/[`BStack::cross_exchange`]
+    /// I/O failure. Not guaranteed stable — the out-of-core merge may reorder
+    /// records that compare equal (use [`sort_by`](Self::sort_by) when the whole
+    /// region fits memory and stability is required).
+    ///
+    /// Requires the `set` and `atomic` features.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[inline]
+    pub fn sort_partial_by(
+        &mut self,
+        mut cmp: impl FnMut(&[u8], &[u8]) -> Ordering,
+    ) -> io::Result<()> {
+        merge_sort(&self.aligned, self.chunk_len, &mut cmp)
+    }
+
+    /// Key-extracting variant of [`sort_partial_by`](Self::sort_partial_by).
+    ///
+    /// Same bounded-memory, out-of-core, converging, per-step-atomic behavior;
+    /// the key is derived from each chunk's bytes per comparison. Requires the
+    /// `set` and `atomic` features.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[inline]
+    pub fn sort_partial_by_key<K: Ord>(
+        &mut self,
+        mut key: impl FnMut(&[u8]) -> K,
+    ) -> io::Result<()> {
+        merge_sort(&self.aligned, self.chunk_len, &mut |a, b| {
+            key(a).cmp(&key(b))
+        })
+    }
+
+    /// Best-effort, bounded-memory, out-of-core selection: partition the chunks
+    /// in place so the chunk at `n` is the one a full sort by `cmp` would put
+    /// there, with every earlier chunk `<=` it and every later chunk `>=` it —
+    /// the same result as [`select_nth_by`](Self::select_nth_by), computed
+    /// without holding the whole region in memory.
+    ///
+    /// Unlike [`select_nth_by`](Self::select_nth_by), which runs
+    /// `select_nth_unstable_by` on an in-memory copy under one
+    /// [`BStack::process`], this is a bounded-memory quickselect: it narrows an
+    /// active record range around `n`, choosing each pivot from a cross-region
+    /// sample and partitioning in place with atomic [`BStack::cross_exchange`]
+    /// swaps, until the range fits the budget and one `process` settles it
+    /// exactly. Peak memory is O(1) in the region's total size; no scratch
+    /// region is used.
+    ///
+    /// Every step is crash-atomic and permutation-preserving, so a crash or an
+    /// early I/O-error return leaves the region as a valid permutation (never
+    /// lost or duplicated data) and re-running completes the selection. Returns
+    /// `Err` only on a genuine [`BStack::process`]/[`BStack::cross_exchange`]
+    /// I/O failure. See `algos/SORTSELECT.md`.
+    ///
+    /// Requires the `set` and `atomic` features.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `n >= self.chunk_count()`.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[track_caller]
+    pub fn select_nth_partial_by(
+        &mut self,
+        n: u64,
+        mut cmp: impl FnMut(&[u8], &[u8]) -> Ordering,
+    ) -> io::Result<()> {
+        assert!(
+            n < self.chunk_count(),
+            "select_nth_partial_by: n must be < chunk_count"
+        );
+        select_nth(&self.aligned, self.chunk_len, n, &mut cmp)
+    }
+
+    /// Key-extracting variant of
+    /// [`select_nth_partial_by`](Self::select_nth_partial_by). Same
+    /// bounded-memory, out-of-core, per-step-atomic behavior; the key is derived
+    /// from each chunk's bytes per comparison. Requires the `set` and `atomic`
+    /// features.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `n >= self.chunk_count()`.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[track_caller]
+    pub fn select_nth_partial_by_key<K: Ord>(
+        &mut self,
+        n: u64,
+        mut key: impl FnMut(&[u8]) -> K,
+    ) -> io::Result<()> {
+        assert!(
+            n < self.chunk_count(),
+            "select_nth_partial_by_key: n must be < chunk_count"
+        );
+        select_nth(&self.aligned, self.chunk_len, n, &mut |a, b| {
+            key(a).cmp(&key(b))
+        })
+    }
 }
 
 impl<'a> IntoIterator for BStackChunk<'a> {
@@ -645,6 +785,417 @@ fn apply_chunk_permutation(buf: &mut [u8], chunk_len: usize, order: &[usize]) {
         }
         buf[cur * chunk_len..(cur + 1) * chunk_len].copy_from_slice(temp);
         visited[cur] = true;
+    }
+}
+
+// ===================== Out-of-core in-place merge sort ======================
+//
+// Engine for `BStackChunk::sort_partial_by`/`sort_partial_by_key`. Bottom-up
+// 2-way merge sort that never holds more than `SORT_WINDOWS * SORT_BLOCK_BYTES`
+// bytes resident: runs are formed with `BStack::process`, and adjacent runs are
+// merged in place by a recursive rotation merge (`imerge`) — sub-ranges that
+// fit the budget are sorted by one atomic `BStack::process`, and larger ranges
+// are split and rotated past each other with atomic `BStack::cross_exchange`
+// record swaps. Every remote op is individually crash-atomic and
+// permutation-preserving, so any crash or early I/O-error return leaves a valid
+// permutation of the records, and re-running completes the sort.
+
+/// Internal record-geometry view shared by the out-of-core sort/select engines:
+/// the target region plus the record stride in bytes (`c`) and as `usize`
+/// (`cu`). `Copy` — three cheap fields threaded through the engine in place of
+/// repeating them (and the low-level record ops) as arguments. Every method's
+/// index arithmetic stays within [`count`](Self::count) (a record count of an
+/// existing region, `<= 2^63`), so nothing can overflow for any real file;
+/// `c >= 1` (the `BStackChunk` invariant) keeps the divisions safe.
+#[cfg(all(feature = "set", feature = "atomic"))]
+#[derive(Clone, Copy)]
+struct Records<'s, 'a> {
+    aligned: &'s BStackSlice<'a>,
+    c: u64,
+    cu: usize,
+}
+
+#[cfg(all(feature = "set", feature = "atomic"))]
+impl<'s, 'a> Records<'s, 'a> {
+    #[inline]
+    fn new(aligned: &'s BStackSlice<'a>, c: u64) -> Self {
+        Records {
+            aligned,
+            c,
+            cu: c as usize,
+        }
+    }
+
+    /// Number of whole records in the region.
+    #[inline]
+    fn count(&self) -> u64 {
+        self.aligned.len() / self.c
+    }
+
+    /// Absolute byte offset of record `rec`.
+    #[inline(always)]
+    fn off(&self, rec: u64) -> u64 {
+        self.aligned.start() + rec * self.c
+    }
+
+    /// Read record `rec` into `buf` (`buf.len() == c`).
+    #[inline(always)]
+    fn read(&self, rec: u64, buf: &mut [u8]) -> io::Result<()> {
+        let s = rec * self.c;
+        self.aligned.subslice(s, s + self.c).read_into(buf)
+    }
+
+    /// Atomically swap the single records at `i` and `j` (which must differ).
+    #[inline(always)]
+    fn swap(&self, i: u64, j: u64) -> io::Result<()> {
+        self.aligned
+            .stack()
+            .cross_exchange(self.off(i), self.off(j), self.c)
+    }
+
+    /// Atomically read the record range `[lo, hi)`, permute it in memory via
+    /// `f`, and commit it — one crash-atomic transaction.
+    #[inline(always)]
+    fn process(&self, lo: u64, hi: u64, f: impl FnOnce(&mut [u8])) -> io::Result<()> {
+        self.aligned.stack().process(self.off(lo), self.off(hi), f)
+    }
+
+    /// Reverse the records in `[x, y)` via single-record atomic swaps.
+    #[inline(always)] // only called by `rotate`
+    fn reverse(&self, mut x: u64, mut y: u64) -> io::Result<()> {
+        while y > x + 1 {
+            let b = y - 1;
+            self.swap(x, b)?;
+            x += 1;
+            y = b;
+        }
+        Ok(())
+    }
+
+    /// Rotate: swap the adjacent record blocks `[a, b)` and `[b, d)` via three
+    /// reversals. Crash-safe: each underlying swap is atomic, so any crash
+    /// leaves a valid permutation.
+    #[inline(always)] // only called by `imerge`
+    fn rotate(&self, a: u64, b: u64, d: u64) -> io::Result<()> {
+        self.reverse(a, b)?;
+        self.reverse(b, d)?;
+        self.reverse(a, d)
+    }
+
+    /// First index in `[lo, hi)` whose record is *not less than* `key`.
+    #[inline(always)] // only called by `imerge`
+    fn lower_bound(
+        &self,
+        mut lo: u64,
+        mut hi: u64,
+        key: &[u8],
+        scratch: &mut [u8],
+        cmp: &mut dyn FnMut(&[u8], &[u8]) -> Ordering,
+    ) -> io::Result<u64> {
+        while lo < hi {
+            let m = lo + (hi - lo) / 2;
+            self.read(m, scratch)?;
+            if cmp(scratch, key) == Ordering::Less {
+                lo = m + 1;
+            } else {
+                hi = m;
+            }
+        }
+        Ok(lo)
+    }
+
+    /// First index in `[lo, hi)` whose record is *greater than* `key`.
+    #[inline(always)] // only called by `imerge`
+    fn upper_bound(
+        &self,
+        mut lo: u64,
+        mut hi: u64,
+        key: &[u8],
+        scratch: &mut [u8],
+        cmp: &mut dyn FnMut(&[u8], &[u8]) -> Ordering,
+    ) -> io::Result<u64> {
+        while lo < hi {
+            let m = lo + (hi - lo) / 2;
+            self.read(m, scratch)?;
+            if cmp(scratch, key) == Ordering::Greater {
+                hi = m;
+            } else {
+                lo = m + 1;
+            }
+        }
+        Ok(lo)
+    }
+
+    /// Merge the adjacent sorted runs `[lo0, mid0)` and `[mid0, hi0)` in place.
+    ///
+    /// A rotation merge (SymMerge): a sub-range that fits [`SORT_BUDGET`] is
+    /// merged by one atomic [`process`](Self::process) sort; a larger range is
+    /// split by binary-searching a pivot from the larger run and rotating the two
+    /// middle blocks past each other, then the two halves are merged the same
+    /// way. Every rotation is a sequence of atomic single-record swaps and every
+    /// base case is one atomic `process`, so O(1) records held resident (beyond
+    /// `ms`) and any crash leaves a valid permutation. Handles arbitrary
+    /// (including ragged) run lengths.
+    ///
+    /// Iterative, not recursive: the deferred half of each split is pushed onto
+    /// `ms.stack` (cleared on entry) and the smaller half is continued in place.
+    /// Since the halves partition the range exactly (`l_size + r_size = hi - lo`),
+    /// the continued half is always `<= (hi - lo) / 2`, so `ms.stack` holds at
+    /// most `⌈log2(hi - lo)⌉` entries — at most 63 for any region a u64-addressed
+    /// file can hold (`hi - lo <= count <= 2^63`). No call-stack recursion.
+    fn imerge(
+        &self,
+        lo0: u64,
+        mid0: u64,
+        hi0: u64,
+        ms: &mut MergeScratch,
+        cmp: &mut dyn FnMut(&[u8], &[u8]) -> Ordering,
+    ) -> io::Result<()> {
+        let cu = self.cu;
+        ms.stack.clear();
+        let (mut lo, mut mid, mut hi) = (lo0, mid0, hi0);
+        loop {
+            // Descend, splitting until the range is a base case. `hi - lo > 2`
+            // guarantees `llen >= 2` in the `llen >= rlen` branch (so `i > lo`)
+            // and is the base for records so wide that two exceed the budget;
+            // with pivoting the larger run, every split leaves both halves
+            // strictly smaller, so this terminates.
+            while lo < mid && mid < hi && hi - lo > 2 && (hi - lo) * self.c > SORT_BUDGET {
+                let (llen, rlen) = (mid - lo, hi - mid);
+                let (i, j);
+                if llen >= rlen {
+                    i = lo + llen / 2; // i in (lo, mid): llen >= 2 here
+                    self.read(i, &mut ms.bi)?; // pivot bytes held in `ms.bi`
+                    j = self.lower_bound(mid, hi, &ms.bi, &mut ms.bj, cmp)?;
+                } else {
+                    j = mid + rlen / 2; // j in (mid, hi): rlen >= 2 here
+                    self.read(j, &mut ms.bj)?; // pivot bytes held in `ms.bj`
+                    i = self.upper_bound(lo, mid, &ms.bj, &mut ms.bi, cmp)?;
+                }
+                // Skip a no-op rotation (one side of the pivot is empty).
+                if i < mid && mid < j {
+                    self.rotate(i, mid, j)?;
+                }
+                let new_mid = i + (j - mid); // in [lo, hi]
+                let (l_lo, l_mid, l_hi) = (lo, i, new_mid);
+                let (r_lo, r_mid, r_hi) = (new_mid, j, hi);
+                // Continue on the smaller half; defer the larger — bounds the stack.
+                if l_hi - l_lo <= r_hi - r_lo {
+                    ms.stack.push((r_lo, r_mid, r_hi));
+                    lo = l_lo;
+                    mid = l_mid;
+                    hi = l_hi;
+                } else {
+                    ms.stack.push((l_lo, l_mid, l_hi));
+                    lo = r_lo;
+                    mid = r_mid;
+                    hi = r_hi;
+                }
+            }
+            // Base case: two already-sorted runs that fit the budget (or a 1-2
+            // record range) — one atomic sort settles them. Degenerate ranges
+            // (an empty side) fall through to the pop.
+            if lo < mid && mid < hi {
+                self.process(lo, hi, |buf| sort_chunks_by(buf, cu, &mut *cmp))?;
+            }
+            match ms.stack.pop() {
+                Some((l, m, h)) => {
+                    lo = l;
+                    mid = m;
+                    hi = h;
+                }
+                None => return Ok(()),
+            }
+        }
+    }
+
+    /// Choose a pivot record index in `[lo, hi)`: read a strided sample into
+    /// `samp` and return the index of its median. `order` is reused scratch.
+    fn sample_pivot(
+        &self,
+        lo: u64,
+        hi: u64,
+        samp: &mut [u8],
+        order: &mut Vec<usize>,
+        cmp: &mut dyn FnMut(&[u8], &[u8]) -> Ordering,
+    ) -> io::Result<u64> {
+        let cu = self.cu;
+        let range = hi - lo;
+        // As many samples as fit `samp`, but never more than the range holds.
+        let s = ((samp.len() / cu) as u64).clamp(1, range);
+        let stride = range / s; // >= 1: partition runs only when range > s
+        for t in 0..s {
+            let pos = lo + stride * t;
+            self.read(pos, &mut samp[(t as usize) * cu..(t as usize + 1) * cu])?;
+        }
+        order.clear();
+        order.extend(0..s as usize);
+        order.sort_by(|&a, &b| cmp(&samp[a * cu..(a + 1) * cu], &samp[b * cu..(b + 1) * cu]));
+        let med = order[order.len() / 2] as u64;
+        Ok(lo + stride * med)
+    }
+
+    /// Lomuto partition of `[lo, hi)` around the record at `piv_idx`, in place via
+    /// atomic single-record swaps. Returns the pivot's final index `p`: `[lo, p)`
+    /// compare `< pivot`, `[p + 1, hi)` compare `>= pivot`, and the pivot record
+    /// sits at `p` in its final position. Requires `hi - lo >= 2`.
+    fn partition(
+        &self,
+        lo: u64,
+        hi: u64,
+        piv_idx: u64,
+        pbuf: &mut [u8],
+        one: &mut [u8],
+        cmp: &mut dyn FnMut(&[u8], &[u8]) -> Ordering,
+    ) -> io::Result<u64> {
+        let last = hi - 1;
+        self.read(piv_idx, pbuf)?; // pivot bytes captured before moving
+        if piv_idx != last {
+            self.swap(piv_idx, last)?;
+        }
+        let mut store = lo;
+        let mut k = lo;
+        while k < last {
+            self.read(k, one)?;
+            if cmp(one, pbuf) == Ordering::Less {
+                if k != store {
+                    self.swap(store, k)?;
+                }
+                store += 1;
+            }
+            k += 1;
+        }
+        if store != last {
+            self.swap(store, last)?;
+        }
+        Ok(store)
+    }
+}
+
+/// Reusable scratch for [`Records::imerge`]: two record-sized compare buffers
+/// and the deferred-work stack. The stack is bounded to `⌈log2(count)⌉` entries
+/// (<= 63 for any u64-addressed file); at ~24 bytes/entry a fixed array would be
+/// ~1.5 KiB, too large for the call stack, so it is a lazily-grown heap `Vec`
+/// reused across every merge.
+#[cfg(all(feature = "set", feature = "atomic"))]
+struct MergeScratch {
+    bi: Vec<u8>,
+    bj: Vec<u8>,
+    stack: Vec<(u64, u64, u64)>,
+}
+
+/// Out-of-core in-place bottom-up merge sort of `aligned`, viewed as records of
+/// `c` bytes. See `BStackChunk::sort_partial_by`.
+#[cfg(all(feature = "set", feature = "atomic"))]
+fn merge_sort(
+    aligned: &BStackSlice<'_>,
+    c: u64,
+    cmp: &mut dyn FnMut(&[u8], &[u8]) -> Ordering,
+) -> io::Result<()> {
+    let r = Records::new(aligned, c);
+    let count = r.count();
+    if count <= 1 {
+        return Ok(());
+    }
+    let k = (SORT_BLOCK_BYTES / c).max(1);
+    let run0 = SORT_WINDOWS * k;
+    let mut ms = MergeScratch {
+        bi: vec![0u8; r.cu],
+        bj: vec![0u8; r.cu],
+        stack: Vec::new(),
+    };
+    // Phase 1: run formation — sort each `run0`-record window. Subtraction-form
+    // comparisons keep every index within `count`, so nothing overflows.
+    let mut p = 0u64;
+    while p < count {
+        let q = if count - p > run0 { p + run0 } else { count };
+        if q - p > 1 {
+            r.process(p, q, |buf| sort_chunks_by(buf, r.cu, &mut *cmp))?;
+        }
+        p = q;
+    }
+    // Phase 2: bottom-up merge passes.
+    let mut width = run0;
+    while width < count {
+        let stop = count - width; // > 0 (loop guard)
+        let mut lo = 0u64;
+        while lo < stop {
+            let mid = lo + width; // < count, since lo < count - width
+            let hi = if count - mid > width {
+                mid + width
+            } else {
+                count
+            };
+            r.imerge(lo, mid, hi, &mut ms, cmp)?;
+            // Advance two runs; saturate so a near-u64::MAX sum only ends the pass.
+            lo = lo.saturating_add(width).saturating_add(width);
+        }
+        width = width.saturating_mul(2);
+    }
+    Ok(())
+}
+
+// ===================== Out-of-core in-place quickselect =====================
+//
+// Engine for `BStackChunk::select_nth_partial_by`/`select_nth_partial_by_key`.
+// Bounded-memory quickselect: narrow an active range `[lo, hi)` that holds rank
+// `n` (every record left of `lo` <= it <= every record right of `hi`), picking
+// each pivot from a cross-region sample and partitioning in place with atomic
+// swaps, until the range fits the budget and one `process` settles it. Every
+// step is crash-atomic and permutation-preserving.
+
+/// Out-of-core in-place selection of rank `n` over `aligned`, viewed as records
+/// of `c` bytes. `n < count` is the caller's precondition (asserted in the
+/// public methods). See `BStackChunk::select_nth_partial_by`.
+#[cfg(all(feature = "set", feature = "atomic"))]
+fn select_nth(
+    aligned: &BStackSlice<'_>,
+    c: u64,
+    n: u64,
+    cmp: &mut dyn FnMut(&[u8], &[u8]) -> Ordering,
+) -> io::Result<()> {
+    let r = Records::new(aligned, c);
+    let count = r.count();
+    if count <= 1 {
+        return Ok(());
+    }
+    // Sized to hold at least one record even when a record exceeds the budget
+    // (`c > SORT_BUDGET`), so the pivot sample can always read one in.
+    let mut samp = vec![0u8; (SORT_BUDGET as usize).max(r.cu)];
+    let mut pbuf = vec![0u8; r.cu];
+    let mut one = vec![0u8; r.cu];
+    let mut order: Vec<usize> = Vec::new(); // reused pivot-sample scratch
+    let (mut lo, mut hi) = (0u64, count);
+    loop {
+        // A single-record band already holds the answer (rank-band invariant).
+        if hi - lo <= 1 {
+            return Ok(());
+        }
+        // Band fits the budget: settle it exactly in one atomic pass. The band
+        // invariant makes the local (n - lo)-th record the global n-th.
+        if (hi - lo) * c <= SORT_BUDGET {
+            let cu = r.cu;
+            let local = (n - lo) as usize;
+            return r.process(lo, hi, |buf| {
+                let cnt = buf.len() / cu;
+                let mut ord: Vec<usize> = (0..cnt).collect();
+                ord.select_nth_unstable_by(local, |&i, &j| {
+                    cmp(&buf[i * cu..(i + 1) * cu], &buf[j * cu..(j + 1) * cu])
+                });
+                apply_chunk_permutation(buf, cu, &ord);
+            });
+        }
+        let piv = r.sample_pivot(lo, hi, &mut samp, &mut order, cmp)?;
+        let p = r.partition(lo, hi, piv, &mut pbuf, &mut one, cmp)?;
+        // Recurse into the side holding `n`, excluding the fixed pivot at `p`
+        // (strict progress → termination).
+        if n < p {
+            hi = p;
+        } else if n > p {
+            lo = p + 1;
+        } else {
+            return Ok(());
+        }
     }
 }
 

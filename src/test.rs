@@ -4410,6 +4410,317 @@ mod alloc_tests {
         assert_eq!(iter.len(), usize::MAX);
     }
 
+    // Build `keys.len()` records of `rec_len` bytes each; record i carries
+    // `keys[i]` as a little-endian u16 in its first two bytes and zeros
+    // elsewhere. With rec_len == 512 the sort's block is 2048/512 == 4 records
+    // and run0 == 12 records, so a few dozen records force real multi-pass
+    // merges (tail-order + cross_exchange block swaps + carry passes).
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    fn keyed_records(keys: &[u16], rec_len: usize) -> Vec<u8> {
+        let mut data = vec![0u8; keys.len() * rec_len];
+        for (i, &k) in keys.iter().enumerate() {
+            data[i * rec_len..i * rec_len + 2].copy_from_slice(&k.to_le_bytes());
+        }
+        data
+    }
+
+    // Read back the per-record u16 keys after a sort over `rec_len`-byte records.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    fn read_keys(bytes: &[u8], rec_len: usize, n: usize) -> Vec<u16> {
+        (0..n)
+            .map(|i| u16::from_le_bytes([bytes[i * rec_len], bytes[i * rec_len + 1]]))
+            .collect()
+    }
+
+    // 23. A region that fits the budget is fully sorted in one process pass.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn chunk_sort_partial_by_small_region_is_full_sort() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut s = alloc.alloc(6).unwrap();
+        s.as_slice_mut().write([5u8, 3, 1, 6, 4, 2]).unwrap();
+        let (mut view, _rem) = s.as_slice().chunks(1);
+        view.sort_partial_by(|a, b| a[0].cmp(&b[0])).unwrap();
+        assert_eq!(s.as_slice().read().unwrap(), [1, 2, 3, 4, 5, 6]);
+    }
+
+    // 24. A region far larger than the budget is fully (globally) sorted via
+    //     multi-pass in-place merges, and the multiset is preserved.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn chunk_sort_partial_by_multipass_fully_sorts() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        // 30 records of 512 bytes: block=4, run0=12 -> several merge passes,
+        // and 30 % 4 == 2 exercises the ragged imerge fixup.
+        let keys: Vec<u16> = (0..30u16).map(|i| (i * 7 + 3) % 30).collect();
+        let data = keyed_records(&keys, 512);
+        let mut s = alloc.alloc(data.len() as u64).unwrap();
+        s.as_slice_mut().write(&data).unwrap();
+        let (mut view, _rem) = s.as_slice().chunks(512);
+        view.sort_partial_by(|a, b| {
+            u16::from_le_bytes([a[0], a[1]]).cmp(&u16::from_le_bytes([b[0], b[1]]))
+        })
+        .unwrap();
+        let got = read_keys(&s.as_slice().read().unwrap(), 512, 30);
+        let mut want = keys.clone();
+        want.sort_unstable();
+        assert_eq!(got, want);
+    }
+
+    // 25. A record count that is not a multiple of the block size is still
+    //     fully sorted (drives the ragged sub-K imerge tail merge).
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn chunk_sort_partial_by_ragged_count_fully_sorts() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        // 13 records of 512 bytes: just over run0 (12); 13 % 4 == 1.
+        let keys: Vec<u16> = [9, 2, 13, 4, 11, 6, 1, 8, 3, 12, 5, 10, 7]
+            .iter()
+            .map(|&x| x as u16)
+            .collect();
+        let data = keyed_records(&keys, 512);
+        let mut s = alloc.alloc(data.len() as u64).unwrap();
+        s.as_slice_mut().write(&data).unwrap();
+        let (mut view, _rem) = s.as_slice().chunks(512);
+        view.sort_partial_by(|a, b| {
+            u16::from_le_bytes([a[0], a[1]]).cmp(&u16::from_le_bytes([b[0], b[1]]))
+        })
+        .unwrap();
+        let got = read_keys(&s.as_slice().read().unwrap(), 512, 13);
+        let mut want = keys.clone();
+        want.sort_unstable();
+        assert_eq!(got, want);
+    }
+
+    // 26. sort_partial_by_key over a multi-pass region sorts fully by key.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn chunk_sort_partial_by_key_multipass_fully_sorts() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let keys: Vec<u16> = (0..25u16).map(|i| (i * 11 + 1) % 25).collect();
+        let data = keyed_records(&keys, 512);
+        let mut s = alloc.alloc(data.len() as u64).unwrap();
+        s.as_slice_mut().write(&data).unwrap();
+        let (mut view, _rem) = s.as_slice().chunks(512);
+        view.sort_partial_by_key(|c| u16::from_le_bytes([c[0], c[1]]))
+            .unwrap();
+        let got = read_keys(&s.as_slice().read().unwrap(), 512, 25);
+        let mut want = keys.clone();
+        want.sort_unstable();
+        assert_eq!(got, want);
+    }
+
+    // 27. Empty and single-record views are no-ops that still succeed.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn chunk_sort_partial_by_trivial_views_are_noops() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut s = alloc.alloc(1).unwrap();
+        s.as_slice_mut().write([7u8]).unwrap();
+        let (mut one, _rem) = s.as_slice().chunks(1);
+        one.sort_partial_by(|a, b| a[0].cmp(&b[0])).unwrap();
+        assert_eq!(s.as_slice().read().unwrap(), [7]);
+
+        let empty = alloc.alloc(0).unwrap();
+        let (mut ev, _rem) = empty.as_slice().chunks(1);
+        ev.sort_partial_by(|a, b| a[0].cmp(&b[0])).unwrap();
+    }
+
+    // 28. Deterministic property test: over many sizes (including ragged and
+    //     multi-pass), the out-of-core sort produces a fully sorted permutation
+    //     of the input. Seeded LCG, run by name — not the fuzz harness.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn chunk_sort_partial_by_property_sorts_all_sizes() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut state: u64 = 0x9E3779B97F4A7C15;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (state >> 33) as u16
+        };
+        for &n in &[
+            0usize, 1, 2, 5, 11, 12, 13, 24, 25, 26, 27, 28, 29, 30, 48, 50,
+        ] {
+            let keys: Vec<u16> = (0..n).map(|_| next() % 1000).collect();
+            let data = keyed_records(&keys, 512);
+            let mut s = alloc.alloc((n * 512).max(1) as u64).unwrap();
+            if n > 0 {
+                s.as_slice_mut().write(&data).unwrap();
+            }
+            let (mut view, _rem) = s.as_slice().chunks(512);
+            view.sort_partial_by(|a, b| {
+                u16::from_le_bytes([a[0], a[1]]).cmp(&u16::from_le_bytes([b[0], b[1]]))
+            })
+            .unwrap();
+            if n > 0 {
+                let got = read_keys(&s.as_slice().read().unwrap()[..n * 512], 512, n);
+                let mut want = keys.clone();
+                want.sort_unstable();
+                assert_eq!(got, want, "n={n}");
+            }
+            alloc.dealloc(s).unwrap();
+        }
+    }
+
+    // Assert that `out` is a valid select_nth result for rank `n`: the n-th
+    // record equals the n-th of the sorted input, everything before it is <=,
+    // everything after is >=, and the whole thing is a permutation of the input.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    fn assert_selected(out: &[u16], n: usize, sorted: &[u16]) {
+        assert_eq!(out[n], sorted[n], "nth value wrong at n={n}");
+        assert!(out[..n].iter().all(|&x| x <= out[n]), "left side at n={n}");
+        assert!(
+            out[n + 1..].iter().all(|&x| x >= out[n]),
+            "right side at n={n}"
+        );
+        let mut perm = out.to_vec();
+        perm.sort_unstable();
+        assert_eq!(&perm, sorted, "not a permutation at n={n}");
+    }
+
+    // 29. A region that fits the budget selects correctly in one pass.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn chunk_select_nth_partial_by_small_region() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut s = alloc.alloc(5).unwrap();
+        s.as_slice_mut().write([5u8, 1, 4, 2, 3]).unwrap();
+        let (mut view, _rem) = s.as_slice().chunks(1);
+        view.select_nth_partial_by(2, |a, b| a[0].cmp(&b[0]))
+            .unwrap();
+        let buf = s.as_slice().read().unwrap();
+        assert_eq!(buf[2], 3); // median of 1..=5
+        assert!(buf[..2].iter().all(|&v| v <= 3));
+        assert!(buf[3..].iter().all(|&v| v >= 3));
+    }
+
+    // 30. A region far larger than the budget selects correctly out-of-core
+    //     (multiple partition rounds), for several ranks.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn chunk_select_nth_partial_by_multipass() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        // 40 records of 512 bytes: budget holds 12, so selection needs several
+        // out-of-core partition rounds. Keys include duplicates.
+        let keys: Vec<u16> = (0..40u16).map(|i| (i * 13 + 5) % 17).collect();
+        let mut sorted = keys.clone();
+        sorted.sort_unstable();
+        for &n in &[0usize, 1, 19, 20, 39] {
+            let data = keyed_records(&keys, 512);
+            let mut s = alloc.alloc(data.len() as u64).unwrap();
+            s.as_slice_mut().write(&data).unwrap();
+            let (mut view, _rem) = s.as_slice().chunks(512);
+            view.select_nth_partial_by(n as u64, |a, b| {
+                u16::from_le_bytes([a[0], a[1]]).cmp(&u16::from_le_bytes([b[0], b[1]]))
+            })
+            .unwrap();
+            let got = read_keys(&s.as_slice().read().unwrap(), 512, 40);
+            assert_selected(&got, n, &sorted);
+            alloc.dealloc(s).unwrap();
+        }
+    }
+
+    // 31. select_nth_partial_by_key over a multi-round region.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn chunk_select_nth_partial_by_key_multipass() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let keys: Vec<u16> = (0..33u16).map(|i| (i * 7 + 1) % 33).collect();
+        let mut sorted = keys.clone();
+        sorted.sort_unstable();
+        let data = keyed_records(&keys, 512);
+        let mut s = alloc.alloc(data.len() as u64).unwrap();
+        s.as_slice_mut().write(&data).unwrap();
+        let (mut view, _rem) = s.as_slice().chunks(512);
+        view.select_nth_partial_by_key(16, |c| u16::from_le_bytes([c[0], c[1]]))
+            .unwrap();
+        let got = read_keys(&s.as_slice().read().unwrap(), 512, 33);
+        assert_selected(&got, 16, &sorted);
+    }
+
+    // 32. select_nth_partial_by panics when n is out of bounds.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    #[should_panic(expected = "n must be < chunk_count")]
+    fn chunk_select_nth_partial_by_out_of_bounds_panics() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(3).unwrap();
+        let (mut view, _rem) = s.as_slice().chunks(1);
+        view.select_nth_partial_by(3, |a, b| a.cmp(b)).unwrap();
+    }
+
+    // 33. Deterministic property test: over many sizes and ranks (including
+    //     duplicates and ragged counts), the out-of-core selection matches the
+    //     sorted n-th and partitions correctly. Seeded LCG, run by name.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn chunk_select_nth_partial_by_property() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut state: u64 = 0xD1B54A32D192ED03;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (state >> 33) as u16
+        };
+        for &sz in &[1usize, 2, 12, 13, 25, 37, 50] {
+            let keys: Vec<u16> = (0..sz).map(|_| next() % 100).collect(); // many dups
+            let mut sorted = keys.clone();
+            sorted.sort_unstable();
+            // A spread of ranks: ends, middle, and a pseudo-random one.
+            let ranks = [
+                0,
+                sz / 2,
+                sz.saturating_sub(1),
+                (next() as usize) % sz.max(1),
+            ];
+            for &n in ranks.iter() {
+                let data = keyed_records(&keys, 512);
+                let mut s = alloc.alloc((sz * 512) as u64).unwrap();
+                s.as_slice_mut().write(&data).unwrap();
+                let (mut view, _rem) = s.as_slice().chunks(512);
+                view.select_nth_partial_by(n as u64, |a, b| {
+                    u16::from_le_bytes([a[0], a[1]]).cmp(&u16::from_le_bytes([b[0], b[1]]))
+                })
+                .unwrap();
+                let got = read_keys(&s.as_slice().read().unwrap(), 512, sz);
+                assert_selected(&got, n, &sorted);
+                alloc.dealloc(s).unwrap();
+            }
+        }
+    }
+
+    // 34. Records wider than the sort/select budget (8192 > 6144) must not
+    //     overflow the pivot-sample buffer; selection still works out-of-core.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn chunk_select_nth_partial_by_record_wider_than_budget() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let keys: Vec<u16> = [4u16, 1, 3, 0, 2].to_vec();
+        let mut sorted = keys.clone();
+        sorted.sort_unstable();
+        let data = keyed_records(&keys, 8192); // 8192 > budget (6144)
+        let mut s = alloc.alloc(data.len() as u64).unwrap();
+        s.as_slice_mut().write(&data).unwrap();
+        let (mut view, _rem) = s.as_slice().chunks(8192);
+        view.select_nth_partial_by(2, |a, b| {
+            u16::from_le_bytes([a[0], a[1]]).cmp(&u16::from_le_bytes([b[0], b[1]]))
+        })
+        .unwrap();
+        let got = read_keys(&s.as_slice().read().unwrap(), 8192, 5);
+        assert_selected(&got, 2, &sorted);
+    }
+
     // ── Foreign handles ───────────────────────────────────────────────────
 
     #[test]
