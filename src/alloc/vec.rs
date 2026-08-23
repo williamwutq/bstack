@@ -324,6 +324,33 @@ impl<'a, A: BStackSliceAllocator> BStackByteVec<'a, A> {
         self.write_len_field(len + 1)
     }
 
+    /// Append every byte in `data` to the end of the vec.
+    ///
+    /// This is the bulk counterpart to [`push`](Self::push): it reserves the
+    /// required capacity in a single reallocation (if any) and writes all of
+    /// `data` with a single durable `set` before committing the new `len`,
+    /// rather than issuing a grow/write/len cycle per byte.  A no-op when
+    /// `data` is empty.
+    ///
+    /// # Crash consistency
+    ///
+    /// The step order is `reserve` → write elements → write `len`.  A crash
+    /// before the `len` write leaves the appended bytes on disk but beyond the
+    /// committed `len`, so they are invisible; re-running `extend_from_slice`
+    /// with the same `data` recovers correctly.
+    pub fn extend_from_slice(&mut self, data: &[u8]) -> io::Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        let (len, _) = self.read_header()?;
+        let additional = data.len() as u64;
+        // `reserve` re-reads the header, checks `len + additional` for overflow,
+        // and grows the block if needed; `len` is left unchanged.
+        self.reserve(additional)?;
+        self.write_bytes_at(len, data)?;
+        self.write_len_field(len + additional)
+    }
+
     /// Remove and return the last byte, or `None` if empty.
     ///
     /// `len` is decremented before the vacated slot is zeroed.
@@ -1018,6 +1045,41 @@ mod tests {
         assert_eq!(v2.get(0).unwrap(), Some(1u8));
         assert_eq!(v2.get(1).unwrap(), Some(2u8));
         assert_eq!(v2.get(2).unwrap(), Some(3u8));
+    }
+
+    #[test]
+    fn extend_from_slice_bulk_appends() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let mut v = BStackByteVec::new(&alloc).unwrap();
+        v.push(1).unwrap();
+        v.extend_from_slice(&[2, 3, 4, 5]).unwrap();
+        assert_eq!(v.len().unwrap(), 5);
+        assert_eq!(v.read_bytes().unwrap(), vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn extend_from_slice_empty_is_noop() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let mut v = BStackByteVec::from_slice(b"hi", &alloc).unwrap();
+        let cap_before = v.capacity().unwrap();
+        v.extend_from_slice(&[]).unwrap();
+        assert_eq!(v.len().unwrap(), 2);
+        assert_eq!(v.capacity().unwrap(), cap_before);
+        assert_eq!(v.read_bytes().unwrap(), b"hi");
+    }
+
+    #[test]
+    fn extend_from_slice_persists_via_raw_block() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let mut v = BStackByteVec::new(&alloc).unwrap();
+        v.extend_from_slice(b"hello world").unwrap();
+        let block = v.into_raw_block();
+        let v2 = unsafe { BStackByteVec::from_raw_block(block) };
+        assert_eq!(v2.len().unwrap(), 11);
+        assert_eq!(v2.read_bytes().unwrap(), b"hello world");
     }
 
     #[test]
