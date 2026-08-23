@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.6] - 2026-08-23
+
 ### Added
 
 - **`BStack::resize`/`ensure` (Rust, base API) / `bstack_resize`/`bstack_ensure` (C, base API) and `ensure_with` (Rust, `atomic`) / `bstack_ensure_with` (C, `BSTACK_FEATURE_ATOMIC`): grow-or-shrink and grow-to-at-least helpers.** `resize(target)` grows (zero-filled) or shrinks the payload to exactly `target` bytes; `ensure(target)` is the grow-only, no-op-if-already-long-enough counterpart. Both return the size before the call. `ensure_with(target, f)` additionally hands the freshly grown tail to `f` (`FnOnce(&mut [u8])` in Rust; `int cb(uint8_t *buf, size_t len, void *ctx)` in C, aborting the call on a nonzero return) for initialization before it commits — no `set` dependency, since it only touches bytes beyond the previously committed length. Growth follows `extend`'s crash-consistency, shrinkage follows `discard`'s. Ported from the 0.4.x line.
