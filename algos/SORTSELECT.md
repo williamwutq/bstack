@@ -2,7 +2,7 @@
 
 This advisory covers the record-level ordering operations on `BStackChunk`
 (feature `alloc`, plus `set` + `atomic` for the mutating ones): the
-single-transaction `sort_by` / `sort_by_key` / `select_nth_by` /
+single-operation `sort_by` / `sort_by_key` / `select_nth_by` /
 `select_nth_by_key`, the read-only `binary_search_by[_key]`, and the
 bounded-memory out-of-core `sort_partial_by` / `sort_partial_by_key` and
 `select_nth_partial_by` / `select_nth_partial_by_key`. The focus is the
@@ -16,13 +16,13 @@ offset is `region_start + index * chunk_len`.
 
 ## The two regimes
 
-| Operation                     | Memory                  | Atomicity          | Notes                                                                           |
-|-------------------------------|-------------------------|--------------------|---------------------------------------------------------------------------------|
-| `sort_by` / `sort_by_key`     | O(region)               | single transaction | reads the whole region into one `Vec<u8>`, permutes, commits with one `process` |
-| `select_nth_by[_key]`         | O(region)               | single transaction | `select_nth_unstable` on an in-memory proxy index, one `process`                |
-| `binary_search_by[_key]`      | O(chunk_len)            | read-only          | O(log n) probed-chunk reads, never the whole region                             |
-| `sort_partial_by[_key]`       | **O(1) in region size** | **per-step**       | in-place out-of-core merge sort; converges to fully sorted                      |
-| `select_nth_partial_by[_key]` | **O(1) in region size** | **per-step**       | in-place out-of-core quickselect; converges to the selected partition           |
+| Operation                     | Memory                  | Atomicity        | Notes                                                                           |
+|-------------------------------|-------------------------|------------------|---------------------------------------------------------------------------------|
+| `sort_by` / `sort_by_key`     | O(region)               | single operation | reads the whole region into one `Vec<u8>`, permutes, commits with one `process` |
+| `select_nth_by[_key]`         | O(region)               | single operation | `select_nth_unstable` on an in-memory proxy index, one `process`                |
+| `binary_search_by[_key]`      | O(chunk_len)            | read-only        | O(log n) probed-chunk reads, never the whole region                             |
+| `sort_partial_by[_key]`       | **O(1) in region size** | **per-step**     | in-place out-of-core merge sort; converges to fully sorted                      |
+| `select_nth_partial_by[_key]` | **O(1) in region size** | **per-step**     | in-place out-of-core quickselect; converges to the selected partition           |
 
 `sort_by` is optimal when the region fits memory: one region-sized read, one
 crash-atomic write. Its bound is memory — a region too large for a single
@@ -36,11 +36,11 @@ budget. The only charged operations are remote transfers; comparisons and
 permutation *within* resident memory are free. `BStack` supplies exactly three
 such operations, each individually crash-atomic:
 
-| Model op                                            | `BStack` primitive        | Guarantee                                                                          |
-|-----------------------------------------------------|---------------------------|------------------------------------------------------------------------------------|
-| `LOAD` a window, permute it freely, `STORE` it back | `process(start, end, f)`  | reads `[start,end)`, runs `f` on the bytes in memory, commits in one transaction   |
-| `RSWAP(i, j)` — swap two equal, disjoint ranges     | `cross_exchange(a, b, n)` | staged tail backup, single `wip_ptr` flip; crash rolls fully back or fully forward |
-| compare / move within a window                      | in-memory                 | free                                                                               |
+| Model op                                            | `BStack` primitive        | Guarantee                                                                             |
+|-----------------------------------------------------|---------------------------|---------------------------------------------------------------------------------------|
+| `LOAD` a window, permute it freely, `STORE` it back | `process(start, end, f)`  | reads `[start,end)`, runs `f` on the bytes in memory, commits in one atomic operation |
+| `RSWAP(i, j)` — swap two equal, disjoint ranges     | `cross_exchange(a, b, n)` | staged tail backup, single `wip_ptr` flip; crash rolls fully back or fully forward    |
+| compare / move within a window                      | in-memory                 | free                                                                                  |
 
 The budget is `SORT_WINDOWS * SORT_BLOCK_BYTES` (3 × 2048 = 6144 bytes), so the
 block size is `K = max(1, SORT_BLOCK_BYTES / chunk_len)` records and no step ever
@@ -64,7 +64,7 @@ A pair is merged by `imerge`, a rotation merge (SymMerge):
 
 - If `(hi − lo)` fits the budget, one `process` sorts the whole range. Because
   the range is two already-sorted runs, an in-memory sort settles it; this is
-  the base case and keeps small merges to a single transaction.
+  the base case and keeps small merges to a single operation.
 - Otherwise pick a pivot in the middle of the **larger** run, binary-search its
   partner position in the other run (`lower_bound` / `upper_bound`, each a
   handful of single-record reads), and rotate the two middle blocks past each
@@ -147,7 +147,7 @@ genuinely exceed memory; prefer `sort_by` whenever the region fits.
 
 ## Selection
 
-`select_nth_by[_key]` is single-transaction: it runs `select_nth_unstable_by`
+`select_nth_by[_key]` is single-operation: it runs `select_nth_unstable_by`
 on an in-memory proxy index under one `process`, so it inherits `sort_by`'s
 memory bound. `select_nth_partial_by[_key]` (see `select_nth` /
 `partition_select` / `sample_pivot_index` in `src/alloc/chunk.rs`) is the
@@ -243,7 +243,7 @@ optimization noted for the merge, deferred for the same reason.
 
 ### Surface
 
-The split mirrors the sort: `select_nth_by[_key]` stays single-transaction for
+The split mirrors the sort: `select_nth_by[_key]` stays single-operation for
 regions that fit memory, and `select_nth_partial_by[_key]` is the shipped
 bounded-memory variant. The current implementation uses the two-way (Lomuto)
 partition above; the three-way partition for heavy-duplicate regions remains the

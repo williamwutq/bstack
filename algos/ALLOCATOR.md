@@ -493,7 +493,7 @@ Every path either commits atomically or leaves an orphaned-but-recoverable block
   commit); tail grow/shrink use `try_extend_zeros` / `try_discard`.
 * **Without `atomic`**: plain read-then-write / `len`-check-then-`extend`
   (each one durable write). A shrink's freed tail overlaps still-live caller
-  bytes and cannot be dropped fault-safely without a transaction, so a shrink
+  bytes and cannot be dropped fault-safely without an atomic operation, so a shrink
   simply **retains** the excess in place (zero writes); the oversized-reuse carve
   (over free excess only) writes all freed pieces first and the claiming header
   last.

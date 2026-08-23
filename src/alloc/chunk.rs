@@ -411,7 +411,7 @@ impl<'a> BStackChunk<'a> {
 
     /// Sort chunks in place by `cmp`, comparing each chunk's raw bytes.
     ///
-    /// Crash-atomic as a single transaction: a single [`BStack::process`]
+    /// Crash-atomic as one atomic operation: a single [`BStack::process`]
     /// call reads the whole chunked region (excluding the remainder) into
     /// memory, sorts there, and commits the result in one write — a crash
     /// leaves either the pre-sort order or the fully-sorted order, never an
@@ -516,7 +516,7 @@ impl<'a> BStackChunk<'a> {
     /// would occupy if the view were fully sorted by `cmp`; order on either
     /// side of `n` is unspecified. Mirrors `[T]::select_nth_unstable_by`.
     ///
-    /// Same single-transaction atomicity as [`sort_by`](Self::sort_by): a
+    /// Same single-operation atomicity as [`sort_by`](Self::sort_by): a
     /// crash leaves either the original order or a valid completed
     /// partition, never a half-applied one.
     ///
@@ -584,7 +584,7 @@ impl<'a> BStackChunk<'a> {
     /// Best-effort, bounded-memory, out-of-core sort of the chunks in place.
     ///
     /// Unlike [`sort_by`](Self::sort_by), which reads the whole region into one
-    /// `Vec<u8>` and commits it in a single [`BStack::process`] transaction —
+    /// `Vec<u8>` and commits it in a single [`BStack::process`] call —
     /// bounded by available memory, so a region too large for one `Vec<u8>`
     /// cannot be sorted that way — this runs an **in-place bottom-up merge
     /// sort** that never holds more than a fixed budget of bytes resident
@@ -854,7 +854,7 @@ impl<'s, 'a> Records<'s, 'a> {
     }
 
     /// Atomically read the record range `[lo, hi)`, permute it in memory via
-    /// `f`, and commit it — one crash-atomic transaction.
+    /// `f`, and commit it — one crash-atomic operation.
     #[inline(always)]
     fn process(&self, lo: u64, hi: u64, f: impl FnOnce(&mut [u8])) -> io::Result<()> {
         self.aligned.stack().process(self.off(lo), self.off(hi), f)

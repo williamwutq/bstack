@@ -31,7 +31,7 @@
 //! write, and multi-write splices are leak-preferring), but the allocator is
 //! `Send` and **not** `Sync`, so concurrent use must be externally synchronised.
 //! A *shrink* reclaims its freed excess (tail `Atrunc` or an in-place carve) only
-//! under `atomic`, where the transaction fuses recording the new physical size
+//! under `atomic`, where one atomic operation fuses recording the new physical size
 //! with dropping the excess; the non-`atomic` build cannot fuse them without a
 //! crash window `recover` mis-parses, so it simply **retains** the excess inside
 //! the still-recorded larger block (zero extra writes, no move).
@@ -634,7 +634,7 @@ impl SegregatedBStackAllocator {
                 self.stack.set(bs, buf)?;
             } else {
                 // Reclaim the excess above the threshold: claim `block` bytes and
-                // carve the rest, all as one crash-atomic transaction (claim
+                // carve the rest, all as one crash-atomic operation (claim
                 // buffer as the prefix).
                 let buf = self.claim_buf(block, copy_from, init)?;
                 self.commit_carve(bs, &buf, bs + block, excess)?;
@@ -701,13 +701,13 @@ impl SegregatedBStackAllocator {
     }
 
     /// Commit a `prefix` write and free a contiguous `region` as **one**
-    /// crash-atomic [`BStack::inplace_gen`] transaction.
+    /// crash-atomic [`BStack::inplace_gen`] operation.
     ///
     /// `region` is greedily decomposed into class free blocks — the largest class
     /// `≤` the remainder, repeated (a region `> MAX_CLASS` becomes one oversized
     /// block). Every piece is a distinct class (greedy remainders strictly
     /// shrink), so each free-list head is read once and rewritten once: the
-    /// transaction reads every involved head, writes `prefix`, writes each
+    /// operation reads every involved head, writes `prefix`, writes each
     /// piece's overhead + `next_free` (= that class's old head), and repoints each
     /// head — all together. Bundling the `prefix` (the shrunk block's overhead,
     /// or the used oversized block) with the carve means a crash leaves the block
@@ -776,7 +776,7 @@ impl SegregatedBStackAllocator {
             Ok(())
         }
 
-        // Atomic path with `inplace_gen` transaction: read each head, write the prefix,
+        // Atomic path with an `inplace_gen` batch: read each head, write the prefix,
         // then write each piece's overhead, next_free, and head. A crash leaves the
         // block either wholly un-shrunk or fully shrunk-and-freed, never a mid-arena gap.
         // Steps: [0, k) read each head; k writes the prefix; then 3 writes per
@@ -867,7 +867,7 @@ impl BStackAllocator for SegregatedBStackAllocator {
     /// |------|----------|
     /// | Fits the current block (`phys_need(new_len) ≤ size`) | retain in place — no metadata write; zero the newly-exposed tail on a visible grow |
     /// | Grow past the block, at the tail | extend the tail in place (zero-filled), then record the new physical size |
-    /// | Shrink, reclaimable excess (`≥ SPLIT_MIN`) | `atomic`: drop the excess — tail `Len` + `Atrunc`, else an in-place carve — recording the new size in one transaction; without `atomic`, retain the excess in place |
+    /// | Shrink, reclaimable excess (`≥ SPLIT_MIN`) | `atomic`: drop the excess — tail `Len` + `Atrunc`, else an in-place carve — recording the new size in one operation; without `atomic`, retain the excess in place |
     /// | Shrink, excess below `SPLIT_MIN` | retain in place — no write |
     /// | Non-tail grow past the block | alloc new class, copy, dealloc old |
     ///
@@ -877,7 +877,7 @@ impl BStackAllocator for SegregatedBStackAllocator {
     /// tail grow records the new physical size leak-preferring so a crash leaves
     /// an orphaned zero tail that [`recover`](Self::recover) reclaims, and an
     /// `atomic` shrink commits the new size together with the truncation (resp.
-    /// the carve) as a single transaction, so a crash leaves the block wholly
+    /// the carve) as a single operation, so a crash leaves the block wholly
     /// un-shrunk or fully shrunk — never a recorded size disagreeing with the
     /// block's physical extent, which would make the recovery scan mis-stride.
     #[inline]
@@ -896,7 +896,7 @@ impl BStackAllocator for SegregatedBStackAllocator {
     /// handle's length is trusted (rejecting only a length too large for the
     /// block). Otherwise an oversized block at the tail is discarded in one call,
     /// and every other block is spliced onto its class head via one crash-atomic
-    /// [`BStack::inplace_gen`] transaction.
+    /// [`BStack::inplace_gen`] operation.
     fn dealloc<'a>(
         &'a self,
         slice: BStackOwnedSlice<'a, Self>,
@@ -1087,7 +1087,7 @@ impl SegregatedBStackAllocator {
                 // above the split threshold, and only under `atomic`: a shrink's
                 // freed tail overlaps still-live caller bytes, so recording the
                 // smaller size and dropping the excess must commit together in one
-                // transaction — the non-`atomic` build cannot fuse them (either
+                // operation — the non-`atomic` build cannot fuse them (either
                 // ordering leaves a window `recover` mis-parses, and a rollback
                 // would hand back a block whose tail the carve already clobbered),
                 // so it retains the excess in place (zero writes, no move).
@@ -1096,7 +1096,7 @@ impl SegregatedBStackAllocator {
                     let old_end = block_start + old_size; // block exists ⇒ ≤ stack_len
 
                     // Tail shrink: replace the whole block with its shrunk self in
-                    // ONE crash-atomic transaction. `Len` confirms the tail under
+                    // ONE crash-atomic operation. `Len` confirms the tail under
                     // `process_gen`'s held write lock and a single `Atrunc` cuts
                     // the old block and re-appends the new one (overhead recording
                     // `new_size`, surviving prefix, zero pad) at the same offset.
@@ -1592,7 +1592,7 @@ mod tests {
     }
 
     /// With `atomic` a tail shrink whose excess reaches `SPLIT_MIN` is one
-    /// `Len` + `Atrunc` transaction: the block is replaced by its shrunk self at
+    /// `Len` + `Atrunc` operation: the block is replaced by its shrunk self at
     /// the same offset and the excess goes back to the stack.
     #[cfg(feature = "atomic")]
     #[test]
