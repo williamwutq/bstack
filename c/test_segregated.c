@@ -346,8 +346,10 @@ static int test_double_free_and_mismatch_detected(void)
     bstack_slice_t s;
     CHECK(bstack_allocator_alloc(base, 100, &s) == 0);
 
-    /* Mismatched length is rejected, original survives (-1). */
-    bstack_slice_t bad = s; bad.len = 50;
+    /* A length too large for the block is rejected, original survives (-1).
+     * (The word now records the physical size, so a length that fits — e.g. 50 —
+     * is trusted; only one exceeding the block's capacity is a mismatch.) */
+    bstack_slice_t bad = s; bad.len = 200;   /* phys_need(200)=208 > block 112 */
     CHECK(bstack_allocator_dealloc(base, bad) == -1);
 
     /* First free succeeds; second is a detected double free. */
@@ -406,11 +408,13 @@ static int test_realloc_paths(void)
     sg_unlink(tmp); return 0;
 }
 
-/* Tail shrink.  With atomic it is one LEN + SPLICE transaction: the block is
- * replaced by its shrunk self at the same offset and the excess goes back to the
- * stack.  Without atomic the length commit and the truncation cannot be fused —
- * either ordering leaves a crash window recover() mis-parses — so the shrink
- * takes the move path and the block relocates, its old block recycled. */
+/* Tail shrink whose excess reaches SPLIT_MIN (256).  With atomic it is one
+ * LEN + SPLICE transaction: the block is replaced by its shrunk self at the same
+ * offset and the excess goes back to the stack.  Without atomic recording the
+ * smaller size and dropping the excess cannot be fused — either ordering leaves
+ * a crash window recover() mis-parses — so the shrink retains the excess in
+ * place: the block keeps its physical size and offset with no move, and a later
+ * grow back into that retained span fits without moving. */
 static int test_realloc_tail_shrink(void)
 {
     char tmp[64]; make_tmp(tmp, sizeof tmp);
@@ -421,11 +425,12 @@ static int test_realloc_tail_shrink(void)
 
     bstack_slice_t s, out;
     uint64_t before, after, off;
-    CHECK(bstack_allocator_alloc(base, 200, &s) == 0);  /* block 208, at the tail */
+    CHECK(bstack_allocator_alloc(base, 500, &s) == 0);  /* block 512, at the tail */
     CHECK(slice_fill(s, 0x3C3C) == 0);
     off = s.offset;
     CHECK(bstack_len(bs, &before) == 0);
-    CHECK(bstack_allocator_realloc(base, s, 100, &out) == 0); /* class 112 < 208 */
+    /* class 112 < 512, excess 400 >= SPLIT_MIN */
+    CHECK(bstack_allocator_realloc(base, s, 100, &out) == 0);
     CHECK(out.len == 100);
     CHECK(slice_verify(out, 100, 0x3C3C, "tail-shrink") == 0);
     CHECK(bstack_len(bs, &after) == 0);
@@ -434,18 +439,98 @@ static int test_realloc_tail_shrink(void)
     CHECK(out.offset == off);       /* replaced in place */
     CHECK(after < before);          /* excess returned to the stack */
 #else
+    CHECK(out.offset == off);       /* retained in place, no move */
+    CHECK(after == before);         /* nothing discarded: the excess is retained */
     {
-        bstack_slice_t reused;
-        CHECK(out.offset != off);   /* moved */
-        /* The vacated 208-byte block is back on its free list and gets reused. */
-        CHECK(bstack_allocator_alloc(base, 200, &reused) == 0);
-        CHECK(reused.offset == off);
-        CHECK(bstack_allocator_dealloc(base, reused) == 0);
+        /* The retained 512-byte block absorbs a grow back to 400 with no move. */
+        bstack_slice_t grown;
+        CHECK(bstack_allocator_realloc(base, out, 400, &grown) == 0);
+        CHECK(grown.offset == off);
+        CHECK(slice_verify(grown, 100, 0x3C3C, "tail-shrink-grow-back") == 0);
+        out = grown;
     }
-    (void)before; (void)after;
 #endif
 
     CHECK(bstack_allocator_dealloc(base, out) == 0);
+    bstack_close(segregated_bstack_allocator_into_stack(a));
+    sg_unlink(tmp); return 0;
+}
+
+/* A shrink whose excess is below SPLIT_MIN is retained inside the live block (in
+ * either build): no metadata write, no move, and the block keeps its larger
+ * physical size so a later grow back fits in place with the re-exposed tail
+ * zeroed. */
+static int test_realloc_small_shrink_retained(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    segregated_bstack_allocator_t *a = segregated_bstack_allocator_new(bs);
+    CHECK(a);
+    bstack_allocator_t *base = (bstack_allocator_t *)a;
+
+    bstack_slice_t s, pin, out, grown;
+    uint64_t off, unsure, len_before, len_after;
+    CHECK(bstack_allocator_alloc(base, 200, &s) == 0);   /* block 208 (class 12) */
+    CHECK(slice_fill(s, 0x5A) == 0);
+    off = s.offset;
+    CHECK(bstack_allocator_alloc(base, 100, &pin) == 0);  /* pins s's tail */
+    CHECK(bstack_len(bs, &len_before) == 0);
+    /* need 112, excess 96 < SPLIT_MIN -> retain in place, no move, no write. */
+    CHECK(bstack_allocator_realloc(base, s, 100, &out) == 0);
+    CHECK(out.offset == off);
+    CHECK(slice_verify(out, 100, 0x5A, "small-shrink") == 0);
+    CHECK(bstack_len(bs, &len_after) == 0);
+    CHECK(len_after == len_before);
+
+    /* The block still spans 208 bytes, so growing back to 200 fits in place. */
+    CHECK(bstack_allocator_realloc(base, out, 200, &grown) == 0);
+    CHECK(grown.offset == off);
+    CHECK(slice_verify(grown, 100, 0x5A, "grow-back-prefix") == 0);
+    {
+        uint8_t data[200];
+        size_t i;
+        CHECK(bstack_slice_read_into(grown, data, 200) == 0);
+        for (i = 100; i < 200; i++) CHECK(data[i] == 0);  /* re-exposed tail zeroed */
+    }
+    CHECK(segregated_bstack_allocator_recover(a, &unsure) == 0);
+    CHECK(unsure == 0);
+
+    CHECK(bstack_allocator_dealloc(base, grown) == 0);
+    CHECK(bstack_allocator_dealloc(base, pin) == 0);
+    bstack_close(segregated_bstack_allocator_into_stack(a));
+    sg_unlink(tmp); return 0;
+}
+
+/* Oversized reuse whose excess is below SPLIT_MIN hands back the popped block
+ * whole, recording its full physical size; a later free returns it to the
+ * oversized list at that size and it recycles. */
+static int test_oversized_reuse_retains_small_excess(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    segregated_bstack_allocator_t *a = segregated_bstack_allocator_new(bs);
+    CHECK(a);
+    bstack_allocator_t *base = (bstack_allocator_t *)a;
+
+    bstack_slice_t x, pin, y, z;
+    uint64_t off_x, unsure;
+    CHECK(bstack_allocator_alloc(base, 5000, &x) == 0);  /* oversized, block 5008 */
+    off_x = x.offset;
+    CHECK(bstack_allocator_alloc(base, 50, &pin) == 0);  /* pins the tail so X interior */
+    CHECK(bstack_allocator_dealloc(base, x) == 0);       /* X -> oversized list (5008) */
+    /* Y needs block 4864 (oversized); reuses X whole (excess 144 < SPLIT_MIN). */
+    CHECK(bstack_allocator_alloc(base, 4850, &y) == 0);
+    CHECK(y.offset == off_x);
+    CHECK(segregated_bstack_allocator_recover(a, &unsure) == 0);
+    CHECK(unsure == 0);                                  /* block strides its full size */
+
+    /* Freed, the retained block returns to the oversized list at its full size. */
+    CHECK(bstack_allocator_dealloc(base, y) == 0);
+    CHECK(bstack_allocator_alloc(base, 5000, &z) == 0);
+    CHECK(z.offset == off_x);                            /* retained 5008 block recycled */
+
+    CHECK(bstack_allocator_dealloc(base, z) == 0);
+    CHECK(bstack_allocator_dealloc(base, pin) == 0);
     bstack_close(segregated_bstack_allocator_into_stack(a));
     sg_unlink(tmp); return 0;
 }
@@ -655,6 +740,8 @@ int main(void)
     T(test_double_free_and_mismatch_detected);
     T(test_realloc_paths);
     T(test_realloc_tail_shrink);
+    T(test_realloc_small_shrink_retained);
+    T(test_oversized_reuse_retains_small_excess);
     T(test_reopen_preserves_live_and_free);
     T(test_fuzz_mixed);
 

@@ -1028,44 +1028,51 @@ uint64_t checked_slab_bstack_allocator_data_size(
  *
  * On-disk layout (all within the bstack payload):
  *   [0..24)  — reserved (OFFSET_SIZE; available for caller use)
- *   [24..32) — magic: "ALSG\x00\x01\x00\x00"
+ *   [24..32) — magic: "ALSG\x00\x02\x00\x00"
  *   [32..40) — reserved (no field yet)
  *   [40..40+NUM_CLASSES*8) — free_head[NUM_CLASSES] (last entry = oversized list)
  *   [ARENA_START..) — block arena (16-byte aligned; ARENA_START = 304)
  *
  * Every arena block is [ overhead(8) | data(block − 8) ]; the caller pointer is
  * the data start (block_start + 8, always of the form 16n + 8).  The overhead is
- * a single tagged word: high bit set ⇒ in use, low 63 bits = the caller's exact
- * slice length; high bit clear ⇒ free, low 63 bits = physical block size >> 4
- * (which doubles as the class tag).  A free block stores its next_free offset
- * inline at the data start, so live allocations carry no overhead beyond the
- * 8-byte word.  Leaked blocks are reclaimable by a linear scan and double-frees
- * are caught.
+ * a single tagged word carrying the physical block size >> 4 in its low 63 bits
+ * under both tags: high bit set ⇒ in use, high bit clear ⇒ free (the size then
+ * doubling as the class tag).  The caller's visible length is *not* recorded on
+ * disk — it lives in the returned slice handle — so a live block may be
+ * physically larger than its request needs (retained excess).  A free block
+ * stores its next_free offset inline at the data start, so live allocations
+ * carry no overhead beyond the 8-byte word.  Leaked blocks are reclaimable by a
+ * linear scan and double-frees are caught.
  *
  * Allocation:
  *   len == 0           → null sentinel slice (offset = 0, len = 0)
  *   classed request    → pop the class head, else extend a fresh class block
- *   oversized request  → reuse an exact/large-enough oversized head (carving any
- *                        excess), else extend
+ *   oversized request  → reuse an exact/large-enough oversized head (retaining
+ *                        the whole block if the excess is below SPLIT_MIN, else
+ *                        carving it), else extend
  *
  * Reallocation:
- *   same class         → rewrite overhead len; zero the grown tail on grow
- *   grow at tail       → extend in place (zero-filled), then rewrite len
- *   shrink at tail     → rewrite len, then discard the excess tail
- *   non-tail shrink    → rewrite len + greedy-carve the freed tail into free
- *                        blocks — one crash-atomic transaction (atomic); a move
- *                        without atomic
- *   non-tail grow      → alloc new class, copy, dealloc old
+ *   fits the block     → retain in place — no metadata write; zero the newly
+ *                        exposed tail on a visible grow
+ *   grow past the block, at the tail
+ *                      → extend in place (zero-filled), then record the new size
+ *   shrink, excess ≥ SPLIT_MIN
+ *                      → atomic: drop the excess (tail truncation, else in-place
+ *                        carve) recording the new size in one transaction;
+ *                        without atomic, retain the excess in place
+ *   shrink, excess < SPLIT_MIN → retain in place — no write
+ *   non-tail grow past the block → alloc new class, copy, dealloc old
  *
- * Crash consistency: every path only ever *leaks* on a mid-op failure, never
- * corrupts — the leak-preferring tail grow leaves an orphaned zero tail that
- * recover() reclaims, and the atomic shrinks commit the length change together
- * with the truncation (tail) or the carve (non-tail) as one transaction, so a
- * crash leaves the block wholly un-shrunk or fully shrunk — never a committed
- * length whose class stride disagrees with the block's physical extent, which
- * would make the recovery scan read live payload bytes as an overhead word.
- * segregated_bstack_allocator_recover rebuilds every free list from a single
- * linear arena scan and reclaims leaked blocks.
+ * The visible length lives in the returned handle, not on disk, so a resize that
+ * fits (or a shrink whose excess is retained) touches no metadata at all.  Crash
+ * consistency: every path only ever *leaks* on a mid-op failure, never corrupts —
+ * the leak-preferring tail grow leaves an orphaned zero tail that recover()
+ * reclaims, and an atomic shrink commits the new size together with the
+ * truncation (tail) or the carve (non-tail) as one transaction, so a crash
+ * leaves the block wholly un-shrunk or fully shrunk — never a recorded size
+ * disagreeing with the block's physical extent, which would make the recovery
+ * scan mis-stride.  segregated_bstack_allocator_recover rebuilds every free list
+ * from a single linear arena scan and reclaims leaked blocks.
  *
  * Thread safety: without -DBSTACK_FEATURE_ATOMIC an allocator handle must be
  * used from one thread at a time — free-list mutations read then write a head as
@@ -1078,10 +1085,11 @@ uint64_t checked_slab_bstack_allocator_data_size(
  * The handle carries no mutex at all; recover() is the sole exception and
  * requires a quiescent allocator (see its contract).
  *
- * Without -DBSTACK_FEATURE_ATOMIC the in-place tail shrink is unavailable — its
- * length commit and truncation cannot be fused without a transaction, and either
- * ordering leaves a crash window recover() mis-parses — so that build's realloc
- * takes a move instead, as the non-tail shrink already does.
+ * Without -DBSTACK_FEATURE_ATOMIC a shrink cannot reclaim its freed excess —
+ * recording the smaller size and dropping the excess cannot be fused without a
+ * transaction, and either ordering leaves a crash window recover() mis-parses —
+ * so that build simply retains the excess inside the still-recorded larger block
+ * (zero extra writes, no move); a later grow back into that span fits in place.
  *
  * Experimental: the on-disk format (ALSG magic) and API are not yet stable, and
  * the background coalescer and deep in-use-leak GC are unimplemented.
@@ -1099,7 +1107,7 @@ typedef struct {
  *
  * - Empty stack: writes the allocator header (reserved + magic + zeroed
  *   free_head table) and returns a fresh allocator.
- * - Non-empty stack: validates the ALSG 0.1 magic prefix and arena alignment,
+ * - Non-empty stack: validates the ALSG 0.2 magic prefix and arena alignment,
  *   pads a short header region with zeros, then runs recovery (rebuild every
  *   free list from a linear scan, reclaim leaks, discard any orphaned tail)
  *   before returning.
