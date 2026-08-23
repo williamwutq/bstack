@@ -821,17 +821,35 @@ impl BStackAllocator for GhostTreeBstackAllocator {
             let freed_tail = aligned_old - aligned_new;
             let tail_ptr = slice.start() + aligned_new;
 
-            // Atomic fast path: discard the tail block without taking the lock.
+            // Atomic fast path: zero the sub-block padding BEFORE discarding the
+            // tail. These two steps cannot be fused into one crash-atomic call
+            // here (that needs the in-sequence tail-replace primitive), so their
+            // order decides what a crash between them leaves behind. Zeroing
+            // first means a crash leaves the retained block with a zeroed
+            // `[new_len, aligned_new)` padding — the zeroed-memory invariant that
+            // a later same-block grow relies on (it does not re-zero) — and an
+            // as-yet-unreclaimed tail, which is a benign leak. Discarding first
+            // would instead leave stale bytes in that padding, which a later grow
+            // would hand back to the caller. The padding is owned exclusively by
+            // this allocation, so zeroing it before confirming the tail is safe.
+            // `try_discard` then atomically checks tail == sentinel and removes
+            // the freed tail under bstack's write lock; on failure the block is
+            // not the tail and we fall through to the non-tail shrink below (which
+            // re-zeros the region, harmlessly, before the AVL insert).
             #[cfg(feature = "atomic")]
-            if self
-                .stack
-                .try_discard(slice.start() + aligned_old, freed_tail)?
             {
                 if new_len < aligned_new {
                     self.stack
                         .zero(slice.start() + new_len, aligned_new - new_len)?;
                 }
-                return Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) });
+                if self
+                    .stack
+                    .try_discard(slice.start() + aligned_old, freed_tail)?
+                {
+                    return Ok(unsafe {
+                        BStackSlice::from_raw_parts(self, slice.start(), new_len)
+                    });
+                }
             }
 
             #[cfg(not(feature = "atomic"))]
@@ -1318,6 +1336,35 @@ mod tests {
         let buf = s2.read().unwrap();
         assert!(buf[..32].iter().all(|&b| b == 0xBB));
         alloc.dealloc(s2).unwrap();
+    }
+
+    #[test]
+    fn realloc_tail_shrink_then_grow_reads_zeros() {
+        // A tail shrink zeroes the sub-block padding it leaves behind, upholding
+        // the zeroed-memory invariant, so a later same-block grow — which does
+        // not re-zero, trusting that invariant — never hands back stale bytes.
+        // (The atomic path zeroes the padding before discarding the freed tail so
+        // that even a crash between the two never strands stale padding.)
+        let (alloc, path) = open_fresh();
+        let _g = Guard(path);
+        let s = alloc.alloc(64).unwrap();
+        let start = s.start();
+        s.write(&[0xEEu8; 64]).unwrap();
+        // Shrink into the first 32-byte sub-block: the padding [20, 32) and the
+        // freed tail [32, 64) must not survive as live 0xEE bytes.
+        let s2 = alloc.realloc(s, 20).unwrap();
+        assert_eq!(s2.start(), start);
+        // Grow back within the retained block; the newly-exposed [20, 30) must
+        // read zero, not the old 0xEE.
+        let s3 = alloc.realloc(s2, 30).unwrap();
+        assert_eq!(s3.start(), start);
+        let buf = s3.read().unwrap();
+        assert!(buf[..20].iter().all(|&b| b == 0xEE), "live bytes preserved");
+        assert!(
+            buf[20..].iter().all(|&b| b == 0),
+            "grown region reads zero, not stale padding"
+        );
+        alloc.dealloc(s3).unwrap();
     }
 
     #[test]

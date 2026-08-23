@@ -2861,23 +2861,32 @@ static int gt_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
         uint64_t tail_ptr   = slice.offset + aligned_new;
 
 #ifdef BSTACK_FEATURE_ATOMIC
-        /* Atomic tail path: try_discard atomically checks and discards. */
+        /* Atomic tail path: zero the sub-block padding BEFORE discarding the
+         * tail. The two steps cannot be fused into one crash-atomic call here,
+         * so their order decides what a crash between them leaves: zeroing first
+         * keeps the retained block's [new_len, aligned_new) padding zeroed (the
+         * zeroed-memory invariant a later same-block grow relies on) and leaves
+         * an as-yet-unreclaimed tail (a benign leak); discarding first would
+         * leave stale bytes there for a later grow to hand back. try_discard
+         * then atomically checks tail == sentinel and removes the freed tail; on
+         * failure the block is not the tail and we fall through to the non-tail
+         * path (which re-zeros the region, harmlessly, before the AVL insert). */
         {
             int ok = 0;
 #if UINT64_MAX > SIZE_MAX
             if (freed_tail > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
 #endif
+            if (new_len < aligned_new) {
+                uint64_t gap = aligned_new - new_len;
+#if UINT64_MAX > SIZE_MAX
+                if (gap > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
+#endif
+                if (bstack_zero(a->bs, slice.offset + new_len, (size_t)gap) != 0)
+                    return -1;
+            }
             if (bstack_try_discard(a->bs, slice.offset + aligned_old,
                                    (size_t)freed_tail, &ok) != 0) return -1;
             if (ok) {
-                if (new_len < aligned_new) {
-                    uint64_t gap = aligned_new - new_len;
-#if UINT64_MAX > SIZE_MAX
-                    if (gap > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
-#endif
-                    if (bstack_zero(a->bs, slice.offset + new_len, (size_t)gap) != 0)
-                        return -1;
-                }
                 out->allocator = self; out->offset = slice.offset; out->len = new_len;
                 return 0;
             }
