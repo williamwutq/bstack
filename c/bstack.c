@@ -1467,6 +1467,87 @@ fail_unlock:
     return -1;
 }
 
+/* -------------------------------------------------------------------------
+ * bstack_repeat
+ * ---------------------------------------------------------------------- */
+
+int bstack_repeat(bstack_t *bs, uint64_t offset,
+                  const uint8_t *pattern, size_t pattern_len, uint64_t count)
+{
+    if (pattern_len == 0 || count == 0)
+        return 0;
+
+    /* total = pattern_len * count, guarded against overflow. */
+    if ((uint64_t)pattern_len > UINT64_MAX / count) {
+        errno = EINVAL;
+        return -1;
+    }
+    uint64_t total = (uint64_t)pattern_len * count;
+    if (total > UINT64_MAX - offset) {
+        errno = EINVAL;
+        return -1;
+    }
+    uint64_t end = offset + total;
+#if UINT64_MAX > SIZE_MAX
+    if (total > (uint64_t)SIZE_MAX) {
+        errno = EINVAL;
+        return -1;
+    }
+#endif
+    size_t total_sz = (size_t)total;
+
+    BS_WRLOCK(bs);
+
+    /* Load locked under the write lock (see bstack_set for rationale). */
+    uint64_t locked = ATOMIC_LOAD_ACQUIRE(&bs->locked);
+    if (offset < locked) {
+        BS_WRUNLOCK(bs);
+        errno = EINVAL;
+        return -1;
+    }
+
+    uint64_t raw_size;
+    if (file_size(bs->fd, &raw_size) != 0)
+        goto fail_unlock;
+
+    uint64_t data_size = raw_size - HEADER_SIZE;
+    if (end > data_size) {
+        BS_WRUNLOCK(bs);
+        errno = EINVAL;
+        return -1;
+    }
+
+    /* Stage the whole expanded region (no journal) and write it in one pass. */
+    uint8_t *buf = (uint8_t *)malloc(total_sz);
+    if (!buf) {
+        BS_WRUNLOCK(bs);
+        errno = ENOMEM;
+        return -1;
+    }
+    for (size_t i = 0; i < total_sz; i += pattern_len)
+        memcpy(buf + i, pattern, pattern_len);
+
+    if (plat_pwrite(bs->fd, buf, total_sz, HEADER_SIZE + offset) != 0) {
+        free(buf);
+        goto fail_unlock;
+    }
+    free(buf);
+
+    if (plat_durable_sync(bs->fd) != 0)
+        goto fail_unlock;
+
+    BS_WRUNLOCK(bs);
+    return 0;
+
+fail_unlock:
+    {
+        int saved = errno;
+        BS_WRUNLOCK(bs);
+        errno = saved;
+    }
+    return -1;
+}
+
 #endif /* BSTACK_FEATURE_SET */
 
 /* -------------------------------------------------------------------------

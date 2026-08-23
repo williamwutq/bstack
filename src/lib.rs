@@ -1900,6 +1900,76 @@ impl BStack {
         file.write_all(&zeros)?;
         durable_sync(file)
     }
+
+    /// Overwrite `[offset, offset + count * pattern.len())` in place with
+    /// `count` back-to-back copies of `pattern`.
+    ///
+    /// An empty `pattern` or `count == 0` is a no-op. The file size is never
+    /// changed: if the write would exceed the current payload size the call is
+    /// rejected. This is the general form of [`zero`](Self::zero) (which is
+    /// `repeat` of the single byte `0x00`).
+    ///
+    /// # Feature flag
+    ///
+    /// Only available when the `set` Cargo feature is enabled.
+    ///
+    /// # Durability
+    ///
+    /// Equivalent to [`set`](Self::set): the whole region is written and durably
+    /// synced before returning. Unlike the write-in-progress-journal
+    /// implementation on the 0.4.x line — which journals only the pattern and
+    /// count — this version has no such journal and writes the full
+    /// `count * pattern.len()` bytes directly, so a crash-safe fill of a large
+    /// region is slower and stages the expanded buffer in memory.
+    pub fn repeat(&self, offset: u64, pattern: impl AsRef<[u8]>, count: u64) -> io::Result<()> {
+        let pattern = pattern.as_ref();
+        if pattern.is_empty() || count == 0 {
+            return Ok(());
+        }
+        let total = (pattern.len() as u64).checked_mul(count).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "repeat: count * pattern.len() overflows u64",
+            )
+        })?;
+        let end = offset.checked_add(total).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "repeat: offset + count*pattern.len() overflows u64",
+            )
+        })?;
+        let total = usize::try_from(total).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "repeat: total length exceeds platform pointer size",
+            )
+        })?;
+        let mut guard = self.lock.write().unwrap();
+        let file = &mut guard.0;
+        // Load `locked` under the write lock (see `set` for rationale).
+        let locked = self.locked.load(Ordering::Acquire);
+        if offset < locked {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("repeat: range [{offset}, {end}) overlaps locked region [0, {locked})"),
+            ));
+        }
+        let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
+        if end > data_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("repeat: write end ({end}) exceeds payload size ({data_size})"),
+            ));
+        }
+        // Stage the whole expanded region and write it in one pass (no journal).
+        let mut buf = Vec::with_capacity(total);
+        while buf.len() < total {
+            buf.extend_from_slice(pattern);
+        }
+        file.seek(SeekFrom::Start(HEADER_SIZE + offset))?;
+        file.write_all(&buf)?;
+        durable_sync(file)
+    }
 }
 
 // ---------------------------------------------------------------------------

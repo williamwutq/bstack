@@ -322,6 +322,21 @@ int bstack_set(bstack_t *bs, uint64_t offset,
  */
 BSTACK_WARN_UNUSED_RESULT
 int bstack_zero(bstack_t *bs, uint64_t offset, size_t n);
+
+/*
+ * Overwrite [offset, offset + count*pattern_len) in place with count back-to-back
+ * copies of the pattern_len bytes at pattern.  An empty pattern (pattern_len == 0)
+ * or count == 0 is a no-op.  The file size is never changed; the write is rejected
+ * if it would exceed the current payload size or overlap the locked region.  The
+ * general form of bstack_zero (which is a repeat of the single byte 0x00).  This
+ * version writes the full count*pattern_len bytes directly (no journal), so a
+ * large fill is slower and stages the expanded buffer in memory.
+ *
+ * Only available when compiled with -DBSTACK_FEATURE_SET.
+ */
+BSTACK_WARN_UNUSED_RESULT
+int bstack_repeat(bstack_t *bs, uint64_t offset,
+                  const uint8_t *pattern, size_t pattern_len, uint64_t count);
 #endif /* BSTACK_FEATURE_SET */
 
 #ifdef BSTACK_FEATURE_ATOMIC

@@ -1021,6 +1021,73 @@ mod tests {
         assert_eq!(s2.peek(0).unwrap(), b"hiZZZ");
     }
 
+    // ---- repeat (feature-gated) ---------------------------------------------
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn repeat_fills_with_pattern_copies() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"............").unwrap(); // 12 bytes
+        s.repeat(0, b"ab", 6).unwrap(); // "ab" x 6 = 12 bytes
+        assert_eq!(s.peek(0).unwrap(), b"abababababab");
+        assert_eq!(s.len().unwrap(), 12);
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn repeat_at_offset_leaves_neighbours() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"XXXXXXXXXX").unwrap(); // 10 bytes
+        s.repeat(2, b"yz", 3).unwrap(); // fills [2,8) with "yzyzyz"
+        assert_eq!(s.peek(0).unwrap(), b"XXyzyzyzXX");
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn repeat_single_byte_pattern_matches_zero_style_fill() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        s.repeat(0, b"\x00", 5).unwrap();
+        assert_eq!(s.peek(0).unwrap(), b"\x00\x00\x00\x00\x00world");
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn repeat_empty_pattern_or_zero_count_is_noop() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        s.repeat(0, b"", 5).unwrap();
+        s.repeat(0, b"ab", 0).unwrap();
+        assert_eq!(s.peek(0).unwrap(), b"helloworld");
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn repeat_past_end_is_rejected() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        let err = s.repeat(0, b"ab", 4).unwrap_err(); // would write 8 into 5
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(s.peek(0).unwrap(), b"hello");
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn repeat_persists_across_reopen() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+        s.push(b"........").unwrap(); // 8 bytes
+        s.repeat(0, b"QW", 4).unwrap();
+        drop(s);
+        let s2 = BStack::open(&p).unwrap();
+        assert_eq!(s2.peek(0).unwrap(), b"QWQWQWQW");
+    }
+
     // ---- zero (feature-gated) -----------------------------------------------
 
     #[cfg(feature = "set")]

@@ -1668,6 +1668,87 @@ static int test_zero_persists_across_reopen(void)
     return 0;
 }
 
+/* -------------------------------------------------------------------------
+ * bstack_repeat  (compiled only with -DBSTACK_FEATURE_SET)
+ * ---------------------------------------------------------------------- */
+
+static int test_repeat_fills_with_pattern_copies(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    CHECK(bstack_push(bs, (uint8_t *)"............", 12, NULL) == 0);
+    CHECK(bstack_repeat(bs, 0, (uint8_t *)"ab", 2, 6) == 0);
+    uint8_t buf[12]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(w == 12);
+    CHECK(memcmp(buf, "abababababab", 12) == 0);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_repeat_at_offset_leaves_neighbours(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    CHECK(bstack_push(bs, (uint8_t *)"XXXXXXXXXX", 10, NULL) == 0);
+    CHECK(bstack_repeat(bs, 2, (uint8_t *)"yz", 2, 3) == 0);
+    uint8_t buf[10]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(memcmp(buf, "XXyzyzyzXX", 10) == 0);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_repeat_empty_or_zero_count_is_noop(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    CHECK(bstack_push(bs, (uint8_t *)"helloworld", 10, NULL) == 0);
+    CHECK(bstack_repeat(bs, 0, (uint8_t *)"", 0, 5) == 0);
+    CHECK(bstack_repeat(bs, 0, (uint8_t *)"ab", 2, 0) == 0);
+    uint8_t buf[10]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(memcmp(buf, "helloworld", 10) == 0);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_repeat_rejects_write_past_end(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    CHECK(bstack_push(bs, (uint8_t *)"hello", 5, NULL) == 0);
+    errno = 0;
+    CHECK(bstack_repeat(bs, 0, (uint8_t *)"ab", 2, 4) == -1); /* 8 into 5 */
+    CHECK(errno == EINVAL);
+    uint8_t buf[5]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(memcmp(buf, "hello", 5) == 0);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_repeat_persists_across_reopen(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    CHECK(bstack_push(bs, (uint8_t *)"........", 8, NULL) == 0);
+    CHECK(bstack_repeat(bs, 0, (uint8_t *)"QW", 2, 4) == 0);
+    bstack_close(bs);
+    bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    uint8_t buf[8]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(memcmp(buf, "QWQWQWQW", 8) == 0);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
 #endif /* BSTACK_FEATURE_SET */
 
 /* =========================================================================
@@ -4648,6 +4729,13 @@ int main(void)
     /* bstack_set / bstack_zero — locked-region protection */
     T(test_set_respects_locked_region);
     T(test_zero_respects_locked_region);
+
+    /* bstack_repeat */
+    T(test_repeat_fills_with_pattern_copies);
+    T(test_repeat_at_offset_leaves_neighbours);
+    T(test_repeat_empty_or_zero_count_is_noop);
+    T(test_repeat_rejects_write_past_end);
+    T(test_repeat_persists_across_reopen);
 #endif
 
 #ifdef BSTACK_FEATURE_ATOMIC
