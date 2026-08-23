@@ -4459,7 +4459,10 @@ mod alloc_tests {
         let mut s = alloc.alloc(data.len() as u64).unwrap();
         s.as_slice_mut().write(&data).unwrap();
         let (mut view, _rem) = s.as_slice().chunks(512);
-        view.sort_partial_by(|a, b| u16::from_le_bytes([a[0], a[1]]).cmp(&u16::from_le_bytes([b[0], b[1]]))).unwrap();
+        view.sort_partial_by(|a, b| {
+            u16::from_le_bytes([a[0], a[1]]).cmp(&u16::from_le_bytes([b[0], b[1]]))
+        })
+        .unwrap();
         let got = read_keys(&s.as_slice().read().unwrap(), 512, 30);
         let mut want = keys.clone();
         want.sort_unstable();
@@ -4482,7 +4485,10 @@ mod alloc_tests {
         let mut s = alloc.alloc(data.len() as u64).unwrap();
         s.as_slice_mut().write(&data).unwrap();
         let (mut view, _rem) = s.as_slice().chunks(512);
-        view.sort_partial_by(|a, b| u16::from_le_bytes([a[0], a[1]]).cmp(&u16::from_le_bytes([b[0], b[1]]))).unwrap();
+        view.sort_partial_by(|a, b| {
+            u16::from_le_bytes([a[0], a[1]]).cmp(&u16::from_le_bytes([b[0], b[1]]))
+        })
+        .unwrap();
         let got = read_keys(&s.as_slice().read().unwrap(), 512, 13);
         let mut want = keys.clone();
         want.sort_unstable();
@@ -4538,7 +4544,9 @@ mod alloc_tests {
             state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
             (state >> 33) as u16
         };
-        for &n in &[0usize, 1, 2, 5, 11, 12, 13, 24, 25, 26, 27, 28, 29, 30, 48, 50] {
+        for &n in &[
+            0usize, 1, 2, 5, 11, 12, 13, 24, 25, 26, 27, 28, 29, 30, 48, 50,
+        ] {
             let keys: Vec<u16> = (0..n).map(|_| next() % 1000).collect();
             let data = keyed_records(&keys, 512);
             let mut s = alloc.alloc((n * 512).max(1) as u64).unwrap();
@@ -4546,7 +4554,10 @@ mod alloc_tests {
                 s.as_slice_mut().write(&data).unwrap();
             }
             let (mut view, _rem) = s.as_slice().chunks(512);
-            view.sort_partial_by(|a, b| u16::from_le_bytes([a[0], a[1]]).cmp(&u16::from_le_bytes([b[0], b[1]]))).unwrap();
+            view.sort_partial_by(|a, b| {
+                u16::from_le_bytes([a[0], a[1]]).cmp(&u16::from_le_bytes([b[0], b[1]]))
+            })
+            .unwrap();
             if n > 0 {
                 let got = read_keys(&s.as_slice().read().unwrap()[..n * 512], 512, n);
                 let mut want = keys.clone();

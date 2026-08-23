@@ -627,7 +627,9 @@ impl<'a> BStackChunk<'a> {
         &mut self,
         mut key: impl FnMut(&[u8]) -> K,
     ) -> io::Result<()> {
-        merge_sort(&self.aligned, self.chunk_len, &mut |a, b| key(a).cmp(&key(b)))
+        merge_sort(&self.aligned, self.chunk_len, &mut |a, b| {
+            key(a).cmp(&key(b))
+        })
     }
 }
 
@@ -820,14 +822,19 @@ fn upper_bound(
 
 /// Merge the adjacent sorted runs `[lo, mid)` and `[mid, hi)` in place.
 ///
-/// A recursive rotation merge (SymMerge): sub-ranges that fit the memory budget
-/// are merged by one atomic [`BStack::process`] sort; larger ranges are split
-/// by binary-searching a pivot from the larger run and rotating the two middle
-/// blocks past each other with [`BStack::cross_exchange`], then recursing on the
-/// two halves. Every rotation is a sequence of atomic single-record swaps and
-/// every base case is one atomic `process`, so O(1) memory beyond the two
-/// scratch records and any crash leaves a valid permutation. Handles arbitrary
-/// (including ragged) run lengths.
+/// A rotation merge (SymMerge): a sub-range that fits the memory budget is
+/// merged by one atomic [`BStack::process`] sort; a larger range is split by
+/// binary-searching a pivot from the larger run and rotating the two middle
+/// blocks past each other with [`BStack::cross_exchange`], then the two halves
+/// are merged the same way. Every rotation is a sequence of atomic single-record
+/// swaps and every base case is one atomic `process`, so O(1) records held
+/// resident (beyond the two scratch records) and any crash leaves a valid
+/// permutation. Handles arbitrary (including ragged) run lengths.
+///
+/// Iterative, not recursive: the deferred half of each split is pushed onto
+/// `stack` (cleared on entry, reused across calls) and the smaller half is
+/// continued in place, so `stack` never holds more than `O(log(hi - lo))`
+/// entries and there is no call-stack recursion to overflow.
 #[cfg(all(feature = "set", feature = "atomic"))]
 #[allow(clippy::too_many_arguments)]
 fn imerge(
@@ -835,43 +842,73 @@ fn imerge(
     c: u64,
     cu: usize,
     budget: u64,
-    lo: u64,
-    mid: u64,
-    hi: u64,
+    lo0: u64,
+    mid0: u64,
+    hi0: u64,
     bi: &mut [u8],
     bj: &mut [u8],
+    stack: &mut Vec<(u64, u64, u64)>,
     cmp: &mut dyn FnMut(&[u8], &[u8]) -> Ordering,
 ) -> io::Result<()> {
-    if lo >= mid || mid >= hi {
-        return Ok(());
+    stack.clear();
+    let (mut lo, mut mid, mut hi) = (lo0, mid0, hi0);
+    loop {
+        // Descend, splitting until the range is a base case. `hi - lo > 2`
+        // guarantees `llen >= 2` in the `llen >= rlen` branch (so `i > lo`) and
+        // is the base for records so wide that two of them exceed the budget;
+        // combined with pivoting the larger run, every split leaves both halves
+        // strictly smaller, so this terminates.
+        while lo < mid && mid < hi && hi - lo > 2 && (hi - lo) * c > budget {
+            let (llen, rlen) = (mid - lo, hi - mid);
+            let (i, j);
+            if llen >= rlen {
+                i = lo + llen / 2; // i in (lo, mid): llen >= 2 here
+                read_record(aligned, i, c, bi)?; // pivot bytes held in `bi`
+                j = lower_bound(aligned, c, mid, hi, bi, bj, cmp)?;
+            } else {
+                j = mid + rlen / 2; // j in (mid, hi): rlen >= 2 here
+                read_record(aligned, j, c, bj)?; // pivot bytes held in `bj`
+                i = upper_bound(aligned, c, lo, mid, bj, bi, cmp)?;
+            }
+            // Skip a no-op rotation (one side of the pivot is empty).
+            if i < mid && mid < j {
+                rotate_records(aligned, c, i, mid, j)?;
+            }
+            let new_mid = i + (j - mid); // in [lo, hi]; see arithmetic note
+            let (l_lo, l_mid, l_hi) = (lo, i, new_mid);
+            let (r_lo, r_mid, r_hi) = (new_mid, j, hi);
+            // Continue on the smaller half; defer the larger — bounds `stack`.
+            if l_hi - l_lo <= r_hi - r_lo {
+                stack.push((r_lo, r_mid, r_hi));
+                lo = l_lo;
+                mid = l_mid;
+                hi = l_hi;
+            } else {
+                stack.push((l_lo, l_mid, l_hi));
+                lo = r_lo;
+                mid = r_mid;
+                hi = r_hi;
+            }
+        }
+        // Base case: two already-sorted runs that fit the budget (or a 1–2
+        // record range) — one atomic sort settles them. Degenerate ranges
+        // (an empty side) fall through to the pop.
+        if lo < mid && mid < hi {
+            let s = rec_off(aligned, lo, c);
+            let e = rec_off(aligned, hi, c);
+            aligned
+                .stack()
+                .process(s, e, |buf| sort_chunks_by(buf, cu, &mut *cmp))?;
+        }
+        match stack.pop() {
+            Some((l, m, h)) => {
+                lo = l;
+                mid = m;
+                hi = h;
+            }
+            None => return Ok(()),
+        }
     }
-    // Base case: the whole range fits the budget — sort it in one atomic pass.
-    // This bounds the recursion depth and keeps small merges fast. (`sort` here
-    // is correct because `[lo, hi)` is two already-sorted runs.)
-    if (hi - lo) * c <= budget {
-        let s = rec_off(aligned, lo, c);
-        let e = rec_off(aligned, hi, c);
-        return aligned
-            .stack()
-            .process(s, e, |buf| sort_chunks_by(buf, cu, &mut *cmp));
-    }
-    let (llen, rlen) = (mid - lo, hi - mid);
-    // Pivot in the middle of the *larger* run so it halves each recursion.
-    let (i, j);
-    if llen >= rlen {
-        i = lo + llen / 2;
-        read_record(aligned, i, c, bi)?; // pivot bytes held in `bi`
-        j = lower_bound(aligned, c, mid, hi, bi, bj, cmp)?;
-    } else {
-        j = mid + rlen / 2;
-        read_record(aligned, j, c, bj)?; // pivot bytes held in `bj`
-        i = upper_bound(aligned, c, lo, mid, bj, bi, cmp)?;
-    }
-    rotate_records(aligned, c, i, mid, j)?;
-    let new_mid = i + (j - mid);
-    imerge(aligned, c, cu, budget, lo, i, new_mid, bi, bj, cmp)?;
-    imerge(aligned, c, cu, budget, new_mid, j, hi, bi, bj, cmp)?;
-    Ok(())
 }
 
 /// Out-of-core in-place bottom-up merge sort of `aligned`, viewed as records of
@@ -887,15 +924,20 @@ fn merge_sort(
         return Ok(());
     }
     let cu = c as usize;
+    // `c >= 1` (BStackChunk invariant), so the divisions are safe. `run0 * c <=
+    // SORT_WINDOWS * SORT_BLOCK_BYTES` fits `u64`; all index arithmetic below
+    // stays within `count` (record count of an existing region) via
+    // subtraction-form comparisons, so nothing can overflow for any real file.
     let k = (SORT_BLOCK_BYTES / c).max(1);
     let budget = SORT_WINDOWS * SORT_BLOCK_BYTES;
     let run0 = SORT_WINDOWS * k;
     let mut bi = vec![0u8; cu];
     let mut bj = vec![0u8; cu];
+    let mut stack: Vec<(u64, u64, u64)> = Vec::new();
     // Phase 1: run formation — sort each `run0`-record window.
     let mut p = 0u64;
     while p < count {
-        let q = (p + run0).min(count);
+        let q = if count - p > run0 { p + run0 } else { count };
         if q - p > 1 {
             let s = rec_off(aligned, p, c);
             let e = rec_off(aligned, q, c);
@@ -908,12 +950,22 @@ fn merge_sort(
     // Phase 2: bottom-up merge passes.
     let mut width = run0;
     while width < count {
+        // `count - width > 0` here (loop guard), so `count - width` is safe.
+        let stop = count - width;
         let mut lo = 0u64;
-        while lo + width < count {
-            let mid = lo + width;
-            let hi = (lo + 2 * width).min(count);
-            imerge(aligned, c, cu, budget, lo, mid, hi, &mut bi, &mut bj, cmp)?;
-            lo += 2 * width;
+        while lo < stop {
+            let mid = lo + width; // < count, since lo < count - width
+            let hi = if count - mid > width {
+                mid + width
+            } else {
+                count
+            };
+            imerge(
+                aligned, c, cu, budget, lo, mid, hi, &mut bi, &mut bj, &mut stack, cmp,
+            )?;
+            // Advance two runs; saturate so a near-`u64::MAX` sum can only end
+            // the pass, never wrap.
+            lo = lo.saturating_add(width).saturating_add(width);
         }
         width = width.saturating_mul(2);
     }
