@@ -5999,6 +5999,7 @@ mod first_fit_tests {
 #[cfg(all(test, feature = "atomic"))]
 mod atomic_tests {
     use crate::BStack;
+    #[cfg(feature = "set")]
     use crate::{bstack_unsafe_reborrow, bstack_unsafe_reborrow_mut};
     use std::io::ErrorKind;
     use std::sync::atomic::{AtomicU64, Ordering};

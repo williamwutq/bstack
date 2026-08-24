@@ -2209,7 +2209,6 @@ mod fault_tests {
             // The grow faulted before committing: the original block is handed back.
             let handle = err.handle.expect("the original block must survive");
             assert_eq!((handle.start(), handle.len()), (start, old_len));
-            drop(handle);
             (start, old_len)
         };
 
@@ -2305,7 +2304,6 @@ mod fault_tests {
                 arm(&alloc, FailOpAt::new("set", at, ErrorKind::Other));
                 let _ = alloc.dealloc(b); // may fault (past-lost → handle None) or succeed
                 disarm(&alloc);
-                drop(g0);
                 g0s
             };
 
