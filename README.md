@@ -1345,6 +1345,7 @@ recoverable after a crash by reconstructing the handle from the raw block via
 - **Readback helper**: `read_bytes` loads all logical bytes into a Rust `Vec<u8>`.
 - **Zeroing on removal**: `pop` decrements `len` before zeroing the vacated slot; `truncate` writes the new `len` before zeroing removed slots in a single `BStackSlice::zero_range` call. Deallocation zeroing is delegated to the allocator.
 - **Iterator**: `BStackByteVecIter` borrows the vec immutably for its lifetime (preventing concurrent mutation) and yields `io::Result<u8>` per byte, reading from disk on demand.
+- **`io::Write`**: `write(buf)` forwards to `extend_from_slice(buf)` and returns `buf.len()`; `flush()` is a no-op. Each `write` re-reads the header and may reallocate, so `write_all` over many small chunks costs more than one `extend_from_slice` call — `reserve` beforehand avoids the repeated regrowth.
 
 ### Example
 

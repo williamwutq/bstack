@@ -611,6 +611,27 @@ impl<'a, A: BStackOwnedSliceAllocator> BStackByteVec<'a, A> {
     }
 }
 
+impl<'a, A: BStackOwnedSliceAllocator> io::Write for BStackByteVec<'a, A> {
+    /// Append `buf` via [`extend_from_slice`](Self::extend_from_slice) and
+    /// return `buf.len()`.
+    ///
+    /// Every call re-reads the 16-byte header via `read_header` and may
+    /// `realloc` to grow capacity, so `write_all` over many small chunks is
+    /// materially worse than one `extend_from_slice` call. Call
+    /// [`reserve`](Self::reserve) beforehand to avoid the repeated regrowth.
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.extend_from_slice(buf)?;
+        Ok(buf.len())
+    }
+
+    /// A no-op: every [`extend_from_slice`](Self::extend_from_slice) is
+    /// already durably synced through the underlying [`crate::BStack`] write.
+    #[inline]
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 // ── atomic bulk / positional operations (requires the `atomic` feature) ─────────
 
 /// Operations built on the crash-atomic in-file byte movers
@@ -1212,6 +1233,35 @@ mod tests {
         let mut v = BStackByteVec::new(&alloc).unwrap();
         v.extend_from_slice(&[10u8, 20, 30]).unwrap();
         assert_eq!(v.read_bytes().unwrap(), [10u8, 20, 30]);
+    }
+
+    #[test]
+    fn io_write_appends_and_returns_len() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let mut v = BStackByteVec::new(&alloc).unwrap();
+        let n = io::Write::write(&mut v, &[1u8, 2, 3]).unwrap();
+        assert_eq!(n, 3);
+        assert_eq!(v.read_bytes().unwrap(), [1u8, 2, 3]);
+    }
+
+    #[test]
+    fn io_write_write_all_appends_multiple_chunks() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let mut v = BStackByteVec::new(&alloc).unwrap();
+        io::Write::write_all(&mut v, &[1u8, 2]).unwrap();
+        io::Write::write_all(&mut v, &[3u8, 4, 5]).unwrap();
+        assert_eq!(v.read_bytes().unwrap(), [1u8, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn io_write_flush_is_noop() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let mut v = BStackByteVec::from_slice(&[7u8], &alloc).unwrap();
+        io::Write::flush(&mut v).unwrap();
+        assert_eq!(v.read_bytes().unwrap(), [7u8]);
     }
 
     #[test]

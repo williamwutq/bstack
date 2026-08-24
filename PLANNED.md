@@ -407,23 +407,6 @@ pub fn replace_with<F: FnOnce(&mut [u8])>(&self, f: F) -> io::Result<()>;
 
 ---
 
-## `io::Write for BStackByteVec`
-
-**Feature flag:** `alloc` + `set`.
-**Breaking change:** No.
-
-### Motivation
-
-`BStackByteVec` is the crate's growable byte buffer and implements no std traits beyond `Debug`. Append is already its primary operation, and `BStackSliceWriter` establishes the pattern.
-
-### Design
-
-- `write(buf)` forwards to `extend_from_slice(buf)` and returns `buf.len()`; `flush()` is `Ok(())`, since every `extend_from_slice` is already durable through the underlying `BStack` write. The `&mut self` receiver matches the existing inherent methods, and the bound is `A: BStackOwnedSliceAllocator`.
-- Document the cost: each `write` re-reads the 16-byte header via `read_header` and may `realloc` to grow capacity, so `write_all` over many small chunks is materially worse than one `extend_from_slice`. `reserve` beforehand is the mitigation.
-- No `io::Read` counterpart — reading needs a cursor, which `BStackSliceReader` already provides over `as_slice`.
-
----
-
 ## `BStackByteVec` standard-collection parity
 
 **Feature flag:** varies per method; see below.
