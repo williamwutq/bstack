@@ -62,8 +62,9 @@
 //! ```
 
 use super::{
-    BStackAllocError, BStackAllocator, BStackBulkAllocError, BStackBulkAllocator, BStackOwnedSlice,
-    BStackUninitAllocator, ensure_own_handle, ensure_own_handles,
+    BStackAllocError, BStackAllocator, BStackBulkAllocError, BStackBulkAllocator,
+    BStackInPlaceResizeAllocator, BStackOwnedSlice, BStackUninitAllocator, ensure_own_handle,
+    ensure_own_handles,
 };
 use crate::BStack;
 use std::collections::HashSet;
@@ -706,6 +707,115 @@ where
     }
 }
 
+/// Forwards to the inner allocator's front/back in-place resize, with the
+/// same overlap checking as [`realloc`](BStackAllocator::realloc).
+///
+/// Only available when the wrapped allocator implements
+/// [`BStackInPlaceResizeAllocator`] itself, for the same reason as
+/// [`BStackUninitAllocator`] above: the wrapper never fabricates a structural
+/// guarantee the inner allocator does not make.
+///
+/// A nonzero `prepend` moves the region's start, so unlike
+/// [`realloc`](BStackAllocator::realloc) the tracked region cannot simply be
+/// resized in place: the old `(start, len)` is retired into the freed set and
+/// `(start - prepend, len + prepend + append)` is recorded as newly allocated,
+/// exactly as a relocating realloc would be tracked. A debug assertion checks
+/// the trait's exact-position guarantee on every success. An `Unsupported`
+/// failure is a clean pre-mutation rejection — the inner handle comes back
+/// untouched and tracking is left exactly as it was.
+impl<A> BStackInPlaceResizeAllocator for DebugCheckingAllocator<A>
+where
+    A: 'static + BStackInPlaceResizeAllocator<Error = io::Error>,
+    for<'b> A: BStackAllocator<Allocated<'b> = BStackOwnedSlice<'b, A>>,
+{
+    fn realloc_inplace<'a>(
+        &'a self,
+        handle: BStackOwnedSlice<'a, Self>,
+        prepend: i64,
+        append: i64,
+    ) -> Result<BStackOwnedSlice<'a, Self>, BStackAllocError<'a, Self>> {
+        let handle = ensure_own_handle(self, handle, "DebugCheckingAllocator::realloc_inplace")?;
+        let old_offset = handle.start();
+        let old_len = handle.len();
+        let old_region = old_offset..old_offset + old_len;
+
+        // SAFETY: Reconstructing the inner handle from coordinates that were
+        // originally produced by the inner allocator.
+        let inner_handle =
+            unsafe { BStackOwnedSlice::from_raw_parts(&self.inner, old_offset, old_len) };
+
+        let new_inner_slice = match self.inner.realloc_inplace(inner_handle, prepend, append) {
+            Ok(h) => h,
+            Err(inner_err) => {
+                // Re-wrap any surviving inner handle as a wrapper handle.
+                // If the handle is None the region is lost — stop tracking it.
+                let handle = match inner_err.handle {
+                    Some(h) => {
+                        let o = h.start();
+                        let l = h.len();
+                        // SAFETY: The inner allocator confirmed this region survives.
+                        Some(unsafe { BStackOwnedSlice::from_raw_parts(self, o, l) })
+                    }
+                    None => {
+                        self.forget_region(old_offset, old_len);
+                        None
+                    }
+                };
+                return Err(BStackAllocError {
+                    source: inner_err.source,
+                    handle,
+                });
+            }
+        };
+
+        let new_offset = new_inner_slice.start();
+        let new_len = new_inner_slice.len();
+        let new_region = new_offset..new_offset + new_len;
+
+        debug_assert_eq!(
+            (new_offset as i64, (new_offset + new_len) as i64),
+            (
+                old_offset as i64 - prepend,
+                (old_offset + old_len) as i64 + append
+            ),
+            "DebugCheckingAllocator: realloc_inplace returned [{}, {}), which is not \
+             exactly (start - prepend, end + append) for the input handle. This indicates \
+             a bug in the underlying allocator's realloc_inplace.",
+            new_offset,
+            new_offset + new_len,
+        );
+
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let overlapping_allocation = state
+            .allocated
+            .iter()
+            .find(|region| **region != old_region && overlaps(&new_region, region))
+            .cloned();
+        if let Some(overlap) = overlapping_allocation {
+            panic!(
+                "DebugCheckingAllocator: In-place reallocated region [{}, {}) overlaps with \
+                 existing allocated region [{}, {}). This indicates a bug in the underlying \
+                 allocator's realloc_inplace.",
+                new_region.start, new_region.end, overlap.start, overlap.end
+            );
+        }
+
+        state.allocated.remove(&old_region);
+        record_freed_region(&mut state, old_region.clone());
+        record_allocated_region(
+            &mut state,
+            new_region,
+            "In-place reallocated region",
+            "'s realloc_inplace",
+        );
+        drop(state);
+
+        // SAFETY: The inner allocator successfully returned this region via
+        // realloc_inplace.
+        Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, new_offset, new_len) })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -904,6 +1014,12 @@ mod tests {
         realloc_lose_handle: bool,
         /// When true, a failed dealloc reports the handle as lost (None).
         dealloc_lose_handle: bool,
+        fail_realloc_inplace: bool,
+        /// When true, a failed `realloc_inplace` reports `Unsupported` instead
+        /// of a generic error.
+        realloc_inplace_unsupported: bool,
+        /// When true, a failed `realloc_inplace` reports the handle as lost (None).
+        realloc_inplace_lose_handle: bool,
     }
 
     struct ControllableMockAllocator {
@@ -944,6 +1060,68 @@ mod tests {
         ) -> Result<Self::Allocated<'a>, BStackAllocError<'a, Self>> {
             self.uninit_calls.set(self.uninit_calls.get() + 1);
             self.realloc(handle, new_len)
+        }
+    }
+
+    // A minimal front/back in-place resize: no real storage to relocate, so
+    // this just recomputes the tracked range and bumps `next_offset` if the
+    // new range grows past it. What is under test is the wrapper's
+    // forwarding, tracking, and position-guarantee assertion — not any real
+    // structural resize logic.
+    impl BStackInPlaceResizeAllocator for ControllableMockAllocator {
+        fn realloc_inplace<'a>(
+            &'a self,
+            handle: Self::Allocated<'a>,
+            prepend: i64,
+            append: i64,
+        ) -> Result<Self::Allocated<'a>, BStackAllocError<'a, Self>> {
+            // Mirrors the trait's "Empty handles" clause: unconditionally
+            // `Unsupported`, regardless of `fail_realloc_inplace`.
+            if handle.is_empty() {
+                return Err(BStackAllocError::with_handle(
+                    io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "mock realloc_inplace: cannot resize an empty handle in place",
+                    ),
+                    handle,
+                ));
+            }
+            let config = self.config.borrow();
+            if config.fail_realloc_inplace {
+                let lose = config.realloc_inplace_lose_handle;
+                let unsupported = config.realloc_inplace_unsupported;
+                drop(config);
+                let source = if unsupported {
+                    io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "mock realloc_inplace unsupported",
+                    )
+                } else {
+                    io::Error::other("mock realloc_inplace failure")
+                };
+                return if lose {
+                    Err(BStackAllocError::lost(source))
+                } else {
+                    Err(BStackAllocError::with_handle(source, handle))
+                };
+            }
+            drop(config);
+
+            let old_offset = handle.start();
+            let old_len = handle.len();
+            let old_region = old_offset..old_offset + old_len;
+            self.allocated.borrow_mut().remove(&old_region);
+
+            let new_offset = (old_offset as i64 - prepend) as u64;
+            let new_len = (old_len as i64 + prepend + append) as u64;
+            let new_end = new_offset + new_len;
+            if self.next_offset.get() < new_end {
+                self.next_offset.set(new_end);
+            }
+            self.allocated.borrow_mut().insert(new_offset..new_end);
+
+            // SAFETY: Mock allocator test harness.
+            Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, new_offset, new_len) })
         }
     }
 
@@ -1347,6 +1525,196 @@ mod tests {
             );
         }
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_realloc_inplace_append_only_retires_old_records_new() -> io::Result<()> {
+        let (stack, path) = create_test_stack()?;
+        let _guard = TestGuard(path);
+        let config = Rc::new(RefCell::new(MockAllocatorConfig::default()));
+        let inner = ControllableMockAllocator::new(stack, config);
+        let alloc = DebugCheckingAllocator::new(inner);
+
+        let handle = alloc.alloc(100)?;
+        let new_handle = alloc.realloc_inplace(handle, 0, 50).map_err(|e| e.source)?;
+        assert_eq!((new_handle.start(), new_handle.len()), (0, 150));
+
+        let state = alloc.state.lock().unwrap();
+        assert!(!state.allocated.contains(&(0..100)), "old region retired");
+        assert!(state.allocated.contains(&(0..150)), "new region tracked");
+        assert!(
+            state.freed.is_empty(),
+            "same-start retire/record cancels out"
+        );
+        drop(state);
+        alloc.dealloc(new_handle).map_err(|e| e.source)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_realloc_inplace_prepend_moves_start_and_records_new_range() -> io::Result<()> {
+        let (stack, path) = create_test_stack()?;
+        let _guard = TestGuard(path);
+        let config = Rc::new(RefCell::new(MockAllocatorConfig::default()));
+        let inner = ControllableMockAllocator::new(stack, config);
+        let alloc = DebugCheckingAllocator::new(inner);
+        // Give the mock room before offset 100 to "prepend" into.
+        alloc.inner().next_offset.set(100);
+
+        let handle = alloc.alloc(50)?;
+        assert_eq!((handle.start(), handle.len()), (100, 50));
+
+        let new_handle = alloc
+            .realloc_inplace(handle, 20, 10)
+            .map_err(|e| e.source)?;
+        assert_eq!(
+            (new_handle.start(), new_handle.len()),
+            (80, 80),
+            "position guarantee: (start - prepend, end + append)"
+        );
+
+        let state = alloc.state.lock().unwrap();
+        assert!(!state.allocated.contains(&(100..150)), "old region retired");
+        assert!(state.allocated.contains(&(80..160)), "new region tracked");
+        // The new range fully contains the old one, so nothing is left in
+        // `freed` — the whole retired region was immediately re-allocated.
+        assert!(state.freed.is_empty());
+        drop(state);
+        alloc.dealloc(new_handle).map_err(|e| e.source)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_realloc_inplace_shift_leaves_uncovered_tail_freed() -> io::Result<()> {
+        // Front grows by 20 while the back shrinks by 30, so the new range
+        // (80..120) does not fully cover the old one (100..150): the
+        // uncovered tail (120..150) must remain in `freed` after the old
+        // region is retired and the new one recorded.
+        let (stack, path) = create_test_stack()?;
+        let _guard = TestGuard(path);
+        let config = Rc::new(RefCell::new(MockAllocatorConfig::default()));
+        let inner = ControllableMockAllocator::new(stack, config);
+        let alloc = DebugCheckingAllocator::new(inner);
+        alloc.inner().next_offset.set(100);
+
+        let handle = alloc.alloc(50)?;
+        let new_handle = alloc
+            .realloc_inplace(handle, 20, -30)
+            .map_err(|e| e.source)?;
+        assert_eq!((new_handle.start(), new_handle.len()), (80, 40));
+
+        let state = alloc.state.lock().unwrap();
+        assert!(!state.allocated.contains(&(100..150)));
+        assert!(state.allocated.contains(&(80..120)));
+        assert!(state.freed.contains(&(120..150)));
+        drop(state);
+        alloc.dealloc(new_handle).map_err(|e| e.source)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_realloc_inplace_unsupported_leaves_tracking_unchanged() -> io::Result<()> {
+        let (stack, path) = create_test_stack()?;
+        let _guard = TestGuard(path);
+        let config = Rc::new(RefCell::new(MockAllocatorConfig {
+            fail_realloc_inplace: true,
+            realloc_inplace_unsupported: true,
+            ..Default::default()
+        }));
+        let inner = ControllableMockAllocator::new(stack, config);
+        let alloc = DebugCheckingAllocator::new(inner);
+
+        let handle = alloc.alloc(100)?;
+        let err = alloc
+            .realloc_inplace(handle, 0, 50)
+            .expect_err("mock realloc_inplace must fail");
+        assert_eq!(err.source.kind(), io::ErrorKind::Unsupported);
+        let recovered = err
+            .handle
+            .expect("clean pre-mutation rejection keeps the handle");
+        assert_eq!((recovered.start(), recovered.len()), (0, 100));
+
+        let state = alloc.state.lock().unwrap();
+        assert!(
+            state.allocated.contains(&(0..100)),
+            "tracking is unchanged by a clean rejection"
+        );
+        assert!(state.freed.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_realloc_inplace_empty_handle_is_always_unsupported() -> io::Result<()> {
+        let (stack, path) = create_test_stack()?;
+        let _guard = TestGuard(path);
+        let config = Rc::new(RefCell::new(MockAllocatorConfig::default()));
+        let inner = ControllableMockAllocator::new(stack, config);
+        let alloc = DebugCheckingAllocator::new(inner);
+
+        let handle = alloc.alloc(0)?;
+        assert!(handle.is_empty());
+
+        // An empty handle names no region, so every `(prepend, append)` —
+        // including the no-op `(0, 0)` — is `Unsupported`, never a state change.
+        let err = alloc
+            .realloc_inplace(handle, 0, 0)
+            .expect_err("an empty handle must be Unsupported");
+        assert_eq!(err.source.kind(), io::ErrorKind::Unsupported);
+        let recovered = err
+            .handle
+            .expect("clean pre-mutation rejection keeps the handle");
+        assert!(recovered.is_empty());
+
+        let state = alloc.state.lock().unwrap();
+        assert!(state.allocated.is_empty());
+        assert!(state.freed.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_realloc_inplace_lost_handle_forgets_region() -> io::Result<()> {
+        let (stack, path) = create_test_stack()?;
+        let _guard = TestGuard(path);
+        let config = Rc::new(RefCell::new(MockAllocatorConfig {
+            fail_realloc_inplace: true,
+            realloc_inplace_lose_handle: true,
+            ..Default::default()
+        }));
+        let inner = ControllableMockAllocator::new(stack, config);
+        let alloc = DebugCheckingAllocator::new(inner);
+
+        let handle = alloc.alloc(100)?;
+        let err = alloc
+            .realloc_inplace(handle, 0, 50)
+            .expect_err("mock realloc_inplace must fail");
+        assert!(err.handle.is_none(), "lost handle should propagate as None");
+
+        let state = alloc.state.lock().unwrap();
+        assert!(!state.allocated.contains(&(0..100)));
+        assert!(!state.freed.contains(&(0..100)));
+        Ok(())
+    }
+
+    #[test]
+    fn test_realloc_inplace_rejects_a_foreign_handle() -> io::Result<()> {
+        let (s1, p1) = create_test_stack()?;
+        let _g1 = TestGuard(p1);
+        let (s2, p2) = create_test_stack()?;
+        let _g2 = TestGuard(p2);
+        let cfg = Rc::new(RefCell::new(MockAllocatorConfig::default()));
+        let a1 = DebugCheckingAllocator::new(ControllableMockAllocator::new(s1, cfg.clone()));
+        let a2 = DebugCheckingAllocator::new(ControllableMockAllocator::new(s2, cfg));
+
+        let h = a1.alloc(64)?;
+        let err = a2
+            .realloc_inplace(h, 0, 32)
+            .expect_err("a2 must refuse a1's handle");
+        assert_eq!(err.source.kind(), io::ErrorKind::InvalidInput);
+        let h = err
+            .handle
+            .expect("a refused handle is returned, not leaked");
+        a1.dealloc(h).map_err(|e| e.source)?;
         Ok(())
     }
 

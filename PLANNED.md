@@ -339,24 +339,6 @@ A bulk request spanning 33 size classes currently degrades to `n` independent `a
 
 ---
 
-## Forward `BStackInPlaceResizeAllocator` through `DebugCheckingAllocator`
-
-**Feature flag:** `alloc`.
-**Breaking change:** No
-
-### Motivation
-
-`DebugCheckingAllocator<A>` forwards `BStackUninitAllocator` and `BStackBulkAllocator` but not `BStackInPlaceResizeAllocator`, so wrapping a `FirstFitBStackAllocator` or `GhostTreeBstackAllocator` in the checker silently drops the newest structural path from anything the checker is used to test.
-
-### Design
-
-- Bound mirrors the existing forwards: `A: 'static + BStackInPlaceResizeAllocator<Error = io::Error>` plus the `for<'b> A: BStackAllocator<Allocated<'b> = BStackOwnedSlice<'b, A>>` HRTB.
-- `realloc_inplace(handle, prepend, append)` does not fit the existing `realloc_with` helper, which threads a single `new_len`. Either generalise that helper or write a bespoke impl; the region bookkeeping is the real work, since a nonzero `prepend` moves the *start*, so the tracker must retire `(start, len)` and record `(start − prepend, len + prepend + append)` rather than resizing in place.
-- `Unsupported` must pass straight through with the inner handle re-wrapped and the original region left recorded — it is a clean pre-mutation rejection, not a state change.
-- The checker can assert something no other layer does: that the returned range is *exactly* `(start − prepend, end + append)`, i.e. the trait's position guarantee, as a debug assertion.
-
----
-
 ## `BStackInPlaceResizeAllocator` for `SegregatedBStackAllocator`
 
 **Feature flag:** `alloc` + `set`.

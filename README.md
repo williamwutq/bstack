@@ -1032,9 +1032,11 @@ two edges is `Unsupported`.
 together (`MIN_ALLOC`-aligned front), inserting each trimmed residue into its
 tree as a free block; any grow is `Unsupported`. This bounds a trim at the bytes
 removed rather than the retained payload.
-The remaining allocators do not implement the trait, and unlike
-`BStackBulkAllocator` and `BStackUninitAllocator`, `DebugCheckingAllocator<A>`
-does **not** forward it — a wrapped allocator loses `realloc_inplace`.
+The remaining allocators do not implement the trait.
+`DebugCheckingAllocator<A>` forwards `realloc_inplace` when `A` implements it,
+tracking a nonzero `prepend` by retiring the old `(start, len)` into the freed
+set and recording `(start - prepend, len + prepend + append)` as newly
+allocated, and asserting the exact-position guarantee in debug builds.
 
 #### Subslicing and joining on `BStackOwnedSlice`
 
