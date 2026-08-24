@@ -550,3 +550,30 @@ Two mechanical details:
 ### Open questions
 
 - **Left-coalesce flag hygiene.** When a left-coalesce merges the block into its predecessor, the original block's header becomes interior to the merged block and its stale `is_free` flag is never read by the scan, which strides by recorded size. Worth confirming against the recovery walk rather than assuming, since dropping the early marker is the one semantic change in Phase 1.
+
+---
+
+## `guarded` semantics under `BStackTransaction` (0.5.0)
+
+**Feature flag:** `guarded`, in combination with `transaction`.
+**Breaking change:** Undetermined. Not in 0.5.0 itself; a deprecation would be, in a later release.
+
+### Motivation
+
+`guarded` exists to solve one specific problem: **communicating atomicity across a crate boundary**. Code that interposes on reads and writes — transforming bytes on the way through — does not own the I/O and cannot establish its own crash-safety guarantee, so the boundary itself has to carry the contract. That is what the hook traits are for, and what `BStackAtomicGuardedSlice` states as an `unsafe trait`: the implementor promises that each pre-hook, I/O, post-hook sequence is one uninterruptible, crash-safe unit.
+
+`BStackTransaction` addresses exactly that problem, and addresses it more directly. A `&mut BStackTransaction<'_>` can be passed through recursion and across crate boundaries, and everything issued through it commits as a single atomic unit — so a caller on the far side of a boundary obtains atomicity by being *handed* a transaction, rather than by implementing a trait whose unsafe contract it must uphold by hand. The transaction entry lists "a sequence cannot span functions or crates" as one of the three limits it exists to remove; guarded's reason for existing is a special case of that same limit.
+
+**There is therefore potential to deprecate `guarded` altogether.** If the transaction covers the cross-boundary atomicity case, what remains of guarded is byte transformation on read and write, which is a narrower job than the trait's current shape implies and may not warrant a feature of its own.
+
+The interaction question is real regardless of which way that goes, because the hooks are written against an assumption the transaction breaks: that a write call *is* the I/O, so `pre_write` runs immediately before bytes reach the disk and `post_write` immediately after they are durable. A transactional write defers both — bytes land in the buffered image at issue time and reach the disk at commit, possibly coalesced with later writes to the same range, possibly never written at all if the transaction is dropped.
+
+Deciding this early is cheap. The module is four traits and four derived methods, with no shipped implementation, no tests, and no examples, so it has more design freedom now than it will ever have again — and far more than it will once the transaction has shipped against it.
+
+### Open questions
+
+- **Deprecate, rework, or integrate.** Whether the transaction fully subsumes the cross-boundary atomicity case, and if it does, whether anything worth keeping remains. A deprecation would need a migration path for the transformation use, which the transaction does not currently offer.
+- **When hooks fire,** if they survive. At issue time, at commit time, or not integrated with transactions at all in the first version. Issue time preserves `pre_write`'s transform semantics but lets a hook observe a write that never commits; commit time is honest about durability but loses the per-call pairing that `post_write`'s `(offset, len)` arguments assume.
+- **Coalescing.** The image merges overlapping writes to the same range, so a hook firing per call at issue time may transform bytes that are later partly overwritten. A transforming hook may not survive that at all.
+- **What the atomic markers mean inside a transaction.** Their contract is per write call; under a transaction the atomic unit is the whole commit. Either the marker means something different there, or it does not apply — and if the transaction is the answer to cross-boundary atomicity, the markers may have no remaining purpose.
+- **Relationship to the transaction entry.** This supersedes that entry's `guarded` interaction open question; the two should not be resolved independently.
