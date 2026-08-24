@@ -294,3 +294,202 @@ Only the API is gated. `MultiAtrunc` recovery is ungated in `io_core`, and the m
 - **Inspectable plans.** Exposing the chosen plan, publicly or in debug builds, would make the planner testable, and would let a caller see that a transaction is about to rewrite a suffix rather than a few blocks.
 - **Spilling.** Staging into the file tail as writes arrive would make transaction size independent of memory. It is harder here than in an in-place-only design, because a later grow can invalidate a staging base chosen earlier.
 - **C parity.** Required by the checklist. An opaque `bstack_txn_t` with `begin`/`read`/`write`/`commit`/`abort` fits C better than the generator callback.
+
+---
+
+## `BStackBulkAllocator` for `SlabBStackAllocator` and `CheckedSlabBStackAllocator`
+
+**Feature flag:** `alloc` + `set`.
+**Breaking change:** No
+
+### Motivation
+
+The two slab allocators are the most natural bulk allocators in the crate — fixed stride, so a run of `k` blocks is `k` independently-freeable handles — and they are the two that do not implement the trait. Today `alloc` on a free-list hit costs 4 `BStack` calls (2× `get_into` + `set` + `zero`) and the slab `dealloc` path costs 3, each individually synced, so `n` handles cost `4n`/`3n` synced calls.
+
+### Design
+
+- `alloc_bulk`: satisfy from the free list first by chasing the singly-linked chain through the block bodies under one `process_gen` (the chase is inherently sequential, but happens in one locked critical section), then write `free_head` once; serve the remainder with a single `extend` of `k · block_size`. Unlike `GhostTreeBstackAllocator::alloc_bulk`, the result is *not* one contiguous block sliced up — each slab block must stay independently deallocatable — so per-block handles are returned.
+- `dealloc_bulk`: thread every freed block into one chain in memory, then commit all `next` pointers plus the `free_head` advance as a single `set_batched` (one `MultiWrite` journal arm, one sync). The slab `dealloc` doc already describes a "bulk `set`" for the multi-block path, so the batching shape exists.
+- `CheckedSlabBStackAllocator` additionally flips a per-block overhead tag; those flips join the same `set_batched`. The ordering rule from the 0.4.2→0.4.3 non-tail-shrink fix carries over: every scrub is staged in the batch *before* the count/head commit, so each crash window leaves either the intact original or zero-overhead leaked blocks that `recover` reclaims.
+
+### Open questions
+
+- Whether `alloc_bulk` should prefer a contiguous run when the free list can supply one, for locality, at the cost of a more complex chain walk.
+
+---
+
+## `BStackBulkAllocator` for `SegregatedBStackAllocator`
+
+**Feature flag:** `alloc` + `set`.
+**Breaking change:** No
+
+### Motivation
+
+A bulk request spanning 33 size classes currently degrades to `n` independent `alloc`/`dealloc` calls, each with its own free-list splice and sync. The class structure makes the batched form strictly better: work is bounded by the number of *distinct classes touched* (≤ 33), not by `n`.
+
+### Design
+
+- `alloc_bulk`: classify every request by the existing register arithmetic, group by class, pop a run per class, and serve the misses with one `extend_sparse` for the summed tail growth.
+- `dealloc_bulk`: read each handle's recorded physical size from its in-use overhead word to recover its class, build per-class chains in memory, and push one chain per class.
+- Atomicity across classes falls out of the header layout: `head_off(class) = FREE_HEAD_BASE + class · 8`, so all 33 class heads are one contiguous 264-byte array and every affected head can be rewritten in a **single `set`**. The per-block link and overhead writes join one `set_batched` with it, giving the trait's all-or-nothing contract in one journal arm.
+
+### Open questions
+
+- Whether the oversized bucket, which is heterogeneous and matched by stored physical size rather than class, can participate in the same batch or must stay a separate step.
+
+---
+
+## Forward `BStackInPlaceResizeAllocator` through `DebugCheckingAllocator`
+
+**Feature flag:** `alloc`.
+**Breaking change:** No
+
+### Motivation
+
+`DebugCheckingAllocator<A>` forwards `BStackUninitAllocator` and `BStackBulkAllocator` but not `BStackInPlaceResizeAllocator`, so wrapping a `FirstFitBStackAllocator` or `GhostTreeBstackAllocator` in the checker silently drops the newest structural path from anything the checker is used to test.
+
+### Design
+
+- Bound mirrors the existing forwards: `A: 'static + BStackInPlaceResizeAllocator<Error = io::Error>` plus the `for<'b> A: BStackAllocator<Allocated<'b> = BStackOwnedSlice<'b, A>>` HRTB.
+- `realloc_inplace(handle, prepend, append)` does not fit the existing `realloc_with` helper, which threads a single `new_len`. Either generalise that helper or write a bespoke impl; the region bookkeeping is the real work, since a nonzero `prepend` moves the *start*, so the tracker must retire `(start, len)` and record `(start − prepend, len + prepend + append)` rather than resizing in place.
+- `Unsupported` must pass straight through with the inner handle re-wrapped and the original region left recorded — it is a clean pre-mutation rejection, not a state change.
+- The checker can assert something no other layer does: that the returned range is *exactly* `(start − prepend, end + append)`, i.e. the trait's position guarantee, as a debug assertion.
+
+---
+
+## `BStackInPlaceResizeAllocator` for `SegregatedBStackAllocator`
+
+**Feature flag:** `alloc` + `set`.
+**Breaking change:** No
+
+### Motivation
+
+Recording the block's *physical* size in the in-use overhead word (0.4.3) already made an in-block resize cost zero `BStack` writes inside `realloc`. That is precisely `realloc_inplace`'s contract for the back edge, and the machinery exists — it is simply not reachable through the trait.
+
+### Design
+
+- `append`-only, where the new physical need `round_up(len + 8, 16)` still fits the recorded block: succeed with **zero writes**; the visible length lives in the returned handle.
+- `append` beyond the recorded physical size: `Unsupported`. Growing into a free neighbour needs adjacency merging, which is the coalescer's job (see below), not this trait's.
+- Shrink: reuse the existing paths — retain the excess inside the still-recorded block, or reclaim it above `SPLIT_MIN` (tail `Atrunc` or in-place carve) under `atomic` only.
+- `prepend != 0`: always `Unsupported`. The overhead word sits immediately before the payload and the block base is fixed at `payload − OVERHEAD`; moving the front edge would move the block base, which both the class free lists and `recover`'s linear scan key on.
+- Empty handle: `Unsupported` for every `(prepend, append)`, per the trait.
+
+---
+
+## `BStackSlice::cas_on` and `BStackSlice::replace_with`
+
+**Feature flag:** `alloc` + `set` + `atomic`.
+**Breaking change:** No.
+
+### Motivation
+
+`eq_crds`/`ne_crds`/`masked_eq_crds` have **zero call sites** anywhere in the slice layer; the cross-region compare-and-swap is reachable only by dropping to raw `BStack` offsets, which discards slice provenance and the same-stack check. `BStack::process` is the opposite case — used internally three times in `slice.rs` and eight times in `chunk.rs` (for `rotate_*`, `reverse`, `sort_by`) but never exposed, so callers cannot run their own length-preserving transform under one lock.
+
+### Design
+
+```rust
+pub fn cas_on(&self, guard: BStackSlice<'a>, expected: impl AsRef<[u8]>,
+              new_bytes: impl AsRef<[u8]>) -> io::Result<Option<Vec<u8>>>;
+pub fn replace_with<F: FnOnce(&mut [u8])>(&self, f: F) -> io::Result<()>;
+```
+
+- `cas_on` is one `eq_crds(guard.start(), expected, self.start(), new_bytes)`: if `guard`'s bytes equal `expected`, `self` is overwritten with `new_bytes` and the old contents returned, all under one write lock. `InvalidInput` if `guard` and `self` are backed by different `BStack`s (matching `merge`/`copy_from_bstack_slice`), if `expected.len() != guard.len()`, or if `new_bytes.len() != self.len()`. Companions `cas_on_ne` and `cas_on_masked` wrap `ne_crds` and `masked_eq_crds`.
+- `replace_with` is one `BStack::process(self.start(), self.end(), f)` — length-preserving, so no allocator interaction, and crash-atomic on `set`'s terms.
+
+### Open questions
+
+- **Naming.** `BStack::replace` is a *tail* operation that may change length, so reusing "replace" invites confusion; naming the slice method `process` to mirror the primitive it wraps may be clearer than `replace_with`.
+
+---
+
+## Mutation APIs on `BStackChunk`
+
+**Feature flag:** `alloc` + `set` + `atomic`.
+**Breaking change:** No — new inherent methods.
+
+### Motivation
+
+`BStackChunk` has no public mutation method at all: the only `set`-gated entries are `sort_*` and `select_nth_*`. Per-chunk *content* edits already work by way of `get(i)`, which yields a `BStackSlice` carrying the full byte-level ergonomics. What is missing is anything at chunk granularity — the permutations and fills that treat a chunk as the unit.
+
+### Design
+
+- `swap(i, j)` — one `BStack::cross_exchange(a, b, chunk_len)`.
+- `reverse()`, `rotate_left(k)`, `rotate_right(k)` — chunk-granularity, one `BStack::process` over the aligned region, same shape and same crash-atomicity as `sort_by`.
+- `fill(chunk: &[u8])` — one `BStack::repeat` over the aligned region, so it commits through the O(1)-staging `Repeat` journal mode. `chunk.len()` must equal `chunk_len`. `repeat` has no uses in `chunk.rs` today.
+- `set(i, bytes)` — delegates to `get(i)` plus `copy_from_slice`; included for symmetry with `get`.
+- Read-side companions needing no new primitive and no `set`: `first`/`last`, `partition_point`, `is_sorted_by`, and a chunk-granularity `split_at`.
+
+### Open questions
+
+- **Out-of-core variants.** `reverse`/`rotate_*` via `process` materialise the whole aligned region, inheriting `sort_by`'s memory profile rather than `sort_partial_by`'s. Bounded-memory counterparts are a natural follow-on but should not gate the first version.
+
+---
+
+## `io::Write for BStackByteVec`
+
+**Feature flag:** `alloc` + `set`.
+**Breaking change:** No.
+
+### Motivation
+
+`BStackByteVec` is the crate's growable byte buffer and implements no std traits beyond `Debug`. Append is already its primary operation, and `BStackSliceWriter` establishes the pattern.
+
+### Design
+
+- `write(buf)` forwards to `extend_from_slice(buf)` and returns `buf.len()`; `flush()` is `Ok(())`, since every `extend_from_slice` is already durable through the underlying `BStack` write. The `&mut self` receiver matches the existing inherent methods, and the bound is `A: BStackOwnedSliceAllocator`.
+- Document the cost: each `write` re-reads the 16-byte header via `read_header` and may `realloc` to grow capacity, so `write_all` over many small chunks is materially worse than one `extend_from_slice`. `reserve` beforehand is the mitigation.
+- No `io::Read` counterpart — reading needs a cursor, which `BStackSliceReader` already provides over `as_slice`.
+
+---
+
+## `BStackByteVec` standard-collection parity
+
+**Feature flag:** varies per method; see below.
+**Breaking change:** No
+
+### Motivation
+
+`BStackByteVec` covers `push`/`pop`/`insert`/`remove`/`swap_remove`/`truncate`/`resize`/`clear`/`fill`/`get`/`set`/`reserve*`/`shrink*`/`extend_from_*`/`append_from_owned`/`move_tail_into`, but has no way to split a vec in two, and no positional removal that hands the removed bytes back.
+
+### Design
+
+- **`split_off(at)`** (`alloc` + `set`, `atomic` optional) — one `alloc` for the tail, the existing `move_tail_into`, then a truncate. `atomic` fuses the move and the length update.
+- **`drain(range)`** (`set` + `atomic`) — return the removed bytes, shift the tail down through one `process`, then commit the shorter `len`. Without `atomic` the payload shift and the length-field write are separate, leaving a crash window where the payload is compacted but `len` is stale.
+
+Both are positional: neither inspects an element, so both are well defined with a byte element. `drain` completes the set the vec already has — `remove` drops one byte, `truncate` drops a suffix and returns nothing, `split_off` hands the tail back as a new vec — leaving no way to cut an interior range and keep its contents.
+
+### Not included: `first`, `last`, `binary_search`, `sort`, `retain`, `dedup`
+
+These inspect elements rather than positions, and a `BStackByteVec` element is a single byte: `first`/`last` return one byte, `binary_search` searches over bytes, `sort` orders bytes, `retain` filters individual bytes, and `dedup` run-length-collapses repeated bytes. Applied to record-structured data every one of them shreds the records. The meaningful unit is a record, which is `BStackChunk`'s job — it carries the stride and already provides `binary_search_by`, `sort_by`/`sort_partial_by`, and `select_nth_*`. `as_slice()` returns a `BStackSlice` over exactly the live payload, so the route is `vec.as_slice()?.chunks(stride)` rather than a duplicate byte-granularity surface on the vec.
+
+`retain`/`dedup` are the awkward pair: they are element-wise like `sort`, but they also *shrink* the container, and `BStackChunk` is a non-owning fixed view with no length-changing method, so it cannot absorb them the way it absorbs `sort`. Reintroducing them would mean stride-parameterised forms on the vec (`retain_chunks(stride, f)`, `dedup_chunks(stride)`), keeping ownership and length management on the vec while the predicate sees a record. Not planned for now; `dedup` in particular only makes sense over an already-sorted region, so it belongs layered on `sort_partial_by` if it is ever wanted.
+
+### Open questions
+
+- **Memory profile.** `drain` shifts the tail through one `process`, materialising the affected payload rather than streaming it, so it inherits `sort_by`'s profile rather than `sort_partial_by`'s. Whether a bounded-memory variant is needed depends on whether `BStackByteVec` is expected to hold regions that do not fit in memory.
+
+---
+
+## `SegregatedBStackAllocator` background coalescer
+
+**Feature flag:** `alloc` + `set`; the merge splices require `atomic`.
+**Breaking change:** No API break. Experimental, like the rest of this allocator.
+
+### Motivation
+
+The module doc lists the coalescer as the single pending item, and it is one of the two reasons the allocator is still marked experimental. Freed blocks are only ever returned to their own class list and adjacent free blocks are never merged, so a workload that frees many small blocks can hold a large contiguous free run that no oversized request can use.
+
+### Design
+
+The scan already exists: `recover()` walks every block by its recorded physical size, which is exactly the walk needed to spot adjacency. The coalescer is that walk plus a merge, not new machinery.
+
+- An explicit `coalesce()` entry point rather than a thread — the crate takes no runtime dependencies and spawns no threads; "background" means "out of the allocation path", not "on its own thread".
+- On a run of two or more adjacent free blocks: unlink each from its class list, write one merged free block, push it onto the class for the merged size. Each merge is a bounded set of free-list splices plus one overhead write.
+- Crash safety: every intermediate state must parse as a valid arena for the existing `recover` scan. Leak-preferring ordering gives this — unlinking before the merged overhead word lands leaves reachable-but-unlinked blocks, which `recover` already reclaims — and makes the whole pass restartable.
+
+### Open questions
+
+- **Concurrency.** Under `atomic` the allocator is lock-free with no allocator-level mutex, so a coalescer racing an `alloc` that pops the very block being merged is the hard part. Options are a quiescence requirement (as `recover` already imposes) or a per-block claim protocol.
+- **Bounded work.** Whether a call must be incremental — a cursor plus a work budget — rather than scanning the whole arena, so it can be driven from an idle hook.
+- **Tail handling.** Whether a coalesced run that reaches the tail should be `try_discard`ed back to the file instead of merged into a free block.
+- **Relationship to the deep in-use-leak GC.** The other unimplemented item shares the same linear scan; whether the two ship together or separately is undecided.
