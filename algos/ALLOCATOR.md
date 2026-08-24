@@ -169,7 +169,7 @@ and reports a lost tail race as `Unsupported`, a contended `FirstFit` operation
 
 ---
 
-## `GhostTreeBstackAllocator` (`alloc` feature)
+## `GhostTreeBstackAllocator` (`alloc + set` features)
 
 A pure-AVL general-purpose allocator built on top of a `BStack`. Free blocks
 store their AVL node inline at offset 0 within the block — live allocations

@@ -604,7 +604,7 @@ bstack = { version = "0.4", features = ["set"] }
 
 ### `alloc`
 
-Enables the region-management layer on top of `BStack`: `BStackAllocator`, `BStackBulkAllocator`, `BStackUninitAllocator`, `BStackInPlaceResizeAllocator`, `BStackOwnedSliceAllocator`, `BStackAllocError`, `BStackBulkAllocError`, `BStackSliceError`, `BStackJoinError`, `BStackRange`, `BStackOwnedSlice`, `BStackSlice`, `BStackSliceReader`, `LinearBStackAllocator`, `GhostTreeBstackAllocator`, and `DebugCheckingAllocator`.  Combined with `set`, also enables `BStackSliceWriter`, `FirstFitBStackAllocator`, `SlabBStackAllocator`, `CheckedSlabBStackAllocator`, `SegregatedBStackAllocator` (experimental), `BStackByteVec`, and `BStackByteVecIter`.
+Enables the region-management layer on top of `BStack`: `BStackAllocator`, `BStackBulkAllocator`, `BStackUninitAllocator`, `BStackInPlaceResizeAllocator`, `BStackOwnedSliceAllocator`, `BStackAllocError`, `BStackBulkAllocError`, `BStackSliceError`, `BStackJoinError`, `BStackRange`, `BStackOwnedSlice`, `BStackSlice`, `BStackSliceReader`, `BStackChunk`, `BStackChunkIter`, `LinearBStackAllocator`, and `DebugCheckingAllocator`.  Combined with `set`, also enables `BStackSliceWriter`, `FirstFitBStackAllocator`, `GhostTreeBstackAllocator`, `SlabBStackAllocator`, `CheckedSlabBStackAllocator`, `SegregatedBStackAllocator` (experimental), `BStackByteVec`, and `BStackByteVecIter`.
 
 ```toml
 [dependencies]
@@ -1032,6 +1032,9 @@ two edges is `Unsupported`.
 together (`MIN_ALLOC`-aligned front), inserting each trimmed residue into its
 tree as a free block; any grow is `Unsupported`. This bounds a trim at the bytes
 removed rather than the retained payload.
+The remaining allocators do not implement the trait, and unlike
+`BStackBulkAllocator` and `BStackUninitAllocator`, `DebugCheckingAllocator<A>`
+does **not** forward it — a wrapped allocator loses `realloc_inplace`.
 
 #### Subslicing and joining on `BStackOwnedSlice`
 
@@ -1204,7 +1207,7 @@ cross-edge grow/shrink is `Unsupported`.
 Without `atomic`: `Send` only.  With `atomic`: `Send + Sync` via an internal
 `Mutex` serialising free-list mutations.
 
-### `GhostTreeBstackAllocator` (`alloc`)
+### `GhostTreeBstackAllocator` (`alloc + set`)
 
 AVL tree keyed on `(size, address)`; best-fit; zero per-allocation overhead.
 Also implements `BStackBulkAllocator` and `BStackInPlaceResizeAllocator` (front

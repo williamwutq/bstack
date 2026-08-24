@@ -362,8 +362,10 @@ may have updated it. The disarm lands with the length in one block write.
 
 ## Multi-write journal
 
-**Backs:** (not yet used by a public API — specified here for implementation
-reference).
+**Backs:** `set_batched` and `inplace_gen`, each once two or more disjoint
+in-place edits have accumulated. Both fast-path a lone edit to the single-write
+path and a zero-edit batch to a no-op, so this mode is reached only at two or
+more blocks.
 
 When several non-overlapping in-place writes must commit atomically, the
 multi-write journal generalizes the single-region protocol. `wip_ptr` stays `0`

@@ -402,12 +402,12 @@
 //!
 //! * **`alloc`** — Region-based sub-allocation over a `BStack` payload.
 //!   Adds the allocator traits, handle types ([`BStackRange`],
-//!   [`BStackOwnedSlice`], [`BStackSlice`]), [`LinearBStackAllocator`],
-//!   [`GhostTreeBstackAllocator`], and [`DebugCheckingAllocator`].
+//!   [`BStackOwnedSlice`], [`BStackSlice`], [`BStackChunk`]),
+//!   [`LinearBStackAllocator`], and [`DebugCheckingAllocator`].
 //!   Combined with `set`, also enables [`BStackSliceWriter`],
-//!   [`FirstFitBStackAllocator`], [`SlabBStackAllocator`],
-//!   [`CheckedSlabBStackAllocator`], [`SegregatedBStackAllocator`]
-//!   (experimental), and [`BStackByteVec`].
+//!   [`FirstFitBStackAllocator`], [`GhostTreeBstackAllocator`],
+//!   [`SlabBStackAllocator`], [`CheckedSlabBStackAllocator`],
+//!   [`SegregatedBStackAllocator`] (experimental), and [`BStackByteVec`].
 //!
 //! * **`atomic`** — Compound read-modify-write operations that hold the write
 //!   lock across what would otherwise be separate calls.  Combined with `set`,
@@ -498,7 +498,8 @@
 //!   zero-overhead live allocations.  Free blocks store their AVL node inline,
 //!   and the tree is keyed on `(size, address)` for best-fit allocation.
 //!   Provides O(log n) allocation and deallocation with crash recovery through
-//!   tree rebalancing on mount.  `Send` in all configurations; `Send + Sync`
+//!   tree rebalancing on mount.  Requires both `alloc` and `set` features.
+//!   `Send` in all configurations; `Send + Sync`
 //!   with the `atomic` feature, where an internal `Mutex` serialises AVL tree
 //!   mutations.
 //!
