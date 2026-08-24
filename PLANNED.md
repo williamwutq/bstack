@@ -407,34 +407,6 @@ pub fn replace_with<F: FnOnce(&mut [u8])>(&self, f: F) -> io::Result<()>;
 
 ---
 
-## `BStackByteVec` standard-collection parity
-
-**Feature flag:** varies per method; see below.
-**Breaking change:** No
-
-### Motivation
-
-`BStackByteVec` covers `push`/`pop`/`insert`/`remove`/`swap_remove`/`truncate`/`resize`/`clear`/`fill`/`get`/`set`/`reserve*`/`shrink*`/`extend_from_*`/`append_from_owned`/`move_tail_into`, but has no way to split a vec in two, and no positional removal that hands the removed bytes back.
-
-### Design
-
-- **`split_off(at)`** (`alloc` + `set`, `atomic` optional) — one `alloc` for the tail, the existing `move_tail_into`, then a truncate. `atomic` fuses the move and the length update.
-- **`drain(range)`** (`set` + `atomic`) — return the removed bytes, shift the tail down through one `process`, then commit the shorter `len`. Without `atomic` the payload shift and the length-field write are separate, leaving a crash window where the payload is compacted but `len` is stale.
-
-Both are positional: neither inspects an element, so both are well defined with a byte element. `drain` completes the set the vec already has — `remove` drops one byte, `truncate` drops a suffix and returns nothing, `split_off` hands the tail back as a new vec — leaving no way to cut an interior range and keep its contents.
-
-### Not included: `first`, `last`, `binary_search`, `sort`, `retain`, `dedup`
-
-These inspect elements rather than positions, and a `BStackByteVec` element is a single byte: `first`/`last` return one byte, `binary_search` searches over bytes, `sort` orders bytes, `retain` filters individual bytes, and `dedup` run-length-collapses repeated bytes. Applied to record-structured data every one of them shreds the records. The meaningful unit is a record, which is `BStackChunk`'s job — it carries the stride and already provides `binary_search_by`, `sort_by`/`sort_partial_by`, and `select_nth_*`. `as_slice()` returns a `BStackSlice` over exactly the live payload, so the route is `vec.as_slice()?.chunks(stride)` rather than a duplicate byte-granularity surface on the vec.
-
-`retain`/`dedup` are the awkward pair: they are element-wise like `sort`, but they also *shrink* the container, and `BStackChunk` is a non-owning fixed view with no length-changing method, so it cannot absorb them the way it absorbs `sort`. Reintroducing them would mean stride-parameterised forms on the vec (`retain_chunks(stride, f)`, `dedup_chunks(stride)`), keeping ownership and length management on the vec while the predicate sees a record. Not planned for now; `dedup` in particular only makes sense over an already-sorted region, so it belongs layered on `sort_partial_by` if it is ever wanted.
-
-### Open questions
-
-- **Memory profile.** `drain` shifts the tail through one `process`, materialising the affected payload rather than streaming it, so it inherits `sort_by`'s profile rather than `sort_partial_by`'s. Whether a bounded-memory variant is needed depends on whether `BStackByteVec` is expected to hold regions that do not fit in memory.
-
----
-
 ## `SegregatedBStackAllocator` background coalescer
 
 **Feature flag:** `alloc` + `set`; the merge splices require `atomic`.
@@ -542,3 +514,28 @@ Deciding this early is cheap. The module is four traits and four derived methods
 - **Coalescing.** The image merges overlapping writes to the same range, so a hook firing per call at issue time may transform bytes that are later partly overwritten. A transforming hook may not survive that at all.
 - **What the atomic markers mean inside a transaction.** Their contract is per write call; under a transaction the atomic unit is the whole commit. Either the marker means something different there, or it does not apply — and if the transaction is the answer to cross-boundary atomicity, the markers may have no remaining purpose.
 - **Relationship to the transaction entry.** This supersedes that entry's `guarded` interaction open question; the two should not be resolved independently.
+
+---
+
+## C `bstack_bytevec` byte-mover parity
+
+**Feature flag:** varies per function; see below.
+**Breaking change:** No — new functions only.
+
+### Motivation
+
+`bstack_bytevec.c`/`.h` covers only `new`/`with_capacity`/`from_data`/`from_raw_block`, the read-only accessors, `push`/`pop`/`truncate`/`clear`/`reserve`/`resize`, and `dealloc`. Every byte-mover the Rust `BStackByteVec` has — `set`, `fill`, `insert`, `remove`, `swap_remove`, `extend_from_within`, `extend_from_bstack_slice`, `copy_into_bstack_slice`, `append_from_owned`, `move_tail_into`, and now `split_off`/`drain` — is Rust-only. This is not one missing method; it is the entire mutation surface beyond append/shrink-at-the-tail, and it is why `bstack_bytevec.c` has never needed a `BSTACK_FEATURE_ATOMIC` build variant at all — every other C module (`bstack_alloc`, `first_fit`, `ghost_tree`, `slab`, `checked_slab`, `segregated`) already has one, and bytevec's `Makefile` targets stop at `libbstack-bytevec-set.a` / `test-bytevec`.
+
+`split_off`/`drain` landing in Rust first (built on `BStack::copy`, requiring `atomic`) makes the gap concrete rather than hypothetical: a C caller who reaches for the vec-splitting or interior-removal operation the changelog just advertised finds nothing. Closing the whole gap in one pass — rather than porting `split_off`/`drain` alone — avoids leaving C bytevec in a second, differently-incomplete state.
+
+### Design
+
+Mirror each Rust method with the existing C bytevec conventions: `int` return (0 success, -1 + `errno`), an `int *out_ok` (or `*out_found`-style) out-param where Rust returns `Option`, and a `uint8_t **out_buf` + `uint64_t *out_len` malloc/free pair where Rust returns an owned `Vec<u8>` (matching `bstack_bytevec_read_bytes`'s existing convention). Absolute-payload offsets for `bstack_copy`/`bstack_cross_exchange` need a `bytevec_abs_offset(v, index)` helper distinct from the existing slice-relative `bytevec_elem_offset` — the two are easy to conflate, since every other bytevec function only ever needs the slice-relative one.
+
+- **`BSTACK_FEATURE_SET` only** (no `atomic`): `bstack_bytevec_set(v, index, value, out_ok)`; `bstack_bytevec_fill(v, value)`.
+- **`BSTACK_FEATURE_SET` + `BSTACK_FEATURE_ATOMIC`, append-only (benign crash model, like `push`):** `bstack_bytevec_extend_from_within(v, start, count, out_ok)`; `bstack_bytevec_extend_from_bstack_slice(v, src, out_ok)`; `bstack_bytevec_append_from_owned(v, other)` (consumes `other` on every path, mirroring Rust's never-silently-leak handling).
+- **`BSTACK_FEATURE_SET` + `BSTACK_FEATURE_ATOMIC`, in-place (torn-but-valid on crash):** `bstack_bytevec_insert(v, index, value, out_ok)`; `bstack_bytevec_remove(v, index, out_byte, out_ok)`; `bstack_bytevec_swap_remove(v, index, out_byte, out_ok)`; `bstack_bytevec_copy_into_bstack_slice(v, start, dst, out_ok)`; `bstack_bytevec_move_tail_into(v, dest, out_ok)`; `bstack_bytevec_split_off(v, at, out, out_ok)`; `bstack_bytevec_drain(v, start, end, out_buf, out_len, out_ok)`.
+
+Cross-`BStack`/cross-allocator misuse (a foreign slice or owned block passed to a cross-slice function) is `errno = EINVAL`, matching the overflow-check convention `bstack_bytevec_with_capacity` already uses, and playing the same role as Rust's `io::ErrorKind::InvalidInput` for the same misuse.
+
+Build system: add `OBJ_BYTEVEC_ATOMIC` / `LIB_BYTEVEC_SET_ATOMIC` (`libbstack-bytevec-set-atomic.a`) and a `test-bytevec-atomic` target to the `Makefile`, following the `test-first-fit-atomic` pattern (SET+ATOMIC object and lib compiled separately from the SET-only ones, test binary linked against the atomic lib). This is net-new for bytevec, not a variant of an existing rule.

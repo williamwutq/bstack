@@ -5,6 +5,8 @@
 use super::{BStackOwnedSlice, BStackOwnedSliceAllocator, BStackRange, BStackSlice};
 use std::fmt;
 use std::io;
+#[cfg(feature = "atomic")]
+use std::ops::Range;
 
 /// Byte offset of the first element within the block (past the 16-byte header).
 const HEADER_LEN: u64 = 16;
@@ -80,6 +82,8 @@ const HEADER_LEN: u64 = 16;
 /// | `shrink_to`, `shrink_to_fit` | `realloc` (shrink) → write `cap` | Crash between the two: block is smaller than the stale `cap` claims; the next `push` re-checks and grows as needed. |
 /// | `set` | write element | Single crash-atomic write; no torn state. |
 /// | `fill` | one `repeat` | Single crash-atomic fill of the whole `len`; no torn state. |
+/// | `split_off` (`atomic` only) | `copy` tail into new vec → write tail `len` → truncate `self` | Crash after the copy but before `self`'s truncate: tail bytes duplicated in both vecs — logically torn but structurally valid. |
+/// | `drain` (`atomic` only) | read removed bytes → `copy` tail down → truncate to shorter `len` | Crash after the `copy` but before the truncate: payload already compacted but `len` still claims the old extent — logically torn but structurally valid. |
 ///
 /// In all cases the header is re-read from disk on the next call, so the
 /// on-disk `(len, cap)` always reflects the last fully committed step.  The
@@ -89,16 +93,17 @@ const HEADER_LEN: u64 = 16;
 ///
 /// The `atomic`-gated byte movers ([`extend_from_within`](Self::extend_from_within),
 /// [`insert`](Self::insert), [`remove`](Self::remove),
-/// [`swap_remove`](Self::swap_remove), and the cross-slice
+/// [`swap_remove`](Self::swap_remove), [`drain`](Self::drain),
+/// [`split_off`](Self::split_off), and the cross-slice
 /// [`extend_from_bstack_slice`](Self::extend_from_bstack_slice) /
 /// [`copy_into_bstack_slice`](Self::copy_into_bstack_slice) /
 /// [`append_from_owned`](Self::append_from_owned) /
 /// [`move_tail_into`](Self::move_tail_into)) build on the crash-atomic
 /// [`crate::BStack::copy`] and [`crate::BStack::cross_exchange`] primitives.  The
 /// append-only ones keep the same benign model as `push`; the in-place ones
-/// (`insert`/`remove`/`swap_remove`/`move_tail_into`) can leave a *logically
-/// torn but structurally valid* vec on a crash mid-operation.  See the dedicated
-/// `impl` block for the per-method details.
+/// (`insert`/`remove`/`swap_remove`/`drain`/`split_off`/`move_tail_into`) can
+/// leave a *logically torn but structurally valid* vec on a crash
+/// mid-operation.  See the dedicated `impl` block for the per-method details.
 ///
 /// ## Feature flags
 ///
@@ -651,7 +656,8 @@ impl<'a, A: BStackOwnedSliceAllocator> io::Write for BStackByteVec<'a, A> {
 /// [`push`](Self::push)/[`extend_from_slice`](Self::extend_from_slice).
 ///
 /// The in-place movers ([`insert`](Self::insert), [`remove`](Self::remove),
-/// [`swap_remove`](Self::swap_remove), [`move_tail_into`](Self::move_tail_into))
+/// [`swap_remove`](Self::swap_remove), [`drain`](Self::drain),
+/// [`split_off`](Self::split_off), [`move_tail_into`](Self::move_tail_into))
 /// mutate the live region before committing the new `len`.  Every individual
 /// `BStack` call is still crash-atomic, so the on-disk `(len, cap)` header is
 /// never left invalid, but the multi-step method is not atomic: a crash between
@@ -945,6 +951,82 @@ impl<'a, A: BStackOwnedSliceAllocator> BStackByteVec<'a, A> {
         stack.cross_exchange(self.abs_offset(start), dest.start(), n)?;
         self.truncate(start)?;
         Ok(Some(()))
+    }
+
+    /// Split the vec in two at `at`: `self` keeps `[0, at)` and a new vec holding
+    /// `[at, len)` is returned.
+    ///
+    /// The new vec is allocated with exactly `len - at` bytes of capacity and
+    /// the tail is transferred with a single crash-atomic [`crate::BStack::copy`]
+    /// straight between the two blocks, never passing through process memory —
+    /// this is why the method is only available under `atomic`; there is no
+    /// in-memory-copy fallback.  In-place mover: a crash after the copy but
+    /// before `self`'s `len` commit leaves the tail bytes duplicated in both
+    /// vecs — a logically torn but structurally valid state (see the
+    /// impl-level note on this block).
+    ///
+    /// Returns `Ok(None)` if `at > len` (out of bounds; `self` is unchanged) and
+    /// `Ok(Some(tail))` on success (`at == len` returns an empty tail).
+    pub fn split_off(&mut self, at: u64) -> io::Result<Option<Self>> {
+        let (len, _) = self.read_header()?;
+        if at > len {
+            return Ok(None);
+        }
+        let tail_len = len - at;
+        let alloc: &'a A = self.slice.allocator();
+        let stack = alloc.stack();
+        // Even when length is zero, allocate a new vec with a 16-byte header and zero capacity.
+        let mut tail = Self::with_capacity(tail_len, alloc)?;
+        if tail_len > 0 {
+            stack.copy(self.abs_offset(at), tail.abs_offset(0), tail_len)?;
+            tail.write_len_field(tail_len)?;
+        }
+        self.truncate(at)?;
+        Ok(Some(tail))
+    }
+
+    /// Remove the bytes in `range`, shifting every later byte down to close the
+    /// gap, and return the removed bytes.
+    ///
+    /// The removed bytes are read out first, the tail (if any) is shifted down
+    /// with a single crash-atomic [`crate::BStack::copy`], and the shorter `len`
+    /// is committed last.  Like [`split_off`](Self::split_off), only available
+    /// under `atomic`: there is no crash-atomic way to perform the shift
+    /// without it, and no in-memory-copy fallback is offered.
+    /// In-place mover: a crash after the shift but before the `len` commit
+    /// leaves the payload already compacted while `len` still claims the old,
+    /// larger extent — a logically torn but structurally valid state (see the
+    /// impl-level note on this block).
+    ///
+    /// Returns `Ok(None)` if `range.start > range.end` or `range.end > len`
+    /// (out of bounds; the vec is unchanged) and `Ok(Some(bytes))` with the
+    /// removed bytes on success (an empty range is a successful no-op that
+    /// returns an empty `Vec`).
+    pub fn drain(&mut self, range: Range<u64>) -> io::Result<Option<Vec<u8>>> {
+        let (len, _) = self.read_header()?;
+        if range.start > range.end || range.end > len {
+            return Ok(None);
+        }
+        let count = range.end - range.start;
+        if count == 0 {
+            return Ok(Some(Vec::new()));
+        }
+        let removed = self
+            .slice
+            .as_slice()
+            .read_range(Self::byte_offset(range.start), Self::byte_offset(range.end))?;
+        let tail = len - range.end;
+        if tail > 0 {
+            let alloc: &'a A = self.slice.allocator();
+            let stack = alloc.stack();
+            stack.copy(
+                self.abs_offset(range.end),
+                self.abs_offset(range.start),
+                tail,
+            )?;
+        }
+        self.truncate(len - count)?;
+        Ok(Some(removed))
     }
 }
 
@@ -1701,6 +1783,101 @@ mod tests {
         // A tail larger than len → None, vec unchanged.
         let mut too_big = alloc.alloc(9).unwrap();
         assert_eq!(v.move_tail_into(&mut too_big).unwrap(), None);
+        assert_eq!(v.read_bytes().unwrap(), [1, 2, 3]);
+    }
+
+    // ── split_off (alloc + set + atomic) ───────────────────────────────────────
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn split_off_moves_tail_into_new_vec() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let mut v = BStackByteVec::from_slice(&[1, 2, 3, 4, 5], &alloc).unwrap();
+        let tail = v.split_off(2).unwrap().unwrap();
+        assert_eq!(v.read_bytes().unwrap(), [1, 2]);
+        assert_eq!(tail.read_bytes().unwrap(), [3, 4, 5]);
+        assert_eq!(tail.capacity().unwrap(), 3);
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn split_off_at_zero_moves_everything() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let mut v = BStackByteVec::from_slice(&[1, 2, 3], &alloc).unwrap();
+        let tail = v.split_off(0).unwrap().unwrap();
+        assert_eq!(v.read_bytes().unwrap(), Vec::<u8>::new());
+        assert_eq!(tail.read_bytes().unwrap(), [1, 2, 3]);
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn split_off_at_len_returns_empty_tail() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let mut v = BStackByteVec::from_slice(&[1, 2, 3], &alloc).unwrap();
+        let tail = v.split_off(3).unwrap().unwrap();
+        assert_eq!(v.read_bytes().unwrap(), [1, 2, 3]);
+        assert_eq!(tail.read_bytes().unwrap(), Vec::<u8>::new());
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn split_off_past_len_returns_none() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let mut v = BStackByteVec::from_slice(&[1, 2, 3], &alloc).unwrap();
+        assert!(v.split_off(4).unwrap().is_none());
+        assert_eq!(v.read_bytes().unwrap(), [1, 2, 3]);
+    }
+
+    // ── drain (set + atomic) ───────────────────────────────────────────────────
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn drain_removes_interior_range_and_returns_it() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let mut v = BStackByteVec::from_slice(&[1, 2, 3, 4, 5], &alloc).unwrap();
+        let removed = v.drain(1..3).unwrap().unwrap();
+        assert_eq!(removed, [2, 3]);
+        assert_eq!(v.read_bytes().unwrap(), [1, 4, 5]);
+        assert_eq!(v.len().unwrap(), 3);
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn drain_at_tail_needs_no_shift() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let mut v = BStackByteVec::from_slice(&[1, 2, 3, 4], &alloc).unwrap();
+        let removed = v.drain(2..4).unwrap().unwrap();
+        assert_eq!(removed, [3, 4]);
+        assert_eq!(v.read_bytes().unwrap(), [1, 2]);
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn drain_empty_range_is_noop() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let mut v = BStackByteVec::from_slice(&[1, 2, 3], &alloc).unwrap();
+        let removed = v.drain(1..1).unwrap().unwrap();
+        assert_eq!(removed, Vec::<u8>::new());
+        assert_eq!(v.read_bytes().unwrap(), [1, 2, 3]);
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn drain_out_of_bounds_returns_none() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let mut v = BStackByteVec::from_slice(&[1, 2, 3], &alloc).unwrap();
+        assert!(v.drain(2..4).unwrap().is_none());
+        #[allow(clippy::reversed_empty_ranges)]
+        let out_of_order = v.drain(3..2).unwrap();
+        assert!(out_of_order.is_none());
         assert_eq!(v.read_bytes().unwrap(), [1, 2, 3]);
     }
 }
