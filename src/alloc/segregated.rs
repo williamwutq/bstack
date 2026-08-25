@@ -13,9 +13,9 @@
 //! magic rather than reinterpreting a stored field.
 //!
 //! Implemented: `new`/`open`, `alloc`, `dealloc`, `realloc`, `realloc_inplace`
-//! (back-edge only: the fixed block base rules out front moves), and `recover`
-//! (linear-scan free-list rebuild + leak reclaim). Still pending: the background
-//! coalescer.
+//! (back-edge only — the fixed block base rules out front moves; a back grow uses
+//! the same tail extend as `realloc`), and `recover` (linear-scan free-list
+//! rebuild + leak reclaim). Still pending: the background coalescer.
 //!
 //! # Feature flags
 //!
@@ -1077,38 +1077,9 @@ impl SegregatedBStackAllocator {
             }
 
             // The request needs a physically larger block (`new_need > old_size`,
-            // so also `new_size > old_size`). Grow at the tail: extend the block in
-            // place, only when it ends at the payload tail. Extend first
-            // (leak-preferring: a failure after it only leaks the extension, never
-            // corrupts), then zero the old slack, then record the new size. Under
-            // `atomic`, `try_extend_zeros` fuses the tail check and the grow into
-            // one locked critical section; otherwise we check `len` then `extend`
-            // (which zero-fills the new region via `set_len`).
-            let old_end = block_start + old_size; // block exists ⇒ ≤ stack_len
-            let grew = {
-                #[cfg(feature = "atomic")]
-                {
-                    self.stack.try_extend_zeros(old_end, new_size - old_size)?
-                }
-                #[cfg(not(feature = "atomic"))]
-                {
-                    old_end == self.stack.len()? && {
-                        self.stack.extend(new_size - old_size)?;
-                        true
-                    }
-                }
-            };
-            if grew {
-                // Old block's slack [start+old_len, old_end) may hold stale bytes
-                // from a prior shrink; the extension past old_end is already zero.
-                let slack = (old_size - Self::OVERHEAD) - old_len;
-                if slack > 0 && init {
-                    self.stack.zero(start + old_len, slack)?;
-                }
-                self.stack.set(
-                    block_start,
-                    (Self::IN_USE_BIT | (new_size >> 4)).to_le_bytes(),
-                )?;
+            // so also `new_size > old_size`). Grow at the tail in place when the
+            // block ends at the payload tail; shared with `realloc_inplace`.
+            if self.grow_tail_inplace(block_start, start, old_len, old_size, new_size, init)? {
                 // SAFETY: block extended in place to the new class at the tail.
                 return Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, start, new_len) });
             }
@@ -1265,6 +1236,59 @@ impl SegregatedBStackAllocator {
         // SAFETY: same physical block, smaller visible length.
         Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, start, new_len) })
     }
+
+    /// Grow the block at `block_start` from `old_size` to `new_size`
+    /// (`new_size > old_size`) by extending the stack tail **in place** — only
+    /// when the block ends at the payload tail. Returns `Ok(true)` on success
+    /// (extended, old slack scrubbed when `init`, the new size recorded) and
+    /// `Ok(false)` when the block is not at the tail, leaving it untouched so the
+    /// caller can decide between a move ([`realloc`](BStackAllocator::realloc)) and
+    /// `Unsupported` ([`realloc_inplace`](BStackInPlaceResizeAllocator::realloc_inplace)).
+    ///
+    /// Shared by both. Extend first (leak-preferring: a failure after it only
+    /// leaks the extension, never corrupts), then zero the old slack, then record
+    /// the new size. Under `atomic`, `try_extend_zeros` fuses the tail check and
+    /// the grow into one locked critical section; otherwise we check `len` then
+    /// `extend` (which zero-fills the new region via `set_len`). The caller's
+    /// original `(start, old_len)` block stays intact on any failure.
+    fn grow_tail_inplace(
+        &self,
+        block_start: u64,
+        start: u64,
+        old_len: u64,
+        old_size: u64,
+        new_size: u64,
+        init: bool,
+    ) -> io::Result<bool> {
+        let old_end = block_start + old_size; // block exists ⇒ ≤ stack_len
+        let grew = {
+            #[cfg(feature = "atomic")]
+            {
+                self.stack.try_extend_zeros(old_end, new_size - old_size)?
+            }
+            #[cfg(not(feature = "atomic"))]
+            {
+                old_end == self.stack.len()? && {
+                    self.stack.extend(new_size - old_size)?;
+                    true
+                }
+            }
+        };
+        if !grew {
+            return Ok(false);
+        }
+        // Old block's slack [start+old_len, old_end) may hold stale bytes
+        // from a prior shrink; the extension past old_end is already zero.
+        let slack = (old_size - Self::OVERHEAD) - old_len;
+        if slack > 0 && init {
+            self.stack.zero(start + old_len, slack)?;
+        }
+        self.stack.set(
+            block_start,
+            (Self::IN_USE_BIT | (new_size >> 4)).to_le_bytes(),
+        )?;
+        Ok(true)
+    }
 }
 
 #[cfg(feature = "set")]
@@ -1296,16 +1320,20 @@ impl BStackInPlaceResizeAllocator for SegregatedBStackAllocator {
     /// | `prepend != 0` (either sign)            | `Unsupported` — moving the front edge would relocate the block base |
     /// | `prepend == 0`, `append == 0`           | identity — the block is untouched, the handle is returned as-is |
     /// | `prepend == 0`, back grow that fits the recorded block | succeed with no metadata write; zero the newly-exposed bytes (a prior shrink may have left stale data there) |
-    /// | `prepend == 0`, back grow past the recorded block | `Unsupported` — growing into a free neighbour is the coalescer's job, not this trait's |
+    /// | `prepend == 0`, back grow past the recorded block, block at the stack tail | extend the tail in place (zero-filled), then record the new physical size |
+    /// | `prepend == 0`, back grow past the recorded block, block not at the tail | `Unsupported` — a free-neighbour merge is the coalescer's job, and relocating would break the position guarantee |
     /// | `prepend == 0`, back shrink             | retain the excess in place, or (above `SPLIT_MIN`, under `atomic`) reclaim it in one crash-atomic operation |
     /// | `prepend == 0`, shrink to zero          | free the block (delegates to [`dealloc`](BStackAllocator::dealloc)) |
     ///
     /// The visible length lives in the returned handle, not on disk, so a grow that
     /// fits (past the scrub) and a shrink that retains its excess both touch no
-    /// metadata at all. Every *resize* path leaves the caller's original block
-    /// intact on a mid-op failure — the grow's scrub adds no new block, and the
-    /// `atomic` shrink reclaim commits the new size together with the truncation (or
-    /// the carve) as a single operation — so those always return `handle: Some`. The
+    /// metadata at all; only a tail grow past the recorded block records a new size.
+    /// Every *resize* path leaves the caller's original block intact on a mid-op
+    /// failure — the in-block grow's scrub adds no new block, the tail extend is
+    /// leak-preferring (a crash leaks the extension, which [`recover`](Self::recover)
+    /// reclaims, and the size is recorded last), and the `atomic` shrink reclaim
+    /// commits the new size together with the truncation (or the carve) as a single
+    /// operation — so those always return `handle: Some`. The
     /// sole exception is the shrink-to-zero free, which delegates to
     /// [`dealloc`](BStackAllocator::dealloc): a torn free-list splice there can drop
     /// the handle (`handle: None`), leaving the block reclaimable only through
@@ -1405,13 +1433,20 @@ impl BStackInPlaceResizeAllocator for SegregatedBStackAllocator {
             }
             let new_need = Self::phys_need(new_len)?;
             if new_need > old_size {
-                // Back grow past the recorded physical block. A tail extend or a
-                // merge into a free neighbour could satisfy this without moving,
-                // but that is the coalescer's job (and `realloc`'s), not this
-                // trait's zero-write fast path.
+                // Back grow past the recorded physical block. Extend the stack
+                // tail in place when the block ends there — the position
+                // guarantee holds, since the retained bytes never move. A block
+                // that is *not* at the tail could only grow by merging a free
+                // neighbour (the coalescer's job) or by relocating (which the
+                // guarantee forbids), so it is `Unsupported`.
+                let new_size = Self::class_blocksize(new_need);
+                if self.grow_tail_inplace(block_start, start, old_len, old_size, new_size, true)? {
+                    // SAFETY: block extended in place to the new class at the tail.
+                    return Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, start, new_len) });
+                }
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
-                    "realloc_inplace: back grow past the recorded block is not supported",
+                    "realloc_inplace: back grow would relocate a non-tail block",
                 ));
             }
             self.resize_in_block(block_start, start, old_len, new_len, old_size, true)
@@ -1840,17 +1875,38 @@ mod tests {
         assert_eq!(&data[90..], &[0u8; 10], "re-exposed tail scrubbed");
     }
 
-    // A back grow past the recorded physical block is `Unsupported` — even at the
-    // stack tail (unlike `realloc`, which would extend). The handle comes back
-    // intact and the stack is untouched.
+    // A back grow past the recorded block, when the block is at the stack tail,
+    // extends the tail in place (same as `realloc`): the block stays at its
+    // offset, the grown region is zeroed, and the stack lengthens.
     #[test]
-    fn seg_realloc_inplace_grow_past_block_is_unsupported() {
+    fn seg_realloc_inplace_tail_grow_past_block_extends() {
         let (a, _g) = new_alloc();
         let mut s = a.alloc(100).unwrap(); // block 112 (cap 104), at the tail
         s.write([7u8; 100]).unwrap();
         let off = s.start();
         let len_before = a.stack().len().unwrap();
-        let err = a.realloc_inplace(s, 0, 100).unwrap_err(); // need 208 > 112
+        let s = a.realloc_inplace(s, 0, 100).unwrap(); // need 208 (class 12) > 112
+        assert_eq!(s.start(), off, "tail grow extends in place, no move");
+        assert_eq!(s.len(), 200);
+        assert!(a.stack().len().unwrap() > len_before, "stack extended");
+        let data = s.read().unwrap();
+        assert_eq!(&data[..100], &[7u8; 100], "prefix preserved");
+        assert_eq!(&data[100..], &[0u8; 100], "grown region zeroed");
+        assert_eq!(unsafe { a.recover() }.unwrap(), 0, "arena accounted for");
+    }
+
+    // A back grow past the recorded block, when the block is NOT at the tail, is
+    // `Unsupported` (a move would break the position guarantee). The handle comes
+    // back intact and the stack is untouched.
+    #[test]
+    fn seg_realloc_inplace_interior_grow_past_block_is_unsupported() {
+        let (a, _g) = new_alloc();
+        let mut s = a.alloc(100).unwrap(); // block 112 (cap 104)
+        s.write([7u8; 100]).unwrap();
+        let off = s.start();
+        let _pin = a.alloc(100).unwrap(); // pin the tail so `s` is interior
+        let len_before = a.stack().len().unwrap();
+        let err = a.realloc_inplace(s, 0, 100).unwrap_err(); // need 208 > 112, not at tail
         assert_eq!(err.source.kind(), std::io::ErrorKind::Unsupported);
         let s = err.handle.expect("handle returned intact");
         assert_eq!(s.start(), off);
@@ -1859,17 +1915,20 @@ mod tests {
         assert_eq!(s.read().unwrap(), vec![7u8; 100], "data intact");
     }
 
-    // A grow that lands exactly on the recorded block capacity still fits.
+    // A grow that lands exactly on the recorded block capacity fits with no
+    // metadata write; one byte past it, when the block is interior, is
+    // `Unsupported`.
     #[test]
     fn seg_realloc_inplace_grow_to_block_capacity_fits() {
         let (a, _g) = new_alloc();
         let mut s = a.alloc(90).unwrap(); // block 112, cap 104
         s.write([1u8; 90]).unwrap();
         let off = s.start();
+        let _pin = a.alloc(100).unwrap(); // pin the tail so `s` cannot tail-extend
         let s = a.realloc_inplace(s, 0, 14).unwrap(); // len 104 == cap, phys_need 112 ≤ 112
         assert_eq!(s.start(), off);
         assert_eq!(s.len(), 104);
-        // One byte more must spill to the next class → Unsupported.
+        // One byte more must spill to the next class; interior → Unsupported.
         let err = a.realloc_inplace(s, 0, 1).unwrap_err();
         assert_eq!(err.source.kind(), std::io::ErrorKind::Unsupported);
     }
