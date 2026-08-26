@@ -74,7 +74,7 @@ where
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or_else(|| rand::rng().random_range(0..=u64::MAX));
-    eprintln!("[alloc_fault_tests salt={seed_salt:#06x}] BSTACK_FUZZ_SEED={master_seed}");
+    eprintln!("[alloc_fuzz::init_fault salt={seed_salt:#06x}] BSTACK_FUZZ_SEED={master_seed}");
     let mut rng = StdRng::seed_from_u64(master_seed ^ seed_salt);
     let bias = rng.random_range(0..=u64::MAX);
     let fault_seed = rng.random_range(0..=u64::MAX);

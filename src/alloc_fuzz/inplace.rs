@@ -26,8 +26,8 @@
 //! not. The fault-injection counterpart is [`inplace_fault`](super::inplace_fault).
 
 use super::common::{
-    FuzzConfig, Guard, Operation, gen_inplace_deltas, gen_op, make_allocator, temp_path,
-    verify_pattern, verify_pattern_range, write_pattern,
+    FuzzConfig, Guard, Operation, gen_inplace_deltas, gen_op, make_allocator, seeded_rng,
+    temp_path, verify_pattern, verify_pattern_range, write_pattern,
 };
 use crate::BStack;
 use crate::alloc::{
@@ -91,7 +91,7 @@ where
     let path = temp_path("ip");
     let _guard = Guard(path.clone());
     let alloc = make(BStack::open(&path).unwrap()).unwrap();
-    let mut rng = rand::rng();
+    let mut rng = seeded_rng();
     let bias = rng.random_range(0..=u64::MAX);
     let mut live: Vec<(BStackOwnedSlice<'_, A>, u64)> = Vec::new();
     let mut next_id = 0u64;
@@ -170,7 +170,7 @@ where
     let _guard = Guard(path.clone());
     drop(make(BStack::open(&path).unwrap()).unwrap());
 
-    let mut rng = rand::rng();
+    let mut rng = seeded_rng();
     let bias = rng.random_range(0..=u64::MAX);
     let mut live: Vec<(BStackRange, u64)> = Vec::new();
     let mut next_id: u64 = 0;

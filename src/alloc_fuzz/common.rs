@@ -16,8 +16,34 @@
 
 use crate::BStack;
 use crate::alloc::{BStackOwnedSlice, BStackOwnedSliceAllocator};
+use rand::{RngExt, SeedableRng, rngs::StdRng};
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Seed a reproducible RNG for a happy-path fuzz driver and print the seed, so a
+/// failing run — whose captured stderr `cargo test` shows on panic — can be
+/// replayed with `BSTACK_FUZZ_SEED=<n>`. Without that env var a fresh random
+/// master is drawn each run.
+///
+/// The label is the running test's thread name (its full path, e.g.
+/// `alloc_fuzz::inplace::first_fit::resize`), and an FNV-1a hash of it salts the
+/// stream so distinct drivers/allocators do not share an op stream under one
+/// master seed. The seeded fault drivers print the same `[label salt=…] SEED=…`
+/// line by hand; this is the happy-path equivalent.
+pub(crate) fn seeded_rng() -> StdRng {
+    let label = std::thread::current().name().unwrap_or("fuzz").to_string();
+    let master = std::env::var("BSTACK_FUZZ_SEED")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| rand::rng().random_range(0..=u64::MAX));
+    let mut salt = 0xcbf2_9ce4_8422_2325u64; // FNV-1a offset basis
+    for &b in label.as_bytes() {
+        salt ^= b as u64;
+        salt = salt.wrapping_mul(0x0000_0100_0000_01b3); // FNV prime
+    }
+    eprintln!("[{label} salt={salt:#018x}] BSTACK_FUZZ_SEED={master}");
+    StdRng::seed_from_u64(master ^ salt)
+}
 
 /// RAII guard that removes a temp backing file when dropped.
 pub(crate) struct Guard(pub std::path::PathBuf);
