@@ -1,17 +1,18 @@
-#![cfg(all(test, feature = "alloc", feature = "set"))]
 // Shared test-support: not every item is exercised under every feature combo
 // (e.g. `Operation::Reopen` and `verify_prefix` are only used once the
 // fault-injection suite is compiled in). Keep the module warning-clean.
 #![allow(dead_code)]
 
-//! Shared support for the allocator fuzz and fault-injection test suites.
+//! Shared support for the allocator fuzz suites.
 //!
-//! [`alloc_fuzz_tests`](crate::alloc_fuzz_tests) and
-//! `alloc_fault_tests` (and, in future, an alloc bench) drive the same
-//! cross-allocator machinery: temp-file management, deterministic byte-pattern
-//! payloads, an adversarial "looks like allocator internals" payload source, a
-//! weighted random-operation generator, and the per-allocator constructor
-//! closures. Centralising them here keeps the two suites from drifting apart.
+//! [`init`](super::init), `init_fault`,
+//! [`uninit`](super::uninit), and `uninit_fault` (and, in future, an
+//! alloc bench) drive the same cross-allocator machinery: temp-file management,
+//! deterministic byte-pattern payloads, an adversarial "looks like allocator
+//! internals" payload source, a weighted random-operation generator, the
+//! per-allocator constructor closures, and (under `fault-injection`) the shared
+//! [`RandomFaults`](policies::RandomFaults) policy. Centralising them here keeps
+//! the suites from drifting apart.
 
 use crate::BStack;
 use crate::alloc::{BStackOwnedSlice, BStackOwnedSliceAllocator};
@@ -336,5 +337,52 @@ pub(crate) mod policies {
             let n = self.seen.fetch_add(1, Ordering::SeqCst);
             (n == self.at).then(|| io::Error::new(self.kind, format!("injected fault at {op}#{n}")))
         }
+    }
+
+    /// Fails a pseudo-random subset of consultations at rate `per_mille`
+    /// (faults per thousand), deterministically from `seed` and an internal
+    /// counter. The counter is the policy's own — not the stack's `seq` — so it
+    /// survives the disarm/re-arm the fault fuzz drivers perform around every
+    /// operation, keeping the schedule reproducible across arming boundaries.
+    ///
+    /// Shared by every fault fuzz suite (`alloc_fault_tests`,
+    /// `alloc_uninit_fuzz_tests`) so their fault schedules stay identical.
+    pub(crate) struct RandomFaults {
+        seed: u64,
+        per_mille: u64,
+        counter: AtomicU64,
+    }
+
+    impl RandomFaults {
+        pub(crate) fn new(seed: u64, per_mille: u64) -> Self {
+            Self {
+                seed,
+                per_mille,
+                counter: AtomicU64::new(0),
+            }
+        }
+    }
+
+    impl FaultPolicy for RandomFaults {
+        fn next_fault(&self, op: &'static str, _seq: u64) -> Option<io::Error> {
+            let n = self.counter.fetch_add(1, Ordering::Relaxed);
+            // splitmix64 hash of (seed, n) → uniform u64.
+            let mut z = self
+                .seed
+                .wrapping_add(n.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            (z % 1000 < self.per_mille)
+                .then(|| io::Error::other(format!("injected fault at {op} (n={n})")))
+        }
+    }
+
+    /// Fault rate in faults-per-thousand, overridable via `BSTACK_FAULT_PER_MILLE`.
+    pub(crate) fn per_mille() -> u64 {
+        std::env::var("BSTACK_FAULT_PER_MILLE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30)
     }
 }
