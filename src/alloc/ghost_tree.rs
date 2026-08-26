@@ -1167,12 +1167,16 @@ impl GhostTreeBstackAllocator {
     ///
     /// # Crash safety
     ///
-    /// Both residues are zeroed first (a fault there leaves the original block
-    /// intact, `handle: Some`), then AVL-inserted under the lock. Once the first
-    /// insert begins a torn insert cannot be retried, so it reports
-    /// `handle: None`; the retained window's bytes are never touched. A crash
-    /// between the two inserts frees one residue and leaks the other (reclaimable
-    /// on reopen), never corrupting the retained window.
+    /// The retained window's bytes are never touched. A residue zero is the first
+    /// write, and a faulted `zero` never writes, so a fault on the first zero
+    /// leaves the block untouched and hands back the original (`handle: Some`).
+    /// Once a residue has been zeroed, though, the original is no longer intact, so
+    /// any later fault — the second residue zero, or an AVL insert — reports
+    /// `handle: None` rather than a `Some` original with a half-scrubbed residue. A
+    /// `None` block leaks (this headerless arena cannot relink it on reopen), which
+    /// the trait permits; the guarantee is that a returned `Some` original is
+    /// byte-for-byte intact. A crash between the two inserts frees one residue and
+    /// leaks the other, never corrupting the retained window.
     fn shrink_inplace<'a>(
         &'a self,
         start: u64,
@@ -1208,19 +1212,25 @@ impl GhostTreeBstackAllocator {
                 }
             };
 
-            // Zero both residues before any tree mutation. Faults here fire
-            // before the `lost` point, so the original block is handed back.
+            // Set `lost` immediately *after* each residue is zeroed. A faulted
+            // `zero` never writes, so a fault on the first zero leaves the block
+            // untouched and the original is handed back (`handle: Some`). But once
+            // a residue has been scrubbed the original is no longer intact, so any
+            // later fault — the second residue zero, or an AVL insert below — must
+            // report `handle: None`, never a `Some` original with a half-zeroed
+            // residue. A `None` block leaks (this headerless arena cannot relink it
+            // on reopen), which the trait permits; the retained window is untouched.
             if pf > 0 {
                 self.stack.zero(start, pf)?;
+                lost = true;
             }
             if back_size > 0 {
                 self.stack.zero(back_start, back_size)?;
+                lost = true;
             }
 
             #[cfg(feature = "atomic")]
             let _guard = self.lock.lock().unwrap();
-            // Past this point a torn AVL insert cannot be safely retried.
-            lost = true;
             if pf > 0 {
                 self.avl_insert(start, pf)?;
             }
@@ -2821,6 +2831,41 @@ mod fault_tests {
         let mut c = alloc.alloc(96).unwrap();
         c.write([6u8; 96]).unwrap();
         assert_eq!(c.read().unwrap(), vec![6u8; 96]);
+    }
+
+    // Regression: a front+back shrink zeroes the front residue, then the back.
+    // Faulting the *second* zero (after the front is already scrubbed) must report
+    // the block lost, not hand back a `Some` original whose front residue is
+    // zeroed. Before the fix `lost` was set only after both zeroes, so this
+    // returned a corrupted `Some` original.
+    #[test]
+    fn front_and_back_shrink_second_zero_fault_is_lost() {
+        let path = temp_path("gt_fbshrink_zero");
+        let _g = Guard(path.clone());
+        let alloc = GhostTreeBstackAllocator::new(BStack::open(&path).unwrap()).unwrap();
+
+        let mut h = alloc.alloc(256).unwrap(); // aligned block 256
+        h.write([0x3Cu8; 256]).unwrap();
+
+        // Front+back shrink: pf = 32 (front residue), retained 192, back residue
+        // 32 — two `zero` calls. The first (index 0) writes and sets `lost`; the
+        // second (index 1) faults.
+        arm(&alloc, FailOpAt::new("zero", 1, ErrorKind::Other));
+        let err = alloc
+            .realloc_inplace(h, -32, -32)
+            .expect_err("second residue zero faults");
+        disarm(&alloc);
+        assert_eq!(err.source.kind(), ErrorKind::Other);
+        assert!(
+            err.handle.is_none(),
+            "the front residue was already zeroed, so the original is not intact: \
+             must report handle: None, never a corrupted Some"
+        );
+
+        // The allocator stays usable after the leak.
+        let mut c = alloc.alloc(64).unwrap();
+        c.write([9u8; 64]).unwrap();
+        assert_eq!(c.read().unwrap(), vec![9u8; 64]);
     }
 
     // A front+back shrink frees two residues with two AVL inserts. Faulting the

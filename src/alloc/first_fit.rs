@@ -1865,10 +1865,11 @@ impl FirstFitBStackAllocator {
                 return unsupported();
             }
 
-            // Decide the path before touching anything (both keep the retained
-            // block anchored and end with our header at `new_header`).
-            let new_start = start - pg;
-            let new_header = new_start - Self::BLOCK_HEADER_SIZE; // start - pg - 16
+            // Decide the path first. Only a `pg` that fits the neighbour is
+            // valid — Shrink keeps a remainder, Absorb consumes it whole — and any
+            // larger `pg` is rejected here. Computing `new_start`/`new_header`
+            // before this check would subtract an unvalidated `pg` from `start`
+            // and underflow for a too-large front grow (a debug-build panic).
             enum Mode {
                 Shrink(u64), // neighbour's new payload size
                 Absorb,
@@ -1880,6 +1881,11 @@ impl FirstFitBStackAllocator {
             } else {
                 return unsupported();
             };
+            // `pg` now fits the neighbour, so both blocks stay within the arena and
+            // neither subtraction underflows. Both paths keep the retained block
+            // anchored and end with our header at `new_header`.
+            let new_start = start - pg;
+            let new_header = new_start - Self::BLOCK_HEADER_SIZE; // start - pg - 16
 
             self.set_recovery_needed()?;
             lost = true;
@@ -2651,6 +2657,33 @@ mod inplace_resize_tests {
         let got = r.read().unwrap();
         assert_eq!(&got[..128], &vec![0u8; 128][..]);
         assert_eq!(&got[128..], &pattern(50)[..]);
+    }
+
+    #[test]
+    fn front_grow_far_larger_than_neighbour_is_unsupported_not_panic() {
+        // Regression: `grow_front_inplace` computed `new_start = start - pg` (and
+        // `new_start - BLOCK_HEADER_SIZE`) *before* the Shrink/Absorb decision
+        // validated that `pg` fits the neighbour. A front grow larger than the
+        // block's own offset therefore underflowed — a debug-build panic — instead
+        // of returning `Unsupported`. It must now reject cleanly with the handle
+        // intact, for any oversized `pg`.
+        let (alloc, _g) = open_fresh();
+        let a = alloc.alloc(100).unwrap();
+        let mut b = alloc.alloc(50).unwrap();
+        b.write(pattern(50)).unwrap();
+        let b_start = b.start();
+        alloc.dealloc(a).map_err(|e| e.source).unwrap(); // `a` is b's free left neighbour
+
+        // `pg` dwarfs both the neighbour (payload 104) and `b_start`, so the old
+        // `start - pg` would underflow. Neither Shrink nor Absorb matches, so the
+        // correct answer is `Unsupported`.
+        let err = alloc.realloc_inplace(b, 4096, 0).unwrap_err();
+        assert_eq!(err.source.kind(), ErrorKind::Unsupported);
+        let b = err
+            .handle
+            .expect("oversized front grow must return the handle");
+        assert_eq!(b.start(), b_start, "block not moved");
+        assert_eq!(b.read().unwrap(), pattern(50), "original bytes intact");
     }
 
     #[test]
