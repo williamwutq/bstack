@@ -232,6 +232,113 @@ pub(crate) fn make_payload<R: rand::RngExt>(
     Payload::Seeded(id)
 }
 
+// The in-place suites need a payload keyed on the *absolute physical offset*,
+// not the logical index the `Payload` above uses. `realloc_inplace` can move the
+// front edge, so a byte's logical index shifts while its physical offset — and
+// the retained value living there — does not. Keying the expected byte on the
+// stack offset makes the trait's core promise ("the retained bytes occupy the
+// same physical offsets") checkable by a single read of the overlap.
+
+/// Expected byte at absolute stack offset `p` for a live allocation tagged `id`
+/// in a run salted by `bias`. Deterministic and cheap to regenerate.
+pub(crate) fn pat(p: u64, id: u64, bias: u64) -> u8 {
+    let mut z =
+        p.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (id ^ bias).wrapping_mul(0xD1B5_4A32_D192_ED03);
+    z ^= z >> 33;
+    z = z.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+    z ^= z >> 33;
+    (z & 0xFF) as u8
+}
+
+/// Fill `slice` with the [`pat`] pattern keyed to its current physical offsets.
+pub(crate) fn write_pattern<A: BStackOwnedSliceAllocator>(
+    slice: &mut BStackOwnedSlice<'_, A>,
+    id: u64,
+    bias: u64,
+) -> io::Result<()> {
+    let start = slice.start();
+    let mut buf = vec![0u8; slice.len() as usize];
+    for (i, b) in buf.iter_mut().enumerate() {
+        *b = pat(start + i as u64, id, bias);
+    }
+    slice.write(&buf)
+}
+
+/// Verify every byte of `slice` matches the [`pat`] pattern for its physical
+/// offsets, panicking on mismatch.
+pub(crate) fn verify_pattern<A: BStackOwnedSliceAllocator>(
+    slice: &BStackOwnedSlice<'_, A>,
+    id: u64,
+    bias: u64,
+    ctx: &str,
+) {
+    verify_pattern_range(
+        slice,
+        slice.start(),
+        slice.start() + slice.len(),
+        id,
+        bias,
+        ctx,
+    )
+}
+
+/// Verify the absolute physical range `[lo, hi)` of `slice` matches the [`pat`]
+/// pattern. `lo`/`hi` must lie within the slice's physical extent; an empty
+/// range is a no-op. Used to check the retained overlap after an in-place
+/// resize.
+pub(crate) fn verify_pattern_range<A: BStackOwnedSliceAllocator>(
+    slice: &BStackOwnedSlice<'_, A>,
+    lo: u64,
+    hi: u64,
+    id: u64,
+    bias: u64,
+    ctx: &str,
+) {
+    if hi <= lo {
+        return;
+    }
+    let start = slice.start();
+    let got = slice.read_range(lo - start, hi - start).unwrap();
+    for (k, &b) in got.iter().enumerate() {
+        let p = lo + k as u64;
+        let e = pat(p, id, bias);
+        assert_eq!(
+            b, e,
+            "{ctx}: corruption at phys {p}: got {b:#04x}, expected {e:#04x} (id={id}, bias={bias})"
+        );
+    }
+}
+
+/// Generate a random `(prepend, append)` delta pair for a live allocation of
+/// `len` bytes. Biases toward pure back-edge and pure front-edge moves (the
+/// cases allocators are most likely to support) while still emitting mixed
+/// moves, front deltas snapped to 8-byte alignment (front carves are
+/// alignment-constrained), and the occasional identity no-op. Many pairs are
+/// `Unsupported` for a given allocator; the driver treats that as a valid
+/// outcome, so the generator need not know each allocator's capabilities.
+pub(crate) fn gen_inplace_deltas<R: rand::RngExt>(
+    rng: &mut R,
+    len: u64,
+    cfg: &FuzzConfig,
+) -> (i64, i64) {
+    let l = len as i64;
+    let max = cfg.max_alloc as i64;
+    // Back edge: shrink to (just past) empty, or grow up to max_alloc.
+    let back = |rng: &mut R| rng.random_range(-(l + 1)..=max);
+    // Front edge: 8-aligned magnitude so front carves can meet alignment rules.
+    let front = |rng: &mut R| {
+        let cap = (len.max(64) / 8 + 8) as i64;
+        let mag = rng.random_range(0..=cap) * 8;
+        if rng.random_bool(0.5) { -mag } else { mag }
+    };
+    match rng.random_range(0..100) {
+        0..=49 => (0, back(rng)),           // append-only
+        50..=79 => (front(rng), 0),         // prepend-only
+        80..=94 => (front(rng), back(rng)), // both edges
+        _ => (0, 0),                        // identity no-op
+    }
+}
+
 /// Volume/shape knobs, read once from the environment with sane defaults so CI
 /// can crank a longer fuzz run without recompiling. No file snapshots are
 /// taken: a failing run panics with enough context (id/bias/offset) to
