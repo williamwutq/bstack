@@ -339,25 +339,6 @@ A bulk request spanning 33 size classes currently degrades to `n` independent `a
 
 ---
 
-## `BStackInPlaceResizeAllocator` for `SegregatedBStackAllocator`
-
-**Feature flag:** `alloc` + `set`.
-**Breaking change:** No
-
-### Motivation
-
-Recording the block's *physical* size in the in-use overhead word (0.4.3) already made an in-block resize cost zero `BStack` writes inside `realloc`. That is precisely `realloc_inplace`'s contract for the back edge, and the machinery exists — it is simply not reachable through the trait.
-
-### Design
-
-- `append`-only, where the new physical need `round_up(len + 8, 16)` still fits the recorded block: succeed with **zero writes**; the visible length lives in the returned handle.
-- `append` beyond the recorded physical size: `Unsupported`. Growing into a free neighbour needs adjacency merging, which is the coalescer's job (see below), not this trait's.
-- Shrink: reuse the existing paths — retain the excess inside the still-recorded block, or reclaim it above `SPLIT_MIN` (tail `Atrunc` or in-place carve) under `atomic` only.
-- `prepend != 0`: always `Unsupported`. The overhead word sits immediately before the payload and the block base is fixed at `payload − OVERHEAD`; moving the front edge would move the block base, which both the class free lists and `recover`'s linear scan key on.
-- Empty handle: `Unsupported` for every `(prepend, append)`, per the trait.
-
----
-
 ## `BStackSlice::cas_on` and `BStackSlice::replace_with`
 
 **Feature flag:** `alloc` + `set` + `atomic`.

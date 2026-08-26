@@ -12,9 +12,10 @@
 //! encoded by the magic version, not per-file state — a format change bumps the
 //! magic rather than reinterpreting a stored field.
 //!
-//! Implemented: `new`/`open`, `alloc`, `dealloc`, `realloc`, and `recover`
-//! (linear-scan free-list rebuild + leak reclaim). Still pending: the background
-//! coalescer.
+//! Implemented: `new`/`open`, `alloc`, `dealloc`, `realloc`, `realloc_inplace`
+//! (back-edge only — the fixed block base rules out front moves; a back grow uses
+//! the same tail extend as `realloc`), and `recover` (linear-scan free-list
+//! rebuild + leak reclaim). Still pending: the background coalescer.
 //!
 //! # Feature flags
 //!
@@ -37,7 +38,8 @@
 //! the still-recorded larger block (zero extra writes, no move).
 
 use super::{
-    BStackAllocError, BStackAllocator, BStackOwnedSlice, BStackUninitAllocator, ensure_own_handle,
+    BStackAllocError, BStackAllocator, BStackInPlaceResizeAllocator, BStackOwnedSlice,
+    BStackUninitAllocator, ensure_own_handle,
 };
 use crate::BStack;
 #[cfg(feature = "atomic")]
@@ -1069,137 +1071,15 @@ impl SegregatedBStackAllocator {
 
             if new_need <= old_size {
                 // The request fits the current physical block — no bigger block
-                // needed.
-                if new_len > old_len {
-                    // Visible grow within the block: zero the newly-exposed bytes
-                    // (a prior shrink may have left stale data there) and retain.
-                    // The length lives in the handle, so there is no metadata
-                    // write and nothing to order the zero against for `recover`.
-                    if init {
-                        self.stack.zero(start + old_len, new_len - old_len)?;
-                    }
-                    // SAFETY: same physical block, larger visible length.
-                    return Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, start, new_len) });
-                }
-
-                // Visible shrink (`new_len < old_len`; the `==` case returned
-                // early above). No new bytes are exposed. Reclaim the excess only
-                // above the split threshold, and only under `atomic`: a shrink's
-                // freed tail overlaps still-live caller bytes, so recording the
-                // smaller size and dropping the excess must commit together in one
-                // operation — the non-`atomic` build cannot fuse them (either
-                // ordering leaves a window `recover` mis-parses, and a rollback
-                // would hand back a block whose tail the carve already clobbered),
-                // so it retains the excess in place (zero writes, no move).
-                #[cfg(feature = "atomic")]
-                if new_size < old_size && old_size - new_size >= Self::SPLIT_MIN {
-                    let old_end = block_start + old_size; // block exists ⇒ ≤ stack_len
-
-                    // Tail shrink: replace the whole block with its shrunk self in
-                    // ONE crash-atomic operation. `Len` confirms the tail under
-                    // `process_gen`'s held write lock and a single `Atrunc` cuts
-                    // the old block and re-appends the new one (overhead recording
-                    // `new_size`, surviving prefix, zero pad) at the same offset.
-                    // Recording the size and dropping the excess as separate calls
-                    // would leave a crash window where the recorded size disagrees
-                    // with the physical extent and `recover` mis-strides.
-                    //
-                    // The replacement buffer is always full-length regardless of
-                    // `init`: `Atrunc` re-appends exactly these bytes, so their
-                    // count *is* the new block's physical extent. A shrink adds no
-                    // new bytes, so there is no uninitialised region to hand back.
-                    let buf = self.claim_buf(new_size, Some((start, new_len)), true)?;
-                    let mut cur_len = 0u64;
-                    let cur_ptr: *mut u64 = &mut cur_len;
-                    let mut phase = 0u8;
-                    let mut truncated = false;
-                    self.stack.process_gen(|| match phase {
-                        0 => {
-                            phase = 1;
-                            // SAFETY: `process_gen` invokes this closure strictly
-                            // sequentially and finishes writing `out` before the
-                            // next call, so the `&mut` never aliases the read below.
-                            Some(BStackGenOp::Len {
-                                out: unsafe { &mut *cur_ptr },
-                            })
-                        }
-                        1 => {
-                            phase = 2;
-                            // SAFETY: the `Len` write above has completed.
-                            if old_end == unsafe { *cur_ptr } {
-                                truncated = true;
-                                Some(BStackGenOp::Atrunc {
-                                    n: old_size,
-                                    data: &buf[..],
-                                })
-                            } else {
-                                None
-                            }
-                        }
-                        _ => None,
-                    })?;
-                    if truncated {
-                        // SAFETY: block replaced in place at the same offset,
-                        // shrunk to the new class with its prefix preserved.
-                        return Ok(unsafe {
-                            BStackOwnedSlice::from_raw_parts(self, start, new_len)
-                        });
-                    }
-
-                    // Non-tail: keep the block at the new class and free the excess
-                    // tail *in place* as one crash-atomic carve — no move, no copy,
-                    // and `recovered` stays the untouched original (a fault leaves
-                    // the block un-shrunk). The prefix commit records `new_size`.
-                    let prefix = (Self::IN_USE_BIT | (new_size >> 4)).to_le_bytes();
-                    self.commit_carve(
-                        block_start,
-                        &prefix,
-                        block_start + new_size,
-                        old_size - new_size,
-                    )?;
-                    // SAFETY: block shrunk in place; the freed tail is now free.
-                    return Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, start, new_len) });
-                }
-
-                // Retain in place: the block records its own size and a shrink
-                // exposes no new bytes, so this is zero `BStack` writes.
-                // SAFETY: same physical block, smaller visible length.
-                return Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, start, new_len) });
+                // needed, and never a move. Shared with `realloc_inplace`, whose
+                // append-only in-block case is exactly this path.
+                return self.resize_in_block(block_start, start, old_len, new_len, old_size, init);
             }
 
             // The request needs a physically larger block (`new_need > old_size`,
-            // so also `new_size > old_size`). Grow at the tail: extend the block in
-            // place, only when it ends at the payload tail. Extend first
-            // (leak-preferring: a failure after it only leaks the extension, never
-            // corrupts), then zero the old slack, then record the new size. Under
-            // `atomic`, `try_extend_zeros` fuses the tail check and the grow into
-            // one locked critical section; otherwise we check `len` then `extend`
-            // (which zero-fills the new region via `set_len`).
-            let old_end = block_start + old_size; // block exists ⇒ ≤ stack_len
-            let grew = {
-                #[cfg(feature = "atomic")]
-                {
-                    self.stack.try_extend_zeros(old_end, new_size - old_size)?
-                }
-                #[cfg(not(feature = "atomic"))]
-                {
-                    old_end == self.stack.len()? && {
-                        self.stack.extend(new_size - old_size)?;
-                        true
-                    }
-                }
-            };
-            if grew {
-                // Old block's slack [start+old_len, old_end) may hold stale bytes
-                // from a prior shrink; the extension past old_end is already zero.
-                let slack = (old_size - Self::OVERHEAD) - old_len;
-                if slack > 0 && init {
-                    self.stack.zero(start + old_len, slack)?;
-                }
-                self.stack.set(
-                    block_start,
-                    (Self::IN_USE_BIT | (new_size >> 4)).to_le_bytes(),
-                )?;
+            // so also `new_size > old_size`). Grow at the tail in place when the
+            // block ends at the payload tail; shared with `realloc_inplace`.
+            if self.grow_tail_inplace(block_start, start, old_len, old_size, new_size, init)? {
                 // SAFETY: block extended in place to the new class at the tail.
                 return Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, start, new_len) });
             }
@@ -1228,6 +1108,187 @@ impl SegregatedBStackAllocator {
             }),
         })
     }
+
+    /// Resize a block whose request already fits its recorded physical extent
+    /// (`new_need ≤ old_size`, so `new_size ≤ old_size`) — never a bigger block
+    /// and never a move. Shared by [`realloc`](BStackAllocator::realloc) (its
+    /// fits-the-block arm) and [`realloc_inplace`](BStackInPlaceResizeAllocator::realloc_inplace)
+    /// (whose append-only in-block case is exactly this).
+    ///
+    /// * Visible grow (`new_len > old_len`): the newly-exposed bytes may hold
+    ///   stale data from a prior shrink, so scrub them when `init`; the length
+    ///   lives in the handle, so nothing else is written.
+    /// * Visible shrink (`new_len < old_len`): under `atomic`, reclaim the excess
+    ///   when it clears `SPLIT_MIN` — a tail `Len` + `Atrunc`, else an in-place
+    ///   carve — recording the new size in the same crash-atomic operation.
+    ///   Otherwise (below threshold, or non-`atomic`) retain it in place with zero
+    ///   writes. The caller's original `(start, old_len)` block stays intact on a
+    ///   mid-op failure, so it is always safe to return as the surviving handle.
+    ///
+    /// `new_len == old_len` is handled by the callers before they reach here.
+    fn resize_in_block<'a>(
+        &'a self,
+        block_start: u64,
+        start: u64,
+        old_len: u64,
+        new_len: u64,
+        old_size: u64,
+        init: bool,
+    ) -> io::Result<BStackOwnedSlice<'a, Self>> {
+        // `block_start` and `old_size` drive only the `atomic` shrink reclaim
+        // below; without `atomic` a shrink always retains in place.
+        #[cfg(not(feature = "atomic"))]
+        let _ = (block_start, old_size);
+        if new_len > old_len {
+            // Visible grow within the block: zero the newly-exposed bytes
+            // (a prior shrink may have left stale data there) and retain.
+            // The length lives in the handle, so there is no metadata
+            // write and nothing to order the zero against for `recover`.
+            if init {
+                self.stack.zero(start + old_len, new_len - old_len)?;
+            }
+            // SAFETY: same physical block, larger visible length.
+            return Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, start, new_len) });
+        }
+
+        // Visible shrink (`new_len < old_len`; the `==` case is handled by the
+        // callers). No new bytes are exposed. Reclaim the excess only
+        // above the split threshold, and only under `atomic`: a shrink's
+        // freed tail overlaps still-live caller bytes, so recording the
+        // smaller size and dropping the excess must commit together in one
+        // operation — the non-`atomic` build cannot fuse them (either
+        // ordering leaves a window `recover` mis-parses, and a rollback
+        // would hand back a block whose tail the carve already clobbered),
+        // so it retains the excess in place (zero writes, no move).
+        #[cfg(feature = "atomic")]
+        {
+            let new_size = Self::class_blocksize(Self::phys_need(new_len)?);
+            if new_size < old_size && old_size - new_size >= Self::SPLIT_MIN {
+                let old_end = block_start + old_size; // block exists ⇒ ≤ stack_len
+
+                // Tail shrink: replace the whole block with its shrunk self in
+                // ONE crash-atomic operation. `Len` confirms the tail under
+                // `process_gen`'s held write lock and a single `Atrunc` cuts
+                // the old block and re-appends the new one (overhead recording
+                // `new_size`, surviving prefix, zero pad) at the same offset.
+                // Recording the size and dropping the excess as separate calls
+                // would leave a crash window where the recorded size disagrees
+                // with the physical extent and `recover` mis-strides.
+                //
+                // The replacement buffer is always full-length regardless of
+                // `init`: `Atrunc` re-appends exactly these bytes, so their
+                // count *is* the new block's physical extent. A shrink adds no
+                // new bytes, so there is no uninitialised region to hand back.
+                let buf = self.claim_buf(new_size, Some((start, new_len)), true)?;
+                let mut cur_len = 0u64;
+                let cur_ptr: *mut u64 = &mut cur_len;
+                let mut phase = 0u8;
+                let mut truncated = false;
+                self.stack.process_gen(|| match phase {
+                    0 => {
+                        phase = 1;
+                        // SAFETY: `process_gen` invokes this closure strictly
+                        // sequentially and finishes writing `out` before the
+                        // next call, so the `&mut` never aliases the read below.
+                        Some(BStackGenOp::Len {
+                            out: unsafe { &mut *cur_ptr },
+                        })
+                    }
+                    1 => {
+                        phase = 2;
+                        // SAFETY: the `Len` write above has completed.
+                        if old_end == unsafe { *cur_ptr } {
+                            truncated = true;
+                            Some(BStackGenOp::Atrunc {
+                                n: old_size,
+                                data: &buf[..],
+                            })
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                })?;
+                if truncated {
+                    // SAFETY: block replaced in place at the same offset,
+                    // shrunk to the new class with its prefix preserved.
+                    return Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, start, new_len) });
+                }
+
+                // Non-tail: keep the block at the new class and free the excess
+                // tail *in place* as one crash-atomic carve — no move, no copy,
+                // and the caller's original handle stays the untouched survivor (a
+                // fault leaves the block un-shrunk). The prefix commit records `new_size`.
+                let prefix = (Self::IN_USE_BIT | (new_size >> 4)).to_le_bytes();
+                self.commit_carve(
+                    block_start,
+                    &prefix,
+                    block_start + new_size,
+                    old_size - new_size,
+                )?;
+                // SAFETY: block shrunk in place; the freed tail is now free.
+                return Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, start, new_len) });
+            }
+        }
+
+        // Retain in place: the block records its own size and a shrink
+        // exposes no new bytes, so this is zero `BStack` writes.
+        // SAFETY: same physical block, smaller visible length.
+        Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, start, new_len) })
+    }
+
+    /// Grow the block at `block_start` from `old_size` to `new_size`
+    /// (`new_size > old_size`) by extending the stack tail **in place** — only
+    /// when the block ends at the payload tail. Returns `Ok(true)` on success
+    /// (extended, old slack scrubbed when `init`, the new size recorded) and
+    /// `Ok(false)` when the block is not at the tail, leaving it untouched so the
+    /// caller can decide between a move ([`realloc`](BStackAllocator::realloc)) and
+    /// `Unsupported` ([`realloc_inplace`](BStackInPlaceResizeAllocator::realloc_inplace)).
+    ///
+    /// Shared by both. Extend first (leak-preferring: a failure after it only
+    /// leaks the extension, never corrupts), then zero the old slack, then record
+    /// the new size. Under `atomic`, `try_extend_zeros` fuses the tail check and
+    /// the grow into one locked critical section; otherwise we check `len` then
+    /// `extend` (which zero-fills the new region via `set_len`). The caller's
+    /// original `(start, old_len)` block stays intact on any failure.
+    fn grow_tail_inplace(
+        &self,
+        block_start: u64,
+        start: u64,
+        old_len: u64,
+        old_size: u64,
+        new_size: u64,
+        init: bool,
+    ) -> io::Result<bool> {
+        let old_end = block_start + old_size; // block exists ⇒ ≤ stack_len
+        let grew = {
+            #[cfg(feature = "atomic")]
+            {
+                self.stack.try_extend_zeros(old_end, new_size - old_size)?
+            }
+            #[cfg(not(feature = "atomic"))]
+            {
+                old_end == self.stack.len()? && {
+                    self.stack.extend(new_size - old_size)?;
+                    true
+                }
+            }
+        };
+        if !grew {
+            return Ok(false);
+        }
+        // Old block's slack [start+old_len, old_end) may hold stale bytes
+        // from a prior shrink; the extension past old_end is already zero.
+        let slack = (old_size - Self::OVERHEAD) - old_len;
+        if slack > 0 && init {
+            self.stack.zero(start + old_len, slack)?;
+        }
+        self.stack.set(
+            block_start,
+            (Self::IN_USE_BIT | (new_size >> 4)).to_le_bytes(),
+        )?;
+        Ok(true)
+    }
 }
 
 #[cfg(feature = "set")]
@@ -1244,6 +1305,157 @@ impl BStackUninitAllocator for SegregatedBStackAllocator {
         new_len: u64,
     ) -> Result<BStackOwnedSlice<'a, Self>, BStackAllocError<'a, Self>> {
         self.realloc_impl(slice, new_len, false)
+    }
+}
+
+#[cfg(feature = "set")]
+impl BStackInPlaceResizeAllocator for SegregatedBStackAllocator {
+    /// Back-edge in-place resize for the segregated arena. The front edge is fixed
+    /// (the overhead word sits immediately before the payload and the block base is
+    /// `payload − OVERHEAD`, which both the class free lists and `recover`'s linear
+    /// scan key on), so this only ever moves the tail.
+    ///
+    /// | `(prepend, append)`                     | Behaviour                                                     |
+    /// |-----------------------------------------|---------------------------------------------------------------|
+    /// | `prepend != 0` (either sign)            | `Unsupported` — moving the front edge would relocate the block base |
+    /// | `prepend == 0`, `append == 0`           | identity — the block is untouched, the handle is returned as-is |
+    /// | `prepend == 0`, back grow that fits the recorded block | succeed with no metadata write; zero the newly-exposed bytes (a prior shrink may have left stale data there) |
+    /// | `prepend == 0`, back grow past the recorded block, block at the stack tail | extend the tail in place (zero-filled), then record the new physical size |
+    /// | `prepend == 0`, back grow past the recorded block, block not at the tail | `Unsupported` — a free-neighbour merge is the coalescer's job, and relocating would break the position guarantee |
+    /// | `prepend == 0`, back shrink             | retain the excess in place, or (above `SPLIT_MIN`, under `atomic`) reclaim it in one crash-atomic operation |
+    /// | `prepend == 0`, shrink to zero          | free the block (delegates to [`dealloc`](BStackAllocator::dealloc)) |
+    ///
+    /// The visible length lives in the returned handle, not on disk, so a grow that
+    /// fits (past the scrub) and a shrink that retains its excess both touch no
+    /// metadata at all; only a tail grow past the recorded block records a new size.
+    /// Every *resize* path leaves the caller's original block intact on a mid-op
+    /// failure — the in-block grow's scrub adds no new block, the tail extend is
+    /// leak-preferring (a crash leaks the extension, which [`recover`](Self::recover)
+    /// reclaims, and the size is recorded last), and the `atomic` shrink reclaim
+    /// commits the new size together with the truncation (or the carve) as a single
+    /// operation — so those always return `handle: Some`. The
+    /// sole exception is the shrink-to-zero free, which delegates to
+    /// [`dealloc`](BStackAllocator::dealloc): a torn free-list splice there can drop
+    /// the handle (`handle: None`), leaving the block reclaimable only through
+    /// [`recover`](Self::recover), exactly as a direct `dealloc` would.
+    fn realloc_inplace<'a>(
+        &'a self,
+        slice: BStackOwnedSlice<'a, Self>,
+        prepend: i64,
+        append: i64,
+    ) -> Result<BStackOwnedSlice<'a, Self>, BStackAllocError<'a, Self>> {
+        // Reject a handle from another allocator instance before any logic runs
+        // (see the module's "Foreign handles" section).
+        let slice = ensure_own_handle(self, slice, "SegregatedBStackAllocator::realloc_inplace")?;
+        // An empty handle anchors no block; resizing it in place is never
+        // supported for any `(prepend, append)` (see the trait's "Empty handles").
+        if slice.is_empty() {
+            return Err(BStackAllocError::with_handle(
+                io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "realloc_inplace: cannot resize an empty handle in place",
+                ),
+                slice,
+            ));
+        }
+
+        // Resulting length, validated before any I/O. Guard the cast and both
+        // additions so a hostile handle or delta cannot wrap into a bogus length.
+        let old_len = slice.len();
+        let new_len = match i64::try_from(old_len)
+            .ok()
+            .and_then(|l| l.checked_add(prepend))
+            .and_then(|l| l.checked_add(append))
+        {
+            Some(n) if n >= 0 => n as u64,
+            _ => {
+                return Err(BStackAllocError::with_handle(
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "realloc_inplace: resulting length is negative or overflows",
+                    ),
+                    slice,
+                ));
+            }
+        };
+
+        // The front edge is anchored to the block base, so any nonzero `prepend`
+        // would relocate the block — never supported here (see the trait docs).
+        if prepend != 0 {
+            return Err(BStackAllocError::with_handle(
+                io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "realloc_inplace: cannot move the front edge of a segregated block in place",
+                ),
+                slice,
+            ));
+        }
+
+        // Shrinking to nothing frees the region; delegate to dealloc, which owns
+        // the handle-return contract on failure.
+        if new_len == 0 {
+            return self.dealloc(slice).map(|()| BStackOwnedSlice::empty(self));
+        }
+
+        let start = slice.start();
+        // Validate the pointer up front (mirrors realloc/dealloc).
+        let block_start = match Self::block_start_of(start) {
+            Ok(bs) => bs,
+            Err(source) => {
+                // SAFETY: the region is untouched and still owned by the caller.
+                let handle = unsafe { BStackOwnedSlice::from_raw_parts(self, start, old_len) };
+                return Err(BStackAllocError::with_handle(source, handle));
+            }
+        };
+        if new_len == old_len {
+            // `(0, 0)` on a non-empty handle: a no-op that returns the handle
+            // exactly as it was, per the position guarantee.
+            // SAFETY: unchanged region.
+            return Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, start, old_len) });
+        }
+
+        // Every supported path below leaves the caller's original block intact on
+        // failure, so the surviving handle is always `(start, old_len)`.
+        let result = (|| -> io::Result<BStackOwnedSlice<'a, Self>> {
+            let word = u64::from_le_bytes(read_bstack!(self.stack, block_start => u64));
+            if word & Self::IN_USE_BIT == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "cannot realloc a freed block",
+                ));
+            }
+            let old_size = (word & !Self::IN_USE_BIT) << 4;
+            if Self::phys_need(old_len)? > old_size {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "cannot realloc a mismatched slice",
+                ));
+            }
+            let new_need = Self::phys_need(new_len)?;
+            if new_need > old_size {
+                // Back grow past the recorded physical block. Extend the stack
+                // tail in place when the block ends there — the position
+                // guarantee holds, since the retained bytes never move. A block
+                // that is *not* at the tail could only grow by merging a free
+                // neighbour (the coalescer's job) or by relocating (which the
+                // guarantee forbids), so it is `Unsupported`.
+                let new_size = Self::class_blocksize(new_need);
+                if self.grow_tail_inplace(block_start, start, old_len, old_size, new_size, true)? {
+                    // SAFETY: block extended in place to the new class at the tail.
+                    return Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, start, new_len) });
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "realloc_inplace: back grow would relocate a non-tail block",
+                ));
+            }
+            self.resize_in_block(block_start, start, old_len, new_len, old_size, true)
+        })();
+        result.map_err(|source| BStackAllocError {
+            source,
+            // SAFETY: (start, old_len) still names the caller's live, intact block.
+            handle: Some(unsafe { BStackOwnedSlice::from_raw_parts(self, start, old_len) }),
+        })
     }
 }
 
@@ -1267,7 +1479,7 @@ mod _assertions {
 mod tests {
     use super::SegregatedBStackAllocator as Seg;
     use crate::BStack;
-    use crate::alloc::{BStackAllocator, BStackUninitAllocator};
+    use crate::alloc::{BStackAllocator, BStackInPlaceResizeAllocator, BStackUninitAllocator};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     struct Guard(std::path::PathBuf);
@@ -1640,6 +1852,228 @@ mod tests {
         let s = a.realloc(s, 400).unwrap();
         assert_eq!(s.start(), off, "grow back into the retained block, no move");
         assert_eq!(&s.read().unwrap()[..100], &[0x3Cu8; 100]);
+    }
+
+    // ── realloc_inplace (BStackInPlaceResizeAllocator) ───────────────────────
+
+    // A back grow that still fits the recorded physical block succeeds in place,
+    // never moving, and scrubs the re-exposed tail (a prior shrink left stale
+    // data there) while keeping the surviving prefix.
+    #[test]
+    fn seg_realloc_inplace_grow_scrubs_stale_tail() {
+        let (a, _g) = new_alloc();
+        let mut s = a.alloc(100).unwrap(); // block 112
+        s.write([0xCDu8; 100]).unwrap();
+        let off = s.start();
+        let s = a.realloc_inplace(s, 0, -10).unwrap(); // len 90, stale [90,100), no move
+        assert_eq!(s.start(), off);
+        assert_eq!(s.len(), 90);
+        let s = a.realloc_inplace(s, 0, 10).unwrap(); // len 100, grow back within block
+        assert_eq!(s.start(), off, "grow within recorded block never moves");
+        let data = s.read().unwrap();
+        assert_eq!(&data[..90], &[0xCDu8; 90], "prefix preserved");
+        assert_eq!(&data[90..], &[0u8; 10], "re-exposed tail scrubbed");
+    }
+
+    // A back grow past the recorded block, when the block is at the stack tail,
+    // extends the tail in place (same as `realloc`): the block stays at its
+    // offset, the grown region is zeroed, and the stack lengthens.
+    #[test]
+    fn seg_realloc_inplace_tail_grow_past_block_extends() {
+        let (a, _g) = new_alloc();
+        let mut s = a.alloc(100).unwrap(); // block 112 (cap 104), at the tail
+        s.write([7u8; 100]).unwrap();
+        let off = s.start();
+        let len_before = a.stack().len().unwrap();
+        let s = a.realloc_inplace(s, 0, 100).unwrap(); // need 208 (class 12) > 112
+        assert_eq!(s.start(), off, "tail grow extends in place, no move");
+        assert_eq!(s.len(), 200);
+        assert!(a.stack().len().unwrap() > len_before, "stack extended");
+        let data = s.read().unwrap();
+        assert_eq!(&data[..100], &[7u8; 100], "prefix preserved");
+        assert_eq!(&data[100..], &[0u8; 100], "grown region zeroed");
+        assert_eq!(unsafe { a.recover() }.unwrap(), 0, "arena accounted for");
+    }
+
+    // A back grow past the recorded block, when the block is NOT at the tail, is
+    // `Unsupported` (a move would break the position guarantee). The handle comes
+    // back intact and the stack is untouched.
+    #[test]
+    fn seg_realloc_inplace_interior_grow_past_block_is_unsupported() {
+        let (a, _g) = new_alloc();
+        let mut s = a.alloc(100).unwrap(); // block 112 (cap 104)
+        s.write([7u8; 100]).unwrap();
+        let off = s.start();
+        let _pin = a.alloc(100).unwrap(); // pin the tail so `s` is interior
+        let len_before = a.stack().len().unwrap();
+        let err = a.realloc_inplace(s, 0, 100).unwrap_err(); // need 208 > 112, not at tail
+        assert_eq!(err.source.kind(), std::io::ErrorKind::Unsupported);
+        let s = err.handle.expect("handle returned intact");
+        assert_eq!(s.start(), off);
+        assert_eq!(s.len(), 100);
+        assert_eq!(a.stack().len().unwrap(), len_before, "stack untouched");
+        assert_eq!(s.read().unwrap(), vec![7u8; 100], "data intact");
+    }
+
+    // A grow that lands exactly on the recorded block capacity fits with no
+    // metadata write; one byte past it, when the block is interior, is
+    // `Unsupported`.
+    #[test]
+    fn seg_realloc_inplace_grow_to_block_capacity_fits() {
+        let (a, _g) = new_alloc();
+        let mut s = a.alloc(90).unwrap(); // block 112, cap 104
+        s.write([1u8; 90]).unwrap();
+        let off = s.start();
+        let _pin = a.alloc(100).unwrap(); // pin the tail so `s` cannot tail-extend
+        let s = a.realloc_inplace(s, 0, 14).unwrap(); // len 104 == cap, phys_need 112 ≤ 112
+        assert_eq!(s.start(), off);
+        assert_eq!(s.len(), 104);
+        // One byte more must spill to the next class; interior → Unsupported.
+        let err = a.realloc_inplace(s, 0, 1).unwrap_err();
+        assert_eq!(err.source.kind(), std::io::ErrorKind::Unsupported);
+    }
+
+    // Any nonzero `prepend` is `Unsupported` (the front edge is anchored to the
+    // block base); the handle is returned intact.
+    #[test]
+    fn seg_realloc_inplace_prepend_is_unsupported() {
+        let (a, _g) = new_alloc();
+        let mut s = a.alloc(100).unwrap();
+        s.write([0x11u8; 100]).unwrap();
+        let off = s.start();
+        for (p, ap) in [(8i64, 0i64), (-8, 0), (8, -8), (-8, 8)] {
+            let err = a.realloc_inplace(s, p, ap).unwrap_err();
+            assert_eq!(
+                err.source.kind(),
+                std::io::ErrorKind::Unsupported,
+                "prepend {p} append {ap}"
+            );
+            s = err.handle.expect("handle returned");
+            assert_eq!(s.start(), off);
+        }
+        assert_eq!(s.read().unwrap(), vec![0x11u8; 100], "block untouched");
+    }
+
+    // An empty handle is `Unsupported` for every `(prepend, append)`, including
+    // the `(0, 0)` no-op.
+    #[test]
+    fn seg_realloc_inplace_empty_handle_is_unsupported() {
+        let (a, _g) = new_alloc();
+        for (p, ap) in [(0i64, 0i64), (0, 8), (8, 0), (0, -8)] {
+            let empty = crate::alloc::BStackOwnedSlice::empty(&a);
+            let err = a.realloc_inplace(empty, p, ap).unwrap_err();
+            assert_eq!(
+                err.source.kind(),
+                std::io::ErrorKind::Unsupported,
+                "prepend {p} append {ap}"
+            );
+            assert!(err.handle.is_some());
+        }
+    }
+
+    // `(0, 0)` on a non-empty handle is an identity no-op that returns the handle
+    // exactly as it was.
+    #[test]
+    fn seg_realloc_inplace_identity_noop() {
+        let (a, _g) = new_alloc();
+        let mut s = a.alloc(64).unwrap();
+        s.write([0x22u8; 64]).unwrap();
+        let off = s.start();
+        let s = a.realloc_inplace(s, 0, 0).unwrap();
+        assert_eq!(s.start(), off);
+        assert_eq!(s.len(), 64);
+        assert_eq!(s.read().unwrap(), vec![0x22u8; 64]);
+    }
+
+    // A back shrink whose excess is below `SPLIT_MIN` retains the excess in place
+    // (no move, no metadata write) in either build; the block keeps its physical
+    // size so a later grow back fits in place.
+    #[test]
+    fn seg_realloc_inplace_small_shrink_retained() {
+        let (a, _g) = new_alloc();
+        let mut s = a.alloc(200).unwrap(); // block 208
+        s.write([0x5Au8; 200]).unwrap();
+        let off = s.start();
+        let _pin = a.alloc(100).unwrap(); // pin the tail so `s` is interior
+        let s = a.realloc_inplace(s, 0, -100).unwrap(); // len 100, excess 96 < SPLIT_MIN → retain
+        assert_eq!(s.start(), off, "small shrink retains in place");
+        assert_eq!(s.read().unwrap(), vec![0x5Au8; 100]);
+        let s = a.realloc_inplace(s, 0, 100).unwrap(); // grow back within retained block
+        assert_eq!(s.start(), off);
+        let data = s.read().unwrap();
+        assert_eq!(&data[..100], &[0x5Au8; 100]);
+        assert_eq!(&data[100..], &[0u8; 100], "re-exposed tail scrubbed");
+        assert_eq!(unsafe { a.recover() }.unwrap(), 0, "arena accounted for");
+    }
+
+    // With `atomic`, a back shrink whose excess clears `SPLIT_MIN` at the tail is
+    // reclaimed in one crash-atomic operation: the block stays at its offset and
+    // the excess returns to the stack.
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn seg_realloc_inplace_tail_shrink_reclaims() {
+        let (a, _g) = new_alloc();
+        let mut s = a.alloc(500).unwrap(); // block 512, at the tail
+        s.write([0x3Cu8; 500]).unwrap();
+        let off = s.start();
+        let len_before = a.stack().len().unwrap();
+        let s = a.realloc_inplace(s, 0, -400).unwrap(); // len 100, excess 400 ≥ SPLIT_MIN, tail
+        assert_eq!(s.start(), off, "tail shrink stays in place");
+        assert!(
+            a.stack().len().unwrap() < len_before,
+            "excess discarded from tail"
+        );
+        assert_eq!(s.read().unwrap(), vec![0x3Cu8; 100]);
+        assert_eq!(unsafe { a.recover() }.unwrap(), 0, "arena accounted for");
+    }
+
+    // Shrinking to zero frees the block and yields an empty handle.
+    #[test]
+    fn seg_realloc_inplace_shrink_to_zero_frees() {
+        let (a, _g) = new_alloc();
+        let s = a.alloc(64).unwrap();
+        let empty = a.realloc_inplace(s, 0, -64).unwrap();
+        assert!(empty.is_empty());
+        // The freed block is reusable and the arena stays accounted for.
+        assert_eq!(unsafe { a.recover() }.unwrap(), 0);
+    }
+
+    // A malformed pointer is rejected with `InvalidInput` and the handle returned,
+    // even though it never reaches the resize logic.
+    #[test]
+    fn seg_realloc_inplace_rejects_malformed_pointer() {
+        let (a, _g) = new_alloc();
+        let bad = unsafe {
+            crate::alloc::BStackOwnedSlice::from_raw_parts(
+                &a,
+                Seg::ARENA_START + Seg::OVERHEAD + 1,
+                16,
+            )
+        };
+        let err = a.realloc_inplace(bad, 0, 8).unwrap_err();
+        assert_eq!(err.source.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.handle.is_some());
+    }
+
+    // A resulting length that underflows below zero is `InvalidInput`, handle kept.
+    #[test]
+    fn seg_realloc_inplace_negative_result_is_invalid() {
+        let (a, _g) = new_alloc();
+        let s = a.alloc(64).unwrap();
+        let err = a.realloc_inplace(s, 0, -65).unwrap_err(); // 64 - 65 < 0
+        assert_eq!(err.source.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.handle.is_some());
+    }
+
+    // A handle from another allocator instance is rejected before any logic runs.
+    #[test]
+    fn seg_realloc_inplace_rejects_foreign_handle() {
+        let (a, _ga) = new_alloc();
+        let (b, _gb) = new_alloc();
+        let s = a.alloc(64).unwrap();
+        let err = b.realloc_inplace(s, 0, 8).unwrap_err();
+        assert_eq!(err.source.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.handle.is_some());
     }
 
     // ── recover ──────────────────────────────────────────────────────────────
