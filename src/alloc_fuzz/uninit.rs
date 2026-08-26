@@ -21,7 +21,8 @@
 //! counterpart is [`uninit_fault`](super::uninit_fault).
 
 use super::common::{
-    FuzzConfig, Guard, Operation, Payload, gen_op, make_allocator, make_payload, temp_path,
+    FuzzConfig, Guard, Operation, Payload, gen_op, make_allocator, make_payload, seeded_rng,
+    temp_path,
 };
 use crate::alloc::{
     BStackOwnedSlice, BStackOwnedSliceAllocator, BStackRange, BStackUninitAllocator,
@@ -30,13 +31,6 @@ use crate::alloc::{
 };
 use crate::{BStack, CheckedSlabBStackAllocator};
 use rand::RngExt;
-
-// A random per-run salt so the deterministic byte patterns of two parallel
-// test binaries (or the seeded/adversarial payload kinds) never alias — a
-// stray cross-allocation read then shows up as a mismatch.
-fn run_bias(rng: &mut impl RngExt) -> u64 {
-    rng.random_range(0..=u64::MAX)
-}
 
 // alloc_uninit/dealloc/check mix. Each live allocation is fully written with a
 // `Payload` — a cheap seeded pattern or an adversarial snapshot copied out of
@@ -53,8 +47,8 @@ where
     let path = temp_path("u_ad");
     let _guard = Guard(path.clone());
     let alloc = make(BStack::open(&path).unwrap()).unwrap();
-    let mut rng = rand::rng();
-    let bias = run_bias(&mut rng);
+    let mut rng = seeded_rng();
+    let bias = rng.random_range(0..=u64::MAX);
     let mut live: Vec<(BStackOwnedSlice<'_, A>, Payload)> = Vec::new();
     let mut next_id = 0u64;
 
@@ -99,8 +93,8 @@ where
     let path = temp_path("u_ard");
     let _guard = Guard(path.clone());
     let alloc = make(BStack::open(&path).unwrap()).unwrap();
-    let mut rng = rand::rng();
-    let bias = run_bias(&mut rng);
+    let mut rng = seeded_rng();
+    let bias = rng.random_range(0..=u64::MAX);
     let mut live: Vec<(BStackOwnedSlice<'_, A>, Payload)> = Vec::new();
     let mut next_id = 0u64;
 
@@ -175,8 +169,8 @@ where
     let _guard = Guard(path.clone());
     drop(make(BStack::open(&path).unwrap()).unwrap());
 
-    let mut rng = rand::rng();
-    let bias = run_bias(&mut rng);
+    let mut rng = seeded_rng();
+    let bias = rng.random_range(0..=u64::MAX);
     let mut live: Vec<(BStackRange, Payload)> = Vec::new();
     let mut next_id: u64 = 0;
 
