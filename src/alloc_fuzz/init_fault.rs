@@ -1,0 +1,258 @@
+//! Fault-injection fuzz for the crash-consistent allocators.
+//!
+//! Where [`init`](super::init) exercises the happy path,
+//! this suite arms a random [`FaultPolicy`] around each `alloc`/`realloc`/
+//! `dealloc` and asserts the 0.4.0 failure contract holds under torn
+//! multi-call operations:
+//!
+//! * every operation either **succeeds** or **fails cleanly** (returns an error,
+//!   never panics);
+//! * on a failed `realloc`/`dealloc` the [`BStackAllocError`] handle contract is
+//!   honoured — `Some` hands back a live region whose data is intact, `None`
+//!   means the region was genuinely lost (a leak, acceptable per the contract);
+//! * a fault leaves at most a leak, never corruption: after **reopen +
+//!   recovery**, every still-live allocation reads back byte-for-byte, including
+//!   adversarial payloads that look like allocator internals.
+//!
+//! Because the crash-consistency model repairs state only at `open`, the driver
+//! reopens (which runs each allocator's recovery) after *every* faulted
+//! operation before continuing — modelling "crash → restart → recover" — and
+//! also on a fixed period. [`LinearBStackAllocator`](crate::LinearBStackAllocator)
+//! is intentionally excluded: it keeps no metadata and has no recovery path.
+
+use super::common::{
+    FuzzConfig, Guard, Operation, Payload, check_is_zero, gen_op, make_allocator, make_payload,
+    policies::{RandomFaults, per_mille},
+    temp_path,
+};
+use crate::alloc::{
+    BStackOwnedSlice, BStackOwnedSliceAllocator, BStackRange, FirstFitBStackAllocator,
+    GhostTreeBstackAllocator, SegregatedBStackAllocator, SlabBStackAllocator,
+};
+use crate::fault::FaultPolicy;
+use crate::{BStack, CheckedSlabBStackAllocator};
+use rand::{RngExt, SeedableRng, rngs::StdRng};
+use std::io;
+use std::sync::Arc;
+
+/// Disarm, reopen (running recovery), and re-verify every live allocation.
+/// Returns the reopened allocator. Panics on any data mismatch — that is the
+/// corruption signal.
+fn reopen_and_verify<A, F>(
+    alloc: A,
+    make: &F,
+    live: &[(BStackRange, Payload)],
+    bias: u64,
+    ctx: &str,
+) -> A
+where
+    A: BStackOwnedSliceAllocator,
+    F: Fn(BStack) -> io::Result<A>,
+{
+    alloc.stack().set_fault_policy(None);
+    let stack = alloc.into_stack();
+    let alloc = make(stack).unwrap();
+    for (i, (range, payload)) in live.iter().enumerate() {
+        let s = unsafe { BStackOwnedSlice::from_raw_parts(&alloc, range.start(), range.len()) };
+        payload.verify(&s, bias, &format!("{ctx} rec{i}"));
+    }
+    alloc
+}
+
+fn run_fault_fuzz<A, F>(make: F, seed_salt: u64)
+where
+    A: BStackOwnedSliceAllocator,
+    F: Fn(BStack) -> io::Result<A>,
+{
+    let cfg = FuzzConfig::from_env();
+    let path = temp_path("fault");
+    let _guard = Guard(path.clone());
+    // Reproducible: `BSTACK_FUZZ_SEED=<n>` replays an identical run (printed
+    // on failure, since cargo shows stderr for failing tests). Everything
+    // random — op stream, bias, fault schedule — derives from this seed.
+    let master_seed = std::env::var("BSTACK_FUZZ_SEED")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| rand::rng().random_range(0..=u64::MAX));
+    eprintln!("[alloc_fault_tests salt={seed_salt:#06x}] BSTACK_FUZZ_SEED={master_seed}");
+    let mut rng = StdRng::seed_from_u64(master_seed ^ seed_salt);
+    let bias = rng.random_range(0..=u64::MAX);
+    let fault_seed = rng.random_range(0..=u64::MAX);
+    let policy: Arc<dyn FaultPolicy> = Arc::new(RandomFaults::new(fault_seed, per_mille()));
+
+    let mut alloc = make(BStack::open(&path).unwrap()).unwrap();
+    let mut live: Vec<(BStackRange, Payload)> = Vec::new();
+    let mut next_id = 0u64;
+
+    for step in 0..cfg.ops {
+        // The op faulted iff it returned an error; a fault may have left the
+        // allocator mid-mutation, so we reopen (recover) before continuing.
+        let mut faulted = false;
+
+        match gen_op(&mut rng, &cfg, !live.is_empty(), false) {
+            Operation::Alloc(len) => {
+                alloc.stack().set_fault_policy(Some(policy.clone()));
+                let r = alloc.alloc(len);
+                alloc.stack().set_fault_policy(None);
+                match r {
+                    Ok(mut s) => {
+                        let payload = make_payload(alloc.stack(), s.len(), next_id, &cfg, &mut rng);
+                        next_id += 1;
+                        payload.write(&mut s, bias).unwrap();
+                        live.push((s.as_range(), payload));
+                    }
+                    Err(_) => faulted = true,
+                }
+            }
+            Operation::Realloc(new_len) => {
+                let i = rng.random_range(0..live.len());
+                let (range, payload) = live.swap_remove(i);
+                let old_len = range.len();
+                let s =
+                    unsafe { BStackOwnedSlice::from_raw_parts(&alloc, range.start(), range.len()) };
+                alloc.stack().set_fault_policy(Some(policy.clone()));
+                let r = alloc.realloc(s, new_len);
+                alloc.stack().set_fault_policy(None);
+                match r {
+                    Ok(mut s2) => {
+                        let preserved = old_len.min(new_len);
+                        payload.verify_prefix(
+                            &s2,
+                            preserved,
+                            bias,
+                            "fault realloc: preserved prefix",
+                        );
+                        if new_len > old_len {
+                            check_is_zero(
+                                &s2.read().unwrap()[old_len as usize..],
+                                "fault realloc: zero-extend",
+                            );
+                        }
+                        let np = make_payload(alloc.stack(), s2.len(), next_id, &cfg, &mut rng);
+                        next_id += 1;
+                        np.write(&mut s2, bias).unwrap();
+                        live.push((s2.as_range(), np));
+                    }
+                    Err(e) => {
+                        faulted = true;
+                        if let Some(mut h) = e.handle {
+                            // Strict contract: a returned handle is either the
+                            // untouched original (old_len, byte-identical) or the
+                            // fully-committed new region (new_len). Anything else
+                            // must be reported as None, so the length tells us
+                            // which case this is, and the survivor is fully
+                            // valid & reuse-safe either way.
+                            if h.len() == old_len {
+                                payload.verify(&h, bias, "fault realloc err: untouched original");
+                            } else {
+                                // Committed new region: prefix preserved, grown
+                                // bytes zero-extended.
+                                let preserved = old_len.min(new_len);
+                                payload.verify_prefix(
+                                    &h,
+                                    preserved,
+                                    bias,
+                                    "fault realloc err: committed-new prefix",
+                                );
+                                if h.len() > preserved {
+                                    check_is_zero(
+                                        &h.read_range(preserved, h.len()).unwrap(),
+                                        "fault realloc err: committed-new zero-extend",
+                                    );
+                                }
+                            }
+                            let np = make_payload(alloc.stack(), h.len(), next_id, &cfg, &mut rng);
+                            next_id += 1;
+                            np.write(&mut h, bias).unwrap();
+                            live.push((h.as_range(), np));
+                        }
+                        // None → region genuinely lost; drop it.
+                    }
+                }
+            }
+            Operation::Dealloc => {
+                let i = rng.random_range(0..live.len());
+                let (range, payload) = live.swap_remove(i);
+                let s =
+                    unsafe { BStackOwnedSlice::from_raw_parts(&alloc, range.start(), range.len()) };
+                alloc.stack().set_fault_policy(Some(policy.clone()));
+                let r = alloc.dealloc(s);
+                alloc.stack().set_fault_policy(None);
+                match r {
+                    Ok(()) => {}
+                    Err(e) => {
+                        faulted = true;
+                        if let Some(h) = e.handle {
+                            // Free failed, region still live and unchanged.
+                            payload.verify(&h, bias, "fault dealloc err: retained");
+                            live.push((h.as_range(), payload));
+                        }
+                        // None → region lost/leaked; drop it.
+                    }
+                }
+            }
+            Operation::Check => {
+                let i = rng.random_range(0..live.len());
+                let (range, payload) = &live[i];
+                let s =
+                    unsafe { BStackOwnedSlice::from_raw_parts(&alloc, range.start(), range.len()) };
+                payload.verify(&s, bias, "fault: check");
+            }
+            Operation::Reopen => {}
+        }
+
+        let periodic = cfg.reopen_every > 0 && step > 0 && step % cfg.reopen_every == 0;
+        if faulted || periodic {
+            // Debug aid: when `BSTACK_SNAPSHOT_PATH` is set, copy the backing
+            // file just *before* recovery runs, overwriting each time. If the
+            // recovery scan then panics, the last snapshot is the exact
+            // pre-recovery image of the failure (its step is written to
+            // `<path>.step`) — feed it to a block walker to see which block's
+            // header/footer the crash left inconsistent.
+            if let Ok(snap) = std::env::var("BSTACK_SNAPSHOT_PATH") {
+                let _ = std::fs::copy(&path, &snap);
+                let _ = std::fs::write(format!("{snap}.step"), format!("{step}"));
+            }
+            alloc = reopen_and_verify(alloc, &make, &live, bias, &format!("reopen@{step}"));
+        }
+    }
+
+    // Final integrity pass.
+    let _alloc = reopen_and_verify(alloc, &make, &live, bias, "final");
+}
+
+macro_rules! fault_suite {
+    ($mod_name:ident, $make:expr, $salt:expr) => {
+        mod $mod_name {
+            use super::*;
+            #[test]
+            fn fault_fuzz() {
+                super::run_fault_fuzz($make, $salt);
+            }
+        }
+    };
+}
+
+fault_suite!(first_fit, make_allocator!(FirstFitBStackAllocator), 0x1111);
+fault_suite!(
+    ghost_tree,
+    make_allocator!(GhostTreeBstackAllocator),
+    0x2222
+);
+fault_suite!(slab_16, make_allocator!(SlabBStackAllocator, 16), 0x3333);
+fault_suite!(slab_64, make_allocator!(SlabBStackAllocator, 64), 0x4444);
+fault_suite!(
+    check_slab_16,
+    make_allocator!(CheckedSlabBStackAllocator, 16),
+    0x5555
+);
+fault_suite!(
+    check_slab_64,
+    make_allocator!(CheckedSlabBStackAllocator, 64),
+    0x6666
+);
+fault_suite!(
+    segregated,
+    make_allocator!(SegregatedBStackAllocator),
+    0x7777
+);

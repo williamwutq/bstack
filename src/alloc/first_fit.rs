@@ -2068,7 +2068,7 @@ mod fault_tests {
     use super::FirstFitBStackAllocator;
     use crate::BStack;
     use crate::alloc::{BStackAllocator, BStackInPlaceResizeAllocator};
-    use crate::alloc_test_common::{Guard, policies::FailOpAt, temp_path};
+    use crate::alloc_fuzz::common::{Guard, policies::FailOpAt, temp_path};
     use crate::fault::FaultPolicy;
     use std::io::ErrorKind;
     use std::sync::Arc;
