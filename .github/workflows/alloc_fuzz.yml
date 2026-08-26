@@ -3,10 +3,10 @@ name: Alloc Fuzz
 on:
   push:
     branches: [ master ]
-    paths: [ src/alloc/**, src/alloc_fuzz_tests.rs, src/alloc_fault_tests.rs, src/alloc_test_common.rs, src/fault.rs ]
+    paths: [ src/alloc/**, src/alloc_fuzz/**, src/fault.rs ]
   pull_request:
     branches: [ master ]
-    paths: [ src/alloc/**, src/alloc_fuzz_tests.rs, src/alloc_fault_tests.rs, src/alloc_test_common.rs, src/fault.rs ]
+    paths: [ src/alloc/**, src/alloc_fuzz/**, src/fault.rs ]
 
 permissions:
   contents: read
@@ -18,11 +18,14 @@ jobs:
     - uses: actions/checkout@v4
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
+    # Happy-path suites (init + uninit); under "set alloc" the fault modules are
+    # not compiled, so `alloc_fuzz` selects exactly the two happy-path suites.
     - name: Fuzz tests
-      run: cargo test --features "set alloc" -- alloc_fuzz_tests
+      run: cargo test --features "set alloc" -- alloc_fuzz
     - name: Fuzz tests (release)
-      run: cargo test --release --features "set alloc" -- alloc_fuzz_tests
+      run: cargo test --release --features "set alloc" -- alloc_fuzz
+    # Fault-injection suites (init_fault + uninit_fault) only.
     - name: Fault fuzz
-      run: cargo test --features "set alloc fault-injection" -- alloc_fault_tests
+      run: cargo test --features "set alloc fault-injection" -- alloc_fuzz::init_fault alloc_fuzz::uninit_fault
     - name: Fault fuzz (atomic)
-      run: cargo test --features "set alloc atomic fault-injection" -- alloc_fault_tests
+      run: cargo test --features "set alloc atomic fault-injection" -- alloc_fuzz::init_fault alloc_fuzz::uninit_fault
