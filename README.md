@@ -1042,12 +1042,12 @@ allocated, and asserting the exact-position guarantee in debug builds.
 
 Built on the trait:
 
-| Method                              | Feature         | Description                                                             |
-|-------------------------------------|-----------------|-------------------------------------------------------------------------|
-| `try_subslice_inplace(start, end)`  | `alloc`         | Narrow to `[start, end)` in place; propagates `Unsupported`             |
-| `try_subslice(start, end)`          | `set + atomic`  | Same, with an `alloc` + copy + `dealloc` fallback — never `Unsupported` |
-| `try_join_inplace(other)`           | `set + atomic`  | Concatenate `self ++ other`, extending one side in place                |
-| `try_join(other)`                   | `set + atomic`  | Same, with a fresh-allocation copy fallback — never `Unsupported`       |
+| Method                             | Feature        | Description                                                             |
+|------------------------------------|----------------|-------------------------------------------------------------------------|
+| `try_subslice_inplace(start, end)` | `alloc`        | Narrow to `[start, end)` in place; propagates `Unsupported`             |
+| `try_subslice(start, end)`         | `set + atomic` | Same, with an `alloc` + copy + `dealloc` fallback — never `Unsupported` |
+| `try_join_inplace(other)`          | `set + atomic` | Concatenate `self ++ other`, extending one side in place                |
+| `try_join(other)`                  | `set + atomic` | Same, with a fresh-allocation copy fallback — never `Unsupported`       |
 
 `try_subslice_inplace` copies nothing, so it needs only the resize trait and is
 available under `alloc` alone; the copying paths need the crash-atomic copy and
@@ -1131,25 +1131,34 @@ Obtained from `BStackSlice::chunks(chunk_len)` / `BStackSlice::rchunks(chunk_len
 
 Also constructible directly, without splitting off a remainder, via `BStackChunk::from_raw_parts(stack, offset, len, chunk_len)` (`unsafe`, mirrors `BStackSlice::from_raw_parts`), `BStackChunk::from_raw_slice(aligned, chunk_len)` (`unsafe`, wraps an existing `BStackSlice` as-is), or `BStackChunk::from_slice(aligned, chunk_len)` (safe, returns `None` unless `chunk_len` is nonzero and evenly divides `aligned.len()`). All three require the slice to already be exactly chunk-aligned — unlike `chunks`/`rchunks`, there is no remainder.
 
-| Method                                                                                              | Description                                                                                                              |
-|-----------------------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------|
-| `chunk_len()` / `chunk_count()` / `len()` / `is_empty()`                                            | Stride, chunk count, and total aligned byte length                                                                       |
-| `same_stride(other)`                                                                                | Whether the two views use the same `chunk_len`                                                                           |
-| `same_phase(other)`                                                                                 | Same stride *and* aligned-region start offsets congruent mod `chunk_len`                                                 |
-| `adjacent_to(other)`                                                                                | Same-phase and the aligned regions touch end-to-end with no gap — `false` unless `same_phase`                            |
-| `overlaps(other)`                                                                                   | Same-phase and the aligned regions share at least one byte — `false` unless `same_phase`                                 |
-| `merge(other)`                                                                                      | `Some` union if the views `overlaps`, or if either is empty and they `same_stride`; `None` otherwise                     |
-| `merge_adjacent(other)`                                                                             | `Some` union if `same_stride` and the regions are adjacent and non-empty, thus also `same_phase`; `None` otherwise       |
-| `get(index)`                                                                                        | The chunk at `index` as a `BStackSlice`, or `None` — O(1), no I/O                                                        |
-| `as_slice()` / `into_slice()`                                                                       | The whole aligned region as a plain `BStackSlice` — by clone, or by consuming `self`                                     |
-| `to_owned_in(alloc)` / `to_owned_uninit_in(alloc)` *(features `set` + `atomic`)*                    | Copy the aligned region into a fresh owned `BStackOwnedSlice`; re-chunk it with `from_slice`; `_uninit` skips zero-fill  |
-| `with_stride(new_stride)`                                                                           | Consume `self`, re-dividing the aligned region with a different stride — `(BStackChunk, BStackSlice)`, same as `chunks`  |
-| `iter()` / `IntoIterator`                                                                           | A lazy `BStackChunkIter` (see below); usable directly in a `for` loop, by value or `&view`                               |
-| `binary_search_by(cmp)` / `binary_search_by_key(target, key)`                                       | Binary search over already-ordered chunks — O(log n) chunk reads, never the whole region.                                |
-| `sort_by(cmp)` / `sort_by_key(key)` *(features `set` + `atomic`)*                                   | Stable sort of whole chunks by their bytes/a key. One `BStack::process` call                                             |
-| `sort_partial_by(cmp)` / `sort_partial_by_key(key)` *(features `set` + `atomic`)*                   | Bounded-memory out-of-core in-place merge sort for regions too large for `sort_by`; per-step crash-atomic, re-runnable   |
-| `select_nth_by(n, cmp)` / `select_nth_by_key(n, key)` *(features `set` + `atomic`)*                 | Partition so chunk `n` lands where a full sort would place it (`[T]::select_nth_unstable_by`); single-operation atomic   |
-| `select_nth_partial_by(n, cmp)` / `select_nth_partial_by_key(n, key)` *(features `set` + `atomic`)* | Bounded-memory out-of-core quickselect for regions too large for `select_nth_by`; per-step crash-atomic, re-runnable     |
+| Method                                                                                              | Description                                                                                                             |
+|-----------------------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------|
+| `chunk_len()` / `chunk_count()` / `len()` / `is_empty()`                                            | Stride, chunk count, and total aligned byte length                                                                      |
+| `same_stride(other)`                                                                                | Whether the two views use the same `chunk_len`                                                                          |
+| `same_phase(other)`                                                                                 | Same stride *and* aligned-region start offsets congruent mod `chunk_len`                                                |
+| `adjacent_to(other)`                                                                                | Same-phase and the aligned regions touch end-to-end with no gap — `false` unless `same_phase`                           |
+| `overlaps(other)`                                                                                   | Same-phase and the aligned regions share at least one byte — `false` unless `same_phase`                                |
+| `merge(other)`                                                                                      | `Some` union if the views `overlaps`, or if either is empty and they `same_stride`; `None` otherwise                    |
+| `merge_adjacent(other)`                                                                             | `Some` union if `same_stride` and the regions are adjacent and non-empty, thus also `same_phase`; `None` otherwise      |
+| `get(index)`                                                                                        | The chunk at `index` as a `BStackSlice`, or `None` — O(1), no I/O                                                       |
+| `first()` / `last()`                                                                                | The first/last chunk as a `BStackSlice`, or `None` if empty — O(1), no I/O                                              |
+| `as_slice()` / `into_slice()`                                                                       | The whole aligned region as a plain `BStackSlice` — by clone, or by consuming `self`                                    |
+| `to_owned_in(alloc)` / `to_owned_uninit_in(alloc)` *(features `set` + `atomic`)*                    | Copy the aligned region into a fresh owned `BStackOwnedSlice`; re-chunk it with `from_slice`; `_uninit` skips zero-fill |
+| `with_stride(new_stride)`                                                                           | Consume `self`, re-dividing the aligned region with a different stride — `(BStackChunk, BStackSlice)`, same as `chunks` |
+| `split_at(mid)`                                                                                     | `(BStackChunk, BStackChunk)` split at chunk index `mid` — no I/O, same stride/phase as `self`                           |
+| `iter()` / `IntoIterator`                                                                           | A lazy `BStackChunkIter` (see below); usable directly in a `for` loop, by value or `&view`                              |
+| `swap(i, j)` *(features `set` + `atomic`)*                                                          | Swap the chunks at `i` and `j` — one `BStack::cross_exchange` call; `i == j` is a no-op                                 |
+| `reverse()` *(features `set` + `atomic`)*                                                           | Reverse chunk order in place — one `BStack::process` call; bytes within each chunk are untouched                        |
+| `rotate_left(k)` / `rotate_right(k)` *(features `set` + `atomic`)*                                  | Rotate chunks in place by `k` positions — one `BStack::process` call over `k * chunk_len()` bytes                       |
+| `fill(chunk)` *(feature `set`)*                                                                     | Fill every chunk with a copy of `chunk` — one `BStack::repeat` call; `chunk.len()` must equal `chunk_len()`             |
+| `set(index, bytes)` *(feature `set`)*                                                               | Overwrite the chunk at `index` with `bytes` — delegates to `get(index)` + `BStackSlice::copy_from_slice`                |
+| `binary_search_by(cmp)` / `binary_search_by_key(target, key)`                                       | Binary search over already-ordered chunks — always atomic; O(log n) probes via `get_batched_gen` with `atomic`, else one bulk `get` |
+| `partition_point(pred)`                                                                             | Index of the first chunk `pred` rejects, over an already-partitioned view — same atomicity split as `binary_search_by`  |
+| `is_sorted_by(cmp)`                                                                                 | Whether every chunk compares `<=` the one after it, per `cmp` — one `BStack::get` call, atomic, no bounded-memory variant |
+| `sort_by(cmp)` / `sort_by_key(key)` *(features `set` + `atomic`)*                                   | Stable sort of whole chunks by their bytes/a key. One `BStack::process` call                                            |
+| `sort_partial_by(cmp)` / `sort_partial_by_key(key)` *(features `set` + `atomic`)*                   | Bounded-memory out-of-core in-place merge sort for regions too large for `sort_by`; per-step crash-atomic, re-runnable  |
+| `select_nth_by(n, cmp)` / `select_nth_by_key(n, key)` *(features `set` + `atomic`)*                 | Partition so chunk `n` lands where a full sort would place it (`[T]::select_nth_unstable_by`); single-operation atomic  |
+| `select_nth_partial_by(n, cmp)` / `select_nth_partial_by_key(n, key)` *(features `set` + `atomic`)* | Bounded-memory out-of-core quickselect for regions too large for `select_nth_by`; per-step crash-atomic, re-runnable    |
 
 > See [`algos/SORTSELECT.md`](algos/SORTSELECT.md) for the sort/select model, the out-of-core merge-sort algorithm behind `sort_partial_by`, its convergence and crash guarantees, and an unsound block-merge shortcut to avoid.
 

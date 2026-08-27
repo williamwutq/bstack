@@ -4721,6 +4721,302 @@ mod alloc_tests {
         assert_selected(&got, 2, &sorted);
     }
 
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn chunk_swap_exchanges_two_chunks() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut s = alloc.alloc(6).unwrap(); // 3 records of 2 bytes
+        s.as_slice_mut().write([1u8, 1, 2, 2, 3, 3]).unwrap();
+        let (mut view, _rem) = s.as_slice().chunks(2);
+        view.swap(0, 2).unwrap();
+        assert_eq!(s.as_slice().read().unwrap(), [3, 3, 2, 2, 1, 1]);
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn chunk_swap_same_index_is_noop() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut s = alloc.alloc(4).unwrap();
+        s.as_slice_mut().write([1u8, 2, 3, 4]).unwrap();
+        let (mut view, _rem) = s.as_slice().chunks(2);
+        view.swap(1, 1).unwrap();
+        assert_eq!(s.as_slice().read().unwrap(), [1, 2, 3, 4]);
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    #[should_panic(expected = "swap: i must be < chunk_count")]
+    fn chunk_swap_out_of_bounds_panics() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(4).unwrap();
+        let (mut view, _rem) = s.as_slice().chunks(2);
+        view.swap(2, 0).unwrap();
+    }
+
+    // Whole records move as units; the (key, tag) pairing within each record
+    // is preserved rather than the bytes themselves being reversed.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn chunk_reverse_reverses_chunk_order() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut s = alloc.alloc(8).unwrap(); // 4 records of 2 bytes: [key, tag]
+        s.as_slice_mut()
+            .write([1u8, b'a', 2, b'b', 3, b'c', 4, b'd'])
+            .unwrap();
+        let (mut view, _rem) = s.as_slice().chunks(2);
+        view.reverse().unwrap();
+        assert_eq!(
+            s.as_slice().read().unwrap(),
+            [4, b'd', 3, b'c', 2, b'b', 1, b'a']
+        );
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn chunk_reverse_odd_chunk_count_leaves_middle_in_place() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut s = alloc.alloc(5).unwrap();
+        s.as_slice_mut().write([1u8, 2, 3, 4, 5]).unwrap();
+        let (mut view, _rem) = s.as_slice().chunks(1);
+        view.reverse().unwrap();
+        assert_eq!(s.as_slice().read().unwrap(), [5, 4, 3, 2, 1]);
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn chunk_rotate_left_moves_chunks_to_front() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut s = alloc.alloc(8).unwrap(); // 4 records of 2 bytes
+        s.as_slice_mut()
+            .write([1u8, b'a', 2, b'b', 3, b'c', 4, b'd'])
+            .unwrap();
+        let (mut view, _rem) = s.as_slice().chunks(2);
+        view.rotate_left(1).unwrap();
+        assert_eq!(
+            s.as_slice().read().unwrap(),
+            [2, b'b', 3, b'c', 4, b'd', 1, b'a']
+        );
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn chunk_rotate_right_moves_chunks_to_back() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut s = alloc.alloc(8).unwrap();
+        s.as_slice_mut()
+            .write([1u8, b'a', 2, b'b', 3, b'c', 4, b'd'])
+            .unwrap();
+        let (mut view, _rem) = s.as_slice().chunks(2);
+        view.rotate_right(1).unwrap();
+        assert_eq!(
+            s.as_slice().read().unwrap(),
+            [4, b'd', 1, b'a', 2, b'b', 3, b'c']
+        );
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    #[should_panic(expected = "rotate_left: k must be <= chunk_count")]
+    fn chunk_rotate_left_panics_when_k_exceeds_count() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(4).unwrap();
+        let (mut view, _rem) = s.as_slice().chunks(2);
+        view.rotate_left(3).unwrap();
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn chunk_fill_repeats_pattern_across_all_chunks() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut s = alloc.alloc(10).unwrap(); // 3 records of 3 bytes + 1 remainder byte
+        s.as_slice_mut()
+            .write([0u8, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF])
+            .unwrap();
+        let (mut view, _rem) = s.as_slice().chunks(3);
+        view.fill(&[7, 8, 9]).unwrap();
+        assert_eq!(
+            s.as_slice().read().unwrap(),
+            [7, 8, 9, 7, 8, 9, 7, 8, 9, 0xFF]
+        );
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    #[should_panic(expected = "fill: chunk length must equal chunk_len")]
+    fn chunk_fill_panics_on_length_mismatch() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(6).unwrap();
+        let (mut view, _rem) = s.as_slice().chunks(3);
+        view.fill(&[1, 2]).unwrap();
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn chunk_set_overwrites_one_chunk() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut s = alloc.alloc(6).unwrap(); // 3 records of 2 bytes
+        s.as_slice_mut().write([1u8, 1, 2, 2, 3, 3]).unwrap();
+        let (mut view, _rem) = s.as_slice().chunks(2);
+        view.set(1, &[9, 9]).unwrap();
+        assert_eq!(s.as_slice().read().unwrap(), [1, 1, 9, 9, 3, 3]);
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    #[should_panic(expected = "set: index must be < chunk_count")]
+    fn chunk_set_out_of_bounds_panics() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(4).unwrap();
+        let (mut view, _rem) = s.as_slice().chunks(2);
+        view.set(2, &[1, 2]).unwrap();
+    }
+
+    // ---- BStackChunk: read-side companions (first/last/split_at/etc.) -------
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn chunk_first_and_last() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut s = alloc.alloc(6).unwrap();
+        s.as_slice_mut().write([1u8, 1, 2, 2, 3, 3]).unwrap();
+        let (view, _rem) = s.as_slice().chunks(2);
+        assert_eq!(view.first().unwrap().read().unwrap(), [1, 1]);
+        assert_eq!(view.last().unwrap().read().unwrap(), [3, 3]);
+    }
+
+    #[test]
+    fn chunk_first_and_last_empty_view() {
+        let (alloc, _path) = mk_alloc();
+        let view = BStackChunk::from_slice(BStackSlice::empty(alloc.stack()), 4).unwrap();
+        assert!(view.first().is_none());
+        assert!(view.last().is_none());
+    }
+
+    #[test]
+    fn chunk_split_at_divides_view() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(10).unwrap(); // 3 records of 3 bytes + 1 remainder byte
+        let (view, _rem) = s.as_slice().chunks(3);
+        let (left, right) = view.split_at(1);
+        assert_eq!(left.chunk_count(), 1);
+        assert_eq!(left.chunk_len(), 3);
+        assert_eq!(right.chunk_count(), 2);
+        assert_eq!(right.chunk_len(), 3);
+        assert_eq!(left.as_slice().range(), 0..3);
+        assert_eq!(right.as_slice().range(), 3..9);
+    }
+
+    // mid == 0 and mid == chunk_count() are the two boundary splits: one side
+    // of the result is empty but both sides stay valid, phase-matching views.
+    #[test]
+    fn chunk_split_at_boundary_mid_yields_one_empty_side() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(9).unwrap();
+        let (view, _rem) = s.as_slice().chunks(3);
+
+        let (left, right) = view.split_at(0);
+        assert!(left.is_empty());
+        assert_eq!(left.chunk_len(), 3);
+        assert_eq!(right, view);
+
+        let (left, right) = view.split_at(3);
+        assert_eq!(left, view);
+        assert!(right.is_empty());
+        assert_eq!(right.chunk_len(), 3);
+    }
+
+    // Splitting an already-empty view is only legal at mid == 0 (its only
+    // valid chunk_count()), and yields two more empty views at the same
+    // phase as the original — mirrors `[].split_at(0) == (&[], &[])`.
+    #[test]
+    fn chunk_split_at_empty_view_returns_two_empty_chunks() {
+        let (alloc, _path) = mk_alloc();
+        let view = BStackChunk::from_slice(BStackSlice::empty(alloc.stack()), 4).unwrap();
+        let (left, right) = view.split_at(0);
+        assert!(left.is_empty());
+        assert!(right.is_empty());
+        assert_eq!(left, view);
+        assert_eq!(right, view);
+    }
+
+    #[test]
+    #[should_panic(expected = "split_at: mid must be <= chunk_count")]
+    fn chunk_split_at_out_of_bounds_panics() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(6).unwrap();
+        let (view, _rem) = s.as_slice().chunks(2);
+        let _ = view.split_at(4);
+    }
+
+    // Runs under both the atomic (get_batched_gen) and non-atomic (plain
+    // reads) implementations, exercising whichever features select.
+    #[cfg(feature = "set")]
+    #[test]
+    fn chunk_partition_point_finds_boundary() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut s = alloc.alloc(5).unwrap();
+        s.as_slice_mut().write([1u8, 2, 3, 7, 9]).unwrap();
+        let (view, _rem) = s.as_slice().chunks(1);
+        let idx = view.partition_point(|c| c[0] < 5).unwrap();
+        assert_eq!(idx, 3);
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn chunk_partition_point_boundary_cases() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut s = alloc.alloc(4).unwrap();
+        s.as_slice_mut().write([1u8, 2, 3, 4]).unwrap();
+        let (view, _rem) = s.as_slice().chunks(1);
+        assert_eq!(view.partition_point(|_| true).unwrap(), 4);
+        assert_eq!(view.partition_point(|_| false).unwrap(), 0);
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn chunk_is_sorted_by_true_and_false() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut s = alloc.alloc(4).unwrap();
+        s.as_slice_mut().write([1u8, 2, 3, 4]).unwrap();
+        let (view, _rem) = s.as_slice().chunks(1);
+        assert!(view.is_sorted_by(|a, b| a[0].cmp(&b[0])).unwrap());
+
+        let mut s2 = alloc.alloc(4).unwrap();
+        s2.as_slice_mut().write([1u8, 3, 2, 4]).unwrap();
+        let (view2, _rem2) = s2.as_slice().chunks(1);
+        assert!(!view2.is_sorted_by(|a, b| a[0].cmp(&b[0])).unwrap());
+    }
+
+    #[test]
+    fn chunk_is_sorted_by_trivial_for_short_views() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(2).unwrap();
+        let (view, _rem) = s.as_slice().chunks(2); // 1 chunk
+        assert!(view.is_sorted_by(|a, b| a.cmp(b)).unwrap());
+        let (empty_view, _rem2) = s.as_slice().subslice(0, 0).chunks(2);
+        assert!(empty_view.is_sorted_by(|a, b| a.cmp(b)).unwrap());
+    }
+
     // ── Foreign handles ───────────────────────────────────────────────────
 
     #[test]

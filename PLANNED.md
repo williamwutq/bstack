@@ -365,29 +365,6 @@ pub fn replace_with<F: FnOnce(&mut [u8])>(&self, f: F) -> io::Result<()>;
 
 ---
 
-## Mutation APIs on `BStackChunk`
-
-**Feature flag:** `alloc` + `set` + `atomic`.
-**Breaking change:** No — new inherent methods.
-
-### Motivation
-
-`BStackChunk` has no public mutation method at all: the only `set`-gated entries are `sort_*` and `select_nth_*`. Per-chunk *content* edits already work by way of `get(i)`, which yields a `BStackSlice` carrying the full byte-level ergonomics. What is missing is anything at chunk granularity — the permutations and fills that treat a chunk as the unit.
-
-### Design
-
-- `swap(i, j)` — one `BStack::cross_exchange(a, b, chunk_len)`.
-- `reverse()`, `rotate_left(k)`, `rotate_right(k)` — chunk-granularity, one `BStack::process` over the aligned region, same shape and same crash-atomicity as `sort_by`.
-- `fill(chunk: &[u8])` — one `BStack::repeat` over the aligned region, so it commits through the O(1)-staging `Repeat` journal mode. `chunk.len()` must equal `chunk_len`. `repeat` has no uses in `chunk.rs` today.
-- `set(i, bytes)` — delegates to `get(i)` plus `copy_from_slice`; included for symmetry with `get`.
-- Read-side companions needing no new primitive and no `set`: `first`/`last`, `partition_point`, `is_sorted_by`, and a chunk-granularity `split_at`.
-
-### Open questions
-
-- **Out-of-core variants.** `reverse`/`rotate_*` via `process` materialise the whole aligned region, inheriting `sort_by`'s memory profile rather than `sort_partial_by`'s. Bounded-memory counterparts are a natural follow-on but should not gate the first version.
-
----
-
 ## `SegregatedBStackAllocator` background coalescer
 
 **Feature flag:** `alloc` + `set`; the merge splices require `atomic`.

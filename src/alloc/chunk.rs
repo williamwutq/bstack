@@ -1,13 +1,16 @@
 //! Fixed-stride chunked view over a [`BStackSlice`].
 //!
-//! Requires feature `alloc`. Sorting and selection additionally require
-//! `set` + `atomic`; construction, iteration, and binary search need no flag
-//! beyond `alloc`.
+//! Requires feature `alloc`. Sorting, selection, and mutation additionally
+//! require `set` (+ `atomic` for the permutation ops); binary search,
+//! `partition_point`, construction, iteration, `first`/
+//! `last`, `split_at`, and `is_sorted_by` need no flag beyond `alloc`.
 
 #[cfg(all(feature = "set", feature = "atomic"))]
 use super::BStackOwnedSliceAllocator;
 use super::{BStackAllocator, BStackOwnedSlice, BStackSlice};
 use crate::BStack;
+#[cfg(feature = "atomic")]
+use crate::bstack_unsafe_reborrow_mut;
 use std::cmp::Ordering;
 use std::fmt;
 use std::hash::{Hash, Hasher};
@@ -376,6 +379,37 @@ impl<'a> BStackChunk<'a> {
         self.aligned.chunks(new_stride)
     }
 
+    /// Split into two chunk-granularity sub-views at chunk index `mid`: the
+    /// first holds chunks `[0, mid)`, the second holds `[mid,
+    /// chunk_count())`. Both share this view's stride and phase.
+    ///
+    /// No I/O — pure offset arithmetic, as cheap as
+    /// [`with_stride`](Self::with_stride).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `mid > self.chunk_count()`.
+    #[inline]
+    #[must_use]
+    #[track_caller]
+    pub fn split_at(&self, mid: u64) -> (BStackChunk<'a>, BStackChunk<'a>) {
+        assert!(
+            mid <= self.chunk_count(),
+            "split_at: mid must be <= chunk_count"
+        );
+        let (left, right) = self.aligned.split_at(mid * self.chunk_len);
+        (
+            BStackChunk {
+                aligned: left,
+                chunk_len: self.chunk_len,
+            },
+            BStackChunk {
+                aligned: right,
+                chunk_len: self.chunk_len,
+            },
+        )
+    }
+
     /// Return the underlying [`BStack`].
     #[inline]
     #[must_use]
@@ -396,6 +430,28 @@ impl<'a> BStackChunk<'a> {
         Some(self.aligned.subslice(start, start + self.chunk_len))
     }
 
+    /// The first chunk, or `None` if the view is empty.
+    ///
+    /// O(1), pure offset arithmetic — no I/O. Equivalent to `self.get(0)`.
+    #[inline]
+    #[must_use]
+    pub fn first(&self) -> Option<BStackSlice<'a>> {
+        self.get(0)
+    }
+
+    /// The last chunk, or `None` if the view is empty.
+    ///
+    /// O(1), pure offset arithmetic — no I/O.
+    #[inline]
+    #[must_use]
+    pub fn last(&self) -> Option<BStackSlice<'a>> {
+        let count = self.chunk_count();
+        if count == 0 {
+            return None;
+        }
+        self.get(count - 1)
+    }
+
     /// Create a lazy iterator over the chunks of this view.
     ///
     /// This clones the view; the iterator and `self` are independent. See
@@ -407,6 +463,156 @@ impl<'a> BStackChunk<'a> {
             remaining: self.aligned.clone(),
             chunk_len: self.chunk_len,
         }
+    }
+
+    /// Swap the chunks at `i` and `j`.
+    ///
+    /// A single crash-atomic [`BStack::cross_exchange`] call: after a crash
+    /// the two chunks hold either their original contents or the fully
+    /// swapped contents, never a half-swap. `i == j` is a valid no-op.
+    ///
+    /// Requires the `set` and `atomic` features.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `i >= self.chunk_count()` or `j >= self.chunk_count()`.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[track_caller]
+    pub fn swap(&mut self, i: u64, j: u64) -> io::Result<()> {
+        let count = self.chunk_count();
+        assert!(i < count, "swap: i must be < chunk_count");
+        assert!(j < count, "swap: j must be < chunk_count");
+        if i == j {
+            return Ok(());
+        }
+        let start = self.aligned.start();
+        self.aligned.stack().cross_exchange(
+            start + i * self.chunk_len,
+            start + j * self.chunk_len,
+            self.chunk_len,
+        )
+    }
+
+    /// Reverse the order of the chunks in place.
+    ///
+    /// Chunk-granularity: whole chunks change position, but the bytes within
+    /// each chunk are untouched. A single crash-atomic [`BStack::process`]
+    /// call, same shape and same atomicity as [`sort_by`](Self::sort_by): a
+    /// crash leaves either the pre-reverse order or the fully-reversed order,
+    /// never an intermediate permutation.
+    ///
+    /// Requires the `set` and `atomic` features.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[inline]
+    pub fn reverse(&mut self) -> io::Result<()> {
+        let chunk_len = self.chunk_len as usize;
+        let start = self.aligned.start();
+        let end = self.aligned.end();
+        self.aligned.stack().process(start, end, |buf| {
+            reverse_chunks(buf, chunk_len);
+        })
+    }
+
+    /// Rotate the chunks in place such that the chunk currently at index
+    /// `k` becomes the first chunk.
+    ///
+    /// Chunk-granularity: equivalent to rotating the underlying bytes left
+    /// by `k * chunk_len()` bytes, which — since that offset always falls on
+    /// a chunk boundary — permutes whole chunks without disturbing the bytes
+    /// within any of them. A single crash-atomic [`BStack::process`] call,
+    /// same shape and same atomicity as [`sort_by`](Self::sort_by).
+    ///
+    /// Requires the `set` and `atomic` features.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `k > self.chunk_count()`.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[track_caller]
+    pub fn rotate_left(&mut self, k: u64) -> io::Result<()> {
+        assert!(
+            k <= self.chunk_count(),
+            "rotate_left: k must be <= chunk_count"
+        );
+        let mid = (k * self.chunk_len) as usize;
+        let start = self.aligned.start();
+        let end = self.aligned.end();
+        self.aligned
+            .stack()
+            .process(start, end, |buf| buf.rotate_left(mid))
+    }
+
+    /// Rotate the chunks in place such that the last `k` chunks move to the
+    /// front.
+    ///
+    /// Chunk-granularity companion to [`rotate_left`](Self::rotate_left); see
+    /// there for the byte/chunk-boundary argument and the atomicity
+    /// guarantee.
+    ///
+    /// Requires the `set` and `atomic` features.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `k > self.chunk_count()`.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[track_caller]
+    pub fn rotate_right(&mut self, k: u64) -> io::Result<()> {
+        assert!(
+            k <= self.chunk_count(),
+            "rotate_right: k must be <= chunk_count"
+        );
+        let mid = (k * self.chunk_len) as usize;
+        let start = self.aligned.start();
+        let end = self.aligned.end();
+        self.aligned
+            .stack()
+            .process(start, end, |buf| buf.rotate_right(mid))
+    }
+
+    /// Fill every chunk in the view with a copy of `chunk`.
+    ///
+    /// A single crash-atomic [`BStack::repeat`] call: only `chunk` and the
+    /// chunk count are journaled, not the whole region, so a crash-safe fill
+    /// of a large view costs a fixed-size journal rather than one
+    /// proportional to the view.
+    ///
+    /// Requires the `set` feature.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `chunk.len() != self.chunk_len()`.
+    #[cfg(feature = "set")]
+    #[inline]
+    #[track_caller]
+    pub fn fill(&mut self, chunk: &[u8]) -> io::Result<()> {
+        assert_eq!(
+            chunk.len() as u64,
+            self.chunk_len,
+            "fill: chunk length must equal chunk_len"
+        );
+        let count = self.chunk_count();
+        self.aligned
+            .stack()
+            .repeat(self.aligned.start(), chunk, count)
+    }
+
+    /// Overwrite the chunk at `index` with `bytes`.
+    ///
+    /// Delegates to [`get`](Self::get) plus
+    /// [`BStackSlice::copy_from_slice`] — included for symmetry with `get`.
+    ///
+    /// Requires the `set` feature.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index >= self.chunk_count()`, or if `bytes.len()` does not
+    /// equal `self.chunk_len()` (via `copy_from_slice`).
+    #[cfg(feature = "set")]
+    #[inline]
+    #[track_caller]
+    pub fn set(&mut self, index: u64, bytes: &[u8]) -> io::Result<()> {
+        let mut chunk = self.get(index).expect("set: index must be < chunk_count");
+        chunk.copy_from_slice(bytes)
     }
 
     /// Sort chunks in place by `cmp`, comparing each chunk's raw bytes.
@@ -459,13 +665,22 @@ impl<'a> BStackChunk<'a> {
     ///
     /// Reads only the probed chunks — O(log n) chunk reads, never the whole
     /// region — into one reused buffer (stack-allocated for `chunk_len <=
-    /// INLINE_SCRATCH_LEN`), not a fresh allocation per probe. No feature
-    /// flag beyond `alloc`: read-only.
+    /// INLINE_SCRATCH_LEN`), not a fresh allocation per probe.
+    ///
+    /// Atomic as a whole: every probe runs inside one
+    /// [`BStack::get_batched_gen`] sequence, held under a single lock for
+    /// the entire search (a shared read lock on Unix/Windows, so concurrent
+    /// *readers* still proceed in parallel; only a concurrent write is
+    /// excluded). No `set`/`swap`/`sort_by`/etc. on this region can land
+    /// mid-search, so every probe sees the same consistent snapshot.
+    ///
+    /// Requires the `atomic` feature.
     ///
     /// Returns `Ok(Ok(index))` naming a matching chunk, or `Ok(Err(index))`
     /// with the index a matching chunk would need to be inserted at to keep
     /// the chunks ordered. `Err` propagates an I/O failure from probing a
     /// chunk.
+    #[cfg(feature = "atomic")]
     pub fn binary_search_by(
         &self,
         mut cmp: impl FnMut(&[u8]) -> Ordering,
@@ -480,16 +695,84 @@ impl<'a> BStackChunk<'a> {
             &mut heap[..]
         };
 
+        let start = self.aligned.start();
+        let chunk_len_u64 = self.chunk_len;
+        let mut size = self.chunk_count();
+        let mut left = 0u64;
+        let mut mid = 0u64;
+        let mut half = 0u64;
+        // Whether `buf` holds an unprocessed result from the previous probe.
+        let mut pending = false;
+        let mut outcome: Option<Result<u64, u64>> = None;
+
+        self.aligned.stack().get_batched_gen(|| {
+            if pending {
+                pending = false;
+                match cmp(buf) {
+                    Ordering::Less => {
+                        left = mid + 1;
+                        size -= half + 1;
+                    }
+                    Ordering::Greater => size = half,
+                    Ordering::Equal => {
+                        outcome = Some(Ok(mid));
+                        return None;
+                    }
+                }
+            }
+            if size == 0 {
+                outcome = Some(Err(left));
+                return None;
+            }
+            half = size / 2;
+            mid = left + half;
+            pending = true;
+            Some((
+                start + mid * chunk_len_u64,
+                bstack_unsafe_reborrow_mut!(&mut *buf),
+            ))
+        })?;
+
+        Ok(outcome.expect("binary_search_by: get_batched_gen always resolves before ending"))
+    }
+
+    /// Binary search for a chunk matching `cmp`, over chunks already ordered
+    /// by the same comparator (caller's responsibility, as with `std`).
+    ///
+    /// `cmp` should return [`Ordering::Less`] if the probed chunk sorts
+    /// before the target, [`Ordering::Greater`] if after, and
+    /// [`Ordering::Equal`] on a match — the same convention as
+    /// `[T]::binary_search_by`.
+    ///
+    /// Reads the whole aligned region in a single [`BStack::get`] call — one
+    /// lock acquisition, so the search is atomic as a whole against
+    /// concurrent mutation, on the same terms as [`is_sorted_by`](Self::is_sorted_by)
+    /// — then searches in memory. No feature flag beyond `alloc`: read-only.
+    /// Unlike the `atomic`-feature version of this method, this trades the
+    /// O(log n) chunk-read bound for O(n) memory (the whole region is
+    /// materialized once) in exchange for not needing `atomic`; enabling
+    /// that feature switches to the bounded-memory alternative, which stays
+    /// equally atomic via a different mechanism (a held lock across
+    /// individual probes rather than one bulk read).
+    ///
+    /// Returns `Ok(Ok(index))` naming a matching chunk, or `Ok(Err(index))`
+    /// with the index a matching chunk would need to be inserted at to keep
+    /// the chunks ordered. `Err` propagates an I/O failure from reading the
+    /// region.
+    #[cfg(not(feature = "atomic"))]
+    pub fn binary_search_by(
+        &self,
+        mut cmp: impl FnMut(&[u8]) -> Ordering,
+    ) -> io::Result<Result<u64, u64>> {
+        let chunk_len = self.chunk_len as usize;
+        let buf = self.aligned.read()?;
         let mut size = self.chunk_count();
         let mut left = 0u64;
         while size > 0 {
             let half = size / 2;
             let mid = left + half;
-            let chunk = self
-                .get(mid)
-                .expect("binary_search_by: mid computed within bounds");
-            chunk.read_into(buf)?;
-            match cmp(buf) {
+            let s = (mid as usize) * chunk_len;
+            match cmp(&buf[s..s + chunk_len]) {
                 Ordering::Less => {
                     left = mid + 1;
                     size -= half + 1;
@@ -502,7 +785,9 @@ impl<'a> BStackChunk<'a> {
     }
 
     /// Binary search for `target` by a key extracted from each probed
-    /// chunk's bytes. See [`binary_search_by`](Self::binary_search_by).
+    /// chunk's bytes. See [`binary_search_by`](Self::binary_search_by) —
+    /// atomic either way, via one of two mechanisms depending on whether
+    /// the `atomic` feature is enabled.
     #[inline]
     pub fn binary_search_by_key<K: Ord>(
         &self,
@@ -510,6 +795,128 @@ impl<'a> BStackChunk<'a> {
         mut key: impl FnMut(&[u8]) -> K,
     ) -> io::Result<Result<u64, u64>> {
         self.binary_search_by(|bytes| key(bytes).cmp(target))
+    }
+
+    /// Return the index of the first chunk for which `pred` returns `false`,
+    /// assuming the view is already partitioned by `pred` — every chunk
+    /// `pred` accepts sorts before every chunk it rejects (caller's
+    /// responsibility, as with `std`). Mirrors `[T]::partition_point`.
+    ///
+    /// Reads only the probed chunks — O(log n) chunk reads, never the whole
+    /// region — into one reused buffer (stack-allocated for `chunk_len <=
+    /// INLINE_SCRATCH_LEN`), not a fresh allocation per probe.
+    ///
+    /// Atomic as a whole, on the same terms as the `atomic`-feature
+    /// [`binary_search_by`](Self::binary_search_by) — one
+    /// [`BStack::get_batched_gen`] sequence under a single lock for the
+    /// whole search. This variant requires the `atomic` feature; without
+    /// it, an equally atomic bulk-read fallback with the same signature is
+    /// used instead, at the cost of O(n) instead of O(log n) memory.
+    ///
+    /// `Err` propagates an I/O failure from probing a chunk.
+    #[cfg(feature = "atomic")]
+    pub fn partition_point(&self, mut pred: impl FnMut(&[u8]) -> bool) -> io::Result<u64> {
+        let chunk_len = self.chunk_len as usize;
+        let mut inline = [0u8; INLINE_SCRATCH_LEN];
+        let mut heap;
+        let buf: &mut [u8] = if chunk_len <= INLINE_SCRATCH_LEN {
+            &mut inline[..chunk_len]
+        } else {
+            heap = vec![0u8; chunk_len];
+            &mut heap[..]
+        };
+
+        let start = self.aligned.start();
+        let chunk_len_u64 = self.chunk_len;
+        let mut size = self.chunk_count();
+        let mut left = 0u64;
+        let mut mid = 0u64;
+        let mut half = 0u64;
+        let mut pending = false;
+
+        self.aligned.stack().get_batched_gen(|| {
+            if pending {
+                pending = false;
+                if pred(buf) {
+                    left = mid + 1;
+                    size -= half + 1;
+                } else {
+                    size = half;
+                }
+            }
+            if size == 0 {
+                return None;
+            }
+            half = size / 2;
+            mid = left + half;
+            pending = true;
+            Some((
+                start + mid * chunk_len_u64,
+                bstack_unsafe_reborrow_mut!(&mut *buf),
+            ))
+        })?;
+        Ok(left)
+    }
+
+    /// Return the index of the first chunk for which `pred` returns `false`,
+    /// assuming the view is already partitioned by `pred` — every chunk
+    /// `pred` accepts sorts before every chunk it rejects (caller's
+    /// responsibility, as with `std`). Mirrors `[T]::partition_point`.
+    ///
+    /// Reads the whole aligned region in a single [`BStack::get`] call — one
+    /// lock acquisition, so the search is atomic as a whole against
+    /// concurrent mutation, on the same terms as [`is_sorted_by`](Self::is_sorted_by)
+    /// — then searches in memory. No feature flag beyond `alloc`: read-only.
+    /// Unlike the `atomic`-feature version of this method, this trades the
+    /// O(log n) chunk-read bound for O(n) memory (the whole region is
+    /// materialized once) in exchange for not needing `atomic`.
+    ///
+    /// `Err` propagates an I/O failure from reading the region.
+    #[cfg(not(feature = "atomic"))]
+    pub fn partition_point(&self, mut pred: impl FnMut(&[u8]) -> bool) -> io::Result<u64> {
+        let chunk_len = self.chunk_len as usize;
+        let buf = self.aligned.read()?;
+        let mut size = self.chunk_count();
+        let mut left = 0u64;
+        while size > 0 {
+            let half = size / 2;
+            let mid = left + half;
+            let s = (mid as usize) * chunk_len;
+            if pred(&buf[s..s + chunk_len]) {
+                left = mid + 1;
+                size -= half + 1;
+            } else {
+                size = half;
+            }
+        }
+        Ok(left)
+    }
+
+    /// Returns `true` if every chunk compares `<=` the chunk after it, per
+    /// `cmp` — i.e. the view is already sorted by `cmp`.
+    ///
+    /// Reads the whole aligned region in a single [`BStack::get`] call — one
+    /// lock acquisition, so the scan is atomic as a whole against concurrent
+    /// mutation — then compares chunks pairwise in memory. No feature flag
+    /// beyond `alloc`: read-only. Unlike the O(log n)-probe searches above,
+    /// this already visits every chunk, so materializing the region once
+    /// costs no more I/O than reading it piecewise would, and buys the
+    /// atomicity for free; unlike [`sort_partial_by`](Self::sort_partial_by),
+    /// there is no bounded-memory counterpart for regions too large for one
+    /// buffer.
+    ///
+    /// `Err` propagates an I/O failure from reading the region.
+    pub fn is_sorted_by(&self, mut cmp: impl FnMut(&[u8], &[u8]) -> Ordering) -> io::Result<bool> {
+        let count = self.chunk_count();
+        if count < 2 {
+            return Ok(true);
+        }
+        let chunk_len = self.chunk_len as usize;
+        let buf = self.aligned.read()?;
+        Ok(buf
+            .chunks_exact(chunk_len)
+            .zip(buf.chunks_exact(chunk_len).skip(1))
+            .all(|(a, b)| cmp(a, b) != Ordering::Greater))
     }
 
     /// Partition chunks in place so the chunk at `n` is in the position it
@@ -746,9 +1153,30 @@ fn sort_chunks_by(buf: &mut [u8], chunk_len: usize, cmp: &mut dyn FnMut(&[u8], &
     apply_chunk_permutation(buf, chunk_len, &order);
 }
 
+/// Reverse the order of `buf`'s `chunk_len`-byte records in place, in a
+/// single pass of whole-record swaps — no scratch allocation beyond what
+/// [`slice::swap_with_slice`] needs internally.
+#[cfg(all(feature = "set", feature = "atomic"))]
+fn reverse_chunks(buf: &mut [u8], chunk_len: usize) {
+    let count = buf.len() / chunk_len;
+    for i in 0..count / 2 {
+        let j = count - 1 - i;
+        let (left, right) = buf.split_at_mut(j * chunk_len);
+        left[i * chunk_len..(i + 1) * chunk_len].swap_with_slice(&mut right[..chunk_len]);
+    }
+}
+
 /// Chunk-sized scratch buffers up to this many bytes live on the stack;
 /// larger ones fall back to a single heap allocation. Covers the common case
 /// (short fixed-width records) without allocating at all.
+///
+/// Every user of this constant requires `atomic` — the `atomic`-feature
+/// `binary_search_by`/`partition_point` (via `get_batched_gen`) and
+/// `apply_chunk_permutation`/`sort_chunks_by` (via `set` + `atomic`) — so
+/// the constant itself is dead code without it; the `not(atomic)` versions
+/// of `binary_search_by`/`partition_point` read the whole region at once
+/// instead of probing chunk-sized buffers.
+#[cfg(feature = "atomic")]
 const INLINE_SCRATCH_LEN: usize = 128;
 
 /// Reorder `buf`'s `chunk_len`-byte records so record `order[dest]` ends up

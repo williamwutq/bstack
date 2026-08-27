@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`BStackChunk` mutation APIs (`alloc` + `set`, `atomic` additionally for the permutation ops), Rust only.** `swap(i, j)` exchanges two chunks via one crash-atomic `BStack::cross_exchange`. `reverse()` reverses chunk order and `rotate_left(k)`/`rotate_right(k)` rotate by `k` chunk positions, both chunk-granularity (the bytes within each chunk are untouched) via one crash-atomic `BStack::process`, same shape as `sort_by`. `fill(chunk)` fills every chunk with a copy of `chunk` via one crash-atomic `BStack::repeat` (O(1) journal staging regardless of region size); panics if `chunk.len() != chunk_len()`. `set(index, bytes)` overwrites one chunk, delegating to `get(index)` + `BStackSlice::copy_from_slice`.
+- **`BStackChunk` read-side companions: `first`/`last`, `split_at`, `partition_point` (`alloc`, read-only).** `first()`/`last()` are O(1) `get(0)`/`get(chunk_count() - 1)`. `split_at(mid)` divides a view into two chunk-granularity sub-views with no I/O, mirroring `with_stride`. `partition_point(pred)` mirrors `[T]::partition_point`, atomic against concurrent mutation either way: O(log n) probes under one `BStack::get_batched_gen` lock with the `atomic` feature, or one whole-region `BStack::get` read without it.
+- **`BStackChunk::is_sorted_by(cmp)` (`alloc`, read-only), Rust only.** Whether every chunk compares `<=` the one after it, via one `BStack::get` call over the whole aligned region followed by an in-memory pairwise scan — atomic as a single lock acquisition, at the cost of no bounded-memory counterpart (unlike `sort_partial_by`) for regions too large for one buffer.
+
+### Fixed
+
+- **`BStackChunk::binary_search_by`/`binary_search_by_key`/`partition_point` were not atomic: each probe took and released its own lock, so a concurrent `swap`/`sort_by`/`set`/etc. could land between probes and the search could observe a composite of several different points in time.** With the `atomic` feature, the probe sequence now runs inside one `BStack::get_batched_gen` call under a single lock for the whole search. Without `atomic`, these methods now read the whole region in one `BStack::get` call and search in memory instead, trading their O(log n) memory bound for atomicity. Their runtime is still O(log n), unchanged.
+
 ## [0.4.3] - 2026-08-27
 
 ### Added
