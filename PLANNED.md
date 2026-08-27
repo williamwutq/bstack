@@ -121,38 +121,6 @@ Reasons:
 
 ---
 
-## `.dealloc()`/`.realloc(new_len)` on `BStackOwnedSlice<'a, A: BStackOwnedSliceAllocator>`
-
-**Feature flag:** `alloc`.
-**Breaking change:** No — new inherent methods, gated behind the `BStackOwnedSliceAllocator` bound.
-
-### Motivation
-
-Freeing or resizing an owned handle today requires the caller to separately hold the allocator and call `allocator.dealloc(handle)`/`allocator.realloc(handle, new_len)`. This is unavoidable in general (see the NOT PLANNED entry above), but under `BStackOwnedSliceAllocator` — the bound `try_clone`/`try_clone_uninit` already use — the handle carries `A::Error = io::Error` and its own `allocator()`, so `dealloc`/`realloc` can be forwarded as inherent methods on the handle itself.
-
-### Design
-
-```rust
-impl<'a, A: BStackOwnedSliceAllocator> BStackOwnedSlice<'a, A> {
-    pub fn dealloc(self) -> Result<(), BStackAllocError<'a, A>> {
-        self.allocator().dealloc(self)
-    }
-
-    pub fn realloc(self, new_len: u64) -> Result<Self, BStackAllocError<'a, A>> {
-        let allocator = self.allocator();
-        allocator.realloc(self, new_len)
-    }
-}
-```
-
-Both are pure forwarding: `allocator()` returns `&'a A`, independent of `&self`, so it can be read before `self` is consumed by the call. No new behavior, error type, or crash-consistency class is introduced — each method has exactly the semantics of `BStackAllocator::dealloc`/`realloc` on the handle's own allocator.
-
-### Open questions
-
-- **Necessity.** The allocator is already at hand wherever a `BStackOwnedSlice` was obtained (it was needed to call `alloc`/`realloc` in the first place), so the caller can always reach `allocator.dealloc(handle)` directly. Whether the convenience of dropping that extra reference at call sites justifies the added inherent-method surface on `BStackOwnedSlice` is not yet decided.
-
----
-
 ## `BStackTransaction` — a buffered, crash-atomic transaction object (0.5.0)
 
 **Feature flag:** `transaction` (implies `set` + `atomic`) for the public API. The recovery path in `io_core` is ungated, like all recovery.
