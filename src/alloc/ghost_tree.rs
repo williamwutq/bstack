@@ -28,6 +28,15 @@ const ARENA_START: u64 = 48;
 /// Minimum allocation size — exactly the size of one AVL node.
 const MIN_ALLOC: u64 = 32;
 
+/// Largest length [`GhostTreeBstackAllocator::align_up_len`] will round up.
+///
+/// Anything larger is rejected as [`io::ErrorKind::InvalidInput`] rather than
+/// wrapped. Unchecked, `len + 31` wraps a near-`u64::MAX` request down to a
+/// 32-byte block, which `alloc` would hand back as a handle claiming the
+/// original length, and which `realloc` would carry into the tail-shrink path
+/// as an underflowed padding size.
+const MAX_ALLOC: u64 = (u64::MAX - ARENA_START) & !31;
+
 /// Null / absent pointer sentinel stored in AVL node child fields.
 const NULL_PTR: u64 = 0;
 
@@ -343,9 +352,16 @@ impl GhostTreeBstackAllocator {
     }
 
     /// Round `len` up to the next multiple of 32, with a floor of [`MIN_ALLOC`].
+    ///
+    /// Returns `None` if `len` exceeds [`MAX_ALLOC`], i.e. if the round-up
+    /// would overflow `u64`; every caller turns that into
+    /// [`io::ErrorKind::InvalidInput`].
     #[inline]
-    fn align_up_len(len: u64) -> u64 {
-        ((len + 31) & !31).max(MIN_ALLOC)
+    fn align_up_len(len: u64) -> Option<u64> {
+        if len > MAX_ALLOC {
+            return None;
+        }
+        Some(((len + 31) & !31).max(MIN_ALLOC))
     }
 
     /// Return the stored height of the subtree rooted at `ptr` (0 for [`NULL_PTR`]).
@@ -862,7 +878,12 @@ impl GhostTreeBstackAllocator {
         if len == 0 {
             return Ok(BStackOwnedSlice::empty(self));
         }
-        let aligned = Self::align_up_len(len);
+        let aligned = Self::align_up_len(len).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "alloc: length exceeds the maximum allocatable size",
+            )
+        })?;
         {
             #[cfg(feature = "atomic")]
             let guard = self.lock.lock().unwrap();
@@ -948,8 +969,23 @@ impl GhostTreeBstackAllocator {
             return Ok(BStackOwnedSlice::empty(self));
         }
         // Re-align to recover the true underlying block sizes.
-        let aligned_old = Self::align_up_len(old_len);
-        let aligned_new = Self::align_up_len(new_len);
+        let (aligned_old, aligned_new) =
+            match (Self::align_up_len(old_len), Self::align_up_len(new_len)) {
+                (Some(old), Some(new)) => (old, new),
+                _ => {
+                    return Err(BStackAllocError {
+                        source: io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "realloc: length exceeds the maximum allocatable size",
+                        ),
+                        // SAFETY: (start, old_len) is exactly what the caller
+                        // passed in; the block has not been touched.
+                        handle: Some(unsafe {
+                            BStackOwnedSlice::from_raw_parts(self, start, old_len)
+                        }),
+                    });
+                }
+            };
 
         // In-place resize paths. Most failures here leave the original block
         // intact at (start, old_len); `Some(_)` means the resize was handled,
@@ -1194,8 +1230,14 @@ impl GhostTreeBstackAllocator {
                     "realloc_inplace: front trim misaligned to carve in place",
                 ));
             }
-            let aligned_old = Self::align_up_len(old_len);
-            let retained = Self::align_up_len(new_len); // >= MIN_ALLOC
+            let too_long = || {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "realloc_inplace: length exceeds the maximum allocatable size",
+                )
+            };
+            let aligned_old = Self::align_up_len(old_len).ok_or_else(too_long)?;
+            let retained = Self::align_up_len(new_len).ok_or_else(too_long)?; // >= MIN_ALLOC
             let new_start = start + pf;
             let back_start = new_start + retained;
             // Back residue. `pf`, `retained`, `aligned_old` are MIN_ALLOC
@@ -1434,7 +1476,12 @@ impl BStackAllocator for GhostTreeBstackAllocator {
                 ));
             }
             let ptr = slice.start();
-            let true_len = Self::align_up_len(slice.len());
+            let true_len = Self::align_up_len(slice.len()).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "dealloc: slice length exceeds the maximum allocatable size",
+                )
+            })?;
 
             // Atomic fast path: discard the tail block without taking the lock.
             // try_discard succeeds only if the stack size is still ptr + true_len,
@@ -1541,8 +1588,20 @@ impl BStackBulkAllocator for GhostTreeBstackAllocator {
 
         let aligned: Vec<u64> = lengths
             .iter()
-            .map(|&l| if l == 0 { 0 } else { Self::align_up_len(l) })
-            .collect();
+            .map(|&l| {
+                if l == 0 {
+                    Some(0)
+                } else {
+                    Self::align_up_len(l)
+                }
+            })
+            .collect::<Option<Vec<u64>>>()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "alloc_bulk: length exceeds the maximum allocatable size",
+                )
+            })?;
 
         let total = aligned
             .iter()
@@ -1643,7 +1702,13 @@ impl BStackBulkAllocator for GhostTreeBstackAllocator {
                         "dealloc_bulk: invalid slice origin",
                     ));
                 }
-                entries.push((s.start(), Self::align_up_len(s.len())));
+                let true_len = Self::align_up_len(s.len()).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "dealloc_bulk: slice length exceeds the maximum allocatable size",
+                    )
+                })?;
+                entries.push((s.start(), true_len));
             }
 
             if entries.is_empty() {
@@ -2062,6 +2127,62 @@ mod tests {
         alloc.dealloc(s2).unwrap();
         alloc.dealloc(r).unwrap();
         alloc.dealloc(anchor).unwrap();
+    }
+
+    // A length that cannot be rounded up to a 32-byte multiple without
+    // overflowing `u64` is rejected up front. Unchecked, `len + 31` wrapped a
+    // near-`u64::MAX` request down to a 32-byte block and `alloc` returned a
+    // handle claiming the original length.
+    #[test]
+    fn alloc_rejects_unalignable_length() {
+        let (alloc, path) = open_fresh();
+        let _g = Guard(path);
+        for len in [MAX_ALLOC + 1, u64::MAX - 5, u64::MAX] {
+            let err = alloc.alloc(len).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "len {len}");
+        }
+        // The allocator is untouched and still works.
+        let s = alloc.alloc(64).unwrap();
+        alloc.dealloc(s).unwrap();
+    }
+
+    // `MAX_ALLOC` is the exact boundary, not a rounded-down guess: it is
+    // 32-aligned so it rounds up to itself, and it leaves room for a block at
+    // `ARENA_START`. One byte more does not.
+    #[test]
+    fn max_alloc_is_the_exact_alignment_boundary() {
+        assert_eq!(MAX_ALLOC % MIN_ALLOC, 0);
+        assert!(ARENA_START.checked_add(MAX_ALLOC).is_some());
+        assert_eq!(
+            GhostTreeBstackAllocator::align_up_len(MAX_ALLOC),
+            Some(MAX_ALLOC)
+        );
+        assert_eq!(GhostTreeBstackAllocator::align_up_len(MAX_ALLOC + 1), None);
+    }
+
+    // Same rejection on the realloc path, which reached it via the tail-shrink
+    // `process_gen`: the wrapped `aligned_new` made `aligned_new - new_len`
+    // underflow, panicking inside the closure while `process_gen` held the
+    // write lock — which poisoned the stack's `RwLock` and bricked the handle
+    // for every later call. The block is untouched, so the caller's handle
+    // comes back intact.
+    #[test]
+    fn realloc_rejects_unalignable_length() {
+        let (alloc, path) = open_fresh();
+        let _g = Guard(path);
+        let s = alloc.alloc(128).unwrap();
+        let start = s.start();
+        let stack_len = alloc.stack().len().unwrap();
+
+        let err = alloc.realloc(s, u64::MAX - 5).unwrap_err();
+        assert_eq!(err.source.kind(), io::ErrorKind::InvalidInput);
+        let handle = err.handle.expect("block untouched, handle returned");
+        assert_eq!(handle.start(), start);
+        assert_eq!(handle.len(), 128);
+
+        // The stack is still usable — the lock was never poisoned.
+        assert_eq!(alloc.stack().len().unwrap(), stack_len);
+        alloc.dealloc(handle).unwrap();
     }
 
     #[test]
