@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **`GhostTreeBstackAllocator` (Rust): a length too large to round up to a 32-byte multiple was accepted rather than rejected — `alloc` returned an oversized handle, and `realloc` poisoned the stack's lock.** `align_up_len` computed `(len + 31) & !31` unchecked, so any `len > u64::MAX - 31` wrapped and a near-`u64::MAX` request rounded *down* to a 32-byte block. `alloc` then handed back a handle claiming the requested length over 32 bytes of backing. `realloc` saw `aligned_new < aligned_old`, took the shrink path into the `atomic` tail-shrink `process_gen`, and underflowed `aligned_new - new_len` into an out-of-range slice index — panicking inside the generator closure while `process_gen` held the write lock, so the unwind poisoned the `BStack`'s `RwLock` and every subsequent call on that stack panicked. Debug builds trapped earlier on the overflowing add, making the reachable damage release-only. `align_up_len` is now checked against a new `MAX_ALLOC` — `(u64::MAX - ARENA_START) & !31`, bounded by the arena rather than by `u64` alone, since a block at the very first arena offset already overflows `ARENA_START + aligned` above that — and `alloc`, `alloc_bulk`, `realloc`, `realloc_inplace`, `dealloc`, and `dealloc_bulk` reject an unalignable length with `io::ErrorKind::InvalidInput`. On-disk format unchanged.
+
 ## [0.4.3] - 2026-08-27
 
 ### Added
