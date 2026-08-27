@@ -248,6 +248,83 @@ int bstack_slice_zero_range(bstack_slice_t s, uint64_t start, uint64_t n)
 #endif /* BSTACK_FEATURE_SET */
 
 /* =========================================================================
+ * bstack_slice_t — cross-region CAS and in-place transform
+ * (BSTACK_FEATURE_SET + BSTACK_FEATURE_ATOMIC)
+ * ====================================================================== */
+
+#if defined(BSTACK_FEATURE_SET) && defined(BSTACK_FEATURE_ATOMIC)
+
+int bstack_slice_cas_on(bstack_slice_t s, bstack_slice_t guard,
+                         const uint8_t *expected, size_t expected_len,
+                         const uint8_t *new_bytes, size_t new_bytes_len,
+                         uint8_t *old_buf, int *ok)
+{
+    if (slice_stack(s) != slice_stack(guard)) {
+        errno = EINVAL;
+        return -1;
+    }
+    if ((uint64_t)expected_len != guard.len ||
+        (uint64_t)new_bytes_len != s.len) {
+        errno = EINVAL;
+        return -1;
+    }
+    return bstack_eq_crds(slice_stack(s),
+                          guard.offset, expected, expected_len,
+                          s.offset, old_buf, new_bytes, new_bytes_len,
+                          ok);
+}
+
+int bstack_slice_cas_on_ne(bstack_slice_t s, bstack_slice_t guard,
+                            const uint8_t *expected, size_t expected_len,
+                            const uint8_t *new_bytes, size_t new_bytes_len,
+                            uint8_t *old_buf, int *ok)
+{
+    if (slice_stack(s) != slice_stack(guard)) {
+        errno = EINVAL;
+        return -1;
+    }
+    if ((uint64_t)expected_len != guard.len ||
+        (uint64_t)new_bytes_len != s.len) {
+        errno = EINVAL;
+        return -1;
+    }
+    return bstack_ne_crds(slice_stack(s),
+                          guard.offset, expected, expected_len,
+                          s.offset, old_buf, new_bytes, new_bytes_len,
+                          ok);
+}
+
+int bstack_slice_cas_on_masked(bstack_slice_t s, bstack_slice_t guard,
+                                const uint8_t *mask,
+                                const uint8_t *expected, size_t expected_len,
+                                const uint8_t *new_bytes, size_t new_bytes_len,
+                                uint8_t *old_buf, int *ok)
+{
+    if (slice_stack(s) != slice_stack(guard)) {
+        errno = EINVAL;
+        return -1;
+    }
+    if ((uint64_t)expected_len != guard.len ||
+        (uint64_t)new_bytes_len != s.len) {
+        errno = EINVAL;
+        return -1;
+    }
+    return bstack_masked_eq_crds(slice_stack(s),
+                                 guard.offset, mask, expected, expected_len,
+                                 s.offset, old_buf, new_bytes, new_bytes_len,
+                                 ok);
+}
+
+int bstack_slice_process(bstack_slice_t s,
+                          int (*cb)(uint8_t *buf, size_t len, void *ctx),
+                          void *ctx)
+{
+    return bstack_process(slice_stack(s), s.offset, s.offset + s.len, cb, ctx);
+}
+
+#endif /* BSTACK_FEATURE_SET && BSTACK_FEATURE_ATOMIC */
+
+/* =========================================================================
  * bstack_guarded_slice_t — I/O
  * ====================================================================== */
 

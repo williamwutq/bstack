@@ -23,6 +23,9 @@
  * linear_bstack_allocator_t — bump allocator; every operation maps to one call.
  *
  * Compile with -DBSTACK_FEATURE_SET to enable bstack_slice_write and friends.
+ * Both -DBSTACK_FEATURE_SET and -DBSTACK_FEATURE_ATOMIC together additionally
+ * enable bstack_slice_cas_on, bstack_slice_cas_on_ne, bstack_slice_cas_on_masked,
+ * and bstack_slice_process.
  */
 
 /* -------------------------------------------------------------------------
@@ -184,6 +187,80 @@ int bstack_slice_zero(bstack_slice_t s);
 BSTACK_WARN_UNUSED_RESULT
 int bstack_slice_zero_range(bstack_slice_t s, uint64_t start, uint64_t n);
 #endif /* BSTACK_FEATURE_SET */
+
+#if defined(BSTACK_FEATURE_SET) && defined(BSTACK_FEATURE_ATOMIC)
+/*
+ * Overwrite s with new_bytes if guard's current contents equal expected.
+ *
+ * One crash-atomic bstack_eq_crds call: guard's expected_len bytes are read
+ * and compared to expected, and if they match, s is overwritten with
+ * new_bytes_len bytes from new_bytes and its prior contents are written to
+ * old_buf, all under the same write lock.  *ok (if non-NULL) is set to 1 if
+ * the swap ran, 0 if the comparison failed (s left untouched).  old_buf must
+ * have room for s.len bytes unless s.len == 0, in which case it may be NULL.
+ *
+ * guard may be a view into the same or a different region of s's bstack,
+ * including s itself, but must be backed by the same bstack_t.
+ *
+ * Returns -1 with errno = EINVAL if guard and s are backed by different
+ * bstack_t instances, if expected_len != guard.len, or if new_bytes_len !=
+ * s.len.
+ *
+ * Requires -DBSTACK_FEATURE_SET and -DBSTACK_FEATURE_ATOMIC.
+ */
+BSTACK_WARN_UNUSED_RESULT
+int bstack_slice_cas_on(bstack_slice_t s, bstack_slice_t guard,
+                         const uint8_t *expected, size_t expected_len,
+                         const uint8_t *new_bytes, size_t new_bytes_len,
+                         uint8_t *old_buf, int *ok);
+
+/*
+ * Overwrite s with new_bytes if guard's current contents do NOT equal
+ * expected.
+ *
+ * Like bstack_slice_cas_on but wraps bstack_ne_crds: the swap runs when the
+ * comparison fails rather than when it succeeds.
+ *
+ * Requires -DBSTACK_FEATURE_SET and -DBSTACK_FEATURE_ATOMIC.
+ */
+BSTACK_WARN_UNUSED_RESULT
+int bstack_slice_cas_on_ne(bstack_slice_t s, bstack_slice_t guard,
+                            const uint8_t *expected, size_t expected_len,
+                            const uint8_t *new_bytes, size_t new_bytes_len,
+                            uint8_t *old_buf, int *ok);
+
+/*
+ * Overwrite s with new_bytes if guard's current contents equal expected
+ * under a bitwise mask.
+ *
+ * Like bstack_slice_cas_on but wraps bstack_masked_eq_crds: the condition is
+ * (guard[i] & mask[i]) == (expected[i] & mask[i]) for every byte i.  mask
+ * must have expected_len bytes.
+ *
+ * Requires -DBSTACK_FEATURE_SET and -DBSTACK_FEATURE_ATOMIC.
+ */
+BSTACK_WARN_UNUSED_RESULT
+int bstack_slice_cas_on_masked(bstack_slice_t s, bstack_slice_t guard,
+                                const uint8_t *mask,
+                                const uint8_t *expected, size_t expected_len,
+                                const uint8_t *new_bytes, size_t new_bytes_len,
+                                uint8_t *old_buf, int *ok);
+
+/*
+ * Run a length-preserving transform over the slice's bytes in place.
+ *
+ * One crash-atomic bstack_process call: the slice's bytes are read, handed
+ * to cb for in-place modification, then written back, all under the same
+ * write lock.  cb must not change the buffer's length — see bstack_process
+ * for the callback contract.
+ *
+ * Requires -DBSTACK_FEATURE_SET and -DBSTACK_FEATURE_ATOMIC.
+ */
+BSTACK_WARN_UNUSED_RESULT
+int bstack_slice_process(bstack_slice_t s,
+                          int (*cb)(uint8_t *buf, size_t len, void *ctx),
+                          void *ctx);
+#endif /* BSTACK_FEATURE_SET && BSTACK_FEATURE_ATOMIC */
 
 /* =========================================================================
  * bstack_guard_vtbl_t / bstack_guarded_slice_t
