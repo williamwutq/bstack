@@ -36,7 +36,7 @@ const SORT_BUDGET: u64 = SORT_WINDOWS * SORT_BLOCK_BYTES;
 /// Chunk-sized scratch buffers up to this many bytes live on the stack;
 /// larger ones fall back to a single heap allocation. Covers the common case
 /// (short fixed-width records) without allocating at all.
-#[cfg(feature = "atomic")]
+#[cfg(all(feature = "set", feature = "atomic"))]
 const INLINE_SCRATCH_LEN: usize = 128;
 
 /// Below this total region size in bytes, the `atomic`-feature
@@ -677,7 +677,7 @@ impl<'a> BStackChunk<'a> {
     ///
     /// Reads only the probed chunks — O(log n) chunk reads, never the whole
     /// region — into one reused buffer (stack-allocated for `chunk_len <=
-    /// INLINE_SCRATCH_LEN`), not a fresh allocation per probe. Below
+    /// BULK_READ_BUDGET`), not a fresh allocation per probe. Below
     /// [`BULK_READ_BUDGET`] total bytes, skips probing altogether and takes
     /// the `not(atomic)` path's own whole-region read instead.
     ///
@@ -700,27 +700,35 @@ impl<'a> BStackChunk<'a> {
     ) -> io::Result<Result<u64, u64>> {
         let chunk_len = self.chunk_len as usize;
 
-        let inline = &mut [0u8; BULK_READ_BUDGET];
-        let inline_ptr = inline.as_mut_ptr();
         if self.aligned.len() <= BULK_READ_BUDGET as u64 {
-            self.aligned.read_into(inline)?;
+            let mut inline = [0u8; BULK_READ_BUDGET];
+            self.aligned.read_into(&mut inline)?;
             return Ok(binary_search_in_memory(
-                inline,
+                &inline,
                 chunk_len,
                 self.chunk_count(),
                 &mut cmp,
             ));
         }
 
+        // `get_batched_gen` protects the generator for the whole call, so the
+        // generator must not *hold* a reference into either buffer — the
+        // `&mut [u8]` it hands back has to be the only live reference to those
+        // bytes while the read is in flight. It therefore captures raw
+        // pointers only (never a slice), and materializes a short-lived
+        // shared slice for `cmp` at the point of use. Each pointer is taken
+        // exactly once, and neither buffer is named again until the call
+        // returns.
+        let mut inline = [0u8; BULK_READ_BUDGET];
+        let inline_ptr = inline.as_mut_ptr();
         let mut heap;
-        let buf: &mut [u8] = if chunk_len <= BULK_READ_BUDGET {
-            &mut inline[..chunk_len]
+        let probe_ptr: *mut u8 = if chunk_len <= BULK_READ_BUDGET {
+            inline_ptr
         } else {
             heap = vec![0u8; chunk_len];
-            &mut heap
+            heap.as_mut_ptr()
         };
 
-        let buf_ptr = buf.as_mut_ptr();
         let start = self.aligned.start();
         let chunk_len_u64 = self.chunk_len;
         let mut size = self.chunk_count();
@@ -735,7 +743,12 @@ impl<'a> BStackChunk<'a> {
 
         self.aligned.stack().get_batched_gen(|| {
             if state == 1 {
-                match cmp(buf) {
+                // SAFETY: the previous probe read `chunk_len` bytes into
+                // `probe_ptr` and has completed, so the bytes are initialized
+                // and no other reference to them is live. The slice dies with
+                // the `cmp` call, before the next read is issued below.
+                let probe = unsafe { core::slice::from_raw_parts(probe_ptr, chunk_len) };
+                match cmp(probe) {
                     Ordering::Less => {
                         left = mid + 1;
                         size -= half + 1;
@@ -758,16 +771,18 @@ impl<'a> BStackChunk<'a> {
             let offset = if bulk { left } else { mid };
             Some((
                 start + offset * chunk_len_u64,
-                // SAFETY: Both inline and buf outlives the generator, and they are never
-                // used together
+                // SAFETY: both buffers outlive the generator, and this is the
+                // only live reference into the one it names — the shared
+                // slice handed to `cmp` above is already dead.
                 unsafe {
                     if bulk {
                         state = 2;
-                        // This as usize is safe because it is smaller or equal to BULK_READ_BUDGET
+                        // `bulk` established `rem_bytes <= BULK_READ_BUDGET`,
+                        // so the cast is lossless and the length fits `inline`.
                         core::slice::from_raw_parts_mut(inline_ptr, rem_bytes as usize)
                     } else {
                         state = 1;
-                        core::slice::from_raw_parts_mut(buf_ptr, chunk_len)
+                        core::slice::from_raw_parts_mut(probe_ptr, chunk_len)
                     }
                 },
             ))
@@ -780,16 +795,13 @@ impl<'a> BStackChunk<'a> {
         // Once the remaining window fits within the bulk-read budget, finish
         // the binary search entirely in memory.
         if state == 2 {
+            // SAFETY: the bulk read filled `size * chunk_len` bytes at
+            // `inline_ptr` (<= BULK_READ_BUDGET, so the cast is lossless), and
+            // every `&mut` handed to `get_batched_gen` died with that call.
+            let window =
+                unsafe { core::slice::from_raw_parts(inline_ptr, (size * chunk_len_u64) as usize) };
             return Ok(
-                match binary_search_in_memory(
-                    // SAFETY: we just read it
-                    unsafe {
-                        core::slice::from_raw_parts_mut(inline_ptr, (size * chunk_len_u64) as usize)
-                    },
-                    chunk_len,
-                    size,
-                    &mut cmp,
-                ) {
+                match binary_search_in_memory(window, chunk_len, size, &mut cmp) {
                     Ok(idx) => Ok(left + idx),
                     Err(idx) => Err(left + idx),
                 },
@@ -857,7 +869,7 @@ impl<'a> BStackChunk<'a> {
     ///
     /// Reads only the probed chunks — O(log n) chunk reads, never the whole
     /// region — into one reused buffer (stack-allocated for `chunk_len <=
-    /// INLINE_SCRATCH_LEN`), not a fresh allocation per probe. Below
+    /// BULK_READ_BUDGET`), not a fresh allocation per probe. Below
     /// [`BULK_READ_BUDGET`] total bytes, skips probing altogether and takes
     /// the `not(atomic)` path's own whole-region read instead.
     ///
@@ -874,27 +886,29 @@ impl<'a> BStackChunk<'a> {
     pub fn partition_point(&self, mut pred: impl FnMut(&[u8]) -> bool) -> io::Result<u64> {
         let chunk_len = self.chunk_len as usize;
 
-        let inline = &mut [0u8; BULK_READ_BUDGET];
-        let inline_ptr = inline.as_mut_ptr();
         if self.aligned.len() <= BULK_READ_BUDGET as u64 {
-            self.aligned.read_into(inline)?;
+            let mut inline = [0u8; BULK_READ_BUDGET];
+            self.aligned.read_into(&mut inline)?;
             return Ok(partition_point_in_memory(
-                inline,
+                &inline,
                 chunk_len,
                 self.chunk_count(),
                 &mut pred,
             ));
         }
 
+        // Raw pointers only in the generator, for the reason spelled out in
+        // the `atomic` [`binary_search_by`](Self::binary_search_by).
+        let mut inline = [0u8; BULK_READ_BUDGET];
+        let inline_ptr = inline.as_mut_ptr();
         let mut heap;
-        let buf: &mut [u8] = if chunk_len <= BULK_READ_BUDGET {
-            &mut inline[..chunk_len]
+        let probe_ptr: *mut u8 = if chunk_len <= BULK_READ_BUDGET {
+            inline_ptr
         } else {
             heap = vec![0u8; chunk_len];
-            &mut heap
+            heap.as_mut_ptr()
         };
 
-        let buf_ptr = buf.as_mut_ptr();
         let start = self.aligned.start();
         let chunk_len_u64 = self.chunk_len;
         let mut size = self.chunk_count();
@@ -905,7 +919,12 @@ impl<'a> BStackChunk<'a> {
 
         self.aligned.stack().get_batched_gen(|| {
             if state == 1 {
-                if pred(buf) {
+                // SAFETY: the previous probe read `chunk_len` bytes into
+                // `probe_ptr` and has completed, so the bytes are initialized
+                // and no other reference to them is live. The slice dies with
+                // the `pred` call, before the next read is issued below.
+                let probe = unsafe { core::slice::from_raw_parts(probe_ptr, chunk_len) };
+                if pred(probe) {
                     left = mid + 1;
                     size -= half + 1;
                 } else {
@@ -913,7 +932,7 @@ impl<'a> BStackChunk<'a> {
                 }
             }
             if size == 0 || state == 2 {
-                // Quit if there are nothing anymore or if we read within bulk
+                // Quit if there is nothing left or if we read within bulk.
                 return None;
             }
             half = size / 2;
@@ -923,16 +942,18 @@ impl<'a> BStackChunk<'a> {
             let offset = if bulk { left } else { mid };
             Some((
                 start + offset * chunk_len_u64,
-                // SAFETY: Both inline and buf outlives the generator, and they are never
-                // used together
+                // SAFETY: both buffers outlive the generator, and this is the
+                // only live reference into the one it names — the shared
+                // slice handed to `pred` above is already dead.
                 unsafe {
                     if bulk {
                         state = 2;
-                        // This as usize is safe because it is smaller or equal to BULK_READ_BUDGET
+                        // `bulk` established `rem_bytes <= BULK_READ_BUDGET`,
+                        // so the cast is lossless and the length fits `inline`.
                         core::slice::from_raw_parts_mut(inline_ptr, rem_bytes as usize)
                     } else {
                         state = 1;
-                        core::slice::from_raw_parts_mut(buf_ptr, chunk_len)
+                        core::slice::from_raw_parts_mut(probe_ptr, chunk_len)
                     }
                 },
             ))
@@ -942,15 +963,14 @@ impl<'a> BStackChunk<'a> {
             // Once the remaining window fits within the bulk-read budget, finish
             // the partition point search entirely in memory.
             + if state == 2 {
-                partition_point_in_memory(
-                    // SAFETY: we just read it
-                    unsafe {
-                        core::slice::from_raw_parts_mut(inline_ptr, (size * chunk_len_u64) as usize)
-                    },
-                    chunk_len,
-                    size,
-                    &mut pred,
-                )
+                // SAFETY: the bulk read filled `size * chunk_len` bytes at
+                // `inline_ptr` (<= BULK_READ_BUDGET, so the cast is lossless),
+                // and every `&mut` handed to `get_batched_gen` died with that
+                // call.
+                let window = unsafe {
+                    core::slice::from_raw_parts(inline_ptr, (size * chunk_len_u64) as usize)
+                };
+                partition_point_in_memory(window, chunk_len, size, &mut pred)
             } else {
                 0
             })
