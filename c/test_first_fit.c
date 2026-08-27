@@ -1106,6 +1106,303 @@ static int test_realloc_copy_move_cascade_reclaims_arena(void)
     ff_unlink(tmp); return 0;
 }
 
+/* =========================================================================
+ * bstack_slice_t: cas_on / cas_on_ne / cas_on_masked / process
+ * (BSTACK_FEATURE_SET + BSTACK_FEATURE_ATOMIC).  Allocator-agnostic; a
+ * first_fit allocator is just the simplest source of two live slices.
+ * ====================================================================== */
+
+static int test_slice_cas_on_match_swaps_and_returns_old(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    first_fit_bstack_allocator_t *a = first_fit_bstack_allocator_new(bs);
+    CHECK(a);
+
+    bstack_slice_t guard, target;
+    CHECK(bstack_allocator_alloc((bstack_allocator_t *)a, 2, &guard) == 0);
+    CHECK(bstack_allocator_alloc((bstack_allocator_t *)a, 2, &target) == 0);
+    uint8_t guard_buf[2] = {1, 2};
+    uint8_t target_buf[2] = {9, 9};
+    CHECK(bstack_slice_write(guard, guard_buf, 2) == 0);
+    CHECK(bstack_slice_write(target, target_buf, 2) == 0);
+
+    uint8_t expected[2] = {1, 2};
+    uint8_t new_bytes[2] = {3, 4};
+    uint8_t old_buf[2];
+    int ok = 0;
+    CHECK(bstack_slice_cas_on(target, guard, expected, 2, new_bytes, 2,
+                              old_buf, &ok) == 0);
+    CHECK(ok == 1);
+    CHECK(memcmp(old_buf, target_buf, 2) == 0);
+    uint8_t rbuf[2];
+    CHECK(bstack_slice_read(target, rbuf) == 0);
+    CHECK(memcmp(rbuf, new_bytes, 2) == 0);
+
+    bstack_close(first_fit_bstack_allocator_into_stack(a));
+    ff_unlink(tmp); return 0;
+}
+
+static int test_slice_cas_on_no_match_leaves_target_untouched(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    first_fit_bstack_allocator_t *a = first_fit_bstack_allocator_new(bs);
+    CHECK(a);
+
+    bstack_slice_t guard, target;
+    CHECK(bstack_allocator_alloc((bstack_allocator_t *)a, 2, &guard) == 0);
+    CHECK(bstack_allocator_alloc((bstack_allocator_t *)a, 2, &target) == 0);
+    uint8_t guard_buf[2] = {1, 2};
+    uint8_t target_buf[2] = {9, 9};
+    CHECK(bstack_slice_write(guard, guard_buf, 2) == 0);
+    CHECK(bstack_slice_write(target, target_buf, 2) == 0);
+
+    uint8_t expected[2] = {0, 0};
+    uint8_t new_bytes[2] = {3, 4};
+    uint8_t old_buf[2];
+    int ok = 1;
+    CHECK(bstack_slice_cas_on(target, guard, expected, 2, new_bytes, 2,
+                              old_buf, &ok) == 0);
+    CHECK(ok == 0);
+    uint8_t rbuf[2];
+    CHECK(bstack_slice_read(target, rbuf) == 0);
+    CHECK(memcmp(rbuf, target_buf, 2) == 0);
+
+    bstack_close(first_fit_bstack_allocator_into_stack(a));
+    ff_unlink(tmp); return 0;
+}
+
+static int test_slice_cas_on_expected_length_mismatch_errors(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    first_fit_bstack_allocator_t *a = first_fit_bstack_allocator_new(bs);
+    CHECK(a);
+
+    bstack_slice_t guard, target;
+    CHECK(bstack_allocator_alloc((bstack_allocator_t *)a, 2, &guard) == 0);
+    CHECK(bstack_allocator_alloc((bstack_allocator_t *)a, 2, &target) == 0);
+
+    uint8_t expected[1] = {0};
+    uint8_t new_bytes[2] = {3, 4};
+    uint8_t old_buf[2];
+    errno = 0;
+    CHECK(bstack_slice_cas_on(target, guard, expected, 1, new_bytes, 2,
+                              old_buf, NULL) == -1);
+    CHECK(errno == EINVAL);
+
+    bstack_close(first_fit_bstack_allocator_into_stack(a));
+    ff_unlink(tmp); return 0;
+}
+
+static int test_slice_cas_on_new_bytes_length_mismatch_errors(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    first_fit_bstack_allocator_t *a = first_fit_bstack_allocator_new(bs);
+    CHECK(a);
+
+    bstack_slice_t guard, target;
+    CHECK(bstack_allocator_alloc((bstack_allocator_t *)a, 2, &guard) == 0);
+    CHECK(bstack_allocator_alloc((bstack_allocator_t *)a, 2, &target) == 0);
+    uint8_t guard_buf[2] = {1, 2};
+    CHECK(bstack_slice_write(guard, guard_buf, 2) == 0);
+
+    uint8_t expected[2] = {1, 2};
+    uint8_t new_bytes[1] = {3};
+    uint8_t old_buf[2];
+    errno = 0;
+    CHECK(bstack_slice_cas_on(target, guard, expected, 2, new_bytes, 1,
+                              old_buf, NULL) == -1);
+    CHECK(errno == EINVAL);
+
+    bstack_close(first_fit_bstack_allocator_into_stack(a));
+    ff_unlink(tmp); return 0;
+}
+
+static int test_slice_cas_on_cross_stack_errors(void)
+{
+    char t1[64], t2[64];
+    make_tmp(t1, sizeof t1);
+    make_tmp(t2, sizeof t2);
+    bstack_t *b1 = bstack_open(t1); CHECK(b1);
+    bstack_t *b2 = bstack_open(t2); CHECK(b2);
+    first_fit_bstack_allocator_t *a1 = first_fit_bstack_allocator_new(b1); CHECK(a1);
+    first_fit_bstack_allocator_t *a2 = first_fit_bstack_allocator_new(b2); CHECK(a2);
+
+    bstack_slice_t guard, target;
+    CHECK(bstack_allocator_alloc((bstack_allocator_t *)a1, 2, &guard) == 0);
+    CHECK(bstack_allocator_alloc((bstack_allocator_t *)a2, 2, &target) == 0);
+
+    uint8_t expected[2] = {0, 0};
+    uint8_t new_bytes[2] = {1, 1};
+    uint8_t old_buf[2];
+    errno = 0;
+    CHECK(bstack_slice_cas_on(target, guard, expected, 2, new_bytes, 2,
+                              old_buf, NULL) == -1);
+    CHECK(errno == EINVAL);
+
+    bstack_close(first_fit_bstack_allocator_into_stack(a1));
+    bstack_close(first_fit_bstack_allocator_into_stack(a2));
+    ff_unlink(t1); ff_unlink(t2); return 0;
+}
+
+static int test_slice_cas_on_ne_no_match_swaps_and_returns_old(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    first_fit_bstack_allocator_t *a = first_fit_bstack_allocator_new(bs);
+    CHECK(a);
+
+    bstack_slice_t guard, target;
+    CHECK(bstack_allocator_alloc((bstack_allocator_t *)a, 2, &guard) == 0);
+    CHECK(bstack_allocator_alloc((bstack_allocator_t *)a, 2, &target) == 0);
+    uint8_t guard_buf[2] = {1, 2};
+    uint8_t target_buf[2] = {9, 9};
+    CHECK(bstack_slice_write(guard, guard_buf, 2) == 0);
+    CHECK(bstack_slice_write(target, target_buf, 2) == 0);
+
+    uint8_t expected[2] = {0, 0};
+    uint8_t new_bytes[2] = {3, 4};
+    uint8_t old_buf[2];
+    int ok = 0;
+    CHECK(bstack_slice_cas_on_ne(target, guard, expected, 2, new_bytes, 2,
+                                 old_buf, &ok) == 0);
+    CHECK(ok == 1);
+    CHECK(memcmp(old_buf, target_buf, 2) == 0);
+    uint8_t rbuf[2];
+    CHECK(bstack_slice_read(target, rbuf) == 0);
+    CHECK(memcmp(rbuf, new_bytes, 2) == 0);
+
+    bstack_close(first_fit_bstack_allocator_into_stack(a));
+    ff_unlink(tmp); return 0;
+}
+
+static int test_slice_cas_on_ne_match_returns_none(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    first_fit_bstack_allocator_t *a = first_fit_bstack_allocator_new(bs);
+    CHECK(a);
+
+    bstack_slice_t guard, target;
+    CHECK(bstack_allocator_alloc((bstack_allocator_t *)a, 2, &guard) == 0);
+    CHECK(bstack_allocator_alloc((bstack_allocator_t *)a, 2, &target) == 0);
+    uint8_t guard_buf[2] = {1, 2};
+    uint8_t target_buf[2] = {9, 9};
+    CHECK(bstack_slice_write(guard, guard_buf, 2) == 0);
+    CHECK(bstack_slice_write(target, target_buf, 2) == 0);
+
+    uint8_t expected[2] = {1, 2};
+    uint8_t new_bytes[2] = {3, 4};
+    uint8_t old_buf[2];
+    int ok = 1;
+    CHECK(bstack_slice_cas_on_ne(target, guard, expected, 2, new_bytes, 2,
+                                 old_buf, &ok) == 0);
+    CHECK(ok == 0);
+    uint8_t rbuf[2];
+    CHECK(bstack_slice_read(target, rbuf) == 0);
+    CHECK(memcmp(rbuf, target_buf, 2) == 0);
+
+    bstack_close(first_fit_bstack_allocator_into_stack(a));
+    ff_unlink(tmp); return 0;
+}
+
+static int test_slice_cas_on_masked_match_swaps_and_returns_old(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    first_fit_bstack_allocator_t *a = first_fit_bstack_allocator_new(bs);
+    CHECK(a);
+
+    bstack_slice_t guard, target;
+    CHECK(bstack_allocator_alloc((bstack_allocator_t *)a, 2, &guard) == 0);
+    CHECK(bstack_allocator_alloc((bstack_allocator_t *)a, 2, &target) == 0);
+    uint8_t guard_buf[2] = {0xff, 0x0f};
+    uint8_t target_buf[2] = {9, 9};
+    CHECK(bstack_slice_write(guard, guard_buf, 2) == 0);
+    CHECK(bstack_slice_write(target, target_buf, 2) == 0);
+
+    /* mask = [0xff, 0xf0]: masked guard = [0xff, 0x00],
+     * masked expected = [0xff, 0x00] -> match */
+    uint8_t mask[2] = {0xff, 0xf0};
+    uint8_t expected[2] = {0xff, 0x0f};
+    uint8_t new_bytes[2] = {3, 4};
+    uint8_t old_buf[2];
+    int ok = 0;
+    CHECK(bstack_slice_cas_on_masked(target, guard, mask, expected, 2,
+                                     new_bytes, 2, old_buf, &ok) == 0);
+    CHECK(ok == 1);
+    CHECK(memcmp(old_buf, target_buf, 2) == 0);
+    uint8_t rbuf[2];
+    CHECK(bstack_slice_read(target, rbuf) == 0);
+    CHECK(memcmp(rbuf, new_bytes, 2) == 0);
+
+    bstack_close(first_fit_bstack_allocator_into_stack(a));
+    ff_unlink(tmp); return 0;
+}
+
+static int test_slice_cas_on_masked_no_match_returns_none(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    first_fit_bstack_allocator_t *a = first_fit_bstack_allocator_new(bs);
+    CHECK(a);
+
+    bstack_slice_t guard, target;
+    CHECK(bstack_allocator_alloc((bstack_allocator_t *)a, 1, &guard) == 0);
+    CHECK(bstack_allocator_alloc((bstack_allocator_t *)a, 2, &target) == 0);
+    uint8_t guard_buf[1] = {0x0f};
+    uint8_t target_buf[2] = {9, 9};
+    CHECK(bstack_slice_write(guard, guard_buf, 1) == 0);
+    CHECK(bstack_slice_write(target, target_buf, 2) == 0);
+
+    uint8_t mask[1] = {0xff};
+    uint8_t expected[1] = {0xff};
+    uint8_t new_bytes[2] = {3, 4};
+    uint8_t old_buf[2];
+    int ok = 1;
+    CHECK(bstack_slice_cas_on_masked(target, guard, mask, expected, 1,
+                                     new_bytes, 2, old_buf, &ok) == 0);
+    CHECK(ok == 0);
+    uint8_t rbuf[2];
+    CHECK(bstack_slice_read(target, rbuf) == 0);
+    CHECK(memcmp(rbuf, target_buf, 2) == 0);
+
+    bstack_close(first_fit_bstack_allocator_into_stack(a));
+    ff_unlink(tmp); return 0;
+}
+
+static int double_bytes_cb(uint8_t *buf, size_t len, void *ctx)
+{
+    (void)ctx;
+    for (size_t i = 0; i < len; i++)
+        buf[i] = (uint8_t)(buf[i] * 2);
+    return 0;
+}
+
+static int test_slice_process_transforms_in_place(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    first_fit_bstack_allocator_t *a = first_fit_bstack_allocator_new(bs);
+    CHECK(a);
+
+    bstack_slice_t s;
+    CHECK(bstack_allocator_alloc((bstack_allocator_t *)a, 4, &s) == 0);
+    uint8_t wbuf[4] = {1, 2, 3, 4};
+    CHECK(bstack_slice_write(s, wbuf, 4) == 0);
+    CHECK(bstack_slice_process(s, double_bytes_cb, NULL) == 0);
+    uint8_t rbuf[4];
+    CHECK(bstack_slice_read(s, rbuf) == 0);
+    uint8_t expect[4] = {2, 4, 6, 8};
+    CHECK(memcmp(rbuf, expect, 4) == 0);
+
+    bstack_close(first_fit_bstack_allocator_into_stack(a));
+    ff_unlink(tmp); return 0;
+}
+
 #endif /* BSTACK_FEATURE_ATOMIC */
 
 /* A slice issued by one allocator instance must be refused by another: the
@@ -1194,6 +1491,18 @@ int main(void)
     T(test_dealloc_non_tail_cascade_reclaims_arena);
     T(test_realloc_copy_move_cascade_reclaims_arena);
     T(test_recovery_needed_already_set_rejects_mutation);
+
+    /* bstack_slice_t cas_on / cas_on_ne / cas_on_masked / process. */
+    T(test_slice_cas_on_match_swaps_and_returns_old);
+    T(test_slice_cas_on_no_match_leaves_target_untouched);
+    T(test_slice_cas_on_expected_length_mismatch_errors);
+    T(test_slice_cas_on_new_bytes_length_mismatch_errors);
+    T(test_slice_cas_on_cross_stack_errors);
+    T(test_slice_cas_on_ne_no_match_swaps_and_returns_old);
+    T(test_slice_cas_on_ne_match_returns_none);
+    T(test_slice_cas_on_masked_match_swaps_and_returns_old);
+    T(test_slice_cas_on_masked_no_match_returns_none);
+    T(test_slice_process_transforms_in_place);
 #endif
 
     T(test_foreign_slice_is_rejected);

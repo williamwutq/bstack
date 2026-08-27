@@ -3459,6 +3459,175 @@ mod alloc_tests {
         assert_eq!(s.read().unwrap(), [4, 5, 1, 2, 3]);
     }
 
+    // ---- BStackSlice: cas_on / cas_on_ne / cas_on_masked (features `set` + `atomic`) ----
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn slice_cas_on_match_swaps_and_returns_old() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut guard = alloc.alloc(2).unwrap();
+        guard.write([1u8, 2]).unwrap();
+        let mut target = alloc.alloc(2).unwrap();
+        target.write([9u8, 9]).unwrap();
+        let old = target
+            .as_slice_mut()
+            .cas_on(&guard.as_slice(), [1u8, 2], [3u8, 4])
+            .unwrap();
+        assert_eq!(old, Some(vec![9, 9]));
+        assert_eq!(target.read().unwrap(), [3, 4]);
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn slice_cas_on_no_match_leaves_target_untouched() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut guard = alloc.alloc(2).unwrap();
+        guard.write([1u8, 2]).unwrap();
+        let mut target = alloc.alloc(2).unwrap();
+        target.write([9u8, 9]).unwrap();
+        let result = target
+            .as_slice_mut()
+            .cas_on(&guard.as_slice(), [0u8, 0], [3u8, 4])
+            .unwrap();
+        assert_eq!(result, None);
+        assert_eq!(target.read().unwrap(), [9, 9]);
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn slice_cas_on_expected_length_mismatch_errors() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let guard = alloc.alloc(2).unwrap();
+        let mut target = alloc.alloc(2).unwrap();
+        let err = target
+            .as_slice_mut()
+            .cas_on(&guard.as_slice(), [0u8], [3u8, 4])
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn slice_cas_on_new_bytes_length_mismatch_errors() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut guard = alloc.alloc(2).unwrap();
+        guard.write([1u8, 2]).unwrap();
+        let mut target = alloc.alloc(2).unwrap();
+        let err = target
+            .as_slice_mut()
+            .cas_on(&guard.as_slice(), [1u8, 2], [3u8])
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn slice_cas_on_cross_stack_errors() {
+        let (alloc_a, path_a) = mk_alloc();
+        let _g_a = Guard(path_a);
+        let (alloc_b, path_b) = mk_alloc();
+        let _g_b = Guard(path_b);
+        let guard = alloc_a.alloc(2).unwrap();
+        let mut target = alloc_b.alloc(2).unwrap();
+        let err = target
+            .as_slice_mut()
+            .cas_on(&guard.as_slice(), [0u8, 0], [1u8, 1])
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn slice_cas_on_ne_no_match_swaps_and_returns_old() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut guard = alloc.alloc(2).unwrap();
+        guard.write([1u8, 2]).unwrap();
+        let mut target = alloc.alloc(2).unwrap();
+        target.write([9u8, 9]).unwrap();
+        let old = target
+            .as_slice_mut()
+            .cas_on_ne(&guard.as_slice(), [0u8, 0], [3u8, 4])
+            .unwrap();
+        assert_eq!(old, Some(vec![9, 9]));
+        assert_eq!(target.read().unwrap(), [3, 4]);
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn slice_cas_on_ne_match_returns_none() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut guard = alloc.alloc(2).unwrap();
+        guard.write([1u8, 2]).unwrap();
+        let mut target = alloc.alloc(2).unwrap();
+        target.write([9u8, 9]).unwrap();
+        let result = target
+            .as_slice_mut()
+            .cas_on_ne(&guard.as_slice(), [1u8, 2], [3u8, 4])
+            .unwrap();
+        assert_eq!(result, None);
+        assert_eq!(target.read().unwrap(), [9, 9]);
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn slice_cas_on_masked_match_swaps_and_returns_old() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut guard = alloc.alloc(2).unwrap();
+        guard.write([0xffu8, 0x0f]).unwrap();
+        let mut target = alloc.alloc(2).unwrap();
+        target.write([9u8, 9]).unwrap();
+        // mask = [0xff, 0xf0]: masked guard = [0xff, 0x00], masked expected = [0xff, 0x00] -> match
+        let old = target
+            .as_slice_mut()
+            .cas_on_masked(&guard.as_slice(), [0xffu8, 0xf0], [0xffu8, 0x0f], [3u8, 4])
+            .unwrap();
+        assert_eq!(old, Some(vec![9, 9]));
+        assert_eq!(target.read().unwrap(), [3, 4]);
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn slice_cas_on_masked_no_match_returns_none() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut guard = alloc.alloc(1).unwrap();
+        guard.write([0x0fu8]).unwrap();
+        let mut target = alloc.alloc(2).unwrap();
+        target.write([9u8, 9]).unwrap();
+        let result = target
+            .as_slice_mut()
+            .cas_on_masked(&guard.as_slice(), [0xffu8], [0xffu8], [3u8, 4])
+            .unwrap();
+        assert_eq!(result, None);
+        assert_eq!(target.read().unwrap(), [9, 9]);
+    }
+
+    // ---- BStackSlice: process (features `set` + `atomic`) -------------------
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn slice_process_transforms_in_place() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut s = alloc.alloc(4).unwrap();
+        s.write([1u8, 2, 3, 4]).unwrap();
+        s.as_slice_mut()
+            .process(|buf| {
+                for b in buf.iter_mut() {
+                    *b *= 2;
+                }
+            })
+            .unwrap();
+        assert_eq!(s.read().unwrap(), [2, 4, 6, 8]);
+    }
+
     // ---- BStackOwnedSlice: ergonomic method mirrors -------------------------
 
     #[cfg(all(feature = "set", feature = "atomic"))]
