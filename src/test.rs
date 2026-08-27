@@ -4272,6 +4272,35 @@ mod alloc_tests {
         assert_eq!(view.binary_search_by_key(&7, |c| c[0]).unwrap(), Err(2));
     }
 
+    // binary_search_by stays correct — both exact matches and insertion
+    // points — across a region much larger than a single chunk.
+    #[cfg(feature = "set")]
+    #[test]
+    fn chunk_binary_search_by_large_region() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let count: usize = 200;
+        let mut data = vec![0u8; count * 8];
+        for i in 0..count {
+            data[i * 8..(i + 1) * 8].copy_from_slice(&((i as u64) * 2).to_le_bytes());
+        }
+        let mut s = alloc.alloc(data.len() as u64).unwrap();
+        s.as_slice_mut().write(&data).unwrap();
+        let (view, _rem) = s.as_slice().chunks(8);
+
+        let key = |c: &[u8]| u64::from_le_bytes(c.try_into().unwrap());
+        for i in (0..count as u64).step_by(4) {
+            assert_eq!(
+                view.binary_search_by(|c| key(c).cmp(&(i * 2))).unwrap(),
+                Ok(i)
+            );
+            assert_eq!(
+                view.binary_search_by(|c| key(c).cmp(&(i * 2 + 1))).unwrap(),
+                Err(i + 1)
+            );
+        }
+    }
+
     // 14. select_nth_by places the nth chunk where it would land in a full
     //     sort; every chunk before it compares <=, every chunk after >=.
     #[cfg(all(feature = "set", feature = "atomic"))]
@@ -4964,8 +4993,8 @@ mod alloc_tests {
         let _ = view.split_at(4);
     }
 
-    // Runs under both the atomic (get_batched_gen) and non-atomic (plain
-    // reads) implementations, exercising whichever features select.
+    // Runs under both the atomic and non-atomic implementations, exercising
+    // whichever features select.
     #[cfg(feature = "set")]
     #[test]
     fn chunk_partition_point_finds_boundary() {
@@ -4988,6 +5017,28 @@ mod alloc_tests {
         let (view, _rem) = s.as_slice().chunks(1);
         assert_eq!(view.partition_point(|_| true).unwrap(), 4);
         assert_eq!(view.partition_point(|_| false).unwrap(), 0);
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn chunk_partition_point_large_region() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let count: usize = 200;
+        let mut data = vec![0u8; count * 8];
+        for i in 0..count {
+            data[i * 8..(i + 1) * 8].copy_from_slice(&(i as u64).to_le_bytes());
+        }
+        let mut s = alloc.alloc(data.len() as u64).unwrap();
+        s.as_slice_mut().write(&data).unwrap();
+        let (view, _rem) = s.as_slice().chunks(8);
+
+        for threshold in (0..=count as u64).step_by(4) {
+            let idx = view
+                .partition_point(|c| u64::from_le_bytes(c.try_into().unwrap()) < threshold)
+                .unwrap();
+            assert_eq!(idx, threshold, "threshold {threshold}");
+        }
     }
 
     #[cfg(feature = "set")]

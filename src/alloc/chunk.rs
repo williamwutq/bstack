@@ -9,8 +9,6 @@
 use super::BStackOwnedSliceAllocator;
 use super::{BStackAllocator, BStackOwnedSlice, BStackSlice};
 use crate::BStack;
-#[cfg(feature = "atomic")]
-use crate::bstack_unsafe_reborrow_mut;
 use std::cmp::Ordering;
 use std::fmt;
 use std::hash::{Hash, Hasher};
@@ -34,6 +32,20 @@ const SORT_WINDOWS: u64 = 3;
 /// [`SORT_WINDOWS`] windows of [`SORT_BLOCK_BYTES`]. No step holds more than this.
 #[cfg(all(feature = "set", feature = "atomic"))]
 const SORT_BUDGET: u64 = SORT_WINDOWS * SORT_BLOCK_BYTES;
+
+/// Chunk-sized scratch buffers up to this many bytes live on the stack;
+/// larger ones fall back to a single heap allocation. Covers the common case
+/// (short fixed-width records) without allocating at all.
+#[cfg(feature = "atomic")]
+const INLINE_SCRATCH_LEN: usize = 128;
+
+/// Below this total region size in bytes, the `atomic`-feature
+/// `binary_search_by`/`partition_point` skip the O(log n) probe-by-probe
+/// [`BStack::get_batched_gen`] path and instead take the `not(atomic)`
+/// variants' own path: one whole-region [`BStack::get`] read, searched in
+/// memory. Still atomic as a single lock acquisition either way.
+#[cfg(feature = "atomic")]
+const BULK_READ_BUDGET: usize = 512;
 
 /// A fixed-size-record view over a [`BStackSlice`] — a slice with a stride.
 ///
@@ -665,16 +677,17 @@ impl<'a> BStackChunk<'a> {
     ///
     /// Reads only the probed chunks — O(log n) chunk reads, never the whole
     /// region — into one reused buffer (stack-allocated for `chunk_len <=
-    /// INLINE_SCRATCH_LEN`), not a fresh allocation per probe.
+    /// INLINE_SCRATCH_LEN`), not a fresh allocation per probe. Below
+    /// [`BULK_READ_BUDGET`] total bytes, skips probing altogether and takes
+    /// the `not(atomic)` path's own whole-region read instead.
     ///
-    /// Atomic as a whole: every probe runs inside one
-    /// [`BStack::get_batched_gen`] sequence, held under a single lock for
+    /// Atomic as a whole either way: the probing path runs every probe inside
+    /// one [`BStack::get_batched_gen`] sequence, held under a single lock for
     /// the entire search (a shared read lock on Unix/Windows, so concurrent
     /// *readers* still proceed in parallel; only a concurrent write is
-    /// excluded). No `set`/`swap`/`sort_by`/etc. on this region can land
-    /// mid-search, so every probe sees the same consistent snapshot.
+    /// excluded).
     ///
-    /// Requires the `atomic` feature.
+    /// Requires the `atomic` feature for O(log n) reads.
     ///
     /// Returns `Ok(Ok(index))` naming a matching chunk, or `Ok(Err(index))`
     /// with the index a matching chunk would need to be inserted at to keep
@@ -686,28 +699,42 @@ impl<'a> BStackChunk<'a> {
         mut cmp: impl FnMut(&[u8]) -> Ordering,
     ) -> io::Result<Result<u64, u64>> {
         let chunk_len = self.chunk_len as usize;
-        let mut inline = [0u8; INLINE_SCRATCH_LEN];
+
+        let inline = &mut [0u8; BULK_READ_BUDGET];
+        let inline_ptr = inline.as_mut_ptr();
+        if self.aligned.len() <= BULK_READ_BUDGET as u64 {
+            self.aligned.read_into(inline)?;
+            return Ok(binary_search_in_memory(
+                inline,
+                chunk_len,
+                self.chunk_count(),
+                &mut cmp,
+            ));
+        }
+
         let mut heap;
-        let buf: &mut [u8] = if chunk_len <= INLINE_SCRATCH_LEN {
+        let buf: &mut [u8] = if chunk_len <= BULK_READ_BUDGET {
             &mut inline[..chunk_len]
         } else {
             heap = vec![0u8; chunk_len];
-            &mut heap[..]
+            &mut heap
         };
 
+        let buf_ptr = buf.as_mut_ptr();
         let start = self.aligned.start();
         let chunk_len_u64 = self.chunk_len;
         let mut size = self.chunk_count();
         let mut left = 0u64;
         let mut mid = 0u64;
         let mut half = 0u64;
-        // Whether `buf` holds an unprocessed result from the previous probe.
-        let mut pending = false;
-        let mut outcome: Option<Result<u64, u64>> = None;
+        let mut state = 0;
+        // Set on an exact match found mid-probe — short-circuits the search,
+        // whether or not the remaining window would otherwise have collapsed
+        // to a bulk read.
+        let mut found: Option<u64> = None;
 
         self.aligned.stack().get_batched_gen(|| {
-            if pending {
-                pending = false;
+            if state == 1 {
                 match cmp(buf) {
                     Ordering::Less => {
                         left = mid + 1;
@@ -715,25 +742,61 @@ impl<'a> BStackChunk<'a> {
                     }
                     Ordering::Greater => size = half,
                     Ordering::Equal => {
-                        outcome = Some(Ok(mid));
+                        found = Some(mid);
                         return None;
                     }
                 }
             }
-            if size == 0 {
-                outcome = Some(Err(left));
+            if size == 0 || state == 2 {
+                // Quit if there is nothing left or if we read within bulk.
                 return None;
             }
             half = size / 2;
             mid = left + half;
-            pending = true;
+            let rem_bytes = size * chunk_len_u64;
+            let bulk = rem_bytes <= BULK_READ_BUDGET as u64;
+            let offset = if bulk { left } else { mid };
             Some((
-                start + mid * chunk_len_u64,
-                bstack_unsafe_reborrow_mut!(&mut *buf),
+                start + offset * chunk_len_u64,
+                // SAFETY: Both inline and buf outlives the generator, and they are never
+                // used together
+                unsafe {
+                    if bulk {
+                        state = 2;
+                        // This as usize is safe because it is smaller or equal to BULK_READ_BUDGET
+                        core::slice::from_raw_parts_mut(inline_ptr, rem_bytes as usize)
+                    } else {
+                        state = 1;
+                        core::slice::from_raw_parts_mut(buf_ptr, chunk_len)
+                    }
+                },
             ))
         })?;
 
-        Ok(outcome.expect("binary_search_by: get_batched_gen always resolves before ending"))
+        if let Some(idx) = found {
+            return Ok(Ok(idx));
+        }
+
+        // Once the remaining window fits within the bulk-read budget, finish
+        // the binary search entirely in memory.
+        if state == 2 {
+            return Ok(
+                match binary_search_in_memory(
+                    // SAFETY: we just read it
+                    unsafe {
+                        core::slice::from_raw_parts_mut(inline_ptr, (size * chunk_len_u64) as usize)
+                    },
+                    chunk_len,
+                    size,
+                    &mut cmp,
+                ) {
+                    Ok(idx) => Ok(left + idx),
+                    Err(idx) => Err(left + idx),
+                },
+            );
+        }
+
+        Ok(Err(left))
     }
 
     /// Binary search for a chunk matching `cmp`, over chunks already ordered
@@ -766,22 +829,12 @@ impl<'a> BStackChunk<'a> {
     ) -> io::Result<Result<u64, u64>> {
         let chunk_len = self.chunk_len as usize;
         let buf = self.aligned.read()?;
-        let mut size = self.chunk_count();
-        let mut left = 0u64;
-        while size > 0 {
-            let half = size / 2;
-            let mid = left + half;
-            let s = (mid as usize) * chunk_len;
-            match cmp(&buf[s..s + chunk_len]) {
-                Ordering::Less => {
-                    left = mid + 1;
-                    size -= half + 1;
-                }
-                Ordering::Greater => size = half,
-                Ordering::Equal => return Ok(Ok(mid)),
-            }
-        }
-        Ok(Err(left))
+        Ok(binary_search_in_memory(
+            &buf,
+            chunk_len,
+            self.chunk_count(),
+            &mut cmp,
+        ))
     }
 
     /// Binary search for `target` by a key extracted from each probed
@@ -804,39 +857,54 @@ impl<'a> BStackChunk<'a> {
     ///
     /// Reads only the probed chunks — O(log n) chunk reads, never the whole
     /// region — into one reused buffer (stack-allocated for `chunk_len <=
-    /// INLINE_SCRATCH_LEN`), not a fresh allocation per probe.
+    /// INLINE_SCRATCH_LEN`), not a fresh allocation per probe. Below
+    /// [`BULK_READ_BUDGET`] total bytes, skips probing altogether and takes
+    /// the `not(atomic)` path's own whole-region read instead.
     ///
-    /// Atomic as a whole, on the same terms as the `atomic`-feature
+    /// Atomic as a whole either way, on the same terms as the `atomic`-feature
     /// [`binary_search_by`](Self::binary_search_by) — one
     /// [`BStack::get_batched_gen`] sequence under a single lock for the
-    /// whole search. This variant requires the `atomic` feature; without
-    /// it, an equally atomic bulk-read fallback with the same signature is
-    /// used instead, at the cost of O(n) instead of O(log n) memory.
+    /// probing path, or one bulk [`BStack::get`] under the same kind of lock
+    /// for the small-region path.
+    ///
+    /// Requires the `atomic` feature for O(log n) reads.
     ///
     /// `Err` propagates an I/O failure from probing a chunk.
     #[cfg(feature = "atomic")]
     pub fn partition_point(&self, mut pred: impl FnMut(&[u8]) -> bool) -> io::Result<u64> {
         let chunk_len = self.chunk_len as usize;
-        let mut inline = [0u8; INLINE_SCRATCH_LEN];
+
+        let inline = &mut [0u8; BULK_READ_BUDGET];
+        let inline_ptr = inline.as_mut_ptr();
+        if self.aligned.len() <= BULK_READ_BUDGET as u64 {
+            self.aligned.read_into(inline)?;
+            return Ok(partition_point_in_memory(
+                inline,
+                chunk_len,
+                self.chunk_count(),
+                &mut pred,
+            ));
+        }
+
         let mut heap;
-        let buf: &mut [u8] = if chunk_len <= INLINE_SCRATCH_LEN {
+        let buf: &mut [u8] = if chunk_len <= BULK_READ_BUDGET {
             &mut inline[..chunk_len]
         } else {
             heap = vec![0u8; chunk_len];
-            &mut heap[..]
+            &mut heap
         };
 
+        let buf_ptr = buf.as_mut_ptr();
         let start = self.aligned.start();
         let chunk_len_u64 = self.chunk_len;
         let mut size = self.chunk_count();
         let mut left = 0u64;
         let mut mid = 0u64;
         let mut half = 0u64;
-        let mut pending = false;
+        let mut state = 0;
 
         self.aligned.stack().get_batched_gen(|| {
-            if pending {
-                pending = false;
+            if state == 1 {
                 if pred(buf) {
                     left = mid + 1;
                     size -= half + 1;
@@ -844,18 +912,48 @@ impl<'a> BStackChunk<'a> {
                     size = half;
                 }
             }
-            if size == 0 {
+            if size == 0 || state == 2 {
+                // Quit if there are nothing anymore or if we read within bulk
                 return None;
             }
             half = size / 2;
             mid = left + half;
-            pending = true;
+            let rem_bytes = size * chunk_len_u64;
+            let bulk = rem_bytes <= BULK_READ_BUDGET as u64;
+            let offset = if bulk { left } else { mid };
             Some((
-                start + mid * chunk_len_u64,
-                bstack_unsafe_reborrow_mut!(&mut *buf),
+                start + offset * chunk_len_u64,
+                // SAFETY: Both inline and buf outlives the generator, and they are never
+                // used together
+                unsafe {
+                    if bulk {
+                        state = 2;
+                        // This as usize is safe because it is smaller or equal to BULK_READ_BUDGET
+                        core::slice::from_raw_parts_mut(inline_ptr, rem_bytes as usize)
+                    } else {
+                        state = 1;
+                        core::slice::from_raw_parts_mut(buf_ptr, chunk_len)
+                    }
+                },
             ))
         })?;
-        Ok(left)
+
+        Ok(left
+            // Once the remaining window fits within the bulk-read budget, finish
+            // the partition point search entirely in memory.
+            + if state == 2 {
+                partition_point_in_memory(
+                    // SAFETY: we just read it
+                    unsafe {
+                        core::slice::from_raw_parts_mut(inline_ptr, (size * chunk_len_u64) as usize)
+                    },
+                    chunk_len,
+                    size,
+                    &mut pred,
+                )
+            } else {
+                0
+            })
     }
 
     /// Return the index of the first chunk for which `pred` returns `false`,
@@ -876,20 +974,12 @@ impl<'a> BStackChunk<'a> {
     pub fn partition_point(&self, mut pred: impl FnMut(&[u8]) -> bool) -> io::Result<u64> {
         let chunk_len = self.chunk_len as usize;
         let buf = self.aligned.read()?;
-        let mut size = self.chunk_count();
-        let mut left = 0u64;
-        while size > 0 {
-            let half = size / 2;
-            let mid = left + half;
-            let s = (mid as usize) * chunk_len;
-            if pred(&buf[s..s + chunk_len]) {
-                left = mid + 1;
-                size -= half + 1;
-            } else {
-                size = half;
-            }
-        }
-        Ok(left)
+        Ok(partition_point_in_memory(
+            &buf,
+            chunk_len,
+            self.chunk_count(),
+            &mut pred,
+        ))
     }
 
     /// Returns `true` if every chunk compares `<=` the chunk after it, per
@@ -1166,18 +1256,57 @@ fn reverse_chunks(buf: &mut [u8], chunk_len: usize) {
     }
 }
 
-/// Chunk-sized scratch buffers up to this many bytes live on the stack;
-/// larger ones fall back to a single heap allocation. Covers the common case
-/// (short fixed-width records) without allocating at all.
-///
-/// Every user of this constant requires `atomic` — the `atomic`-feature
-/// `binary_search_by`/`partition_point` (via `get_batched_gen`) and
-/// `apply_chunk_permutation`/`sort_chunks_by` (via `set` + `atomic`) — so
-/// the constant itself is dead code without it; the `not(atomic)` versions
-/// of `binary_search_by`/`partition_point` read the whole region at once
-/// instead of probing chunk-sized buffers.
-#[cfg(feature = "atomic")]
-const INLINE_SCRATCH_LEN: usize = 128;
+/// Shared tail of `binary_search_by`: search `count` `chunk_len`-byte records
+/// in `buf` already read into memory. Used by the `not(atomic)` path
+/// unconditionally and by the `atomic` path's small-region fast case.
+fn binary_search_in_memory(
+    buf: &[u8],
+    chunk_len: usize,
+    count: u64,
+    cmp: &mut dyn FnMut(&[u8]) -> Ordering,
+) -> Result<u64, u64> {
+    let mut size = count;
+    let mut left = 0u64;
+    while size > 0 {
+        let half = size / 2;
+        let mid = left + half;
+        let s = (mid as usize) * chunk_len;
+        match cmp(&buf[s..s + chunk_len]) {
+            Ordering::Less => {
+                left = mid + 1;
+                size -= half + 1;
+            }
+            Ordering::Greater => size = half,
+            Ordering::Equal => return Ok(mid),
+        }
+    }
+    Err(left)
+}
+
+/// Shared tail of `partition_point`: search `count` `chunk_len`-byte records
+/// in `buf` already read into memory. Used by the `not(atomic)` path
+/// unconditionally and by the `atomic` path's small-region fast case.
+fn partition_point_in_memory(
+    buf: &[u8],
+    chunk_len: usize,
+    count: u64,
+    pred: &mut dyn FnMut(&[u8]) -> bool,
+) -> u64 {
+    let mut size = count;
+    let mut left = 0u64;
+    while size > 0 {
+        let half = size / 2;
+        let mid = left + half;
+        let s = (mid as usize) * chunk_len;
+        if pred(&buf[s..s + chunk_len]) {
+            left = mid + 1;
+            size -= half + 1;
+        } else {
+            size = half;
+        }
+    }
+    left
+}
 
 /// Reorder `buf`'s `chunk_len`-byte records so record `order[dest]` ends up
 /// at position `dest`, in place via cycle-following.
