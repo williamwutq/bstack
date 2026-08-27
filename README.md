@@ -1111,6 +1111,10 @@ Key methods on `BStackSlice`:
 | `swap(other)` *(features `set` + `atomic`)*                          | Exchange contents with another same-length slice        |
 | `reverse()` *(features `set` + `atomic`)*                            | Reverse the byte order in place                         |
 | `rotate_left(mid)` / `rotate_right(k)` *(features `set` + `atomic`)* | Rotate the slice in place                               |
+| `process(f)` *(features `set` + `atomic`)*                           | Run an arbitrary length-preserving in-place transform — the primitive `reverse`/`rotate_left`/`rotate_right` are built on |
+| `cas_on(guard, expected, new_bytes)` *(features `set` + `atomic`)*   | Overwrite `self` with `new_bytes`, returning the prior contents, if `guard`'s bytes equal `expected` |
+| `cas_on_ne(guard, expected, new_bytes)` *(features `set` + `atomic`)* | Like `cas_on`, but swaps when `guard`'s bytes do **not** equal `expected` |
+| `cas_on_masked(guard, mask, expected, new_bytes)` *(features `set` + `atomic`)* | Like `cas_on`, comparing `guard`'s bytes to `expected` under a bitwise `mask` |
 | `to_owned_in(alloc)` / `to_owned_uninit_in(alloc)` *(features `set` + `atomic`)* | Copy into a fresh owned allocation from `alloc`; `_uninit` skips the destination zero-fill |
 
 Every write method above is a single crash-atomic call. `BStackOwnedSlice` mirrors all of these (delegating through `as_slice()`/`as_slice_mut()`), and adds `try_clone()`/`try_clone_uninit()` — its own explicit, fallible copy into a second independent allocation, since it is deliberately non-`Clone`.

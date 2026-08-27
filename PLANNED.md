@@ -339,32 +339,6 @@ A bulk request spanning 33 size classes currently degrades to `n` independent `a
 
 ---
 
-## `BStackSlice::cas_on` and `BStackSlice::replace_with`
-
-**Feature flag:** `alloc` + `set` + `atomic`.
-**Breaking change:** No.
-
-### Motivation
-
-`eq_crds`/`ne_crds`/`masked_eq_crds` have **zero call sites** anywhere in the slice layer; the cross-region compare-and-swap is reachable only by dropping to raw `BStack` offsets, which discards slice provenance and the same-stack check. `BStack::process` is the opposite case — used internally three times in `slice.rs` and eight times in `chunk.rs` (for `rotate_*`, `reverse`, `sort_by`) but never exposed, so callers cannot run their own length-preserving transform under one lock.
-
-### Design
-
-```rust
-pub fn cas_on(&self, guard: BStackSlice<'a>, expected: impl AsRef<[u8]>,
-              new_bytes: impl AsRef<[u8]>) -> io::Result<Option<Vec<u8>>>;
-pub fn replace_with<F: FnOnce(&mut [u8])>(&self, f: F) -> io::Result<()>;
-```
-
-- `cas_on` is one `eq_crds(guard.start(), expected, self.start(), new_bytes)`: if `guard`'s bytes equal `expected`, `self` is overwritten with `new_bytes` and the old contents returned, all under one write lock. `InvalidInput` if `guard` and `self` are backed by different `BStack`s (matching `merge`/`copy_from_bstack_slice`), if `expected.len() != guard.len()`, or if `new_bytes.len() != self.len()`. Companions `cas_on_ne` and `cas_on_masked` wrap `ne_crds` and `masked_eq_crds`.
-- `replace_with` is one `BStack::process(self.start(), self.end(), f)` — length-preserving, so no allocator interaction, and crash-atomic on `set`'s terms.
-
-### Open questions
-
-- **Naming.** `BStack::replace` is a *tail* operation that may change length, so reusing "replace" invites confusion; naming the slice method `process` to mirror the primitive it wraps may be clearer than `replace_with`.
-
----
-
 ## `SegregatedBStackAllocator` background coalescer
 
 **Feature flag:** `alloc` + `set`; the merge splices require `atomic`.

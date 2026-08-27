@@ -902,6 +902,171 @@ impl<'a> BStackSlice<'a> {
             .copy(self.start() + src_range.start, self.start() + dest, n)
     }
 
+    /// Overwrite this slice with `new_bytes` if `guard`'s current contents
+    /// equal `expected`.
+    ///
+    /// One crash-atomic [`BStack::eq_crds`] call: `guard`'s bytes are read
+    /// and compared to `expected`, and if they match, `self` is overwritten
+    /// with `new_bytes` — all under the same write lock, so no other thread
+    /// can observe the comparison and the write as separate steps. Returns
+    /// the prior contents of `self` as `Ok(Some(_))` if the swap ran, or
+    /// `Ok(None)` if the comparison failed, leaving `self` untouched.
+    ///
+    /// `guard` may be a view into the same or a different region of `self`'s
+    /// [`BStack`], including `self` itself.
+    ///
+    /// Requires the `set` and `atomic` features.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] if `guard` and `self` are
+    /// backed by different [`BStack`]s, if `expected.as_ref().len() !=
+    /// guard.len()`, or if `new_bytes.as_ref().len() != self.len()`.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    pub fn cas_on(
+        &mut self,
+        guard: &BStackSlice<'_>,
+        expected: impl AsRef<[u8]>,
+        new_bytes: impl AsRef<[u8]>,
+    ) -> io::Result<Option<Vec<u8>>> {
+        let expected = expected.as_ref();
+        let new_bytes = new_bytes.as_ref();
+        if self.stack != guard.stack() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "BStackSlice::cas_on: guard belongs to a different BStack",
+            ));
+        }
+        if expected.len() as u64 != guard.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "BStackSlice::cas_on: expected length ({}) != guard length ({})",
+                    expected.len(),
+                    guard.len()
+                ),
+            ));
+        }
+        if new_bytes.len() as u64 != self.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "BStackSlice::cas_on: new_bytes length ({}) != self length ({})",
+                    new_bytes.len(),
+                    self.len()
+                ),
+            ));
+        }
+        self.stack
+            .eq_crds(guard.start(), expected, self.start(), new_bytes)
+    }
+
+    /// Overwrite this slice with `new_bytes` if `guard`'s current contents do
+    /// **not** equal `expected`.
+    ///
+    /// Like [`cas_on`](Self::cas_on) but wraps [`BStack::ne_crds`]: the swap
+    /// runs when the comparison fails rather than when it succeeds.
+    ///
+    /// Requires the `set` and `atomic` features.
+    ///
+    /// # Errors
+    ///
+    /// Same conditions as [`cas_on`](Self::cas_on).
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    pub fn cas_on_ne(
+        &mut self,
+        guard: &BStackSlice<'_>,
+        expected: impl AsRef<[u8]>,
+        new_bytes: impl AsRef<[u8]>,
+    ) -> io::Result<Option<Vec<u8>>> {
+        let expected = expected.as_ref();
+        let new_bytes = new_bytes.as_ref();
+        if self.stack != guard.stack() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "BStackSlice::cas_on_ne: guard belongs to a different BStack",
+            ));
+        }
+        if expected.len() as u64 != guard.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "BStackSlice::cas_on_ne: expected length ({}) != guard length ({})",
+                    expected.len(),
+                    guard.len()
+                ),
+            ));
+        }
+        if new_bytes.len() as u64 != self.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "BStackSlice::cas_on_ne: new_bytes length ({}) != self length ({})",
+                    new_bytes.len(),
+                    self.len()
+                ),
+            ));
+        }
+        self.stack
+            .ne_crds(guard.start(), expected, self.start(), new_bytes)
+    }
+
+    /// Overwrite this slice with `new_bytes` if `guard`'s current contents
+    /// equal `expected` under a bitwise `mask`.
+    ///
+    /// Like [`cas_on`](Self::cas_on) but wraps [`BStack::masked_eq_crds`]:
+    /// the condition is `(guard[i] & mask[i]) == (expected[i] & mask[i])` for
+    /// every byte `i`.
+    ///
+    /// Requires the `set` and `atomic` features.
+    ///
+    /// # Errors
+    ///
+    /// Same conditions as [`cas_on`](Self::cas_on), plus
+    /// [`io::ErrorKind::InvalidInput`] if `mask.as_ref().len() !=
+    /// expected.as_ref().len()` (checked by [`BStack::masked_eq_crds`]
+    /// itself).
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    pub fn cas_on_masked(
+        &mut self,
+        guard: &BStackSlice<'_>,
+        mask: impl AsRef<[u8]>,
+        expected: impl AsRef<[u8]>,
+        new_bytes: impl AsRef<[u8]>,
+    ) -> io::Result<Option<Vec<u8>>> {
+        let mask = mask.as_ref();
+        let expected = expected.as_ref();
+        let new_bytes = new_bytes.as_ref();
+        if self.stack != guard.stack() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "BStackSlice::cas_on_masked: guard belongs to a different BStack",
+            ));
+        }
+        if expected.len() as u64 != guard.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "BStackSlice::cas_on_masked: expected length ({}) != guard length ({})",
+                    expected.len(),
+                    guard.len()
+                ),
+            ));
+        }
+        if new_bytes.len() as u64 != self.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "BStackSlice::cas_on_masked: new_bytes length ({}) != self length ({})",
+                    new_bytes.len(),
+                    self.len()
+                ),
+            ));
+        }
+        self.stack
+            .masked_eq_crds(guard.start(), mask, expected, self.start(), new_bytes)
+    }
+
     /// Swap the contents of this slice with `other`.
     ///
     /// A single crash-atomic [`BStack::cross_exchange`] call.
@@ -931,6 +1096,23 @@ impl<'a> BStackSlice<'a> {
         }
         self.stack
             .cross_exchange(self.start(), other.start(), self.len())
+    }
+
+    /// Run a length-preserving transform over this slice's bytes in place.
+    ///
+    /// One crash-atomic [`BStack::process`] call: the slice's bytes are
+    /// read, handed to `f` for in-memory mutation, then written back, all
+    /// under the same write lock. `f` must not change the buffer's length —
+    /// this only rewrites `self`'s existing bytes, so no allocator
+    /// interaction is needed. [`reverse`](Self::reverse),
+    /// [`rotate_left`](Self::rotate_left), and
+    /// [`rotate_right`](Self::rotate_right) are built on the same primitive.
+    ///
+    /// Requires the `set` and `atomic` features.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[inline]
+    pub fn process<F: FnOnce(&mut [u8])>(&mut self, f: F) -> io::Result<()> {
+        self.stack.process(self.start(), self.end(), f)
     }
 
     /// Reverse the byte order of this slice in place.
