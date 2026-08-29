@@ -1918,7 +1918,10 @@ impl BStackBulkAllocator for CheckedSlabBStackAllocator {
         }
 
         if total_blocks == 0 {
-            return Ok(lengths.iter().map(|_| BStackOwnedSlice::empty(self)).collect());
+            return Ok(lengths
+                .iter()
+                .map(|_| BStackOwnedSlice::empty(self))
+                .collect());
         }
 
         let popped = self.pop_free_blocks_bulk(singles)?;
@@ -1926,7 +1929,10 @@ impl BStackBulkAllocator for CheckedSlabBStackAllocator {
 
         let ext_base = if remainder > 0 {
             let total_bytes = remainder.checked_mul(bs).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "alloc_bulk: extend size overflows u64")
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "alloc_bulk: extend size overflows u64",
+                )
             })?;
             self.stack.extend(total_bytes)?
         } else {
@@ -2105,7 +2111,9 @@ impl BStackBulkAllocator for CheckedSlabBStackAllocator {
                     if !seen.insert(b) {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidInput,
-                            format!("dealloc_bulk: double free detected: block at {b} appears twice"),
+                            format!(
+                                "dealloc_bulk: double free detected: block at {b} appears twice"
+                            ),
                         ));
                     }
                     blocks.push(b);
@@ -2950,7 +2958,10 @@ mod bulk_tests {
         // data_size = 24, block_size = 32.
         let alloc = CheckedSlabBStackAllocator::new(stack, 24).unwrap();
         let mut slices = alloc.alloc_bulk([8u64, 24, 20]).unwrap();
-        assert_eq!(slices.iter().map(|s| s.len()).collect::<Vec<_>>(), [8, 24, 20]);
+        assert_eq!(
+            slices.iter().map(|s| s.len()).collect::<Vec<_>>(),
+            [8, 24, 20]
+        );
         for (i, s) in slices.iter_mut().enumerate() {
             let n = s.len() as usize;
             s.write(vec![i as u8 + 1; n]).unwrap();
@@ -2999,7 +3010,11 @@ mod bulk_tests {
         alloc.dealloc_bulk(a).unwrap();
         let b = alloc.alloc_bulk([24u64, 24, 24]).unwrap();
         for s in &b {
-            assert_eq!(s.read().unwrap(), vec![0u8; 24], "recycled block not scrubbed");
+            assert_eq!(
+                s.read().unwrap(),
+                vec![0u8; 24],
+                "recycled block not scrubbed"
+            );
         }
     }
 
@@ -3052,8 +3067,7 @@ mod bulk_tests {
         let a_start = a.start();
         alloc.dealloc(a).unwrap();
         // Reconstruct a stale handle over the now-free block (white-box).
-        let stale =
-            unsafe { crate::alloc::BStackOwnedSlice::from_raw_parts(&alloc, a_start, 24) };
+        let stale = unsafe { crate::alloc::BStackOwnedSlice::from_raw_parts(&alloc, a_start, 24) };
         let err = alloc
             .dealloc_bulk([b, stale])
             .expect_err("double free must be rejected");
@@ -3141,7 +3155,11 @@ mod bulk_tests {
                         {
                             let mut set = live.lock().unwrap();
                             for s in &slices {
-                                assert!(set.insert(s.start()), "duplicate live offset {}", s.start());
+                                assert!(
+                                    set.insert(s.start()),
+                                    "duplicate live offset {}",
+                                    s.start()
+                                );
                             }
                         }
                         for s in &mut slices {

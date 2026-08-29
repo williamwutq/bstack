@@ -1094,7 +1094,10 @@ impl BStackBulkAllocator for SlabBStackAllocator {
 
         // All zero-length: null slices, no I/O.
         if total_blocks == 0 {
-            return Ok(lengths.iter().map(|_| BStackOwnedSlice::empty(self)).collect());
+            return Ok(lengths
+                .iter()
+                .map(|_| BStackOwnedSlice::empty(self))
+                .collect());
         }
 
         // Serve single-block requests from the free list first.
@@ -1104,7 +1107,10 @@ impl BStackBulkAllocator for SlabBStackAllocator {
         // One tail extend for everything the free list could not supply.
         let ext_base = if remainder > 0 {
             let total_bytes = remainder.checked_mul(bs).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "alloc_bulk: extend size overflows u64")
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "alloc_bulk: extend size overflows u64",
+                )
             })?;
             self.stack.extend(total_bytes)?
         } else {
@@ -1767,7 +1773,10 @@ mod bulk_tests {
         let alloc = SlabBStackAllocator::new(stack, 16).unwrap();
         let mut slices = alloc.alloc_bulk([8u64, 16, 12]).unwrap();
         assert_eq!(slices.len(), 3);
-        assert_eq!(slices.iter().map(|s| s.len()).collect::<Vec<_>>(), [8, 16, 12]);
+        assert_eq!(
+            slices.iter().map(|s| s.len()).collect::<Vec<_>>(),
+            [8, 16, 12]
+        );
         // Distinct starts.
         let starts: Vec<u64> = slices.iter().map(|s| s.start()).collect();
         assert_ne!(starts[0], starts[1]);
@@ -1837,7 +1846,11 @@ mod bulk_tests {
         // Bulk-alloc again: recycled blocks must honour the zero-init guarantee.
         let b = alloc.alloc_bulk([16u64, 16, 16]).unwrap();
         for s in &b {
-            assert_eq!(s.read().unwrap(), vec![0u8; 16], "recycled block not scrubbed");
+            assert_eq!(
+                s.read().unwrap(),
+                vec![0u8; 16],
+                "recycled block not scrubbed"
+            );
         }
     }
 
@@ -1958,7 +1971,11 @@ mod bulk_tests {
                         {
                             let mut set = live.lock().unwrap();
                             for s in &slices {
-                                assert!(set.insert(s.start()), "duplicate live offset {}", s.start());
+                                assert!(
+                                    set.insert(s.start()),
+                                    "duplicate live offset {}",
+                                    s.start()
+                                );
                             }
                         }
                         for s in &mut slices {
