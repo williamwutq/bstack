@@ -265,27 +265,6 @@ Only the API is gated. `MultiAtrunc` recovery is ungated in `io_core`, and the m
 
 ---
 
-## `BStackBulkAllocator` for `SlabBStackAllocator` and `CheckedSlabBStackAllocator`
-
-**Feature flag:** `alloc` + `set`.
-**Breaking change:** No
-
-### Motivation
-
-The two slab allocators are the most natural bulk allocators in the crate — fixed stride, so a run of `k` blocks is `k` independently-freeable handles — and they are the two that do not implement the trait. Today `alloc` on a free-list hit costs 4 `BStack` calls (2× `get_into` + `set` + `zero`) and the slab `dealloc` path costs 3, each individually synced, so `n` handles cost `4n`/`3n` synced calls.
-
-### Design
-
-- `alloc_bulk`: satisfy from the free list first by chasing the singly-linked chain through the block bodies under one `process_gen` (the chase is inherently sequential, but happens in one locked critical section), then write `free_head` once; serve the remainder with a single `extend` of `k · block_size`. Unlike `GhostTreeBstackAllocator::alloc_bulk`, the result is *not* one contiguous block sliced up — each slab block must stay independently deallocatable — so per-block handles are returned.
-- `dealloc_bulk`: thread every freed block into one chain in memory, then commit all `next` pointers plus the `free_head` advance as a single `set_batched` (one `MultiWrite` journal arm, one sync). The slab `dealloc` doc already describes a "bulk `set`" for the multi-block path, so the batching shape exists.
-- `CheckedSlabBStackAllocator` additionally flips a per-block overhead tag; those flips join the same `set_batched`. The ordering rule from the 0.4.2→0.4.3 non-tail-shrink fix carries over: every scrub is staged in the batch *before* the count/head commit, so each crash window leaves either the intact original or zero-overhead leaked blocks that `recover` reclaims.
-
-### Open questions
-
-- Whether `alloc_bulk` should prefer a contiguous run when the free list can supply one, for locality, at the cost of a more complex chain walk.
-
----
-
 ## `BStackBulkAllocator` for `SegregatedBStackAllocator`
 
 **Feature flag:** `alloc` + `set`.
