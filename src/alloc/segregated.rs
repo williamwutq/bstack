@@ -995,8 +995,6 @@ impl SegregatedBStackAllocator {
             return Ok((Vec::new(), counts));
         }
         let mut popped: Vec<u64> = Vec::with_capacity(total_want);
-        // A cyclic list of period ≤ want[c] would pop a block twice; the visited
-        // set turns that into a clean cycle error instead of a duplicate block.
         let mut seen: HashSet<u64> = HashSet::with_capacity(total_want);
         let mut head_buf = [0u8; 8];
         let mut next_buf = [0u8; 8];
@@ -1059,13 +1057,11 @@ impl SegregatedBStackAllocator {
                         }
                     }
                     St::ReadNode(c, cursor) => {
-                        // A revisited block is a cycle: bail popping nothing. No
-                        // write is staged in the read phase, so `None` commits
-                        // nothing (no `Abort` needed).
                         if !seen.insert(cursor) {
-                            err = Some(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "alloc_bulk: free-list cycle detected",
+                            // Cycle. Since no writes are staged, `None` commits nothing.
+                            err = Some(io_error!(
+                                InvalidData,
+                                "alloc_bulk: free-list cycle detected"
                             ));
                             return None;
                         }
@@ -1079,7 +1075,7 @@ impl SegregatedBStackAllocator {
                     St::ConsumeNode(c, cursor) => {
                         popped.push(cursor);
                         counts[c] += 1;
-                        in_class += 1;
+                        in_class += 1; // bounded by want[c]
                         let next = u64::from_le_bytes(next_buf);
                         if in_class == want[c] || next == Self::SENTINEL {
                             head_writes[c] = next.to_le_bytes();
@@ -1144,49 +1140,52 @@ impl SegregatedBStackAllocator {
         }
     }
 
-    /// Detach a **bounded prefix** of the oversized free list and match its blocks
-    /// to `reqs` in one [`BStack::process_gen`]. `reqs` is sorted largest-first; the
-    /// chase assigns each free block to the largest still-unmet request it fits
-    /// (compacting `reqs` as matches land, so the scan shrinks) and **stops as soon
-    /// as every request is matched** — the prefix up to that last match is detached
-    /// with the single terminal head write (`head ← last_match.next`), so the chase
-    /// and the write lock are bounded by the batch's needs, not the whole list. Only
-    /// a list too small to satisfy every request is walked in full (then `head ←
-    /// SENTINEL`, detaching all of it).
+    /// Match `reqs` against the oversized free list and unlink the matched blocks in
+    /// one [`BStack::inplace_gen`]. `reqs` is sorted largest-first; the chase assigns
+    /// each free block to the largest still-unmet request it fits (compacting `reqs`
+    /// as matches land) and **stops as soon as every request is matched**, so the
+    /// chase — and the write lock — is bounded by the batch's needs, not the whole
+    /// list (only a list too small to satisfy every request is walked in full).
     ///
-    /// Returns the matched blocks as `(req, block_start, size)` and the prefix
-    /// blocks that matched nothing as `(block_start, size)` for the caller to
-    /// re-splice. Detached blocks are left free-tagged (their overhead untouched),
-    /// so a crash after the head write leaves them reclaimable by
+    /// Matched blocks are removed by **patching their predecessor** (`head`, or the
+    /// previous survivor's `next`) to skip past them, so survivors are left in place
+    /// — never read-and-rewritten or reordered, and the common "nothing fits" case
+    /// writes nothing. The read phase chases and records the patches (a run of
+    /// adjacent removals collapses to one, so at most `reqs.len()` of them); the
+    /// write phase emits them together. Removed blocks are left free-tagged and
+    /// detached, so a crash before the claim leaves them reclaimable by
     /// [`recover`](Self::recover).
     ///
-    /// The chase is unbounded (no per-class cap), so it carries cycle detection —
-    /// a revisited block aborts with no write, instead of spinning forever under
-    /// the write lock while `unmatched` grows without bound. Each block's overhead
-    /// is validated before use: the in-use bit must be clear (mirroring
-    /// [`pop_oversized`](Self::pop_oversized), which also refuses a set high bit),
-    /// and the decoded physical size must be at least a
-    /// [`QUANTUM`](Self::QUANTUM) and fit within the payload — so a corrupt word
-    /// (e.g. bits shifted out by `<< 4` leaving `size == 0`, which would underflow
-    /// [`classify`](Self::classify)) is rejected rather than fed to the carve math.
-    /// Any of these aborts with [`io::ErrorKind::InvalidData`] and no write.
-    #[expect(clippy::type_complexity)]
+    /// The chase is unbounded, so it carries cycle detection (a revisited block
+    /// aborts with no write). Each block's overhead is validated before use: the
+    /// in-use bit must be clear (mirroring [`pop_oversized`](Self::pop_oversized)),
+    /// and the decoded size must be at least a [`QUANTUM`](Self::QUANTUM) and fit the
+    /// payload — so a corrupt word (`<< 4` leaving `size == 0`, which underflows
+    /// [`classify`](Self::classify), or a size running past the payload) is rejected
+    /// before it reaches the carve math. Any of these aborts with
+    /// [`io::ErrorKind::InvalidData`] and no write.
     fn match_oversized_bounded(
         &self,
         reqs: &mut Vec<usize>,
         block_of: &[u64],
-    ) -> io::Result<(Vec<(usize, u64, u64)>, Vec<(u64, u64)>)> {
+    ) -> io::Result<Vec<(usize, u64, u64)>> {
         let head_off = Self::head_off(Self::OVERSIZED_CLASS);
         let mut matched: Vec<(usize, u64, u64)> = Vec::with_capacity(reqs.len());
-        let mut unmatched: Vec<(u64, u64)> = Vec::new();
+        // Predecessor patches `(pointer offset, new next value)`, one per removed
+        // run (≤ one per match). Reserved so the Vec never reallocates while its
+        // entries are borrowed by the write-phase `Write`s.
+        let mut patches: Vec<(u64, [u8; 8])> = Vec::with_capacity(reqs.len());
         let mut head_buf = [0u8; 8];
         let mut node_buf = [0u8; 16]; // [0..8] overhead (free tag), [8..16] next
-        let mut new_head = [0u8; 8]; // terminal write: the detached prefix's successor
         let mut payload_len = 0u64;
         let payload_ptr: *mut u64 = &mut payload_len;
-        // The chase is unbounded, so a cyclic list must be caught or it spins
-        // forever under the write lock.
+        // The chase is unbounded, so a cyclic list must be caught or it spins forever.
         let mut seen: HashSet<u64> = HashSet::new();
+        // The pointer field that currently points at `cursor` (head, or a survivor's
+        // `next`); `dangling` marks it as needing a repoint once a removal has left a
+        // gap, deferred so a run of removals collapses into one patch.
+        let mut prev_next_off = head_off;
+        let mut dangling = false;
         let mut err: Option<io::Error> = None;
 
         #[derive(Clone, Copy)]
@@ -1196,16 +1195,25 @@ impl SegregatedBStackAllocator {
             ConsumeHead,
             ReadNode(u64),
             ConsumeNode(u64),
+            Emit(usize),
             Done,
         }
         let mut st = St::ReadLen;
 
-        self.stack.process_gen(|| {
+        self.stack.inplace_gen(|res| {
+            // A prior read failed. Read-phase reads never stage a write and the
+            // write phase issues no reads, so nothing is staged when a read error
+            // can arrive: ending with `None` commits nothing.
+            if let Err(e) = res {
+                err = Some(e);
+                return None;
+            }
             loop {
                 match st {
+                    // --- read phase ---
                     St::ReadLen => {
                         st = St::ReadHead;
-                        // SAFETY: `process_gen` finishes writing `out` before the
+                        // SAFETY: `inplace_gen` finishes writing `out` before the
                         // next call, so this `&mut` never aliases a later read.
                         return Some(BStackGenOp::Len {
                             out: unsafe { &mut *payload_ptr },
@@ -1222,16 +1230,17 @@ impl SegregatedBStackAllocator {
                     St::ConsumeHead => {
                         let head = u64::from_le_bytes(head_buf);
                         if head == Self::SENTINEL {
-                            return None; // empty: nothing detached, no write
+                            st = St::Emit(0); // empty list: no matches, no patches
+                        } else {
+                            st = St::ReadNode(head);
                         }
-                        st = St::ReadNode(head);
                     }
                     St::ReadNode(cursor) => {
                         // A revisited block is a cycle: bail with no write staged.
                         if !seen.insert(cursor) {
-                            err = Some(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "alloc_bulk: oversized free-list cycle detected",
+                            err = Some(io_error!(
+                                InvalidData,
+                                "alloc_bulk: oversized free-list cycle detected"
                             ));
                             return None;
                         }
@@ -1245,11 +1254,9 @@ impl SegregatedBStackAllocator {
                     St::ConsumeNode(cursor) => {
                         let word = read_buf_le!(node_buf, 0 => u64);
                         if word & Self::IN_USE_BIT != 0 {
-                            // Corrupt free list: bail with no write staged, so `None`
-                            // commits nothing and the list is left untouched.
-                            err = Some(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "alloc_bulk: oversized free list has an in-use block",
+                            err = Some(io_error!(
+                                InvalidData,
+                                "alloc_bulk: oversized free list has an in-use block"
                             ));
                             return None;
                         }
@@ -1261,9 +1268,9 @@ impl SegregatedBStackAllocator {
                         if size < Self::QUANTUM
                             || cursor.checked_add(size).is_none_or(|end| end > payload_len)
                         {
-                            err = Some(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "alloc_bulk: oversized free block has an invalid size",
+                            err = Some(io_error!(
+                                InvalidData,
+                                "alloc_bulk: oversized free block has an invalid size"
                             ));
                             return None;
                         }
@@ -1273,30 +1280,46 @@ impl SegregatedBStackAllocator {
                         if let Some(j) = reqs.iter().position(|&req| block_of[req] <= size) {
                             let req = reqs.remove(j);
                             matched.push((req, cursor, size));
-                            if reqs.is_empty() {
-                                // Every request met: detach the prefix ending here.
-                                new_head = next.to_le_bytes();
-                                st = St::Done;
-                                return Some(BStackGenOp::Write {
-                                    offset: head_off,
-                                    // SAFETY: `new_head` outlives this call.
-                                    data: bstack_unsafe_reborrow!(&new_head[..]),
-                                });
+                            // Remove `cursor`: its predecessor must skip it. Defer the
+                            // patch until the next survivor (or the end) is known so a
+                            // run of removals collapses to one repoint.
+                            dangling = true;
+                            if reqs.is_empty() || next == Self::SENTINEL {
+                                // Every request met, or the list ended: repoint the
+                                // predecessor past this last removed block and stop.
+                                patches.push((prev_next_off, next.to_le_bytes()));
+                                st = St::Emit(0);
+                            } else {
+                                st = St::ReadNode(next);
                             }
                         } else {
-                            unmatched.push((cursor, size));
+                            // Survivor: settle any pending removal by repointing the
+                            // predecessor to this block, then it becomes the new prev.
+                            if dangling {
+                                patches.push((prev_next_off, cursor.to_le_bytes()));
+                                dangling = false;
+                            }
+                            prev_next_off = cursor + Self::OVERHEAD;
+                            if next == Self::SENTINEL {
+                                st = St::Emit(0);
+                            } else {
+                                st = St::ReadNode(next);
+                            }
                         }
-                        if next == Self::SENTINEL {
-                            // List exhausted with requests unmet: detach all of it.
-                            // `new_head` stays SENTINEL.
+                    }
+                    // --- write phase ---
+                    St::Emit(i) => {
+                        if i >= patches.len() {
                             st = St::Done;
-                            return Some(BStackGenOp::Write {
-                                offset: head_off,
-                                // SAFETY: `new_head` outlives this call.
-                                data: bstack_unsafe_reborrow!(&new_head[..]),
-                            });
+                            return None; // commit the accumulated patches
                         }
-                        st = St::ReadNode(next);
+                        st = St::Emit(i + 1);
+                        return Some(BStackGenOp::Write {
+                            offset: patches[i].0,
+                            // SAFETY: `patches[i].1` outlives this call and was set in
+                            // the read phase, never mutated after any write.
+                            data: bstack_unsafe_reborrow!(&patches[i].1[..]),
+                        });
                     }
                     St::Done => return None,
                 }
@@ -1305,7 +1328,7 @@ impl SegregatedBStackAllocator {
         if let Some(e) = err {
             return Err(e);
         }
-        Ok((matched, unmatched))
+        Ok(matched)
     }
 
     /// Splice a run of blocks onto `class`'s free list as one chain: stage each
@@ -1318,8 +1341,9 @@ impl SegregatedBStackAllocator {
         if blocks.is_empty() {
             return Ok(());
         }
-        let mut batch: Vec<(u64, [u8; 16])> = Vec::with_capacity(blocks.len());
-        for (i, &(block, size)) in blocks.iter().enumerate() {
+        // `set_batched` takes an iterator (each `[u8; 16]` is `AsRef<[u8]>`), so the
+        // staged nodes stream straight from `blocks` — no intermediate batch Vec.
+        let writes = blocks.iter().enumerate().map(|(i, &(block, size))| {
             // Last block's next is the placeholder `blocks[0]` that cross_exchange
             // replaces with the old head.
             let next = if i + 1 < blocks.len() {
@@ -1330,9 +1354,9 @@ impl SegregatedBStackAllocator {
             let mut buf = [0u8; 16];
             write_buf!(size >> 4 => buf, 0);
             write_buf!(next => buf, 8);
-            batch.push((block, buf));
-        }
-        self.stack.set_batched(batch)?;
+            (block, buf)
+        });
+        self.stack.set_batched(writes)?;
         self.stack.cross_exchange(
             blocks[blocks.len() - 1].0 + Self::OVERHEAD,
             Self::head_off(class),
@@ -1483,12 +1507,11 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
             }
 
             // 2. Oversized matching (largest request first), with SPLIT_MIN carve.
-            //    The bounded matcher detaches only the prefix it needs and returns
-            //    the matches plus any prefix blocks that fit nothing.
+            //    The bounded matcher unlinks only the matched blocks (survivors stay
+            //    in place), so there is nothing to re-splice here.
             if !oversized_reqs.is_empty() {
                 oversized_reqs.sort_unstable_by(|&x, &y| block_of[y].cmp(&block_of[x]));
-                let (matched, unmatched) =
-                    self.match_oversized_bounded(&mut oversized_reqs, &block_of)?;
+                let matched = self.match_oversized_bounded(&mut oversized_reqs, &block_of)?;
                 for (req, boff, bsize) in matched {
                     let block = block_of[req];
                     // SAFETY: `boff` is a live oversized block; data begins at
@@ -1524,11 +1547,6 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
                         claims.push((boff, bsize, ClaimKind::Reuse));
                     }
                 }
-                for (boff, bsize) in unmatched {
-                    // Detached but fit nothing: relink on success, repush on rollback.
-                    detached.push((boff, bsize));
-                    to_splice.push((boff, bsize));
-                }
             }
 
             // 3. Misses (classed short + unmatched oversized): one extend that
@@ -1540,9 +1558,9 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
             for i in 0..n {
                 if block_of[i] > 0 && result[i].is_empty() {
                     total_ext = total_ext.checked_add(block_of[i]).ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            "alloc_bulk: total allocation size overflows u64",
+                        io_error!(
+                            InvalidInput,
+                            "alloc_bulk: total allocation size overflows u64"
                         )
                     })?;
                 }
@@ -1596,10 +1614,7 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
                         if let std::collections::hash_map::Entry::Vacant(e) = reuse_buf.entry(size)
                         {
                             let n = usize::try_from(size).map_err(|_| {
-                                io::Error::new(
-                                    io::ErrorKind::InvalidInput,
-                                    "alloc_bulk: block size exceeds usize",
-                                )
+                                io_error!(InvalidInput, "alloc_bulk: block size exceeds usize")
                             })?;
                             let mut b = vec![0u8; n];
                             write_buf!(Self::IN_USE_BIT | (size >> 4) => b, 0);
@@ -1619,22 +1634,23 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
                     }
                 }
             }
-            let mut batch: Vec<(u64, &[u8])> = Vec::with_capacity(claims.len());
-            for &(off, size, kind) in &claims {
-                let buf: &[u8] = match kind {
-                    ClaimKind::Reuse => &reuse_buf[&size],
-                    ClaimKind::Fresh => &oh_buf[&(Self::IN_USE_BIT | (size >> 4))],
-                    ClaimKind::CarveFree => &oh_buf[&(size >> 4)],
-                };
-                batch.push((off, buf));
-            }
-            if !batch.is_empty() {
-                self.stack.set_batched(batch)?;
+            // `set_batched` takes an iterator, so the writes stream straight from
+            // `claims` and the shared buffers — no intermediate batch Vec.
+            if !claims.is_empty() {
+                let writes = claims.iter().map(|&(off, size, kind)| {
+                    let buf: &[u8] = match kind {
+                        ClaimKind::Reuse => &reuse_buf[&size],
+                        ClaimKind::Fresh => &oh_buf[&(Self::IN_USE_BIT | (size >> 4))],
+                        ClaimKind::CarveFree => &oh_buf[&(size >> 4)],
+                    };
+                    (off, buf)
+                });
+                self.stack.set_batched(writes)?;
             }
 
-            // 5. Relink the now-free carve remainders and unmatched oversized
-            //    blocks. Best-effort: the allocations are already valid, and a
-            //    block left unspliced stays free-tagged (reclaimed by `recover`).
+            // 5. Relink the now-free carve remainders. Best-effort: the allocations
+            //    are already valid, and a block left unspliced stays free-tagged
+            //    (reclaimed by `recover`).
             self.repush_detached(&mut to_splice);
 
             // `result` was filled in place as blocks were assigned.
@@ -1684,99 +1700,114 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
 
         let mut freeing = false;
         let result = (|| -> io::Result<()> {
-            // Resolve each non-empty handle's block start (pointer validation, no
-            // I/O), then read every overhead word under ONE lock via
+            // Block start per handle (`SENTINEL` for a null/empty handle), validated
+            // up front — like alloc's `block_of`, so there is no separate non-empty
+            // list to build, and an all-null batch falls through the normal path.
+            let mut starts: Vec<u64> = Vec::with_capacity(slices.len());
+            for s in &slices {
+                starts.push(if s.is_empty() {
+                    Self::SENTINEL
+                } else {
+                    Self::block_start_of(s.start())?
+                });
+            }
+            // Read every non-null handle's overhead word under ONE lock via
             // `get_batched_gen` rather than one locked read per handle.
-            let mut nonempty: Vec<(usize, u64)> = Vec::with_capacity(slices.len()); // (slice idx, block)
-            for (si, s) in slices.iter().enumerate() {
-                if !s.is_empty() {
-                    nonempty.push((si, Self::block_start_of(s.start())?));
-                }
-            }
-            if nonempty.is_empty() {
-                return Ok(());
-            }
-            let mut words: Vec<[u8; 8]> = vec![[0u8; 8]; nonempty.len()];
-            let mut k = 0usize;
+            let mut words: Vec<[u8; 8]> = vec![[0u8; 8]; slices.len()];
+            let mut gi = 0usize;
             self.stack.get_batched_gen(|| {
-                if k >= nonempty.len() {
+                while gi < slices.len() && starts[gi] == Self::SENTINEL {
+                    gi += 1; // skip null handles
+                }
+                if gi >= slices.len() {
                     return None;
                 }
-                let off = nonempty[k].1;
-                // SAFETY: `words[k]` outlives this call; each step fills a distinct
+                let off = starts[gi];
+                // SAFETY: `words[gi]` outlives this call; each step fills a distinct
                 // index, ready before the next step requests the following one.
-                let buf = bstack_unsafe_reborrow_mut!(&mut words[k][..]);
-                k += 1;
+                let buf = bstack_unsafe_reborrow_mut!(&mut words[gi][..]);
+                gi += 1;
                 Some((off, buf))
             })?;
 
-            // Validate every handle and build the per-class chains in one pass (no
-            // I/O). `prev[class]` holds the batch index of the previous freed block
-            // of that class; it is valid exactly when `first[class] != SENTINEL` —
-            // which already records whether the class has been seen — so no
-            // `Option`. `touched[..ntouched]` lists the classes that got a block,
-            // in first-touch order. Reject a bad batch whole before any write.
-            let mut batch: Vec<(u64, [u8; 16])> = Vec::with_capacity(nonempty.len()); // (block, [free oh | next])
-            let mut prev = [0usize; Self::NUM_CLASSES as usize];
+            // Validate every handle and build each class's chain BACKWARD in one
+            // pass, so a block's `next` — the class's current chain head — is known
+            // when the block is pushed (its 16-byte payload is complete, no per-block
+            // back-patch). `first[class]` is the chain head so far (a plain offset,
+            // `SENTINEL` until the class is first seen); `tail_idx[class]` is the
+            // batch index of the class's first block, whose `next` is the one field
+            // patched at close (≤ NUM_CLASSES patches). `touched[..ntouched]` lists
+            // the classes in first-touch order. Reject a bad batch before any write.
+            let mut batch: Vec<(u64, [u8; 16])> = Vec::with_capacity(slices.len()); // (block, [free oh | next])
             let mut first = [Self::SENTINEL; Self::NUM_CLASSES as usize];
+            let mut tail_idx = [0usize; Self::NUM_CLASSES as usize];
             let mut touched = [0usize; Self::NUM_CLASSES as usize];
             let mut ntouched = 0usize;
-            let mut seen: HashSet<u64> = HashSet::with_capacity(nonempty.len());
-            for (kk, &(si, block_start)) in nonempty.iter().enumerate() {
-                let word = u64::from_le_bytes(words[kk]);
+            let mut seen: HashSet<u64> = HashSet::with_capacity(slices.len());
+            for (si, s) in slices.iter().enumerate() {
+                let block_start = starts[si];
+                if block_start == Self::SENTINEL {
+                    continue; // null handle
+                }
+                let word = u64::from_le_bytes(words[si]);
                 if word & Self::IN_USE_BIT == 0 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "dealloc_bulk: double free: block is already free",
+                    return Err(io_error!(
+                        InvalidInput,
+                        "dealloc_bulk: double free: block is already free"
                     ));
                 }
                 let size = (word & !Self::IN_USE_BIT) << 4;
-                if Self::phys_need(slices[si].len())? > size {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "dealloc_bulk: cannot free a mismatched slice",
+                if Self::phys_need(s.len())? > size {
+                    return Err(io_error!(
+                        InvalidInput,
+                        "dealloc_bulk: cannot free a mismatched slice"
                     ));
                 }
                 if !seen.insert(block_start) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "dealloc_bulk: double free: block appears twice",
+                    return Err(io_error!(
+                        InvalidInput,
+                        "dealloc_bulk: double free: block appears twice"
                     ));
                 }
                 let class = Self::classify(size) as usize;
                 let idx = batch.len();
                 let mut buf = [0u8; 16]; // [0..8] free overhead (size>>4), [8..16] next
                 write_buf!(size >> 4 => buf, 0);
+                // Backward link: next = the class's current chain head (SENTINEL for
+                // the first block of the class, patched to the head at close).
+                write_buf!(first[class] => buf, 8);
                 batch.push((block_start, buf));
-                if first[class] != Self::SENTINEL {
-                    // Link the previous block of this class to this one.
-                    write_buf!(block_start => batch[prev[class]].1, 8);
-                } else {
-                    first[class] = block_start;
+                if first[class] == Self::SENTINEL {
+                    tail_idx[class] = idx; // first block of the class is the chain tail
                     touched[ntouched] = class;
                     ntouched += 1;
                 }
-                prev[class] = idx;
+                first[class] = block_start; // this block is the new chain head
             }
 
-            // Close each class chain: the last block's next is seeded to the chain
-            // head (`first`), the placeholder `cross_exchange` swaps with the head.
+            // Close each class chain for a prepend splice: patch the tail block's
+            // `next` (still SENTINEL) to the chain head as the `cross_exchange`
+            // placeholder — one patch per touched class. The swap then puts the head
+            // at the free-list head and links the tail to the old head.
             let mut splices = [(0u64, 0u64); Self::NUM_CLASSES as usize];
             for (s, &class) in touched[..ntouched].iter().enumerate() {
-                let last_off = batch[prev[class]].0;
-                write_buf!(first[class] => batch[prev[class]].1, 8);
-                splices[s] = (last_off, class as u64);
+                let tail = tail_idx[class];
+                write_buf!(first[class] => batch[tail].1, 8);
+                splices[s] = (batch[tail].0, class as u64);
             }
 
             freeing = true;
             self.stack.set_batched(batch)?;
-            // Attempt every class splice even if one fails; an unspliced class is
-            // left free-tagged (reclaimed by `recover`). Surface the first error.
+            // One atomic `cross_exchange` per touched class: there is no primitive to
+            // fold several splices into one generator (`inplace_gen` forbids `Swap`,
+            // and `process_gen`'s `Swap` is a single terminal step). Every class is
+            // attempted even if one fails; the first error is surfaced and an
+            // unspliced class is left free-tagged (reclaimed by `recover`).
             let mut first_err: Option<io::Error> = None;
-            for &(last_block, class) in &splices[..ntouched] {
+            for &(tail_block, class) in &splices[..ntouched] {
                 if let Err(e) =
                     self.stack
-                        .cross_exchange(last_block + Self::OVERHEAD, Self::head_off(class), 8)
+                        .cross_exchange(tail_block + Self::OVERHEAD, Self::head_off(class), 8)
                 {
                     first_err.get_or_insert(e);
                 }
@@ -3408,6 +3439,35 @@ mod bulk_tests {
 
         a.dealloc(rem).unwrap();
         a.dealloc_bulk(slices).unwrap();
+        assert_eq!(unsafe { a.recover() }.unwrap(), 0);
+    }
+
+    #[test]
+    fn alloc_bulk_oversized_survivors_stay_reusable() {
+        let (a, _g) = new_alloc();
+        // Three equal oversized blocks on the free list, pinned off the tail.
+        let s1 = a.alloc(5000).unwrap();
+        let s2 = a.alloc(5000).unwrap();
+        let s3 = a.alloc(5000).unwrap();
+        let _pin = a.alloc(100).unwrap();
+        let mut freed = [s1.start() - 8, s2.start() - 8, s3.start() - 8];
+        freed.sort_unstable();
+        a.dealloc(s1).unwrap();
+        a.dealloc(s2).unwrap();
+        a.dealloc(s3).unwrap();
+        // Match one block; the matcher must unlink only it and leave the other two
+        // on the list (predecessor patched, survivors untouched).
+        let one = a.alloc_bulk([5000u64]).unwrap();
+        assert!(freed.contains(&(one[0].start() - 8)));
+        // The two survivors are still reachable and reused — no fresh extend.
+        let two = a.alloc_bulk([5000u64, 5000]).unwrap();
+        let mut used: Vec<u64> = std::iter::once(one[0].start() - 8)
+            .chain(two.iter().map(|s| s.start() - 8))
+            .collect();
+        used.sort_unstable();
+        assert_eq!(used, freed, "all three freed blocks reused exactly once");
+        a.dealloc_bulk(one).unwrap();
+        a.dealloc_bulk(two).unwrap();
         assert_eq!(unsafe { a.recover() }.unwrap(), 0);
     }
 
