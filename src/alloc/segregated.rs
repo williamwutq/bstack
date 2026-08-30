@@ -51,7 +51,7 @@ use crate::{bstack_unsafe_reborrow, bstack_unsafe_reborrow_mut};
 #[cfg(not(feature = "atomic"))]
 use std::cell::Cell;
 #[cfg(feature = "atomic")]
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 #[cfg(not(feature = "atomic"))]
 use std::marker::PhantomData;
 use std::{fmt, io};
@@ -963,131 +963,149 @@ impl SegregatedBStackAllocator {
     /// Pop up to `want[c]` blocks from every classed free list `c` in **one**
     /// crash-atomic [`BStack::inplace_gen`], advancing each touched `head[c]` past
     /// its last popped block. Every head advance commits together: on any error
-    /// the whole batch is discarded, so a failure pops **nothing** — no class is
-    /// left with blocks detached while another keeps its head (the O(n) cross-class
-    /// leak a per-class chase would risk). The oversized class is skipped (matched
-    /// separately). Returns the popped block starts flattened in ascending class
+    /// nothing is popped — no class is left with blocks detached while another
+    /// keeps its head (the O(n) cross-class leak a per-class chase would risk).
+    ///
+    /// The generator runs in two phases: a **read phase** chases every classed
+    /// list and computes each touched class's new head, then a **write phase**
+    /// emits those head advances. Because no write is staged until all reads have
+    /// completed, a read failure or a detected cycle can bail with `None` (which
+    /// commits the — still empty — batch), so no `Abort` is needed and no head
+    /// slot is mutated after a write is staged (the reborrow aliasing rule). The
+    /// oversized class is skipped (matched separately, and `want[OVERSIZED]` is
+    /// never set). Returns the popped block starts flattened in ascending class
     /// order, plus the per-class count actually popped (fewer than `want[c]` if
     /// that list ran out). Popped blocks are left **free-tagged and detached** —
     /// the caller claims them — and a crash before the claim leaves them
-    /// reclaimable by [`recover`](Self::recover). A cycle in any list aborts with
-    /// nothing popped.
-    fn pop_all_classes(&self, want: &[usize]) -> io::Result<(Vec<u64>, Vec<usize>)> {
+    /// reclaimable by [`recover`](Self::recover).
+    fn pop_all_classes(
+        &self,
+        want: &[usize],
+    ) -> io::Result<(Vec<u64>, [usize; Self::NUM_CLASSES as usize])> {
         let num = Self::NUM_CLASSES as usize;
-        let mut counts = vec![0usize; num];
-        // Touched classed classes (skip the oversized bucket and empty wants).
-        let touched: Vec<usize> = (0..num)
-            .filter(|&c| c as u64 != Self::OVERSIZED_CLASS && want[c] > 0)
-            .collect();
-        if touched.is_empty() {
+        let mut counts = [0usize; Self::NUM_CLASSES as usize];
+        // Total blocks wanted across all classes (the oversized bucket never has
+        // `want > 0`). Zero means nothing to pop.
+        let total_want: usize = want.iter().take(num).sum();
+        if total_want == 0 {
             return Ok((Vec::new(), counts));
         }
-        let total_want: usize = touched.iter().map(|&c| want[c]).sum();
         let mut popped: Vec<u64> = Vec::with_capacity(total_want);
         let mut seen: HashSet<u64> = HashSet::with_capacity(total_want);
         let mut head_buf = [0u8; 8];
         let mut next_buf = [0u8; 8];
-        // One 8-byte buffer per touched class holds that class's new head value;
-        // a terminal head write borrows it until the final commit, so it must not
-        // share storage with the reused `next_buf`.
-        let mut head_writes: Vec<[u8; 8]> = vec![[0u8; 8]; touched.len()];
-        let mut cycle = false;
-        let mut fatal: Option<io::Error> = None;
+        // Each touched class's new head value, all computed in the read phase and
+        // only emitted in the write phase: a head slot is never mutated after any
+        // write is staged, so the reborrow is sound. `advance[c]` marks the
+        // classes that actually popped a block (an empty list advances nothing).
+        let mut head_writes = [[0u8; 8]; Self::NUM_CLASSES as usize];
+        let mut advance = [false; Self::NUM_CLASSES as usize];
+        let mut err: Option<io::Error> = None;
 
         #[derive(Clone, Copy)]
         enum St {
-            ClassStart(usize),
+            // Read phase: chase class `c`'s chain (empty `want[c]` skipped).
+            Chase(usize),
             ConsumeHead(usize),
-            ReadNext(usize, u64),
-            ConsumeNext(usize, u64),
-            EmitHead(usize),
+            ReadNode(usize, u64),
+            ConsumeNode(usize, u64),
+            // Write phase: emit the advanced heads, then finish.
+            Emit(usize),
             Done,
         }
-        let mut st = St::ClassStart(0);
+        let mut st = St::Chase(0);
         let mut in_class = 0usize; // blocks popped so far from the current class
 
         self.stack.inplace_gen(|res| {
-            // A prior read failed: discard the whole batch (pop nothing).
+            // A prior read failed. All writes live in the write phase, entered
+            // only once every read has completed, so nothing is staged yet:
+            // ending with `None` commits the empty batch (pops nothing).
             if let Err(e) = res {
-                fatal = Some(e);
-                return Some(BStackGenOp::Abort {
-                    source: Some(io::Error::other("alloc_bulk: free-list read failed")),
-                });
+                err = Some(e);
+                return None;
             }
             loop {
                 match st {
-                    St::ClassStart(ti) => {
-                        if ti >= touched.len() {
-                            st = St::Done;
-                            return None; // commit the accumulated head advances
+                    // --- read phase ---
+                    St::Chase(c) => {
+                        if c >= num {
+                            st = St::Emit(0);
+                            continue;
+                        }
+                        if want[c] == 0 {
+                            st = St::Chase(c + 1);
+                            continue;
                         }
                         in_class = 0;
-                        st = St::ConsumeHead(ti);
+                        st = St::ConsumeHead(c);
                         return Some(BStackGenOp::Read {
-                            offset: Self::head_off(touched[ti] as u64),
+                            offset: Self::head_off(c as u64),
                             // SAFETY: `head_buf` outlives this call.
                             buf: bstack_unsafe_reborrow_mut!(&mut head_buf[..]),
                         });
                     }
-                    St::ConsumeHead(ti) => {
+                    St::ConsumeHead(c) => {
                         let head = u64::from_le_bytes(head_buf);
                         if head == Self::SENTINEL {
-                            st = St::ClassStart(ti + 1); // empty: no write
+                            st = St::Chase(c + 1); // empty list: no head advance
                         } else {
-                            st = St::ReadNext(ti, head);
+                            st = St::ReadNode(c, head);
                         }
                     }
-                    St::ReadNext(ti, cursor) => {
-                        // A revisited block means a cycle: abort, popping nothing.
+                    St::ReadNode(c, cursor) => {
+                        // A revisited block means a cycle: bail popping nothing.
+                        // No write is staged yet, so `None` commits nothing.
                         if !seen.insert(cursor) {
-                            cycle = true;
-                            return Some(BStackGenOp::Abort {
-                                source: Some(io::Error::new(
-                                    io::ErrorKind::InvalidData,
-                                    "alloc_bulk: free-list cycle detected",
-                                )),
-                            });
+                            err = Some(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "alloc_bulk: free-list cycle detected",
+                            ));
+                            return None;
                         }
-                        st = St::ConsumeNext(ti, cursor);
+                        st = St::ConsumeNode(c, cursor);
                         return Some(BStackGenOp::Read {
                             offset: cursor + Self::OVERHEAD,
                             // SAFETY: `next_buf` outlives this call.
                             buf: bstack_unsafe_reborrow_mut!(&mut next_buf[..]),
                         });
                     }
-                    St::ConsumeNext(ti, cursor) => {
+                    St::ConsumeNode(c, cursor) => {
                         popped.push(cursor);
-                        counts[touched[ti]] += 1;
+                        counts[c] += 1;
                         in_class += 1;
                         let next = u64::from_le_bytes(next_buf);
-                        if in_class == want[touched[ti]] || next == Self::SENTINEL {
-                            head_writes[ti] = next.to_le_bytes();
-                            st = St::EmitHead(ti);
+                        if in_class == want[c] || next == Self::SENTINEL {
+                            head_writes[c] = next.to_le_bytes();
+                            advance[c] = true;
+                            st = St::Chase(c + 1);
                         } else {
-                            st = St::ReadNext(ti, next);
+                            st = St::ReadNode(c, next);
                         }
                     }
-                    St::EmitHead(ti) => {
-                        st = St::ClassStart(ti + 1);
+                    // --- write phase ---
+                    St::Emit(c) => {
+                        let mut c = c;
+                        while c < num && !advance[c] {
+                            c += 1;
+                        }
+                        if c >= num {
+                            st = St::Done;
+                            return None; // commit the accumulated head advances
+                        }
+                        st = St::Emit(c + 1);
                         return Some(BStackGenOp::Write {
-                            offset: Self::head_off(touched[ti] as u64),
-                            // SAFETY: `head_writes[ti]` outlives this call and is
-                            // not mutated after being set just above.
-                            data: bstack_unsafe_reborrow!(&head_writes[ti][..]),
+                            offset: Self::head_off(c as u64),
+                            // SAFETY: `head_writes[c]` outlives this call and was
+                            // set in the read phase, never mutated after any write.
+                            data: bstack_unsafe_reborrow!(&head_writes[c][..]),
                         });
                     }
                     St::Done => return None,
                 }
             }
         })?;
-        if let Some(e) = fatal {
+        if let Some(e) = err {
             return Err(e);
-        }
-        if cycle {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "alloc_bulk: free-list cycle detected",
-            ));
         }
         Ok((popped, counts))
     }
@@ -1102,23 +1120,19 @@ impl SegregatedBStackAllocator {
         if blocks.is_empty() {
             return;
         }
-        // Bucket by class without a Vec-per-class: sort a working copy by class,
-        // then splice each contiguous run.
-        let mut by_class: Vec<(u64, u64, u64)> = blocks
-            .iter()
-            .map(|&(off, size)| (Self::classify(size), off, size))
-            .collect();
-        by_class.sort_by_key(|&(class, _, _)| class);
+        // Bucket by class without a Vec-per-class: sort one working copy by class
+        // (classify recomputed on demand, so no `(class, off, size)` triple), then
+        // splice each contiguous run straight from a sub-slice.
+        let mut blocks = blocks.to_vec();
+        blocks.sort_unstable_by_key(|&(_, size)| Self::classify(size));
         let mut i = 0usize;
-        while i < by_class.len() {
-            let class = by_class[i].0;
-            let mut j = i;
-            let mut run: Vec<(u64, u64)> = Vec::new();
-            while j < by_class.len() && by_class[j].0 == class {
-                run.push((by_class[j].1, by_class[j].2));
+        while i < blocks.len() {
+            let class = Self::classify(blocks[i].1);
+            let mut j = i + 1;
+            while j < blocks.len() && Self::classify(blocks[j].1) == class {
                 j += 1;
             }
-            let _ = self.splice_class_chain(class, &run);
+            let _ = self.splice_class_chain(class, &blocks[i..j]);
             i = j;
         }
     }
@@ -1216,16 +1230,14 @@ impl SegregatedBStackAllocator {
     /// cannot be lost. Every `blocks[i]` must map to `class` (all classed blocks of
     /// one class share a size; the oversized bucket holds any size). No-op if empty.
     fn splice_class_chain(&self, class: u64, blocks: &[(u64, u64)]) -> io::Result<()> {
-        let k = blocks.len();
-        if k == 0 {
+        if blocks.is_empty() {
             return Ok(());
         }
-        let mut batch: Vec<(u64, [u8; 16])> = Vec::with_capacity(k);
-        for i in 0..k {
-            let (block, size) = blocks[i];
+        let mut batch: Vec<(u64, [u8; 16])> = Vec::with_capacity(blocks.len());
+        for (i, &(block, size)) in blocks.iter().enumerate() {
             // Last block's next is the placeholder `blocks[0]` that cross_exchange
             // replaces with the old head.
-            let next = if i + 1 < k {
+            let next = if i + 1 < blocks.len() {
                 blocks[i + 1].0
             } else {
                 blocks[0].0
@@ -1236,8 +1248,11 @@ impl SegregatedBStackAllocator {
             batch.push((block, buf));
         }
         self.stack.set_batched(batch)?;
-        self.stack
-            .cross_exchange(blocks[k - 1].0 + Self::OVERHEAD, Self::head_off(class), 8)
+        self.stack.cross_exchange(
+            blocks[blocks.len() - 1].0 + Self::OVERHEAD,
+            Self::head_off(class),
+            8,
+        )
     }
 }
 
@@ -1296,7 +1311,9 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
         // oversized ones are collected for separate matching. No `Vec<Vec>`.
         let mut block_of = vec![0u64; n];
         let mut class_of = vec![0u64; n];
-        let mut want = vec![0usize; num];
+        // Per-class counts and offsets are bounded by `NUM_CLASSES` (a constant),
+        // so they live on the stack, not the heap.
+        let mut want = [0usize; Self::NUM_CLASSES as usize];
         let mut oversized_reqs: Vec<usize> = Vec::new();
         for (i, &len) in lengths.iter().enumerate() {
             if len == 0 {
@@ -1315,13 +1332,13 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
 
         // Counting-sort classed request indices into `order`, grouped by class,
         // with `req_base[c]` the start of class `c`'s run.
-        let mut req_base = vec![0usize; num + 1];
+        let mut req_base = [0usize; Self::NUM_CLASSES as usize + 1];
         for c in 0..num {
             req_base[c + 1] = req_base[c] + want[c];
         }
         let mut order = vec![0usize; req_base[num]];
         {
-            let mut cur: Vec<usize> = req_base[..num].to_vec();
+            let mut cur = req_base; // Copy: a per-class write cursor.
             for (i, &len) in lengths.iter().enumerate() {
                 if len == 0 {
                     continue;
@@ -1347,16 +1364,16 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
             let mut carve_free: Vec<(u64, u64)> = Vec::new(); // carve remainder: free overhead
             let mut to_splice: Vec<(u64, u64)> = Vec::new(); // free blocks to relink (best-effort)
 
-            // 1. Atomic classed pop across all touched classes.
+            // 1. Atomic classed pop across all touched classes. `popped` is
+            //    already flattened in ascending class order, so one running index
+            //    walks it — no per-class base array.
             let (popped, popped_counts) = self.pop_all_classes(&want)?;
-            let mut pop_base = vec![0usize; num + 1];
-            for c in 0..num {
-                pop_base[c + 1] = pop_base[c] + popped_counts[c];
-            }
+            let mut pi = 0usize;
             for c in 0..num {
                 for k in 0..popped_counts[c] {
                     let i = order[req_base[c] + k];
-                    let bs = popped[pop_base[c] + k];
+                    let bs = popped[pi];
+                    pi += 1;
                     let size = block_of[i]; // classed: block == class block size
                     assign[i] = Some(bs);
                     detached.push((bs, size));
@@ -1369,7 +1386,9 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
             // 2. Oversized matching (largest request first), with SPLIT_MIN carve.
             if !oversized_reqs.is_empty() {
                 let free_blocks = self.detach_oversized_all()?;
-                let mut reqs: Vec<usize> = oversized_reqs.clone();
+                // Match largest request first; `oversized_reqs` is not used again,
+                // so sort it in place rather than cloning.
+                let reqs = &mut oversized_reqs;
                 reqs.sort_unstable_by(|&x, &y| block_of[y].cmp(&block_of[x]));
                 let mut matched = vec![false; reqs.len()];
                 for &(boff, bsize) in &free_blocks {
@@ -1455,43 +1474,50 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
                 }
             }
 
-            // 4. Claim: one crash-atomic `set_batched` with buffers shared per size.
-            //    Reused blocks get a full-block scrub; fresh blocks just the in-use
-            //    overhead; carve remainders their free overhead (recover-safe).
-            let mut scrub_buf: HashMap<u64, Vec<u8>> = HashMap::new();
+            // 4. Claim: one crash-atomic `set_batched`. Every block's 8-byte
+            //    overhead word is owned in one flat `oh_words` Vec (no per-size
+            //    `HashMap` of buffers) — in claim order: reused (scrub) blocks
+            //    marked in-use, then fresh blocks marked in-use, then carve
+            //    remainders marked free. Reused blocks additionally scrub their
+            //    body, which is all zeros, so every scrub shares one zero buffer
+            //    sub-sliced to its body length (no per-block heap allocation).
+            let njobs = scrub.len() + oh_only.len() + carve_free.len();
+            let mut oh_words: Vec<[u8; 8]> = Vec::with_capacity(njobs);
             for &(_, size) in &scrub {
-                scrub_buf.entry(size).or_insert_with(|| {
-                    let mut b = vec![0u8; size as usize];
-                    write_buf!(Self::IN_USE_BIT | (size >> 4) => b, 0);
-                    b
-                });
+                let mut oh = [0u8; 8];
+                write_buf!(Self::IN_USE_BIT | (size >> 4) => oh, 0);
+                oh_words.push(oh);
             }
-            let mut inuse_oh: HashMap<u64, [u8; 8]> = HashMap::new();
             for &(_, size) in &oh_only {
-                inuse_oh.entry(size).or_insert_with(|| {
-                    let mut b = [0u8; 8];
-                    write_buf!(Self::IN_USE_BIT | (size >> 4) => b, 0);
-                    b
-                });
+                let mut oh = [0u8; 8];
+                write_buf!(Self::IN_USE_BIT | (size >> 4) => oh, 0);
+                oh_words.push(oh);
             }
-            let mut free_oh: HashMap<u64, [u8; 8]> = HashMap::new();
             for &(_, size) in &carve_free {
-                free_oh.entry(size).or_insert_with(|| {
-                    let mut b = [0u8; 8];
-                    write_buf!(size >> 4 => b, 0);
-                    b
-                });
+                let mut oh = [0u8; 8];
+                write_buf!(size >> 4 => oh, 0); // free tag: high bit clear
+                oh_words.push(oh);
             }
-            let mut batch: Vec<(u64, &[u8])> =
-                Vec::with_capacity(scrub.len() + oh_only.len() + carve_free.len());
+            let max_scrub = scrub.iter().map(|&(_, s)| s).max().unwrap_or(0);
+            let zeros = vec![0u8; max_scrub.saturating_sub(Self::OVERHEAD) as usize];
+            let mut batch: Vec<(u64, &[u8])> = Vec::with_capacity(njobs + scrub.len());
+            let mut w = 0usize;
             for &(off, size) in &scrub {
-                batch.push((off, &scrub_buf[&size][..]));
+                batch.push((off, &oh_words[w][..]));
+                w += 1;
+                let body = (size - Self::OVERHEAD) as usize;
+                if body > 0 {
+                    // Adjacent to the overhead, non-overlapping: a full-block scrub.
+                    batch.push((off + Self::OVERHEAD, &zeros[..body]));
+                }
             }
-            for &(off, size) in &oh_only {
-                batch.push((off, &inuse_oh[&size][..]));
+            for &(off, _) in &oh_only {
+                batch.push((off, &oh_words[w][..]));
+                w += 1;
             }
-            for &(off, size) in &carve_free {
-                batch.push((off, &free_oh[&size][..]));
+            for &(off, _) in &carve_free {
+                batch.push((off, &oh_words[w][..]));
+                w += 1;
             }
             if !batch.is_empty() {
                 self.stack.set_batched(batch)?;
@@ -1558,7 +1584,6 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
     ) -> Result<(), BStackBulkAllocError<'a, Self>> {
         let slices: Vec<BStackOwnedSlice<'a, Self>> = handles.into_iter().collect();
         let slices = ensure_own_handles(self, slices, "SegregatedBStackAllocator::dealloc_bulk")?;
-        let num = Self::NUM_CLASSES as usize;
 
         let mut freeing = false;
         let result = (|| -> io::Result<()> {
@@ -1568,9 +1593,13 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
             // chain tail (seeded to the chain head once the pass ends). Reject a bad
             // batch whole before any write.
             let mut batch: Vec<(u64, [u8; 16])> = Vec::new(); // (block, [free oh | next])
-            let mut prev: Vec<Option<usize>> = vec![None; num];
-            let mut first: Vec<u64> = vec![Self::SENTINEL; num];
-            let mut touched: Vec<usize> = Vec::new();
+            // Per-class state is bounded by `NUM_CLASSES` (a constant), so it lives
+            // on the stack. `touched[..ntouched]` lists the classes that got a
+            // block, in first-touch order.
+            let mut prev = [None::<usize>; Self::NUM_CLASSES as usize];
+            let mut first = [Self::SENTINEL; Self::NUM_CLASSES as usize];
+            let mut touched = [0usize; Self::NUM_CLASSES as usize];
+            let mut ntouched = 0usize;
             let mut seen: HashSet<u64> = HashSet::new();
             for s in &slices {
                 if s.is_empty() {
@@ -1607,7 +1636,8 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
                     write_buf!(block_start => batch[p].1, 8);
                 } else {
                     first[class] = block_start;
-                    touched.push(class);
+                    touched[ntouched] = class;
+                    ntouched += 1;
                 }
                 prev[class] = Some(idx);
             }
@@ -1617,12 +1647,12 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
 
             // Close each class chain: the last block's next is seeded to the chain
             // head (`first`), the placeholder `cross_exchange` swaps with the head.
-            let mut splices: Vec<(u64, u64)> = Vec::with_capacity(touched.len());
-            for &class in &touched {
+            let mut splices = [(0u64, 0u64); Self::NUM_CLASSES as usize];
+            for (s, &class) in touched[..ntouched].iter().enumerate() {
                 let last = prev[class].expect("touched class has a last block");
                 let last_off = batch[last].0;
                 write_buf!(first[class] => batch[last].1, 8);
-                splices.push((last_off, class as u64));
+                splices[s] = (last_off, class as u64);
             }
 
             freeing = true;
@@ -1630,7 +1660,7 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
             // Attempt every class splice even if one fails; an unspliced class is
             // left free-tagged (reclaimed by `recover`). Surface the first error.
             let mut first_err: Option<io::Error> = None;
-            for (last_block, class) in splices {
+            for &(last_block, class) in &splices[..ntouched] {
                 if let Err(e) =
                     self.stack
                         .cross_exchange(last_block + Self::OVERHEAD, Self::head_off(class), 8)

@@ -494,10 +494,10 @@ With `atomic`, implements `BStackBulkAllocator`; work is bounded by the distinct
 
 | Operation      | Strategy                                                                                                                                        |
 |----------------|------------------------------------------------------------------------------------------------------------------------------------------------|
-| `alloc_bulk`   | Group classed requests by class and chase each class's free list once (`process_gen`); detach the oversized list whole and assign each free block to the largest request it fits (retaining the whole block), re-splicing the unmatched; serve the remaining misses from one `extend`; mark in-use + scrub in one `set_batched` |
+| `alloc_bulk`   | Count classed requests by class and drain every touched class's free list in one atomic multi-class pop (`inplace_gen`: read every chain, then advance every head — a failure pops nothing); detach the oversized list whole and assign each free block to the largest request it fits, carving a block whose slack reaches `SPLIT_MIN` (freeing the remainder) and re-splicing the unmatched; serve the remaining misses from one `extend_sparse_batched` that writes each fresh block's *free* overhead (self-describing tail); mark in-use + scrub in one `set_batched` |
 | `dealloc_bulk` | Validate/reject double-frees (incl. a block twice in the batch); group freed blocks by class, stage each class's chain in one `set_batched`, and splice each onto its class head with one `cross_exchange` |
 
-Blocks pulled from the free lists are left free-tagged until the final claim, so a crash leaves them reclaimable by `recover` and the fresh (zero) tail discardable. On an I/O failure the detached blocks are re-pushed to their class lists and the fresh tail discarded, best-effort.
+Blocks pulled from the free lists are left free-tagged until the final claim, so a crash leaves them reclaimable by `recover`; the freshly extended tail is free-tagged too (its blocks carry a *free* overhead word, so `recover` relinks them rather than mistaking a mid-arena zero hole for an orphaned tail to truncate). On an I/O failure the fresh tail is discarded first and the detached blocks re-pushed to their class lists, both best-effort.
 
 ### Realloc
 
