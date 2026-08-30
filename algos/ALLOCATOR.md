@@ -312,6 +312,8 @@ With `atomic`, implements `BStackBulkAllocator`; each request yields its own fre
 | `alloc_bulk`   | Pop single-block requests from the free list in one `process_gen` chase; serve oversized runs and any overflow from one `extend`; scrub recycled blocks in one streamed `inplace_gen` (shared buffer) |
 | `dealloc_bulk` | Thread the whole batch into one chain with one `set_batched`, then splice onto the free list with one `cross_exchange` (freed runs go to the list, never discarded) |
 
+If an `alloc_bulk` step fails after popping, cleanup first truncates the fresh tail and returns the popped blocks to the free list; if the tail cannot be truncated, its blocks are recycled onto the free list too, so nothing leaks.
+
 ### Crash consistency
 
 Each free-list mutation is two `BStack` calls: write the next-pointer into the block, then update `free_head` in the header.  A crash between the two calls leaks the block being added or removed but leaves the rest of the free list intact.  No recovery scan is required on reopen.
@@ -393,6 +395,8 @@ With `atomic`, implements `BStackBulkAllocator`; each request yields its own fre
 |----------------|-----------------------------------------------------------------------------------------------------------------------------------------------|
 | `alloc_bulk`   | Pop single-block requests from the free list in one `process_gen` chase; serve oversized runs and any overflow from one `extend`; write every overhead tag (and scrub recycled blocks) in one streamed `inplace_gen` |
 | `dealloc_bulk` | Validate/reject double-frees first (including a block repeated within the batch); clear every freed overhead and thread the chain in one `set_batched`, then splice with one `cross_exchange`. A crash leaves only `recover`-reclaimable zero-overhead leaks |
+
+If an `alloc_bulk` step fails after popping, cleanup first truncates the fresh tail and returns the popped blocks to the free list; if the tail cannot be truncated, its blocks are recycled onto the free list too. Anything the best-effort cleanup misses is a zero-overhead leak `recover` reclaims.
 
 ### Crash consistency
 
