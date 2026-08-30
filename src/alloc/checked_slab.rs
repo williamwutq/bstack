@@ -1882,7 +1882,12 @@ impl CheckedSlabBStackAllocator {
             b[..8].copy_from_slice(&(Self::IN_USE_BIT | 1).to_le_bytes());
             b
         };
-        let mut popped: Vec<u64> = Vec::with_capacity(singles);
+        // Slices are built straight into `result` during the chase (with null
+        // slots for zero-length requests); the claim phase reads their block
+        // starts back, so no separate list of popped offsets is kept.
+        let mut result: Vec<BStackOwnedSlice<'_, Self>> = Vec::with_capacity(lengths.len());
+        let mut len_idx = 0usize;
+        let mut collected = 0usize;
         let mut head_buf = [0u8; 8];
         let mut node_buf = [0u8; 16];
         let mut enough = false;
@@ -1934,9 +1939,23 @@ impl CheckedSlabBStackAllocator {
                             corrupt = Some((cursor, overhead));
                             st = St::Abort;
                         } else {
-                            popped.push(cursor);
+                            // Place this block into the next non-null request slot,
+                            // emitting null slices for zero-length requests first.
+                            while len_idx < lengths.len() && lengths[len_idx] == 0 {
+                                result.push(BStackOwnedSlice::empty(self));
+                                len_idx += 1;
+                            }
+                            let len = lengths[len_idx];
+                            len_idx += 1;
+                            // SAFETY: a live block just popped; the WriteClaim below
+                            // marks + scrubs it before commit. The data region
+                            // begins at `cursor + OVERHEAD` and spans `len ≤ data_size`.
+                            result.push(unsafe {
+                                BStackOwnedSlice::from_raw_parts(self, cursor + Self::OVERHEAD, len)
+                            });
+                            collected += 1;
                             let next = u64::from_le_bytes(node_buf[8..16].try_into().unwrap());
-                            if popped.len() == singles {
+                            if collected == singles {
                                 enough = true;
                                 st = St::WriteHead;
                             } else if next == Self::SENTINEL {
@@ -1957,16 +1976,20 @@ impl CheckedSlabBStackAllocator {
                             data: bstack_unsafe_reborrow!(&node_buf[8..16]),
                         });
                     }
-                    // `i` indexes `popped`, filled during the chase, so every index
-                    // below `popped.len()` is in bounds; the guard ends the
-                    // sequence once all blocks are claimed.
-                    St::WriteClaim(i) => {
-                        let Some(&off) = popped.get(i) else {
-                            return None; // commit
+                    // Claim each real block just placed in `result`, skipping null
+                    // (zero-length) slots. `result` is complete by the write phase.
+                    St::WriteClaim(k) => {
+                        let mut j = k;
+                        while j < result.len() && result[j].is_empty() {
+                            j += 1;
+                        }
+                        let Some(slice) = result.get(j) else {
+                            return None; // all claimed: commit
                         };
-                        st = St::WriteClaim(i + 1);
+                        let block_start = slice.start() - Self::OVERHEAD;
+                        st = St::WriteClaim(j + 1);
                         return Some(BStackGenOp::Write {
-                            offset: off,
+                            offset: block_start,
                             // SAFETY: `claim_buf` outlives this call and is never
                             // mutated; every write aliases it read-only.
                             data: bstack_unsafe_reborrow!(&claim_buf[..]),
@@ -1989,31 +2012,26 @@ impl CheckedSlabBStackAllocator {
         if !enough {
             return Ok(None);
         }
-        // Map the popped blocks onto the requests in order (all single-block).
-        let mut popped_iter = popped.into_iter();
-        let mut result = Vec::with_capacity(lengths.len());
-        for &len in lengths {
-            if len == 0 {
-                result.push(BStackOwnedSlice::empty(self));
-            } else {
-                let block_start = popped_iter.next().unwrap();
-                // SAFETY: a live block just popped and claimed; the data region
-                // begins at `block_start + OVERHEAD` and spans `len ≤ data_size`.
-                result.push(unsafe {
-                    BStackOwnedSlice::from_raw_parts(self, block_start + Self::OVERHEAD, len)
-                });
-            }
+        // Emit null slices for any trailing zero-length requests.
+        while len_idx < lengths.len() {
+            result.push(BStackOwnedSlice::empty(self));
+            len_idx += 1;
         }
         Ok(Some(result))
     }
 
-    /// Commit the claim for each job in one crash-atomic multi-write.
+    /// Commit the claim for each `(block_start, overhead)` job in one crash-atomic
+    /// multi-write.
     ///
-    /// Streaming through [`BStack::inplace_gen`] lets every recycled block reuse a
-    /// single `claim_buf`, so peak memory is one `block_size` buffer regardless of
-    /// how many blocks are recycled; each extended block's overhead is carried
-    /// inline in the job, needing no separate buffer.
-    fn claim_blocks(&self, jobs: &[(u64, CheckedClaim)]) -> io::Result<()> {
+    /// An **all-zero** overhead is the sentinel for a recycled free-list block:
+    /// its stale payload is scrubbed by writing the whole shared `claim_buf`
+    /// (overhead `IN_USE_BIT | 1` then zeros). A valid in-use overhead always has
+    /// the high bit set, so it is never all-zero — no ambiguity. Any other
+    /// overhead is an extended block, whose data already reads as zero for free,
+    /// so only the 8-byte overhead is written. Streaming through
+    /// [`BStack::inplace_gen`] lets every recycled block reuse the single
+    /// `claim_buf`, so peak memory is one `block_size` buffer.
+    fn claim_blocks(&self, jobs: &[(u64, [u8; 8])]) -> io::Result<()> {
         if jobs.is_empty() {
             return Ok(());
         }
@@ -2026,11 +2044,12 @@ impl CheckedSlabBStackAllocator {
         self.stack.inplace_gen(|_prev| {
             // `i` walks `jobs` (collected before this call), so `get` is in bounds
             // until it runs off the end, where `?` ends the sequence.
-            let (off, claim) = jobs.get(i)?;
+            let (off, overhead) = jobs.get(i)?;
             i += 1;
-            let data: &[u8] = match claim {
-                CheckedClaim::Recycled => &claim_buf[..],
-                CheckedClaim::Extended(bytes) => &bytes[..],
+            let data: &[u8] = if *overhead == [0u8; 8] {
+                &claim_buf[..] // recycled: full-block scrub
+            } else {
+                &overhead[..] // extended: overhead only
             };
             Some(BStackGenOp::Write {
                 offset: *off,
@@ -2066,19 +2085,37 @@ impl CheckedSlabBStackAllocator {
         self.stack
             .cross_exchange(blocks[k - 1] + Self::OVERHEAD, Self::FREE_HEAD_OFFSET, 8)
     }
-}
 
-/// How the checked [`alloc_bulk`](BStackBulkAllocator::alloc_bulk) claim writes a
-/// block. Carried inline in the job list so the extended overheads need no
-/// separate buffer allocation.
-#[cfg(feature = "atomic")]
-#[derive(Clone, Copy)]
-enum CheckedClaim {
-    /// Recycled free-list block: write the whole shared claim buffer (overhead
-    /// `IN_USE_BIT | 1` then a zero scrub of the stale payload).
-    Recycled,
-    /// Extended block: write just this 8-byte overhead word.
-    Extended([u8; 8]),
+    /// Best-effort cleanup after an `alloc_bulk` extend path fails partway.
+    ///
+    /// Truncating the fresh tail is preferred (it shrinks the file); the popped
+    /// blocks then go back to the free list. If the truncation cannot happen (I/O
+    /// error, or another thread grew the tail past ours), the `remainder` fresh
+    /// blocks are recycled onto the free list alongside the popped ones instead of
+    /// being leaked. `ext_bytes == 0` means no tail was created (the extend itself
+    /// failed), so only the popped blocks are returned. Every step is best-effort:
+    /// a failure here leaves the blocks as zero-overhead leaks that
+    /// [`recover`](CheckedSlabBStackAllocator::recover) reclaims.
+    fn reclaim_after_alloc_failure(&self, popped: &[u64], ext_base: u64, ext_bytes: u64) {
+        let bs = self.block_size;
+        // 1. Try to truncate the fresh tail first.
+        let truncated = ext_bytes == 0
+            || self
+                .stack
+                .try_discard(ext_base + ext_bytes, ext_bytes)
+                .unwrap_or(false);
+        if truncated {
+            // 2. Tail gone (or never created): return only the popped blocks.
+            let _ = self.splice_blocks_onto_free_list(popped);
+        } else {
+            // 3. Could not truncate: return the popped blocks AND the fresh tail.
+            let n_tail = ext_bytes / bs;
+            let mut blocks: Vec<u64> = Vec::with_capacity(popped.len() + n_tail as usize);
+            blocks.extend_from_slice(popped);
+            blocks.extend((0..n_tail).map(|i| ext_base + i * bs));
+            let _ = self.splice_blocks_onto_free_list(&blocks);
+        }
+    }
 }
 
 /// [`CheckedSlabBStackAllocator`] batches whole runs of fixed-size blocks.
@@ -2182,8 +2219,8 @@ impl BStackBulkAllocator for CheckedSlabBStackAllocator {
             match self.stack.extend(bytes) {
                 Ok(base) => (base, bytes),
                 Err(e) => {
-                    // Best-effort: return the detached blocks to the free list.
-                    let _ = self.splice_blocks_onto_free_list(&popped);
+                    // No tail was created: return the detached blocks only.
+                    self.reclaim_after_alloc_failure(&popped, 0, 0);
                     return Err(e);
                 }
             }
@@ -2191,13 +2228,13 @@ impl BStackBulkAllocator for CheckedSlabBStackAllocator {
             (0, 0)
         };
 
-        // Assign a region per request and record how each block is claimed: a
-        // recycled block writes the shared full-block image, an extended block
-        // only its 8-byte overhead (carried inline in the job).
+        // Assign a region per request and record each block's claim overhead: an
+        // all-zero overhead marks a recycled block (full-block scrub), otherwise
+        // the 8-byte in-use overhead of an extended block.
         let mut popped_iter = popped.iter().copied();
         let mut ext_cursor = ext_base;
         let mut result = Vec::with_capacity(lengths.len());
-        let mut jobs: Vec<(u64, CheckedClaim)> = Vec::with_capacity(lengths.len());
+        let mut jobs: Vec<(u64, [u8; 8])> = Vec::with_capacity(lengths.len());
         for (&len, &n) in lengths.iter().zip(counts.iter()) {
             if n == 0 {
                 result.push(BStackOwnedSlice::empty(self));
@@ -2205,25 +2242,19 @@ impl BStackBulkAllocator for CheckedSlabBStackAllocator {
             }
             let block_start = if n == 1 {
                 if let Some(b) = popped_iter.next() {
-                    jobs.push((b, CheckedClaim::Recycled));
+                    jobs.push((b, [0u8; 8])); // recycled sentinel
                     b
                 } else {
                     let b = ext_cursor;
                     ext_cursor += bs;
-                    jobs.push((
-                        b,
-                        CheckedClaim::Extended((Self::IN_USE_BIT | 1).to_le_bytes()),
-                    ));
+                    jobs.push((b, (Self::IN_USE_BIT | 1).to_le_bytes()));
                     b
                 }
             } else {
                 let b = ext_cursor;
                 ext_cursor += n * bs;
                 // Multi-block: overhead lives in the first block only.
-                jobs.push((
-                    b,
-                    CheckedClaim::Extended((Self::IN_USE_BIT | n).to_le_bytes()),
-                ));
+                jobs.push((b, (Self::IN_USE_BIT | n).to_le_bytes()));
                 b
             };
             // SAFETY: `block_start` names a live block just popped or extended;
@@ -2234,15 +2265,12 @@ impl BStackBulkAllocator for CheckedSlabBStackAllocator {
             });
         }
 
-        // Commit every claim atomically. On failure, roll back best-effort: return
-        // the popped blocks to the free list and discard the fresh tail (both
-        // still have zero overhead, so `recover` reclaims whatever the rollback
-        // could not).
+        // Commit every claim atomically. On failure, roll back best-effort:
+        // truncate the fresh tail (or recycle it if that fails) and return the
+        // popped blocks to the free list; anything the rollback misses is a
+        // zero-overhead leak that `recover` reclaims.
         if let Err(e) = self.claim_blocks(&jobs) {
-            let _ = self.splice_blocks_onto_free_list(&popped);
-            if ext_bytes > 0 {
-                let _ = self.stack.try_discard(ext_base + ext_bytes, ext_bytes);
-            }
+            self.reclaim_after_alloc_failure(&popped, ext_base, ext_bytes);
             return Err(e);
         }
         Ok(result)

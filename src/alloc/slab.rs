@@ -1054,7 +1054,12 @@ impl SlabBStackAllocator {
         debug_assert!(singles > 0);
         let bs = self.block_size;
         let zero_block = vec![0u8; bs as usize];
-        let mut popped: Vec<u64> = Vec::with_capacity(singles);
+        // Slices are built straight into `result` during the chase (with null
+        // slots for zero-length requests); the scrub phase reads their offsets
+        // back, so no separate list of popped offsets is kept.
+        let mut result: Vec<BStackOwnedSlice<'_, Self>> = Vec::with_capacity(lengths.len());
+        let mut len_idx = 0usize;
+        let mut collected = 0usize;
         let mut head_buf = [0u8; 8];
         let mut node_buf = [0u8; 8];
         let mut enough = false;
@@ -1101,9 +1106,20 @@ impl SlabBStackAllocator {
                         });
                     }
                     St::ConsumeNode(cursor) => {
-                        popped.push(cursor);
+                        // Place this block into the next non-null request slot,
+                        // emitting null slices for any zero-length requests first.
+                        while len_idx < lengths.len() && lengths[len_idx] == 0 {
+                            result.push(BStackOwnedSlice::empty(self));
+                            len_idx += 1;
+                        }
+                        let len = lengths[len_idx];
+                        len_idx += 1;
+                        // SAFETY: a live `block_size`-aligned block just popped; the
+                        // WriteClaim below scrubs it before commit; `len ≤ block_size`.
+                        result.push(unsafe { BStackOwnedSlice::from_raw_parts(self, cursor, len) });
+                        collected += 1;
                         let next = u64::from_le_bytes(node_buf);
-                        if popped.len() == singles {
+                        if collected == singles {
                             // Got them all: commit the pop + claims atomically.
                             enough = true;
                             st = St::WriteHead;
@@ -1125,14 +1141,18 @@ impl SlabBStackAllocator {
                             data: bstack_unsafe_reborrow!(&node_buf[..]),
                         });
                     }
-                    // `i` indexes `popped`, which was filled during the chase, so
-                    // every index below `popped.len()` is in bounds; the guard
-                    // ends the sequence exactly once all blocks are scrubbed.
-                    St::WriteClaim(i) => {
-                        let Some(&off) = popped.get(i) else {
-                            return None; // commit
+                    // Scrub each real block just placed in `result`, skipping null
+                    // (zero-length) slots. `result` is complete by the write phase.
+                    St::WriteClaim(k) => {
+                        let mut j = k;
+                        while j < result.len() && result[j].is_empty() {
+                            j += 1;
+                        }
+                        let Some(slice) = result.get(j) else {
+                            return None; // all scrubbed: commit
                         };
-                        st = St::WriteClaim(i + 1);
+                        let off = slice.start();
+                        st = St::WriteClaim(j + 1);
                         return Some(BStackGenOp::Write {
                             offset: off,
                             // SAFETY: `zero_block` outlives this call and is never
@@ -1149,18 +1169,10 @@ impl SlabBStackAllocator {
         if !enough {
             return Ok(None);
         }
-        // Map the popped blocks onto the requests in order (all single-block).
-        let mut popped_iter = popped.into_iter();
-        let mut result = Vec::with_capacity(lengths.len());
-        for &len in lengths {
-            if len == 0 {
-                result.push(BStackOwnedSlice::empty(self));
-            } else {
-                let block_start = popped_iter.next().unwrap();
-                // SAFETY: a live `block_size`-aligned block just popped and
-                // scrubbed; `len ≤ block_size`.
-                result.push(unsafe { BStackOwnedSlice::from_raw_parts(self, block_start, len) });
-            }
+        // Emit null slices for any trailing zero-length requests.
+        while len_idx < lengths.len() {
+            result.push(BStackOwnedSlice::empty(self));
+            len_idx += 1;
         }
         Ok(Some(result))
     }
@@ -1214,6 +1226,37 @@ impl SlabBStackAllocator {
         self.stack.set_batched(batch)?;
         self.stack
             .cross_exchange(blocks[k - 1], Self::FREE_HEAD_OFFSET, 8)
+    }
+
+    /// Best-effort cleanup after an `alloc_bulk` extend path fails partway.
+    ///
+    /// Truncating the fresh tail is preferred (it shrinks the file); the popped
+    /// blocks then go back to the free list. If the truncation cannot happen (I/O
+    /// error, or another thread grew the tail past ours), the `remainder` fresh
+    /// blocks are recycled onto the free list alongside the popped ones instead
+    /// of being leaked. `ext_bytes == 0` means no tail was created (the extend
+    /// itself failed), so only the popped blocks are returned. Every step is
+    /// best-effort: a failure here leaves the blocks leaked (the free list stays
+    /// consistent; `recover` reclaims them for the checked variant).
+    fn reclaim_after_alloc_failure(&self, popped: &[u64], ext_base: u64, ext_bytes: u64) {
+        let bs = self.block_size;
+        // 1. Try to truncate the fresh tail first.
+        let truncated = ext_bytes == 0
+            || self
+                .stack
+                .try_discard(ext_base + ext_bytes, ext_bytes)
+                .unwrap_or(false);
+        if truncated {
+            // 2. Tail gone (or never created): return only the popped blocks.
+            let _ = self.splice_blocks_onto_free_list(popped);
+        } else {
+            // 3. Could not truncate: return the popped blocks AND the fresh tail.
+            let n_tail = ext_bytes / bs;
+            let mut blocks: Vec<u64> = Vec::with_capacity(popped.len() + n_tail as usize);
+            blocks.extend_from_slice(popped);
+            blocks.extend((0..n_tail).map(|i| ext_base + i * bs));
+            let _ = self.splice_blocks_onto_free_list(&blocks);
+        }
     }
 }
 
@@ -1316,8 +1359,8 @@ impl BStackBulkAllocator for SlabBStackAllocator {
             match self.stack.extend(bytes) {
                 Ok(base) => (base, bytes),
                 Err(e) => {
-                    // Best-effort: return the detached blocks to the free list.
-                    let _ = self.splice_blocks_onto_free_list(&popped);
+                    // No tail was created: return the detached blocks only.
+                    self.reclaim_after_alloc_failure(&popped, 0, 0);
                     return Err(e);
                 }
             }
@@ -1353,13 +1396,11 @@ impl BStackBulkAllocator for SlabBStackAllocator {
             result.push(unsafe { BStackOwnedSlice::from_raw_parts(self, block_start, len) });
         }
 
-        // Scrub the recycled blocks. On failure, roll back best-effort: return the
-        // popped blocks to the free list and discard the fresh tail.
+        // Scrub the recycled blocks. On failure, roll back best-effort: truncate
+        // the fresh tail (or recycle it if that fails) and return the popped
+        // blocks to the free list.
         if let Err(e) = self.scrub_blocks(&popped) {
-            let _ = self.splice_blocks_onto_free_list(&popped);
-            if ext_bytes > 0 {
-                let _ = self.stack.try_discard(ext_base + ext_bytes, ext_bytes);
-            }
+            self.reclaim_after_alloc_failure(&popped, ext_base, ext_bytes);
             return Err(e);
         }
         Ok(result)
@@ -2279,6 +2320,64 @@ mod bulk_fault_tests {
             reuse_two(&alloc),
             freed,
             "fast-path fault must leave the free list intact"
+        );
+    }
+
+    // When cleanup cannot truncate the fresh tail (here the truncate is faulted),
+    // the extend path recycles those blocks onto the free list too, so nothing
+    // leaks — the whole arena stays reusable without any further extend.
+    #[test]
+    fn alloc_bulk_cleanup_recycles_tail_when_discard_fails() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // Fail the first claim (`inplace_gen`) to trigger cleanup, then fail the
+        // cleanup's truncate (`try_discard`) so the tail is recycled instead.
+        struct FailClaimThenDiscard {
+            claim: AtomicBool,
+            discard: AtomicBool,
+        }
+        impl FaultPolicy for FailClaimThenDiscard {
+            fn next_fault(&self, op: &'static str, _seq: u64) -> Option<std::io::Error> {
+                let hit = |flag: &AtomicBool| {
+                    (!flag.swap(true, Ordering::SeqCst)).then(|| std::io::Error::other("injected"))
+                };
+                match op {
+                    "inplace_gen" => hit(&self.claim),
+                    "try_discard" => hit(&self.discard),
+                    _ => None,
+                }
+            }
+        }
+
+        let path = temp_path("slab_bulk_cleanup");
+        let _g = Guard(path.clone());
+        let alloc = SlabBStackAllocator::new(BStack::open(&path).unwrap(), BLOCK).unwrap();
+        let _freed = seed_two(&alloc); // two blocks in the free list
+
+        let policy: Arc<dyn FaultPolicy> = Arc::new(FailClaimThenDiscard {
+            claim: AtomicBool::new(false),
+            discard: AtomicBool::new(false),
+        });
+        alloc.stack().set_fault_policy(Some(policy));
+        // Two singles (drain the list) plus an oversized run (3 blocks) → the
+        // extend path; the claim faults, then the cleanup's truncate faults.
+        let err = alloc
+            .alloc_bulk([BLOCK, BLOCK, BLOCK * 3])
+            .expect_err("claim fault must fail alloc_bulk");
+        disarm(&alloc);
+        assert_eq!(err.kind(), ErrorKind::Other);
+
+        // All five arena blocks (two popped + three fresh tail) are back on the
+        // free list, so five allocations reuse them without growing the stack.
+        let len_before = alloc.stack().len().unwrap();
+        let mut held = Vec::new();
+        for _ in 0..5 {
+            held.push(alloc.alloc(BLOCK).unwrap());
+        }
+        assert_eq!(
+            alloc.stack().len().unwrap(),
+            len_before,
+            "the fresh tail was leaked instead of recycled onto the free list"
         );
     }
 }
