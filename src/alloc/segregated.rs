@@ -1338,13 +1338,11 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
         let n = lengths.len();
         let num = Self::NUM_CLASSES as usize;
 
-        // Per-request physical block size (0 marks a zero-length/null request) and
-        // its class. Classed (non-oversized) requests are counted per class; the
-        // oversized ones are collected for separate matching. No `Vec<Vec>`.
+        // Per-request physical block size (0 marks a zero-length/null request).
+        // Classed (non-oversized) requests are counted per class; the oversized
+        // ones are collected for separate matching. Per-class state is bounded by
+        // `NUM_CLASSES` (a constant), so it lives on the stack, not the heap.
         let mut block_of = vec![0u64; n];
-        let mut class_of = vec![0u64; n];
-        // Per-class counts and offsets are bounded by `NUM_CLASSES` (a constant),
-        // so they live on the stack, not the heap.
         let mut want = [0usize; Self::NUM_CLASSES as usize];
         let mut oversized_reqs: Vec<usize> = Vec::new();
         for (i, &len) in lengths.iter().enumerate() {
@@ -1354,32 +1352,10 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
             let block = Self::class_blocksize(Self::phys_need(len)?);
             block_of[i] = block;
             let class = Self::classify(block);
-            class_of[i] = class;
             if class == Self::OVERSIZED_CLASS {
                 oversized_reqs.push(i);
             } else {
                 want[class as usize] += 1;
-            }
-        }
-
-        // Counting-sort classed request indices into `order`, grouped by class,
-        // with `req_base[c]` the start of class `c`'s run.
-        let mut req_base = [0usize; Self::NUM_CLASSES as usize + 1];
-        for c in 0..num {
-            req_base[c + 1] = req_base[c] + want[c];
-        }
-        let mut order = vec![0usize; req_base[num]];
-        {
-            let mut cur = req_base; // Copy: a per-class write cursor.
-            for (i, &len) in lengths.iter().enumerate() {
-                if len == 0 {
-                    continue;
-                }
-                let c = class_of[i] as usize;
-                if c != Self::OVERSIZED_CLASS as usize {
-                    order[cur[c]] = i;
-                    cur[c] += 1;
-                }
             }
         }
 
@@ -1401,25 +1377,37 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
             let mut to_splice: Vec<(u64, u64)> = Vec::new(); // free blocks to relink (best-effort)
 
             // 1. Atomic classed pop across all touched classes. `popped` is
-            //    already flattened in ascending class order, so one running index
-            //    walks it — no per-class base array.
+            //    flattened in ascending class order, so class `c`'s blocks are the
+            //    contiguous run `popped[pop_base[c] .. pop_base[c] + popped_counts[c]]`.
             let (popped, popped_counts) = self.pop_all_classes(&want)?;
-            let mut pi = 0usize;
+            let mut pop_base = [0usize; Self::NUM_CLASSES as usize];
+            let mut acc = 0usize;
             for c in 0..num {
-                for k in 0..popped_counts[c] {
-                    let i = order[req_base[c] + k];
-                    let bs = popped[pi];
-                    pi += 1;
-                    let size = block_of[i]; // classed: block == class block size
-                    // SAFETY: a live block just popped; its data region begins at
-                    // `bs + OVERHEAD` (claimed below) and spans `lengths[i]` bytes.
-                    result[i] =
-                        unsafe { BStackOwnedSlice::from_raw_parts(self, bs + Self::OVERHEAD, lengths[i]) };
-                    detached.push((bs, size));
-                    claims.push((bs, size, ClaimKind::Reuse));
+                pop_base[c] = acc;
+                acc += popped_counts[c];
+            }
+            // Walking requests in input order while counting per class assigns, to
+            // the j-th request of a class, that class's j-th popped block. A
+            // request past its class's supply keeps its null slice and is picked up
+            // as a miss in step 3.
+            let mut taken = [0usize; Self::NUM_CLASSES as usize];
+            for i in 0..n {
+                let size = block_of[i];
+                if size == 0 {
+                    continue; // zero-length request
                 }
-                // order[req_base[c]+popped_counts[c] .. req_base[c]+want[c]] are
-                // misses served by the extend below.
+                let c = Self::classify(size) as usize;
+                if c == Self::OVERSIZED_CLASS as usize || taken[c] == popped_counts[c] {
+                    continue; // matched in step 2 instead, or this class ran out
+                }
+                let bs = popped[pop_base[c] + taken[c]];
+                taken[c] += 1;
+                // SAFETY: a live block just popped; its data region begins at
+                // `bs + OVERHEAD` (claimed below) and spans `lengths[i]` bytes.
+                result[i] =
+                    unsafe { BStackOwnedSlice::from_raw_parts(self, bs + Self::OVERHEAD, lengths[i]) };
+                detached.push((bs, size));
+                claims.push((bs, size, ClaimKind::Reuse));
             }
 
             // 2. Oversized matching (largest request first), with SPLIT_MIN carve.
