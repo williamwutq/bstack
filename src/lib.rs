@@ -673,6 +673,8 @@ pub mod reborrow;
 
 pub mod fault;
 use fault::fault_point;
+#[cfg(all(feature = "set", feature = "atomic"))]
+use fault::fault_probe;
 #[cfg(all(debug_assertions, feature = "fault-injection"))]
 pub use fault::{FaultPolicy, FaultState};
 #[cfg(all(test, feature = "alloc", feature = "set"))]
@@ -2632,6 +2634,9 @@ impl BStack {
                         format!("get_batched_gen: end ({end}) exceeds payload size ({data_size})")
                     ));
                 }
+                // Per-step read fault: stands in for this read's I/O and ends
+                // the whole call, as a genuine read failure here does.
+                fault_point!(self, "get_batched_gen:read");
                 pread_exact_into(file, HEADER_SIZE + offset, buf)?;
             }
             Ok(())
@@ -2655,6 +2660,9 @@ impl BStack {
                         format!("get_batched_gen: end ({end}) exceeds payload size ({data_size})")
                     ));
                 }
+                // Per-step read fault: stands in for this read's I/O and ends
+                // the whole call, as a genuine read failure here does.
+                fault_point!(self, "get_batched_gen:read");
                 file.seek(SeekFrom::Start(HEADER_SIZE + offset))?;
                 file.read_exact(buf)?;
             }
@@ -3411,6 +3419,13 @@ impl BStack {
                             )
                         ));
                     }
+                    // Per-step read fault: stands in for this `Read`'s I/O, and
+                    // like a genuine read failure here it ends the whole call —
+                    // `process_gen` has no channel to report a step failure on.
+                    // Consulted for every `Read` op, including ones the fast
+                    // paths below serve without touching the disk, so the
+                    // schedule does not shift with cache state.
+                    fault_point!(self, "process_gen:read");
                     // Fast path: locked bytes are immutable, so they can be
                     // served from the cache or via a lock-free pread instead
                     // of going through the held file handle — mirroring how
@@ -3857,7 +3872,19 @@ impl BStack {
         loop {
             match f(feedback) {
                 Some(BStackGenOp::Read { offset, buf }) => {
-                    feedback = inplace_overlay_read(file, data_size, offset, buf, &overlay);
+                    // Validate first so a bad range still beats an injected
+                    // fault, then let the policy stand in for the read itself.
+                    // Unlike `process_gen`, a failed `Read` here does not end
+                    // the call: it is reported to the generator through its
+                    // `feedback` argument, so an injected fault must take the
+                    // same route as a genuine one.
+                    feedback = match inplace_validate_read(offset, buf.len() as u64, data_size) {
+                        Err(e) => Err(e),
+                        Ok(()) => match fault_probe!(self, "inplace_gen:read") {
+                            Some(e) => Err(e),
+                            None => inplace_overlay_read(file, data_size, offset, buf, &overlay),
+                        },
+                    };
                 }
                 Some(BStackGenOp::Write { offset, data }) => {
                     feedback = inplace_validate_write(offset, data, data_size, locked);

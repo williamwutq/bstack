@@ -1284,6 +1284,29 @@ pub(crate) fn inplace_validate_write(
     Ok(())
 }
 
+/// Validate an `inplace_gen` `Read` op against the fixed payload size, mirroring
+/// `get`'s checks.
+///
+/// Split out of [`inplace_overlay_read`] so `inplace_gen` can run it *before*
+/// consulting the fault policy, preserving the crate-wide rule that
+/// argument-validation errors are reported in preference to an injected fault.
+/// `inplace_overlay_read` still calls it, so it remains correct standalone.
+#[cfg(all(feature = "set", feature = "atomic"))]
+pub(crate) fn inplace_validate_read(offset: u64, buf_len: u64, data_size: u64) -> io::Result<()> {
+    let end = crate::checked_end(
+        offset,
+        buf_len,
+        "inplace_gen: read offset + buf.len() overflows u64",
+    )?;
+    if end > data_size {
+        return Err(io_error!(
+            InvalidInput,
+            format!("inplace_gen: read range [{offset}, {end}) exceeds payload size ({data_size})")
+        ));
+    }
+    Ok(())
+}
+
 /// Serve an `inplace_gen` `Read` op: validate the range, then fill `buf` with the
 /// batch-so-far ("new") content — the pending edits overlaid on the committed
 /// bytes. The disk read is skipped entirely when the pending edits already cover
@@ -1296,17 +1319,9 @@ pub(crate) fn inplace_overlay_read(
     buf: &mut [u8],
     overlay: &[(u64, &[u8])],
 ) -> io::Result<()> {
-    let end = crate::checked_end(
-        offset,
-        buf.len() as u64,
-        "inplace_gen: read offset + buf.len() overflows u64",
-    )?;
-    if end > data_size {
-        return Err(io_error!(
-            InvalidInput,
-            format!("inplace_gen: read range [{offset}, {end}) exceeds payload size ({data_size})")
-        ));
-    }
+    inplace_validate_read(offset, buf.len() as u64, data_size)?;
+    // Validated above, so this cannot overflow.
+    let end = offset + buf.len() as u64;
     if buf.is_empty() {
         return Ok(());
     }

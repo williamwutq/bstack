@@ -18,12 +18,11 @@
 //! violations) are therefore always reported in preference to an injected fault:
 //! a call that would fail validation never reaches its fault point.
 //!
-//! The batched and generator methods (`get_batched*`, `process_gen`,
-//! `inplace_gen`, `set_batched`) consult the policy **once**, at the point their
-//! batch I/O begins. Their up-front, whole-request validation still precedes that
-//! consult, but per-item checks performed while iterating the batch do not — a
-//! fault armed for such a method fails the whole call before those per-item
-//! checks run.
+//! The batched methods (`get_batched`, `get_batched_into`, `set_batched`) consult
+//! the policy **once**, at the point their batch I/O begins. Their up-front,
+//! whole-request validation still precedes that consult, but per-item checks
+//! performed while iterating the batch do not — a fault armed for such a method
+//! fails the whole call before those per-item checks run.
 //!
 //! # Compile-time gating
 //!
@@ -73,9 +72,42 @@ macro_rules! fault_point {
     };
 }
 
-// Bring the macro into scope for the rest of the crate. `pub(crate) use` on a
+/// Consult the installed [`FaultPolicy`] and *yield* its decision as an
+/// `Option<io::Error>`, instead of returning from the enclosing method.
+///
+/// The counterpart of [`fault_point!`] for call sites where an injected error has
+/// somewhere better to go than the caller — chiefly
+/// [`BStack::inplace_gen`](crate::BStack::inplace_gen), whose `Read` failures are
+/// reported to the generator through its `feedback` argument rather than by
+/// aborting the sequence. Use `fault_point!` wherever `return Err(_)` is the
+/// faithful response to a real I/O failure at that point, and this where it is
+/// not.
+///
+/// Placement follows the same rule: **after** the step's argument validation,
+/// **before** its I/O.
+///
+/// Evaluates to `None` unless `all(debug_assertions, feature = "fault-injection")`
+/// holds, so an inactive build folds the whole call site away.
+///
+/// Gated on `set` + `atomic`, the configuration of its only call site: unlike
+/// [`fault_point!`], which every build has somewhere to use, this one would be an
+/// unused macro without them.
+#[cfg(all(feature = "set", feature = "atomic"))]
+macro_rules! fault_probe {
+    ($stack:expr, $op:expr) => {{
+        #[cfg(all(debug_assertions, feature = "fault-injection"))]
+        let __fault_probe = $crate::fault::__consult(&$stack.fault, $op);
+        #[cfg(not(all(debug_assertions, feature = "fault-injection")))]
+        let __fault_probe: ::core::option::Option<::std::io::Error> = ::core::option::Option::None;
+        __fault_probe
+    }};
+}
+
+// Bring the macros into scope for the rest of the crate. `pub(crate) use` on a
 // `macro_rules!` item is the edition-2024 idiom for a crate-internal macro.
 pub(crate) use fault_point;
+#[cfg(all(feature = "set", feature = "atomic"))]
+pub(crate) use fault_probe;
 
 #[cfg(all(debug_assertions, feature = "fault-injection"))]
 pub use active::*;
