@@ -1256,6 +1256,38 @@ impl SegregatedBStackAllocator {
     }
 }
 
+/// How the final `alloc_bulk` claim writes one block.
+#[cfg(feature = "atomic")]
+#[derive(Clone, Copy)]
+enum ClaimKind {
+    /// Reused block (popped or oversized-retained): mark in-use, scrub the body.
+    Reuse,
+    /// Freshly extended block: mark in-use (its body is already sparse-zero).
+    Fresh,
+    /// Carve remainder: mark free so [`recover`](SegregatedBStackAllocator::recover) relinks it.
+    CarveFree,
+}
+
+/// One claim write's payload: an 8-byte overhead word carried by value, or a
+/// body-scrub slice borrowing the shared zero buffer. Both are `AsRef<[u8]>`, so
+/// a single [`BStack::set_batched`] iterator can mix them without a per-block
+/// heap buffer for the overhead.
+#[cfg(feature = "atomic")]
+enum ClaimBuf<'z> {
+    Oh([u8; 8]),
+    Body(&'z [u8]),
+}
+
+#[cfg(feature = "atomic")]
+impl AsRef<[u8]> for ClaimBuf<'_> {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            ClaimBuf::Oh(oh) => oh,
+            ClaimBuf::Body(b) => b,
+        }
+    }
+}
+
 /// [`SegregatedBStackAllocator`] batches whole runs across its size classes.
 ///
 /// Work is bounded by the number of *distinct classes touched* (≤ `NUM_CLASSES`),
@@ -1357,11 +1389,11 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
         let mut ext_bytes = 0u64;
 
         let build = (|| -> io::Result<Vec<BStackOwnedSlice<'_, Self>>> {
-            let mut assign: Vec<Option<u64>> = vec![None; n];
-            // Claim jobs, all applied by the final `set_batched`.
-            let mut scrub: Vec<(u64, u64)> = Vec::new(); // reused: in-use overhead + zero body
-            let mut oh_only: Vec<(u64, u64)> = Vec::new(); // fresh: in-use overhead only
-            let mut carve_free: Vec<(u64, u64)> = Vec::new(); // carve remainder: free overhead
+            // Block starts are always ≥ ARENA_START > 0, so 0 marks an unassigned
+            // request; zero-length requests keep 0 and become null slices.
+            let mut assign: Vec<u64> = vec![0u64; n];
+            // Every claim the final `set_batched` applies, tagged by kind.
+            let mut claims: Vec<(u64, u64, ClaimKind)> = Vec::new(); // (offset, size, kind)
             let mut to_splice: Vec<(u64, u64)> = Vec::new(); // free blocks to relink (best-effort)
 
             // 1. Atomic classed pop across all touched classes. `popped` is
@@ -1375,9 +1407,9 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
                     let bs = popped[pi];
                     pi += 1;
                     let size = block_of[i]; // classed: block == class block size
-                    assign[i] = Some(bs);
+                    assign[i] = bs;
                     detached.push((bs, size));
-                    scrub.push((bs, size));
+                    claims.push((bs, size, ClaimKind::Reuse));
                 }
                 // order[req_base[c]+popped_counts[c] .. req_base[c]+want[c]] are
                 // misses served by the extend below.
@@ -1396,7 +1428,7 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
                     for (ri, &req) in reqs.iter().enumerate() {
                         if !matched[ri] && block_of[req] <= bsize {
                             let block = block_of[req];
-                            assign[req] = Some(boff);
+                            assign[req] = boff;
                             matched[ri] = true;
                             // Rollback frees the whole block (nothing is carved
                             // until the claim commits).
@@ -1406,7 +1438,7 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
                                 // Carve: claim `block`, free the remainder greedily
                                 // into class blocks (their free overhead is written
                                 // by the claim, so the region stays recover-safe).
-                                scrub.push((boff, block));
+                                claims.push((boff, block, ClaimKind::Reuse));
                                 let mut off = boff + block;
                                 let mut rem = excess;
                                 while rem > 0 {
@@ -1415,7 +1447,7 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
                                     } else {
                                         Self::largest_class_le(rem)
                                     };
-                                    carve_free.push((off, ps));
+                                    claims.push((off, ps, ClaimKind::CarveFree));
                                     to_splice.push((off, ps));
                                     off += ps;
                                     rem -= ps;
@@ -1423,7 +1455,7 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
                             } else {
                                 // Retain the whole block (a non-class size is sound
                                 // in the heterogeneous oversized bucket).
-                                scrub.push((boff, bsize));
+                                claims.push((boff, bsize, ClaimKind::Reuse));
                             }
                             used = true;
                             break;
@@ -1442,7 +1474,7 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
             let mut misses: Vec<usize> = Vec::new();
             let mut total_ext = 0u64;
             for i in 0..n {
-                if block_of[i] > 0 && assign[i].is_none() {
+                if block_of[i] > 0 && assign[i] == 0 {
                     total_ext = total_ext.checked_add(block_of[i]).ok_or_else(|| {
                         io::Error::new(
                             io::ErrorKind::InvalidInput,
@@ -1453,71 +1485,56 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
                 }
             }
             if total_ext > 0 {
-                let mut rels: Vec<u64> = Vec::with_capacity(misses.len());
-                let mut oh_bufs: Vec<[u8; 8]> = Vec::with_capacity(misses.len());
-                let mut rel = 0u64;
-                for &i in &misses {
+                // Each fresh block's free overhead, laid out back-to-back from the
+                // extend base. `[u8; 8]` is `AsRef<[u8]>`, so the writes are yielded
+                // by value — no `rels`/`oh_bufs` parallel Vecs.
+                let writes = misses.iter().scan(0u64, |rel, &i| {
+                    let off = *rel;
                     let size = block_of[i];
+                    *rel += size;
                     let mut oh = [0u8; 8];
                     write_buf!(size >> 4 => oh, 0); // free tag: high bit clear
-                    oh_bufs.push(oh);
-                    rels.push(rel);
-                    rel += size;
-                }
-                let writes = rels.iter().zip(oh_bufs.iter()).map(|(&o, b)| (o, &b[..]));
+                    Some((off, oh))
+                });
                 ext_base = self.stack.extend_sparse_batched(writes, total_ext)?;
                 ext_bytes = total_ext;
-                for (k, &i) in misses.iter().enumerate() {
-                    let abs = ext_base + rels[k];
-                    assign[i] = Some(abs);
-                    oh_only.push((abs, block_of[i])); // flip to in-use in the claim
+                let mut rel = 0u64;
+                for &i in &misses {
+                    let abs = ext_base + rel;
+                    assign[i] = abs;
+                    claims.push((abs, block_of[i], ClaimKind::Fresh)); // flip in-use
+                    rel += block_of[i];
                 }
             }
 
-            // 4. Claim: one crash-atomic `set_batched`. Every block's 8-byte
-            //    overhead word is owned in one flat `oh_words` Vec (no per-size
-            //    `HashMap` of buffers) — in claim order: reused (scrub) blocks
-            //    marked in-use, then fresh blocks marked in-use, then carve
-            //    remainders marked free. Reused blocks additionally scrub their
-            //    body, which is all zeros, so every scrub shares one zero buffer
-            //    sub-sliced to its body length (no per-block heap allocation).
-            let njobs = scrub.len() + oh_only.len() + carve_free.len();
-            let mut oh_words: Vec<[u8; 8]> = Vec::with_capacity(njobs);
-            for &(_, size) in &scrub {
-                let mut oh = [0u8; 8];
-                write_buf!(Self::IN_USE_BIT | (size >> 4) => oh, 0);
-                oh_words.push(oh);
-            }
-            for &(_, size) in &oh_only {
-                let mut oh = [0u8; 8];
-                write_buf!(Self::IN_USE_BIT | (size >> 4) => oh, 0);
-                oh_words.push(oh);
-            }
-            for &(_, size) in &carve_free {
-                let mut oh = [0u8; 8];
-                write_buf!(size >> 4 => oh, 0); // free tag: high bit clear
-                oh_words.push(oh);
-            }
-            let max_scrub = scrub.iter().map(|&(_, s)| s).max().unwrap_or(0);
+            // 4. Claim: one crash-atomic `set_batched`. Each block contributes its
+            //    8-byte overhead word (carried by value — in-use for `Reuse`/`Fresh`,
+            //    free for `CarveFree`); a `Reuse` block additionally scrubs its
+            //    body, all of which is zero, so every scrub borrows one shared zero
+            //    buffer sub-sliced to its length (no per-block heap buffer).
+            let max_scrub = claims
+                .iter()
+                .filter(|(_, _, k)| matches!(k, ClaimKind::Reuse))
+                .map(|&(_, s, _)| s)
+                .max()
+                .unwrap_or(0);
             let zeros = vec![0u8; max_scrub.saturating_sub(Self::OVERHEAD) as usize];
-            let mut batch: Vec<(u64, &[u8])> = Vec::with_capacity(njobs + scrub.len());
-            let mut w = 0usize;
-            for &(off, size) in &scrub {
-                batch.push((off, &oh_words[w][..]));
-                w += 1;
-                let body = (size - Self::OVERHEAD) as usize;
-                if body > 0 {
-                    // Adjacent to the overhead, non-overlapping: a full-block scrub.
-                    batch.push((off + Self::OVERHEAD, &zeros[..body]));
+            let mut batch: Vec<(u64, ClaimBuf)> = Vec::with_capacity(claims.len() * 2);
+            for &(off, size, kind) in &claims {
+                let word = match kind {
+                    ClaimKind::Reuse | ClaimKind::Fresh => Self::IN_USE_BIT | (size >> 4),
+                    ClaimKind::CarveFree => size >> 4, // free tag: high bit clear
+                };
+                let mut oh = [0u8; 8];
+                write_buf!(word => oh, 0);
+                batch.push((off, ClaimBuf::Oh(oh)));
+                if matches!(kind, ClaimKind::Reuse) {
+                    let body = (size - Self::OVERHEAD) as usize;
+                    if body > 0 {
+                        // Adjacent to the overhead, non-overlapping: a body scrub.
+                        batch.push((off + Self::OVERHEAD, ClaimBuf::Body(&zeros[..body])));
+                    }
                 }
-            }
-            for &(off, _) in &oh_only {
-                batch.push((off, &oh_words[w][..]));
-                w += 1;
-            }
-            for &(off, _) in &carve_free {
-                batch.push((off, &oh_words[w][..]));
-                w += 1;
             }
             if !batch.is_empty() {
                 self.stack.set_batched(batch)?;
@@ -1534,7 +1551,8 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
                 if len == 0 {
                     result.push(BStackOwnedSlice::empty(self));
                 } else {
-                    let block_start = assign[i].expect("every non-zero request assigned");
+                    // Every non-zero request was assigned a nonzero block start.
+                    let block_start = assign[i];
                     // SAFETY: a live block just popped or extended; its data region
                     // begins at `block_start + OVERHEAD` and spans `len` bytes.
                     result.push(unsafe {
