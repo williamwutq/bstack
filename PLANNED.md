@@ -121,36 +121,6 @@ Reasons:
 
 ---
 
-## Read-side per-op fault injection
-
-**Feature flag:** `fault-injection`; active only in builds with `debug_assertions`.
-**Breaking change:** No
-
-### Motivation
-
-Faults are injected at the `BStack` public-API level: each instrumented method consults the policy once, after validating its arguments. Reads are instrumented — `get`, `get_into`, `peek`, `peek_into`, `pop_into`, `get_batched*`, `len`, `is_empty` — so the machinery is not write-only. Two gaps sit where the allocators are most fragile:
-
-- **No fault can be injected *inside* a batched or generator call.** `get_batched*`, `process_gen`, `inplace_gen` and `set_batched` consult once, where their batch I/O begins, so an armed fault fails the whole call before any per-item work. In `inplace_gen` the only op that performs I/O of its own is `Read`: a `Write` merely validates and inserts into the in-memory overlay, and every byte reaches the file in the single commit after the loop. What is missing there is therefore precisely the ability to fail one read of a dependent chase.
-- **No injected fault is validation-shaped.** `fault_point!` sits after argument validation by design, so a fault always presents as an I/O error at the boundary. The per-op failures `inplace_gen` reports through `feedback` are `InvalidInput` from range and locked-region checks — the only way a `Write` fails there — which no policy can produce.
-
-Together those leave the swallowed-rejection state space unreachable: a generator that inspects `feedback` and responds with `BStackGenOp::Abort` is the whole reason that variant exists, and no policy can produce the rejection that would exercise it.
-
-At the suite level the targeted allocator fault tests arm only write and size-changing operations — `set`, `extend`, `zero`, `discard`, `push`. None arms a read, though every allocator reads metadata before deciding what to write, and the `?` on each of those reads is a path whose surviving-handle contract is never deliberately exercised. `RandomFaults` is op-agnostic and hits reads incidentally, so that coverage lives in the fuzz suites and is pinned by no white-box test.
-
-### Design
-
-- **Per-op fault points wherever a batched or generator op does its own I/O:** each `Read` in `inplace_gen`, `process_gen` and `get_batched_gen`, and each block in `set_batched`'s commit loop. Names that distinguish the step (`"inplace_gen.read"`, and likewise for the rest) let `FailOpAt` target them through its existing per-name counting, so this needs no new policy type and no trait change; the whole-call names stay, so armed tests keep working.
-- **A validation-class fault:** let a policy fail an op *the way validation does* — recorded as `feedback`, not performed, the sequence continuing — rather than as a returned I/O error. This is what makes the state space above reachable.
-- **Targeted read-fault tests per allocator,** one per metadata read that precedes a decision: the free-list head chase, the overhead word in `dealloc`, the recorded physical size in segregated's `realloc`. Each asserts the error kind and that the surviving handle still reads back its bytes.
-
-### Open questions
-
-- **Naming versus signature.** Sub-operation names leave `FaultPolicy` untouched; threading the op kind through `next_fault` is cleaner but breaks a public, if debug-only, trait.
-- **Whether a short read is worth modelling.** `fault_point!` returns before the I/O, so an injected read fault leaves the destination buffer untouched — matching what `inplace_gen` does with a rejected `Read`, but not a genuine torn read.
-- **Ordering.** The first two design items are what make `BStackGenOp::Abort` testable; the read-fault tests are independent and can land at any time.
-
----
-
 ## `BStackTransaction` — a buffered, crash-atomic transaction object (0.5.0)
 
 **Feature flag:** `transaction` (implies `set` + `atomic`) for the public API. The recovery path in `io_core` is ungated, like all recovery.
