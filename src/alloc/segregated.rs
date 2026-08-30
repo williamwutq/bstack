@@ -969,13 +969,15 @@ impl SegregatedBStackAllocator {
     /// The generator runs in two phases: a **read phase** chases every classed
     /// list and computes each touched class's new head, then a **write phase**
     /// emits those head advances. Because no write is staged until all reads have
-    /// completed, a read failure can bail with `None` (which commits the — still
-    /// empty — batch), so no `Abort` is needed and no head slot is mutated after a
-    /// write is staged (the reborrow aliasing rule). Each chase is bounded by
-    /// `want[c]`, so it cannot loop on a cyclic list; like every classed path it
-    /// trusts the list to be acyclic rather than tracking visited blocks. The
-    /// oversized class is skipped (matched separately, and `want[OVERSIZED]` is
-    /// never set). Returns the popped block starts flattened in ascending class
+    /// completed, a read failure or a detected cycle can bail with `None` (which
+    /// commits the — still empty — batch), so no `Abort` is needed and no head slot
+    /// is mutated after a write is staged (the reborrow aliasing rule). The chase
+    /// is bounded by `want[c]` so it always terminates, but a cycle of period
+    /// ≤ `want[c]` would otherwise pop one block twice and hand two requests the
+    /// same block, so a visited-set still guards it (a revisited block aborts with
+    /// nothing popped). The oversized class is skipped (matched separately, and
+    /// `want[OVERSIZED]` is never set). Returns the popped block starts flattened in
+    /// ascending class
     /// order, plus the per-class count actually popped (fewer than `want[c]` if
     /// that list ran out). Popped blocks are left **free-tagged and detached** —
     /// the caller claims them — and a crash before the claim leaves them
@@ -993,6 +995,9 @@ impl SegregatedBStackAllocator {
             return Ok((Vec::new(), counts));
         }
         let mut popped: Vec<u64> = Vec::with_capacity(total_want);
+        // A cyclic list of period ≤ want[c] would pop a block twice; the visited
+        // set turns that into a clean cycle error instead of a duplicate block.
+        let mut seen: HashSet<u64> = HashSet::with_capacity(total_want);
         let mut head_buf = [0u8; 8];
         let mut next_buf = [0u8; 8];
         // Each touched class's new head value, all computed in the read phase and
@@ -1054,10 +1059,16 @@ impl SegregatedBStackAllocator {
                         }
                     }
                     St::ReadNode(c, cursor) => {
-                        // The chase is bounded by `want[c]`, so a cyclic list cannot
-                        // loop forever here; like every other classed path
-                        // ([`pop_class`](Self::pop_class) included) this trusts the
-                        // list to be acyclic rather than tracking visited blocks.
+                        // A revisited block is a cycle: bail popping nothing. No
+                        // write is staged in the read phase, so `None` commits
+                        // nothing (no `Abort` needed).
+                        if !seen.insert(cursor) {
+                            err = Some(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "alloc_bulk: free-list cycle detected",
+                            ));
+                            return None;
+                        }
                         st = St::ConsumeNode(c, cursor);
                         return Some(BStackGenOp::Read {
                             offset: cursor + Self::OVERHEAD,
@@ -1147,10 +1158,18 @@ impl SegregatedBStackAllocator {
     /// blocks that matched nothing as `(block_start, size)` for the caller to
     /// re-splice. Detached blocks are left free-tagged (their overhead untouched),
     /// so a crash after the head write leaves them reclaimable by
-    /// [`recover`](Self::recover). An in-use block found on the free list is
-    /// rejected with [`io::ErrorKind::InvalidData`], mirroring
-    /// [`pop_oversized`](Self::pop_oversized), which also refuses to trust a set
-    /// high bit. Trusts the list to be acyclic, as the rest of the allocator does.
+    /// [`recover`](Self::recover).
+    ///
+    /// The chase is unbounded (no per-class cap), so it carries cycle detection —
+    /// a revisited block aborts with no write, instead of spinning forever under
+    /// the write lock while `unmatched` grows without bound. Each block's overhead
+    /// is validated before use: the in-use bit must be clear (mirroring
+    /// [`pop_oversized`](Self::pop_oversized), which also refuses a set high bit),
+    /// and the decoded physical size must be at least a
+    /// [`QUANTUM`](Self::QUANTUM) and fit within the payload — so a corrupt word
+    /// (e.g. bits shifted out by `<< 4` leaving `size == 0`, which would underflow
+    /// [`classify`](Self::classify)) is rejected rather than fed to the carve math.
+    /// Any of these aborts with [`io::ErrorKind::InvalidData`] and no write.
     #[expect(clippy::type_complexity)]
     fn match_oversized_bounded(
         &self,
@@ -1163,21 +1182,35 @@ impl SegregatedBStackAllocator {
         let mut head_buf = [0u8; 8];
         let mut node_buf = [0u8; 16]; // [0..8] overhead (free tag), [8..16] next
         let mut new_head = [0u8; 8]; // terminal write: the detached prefix's successor
+        let mut payload_len = 0u64;
+        let payload_ptr: *mut u64 = &mut payload_len;
+        // The chase is unbounded, so a cyclic list must be caught or it spins
+        // forever under the write lock.
+        let mut seen: HashSet<u64> = HashSet::new();
         let mut err: Option<io::Error> = None;
 
         #[derive(Clone, Copy)]
         enum St {
+            ReadLen,
             ReadHead,
             ConsumeHead,
             ReadNode(u64),
             ConsumeNode(u64),
             Done,
         }
-        let mut st = St::ReadHead;
+        let mut st = St::ReadLen;
 
         self.stack.process_gen(|| {
             loop {
                 match st {
+                    St::ReadLen => {
+                        st = St::ReadHead;
+                        // SAFETY: `process_gen` finishes writing `out` before the
+                        // next call, so this `&mut` never aliases a later read.
+                        return Some(BStackGenOp::Len {
+                            out: unsafe { &mut *payload_ptr },
+                        });
+                    }
                     St::ReadHead => {
                         st = St::ConsumeHead;
                         return Some(BStackGenOp::Read {
@@ -1194,6 +1227,14 @@ impl SegregatedBStackAllocator {
                         st = St::ReadNode(head);
                     }
                     St::ReadNode(cursor) => {
+                        // A revisited block is a cycle: bail with no write staged.
+                        if !seen.insert(cursor) {
+                            err = Some(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "alloc_bulk: oversized free-list cycle detected",
+                            ));
+                            return None;
+                        }
                         st = St::ConsumeNode(cursor);
                         return Some(BStackGenOp::Read {
                             offset: cursor,
@@ -1213,6 +1254,19 @@ impl SegregatedBStackAllocator {
                             return None;
                         }
                         let size = word << 4;
+                        // A decoded size below a quantum (e.g. `<< 4` shifted the real
+                        // bits out, leaving 0 — which underflows `classify`) or one
+                        // running past the payload is corruption: reject it before it
+                        // reaches the carve/`classify` math.
+                        if size < Self::QUANTUM
+                            || cursor.checked_add(size).is_none_or(|end| end > payload_len)
+                        {
+                            err = Some(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "alloc_bulk: oversized free block has an invalid size",
+                            ));
+                            return None;
+                        }
                         let next = read_buf_le!(node_buf, 8 => u64);
                         // Largest request first: `reqs` is descending, so the first
                         // that fits is the largest that fits. Compact on a match.
@@ -3340,7 +3394,7 @@ mod bulk_tests {
             big_start,
             "the carved request keeps the block start"
         );
-        slices[0].write(&[0xABu8; 4100]).unwrap();
+        slices[0].write([0xABu8; 4100]).unwrap();
         assert_eq!(slices[0].read().unwrap(), vec![0xABu8; 4100]);
 
         // The carved-off remainder is a reusable free block inside the original
@@ -3355,6 +3409,66 @@ mod bulk_tests {
         a.dealloc(rem).unwrap();
         a.dealloc_bulk(slices).unwrap();
         assert_eq!(unsafe { a.recover() }.unwrap(), 0);
+    }
+
+    // Put one oversized block on the free list, pinned off the tail so `dealloc`
+    // routes it there, and return its block start for corruption. The pin block
+    // stays in use on disk after its handle drops (`BStackOwnedSlice` has no Drop).
+    fn freed_oversized_block(a: &Seg) -> u64 {
+        let big = a.alloc(5000).unwrap();
+        let block_start = big.start() - Seg::OVERHEAD;
+        let _pin = a.alloc(100).unwrap();
+        a.dealloc(big).unwrap();
+        block_start
+    }
+
+    #[test]
+    fn alloc_bulk_rejects_in_use_block_on_oversized_list() {
+        let (a, _g) = new_alloc();
+        let block_start = freed_oversized_block(&a);
+        // Corrupt: set the free block's overhead in-use bit while it is on the list.
+        let mut buf = [0u8; 8];
+        a.stack.get_into(block_start, &mut buf).unwrap();
+        let word = u64::from_le_bytes(buf);
+        a.stack
+            .set(block_start, (word | Seg::IN_USE_BIT).to_le_bytes())
+            .unwrap();
+        let err = a.alloc_bulk([5000u64]).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn alloc_bulk_rejects_invalid_size_on_oversized_list() {
+        let (a, _g) = new_alloc();
+        let block_start = freed_oversized_block(&a);
+        // Corrupt: in-use bit clear but only a high bit set, so `<< 4` shifts it out
+        // and the decoded size is 0 — which would underflow `classify`.
+        a.stack
+            .set(block_start, 0x1000_0000_0000_0000u64.to_le_bytes())
+            .unwrap();
+        let err = a.alloc_bulk([5000u64]).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn alloc_bulk_rejects_oversized_free_list_cycle() {
+        let (a, _g) = new_alloc();
+        // Two oversized free blocks, both pinned off the tail: list is y → x → end.
+        let x = a.alloc(5000).unwrap();
+        let y = a.alloc(5000).unwrap();
+        let _pin = a.alloc(100).unwrap();
+        let x_start = x.start() - Seg::OVERHEAD;
+        let y_start = y.start() - Seg::OVERHEAD;
+        a.dealloc(x).unwrap();
+        a.dealloc(y).unwrap();
+        // Splice x's next back to y, forming the cycle y → x → y with no terminator.
+        a.stack
+            .set(x_start + Seg::OVERHEAD, y_start.to_le_bytes())
+            .unwrap();
+        // A request larger than either block fits neither, so the matcher chases the
+        // whole cycle and must detect the revisit rather than spin forever.
+        let err = a.alloc_bulk([9000u64]).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 }
 

@@ -490,7 +490,7 @@ class head.
 
 ### Bulk operations (`atomic` feature)
 
-With `atomic`, implements `BStackBulkAllocator`; work is bounded by the distinct classes touched (≤ 33), not by the request count. Classed chases are bounded by the per-class demand, so a cyclic list cannot loop them; like every classed path they trust the list to be acyclic (the oversized in-use-bit check aside).
+With `atomic`, implements `BStackBulkAllocator`; work is bounded by the distinct classes touched (≤ 33), not by the request count. Free-list chases carry cycle detection (a revisited block aborts with no write); the oversized chase additionally validates each block's overhead (in-use bit clear, size ≥ a quantum and within the payload) before use.
 
 | Operation      | Strategy                                                                                                                                        |
 |----------------|------------------------------------------------------------------------------------------------------------------------------------------------|
