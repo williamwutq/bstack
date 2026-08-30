@@ -19,6 +19,8 @@ use core::cell::Cell;
 #[cfg(not(feature = "atomic"))]
 use core::marker::PhantomData;
 use core::num::NonZeroU64;
+#[cfg(feature = "atomic")]
+use std::collections::HashSet;
 use std::{fmt, io};
 
 #[cfg(feature = "set")]
@@ -959,11 +961,15 @@ impl SlabBStackAllocator {
             return Ok(Vec::new());
         }
         let mut popped: Vec<u64> = Vec::with_capacity(want);
+        let mut seen: HashSet<u64> = HashSet::with_capacity(want);
         let mut head_buf = [0u8; 8];
         // Holds the last-read node's next-pointer; on the terminating write it is
         // exactly the value `free_head` must advance to, so no separate buffer is
         // needed. Declared here so it outlives the `process_gen` borrow.
         let mut next_buf = [0u8; 8];
+        // Set if the chase revisits a block (a cycle in a corrupt free list): end
+        // with no write (nothing popped) and raise the error afterwards.
+        let mut cycle = false;
 
         #[derive(Clone, Copy)]
         enum St {
@@ -997,6 +1003,12 @@ impl SlabBStackAllocator {
                     }
                     // Read the next-pointer of the block at `cursor`.
                     St::ReadNode(cursor) => {
+                        // A revisited block means the list cycles: abort with no
+                        // write so `free_head` is unchanged and nothing is popped.
+                        if !seen.insert(cursor) {
+                            cycle = true;
+                            return None;
+                        }
                         st = St::ConsumeNode(cursor);
                         return Some(BStackGenOp::Read {
                             offset: cursor,
@@ -1027,6 +1039,12 @@ impl SlabBStackAllocator {
                 }
             }
         })?;
+        if cycle {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "alloc_bulk: free-list cycle detected",
+            ));
+        }
 
         Ok(popped)
     }
@@ -1058,11 +1076,18 @@ impl SlabBStackAllocator {
         // slots for zero-length requests); the scrub phase reads their offsets
         // back, so no separate list of popped offsets is kept.
         let mut result: Vec<BStackOwnedSlice<'_, Self>> = Vec::with_capacity(lengths.len());
+        let mut seen: HashSet<u64> = HashSet::with_capacity(singles);
         let mut len_idx = 0usize;
         let mut collected = 0usize;
         let mut head_buf = [0u8; 8];
         let mut node_buf = [0u8; 8];
         let mut enough = false;
+        let mut cycle = false;
+        // Captures a `Read` whose offset failed validation (a corrupt next-pointer
+        // out of range): `inplace_gen` reports that to the closure as the previous
+        // op's result rather than returning it, and leaves the buffer unfilled, so
+        // we must abort instead of interpreting stale bytes.
+        let mut io_err: Option<io::Error> = None;
 
         #[derive(Clone, Copy)]
         enum St {
@@ -1076,7 +1101,14 @@ impl SlabBStackAllocator {
         }
         let mut st = St::ReadHead;
 
-        self.stack.inplace_gen(|_prev| {
+        self.stack.inplace_gen(|prev| {
+            // A failed read reports its error here (not as a return value); the
+            // buffer was not filled, so bail out before consuming it. During the
+            // write phase `prev` is always the Ok validation of an in-range write.
+            if let Err(e) = prev {
+                io_err = Some(e);
+                return None;
+            }
             loop {
                 match st {
                     // ── Chase phase: reads only, so they see committed bytes. ──
@@ -1098,6 +1130,12 @@ impl SlabBStackAllocator {
                         }
                     }
                     St::ReadNode(cursor) => {
+                        // A revisited block means the list cycles: abort (no writes
+                        // are staged during the chase, so nothing commits).
+                        if !seen.insert(cursor) {
+                            cycle = true;
+                            return None;
+                        }
                         st = St::ConsumeNode(cursor);
                         return Some(BStackGenOp::Read {
                             offset: cursor,
@@ -1166,6 +1204,15 @@ impl SlabBStackAllocator {
             }
         })?;
 
+        if let Some(e) = io_err {
+            return Err(e);
+        }
+        if cycle {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "alloc_bulk: free-list cycle detected",
+            ));
+        }
         if !enough {
             return Ok(None);
         }
@@ -2221,6 +2268,47 @@ mod bulk_tests {
         for h in handles {
             h.join().unwrap();
         }
+    }
+
+    #[test]
+    fn alloc_bulk_detects_free_list_cycle() {
+        let (stack, path) = empty_stack();
+        let _g = Guard(path);
+        let alloc = SlabBStackAllocator::new(stack, 16).unwrap();
+        let a = alloc.alloc(16).unwrap();
+        let b = alloc.alloc(16).unwrap();
+        let b_start = b.start();
+        alloc.dealloc(a).unwrap();
+        alloc.dealloc(b).unwrap(); // head → b → a
+        // Corrupt the list into a self-cycle: b.next → b (next lives at the block
+        // start for the plain slab).
+        alloc.stack().set(b_start, b_start.to_le_bytes()).unwrap();
+        let err = alloc
+            .alloc_bulk([16u64, 16, 16])
+            .expect_err("a free-list cycle must be reported, not looped/duplicated");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn alloc_bulk_rejects_out_of_range_free_pointer() {
+        let (stack, path) = empty_stack();
+        let _g = Guard(path);
+        let alloc = SlabBStackAllocator::new(stack, 16).unwrap();
+        let a = alloc.alloc(16).unwrap();
+        let b = alloc.alloc(16).unwrap();
+        let b_start = b.start();
+        alloc.dealloc(a).unwrap();
+        alloc.dealloc(b).unwrap(); // head → b → a
+        // Corrupt b.next to a wildly out-of-range offset; the chase's read of it
+        // must surface as an error rather than interpreting an unfilled buffer.
+        alloc
+            .stack()
+            .set(b_start, (1u64 << 40).to_le_bytes())
+            .unwrap();
+        let err = alloc
+            .alloc_bulk([16u64, 16])
+            .expect_err("an out-of-range free-list pointer must be rejected");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
 }
 

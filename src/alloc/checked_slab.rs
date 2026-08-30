@@ -1771,12 +1771,14 @@ impl CheckedSlabBStackAllocator {
             return Ok(Vec::new());
         }
         let mut popped: Vec<u64> = Vec::with_capacity(want);
+        let mut seen: HashSet<u64> = HashSet::with_capacity(want);
         let mut head_buf = [0u8; 8];
         let mut node_buf = [0u8; 16];
-        // Set when a chased block has a non-zero (in-use) overhead: the free list
-        // is corrupt. The sequence ends with no write and the error is raised
-        // after `process_gen` returns.
+        // Set when a chased block has a non-zero (in-use) overhead, or when the
+        // chase revisits a block (a cycle): the free list is corrupt. The sequence
+        // ends with no write and the error is raised after `process_gen` returns.
         let mut corrupt: Option<(u64, u64)> = None;
+        let mut cycle = false;
 
         #[derive(Clone, Copy)]
         enum St {
@@ -1808,6 +1810,12 @@ impl CheckedSlabBStackAllocator {
                     }
                     // Read the overhead + next-pointer of the block at `cursor`.
                     St::ReadNode(cursor) => {
+                        // A revisited block means the list cycles: abort with no
+                        // write so nothing is popped.
+                        if !seen.insert(cursor) {
+                            cycle = true;
+                            return None;
+                        }
                         st = St::ConsumeNode(cursor);
                         return Some(BStackGenOp::Read {
                             offset: cursor,
@@ -1849,6 +1857,12 @@ impl CheckedSlabBStackAllocator {
                 ),
             ));
         }
+        if cycle {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "alloc_bulk: free-list cycle detected",
+            ));
+        }
         Ok(popped)
     }
 
@@ -1886,12 +1900,18 @@ impl CheckedSlabBStackAllocator {
         // slots for zero-length requests); the claim phase reads their block
         // starts back, so no separate list of popped offsets is kept.
         let mut result: Vec<BStackOwnedSlice<'_, Self>> = Vec::with_capacity(lengths.len());
+        let mut seen: HashSet<u64> = HashSet::with_capacity(singles);
         let mut len_idx = 0usize;
         let mut collected = 0usize;
         let mut head_buf = [0u8; 8];
         let mut node_buf = [0u8; 16];
         let mut enough = false;
         let mut corrupt: Option<(u64, u64)> = None;
+        let mut cycle = false;
+        // Captures a `Read` whose offset failed validation (a corrupt next-pointer
+        // out of range): `inplace_gen` reports that to the closure as the previous
+        // op's result rather than returning it, and leaves the buffer unfilled.
+        let mut io_err: Option<io::Error> = None;
 
         #[derive(Clone, Copy)]
         enum St {
@@ -1905,7 +1925,13 @@ impl CheckedSlabBStackAllocator {
         }
         let mut st = St::ReadHead;
 
-        self.stack.inplace_gen(|_prev| {
+        self.stack.inplace_gen(|prev| {
+            // A failed read reports its error here, not as a return value, and
+            // leaves the buffer unfilled: bail before consuming stale bytes.
+            if let Err(e) = prev {
+                io_err = Some(e);
+                return None;
+            }
             loop {
                 match st {
                     // ── Chase phase: reads only, so they see committed bytes. ──
@@ -1926,6 +1952,12 @@ impl CheckedSlabBStackAllocator {
                         }
                     }
                     St::ReadNode(cursor) => {
+                        // A revisited block means the list cycles: abort (no writes
+                        // are staged during the chase, so nothing commits).
+                        if !seen.insert(cursor) {
+                            cycle = true;
+                            return None;
+                        }
                         st = St::ConsumeNode(cursor);
                         return Some(BStackGenOp::Read {
                             offset: cursor,
@@ -2001,12 +2033,21 @@ impl CheckedSlabBStackAllocator {
             }
         })?;
 
+        if let Some(e) = io_err {
+            return Err(e);
+        }
         if let Some((head, overhead)) = corrupt {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
                     "free-list block at {head} has non-zero overhead {overhead:#018x}; free list corrupt"
                 ),
+            ));
+        }
+        if cycle {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "alloc_bulk: free-list cycle detected",
             ));
         }
         if !enough {
@@ -3424,6 +3465,27 @@ mod bulk_tests {
         }
         // After all threads finish, the arena must be fully accounted for.
         assert_eq!(alloc.recover().unwrap(), 0);
+    }
+
+    #[test]
+    fn alloc_bulk_detects_free_list_cycle() {
+        let (stack, path) = empty_stack();
+        let _g = Guard(path);
+        let alloc = CheckedSlabBStackAllocator::new(stack, 24).unwrap();
+        let a = alloc.alloc(24).unwrap();
+        let b = alloc.alloc(24).unwrap();
+        let _pin = alloc.alloc(24).unwrap(); // keep b off the tail so it is pushed
+        let b_data = b.start();
+        let b_block = b_data - 8; // block start = data ptr − OVERHEAD
+        alloc.dealloc(a).unwrap();
+        alloc.dealloc(b).unwrap(); // head → b → a
+        // Corrupt the list into a self-cycle: b.next (at data[0..8] = b_data)
+        // → b's own block start, leaving the free overhead (0) intact.
+        alloc.stack().set(b_data, b_block.to_le_bytes()).unwrap();
+        let err = alloc
+            .alloc_bulk([24u64, 24, 24])
+            .expect_err("a free-list cycle must be reported, not looped/duplicated");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 }
 
