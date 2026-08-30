@@ -1389,9 +1389,13 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
         let mut ext_bytes = 0u64;
 
         let build = (|| -> io::Result<Vec<BStackOwnedSlice<'_, Self>>> {
-            // Block starts are always ≥ ARENA_START > 0, so 0 marks an unassigned
-            // request; zero-length requests keep 0 and become null slices.
-            let mut assign: Vec<u64> = vec![0u64; n];
+            // Result slices in input order, built as blocks are assigned rather
+            // than in a second pass (like the slab bulk path). Every request
+            // starts null; a non-zero request is overwritten in place once
+            // assigned, so one still holding a null slice is an unserved miss, and
+            // zero-length requests simply keep theirs.
+            let mut result: Vec<BStackOwnedSlice<'_, Self>> =
+                (0..n).map(|_| BStackOwnedSlice::empty(self)).collect();
             // Every claim the final `set_batched` applies, tagged by kind.
             let mut claims: Vec<(u64, u64, ClaimKind)> = Vec::new(); // (offset, size, kind)
             let mut to_splice: Vec<(u64, u64)> = Vec::new(); // free blocks to relink (best-effort)
@@ -1407,7 +1411,10 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
                     let bs = popped[pi];
                     pi += 1;
                     let size = block_of[i]; // classed: block == class block size
-                    assign[i] = bs;
+                    // SAFETY: a live block just popped; its data region begins at
+                    // `bs + OVERHEAD` (claimed below) and spans `lengths[i]` bytes.
+                    result[i] =
+                        unsafe { BStackOwnedSlice::from_raw_parts(self, bs + Self::OVERHEAD, lengths[i]) };
                     detached.push((bs, size));
                     claims.push((bs, size, ClaimKind::Reuse));
                 }
@@ -1428,7 +1435,12 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
                     for (ri, &req) in reqs.iter().enumerate() {
                         if !matched[ri] && block_of[req] <= bsize {
                             let block = block_of[req];
-                            assign[req] = boff;
+                            // SAFETY: `boff` is a live oversized block; data begins
+                            // at `boff + OVERHEAD` (claimed below), spanning
+                            // `lengths[req]` bytes.
+                            result[req] = unsafe {
+                                BStackOwnedSlice::from_raw_parts(self, boff + Self::OVERHEAD, lengths[req])
+                            };
                             matched[ri] = true;
                             // Rollback frees the whole block (nothing is carved
                             // until the claim commits).
@@ -1474,7 +1486,7 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
             let mut misses: Vec<usize> = Vec::new();
             let mut total_ext = 0u64;
             for i in 0..n {
-                if block_of[i] > 0 && assign[i] == 0 {
+                if block_of[i] > 0 && result[i].is_empty() {
                     total_ext = total_ext.checked_add(block_of[i]).ok_or_else(|| {
                         io::Error::new(
                             io::ErrorKind::InvalidInput,
@@ -1501,7 +1513,11 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
                 let mut rel = 0u64;
                 for &i in &misses {
                     let abs = ext_base + rel;
-                    assign[i] = abs;
+                    // SAFETY: freshly extended block; data begins at `abs + OVERHEAD`
+                    // (claimed below), spanning `lengths[i]` bytes.
+                    result[i] = unsafe {
+                        BStackOwnedSlice::from_raw_parts(self, abs + Self::OVERHEAD, lengths[i])
+                    };
                     claims.push((abs, block_of[i], ClaimKind::Fresh)); // flip in-use
                     rel += block_of[i];
                 }
@@ -1545,21 +1561,7 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
             //    block left unspliced stays free-tagged (reclaimed by `recover`).
             self.repush_detached(&to_splice);
 
-            // Build the result in input order (null slices for zero-length).
-            let mut result = Vec::with_capacity(n);
-            for (i, &len) in lengths.iter().enumerate() {
-                if len == 0 {
-                    result.push(BStackOwnedSlice::empty(self));
-                } else {
-                    // Every non-zero request was assigned a nonzero block start.
-                    let block_start = assign[i];
-                    // SAFETY: a live block just popped or extended; its data region
-                    // begins at `block_start + OVERHEAD` and spans `len` bytes.
-                    result.push(unsafe {
-                        BStackOwnedSlice::from_raw_parts(self, block_start + Self::OVERHEAD, len)
-                    });
-                }
-            }
+            // `result` was filled in place as blocks were assigned.
             Ok(result)
         })();
 
