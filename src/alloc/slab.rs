@@ -203,7 +203,7 @@ impl SlabBStackAllocator {
         let mut hdr = [0u8; Self::ARENA_START as usize];
         let off = Self::OFFSET_SIZE as usize;
         hdr[off..off + 8].copy_from_slice(&ALSL_MAGIC);
-        hdr[off + 8..off + 16].copy_from_slice(&block_size.to_le_bytes());
+        write_buf!(block_size => hdr, off + 8);
         // free_head at off+16 remains 0 (SENTINEL)
         stack.push(hdr)?;
         Ok(Self {
@@ -252,7 +252,7 @@ impl SlabBStackAllocator {
             ));
         }
 
-        let stored_block_size = u64::from_le_bytes(header[8..16].try_into().unwrap());
+        let stored_block_size = read_buf_le!(header, 8 => u64);
         if stored_block_size < Self::MIN_BLOCK_SIZE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -265,7 +265,7 @@ impl SlabBStackAllocator {
                 "stored block_size is too large for this platform",
             ));
         }
-        let stored_free_head = u64::from_le_bytes(header[16..24].try_into().unwrap());
+        let stored_free_head = read_buf_le!(header, 16 => u64);
         if stored_free_head != Self::SENTINEL
             && (stored_free_head < Self::ARENA_START
                 || (stored_free_head - Self::ARENA_START) % stored_block_size != 0
@@ -506,7 +506,7 @@ impl SlabBStackAllocator {
                     "free-list offset overflows usize",
                 )
             })?;
-            buf[off..off + 8].copy_from_slice(&next.to_le_bytes());
+            write_buf!(next => buf, off);
         }
         self.stack.set(first_block, buf)?;
 
@@ -1721,7 +1721,7 @@ mod tests {
         // Craft a header with valid magic but block_size = 1 (< MIN_BLOCK_SIZE = 8).
         let mut hdr = [0u8; 48];
         hdr[24..32].copy_from_slice(b"ALSL\x00\x01\x00\x00");
-        hdr[32..40].copy_from_slice(&1u64.to_le_bytes());
+        write_buf!(1u64 => hdr, 32);
         stack.push(hdr).unwrap();
         drop(stack);
         let err = SlabBStackAllocator::open(BStack::open(&path).unwrap()).unwrap_err();

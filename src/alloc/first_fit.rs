@@ -371,8 +371,8 @@ impl FirstFitBStackAllocator {
     fn unlink_from_free_list(&self, payload_start: u64) -> io::Result<()> {
         let mut ptrs = [0u8; 16];
         self.stack.get_into(payload_start, &mut ptrs)?;
-        let next = u64::from_le_bytes(ptrs[0..8].try_into().unwrap());
-        let prev = u64::from_le_bytes(ptrs[8..16].try_into().unwrap());
+        let next = read_buf_le!(ptrs, 0 => u64);
+        let prev = read_buf_le!(ptrs, 8 => u64);
         if prev != 0 {
             self.stack.set(prev, next.to_le_bytes())?;
         } else {
@@ -415,7 +415,7 @@ impl FirstFitBStackAllocator {
         if next_header + Self::BLOCK_HEADER_SIZE <= stack_len {
             let mut next_hdr = [0u8; 16];
             self.stack.get_into(next_header, &mut next_hdr)?;
-            let next_size = u64::from_le_bytes(next_hdr[0..8].try_into().unwrap());
+            let next_size = read_buf_le!(next_hdr, 0 => u64);
             if next_hdr[8] & 1 != 0
                 && next_size >= Self::MIN_BLOCK_PAYLOAD_SIZE
                 && next_size % 8 == 0
@@ -443,7 +443,7 @@ impl FirstFitBStackAllocator {
             {
                 let mut prev_hdr = [0u8; 16];
                 self.stack.get_into(prev_header, &mut prev_hdr)?;
-                let prev_hdr_size = u64::from_le_bytes(prev_hdr[0..8].try_into().unwrap());
+                let prev_hdr_size = read_buf_le!(prev_hdr, 0 => u64);
                 // Cross-check: header size must match footer size
                 if prev_hdr[8] & 1 != 0 && prev_hdr_size == prev_size {
                     self.unlink_from_free_list(prev_header + Self::BLOCK_HEADER_SIZE)?;
@@ -468,8 +468,8 @@ impl FirstFitBStackAllocator {
         self.stack.get_into(Self::FREE_HEAD_OFFSET, &mut head_buf)?;
         let next_block = u64::from_le_bytes(head_buf);
         let mut update_buf = [0u8; 24];
-        update_buf[0..4].copy_from_slice(&1u32.to_le_bytes()); // is_free = 1
-        update_buf[8..16].copy_from_slice(&next_block.to_le_bytes()); // next_free = old head
+        write_buf!(1u32 => update_buf, 0); // is_free = 1
+        write_buf!(next_block => update_buf, 8); // next_free = old head
         // update_buf[4..8] = reserved = 0, update_buf[16..24] = prev_free = 0
         self.stack
             .set(result_start - Self::BLOCK_HEADER_SIZE + 8, update_buf)?;
@@ -526,7 +526,7 @@ impl FirstFitBStackAllocator {
             let size_flags_and_ptr_buf = &mut [0u8; Self::BLOCK_HEADER_SIZE as usize + 8];
             self.stack
                 .get_into(head - Self::BLOCK_HEADER_SIZE, size_flags_and_ptr_buf)?;
-            let block_size = u64::from_le_bytes(size_flags_and_ptr_buf[0..8].try_into().unwrap());
+            let block_size = read_buf_le!(size_flags_and_ptr_buf, 0 => u64);
             let is_free = size_flags_and_ptr_buf[8] & 1 != 0;
             debug_assert!(
                 is_free,
@@ -607,8 +607,8 @@ impl FirstFitBStackAllocator {
             // Update the footer of the free block and write the header of the allocated block together
             // Flag and reserved bytes are already 0, so the new block is marked as allocated.
             let update_buf = &mut [0u8; Self::BLOCK_OVERHEAD_SIZE as usize];
-            update_buf[..8].copy_from_slice(&remaining_size.to_le_bytes());
-            update_buf[8..16].copy_from_slice(&requested_size.to_le_bytes());
+            write_buf!(remaining_size => update_buf, 0);
+            write_buf!(requested_size => update_buf, 8);
             self.stack.set(found_start + remaining_size, update_buf)?;
 
             // Update 2
@@ -620,9 +620,7 @@ impl FirstFitBStackAllocator {
                 Some(content_buffer) => {
                     // Write the footer of the allocated block into the content
                     // buffer so payload and footer land in one call.
-                    content_buffer[(requested_size + Self::BLOCK_HEADER_SIZE) as usize
-                        ..(requested_size + Self::BLOCK_OVERHEAD_SIZE) as usize]
-                        .copy_from_slice(&requested_size.to_le_bytes());
+                    write_buf!(requested_size => content_buffer, (requested_size + Self::BLOCK_HEADER_SIZE) as usize);
                     self.stack.set(
                         payload_start,
                         &content_buffer[Self::BLOCK_HEADER_SIZE as usize..],
@@ -648,8 +646,8 @@ impl FirstFitBStackAllocator {
             // Read both pointers
             let mut pointers_buf = [0u8; 16];
             self.stack.get_into(found_start, &mut pointers_buf)?;
-            let next = u64::from_le_bytes(pointers_buf[0..8].try_into().unwrap());
-            let prev = u64::from_le_bytes(pointers_buf[8..16].try_into().unwrap());
+            let next = read_buf_le!(pointers_buf, 0 => u64);
+            let prev = read_buf_le!(pointers_buf, 8 => u64);
 
             // Commit backward pointer first
             // If fails here, the free list looks like this:
@@ -726,7 +724,7 @@ impl FirstFitBStackAllocator {
             // Cross-check: header size must match footer size and block must be free
             let mut hdr_buf = [0u8; 16];
             self.stack.get_into(hdr, &mut hdr_buf)?;
-            let hdr_size = u64::from_le_bytes(hdr_buf[0..8].try_into().unwrap());
+            let hdr_size = read_buf_le!(hdr_buf, 0 => u64);
             if hdr_buf[8] & 1 == 0 || hdr_size != sz {
                 break;
             }
@@ -761,7 +759,7 @@ impl FirstFitBStackAllocator {
             // Read block header: size(8) + flags(4) + reserved(4)
             let mut hdr_buf = [0u8; 16];
             self.stack.get_into(pos, &mut hdr_buf)?;
-            let mut size = u64::from_le_bytes(hdr_buf[0..8].try_into().unwrap());
+            let mut size = read_buf_le!(hdr_buf, 0 => u64);
             let is_free = hdr_buf[8] & 1 != 0;
 
             // Validate: size must be ≥ minimum, 8-aligned, and the full block must fit in the stack.
@@ -877,8 +875,8 @@ impl FirstFitBStackAllocator {
             let next = if i + 1 < count { free_blocks[i + 1] } else { 0 };
             let prev = if i > 0 { free_blocks[i - 1] } else { 0 };
             let mut ptr_buf = [0u8; 16];
-            ptr_buf[0..8].copy_from_slice(&next.to_le_bytes());
-            ptr_buf[8..16].copy_from_slice(&prev.to_le_bytes());
+            write_buf!(next => ptr_buf, 0);
+            write_buf!(prev => ptr_buf, 8);
             self.stack.set(curr, ptr_buf)?;
         }
 
@@ -1116,9 +1114,8 @@ impl FirstFitBStackAllocator {
             let ptr = match buf.as_mut() {
                 // Push the full block: header + zero payload + footer.
                 Some(buf) => {
-                    buf[..8].copy_from_slice(&aligned_len.to_le_bytes());
-                    buf[(aligned_len + Self::BLOCK_HEADER_SIZE) as usize..]
-                        .copy_from_slice(&aligned_len.to_le_bytes());
+                    write_buf!(aligned_len => buf, 0);
+                    write_buf!(aligned_len => buf, (aligned_len + Self::BLOCK_HEADER_SIZE) as usize);
                     self.stack.push(&*buf)?
                 }
                 // Only the header and footer size words have to be written: one
@@ -1168,7 +1165,7 @@ impl FirstFitBStackAllocator {
             let mut next_hdr_buf = [0u8; 16];
             self.stack
                 .get_into(next_block - Self::BLOCK_HEADER_SIZE, &mut next_hdr_buf)?;
-            let next_block_size = u64::from_le_bytes(next_hdr_buf[0..8].try_into().unwrap());
+            let next_block_size = read_buf_le!(next_hdr_buf, 0 => u64);
             let next_block_is_free = next_hdr_buf[8] & 1 != 0;
 
             // Validate: next_block_size must be ≥ minimum, 8-aligned, and large enough to hold
@@ -1222,17 +1219,12 @@ impl FirstFitBStackAllocator {
                     let free_payload_off = alloc_footer_off + Self::BLOCK_OVERHEAD_SIZE as usize;
                     let free_footer_off = (next_block_size + Self::BLOCK_OVERHEAD_SIZE) as usize;
 
-                    zero_buff[alloc_footer_off..alloc_footer_off + 8]
-                        .copy_from_slice(&aligned_new_len.to_le_bytes());
-                    zero_buff[free_hdr_off..free_hdr_off + 8]
-                        .copy_from_slice(&remainder_size.to_le_bytes());
-                    zero_buff[free_hdr_off + 8..free_hdr_off + 12]
-                        .copy_from_slice(&1u32.to_le_bytes()); // is_free = 1
-                    zero_buff[free_payload_off..free_payload_off + 8]
-                        .copy_from_slice(&old_head.to_le_bytes()); // next_free = old head
+                    write_buf!(aligned_new_len => zero_buff, alloc_footer_off);
+                    write_buf!(remainder_size => zero_buff, free_hdr_off);
+                    write_buf!(1u32 => zero_buff, free_hdr_off + 8); // is_free = 1
+                    write_buf!(old_head => zero_buff, free_payload_off); // next_free = old head
                     // prev_free stays 0
-                    zero_buff[free_footer_off..free_footer_off + 8]
-                        .copy_from_slice(&remainder_size.to_le_bytes());
+                    write_buf!(remainder_size => zero_buff, free_footer_off);
 
                     // Set the header to merged_size first so that if we crash after the
                     // big write but before the aligned_new_len update, recovery sees a
@@ -1271,7 +1263,7 @@ impl FirstFitBStackAllocator {
                         .set(start - Self::BLOCK_HEADER_SIZE, merged_size.to_le_bytes())?;
                     let footer_off = (next_block_size + Self::BLOCK_OVERHEAD_SIZE) as usize;
                     if init {
-                        zero_buff[footer_off..].copy_from_slice(&merged_size.to_le_bytes());
+                        write_buf!(merged_size => zero_buff, footer_off);
                         self.stack.set(start + block_size, &zero_buff)?;
                     } else {
                         // Everything before the footer is absorbed overhead and
@@ -1520,14 +1512,13 @@ impl FirstFitBStackAllocator {
                 // No free block fits; push the full new block in one call, then free the old one.
                 // Copy only the user-visible bytes; the rest of `block_buf` stays zeroed.
                 let copy_len = (slice.len().min(aligned_new_len)) as usize;
-                block_buf[..8].copy_from_slice(&aligned_new_len.to_le_bytes());
+                write_buf!(aligned_new_len => block_buf, 0);
                 self.stack.get_into(
                     slice.start(),
                     &mut block_buf[Self::BLOCK_HEADER_SIZE as usize
                         ..Self::BLOCK_HEADER_SIZE as usize + copy_len],
                 )?;
-                block_buf[(aligned_new_len + Self::BLOCK_HEADER_SIZE) as usize..]
-                    .copy_from_slice(&aligned_new_len.to_le_bytes());
+                write_buf!(aligned_new_len => block_buf, (aligned_new_len + Self::BLOCK_HEADER_SIZE) as usize);
                 self.set_recovery_needed()?;
                 let ptr = self.stack.push(&block_buf)? + Self::BLOCK_HEADER_SIZE;
                 // The new block is committed and populated; it is now the
@@ -1592,8 +1583,8 @@ impl FirstFitBStackAllocator {
         header_size: u64,
     ) -> [u8; Self::BLOCK_OVERHEAD_SIZE as usize] {
         let mut buf = [0u8; Self::BLOCK_OVERHEAD_SIZE as usize];
-        buf[0..8].copy_from_slice(&footer_size.to_le_bytes());
-        buf[8..16].copy_from_slice(&header_size.to_le_bytes());
+        write_buf!(footer_size => buf, 0);
+        write_buf!(header_size => buf, 8);
         // buf[16..24] stays zero: the allocated block's flags + reserved words.
         buf
     }
@@ -1859,7 +1850,7 @@ impl FirstFitBStackAllocator {
             };
             let mut lhbuf = [0u8; 16];
             self.stack.get_into(l_header, &mut lhbuf)?;
-            let l_hdr_size = u64::from_le_bytes(lhbuf[0..8].try_into().unwrap());
+            let l_hdr_size = read_buf_le!(lhbuf, 0 => u64);
             let l_is_free = lhbuf[8] & 1 != 0;
             if !l_is_free || l_hdr_size != lsize {
                 return unsupported();
@@ -1909,7 +1900,7 @@ impl FirstFitBStackAllocator {
                     // header with our grown allocated header and rewrite our footer.
                     self.unlink_from_free_list(l_header + Self::BLOCK_HEADER_SIZE)?;
                     let mut hdr = [0u8; Self::BLOCK_HEADER_SIZE as usize];
-                    hdr[0..8].copy_from_slice(&our_new_size.to_le_bytes());
+                    write_buf!(our_new_size => hdr, 0);
                     // hdr[8..16] = flags(0)+reserved(0) => allocated.
                     self.stack.set(new_header, hdr)?;
                     self.stack

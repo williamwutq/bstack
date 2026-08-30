@@ -145,8 +145,8 @@ impl<'a, A: BStackOwnedSliceAllocator> BStackByteVec<'a, A> {
     fn read_header(&self) -> io::Result<(u64, u64)> {
         let mut hdr = [0u8; 16];
         self.slice.read_range_into(0, &mut hdr)?;
-        let len = u64::from_le_bytes(hdr[..8].try_into().unwrap());
-        let cap = u64::from_le_bytes(hdr[8..].try_into().unwrap());
+        let len = read_buf_le!(hdr, 0 => u64);
+        let cap = read_buf_le!(hdr, 8 => u64);
         Ok((len, cap))
     }
 
@@ -160,8 +160,8 @@ impl<'a, A: BStackOwnedSliceAllocator> BStackByteVec<'a, A> {
 
     fn write_header(&mut self, len: u64, cap: u64) -> io::Result<()> {
         let mut hdr = [0u8; 16];
-        hdr[0..8].copy_from_slice(&len.to_le_bytes());
-        hdr[8..16].copy_from_slice(&cap.to_le_bytes());
+        write_buf!(len => hdr, 0);
+        write_buf!(cap => hdr, 8);
         self.slice.write_range(0, hdr)
     }
 

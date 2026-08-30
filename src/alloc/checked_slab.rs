@@ -286,7 +286,7 @@ impl CheckedSlabBStackAllocator {
         let mut hdr = [0u8; Self::ARENA_START as usize];
         let off = Self::OFFSET_SIZE as usize;
         hdr[off..off + 8].copy_from_slice(&ALCK_MAGIC);
-        hdr[off + 8..off + 16].copy_from_slice(&block_size.to_le_bytes());
+        write_buf!(block_size => hdr, off + 8);
         // free_head at off+16 remains 0 (SENTINEL)
         stack.push(hdr)?;
         Ok(Self {
@@ -344,7 +344,7 @@ impl CheckedSlabBStackAllocator {
             ));
         }
 
-        let stored_block_size = u64::from_le_bytes(header[8..16].try_into().unwrap());
+        let stored_block_size = read_buf_le!(header, 8 => u64);
         if stored_block_size < Self::MIN_BLOCK_SIZE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -357,7 +357,7 @@ impl CheckedSlabBStackAllocator {
                 "stored block_size is too large for this platform",
             ));
         }
-        let stored_free_head = u64::from_le_bytes(header[16..24].try_into().unwrap());
+        let stored_free_head = read_buf_le!(header, 16 => u64);
         if stored_free_head != Self::SENTINEL
             && (stored_free_head < Self::ARENA_START
                 || (stored_free_head - Self::ARENA_START) % stored_block_size != 0
@@ -584,7 +584,7 @@ impl CheckedSlabBStackAllocator {
                         });
                     }
                     St::ConsumeNode(head) => {
-                        let overhead = u64::from_le_bytes(node_buf[0..8].try_into().unwrap());
+                        let overhead = read_buf_le!(node_buf, 0 => u64);
                         if overhead != 0 {
                             free_corrupt = true;
                             free.sort_unstable();
@@ -592,7 +592,7 @@ impl CheckedSlabBStackAllocator {
                             continue;
                         }
                         free.push(head);
-                        let next = u64::from_le_bytes(node_buf[8..16].try_into().unwrap());
+                        let next = read_buf_le!(node_buf, 8 => u64);
                         st = St::WalkHead(next);
                         continue;
                     }
@@ -835,12 +835,12 @@ impl CheckedSlabBStackAllocator {
             }
             let mut prefix = [0u8; 16];
             self.stack.get_into(head, &mut prefix)?;
-            if u64::from_le_bytes(prefix[0..8].try_into().unwrap()) != 0 {
+            if read_buf_le!(prefix, 0 => u64) != 0 {
                 corrupt = true;
                 break;
             }
             free.push(head);
-            head = u64::from_le_bytes(prefix[8..16].try_into().unwrap());
+            head = read_buf_le!(prefix, 8 => u64);
         }
         free.sort_unstable();
         Ok((free, corrupt))
@@ -1016,7 +1016,7 @@ impl CheckedSlabBStackAllocator {
                 // Otherwise advance free_head to the popped block's next
                 // pointer, still under the lock acquired for step 0's read.
                 2 => {
-                    let overhead = u64::from_le_bytes(prefix_buf[0..8].try_into().unwrap());
+                    let overhead = read_buf_le!(prefix_buf, 0 => u64);
                     if overhead != 0 {
                         corrupt = Some(overhead);
                         None
@@ -1077,7 +1077,7 @@ impl CheckedSlabBStackAllocator {
         }
         let mut prefix = [0u8; 16];
         self.stack.get_into(head, &mut prefix)?;
-        let overhead = u64::from_le_bytes(prefix[0..8].try_into().unwrap());
+        let overhead = read_buf_le!(prefix, 0 => u64);
         if overhead != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -1824,7 +1824,7 @@ impl CheckedSlabBStackAllocator {
                         });
                     }
                     St::ConsumeNode(cursor) => {
-                        let overhead = u64::from_le_bytes(node_buf[0..8].try_into().unwrap());
+                        let overhead = read_buf_le!(node_buf, 0 => u64);
                         if overhead != 0 {
                             // Corrupt: end with no write, leaving free_head intact
                             // so nothing is actually popped.
@@ -1832,7 +1832,7 @@ impl CheckedSlabBStackAllocator {
                             return None;
                         }
                         popped.push(cursor);
-                        let next = u64::from_le_bytes(node_buf[8..16].try_into().unwrap());
+                        let next = read_buf_le!(node_buf, 8 => u64);
                         if popped.len() == want || next == Self::SENTINEL {
                             st = St::Done;
                             return Some(BStackGenOp::Write {
@@ -1893,7 +1893,7 @@ impl CheckedSlabBStackAllocator {
         // request) followed by a zero scrub of the stale payload.
         let claim_buf = {
             let mut b = vec![0u8; bs as usize];
-            b[..8].copy_from_slice(&(Self::IN_USE_BIT | 1).to_le_bytes());
+            write_buf!((Self::IN_USE_BIT | 1) => b, 0);
             b
         };
         // Slices are built straight into `result` during the chase (with null
@@ -1966,7 +1966,7 @@ impl CheckedSlabBStackAllocator {
                         });
                     }
                     St::ConsumeNode(cursor) => {
-                        let overhead = u64::from_le_bytes(node_buf[0..8].try_into().unwrap());
+                        let overhead = read_buf_le!(node_buf, 0 => u64);
                         if overhead != 0 {
                             corrupt = Some((cursor, overhead));
                             st = St::Abort;
@@ -1986,7 +1986,7 @@ impl CheckedSlabBStackAllocator {
                                 BStackOwnedSlice::from_raw_parts(self, cursor + Self::OVERHEAD, len)
                             });
                             collected += 1;
-                            let next = u64::from_le_bytes(node_buf[8..16].try_into().unwrap());
+                            let next = read_buf_le!(node_buf, 8 => u64);
                             if collected == singles {
                                 enough = true;
                                 st = St::WriteHead;
@@ -2078,7 +2078,7 @@ impl CheckedSlabBStackAllocator {
         }
         let claim_buf = {
             let mut b = vec![0u8; self.block_size as usize];
-            b[..8].copy_from_slice(&(Self::IN_USE_BIT | 1).to_le_bytes());
+            write_buf!((Self::IN_USE_BIT | 1) => b, 0);
             b
         };
         let mut i = 0usize;
@@ -2119,7 +2119,7 @@ impl CheckedSlabBStackAllocator {
         for i in 0..k {
             let next = if i + 1 < k { blocks[i + 1] } else { blocks[0] };
             let mut buf = [0u8; 16]; // overhead(0..8) cleared, next at data[0..8]
-            buf[8..16].copy_from_slice(&next.to_le_bytes());
+            write_buf!(next => buf, 8);
             batch.push((blocks[i], buf));
         }
         self.stack.set_batched(batch)?;
@@ -2696,7 +2696,7 @@ mod tests {
         // Valid magic but block_size = 8 (< MIN_BLOCK_SIZE = 16).
         let mut hdr = [0u8; 48];
         hdr[24..32].copy_from_slice(b"ALCK\x00\x01\x00\x00");
-        hdr[32..40].copy_from_slice(&8u64.to_le_bytes());
+        write_buf!(8u64 => hdr, 32);
         // free_head at [40..48] stays 0 (SENTINEL)
         stack.push(hdr).unwrap();
         drop(stack);
