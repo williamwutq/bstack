@@ -3671,4 +3671,88 @@ mod fault_tests {
         let d = alloc.alloc(DATA).unwrap();
         alloc.dealloc(d).unwrap();
     }
+
+    // `dealloc` reads the overhead word to reject a double free and to learn the
+    // block span. A fault there precedes every write, so the handle comes back.
+    #[test]
+    fn dealloc_overhead_read_fault_returns_handle() {
+        let path = temp_path("cslab_read");
+        let _g = Guard(path.clone());
+        let alloc = CheckedSlabBStackAllocator::new(BStack::open(&path).unwrap(), DATA).unwrap();
+
+        let mut s = alloc.alloc(DATA).unwrap();
+        s.write([4u8; DATA as usize]).unwrap();
+        let (start, len) = (s.start(), s.len());
+
+        arm(&alloc, FailOpAt::new("get_into", 0, ErrorKind::Other));
+        let err = alloc
+            .dealloc(s)
+            .expect_err("dealloc must fail when the overhead read faults");
+        disarm(&alloc);
+
+        assert_eq!(err.source.kind(), ErrorKind::Other);
+        let handle = err.handle.expect("the overhead read precedes every write");
+        assert_eq!((handle.start(), handle.len()), (start, len));
+        assert_eq!(
+            handle.read().unwrap(),
+            vec![4u8; DATA as usize],
+            "data must be intact"
+        );
+        alloc.dealloc(handle).unwrap();
+    }
+}
+
+// The free-list head chase is the one metadata read that has no home in
+// `fault_tests` above: that module is `not(atomic)` by design, and under `atomic`
+// the chase runs inside a single `process_gen`, where the head read is a step
+// within the sequence rather than a `BStack` call of its own. Faulting it needs
+// the per-step `"process_gen:read"` op, so the test is gated the other way.
+#[cfg(all(
+    test,
+    debug_assertions,
+    feature = "fault-injection",
+    feature = "set",
+    feature = "atomic"
+))]
+mod read_fault_tests {
+    use super::CheckedSlabBStackAllocator;
+    use crate::BStack;
+    use crate::alloc::BStackAllocator;
+    use crate::alloc_fuzz::common::{Guard, policies::FailOpAt, temp_path};
+    use crate::fault::FaultPolicy;
+    use std::io::ErrorKind;
+    use std::sync::Arc;
+
+    const SIZE: u64 = 64;
+
+    // `alloc` chases the free-list head before deciding to recycle or extend.
+    // Faulting that read must leave the freed block on the list, still reachable
+    // by the next `alloc`.
+    #[test]
+    fn alloc_free_list_head_read_fault_leaves_block_reusable() {
+        let path = temp_path("cslab_chase");
+        let _g = Guard(path.clone());
+        let alloc = CheckedSlabBStackAllocator::new(BStack::open(&path).unwrap(), SIZE).unwrap();
+
+        let s = alloc.alloc(SIZE).unwrap();
+        let freed = s.start();
+        let _pin = alloc.alloc(SIZE).unwrap(); // keep `s` off the tail
+        alloc.dealloc(s).unwrap();
+
+        let policy: Arc<dyn FaultPolicy> =
+            Arc::new(FailOpAt::new("process_gen:read", 0, ErrorKind::Other));
+        alloc.stack().set_fault_policy(Some(policy));
+        let err = alloc
+            .alloc(SIZE)
+            .expect_err("alloc must fail when the head read faults");
+        alloc.stack().set_fault_policy(None);
+        assert_eq!(err.kind(), ErrorKind::Other);
+
+        let reused = alloc.alloc(SIZE).unwrap();
+        assert_eq!(
+            reused.start(),
+            freed,
+            "the faulted chase must leave the block on the free list"
+        );
+    }
 }

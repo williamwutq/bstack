@@ -3022,4 +3022,29 @@ mod fault_tests {
         c.write([6u8; 96]).unwrap();
         assert_eq!(c.read().unwrap(), vec![6u8; 96]);
     }
+
+    // `dealloc` reads the payload size to decide truncate-the-tail versus recycle
+    // through the AVL tree. A fault there precedes both, so the handle survives.
+    #[test]
+    fn dealloc_tail_check_read_fault_returns_handle() {
+        let path = temp_path("ghost_read");
+        let _g = Guard(path.clone());
+        let alloc = GhostTreeBstackAllocator::new(BStack::open(&path).unwrap()).unwrap();
+
+        let mut s = alloc.alloc(64).unwrap();
+        s.write([5u8; 64]).unwrap();
+        let (start, len) = (s.start(), s.len());
+
+        arm(&alloc, FailOpAt::new("len", 0, ErrorKind::Other));
+        let err = alloc
+            .dealloc(s)
+            .expect_err("dealloc must fail when the tail check faults");
+        disarm(&alloc);
+
+        assert_eq!(err.source.kind(), ErrorKind::Other);
+        let handle = err.handle.expect("the tail check precedes every mutation");
+        assert_eq!((handle.start(), handle.len()), (start, len));
+        assert_eq!(handle.read().unwrap(), vec![5u8; 64], "data must be intact");
+        alloc.dealloc(handle).unwrap();
+    }
 }
