@@ -5002,6 +5002,168 @@ static int test_inplace_gen_immediate_none_is_noop(void)
     return 0;
 }
 
+/* ---- BSTACK_GEN_ABORT ---- */
+
+struct ig_abort_ctx {
+    int      step;
+    int     *prev;      /* prev_status slot, so gen can inspect it */
+    uint8_t  a[4];
+    uint8_t  b[4];
+    int      rejected;  /* prev_status captured after the out-of-range WRITE */
+};
+
+/* Stage two valid writes, then abort: neither may reach the file. */
+static int ig_abort_gen(bstack_gen_op_t *out_op, void *userctx)
+{
+    struct ig_abort_ctx *c = userctx;
+    switch (c->step++) {
+    case 0:
+        out_op->kind = BSTACK_GEN_WRITE;
+        out_op->u.write.offset = 0; out_op->u.write.data = c->a; out_op->u.write.len = 4;
+        return 1;
+    case 1:
+        out_op->kind = BSTACK_GEN_WRITE;
+        out_op->u.write.offset = 10; out_op->u.write.data = c->b; out_op->u.write.len = 4;
+        return 1;
+    default:
+        out_op->kind = BSTACK_GEN_ABORT;
+        out_op->u.abort.status = EIO;
+        return 1;
+    }
+}
+
+static int test_inplace_gen_abort_discards_staged_writes(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    uint8_t dots[20]; memset(dots, '.', sizeof dots);
+    CHECK(bstack_push(bs, dots, sizeof dots, NULL) == 0);
+
+    struct ig_abort_ctx c;
+    c.step = 0; c.prev = NULL; c.rejected = 0;
+    memset(c.a, 'A', 4); memset(c.b, 'B', 4);
+    errno = 0;
+    CHECK(bstack_inplace_gen(bs, ig_abort_gen, &c, NULL) == -1);
+    CHECK(errno == EIO);
+    /* Neither staged write committed. */
+    uint8_t buf[20]; CHECK(bstack_peek(bs, 0, buf, NULL) == 0);
+    CHECK(memcmp(buf, dots, sizeof dots) == 0);
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 20);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+/* A rejected write arrives through prev_status; aborting in response unwinds
+ * the write that did land, which returning 0 would have committed. */
+static int ig_abort_after_reject_gen(bstack_gen_op_t *out_op, void *userctx)
+{
+    struct ig_abort_ctx *c = userctx;
+    switch (c->step++) {
+    case 0:
+        out_op->kind = BSTACK_GEN_WRITE;
+        out_op->u.write.offset = 0; out_op->u.write.data = c->a; out_op->u.write.len = 4;
+        return 1;
+    case 1:
+        out_op->kind = BSTACK_GEN_WRITE;   /* past the payload: rejected */
+        out_op->u.write.offset = 100; out_op->u.write.data = c->b; out_op->u.write.len = 4;
+        return 1;
+    default:
+        c->rejected = *c->prev;
+        out_op->kind = BSTACK_GEN_ABORT;
+        out_op->u.abort.status = EINVAL;
+        return 1;
+    }
+}
+
+static int test_inplace_gen_abort_unwinds_after_a_rejected_write(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    uint8_t dots[20]; memset(dots, '.', sizeof dots);
+    CHECK(bstack_push(bs, dots, sizeof dots, NULL) == 0);
+
+    int prev = 0;
+    struct ig_abort_ctx c;
+    c.step = 0; c.prev = &prev; c.rejected = 0;
+    memset(c.a, 'A', 4); memset(c.b, 'B', 4);
+    errno = 0;
+    CHECK(bstack_inplace_gen(bs, ig_abort_after_reject_gen, &c, &prev) == -1);
+    CHECK(c.rejected == EINVAL);
+    CHECK(errno == EINVAL);
+    uint8_t buf[20]; CHECK(bstack_peek(bs, 0, buf, NULL) == 0);
+    CHECK(memcmp(buf, dots, sizeof dots) == 0);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+/* A zero-status abort is not a failure: the call succeeds, but the staged write
+ * is still dropped — unlike returning 0, which commits it. */
+static int ig_abort_ok_gen(bstack_gen_op_t *out_op, void *userctx)
+{
+    struct ig_abort_ctx *c = userctx;
+    if (c->step++ == 0) {
+        out_op->kind = BSTACK_GEN_WRITE;
+        out_op->u.write.offset = 0; out_op->u.write.data = c->a; out_op->u.write.len = 4;
+        return 1;
+    }
+    out_op->kind = BSTACK_GEN_ABORT;
+    out_op->u.abort.status = 0;
+    return 1;
+}
+
+static int test_inplace_gen_abort_without_a_status_succeeds_and_commits_nothing(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    uint8_t dots[20]; memset(dots, '.', sizeof dots);
+    CHECK(bstack_push(bs, dots, sizeof dots, NULL) == 0);
+
+    struct ig_abort_ctx c;
+    c.step = 0; c.prev = NULL; c.rejected = 0;
+    memset(c.a, 'A', 4); memset(c.b, 'B', 4);
+    CHECK(bstack_inplace_gen(bs, ig_abort_ok_gen, &c, NULL) == 0);
+    uint8_t buf[20]; CHECK(bstack_peek(bs, 0, buf, NULL) == 0);
+    CHECK(memcmp(buf, dots, sizeof dots) == 0);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+struct pg_abort_ctx { int step; uint8_t rbuf[5]; };
+
+static int pg_abort_gen(bstack_gen_op_t *out_op, void *userctx)
+{
+    struct pg_abort_ctx *c = userctx;
+    if (c->step++ == 0) {
+        out_op->kind = BSTACK_GEN_READ;
+        out_op->u.read.offset = 0; out_op->u.read.buf = c->rbuf; out_op->u.read.len = 5;
+        return 1;
+    }
+    out_op->kind = BSTACK_GEN_ABORT;
+    out_op->u.abort.status = EIO;
+    return 1;
+}
+
+static int test_process_gen_abort_ends_the_sequence_with_an_error(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    CHECK(bstack_push(bs, (uint8_t *)"helloworld", 10, NULL) == 0);
+
+    struct pg_abort_ctx c; c.step = 0; memset(c.rbuf, 0, sizeof c.rbuf);
+    errno = 0;
+    CHECK(bstack_process_gen(bs, pg_abort_gen, &c) == -1);
+    CHECK(errno == EIO);
+    CHECK(memcmp(c.rbuf, "hello", 5) == 0);   /* the read still happened */
+    uint8_t buf[10]; CHECK(bstack_peek(bs, 0, buf, NULL) == 0);
+    CHECK(memcmp(buf, "helloworld", 10) == 0);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
 #endif /* BSTACK_FEATURE_ATOMIC && BSTACK_FEATURE_SET */
 
 /* =========================================================================
@@ -5900,6 +6062,10 @@ int main(void)
     T(test_inplace_gen_read_spans_multiple_edits_and_gaps);
     T(test_inplace_gen_rejects_size_ops_but_still_commits);
     T(test_inplace_gen_immediate_none_is_noop);
+    T(test_inplace_gen_abort_discards_staged_writes);
+    T(test_inplace_gen_abort_unwinds_after_a_rejected_write);
+    T(test_inplace_gen_abort_without_a_status_succeeds_and_commits_nothing);
+    T(test_process_gen_abort_ends_the_sequence_with_an_error);
 
     /* bstack_copy — disjoint copy journal */
     T(test_copy_disjoint_journals_and_reopens_clean);

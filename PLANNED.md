@@ -121,35 +121,6 @@ Reasons:
 
 ---
 
-## `BStackGenOp::Abort` — discarding a staged `inplace_gen` batch
-
-**Feature flag:** `set` + `atomic`.
-**Breaking change:** No. `BStackGenOp` is `#[non_exhaustive]`
-
-### Motivation
-
-`inplace_gen` is the only primitive whose per-op failures are **reported rather than returned**: a `Read` or `Write` rejected by validation — offset overflow, a range past the payload, a range overlapping the locked region — is not performed, is not recorded, and its error is handed to the *next* `f(feedback)` call. The call itself fails only on a `Read`'s I/O error or on the final commit.
-
-A caller that notices a bad `feedback` therefore has no way to say "throw the batch away". The only exit from the loop is `None`, and `None` **commits the overlay**, so a generator that gives up on the third of five writes still commits the first two. The batch is atomic against crashes but not against a rejected op, and no operation expresses "unwind".
-
-The consequences are silent. `SegregatedBStackAllocator::push` returns `Ok` having pointed the class head at a block whose `overhead ‖ next_free` were never written; `commit_carve` returns `Ok` having repointed every head at an unwritten piece. Neither is a crash state — the file is intact and the free list is corrupt.
-
-No corruption is needed to reach it. `lock_up_to` is public and `BStackAllocator::stack()` hands out the `&BStack`, so locking a prefix that covers the free-list heads makes every head write fail validation. `set`, `set_batched` and `process_gen` all *return* that `InvalidInput`, so the single-item paths fail loudly; only `inplace_gen` swallows it.
-
-Checking `feedback` is necessary but not sufficient: it is a complete fix only where the error is guaranteed to precede any staged write, which holds for neither caller.
-
-### Design
-
-`BStackGenOp::Abort` ends the sequence like `None` but **discards the accumulated overlay** and makes `inplace_gen` return an error. Nothing has been written at that point — the overlay is an in-memory `Vec<(u64, &[u8])>` and the journal is not armed until the commit — so the file is bit-identical to before the call. `Abort { source: io::Error }` carries the cause, letting a caller hand back the `feedback` that made it abort. `process_gen` rejects `Abort` through the existing disallowed-op path: it accumulates nothing, and `None` already means "end without writing".
-
-### Open questions
-
-- **Should a rejected op abort by default?** That would fix every caller with no caller change and match every other write primitive, but it removes the "inspect the error and continue" affordance the contract advertises and the disallowed-op test pins. A per-call mode flag is the middle option.
-- **`get_batched_gen`** shares the generator shape but is read-only, so there is nothing to discard — worth confirming its per-op errors are returned before assuming it is unaffected.
-- **Whether callers should also pre-validate.** For offsets derived from on-disk metadata — `commit_carve`'s region, computed from a recorded physical size — a bounds check against `len()` before entering the closure diagnoses the condition rather than merely refusing it.
-
----
-
 ## Read-side per-op fault injection
 
 **Feature flag:** `fault-injection`; active only in builds with `debug_assertions`.
@@ -162,7 +133,7 @@ Faults are injected at the `BStack` public-API level: each instrumented method c
 - **No fault can be injected *inside* a batched or generator call.** `get_batched*`, `process_gen`, `inplace_gen` and `set_batched` consult once, where their batch I/O begins, so an armed fault fails the whole call before any per-item work. In `inplace_gen` the only op that performs I/O of its own is `Read`: a `Write` merely validates and inserts into the in-memory overlay, and every byte reaches the file in the single commit after the loop. What is missing there is therefore precisely the ability to fail one read of a dependent chase.
 - **No injected fault is validation-shaped.** `fault_point!` sits after argument validation by design, so a fault always presents as an I/O error at the boundary. The per-op failures `inplace_gen` reports through `feedback` are `InvalidInput` from range and locked-region checks — the only way a `Write` fails there — which no policy can produce.
 
-Together those leave the swallowed-rejection state space unreachable, so the defect the `BStackGenOp::Abort` entry fixes cannot be reproduced in a test.
+Together those leave the swallowed-rejection state space unreachable: a generator that inspects `feedback` and responds with `BStackGenOp::Abort` is the whole reason that variant exists, and no policy can produce the rejection that would exercise it.
 
 At the suite level the targeted allocator fault tests arm only write and size-changing operations — `set`, `extend`, `zero`, `discard`, `push`. None arms a read, though every allocator reads metadata before deciding what to write, and the `?` on each of those reads is a path whose surviving-handle contract is never deliberately exercised. `RandomFaults` is op-agnostic and hits reads incidentally, so that coverage lives in the fuzz suites and is pinned by no white-box test.
 
@@ -176,7 +147,7 @@ At the suite level the targeted allocator fault tests arm only write and size-ch
 
 - **Naming versus signature.** Sub-operation names leave `FaultPolicy` untouched; threading the op kind through `next_fault` is cleaner but breaks a public, if debug-only, trait.
 - **Whether a short read is worth modelling.** `fault_point!` returns before the I/O, so an injected read fault leaves the destination buffer untouched — matching what `inplace_gen` does with a rejected `Read`, but not a genuine torn read.
-- **Ordering.** The first two design items are what make the `Abort` entry testable; the read-fault tests are independent and can land at any time.
+- **Ordering.** The first two design items are what make `BStackGenOp::Abort` testable; the read-fault tests are independent and can land at any time.
 
 ---
 

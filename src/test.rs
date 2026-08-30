@@ -8982,6 +8982,146 @@ mod atomic_tests {
         assert_eq!(s.peek(0).unwrap(), b"hello");
     }
 
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn inplace_gen_abort_discards_staged_writes() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(vec![b'.'; 20]).unwrap();
+
+        // Two writes accumulate, then the sequence aborts: neither may commit,
+        // and the supplied error is what the call returns.
+        let a = [b'A'; 4];
+        let b = [b'B'; 4];
+        let mut step = 0usize;
+        let err = s
+            .inplace_gen(|_res| {
+                let r = match step {
+                    0 => Some(BStackGenOp::Write {
+                        offset: 0,
+                        data: bstack_unsafe_reborrow!(&a[..]),
+                    }),
+                    1 => Some(BStackGenOp::Write {
+                        offset: 10,
+                        data: bstack_unsafe_reborrow!(&b[..]),
+                    }),
+                    _ => Some(BStackGenOp::Abort {
+                        source: Some(std::io::Error::new(ErrorKind::Other, "gave up")),
+                    }),
+                };
+                step += 1;
+                r
+            })
+            .expect_err("Abort must fail the call");
+        assert_eq!(err.kind(), ErrorKind::Other);
+        assert_eq!(err.to_string(), "gave up");
+        assert_eq!(s.peek(0).unwrap(), vec![b'.'; 20]);
+    }
+
+    // A rejected write is reported through the feedback argument; responding to
+    // it with `Abort` unwinds the writes that did land, which returning `None`
+    // would have committed.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn inplace_gen_abort_unwinds_after_a_rejected_write() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(vec![b'.'; 20]).unwrap();
+
+        let a = [b'A'; 4];
+        let far = [b'X'; 4];
+        let mut step = 0usize;
+        let mut rejected = None;
+        let err = s
+            .inplace_gen(|res| {
+                if step == 2 {
+                    rejected = Some(res.as_ref().err().map(std::io::Error::kind));
+                }
+                let r = match step {
+                    // Valid: staged.
+                    0 => Some(BStackGenOp::Write {
+                        offset: 0,
+                        data: bstack_unsafe_reborrow!(&a[..]),
+                    }),
+                    // Past the payload: rejected, reported on the next call.
+                    1 => Some(BStackGenOp::Write {
+                        offset: 100,
+                        data: bstack_unsafe_reborrow!(&far[..]),
+                    }),
+                    _ => Some(BStackGenOp::Abort {
+                        source: Some(std::io::Error::new(ErrorKind::InvalidInput, "rejected op")),
+                    }),
+                };
+                step += 1;
+                r
+            })
+            .expect_err("Abort must fail the call");
+        assert_eq!(rejected, Some(Some(ErrorKind::InvalidInput)));
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        // The staged write at 0 was dropped, not committed.
+        assert_eq!(s.peek(0).unwrap(), vec![b'.'; 20]);
+    }
+
+    // A sourceless abort is not a failure: the call succeeds, but the staged
+    // writes are still dropped — unlike ending with `None`, which commits them.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn inplace_gen_abort_without_a_source_succeeds_and_commits_nothing() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(vec![b'.'; 20]).unwrap();
+
+        let a = [b'A'; 4];
+        let mut step = 0usize;
+        s.inplace_gen(|_res| {
+            let r = match step {
+                0 => Some(BStackGenOp::Write {
+                    offset: 0,
+                    data: bstack_unsafe_reborrow!(&a[..]),
+                }),
+                _ => Some(BStackGenOp::Abort { source: None }),
+            };
+            step += 1;
+            r
+        })
+        .expect("a sourceless abort succeeds");
+        assert_eq!(s.peek(0).unwrap(), vec![b'.'; 20]);
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn process_gen_abort_ends_the_sequence_with_an_error() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+
+        // Read, then decide against the write the sequence would have made.
+        let mut rbuf = [0u8; 5];
+        let mut step = 0usize;
+        let err = s
+            .process_gen(|| {
+                let r = match step {
+                    0 => Some(BStackGenOp::Read {
+                        offset: 0,
+                        buf: bstack_unsafe_reborrow_mut!(&mut rbuf[..]),
+                    }),
+                    _ => Some(BStackGenOp::Abort {
+                        source: Some(std::io::Error::new(ErrorKind::Other, "read says no")),
+                    }),
+                };
+                step += 1;
+                r
+            })
+            .expect_err("Abort must fail the call");
+        assert_eq!(err.kind(), ErrorKind::Other);
+        assert_eq!(&rbuf, b"hello");
+        assert_eq!(s.peek(0).unwrap(), b"helloworld");
+    }
+
     // ---- lock_up_to / locked_len / open_locked_up_to -----------------------
 
     #[test]

@@ -2719,7 +2719,8 @@ impl BStack {
 /// sequence itself signals that it is done, and so on. The "ending the
 /// sequence" notes below describe [`process_gen`](BStack::process_gen);
 /// [`inplace_gen`](BStack::inplace_gen) instead accumulates multiple `Write`s
-/// (none ends the sequence) and permits only `Read`, `Write`, and `Len`.
+/// (none ends the sequence) and permits only `Read`, `Write`, `Len`, and
+/// `Abort`.
 ///
 /// # Variants
 ///
@@ -2740,6 +2741,8 @@ impl BStack {
 /// - `Splice { old, new }` — pop `old.len()` bytes off the tail into `old` then
 ///   append `new`, ending the sequence.
 /// - `Len { out }` — write the current logical payload size into `out`.
+/// - `Abort { source }` — end the sequence discarding anything it accumulated,
+///   failing the call with `source` if it is `Some`.
 /// - `#[non_exhaustive]` — later versions may add further variants, for
 ///   richer write ownership or multi-write protocols, for instance, without
 ///   a breaking change.
@@ -2872,6 +2875,14 @@ pub enum BStackGenOp<'a> {
     Len {
         /// Destination for the current payload size.
         out: &'a mut u64,
+    },
+    /// End the sequence **without applying anything it accumulated** — the
+    /// counterpart of `None`, which ends it committing everything. `source`
+    /// sets the outcome independently: `Some(e)` returns `Err(e)`, `None`
+    /// returns `Ok(())`.
+    Abort {
+        /// The error the call fails with, or `None` to end successfully.
+        source: Option<io::Error>,
     },
 }
 
@@ -3325,6 +3336,9 @@ impl BStack {
     ///   size into `out` and calls `f` again — the in-sequence equivalent of
     ///   [`len`](Self::len), useful when a later step's offset depends on the
     ///   payload size (e.g. "read the size, then read the last element").
+    /// - `Some(BStackGenOp::Abort { source })` ends the sequence without writing
+    ///   anything, returning `Err(e)` for `Some(e)` and `Ok(())` for `None` —
+    ///   `None` with an optional error attached.
     /// - `None` ends the sequence without writing anything — useful when the
     ///   reads alone inform a decision, including the decision to change
     ///   nothing.
@@ -3638,6 +3652,11 @@ impl BStack {
                 Some(BStackGenOp::Len { out }) => {
                     *out = data_size;
                 }
+                Some(BStackGenOp::Abort { source }) => {
+                    // Nothing has been mutated: every mutating op ends the
+                    // sequence, so reaching here means only reads have run.
+                    return source.map_or(Ok(()), Err);
+                }
                 None => return Ok(()),
             }
         }
@@ -3768,6 +3787,9 @@ impl BStack {
     ///   offset, buf })` returns the payload as it *would* look with every pending
     ///   write applied — committed bytes overlaid with the edits recorded so far —
     ///   not the on-disk committed bytes.
+    /// - **A `Read` can fail**, and does not end the call: its error is reported
+    ///   through the next `f(feedback)` like any other op, and `buf` is left
+    ///   holding whatever it held before. Check `feedback` before trusting it.
     ///
     /// `f` receives the [`io::Result`] of the **previous** op (the first call
     /// receives `Ok(())`): the outcome of a `Read`, or the validation result of a
@@ -3777,7 +3799,12 @@ impl BStack {
     /// writes the current payload size into `out` (it never changes here) and
     /// continues. `None` ends the sequence and commits the accumulated writes.
     ///
-    /// Only in-place operations are permitted: `Read`, `Write`, and `Len`. The
+    /// `Some(BStackGenOp::Abort { source })` ends it the other way: the accumulated
+    /// writes are **discarded** — the only way to unwind a batch — and the call
+    /// returns `Err(e)` for `Some(e)` or `Ok(())` for `None`.
+    ///
+    /// Only in-place operations are permitted: `Read`, `Write`, `Len`, and
+    /// `Abort`. The
     /// size-changing ops (`Push`, `Pop`, `Discard`, `Atrunc`, `Splice`, `Sparse`)
     /// and `Swap` are rejected with [`io::ErrorKind::InvalidInput`] reported to `f`
     /// (they are not recorded and do not end the sequence) — the multi-write
@@ -3803,8 +3830,9 @@ impl BStack {
     ///
     /// Per-op validation failures (overflow, out-of-range, locked-region or
     /// disallowed-op errors) are reported to `f` as the next call's argument, not
-    /// returned. The call itself returns an error only if a `Read`'s I/O fails, or
-    /// if staging, replaying, or disarming the final commit fails — propagating
+    /// returned; a generator that wants one to fail the whole call must respond
+    /// with `Abort { source: Some(_) }`. Otherwise the call returns an error only if a `Read`'s I/O fails,
+    /// or if staging, replaying, or disarming the final commit fails — propagating
     /// any I/O error from `read_exact`, `write_all`, `set_len`, or `durable_sync`.
     #[cfg(all(feature = "set", feature = "atomic"))]
     pub fn inplace_gen<'a, F>(&self, mut f: F) -> io::Result<()>
@@ -3834,6 +3862,11 @@ impl BStack {
                 Some(BStackGenOp::Len { out }) => {
                     *out = data_size;
                     feedback = Ok(());
+                }
+                Some(BStackGenOp::Abort { source }) => {
+                    // Drop the overlay without committing: the pending writes
+                    // only ever existed in memory, so the file is untouched.
+                    return source.map_or(Ok(()), Err);
                 }
                 Some(BStackGenOp::Swap { .. }) => {
                     feedback = Err(io::Error::new(

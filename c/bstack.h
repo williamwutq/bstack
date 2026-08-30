@@ -630,6 +630,9 @@ typedef enum {
     /* Write the current logical payload size into *u.len.out, then call gen
      * again — does not end the sequence. */
     BSTACK_GEN_LEN,
+    /* End the sequence without applying anything it accumulated.  Fails the
+     * call with errno = u.abort.status, or succeeds if status is 0. */
+    BSTACK_GEN_ABORT,
 } bstack_gen_op_kind_t;
 
 /*
@@ -671,6 +674,10 @@ typedef enum {
  * - BSTACK_GEN_LEN: write the current logical payload size into
  *   *u.len.out and call gen again — the in-sequence equivalent of
  *   bstack_len.  Does not end the sequence.
+ * - BSTACK_GEN_ABORT: end the sequence without applying anything it
+ *   accumulated — the counterpart of returning 0 from gen, which ends it
+ *   committing everything.  u.abort.status sets the outcome independently:
+ *   non-zero fails the call with errno = u.abort.status, 0 returns 0.
  *
  * BSTACK_GEN_WRITE, BSTACK_GEN_SWAP, BSTACK_GEN_PUSH, BSTACK_GEN_POP,
  * BSTACK_GEN_SPLICE, and BSTACK_GEN_SPARSE are the only mutating kinds — exactly
@@ -722,6 +729,9 @@ typedef struct {
         struct {
             uint64_t *out;
         } len;
+        struct {
+            int status;  /* errno to fail the call with; 0 succeeds instead */
+        } abort;
     } u;
 } bstack_gen_op_t;
 
@@ -846,8 +856,9 @@ int bstack_process(bstack_t *bs, uint64_t start, uint64_t end,
  * overlap, if a write or swap range overlaps the locked region
  * [0, bstack_locked_len()), if a pop removes more bytes than the current
  * payload size, or if a pop would shrink the payload below
- * bstack_locked_len().  Returns -1 (errno set) if gen returns -1, or if
- * an I/O error occurs.
+ * bstack_locked_len().  Returns -1 (errno set) if gen yields a
+ * BSTACK_GEN_ABORT with a non-zero status, if gen returns -1, or if an I/O
+ * error occurs.
  *
  * Only available when compiled with both -DBSTACK_FEATURE_SET and
  * -DBSTACK_FEATURE_ATOMIC.
@@ -901,12 +912,17 @@ int bstack_set_batched(bstack_t *bs, const bstack_iovec_t *writes, size_t count)
  *   from the second.
  * - A BSTACK_GEN_READ returns the batch-so-far content: committed bytes overlaid
  *   with the edits recorded so far, not the on-disk bytes.
+ * - A BSTACK_GEN_READ can fail, and does not end the call: its errno is reported
+ *   through prev_status like any other op, and u.read.buf is left holding
+ *   whatever it held before.  Check prev_status before trusting it.
  *
- * Only in-place ops are permitted: BSTACK_GEN_READ, BSTACK_GEN_WRITE, and
- * BSTACK_GEN_LEN.  The size-changing ops (PUSH/POP/SPLICE/SPARSE) and SWAP are
- * rejected (reported as EINVAL via prev_status; not recorded, and the sequence
- * continues).
- * There is no abort: returning 0 always commits whatever validly accumulated.
+ * Only in-place ops are permitted: BSTACK_GEN_READ, BSTACK_GEN_WRITE,
+ * BSTACK_GEN_LEN, and BSTACK_GEN_ABORT.  The size-changing ops
+ * (PUSH/POP/SPLICE/SPARSE) and SWAP are rejected (reported as EINVAL via
+ * prev_status; not recorded, and the sequence continues).
+ * A BSTACK_GEN_ABORT ends the sequence the other way: every pending write is
+ * discarded — the only way to unwind a batch — and the call fails with
+ * errno = u.abort.status, or returns 0 when status is 0.
  *
  * If prev_status is non-NULL, before each gen call *prev_status is set to the
  * previous op's result — 0 on success, or the errno of a failed op (the first
@@ -921,8 +937,10 @@ int bstack_set_batched(bstack_t *bs, const bstack_iovec_t *writes, size_t count)
  * Reads of the locked region [0, bstack_locked_len()) are permitted; write ranges
  * touching it are rejected, matching bstack_set.
  *
- * Returns 0 on success (including an empty sequence).  Returns -1 (errno set) on
- * an I/O error during a read or the final commit, or on allocation failure.
+ * Returns 0 on success (including an empty sequence, and a BSTACK_GEN_ABORT
+ * with status 0).  Returns -1 (errno set) on a BSTACK_GEN_ABORT with a non-zero
+ * status, on an I/O error during a read or the final commit, or on allocation
+ * failure.
  *
  * Only available when compiled with both -DBSTACK_FEATURE_SET and
  * -DBSTACK_FEATURE_ATOMIC.
