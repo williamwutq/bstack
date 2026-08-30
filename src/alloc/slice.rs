@@ -642,9 +642,10 @@ impl<'a> BStackSlice<'a> {
     /// Read `[start, end)` relative to this slice into a new `Vec<u8>`.
     pub fn read_range(&self, start: u64, end: u64) -> io::Result<Vec<u8>> {
         if end > self.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("range [{start}, {end}) exceeds slice length {}", self.len()),
+            return Err(io_error!(
+                InvalidInput,
+                "range [{start}, {end}) exceeds slice length {}",
+                self.len()
             ));
         }
         self.stack.get(self.start() + start, self.start() + end)
@@ -654,12 +655,10 @@ impl<'a> BStackSlice<'a> {
     pub fn read_range_into(&self, start: u64, buf: &mut [u8]) -> io::Result<()> {
         let end_rel = start + buf.len() as u64;
         if end_rel > self.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "range [{start}, {end_rel}) exceeds slice length {}",
-                    self.len()
-                ),
+            return Err(io_error!(
+                InvalidInput,
+                "range [{start}, {end_rel}) exceeds slice length {}",
+                self.len()
             ));
         }
         self.stack.get_into(self.start() + start, buf)
@@ -683,12 +682,10 @@ impl<'a> BStackSlice<'a> {
         let data = data.as_ref();
         let end_rel = start + data.len() as u64;
         if end_rel > self.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "range [{start}, {end_rel}) exceeds slice length {}",
-                    self.len()
-                ),
+            return Err(io_error!(
+                InvalidInput,
+                "range [{start}, {end_rel}) exceeds slice length {}",
+                self.len()
             ));
         }
         self.stack.set(self.start() + start, data)
@@ -710,12 +707,10 @@ impl<'a> BStackSlice<'a> {
     pub fn zero_range(&mut self, start: u64, n: u64) -> io::Result<()> {
         let end_rel = start + n;
         if end_rel > self.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "range [{start}, {end_rel}) exceeds slice length {}",
-                    self.len()
-                ),
+            return Err(io_error!(
+                InvalidInput,
+                "range [{start}, {end_rel}) exceeds slice length {}",
+                self.len()
             ));
         }
         self.stack.zero(self.start() + start, n)
@@ -790,9 +785,9 @@ impl<'a> BStackSlice<'a> {
             "copy_from_bstack_slice: length mismatch"
         );
         if !std::ptr::eq(src.stack(), self.stack) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "BStackSlice::copy_from_bstack_slice: source belongs to a different BStack",
+            return Err(io_error!(
+                InvalidInput,
+                "BStackSlice::copy_from_bstack_slice: source belongs to a different BStack"
             ));
         }
         if self.is_empty() {
@@ -932,29 +927,25 @@ impl<'a> BStackSlice<'a> {
         let expected = expected.as_ref();
         let new_bytes = new_bytes.as_ref();
         if self.stack != guard.stack() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "BStackSlice::cas_on: guard belongs to a different BStack",
+            return Err(io_error!(
+                InvalidInput,
+                "BStackSlice::cas_on: guard belongs to a different BStack"
             ));
         }
         if expected.len() as u64 != guard.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "BStackSlice::cas_on: expected length ({}) != guard length ({})",
-                    expected.len(),
-                    guard.len()
-                ),
+            return Err(io_error!(
+                InvalidInput,
+                "BStackSlice::cas_on: expected length ({}) != guard length ({})",
+                expected.len(),
+                guard.len()
             ));
         }
         if new_bytes.len() as u64 != self.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "BStackSlice::cas_on: new_bytes length ({}) != self length ({})",
-                    new_bytes.len(),
-                    self.len()
-                ),
+            return Err(io_error!(
+                InvalidInput,
+                "BStackSlice::cas_on: new_bytes length ({}) != self length ({})",
+                new_bytes.len(),
+                self.len()
             ));
         }
         self.stack
@@ -982,29 +973,25 @@ impl<'a> BStackSlice<'a> {
         let expected = expected.as_ref();
         let new_bytes = new_bytes.as_ref();
         if self.stack != guard.stack() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "BStackSlice::cas_on_ne: guard belongs to a different BStack",
+            return Err(io_error!(
+                InvalidInput,
+                "BStackSlice::cas_on_ne: guard belongs to a different BStack"
             ));
         }
         if expected.len() as u64 != guard.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "BStackSlice::cas_on_ne: expected length ({}) != guard length ({})",
-                    expected.len(),
-                    guard.len()
-                ),
+            return Err(io_error!(
+                InvalidInput,
+                "BStackSlice::cas_on_ne: expected length ({}) != guard length ({})",
+                expected.len(),
+                guard.len()
             ));
         }
         if new_bytes.len() as u64 != self.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "BStackSlice::cas_on_ne: new_bytes length ({}) != self length ({})",
-                    new_bytes.len(),
-                    self.len()
-                ),
+            return Err(io_error!(
+                InvalidInput,
+                "BStackSlice::cas_on_ne: new_bytes length ({}) != self length ({})",
+                new_bytes.len(),
+                self.len()
             ));
         }
         self.stack
@@ -1038,29 +1025,25 @@ impl<'a> BStackSlice<'a> {
         let expected = expected.as_ref();
         let new_bytes = new_bytes.as_ref();
         if self.stack != guard.stack() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "BStackSlice::cas_on_masked: guard belongs to a different BStack",
+            return Err(io_error!(
+                InvalidInput,
+                "BStackSlice::cas_on_masked: guard belongs to a different BStack"
             ));
         }
         if expected.len() as u64 != guard.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "BStackSlice::cas_on_masked: expected length ({}) != guard length ({})",
-                    expected.len(),
-                    guard.len()
-                ),
+            return Err(io_error!(
+                InvalidInput,
+                "BStackSlice::cas_on_masked: expected length ({}) != guard length ({})",
+                expected.len(),
+                guard.len()
             ));
         }
         if new_bytes.len() as u64 != self.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "BStackSlice::cas_on_masked: new_bytes length ({}) != self length ({})",
-                    new_bytes.len(),
-                    self.len()
-                ),
+            return Err(io_error!(
+                InvalidInput,
+                "BStackSlice::cas_on_masked: new_bytes length ({}) != self length ({})",
+                new_bytes.len(),
+                self.len()
             ));
         }
         self.stack
@@ -1086,9 +1069,9 @@ impl<'a> BStackSlice<'a> {
     pub fn swap(&mut self, other: &mut BStackSlice<'_>) -> io::Result<()> {
         assert_eq!(self.len(), other.len(), "swap: length mismatch");
         if !std::ptr::eq(self.stack, other.stack()) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "BStackSlice::swap: slices belong to different BStacks",
+            return Err(io_error!(
+                InvalidInput,
+                "BStackSlice::swap: slices belong to different BStacks"
             ));
         }
         if self.is_empty() || self.start() == other.start() {
@@ -1990,10 +1973,7 @@ where
         let len = self.len();
         if start > end || end > len {
             return Err(crate::alloc::BStackSliceError::with_handle(
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "try_subslice_inplace: range out of bounds",
-                ),
+                io_error!(InvalidInput, "try_subslice_inplace: range out of bounds"),
                 self,
             ));
         }
@@ -2001,10 +1981,7 @@ where
             Some(d) => d,
             None => {
                 return Err(crate::alloc::BStackSliceError::with_handle(
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "try_subslice_inplace: length overflows i64",
-                    ),
+                    io_error!(InvalidInput, "try_subslice_inplace: length overflows i64"),
                     self,
                 ));
             }
@@ -2068,10 +2045,7 @@ where
         let len = self.len();
         if start > end || end > len {
             return Err(crate::alloc::BStackSliceError::with_handle(
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "try_subslice: range out of bounds",
-                ),
+                io_error!(InvalidInput, "try_subslice: range out of bounds"),
                 self,
             ));
         }
@@ -2179,9 +2153,9 @@ where
         // own allocator's by construction.)
         if !other.is_from(self.allocator()) {
             return Err(BStackJoinError::both(
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("{op}: `other` was issued by a different allocator"),
+                io_error!(
+                    InvalidInput,
+                    format!("{op}: `other` was issued by a different allocator")
                 ),
                 self,
                 other,
@@ -2194,10 +2168,7 @@ where
             (Ok(s), Ok(o)) => (s, o),
             _ => {
                 return Err(BStackJoinError::both(
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("{op}: length overflows i64"),
-                    ),
+                    io_error!(InvalidInput, format!("{op}: length overflows i64")),
                     self,
                     other,
                 ));
@@ -2289,10 +2260,7 @@ where
         Some(t) => t,
         None => {
             return Err(BStackJoinError::both(
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("{op}: combined length overflows"),
-                ),
+                io_error!(InvalidInput, format!("{op}: combined length overflows")),
                 a,
                 b,
             ));
@@ -2498,10 +2466,7 @@ impl<'a> io::Seek for BStackSliceReader<'a> {
             io::SeekFrom::Current(n) => self.cursor as i128 + n as i128,
         };
         if new_pos < 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "seek before beginning of slice",
-            ));
+            return Err(io_error!(InvalidInput, "seek before beginning of slice"));
         }
         self.cursor = new_pos as u64;
         Ok(self.cursor)
@@ -2660,10 +2625,7 @@ impl<'a> io::Seek for BStackSliceWriter<'a> {
             io::SeekFrom::Current(n) => self.cursor as i128 + n as i128,
         };
         if new_pos < 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "seek before beginning of slice",
-            ));
+            return Err(io_error!(InvalidInput, "seek before beginning of slice"));
         }
         self.cursor = new_pos as u64;
         Ok(self.cursor)

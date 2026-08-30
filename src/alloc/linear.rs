@@ -165,12 +165,9 @@ impl BStackAllocator for LinearBStackAllocator {
         (|| -> io::Result<BStackOwnedSlice<'a, Self>> {
             let current_tail = self.stack.len()?;
             if end != current_tail {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "LinearBStackAllocator does not support reallocation of non-tail slices; \
+                return Err(io_error!(Unsupported, "LinearBStackAllocator does not support reallocation of non-tail slices; \
                      callers must alloc a new region and copy manually. \
-                     Note: dealloc of the old (non-tail) slice is also a no-op and leaks the region.",
-                ));
+                     Note: dealloc of the old (non-tail) slice is also a no-op and leaks the region."));
             }
             match new_len.cmp(&old_len) {
                 std::cmp::Ordering::Equal => {
@@ -223,24 +220,18 @@ impl BStackAllocator for LinearBStackAllocator {
                     // realised by one `set_len` on a sparse file, so the zeros
                     // cost no write I/O and no heap staging.
                     if !self.stack.try_extend_zeros(end, new_len - old_len)? {
-                        return Err(io::Error::new(
-                            io::ErrorKind::Unsupported,
-                            "LinearBStackAllocator does not support reallocation of non-tail slices; \
+                        return Err(io_error!(Unsupported, "LinearBStackAllocator does not support reallocation of non-tail slices; \
                              callers must alloc a new region and copy manually. \
-                             Note: dealloc of the old (non-tail) slice is also a no-op and leaks the region.",
-                        ));
+                             Note: dealloc of the old (non-tail) slice is also a no-op and leaks the region."));
                     }
                     // SAFETY: tail atomically extended in place
                     Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, start, new_len) })
                 }
                 std::cmp::Ordering::Less => {
                     if !self.stack.try_discard(end, old_len - new_len)? {
-                        return Err(io::Error::new(
-                            io::ErrorKind::Unsupported,
-                            "LinearBStackAllocator does not support reallocation of non-tail slices; \
+                        return Err(io_error!(Unsupported, "LinearBStackAllocator does not support reallocation of non-tail slices; \
                              callers must alloc a new region and copy manually. \
-                             Note: dealloc of the old (non-tail) slice is also a no-op and leaks the region.",
-                        ));
+                             Note: dealloc of the old (non-tail) slice is also a no-op and leaks the region."));
                     }
                     // SAFETY: tail atomically shrunk in place
                     Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, start, new_len) })
@@ -324,9 +315,9 @@ impl BStackInPlaceResizeAllocator for LinearBStackAllocator {
         // supported for any `(prepend, append)` (see the trait's "Empty handles").
         if handle.is_empty() {
             return Err(BStackAllocError::with_handle(
-                io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "realloc_inplace: cannot resize an empty handle in place",
+                io_error!(
+                    Unsupported,
+                    "realloc_inplace: cannot resize an empty handle in place"
                 ),
                 handle,
             ));
@@ -343,9 +334,9 @@ impl BStackInPlaceResizeAllocator for LinearBStackAllocator {
             Some(n) if n >= 0 => {
                 if prepend != 0 {
                     return Err(BStackAllocError::with_handle(
-                        io::Error::new(
-                            io::ErrorKind::Unsupported,
-                            "LinearBStackAllocator cannot resize the front edge in place",
+                        io_error!(
+                            Unsupported,
+                            "LinearBStackAllocator cannot resize the front edge in place"
                         ),
                         handle,
                     ));
@@ -355,9 +346,9 @@ impl BStackInPlaceResizeAllocator for LinearBStackAllocator {
                 self.realloc(handle, n as u64)
             }
             _ => Err(BStackAllocError::with_handle(
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "realloc_inplace: resulting length is negative or overflows",
+                io_error!(
+                    InvalidInput,
+                    "realloc_inplace: resulting length is negative or overflows"
                 ),
                 handle,
             )),
@@ -392,12 +383,7 @@ impl BStackBulkAllocator for LinearBStackAllocator {
         let total = lengths
             .iter()
             .try_fold(0u64, |acc, &len| acc.checked_add(len))
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "alloc_bulk: total length overflows u64",
-                )
-            })?;
+            .ok_or_else(|| io_error!(InvalidInput, "alloc_bulk: total length overflows u64"))?;
         let base = self.stack.extend(total)?;
         let mut result = Vec::with_capacity(lengths.len());
         let mut offset = base;

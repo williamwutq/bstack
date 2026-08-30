@@ -559,7 +559,7 @@ where
         // The region is untouched and still owned by whoever holds it, so the
         // handle goes back with the error rather than being dropped (leaked).
         Err(BStackAllocError::with_handle(
-            io::Error::new(io::ErrorKind::InvalidInput, foreign_handle_message(op)),
+            io_error!(InvalidInput, foreign_handle_message(op)),
             handle,
         ))
     }
@@ -580,7 +580,7 @@ where
         Ok(handles)
     } else {
         Err(BStackBulkAllocError::with_handles(
-            io::Error::new(io::ErrorKind::InvalidInput, foreign_handle_message(op)),
+            io_error!(InvalidInput, foreign_handle_message(op)),
             handles,
         ))
     }

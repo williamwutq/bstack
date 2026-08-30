@@ -130,12 +130,9 @@ impl<'a, A: BStackOwnedSliceAllocator> fmt::Debug for BStackByteVec<'a, A> {
 
 impl<'a, A: BStackOwnedSliceAllocator> BStackByteVec<'a, A> {
     fn block_size(capacity: u64) -> io::Result<u64> {
-        capacity.checked_add(HEADER_LEN).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "BStackByteVec: block size overflows u64",
-            )
-        })
+        capacity
+            .checked_add(HEADER_LEN)
+            .ok_or_else(|| io_error!(InvalidInput, "BStackByteVec: block size overflows u64"))
     }
 
     fn byte_offset(index: u64) -> u64 {
@@ -443,12 +440,9 @@ impl<'a, A: BStackOwnedSliceAllocator> BStackByteVec<'a, A> {
     /// the current capacity is already sufficient.
     pub fn reserve(&mut self, additional: u64) -> io::Result<()> {
         let (len, cap) = self.read_header()?;
-        let needed = len.checked_add(additional).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "BStackByteVec::reserve: capacity overflow",
-            )
-        })?;
+        let needed = len
+            .checked_add(additional)
+            .ok_or_else(|| io_error!(InvalidInput, "BStackByteVec::reserve: capacity overflow"))?;
         if needed <= cap {
             return Ok(());
         }
@@ -468,9 +462,9 @@ impl<'a, A: BStackOwnedSliceAllocator> BStackByteVec<'a, A> {
     pub fn reserve_exact(&mut self, additional: u64) -> io::Result<()> {
         let (len, cap) = self.read_header()?;
         let needed = len.checked_add(additional).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "BStackByteVec::reserve_exact: capacity overflow",
+            io_error!(
+                InvalidInput,
+                "BStackByteVec::reserve_exact: capacity overflow"
             )
         })?;
         if needed <= cap {
@@ -545,12 +539,8 @@ impl<'a, A: BStackOwnedSliceAllocator> BStackByteVec<'a, A> {
         }
         let additional = new_len - len;
         self.reserve(additional)?;
-        let count = usize::try_from(additional).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "BStackByteVec::resize: growth exceeds usize",
-            )
-        })?;
+        let count = usize::try_from(additional)
+            .map_err(|_| io_error!(InvalidInput, "BStackByteVec::resize: growth exceeds usize"))?;
         let fill: Vec<u8> = std::iter::repeat_n(value, count).collect();
         self.write_bytes_at(len, &fill)?;
         self.write_len_field(new_len)
@@ -797,9 +787,9 @@ impl<'a, A: BStackOwnedSliceAllocator> BStackByteVec<'a, A> {
         let alloc: &'a A = self.slice.allocator();
         let stack = alloc.stack();
         if !std::ptr::eq(src.stack(), stack) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "BStackByteVec::extend_from_bstack_slice: source belongs to a different BStack",
+            return Err(io_error!(
+                InvalidInput,
+                "BStackByteVec::extend_from_bstack_slice: source belongs to a different BStack"
             ));
         }
         let n = src.len();
@@ -838,9 +828,9 @@ impl<'a, A: BStackOwnedSliceAllocator> BStackByteVec<'a, A> {
         let alloc: &'a A = self.slice.allocator();
         let stack = alloc.stack();
         if !std::ptr::eq(dst.stack(), stack) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "BStackByteVec::copy_into_bstack_slice: destination belongs to a different BStack",
+            return Err(io_error!(
+                InvalidInput,
+                "BStackByteVec::copy_into_bstack_slice: destination belongs to a different BStack"
             ));
         }
         let n = dst.len();
@@ -883,9 +873,9 @@ impl<'a, A: BStackOwnedSliceAllocator> BStackByteVec<'a, A> {
             // surface the I/O error rather than swallowing it — either way the
             // dealloc result is not discarded.
             other_alloc.dealloc(other).map_err(|e| e.source)?;
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "BStackByteVec::append_from_owned: source belongs to a different BStack",
+            return Err(io_error!(
+                InvalidInput,
+                "BStackByteVec::append_from_owned: source belongs to a different BStack"
             ));
         }
         // Append first, capturing any error, but always fall through to the free
@@ -934,9 +924,9 @@ impl<'a, A: BStackOwnedSliceAllocator> BStackByteVec<'a, A> {
         let alloc: &'a A = self.slice.allocator();
         let stack = alloc.stack();
         if !std::ptr::eq(dest.allocator().stack(), stack) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "BStackByteVec::move_tail_into: destination belongs to a different BStack",
+            return Err(io_error!(
+                InvalidInput,
+                "BStackByteVec::move_tail_into: destination belongs to a different BStack"
             ));
         }
         let n = dest.len();

@@ -81,9 +81,9 @@ where
     /// performed to prevent data races or undefined behavior.
     #[inline]
     fn as_slice(&self) -> Result<BStackSlice<'a>, io::Error> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "operation not supported on this guarded slice",
+        Err(io_error!(
+            Unsupported,
+            "operation not supported on this guarded slice"
         ))
     }
 

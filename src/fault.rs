@@ -115,7 +115,7 @@ mod active {
     /// impl FaultPolicy for FailNth {
     ///     fn next_fault(&self, op: &'static str, seq: u64) -> Option<io::Error> {
     ///         (seq == self.n).then(|| {
-    ///             io::Error::new(io::ErrorKind::Other, format!("injected fault at {op}"))
+    ///             io_error!(Other, format!("injected fault at {op}"))
     ///         })
     ///     }
     /// }

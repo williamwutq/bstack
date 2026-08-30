@@ -226,18 +226,18 @@ impl FirstFitBStackAllocator {
         // Validate header
         let stack_len = stack.len()?;
         if stack_len < Self::OFFSET_SIZE + Self::HEADER_SIZE {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "stack too short to contain allocator header",
+            return Err(io_error!(
+                InvalidData,
+                "stack too short to contain allocator header"
             ));
         }
         let mut header = [0u8; Self::HEADER_SIZE as usize];
         stack.get_into(Self::OFFSET_SIZE, &mut header)?;
         // Check magic prefix for compatibility with 0.1.x files.
         if header[..ALFF_MAGIC_PREFIX.len()] != ALFF_MAGIC_PREFIX {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid magic prefix: expected ALFF\\x00\\x01",
+            return Err(io_error!(
+                InvalidData,
+                "invalid magic prefix: expected ALFF\\x00\\x01"
             ));
         }
         // Only bit 0 of flags is recovery_needed; ignore reserved flag bits
@@ -292,9 +292,9 @@ impl FirstFitBStackAllocator {
         )? {
             // CAS failed: recovery_needed was already set, so a prior operation
             // crashed or failed mid-mutation and the stack must be recovered.
-            Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "stack needs recovery: recovery_needed already set",
+            Err(io_error!(
+                InvalidData,
+                "stack needs recovery: recovery_needed already set"
             ))
         } else {
             Ok(())
@@ -321,9 +321,9 @@ impl FirstFitBStackAllocator {
             [0u8; 4].as_slice(),
         )? {
             // CAS failed: recovery_needed was not set when we expected it to be.
-            Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "recovery_needed was not set when clearing",
+            Err(io_error!(
+                InvalidData,
+                "recovery_needed was not set when clearing"
             ))
         } else {
             Ok(())
@@ -518,9 +518,9 @@ impl FirstFitBStackAllocator {
         while head != 0 {
             walk_count += 1;
             if walk_count > max_walk {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "corrupted free list: cycle detected (walk exceeded maximum block count)",
+                return Err(io_error!(
+                    InvalidData,
+                    "corrupted free list: cycle detected (walk exceeded maximum block count)"
                 ));
             }
             let size_flags_and_ptr_buf = &mut [0u8; Self::BLOCK_HEADER_SIZE as usize + 8];
@@ -533,16 +533,16 @@ impl FirstFitBStackAllocator {
                 "corrupted free list: block at offset {head} is not marked free"
             );
             if !is_free {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("corrupted free list: block at offset {head} is not marked free"),
+                return Err(io_error!(
+                    InvalidData,
+                    format!("corrupted free list: block at offset {head} is not marked free")
                 ));
             } else if self.is_impossible_block_size(block_size) || block_size % 8 != 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
+                return Err(io_error!(
+                    InvalidData,
                     format!(
                         "corrupted free list: block at offset {head} has invalid size {block_size}"
-                    ),
+                    )
                 ));
             }
             if block_size >= size {
@@ -557,9 +557,9 @@ impl FirstFitBStackAllocator {
                     .unwrap(),
             );
             if head != 0 && self.is_impossible_block_start(head) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("corrupted free list: next block offset {head} is invalid"),
+                return Err(io_error!(
+                    InvalidData,
+                    format!("corrupted free list: next block offset {head} is invalid")
                 ));
             }
         }
@@ -787,12 +787,12 @@ impl FirstFitBStackAllocator {
                             self.stack.discard(remaining)?;
                             break;
                         }
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
+                        return Err(io_error!(
+                            InvalidData,
                             format!(
                                 "recovery: corrupted block header at offset {pos}: \
                                  invalid size {size}; manual repair required"
-                            ),
+                            )
                         ));
                     }
                     // Size is valid but the block extends past the stack end: partial tail write.
@@ -934,9 +934,9 @@ impl BStackAllocator for FirstFitBStackAllocator {
                 || self.is_impossible_block_end(slice.start() + aligned_len)
                 || self.is_impossible_block_size(aligned_len)
             {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "invalid slice: start or end offset is impossible",
+                return Err(io_error!(
+                    InvalidInput,
+                    "invalid slice: start or end offset is impossible"
                 ));
             }
             // Double-free detection: the block must not already be marked free.
@@ -944,9 +944,9 @@ impl BStackAllocator for FirstFitBStackAllocator {
             self.stack
                 .get_into(slice.start() - Self::BLOCK_HEADER_SIZE + 8, &mut flags_buf)?;
             if flags_buf[0] & 1 != 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "double-free: block is already free",
+                return Err(io_error!(
+                    InvalidInput,
+                    "double-free: block is already free"
                 ));
             }
 
@@ -1326,9 +1326,9 @@ impl FirstFitBStackAllocator {
                 || self.is_impossible_block_end(slice.start() + aligned_current_len)
                 || self.is_impossible_block_size(aligned_current_len)
             {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "invalid slice: start or end offset is impossible",
+                return Err(io_error!(
+                    InvalidInput,
+                    "invalid slice: start or end offset is impossible"
                 ));
             }
 
@@ -1563,9 +1563,9 @@ impl FirstFitBStackAllocator {
             .and_then(|e| e.checked_add(Self::BLOCK_FOOTER_SIZE))
             .is_some_and(|e| e <= tail);
         if size < Self::MIN_BLOCK_PAYLOAD_SIZE || !size.is_multiple_of(8) || !end_ok {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "realloc_inplace: block header reports an invalid size",
+            return Err(io_error!(
+                InvalidInput,
+                "realloc_inplace: block header reports an invalid size"
             ));
         }
         Ok(size)
@@ -1655,9 +1655,9 @@ impl FirstFitBStackAllocator {
                 // SAFETY: block grown in place by merging the next free block.
                 return Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, start, new_len) });
             }
-            Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "realloc_inplace: back grow would relocate a non-tail block",
+            Err(io_error!(
+                Unsupported,
+                "realloc_inplace: back grow would relocate a non-tail block"
             ))
         })();
         result.map_err(|source| BStackAllocError {
@@ -1698,9 +1698,9 @@ impl FirstFitBStackAllocator {
             // A front trim below the minimum, or one that would misalign the
             // retained block, cannot be done in place.
             if pf < Self::MIN_FRONT_TRIM || !pf.is_multiple_of(8) {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "realloc_inplace: front trim too small or misaligned to carve in place",
+                return Err(io_error!(
+                    Unsupported,
+                    "realloc_inplace: front trim too small or misaligned to carve in place"
                 ));
             }
             let block_size = self.read_block_size(start)?;
@@ -1709,9 +1709,9 @@ impl FirstFitBStackAllocator {
             let retained = match block_size.checked_sub(pf) {
                 Some(r) if r >= Self::MIN_BLOCK_PAYLOAD_SIZE && r >= new_len => r,
                 _ => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        "realloc_inplace: front trim leaves too small a retained block",
+                    return Err(io_error!(
+                        Unsupported,
+                        "realloc_inplace: front trim leaves too small a retained block"
                     ));
                 }
             };
@@ -1796,18 +1796,18 @@ impl FirstFitBStackAllocator {
         let mut lost = false;
         let result = (|| -> io::Result<BStackOwnedSlice<'a, Self>> {
             if pg < Self::MIN_FRONT_GROW || !pg.is_multiple_of(8) {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "realloc_inplace: front growth too small or misaligned to carve in place",
+                return Err(io_error!(
+                    Unsupported,
+                    "realloc_inplace: front growth too small or misaligned to carve in place"
                 ));
             }
             let arena_start = Self::OFFSET_SIZE + Self::HEADER_SIZE;
             let our_header = start - Self::BLOCK_HEADER_SIZE;
             if our_header <= arena_start {
                 // No room for a left neighbour: this is the first arena block.
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "realloc_inplace: front growth has no left neighbour",
+                return Err(io_error!(
+                    Unsupported,
+                    "realloc_inplace: front growth has no left neighbour"
                 ));
             }
 
@@ -1820,9 +1820,9 @@ impl FirstFitBStackAllocator {
             let our_new_size = match block_size.checked_add(pg) {
                 Some(s) => s,
                 None => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "realloc_inplace: grown block size overflows",
+                    return Err(io_error!(
+                        InvalidInput,
+                        "realloc_inplace: grown block size overflows"
                     ));
                 }
             };
@@ -1833,9 +1833,9 @@ impl FirstFitBStackAllocator {
                 .get_into(our_header - Self::BLOCK_FOOTER_SIZE, &mut fbuf)?;
             let lsize = u64::from_le_bytes(fbuf);
             let unsupported = || {
-                Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "realloc_inplace: front growth needs a large-enough free left neighbour",
+                Err(io_error!(
+                    Unsupported,
+                    "realloc_inplace: front growth needs a large-enough free left neighbour"
                 ))
             };
             if lsize < Self::MIN_BLOCK_PAYLOAD_SIZE || !lsize.is_multiple_of(8) {
@@ -1957,9 +1957,9 @@ impl BStackInPlaceResizeAllocator for FirstFitBStackAllocator {
         // supported for any `(prepend, append)` (see the trait's "Empty handles").
         if slice.is_empty() {
             return Err(BStackAllocError::with_handle(
-                io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "realloc_inplace: cannot resize an empty handle in place",
+                io_error!(
+                    Unsupported,
+                    "realloc_inplace: cannot resize an empty handle in place"
                 ),
                 slice,
             ));
@@ -1977,9 +1977,9 @@ impl BStackInPlaceResizeAllocator for FirstFitBStackAllocator {
             Some(n) if n >= 0 => n as u64,
             _ => {
                 return Err(BStackAllocError::with_handle(
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "realloc_inplace: resulting length is negative or overflows",
+                    io_error!(
+                        InvalidInput,
+                        "realloc_inplace: resulting length is negative or overflows"
                     ),
                     slice,
                 ));
@@ -1999,9 +1999,9 @@ impl BStackInPlaceResizeAllocator for FirstFitBStackAllocator {
             || self.is_impossible_block_size(aligned_old)
         {
             return Err(BStackAllocError::with_handle(
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "realloc_inplace: slice does not describe a valid block",
+                io_error!(
+                    InvalidInput,
+                    "realloc_inplace: slice does not describe a valid block"
                 ),
                 slice,
             ));
@@ -2011,7 +2011,7 @@ impl BStackInPlaceResizeAllocator for FirstFitBStackAllocator {
         // handle for the Unsupported paths that never touch the block.
         // SAFETY: (start, old_len) still names the live, unmodified block.
         let unsupported = |msg: &'static str| {
-            BStackAllocError::with_handle(io::Error::new(io::ErrorKind::Unsupported, msg), unsafe {
+            BStackAllocError::with_handle(io_error!(Unsupported, msg), unsafe {
                 BStackOwnedSlice::from_raw_parts(self, start, old_len)
             })
         };
