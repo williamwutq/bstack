@@ -37,8 +37,9 @@
 //!   [`alloc_bulk`](BStackBulkAllocator::alloc_bulk) /
 //!   [`dealloc_bulk`](BStackBulkAllocator::dealloc_bulk).  Implemented by
 //!   [`LinearBStackAllocator`] and [`GhostTreeBstackAllocator`]; by
-//!   [`SlabBStackAllocator`] and [`CheckedSlabBStackAllocator`] with the
-//!   `atomic` feature; forwarded by [`DebugCheckingAllocator`].
+//!   [`SlabBStackAllocator`], [`CheckedSlabBStackAllocator`], and
+//!   [`SegregatedBStackAllocator`] with the `atomic` feature; forwarded by
+//!   [`DebugCheckingAllocator`].
 //!
 //! * [`BStackUninitAllocator`] — opt-in extension trait for allocators with a
 //!   cheaper uninitialised path.  [`alloc_uninit`](BStackUninitAllocator::alloc_uninit) /
@@ -87,7 +88,9 @@
 //!   free-list allocator (`alloc` + `set`).  Generalises the checked slab to 33
 //!   size classes sharing one arena; 8-byte per-block header, O(1) classed
 //!   alloc/dealloc, crash-recoverable by linear scan.  `Send` in all
-//!   configurations; `Send + Sync` with `atomic`.
+//!   configurations; `Send + Sync` with `atomic`, where it also implements
+//!   [`BStackBulkAllocator`] (`alloc_bulk`/`dealloc_bulk`, work bounded by the
+//!   classes touched).
 //!
 //! # Uninitialised allocation
 //!

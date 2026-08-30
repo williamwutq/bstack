@@ -488,6 +488,17 @@ physical size comes straight from the word; the handle's length is trusted
 the tail is `discard`ed back to the stack; every other block is spliced onto its
 class head.
 
+### Bulk operations (`atomic` feature)
+
+With `atomic`, implements `BStackBulkAllocator`; work is bounded by the distinct classes touched (≤ 33), not by the request count. Free-list chases carry cycle detection (a revisited block aborts with no write).
+
+| Operation      | Strategy                                                                                                                                        |
+|----------------|------------------------------------------------------------------------------------------------------------------------------------------------|
+| `alloc_bulk`   | Group classed requests by class and chase each class's free list once (`process_gen`); detach the oversized list whole and assign each free block to the largest request it fits (retaining the whole block), re-splicing the unmatched; serve the remaining misses from one `extend`; mark in-use + scrub in one `set_batched` |
+| `dealloc_bulk` | Validate/reject double-frees (incl. a block twice in the batch); group freed blocks by class, stage each class's chain in one `set_batched`, and splice each onto its class head with one `cross_exchange` |
+
+Blocks pulled from the free lists are left free-tagged until the final claim, so a crash leaves them reclaimable by `recover` and the fresh (zero) tail discardable. On an I/O failure the detached blocks are re-pushed to their class lists and the fresh tail discarded, best-effort.
+
 ### Realloc
 
 The caller's length lives in the returned handle, not on disk, so a resize that
