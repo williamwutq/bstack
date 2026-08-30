@@ -4499,7 +4499,17 @@ static void slab_reclaim_after_alloc_failure(bstack_t *bs, uint64_t block_size,
         (void)slab_splice_blocks_onto_free_list(bs, popped, pcount);
     } else {
         uint64_t n_tail = ext_bytes / block_size, k;
-        uint64_t *all = malloc((pcount + (size_t)n_tail) * sizeof *all);
+        uint64_t *all;
+        /* Best-effort: skip the recycle rather than under-allocate if the
+         * combined array (or the iovecs the splice stages from it) would
+         * overflow size_t. Cannot happen on 64-bit (pcount+n_tail ==
+         * total_blocks <= UINT64_MAX/block_size, block_size >= 8), but on
+         * 32-bit the extend cap (ext_bytes <= SIZE_MAX) alone leaves the
+         * product unbounded. sizeof(bstack_iovec_t) is the largest per-block
+         * element downstream and so bounds the uint64 array here too. */
+        if (n_tail > (uint64_t)(SIZE_MAX / sizeof(bstack_iovec_t)) - (uint64_t)pcount)
+            return; /* leak; free list stays consistent */
+        all = malloc((pcount + (size_t)n_tail) * sizeof *all);
         if (!all) return; /* leak; free list stays consistent */
         for (k = 0; k < pcount; k++) all[k] = popped[k];
         for (k = 0; k < n_tail; k++) all[pcount + k] = ext_base + k * block_size;
@@ -4770,9 +4780,12 @@ static int slab_vt_dealloc_bulk(bstack_allocator_t *base,
         total += nb;
     }
     if (total == 0) return 0;
-    /* Guard the block array against size_t overflow: total * sizeof *blocks
-     * must fit, not just total itself. */
-    if (total > (uint64_t)(SIZE_MAX / sizeof *blocks)) { errno = EINVAL; return -1; }
+    /* Guard every per-block array in this call against size_t overflow. The
+     * block array below is uint64 (8 bytes), but total also drives the iovec
+     * array staged per block in slab_splice_blocks_onto_free_list, which is
+     * wider (16 bytes on a 32-bit target); bound by that larger element so the
+     * whole pipeline is safe. */
+    if (total > (uint64_t)(SIZE_MAX / sizeof(bstack_iovec_t))) { errno = EINVAL; return -1; }
     blocks = malloc((size_t)total * sizeof *blocks);
     if (!blocks) { errno = ENOMEM; return -1; }
     for (i = 0; i < n; i++) {
@@ -6555,7 +6568,17 @@ static void alck_reclaim_after_alloc_failure(bstack_t *bs, uint64_t block_size,
         (void)alck_splice_blocks_onto_free_list(bs, popped, pcount);
     } else {
         uint64_t n_tail = ext_bytes / block_size, k;
-        uint64_t *all = malloc((pcount + (size_t)n_tail) * sizeof *all);
+        uint64_t *all;
+        /* Best-effort: skip the recycle rather than under-allocate if the
+         * combined array (or the iovecs the splice stages from it) would
+         * overflow size_t. Cannot happen on 64-bit (pcount+n_tail ==
+         * total_blocks <= UINT64_MAX/block_size, block_size >= 8), but on
+         * 32-bit the extend cap (ext_bytes <= SIZE_MAX) alone leaves the
+         * product unbounded. sizeof(bstack_iovec_t) is the largest per-block
+         * element downstream and so bounds the uint64 array here too. */
+        if (n_tail > (uint64_t)(SIZE_MAX / sizeof(bstack_iovec_t)) - (uint64_t)pcount)
+            return; /* leak; free list stays consistent */
+        all = malloc((pcount + (size_t)n_tail) * sizeof *all);
         if (!all) return;
         for (k = 0; k < pcount; k++) all[k] = popped[k];
         for (k = 0; k < n_tail; k++) all[pcount + k] = ext_base + k * block_size;
@@ -6832,9 +6855,12 @@ static int alck_vt_dealloc_bulk(bstack_allocator_t *base,
         total += nb;
     }
     if (total == 0) return 0;
-    /* Guard the block array against size_t overflow: total * sizeof *blocks
-     * must fit, not just total itself. */
-    if (total > (uint64_t)(SIZE_MAX / sizeof *blocks)) { errno = EINVAL; return -1; }
+    /* Guard every per-block array in this call against size_t overflow. The
+     * block array below is uint64 (8 bytes), but total also drives the iovec
+     * array staged per block in alck_splice_blocks_onto_free_list, which is
+     * wider (16 bytes on a 32-bit target); bound by that larger element so the
+     * whole pipeline is safe. */
+    if (total > (uint64_t)(SIZE_MAX / sizeof(bstack_iovec_t))) { errno = EINVAL; return -1; }
     blocks = malloc((size_t)total * sizeof *blocks);
     if (!blocks) { errno = ENOMEM; return -1; }
     for (i = 0; i < n; i++) {
