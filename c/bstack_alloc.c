@@ -4644,6 +4644,10 @@ static int slab_vt_alloc_bulk(bstack_allocator_t *base, const uint64_t *lens,
     int oversized = 0;
 
     if (n == 0) return 0;
+    /* Reject counts whose per-request arrays would overflow size_t.
+     * sizeof *tmp (bstack_slice_t) is the largest element used here, so it
+     * bounds counts, popped, and the fast-path seen[] as well. */
+    if (n > SIZE_MAX / sizeof *tmp) { errno = ENOMEM; return -1; }
 
     counts = malloc(n * sizeof *counts);
     tmp = malloc(n * sizeof *tmp);
@@ -4766,9 +4770,9 @@ static int slab_vt_dealloc_bulk(bstack_allocator_t *base,
         total += nb;
     }
     if (total == 0) return 0;
-#if UINT64_MAX > SIZE_MAX
-    if (total > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
-#endif
+    /* Guard the block array against size_t overflow: total * sizeof *blocks
+     * must fit, not just total itself. */
+    if (total > (uint64_t)(SIZE_MAX / sizeof *blocks)) { errno = EINVAL; return -1; }
     blocks = malloc((size_t)total * sizeof *blocks);
     if (!blocks) { errno = ENOMEM; return -1; }
     for (i = 0; i < n; i++) {
@@ -6694,6 +6698,10 @@ static int alck_vt_alloc_bulk(bstack_allocator_t *base, const uint64_t *lens,
     int oversized = 0;
 
     if (n == 0) return 0;
+    /* Reject counts whose per-request arrays would overflow size_t.
+     * sizeof *tmp (bstack_slice_t) is the largest element used here, so it
+     * bounds counts, popped, jobs, and the fast-path seen[] as well. */
+    if (n > SIZE_MAX / sizeof *tmp) { errno = ENOMEM; return -1; }
 
     counts = malloc(n * sizeof *counts);
     tmp = malloc(n * sizeof *tmp);
@@ -6824,9 +6832,9 @@ static int alck_vt_dealloc_bulk(bstack_allocator_t *base,
         total += nb;
     }
     if (total == 0) return 0;
-#if UINT64_MAX > SIZE_MAX
-    if (total > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
-#endif
+    /* Guard the block array against size_t overflow: total * sizeof *blocks
+     * must fit, not just total itself. */
+    if (total > (uint64_t)(SIZE_MAX / sizeof *blocks)) { errno = EINVAL; return -1; }
     blocks = malloc((size_t)total * sizeof *blocks);
     if (!blocks) { errno = ENOMEM; return -1; }
     for (i = 0; i < n; i++) {

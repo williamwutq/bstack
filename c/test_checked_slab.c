@@ -1231,6 +1231,25 @@ static int test_bulk_alloc_detects_cycle(void)
     csl_unlink(tmp); return 0;
 }
 
+/* A count so large that n * sizeof(per-request array element) would overflow
+ * size_t must be rejected before any allocation, not wrap into a short buffer.
+ * The guard returns before reading lens, so a NULL lens is safe here. */
+static int test_bulk_alloc_rejects_overflow_count(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    checked_slab_bstack_allocator_t *a = checked_slab_bstack_allocator_new(bs, 24);
+    CHECK(a);
+    bstack_allocator_t *al = (bstack_allocator_t *)a;
+
+    errno = 0;
+    CHECK(bstack_allocator_alloc_bulk(al, NULL, SIZE_MAX, NULL) == -1);
+    CHECK(errno == ENOMEM);
+
+    bstack_close(checked_slab_bstack_allocator_into_stack(a));
+    csl_unlink(tmp); return 0;
+}
+
 #endif /* BSTACK_FEATURE_ATOMIC */
 
 /* A slice issued by one allocator instance must be refused by another: the
@@ -1334,6 +1353,7 @@ int main(void)
     T(test_bulk_dealloc_rejects_double_free);
     T(test_bulk_dealloc_rejects_foreign);
     T(test_bulk_alloc_detects_cycle);
+    T(test_bulk_alloc_rejects_overflow_count);
 #endif
 
     T(test_foreign_slice_is_rejected);
