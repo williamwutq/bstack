@@ -1079,9 +1079,9 @@ mod tests {
             // `Unsupported`, regardless of `fail_realloc_inplace`.
             if handle.is_empty() {
                 return Err(BStackAllocError::with_handle(
-                    io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        "mock realloc_inplace: cannot resize an empty handle in place",
+                    io_error!(
+                        Unsupported,
+                        "mock realloc_inplace: cannot resize an empty handle in place"
                     ),
                     handle,
                 ));
@@ -1092,10 +1092,7 @@ mod tests {
                 let unsupported = config.realloc_inplace_unsupported;
                 drop(config);
                 let source = if unsupported {
-                    io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        "mock realloc_inplace unsupported",
-                    )
+                    io_error!(Unsupported, "mock realloc_inplace unsupported")
                 } else {
                     io::Error::other("mock realloc_inplace failure")
                 };

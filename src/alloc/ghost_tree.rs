@@ -236,12 +236,12 @@ impl GhostTreeBstackAllocator {
         }
 
         if size < ARENA_START {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
+            return Err(io_error!(
+                InvalidData,
                 format!(
                     "GhostTreeBstackAllocator: payload is {size} B, \
                      too small for the {ARENA_START}-byte header"
-                ),
+                )
             ));
         }
 
@@ -249,9 +249,9 @@ impl GhostTreeBstackAllocator {
         let mut magic_buf = [0u8; 6];
         stack.get_into(MAGIC_OFFSET, &mut magic_buf)?;
         if magic_buf != ALGT_MAGIC_PREFIX {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "GhostTreeBstackAllocator: magic number mismatch",
+            return Err(io_error!(
+                InvalidData,
+                "GhostTreeBstackAllocator: magic number mismatch"
             ));
         }
 
@@ -528,9 +528,9 @@ impl GhostTreeBstackAllocator {
         let mut current = root;
         while current != NULL_PTR {
             if path_len >= MAX_AVL_DEPTH as usize {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "AVL insert exceeded maximum depth: corrupted tree (possible cycle)",
+                return Err(io_error!(
+                    InvalidData,
+                    "AVL insert exceeded maximum depth: corrupted tree (possible cycle)"
                 ));
             }
             let (root_sz, left, right, lh, rh) = self.read_node_hc(current)?;
@@ -611,9 +611,9 @@ impl GhostTreeBstackAllocator {
                 return Ok((current, size, child));
             }
             if path_len >= MAX_AVL_DEPTH as usize {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "AVL min exceeded maximum depth: corrupted tree (possible cycle)",
+                return Err(io_error!(
+                    InvalidData,
+                    "AVL min exceeded maximum depth: corrupted tree (possible cycle)"
                 ));
             }
             path[path_len] = (current, size, right, rh);
@@ -646,9 +646,9 @@ impl GhostTreeBstackAllocator {
         let mut current = root;
         while current != NULL_PTR {
             if path_len >= MAX_AVL_DEPTH as usize {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "AVL find exceeded maximum depth: corrupted tree (possible cycle)",
+                return Err(io_error!(
+                    InvalidData,
+                    "AVL find exceeded maximum depth: corrupted tree (possible cycle)"
                 ));
             }
             let (root_sz, left, right, lh, rh) = self.read_node_hc(current)?;
@@ -749,9 +749,9 @@ impl GhostTreeBstackAllocator {
             // Descend left, pushing nodes onto the stack.
             while current != NULL_PTR {
                 if stack.len() >= MAX_AVL_DEPTH as usize {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "AVL walk exceeded maximum depth: corrupted tree (possible cycle)",
+                    return Err(io_error!(
+                        InvalidData,
+                        "AVL walk exceeded maximum depth: corrupted tree (possible cycle)"
                     ));
                 }
                 let (size, _, _, left, right) = self.read_node(current)?;
@@ -879,9 +879,9 @@ impl GhostTreeBstackAllocator {
             return Ok(BStackOwnedSlice::empty(self));
         }
         let aligned = Self::align_up_len(len).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "alloc: length exceeds the maximum allocatable size",
+            io_error!(
+                InvalidInput,
+                "alloc: length exceeds the maximum allocatable size"
             )
         })?;
         {
@@ -955,9 +955,9 @@ impl GhostTreeBstackAllocator {
         if start < ARENA_START || start != Self::align_up_ptr(start) {
             // Invalid address: the caller's handle is unchanged, hand it back.
             return Err(BStackAllocError {
-                source: io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "realloc: slice origin is not a valid allocator address",
+                source: io_error!(
+                    InvalidInput,
+                    "realloc: slice origin is not a valid allocator address"
                 ),
                 // SAFETY: (start, old_len) is exactly what the caller passed in.
                 handle: Some(unsafe { BStackOwnedSlice::from_raw_parts(self, start, old_len) }),
@@ -974,9 +974,9 @@ impl GhostTreeBstackAllocator {
                 (Some(old), Some(new)) => (old, new),
                 _ => {
                     return Err(BStackAllocError {
-                        source: io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            "realloc: length exceeds the maximum allocatable size",
+                        source: io_error!(
+                            InvalidInput,
+                            "realloc: length exceeds the maximum allocatable size"
                         ),
                         // SAFETY: (start, old_len) is exactly what the caller
                         // passed in; the block has not been touched.
@@ -1225,15 +1225,15 @@ impl GhostTreeBstackAllocator {
             // A nonzero front trim must land the retained window on a valid,
             // aligned block boundary. `pf == 0` (pure back shrink) is allowed.
             if !pf.is_multiple_of(MIN_ALLOC) {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "realloc_inplace: front trim misaligned to carve in place",
+                return Err(io_error!(
+                    Unsupported,
+                    "realloc_inplace: front trim misaligned to carve in place"
                 ));
             }
             let too_long = || {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "realloc_inplace: length exceeds the maximum allocatable size",
+                io_error!(
+                    InvalidInput,
+                    "realloc_inplace: length exceeds the maximum allocatable size"
                 )
             };
             let aligned_old = Self::align_up_len(old_len).ok_or_else(too_long)?;
@@ -1247,9 +1247,9 @@ impl GhostTreeBstackAllocator {
             let back_size = match aligned_old.checked_sub(pf + retained) {
                 Some(b) => b,
                 None => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        "realloc_inplace: shrink leaves an unaccounted block",
+                    return Err(io_error!(
+                        Unsupported,
+                        "realloc_inplace: shrink leaves an unaccounted block"
                     ));
                 }
             };
@@ -1325,9 +1325,9 @@ impl BStackInPlaceResizeAllocator for GhostTreeBstackAllocator {
         // supported for any `(prepend, append)` (see the trait's "Empty handles").
         if slice.is_empty() {
             return Err(BStackAllocError::with_handle(
-                io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "realloc_inplace: cannot resize an empty handle in place",
+                io_error!(
+                    Unsupported,
+                    "realloc_inplace: cannot resize an empty handle in place"
                 ),
                 slice,
             ));
@@ -1343,9 +1343,9 @@ impl BStackInPlaceResizeAllocator for GhostTreeBstackAllocator {
             Some(n) if n >= 0 => n as u64,
             _ => {
                 return Err(BStackAllocError::with_handle(
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "realloc_inplace: resulting length is negative or overflows",
+                    io_error!(
+                        InvalidInput,
+                        "realloc_inplace: resulting length is negative or overflows"
                     ),
                     slice,
                 ));
@@ -1357,9 +1357,9 @@ impl BStackInPlaceResizeAllocator for GhostTreeBstackAllocator {
         }
         if start < ARENA_START || start != Self::align_up_ptr(start) {
             return Err(BStackAllocError::with_handle(
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "realloc_inplace: slice origin is not a valid allocator address",
+                io_error!(
+                    InvalidInput,
+                    "realloc_inplace: slice origin is not a valid allocator address"
                 ),
                 slice,
             ));
@@ -1367,7 +1367,7 @@ impl BStackInPlaceResizeAllocator for GhostTreeBstackAllocator {
 
         let unsupported = |msg: &'static str| {
             // SAFETY: (start, old_len) still names the live, unmodified block.
-            BStackAllocError::with_handle(io::Error::new(io::ErrorKind::Unsupported, msg), unsafe {
+            BStackAllocError::with_handle(io_error!(Unsupported, msg), unsafe {
                 BStackOwnedSlice::from_raw_parts(self, start, old_len)
             })
         };
@@ -1470,16 +1470,16 @@ impl BStackAllocator for GhostTreeBstackAllocator {
                 return Ok(());
             }
             if slice.start() < ARENA_START || slice.start() != Self::align_up_ptr(slice.start()) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "dealloc: slice origin is not a valid allocator address",
+                return Err(io_error!(
+                    InvalidInput,
+                    "dealloc: slice origin is not a valid allocator address"
                 ));
             }
             let ptr = slice.start();
             let true_len = Self::align_up_len(slice.len()).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "dealloc: slice length exceeds the maximum allocatable size",
+                io_error!(
+                    InvalidInput,
+                    "dealloc: slice length exceeds the maximum allocatable size"
                 )
             })?;
 
@@ -1597,9 +1597,9 @@ impl BStackBulkAllocator for GhostTreeBstackAllocator {
             })
             .collect::<Option<Vec<u64>>>()
             .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "alloc_bulk: length exceeds the maximum allocatable size",
+                io_error!(
+                    InvalidInput,
+                    "alloc_bulk: length exceeds the maximum allocatable size"
                 )
             })?;
 
@@ -1607,12 +1607,7 @@ impl BStackBulkAllocator for GhostTreeBstackAllocator {
             .iter()
             .copied()
             .try_fold(0u64, |acc, a| acc.checked_add(a))
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "alloc_bulk: total size overflows u64",
-                )
-            })?;
+            .ok_or_else(|| io_error!(InvalidInput, "alloc_bulk: total size overflows u64"))?;
 
         // All zero-length: return null slices without touching the BStack.
         if total == 0 {
@@ -1697,15 +1692,15 @@ impl BStackBulkAllocator for GhostTreeBstackAllocator {
                     continue;
                 }
                 if s.start() < ARENA_START || s.start() != Self::align_up_ptr(s.start()) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "dealloc_bulk: invalid slice origin",
+                    return Err(io_error!(
+                        InvalidInput,
+                        "dealloc_bulk: invalid slice origin"
                     ));
                 }
                 let true_len = Self::align_up_len(s.len()).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "dealloc_bulk: slice length exceeds the maximum allocatable size",
+                    io_error!(
+                        InvalidInput,
+                        "dealloc_bulk: slice length exceeds the maximum allocatable size"
                     )
                 })?;
                 entries.push((s.start(), true_len));
@@ -3026,5 +3021,30 @@ mod fault_tests {
         let mut c = alloc.alloc(96).unwrap();
         c.write([6u8; 96]).unwrap();
         assert_eq!(c.read().unwrap(), vec![6u8; 96]);
+    }
+
+    // `dealloc` reads the payload size to decide truncate-the-tail versus recycle
+    // through the AVL tree. A fault there precedes both, so the handle survives.
+    #[test]
+    fn dealloc_tail_check_read_fault_returns_handle() {
+        let path = temp_path("ghost_read");
+        let _g = Guard(path.clone());
+        let alloc = GhostTreeBstackAllocator::new(BStack::open(&path).unwrap()).unwrap();
+
+        let mut s = alloc.alloc(64).unwrap();
+        s.write([5u8; 64]).unwrap();
+        let (start, len) = (s.start(), s.len());
+
+        arm(&alloc, FailOpAt::new("len", 0, ErrorKind::Other));
+        let err = alloc
+            .dealloc(s)
+            .expect_err("dealloc must fail when the tail check faults");
+        disarm(&alloc);
+
+        assert_eq!(err.source.kind(), ErrorKind::Other);
+        let handle = err.handle.expect("the tail check precedes every mutation");
+        assert_eq!((handle.start(), handle.len()), (start, len));
+        assert_eq!(handle.read().unwrap(), vec![5u8; 64], "data must be intact");
+        alloc.dealloc(handle).unwrap();
     }
 }

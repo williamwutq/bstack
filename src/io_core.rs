@@ -77,10 +77,7 @@ pub(crate) fn pread_exact(file: &File, offset: u64, len: usize) -> io::Result<Ve
     while filled < len {
         let n = file.seek_read(&mut buf[filled..], offset + filled as u64)?;
         if n == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "pread_exact: unexpected EOF",
-            ));
+            return Err(io_error!(UnexpectedEof, "pread_exact: unexpected EOF"));
         }
         filled += n;
     }
@@ -103,10 +100,7 @@ pub(crate) fn pread_exact_into(file: &File, offset: u64, buf: &mut [u8]) -> io::
     while filled < len {
         let n = file.seek_read(&mut buf[filled..], offset + filled as u64)?;
         if n == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "pread_exact_into: unexpected EOF",
-            ));
+            return Err(io_error!(UnexpectedEof, "pread_exact_into: unexpected EOF"));
         }
         filled += n;
     }
@@ -134,10 +128,7 @@ pub(crate) fn pread_exact_raw(fd: RawFd, offset: u64, buf: &mut [u8]) -> io::Res
             return Err(io::Error::last_os_error());
         }
         if n == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "locked pread: unexpected EOF",
-            ));
+            return Err(io_error!(UnexpectedEof, "locked pread: unexpected EOF"));
         }
         filled += n as usize;
     }
@@ -173,10 +164,7 @@ pub(crate) fn pread_exact_raw_handle(handle: isize, offset: u64, buf: &mut [u8])
             return Err(io::Error::last_os_error());
         }
         if bytes_read == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "locked ReadFile: unexpected EOF",
-            ));
+            return Err(io_error!(UnexpectedEof, "locked ReadFile: unexpected EOF"));
         }
         filled += bytes_read as usize;
     }
@@ -714,12 +702,9 @@ pub(crate) fn write_repeated(file: &mut File, phys: u64, s: &[u8], k: u64) -> io
     if unit == 0 || k == 0 {
         return Ok(());
     }
-    let total = k.checked_mul(unit).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "write_repeated: length overflow",
-        )
-    })?;
+    let total = k
+        .checked_mul(unit)
+        .ok_or_else(|| io_error!(InvalidData, "write_repeated: length overflow"))?;
     // Pack as many whole copies of `s` into one buffer as fit under MOVE_CHUNK
     // (at least one), capped at `k`.
     let copies = (MOVE_CHUNK / unit).max(1).min(k);
@@ -1281,19 +1266,42 @@ pub(crate) fn inplace_validate_write(
         "inplace_gen: write offset + data.len() overflows u64",
     )?;
     if offset < locked {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
+        return Err(io_error!(
+            InvalidInput,
             format!(
                 "inplace_gen: write range [{offset}, {end}) overlaps locked region [0, {locked})"
-            ),
+            )
         ));
     }
     if end > data_size {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
+        return Err(io_error!(
+            InvalidInput,
             format!(
                 "inplace_gen: write range [{offset}, {end}) exceeds payload size ({data_size})"
-            ),
+            )
+        ));
+    }
+    Ok(())
+}
+
+/// Validate an `inplace_gen` `Read` op against the fixed payload size, mirroring
+/// `get`'s checks.
+///
+/// Split out of [`inplace_overlay_read`] so `inplace_gen` can run it *before*
+/// consulting the fault policy, preserving the crate-wide rule that
+/// argument-validation errors are reported in preference to an injected fault.
+/// `inplace_overlay_read` still calls it, so it remains correct standalone.
+#[cfg(all(feature = "set", feature = "atomic"))]
+pub(crate) fn inplace_validate_read(offset: u64, buf_len: u64, data_size: u64) -> io::Result<()> {
+    let end = crate::checked_end(
+        offset,
+        buf_len,
+        "inplace_gen: read offset + buf.len() overflows u64",
+    )?;
+    if end > data_size {
+        return Err(io_error!(
+            InvalidInput,
+            format!("inplace_gen: read range [{offset}, {end}) exceeds payload size ({data_size})")
         ));
     }
     Ok(())
@@ -1311,17 +1319,9 @@ pub(crate) fn inplace_overlay_read(
     buf: &mut [u8],
     overlay: &[(u64, &[u8])],
 ) -> io::Result<()> {
-    let end = crate::checked_end(
-        offset,
-        buf.len() as u64,
-        "inplace_gen: read offset + buf.len() overflows u64",
-    )?;
-    if end > data_size {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("inplace_gen: read range [{offset}, {end}) exceeds payload size ({data_size})"),
-        ));
-    }
+    inplace_validate_read(offset, buf.len() as u64, data_size)?;
+    // Validated above, so this cannot overflow.
+    let end = offset + buf.len() as u64;
     if buf.is_empty() {
         return Ok(());
     }

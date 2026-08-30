@@ -648,6 +648,27 @@
     doc = "performance is unaffected. See the [`fault`] module for details."
 )]
 
+/// Build an [`io::Error`](std::io::Error) from an [`ErrorKind`](std::io::ErrorKind)
+/// variant and a message, without repeating `io::Error::new(io::ErrorKind::…, …)`.
+///
+/// * `$kind` — bare `ErrorKind` variant name (`InvalidData`, `NotFound`, …); expands
+///   to `std::io::ErrorKind::$kind`.
+/// * message — either a single expr (any `Into<Box<dyn Error + Send + Sync>>`: a
+///   `&str`, `String`, or error value), or a format literal plus args (via
+///   [`format!`]).
+#[allow(unused)]
+macro_rules! io_error {
+    ($kind:ident, $fmt:literal, $($arg:tt)+) => {
+        ::std::io::Error::new(
+            ::std::io::ErrorKind::$kind,
+            ::std::format!($fmt, $($arg)+),
+        )
+    };
+    ($kind:ident, $msg:expr $(,)?) => {
+        ::std::io::Error::new(::std::io::ErrorKind::$kind, $msg)
+    };
+}
+
 mod io_core;
 use io_core::*;
 
@@ -655,6 +676,8 @@ pub mod reborrow;
 
 pub mod fault;
 use fault::fault_point;
+#[cfg(all(feature = "set", feature = "atomic"))]
+use fault::fault_probe;
 #[cfg(all(debug_assertions, feature = "fault-injection"))]
 pub use fault::{FaultPolicy, FaultState};
 #[cfg(all(test, feature = "alloc", feature = "set"))]
@@ -744,7 +767,7 @@ const LEGACY_HEADER_SIZE: u64 = 16;
 #[cfg(any(feature = "set", feature = "atomic"))]
 pub(crate) fn checked_end(base: u64, len: u64, msg: &'static str) -> io::Result<u64> {
     base.checked_add(len)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, msg))
+        .ok_or_else(|| io_error!(InvalidInput, msg))
 }
 
 /// Reject an in-place write whose range `[offset, end)` starts inside the locked
@@ -761,9 +784,9 @@ pub(crate) fn check_offset_unlocked(
     locked: u64,
 ) -> io::Result<()> {
     if offset < locked {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("{op}: range [{offset}, {end}) overlaps locked region [0, {locked})"),
+        return Err(io_error!(
+            InvalidInput,
+            format!("{op}: range [{offset}, {end}) overlaps locked region [0, {locked})")
         ));
     }
     Ok(())
@@ -785,18 +808,16 @@ pub(crate) fn check_offset_unlocked(
 fn validate_sparse_blocks(blocks: &mut [(u64, &[u8])], length: u64, op: &str) -> io::Result<()> {
     for (off, data) in blocks.iter() {
         let end = off.checked_add(data.len() as u64).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "{op}: relative offset ({off}) + len ({}) overflows u64",
-                    data.len()
-                ),
+            io_error!(
+                InvalidInput,
+                "{op}: relative offset ({off}) + len ({}) overflows u64",
+                data.len()
             )
         })?;
         if end > length {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("{op}: write range [{off}, {end}) exceeds declared length ({length})"),
+            return Err(io_error!(
+                InvalidInput,
+                format!("{op}: write range [{off}, {end}) exceeds declared length ({length})")
             ));
         }
     }
@@ -808,9 +829,9 @@ fn validate_sparse_blocks(blocks: &mut [(u64, &[u8])], length: u64, op: &str) ->
         let (b_off, _) = pair[1];
         let a_end = a_off + a_data.len() as u64;
         if a_end > b_off {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("{op}: write range [{a_off}, {a_end}) overlaps [{b_off}, ...)"),
+            return Err(io_error!(
+                InvalidInput,
+                format!("{op}: write range [{a_off}, {a_end}) overlaps [{b_off}, ...)")
             ));
         }
     }
@@ -884,9 +905,9 @@ impl BStack {
         let mut hdr = [0u8; HEADER_SIZE as usize];
         file.read_exact(&mut hdr)?;
         if hdr[0..6] != MAGIC_PREFIX {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "bstack: bad magic number — not a bstack file or incompatible version",
+            return Err(io_error!(
+                InvalidData,
+                "bstack: bad magic number — not a bstack file or incompatible version"
             ));
         }
         let committed_len = u64::from_le_bytes(hdr[8..16].try_into().unwrap());
@@ -938,11 +959,11 @@ impl BStack {
             Self::init_header(&mut file)?;
             durable_sync(&file)?;
         } else if raw_size < HEADER_SIZE {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
+            return Err(io_error!(
+                InvalidData,
                 format!(
                     "bstack: file is {raw_size} bytes — too small to contain the {HEADER_SIZE}-byte header"
-                ),
+                )
             ));
         } else {
             let (committed_len, wip_ptr, wip_aux) = Self::read_header(&mut file)?;
@@ -1018,19 +1039,19 @@ impl BStack {
         let mut old = OpenOptions::new().read(true).open(path)?;
         let old_size = old.metadata()?.len();
         if old_size < LEGACY_HEADER_SIZE {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
+            return Err(io_error!(
+                InvalidData,
                 format!(
                     "bstack: file is {old_size} bytes — too small to be a legacy {LEGACY_HEADER_SIZE}-byte-header file"
-                ),
+                )
             ));
         }
         let mut hdr = [0u8; LEGACY_HEADER_SIZE as usize];
         old.read_exact(&mut hdr)?;
         if hdr[0..6] != LEGACY_MAGIC_PREFIX {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "bstack: not a legacy 0.1.x file — nothing to migrate",
+            return Err(io_error!(
+                InvalidData,
+                "bstack: not a legacy 0.1.x file — nothing to migrate"
             ));
         }
         // Committed length, clamped to the payload actually present.
@@ -1059,9 +1080,9 @@ impl BStack {
             let mut src = (&mut old).take(clen);
             let copied = io::copy(&mut src, &mut new)?;
             if copied != clen {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "bstack: legacy payload shorter than committed length during migration",
+                return Err(io_error!(
+                    UnexpectedEof,
+                    "bstack: legacy payload shorter than committed length during migration"
                 ));
             }
             new.sync_all()?;
@@ -1185,12 +1206,10 @@ impl BStack {
     pub fn extend_sparse(&self, buf: impl AsRef<[u8]>, length: u64) -> io::Result<u64> {
         let buf = buf.as_ref();
         if buf.len() as u64 > length {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "extend_sparse: buffer length ({}) exceeds extension length ({length})",
-                    buf.len()
-                ),
+            return Err(io_error!(
+                InvalidInput,
+                "extend_sparse: buffer length ({}) exceeds extension length ({length})",
+                buf.len()
             ));
         }
         let mut guard = self.lock.write().unwrap();
@@ -1202,9 +1221,9 @@ impl BStack {
             return Ok(logical_offset);
         }
         let new_len = logical_offset.checked_add(length).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "extend_sparse: payload size + length overflows u64",
+            io_error!(
+                InvalidInput,
+                "extend_sparse: payload size + length overflows u64"
             )
         })?;
         fault_point!(self, "extend_sparse");
@@ -1271,9 +1290,9 @@ impl BStack {
             return Ok(logical_offset);
         }
         let new_len = logical_offset.checked_add(length).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "extend_sparse_batched: payload size + length overflows u64",
+            io_error!(
+                InvalidInput,
+                "extend_sparse_batched: payload size + length overflows u64"
             )
         })?;
         fault_point!(self, "extend_sparse_batched");
@@ -1312,9 +1331,9 @@ impl BStack {
         if target < data_size {
             let locked = self.locked.load(Ordering::Acquire);
             if target < locked {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("resize({target}) would shrink payload below locked length ({locked})"),
+                return Err(io_error!(
+                    InvalidInput,
+                    format!("resize({target}) would shrink payload below locked length ({locked})")
                 ));
             }
             fault_point!(self, "resize");
@@ -1411,9 +1430,9 @@ impl BStack {
         // where `usize` is narrower than `u64`.
         let growth = target - data_size;
         if growth > isize::MAX as u64 {
-            return Err(io::Error::new(
-                io::ErrorKind::OutOfMemory,
-                "ensure_with: growth too large to buffer on this platform",
+            return Err(io_error!(
+                OutOfMemory,
+                "ensure_with: growth too large to buffer on this platform"
             ));
         }
         let mut buf = vec![0u8; growth as usize];
@@ -1448,17 +1467,17 @@ impl BStack {
         let raw_size = file.seek(SeekFrom::End(0))?;
         let data_size = raw_size - HEADER_SIZE;
         if n > data_size {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("pop({n}) exceeds payload size ({data_size})"),
+            return Err(io_error!(
+                InvalidInput,
+                format!("pop({n}) exceeds payload size ({data_size})")
             ));
         }
         let new_data_len = data_size - n;
         let locked = self.locked.load(Ordering::Acquire);
         if new_data_len < locked {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("pop({n}) would shrink payload below locked length ({locked})"),
+            return Err(io_error!(
+                InvalidInput,
+                format!("pop({n}) would shrink payload below locked length ({locked})")
             ));
         }
         let mut buf = vec![0u8; n as usize];
@@ -1496,9 +1515,9 @@ impl BStack {
             let file = &guard.0;
             let data_size = file.metadata()?.len().saturating_sub(HEADER_SIZE);
             if offset > data_size {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("peek offset ({offset}) exceeds payload size ({data_size})"),
+                return Err(io_error!(
+                    InvalidInput,
+                    format!("peek offset ({offset}) exceeds payload size ({data_size})")
                 ));
             }
             fault_point!(self, "peek");
@@ -1511,9 +1530,9 @@ impl BStack {
             let raw_size = file.seek(SeekFrom::End(0))?;
             let data_size = raw_size.saturating_sub(HEADER_SIZE);
             if offset > data_size {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("peek offset ({offset}) exceeds payload size ({data_size})"),
+                return Err(io_error!(
+                    InvalidInput,
+                    format!("peek offset ({offset}) exceeds payload size ({data_size})")
                 ));
             }
             fault_point!(self, "peek");
@@ -1541,9 +1560,9 @@ impl BStack {
     /// exceeds the current payload size.
     pub fn get(&self, start: u64, end: u64) -> io::Result<Vec<u8>> {
         if end < start {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("get: end ({end}) < start ({start})"),
+            return Err(io_error!(
+                InvalidInput,
+                format!("get: end ({end}) < start ({start})")
             ));
         }
         // Fast-path: if the range lies entirely within the locked region,
@@ -1580,9 +1599,9 @@ impl BStack {
             let file = &guard.0;
             let data_size = file.metadata()?.len().saturating_sub(HEADER_SIZE);
             if end > data_size {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("get: end ({end}) exceeds payload size ({data_size})"),
+                return Err(io_error!(
+                    InvalidInput,
+                    format!("get: end ({end}) exceeds payload size ({data_size})")
                 ));
             }
             fault_point!(self, "get");
@@ -1600,9 +1619,9 @@ impl BStack {
             let raw_size = file.seek(SeekFrom::End(0))?;
             let data_size = raw_size.saturating_sub(HEADER_SIZE);
             if end > data_size {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("get: end ({end}) exceeds payload size ({data_size})"),
+                return Err(io_error!(
+                    InvalidInput,
+                    format!("get: end ({end}) exceeds payload size ({data_size})")
                 ));
             }
             fault_point!(self, "get");
@@ -1635,23 +1654,20 @@ impl BStack {
             return Ok(());
         }
         let len = buf.len() as u64;
-        let end = offset.checked_add(len).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "peek_into: offset + len overflows u64",
-            )
-        })?;
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| io_error!(InvalidInput, "peek_into: offset + len overflows u64"))?;
         #[cfg(any(unix, windows))]
         {
             let guard = self.lock.read().unwrap();
             let file = &guard.0;
             let data_size = file.metadata()?.len().saturating_sub(HEADER_SIZE);
             if end > data_size {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
+                return Err(io_error!(
+                    InvalidInput,
                     format!(
                         "peek_into: range [{offset}, {end}) exceeds payload size ({data_size})"
-                    ),
+                    )
                 ));
             }
             fault_point!(self, "peek_into");
@@ -1663,11 +1679,11 @@ impl BStack {
             let file = &mut guard.0;
             let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
             if end > data_size {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
+                return Err(io_error!(
+                    InvalidInput,
                     format!(
                         "peek_into: range [{offset}, {end}) exceeds payload size ({data_size})"
-                    ),
+                    )
                 ));
             }
             fault_point!(self, "peek_into");
@@ -1698,12 +1714,9 @@ impl BStack {
             return Ok(());
         }
         let len = buf.len() as u64;
-        let end = start.checked_add(len).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "get_into: start + len overflows u64",
-            )
-        })?;
+        let end = start
+            .checked_add(len)
+            .ok_or_else(|| io_error!(InvalidInput, "get_into: start + len overflows u64"))?;
         // Fast-path: locked region is immutable — serve from cache or pread.
         #[cfg(any(unix, windows))]
         {
@@ -1726,9 +1739,9 @@ impl BStack {
             let file = &guard.0;
             let data_size = file.metadata()?.len().saturating_sub(HEADER_SIZE);
             if end > data_size {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("get_into: end ({end}) exceeds payload size ({data_size})"),
+                return Err(io_error!(
+                    InvalidInput,
+                    format!("get_into: end ({end}) exceeds payload size ({data_size})")
                 ));
             }
             fault_point!(self, "get_into");
@@ -1746,9 +1759,9 @@ impl BStack {
             let file = &mut guard.0;
             let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
             if end > data_size {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("get_into: end ({end}) exceeds payload size ({data_size})"),
+                return Err(io_error!(
+                    InvalidInput,
+                    format!("get_into: end ({end}) exceeds payload size ({data_size})")
                 ));
             }
             fault_point!(self, "get_into");
@@ -1783,17 +1796,17 @@ impl BStack {
         let raw_size = file.seek(SeekFrom::End(0))?;
         let data_size = raw_size - HEADER_SIZE;
         if n > data_size {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("pop_into({n}) exceeds payload size ({data_size})"),
+            return Err(io_error!(
+                InvalidInput,
+                format!("pop_into({n}) exceeds payload size ({data_size})")
             ));
         }
         let new_data_len = data_size - n;
         let locked = self.locked.load(Ordering::Acquire);
         if new_data_len < locked {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("pop_into({n}) would shrink payload below locked length ({locked})"),
+            return Err(io_error!(
+                InvalidInput,
+                format!("pop_into({n}) would shrink payload below locked length ({locked})")
             ));
         }
         fault_point!(self, "pop_into");
@@ -1825,17 +1838,17 @@ impl BStack {
         let raw_size = file.seek(SeekFrom::End(0))?;
         let data_size = raw_size - HEADER_SIZE;
         if n > data_size {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("discard({n}) exceeds payload size ({data_size})"),
+            return Err(io_error!(
+                InvalidInput,
+                format!("discard({n}) exceeds payload size ({data_size})")
             ));
         }
         let new_data_len = data_size - n;
         let locked = self.locked.load(Ordering::Acquire);
         if new_data_len < locked {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("discard({n}) would shrink payload below locked length ({locked})"),
+            return Err(io_error!(
+                InvalidInput,
+                format!("discard({n}) would shrink payload below locked length ({locked})")
             ));
         }
         fault_point!(self, "discard");
@@ -1883,9 +1896,9 @@ impl BStack {
         check_offset_unlocked("set", offset, end, locked)?;
         let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
         if end > data_size {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("set: write end ({end}) exceeds payload size ({data_size})"),
+            return Err(io_error!(
+                InvalidInput,
+                format!("set: write end ({end}) exceeds payload size ({data_size})")
             ));
         }
         fault_point!(self, "set");
@@ -1928,9 +1941,9 @@ impl BStack {
         check_offset_unlocked("zero", offset, end, locked)?;
         let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
         if end > data_size {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("zero: write end ({end}) exceeds payload size ({data_size})"),
+            return Err(io_error!(
+                InvalidInput,
+                format!("zero: write end ({end}) exceeds payload size ({data_size})")
             ));
         }
         // Zeroing is a repeat-fill of the single-byte pattern `[0x00]` `n` times:
@@ -1979,10 +1992,7 @@ impl BStack {
             return Ok(());
         }
         let total = (pattern.len() as u64).checked_mul(count).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "repeat: count * pattern.len() overflows u64",
-            )
+            io_error!(InvalidInput, "repeat: count * pattern.len() overflows u64")
         })?;
         let end = checked_end(
             offset,
@@ -1996,9 +2006,9 @@ impl BStack {
         check_offset_unlocked("repeat", offset, end, locked)?;
         let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
         if end > data_size {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("repeat: write end ({end}) exceeds payload size ({data_size})"),
+            return Err(io_error!(
+                InvalidInput,
+                format!("repeat: write end ({end}) exceeds payload size ({data_size})")
             ));
         }
         fault_point!(self, "repeat");
@@ -2053,17 +2063,17 @@ impl BStack {
         let file_end = file.seek(SeekFrom::End(0))?;
         let data_size = file_end - HEADER_SIZE;
         if n > data_size {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("atrunc: n ({n}) exceeds payload size ({data_size})"),
+            return Err(io_error!(
+                InvalidInput,
+                format!("atrunc: n ({n}) exceeds payload size ({data_size})")
             ));
         }
         let locked = self.locked.load(Ordering::Acquire);
         let new_tail_start = data_size - n;
         if new_tail_start < locked {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("atrunc: operation would modify locked region [0, {locked})"),
+            return Err(io_error!(
+                InvalidInput,
+                format!("atrunc: operation would modify locked region [0, {locked})")
             ));
         }
         fault_point!(self, "atrunc");
@@ -2100,17 +2110,17 @@ impl BStack {
         let file_end = file.seek(SeekFrom::End(0))?;
         let data_size = file_end - HEADER_SIZE;
         if n > data_size {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("splice: n ({n}) exceeds payload size ({data_size})"),
+            return Err(io_error!(
+                InvalidInput,
+                format!("splice: n ({n}) exceeds payload size ({data_size})")
             ));
         }
         let locked = self.locked.load(Ordering::Acquire);
         let new_tail_start = data_size - n;
         if new_tail_start < locked {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("splice: operation would modify locked region [0, {locked})"),
+            return Err(io_error!(
+                InvalidInput,
+                format!("splice: operation would modify locked region [0, {locked})")
             ));
         }
         fault_point!(self, "splice");
@@ -2153,17 +2163,17 @@ impl BStack {
         let file_end = file.seek(SeekFrom::End(0))?;
         let data_size = file_end - HEADER_SIZE;
         if n > data_size {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("splice_into: n ({n}) exceeds payload size ({data_size})"),
+            return Err(io_error!(
+                InvalidInput,
+                format!("splice_into: n ({n}) exceeds payload size ({data_size})")
             ));
         }
         let locked = self.locked.load(Ordering::Acquire);
         let new_tail_start = data_size - n;
         if new_tail_start < locked {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("splice_into: operation would modify locked region [0, {locked})"),
+            return Err(io_error!(
+                InvalidInput,
+                format!("splice_into: operation would modify locked region [0, {locked})")
             ));
         }
         fault_point!(self, "splice_into");
@@ -2279,12 +2289,10 @@ impl BStack {
     ) -> io::Result<bool> {
         let buf = buf.as_ref();
         if buf.len() as u64 > length {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "try_extend_sparse: buffer length ({}) exceeds extension length ({length})",
-                    buf.len()
-                ),
+            return Err(io_error!(
+                InvalidInput,
+                "try_extend_sparse: buffer length ({}) exceeds extension length ({length})",
+                buf.len()
             ));
         }
         let mut guard = self.lock.write().unwrap();
@@ -2405,17 +2413,17 @@ impl BStack {
             return Ok(false);
         }
         if n > data_size {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("try_discard: n ({n}) exceeds payload size ({data_size})"),
+            return Err(io_error!(
+                InvalidInput,
+                format!("try_discard: n ({n}) exceeds payload size ({data_size})")
             ));
         }
         let new_data_len = data_size - n;
         let locked = self.locked.load(Ordering::Acquire);
         if new_data_len < locked {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("try_discard: would shrink payload below locked length ({locked})"),
+            return Err(io_error!(
+                InvalidInput,
+                format!("try_discard: would shrink payload below locked length ({locked})")
             ));
         }
         fault_point!(self, "try_discard");
@@ -2454,9 +2462,11 @@ impl BStack {
         }
         for r in &ranges {
             if r.end < r.start {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("get_batched: end ({}) < start ({})", r.end, r.start),
+                return Err(io_error!(
+                    InvalidInput,
+                    "get_batched: end ({}) < start ({})",
+                    r.end,
+                    r.start
                 ));
             }
         }
@@ -2469,12 +2479,10 @@ impl BStack {
             let mut results = Vec::with_capacity(ranges.len());
             for r in &ranges {
                 if r.end > data_size {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!(
-                            "get_batched: end ({}) exceeds payload size ({data_size})",
-                            r.end
-                        ),
+                    return Err(io_error!(
+                        InvalidInput,
+                        "get_batched: end ({}) exceeds payload size ({data_size})",
+                        r.end
                     ));
                 }
                 results.push(pread_exact(
@@ -2494,12 +2502,10 @@ impl BStack {
             let mut results = Vec::with_capacity(ranges.len());
             for r in &ranges {
                 if r.end > data_size {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!(
-                            "get_batched: end ({}) exceeds payload size ({data_size})",
-                            r.end
-                        ),
+                    return Err(io_error!(
+                        InvalidInput,
+                        "get_batched: end ({}) exceeds payload size ({data_size})",
+                        r.end
                     ));
                 }
                 file.seek(SeekFrom::Start(HEADER_SIZE + r.start))?;
@@ -2547,15 +2553,15 @@ impl BStack {
             fault_point!(self, "get_batched_into");
             for (ptr, buf) in bufs {
                 let end = ptr.checked_add(buf.len() as u64).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "get_batched_into: offset + buf.len() overflows u64",
+                    io_error!(
+                        InvalidInput,
+                        "get_batched_into: offset + buf.len() overflows u64"
                     )
                 })?;
                 if end > data_size {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("get_batched_into: end ({end}) exceeds payload size ({data_size})",),
+                    return Err(io_error!(
+                        InvalidInput,
+                        format!("get_batched_into: end ({end}) exceeds payload size ({data_size})",)
                     ));
                 }
                 pread_exact_into(file, HEADER_SIZE + ptr, buf)?;
@@ -2570,15 +2576,15 @@ impl BStack {
             fault_point!(self, "get_batched_into");
             for (ptr, buf) in bufs {
                 let end = ptr.checked_add(buf.len() as u64).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "get_batched_into: offset + buf.len() overflows u64",
+                    io_error!(
+                        InvalidInput,
+                        "get_batched_into: offset + buf.len() overflows u64"
                     )
                 })?;
                 if end > data_size {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("get_batched_into: end ({end}) exceeds payload size ({data_size})",),
+                    return Err(io_error!(
+                        InvalidInput,
+                        format!("get_batched_into: end ({end}) exceeds payload size ({data_size})",)
                     ));
                 }
                 file.seek(SeekFrom::Start(HEADER_SIZE + ptr))?;
@@ -2620,17 +2626,20 @@ impl BStack {
             fault_point!(self, "get_batched_gen");
             while let Some((offset, buf)) = f() {
                 let end = offset.checked_add(buf.len() as u64).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "get_batched_gen: offset + buf.len() overflows u64",
+                    io_error!(
+                        InvalidInput,
+                        "get_batched_gen: offset + buf.len() overflows u64"
                     )
                 })?;
                 if end > data_size {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("get_batched_gen: end ({end}) exceeds payload size ({data_size})"),
+                    return Err(io_error!(
+                        InvalidInput,
+                        format!("get_batched_gen: end ({end}) exceeds payload size ({data_size})")
                     ));
                 }
+                // Per-step read fault: stands in for this read's I/O and ends
+                // the whole call, as a genuine read failure here does.
+                fault_point!(self, "get_batched_gen:read");
                 pread_exact_into(file, HEADER_SIZE + offset, buf)?;
             }
             Ok(())
@@ -2643,17 +2652,20 @@ impl BStack {
             fault_point!(self, "get_batched_gen");
             while let Some((offset, buf)) = f() {
                 let end = offset.checked_add(buf.len() as u64).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "get_batched_gen: offset + buf.len() overflows u64",
+                    io_error!(
+                        InvalidInput,
+                        "get_batched_gen: offset + buf.len() overflows u64"
                     )
                 })?;
                 if end > data_size {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("get_batched_gen: end ({end}) exceeds payload size ({data_size})"),
+                    return Err(io_error!(
+                        InvalidInput,
+                        format!("get_batched_gen: end ({end}) exceeds payload size ({data_size})")
                     ));
                 }
+                // Per-step read fault: stands in for this read's I/O and ends
+                // the whole call, as a genuine read failure here does.
+                fault_point!(self, "get_batched_gen:read");
                 file.seek(SeekFrom::Start(HEADER_SIZE + offset))?;
                 file.read_exact(buf)?;
             }
@@ -2692,17 +2704,17 @@ impl BStack {
         let file_end = file.seek(SeekFrom::End(0))?;
         let data_size = file_end - HEADER_SIZE;
         if n > data_size {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("replace: n ({n}) exceeds payload size ({data_size})"),
+            return Err(io_error!(
+                InvalidInput,
+                format!("replace: n ({n}) exceeds payload size ({data_size})")
             ));
         }
         let locked = self.locked.load(Ordering::Acquire);
         let new_tail_start = data_size - n;
         if new_tail_start < locked {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("replace: operation would modify locked region [0, {locked})"),
+            return Err(io_error!(
+                InvalidInput,
+                format!("replace: operation would modify locked region [0, {locked})")
             ));
         }
         fault_point!(self, "replace");
@@ -2932,9 +2944,9 @@ impl BStack {
         check_offset_unlocked("swap", offset, end, locked)?;
         let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
         if end > data_size {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("swap: range [{offset}, {end}) exceeds payload size ({data_size})"),
+            return Err(io_error!(
+                InvalidInput,
+                format!("swap: range [{offset}, {end}) exceeds payload size ({data_size})")
             ));
         }
         fault_point!(self, "swap");
@@ -2984,9 +2996,9 @@ impl BStack {
         check_offset_unlocked("swap_into", offset, end, locked)?;
         let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
         if end > data_size {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("swap_into: range [{offset}, {end}) exceeds payload size ({data_size})"),
+            return Err(io_error!(
+                InvalidInput,
+                format!("swap_into: range [{offset}, {end}) exceeds payload size ({data_size})")
             ));
         }
         fault_point!(self, "swap_into");
@@ -3045,9 +3057,9 @@ impl BStack {
         check_offset_unlocked("cas", offset, end, locked)?;
         let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
         if end > data_size {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("cas: range [{offset}, {end}) exceeds payload size ({data_size})"),
+            return Err(io_error!(
+                InvalidInput,
+                format!("cas: range [{offset}, {end}) exceeds payload size ({data_size})")
             ));
         }
         fault_point!(self, "cas");
@@ -3096,9 +3108,9 @@ impl BStack {
         if n > 0 {
             let (lo, hi) = if a < b { (a, b) } else { (b, a) };
             if lo + n > hi {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("cross_exchange: regions [{a}, {a_end}) and [{b}, {b_end}) overlap"),
+                return Err(io_error!(
+                    InvalidInput,
+                    format!("cross_exchange: regions [{a}, {a_end}) and [{b}, {b_end}) overlap")
                 ));
             }
         }
@@ -3106,32 +3118,32 @@ impl BStack {
         let file = &mut guard.0;
         let locked = self.locked.load(Ordering::Acquire);
         if a < locked {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
+            return Err(io_error!(
+                InvalidInput,
                 format!(
                     "cross_exchange: region [{a}, {a_end}) overlaps locked region [0, {locked})"
-                ),
+                )
             ));
         }
         if b < locked {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
+            return Err(io_error!(
+                InvalidInput,
                 format!(
                     "cross_exchange: region [{b}, {b_end}) overlaps locked region [0, {locked})"
-                ),
+                )
             ));
         }
         let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
         if a_end > data_size {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("cross_exchange: region [{a}, {a_end}) exceeds payload size ({data_size})"),
+            return Err(io_error!(
+                InvalidInput,
+                format!("cross_exchange: region [{a}, {a_end}) exceeds payload size ({data_size})")
             ));
         }
         if b_end > data_size {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("cross_exchange: region [{b}, {b_end}) exceeds payload size ({data_size})"),
+            return Err(io_error!(
+                InvalidInput,
+                format!("cross_exchange: region [{b}, {b_end}) exceeds payload size ({data_size})")
             ));
         }
         if n == 0 {
@@ -3178,22 +3190,22 @@ impl BStack {
         let file = &mut guard.0;
         let locked = self.locked.load(Ordering::Acquire);
         if to < locked {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("copy: destination [{to}, {to_end}) overlaps locked region [0, {locked})"),
+            return Err(io_error!(
+                InvalidInput,
+                format!("copy: destination [{to}, {to_end}) overlaps locked region [0, {locked})")
             ));
         }
         let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
         if from_end > data_size {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("copy: source [{from}, {from_end}) exceeds payload size ({data_size})"),
+            return Err(io_error!(
+                InvalidInput,
+                format!("copy: source [{from}, {from_end}) exceeds payload size ({data_size})")
             ));
         }
         if to_end > data_size {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("copy: destination [{to}, {to_end}) exceeds payload size ({data_size})"),
+            return Err(io_error!(
+                InvalidInput,
+                format!("copy: destination [{to}, {to_end}) exceeds payload size ({data_size})")
             ));
         }
         if n == 0 {
@@ -3260,9 +3272,9 @@ impl BStack {
         F: FnOnce(&mut [u8]),
     {
         if end < start {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("process: end ({end}) < start ({start})"),
+            return Err(io_error!(
+                InvalidInput,
+                format!("process: end ({end}) < start ({start})")
             ));
         }
         let n = end - start;
@@ -3270,16 +3282,16 @@ impl BStack {
         let file = &mut guard.0;
         let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
         if end > data_size {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("process: end ({end}) exceeds payload size ({data_size})"),
+            return Err(io_error!(
+                InvalidInput,
+                format!("process: end ({end}) exceeds payload size ({data_size})")
             ));
         }
         let locked = self.locked.load(Ordering::Acquire);
         if start < locked {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("process: range [{start}, {end}) overlaps locked region [0, {locked})"),
+            return Err(io_error!(
+                InvalidInput,
+                format!("process: range [{start}, {end}) overlaps locked region [0, {locked})")
             ));
         }
         fault_point!(self, "process");
@@ -3403,13 +3415,20 @@ impl BStack {
                         "process_gen: read offset + buf.len() overflows u64",
                     )?;
                     if end > data_size {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidInput,
+                        return Err(io_error!(
+                            InvalidInput,
                             format!(
                                 "process_gen: read range [{offset}, {end}) exceeds payload size ({data_size})"
-                            ),
+                            )
                         ));
                     }
+                    // Per-step read fault: stands in for this `Read`'s I/O, and
+                    // like a genuine read failure here it ends the whole call —
+                    // `process_gen` has no channel to report a step failure on.
+                    // Consulted for every `Read` op, including ones the fast
+                    // paths below serve without touching the disk, so the
+                    // schedule does not shift with cache state.
+                    fault_point!(self, "process_gen:read");
                     // Fast path: locked bytes are immutable, so they can be
                     // served from the cache or via a lock-free pread instead
                     // of going through the held file handle — mirroring how
@@ -3447,19 +3466,19 @@ impl BStack {
                         "process_gen: write offset + data.len() overflows u64",
                     )?;
                     if offset < locked {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidInput,
+                        return Err(io_error!(
+                            InvalidInput,
                             format!(
                                 "process_gen: write range [{offset}, {end}) overlaps locked region [0, {locked})"
-                            ),
+                            )
                         ));
                     }
                     if end > data_size {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidInput,
+                        return Err(io_error!(
+                            InvalidInput,
                             format!(
                                 "process_gen: write range [{offset}, {end}) exceeds payload size ({data_size})"
-                            ),
+                            )
                         ));
                     }
                     if !data.is_empty() {
@@ -3483,44 +3502,44 @@ impl BStack {
                             (b_offset, a_offset)
                         };
                         if lo + len > hi {
-                            return Err(io::Error::new(
-                                io::ErrorKind::InvalidInput,
+                            return Err(io_error!(
+                                InvalidInput,
                                 format!(
                                     "process_gen: swap regions [{a_offset}, {a_end}) and [{b_offset}, {b_end}) overlap"
-                                ),
+                                )
                             ));
                         }
                     }
                     if a_offset < locked {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidInput,
+                        return Err(io_error!(
+                            InvalidInput,
                             format!(
                                 "process_gen: swap region [{a_offset}, {a_end}) overlaps locked region [0, {locked})"
-                            ),
+                            )
                         ));
                     }
                     if b_offset < locked {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidInput,
+                        return Err(io_error!(
+                            InvalidInput,
                             format!(
                                 "process_gen: swap region [{b_offset}, {b_end}) overlaps locked region [0, {locked})"
-                            ),
+                            )
                         ));
                     }
                     if a_end > data_size {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidInput,
+                        return Err(io_error!(
+                            InvalidInput,
                             format!(
                                 "process_gen: swap region [{a_offset}, {a_end}) exceeds payload size ({data_size})"
-                            ),
+                            )
                         ));
                     }
                     if b_end > data_size {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidInput,
+                        return Err(io_error!(
+                            InvalidInput,
                             format!(
                                 "process_gen: swap region [{b_offset}, {b_end}) exceeds payload size ({data_size})"
-                            ),
+                            )
                         ));
                     }
                     if len > 0 {
@@ -3544,18 +3563,18 @@ impl BStack {
                 Some(BStackGenOp::Pop { buf }) => {
                     let n = buf.len() as u64;
                     if n > data_size {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            format!("process_gen: pop({n}) exceeds payload size ({data_size})"),
+                        return Err(io_error!(
+                            InvalidInput,
+                            format!("process_gen: pop({n}) exceeds payload size ({data_size})")
                         ));
                     }
                     let new_data_len = data_size - n;
                     if new_data_len < locked {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidInput,
+                        return Err(io_error!(
+                            InvalidInput,
                             format!(
                                 "process_gen: pop({n}) would shrink payload below locked length ({locked})"
-                            ),
+                            )
                         ));
                     }
                     if n > 0 {
@@ -3566,20 +3585,20 @@ impl BStack {
                 }
                 Some(BStackGenOp::Discard { len }) => {
                     if len > data_size {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidInput,
+                        return Err(io_error!(
+                            InvalidInput,
                             format!(
                                 "process_gen: discard({len}) exceeds payload size ({data_size})"
-                            ),
+                            )
                         ));
                     }
                     let new_data_len = data_size - len;
                     if new_data_len < locked {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidInput,
+                        return Err(io_error!(
+                            InvalidInput,
                             format!(
                                 "process_gen: discard({len}) would shrink payload below locked length ({locked})"
-                            ),
+                            )
                         ));
                     }
                     if len > 0 {
@@ -3589,18 +3608,18 @@ impl BStack {
                 }
                 Some(BStackGenOp::Atrunc { n, data }) => {
                     if n > data_size {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidInput,
+                        return Err(io_error!(
+                            InvalidInput,
                             format!(
                                 "process_gen: atrunc n ({n}) exceeds payload size ({data_size})"
-                            ),
+                            )
                         ));
                     }
                     let new_tail_start = data_size - n;
                     if new_tail_start < locked {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            format!("process_gen: atrunc would modify locked region [0, {locked})"),
+                        return Err(io_error!(
+                            InvalidInput,
+                            format!("process_gen: atrunc would modify locked region [0, {locked})")
                         ));
                     }
                     if n != 0 || !data.is_empty() {
@@ -3612,18 +3631,18 @@ impl BStack {
                 Some(BStackGenOp::Splice { old, new }) => {
                     let n = old.len() as u64;
                     if n > data_size {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidInput,
+                        return Err(io_error!(
+                            InvalidInput,
                             format!(
                                 "process_gen: splice n ({n}) exceeds payload size ({data_size})"
-                            ),
+                            )
                         ));
                     }
                     let new_tail_start = data_size - n;
                     if new_tail_start < locked {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            format!("process_gen: splice would modify locked region [0, {locked})"),
+                        return Err(io_error!(
+                            InvalidInput,
+                            format!("process_gen: splice would modify locked region [0, {locked})")
                         ));
                     }
                     if n != 0 || !new.is_empty() {
@@ -3731,19 +3750,19 @@ impl BStack {
                 "set_batched: offset + len overflows u64",
             )?;
             if *off < locked {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
+                return Err(io_error!(
+                    InvalidInput,
                     format!(
                         "set_batched: write range [{off}, {end}) overlaps locked region [0, {locked})"
-                    ),
+                    )
                 ));
             }
             if end > data_size {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
+                return Err(io_error!(
+                    InvalidInput,
                     format!(
                         "set_batched: write range [{off}, {end}) exceeds payload size ({data_size})"
-                    ),
+                    )
                 ));
             }
         }
@@ -3762,9 +3781,9 @@ impl BStack {
             let (b_off, _) = pair[1];
             let a_end = a_off + a_data.len() as u64;
             if a_end > b_off {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("set_batched: write range [{a_off}, {a_end}) overlaps [{b_off}, ...)"),
+                return Err(io_error!(
+                    InvalidInput,
+                    format!("set_batched: write range [{a_off}, {a_end}) overlaps [{b_off}, ...)")
                 ));
             }
         }
@@ -3856,7 +3875,19 @@ impl BStack {
         loop {
             match f(feedback) {
                 Some(BStackGenOp::Read { offset, buf }) => {
-                    feedback = inplace_overlay_read(file, data_size, offset, buf, &overlay);
+                    // Validate first so a bad range still beats an injected
+                    // fault, then let the policy stand in for the read itself.
+                    // Unlike `process_gen`, a failed `Read` here does not end
+                    // the call: it is reported to the generator through its
+                    // `feedback` argument, so an injected fault must take the
+                    // same route as a genuine one.
+                    feedback = match inplace_validate_read(offset, buf.len() as u64, data_size) {
+                        Err(e) => Err(e),
+                        Ok(()) => match fault_probe!(self, "inplace_gen:read") {
+                            Some(e) => Err(e),
+                            None => inplace_overlay_read(file, data_size, offset, buf, &overlay),
+                        },
+                    };
                 }
                 Some(BStackGenOp::Write { offset, data }) => {
                     feedback = inplace_validate_write(offset, data, data_size, locked);
@@ -3874,45 +3905,45 @@ impl BStack {
                     return source.map_or(Ok(()), Err);
                 }
                 Some(BStackGenOp::Swap { .. }) => {
-                    feedback = Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "inplace_gen: Swap is not permitted (Read/Write/Len only)",
+                    feedback = Err(io_error!(
+                        InvalidInput,
+                        "inplace_gen: Swap is not permitted (Read/Write/Len only)"
                     ));
                 }
                 Some(BStackGenOp::Push { .. }) => {
-                    feedback = Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "inplace_gen: Push is not permitted (in-place writes only)",
+                    feedback = Err(io_error!(
+                        InvalidInput,
+                        "inplace_gen: Push is not permitted (in-place writes only)"
                     ));
                 }
                 Some(BStackGenOp::Pop { .. }) => {
-                    feedback = Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "inplace_gen: Pop is not permitted (in-place writes only)",
+                    feedback = Err(io_error!(
+                        InvalidInput,
+                        "inplace_gen: Pop is not permitted (in-place writes only)"
                     ));
                 }
                 Some(BStackGenOp::Discard { .. }) => {
-                    feedback = Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "inplace_gen: Discard is not permitted (in-place writes only)",
+                    feedback = Err(io_error!(
+                        InvalidInput,
+                        "inplace_gen: Discard is not permitted (in-place writes only)"
                     ));
                 }
                 Some(BStackGenOp::Atrunc { .. }) => {
-                    feedback = Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "inplace_gen: Atrunc is not permitted (in-place writes only)",
+                    feedback = Err(io_error!(
+                        InvalidInput,
+                        "inplace_gen: Atrunc is not permitted (in-place writes only)"
                     ));
                 }
                 Some(BStackGenOp::Splice { .. }) => {
-                    feedback = Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "inplace_gen: Splice is not permitted (in-place writes only)",
+                    feedback = Err(io_error!(
+                        InvalidInput,
+                        "inplace_gen: Splice is not permitted (in-place writes only)"
                     ));
                 }
                 Some(BStackGenOp::Sparse { .. }) => {
-                    feedback = Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "inplace_gen: Sparse is not permitted (in-place writes only)",
+                    feedback = Err(io_error!(
+                        InvalidInput,
+                        "inplace_gen: Sparse is not permitted (in-place writes only)"
                     ));
                 }
                 None => break,
@@ -3977,28 +4008,28 @@ impl BStack {
         let file = &mut guard.0;
         let locked = self.locked.load(Ordering::Acquire);
         if !b_buf.is_empty() && b_offset < locked {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
+            return Err(io_error!(
+                InvalidInput,
                 format!(
                     "eq_crds: B range [{b_offset}, {b_end}) overlaps locked region [0, {locked})"
-                ),
+                )
             ));
         }
         let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
         if !a_expected.is_empty() && a_end > data_size {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
+            return Err(io_error!(
+                InvalidInput,
                 format!(
                     "eq_crds: A range [{a_offset}, {a_end}) exceeds payload size ({data_size})"
-                ),
+                )
             ));
         }
         if !b_buf.is_empty() && b_end > data_size {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
+            return Err(io_error!(
+                InvalidInput,
                 format!(
                     "eq_crds: B range [{b_offset}, {b_end}) exceeds payload size ({data_size})"
-                ),
+                )
             ));
         }
         fault_point!(self, "eq_crds");
@@ -4054,28 +4085,28 @@ impl BStack {
         let file = &mut guard.0;
         let locked = self.locked.load(Ordering::Acquire);
         if !b_buf.is_empty() && b_offset < locked {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
+            return Err(io_error!(
+                InvalidInput,
                 format!(
                     "ne_crds: B range [{b_offset}, {b_end}) overlaps locked region [0, {locked})"
-                ),
+                )
             ));
         }
         let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
         if !a_expected.is_empty() && a_end > data_size {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
+            return Err(io_error!(
+                InvalidInput,
                 format!(
                     "ne_crds: A range [{a_offset}, {a_end}) exceeds payload size ({data_size})"
-                ),
+                )
             ));
         }
         if !b_buf.is_empty() && b_end > data_size {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
+            return Err(io_error!(
+                InvalidInput,
                 format!(
                     "ne_crds: B range [{b_offset}, {b_end}) exceeds payload size ({data_size})"
-                ),
+                )
             ));
         }
         fault_point!(self, "ne_crds");
@@ -4129,13 +4160,11 @@ impl BStack {
         let a_expected = a_expected.as_ref();
         let b_buf = b_buf.as_ref();
         if mask.len() != a_expected.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "masked_eq_crds: mask length ({}) != a_expected length ({})",
-                    mask.len(),
-                    a_expected.len()
-                ),
+            return Err(io_error!(
+                InvalidInput,
+                "masked_eq_crds: mask length ({}) != a_expected length ({})",
+                mask.len(),
+                a_expected.len()
             ));
         }
         let a_len = a_expected.len() as u64;
@@ -4154,28 +4183,28 @@ impl BStack {
         let file = &mut guard.0;
         let locked = self.locked.load(Ordering::Acquire);
         if !b_buf.is_empty() && b_offset < locked {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
+            return Err(io_error!(
+                InvalidInput,
                 format!(
                     "masked_eq_crds: B range [{b_offset}, {b_end}) overlaps locked region [0, {locked})"
-                ),
+                )
             ));
         }
         let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
         if !a_expected.is_empty() && a_end > data_size {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
+            return Err(io_error!(
+                InvalidInput,
                 format!(
                     "masked_eq_crds: A range [{a_offset}, {a_end}) exceeds payload size ({data_size})"
-                ),
+                )
             ));
         }
         if !b_buf.is_empty() && b_end > data_size {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
+            return Err(io_error!(
+                InvalidInput,
                 format!(
                     "masked_eq_crds: B range [{b_offset}, {b_end}) exceeds payload size ({data_size})"
-                ),
+                )
             ));
         }
         fault_point!(self, "masked_eq_crds");
@@ -4232,13 +4261,11 @@ impl BStack {
         let a_expected = a_expected.as_ref();
         let b_buf = b_buf.as_ref();
         if mask.len() != a_expected.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "masked_ne_crds: mask length ({}) != a_expected length ({})",
-                    mask.len(),
-                    a_expected.len()
-                ),
+            return Err(io_error!(
+                InvalidInput,
+                "masked_ne_crds: mask length ({}) != a_expected length ({})",
+                mask.len(),
+                a_expected.len()
             ));
         }
         let a_len = a_expected.len() as u64;
@@ -4257,28 +4284,28 @@ impl BStack {
         let file = &mut guard.0;
         let locked = self.locked.load(Ordering::Acquire);
         if !b_buf.is_empty() && b_offset < locked {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
+            return Err(io_error!(
+                InvalidInput,
                 format!(
                     "masked_ne_crds: B range [{b_offset}, {b_end}) overlaps locked region [0, {locked})"
-                ),
+                )
             ));
         }
         let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
         if !a_expected.is_empty() && a_end > data_size {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
+            return Err(io_error!(
+                InvalidInput,
                 format!(
                     "masked_ne_crds: A range [{a_offset}, {a_end}) exceeds payload size ({data_size})"
-                ),
+                )
             ));
         }
         if !b_buf.is_empty() && b_end > data_size {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
+            return Err(io_error!(
+                InvalidInput,
                 format!(
                     "masked_ne_crds: B range [{b_offset}, {b_end}) exceeds payload size ({data_size})"
-                ),
+                )
             ));
         }
         fault_point!(self, "masked_ne_crds");
@@ -4387,17 +4414,17 @@ impl BStack {
         let data_size = file.metadata()?.len().saturating_sub(HEADER_SIZE);
         let current_locked = self.locked.load(Ordering::Relaxed);
         if n < current_locked {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
+            return Err(io_error!(
+                InvalidInput,
                 format!(
                     "lock_up_to: n ({n}) is less than the current locked length ({current_locked})"
-                ),
+                )
             ));
         }
         if n > data_size {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("lock_up_to: n ({n}) exceeds payload size ({data_size})"),
+            return Err(io_error!(
+                InvalidInput,
+                format!("lock_up_to: n ({n}) exceeds payload size ({data_size})")
             ));
         }
         fault_point!(self, "lock_up_to");
@@ -4409,9 +4436,9 @@ impl BStack {
             // cached.  Validate before casting to avoid silent truncation or a
             // panic inside next_power_of_two.
             if n > usize::MAX as u64 {
-                return Err(io::Error::new(
-                    io::ErrorKind::OutOfMemory,
-                    "lock_up_to: locked region too large to cache on this platform",
+                return Err(io_error!(
+                    OutOfMemory,
+                    "lock_up_to: locked region too large to cache on this platform"
                 ));
             }
             let ol = current_locked as usize; // safe: <= n, which was just validated
@@ -4419,9 +4446,9 @@ impl BStack {
             // isize::MAX is the maximum valid allocation size; values above it
             // would also cause next_power_of_two to overflow.
             if nl > isize::MAX as usize {
-                return Err(io::Error::new(
-                    io::ErrorKind::OutOfMemory,
-                    "lock_up_to: locked region too large to cache on this platform",
+                return Err(io_error!(
+                    OutOfMemory,
+                    "lock_up_to: locked region too large to cache on this platform"
                 ));
             }
             let mut cache = self.cache.lock().unwrap();
@@ -4811,10 +4838,7 @@ impl<'a> io::Seek for BStackReader<'a> {
             SeekFrom::Current(n) => self.offset as i128 + n as i128,
         };
         if new_offset < 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "seek before beginning of payload",
-            ));
+            return Err(io_error!(InvalidInput, "seek before beginning of payload"));
         }
         self.offset = new_offset as u64;
         Ok(self.offset)

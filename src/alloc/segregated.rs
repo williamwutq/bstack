@@ -178,12 +178,7 @@ impl SegregatedBStackAllocator {
     fn phys_need(len: u64) -> io::Result<u64> {
         let n = len
             .checked_add(Self::OVERHEAD + Self::QUANTUM - 1)
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "allocation length overflows u64",
-                )
-            })?;
+            .ok_or_else(|| io_error!(InvalidInput, "allocation length overflows u64"))?;
         Ok(n & !(Self::QUANTUM - 1))
     }
 
@@ -250,9 +245,9 @@ impl SegregatedBStackAllocator {
     #[inline]
     fn block_start_of(ptr: u64) -> io::Result<u64> {
         if ptr < Self::ARENA_START + Self::OVERHEAD || ptr % Self::QUANTUM != Self::OVERHEAD {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "slice start is not a valid block pointer",
+            return Err(io_error!(
+                InvalidInput,
+                "slice start is not a valid block pointer"
             ));
         }
         Ok(ptr - Self::OVERHEAD)
@@ -289,18 +284,18 @@ impl SegregatedBStackAllocator {
         // Reopen an existing file
         let stack_len = stack.len()?;
         if stack_len < Self::FREE_HEAD_BASE {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "stack too short to contain allocator header",
+            return Err(io_error!(
+                UnexpectedEof,
+                "stack too short to contain allocator header"
             ));
         }
 
         let mut magic = [0u8; 8];
         stack.get_into(Self::OFFSET_SIZE, &mut magic)?;
         if magic[..ALSG_MAGIC_PREFIX.len()] != ALSG_MAGIC_PREFIX {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid magic: not a SegregatedBStackAllocator file of the expected version",
+            return Err(io_error!(
+                InvalidData,
+                "invalid magic: not a SegregatedBStackAllocator file of the expected version"
             ));
         }
         if stack_len < Self::ARENA_START {
@@ -309,9 +304,9 @@ impl SegregatedBStackAllocator {
             let _ = stack.extend(needed)?;
         } else if (stack_len - Self::ARENA_START) % Self::QUANTUM != 0 {
             // Every block is a multiple of QUANTUM, so the arena byte count is too.
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "arena is not a multiple of the block quantum",
+            return Err(io_error!(
+                UnexpectedEof,
+                "arena is not a multiple of the block quantum"
             ));
         }
         let allocator = Self {
@@ -920,24 +915,21 @@ impl BStackAllocator for SegregatedBStackAllocator {
             let block_start = Self::block_start_of(start)?;
             let word = u64::from_le_bytes(read_bstack!(self.stack, block_start => u64));
             if word & Self::IN_USE_BIT == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "double free: block is already free",
+                return Err(io_error!(
+                    InvalidInput,
+                    "double free: block is already free"
                 ));
             }
             let size = (word & !Self::IN_USE_BIT) << 4;
             if Self::phys_need(len)? > size {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "cannot free a mismatched slice",
-                ));
+                return Err(io_error!(InvalidInput, "cannot free a mismatched slice"));
             }
             let class = Self::classify(size);
 
             if size > Self::MAX_CLASS {
-                let end = block_start.checked_add(size).ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "block end overflows u64")
-                })?;
+                let end = block_start
+                    .checked_add(size)
+                    .ok_or_else(|| io_error!(InvalidInput, "block end overflows u64"))?;
                 // Oversized tail block: hand its bytes back to the stack instead of
                 // the free list. Under `atomic`, `try_discard` fuses the tail check
                 // and the drop; otherwise check `len` then `discard`.
@@ -1750,17 +1742,11 @@ impl SegregatedBStackAllocator {
         let result = (|| -> io::Result<BStackOwnedSlice<'a, Self>> {
             let word = u64::from_le_bytes(read_bstack!(self.stack, block_start => u64));
             if word & Self::IN_USE_BIT == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "cannot realloc a freed block",
-                ));
+                return Err(io_error!(InvalidInput, "cannot realloc a freed block"));
             }
             let old_size = (word & !Self::IN_USE_BIT) << 4;
             if Self::phys_need(old_len)? > old_size {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "cannot realloc a mismatched slice",
-                ));
+                return Err(io_error!(InvalidInput, "cannot realloc a mismatched slice"));
             }
             let new_need = Self::phys_need(new_len)?;
             let new_size = Self::class_blocksize(new_need);
@@ -2047,9 +2033,9 @@ impl BStackInPlaceResizeAllocator for SegregatedBStackAllocator {
         // supported for any `(prepend, append)` (see the trait's "Empty handles").
         if slice.is_empty() {
             return Err(BStackAllocError::with_handle(
-                io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "realloc_inplace: cannot resize an empty handle in place",
+                io_error!(
+                    Unsupported,
+                    "realloc_inplace: cannot resize an empty handle in place"
                 ),
                 slice,
             ));
@@ -2066,9 +2052,9 @@ impl BStackInPlaceResizeAllocator for SegregatedBStackAllocator {
             Some(n) if n >= 0 => n as u64,
             _ => {
                 return Err(BStackAllocError::with_handle(
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "realloc_inplace: resulting length is negative or overflows",
+                    io_error!(
+                        InvalidInput,
+                        "realloc_inplace: resulting length is negative or overflows"
                     ),
                     slice,
                 ));
@@ -2079,9 +2065,9 @@ impl BStackInPlaceResizeAllocator for SegregatedBStackAllocator {
         // would relocate the block — never supported here (see the trait docs).
         if prepend != 0 {
             return Err(BStackAllocError::with_handle(
-                io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "realloc_inplace: cannot move the front edge of a segregated block in place",
+                io_error!(
+                    Unsupported,
+                    "realloc_inplace: cannot move the front edge of a segregated block in place"
                 ),
                 slice,
             ));
@@ -2115,17 +2101,11 @@ impl BStackInPlaceResizeAllocator for SegregatedBStackAllocator {
         let result = (|| -> io::Result<BStackOwnedSlice<'a, Self>> {
             let word = u64::from_le_bytes(read_bstack!(self.stack, block_start => u64));
             if word & Self::IN_USE_BIT == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "cannot realloc a freed block",
-                ));
+                return Err(io_error!(InvalidInput, "cannot realloc a freed block"));
             }
             let old_size = (word & !Self::IN_USE_BIT) << 4;
             if Self::phys_need(old_len)? > old_size {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "cannot realloc a mismatched slice",
-                ));
+                return Err(io_error!(InvalidInput, "cannot realloc a mismatched slice"));
             }
             let new_need = Self::phys_need(new_len)?;
             if new_need > old_size {
@@ -2140,9 +2120,9 @@ impl BStackInPlaceResizeAllocator for SegregatedBStackAllocator {
                     // SAFETY: block extended in place to the new class at the tail.
                     return Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, start, new_len) });
                 }
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "realloc_inplace: back grow would relocate a non-tail block",
+                return Err(io_error!(
+                    Unsupported,
+                    "realloc_inplace: back grow would relocate a non-tail block"
                 ));
             }
             self.resize_in_block(block_start, start, old_len, new_len, old_size, true)

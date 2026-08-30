@@ -9007,7 +9007,7 @@ mod atomic_tests {
                         data: bstack_unsafe_reborrow!(&b[..]),
                     }),
                     _ => Some(BStackGenOp::Abort {
-                        source: Some(std::io::Error::new(ErrorKind::Other, "gave up")),
+                        source: Some(io_error!(Other, "gave up")),
                     }),
                 };
                 step += 1;
@@ -9051,7 +9051,7 @@ mod atomic_tests {
                         data: bstack_unsafe_reborrow!(&far[..]),
                     }),
                     _ => Some(BStackGenOp::Abort {
-                        source: Some(std::io::Error::new(ErrorKind::InvalidInput, "rejected op")),
+                        source: Some(io_error!(InvalidInput, "rejected op")),
                     }),
                 };
                 step += 1;
@@ -9110,7 +9110,7 @@ mod atomic_tests {
                         buf: bstack_unsafe_reborrow_mut!(&mut rbuf[..]),
                     }),
                     _ => Some(BStackGenOp::Abort {
-                        source: Some(std::io::Error::new(ErrorKind::Other, "read says no")),
+                        source: Some(io_error!(Other, "read says no")),
                     }),
                 };
                 step += 1;
