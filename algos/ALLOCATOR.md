@@ -490,12 +490,12 @@ class head.
 
 ### Bulk operations (`atomic` feature)
 
-With `atomic`, implements `BStackBulkAllocator`; work is bounded by the distinct classes touched (≤ 33), not by the request count. Free-list chases carry cycle detection (a revisited block aborts with no write).
+With `atomic`, implements `BStackBulkAllocator`; work is bounded by the distinct classes touched (≤ 33), not by the request count. Classed chases are bounded by the per-class demand, so a cyclic list cannot loop them; like every classed path they trust the list to be acyclic (the oversized in-use-bit check aside).
 
 | Operation      | Strategy                                                                                                                                        |
 |----------------|------------------------------------------------------------------------------------------------------------------------------------------------|
-| `alloc_bulk`   | Count classed requests by class and drain every touched class's free list in one atomic multi-class pop (`inplace_gen`: read every chain, then advance every head — a failure pops nothing); detach the oversized list whole and assign each free block to the largest request it fits, carving a block whose slack reaches `SPLIT_MIN` (freeing the remainder) and re-splicing the unmatched; serve the remaining misses from one `extend_sparse_batched` that writes each fresh block's *free* overhead (self-describing tail); mark in-use + scrub in one `set_batched` |
-| `dealloc_bulk` | Validate/reject double-frees (incl. a block twice in the batch); group freed blocks by class, stage each class's chain in one `set_batched`, and splice each onto its class head with one `cross_exchange` |
+| `alloc_bulk`   | Count classed requests by class and drain every touched class's free list in one atomic multi-class pop (`inplace_gen`: read every chain, then advance every head — a failure pops nothing); match oversized requests largest-first against the oversized list, chasing only the prefix needed to satisfy them all (`process_gen`, rejecting an in-use block on the list), carving a matched block whose slack reaches `SPLIT_MIN` (freeing the remainder) and re-splicing prefix blocks that fit nothing; serve the remaining misses from one `extend_sparse_batched` that writes each fresh block's *free* overhead (self-describing tail); mark in-use + scrub in one `set_batched`, one contiguous entry per block |
+| `dealloc_bulk` | Read every handle's overhead in one `get_batched_gen` lock; validate/reject double-frees (incl. a block twice in the batch); group freed blocks by class, stage each class's chain in one `set_batched`, and splice each onto its class head with one `cross_exchange` |
 
 Blocks pulled from the free lists are left free-tagged until the final claim, so a crash leaves them reclaimable by `recover`; the freshly extended tail is free-tagged too (its blocks carry a *free* overhead word, so `recover` relinks them rather than mistaking a mid-arena zero hole for an orphaned tail to truncate). On an I/O failure the fresh tail is discarded first and the detached blocks re-pushed to their class lists, both best-effort.
 
