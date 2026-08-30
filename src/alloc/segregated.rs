@@ -1115,15 +1115,15 @@ impl SegregatedBStackAllocator {
     /// back in **one** [`splice_class_chain`](Self::splice_class_chain) (one
     /// `set_batched` + one `cross_exchange`) rather than one `push` per block.
     /// Errors are swallowed — a block that cannot be re-pushed is a free-tagged
-    /// leak `recover` reclaims.
-    fn repush_detached(&self, blocks: &[(u64, u64)]) {
+    /// leak `recover` reclaims. Sorts `blocks` in place (the caller no longer needs
+    /// its order), so no working copy is allocated.
+    fn repush_detached(&self, blocks: &mut [(u64, u64)]) {
         if blocks.is_empty() {
             return;
         }
-        // Bucket by class without a Vec-per-class: sort one working copy by class
-        // (classify recomputed on demand, so no `(class, off, size)` triple), then
-        // splice each contiguous run straight from a sub-slice.
-        let mut blocks = blocks.to_vec();
+        // Bucket by class without a Vec-per-class: sort by class in place (classify
+        // recomputed on demand, so no `(class, off, size)` triple), then splice
+        // each contiguous run straight from a sub-slice.
         blocks.sort_unstable_by_key(|&(_, size)| Self::classify(size));
         let mut i = 0usize;
         while i < blocks.len() {
@@ -1372,8 +1372,10 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
             // zero-length requests simply keep theirs.
             let mut result: Vec<BStackOwnedSlice<'_, Self>> =
                 (0..n).map(|_| BStackOwnedSlice::empty(self)).collect();
-            // Every claim the final `set_batched` applies, tagged by kind.
-            let mut claims: Vec<(u64, u64, ClaimKind)> = Vec::new(); // (offset, size, kind)
+            // Every claim the final `set_batched` applies, tagged by kind. Each
+            // non-zero request contributes at least one claim (carve remainders add
+            // a bounded few more), so `n` is a good starting capacity.
+            let mut claims: Vec<(u64, u64, ClaimKind)> = Vec::with_capacity(n); // (offset, size, kind)
             let mut to_splice: Vec<(u64, u64)> = Vec::new(); // free blocks to relink (best-effort)
 
             // 1. Atomic classed pop across all touched classes. `popped` is
@@ -1404,8 +1406,9 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
                 taken[c] += 1;
                 // SAFETY: a live block just popped; its data region begins at
                 // `bs + OVERHEAD` (claimed below) and spans `lengths[i]` bytes.
-                result[i] =
-                    unsafe { BStackOwnedSlice::from_raw_parts(self, bs + Self::OVERHEAD, lengths[i]) };
+                result[i] = unsafe {
+                    BStackOwnedSlice::from_raw_parts(self, bs + Self::OVERHEAD, lengths[i])
+                };
                 detached.push((bs, size));
                 claims.push((bs, size, ClaimKind::Reuse));
             }
@@ -1417,19 +1420,24 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
                 // so sort it in place rather than cloning.
                 let reqs = &mut oversized_reqs;
                 reqs.sort_unstable_by(|&x, &y| block_of[y].cmp(&block_of[x]));
-                let mut matched = vec![false; reqs.len()];
                 for &(boff, bsize) in &free_blocks {
                     let mut used = false;
-                    for (ri, &req) in reqs.iter().enumerate() {
-                        if !matched[ri] && block_of[req] <= bsize {
+                    // A request whose slice is still null has not been matched yet,
+                    // so `result[req].is_empty()` is the "unmatched" test — no
+                    // separate `matched` bitmap.
+                    for &req in reqs.iter() {
+                        if result[req].is_empty() && block_of[req] <= bsize {
                             let block = block_of[req];
                             // SAFETY: `boff` is a live oversized block; data begins
                             // at `boff + OVERHEAD` (claimed below), spanning
                             // `lengths[req]` bytes.
                             result[req] = unsafe {
-                                BStackOwnedSlice::from_raw_parts(self, boff + Self::OVERHEAD, lengths[req])
+                                BStackOwnedSlice::from_raw_parts(
+                                    self,
+                                    boff + Self::OVERHEAD,
+                                    lengths[req],
+                                )
                             };
-                            matched[ri] = true;
                             // Rollback frees the whole block (nothing is carved
                             // until the claim commits).
                             detached.push((boff, bsize));
@@ -1470,8 +1478,10 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
             }
 
             // 3. Misses (classed short + unmatched oversized): one extend that
-            //    writes each fresh block's free overhead (self-describing tail).
-            let mut misses: Vec<usize> = Vec::new();
+            //    writes each fresh block's free overhead (self-describing tail). A
+            //    miss is a non-zero request still holding its null slice —
+            //    `block_of[i] > 0 && result[i].is_empty()` — recomputed at each pass
+            //    rather than materialised into a `Vec`.
             let mut total_ext = 0u64;
             for i in 0..n {
                 if block_of[i] > 0 && result[i].is_empty() {
@@ -1481,33 +1491,37 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
                             "alloc_bulk: total allocation size overflows u64",
                         )
                     })?;
-                    misses.push(i);
                 }
             }
             if total_ext > 0 {
                 // Each fresh block's free overhead, laid out back-to-back from the
                 // extend base. `[u8; 8]` is `AsRef<[u8]>`, so the writes are yielded
-                // by value — no `rels`/`oh_bufs` parallel Vecs.
-                let writes = misses.iter().scan(0u64, |rel, &i| {
-                    let off = *rel;
-                    let size = block_of[i];
-                    *rel += size;
-                    let mut oh = [0u8; 8];
-                    write_buf!(size >> 4 => oh, 0); // free tag: high bit clear
-                    Some((off, oh))
-                });
+                // by value; `extend_sparse_batched` consumes the iterator (releasing
+                // its shared borrow of `result`) before the assign loop below.
+                let writes = (0..n)
+                    .filter(|&i| block_of[i] > 0 && result[i].is_empty())
+                    .scan(0u64, |rel, i| {
+                        let off = *rel;
+                        let size = block_of[i];
+                        *rel += size;
+                        let mut oh = [0u8; 8];
+                        write_buf!(size >> 4 => oh, 0); // free tag: high bit clear
+                        Some((off, oh))
+                    });
                 ext_base = self.stack.extend_sparse_batched(writes, total_ext)?;
                 ext_bytes = total_ext;
                 let mut rel = 0u64;
-                for &i in &misses {
-                    let abs = ext_base + rel;
-                    // SAFETY: freshly extended block; data begins at `abs + OVERHEAD`
-                    // (claimed below), spanning `lengths[i]` bytes.
-                    result[i] = unsafe {
-                        BStackOwnedSlice::from_raw_parts(self, abs + Self::OVERHEAD, lengths[i])
-                    };
-                    claims.push((abs, block_of[i], ClaimKind::Fresh)); // flip in-use
-                    rel += block_of[i];
+                for i in 0..n {
+                    if block_of[i] > 0 && result[i].is_empty() {
+                        let abs = ext_base + rel;
+                        // SAFETY: freshly extended block; data begins at `abs +
+                        // OVERHEAD` (claimed below), spanning `lengths[i]` bytes.
+                        result[i] = unsafe {
+                            BStackOwnedSlice::from_raw_parts(self, abs + Self::OVERHEAD, lengths[i])
+                        };
+                        claims.push((abs, block_of[i], ClaimKind::Fresh)); // flip in-use
+                        rel += block_of[i];
+                    }
                 }
             }
 
@@ -1547,7 +1561,7 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
             // 5. Relink the now-free carve remainders and unmatched oversized
             //    blocks. Best-effort: the allocations are already valid, and a
             //    block left unspliced stays free-tagged (reclaimed by `recover`).
-            self.repush_detached(&to_splice);
+            self.repush_detached(&mut to_splice);
 
             // `result` was filled in place as blocks were assigned.
             Ok(result)
@@ -1560,7 +1574,7 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
             if ext_bytes > 0 {
                 let _ = self.stack.try_discard(ext_base + ext_bytes, ext_bytes);
             }
-            self.repush_detached(&detached);
+            self.repush_detached(&mut detached);
         })
     }
 
