@@ -2428,6 +2428,33 @@ mod fault_tests {
         d.write([8u8; 64]).unwrap();
         assert_eq!(d.read().unwrap(), vec![8u8; 64]);
     }
+
+    // `dealloc` reads the block header's flags to reject a double free before it
+    // touches the free list. A fault there leaves the block live and returns it.
+    #[test]
+    fn dealloc_double_free_check_read_fault_returns_handle() {
+        let path = temp_path("ff_read");
+        let _g = Guard(path.clone());
+        let alloc = FirstFitBStackAllocator::new(BStack::open(&path).unwrap()).unwrap();
+
+        let mut s = alloc.alloc(48).unwrap();
+        s.write([2u8; 48]).unwrap();
+        let (start, len) = (s.start(), s.len());
+
+        arm(&alloc, FailOpAt::new("get_into", 0, ErrorKind::Other));
+        let err = alloc
+            .dealloc(s)
+            .expect_err("dealloc must fail when the flags read faults");
+        disarm(&alloc);
+
+        assert_eq!(err.source.kind(), ErrorKind::Other);
+        let handle = err
+            .handle
+            .expect("the double-free check precedes every mutation");
+        assert_eq!((handle.start(), handle.len()), (start, len));
+        assert_eq!(handle.read().unwrap(), vec![2u8; 48], "data must be intact");
+        alloc.dealloc(handle).unwrap();
+    }
 }
 
 // In-place resize (`BStackInPlaceResizeAllocator`) and owned-slice subslice/join.

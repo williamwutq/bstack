@@ -574,6 +574,31 @@ mod fault_tests {
         // Retrying the free (unarmed) reclaims the tail cleanly.
         alloc.dealloc(handle).unwrap();
     }
+
+    // `realloc` reads the payload size to decide whether the handle is still at
+    // the tail. That read precedes every mutation, so faulting it must hand the
+    // original handle back readable.
+    #[test]
+    fn realloc_tail_check_read_fault_returns_handle() {
+        let path = temp_path("linear_read");
+        let _g = Guard(path.clone());
+        let alloc = LinearBStackAllocator::new(BStack::open(&path).unwrap());
+
+        let mut s = alloc.alloc(32).unwrap();
+        s.write([9u8; 32]).unwrap();
+        let (start, len) = (s.start(), s.len());
+
+        arm(&alloc, FailOpAt::new("len", 0, ErrorKind::Other));
+        let err = alloc
+            .realloc(s, 64)
+            .expect_err("realloc must fail when the tail check faults");
+        disarm(&alloc);
+
+        assert_eq!(err.source.kind(), ErrorKind::Other);
+        let handle = err.handle.expect("the tail check precedes every mutation");
+        assert_eq!((handle.start(), handle.len()), (start, len));
+        assert_eq!(handle.read().unwrap(), vec![9u8; 32], "data must be intact");
+    }
 }
 
 // In-place resize (`BStackInPlaceResizeAllocator`): tail-only for a bump allocator.

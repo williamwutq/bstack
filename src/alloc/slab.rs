@@ -2538,3 +2538,58 @@ mod fault_tests {
         assert_eq!(c.read().unwrap(), vec![6u8; BLOCK as usize]);
     }
 }
+
+// The free-list head chase is the one metadata read that has no home in
+// `fault_tests` above: that module is `not(atomic)` by design, and under `atomic`
+// the chase runs inside a single `process_gen`, where the head read is a step
+// within the sequence rather than a `BStack` call of its own. Faulting it needs
+// the per-step `"process_gen:read"` op, so the test is gated the other way.
+#[cfg(all(
+    test,
+    debug_assertions,
+    feature = "fault-injection",
+    feature = "set",
+    feature = "atomic"
+))]
+mod read_fault_tests {
+    use super::SlabBStackAllocator;
+    use crate::BStack;
+    use crate::alloc::BStackAllocator;
+    use crate::alloc_fuzz::common::{Guard, policies::FailOpAt, temp_path};
+    use crate::fault::FaultPolicy;
+    use std::io::ErrorKind;
+    use std::sync::Arc;
+
+    const SIZE: u64 = 64;
+
+    // `alloc` chases the free-list head before deciding to recycle or extend.
+    // Faulting that read must leave the freed block on the list, still reachable
+    // by the next `alloc`.
+    #[test]
+    fn alloc_free_list_head_read_fault_leaves_block_reusable() {
+        let path = temp_path("slab_chase");
+        let _g = Guard(path.clone());
+        let alloc = SlabBStackAllocator::new(BStack::open(&path).unwrap(), SIZE).unwrap();
+
+        let s = alloc.alloc(SIZE).unwrap();
+        let freed = s.start();
+        // A single block never takes the tail-discard path.
+        alloc.dealloc(s).unwrap();
+
+        let policy: Arc<dyn FaultPolicy> =
+            Arc::new(FailOpAt::new("process_gen:read", 0, ErrorKind::Other));
+        alloc.stack().set_fault_policy(Some(policy));
+        let err = alloc
+            .alloc(SIZE)
+            .expect_err("alloc must fail when the head read faults");
+        alloc.stack().set_fault_policy(None);
+        assert_eq!(err.kind(), ErrorKind::Other);
+
+        let reused = alloc.alloc(SIZE).unwrap();
+        assert_eq!(
+            reused.start(),
+            freed,
+            "the faulted chase must leave the block on the free list"
+        );
+    }
+}
