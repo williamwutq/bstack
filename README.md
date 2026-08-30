@@ -958,6 +958,15 @@ pub trait BStackBulkAllocator: BStackAllocator {
 carries `source: A::Error` plus `handles: Vec<A::Allocated<'a>>`, the handles
 still owned by the caller after a failed bulk free.
 
+`LinearBStackAllocator` and `GhostTreeBstackAllocator` implement the trait;
+`SlabBStackAllocator` and `CheckedSlabBStackAllocator` implement it with the
+`atomic` feature (both commit through `set_batched`/`inplace_gen`/`cross_exchange`,
+which require `atomic`), and `DebugCheckingAllocator` forwards it. Each slab
+request becomes an independently-freeable handle rather than one sliced block:
+`alloc_bulk` draws single-block requests from the free list first, then serves
+oversized runs and any overflow from one tail extend; `dealloc_bulk` returns the
+whole batch to the free list as a single spliced chain.
+
 ### `BStackUninitAllocator` trait
 
 An opt-in extension trait for `BStackAllocator` that adds uninitialised
@@ -1237,7 +1246,8 @@ With `atomic`: `Send + Sync` via an internal `Mutex`.
 Fixed `block_size` slab; singly-linked free list; zero per-block overhead.
 Constructors: `new(stack, block_size)` for a fresh stack, `open(stack)` to
 reattach.  Without `atomic`: `Send` only.  With `atomic`: `Send + Sync` with
-no allocator-level lock (uses `BStack::process_gen` / `cross_exchange`).
+no allocator-level lock (uses `BStack::process_gen` / `cross_exchange`), and
+additionally implements `BStackBulkAllocator` (`alloc_bulk`/`dealloc_bulk`).
 
 ### `CheckedSlabBStackAllocator` (`alloc + set`)
 
@@ -1245,7 +1255,9 @@ Like `SlabBStackAllocator` but each block has an 8-byte overhead tag that
 catches double-frees immediately and allows full recovery after a crash.
 Constructor takes `data_size` (usable bytes per block; physical = `data_size + 8`).
 `open` runs `recover()` automatically.  Without `atomic`: `Send` only.  With
-`atomic`: `Send + Sync` (same lock-free strategy as `SlabBStackAllocator`).
+`atomic`: `Send + Sync` (same lock-free strategy as `SlabBStackAllocator`), and
+additionally implements `BStackBulkAllocator` (`alloc_bulk`/`dealloc_bulk`;
+freed batches leave only `recover`-reclaimable leaks on a crash).
 
 ### `SegregatedBStackAllocator` (**experimental**, `alloc + set`)
 

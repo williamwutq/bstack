@@ -35,7 +35,10 @@
 //!
 //! * [`BStackBulkAllocator`] — extension trait for atomic bulk
 //!   [`alloc_bulk`](BStackBulkAllocator::alloc_bulk) /
-//!   [`dealloc_bulk`](BStackBulkAllocator::dealloc_bulk).
+//!   [`dealloc_bulk`](BStackBulkAllocator::dealloc_bulk).  Implemented by
+//!   [`LinearBStackAllocator`] and [`GhostTreeBstackAllocator`]; by
+//!   [`SlabBStackAllocator`] and [`CheckedSlabBStackAllocator`] with the
+//!   `atomic` feature; forwarded by [`DebugCheckingAllocator`].
 //!
 //! * [`BStackUninitAllocator`] — opt-in extension trait for allocators with a
 //!   cheaper uninitialised path.  [`alloc_uninit`](BStackUninitAllocator::alloc_uninit) /
@@ -74,10 +77,11 @@
 //!   `Send` in all configurations; `Send + Sync` with `atomic`.
 //!
 //! * [`SlabBStackAllocator`] — fixed-block slab allocator (`alloc` + `set`).
-//!   O(1) alloc/dealloc.
+//!   O(1) alloc/dealloc; bulk `alloc_bulk`/`dealloc_bulk` with `atomic`.
 //!
 //! * [`CheckedSlabBStackAllocator`] — crash-recoverable slab variant (`alloc` + `set`).
-//!   8-byte per-block header tracks state; double-frees caught.
+//!   8-byte per-block header tracks state; double-frees caught; bulk
+//!   `alloc_bulk`/`dealloc_bulk` with `atomic`.
 //!
 //! * [`SegregatedBStackAllocator`] — **experimental** segregated (binned)
 //!   free-list allocator (`alloc` + `set`).  Generalises the checked slab to 33

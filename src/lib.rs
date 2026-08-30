@@ -509,7 +509,8 @@
 //!   the first 8 bytes of each free block.  O(1) alloc and dealloc.
 //!   Use [`SlabBStackAllocator::new`] to initialise an empty stack and
 //!   [`SlabBStackAllocator::open`] to reopen an existing one.
-//!   Requires both `alloc` and `set` features.
+//!   Requires both `alloc` and `set` features; with `atomic` additionally
+//!   implements [`BStackBulkAllocator`] (`alloc_bulk`/`dealloc_bulk`).
 //!
 //! * [`CheckedSlabBStackAllocator`] — Crash-recoverable
 //!   variant of [`SlabBStackAllocator`].  Prefixes every block with an 8-byte
@@ -521,7 +522,8 @@
 //!   an empty stack and [`CheckedSlabBStackAllocator::open`] to reopen one
 //!   ([`open`](CheckedSlabBStackAllocator::open) runs
 //!   [`recover`](CheckedSlabBStackAllocator::recover) automatically).
-//!   Requires both `alloc` and `set` features.
+//!   Requires both `alloc` and `set` features; with `atomic` additionally
+//!   implements [`BStackBulkAllocator`] (`alloc_bulk`/`dealloc_bulk`).
 //!
 //! * [`SegregatedBStackAllocator`] — **experimental** segregated (binned)
 //!   free-list allocator.  Generalises [`CheckedSlabBStackAllocator`] from one
