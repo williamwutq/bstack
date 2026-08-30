@@ -4321,12 +4321,473 @@ static int slab_vtbl_realloc(bstack_allocator_t *base, bstack_slice_t s,
     }
 }
 
+#ifndef BSTACK_FEATURE_ATOMIC
 static const bstack_allocator_vtbl_t slab_allocator_vtbl = {
     slab_vtbl_stack,
     slab_vtbl_alloc,
     slab_vtbl_realloc,
     slab_vtbl_dealloc,
 };
+#endif
+
+/* ---- bulk (BStackBulkAllocator), atomic only --------------------------- */
+#ifdef BSTACK_FEATURE_ATOMIC
+
+/*
+ * Chase up to `want` blocks off the free list under one bstack_process_gen,
+ * advancing free_head once past the last popped block. Fills popped[] (caller
+ * array of at least `want`) and *out_count. Blocks are left detached but not
+ * scrubbed (the caller scrubs them). A revisited block (a cycle in a corrupt
+ * list) aborts with no write and fails with EINVAL. process_gen propagates any
+ * read error directly.
+ */
+struct slab_pop_bulk_ctx {
+    uint64_t *popped;
+    size_t    want;
+    size_t    count;
+    uint64_t  cursor;
+    uint8_t   head_buf[8];
+    uint8_t   next_buf[8];
+    int       phase;
+    int       cycle;
+};
+
+enum { SLB_PH_READ_HEAD, SLB_PH_CONSUME_HEAD, SLB_PH_READ_NODE,
+       SLB_PH_CONSUME_NODE, SLB_PH_DONE };
+
+static int slab_pop_bulk_gen(bstack_gen_op_t *op, void *uc)
+{
+    struct slab_pop_bulk_ctx *c = uc;
+    for (;;) {
+        switch (c->phase) {
+        case SLB_PH_READ_HEAD:
+            c->phase = SLB_PH_CONSUME_HEAD;
+            op->kind = BSTACK_GEN_READ;
+            op->u.read.offset = SLAB_FREE_HEAD_OFFSET;
+            op->u.read.buf = c->head_buf; op->u.read.len = 8;
+            return 1;
+        case SLB_PH_CONSUME_HEAD: {
+            uint64_t head = read_le64(c->head_buf);
+            if (head == SLAB_SENTINEL) return 0; /* empty: no write */
+            c->cursor = head;
+            c->phase = SLB_PH_READ_NODE;
+            break;
+        }
+        case SLB_PH_READ_NODE: {
+            size_t i;
+            for (i = 0; i < c->count; i++)
+                if (c->popped[i] == c->cursor) { c->cycle = 1; return 0; }
+            c->phase = SLB_PH_CONSUME_NODE;
+            op->kind = BSTACK_GEN_READ;
+            op->u.read.offset = c->cursor;
+            op->u.read.buf = c->next_buf; op->u.read.len = 8;
+            return 1;
+        }
+        case SLB_PH_CONSUME_NODE: {
+            uint64_t next;
+            c->popped[c->count++] = c->cursor;
+            next = read_le64(c->next_buf);
+            if (c->count == c->want || next == SLAB_SENTINEL) {
+                c->phase = SLB_PH_DONE;
+                op->kind = BSTACK_GEN_WRITE;
+                op->u.write.offset = SLAB_FREE_HEAD_OFFSET;
+                op->u.write.data = c->next_buf; op->u.write.len = 8;
+                return 1;
+            }
+            c->cursor = next;
+            c->phase = SLB_PH_READ_NODE;
+            break;
+        }
+        default:
+            return 0;
+        }
+    }
+}
+
+static int slab_pop_free_blocks_bulk(bstack_t *bs, size_t want,
+                                     uint64_t *popped, size_t *out_count)
+{
+    struct slab_pop_bulk_ctx c;
+    if (want == 0) { *out_count = 0; return 0; }
+    memset(&c, 0, sizeof c);
+    c.popped = popped; c.want = want; c.phase = SLB_PH_READ_HEAD;
+    if (bstack_process_gen(bs, slab_pop_bulk_gen, &c) != 0) return -1;
+    if (c.cycle) { errno = EINVAL; return -1; }
+    *out_count = c.count;
+    return 0;
+}
+
+/* Scrub each block in blocks[] to zero in one bstack_set_batched-backed
+ * inplace_gen, reusing one zero buffer. */
+struct slab_scrub_ctx {
+    const uint64_t *blocks;
+    size_t          count;
+    size_t          i;
+    const uint8_t  *zero;
+    uint64_t        block_size;
+};
+
+static int slab_scrub_gen(bstack_gen_op_t *op, void *uc)
+{
+    struct slab_scrub_ctx *c = uc;
+    if (c->i >= c->count) return 0;
+    op->kind = BSTACK_GEN_WRITE;
+    op->u.write.offset = c->blocks[c->i++];
+    op->u.write.data = c->zero;
+    op->u.write.len = (size_t)c->block_size;
+    return 1;
+}
+
+static int slab_scrub_blocks(bstack_t *bs, uint64_t block_size,
+                             const uint64_t *blocks, size_t count)
+{
+    struct slab_scrub_ctx c;
+    uint8_t *zero;
+    int r;
+    if (count == 0) return 0;
+    zero = calloc(1, (size_t)block_size);
+    if (!zero) { errno = ENOMEM; return -1; }
+    c.blocks = blocks; c.count = count; c.i = 0;
+    c.zero = zero; c.block_size = block_size;
+    r = bstack_inplace_gen(bs, slab_scrub_gen, &c, NULL);
+    free(zero);
+    return r;
+}
+
+/* Splice blocks[] onto the free list as one chain: stage every next-pointer
+ * with one bstack_set_batched (unreachable until spliced), then splice with one
+ * bstack_cross_exchange. */
+static int slab_splice_blocks_onto_free_list(bstack_t *bs,
+                                             const uint64_t *blocks, size_t count)
+{
+    bstack_iovec_t *iov;
+    uint8_t *nexts;
+    size_t i;
+    int r;
+    if (count == 0) return 0;
+    iov = malloc(count * sizeof *iov);
+    nexts = malloc(count * 8);
+    if (!iov || !nexts) { free(iov); free(nexts); errno = ENOMEM; return -1; }
+    for (i = 0; i < count; i++) {
+        uint64_t next = (i + 1 < count) ? blocks[i + 1] : blocks[0];
+        write_le64(nexts + i * 8, next);
+        iov[i].offset = blocks[i];
+        iov[i].buf = nexts + i * 8;
+        iov[i].len = 8;
+    }
+    r = bstack_set_batched(bs, iov, count);
+    free(iov); free(nexts);
+    if (r != 0) return -1;
+    return bstack_cross_exchange(bs, blocks[count - 1], SLAB_FREE_HEAD_OFFSET, 8);
+}
+
+/* Best-effort cleanup after an alloc_bulk failure: truncate the fresh tail
+ * first, else recycle it onto the free list alongside the popped blocks. */
+static void slab_reclaim_after_alloc_failure(bstack_t *bs, uint64_t block_size,
+                                             const uint64_t *popped, size_t pcount,
+                                             uint64_t ext_base, uint64_t ext_bytes)
+{
+    int truncated = 0;
+    if (ext_bytes == 0) {
+        truncated = 1;
+    } else {
+        int ok = 0;
+        if (bstack_try_discard(bs, ext_base + ext_bytes, (size_t)ext_bytes, &ok) == 0 && ok)
+            truncated = 1;
+    }
+    if (truncated) {
+        (void)slab_splice_blocks_onto_free_list(bs, popped, pcount);
+    } else {
+        uint64_t n_tail = ext_bytes / block_size, k;
+        uint64_t *all = malloc((pcount + (size_t)n_tail) * sizeof *all);
+        if (!all) return; /* leak; free list stays consistent */
+        for (k = 0; k < pcount; k++) all[k] = popped[k];
+        for (k = 0; k < n_tail; k++) all[pcount + k] = ext_base + k * block_size;
+        (void)slab_splice_blocks_onto_free_list(bs, all, pcount + (size_t)n_tail);
+        free(all);
+    }
+}
+
+/*
+ * No-extend fast path: serve an all-single-block request entirely from the free
+ * list in one crash-atomic bstack_inplace_gen (chase + advance free_head +
+ * scrub). Returns 1 (served, out filled), 0 (list too short, nothing written),
+ * or -1 (error: cycle / read failure).
+ */
+struct slab_fast_ctx {
+    bstack_allocator_t *base;
+    const uint64_t     *lens;
+    size_t              n;
+    size_t              singles;
+    uint64_t            block_size;
+    bstack_slice_t     *out;      /* size n, pre-initialised to null slices */
+    uint64_t           *seen;     /* size singles */
+    size_t              seen_count;
+    const uint8_t      *zero;
+    const int          *prev;     /* inplace_gen prev-status pointer */
+    int                 phase;
+    size_t              len_idx;
+    size_t              collected;
+    size_t              claim_idx;
+    uint64_t            cursor;
+    uint8_t             head_buf[8];
+    uint8_t             node_buf[8];
+    int                 enough;
+    int                 cycle;
+    int                 io_err;
+};
+
+enum { SLF_READ_HEAD, SLF_CONSUME_HEAD, SLF_READ_NODE, SLF_CONSUME_NODE,
+       SLF_WRITE_HEAD, SLF_WRITE_CLAIM, SLF_ABORT };
+
+static int slab_fast_gen(bstack_gen_op_t *op, void *uc)
+{
+    struct slab_fast_ctx *c = uc;
+    /* A failed read is reported through prev-status, not a return value, and
+     * leaves the buffer unfilled: bail before consuming stale bytes. */
+    if (c->prev && *c->prev != 0) { c->io_err = *c->prev; return 0; }
+    for (;;) {
+        switch (c->phase) {
+        case SLF_READ_HEAD:
+            c->phase = SLF_CONSUME_HEAD;
+            op->kind = BSTACK_GEN_READ;
+            op->u.read.offset = SLAB_FREE_HEAD_OFFSET;
+            op->u.read.buf = c->head_buf; op->u.read.len = 8;
+            return 1;
+        case SLF_CONSUME_HEAD: {
+            uint64_t head = read_le64(c->head_buf);
+            if (head == SLAB_SENTINEL) { c->phase = SLF_ABORT; break; }
+            c->cursor = head; c->phase = SLF_READ_NODE;
+            break;
+        }
+        case SLF_READ_NODE: {
+            size_t i;
+            for (i = 0; i < c->seen_count; i++)
+                if (c->seen[i] == c->cursor) { c->cycle = 1; return 0; }
+            c->phase = SLF_CONSUME_NODE;
+            op->kind = BSTACK_GEN_READ;
+            op->u.read.offset = c->cursor;
+            op->u.read.buf = c->node_buf; op->u.read.len = 8;
+            return 1;
+        }
+        case SLF_CONSUME_NODE: {
+            uint64_t next;
+            while (c->len_idx < c->n && c->lens[c->len_idx] == 0) c->len_idx++;
+            c->out[c->len_idx].allocator = c->base;
+            c->out[c->len_idx].offset = c->cursor;
+            c->out[c->len_idx].len = c->lens[c->len_idx];
+            c->len_idx++;
+            c->seen[c->seen_count++] = c->cursor;
+            c->collected++;
+            next = read_le64(c->node_buf);
+            if (c->collected == c->singles) { c->enough = 1; c->phase = SLF_WRITE_HEAD; break; }
+            if (next == SLAB_SENTINEL) { c->phase = SLF_ABORT; break; }
+            c->cursor = next; c->phase = SLF_READ_NODE;
+            break;
+        }
+        case SLF_WRITE_HEAD:
+            c->phase = SLF_WRITE_CLAIM; c->claim_idx = 0;
+            op->kind = BSTACK_GEN_WRITE;
+            op->u.write.offset = SLAB_FREE_HEAD_OFFSET;
+            op->u.write.data = c->node_buf; op->u.write.len = 8;
+            return 1;
+        case SLF_WRITE_CLAIM:
+            while (c->claim_idx < c->n && c->out[c->claim_idx].len == 0) c->claim_idx++;
+            if (c->claim_idx >= c->n) return 0; /* all scrubbed: commit */
+            op->kind = BSTACK_GEN_WRITE;
+            op->u.write.offset = c->out[c->claim_idx].offset;
+            op->u.write.data = c->zero;
+            op->u.write.len = (size_t)c->block_size;
+            c->claim_idx++;
+            return 1;
+        default: /* SLF_ABORT */
+            return 0;
+        }
+    }
+}
+
+static int slab_alloc_bulk_from_freelist_atomic(bstack_allocator_t *base,
+        const uint64_t *lens, size_t n, size_t singles, bstack_slice_t *out)
+{
+    slab_bstack_allocator_t *a = (slab_bstack_allocator_t *)base;
+    struct slab_fast_ctx c;
+    uint8_t *zero;
+    uint64_t *seen;
+    int prev = 0, r;
+
+    zero = calloc(1, (size_t)a->block_size);
+    seen = malloc(singles * sizeof *seen);
+    if (!zero || !seen) { free(zero); free(seen); errno = ENOMEM; return -1; }
+
+    memset(&c, 0, sizeof c);
+    c.base = base; c.lens = lens; c.n = n; c.singles = singles;
+    c.block_size = a->block_size; c.out = out; c.seen = seen;
+    c.zero = zero; c.prev = &prev; c.phase = SLF_READ_HEAD;
+
+    r = bstack_inplace_gen(a->bs, slab_fast_gen, &c, &prev);
+    free(zero); free(seen);
+    if (r != 0) return -1;
+    if (c.io_err) { errno = c.io_err; return -1; }
+    if (c.cycle) { errno = EINVAL; return -1; }
+    return c.enough ? 1 : 0;
+}
+
+static int slab_vt_alloc_bulk(bstack_allocator_t *base, const uint64_t *lens,
+                              size_t n, bstack_slice_t *out_slices)
+{
+    slab_bstack_allocator_t *a = (slab_bstack_allocator_t *)base;
+    uint64_t bs = a->block_size;
+    uint64_t *counts = NULL, *popped = NULL;
+    bstack_slice_t *tmp = NULL;
+    uint64_t total_blocks = 0, ext_base = 0, ext_bytes = 0, ext_cursor, remainder;
+    size_t singles = 0, i, pcount = 0, pi;
+    int oversized = 0;
+
+    if (n == 0) return 0;
+
+    counts = malloc(n * sizeof *counts);
+    tmp = malloc(n * sizeof *tmp);
+    if (!counts || !tmp) { free(counts); free(tmp); errno = ENOMEM; return -1; }
+
+    for (i = 0; i < n; i++) {
+        uint64_t nb = slab_blocks_needed(lens[i], bs);
+        if (nb > UINT64_MAX - total_blocks) { errno = EINVAL; goto fail; }
+        total_blocks += nb;
+        if (nb == 1) singles++;
+        else if (nb > 1) oversized = 1;
+        counts[i] = nb;
+    }
+
+    /* All zero-length: null slices, no I/O. */
+    if (total_blocks == 0) {
+        for (i = 0; i < n; i++) {
+            out_slices[i].allocator = base;
+            out_slices[i].offset = SLAB_SENTINEL;
+            out_slices[i].len = 0;
+        }
+        free(counts); free(tmp);
+        return 0;
+    }
+    if (total_blocks > UINT64_MAX / bs) { errno = EINVAL; goto fail; }
+
+    /* Fast path: no oversized request, try to serve entirely from the free
+     * list in one atomic commit. tmp is pre-initialised to null slices. */
+    if (!oversized) {
+        int fr;
+        for (i = 0; i < n; i++) {
+            tmp[i].allocator = base; tmp[i].offset = SLAB_SENTINEL; tmp[i].len = 0;
+        }
+        fr = slab_alloc_bulk_from_freelist_atomic(base, lens, n, singles, tmp);
+        if (fr < 0) goto fail;
+        if (fr == 1) {
+            memcpy(out_slices, tmp, n * sizeof *tmp);
+            free(counts); free(tmp);
+            return 0;
+        }
+        /* fr == 0: list too short, nothing written — fall through. */
+    }
+
+    /* Extend path. */
+    popped = malloc((singles ? singles : 1) * sizeof *popped);
+    if (!popped) { errno = ENOMEM; goto fail; }
+    if (slab_pop_free_blocks_bulk(a->bs, singles, popped, &pcount) != 0) goto fail;
+
+    remainder = total_blocks - (uint64_t)pcount;
+    if (remainder > 0) {
+        ext_bytes = remainder * bs; /* <= total_blocks*bs, checked above */
+#if UINT64_MAX > SIZE_MAX
+        if (ext_bytes > (uint64_t)SIZE_MAX) {
+            errno = EINVAL;
+            slab_reclaim_after_alloc_failure(a->bs, bs, popped, pcount, 0, 0);
+            goto fail_pop_freed;
+        }
+#endif
+        if (bstack_extend(a->bs, (size_t)ext_bytes, &ext_base) != 0) {
+            slab_reclaim_after_alloc_failure(a->bs, bs, popped, pcount, 0, 0);
+            goto fail_pop_freed;
+        }
+    }
+
+    /* Assign a region to each request in order. */
+    pi = 0; ext_cursor = ext_base;
+    for (i = 0; i < n; i++) {
+        uint64_t block_start;
+        if (counts[i] == 0) {
+            tmp[i].allocator = base; tmp[i].offset = SLAB_SENTINEL; tmp[i].len = 0;
+            continue;
+        }
+        if (counts[i] == 1 && pi < pcount) {
+            block_start = popped[pi++];
+        } else {
+            block_start = ext_cursor;
+            ext_cursor += counts[i] * bs;
+        }
+        tmp[i].allocator = base; tmp[i].offset = block_start; tmp[i].len = lens[i];
+    }
+
+    /* Scrub the recycled (popped) blocks; roll back best-effort on failure. */
+    if (slab_scrub_blocks(a->bs, bs, popped, pcount) != 0) {
+        slab_reclaim_after_alloc_failure(a->bs, bs, popped, pcount, ext_base, ext_bytes);
+        goto fail_pop_freed;
+    }
+
+    memcpy(out_slices, tmp, n * sizeof *tmp);
+    free(counts); free(tmp); free(popped);
+    return 0;
+
+fail_pop_freed:
+    free(counts); free(tmp); free(popped);
+    return -1;
+fail:
+    free(counts); free(tmp); free(popped);
+    return -1;
+}
+
+static int slab_vt_dealloc_bulk(bstack_allocator_t *base,
+                                const bstack_slice_t *slices, size_t n)
+{
+    slab_bstack_allocator_t *a = (slab_bstack_allocator_t *)base;
+    uint64_t bs = a->block_size, total = 0;
+    uint64_t *blocks;
+    size_t i, k = 0;
+    int r;
+
+    if (check_own_slices(base, slices, n) != 0) return -1;
+
+    /* Count constituent blocks (validate arithmetic) before allocating. */
+    for (i = 0; i < n; i++) {
+        uint64_t nb, backing;
+        if (slices[i].len == 0) continue;
+        nb = slab_blocks_needed(slices[i].len, bs);
+        if (nb > UINT64_MAX / bs) { errno = EINVAL; return -1; }
+        backing = nb * bs;
+        if (slices[i].offset > UINT64_MAX - backing) { errno = EINVAL; return -1; }
+        if (nb > UINT64_MAX - total) { errno = EINVAL; return -1; }
+        total += nb;
+    }
+    if (total == 0) return 0;
+#if UINT64_MAX > SIZE_MAX
+    if (total > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
+#endif
+    blocks = malloc((size_t)total * sizeof *blocks);
+    if (!blocks) { errno = ENOMEM; return -1; }
+    for (i = 0; i < n; i++) {
+        uint64_t nb, j;
+        if (slices[i].len == 0) continue;
+        nb = slab_blocks_needed(slices[i].len, bs);
+        for (j = 0; j < nb; j++) blocks[k++] = slices[i].offset + j * bs;
+    }
+    r = slab_splice_blocks_onto_free_list(a->bs, blocks, (size_t)total);
+    free(blocks);
+    return r;
+}
+
+static const bstack_bulk_allocator_vtbl_t slab_bulk_vtbl = {
+    { slab_vtbl_stack, slab_vtbl_alloc, slab_vtbl_realloc, slab_vtbl_dealloc },
+    slab_vt_alloc_bulk,
+    slab_vt_dealloc_bulk
+};
+#endif /* BSTACK_FEATURE_ATOMIC */
 
 /* ---- public API -------------------------------------------------------- */
 
@@ -4357,8 +4818,13 @@ slab_bstack_allocator_t *slab_bstack_allocator_new(bstack_t *bs,
         free(a); return NULL;
     }
 
+#ifdef BSTACK_FEATURE_ATOMIC
+    a->base.vtbl      = &slab_bulk_vtbl.base;
+    a->base.bulk_vtbl = &slab_bulk_vtbl;
+#else
     a->base.vtbl      = &slab_allocator_vtbl;
     a->base.bulk_vtbl = NULL;
+#endif
     a->bs             = bs;
     a->block_size     = block_size;
     return a;
@@ -4409,8 +4875,13 @@ slab_bstack_allocator_t *slab_bstack_allocator_open(bstack_t *bs)
         return NULL;
     }
 
+#ifdef BSTACK_FEATURE_ATOMIC
+    a->base.vtbl      = &slab_bulk_vtbl.base;
+    a->base.bulk_vtbl = &slab_bulk_vtbl;
+#else
     a->base.vtbl      = &slab_allocator_vtbl;
     a->base.bulk_vtbl = NULL;
+#endif
     a->bs             = bs;
     a->block_size     = stored_block_size;
     return a;
@@ -5890,12 +6361,498 @@ static int alck_vt_realloc(bstack_allocator_t *base, bstack_slice_t s,
     }
 }
 
+#ifndef BSTACK_FEATURE_ATOMIC
 static const bstack_allocator_vtbl_t alck_allocator_vtbl = {
     alck_vt_stack,
     alck_vt_alloc,
     alck_vt_realloc,
     alck_vt_dealloc,
 };
+#endif
+
+/* ---- bulk (BStackBulkAllocator), atomic only --------------------------- */
+#ifdef BSTACK_FEATURE_ATOMIC
+
+/*
+ * Chase up to `want` blocks off the free list under one bstack_process_gen,
+ * verifying each chased block's overhead is zero (free) and advancing free_head
+ * once. Fills popped[] (block starts) and *out_count. A non-zero overhead or a
+ * revisited block (a cycle) aborts with no write and fails with EINVAL.
+ */
+struct alck_pop_bulk_ctx {
+    uint64_t *popped;
+    size_t    want;
+    size_t    count;
+    uint64_t  cursor;
+    uint8_t   head_buf[8];
+    uint8_t   node_buf[16]; /* [0..8] overhead, [8..16] next */
+    int       phase;
+    int       bad; /* 1 = cycle or corrupt overhead */
+};
+
+enum { ACB_READ_HEAD, ACB_CONSUME_HEAD, ACB_READ_NODE, ACB_CONSUME_NODE, ACB_DONE };
+
+static int alck_pop_bulk_gen(bstack_gen_op_t *op, void *uc)
+{
+    struct alck_pop_bulk_ctx *c = uc;
+    for (;;) {
+        switch (c->phase) {
+        case ACB_READ_HEAD:
+            c->phase = ACB_CONSUME_HEAD;
+            op->kind = BSTACK_GEN_READ;
+            op->u.read.offset = ALCK_FREE_HEAD_OFFSET;
+            op->u.read.buf = c->head_buf; op->u.read.len = 8;
+            return 1;
+        case ACB_CONSUME_HEAD: {
+            uint64_t head = read_le64(c->head_buf);
+            if (head == ALCK_SENTINEL) return 0;
+            c->cursor = head; c->phase = ACB_READ_NODE;
+            break;
+        }
+        case ACB_READ_NODE: {
+            size_t i;
+            for (i = 0; i < c->count; i++)
+                if (c->popped[i] == c->cursor) { c->bad = 1; return 0; }
+            c->phase = ACB_CONSUME_NODE;
+            op->kind = BSTACK_GEN_READ;
+            op->u.read.offset = c->cursor;
+            op->u.read.buf = c->node_buf; op->u.read.len = 16;
+            return 1;
+        }
+        case ACB_CONSUME_NODE: {
+            uint64_t next;
+            if (read_le64(c->node_buf) != 0) { c->bad = 1; return 0; } /* corrupt */
+            c->popped[c->count++] = c->cursor;
+            next = read_le64(c->node_buf + 8);
+            if (c->count == c->want || next == ALCK_SENTINEL) {
+                c->phase = ACB_DONE;
+                op->kind = BSTACK_GEN_WRITE;
+                op->u.write.offset = ALCK_FREE_HEAD_OFFSET;
+                op->u.write.data = c->node_buf + 8; op->u.write.len = 8;
+                return 1;
+            }
+            c->cursor = next; c->phase = ACB_READ_NODE;
+            break;
+        }
+        default:
+            return 0;
+        }
+    }
+}
+
+static int alck_pop_free_blocks_bulk(bstack_t *bs, size_t want,
+                                     uint64_t *popped, size_t *out_count)
+{
+    struct alck_pop_bulk_ctx c;
+    if (want == 0) { *out_count = 0; return 0; }
+    memset(&c, 0, sizeof c);
+    c.popped = popped; c.want = want; c.phase = ACB_READ_HEAD;
+    if (bstack_process_gen(bs, alck_pop_bulk_gen, &c) != 0) return -1;
+    if (c.bad) { errno = EINVAL; return -1; }
+    *out_count = c.count;
+    return 0;
+}
+
+/* Commit each (block_start, overhead[8]) claim in one inplace_gen: an all-zero
+ * overhead marks a recycled block (write the whole claim_buf: IN_USE|1 then a
+ * zero scrub); any other overhead is an extended block (write the 8-byte
+ * overhead only). */
+struct alck_claim_job { uint64_t offset; uint8_t oh[8]; };
+
+struct alck_claim_ctx {
+    const struct alck_claim_job *jobs;
+    size_t         count;
+    size_t         i;
+    const uint8_t *claim_buf;
+    uint64_t       block_size;
+};
+
+static int alck_claim_all_zero(const uint8_t *oh)
+{
+    int i; for (i = 0; i < 8; i++) if (oh[i]) return 0; return 1;
+}
+
+static int alck_claim_gen(bstack_gen_op_t *op, void *uc)
+{
+    struct alck_claim_ctx *c = uc;
+    if (c->i >= c->count) return 0;
+    op->kind = BSTACK_GEN_WRITE;
+    op->u.write.offset = c->jobs[c->i].offset;
+    if (alck_claim_all_zero(c->jobs[c->i].oh)) {
+        op->u.write.data = c->claim_buf;
+        op->u.write.len = (size_t)c->block_size;
+    } else {
+        op->u.write.data = c->jobs[c->i].oh;
+        op->u.write.len = 8;
+    }
+    c->i++;
+    return 1;
+}
+
+static int alck_claim_blocks(bstack_t *bs, uint64_t block_size,
+                             const struct alck_claim_job *jobs, size_t count)
+{
+    struct alck_claim_ctx c;
+    uint8_t *claim_buf;
+    int r;
+    if (count == 0) return 0;
+    claim_buf = calloc(1, (size_t)block_size);
+    if (!claim_buf) { errno = ENOMEM; return -1; }
+    write_le64(claim_buf, ALCK_IN_USE_BIT | UINT64_C(1));
+    c.jobs = jobs; c.count = count; c.i = 0;
+    c.claim_buf = claim_buf; c.block_size = block_size;
+    r = bstack_inplace_gen(bs, alck_claim_gen, &c, NULL);
+    free(claim_buf);
+    return r;
+}
+
+/* Splice blocks[] onto the free list: stage each block's [overhead=0 | next]
+ * (16 bytes) with one bstack_set_batched, then splice with one
+ * bstack_cross_exchange on the last block's next slot (block + OVERHEAD). */
+static int alck_splice_blocks_onto_free_list(bstack_t *bs,
+                                             const uint64_t *blocks, size_t count)
+{
+    bstack_iovec_t *iov;
+    uint8_t *bufs;
+    size_t i;
+    int r;
+    if (count == 0) return 0;
+    iov = malloc(count * sizeof *iov);
+    bufs = calloc(count, 16);
+    if (!iov || !bufs) { free(iov); free(bufs); errno = ENOMEM; return -1; }
+    for (i = 0; i < count; i++) {
+        uint64_t next = (i + 1 < count) ? blocks[i + 1] : blocks[0];
+        /* bufs[i*16 .. +8] overhead stays 0; [+8 .. +16] = next */
+        write_le64(bufs + i * 16 + 8, next);
+        iov[i].offset = blocks[i];
+        iov[i].buf = bufs + i * 16;
+        iov[i].len = 16;
+    }
+    r = bstack_set_batched(bs, iov, count);
+    free(iov); free(bufs);
+    if (r != 0) return -1;
+    return bstack_cross_exchange(bs, blocks[count - 1] + ALCK_OVERHEAD,
+                                 ALCK_FREE_HEAD_OFFSET, 8);
+}
+
+static void alck_reclaim_after_alloc_failure(bstack_t *bs, uint64_t block_size,
+                                             const uint64_t *popped, size_t pcount,
+                                             uint64_t ext_base, uint64_t ext_bytes)
+{
+    int truncated = 0;
+    if (ext_bytes == 0) {
+        truncated = 1;
+    } else {
+        int ok = 0;
+        if (bstack_try_discard(bs, ext_base + ext_bytes, (size_t)ext_bytes, &ok) == 0 && ok)
+            truncated = 1;
+    }
+    if (truncated) {
+        (void)alck_splice_blocks_onto_free_list(bs, popped, pcount);
+    } else {
+        uint64_t n_tail = ext_bytes / block_size, k;
+        uint64_t *all = malloc((pcount + (size_t)n_tail) * sizeof *all);
+        if (!all) return;
+        for (k = 0; k < pcount; k++) all[k] = popped[k];
+        for (k = 0; k < n_tail; k++) all[pcount + k] = ext_base + k * block_size;
+        (void)alck_splice_blocks_onto_free_list(bs, all, pcount + (size_t)n_tail);
+        free(all);
+    }
+}
+
+/* Fast path: all-single-block request served entirely from the free list in one
+ * crash-atomic inplace_gen (chase + advance free_head + claim). Returns 1
+ * (served), 0 (too short, nothing written), -1 (cycle/corrupt/read error). */
+struct alck_fast_ctx {
+    bstack_allocator_t *base;
+    const uint64_t     *lens;
+    size_t              n;
+    size_t              singles;
+    uint64_t            block_size;
+    bstack_slice_t     *out;
+    uint64_t           *seen;
+    size_t              seen_count;
+    const uint8_t      *claim_buf;
+    const int          *prev;
+    int                 phase;
+    size_t              len_idx;
+    size_t              collected;
+    size_t              claim_idx;
+    uint64_t            cursor;
+    uint8_t             head_buf[8];
+    uint8_t             node_buf[16];
+    int                 enough;
+    int                 bad;   /* cycle or corrupt overhead */
+    int                 io_err;
+};
+
+enum { ACF_READ_HEAD, ACF_CONSUME_HEAD, ACF_READ_NODE, ACF_CONSUME_NODE,
+       ACF_WRITE_HEAD, ACF_WRITE_CLAIM, ACF_ABORT };
+
+static int alck_fast_gen(bstack_gen_op_t *op, void *uc)
+{
+    struct alck_fast_ctx *c = uc;
+    if (c->prev && *c->prev != 0) { c->io_err = *c->prev; return 0; }
+    for (;;) {
+        switch (c->phase) {
+        case ACF_READ_HEAD:
+            c->phase = ACF_CONSUME_HEAD;
+            op->kind = BSTACK_GEN_READ;
+            op->u.read.offset = ALCK_FREE_HEAD_OFFSET;
+            op->u.read.buf = c->head_buf; op->u.read.len = 8;
+            return 1;
+        case ACF_CONSUME_HEAD: {
+            uint64_t head = read_le64(c->head_buf);
+            if (head == ALCK_SENTINEL) { c->phase = ACF_ABORT; break; }
+            c->cursor = head; c->phase = ACF_READ_NODE;
+            break;
+        }
+        case ACF_READ_NODE: {
+            size_t i;
+            for (i = 0; i < c->seen_count; i++)
+                if (c->seen[i] == c->cursor) { c->bad = 1; return 0; }
+            c->phase = ACF_CONSUME_NODE;
+            op->kind = BSTACK_GEN_READ;
+            op->u.read.offset = c->cursor;
+            op->u.read.buf = c->node_buf; op->u.read.len = 16;
+            return 1;
+        }
+        case ACF_CONSUME_NODE: {
+            uint64_t next;
+            if (read_le64(c->node_buf) != 0) { c->bad = 1; return 0; } /* corrupt */
+            while (c->len_idx < c->n && c->lens[c->len_idx] == 0) c->len_idx++;
+            c->out[c->len_idx].allocator = c->base;
+            c->out[c->len_idx].offset = c->cursor + ALCK_OVERHEAD;
+            c->out[c->len_idx].len = c->lens[c->len_idx];
+            c->len_idx++;
+            c->seen[c->seen_count++] = c->cursor;
+            c->collected++;
+            next = read_le64(c->node_buf + 8);
+            if (c->collected == c->singles) { c->enough = 1; c->phase = ACF_WRITE_HEAD; break; }
+            if (next == ALCK_SENTINEL) { c->phase = ACF_ABORT; break; }
+            c->cursor = next; c->phase = ACF_READ_NODE;
+            break;
+        }
+        case ACF_WRITE_HEAD:
+            c->phase = ACF_WRITE_CLAIM; c->claim_idx = 0;
+            op->kind = BSTACK_GEN_WRITE;
+            op->u.write.offset = ALCK_FREE_HEAD_OFFSET;
+            op->u.write.data = c->node_buf + 8; op->u.write.len = 8;
+            return 1;
+        case ACF_WRITE_CLAIM:
+            while (c->claim_idx < c->n && c->out[c->claim_idx].len == 0) c->claim_idx++;
+            if (c->claim_idx >= c->n) return 0;
+            op->kind = BSTACK_GEN_WRITE;
+            op->u.write.offset = c->out[c->claim_idx].offset - ALCK_OVERHEAD;
+            op->u.write.data = c->claim_buf;
+            op->u.write.len = (size_t)c->block_size;
+            c->claim_idx++;
+            return 1;
+        default: /* ACF_ABORT */
+            return 0;
+        }
+    }
+}
+
+static int alck_alloc_bulk_from_freelist_atomic(bstack_allocator_t *base,
+        const uint64_t *lens, size_t n, size_t singles, bstack_slice_t *out)
+{
+    checked_slab_bstack_allocator_t *a = (checked_slab_bstack_allocator_t *)base;
+    struct alck_fast_ctx c;
+    uint8_t *claim_buf;
+    uint64_t *seen;
+    int prev = 0, r;
+
+    claim_buf = calloc(1, (size_t)a->block_size);
+    seen = malloc(singles * sizeof *seen);
+    if (!claim_buf || !seen) { free(claim_buf); free(seen); errno = ENOMEM; return -1; }
+    write_le64(claim_buf, ALCK_IN_USE_BIT | UINT64_C(1));
+
+    memset(&c, 0, sizeof c);
+    c.base = base; c.lens = lens; c.n = n; c.singles = singles;
+    c.block_size = a->block_size; c.out = out; c.seen = seen;
+    c.claim_buf = claim_buf; c.prev = &prev; c.phase = ACF_READ_HEAD;
+
+    r = bstack_inplace_gen(a->bs, alck_fast_gen, &c, &prev);
+    free(claim_buf); free(seen);
+    if (r != 0) return -1;
+    if (c.io_err) { errno = c.io_err; return -1; }
+    if (c.bad) { errno = EINVAL; return -1; }
+    return c.enough ? 1 : 0;
+}
+
+static int alck_vt_alloc_bulk(bstack_allocator_t *base, const uint64_t *lens,
+                              size_t n, bstack_slice_t *out_slices)
+{
+    checked_slab_bstack_allocator_t *a = (checked_slab_bstack_allocator_t *)base;
+    uint64_t bs = a->block_size;
+    uint64_t *counts = NULL, *popped = NULL;
+    struct alck_claim_job *jobs = NULL;
+    bstack_slice_t *tmp = NULL;
+    uint64_t total_blocks = 0, ext_base = 0, ext_bytes = 0, ext_cursor, remainder;
+    size_t singles = 0, i, pcount = 0, pi, njobs = 0;
+    int oversized = 0;
+
+    if (n == 0) return 0;
+
+    counts = malloc(n * sizeof *counts);
+    tmp = malloc(n * sizeof *tmp);
+    if (!counts || !tmp) { free(counts); free(tmp); errno = ENOMEM; return -1; }
+
+    for (i = 0; i < n; i++) {
+        uint64_t nb = alck_blocks_needed(lens[i], bs);
+        if (nb == UINT64_MAX) { errno = EINVAL; goto fail; } /* overflow signal */
+        if (nb > UINT64_MAX - total_blocks) { errno = EINVAL; goto fail; }
+        total_blocks += nb;
+        if (nb == 1) singles++;
+        else if (nb > 1) oversized = 1;
+        counts[i] = nb;
+    }
+
+    if (total_blocks == 0) {
+        for (i = 0; i < n; i++) {
+            out_slices[i].allocator = base;
+            out_slices[i].offset = ALCK_SENTINEL;
+            out_slices[i].len = 0;
+        }
+        free(counts); free(tmp);
+        return 0;
+    }
+    if (total_blocks > UINT64_MAX / bs) { errno = EINVAL; goto fail; }
+
+    if (!oversized) {
+        int fr;
+        for (i = 0; i < n; i++) {
+            tmp[i].allocator = base; tmp[i].offset = ALCK_SENTINEL; tmp[i].len = 0;
+        }
+        fr = alck_alloc_bulk_from_freelist_atomic(base, lens, n, singles, tmp);
+        if (fr < 0) goto fail;
+        if (fr == 1) {
+            memcpy(out_slices, tmp, n * sizeof *tmp);
+            free(counts); free(tmp);
+            return 0;
+        }
+    }
+
+    popped = malloc((singles ? singles : 1) * sizeof *popped);
+    jobs   = malloc(n * sizeof *jobs);
+    if (!popped || !jobs) { errno = ENOMEM; goto fail; }
+    if (alck_pop_free_blocks_bulk(a->bs, singles, popped, &pcount) != 0) goto fail;
+
+    remainder = total_blocks - (uint64_t)pcount;
+    if (remainder > 0) {
+        ext_bytes = remainder * bs;
+#if UINT64_MAX > SIZE_MAX
+        if (ext_bytes > (uint64_t)SIZE_MAX) {
+            errno = EINVAL;
+            alck_reclaim_after_alloc_failure(a->bs, bs, popped, pcount, 0, 0);
+            goto fail_freed;
+        }
+#endif
+        if (bstack_extend(a->bs, (size_t)ext_bytes, &ext_base) != 0) {
+            alck_reclaim_after_alloc_failure(a->bs, bs, popped, pcount, 0, 0);
+            goto fail_freed;
+        }
+    }
+
+    /* Assign a region per request and record each block's claim overhead:
+     * all-zero = recycled (full-block scrub), else the in-use overhead. */
+    pi = 0; ext_cursor = ext_base; njobs = 0;
+    for (i = 0; i < n; i++) {
+        uint64_t block_start;
+        if (counts[i] == 0) {
+            tmp[i].allocator = base; tmp[i].offset = ALCK_SENTINEL; tmp[i].len = 0;
+            continue;
+        }
+        if (counts[i] == 1 && pi < pcount) {
+            block_start = popped[pi++];
+            jobs[njobs].offset = block_start;
+            memset(jobs[njobs].oh, 0, 8); /* recycled sentinel */
+            njobs++;
+        } else {
+            block_start = ext_cursor;
+            ext_cursor += counts[i] * bs;
+            jobs[njobs].offset = block_start;
+            write_le64(jobs[njobs].oh, ALCK_IN_USE_BIT | counts[i]);
+            njobs++;
+        }
+        tmp[i].allocator = base; tmp[i].offset = block_start + ALCK_OVERHEAD; tmp[i].len = lens[i];
+    }
+
+    if (alck_claim_blocks(a->bs, bs, jobs, njobs) != 0) {
+        alck_reclaim_after_alloc_failure(a->bs, bs, popped, pcount, ext_base, ext_bytes);
+        goto fail_freed;
+    }
+
+    memcpy(out_slices, tmp, n * sizeof *tmp);
+    free(counts); free(tmp); free(popped); free(jobs);
+    return 0;
+
+fail_freed:
+    free(counts); free(tmp); free(popped); free(jobs);
+    return -1;
+fail:
+    free(counts); free(tmp); free(popped); free(jobs);
+    return -1;
+}
+
+static int alck_vt_dealloc_bulk(bstack_allocator_t *base,
+                                const bstack_slice_t *slices, size_t n)
+{
+    checked_slab_bstack_allocator_t *a = (checked_slab_bstack_allocator_t *)base;
+    uint64_t bs = a->block_size, total = 0;
+    uint64_t *blocks;
+    size_t i, k = 0;
+    int r;
+
+    if (check_own_slices(base, slices, n) != 0) return -1;
+
+    /* Validate every handle and count blocks before any write. */
+    for (i = 0; i < n; i++) {
+        uint64_t block_start, overhead, nb, backing;
+        if (slices[i].len == 0 && slices[i].offset == 0) continue;
+        if (slices[i].offset < ALCK_OVERHEAD) { errno = EINVAL; return -1; }
+        block_start = slices[i].offset - ALCK_OVERHEAD;
+        if (alck_read_overhead(a->bs, block_start, &overhead) != 0) return -1;
+        if ((overhead & ALCK_IN_USE_BIT) == 0) { errno = EINVAL; return -1; } /* double free */
+        nb = overhead & ALCK_BLOCKS_MASK;
+        if (nb == 0) { errno = EINVAL; return -1; }
+        if (nb > UINT64_MAX / bs) { errno = EINVAL; return -1; }
+        backing = nb * bs;
+        if (block_start > UINT64_MAX - backing) { errno = EINVAL; return -1; }
+        if (nb > UINT64_MAX - total) { errno = EINVAL; return -1; }
+        total += nb;
+    }
+    if (total == 0) return 0;
+#if UINT64_MAX > SIZE_MAX
+    if (total > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
+#endif
+    blocks = malloc((size_t)total * sizeof *blocks);
+    if (!blocks) { errno = ENOMEM; return -1; }
+    for (i = 0; i < n; i++) {
+        uint64_t block_start, overhead, nb, j;
+        if (slices[i].len == 0 && slices[i].offset == 0) continue;
+        block_start = slices[i].offset - ALCK_OVERHEAD;
+        if (alck_read_overhead(a->bs, block_start, &overhead) != 0) { free(blocks); return -1; }
+        nb = overhead & ALCK_BLOCKS_MASK;
+        for (j = 0; j < nb; j++) {
+            uint64_t b = block_start + j * bs, t;
+            for (t = 0; t < k; t++)
+                if (blocks[t] == b) { free(blocks); errno = EINVAL; return -1; } /* dup */
+            blocks[k++] = b;
+        }
+    }
+    r = alck_splice_blocks_onto_free_list(a->bs, blocks, (size_t)total);
+    free(blocks);
+    return r;
+}
+
+static const bstack_bulk_allocator_vtbl_t alck_bulk_vtbl = {
+    { alck_vt_stack, alck_vt_alloc, alck_vt_realloc, alck_vt_dealloc },
+    alck_vt_alloc_bulk,
+    alck_vt_dealloc_bulk
+};
+#endif /* BSTACK_FEATURE_ATOMIC */
 
 /* ---- public API -------------------------------------------------------- */
 
@@ -5937,8 +6894,13 @@ checked_slab_bstack_allocator_t *checked_slab_bstack_allocator_new(
         free(a); return NULL;
     }
 
+#ifdef BSTACK_FEATURE_ATOMIC
+    a->base.vtbl      = &alck_bulk_vtbl.base;
+    a->base.bulk_vtbl = &alck_bulk_vtbl;
+#else
     a->base.vtbl      = &alck_allocator_vtbl;
     a->base.bulk_vtbl = NULL;
+#endif
     a->bs             = bs;
     a->block_size     = block_size;
     return a;
@@ -5998,8 +6960,13 @@ checked_slab_bstack_allocator_t *checked_slab_bstack_allocator_open(bstack_t *bs
     if (bstack_alloc_lock_init(&a->lock) != 0) { free(a); return NULL; }
 #endif
 
+#ifdef BSTACK_FEATURE_ATOMIC
+    a->base.vtbl      = &alck_bulk_vtbl.base;
+    a->base.bulk_vtbl = &alck_bulk_vtbl;
+#else
     a->base.vtbl      = &alck_allocator_vtbl;
     a->base.bulk_vtbl = NULL;
+#endif
     a->bs             = bs;
     a->block_size     = stored_block_size;
 

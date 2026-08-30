@@ -878,6 +878,131 @@ static int test_concurrent_realloc_tail_paths(void)
     sl_unlink(tmp); return 0;
 }
 
+/* ---- bulk (BStackBulkAllocator) --------------------------------------- */
+
+static int test_bulk_alloc_distinct_usable(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    slab_bstack_allocator_t *a = slab_bstack_allocator_new(bs, 16);
+    CHECK(a);
+    bstack_allocator_t *al = (bstack_allocator_t *)a;
+
+    uint64_t lens[3] = { 8, 16, 40 }; /* 40 -> oversized (3 blocks) */
+    bstack_slice_t out[3];
+    CHECK(bstack_allocator_alloc_bulk(al, lens, 3, out) == 0);
+    CHECK(out[0].len == 8 && out[1].len == 16 && out[2].len == 40);
+    CHECK(out[0].offset != out[1].offset && out[1].offset != out[2].offset);
+    for (size_t i = 0; i < 3; i++) {
+        uint8_t buf[40]; memset(buf, (int)(i + 1), (size_t)lens[i]);
+        CHECK(bstack_slice_write(out[i], buf, (size_t)lens[i]) == 0);
+    }
+    for (size_t i = 0; i < 3; i++) {
+        uint8_t r[40], want[40]; memset(want, (int)(i + 1), (size_t)lens[i]);
+        CHECK(bstack_slice_read(out[i], r) == 0);
+        CHECK(memcmp(r, want, (size_t)lens[i]) == 0);
+    }
+    CHECK(bstack_allocator_dealloc_bulk(al, out, 3) == 0);
+    bstack_close(slab_bstack_allocator_into_stack(a));
+    sl_unlink(tmp); return 0;
+}
+
+static int test_bulk_zero_length_null_slices(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    slab_bstack_allocator_t *a = slab_bstack_allocator_new(bs, 16);
+    CHECK(a);
+    bstack_allocator_t *al = (bstack_allocator_t *)a;
+
+    uint64_t lens[3] = { 0, 16, 0 };
+    bstack_slice_t out[3];
+    CHECK(bstack_allocator_alloc_bulk(al, lens, 3, out) == 0);
+    CHECK(out[0].len == 0 && out[1].len == 16 && out[2].len == 0);
+    bstack_close(slab_bstack_allocator_into_stack(a));
+    sl_unlink(tmp); return 0;
+}
+
+static int test_bulk_reuses_freed_blocks(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    slab_bstack_allocator_t *a = slab_bstack_allocator_new(bs, 16);
+    CHECK(a);
+    bstack_allocator_t *al = (bstack_allocator_t *)a;
+
+    uint64_t lens[3] = { 16, 16, 16 };
+    bstack_slice_t first[3], second[3];
+    CHECK(bstack_allocator_alloc_bulk(al, lens, 3, first) == 0);
+    /* Write a pattern, then bulk-free. */
+    for (size_t i = 0; i < 3; i++) {
+        uint8_t buf[16]; memset(buf, 0x5A, 16);
+        CHECK(bstack_slice_write(first[i], buf, 16) == 0);
+    }
+    uint64_t freed[3] = { first[0].offset, first[1].offset, first[2].offset };
+    CHECK(bstack_allocator_dealloc_bulk(al, first, 3) == 0);
+    /* Realloc: all three reused, and scrubbed back to zero. */
+    CHECK(bstack_allocator_alloc_bulk(al, lens, 3, second) == 0);
+    for (size_t i = 0; i < 3; i++) {
+        int found = 0;
+        for (size_t j = 0; j < 3; j++) if (second[i].offset == freed[j]) found = 1;
+        CHECK(found);
+        uint8_t r[16], zero[16]; memset(zero, 0, 16);
+        CHECK(bstack_slice_read(second[i], r) == 0);
+        CHECK(memcmp(r, zero, 16) == 0);
+    }
+    bstack_close(slab_bstack_allocator_into_stack(a));
+    sl_unlink(tmp); return 0;
+}
+
+static int test_bulk_dealloc_rejects_foreign(void)
+{
+    char t1[64], t2[64]; make_tmp(t1, sizeof t1); make_tmp(t2, sizeof t2);
+    bstack_t *b1 = bstack_open(t1); CHECK(b1);
+    bstack_t *b2 = bstack_open(t2); CHECK(b2);
+    slab_bstack_allocator_t *a1 = slab_bstack_allocator_new(b1, 32); CHECK(a1);
+    slab_bstack_allocator_t *a2 = slab_bstack_allocator_new(b2, 32); CHECK(a2);
+
+    bstack_slice_t own, foreign;
+    CHECK(bstack_allocator_alloc((bstack_allocator_t *)a2, 32, &own) == 0);
+    CHECK(bstack_allocator_alloc((bstack_allocator_t *)a1, 32, &foreign) == 0);
+    bstack_slice_t batch[2] = { own, foreign };
+    errno = 0;
+    CHECK(bstack_allocator_dealloc_bulk((bstack_allocator_t *)a2, batch, 2) == -1);
+    CHECK(errno == EINVAL);
+
+    bstack_close(slab_bstack_allocator_into_stack(a1));
+    bstack_close(slab_bstack_allocator_into_stack(a2));
+    sl_unlink(t1); sl_unlink(t2); return 0;
+}
+
+static int test_bulk_alloc_detects_cycle(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    slab_bstack_allocator_t *a = slab_bstack_allocator_new(bs, 16);
+    CHECK(a);
+    bstack_allocator_t *al = (bstack_allocator_t *)a;
+
+    bstack_slice_t sa, sb;
+    CHECK(bstack_allocator_alloc(al, 16, &sa) == 0);
+    CHECK(bstack_allocator_alloc(al, 16, &sb) == 0);
+    uint64_t b_off = sb.offset;
+    CHECK(bstack_allocator_dealloc(al, sa) == 0);
+    CHECK(bstack_allocator_dealloc(al, sb) == 0);
+    /* Corrupt the free list into a self-cycle: b.next -> b (next at block start). */
+    uint8_t nb[8];
+    for (int k = 0; k < 8; k++) nb[k] = (uint8_t)(b_off >> (8 * k));
+    CHECK(bstack_set(bs, b_off, nb, 8) == 0);
+    bstack_slice_t out[3];
+    errno = 0;
+    CHECK(bstack_allocator_alloc_bulk(al, (uint64_t[]){16,16,16}, 3, out) == -1);
+    CHECK(errno == EINVAL);
+
+    bstack_close(slab_bstack_allocator_into_stack(a));
+    sl_unlink(tmp); return 0;
+}
+
 #endif /* BSTACK_FEATURE_ATOMIC */
 
 /* A slice issued by one allocator instance must be refused by another: the
@@ -959,6 +1084,13 @@ int main(void)
     /* Concurrent */
     T(test_concurrent_alloc_dealloc_data_integrity);
     T(test_concurrent_realloc_tail_paths);
+
+    /* Bulk */
+    T(test_bulk_alloc_distinct_usable);
+    T(test_bulk_zero_length_null_slices);
+    T(test_bulk_reuses_freed_blocks);
+    T(test_bulk_dealloc_rejects_foreign);
+    T(test_bulk_alloc_detects_cycle);
 #endif
 
     T(test_foreign_slice_is_rejected);
