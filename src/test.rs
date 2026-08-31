@@ -2492,6 +2492,7 @@ mod tests {
         let mut buf = [0u8; 4];
         assert!(is_pending(&stack.get_into(0, &mut buf).unwrap_err()));
         assert!(is_pending(&stack.peek_into(0, &mut buf).unwrap_err()));
+        #[cfg(feature = "atomic")]
         assert!(is_pending(&stack.get_batched([0..4, 4..8]).unwrap_err()));
         assert!(is_pending(&stack.lock_up_to(8).unwrap_err()));
 
