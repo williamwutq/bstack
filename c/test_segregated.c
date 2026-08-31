@@ -983,6 +983,125 @@ static int test_bulk_rejects_free_list_cycle(void)
     sg_unlink(tmp); return 0;
 }
 
+/* ---- coalesce ---------------------------------------------------------- */
+
+static int test_coalesce_merges_adjacent(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    segregated_bstack_allocator_t *a = segregated_bstack_allocator_new(bs);
+    CHECK(a);
+    bstack_allocator_t *base = (bstack_allocator_t *)a;
+
+    /* Four contiguous equal blocks, then a tail pin so freeing routes them to
+     * the free list rather than discarding. */
+    bstack_slice_t b0, b1, b2, b3, pin, big;
+    uint64_t fused = 999, unsure = 999, base_off;
+    CHECK(bstack_allocator_alloc(base, 100, &b0) == 0);
+    CHECK(bstack_allocator_alloc(base, 100, &b1) == 0);
+    CHECK(bstack_allocator_alloc(base, 100, &b2) == 0);
+    CHECK(bstack_allocator_alloc(base, 100, &b3) == 0);
+    CHECK(bstack_allocator_alloc(base, 100, &pin) == 0);
+    base_off = b0.offset;
+    CHECK(bstack_allocator_dealloc(base, b0) == 0);
+    CHECK(bstack_allocator_dealloc(base, b1) == 0);
+    CHECK(bstack_allocator_dealloc(base, b2) == 0);
+    CHECK(bstack_allocator_dealloc(base, b3) == 0);
+
+    /* Four adjacent free blocks fuse into one: three blocks absorbed. */
+    CHECK(segregated_bstack_allocator_coalesce(a, &fused) == 0);
+    CHECK(fused == 3);
+    /* The merged run backs a request no single 112-block could serve. */
+    CHECK(bstack_allocator_alloc(base, 440, &big) == 0);
+    CHECK(big.offset == base_off);
+    CHECK(segregated_bstack_allocator_recover(a, &unsure) == 0);
+    CHECK(unsure == 0);
+    (void)pin;
+
+    bstack_close(segregated_bstack_allocator_into_stack(a));
+    sg_unlink(tmp); return 0;
+}
+
+static int test_coalesce_noop_without_adjacency(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    segregated_bstack_allocator_t *a = segregated_bstack_allocator_new(bs);
+    CHECK(a);
+    bstack_allocator_t *base = (bstack_allocator_t *)a;
+
+    /* Free the outer two but keep the middle live, so the frees are not adjacent. */
+    bstack_slice_t b0, b1, b2, pin, x, y;
+    uint64_t fused = 999, s0, s2, g0, g1;
+    CHECK(bstack_allocator_alloc(base, 100, &b0) == 0);
+    CHECK(bstack_allocator_alloc(base, 100, &b1) == 0);
+    CHECK(bstack_allocator_alloc(base, 100, &b2) == 0);
+    CHECK(bstack_allocator_alloc(base, 100, &pin) == 0);
+    s0 = b0.offset; s2 = b2.offset;
+    CHECK(bstack_allocator_dealloc(base, b0) == 0);
+    CHECK(bstack_allocator_dealloc(base, b2) == 0);
+
+    CHECK(segregated_bstack_allocator_coalesce(a, &fused) == 0);
+    CHECK(fused == 0);
+    /* Both freed blocks stay individually reusable (lists untouched by the no-op). */
+    CHECK(bstack_allocator_alloc(base, 100, &x) == 0);
+    CHECK(bstack_allocator_alloc(base, 100, &y) == 0);
+    g0 = x.offset; g1 = y.offset;
+    CHECK((g0 == s0 && g1 == s2) || (g0 == s2 && g1 == s0));
+    (void)b1; (void)pin;
+
+    bstack_close(segregated_bstack_allocator_into_stack(a));
+    sg_unlink(tmp); return 0;
+}
+
+static int test_coalesce_empty_arena(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    segregated_bstack_allocator_t *a = segregated_bstack_allocator_new(bs);
+    CHECK(a);
+
+    uint64_t fused = 999;
+    CHECK(segregated_bstack_allocator_coalesce(a, &fused) == 0);
+    CHECK(fused == 0);
+
+    bstack_close(segregated_bstack_allocator_into_stack(a));
+    sg_unlink(tmp); return 0;
+}
+
+static int test_coalesce_partial_run(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    segregated_bstack_allocator_t *a = segregated_bstack_allocator_new(bs);
+    CHECK(a);
+    bstack_allocator_t *base = (bstack_allocator_t *)a;
+
+    /* Layout: live, free, free, live, tail-pin. Only the middle pair merges. */
+    bstack_slice_t live0, f0, f1, live1, pin, merged;
+    uint64_t fused = 999, unsure = 999, f0_off;
+    CHECK(bstack_allocator_alloc(base, 100, &live0) == 0);
+    CHECK(bstack_allocator_alloc(base, 100, &f0) == 0);
+    CHECK(bstack_allocator_alloc(base, 100, &f1) == 0);
+    CHECK(bstack_allocator_alloc(base, 100, &live1) == 0);
+    CHECK(bstack_allocator_alloc(base, 100, &pin) == 0);
+    f0_off = f0.offset;
+    CHECK(bstack_allocator_dealloc(base, f0) == 0);
+    CHECK(bstack_allocator_dealloc(base, f1) == 0);
+
+    CHECK(segregated_bstack_allocator_coalesce(a, &fused) == 0);
+    CHECK(fused == 1);
+    /* Two 112-blocks fuse to a 224-block; request the size that maps to that class. */
+    CHECK(bstack_allocator_alloc(base, 216, &merged) == 0);
+    CHECK(merged.offset == f0_off);
+    CHECK(segregated_bstack_allocator_recover(a, &unsure) == 0);
+    CHECK(unsure == 0);
+    (void)live0; (void)live1; (void)pin;
+
+    bstack_close(segregated_bstack_allocator_into_stack(a));
+    sg_unlink(tmp); return 0;
+}
+
 #endif /* BSTACK_FEATURE_ATOMIC */
 
 /* =========================================================================
@@ -1016,6 +1135,11 @@ int main(void)
     T(test_bulk_dealloc_rejects_bad_batches);
     T(test_bulk_reuses_recovered_non_class_size);
     T(test_bulk_rejects_free_list_cycle);
+
+    T(test_coalesce_merges_adjacent);
+    T(test_coalesce_noop_without_adjacency);
+    T(test_coalesce_empty_arena);
+    T(test_coalesce_partial_run);
 #endif
 
     printf("\n%d/%d tests passed\n", g_passed, g_total);

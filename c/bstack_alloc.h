@@ -1381,7 +1381,8 @@ uint64_t checked_slab_bstack_allocator_data_size(
  * (zero extra writes, no move); a later grow back into that span fits in place.
  *
  * Experimental: the on-disk format (ALSG magic) and API are not yet stable, and
- * the background coalescer and deep in-use-leak GC are unimplemented.
+ * the deep in-use-leak GC is unimplemented (the free-neighbour coalescer,
+ * segregated_bstack_allocator_coalesce, is implemented under BSTACK_FEATURE_ATOMIC).
  *
  * Requires -DBSTACK_FEATURE_SET.
  * ====================================================================== */
@@ -1428,6 +1429,35 @@ segregated_bstack_allocator_t *segregated_bstack_allocator_new(bstack_t *bs);
 BSTACK_WARN_UNUSED_RESULT
 int segregated_bstack_allocator_recover(segregated_bstack_allocator_t *alloc,
                                          uint64_t *out_unsure);
+
+#ifdef BSTACK_FEATURE_ATOMIC
+/*
+ * Merge physically-adjacent free blocks.  Freed blocks only ever return to their
+ * own class list, so adjacent free blocks accumulate without merging and no
+ * oversized request can reuse the contiguous run; coalesce fuses them.  It is the
+ * recover walk plus a merge: it strides the arena by the recorded physical sizes
+ * and, on any run of two or more adjacent free blocks, writes one merged free
+ * block in place and rebuilds every free list from the scan (the same wholesale
+ * rebuild recover uses, so no swallowed block needs a per-block unlink).  Writes
+ * *out_fused (if non-NULL) with the number of blocks fused into a neighbour
+ * (0 = nothing was adjacent, and nothing is written).
+ *
+ * Unlike recover, this needs no quiescence: the whole scan-and-rewrite runs
+ * inside one bstack_inplace_gen, striding the overhead words one at a time under
+ * the held write lock and committing the merges as one journalled batch, so a
+ * concurrent alloc/dealloc can neither observe an intermediate state nor be
+ * clobbered — no allocator-level lock.  A torn commit re-parses as a valid arena
+ * and is reclaimed by recover, so the pass is restartable; the scan follows only
+ * physical sizes, never next_free, so a corrupt free list cannot cycle it.  A run
+ * reaching the tail is merged like any other — tail discard is not attempted.
+ *
+ * Returns 0 on success, -1 on I/O or allocation error (errno set).
+ * Requires -DBSTACK_FEATURE_ATOMIC (the merge rides bstack_inplace_gen).
+ */
+BSTACK_WARN_UNUSED_RESULT
+int segregated_bstack_allocator_coalesce(segregated_bstack_allocator_t *alloc,
+                                         uint64_t *out_fused);
+#endif /* BSTACK_FEATURE_ATOMIC */
 
 /*
  * Free the allocator wrapper without closing the underlying bstack.
