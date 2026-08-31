@@ -1140,6 +1140,12 @@ uint64_t checked_slab_bstack_allocator_data_size(
  *   shrink, excess < SPLIT_MIN → retain in place — no write
  *   non-tail grow past the block → alloc new class, copy, dealloc old
  *
+ * With -DBSTACK_FEATURE_ATOMIC the allocator also carries a bulk vtable: work is
+ * bounded by the distinct classes a batch touches, not by its request count —
+ * every touched class drains in one multi-class pop, the misses share one sparse
+ * extend, and every claim commits in one batched set.  Without it, bulk_vtbl is
+ * NULL and bstack_allocator_alloc_bulk fails with ENOTSUP.
+ *
  * The visible length lives in the returned handle, not on disk, so a resize that
  * fits (or a shrink whose excess is retained) touches no metadata at all.  Crash
  * consistency: every path only ever *leaks* on a mid-op failure, never corrupts —

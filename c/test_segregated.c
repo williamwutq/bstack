@@ -725,6 +725,267 @@ static int test_foreign_slice_is_rejected(void)
 }
 
 /* =========================================================================
+ * Bulk (BStackBulkAllocator) — requires -DBSTACK_FEATURE_ATOMIC
+ * ====================================================================== */
+#ifdef BSTACK_FEATURE_ATOMIC
+
+#define SG_HEAD_OFF(c) (40u + (uint64_t)(c) * 8u)
+
+static void sg_wr64(uint8_t *p, uint64_t v)
+{
+    int i;
+    for (i = 0; i < 8; i++) p[i] = (uint8_t)(v >> (8 * i));
+}
+
+static uint64_t sg_rd64(const uint8_t *p)
+{
+    uint64_t v = 0;
+    int i;
+    for (i = 7; i >= 0; i--) v = (v << 8) | p[i];
+    return v;
+}
+
+/* n == 0 is a no-op; a zero-length entry yields the null sentinel slice. */
+static int test_bulk_empty_and_zero_lengths(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    segregated_bstack_allocator_t *a = segregated_bstack_allocator_new(bs);
+    CHECK(a);
+    bstack_allocator_t *base = (bstack_allocator_t *)a;
+
+    uint64_t lens[3] = { 0, 40, 0 };
+    bstack_slice_t out[3];
+    uint64_t unsure;
+
+    CHECK(bstack_allocator_alloc_bulk(base, NULL, 0, NULL) == 0);
+    CHECK(bstack_allocator_alloc_bulk(base, lens, 3, out) == 0);
+    CHECK(out[0].offset == 0 && out[0].len == 0);
+    CHECK(out[2].offset == 0 && out[2].len == 0);
+    CHECK(out[1].offset != 0 && out[1].len == 40);
+    CHECK(bstack_allocator_dealloc_bulk(base, out, 3) == 0);
+    CHECK(segregated_bstack_allocator_recover(a, &unsure) == 0);
+    CHECK(unsure == 0);
+
+    bstack_close(segregated_bstack_allocator_into_stack(a));
+    sg_unlink(tmp); return 0;
+}
+
+/* One batch spanning linear, geometric, and oversized classes hands back
+ * distinct, independently writable regions of the requested length. */
+static int test_bulk_alloc_distinct_usable(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    segregated_bstack_allocator_t *a = segregated_bstack_allocator_new(bs);
+    CHECK(a);
+    bstack_allocator_t *base = (bstack_allocator_t *)a;
+
+    uint64_t lens[4] = { 8, 100, 300, 5000 };
+    bstack_slice_t out[4];
+    uint8_t buf[5000], got[5000];
+    size_t i, j;
+    uint64_t unsure;
+
+    CHECK(bstack_allocator_alloc_bulk(base, lens, 4, out) == 0);
+    for (i = 0; i < 4; i++) {
+        CHECK(out[i].len == lens[i]);
+        CHECK(out[i].offset % 16 == 8);
+        for (j = 0; j < 4; j++)
+            if (i != j) CHECK(out[i].offset != out[j].offset);
+    }
+    for (i = 0; i < 4; i++) {
+        memset(buf, (int)(i + 1), (size_t)lens[i]);
+        CHECK(bstack_slice_write(out[i], buf, (size_t)lens[i]) == 0);
+    }
+    for (i = 0; i < 4; i++) {
+        memset(buf, (int)(i + 1), (size_t)lens[i]);
+        CHECK(bstack_slice_read_into(out[i], got, (size_t)lens[i]) == 0);
+        CHECK(memcmp(got, buf, (size_t)lens[i]) == 0);
+    }
+    CHECK(bstack_allocator_dealloc_bulk(base, out, 4) == 0);
+    CHECK(segregated_bstack_allocator_recover(a, &unsure) == 0);
+    CHECK(unsure == 0);
+
+    bstack_close(segregated_bstack_allocator_into_stack(a));
+    sg_unlink(tmp); return 0;
+}
+
+/* A freed batch is drained back out of its class lists, and a recycled block
+ * reads back zero (the claim scrubs the previous occupant's bytes). */
+static int test_bulk_reuses_and_scrubs(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    segregated_bstack_allocator_t *a = segregated_bstack_allocator_new(bs);
+    CHECK(a);
+    bstack_allocator_t *base = (bstack_allocator_t *)a;
+
+    uint64_t lens[3] = { 100, 100, 100 };
+    bstack_slice_t first[3], second[3];
+    uint8_t buf[100], got[100];
+    size_t i, j;
+    int found;
+
+    CHECK(bstack_allocator_alloc_bulk(base, lens, 3, first) == 0);
+    memset(buf, 0x5A, sizeof buf);
+    for (i = 0; i < 3; i++) CHECK(bstack_slice_write(first[i], buf, 100) == 0);
+    CHECK(bstack_allocator_dealloc_bulk(base, first, 3) == 0);
+
+    CHECK(bstack_allocator_alloc_bulk(base, lens, 3, second) == 0);
+    for (i = 0; i < 3; i++) {
+        found = 0;
+        for (j = 0; j < 3; j++) if (second[i].offset == first[j].offset) found = 1;
+        CHECK(found); /* every block came off the class free list */
+        CHECK(bstack_slice_read_into(second[i], got, 100) == 0);
+        for (j = 0; j < 100; j++) CHECK(got[j] == 0); /* scrubbed */
+    }
+
+    bstack_close(segregated_bstack_allocator_into_stack(a));
+    sg_unlink(tmp); return 0;
+}
+
+/* An oversized request matches a freed oversized block; slack at or above
+ * SPLIT_MIN is carved back into class blocks that stay reusable. */
+static int test_bulk_oversized_match_and_carve(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    segregated_bstack_allocator_t *a = segregated_bstack_allocator_new(bs);
+    CHECK(a);
+    bstack_allocator_t *base = (bstack_allocator_t *)a;
+
+    bstack_slice_t x, pin, out[1], rem;
+    uint64_t off_x, lens[1], unsure;
+
+    CHECK(bstack_allocator_alloc(base, 5000, &x) == 0); /* oversized, block 5008 */
+    off_x = x.offset;
+    CHECK(bstack_allocator_alloc(base, 50, &pin) == 0); /* keeps X off the tail */
+    CHECK(bstack_allocator_dealloc(base, x) == 0);      /* X -> oversized list */
+
+    /* 4200 -> block 4208 (oversized); excess 800 >= SPLIT_MIN, so it carves. */
+    lens[0] = 4200;
+    CHECK(bstack_allocator_alloc_bulk(base, lens, 1, out) == 0);
+    CHECK(out[0].offset == off_x);
+    CHECK(segregated_bstack_allocator_recover(a, &unsure) == 0);
+    CHECK(unsure == 0); /* every carved piece strides its recorded size */
+
+    /* The 768-byte remainder is on its class list and recycles. */
+    CHECK(bstack_allocator_alloc(base, 700, &rem) == 0);
+    CHECK(rem.offset == off_x - 8 + 4208 + 8);
+
+    CHECK(bstack_allocator_dealloc(base, rem) == 0);
+    CHECK(bstack_allocator_dealloc_bulk(base, out, 1) == 0);
+    CHECK(bstack_allocator_dealloc(base, pin) == 0);
+
+    bstack_close(segregated_bstack_allocator_into_stack(a));
+    sg_unlink(tmp); return 0;
+}
+
+/* A batch repeating a block, or freeing one twice, is rejected before any
+ * write; a foreign slice rejects the whole batch. */
+static int test_bulk_dealloc_rejects_bad_batches(void)
+{
+    char t1[64], t2[64]; make_tmp(t1, sizeof t1); make_tmp(t2, sizeof t2);
+    bstack_t *b1 = bstack_open(t1); CHECK(b1);
+    bstack_t *b2 = bstack_open(t2); CHECK(b2);
+    segregated_bstack_allocator_t *a1 = segregated_bstack_allocator_new(b1);
+    segregated_bstack_allocator_t *a2 = segregated_bstack_allocator_new(b2);
+    CHECK(a1 && a2);
+    bstack_allocator_t *g1 = (bstack_allocator_t *)a1;
+    bstack_allocator_t *g2 = (bstack_allocator_t *)a2;
+
+    uint64_t lens[2] = { 40, 40 };
+    bstack_slice_t out[2], dup[2], foreign[2];
+
+    CHECK(bstack_allocator_alloc_bulk(g1, lens, 2, out) == 0);
+
+    dup[0] = out[0]; dup[1] = out[0];              /* same block twice */
+    CHECK(bstack_allocator_dealloc_bulk(g1, dup, 2) == -1);
+    /* Nothing was freed: the real batch still succeeds. */
+    CHECK(bstack_allocator_dealloc_bulk(g1, out, 2) == 0);
+    /* Now they are free: a second pass is a double free. */
+    CHECK(bstack_allocator_dealloc_bulk(g1, out, 2) == -1);
+
+    CHECK(bstack_allocator_alloc_bulk(g2, lens, 2, foreign) == 0);
+    CHECK(bstack_allocator_dealloc_bulk(g1, foreign, 2) == -1);
+    CHECK(bstack_allocator_dealloc_bulk(g2, foreign, 2) == 0);
+
+    bstack_close(segregated_bstack_allocator_into_stack(a1));
+    bstack_close(segregated_bstack_allocator_into_stack(a2));
+    sg_unlink(t1); sg_unlink(t2); return 0;
+}
+
+/* recover() relinks a non-class size onto the largest class <= size, so
+ * alloc_bulk must accept it there too (single alloc already does). */
+static int test_bulk_reuses_recovered_non_class_size(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    segregated_bstack_allocator_t *a = segregated_bstack_allocator_new(bs);
+    CHECK(a);
+    bstack_allocator_t *base = (bstack_allocator_t *)a;
+
+    bstack_slice_t x, pin, out[1];
+    uint64_t xb, lens[1], unsure;
+    uint8_t w[8];
+
+    /* Block 320 (class 16) at the arena start; the second alloc pins it off the
+     * tail so dealloc frees it rather than discarding it. */
+    CHECK(bstack_allocator_alloc(base, 300, &x) == 0);
+    xb = x.offset - 8;
+    CHECK(xb == SG_ARENA_START);
+    CHECK(bstack_allocator_alloc(base, 300, &pin) == 0);
+    CHECK(bstack_allocator_dealloc(base, x) == 0);
+
+    /* Split the 320 into a free 272 (not a class size) plus a free 48, so
+     * recover()'s linear scan still walks cleanly into the pinned block. */
+    sg_wr64(w, 272u >> 4); CHECK(bstack_set(bs, xb, w, 8) == 0);
+    sg_wr64(w, 48u >> 4);  CHECK(bstack_set(bs, xb + 272, w, 8) == 0);
+    CHECK(segregated_bstack_allocator_recover(a, &unsure) == 0);
+    CHECK(unsure == 0);
+
+    /* largest_class_le(272) == 256, so it lands on class 15. */
+    CHECK(bstack_get(bs, SG_HEAD_OFF(15), SG_HEAD_OFF(15) + 8, w) == 0);
+    CHECK(sg_rd64(w) == xb);
+
+    /* A class-15 request (block 256) reuses it instead of failing the batch. */
+    lens[0] = 248;
+    CHECK(bstack_allocator_alloc_bulk(base, lens, 1, out) == 0);
+    CHECK(out[0].offset == xb + 8);
+
+    CHECK(bstack_allocator_dealloc(base, pin) == 0);
+    bstack_close(segregated_bstack_allocator_into_stack(a));
+    sg_unlink(tmp); return 0;
+}
+
+/* A cycle in a classed free list is rejected with no write. */
+static int test_bulk_rejects_free_list_cycle(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    segregated_bstack_allocator_t *a = segregated_bstack_allocator_new(bs);
+    CHECK(a);
+    bstack_allocator_t *base = (bstack_allocator_t *)a;
+
+    bstack_slice_t p[2], out[2];
+    uint64_t lens[2] = { 40, 40 };
+    uint8_t w[8];
+
+    CHECK(bstack_allocator_alloc_bulk(base, lens, 2, p) == 0);
+    CHECK(bstack_allocator_dealloc_bulk(base, p, 2) == 0);
+    /* Point the list head's block back at itself. */
+    CHECK(bstack_get(bs, SG_HEAD_OFF(2), SG_HEAD_OFF(2) + 8, w) == 0);
+    CHECK(bstack_set(bs, sg_rd64(w) + 8, w, 8) == 0);
+    CHECK(bstack_allocator_alloc_bulk(base, lens, 2, out) == -1);
+
+    bstack_close(segregated_bstack_allocator_into_stack(a));
+    sg_unlink(tmp); return 0;
+}
+
+#endif /* BSTACK_FEATURE_ATOMIC */
+
+/* =========================================================================
  * main
  * ====================================================================== */
 
@@ -746,6 +1007,16 @@ int main(void)
     T(test_fuzz_mixed);
 
     T(test_foreign_slice_is_rejected);
+
+#ifdef BSTACK_FEATURE_ATOMIC
+    T(test_bulk_empty_and_zero_lengths);
+    T(test_bulk_alloc_distinct_usable);
+    T(test_bulk_reuses_and_scrubs);
+    T(test_bulk_oversized_match_and_carve);
+    T(test_bulk_dealloc_rejects_bad_batches);
+    T(test_bulk_reuses_recovered_non_class_size);
+    T(test_bulk_rejects_free_list_cycle);
+#endif
 
     printf("\n%d/%d tests passed\n", g_passed, g_total);
     return g_passed == g_total ? 0 : 1;
