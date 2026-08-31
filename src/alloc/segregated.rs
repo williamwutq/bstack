@@ -1437,7 +1437,7 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
         // `NUM_CLASSES` (a constant), so it lives on the stack, not the heap.
         let mut block_of = vec![0u64; n];
         let mut want = [0usize; Self::NUM_CLASSES as usize];
-        let mut oversized_reqs: Vec<usize> = Vec::new();
+        let mut oversized_reqs: Vec<usize> = Vec::with_capacity(n);
         for (i, &len) in lengths.iter().enumerate() {
             if len == 0 {
                 continue;
@@ -1458,7 +1458,10 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
         // rollback, and the `CarveFree` portion alone is relinked on success.
         // `Fresh` blocks (the extended tail) are a suffix, discarded via `try_discard`.
         let mut claims: Vec<(u64, u64, ClaimKind)> = Vec::with_capacity(n); // (offset, size, kind)
-        let mut fresh_start = 0usize;
+        // Where the `Fresh` suffix begins. `usize::MAX` until step 3 records it, so
+        // an error in step 1/2 (before any `Fresh` exists) treats every claim as
+        // non-`Fresh`; always used clamped to `claims.len()`.
+        let mut fresh_start = usize::MAX;
         let mut ext_base = 0u64;
         let mut ext_bytes = 0u64;
 
@@ -1651,6 +1654,7 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
             //    (reclaimed by `recover`). In-place partition the non-`Fresh` prefix
             //    so `Reuse` blocks come first and `CarveFree` remainders last, then
             //    relink just the remainders.
+            let fresh_start = fresh_start.min(claims.len());
             let non_fresh = &mut claims[..fresh_start];
             let mut carve_start = 0usize;
             for j in 0..non_fresh.len() {
@@ -1673,7 +1677,8 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
             if ext_bytes > 0 {
                 let _ = self.stack.try_discard(ext_base + ext_bytes, ext_bytes);
             }
-            self.repush_detached(&mut claims[..fresh_start]);
+            let end = fresh_start.min(claims.len());
+            self.repush_detached(&mut claims[..end]);
         })
     }
 
@@ -3538,6 +3543,37 @@ mod bulk_tests {
         // whole cycle and must detect the revisit rather than spin forever.
         let err = a.alloc_bulk([9000u64]).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn alloc_bulk_oversized_error_rolls_back_classed_pops() {
+        let (a, _g) = new_alloc();
+        // A classed free block (step-1 poppable) and an oversized block, both
+        // pinned off the tail.
+        let c = a.alloc(64).unwrap();
+        let c_start = c.start() - Seg::OVERHEAD;
+        let big = a.alloc(5000).unwrap();
+        let big_start = big.start() - Seg::OVERHEAD;
+        let _pin = a.alloc(100).unwrap();
+        a.dealloc(c).unwrap();
+        a.dealloc(big).unwrap();
+        // Corrupt the oversized block so step 2 errors after step 1 has popped `c`.
+        let mut buf = [0u8; 8];
+        a.stack.get_into(big_start, &mut buf).unwrap();
+        let word = u64::from_le_bytes(buf);
+        a.stack
+            .set(big_start, (word | Seg::IN_USE_BIT).to_le_bytes())
+            .unwrap();
+        let err = a.alloc_bulk([64u64, 5000]).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        // Rollback must repush the step-1 pop, not leak it: a fresh classed alloc
+        // reuses the same block.
+        let again = a.alloc(64).unwrap();
+        assert_eq!(
+            again.start() - Seg::OVERHEAD,
+            c_start,
+            "step-1 pop leaked on oversized-error rollback"
+        );
     }
 }
 
