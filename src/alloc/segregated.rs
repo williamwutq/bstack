@@ -1210,8 +1210,10 @@ impl SegregatedBStackAllocator {
         let mut node_buf = [0u8; 16]; // [0..8] overhead (free tag), [8..16] next
         let mut payload_len = 0u64;
         let payload_ptr: *mut u64 = &mut payload_len;
-        // The chase is unbounded, so a cyclic list must be caught or it spins forever.
-        let mut seen: HashSet<u64> = HashSet::new();
+        // The chase is unbounded, so a cyclic list must be caught. No visited set:
+        // a valid list holds at most `payload_len / QUANTUM` blocks, so a walk past
+        // that is a cycle (an O(1) counter, like `FirstFitBStackAllocator`).
+        let mut walk = 0u64;
         // The pointer field that currently points at `cursor` (head, or a survivor's
         // `next`); `dangling` marks it as needing a repoint once a removal has left a
         // gap, deferred so a run of removals collapses into one patch.
@@ -1267,8 +1269,10 @@ impl SegregatedBStackAllocator {
                         }
                     }
                     St::ReadNode(cursor) => {
-                        // A revisited block is a cycle: bail with no write staged.
-                        if !seen.insert(cursor) {
+                        // More blocks walked than could fit means a cycle: bail with
+                        // no write staged.
+                        walk += 1;
+                        if walk > payload_len / Self::QUANTUM + 1 {
                             err = Some(io_error!(
                                 InvalidData,
                                 "alloc_bulk: oversized free-list cycle detected"
