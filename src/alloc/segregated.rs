@@ -1120,14 +1120,14 @@ impl SegregatedBStackAllocator {
     /// Errors are swallowed — a block that cannot be re-pushed is a free-tagged
     /// leak `recover` reclaims. Sorts `blocks` in place (the caller no longer needs
     /// its order), so no working copy is allocated.
-    fn repush_detached(&self, blocks: &mut [(u64, u64)]) {
+    fn repush_detached(&self, blocks: &mut [(u64, u64, ClaimKind)]) {
         if blocks.is_empty() {
             return;
         }
-        // Bucket by class without a Vec-per-class: sort by class in place (classify
-        // recomputed on demand, so no `(class, off, size)` triple), then splice
+        // Bucket by class without a Vec-per-class: sort by class in place (the
+        // `ClaimKind` tag is ignored — only offset and size matter), then splice
         // each contiguous run straight from a sub-slice.
-        blocks.sort_unstable_by_key(|&(_, size)| Self::classify(size));
+        blocks.sort_unstable_by_key(|&(_, size, _)| Self::classify(size));
         let mut i = 0usize;
         while i < blocks.len() {
             let class = Self::classify(blocks[i].1);
@@ -1337,13 +1337,14 @@ impl SegregatedBStackAllocator {
     /// run with one atomic [`BStack::cross_exchange`] — so a concurrent push/pop
     /// cannot be lost. Every `blocks[i]` must map to `class` (all classed blocks of
     /// one class share a size; the oversized bucket holds any size). No-op if empty.
-    fn splice_class_chain(&self, class: u64, blocks: &[(u64, u64)]) -> io::Result<()> {
+    fn splice_class_chain(&self, class: u64, blocks: &[(u64, u64, ClaimKind)]) -> io::Result<()> {
         if blocks.is_empty() {
             return Ok(());
         }
         // `set_batched` takes an iterator (each `[u8; 16]` is `AsRef<[u8]>`), so the
         // staged nodes stream straight from `blocks` — no intermediate batch Vec.
-        let writes = blocks.iter().enumerate().map(|(i, &(block, size))| {
+        // The `ClaimKind` tag is ignored; only offset and size matter.
+        let writes = blocks.iter().enumerate().map(|(i, &(block, size, _))| {
             // Last block's next is the placeholder `blocks[0]` that cross_exchange
             // replaces with the old head.
             let next = if i + 1 < blocks.len() {
@@ -1451,9 +1452,13 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
             }
         }
 
-        // Every free-tagged block we detached/created, for rollback repush. At
-        // least one per non-zero request (oversized carves/relinks add a few more).
-        let mut detached: Vec<(u64, u64)> = Vec::with_capacity(n);
+        // Every claim the final `set_batched` applies, tagged by kind — also the
+        // one source for rollback and relink: `Reuse`/`CarveFree` (the non-`Fresh`
+        // prefix `claims[..fresh_start]`) are the detached blocks to repush on
+        // rollback, and the `CarveFree` portion alone is relinked on success.
+        // `Fresh` blocks (the extended tail) are a suffix, discarded via `try_discard`.
+        let mut claims: Vec<(u64, u64, ClaimKind)> = Vec::with_capacity(n); // (offset, size, kind)
+        let mut fresh_start = 0usize;
         let mut ext_base = 0u64;
         let mut ext_bytes = 0u64;
 
@@ -1465,11 +1470,6 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
             // zero-length requests simply keep theirs.
             let mut result: Vec<BStackOwnedSlice<'_, Self>> =
                 (0..n).map(|_| BStackOwnedSlice::empty(self)).collect();
-            // Every claim the final `set_batched` applies, tagged by kind. Each
-            // non-zero request contributes at least one claim (carve remainders add
-            // a bounded few more), so `n` is a good starting capacity.
-            let mut claims: Vec<(u64, u64, ClaimKind)> = Vec::with_capacity(n); // (offset, size, kind)
-            let mut to_splice: Vec<(u64, u64)> = Vec::new(); // free blocks to relink (best-effort)
 
             // 1. Atomic classed pop across all touched classes. `popped` is
             //    flattened in ascending class order, so class `c`'s blocks are the
@@ -1502,7 +1502,6 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
                 result[i] = unsafe {
                     BStackOwnedSlice::from_raw_parts(self, bs + Self::OVERHEAD, lengths[i])
                 };
-                detached.push((bs, size));
                 claims.push((bs, size, ClaimKind::Reuse));
             }
 
@@ -1519,14 +1518,12 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
                     result[req] = unsafe {
                         BStackOwnedSlice::from_raw_parts(self, boff + Self::OVERHEAD, lengths[req])
                     };
-                    // Rollback frees the whole block (nothing is carved until the
-                    // claim commits).
-                    detached.push((boff, bsize));
                     let excess = bsize - block;
                     if excess >= Self::SPLIT_MIN {
                         // Carve: claim `block`, free the remainder greedily into
-                        // class blocks (their free overhead is written by the claim,
-                        // so the region stays recover-safe).
+                        // class blocks. On rollback the block is repushed as this
+                        // sub-block plus the remainders (fragmenting it — accepted,
+                        // as only large blocks carve and rarely).
                         claims.push((boff, block, ClaimKind::Reuse));
                         let mut off = boff + block;
                         let mut rem = excess;
@@ -1537,7 +1534,6 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
                                 Self::largest_class_le(rem)
                             };
                             claims.push((off, ps, ClaimKind::CarveFree));
-                            to_splice.push((off, ps));
                             off += ps;
                             rem -= ps;
                         }
@@ -1553,7 +1549,9 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
             //    writes each fresh block's free overhead (self-describing tail). A
             //    miss is a non-zero request still holding its null slice —
             //    `block_of[i] > 0 && result[i].is_empty()` — recomputed at each pass
-            //    rather than materialised into a `Vec`.
+            //    rather than materialised into a `Vec`. Everything pushed so far is
+            //    non-`Fresh`; the `Fresh` blocks appended below form the suffix.
+            fresh_start = claims.len();
             let mut total_ext = 0u64;
             for i in 0..n {
                 if block_of[i] > 0 && result[i].is_empty() {
@@ -1650,21 +1648,32 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
 
             // 5. Relink the now-free carve remainders. Best-effort: the allocations
             //    are already valid, and a block left unspliced stays free-tagged
-            //    (reclaimed by `recover`).
-            self.repush_detached(&mut to_splice);
+            //    (reclaimed by `recover`). In-place partition the non-`Fresh` prefix
+            //    so `Reuse` blocks come first and `CarveFree` remainders last, then
+            //    relink just the remainders.
+            let non_fresh = &mut claims[..fresh_start];
+            let mut carve_start = 0usize;
+            for j in 0..non_fresh.len() {
+                if matches!(non_fresh[j].2, ClaimKind::Reuse) {
+                    non_fresh.swap(carve_start, j);
+                    carve_start += 1;
+                }
+            }
+            self.repush_detached(&mut claims[carve_start..fresh_start]);
 
             // `result` was filled in place as blocks were assigned.
             Ok(result)
         })();
 
         build.inspect_err(|_| {
-            // Best-effort rollback: drop the fresh tail first, then return the
-            // detached blocks to their lists (a fresh tail a concurrent extend
-            // grew past stays free-tagged and is reclaimed by `recover`).
+            // Best-effort rollback: drop the fresh tail first, then repush every
+            // non-`Fresh` claim (the detached/matched blocks and any carve
+            // remainders) to its class list. A carved block returns as its claimed
+            // sub-block plus the remainders — fragmented, but every byte reclaimed.
             if ext_bytes > 0 {
                 let _ = self.stack.try_discard(ext_base + ext_bytes, ext_bytes);
             }
-            self.repush_detached(&mut detached);
+            self.repush_detached(&mut claims[..fresh_start]);
         })
     }
 
