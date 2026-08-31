@@ -88,22 +88,26 @@
 //!
 //! # Deferred replay
 //!
-//! The same recovery also runs without reopening the file. A write that fails
-//! after its first mutating I/O can leave the states above — an armed journal, or
-//! a stale tail past the committed length — on a handle that stays open. Rather
-//! than replay on the spot, the failure is recorded in an in-memory
-//! `replay_needed` flag under the `BStack` rwlock and the error is returned
-//! unchanged. While it is set:
+//! A [`BStack`] stays usable after a write fails, with no reopen: the next write
+//! repairs the file before doing anything else, and reads refuse until it has.
+//!
+//! A write that fails after its first mutating I/O can leave the states above —
+//! an armed journal, or a stale tail past the committed length — on a handle
+//! that stays open. The failed call returns its error unchanged and the repair
+//! is deferred to the next write, through an in-memory `replay_needed` flag
+//! under the `BStack` rwlock. While it is set:
 //!
 //! * **The next write replays first, silently**, before validating its own
 //!   arguments — a stale tail would inflate the payload size every mutator
 //!   derives from the file end — then proceeds normally. The flag clears only
 //!   once the replay succeeds; a failing replay returns its own error.
 //! * **Reads fail** with [`InterruptedWrite`]. This covers every read that
-//!   consults the file or the cached committed length, [`len`](BStack::len)
-//!   included; a read that returns before taking the lock (an empty buffer,
-//!   `n == 0`), and a lock-free read of the immutable locked prefix, are
-//!   unaffected.
+//!   consults the file or the cached committed length — [`len`](BStack::len),
+//!   and a zero-length [`get(n, n)`](BStack::get) too, since it still checks
+//!   `n` against the payload size. Unaffected are the calls that return before
+//!   taking the lock (`peek_into`/`get_into` on an empty buffer,
+//!   `get_batched`/`get_batched_into` on no entries) and lock-free reads of the
+//!   immutable locked prefix.
 //!
 //! # Durability
 //!
@@ -1655,6 +1659,8 @@ impl BStack {
     ///
     /// Returns [`io::ErrorKind::InvalidInput`] if `offset` exceeds the current
     /// payload size.
+    ///
+    /// Fails with [`InterruptedWrite`] while an earlier write is pending replay.
     pub fn peek(&self, offset: u64) -> io::Result<Vec<u8>> {
         #[cfg(any(unix, windows))]
         {
@@ -1705,6 +1711,8 @@ impl BStack {
     ///
     /// Returns [`io::ErrorKind::InvalidInput`] if `end < start` or if `end`
     /// exceeds the current payload size.
+    ///
+    /// Fails with [`InterruptedWrite`] while an earlier write is pending replay.
     pub fn get(&self, start: u64, end: u64) -> io::Result<Vec<u8>> {
         if end < start {
             return Err(io_error!(
@@ -1796,6 +1804,8 @@ impl BStack {
     ///
     /// Returns [`io::ErrorKind::InvalidInput`] if `offset + buf.len()` overflows
     /// `u64` or exceeds the current payload size.
+    ///
+    /// Fails with [`InterruptedWrite`] while an earlier write is pending replay.
     pub fn peek_into(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
         if buf.is_empty() {
             return Ok(());
@@ -1856,6 +1866,8 @@ impl BStack {
     ///
     /// Returns [`io::ErrorKind::InvalidInput`] if `start + buf.len()` overflows
     /// `u64` or exceeds the current payload size.
+    ///
+    /// Fails with [`InterruptedWrite`] while an earlier write is pending replay.
     pub fn get_into(&self, start: u64, buf: &mut [u8]) -> io::Result<()> {
         if buf.is_empty() {
             return Ok(());
@@ -2623,6 +2635,8 @@ impl BStack {
     ///
     /// Returns [`io::ErrorKind::InvalidInput`] if any range has `end < start`
     /// or if any `end` exceeds the current payload size.
+    ///
+    /// Fails with [`InterruptedWrite`] while an earlier write is pending replay.
     #[cfg(feature = "atomic")]
     pub fn get_batched<I>(&self, ranges: I) -> io::Result<Vec<Vec<u8>>>
     where
@@ -2708,6 +2722,8 @@ impl BStack {
     /// Returns [`io::ErrorKind::InvalidInput`] if any `offset + buf.len()`
     /// overflows `u64` or if any read would extend beyond the current payload
     /// size.
+    ///
+    /// Fails with [`InterruptedWrite`] while an earlier write is pending replay.
     #[cfg(feature = "atomic")]
     pub fn get_batched_into<'a, I>(&self, bufs: I) -> io::Result<()>
     where
@@ -2785,6 +2801,8 @@ impl BStack {
     ///
     /// Returns [`io::ErrorKind::InvalidInput`] if any `offset + buf.len()`
     /// overflows `u64` or exceeds the current payload size.
+    ///
+    /// Fails with [`InterruptedWrite`] while an earlier write is pending replay.
     #[cfg(feature = "atomic")]
     pub fn get_batched_gen<'a, F>(&self, mut f: F) -> io::Result<()>
     where
@@ -4602,6 +4620,8 @@ impl BStack {
     /// Returns [`io::ErrorKind::InvalidInput`] if `n` is less than the current
     /// locked length (partition can only grow) or if `n` exceeds the current
     /// payload length.
+    ///
+    /// Fails with [`InterruptedWrite`] while an earlier write is pending replay.
     pub fn lock_up_to(&self, n: u64) -> io::Result<()> {
         // Acquire the write lock to serialise against any in-flight writers.
         #[allow(unused_mut)]
