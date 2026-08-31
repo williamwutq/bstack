@@ -954,6 +954,67 @@ static int test_pending_replay_leaves_the_locked_prefix_readable(void)
     return 0;
 }
 
+static int test_recover_applies_a_pending_replay_without_a_write(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    uint8_t a[300]; memset(a, 'a', sizeof a);
+    CHECK(bstack_push(bs, a, sizeof a, NULL) == 0);
+    {
+        uint8_t b[300]; memset(b, 'b', sizeof b);
+        uint8_t ptr[8] = { TEST_HEADER_SIZE, 0, 0, 0, 0, 0, 0, 0 };
+        int fd = open(tmp, O_WRONLY | O_BINARY);
+        CHECK(fd >= 0);
+        CHECK(pwrite(fd, b, sizeof b, TEST_HEADER_SIZE + 300) == (ssize_t)sizeof b);
+        CHECK(pwrite(fd, ptr, 8, 16) == 8);
+        close(fd);
+    }
+    CHECK(fail_one_write(bs, tmp) == 0);
+    uint8_t got[300];
+    CHECK(bstack_get(bs, 0, 300, got) == -1);
+
+    /* The point of the call: read again after a failed write, without
+     * having to issue another one. */
+    int replayed = -1;
+    CHECK(bstack_recover(bs, &replayed) == 0);
+    CHECK(replayed == 1);
+    uint64_t len;
+    CHECK(bstack_len(bs, &len) == 0);
+    CHECK(len == 300);
+    uint8_t expect[300]; memset(expect, 'b', sizeof expect);
+    CHECK(bstack_get(bs, 0, 300, got) == 0);
+    CHECK(memcmp(got, expect, sizeof expect) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_recover_on_an_intact_stack_reports_nothing_pending(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    CHECK(bstack_push(bs, (const uint8_t *)"hello", 5, NULL) == 0);
+
+    int replayed = -1;
+    CHECK(bstack_recover(bs, &replayed) == 0);
+    CHECK(replayed == 0);
+
+    /* A replay runs once: the second call has nothing left to do.  A NULL
+     * out_replayed is valid. */
+    CHECK(fail_one_write(bs, tmp) == 0);
+    CHECK(bstack_recover(bs, &replayed) == 0);
+    CHECK(replayed == 1);
+    CHECK(bstack_recover(bs, NULL) == 0);
+    uint64_t len;
+    CHECK(bstack_len(bs, &len) == 0);
+    CHECK(len == 5);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
 #endif /* !_WIN32 */
 
 /* =========================================================================
@@ -5951,6 +6012,8 @@ int main(void)
     T(test_failed_write_defers_a_replay);
     T(test_pending_replay_applies_the_journal_on_the_next_write);
     T(test_pending_replay_leaves_the_locked_prefix_readable);
+    T(test_recover_applies_a_pending_replay_without_a_write);
+    T(test_recover_on_an_intact_stack_reports_nothing_pending);
 #endif
 
     /* Write-in-progress journal recovery (always compiled) */

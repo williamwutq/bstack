@@ -42,7 +42,8 @@
  * is deferred to the next write, through an in-memory replay_needed flag held
  * under the same rwlock as the file descriptor.  While it is set:
  *   - any write replays silently and clears the flag, before validating its own
- *     arguments, then proceeds normally;
+ *     arguments, then proceeds normally, and bstack_recover does the same on
+ *     demand without writing;
  *   - any read fails with errno = BSTACK_EREPLAY, including bstack_len,
  *     bstack_is_empty, bstack_lock_up_to, and bstack_try_discard(s, 0);
  *   - a read that returns before taking the lock, and a lock-free read inside
@@ -59,7 +60,7 @@
  * bstack_try_extend / bstack_try_extend_zeros / bstack_try_discard(s, n>0) /
  * bstack_ensure_with / bstack_swap / bstack_cas / bstack_replace / bstack_process /
  * bstack_process_gen / bstack_set_batched / bstack_inplace_gen /
- * bstack_cross_exchange / bstack_copy /
+ * bstack_cross_exchange / bstack_copy / bstack_recover /
  * bstack_eq_crds / bstack_ne_crds /
  * bstack_masked_eq_crds / bstack_masked_ne_crds
  * hold a write lock.  bstack_try_discard(s, 0) holds a read lock.
@@ -153,6 +154,27 @@ void bstack_close(bstack_t *bs);
  */
 BSTACK_WARN_UNUSED_RESULT
 int bstack_migrate(const char *path);
+
+/*
+ * Replay a pending interrupted write now, rather than waiting for the next
+ * write to do it (see "Deferred replay" above).
+ *
+ * If out_replayed is non-NULL it receives 1 when one was pending and has been
+ * replayed, 0 when the stack was already intact.  Reads refused with
+ * BSTACK_EREPLAY succeed again once this returns 0 — which is the point of the
+ * call: a caller whose write failed can carry on reading without having to
+ * issue another write or reopen the file.
+ *
+ * The repair is the one bstack_open performs, and every write already runs it,
+ * so calling this is never required for correctness.  On failure the replay's
+ * errno is returned and the stack stays flagged, so a later call — or the next
+ * write — can retry.
+ *
+ * Not marked warn-unused-result: discarding the return value is a reasonable
+ * way to call it — repair if you can, and leave the flag for the next write
+ * otherwise.
+ */
+int bstack_recover(bstack_t *bs, int *out_replayed);
 
 /*
  * Append len bytes from data to the stack.

@@ -1202,6 +1202,31 @@ static int commit_sparse_extend(bstack_t *bs, uint64_t logical_offset,
 }
 
 /* -------------------------------------------------------------------------
+ * bstack_recover
+ * ---------------------------------------------------------------------- */
+
+int bstack_recover(bstack_t *bs, int *out_replayed)
+{
+    BS_WRLOCK(bs);
+    if (!bs->replay_needed) {
+        BS_WRUNLOCK(bs);
+        if (out_replayed)
+            *out_replayed = 0;
+        return 0;
+    }
+    if (replay_pending(bs) != 0) {
+        int saved = errno;
+        BS_WRUNLOCK(bs);
+        errno = saved;
+        return -1;
+    }
+    BS_WRUNLOCK(bs);
+    if (out_replayed)
+        *out_replayed = 1;
+    return 0;
+}
+
+/* -------------------------------------------------------------------------
  * bstack_push
  * ---------------------------------------------------------------------- */
 
