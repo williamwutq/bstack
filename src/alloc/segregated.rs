@@ -1719,8 +1719,8 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
             if n_live == 0 {
                 return Ok(()); // no-op: nothing to read, stage, or splice
             }
-            // Read every non-null handle's overhead word under ONE lock via
-            // `get_batched_gen` rather than one locked read per handle.
+            // Read every non-null handle's overhead word under one lock, rather
+            // than one locked read per handle.
             let mut words: Vec<[u8; 8]> = vec![[0u8; 8]; slices.len()];
             let mut gi = 0usize;
             self.stack.get_batched_gen(|| {
@@ -1738,14 +1738,11 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
                 Some((off, buf))
             })?;
 
-            // Validate every handle and build each class's chain BACKWARD in one
-            // pass, so a block's `next` — the class's current chain head — is known
-            // when the block is pushed (its 16-byte payload is complete, no per-block
-            // back-patch). `first[class]` is the chain head so far (a plain offset,
-            // `SENTINEL` until the class is first seen); `tail_idx[class]` is the
-            // batch index of the class's first block, whose `next` is the one field
-            // patched at close (≤ NUM_CLASSES patches). `touched[..ntouched]` lists
-            // the classes in first-touch order. Reject a bad batch before any write.
+            // Validate and chain each class backward: a block's `next` is the class's
+            // current head (`first[class]`, an offset), known at push, so no
+            // per-block back-patch — only each class's first block (`tail_idx`) is
+            // patched at close. `touched[..ntouched]` lists the classes seen. Reject
+            // a bad batch before any write.
             let mut batch: Vec<(u64, [u8; 16])> = Vec::with_capacity(slices.len()); // (block, [free oh | next])
             let mut first = [Self::SENTINEL; Self::NUM_CLASSES as usize];
             let mut tail_idx = [0usize; Self::NUM_CLASSES as usize];
