@@ -747,20 +747,25 @@ recovery is safe to re-run.  No caller action is required; recovery is transpare
 
 ## Deferred replay
 
-The same recovery also runs *without* reopening the file.  A write that fails
-after its first mutating I/O — a full disk, an I/O error, a failed
-`durable_sync` — can leave exactly the states above: an armed journal, or a
+**A `BStack` stays usable after a write fails**, with no reopen: the next write
+repairs the file before doing anything else, and reads refuse until it has.
+
+A write that fails after its first mutating I/O — a full disk, an I/O error, a
+failed `durable_sync` — can leave exactly the states above: an armed journal, or a
 stale tail past the committed length.  The failed call returns its error
 unchanged and the repair is deferred to the next write, through an in-memory
 `replay_needed` flag held under the same rwlock as the file handle.  While it is
 set:
 
-| Call                                                  | Behaviour                                                                                   |
-|-------------------------------------------------------|---------------------------------------------------------------------------------------------|
-| any write (`push`, `set`, `splice`, …)                | replays silently and clears the flag, *before* validating arguments, then proceeds normally |
-| any read (`get`, `len`, `lock_up_to`, …)              | fails with an `InterruptedWrite` payload                                                    |
-| a read that touches no bytes (empty buffer, `n == 0`) | unaffected — it returns before taking the lock                                              |
-| a `get`/`get_into` inside the locked prefix           | unaffected — those bytes are immutable and no journal can target them                       |
+| Call                                                                                      | Behaviour                                                                                   |
+|-------------------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------|
+| any write (`push`, `set`, `splice`, …)                                                    | replays silently and clears the flag, *before* validating arguments, then proceeds normally |
+| any read (`get`, `len`, `lock_up_to`, …)                                                  | fails with an `InterruptedWrite` payload                                                    |
+| `peek_into`/`get_into` on an empty buffer, `get_batched`/`get_batched_into` on no entries | unaffected — they return before taking the lock                                             |
+| `get`/`get_into` inside the locked prefix                                                 | unaffected — those bytes are immutable and no journal can target them                       |
+
+A zero-length read is *not* exempt: `get(n, n)` still checks `n` against the
+payload size, so it fails like any other.
 
 `InterruptedWrite` is a public unit struct carried as the payload of an
 `io::ErrorKind::Other` error, so the state is detectable without matching on the
