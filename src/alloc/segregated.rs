@@ -988,8 +988,7 @@ impl SegregatedBStackAllocator {
     ) -> io::Result<(Vec<u64>, [usize; Self::NUM_CLASSES as usize])> {
         let num = Self::NUM_CLASSES as usize;
         let mut counts = [0usize; Self::NUM_CLASSES as usize];
-        // Total blocks wanted across all classes (the oversized bucket never has
-        // `want > 0`). Zero means nothing to pop.
+        // Total blocks wanted across all classes
         let total_want: usize = want.iter().take(num).sum();
         if total_want == 0 {
             return Ok((Vec::new(), counts));
@@ -1008,12 +1007,12 @@ impl SegregatedBStackAllocator {
 
         #[derive(Clone, Copy)]
         enum St {
-            // Read phase: chase class `c`'s chain (empty `want[c]` skipped).
+            // Read phase
             Chase(usize),
             ConsumeHead(usize),
             ReadNode(usize, u64),
             ConsumeNode(usize, u64),
-            // Write phase: emit the advanced heads, then finish.
+            // Write phase
             Emit(usize),
             Done,
         }
@@ -1030,7 +1029,6 @@ impl SegregatedBStackAllocator {
             }
             loop {
                 match st {
-                    // --- read phase ---
                     St::Chase(c) => {
                         if c >= num {
                             st = St::Emit(0);
@@ -1085,7 +1083,6 @@ impl SegregatedBStackAllocator {
                             st = St::ReadNode(c, next);
                         }
                     }
-                    // --- write phase ---
                     St::Emit(c) => {
                         let mut c = c;
                         while c < num && !advance[c] {
@@ -1127,36 +1124,33 @@ impl SegregatedBStackAllocator {
             return;
         }
         blocks.sort_unstable_by_key(|&(_, size, _)| Self::classify(size));
-        // Stage every class's chain in one batch; record each run's (last block,
-        // class) for its splice. Within a run block[k].next = block[k+1], and the
-        // last block's next is the run head as the cross_exchange placeholder.
-        let mut batch: Vec<(u64, [u8; 16])> = Vec::with_capacity(blocks.len());
-        let mut splices = [(0u64, 0u64); Self::NUM_CLASSES as usize]; // (last block, class)
+        let same_class = |a: &(u64, u64, ClaimKind), b: &(u64, u64, ClaimKind)| {
+            Self::classify(a.1) == Self::classify(b.1)
+        };
+        // Each class run's (last block, class) for its splice.
+        let mut splices = [(0u64, 0u64); Self::NUM_CLASSES as usize];
         let mut ns = 0usize;
-        let mut i = 0usize;
-        while i < blocks.len() {
-            let class = Self::classify(blocks[i].1);
-            let mut j = i + 1;
-            while j < blocks.len() && Self::classify(blocks[j].1) == class {
-                j += 1;
-            }
-            for k in i..j {
-                let (block, size, _) = blocks[k];
-                let next = if k + 1 < j {
-                    blocks[k + 1].0
+        for run in blocks.chunk_by(same_class) {
+            splices[ns] = (run[run.len() - 1].0, Self::classify(run[0].1));
+            ns += 1;
+        }
+        // Stage every class's chain in one `set_batched`, streamed (no batch Vec):
+        // within a run block[k].next = block[k+1], and the last block's next is the
+        // run head — the cross_exchange placeholder.
+        let writes = blocks.chunk_by(same_class).flat_map(|run| {
+            run.iter().enumerate().map(move |(k, &(block, size, _))| {
+                let next = if k + 1 < run.len() {
+                    run[k + 1].0
                 } else {
-                    blocks[i].0
+                    run[0].0
                 };
                 let mut buf = [0u8; 16];
                 write_buf!(size >> 4 => buf, 0);
                 write_buf!(next => buf, 8);
-                batch.push((block, buf));
-            }
-            splices[ns] = (blocks[j - 1].0, class);
-            ns += 1;
-            i = j;
-        }
-        if self.stack.set_batched(batch).is_err() {
+                (block, buf)
+            })
+        });
+        if self.stack.set_batched(writes).is_err() {
             return; // nothing staged: every block stays free-tagged for `recover`
         }
         for &(last_block, class) in &splices[..ns] {
@@ -1243,7 +1237,6 @@ impl SegregatedBStackAllocator {
             }
             loop {
                 match st {
-                    // --- read phase ---
                     St::ReadLen => {
                         st = St::ReadHead;
                         // SAFETY: `inplace_gen` finishes writing `out` before the
@@ -1347,7 +1340,6 @@ impl SegregatedBStackAllocator {
                             }
                         }
                     }
-                    // --- write phase ---
                     St::Emit(i) => {
                         if i >= patches.len() {
                             st = St::Done;
