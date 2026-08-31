@@ -1275,9 +1275,12 @@ impl SegregatedBStackAllocator {
                             return None;
                         }
                         let next = read_buf_le!(node_buf, 8 => u64);
-                        // Largest request first: `reqs` is descending, so the first
-                        // that fits is the largest that fits. Compact on a match.
-                        if let Some(j) = reqs.iter().position(|&req| block_of[req] <= size) {
+                        // Largest request first: `reqs` is descending, so
+                        // `block_of[req] > size` holds for a prefix; `partition_point`
+                        // (O(log n)) lands on the first request that fits — the
+                        // largest one. Compact on a match.
+                        let j = reqs.partition_point(|&req| block_of[req] > size);
+                        if j < reqs.len() {
                             let req = reqs.remove(j);
                             matched.push((req, cursor, size));
                             // Remove `cursor`: its predecessor must skip it. Defer the
@@ -1376,6 +1379,25 @@ enum ClaimKind {
     Fresh,
     /// Carve remainder: mark free so [`recover`](SegregatedBStackAllocator::recover) relinks it.
     CarveFree,
+}
+
+/// One claim's `set_batched` payload. `Fresh`/`CarveFree` compute their 8-byte
+/// overhead word inline and carry it by value (nothing to memoise); `Reuse`
+/// borrows its whole `[overhead ‖ zeros]` buffer, shared per size.
+#[cfg(feature = "atomic")]
+enum ClaimBuf<'a> {
+    Word([u8; 8]),
+    Body(&'a [u8]),
+}
+
+#[cfg(feature = "atomic")]
+impl AsRef<[u8]> for ClaimBuf<'_> {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            ClaimBuf::Word(w) => w,
+            ClaimBuf::Body(b) => b,
+        }
+    }
 }
 
 /// [`SegregatedBStackAllocator`] batches whole runs across its size classes.
@@ -1598,51 +1620,36 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
                 }
             }
 
-            // 4. Claim: one crash-atomic `set_batched`, one entry per block — a
+            // 4. Claim: one crash-atomic `set_batched`, one entry per block. A
             //    `Reuse` block writes `[in-use overhead ‖ zero body]` as one
-            //    contiguous buffer (so a single reused block still takes
-            //    `set_batched`'s single-write fast path, not a doubled journal),
-            //    a `Fresh` block just its in-use overhead (body already sparse-zero),
-            //    a `CarveFree` remainder its free overhead. Buffers are shared:
-            //    reuse bodies by size, 8-byte overheads by their exact word — the
-            //    distinct sizes are few (≤ NUM_CLASSES classed plus a handful of
-            //    oversized), so this is a handful of buffers, not one per block.
+            //    contiguous buffer (so a single reused block keeps `set_batched`'s
+            //    single-write fast path) borrowed from a per-size buffer — the
+            //    distinct reuse sizes are few. `Fresh`/`CarveFree` need only their
+            //    8-byte overhead word, computed inline and carried by value, so
+            //    there is nothing to memoise for them.
             let mut reuse_buf: HashMap<u64, Vec<u8>> = HashMap::new(); // size → [oh ‖ zeros]
-            let mut oh_buf: HashMap<u64, [u8; 8]> = HashMap::new(); // overhead word → bytes
             for &(_, size, kind) in &claims {
-                match kind {
-                    ClaimKind::Reuse => {
-                        if let std::collections::hash_map::Entry::Vacant(e) = reuse_buf.entry(size)
-                        {
-                            let n = usize::try_from(size).map_err(|_| {
-                                io_error!(InvalidInput, "alloc_bulk: block size exceeds usize")
-                            })?;
-                            let mut b = vec![0u8; n];
-                            write_buf!(Self::IN_USE_BIT | (size >> 4) => b, 0);
-                            e.insert(b);
-                        }
-                    }
-                    ClaimKind::Fresh | ClaimKind::CarveFree => {
-                        let word = match kind {
-                            ClaimKind::CarveFree => size >> 4, // free tag: high bit clear
-                            _ => Self::IN_USE_BIT | (size >> 4),
-                        };
-                        oh_buf.entry(word).or_insert_with(|| {
-                            let mut b = [0u8; 8];
-                            write_buf!(word => b, 0);
-                            b
-                        });
-                    }
+                if matches!(kind, ClaimKind::Reuse)
+                    && let std::collections::hash_map::Entry::Vacant(e) = reuse_buf.entry(size)
+                {
+                    let n = usize::try_from(size).map_err(|_| {
+                        io_error!(InvalidInput, "alloc_bulk: block size exceeds usize")
+                    })?;
+                    let mut b = vec![0u8; n];
+                    write_buf!(Self::IN_USE_BIT | (size >> 4) => b, 0);
+                    e.insert(b);
                 }
             }
             // `set_batched` takes an iterator, so the writes stream straight from
-            // `claims` and the shared buffers — no intermediate batch Vec.
+            // `claims` and the shared reuse buffers — no intermediate batch Vec.
             if !claims.is_empty() {
                 let writes = claims.iter().map(|&(off, size, kind)| {
-                    let buf: &[u8] = match kind {
-                        ClaimKind::Reuse => &reuse_buf[&size],
-                        ClaimKind::Fresh => &oh_buf[&(Self::IN_USE_BIT | (size >> 4))],
-                        ClaimKind::CarveFree => &oh_buf[&(size >> 4)],
+                    let buf = match kind {
+                        ClaimKind::Reuse => ClaimBuf::Body(&reuse_buf[&size]),
+                        ClaimKind::Fresh => {
+                            ClaimBuf::Word((Self::IN_USE_BIT | (size >> 4)).to_le_bytes())
+                        }
+                        ClaimKind::CarveFree => ClaimBuf::Word((size >> 4).to_le_bytes()),
                     };
                     (off, buf)
                 });
