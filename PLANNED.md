@@ -265,32 +265,6 @@ Only the API is gated. `MultiAtrunc` recovery is ungated in `io_core`, and the m
 
 ---
 
-## `SegregatedBStackAllocator` background coalescer
-
-**Feature flag:** `alloc` + `set`; the merge splices require `atomic`.
-**Breaking change:** No API break. Experimental, like the rest of this allocator.
-
-### Motivation
-
-The module doc lists the coalescer as the single pending item, and it is one of the two reasons the allocator is still marked experimental. Freed blocks are only ever returned to their own class list and adjacent free blocks are never merged, so a workload that frees many small blocks can hold a large contiguous free run that no oversized request can use.
-
-### Design
-
-The scan already exists: `recover()` walks every block by its recorded physical size, which is exactly the walk needed to spot adjacency. The coalescer is that walk plus a merge, not new machinery.
-
-- An explicit `coalesce()` entry point rather than a thread — the crate takes no runtime dependencies and spawns no threads; "background" means "out of the allocation path", not "on its own thread".
-- On a run of two or more adjacent free blocks: unlink each from its class list, write one merged free block, push it onto the class for the merged size. Each merge is a bounded set of free-list splices plus one overhead write.
-- Crash safety: every intermediate state must parse as a valid arena for the existing `recover` scan. Leak-preferring ordering gives this — unlinking before the merged overhead word lands leaves reachable-but-unlinked blocks, which `recover` already reclaims — and makes the whole pass restartable.
-
-### Open questions
-
-- **Concurrency.** Under `atomic` the allocator is lock-free with no allocator-level mutex, so a coalescer racing an `alloc` that pops the very block being merged is the hard part. Options are a quiescence requirement (as `recover` already imposes) or a per-block claim protocol.
-- **Bounded work.** Whether a call must be incremental — a cursor plus a work budget — rather than scanning the whole arena, so it can be driven from an idle hook.
-- **Tail handling.** Whether a coalesced run that reaches the tail should be `try_discard`ed back to the file instead of merged into a free block.
-- **Relationship to the deep in-use-leak GC.** The other unimplemented item shares the same linear scan; whether the two ship together or separately is undecided.
-
----
-
 ## Batch `FirstFitBStackAllocator`'s free-list writes
 
 **Feature flag:** `alloc` + `set` + `atomic`.

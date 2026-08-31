@@ -567,8 +567,9 @@
 //!   work bounded by the classes touched, with oversized requests matched
 //!   largest-first against the oversized free list).
 //!   **Experimental:** the on-disk format and API may change, some resize paths
-//!   differ between the `atomic` and non-`atomic` builds, and the background
-//!   coalescer / deep in-use-leak GC are not yet implemented.
+//!   differ between the `atomic` and non-`atomic` builds, and the deep in-use-leak
+//!   GC is not yet implemented (the free-neighbour coalescer, `coalesce`, now is —
+//!   `atomic` only).
 //!
 //! * [`DebugCheckingAllocator<A>`](DebugCheckingAllocator) — transparent debug
 //!   wrapper.  Wraps any allocator whose `Allocated` type is [`BStackOwnedSlice`]
