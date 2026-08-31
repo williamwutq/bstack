@@ -7622,6 +7622,222 @@ int segregated_bstack_allocator_recover(segregated_bstack_allocator_t *alloc,
     return 0;
 }
 
+/* ---- coalesce ---------------------------------------------------------- */
+
+#ifdef BSTACK_FEATURE_ATOMIC
+/* One (block_start, [overhead||next_free]) edit for an output free block. */
+struct alsg_co_write { uint64_t off; uint8_t buf[16]; };
+
+/* Where the striding scan is; word_buf holds the overhead word for the offset
+ * the state names, filled by the previous READ. */
+enum alsg_co_state {
+    ALSG_CO_NEEDLEN,  /* read the arena length under the lock (first op) */
+    ALSG_CO_HAVELEN,  /* stack_len is the true length; bounds-check and begin */
+    ALSG_CO_NEEDBLOCK,/* issue a READ of the block at p */
+    ALSG_CO_HAVEBLOCK,/* word_buf = word@p; classify (stride / free-run start) */
+    ALSG_CO_NEEDRUN,  /* issue a READ of the run's next candidate at j */
+    ALSG_CO_HAVERUN,  /* word_buf = word@j; extend the run or close it */
+    ALSG_CO_FLUSH     /* scan done: drain the writes, then the head table */
+};
+
+/* Fields ordered by descending alignment (8-byte, then pointer/size_t, then int,
+ * then byte arrays) so the layout carries no internal padding. */
+struct alsg_co_ctx {
+    uint64_t   stack_len;                    /* length seen under the lock */
+    uint64_t   p, run_start, run_size, j;    /* cursor p; run being built [run_start, j) */
+    uint64_t   fused;                        /* blocks merged into a neighbour */
+    uint64_t   heads[ALSG_NUM_CLASSES];      /* rebuilt head table (SENTINEL == 0) */
+    const int *prev;                         /* inplace_gen prev-status */
+    struct alsg_co_write *writes;            /* plan, grown during the scan */
+    size_t     nwrites, cap;                 /* plan length / capacity */
+    size_t     wi;                           /* next write to emit in FLUSH */
+    int        state;                        /* scan state (enum alsg_co_state) */
+    uint8_t    head_bytes[ALSG_NUM_CLASSES * 8];
+    uint8_t    word_buf[8];                  /* reused across strides */
+};
+
+/* Record one maximal free run as a single output free block: stage its
+ * [overhead || next_free] edit at run_start and prepend it onto the class for
+ * run_size (largest class <= run_size, or oversized above MAX_CLASS, so a
+ * non-class merged size degrades to retained slack — the recover rule).
+ * Returns 0, or -1 on allocation failure (nothing mutated). */
+static int alsg_co_record(struct alsg_co_ctx *c)
+{
+    uint64_t cls = (c->run_size > ALSG_MAX_CLASS)
+                   ? ALSG_OVERSIZED_CLASS
+                   : alsg_classify(alsg_largest_class_le(c->run_size));
+    struct alsg_co_write *w;
+    if (c->nwrites == c->cap) {
+        size_t newcap = c->cap ? c->cap * 2 : 16;
+        struct alsg_co_write *nw = realloc(c->writes, newcap * sizeof *nw);
+        if (!nw) return -1;
+        c->writes = nw;
+        c->cap = newcap;
+    }
+    w = &c->writes[c->nwrites++];
+    w->off = c->run_start;
+    write_le64(w->buf, c->run_size >> 4);    /* overhead: free tag | merged size */
+    write_le64(w->buf + 8, c->heads[cls]);   /* next_free <- current class head */
+    c->heads[cls] = c->run_start;
+    return 0;
+}
+
+static int alsg_coalesce_gen(bstack_gen_op_t *op, void *uc)
+{
+    struct alsg_co_ctx *c = uc;
+
+    /* A failed READ (or WRITE) is reported through prev-status: unwind. */
+    if (c->prev && *c->prev != 0) {
+        op->kind = BSTACK_GEN_ABORT; op->u.abort.status = *c->prev; return 1;
+    }
+
+    for (;;) {
+        switch (c->state) {
+        case ALSG_CO_NEEDLEN:
+            c->state = ALSG_CO_HAVELEN;
+            op->kind = BSTACK_GEN_LEN; op->u.len.out = &c->stack_len;
+            return 1;
+
+        case ALSG_CO_HAVELEN:
+            /* Re-checked against the true length: a concurrent shrink since the
+             * pre-check could have emptied the arena. */
+            c->state = (c->stack_len <= ALSG_ARENA_START)
+                       ? ALSG_CO_FLUSH : ALSG_CO_NEEDBLOCK;
+            continue;
+
+        case ALSG_CO_NEEDBLOCK:
+            /* p <= stack_len, so the subtraction cannot underflow. */
+            if (ALSG_OVERHEAD > c->stack_len - c->p) {
+                c->state = ALSG_CO_FLUSH; continue;
+            }
+            c->state = ALSG_CO_HAVEBLOCK;
+            op->kind = BSTACK_GEN_READ;
+            op->u.read.offset = c->p; op->u.read.buf = c->word_buf; op->u.read.len = 8;
+            return 1;
+
+        case ALSG_CO_HAVEBLOCK: {
+            uint64_t word = read_le64(c->word_buf);
+            /* Zeroed tail from a crashed extend: stop (tail unhandled). */
+            if (word == 0) { c->state = ALSG_CO_FLUSH; continue; }
+            if (word & ALSG_IN_USE_BIT) {
+                uint64_t size = (word & ~ALSG_IN_USE_BIT) << 4;
+                /* Malformed: stop; the remainder leaks until a recover. */
+                if (size < ALSG_QUANTUM || size % ALSG_QUANTUM
+                    || size > c->stack_len - c->p) {
+                    c->state = ALSG_CO_FLUSH; continue;
+                }
+                c->p += size;                /* <= stack_len by the check above */
+                c->state = ALSG_CO_NEEDBLOCK; continue;
+            } else {
+                uint64_t size = word << 4;
+                if (size < ALSG_QUANTUM || size % ALSG_QUANTUM
+                    || size > c->stack_len - c->p) {
+                    c->state = ALSG_CO_FLUSH; continue;
+                }
+                /* Free block: open a run and look ahead at the next block. */
+                c->run_start = c->p;
+                c->run_size  = size;
+                c->j = c->p + size;          /* <= stack_len by the check above */
+                c->state = ALSG_CO_NEEDRUN; continue;
+            }
+        }
+
+        case ALSG_CO_NEEDRUN:
+            /* j <= stack_len; j == stack_len ⇒ run reached the tail. */
+            if (ALSG_OVERHEAD > c->stack_len - c->j) {
+                if (alsg_co_record(c)) {
+                    op->kind = BSTACK_GEN_ABORT; op->u.abort.status = ENOMEM; return 1;
+                }
+                c->state = ALSG_CO_FLUSH; continue;
+            }
+            c->state = ALSG_CO_HAVERUN;
+            op->kind = BSTACK_GEN_READ;
+            op->u.read.offset = c->j; op->u.read.buf = c->word_buf; op->u.read.len = 8;
+            return 1;
+
+        case ALSG_CO_HAVERUN: {
+            uint64_t word = read_le64(c->word_buf);
+            if (word != 0 && (word & ALSG_IN_USE_BIT) == 0) {
+                uint64_t s = word << 4;
+                if (s >= ALSG_QUANTUM && s % ALSG_QUANTUM == 0
+                    && s <= c->stack_len - c->j) {
+                    /* One more adjacent block absorbed; run_size == j - run_start
+                     * <= stack_len, so neither add overflows. */
+                    c->run_size += s;
+                    c->j += s;
+                    c->fused += 1;
+                    c->state = ALSG_CO_NEEDRUN; continue;
+                }
+            }
+            /* Block at j is in-use / zero / malformed: the run ends. */
+            if (alsg_co_record(c)) {
+                op->kind = BSTACK_GEN_ABORT; op->u.abort.status = ENOMEM; return 1;
+            }
+            c->p = c->j;
+            c->state = ALSG_CO_NEEDBLOCK; continue;
+        }
+
+        case ALSG_CO_FLUSH:
+            /* No merge happened: abort so the existing lists are untouched. */
+            if (c->fused == 0) {
+                op->kind = BSTACK_GEN_ABORT; op->u.abort.status = 0; return 1;
+            }
+            if (c->wi < c->nwrites) {
+                op->kind = BSTACK_GEN_WRITE;
+                op->u.write.offset = c->writes[c->wi].off;
+                op->u.write.data   = c->writes[c->wi].buf;
+                op->u.write.len    = 16;
+                c->wi++;
+                return 1;
+            }
+            if (c->wi == c->nwrites) {
+                size_t k;
+                for (k = 0; k < ALSG_NUM_CLASSES; k++)
+                    write_le64(c->head_bytes + k * 8, c->heads[k]);
+                op->kind = BSTACK_GEN_WRITE;
+                op->u.write.offset = ALSG_FREE_HEAD_BASE;
+                op->u.write.data   = c->head_bytes;
+                op->u.write.len    = sizeof c->head_bytes;
+                c->wi++;
+                return 1;
+            }
+            return 0;                        /* head table published: commit */
+
+        default:
+            return 0;
+        }
+    }
+}
+
+int segregated_bstack_allocator_coalesce(segregated_bstack_allocator_t *alloc,
+                                         uint64_t *out_fused)
+{
+    bstack_t *bs = alloc->bs;
+    struct alsg_co_ctx c;
+    int prev = 0, r;
+    uint64_t pre_len;
+
+    /* Cheap pre-check to skip the gen on an obviously-empty arena; the length
+     * is re-read under the write lock inside the gen (it may be stale here). */
+    if (bstack_len(bs, &pre_len)) return -1;
+    if (pre_len <= ALSG_ARENA_START) {
+        if (out_fused) *out_fused = 0;
+        return 0;
+    }
+
+    memset(&c, 0, sizeof c);                  /* heads[] <- SENTINEL (0) */
+    c.prev  = &prev;
+    c.state = ALSG_CO_NEEDLEN;
+    c.p     = ALSG_ARENA_START;
+
+    r = bstack_inplace_gen(bs, alsg_coalesce_gen, &c, &prev);
+    free(c.writes);
+    if (r) return -1;
+    if (out_fused) *out_fused = c.fused;
+    return 0;
+}
+#endif /* BSTACK_FEATURE_ATOMIC */
+
 /* ---- vtable implementations -------------------------------------------- */
 
 static bstack_t *alsg_vt_stack(bstack_allocator_t *base)
