@@ -1160,30 +1160,17 @@ impl SegregatedBStackAllocator {
         }
     }
 
-    /// Match `reqs` against the oversized free list and unlink the matched blocks in
-    /// one [`BStack::inplace_gen`]. `reqs` is sorted largest-first; the chase assigns
-    /// each free block to the largest still-unmet request it fits (compacting `reqs`
-    /// as matches land) and **stops as soon as every request is matched**, so the
-    /// chase — and the write lock — is bounded by the batch's needs, not the whole
-    /// list (only a list too small to satisfy every request is walked in full).
+    /// Match the largest-first-sorted `reqs` against the oversized free list in one
+    /// [`BStack::inplace_gen`], returning the matched `(req, block, size)`. Each
+    /// matched block is unlinked by patching its predecessor's `next` (read phase
+    /// records the patches, write phase emits them), so survivors stay in place; the
+    /// chase stops once every request is matched, bounding the write lock to the
+    /// batch's needs. Removed blocks stay free-tagged, so a crash before the claim
+    /// leaves them reclaimable by [`recover`](Self::recover).
     ///
-    /// Matched blocks are removed by **patching their predecessor** (`head`, or the
-    /// previous survivor's `next`) to skip past them, so survivors are left in place
-    /// — never read-and-rewritten or reordered, and the common "nothing fits" case
-    /// writes nothing. The read phase chases and records the patches (a run of
-    /// adjacent removals collapses to one, so at most `reqs.len()` of them); the
-    /// write phase emits them together. Removed blocks are left free-tagged and
-    /// detached, so a crash before the claim leaves them reclaimable by
-    /// [`recover`](Self::recover).
-    ///
-    /// The chase is unbounded, so it carries cycle detection (a revisited block
-    /// aborts with no write). Each block's overhead is validated before use: the
-    /// in-use bit must be clear (mirroring [`pop_oversized`](Self::pop_oversized)),
-    /// and the decoded size must be at least a [`QUANTUM`](Self::QUANTUM) and fit the
-    /// payload — so a corrupt word (`<< 4` leaving `size == 0`, which underflows
-    /// [`classify`](Self::classify), or a size running past the payload) is rejected
-    /// before it reaches the carve math. Any of these aborts with
-    /// [`io::ErrorKind::InvalidData`] and no write.
+    /// Rejects a corrupt list with [`io::ErrorKind::InvalidData`] and no write: an
+    /// over-long walk (cycle), an in-use bit set, or a size below a
+    /// [`QUANTUM`](Self::QUANTUM) or past the payload.
     fn match_oversized_bounded(
         &self,
         reqs: &mut Vec<usize>,
