@@ -1061,14 +1061,17 @@ impl SegregatedBStackAllocator {
                         });
                     }
                     St::ConsumeNode(c, cursor) => {
-                        // A block on class `c`'s list must be free and of that class.
-                        // The `size >= QUANTUM` guard precedes `classify` (which
-                        // underflows on 0) via `||` short-circuit.
+                        // A block on class `c`'s list must be free and belong on
+                        // it — matching how `recover` places blocks, so a
+                        // non-class size relinked onto a smaller class is reused
+                        // here just as `pop_class` reuses it. The `size >= QUANTUM`
+                        // guard precedes `classify` (which underflows on 0) via
+                        // `||` short-circuit.
                         let word = read_buf_le!(node_buf, 0 => u64);
                         let size = word << 4;
                         if word & Self::IN_USE_BIT != 0
                             || size < Self::QUANTUM
-                            || Self::classify(size) as usize != c
+                            || Self::classify(Self::largest_class_le(size)) as usize != c
                         {
                             err = Some(io_error!(
                                 InvalidData,
@@ -3115,6 +3118,36 @@ mod bulk_tests {
         let path = temp_path();
         let g = Guard(path.clone());
         (Seg::new(BStack::open(&path).unwrap()).unwrap(), g)
+    }
+
+    /// `recover` relinks a non-class size onto the largest class `<= size`, so
+    /// `alloc_bulk` must accept it there too (`pop_class` already does).
+    #[test]
+    fn alloc_bulk_reuses_a_recovered_non_class_size() {
+        let (a, _g) = new_alloc();
+        // Block 320 (class 16) at the arena start; the second alloc pins it off
+        // the tail so `dealloc` frees it rather than discarding it.
+        let x = a.alloc(300).unwrap();
+        let xb = x.start() - Seg::OVERHEAD;
+        let _pin = a.alloc(300).unwrap();
+        a.dealloc(x).unwrap();
+        // Split the 320 into a free 272 (not a class size) plus a free 48, so
+        // `recover`'s linear scan still walks cleanly into the pinned block.
+        a.stack.set(xb, (272u64 >> 4).to_le_bytes()).unwrap();
+        a.stack.set(xb + 272, (48u64 >> 4).to_le_bytes()).unwrap();
+        assert_eq!(unsafe { a.recover() }.unwrap(), 0);
+        // largest_class_le(272) == 256, so it lands on class 15.
+        let head = u64::from_le_bytes(
+            a.stack
+                .get(Seg::head_off(15), Seg::head_off(15) + 8)
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(head, xb);
+        // A class-15 request (block 256) reuses it instead of failing the batch.
+        let r = a.alloc_bulk([248u64]).unwrap();
+        assert_eq!(r[0].start() - Seg::OVERHEAD, xb);
     }
 
     #[test]
