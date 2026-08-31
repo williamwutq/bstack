@@ -1674,34 +1674,24 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
 
         let mut freeing = false;
         let result = (|| -> io::Result<()> {
-            // Block start per handle (`SENTINEL` for a null/empty handle), validated
-            // up front — like alloc's `block_of`, so there is no separate non-empty
-            // list to build.
-            let mut starts: Vec<u64> = Vec::with_capacity(slices.len());
-            let mut n_live = 0usize;
-            for s in &slices {
-                if s.is_empty() {
-                    starts.push(Self::SENTINEL);
-                } else {
-                    starts.push(Self::block_start_of(s.start())?);
-                    n_live += 1;
-                }
-            }
+            let n_live = slices.iter().filter(|s| !s.is_empty()).count();
             if n_live == 0 {
                 return Ok(()); // no-op: nothing to read, stage, or splice
             }
-            // Read every non-null handle's overhead word under one lock, rather
-            // than one locked read per handle.
+            // Read every non-null handle's overhead word (at `start() - OVERHEAD`)
+            // under one lock, rather than one locked read per handle. The pointer's
+            // strict validity is checked in the validation pass below, before any
+            // write; a bad read here only errors early.
             let mut words: Vec<[u8; 8]> = vec![[0u8; 8]; slices.len()];
             let mut gi = 0usize;
             self.stack.get_batched_gen(|| {
-                while gi < slices.len() && starts[gi] == Self::SENTINEL {
+                while gi < slices.len() && slices[gi].is_empty() {
                     gi += 1; // skip null handles
                 }
                 if gi >= slices.len() {
                     return None;
                 }
-                let off = starts[gi];
+                let off = slices[gi].start() - Self::OVERHEAD;
                 // SAFETY: `words[gi]` outlives this call; each step fills a distinct
                 // index, ready before the next step requests the following one.
                 let buf = bstack_unsafe_reborrow_mut!(&mut words[gi][..]);
@@ -1714,10 +1704,10 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
             let mut blocks: Vec<(u64, u64)> = Vec::with_capacity(n_live);
             let mut seen: HashSet<u64> = HashSet::with_capacity(n_live);
             for (si, s) in slices.iter().enumerate() {
-                let block_start = starts[si];
-                if block_start == Self::SENTINEL {
+                if s.is_empty() {
                     continue; // null handle
                 }
+                let block_start = Self::block_start_of(s.start())?;
                 let word = u64::from_le_bytes(words[si]);
                 if word & Self::IN_USE_BIT == 0 {
                     return Err(io_error!(
