@@ -852,8 +852,6 @@ the first read so the whole sequence runs as one indivisible step.
 
 - **No record framing.** The file stores raw bytes; the caller must track how
   many bytes each logical record occupies.
-- **Push rollback is best-effort.** A failure during rollback is silently
-  swallowed; crash recovery on the next `open` will repair the state.
 - **No `O_DIRECT`.** Writes go through the page cache; durability relies on
   `durable_sync`, not cache bypass.
 - **Single file only.** There is no WAL, manifest, or secondary index.

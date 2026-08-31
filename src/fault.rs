@@ -18,6 +18,11 @@
 //! violations) are therefore always reported in preference to an injected fault:
 //! a call that would fail validation never reaches its fault point.
 //!
+//! A pending deferred replay is the one step that precedes the fault point: it
+//! runs when a write takes the lock, ahead of validation, so a faulted write may
+//! still have repaired the file. An injected fault never sets the replay flag
+//! itself — it returns before any mutating call.
+//!
 //! The batched methods (`get_batched`, `get_batched_into`, `set_batched`) consult
 //! the policy **once**, at the point their batch I/O begins. Their up-front,
 //! whole-request validation still precedes that consult, but per-item checks
