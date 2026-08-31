@@ -1113,21 +1113,26 @@ impl SegregatedBStackAllocator {
         Ok((popped, counts))
     }
 
-    /// Best-effort: return free-tagged detached blocks to their class lists after
-    /// an `alloc_bulk` failure, grouped by class so each touched class is spliced
-    /// back in **one** [`splice_class_chain`](Self::splice_class_chain) (one
-    /// `set_batched` + one `cross_exchange`) rather than one `push` per block.
-    /// Errors are swallowed — a block that cannot be re-pushed is a free-tagged
-    /// leak `recover` reclaims. Sorts `blocks` in place (the caller no longer needs
-    /// its order), so no working copy is allocated.
+    /// Best-effort: return free-tagged detached blocks to their class lists after an
+    /// `alloc_bulk` failure. Blocks are grouped by class (sorted in place; the
+    /// `ClaimKind` tag is ignored — only offset and size matter) and every class's
+    /// chain is staged in **one** [`BStack::set_batched`], then each is spliced onto
+    /// its head with one atomic [`BStack::cross_exchange`] — `1 + classes`
+    /// operations, and every overhead word lands or none does. Errors are swallowed:
+    /// a block left unspliced (or all of them, if the stage fails) stays
+    /// free-tagged and unlinked, exactly the state [`recover`](Self::recover)
+    /// reclaims.
     fn repush_detached(&self, blocks: &mut [(u64, u64, ClaimKind)]) {
         if blocks.is_empty() {
             return;
         }
-        // Bucket by class without a Vec-per-class: sort by class in place (the
-        // `ClaimKind` tag is ignored — only offset and size matter), then splice
-        // each contiguous run straight from a sub-slice.
         blocks.sort_unstable_by_key(|&(_, size, _)| Self::classify(size));
+        // Stage every class's chain in one batch; record each run's (last block,
+        // class) for its splice. Within a run block[k].next = block[k+1], and the
+        // last block's next is the run head as the cross_exchange placeholder.
+        let mut batch: Vec<(u64, [u8; 16])> = Vec::with_capacity(blocks.len());
+        let mut splices = [(0u64, 0u64); Self::NUM_CLASSES as usize]; // (last block, class)
+        let mut ns = 0usize;
         let mut i = 0usize;
         while i < blocks.len() {
             let class = Self::classify(blocks[i].1);
@@ -1135,8 +1140,29 @@ impl SegregatedBStackAllocator {
             while j < blocks.len() && Self::classify(blocks[j].1) == class {
                 j += 1;
             }
-            let _ = self.splice_class_chain(class, &blocks[i..j]);
+            for k in i..j {
+                let (block, size, _) = blocks[k];
+                let next = if k + 1 < j {
+                    blocks[k + 1].0
+                } else {
+                    blocks[i].0
+                };
+                let mut buf = [0u8; 16];
+                write_buf!(size >> 4 => buf, 0);
+                write_buf!(next => buf, 8);
+                batch.push((block, buf));
+            }
+            splices[ns] = (blocks[j - 1].0, class);
+            ns += 1;
             i = j;
+        }
+        if self.stack.set_batched(batch).is_err() {
+            return; // nothing staged: every block stays free-tagged for `recover`
+        }
+        for &(last_block, class) in &splices[..ns] {
+            let _ =
+                self.stack
+                    .cross_exchange(last_block + Self::OVERHEAD, Self::head_off(class), 8);
         }
     }
 
@@ -1169,6 +1195,11 @@ impl SegregatedBStackAllocator {
         reqs: &mut Vec<usize>,
         block_of: &[u64],
     ) -> io::Result<Vec<(usize, u64, u64)>> {
+        // `partition_point` below relies on `reqs` being descending by block size.
+        debug_assert!(
+            reqs.windows(2).all(|w| block_of[w[0]] >= block_of[w[1]]),
+            "reqs must be sorted descending by block size"
+        );
         let head_off = Self::head_off(Self::OVERSIZED_CLASS);
         let mut matched: Vec<(usize, u64, u64)> = Vec::with_capacity(reqs.len());
         // Predecessor patches `(pointer offset, new next value)`, one per removed
@@ -1278,9 +1309,11 @@ impl SegregatedBStackAllocator {
                         // Largest request first: `reqs` is descending, so
                         // `block_of[req] > size` holds for a prefix; `partition_point`
                         // (O(log n)) lands on the first request that fits — the
-                        // largest one. Compact on a match.
+                        // largest one. The explicit `<= size` re-check keeps an
+                        // unsorted `reqs` degrading to "no match" rather than picking
+                        // one that doesn't fit (an underflowing carve). Compact on a match.
                         let j = reqs.partition_point(|&req| block_of[req] > size);
-                        if j < reqs.len() {
+                        if j < reqs.len() && block_of[reqs[j]] <= size {
                             let req = reqs.remove(j);
                             matched.push((req, cursor, size));
                             // Remove `cursor`: its predecessor must skip it. Defer the
@@ -1332,40 +1365,6 @@ impl SegregatedBStackAllocator {
             return Err(e);
         }
         Ok(matched)
-    }
-
-    /// Splice a run of blocks onto `class`'s free list as one chain: stage each
-    /// block's `[free overhead (size>>4) | next]` with **one**
-    /// [`BStack::set_batched`] (unreachable until spliced), then splice the whole
-    /// run with one atomic [`BStack::cross_exchange`] — so a concurrent push/pop
-    /// cannot be lost. Every `blocks[i]` must map to `class` (all classed blocks of
-    /// one class share a size; the oversized bucket holds any size). No-op if empty.
-    fn splice_class_chain(&self, class: u64, blocks: &[(u64, u64, ClaimKind)]) -> io::Result<()> {
-        if blocks.is_empty() {
-            return Ok(());
-        }
-        // `set_batched` takes an iterator (each `[u8; 16]` is `AsRef<[u8]>`), so the
-        // staged nodes stream straight from `blocks` — no intermediate batch Vec.
-        // The `ClaimKind` tag is ignored; only offset and size matter.
-        let writes = blocks.iter().enumerate().map(|(i, &(block, size, _))| {
-            // Last block's next is the placeholder `blocks[0]` that cross_exchange
-            // replaces with the old head.
-            let next = if i + 1 < blocks.len() {
-                blocks[i + 1].0
-            } else {
-                blocks[0].0
-            };
-            let mut buf = [0u8; 16];
-            write_buf!(size >> 4 => buf, 0);
-            write_buf!(next => buf, 8);
-            (block, buf)
-        });
-        self.stack.set_batched(writes)?;
-        self.stack.cross_exchange(
-            blocks[blocks.len() - 1].0 + Self::OVERHEAD,
-            Self::head_off(class),
-            8,
-        )
     }
 }
 
@@ -1723,14 +1722,19 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
         let result = (|| -> io::Result<()> {
             // Block start per handle (`SENTINEL` for a null/empty handle), validated
             // up front — like alloc's `block_of`, so there is no separate non-empty
-            // list to build, and an all-null batch falls through the normal path.
+            // list to build.
             let mut starts: Vec<u64> = Vec::with_capacity(slices.len());
+            let mut n_live = 0usize;
             for s in &slices {
-                starts.push(if s.is_empty() {
-                    Self::SENTINEL
+                if s.is_empty() {
+                    starts.push(Self::SENTINEL);
                 } else {
-                    Self::block_start_of(s.start())?
-                });
+                    starts.push(Self::block_start_of(s.start())?);
+                    n_live += 1;
+                }
+            }
+            if n_live == 0 {
+                return Ok(()); // no-op: nothing to read, stage, or splice
             }
             // Read every non-null handle's overhead word under ONE lock via
             // `get_batched_gen` rather than one locked read per handle.
