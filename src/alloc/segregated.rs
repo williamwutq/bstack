@@ -986,7 +986,7 @@ impl SegregatedBStackAllocator {
         let mut popped: Vec<u64> = Vec::with_capacity(total_want);
         let mut seen: HashSet<u64> = HashSet::with_capacity(total_want);
         let mut head_buf = [0u8; 8];
-        let mut next_buf = [0u8; 8];
+        let mut node_buf = [0u8; 16]; // [0..8] overhead (free tag), [8..16] next
         // Each touched class's new head value, all computed in the read phase and
         // only emitted in the write phase: a head slot is never mutated after any
         // write is staged, so the reborrow is sound. `advance[c]` marks the
@@ -1055,16 +1055,31 @@ impl SegregatedBStackAllocator {
                         }
                         st = St::ConsumeNode(c, cursor);
                         return Some(BStackGenOp::Read {
-                            offset: cursor + Self::OVERHEAD,
-                            // SAFETY: `next_buf` outlives this call.
-                            buf: bstack_unsafe_reborrow_mut!(&mut next_buf[..]),
+                            offset: cursor,
+                            // SAFETY: `node_buf` outlives this call.
+                            buf: bstack_unsafe_reborrow_mut!(&mut node_buf[..]),
                         });
                     }
                     St::ConsumeNode(c, cursor) => {
+                        // A block on class `c`'s list must be free and of that class.
+                        // The `size >= QUANTUM` guard precedes `classify` (which
+                        // underflows on 0) via `||` short-circuit.
+                        let word = read_buf_le!(node_buf, 0 => u64);
+                        let size = word << 4;
+                        if word & Self::IN_USE_BIT != 0
+                            || size < Self::QUANTUM
+                            || Self::classify(size) as usize != c
+                        {
+                            err = Some(io_error!(
+                                InvalidData,
+                                "alloc_bulk: classed free list has a wrong or in-use block"
+                            ));
+                            return None;
+                        }
                         popped.push(cursor);
                         counts[c] += 1;
                         in_class += 1; // bounded by want[c]
-                        let next = u64::from_le_bytes(next_buf);
+                        let next = read_buf_le!(node_buf, 8 => u64);
                         if in_class == want[c] || next == Self::SENTINEL {
                             head_writes[c] = next.to_le_bytes();
                             advance[c] = true;
@@ -1179,13 +1194,11 @@ impl SegregatedBStackAllocator {
         let mut node_buf = [0u8; 16]; // [0..8] overhead (free tag), [8..16] next
         let mut payload_len = 0u64;
         let payload_ptr: *mut u64 = &mut payload_len;
-        // The chase is unbounded, so a cyclic list must be caught. No visited set:
-        // a valid list holds at most `payload_len / QUANTUM` blocks, so a walk past
-        // that is a cycle (an O(1) counter, like `FirstFitBStackAllocator`).
+        // The chase is unbounded, so a cyclic list must be caught.
         let mut walk = 0u64;
-        // The pointer field that currently points at `cursor` (head, or a survivor's
-        // `next`); `dangling` marks it as needing a repoint once a removal has left a
-        // gap, deferred so a run of removals collapses into one patch.
+        // The pointer field that currently points at `cursor`; `dangling` marks
+        // it as needing a repoint once a removal has left a gap, deferred so a
+        // run of removals collapses into one patch.
         let mut prev_next_off = head_off;
         let mut dangling = false;
         let mut err: Option<io::Error> = None;
@@ -1411,17 +1424,24 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
 
         // Per-request physical block size (0 marks a zero-length/null request).
         // Classed (non-oversized) requests are counted per class; the oversized
-        // ones are collected for separate matching. Per-class state is bounded by
-        // `NUM_CLASSES` (a constant), so it lives on the stack, not the heap.
+        // ones are collected for separate matching.
         let mut block_of = vec![0u64; n];
         let mut want = [0usize; Self::NUM_CLASSES as usize];
         let mut oversized_reqs: Vec<usize> = Vec::with_capacity(n);
+        // Reject when total size does not fit u64
+        let mut total_block = 0u64;
         for (i, &len) in lengths.iter().enumerate() {
             if len == 0 {
                 continue;
             }
             let block = Self::class_blocksize(Self::phys_need(len)?);
             block_of[i] = block;
+            total_block = total_block.checked_add(block).ok_or_else(|| {
+                io_error!(
+                    InvalidInput,
+                    "alloc_bulk: total allocation size overflows u64"
+                )
+            })?;
             let class = Self::classify(block);
             if class == Self::OVERSIZED_CLASS {
                 oversized_reqs.push(i);
@@ -1430,25 +1450,16 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
             }
         }
 
-        // Every claim the final `set_batched` applies, tagged by kind — also the
-        // one source for rollback and relink: `Reuse`/`CarveFree` (the non-`Fresh`
-        // prefix `claims[..fresh_start]`) are the detached blocks to repush on
-        // rollback, and the `CarveFree` portion alone is relinked on success.
-        // `Fresh` blocks (the extended tail) are a suffix, discarded via `try_discard`.
-        let mut claims: Vec<(u64, u64, ClaimKind)> = Vec::with_capacity(n); // (offset, size, kind)
+        // Every claim the final `set_batched` applies, tagged by kind. (offset, size, kind)
+        let mut claims: Vec<(u64, u64, ClaimKind)> = Vec::with_capacity(n);
         // Where the `Fresh` suffix begins. `usize::MAX` until step 3 records it, so
-        // an error in step 1/2 (before any `Fresh` exists) treats every claim as
-        // non-`Fresh`; always used clamped to `claims.len()`.
+        // an error before any `Fresh` exists treats every claim as non-`Fresh`
         let mut fresh_start = usize::MAX;
         let mut ext_base = 0u64;
         let mut ext_bytes = 0u64;
 
         let build = (|| -> io::Result<Vec<BStackOwnedSlice<'_, Self>>> {
-            // Result slices in input order, built as blocks are assigned rather
-            // than in a second pass (like the slab bulk path). Every request
-            // starts null; a non-zero request is overwritten in place once
-            // assigned, so one still holding a null slice is an unserved miss, and
-            // zero-length requests simply keep theirs.
+            // Result slices in input order, null-initialised
             let mut result: Vec<BStackOwnedSlice<'_, Self>> =
                 (0..n).map(|_| BStackOwnedSlice::empty(self)).collect();
 
@@ -1463,9 +1474,7 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
                 acc += popped_counts[c];
             }
             // Walking requests in input order while counting per class assigns, to
-            // the j-th request of a class, that class's j-th popped block. A
-            // request past its class's supply keeps its null slice and is picked up
-            // as a miss in step 3.
+            // the j-th request of a class, that class's j-th popped block.
             let mut taken = [0usize; Self::NUM_CLASSES as usize];
             for i in 0..n {
                 let size = block_of[i];
@@ -1501,10 +1510,9 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
                     };
                     let excess = bsize - block;
                     if excess >= Self::SPLIT_MIN {
-                        // Carve: claim `block`, free the remainder greedily into
-                        // class blocks. On rollback the block is repushed as this
-                        // sub-block plus the remainders (fragmenting it — accepted,
-                        // as only large blocks carve and rarely).
+                        // Carve: claim `block`, free the remainder greedily into class blocks.
+                        // On rollback the block is repushed as this sub-block plus the remainders
+                        // Fragmentation in large blocks is fine
                         claims.push((boff, block, ClaimKind::Reuse));
                         let mut off = boff + block;
                         let mut rem = excess;
@@ -1529,26 +1537,19 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
             // 3. Misses (classed short + unmatched oversized): one extend that
             //    writes each fresh block's free overhead (self-describing tail). A
             //    miss is a non-zero request still holding its null slice —
-            //    `block_of[i] > 0 && result[i].is_empty()` — recomputed at each pass
-            //    rather than materialised into a `Vec`. Everything pushed so far is
+            //    `block_of[i] > 0 && result[i].is_empty(). Everything pushed so far is
             //    non-`Fresh`; the `Fresh` blocks appended below form the suffix.
             fresh_start = claims.len();
+            // A subset of the batch total already checked for overflow above.
             let mut total_ext = 0u64;
             for i in 0..n {
                 if block_of[i] > 0 && result[i].is_empty() {
-                    total_ext = total_ext.checked_add(block_of[i]).ok_or_else(|| {
-                        io_error!(
-                            InvalidInput,
-                            "alloc_bulk: total allocation size overflows u64"
-                        )
-                    })?;
+                    total_ext += block_of[i];
                 }
             }
             if total_ext > 0 {
                 // Each fresh block's free overhead, laid out back-to-back from the
-                // extend base. `[u8; 8]` is `AsRef<[u8]>`, so the writes are yielded
-                // by value; `extend_sparse_batched` consumes the iterator (releasing
-                // its shared borrow of `result`) before the assign loop below.
+                // extend base.
                 let writes = (0..n)
                     .filter(|&i| block_of[i] > 0 && result[i].is_empty())
                     .scan(0u64, |rel, i| {
@@ -1581,8 +1582,7 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
             //    contiguous buffer (so a single reused block keeps `set_batched`'s
             //    single-write fast path) borrowed from a per-size buffer — the
             //    distinct reuse sizes are few. `Fresh`/`CarveFree` need only their
-            //    8-byte overhead word, computed inline and carried by value, so
-            //    there is nothing to memoise for them.
+            //    8-byte overhead word, computed inline and carried by value.
             let mut reuse_buf: HashMap<u64, Vec<u8>> = HashMap::new(); // size → [oh ‖ zeros]
             for &(_, size, kind) in &claims {
                 if matches!(kind, ClaimKind::Reuse)
@@ -1596,8 +1596,7 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
                     e.insert(b);
                 }
             }
-            // `set_batched` takes an iterator, so the writes stream straight from
-            // `claims` and the shared reuse buffers — no intermediate batch Vec.
+
             if !claims.is_empty() {
                 let writes = claims.iter().map(|&(off, size, kind)| {
                     let buf = match kind {
@@ -1634,9 +1633,8 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
 
         build.inspect_err(|_| {
             // Best-effort rollback: drop the fresh tail first, then repush every
-            // non-`Fresh` claim (the detached/matched blocks and any carve
-            // remainders) to its class list. A carved block returns as its claimed
-            // sub-block plus the remainders — fragmented, but every byte reclaimed.
+            // non-`Fresh` claim to its class list. A carved block returns as its claimed
+            // sub-block plus the remainders
             if ext_bytes > 0 {
                 let _ = self.stack.try_discard(ext_base + ext_bytes, ext_bytes);
             }
@@ -1674,14 +1672,19 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
 
         let mut freeing = false;
         let result = (|| -> io::Result<()> {
-            let n_live = slices.iter().filter(|s| !s.is_empty()).count();
+            // Validate every non-null handle's pointer before any read
+            let mut n_live = 0usize;
+            for s in &slices {
+                if !s.is_empty() {
+                    Self::block_start_of(s.start())?;
+                    n_live += 1;
+                }
+            }
             if n_live == 0 {
                 return Ok(()); // no-op: nothing to read, stage, or splice
             }
-            // Read every non-null handle's overhead word (at `start() - OVERHEAD`)
-            // under one lock, rather than one locked read per handle. The pointer's
-            // strict validity is checked in the validation pass below, before any
-            // write; a bad read here only errors early.
+            // Read every non-null handle's overhead word (at `start() - OVERHEAD`,
+            // validated above) under one lock
             let mut words: Vec<[u8; 8]> = vec![[0u8; 8]; slices.len()];
             let mut gi = 0usize;
             self.stack.get_batched_gen(|| {
@@ -1707,7 +1710,7 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
                 if s.is_empty() {
                     continue; // null handle
                 }
-                let block_start = Self::block_start_of(s.start())?;
+                let block_start = s.start() - Self::OVERHEAD; // validated above
                 let word = u64::from_le_bytes(words[si]);
                 if word & Self::IN_USE_BIT == 0 {
                     return Err(io_error!(
