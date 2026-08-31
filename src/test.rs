@@ -2440,6 +2440,184 @@ mod tests {
             (PUSH_THREADS * PUSHES_PER_THREAD) as u64 * ITEM
         );
     }
+
+    // -------------------------------------------------------------------------
+    // Deferred replay
+    // -------------------------------------------------------------------------
+
+    /// Physically arm the header's write-in-progress journal, bypassing the
+    /// public API — the on-disk state a write that died between arm and commit
+    /// leaves behind. Writes both fields directly so the helper needs no feature.
+    fn arm_wip(stack: &BStack, wip_ptr: u64, wip_aux: u64) {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut guard = stack.lock.write().unwrap();
+        let file = &mut guard.0;
+        file.seek(SeekFrom::Start(16)).unwrap();
+        file.write_all(&wip_ptr.to_le_bytes()).unwrap();
+        file.write_all(&wip_aux.to_le_bytes()).unwrap();
+        crate::io_core::durable_sync(file).unwrap();
+    }
+
+    /// Append `data` past the committed end — the journal's staging area, and
+    /// equally the stale tail a crashed `push` leaves.
+    fn stage_tail(stack: &BStack, data: &[u8]) {
+        let mut guard = stack.lock.write().unwrap();
+        let (file, clen, _) = &mut *guard;
+        crate::io_core::write_at(file, *clen, data).unwrap();
+        crate::io_core::durable_sync(file).unwrap();
+    }
+
+    /// Set the deferred-replay flag, as a write that failed midway would.
+    fn mark_replay_needed(stack: &BStack) {
+        stack.lock.write().unwrap().2 = true;
+    }
+
+    fn is_pending(e: &std::io::Error) -> bool {
+        e.kind() == ErrorKind::Other
+            && e.get_ref()
+                .is_some_and(|s| s.is::<crate::InterruptedWrite>())
+    }
+
+    #[test]
+    fn pending_replay_refuses_reads() {
+        let (stack, path) = mk_stack();
+        let _g = Guard(path);
+        stack.push([b'a'; 300]).unwrap();
+        mark_replay_needed(&stack);
+
+        assert!(is_pending(&stack.get(0, 10).unwrap_err()));
+        assert!(is_pending(&stack.peek(0).unwrap_err()));
+        assert!(is_pending(&stack.len().unwrap_err()));
+        assert!(is_pending(&stack.is_empty().unwrap_err()));
+        let mut buf = [0u8; 4];
+        assert!(is_pending(&stack.get_into(0, &mut buf).unwrap_err()));
+        assert!(is_pending(&stack.peek_into(0, &mut buf).unwrap_err()));
+        assert!(is_pending(&stack.get_batched([0..4, 4..8]).unwrap_err()));
+        assert!(is_pending(&stack.lock_up_to(8).unwrap_err()));
+
+        // A read that touches no bytes returns before the lock, so it is
+        // unaffected — as is the locked length, which is not file state.
+        assert!(stack.get_into(0, &mut []).is_ok());
+        assert!(stack.peek_into(0, &mut []).is_ok());
+        assert_eq!(stack.locked_len(), 0);
+    }
+
+    #[test]
+    fn pending_replay_applies_the_journal_on_the_next_write() {
+        let (stack, path) = mk_stack();
+        let _g = Guard(path);
+        stack.push([b'a'; 300]).unwrap();
+        // A `set` of [0, 300) that staged its backup and armed, then died before
+        // writing in place: recovery rolls it *forward* from the staged tail.
+        stage_tail(&stack, &[b'b'; 300]);
+        arm_wip(&stack, HEADER_SIZE, 0 /* WipAux::Set */);
+        mark_replay_needed(&stack);
+        assert!(stack.get(0, 300).is_err());
+
+        let off = stack.push(b"z").unwrap();
+        assert_eq!(off, 300);
+        assert_eq!(stack.len().unwrap(), 301);
+        assert_eq!(stack.get(0, 300).unwrap(), vec![b'b'; 300]);
+        assert_eq!(stack.get(300, 301).unwrap(), b"z");
+        // Replay ran once and disarmed: the stack is ordinary again.
+        stack.push(b"y").unwrap();
+        assert_eq!(stack.len().unwrap(), 302);
+    }
+
+    #[test]
+    fn pending_replay_drops_a_stale_tail() {
+        let (stack, path) = mk_stack();
+        let _g = Guard(path);
+        stack.push(b"hello").unwrap();
+        // A crashed `push`: bytes past the committed length, no journal armed.
+        stage_tail(&stack, &[0xff; 64]);
+        mark_replay_needed(&stack);
+        assert!(stack.len().is_err());
+
+        stack.push(b"!").unwrap();
+        assert_eq!(stack.len().unwrap(), 6);
+        assert_eq!(stack.peek(0).unwrap(), b"hello!");
+    }
+
+    #[test]
+    fn pending_replay_on_an_intact_file_is_a_silent_no_op() {
+        let (stack, path) = mk_stack();
+        let _g = Guard(path);
+        stack.push(b"hello").unwrap();
+        mark_replay_needed(&stack);
+
+        stack.push(b" world").unwrap();
+        assert_eq!(stack.peek(0).unwrap(), b"hello world");
+        assert_eq!(stack.len().unwrap(), 11);
+    }
+
+    #[test]
+    fn pending_replay_applies_a_multi_write_journal() {
+        let (stack, path) = mk_stack();
+        let _g = Guard(path);
+        stack.push([b'a'; 64]).unwrap();
+        // Two staged `[s | e | data]` blocks plus the intent-complete sentinel.
+        let mut tail = Vec::new();
+        for (s, data) in [(0u64, [b'x'; 8]), (32u64, [b'y'; 8])] {
+            tail.extend_from_slice(&s.to_le_bytes());
+            tail.extend_from_slice(&(s + data.len() as u64).to_le_bytes());
+            tail.extend_from_slice(&data);
+        }
+        stage_tail(&stack, &tail);
+        arm_wip(&stack, 0, u64::MAX - 5 /* WipAux::MultiWrite */);
+        mark_replay_needed(&stack);
+
+        stack.push(b"!").unwrap();
+        assert_eq!(stack.len().unwrap(), 65);
+        assert_eq!(stack.get(0, 8).unwrap(), vec![b'x'; 8]);
+        assert_eq!(stack.get(32, 40).unwrap(), vec![b'y'; 8]);
+        assert_eq!(stack.get(8, 32).unwrap(), vec![b'a'; 24]);
+    }
+
+    #[test]
+    #[cfg(any(unix, windows))]
+    fn pending_replay_leaves_the_locked_prefix_readable() {
+        let (stack, path) = mk_stack();
+        let _g = Guard(path);
+        stack.push([b'a'; 128]).unwrap();
+        stack.lock_up_to(64).unwrap();
+        mark_replay_needed(&stack);
+
+        // Locked bytes are immutable and no journal can target them, so the
+        // lock-free path still serves them; anything past the prefix is refused.
+        assert_eq!(stack.get(0, 64).unwrap(), vec![b'a'; 64]);
+        assert!(is_pending(&stack.get(0, 65).unwrap_err()));
+    }
+
+    /// A genuine mid-write I/O failure: the stack's descriptor is swapped for a
+    /// read-only one on the same file, so seeks and size checks still succeed but
+    /// every write — including the rollback `ftruncate` — fails.
+    #[test]
+    #[cfg(unix)]
+    fn a_failed_write_defers_a_replay() {
+        use std::os::unix::io::AsRawFd;
+        let (stack, path) = mk_stack();
+        let _g = Guard(path.clone());
+        stack.push(b"hello").unwrap();
+
+        let read_only = std::fs::File::open(&path).unwrap();
+        let fd = stack.fd;
+        let saved = unsafe { libc::dup(fd) };
+        assert!(saved >= 0);
+        assert!(unsafe { libc::dup2(read_only.as_raw_fd(), fd) } >= 0);
+        let err = stack.push(b" world").unwrap_err();
+        assert!(unsafe { libc::dup2(saved, fd) } >= 0);
+        assert_eq!(unsafe { libc::close(saved) }, 0);
+
+        assert!(!is_pending(&err), "the write reports its own I/O error");
+        // The failed write flagged the stack, so reads are refused ...
+        assert!(is_pending(&stack.len().unwrap_err()));
+        assert!(is_pending(&stack.peek(0).unwrap_err()));
+        // ... until the next write replays (a no-op: nothing ever landed).
+        stack.push(b"!").unwrap();
+        assert_eq!(stack.peek(0).unwrap(), b"hello!");
+        assert_eq!(stack.len().unwrap(), 6);
+    }
 }
 
 // -------------------------------------------------------------------------

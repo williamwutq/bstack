@@ -481,3 +481,35 @@ beginning.
 
 After recovery, `durable_sync` ensures the repaired state is on stable storage
 before any caller can observe or modify the file.
+
+## Deferred replay (same-process)
+
+The dispatch above is not reached only through `open`. A write that fails after
+its first mutating I/O leaves the header in one of the same states — armed, or
+disarmed with `file_size != 32 + clen` — on a handle that stays open. Replaying
+immediately is the wrong response: the replay writes to the device that just
+failed, and the caller may not want a retry at all. So the failure is recorded in
+an in-memory flag (`replay_needed`, held under the `BStack` rwlock alongside the
+file handle and the cached `clen`) and the original error is returned.
+
+```
+write:  take write lock → if replay_needed { dispatch (above); clen ← result;
+                                             replay_needed ← false }
+                        → validate → mutate → mark replay_needed on failure
+read:   take lock → if replay_needed { fail } → read
+```
+
+Two ordering constraints:
+
+* **Replay precedes validation.** Every mutator derives the payload size from the
+  file end, so a stale tail would inflate it and let an out-of-range write through
+  the bounds check.
+* **Only mutating steps set the flag.** The flag is set by the failure of a call
+  that writes (a journal step, a commit, a `set_len`, or a failed rollback
+  `ftruncate`), never by a failing read — a read that fails changed nothing on
+  disk. A pre-I/O rejection (argument validation, an injected fault) therefore
+  never arms it.
+
+Marking is conservative: a mutating call that failed before its first byte
+reached the file still sets the flag, because the caller cannot tell where inside
+the sequence it died.

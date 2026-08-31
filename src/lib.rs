@@ -86,6 +86,25 @@
 //! recovery a `durable_sync` ensures the repaired state is on stable storage
 //! before any caller can observe or modify the file.
 //!
+//! # Deferred replay
+//!
+//! The same recovery also runs without reopening the file. A write that fails
+//! after its first mutating I/O can leave the states above — an armed journal, or
+//! a stale tail past the committed length — on a handle that stays open. Rather
+//! than replay on the spot, the failure is recorded in an in-memory
+//! `replay_needed` flag under the `BStack` rwlock and the error is returned
+//! unchanged. While it is set:
+//!
+//! * **The next write replays first, silently**, before validating its own
+//!   arguments — a stale tail would inflate the payload size every mutator
+//!   derives from the file end — then proceeds normally. The flag clears only
+//!   once the replay succeeds; a failing replay returns its own error.
+//! * **Reads fail** with [`InterruptedWrite`]. This covers every read that
+//!   consults the file or the cached committed length, [`len`](BStack::len)
+//!   included; a read that returns before taking the lock (an empty buffer,
+//!   `n == 0`), and a lock-free read of the immutable locked prefix, are
+//!   unaffected.
+//!
 //! # Durability
 //!
 //! **In-place same-length writes** — [`set`](BStack::set), [`zero`](BStack::zero),
@@ -837,13 +856,53 @@ fn validate_sparse_blocks(blocks: &mut [(u64, &[u8])], length: u64, op: &str) ->
 
 // ---------------------------------------------------------------------------
 
+/// The error a read carries while an interrupted write is pending replay.
+///
+/// Returned as the payload of an [`io::Error`] of kind
+/// [`Other`](io::ErrorKind::Other) by every read that consults the file or the
+/// cached committed length, until the next write replays the interruption (see
+/// *Deferred replay* in the crate docs).  Match on it instead of the message:
+///
+/// ```
+/// # use bstack::InterruptedWrite;
+/// # fn f(err: &std::io::Error) -> bool {
+/// err.get_ref().is_some_and(|e| e.is::<InterruptedWrite>())
+/// # }
+/// ```
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct InterruptedWrite;
+
+impl fmt::Display for InterruptedWrite {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(
+            "bstack: an interrupted write is pending replay — the next write replays it \
+             silently; reads are refused until then",
+        )
+    }
+}
+
+impl std::error::Error for InterruptedWrite {}
+
+impl From<InterruptedWrite> for io::Error {
+    #[inline]
+    fn from(e: InterruptedWrite) -> Self {
+        io::Error::other(e)
+    }
+}
+
 /// A persistent, fsync-durable binary stack backed by a single file.
 ///
 /// See the [crate-level documentation](crate) for the file format, durability
 /// guarantees, crash recovery, multi-process safety, and thread-safety model.
 pub struct BStack {
-    /// The file handle together with a cached copy of the on-disk header's
-    /// committed payload length (`clen`).
+    /// The file handle, a cached copy of the on-disk header's committed payload
+    /// length (`clen`), and the deferred-replay flag.
+    ///
+    /// The flag (the `.2` field) is `true` when a write failed after its first
+    /// mutating I/O, so the file may still hold an armed journal or a stale tail
+    /// (see *Deferred replay* in the crate docs). It is in-memory only — the
+    /// on-disk journal is what recovery actually reads — and is cleared by the
+    /// replay the next write performs.
     ///
     /// `clen` (the `.1` field) is seeded from the validated header at
     /// construction time (after recovery) and kept in sync by every
@@ -851,7 +910,7 @@ pub struct BStack {
     /// `write_committed_len`. [`BStack::len`] and [`BStack::is_empty`] read it
     /// under the same lock used for the on-disk state, so no extra
     /// synchronisation is needed.
-    lock: RwLock<(File, u64)>,
+    lock: RwLock<(File, u64, bool)>,
     /// Monotonically growing partition boundary.  Bytes in `[0, locked)` are
     /// immutable and can be read without the rwlock on supported platforms.
     /// Not persisted — resets to 0 on every open.
@@ -913,6 +972,102 @@ impl BStack {
         Ok((committed_len, wip_ptr, wip_aux))
     }
 
+    /// Replay or roll back an interrupted write, restoring the at-rest invariant
+    /// (`file_size == HEADER_SIZE + clen`, journal disarmed).  Returns the
+    /// committed length afterwards (unchanged except by a splice).
+    ///
+    /// `raw_size` is the current file size.  Shared by [`open`](Self::open) — a
+    /// crash left the file armed — and by the deferred replay a write performs
+    /// after an earlier write on the same handle failed midway.  Every replay is
+    /// idempotent, so running it twice is harmless.
+    #[inline]
+    fn recover(file: &mut File, raw_size: u64) -> io::Result<u64> {
+        let (committed_len, wip_ptr, wip_aux) = Self::read_header(file)?;
+        let mut clen = committed_len;
+        if wip_ptr != 0 {
+            // An in-place write was in flight. Replay or roll it back, then
+            // restore the at-rest invariant. A splice changes the committed
+            // length, so adopt whatever recovery commits.
+            clen = recover_wip(file, committed_len, wip_ptr, wip_aux, raw_size)?;
+        } else if wip_aux == u64::from(WipAux::MultiWrite) {
+            // A multi-write batch was in flight (armed with `wip_ptr == 0` and the
+            // intent-complete sentinel). All blocks were fully staged before the
+            // arm, so replay the sequence and disarm. The committed length is
+            // unchanged.
+            clen = recover_multi_write(file, committed_len, raw_size)?;
+        } else {
+            // No journal armed: reconcile the committed length against the file
+            // size, using whichever is smaller (the committed value is the last
+            // successfully synced boundary). This drops a stale tail from a
+            // crashed push/extend or a crashed journal stage.
+            let actual_data_len = raw_size - HEADER_SIZE;
+            if actual_data_len != committed_len {
+                let correct_len = committed_len.min(actual_data_len);
+                file.set_len(HEADER_SIZE + correct_len)?;
+                write_committed_len(file, &mut clen, correct_len)?;
+                durable_sync(file)?;
+            }
+        }
+        Ok(clen)
+    }
+
+    /// Flag the stack for replay when `r` failed: a mutating step that got past
+    /// its first write may have left an armed journal or a stale tail behind.
+    ///
+    /// Wraps every mutating call made under the write lock. Read-only steps are
+    /// not wrapped — a read that fails changes nothing on disk.
+    #[inline]
+    fn mark_replay<T>(replay: &mut bool, r: io::Result<T>) -> io::Result<T> {
+        if r.is_err() {
+            *replay = true;
+        }
+        r
+    }
+
+    /// Take the write lock for a **mutating** operation, first silently replaying
+    /// any earlier write that failed midway (see *Deferred replay* in the crate
+    /// docs).
+    ///
+    /// The replay must precede the operation's own validation: a pending one can
+    /// leave a stale tail past the committed length, which would inflate the
+    /// payload size every mutator derives from the file end.  A failed replay
+    /// leaves the flag set, so the next write tries again.
+    fn write_lock(&self) -> io::Result<std::sync::RwLockWriteGuard<'_, (File, u64, bool)>> {
+        let mut guard = self.lock.write().unwrap();
+        if guard.2 {
+            let (file, clen, replay) = &mut *guard;
+            let raw_size = file.metadata()?.len();
+            *clen = Self::recover(file, raw_size)?;
+            *replay = false;
+        }
+        Ok(guard)
+    }
+
+    /// Take the write lock for a **read-only** operation that needs `&mut File`
+    /// (the non-positional-read platform fallbacks, and `lock_up_to`).
+    ///
+    /// A pending replay fails the call rather than being applied: only a write
+    /// replays, so a read never returns bytes an interrupted write may still own.
+    #[inline]
+    fn write_lock_read(&self) -> io::Result<std::sync::RwLockWriteGuard<'_, (File, u64, bool)>> {
+        let guard = self.lock.write().unwrap();
+        if guard.2 {
+            return Err(InterruptedWrite.into());
+        }
+        Ok(guard)
+    }
+
+    /// Take the read lock.  A pending replay fails the call — see
+    /// [`write_lock_read`](Self::write_lock_read).
+    #[inline]
+    fn read_lock(&self) -> io::Result<std::sync::RwLockReadGuard<'_, (File, u64, bool)>> {
+        let guard = self.lock.read().unwrap();
+        if guard.2 {
+            return Err(InterruptedWrite.into());
+        }
+        Ok(guard)
+    }
+
     /// Open or create a stack file at `path`.
     ///
     /// On a **new** file the 32-byte header is written and durably synced
@@ -963,32 +1118,7 @@ impl BStack {
                 )
             ));
         } else {
-            let (committed_len, wip_ptr, wip_aux) = Self::read_header(&mut file)?;
-            clen = committed_len;
-            if wip_ptr != 0 {
-                // An in-place write was in flight. Replay or roll it back, then
-                // restore the at-rest invariant. A splice changes the committed
-                // length, so adopt whatever recovery commits.
-                clen = recover_wip(&mut file, committed_len, wip_ptr, wip_aux, raw_size)?;
-            } else if wip_aux == u64::from(WipAux::MultiWrite) {
-                // A multi-write batch was in flight (armed with `wip_ptr == 0`
-                // and the intent-complete sentinel). All blocks were fully
-                // staged before the arm, so replay the sequence and disarm. The
-                // committed length is unchanged.
-                clen = recover_multi_write(&mut file, committed_len, raw_size)?;
-            } else {
-                // No journal armed: reconcile the committed length against the
-                // file size, using whichever is smaller (the committed value is
-                // the last successfully synced boundary). This drops a stale tail
-                // from a crashed push/extend or a crashed journal stage.
-                let actual_data_len = raw_size - HEADER_SIZE;
-                if actual_data_len != committed_len {
-                    let correct_len = committed_len.min(actual_data_len);
-                    file.set_len(HEADER_SIZE + correct_len)?;
-                    write_committed_len(&mut file, &mut clen, correct_len)?;
-                    durable_sync(&file)?;
-                }
-            }
+            clen = Self::recover(&mut file, raw_size)?;
         }
 
         #[cfg(unix)]
@@ -1001,7 +1131,7 @@ impl BStack {
             fd,
             #[cfg(windows)]
             handle,
-            lock: RwLock::new((file, clen)),
+            lock: RwLock::new((file, clen, false)),
             locked: AtomicU64::new(0),
             cache_enabled: false,
             cache: Mutex::new(Vec::new()),
@@ -1114,8 +1244,8 @@ impl BStack {
     /// fallback `set_len`.
     pub fn push(&self, data: impl AsRef<[u8]>) -> io::Result<u64> {
         let data = data.as_ref();
-        let mut guard = self.lock.write().unwrap();
-        let (file, clen) = &mut *guard;
+        let mut guard = self.write_lock()?;
+        let (file, clen, replay) = &mut *guard;
         let file_end = file.seek(SeekFrom::End(0))?;
         let logical_offset = file_end - HEADER_SIZE;
 
@@ -1125,12 +1255,19 @@ impl BStack {
 
         fault_point!(self, "push");
         if let Err(e) = file.write_all(data) {
-            let _ = file.set_len(file_end);
+            // A failed rollback leaves a stale tail past the committed length:
+            // defer it to the next write's replay.
+            if file.set_len(file_end).is_err() {
+                *replay = true;
+            }
             return Err(e);
         }
 
         let new_len = logical_offset + data.len() as u64;
-        commit_grow(file, clen, new_len, logical_offset, file_end)?;
+        Self::mark_replay(
+            replay,
+            commit_grow(file, clen, new_len, logical_offset, file_end),
+        )?;
         Ok(logical_offset)
     }
 
@@ -1151,8 +1288,8 @@ impl BStack {
     /// Returns any [`io::Error`] from `set_len`, `durable_sync`, or the
     /// fallback `set_len`.
     pub fn extend(&self, n: u64) -> io::Result<u64> {
-        let mut guard = self.lock.write().unwrap();
-        let (file, clen) = &mut *guard;
+        let mut guard = self.write_lock()?;
+        let (file, clen, replay) = &mut *guard;
         let file_end = file.seek(SeekFrom::End(0))?;
         let logical_offset = file_end - HEADER_SIZE;
 
@@ -1162,10 +1299,13 @@ impl BStack {
 
         fault_point!(self, "extend");
         let new_file_end = file_end + n;
-        file.set_len(new_file_end)?;
+        Self::mark_replay(replay, file.set_len(new_file_end))?;
 
         let new_len = logical_offset + n;
-        commit_grow(file, clen, new_len, logical_offset, file_end)?;
+        Self::mark_replay(
+            replay,
+            commit_grow(file, clen, new_len, logical_offset, file_end),
+        )?;
         Ok(logical_offset)
     }
 
@@ -1209,8 +1349,8 @@ impl BStack {
                 buf.len()
             ));
         }
-        let mut guard = self.lock.write().unwrap();
-        let (file, clen) = &mut *guard;
+        let mut guard = self.write_lock()?;
+        let (file, clen, replay) = &mut *guard;
         let file_end = file.seek(SeekFrom::End(0))?;
         let logical_offset = file_end - HEADER_SIZE;
 
@@ -1226,7 +1366,10 @@ impl BStack {
         fault_point!(self, "extend_sparse");
         let one = [(0u64, buf)];
         let blocks: &[(u64, &[u8])] = if buf.is_empty() { &[] } else { &one };
-        commit_sparse_extend(file, clen, logical_offset, file_end, new_len, blocks)?;
+        Self::mark_replay(
+            replay,
+            commit_sparse_extend(file, clen, logical_offset, file_end, new_len, blocks),
+        )?;
         Ok(logical_offset)
     }
 
@@ -1277,8 +1420,8 @@ impl BStack {
             .collect();
         validate_sparse_blocks(&mut blocks, length, "extend_sparse_batched")?;
 
-        let mut guard = self.lock.write().unwrap();
-        let (file, clen) = &mut *guard;
+        let mut guard = self.write_lock()?;
+        let (file, clen, replay) = &mut *guard;
         let file_end = file.seek(SeekFrom::End(0))?;
         let logical_offset = file_end - HEADER_SIZE;
 
@@ -1293,7 +1436,10 @@ impl BStack {
             )
         })?;
         fault_point!(self, "extend_sparse_batched");
-        commit_sparse_extend(file, clen, logical_offset, file_end, new_len, &blocks)?;
+        Self::mark_replay(
+            replay,
+            commit_sparse_extend(file, clen, logical_offset, file_end, new_len, &blocks),
+        )?;
         Ok(logical_offset)
     }
 
@@ -1317,8 +1463,8 @@ impl BStack {
     /// locked region `[0, locked_len())`. Propagates any I/O error from
     /// `set_len`, `write_committed_len`, or `durable_sync`.
     pub fn resize(&self, target: u64) -> io::Result<u64> {
-        let mut guard = self.lock.write().unwrap();
-        let (file, clen) = &mut *guard;
+        let mut guard = self.write_lock()?;
+        let (file, clen, replay) = &mut *guard;
         let file_end = file.seek(SeekFrom::End(0))?;
         let data_size = file_end - HEADER_SIZE;
 
@@ -1334,13 +1480,13 @@ impl BStack {
                 ));
             }
             fault_point!(self, "resize");
-            commit_shrink(file, clen, target)?;
+            Self::mark_replay(replay, commit_shrink(file, clen, target))?;
             return Ok(data_size);
         }
 
         fault_point!(self, "resize");
-        file.set_len(HEADER_SIZE + target)?;
-        commit_grow(file, clen, target, data_size, file_end)?;
+        Self::mark_replay(replay, file.set_len(HEADER_SIZE + target))?;
+        Self::mark_replay(replay, commit_grow(file, clen, target, data_size, file_end))?;
         Ok(data_size)
     }
 
@@ -1360,8 +1506,8 @@ impl BStack {
     /// Propagates any I/O error from `set_len`, `write_committed_len`, or
     /// `durable_sync`.
     pub fn ensure(&self, target: u64) -> io::Result<u64> {
-        let mut guard = self.lock.write().unwrap();
-        let (file, clen) = &mut *guard;
+        let mut guard = self.write_lock()?;
+        let (file, clen, replay) = &mut *guard;
         let file_end = file.seek(SeekFrom::End(0))?;
         let data_size = file_end - HEADER_SIZE;
 
@@ -1370,8 +1516,8 @@ impl BStack {
         }
 
         fault_point!(self, "ensure");
-        file.set_len(HEADER_SIZE + target)?;
-        commit_grow(file, clen, target, data_size, file_end)?;
+        Self::mark_replay(replay, file.set_len(HEADER_SIZE + target))?;
+        Self::mark_replay(replay, commit_grow(file, clen, target, data_size, file_end))?;
         Ok(data_size)
     }
 
@@ -1412,8 +1558,8 @@ impl BStack {
     where
         F: FnOnce(&mut [u8]),
     {
-        let mut guard = self.lock.write().unwrap();
-        let (file, clen) = &mut *guard;
+        let mut guard = self.write_lock()?;
+        let (file, clen, replay) = &mut *guard;
         let file_end = file.seek(SeekFrom::End(0))?;
         let data_size = file_end - HEADER_SIZE;
 
@@ -1436,10 +1582,14 @@ impl BStack {
         f(&mut buf);
         fault_point!(self, "ensure_with");
         if let Err(e) = file.write_all(&buf) {
-            let _ = file.set_len(file_end);
+            // A failed rollback leaves a stale tail past the committed length:
+            // defer it to the next write's replay.
+            if file.set_len(file_end).is_err() {
+                *replay = true;
+            }
             return Err(e);
         }
-        commit_grow(file, clen, target, data_size, file_end)?;
+        Self::mark_replay(replay, commit_grow(file, clen, target, data_size, file_end))?;
         Ok(data_size)
     }
 
@@ -1459,8 +1609,8 @@ impl BStack {
     /// payload size.  Also propagates any I/O error from `read_exact`,
     /// `set_len`, `write_all`, or `durable_sync`.
     pub fn pop(&self, n: u64) -> io::Result<Vec<u8>> {
-        let mut guard = self.lock.write().unwrap();
-        let (file, clen) = &mut *guard;
+        let mut guard = self.write_lock()?;
+        let (file, clen, replay) = &mut *guard;
         let raw_size = file.seek(SeekFrom::End(0))?;
         let data_size = raw_size - HEADER_SIZE;
         if n > data_size {
@@ -1480,7 +1630,7 @@ impl BStack {
         let mut buf = vec![0u8; n as usize];
         fault_point!(self, "pop");
         read_at(file, new_data_len, &mut buf)?;
-        commit_shrink(file, clen, new_data_len)?;
+        Self::mark_replay(replay, commit_shrink(file, clen, new_data_len))?;
         Ok(buf)
     }
 
@@ -1508,7 +1658,7 @@ impl BStack {
     pub fn peek(&self, offset: u64) -> io::Result<Vec<u8>> {
         #[cfg(any(unix, windows))]
         {
-            let guard = self.lock.read().unwrap();
+            let guard = self.read_lock()?;
             let file = &guard.0;
             let data_size = file.metadata()?.len().saturating_sub(HEADER_SIZE);
             if offset > data_size {
@@ -1522,7 +1672,7 @@ impl BStack {
         }
         #[cfg(not(any(unix, windows)))]
         {
-            let mut guard = self.lock.write().unwrap();
+            let mut guard = self.write_lock_read()?;
             let file = &mut guard.0;
             let raw_size = file.seek(SeekFrom::End(0))?;
             let data_size = raw_size.saturating_sub(HEADER_SIZE);
@@ -1592,7 +1742,7 @@ impl BStack {
         }
         #[cfg(any(unix, windows))]
         {
-            let guard = self.lock.read().unwrap();
+            let guard = self.read_lock()?;
             let file = &guard.0;
             let data_size = file.metadata()?.len().saturating_sub(HEADER_SIZE);
             if end > data_size {
@@ -1611,7 +1761,7 @@ impl BStack {
                 let cache = self.cache.lock().unwrap();
                 return Ok(cache[start as usize..end as usize].to_vec());
             }
-            let mut guard = self.lock.write().unwrap();
+            let mut guard = self.write_lock_read()?;
             let file = &mut guard.0;
             let raw_size = file.seek(SeekFrom::End(0))?;
             let data_size = raw_size.saturating_sub(HEADER_SIZE);
@@ -1656,7 +1806,7 @@ impl BStack {
             .ok_or_else(|| io_error!(InvalidInput, "peek_into: offset + len overflows u64"))?;
         #[cfg(any(unix, windows))]
         {
-            let guard = self.lock.read().unwrap();
+            let guard = self.read_lock()?;
             let file = &guard.0;
             let data_size = file.metadata()?.len().saturating_sub(HEADER_SIZE);
             if end > data_size {
@@ -1672,7 +1822,7 @@ impl BStack {
         }
         #[cfg(not(any(unix, windows)))]
         {
-            let mut guard = self.lock.write().unwrap();
+            let mut guard = self.write_lock_read()?;
             let file = &mut guard.0;
             let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
             if end > data_size {
@@ -1732,7 +1882,7 @@ impl BStack {
         }
         #[cfg(any(unix, windows))]
         {
-            let guard = self.lock.read().unwrap();
+            let guard = self.read_lock()?;
             let file = &guard.0;
             let data_size = file.metadata()?.len().saturating_sub(HEADER_SIZE);
             if end > data_size {
@@ -1752,7 +1902,7 @@ impl BStack {
                 buf.copy_from_slice(&cache[start as usize..end as usize]);
                 return Ok(());
             }
-            let mut guard = self.lock.write().unwrap();
+            let mut guard = self.write_lock_read()?;
             let file = &mut guard.0;
             let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
             if end > data_size {
@@ -1788,8 +1938,8 @@ impl BStack {
             return Ok(());
         }
         let n = buf.len() as u64;
-        let mut guard = self.lock.write().unwrap();
-        let (file, clen) = &mut *guard;
+        let mut guard = self.write_lock()?;
+        let (file, clen, replay) = &mut *guard;
         let raw_size = file.seek(SeekFrom::End(0))?;
         let data_size = raw_size - HEADER_SIZE;
         if n > data_size {
@@ -1808,7 +1958,7 @@ impl BStack {
         }
         fault_point!(self, "pop_into");
         read_at(file, new_data_len, buf)?;
-        commit_shrink(file, clen, new_data_len)?;
+        Self::mark_replay(replay, commit_shrink(file, clen, new_data_len))?;
         Ok(())
     }
 
@@ -1830,8 +1980,8 @@ impl BStack {
         if n == 0 {
             return Ok(());
         }
-        let mut guard = self.lock.write().unwrap();
-        let (file, clen) = &mut *guard;
+        let mut guard = self.write_lock()?;
+        let (file, clen, replay) = &mut *guard;
         let raw_size = file.seek(SeekFrom::End(0))?;
         let data_size = raw_size - HEADER_SIZE;
         if n > data_size {
@@ -1849,7 +1999,7 @@ impl BStack {
             ));
         }
         fault_point!(self, "discard");
-        commit_shrink(file, clen, new_data_len)?;
+        Self::mark_replay(replay, commit_shrink(file, clen, new_data_len))?;
         Ok(())
     }
 
@@ -1884,8 +2034,8 @@ impl BStack {
             return Ok(());
         }
         let end = checked_end(offset, data.len() as u64, "set: offset + len overflows u64")?;
-        let mut guard = self.lock.write().unwrap();
-        let file = &mut guard.0;
+        let mut guard = self.write_lock()?;
+        let (file, _, replay) = &mut *guard;
         // Load `locked` under the write lock — otherwise a concurrent
         // `lock_up_to` could extend the locked region between our check and
         // our write, letting us mutate a now-immutable byte.
@@ -1899,7 +2049,7 @@ impl BStack {
             ));
         }
         fault_point!(self, "set");
-        set_in_place(file, data_size, offset, data)
+        Self::mark_replay(replay, set_in_place(file, data_size, offset, data))
     }
 
     /// Overwrite `n` bytes with zeros in place starting at logical `offset`.
@@ -1931,8 +2081,8 @@ impl BStack {
             return Ok(());
         }
         let end = checked_end(offset, n, "zero: offset + n overflows u64")?;
-        let mut guard = self.lock.write().unwrap();
-        let file = &mut guard.0;
+        let mut guard = self.write_lock()?;
+        let (file, _, replay) = &mut *guard;
         // Load `locked` under the write lock (see `set` for rationale).
         let locked = self.locked.load(Ordering::Acquire);
         check_offset_unlocked("zero", offset, end, locked)?;
@@ -1946,7 +2096,7 @@ impl BStack {
         // Zeroing is a repeat-fill of the single-byte pattern `[0x00]` `n` times:
         // the journal stages a fixed 9-byte `[k | s]` tail instead of `n` bytes.
         fault_point!(self, "zero");
-        repeat_fill(file, data_size, offset, &[0u8], n)
+        Self::mark_replay(replay, repeat_fill(file, data_size, offset, &[0u8], n))
     }
 
     /// Fill `count` copies of `pattern` in place starting at logical `offset` —
@@ -1996,8 +2146,8 @@ impl BStack {
             total,
             "repeat: offset + count*pattern.len() overflows u64",
         )?;
-        let mut guard = self.lock.write().unwrap();
-        let file = &mut guard.0;
+        let mut guard = self.write_lock()?;
+        let (file, _, replay) = &mut *guard;
         // Load `locked` under the write lock (see `set` for rationale).
         let locked = self.locked.load(Ordering::Acquire);
         check_offset_unlocked("repeat", offset, end, locked)?;
@@ -2009,7 +2159,7 @@ impl BStack {
             ));
         }
         fault_point!(self, "repeat");
-        repeat_fill(file, data_size, offset, pattern, count)
+        Self::mark_replay(replay, repeat_fill(file, data_size, offset, pattern, count))
     }
 }
 
@@ -2055,8 +2205,8 @@ impl BStack {
         if n == 0 && buf_len == 0 {
             return Ok(());
         }
-        let mut guard = self.lock.write().unwrap();
-        let (file, clen) = &mut *guard;
+        let mut guard = self.write_lock()?;
+        let (file, clen, replay) = &mut *guard;
         let file_end = file.seek(SeekFrom::End(0))?;
         let data_size = file_end - HEADER_SIZE;
         if n > data_size {
@@ -2074,7 +2224,10 @@ impl BStack {
             ));
         }
         fault_point!(self, "atrunc");
-        commit_tail_replace(file, clen, new_tail_start, n, buf, file_end)
+        Self::mark_replay(
+            replay,
+            commit_tail_replace(file, clen, new_tail_start, n, buf, file_end),
+        )
     }
 
     /// Pop `n` bytes off the tail then append `buf`, returning the removed bytes.
@@ -2102,8 +2255,8 @@ impl BStack {
         if n == 0 && buf_len == 0 {
             return Ok(Vec::new());
         }
-        let mut guard = self.lock.write().unwrap();
-        let (file, clen) = &mut *guard;
+        let mut guard = self.write_lock()?;
+        let (file, clen, replay) = &mut *guard;
         let file_end = file.seek(SeekFrom::End(0))?;
         let data_size = file_end - HEADER_SIZE;
         if n > data_size {
@@ -2125,7 +2278,10 @@ impl BStack {
         let mut removed = vec![0u8; n as usize];
         read_at(file, new_tail_start, &mut removed)?;
 
-        commit_tail_replace(file, clen, new_tail_start, n, buf, file_end)?;
+        Self::mark_replay(
+            replay,
+            commit_tail_replace(file, clen, new_tail_start, n, buf, file_end),
+        )?;
         Ok(removed)
     }
 
@@ -2155,8 +2311,8 @@ impl BStack {
         if n == 0 && new_len == 0 {
             return Ok(());
         }
-        let mut guard = self.lock.write().unwrap();
-        let (file, clen) = &mut *guard;
+        let mut guard = self.write_lock()?;
+        let (file, clen, replay) = &mut *guard;
         let file_end = file.seek(SeekFrom::End(0))?;
         let data_size = file_end - HEADER_SIZE;
         if n > data_size {
@@ -2177,7 +2333,10 @@ impl BStack {
         // Read the bytes to remove before any mutation.
         read_at(file, new_tail_start, old)?;
 
-        commit_tail_replace(file, clen, new_tail_start, n, new, file_end)
+        Self::mark_replay(
+            replay,
+            commit_tail_replace(file, clen, new_tail_start, n, new, file_end),
+        )
     }
 
     /// Append `buf` only if the current logical payload size equals `s`.
@@ -2197,8 +2356,8 @@ impl BStack {
     #[cfg(feature = "atomic")]
     pub fn try_extend(&self, s: u64, buf: impl AsRef<[u8]>) -> io::Result<bool> {
         let buf = buf.as_ref();
-        let mut guard = self.lock.write().unwrap();
-        let (file, clen) = &mut *guard;
+        let mut guard = self.write_lock()?;
+        let (file, clen, replay) = &mut *guard;
         let file_end = file.seek(SeekFrom::End(0))?;
         let data_size = file_end - HEADER_SIZE;
         if data_size != s {
@@ -2209,11 +2368,18 @@ impl BStack {
         }
         fault_point!(self, "try_extend");
         if let Err(e) = file.write_all(buf) {
-            let _ = file.set_len(file_end);
+            // A failed rollback leaves a stale tail past the committed length:
+            // defer it to the next write's replay.
+            if file.set_len(file_end).is_err() {
+                *replay = true;
+            }
             return Err(e);
         }
         let new_len = data_size + buf.len() as u64;
-        commit_grow(file, clen, new_len, data_size, file_end)?;
+        Self::mark_replay(
+            replay,
+            commit_grow(file, clen, new_len, data_size, file_end),
+        )?;
         Ok(true)
     }
 
@@ -2234,8 +2400,8 @@ impl BStack {
     /// `set_len`, `write_committed_len`, or `durable_sync`.
     #[cfg(feature = "atomic")]
     pub fn try_extend_zeros(&self, s: u64, n: u64) -> io::Result<bool> {
-        let mut guard = self.lock.write().unwrap();
-        let (file, clen) = &mut *guard;
+        let mut guard = self.write_lock()?;
+        let (file, clen, replay) = &mut *guard;
         let file_end = file.seek(SeekFrom::End(0))?;
         let data_size = file_end - HEADER_SIZE;
         if data_size != s {
@@ -2250,8 +2416,11 @@ impl BStack {
             "try_extend_zeros: data_size + n overflows u64",
         )?;
         fault_point!(self, "try_extend_zeros");
-        file.set_len(HEADER_SIZE + new_len)?;
-        commit_grow(file, clen, new_len, data_size, file_end)?;
+        Self::mark_replay(replay, file.set_len(HEADER_SIZE + new_len))?;
+        Self::mark_replay(
+            replay,
+            commit_grow(file, clen, new_len, data_size, file_end),
+        )?;
         Ok(true)
     }
 
@@ -2292,8 +2461,8 @@ impl BStack {
                 buf.len()
             ));
         }
-        let mut guard = self.lock.write().unwrap();
-        let (file, clen) = &mut *guard;
+        let mut guard = self.write_lock()?;
+        let (file, clen, replay) = &mut *guard;
         let file_end = file.seek(SeekFrom::End(0))?;
         let data_size = file_end - HEADER_SIZE;
         if data_size != s {
@@ -2310,7 +2479,10 @@ impl BStack {
         fault_point!(self, "try_extend_sparse");
         let one = [(0u64, buf)];
         let blocks: &[(u64, &[u8])] = if buf.is_empty() { &[] } else { &one };
-        commit_sparse_extend(file, clen, data_size, file_end, new_len, blocks)?;
+        Self::mark_replay(
+            replay,
+            commit_sparse_extend(file, clen, data_size, file_end, new_len, blocks),
+        )?;
         Ok(true)
     }
 
@@ -2357,8 +2529,8 @@ impl BStack {
             .collect();
         validate_sparse_blocks(&mut blocks, length, "try_extend_sparse_batched")?;
 
-        let mut guard = self.lock.write().unwrap();
-        let (file, clen) = &mut *guard;
+        let mut guard = self.write_lock()?;
+        let (file, clen, replay) = &mut *guard;
         let file_end = file.seek(SeekFrom::End(0))?;
         let data_size = file_end - HEADER_SIZE;
         if data_size != s {
@@ -2373,7 +2545,10 @@ impl BStack {
             "try_extend_sparse_batched: data_size + length overflows u64",
         )?;
         fault_point!(self, "try_extend_sparse_batched");
-        commit_sparse_extend(file, clen, data_size, file_end, new_len, &blocks)?;
+        Self::mark_replay(
+            replay,
+            commit_sparse_extend(file, clen, data_size, file_end, new_len, &blocks),
+        )?;
         Ok(true)
     }
 
@@ -2397,13 +2572,13 @@ impl BStack {
     #[cfg(feature = "atomic")]
     pub fn try_discard(&self, s: u64, n: u64) -> io::Result<bool> {
         if n == 0 {
-            let guard = self.lock.read().unwrap();
+            let guard = self.read_lock()?;
             let file = &guard.0;
             let data_size = file.metadata()?.len().saturating_sub(HEADER_SIZE);
             return Ok(data_size == s);
         }
-        let mut guard = self.lock.write().unwrap();
-        let (file, clen) = &mut *guard;
+        let mut guard = self.write_lock()?;
+        let (file, clen, replay) = &mut *guard;
         let raw_size = file.seek(SeekFrom::End(0))?;
         let data_size = raw_size - HEADER_SIZE;
         if data_size != s {
@@ -2424,7 +2599,7 @@ impl BStack {
             ));
         }
         fault_point!(self, "try_discard");
-        commit_shrink(file, clen, new_data_len)?;
+        Self::mark_replay(replay, commit_shrink(file, clen, new_data_len))?;
         Ok(true)
     }
 
@@ -2469,7 +2644,7 @@ impl BStack {
         }
         #[cfg(any(unix, windows))]
         {
-            let guard = self.lock.read().unwrap();
+            let guard = self.read_lock()?;
             let file = &guard.0;
             let data_size = file.metadata()?.len().saturating_sub(HEADER_SIZE);
             fault_point!(self, "get_batched");
@@ -2492,7 +2667,7 @@ impl BStack {
         }
         #[cfg(not(any(unix, windows)))]
         {
-            let mut guard = self.lock.write().unwrap();
+            let mut guard = self.write_lock_read()?;
             let file = &mut guard.0;
             let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
             fault_point!(self, "get_batched");
@@ -2544,7 +2719,7 @@ impl BStack {
         }
         #[cfg(any(unix, windows))]
         {
-            let guard = self.lock.read().unwrap();
+            let guard = self.read_lock()?;
             let file = &guard.0;
             let data_size = file.metadata()?.len().saturating_sub(HEADER_SIZE);
             fault_point!(self, "get_batched_into");
@@ -2567,7 +2742,7 @@ impl BStack {
         }
         #[cfg(not(any(unix, windows)))]
         {
-            let mut guard = self.lock.write().unwrap();
+            let mut guard = self.write_lock_read()?;
             let file = &mut guard.0;
             let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
             fault_point!(self, "get_batched_into");
@@ -2617,7 +2792,7 @@ impl BStack {
     {
         #[cfg(any(unix, windows))]
         {
-            let guard = self.lock.read().unwrap();
+            let guard = self.read_lock()?;
             let file = &guard.0;
             let data_size = file.metadata()?.len().saturating_sub(HEADER_SIZE);
             fault_point!(self, "get_batched_gen");
@@ -2643,7 +2818,7 @@ impl BStack {
         }
         #[cfg(not(any(unix, windows)))]
         {
-            let mut guard = self.lock.write().unwrap();
+            let mut guard = self.write_lock_read()?;
             let file = &mut guard.0;
             let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
             fault_point!(self, "get_batched_gen");
@@ -2696,8 +2871,8 @@ impl BStack {
     where
         F: FnOnce(&[u8]) -> Vec<u8>,
     {
-        let mut guard = self.lock.write().unwrap();
-        let (file, clen) = &mut *guard;
+        let mut guard = self.write_lock()?;
+        let (file, clen, replay) = &mut *guard;
         let file_end = file.seek(SeekFrom::End(0))?;
         let data_size = file_end - HEADER_SIZE;
         if n > data_size {
@@ -2719,7 +2894,10 @@ impl BStack {
         read_at(file, new_tail_start, &mut old_tail)?;
         let new_tail = f(&old_tail);
 
-        commit_tail_replace(file, clen, new_tail_start, n, &new_tail, file_end)
+        Self::mark_replay(
+            replay,
+            commit_tail_replace(file, clen, new_tail_start, n, &new_tail, file_end),
+        )
     }
 }
 
@@ -2934,8 +3112,8 @@ impl BStack {
             return Ok(Vec::new());
         }
         let end = checked_end(offset, buf.len() as u64, "swap: offset + len overflows u64")?;
-        let mut guard = self.lock.write().unwrap();
-        let file = &mut guard.0;
+        let mut guard = self.write_lock()?;
+        let (file, _, replay) = &mut *guard;
         // Load `locked` under the write lock (see `set` for rationale).
         let locked = self.locked.load(Ordering::Acquire);
         check_offset_unlocked("swap", offset, end, locked)?;
@@ -2949,7 +3127,7 @@ impl BStack {
         fault_point!(self, "swap");
         let mut old = vec![0u8; buf.len()];
         read_at(file, offset, &mut old)?;
-        set_in_place(file, data_size, offset, buf)?;
+        Self::mark_replay(replay, set_in_place(file, data_size, offset, buf))?;
         Ok(old)
     }
 
@@ -2986,8 +3164,8 @@ impl BStack {
             buf.len() as u64,
             "swap_into: offset + len overflows u64",
         )?;
-        let mut guard = self.lock.write().unwrap();
-        let file = &mut guard.0;
+        let mut guard = self.write_lock()?;
+        let (file, _, replay) = &mut *guard;
         // Load `locked` under the write lock (see `set` for rationale).
         let locked = self.locked.load(Ordering::Acquire);
         check_offset_unlocked("swap_into", offset, end, locked)?;
@@ -3001,7 +3179,7 @@ impl BStack {
         fault_point!(self, "swap_into");
         let mut tmp = vec![0u8; buf.len()];
         read_at(file, offset, &mut tmp)?;
-        set_in_place(file, data_size, offset, buf)?;
+        Self::mark_replay(replay, set_in_place(file, data_size, offset, buf))?;
         buf.copy_from_slice(&tmp);
         Ok(())
     }
@@ -3047,8 +3225,8 @@ impl BStack {
             return Ok(true);
         }
         let end = checked_end(offset, old.len() as u64, "cas: offset + len overflows u64")?;
-        let mut guard = self.lock.write().unwrap();
-        let file = &mut guard.0;
+        let mut guard = self.write_lock()?;
+        let (file, _, replay) = &mut *guard;
         // Load `locked` under the write lock (see `set` for rationale).
         let locked = self.locked.load(Ordering::Acquire);
         check_offset_unlocked("cas", offset, end, locked)?;
@@ -3065,7 +3243,7 @@ impl BStack {
         if current != old {
             return Ok(false);
         }
-        set_in_place(file, data_size, offset, new)?;
+        Self::mark_replay(replay, set_in_place(file, data_size, offset, new))?;
         Ok(true)
     }
 
@@ -3111,8 +3289,8 @@ impl BStack {
                 ));
             }
         }
-        let mut guard = self.lock.write().unwrap();
-        let file = &mut guard.0;
+        let mut guard = self.write_lock()?;
+        let (file, _, replay) = &mut *guard;
         let locked = self.locked.load(Ordering::Acquire);
         if a < locked {
             return Err(io_error!(
@@ -3147,7 +3325,7 @@ impl BStack {
             return Ok(());
         }
         fault_point!(self, "cross_exchange");
-        journaled_exchange(file, data_size, a, b, n)
+        Self::mark_replay(replay, journaled_exchange(file, data_size, a, b, n))
     }
 
     /// Copy `n` bytes from `from..from+n` to `to..to+n` under a single write lock.
@@ -3183,8 +3361,8 @@ impl BStack {
     pub fn copy(&self, from: u64, to: u64, n: u64) -> io::Result<()> {
         let from_end = checked_end(from, n, "copy: from + n overflows u64")?;
         let to_end = checked_end(to, n, "copy: to + n overflows u64")?;
-        let mut guard = self.lock.write().unwrap();
-        let file = &mut guard.0;
+        let mut guard = self.write_lock()?;
+        let (file, _, replay) = &mut *guard;
         let locked = self.locked.load(Ordering::Acquire);
         if to < locked {
             return Err(io_error!(
@@ -3227,12 +3405,12 @@ impl BStack {
         if is_atomic_write(to, n) {
             let mut buf = vec![0u8; n as usize];
             read_at(file, from, &mut buf)?;
-            write_at(file, to, &buf)?;
-            durable_sync(file)
+            Self::mark_replay(replay, write_at(file, to, &buf))?;
+            Self::mark_replay(replay, durable_sync(file))
         } else if from < to_end && to < from_end {
-            journaled_move(file, data_size, from, to, n)
+            Self::mark_replay(replay, journaled_move(file, data_size, from, to, n))
         } else {
-            journaled_copy(file, data_size, from, to, n)
+            Self::mark_replay(replay, journaled_copy(file, data_size, from, to, n))
         }
     }
 
@@ -3275,8 +3453,8 @@ impl BStack {
             ));
         }
         let n = end - start;
-        let mut guard = self.lock.write().unwrap();
-        let file = &mut guard.0;
+        let mut guard = self.write_lock()?;
+        let (file, _, replay) = &mut *guard;
         let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
         if end > data_size {
             return Err(io_error!(
@@ -3298,7 +3476,7 @@ impl BStack {
         }
         f(&mut buf);
         if n > 0 {
-            set_in_place(file, data_size, start, &buf)?;
+            Self::mark_replay(replay, set_in_place(file, data_size, start, &buf))?;
         }
         Ok(())
     }
@@ -3398,8 +3576,8 @@ impl BStack {
     where
         F: FnMut() -> Option<BStackGenOp<'a>>,
     {
-        let mut guard = self.lock.write().unwrap();
-        let (file, clen) = &mut *guard;
+        let mut guard = self.write_lock()?;
+        let (file, clen, replay) = &mut *guard;
         let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
         let locked = self.locked.load(Ordering::Acquire);
         fault_point!(self, "process_gen");
@@ -3479,7 +3657,7 @@ impl BStack {
                         ));
                     }
                     if !data.is_empty() {
-                        set_in_place(file, data_size, offset, data)?;
+                        Self::mark_replay(replay, set_in_place(file, data_size, offset, data))?;
                     }
                     return Ok(());
                 }
@@ -3540,7 +3718,10 @@ impl BStack {
                         ));
                     }
                     if len > 0 {
-                        journaled_exchange(file, data_size, a_offset, b_offset, len)?;
+                        Self::mark_replay(
+                            replay,
+                            journaled_exchange(file, data_size, a_offset, b_offset, len),
+                        )?;
                     }
                     return Ok(());
                 }
@@ -3549,11 +3730,18 @@ impl BStack {
                         let file_end = file.seek(SeekFrom::End(0))?;
                         let logical_offset = file_end - HEADER_SIZE;
                         if let Err(e) = file.write_all(data) {
-                            let _ = file.set_len(file_end);
+                            // A failed rollback leaves a stale tail past the committed length:
+                            // defer it to the next write's replay.
+                            if file.set_len(file_end).is_err() {
+                                *replay = true;
+                            }
                             return Err(e);
                         }
                         let new_len = logical_offset + data.len() as u64;
-                        commit_grow(file, clen, new_len, logical_offset, file_end)?;
+                        Self::mark_replay(
+                            replay,
+                            commit_grow(file, clen, new_len, logical_offset, file_end),
+                        )?;
                     }
                     return Ok(());
                 }
@@ -3576,7 +3764,7 @@ impl BStack {
                     }
                     if n > 0 {
                         read_at(file, new_data_len, buf)?;
-                        commit_shrink(file, clen, new_data_len)?;
+                        Self::mark_replay(replay, commit_shrink(file, clen, new_data_len))?;
                     }
                     return Ok(());
                 }
@@ -3599,7 +3787,7 @@ impl BStack {
                         ));
                     }
                     if len > 0 {
-                        commit_shrink(file, clen, new_data_len)?;
+                        Self::mark_replay(replay, commit_shrink(file, clen, new_data_len))?;
                     }
                     return Ok(());
                 }
@@ -3621,7 +3809,10 @@ impl BStack {
                     }
                     if n != 0 || !data.is_empty() {
                         let file_end = HEADER_SIZE + data_size;
-                        commit_tail_replace(file, clen, new_tail_start, n, data, file_end)?;
+                        Self::mark_replay(
+                            replay,
+                            commit_tail_replace(file, clen, new_tail_start, n, data, file_end),
+                        )?;
                     }
                     return Ok(());
                 }
@@ -3646,7 +3837,10 @@ impl BStack {
                         // Read the removed bytes before any mutation.
                         read_at(file, new_tail_start, old)?;
                         let file_end = HEADER_SIZE + data_size;
-                        commit_tail_replace(file, clen, new_tail_start, n, new, file_end)?;
+                        Self::mark_replay(
+                            replay,
+                            commit_tail_replace(file, clen, new_tail_start, n, new, file_end),
+                        )?;
                     }
                     return Ok(());
                 }
@@ -3666,7 +3860,10 @@ impl BStack {
                             length,
                             "process_gen: sparse data_size + length overflows u64",
                         )?;
-                        commit_sparse_extend(file, clen, data_size, file_end, new_len, &blocks)?;
+                        Self::mark_replay(
+                            replay,
+                            commit_sparse_extend(file, clen, data_size, file_end, new_len, &blocks),
+                        )?;
                     }
                     return Ok(());
                 }
@@ -3734,8 +3931,8 @@ impl BStack {
         if blocks.is_empty() {
             return Ok(());
         }
-        let mut guard = self.lock.write().unwrap();
-        let file = &mut guard.0;
+        let mut guard = self.write_lock()?;
+        let (file, _, replay) = &mut *guard;
         // Load `locked` under the write lock (see `set` for rationale).
         let locked = self.locked.load(Ordering::Acquire);
         let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
@@ -3768,7 +3965,7 @@ impl BStack {
         // so skip the overlap scan and the multi-write journal.
         if blocks.len() == 1 {
             let (off, data) = blocks[0];
-            return set_in_place(file, data_size, off, data);
+            return Self::mark_replay(replay, set_in_place(file, data_size, off, data));
         }
         // Reject overlap: sort by offset, then check that each block ends at or
         // before the next one begins.
@@ -3784,7 +3981,7 @@ impl BStack {
                 ));
             }
         }
-        journaled_multi_set(file, data_size, &blocks)
+        Self::mark_replay(replay, journaled_multi_set(file, data_size, &blocks))
     }
 
     /// Run a sequence of dependent reads interleaved with multiple in-place
@@ -3860,8 +4057,8 @@ impl BStack {
     where
         F: FnMut(io::Result<()>) -> Option<BStackGenOp<'a>>,
     {
-        let mut guard = self.lock.write().unwrap();
-        let file = &mut guard.0;
+        let mut guard = self.write_lock()?;
+        let (file, _, replay) = &mut *guard;
         let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
         let locked = self.locked.load(Ordering::Acquire);
         fault_point!(self, "inplace_gen");
@@ -3952,9 +4149,9 @@ impl BStack {
             0 => Ok(()),
             1 => {
                 let (offset, data) = overlay[0];
-                set_in_place(file, data_size, offset, data)
+                Self::mark_replay(replay, set_in_place(file, data_size, offset, data))
             }
-            _ => journaled_multi_set(file, data_size, &overlay),
+            _ => Self::mark_replay(replay, journaled_multi_set(file, data_size, &overlay)),
         }
     }
 
@@ -4001,8 +4198,8 @@ impl BStack {
         let b_len = b_buf.len() as u64;
         let a_end = checked_end(a_offset, a_len, "eq_crds: a_offset + a_len overflows u64")?;
         let b_end = checked_end(b_offset, b_len, "eq_crds: b_offset + b_len overflows u64")?;
-        let mut guard = self.lock.write().unwrap();
-        let file = &mut guard.0;
+        let mut guard = self.write_lock()?;
+        let (file, _, replay) = &mut *guard;
         let locked = self.locked.load(Ordering::Acquire);
         if !b_buf.is_empty() && b_offset < locked {
             return Err(io_error!(
@@ -4042,7 +4239,7 @@ impl BStack {
         }
         let mut old_b = vec![0u8; b_buf.len()];
         read_at(file, b_offset, &mut old_b)?;
-        set_in_place(file, data_size, b_offset, b_buf)?;
+        Self::mark_replay(replay, set_in_place(file, data_size, b_offset, b_buf))?;
         Ok(Some(old_b))
     }
 
@@ -4078,8 +4275,8 @@ impl BStack {
         let b_len = b_buf.len() as u64;
         let a_end = checked_end(a_offset, a_len, "ne_crds: a_offset + a_len overflows u64")?;
         let b_end = checked_end(b_offset, b_len, "ne_crds: b_offset + b_len overflows u64")?;
-        let mut guard = self.lock.write().unwrap();
-        let file = &mut guard.0;
+        let mut guard = self.write_lock()?;
+        let (file, _, replay) = &mut *guard;
         let locked = self.locked.load(Ordering::Acquire);
         if !b_buf.is_empty() && b_offset < locked {
             return Err(io_error!(
@@ -4119,7 +4316,7 @@ impl BStack {
         }
         let mut old_b = vec![0u8; b_buf.len()];
         read_at(file, b_offset, &mut old_b)?;
-        set_in_place(file, data_size, b_offset, b_buf)?;
+        Self::mark_replay(replay, set_in_place(file, data_size, b_offset, b_buf))?;
         Ok(Some(old_b))
     }
 
@@ -4176,8 +4373,8 @@ impl BStack {
             b_len,
             "masked_eq_crds: b_offset + b_len overflows u64",
         )?;
-        let mut guard = self.lock.write().unwrap();
-        let file = &mut guard.0;
+        let mut guard = self.write_lock()?;
+        let (file, _, replay) = &mut *guard;
         let locked = self.locked.load(Ordering::Acquire);
         if !b_buf.is_empty() && b_offset < locked {
             return Err(io_error!(
@@ -4222,7 +4419,7 @@ impl BStack {
         }
         let mut old_b = vec![0u8; b_buf.len()];
         read_at(file, b_offset, &mut old_b)?;
-        set_in_place(file, data_size, b_offset, b_buf)?;
+        Self::mark_replay(replay, set_in_place(file, data_size, b_offset, b_buf))?;
         Ok(Some(old_b))
     }
 
@@ -4277,8 +4474,8 @@ impl BStack {
             b_len,
             "masked_ne_crds: b_offset + b_len overflows u64",
         )?;
-        let mut guard = self.lock.write().unwrap();
-        let file = &mut guard.0;
+        let mut guard = self.write_lock()?;
+        let (file, _, replay) = &mut *guard;
         let locked = self.locked.load(Ordering::Acquire);
         if !b_buf.is_empty() && b_offset < locked {
             return Err(io_error!(
@@ -4323,7 +4520,7 @@ impl BStack {
         }
         let mut old_b = vec![0u8; b_buf.len()];
         read_at(file, b_offset, &mut old_b)?;
-        set_in_place(file, data_size, b_offset, b_buf)?;
+        Self::mark_replay(replay, set_in_place(file, data_size, b_offset, b_buf))?;
         Ok(Some(old_b))
     }
 }
@@ -4341,26 +4538,29 @@ impl BStack {
     ///
     /// # Errors
     ///
-    /// Never actually fails outside of an armed fault policy under the
-    /// `fault-injection` feature; returns [`io::Result`] for source
-    /// compatibility.
+    /// Fails with [`InterruptedWrite`] while an interrupted write is pending
+    /// replay: the cached length is exactly what that replay may correct.
+    /// Otherwise never actually fails
+    /// outside of an armed fault policy under the `fault-injection` feature;
+    /// returns [`io::Result`] for source compatibility.
     #[inline]
     pub fn len(&self) -> io::Result<u64> {
         fault_point!(self, "len");
-        Ok(self.lock.read().unwrap().1)
+        Ok(self.read_lock()?.1)
     }
 
     /// Return `true` if the stack contains no payload bytes.
     ///
     /// # Errors
     ///
-    /// Never actually fails outside of an armed fault policy under the
-    /// `fault-injection` feature; returns [`io::Result`] for source
+    /// Fails while an interrupted write is pending replay, as [`len`](Self::len)
+    /// does.  Otherwise never actually fails outside of an armed fault policy
+    /// under the `fault-injection` feature; returns [`io::Result`] for source
     /// compatibility.
     #[inline]
     pub fn is_empty(&self) -> io::Result<bool> {
         fault_point!(self, "is_empty");
-        Ok(self.lock.read().unwrap().1 == 0)
+        Ok(self.read_lock()?.1 == 0)
     }
 
     /// Returns the current locked length.  `0` means no bytes are locked.
@@ -4406,7 +4606,7 @@ impl BStack {
         // Acquire the write lock to serialise against any in-flight writers.
         #[allow(unused_mut)]
         // `mut` is not needed on Unix and Windows, but other platforms may need it for the file handle.
-        let mut guard = self.lock.write().unwrap();
+        let mut guard = self.write_lock_read()?;
         let file = &mut guard.0;
         let data_size = file.metadata()?.len().saturating_sub(HEADER_SIZE);
         let current_locked = self.locked.load(Ordering::Relaxed);
