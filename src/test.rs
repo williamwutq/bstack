@@ -2590,6 +2590,38 @@ mod tests {
         assert!(is_pending(&stack.get(0, 65).unwrap_err()));
     }
 
+    #[test]
+    fn recover_applies_a_pending_replay_without_a_write() {
+        let (stack, path) = mk_stack();
+        let _g = Guard(path);
+        stack.push([b'a'; 300]).unwrap();
+        stage_tail(&stack, &[b'b'; 300]);
+        arm_wip(&stack, HEADER_SIZE, 0 /* WipAux::Set */);
+        mark_replay_needed(&stack);
+        assert!(stack.get(0, 300).is_err());
+
+        // The point of the call: read again after a failed write, without
+        // having to issue another one.
+        assert!(stack.recover().unwrap());
+        assert_eq!(stack.len().unwrap(), 300);
+        assert_eq!(stack.get(0, 300).unwrap(), vec![b'b'; 300]);
+    }
+
+    #[test]
+    fn recover_on_an_intact_stack_reports_nothing_pending() {
+        let (stack, path) = mk_stack();
+        let _g = Guard(path);
+        stack.push(b"hello").unwrap();
+        assert!(!stack.recover().unwrap());
+        assert_eq!(stack.peek(0).unwrap(), b"hello");
+
+        // A replay runs once: the second call has nothing left to do.
+        mark_replay_needed(&stack);
+        assert!(stack.recover().unwrap());
+        assert!(!stack.recover().unwrap());
+        assert_eq!(stack.len().unwrap(), 5);
+    }
+
     /// A genuine mid-write I/O failure: the stack's descriptor is swapped for a
     /// read-only one on the same file, so seeks and size checks still succeed but
     /// every write — including the rollback `ftruncate` — fails.

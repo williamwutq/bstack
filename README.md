@@ -85,6 +85,10 @@ impl BStack {
     /// Validates the header and performs crash recovery on existing files.
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self>;
 
+    /// Replay a pending interrupted write now, rather than waiting for the next
+    /// write to do it.  Returns whether one was pending (see *Deferred replay*).
+    pub fn recover(&self) -> io::Result<bool>;
+
     /// Append `data` and durable-sync.  Returns the starting logical offset.
     /// An empty slice is valid and a no-op on disk.
     pub fn push(&self, data: impl AsRef<[u8]>) -> io::Result<u64>;
@@ -775,8 +779,10 @@ message:
 let pending = err.get_ref().is_some_and(|e| e.is::<bstack::InterruptedWrite>());
 ```
 
-A replay that fails returns its own error and leaves the flag set, for the write
-after it to try again.
+`recover()` runs the pending replay on demand and reports whether there was one,
+for a caller that wants to read again after a failed write without issuing
+another.  A replay that fails — from either route — returns its own error and
+leaves the flag set, for the next attempt to retry.
 
 ---
 

@@ -101,7 +101,9 @@
 //!   arguments — a stale tail would inflate the payload size every mutator
 //!   derives from the file end — then proceeds normally. The flag clears only
 //!   once the replay succeeds; a failing replay returns its own error.
-//! * **Reads fail** with [`InterruptedWrite`]. This covers every read that
+//! * **Reads fail** with [`InterruptedWrite`], until a write replays or
+//!   [`recover`](BStack::recover) is called to replay on its own. This covers
+//!   every read that
 //!   consults the file or the cached committed length — [`len`](BStack::len),
 //!   and a zero-length [`get(n, n)`](BStack::get) too, since it still checks
 //!   `n` against the payload size. Unaffected are the calls that return before
@@ -985,7 +987,7 @@ impl BStack {
     /// after an earlier write on the same handle failed midway.  Every replay is
     /// idempotent, so running it twice is harmless.
     #[inline]
-    fn recover(file: &mut File, raw_size: u64) -> io::Result<u64> {
+    fn recover_file(file: &mut File, raw_size: u64) -> io::Result<u64> {
         let (committed_len, wip_ptr, wip_aux) = Self::read_header(file)?;
         let mut clen = committed_len;
         if wip_ptr != 0 {
@@ -1036,15 +1038,27 @@ impl BStack {
     /// leave a stale tail past the committed length, which would inflate the
     /// payload size every mutator derives from the file end.  A failed replay
     /// leaves the flag set, so the next write tries again.
+    #[inline(always)]
     fn write_lock(&self) -> io::Result<std::sync::RwLockWriteGuard<'_, (File, u64, bool)>> {
         let mut guard = self.lock.write().unwrap();
-        if guard.2 {
-            let (file, clen, replay) = &mut *guard;
-            let raw_size = file.metadata()?.len();
-            *clen = Self::recover(file, raw_size)?;
-            *replay = false;
-        }
+        Self::replay_pending(&mut guard)?;
         Ok(guard)
+    }
+
+    /// Replay a pending interruption on a held write guard, adopting the
+    /// committed length it commits and clearing the flag.  Returns whether one
+    /// was pending.  A failed replay leaves the flag set, so the next write — or
+    /// [`recover`](Self::recover) — tries again.
+    #[inline]
+    fn replay_pending(guard: &mut (File, u64, bool)) -> io::Result<bool> {
+        if !guard.2 {
+            return Ok(false);
+        }
+        let (file, clen, replay) = guard;
+        let raw_size = file.metadata()?.len();
+        *clen = Self::recover_file(file, raw_size)?;
+        *replay = false;
+        Ok(true)
     }
 
     /// Take the write lock for a **read-only** operation that needs `&mut File`
@@ -1122,7 +1136,7 @@ impl BStack {
                 )
             ));
         } else {
-            clen = Self::recover(&mut file, raw_size)?;
+            clen = Self::recover_file(&mut file, raw_size)?;
         }
 
         #[cfg(unix)]
@@ -1228,6 +1242,29 @@ impl BStack {
         // a crash leaves only the sibling.)
         std::fs::rename(&tmp, path)?;
         Ok(())
+    }
+
+    /// Replay a pending interrupted write now, instead of waiting for the next
+    /// write to do it.
+    ///
+    /// Returns `true` if one was pending and has been replayed, `false` if the
+    /// stack was already intact.  Reads refused with [`InterruptedWrite`] succeed
+    /// again once this returns `Ok` — which is the point of the call: a caller
+    /// whose write failed can carry on reading without having to issue another
+    /// write or reopen the file.
+    ///
+    /// The repair is the one [`open`](Self::open) performs (see *Deferred replay*
+    /// in the crate docs), and every write already runs it, so calling this is
+    /// never required for correctness.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any I/O error from the replay, leaving the stack flagged so a
+    /// later call — or the next write — can retry.
+    pub fn recover(&self) -> io::Result<bool> {
+        let mut guard = self.lock.write().unwrap();
+        fault_point!(self, "recover");
+        Self::replay_pending(&mut guard)
     }
 
     /// Append `data` to the end of the file.
