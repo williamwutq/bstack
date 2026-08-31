@@ -562,7 +562,10 @@
 //!   constructor initialises an empty stack or reopens one (running recovery
 //!   automatically). Requires both `alloc` and `set`; `Send` in all
 //!   configurations, `Send + Sync` with `atomic` (no allocator-level lock —
-//!   free-list splices ride [`BStack::process_gen`]/[`BStack::inplace_gen`]).
+//!   free-list splices ride [`BStack::process_gen`]/[`BStack::inplace_gen`]), where
+//!   it additionally implements [`BStackBulkAllocator`] (`alloc_bulk`/`dealloc_bulk`,
+//!   work bounded by the classes touched, with oversized requests matched
+//!   largest-first against the oversized free list).
 //!   **Experimental:** the on-disk format and API may change, some resize paths
 //!   differ between the `atomic` and non-`atomic` builds, and the background
 //!   coalescer / deep in-use-leak GC are not yet implemented.

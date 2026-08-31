@@ -998,13 +998,15 @@ carries `source: A::Error` plus `handles: Vec<A::Allocated<'a>>`, the handles
 still owned by the caller after a failed bulk free.
 
 `LinearBStackAllocator` and `GhostTreeBstackAllocator` implement the trait;
-`SlabBStackAllocator` and `CheckedSlabBStackAllocator` implement it with the
-`atomic` feature (both commit through `set_batched`/`inplace_gen`/`cross_exchange`,
-which require `atomic`), and `DebugCheckingAllocator` forwards it. Each slab
-request becomes an independently-freeable handle rather than one sliced block:
-`alloc_bulk` draws single-block requests from the free list first, then serves
-oversized runs and any overflow from one tail extend; `dealloc_bulk` returns the
-whole batch to the free list as a single spliced chain.
+`SlabBStackAllocator`, `CheckedSlabBStackAllocator`, and
+`SegregatedBStackAllocator` implement it with the `atomic` feature (they commit
+through `set_batched`/`inplace_gen`/`cross_exchange`, which require `atomic`), and
+`DebugCheckingAllocator` forwards it. Each slab request becomes an
+independently-freeable handle rather than one sliced block. For the segregated
+allocator, work is bounded by the number of distinct size classes touched (≤ 33)
+rather than the request count: each class's free list is chased once, oversized
+requests are matched largest-first against the oversized free list, the remaining
+misses share one tail `extend`, and every claim commits in one `set_batched`.
 
 ### `BStackUninitAllocator` trait
 
@@ -1305,7 +1307,9 @@ classes (16 linear 16‥256 B, 16 geometric 320‥4096 B, one oversized bucket)
 sharing one arena.  Class computed by register arithmetic; O(1) classed
 alloc/dealloc; 8-byte overhead tag per block.  Single `new(stack)` constructor
 (runs recovery automatically).  Without `atomic`: `Send` only.  With `atomic`:
-`Send + Sync`, no allocator-level lock.
+`Send + Sync`, no allocator-level lock, and additionally implements
+`BStackBulkAllocator` (`alloc_bulk`/`dealloc_bulk`; oversized requests matched
+largest-first against the oversized free list).
 
 > **Experimental.**  The on-disk format and API are not yet stable — some resize
 > paths differ between the `atomic` and non-`atomic` builds (a shrink reclaims its

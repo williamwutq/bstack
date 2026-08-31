@@ -488,6 +488,17 @@ physical size comes straight from the word; the handle's length is trusted
 the tail is `discard`ed back to the stack; every other block is spliced onto its
 class head.
 
+### Bulk operations (`atomic` feature)
+
+With `atomic`, implements `BStackBulkAllocator`; work is bounded by the distinct classes touched (≤ 33), not by the request count. Free-list chases carry cycle detection (a revisited block aborts with no write); the oversized chase additionally validates each block's overhead (in-use bit clear, size ≥ a quantum and within the payload) before use.
+
+| Operation      | Strategy                                                                                                                                        |
+|----------------|------------------------------------------------------------------------------------------------------------------------------------------------|
+| `alloc_bulk`   | Count classed requests by class and drain every touched class's free list in one atomic multi-class pop (`inplace_gen`: read every chain, then advance every head — a failure pops nothing); match oversized requests largest-first against the oversized list, chasing only the prefix needed to satisfy them all (`process_gen`, rejecting an in-use block on the list), carving a matched block whose slack reaches `SPLIT_MIN` (freeing the remainder) and re-splicing prefix blocks that fit nothing; serve the remaining misses from one `extend_sparse_batched` that writes each fresh block's *free* overhead (self-describing tail); mark in-use + scrub in one `set_batched`, one contiguous entry per block |
+| `dealloc_bulk` | Read every handle's overhead in one `get_batched_gen` lock; validate/reject double-frees (incl. a block twice in the batch); group freed blocks by class, stage each class's chain in one `set_batched`, and splice each onto its class head with one `cross_exchange` |
+
+Blocks pulled from the free lists are left free-tagged until the final claim, so a crash leaves them reclaimable by `recover`; the freshly extended tail is free-tagged too (its blocks carry a *free* overhead word, so `recover` relinks them rather than mistaking a mid-arena zero hole for an orphaned tail to truncate). On an I/O failure the fresh tail is discarded first and the detached blocks re-pushed to their class lists, both best-effort.
+
 ### Realloc
 
 The caller's length lives in the returned handle, not on disk, so a resize that
