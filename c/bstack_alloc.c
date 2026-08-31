@@ -7892,12 +7892,845 @@ fail_recover:
     return -1;
 }
 
+#ifndef BSTACK_FEATURE_ATOMIC
 static const bstack_allocator_vtbl_t alsg_allocator_vtbl = {
     alsg_vt_stack,
     alsg_vt_alloc,
     alsg_vt_realloc,
     alsg_vt_dealloc,
 };
+#endif
+
+/* ---- bulk (BStackBulkAllocator), atomic only --------------------------- */
+#ifdef BSTACK_FEATURE_ATOMIC
+
+/* How the final alloc_bulk claim writes one block. */
+enum {
+    ALSG_CLAIM_REUSE, /* popped or oversized-retained: in-use tag, body scrubbed */
+    ALSG_CLAIM_FRESH, /* freshly extended: in-use tag only (body already zero) */
+    ALSG_CLAIM_CARVE  /* carve remainder: free tag, so recover() relinks it */
+};
+
+struct alsg_claim {
+    uint64_t off;
+    uint64_t size;
+    int      kind;
+};
+
+/* One oversized request, paired with its block size for the largest-first sort. */
+struct alsg_ovreq {
+    uint64_t block;
+    size_t   req;
+};
+
+/* One oversized match: which request took which block, and the block's size. */
+struct alsg_ovmatch {
+    uint64_t off;
+    uint64_t size;
+    size_t   req;
+};
+
+static int alsg_cmp_claim_by_class(const void *pa, const void *pb)
+{
+    uint64_t ca = alsg_classify(((const struct alsg_claim *)pa)->size);
+    uint64_t cb = alsg_classify(((const struct alsg_claim *)pb)->size);
+    return (ca > cb) - (ca < cb);
+}
+
+static int alsg_cmp_ovreq_desc(const void *pa, const void *pb)
+{
+    uint64_t ba = ((const struct alsg_ovreq *)pa)->block;
+    uint64_t bb = ((const struct alsg_ovreq *)pb)->block;
+    return (ba < bb) - (ba > bb);
+}
+
+/* ---- multi-class pop --------------------------------------------------- */
+
+/*
+ * Pop up to want[c] blocks from every classed free list in one crash-atomic
+ * bstack_inplace_gen.  popped[] receives the block starts flattened in ascending
+ * class order, counts[c] how many class c gave up (fewer than want[c] when the
+ * list runs out), and *out_total their sum.  The oversized class is skipped
+ * (matched separately by alsg_match_oversized_bounded).
+ *
+ * Every chain is read first and all head advances are emitted afterwards, so an
+ * error stages nothing and no class is left with blocks detached while another
+ * keeps its head.  The chase is bounded by want[c], but a cycle of period
+ * <= want[c] would pop one block twice, so every candidate is checked against
+ * the blocks popped so far.  Popped blocks stay free-tagged and detached; the
+ * caller claims them, and a crash before that leaves them reclaimable by
+ * segregated_bstack_allocator_recover.
+ */
+struct alsg_popall_ctx {
+    size_t        counts[ALSG_NUM_CLASSES];
+    int           advance[ALSG_NUM_CLASSES];
+    uint8_t       head_writes[ALSG_NUM_CLASSES][8];
+    uint8_t       head_buf[8];
+    uint8_t       node_buf[16]; /* [0..8] overhead (free tag), [8..16] next */
+    uint64_t      cursor;
+    const size_t *want;
+    uint64_t     *popped;
+    int          *prev;
+    size_t        total;
+    size_t        cls;          /* class being chased */
+    size_t        in_class;     /* blocks taken from it so far */
+    size_t        emit;         /* next class to consider in the write phase */
+    int           phase;
+    int           err;
+};
+
+enum { APA_CHASE, APA_CONSUME_HEAD, APA_READ_NODE, APA_CONSUME_NODE, APA_EMIT };
+
+static int alsg_popall_gen(bstack_gen_op_t *op, void *uc)
+{
+    struct alsg_popall_ctx *c = uc;
+
+    /* A prior read failed.  All writes live in the write phase, entered only
+     * once every read has completed, so nothing is staged yet: ending here
+     * commits the empty batch (pops nothing). */
+    if (*c->prev != 0) { c->err = *c->prev; return 0; }
+
+    for (;;) {
+        switch (c->phase) {
+        case APA_CHASE:
+            if (c->cls >= ALSG_NUM_CLASSES) { c->phase = APA_EMIT; break; }
+            if (c->want[c->cls] == 0) { c->cls++; break; }
+            c->in_class = 0;
+            c->phase = APA_CONSUME_HEAD;
+            op->kind = BSTACK_GEN_READ;
+            op->u.read.offset = alsg_head_off(c->cls);
+            op->u.read.buf = c->head_buf;
+            op->u.read.len = 8;
+            return 1;
+
+        case APA_CONSUME_HEAD: {
+            uint64_t head = read_le64(c->head_buf);
+            if (head == ALSG_SENTINEL) {
+                c->cls++; c->phase = APA_CHASE; /* empty list: no head advance */
+            } else {
+                c->cursor = head; c->phase = APA_READ_NODE;
+            }
+            break;
+        }
+
+        case APA_READ_NODE: {
+            size_t i;
+            for (i = 0; i < c->total; i++) {
+                if (c->popped[i] == c->cursor) { /* cycle: no write staged */
+                    c->err = EINVAL;
+                    return 0;
+                }
+            }
+            c->phase = APA_CONSUME_NODE;
+            op->kind = BSTACK_GEN_READ;
+            op->u.read.offset = c->cursor;
+            op->u.read.buf = c->node_buf;
+            op->u.read.len = 16;
+            return 1;
+        }
+
+        case APA_CONSUME_NODE: {
+            uint64_t word = read_le64(c->node_buf);
+            uint64_t size = word << 4;
+            uint64_t next;
+            /* A block on class cls's list must be free and belong on it —
+             * matching how recover() places blocks, so a non-class size relinked
+             * onto a smaller class is reused here just as alsg_pop_class reuses
+             * it.  The size >= QUANTUM guard precedes alsg_classify (which
+             * underflows on 0). */
+            if ((word & ALSG_IN_USE_BIT) || size < ALSG_QUANTUM
+                || alsg_classify(alsg_largest_class_le(size)) != (uint64_t)c->cls) {
+                c->err = EINVAL;
+                return 0;
+            }
+            c->popped[c->total++] = c->cursor;
+            c->counts[c->cls]++;
+            c->in_class++;
+            next = read_le64(c->node_buf + 8);
+            if (c->in_class == c->want[c->cls] || next == ALSG_SENTINEL) {
+                write_le64(c->head_writes[c->cls], next);
+                c->advance[c->cls] = 1;
+                c->cls++; c->phase = APA_CHASE;
+            } else {
+                c->cursor = next; c->phase = APA_READ_NODE;
+            }
+            break;
+        }
+
+        default: /* APA_EMIT */
+            while (c->emit < ALSG_NUM_CLASSES && !c->advance[c->emit]) c->emit++;
+            if (c->emit >= ALSG_NUM_CLASSES) return 0; /* commit the advances */
+            op->kind = BSTACK_GEN_WRITE;
+            op->u.write.offset = alsg_head_off(c->emit);
+            op->u.write.data = c->head_writes[c->emit];
+            op->u.write.len = 8;
+            c->emit++;
+            return 1;
+        }
+    }
+}
+
+static int alsg_pop_all_classes(bstack_t *bs, const size_t *want,
+                                uint64_t *popped, size_t *counts,
+                                size_t *out_total)
+{
+    struct alsg_popall_ctx c;
+    size_t i, total_want = 0;
+    int prev = 0;
+
+    for (i = 0; i < ALSG_NUM_CLASSES; i++) { counts[i] = 0; total_want += want[i]; }
+    *out_total = 0;
+    if (total_want == 0) return 0;
+
+    memset(&c, 0, sizeof c);
+    c.want = want; c.popped = popped; c.phase = APA_CHASE; c.prev = &prev;
+    if (bstack_inplace_gen(bs, alsg_popall_gen, &c, &prev) != 0) return -1;
+    if (c.err) { errno = c.err; return -1; }
+    memcpy(counts, c.counts, sizeof c.counts);
+    *out_total = c.total;
+    return 0;
+}
+
+/* ---- detached-block repush --------------------------------------------- */
+
+/*
+ * Best-effort: return free-tagged detached blocks to their class lists after an
+ * alloc_bulk failure.  Blocks are grouped by class (sorted in place; the claim
+ * kind is ignored — only offset and size matter) and every class's chain is
+ * staged in one bstack_set_batched, then each is spliced onto its head with one
+ * atomic bstack_cross_exchange — 1 + classes operations, and every overhead word
+ * lands or none does.  Errors are swallowed: a block left unspliced (or all of
+ * them, if the stage fails) stays free-tagged and unlinked, exactly the state
+ * recover() reclaims.
+ */
+static void alsg_repush_detached(bstack_t *bs, struct alsg_claim *blocks,
+                                 size_t count)
+{
+    bstack_iovec_t *iov;
+    uint8_t *bufs;
+    size_t run, end, i;
+
+    if (count == 0) return;
+    if (count > SIZE_MAX / sizeof *iov || count > SIZE_MAX / 16) return;
+    iov = malloc(count * sizeof *iov);
+    bufs = malloc(count * 16);
+    if (!iov || !bufs) { free(iov); free(bufs); return; }
+
+    qsort(blocks, count, sizeof *blocks, alsg_cmp_claim_by_class);
+
+    /* Stage every class's chain: within a run block[k].next = block[k+1], and
+     * the last block's next is the run head — the cross_exchange placeholder. */
+    for (run = 0; run < count; run = end) {
+        uint64_t cls = alsg_classify(blocks[run].size);
+        for (end = run + 1; end < count && alsg_classify(blocks[end].size) == cls; end++)
+            ;
+        for (i = run; i < end; i++) {
+            uint64_t next = (i + 1 < end) ? blocks[i + 1].off : blocks[run].off;
+            write_le64(bufs + i * 16, blocks[i].size >> 4); /* free tag */
+            write_le64(bufs + i * 16 + 8, next);
+            iov[i].offset = blocks[i].off;
+            iov[i].buf = bufs + i * 16;
+            iov[i].len = 16;
+        }
+    }
+    if (bstack_set_batched(bs, iov, count) != 0) {
+        free(iov); free(bufs); /* nothing staged: every block stays free-tagged */
+        return;
+    }
+    /* The chain must be staged before the head moves, so this is a second pass. */
+    for (run = 0; run < count; run = end) {
+        uint64_t cls = alsg_classify(blocks[run].size);
+        int r;
+        for (end = run + 1; end < count && alsg_classify(blocks[end].size) == cls; end++)
+            ;
+        r = bstack_cross_exchange(bs, blocks[end - 1].off + ALSG_OVERHEAD,
+                                  alsg_head_off(cls), 8);
+        (void)r;
+    }
+    free(iov); free(bufs);
+}
+
+/* ---- oversized matching ------------------------------------------------ */
+
+/*
+ * Match the largest-first-sorted reqs against the oversized free list in one
+ * bstack_inplace_gen, filling matched[] with the (req, block, size) triples.
+ * Each matched block is unlinked by patching its predecessor's next (the read
+ * phase records the patches, the write phase emits them), so survivors stay in
+ * place; the chase stops once every request is matched, bounding the write lock
+ * to the batch's needs.  Removed blocks stay free-tagged, so a crash before the
+ * claim leaves them reclaimable by recover().
+ *
+ * Rejects a corrupt list with EINVAL and no write: an over-long walk (cycle), an
+ * in-use bit set, or a size below a QUANTUM or running past the payload.
+ */
+struct alsg_ovm_ctx {
+    uint8_t              head_buf[8];
+    uint8_t              node_buf[16];
+    uint64_t             payload_len;
+    uint64_t             walk;
+    uint64_t             cursor;
+    uint64_t             prev_next_off; /* field currently pointing at cursor */
+    struct alsg_ovreq   *reqs;      /* descending by block; compacted on a match */
+    struct alsg_ovmatch *matched;
+    uint64_t            *patch_off; /* predecessor patches, one per removed run */
+    uint8_t            (*patch_val)[8];
+    int                 *prev;
+    size_t               nreqs;
+    size_t               nmatched;
+    size_t               npatch;
+    size_t               emit;
+    int                  dangling;  /* a removal awaits a repoint */
+    int                  phase;
+    int                  err;
+};
+
+enum { AOV_READ_LEN, AOV_READ_HEAD, AOV_CONSUME_HEAD, AOV_READ_NODE,
+       AOV_CONSUME_NODE, AOV_EMIT };
+
+static int alsg_ovm_gen(bstack_gen_op_t *op, void *uc)
+{
+    struct alsg_ovm_ctx *c = uc;
+
+    /* Read-phase reads never stage a write and the write phase issues no reads,
+     * so nothing is staged when a read error can arrive: ending commits nothing. */
+    if (*c->prev != 0) { c->err = *c->prev; return 0; }
+
+    for (;;) {
+        switch (c->phase) {
+        case AOV_READ_LEN:
+            c->phase = AOV_READ_HEAD;
+            op->kind = BSTACK_GEN_LEN;
+            op->u.len.out = &c->payload_len;
+            return 1;
+
+        case AOV_READ_HEAD:
+            c->phase = AOV_CONSUME_HEAD;
+            op->kind = BSTACK_GEN_READ;
+            op->u.read.offset = alsg_head_off(ALSG_OVERSIZED_CLASS);
+            op->u.read.buf = c->head_buf;
+            op->u.read.len = 8;
+            return 1;
+
+        case AOV_CONSUME_HEAD: {
+            uint64_t head = read_le64(c->head_buf);
+            if (head == ALSG_SENTINEL) {
+                c->phase = AOV_EMIT; /* empty list: no matches, no patches */
+            } else {
+                c->cursor = head; c->phase = AOV_READ_NODE;
+            }
+            break;
+        }
+
+        case AOV_READ_NODE:
+            /* More blocks walked than could fit means a cycle: bail with no
+             * write staged. */
+            c->walk++;
+            if (c->walk > c->payload_len / ALSG_QUANTUM + 1) {
+                c->err = EINVAL;
+                return 0;
+            }
+            c->phase = AOV_CONSUME_NODE;
+            op->kind = BSTACK_GEN_READ;
+            op->u.read.offset = c->cursor;
+            op->u.read.buf = c->node_buf;
+            op->u.read.len = 16;
+            return 1;
+
+        case AOV_CONSUME_NODE: {
+            uint64_t word = read_le64(c->node_buf);
+            uint64_t size = word << 4;
+            uint64_t next;
+            size_t lo = 0, hi = c->nreqs, j;
+
+            if (word & ALSG_IN_USE_BIT) { c->err = EINVAL; return 0; }
+            /* A decoded size below a quantum (e.g. << 4 shifted the real bits
+             * out, leaving 0 — which underflows alsg_classify) or one running
+             * past the payload is corruption: reject it before it reaches the
+             * carve/classify math. */
+            if (size < ALSG_QUANTUM || c->cursor > UINT64_MAX - size
+                || c->cursor + size > c->payload_len) {
+                c->err = EINVAL;
+                return 0;
+            }
+            next = read_le64(c->node_buf + 8);
+
+            /* Largest request first: reqs is descending, so block > size holds
+             * for a prefix; the binary search lands on the first request that
+             * fits — the largest one.  The explicit <= size re-check keeps an
+             * unsorted reqs degrading to "no match" rather than picking one that
+             * doesn't fit (an underflowing carve).  Compact on a match. */
+            while (lo < hi) {
+                size_t mid = lo + (hi - lo) / 2;
+                if (c->reqs[mid].block > size) lo = mid + 1; else hi = mid;
+            }
+            j = lo;
+            if (j < c->nreqs && c->reqs[j].block <= size) {
+                c->matched[c->nmatched].req = c->reqs[j].req;
+                c->matched[c->nmatched].off = c->cursor;
+                c->matched[c->nmatched].size = size;
+                c->nmatched++;
+                memmove(c->reqs + j, c->reqs + j + 1,
+                        (c->nreqs - j - 1) * sizeof *c->reqs);
+                c->nreqs--;
+                /* Remove cursor: its predecessor must skip it.  Defer the patch
+                 * until the next survivor (or the end) is known so a run of
+                 * removals collapses to one repoint. */
+                c->dangling = 1;
+                if (c->nreqs == 0 || next == ALSG_SENTINEL) {
+                    /* Every request met, or the list ended: repoint the
+                     * predecessor past this last removed block and stop. */
+                    c->patch_off[c->npatch] = c->prev_next_off;
+                    write_le64(c->patch_val[c->npatch], next);
+                    c->npatch++;
+                    c->phase = AOV_EMIT;
+                } else {
+                    c->cursor = next; c->phase = AOV_READ_NODE;
+                }
+            } else {
+                /* Survivor: settle any pending removal by repointing the
+                 * predecessor to this block, then it becomes the new prev. */
+                if (c->dangling) {
+                    c->patch_off[c->npatch] = c->prev_next_off;
+                    write_le64(c->patch_val[c->npatch], c->cursor);
+                    c->npatch++;
+                    c->dangling = 0;
+                }
+                c->prev_next_off = c->cursor + ALSG_OVERHEAD;
+                if (next == ALSG_SENTINEL) {
+                    c->phase = AOV_EMIT;
+                } else {
+                    c->cursor = next; c->phase = AOV_READ_NODE;
+                }
+            }
+            break;
+        }
+
+        default: /* AOV_EMIT */
+            if (c->emit >= c->npatch) return 0; /* commit the patches */
+            op->kind = BSTACK_GEN_WRITE;
+            op->u.write.offset = c->patch_off[c->emit];
+            op->u.write.data = c->patch_val[c->emit];
+            op->u.write.len = 8;
+            c->emit++;
+            return 1;
+        }
+    }
+}
+
+static int alsg_match_oversized_bounded(bstack_t *bs, struct alsg_ovreq *reqs,
+                                        size_t nreqs,
+                                        struct alsg_ovmatch *matched,
+                                        size_t *out_nmatched)
+{
+    struct alsg_ovm_ctx c;
+    uint64_t *patch_off;
+    uint8_t (*patch_val)[8];
+    int prev = 0, r;
+
+    *out_nmatched = 0;
+    if (nreqs == 0) return 0;
+
+    patch_off = malloc(nreqs * sizeof *patch_off);
+    patch_val = malloc(nreqs * sizeof *patch_val);
+    if (!patch_off || !patch_val) {
+        free(patch_off); free(patch_val); errno = ENOMEM; return -1;
+    }
+
+    memset(&c, 0, sizeof c);
+    c.reqs = reqs; c.nreqs = nreqs; c.matched = matched;
+    c.patch_off = patch_off; c.patch_val = patch_val;
+    c.prev_next_off = alsg_head_off(ALSG_OVERSIZED_CLASS);
+    c.phase = AOV_READ_LEN; c.prev = &prev;
+
+    r = bstack_inplace_gen(bs, alsg_ovm_gen, &c, &prev);
+    free(patch_off); free(patch_val);
+    if (r != 0) return -1;
+    if (c.err) { errno = c.err; return -1; }
+    *out_nmatched = c.nmatched;
+    return 0;
+}
+
+/* ---- alloc_bulk / dealloc_bulk ----------------------------------------- */
+
+/* One [in-use overhead || zeros] buffer per distinct reused size.  The distinct
+ * sizes are few (a class size per touched class, plus any retained oversized
+ * block), so a linear lookup beats a map. */
+struct alsg_reuse { uint64_t size; uint8_t *buf; };
+
+static uint8_t *alsg_reuse_buf(struct alsg_reuse *tab, size_t *ntab, uint64_t size)
+{
+    size_t i;
+    uint8_t *buf;
+    for (i = 0; i < *ntab; i++) if (tab[i].size == size) return tab[i].buf;
+#if UINT64_MAX > SIZE_MAX
+    if (size > (uint64_t)SIZE_MAX) { errno = EINVAL; return NULL; }
+#endif
+    buf = calloc(1, (size_t)size);
+    if (!buf) { errno = ENOMEM; return NULL; }
+    write_le64(buf, ALSG_IN_USE_BIT | (size >> 4));
+    tab[*ntab].size = size; tab[*ntab].buf = buf; (*ntab)++;
+    return buf;
+}
+
+/*
+ * Allocate one independently-freeable region per requested length.
+ *
+ * In four steps: classed requests drain their free lists in one
+ * alsg_pop_all_classes; oversized requests take blocks from
+ * alsg_match_oversized_bounded, carving a match whose slack clears SPLIT_MIN
+ * (like single alloc); the remaining misses share one
+ * bstack_extend_sparse_batched; and every block is claimed in one
+ * bstack_set_batched, after which carve remainders are relinked.  Zero-length
+ * requests yield the null sentinel slice.
+ *
+ * Work is bounded by the number of distinct classes touched, not by the request
+ * count.  Every block is detached or extended free-tagged and only flipped
+ * in-use by the final set_batched, so a crash before it leaves them reclaimable
+ * by recover().  On failure the fresh tail is discarded and the detached blocks
+ * re-pushed, both best-effort, and out_slices is left unmodified.
+ */
+static int alsg_vt_alloc_bulk(bstack_allocator_t *base, const uint64_t *lens,
+                              size_t n, bstack_slice_t *out_slices)
+{
+    segregated_bstack_allocator_t *a = (segregated_bstack_allocator_t *)base;
+    bstack_t             *bs = a->bs;
+    uint64_t             *block_of = NULL;
+    bstack_slice_t       *tmp = NULL;
+    struct alsg_ovreq    *ovreqs = NULL;
+    struct alsg_ovmatch  *matched = NULL;
+    uint64_t             *popped = NULL;
+    struct alsg_claim    *claims = NULL;
+    bstack_iovec_t       *iov = NULL;
+    uint8_t              *words = NULL;
+    struct alsg_reuse    *reuse = NULL;
+    size_t   want[ALSG_NUM_CLASSES], counts[ALSG_NUM_CLASSES];
+    size_t   pop_base[ALSG_NUM_CLASSES], taken[ALSG_NUM_CLASSES];
+    size_t   i, c, nov = 0, nmatched = 0, nclaims = 0, cap = 0, ptotal = 0;
+    size_t   nreuse = 0, niov = 0, fresh_start = SIZE_MAX, carve_start = 0, end;
+    uint64_t total_block = 0, total_ext = 0, ext_base = 0, ext_bytes = 0, rel;
+    int      ret = -1, saved_errno = 0;
+
+    if (n == 0) return 0;
+    /* Reject counts whose per-request arrays would overflow size_t. */
+    if (n > SIZE_MAX / sizeof *tmp || n > SIZE_MAX / sizeof *ovreqs
+        || n > SIZE_MAX / sizeof *matched) { errno = ENOMEM; return -1; }
+
+    block_of = malloc(n * sizeof *block_of);
+    tmp      = malloc(n * sizeof *tmp);
+    ovreqs   = malloc(n * sizeof *ovreqs);
+    if (!block_of || !tmp || !ovreqs) { errno = ENOMEM; goto done; }
+
+    for (c = 0; c < ALSG_NUM_CLASSES; c++) { want[c] = 0; taken[c] = 0; }
+
+    /* Per-request physical block size (0 marks a zero-length/null request).
+     * Classed requests are counted per class; oversized ones are collected for
+     * separate matching.  Reject a total that does not fit u64. */
+    for (i = 0; i < n; i++) {
+        uint64_t need, block, cls;
+        tmp[i].allocator = base; tmp[i].offset = 0; tmp[i].len = 0;
+        if (lens[i] == 0) { block_of[i] = 0; continue; }
+        need = alsg_phys_need(lens[i]);
+        if (need == 0) { errno = EINVAL; goto done; }
+        block = alsg_class_blocksize(need);
+        block_of[i] = block;
+        if (block > UINT64_MAX - total_block) { errno = EINVAL; goto done; }
+        total_block += block;
+        cls = alsg_classify(block);
+        if (cls == ALSG_OVERSIZED_CLASS) {
+            ovreqs[nov].block = block; ovreqs[nov].req = i; nov++;
+        } else {
+            want[cls]++;
+        }
+    }
+
+    /* Every claim the final set_batched applies: one per request, plus up to
+     * MAX_CARVE_PIECES remainders per carved oversized match. */
+    if (nov > (SIZE_MAX - n) / ALSG_MAX_CARVE_PIECES) { errno = ENOMEM; goto done; }
+    cap = n + nov * ALSG_MAX_CARVE_PIECES;
+    if (cap > SIZE_MAX / sizeof *claims || cap > SIZE_MAX / sizeof *iov
+        || cap > SIZE_MAX / 8 || cap > SIZE_MAX / sizeof *reuse) {
+        errno = ENOMEM; goto done;
+    }
+    claims  = malloc(cap * sizeof *claims);
+    iov     = malloc(cap * sizeof *iov);
+    words   = malloc(cap * 8);
+    reuse   = malloc(cap * sizeof *reuse);
+    popped  = malloc(n * sizeof *popped);
+    matched = malloc(n * sizeof *matched);
+    if (!claims || !iov || !words || !reuse || !popped || !matched) {
+        errno = ENOMEM; goto done;
+    }
+
+    /* 1. Atomic classed pop across all touched classes.  popped is flattened in
+     *    ascending class order, so class c's blocks are the contiguous run
+     *    popped[pop_base[c] .. pop_base[c] + counts[c]]. */
+    if (alsg_pop_all_classes(bs, want, popped, counts, &ptotal) != 0) goto done;
+    for (c = 0, i = 0; c < ALSG_NUM_CLASSES; c++) { pop_base[c] = i; i += counts[c]; }
+
+    /* Walking requests in input order while counting per class assigns, to the
+     * j-th request of a class, that class's j-th popped block. */
+    for (i = 0; i < n; i++) {
+        uint64_t block = block_of[i];
+        uint64_t start;
+        if (block == 0) continue;
+        c = (size_t)alsg_classify(block);
+        if (c == ALSG_OVERSIZED_CLASS || taken[c] == counts[c]) continue;
+        start = popped[pop_base[c] + taken[c]];
+        taken[c]++;
+        tmp[i].offset = start + ALSG_OVERHEAD; tmp[i].len = lens[i];
+        claims[nclaims].off = start; claims[nclaims].size = block;
+        claims[nclaims].kind = ALSG_CLAIM_REUSE; nclaims++;
+    }
+
+    /* 2. Oversized matching (largest request first), with a SPLIT_MIN carve.
+     *    The bounded matcher unlinks only the matched blocks (survivors stay in
+     *    place), so there is nothing to re-splice here. */
+    if (nov > 0) {
+        qsort(ovreqs, nov, sizeof *ovreqs, alsg_cmp_ovreq_desc);
+        if (alsg_match_oversized_bounded(bs, ovreqs, nov, matched, &nmatched) != 0)
+            goto rollback;
+        for (i = 0; i < nmatched; i++) {
+            size_t   req    = matched[i].req;
+            uint64_t boff   = matched[i].off;
+            uint64_t bsize  = matched[i].size;
+            uint64_t block  = block_of[req];
+            uint64_t excess = bsize - block;
+            tmp[req].offset = boff + ALSG_OVERHEAD; tmp[req].len = lens[req];
+            if (excess >= ALSG_SPLIT_MIN) {
+                /* Carve: claim `block`, free the remainder greedily into class
+                 * blocks.  On rollback the block returns as this sub-block plus
+                 * the remainders; fragmentation in large blocks is fine. */
+                uint64_t off = boff + block, rem = excess;
+                claims[nclaims].off = boff; claims[nclaims].size = block;
+                claims[nclaims].kind = ALSG_CLAIM_REUSE; nclaims++;
+                while (rem > 0) {
+                    uint64_t ps = (rem > ALSG_MAX_CLASS) ? rem
+                                                         : alsg_largest_class_le(rem);
+                    claims[nclaims].off = off; claims[nclaims].size = ps;
+                    claims[nclaims].kind = ALSG_CLAIM_CARVE; nclaims++;
+                    off += ps; rem -= ps;
+                }
+            } else {
+                /* Retain the whole block (a non-class size is sound in the
+                 * heterogeneous oversized bucket). */
+                claims[nclaims].off = boff; claims[nclaims].size = bsize;
+                claims[nclaims].kind = ALSG_CLAIM_REUSE; nclaims++;
+            }
+        }
+    }
+
+    /* 3. Misses (classed short + unmatched oversized): one extend that writes
+     *    each fresh block's free overhead (self-describing tail).  Everything
+     *    pushed so far is non-Fresh; the Fresh blocks form the suffix. */
+    fresh_start = nclaims;
+    for (i = 0; i < n; i++)
+        if (block_of[i] > 0 && tmp[i].offset == 0) total_ext += block_of[i];
+    if (total_ext > 0) {
+        niov = 0; rel = 0;
+        for (i = 0; i < n; i++) {
+            if (block_of[i] == 0 || tmp[i].offset != 0) continue;
+            write_le64(words + niov * 8, block_of[i] >> 4); /* free tag */
+            iov[niov].offset = rel; iov[niov].buf = words + niov * 8;
+            iov[niov].len = 8;
+            rel += block_of[i]; niov++;
+        }
+        if (bstack_extend_sparse_batched(bs, iov, niov, total_ext, &ext_base) != 0)
+            goto rollback;
+        ext_bytes = total_ext;
+        rel = 0;
+        for (i = 0; i < n; i++) {
+            if (block_of[i] == 0 || tmp[i].offset != 0) continue;
+            tmp[i].offset = ext_base + rel + ALSG_OVERHEAD; tmp[i].len = lens[i];
+            claims[nclaims].off = ext_base + rel; claims[nclaims].size = block_of[i];
+            claims[nclaims].kind = ALSG_CLAIM_FRESH; nclaims++;
+            rel += block_of[i];
+        }
+    }
+
+    /* 4. Claim: one crash-atomic set_batched, one entry per block.  A Reuse
+     *    block writes [in-use overhead || zero body] as one contiguous buffer
+     *    (so a single reused block keeps set_batched's single-write fast path);
+     *    Fresh/CarveFree need only their 8-byte overhead word. */
+    for (i = 0; i < nclaims; i++) {
+        iov[i].offset = claims[i].off;
+        if (claims[i].kind == ALSG_CLAIM_REUSE) {
+            uint8_t *b = alsg_reuse_buf(reuse, &nreuse, claims[i].size);
+            if (!b) goto rollback;
+            iov[i].buf = b; iov[i].len = (size_t)claims[i].size;
+        } else {
+            uint64_t w = (claims[i].kind == ALSG_CLAIM_FRESH)
+                       ? (ALSG_IN_USE_BIT | (claims[i].size >> 4))
+                       : (claims[i].size >> 4);
+            write_le64(words + i * 8, w);
+            iov[i].buf = words + i * 8; iov[i].len = 8;
+        }
+    }
+    if (nclaims > 0 && bstack_set_batched(bs, iov, nclaims) != 0) goto rollback;
+
+    /* 5. Relink the now-free carve remainders.  Best-effort: the allocations are
+     *    already valid, and a block left unspliced stays free-tagged (reclaimed
+     *    by recover()).  Partition the non-Fresh prefix in place so Reuse blocks
+     *    come first and the remainders last, then relink just the remainders. */
+    for (i = 0; i < fresh_start; i++) {
+        if (claims[i].kind == ALSG_CLAIM_REUSE) {
+            struct alsg_claim t = claims[carve_start];
+            claims[carve_start] = claims[i]; claims[i] = t;
+            carve_start++;
+        }
+    }
+    alsg_repush_detached(bs, claims + carve_start, fresh_start - carve_start);
+
+    memcpy(out_slices, tmp, n * sizeof *tmp);
+    ret = 0;
+    goto done;
+
+rollback:
+    /* Best-effort: drop the fresh tail first, then repush every non-Fresh claim
+     * to its class list.  A carved block returns as its claimed sub-block plus
+     * the remainders.  Neither may clobber the errno that got us here. */
+    saved_errno = errno;
+    if (ext_bytes > 0) {
+        int ok = 0, r;
+#if UINT64_MAX > SIZE_MAX
+        if (ext_bytes <= (uint64_t)SIZE_MAX)
+#endif
+        { r = bstack_try_discard(bs, ext_base + ext_bytes, (size_t)ext_bytes, &ok);
+          (void)r; (void)ok; }
+    }
+    end = (fresh_start < nclaims) ? fresh_start : nclaims;
+    alsg_repush_detached(bs, claims, end);
+    errno = saved_errno;
+
+done:
+    for (i = 0; i < nreuse; i++) free(reuse[i].buf);
+    free(block_of); free(tmp); free(ovreqs); free(matched);
+    free(popped); free(claims); free(iov); free(words); free(reuse);
+    return ret;
+}
+
+/*
+ * Free every handle in one batch.
+ *
+ * Every handle's overhead word is read in one bstack_get_batched lock (not one
+ * locked read per handle), then validated — a clear in-use bit, a length larger
+ * than the block, or a block repeated within the batch is rejected before any
+ * write.  Valid blocks are grouped by class, every class's chain staged in one
+ * bstack_set_batched, and each spliced onto its head with one atomic
+ * bstack_cross_exchange.  Null sentinel handles are ignored.
+ *
+ * Unlike the single-item dealloc, an oversized block at the tail is *not*
+ * discarded — every block goes to its free list.
+ *
+ * The staging batch is crash-atomic and every class splice is attempted even if
+ * one fails, so a partial splice failure still relinks the classes it can; any
+ * class left unspliced (or a crash after staging) leaves its blocks free-tagged
+ * and reclaimed by recover().
+ */
+static int alsg_vt_dealloc_bulk(bstack_allocator_t *base,
+                                const bstack_slice_t *slices, size_t n)
+{
+    segregated_bstack_allocator_t *a = (segregated_bstack_allocator_t *)base;
+    bstack_t          *bs = a->bs;
+    bstack_iovec_t    *iov = NULL;
+    uint8_t           *words = NULL, *bufs = NULL;
+    struct alsg_claim *blocks = NULL;
+    size_t i, k, nlive = 0, nb = 0, run, end;
+    int    ret = -1, first_err = 0;
+
+    if (check_own_slices(base, slices, n) != 0) return -1;
+    if (n == 0) return 0;
+
+    /* Validate every non-null handle's pointer before any read. */
+    for (i = 0; i < n; i++) {
+        uint64_t bstart;
+        if (slices[i].len == 0) continue;
+        if (alsg_block_start_of(slices[i].offset, &bstart)) return -1;
+        nlive++;
+    }
+    if (nlive == 0) return 0; /* no-op: nothing to read, stage, or splice */
+    if (nlive > SIZE_MAX / sizeof *iov || nlive > SIZE_MAX / sizeof *blocks
+        || nlive > SIZE_MAX / 16) { errno = ENOMEM; return -1; }
+
+    iov    = malloc(nlive * sizeof *iov);
+    words  = malloc(nlive * 8);
+    blocks = malloc(nlive * sizeof *blocks);
+    bufs   = malloc(nlive * 16);
+    if (!iov || !words || !blocks || !bufs) { errno = ENOMEM; goto done; }
+
+    /* Read every live handle's overhead word (at offset - OVERHEAD, validated
+     * above) under one lock. */
+    for (i = 0, k = 0; i < n; i++) {
+        if (slices[i].len == 0) continue;
+        iov[k].offset = slices[i].offset - ALSG_OVERHEAD;
+        iov[k].buf = words + k * 8; iov[k].len = 8;
+        k++;
+    }
+    if (bstack_get_batched(bs, iov, nlive) != 0) goto done;
+
+    /* Validate every handle, collecting the valid (block, size) pairs.  Reject a
+     * bad batch before any write. */
+    for (i = 0, k = 0; i < n; i++) {
+        uint64_t bstart, word, size, need;
+        size_t t;
+        if (slices[i].len == 0) continue;
+        bstart = slices[i].offset - ALSG_OVERHEAD;
+        word = read_le64(words + k * 8);
+        k++;
+        if (!(word & ALSG_IN_USE_BIT)) { errno = EINVAL; goto done; } /* double free */
+        size = (word & ~ALSG_IN_USE_BIT) << 4;
+        need = alsg_phys_need(slices[i].len);
+        if (need == 0 || need > size) { errno = EINVAL; goto done; } /* mismatch */
+        for (t = 0; t < nb; t++)
+            if (blocks[t].off == bstart) { errno = EINVAL; goto done; } /* twice */
+        blocks[nb].off = bstart; blocks[nb].size = size;
+        blocks[nb].kind = ALSG_CLAIM_REUSE; /* unused here */
+        nb++;
+    }
+
+    /* Group by class, stage every class's chain in one set_batched, and splice
+     * each with one cross_exchange — the same shape as alsg_repush_detached, but
+     * errors are surfaced.  Within a run block[k].next = block[k+1]; the last
+     * block's next is the run head, the cross_exchange placeholder. */
+    qsort(blocks, nb, sizeof *blocks, alsg_cmp_claim_by_class);
+    for (run = 0; run < nb; run = end) {
+        uint64_t cls = alsg_classify(blocks[run].size);
+        for (end = run + 1; end < nb && alsg_classify(blocks[end].size) == cls; end++)
+            ;
+        for (i = run; i < end; i++) {
+            uint64_t next = (i + 1 < end) ? blocks[i + 1].off : blocks[run].off;
+            write_le64(bufs + i * 16, blocks[i].size >> 4); /* free tag */
+            write_le64(bufs + i * 16 + 8, next);
+            iov[i].offset = blocks[i].off;
+            iov[i].buf = bufs + i * 16; iov[i].len = 16;
+        }
+    }
+    if (bstack_set_batched(bs, iov, nb) != 0) goto done;
+
+    /* Every class is attempted even if one fails; the first error is surfaced
+     * and an unspliced class stays free-tagged (reclaimed by recover()). */
+    for (run = 0; run < nb; run = end) {
+        uint64_t cls = alsg_classify(blocks[run].size);
+        for (end = run + 1; end < nb && alsg_classify(blocks[end].size) == cls; end++)
+            ;
+        if (bstack_cross_exchange(bs, blocks[end - 1].off + ALSG_OVERHEAD,
+                                  alsg_head_off(cls), 8) != 0 && !first_err)
+            first_err = errno;
+    }
+    if (first_err) { errno = first_err; goto done; }
+    ret = 0;
+
+done:
+    free(iov); free(words); free(blocks); free(bufs);
+    return ret;
+}
+
+static const bstack_bulk_allocator_vtbl_t alsg_bulk_vtbl = {
+    { alsg_vt_stack, alsg_vt_alloc, alsg_vt_realloc, alsg_vt_dealloc },
+    alsg_vt_alloc_bulk,
+    alsg_vt_dealloc_bulk
+};
+#endif /* BSTACK_FEATURE_ATOMIC */
 
 /* ---- public API -------------------------------------------------------- */
 
@@ -7910,8 +8743,13 @@ segregated_bstack_allocator_t *segregated_bstack_allocator_new(bstack_t *bs)
 
     a = malloc(sizeof *a);
     if (!a) { errno = ENOMEM; return NULL; }
+#ifdef BSTACK_FEATURE_ATOMIC
+    a->base.vtbl      = &alsg_bulk_vtbl.base;
+    a->base.bulk_vtbl = &alsg_bulk_vtbl;
+#else
     a->base.vtbl      = &alsg_allocator_vtbl;
     a->base.bulk_vtbl = NULL;
+#endif
     a->bs             = bs;
 
     if (is_empty) {
