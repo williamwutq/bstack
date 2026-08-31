@@ -819,6 +819,143 @@ static int test_recovery_repairs_header_after_partial_pop(void)
     return 0;
 }
 
+
+/* =========================================================================
+ * Deferred replay
+ *
+ * A genuine mid-write I/O failure is unreachable through the public API, so
+ * these tests induce one: the stack's descriptor is swapped for a read-only
+ * one on the same file, leaving seeks and size checks working while every
+ * write — including the rollback ftruncate — fails.  struct bstack is opaque
+ * here, so the descriptor is located by matching (st_dev, st_ino).
+ * ====================================================================== */
+
+#ifndef _WIN32
+
+static int find_stack_fd(const char *path, int exclude)
+{
+    struct stat want;
+    if (stat(path, &want) != 0)
+        return -1;
+    for (int fd = 3; fd < 256; fd++) {
+        struct stat st;
+        if (fd == exclude || fstat(fd, &st) != 0)
+            continue;
+        if (st.st_dev == want.st_dev && st.st_ino == want.st_ino)
+            return fd;
+    }
+    return -1;
+}
+
+/* Make every write on bs fail, issue one push, then restore the descriptor.
+ * Returns 0 only if that push failed, which is what flags the stack. */
+static int fail_one_write(bstack_t *bs, const char *path)
+{
+    int ro = open(path, O_RDONLY | O_BINARY);
+    if (ro < 0)
+        return -1;
+    int fd = find_stack_fd(path, ro);
+    if (fd < 0) { close(ro); return -1; }
+    int saved = dup(fd);
+    if (saved < 0) { close(ro); return -1; }
+    if (dup2(ro, fd) < 0) { close(ro); close(saved); return -1; }
+
+    int rc = bstack_push(bs, (const uint8_t *)"x", 1, NULL);
+
+    if (dup2(saved, fd) < 0) { close(ro); close(saved); return -1; }
+    close(saved);
+    close(ro);
+    return (rc == 0) ? -1 : 0;
+}
+
+static int test_failed_write_defers_a_replay(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    CHECK(bstack_push(bs, (const uint8_t *)"hello", 5, NULL) == 0);
+    CHECK(fail_one_write(bs, tmp) == 0);
+
+    /* The failed write flagged the stack, so reads are refused ... */
+    uint64_t len;
+    errno = 0;
+    CHECK(bstack_len(bs, &len) == -1);
+    CHECK(errno == BSTACK_EREPLAY);
+    uint8_t buf[8];
+    errno = 0;
+    CHECK(bstack_get(bs, 0, 5, buf) == -1);
+    CHECK(errno == BSTACK_EREPLAY);
+
+    /* ... until the next write replays (a no-op: nothing ever landed). */
+    CHECK(bstack_push(bs, (const uint8_t *)"!", 1, NULL) == 0);
+    CHECK(bstack_len(bs, &len) == 0);
+    CHECK(len == 6);
+    CHECK(bstack_peek(bs, 0, buf, NULL) == 0);
+    CHECK(memcmp(buf, "hello!", 6) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_pending_replay_applies_the_journal_on_the_next_write(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    uint8_t a[300]; memset(a, 'a', sizeof a);
+    CHECK(bstack_push(bs, a, sizeof a, NULL) == 0);
+
+    /* A set of [0, 300) that staged its backup and armed, then died before
+     * writing in place: recovery rolls it forward from the staged tail. */
+    {
+        uint8_t b[300]; memset(b, 'b', sizeof b);
+        uint8_t ptr[8] = { TEST_HEADER_SIZE, 0, 0, 0, 0, 0, 0, 0 };
+        int fd = open(tmp, O_WRONLY | O_BINARY);
+        CHECK(fd >= 0);
+        CHECK(pwrite(fd, b, sizeof b, TEST_HEADER_SIZE + 300) == (ssize_t)sizeof b);
+        CHECK(pwrite(fd, ptr, 8, 16) == 8);   /* wip_ptr = 32 (target 0) */
+        close(fd);
+    }
+    CHECK(fail_one_write(bs, tmp) == 0);
+
+    CHECK(bstack_push(bs, (const uint8_t *)"z", 1, NULL) == 0);
+    uint64_t len;
+    CHECK(bstack_len(bs, &len) == 0);
+    CHECK(len == 301);
+    uint8_t got[301], expect[301];
+    memset(expect, 'b', 300); expect[300] = 'z';
+    CHECK(bstack_peek(bs, 0, got, NULL) == 0);
+    CHECK(memcmp(got, expect, sizeof expect) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_pending_replay_leaves_the_locked_prefix_readable(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    uint8_t a[128]; memset(a, 'a', sizeof a);
+    CHECK(bstack_push(bs, a, sizeof a, NULL) == 0);
+    CHECK(bstack_lock_up_to(bs, 64) == 0);
+    CHECK(fail_one_write(bs, tmp) == 0);
+
+    /* Locked bytes are immutable and no journal can target them, so the
+     * lock-free path still serves them; anything past the prefix is refused. */
+    uint8_t buf[65];
+    CHECK(bstack_get(bs, 0, 64, buf) == 0);
+    CHECK(memcmp(buf, a, 64) == 0);
+    errno = 0;
+    CHECK(bstack_get(bs, 0, 65, buf) == -1);
+    CHECK(errno == BSTACK_EREPLAY);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+#endif /* !_WIN32 */
+
 /* =========================================================================
  * Write-in-progress journal recovery (armed on open) — recovery is always
  * compiled, so these run in every feature configuration.
@@ -5810,6 +5947,11 @@ int main(void)
     /* Crash recovery */
     T(test_recovery_truncates_partial_push);
     T(test_recovery_repairs_header_after_partial_pop);
+#ifndef _WIN32
+    T(test_failed_write_defers_a_replay);
+    T(test_pending_replay_applies_the_journal_on_the_next_write);
+    T(test_pending_replay_leaves_the_locked_prefix_readable);
+#endif
 
     /* Write-in-progress journal recovery (always compiled) */
     T(test_recovery_replays_armed_set);
