@@ -1314,8 +1314,9 @@ largest-first against the oversized free list).
 > **Experimental.**  The on-disk format and API are not yet stable — some resize
 > paths differ between the `atomic` and non-`atomic` builds (a shrink reclaims its
 > freed excess only under `atomic`; the non-`atomic` build retains it in place),
-> and the background coalescer and deep in-use-leak GC are not yet implemented.
-> See [`algos/ALLOCATOR.md`](algos/ALLOCATOR.md) for the full design.
+> and the deep in-use-leak GC is not yet implemented (the free-neighbour
+> coalescer, `coalesce`, now is — `atomic` only).  See
+> [`algos/ALLOCATOR.md`](algos/ALLOCATOR.md) for the full design.
 
 ### `DebugCheckingAllocator` (`alloc`)
 

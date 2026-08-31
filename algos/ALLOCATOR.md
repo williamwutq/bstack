@@ -423,8 +423,8 @@ With the `atomic` feature it **is `Sync`**. `alloc` / `dealloc` / `realloc` take
 ## `SegregatedBStackAllocator` (**experimental**, `alloc + set` features)
 
 > **Experimental.** The on-disk format and API are not yet stable, a few resize
-> paths behave differently between the `atomic` and non-`atomic` builds, and the
-> background coalescer and deep in-use-leak reclamation are not yet implemented.
+> paths behave differently between the `atomic` and non-`atomic` builds, and deep
+> in-use-leak reclamation is not yet implemented.
 
 [`CheckedSlabBStackAllocator`] generalised from one block size to **33 size
 classes** sharing one arena. Each class is an independent intrusive free list;
@@ -541,6 +541,27 @@ write. The scan trusts only the overhead words and is idempotent. In-use orphans
 (e.g. the old block of a crashed *move*) are left live; a deep GC to reclaim them
 is future work. `recover` requires a quiescent allocator and is `unsafe`; `new`
 runs it before the handle escapes.
+
+### Coalescing (`atomic` feature)
+
+Freed blocks only ever return to their own class list, so physically adjacent
+free blocks accumulate without merging and no oversized request can reuse the
+contiguous run. `coalesce()` fuses them. It is the `recover` walk plus a merge:
+it strides the arena by the recorded physical sizes and, on any run of two or
+more adjacent free blocks, writes one merged free block in place and rebuilds
+every free list from the scan — the same wholesale rebuild `recover` uses, so no
+swallowed block needs a per-block unlink. Returns the number of blocks fused into a
+neighbour; `0` means nothing was adjacent, and nothing is written. A merged run
+lands on the largest class `≤` its size (a non-class size degrades to retained
+slack, never a head that overruns the block); a run reaching the tail is merged.
+
+Unlike `recover`, `coalesce` is a **safe** method. The whole scan-and-rewrite
+runs inside one `BStack::inplace_gen`, striding the overhead words one at a time
+under the held write lock and committing the merges as one journalled batch, so
+a concurrent `alloc`/`dealloc` can neither observe an intermediate state nor be
+clobbered, with no allocator-level lock. A torn commit re-parses as a valid arena
+and is reclaimed by `recover`, so the pass is restartable; the scan follows only
+physical sizes, never `next_free`, so a corrupt free list cannot cycle it.
 
 ### Thread safety
 
