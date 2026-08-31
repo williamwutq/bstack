@@ -263,6 +263,212 @@ int bstack_slice_process(bstack_slice_t s,
 #endif /* BSTACK_FEATURE_SET && BSTACK_FEATURE_ATOMIC */
 
 /* =========================================================================
+ * Chunked-view operations over a bstack_slice_t
+ *
+ * A "chunk view" is a slice plus a fixed record stride (chunk_len): the slice
+ * is divided into s.len / chunk_len records of chunk_len bytes each.  Rather
+ * than a dedicated chunk type, these take a bstack_slice_t and a chunk_len.
+ *
+ * Precondition (undefined behaviour if violated): chunk_len must be non-zero
+ * and evenly divide s.len, so the slice is exactly chunk_count whole records
+ * with no remainder.  Callers that may have a remainder should trim it off the
+ * slice first.  The geometry helpers (overlaps/adjacent_to/merge/merge_adjacent)
+ * additionally accept chunk_len == 0 to mean "plain slice, ignore phase" — see
+ * each function.
+ *
+ * Comparators and predicates follow the qsort/bsearch convention: each receives
+ * pointers to whole chunk_len-byte records (and, for the searches, a key), and
+ * takes no user context pointer.
+ * ====================================================================== */
+
+/*
+ * Non-zero if a and b share chunk phase: their start offsets are congruent
+ * modulo chunk_len, so a record boundary in one lines up with a boundary in the
+ * other wherever the regions coincide.  Pure coordinate test.  chunk_len == 0
+ * always returns 0 (no stride, no phase to share).
+ */
+int bstack_slice_same_chunk_phase(bstack_slice_t a, bstack_slice_t b,
+                                  uint64_t chunk_len);
+
+/*
+ * Non-zero if a and b touch end-to-end with no gap and no overlap
+ * (end(a) == start(b) or end(b) == start(a)).  When chunk_len != 0 the two must
+ * also be same-phase (see bstack_slice_same_chunk_phase); chunk_len == 0 drops
+ * that requirement, giving the plain-slice test.  Pure coordinate test.
+ */
+int bstack_slice_adjacent_to(bstack_slice_t a, bstack_slice_t b,
+                             uint64_t chunk_len);
+
+/*
+ * Non-zero if a and b share at least one byte.  A zero-length slice overlaps
+ * nothing.  When chunk_len != 0 the two must also be same-phase; chunk_len == 0
+ * gives the plain-slice test.  Pure coordinate test.
+ */
+int bstack_slice_overlaps(bstack_slice_t a, bstack_slice_t b,
+                          uint64_t chunk_len);
+
+/*
+ * Merge a and b into the smallest slice covering both, into *out.
+ *
+ * Succeeds if they overlap (chunk_len != 0 also requires same phase), or if
+ * either is empty (an empty slice is the identity: the other is returned
+ * unchanged).  chunk_len == 0 gives the plain-slice merge.
+ *
+ * Returns 0 on success, -1 with errno = EINVAL if a and b come from different
+ * allocators, or if both are non-empty and do not overlap.
+ */
+BSTACK_WARN_UNUSED_RESULT
+int bstack_slice_merge(bstack_slice_t a, bstack_slice_t b, uint64_t chunk_len,
+                       bstack_slice_t *out);
+
+/*
+ * Merge a and b into the smallest slice covering both, into *out, requiring
+ * them to be adjacent (touching end-to-end) and both non-empty.
+ *
+ * For two non-empty same-stride records-slices, byte adjacency already forces
+ * the same phase, so chunk_len is not consulted here (kept for signature
+ * symmetry).  Returns 0 on success, -1 with errno = EINVAL if a and b come from
+ * different allocators, either is empty, or they are not adjacent.
+ */
+BSTACK_WARN_UNUSED_RESULT
+int bstack_slice_merge_adjacent(bstack_slice_t a, bstack_slice_t b,
+                                uint64_t chunk_len, bstack_slice_t *out);
+
+/*
+ * Split s at byte offset mid into *left = [0, mid) and *right = [mid, s.len),
+ * both relative to s.  Returns 0 on success, -1 with errno = EINVAL if
+ * mid > s.len.  left and right may be NULL to discard that half.
+ */
+BSTACK_WARN_UNUSED_RESULT
+int bstack_slice_split_at(bstack_slice_t s, uint64_t mid,
+                          bstack_slice_t *left, bstack_slice_t *right);
+
+/*
+ * Split s at chunk index mid: *left holds records [0, mid), *right holds
+ * [mid, chunk_count).  Both inherit s's stride and phase.  Returns 0 on
+ * success, -1 with errno = EINVAL if mid > chunk_count.  left and right may be
+ * NULL to discard that half.
+ */
+BSTACK_WARN_UNUSED_RESULT
+int bstack_slice_split_chunk_at(bstack_slice_t s, uint64_t chunk_len,
+                                uint64_t mid, bstack_slice_t *left,
+                                bstack_slice_t *right);
+
+/*
+ * The index-th chunk of s as a bstack_slice_t, by pure offset arithmetic.
+ *
+ * No bounds check: index must be < chunk_count (UB otherwise), matching the
+ * precondition style of this section.  Function-like macro — s, chunk_len, and
+ * index are each evaluated more than once, so pass side-effect-free arguments.
+ */
+#define bstack_slice_nth_chunk(s, chunk_len, index)                        \
+    ((bstack_slice_t){ (s).allocator,                                      \
+                       (s).offset + (uint64_t)(index) * (uint64_t)(chunk_len), \
+                       (uint64_t)(chunk_len) })
+
+/*
+ * Binary search s (already ordered by cmp) for a record matching key.
+ *
+ * cmp(key, chunk) returns < 0 if key sorts before chunk, > 0 if after, 0 on a
+ * match — the bsearch convention.  On a match *out_index receives its index and
+ * the call returns 0; with no match *out_index receives the index at which a
+ * matching record would be inserted to keep s ordered and the call returns 1.
+ * Returns -1 (errno set) on an I/O or allocation failure.
+ *
+ * With BSTACK_FEATURE_ATOMIC this probes O(log n) records under one lock;
+ * otherwise it reads the whole region once (O(n) memory) under one lock.
+ */
+BSTACK_WARN_UNUSED_RESULT
+int bstack_slice_search(bstack_slice_t s, uint64_t chunk_len,
+                        const void *key,
+                        int (*cmp)(const void *key, const void *chunk),
+                        uint64_t *out_index);
+
+/*
+ * Index of the first record of s for which pred is false, assuming s is already
+ * partitioned by pred (every accepted record before every rejected one).
+ *
+ * pred(key, chunk) returns non-zero to accept.  *out_index receives the
+ * partition point.  Returns 0 on success, -1 (errno set) on an I/O or
+ * allocation failure.  Same O(log n)/whole-region behaviour as
+ * bstack_slice_search.
+ */
+BSTACK_WARN_UNUSED_RESULT
+int bstack_slice_select(bstack_slice_t s, uint64_t chunk_len,
+                        const void *key,
+                        int (*pred)(const void *key, const void *chunk),
+                        uint64_t *out_index);
+
+/*
+ * Set *out_sorted to non-zero iff every record of s compares <= the next by cmp
+ * (qsort convention: cmp(a, b) < 0 when a sorts before b).  Reads the whole
+ * region once under one lock, then scans in memory.  Returns 0 on success,
+ * -1 (errno set) on an I/O or allocation failure.
+ */
+BSTACK_WARN_UNUSED_RESULT
+int bstack_slice_is_sorted(bstack_slice_t s, uint64_t chunk_len,
+                           int (*cmp)(const void *a, const void *b),
+                           int *out_sorted);
+
+#if defined(BSTACK_FEATURE_SET) && defined(BSTACK_FEATURE_ATOMIC)
+/*
+ * Reverse the order of s's records in place — whole records change position,
+ * the bytes within each are untouched.  One crash-atomic bstack_process call.
+ * Returns 0 on success, -1 (errno set) on failure.
+ *
+ * Requires -DBSTACK_FEATURE_SET and -DBSTACK_FEATURE_ATOMIC.
+ */
+BSTACK_WARN_UNUSED_RESULT
+int bstack_slice_reverse_chunks(bstack_slice_t s, uint64_t chunk_len);
+
+/*
+ * Rotate s's records left in place so the record at index k becomes first —
+ * equivalently, rotate the bytes left by k * chunk_len.  One crash-atomic
+ * bstack_process call.  Returns 0 on success, -1 with errno = EINVAL if
+ * k > chunk_count, else -1 (errno set) on I/O failure.
+ *
+ * Requires -DBSTACK_FEATURE_SET and -DBSTACK_FEATURE_ATOMIC.
+ */
+BSTACK_WARN_UNUSED_RESULT
+int bstack_slice_rotate_left(bstack_slice_t s, uint64_t chunk_len, uint64_t k);
+
+/*
+ * Rotate s's records right in place so the last k records move to the front.
+ * Companion to bstack_slice_rotate_left.  Returns 0 on success, -1 with
+ * errno = EINVAL if k > chunk_count, else -1 (errno set) on I/O failure.
+ *
+ * Requires -DBSTACK_FEATURE_SET and -DBSTACK_FEATURE_ATOMIC.
+ */
+BSTACK_WARN_UNUSED_RESULT
+int bstack_slice_rotate_right(bstack_slice_t s, uint64_t chunk_len, uint64_t k);
+
+/*
+ * Sort s's records in place by cmp (qsort convention).  Reads the whole region,
+ * sorts in memory, and commits it in one crash-atomic bstack_process call.  Not
+ * guaranteed stable (uses qsort internally).  Returns 0 on success, -1 (errno
+ * set) on failure.
+ *
+ * Requires -DBSTACK_FEATURE_SET and -DBSTACK_FEATURE_ATOMIC.
+ */
+BSTACK_WARN_UNUSED_RESULT
+int bstack_slice_sort(bstack_slice_t s, uint64_t chunk_len,
+                      int (*cmp)(const void *a, const void *b));
+
+/*
+ * Partition s's records in place so the record at index n lands where a full
+ * sort by cmp would put it, with every earlier record <= it and every later
+ * record >= it; order on either side of n is otherwise unspecified.  One
+ * crash-atomic bstack_process call.  Returns 0 on success, -1 with errno =
+ * EINVAL if n >= chunk_count, else -1 (errno set) on I/O failure.
+ *
+ * Requires -DBSTACK_FEATURE_SET and -DBSTACK_FEATURE_ATOMIC.
+ */
+BSTACK_WARN_UNUSED_RESULT
+int bstack_slice_partition(bstack_slice_t s, uint64_t chunk_len, uint64_t n,
+                           int (*cmp)(const void *a, const void *b));
+#endif /* BSTACK_FEATURE_SET && BSTACK_FEATURE_ATOMIC */
+
+/* =========================================================================
  * bstack_guard_vtbl_t / bstack_guarded_slice_t
  *
  * Transparent wrapper around bstack_slice_t that intercepts reads, writes,

@@ -325,6 +325,623 @@ int bstack_slice_process(bstack_slice_t s,
 #endif /* BSTACK_FEATURE_SET && BSTACK_FEATURE_ATOMIC */
 
 /* =========================================================================
+ * bstack_slice_t — chunked-view operations
+ *
+ * A slice plus a record stride (chunk_len); s.len must be a whole multiple of
+ * chunk_len (UB otherwise).  See bstack_alloc.h for the contract.
+ * ====================================================================== */
+
+/* Coordinate-only overlap: shared byte, both non-empty.  No phase check. */
+static int slice_overlaps_raw(bstack_slice_t a, bstack_slice_t b)
+{
+    return a.len != 0 && b.len != 0 &&
+           a.offset < b.offset + b.len &&
+           b.offset < a.offset + a.len;
+}
+
+/* Coordinate-only adjacency: touching end-to-end.  No phase check. */
+static int slice_adjacent_raw(bstack_slice_t a, bstack_slice_t b)
+{
+    return a.offset + a.len == b.offset || b.offset + b.len == a.offset;
+}
+
+int bstack_slice_same_chunk_phase(bstack_slice_t a, bstack_slice_t b,
+                                  uint64_t chunk_len)
+{
+    if (chunk_len == 0)
+        return 0;
+    return (a.offset % chunk_len) == (b.offset % chunk_len);
+}
+
+int bstack_slice_adjacent_to(bstack_slice_t a, bstack_slice_t b,
+                             uint64_t chunk_len)
+{
+    if (!slice_adjacent_raw(a, b))
+        return 0;
+    if (chunk_len == 0)
+        return 1;
+    return (a.offset % chunk_len) == (b.offset % chunk_len);
+}
+
+int bstack_slice_overlaps(bstack_slice_t a, bstack_slice_t b, uint64_t chunk_len)
+{
+    if (!slice_overlaps_raw(a, b))
+        return 0;
+    if (chunk_len == 0)
+        return 1;
+    return (a.offset % chunk_len) == (b.offset % chunk_len);
+}
+
+int bstack_slice_merge(bstack_slice_t a, bstack_slice_t b, uint64_t chunk_len,
+                       bstack_slice_t *out)
+{
+    uint64_t start, end, end_a, end_b;
+    if (a.allocator != b.allocator) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (a.len == 0) { *out = b; return 0; }
+    if (b.len == 0) { *out = a; return 0; }
+    if (!bstack_slice_overlaps(a, b, chunk_len)) {
+        errno = EINVAL;
+        return -1;
+    }
+    start = a.offset < b.offset ? a.offset : b.offset;
+    end_a = a.offset + a.len;
+    end_b = b.offset + b.len;
+    end   = end_a > end_b ? end_a : end_b;
+    out->allocator = a.allocator;
+    out->offset    = start;
+    out->len       = end - start;
+    return 0;
+}
+
+int bstack_slice_merge_adjacent(bstack_slice_t a, bstack_slice_t b,
+                                uint64_t chunk_len, bstack_slice_t *out)
+{
+    uint64_t start, end, end_a, end_b;
+    (void)chunk_len; /* adjacency of same-stride records already forces phase */
+    if (a.allocator != b.allocator) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (a.len == 0 || b.len == 0 || !slice_adjacent_raw(a, b)) {
+        errno = EINVAL;
+        return -1;
+    }
+    start = a.offset < b.offset ? a.offset : b.offset;
+    end_a = a.offset + a.len;
+    end_b = b.offset + b.len;
+    end   = end_a > end_b ? end_a : end_b;
+    out->allocator = a.allocator;
+    out->offset    = start;
+    out->len       = end - start;
+    return 0;
+}
+
+int bstack_slice_split_at(bstack_slice_t s, uint64_t mid,
+                          bstack_slice_t *left, bstack_slice_t *right)
+{
+    if (mid > s.len) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (left) {
+        left->allocator = s.allocator;
+        left->offset    = s.offset;
+        left->len       = mid;
+    }
+    if (right) {
+        right->allocator = s.allocator;
+        right->offset    = s.offset + mid;
+        right->len       = s.len - mid;
+    }
+    return 0;
+}
+
+int bstack_slice_split_chunk_at(bstack_slice_t s, uint64_t chunk_len,
+                                uint64_t mid, bstack_slice_t *left,
+                                bstack_slice_t *right)
+{
+    uint64_t count = s.len / chunk_len;
+    uint64_t bmid;
+    if (mid > count) {
+        errno = EINVAL;
+        return -1;
+    }
+    bmid = mid * chunk_len;
+    if (left) {
+        left->allocator = s.allocator;
+        left->offset    = s.offset;
+        left->len       = bmid;
+    }
+    if (right) {
+        right->allocator = s.allocator;
+        right->offset    = s.offset + bmid;
+        right->len       = s.len - bmid;
+    }
+    return 0;
+}
+
+/* Resident-byte budget for the search probing path, mirroring the Rust
+ * BULK_READ_BUDGET: once the live window fits this, finish in memory. */
+#define BSTACK_CHUNK_BULK_BUDGET 512
+
+/* Binary search count records already read into buf.  Returns 1 with *idx the
+ * match, or 0 with *idx the insertion point.  cmp(key, chunk): <0 key first. */
+static int chunk_bsearch_mem(const uint8_t *buf, uint64_t chunk_len,
+                             uint64_t count, const void *key,
+                             int (*cmp)(const void *, const void *),
+                             uint64_t *idx)
+{
+    uint64_t size = count, left = 0;
+    while (size > 0) {
+        uint64_t half = size / 2;
+        uint64_t mid  = left + half;
+        int c = cmp(key, buf + (size_t)(mid * chunk_len));
+        if (c > 0) { left = mid + 1; size -= half + 1; }
+        else if (c < 0) { size = half; }
+        else { *idx = mid; return 1; }
+    }
+    *idx = left;
+    return 0;
+}
+
+/* Partition point over count records already read into buf. */
+static uint64_t chunk_partition_mem(const uint8_t *buf, uint64_t chunk_len,
+                                    uint64_t count, const void *key,
+                                    int (*pred)(const void *, const void *))
+{
+    uint64_t size = count, left = 0;
+    while (size > 0) {
+        uint64_t half = size / 2;
+        uint64_t mid  = left + half;
+        if (pred(key, buf + (size_t)(mid * chunk_len))) {
+            left = mid + 1;
+            size -= half + 1;
+        } else {
+            size = half;
+        }
+    }
+    return left;
+}
+
+/* Read the whole slice into a fresh malloc'd buffer (*out_buf NULL when empty);
+ * caller frees.  Returns 0, or -1 with errno on allocation/I/O failure. */
+static int read_whole_slice(bstack_slice_t s, uint8_t **out_buf)
+{
+    uint8_t *buf;
+    if (s.len == 0) {
+        *out_buf = NULL;
+        return 0;
+    }
+#if UINT64_MAX > SIZE_MAX
+    if (s.len > (uint64_t)SIZE_MAX) {
+        errno = ENOMEM;
+        return -1;
+    }
+#endif
+    buf = (uint8_t *)malloc((size_t)s.len);
+    if (!buf) {
+        errno = ENOMEM;
+        return -1;
+    }
+    if (bstack_slice_read(s, buf) != 0) {
+        free(buf);
+        return -1;
+    }
+    *out_buf = buf;
+    return 0;
+}
+
+#ifdef BSTACK_FEATURE_ATOMIC
+/* Shared probing state for the O(log n) search/select generators.  state: 0
+ * initial, 1 a single record was just probed, 2 the residual window was bulk
+ * read into `inln`.  For search, cmp/found are used; for select, pred. */
+struct chunk_probe_ctx {
+    uint64_t start;
+    uint64_t chunk_len;
+    uint64_t size;
+    uint64_t left;
+    uint64_t mid;
+    uint64_t half;
+    int      state;
+    int      found;     /* search only */
+    uint64_t found_idx; /* search only */
+    const void *key;
+    int (*cmp)(const void *, const void *);  /* search */
+    int (*pred)(const void *, const void *); /* select */
+    uint8_t *inln;
+    uint8_t *probe;
+};
+
+/* Emit the next probe/bulk read for the shrinking window; returns 0 to stop. */
+static int chunk_probe_next(struct chunk_probe_ctx *c, uint64_t *out_offset,
+                            uint8_t **out_buf, size_t *out_len)
+{
+    uint64_t rem, off;
+    int bulk;
+    if (c->size == 0 || c->state == 2)
+        return 0;
+    c->half = c->size / 2;
+    c->mid  = c->left + c->half;
+    rem  = c->size * c->chunk_len;
+    bulk = rem <= (uint64_t)BSTACK_CHUNK_BULK_BUDGET;
+    off  = bulk ? c->left : c->mid;
+    *out_offset = c->start + off * c->chunk_len;
+    if (bulk) {
+        c->state = 2;
+        *out_buf = c->inln;
+        *out_len = (size_t)rem;
+    } else {
+        c->state = 1;
+        *out_buf = c->probe;
+        *out_len = (size_t)c->chunk_len;
+    }
+    return 1;
+}
+
+static int chunk_search_gen(uint64_t *out_offset, uint8_t **out_buf,
+                            size_t *out_len, void *ctxp)
+{
+    struct chunk_probe_ctx *c = (struct chunk_probe_ctx *)ctxp;
+    if (c->state == 1) {
+        int cc = c->cmp(c->key, c->probe);
+        if (cc > 0) { c->left = c->mid + 1; c->size -= c->half + 1; }
+        else if (cc < 0) { c->size = c->half; }
+        else { c->found = 1; c->found_idx = c->mid; return 0; }
+    }
+    return chunk_probe_next(c, out_offset, out_buf, out_len);
+}
+
+static int chunk_select_gen(uint64_t *out_offset, uint8_t **out_buf,
+                            size_t *out_len, void *ctxp)
+{
+    struct chunk_probe_ctx *c = (struct chunk_probe_ctx *)ctxp;
+    if (c->state == 1) {
+        if (c->pred(c->key, c->probe)) { c->left = c->mid + 1; c->size -= c->half + 1; }
+        else { c->size = c->half; }
+    }
+    return chunk_probe_next(c, out_offset, out_buf, out_len);
+}
+
+/* Pick the probe buffer: reuse `inln` when a record fits the budget, else a
+ * fresh heap buffer (*heap, caller frees).  Returns the probe pointer, or NULL
+ * with errno on allocation failure. */
+static uint8_t *chunk_probe_buf(uint64_t chunk_len, uint8_t *inln, uint8_t **heap)
+{
+    *heap = NULL;
+    if (chunk_len <= (uint64_t)BSTACK_CHUNK_BULK_BUDGET)
+        return inln;
+#if UINT64_MAX > SIZE_MAX
+    if (chunk_len > (uint64_t)SIZE_MAX) {
+        errno = ENOMEM;
+        return NULL;
+    }
+#endif
+    *heap = (uint8_t *)malloc((size_t)chunk_len);
+    if (!*heap) {
+        errno = ENOMEM;
+        return NULL;
+    }
+    return *heap;
+}
+#endif /* BSTACK_FEATURE_ATOMIC */
+
+int bstack_slice_search(bstack_slice_t s, uint64_t chunk_len, const void *key,
+                        int (*cmp)(const void *key, const void *chunk),
+                        uint64_t *out_index)
+{
+    uint64_t count = s.len / chunk_len;
+#ifdef BSTACK_FEATURE_ATOMIC
+    if (s.len <= (uint64_t)BSTACK_CHUNK_BULK_BUDGET) {
+        uint8_t inln[BSTACK_CHUNK_BULK_BUDGET];
+        if (bstack_get(slice_stack(s), s.offset, s.offset + s.len, inln) != 0)
+            return -1;
+        return chunk_bsearch_mem(inln, chunk_len, count, key, cmp, out_index)
+                   ? 0 : 1;
+    }
+    {
+        uint8_t inln[BSTACK_CHUNK_BULK_BUDGET];
+        uint8_t *heap, *probe;
+        struct chunk_probe_ctx c;
+        int rc;
+        probe = chunk_probe_buf(chunk_len, inln, &heap);
+        if (!probe)
+            return -1;
+        c.start = s.offset; c.chunk_len = chunk_len; c.size = count;
+        c.left = 0; c.mid = 0; c.half = 0; c.state = 0;
+        c.found = 0; c.found_idx = 0;
+        c.key = key; c.cmp = cmp; c.pred = NULL;
+        c.inln = inln; c.probe = probe;
+        rc = bstack_get_batched_gen(slice_stack(s), chunk_search_gen, &c);
+        if (rc != 0) { free(heap); return -1; }
+        if (c.found) { free(heap); *out_index = c.found_idx; return 0; }
+        if (c.state == 2) {
+            uint64_t idx;
+            int f = chunk_bsearch_mem(inln, chunk_len, c.size, key, cmp, &idx);
+            free(heap);
+            *out_index = c.left + idx;
+            return f ? 0 : 1;
+        }
+        free(heap);
+        *out_index = c.left;
+        return 1;
+    }
+#else
+    {
+        uint8_t *buf;
+        int f;
+        if (read_whole_slice(s, &buf) != 0)
+            return -1;
+        f = chunk_bsearch_mem(buf, chunk_len, count, key, cmp, out_index);
+        free(buf);
+        return f ? 0 : 1;
+    }
+#endif
+}
+
+int bstack_slice_select(bstack_slice_t s, uint64_t chunk_len, const void *key,
+                        int (*pred)(const void *key, const void *chunk),
+                        uint64_t *out_index)
+{
+    uint64_t count = s.len / chunk_len;
+#ifdef BSTACK_FEATURE_ATOMIC
+    if (s.len <= (uint64_t)BSTACK_CHUNK_BULK_BUDGET) {
+        uint8_t inln[BSTACK_CHUNK_BULK_BUDGET];
+        if (bstack_get(slice_stack(s), s.offset, s.offset + s.len, inln) != 0)
+            return -1;
+        *out_index = chunk_partition_mem(inln, chunk_len, count, key, pred);
+        return 0;
+    }
+    {
+        uint8_t inln[BSTACK_CHUNK_BULK_BUDGET];
+        uint8_t *heap, *probe;
+        struct chunk_probe_ctx c;
+        uint64_t add = 0;
+        int rc;
+        probe = chunk_probe_buf(chunk_len, inln, &heap);
+        if (!probe)
+            return -1;
+        c.start = s.offset; c.chunk_len = chunk_len; c.size = count;
+        c.left = 0; c.mid = 0; c.half = 0; c.state = 0;
+        c.found = 0; c.found_idx = 0;
+        c.key = key; c.cmp = NULL; c.pred = pred;
+        c.inln = inln; c.probe = probe;
+        rc = bstack_get_batched_gen(slice_stack(s), chunk_select_gen, &c);
+        if (rc != 0) { free(heap); return -1; }
+        if (c.state == 2)
+            add = chunk_partition_mem(inln, chunk_len, c.size, key, pred);
+        free(heap);
+        *out_index = c.left + add;
+        return 0;
+    }
+#else
+    {
+        uint8_t *buf;
+        if (read_whole_slice(s, &buf) != 0)
+            return -1;
+        *out_index = chunk_partition_mem(buf, chunk_len, count, key, pred);
+        free(buf);
+        return 0;
+    }
+#endif
+}
+
+int bstack_slice_is_sorted(bstack_slice_t s, uint64_t chunk_len,
+                           int (*cmp)(const void *a, const void *b),
+                           int *out_sorted)
+{
+    uint64_t count = s.len / chunk_len;
+    uint8_t *buf;
+    uint64_t i;
+    int sorted = 1;
+    if (count < 2) {
+        *out_sorted = 1;
+        return 0;
+    }
+    if (read_whole_slice(s, &buf) != 0)
+        return -1;
+    for (i = 0; i + 1 < count; i++) {
+        if (cmp(buf + (size_t)(i * chunk_len),
+                buf + (size_t)((i + 1) * chunk_len)) > 0) {
+            sorted = 0;
+            break;
+        }
+    }
+    free(buf);
+    *out_sorted = sorted;
+    return 0;
+}
+
+#if defined(BSTACK_FEATURE_SET) && defined(BSTACK_FEATURE_ATOMIC)
+
+/* Reverse the bytes buf[lo, hi) in place. */
+static void bytes_reverse(uint8_t *buf, size_t lo, size_t hi)
+{
+    while (hi - lo >= 2) {
+        uint8_t t = buf[lo];
+        buf[lo] = buf[hi - 1];
+        buf[hi - 1] = t;
+        lo++;
+        hi--;
+    }
+}
+
+struct reverse_ctx { size_t chunk_len; };
+
+static int reverse_cb(uint8_t *buf, size_t len, void *ctxp)
+{
+    size_t cl = ((struct reverse_ctx *)ctxp)->chunk_len;
+    size_t count = len / cl;
+    size_t i;
+    uint8_t *tmp;
+    if (count < 2)
+        return 0;
+    tmp = (uint8_t *)malloc(cl);
+    if (!tmp) {
+        errno = ENOMEM;
+        return -1;
+    }
+    for (i = 0; i < count / 2; i++) {
+        size_t j = count - 1 - i;
+        memcpy(tmp, buf + i * cl, cl);
+        memcpy(buf + i * cl, buf + j * cl, cl);
+        memcpy(buf + j * cl, tmp, cl);
+    }
+    free(tmp);
+    return 0;
+}
+
+int bstack_slice_reverse_chunks(bstack_slice_t s, uint64_t chunk_len)
+{
+    struct reverse_ctx ctx;
+    ctx.chunk_len = (size_t)chunk_len;
+    return bstack_slice_process(s, reverse_cb, &ctx);
+}
+
+/* Rotate whole records left by `mid` bytes (a record multiple) via the
+ * three-reversal trick — a pure byte rotation preserves each record's internal
+ * order because `mid` lands on a record boundary. */
+struct rotate_ctx { size_t mid; };
+
+static int rotate_cb(uint8_t *buf, size_t len, void *ctxp)
+{
+    size_t mid = ((struct rotate_ctx *)ctxp)->mid;
+    if (len == 0 || mid == 0 || mid == len)
+        return 0;
+    bytes_reverse(buf, 0, mid);
+    bytes_reverse(buf, mid, len);
+    bytes_reverse(buf, 0, len);
+    return 0;
+}
+
+int bstack_slice_rotate_left(bstack_slice_t s, uint64_t chunk_len, uint64_t k)
+{
+    uint64_t count = s.len / chunk_len;
+    struct rotate_ctx ctx;
+    if (k > count) {
+        errno = EINVAL;
+        return -1;
+    }
+    ctx.mid = (size_t)(k * chunk_len);
+    return bstack_slice_process(s, rotate_cb, &ctx);
+}
+
+int bstack_slice_rotate_right(bstack_slice_t s, uint64_t chunk_len, uint64_t k)
+{
+    uint64_t count = s.len / chunk_len;
+    struct rotate_ctx ctx;
+    if (k > count) {
+        errno = EINVAL;
+        return -1;
+    }
+    /* Right by k records == left by (len - k*chunk_len) bytes. */
+    ctx.mid = (size_t)(s.len - k * chunk_len);
+    return bstack_slice_process(s, rotate_cb, &ctx);
+}
+
+struct sort_ctx {
+    size_t chunk_len;
+    int (*cmp)(const void *, const void *);
+};
+
+static int sort_cb(uint8_t *buf, size_t len, void *ctxp)
+{
+    struct sort_ctx *c = (struct sort_ctx *)ctxp;
+    size_t count = len / c->chunk_len;
+    if (count < 2)
+        return 0;
+    qsort(buf, count, c->chunk_len, c->cmp);
+    return 0;
+}
+
+int bstack_slice_sort(bstack_slice_t s, uint64_t chunk_len,
+                      int (*cmp)(const void *a, const void *b))
+{
+    struct sort_ctx ctx;
+    ctx.chunk_len = (size_t)chunk_len;
+    ctx.cmp = cmp;
+    return bstack_slice_process(s, sort_cb, &ctx);
+}
+
+struct select_ctx {
+    size_t chunk_len;
+    size_t n;
+    int (*cmp)(const void *, const void *);
+};
+
+/* In-place quickselect (Lomuto, middle pivot) over `count` records so the
+ * record at index n lands in its fully-sorted position. */
+static int select_cb(uint8_t *buf, size_t len, void *ctxp)
+{
+    struct select_ctx *c = (struct select_ctx *)ctxp;
+    size_t cl = c->chunk_len;
+    size_t count = len / cl;
+    size_t lo = 0, hi = count; /* active window [lo, hi) */
+    uint8_t *scratch, *tmp, *pivot;
+    if (count < 2)
+        return 0;
+    scratch = (uint8_t *)malloc(cl * 2); /* tmp + pivot */
+    if (!scratch) {
+        errno = ENOMEM;
+        return -1;
+    }
+    tmp   = scratch;
+    pivot = scratch + cl;
+    while (hi - lo > 1) {
+        size_t mid = lo + (hi - lo) / 2;
+        size_t store, k, p;
+        /* Move the pivot to lo, then stash it. */
+        memcpy(tmp, buf + lo * cl, cl);
+        memcpy(buf + lo * cl, buf + mid * cl, cl);
+        memcpy(buf + mid * cl, tmp, cl);
+        memcpy(pivot, buf + lo * cl, cl);
+        store = lo + 1;
+        for (k = lo + 1; k < hi; k++) {
+            if (c->cmp(buf + k * cl, pivot) < 0) {
+                if (store != k) {
+                    memcpy(tmp, buf + store * cl, cl);
+                    memcpy(buf + store * cl, buf + k * cl, cl);
+                    memcpy(buf + k * cl, tmp, cl);
+                }
+                store++;
+            }
+        }
+        p = store - 1;
+        /* Swap the pivot into its final resting index p. */
+        memcpy(tmp, buf + lo * cl, cl);
+        memcpy(buf + lo * cl, buf + p * cl, cl);
+        memcpy(buf + p * cl, tmp, cl);
+        if (c->n == p)
+            break;
+        else if (c->n < p)
+            hi = p;
+        else
+            lo = p + 1;
+    }
+    free(scratch);
+    return 0;
+}
+
+int bstack_slice_partition(bstack_slice_t s, uint64_t chunk_len, uint64_t n,
+                           int (*cmp)(const void *a, const void *b))
+{
+    uint64_t count = s.len / chunk_len;
+    struct select_ctx ctx;
+    if (n >= count) {
+        errno = EINVAL;
+        return -1;
+    }
+    ctx.chunk_len = (size_t)chunk_len;
+    ctx.n   = (size_t)n;
+    ctx.cmp = cmp;
+    return bstack_slice_process(s, select_cb, &ctx);
+}
+
+#endif /* BSTACK_FEATURE_SET && BSTACK_FEATURE_ATOMIC */
+
+/* =========================================================================
  * bstack_guarded_slice_t — I/O
  * ====================================================================== */
 
