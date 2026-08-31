@@ -14,8 +14,10 @@
 //!
 //! Implemented: `new`/`open`, `alloc`, `dealloc`, `realloc`, `realloc_inplace`
 //! (back-edge only — the fixed block base rules out front moves; a back grow uses
-//! the same tail extend as `realloc`), and `recover` (linear-scan free-list
-//! rebuild + leak reclaim). Still pending: the background coalescer.
+//! the same tail extend as `realloc`), `recover` (linear-scan free-list
+//! rebuild + leak reclaim), and `coalesce` (the `recover` walk plus an
+//! adjacent-free-block merge; `atomic` only). The deep in-use-leak GC is still
+//! pending.
 //!
 //! # Feature flags
 //!
@@ -410,6 +412,239 @@ impl SegregatedBStackAllocator {
         }
         self.stack.set(Self::FREE_HEAD_BASE, head_bytes)?;
         Ok(unsure)
+    }
+
+    /// Record one maximal free run as a single output free block: stage its
+    /// `[overhead | next_free]` edit at `run_start` and prepend it onto the class
+    /// for `run_size` (the largest class `≤ run_size`, or oversized above
+    /// `MAX_CLASS`, so a non-class merged size degrades to retained slack rather
+    /// than a head that overruns the block — the `recover` rule).
+    #[cfg(feature = "atomic")]
+    fn record_run(
+        run_start: u64,
+        run_size: u64,
+        heads: &mut [u64],
+        writes: &mut Vec<(u64, Box<[u8; 16]>)>,
+    ) {
+        let c = if run_size > Self::MAX_CLASS {
+            Self::OVERSIZED_CLASS
+        } else {
+            Self::classify(Self::largest_class_le(run_size))
+        } as usize;
+        let mut buf = Box::new([0u8; 16]);
+        write_buf!(run_size >> 4 => buf, 0); // overhead: free tag | merged size
+        write_buf!(heads[c] => buf, 8); // next_free ← current class head
+        writes.push((run_start, buf));
+        heads[c] = run_start;
+    }
+
+    /// Merge physically-adjacent free blocks, returning the number of blocks
+    /// fused into a neighbour (`0` ⇒ nothing to merge, nothing written).
+    ///
+    /// Freed blocks are only ever returned to their own class list, so adjacent
+    /// free blocks accumulate without ever combining and no oversized request can
+    /// reuse the contiguous run. This pass is the [`recover`](Self::recover) walk
+    /// plus a merge: it strides the arena by the recorded physical sizes, and on
+    /// any run of two or more adjacent free blocks writes one merged free block in
+    /// place and rebuilds every free list from the scan (so no swallowed block is
+    /// left linked — the same wholesale rebuild `recover` uses, which needs no
+    /// per-block unlink).
+    ///
+    /// Unlike `recover`, this is a safe method: the whole scan-and-rewrite runs
+    /// inside a single [`BStack::inplace_gen`], which strides the overhead words
+    /// one at a time under the held write lock and accumulates the merges, so a
+    /// concurrent `alloc`/`dealloc` can neither observe an intermediate state nor
+    /// be clobbered. The batch commits crash-atomically; a torn commit re-parses
+    /// as a valid arena and is reclaimed by `recover`, so the pass is restartable.
+    /// A run reaching the tail is merged like any other — tail discard is not
+    /// attempted.
+    ///
+    /// # Feature flags
+    ///
+    /// Requires `atomic` (the merge rides [`BStack::inplace_gen`]).
+    #[cfg(feature = "atomic")]
+    pub fn coalesce(&self) -> io::Result<u64> {
+        // Cheap pre-check to skip the gen on an obviously-empty arena; the length
+        // is re-read under the write lock inside the gen (it may be stale here).
+        if self.stack.len()? <= Self::ARENA_START {
+            return Ok(0);
+        }
+
+        /// Where the striding scan is: `word_buf` holds the overhead word for the
+        /// offset the state names, filled by the previous `Read`.
+        enum Scan {
+            /// Read the arena length under the lock (the first op).
+            NeedLen,
+            /// `stack_len` is now the true length; bounds-check and begin.
+            HaveLen,
+            /// Issue a `Read` of the block at `p`.
+            NeedBlock,
+            /// `word_buf` = word at `p`; classify it (in-use stride / free-run start).
+            HaveBlock,
+            /// Issue a `Read` of the run's next candidate block at `j`.
+            NeedRun,
+            /// `word_buf` = word at `j`; extend the run or close it.
+            HaveRun,
+            /// Scan done: drain the accumulated writes, then the head table.
+            Flush,
+        }
+
+        // The rebuilt head table and the per-output-block edits both live for the
+        // whole `inplace_gen` call so their reborrowed buffers stay valid; the read
+        // word buffer is reused across strides (each read resolves before the next op).
+        // Each edit buffer is boxed so its address is stable even as `writes` grows —
+        // the overlay holds a reborrow of it until the batch commits.
+        let mut heads = [Self::SENTINEL; Self::NUM_CLASSES as usize];
+        let mut writes: Vec<(u64, Box<[u8; 16]>)> = Vec::new();
+        let mut head_bytes = [0u8; Self::NUM_CLASSES as usize * 8];
+        let mut word_buf = [0u8; 8];
+        // The arena length as seen under the lock; every bound below is expressed as
+        // a subtraction against it, and the scan keeps `p <= stack_len`, `j <= stack_len`.
+        let mut stack_len = 0u64;
+        let mut fused = 0u64;
+        // Scan cursor `p` (current block), run being built `[run_start, j)`.
+        let mut p = Self::ARENA_START;
+        let mut run_start = 0u64;
+        let mut run_size = 0u64;
+        let mut j = 0u64;
+        let mut wi = 0usize;
+        let mut state = Scan::NeedLen;
+
+        self.stack.inplace_gen(|feedback| {
+            if let Err(e) = feedback {
+                return Some(BStackGenOp::Abort { source: Some(e) });
+            }
+            loop {
+                match state {
+                    Scan::NeedLen => {
+                        state = Scan::HaveLen;
+                        return Some(BStackGenOp::Len {
+                            // SAFETY: `stack_len` outlives this call.
+                            out: bstack_unsafe_reborrow_mut!(&mut stack_len),
+                        });
+                    }
+                    Scan::HaveLen => {
+                        // Re-checked against the true length: a concurrent shrink
+                        // since the pre-check could have emptied the arena.
+                        state = if stack_len <= Self::ARENA_START {
+                            Scan::Flush
+                        } else {
+                            Scan::NeedBlock
+                        };
+                        continue;
+                    }
+                    Scan::NeedBlock => {
+                        // `p <= stack_len`, so the subtraction cannot underflow.
+                        if Self::OVERHEAD > stack_len - p {
+                            state = Scan::Flush;
+                            continue;
+                        }
+                        state = Scan::HaveBlock;
+                        return Some(BStackGenOp::Read {
+                            offset: p,
+                            // SAFETY: `word_buf` outlives this call.
+                            buf: bstack_unsafe_reborrow_mut!(&mut word_buf[..]),
+                        });
+                    }
+                    Scan::HaveBlock => {
+                        let word = u64::from_le_bytes(word_buf);
+                        // Zeroed tail from a crashed extend: stop (tail unhandled).
+                        if word == 0 {
+                            state = Scan::Flush;
+                            continue;
+                        }
+                        if word & Self::IN_USE_BIT != 0 {
+                            let size = (word & !Self::IN_USE_BIT) << 4;
+                            // Malformed: stop; the remainder leaks until a `recover`.
+                            if size < Self::QUANTUM
+                                || size % Self::QUANTUM != 0
+                                || size > stack_len - p
+                            {
+                                state = Scan::Flush;
+                                continue;
+                            }
+                            p += size; // ≤ stack_len by the check above.
+                            state = Scan::NeedBlock;
+                            continue;
+                        }
+                        let size = word << 4;
+                        if size < Self::QUANTUM || size % Self::QUANTUM != 0 || size > stack_len - p
+                        {
+                            state = Scan::Flush;
+                            continue;
+                        }
+                        // Free block: open a run and look ahead at the next block.
+                        run_start = p;
+                        run_size = size;
+                        j = p + size; // ≤ stack_len by the check above.
+                        state = Scan::NeedRun;
+                        continue;
+                    }
+                    Scan::NeedRun => {
+                        // `j <= stack_len`; `j == stack_len` -> run reached the tail.
+                        if Self::OVERHEAD > stack_len - j {
+                            Self::record_run(run_start, run_size, &mut heads, &mut writes);
+                            state = Scan::Flush;
+                            continue;
+                        }
+                        state = Scan::HaveRun;
+                        return Some(BStackGenOp::Read {
+                            offset: j,
+                            // SAFETY: `word_buf` outlives this call.
+                            buf: bstack_unsafe_reborrow_mut!(&mut word_buf[..]),
+                        });
+                    }
+                    Scan::HaveRun => {
+                        let word = u64::from_le_bytes(word_buf);
+                        if word != 0 && word & Self::IN_USE_BIT == 0 {
+                            let s = word << 4;
+                            if s >= Self::QUANTUM && s % Self::QUANTUM == 0 && s <= stack_len - j {
+                                // One more adjacent block absorbed into the run;
+                                // `run_size == j - run_start ≤ stack_len`, so neither add overflows.
+                                run_size += s;
+                                j += s;
+                                fused += 1;
+                                state = Scan::NeedRun;
+                                continue;
+                            }
+                        }
+                        // Block at `j` is in-use / zero / malformed: the run ends.
+                        Self::record_run(run_start, run_size, &mut heads, &mut writes);
+                        p = j;
+                        state = Scan::NeedBlock;
+                        continue;
+                    }
+                    Scan::Flush => {
+                        // No merge happened: abort so the existing lists are untouched.
+                        if fused == 0 {
+                            return Some(BStackGenOp::Abort { source: None });
+                        }
+                        if wi < writes.len() {
+                            let off = writes[wi].0;
+                            // SAFETY: the boxed buffer has a heap-stable address that
+                            // outlives the call and is not mutated after `record_run`,
+                            // so growing `writes` never invalidates this reborrow.
+                            let data = bstack_unsafe_reborrow!(&writes[wi].1[..]);
+                            wi += 1;
+                            return Some(BStackGenOp::Write { offset: off, data });
+                        }
+                        if wi == writes.len() {
+                            for (c, &h) in heads.iter().enumerate() {
+                                write_buf!(h => head_bytes, c * 8);
+                            }
+                            wi += 1;
+                            return Some(BStackGenOp::Write {
+                                offset: Self::FREE_HEAD_BASE,
+                                // SAFETY: `head_bytes` outlives this call.
+                                data: bstack_unsafe_reborrow!(&head_bytes[..]),
+                            });
+                        }
+                        return None; // head table published: commit the batch.
+                    }
+                }
+            }
+        })?;
+        Ok(fused)
     }
 
     /// Pop the head of `class`, returning its block-start offset or `None`.
@@ -2372,6 +2607,90 @@ mod tests {
         y.write([0x77u8; 100]).unwrap();
         assert_eq!(unsafe { a.recover() }.unwrap(), 0);
         assert_eq!(y.read().unwrap(), vec![0x77u8; 100]);
+    }
+
+    // ── coalesce ─────────────────────────────────────────────────────────────
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn seg_coalesce_merges_adjacent_frees_into_reusable_run() {
+        let (a, _g) = new_alloc();
+        // Four contiguous equal blocks, then a tail pin so freeing routes them to
+        // the free list rather than discarding.
+        let b0 = a.alloc(100).unwrap();
+        let b1 = a.alloc(100).unwrap();
+        let b2 = a.alloc(100).unwrap();
+        let b3 = a.alloc(100).unwrap();
+        let _pin = a.alloc(100).unwrap();
+        let base = b0.start();
+        a.dealloc(b0).unwrap();
+        a.dealloc(b1).unwrap();
+        a.dealloc(b2).unwrap();
+        a.dealloc(b3).unwrap();
+
+        // Four adjacent free blocks fuse into one: three blocks absorbed.
+        assert_eq!(a.coalesce().unwrap(), 3);
+        // The merged run is now reusable by a request no single 112-block could serve.
+        let big = a.alloc(440).unwrap();
+        assert_eq!(
+            big.start(),
+            base,
+            "the merged run must back the oversized alloc"
+        );
+        assert_eq!(unsafe { a.recover() }.unwrap(), 0, "arena stays clean");
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn seg_coalesce_is_a_noop_without_adjacency() {
+        let (a, _g) = new_alloc();
+        // Free the outer two but keep the middle live, so the frees are not adjacent.
+        let b0 = a.alloc(100).unwrap();
+        let _b1 = a.alloc(100).unwrap();
+        let b2 = a.alloc(100).unwrap();
+        let _pin = a.alloc(100).unwrap();
+        let s0 = b0.start();
+        let s2 = b2.start();
+        a.dealloc(b0).unwrap();
+        a.dealloc(b2).unwrap();
+
+        assert_eq!(a.coalesce().unwrap(), 0, "no adjacent frees to merge");
+        // Both freed blocks stay individually reusable (lists untouched by the no-op).
+        let x = a.alloc(100).unwrap();
+        let y = a.alloc(100).unwrap();
+        let mut got = [x.start(), y.start()];
+        got.sort_unstable();
+        let mut want = [s0, s2];
+        want.sort_unstable();
+        assert_eq!(got, want);
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn seg_coalesce_empty_arena_is_zero() {
+        let (a, _g) = new_alloc();
+        assert_eq!(a.coalesce().unwrap(), 0);
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn seg_coalesce_merges_a_partial_run_between_live_blocks() {
+        let (a, _g) = new_alloc();
+        // Layout: live, free, free, live, tail-pin. Only the middle pair merges.
+        let _live0 = a.alloc(100).unwrap();
+        let f0 = a.alloc(100).unwrap();
+        let f1 = a.alloc(100).unwrap();
+        let _live1 = a.alloc(100).unwrap();
+        let _pin = a.alloc(100).unwrap();
+        let f0_start = f0.start();
+        a.dealloc(f0).unwrap();
+        a.dealloc(f1).unwrap();
+
+        assert_eq!(a.coalesce().unwrap(), 1, "one adjacent pair fuses");
+        // Two 112-blocks fuse to a 224-block; request the size that maps to that class.
+        let merged = a.alloc(216).unwrap();
+        assert_eq!(merged.start(), f0_start);
+        assert_eq!(unsafe { a.recover() }.unwrap(), 0);
     }
 
     #[test]
