@@ -121,6 +121,12 @@ struct bstack {
      * immutable and can be read without the rwlock on supported platforms.
      * Not persisted — resets to 0 on every open. */
     ATOMIC_UINT64_T locked;
+    /* Deferred-replay flag, guarded by `lock` alongside fd and clen. Set when a
+     * write failed after its first mutating I/O, so the file may still hold an
+     * armed journal or a stale tail. In-memory only — the on-disk journal is
+     * what recovery actually reads — and cleared by the replay the next write
+     * performs. See "Deferred replay" in bstack.h. */
+    int replay_needed;
     /* In-memory mirror of [0, locked).  Only active when cache_enabled != 0.
      * cache_buf is a malloc'd buffer of cache_cap bytes; the count of valid
      * bytes equals bstack_locked_len().  Protected by cache_mutex.
@@ -741,6 +747,115 @@ static int file_size(bstack_fd_t fd, uint64_t *out)
     return plat_file_size(fd, out);
 }
 
+/* Replay or roll back an interrupted write, restoring the at-rest invariant
+ * (file size == HEADER_SIZE + clen, journal disarmed), and store the committed
+ * length afterwards in *out_clen (unchanged except by a splice).
+ *
+ * raw_size is the current file size. Shared by bstack_open — a crash left the
+ * file armed — and by the deferred replay a write performs after an earlier
+ * write on the same handle failed midway. Every replay is idempotent, so
+ * running it twice is harmless. Returns 0 on success, -1 with errno set. */
+static int recover(bstack_fd_t fd, uint64_t raw_size, uint64_t *out_clen)
+{
+    uint64_t committed_len, wip_ptr, wip_aux;
+    if (read_header(fd, &committed_len, &wip_ptr, &wip_aux) != 0)
+        return -1;
+
+    uint64_t clen = committed_len;
+    if (wip_ptr != 0) {
+        /* An in-place write was in flight. Replay or roll it back, then restore
+         * the at-rest invariant. A splice changes the committed length, so adopt
+         * whatever recovery commits. */
+        if (recover_wip(fd, committed_len, wip_ptr, wip_aux, raw_size, &clen) != 0)
+            return -1;
+    } else if (wip_aux == WIP_MULTI) {
+        /* A multi-write batch was in flight (armed with wip_ptr == 0 and the
+         * intent-complete sentinel). All blocks were fully staged before the
+         * arm, so replay the sequence and disarm. clen is unchanged. */
+        if (recover_multi_write(fd, committed_len, raw_size, &clen) != 0)
+            return -1;
+    } else {
+        /* No journal armed: reconcile the committed length against the file
+         * size, using whichever is smaller (drops a stale tail from a crashed
+         * push/extend or a crashed journal stage). */
+        uint64_t actual = raw_size - HEADER_SIZE;
+        if (actual != committed_len) {
+            uint64_t correct = (committed_len < actual) ? committed_len : actual;
+            if (plat_ftruncate(fd, HEADER_SIZE + correct) != 0 ||
+                write_committed_len(fd, &clen, correct) != 0 ||
+                plat_durable_sync(fd) != 0)
+                return -1;
+        }
+    }
+    *out_clen = clen;
+    return 0;
+}
+
+/* Run the deferred replay recorded by an earlier failed write, adopting the
+ * committed length it commits and clearing the flag. A failed replay leaves the
+ * flag set, so the next write tries again. Caller holds the write lock. */
+static int replay_pending(bstack_t *bs)
+{
+    uint64_t raw_size;
+    if (file_size(bs->fd, &raw_size) != 0)
+        return -1;
+    if (recover(bs->fd, raw_size, &bs->clen) != 0)
+        return -1;
+    bs->replay_needed = 0;
+    return 0;
+}
+
+/* Flag the stack for replay when rc reports failure: a mutating step that got
+ * past its first write may have left an armed journal or a stale tail behind.
+ * Wraps every mutating call made under the write lock; read-only steps are not
+ * wrapped, since a read that fails changes nothing on disk. Returns rc. */
+static int mark_replay(bstack_t *bs, int rc)
+{
+    if (rc != 0)
+        bs->replay_needed = 1;
+    return rc;
+}
+
+/* Take the write lock for a mutating operation, first silently replaying any
+ * earlier write that failed midway. The replay must precede the operation's own
+ * validation: a stale tail would otherwise inflate the payload size every
+ * mutator derives from the file end. */
+#define BS_WRLOCK_REPLAY(bs)                                                  \
+    do {                                                                      \
+        BS_WRLOCK(bs);                                                        \
+        if ((bs)->replay_needed && replay_pending(bs) != 0) {                 \
+            int saved_ = errno;                                               \
+            BS_WRUNLOCK(bs);                                                  \
+            errno = saved_;                                                   \
+            return -1;                                                        \
+        }                                                                     \
+    } while (0)
+
+/* Take the write lock for a read-only operation. A pending replay fails the call
+ * with BSTACK_EREPLAY rather than being
+ * applied: only a write replays, so a read never
+ * returns bytes an interrupted write may still own. */
+#define BS_WRLOCK_INTACT(bs)                                                  \
+    do {                                                                      \
+        BS_WRLOCK(bs);                                                        \
+        if ((bs)->replay_needed) {                                            \
+            BS_WRUNLOCK(bs);                                                  \
+            errno = BSTACK_EREPLAY;                                                    \
+            return -1;                                                        \
+        }                                                                     \
+    } while (0)
+
+/* Read-lock counterpart of BS_WRLOCK_INTACT. */
+#define BS_RDLOCK_INTACT(bs)                                                  \
+    do {                                                                      \
+        BS_RDLOCK(bs);                                                        \
+        if ((bs)->replay_needed) {                                            \
+            BS_RDUNLOCK(bs);                                                  \
+            errno = BSTACK_EREPLAY;                                                    \
+            return -1;                                                        \
+        }                                                                     \
+    } while (0)
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -813,53 +928,11 @@ bstack_t *bstack_open(const char *path)
         return NULL;
     } else {
         /* Existing file — validate header and crash-recover if needed. */
-        uint64_t committed_len, wip_ptr, wip_aux;
-        if (read_header(fd, &committed_len, &wip_ptr, &wip_aux) != 0) {
+        if (recover(fd, raw_size, &clen) != 0) {
             int saved = errno;
             close_fd(fd);
             errno = saved;
             return NULL;
-        }
-
-        clen = committed_len;
-        if (wip_ptr != 0) {
-            /* An in-place write was in flight. Replay or roll it back, then
-             * restore the at-rest invariant. A splice changes the committed
-             * length, so adopt whatever recovery commits. */
-            if (recover_wip(fd, committed_len, wip_ptr, wip_aux,
-                            raw_size, &clen) != 0) {
-                int saved = errno;
-                close_fd(fd);
-                errno = saved;
-                return NULL;
-            }
-        } else if (wip_aux == WIP_MULTI) {
-            /* A multi-write batch was in flight (armed with wip_ptr == 0 and the
-             * intent-complete sentinel). All blocks were fully staged before the
-             * arm, so replay the sequence and disarm. clen is unchanged. */
-            if (recover_multi_write(fd, committed_len, raw_size, &clen) != 0) {
-                int saved = errno;
-                close_fd(fd);
-                errno = saved;
-                return NULL;
-            }
-        } else {
-            /* No journal armed: reconcile the committed length against the file
-             * size, using whichever is smaller (drops a stale tail from a
-             * crashed push/extend or a crashed journal stage). */
-            uint64_t actual = raw_size - HEADER_SIZE;
-            if (actual != committed_len) {
-                uint64_t correct = (committed_len < actual) ? committed_len : actual;
-                if (plat_ftruncate(fd, HEADER_SIZE + correct) != 0 ||
-                    write_committed_len(fd, &clen, correct) != 0 ||
-                    plat_durable_sync(fd) != 0)
-                {
-                    int saved = errno;
-                    close_fd(fd);
-                    errno = saved;
-                    return NULL;
-                }
-            }
         }
     }
 
@@ -871,6 +944,7 @@ bstack_t *bstack_open(const char *path)
     bs->fd            = fd;
     bs->clen          = clen;
     bs->locked        = ATOMIC_INIT(0);
+    bs->replay_needed = 0;
     bs->cache_enabled = 0;
     bs->cache_buf     = NULL;
     bs->cache_cap     = 0;
@@ -1116,10 +1190,11 @@ static int commit_sparse_extend(bstack_t *bs, uint64_t logical_offset,
          * cache is reset up front so it reflects the rolled-back file even if the
          * best-effort header rewrite below fails. */
         int saved = errno;
-        plat_ftruncate(bs->fd, raw_size);
+        int rb_ = plat_ftruncate(bs->fd, raw_size);
         bs->clen = logical_offset;
-        write_committed_len(bs->fd, &bs->clen, logical_offset);
-        plat_durable_sync(bs->fd);
+        rb_ |= write_committed_len(bs->fd, &bs->clen, logical_offset);
+        rb_ |= plat_durable_sync(bs->fd);
+        mark_replay(bs, rb_);
         errno = saved;
         return -1;
     }
@@ -1133,7 +1208,7 @@ static int commit_sparse_extend(bstack_t *bs, uint64_t logical_offset,
 int bstack_push(bstack_t *bs, const uint8_t *data, size_t len,
                 uint64_t *out_offset)
 {
-    BS_WRLOCK(bs);
+    BS_WRLOCK_REPLAY(bs);
 
     uint64_t raw_size;
     if (file_size(bs->fd, &raw_size) != 0)
@@ -1149,23 +1224,25 @@ int bstack_push(bstack_t *bs, const uint8_t *data, size_t len,
     }
 
     /* Write payload at end of file. */
-    if (plat_pwrite(bs->fd, data, len, raw_size) != 0) {
-        /* Best-effort rollback: truncate any partial write. */
-        plat_ftruncate(bs->fd, raw_size);
+    if (mark_replay(bs, plat_pwrite(bs->fd, data, len, raw_size)) != 0) {
+        /* Best-effort rollback: truncate any partial write. A failed
+         * rollback leaves a stale tail, so defer the repair. */
+        mark_replay(bs, plat_ftruncate(bs->fd, raw_size));
         goto fail_unlock;
     }
 
     uint64_t new_len = logical_offset + (uint64_t)len;
-    if (write_committed_len(bs->fd, &bs->clen, new_len) != 0 ||
-        plat_durable_sync(bs->fd) != 0)
+    if (mark_replay(bs, write_committed_len(bs->fd, &bs->clen, new_len)) != 0 ||
+                        mark_replay(bs, plat_durable_sync(bs->fd)) != 0)
     {
         /* Rollback: remove written data and reset committed length. The
          * cache is reset up front so it reflects the rolled-back file even
          * if the best-effort header rewrite below fails. */
-        plat_ftruncate(bs->fd, raw_size);
+        int rb_ = plat_ftruncate(bs->fd, raw_size);
         bs->clen = logical_offset;
-        write_committed_len(bs->fd, &bs->clen, logical_offset);
-        plat_durable_sync(bs->fd);
+        rb_ |= write_committed_len(bs->fd, &bs->clen, logical_offset);
+        rb_ |= plat_durable_sync(bs->fd);
+        mark_replay(bs, rb_);
         goto fail_unlock;
     }
 
@@ -1189,7 +1266,7 @@ fail_unlock:
 
 int bstack_extend(bstack_t *bs, size_t n, uint64_t *out_offset)
 {
-    BS_WRLOCK(bs);
+    BS_WRLOCK_REPLAY(bs);
 
     uint64_t raw_size;
     if (file_size(bs->fd, &raw_size) != 0)
@@ -1206,20 +1283,21 @@ int bstack_extend(bstack_t *bs, size_t n, uint64_t *out_offset)
 
     /* Extend the file; the OS will zero-fill the new space. */
     uint64_t new_raw_size = raw_size + (uint64_t)n;
-    if (plat_ftruncate(bs->fd, new_raw_size) != 0)
+    if (mark_replay(bs, plat_ftruncate(bs->fd, new_raw_size)) != 0)
         goto fail_unlock;
 
     uint64_t new_len = logical_offset + (uint64_t)n;
-    if (write_committed_len(bs->fd, &bs->clen, new_len) != 0 ||
-        plat_durable_sync(bs->fd) != 0)
+    if (mark_replay(bs, write_committed_len(bs->fd, &bs->clen, new_len)) != 0 ||
+                        mark_replay(bs, plat_durable_sync(bs->fd)) != 0)
     {
         /* Rollback: truncate and reset committed length. The cache is reset
          * up front so it reflects the rolled-back file even if the
          * best-effort header rewrite below fails. */
-        plat_ftruncate(bs->fd, raw_size);
+        int rb_ = plat_ftruncate(bs->fd, raw_size);
         bs->clen = logical_offset;
-        write_committed_len(bs->fd, &bs->clen, logical_offset);
-        plat_durable_sync(bs->fd);
+        rb_ |= write_committed_len(bs->fd, &bs->clen, logical_offset);
+        rb_ |= plat_durable_sync(bs->fd);
+        mark_replay(bs, rb_);
         goto fail_unlock;
     }
 
@@ -1246,7 +1324,7 @@ int bstack_extend_sparse(bstack_t *bs, const uint8_t *buf, size_t buf_len,
 {
     if ((uint64_t)buf_len > length) { errno = EINVAL; return -1; }
 
-    BS_WRLOCK(bs);
+    BS_WRLOCK_REPLAY(bs);
 
     uint64_t raw_size;
     if (file_size(bs->fd, &raw_size) != 0)
@@ -1274,8 +1352,8 @@ int bstack_extend_sparse(bstack_t *bs, const uint8_t *buf, size_t buf_len,
         one.len    = buf_len;
         n_blocks   = 1;
     }
-    if (commit_sparse_extend(bs, logical_offset, raw_size, new_len,
-                             n_blocks ? &one : NULL, n_blocks) != 0)
+    if (mark_replay(bs, commit_sparse_extend(bs, logical_offset, raw_size, new_len,
+                                             n_blocks ? &one : NULL, n_blocks)) != 0)
         goto fail_unlock;
 
     BS_WRUNLOCK(bs);
@@ -1315,7 +1393,7 @@ int bstack_extend_sparse_batched(bstack_t *bs,
         }
     }
 
-    BS_WRLOCK(bs);
+    BS_WRLOCK_REPLAY(bs);
 
     uint64_t raw_size;
     if (file_size(bs->fd, &raw_size) != 0)
@@ -1336,7 +1414,7 @@ int bstack_extend_sparse_batched(bstack_t *bs,
     }
     uint64_t new_len = logical_offset + length;
 
-    if (commit_sparse_extend(bs, logical_offset, raw_size, new_len, w, n) != 0)
+    if (mark_replay(bs, commit_sparse_extend(bs, logical_offset, raw_size, new_len, w, n)) != 0)
         goto fail;
 
     BS_WRUNLOCK(bs);
@@ -1361,7 +1439,7 @@ fail:
 
 int bstack_resize(bstack_t *bs, uint64_t target, uint64_t *out_initial_len)
 {
-    BS_WRLOCK(bs);
+    BS_WRLOCK_REPLAY(bs);
 
     uint64_t raw_size;
     if (file_size(bs->fd, &raw_size) != 0)
@@ -1383,13 +1461,13 @@ int bstack_resize(bstack_t *bs, uint64_t target, uint64_t *out_initial_len)
             return -1;
         }
 
-        if (plat_ftruncate(bs->fd, HEADER_SIZE + target) != 0)
+        if (mark_replay(bs, plat_ftruncate(bs->fd, HEADER_SIZE + target)) != 0)
             goto fail_unlock;
         /* Truncation is the commit point: update the cache now, before the
          * header write, which can fail and skip it (matching bstack_discard). */
         bs->clen = target;
-        if (write_committed_len(bs->fd, &bs->clen, target) != 0 ||
-            plat_durable_sync(bs->fd) != 0)
+        if (mark_replay(bs, write_committed_len(bs->fd, &bs->clen, target)) != 0 ||
+                            mark_replay(bs, plat_durable_sync(bs->fd)) != 0)
             goto fail_unlock;
 
         BS_WRUNLOCK(bs);
@@ -1398,18 +1476,19 @@ int bstack_resize(bstack_t *bs, uint64_t target, uint64_t *out_initial_len)
     }
 
     /* Grow: the OS zero-fills the new space. */
-    if (plat_ftruncate(bs->fd, HEADER_SIZE + target) != 0)
+    if (mark_replay(bs, plat_ftruncate(bs->fd, HEADER_SIZE + target)) != 0)
         goto fail_unlock;
 
-    if (write_committed_len(bs->fd, &bs->clen, target) != 0 ||
-        plat_durable_sync(bs->fd) != 0)
+    if (mark_replay(bs, write_committed_len(bs->fd, &bs->clen, target)) != 0 ||
+                        mark_replay(bs, plat_durable_sync(bs->fd)) != 0)
     {
         /* Best-effort rollback. The cache is reset up front so it reflects
          * the rolled-back file even if the header rewrite below fails. */
-        plat_ftruncate(bs->fd, raw_size);
+        int rb_ = plat_ftruncate(bs->fd, raw_size);
         bs->clen = data_size;
-        write_committed_len(bs->fd, &bs->clen, data_size);
-        plat_durable_sync(bs->fd);
+        rb_ |= write_committed_len(bs->fd, &bs->clen, data_size);
+        rb_ |= plat_durable_sync(bs->fd);
+        mark_replay(bs, rb_);
         goto fail_unlock;
     }
 
@@ -1432,7 +1511,7 @@ fail_unlock:
 
 int bstack_ensure(bstack_t *bs, uint64_t target, uint64_t *out_initial_len)
 {
-    BS_WRLOCK(bs);
+    BS_WRLOCK_REPLAY(bs);
 
     uint64_t raw_size;
     if (file_size(bs->fd, &raw_size) != 0)
@@ -1446,16 +1525,17 @@ int bstack_ensure(bstack_t *bs, uint64_t target, uint64_t *out_initial_len)
         return 0;
     }
 
-    if (plat_ftruncate(bs->fd, HEADER_SIZE + target) != 0)
+    if (mark_replay(bs, plat_ftruncate(bs->fd, HEADER_SIZE + target)) != 0)
         goto fail_unlock;
 
-    if (write_committed_len(bs->fd, &bs->clen, target) != 0 ||
-        plat_durable_sync(bs->fd) != 0)
+    if (mark_replay(bs, write_committed_len(bs->fd, &bs->clen, target)) != 0 ||
+                        mark_replay(bs, plat_durable_sync(bs->fd)) != 0)
     {
-        plat_ftruncate(bs->fd, raw_size);
+        int rb_ = plat_ftruncate(bs->fd, raw_size);
         bs->clen = data_size;
-        write_committed_len(bs->fd, &bs->clen, data_size);
-        plat_durable_sync(bs->fd);
+        rb_ |= write_committed_len(bs->fd, &bs->clen, data_size);
+        rb_ |= plat_durable_sync(bs->fd);
+        mark_replay(bs, rb_);
         goto fail_unlock;
     }
 
@@ -1479,7 +1559,7 @@ fail_unlock:
 int bstack_pop(bstack_t *bs, size_t n,
                uint8_t *buf, size_t *written_out)
 {
-    BS_WRLOCK(bs);
+    BS_WRLOCK_REPLAY(bs);
 
     uint64_t raw_size;
     if (file_size(bs->fd, &raw_size) != 0)
@@ -1510,14 +1590,14 @@ int bstack_pop(bstack_t *bs, size_t n,
             goto fail_unlock;
     }
 
-    if (plat_ftruncate(bs->fd, HEADER_SIZE + new_len) != 0)
+    if (mark_replay(bs, plat_ftruncate(bs->fd, HEADER_SIZE + new_len)) != 0)
         goto fail_unlock;
     /* The truncation is the commit point: the tail bytes are gone and
      * recovery would adopt the smaller file size, so update the cache now —
      * before the header write, which can fail and skip it. */
     bs->clen = new_len;
-    if (write_committed_len(bs->fd, &bs->clen, new_len) != 0 ||
-        plat_durable_sync(bs->fd) != 0)
+    if (mark_replay(bs, write_committed_len(bs->fd, &bs->clen, new_len)) != 0 ||
+                        mark_replay(bs, plat_durable_sync(bs->fd)) != 0)
         goto fail_unlock;
 
     BS_WRUNLOCK(bs);
@@ -1541,7 +1621,7 @@ fail_unlock:
 int bstack_peek(bstack_t *bs, uint64_t offset,
                 uint8_t *buf, size_t *written_out)
 {
-    BS_RDLOCK(bs);
+    BS_RDLOCK_INTACT(bs);
 
     uint64_t raw_size;
     if (file_size(bs->fd, &raw_size) != 0)
@@ -1607,7 +1687,7 @@ int bstack_get(bstack_t *bs, uint64_t start, uint64_t end,
         return 0;
     }
 
-    BS_RDLOCK(bs);
+    BS_RDLOCK_INTACT(bs);
 
     uint64_t raw_size;
     if (file_size(bs->fd, &raw_size) != 0)
@@ -1647,7 +1727,7 @@ int bstack_discard(bstack_t *bs, size_t n)
     if (n == 0)
         return 0;
 
-    BS_WRLOCK(bs);
+    BS_WRLOCK_REPLAY(bs);
 
     uint64_t raw_size;
     if (file_size(bs->fd, &raw_size) != 0)
@@ -1670,14 +1750,14 @@ int bstack_discard(bstack_t *bs, size_t n)
         return -1;
     }
 
-    if (plat_ftruncate(bs->fd, HEADER_SIZE + new_len) != 0)
+    if (mark_replay(bs, plat_ftruncate(bs->fd, HEADER_SIZE + new_len)) != 0)
         goto fail_unlock;
     /* The truncation is the commit point: the tail bytes are gone and
      * recovery would adopt the smaller file size, so update the cache now —
      * before the header write, which can fail and skip it. */
     bs->clen = new_len;
-    if (write_committed_len(bs->fd, &bs->clen, new_len) != 0 ||
-        plat_durable_sync(bs->fd) != 0)
+    if (mark_replay(bs, write_committed_len(bs->fd, &bs->clen, new_len)) != 0 ||
+                        mark_replay(bs, plat_durable_sync(bs->fd)) != 0)
         goto fail_unlock;
 
     BS_WRUNLOCK(bs);
@@ -1698,7 +1778,7 @@ fail_unlock:
 
 int bstack_len(bstack_t *bs, uint64_t *out_len)
 {
-    BS_RDLOCK(bs);
+    BS_RDLOCK_INTACT(bs);
     *out_len = bs->clen;
     BS_RDUNLOCK(bs);
     return 0;
@@ -1710,7 +1790,7 @@ int bstack_len(bstack_t *bs, uint64_t *out_len)
 
 int bstack_is_empty(bstack_t *bs, int *out_empty)
 {
-    BS_RDLOCK(bs);
+    BS_RDLOCK_INTACT(bs);
     *out_empty = (bs->clen == 0) ? 1 : 0;
     BS_RDUNLOCK(bs);
     return 0;
@@ -1728,7 +1808,7 @@ uint64_t bstack_locked_len(bstack_t *bs)
 int bstack_lock_up_to(bstack_t *bs, uint64_t n)
 {
     /* Acquire the write lock to serialize against any in-flight writers. */
-    BS_WRLOCK(bs);
+    BS_WRLOCK_INTACT(bs);
 
     uint64_t raw_size;
     if (file_size(bs->fd, &raw_size) != 0) {
@@ -2184,7 +2264,7 @@ int bstack_set(bstack_t *bs, uint64_t offset,
     }
     uint64_t end = offset + (uint64_t)len;
 
-    BS_WRLOCK(bs);
+    BS_WRLOCK_REPLAY(bs);
     
     /* Load locked under the write lock — otherwise a concurrent
      * lock_up_to could extend the locked region between our check and
@@ -2209,7 +2289,7 @@ int bstack_set(bstack_t *bs, uint64_t offset,
 
     /* Crash-atomic same-length overwrite: single-block atomic write, else the
      * write-in-progress journal. */
-    if (set_in_place(bs->fd, data_size, offset, data, len) != 0)
+    if (mark_replay(bs, set_in_place(bs->fd, data_size, offset, data, len)) != 0)
         goto fail_unlock;
 
     BS_WRUNLOCK(bs);
@@ -2249,7 +2329,7 @@ int bstack_repeat(bstack_t *bs, uint64_t offset,
     }
     uint64_t end = offset + total;
 
-    BS_WRLOCK(bs);
+    BS_WRLOCK_REPLAY(bs);
 
     /* Load locked under the write lock (see bstack_set for rationale). */
     uint64_t locked = ATOMIC_LOAD_ACQUIRE(&bs->locked);
@@ -2272,7 +2352,7 @@ int bstack_repeat(bstack_t *bs, uint64_t offset,
 
     /* Only the pattern and count are journaled: a fixed 8 + pattern_len tail
      * regardless of how large the filled region is. */
-    if (repeat_fill(bs->fd, data_size, offset, pattern, pattern_len, count) != 0)
+    if (mark_replay(bs, repeat_fill(bs->fd, data_size, offset, pattern, pattern_len, count)) != 0)
         goto fail_unlock;
 
     BS_WRUNLOCK(bs);
@@ -2301,7 +2381,7 @@ int bstack_atrunc(bstack_t *bs, size_t n,
     if (n == 0 && buf_len == 0)
         return 0;
 
-    BS_WRLOCK(bs);
+    BS_WRLOCK_REPLAY(bs);
 
     uint64_t raw_size;
     if (file_size(bs->fd, &raw_size) != 0)
@@ -2322,8 +2402,8 @@ int bstack_atrunc(bstack_t *bs, size_t n,
         return -1;
     }
 
-    if (commit_tail_replace(bs->fd, &bs->clen, new_tail_start,
-                            (uint64_t)n, buf, (uint64_t)buf_len, raw_size) != 0)
+    if (mark_replay(bs, commit_tail_replace(bs->fd, &bs->clen, new_tail_start,
+                                            (uint64_t)n, buf, (uint64_t)buf_len, raw_size)) != 0)
         goto fail_unlock;
 
     BS_WRUNLOCK(bs);
@@ -2341,7 +2421,7 @@ int bstack_splice(bstack_t *bs,
     if (n == 0 && new_len == 0)
         return 0;
 
-    BS_WRLOCK(bs);
+    BS_WRLOCK_REPLAY(bs);
 
     uint64_t raw_size;
     if (file_size(bs->fd, &raw_size) != 0)
@@ -2370,8 +2450,8 @@ int bstack_splice(bstack_t *bs,
             goto fail_unlock;
     }
 
-    if (commit_tail_replace(bs->fd, &bs->clen, new_tail_start,
-                            (uint64_t)n, new_buf, (uint64_t)new_len, raw_size) != 0)
+    if (mark_replay(bs, commit_tail_replace(bs->fd, &bs->clen, new_tail_start,
+                                            (uint64_t)n, new_buf, (uint64_t)new_len, raw_size)) != 0)
         goto fail_unlock;
 
     BS_WRUNLOCK(bs);
@@ -2385,7 +2465,7 @@ fail_unlock:
 int bstack_try_extend(bstack_t *bs, uint64_t s,
                       const uint8_t *buf, size_t buf_len, int *ok)
 {
-    BS_WRLOCK(bs);
+    BS_WRLOCK_REPLAY(bs);
 
     uint64_t raw_size;
     if (file_size(bs->fd, &raw_size) != 0)
@@ -2404,19 +2484,20 @@ int bstack_try_extend(bstack_t *bs, uint64_t s,
     }
 
     /* Same sequence as bstack_push. */
-    if (plat_pwrite(bs->fd, buf, buf_len, raw_size) != 0) {
-        plat_ftruncate(bs->fd, raw_size);
+    if (mark_replay(bs, plat_pwrite(bs->fd, buf, buf_len, raw_size)) != 0) {
+        mark_replay(bs, plat_ftruncate(bs->fd, raw_size));
         goto fail_unlock;
     }
     uint64_t new_len = data_size + (uint64_t)buf_len;
-    if (write_committed_len(bs->fd, &bs->clen, new_len) != 0 ||
-        plat_durable_sync(bs->fd) != 0) {
+    if (mark_replay(bs, write_committed_len(bs->fd, &bs->clen, new_len)) != 0 ||
+                        mark_replay(bs, plat_durable_sync(bs->fd)) != 0) {
         /* The cache is reset up front so it reflects the rolled-back file
          * even if the best-effort header rewrite below fails. */
-        plat_ftruncate(bs->fd, raw_size);
+        int rb_ = plat_ftruncate(bs->fd, raw_size);
         bs->clen = data_size;
-        write_committed_len(bs->fd, &bs->clen, data_size);
-        plat_durable_sync(bs->fd);
+        rb_ |= write_committed_len(bs->fd, &bs->clen, data_size);
+        rb_ |= plat_durable_sync(bs->fd);
+        mark_replay(bs, rb_);
         goto fail_unlock;
     }
 
@@ -2433,7 +2514,7 @@ int bstack_try_discard(bstack_t *bs, uint64_t s, size_t n, int *ok)
 {
     if (n == 0) {
         /* Read-only path: just check the size. */
-        BS_RDLOCK(bs);
+        BS_RDLOCK_INTACT(bs);
         uint64_t raw_size;
         if (file_size(bs->fd, &raw_size) != 0) {
             int saved = errno;
@@ -2446,7 +2527,7 @@ int bstack_try_discard(bstack_t *bs, uint64_t s, size_t n, int *ok)
         return 0;
     }
 
-    BS_WRLOCK(bs);
+    BS_WRLOCK_REPLAY(bs);
 
     uint64_t raw_size;
     if (file_size(bs->fd, &raw_size) != 0)
@@ -2474,14 +2555,14 @@ int bstack_try_discard(bstack_t *bs, uint64_t s, size_t n, int *ok)
         return -1;
     }
     
-    if (plat_ftruncate(bs->fd, HEADER_SIZE + new_len) != 0)
+    if (mark_replay(bs, plat_ftruncate(bs->fd, HEADER_SIZE + new_len)) != 0)
         goto fail_unlock;
     /* The truncation is the commit point: the tail bytes are gone and
      * recovery would adopt the smaller file size, so update the cache now —
      * before the header write, which can fail and skip it. */
     bs->clen = new_len;
-    if (write_committed_len(bs->fd, &bs->clen, new_len) != 0 ||
-        plat_durable_sync(bs->fd) != 0)
+    if (mark_replay(bs, write_committed_len(bs->fd, &bs->clen, new_len)) != 0 ||
+                        mark_replay(bs, plat_durable_sync(bs->fd)) != 0)
         goto fail_unlock;
 
     BS_WRUNLOCK(bs);
@@ -2499,7 +2580,7 @@ int bstack_replace(bstack_t *bs, size_t n,
                               void *ctx),
                    void *ctx)
 {
-    BS_WRLOCK(bs);
+    BS_WRLOCK_REPLAY(bs);
 
     uint64_t raw_size;
     if (file_size(bs->fd, &raw_size) != 0)
@@ -2549,9 +2630,9 @@ int bstack_replace(bstack_t *bs, size_t n,
         return 0;
     }
 
-    if (commit_tail_replace(bs->fd, &bs->clen, new_tail_start,
-                            (uint64_t)n, new_buf, (uint64_t)new_len,
-                            raw_size) != 0) {
+    if (mark_replay(bs, commit_tail_replace(bs->fd, &bs->clen, new_tail_start,
+                                            (uint64_t)n, new_buf, (uint64_t)new_len,
+                                            raw_size)) != 0) {
         free(new_buf);
         goto fail_unlock;
     }
@@ -2567,7 +2648,7 @@ fail_unlock:
 
 int bstack_try_extend_zeros(bstack_t *bs, uint64_t s, size_t n, int *ok)
 {
-    BS_WRLOCK(bs);
+    BS_WRLOCK_REPLAY(bs);
 
     uint64_t raw_size;
     if (file_size(bs->fd, &raw_size) != 0)
@@ -2586,16 +2667,17 @@ int bstack_try_extend_zeros(bstack_t *bs, uint64_t s, size_t n, int *ok)
     }
 
     uint64_t new_len = data_size + (uint64_t)n;
-    if (plat_ftruncate(bs->fd, HEADER_SIZE + new_len) != 0 ||
-        write_committed_len(bs->fd, &bs->clen, new_len) != 0 ||
-        plat_durable_sync(bs->fd) != 0)
+    if (mark_replay(bs, plat_ftruncate(bs->fd, HEADER_SIZE + new_len)) != 0 ||
+                        mark_replay(bs, write_committed_len(bs->fd, &bs->clen, new_len)) != 0 ||
+                        mark_replay(bs, plat_durable_sync(bs->fd)) != 0)
     {
         /* Best-effort rollback. The cache is reset up front so it reflects
          * the rolled-back file even if the header rewrite below fails. */
-        plat_ftruncate(bs->fd, raw_size);
+        int rb_ = plat_ftruncate(bs->fd, raw_size);
         bs->clen = data_size;
-        write_committed_len(bs->fd, &bs->clen, data_size);
-        plat_durable_sync(bs->fd);
+        rb_ |= write_committed_len(bs->fd, &bs->clen, data_size);
+        rb_ |= plat_durable_sync(bs->fd);
+        mark_replay(bs, rb_);
         goto fail_unlock;
     }
 
@@ -2615,7 +2697,7 @@ int bstack_try_extend_sparse(bstack_t *bs, uint64_t s,
     /* Reject a malformed request before the lock, regardless of the size guard. */
     if ((uint64_t)buf_len > length) { errno = EINVAL; return -1; }
 
-    BS_WRLOCK(bs);
+    BS_WRLOCK_REPLAY(bs);
 
     uint64_t raw_size;
     if (file_size(bs->fd, &raw_size) != 0)
@@ -2645,8 +2727,8 @@ int bstack_try_extend_sparse(bstack_t *bs, uint64_t s,
         one.len    = buf_len;
         n_blocks   = 1;
     }
-    if (commit_sparse_extend(bs, data_size, raw_size, new_len,
-                             n_blocks ? &one : NULL, n_blocks) != 0)
+    if (mark_replay(bs, commit_sparse_extend(bs, data_size, raw_size, new_len,
+                                             n_blocks ? &one : NULL, n_blocks)) != 0)
         goto fail_unlock;
 
     BS_WRUNLOCK(bs);
@@ -2677,7 +2759,7 @@ int bstack_try_extend_sparse_batched(bstack_t *bs, uint64_t s,
         }
     }
 
-    BS_WRLOCK(bs);
+    BS_WRLOCK_REPLAY(bs);
 
     uint64_t raw_size;
     if (file_size(bs->fd, &raw_size) != 0)
@@ -2699,7 +2781,7 @@ int bstack_try_extend_sparse_batched(bstack_t *bs, uint64_t s,
     }
     uint64_t new_len = data_size + length;
 
-    if (commit_sparse_extend(bs, data_size, raw_size, new_len, w, n) != 0)
+    if (mark_replay(bs, commit_sparse_extend(bs, data_size, raw_size, new_len, w, n)) != 0)
         goto fail;
 
     BS_WRUNLOCK(bs); free(w);
@@ -2720,7 +2802,7 @@ int bstack_ensure_with(bstack_t *bs, uint64_t target,
                        int (*cb)(uint8_t *buf, size_t len, void *ctx),
                        void *ctx, uint64_t *out_initial_len)
 {
-    BS_WRLOCK(bs);
+    BS_WRLOCK_REPLAY(bs);
 
     uint64_t raw_size;
     if (file_size(bs->fd, &raw_size) != 0)
@@ -2753,22 +2835,23 @@ int bstack_ensure_with(bstack_t *bs, uint64_t target,
         goto fail_unlock;
     }
 
-    if (plat_pwrite(bs->fd, buf, growth, raw_size) != 0) {
+    if (mark_replay(bs, plat_pwrite(bs->fd, buf, growth, raw_size)) != 0) {
         free(buf);
-        plat_ftruncate(bs->fd, raw_size);
+        mark_replay(bs, plat_ftruncate(bs->fd, raw_size));
         goto fail_unlock;
     }
     free(buf);
 
-    if (write_committed_len(bs->fd, &bs->clen, target) != 0 ||
-        plat_durable_sync(bs->fd) != 0)
+    if (mark_replay(bs, write_committed_len(bs->fd, &bs->clen, target)) != 0 ||
+                        mark_replay(bs, plat_durable_sync(bs->fd)) != 0)
     {
         /* Best-effort rollback. The cache is reset up front so it reflects
          * the rolled-back file even if the header rewrite below fails. */
-        plat_ftruncate(bs->fd, raw_size);
+        int rb_ = plat_ftruncate(bs->fd, raw_size);
         bs->clen = data_size;
-        write_committed_len(bs->fd, &bs->clen, data_size);
-        plat_durable_sync(bs->fd);
+        rb_ |= write_committed_len(bs->fd, &bs->clen, data_size);
+        rb_ |= plat_durable_sync(bs->fd);
+        mark_replay(bs, rb_);
         goto fail_unlock;
     }
 
@@ -2791,7 +2874,7 @@ int bstack_get_batched(bstack_t *bs,
     if (n_entries == 0)
         return 0;
 
-    BS_RDLOCK(bs);
+    BS_RDLOCK_INTACT(bs);
 
     uint64_t raw_size;
     if (file_size(bs->fd, &raw_size) != 0)
@@ -2831,7 +2914,7 @@ int bstack_get_batched_gen(bstack_t *bs,
                                       size_t *out_len, void *ctx),
                            void *ctx)
 {
-    BS_RDLOCK(bs);
+    BS_RDLOCK_INTACT(bs);
 
     uint64_t raw_size;
     if (file_size(bs->fd, &raw_size) != 0)
@@ -2892,7 +2975,7 @@ int bstack_swap(bstack_t *bs, uint64_t offset,
     }
     uint64_t end = offset + (uint64_t)len;
 
-    BS_WRLOCK(bs);
+    BS_WRLOCK_REPLAY(bs);
     
     /* Load locked under the write lock (see bstack_set for rationale). */
     uint64_t locked = ATOMIC_LOAD_ACQUIRE(&bs->locked);
@@ -2915,7 +2998,7 @@ int bstack_swap(bstack_t *bs, uint64_t offset,
 
     if (plat_pread(bs->fd, old_buf, len, HEADER_SIZE + offset) != 0)
         goto fail_unlock;
-    if (set_in_place(bs->fd, data_size, offset, new_buf, len) != 0)
+    if (mark_replay(bs, set_in_place(bs->fd, data_size, offset, new_buf, len)) != 0)
         goto fail_unlock;
 
     BS_WRUNLOCK(bs);
@@ -2940,7 +3023,7 @@ int bstack_cas(bstack_t *bs, uint64_t offset,
     }
     uint64_t end = offset + (uint64_t)len;
 
-    BS_WRLOCK(bs);
+    BS_WRLOCK_REPLAY(bs);
     
     /* Load locked under the write lock (see bstack_set for rationale). */
     uint64_t locked = ATOMIC_LOAD_ACQUIRE(&bs->locked);
@@ -2981,7 +3064,7 @@ int bstack_cas(bstack_t *bs, uint64_t offset,
     }
 
     /* All bytes matched — crash-atomically write new_buf. */
-    if (set_in_place(bs->fd, data_size, offset, new_buf, len) != 0)
+    if (mark_replay(bs, set_in_place(bs->fd, data_size, offset, new_buf, len)) != 0)
         goto fail_unlock;
 
     BS_WRUNLOCK(bs);
@@ -3003,7 +3086,7 @@ int bstack_process(bstack_t *bs, uint64_t start, uint64_t end,
     }
     uint64_t n = end - start;
 
-    BS_WRLOCK(bs);
+    BS_WRLOCK_REPLAY(bs);
     
     /* Load locked under the write lock (see bstack_set for rationale). */
     uint64_t locked = ATOMIC_LOAD_ACQUIRE(&bs->locked);
@@ -3041,7 +3124,7 @@ int bstack_process(bstack_t *bs, uint64_t start, uint64_t end,
     }
 
     if (n > 0) {
-        if (set_in_place(bs->fd, data_size, start, buf, (size_t)n) != 0) {
+        if (mark_replay(bs, set_in_place(bs->fd, data_size, start, buf, (size_t)n)) != 0) {
             free(buf);
             goto fail_unlock;
         }
@@ -3060,7 +3143,7 @@ int bstack_process_gen(bstack_t *bs,
                        int (*gen)(bstack_gen_op_t *out_op, void *ctx),
                        void *ctx)
 {
-    BS_WRLOCK(bs);
+    BS_WRLOCK_REPLAY(bs);
 
     uint64_t raw_size;
     if (file_size(bs->fd, &raw_size) != 0)
@@ -3120,8 +3203,8 @@ int bstack_process_gen(bstack_t *bs,
                 BS_WRUNLOCK(bs); errno = EINVAL; return -1;
             }
             if (len > 0) {
-                if (set_in_place(bs->fd, data_size, offset,
-                                 op.u.write.data, len) != 0)
+                if (mark_replay(bs, set_in_place(bs->fd, data_size, offset,
+                                                 op.u.write.data, len)) != 0)
                     goto fail_unlock;
             }
             BS_WRUNLOCK(bs);
@@ -3153,8 +3236,8 @@ int bstack_process_gen(bstack_t *bs,
 
             if (len > 0) {
                 /* Crash-atomic exchange journal (as bstack_cross_exchange). */
-                if (journaled_exchange(bs->fd, data_size,
-                                       a_offset, b_offset, len) != 0)
+                if (mark_replay(bs, journaled_exchange(bs->fd, data_size,
+                                                       a_offset, b_offset, len)) != 0)
                     goto fail_unlock;
             }
             BS_WRUNLOCK(bs);
@@ -3165,22 +3248,23 @@ int bstack_process_gen(bstack_t *bs,
             size_t   len  = op.u.push.len;
             if (len > 0) {
                 uint64_t raw_size_now = HEADER_SIZE + data_size;
-                if (plat_pwrite(bs->fd, data, len, raw_size_now) != 0) {
-                    plat_ftruncate(bs->fd, raw_size_now);
+                if (mark_replay(bs, plat_pwrite(bs->fd, data, len, raw_size_now)) != 0) {
+                    mark_replay(bs, plat_ftruncate(bs->fd, raw_size_now));
                     goto fail_unlock;
                 }
                 uint64_t new_len = data_size + (uint64_t)len;
-                if (write_committed_len(bs->fd, &bs->clen, new_len) != 0 ||
-                    plat_durable_sync(bs->fd) != 0)
+                if (mark_replay(bs, write_committed_len(bs->fd, &bs->clen, new_len)) != 0 ||
+                                    mark_replay(bs, plat_durable_sync(bs->fd)) != 0)
                 {
                     /* Rollback: remove written data and reset committed
                      * length. The cache is reset up front so it reflects
                      * the rolled-back file even if the header rewrite below
                      * fails. */
-                    plat_ftruncate(bs->fd, raw_size_now);
+                    int rb_ = plat_ftruncate(bs->fd, raw_size_now);
                     bs->clen = data_size;
-                    write_committed_len(bs->fd, &bs->clen, data_size);
-                    plat_durable_sync(bs->fd);
+                    rb_ |= write_committed_len(bs->fd, &bs->clen, data_size);
+                    rb_ |= plat_durable_sync(bs->fd);
+                    mark_replay(bs, rb_);
                     goto fail_unlock;
                 }
             }
@@ -3205,15 +3289,15 @@ int bstack_process_gen(bstack_t *bs,
                     if (plat_pread(bs->fd, buf, len, read_offset) != 0)
                         goto fail_unlock;
                 }
-                if (plat_ftruncate(bs->fd, HEADER_SIZE + new_len) != 0)
+                if (mark_replay(bs, plat_ftruncate(bs->fd, HEADER_SIZE + new_len)) != 0)
                     goto fail_unlock;
                 /* The truncation is the commit point: the tail bytes are
                  * gone and recovery would adopt the smaller file size, so
                  * update the cache now — before the header write, which can
                  * fail and skip it. */
                 bs->clen = new_len;
-                if (write_committed_len(bs->fd, &bs->clen, new_len) != 0 ||
-                    plat_durable_sync(bs->fd) != 0)
+                if (mark_replay(bs, write_committed_len(bs->fd, &bs->clen, new_len)) != 0 ||
+                                    mark_replay(bs, plat_durable_sync(bs->fd)) != 0)
                     goto fail_unlock;
             }
             BS_WRUNLOCK(bs);
@@ -3240,9 +3324,9 @@ int bstack_process_gen(bstack_t *bs,
                                    HEADER_SIZE + new_tail_start) != 0)
                         goto fail_unlock;
                 }
-                if (commit_tail_replace(bs->fd, &bs->clen, new_tail_start,
-                                        (uint64_t)n, new_buf, (uint64_t)new_len,
-                                        HEADER_SIZE + data_size) != 0)
+                if (mark_replay(bs, commit_tail_replace(bs->fd, &bs->clen, new_tail_start,
+                                                        (uint64_t)n, new_buf, (uint64_t)new_len,
+                                                        HEADER_SIZE + data_size)) != 0)
                     goto fail_unlock;
             }
             BS_WRUNLOCK(bs);
@@ -3280,8 +3364,8 @@ int bstack_process_gen(bstack_t *bs,
                     BS_WRUNLOCK(bs); errno = EINVAL; return -1;
                 }
                 uint64_t new_len = data_size + length;
-                if (commit_sparse_extend(bs, data_size, raw_size, new_len,
-                                         w, n) != 0) {
+                if (mark_replay(bs, commit_sparse_extend(bs, data_size, raw_size, new_len,
+                                                         w, n)) != 0) {
                     int saved = errno;
                     free(w);
                     errno = saved;
@@ -3336,7 +3420,7 @@ int bstack_set_batched(bstack_t *bs, const bstack_iovec_t *writes, size_t count)
     }
     if (n == 0) { free(w); return 0; }
 
-    BS_WRLOCK(bs);
+    BS_WRLOCK_REPLAY(bs);
 
     /* Load locked under the write lock (see bstack_set for rationale). */
     uint64_t locked = ATOMIC_LOAD_ACQUIRE(&bs->locked);
@@ -3356,7 +3440,7 @@ int bstack_set_batched(bstack_t *bs, const bstack_iovec_t *writes, size_t count)
     /* A lone write cannot overlap anything and is already atomic on its own, so
      * skip the overlap scan and the multi-write journal. */
     if (n == 1) {
-        if (set_in_place(bs->fd, data_size, w[0].offset, w[0].buf, w[0].len) != 0)
+        if (mark_replay(bs, set_in_place(bs->fd, data_size, w[0].offset, w[0].buf, w[0].len)) != 0)
             goto fail;
         BS_WRUNLOCK(bs);
         free(w);
@@ -3371,7 +3455,7 @@ int bstack_set_batched(bstack_t *bs, const bstack_iovec_t *writes, size_t count)
         if (a_end > w[i + 1].offset) goto fail_einval;
     }
 
-    if (journaled_multi_set(bs->fd, data_size, w, n) != 0)
+    if (mark_replay(bs, journaled_multi_set(bs->fd, data_size, w, n)) != 0)
         goto fail;
 
     BS_WRUNLOCK(bs);
@@ -3511,7 +3595,7 @@ int bstack_inplace_gen(bstack_t *bs,
                        int (*gen)(bstack_gen_op_t *out_op, void *ctx),
                        void *ctx, int *prev_status)
 {
-    BS_WRLOCK(bs);
+    BS_WRLOCK_REPLAY(bs);
 
     uint64_t raw_size;
     if (file_size(bs->fd, &raw_size) != 0)
@@ -3601,10 +3685,10 @@ int bstack_inplace_gen(bstack_t *bs,
     {
         int rc = 0;
         if (ov_count == 1) {
-            rc = set_in_place(bs->fd, data_size, overlay[0].offset,
-                              overlay[0].buf, overlay[0].len);
+            rc = mark_replay(bs, set_in_place(bs->fd, data_size, overlay[0].offset,
+                                              overlay[0].buf, overlay[0].len));
         } else if (ov_count > 1) {
-            rc = journaled_multi_set(bs->fd, data_size, overlay, ov_count);
+            rc = mark_replay(bs, journaled_multi_set(bs->fd, data_size, overlay, ov_count));
         }
         if (rc != 0)
             goto fail_free;
@@ -3638,7 +3722,7 @@ int bstack_cross_exchange(bstack_t *bs, uint64_t a, uint64_t b, uint64_t n)
         }
     }
 
-    BS_WRLOCK(bs);
+    BS_WRLOCK_REPLAY(bs);
 
     uint64_t locked = ATOMIC_LOAD_ACQUIRE(&bs->locked);
     if (a < locked) { BS_WRUNLOCK(bs); errno = EINVAL; return -1; }
@@ -3659,7 +3743,7 @@ int bstack_cross_exchange(bstack_t *bs, uint64_t a, uint64_t b, uint64_t n)
 
     /* Crash-atomic exchange through the write-in-progress journal (O(1)
      * memory): stage A's bytes, then commit at a single wip_ptr flip A -> B. */
-    if (journaled_exchange(bs->fd, data_size, a, b, n) != 0)
+    if (mark_replay(bs, journaled_exchange(bs->fd, data_size, a, b, n)) != 0)
         goto fail_unlock;
 
     BS_WRUNLOCK(bs);
@@ -3677,7 +3761,7 @@ int bstack_copy(bstack_t *bs, uint64_t from, uint64_t to, uint64_t n)
     uint64_t from_end = from + n;
     uint64_t to_end   = to   + n;
 
-    BS_WRLOCK(bs);
+    BS_WRLOCK_REPLAY(bs);
 
     uint64_t locked = ATOMIC_LOAD_ACQUIRE(&bs->locked);
     if (to < locked) { BS_WRUNLOCK(bs); errno = EINVAL; return -1; }
@@ -3713,18 +3797,18 @@ int bstack_copy(bstack_t *bs, uint64_t from, uint64_t to, uint64_t n)
         uint8_t *buf = (uint8_t *)malloc((size_t)n);
         if (!buf) goto fail_unlock;
         if (plat_pread(bs->fd,  buf, (size_t)n, HEADER_SIZE + from) != 0 ||
-            plat_pwrite(bs->fd, buf, (size_t)n, HEADER_SIZE + to)   != 0 ||
-            plat_durable_sync(bs->fd) != 0)
+            mark_replay(bs, plat_pwrite(bs->fd, buf, (size_t)n, HEADER_SIZE + to))   != 0 ||
+            mark_replay(bs, plat_durable_sync(bs->fd)) != 0)
         {
             free(buf);
             goto fail_unlock;
         }
         free(buf);
     } else if (from < to_end && to < from_end) {
-        if (journaled_move(bs->fd, data_size, from, to, n) != 0)
+        if (mark_replay(bs, journaled_move(bs->fd, data_size, from, to, n)) != 0)
             goto fail_unlock;
     } else {
-        if (journaled_copy(bs->fd, data_size, from, to, n) != 0)
+        if (mark_replay(bs, journaled_copy(bs->fd, data_size, from, to, n)) != 0)
             goto fail_unlock;
     }
 
@@ -3796,15 +3880,17 @@ static int crds_compare_a_masked(bstack_fd_t fd,
  * When matched == 1, reads b_len bytes at b_offset into b_old_buf, writes
  * b_new_buf, and syncs.  Caller holds the write lock.
  * Returns 0 on success, -1 on I/O error. */
-static int crds_do_swap(bstack_fd_t fd, uint64_t data_size,
+static int crds_do_swap(bstack_t *bs, uint64_t data_size,
                         uint64_t b_offset, uint8_t *b_old_buf,
                         const uint8_t *b_new_buf, size_t b_len)
 {
     if (b_len == 0)
         return 0;
-    if (plat_pread(fd, b_old_buf, b_len, HEADER_SIZE + b_offset) != 0)
+    /* The read is not wrapped: a read that fails changes nothing on disk. */
+    if (plat_pread(bs->fd, b_old_buf, b_len, HEADER_SIZE + b_offset) != 0)
         return -1;
-    return set_in_place(fd, data_size, b_offset, b_new_buf, b_len);
+    return mark_replay(bs, set_in_place(bs->fd, data_size, b_offset,
+                                        b_new_buf, b_len));
 }
 
 /* Common setup for all CRDS operations: validates bounds and locked region,
@@ -3825,7 +3911,7 @@ static int crds_setup(bstack_t *bs,
     *out_a_end = a_offset + (uint64_t)a_len;
     *out_b_end = b_offset + (uint64_t)b_len;
 
-    BS_WRLOCK(bs);
+    BS_WRLOCK_REPLAY(bs);
 
     uint64_t locked = ATOMIC_LOAD_ACQUIRE(&bs->locked);
     if (b_len > 0 && b_offset < locked) {
@@ -3872,7 +3958,7 @@ int bstack_eq_crds(bstack_t *bs,
     if (cmp < 0)  goto fail_unlock;
     if (cmp == 0) { BS_WRUNLOCK(bs); if (ok) *ok = 0; return 0; }
 
-    if (crds_do_swap(bs->fd, data_size, b_offset, b_old_buf, b_new_buf, b_len) != 0)
+    if (crds_do_swap(bs, data_size, b_offset, b_old_buf, b_new_buf, b_len) != 0)
         goto fail_unlock;
 
     BS_WRUNLOCK(bs);
@@ -3900,7 +3986,7 @@ int bstack_ne_crds(bstack_t *bs,
     if (cmp < 0)  goto fail_unlock;
     if (cmp == 1) { BS_WRUNLOCK(bs); if (ok) *ok = 0; return 0; }
 
-    if (crds_do_swap(bs->fd, data_size, b_offset, b_old_buf, b_new_buf, b_len) != 0)
+    if (crds_do_swap(bs, data_size, b_offset, b_old_buf, b_new_buf, b_len) != 0)
         goto fail_unlock;
 
     BS_WRUNLOCK(bs);
@@ -3929,7 +4015,7 @@ int bstack_masked_eq_crds(bstack_t *bs,
     if (cmp < 0)  goto fail_unlock;
     if (cmp == 0) { BS_WRUNLOCK(bs); if (ok) *ok = 0; return 0; }
 
-    if (crds_do_swap(bs->fd, data_size, b_offset, b_old_buf, b_new_buf, b_len) != 0)
+    if (crds_do_swap(bs, data_size, b_offset, b_old_buf, b_new_buf, b_len) != 0)
         goto fail_unlock;
 
     BS_WRUNLOCK(bs);
@@ -3958,7 +4044,7 @@ int bstack_masked_ne_crds(bstack_t *bs,
     if (cmp < 0)  goto fail_unlock;
     if (cmp == 1) { BS_WRUNLOCK(bs); if (ok) *ok = 0; return 0; }
 
-    if (crds_do_swap(bs->fd, data_size, b_offset, b_old_buf, b_new_buf, b_len) != 0)
+    if (crds_do_swap(bs, data_size, b_offset, b_old_buf, b_new_buf, b_len) != 0)
         goto fail_unlock;
 
     BS_WRUNLOCK(bs);

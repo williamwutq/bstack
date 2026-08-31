@@ -31,6 +31,25 @@
  *              another process holds the exclusive lock.
  * All other functions return 0 on success, -1 on failure with errno set.
  *
+ * Deferred replay
+ * ---------------
+ * A bstack_t stays usable after a write fails, with no reopen: the next write
+ * repairs the file before doing anything else, and reads refuse until it has.
+ *
+ * A write that fails after its first mutating I/O can leave the states open-time
+ * recovery handles — an armed journal, or a stale tail past clen — on a handle
+ * that stays open.  The failed call returns -1 with its own errno and the repair
+ * is deferred to the next write, through an in-memory replay_needed flag held
+ * under the same rwlock as the file descriptor.  While it is set:
+ *   - any write replays silently and clears the flag, before validating its own
+ *     arguments, then proceeds normally;
+ *   - any read fails with errno = BSTACK_EREPLAY, including bstack_len,
+ *     bstack_is_empty, bstack_lock_up_to, and bstack_try_discard(s, 0);
+ *   - a read that returns before taking the lock, and a lock-free read inside
+ *     the locked prefix, are unaffected.
+ * A replay that fails returns its own errno and leaves the flag set, for the
+ * write after it to try again.
+ *
  * Thread safety
  * -------------
  * On Unix a pthread_rwlock protects each handle; on Windows an SRWLOCK is
@@ -84,6 +103,16 @@
 #else
 #define BSTACK_WARN_UNUSED_RESULT
 #endif
+
+/*
+ * BSTACK_EREPLAY — the errno value a read reports while an interrupted write is
+ * pending replay (see "Deferred replay" above).  Sits above the range the
+ * platform uses for its own E* codes, so it can never be confused with a
+ * genuine syscall failure and no existing errno has to be borrowed for a
+ * condition it does not describe.  strerror() does not know it; print something
+ * like "bstack: interrupted write pending replay" instead.
+ */
+#define BSTACK_EREPLAY 0x4123
 
 typedef struct bstack bstack_t;
 
