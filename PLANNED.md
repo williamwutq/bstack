@@ -265,27 +265,6 @@ Only the API is gated. `MultiAtrunc` recovery is ungated in `io_core`, and the m
 
 ---
 
-## `BStackBulkAllocator` for `SegregatedBStackAllocator`
-
-**Feature flag:** `alloc` + `set`.
-**Breaking change:** No
-
-### Motivation
-
-A bulk request spanning 33 size classes currently degrades to `n` independent `alloc`/`dealloc` calls, each with its own free-list splice and sync. The class structure makes the batched form strictly better: work is bounded by the number of *distinct classes touched* (≤ 33), not by `n`.
-
-### Design
-
-- `alloc_bulk`: classify every request by the existing register arithmetic, group by class, pop a run per class, and serve the misses with one `extend_sparse` for the summed tail growth.
-- `dealloc_bulk`: read each handle's recorded physical size from its in-use overhead word to recover its class, build per-class chains in memory, and push one chain per class.
-- Atomicity across classes falls out of the header layout: `head_off(class) = FREE_HEAD_BASE + class · 8`, so all 33 class heads are one contiguous 264-byte array and every affected head can be rewritten in a **single `set`**. The per-block link and overhead writes join one `set_batched` with it, giving the trait's all-or-nothing contract in one journal arm.
-
-### Open questions
-
-- Whether the oversized bucket, which is heterogeneous and matched by stored physical size rather than class, can participate in the same batch or must stay a separate step.
-
----
-
 ## `SegregatedBStackAllocator` background coalescer
 
 **Feature flag:** `alloc` + `set`; the merge splices require `atomic`.
