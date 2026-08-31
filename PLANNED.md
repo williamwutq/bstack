@@ -373,3 +373,39 @@ Deciding this early is cheap. The module is four traits and four derived methods
 - **What the atomic markers mean inside a transaction.** Their contract is per write call; under a transaction the atomic unit is the whole commit. Either the marker means something different there, or it does not apply — and if the transaction is the answer to cross-boundary atomicity, the markers may have no remaining purpose.
 - **Relationship to the transaction entry.** This supersedes that entry's `guarded` interaction open question; the two should not be resolved independently.
 
+---
+
+## `CycleSwap` — a journal mode for cyclic multi-region swaps (0.5.0)
+
+**Feature flag:** `set` + `atomic`.
+**Breaking change:** Yes (0.5.0) — a new `wip_aux` mode, so the magic bumps.
+
+### Motivation
+
+`cross_exchange` swaps two regions atomically. A three-way rotation — `a → b → c → a`, as a sort or a free-list reorder produces — has no single-call form today, and running it as three `cross_exchange` calls exposes intermediate states to a crash. The generator cannot help: `process_gen` allows at most one mutating step.
+
+Rotation is the right primitive because it is the only one needed. Any rearrangement of `k` regions is a map `s` on slot indices — the content in slot `i` ends up in slot `s(i)` — and it is a bijection, since every slot ends up holding exactly one region's content. Pick any slot `i` and follow it: `i`, `s(i)`, `s(s(i))`, … There are finitely many slots, so some value repeats, and the first repeat must be `i` itself — if `s^a(i) = s^b(i)` with `a < b`, injectivity cancels `s^a` and gives `s^(b-a)(i) = i`. That orbit is therefore a cycle, and `s` restricted to it is a rotation. Orbits partition the slots (following `s` forward or backward from a shared member reaches the same set), so `s` is a set of disjoint rotations, and disjoint slots mean disjoint bytes. A 2-cycle is a plain swap and a 1-cycle is a no-op, so `cross_exchange` and "leave it alone" are the two smallest cases of this mode.
+
+The decomposition is per cycle, not per permutation: each rotation is atomic on its own, and a caller that needs a whole multi-cycle permutation to land as one unit needs `BStackTransaction`.
+
+### Design
+
+```rust
+pub fn cross_rotate(&self, offsets: &[u64], n: u64) -> io::Result<()>;
+```
+
+Rotates `k` disjoint equal-length regions: the content of `offsets[i]` moves to `offsets[i + 1]`, and the last to `offsets[0]`. `k == 2` is a plain swap and delegates to the existing exchange journal; `k < 2` is a no-op.
+
+- `wip_aux = u64::MAX - 7`, continuing the decrementing sequence (`u64::MAX - 6` if `MultiAtrunc` does not land first).
+- Staging: `[n | k | offsets… | snapshot of offsets[k - 1]]` appended at `32 + clen` — one region of bytes, not `k`.
+- Progress is a step counter `s`, carried in the header as `wip_ptr = 32 + offsets[s]`: the destination of the next unperformed copy, non-zero, and matching the convention of the existing modes. `cross_exchange` already advances `wip_ptr` mid-journal for the same reason. Keeping the counter in the header rather than in the staged tail is what makes it non-tearing (WIP.md's first-256-bytes argument) and costs one 8-byte write per step either way.
+- Protocol: stage → sync → arm at `s = k - 1` → sync → then, for `s` from `k - 1` down to `1`: copy `offsets[s - 1]` → `offsets[s]` → sync → write `wip_ptr = 32 + offsets[s - 1]` → sync. The final step copies the staged snapshot to `offsets[0]`. Then disarm → sync → truncate to `32 + clen`.
+- Each step is a **commit point**: the file is at a fully-defined intermediate state of the rotation, and the counter names which step is next. A crash replays exactly one step. Replaying a step is idempotent because its source, `offsets[s - 1]`, is not written until the following step — so the snapshot only ever has to cover `offsets[k - 1]`, the one region overwritten before it is read.
+- Recovery validates `tail_len == 16 + 8 * k + n`, `n > 0`, `k >= 2`, `wip_ptr - 32` present in the staged offset list, every `offset + n <= clen`, and pairwise disjointness, then resumes at `s`. `clen` never changes, so the mode overwrites committed bytes before its commit point and WIP.md's Rule 2 applies — which is why the format changes.
+
+Cost is `n` staged bytes and `2k` syncs. Staging is independent of `k`, so rotating a hundred megabyte-sized regions stages one megabyte rather than a hundred. The mode defines exactly one protocol and one recovery path; a caller that would rather stage every region and land them in one shot is describing a `MultiWrite`, which already exists, and that choice belongs in the `BStack` method, not in the journal.
+
+### Open questions
+
+- **A `BStackGenOp` variant.** `process_gen` already ends in at most one mutating step, and `Swap` there is the two-region case of this mode, so a `Rotate { offsets, n }` variant would fit the existing shape — a generator could read the regions it wants to reorder and end by rotating them under the same lock. Whether the borrow of an offset slice works inside `BStackGenOp`'s single caller-chosen `'a` is the open part.
+- **Arbitrary permutations.** A general permutation decomposes into disjoint cycles, so the mode could take a full mapping and rotate each cycle. Whether that belongs here or in `BStackTransaction`, which can already express it, is undecided.
