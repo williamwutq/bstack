@@ -3,6 +3,10 @@ use super::{
     BStackUninitAllocator, ensure_own_handle,
 };
 use crate::BStack;
+#[cfg(feature = "atomic")]
+use crate::BStackGenOp;
+#[cfg(feature = "atomic")]
+use crate::{bstack_unsafe_reborrow, bstack_unsafe_reborrow_mut};
 #[cfg(not(feature = "atomic"))]
 use std::cell::Cell;
 use std::fmt;
@@ -11,6 +15,20 @@ use std::io;
 use std::marker::PhantomData;
 #[cfg(feature = "atomic")]
 use std::sync::Mutex;
+
+/// Bail out of the enclosing `inplace_gen` generator closure with an error — the
+/// corruption/abort path used across the atomic free-list code. Takes the same
+/// arguments as [`io_error!`] (an [`io::ErrorKind`] variant name plus a message
+/// or format string) and expands to
+/// `return Some(BStackGenOp::Abort { source: Some(io_error!(..)) })`.
+#[cfg(feature = "atomic")]
+macro_rules! gen_abort {
+    ($kind:ident, $($arg:tt)+) => {
+        return ::core::option::Option::Some($crate::BStackGenOp::Abort {
+            source: ::core::option::Option::Some(io_error!($kind, $($arg)+)),
+        })
+    };
+}
 
 /// Full magic for FirstFitBStackAllocator
 #[cfg(feature = "set")]
@@ -184,8 +202,11 @@ impl FirstFitBStackAllocator {
     const HEADER_SIZE: u64 = 32;
     const BLOCK_HEADER_SIZE: u64 = 16;
     const BLOCK_FOOTER_SIZE: u64 = 8;
+    const ARENA_START: u64 = Self::OFFSET_SIZE + Self::HEADER_SIZE;
     const BLOCK_OVERHEAD_SIZE: u64 = Self::BLOCK_HEADER_SIZE + Self::BLOCK_FOOTER_SIZE;
     const MIN_BLOCK_PAYLOAD_SIZE: u64 = 16;
+    #[cfg(feature = "atomic")]
+    const MIN_BLOCK_ON_DISK_SIZE: u64 = Self::MIN_BLOCK_PAYLOAD_SIZE + Self::BLOCK_OVERHEAD_SIZE;
     // Absolute payload offset of the free_head field in the allocator header:
     // OFFSET_SIZE(16) + magic(8) + flags(4) + _reserved(4) = 32
     const FREE_HEAD_OFFSET: u64 = Self::OFFSET_SIZE + 16;
@@ -332,7 +353,8 @@ impl FirstFitBStackAllocator {
 
     /// Check if a block size is impossible given the allocator's invariants and the stack length.
     ///
-    /// Includes the multiple of 8 alignment invariant
+    /// Includes the multiple of 8 alignment invariant. This function calls len(), which potentially
+    /// does IO and aquires lock.
     #[inline]
     fn is_impossible_block_size(&self, size: u64) -> bool {
         size < Self::MIN_BLOCK_PAYLOAD_SIZE || size > self.len().unwrap_or(u64::MAX)
@@ -340,7 +362,8 @@ impl FirstFitBStackAllocator {
 
     /// Check if a block start is impossible given the allocator's invariants and the stack length.
     ///
-    /// Includes the multiple of 8 alignment invariant
+    /// Includes the multiple of 8 alignment invariant. This function calls len(), which potentially
+    /// does IO and aquires lock.
     #[inline]
     fn is_impossible_block_start(&self, start: u64) -> bool {
         !start.is_multiple_of(8)
@@ -350,14 +373,73 @@ impl FirstFitBStackAllocator {
 
     /// Check if a block end offset is impossible given the allocator's invariants and the stack length.
     ///
-    /// Does not include multiple of 8 alignment
+    /// Does not include multiple of 8 alignment. This function calls len(), which potentially
+    /// does IO and aquires lock.
     #[inline]
     fn is_impossible_block_end(&self, end: u64) -> bool {
-        end < Self::OFFSET_SIZE
-            + Self::HEADER_SIZE
-            + Self::BLOCK_HEADER_SIZE
-            + Self::MIN_BLOCK_PAYLOAD_SIZE
+        end < Self::ARENA_START + Self::BLOCK_HEADER_SIZE + Self::MIN_BLOCK_PAYLOAD_SIZE
             || end > self.len().unwrap_or(u64::MAX) - Self::BLOCK_FOOTER_SIZE
+    }
+
+    /// Whether the block `header` at `header_start` (its first 16 bytes:
+    /// `size` + `flags`) describes a valid **free** block that fits within
+    /// `stack_len`: the `is_free` flag is set, the size is a multiple of 8 at
+    /// least [`MIN_BLOCK_PAYLOAD_SIZE`](Self::MIN_BLOCK_PAYLOAD_SIZE), and the
+    /// whole block (header + payload + footer) lies within the stack.
+    #[inline]
+    fn is_free_block(header_start: u64, header: &[u8], stack_len: u64) -> bool {
+        let size = read_buf_le!(header, 0 => u64);
+        header[8] & 1 != 0
+            && size >= Self::MIN_BLOCK_PAYLOAD_SIZE
+            && size.is_multiple_of(8)
+            && size
+                <= stack_len
+                    .saturating_sub(header_start)
+                    .saturating_sub(Self::BLOCK_OVERHEAD_SIZE)
+    }
+
+    /// Whether an on-disk block size, obtained either from user or on disk read is possible:
+    /// aligned to 8 and at least [`MIN_BLOCK_PAYLOAD_SIZE`](Self::MIN_BLOCK_PAYLOAD_SIZE).
+    /// This is the payload size, not the on disk size, which is this plus
+    /// [`BLOCK_OVERHEAD_SIZE`](Self::BLOCK_OVERHEAD_SIZE)
+    #[cfg(feature = "atomic")]
+    #[inline(always)]
+    fn is_possible_block_size(size: u64) -> bool {
+        size.is_multiple_of(8) && size >= Self::MIN_BLOCK_PAYLOAD_SIZE
+    }
+
+    /// Whether an on-disk block pointer, obtained either from user, on disk read, or free list,
+    /// is possible: an aligned payload offset whose 16 bytes of ptr words that is outside
+    /// the protected header region. This check may have false positives, but never false negatives
+    #[cfg(feature = "atomic")]
+    #[inline(always)]
+    fn is_possible_block_ptr(ptr: u64) -> bool {
+        ptr.is_multiple_of(8) && ptr >= Self::ARENA_START + Self::BLOCK_HEADER_SIZE
+    }
+
+    /// Whether an on-disk block pointer, obtained either from user, on disk read, or free list,
+    /// is in bounds: an aligned payload offset whose 16 bytes of ptr words fit within `stack_len`
+    /// A larger value is corrupt.
+    ///
+    /// Stack length must be checked to be larger than [`ARENA_START`](Self::ARENA_START)
+    /// before this call, otherwise may overflow
+    #[cfg(feature = "atomic")]
+    #[inline]
+    fn is_real_block_ptr(ptr: u64, stack_len: u64) -> bool {
+        Self::is_possible_block_ptr(ptr)
+            && ptr <= stack_len - (Self::BLOCK_FOOTER_SIZE + Self::MIN_BLOCK_PAYLOAD_SIZE)
+    }
+
+    /// Whether an on-disk free list next/prev pointer is in bounds: the null terminator,
+    /// or an aligned payload offset whose 16 bytes of ptr words fit within `stack_len`.
+    /// A larger value is corrupt.
+    ///
+    /// Stack length must be checked to be larger than [`ARENA_START`](Self::ARENA_START)
+    /// before this call, otherwise may overflow
+    #[cfg(feature = "atomic")]
+    #[inline(always)]
+    fn is_valid_link_ptr(ptr: u64, stack_len: u64) -> bool {
+        ptr == 0 || Self::is_real_block_ptr(ptr, stack_len)
     }
 
     /// Align a requested payload length to the allocator's block size and alignment requirements.
@@ -384,6 +466,7 @@ impl FirstFitBStackAllocator {
         Ok(())
     }
 
+    #[cfg(not(feature = "atomic"))]
     fn add_to_free_list(&self, block_start: u64) -> io::Result<()> {
         // Add the block at block_start to the head of the free list, coalescing adjacent free
         // neighbours first. This involves:
@@ -411,44 +494,40 @@ impl FirstFitBStackAllocator {
         self.stack.set(block_header_start + 8, 1u32.to_le_bytes())?;
 
         // Coalesce right: absorb the immediately following block if it is free
-        let next_header = block_header_start + Self::BLOCK_OVERHEAD_SIZE + size;
-        if next_header + Self::BLOCK_HEADER_SIZE <= stack_len {
-            let mut next_hdr = [0u8; 16];
-            self.stack.get_into(next_header, &mut next_hdr)?;
-            let next_size = read_buf_le!(next_hdr, 0 => u64);
-            if next_hdr[8] & 1 != 0
-                && next_size >= Self::MIN_BLOCK_PAYLOAD_SIZE
-                && next_size % 8 == 0
-                && next_header + Self::BLOCK_OVERHEAD_SIZE + next_size <= stack_len
-            {
-                self.unlink_from_free_list(next_header + Self::BLOCK_HEADER_SIZE)?;
-                size += next_size + Self::BLOCK_OVERHEAD_SIZE;
+        let right_header = block_header_start + Self::BLOCK_OVERHEAD_SIZE + size;
+        if right_header + Self::BLOCK_HEADER_SIZE <= stack_len {
+            let mut right_hdr = [0u8; 16];
+            self.stack.get_into(right_header, &mut right_hdr)?;
+            let right_size = read_buf_le!(right_hdr, 0 => u64);
+            if Self::is_free_block(right_header, &right_hdr, stack_len) {
+                self.unlink_from_free_list(right_header + Self::BLOCK_HEADER_SIZE)?;
+                size += right_size + Self::BLOCK_OVERHEAD_SIZE;
             }
         }
 
         // Coalesce left: merge into the immediately preceding block if it is free.
         // Use its footer (8 bytes before our header) to locate its header, then cross-check.
         if block_header_start > arena_start {
-            let mut prev_footer_buf = [0u8; 8];
+            let mut left_footer_buf = [0u8; 8];
             self.stack.get_into(
                 block_header_start - Self::BLOCK_FOOTER_SIZE,
-                &mut prev_footer_buf,
+                &mut left_footer_buf,
             )?;
-            let prev_size = u64::from_le_bytes(prev_footer_buf);
-            if prev_size >= Self::MIN_BLOCK_PAYLOAD_SIZE
-                && prev_size % 8 == 0
-                && let Some(prev_header) = block_header_start
-                    .checked_sub(prev_size + Self::BLOCK_OVERHEAD_SIZE)
+            let left_size = u64::from_le_bytes(left_footer_buf);
+            if left_size >= Self::MIN_BLOCK_PAYLOAD_SIZE
+                && left_size % 8 == 0
+                && let Some(left_header) = block_header_start
+                    .checked_sub(left_size + Self::BLOCK_OVERHEAD_SIZE)
                     .filter(|&h| h >= arena_start)
             {
-                let mut prev_hdr = [0u8; 16];
-                self.stack.get_into(prev_header, &mut prev_hdr)?;
-                let prev_hdr_size = read_buf_le!(prev_hdr, 0 => u64);
+                let mut left_hdr = [0u8; 16];
+                self.stack.get_into(left_header, &mut left_hdr)?;
+                let left_hdr_size = read_buf_le!(left_hdr, 0 => u64);
                 // Cross-check: header size must match footer size
-                if prev_hdr[8] & 1 != 0 && prev_hdr_size == prev_size {
-                    self.unlink_from_free_list(prev_header + Self::BLOCK_HEADER_SIZE)?;
-                    size += prev_size + Self::BLOCK_OVERHEAD_SIZE;
-                    result_header_start = prev_header;
+                if left_hdr[8] & 1 != 0 && left_hdr_size == left_size {
+                    self.unlink_from_free_list(left_header + Self::BLOCK_HEADER_SIZE)?;
+                    size += left_size + Self::BLOCK_OVERHEAD_SIZE;
+                    result_header_start = left_header;
                 }
             }
         }
@@ -466,10 +545,10 @@ impl FirstFitBStackAllocator {
         // free_head <------------------- next <- ...
         let mut head_buf = [0u8; 8];
         self.stack.get_into(Self::FREE_HEAD_OFFSET, &mut head_buf)?;
-        let next_block = u64::from_le_bytes(head_buf);
+        let old_head = u64::from_le_bytes(head_buf);
         let mut update_buf = [0u8; 24];
         write_buf!(1u32 => update_buf, 0); // is_free = 1
-        write_buf!(next_block => update_buf, 8); // next_free = old head
+        write_buf!(old_head => update_buf, 8); // next_free = old head
         // update_buf[4..8] = reserved = 0, update_buf[16..24] = prev_free = 0
         self.stack
             .set(result_start - Self::BLOCK_HEADER_SIZE + 8, update_buf)?;
@@ -487,11 +566,436 @@ impl FirstFitBStackAllocator {
         // free_head <- result_block <- next <- ...
         // If this step fails, the forward links are still consistent but the backward link from next to result_block
         // is missing, which can be detected and fixed in recovery. This is similar to the unlink case in unlink_block
-        if next_block != 0 {
-            self.stack.set(next_block + 8, result_start.to_le_bytes())?;
+        if old_head != 0 {
+            self.stack.set(old_head + 8, result_start.to_le_bytes())?;
         }
 
         Ok(())
+    }
+
+    /// Atomic counterpart of [`add_to_free_list`](Self::add_to_free_list) above.
+    ///
+    /// The same probe-and-decide logic runs inside a single [`BStack::inplace_gen`]:
+    /// the write lock is held across every read, each `Read` sees the batch so far
+    /// (so the `free_head` read taken after a coalesce unlink observes the
+    /// post-unlink value, exactly as the sequential body's committed read would),
+    /// and every edit commits as one crash-atomic journal arm. Because reads are
+    /// read-your-writes and a later write wins any overlap, issuing the writes in
+    /// the sequential order lands a byte-identical final state. However, the
+    /// sequential body's early "mark free" write (a crash-mid-coalesce breadcrumb
+    /// for recovery) is dropped, since an all-or-nothing commit never exposes a
+    /// mid-coalesce state and the result block's `is_free` flag is carried in the
+    /// 24-byte flags/links write anyway.
+    ///
+    /// This function fully verifies on disk state and input values, and carries no
+    /// additional invariants of its own that caller must pay attention to.
+    #[cfg(feature = "atomic")]
+    fn add_to_free_list(&self, block_start: u64) -> io::Result<()> {
+        // Check that the input block_start is possible
+        if !Self::is_possible_block_ptr(block_start) {
+            return Err(io_error!(
+                InvalidInput,
+                "add_to_free_list: given block_start is not a valid block start"
+            ));
+        }
+        // This subtraction is safe since block_start >= Self::BLOCK_HEADER_SIZE + Self::ARENA_START
+        let block_header_start = block_start - Self::BLOCK_HEADER_SIZE;
+
+        // Generator phases. `Need*` issues a read and hands control back; the
+        // matching `Have*` consumes the just-filled buffer and decides; `Emit*`
+        // stages one write. `continue` transitions without an op, `return Some`
+        // issues one.
+        enum P {
+            NeedLen,
+            NeedOwnSize,
+            HaveOwnSize,
+            HaveRightHdr,
+            EmitRightB,
+            StartLeft,
+            HaveLeftFtr,
+            HaveLeftHdr,
+            EmitLeftB,
+            NeedFreeHead,
+            EmitHdr,
+            EmitFtr,
+            EmitHead,
+            EmitBack,
+            Done,
+        }
+
+        let mut state = P::NeedLen;
+        let mut stack_len = 0u64;
+        let mut block_size = 0u64;
+        let mut result_header_start = block_header_start;
+        let mut result_start = 0u64;
+        let mut right_header_start = 0u64;
+        let mut left_header_start = 0u64;
+        let mut left_size = 0u64;
+        let mut old_head = 0u64;
+
+        // Where each coalesce unlink writes the *back*-link: the offset of the
+        // `prev_free` word in the unlinked neighbour's successor (`neighbour.next`),
+        // i.e. `&(neighbour.next->prev_free)` == `next + 8`. We store the neighbour's
+        // `prev` there to splice it out. 0 means the neighbour has no successor
+        // (`next == 0`), so the write is skipped — a real link target is never 0.
+        // (The forward-link write, into the predecessor's `next_free` or `free_head`,
+        // is computed as a local in its emit state.)
+        let mut right_next_backlink_off = 0u64;
+        let mut left_next_backlink_off = 0u64;
+
+        // Read scratch. Each read is consumed in its `Have*` state before the buffer
+        // is reused. Each neighbour's header and its free-list links are read together
+        // into a 32-byte buffer (`rd_right`/`rd_left`; header in [0..16], next/prev in
+        // [16..32]) — separate buffers because their unlink writes borrow the link
+        // halves and hold them until the commit. `rd8` backs every scalar read.
+        let mut rd8 = [0u8; 8];
+        let mut rd_right = [0u8; 32];
+        let mut rd_left = [0u8; 32];
+
+        // Write payloads that are not sub-slices of a read buffer: each is filled
+        // once, its `Write` issued once, and never touched again.
+        let mut hdrflags_buf = [0u8; 32];
+        let mut ftr_buf = [0u8; 8];
+        let mut head_buf = [0u8; 8];
+        let mut back_buf = [0u8; 8];
+
+        self.stack.inplace_gen(|feedback| {
+            // A failed read or rejected write must tear the batch down, not commit
+            // a partial one
+            if let Err(e) = feedback {
+                return Some(BStackGenOp::Abort { source: Some(e) });
+            }
+            loop {
+                match state {
+                    P::NeedLen => {
+                        state = P::NeedOwnSize;
+                        return Some(BStackGenOp::Len {
+                            // SAFETY: `stack_len` outlives the call.
+                            out: bstack_unsafe_reborrow_mut!(&mut stack_len),
+                        });
+                    }
+                    P::NeedOwnSize => {
+                        // Guard against a corrupt/too-short stack before touching the
+                        // block: the stack must be long enough to fit at least one block
+                        // because free list only makes sense if we have a block
+                        if stack_len < Self::ARENA_START + Self::MIN_BLOCK_ON_DISK_SIZE {
+                            gen_abort!(
+                                UnexpectedEof,
+                                "add_to_free_list: truncated underlying arena"
+                            );
+                        }
+                        // Guard against invalid block_header_start or corrupt stack.
+                        // The smallest possible block at `block_header_start`
+                        // (header + min payload + footer) must fit within `stack_len`.
+                        // The subtraction here is checked by the previous condition
+                        if !Self::is_real_block_ptr(block_start, stack_len) {
+                            gen_abort!(
+                                InvalidData,
+                                "add_to_free_list: block does not fit within stack"
+                            );
+                        }
+                        state = P::HaveOwnSize;
+                        return Some(BStackGenOp::Read {
+                            offset: block_header_start,
+                            // SAFETY: `rd8` outlives the call; consumed before reuse.
+                            buf: bstack_unsafe_reborrow_mut!(&mut rd8[..]),
+                        });
+                    }
+                    P::HaveOwnSize => {
+                        block_size = u64::from_le_bytes(rd8);
+                        if !Self::is_possible_block_size(block_size) {
+                            gen_abort!(InvalidData, "add_to_free_list: on disk block size corrupt");
+                        }
+                        // stack_len is already checked to be greater than MIN_BLOCK_SIZE + ARENA
+                        // We check that there possibly is a block on the right because if there is,
+                        // the point obtained by block_start + block_size + footer must be at least
+                        // MIN_BLOCK_SIZE from the tail of the stack to leave enough room for a valid
+                        // block. After this check, the addition for right_header is safe since it is bounded
+                        // by the length of the stack.
+                        //
+                        // | current block                | next block >= MIN_BLOCK_SIZE |
+                        // | HEADER | block_size | FOOTER | HEADER |      ?     | FOOTER |
+                        //          ^                     ^                              ^
+                        //          block_start           right_header            stack_len
+                        if block_size
+                            <= (stack_len - Self::MIN_BLOCK_ON_DISK_SIZE - Self::BLOCK_FOOTER_SIZE)
+                                .saturating_sub(block_start)
+                        {
+                            // Read the right neighbour's header and, contiguously, its
+                            // free-list links in one 32-byte read (the `HaveOwnSize`
+                            // guard proved `right_header_start + 40 <= stack_len`).
+                            right_header_start =
+                                block_header_start + Self::BLOCK_OVERHEAD_SIZE + block_size;
+                            state = P::HaveRightHdr;
+                            return Some(BStackGenOp::Read {
+                                offset: right_header_start,
+                                // SAFETY: `rd_right` outlives the call; consumed before reuse.
+                                buf: bstack_unsafe_reborrow_mut!(&mut rd_right[..]),
+                            });
+                        }
+                        // Otherwise, see if we can read left
+                        state = P::StartLeft;
+                        continue;
+                    }
+                    P::HaveRightHdr => {
+                        // Header in rd_right[0..16], links in rd_right[16..32].
+                        if !Self::is_free_block(right_header_start, &rd_right[0..16], stack_len) {
+                            // Right neighbour is not free; try the left.
+                            state = P::StartLeft;
+                            continue;
+                        }
+                        let right_size = read_buf_le!(rd_right, 0 => u64);
+                        // The right neighbour ends at right_header_start + right_size +
+                        // OVERHEAD (safe: is_free_block bounded it within stack_len).
+                        // Accept it only as a plausible block boundary: the stack tail,
+                        // or far enough that a whole block fits after it (a shorter gap
+                        // could not be a valid block).
+                        // NeedOwnSize proved stack_len >= ARENA_START + MIN.
+                        let right_end = right_header_start + right_size + Self::BLOCK_OVERHEAD_SIZE;
+                        if right_end != stack_len
+                            && right_end > stack_len - Self::MIN_BLOCK_ON_DISK_SIZE
+                        {
+                            // Boundary lands in the impossible zone; skip the right
+                            // coalesce and try the left.
+                            state = P::StartLeft;
+                            continue;
+                        }
+                        // `is_free_block` bounded the neighbour within `stack_len`,
+                        // so both sums stay `<= stack_len`.
+                        block_size += right_size + Self::BLOCK_OVERHEAD_SIZE;
+                        // Unlink the right neighbour, whose links are already read:
+                        // next at rd_right[16..24], prev at rd_right[24..32].
+                        let next = read_buf_le!(rd_right, 16 => u64);
+                        let prev = read_buf_le!(rd_right, 24 => u64);
+                        // Both are untrusted on-disk links; reject an out-of-bounds
+                        // one as corruption before it reaches a write offset (also
+                        // guarding `next + 8` from overflow).
+                        if !Self::is_valid_link_ptr(next, stack_len)
+                            || !Self::is_valid_link_ptr(prev, stack_len)
+                        {
+                            gen_abort!(InvalidData, "add_to_free_list: corrupted free-list link");
+                        }
+                        // Forward-link target: the `next_free` word in the right
+                        // neighbour's predecessor (`&(right.prev->next_free)` == `prev`),
+                        // or `free_head` when it has no predecessor. We store the
+                        // neighbour's `next` there to splice it out.
+                        let right_prev_forwardlink_off = if prev != 0 {
+                            prev
+                        } else {
+                            Self::FREE_HEAD_OFFSET
+                        };
+                        // The +8 is safe because is_valid_link_ptr already accepted
+                        // `next` only if it can hold a block (hence its link words).
+                        right_next_backlink_off = if next != 0 { next + 8 } else { 0 };
+                        state = P::EmitRightB;
+                        return Some(BStackGenOp::Write {
+                            offset: right_prev_forwardlink_off,
+                            // SAFETY: `rd_right` outlives the call and is not reused
+                            // after the right read; `[16..24]` is `next`.
+                            data: bstack_unsafe_reborrow!(&rd_right[16..24]),
+                        });
+                    }
+                    P::EmitRightB => {
+                        state = P::StartLeft;
+                        // right_next_backlink_off is either 0 or valid, per last check
+                        if right_next_backlink_off != 0 {
+                            return Some(BStackGenOp::Write {
+                                offset: right_next_backlink_off,
+                                // SAFETY: as above; `[24..32]` is `prev`.
+                                data: bstack_unsafe_reborrow!(&rd_right[24..32]),
+                            });
+                        }
+                        continue;
+                    }
+                    P::StartLeft => {
+                        // Coalesce left: the left neighbour's block ends where ours
+                        // begins. Read its footer (the 8 bytes before our header) for
+                        // its size, walk back to its header, and confirm it is free.
+                        // Only probed when a whole min block can precede us.
+                        //
+                        // | left block, >= MIN_BLOCK_ON_DISK_SIZE (40) | current block ...
+                        // | HEADER |    left payload    | FOOTER       | HEADER | block_size ...
+                        // ^                             ^              ^
+                        // left_header_start     footer read here       block_header_start
+                        // (>= ARENA_START)      (= bhs - FOOTER)
+                        if block_header_start >= Self::ARENA_START + Self::MIN_BLOCK_ON_DISK_SIZE {
+                            state = P::HaveLeftFtr;
+                            return Some(BStackGenOp::Read {
+                                // This subtraction is obvious safe thanks to the check above
+                                offset: block_header_start - Self::BLOCK_FOOTER_SIZE,
+                                // SAFETY: `rd8` outlives the call; consumed before reuse.
+                                buf: bstack_unsafe_reborrow_mut!(&mut rd8[..]),
+                            });
+                        }
+                        state = P::NeedFreeHead;
+                        continue;
+                    }
+                    P::HaveLeftFtr => {
+                        // Left neighbour's size, read from its footer (the 8 bytes
+                        // before our header); confirmed against its header below.
+                        left_size = u64::from_le_bytes(rd8);
+                        // The neighbour spans HEADER + left_size + FOOTER and ends at
+                        // our header, so its header is at
+                        // block_header_start - left_size - OVERHEAD.
+                        //
+                        // | left block                        | current ...
+                        // | HEADER | left_size | FOOTER       | HEADER ...
+                        // ^                                   ^
+                        // left_header_start                   block_header_start
+                        //
+                        // `block_header_start - OVERHEAD` is in range (block_header_start
+                        // >= ARENA_START > OVERHEAD); the saturating sub yields 0 for a
+                        // `left_size` too large to fit, which the boundary check rejects.
+                        let lhs =
+                            (block_header_start - Self::BLOCK_OVERHEAD_SIZE).saturating_sub(left_size);
+                        // Gate the size with the shared helper, and accept the header only
+                        // as a plausible block boundary: the arena start, or far enough in
+                        // that a whole block fits before it (a shorter gap could not be a
+                        // valid block).
+                        if Self::is_possible_block_size(left_size)
+                            && (lhs == Self::ARENA_START
+                                || lhs >= Self::ARENA_START + Self::MIN_BLOCK_ON_DISK_SIZE)
+                        {
+                            left_header_start = lhs;
+                            // Read the left neighbour's header and, contiguously, its
+                            // links in one 32-byte read (in bounds: its block spans
+                            // >= MIN_BLOCK_ON_DISK_SIZE from `left_header_start`).
+                            state = P::HaveLeftHdr;
+                            return Some(BStackGenOp::Read {
+                                offset: left_header_start,
+                                // SAFETY: `rd_left` outlives the call; consumed before reuse.
+                                buf: bstack_unsafe_reborrow_mut!(&mut rd_left[..]),
+                            });
+                        }
+                        state = P::NeedFreeHead;
+                        continue;
+                    }
+                    P::HaveLeftHdr => {
+                        // Header in rd_left[0..16], links in rd_left[16..32]. It must be a
+                        // valid free block whose header size agrees with the footer we
+                        // read (is_free_block checks the flag + size; the cross-check
+                        // against left_size catches a footer/header mismatch).
+                        let left_hdr_size = read_buf_le!(rd_left, 0 => u64);
+                        if !Self::is_free_block(left_header_start, &rd_left[0..16], stack_len)
+                            || left_hdr_size != left_size
+                        {
+                            // Not a matching free block; leave the left neighbour alone.
+                            state = P::NeedFreeHead;
+                            continue;
+                        }
+                        block_size += left_size + Self::BLOCK_OVERHEAD_SIZE;
+                        result_header_start = left_header_start;
+                        // Unlink the left neighbour, whose links are already read:
+                        // next at rd_left[16..24], prev at rd_left[24..32].
+                        let next = read_buf_le!(rd_left, 16 => u64);
+                        let prev = read_buf_le!(rd_left, 24 => u64);
+                        if !Self::is_valid_link_ptr(next, stack_len)
+                            || !Self::is_valid_link_ptr(prev, stack_len)
+                        {
+                            gen_abort!(InvalidData, "add_to_free_list: corrupted free-list link");
+                        }
+                        // Forward-link target: the `next_free` word in the left
+                        // neighbour's predecessor (`&(left.prev->next_free)` == `prev`),
+                        // or `free_head` when it has no predecessor. We store the
+                        // neighbour's `next` there to splice it out.
+                        let left_prev_forwardlink_off = if prev != 0 {
+                            prev
+                        } else {
+                            Self::FREE_HEAD_OFFSET
+                        };
+                        // The +8 is safe because is_valid_link_ptr already accepted
+                        // `next` only if it can hold a block (hence its link words).
+                        left_next_backlink_off = if next != 0 { next + 8 } else { 0 };
+                        state = P::EmitLeftB;
+                        return Some(BStackGenOp::Write {
+                            offset: left_prev_forwardlink_off,
+                            // SAFETY: `rd_left` outlives the call and is not reused after
+                            // the left read; `[16..24]` is `next`.
+                            data: bstack_unsafe_reborrow!(&rd_left[16..24]),
+                        });
+                    }
+                    P::EmitLeftB => {
+                        state = P::NeedFreeHead;
+                        if left_next_backlink_off != 0 {
+                            return Some(BStackGenOp::Write {
+                                // left_next_backlink_off is either 0 or valid, per last check
+                                // and it cannot be zero due to the if
+                                offset: left_next_backlink_off,
+                                // SAFETY: as above; `[24..32]` is `prev`.
+                                data: bstack_unsafe_reborrow!(&rd_left[24..32]),
+                            });
+                        }
+                        continue;
+                    }
+                    P::NeedFreeHead => {
+                        state = P::EmitHdr;
+                        return Some(BStackGenOp::Read {
+                            offset: Self::FREE_HEAD_OFFSET,
+                            // SAFETY: `rd8` outlives the call; consumed before reuse.
+                            buf: bstack_unsafe_reborrow_mut!(&mut rd8[..]),
+                        });
+                    }
+                    P::EmitHdr => {
+                        // free_head is in rd8 now — read after the unlinks, so it is the
+                        // post-unlink head; the header/footer writes below don't touch it.
+                        old_head = u64::from_le_bytes(rd8);
+                        // The old head becomes our `next_free`, and EmitBack writes its
+                        // back-link at `old_head + 8`, so validate it like any other
+                        // free-list link (this also guards that `+ 8` from overflow).
+                        if !Self::is_valid_link_ptr(old_head, stack_len) {
+                            gen_abort!(InvalidData, "add_to_free_list: corrupted free-list head");
+                        }
+                        // result_header_start grants a valid block, so this add is safe.
+                        result_start = result_header_start + Self::BLOCK_HEADER_SIZE;
+                        // Header and the free-block link words are contiguous, so write
+                        // them as one 32-byte block at result_header_start:
+                        //   size[0..8] | flags[8..12] | reserved[12..16]
+                        //             | next_free[16..24] | prev_free[24..32]
+                        write_buf!(block_size => hdrflags_buf, 0); // size
+                        write_buf!(1u32 => hdrflags_buf, 8); // flags: is_free = 1
+                        write_buf!(old_head => hdrflags_buf, 16); // next_free = old head
+                        // reserved [12..16] and prev_free [24..32] stay 0
+                        state = P::EmitFtr;
+                        return Some(BStackGenOp::Write {
+                            offset: result_header_start,
+                            // SAFETY: `hdrflags_buf` outlives the call, unmutated hereafter.
+                            data: bstack_unsafe_reborrow!(&hdrflags_buf[..]),
+                        });
+                    }
+                    P::EmitFtr => {
+                        ftr_buf = block_size.to_le_bytes();
+                        state = P::EmitHead;
+                        return Some(BStackGenOp::Write {
+                            offset: result_start + block_size,
+                            // SAFETY: `ftr_buf` outlives the call, unmutated hereafter.
+                            data: bstack_unsafe_reborrow!(&ftr_buf[..]),
+                        });
+                    }
+                    P::EmitHead => {
+                        head_buf = result_start.to_le_bytes();
+                        state = P::EmitBack;
+                        return Some(BStackGenOp::Write {
+                            offset: Self::FREE_HEAD_OFFSET,
+                            // SAFETY: `head_buf` outlives the call, unmutated hereafter.
+                            data: bstack_unsafe_reborrow!(&head_buf[..]),
+                        });
+                    }
+                    P::EmitBack => {
+                        state = P::Done;
+                        if old_head != 0 {
+                            back_buf = result_start.to_le_bytes();
+                            return Some(BStackGenOp::Write {
+                                offset: old_head + 8,
+                                // SAFETY: `back_buf` outlives the call, unmutated hereafter.
+                                data: bstack_unsafe_reborrow!(&back_buf[..]),
+                            });
+                        }
+                        continue;
+                    }
+                    P::Done => return None,
+                }
+            }
+        })
     }
 
     /// Find the first free block that is large enough to hold `size` bytes of payload.
@@ -579,6 +1083,7 @@ impl FirstFitBStackAllocator {
     /// block keeps whatever its previous occupant wrote. The same writes are
     /// issued in the same order, each covering only the metadata words, so the
     /// crash-consistency reasoning below is unchanged.
+    #[cfg(not(feature = "atomic"))]
     fn unlink_block(
         &self,
         found_start: u64,
@@ -686,6 +1191,174 @@ impl FirstFitBStackAllocator {
             }
 
             Ok(())
+        }
+    }
+
+    /// Atomic counterpart of [`unlink_block`](Self::unlink_block) above.
+    ///
+    /// Both branches commit as one crash-atomic unit. The **split** branch has no
+    /// dependent reads — its three writes (free-block footer + allocated-block
+    /// header, the payload/footer image, and the shrunk free-block header) are all
+    /// known up front and disjoint, so it uses [`BStack::set_batched`], whose
+    /// overlap rejection doubles as a check that they really are disjoint. The
+    /// **no-split** branch reads the block's free-list pointers and then rewrites
+    /// its neighbours' links and clears its flags, so it rides one
+    /// [`BStack::inplace_gen`]. Issuing the writes in the sequential order lands a
+    /// byte-identical final state (later writes win any overlap).
+    #[cfg(feature = "atomic")]
+    fn unlink_block(
+        &self,
+        found_start: u64,
+        found_size: u64,
+        requested_size: u64,
+        content_buffer: Option<&mut [u8]>,
+    ) -> io::Result<()> {
+        if found_size >= requested_size + Self::BLOCK_OVERHEAD_SIZE + Self::MIN_BLOCK_PAYLOAD_SIZE {
+            // Split: carve an allocated block off the back, keep the remainder free.
+            // See the non-atomic body above for the block-layout diagram; the same
+            // three disjoint writes commit together here.
+            let remaining_size = found_size - requested_size - Self::BLOCK_OVERHEAD_SIZE;
+            let payload_start = found_start + remaining_size + Self::BLOCK_OVERHEAD_SIZE;
+
+            // Free-block footer + allocated-block header, contiguous (flags stay 0
+            // -> allocated).
+            let mut update_buf = [0u8; Self::BLOCK_OVERHEAD_SIZE as usize];
+            write_buf!(remaining_size => update_buf, 0);
+            write_buf!(requested_size => update_buf, 8);
+            // Shrunk free-block header size.
+            let header_buf = remaining_size.to_le_bytes();
+            // Allocated-block footer, used only when the payload is left as-is.
+            let footer_buf = requested_size.to_le_bytes();
+
+            // The middle write is the only branch-dependent one: the payload image
+            // (footer folded in) when a content buffer was passed, else just the
+            // allocated-block footer.
+            let middle: (u64, &[u8]) = match content_buffer {
+                Some(content_buffer) => {
+                    write_buf!(requested_size => content_buffer, (requested_size + Self::BLOCK_HEADER_SIZE) as usize);
+                    (
+                        payload_start,
+                        &content_buffer[Self::BLOCK_HEADER_SIZE as usize..],
+                    )
+                }
+                None => (payload_start + requested_size, &footer_buf[..]),
+            };
+            self.stack.set_batched([
+                (found_start + remaining_size, &update_buf[..]),
+                middle,
+                (found_start - Self::BLOCK_HEADER_SIZE, &header_buf[..]),
+            ])
+        } else {
+            // No split: unlink the whole block and clear its free flag.
+            let flags_offset = found_start - Self::BLOCK_HEADER_SIZE + 8;
+            let mut content_buffer = content_buffer;
+
+            enum P {
+                NeedLen,
+                NeedPtrs,
+                EmitA,
+                EmitB,
+                EmitFlags,
+                Done,
+            }
+            let mut state = P::NeedLen;
+            // Read via a `Len` op under the generator's held write lock (one fewer
+            // lock than sampling `len()` outside); backs the link check in `EmitA`.
+            let mut stack_len = 0u64;
+            // 0 = no forward neighbour, so the back-link write is skipped
+            let mut next_backlink_off = 0u64;
+            // `rd16` holds the block's pointers after the read and is never
+            // rewritten, so the two link writes borrow its halves directly:
+            let mut rd16 = [0u8; 16];
+            let zeros = [0u8; 8];
+
+            self.stack.inplace_gen(|feedback| {
+                if let Err(e) = feedback {
+                    return Some(BStackGenOp::Abort { source: Some(e) });
+                }
+                loop {
+                    match state {
+                        P::NeedLen => {
+                            state = P::NeedPtrs;
+                            return Some(BStackGenOp::Len {
+                                // SAFETY: `stack_len` outlives the call.
+                                out: bstack_unsafe_reborrow_mut!(&mut stack_len),
+                            });
+                        }
+                        P::NeedPtrs => {
+                            state = P::EmitA;
+                            return Some(BStackGenOp::Read {
+                                offset: found_start,
+                                // SAFETY: `rd16` outlives the call; consumed before reuse.
+                                buf: bstack_unsafe_reborrow_mut!(&mut rd16[..]),
+                            });
+                        }
+                        P::EmitA => {
+                            // Pointers are in `rd16` now (the read resolved).
+                            let next = read_buf_le!(rd16, 0 => u64);
+                            let prev = read_buf_le!(rd16, 8 => u64);
+                            // Untrusted on-disk links; reject an out-of-bounds one as
+                            // corruption (also guarding `next + 8` from overflow).
+                            if !Self::is_valid_link_ptr(next, stack_len)
+                                || !Self::is_valid_link_ptr(prev, stack_len)
+                            {
+                                gen_abort!(InvalidData, "unlink_block: corrupted free-list link");
+                            }
+                            let prev_forwardlink_off = if prev != 0 {
+                                prev
+                            } else {
+                                Self::FREE_HEAD_OFFSET
+                            };
+                            next_backlink_off = if next != 0 { next + 8 } else { 0 };
+                            state = P::EmitB;
+                            return Some(BStackGenOp::Write {
+                                offset: prev_forwardlink_off,
+                                // SAFETY: `rd16` outlives the call and is not mutated
+                                // after the read; `[0..8]` is the `next` link.
+                                data: bstack_unsafe_reborrow!(&rd16[0..8]),
+                            });
+                        }
+                        P::EmitB => {
+                            state = P::EmitFlags;
+                            if next_backlink_off != 0 {
+                                return Some(BStackGenOp::Write {
+                                    offset: next_backlink_off,
+                                    // SAFETY: as above; `[8..16]` is the `prev` link.
+                                    data: bstack_unsafe_reborrow!(&rd16[8..16]),
+                                });
+                            }
+                            continue;
+                        }
+                        P::EmitFlags => {
+                            state = P::Done;
+                            match content_buffer {
+                                Some(ref mut cb) => {
+                                    // Clear is_free + reserved in the image; the rest
+                                    // is the caller's payload. One write lands both.
+                                    cb[8..16].copy_from_slice(&[0u8; 8]);
+                                    return Some(BStackGenOp::Write {
+                                        offset: flags_offset,
+                                        // SAFETY: `cb`'s referent outlives the call and
+                                        // is not mutated after this write is issued.
+                                        data: bstack_unsafe_reborrow!(
+                                            &cb[8..Self::BLOCK_HEADER_SIZE as usize
+                                                + requested_size as usize]
+                                        ),
+                                    });
+                                }
+                                None => {
+                                    return Some(BStackGenOp::Write {
+                                        offset: flags_offset,
+                                        // SAFETY: `zeros` outlives the call, never mutated.
+                                        data: bstack_unsafe_reborrow!(&zeros[..]),
+                                    });
+                                }
+                            }
+                        }
+                        P::Done => return None,
+                    }
+                }
+            })
         }
     }
 

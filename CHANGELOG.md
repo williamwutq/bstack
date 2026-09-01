@@ -24,6 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **`len`, `is_empty`, and every other read now fail while an interrupted write is pending replay — with the new `InterruptedWrite` error (Rust) or `errno = BSTACK_EREPLAY` (C).** The signatures are unchanged, but `len`/`is_empty` previously could not fail outside an armed fault policy, so a `len().unwrap()` issued after a failed write on the same stack now panics where it did not before, and `bstack_len`/`bstack_is_empty` gain a failure mode their callers may not check. `InterruptedWrite` is a public unit struct carried as the payload of an `io::ErrorKind::Other` error.
+- **`FirstFitBStackAllocator` (Rust, `atomic` feature): each free-list mutation now commits as a single crash-atomic unit instead of a sequence of individually-synced writes.** Previously every free-list write was a separate `BStack::set` with its own `durable_sync`, so a crash could land after any prefix, leaving a partial state only the reopen recovery scan resolved. `add_to_free_list` now runs its probe-coalesce-prepend inside one `BStack::inplace_gen`, and the alloc/realloc carve commits through one `inplace_gen` or `BStack::set_batched`, so a crash leaves the operation wholly applied or wholly absent — and `add_to_free_list`'s six syncs collapse to one four-sync journal arm. The `recovery_needed` bracket, the recovery scan, and the on-disk format are unchanged, and the non-`atomic` build is byte-for-byte as before.
 
 ### Fixed
 
