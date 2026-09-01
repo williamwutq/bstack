@@ -846,8 +846,8 @@ impl FirstFitBStackAllocator {
                         // `block_header_start - OVERHEAD` is in range (block_header_start
                         // >= ARENA_START > OVERHEAD); the saturating sub yields 0 for a
                         // `left_size` too large to fit, which the boundary check rejects.
-                        let lhs =
-                            (block_header_start - Self::BLOCK_OVERHEAD_SIZE).saturating_sub(left_size);
+                        let lhs = (block_header_start - Self::BLOCK_OVERHEAD_SIZE)
+                            .saturating_sub(left_size);
                         // Gate the size with the shared helper, and accept the header only
                         // as a plausible block boundary: the arena start, or far enough in
                         // that a whole block fits before it (a shorter gap could not be a
