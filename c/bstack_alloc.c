@@ -1493,6 +1493,7 @@ bstack_t *linear_bstack_allocator_into_stack(linear_bstack_allocator_t *alloc)
 #define ALFF_ARENA_START      UINT64_C(48)
 #define ALFF_MIN_BLOCK_START  UINT64_C(64)  /* ARENA_START + BLOCK_HDR_SIZE */
 #define ALFF_MIN_BLOCK_END    UINT64_C(80)  /* ARENA_START + BLOCK_HDR_SIZE + MIN_PAYLOAD */
+#define ALFF_MIN_BLOCK_ON_DISK UINT64_C(40) /* MIN_PAYLOAD + BLOCK_OVERHEAD */
 
 static const uint8_t alff_magic[8]        = {'A','L','F','F',0,1,3,0};
 static const uint8_t alff_magic_prefix[6] = {'A','L','F','F',0,1};
@@ -1547,6 +1548,59 @@ static inline int alff_is_impossible_block_end(uint64_t stack_len, uint64_t end)
     if (stack_len < ALFF_BLOCK_FTR_SIZE) return 1;
     return end > stack_len - ALFF_BLOCK_FTR_SIZE;
 }
+
+#ifdef BSTACK_FEATURE_ATOMIC
+/* ---- atomic free-list validation predicates ---------------------------
+ * Mirror the Rust helpers used by the crash-atomic add_to_free_list /
+ * unlink_block: they verify untrusted on-disk sizes and pointers before those
+ * values reach a read/write offset, so a corrupt arena is rejected rather than
+ * chased. */
+
+/* A possible payload size: a multiple of 8, at least MIN_PAYLOAD.  This is the
+ * payload size, not the on-disk size (which is this plus BLOCK_OVERHEAD). */
+static inline int alff_is_possible_block_size(uint64_t size)
+{
+    return size % 8 == 0 && size >= ALFF_MIN_PAYLOAD;
+}
+
+/* A possible payload offset: aligned, and past the protected header region.
+ * May have false positives, never false negatives. */
+static inline int alff_is_possible_block_ptr(uint64_t ptr)
+{
+    return ptr % 8 == 0 && ptr >= ALFF_ARENA_START + ALFF_BLOCK_HDR_SIZE;
+}
+
+/* An in-bounds payload offset: possible, and whose block's footer + min payload
+ * still fit within stack_len.  A larger value is corrupt.  stack_len must have
+ * been checked >= ARENA_START before this call, else the subtraction may wrap. */
+static inline int alff_is_real_block_ptr(uint64_t ptr, uint64_t stack_len)
+{
+    return alff_is_possible_block_ptr(ptr)
+        && ptr <= stack_len - (ALFF_BLOCK_FTR_SIZE + ALFF_MIN_PAYLOAD);
+}
+
+/* A free-list next/prev link: the null terminator, or a real block pointer. */
+static inline int alff_is_valid_link_ptr(uint64_t ptr, uint64_t stack_len)
+{
+    return ptr == 0 || alff_is_real_block_ptr(ptr, stack_len);
+}
+
+/* Whether the block `header` at header_start (first 16 bytes: size + flags)
+ * describes a valid free block that fits within stack_len: is_free set, size a
+ * multiple of 8 >= MIN_PAYLOAD, and the whole block (header + payload + footer)
+ * within the stack.  The fit test is a saturating subtraction. */
+static inline int alff_is_free_block(uint64_t header_start, const uint8_t *header,
+                                     uint64_t stack_len)
+{
+    uint64_t size = read_le64(header);
+    uint64_t room = header_start <= stack_len ? stack_len - header_start : 0;
+    room = room >= ALFF_BLOCK_OVERHEAD ? room - ALFF_BLOCK_OVERHEAD : 0;
+    return (header[8] & 1) != 0
+        && size >= ALFF_MIN_PAYLOAD
+        && size % 8 == 0
+        && size <= room;
+}
+#endif /* BSTACK_FEATURE_ATOMIC */
 
 /* ---- recovery flag management ----------------------------------------- */
 
@@ -1637,6 +1691,7 @@ static int alff_unlink_from_free_list(bstack_t *bs, uint64_t payload_start)
  *
  * Caller must set recovery_needed before calling and clear it after.
  */
+#ifndef BSTACK_FEATURE_ATOMIC
 static int alff_add_to_free_list(bstack_t *bs, uint64_t block_start)
 {
     uint64_t stack_len, block_header_start;
@@ -1746,6 +1801,281 @@ static int alff_add_to_free_list(bstack_t *bs, uint64_t block_start)
     }
     return 0;
 }
+#else /* BSTACK_FEATURE_ATOMIC */
+
+/*
+ * Crash-atomic counterpart of the sequential alff_add_to_free_list above.
+ *
+ * The same probe-and-decide logic runs inside one bstack_inplace_gen: reads see
+ * the batch so far (so the free_head read taken after a coalesce unlink observes
+ * the post-unlink value), and every edit commits as one journal arm. Issuing the
+ * writes in the sequential order lands a byte-identical final state, minus the
+ * sequential body's early "mark free" write — an all-or-nothing commit never
+ * exposes a mid-coalesce state, and the result block's is_free flag rides the
+ * 32-byte header/links write. Untrusted on-disk sizes and pointers are fully
+ * validated before they reach a read/write offset.
+ *
+ *   NeedLen -> NeedOwnSize -> HaveOwnSize -> [right: HaveRightHdr -> EmitRightB]
+ *   -> StartLeft -> [left: HaveLeftFtr -> HaveLeftHdr -> EmitLeftB]
+ *   -> NeedFreeHead -> EmitHdr -> EmitFtr -> EmitHead -> EmitBack -> Done
+ */
+enum {
+    AFL_NEED_LEN, AFL_NEED_OWN_SIZE, AFL_HAVE_OWN_SIZE, AFL_HAVE_RIGHT_HDR,
+    AFL_EMIT_RIGHT_B, AFL_START_LEFT, AFL_HAVE_LEFT_FTR, AFL_HAVE_LEFT_HDR,
+    AFL_EMIT_LEFT_B, AFL_NEED_FREE_HEAD, AFL_EMIT_HDR, AFL_EMIT_FTR,
+    AFL_EMIT_HEAD, AFL_EMIT_BACK, AFL_DONE
+};
+
+/* Fields are ordered widest-alignment-first (byte buffers, then u64, then the
+ * scalar control fields) so the struct has no internal padding. Each neighbour's
+ * header + links are read together ([0..16] header, [16..32] next/prev); the link
+ * writes borrow the halves until commit, so right/left need separate buffers.
+ * rd8 backs scalar reads; the rest are write payloads not sub-slicing a read. */
+struct alff_add_ctx {
+    uint8_t    rd_right[32], rd_left[32], hdrflags_buf[32];
+    uint8_t    rd8[8], ftr_buf[8], head_buf[8], back_buf[8];
+    uint64_t   block_start, block_header_start, stack_len, block_size;
+    uint64_t   result_header_start, result_start;
+    uint64_t   right_header_start, left_header_start, left_size, old_head;
+    /* &(neighbour.next->prev_free) back-link write offsets, or 0 to skip */
+    uint64_t   right_next_backlink_off, left_next_backlink_off;
+    const int *prev;                    /* inplace_gen prev-status pointer */
+    int        phase;
+};
+
+static int alff_add_gen(bstack_gen_op_t *op, void *uc)
+{
+    struct alff_add_ctx *c = uc;
+    int status = EINVAL; // abort status for `goto abort`; EINVAL means corruption
+    /* A failed read or rejected write tears the batch down (never commit a
+     * partial one) — abort with the reported errno. */
+    if (c->prev && *c->prev != 0) { status = *c->prev; goto abort; }
+    /* No loop: every case returns, and a state that yields no op this call jumps
+     * within the switch (goto afl_start_left / afl_commit) or falls through to the
+     * next case, so control always reaches a return. */
+    switch (c->phase) {
+    case AFL_NEED_LEN:
+        c->phase = AFL_NEED_OWN_SIZE;
+        op->kind = BSTACK_GEN_LEN;
+        op->u.len.out = &c->stack_len;
+        return 1;
+    case AFL_NEED_OWN_SIZE:
+        /* Guard a corrupt/too-short stack: it must fit at least one block,
+         * since a free list only makes sense if a block exists.
+         * The smallest possible block at block_start must also fit within it. */
+        if (c->stack_len < ALFF_ARENA_START + ALFF_MIN_BLOCK_ON_DISK
+            || !alff_is_real_block_ptr(c->block_start, c->stack_len)) goto abort;
+        c->phase = AFL_HAVE_OWN_SIZE;
+        op->kind = BSTACK_GEN_READ;
+        op->u.read.offset = c->block_header_start;
+        op->u.read.buf = c->rd8; op->u.read.len = 8;
+        return 1;
+    case AFL_HAVE_OWN_SIZE: {
+        uint64_t bound;
+        c->block_size = read_le64(c->rd8);
+        if (!alff_is_possible_block_size(c->block_size)) goto abort;
+        /* Room for a right neighbour: block_size <= (stack_len - MIN_ON_DISK
+         * - FOOTER) - block_start (saturating on block_start). The first two
+         * subs are in range (NeedOwnSize proved stack_len >= ARENA + MIN).
+         * When it holds, right_header_start + 40 <= stack_len, so the 32-byte
+         * read below is in bounds. */
+        bound = c->stack_len - ALFF_MIN_BLOCK_ON_DISK - ALFF_BLOCK_FTR_SIZE;
+        bound = bound >= c->block_start ? bound - c->block_start : 0;
+        if (c->block_size <= bound) {
+            c->right_header_start =
+            c->block_header_start + ALFF_BLOCK_OVERHEAD + c->block_size;
+            c->phase = AFL_HAVE_RIGHT_HDR;
+            op->kind = BSTACK_GEN_READ;
+            op->u.read.offset = c->right_header_start;
+            op->u.read.buf = c->rd_right; op->u.read.len = 32;
+            return 1;
+        }
+        goto afl_start_left; // no right neighbour: probe left
+    }
+    case AFL_HAVE_RIGHT_HDR: {
+        uint64_t right_size, right_end, next, prev, fwd;
+        // Header in rd_right[0..16], links in rd_right[16..32]
+        if (!alff_is_free_block(c->right_header_start, c->rd_right, c->stack_len))
+            goto afl_start_left; // not free: try the left
+        right_size = read_le64(c->rd_right);
+        /* The neighbour ends at right_header_start + right_size + OVERHEAD
+         * (in bounds by is_free_block). Accept only as a plausible boundary:
+         * the stack tail, or far enough that a whole block fits after it. */
+        right_end = c->right_header_start + right_size + ALFF_BLOCK_OVERHEAD;
+        if (right_end != c->stack_len
+            && right_end > c->stack_len - ALFF_MIN_BLOCK_ON_DISK)
+            goto afl_start_left;  // impossible zone: skip
+        c->block_size += right_size + ALFF_BLOCK_OVERHEAD;
+        /* Unlink the right neighbour: next at [16..24], prev at [24..32]. */
+        next = read_le64(c->rd_right + 16);
+        prev = read_le64(c->rd_right + 24);
+        if (!alff_is_valid_link_ptr(next, c->stack_len)
+         || !alff_is_valid_link_ptr(prev, c->stack_len)) {
+            goto abort;
+        }
+        /* Forward-link target &(right.prev->next_free) == prev, else free_head;
+         * store next there. The + 8 back-link is guarded by is_valid_link_ptr. */
+        fwd = prev != 0 ? prev : ALFF_FREE_HEAD_OFFSET;
+        c->right_next_backlink_off = next != 0 ? next + 8 : 0;
+        c->phase = AFL_EMIT_RIGHT_B;
+        op->kind = BSTACK_GEN_WRITE;
+        op->u.write.offset = fwd;
+        op->u.write.data = c->rd_right + 16; op->u.write.len = 8; /* next */
+        return 1;
+    }
+    case AFL_EMIT_RIGHT_B:
+        c->phase = AFL_START_LEFT;
+        if (c->right_next_backlink_off != 0) {
+            op->kind = BSTACK_GEN_WRITE;
+            op->u.write.offset = c->right_next_backlink_off;
+            op->u.write.data = c->rd_right + 24; op->u.write.len = 8; /* prev */
+            return 1;
+        }
+        // Fall through to the left neighbour probe
+    afl_start_left:
+    case AFL_START_LEFT:
+        /* Left neighbour ends where we begin; probe only when a whole min
+         * block can precede us. Read its footer (8 bytes before our header). */
+        if (c->block_header_start >= ALFF_ARENA_START + ALFF_MIN_BLOCK_ON_DISK) {
+            c->phase = AFL_HAVE_LEFT_FTR;
+            op->kind = BSTACK_GEN_READ;
+            op->u.read.offset = c->block_header_start - ALFF_BLOCK_FTR_SIZE;
+            op->u.read.buf = c->rd8; op->u.read.len = 8;
+            return 1;
+        }
+        goto afl_commit;  // no left neighbour: commit the new block
+    case AFL_HAVE_LEFT_FTR: {
+        uint64_t lhs;
+        c->left_size = read_le64(c->rd8);
+        /* header = block_header_start - left_size - OVERHEAD: the first sub is
+         * in range (bhs >= ARENA_START > OVERHEAD), the saturating sub yields
+         * 0 for an over-large left_size (rejected by the boundary check). */
+        lhs = c->block_header_start - ALFF_BLOCK_OVERHEAD;
+        lhs = lhs >= c->left_size ? lhs - c->left_size : 0;
+        // Gate the size, and accept the header only as a plausible boundary:
+        // the arena start, or far enough in that a whole block fits before.
+        if (alff_is_possible_block_size(c->left_size)
+            && (lhs == ALFF_ARENA_START
+             || lhs >= ALFF_ARENA_START + ALFF_MIN_BLOCK_ON_DISK)) {
+            c->left_header_start = lhs;
+            c->phase = AFL_HAVE_LEFT_HDR;
+            op->kind = BSTACK_GEN_READ;
+            op->u.read.offset = c->left_header_start;
+            op->u.read.buf = c->rd_left; op->u.read.len = 32;
+            return 1;
+        }
+        goto afl_commit;  // no left neighbour: commit the new block
+    }
+    case AFL_HAVE_LEFT_HDR: {
+        uint64_t left_hdr_size, next, prev, fwd;
+        // Header in rd_left[0..16], links in rd_left[16..32]. Must be a valid
+        // free block whose header size agrees with the footer we read.
+        left_hdr_size = read_le64(c->rd_left);
+        if (!alff_is_free_block(c->left_header_start, c->rd_left, c->stack_len)
+            || left_hdr_size != c->left_size) goto afl_commit; // not free, commit
+        c->block_size += c->left_size + ALFF_BLOCK_OVERHEAD;
+        c->result_header_start = c->left_header_start;
+        next = read_le64(c->rd_left + 16);
+        prev = read_le64(c->rd_left + 24);
+        if (!alff_is_valid_link_ptr(next, c->stack_len)
+         || !alff_is_valid_link_ptr(prev, c->stack_len)) goto abort;
+        fwd = prev != 0 ? prev : ALFF_FREE_HEAD_OFFSET;
+        c->left_next_backlink_off = next != 0 ? next + 8 : 0;
+        c->phase = AFL_EMIT_LEFT_B;
+        op->kind = BSTACK_GEN_WRITE;
+        op->u.write.offset = fwd;
+        op->u.write.data = c->rd_left + 16; op->u.write.len = 8; /* next */
+        return 1;
+    }
+    case AFL_EMIT_LEFT_B:
+        c->phase = AFL_NEED_FREE_HEAD;
+        if (c->left_next_backlink_off != 0) {
+            op->kind = BSTACK_GEN_WRITE;
+            op->u.write.offset = c->left_next_backlink_off;
+            op->u.write.data = c->rd_left + 24; op->u.write.len = 8; /* prev */
+            return 1;
+        }
+        // Fall through to the free_head read
+    afl_commit:
+    case AFL_NEED_FREE_HEAD:
+        c->phase = AFL_EMIT_HDR;
+        op->kind = BSTACK_GEN_READ;
+        op->u.read.offset = ALFF_FREE_HEAD_OFFSET;
+        op->u.read.buf = c->rd8; op->u.read.len = 8;
+        return 1;
+    case AFL_EMIT_HDR:
+        /* free_head (post-unlink) is in rd8. It becomes our next_free and
+         * EmitBack writes its back-link at old_head + 8, so validate it like
+         * any other link (this also guards that + 8 from overflow). */
+        c->old_head = read_le64(c->rd8);
+        if (!alff_is_valid_link_ptr(c->old_head, c->stack_len)) goto abort;
+        c->result_start = c->result_header_start + ALFF_BLOCK_HDR_SIZE;
+        /* Header and free-block link words are contiguous: one 32-byte write
+         *   size[0..8] | flags[8..12] | reserved[12..16]
+         *              | next_free[16..24] | prev_free[24..32] */
+        memset(c->hdrflags_buf, 0, 32);
+        write_le64(c->hdrflags_buf, c->block_size);     /* size */
+        write_le32(c->hdrflags_buf + 8, 1);             /* flags: is_free = 1 */
+        write_le64(c->hdrflags_buf + 16, c->old_head);  /* next_free = old head */
+        c->phase = AFL_EMIT_FTR;
+        op->kind = BSTACK_GEN_WRITE;
+        op->u.write.offset = c->result_header_start;
+        op->u.write.data = c->hdrflags_buf; op->u.write.len = 32;
+        return 1;
+    case AFL_EMIT_FTR:
+        write_le64(c->ftr_buf, c->block_size);
+        c->phase = AFL_EMIT_HEAD;
+        op->kind = BSTACK_GEN_WRITE;
+        op->u.write.offset = c->result_start + c->block_size;
+        op->u.write.data = c->ftr_buf; op->u.write.len = 8;
+        return 1;
+    case AFL_EMIT_HEAD:
+        write_le64(c->head_buf, c->result_start);
+        c->phase = AFL_EMIT_BACK;
+        op->kind = BSTACK_GEN_WRITE;
+        op->u.write.offset = ALFF_FREE_HEAD_OFFSET;
+        op->u.write.data = c->head_buf; op->u.write.len = 8;
+        return 1;
+    case AFL_EMIT_BACK:
+        c->phase = AFL_DONE;
+        if (c->old_head != 0) {
+            write_le64(c->back_buf, c->result_start);
+            op->kind = BSTACK_GEN_WRITE;
+            op->u.write.offset = c->old_head + 8;
+            op->u.write.data = c->back_buf; op->u.write.len = 8;
+            return 1;
+        }
+    default: /* AFL_DONE */
+        return 0;
+    }
+abort:
+    op->kind = BSTACK_GEN_ABORT;
+    op->u.abort.status = status;
+    return 1;
+}
+
+static int alff_add_to_free_list(bstack_t *bs, uint64_t block_start)
+{
+    struct alff_add_ctx c;
+    int prev = 0;
+
+    // Check the input block_start is a possible block start.
+    if (!alff_is_possible_block_ptr(block_start)) {
+        errno = EINVAL;
+        return -1;
+    }
+    /* Every field the generator reads is written (here or by an earlier phase)
+     * before its first read, so no zero-init is needed. */
+    c.prev = &prev;
+    c.phase = AFL_NEED_LEN;
+    c.block_start = block_start;
+    c.block_header_start = block_start - ALFF_BLOCK_HDR_SIZE;
+    c.result_header_start = c.block_header_start;
+
+    return bstack_inplace_gen(bs, alff_add_gen, &c, &prev);
+}
+
+#endif /* BSTACK_FEATURE_ATOMIC */
 
 /*
  * Walk the free list for the first block whose payload size >= size.
@@ -1832,6 +2162,7 @@ static int alff_find_large_enough_block(bstack_t *bs, uint64_t size,
  *   Unlinks the block entirely, zeroes its is_free flag, and writes the
  *   combined flags+data region in one disk write.
  */
+#ifndef BSTACK_FEATURE_ATOMIC
 static int alff_unlink_block(bstack_t *bs,
                               uint64_t found_start, uint64_t found_size,
                               uint64_t requested_size, uint8_t *content_buf)
@@ -1897,6 +2228,140 @@ static int alff_unlink_block(bstack_t *bs,
         return 0;
     }
 }
+#else /* BSTACK_FEATURE_ATOMIC */
+
+/*
+ * Crash-atomic counterpart of the sequential alff_unlink_block above.
+ *
+ * The split path has no dependent reads — its three disjoint writes (free-block
+ * footer + allocated-block header, the payload/footer image, and the shrunk free
+ * header) commit through one bstack_set_batched, whose overlap rejection doubles
+ * as a disjointness check. The no-split path reads the block's free-list links,
+ * validates them, then rewrites the neighbours' links and clears its flags in one
+ * bstack_inplace_gen. Issuing the writes in the sequential order lands a
+ * byte-identical final state.
+ */
+enum { AUB_NEED_LEN, AUB_NEED_PTRS, AUB_EMIT_A, AUB_EMIT_B, AUB_EMIT_FLAGS, AUB_DONE };
+
+/* Fields ordered widest-alignment-first (byte buffer, then u64, then pointers,
+ * then the int) so the struct has no internal padding. */
+struct alff_unlink_ctx {
+    uint8_t    rd16[16];           /* the block's links; the write halves borrow it */
+    uint64_t   found_start, requested_size, flags_offset, stack_len;
+    uint64_t   next_backlink_off;  /* &(found.next->prev_free), or 0 to skip */
+    uint8_t   *content_buf;
+    const int *prev;               /* inplace_gen prev-status pointer */
+    int        phase;
+};
+
+static int alff_unlink_gen(bstack_gen_op_t *op, void *uc)
+{
+    struct alff_unlink_ctx *c = uc;
+    int status = EINVAL; // abort status for `goto abort`; EINVAL means corruption
+    if (c->prev && *c->prev != 0) { status = *c->prev; goto abort; }
+    switch (c->phase) {
+    case AUB_NEED_LEN:
+        c->phase = AUB_NEED_PTRS;
+        op->kind = BSTACK_GEN_LEN;
+        op->u.len.out = &c->stack_len;
+        return 1;
+    case AUB_NEED_PTRS:
+        c->phase = AUB_EMIT_A;
+        op->kind = BSTACK_GEN_READ;
+        op->u.read.offset = c->found_start;
+        op->u.read.buf = c->rd16; op->u.read.len = 16;
+        return 1;
+    case AUB_EMIT_A: {
+        /* Links in rd16: next at [0..8], prev at [8..16]. Untrusted on-disk
+         * links; reject an out-of-bounds one (also guards next + 8). */
+        uint64_t next = read_le64(c->rd16);
+        uint64_t prev = read_le64(c->rd16 + 8);
+        uint64_t fwd;
+        if (!alff_is_valid_link_ptr(next, c->stack_len)
+            || !alff_is_valid_link_ptr(prev, c->stack_len)) {
+            goto abort;
+        }
+        fwd = prev != 0 ? prev : ALFF_FREE_HEAD_OFFSET;
+        c->next_backlink_off = next != 0 ? next + 8 : 0;
+        c->phase = AUB_EMIT_B;
+        op->kind = BSTACK_GEN_WRITE;
+        op->u.write.offset = fwd;
+        op->u.write.data = c->rd16; op->u.write.len = 8; /* next */
+        return 1;
+    }
+    case AUB_EMIT_B:
+        c->phase = AUB_EMIT_FLAGS;
+        if (c->next_backlink_off != 0) {
+            op->kind = BSTACK_GEN_WRITE;
+            op->u.write.offset = c->next_backlink_off;
+            op->u.write.data = c->rd16 + 8; op->u.write.len = 8; /* prev */
+            return 1;
+        }
+        // Fall through: no back-link write needed, clear flags now
+    case AUB_EMIT_FLAGS:
+        c->phase = AUB_DONE;
+        /* Clear is_free + reserved in the image; the rest is the caller's
+         * payload. One write lands both. */
+        memset(c->content_buf + 8, 0, 8);
+        op->kind = BSTACK_GEN_WRITE;
+        op->u.write.offset = c->flags_offset;
+        op->u.write.data = c->content_buf + 8;
+        op->u.write.len = (size_t)(8 + c->requested_size);
+        return 1;
+    default: /* AUB_DONE */
+        return 0;
+    }
+abort:
+    op->kind = BSTACK_GEN_ABORT;
+    op->u.abort.status = status;
+    return 1;
+}
+
+static int alff_unlink_block(bstack_t *bs,
+                              uint64_t found_start, uint64_t found_size,
+                              uint64_t requested_size, uint8_t *content_buf)
+{
+    if (found_size >= requested_size + ALFF_BLOCK_OVERHEAD + ALFF_MIN_PAYLOAD) {
+        /* SPLIT: three disjoint writes, all known up front — one set_batched. */
+        uint64_t remaining_size = found_size - requested_size - ALFF_BLOCK_OVERHEAD;
+        uint64_t payload_start   = found_start + remaining_size + ALFF_BLOCK_OVERHEAD;
+        uint8_t update_buf[24]; /* free_footer(8) | alloc_hdr_size(8) | alloc_flags+reserved(8) */
+        uint8_t header_le[8];   /* shrunk free-block header size */
+        bstack_iovec_t iov[3];
+
+        /* Fold the allocated block's footer into the content image. */
+        write_le64(content_buf + ALFF_BLOCK_HDR_SIZE + requested_size, requested_size);
+
+        memset(update_buf, 0, 24);
+        write_le64(update_buf,     remaining_size);
+        write_le64(update_buf + 8, requested_size);
+        write_le64(header_le, remaining_size);
+
+        iov[0].offset = found_start + remaining_size;
+        iov[0].buf    = update_buf; iov[0].len = 24;
+        iov[1].offset = payload_start;
+        iov[1].buf    = content_buf + ALFF_BLOCK_HDR_SIZE;
+        iov[1].len    = (size_t)(requested_size + ALFF_BLOCK_FTR_SIZE);
+        iov[2].offset = found_start - ALFF_BLOCK_HDR_SIZE;
+        iov[2].buf    = header_le; iov[2].len = 8;
+        return bstack_set_batched(bs, iov, 3);
+    } else {
+        /* NO-SPLIT: unlink the whole block and clear its flag in one gen. The
+         * unread fields (stack_len, next_backlink_off, rd16) are all written by
+         * the generator before they are read, so no zero-init is needed. */
+        struct alff_unlink_ctx c;
+        int prev = 0;
+        c.prev           = &prev;
+        c.phase          = AUB_NEED_LEN;
+        c.found_start    = found_start;
+        c.requested_size = requested_size;
+        c.flags_offset   = found_start - ALFF_BLOCK_HDR_SIZE + 8;
+        c.content_buf    = content_buf;
+        return bstack_inplace_gen(bs, alff_unlink_gen, &c, &prev);
+    }
+}
+
+#endif /* BSTACK_FEATURE_ATOMIC */
 
 /*
  * After discarding the tail block, cascade-discard any free blocks that are

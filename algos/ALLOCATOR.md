@@ -67,6 +67,7 @@ Every allocation in the arena is:
 
 ```
 [ BlockHeader 16 B | payload (size bytes) | BlockFooter 8 B ]
+                   ^ Block start - this is where pointer points to and linked list links to
 ```
 
 * **BlockHeader** — `size: u64`, `flags: u32` (bit 0 = `is_free`), `_reserved: u32`.
@@ -74,7 +75,15 @@ Every allocation in the arena is:
 * **Free blocks** additionally store `next_free: u64` and `prev_free: u64` in the
   first 16 bytes of their payload, forming an intrusive doubly-linked list.
 
-The minimum allocation size is 16 bytes; all sizes are rounded up to a multiple of 8.
+The minimum **payload** is 16 bytes, and every size is rounded up to a multiple
+of 8. The 16-byte floor is not arbitrary: a free block reuses the first 16 bytes
+of its own payload to hold the `next_free`/`prev_free` links, so the payload must
+be wide enough to store them even when the block carries no user data. The
+8-byte rounding `u64` words aligned. These imply a smallest-block footprint of
+**40 bytes** on disk: the 16-byte minimum payload plus the 24 bytes of per-block
+overhead (16-byte `BlockHeader` + 8-byte `BlockFooter`). It also sets the split
+threshold — a free block is only split on allocation when the remainder would
+still be a whole minimum block (≥ 16 payload + 24 overhead = 40 bytes).
 
 ### Allocation policy
 
