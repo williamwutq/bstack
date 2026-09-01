@@ -32,7 +32,7 @@ macro_rules! gen_abort {
 
 /// Full magic for FirstFitBStackAllocator
 #[cfg(feature = "set")]
-const ALFF_MAGIC: [u8; 8] = *b"ALFF\x00\x01\x03\x00";
+const ALFF_MAGIC: [u8; 8] = *b"ALFF\x00\x01\x04\x00";
 
 /// Compatibility prefix checked on open: `ALFF` + major 0 + minor 1.
 /// Any file whose first 6 bytes match is considered compatible.
