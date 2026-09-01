@@ -34,21 +34,27 @@ pub(crate) use acl_check;
 #[cfg(feature = "expensive-slice-access-control")]
 mod inner {
     use crate::fault::fault_point;
-    use crate::io_core::{HEADER_SIZE, commit_shrink, set_in_place};
+    use crate::io_core::{HEADER_SIZE, commit_shrink, repeat_fill, set_in_place};
     use crate::{
         AccessOp, BStack, BStackAccess, BStackAccessAuthorities, check_offset_unlocked, checked_end,
     };
     use std::io::{self, Seek, SeekFrom};
     use std::sync::atomic::Ordering;
 
-    #[cfg(any(unix, windows))]
-    use crate::io_core::pread_exact;
     #[cfg(unix)]
     use crate::io_core::pread_exact_raw;
     #[cfg(windows)]
     use crate::io_core::pread_exact_raw_handle;
+    #[cfg(any(unix, windows))]
+    use crate::io_core::{pread_exact, pread_exact_into};
     #[cfg(not(any(unix, windows)))]
     use std::io::Read;
+
+    #[cfg(feature = "atomic")]
+    use crate::io_core::{
+        durable_sync, is_atomic_write, journaled_copy, journaled_exchange, journaled_move, read_at,
+        write_at,
+    };
 
     /// A one-shot capability token authorizing guard-level access to a stack's
     /// protected ranges.
@@ -85,6 +91,15 @@ mod inner {
         #[inline]
         fn authorities_for(&self, _stack: &BStack) -> BStackAccessAuthorities {
             BStackAccessAuthorities::NONE
+        }
+    }
+
+    // Resolved authorities carry themselves — the form a slice stores after a
+    // token grant, so its I/O can present the authority it was given.
+    impl BStackAuthority for BStackAccessAuthorities {
+        #[inline]
+        fn authorities_for(&self, _stack: &BStack) -> BStackAccessAuthorities {
+            *self
         }
     }
 
@@ -162,36 +177,40 @@ mod inner {
 
         /// Arm `[offset, offset + len)` with `mode`, tokenless.
         ///
+        /// Crate-internal: all public protection goes through
+        /// [`BStackOwnedSlice::protect`](crate::BStackOwnedSlice::protect), which
+        /// bounds the range to a genuine allocation rather than an arbitrary span.
+        ///
         /// A tokenless caller may only tighten a range that is currently
         /// [`All`](BStackAccess::All) everywhere; arming a range already governed by
         /// a token is [`PermissionDenied`](io::ErrorKind::PermissionDenied). Present a
-        /// token via [`protect_as`](BStack::protect_as) to re-mode a range you own.
-        /// Nothing is persisted, so reopening clears the policy.
+        /// token via `protect_as` to re-mode a range you own. Nothing is persisted,
+        /// so reopening clears the policy.
         ///
         /// # Errors
         ///
         /// [`InvalidInput`](io::ErrorKind::InvalidInput) if `offset + len` overflows;
         /// [`PermissionDenied`](io::ErrorKind::PermissionDenied) if the range is not
         /// entirely unprotected.
-        pub fn protect(&self, offset: u64, len: u64, mode: BStackAccess) -> io::Result<()> {
+        pub(crate) fn protect(&self, offset: u64, len: u64, mode: BStackAccess) -> io::Result<()> {
             self.protect_as((), offset, len, mode)
         }
 
-        /// Arm `[offset, offset + len)` with `mode`, presenting `auth`.
+        /// Arm `[offset, offset + len)` with `mode`, presenting `auth`. Crate-internal;
+        /// see [`protect`](Self::protect).
         ///
-        /// The token sibling of [`protect`](BStack::protect): a caller may re-mode any
-        /// range whose current mode its token can already write (which, by the
-        /// incomparability of the two tokens, keeps a guard out of
-        /// [`Alloc`](BStackAccess::Alloc) ranges and an allocator out of
-        /// [`Prot`](BStackAccess::Prot) ranges). A tokenless `auth` of `()` falls back
-        /// to the tighten-`All`-only rule.
+        /// The token sibling of `protect`: a caller may re-mode any range whose
+        /// current mode its token can already write (which, by the incomparability
+        /// of the two tokens, keeps a guard out of [`Alloc`](BStackAccess::Alloc)
+        /// ranges and an allocator out of [`Prot`](BStackAccess::Prot) ranges). A
+        /// tokenless `auth` of `()` falls back to the tighten-`All`-only rule.
         ///
         /// # Errors
         ///
         /// [`InvalidInput`](io::ErrorKind::InvalidInput) if `offset + len` overflows;
         /// [`PermissionDenied`](io::ErrorKind::PermissionDenied) if the current policy
         /// does not admit the token over the whole range.
-        pub fn protect_as(
+        pub(crate) fn protect_as(
             &self,
             auth: impl BStackAuthority,
             offset: u64,
@@ -400,6 +419,576 @@ mod inner {
                 file.read_exact(&mut buf)?;
                 Ok(buf)
             }
+        }
+
+        /// [`get_into`](BStack::get_into) presenting an access token, mirroring the
+        /// tokenless body but checking with `auth`.
+        pub fn get_into_as(
+            &self,
+            auth: impl BStackAuthority,
+            start: u64,
+            buf: &mut [u8],
+        ) -> io::Result<()> {
+            if buf.is_empty() {
+                return Ok(());
+            }
+            let len = buf.len() as u64;
+            let end = start
+                .checked_add(len)
+                .ok_or_else(|| io_error!(InvalidInput, "get_into: start + len overflows u64"))?;
+            acl_check!(self, start, end, Read, auth.authorities_for(self));
+            #[cfg(any(unix, windows))]
+            {
+                let locked = self.locked.load(Ordering::Acquire);
+                if end <= locked {
+                    if self.cache_enabled {
+                        let cache = self.cache.lock().unwrap();
+                        buf.copy_from_slice(&cache[start as usize..end as usize]);
+                        return Ok(());
+                    }
+                    #[cfg(unix)]
+                    return pread_exact_raw(self.fd, HEADER_SIZE + start, buf);
+                    #[cfg(windows)]
+                    return pread_exact_raw_handle(self.handle, HEADER_SIZE + start, buf);
+                }
+            }
+            #[cfg(any(unix, windows))]
+            {
+                let guard = self.read_lock()?;
+                let file = &guard.0;
+                let data_size = file.metadata()?.len().saturating_sub(HEADER_SIZE);
+                if end > data_size {
+                    return Err(io_error!(
+                        InvalidInput,
+                        format!("get_into: end ({end}) exceeds payload size ({data_size})")
+                    ));
+                }
+                fault_point!(self, "get_into");
+                pread_exact_into(file, HEADER_SIZE + start, buf)
+            }
+            #[cfg(not(any(unix, windows)))]
+            {
+                let locked = self.locked.load(Ordering::Acquire);
+                if end <= locked && self.cache_enabled {
+                    let cache = self.cache.lock().unwrap();
+                    buf.copy_from_slice(&cache[start as usize..end as usize]);
+                    return Ok(());
+                }
+                let mut guard = self.write_lock_read()?;
+                let file = &mut guard.0;
+                let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
+                if end > data_size {
+                    return Err(io_error!(
+                        InvalidInput,
+                        format!("get_into: end ({end}) exceeds payload size ({data_size})")
+                    ));
+                }
+                fault_point!(self, "get_into");
+                file.seek(SeekFrom::Start(HEADER_SIZE + start))?;
+                file.read_exact(buf)
+            }
+        }
+
+        /// [`zero`](BStack::zero) presenting an access token.
+        pub fn zero_as(&self, auth: impl BStackAuthority, offset: u64, n: u64) -> io::Result<()> {
+            if n == 0 {
+                return Ok(());
+            }
+            let held = auth.authorities_for(self);
+            let end = checked_end(offset, n, "zero: offset + n overflows u64")?;
+            let mut guard = self.write_lock()?;
+            let (file, _, replay) = &mut *guard;
+            let locked = self.locked.load(Ordering::Acquire);
+            check_offset_unlocked("zero", offset, end, locked)?;
+            acl_check!(self, offset, end, Write, held);
+            let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
+            if end > data_size {
+                return Err(io_error!(
+                    InvalidInput,
+                    format!("zero: write end ({end}) exceeds payload size ({data_size})")
+                ));
+            }
+            fault_point!(self, "zero");
+            Self::mark_replay(replay, repeat_fill(file, data_size, offset, &[0u8], n))
+        }
+
+        /// [`repeat`](BStack::repeat) presenting an access token.
+        pub fn repeat_as(
+            &self,
+            auth: impl BStackAuthority,
+            offset: u64,
+            pattern: impl AsRef<[u8]>,
+            count: u64,
+        ) -> io::Result<()> {
+            let pattern = pattern.as_ref();
+            if pattern.is_empty() || count == 0 {
+                return Ok(());
+            }
+            let held = auth.authorities_for(self);
+            let total = (pattern.len() as u64).checked_mul(count).ok_or_else(|| {
+                io_error!(InvalidInput, "repeat: count * pattern.len() overflows u64")
+            })?;
+            let end = checked_end(
+                offset,
+                total,
+                "repeat: offset + count*pattern.len() overflows u64",
+            )?;
+            let mut guard = self.write_lock()?;
+            let (file, _, replay) = &mut *guard;
+            let locked = self.locked.load(Ordering::Acquire);
+            check_offset_unlocked("repeat", offset, end, locked)?;
+            acl_check!(self, offset, end, Write, held);
+            let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
+            if end > data_size {
+                return Err(io_error!(
+                    InvalidInput,
+                    format!("repeat: write end ({end}) exceeds payload size ({data_size})")
+                ));
+            }
+            fault_point!(self, "repeat");
+            Self::mark_replay(replay, repeat_fill(file, data_size, offset, pattern, count))
+        }
+
+        /// [`cas`](BStack::cas) presenting an access token.
+        #[cfg(feature = "atomic")]
+        pub fn cas_as(
+            &self,
+            auth: impl BStackAuthority,
+            offset: u64,
+            old: impl AsRef<[u8]>,
+            new: impl AsRef<[u8]>,
+        ) -> io::Result<bool> {
+            let old = old.as_ref();
+            let new = new.as_ref();
+            if old.len() != new.len() {
+                return Ok(false);
+            }
+            if old.is_empty() {
+                return Ok(true);
+            }
+            let held = auth.authorities_for(self);
+            let end = checked_end(offset, old.len() as u64, "cas: offset + len overflows u64")?;
+            let mut guard = self.write_lock()?;
+            let (file, _, replay) = &mut *guard;
+            let locked = self.locked.load(Ordering::Acquire);
+            check_offset_unlocked("cas", offset, end, locked)?;
+            let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
+            if end > data_size {
+                return Err(io_error!(
+                    InvalidInput,
+                    format!("cas: range [{offset}, {end}) exceeds payload size ({data_size})")
+                ));
+            }
+            acl_check!(self, offset, end, Write, held);
+            fault_point!(self, "cas");
+            let mut current = vec![0u8; old.len()];
+            read_at(file, offset, &mut current)?;
+            if current != old {
+                return Ok(false);
+            }
+            Self::mark_replay(replay, set_in_place(file, data_size, offset, new))?;
+            Ok(true)
+        }
+
+        /// [`cross_exchange`](BStack::cross_exchange) presenting an access token.
+        #[cfg(feature = "atomic")]
+        pub fn cross_exchange_as(
+            &self,
+            auth: impl BStackAuthority,
+            a: u64,
+            b: u64,
+            n: u64,
+        ) -> io::Result<()> {
+            let held = auth.authorities_for(self);
+            let a_end = checked_end(a, n, "cross_exchange: a + n overflows u64")?;
+            let b_end = checked_end(b, n, "cross_exchange: b + n overflows u64")?;
+            if n > 0 {
+                let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+                if lo + n > hi {
+                    return Err(io_error!(
+                        InvalidInput,
+                        format!(
+                            "cross_exchange: regions [{a}, {a_end}) and [{b}, {b_end}) overlap"
+                        )
+                    ));
+                }
+            }
+            let mut guard = self.write_lock()?;
+            let (file, _, replay) = &mut *guard;
+            let locked = self.locked.load(Ordering::Acquire);
+            if a < locked {
+                return Err(io_error!(
+                    InvalidInput,
+                    format!(
+                        "cross_exchange: region [{a}, {a_end}) overlaps locked region [0, {locked})"
+                    )
+                ));
+            }
+            if b < locked {
+                return Err(io_error!(
+                    InvalidInput,
+                    format!(
+                        "cross_exchange: region [{b}, {b_end}) overlaps locked region [0, {locked})"
+                    )
+                ));
+            }
+            let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
+            if a_end > data_size {
+                return Err(io_error!(
+                    InvalidInput,
+                    format!(
+                        "cross_exchange: region [{a}, {a_end}) exceeds payload size ({data_size})"
+                    )
+                ));
+            }
+            if b_end > data_size {
+                return Err(io_error!(
+                    InvalidInput,
+                    format!(
+                        "cross_exchange: region [{b}, {b_end}) exceeds payload size ({data_size})"
+                    )
+                ));
+            }
+            if n == 0 {
+                return Ok(());
+            }
+            acl_check!(self, a, a_end, Write, held);
+            acl_check!(self, b, b_end, Write, held);
+            fault_point!(self, "cross_exchange");
+            Self::mark_replay(replay, journaled_exchange(file, data_size, a, b, n))
+        }
+
+        /// [`copy`](BStack::copy) presenting an access token.
+        #[cfg(feature = "atomic")]
+        pub fn copy_as(
+            &self,
+            auth: impl BStackAuthority,
+            from: u64,
+            to: u64,
+            n: u64,
+        ) -> io::Result<()> {
+            let held = auth.authorities_for(self);
+            let from_end = checked_end(from, n, "copy: from + n overflows u64")?;
+            let to_end = checked_end(to, n, "copy: to + n overflows u64")?;
+            let mut guard = self.write_lock()?;
+            let (file, _, replay) = &mut *guard;
+            let locked = self.locked.load(Ordering::Acquire);
+            if to < locked {
+                return Err(io_error!(
+                    InvalidInput,
+                    format!(
+                        "copy: destination [{to}, {to_end}) overlaps locked region [0, {locked})"
+                    )
+                ));
+            }
+            let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
+            if from_end > data_size {
+                return Err(io_error!(
+                    InvalidInput,
+                    format!("copy: source [{from}, {from_end}) exceeds payload size ({data_size})")
+                ));
+            }
+            if to_end > data_size {
+                return Err(io_error!(
+                    InvalidInput,
+                    format!(
+                        "copy: destination [{to}, {to_end}) exceeds payload size ({data_size})"
+                    )
+                ));
+            }
+            if n == 0 {
+                return Ok(());
+            }
+            if from == to {
+                return Ok(());
+            }
+            acl_check!(self, from, from_end, Read, held);
+            acl_check!(self, to, to_end, Write, held);
+            fault_point!(self, "copy");
+            if is_atomic_write(to, n) {
+                let mut buf = vec![0u8; n as usize];
+                read_at(file, from, &mut buf)?;
+                Self::mark_replay(replay, write_at(file, to, &buf))?;
+                Self::mark_replay(replay, durable_sync(file))
+            } else if from < to_end && to < from_end {
+                Self::mark_replay(replay, journaled_move(file, data_size, from, to, n))
+            } else {
+                Self::mark_replay(replay, journaled_copy(file, data_size, from, to, n))
+            }
+        }
+
+        /// [`process`](BStack::process) presenting an access token.
+        #[cfg(feature = "atomic")]
+        pub fn process_as<F>(
+            &self,
+            auth: impl BStackAuthority,
+            start: u64,
+            end: u64,
+            f: F,
+        ) -> io::Result<()>
+        where
+            F: FnOnce(&mut [u8]),
+        {
+            if end < start {
+                return Err(io_error!(
+                    InvalidInput,
+                    format!("process: end ({end}) < start ({start})")
+                ));
+            }
+            let held = auth.authorities_for(self);
+            let n = end - start;
+            let mut guard = self.write_lock()?;
+            let (file, _, replay) = &mut *guard;
+            let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
+            if end > data_size {
+                return Err(io_error!(
+                    InvalidInput,
+                    format!("process: end ({end}) exceeds payload size ({data_size})")
+                ));
+            }
+            let locked = self.locked.load(Ordering::Acquire);
+            if start < locked {
+                return Err(io_error!(
+                    InvalidInput,
+                    format!("process: range [{start}, {end}) overlaps locked region [0, {locked})")
+                ));
+            }
+            acl_check!(self, start, end, Write, held);
+            fault_point!(self, "process");
+            let mut buf = vec![0u8; n as usize];
+            if n > 0 {
+                read_at(file, start, &mut buf)?;
+            }
+            f(&mut buf);
+            if n > 0 {
+                Self::mark_replay(replay, set_in_place(file, data_size, start, &buf))?;
+            }
+            Ok(())
+        }
+
+        /// [`eq_crds`](BStack::eq_crds) presenting an access token.
+        #[cfg(feature = "atomic")]
+        pub fn eq_crds_as(
+            &self,
+            auth: impl BStackAuthority,
+            a_offset: u64,
+            a_expected: impl AsRef<[u8]>,
+            b_offset: u64,
+            b_buf: impl AsRef<[u8]>,
+        ) -> io::Result<Option<Vec<u8>>> {
+            let a_expected = a_expected.as_ref();
+            let b_buf = b_buf.as_ref();
+            let held = auth.authorities_for(self);
+            let a_end = checked_end(
+                a_offset,
+                a_expected.len() as u64,
+                "eq_crds: a_offset + a_len overflows u64",
+            )?;
+            let b_end = checked_end(
+                b_offset,
+                b_buf.len() as u64,
+                "eq_crds: b_offset + b_len overflows u64",
+            )?;
+            let mut guard = self.write_lock()?;
+            let (file, _, replay) = &mut *guard;
+            let locked = self.locked.load(Ordering::Acquire);
+            if !b_buf.is_empty() && b_offset < locked {
+                return Err(io_error!(
+                    InvalidInput,
+                    format!(
+                        "eq_crds: B range [{b_offset}, {b_end}) overlaps locked region [0, {locked})"
+                    )
+                ));
+            }
+            let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
+            if !a_expected.is_empty() && a_end > data_size {
+                return Err(io_error!(
+                    InvalidInput,
+                    format!(
+                        "eq_crds: A range [{a_offset}, {a_end}) exceeds payload size ({data_size})"
+                    )
+                ));
+            }
+            if !b_buf.is_empty() && b_end > data_size {
+                return Err(io_error!(
+                    InvalidInput,
+                    format!(
+                        "eq_crds: B range [{b_offset}, {b_end}) exceeds payload size ({data_size})"
+                    )
+                ));
+            }
+            acl_check!(self, a_offset, a_end, Read, held);
+            acl_check!(self, b_offset, b_end, Write, held);
+            fault_point!(self, "eq_crds");
+            let mut a_current = vec![0u8; a_expected.len()];
+            if !a_expected.is_empty() {
+                read_at(file, a_offset, &mut a_current)?;
+            }
+            if a_current != a_expected {
+                return Ok(None);
+            }
+            if b_buf.is_empty() {
+                return Ok(Some(Vec::new()));
+            }
+            let mut old_b = vec![0u8; b_buf.len()];
+            read_at(file, b_offset, &mut old_b)?;
+            Self::mark_replay(replay, set_in_place(file, data_size, b_offset, b_buf))?;
+            Ok(Some(old_b))
+        }
+
+        /// [`ne_crds`](BStack::ne_crds) presenting an access token.
+        #[cfg(feature = "atomic")]
+        pub fn ne_crds_as(
+            &self,
+            auth: impl BStackAuthority,
+            a_offset: u64,
+            a_expected: impl AsRef<[u8]>,
+            b_offset: u64,
+            b_buf: impl AsRef<[u8]>,
+        ) -> io::Result<Option<Vec<u8>>> {
+            let a_expected = a_expected.as_ref();
+            let b_buf = b_buf.as_ref();
+            let held = auth.authorities_for(self);
+            let a_end = checked_end(
+                a_offset,
+                a_expected.len() as u64,
+                "ne_crds: a_offset + a_len overflows u64",
+            )?;
+            let b_end = checked_end(
+                b_offset,
+                b_buf.len() as u64,
+                "ne_crds: b_offset + b_len overflows u64",
+            )?;
+            let mut guard = self.write_lock()?;
+            let (file, _, replay) = &mut *guard;
+            let locked = self.locked.load(Ordering::Acquire);
+            if !b_buf.is_empty() && b_offset < locked {
+                return Err(io_error!(
+                    InvalidInput,
+                    format!(
+                        "ne_crds: B range [{b_offset}, {b_end}) overlaps locked region [0, {locked})"
+                    )
+                ));
+            }
+            let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
+            if !a_expected.is_empty() && a_end > data_size {
+                return Err(io_error!(
+                    InvalidInput,
+                    format!(
+                        "ne_crds: A range [{a_offset}, {a_end}) exceeds payload size ({data_size})"
+                    )
+                ));
+            }
+            if !b_buf.is_empty() && b_end > data_size {
+                return Err(io_error!(
+                    InvalidInput,
+                    format!(
+                        "ne_crds: B range [{b_offset}, {b_end}) exceeds payload size ({data_size})"
+                    )
+                ));
+            }
+            acl_check!(self, a_offset, a_end, Read, held);
+            acl_check!(self, b_offset, b_end, Write, held);
+            fault_point!(self, "ne_crds");
+            let mut a_current = vec![0u8; a_expected.len()];
+            if !a_expected.is_empty() {
+                read_at(file, a_offset, &mut a_current)?;
+            }
+            if a_current == a_expected {
+                return Ok(None);
+            }
+            if b_buf.is_empty() {
+                return Ok(Some(Vec::new()));
+            }
+            let mut old_b = vec![0u8; b_buf.len()];
+            read_at(file, b_offset, &mut old_b)?;
+            Self::mark_replay(replay, set_in_place(file, data_size, b_offset, b_buf))?;
+            Ok(Some(old_b))
+        }
+
+        /// [`masked_eq_crds`](BStack::masked_eq_crds) presenting an access token.
+        #[cfg(feature = "atomic")]
+        pub fn masked_eq_crds_as(
+            &self,
+            auth: impl BStackAuthority,
+            a_offset: u64,
+            mask: impl AsRef<[u8]>,
+            a_expected: impl AsRef<[u8]>,
+            b_offset: u64,
+            b_buf: impl AsRef<[u8]>,
+        ) -> io::Result<Option<Vec<u8>>> {
+            let mask = mask.as_ref();
+            let a_expected = a_expected.as_ref();
+            let b_buf = b_buf.as_ref();
+            if mask.len() != a_expected.len() {
+                return Err(io_error!(
+                    InvalidInput,
+                    "masked_eq_crds: mask length ({}) != a_expected length ({})",
+                    mask.len(),
+                    a_expected.len()
+                ));
+            }
+            let held = auth.authorities_for(self);
+            let a_end = checked_end(
+                a_offset,
+                a_expected.len() as u64,
+                "masked_eq_crds: a_offset + a_len overflows u64",
+            )?;
+            let b_end = checked_end(
+                b_offset,
+                b_buf.len() as u64,
+                "masked_eq_crds: b_offset + b_len overflows u64",
+            )?;
+            let mut guard = self.write_lock()?;
+            let (file, _, replay) = &mut *guard;
+            let locked = self.locked.load(Ordering::Acquire);
+            if !b_buf.is_empty() && b_offset < locked {
+                return Err(io_error!(
+                    InvalidInput,
+                    format!(
+                        "masked_eq_crds: B range [{b_offset}, {b_end}) overlaps locked region [0, {locked})"
+                    )
+                ));
+            }
+            let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
+            if !a_expected.is_empty() && a_end > data_size {
+                return Err(io_error!(
+                    InvalidInput,
+                    format!(
+                        "masked_eq_crds: A range [{a_offset}, {a_end}) exceeds payload size ({data_size})"
+                    )
+                ));
+            }
+            if !b_buf.is_empty() && b_end > data_size {
+                return Err(io_error!(
+                    InvalidInput,
+                    format!(
+                        "masked_eq_crds: B range [{b_offset}, {b_end}) exceeds payload size ({data_size})"
+                    )
+                ));
+            }
+            acl_check!(self, a_offset, a_end, Read, held);
+            acl_check!(self, b_offset, b_end, Write, held);
+            fault_point!(self, "masked_eq_crds");
+            let mut a_current = vec![0u8; a_expected.len()];
+            if !a_expected.is_empty() {
+                read_at(file, a_offset, &mut a_current)?;
+            }
+            let masked_match = a_current
+                .iter()
+                .zip(mask.iter())
+                .zip(a_expected.iter())
+                .all(|((&a, &m), &e)| (a & m) == (e & m));
+            if !masked_match {
+                return Ok(None);
+            }
+            if b_buf.is_empty() {
+                return Ok(Some(Vec::new()));
+            }
+            let mut old_b = vec![0u8; b_buf.len()];
+            read_at(file, b_offset, &mut old_b)?;
+            Self::mark_replay(replay, set_in_place(file, data_size, b_offset, b_buf))?;
+            Ok(Some(old_b))
         }
     }
 }

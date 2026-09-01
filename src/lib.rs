@@ -4412,6 +4412,8 @@ impl BStack {
                 )
             ));
         }
+        acl_check!(self, a_offset, a_end, Read);
+        acl_check!(self, b_offset, b_end, Write);
         fault_point!(self, "eq_crds");
         let mut a_current = vec![0u8; a_expected.len()];
         if !a_expected.is_empty() {
@@ -4489,6 +4491,8 @@ impl BStack {
                 )
             ));
         }
+        acl_check!(self, a_offset, a_end, Read);
+        acl_check!(self, b_offset, b_end, Write);
         fault_point!(self, "ne_crds");
         let mut a_current = vec![0u8; a_expected.len()];
         if !a_expected.is_empty() {
@@ -4587,6 +4591,8 @@ impl BStack {
                 )
             ));
         }
+        acl_check!(self, a_offset, a_end, Read);
+        acl_check!(self, b_offset, b_end, Write);
         fault_point!(self, "masked_eq_crds");
         let mut a_current = vec![0u8; a_expected.len()];
         if !a_expected.is_empty() {
@@ -5466,6 +5472,71 @@ mod acl_tests {
         assert_eq!(s.get(40, 44).unwrap(), [1, 1, 1, 1]);
     }
 
+    #[test]
+    fn authorized_slice_reaches_prot_region() {
+        let (s, p) = mk();
+        let _g = Guard(p);
+        let alloc = crate::LinearBStackAllocator::new(s);
+        let mut slice = alloc.alloc(32).unwrap();
+        let prot = alloc.stack().take_protection().unwrap();
+        slice.protect_as(&prot, BStackAccess::Prot).unwrap();
+        // Without authority, the slice's own I/O is denied.
+        assert_eq!(
+            slice.read().unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        // Grant the slice the guard authority; its I/O now reaches the region.
+        slice.authorize(&prot);
+        slice.write([7u8; 4]).unwrap();
+        let bytes = slice.read().unwrap();
+        assert_eq!(bytes.len(), 32);
+        assert_eq!(&bytes[..4], &[7, 7, 7, 7]);
+    }
+
+    #[test]
+    fn owned_slice_protect_forwards_to_stack() {
+        let (s, p) = mk();
+        let _g = Guard(p);
+        let alloc = crate::LinearBStackAllocator::new(s);
+        let mut slice = alloc.alloc(32).unwrap();
+        // Arm the allocation as ReadOnly through the owned handle.
+        slice.protect(BStackAccess::ReadOnly).unwrap();
+        assert_eq!(
+            alloc.stack().access_at(slice.start()),
+            BStackAccess::ReadOnly
+        );
+        // Reads through the slice pass; writes are denied by the forwarded policy.
+        assert!(slice.read().is_ok());
+        assert_eq!(
+            slice.write([0u8; 4]).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn owned_slice_protect_as_with_guard() {
+        let (s, p) = mk();
+        let _g = Guard(p);
+        let alloc = crate::LinearBStackAllocator::new(s);
+        let slice = alloc.alloc(32).unwrap();
+        let prot = alloc.stack().take_protection().unwrap();
+        // Arm as Prot; only the guard token may then read or write it.
+        slice.protect_as(&prot, BStackAccess::Prot).unwrap();
+        assert_eq!(
+            slice.read().unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        // The stack's token-carrying entry points still reach it.
+        let stack = alloc.stack();
+        stack.set_as(&prot, slice.start(), [9u8; 4]).unwrap();
+        assert_eq!(
+            stack
+                .get_as(&prot, slice.start(), slice.start() + 4)
+                .unwrap(),
+            [9, 9, 9, 9]
+        );
+    }
+
     #[cfg(feature = "atomic")]
     #[test]
     fn set_batched_checks_every_block() {
@@ -5482,5 +5553,47 @@ mod acl_tests {
         );
         // The permitted block was not applied (checks run before the journal).
         assert_eq!(s.get(0, 4).unwrap(), [0xAA, 0xAA, 0xAA, 0xAA]);
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn authorized_slice_atomic_ops_reach_prot() {
+        let (s, p) = mk();
+        let _g = Guard(p);
+        let alloc = crate::LinearBStackAllocator::new(s);
+        let mut slice = alloc.alloc(32).unwrap();
+        let prot = alloc.stack().take_protection().unwrap();
+        slice.protect_as(&prot, BStackAccess::Prot).unwrap();
+        // Tokenless slice process (a write) is denied.
+        assert_eq!(
+            slice
+                .as_slice_mut()
+                .process(|b| b.fill(9))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        // With authority the atomic slice ops reach the Prot region.
+        slice.authorize(&prot);
+        slice.as_slice_mut().process(|b| b.fill(1)).unwrap();
+        assert_eq!(&slice.read().unwrap()[..4], &[1, 1, 1, 1]);
+    }
+
+    #[test]
+    fn merge_requires_matching_authority() {
+        let (s, p) = mk();
+        let _g = Guard(p);
+        let alloc = crate::LinearBStackAllocator::new(s);
+        let owned = alloc.alloc(32).unwrap();
+        let full = owned.as_slice();
+        let mut left = full.subslice(0, 16);
+        let right = full.subslice(16, 32);
+        // Same (NONE) authority: the adjacent subslices merge.
+        assert!(left.merge_adjacent(&right).is_some());
+        // Grant `left` an authority; now the authorities differ and merge refuses.
+        let prot = alloc.stack().take_protection().unwrap();
+        left.authorize(&prot);
+        assert!(left.merge(&right).is_none());
+        assert!(left.merge_adjacent(&right).is_none());
     }
 }
