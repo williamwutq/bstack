@@ -383,3 +383,72 @@ Cost is `n` staged bytes and `2k` syncs. Staging is independent of `k`, so rotat
 
 - **A `BStackGenOp` variant.** `process_gen` already ends in at most one mutating step, and `Swap` there is the two-region case of this mode, so a `Rotate { offsets, n }` variant would fit the existing shape — a generator could read the regions it wants to reorder and end by rotating them under the same lock. Whether the borrow of an offset slice works inside `BStackGenOp`'s single caller-chosen `'a` is the open part.
 - **Arbitrary permutations.** A general permutation decomposes into disjoint cycles, so the mode could take a full mapping and rotate each cycle. Whether that belongs here or in `BStackTransaction`, which can already express it, is undecided.
+
+---
+
+## Range access control on `BStack` and `BStackOwnedSlice`
+
+**Feature flag:** `expensive-slice-access-control` (implies `alloc` + `set`). Off by default.
+**Breaking change:** No. A build without the flag compiles to exactly today's code.
+
+### Motivation
+
+`bstack` has one enforcement mechanism for "these bytes must not change": `lock_up_to`. It is shaped for the stack case — a consumer whose bottom `n` bytes are settled and whose later pushes build on them — and is right there. For anything else it is a prefix, it is all-or-nothing, and it conflates writing with truncating.
+
+What nothing encodes is *who is asking*. Ownership and borrowing settle aliasing, but aliasing is not authority: two callers holding the same range are indistinguishable, and nothing can say that one may write it and the other may not. It is the axis an OS gives every page, where `rwx` belongs to the mapping rather than to any pointer into it. Three things follow:
+
+- **Allocator metadata is protected only as far as the slice API.** No handle spans a block header, but an allocator hands out its stack, and `allocator.stack().set(..)` reaches any byte in the arena. The rule being broken — *only the allocator may write here* — is about the caller, not about aliasing.
+- **Truncating cannot be separated from writing.** A tail region may be freely writable yet must not be discarded.
+- **Reads cannot be denied.** Atomicity guarantees a read is never torn, not that the bytes are still *yours*: a slice held across a `dealloc` reads whatever the block was reused for.
+
+None of this is a correction — used as documented, the APIs keep a stack intact. Access control is an **additional layer** for callers who would rather have an invariant checked at runtime.
+
+### Design
+
+#### Modes
+
+```rust
+pub enum BStackAccess { All, Rw, RwStrict, Prot, RwProt, Alloc, ReadOnly, Locked }
+```
+
+| Mode       | Read      | Write     | Truncate           |
+|------------|-----------|-----------|--------------------|
+| `All`      | any       | any       | any                |
+| `Rw`       | any       | any       | allocator or guard |
+| `RwStrict` | any       | any       | none               |
+| `Prot`     | guard     | guard     | guard              |
+| `RwProt`   | guard     | guard     | none               |
+| `Alloc`    | allocator | allocator | allocator          |
+| `ReadOnly` | any       | none      | none               |
+| `Locked`   | none      | none      | none               |
+
+Each cell lists the authorities that satisfy it; `any` means no token is needed. The two tokens are **incomparable** — neither outranks the other — so `Prot` and `Alloc` are each private to their own holder on all three axes: a range marked `Alloc` cannot be read, written, or truncated by a guard holder, which is what makes metadata inviolable even to the policy owner. `All` is the default everywhere and is what an unprotected stack reports.
+
+#### Authority
+
+Two capability tokens, `BStackProtection<'a>` and `BStackAllocAuthority<'a>`, neither `Clone` nor `Copy`, each minted at most once per handle (`take_protection() -> Option<_>`, `None` thereafter). One-shot minting is what makes them mean anything. Allocator constructors claim the second naturally, since they already consume a `BStack` exclusively. Checked entry points gain a token-carrying sibling, `set_as(&self, auth, offset, data)`.
+
+#### The point table
+
+A sorted `Vec<(u64, BStackAccess)>` of change points: `(16, Alloc)` means `Alloc` from offset 16 until the next point, with an absent leading point implying `All` from 0. Adjacent equal modes coalesce, so the table is proportional to the number of distinct regions and one protected header is two entries. Deliberately **not** a `BTreeMap`: the table is read far more often than written, a read is a `partition_point` over a contiguous array.
+
+- **Point lookup** — `partition_point(|p| p.0 <= off) - 1`.
+- **Range check** for `[a, b)` — one `partition_point`, then a forward scan while `points[j].0 < b`, folding to the most restrictive mode. The common case spans one point and the scan does not run.
+- **Setting** `[a, b)` to `M` — record the mode in effect at `b` as a point at `b`, insert `(a, M)`, drop points strictly inside, coalesce.
+
+The table takes its own `RwLock`, separate from the stack lock, because the locked-region read fast path bypasses the stack lock and must still reject a `Locked` read. Mutation takes both, stack lock first, so in-flight writers drain before the new policy is published — the ordering and the reasoning of `lock_up_to`. An `AtomicBool` short-circuits every check on a stack that has never been protected.
+
+#### Checks
+
+Writes check their target range, truncations `[new_len, old_len)`, reads their read range. Batched paths check every block before the journal is armed. Points beyond `len` are retained rather than trimmed, so a range can be armed before its bytes arrive. Denials return `PermissionDenied`.
+
+The locked prefix is checked first and stays out of the table, which can only further restrict it; folding the two would cost `lock_up_to` its lock-free read path. Protection is set through an owned handle — `BStackOwnedSlice::protect(mode)`, forwarded to the stack's table — never through `BStack` with an arbitrary range. A caller may set any range whose current mode already admits its token; one without a token may only tighten a range currently at `All`. Nothing is persisted, so reopening clears the table.
+
+#### Cost
+
+The flag is named for it. On a protected stack every checked call pays a relaxed load, an `RwLock` read acquisition, and a binary search before any I/O — a real fraction of a small `set`, whose fast path is one write and one sync. Batched ops pay per block, and every checked entry point grows a token-carrying sibling.
+
+### Open questions
+
+- **Named modes or an axis triple.** A `{ read, write, truncate }` triple of authorities is more expressive and no larger, at the cost of admitting nonsense (`read: none, write: any`). The enum is proposed because the curated eight are what callers want and a one-byte discriminant keeps the table compact.
+- **What an allocator may do inside a `Prot` range.** Incomparability settles one direction — a guard holder cannot reach an `Alloc` range — but not the other. A caller may mark its own allocation `Prot` and then free it, leaving a mode over bytes the allocator is about to hand to someone else. Either `dealloc` resets the reclaimed range to `All`, which means an allocator overriding a mode it otherwise cannot touch, or the protection outlives the allocation and poisons the block for its next owner.
