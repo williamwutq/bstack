@@ -217,6 +217,24 @@ impl PointTable {
         }
     }
 
+    /// Whether every offset in `[a, b)` is currently [`All`](BStackAccess::All).
+    ///
+    /// The tokenless authorization rule for arming a range: a caller with no
+    /// token may only tighten a range that is entirely unprotected. An empty
+    /// range is trivially uniform.
+    #[must_use]
+    pub fn all_over(&self, a: u64, b: u64) -> bool {
+        if a >= b {
+            return true;
+        }
+        if self.mode_at(a) != BStackAccess::All {
+            return false;
+        }
+        // Any change point inside `[a, b)` breaks uniformity.
+        let i = self.points.partition_point(|p| p.0 <= a);
+        i >= self.points.len() || self.points[i].0 >= b
+    }
+
     /// Whether every offset in `[a, b)` permits `op` under `held`.
     ///
     /// One `partition_point` locates the mode at `a`; a forward scan folds in
@@ -425,6 +443,19 @@ mod tests {
         assert!(t.check(15, 15, Read, NONE));
         t.set(15, 15, All);
         assert_eq!(t.mode_at(15), Locked);
+    }
+
+    #[test]
+    fn all_over_detects_uniform_all() {
+        let mut t = PointTable::new();
+        assert!(t.all_over(0, 100));
+        assert!(t.all_over(50, 50)); // empty
+        t.set(20, 40, Prot);
+        assert!(t.all_over(0, 20)); // touches boundary but stays All
+        assert!(!t.all_over(0, 21)); // reaches into Prot
+        assert!(!t.all_over(25, 30)); // inside Prot
+        assert!(t.all_over(40, 100)); // All resumes after
+        assert!(!t.all_over(30, 60)); // spans Prot -> All
     }
 
     #[test]

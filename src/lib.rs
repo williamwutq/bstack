@@ -715,6 +715,11 @@ mod acl_core;
 #[cfg(feature = "expensive-slice-access-control")]
 pub use acl_core::{AccessOp, BStackAccess, BStackAccessAuthorities, BStackAccessRequirement};
 
+mod acl;
+use acl::acl_check;
+#[cfg(feature = "expensive-slice-access-control")]
+pub use acl::{BStackAllocAuthority, BStackAuthority, BStackProtection};
+
 #[cfg(feature = "alloc")]
 mod alloc;
 #[cfg(feature = "alloc")]
@@ -740,6 +745,8 @@ use std::fs::{File, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+#[cfg(feature = "expensive-slice-access-control")]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
 
@@ -952,6 +959,22 @@ pub struct BStack {
     /// enabled; release builds carry neither the field nor its per-call branch.
     #[cfg(all(debug_assertions, feature = "fault-injection"))]
     fault: fault::FaultState,
+    /// Range access-control point table, under its own lock (separate from the
+    /// stack lock so the locked-region read fast path can still consult it). Not
+    /// persisted — reopening clears it.
+    #[cfg(feature = "expensive-slice-access-control")]
+    acl: RwLock<acl_core::PointTable>,
+    /// Cleared until the first [`protect`](BStack::protect); every access check
+    /// short-circuits on it, so an unprotected stack pays only a relaxed load.
+    #[cfg(feature = "expensive-slice-access-control")]
+    acl_active: AtomicBool,
+    /// One-shot guard-token flag: set the first time [`take_protection`] mints
+    /// the token, `None` thereafter.
+    #[cfg(feature = "expensive-slice-access-control")]
+    protection_taken: AtomicBool,
+    /// One-shot allocator-token flag, minted by [`take_alloc_authority`].
+    #[cfg(feature = "expensive-slice-access-control")]
+    alloc_authority_taken: AtomicBool,
 }
 
 // `BStack` is auto-`Send + Sync` on every platform: all fields
@@ -1164,6 +1187,14 @@ impl BStack {
             cache: Mutex::new(Vec::new()),
             #[cfg(all(debug_assertions, feature = "fault-injection"))]
             fault: fault::FaultState::new(),
+            #[cfg(feature = "expensive-slice-access-control")]
+            acl: RwLock::new(acl_core::PointTable::new()),
+            #[cfg(feature = "expensive-slice-access-control")]
+            acl_active: AtomicBool::new(false),
+            #[cfg(feature = "expensive-slice-access-control")]
+            protection_taken: AtomicBool::new(false),
+            #[cfg(feature = "expensive-slice-access-control")]
+            alloc_authority_taken: AtomicBool::new(false),
         })
     }
 
@@ -1303,6 +1334,12 @@ impl BStack {
             return Ok(logical_offset);
         }
 
+        acl_check!(
+            self,
+            logical_offset,
+            logical_offset + data.len() as u64,
+            Write
+        );
         fault_point!(self, "push");
         if let Err(e) = file.write_all(data) {
             // A failed rollback leaves a stale tail past the committed length:
@@ -1347,6 +1384,7 @@ impl BStack {
             return Ok(logical_offset);
         }
 
+        acl_check!(self, logical_offset, logical_offset + n, Write);
         fault_point!(self, "extend");
         let new_file_end = file_end + n;
         Self::mark_replay(replay, file.set_len(new_file_end))?;
@@ -1413,6 +1451,7 @@ impl BStack {
                 "extend_sparse: payload size + length overflows u64"
             )
         })?;
+        acl_check!(self, logical_offset, new_len, Write);
         fault_point!(self, "extend_sparse");
         let one = [(0u64, buf)];
         let blocks: &[(u64, &[u8])] = if buf.is_empty() { &[] } else { &one };
@@ -1485,6 +1524,7 @@ impl BStack {
                 "extend_sparse_batched: payload size + length overflows u64"
             )
         })?;
+        acl_check!(self, logical_offset, new_len, Write);
         fault_point!(self, "extend_sparse_batched");
         Self::mark_replay(
             replay,
@@ -1677,6 +1717,7 @@ impl BStack {
                 format!("pop({n}) would shrink payload below locked length ({locked})")
             ));
         }
+        acl_check!(self, new_data_len, data_size, Truncate);
         let mut buf = vec![0u8; n as usize];
         fault_point!(self, "pop");
         read_at(file, new_data_len, &mut buf)?;
@@ -1719,6 +1760,7 @@ impl BStack {
                     format!("peek offset ({offset}) exceeds payload size ({data_size})")
                 ));
             }
+            acl_check!(self, offset, data_size, Read);
             fault_point!(self, "peek");
             pread_exact(file, HEADER_SIZE + offset, (data_size - offset) as usize)
         }
@@ -1734,6 +1776,7 @@ impl BStack {
                     format!("peek offset ({offset}) exceeds payload size ({data_size})")
                 ));
             }
+            acl_check!(self, offset, data_size, Read);
             fault_point!(self, "peek");
             file.seek(SeekFrom::Start(HEADER_SIZE + offset))?;
             let mut buf = vec![0u8; (data_size - offset) as usize];
@@ -1760,6 +1803,9 @@ impl BStack {
     ///
     /// Fails with [`InterruptedWrite`] while an earlier write is pending replay.
     pub fn get(&self, start: u64, end: u64) -> io::Result<Vec<u8>> {
+        // The read check runs before the locked-region fast path, so a `Locked`
+        // range is rejected even though that path bypasses the stack lock.
+        acl_check!(self, start, end, Read);
         if end < start {
             return Err(io_error!(
                 InvalidInput,
@@ -1860,6 +1906,7 @@ impl BStack {
         let end = offset
             .checked_add(len)
             .ok_or_else(|| io_error!(InvalidInput, "peek_into: offset + len overflows u64"))?;
+        acl_check!(self, offset, end, Read);
         #[cfg(any(unix, windows))]
         {
             let guard = self.read_lock()?;
@@ -1922,6 +1969,8 @@ impl BStack {
         let end = start
             .checked_add(len)
             .ok_or_else(|| io_error!(InvalidInput, "get_into: start + len overflows u64"))?;
+        // Before the locked-region fast path, so a `Locked` range is still denied.
+        acl_check!(self, start, end, Read);
         // Fast-path: locked region is immutable — serve from cache or pread.
         #[cfg(any(unix, windows))]
         {
@@ -2014,6 +2063,7 @@ impl BStack {
                 format!("pop_into({n}) would shrink payload below locked length ({locked})")
             ));
         }
+        acl_check!(self, new_data_len, data_size, Truncate);
         fault_point!(self, "pop_into");
         read_at(file, new_data_len, buf)?;
         Self::mark_replay(replay, commit_shrink(file, clen, new_data_len))?;
@@ -2056,6 +2106,7 @@ impl BStack {
                 format!("discard({n}) would shrink payload below locked length ({locked})")
             ));
         }
+        acl_check!(self, new_data_len, data_size, Truncate);
         fault_point!(self, "discard");
         Self::mark_replay(replay, commit_shrink(file, clen, new_data_len))?;
         Ok(())
@@ -2099,6 +2150,7 @@ impl BStack {
         // our write, letting us mutate a now-immutable byte.
         let locked = self.locked.load(Ordering::Acquire);
         check_offset_unlocked("set", offset, end, locked)?;
+        acl_check!(self, offset, end, Write);
         let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
         if end > data_size {
             return Err(io_error!(
@@ -2144,6 +2196,7 @@ impl BStack {
         // Load `locked` under the write lock (see `set` for rationale).
         let locked = self.locked.load(Ordering::Acquire);
         check_offset_unlocked("zero", offset, end, locked)?;
+        acl_check!(self, offset, end, Write);
         let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
         if end > data_size {
             return Err(io_error!(
@@ -2209,6 +2262,7 @@ impl BStack {
         // Load `locked` under the write lock (see `set` for rationale).
         let locked = self.locked.load(Ordering::Acquire);
         check_offset_unlocked("repeat", offset, end, locked)?;
+        acl_check!(self, offset, end, Write);
         let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
         if end > data_size {
             return Err(io_error!(
@@ -2281,6 +2335,7 @@ impl BStack {
                 format!("atrunc: operation would modify locked region [0, {locked})")
             ));
         }
+        acl_check!(self, new_tail_start, data_size, Truncate);
         fault_point!(self, "atrunc");
         Self::mark_replay(
             replay,
@@ -2331,6 +2386,7 @@ impl BStack {
                 format!("splice: operation would modify locked region [0, {locked})")
             ));
         }
+        acl_check!(self, new_tail_start, data_size, Truncate);
         fault_point!(self, "splice");
         // Read the bytes to remove before any mutation.
         let mut removed = vec![0u8; n as usize];
@@ -2387,6 +2443,7 @@ impl BStack {
                 format!("splice_into: operation would modify locked region [0, {locked})")
             ));
         }
+        acl_check!(self, new_tail_start, data_size, Truncate);
         fault_point!(self, "splice_into");
         // Read the bytes to remove before any mutation.
         read_at(file, new_tail_start, old)?;
@@ -2424,6 +2481,7 @@ impl BStack {
         if buf.is_empty() {
             return Ok(true);
         }
+        acl_check!(self, data_size, data_size + buf.len() as u64, Write);
         fault_point!(self, "try_extend");
         if let Err(e) = file.write_all(buf) {
             // A failed rollback leaves a stale tail past the committed length:
@@ -2473,6 +2531,7 @@ impl BStack {
             n,
             "try_extend_zeros: data_size + n overflows u64",
         )?;
+        acl_check!(self, data_size, new_len, Write);
         fault_point!(self, "try_extend_zeros");
         Self::mark_replay(replay, file.set_len(HEADER_SIZE + new_len))?;
         Self::mark_replay(
@@ -2534,6 +2593,7 @@ impl BStack {
             length,
             "try_extend_sparse: data_size + length overflows u64",
         )?;
+        acl_check!(self, data_size, new_len, Write);
         fault_point!(self, "try_extend_sparse");
         let one = [(0u64, buf)];
         let blocks: &[(u64, &[u8])] = if buf.is_empty() { &[] } else { &one };
@@ -2602,6 +2662,7 @@ impl BStack {
             length,
             "try_extend_sparse_batched: data_size + length overflows u64",
         )?;
+        acl_check!(self, data_size, new_len, Write);
         fault_point!(self, "try_extend_sparse_batched");
         Self::mark_replay(
             replay,
@@ -2656,6 +2717,7 @@ impl BStack {
                 format!("try_discard: would shrink payload below locked length ({locked})")
             ));
         }
+        acl_check!(self, new_data_len, data_size, Truncate);
         fault_point!(self, "try_discard");
         Self::mark_replay(replay, commit_shrink(file, clen, new_data_len))?;
         Ok(true)
@@ -2701,6 +2763,7 @@ impl BStack {
                     r.start
                 ));
             }
+            acl_check!(self, r.start, r.end, Read);
         }
         #[cfg(any(unix, windows))]
         {
@@ -2798,6 +2861,7 @@ impl BStack {
                         format!("get_batched_into: end ({end}) exceeds payload size ({data_size})",)
                     ));
                 }
+                acl_check!(self, ptr, end, Read);
                 pread_exact_into(file, HEADER_SIZE + ptr, buf)?;
             }
             Ok(())
@@ -2821,6 +2885,7 @@ impl BStack {
                         format!("get_batched_into: end ({end}) exceeds payload size ({data_size})",)
                     ));
                 }
+                acl_check!(self, ptr, end, Read);
                 file.seek(SeekFrom::Start(HEADER_SIZE + ptr))?;
                 file.read_exact(buf)?;
             }
@@ -2873,6 +2938,7 @@ impl BStack {
                         format!("get_batched_gen: end ({end}) exceeds payload size ({data_size})")
                     ));
                 }
+                acl_check!(self, offset, end, Read);
                 // Per-step read fault: stands in for this read's I/O and ends
                 // the whole call, as a genuine read failure here does.
                 fault_point!(self, "get_batched_gen:read");
@@ -2899,6 +2965,7 @@ impl BStack {
                         format!("get_batched_gen: end ({end}) exceeds payload size ({data_size})")
                     ));
                 }
+                acl_check!(self, offset, end, Read);
                 // Per-step read fault: stands in for this read's I/O and ends
                 // the whole call, as a genuine read failure here does.
                 fault_point!(self, "get_batched_gen:read");
@@ -2953,6 +3020,7 @@ impl BStack {
                 format!("replace: operation would modify locked region [0, {locked})")
             ));
         }
+        acl_check!(self, new_tail_start, data_size, Truncate);
         fault_point!(self, "replace");
         let mut old_tail = vec![0u8; n as usize];
         read_at(file, new_tail_start, &mut old_tail)?;
@@ -3188,6 +3256,7 @@ impl BStack {
                 format!("swap: range [{offset}, {end}) exceeds payload size ({data_size})")
             ));
         }
+        acl_check!(self, offset, end, Write);
         fault_point!(self, "swap");
         let mut old = vec![0u8; buf.len()];
         read_at(file, offset, &mut old)?;
@@ -3240,6 +3309,7 @@ impl BStack {
                 format!("swap_into: range [{offset}, {end}) exceeds payload size ({data_size})")
             ));
         }
+        acl_check!(self, offset, end, Write);
         fault_point!(self, "swap_into");
         let mut tmp = vec![0u8; buf.len()];
         read_at(file, offset, &mut tmp)?;
@@ -3301,6 +3371,7 @@ impl BStack {
                 format!("cas: range [{offset}, {end}) exceeds payload size ({data_size})")
             ));
         }
+        acl_check!(self, offset, end, Write);
         fault_point!(self, "cas");
         let mut current = vec![0u8; old.len()];
         read_at(file, offset, &mut current)?;
@@ -3388,6 +3459,8 @@ impl BStack {
         if n == 0 {
             return Ok(());
         }
+        acl_check!(self, a, a_end, Write);
+        acl_check!(self, b, b_end, Write);
         fault_point!(self, "cross_exchange");
         Self::mark_replay(replay, journaled_exchange(file, data_size, a, b, n))
     }
@@ -3455,6 +3528,8 @@ impl BStack {
         if from == to {
             return Ok(());
         }
+        acl_check!(self, from, from_end, Read);
+        acl_check!(self, to, to_end, Write);
         fault_point!(self, "copy");
         // Write-strategy hierarchy (see `algos/WIP.md`):
         //  * destination within one aligned block → single-block atomic write
@@ -3533,6 +3608,7 @@ impl BStack {
                 format!("process: range [{start}, {end}) overlaps locked region [0, {locked})")
             ));
         }
+        acl_check!(self, start, end, Write);
         fault_point!(self, "process");
         let mut buf = vec![0u8; n as usize];
         if n > 0 {
@@ -3668,6 +3744,7 @@ impl BStack {
                     // paths below serve without touching the disk, so the
                     // schedule does not shift with cache state.
                     fault_point!(self, "process_gen:read");
+                    acl_check!(self, offset, end, Read);
                     // Fast path: locked bytes are immutable, so they can be
                     // served from the cache or via a lock-free pread instead
                     // of going through the held file handle — mirroring how
@@ -3720,6 +3797,7 @@ impl BStack {
                             )
                         ));
                     }
+                    acl_check!(self, offset, end, Write);
                     if !data.is_empty() {
                         Self::mark_replay(replay, set_in_place(file, data_size, offset, data))?;
                     }
@@ -3781,6 +3859,8 @@ impl BStack {
                             )
                         ));
                     }
+                    acl_check!(self, a_offset, a_end, Write);
+                    acl_check!(self, b_offset, b_end, Write);
                     if len > 0 {
                         Self::mark_replay(
                             replay,
@@ -3793,6 +3873,12 @@ impl BStack {
                     if !data.is_empty() {
                         let file_end = file.seek(SeekFrom::End(0))?;
                         let logical_offset = file_end - HEADER_SIZE;
+                        acl_check!(
+                            self,
+                            logical_offset,
+                            logical_offset + data.len() as u64,
+                            Write
+                        );
                         if let Err(e) = file.write_all(data) {
                             // A failed rollback leaves a stale tail past the committed length:
                             // defer it to the next write's replay.
@@ -3826,6 +3912,7 @@ impl BStack {
                             )
                         ));
                     }
+                    acl_check!(self, new_data_len, data_size, Truncate);
                     if n > 0 {
                         read_at(file, new_data_len, buf)?;
                         Self::mark_replay(replay, commit_shrink(file, clen, new_data_len))?;
@@ -3850,6 +3937,7 @@ impl BStack {
                             )
                         ));
                     }
+                    acl_check!(self, new_data_len, data_size, Truncate);
                     if len > 0 {
                         Self::mark_replay(replay, commit_shrink(file, clen, new_data_len))?;
                     }
@@ -3871,6 +3959,7 @@ impl BStack {
                             format!("process_gen: atrunc would modify locked region [0, {locked})")
                         ));
                     }
+                    acl_check!(self, new_tail_start, data_size, Truncate);
                     if n != 0 || !data.is_empty() {
                         let file_end = HEADER_SIZE + data_size;
                         Self::mark_replay(
@@ -3897,6 +3986,7 @@ impl BStack {
                             format!("process_gen: splice would modify locked region [0, {locked})")
                         ));
                     }
+                    acl_check!(self, new_tail_start, data_size, Truncate);
                     if n != 0 || !new.is_empty() {
                         // Read the removed bytes before any mutation.
                         read_at(file, new_tail_start, old)?;
@@ -3924,6 +4014,7 @@ impl BStack {
                             length,
                             "process_gen: sparse data_size + length overflows u64",
                         )?;
+                        acl_check!(self, data_size, new_len, Write);
                         Self::mark_replay(
                             replay,
                             commit_sparse_extend(file, clen, data_size, file_end, new_len, &blocks),
@@ -4023,6 +4114,7 @@ impl BStack {
                     )
                 ));
             }
+            acl_check!(self, *off, end, Write);
         }
         fault_point!(self, "set_batched");
         // A lone write cannot overlap anything and is already atomic on its own,
@@ -4141,14 +4233,44 @@ impl BStack {
                     // same route as a genuine one.
                     feedback = match inplace_validate_read(offset, buf.len() as u64, data_size) {
                         Err(e) => Err(e),
-                        Ok(()) => match fault_probe!(self, "inplace_gen:read") {
-                            Some(e) => Err(e),
-                            None => inplace_overlay_read(file, data_size, offset, buf, &overlay),
-                        },
+                        Ok(()) => {
+                            // A denied read is reported through `feedback`, the same
+                            // route a genuine read failure takes. Validation passed,
+                            // so `offset + len` cannot overflow.
+                            #[cfg(feature = "expensive-slice-access-control")]
+                            let gate = self.acl_check(
+                                offset,
+                                offset + buf.len() as u64,
+                                AccessOp::Read,
+                                BStackAccessAuthorities::NONE,
+                            );
+                            #[cfg(not(feature = "expensive-slice-access-control"))]
+                            let gate: io::Result<()> = Ok(());
+                            gate.and_then(|()| {
+                                fault_probe!(self, "inplace_gen:read").map_or_else(
+                                    || inplace_overlay_read(file, data_size, offset, buf, &overlay),
+                                    Err,
+                                )
+                            })
+                        }
                     };
                 }
                 Some(BStackGenOp::Write { offset, data }) => {
                     feedback = inplace_validate_write(offset, data, data_size, locked);
+                    // A denial is routed to the generator like a validation error,
+                    // not returned from the call. `is_ok` implies the range already
+                    // passed `inplace_validate_write`'s `checked_end`, so `offset +
+                    // len` cannot overflow here.
+                    #[cfg(feature = "expensive-slice-access-control")]
+                    if feedback.is_ok() {
+                        let end = offset + data.len() as u64;
+                        feedback = self.acl_check(
+                            offset,
+                            end,
+                            AccessOp::Write,
+                            BStackAccessAuthorities::NONE,
+                        );
+                    }
                     if feedback.is_ok() && !data.is_empty() {
                         inplace_overlay_insert(&mut overlay, offset, data);
                     }
@@ -5129,5 +5251,236 @@ impl<'a> io::Seek for BStackReader<'a> {
         }
         self.offset = new_offset as u64;
         Ok(self.offset)
+    }
+}
+
+#[cfg(all(test, feature = "expensive-slice-access-control"))]
+mod acl_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn mk() -> (BStack, PathBuf) {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        let path = std::env::temp_dir().join(format!("bstack_acl_{pid}_{id}.bin"));
+        let _ = std::fs::remove_file(&path);
+        (BStack::open(&path).unwrap(), path)
+    }
+
+    struct Guard(PathBuf);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn seed(s: &BStack, n: usize) {
+        s.push(vec![0xAAu8; n]).unwrap();
+    }
+
+    #[test]
+    fn unprotected_stack_is_transparent() {
+        let (s, p) = mk();
+        let _g = Guard(p);
+        seed(&s, 64);
+        assert_eq!(s.access_at(10), BStackAccess::All);
+        s.set(0, [1, 2, 3]).unwrap();
+        assert_eq!(s.get(0, 3).unwrap(), [1, 2, 3]);
+        s.discard(8).unwrap();
+        assert_eq!(s.len().unwrap(), 56);
+    }
+
+    #[test]
+    fn prot_range_needs_guard_on_every_axis() {
+        let (s, p) = mk();
+        let _g = Guard(p);
+        seed(&s, 64);
+        let prot = s.take_protection().unwrap();
+        s.protect_as(&prot, 16, 16, BStackAccess::Prot).unwrap();
+        assert_eq!(s.access_at(20), BStackAccess::Prot);
+
+        // Tokenless is denied on read, write, and (via the tail) truncate.
+        assert_eq!(
+            s.set(16, [0; 4]).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            s.get(16, 20).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            s.discard(56).unwrap_err().kind(), // would cut into [16,32)
+            io::ErrorKind::PermissionDenied
+        );
+
+        // The guard token satisfies all three.
+        s.set_as(&prot, 16, [7u8; 4]).unwrap();
+        assert_eq!(s.get_as(&prot, 16, 20).unwrap(), [7, 7, 7, 7]);
+        s.discard_as(&prot, 56).unwrap();
+        assert_eq!(s.len().unwrap(), 8);
+    }
+
+    #[test]
+    fn alloc_and_guard_are_incomparable() {
+        let (s, p) = mk();
+        let _g = Guard(p);
+        seed(&s, 64);
+        let alloc = s.take_alloc_authority().unwrap();
+        let prot = s.take_protection().unwrap();
+        s.protect_as(&alloc, 0, 16, BStackAccess::Alloc).unwrap();
+
+        // The guard cannot touch an Alloc range, nor re-mode it.
+        assert_eq!(
+            s.get_as(&prot, 0, 4).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            s.protect_as(&prot, 0, 16, BStackAccess::Prot)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        // The allocator can.
+        s.set_as(&alloc, 0, [1u8; 4]).unwrap();
+        assert_eq!(s.get_as(&alloc, 0, 4).unwrap(), [1, 1, 1, 1]);
+    }
+
+    #[test]
+    fn readonly_denies_writes_only() {
+        let (s, p) = mk();
+        let _g = Guard(p);
+        seed(&s, 32);
+        s.protect(0, 16, BStackAccess::ReadOnly).unwrap();
+        assert_eq!(s.get(0, 4).unwrap().len(), 4); // reads pass
+        assert_eq!(
+            s.set(0, [0u8; 4]).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            s.zero(0, 4).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn locked_denies_reads() {
+        let (s, p) = mk();
+        let _g = Guard(p);
+        seed(&s, 32);
+        s.protect(0, 16, BStackAccess::Locked).unwrap();
+        assert_eq!(
+            s.get(0, 4).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            s.peek(0).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn tokenless_protect_only_tightens_all() {
+        let (s, p) = mk();
+        let _g = Guard(p);
+        seed(&s, 32);
+        s.protect(0, 16, BStackAccess::ReadOnly).unwrap();
+        // Re-arming a now-non-All range without a token is denied.
+        assert_eq!(
+            s.protect(0, 16, BStackAccess::All).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn tokens_are_one_shot() {
+        let (s, p) = mk();
+        let _g = Guard(p);
+        assert!(s.take_protection().is_some());
+        assert!(s.take_protection().is_none());
+        assert!(s.take_alloc_authority().is_some());
+        assert!(s.take_alloc_authority().is_none());
+    }
+
+    #[test]
+    fn foreign_token_grants_nothing() {
+        let (s1, p1) = mk();
+        let _g1 = Guard(p1);
+        let (s2, p2) = mk();
+        let _g2 = Guard(p2);
+        seed(&s1, 32);
+        let foreign = s2.take_protection().unwrap();
+        s1.protect(0, 16, BStackAccess::Prot).unwrap();
+        // A token minted from s2 is treated as tokenless on s1.
+        assert_eq!(
+            s1.get_as(&foreign, 0, 4).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn append_checks_its_target_region() {
+        let (s, p) = mk();
+        let _g = Guard(p);
+        seed(&s, 16);
+        // Arm the region a push would land in, before its bytes exist.
+        s.protect(16, 16, BStackAccess::Locked).unwrap();
+        assert_eq!(
+            s.push(vec![0u8; 8]).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            s.extend(8).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(s.len().unwrap(), 16); // nothing appended
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn atomic_ops_respect_protection() {
+        let (s, p) = mk();
+        let _g = Guard(p);
+        seed(&s, 64);
+        let prot = s.take_protection().unwrap();
+        s.protect_as(&prot, 16, 16, BStackAccess::Prot).unwrap();
+        let denied = |k: io::ErrorKind| assert_eq!(k, io::ErrorKind::PermissionDenied);
+
+        // In-place mutators over the protected range are denied tokenless.
+        denied(s.swap(16, [0u8; 4]).unwrap_err().kind());
+        denied(s.cas(16, [0xAAu8; 4], [0u8; 4]).unwrap_err().kind());
+        denied(s.process(16, 20, |b| b.fill(0)).unwrap_err().kind());
+        // copy: source read denied.
+        denied(s.copy(16, 40, 4).unwrap_err().kind());
+        // copy: destination write denied.
+        denied(s.copy(40, 16, 4).unwrap_err().kind());
+        // cross_exchange touching the range denied.
+        denied(s.cross_exchange(16, 40, 4).unwrap_err().kind());
+        // A tail replace that reaches into the range is denied.
+        denied(s.atrunc(56, []).unwrap_err().kind()); // truncates [8, 64) ⊇ [16,32)
+        // Batched read of the range denied.
+        denied(s.get_batched(std::iter::once(16..20)).unwrap_err().kind());
+
+        // Outside the protected range, the same ops succeed.
+        s.swap(40, [1u8; 4]).unwrap();
+        assert_eq!(s.get(40, 44).unwrap(), [1, 1, 1, 1]);
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn set_batched_checks_every_block() {
+        let (s, p) = mk();
+        let _g = Guard(p);
+        seed(&s, 64);
+        s.protect(32, 8, BStackAccess::ReadOnly).unwrap();
+        // One block lands in the ReadOnly region → the whole batch is refused.
+        assert_eq!(
+            s.set_batched([(0u64, vec![1u8; 4]), (32u64, vec![2u8; 4])])
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        // The permitted block was not applied (checks run before the journal).
+        assert_eq!(s.get(0, 4).unwrap(), [0xAA, 0xAA, 0xAA, 0xAA]);
     }
 }
