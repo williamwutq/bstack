@@ -1077,7 +1077,7 @@ bstack_t *ghost_tree_bstack_allocator_into_stack(ghost_tree_bstack_allocator_t *
  *
  * On-disk layout (all within the bstack payload):
  *   [0..24)  — reserved (OFFSET_SIZE; available for caller use)
- *   [24..32) — magic: "ALSL\x00\x01\x01\x00"
+ *   [24..32) — magic: "ALSL\x00\x01\x02\x00"
  *   [32..40) — block_size (8 B LE)
  *   [40..48) — free_head  (8 B LE) — payload offset of first free block, or 0
  *   [48..)   — block arena
@@ -1177,7 +1177,7 @@ uint64_t slab_bstack_allocator_block_size(const slab_bstack_allocator_t *alloc);
  * On-disk layout (all within the bstack payload):
  *   [0..24)  — reserved (OFFSET_SIZE; available for caller use)
  *   [24..48) — allocator header: magic[8] | block_size[8] | free_head[8]
- *              magic = "ALCK\x00\x01\x01\x00"
+ *              magic = "ALCK\x00\x01\x03\x00"
  *   [48..)   — block arena
  *
  * Each block in the arena:
@@ -1311,7 +1311,7 @@ uint64_t checked_slab_bstack_allocator_data_size(
  *
  * On-disk layout (all within the bstack payload):
  *   [0..24)  — reserved (OFFSET_SIZE; available for caller use)
- *   [24..32) — magic: "ALSG\x00\x02\x00\x00"
+ *   [24..32) — magic: "ALSG\x00\x02\x01\x00"
  *   [32..40) — reserved (no field yet)
  *   [40..40+NUM_CLASSES*8) — free_head[NUM_CLASSES] (last entry = oversized list)
  *   [ARENA_START..) — block arena (16-byte aligned; ARENA_START = 304)

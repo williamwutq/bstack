@@ -24,6 +24,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **`len`, `is_empty`, and every other read now fail while an interrupted write is pending replay — with the new `InterruptedWrite` error (Rust) or `errno = BSTACK_EREPLAY` (C).** The signatures are unchanged, but `len`/`is_empty` previously could not fail outside an armed fault policy, so a `len().unwrap()` issued after a failed write on the same stack now panics where it did not before, and `bstack_len`/`bstack_is_empty` gain a failure mode their callers may not check. `InterruptedWrite` is a public unit struct carried as the payload of an `io::ErrorKind::Other` error.
+- **`SlabBStackAllocator` and `CheckedSlabBStackAllocator` versions bumped (`alloc` + `set`; Rust and C): magic `ALSL\x00\x01\x01\x00` → `ALSL\x00\x01\x02\x00`, `ALCK\x00\x01\x02\x00` → `ALCK\x00\x01\x03\x00`.** No layout change; the patch byte records the writer, so a file can be attributed to a build carrying this cycle's `BStackBulkAllocator` paths — `alloc_bulk`/`dealloc_bulk`, including the checked variant's clearing of each freed block's overhead before the splice.
+- **`SegregatedBStackAllocator` version bumped (`alloc` + `set`, experimental; Rust and C): magic `ALSG\x00\x02\x00\x00` → `ALSG\x00\x02\x01\x00`.** No layout change; the patch byte records the writer, so a file can be attributed to a build carrying this cycle's `alloc_bulk`/`dealloc_bulk` and `coalesce`, the latter merging physically-adjacent free blocks and rebuilding every class list in place. Only the first 6 bytes are checked on open, so 0.2.x files stay compatible in both directions.
 
 ### Fixed
 

@@ -61,7 +61,7 @@ use std::{fmt, io};
 /// Magic: `ALSG` + major 0 + minor 2; the version encodes the fixed class scheme
 /// and the in-use overhead recording the block's physical size (minor 1 recorded
 /// the caller's length instead — a `\x01` file fails `new` with `InvalidData`).
-const ALSG_MAGIC: [u8; 8] = *b"ALSG\x00\x02\x00\x00";
+const ALSG_MAGIC: [u8; 8] = *b"ALSG\x00\x02\x01\x00";
 /// Compatibility prefix checked on open (`ALSG` + major 0 + minor 2).
 const ALSG_MAGIC_PREFIX: [u8; 6] = *b"ALSG\x00\x02";
 
@@ -72,7 +72,7 @@ const ALSG_MAGIC_PREFIX: [u8; 6] = *b"ALSG\x00\x02";
 ///
 /// ```text
 /// offset  0  reserved (user)                24 B
-/// offset 24  magic  "ALSG\x00\x02\x00\x00"   8 B
+/// offset 24  magic  "ALSG\x00\x02\x01\x00"   8 B
 /// offset 32  _reserved                       8 B
 /// offset 40  free_head[NUM_CLASSES] : u64          # last entry = oversized list
 /// arena start (16-B aligned; header ends 16-aligned already)

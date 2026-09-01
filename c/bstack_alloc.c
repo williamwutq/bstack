@@ -4378,7 +4378,7 @@ bstack_t *ghost_tree_bstack_allocator_into_stack(ghost_tree_bstack_allocator_t *
 #define SLAB_MIN_BLOCK_SIZE    UINT64_C(8)
 #define SLAB_SENTINEL          UINT64_C(0)
 
-static const uint8_t alsl_magic[8]        = {'A','L','S','L',0,1,1,0};
+static const uint8_t alsl_magic[8]        = {'A','L','S','L',0,1,2,0};
 static const uint8_t alsl_magic_prefix[6] = {'A','L','S','L',0,1};
 
 /* ---- helpers ----------------------------------------------------------- */
@@ -5558,7 +5558,7 @@ uint64_t slab_bstack_allocator_block_size(const slab_bstack_allocator_t *alloc)
 /* Maximum number of suspect blocks analysed in resync_tail before giving up. */
 #define ALCK_MAX_RECOVER_REGION ((size_t)(1u << 26))
 
-static const uint8_t alck_magic[8]        = {'A','L','C','K',0,1,2,0};
+static const uint8_t alck_magic[8]        = {'A','L','C','K',0,1,3,0};
 static const uint8_t alck_magic_prefix[6] = {'A','L','C','K',0,1};
 
 /* ---- LE helpers (reuse read_le64 / write_le64 already defined above) --- */
@@ -7701,7 +7701,7 @@ uint64_t checked_slab_bstack_allocator_data_size(
 /* Magic: "ALSG" + major 0 + minor 2; the version encodes the fixed class scheme
  * and the in-use overhead recording the block's physical size (minor 1 recorded
  * the caller's length instead — a \x01 file fails new() with EINVAL). */
-static const uint8_t alsg_magic[8]        = {'A','L','S','G',0,2,0,0};
+static const uint8_t alsg_magic[8]        = {'A','L','S','G',0,2,1,0};
 static const uint8_t alsg_magic_prefix[6] = {'A','L','S','G',0,2};
 
 #define alsg_head_off(cls) (ALSG_FREE_HEAD_BASE + (uint64_t)(cls) * 8)
