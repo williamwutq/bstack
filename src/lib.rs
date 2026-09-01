@@ -710,6 +710,11 @@ pub use fault::{FaultPolicy, FaultState};
 mod alloc_fuzz;
 mod test;
 
+#[cfg(feature = "expensive-slice-access-control")]
+mod acl_core;
+#[cfg(feature = "expensive-slice-access-control")]
+pub use acl_core::{AccessOp, BStackAccess, BStackAccessAuthorities, BStackAccessRequirement};
+
 #[cfg(feature = "alloc")]
 mod alloc;
 #[cfg(feature = "alloc")]

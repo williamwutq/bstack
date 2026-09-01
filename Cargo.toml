@@ -22,6 +22,9 @@ alloc = []
 atomic = []
 # Enables BStackGuardedSlice and related hook-based slice abstractions.
 guarded = ["alloc"]
+# Enables runtime range access control on BStack / BStackOwnedSlice (the
+# BStackAccess point table). Off by default; See the `acl_core` module.
+expensive-slice-access-control = ["alloc", "set"]
 # Enables deterministic I/O-fault injection at the BStack API level, for testing
 # allocator and downstream error-handling paths. Only takes effect in builds with
 # `debug_assertions` on (dev/test); release builds are completely unaffected even
