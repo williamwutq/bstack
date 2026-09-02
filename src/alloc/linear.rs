@@ -29,7 +29,7 @@ use std::{fmt, io};
 /// | Operation            | Without `atomic`    | With `atomic`           |
 /// |----------------------|---------------------|-------------------------|
 /// | `alloc`              | [`BStack::extend`]  | [`BStack::extend`]      |
-/// | `realloc` grow       | [`BStack::extend`]  | [`BStack::try_extend`]  |
+/// | `realloc` grow       | [`BStack::extend`]  | [`BStack::try_extend_zeros`] |
 /// | `realloc` shrink     | [`BStack::discard`] | [`BStack::try_discard`] |
 /// | `dealloc` (tail)     | [`BStack::discard`] | [`BStack::try_discard`] |
 /// | `dealloc` (non-tail) | no-op               | no-op                   |
@@ -46,7 +46,7 @@ use std::{fmt, io};
 ///
 /// * **`alloc`** / **`alloc_bulk`**: a single [`BStack::extend`] returns a
 ///   distinct region to every caller regardless of concurrency.
-/// * **`realloc`**: uses [`BStack::try_extend`] / [`BStack::try_discard`]
+/// * **`realloc`**: uses [`BStack::try_extend_zeros`] / [`BStack::try_discard`]
 ///   with `slice.end()` as the sentinel.  If the tail has moved (another
 ///   thread raced), the call returns [`io::ErrorKind::Unsupported`] — the
 ///   same error as a non-tail realloc on a single thread.
@@ -165,7 +165,7 @@ impl BStackAllocator for LinearBStackAllocator {
     }
 
     // With the `atomic` feature the tail check and the modification are a
-    // single locked step (`try_extend`/`try_discard`), eliminating the TOCTOU
+    // single locked step (`try_extend_zeros`/`try_discard`), eliminating the TOCTOU
     // race that exists in the non-atomic version.  A `false` return means
     // another thread moved the tail first; we surface this as `Unsupported`,
     // the same error returned for a non-tail slice on a single thread.
@@ -178,9 +178,14 @@ impl BStackAllocator for LinearBStackAllocator {
         match new_len.cmp(&slice.len()) {
             std::cmp::Ordering::Equal => Ok(slice),
             std::cmp::Ordering::Greater => {
-                let delta = new_len - slice.len();
-                let zeros = vec![0u8; delta as usize];
-                if !self.stack.try_extend(slice.end(), zeros)? {
+                // `try_extend_zeros` rather than `try_extend` of a zero
+                // buffer: same tail guard and same result, but the growth is
+                // realised by one `set_len` on a sparse file, so the zeros
+                // cost no write I/O and no heap staging.
+                if !self
+                    .stack
+                    .try_extend_zeros(slice.end(), new_len - slice.len())?
+                {
                     return Err(io::Error::new(
                         io::ErrorKind::Unsupported,
                         "LinearBStackAllocator does not support reallocation of non-tail slices; \

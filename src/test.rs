@@ -2191,6 +2191,21 @@ mod alloc_tests {
         assert_eq!(alloc.len().unwrap(), 16);
     }
 
+    // The grown tail reads back as zeros, whether it was realised by
+    // `extend` (no `atomic`) or `try_extend_zeros` (with `atomic`).
+    #[cfg(feature = "set")]
+    #[test]
+    fn realloc_tail_grow_zero_fills_the_new_bytes() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(8).unwrap();
+        s.write([0xFFu8; 8]).unwrap();
+        let s2 = alloc.realloc(s, 16).unwrap();
+        let buf = s2.read().unwrap();
+        assert!(buf[..8].iter().all(|&b| b == 0xFF));
+        assert!(buf[8..].iter().all(|&b| b == 0));
+    }
+
     // 10. realloc tail-shrink decreases len
     #[test]
     fn realloc_tail_shrink() {
