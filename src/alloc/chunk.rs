@@ -7,7 +7,7 @@
 
 #[cfg(all(feature = "set", feature = "atomic"))]
 use super::BStackOwnedSliceAllocator;
-use super::{BStackAllocator, BStackOwnedSlice, BStackSlice};
+use super::{BStackAllocator, BStackOwnedSlice, BStackRange, BStackSlice};
 use crate::BStack;
 use std::cmp::Ordering;
 use std::fmt;
@@ -173,6 +173,23 @@ impl<'a> AsRef<BStackSlice<'a>> for BStackChunk<'a> {
     #[inline]
     fn as_ref(&self) -> &BStackSlice<'a> {
         &self.aligned
+    }
+}
+
+/// Discards the stride, yielding the aligned region's coordinate pair.
+impl<'a> From<BStackChunk<'a>> for BStackRange {
+    #[inline]
+    fn from(chunk: BStackChunk<'a>) -> Self {
+        chunk.aligned.as_range()
+    }
+}
+
+/// Discards the stride, serialising the aligned region as `offset` then
+/// `len`, 8 bytes LE each.
+impl<'a> From<BStackChunk<'a>> for [u8; 16] {
+    #[inline]
+    fn from(chunk: BStackChunk<'a>) -> Self {
+        chunk.aligned.to_bytes()
     }
 }
 

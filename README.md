@@ -513,12 +513,12 @@ assert!(stack.pop(stack.len()? - 60).is_err()); // would shrink below locked
 
 **`BStackRange`** — raw `(offset, len)` coordinate pair, no backing reference.
 
-| Trait                                                               | Semantics                                                             |
-|---------------------------------------------------------------------|-----------------------------------------------------------------------|
-| `PartialEq` / `Eq`                                                  | Compares `(offset, len)`.                                             |
-| `Hash`                                                              | Hashes `(offset, len)`.                                               |
-| `PartialOrd` / `Ord`                                                | Ordered by `offset`, then `len`.                                      |
-| `From<[u8; 16]> for BStackRange` / `From<BStackRange> for [u8; 16]` | Serialises/deserialises `[offset_le8 ‖ len_le8]` for on-disk storage. |
+| Trait                                                               | Semantics                                                                          |
+|---------------------------------------------------------------------|------------------------------------------------------------------------------------|
+| `PartialEq` / `Eq`                                                  | Compares `(offset, len)`.                                                          |
+| `Hash`                                                              | Hashes `(offset, len)`.                                                            |
+| `PartialOrd` / `Ord`                                                | Ordered by `offset`, then `len`.                                                   |
+| `From<[u8; 16]> for BStackRange` / `From<BStackRange> for [u8; 16]` | Serialises/deserialises `offset` then `len`, 8 bytes LE each, for on-disk storage. |
 
 **`BStackOwnedSlice<'a, A>`** — ownership handle carrying `&'a A`. Non-`Copy`, non-`Clone`.
 
@@ -571,7 +571,9 @@ weaker contract, for generic code that accepts `impl AsRef<BStackRange>`.
 | `Hash`                   | Hashes `(chunk_len, aligned region)`.                                                       |
 | `PartialOrd` / `Ord`     | Ordered by `chunk_len` first, then by the aligned region's own `Ord`.                       |
 | `AsRef<BStackSlice<'a>>` | Borrows the aligned region.                                                                 |
-| `Into<BStackSlice<'a>>`  | Consumes the view, discarding the stride.                                                   |
+| `Into<BStackSlice<'a>>`  | The aligned region as a plain slice, stride dropped.                                        |
+| `Into<BStackRange>`      | The aligned region's `(offset, len)`, stride dropped.                                       |
+| `Into<[u8; 16]>`         | The aligned region as `offset` then `len`, 8 bytes LE each, for on-disk storage.            |
 
 Deliberately **not** cross-comparable with `BStackSlice`/`BStackOwnedSlice`/`BStackRange` — a chunk view's stride is part of its identity, and comparing it directly against a bare slice would silently discard that.
 

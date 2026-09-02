@@ -202,6 +202,16 @@ impl From<BStackRange> for [u8; 16] {
     }
 }
 
+/// The inverse of `From<BStackRange> for [u8; 16]`, via
+/// [`from_bytes`](BStackRange::from_bytes) — `len` is silently capped so that
+/// `offset + len` cannot overflow.
+impl From<[u8; 16]> for BStackRange {
+    #[inline]
+    fn from(bytes: [u8; 16]) -> Self {
+        BStackRange::from_bytes(bytes)
+    }
+}
+
 impl From<Range<u64>> for BStackRange {
     #[inline]
     fn from(r: Range<u64>) -> Self {

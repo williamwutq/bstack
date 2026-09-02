@@ -5578,6 +5578,27 @@ mod alloc_tests {
         assert_eq!(slice.start(), own.start());
         assert_eq!(slice.len(), 12);
     }
+
+    // The serialization edges: chunk -> range / bytes, and bytes -> range.
+    #[test]
+    fn range_and_chunk_serialization_conversions() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let own = alloc.alloc(12).unwrap();
+        let (view, _) = own.as_slice().chunks(4);
+        let expected = view.as_slice().as_range();
+
+        let bytes: [u8; 16] = view.clone().into();
+        let range: BStackRange = view.into();
+        assert_eq!(range, expected);
+        assert_eq!(bytes, expected.to_bytes());
+
+        // [u8; 16] -> BStackRange is the inverse of BStackRange -> [u8; 16].
+        let round: BStackRange = bytes.into();
+        assert_eq!(round, range);
+        let back: [u8; 16] = round.into();
+        assert_eq!(back, bytes);
+    }
 }
 
 // -------------------------------------------------------------------------
