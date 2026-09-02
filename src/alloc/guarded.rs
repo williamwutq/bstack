@@ -812,3 +812,406 @@ where
     Self: 'a,
 {
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{BStackGuardedSlice, BStackGuardedSliceSubview};
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    use super::BStackAtomicGuardedSlice;
+    use crate::{BStack, BStackSlice, LinearBStackAllocator};
+    use std::borrow::Cow;
+    use std::cell::Cell;
+    use std::io;
+
+    /// The allocator type is a phantom parameter of the trait; pin it so method
+    /// calls resolve. No allocator is ever constructed.
+    type A = LinearBStackAllocator;
+
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn mk_stack() -> (BStack, Cleanup) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static C: AtomicU64 = AtomicU64::new(0);
+        let id = C.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("bstack_guard_{}_{}.bin", std::process::id(), id));
+        let stack = BStack::open(&path).unwrap();
+        (stack, Cleanup(path))
+    }
+
+    /// A raw `BStackSlice` over `[offset, offset + len)` of `stack`'s payload.
+    fn region(stack: &BStack, offset: u64, len: u64) -> BStackSlice<'_> {
+        // SAFETY: tests place the region within the committed payload before use.
+        unsafe { BStackSlice::from_raw_parts(stack, offset, len) }
+    }
+
+    // ---- test guards ----
+
+    /// Identity pass-through guard: `encode`/`decode` default to no-ops.
+    struct Pass<'a>(BStackSlice<'a>);
+    impl<'a> BStackGuardedSlice<'a, A> for Pass<'a> {
+        fn len(&self) -> u64 {
+            self.0.len()
+        }
+        unsafe fn raw_block(&self) -> BStackSlice<'a> {
+            self.0.clone()
+        }
+    }
+    impl<'a> BStackGuardedSliceSubview<'a, A> for Pass<'a> {
+        fn subview(&self, start: u64, end: u64) -> impl BStackGuardedSliceSubview<'a, A> + '_ {
+            Pass(self.0.subslice(start, end))
+        }
+    }
+
+    /// XOR cipher guard: length-preserving, `encode == decode` (an involution),
+    /// so the raw stored bytes differ from the apparent (decoded) bytes.
+    struct Xor<'a> {
+        slice: BStackSlice<'a>,
+        key: u8,
+    }
+    impl<'a> BStackGuardedSlice<'a, A> for Xor<'a> {
+        fn len(&self) -> u64 {
+            self.slice.len()
+        }
+        unsafe fn raw_block(&self) -> BStackSlice<'a> {
+            self.slice.clone()
+        }
+        fn decode<'d>(&self, data: &'d [u8]) -> io::Result<Cow<'d, [u8]>> {
+            Ok(Cow::Owned(data.iter().map(|b| b ^ self.key).collect()))
+        }
+        fn encode<'d>(&self, data: &'d [u8]) -> io::Result<Cow<'d, [u8]>> {
+            Ok(Cow::Owned(data.iter().map(|b| b ^ self.key).collect()))
+        }
+    }
+
+    // ---- reads, accessors, scans (feature `guarded`) ----
+
+    #[test]
+    fn read_identity() {
+        let (stack, _c) = mk_stack();
+        stack.push(b"hello world!").unwrap();
+        let g = Pass(region(&stack, 0, 12));
+        assert_eq!(g.read().unwrap(), b"hello world!");
+        assert_eq!(g.len(), 12);
+        assert!(!g.is_empty());
+    }
+
+    #[test]
+    fn accessors_report_raw_block() {
+        let (stack, _c) = mk_stack();
+        stack.push([0u8; 32]).unwrap();
+        let g = Pass(region(&stack, 8, 16));
+        assert_eq!(g.start(), 8);
+        assert_eq!(g.end(), 24);
+        assert_eq!(g.range(), 8..24);
+        assert_eq!(g.as_range().start(), 8);
+        assert!(std::ptr::eq(g.stack(), &stack));
+    }
+
+    #[test]
+    fn read_into_and_ranges() {
+        let (stack, _c) = mk_stack();
+        stack.push(b"abcdefgh").unwrap();
+        let g = Pass(region(&stack, 0, 8));
+        let mut buf = [0u8; 8];
+        g.read_into(&mut buf).unwrap();
+        assert_eq!(&buf, b"abcdefgh");
+        let mut small = [0u8; 4];
+        assert_eq!(g.read_into(&mut small).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(g.read_range(2, 5).unwrap(), b"cde");
+        assert_eq!(g.read_range(5, 2).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(g.read_range(0, 9).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        let mut into = [0u8; 3];
+        g.read_range_into(1, &mut into).unwrap();
+        assert_eq!(&into, b"bcd");
+    }
+
+    #[test]
+    fn scan_family() {
+        let (stack, _c) = mk_stack();
+        stack.push(b"abcabc").unwrap();
+        let g = Pass(region(&stack, 0, 6));
+        assert_eq!(g.get(2).unwrap(), Some(b'c'));
+        assert_eq!(g.get(6).unwrap(), None);
+        assert!(g.contains(b'b').unwrap());
+        assert!(!g.contains(b'z').unwrap());
+        assert!(g.starts_with(b"abc").unwrap());
+        assert!(g.ends_with(b"abc").unwrap());
+        assert_eq!(g.find(b'c').unwrap(), Some(2));
+        assert_eq!(g.rfind(b'a').unwrap(), Some(3));
+        assert_eq!(g.position(|b| b == b'b').unwrap(), Some(1));
+        assert_eq!(g.rposition(|b| b == b'b').unwrap(), Some(4));
+    }
+
+    #[test]
+    fn xor_decode_on_read() {
+        let (stack, _c) = mk_stack();
+        let key = 0x5A;
+        let plain = b"secret payload!!";
+        let cipher: Vec<u8> = plain.iter().map(|b| b ^ key).collect();
+        stack.push(&cipher).unwrap();
+        let g = Xor { slice: region(&stack, 0, plain.len() as u64), key };
+        assert_eq!(g.read().unwrap(), plain);
+        // raw bytes on disk stay ciphertext
+        assert_eq!(region(&stack, 0, plain.len() as u64).read().unwrap(), cipher);
+    }
+
+    #[test]
+    fn subview_head_tail() {
+        let (stack, _c) = mk_stack();
+        stack.push(b"abcdefgh").unwrap();
+        let g = Pass(region(&stack, 0, 8));
+        let sv = g.subview(2, 5);
+        assert_eq!(sv.len(), 3);
+        assert_eq!(sv.read().unwrap(), b"cde");
+        assert_eq!(g.subview_range(1..4).read().unwrap(), b"bcd");
+        assert_eq!(g.head(3).read().unwrap(), b"abc");
+        assert_eq!(g.tail(2).read().unwrap(), b"gh");
+        // clamps to len
+        assert_eq!(g.head(99).read().unwrap(), b"abcdefgh");
+        assert_eq!(g.tail(99).read().unwrap(), b"abcdefgh");
+    }
+
+    #[test]
+    fn on_read_can_deny() {
+        struct Deny<'a>(BStackSlice<'a>);
+        impl<'a> BStackGuardedSlice<'a, A> for Deny<'a> {
+            fn len(&self) -> u64 {
+                self.0.len()
+            }
+            unsafe fn raw_block(&self) -> BStackSlice<'a> {
+                self.0.clone()
+            }
+            fn on_read(&self, _o: u64, _l: u64) -> io::Result<()> {
+                Err(io::Error::from(io::ErrorKind::PermissionDenied))
+            }
+        }
+        let (stack, _c) = mk_stack();
+        stack.push([0u8; 4]).unwrap();
+        let g = Deny(region(&stack, 0, 4));
+        assert_eq!(g.read().unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn on_read_fires_relative() {
+        struct Rec<'a> {
+            slice: BStackSlice<'a>,
+            seen: Cell<Option<(u64, u64)>>,
+        }
+        impl<'a> BStackGuardedSlice<'a, A> for Rec<'a> {
+            fn len(&self) -> u64 {
+                self.slice.len()
+            }
+            unsafe fn raw_block(&self) -> BStackSlice<'a> {
+                self.slice.clone()
+            }
+            fn on_read(&self, offset: u64, len: u64) -> io::Result<()> {
+                self.seen.set(Some((offset, len)));
+                Ok(())
+            }
+        }
+        let (stack, _c) = mk_stack();
+        stack.push([0u8; 24]).unwrap();
+        // Region at absolute offset 8; on_read must see the *relative* offset 0.
+        let g = Rec { slice: region(&stack, 8, 10), seen: Cell::new(None) };
+        g.read().unwrap();
+        assert_eq!(g.seen.get(), Some((0, 10)));
+    }
+
+    // ---- full-replace writes (feature `set`) ----
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn write_and_fill_family() {
+        let (stack, _c) = mk_stack();
+        stack.push([9u8; 5]).unwrap();
+        let g = Pass(region(&stack, 0, 5));
+        g.write(b"world").unwrap();
+        assert_eq!(g.read().unwrap(), b"world");
+        g.fill(7).unwrap();
+        assert_eq!(g.read().unwrap(), [7, 7, 7, 7, 7]);
+        g.zero().unwrap();
+        assert_eq!(g.read().unwrap(), [0, 0, 0, 0, 0]);
+        let mut n = 0u8;
+        g.fill_with(|| {
+            n += 1;
+            n
+        })
+        .unwrap();
+        assert_eq!(g.read().unwrap(), [1, 2, 3, 4, 5]);
+        g.copy_from_slice(b"abcde").unwrap();
+        assert_eq!(g.read().unwrap(), b"abcde");
+        assert_eq!(g.copy_from_slice(b"abc").unwrap_err().kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn xor_write_roundtrip() {
+        let (stack, _c) = mk_stack();
+        stack.push([0u8; 8]).unwrap();
+        let key = 0x33;
+        let g = Xor { slice: region(&stack, 0, 8), key };
+        g.write(b"12345678").unwrap();
+        assert_eq!(g.read().unwrap(), b"12345678");
+        let raw = region(&stack, 0, 8).read().unwrap();
+        let expect: Vec<u8> = b"12345678".iter().map(|b| b ^ key).collect();
+        assert_eq!(raw, expect);
+    }
+
+    /// A guard overriding only the **deprecated** hooks keeps working, and the
+    /// bridges preserve each hook's original offset convention: `pre_read`
+    /// absolute, `post_write` relative.
+    #[cfg(feature = "set")]
+    #[test]
+    #[allow(deprecated)]
+    fn deprecated_hook_bridge() {
+        struct Legacy<'a> {
+            slice: BStackSlice<'a>,
+            key: u8,
+            pre_read_off: Cell<u64>,
+            post_write_off: Cell<u64>,
+        }
+        #[allow(deprecated)]
+        impl<'a> BStackGuardedSlice<'a, A> for Legacy<'a> {
+            fn len(&self) -> u64 {
+                self.slice.len()
+            }
+            unsafe fn raw_block(&self) -> BStackSlice<'a> {
+                self.slice.clone()
+            }
+            fn post_read<'d>(&self, data: &'d [u8]) -> io::Result<Cow<'d, [u8]>> {
+                Ok(Cow::Owned(data.iter().map(|b| b ^ self.key).collect()))
+            }
+            fn pre_write<'d>(&self, data: &'d [u8]) -> io::Result<Cow<'d, [u8]>> {
+                Ok(Cow::Owned(data.iter().map(|b| b ^ self.key).collect()))
+            }
+            fn pre_read(&self, offset: u64, _len: u64) -> io::Result<()> {
+                self.pre_read_off.set(offset);
+                Ok(())
+            }
+            fn post_write(&self, offset: u64, _len: u64) -> io::Result<()> {
+                self.post_write_off.set(offset);
+                Ok(())
+            }
+        }
+        let (stack, _c) = mk_stack();
+        stack.push([0u8; 16]).unwrap(); // 8 bytes padding, then the region
+        let key = 0x5A;
+        let g = Legacy {
+            slice: region(&stack, 8, 4),
+            key,
+            pre_read_off: Cell::new(u64::MAX),
+            post_write_off: Cell::new(u64::MAX),
+        };
+        // write() -> encode bridges to the deprecated pre_write (XOR).
+        g.write(b"WXYZ").unwrap();
+        // post_write bridged with the RELATIVE offset 0.
+        assert_eq!(g.post_write_off.get(), 0);
+        let raw = region(&stack, 8, 4).read().unwrap();
+        let expect: Vec<u8> = b"WXYZ".iter().map(|b| b ^ key).collect();
+        assert_eq!(raw, expect);
+        // read() -> decode bridges to the deprecated post_read (XOR back).
+        assert_eq!(g.read().unwrap(), b"WXYZ");
+        // pre_read bridged with the ABSOLUTE offset = slice.start() = 8.
+        assert_eq!(g.pre_read_off.get(), 8);
+    }
+
+    // ---- atomic read-modify-write (features `set` + `atomic`) ----
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn write_range_and_process() {
+        let (stack, _c) = mk_stack();
+        stack.push(b"AAAAAAAA").unwrap();
+        let g = Pass(region(&stack, 0, 8));
+        g.write_range(2, b"XYZ").unwrap();
+        assert_eq!(g.read().unwrap(), b"AAXYZAAA");
+        assert_eq!(g.write_range(6, b"XYZ").unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        g.process(|b| b.iter_mut().for_each(|x| *x = x.to_ascii_lowercase())).unwrap();
+        assert_eq!(g.read().unwrap(), b"aaxyzaaa");
+        g.copy_within(2..5, 5).unwrap(); // copy "xyz" to offset 5
+        assert_eq!(g.read().unwrap(), b"aaxyzxyz");
+        g.zero_range(0, 2).unwrap();
+        assert_eq!(g.read().unwrap(), &[0, 0, b'x', b'y', b'z', b'x', b'y', b'z']);
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn xor_write_range_is_rmw() {
+        let (stack, _c) = mk_stack();
+        stack.push([0u8; 8]).unwrap();
+        let key = 0xAA;
+        let g = Xor { slice: region(&stack, 0, 8), key };
+        g.write(b"00000000").unwrap();
+        g.write_range(3, b"ABC").unwrap();
+        assert_eq!(g.read().unwrap(), b"000ABC00");
+        let raw = region(&stack, 0, 8).read().unwrap();
+        let expect: Vec<u8> = b"000ABC00".iter().map(|b| b ^ key).collect();
+        assert_eq!(raw, expect);
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn encode_length_change_rejected() {
+        struct BadEncode<'a>(BStackSlice<'a>);
+        impl<'a> BStackGuardedSlice<'a, A> for BadEncode<'a> {
+            fn len(&self) -> u64 {
+                self.0.len()
+            }
+            unsafe fn raw_block(&self) -> BStackSlice<'a> {
+                self.0.clone()
+            }
+            fn encode<'d>(&self, data: &'d [u8]) -> io::Result<Cow<'d, [u8]>> {
+                let mut v = data.to_vec();
+                v.push(0); // wrongly grows the block
+                Ok(Cow::Owned(v))
+            }
+        }
+        let (stack, _c) = mk_stack();
+        stack.push([0u8; 4]).unwrap();
+        let g = BadEncode(region(&stack, 0, 4));
+        assert_eq!(g.write_range(0, b"ab").unwrap_err().kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn empty_block_ops_are_noops() {
+        let (stack, _c) = mk_stack();
+        let g = Pass(region(&stack, 0, 0));
+        assert_eq!(g.read().unwrap(), b"");
+        g.process(|_| {}).unwrap();
+        g.write_range(0, b"").unwrap();
+    }
+
+    // ---- atomic marker: raw swap / cas (features `set` + `atomic`) ----
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    unsafe impl<'a> BStackAtomicGuardedSlice<'a, A> for Pass<'a> {}
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn atomic_cas_and_swap_on_raw() {
+        let (stack, _c) = mk_stack();
+        stack.push(b"OLDDATA_").unwrap();
+        let g = Pass(region(&stack, 0, 8));
+        let target = region(&stack, 0, 8);
+        let prev = g.cas_on(&target, b"OLDDATA_", b"NEWDATA!").unwrap();
+        assert_eq!(prev.as_deref(), Some(&b"OLDDATA_"[..]));
+        assert_eq!(g.read().unwrap(), b"NEWDATA!");
+        // mismatched expected -> no swap
+        assert!(g.cas_on(&target, b"OLDDATA_", b"XXXXXXXX").unwrap().is_none());
+        assert_eq!(g.read().unwrap(), b"NEWDATA!");
+
+        // swap two adjacent regions
+        let (stack2, _c2) = mk_stack();
+        stack2.push(b"AAAABBBB").unwrap();
+        let left = Pass(region(&stack2, 0, 4));
+        let mut right = region(&stack2, 4, 4);
+        left.swap(&mut right).unwrap();
+        assert_eq!(region(&stack2, 0, 8).read().unwrap(), b"BBBBAAAA");
+    }
+}
