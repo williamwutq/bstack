@@ -4363,10 +4363,18 @@ impl PartialEq for BStack {
     }
 }
 
-/// Hashes the instance address, consistent with the pointer-identity [`PartialEq`].
+/// Hashes the raw fd (Unix) / handle (Windows), consistent with the
+/// pointer-identity [`PartialEq`]: unique per live instance, and unlike the
+/// address it is stable across moves. On other platforms the instance address
+/// is hashed, which is not move-stable.
 impl Hash for BStack {
     #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
+        #[cfg(unix)]
+        self.fd.hash(state);
+        #[cfg(windows)]
+        self.handle.hash(state);
+        #[cfg(not(any(unix, windows)))]
         (self as *const BStack).hash(state);
     }
 }

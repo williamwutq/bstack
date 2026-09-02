@@ -2026,6 +2026,27 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
         assert_eq!(s.len().unwrap(), 2);
     }
+
+    // The hash is keyed on the fd/handle, not the instance address, so moving
+    // the value does not change it. `PartialEq` stays pointer identity, which
+    // a moved value cannot violate — nothing else holds a reference to compare.
+    #[test]
+    fn hash_is_stable_across_a_move() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        fn hash_of(s: &BStack) -> u64 {
+            let mut h = DefaultHasher::new();
+            s.hash(&mut h);
+            h.finish()
+        }
+
+        let (s, path) = mk_stack();
+        let _g = Guard(path);
+        let before = hash_of(&s);
+        let moved = Box::new(s); // forces a move to a new address
+        assert_eq!(hash_of(&moved), before);
+    }
 }
 
 // -------------------------------------------------------------------------

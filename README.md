@@ -436,7 +436,7 @@ assert!(stack.pop(stack.len()? - 60).is_err()); // would shrink below locked
 | Trait              | Semantics                                                                                                                                             |
 |--------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `PartialEq` / `Eq` | **Pointer identity.** Two values are equal iff they are the same instance. No two distinct `BStack` values in one process can refer to the same file. |
-| `Hash`             | Hashes the instance address — consistent with pointer-identity equality.                                                                              |
+| `Hash`             | Hashes the raw fd (Unix) / handle (Windows) — unique per live instance, consistent with pointer-identity equality, and stable across moves.           |
 
 ### `BStackReader`
 

@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`BStack`'s `Hash` now hashes the raw fd (Unix) / handle (Windows) instead of the instance address (Rust only).** Same per-live-instance uniqueness, still consistent with the pointer-identity `PartialEq`, but stable when the value moves. Platforms that are neither Unix nor Windows keep the address hash. Backported from the 0.4.x line.
 - **`GhostTreeBstackAllocator` version bumped to 0.1.4** (`alloc` + `set`; Rust and C): magic `ALGT\x00\x01\x03\x00` → `ALGT\x00\x01\x04\x00`. No layout change; the patch byte attributes a file to a build that rejects an unalignable length rather than wrapping it. Existing 0.1.x files remain fully compatible (only the first 6 bytes are checked on open).
 
 ## [0.2.6] - 2026-08-23
