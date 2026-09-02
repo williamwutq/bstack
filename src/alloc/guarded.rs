@@ -30,8 +30,8 @@
 //! [`as_slice`]: BStackGuardedSlice::as_slice
 //! [`raw_block`]: BStackGuardedSlice::raw_block
 
-use super::{BStackAllocator, BStackSlice};
-use std::{borrow::Cow, io};
+use super::{BStackAllocator, BStackRange, BStackSlice};
+use std::{borrow::Cow, io, ops::Range};
 
 /// A [`BStackSlice`] abstraction with lifecycle hooks for transparent I/O
 /// interception.
@@ -49,24 +49,34 @@ use std::{borrow::Cow, io};
 /// [`Unsupported`](std::io::ErrorKind::Unsupported) — override it to expose an
 /// apparent view when a meaningful one exists.
 ///
-/// # Hook methods
+/// # Hooks
 ///
-/// Override any combination of the four hook methods to intercept I/O:
+/// Override any combination of four hooks to intercept I/O:
 ///
-/// | Hook           | When it fires                                             |
-/// |----------------|-----------------------------------------------------------|
-/// | [`pre_read`]   | Before bytes are read from disk. Return `Err` to deny.    |
-/// | [`post_read`]  | After bytes arrive from disk. Transform or pass through.  |
-/// | [`pre_write`]  | Before bytes are sent to disk. Transform or pass through. |
-/// | [`post_write`] | After a successful write. Audit or update metadata.       |
+/// | Hook         | Role                                                        |
+/// |--------------|-------------------------------------------------------------|
+/// | [`decode`]   | Transform raw bytes read from disk into the apparent bytes.  |
+/// | [`encode`]   | Transform apparent bytes into the raw bytes written to disk. |
+/// | [`on_read`]  | Observe or deny a read. Return `Err` to deny.               |
+/// | [`on_write`] | Observe a completed write (audit, metadata).                |
 ///
-/// All four hooks default to no-ops.  `post_read` and `pre_write` return
-/// `Cow::Borrowed`, so no allocation occurs in the non-transforming path.
+/// [`decode`]/[`encode`] default to identity (`Cow::Borrowed`, no allocation);
+/// [`on_read`]/[`on_write`] default to no-ops. Both `offset`s are **relative to
+/// the start of the slice** (`0` is the first byte of this view).
 ///
-/// The two offset-bearing hooks deliberately use **different** offset
-/// conventions, for compatibility with existing implementors: [`pre_read`]'s
-/// `offset` is **absolute** within the [`BStack`](crate::BStack), while
-/// [`post_write`]'s `offset` is **relative** to the start of the slice.
+/// [`decode`]/[`encode`] are whole-block transforms: `read`/`write` and the
+/// derived range methods route the entire apparent block through them, which is
+/// why a transforming guard (encryption, compression) can implement just
+/// [`len`](BStackGuardedSlice::len), [`raw_block`], [`decode`], and [`encode`].
+///
+/// ## Deprecated hooks
+///
+/// The former hooks are **deprecated since 0.4.4** and removed in 0.5.0:
+/// `post_read` → [`decode`], `pre_write` → [`encode`], `pre_read` → [`on_read`],
+/// `post_write` → [`on_write`]. Note `pre_read`'s offset was *absolute* whereas
+/// [`on_read`]'s is *relative*. The new hooks bridge to the old ones by default,
+/// so an implementor overriding only the old hooks keeps working unchanged until
+/// 0.5.0.
 ///
 /// # Borrow semantics
 ///
@@ -85,10 +95,11 @@ use std::{borrow::Cow, io};
 /// [`BStackSlice::subslice`], not the `&self`-scoped narrowing used by ownership
 /// handles.
 ///
-/// [`pre_read`]: BStackGuardedSlice::pre_read
-/// [`post_read`]: BStackGuardedSlice::post_read
-/// [`pre_write`]: BStackGuardedSlice::pre_write
-/// [`post_write`]: BStackGuardedSlice::post_write
+/// [`decode`]: BStackGuardedSlice::decode
+/// [`encode`]: BStackGuardedSlice::encode
+/// [`on_read`]: BStackGuardedSlice::on_read
+/// [`on_write`]: BStackGuardedSlice::on_write
+/// [`raw_block`]: BStackGuardedSlice::raw_block
 pub trait BStackGuardedSlice<'a, A: BStackAllocator + 'a>
 where
     Self: 'a,
@@ -155,105 +166,512 @@ where
     /// when possible.
     unsafe fn raw_block(&self) -> BStackSlice<'a>;
 
-    /// Called before a read at `[offset, offset + len)` within the Range.
+    /// Transform raw bytes read from the underlying store into the apparent bytes.
     ///
-    /// Calling this method directly is not recommended. Use `read` instead,
-    /// which automatically fires the hooks and handles the necessary allocations.
+    /// The inverse of [`encode`](BStackGuardedSlice::encode). Called by
+    /// [`read`](BStackGuardedSlice::read) with the whole raw block; return
+    /// `Cow::Borrowed` to pass through without allocation, or `Cow::Owned` for
+    /// decryption, decompression, or other transformations. The transformed
+    /// length should equal [`len`](BStackGuardedSlice::len).
     ///
-    /// `offset` is absolute to the [`crate::BStack`], and `len` is the number of
-    /// bytes of the raw block to be read (before any `post_read` transformation).
-    /// Return `Err` to deny the operation.
+    /// Defaults to the deprecated [`post_read`](BStackGuardedSlice::post_read)
+    /// (identity), for back-compat during the deprecation window.
+    #[inline]
+    fn decode<'d>(&self, data: &'d [u8]) -> io::Result<Cow<'d, [u8]>> {
+        #[allow(deprecated)]
+        self.post_read(data)
+    }
+
+    /// Transform apparent bytes into the raw bytes written to the underlying store.
+    ///
+    /// The inverse of [`decode`](BStackGuardedSlice::decode). Called by
+    /// [`write`](BStackGuardedSlice::write) with the whole apparent block; return
+    /// `Cow::Borrowed` to pass through, or `Cow::Owned` for encryption,
+    /// compression, or other transformations.
+    ///
+    /// Defaults to the deprecated [`pre_write`](BStackGuardedSlice::pre_write)
+    /// (identity), for back-compat during the deprecation window.
+    #[inline]
+    fn encode<'d>(&self, data: &'d [u8]) -> io::Result<Cow<'d, [u8]>> {
+        #[allow(deprecated)]
+        self.pre_write(data)
+    }
+
+    /// Observe or deny a read of `len` raw bytes at `offset`.
+    ///
+    /// `offset` is **relative to the start of the slice**; `len` is the number of
+    /// raw bytes about to be read (before [`decode`](BStackGuardedSlice::decode)).
+    /// Return `Err` to deny.
+    ///
+    /// Defaults to bridging the deprecated
+    /// [`pre_read`](BStackGuardedSlice::pre_read), whose offset was *absolute*: the
+    /// bridge adds the slice start, so an implementor overriding only `pre_read`
+    /// still receives the absolute offset it expects.
+    #[inline]
+    fn on_read(&self, offset: u64, len: u64) -> io::Result<()> {
+        let start = unsafe { self.raw_block() }.start();
+        #[allow(deprecated)]
+        self.pre_read(start.saturating_add(offset), len)
+    }
+
+    /// Observe a completed write of `len` logical bytes at `offset`.
+    ///
+    /// `offset` is **relative to the start of the slice**; `len` is the number of
+    /// apparent bytes written (before [`encode`](BStackGuardedSlice::encode)). The
+    /// write has already succeeded; use for auditing or metadata.
+    ///
+    /// Defaults to the deprecated [`post_write`](BStackGuardedSlice::post_write),
+    /// whose offset was already relative.
+    #[inline]
+    fn on_write(&self, offset: u64, len: u64) -> io::Result<()> {
+        #[allow(deprecated)]
+        self.post_write(offset, len)
+    }
+
+    /// Deprecated: renamed to [`on_read`](BStackGuardedSlice::on_read); its offset
+    /// is now **relative** to the slice, not absolute.
+    #[deprecated(
+        since = "0.4.4",
+        note = "renamed to `on_read`; offset is now relative to the slice"
+    )]
     #[inline]
     fn pre_read(&self, _offset: u64, _len: u64) -> io::Result<()> {
         Ok(())
     }
 
-    /// Called with the raw bytes just read from the underlying store.
-    ///
-    /// Calling this method directly is not recommended. Use [`read`](BStackGuardedSlice::read) instead,
-    /// which automatically fires the hooks and handles the necessary allocations.
-    ///
-    /// Return `Cow::Borrowed` to pass through without allocation; return
-    /// `Cow::Owned` for decryption, decompression, or other transformations.
-    ///
-    /// Callers that need a fixed output size should check the returned slice length
-    /// and return `InvalidData` if it differs from the expected length.
+    /// Deprecated: renamed to [`decode`](BStackGuardedSlice::decode).
+    #[deprecated(since = "0.4.4", note = "renamed to `decode`")]
     #[inline]
     fn post_read<'d>(&self, data: &'d [u8]) -> io::Result<Cow<'d, [u8]>> {
         Ok(Cow::Borrowed(data))
     }
 
-    /// Called with the data about to be written.
-    ///
-    /// Calling this method directly is not recommended. Use `write` instead,
-    /// which automatically fires the hooks and handles the necessary allocations.
-    ///
-    /// Return `Cow::Borrowed` to pass through without allocation; return
-    /// `Cow::Owned` for encryption, compression, or other transformations.
+    /// Deprecated: renamed to [`encode`](BStackGuardedSlice::encode).
+    #[deprecated(since = "0.4.4", note = "renamed to `encode`")]
     #[inline]
     fn pre_write<'d>(&self, data: &'d [u8]) -> io::Result<Cow<'d, [u8]>> {
         Ok(Cow::Borrowed(data))
     }
 
-    /// Called after a successful write at `[offset, offset + len)`.
-    ///
-    /// Calling this method directly is not recommended. Use `write` instead,
-    /// which automatically fires the hooks and handles the necessary allocations.
-    ///
-    /// `offset` is **relative to the start of the slice** (`0` is the first byte
-    /// of this view), and `len` is the length of the original data passed to
-    /// `pre_write` (not the transformed length returned by `pre_write`).
+    /// Deprecated: renamed to [`on_write`](BStackGuardedSlice::on_write).
+    #[deprecated(since = "0.4.4", note = "renamed to `on_write`")]
     #[inline]
     fn post_write(&self, _offset: u64, _len: u64) -> io::Result<()> {
         Ok(())
     }
 
-    /// Read the entire slice into a newly allocated `Vec<u8>`.
+    /// Absolute start offset of the **raw block** (`raw_block().start()`) within
+    /// the [`BStack`](crate::BStack) payload.
     ///
-    /// Fires `pre_read(slice.start(), slice.len())`, reads raw bytes, then passes
-    /// them through `post_read`.  The transformation may change the returned length.
-    ///
-    /// This method at maximum allocates twice the slice length (once for the
-    /// raw read and once for the transformed output).
-    fn read(&self) -> io::Result<Vec<u8>> {
-        let slice = unsafe { self.raw_block() };
-        self.pre_read(slice.start(), slice.len())?;
-        let raw = slice.read()?;
-        let transformed = self.post_read(&raw)?;
-        Ok(transformed.into_owned())
+    /// This is a physical-storage coordinate. The *apparent* view is always
+    /// addressed as `[0, len())`; `start` locates where the raw (stored) bytes
+    /// actually live. For a pass-through guard (identity `encode`/`decode`) the two
+    /// coincide, but for a transforming
+    /// guard (encryption, compression) the raw span `end - start` is the encoded
+    /// size and differs from the apparent [`len`](BStackGuardedSlice::len). Parity
+    /// with [`BStackSlice::start`].
+    #[inline]
+    fn start(&self) -> u64 {
+        unsafe { self.raw_block() }.start()
     }
 
-    /// Overwrite the beginning of this slice with `data`.
+    /// Absolute exclusive end offset of the **raw block**
+    /// (`start() + raw_block().len()`).
     ///
-    /// Passes `data` through `pre_write` before writing.  Writes
-    /// `min(self.len(), data.len())` bytes, and passes the original length to `post_write`.
+    /// A physical-storage coordinate; `end - start` is the encoded byte count,
+    /// which may exceed or fall short of the apparent
+    /// [`len`](BStackGuardedSlice::len) for a transforming guard. Parity with
+    /// [`BStackSlice::end`].
+    #[inline]
+    fn end(&self) -> u64 {
+        unsafe { self.raw_block() }.end()
+    }
+
+    /// Half-open **raw block** byte range `start()..end()` within the
+    /// [`BStack`](crate::BStack) payload.
+    ///
+    /// The physical span the encoded bytes occupy, not the apparent `[0, len())`
+    /// view. Parity with [`BStackSlice::range`].
+    #[inline]
+    fn range(&self) -> Range<u64> {
+        unsafe { self.raw_block() }.range()
+    }
+
+    /// The **raw block** location as a [`BStackRange`] — the physical
+    /// `(offset, len)` pair describing where the encoded bytes are stored.
+    ///
+    /// Useful for recording or comparing storage locations; it is *not* the
+    /// apparent view, and its `len` is the encoded size rather than the decoded
+    /// [`len`](BStackGuardedSlice::len). Parity with [`BStackSlice::as_range`].
+    #[inline]
+    fn as_range(&self) -> BStackRange {
+        unsafe { self.raw_block() }.as_range()
+    }
+
+    /// The [`BStack`](crate::BStack) backing this guard, borrowed for the full
+    /// allocator lifetime `'a`.
+    ///
+    /// Every guard I/O method ultimately reads from and writes to this store;
+    /// `stack` hands out the same reference for callers that need to issue their
+    /// own operations against it (for example, cross-region atomics that take a
+    /// `&BStack`). Parity with [`BStackSlice::stack`].
+    #[inline]
+    fn stack(&self) -> &'a crate::BStack {
+        unsafe { self.raw_block() }.stack()
+    }
+
+    /// Read the entire apparent slice — the decoded bytes — into a newly allocated
+    /// `Vec<u8>`.
+    ///
+    /// Fires [`on_read`](BStackGuardedSlice::on_read)`(0, raw_len)`, reads the raw
+    /// block, then passes it through [`decode`](BStackGuardedSlice::decode); the
+    /// decoded length may differ from the raw length. Allocates up to twice the raw
+    /// length — once for the raw read, and again for the decoded output whenever
+    /// `decode` returns `Cow::Owned`. A pass-through guard (identity `decode`)
+    /// returns `Cow::Borrowed` and so allocates only the raw read.
+    fn read(&self) -> io::Result<Vec<u8>> {
+        let slice = unsafe { self.raw_block() };
+        self.on_read(0, slice.len())?;
+        let raw = slice.read()?;
+        Ok(self.decode(&raw)?.into_owned())
+    }
+
+    /// Read the entire apparent slice (the decoded bytes) into `buf`.
+    ///
+    /// `buf.len()` must equal the decoded length, otherwise returns `InvalidInput`.
+    ///
+    /// **Unlike [`BStackSlice::read_into`], this does not avoid allocation.** It
+    /// reads the raw block into a temporary `Vec` and runs
+    /// [`decode`](BStackGuardedSlice::decode) (which may allocate again) before
+    /// copying the result into `buf` — the caller's buffer is not read into
+    /// directly. Use it for the exact-length delivery and length check, not to save
+    /// an allocation; when you want the bytes owned anyway, prefer
+    /// [`read`](BStackGuardedSlice::read).
+    fn read_into(&self, buf: &mut [u8]) -> io::Result<()> {
+        let slice = unsafe { self.raw_block() };
+        self.on_read(0, slice.len())?;
+        let raw = slice.read()?;
+        let decoded = self.decode(&raw)?;
+        if decoded.len() != buf.len() {
+            return Err(io_error!(
+                InvalidInput,
+                "buffer length does not match decoded length"
+            ));
+        }
+        buf.copy_from_slice(decoded.as_ref());
+        Ok(())
+    }
+
+    /// Read the apparent sub-range `[start, end)` into a newly allocated `Vec<u8>`.
+    ///
+    /// There is no partial decode: this reads and decodes the **whole** block (via
+    /// [`read`](BStackGuardedSlice::read)) and then copies out the requested
+    /// sub-range. Returns `InvalidInput` if `start > end` or `end` exceeds the
+    /// apparent [`len`](BStackGuardedSlice::len). Parity with
+    /// [`BStackSlice::read_range`], but note the whole-block read and the extra
+    /// allocation.
+    fn read_range(&self, start: u64, end: u64) -> io::Result<Vec<u8>> {
+        let whole = self.read()?;
+        if start > end || end as usize > whole.len() {
+            return Err(io_error!(
+                InvalidInput,
+                "range out of bounds of apparent slice"
+            ));
+        }
+        Ok(whole[start as usize..end as usize].to_vec())
+    }
+
+    /// Read the apparent sub-range `[start, start + buf.len())` into `buf`.
+    ///
+    /// Like [`read_range`](BStackGuardedSlice::read_range), this decodes the
+    /// **whole** block into a temporary `Vec` first and then copies the sub-range
+    /// into `buf` — so, unlike [`BStackSlice::read_range_into`], it allocates and
+    /// reads more than the requested range. Returns `InvalidInput` if the range
+    /// exceeds the apparent [`len`](BStackGuardedSlice::len).
+    fn read_range_into(&self, start: u64, buf: &mut [u8]) -> io::Result<()> {
+        let whole = self.read()?;
+        let s = start as usize;
+        let e = s
+            .checked_add(buf.len())
+            .filter(|&e| e <= whole.len())
+            .ok_or_else(|| io_error!(InvalidInput, "range out of bounds of apparent slice"))?;
+        buf.copy_from_slice(&whole[s..e]);
+        Ok(())
+    }
+
+    /// Read the byte at apparent index `index`, or `None` if out of range.
+    ///
+    /// Like every scan/search convenience here
+    /// ([`contains`](BStackGuardedSlice::contains),
+    /// [`find`](BStackGuardedSlice::find),
+    /// [`position`](BStackGuardedSlice::position), and the rest), this reads and
+    /// decodes the **whole** apparent block on each call. To run several queries,
+    /// call [`read`](BStackGuardedSlice::read) once and scan the returned `Vec`
+    /// yourself. Parity with [`BStackSlice::get`].
+    fn get(&self, index: u64) -> io::Result<Option<u8>> {
+        Ok(self.read()?.get(index as usize).copied())
+    }
+
+    /// Whether the apparent bytes contain `needle`. Parity with
+    /// [`BStackSlice::contains`].
+    fn contains(&self, needle: u8) -> io::Result<bool> {
+        Ok(self.read()?.contains(&needle))
+    }
+
+    /// Whether the apparent bytes start with `prefix`. Parity with
+    /// [`BStackSlice::starts_with`].
+    fn starts_with(&self, prefix: &[u8]) -> io::Result<bool> {
+        Ok(self.read()?.starts_with(prefix))
+    }
+
+    /// Whether the apparent bytes end with `suffix`. Parity with
+    /// [`BStackSlice::ends_with`].
+    fn ends_with(&self, suffix: &[u8]) -> io::Result<bool> {
+        Ok(self.read()?.ends_with(suffix))
+    }
+
+    /// Apparent index of the first byte equal to `needle`. Parity with
+    /// [`BStackSlice::find`].
+    fn find(&self, needle: u8) -> io::Result<Option<u64>> {
+        Ok(self
+            .read()?
+            .iter()
+            .position(|&b| b == needle)
+            .map(|i| i as u64))
+    }
+
+    /// Apparent index of the last byte equal to `needle`. Parity with
+    /// [`BStackSlice::rfind`].
+    fn rfind(&self, needle: u8) -> io::Result<Option<u64>> {
+        Ok(self
+            .read()?
+            .iter()
+            .rposition(|&b| b == needle)
+            .map(|i| i as u64))
+    }
+
+    /// Apparent index of the first byte satisfying `predicate`. Parity with
+    /// [`BStackSlice::position`].
+    fn position(&self, predicate: impl Fn(u8) -> bool) -> io::Result<Option<u64>> {
+        Ok(self
+            .read()?
+            .iter()
+            .position(|&b| predicate(b))
+            .map(|i| i as u64))
+    }
+
+    /// Apparent index of the last byte satisfying `predicate`. Parity with
+    /// [`BStackSlice::rposition`].
+    fn rposition(&self, predicate: impl Fn(u8) -> bool) -> io::Result<Option<u64>> {
+        Ok(self
+            .read()?
+            .iter()
+            .rposition(|&b| predicate(b))
+            .map(|i| i as u64))
+    }
+
+    /// Overwrite the whole apparent slice with `data`.
+    ///
+    /// Passes `data` through [`encode`](BStackGuardedSlice::encode), writes the
+    /// result to the raw block, then fires
+    /// [`on_write`](BStackGuardedSlice::on_write)`(0, data.len())`. `data` is the
+    /// full apparent block — for a length-preserving guard `data.len()` should
+    /// equal [`len`](BStackGuardedSlice::len).
     ///
     /// Requires feature `set`.
     #[cfg(feature = "set")]
     fn write(&self, data: impl AsRef<[u8]>) -> io::Result<()> {
         let mut slice = unsafe { self.raw_block() };
-        let raw = data.as_ref();
-        let n = self.len().min(raw.len() as u64);
-        let cooked = self.pre_write(&raw[..n as usize])?;
+        let data = data.as_ref();
+        let cooked = self.encode(data)?;
         slice.write(cooked.as_ref())?;
-        self.post_write(0, n)
+        self.on_write(0, data.len() as u64)
     }
 
-    /// Zero the entire slice.
+    /// Overwrite the whole apparent slice with `src`; `src.len()` must equal
+    /// [`len`](BStackGuardedSlice::len). Parity with
+    /// [`BStackSlice::copy_from_slice`] (returns `InvalidInput` on mismatch rather
+    /// than panicking). Requires feature `set`.
+    #[cfg(feature = "set")]
+    fn copy_from_slice(&self, src: &[u8]) -> io::Result<()> {
+        if src.len() as u64 != self.len() {
+            return Err(io_error!(InvalidInput, "copy_from_slice: length mismatch"));
+        }
+        self.write(src)
+    }
+
+    /// Overwrite the apparent sub-range at `start` with `data`, atomic
+    /// read-modify-write.
     ///
-    /// Constructs a zero buffer, passes it through `pre_write` (allowing hooks
-    /// to substitute a different fill pattern), then writes the result.
+    /// One crash-atomic [`BStack::process_gen`](crate::BStack::process_gen): decodes
+    /// the whole block, splices `data` in at `start`, re-encodes, and writes — the
+    /// only correct way to patch a transformed (e.g. AEAD) block, all under one write
+    /// lock. The internal read does **not** fire
+    /// [`on_read`](BStackGuardedSlice::on_read); only
+    /// [`on_write`](BStackGuardedSlice::on_write)`(start, data.len())` fires. Parity
+    /// with [`BStackSlice::write_range`]. Requires features `set` and `atomic`.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    fn write_range(&self, start: u64, data: impl AsRef<[u8]>) -> io::Result<()> {
+        let data = data.as_ref();
+        atomic_process(self, |whole| {
+            let s = start as usize;
+            let e = s
+                .checked_add(data.len())
+                .filter(|&e| e <= whole.len())
+                .ok_or_else(|| io_error!(InvalidInput, "range out of bounds of apparent slice"))?;
+            whole[s..e].copy_from_slice(data);
+            Ok(())
+        })?;
+        self.on_write(start, data.len() as u64)
+    }
+
+    /// Zero the whole apparent slice — writes `encode(&[0; len])`.
     ///
-    /// Requires feature `set`.
+    /// Zeroes the *apparent* (decoded) content, not the raw storage: for a
+    /// transforming guard the bytes on disk become the encoding of zeros (e.g. the
+    /// ciphertext of a zero block), not literal `0x00`. To scrub the raw bytes,
+    /// operate on the underlying [`BStackSlice`] directly. Requires feature `set`.
     #[cfg(feature = "set")]
     fn zero(&self) -> io::Result<()> {
-        let mut slice = unsafe { self.raw_block() };
-        let n = self.len();
-        let zeros = vec![0u8; n as usize];
-        let cooked = self.pre_write(&zeros)?;
-        slice.write(cooked.as_ref())?;
-        self.post_write(0, n)
+        self.write(vec![0u8; self.len() as usize])
     }
+
+    /// Zero the apparent sub-range `[start, start + n)`, atomic read-modify-write.
+    /// Parity with [`BStackSlice::zero_range`]. Requires features `set` and `atomic`.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    fn zero_range(&self, start: u64, n: u64) -> io::Result<()> {
+        self.write_range(start, vec![0u8; n as usize])
+    }
+
+    /// Fill the whole apparent slice with `value` — writes `encode(&[value; len])`.
+    ///
+    /// Sets the *apparent* content; like [`zero`](BStackGuardedSlice::zero), the raw
+    /// bytes on disk are the *encoding* of the fill, not `value` repeated. Parity
+    /// with [`BStackSlice::fill`]. Requires feature `set`.
+    #[cfg(feature = "set")]
+    fn fill(&self, value: u8) -> io::Result<()> {
+        self.write(vec![value; self.len() as usize])
+    }
+
+    /// Fill the whole apparent slice by calling `f` once per apparent byte, then
+    /// writing `encode` of the result.
+    ///
+    /// `f` generates the *apparent* (decoded) bytes; the raw storage is their
+    /// encoding. Parity with [`BStackSlice::fill_with`]. Requires feature `set`.
+    #[cfg(feature = "set")]
+    fn fill_with(&self, mut f: impl FnMut() -> u8) -> io::Result<()> {
+        let buf: Vec<u8> = (0..self.len()).map(|_| f()).collect();
+        self.write(buf)
+    }
+
+    /// Transform the whole apparent block in place, atomic read-modify-write.
+    ///
+    /// One crash-atomic [`BStack::process_gen`](crate::BStack::process_gen): decodes
+    /// the block, hands it to `f` as a length-preserving mutable slice, re-encodes,
+    /// and writes — all under one write lock. The internal read does **not** fire
+    /// [`on_read`](BStackGuardedSlice::on_read); only
+    /// [`on_write`](BStackGuardedSlice::on_write)`(0, len)` fires, after the write.
+    /// The general form of `write_range`/`zero`/`fill`. Requires features `set` and
+    /// `atomic`.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    fn process(&self, f: impl FnOnce(&mut [u8])) -> io::Result<()> {
+        let len = self.len();
+        atomic_process(self, |whole| {
+            f(whole.as_mut_slice());
+            Ok(())
+        })?;
+        self.on_write(0, len)
+    }
+
+    /// Copy the apparent sub-range `src` to `dest` within the slice, atomic
+    /// read-modify-write. Parity with [`BStackSlice::copy_within`]. Requires
+    /// features `set` and `atomic`.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    fn copy_within(&self, src: Range<u64>, dest: u64) -> io::Result<()> {
+        let mut n = 0u64;
+        atomic_process(self, |whole| {
+            let (ss, se, d) = (src.start as usize, src.end as usize, dest as usize);
+            let count = se
+                .checked_sub(ss)
+                .filter(|&c| {
+                    se <= whole.len() && d.checked_add(c).is_some_and(|e| e <= whole.len())
+                })
+                .ok_or_else(|| io_error!(InvalidInput, "copy_within range out of bounds"))?;
+            whole.copy_within(ss..se, d);
+            n = count as u64;
+            Ok(())
+        })?;
+        self.on_write(dest, n)
+    }
+}
+
+/// Atomic decode → mutate → encode → write for the length-preserving update methods.
+///
+/// One crash-atomic [`BStack::process_gen`](crate::BStack::process_gen) on the raw
+/// block: under a single held write lock it reads the raw bytes, decodes them, hands
+/// the apparent block to `f`, re-encodes, and writes back. `encode` must preserve
+/// the raw block length. Any error (`decode`, `f`, `encode`, or a length change)
+/// aborts the sequence with **no** write.
+#[cfg(all(feature = "set", feature = "atomic"))]
+fn atomic_process<'g, A, G>(g: &G, f: impl FnOnce(&mut Vec<u8>) -> io::Result<()>) -> io::Result<()>
+where
+    A: BStackAllocator + 'g,
+    G: BStackGuardedSlice<'g, A> + ?Sized,
+{
+    use crate::{BStackGenOp, bstack_unsafe_reborrow, bstack_unsafe_reborrow_mut};
+    let raw = unsafe { g.raw_block() };
+    let stack = raw.stack();
+    let raw_start = raw.start();
+    let raw_len = raw.len() as usize;
+    let mut raw_buf = vec![0u8; raw_len];
+    let mut cooked: Vec<u8> = Vec::new();
+    let mut f = Some(f);
+    let mut step = 0u32;
+    stack.process_gen(|| {
+        let op = match step {
+            // SAFETY: `raw_buf` is declared before this call and never moved; the
+            // Read op is consumed before the closure runs again, so no other access
+            // to `raw_buf` overlaps it.
+            0 => Some(BStackGenOp::Read {
+                offset: raw_start,
+                buf: bstack_unsafe_reborrow_mut!(&mut raw_buf[..]),
+            }),
+            1 => {
+                let built = (|| -> io::Result<()> {
+                    let mut whole = g.decode(&raw_buf)?.into_owned();
+                    (f.take().expect("atomic_process f called once"))(&mut whole)?;
+                    let out = g.encode(&whole)?;
+                    if out.len() != raw_buf.len() {
+                        return Err(io_error!(
+                            InvalidInput,
+                            "guard `encode` returned {} bytes for a {}-byte block; operations \
+                             that re-encode the whole block after a partial change require \
+                             `encode` to preserve the block length. This typically indicates a \
+                             programming error in the guard's `encode` implementation.",
+                            out.len(),
+                            raw_buf.len()
+                        ));
+                    }
+                    cooked = out.into_owned();
+                    Ok(())
+                })();
+                match built {
+                    // Empty block (also empty encode) — nothing to write.
+                    Ok(()) if cooked.is_empty() => None,
+                    // SAFETY: `cooked` is declared before this call, is not mutated
+                    // after this step, and the Write ends the sequence.
+                    Ok(()) => Some(BStackGenOp::Write {
+                        offset: raw_start,
+                        data: bstack_unsafe_reborrow!(&cooked[..]),
+                    }),
+                    Err(e) => Some(BStackGenOp::Abort { source: Some(e) }),
+                }
+            }
+            _ => None,
+        };
+        step += 1;
+        op
+    })
 }
 
 /// Marker trait for [`BStackGuardedSlice`] implementations that guarantee
@@ -286,6 +704,64 @@ pub unsafe trait BStackAtomicGuardedSlice<'a, A: BStackAllocator + 'a>:
 where
     Self: 'a,
 {
+    /// Swap the raw stored bytes of this guard with `other` — a single
+    /// crash-atomic [`BStackSlice::swap`] on the raw block.
+    ///
+    /// Operates on **raw** bytes and bypasses [`encode`](BStackGuardedSlice::encode)/
+    /// [`decode`](BStackGuardedSlice::decode); for a pass-through guard the raw and
+    /// apparent bytes coincide.
+    /// Requires features `set` and `atomic`.
+    #[cfg(feature = "set")]
+    fn swap(&self, other: &mut BStackSlice<'_>) -> io::Result<()> {
+        let mut slice = unsafe { self.raw_block() };
+        slice.swap(other)
+    }
+
+    /// Compare-and-swap on the raw stored bytes: if `guard`'s bytes equal
+    /// `expected`, overwrite the raw block with `new_bytes` and return the prior
+    /// raw bytes. One crash-atomic [`BStackSlice::cas_on`].
+    ///
+    /// Operates on **raw** bytes and bypasses `encode`/`decode`; `expected` and
+    /// `new_bytes` are in raw (encoded) form. Requires features `set` and `atomic`.
+    #[cfg(feature = "set")]
+    fn cas_on(
+        &self,
+        guard: &BStackSlice<'_>,
+        expected: impl AsRef<[u8]>,
+        new_bytes: impl AsRef<[u8]>,
+    ) -> io::Result<Option<Vec<u8>>> {
+        let mut slice = unsafe { self.raw_block() };
+        slice.cas_on(guard, expected, new_bytes)
+    }
+
+    /// Like [`cas_on`](Self::cas_on) but swaps when the comparison **fails**
+    /// ([`BStackSlice::cas_on_ne`]). Raw bytes. Requires `set` and `atomic`.
+    #[cfg(feature = "set")]
+    fn cas_on_ne(
+        &self,
+        guard: &BStackSlice<'_>,
+        expected: impl AsRef<[u8]>,
+        new_bytes: impl AsRef<[u8]>,
+    ) -> io::Result<Option<Vec<u8>>> {
+        let mut slice = unsafe { self.raw_block() };
+        slice.cas_on_ne(guard, expected, new_bytes)
+    }
+
+    /// Masked compare-and-swap on the raw stored bytes
+    /// ([`BStackSlice::cas_on_masked`]): the condition is
+    /// `(guard[i] & mask[i]) == (expected[i] & mask[i])`. Raw bytes. Requires
+    /// `set` and `atomic`.
+    #[cfg(feature = "set")]
+    fn cas_on_masked(
+        &self,
+        guard: &BStackSlice<'_>,
+        mask: impl AsRef<[u8]>,
+        expected: impl AsRef<[u8]>,
+        new_bytes: impl AsRef<[u8]>,
+    ) -> io::Result<Option<Vec<u8>>> {
+        let mut slice = unsafe { self.raw_block() };
+        slice.cas_on_masked(guard, mask, expected, new_bytes)
+    }
 }
 
 /// Extension trait for [`BStackGuardedSlice`] implementations that can produce
@@ -301,7 +777,7 @@ where
     ///
     /// `start` and `end` are relative to [`as_slice`](BStackGuardedSlice::as_slice),
     /// or equivalently in the range `[0, len())`. The returned view preserves
-    /// the parent's hook scope — calls to `pre_read`, `post_read`, etc. on the
+    /// the parent's hook scope — calls to `on_read`, `decode`, etc. on the
     /// subview delegate to the parent with appropriately translated offsets.
     ///
     /// # Panics
@@ -313,7 +789,7 @@ where
     ///
     /// `start` and `end` are relative to [`as_slice`](BStackGuardedSlice::as_slice),
     /// or equivalently in the range `[0, len())`. The returned view preserves
-    /// the parent's hook scope — calls to `pre_read`, `post_read`, etc. on the
+    /// the parent's hook scope — calls to `on_read`, `decode`, etc. on the
     /// subview delegate to the parent with appropriately translated offsets.
     ///
     /// # Panics
@@ -325,6 +801,20 @@ where
         range: std::ops::Range<u64>,
     ) -> impl BStackGuardedSliceSubview<'a, A> + '_ {
         self.subview(range.start, range.end)
+    }
+
+    /// Sub-view of the first `min(n, len)` bytes. Parity with [`BStackSlice::head`].
+    #[inline]
+    fn head(&self, n: u64) -> impl BStackGuardedSliceSubview<'a, A> + '_ {
+        self.subview(0, n.min(self.len()))
+    }
+
+    /// Sub-view of the last `min(n, len)` bytes. Parity with [`BStackSlice::tail`].
+    #[inline]
+    fn tail(&self, n: u64) -> impl BStackGuardedSliceSubview<'a, A> + '_ {
+        let len = self.len();
+        let n = n.min(len);
+        self.subview(len - n, len)
     }
 }
 
@@ -342,4 +832,452 @@ pub unsafe trait BStackAtomicGuardedSliceSubview<'a, A: BStackAllocator + 'a>:
 where
     Self: 'a,
 {
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    use super::BStackAtomicGuardedSlice;
+    use super::{BStackGuardedSlice, BStackGuardedSliceSubview};
+    use crate::{BStack, BStackSlice, LinearBStackAllocator};
+    use std::borrow::Cow;
+    use std::cell::Cell;
+    use std::io;
+
+    /// The allocator type is a phantom parameter of the trait; pin it so method
+    /// calls resolve. No allocator is ever constructed.
+    type A = LinearBStackAllocator;
+
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn mk_stack() -> (BStack, Cleanup) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static C: AtomicU64 = AtomicU64::new(0);
+        let id = C.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("bstack_guard_{}_{}.bin", std::process::id(), id));
+        let stack = BStack::open(&path).unwrap();
+        (stack, Cleanup(path))
+    }
+
+    /// A raw `BStackSlice` over `[offset, offset + len)` of `stack`'s payload.
+    fn region(stack: &BStack, offset: u64, len: u64) -> BStackSlice<'_> {
+        // SAFETY: tests place the region within the committed payload before use.
+        unsafe { BStackSlice::from_raw_parts(stack, offset, len) }
+    }
+
+    // ---- test guards ----
+
+    /// Identity pass-through guard: `encode`/`decode` default to no-ops.
+    struct Pass<'a>(BStackSlice<'a>);
+    impl<'a> BStackGuardedSlice<'a, A> for Pass<'a> {
+        fn len(&self) -> u64 {
+            self.0.len()
+        }
+        unsafe fn raw_block(&self) -> BStackSlice<'a> {
+            self.0.clone()
+        }
+    }
+    impl<'a> BStackGuardedSliceSubview<'a, A> for Pass<'a> {
+        fn subview(&self, start: u64, end: u64) -> impl BStackGuardedSliceSubview<'a, A> + '_ {
+            Pass(self.0.subslice(start, end))
+        }
+    }
+
+    /// XOR cipher guard: length-preserving, `encode == decode` (an involution),
+    /// so the raw stored bytes differ from the apparent (decoded) bytes.
+    struct Xor<'a> {
+        slice: BStackSlice<'a>,
+        key: u8,
+    }
+    impl<'a> BStackGuardedSlice<'a, A> for Xor<'a> {
+        fn len(&self) -> u64 {
+            self.slice.len()
+        }
+        unsafe fn raw_block(&self) -> BStackSlice<'a> {
+            self.slice.clone()
+        }
+        fn decode<'d>(&self, data: &'d [u8]) -> io::Result<Cow<'d, [u8]>> {
+            Ok(Cow::Owned(data.iter().map(|b| b ^ self.key).collect()))
+        }
+        fn encode<'d>(&self, data: &'d [u8]) -> io::Result<Cow<'d, [u8]>> {
+            Ok(Cow::Owned(data.iter().map(|b| b ^ self.key).collect()))
+        }
+    }
+
+    // ---- reads, accessors, scans (feature `guarded`) ----
+
+    #[test]
+    fn read_identity() {
+        let (stack, _c) = mk_stack();
+        stack.push(b"hello world!").unwrap();
+        let g = Pass(region(&stack, 0, 12));
+        assert_eq!(g.read().unwrap(), b"hello world!");
+        assert_eq!(g.len(), 12);
+        assert!(!g.is_empty());
+    }
+
+    #[test]
+    fn accessors_report_raw_block() {
+        let (stack, _c) = mk_stack();
+        stack.push([0u8; 32]).unwrap();
+        let g = Pass(region(&stack, 8, 16));
+        assert_eq!(g.start(), 8);
+        assert_eq!(g.end(), 24);
+        assert_eq!(g.range(), 8..24);
+        assert_eq!(g.as_range().start(), 8);
+        assert!(std::ptr::eq(g.stack(), &stack));
+    }
+
+    #[test]
+    fn read_into_and_ranges() {
+        let (stack, _c) = mk_stack();
+        stack.push(b"abcdefgh").unwrap();
+        let g = Pass(region(&stack, 0, 8));
+        let mut buf = [0u8; 8];
+        g.read_into(&mut buf).unwrap();
+        assert_eq!(&buf, b"abcdefgh");
+        let mut small = [0u8; 4];
+        assert_eq!(
+            g.read_into(&mut small).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(g.read_range(2, 5).unwrap(), b"cde");
+        assert_eq!(
+            g.read_range(5, 2).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            g.read_range(0, 9).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        let mut into = [0u8; 3];
+        g.read_range_into(1, &mut into).unwrap();
+        assert_eq!(&into, b"bcd");
+    }
+
+    #[test]
+    fn scan_family() {
+        let (stack, _c) = mk_stack();
+        stack.push(b"abcabc").unwrap();
+        let g = Pass(region(&stack, 0, 6));
+        assert_eq!(g.get(2).unwrap(), Some(b'c'));
+        assert_eq!(g.get(6).unwrap(), None);
+        assert!(g.contains(b'b').unwrap());
+        assert!(!g.contains(b'z').unwrap());
+        assert!(g.starts_with(b"abc").unwrap());
+        assert!(g.ends_with(b"abc").unwrap());
+        assert_eq!(g.find(b'c').unwrap(), Some(2));
+        assert_eq!(g.rfind(b'a').unwrap(), Some(3));
+        assert_eq!(g.position(|b| b == b'b').unwrap(), Some(1));
+        assert_eq!(g.rposition(|b| b == b'b').unwrap(), Some(4));
+    }
+
+    #[test]
+    fn xor_decode_on_read() {
+        let (stack, _c) = mk_stack();
+        let key = 0x5A;
+        let plain = b"secret payload!!";
+        let cipher: Vec<u8> = plain.iter().map(|b| b ^ key).collect();
+        stack.push(&cipher).unwrap();
+        let g = Xor {
+            slice: region(&stack, 0, plain.len() as u64),
+            key,
+        };
+        assert_eq!(g.read().unwrap(), plain);
+        // raw bytes on disk stay ciphertext
+        assert_eq!(
+            region(&stack, 0, plain.len() as u64).read().unwrap(),
+            cipher
+        );
+    }
+
+    #[test]
+    fn subview_head_tail() {
+        let (stack, _c) = mk_stack();
+        stack.push(b"abcdefgh").unwrap();
+        let g = Pass(region(&stack, 0, 8));
+        let sv = g.subview(2, 5);
+        assert_eq!(sv.len(), 3);
+        assert_eq!(sv.read().unwrap(), b"cde");
+        assert_eq!(g.subview_range(1..4).read().unwrap(), b"bcd");
+        assert_eq!(g.head(3).read().unwrap(), b"abc");
+        assert_eq!(g.tail(2).read().unwrap(), b"gh");
+        // clamps to len
+        assert_eq!(g.head(99).read().unwrap(), b"abcdefgh");
+        assert_eq!(g.tail(99).read().unwrap(), b"abcdefgh");
+    }
+
+    #[test]
+    fn on_read_can_deny() {
+        struct Deny<'a>(BStackSlice<'a>);
+        impl<'a> BStackGuardedSlice<'a, A> for Deny<'a> {
+            fn len(&self) -> u64 {
+                self.0.len()
+            }
+            unsafe fn raw_block(&self) -> BStackSlice<'a> {
+                self.0.clone()
+            }
+            fn on_read(&self, _o: u64, _l: u64) -> io::Result<()> {
+                Err(io::Error::from(io::ErrorKind::PermissionDenied))
+            }
+        }
+        let (stack, _c) = mk_stack();
+        stack.push([0u8; 4]).unwrap();
+        let g = Deny(region(&stack, 0, 4));
+        assert_eq!(
+            g.read().unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn on_read_fires_relative() {
+        struct Rec<'a> {
+            slice: BStackSlice<'a>,
+            seen: Cell<Option<(u64, u64)>>,
+        }
+        impl<'a> BStackGuardedSlice<'a, A> for Rec<'a> {
+            fn len(&self) -> u64 {
+                self.slice.len()
+            }
+            unsafe fn raw_block(&self) -> BStackSlice<'a> {
+                self.slice.clone()
+            }
+            fn on_read(&self, offset: u64, len: u64) -> io::Result<()> {
+                self.seen.set(Some((offset, len)));
+                Ok(())
+            }
+        }
+        let (stack, _c) = mk_stack();
+        stack.push([0u8; 24]).unwrap();
+        // Region at absolute offset 8; on_read must see the *relative* offset 0.
+        let g = Rec {
+            slice: region(&stack, 8, 10),
+            seen: Cell::new(None),
+        };
+        g.read().unwrap();
+        assert_eq!(g.seen.get(), Some((0, 10)));
+    }
+
+    // ---- full-replace writes (feature `set`) ----
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn write_and_fill_family() {
+        let (stack, _c) = mk_stack();
+        stack.push([9u8; 5]).unwrap();
+        let g = Pass(region(&stack, 0, 5));
+        g.write(b"world").unwrap();
+        assert_eq!(g.read().unwrap(), b"world");
+        g.fill(7).unwrap();
+        assert_eq!(g.read().unwrap(), [7, 7, 7, 7, 7]);
+        g.zero().unwrap();
+        assert_eq!(g.read().unwrap(), [0, 0, 0, 0, 0]);
+        let mut n = 0u8;
+        g.fill_with(|| {
+            n += 1;
+            n
+        })
+        .unwrap();
+        assert_eq!(g.read().unwrap(), [1, 2, 3, 4, 5]);
+        g.copy_from_slice(b"abcde").unwrap();
+        assert_eq!(g.read().unwrap(), b"abcde");
+        assert_eq!(
+            g.copy_from_slice(b"abc").unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn xor_write_roundtrip() {
+        let (stack, _c) = mk_stack();
+        stack.push([0u8; 8]).unwrap();
+        let key = 0x33;
+        let g = Xor {
+            slice: region(&stack, 0, 8),
+            key,
+        };
+        g.write(b"12345678").unwrap();
+        assert_eq!(g.read().unwrap(), b"12345678");
+        let raw = region(&stack, 0, 8).read().unwrap();
+        let expect: Vec<u8> = b"12345678".iter().map(|b| b ^ key).collect();
+        assert_eq!(raw, expect);
+    }
+
+    /// A guard overriding only the **deprecated** hooks keeps working, and the
+    /// bridges preserve each hook's original offset convention: `pre_read`
+    /// absolute, `post_write` relative.
+    #[cfg(feature = "set")]
+    #[test]
+    #[allow(deprecated)]
+    fn deprecated_hook_bridge() {
+        struct Legacy<'a> {
+            slice: BStackSlice<'a>,
+            key: u8,
+            pre_read_off: Cell<u64>,
+            post_write_off: Cell<u64>,
+        }
+        #[allow(deprecated)]
+        impl<'a> BStackGuardedSlice<'a, A> for Legacy<'a> {
+            fn len(&self) -> u64 {
+                self.slice.len()
+            }
+            unsafe fn raw_block(&self) -> BStackSlice<'a> {
+                self.slice.clone()
+            }
+            fn post_read<'d>(&self, data: &'d [u8]) -> io::Result<Cow<'d, [u8]>> {
+                Ok(Cow::Owned(data.iter().map(|b| b ^ self.key).collect()))
+            }
+            fn pre_write<'d>(&self, data: &'d [u8]) -> io::Result<Cow<'d, [u8]>> {
+                Ok(Cow::Owned(data.iter().map(|b| b ^ self.key).collect()))
+            }
+            fn pre_read(&self, offset: u64, _len: u64) -> io::Result<()> {
+                self.pre_read_off.set(offset);
+                Ok(())
+            }
+            fn post_write(&self, offset: u64, _len: u64) -> io::Result<()> {
+                self.post_write_off.set(offset);
+                Ok(())
+            }
+        }
+        let (stack, _c) = mk_stack();
+        stack.push([0u8; 16]).unwrap(); // 8 bytes padding, then the region
+        let key = 0x5A;
+        let g = Legacy {
+            slice: region(&stack, 8, 4),
+            key,
+            pre_read_off: Cell::new(u64::MAX),
+            post_write_off: Cell::new(u64::MAX),
+        };
+        // write() -> encode bridges to the deprecated pre_write (XOR).
+        g.write(b"WXYZ").unwrap();
+        // post_write bridged with the RELATIVE offset 0.
+        assert_eq!(g.post_write_off.get(), 0);
+        let raw = region(&stack, 8, 4).read().unwrap();
+        let expect: Vec<u8> = b"WXYZ".iter().map(|b| b ^ key).collect();
+        assert_eq!(raw, expect);
+        // read() -> decode bridges to the deprecated post_read (XOR back).
+        assert_eq!(g.read().unwrap(), b"WXYZ");
+        // pre_read bridged with the ABSOLUTE offset = slice.start() = 8.
+        assert_eq!(g.pre_read_off.get(), 8);
+    }
+
+    // ---- atomic read-modify-write (features `set` + `atomic`) ----
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn write_range_and_process() {
+        let (stack, _c) = mk_stack();
+        stack.push(b"AAAAAAAA").unwrap();
+        let g = Pass(region(&stack, 0, 8));
+        g.write_range(2, b"XYZ").unwrap();
+        assert_eq!(g.read().unwrap(), b"AAXYZAAA");
+        assert_eq!(
+            g.write_range(6, b"XYZ").unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        g.process(|b| b.iter_mut().for_each(|x| *x = x.to_ascii_lowercase()))
+            .unwrap();
+        assert_eq!(g.read().unwrap(), b"aaxyzaaa");
+        g.copy_within(2..5, 5).unwrap(); // copy "xyz" to offset 5
+        assert_eq!(g.read().unwrap(), b"aaxyzxyz");
+        g.zero_range(0, 2).unwrap();
+        assert_eq!(
+            g.read().unwrap(),
+            &[0, 0, b'x', b'y', b'z', b'x', b'y', b'z']
+        );
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn xor_write_range_is_rmw() {
+        let (stack, _c) = mk_stack();
+        stack.push([0u8; 8]).unwrap();
+        let key = 0xAA;
+        let g = Xor {
+            slice: region(&stack, 0, 8),
+            key,
+        };
+        g.write(b"00000000").unwrap();
+        g.write_range(3, b"ABC").unwrap();
+        assert_eq!(g.read().unwrap(), b"000ABC00");
+        let raw = region(&stack, 0, 8).read().unwrap();
+        let expect: Vec<u8> = b"000ABC00".iter().map(|b| b ^ key).collect();
+        assert_eq!(raw, expect);
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn encode_length_change_rejected() {
+        struct BadEncode<'a>(BStackSlice<'a>);
+        impl<'a> BStackGuardedSlice<'a, A> for BadEncode<'a> {
+            fn len(&self) -> u64 {
+                self.0.len()
+            }
+            unsafe fn raw_block(&self) -> BStackSlice<'a> {
+                self.0.clone()
+            }
+            fn encode<'d>(&self, data: &'d [u8]) -> io::Result<Cow<'d, [u8]>> {
+                let mut v = data.to_vec();
+                v.push(0); // wrongly grows the block
+                Ok(Cow::Owned(v))
+            }
+        }
+        let (stack, _c) = mk_stack();
+        stack.push([0u8; 4]).unwrap();
+        let g = BadEncode(region(&stack, 0, 4));
+        assert_eq!(
+            g.write_range(0, b"ab").unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn empty_block_ops_are_noops() {
+        let (stack, _c) = mk_stack();
+        let g = Pass(region(&stack, 0, 0));
+        assert_eq!(g.read().unwrap(), b"");
+        g.process(|_| {}).unwrap();
+        g.write_range(0, b"").unwrap();
+    }
+
+    // ---- atomic marker: raw swap / cas (features `set` + `atomic`) ----
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    unsafe impl<'a> BStackAtomicGuardedSlice<'a, A> for Pass<'a> {}
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn atomic_cas_and_swap_on_raw() {
+        let (stack, _c) = mk_stack();
+        stack.push(b"OLDDATA_").unwrap();
+        let g = Pass(region(&stack, 0, 8));
+        let target = region(&stack, 0, 8);
+        let prev = g.cas_on(&target, b"OLDDATA_", b"NEWDATA!").unwrap();
+        assert_eq!(prev.as_deref(), Some(&b"OLDDATA_"[..]));
+        assert_eq!(g.read().unwrap(), b"NEWDATA!");
+        // mismatched expected -> no swap
+        assert!(
+            g.cas_on(&target, b"OLDDATA_", b"XXXXXXXX")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(g.read().unwrap(), b"NEWDATA!");
+
+        // swap two adjacent regions
+        let (stack2, _c2) = mk_stack();
+        stack2.push(b"AAAABBBB").unwrap();
+        let left = Pass(region(&stack2, 0, 4));
+        let mut right = region(&stack2, 4, 4);
+        left.swap(&mut right).unwrap();
+        assert_eq!(region(&stack2, 0, 8).read().unwrap(), b"BBBBAAAA");
+    }
 }
