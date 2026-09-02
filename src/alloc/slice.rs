@@ -238,6 +238,13 @@ impl fmt::Debug for BStackRange {
     }
 }
 
+/// The half-open byte range, as `start..end` (e.g. `0..64`).
+impl fmt::Display for BStackRange {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}..{}", self.start(), self.end())
+    }
+}
+
 /// A borrowed, non-owning view of a contiguous region within a [`BStack`] payload.
 ///
 /// `BStackSlice<'a>` is the I/O handle: it carries a `&'a BStack` reference plus
@@ -289,6 +296,13 @@ impl<'a> fmt::Debug for BStackSlice<'a> {
             .field("end", &self.end())
             .field("len", &self.len())
             .finish_non_exhaustive()
+    }
+}
+
+/// The region's half-open byte range within the payload, as `start..end`.
+impl<'a> fmt::Display for BStackSlice<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}..{}", self.start(), self.end())
     }
 }
 
@@ -1345,6 +1359,13 @@ impl<'a, A: BStackAllocator> fmt::Debug for BStackOwnedSlice<'a, A> {
             .field("end", &self.end())
             .field("len", &self.len())
             .finish_non_exhaustive()
+    }
+}
+
+/// The allocation's half-open byte range within the payload, as `start..end`.
+impl<'a, A: BStackAllocator> fmt::Display for BStackOwnedSlice<'a, A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}..{}", self.start(), self.end())
     }
 }
 
@@ -2429,6 +2450,20 @@ impl<'a> fmt::Debug for BStackSliceReader<'a> {
     }
 }
 
+/// The slice's range and the cursor, as `start..end@cursor` — the cursor
+/// relative to the slice, as [`position`](Self::position) reports it.
+impl<'a> fmt::Display for BStackSliceReader<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}..{}@{}",
+            self.slice.start(),
+            self.slice.end(),
+            self.cursor
+        )
+    }
+}
+
 impl<'a> BStackSliceReader<'a> {
     /// Return the current cursor position within the slice (not the payload).
     #[inline]
@@ -2577,6 +2612,21 @@ impl<'a> fmt::Debug for BStackSliceWriter<'a> {
             .field("len", &self.slice.len())
             .field("cursor", &self.cursor)
             .finish_non_exhaustive()
+    }
+}
+
+/// The slice's range and the cursor, as `start..end@cursor` — the cursor
+/// relative to the slice, as [`position`](Self::position) reports it.
+#[cfg(feature = "set")]
+impl<'a> fmt::Display for BStackSliceWriter<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}..{}@{}",
+            self.slice.start(),
+            self.slice.end(),
+            self.cursor
+        )
     }
 }
 

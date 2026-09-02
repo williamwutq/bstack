@@ -104,6 +104,19 @@ impl<'a> fmt::Debug for BStackChunk<'a> {
     }
 }
 
+/// The underlying region's range and the stride, as `start..end/chunk_len`.
+impl<'a> fmt::Display for BStackChunk<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}..{}/{}",
+            self.aligned.start(),
+            self.aligned.end(),
+            self.chunk_len
+        )
+    }
+}
+
 /// Location equality: same stride *and* the same underlying region
 /// (`self.as_slice() == other.as_slice()`), not content. No cross-type
 /// `PartialEq` against a bare [`BStackSlice`] is provided — a `BStackChunk`
