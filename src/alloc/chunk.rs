@@ -158,6 +158,24 @@ impl<'a> Ord for BStackChunk<'a> {
     }
 }
 
+/// Discards the stride, yielding the aligned region. Equivalent to
+/// [`into_slice`](BStackChunk::into_slice).
+impl<'a> From<BStackChunk<'a>> for BStackSlice<'a> {
+    #[inline]
+    fn from(chunk: BStackChunk<'a>) -> Self {
+        chunk.into_slice()
+    }
+}
+
+/// Borrows the aligned region. Deliberately not `Deref`: autoderef would pull
+/// the slice's byte-unit methods into this type's chunk-unit API.
+impl<'a> AsRef<BStackSlice<'a>> for BStackChunk<'a> {
+    #[inline]
+    fn as_ref(&self) -> &BStackSlice<'a> {
+        &self.aligned
+    }
+}
+
 impl<'a> BStackChunk<'a> {
     /// Construct a `BStackChunk` from raw parts: a stack, byte offset, byte
     /// length, and stride — no I/O, no validation.

@@ -5559,6 +5559,25 @@ mod alloc_tests {
             assert_eq!(writer.position(), 4);
         }
     }
+
+    // From<BStackChunk> discards the stride; AsRef borrows the aligned region.
+    #[test]
+    fn chunk_slice_conversions() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let own = alloc.alloc(12).unwrap();
+        let (view, rem) = own.as_slice().chunks(4);
+        assert!(rem.is_empty());
+
+        let borrowed: &BStackSlice = view.as_ref();
+        assert_eq!(*borrowed, view.as_slice());
+        assert_eq!(borrowed.len(), 12);
+        assert_eq!(view.chunk_count(), 3);
+
+        let slice: BStackSlice = view.into();
+        assert_eq!(slice.start(), own.start());
+        assert_eq!(slice.len(), 12);
+    }
 }
 
 // -------------------------------------------------------------------------

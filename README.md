@@ -531,12 +531,14 @@ assert!(stack.pop(stack.len()? - 60).is_err()); // would shrink below locked
 
 **`BStackSlice<'a>`** — borrowed I/O view carrying `&'a BStack`. Non-`Copy`, `Clone`.
 
-| Trait                                        | Semantics                                                          |
-|----------------------------------------------|--------------------------------------------------------------------|
-| `PartialEq` / `Eq`                           | Compares `(offset, len)`. The stack reference is **not** compared. |
-| `Hash`                                       | Hashes `(offset, len)`.                                            |
-| `PartialOrd` / `Ord`                         | Ordered by `offset`, then `len`.                                   |
-| `Borrow<BStackRange>` / `AsRef<BStackRange>` | Borrows the stored `(offset, len)`.                                |
+| Trait                                                         | Semantics                                                          |
+|---------------------------------------------------------------|--------------------------------------------------------------------|
+| `PartialEq` / `Eq`                                            | Compares `(offset, len)`. The stack reference is **not** compared. |
+| `Hash`                                                        | Hashes `(offset, len)`.                                            |
+| `PartialOrd` / `Ord`                                          | Ordered by `offset`, then `len`.                                   |
+| `Borrow<BStackRange>` / `AsRef<BStackRange>`                  | Borrows the stored `(offset, len)`.                                |
+| `From<BStackSliceReader<'a>>` / `From<BStackSliceWriter<'a>>` | Consumes a cursor type, dropping the cursor.                       |
+| `From<BStackChunk<'a>>`                                       | Consumes a chunk view, dropping the stride.                        |
 
 `BStackRange`, `BStackOwnedSlice`, and `BStackSlice` are also **cross-comparable**: `PartialEq` and
 `PartialOrd` are defined between every pair of the three (both directions), all keyed on the same
@@ -563,13 +565,17 @@ weaker contract, for generic code that accepts `impl AsRef<BStackRange>`.
 
 **`BStackChunk<'a>`** — fixed-stride view carrying `&'a BStack`. Non-`Copy`, `Clone`.
 
-| Trait                | Semantics                                                                                   |
-|----------------------|---------------------------------------------------------------------------------------------|
-| `PartialEq` / `Eq`   | Compares `(chunk_len, aligned region)` — same stride *and* same underlying `(offset, len)`. |
-| `Hash`               | Hashes `(chunk_len, aligned region)`.                                                       |
-| `PartialOrd` / `Ord` | Ordered by `chunk_len` first, then by the aligned region's own `Ord`.                       |
+| Trait                    | Semantics                                                                                   |
+|--------------------------|---------------------------------------------------------------------------------------------|
+| `PartialEq` / `Eq`       | Compares `(chunk_len, aligned region)` — same stride *and* same underlying `(offset, len)`. |
+| `Hash`                   | Hashes `(chunk_len, aligned region)`.                                                       |
+| `PartialOrd` / `Ord`     | Ordered by `chunk_len` first, then by the aligned region's own `Ord`.                       |
+| `AsRef<BStackSlice<'a>>` | Borrows the aligned region.                                                                 |
+| `Into<BStackSlice<'a>>`  | Consumes the view, discarding the stride.                                                   |
 
 Deliberately **not** cross-comparable with `BStackSlice`/`BStackOwnedSlice`/`BStackRange` — a chunk view's stride is part of its identity, and comparing it directly against a bare slice would silently discard that.
+
+Dropping the stride is therefore explicit, through `AsRef` (borrow) or `Into` (consume) — the named `as_slice`/`into_slice` under their standard trait spellings. `Deref` would do it implicitly, which is why it is absent: see [below](#traits-deliberately-not-implemented).
 
 **`BStackGuardedSlice<'a, A>`** — lifecycle-hook I/O view for transparent interception (encryption, compression, auditing; `guarded` feature). *A trait, not a concrete handle*, so it defines no comparison or hashing traits of its own — an implementor derives those from the type it lives on.
 
@@ -607,7 +613,7 @@ resolution. `Deref` exposes only the `&self` methods, keeping the two apart.
 | `Deref<Target = BStack>`                       | every allocator, `BStackReader` | Would put `push` / `pop` / `discard` / `set` on the deref'ing type.                   |
 | `AsRef<BStack>`                                | every allocator                 | `BStackAllocator::stack()` already names it; no blanket impl is possible.             |
 | `Deref<Target = A>`                            | `DebugCheckingAllocator<A>`     | Would bypass the tracking the wrapper exists to perform.                              |
-| `Deref<Target = BStackSlice>`                  | `BStackChunk`                   | Would leak byte-unit methods into a chunk-unit API.                                   |
+| `Deref<Target = BStackSlice>`                  | `BStackChunk`                   | Would leak byte-unit methods into a chunk-unit API; `AsRef` gives the borrow instead. |
 | `Borrow<BStackRange>`                          | `BStackChunk`                   | Contract violation — chunk hashes `chunk_len` alongside the region.                   |
 | `Deref<Target = BStackOwnedSlice>`             | `BStackByteVec`                 | Would expose the 16-byte header to raw region writes.                                 |
 
@@ -1254,7 +1260,7 @@ Also constructible directly, without splitting off a remainder, via `BStackChunk
 | `merge_adjacent(other)`                                                                             | `Some` union if `same_stride` and the regions are adjacent and non-empty, thus also `same_phase`; `None` otherwise      |
 | `get(index)`                                                                                        | The chunk at `index` as a `BStackSlice`, or `None` — O(1), no I/O                                                       |
 | `first()` / `last()`                                                                                | The first/last chunk as a `BStackSlice`, or `None` if empty — O(1), no I/O                                              |
-| `as_slice()` / `into_slice()`                                                                       | The whole aligned region as a plain `BStackSlice` — by clone, or by consuming `self`                                    |
+| `as_slice()` / `into_slice()`                                                                       | The whole aligned region as a plain `BStackSlice` — by clone, or by consuming `self`; also as `AsRef` / `Into`          |
 | `to_owned_in(alloc)` / `to_owned_uninit_in(alloc)` *(features `set` + `atomic`)*                    | Copy the aligned region into a fresh owned `BStackOwnedSlice`; re-chunk it with `from_slice`; `_uninit` skips zero-fill |
 | `with_stride(new_stride)`                                                                           | Consume `self`, re-dividing the aligned region with a different stride — `(BStackChunk, BStackSlice)`, same as `chunks` |
 | `split_at(mid)`                                                                                     | `(BStackChunk, BStackChunk)` split at chunk index `mid` — no I/O, same stride/phase as `self`                           |
