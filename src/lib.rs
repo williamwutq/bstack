@@ -41,7 +41,7 @@
 //! ```
 //!
 //! * **`magic`** — 8 bytes: `BSTK` + major(1 B) + minor(1 B) + patch(1 B) + reserved(1 B).
-//!   This version writes `BSTK\x00\x04\x03\x00` (0.4.3).  [`open`](BStack::open)
+//!   This version writes `BSTK\x00\x04\x04\x00` (0.4.4).  [`open`](BStack::open)
 //!   accepts any file whose first 6 bytes match `BSTK\x00\x04` (any 0.4.x) and
 //!   rejects anything with a different major or minor.
 //! * **`clen`** — little-endian `u64` recording the *committed* payload length.
@@ -408,7 +408,7 @@
 //!
 //! | Trait | Semantics |
 //! |-------|-----------|
-//! | `Debug` | Shows `version` (semver string from the magic header, e.g. `"0.4.3"`) and `len` (`Option<u64>`, `None` on I/O failure). |
+//! | `Debug` | Shows `version` (semver string from the magic header, e.g. `"0.4.4"`) and `len` (`Option<u64>`, `None` on I/O failure). |
 //! | `PartialEq` / `Eq` | **Pointer identity.** Two values are equal iff they are the same instance. No two distinct `BStack` values in one process can refer to the same file. |
 //! | `Hash` | Hashes the instance address — consistent with pointer-identity `PartialEq`. |
 //!
@@ -761,7 +761,7 @@ use windows_sys::Win32::System::IO::OVERLAPPED;
 /// reject the new files loudly instead of misreading them.
 const FORMAT_MAJOR: u8 = 0;
 const FORMAT_MINOR: u8 = 4;
-const FORMAT_PATCH: u8 = 3;
+const FORMAT_PATCH: u8 = 4;
 
 /// Full magic for files written by this version
 /// (`BSTK` + major + minor + patch + reserved(0)).
