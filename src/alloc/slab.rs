@@ -142,6 +142,10 @@ pub struct SlabBStackAllocator {
     _not_sync: PhantomData<Cell<()>>,
 }
 
+/// `Sync` is removed deliberately by `_not_sync`; `RefUnwindSafe` is collateral.
+#[cfg(not(feature = "atomic"))]
+impl std::panic::RefUnwindSafe for SlabBStackAllocator {}
+
 #[cfg(feature = "set")]
 impl SlabBStackAllocator {
     /// Bytes before the allocator header reserved for caller use.

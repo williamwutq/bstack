@@ -163,6 +163,10 @@ pub struct FirstFitBStackAllocator {
     _not_sync: PhantomData<Cell<()>>,
 }
 
+/// `Sync` is removed deliberately by `_not_sync`; `RefUnwindSafe` is collateral.
+#[cfg(not(feature = "atomic"))]
+impl std::panic::RefUnwindSafe for FirstFitBStackAllocator {}
+
 #[cfg(feature = "set")]
 impl fmt::Debug for FirstFitBStackAllocator {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

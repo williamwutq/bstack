@@ -72,6 +72,12 @@
 //!   [`recover`](CheckedSlabBStackAllocator::recover) single-flight.
 //!   *Experimental.*
 //!
+//! Every allocator above is `UnwindSafe` and `RefUnwindSafe` in all
+//! configurations.  Without `atomic` the latter is an explicit impl: the
+//! `PhantomData<Cell<()>>` marker that removes `Sync` would otherwise take
+//! `RefUnwindSafe` with it, and the only interior mutability is the
+//! [`BStack`](crate::BStack)'s own poisoning lock.
+//!
 //! * [`BStackByteVec`] — a growable byte (`u8`) vector backed by a
 //!   [`BStack`] allocation (requires both `alloc` **and** `set`).  Mirrors the
 //!   core [`Vec<u8>`] API: `push`, `pop`, `get`, `read_bytes`, `as_slice`,

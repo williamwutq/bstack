@@ -179,6 +179,10 @@ pub struct CheckedSlabBStackAllocator {
     _not_sync: PhantomData<Cell<()>>,
 }
 
+/// `Sync` is removed deliberately by `_not_sync`; `RefUnwindSafe` is collateral.
+#[cfg(not(feature = "atomic"))]
+impl std::panic::RefUnwindSafe for CheckedSlabBStackAllocator {}
+
 /// How a single block looks to the recovery scan.
 ///
 /// Only used by the non-`atomic` recovery path; the `atomic` path inlines the
