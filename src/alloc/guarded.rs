@@ -230,7 +230,10 @@ where
 
     /// Deprecated: renamed to [`on_read`](BStackGuardedSlice::on_read); its offset
     /// is now **relative** to the slice, not absolute.
-    #[deprecated(since = "0.4.4", note = "renamed to `on_read`; offset is now relative to the slice")]
+    #[deprecated(
+        since = "0.4.4",
+        note = "renamed to `on_read`; offset is now relative to the slice"
+    )]
     #[inline]
     fn pre_read(&self, _offset: u64, _len: u64) -> io::Result<()> {
         Ok(())
@@ -430,25 +433,41 @@ where
     /// Apparent index of the first byte equal to `needle`. Parity with
     /// [`BStackSlice::find`].
     fn find(&self, needle: u8) -> io::Result<Option<u64>> {
-        Ok(self.read()?.iter().position(|&b| b == needle).map(|i| i as u64))
+        Ok(self
+            .read()?
+            .iter()
+            .position(|&b| b == needle)
+            .map(|i| i as u64))
     }
 
     /// Apparent index of the last byte equal to `needle`. Parity with
     /// [`BStackSlice::rfind`].
     fn rfind(&self, needle: u8) -> io::Result<Option<u64>> {
-        Ok(self.read()?.iter().rposition(|&b| b == needle).map(|i| i as u64))
+        Ok(self
+            .read()?
+            .iter()
+            .rposition(|&b| b == needle)
+            .map(|i| i as u64))
     }
 
     /// Apparent index of the first byte satisfying `predicate`. Parity with
     /// [`BStackSlice::position`].
     fn position(&self, predicate: impl Fn(u8) -> bool) -> io::Result<Option<u64>> {
-        Ok(self.read()?.iter().position(|&b| predicate(b)).map(|i| i as u64))
+        Ok(self
+            .read()?
+            .iter()
+            .position(|&b| predicate(b))
+            .map(|i| i as u64))
     }
 
     /// Apparent index of the last byte satisfying `predicate`. Parity with
     /// [`BStackSlice::rposition`].
     fn rposition(&self, predicate: impl Fn(u8) -> bool) -> io::Result<Option<u64>> {
-        Ok(self.read()?.iter().rposition(|&b| predicate(b)).map(|i| i as u64))
+        Ok(self
+            .read()?
+            .iter()
+            .rposition(|&b| predicate(b))
+            .map(|i| i as u64))
     }
 
     /// Overwrite the whole apparent slice with `data`.
@@ -574,7 +593,9 @@ where
             let (ss, se, d) = (src.start as usize, src.end as usize, dest as usize);
             let count = se
                 .checked_sub(ss)
-                .filter(|&c| se <= whole.len() && d.checked_add(c).is_some_and(|e| e <= whole.len()))
+                .filter(|&c| {
+                    se <= whole.len() && d.checked_add(c).is_some_and(|e| e <= whole.len())
+                })
                 .ok_or_else(|| io_error!(InvalidInput, "copy_within range out of bounds"))?;
             whole.copy_within(ss..se, d);
             n = count as u64;
@@ -815,9 +836,9 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{BStackGuardedSlice, BStackGuardedSliceSubview};
     #[cfg(all(feature = "set", feature = "atomic"))]
     use super::BStackAtomicGuardedSlice;
+    use super::{BStackGuardedSlice, BStackGuardedSliceSubview};
     use crate::{BStack, BStackSlice, LinearBStackAllocator};
     use std::borrow::Cow;
     use std::cell::Cell;
@@ -838,7 +859,8 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static C: AtomicU64 = AtomicU64::new(0);
         let id = C.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("bstack_guard_{}_{}.bin", std::process::id(), id));
+        let path =
+            std::env::temp_dir().join(format!("bstack_guard_{}_{}.bin", std::process::id(), id));
         let stack = BStack::open(&path).unwrap();
         (stack, Cleanup(path))
     }
@@ -921,10 +943,19 @@ mod tests {
         g.read_into(&mut buf).unwrap();
         assert_eq!(&buf, b"abcdefgh");
         let mut small = [0u8; 4];
-        assert_eq!(g.read_into(&mut small).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            g.read_into(&mut small).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
         assert_eq!(g.read_range(2, 5).unwrap(), b"cde");
-        assert_eq!(g.read_range(5, 2).unwrap_err().kind(), io::ErrorKind::InvalidInput);
-        assert_eq!(g.read_range(0, 9).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            g.read_range(5, 2).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            g.read_range(0, 9).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
         let mut into = [0u8; 3];
         g.read_range_into(1, &mut into).unwrap();
         assert_eq!(&into, b"bcd");
@@ -954,10 +985,16 @@ mod tests {
         let plain = b"secret payload!!";
         let cipher: Vec<u8> = plain.iter().map(|b| b ^ key).collect();
         stack.push(&cipher).unwrap();
-        let g = Xor { slice: region(&stack, 0, plain.len() as u64), key };
+        let g = Xor {
+            slice: region(&stack, 0, plain.len() as u64),
+            key,
+        };
         assert_eq!(g.read().unwrap(), plain);
         // raw bytes on disk stay ciphertext
-        assert_eq!(region(&stack, 0, plain.len() as u64).read().unwrap(), cipher);
+        assert_eq!(
+            region(&stack, 0, plain.len() as u64).read().unwrap(),
+            cipher
+        );
     }
 
     #[test]
@@ -993,7 +1030,10 @@ mod tests {
         let (stack, _c) = mk_stack();
         stack.push([0u8; 4]).unwrap();
         let g = Deny(region(&stack, 0, 4));
-        assert_eq!(g.read().unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            g.read().unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
     }
 
     #[test]
@@ -1017,7 +1057,10 @@ mod tests {
         let (stack, _c) = mk_stack();
         stack.push([0u8; 24]).unwrap();
         // Region at absolute offset 8; on_read must see the *relative* offset 0.
-        let g = Rec { slice: region(&stack, 8, 10), seen: Cell::new(None) };
+        let g = Rec {
+            slice: region(&stack, 8, 10),
+            seen: Cell::new(None),
+        };
         g.read().unwrap();
         assert_eq!(g.seen.get(), Some((0, 10)));
     }
@@ -1045,7 +1088,10 @@ mod tests {
         assert_eq!(g.read().unwrap(), [1, 2, 3, 4, 5]);
         g.copy_from_slice(b"abcde").unwrap();
         assert_eq!(g.read().unwrap(), b"abcde");
-        assert_eq!(g.copy_from_slice(b"abc").unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            g.copy_from_slice(b"abc").unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
     }
 
     #[cfg(feature = "set")]
@@ -1054,7 +1100,10 @@ mod tests {
         let (stack, _c) = mk_stack();
         stack.push([0u8; 8]).unwrap();
         let key = 0x33;
-        let g = Xor { slice: region(&stack, 0, 8), key };
+        let g = Xor {
+            slice: region(&stack, 0, 8),
+            key,
+        };
         g.write(b"12345678").unwrap();
         assert_eq!(g.read().unwrap(), b"12345678");
         let raw = region(&stack, 0, 8).read().unwrap();
@@ -1130,13 +1179,20 @@ mod tests {
         let g = Pass(region(&stack, 0, 8));
         g.write_range(2, b"XYZ").unwrap();
         assert_eq!(g.read().unwrap(), b"AAXYZAAA");
-        assert_eq!(g.write_range(6, b"XYZ").unwrap_err().kind(), io::ErrorKind::InvalidInput);
-        g.process(|b| b.iter_mut().for_each(|x| *x = x.to_ascii_lowercase())).unwrap();
+        assert_eq!(
+            g.write_range(6, b"XYZ").unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        g.process(|b| b.iter_mut().for_each(|x| *x = x.to_ascii_lowercase()))
+            .unwrap();
         assert_eq!(g.read().unwrap(), b"aaxyzaaa");
         g.copy_within(2..5, 5).unwrap(); // copy "xyz" to offset 5
         assert_eq!(g.read().unwrap(), b"aaxyzxyz");
         g.zero_range(0, 2).unwrap();
-        assert_eq!(g.read().unwrap(), &[0, 0, b'x', b'y', b'z', b'x', b'y', b'z']);
+        assert_eq!(
+            g.read().unwrap(),
+            &[0, 0, b'x', b'y', b'z', b'x', b'y', b'z']
+        );
     }
 
     #[cfg(all(feature = "set", feature = "atomic"))]
@@ -1145,7 +1201,10 @@ mod tests {
         let (stack, _c) = mk_stack();
         stack.push([0u8; 8]).unwrap();
         let key = 0xAA;
-        let g = Xor { slice: region(&stack, 0, 8), key };
+        let g = Xor {
+            slice: region(&stack, 0, 8),
+            key,
+        };
         g.write(b"00000000").unwrap();
         g.write_range(3, b"ABC").unwrap();
         assert_eq!(g.read().unwrap(), b"000ABC00");
@@ -1174,7 +1233,10 @@ mod tests {
         let (stack, _c) = mk_stack();
         stack.push([0u8; 4]).unwrap();
         let g = BadEncode(region(&stack, 0, 4));
-        assert_eq!(g.write_range(0, b"ab").unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            g.write_range(0, b"ab").unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
     }
 
     #[cfg(all(feature = "set", feature = "atomic"))]
@@ -1203,7 +1265,11 @@ mod tests {
         assert_eq!(prev.as_deref(), Some(&b"OLDDATA_"[..]));
         assert_eq!(g.read().unwrap(), b"NEWDATA!");
         // mismatched expected -> no swap
-        assert!(g.cas_on(&target, b"OLDDATA_", b"XXXXXXXX").unwrap().is_none());
+        assert!(
+            g.cas_on(&target, b"OLDDATA_", b"XXXXXXXX")
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(g.read().unwrap(), b"NEWDATA!");
 
         // swap two adjacent regions
