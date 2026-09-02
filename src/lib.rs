@@ -4996,6 +4996,15 @@ pub struct BStackReader<'a> {
     offset: u64,
 }
 
+impl<'a> fmt::Debug for BStackReader<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BStackReader")
+            .field("position", &self.offset)
+            .field("len", &self.stack.len().ok())
+            .finish_non_exhaustive()
+    }
+}
+
 impl BStack {
     /// Create a [`BStackReader`] positioned at the start of the payload.
     #[inline]
