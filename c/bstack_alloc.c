@@ -2098,13 +2098,21 @@ static void bstack_alloc_lock_destroy(void *lock)
 #define ALGT_ROOT_OFFSET     UINT64_C(40)
 #define ALGT_ARENA_START     UINT64_C(48)
 #define ALGT_MIN_ALLOC       UINT64_C(32)
+/* Largest length algt_align_up_len will round up; anything larger is rejected
+ * with EINVAL rather than wrapped.  Unchecked, len + 31 wraps a near-UINT64_MAX
+ * request down to a 32-byte block, which alloc would hand back as a slice
+ * claiming the original length and realloc would carry into the tail-shrink
+ * path as an underflowed padding size.  Bounded by the arena rather than by
+ * UINT64_MAX alone: above this a block at the first arena offset already
+ * overflows ALGT_ARENA_START + aligned. */
+#define ALGT_MAX_ALLOC       ((UINT64_MAX - ALGT_ARENA_START) & ~UINT64_C(31))
 #define ALGT_NULL_PTR        UINT64_C(0)
 /* Maximum recursion depth for AVL operations.  A balanced AVL tree never
  * exceeds ~60 levels; 128 gives headroom for post-crash imbalance while
  * reliably detecting cycles created by a partial rotation crash. */
 #define ALGT_MAX_AVL_DEPTH   128u
 
-static const uint8_t algt_magic[8]        = {'A','L','G','T',0,1,3,0};
+static const uint8_t algt_magic[8]        = {'A','L','G','T',0,1,4,0};
 static const uint8_t algt_magic_prefix[6] = {'A','L','G','T',0,1};
 
 typedef struct {
@@ -2122,7 +2130,9 @@ typedef struct {
 /* Round len up to a multiple of 32, minimum 32. */
 static inline uint64_t algt_align_up_len(uint64_t len)
 {
-    uint64_t a = (len + UINT64_C(31)) & ~UINT64_C(31);
+    uint64_t a;
+    if (len > ALGT_MAX_ALLOC) return UINT64_MAX; /* signal overflow */
+    a = (len + UINT64_C(31)) & ~UINT64_C(31);
     return a < ALGT_MIN_ALLOC ? ALGT_MIN_ALLOC : a;
 }
 
@@ -2813,6 +2823,7 @@ static int gt_vt_alloc(bstack_allocator_t *self, uint64_t len,
     }
 
     aligned = algt_align_up_len(len);
+    if (aligned == UINT64_MAX) { errno = EINVAL; return -1; }
 
     /* Lock covers AVL search and conditional insert (split case).
      * Released before bstack_zero (no-split) and before bstack_extend. */
@@ -2877,6 +2888,7 @@ static int gt_vt_dealloc(bstack_allocator_t *self, bstack_slice_t slice)
     }
 
     true_len = algt_align_up_len(slice.len);
+    if (true_len == UINT64_MAX) { errno = EINVAL; return -1; }
 #if UINT64_MAX > SIZE_MAX
     if (true_len > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
 #endif
@@ -2941,6 +2953,10 @@ static int gt_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
     old_len     = slice.len;
     aligned_old = algt_align_up_len(old_len);
     aligned_new = algt_align_up_len(new_len);
+    if (aligned_old == UINT64_MAX || aligned_new == UINT64_MAX) {
+        errno = EINVAL;
+        return -1;
+    }
 
     if (aligned_new == aligned_old) {
         /* Same underlying block: just zero the gap on shrink. */
@@ -3110,6 +3126,11 @@ gt_vt_alloc_bulk(bstack_allocator_t *self, const uint64_t *lens, size_t n,
     for (i = 0; i < n; i++) {
         uint64_t al = (lens[i] == 0) ? 0 : algt_align_up_len(lens[i]);
         aligned[i] = al;
+        if (al == UINT64_MAX) {
+            free(aligned);
+            errno = EINVAL;
+            return -1;
+        }
         if (al > UINT64_MAX - total) {
             free(aligned);
             errno = EINVAL;
@@ -3224,6 +3245,9 @@ gt_vt_dealloc_bulk(bstack_allocator_t *self, const bstack_slice_t *slices,
         }
         pairs[pairs_n].ptr  = slices[i].offset;
         pairs[pairs_n].size = algt_align_up_len(slices[i].len);
+        if (pairs[pairs_n].size == UINT64_MAX) {
+            free(pairs); errno = EINVAL; return -1;
+        }
         pairs_n++;
     }
 

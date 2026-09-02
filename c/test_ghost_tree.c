@@ -894,6 +894,83 @@ static int test_realloc_misaligned_error(void)
     return 0;
 }
 
+/* Regression: a length too large to round up to a 32-byte multiple must be
+ * rejected, not wrapped.  Unchecked, `len + 31` wrapped a near-UINT64_MAX
+ * request down to a 32-byte block and alloc handed back a slice claiming the
+ * original length.  ALGT_MAX_ALLOC is internal, so it is recomputed here from
+ * the arena start (48) exactly as bstack_alloc.c derives it. */
+#define GT_MAX_ALLOC ((UINT64_MAX - UINT64_C(48)) & ~UINT64_C(31))
+
+static int test_alloc_rejects_unalignable_length(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    ghost_tree_bstack_allocator_t *a = ghost_tree_bstack_allocator_new(bs);
+    CHECK(a);
+    bstack_allocator_t *al = (bstack_allocator_t *)a;
+
+    {
+        uint64_t bad[3];
+        int i;
+        bad[0] = GT_MAX_ALLOC + 1;
+        bad[1] = UINT64_MAX - 5;
+        bad[2] = UINT64_MAX;
+        for (i = 0; i < 3; i++) {
+            bstack_slice_t s;
+            errno = 0;
+            CHECK(bstack_allocator_alloc(al, bad[i], &s) == -1);
+            CHECK(errno == EINVAL);
+        }
+    }
+
+    /* The allocator is untouched and still works. */
+    {
+        bstack_slice_t s;
+        CHECK(bstack_allocator_alloc(al, 64, &s) == 0);
+        CHECK(s.len == 64);
+        CHECK(bstack_allocator_dealloc(al, s) == 0);
+    }
+
+    bstack_close(ghost_tree_bstack_allocator_into_stack(a));
+    gt_unlink(tmp);
+    return 0;
+}
+
+/* Same rejection on realloc, which reached the wrap through the tail-shrink
+ * path with an underflowed padding length.  The block is untouched, so the
+ * caller's handle stays live. */
+static int test_realloc_rejects_unalignable_length(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    ghost_tree_bstack_allocator_t *a = ghost_tree_bstack_allocator_new(bs);
+    CHECK(a);
+    bstack_allocator_t *al = (bstack_allocator_t *)a;
+
+    bstack_slice_t s;
+    CHECK(bstack_allocator_alloc(al, 64, &s) == 0);
+    {
+        bstack_slice_t out;
+        errno = 0;
+        CHECK(bstack_allocator_realloc(al, s, GT_MAX_ALLOC + 1, &out) == -1);
+        CHECK(errno == EINVAL);
+    }
+    /* Still a live block: writable, readable, and freeable. */
+    {
+        unsigned char buf[64];
+        memset(buf, 0xA5, sizeof buf);
+        CHECK(bstack_slice_write(s, buf, sizeof buf) == 0);
+        memset(buf, 0, sizeof buf);
+        CHECK(bstack_slice_read(s, buf) == 0);
+        CHECK(buf[0] == 0xA5 && buf[63] == 0xA5);
+    }
+    CHECK(bstack_allocator_dealloc(al, s) == 0);
+
+    bstack_close(ghost_tree_bstack_allocator_into_stack(a));
+    gt_unlink(tmp);
+    return 0;
+}
+
 /* ── alloc_bulk / dealloc_bulk ─────────────────────────────────────────── */
 
 static int test_alloc_bulk_contiguous(void)
@@ -1651,6 +1728,8 @@ int main(void)
     T(test_realloc_grow_nontail);
     T(test_dealloc_misaligned_error);
     T(test_realloc_misaligned_error);
+    T(test_alloc_rejects_unalignable_length);
+    T(test_realloc_rejects_unalignable_length);
     T(test_alloc_bulk_contiguous);
     T(test_alloc_bulk_with_zeros);
     T(test_dealloc_bulk_merges);

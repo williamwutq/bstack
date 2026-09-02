@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`GhostTreeBstackAllocator` (Rust and C): a length too large to round up to a 32-byte multiple was accepted rather than rejected.** `align_up_len` / `algt_align_up_len` computed `(len + 31) & !31` unchecked, so any `len > u64::MAX - 31` wrapped and rounded *down* to a 32-byte block: `alloc` returned a handle claiming the requested length, and `realloc` shrank the block to 32 bytes and freed the remainder while the handle still claimed the huge length. Debug builds trapped on the overflowing add, so the damage was release-only. Both helpers now check against a new `MAX_ALLOC` / `ALGT_MAX_ALLOC` (`(u64::MAX - ARENA_START) & !31`, bounded by the arena rather than by `u64` alone), and `alloc`, `alloc_bulk`, `realloc`, `dealloc`, and `dealloc_bulk` reject an unalignable length with `io::ErrorKind::InvalidInput` / `errno = EINVAL`. On-disk format unchanged. Backported from the 0.4.x line.
+
+### Changed
+
+- **`GhostTreeBstackAllocator` version bumped to 0.1.4** (`alloc` + `set`; Rust and C): magic `ALGT\x00\x01\x03\x00` → `ALGT\x00\x01\x04\x00`. No layout change; the patch byte attributes a file to a build that rejects an unalignable length rather than wrapping it. Existing 0.1.x files remain fully compatible (only the first 6 bytes are checked on open).
+
 ## [0.2.6] - 2026-08-23
 
 ### Added
