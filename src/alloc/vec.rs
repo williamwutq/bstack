@@ -1027,10 +1027,27 @@ impl<'a, A: BStackOwnedSliceAllocator> BStackByteVec<'a, A> {
 /// Constructed by [`BStackByteVec::iter`].  `len` is snapshotted at
 /// construction; bytes pushed after construction are not visible.  Each byte
 /// is read from disk on demand; I/O errors surface as `Err` items.
+///
+/// Implements [`ExactSizeIterator`]: the remaining count is tracked as `u64`
+/// and is exact on 64-bit targets.  On targets where `usize` is narrower than
+/// `u64` (e.g. 32-bit), a count that doesn't fit in `usize` is clamped to
+/// `usize::MAX` rather than silently truncated — `size_hint()`/`len()` then
+/// under-report, but never wrap to a smaller, wrong value.
 pub struct BStackByteVecIter<'b, 'a: 'b, A: BStackOwnedSliceAllocator> {
     vec: &'b BStackByteVec<'a, A>,
     index: u64,
     len: u64,
+}
+
+impl<'b, 'a: 'b, A: BStackOwnedSliceAllocator> Clone for BStackByteVecIter<'b, 'a, A> {
+    #[inline]
+    fn clone(&self) -> Self {
+        BStackByteVecIter {
+            vec: self.vec,
+            index: self.index,
+            len: self.len,
+        }
+    }
 }
 
 impl<'b, 'a: 'b, A: BStackOwnedSliceAllocator> fmt::Debug for BStackByteVecIter<'b, 'a, A> {
@@ -1060,6 +1077,26 @@ impl<'b, 'a: 'b, A: BStackOwnedSliceAllocator> Iterator for BStackByteVecIter<'b
         let remaining = (self.len - self.index).min(usize::MAX as u64) as usize;
         (remaining, Some(remaining))
     }
+}
+
+impl<'b, 'a: 'b, A: BStackOwnedSliceAllocator> DoubleEndedIterator
+    for BStackByteVecIter<'b, 'a, A>
+{
+    #[inline]
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.index >= self.len {
+            return None;
+        }
+        self.len -= 1;
+        Some(self.vec.read_byte_at(self.len))
+    }
+}
+
+impl<'b, 'a: 'b, A: BStackOwnedSliceAllocator> ExactSizeIterator for BStackByteVecIter<'b, 'a, A> {}
+
+impl<'b, 'a: 'b, A: BStackOwnedSliceAllocator> std::iter::FusedIterator
+    for BStackByteVecIter<'b, 'a, A>
+{
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
@@ -1496,6 +1533,58 @@ mod tests {
         let v = BStackByteVec::new(&alloc).unwrap();
         let count = v.iter().unwrap().count();
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn iter_double_ended_meets_in_the_middle() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let src = [3u8, 1, 4, 1, 5];
+        let v = BStackByteVec::from_slice(&src, &alloc).unwrap();
+
+        let reversed: Vec<u8> = v.iter().unwrap().rev().map(|r| r.unwrap()).collect();
+        assert_eq!(reversed, [5u8, 1, 4, 1, 3]);
+
+        let mut it = v.iter().unwrap();
+        assert_eq!(it.next().unwrap().unwrap(), 3);
+        assert_eq!(it.next_back().unwrap().unwrap(), 5);
+        assert_eq!(it.next().unwrap().unwrap(), 1);
+        assert_eq!(it.next_back().unwrap().unwrap(), 1);
+        assert_eq!(it.next_back().unwrap().unwrap(), 4);
+        assert!(it.next().is_none());
+        assert!(it.next_back().is_none());
+    }
+
+    #[test]
+    fn iter_exact_size_and_fused() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let v = BStackByteVec::from_slice(&[1u8, 2, 3], &alloc).unwrap();
+        let mut it = v.iter().unwrap();
+        assert_eq!(it.len(), 3);
+        it.next().unwrap().unwrap();
+        it.next_back().unwrap().unwrap();
+        assert_eq!(it.len(), 1);
+        it.next().unwrap().unwrap();
+        assert_eq!(it.len(), 0);
+        // Fused: exhausted from either end, and it stays exhausted.
+        assert!(it.next().is_none());
+        assert!(it.next().is_none());
+        assert!(it.next_back().is_none());
+    }
+
+    #[test]
+    fn iter_clone_forks_position() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let v = BStackByteVec::from_slice(&[9u8, 8, 7, 6], &alloc).unwrap();
+        let mut it = v.iter().unwrap();
+        it.next().unwrap().unwrap();
+        let forked = it.clone();
+        let a: Vec<u8> = it.map(|r| r.unwrap()).collect();
+        let b: Vec<u8> = forked.map(|r| r.unwrap()).collect();
+        assert_eq!(a, [8u8, 7, 6]);
+        assert_eq!(b, a);
     }
 
     #[test]

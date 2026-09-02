@@ -5508,7 +5508,11 @@ mod alloc_tests {
     }
 
     // Borrow<BStackRange> lets a map keyed by handles be probed by a bare range.
+    //
+    // `mutable_key_type` fires because the handles reach a `BStack` behind a
+    // reference, but `Hash`/`Eq` key on the plain `(offset, len)` alone.
     #[test]
+    #[allow(clippy::mutable_key_type)]
     fn borrow_range_map_lookup() {
         use std::collections::{HashMap, HashSet};
 
