@@ -119,6 +119,10 @@ pub struct SegregatedBStackAllocator {
     _not_sync: PhantomData<Cell<()>>,
 }
 
+/// `Sync` is removed deliberately by `_not_sync`; `RefUnwindSafe` is collateral.
+#[cfg(not(feature = "atomic"))]
+impl std::panic::RefUnwindSafe for SegregatedBStackAllocator {}
+
 #[cfg(feature = "set")]
 impl SegregatedBStackAllocator {
     // Class scheme (compile-time, encoded by the magic version)
