@@ -1,6 +1,6 @@
 #![cfg(all(test, feature = "alloc", feature = "set"))]
 
-mod alloc_fuzz_tests {
+mod tests {
     use crate::alloc::{
         BStackSlice, BStackSliceAllocator, FirstFitBStackAllocator, GhostTreeBstackAllocator,
         SlabBStackAllocator,

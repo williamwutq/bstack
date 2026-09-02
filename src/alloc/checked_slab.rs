@@ -2036,7 +2036,7 @@ mod tests {
         let _g = Guard(path);
         let alloc = CheckedSlabBStackAllocator::new(stack, 8).unwrap(); // block_size 16
         let s = alloc.alloc(40).unwrap(); // 3 blocks: block 48, stack -> 96
-        s.write(&[0xFFu8; 40]).unwrap(); // fill so orphan blocks read as garbage
+        s.write([0xFFu8; 40]).unwrap(); // fill so orphan blocks read as garbage
         assert_eq!(alloc.stack().len().unwrap(), 96);
         // Simulate a realloc tail-shrink crash: commit new_n=1, skip the discard.
         alloc.stack().set(48, in_use(1).to_le_bytes()).unwrap();
@@ -2069,7 +2069,7 @@ mod tests {
         {
             let alloc = CheckedSlabBStackAllocator::new(stack, 8).unwrap();
             let s = alloc.alloc(40).unwrap(); // 3 blocks, stack -> 96
-            s.write(&[0xFFu8; 40]).unwrap();
+            s.write([0xFFu8; 40]).unwrap();
             alloc.stack().set(48, in_use(1).to_le_bytes()).unwrap(); // crash sim
         }
         let reopened = CheckedSlabBStackAllocator::open(BStack::open(&path).unwrap()).unwrap();
@@ -2129,7 +2129,7 @@ mod tests {
                             let mut set = live.lock().unwrap();
                             assert!(set.insert(off), "duplicate live offset {off}");
                         }
-                        slice.write(&[tid as u8; 8]).unwrap();
+                        slice.write([tid as u8; 8]).unwrap();
                         let data = slice.read().unwrap();
                         assert_eq!(data, vec![tid as u8; 8]);
                         {
@@ -2180,7 +2180,7 @@ mod tests {
                 thread::spawn(move || {
                     let a: &CheckedSlabBStackAllocator = &alloc;
                     let mut slice = a.alloc(SMALL).unwrap();
-                    slice.write(&[tid as u8; SMALL as usize]).unwrap();
+                    slice.write([tid as u8; SMALL as usize]).unwrap();
 
                     for _ in 0..ROUNDS {
                         // Grow: tail → try_extend_zeros; non-tail → copy to new region.

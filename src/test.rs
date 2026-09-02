@@ -237,7 +237,7 @@ mod tests {
         let _g = Guard(p);
 
         let off0 = s.push(b"abc").unwrap();
-        let off1 = s.push(&[]).unwrap();
+        let off1 = s.push([]).unwrap();
         let off2 = s.push(b"def").unwrap();
 
         assert_eq!(off0, 0);
@@ -1659,7 +1659,7 @@ mod tests {
         for i in 0..RECORDS {
             let mut rec = [0u8; RSIZE as usize];
             rec[0] = i as u8;
-            s.push(&rec).unwrap();
+            s.push(rec).unwrap();
         }
 
         let s = Arc::new(s);
@@ -1711,7 +1711,7 @@ mod tests {
                             let mut data = [0u8; ITEM];
                             data[0] = t as u8;
                             data[1..9].copy_from_slice(&(i as u64).to_le_bytes());
-                            let off = s.push(&data).unwrap();
+                            let off = s.push(data).unwrap();
                             (off, t, i)
                         })
                         .collect::<Vec<_>>()
@@ -1761,7 +1761,7 @@ mod tests {
                 let s = Arc::clone(&s);
                 thread::spawn(move || {
                     for _ in 0..PUSHES_PER_THREAD {
-                        s.push(&[0xBEu8; ITEM as usize]).unwrap();
+                        s.push([0xBEu8; ITEM as usize]).unwrap();
                     }
                 })
             })
@@ -2837,7 +2837,7 @@ mod alloc_tests {
         let slices = alloc.alloc_bulk([8_u64, 16, 32]).unwrap();
         let (head, tail) = slices.split_at(1);
         // Reclaim only the last two slices (tail suffix).
-        alloc.dealloc_bulk(tail.to_vec()).unwrap();
+        alloc.dealloc_bulk(tail).unwrap();
         assert_eq!(alloc.len().unwrap(), 8);
         // head[0] (0..8) is still live; a new bulk alloc goes right after it.
         let new = alloc.alloc_bulk([4_u64, 4]).unwrap();
@@ -3427,7 +3427,7 @@ mod first_fit_tests {
             // Push 48 bytes with wrong magic
             let mut hdr = [0u8; 48];
             hdr[16..24].copy_from_slice(b"WRONGHDR");
-            stack.push(&hdr).unwrap();
+            stack.push(hdr).unwrap();
         }
         let stack = BStack::open(&path).unwrap();
         assert!(FirstFitBStackAllocator::new(stack).is_err());
@@ -3886,7 +3886,7 @@ mod first_fit_tests {
         let b = alloc.alloc(80).unwrap();
         let _c = alloc.alloc(16).unwrap();
         // Write garbage into B so the overlap area is dirty before freeing.
-        b.write(&vec![0xFFu8; 80]).unwrap();
+        b.write(vec![0xFFu8; 80]).unwrap();
         alloc.dealloc(b).unwrap();
         let _a2 = alloc.realloc(a, 32).unwrap(); // merge + split
         let rem = alloc.alloc(64).unwrap();
@@ -3976,12 +3976,12 @@ mod first_fit_tests {
             let mut alff = [0u8; 48];
             alff[16..24].copy_from_slice(b"ALFF\x00\x01\x01\x00");
             alff[24..28].copy_from_slice(&1u32.to_le_bytes()); // recovery_needed
-            stack.push(&alff).unwrap();
+            stack.push(alff).unwrap();
 
             // Block A header: size=80, flags=0 (allocated, but header not yet shrunk)
             let mut a_hdr = [0u8; 16];
             a_hdr[..8].copy_from_slice(&80u64.to_le_bytes());
-            stack.push(&a_hdr).unwrap();
+            stack.push(a_hdr).unwrap();
 
             // Block A payload (80 bytes): inner footer + second sub-block embedded
             let mut a_pay = [0u8; 80];
@@ -3992,16 +3992,16 @@ mod first_fit_tests {
             // [48..52): is_free = 1
             a_pay[48..52].copy_from_slice(&1u32.to_le_bytes());
             // [52..80): zeros (reserved + second sub-block payload)
-            stack.push(&a_pay).unwrap();
+            stack.push(a_pay).unwrap();
 
             // Outer footer: F=24
-            stack.push(&24u64.to_le_bytes()).unwrap();
+            stack.push(24u64.to_le_bytes()).unwrap();
 
             // Sentinel block: header(size=16,flags=0) + payload(16 zeros) + footer(16)
             let mut sent = [0u8; 40];
             sent[..8].copy_from_slice(&16u64.to_le_bytes());
             sent[32..40].copy_from_slice(&16u64.to_le_bytes());
-            stack.push(&sent).unwrap();
+            stack.push(sent).unwrap();
         }
 
         let alloc = FirstFitBStackAllocator::new(BStack::open(&path).unwrap()).unwrap();
@@ -4063,9 +4063,9 @@ mod first_fit_tests {
         let stack = alloc.into_stack();
 
         // Corrupt: set recovery_needed=1 and scramble free_head to garbage
-        stack.set(24, &1u32.to_le_bytes()).unwrap(); // flags byte → recovery_needed=1
+        stack.set(24, 1u32.to_le_bytes()).unwrap(); // flags byte → recovery_needed=1
         stack
-            .set(FREE_HEAD_OFFSET, &0xDEADBEEFu64.to_le_bytes())
+            .set(FREE_HEAD_OFFSET, 0xDEADBEEFu64.to_le_bytes())
             .unwrap();
         drop(stack);
 
@@ -4128,7 +4128,7 @@ mod first_fit_tests {
         let (alloc, path) = mk_ff("recovery_tailgrow");
         let _g = Guard(path.clone());
         let a = alloc.alloc(32).unwrap();
-        a.write(&[0xA7u8; 32]).unwrap();
+        a.write([0xA7u8; 32]).unwrap();
         let a_start = a.start();
         let stack = alloc.into_stack();
         let before_len = stack.len().unwrap();
@@ -4136,7 +4136,7 @@ mod first_fit_tests {
         // Reproduce the stranded state: a zero-filled tail region past the block
         // with no header of its own, plus recovery_needed set.
         stack.extend(64).unwrap();
-        stack.set(24, &1u32.to_le_bytes()).unwrap(); // recovery_needed = 1
+        stack.set(24, 1u32.to_le_bytes()).unwrap(); // recovery_needed = 1
         drop(stack);
 
         let stack2 = BStack::open(&path).unwrap();
@@ -4175,8 +4175,8 @@ mod first_fit_tests {
             <[u8; 8]>::try_from(stack.get(block_start, block_start + 8).unwrap()).unwrap(),
         );
         let footer_pos = block_start + 16 + size;
-        stack.set(footer_pos, &0xDEADu64.to_le_bytes()).unwrap();
-        stack.set(24, &1u32.to_le_bytes()).unwrap(); // recovery_needed = 1
+        stack.set(footer_pos, 0xDEADu64.to_le_bytes()).unwrap();
+        stack.set(24, 1u32.to_le_bytes()).unwrap(); // recovery_needed = 1
         drop(stack);
 
         let stack2 = BStack::open(&path).unwrap();
@@ -4189,7 +4189,7 @@ mod first_fit_tests {
         assert_eq!(footer, size, "recovery normalizes footer to header size");
         // The allocator remains usable.
         let r = alloc2.alloc(16).unwrap();
-        r.write(&[0x22u8; 16]).unwrap();
+        r.write([0x22u8; 16]).unwrap();
         assert_eq!(r.read().unwrap(), vec![0x22u8; 16]);
     }
 
@@ -4295,7 +4295,7 @@ mod first_fit_tests {
                 thread::spawn(move || {
                     let pat = (tid as u8).wrapping_add(0x40);
                     let mut slice = alloc.alloc(16).unwrap();
-                    slice.write(&vec![pat; 16]).unwrap();
+                    slice.write(vec![pat; 16]).unwrap();
                     let mut prev_len = 16u64;
 
                     // Sizes oscillate up and down to exercise both branches.
@@ -4318,7 +4318,7 @@ mod first_fit_tests {
 
                         // Re-stamp the full new length so the next iteration
                         // can re-verify against `pat`.
-                        slice.write(&vec![pat; new_len as usize]).unwrap();
+                        slice.write(vec![pat; new_len as usize]).unwrap();
                         prev_len = new_len;
                     }
 
@@ -5340,11 +5340,11 @@ mod atomic_tests {
             let r = match step {
                 0 => Some(BStackGenOp::Read {
                     offset: 0,
-                    buf: unsafe { core::mem::transmute::<&mut [u8], _>(&mut buf[..]) },
+                    buf: unsafe { core::mem::transmute::<&mut [u8], &mut [u8]>(&mut buf[..]) },
                 }),
                 1 => Some(BStackGenOp::Write {
                     offset: 5,
-                    data: unsafe { core::mem::transmute::<&[u8], _>(&buf[..]) },
+                    data: unsafe { core::mem::transmute::<&[u8], &[u8]>(&buf[..]) },
                 }),
                 _ => None,
             };
@@ -5377,7 +5377,7 @@ mod atomic_tests {
             let r = match step {
                 0 => Some(BStackGenOp::Read {
                     offset: 0,
-                    buf: unsafe { core::mem::transmute::<&mut [u8], _>(&mut ptr_buf[..]) },
+                    buf: unsafe { core::mem::transmute::<&mut [u8], &mut [u8]>(&mut ptr_buf[..]) },
                 }),
                 1 => {
                     // The previous read has already filled `ptr_buf` by the
@@ -5385,7 +5385,9 @@ mod atomic_tests {
                     let target = u64::from_le_bytes(ptr_buf);
                     Some(BStackGenOp::Read {
                         offset: target,
-                        buf: unsafe { core::mem::transmute::<&mut [u8], _>(&mut node_buf[..]) },
+                        buf: unsafe {
+                            core::mem::transmute::<&mut [u8], &mut [u8]>(&mut node_buf[..])
+                        },
                     })
                 }
                 _ => None,
@@ -5486,7 +5488,7 @@ mod atomic_tests {
                 0 => Some(BStackGenOp::Read {
                     offset: 0,
                     // SAFETY: `ptr_buf` outlives this whole `process_gen` call.
-                    buf: unsafe { core::mem::transmute::<&mut [u8], _>(&mut ptr_buf[..]) },
+                    buf: unsafe { core::mem::transmute::<&mut [u8], &mut [u8]>(&mut ptr_buf[..]) },
                 }),
                 1 => {
                     let target = u64::from_le_bytes(ptr_buf);
@@ -5581,7 +5583,7 @@ mod atomic_tests {
                 // SAFETY: `buf` outlives this whole `process_gen` call.
                 Some(BStackGenOp::Read {
                     offset: 0,
-                    buf: unsafe { core::mem::transmute::<&mut [u8], _>(&mut buf[..]) },
+                    buf: unsafe { core::mem::transmute::<&mut [u8], &mut [u8]>(&mut buf[..]) },
                 })
             })
             .unwrap_err();
@@ -5646,7 +5648,7 @@ mod atomic_tests {
             // SAFETY: `buf` outlives this whole `process_gen` call.
             Some(BStackGenOp::Read {
                 offset: 0,
-                buf: unsafe { core::mem::transmute::<&mut [u8], _>(&mut buf[..]) },
+                buf: unsafe { core::mem::transmute::<&mut [u8], &mut [u8]>(&mut buf[..]) },
             })
         })
         .unwrap();
@@ -5701,7 +5703,7 @@ mod atomic_tests {
             match calls {
                 // SAFETY: `buf` outlives this whole `process_gen` call.
                 1 => Some(BStackGenOp::Pop {
-                    buf: unsafe { core::mem::transmute::<&mut [u8], _>(&mut buf[..]) },
+                    buf: unsafe { core::mem::transmute::<&mut [u8], &mut [u8]>(&mut buf[..]) },
                 }),
                 _ => Some(BStackGenOp::Write {
                     offset: 0,
@@ -5741,7 +5743,7 @@ mod atomic_tests {
             .process_gen(|| {
                 // SAFETY: `buf` outlives this whole `process_gen` call.
                 Some(BStackGenOp::Pop {
-                    buf: unsafe { core::mem::transmute::<&mut [u8], _>(&mut buf[..]) },
+                    buf: unsafe { core::mem::transmute::<&mut [u8], &mut [u8]>(&mut buf[..]) },
                 })
             })
             .unwrap_err();
@@ -5763,7 +5765,7 @@ mod atomic_tests {
             .process_gen(|| {
                 // SAFETY: `buf` outlives this whole `process_gen` call.
                 Some(BStackGenOp::Pop {
-                    buf: unsafe { core::mem::transmute::<&mut [u8], _>(&mut buf[..]) },
+                    buf: unsafe { core::mem::transmute::<&mut [u8], &mut [u8]>(&mut buf[..]) },
                 })
             })
             .unwrap_err();
@@ -5856,7 +5858,7 @@ mod atomic_tests {
             match calls {
                 // SAFETY: `size` outlives this whole `process_gen` call.
                 1 => Some(BStackGenOp::Len {
-                    out: unsafe { core::mem::transmute::<&mut u64, _>(&mut size) },
+                    out: unsafe { core::mem::transmute::<&mut u64, &mut u64>(&mut size) },
                 }),
                 _ => Some(BStackGenOp::Discard { len: size - 4 }),
             }
@@ -5881,7 +5883,7 @@ mod atomic_tests {
             match calls {
                 // SAFETY: `size` outlives this whole `process_gen` call.
                 1 => Some(BStackGenOp::Len {
-                    out: unsafe { core::mem::transmute::<&mut u64, _>(&mut size) },
+                    out: unsafe { core::mem::transmute::<&mut u64, &mut u64>(&mut size) },
                 }),
                 _ => None,
             }
@@ -5913,14 +5915,14 @@ mod atomic_tests {
             let r = match step {
                 // SAFETY: `size` outlives this whole `process_gen` call.
                 0 => Some(BStackGenOp::Len {
-                    out: unsafe { core::mem::transmute::<&mut u64, _>(&mut size) },
+                    out: unsafe { core::mem::transmute::<&mut u64, &mut u64>(&mut size) },
                 }),
                 1 => {
                     let n = (size - 8) as usize;
                     buf = vec![0u8; n];
                     // SAFETY: `buf` outlives this whole `process_gen` call.
                     Some(BStackGenOp::Pop {
-                        buf: unsafe { core::mem::transmute::<&mut [u8], _>(&mut buf[..]) },
+                        buf: unsafe { core::mem::transmute::<&mut [u8], &mut [u8]>(&mut buf[..]) },
                     })
                 }
                 _ => None,
@@ -5976,7 +5978,7 @@ mod atomic_tests {
         // read the same value and one increment would be lost.
         let (s, p) = mk_stack();
         let _g = Guard(p);
-        s.push(&0u64.to_le_bytes()).unwrap();
+        s.push(0u64.to_le_bytes()).unwrap();
         let s = Arc::new(s);
 
         const THREADS: usize = 8;
@@ -5995,7 +5997,7 @@ mod atomic_tests {
                                     offset: 0,
                                     // SAFETY: `buf` outlives this whole `process_gen` call.
                                     buf: unsafe {
-                                        core::mem::transmute::<&mut [u8], _>(&mut buf[..])
+                                        core::mem::transmute::<&mut [u8], &mut [u8]>(&mut buf[..])
                                     },
                                 }),
                                 1 => {
@@ -6004,7 +6006,9 @@ mod atomic_tests {
                                     Some(BStackGenOp::Write {
                                         offset: 0,
                                         // SAFETY: `buf` outlives this whole `process_gen` call.
-                                        data: unsafe { core::mem::transmute::<&[u8], _>(&buf[..]) },
+                                        data: unsafe {
+                                            core::mem::transmute::<&[u8], &[u8]>(&buf[..])
+                                        },
                                     })
                                 }
                                 _ => None,
@@ -6086,7 +6090,7 @@ mod atomic_tests {
                                 offset: 0,
                                 // SAFETY: `head_buf` outlives this whole `process_gen` call.
                                 buf: unsafe {
-                                    core::mem::transmute::<&mut [u8], _>(&mut head_buf[..])
+                                    core::mem::transmute::<&mut [u8], &mut [u8]>(&mut head_buf[..])
                                 },
                             }),
                             1 => {
@@ -6100,7 +6104,9 @@ mod atomic_tests {
                                         offset: head,
                                         // SAFETY: `next_buf` outlives this whole `process_gen` call.
                                         buf: unsafe {
-                                            core::mem::transmute::<&mut [u8], _>(&mut next_buf[..])
+                                            core::mem::transmute::<&mut [u8], &mut [u8]>(
+                                                &mut next_buf[..],
+                                            )
                                         },
                                     })
                                 }
@@ -6108,7 +6114,9 @@ mod atomic_tests {
                             2 => Some(BStackGenOp::Write {
                                 offset: 0,
                                 // SAFETY: `next_buf` outlives this whole `process_gen` call.
-                                data: unsafe { core::mem::transmute::<&[u8], _>(&next_buf[..]) },
+                                data: unsafe {
+                                    core::mem::transmute::<&[u8], &[u8]>(&next_buf[..])
+                                },
                             }),
                             _ => None,
                         };
@@ -6194,7 +6202,9 @@ mod atomic_tests {
                             // SAFETY: `buf` outlives this whole `process_gen` call.
                             Some(BStackGenOp::Read {
                                 offset: 0,
-                                buf: unsafe { core::mem::transmute::<&mut [u8], _>(&mut buf[..]) },
+                                buf: unsafe {
+                                    core::mem::transmute::<&mut [u8], &mut [u8]>(&mut buf[..])
+                                },
                             })
                         }
                         1 => {
@@ -6606,6 +6616,7 @@ mod atomic_tests {
 
     #[cfg(feature = "atomic")]
     #[test]
+    #[allow(clippy::single_range_in_vec_init)]
     fn get_batched_zero_length_range_returns_empty_buf() {
         let (s, p) = mk_stack();
         let _g = Guard(p);
@@ -6617,6 +6628,7 @@ mod atomic_tests {
 
     #[cfg(feature = "atomic")]
     #[test]
+    #[allow(clippy::single_range_in_vec_init)]
     fn get_batched_out_of_bounds_returns_error() {
         let (s, p) = mk_stack();
         let _g = Guard(p);
@@ -6627,6 +6639,8 @@ mod atomic_tests {
 
     #[cfg(feature = "atomic")]
     #[test]
+    #[allow(clippy::single_range_in_vec_init)]
+    #[allow(clippy::reversed_empty_ranges)]
     fn get_batched_end_less_than_start_returns_error() {
         let (s, p) = mk_stack();
         let _g = Guard(p);

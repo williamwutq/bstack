@@ -1048,7 +1048,7 @@ mod tests {
                             let mut set = live.lock().unwrap();
                             assert!(set.insert(off), "duplicate live offset {off}");
                         }
-                        slice.write(&[tid as u8; 16]).unwrap();
+                        slice.write([tid as u8; 16]).unwrap();
                         let data = slice.read().unwrap();
                         assert_eq!(data, vec![tid as u8; 16]);
                         {
@@ -1095,7 +1095,7 @@ mod tests {
                 thread::spawn(move || {
                     let a: &SlabBStackAllocator = &alloc;
                     let mut slice = a.alloc(SMALL).unwrap();
-                    slice.write(&[tid as u8; SMALL as usize]).unwrap();
+                    slice.write([tid as u8; SMALL as usize]).unwrap();
 
                     for _ in 0..ROUNDS {
                         // Grow: tail → try_extend_zeros; non-tail → copy to new region.

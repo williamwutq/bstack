@@ -797,6 +797,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::single_range_in_vec_init)]
     fn test_untracked_disjoint_alloc_is_allowed() {
         let c = DebugCheckingAllocator::with_state(MockAllocator, [0..100], [200..300]);
         c.record_allocation(120, 50);
@@ -1173,6 +1174,7 @@ mod tests {
         let _guard = TestGuard(path);
         let config = Rc::new(RefCell::new(MockAllocatorConfig::default()));
         let inner = ControllableMockAllocator::new(stack, config.clone());
+        #[allow(clippy::single_range_in_vec_init)]
         let alloc = DebugCheckingAllocator::with_state(inner, [], [150..300]);
 
         let handle = alloc.alloc(100)?;
@@ -1231,7 +1233,7 @@ mod tests {
         let alloc = DebugCheckingAllocator::new(inner);
 
         let handle = alloc.alloc(100).unwrap();
-        let stale_handle = handle.clone();
+        let stale_handle = handle;
         let _new_handle = alloc.realloc(handle, 60).unwrap();
 
         alloc.dealloc(stale_handle).unwrap();
@@ -1387,7 +1389,7 @@ mod tests {
         let inner = ControllableMockAllocator::new(stack, config);
         let alloc = DebugCheckingAllocator::new(inner);
 
-        let handles = alloc.alloc_bulk(&[100, 200, 300])?;
+        let handles = alloc.alloc_bulk([100, 200, 300])?;
         assert_eq!(handles.len(), 3);
 
         // Verify all were tracked
@@ -1413,7 +1415,7 @@ mod tests {
         let inner = ControllableMockAllocator::new(stack, config);
         let alloc = DebugCheckingAllocator::new(inner);
 
-        let handles = alloc.alloc_bulk(&[100, 200, 300])?;
+        let handles = alloc.alloc_bulk([100, 200, 300])?;
 
         alloc.dealloc_bulk(handles)?;
 
@@ -1438,7 +1440,7 @@ mod tests {
         let inner = ControllableMockAllocator::new(stack, config.clone());
         let alloc = DebugCheckingAllocator::new(inner);
 
-        let handles = alloc.alloc_bulk(&[100, 200, 300])?;
+        let handles = alloc.alloc_bulk([100, 200, 300])?;
 
         // Make dealloc_bulk fail
         config.borrow_mut().fail_dealloc_bulk = true;
@@ -1473,7 +1475,7 @@ mod tests {
         let inner = ControllableMockAllocator::new(stack, config);
         let alloc = DebugCheckingAllocator::new(inner);
 
-        let handles = alloc.alloc_bulk(&[100, 200]).unwrap();
+        let handles = alloc.alloc_bulk([100, 200]).unwrap();
         alloc.dealloc_bulk(&handles).unwrap();
         // Second dealloc_bulk with same regions should panic during validation
         alloc.record_deallocation(0, 100);
@@ -1482,6 +1484,7 @@ mod tests {
     // --- Tests for with_state() validation ---
 
     #[test]
+    #[allow(clippy::single_range_in_vec_init)]
     fn test_with_state_valid_disjoint_ranges() {
         let c = DebugCheckingAllocator::with_state(MockAllocator, [0..100, 200..300], [400..500]);
         let state = c.state.lock().unwrap();
@@ -1506,7 +1509,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "Initial allocated set contains overlapping ranges")]
     fn test_with_state_panics_on_overlapping_allocated() {
-        DebugCheckingAllocator::with_state(
+        let _ = DebugCheckingAllocator::with_state(
             MockAllocator,
             [0..100, 50..150], // overlapping
             [],
@@ -1516,7 +1519,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "Initial freed set contains overlapping ranges")]
     fn test_with_state_panics_on_overlapping_freed() {
-        DebugCheckingAllocator::with_state(
+        let _ = DebugCheckingAllocator::with_state(
             MockAllocator,
             [],
             [0..100, 50..150], // overlapping
@@ -1526,7 +1529,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "allocated range")]
     fn test_with_state_panics_on_allocated_freed_overlap() {
-        DebugCheckingAllocator::with_state(
+        let _ = DebugCheckingAllocator::with_state(
             MockAllocator,
             [0..100, 200..300],
             [50..150, 400..500], // [50, 150) overlaps [0, 100)
