@@ -1,4 +1,6 @@
-use super::{BStackAllocator, BStackBulkAllocator, BStackSlice};
+use super::{
+    BStackAllocator, BStackBulkAllocator, BStackSlice, ensure_own_slice, ensure_own_slices,
+};
 use crate::BStack;
 #[cfg(not(feature = "atomic"))]
 use std::cell::Cell;
@@ -945,6 +947,7 @@ impl BStackAllocator for GhostTreeBstackAllocator {
         slice: BStackSlice<'a, Self>,
         new_len: u64,
     ) -> io::Result<BStackSlice<'a, Self>> {
+        ensure_own_slice(self, &slice, "GhostTreeBstackAllocator::realloc")?;
         if slice.is_empty() {
             return self.alloc(new_len);
         }
@@ -1073,6 +1076,7 @@ impl BStackAllocator for GhostTreeBstackAllocator {
     /// Multi-call: a crash after the zero but before the AVL insert permanently
     /// loses the block.
     fn dealloc(&self, slice: BStackSlice<'_, Self>) -> io::Result<()> {
+        ensure_own_slice(self, &slice, "GhostTreeBstackAllocator::dealloc")?;
         if slice.is_empty() {
             return Ok(());
         }
@@ -1235,6 +1239,7 @@ impl BStackBulkAllocator for GhostTreeBstackAllocator {
         slices: impl AsRef<[Self::Allocated<'a>]>,
     ) -> Result<(), Self::Error> {
         let slices = slices.as_ref();
+        ensure_own_slices(self, slices, "GhostTreeBstackAllocator::dealloc_bulk")?;
 
         // Collect, validate, and convert to (ptr, aligned_size) pairs.
         let mut entries: Vec<(u64, u64)> = Vec::new();

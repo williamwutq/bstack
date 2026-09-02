@@ -211,6 +211,28 @@ impl<'a, A: BStackAllocator> BStackSlice<'a, A> {
         self.allocator
     }
 
+    /// Returns `true` if this slice was issued by `allocator`.
+    ///
+    /// A slice records which allocator produced it, but the type system cannot
+    /// enforce that it is only ever handed back to *that* instance — two
+    /// allocators of the same type are the same type, and `BStackSlice` is
+    /// `Copy`, so `a2.dealloc(s1)` type-checks. It is not a soundness issue
+    /// either: a slice is an `(offset, len)` coordinate pair into a file, not
+    /// a pointer, and reaches the payload only through [`BStack`]'s
+    /// bounds-checked I/O — the damage would be `a2` recording a free block it
+    /// never owned.
+    ///
+    /// Rejecting a foreign slice is therefore the allocator's job, at run
+    /// time. Every built-in allocator checks ownership at the top of
+    /// `realloc`, `dealloc` and `dealloc_bulk`, before touching any metadata,
+    /// and fails with [`io::ErrorKind::InvalidInput`]. This is the check they
+    /// use, and custom allocators should do the same.
+    #[inline]
+    #[must_use]
+    pub fn is_from(&self, allocator: &A) -> bool {
+        std::ptr::eq(self.allocator, allocator)
+    }
+
     /// Return the underlying stack.
     ///
     /// Note: `Bstack` does not require mutability for any of its operations,

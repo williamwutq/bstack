@@ -56,6 +56,36 @@ typedef struct {
 #define bstack_slice_len(s)      ((s).len)
 #define bstack_slice_is_empty(s) ((s).len == 0)
 
+/*
+ * bstack_slice_is_from(s, a) → non-zero if s was issued by allocator a
+ *
+ * A slice records the allocator that produced it, but nothing checks at
+ * compile time that it is only ever handed back to *that* instance: every
+ * allocator of a given kind has the same type, so passing a1's slice to a2's
+ * realloc/dealloc compiles.  See "Foreign slices" below; allocators use this
+ * to reject a foreign slice at run time.  `a` is a bstack_allocator_t * — for
+ * a concrete allocator, pass &alloc->base.
+ */
+#define bstack_slice_is_from(s, a) ((s).allocator == (a))
+
+/*
+ * Foreign slices
+ * --------------
+ * Handing a slice to an allocator that did not issue it is a caller error the
+ * language cannot catch.  It is not a memory-safety problem: a slice is an
+ * (offset, len) coordinate pair into a file, not a pointer, and every access
+ * through it goes via bstack's bounds-checked I/O.  The damage would be to
+ * on-disk bookkeeping — the receiving allocator recording a free block it
+ * never owned.
+ *
+ * Rejecting it is therefore the allocator's job, at run time.  Every allocator
+ * in this library checks slice ownership at the top of realloc, dealloc, and
+ * dealloc_bulk, before touching any metadata, and fails with -1 and
+ * errno = EINVAL; dealloc_bulk rejects the whole batch and frees nothing.
+ * The slice is passed by value, so a refused caller still holds it.  Custom
+ * allocators should do the same; bstack_slice_is_from is the check.
+ */
+
 #ifdef __cplusplus
 extern "C" {
 #endif

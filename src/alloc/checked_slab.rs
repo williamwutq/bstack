@@ -7,7 +7,7 @@
 //! and lets `dealloc` detect double-free at runtime before the free list can be
 //! corrupted.
 
-use super::{BStackAllocator, BStackSlice};
+use super::{BStackAllocator, BStackSlice, ensure_own_slice};
 use crate::BStack;
 #[cfg(feature = "atomic")]
 use crate::BStackGenOp;
@@ -1339,6 +1339,7 @@ impl BStackAllocator for CheckedSlabBStackAllocator {
     /// | tail (any block count) | 1 (`discard`) | crash-safe by inheritance |
     /// | free list | 2 (`set` + `set`) | crash leaks freed blocks; double-free guard unaffected |
     fn dealloc(&self, slice: BStackSlice<'_, Self>) -> io::Result<()> {
+        ensure_own_slice(self, &slice, "CheckedSlabBStackAllocator::dealloc")?;
         if slice.is_empty() && slice.start() == 0 {
             return Ok(());
         }
@@ -1443,6 +1444,7 @@ impl BStackAllocator for CheckedSlabBStackAllocator {
         slice: BStackSlice<'a, Self>,
         new_len: u64,
     ) -> io::Result<BStackSlice<'a, Self>> {
+        ensure_own_slice(self, &slice, "CheckedSlabBStackAllocator::realloc")?;
         if slice.is_empty() && slice.start() == 0 {
             return self.alloc(new_len);
         }

@@ -1,4 +1,4 @@
-use super::{BStackAllocator, BStackSlice};
+use super::{BStackAllocator, BStackSlice, ensure_own_slice};
 use crate::BStack;
 #[cfg(not(feature = "atomic"))]
 use std::cell::Cell;
@@ -929,6 +929,7 @@ impl BStackAllocator for FirstFitBStackAllocator {
     }
 
     fn dealloc(&self, slice: BStackSlice<'_, Self>) -> io::Result<()> {
+        ensure_own_slice(self, &slice, "FirstFitBStackAllocator::dealloc")?;
         if slice.is_empty() && slice.start() == 0 {
             return Ok(());
         }
@@ -988,6 +989,7 @@ impl BStackAllocator for FirstFitBStackAllocator {
         slice: BStackSlice<'a, Self>,
         new_len: u64,
     ) -> io::Result<BStackSlice<'a, Self>> {
+        ensure_own_slice(self, &slice, "FirstFitBStackAllocator::realloc")?;
         if slice.is_empty() && slice.start() == 0 {
             return self.alloc(new_len);
         }

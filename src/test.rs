@@ -3320,6 +3320,54 @@ mod alloc_tests {
         .unwrap();
         assert_eq!(s.read().unwrap(), [2, 4, 6, 8]);
     }
+
+    // ── Foreign slices ────────────────────────────────────────────────────
+
+    #[test]
+    fn dealloc_and_realloc_reject_a_slice_from_another_instance() {
+        let (a1, p1) = mk_alloc();
+        let _g1 = Guard(p1);
+        let (a2, p2) = mk_alloc();
+        let _g2 = Guard(p2);
+
+        let s = a1.alloc(64).unwrap();
+        assert!(s.is_from(&a1));
+        assert!(!s.is_from(&a2));
+
+        let err = a2.dealloc(s).expect_err("a2 must refuse a1's slice");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        let err = a2.realloc(s, 128).expect_err("a2 must refuse a1's slice");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+
+        // Both allocators are untouched by the refusals: the slice is `Copy`,
+        // so nothing was lost, and each still serves its own handles.
+        assert_eq!(a1.len().unwrap(), 64);
+        let own = a2.alloc(64).unwrap();
+        a2.dealloc(own).unwrap();
+        a1.dealloc(s).unwrap();
+    }
+
+    #[test]
+    fn dealloc_bulk_rejects_a_batch_containing_a_foreign_slice() {
+        let (a1, p1) = mk_alloc();
+        let _g1 = Guard(p1);
+        let (a2, p2) = mk_alloc();
+        let _g2 = Guard(p2);
+
+        let own = a2.alloc(32).unwrap();
+        let foreign = a1.alloc(32).unwrap();
+
+        // One foreign slice poisons the batch: nothing is freed, including the
+        // slice that did belong to `a2`.
+        let err = a2
+            .dealloc_bulk([own, foreign])
+            .expect_err("a2 must refuse a batch holding a1's slice");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(a2.len().unwrap(), 32);
+
+        a2.dealloc(own).unwrap();
+        a1.dealloc(foreign).unwrap();
+    }
 }
 
 // -------------------------------------------------------------------------

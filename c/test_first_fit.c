@@ -1435,6 +1435,58 @@ static int test_slice_process_transforms_in_place(void)
 
 #endif /* BSTACK_FEATURE_ATOMIC */
 
+/* A slice issued by one allocator instance must be refused by another: the
+ * language cannot catch it, so the allocator does, at run time, before
+ * touching any metadata.  See "Foreign slices" in bstack_alloc.h. */
+static int test_foreign_slice_is_rejected(void)
+{
+    char t1[64], t2[64];
+    make_tmp(t1, sizeof t1);
+    make_tmp(t2, sizeof t2);
+    {
+        bstack_t *b1 = bstack_open(t1); CHECK(b1);
+        bstack_t *b2 = bstack_open(t2); CHECK(b2);
+        first_fit_bstack_allocator_t *a1 = first_fit_bstack_allocator_new(b1); CHECK(a1);
+        first_fit_bstack_allocator_t *a2 = first_fit_bstack_allocator_new(b2); CHECK(a2);
+        bstack_allocator_t *g1 = (bstack_allocator_t *)a1;
+        bstack_allocator_t *g2 = (bstack_allocator_t *)a2;
+        bstack_slice_t s, out, own;
+
+        CHECK(bstack_allocator_alloc(g1, 64, &s) == 0);
+        CHECK(bstack_slice_is_from(s, g1));
+        CHECK(!bstack_slice_is_from(s, g2));
+
+        errno = 0;
+        CHECK(bstack_allocator_dealloc(g2, s) == -1);
+        CHECK(errno == EINVAL);
+
+        errno = 0;
+        CHECK(bstack_allocator_realloc(g2, s, 128, &out) == -1);
+        CHECK(errno == EINVAL);
+
+        /* One foreign slice rejects the whole batch — nothing is freed. */
+        {
+            bstack_slice_t batch[2];
+            CHECK(bstack_allocator_alloc(g2, 32, &batch[0]) == 0);
+            batch[1] = s;
+            errno = 0;
+            CHECK(bstack_allocator_dealloc_bulk(g2, batch, 2) == -1);
+            CHECK(errno == EINVAL);
+            CHECK(bstack_allocator_dealloc(g2, batch[0]) == 0);
+        }
+
+        /* Neither allocator's bookkeeping was touched: a2 still round-trips
+         * its own allocation, and a1 can still free the original region. */
+        CHECK(bstack_allocator_alloc(g2, 64, &own) == 0);
+        CHECK(bstack_allocator_dealloc(g2, own) == 0);
+        CHECK(bstack_allocator_dealloc(g1, s) == 0);
+
+        bstack_close(first_fit_bstack_allocator_into_stack(a1));
+        bstack_close(first_fit_bstack_allocator_into_stack(a2));
+    }
+    ff_unlink(t1); ff_unlink(t2); return 0;
+}
+
 /* =========================================================================
  * main
  * ====================================================================== */
@@ -1449,6 +1501,7 @@ int main(void)
     T(test_persist_reopen);
     T(test_realloc_small);
     T(test_slice_read_range);
+    T(test_foreign_slice_is_rejected);
 
     /* Fuzz */
     T(test_fuzz_alloc_dealloc);

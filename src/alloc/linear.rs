@@ -1,4 +1,6 @@
-use super::{BStackAllocator, BStackBulkAllocator, BStackSlice};
+use super::{
+    BStackAllocator, BStackBulkAllocator, BStackSlice, ensure_own_slice, ensure_own_slices,
+};
 use crate::BStack;
 #[cfg(not(feature = "atomic"))]
 use std::cell::Cell;
@@ -140,6 +142,7 @@ impl BStackAllocator for LinearBStackAllocator {
         slice: BStackSlice<'a, Self>,
         new_len: u64,
     ) -> io::Result<BStackSlice<'a, Self>> {
+        ensure_own_slice(self, &slice, "LinearBStackAllocator::realloc")?;
         let current_tail = self.stack.len()?;
         if slice.end() != current_tail {
             return Err(io::Error::new(
@@ -175,6 +178,7 @@ impl BStackAllocator for LinearBStackAllocator {
         slice: BStackSlice<'a, Self>,
         new_len: u64,
     ) -> io::Result<BStackSlice<'a, Self>> {
+        ensure_own_slice(self, &slice, "LinearBStackAllocator::realloc")?;
         match new_len.cmp(&slice.len()) {
             std::cmp::Ordering::Equal => Ok(slice),
             std::cmp::Ordering::Greater => {
@@ -213,6 +217,7 @@ impl BStackAllocator for LinearBStackAllocator {
 
     #[cfg(not(feature = "atomic"))]
     fn dealloc(&self, slice: BStackSlice<'_, Self>) -> io::Result<()> {
+        ensure_own_slice(self, &slice, "LinearBStackAllocator::dealloc")?;
         let current_tail = self.stack.len()?;
         if slice.end() == current_tail {
             self.stack.discard(slice.len())?;
@@ -222,6 +227,7 @@ impl BStackAllocator for LinearBStackAllocator {
 
     #[cfg(feature = "atomic")]
     fn dealloc(&self, slice: BStackSlice<'_, Self>) -> io::Result<()> {
+        ensure_own_slice(self, &slice, "LinearBStackAllocator::dealloc")?;
         // try_discard is a no-op when the tail has moved, matching non-tail dealloc semantics.
         self.stack.try_discard(slice.end(), slice.len())?;
         Ok(())
@@ -295,6 +301,7 @@ impl BStackBulkAllocator for LinearBStackAllocator {
         slices: impl AsRef<[Self::Allocated<'a>]>,
     ) -> Result<(), Self::Error> {
         let slices = slices.as_ref();
+        ensure_own_slices(self, slices, "LinearBStackAllocator::dealloc_bulk")?;
         if slices.is_empty() {
             return Ok(());
         }
@@ -326,6 +333,7 @@ impl BStackBulkAllocator for LinearBStackAllocator {
         slices: impl AsRef<[Self::Allocated<'a>]>,
     ) -> Result<(), Self::Error> {
         let slices = slices.as_ref();
+        ensure_own_slices(self, slices, "LinearBStackAllocator::dealloc_bulk")?;
         if slices.is_empty() {
             return Ok(());
         }

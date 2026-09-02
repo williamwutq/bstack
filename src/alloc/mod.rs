@@ -143,6 +143,25 @@
 //! copy the data to a new allocation and update the metadata accordingly,
 //! and must return an error if they do not support this operation.
 //!
+//! # Foreign slices
+//!
+//! What the borrow checker does *not* prove is that a slice goes back to the
+//! allocator that issued it.  Two allocators of the same type are the same
+//! type, and [`BStackSlice`] is `Copy`, so for `a1` and `a2` of type `A`,
+//! `a2.dealloc(s1)` compiles.  No lifetime or type discipline rules that out.
+//! It is also not a soundness problem: a slice is an `(offset, len)`
+//! coordinate pair into a file, not a pointer, and reaches the payload only
+//! through [`BStack`]'s bounds-checked I/O — the damage is `a2` recording a
+//! free block it never owned, which is corruption, not undefined behaviour.
+//!
+//! Rejecting a foreign slice is therefore the *allocator's* job, at run time.
+//! Every allocator here checks ownership at the top of `realloc`, `dealloc`
+//! and `dealloc_bulk` — before touching any metadata — and returns
+//! [`io::ErrorKind::InvalidInput`]; `dealloc_bulk` rejects the whole batch and
+//! frees nothing.  The slice is `Copy`, so a refused caller still holds it.
+//! Custom implementors should do the same; [`BStackSlice::is_from`] is the
+//! check.
+//!
 //! # Crash consistency
 //!
 //! Every individual [`BStack`] operation — [`extend`](BStack::extend),
@@ -214,6 +233,45 @@ pub mod slice;
 #[cfg(feature = "set")]
 pub use slice::BStackSliceWriter;
 pub use slice::{BStackSlice, BStackSliceReader};
+
+/// Reject a slice that was not issued by `allocator`.
+///
+/// `op` names the calling method for the error message.  See the module's
+/// "Foreign slices" section for why this must be a run-time check and why it
+/// is not a soundness issue.
+#[inline]
+pub(crate) fn ensure_own_slice<A: BStackAllocator>(
+    allocator: &A,
+    slice: &BStackSlice<'_, A>,
+    op: &'static str,
+) -> io::Result<()> {
+    if slice.is_from(allocator) {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{op}: slice was issued by a different allocator instance"),
+        ))
+    }
+}
+
+/// Bulk analogue of [`ensure_own_slice`]: rejects the whole batch if any slice
+/// is foreign, so a bad batch frees nothing rather than stopping part-way.
+#[inline]
+pub(crate) fn ensure_own_slices<A: BStackAllocator>(
+    allocator: &A,
+    slices: &[BStackSlice<'_, A>],
+    op: &'static str,
+) -> io::Result<()> {
+    if slices.iter().all(|s| s.is_from(allocator)) {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{op}: slice was issued by a different allocator instance"),
+        ))
+    }
+}
 
 /// A trait for types that own a [`BStack`] and manage contiguous byte regions
 /// within its payload.

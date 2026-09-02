@@ -4,7 +4,7 @@
 //! O(1) alloc and dealloc by keeping all blocks the same size and tracking
 //! freed blocks in an intrusive singly-linked free list.
 
-use super::{BStackAllocator, BStackSlice};
+use super::{BStackAllocator, BStackSlice, ensure_own_slice};
 use crate::BStack;
 #[cfg(feature = "atomic")]
 use crate::BStackGenOp;
@@ -598,6 +598,7 @@ impl BStackAllocator for SlabBStackAllocator {
     ///
     /// Double-freeing a slice corrupts the free list; this allocator does not guard against it.
     fn dealloc(&self, slice: BStackSlice<'_, Self>) -> io::Result<()> {
+        ensure_own_slice(self, &slice, "SlabBStackAllocator::dealloc")?;
         if slice.is_empty() && slice.start() == Self::SENTINEL {
             return Ok(());
         }
@@ -648,6 +649,7 @@ impl BStackAllocator for SlabBStackAllocator {
         slice: BStackSlice<'a, Self>,
         new_len: u64,
     ) -> io::Result<BStackSlice<'a, Self>> {
+        ensure_own_slice(self, &slice, "SlabBStackAllocator::realloc")?;
         if slice.is_empty() && slice.start() == Self::SENTINEL {
             return self.alloc(new_len);
         }

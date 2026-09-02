@@ -68,6 +68,28 @@ use std::io;
 use std::ops::Range;
 use std::sync::Mutex;
 
+/// Reject a handle that was not issued by `alloc`, before any tracking state or
+/// inner-allocator call is touched.  The wrapper's analogue of
+/// [`super::ensure_own_slice`]; `op` names the calling method.
+#[inline]
+fn ensure_own_handle<A>(
+    alloc: &DebugCheckingAllocator<A>,
+    handle: &DebugHandle<'_, A>,
+    op: &'static str,
+) -> io::Result<()>
+where
+    A: BStackAllocator<Error = io::Error>,
+{
+    if handle.is_from(alloc) {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{op}: handle was issued by a different allocator instance"),
+        ))
+    }
+}
+
 /// Returns `true` if two half-open byte ranges overlap.
 fn overlaps(a: &Range<u64>, b: &Range<u64>) -> bool {
     !a.is_empty() && !b.is_empty() && a.start.max(b.start) < a.end.min(b.end)
@@ -286,6 +308,16 @@ where
 {
     fn new(alloc: &'a DebugCheckingAllocator<A>, inner: A::Allocated<'a>) -> Self {
         Self { alloc, inner }
+    }
+
+    /// Returns `true` if this handle was issued by `alloc`.
+    ///
+    /// The wrapper's analogue of [`BStackSlice::is_from`]: a handle records the
+    /// wrapper that produced it, but nothing stops it being handed to a second
+    /// wrapper of the same type.
+    #[inline]
+    fn is_from(&self, alloc: &DebugCheckingAllocator<A>) -> bool {
+        std::ptr::eq(self.alloc, alloc)
     }
 
     /// Return the inner allocator's handle.
@@ -534,6 +566,7 @@ where
         handle: Self::Allocated<'a>,
         new_len: u64,
     ) -> io::Result<Self::Allocated<'a>> {
+        ensure_own_handle(self, &handle, "DebugCheckingAllocator::realloc")?;
         // Extract old region info before handing the inner handle to the inner realloc
         let old_slice: BStackSlice<'_, A> = handle.inner.try_into().map_err(|e| {
             io::Error::other(format!(
@@ -583,6 +616,7 @@ where
     }
 
     fn dealloc(&self, handle: Self::Allocated<'_>) -> io::Result<()> {
+        ensure_own_handle(self, &handle, "DebugCheckingAllocator::dealloc")?;
         let slice: BStackSlice<'_, A> = match handle.inner.try_into() {
             Ok(slice) => slice,
             Err(e) => {
@@ -653,6 +687,9 @@ where
 
     fn dealloc_bulk<'a>(&'a self, handles: impl AsRef<[Self::Allocated<'a>]>) -> io::Result<()> {
         let handles = handles.as_ref();
+        if let Some(foreign) = handles.iter().find(|h| !h.is_from(self)) {
+            ensure_own_handle(self, foreign, "DebugCheckingAllocator::dealloc_bulk")?;
+        }
 
         // Pass 1: convert and validate all handles without mutating tracking state.
         // `pending_freed` accumulates regions already cleared in this batch so

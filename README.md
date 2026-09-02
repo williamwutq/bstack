@@ -750,6 +750,14 @@ Produced by `BStackAllocator::alloc`; consumed by `realloc` and `dealloc`.
 > raw `(start, len)` fields and reconstruct via
 > `unsafe { BStackSlice::from_raw_parts(...) }` for read/write I/O only —
 > never pass a reconstructed slice to `realloc` or `dealloc`.
+>
+> **Foreign slices.** A slice records the allocator that issued it, but nothing
+> stops it being handed to a *different* instance of the same type — the
+> language cannot catch it. Every built-in allocator therefore checks ownership
+> at the top of `realloc`, `dealloc` and `dealloc_bulk`, before touching any
+> metadata, and fails with `io::ErrorKind::InvalidInput` (C: `-1` / `errno =
+> EINVAL`); `dealloc_bulk` rejects the whole batch and frees nothing. The slice
+> is `Copy`, so a refused caller still holds it. `is_from` is the check.
 
 Key methods:
 
@@ -761,6 +769,7 @@ Key methods:
 | `read_range_into(start, buf)`                                                   | Read a sub-range into a caller-supplied buffer                                                                            |
 | `subslice(start, end)`                                                          | Narrow to a sub-range (relative offsets)                                                                                  |
 | `subslice_range(range)`                                                         | Narrow to a sub-range using a `Range<u64>`                                                                                |
+| `is_from(allocator)`                                                            | Whether this slice was issued by `allocator` (the foreign-slice check)                                                    |
 | `reader()`                                                                      | Cursor-based `BStackSliceReader` at position 0                                                                            |
 | `reader_at(offset)`                                                             | Cursor-based `BStackSliceReader` at `offset`                                                                              |
 | `write(data)` *(feature `set`)*                                                 | Overwrite the beginning of the region in place                                                                            |
