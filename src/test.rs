@@ -5506,6 +5506,55 @@ mod alloc_tests {
         a2.dealloc(own).map_err(|e| e.source).unwrap();
         a1.dealloc(foreign).map_err(|e| e.source).unwrap();
     }
+
+    // Borrow<BStackRange> lets a map keyed by handles be probed by a bare range.
+    #[test]
+    fn borrow_range_map_lookup() {
+        use std::collections::{HashMap, HashSet};
+
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let a = alloc.alloc(32).unwrap();
+        let b = alloc.alloc(16).unwrap();
+        let (ra, rb) = (a.as_range(), b.as_range());
+
+        let map: HashMap<_, _> = [(a, "a"), (b, "b")].into_iter().collect();
+        assert_eq!(map.get(&ra), Some(&"a"));
+        assert_eq!(map.get(&rb), Some(&"b"));
+        assert_eq!(map.get(&BStackRange::new(999, 1)), None);
+
+        let stack = alloc.stack();
+        // SAFETY: `ra` came from a live allocation on this stack.
+        let slice = unsafe { BStackSlice::from_raw_range(stack, ra) };
+        let set: HashSet<_> = [slice].into_iter().collect();
+        assert!(set.contains(&ra));
+        assert!(!set.contains(&rb));
+    }
+
+    // Deref exposes the slice's shared API on the cursor types.
+    #[test]
+    fn deref_cursor_types_to_slice() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let own = alloc.alloc(24).unwrap();
+        let slice = own.as_slice();
+
+        let reader = slice.reader_at(8);
+        assert_eq!(reader.len(), 24);
+        assert_eq!(reader.start(), slice.start());
+        assert_eq!(reader.end(), slice.end());
+        assert_eq!(reader.position(), 8);
+        assert_eq!(reader.subslice(0, 4).len(), 4);
+
+        #[cfg(feature = "set")]
+        {
+            let start = slice.start();
+            let writer = slice.clone().writer_at(4);
+            assert_eq!(writer.len(), 24);
+            assert_eq!(writer.start(), start);
+            assert_eq!(writer.position(), 4);
+        }
+    }
 }
 
 // -------------------------------------------------------------------------

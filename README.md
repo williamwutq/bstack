@@ -522,25 +522,44 @@ assert!(stack.pop(stack.len()? - 60).is_err()); // would shrink below locked
 
 **`BStackOwnedSlice<'a, A>`** — ownership handle carrying `&'a A`. Non-`Copy`, non-`Clone`.
 
-| Trait                | Semantics                                                              |
-|----------------------|------------------------------------------------------------------------|
-| `PartialEq` / `Eq`   | Compares `(offset, len)`. The allocator reference is **not** compared. |
-| `Hash`               | Hashes `(offset, len)`.                                                |
-| `PartialOrd` / `Ord` | Ordered by `offset`, then `len`.                                       |
+| Trait                                        | Semantics                                                              |
+|----------------------------------------------|------------------------------------------------------------------------|
+| `PartialEq` / `Eq`                           | Compares `(offset, len)`. The allocator reference is **not** compared. |
+| `Hash`                                       | Hashes `(offset, len)`.                                                |
+| `PartialOrd` / `Ord`                         | Ordered by `offset`, then `len`.                                       |
+| `Borrow<BStackRange>` / `AsRef<BStackRange>` | Borrows the stored `(offset, len)`.                                    |
 
 **`BStackSlice<'a>`** — borrowed I/O view carrying `&'a BStack`. Non-`Copy`, `Clone`.
 
-| Trait                | Semantics                                                          |
-|----------------------|--------------------------------------------------------------------|
-| `PartialEq` / `Eq`   | Compares `(offset, len)`. The stack reference is **not** compared. |
-| `Hash`               | Hashes `(offset, len)`.                                            |
-| `PartialOrd` / `Ord` | Ordered by `offset`, then `len`.                                   |
+| Trait                                        | Semantics                                                          |
+|----------------------------------------------|--------------------------------------------------------------------|
+| `PartialEq` / `Eq`                           | Compares `(offset, len)`. The stack reference is **not** compared. |
+| `Hash`                                       | Hashes `(offset, len)`.                                            |
+| `PartialOrd` / `Ord`                         | Ordered by `offset`, then `len`.                                   |
+| `Borrow<BStackRange>` / `AsRef<BStackRange>` | Borrows the stored `(offset, len)`.                                |
 
 `BStackRange`, `BStackOwnedSlice`, and `BStackSlice` are also **cross-comparable**: `PartialEq` and
 `PartialOrd` are defined between every pair of the three (both directions), all keyed on the same
 `(offset, len)`, so a raw token, an allocation handle, and a borrowed view can be compared or sorted
 together directly without an explicit conversion. See [Slice Location Equality](#slice-location-equality)
 below for what this comparison does and does not mean.
+
+`Borrow<BStackRange>` on both handle types extends that key from comparison to lookup. `Eq`, `Ord`,
+and `Hash` on a slice and on an owned handle are the range's own, so the `Borrow` contract holds
+exactly and a `HashMap<BStackOwnedSlice<A>, V>` or `BTreeSet<BStackSlice>` can be probed with a bare
+`BStackRange`:
+
+```rust
+let mut map: HashMap<BStackOwnedSlice<A>, Meta> = HashMap::new();
+map.insert(handle, meta);
+// Later, holding only a persisted coordinate pair:
+let range = BStackRange::from_bytes(bytes);
+let meta = map.get(&range);
+```
+
+Without it the probe would have to fabricate a handle, which needs both an `unsafe` constructor and an
+allocator reference the lookup site may not have. `AsRef<BStackRange>` is the same borrow under the
+weaker contract, for generic code that accepts `impl AsRef<BStackRange>`.
 
 **`BStackChunk<'a>`** — fixed-stride view carrying `&'a BStack`. Non-`Copy`, `Clone`.
 
@@ -558,16 +577,47 @@ For borrow and lifetime purposes a guard sits at the **same semantic position as
 
 ### `BStackSliceReader` and `BStackSliceWriter` (`alloc` / `alloc + set` features)
 
-| Trait                | Semantics                                                                            |
-|----------------------|--------------------------------------------------------------------------------------|
-| `PartialEq` / `Eq`   | Equal when the underlying slice (`offset` + `len`) and cursor position both match.   |
-| `Hash`               | Hashes `(slice, cursor)`.                                                            |
-| `PartialOrd` / `Ord` | Ordered by absolute payload position (`slice.start() + cursor`), then `slice.len()`. |
+| Trait                             | Semantics                                                                            |
+|-----------------------------------|--------------------------------------------------------------------------------------|
+| `PartialEq` / `Eq`                | Equal when the underlying slice (`offset` + `len`) and cursor position both match.   |
+| `Hash`                            | Hashes `(slice, cursor)`.                                                            |
+| `PartialOrd` / `Ord`              | Ordered by absolute payload position (`slice.start() + cursor`), then `slice.len()`. |
+| `Deref<Target = BStackSlice<'a>>` | Borrows the underlying slice; equivalent to `slice()`.                               |
 
 Reader and writer are also **cross-comparable**: `PartialEq` and `PartialOrd` are defined between
 `BStackSliceReader` and `BStackSliceWriter` using the same `(abs_pos, len)` key, so the two cursor
 types can be mixed in sorted collections. Both also implement `PartialEq<BStackSlice>` (cursor
 position is ignored for that comparison).
+
+`Deref` puts the slice's shared-reference API (`len`, `start`, `end`, `read`, `find`, `subslice`, …)
+directly on the cursor types, so `reader.len()` works as well as `reader.slice().len()`. It grants
+nothing new — `slice()` already hands out `&BStackSlice`.
+
+`DerefMut` is deliberately absent: it would hand out the exclusive slice the writer holds, and would
+put `BStackSlice::write` (overwrites from the region's start) one shadow away from `io::Write::write`
+(writes at the cursor) — same arity, both taking `&[u8]`, with the inherent trait impl winning
+resolution. `Deref` exposes only the `&self` methods, keeping the two apart.
+
+### Traits deliberately not implemented
+
+| Trait                                          | On                              | Why not                                                                               |
+|------------------------------------------------|---------------------------------|---------------------------------------------------------------------------------------|
+| `AsRef<[u8]>` / `Borrow<[u8]>` / `Deref<[u8]>` | any region handle               | Byte access is fallible I/O; these traits are infallible and must return live memory. |
+| `Deref<Target = BStackSlice>`                  | `BStackOwnedSlice`              | Would leak `'a`-lifetime subslices past the handle's borrow.                          |
+| `Deref<Target = BStack>`                       | every allocator, `BStackReader` | Would put `push` / `pop` / `discard` / `set` on the deref'ing type.                   |
+| `AsRef<BStack>`                                | every allocator                 | `BStackAllocator::stack()` already names it; no blanket impl is possible.             |
+| `Deref<Target = A>`                            | `DebugCheckingAllocator<A>`     | Would bypass the tracking the wrapper exists to perform.                              |
+| `Deref<Target = BStackSlice>`                  | `BStackChunk`                   | Would leak byte-unit methods into a chunk-unit API.                                   |
+| `Borrow<BStackRange>`                          | `BStackChunk`                   | Contract violation — chunk hashes `chunk_len` alongside the region.                   |
+| `Deref<Target = BStackOwnedSlice>`             | `BStackByteVec`                 | Would expose the 16-byte header to raw region writes.                                 |
+
+**`BStackOwnedSlice` does not deref to `BStackSlice`**, though the two share 44 method names. `Deref`
+must return a reference to a field, and the handle holds only `&'a A` and a range — `as_slice`
+synthesises the view from `allocator.stack()` — so it would need an added `&'a BStack`, widening every
+handle from 24 to 32 bytes. The semantics would still be wrong: `as_slice<'s>(&'s self)` narrows the
+view to the borrow, while `Deref` yields `&BStackSlice<'a>`, whose `subslice`, `split_at`, `head`, and
+`tail` all return `BStackSlice<'a>` — outliving the handle and collapsing the `as_slice` /
+`as_slice_mut` split that turns use-after-free into a compile error.
 
 ---
 

@@ -2,10 +2,11 @@ use super::BStackAllocator;
 #[cfg(all(feature = "set", feature = "atomic"))]
 use super::BStackOwnedSliceAllocator;
 use crate::BStack;
+use std::borrow::Borrow;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::io;
-use std::ops::Range;
+use std::ops::{Deref, Range};
 
 /// A raw `(offset, len)` coordinate pair with no backing reference.
 ///
@@ -1283,6 +1284,23 @@ impl<'a> PartialOrd<BStackSlice<'a>> for BStackRange {
     }
 }
 
+/// Borrows the coordinate pair. `Eq`, `Ord` and `Hash` on `BStackSlice` are
+/// the range's own, so a `HashMap`/`BTreeMap` keyed by slices can be probed
+/// with a bare [`BStackRange`].
+impl<'a> Borrow<BStackRange> for BStackSlice<'a> {
+    #[inline]
+    fn borrow(&self) -> &BStackRange {
+        &self.range
+    }
+}
+
+impl<'a> AsRef<BStackRange> for BStackSlice<'a> {
+    #[inline]
+    fn as_ref(&self) -> &BStackRange {
+        &self.range
+    }
+}
+
 impl<'a> From<BStackSlice<'a>> for BStackRange {
     #[inline]
     fn from(s: BStackSlice<'a>) -> BStackRange {
@@ -2400,6 +2418,23 @@ impl<'a, A: BStackAllocator> PartialOrd<BStackOwnedSlice<'a, A>> for BStackRange
     }
 }
 
+/// Borrows the coordinate pair. `Eq`, `Ord` and `Hash` on `BStackOwnedSlice`
+/// are the range's own, so a map keyed by handles can be probed with a bare
+/// [`BStackRange`] — no allocator reference or `unsafe` handle needed.
+impl<'a, A: BStackAllocator> Borrow<BStackRange> for BStackOwnedSlice<'a, A> {
+    #[inline]
+    fn borrow(&self) -> &BStackRange {
+        &self.range
+    }
+}
+
+impl<'a, A: BStackAllocator> AsRef<BStackRange> for BStackOwnedSlice<'a, A> {
+    #[inline]
+    fn as_ref(&self) -> &BStackRange {
+        &self.range
+    }
+}
+
 impl<'a, A: BStackAllocator> From<BStackOwnedSlice<'a, A>> for BStackRange {
     #[inline]
     fn from(s: BStackOwnedSlice<'a, A>) -> BStackRange {
@@ -2483,6 +2518,23 @@ impl<'a> BStackSliceReader<'a> {
     #[inline]
     #[must_use]
     pub fn slice(&self) -> &BStackSlice<'a> {
+        &self.slice
+    }
+}
+
+/// Derefs to the underlying [`BStackSlice`], so the slice's shared-reference
+/// API ([`len`](BStackSlice::len), [`read`](BStackSlice::read),
+/// [`subslice`](BStackSlice::subslice), …) is reachable directly on the
+/// reader. Equivalent to [`slice`](Self::slice).
+///
+/// There is deliberately no `DerefMut`: the slice's `&mut self` methods would
+/// write outside the cursor, and [`io::Read::read`] shadows
+/// [`BStackSlice::read`] on this type.
+impl<'a> Deref for BStackSliceReader<'a> {
+    type Target = BStackSlice<'a>;
+
+    #[inline]
+    fn deref(&self) -> &BStackSlice<'a> {
         &self.slice
     }
 }
@@ -2650,6 +2702,25 @@ impl<'a> BStackSliceWriter<'a> {
     #[inline]
     #[must_use]
     pub fn slice(&self) -> &BStackSlice<'a> {
+        &self.slice
+    }
+}
+
+/// Derefs to the underlying [`BStackSlice`], so the slice's shared-reference
+/// API ([`len`](BStackSlice::len), [`read`](BStackSlice::read),
+/// [`subslice`](BStackSlice::subslice), …) is reachable directly on the
+/// writer. Equivalent to [`slice`](Self::slice).
+///
+/// There is deliberately no `DerefMut`: it would hand out the exclusive slice
+/// the writer holds, and [`BStackSlice::write`] — which overwrites from the
+/// start of the region — would sit one shadow away from
+/// [`io::Write::write`], which writes at the cursor.
+#[cfg(feature = "set")]
+impl<'a> Deref for BStackSliceWriter<'a> {
+    type Target = BStackSlice<'a>;
+
+    #[inline]
+    fn deref(&self) -> &BStackSlice<'a> {
         &self.slice
     }
 }
