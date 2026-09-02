@@ -939,6 +939,420 @@ int bstack_slice_partition(bstack_slice_t s, uint64_t chunk_len, uint64_t n,
     return bstack_slice_process(s, select_cb, &ctx);
 }
 
+/* =========================================================================
+ * Out-of-core partial sort / selection
+ *
+ * bstack_slice_sort and bstack_slice_partition read the whole region into one
+ * buffer and commit it with a single bstack_process, so a region larger than
+ * memory cannot be ordered at all.  The two "partial" entry points below do
+ * the same work through a fixed byte budget instead: runs and base cases go
+ * through bstack_process on sub-ranges that fit the budget, everything wider
+ * is moved by single-record bstack_cross_exchange swaps.  Peak residency is
+ * O(1) in the region's size.
+ *
+ * Every remote step is individually crash-atomic and permutation-preserving,
+ * so a crash or an early I/O-error return leaves the region as some valid
+ * permutation of the records — never lost or duplicated data — and re-running
+ * completes the work.  Mirrors BStackChunk::sort_partial_by /
+ * select_nth_partial_by; see algos/SORTSELECT.md.
+ * ====================================================================== */
+
+/* One window / block of the out-of-core sort, in bytes; at most
+ * BSTACK_SORT_WINDOWS of them (two merge inputs plus one carry/output) are
+ * resident, so BSTACK_SORT_BUDGET bounds every step.  Mirrors the Rust
+ * SORT_BLOCK_BYTES / SORT_WINDOWS; independent of BSTACK_CHUNK_BULK_BUDGET. */
+#define BSTACK_SORT_BLOCK_BYTES 2048
+#define BSTACK_SORT_WINDOWS     3
+#define BSTACK_SORT_BUDGET      (BSTACK_SORT_WINDOWS * BSTACK_SORT_BLOCK_BYTES)
+
+/* Records sampled per quickselect pivot round.  The Rust engine sorts as many
+ * samples as the budget holds; C has no portable context-passing qsort, so the
+ * sample is index-sorted by insertion sort and capped here to keep that cheap.
+ * Pivot quality only affects speed, never the result. */
+#define BSTACK_SORT_SAMPLES 32
+
+/* Deferred merge ranges held by rec_imerge.  Each split continues on the
+ * smaller half, so the live range at depth d is <= count / 2^d and 64 slots
+ * cover any count a uint64_t offset can address. */
+#define BSTACK_MERGE_DEPTH_MAX 64
+
+/* Record geometry shared by the out-of-core engines: the region's base offset
+ * plus the record stride, in bytes (c) and as size_t (cu). */
+struct records {
+    uint64_t  start;
+    uint64_t  c;
+    uint64_t  count;
+    size_t    cu;
+    bstack_t *bs;
+};
+
+/* Absolute byte offset of record rec.  Function-like macro — r is evaluated
+ * more than once, so pass a side-effect-free argument. */
+#define REC_OFF(r, rec) ((r)->start + (uint64_t)(rec) * (r)->c)
+
+/* Read record rec into buf (r->cu bytes). */
+static inline int rec_read(const struct records *r, uint64_t rec, uint8_t *buf)
+{
+    uint64_t off = REC_OFF(r, rec);
+    return bstack_get(r->bs, off, off + r->c, buf);
+}
+
+/* Atomically swap the records at i and j (which must differ). */
+static inline int rec_swap(const struct records *r, uint64_t i, uint64_t j)
+{
+    return bstack_cross_exchange(r->bs, REC_OFF(r, i), REC_OFF(r, j), r->c);
+}
+
+/* Atomically read the record range [lo, hi), permute it in memory via cb, and
+ * commit it — one crash-atomic operation. */
+static inline int rec_process(const struct records *r, uint64_t lo, uint64_t hi,
+                       int (*cb)(uint8_t *buf, size_t len, void *ctx), void *ctx)
+{
+    return bstack_process(r->bs, REC_OFF(r, lo), REC_OFF(r, hi), cb, ctx);
+}
+
+/* Reverse the records in [x, y) via single-record atomic swaps. */
+static inline int rec_reverse(const struct records *r, uint64_t x, uint64_t y)
+{
+    while (y > x + 1) {
+        uint64_t b = y - 1;
+        if (rec_swap(r, x, b)) return -1;
+        x++;
+        y = b;
+    }
+    return 0;
+}
+
+/* Swap the adjacent record blocks [a, b) and [b, d) by three reversals. */
+static inline int rec_rotate(const struct records *r, uint64_t a, uint64_t b, uint64_t d)
+{
+    if (rec_reverse(r, a, b)) return -1;
+    if (rec_reverse(r, b, d)) return -1;
+    return rec_reverse(r, a, d);
+}
+
+/* First index in [lo, hi) whose record is not less than key. */
+static inline int rec_lower_bound(const struct records *r, uint64_t lo, uint64_t hi,
+                           const uint8_t *key, uint8_t *scratch,
+                           int (*cmp)(const void *, const void *), uint64_t *out)
+{
+    while (lo < hi) {
+        uint64_t m = lo + (hi - lo) / 2;
+        if (rec_read(r, m, scratch)) return -1;
+        if (cmp(scratch, key) < 0)
+            lo = m + 1;
+        else
+            hi = m;
+    }
+    *out = lo;
+    return 0;
+}
+
+/* First index in [lo, hi) whose record is greater than key. */
+static inline int rec_upper_bound(const struct records *r, uint64_t lo, uint64_t hi,
+                           const uint8_t *key, uint8_t *scratch,
+                           int (*cmp)(const void *, const void *), uint64_t *out)
+{
+    while (lo < hi) {
+        uint64_t m = lo + (hi - lo) / 2;
+        if (rec_read(r, m, scratch)) return -1;
+        if (cmp(scratch, key) > 0)
+            hi = m;
+        else
+            lo = m + 1;
+    }
+    *out = lo;
+    return 0;
+}
+
+struct mrange { uint64_t lo, mid, hi; };
+
+/* Reusable scratch for rec_imerge: two record-sized compare buffers and the
+ * deferred-work stack. */
+struct merge_scratch {
+    struct mrange stack[BSTACK_MERGE_DEPTH_MAX];
+    size_t        depth;
+    uint8_t      *bi;
+    uint8_t      *bj;
+};
+
+/* Merge the adjacent sorted runs [lo0, mid0) and [mid0, hi0) in place.
+ *
+ * A rotation merge (SymMerge): a range that fits the budget is settled by one
+ * atomic rec_process sort; a wider one is split by binary-searching a pivot
+ * from the larger run, rotating the two middle blocks past each other, and
+ * merging the halves the same way.  Iterative — the larger half is deferred on
+ * ms->stack and the smaller continued in place, bounding the depth. */
+static int rec_imerge(const struct records *r, uint64_t lo0, uint64_t mid0,
+                      uint64_t hi0, struct merge_scratch *ms,
+                      int (*cmp)(const void *, const void *))
+{
+    /* Records that fit the budget; (hi - lo) > fit is exactly
+     * (hi - lo) * c > BUDGET, without the multiplication's overflow risk. */
+    uint64_t fit = BSTACK_SORT_BUDGET / r->c;
+    uint64_t lo = lo0, mid = mid0, hi = hi0;
+    struct sort_ctx sc;
+    sc.chunk_len = r->cu;
+    sc.cmp = cmp;
+    ms->depth = 0;
+    for (;;) {
+        /* Descend, splitting until the range is a base case.  hi - lo > 2
+         * keeps llen >= 2 in the pivot-left branch and is the floor for
+         * records so wide that two of them exceed the budget. */
+        while (lo < mid && mid < hi && hi - lo > 2 && hi - lo > fit) {
+            uint64_t llen = mid - lo, rlen = hi - mid;
+            uint64_t i, j, new_mid;
+            if (llen >= rlen) {
+                i = lo + llen / 2;
+                if (rec_read(r, i, ms->bi) ||
+                    rec_lower_bound(r, mid, hi, ms->bi, ms->bj, cmp, &j)) return -1;
+            } else {
+                j = mid + rlen / 2;
+                if (rec_read(r, j, ms->bj) ||
+                    rec_upper_bound(r, lo, mid, ms->bj, ms->bi, cmp, &i)) return -1;
+            }
+            /* Skip a no-op rotation (one side of the pivot is empty). */
+            if (i < mid && mid < j && rec_rotate(r, i, mid, j)) return -1;
+            new_mid = i + (j - mid);
+            /* Continue on the smaller half; defer the larger. */
+            if (new_mid - lo <= hi - new_mid) {
+                ms->stack[ms->depth].lo  = new_mid;
+                ms->stack[ms->depth].mid = j;
+                ms->stack[ms->depth].hi  = hi;
+                mid = i;
+                hi  = new_mid;
+            } else {
+                ms->stack[ms->depth].lo  = lo;
+                ms->stack[ms->depth].mid = i;
+                ms->stack[ms->depth].hi  = new_mid;
+                lo  = new_mid;
+                mid = j;
+            }
+            ms->depth++;
+        }
+        /* Base case: two sorted runs within the budget (or a 1-2 record
+         * range) — one atomic sort settles them.  Degenerate ranges with an
+         * empty side fall through to the pop. */
+        if (lo < mid && mid < hi && rec_process(r, lo, hi, sort_cb, &sc)) return -1;
+        if (ms->depth == 0) return 0;
+        ms->depth--;
+        lo  = ms->stack[ms->depth].lo;
+        mid = ms->stack[ms->depth].mid;
+        hi  = ms->stack[ms->depth].hi;
+    }
+}
+
+/* Out-of-core in-place bottom-up merge sort of the region's records. */
+static int rec_merge_sort(const struct records *r,
+                          int (*cmp)(const void *, const void *))
+{
+    uint64_t count = r->count, k, run0, p, width;
+    struct merge_scratch ms;
+    struct sort_ctx sc;
+    uint8_t *scratch;
+    int rc = 0;
+    if (count <= 1)
+        return 0;
+    scratch = (uint8_t *)malloc(r->cu * 2);
+    if (!scratch) {
+        errno = ENOMEM;
+        return -1;
+    }
+    ms.bi = scratch;
+    ms.bj = scratch + r->cu;
+    ms.depth = 0;
+    sc.chunk_len = r->cu;
+    sc.cmp = cmp;
+    k = BSTACK_SORT_BLOCK_BYTES / r->c;
+    if (k == 0) k = 1;
+    run0 = BSTACK_SORT_WINDOWS * k;
+    /* Phase 1: run formation — sort each run0-record window in one atomic
+     * pass.  Subtraction-form comparisons keep every index within count. */
+    for (p = 0; p < count; ) {
+        uint64_t q = (count - p > run0) ? p + run0 : count;
+        if (q - p > 1 && rec_process(r, p, q, sort_cb, &sc)) {
+            rc = -1;
+            goto done;
+        }
+        p = q;
+    }
+    /* Phase 2: bottom-up merge passes. */
+    for (width = run0; width < count;) {
+        uint64_t stop = count - width; /* > 0 by the loop guard */
+        uint64_t step = (width > UINT64_MAX / 2) ? UINT64_MAX : width * 2;
+        uint64_t lo;
+        for (lo = 0; lo < stop;) {
+            uint64_t mid = lo + width; /* < count, since lo < count - width */
+            uint64_t hi  = (count - mid > width) ? mid + width : count;
+            if (rec_imerge(r, lo, mid, hi, &ms, cmp)) {
+                rc = -1; goto done;
+            }
+            /* Advance two runs; saturate so a near-UINT64_MAX sum only ends
+             * the pass. */
+            lo = (lo > UINT64_MAX - step) ? UINT64_MAX : lo + step;
+        }
+        width = step;
+    }
+done:
+    free(scratch);
+    return rc;
+}
+
+/* Choose a pivot record index in [lo, hi): read a strided sample into samp and
+ * return the index of its median.  max_samples <= BSTACK_SORT_SAMPLES. */
+static int rec_sample_pivot(const struct records *r, uint64_t lo, uint64_t hi,
+                            uint8_t *samp, uint64_t max_samples,
+                            int (*cmp)(const void *, const void *),
+                            uint64_t *out_piv)
+{
+    size_t cu = r->cu;
+    uint64_t range = hi - lo;
+    uint64_t s = (max_samples < range) ? max_samples : range;
+    uint64_t stride = range / s; /* >= 1: s <= range */
+    unsigned ord[BSTACK_SORT_SAMPLES];
+    unsigned i, j;
+    uint64_t t;
+    for (t = 0; t < s; t++)
+        if (rec_read(r, lo + stride * t, samp + (size_t)t * cu)) return -1;
+    /* Insertion-sort the sample indices; the median index recovers a real
+     * record position, which a plain qsort of the sample bytes would lose. */
+    for (i = 0; i < (unsigned)s; i++) {
+        ord[i] = i;
+        for (j = i; j > 0
+                 && cmp(samp + (size_t)ord[j] * cu,
+                        samp + (size_t)ord[j - 1] * cu) < 0; j--) {
+            unsigned tmp = ord[j];
+            ord[j] = ord[j - 1];
+            ord[j - 1] = tmp;
+        }
+    }
+    *out_piv = lo + stride * ord[(unsigned)s / 2];
+    return 0;
+}
+
+/* Lomuto partition of [lo, hi) around the record at piv, in place via atomic
+ * single-record swaps.  *out_p receives the pivot's final index p: [lo, p)
+ * compare < pivot and [p + 1, hi) compare >= pivot.  Requires hi - lo >= 2. */
+static int rec_partition(const struct records *r, uint64_t lo, uint64_t hi,
+                         uint64_t piv, uint8_t *pbuf, uint8_t *one,
+                         int (*cmp)(const void *, const void *), uint64_t *out_p)
+{
+    uint64_t last = hi - 1, store = lo, k;
+    if (rec_read(r, piv, pbuf)) /* pivot bytes captured before moving */
+        return -1;
+    if (piv != last && rec_swap(r, piv, last)) return -1;
+    for (k = lo; k < last; k++) {
+        if (rec_read(r, k, one)) return -1;
+        if (cmp(one, pbuf) < 0) {
+            if (k != store && rec_swap(r, store, k)) return -1;
+            store++;
+        }
+    }
+    if (store != last && rec_swap(r, store, last)) return -1;
+    *out_p = store;
+    return 0;
+}
+
+/* Out-of-core in-place selection of rank n.  Narrows a record band [lo, hi)
+ * holding rank n — everything left of lo compares <= it, everything right of
+ * hi >= it — until the band fits the budget and one atomic pass settles it. */
+static int rec_select_nth(const struct records *r, uint64_t n,
+                          int (*cmp)(const void *, const void *))
+{
+    size_t cu = r->cu;
+    uint64_t fit = BSTACK_SORT_BUDGET / r->c;
+    uint64_t lo = 0, hi = r->count;
+    uint64_t max_samples;
+    uint8_t *scratch, *samp, *pbuf, *one;
+    int rc = 0;
+    if (r->count <= 1) return 0;
+    max_samples = BSTACK_SORT_BUDGET / r->c;
+    if (max_samples > BSTACK_SORT_SAMPLES)
+        max_samples = BSTACK_SORT_SAMPLES;
+    /* a record wider than the budget still samples one */
+    if (max_samples == 0) max_samples = 1;
+    /* One allocation: the sample buffer, the pivot copy, and a compare slot. */
+    scratch = (uint8_t *)malloc((size_t)max_samples * cu + cu * 2);
+    if (!scratch) {
+        errno = ENOMEM;
+        return -1;
+    }
+    samp = scratch;
+    pbuf = scratch + (size_t)max_samples * cu;
+    one  = pbuf + cu;
+    for (;;) {
+        uint64_t piv, p;
+        /* A single-record band already holds the answer. */
+        if (hi - lo <= 1) break;
+        /* Band within the budget: settle it exactly in one atomic pass.  The
+         * band invariant makes the local (n - lo)-th record the global n-th. */
+        if (hi - lo <= fit) {
+            struct select_ctx sc;
+            sc.chunk_len = cu;
+            sc.n   = (size_t)(n - lo);
+            sc.cmp = cmp;
+            rc = rec_process(r, lo, hi, select_cb, &sc);
+            break;
+        }
+        if (rec_sample_pivot(r, lo, hi, samp, max_samples, cmp, &piv)) {
+            rc = -1; break;
+        }
+        if (rec_partition(r, lo, hi, piv, pbuf, one, cmp, &p)) {
+            rc = -1; break;
+        }
+        /* Recurse into the side holding n, excluding the now-fixed pivot. */
+        if (n < p)
+            hi = p;
+        else if (n > p)
+            lo = p + 1;
+        else
+            break;
+    }
+    free(scratch);
+    return rc;
+}
+
+/* Fill in the record geometry, rejecting a stride this platform's size_t
+ * cannot express.  The engines hold two to three records in memory, so the
+ * bound applies on every target, not just where size_t is narrower than the
+ * offset type: three records must fit a size_t for rec_select_nth's scratch. */
+static inline int records_init(struct records *r, bstack_slice_t s, uint64_t chunk_len)
+{
+    if (chunk_len > (uint64_t)(SIZE_MAX / 4)) {
+        errno = ENOMEM;
+        return -1;
+    }
+    r->start = s.offset;
+    r->c     = chunk_len;
+    r->count = s.len / chunk_len;
+    r->cu    = (size_t)chunk_len;
+    r->bs    = slice_stack(s);
+    return 0;
+}
+
+int bstack_slice_sort_partial(bstack_slice_t s, uint64_t chunk_len,
+                              int (*cmp)(const void *a, const void *b))
+{
+    struct records r;
+    if (records_init(&r, s, chunk_len)) return -1;
+    return rec_merge_sort(&r, cmp);
+}
+
+int bstack_slice_partition_partial(bstack_slice_t s, uint64_t chunk_len,
+                                   uint64_t n,
+                                   int (*cmp)(const void *a, const void *b))
+{
+    struct records r;
+    if (records_init(&r, s, chunk_len)) return -1;
+    if (n >= r.count) {
+        errno = EINVAL;
+        return -1;
+    }
+    return rec_select_nth(&r, n, cmp);
+}
+
+#undef REC_OFF
+
 #endif /* BSTACK_FEATURE_SET && BSTACK_FEATURE_ATOMIC */
 
 /* =========================================================================

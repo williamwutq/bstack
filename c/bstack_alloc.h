@@ -466,6 +466,59 @@ int bstack_slice_sort(bstack_slice_t s, uint64_t chunk_len,
 BSTACK_WARN_UNUSED_RESULT
 int bstack_slice_partition(bstack_slice_t s, uint64_t chunk_len, uint64_t n,
                            int (*cmp)(const void *a, const void *b));
+
+/*
+ * Bounded-memory, out-of-core sort of s's records in place by cmp (qsort
+ * convention).
+ *
+ * Unlike bstack_slice_sort, which reads the whole region into one buffer and
+ * commits it in a single bstack_process — bounded by available memory, so a
+ * region too large for one buffer cannot be sorted that way — this runs an
+ * in-place bottom-up merge sort that never holds more than a fixed internal
+ * byte budget resident (no knob), so peak memory is O(1) in the region's size.
+ * Runs are formed with bstack_process and merged in place by a rotation merge:
+ * bstack_process for sub-ranges that fit the budget, plus single-record
+ * bstack_cross_exchange swaps to rotate wider ones.  No scratch region.
+ *
+ * "Partial" names the interruptible middle state, not the result: on success
+ * the region is fully sorted.  Every step is an independent crash-atomic
+ * operation that only permutes the bytes it touches, so a crash or an early
+ * error return leaves the region as some valid permutation of the records —
+ * never lost or duplicated data — just not fully ordered, and re-running from
+ * any such state completes the sort.
+ *
+ * Not stable.  Returns 0 on success, -1 (errno set) on an allocation failure
+ * or a genuine bstack_process / bstack_cross_exchange I/O failure.
+ *
+ * Requires -DBSTACK_FEATURE_SET and -DBSTACK_FEATURE_ATOMIC.
+ */
+BSTACK_WARN_UNUSED_RESULT
+int bstack_slice_sort_partial(bstack_slice_t s, uint64_t chunk_len,
+                              int (*cmp)(const void *a, const void *b));
+
+/*
+ * Bounded-memory, out-of-core partition of s's records around rank n: the same
+ * result as bstack_slice_partition — the record at index n lands where a full
+ * sort by cmp would put it, every earlier record <= it and every later record
+ * >= it — computed without holding the whole region in memory.
+ *
+ * A bounded-memory quickselect: it narrows an active record band around n,
+ * choosing each pivot from a cross-region sample and partitioning in place with
+ * atomic bstack_cross_exchange swaps, until the band fits the internal budget
+ * and one bstack_process settles it exactly.  Peak memory is O(1) in the
+ * region's size; no scratch region.
+ *
+ * Every step is crash-atomic and permutation-preserving, so a crash or an early
+ * error return leaves a valid permutation and re-running completes the
+ * selection.  Returns 0 on success, -1 with errno = EINVAL if n >= chunk_count,
+ * else -1 (errno set) on an allocation or I/O failure.
+ *
+ * Requires -DBSTACK_FEATURE_SET and -DBSTACK_FEATURE_ATOMIC.
+ */
+BSTACK_WARN_UNUSED_RESULT
+int bstack_slice_partition_partial(bstack_slice_t s, uint64_t chunk_len,
+                                   uint64_t n,
+                                   int (*cmp)(const void *a, const void *b));
 #endif /* BSTACK_FEATURE_SET && BSTACK_FEATURE_ATOMIC */
 
 /* =========================================================================
