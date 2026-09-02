@@ -2,10 +2,10 @@ name: CCI
 
 on:
   push:
-    branches: [ master ]
+    branches: [ master, "0.2-backports" ]
     paths: [c/**, .github/workflows/cci.yml]
   pull_request:
-    branches: [ master ]
+    branches: [ master, "0.2-backports" ]
     paths: [c/**, .github/workflows/cci.yml]
 
 permissions:
@@ -61,5 +61,8 @@ jobs:
       run: cd c && make test-checked-slab-atomic
     - name: Build and test bytevec
       run: cd c && make test-bytevec
+    - name: Build and test bytevec (atomic)
+      if: runner.os != 'Windows'
+      run: cd c && make test-bytevec-atomic
     - name: Build alloc libraries (all feature variants)
       run: cd c && make libbstack-alloc.a libbstack-alloc-set.a

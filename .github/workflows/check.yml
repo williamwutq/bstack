@@ -2,9 +2,9 @@ name: Check
 
 on:
   push:
-    branches: [ master ]
+    branches: [ master, "0.2-backports" ]
   pull_request:
-    branches: [ master ]
+    branches: [ master, "0.2-backports" ]
 
 permissions:
   contents: read
