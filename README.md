@@ -885,18 +885,21 @@ The `alloc` feature adds typed region management over a `BStack` payload.
 
 ### Region handle design
 
-The `alloc` feature provides four distinct handle types for different roles:
+The `alloc` feature provides four distinct handle types for different roles; the `guarded` feature adds a fifth, `BStackGuardedSlice`, for transparent I/O interception:
 
-| Type                      | Carries      | Copy | I/O      | Alloc ops |
-|---------------------------|--------------|------|----------|-----------|
-| `BStackRange`             | nothing      | yes  | no       | no        |
-| `BStackOwnedSlice<'a, A>` | `&'a A`      | no   | via view | yes       |
-| `BStackSlice<'a>`         | `&'a BStack` | no   | yes      | no        |
-| `BStackChunk<'a>`         | `&'a BStack` | no   | yes      | no        |
+| Type                        | Carries      | Copy | I/O      | Alloc ops |
+|-----------------------------|--------------|------|----------|-----------|
+| `BStackRange`               | nothing      | yes  | no       | no        |
+| `BStackOwnedSlice<'a, A>`   | `&'a A`      | no   | via view | yes       |
+| `BStackSlice<'a>`           | `&'a BStack` | no   | yes      | no        |
+| `BStackChunk<'a>`           | `&'a BStack` | no   | yes      | no        |
+| `BStackGuardedSlice<'a, A>` | `&'a BStack` | no   | yes      | no        |
 
 `BStackOwnedSlice` is non-`Copy` and non-`Clone`: an allocation has exactly one owner.  Obtaining an I/O view via `as_slice()` or `as_slice_mut()` ties the view's lifetime to the borrow of the owned slice, preventing it from outliving the handle.  `BStackSlice` is non-`Copy` so that `write*(&mut self)` provides single-writer exclusivity; it is `Clone` for explicit second views.
 
 `BStackChunk` sits at the same semantic position as `BStackSlice` — same `Carries`/`Copy`/`I/O`/`Alloc ops` columns, same non-`Copy`-but-`Clone` rationale — it is simply a `BStackSlice` with a fixed stride layered on top (see "`BStackChunk<'a>` — fixed-stride chunked view" below). It is not an iterator itself and has no allocator operations of its own.
+
+`BStackGuardedSlice` also sits at the same semantic position as `BStackSlice` — same `Carries`/`Copy`/`I/O`/`Alloc ops` columns — but it is a **trait** (`guarded` feature), not a concrete type: an implementor wraps a `BStackSlice` and intercepts I/O through `encode`/`decode`/`on_read`/`on_write` hooks. It owns no region and has no allocator operations of its own; see the region-handle-types section above and the module docs.
 
 ### `BStackAllocator` trait
 
