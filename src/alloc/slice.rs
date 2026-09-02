@@ -219,6 +219,15 @@ impl From<BStackRange> for Range<u64> {
     }
 }
 
+/// The zero-length range at offset 0 — the same sentinel [`empty`](BStackRange::empty)
+/// returns, for use before a real allocation is available.
+impl Default for BStackRange {
+    #[inline]
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
 impl fmt::Debug for BStackRange {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BStackRange")

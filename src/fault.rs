@@ -172,7 +172,6 @@ mod active {
     /// Per-stack fault-injection state: the currently armed policy (if any) and a
     /// shared operation counter. One instance lives inside each [`BStack`](crate::BStack) under
     /// the fault-injection configuration.
-    #[derive(Default)]
     pub struct FaultState {
         policy: Mutex<Option<Arc<dyn FaultPolicy>>>,
         seq: AtomicU64,
@@ -180,8 +179,14 @@ mod active {
 
     impl FaultState {
         /// Create an unarmed state (no policy installed).
+        ///
+        /// Written out rather than derived: `Default` would be a public impl on a
+        /// type whose every method is crate-internal.
         pub(crate) fn new() -> Self {
-            Self::default()
+            Self {
+                policy: Mutex::new(None),
+                seq: AtomicU64::new(0),
+            }
         }
 
         /// Install (or, with `None`, clear) the policy and reset the sequence
