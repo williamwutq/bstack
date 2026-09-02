@@ -753,20 +753,39 @@ Produced by `BStackAllocator::alloc`; consumed by `realloc` and `dealloc`.
 
 Key methods:
 
-| Method                                       | Description                                    |
-|----------------------------------------------|------------------------------------------------|
-| `read()`                                     | Read the entire region into a new `Vec<u8>`    |
-| `read_into(buf)`                             | Read into a caller-supplied buffer             |
-| `read_range(start, end)`                     | Read a sub-range into a new `Vec<u8>`          |
-| `read_range_into(start, buf)`                | Read a sub-range into a caller-supplied buffer |
-| `subslice(start, end)`                       | Narrow to a sub-range (relative offsets)       |
-| `subslice_range(range)`                      | Narrow to a sub-range using a `Range<u64>`     |
-| `reader()`                                   | Cursor-based `BStackSliceReader` at position 0 |
-| `reader_at(offset)`                          | Cursor-based `BStackSliceReader` at `offset`   |
-| `write(data)` *(feature `set`)*              | Overwrite the beginning of the region in place |
-| `write_range(start, data)` *(feature `set`)* | Overwrite a sub-range in place                 |
-| `zero()` *(feature `set`)*                   | Zero the entire region in place                |
-| `zero_range(start, n)` *(feature `set`)*     | Zero a sub-range in place                      |
+| Method                                                                          | Description                                                                                                               |
+|---------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------|
+| `read()`                                                                        | Read the entire region into a new `Vec<u8>`                                                                               |
+| `read_into(buf)`                                                                | Read into a caller-supplied buffer                                                                                        |
+| `read_range(start, end)`                                                        | Read a sub-range into a new `Vec<u8>`                                                                                     |
+| `read_range_into(start, buf)`                                                   | Read a sub-range into a caller-supplied buffer                                                                            |
+| `subslice(start, end)`                                                          | Narrow to a sub-range (relative offsets)                                                                                  |
+| `subslice_range(range)`                                                         | Narrow to a sub-range using a `Range<u64>`                                                                                |
+| `reader()`                                                                      | Cursor-based `BStackSliceReader` at position 0                                                                            |
+| `reader_at(offset)`                                                             | Cursor-based `BStackSliceReader` at `offset`                                                                              |
+| `write(data)` *(feature `set`)*                                                 | Overwrite the beginning of the region in place                                                                            |
+| `write_range(start, data)` *(feature `set`)*                                    | Overwrite a sub-range in place                                                                                            |
+| `zero()` *(feature `set`)*                                                      | Zero the entire region in place                                                                                           |
+| `zero_range(start, n)` *(feature `set`)*                                        | Zero a sub-range in place                                                                                                 |
+| `get(index)`                                                                    | Read a single byte, or `None` if out of bounds                                                                            |
+| `head(n)` / `tail(n)`                                                           | Sub-view of the first/last `n` bytes (capped to length)                                                                   |
+| `split_at(mid)` / `split_at_mut(mid)`                                           | Split into two independent sub-views                                                                                      |
+| `contains(byte)`                                                                | Whether the slice contains a byte                                                                                         |
+| `starts_with(prefix)` / `ends_with(suffix)`                                     | Whether the slice starts/ends with a byte pattern                                                                         |
+| `find(byte)` / `rfind(byte)`                                                    | Index of the first/last occurrence of a byte                                                                              |
+| `position(pred)` / `rposition(pred)`                                            | Index of the first/last byte matching a predicate                                                                         |
+| `fill(value)` *(feature `set`)*                                                 | Overwrite the entire slice with one byte value                                                                            |
+| `fill_with(f)` *(feature `set`)*                                                | Overwrite the entire slice, generating each byte                                                                          |
+| `copy_from_slice(src)` *(feature `set`)*                                        | Overwrite from a matching-length `&[u8]`                                                                                  |
+| `copy_from_bstack_slice(src)` *(features `set` + `atomic`)*                     | Overwrite from a matching-length `BStackSlice`                                                                            |
+| `copy_within(range, dest)` *(features `set` + `atomic`)*                        | Copy a sub-range to another offset, in place                                                                              |
+| `swap(other)` *(features `set` + `atomic`)*                                     | Exchange contents with another same-length slice                                                                          |
+| `reverse()` *(features `set` + `atomic`)*                                       | Reverse the byte order in place                                                                                           |
+| `rotate_left(mid)` / `rotate_right(k)` *(features `set` + `atomic`)*            | Rotate the slice in place                                                                                                 |
+| `process(f)` *(features `set` + `atomic`)*                                      | Run an arbitrary length-preserving in-place transform — the primitive `reverse`/`rotate_left`/`rotate_right` are built on |
+| `cas_on(guard, expected, new_bytes)` *(features `set` + `atomic`)*              | Overwrite `self` with `new_bytes`, returning the prior contents, if `guard`'s bytes equal `expected`                      |
+| `cas_on_ne(guard, expected, new_bytes)` *(features `set` + `atomic`)*           | Like `cas_on`, but swaps when `guard`'s bytes do **not** equal `expected`                                                 |
+| `cas_on_masked(guard, mask, expected, new_bytes)` *(features `set` + `atomic`)* | Like `cas_on`, comparing `guard`'s bytes to `expected` under a bitwise `mask`                                             |
 
 ### `BStackSliceReader<'a, A>`
 

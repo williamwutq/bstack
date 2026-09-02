@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`BStackSlice::cas_on`/`cas_on_ne`/`cas_on_masked`/`process` (`alloc` + `set` + `atomic`, Rust only).** `cas_on(guard, expected, new_bytes)` is one crash-atomic `BStack::eq_crds` call: if `guard`'s bytes equal `expected`, the slice is overwritten with `new_bytes` and the prior contents returned as `Some(_)`, else `None` and the slice is untouched. `cas_on_ne`/`cas_on_masked` wrap `ne_crds`/`masked_eq_crds` the same way. `guard` may be any view into the same `BStack`, including the slice itself. Each rejects a `guard` backed by a different `BStack`, or a length mismatch against `guard`/self, with `io::ErrorKind::InvalidInput`. `process(f)` is one crash-atomic `BStack::process` call, exposing for arbitrary transforms the length-preserving primitive `reverse`/`rotate_left`/`rotate_right` already use. Backported from the 0.4.x line.
+
 ### Fixed
 
 - **`GhostTreeBstackAllocator` (Rust and C): a length too large to round up to a 32-byte multiple was accepted rather than rejected.** `align_up_len` / `algt_align_up_len` computed `(len + 31) & !31` unchecked, so any `len > u64::MAX - 31` wrapped and rounded *down* to a 32-byte block: `alloc` returned a handle claiming the requested length, and `realloc` shrank the block to 32 bytes and freed the remainder while the handle still claimed the huge length. Debug builds trapped on the overflowing add, so the damage was release-only. Both helpers now check against a new `MAX_ALLOC` / `ALGT_MAX_ALLOC` (`(u64::MAX - ARENA_START) & !31`, bounded by the arena rather than by `u64` alone), and `alloc`, `alloc_bulk`, `realloc`, `dealloc`, and `dealloc_bulk` reject an unalignable length with `io::ErrorKind::InvalidInput` / `errno = EINVAL`. On-disk format unchanged. Backported from the 0.4.x line.

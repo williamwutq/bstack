@@ -3125,6 +3125,165 @@ mod alloc_tests {
         let mut s = alloc.alloc(4).unwrap();
         let _ = s.rotate_left(5);
     }
+
+    // ---- BStackSlice: cas_on / cas_on_ne / cas_on_masked --------------------
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn slice_cas_on_match_swaps_and_returns_old() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let guard = alloc.alloc(2).unwrap();
+        guard.write([1u8, 2]).unwrap();
+        let mut target = alloc.alloc(2).unwrap();
+        target.write([9u8, 9]).unwrap();
+        let old = target.cas_on(&guard, [1u8, 2], [3u8, 4]).unwrap();
+        assert_eq!(old, Some(vec![9, 9]));
+        assert_eq!(target.read().unwrap(), [3, 4]);
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn slice_cas_on_no_match_leaves_target_untouched() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let guard = alloc.alloc(2).unwrap();
+        guard.write([1u8, 2]).unwrap();
+        let mut target = alloc.alloc(2).unwrap();
+        target.write([9u8, 9]).unwrap();
+        let result = target.cas_on(&guard, [0u8, 0], [3u8, 4]).unwrap();
+        assert_eq!(result, None);
+        assert_eq!(target.read().unwrap(), [9, 9]);
+    }
+
+    // The guard may be the target itself — the plain single-region CAS.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn slice_cas_on_self_guard_swaps() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut target = alloc.alloc(2).unwrap();
+        target.write([1u8, 2]).unwrap();
+        let guard = target;
+        let old = target.cas_on(&guard, [1u8, 2], [3u8, 4]).unwrap();
+        assert_eq!(old, Some(vec![1, 2]));
+        assert_eq!(target.read().unwrap(), [3, 4]);
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn slice_cas_on_expected_length_mismatch_errors() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let guard = alloc.alloc(2).unwrap();
+        let mut target = alloc.alloc(2).unwrap();
+        let err = target.cas_on(&guard, [0u8], [3u8, 4]).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn slice_cas_on_new_bytes_length_mismatch_errors() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let guard = alloc.alloc(2).unwrap();
+        guard.write([1u8, 2]).unwrap();
+        let mut target = alloc.alloc(2).unwrap();
+        let err = target.cas_on(&guard, [1u8, 2], [3u8]).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn slice_cas_on_cross_stack_errors() {
+        let (alloc_a, path_a) = mk_alloc();
+        let _g_a = Guard(path_a);
+        let (alloc_b, path_b) = mk_alloc();
+        let _g_b = Guard(path_b);
+        let guard = alloc_a.alloc(2).unwrap();
+        let mut target = alloc_b.alloc(2).unwrap();
+        let err = target.cas_on(&guard, [0u8, 0], [1u8, 1]).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn slice_cas_on_ne_no_match_swaps_and_returns_old() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let guard = alloc.alloc(2).unwrap();
+        guard.write([1u8, 2]).unwrap();
+        let mut target = alloc.alloc(2).unwrap();
+        target.write([9u8, 9]).unwrap();
+        let old = target.cas_on_ne(&guard, [0u8, 0], [3u8, 4]).unwrap();
+        assert_eq!(old, Some(vec![9, 9]));
+        assert_eq!(target.read().unwrap(), [3, 4]);
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn slice_cas_on_ne_match_returns_none() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let guard = alloc.alloc(2).unwrap();
+        guard.write([1u8, 2]).unwrap();
+        let mut target = alloc.alloc(2).unwrap();
+        target.write([9u8, 9]).unwrap();
+        let result = target.cas_on_ne(&guard, [1u8, 2], [3u8, 4]).unwrap();
+        assert_eq!(result, None);
+        assert_eq!(target.read().unwrap(), [9, 9]);
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn slice_cas_on_masked_match_swaps_and_returns_old() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let guard = alloc.alloc(2).unwrap();
+        guard.write([0xffu8, 0x0f]).unwrap();
+        let mut target = alloc.alloc(2).unwrap();
+        target.write([9u8, 9]).unwrap();
+        // mask = [0xff, 0xf0]: masked guard = [0xff, 0x00] == masked expected
+        let old = target
+            .cas_on_masked(&guard, [0xffu8, 0xf0], [0xffu8, 0x0f], [3u8, 4])
+            .unwrap();
+        assert_eq!(old, Some(vec![9, 9]));
+        assert_eq!(target.read().unwrap(), [3, 4]);
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn slice_cas_on_masked_no_match_returns_none() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let guard = alloc.alloc(1).unwrap();
+        guard.write([0x0fu8]).unwrap();
+        let mut target = alloc.alloc(2).unwrap();
+        target.write([9u8, 9]).unwrap();
+        let result = target
+            .cas_on_masked(&guard, [0xffu8], [0xffu8], [3u8, 4])
+            .unwrap();
+        assert_eq!(result, None);
+        assert_eq!(target.read().unwrap(), [9, 9]);
+    }
+
+    // ---- BStackSlice: process ----------------------------------------------
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn slice_process_transforms_in_place() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut s = alloc.alloc(4).unwrap();
+        s.write([1u8, 2, 3, 4]).unwrap();
+        s.process(|buf| {
+            for b in buf.iter_mut() {
+                *b *= 2;
+            }
+        })
+        .unwrap();
+        assert_eq!(s.read().unwrap(), [2, 4, 6, 8]);
+    }
 }
 
 // -------------------------------------------------------------------------
