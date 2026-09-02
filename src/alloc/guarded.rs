@@ -30,7 +30,7 @@
 //! [`as_slice`]: BStackGuardedSlice::as_slice
 //! [`raw_block`]: BStackGuardedSlice::raw_block
 
-use super::{BStackAllocator, BStackRange, BStackSlice};
+use super::{BStackAllocator, BStackOwnedSlice, BStackRange, BStackSlice};
 use std::{borrow::Cow, io, ops::Range};
 
 /// A [`BStackSlice`] abstraction with lifecycle hooks for transparent I/O
@@ -603,6 +603,59 @@ where
         })?;
         self.on_write(dest, n)
     }
+
+    /// Copy this view's apparent bytes into a fresh allocation from `allocator`,
+    /// returning a plain [`BStackOwnedSlice`].
+    ///
+    /// The bytes are [`decode`](Self::decode)d on the way out, so the result holds
+    /// the apparent block, not the raw one, and is a plain region with no guard
+    /// attached. Unlike [`BStackSlice::to_owned_in`], which copies on disk via one
+    /// atomic primitive, this necessarily routes through memory — decoding cannot
+    /// happen on disk — so it needs only the `set` feature.
+    ///
+    /// # Errors
+    ///
+    /// Any [`io::Error`] from the read, the allocation, or the copy. If the copy
+    /// fails after the allocation succeeds, the fresh region is freed on a
+    /// best-effort basis before returning the copy error; if that free itself
+    /// fails, the region is left allocated but unreferenced (reclaimable by the
+    /// allocator's recovery).
+    #[cfg(feature = "set")]
+    fn to_owned_in<'b, B: super::BStackOwnedSliceAllocator>(
+        &self,
+        allocator: &'b B,
+    ) -> io::Result<BStackOwnedSlice<'b, B>> {
+        let bytes = self.read()?;
+        let mut dest = allocator.alloc(self.len())?;
+        if let Err(e) = dest.as_slice_mut().copy_from_slice(&bytes) {
+            let _ = allocator.dealloc(dest);
+            return Err(e);
+        }
+        Ok(dest)
+    }
+
+    /// Like [`to_owned_in`](Self::to_owned_in), but skips the destination's
+    /// zero-fill via [`alloc_uninit`](super::BStackUninitAllocator::alloc_uninit).
+    ///
+    /// The fresh region is fully overwritten by the copy, so the zero-fill `alloc`
+    /// would perform is pure waste here.
+    ///
+    /// # Errors
+    ///
+    /// As [`to_owned_in`](Self::to_owned_in).
+    #[cfg(feature = "set")]
+    fn to_owned_uninit_in<'b, B>(&self, allocator: &'b B) -> io::Result<BStackOwnedSlice<'b, B>>
+    where
+        B: super::BStackUninitAllocator + super::BStackOwnedSliceAllocator,
+    {
+        let bytes = self.read()?;
+        let mut dest = allocator.alloc_uninit(self.len())?;
+        if let Err(e) = dest.as_slice_mut().copy_from_slice(&bytes) {
+            let _ = allocator.dealloc(dest);
+            return Err(e);
+        }
+        Ok(dest)
+    }
 }
 
 /// Atomic decode → mutate → encode → write for the length-preserving update methods.
@@ -816,6 +869,24 @@ where
         let n = n.min(len);
         self.subview(len - n, len)
     }
+
+    /// Split into `[0, mid)` and `[mid, len)`. Parity with [`BStackSlice::split_at`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if `mid > len()`.
+    #[inline]
+    fn split_at(
+        &self,
+        mid: u64,
+    ) -> (
+        impl BStackGuardedSliceSubview<'a, A> + '_,
+        impl BStackGuardedSliceSubview<'a, A> + '_,
+    ) {
+        let len = self.len();
+        assert!(mid <= len, "split_at: mid must be <= slice length");
+        (self.subview(0, mid), self.subview(mid, len))
+    }
 }
 
 /// Marker trait for [`BStackGuardedSliceSubview`] implementations that also
@@ -1011,6 +1082,75 @@ mod tests {
         // clamps to len
         assert_eq!(g.head(99).read().unwrap(), b"abcdefgh");
         assert_eq!(g.tail(99).read().unwrap(), b"abcdefgh");
+    }
+
+    #[test]
+    fn subview_split_at() {
+        let (stack, _c) = mk_stack();
+        stack.push(b"abcdefgh").unwrap();
+        let g = Pass(region(&stack, 0, 8));
+        let (head, tail) = g.split_at(3);
+        assert_eq!(head.read().unwrap(), b"abc");
+        assert_eq!(tail.read().unwrap(), b"defgh");
+        // the degenerate ends
+        let (empty, whole) = g.split_at(0);
+        assert_eq!(empty.len(), 0);
+        assert_eq!(whole.read().unwrap(), b"abcdefgh");
+        let (whole, empty) = g.split_at(8);
+        assert_eq!(whole.read().unwrap(), b"abcdefgh");
+        assert_eq!(empty.len(), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "split_at: mid must be <= slice length")]
+    fn subview_split_at_out_of_bounds() {
+        let (stack, _c) = mk_stack();
+        stack.push(b"abcd").unwrap();
+        let g = Pass(region(&stack, 0, 4));
+        let _ = g.split_at(5);
+    }
+
+    /// `to_owned_in` exports the *decoded* bytes, and — unlike
+    /// `BStackSlice::to_owned_in` — may target a different `BStack`.
+    #[cfg(feature = "set")]
+    #[test]
+    fn to_owned_in_copies_decoded_bytes() {
+        use crate::BStackAllocator;
+        let (stack, _c) = mk_stack();
+        let key = 0x5A;
+        let plain = b"secret payload!!";
+        let cipher: Vec<u8> = plain.iter().map(|b| b ^ key).collect();
+        stack.push(&cipher).unwrap();
+        let g = Xor {
+            slice: region(&stack, 0, plain.len() as u64),
+            key,
+        };
+
+        let (dest, _c2) = mk_stack();
+        let alloc = LinearBStackAllocator::new(dest);
+        let owned = g.to_owned_in(&alloc).unwrap();
+        assert_eq!(owned.len(), plain.len() as u64);
+        assert_eq!(owned.as_slice().read().unwrap(), plain);
+        // the source is untouched and still ciphertext
+        assert_eq!(
+            region(&stack, 0, plain.len() as u64).read().unwrap(),
+            cipher
+        );
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn to_owned_uninit_in_matches_to_owned_in() {
+        use crate::{BStackAllocator, FirstFitBStackAllocator};
+        let (stack, _c) = mk_stack();
+        stack.push(b"abcdefgh").unwrap();
+        let g = Pass(region(&stack, 0, 8));
+
+        let (dest, _c2) = mk_stack();
+        let alloc = FirstFitBStackAllocator::new(dest).unwrap();
+        let owned = g.to_owned_uninit_in(&alloc).unwrap();
+        assert_eq!(owned.as_slice().read().unwrap(), b"abcdefgh");
+        alloc.dealloc(owned).map_err(|e| e.source).unwrap();
     }
 
     #[test]
