@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`Debug` for `BStackReader` (base API, Rust only).** `BStackSliceReader` and `BStackSliceWriter` already implemented it, so a struct holding a plain `BStackReader` could not itself derive `Debug`. Prints `position` and the stack's `len` (as `Option`, `None` when the length cannot be read), matching `BStack`'s own `Debug`. Backported from the 0.4.x line.
+- **`Display` for `BStackSlice`, `BStackReader`, `BStackSliceReader` and `BStackSliceWriter` (`alloc` for all but `BStackReader`; `set` for `BStackSliceWriter`; Rust only).** A compact one-line form for log and error messages, where `Debug`'s struct rendering is too noisy: `start..end` for a slice, `start..end@cursor` for the slice reader/writer (cursor relative to the slice, as `position` reports it), and `@position` for `BStackReader`. `Display` is deliberately not provided for `BStack`, the allocators, or the iterators, which have no canonical text form. Backported from the 0.4.x line.
+
 ## [0.2.7] - 2026-09-02
 
 ### Added
