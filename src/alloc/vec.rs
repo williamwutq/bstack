@@ -5,6 +5,7 @@
 use super::{BStackSlice, BStackSliceAllocator};
 use std::fmt;
 use std::io;
+#[cfg(feature = "atomic")]
 use std::ops::Range;
 
 /// Byte offset of the first element within the block (past the 16-byte header).
