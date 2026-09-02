@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.7] - 2026-09-02
+
 ### Added
 
 - **`BStackSlice::cas_on`/`cas_on_ne`/`cas_on_masked`/`process` (Rust, `alloc` + `set` + `atomic`) / `bstack_slice_cas_on`/`cas_on_ne`/`cas_on_masked`/`process` (C, `BSTACK_FEATURE_SET` + `BSTACK_FEATURE_ATOMIC`).** `cas_on(guard, expected, new_bytes)` is one crash-atomic `BStack::eq_crds`/`bstack_eq_crds` call: if `guard`'s bytes equal `expected`, the slice is overwritten with `new_bytes` and the prior contents returned (Rust: `Option<Vec<u8>>`; C: an `old_buf` buffer plus `int *ok` flag, matching the existing CRDS convention). `cas_on_ne`/`cas_on_masked` wrap `ne_crds`/`masked_eq_crds` the same way. `guard` may be any view into the same `BStack`/`bstack_t`, including the slice itself. Each rejects a `guard` backed by a different `BStack`/`bstack_t`, or a length mismatch against `guard`/self, with `io::ErrorKind::InvalidInput`/`errno = EINVAL`. `process(f)`/`bstack_slice_process` is one crash-atomic `BStack::process`/`bstack_process` call, exposing for arbitrary transforms the length-preserving primitive `reverse`/`rotate_left`/`rotate_right` already use. Backported from the 0.4.x line.
