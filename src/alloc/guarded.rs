@@ -13,6 +13,20 @@
 //! `BStackGuardedSlice<'a, A>` for any allocator `A` without coupling the trait
 //! to a single concrete allocator.
 //!
+//! # Borrow semantics
+//!
+//! A guard sits at the same semantic position as [`BStackSlice`]: a **borrowed
+//! I/O view** that owns no region, carries no allocator handle, and frees nothing
+//! on `Drop`. It binds only to a [`BStackSlice`], so it inherits the crate's
+//! on-disk borrow soundness by composition rather than defining rules of its own.
+//! A guard cannot hold a still-freeable region — [`BStackOwnedSlice`](crate::BStackOwnedSlice)
+//! exposes only `&self`-scoped views with no safe path to a `'a`-lifetime slice,
+//! and `dealloc`/`realloc` consume the owning handle by value — so a guard built
+//! in safe code can neither free a region nor observe one freed out from under it.
+//! Only `unsafe` (the [`raw_block`] you implement, or
+//! [`BStackSlice::from_raw_parts`]) can break that, exactly as for a bare
+//! [`BStackSlice`].
+//!
 //! [`as_slice`]: BStackGuardedSlice::as_slice
 //! [`raw_block`]: BStackGuardedSlice::raw_block
 
@@ -26,10 +40,14 @@ use std::{borrow::Cow, io};
 /// implementing struct can satisfy `BStackGuardedSlice<'a, A>` for any allocator
 /// without being locked to one concrete choice.
 ///
-/// # Required method
+/// # Required methods
 ///
-/// Implement [`as_slice`](BStackGuardedSlice::as_slice) to bind the trait to an
-/// underlying [`BStackSlice`].  All other methods have working defaults.
+/// Implement [`len`](BStackGuardedSlice::len) and the `unsafe`
+/// [`raw_block`](BStackGuardedSlice::raw_block), which binds the trait to an
+/// underlying [`BStackSlice`]; every other method has a working default.
+/// [`as_slice`](BStackGuardedSlice::as_slice) defaults to returning
+/// [`Unsupported`](std::io::ErrorKind::Unsupported) — override it to expose an
+/// apparent view when a meaningful one exists.
 ///
 /// # Hook methods
 ///
@@ -45,10 +63,27 @@ use std::{borrow::Cow, io};
 /// All four hooks default to no-ops.  `post_read` and `pre_write` return
 /// `Cow::Borrowed`, so no allocation occurs in the non-transforming path.
 ///
+/// The two offset-bearing hooks deliberately use **different** offset
+/// conventions, for compatibility with existing implementors: [`pre_read`]'s
+/// `offset` is **absolute** within the [`BStack`](crate::BStack), while
+/// [`post_write`]'s `offset` is **relative** to the start of the slice.
+///
+/// # Borrow semantics
+///
+/// A guard sits at the same semantic position as [`BStackSlice`]: a borrowed I/O
+/// view that owns no region and frees nothing on `Drop`. Because it binds only to
+/// a [`BStackSlice`] it cannot hold a still-freeable region, and so inherits the
+/// crate's on-disk borrow soundness unchanged. See the module-level
+/// documentation for the full argument.
+///
 /// # Lifetime
 ///
-/// `'a` is the allocator lifetime, matching [`BStackSlice<'a>`].
-/// All implementors must satisfy `Self: 'a` and `A: 'a`.
+/// `'a` is the allocator lifetime, matching [`BStackSlice<'a>`]. All implementors
+/// must satisfy `Self: 'a` and `A: 'a`. [`as_slice`](BStackGuardedSlice::as_slice)
+/// and [`raw_block`](BStackGuardedSlice::raw_block) hand back `BStackSlice<'a>` at
+/// that full lifetime — the borrowed-view convention shared with
+/// [`BStackSlice::subslice`], not the `&self`-scoped narrowing used by ownership
+/// handles.
 ///
 /// [`pre_read`]: BStackGuardedSlice::pre_read
 /// [`post_read`]: BStackGuardedSlice::post_read
@@ -103,9 +138,11 @@ where
 
     /// The raw I/O block for this guarded view.
     ///
-    /// Defaults to [`as_slice`](BStackGuardedSlice::as_slice).  Override when
-    /// hooks operate on a coarser granularity than the slice — for example, a
-    /// block cipher that must process aligned 16-byte blocks.
+    /// A **required** method with no default: return the [`BStackSlice`] that
+    /// hooks and I/O actually operate on. It coincides with the apparent
+    /// [`as_slice`](BStackGuardedSlice::as_slice) view unless hooks operate on a
+    /// coarser granularity than the slice — for example, a block cipher that must
+    /// process aligned 16-byte blocks.
     ///
     /// Can be used by custom subview implementations to issue reads against the full block
     /// rather than the narrowed sub-range.
@@ -163,9 +200,9 @@ where
     /// Calling this method directly is not recommended. Use `write` instead,
     /// which automatically fires the hooks and handles the necessary allocations.
     ///
-    /// `offset` is absolute offset within the [`crate::BStack`], and `len` is the length of the
-    /// original data passed to `pre_write` (not the transformed length returned by `pre_write`).
-    /// (before any `pre_write` transformation).
+    /// `offset` is **relative to the start of the slice** (`0` is the first byte
+    /// of this view), and `len` is the length of the original data passed to
+    /// `pre_write` (not the transformed length returned by `pre_write`).
     #[inline]
     fn post_write(&self, _offset: u64, _len: u64) -> io::Result<()> {
         Ok(())
@@ -173,8 +210,8 @@ where
 
     /// Read the entire slice into a newly allocated `Vec<u8>`.
     ///
-    /// Fires `pre_read(0, slice.len())`, reads raw bytes, then passes them
-    /// through `post_read`.  The transformation may change the returned length.
+    /// Fires `pre_read(slice.start(), slice.len())`, reads raw bytes, then passes
+    /// them through `post_read`.  The transformation may change the returned length.
     ///
     /// This method at maximum allocates twice the slice length (once for the
     /// raw read and once for the transformed output).

@@ -552,6 +552,10 @@ below for what this comparison does and does not mean.
 
 Deliberately **not** cross-comparable with `BStackSlice`/`BStackOwnedSlice`/`BStackRange` — a chunk view's stride is part of its identity, and comparing it directly against a bare slice would silently discard that.
 
+**`BStackGuardedSlice<'a, A>`** — lifecycle-hook I/O view for transparent interception (encryption, compression, auditing; `guarded` feature). *A trait, not a concrete handle*, so it defines no comparison or hashing traits of its own — an implementor derives those from the type it lives on.
+
+For borrow and lifetime purposes a guard sits at the **same semantic position as `BStackSlice`**: a borrowed I/O view that owns no region, carries no allocator handle, and frees nothing on drop. It binds only to a `BStackSlice`, so it cannot hold a still-freeable region and inherits the crate's on-disk borrow soundness unchanged — a guard built in safe code can neither free a region nor read one freed out from under it. Only `unsafe` breaks that, exactly as for a bare `BStackSlice`.
+
 ### `BStackSliceReader` and `BStackSliceWriter` (`alloc` / `alloc + set` features)
 
 | Trait                | Semantics                                                                            |
