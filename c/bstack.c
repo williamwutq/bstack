@@ -132,7 +132,7 @@ static void win_set_errno(void)
  * yet on macOS F_FULLFSYNC otherwise dominates runtime (minutes -> seconds).
  * The define is never set by the default build; opt in only for test/fuzz runs.
  * UNSAFE for any build that must survive a real crash — never production. */
-static int plat_durable_sync(bstack_fd_t h)
+static inline int plat_durable_sync(bstack_fd_t h)
 {
 #ifdef BSTACK_TEST_NO_DURABLE_SYNC
     (void)h;
@@ -143,7 +143,7 @@ static int plat_durable_sync(bstack_fd_t h)
 #endif
 }
 
-static int plat_file_size(bstack_fd_t h, uint64_t *out)
+static inline int plat_file_size(bstack_fd_t h, uint64_t *out)
 {
     LARGE_INTEGER li;
     if (!GetFileSizeEx(h, &li)) { win_set_errno(); return -1; }
@@ -155,7 +155,7 @@ static int plat_file_size(bstack_fd_t h, uint64_t *out)
  * Positional write via OVERLAPPED — does not advance the file pointer.
  * The file is extended automatically if offset + count exceeds its size.
  */
-static int plat_pwrite(bstack_fd_t h, const void *buf, size_t count,
+static inline int plat_pwrite(bstack_fd_t h, const void *buf, size_t count,
                        uint64_t offset)
 {
     if (count == 0) return 0;
@@ -171,7 +171,7 @@ static int plat_pwrite(bstack_fd_t h, const void *buf, size_t count,
 }
 
 /* Positional read via OVERLAPPED — does not advance the file pointer. */
-static int plat_pread(bstack_fd_t h, void *buf, size_t count,
+static inline int plat_pread(bstack_fd_t h, void *buf, size_t count,
                       uint64_t offset)
 {
     if (count == 0) return 0;
@@ -187,7 +187,7 @@ static int plat_pread(bstack_fd_t h, void *buf, size_t count,
 }
 
 /* Truncate (or extend) the file to exactly `size` bytes. */
-static int plat_ftruncate(bstack_fd_t h, uint64_t size)
+static inline int plat_ftruncate(bstack_fd_t h, uint64_t size)
 {
     LARGE_INTEGER li;
     li.QuadPart = (LONGLONG)size;
@@ -204,7 +204,7 @@ static int plat_ftruncate(bstack_fd_t h, uint64_t size)
 
 /* No-op under BSTACK_TEST_NO_DURABLE_SYNC — see the note on the Windows
  * definition above.  Test/fuzz builds only, never production. */
-static int plat_durable_sync(bstack_fd_t fd)
+static inline int plat_durable_sync(bstack_fd_t fd)
 {
 #ifdef BSTACK_TEST_NO_DURABLE_SYNC
     (void)fd;
@@ -219,7 +219,7 @@ static int plat_durable_sync(bstack_fd_t fd)
 #endif
 }
 
-static int plat_file_size(bstack_fd_t fd, uint64_t *out)
+static inline int plat_file_size(bstack_fd_t fd, uint64_t *out)
 {
     struct stat st;
     if (fstat(fd, &st) != 0) return -1;
@@ -227,7 +227,7 @@ static int plat_file_size(bstack_fd_t fd, uint64_t *out)
     return 0;
 }
 
-static int plat_pwrite(bstack_fd_t fd, const void *buf, size_t count,
+static inline int plat_pwrite(bstack_fd_t fd, const void *buf, size_t count,
                        uint64_t offset)
 {
     if (count == 0) return 0;
@@ -237,7 +237,7 @@ static int plat_pwrite(bstack_fd_t fd, const void *buf, size_t count,
     return 0;
 }
 
-static int plat_pread(bstack_fd_t fd, void *buf, size_t count,
+static inline int plat_pread(bstack_fd_t fd, void *buf, size_t count,
                       uint64_t offset)
 {
     if (count == 0) return 0;
@@ -247,7 +247,7 @@ static int plat_pread(bstack_fd_t fd, void *buf, size_t count,
     return 0;
 }
 
-static int plat_ftruncate(bstack_fd_t fd, uint64_t size)
+static inline int plat_ftruncate(bstack_fd_t fd, uint64_t size)
 {
     return ftruncate(fd, (off_t)size);
 }
@@ -258,7 +258,7 @@ static int plat_ftruncate(bstack_fd_t fd, uint64_t size)
  * Close helper (releases advisory lock on both platforms)
  * ---------------------------------------------------------------------- */
 
-static void close_fd(bstack_fd_t fd)
+static inline void close_fd(bstack_fd_t fd)
 {
 #ifdef _WIN32
     CloseHandle(fd);
@@ -295,7 +295,7 @@ static void close_fd(bstack_fd_t fd)
  * Returns 1 for n == 0.
  * Returns 0 on overflow (input > 2^63; next power of two would be 2^64).
  * Callers must treat a 0 return as an error (ENOMEM / EINVAL). */
-static uint64_t next_pow2_u64(uint64_t n)
+static inline uint64_t next_pow2_u64(uint64_t n)
 {
     if (n == 0) return 1;
     n--;
@@ -314,7 +314,7 @@ static uint64_t next_pow2_u64(uint64_t n)
  * Little-endian helpers (positional — no cursor side-effects)
  * ---------------------------------------------------------------------- */
 
-static int write_le64(bstack_fd_t fd, uint64_t file_offset, uint64_t val)
+static inline int write_le64(bstack_fd_t fd, uint64_t file_offset, uint64_t val)
 {
     uint8_t buf[8];
     for (int i = 0; i < 8; i++)
@@ -328,7 +328,7 @@ static int write_le64(bstack_fd_t fd, uint64_t file_offset, uint64_t val)
 
 /* Overwrite the committed-length field at file offset 8 and update the
  * in-memory cache (*clen) to match. */
-static int write_committed_len(bstack_fd_t fd, uint64_t *clen, uint64_t len)
+static inline int write_committed_len(bstack_fd_t fd, uint64_t *clen, uint64_t len)
 {
     if (write_le64(fd, 8, len) != 0)
         return -1;
@@ -336,7 +336,7 @@ static int write_committed_len(bstack_fd_t fd, uint64_t *clen, uint64_t len)
     return 0;
 }
 
-static int init_header(bstack_fd_t fd)
+static inline int init_header(bstack_fd_t fd)
 {
     uint8_t hdr[16];
     memcpy(hdr, MAGIC, 8);
@@ -368,7 +368,7 @@ static int read_header(bstack_fd_t fd, uint64_t *out_clen)
  * File size helper
  * ---------------------------------------------------------------------- */
 
-static int file_size(bstack_fd_t fd, uint64_t *out)
+static inline int file_size(bstack_fd_t fd, uint64_t *out)
 {
     return plat_file_size(fd, out);
 }
@@ -2753,7 +2753,7 @@ static int crds_compare_a_masked(bstack_fd_t fd,
  * When matched == 1, reads b_len bytes at b_offset into b_old_buf, writes
  * b_new_buf, and syncs.  Caller holds the write lock.
  * Returns 0 on success, -1 on I/O error. */
-static int crds_do_swap(bstack_fd_t fd,
+static inline int crds_do_swap(bstack_fd_t fd,
                         uint64_t b_offset, uint8_t *b_old_buf,
                         const uint8_t *b_new_buf, size_t b_len)
 {

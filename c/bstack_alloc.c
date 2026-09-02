@@ -435,7 +435,7 @@ int bstack_guarded_slice_subslice(bstack_guarded_slice_t gs,
 #ifdef BSTACK_FEATURE_SET
 
 /* Clip n to cap after a pre_write hook may have changed it. */
-static size_t guard_clip(size_t n, uint64_t cap)
+static inline size_t guard_clip(size_t n, uint64_t cap)
 {
     if (cap > (uint64_t)SIZE_MAX)
         cap = (uint64_t)SIZE_MAX;
@@ -2267,7 +2267,7 @@ static inline uint64_t algt_align_up_ptr(uint64_t ptr)
 
 /* ---- root I/O ---------------------------------------------------------- */
 
-static int algt_read_root(bstack_t *bs, uint64_t *out)
+static inline int algt_read_root(bstack_t *bs, uint64_t *out)
 {
     uint8_t buf[8];
     if (bstack_get(bs, ALGT_ROOT_OFFSET, ALGT_ROOT_OFFSET + 8, buf) != 0)
@@ -2276,7 +2276,7 @@ static int algt_read_root(bstack_t *bs, uint64_t *out)
     return 0;
 }
 
-static int algt_write_root(bstack_t *bs, uint64_t root)
+static inline int algt_write_root(bstack_t *bs, uint64_t root)
 {
     uint8_t buf[8];
     write_le64(buf, root);
@@ -2377,7 +2377,7 @@ static int algt_avl_write_h(bstack_t *bs, uint64_t ptr, uint64_t size,
 
 /* Write (size, left, right) to ptr, reading both child heights.  Thin wrapper
  * over algt_avl_write_h.  Sets *out_bf if non-NULL.  Returns 0/-1. */
-static int algt_avl_write_and_update(bstack_t *bs, uint64_t ptr,
+static inline int algt_avl_write_and_update(bstack_t *bs, uint64_t ptr,
     uint64_t size, uint64_t left, uint64_t right, int8_t *out_bf)
 {
     return algt_avl_write_h(bs, ptr, size, left, right, -1, -1, out_bf, NULL);
@@ -3605,7 +3605,7 @@ static const uint8_t alsl_magic_prefix[6] = {'A','L','S','L',0,1};
 
 /* ---- helpers ----------------------------------------------------------- */
 
-static uint64_t slab_blocks_needed(uint64_t len, uint64_t block_size)
+static inline uint64_t slab_blocks_needed(uint64_t len, uint64_t block_size)
 {
     if (len == 0) return 0;
     /* (len - 1) / block_size + 1 avoids the (len + block_size - 1) overflow.
@@ -3617,7 +3617,7 @@ static uint64_t slab_blocks_needed(uint64_t len, uint64_t block_size)
 /* free_head read/write helpers: only the non-atomic free-list paths use them;
  * the atomic paths drive free_head through process_gen / cross_exchange. */
 #ifndef BSTACK_FEATURE_ATOMIC
-static int slab_read_free_head(bstack_t *bs, uint64_t *out)
+static inline int slab_read_free_head(bstack_t *bs, uint64_t *out)
 {
     uint8_t buf[8];
     if (bstack_get(bs, SLAB_FREE_HEAD_OFFSET,
@@ -3626,7 +3626,7 @@ static int slab_read_free_head(bstack_t *bs, uint64_t *out)
     return 0;
 }
 
-static int slab_write_free_head(bstack_t *bs, uint64_t val)
+static inline int slab_write_free_head(bstack_t *bs, uint64_t val)
 {
     uint8_t buf[8];
     write_le64(buf, val);
@@ -3747,7 +3747,7 @@ static int slab_pop_free_block(bstack_t *bs, uint64_t block_size,
  * becomes the old head, in a single indivisible step.  A crash between the two
  * calls leaks block_start rather than corrupting the list.
  */
-static int slab_push_free_block(bstack_t *bs, uint64_t block_start)
+static inline int slab_push_free_block(bstack_t *bs, uint64_t block_start)
 {
     uint8_t buf[8];
     write_le64(buf, block_start); /* placeholder: replaced by old head below */
@@ -3760,7 +3760,7 @@ static int slab_push_free_block(bstack_t *bs, uint64_t block_start)
  * a crash after the first write but before the second leaks the block rather
  * than corrupting the list.
  */
-static int slab_push_free_block(bstack_t *bs, uint64_t block_start)
+static inline int slab_push_free_block(bstack_t *bs, uint64_t block_start)
 {
     uint8_t buf[8];
     uint64_t head;
@@ -4235,7 +4235,7 @@ static const uint8_t alck_magic_prefix[6] = {'A','L','C','K',0,1};
 
 /* ---- overhead I/O ------------------------------------------------------ */
 
-static int alck_read_overhead(bstack_t *bs, uint64_t block_start, uint64_t *out)
+static inline int alck_read_overhead(bstack_t *bs, uint64_t block_start, uint64_t *out)
 {
     uint8_t buf[8];
     if (bstack_get(bs, block_start, block_start + 8, buf) != 0) return -1;
@@ -4243,7 +4243,7 @@ static int alck_read_overhead(bstack_t *bs, uint64_t block_start, uint64_t *out)
     return 0;
 }
 
-static int alck_write_overhead(bstack_t *bs, uint64_t block_start, uint64_t value)
+static inline int alck_write_overhead(bstack_t *bs, uint64_t block_start, uint64_t value)
 {
     uint8_t buf[8];
     write_le64(buf, value);
@@ -4255,7 +4255,7 @@ static int alck_write_overhead(bstack_t *bs, uint64_t block_start, uint64_t valu
 /* Only the non-atomic free-list paths read/write free_head directly; the
  * atomic paths drive it through process_gen / cross_exchange. */
 #ifndef BSTACK_FEATURE_ATOMIC
-static int alck_read_free_head(bstack_t *bs, uint64_t *out)
+static inline int alck_read_free_head(bstack_t *bs, uint64_t *out)
 {
     uint8_t buf[8];
     if (bstack_get(bs, ALCK_FREE_HEAD_OFFSET,
@@ -4264,7 +4264,7 @@ static int alck_read_free_head(bstack_t *bs, uint64_t *out)
     return 0;
 }
 
-static int alck_write_free_head(bstack_t *bs, uint64_t val)
+static inline int alck_write_free_head(bstack_t *bs, uint64_t val)
 {
     uint8_t buf[8];
     write_le64(buf, val);
@@ -4278,7 +4278,7 @@ static int alck_write_free_head(bstack_t *bs, uint64_t val)
  * Number of block_size blocks required to hold len usable bytes plus the
  * 8-byte overhead prefix.
  */
-static uint64_t alck_blocks_needed(uint64_t len, uint64_t block_size)
+static inline uint64_t alck_blocks_needed(uint64_t len, uint64_t block_size)
 {
     uint64_t total;
     if (len == 0) return 0;

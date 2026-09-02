@@ -29,7 +29,7 @@ extern "C" {
  * ====================================================================== */
 
 /* Decode 8 bytes from buf[0..8) as a little-endian uint64_t. */
-static uint64_t le64_read(const uint8_t b[8])
+static inline uint64_t le64_read(const uint8_t b[8])
 {
     int i;
     uint64_t v = 0;
@@ -39,7 +39,7 @@ static uint64_t le64_read(const uint8_t b[8])
 }
 
 /* Encode val as 8 little-endian bytes into buf[0..8). */
-static void le64_write(uint8_t b[8], uint64_t val)
+static inline void le64_write(uint8_t b[8], uint64_t val)
 {
     int i;
     for (i = 0; i < 8; i++)
@@ -47,7 +47,7 @@ static void le64_write(uint8_t b[8], uint64_t val)
 }
 
 /* Re-read (len, cap) from the 16-byte block header. */
-static int bytevec_read_header(const bstack_bytevec_t *v,
+static inline int bytevec_read_header(const bstack_bytevec_t *v,
                                 uint64_t *out_len, uint64_t *out_cap)
 {
     uint8_t hdr[16];
@@ -59,7 +59,7 @@ static int bytevec_read_header(const bstack_bytevec_t *v,
 }
 
 /* Write the len field (bytes 0..8) of the header. */
-static int bytevec_write_len(const bstack_bytevec_t *v, uint64_t len)
+static inline int bytevec_write_len(const bstack_bytevec_t *v, uint64_t len)
 {
     uint8_t b[8];
     le64_write(b, len);
@@ -67,7 +67,7 @@ static int bytevec_write_len(const bstack_bytevec_t *v, uint64_t len)
 }
 
 /* Write the cap field (bytes 8..16) of the header. */
-static int bytevec_write_cap(const bstack_bytevec_t *v, uint64_t cap)
+static inline int bytevec_write_cap(const bstack_bytevec_t *v, uint64_t cap)
 {
     uint8_t b[8];
     le64_write(b, cap);
@@ -75,7 +75,7 @@ static int bytevec_write_cap(const bstack_bytevec_t *v, uint64_t cap)
 }
 
 /* Write both len and cap in a single 16-byte write. */
-static int bytevec_write_header(const bstack_bytevec_t *v,
+static inline int bytevec_write_header(const bstack_bytevec_t *v,
                                   uint64_t len, uint64_t cap)
 {
     uint8_t hdr[16];
@@ -85,7 +85,7 @@ static int bytevec_write_header(const bstack_bytevec_t *v,
 }
 
 /* Saturating double of cap, used for growth decisions. */
-static uint64_t sat_double(uint64_t cap)
+static inline uint64_t sat_double(uint64_t cap)
 {
     return (cap >= UINT64_MAX / 2) ? UINT64_MAX : cap * 2;
 }
@@ -97,7 +97,7 @@ static uint64_t sat_double(uint64_t cap)
  * index.  Must be recomputed after any reallocation since the block's start
  * may move.
  */
-static uint64_t bytevec_abs_offset(const bstack_bytevec_t *v, uint64_t index)
+static inline uint64_t bytevec_abs_offset(const bstack_bytevec_t *v, uint64_t index)
 {
     return bstack_slice_start(v->slice) + BYTEVEC_HEADER_LEN + index;
 }
