@@ -395,3 +395,51 @@ The flag is named for it. On a protected stack every checked call pays a relaxed
 
 - **Named modes or an axis triple.** A `{ read, write, truncate }` triple of authorities is more expressive and no larger, at the cost of admitting nonsense (`read: none, write: any`). The enum is proposed because the curated eight are what callers want and a one-byte discriminant keeps the table compact.
 - **What an allocator may do inside a `Prot` range.** Incomparability settles one direction — a guard holder cannot reach an `Alloc` range — but not the other. A caller may mark its own allocation `Prot` and then free it, leaving a mode over bytes the allocator is about to hand to someone else. Either `dealloc` resets the reclaimed range to `All`, which means an allocator overriding a mode it otherwise cannot touch, or the protection outlives the allocation and poisons the block for its next owner.
+
+---
+
+## `BStackGuardedUnit` and `BStackGuardedBuilder` — composable transform units for `guarded` (0.5.0)
+
+**Feature flag:** `guarded`.
+**Breaking change:** No
+
+### Motivation
+
+The whole-block codec model (`decode`/`encode`) already makes layering transforms — compress-then-encrypt, checksum-then-encode — a plain function composition: `decode = inner.decode ∘ outer.decode`, `encode = outer.encode ∘ inner.encode`. It works today with no new API: an implementor writes a guard whose `decode`/`encode` chain the layers by hand. That manual pattern is enough — this entry is convenience, not a missing capability.
+
+What it removes is repetition. Every downstream that stacks transforms hand-rolls a bespoke guard, re-deriving the composition order each time and, in the naive form, allocating a fresh buffer at every layer.
+
+A "middle" layer is not a guard: it binds no storage (`len`/`raw_block`) and has no side hooks — it is only a transform. Composition therefore operates on the transform half alone, over one shared storage binding. Making that first-class means naming the transform as its own unit and giving a builder that stacks units and attaches the result to a `BStackSlice`.
+
+### Design
+
+A **unit** is a single storage-agnostic transform — an `encode`/`decode` pair, with no `len`/`raw_block`/hooks:
+
+```rust
+pub trait BStackGuardedUnit {
+    /// inner (toward storage) bytes -> outer (toward caller) bytes
+    fn decode<'d>(&self, data: &'d [u8]) -> io::Result<Cow<'d, [u8]>>;
+    /// outer bytes -> inner bytes
+    fn encode<'d>(&self, data: &'d [u8]) -> io::Result<Cow<'d, [u8]>>;
+}
+```
+
+A **builder** accumulates units from storage outward and binds them to a slice. It is monadic — each `then` returns a new builder carrying one more layer — so a pipeline reads in storage-to-caller order and the composition order stays implicit:
+
+```rust
+let guard = BStackGuardedBuilder::over(slice) // innermost = closest to storage
+    .then(Encrypt::new(key))                  // raw <-> compressed
+    .then(Compress::default())                // compressed <-> plaintext
+    .build();                                 // : impl BStackGuardedSlice
+// guard.decode = Compress.decode ∘ Encrypt.decode
+// guard.encode = Encrypt.encode ∘ Compress.encode
+```
+
+`build()` yields a `BStackGuardedSlice` whose `len`/`raw_block` come from the bound slice, whose `decode`/`encode` fold the units in the two opposite orders, and whose `on_read`/`on_write` fire once for the whole stack.
+
+### Open questions
+
+- **Allocation between layers.** The naive fold allocates a `Vec` per unit (each `Cow::Owned`). Users that care run the layers through a reused scratch/ring buffer instead. The builder should offer a buffer-reusing fold — a scratch pair the fold ping-pongs between, or an in-place unit variant — without forcing every unit author to manage buffers. A length-changing unit (compression) complicates a fixed scratch.
+- **Static vs dynamic stacks.** A tuple/HList builder monomorphizes and inlines the fold with zero per-layer dispatch but fixes the layer count at the type level; a `Vec<Box<dyn BStackGuardedUnit>>` allows runtime-assembled pipelines at the cost of a virtual call and a heap indirection per layer. Pick the static form as the default and let a `Box<dyn>` unit holding a `Vec` cover the dynamic case, or offer both.
+- **Length bookkeeping.** For a length-changing stack `len()` (apparent) must be derived, and the atomic in-place methods (`write_range`/`process`/…) do not apply — they require `encode` to preserve the raw block length. The builder should surface whether the composed stack is length-preserving, so those methods are available exactly when every unit is.
+- **Relationship to the deprecation question.** If `BStackTransaction` subsumes cross-boundary atomicity and `guarded` is reduced to byte transformation (see "`guarded` semantics under `BStackTransaction`"), the unit/builder *is* that reduced core — the transform surface without the storage/atomicity trait machinery. These entries should be resolved together.
