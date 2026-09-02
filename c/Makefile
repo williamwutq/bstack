@@ -82,6 +82,14 @@ LIB_BYTEVEC_SET = libbstack-bytevec-set.a
 TEST_BV_BIN     = test_bstack_bytevec$(EXE_EXT)
 TEST_BV_OBJ     = test_bstack_bytevec.o
 
+# ByteVec compiled with SET+ATOMIC — adds the atomic byte-mover surface
+# (extend_from_within, insert, remove, swap_remove, split_off, drain, ...) built
+# on bstack_copy / bstack_cross_exchange.
+OBJ_BYTEVEC_ATOMIC     = bstack_bytevec-atomic.o
+LIB_BYTEVEC_SET_ATOMIC = libbstack-bytevec-set-atomic.a
+TEST_BV_ATOMIC_OBJ     = test_bstack_bytevec-atomic.o
+TEST_BV_ATOMIC_BIN     = test_bstack_bytevec-atomic$(EXE_EXT)
+
 EXAMPLE_NAMES    = basic buffer_reuse journal reading vec_store
 EXAMPLE_BINS     = $(addprefix ../examples/,$(addsuffix $(EXE_EXT),$(EXAMPLE_NAMES)))
 HASHMAP_BIN      = ../examples/hashmap$(EXE_EXT)
@@ -91,7 +99,7 @@ LINKED_LIST_BIN        = ../examples/linked_list$(EXE_EXT)
 CHECKSUMMED_CACHE_BIN  = ../examples/checksummed_cache$(EXE_EXT)
 ATOMIC_LINKED_LIST_BIN = ../examples/atomic_linked_list$(EXE_EXT)
 
-.PHONY: all test test-set test-atomic test-set-atomic test-first-fit test-first-fit-atomic test-ghost-tree test-ghost-tree-atomic test-slab test-slab-atomic test-checked-slab test-checked-slab-atomic test-bytevec leaks clean alloc \
+.PHONY: all test test-set test-atomic test-set-atomic test-first-fit test-first-fit-atomic test-ghost-tree test-ghost-tree-atomic test-slab test-slab-atomic test-checked-slab test-checked-slab-atomic test-bytevec test-bytevec-atomic leaks clean alloc \
         example example-basic example-buffer_reuse example-journal \
         example-reading example-vec_store example-hashmap example-atomic_ops example-move_and_cow \
         example-linked_list example-checksummed_cache example-atomic_linked_list
@@ -231,6 +239,19 @@ $(TEST_BV_BIN): $(TEST_BV_OBJ) $(LIB_BYTEVEC_SET)
 test-bytevec: $(TEST_BV_BIN)
 	$(RUN)$(TEST_BV_BIN)
 
+$(OBJ_BYTEVEC_ATOMIC): bstack_bytevec.c bstack_bytevec.h bstack_alloc.h bstack.h
+	$(CC) $(CFLAGS) -DBSTACK_FEATURE_SET -DBSTACK_FEATURE_ATOMIC -c -o $@ $<
+
+$(LIB_BYTEVEC_SET_ATOMIC): $(OBJ_SET_ATOMIC) $(OBJ_ALLOC_SET_ATOMIC) $(OBJ_BYTEVEC_ATOMIC)
+	ar rcs $@ $^
+
+# Same bytevec test compiled against the SET+ATOMIC bytevec lib, exercising the
+# atomic byte-mover surface guarded by BSTACK_FEATURE_ATOMIC.
+test-bytevec-atomic: $(LIB_BYTEVEC_SET_ATOMIC)
+	$(CC) $(CFLAGS) -DBSTACK_FEATURE_SET -DBSTACK_FEATURE_ATOMIC -c -o $(TEST_BV_ATOMIC_OBJ) test_bstack_bytevec.c
+	$(CC) $(CFLAGS) -DBSTACK_FEATURE_SET -DBSTACK_FEATURE_ATOMIC -o $(TEST_BV_ATOMIC_BIN) $(TEST_BV_ATOMIC_OBJ) -L. -lbstack-bytevec-set-atomic -lpthread
+	$(RUN)$(TEST_BV_ATOMIC_BIN)
+
 # Run tests with the set feature enabled.
 test-set: $(LIB_SET)
 	$(CC) $(CFLAGS) -DBSTACK_FEATURE_SET -c -o $(TEST_OBJ) test_bstack.c
@@ -359,4 +380,6 @@ clean:
 	      $(TEST_CSL_OBJ) $(TEST_CSL_BIN) \
 	      $(TEST_CSL_ATOMIC_OBJ) $(TEST_CSL_ATOMIC_BIN) \
 	      $(OBJ_BYTEVEC) $(LIB_BYTEVEC_SET) $(TEST_BV_OBJ) $(TEST_BV_BIN) \
+	      $(OBJ_BYTEVEC_ATOMIC) $(LIB_BYTEVEC_SET_ATOMIC) \
+	      $(TEST_BV_ATOMIC_OBJ) $(TEST_BV_ATOMIC_BIN) \
 	      $(EXAMPLE_BINS) $(HASHMAP_BIN) $(ATOMIC_BIN) $(MOVE_COW_BIN) $(LINKED_LIST_BIN) $(CHECKSUMMED_CACHE_BIN) $(ATOMIC_LINKED_LIST_BIN)

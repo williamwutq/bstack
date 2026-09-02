@@ -91,6 +91,18 @@ static uint64_t sat_double(uint64_t cap)
 }
 
 /*
+ * Absolute payload offset of logical byte index within the backing bstack,
+ * i.e. the coordinate accepted by bstack_copy, bstack_cross_exchange and
+ * bstack_repeat.  Equal to the block start plus the 16-byte header plus
+ * index.  Must be recomputed after any reallocation since the block's start
+ * may move.
+ */
+static uint64_t bytevec_abs_offset(const bstack_bytevec_t *v, uint64_t index)
+{
+    return bstack_slice_start(v->slice) + BYTEVEC_HEADER_LEN + index;
+}
+
+/*
  * Reallocate the block to hold new_cap bytes of data (total block size is
  * BYTEVEC_HEADER_LEN + new_cap).  Updates v->slice on success.
  */
@@ -399,6 +411,383 @@ int bstack_bytevec_resize(bstack_bytevec_t *v, uint64_t new_len, uint8_t value)
         return -1;
     return bytevec_write_len(v, new_len);
 }
+
+int bstack_bytevec_set(bstack_bytevec_t *v, uint64_t index, uint8_t value,
+                        int *out_ok)
+{
+    uint64_t len, cap;
+
+    if (bytevec_read_header(v, &len, &cap) != 0)
+        return -1;
+    if (index >= len) {
+        *out_ok = 0;
+        return 0;
+    }
+    if (bstack_slice_write_range(v->slice, bytevec_elem_offset(index),
+                                  &value, 1) != 0)
+        return -1;
+    *out_ok = 1;
+    return 0;
+}
+
+int bstack_bytevec_fill(bstack_bytevec_t *v, uint8_t value)
+{
+    uint64_t len, cap;
+
+    if (bytevec_read_header(v, &len, &cap) != 0)
+        return -1;
+    if (len == 0)
+        return 0;
+    return bstack_repeat(bstack_allocator_stack(v->slice.allocator),
+                         bytevec_abs_offset(v, 0), &value, 1, len);
+}
+
+/* =========================================================================
+ * Atomic byte-mover operations
+ * ====================================================================== */
+
+#ifdef BSTACK_FEATURE_ATOMIC
+
+int bstack_bytevec_extend_from_within(bstack_bytevec_t *v, uint64_t start,
+                                       uint64_t count, int *out_ok)
+{
+    uint64_t len, cap;
+    bstack_t *stack;
+
+    if (count == 0) {
+        *out_ok = 1;
+        return 0;
+    }
+    if (bytevec_read_header(v, &len, &cap) != 0)
+        return -1;
+    /* Out of bounds (overflow or past len) → not ok, per the get()-style contract. */
+    if (count > UINT64_MAX - start || start + count > len) {
+        *out_ok = 0;
+        return 0;
+    }
+    if (bstack_bytevec_reserve(v, count) != 0)
+        return -1;
+    /* Recompute offsets after reserve: a realloc may have moved the block. */
+    stack = bstack_allocator_stack(v->slice.allocator);
+    if (bstack_copy(stack, bytevec_abs_offset(v, start),
+                    bytevec_abs_offset(v, len), count) != 0)
+        return -1;
+    if (bytevec_write_len(v, len + count) != 0)
+        return -1;
+    *out_ok = 1;
+    return 0;
+}
+
+int bstack_bytevec_extend_from_bstack_slice(bstack_bytevec_t *v,
+                                             bstack_slice_t src)
+{
+    uint64_t len, cap, n;
+    bstack_t *stack = bstack_allocator_stack(v->slice.allocator);
+
+    if (bstack_allocator_stack(src.allocator) != stack) {
+        errno = EINVAL;
+        return -1;
+    }
+    n = bstack_slice_len(src);
+    if (n == 0)
+        return 0;
+    if (bytevec_read_header(v, &len, &cap) != 0)
+        return -1;
+    if (bstack_bytevec_reserve(v, n) != 0)
+        return -1;
+    if (bstack_copy(stack, bstack_slice_start(src),
+                    bytevec_abs_offset(v, len), n) != 0)
+        return -1;
+    return bytevec_write_len(v, len + n);
+}
+
+int bstack_bytevec_append_from_owned(bstack_bytevec_t *v, bstack_slice_t other)
+{
+    uint64_t len, cap, n;
+    bstack_t *stack = bstack_allocator_stack(v->slice.allocator);
+    int appended = 0;
+    int saved_errno = 0;
+    int freed;
+
+    if (bstack_allocator_stack(other.allocator) != stack) {
+        /* Foreign BStack (a misuse).  Free other through its own allocator so
+         * the call is not a leak; if that free itself fails, surface its I/O
+         * error, otherwise report EINVAL.  Either way other is consumed. */
+        if (bstack_allocator_dealloc(other.allocator, other) != 0)
+            return -1;
+        errno = EINVAL;
+        return -1;
+    }
+    /* Append first, capturing any error, but always fall through to the free so
+     * other is never leaked on an append failure. */
+    n = bstack_slice_len(other);
+    if (n > 0) {
+        if (bytevec_read_header(v, &len, &cap) != 0 ||
+            bstack_bytevec_reserve(v, n) != 0 ||
+            bstack_copy(stack, bstack_slice_start(other),
+                        bytevec_abs_offset(v, len), n) != 0 ||
+            bytevec_write_len(v, len + n) != 0) {
+            appended = -1;
+            saved_errno = errno;
+        }
+    }
+    freed = bstack_allocator_dealloc(other.allocator, other);
+    if (appended != 0) {
+        errno = saved_errno; /* prefer the append error over any dealloc error */
+        return -1;
+    }
+    if (freed != 0)
+        return -1;
+    return 0;
+}
+
+int bstack_bytevec_insert(bstack_bytevec_t *v, uint64_t index, uint8_t value,
+                           int *out_ok)
+{
+    uint64_t len, cap;
+    bstack_t *stack;
+
+    if (bytevec_read_header(v, &len, &cap) != 0)
+        return -1;
+    if (index > len) {
+        *out_ok = 0;
+        return 0;
+    }
+    if (bstack_bytevec_reserve(v, 1) != 0)
+        return -1;
+    stack = bstack_allocator_stack(v->slice.allocator);
+    if (index < len) {
+        uint64_t n = len - index;
+        if (bstack_copy(stack, bytevec_abs_offset(v, index),
+                        bytevec_abs_offset(v, index + 1), n) != 0)
+            return -1;
+    }
+    if (bstack_slice_write_range(v->slice, bytevec_elem_offset(index),
+                                  &value, 1) != 0)
+        return -1;
+    if (bytevec_write_len(v, len + 1) != 0)
+        return -1;
+    *out_ok = 1;
+    return 0;
+}
+
+int bstack_bytevec_remove(bstack_bytevec_t *v, uint64_t index,
+                           uint8_t *out_byte, int *out_ok)
+{
+    uint64_t len, cap, tail;
+    uint8_t  value;
+
+    if (bytevec_read_header(v, &len, &cap) != 0)
+        return -1;
+    if (index >= len) {
+        *out_ok = 0;
+        return 0;
+    }
+    if (bstack_slice_read_range_into(v->slice, bytevec_elem_offset(index),
+                                      &value, 1) != 0)
+        return -1;
+    tail = len - index - 1;
+    if (tail > 0) {
+        bstack_t *stack = bstack_allocator_stack(v->slice.allocator);
+        if (bstack_copy(stack, bytevec_abs_offset(v, index + 1),
+                        bytevec_abs_offset(v, index), tail) != 0)
+            return -1;
+    }
+    /* Commit the shorter len first, then zero the vacated tail slot, as in pop. */
+    if (bytevec_write_len(v, len - 1) != 0)
+        return -1;
+    if (bstack_slice_zero_range(v->slice, bytevec_elem_offset(len - 1), 1) != 0)
+        return -1;
+    if (out_byte) *out_byte = value;
+    *out_ok = 1;
+    return 0;
+}
+
+int bstack_bytevec_swap_remove(bstack_bytevec_t *v, uint64_t index,
+                                uint8_t *out_byte, int *out_ok)
+{
+    uint64_t len, cap, last;
+    uint8_t  value;
+
+    if (bytevec_read_header(v, &len, &cap) != 0)
+        return -1;
+    if (index >= len) {
+        *out_ok = 0;
+        return 0;
+    }
+    if (bstack_slice_read_range_into(v->slice, bytevec_elem_offset(index),
+                                      &value, 1) != 0)
+        return -1;
+    last = len - 1;
+    if (index != last) {
+        bstack_t *stack = bstack_allocator_stack(v->slice.allocator);
+        if (bstack_cross_exchange(stack, bytevec_abs_offset(v, index),
+                                  bytevec_abs_offset(v, last), 1) != 0)
+            return -1;
+    }
+    if (bytevec_write_len(v, last) != 0)
+        return -1;
+    if (bstack_slice_zero_range(v->slice, bytevec_elem_offset(last), 1) != 0)
+        return -1;
+    if (out_byte) *out_byte = value;
+    *out_ok = 1;
+    return 0;
+}
+
+int bstack_bytevec_copy_into_bstack_slice(const bstack_bytevec_t *v,
+                                          uint64_t start, bstack_slice_t dst,
+                                          int *out_ok)
+{
+    uint64_t len, cap, n;
+    bstack_t *stack = bstack_allocator_stack(v->slice.allocator);
+
+    if (bstack_allocator_stack(dst.allocator) != stack) {
+        errno = EINVAL;
+        return -1;
+    }
+    n = bstack_slice_len(dst);
+    if (n == 0) {
+        *out_ok = 1;
+        return 0;
+    }
+    if (bytevec_read_header(v, &len, &cap) != 0)
+        return -1;
+    /* Out of bounds (overflow or past len) → not ok. */
+    if (n > UINT64_MAX - start || start + n > len) {
+        *out_ok = 0;
+        return 0;
+    }
+    if (bstack_copy(stack, bytevec_abs_offset(v, start),
+                    bstack_slice_start(dst), n) != 0)
+        return -1;
+    *out_ok = 1;
+    return 0;
+}
+
+int bstack_bytevec_move_tail_into(bstack_bytevec_t *v, bstack_slice_t dest,
+                                   int *out_ok)
+{
+    uint64_t len, cap, n, start;
+    bstack_t *stack = bstack_allocator_stack(v->slice.allocator);
+
+    if (bstack_allocator_stack(dest.allocator) != stack) {
+        errno = EINVAL;
+        return -1;
+    }
+    n = bstack_slice_len(dest);
+    if (n == 0) {
+        *out_ok = 1;
+        return 0;
+    }
+    if (bytevec_read_header(v, &len, &cap) != 0)
+        return -1;
+    if (n > len) {
+        *out_ok = 0;
+        return 0;
+    }
+    start = len - n;
+    if (bstack_cross_exchange(stack, bytevec_abs_offset(v, start),
+                              bstack_slice_start(dest), n) != 0)
+        return -1;
+    if (bstack_bytevec_truncate(v, start) != 0)
+        return -1;
+    *out_ok = 1;
+    return 0;
+}
+
+int bstack_bytevec_split_off(bstack_bytevec_t *v, uint64_t at,
+                              bstack_bytevec_t *out, int *out_ok)
+{
+    uint64_t len, cap, tail_len;
+    bstack_bytevec_t tail;
+
+    if (bytevec_read_header(v, &len, &cap) != 0)
+        return -1;
+    if (at > len) {
+        *out_ok = 0;
+        return 0;
+    }
+    tail_len = len - at;
+    /* Even when tail_len is zero, allocate a real header-only tail vec. */
+    if (bstack_bytevec_with_capacity(v->slice.allocator, tail_len, &tail) != 0)
+        return -1;
+    if (tail_len > 0) {
+        bstack_t *stack = bstack_allocator_stack(v->slice.allocator);
+        if (bstack_copy(stack, bytevec_abs_offset(v, at),
+                        bytevec_abs_offset(&tail, 0), tail_len) != 0) {
+            (void)bstack_bytevec_dealloc(tail);
+            return -1;
+        }
+        if (bytevec_write_len(&tail, tail_len) != 0) {
+            (void)bstack_bytevec_dealloc(tail);
+            return -1;
+        }
+    }
+    if (bstack_bytevec_truncate(v, at) != 0) {
+        (void)bstack_bytevec_dealloc(tail);
+        return -1;
+    }
+    *out = tail;
+    *out_ok = 1;
+    return 0;
+}
+
+int bstack_bytevec_drain(bstack_bytevec_t *v, uint64_t start, uint64_t end,
+                          uint8_t **out_buf, uint64_t *out_len, int *out_ok)
+{
+    uint64_t len, cap, count, tail;
+    uint8_t *buf;
+
+    if (bytevec_read_header(v, &len, &cap) != 0)
+        return -1;
+    if (start > end || end > len) {
+        *out_ok = 0;
+        return 0;
+    }
+    count = end - start;
+    if (count == 0) {
+        *out_buf = NULL;
+        *out_len = 0;
+        *out_ok = 1;
+        return 0;
+    }
+#if UINT64_MAX > SIZE_MAX
+    if (count > (uint64_t)SIZE_MAX) {
+        errno = EINVAL;
+        return -1;
+    }
+#endif
+    buf = (uint8_t *)malloc((size_t)count);
+    if (!buf) {
+        errno = ENOMEM;
+        return -1;
+    }
+    /* Read the removed bytes out before compacting. */
+    if (bstack_slice_read_range(v->slice, bytevec_elem_offset(start),
+                                 bytevec_elem_offset(end), buf) != 0) {
+        free(buf);
+        return -1;
+    }
+    tail = len - end;
+    if (tail > 0) {
+        bstack_t *stack = bstack_allocator_stack(v->slice.allocator);
+        if (bstack_copy(stack, bytevec_abs_offset(v, end),
+                        bytevec_abs_offset(v, start), tail) != 0) {
+            free(buf);
+            return -1;
+        }
+    }
+    if (bstack_bytevec_truncate(v, len - count) != 0) {
+        free(buf);
+        return -1;
+    }
+    *out_buf = buf;
+    *out_len = count;
+    *out_ok = 1;
+    return 0;
+}
+
+#endif /* BSTACK_FEATURE_ATOMIC */
 
 /* =========================================================================
  * Deallocation
