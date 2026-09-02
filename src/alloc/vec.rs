@@ -5,6 +5,7 @@
 use super::{BStackSlice, BStackSliceAllocator};
 use std::fmt;
 use std::io;
+use std::ops::Range;
 
 /// Byte offset of the first element within the block (past the 16-byte header).
 const HEADER_LEN: u64 = 16;
@@ -579,6 +580,27 @@ impl<'a, A: BStackSliceAllocator> BStackByteVec<'a, A> {
     }
 }
 
+impl<'a, A: BStackSliceAllocator> io::Write for BStackByteVec<'a, A> {
+    /// Append `buf` via [`extend_from_slice`](Self::extend_from_slice) and
+    /// return `buf.len()`.
+    ///
+    /// Every call re-reads the 16-byte header via `read_header` and may
+    /// `realloc` to grow capacity, so `write_all` over many small chunks is
+    /// materially worse than one `extend_from_slice` call. Call
+    /// [`reserve`](Self::reserve) beforehand to avoid the repeated regrowth.
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.extend_from_slice(buf)?;
+        Ok(buf.len())
+    }
+
+    /// A no-op: every [`extend_from_slice`](Self::extend_from_slice) is
+    /// already durably synced through the underlying [`crate::BStack`] write.
+    #[inline]
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 // ── atomic bulk / positional operations (requires the `atomic` feature) ─────────
 
 /// Operations built on the crash-atomic in-file byte movers
@@ -905,6 +927,81 @@ impl<'a, A: BStackSliceAllocator> BStackByteVec<'a, A> {
         self.truncate(start)?;
         Ok(Some(()))
     }
+
+    /// Split the vec in two at `at`: `self` keeps `[0, at)` and a new vec holding
+    /// `[at, len)` is returned.
+    ///
+    /// The new vec is allocated with exactly `len - at` bytes of capacity and
+    /// the tail is transferred with a single crash-atomic [`crate::BStack::copy`]
+    /// straight between the two blocks, never passing through process memory —
+    /// this is why the method is only available under `atomic`; there is no
+    /// in-memory-copy fallback.  In-place mover: a crash after the copy but
+    /// before `self`'s `len` commit leaves the tail bytes duplicated in both
+    /// vecs — a logically torn but structurally valid state (see the
+    /// impl-level note on this block).
+    ///
+    /// Returns `Ok(None)` if `at > len` (out of bounds; `self` is unchanged) and
+    /// `Ok(Some(tail))` on success (`at == len` returns an empty tail).
+    pub fn split_off(&mut self, at: u64) -> io::Result<Option<Self>> {
+        let (len, _) = self.read_header()?;
+        if at > len {
+            return Ok(None);
+        }
+        let tail_len = len - at;
+        let alloc: &'a A = self.slice.allocator();
+        let stack = alloc.stack();
+        // Even when length is zero, allocate a new vec with a 16-byte header and zero capacity.
+        let tail = Self::with_capacity(tail_len, alloc)?;
+        if tail_len > 0 {
+            stack.copy(self.abs_offset(at), tail.abs_offset(0), tail_len)?;
+            tail.write_len_field(tail_len)?;
+        }
+        self.truncate(at)?;
+        Ok(Some(tail))
+    }
+
+    /// Remove the bytes in `range`, shifting every later byte down to close the
+    /// gap, and return the removed bytes.
+    ///
+    /// The removed bytes are read out first, the tail (if any) is shifted down
+    /// with a single crash-atomic [`crate::BStack::copy`], and the shorter `len`
+    /// is committed last.  Like [`split_off`](Self::split_off), only available
+    /// under `atomic`: there is no crash-atomic way to perform the shift
+    /// without it, and no in-memory-copy fallback is offered.
+    /// In-place mover: a crash after the shift but before the `len` commit
+    /// leaves the payload already compacted while `len` still claims the old,
+    /// larger extent — a logically torn but structurally valid state (see the
+    /// impl-level note on this block).
+    ///
+    /// Returns `Ok(None)` if `range.start > range.end` or `range.end > len`
+    /// (out of bounds; the vec is unchanged) and `Ok(Some(bytes))` with the
+    /// removed bytes on success (an empty range is a successful no-op that
+    /// returns an empty `Vec`).
+    pub fn drain(&mut self, range: Range<u64>) -> io::Result<Option<Vec<u8>>> {
+        let (len, _) = self.read_header()?;
+        if range.start > range.end || range.end > len {
+            return Ok(None);
+        }
+        let count = range.end - range.start;
+        if count == 0 {
+            return Ok(Some(Vec::new()));
+        }
+        let removed = self
+            .slice
+            .read_range(Self::byte_offset(range.start), Self::byte_offset(range.end))?;
+        let tail = len - range.end;
+        if tail > 0 {
+            let alloc: &'a A = self.slice.allocator();
+            let stack = alloc.stack();
+            stack.copy(
+                self.abs_offset(range.end),
+                self.abs_offset(range.start),
+                tail,
+            )?;
+        }
+        self.truncate(len - count)?;
+        Ok(Some(removed))
+    }
 }
 
 // ── iterator ──────────────────────────────────────────────────────────────────
@@ -1192,6 +1289,37 @@ mod tests {
         v.push(3).unwrap(); // triggers doubling
         assert!(v.capacity().unwrap() >= 4);
         assert_eq!(v.len().unwrap(), 3);
+    }
+
+    // ── io::Write ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn io_write_appends_and_returns_len() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let mut v = BStackByteVec::new(&alloc).unwrap();
+        let n = io::Write::write(&mut v, &[1u8, 2, 3]).unwrap();
+        assert_eq!(n, 3);
+        assert_eq!(v.read_bytes().unwrap(), [1u8, 2, 3]);
+    }
+
+    #[test]
+    fn io_write_write_all_appends_multiple_chunks() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let mut v = BStackByteVec::new(&alloc).unwrap();
+        io::Write::write_all(&mut v, &[1u8, 2]).unwrap();
+        io::Write::write_all(&mut v, &[3u8, 4, 5]).unwrap();
+        assert_eq!(v.read_bytes().unwrap(), [1u8, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn io_write_flush_is_noop() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let mut v = BStackByteVec::from_slice(&[7u8], &alloc).unwrap();
+        io::Write::flush(&mut v).unwrap();
+        assert_eq!(v.read_bytes().unwrap(), [7u8]);
     }
 
     // ── truncate / clear ──────────────────────────────────────────────────────
@@ -1798,5 +1926,100 @@ mod tests {
         let v = unsafe { BStackByteVec::from_raw_block(block) };
         assert_eq!(v.len().unwrap(), 3);
         assert_eq!(v.read_bytes().unwrap(), [10, 99, 20]);
+    }
+
+    // ── split_off (alloc + set + atomic) ───────────────────────────────────────
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn split_off_moves_tail_into_new_vec() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let mut v = BStackByteVec::from_slice(&[1, 2, 3, 4, 5], &alloc).unwrap();
+        let tail = v.split_off(2).unwrap().unwrap();
+        assert_eq!(v.read_bytes().unwrap(), [1, 2]);
+        assert_eq!(tail.read_bytes().unwrap(), [3, 4, 5]);
+        assert_eq!(tail.capacity().unwrap(), 3);
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn split_off_at_zero_moves_everything() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let mut v = BStackByteVec::from_slice(&[1, 2, 3], &alloc).unwrap();
+        let tail = v.split_off(0).unwrap().unwrap();
+        assert_eq!(v.read_bytes().unwrap(), Vec::<u8>::new());
+        assert_eq!(tail.read_bytes().unwrap(), [1, 2, 3]);
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn split_off_at_len_returns_empty_tail() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let mut v = BStackByteVec::from_slice(&[1, 2, 3], &alloc).unwrap();
+        let tail = v.split_off(3).unwrap().unwrap();
+        assert_eq!(v.read_bytes().unwrap(), [1, 2, 3]);
+        assert_eq!(tail.read_bytes().unwrap(), Vec::<u8>::new());
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn split_off_past_len_returns_none() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let mut v = BStackByteVec::from_slice(&[1, 2, 3], &alloc).unwrap();
+        assert!(v.split_off(4).unwrap().is_none());
+        assert_eq!(v.read_bytes().unwrap(), [1, 2, 3]);
+    }
+
+    // ── drain (alloc + set + atomic) ───────────────────────────────────────────
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn drain_removes_interior_range_and_returns_it() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let mut v = BStackByteVec::from_slice(&[1, 2, 3, 4, 5], &alloc).unwrap();
+        let removed = v.drain(1..3).unwrap().unwrap();
+        assert_eq!(removed, [2, 3]);
+        assert_eq!(v.read_bytes().unwrap(), [1, 4, 5]);
+        assert_eq!(v.len().unwrap(), 3);
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn drain_at_tail_needs_no_shift() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let mut v = BStackByteVec::from_slice(&[1, 2, 3, 4], &alloc).unwrap();
+        let removed = v.drain(2..4).unwrap().unwrap();
+        assert_eq!(removed, [3, 4]);
+        assert_eq!(v.read_bytes().unwrap(), [1, 2]);
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn drain_empty_range_is_noop() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let mut v = BStackByteVec::from_slice(&[1, 2, 3], &alloc).unwrap();
+        let removed = v.drain(1..1).unwrap().unwrap();
+        assert_eq!(removed, Vec::<u8>::new());
+        assert_eq!(v.read_bytes().unwrap(), [1, 2, 3]);
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn drain_out_of_bounds_returns_none() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let mut v = BStackByteVec::from_slice(&[1, 2, 3], &alloc).unwrap();
+        assert!(v.drain(2..4).unwrap().is_none());
+        #[allow(clippy::reversed_empty_ranges)]
+        let out_of_order = v.drain(3..2).unwrap();
+        assert!(out_of_order.is_none());
+        assert_eq!(v.read_bytes().unwrap(), [1, 2, 3]);
     }
 }
