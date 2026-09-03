@@ -55,6 +55,21 @@ mod inner {
         durable_sync, is_atomic_write, journaled_copy, journaled_exchange, journaled_move, read_at,
         write_at,
     };
+    // Extra helpers used only by the duplicated `process_gen_as` journal engine.
+    #[cfg(feature = "atomic")]
+    use crate::io_core::{commit_grow, commit_sparse_extend, commit_tail_replace};
+    #[cfg(feature = "atomic")]
+    use crate::{BStackGenOp, validate_sparse_blocks};
+    #[cfg(feature = "atomic")]
+    use std::io::Write;
+    // Helpers for the duplicated `inplace_gen_as` engine.
+    #[cfg(feature = "atomic")]
+    use crate::fault::fault_probe;
+    #[cfg(feature = "atomic")]
+    use crate::io_core::{
+        inplace_overlay_insert, inplace_overlay_read, inplace_validate_read, inplace_validate_write,
+        journaled_multi_set,
+    };
 
     /// A one-shot capability token authorizing guard-level access to a stack's
     /// protected ranges.
@@ -173,6 +188,491 @@ mod inner {
                     format!("{op:?} on [{a}, {b}) denied by access control")
                 ))
             }
+        }
+
+        /// [`process_gen`](BStack::process_gen) run under an access token: every
+        /// per-op check is evaluated as if `auth` were presented, so an allocator
+        /// can drive its own [`Alloc`](BStackAccess)-marked metadata (the free-list
+        /// head, say) through a journalled sequence without ever lifting the mark —
+        /// leaving no window in which a concurrent op could see it unprotected.
+        ///
+        /// Present [`ALLOC`](BStackAccessAuthorities::ALLOC) or an alloc token. The
+        /// body duplicates `process_gen` (kept in `lib.rs` as the tokenless engine)
+        /// rather than threading authority through the crash-atomic core; the two
+        /// must stay in sync.
+        #[cfg(feature = "atomic")]
+        pub fn process_gen_as<'a, A, F>(&self, auth: A, mut f: F) -> io::Result<()>
+        where
+            A: super::BStackAuthority,
+            F: FnMut() -> Option<BStackGenOp<'a>>,
+        {
+            let held = auth.authorities_for(self);
+            let mut guard = self.write_lock()?;
+            let (file, clen, replay) = &mut *guard;
+            let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
+            let locked = self.locked.load(Ordering::Acquire);
+            fault_point!(self, "process_gen");
+            loop {
+                match f() {
+                    Some(BStackGenOp::Read { offset, buf }) => {
+                        let end = checked_end(
+                            offset,
+                            buf.len() as u64,
+                            "process_gen: read offset + buf.len() overflows u64",
+                        )?;
+                        if end > data_size {
+                            return Err(io_error!(
+                                InvalidInput,
+                                format!(
+                                    "process_gen: read range [{offset}, {end}) exceeds payload size ({data_size})"
+                                )
+                            ));
+                        }
+                        fault_point!(self, "process_gen:read");
+                        self.acl_check(offset, end, AccessOp::Read, held)?;
+                        #[cfg(any(unix, windows))]
+                        {
+                            if end <= locked {
+                                if self.cache_enabled {
+                                    let cache = self.cache.lock().unwrap();
+                                    buf.copy_from_slice(&cache[offset as usize..end as usize]);
+                                } else {
+                                    #[cfg(unix)]
+                                    pread_exact_raw(self.fd, HEADER_SIZE + offset, buf)?;
+                                    #[cfg(windows)]
+                                    pread_exact_raw_handle(self.handle, HEADER_SIZE + offset, buf)?;
+                                }
+                            } else {
+                                pread_exact_into(file, HEADER_SIZE + offset, buf)?;
+                            }
+                        }
+                        #[cfg(not(any(unix, windows)))]
+                        {
+                            if end <= locked && self.cache_enabled {
+                                let cache = self.cache.lock().unwrap();
+                                buf.copy_from_slice(&cache[offset as usize..end as usize]);
+                            } else {
+                                read_at(file, offset, buf)?;
+                            }
+                        }
+                    }
+                    Some(BStackGenOp::Write { offset, data }) => {
+                        let end = checked_end(
+                            offset,
+                            data.len() as u64,
+                            "process_gen: write offset + data.len() overflows u64",
+                        )?;
+                        if offset < locked {
+                            return Err(io_error!(
+                                InvalidInput,
+                                format!(
+                                    "process_gen: write range [{offset}, {end}) overlaps locked region [0, {locked})"
+                                )
+                            ));
+                        }
+                        if end > data_size {
+                            return Err(io_error!(
+                                InvalidInput,
+                                format!(
+                                    "process_gen: write range [{offset}, {end}) exceeds payload size ({data_size})"
+                                )
+                            ));
+                        }
+                        self.acl_check(offset, end, AccessOp::Write, held)?;
+                        if !data.is_empty() {
+                            Self::mark_replay(replay, set_in_place(file, data_size, offset, data))?;
+                        }
+                        return Ok(());
+                    }
+                    Some(BStackGenOp::Swap {
+                        a_offset,
+                        b_offset,
+                        len,
+                    }) => {
+                        let a_end =
+                            checked_end(a_offset, len, "process_gen: a_offset + len overflows u64")?;
+                        let b_end =
+                            checked_end(b_offset, len, "process_gen: b_offset + len overflows u64")?;
+                        if len > 0 {
+                            let (lo, hi) = if a_offset < b_offset {
+                                (a_offset, b_offset)
+                            } else {
+                                (b_offset, a_offset)
+                            };
+                            if lo + len > hi {
+                                return Err(io_error!(
+                                    InvalidInput,
+                                    format!(
+                                        "process_gen: swap regions [{a_offset}, {a_end}) and [{b_offset}, {b_end}) overlap"
+                                    )
+                                ));
+                            }
+                        }
+                        if a_offset < locked {
+                            return Err(io_error!(
+                                InvalidInput,
+                                format!(
+                                    "process_gen: swap region [{a_offset}, {a_end}) overlaps locked region [0, {locked})"
+                                )
+                            ));
+                        }
+                        if b_offset < locked {
+                            return Err(io_error!(
+                                InvalidInput,
+                                format!(
+                                    "process_gen: swap region [{b_offset}, {b_end}) overlaps locked region [0, {locked})"
+                                )
+                            ));
+                        }
+                        if a_end > data_size {
+                            return Err(io_error!(
+                                InvalidInput,
+                                format!(
+                                    "process_gen: swap region [{a_offset}, {a_end}) exceeds payload size ({data_size})"
+                                )
+                            ));
+                        }
+                        if b_end > data_size {
+                            return Err(io_error!(
+                                InvalidInput,
+                                format!(
+                                    "process_gen: swap region [{b_offset}, {b_end}) exceeds payload size ({data_size})"
+                                )
+                            ));
+                        }
+                        self.acl_check(a_offset, a_end, AccessOp::Write, held)?;
+                        self.acl_check(b_offset, b_end, AccessOp::Write, held)?;
+                        if len > 0 {
+                            Self::mark_replay(
+                                replay,
+                                journaled_exchange(file, data_size, a_offset, b_offset, len),
+                            )?;
+                        }
+                        return Ok(());
+                    }
+                    Some(BStackGenOp::Push { data }) => {
+                        if !data.is_empty() {
+                            let file_end = file.seek(SeekFrom::End(0))?;
+                            let logical_offset = file_end - HEADER_SIZE;
+                            self.acl_check(
+                                logical_offset,
+                                logical_offset + data.len() as u64,
+                                AccessOp::Write,
+                                held,
+                            )?;
+                            if let Err(e) = file.write_all(data) {
+                                if file.set_len(file_end).is_err() {
+                                    *replay = true;
+                                }
+                                return Err(e);
+                            }
+                            let new_len = logical_offset + data.len() as u64;
+                            Self::mark_replay(
+                                replay,
+                                commit_grow(file, clen, new_len, logical_offset, file_end),
+                            )?;
+                        }
+                        return Ok(());
+                    }
+                    Some(BStackGenOp::Pop { buf }) => {
+                        let n = buf.len() as u64;
+                        if n > data_size {
+                            return Err(io_error!(
+                                InvalidInput,
+                                format!("process_gen: pop({n}) exceeds payload size ({data_size})")
+                            ));
+                        }
+                        let new_data_len = data_size - n;
+                        if new_data_len < locked {
+                            return Err(io_error!(
+                                InvalidInput,
+                                format!(
+                                    "process_gen: pop({n}) would shrink payload below locked length ({locked})"
+                                )
+                            ));
+                        }
+                        self.acl_check(new_data_len, data_size, AccessOp::Truncate, held)?;
+                        if n > 0 {
+                            read_at(file, new_data_len, buf)?;
+                            Self::mark_replay(replay, commit_shrink(file, clen, new_data_len))?;
+                        }
+                        return Ok(());
+                    }
+                    Some(BStackGenOp::Discard { len }) => {
+                        if len > data_size {
+                            return Err(io_error!(
+                                InvalidInput,
+                                format!(
+                                    "process_gen: discard({len}) exceeds payload size ({data_size})"
+                                )
+                            ));
+                        }
+                        let new_data_len = data_size - len;
+                        if new_data_len < locked {
+                            return Err(io_error!(
+                                InvalidInput,
+                                format!(
+                                    "process_gen: discard({len}) would shrink payload below locked length ({locked})"
+                                )
+                            ));
+                        }
+                        self.acl_check(new_data_len, data_size, AccessOp::Truncate, held)?;
+                        if len > 0 {
+                            Self::mark_replay(replay, commit_shrink(file, clen, new_data_len))?;
+                        }
+                        return Ok(());
+                    }
+                    Some(BStackGenOp::Atrunc { n, data }) => {
+                        if n > data_size {
+                            return Err(io_error!(
+                                InvalidInput,
+                                format!(
+                                    "process_gen: atrunc n ({n}) exceeds payload size ({data_size})"
+                                )
+                            ));
+                        }
+                        let new_tail_start = data_size - n;
+                        if new_tail_start < locked {
+                            return Err(io_error!(
+                                InvalidInput,
+                                format!("process_gen: atrunc would modify locked region [0, {locked})")
+                            ));
+                        }
+                        self.acl_check(new_tail_start, data_size, AccessOp::Truncate, held)?;
+                        if n != 0 || !data.is_empty() {
+                            let file_end = HEADER_SIZE + data_size;
+                            Self::mark_replay(
+                                replay,
+                                commit_tail_replace(file, clen, new_tail_start, n, data, file_end),
+                            )?;
+                        }
+                        return Ok(());
+                    }
+                    Some(BStackGenOp::Splice { old, new }) => {
+                        let n = old.len() as u64;
+                        if n > data_size {
+                            return Err(io_error!(
+                                InvalidInput,
+                                format!(
+                                    "process_gen: splice n ({n}) exceeds payload size ({data_size})"
+                                )
+                            ));
+                        }
+                        let new_tail_start = data_size - n;
+                        if new_tail_start < locked {
+                            return Err(io_error!(
+                                InvalidInput,
+                                format!("process_gen: splice would modify locked region [0, {locked})")
+                            ));
+                        }
+                        self.acl_check(new_tail_start, data_size, AccessOp::Truncate, held)?;
+                        if n != 0 || !new.is_empty() {
+                            read_at(file, new_tail_start, old)?;
+                            let file_end = HEADER_SIZE + data_size;
+                            Self::mark_replay(
+                                replay,
+                                commit_tail_replace(file, clen, new_tail_start, n, new, file_end),
+                            )?;
+                        }
+                        return Ok(());
+                    }
+                    Some(BStackGenOp::Sparse { writes, length }) => {
+                        let mut blocks: Vec<(u64, &[u8])> = writes
+                            .iter()
+                            .map(|(off, d)| (*off, *d))
+                            .filter(|(_, d)| !d.is_empty())
+                            .collect();
+                        validate_sparse_blocks(&mut blocks, length, "process_gen: sparse")?;
+                        if length != 0 {
+                            let file_end = HEADER_SIZE + data_size;
+                            let new_len = checked_end(
+                                data_size,
+                                length,
+                                "process_gen: sparse data_size + length overflows u64",
+                            )?;
+                            self.acl_check(data_size, new_len, AccessOp::Write, held)?;
+                            Self::mark_replay(
+                                replay,
+                                commit_sparse_extend(
+                                    file, clen, data_size, file_end, new_len, &blocks,
+                                ),
+                            )?;
+                        }
+                        return Ok(());
+                    }
+                    Some(BStackGenOp::Len { out }) => {
+                        *out = data_size;
+                    }
+                    Some(BStackGenOp::Abort { source }) => {
+                        return source.map_or(Ok(()), Err);
+                    }
+                    None => return Ok(()),
+                }
+            }
+        }
+
+        /// [`inplace_gen`](BStack::inplace_gen) run under an access token — the
+        /// generator counterpart to [`process_gen_as`](Self::process_gen_as), for
+        /// the overlay-resolving in-place engine. Duplicates `inplace_gen` (kept in
+        /// `lib.rs`) rather than threading authority through it; the two must stay
+        /// in sync.
+        #[cfg(feature = "atomic")]
+        pub fn inplace_gen_as<'a, A, F>(&self, auth: A, mut f: F) -> io::Result<()>
+        where
+            A: super::BStackAuthority,
+            F: FnMut(io::Result<()>) -> Option<BStackGenOp<'a>>,
+        {
+            let held = auth.authorities_for(self);
+            let mut guard = self.write_lock()?;
+            let (file, _, replay) = &mut *guard;
+            let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
+            let locked = self.locked.load(Ordering::Acquire);
+            fault_point!(self, "inplace_gen");
+            let mut overlay: Vec<(u64, &'a [u8])> = Vec::new();
+            let mut feedback: io::Result<()> = Ok(());
+            loop {
+                match f(feedback) {
+                    Some(BStackGenOp::Read { offset, buf }) => {
+                        feedback = match inplace_validate_read(offset, buf.len() as u64, data_size) {
+                            Err(e) => Err(e),
+                            Ok(()) => self
+                                .acl_check(
+                                    offset,
+                                    offset + buf.len() as u64,
+                                    AccessOp::Read,
+                                    held,
+                                )
+                                .and_then(|()| {
+                                    fault_probe!(self, "inplace_gen:read").map_or_else(
+                                        || {
+                                            inplace_overlay_read(
+                                                file, data_size, offset, buf, &overlay,
+                                            )
+                                        },
+                                        Err,
+                                    )
+                                }),
+                        };
+                    }
+                    Some(BStackGenOp::Write { offset, data }) => {
+                        feedback = inplace_validate_write(offset, data, data_size, locked);
+                        if feedback.is_ok() {
+                            let end = offset + data.len() as u64;
+                            feedback = self.acl_check(offset, end, AccessOp::Write, held);
+                        }
+                        if feedback.is_ok() && !data.is_empty() {
+                            inplace_overlay_insert(&mut overlay, offset, data);
+                        }
+                    }
+                    Some(BStackGenOp::Len { out }) => {
+                        *out = data_size;
+                        feedback = Ok(());
+                    }
+                    Some(BStackGenOp::Abort { source }) => {
+                        return source.map_or(Ok(()), Err);
+                    }
+                    Some(BStackGenOp::Swap { .. }) => {
+                        feedback = Err(io_error!(
+                            InvalidInput,
+                            "inplace_gen: Swap is not permitted (Read/Write/Len only)"
+                        ));
+                    }
+                    Some(BStackGenOp::Push { .. }) => {
+                        feedback = Err(io_error!(
+                            InvalidInput,
+                            "inplace_gen: Push is not permitted (in-place writes only)"
+                        ));
+                    }
+                    Some(BStackGenOp::Pop { .. }) => {
+                        feedback = Err(io_error!(
+                            InvalidInput,
+                            "inplace_gen: Pop is not permitted (in-place writes only)"
+                        ));
+                    }
+                    Some(BStackGenOp::Discard { .. }) => {
+                        feedback = Err(io_error!(
+                            InvalidInput,
+                            "inplace_gen: Discard is not permitted (in-place writes only)"
+                        ));
+                    }
+                    Some(BStackGenOp::Atrunc { .. }) => {
+                        feedback = Err(io_error!(
+                            InvalidInput,
+                            "inplace_gen: Atrunc is not permitted (in-place writes only)"
+                        ));
+                    }
+                    Some(BStackGenOp::Splice { .. }) => {
+                        feedback = Err(io_error!(
+                            InvalidInput,
+                            "inplace_gen: Splice is not permitted (in-place writes only)"
+                        ));
+                    }
+                    Some(BStackGenOp::Sparse { .. }) => {
+                        feedback = Err(io_error!(
+                            InvalidInput,
+                            "inplace_gen: Sparse is not permitted (in-place writes only)"
+                        ));
+                    }
+                    None => break,
+                }
+            }
+            match overlay.len() {
+                0 => Ok(()),
+                1 => {
+                    let (offset, data) = overlay[0];
+                    Self::mark_replay(replay, set_in_place(file, data_size, offset, data))
+                }
+                _ => Self::mark_replay(replay, journaled_multi_set(file, data_size, &overlay)),
+            }
+        }
+
+        /// Overwrite allocator metadata at `offset`, presenting allocator
+        /// authority so a permanently [`Alloc`](BStackAccess)-marked region (the
+        /// header) accepts the allocator's own write. The `meta_*` family is how
+        /// an allocator does metadata I/O uniformly across feature configurations;
+        /// without the feature they are the plain ops (see the shim).
+        // Used by the non-atomic allocator paths; the atomic paths route free-list
+        // writes through the generators instead, so this is dead in `atomic`-only
+        // builds until more allocators adopt it.
+        #[allow(dead_code)]
+        pub(crate) fn meta_set(&self, offset: u64, data: impl AsRef<[u8]>) -> io::Result<()> {
+            self.set_as(BStackAccessAuthorities::ALLOC, offset, data)
+        }
+
+        /// Read a little-endian `u64` of allocator metadata at `offset`, presenting
+        /// allocator authority. See [`meta_set`](Self::meta_set).
+        #[allow(dead_code)]
+        pub(crate) fn meta_read_u64(&self, offset: u64) -> io::Result<u64> {
+            let mut buf = [0u8; 8];
+            self.get_into_as(BStackAccessAuthorities::ALLOC, offset, &mut buf)?;
+            Ok(u64::from_le_bytes(buf))
+        }
+
+        /// [`cross_exchange`](BStack::cross_exchange) of allocator metadata,
+        /// presenting allocator authority. See [`meta_set`](Self::meta_set).
+        #[cfg(feature = "atomic")]
+        pub(crate) fn meta_cross_exchange(&self, a: u64, b: u64, n: u64) -> io::Result<()> {
+            self.cross_exchange_as(BStackAccessAuthorities::ALLOC, a, b, n)
+        }
+
+        /// [`process_gen`](BStack::process_gen) run as the allocator (see
+        /// [`process_gen_as`](Self::process_gen_as)). See [`meta_set`](Self::meta_set).
+        #[cfg(feature = "atomic")]
+        pub(crate) fn meta_process_gen<'a, F>(&self, f: F) -> io::Result<()>
+        where
+            F: FnMut() -> Option<BStackGenOp<'a>>,
+        {
+            self.process_gen_as(BStackAccessAuthorities::ALLOC, f)
+        }
+
+        /// [`inplace_gen`](BStack::inplace_gen) run as the allocator (see
+        /// [`inplace_gen_as`](Self::inplace_gen_as)). See [`meta_set`](Self::meta_set).
+        #[cfg(feature = "atomic")]
+        pub(crate) fn meta_inplace_gen<'a, F>(&self, f: F) -> io::Result<()>
+        where
+            F: FnMut(io::Result<()>) -> Option<BStackGenOp<'a>>,
+        {
+            self.inplace_gen_as(BStackAccessAuthorities::ALLOC, f)
         }
 
         /// Arm `[offset, offset + len)` with `mode`, tokenless.
@@ -1102,5 +1602,52 @@ impl crate::BStack {
     #[inline]
     pub(crate) fn acl_reclaim(&self, _offset: u64, _len: u64) -> std::io::Result<()> {
         Ok(())
+    }
+}
+
+// Metadata I/O shims: without the feature these are the plain ops (no marking to
+// respect), so an allocator calls the same `meta_*` methods in every config.
+#[cfg(all(feature = "set", not(feature = "expensive-slice-access-control")))]
+impl crate::BStack {
+    #[inline]
+    #[allow(dead_code)] // see the gated sibling
+    pub(crate) fn meta_set(&self, offset: u64, data: impl AsRef<[u8]>) -> std::io::Result<()> {
+        self.set(offset, data)
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn meta_read_u64(&self, offset: u64) -> std::io::Result<u64> {
+        let mut buf = [0u8; 8];
+        self.get_into(offset, &mut buf)?;
+        Ok(u64::from_le_bytes(buf))
+    }
+}
+
+#[cfg(all(
+    feature = "set",
+    feature = "atomic",
+    not(feature = "expensive-slice-access-control")
+))]
+impl crate::BStack {
+    #[inline]
+    pub(crate) fn meta_cross_exchange(&self, a: u64, b: u64, n: u64) -> std::io::Result<()> {
+        self.cross_exchange(a, b, n)
+    }
+
+    #[inline]
+    pub(crate) fn meta_process_gen<'a, F>(&self, f: F) -> std::io::Result<()>
+    where
+        F: FnMut() -> Option<crate::BStackGenOp<'a>>,
+    {
+        self.process_gen(f)
+    }
+
+    #[inline]
+    pub(crate) fn meta_inplace_gen<'a, F>(&self, f: F) -> std::io::Result<()>
+    where
+        F: FnMut(std::io::Result<()>) -> Option<crate::BStackGenOp<'a>>,
+    {
+        self.inplace_gen(f)
     }
 }
