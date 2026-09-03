@@ -231,6 +231,9 @@ impl GhostTreeBstackAllocator {
             stack.extend(ARENA_START)?;
             stack.set(MAGIC_OFFSET, ALGT_MAGIC)?;
             // ROOT_OFFSET is zeroed by extend — null root pointer.
+            // Header (magic + root pointer) stays `Alloc` for the allocator's
+            // lifetime; own I/O via the `meta_*` helpers.
+            stack.acl_mark_alloc(MAGIC_OFFSET, ARENA_START - MAGIC_OFFSET)?;
             return Ok(Self {
                 stack,
                 #[cfg(feature = "atomic")]
@@ -274,6 +277,10 @@ impl GhostTreeBstackAllocator {
             #[cfg(not(feature = "atomic"))]
             _not_sync: PhantomData,
         };
+        // Re-arm the header mark on reopen (policy is not persisted); the root I/O
+        // in `coalesce_and_rebalance` below goes through the `meta_*` helpers.
+        this.stack
+            .acl_mark_alloc(MAGIC_OFFSET, ARENA_START - MAGIC_OFFSET)?;
         this.coalesce_and_rebalance()?;
         Ok(this)
     }
@@ -283,9 +290,8 @@ impl GhostTreeBstackAllocator {
     /// Read the AVL root pointer from the header.
     #[inline]
     fn read_root(&self) -> io::Result<u64> {
-        let buf = &mut [0u8; 8];
-        self.stack.get_into(ROOT_OFFSET, buf)?;
-        Ok(read_buf_le!(buf, 0 => u64))
+        // Header stays `Alloc`; the root pointer is read as the allocator.
+        self.stack.meta_read_u64(ROOT_OFFSET)
     }
 
     /// Write the AVL root pointer to the header.
@@ -293,7 +299,7 @@ impl GhostTreeBstackAllocator {
     fn write_root(&self, ptr: u64) -> io::Result<()> {
         let mut buf = [0u8; 8];
         write_buf!(ptr => buf, 0);
-        self.stack.set(ROOT_OFFSET, buf)?;
+        self.stack.meta_set(ROOT_OFFSET, buf)?;
         Ok(())
     }
 

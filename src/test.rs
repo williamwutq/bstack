@@ -6410,10 +6410,12 @@ mod first_fit_tests {
         alloc.dealloc(b).unwrap();
         let stack = alloc.into_stack();
 
-        // Corrupt: set recovery_needed=1 and scramble free_head to garbage
-        stack.set(24, 1u32.to_le_bytes()).unwrap(); // flags byte → recovery_needed=1
+        // Corrupt: set recovery_needed=1 and scramble free_head to garbage. These
+        // are allocator-metadata writes (the header is protected under the ACL
+        // feature), so they go through the authorized `meta_*` path.
+        stack.meta_set(24, 1u32.to_le_bytes()).unwrap(); // flags byte → recovery_needed=1
         stack
-            .set(FREE_HEAD_OFFSET, 0xDEADBEEFu64.to_le_bytes())
+            .meta_set(FREE_HEAD_OFFSET, 0xDEADBEEFu64.to_le_bytes())
             .unwrap();
         drop(stack);
 
@@ -6756,7 +6758,7 @@ mod first_fit_tests {
         // = OFFSET_SIZE(16) + magic(8); the flag occupies the next 4 bytes.
         alloc
             .stack()
-            .set(24u64, 1u32.to_le_bytes().as_slice())
+            .meta_set(24u64, 1u32.to_le_bytes().as_slice())
             .unwrap();
 
         // Any operation that goes through `set_recovery_needed` should now

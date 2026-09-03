@@ -675,6 +675,19 @@ mod inner {
             self.inplace_gen_as(BStackAccessAuthorities::ALLOC, f)
         }
 
+        /// [`cas`](BStack::cas) of allocator metadata, presenting allocator
+        /// authority. See [`meta_set`](Self::meta_set).
+        #[cfg(feature = "atomic")]
+        #[allow(dead_code)]
+        pub(crate) fn meta_cas(
+            &self,
+            offset: u64,
+            old: impl AsRef<[u8]>,
+            new: impl AsRef<[u8]>,
+        ) -> io::Result<bool> {
+            self.cas_as(BStackAccessAuthorities::ALLOC, offset, old, new)
+        }
+
         /// Arm `[offset, offset + len)` with `mode`, tokenless.
         ///
         /// Crate-internal: all public protection goes through
@@ -1649,5 +1662,16 @@ impl crate::BStack {
         F: FnMut(std::io::Result<()>) -> Option<crate::BStackGenOp<'a>>,
     {
         self.inplace_gen(f)
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn meta_cas(
+        &self,
+        offset: u64,
+        old: impl AsRef<[u8]>,
+        new: impl AsRef<[u8]>,
+    ) -> std::io::Result<bool> {
+        self.cas(offset, old, new)
     }
 }
