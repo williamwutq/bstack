@@ -273,6 +273,7 @@ impl SegregatedBStackAllocator {
     ///   allocator of the expected version).
     /// * Any [`io::Error`] from the underlying [`BStack`] operations.
     pub fn new(stack: BStack) -> io::Result<Self> {
+        stack.acl_claim_alloc();
         if stack.is_empty()? {
             // Initialize a new stack: write the header and return a fresh allocator.
             const OFFSET_OFFSET: usize = SegregatedBStackAllocator::OFFSET_SIZE as usize;
@@ -1144,6 +1145,9 @@ impl BStackAllocator for SegregatedBStackAllocator {
         let slice = ensure_own_handle(self, slice, "SegregatedBStackAllocator::dealloc")?;
         let start = slice.start();
         let len = slice.len();
+        if let Err(source) = self.stack.acl_reclaim(start, len) {
+            return Err(BStackAllocError::with_handle(source, slice));
+        }
         if slice.is_empty() {
             return Ok(());
         }
@@ -1911,6 +1915,11 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
     ) -> Result<(), BStackBulkAllocError<'a, Self>> {
         let slices: Vec<BStackOwnedSlice<'a, Self>> = handles.into_iter().collect();
         let slices = ensure_own_handles(self, slices, "SegregatedBStackAllocator::dealloc_bulk")?;
+        for s in &slices {
+            if let Err(source) = self.stack.acl_reclaimable(s.start(), s.len()) {
+                return Err(BStackBulkAllocError::with_handles(source, slices));
+            }
+        }
 
         let mut freeing = false;
         let result = (|| -> io::Result<()> {

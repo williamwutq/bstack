@@ -267,6 +267,39 @@ impl PointTable {
         true
     }
 
+    /// Whether every offset in `[a, b)` is [`All`](BStackAccess::All) or
+    /// [`Alloc`](BStackAccess::Alloc) — the modes an allocator may clear when it
+    /// reclaims the range on `dealloc`.
+    ///
+    /// Any caller-set mode (`Rw`/`RwStrict`/`Prot`/`RwProt`/`ReadOnly`/`Locked`)
+    /// makes the range non-reclaimable: the free must be refused so the policy is
+    /// never silently discarded. Folds the range exactly like [`check`](Self::check);
+    /// an empty range is trivially reclaimable.
+    #[must_use]
+    pub fn reclaimable_by_alloc(&self, a: u64, b: u64) -> bool {
+        if a >= b {
+            return true;
+        }
+        let is_ok = |m: BStackAccess| matches!(m, BStackAccess::All | BStackAccess::Alloc);
+        let start = self.points.partition_point(|p| p.0 <= a);
+        let mode = if start == 0 {
+            BStackAccess::All
+        } else {
+            self.points[start - 1].1
+        };
+        if !is_ok(mode) {
+            return false;
+        }
+        let mut j = start;
+        while j < self.points.len() && self.points[j].0 < b {
+            if !is_ok(self.points[j].1) {
+                return false;
+            }
+            j += 1;
+        }
+        true
+    }
+
     /// Set `[a, b)` to `mode`, leaving everything at or after `b` unchanged.
     ///
     /// Splices in the up-to-two boundaries the range needs — `(a, mode)` and a
@@ -456,6 +489,25 @@ mod tests {
         assert!(!t.all_over(25, 30)); // inside Prot
         assert!(t.all_over(40, 100)); // All resumes after
         assert!(!t.all_over(30, 60)); // spans Prot -> All
+    }
+
+    #[test]
+    fn reclaimable_by_alloc_accepts_all_and_alloc_only() {
+        let mut t = PointTable::new();
+        assert!(t.reclaimable_by_alloc(0, 100)); // empty table = All
+        assert!(t.reclaimable_by_alloc(50, 50)); // empty range
+        t.set(16, 32, Alloc);
+        assert!(t.reclaimable_by_alloc(0, 64)); // All -> Alloc -> All, all clearable
+        t.set(40, 48, Prot);
+        assert!(!t.reclaimable_by_alloc(0, 64)); // Prot region blocks reclaim
+        assert!(t.reclaimable_by_alloc(0, 40)); // stops before the Prot region
+        assert!(!t.reclaimable_by_alloc(40, 48)); // exactly the Prot region
+        // Every non-All/non-Alloc mode blocks a reclaim.
+        for m in [Rw, RwStrict, RwProt, ReadOnly, Locked] {
+            let mut u = PointTable::new();
+            u.set(10, 20, m);
+            assert!(!u.reclaimable_by_alloc(0, 30), "{m:?} should block reclaim");
+        }
     }
 
     #[test]

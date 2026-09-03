@@ -244,6 +244,90 @@ mod inner {
             Ok(())
         }
 
+        /// Burn the allocator-authority mint, so no external caller can obtain
+        /// [`Alloc`](BStackAccess::Alloc) authority over an allocator's arena.
+        ///
+        /// Every allocator constructor calls this: an allocator owns its stack
+        /// exclusively, and its metadata marks and reclaims are made through the
+        /// crate-internal [`acl_mark_alloc`](Self::acl_mark_alloc) /
+        /// [`acl_reclaim`](Self::acl_reclaim), never through the public token. Left
+        /// mintable, `allocator.stack().take_alloc_authority()` would hand a caller
+        /// the very capability that makes metadata inviolable. Idempotent — the
+        /// mint is one-shot.
+        pub(crate) fn acl_claim_alloc(&self) {
+            let _ = self.take_alloc_authority();
+        }
+
+        /// Mark `[offset, offset + len)` as allocator-owned
+        /// [`Alloc`](BStackAccess::Alloc) metadata.
+        ///
+        /// Presents synthetic [`ALLOC`](BStackAccessAuthorities::ALLOC) authority:
+        /// the crate-internal caller *is* the allocator, so it needs no minted
+        /// token to arm its own metadata. Re-marking a range already `Alloc` (a
+        /// reopened arena, a reused block) is admitted.
+        ///
+        // The metadata-marking hook. Marking a region `Alloc` also requires the
+        // allocator to route its own reads/writes of that region through the
+        // `_as(ALLOC)` siblings, so per-allocator adoption is staged separately
+        // from the (universal) mint-burn and dealloc-reclaim wiring.
+        #[allow(dead_code)]
+        pub(crate) fn acl_mark_alloc(&self, offset: u64, len: u64) -> io::Result<()> {
+            self.protect_as(BStackAccessAuthorities::ALLOC, offset, len, BStackAccess::Alloc)
+        }
+
+        /// Whether `[offset, offset + len)` may be reclaimed on `dealloc` — i.e.
+        /// carries no caller-set policy (nothing but
+        /// [`All`](BStackAccess::All)/[`Alloc`](BStackAccess::Alloc)).
+        ///
+        /// The read-only half of [`acl_reclaim`](Self::acl_reclaim), split out so a
+        /// bulk free can validate every handle *before* clearing any — keeping the
+        /// batch atomic. Returns [`PermissionDenied`](io::ErrorKind::PermissionDenied)
+        /// otherwise. Short-circuits a stack that was never protected.
+        pub(crate) fn acl_reclaimable(&self, offset: u64, len: u64) -> io::Result<()> {
+            if len == 0 || !self.acl_active.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            let end = checked_end(offset, len, "acl_reclaimable: offset + len overflows u64")?;
+            if self.acl.read().unwrap().reclaimable_by_alloc(offset, end) {
+                Ok(())
+            } else {
+                Err(io_error!(
+                    PermissionDenied,
+                    format!(
+                        "dealloc: [{offset}, {end}) carries access-control policy; \
+                         unprotect it before freeing"
+                    )
+                ))
+            }
+        }
+
+        /// Reclaim `[offset, offset + len)` on `dealloc`: refuse (see
+        /// [`acl_reclaimable`](Self::acl_reclaimable)) if it carries caller-set
+        /// policy, so a stated policy is never silently dropped nor left to poison
+        /// the block's next owner; otherwise reset the range to
+        /// [`All`](BStackAccess::All), clearing the allocator's own
+        /// [`Alloc`](BStackAccess::Alloc) metadata marks over it.
+        pub(crate) fn acl_reclaim(&self, offset: u64, len: u64) -> io::Result<()> {
+            if len == 0 || !self.acl_active.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            let end = checked_end(offset, len, "acl_reclaim: offset + len overflows u64")?;
+            // Stack lock first, then the acl lock, as in `protect_as`.
+            let _guard = self.write_lock()?;
+            let mut table = self.acl.write().unwrap();
+            if !table.reclaimable_by_alloc(offset, end) {
+                return Err(io_error!(
+                    PermissionDenied,
+                    format!(
+                        "dealloc: [{offset}, {end}) carries access-control policy; \
+                         unprotect it before freeing"
+                    )
+                ));
+            }
+            table.set(offset, end, BStackAccess::All);
+            Ok(())
+        }
+
         /// The mode currently governing logical `offset` (for inspection/testing).
         #[must_use]
         pub fn access_at(&self, offset: u64) -> BStackAccess {
@@ -995,3 +1079,28 @@ mod inner {
 
 #[cfg(feature = "expensive-slice-access-control")]
 pub use inner::*;
+
+// Without the feature the allocator wiring still compiles: these fold to nothing
+// and inline away, keeping the build byte-identical to one that never mentioned
+// access control. Only the allocators (the `alloc` feature) call them.
+#[cfg(all(feature = "alloc", not(feature = "expensive-slice-access-control")))]
+impl crate::BStack {
+    #[inline]
+    pub(crate) fn acl_claim_alloc(&self) {}
+
+    #[inline]
+    #[allow(dead_code)] // metadata-marking hook; see the gated sibling
+    pub(crate) fn acl_mark_alloc(&self, _offset: u64, _len: u64) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    #[inline]
+    pub(crate) fn acl_reclaimable(&self, _offset: u64, _len: u64) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    #[inline]
+    pub(crate) fn acl_reclaim(&self, _offset: u64, _len: u64) -> std::io::Result<()> {
+        Ok(())
+    }
+}

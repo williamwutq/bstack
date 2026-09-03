@@ -5596,4 +5596,65 @@ mod acl_tests {
         assert!(left.merge(&right).is_none());
         assert!(left.merge_adjacent(&right).is_none());
     }
+
+    #[test]
+    fn allocator_constructor_burns_alloc_authority() {
+        // Every allocator claims the alloc-authority mint on construction, so no
+        // external caller can obtain `Alloc` authority over its arena.
+        let (s, p) = mk();
+        let _g = Guard(p);
+        let alloc = crate::LinearBStackAllocator::new(s);
+        assert!(alloc.stack().take_alloc_authority().is_none());
+        // The guard mint is independent and still available.
+        assert!(alloc.stack().take_protection().is_some());
+
+        let (s2, p2) = mk();
+        let _g2 = Guard(p2);
+        let ff = crate::FirstFitBStackAllocator::new(s2).unwrap();
+        assert!(ff.stack().take_alloc_authority().is_none());
+    }
+
+    #[test]
+    fn dealloc_refuses_protected_region_then_frees_once_cleared() {
+        let (s, p) = mk();
+        let _g = Guard(p);
+        let alloc = crate::LinearBStackAllocator::new(s);
+        let slice = alloc.alloc(32).unwrap();
+        let start = slice.start();
+        let len = slice.len();
+        let prot = alloc.stack().take_protection().unwrap();
+        slice.protect_as(&prot, BStackAccess::Prot).unwrap();
+
+        // Freeing a region that carries caller policy is refused, and the handle
+        // comes back intact rather than being consumed.
+        let err = alloc.dealloc(slice).unwrap_err();
+        assert_eq!(err.source.kind(), io::ErrorKind::PermissionDenied);
+        let slice = err.into_handle().expect("region survives a refused free");
+
+        // The guard holder clears the policy, and the free now succeeds.
+        alloc
+            .stack()
+            .protect_as(&prot, start, len, BStackAccess::All)
+            .unwrap();
+        alloc.dealloc(slice).unwrap();
+        assert_eq!(alloc.stack().len().unwrap(), 0);
+    }
+
+    #[test]
+    fn dealloc_bulk_refuses_batch_with_any_protected_handle() {
+        use crate::BStackBulkAllocator;
+        let (s, p) = mk();
+        let _g = Guard(p);
+        let alloc = crate::LinearBStackAllocator::new(s);
+        let a = alloc.alloc(16).unwrap();
+        let b = alloc.alloc(16).unwrap();
+        let prot = alloc.stack().take_protection().unwrap();
+        // Arm just one of the two allocations.
+        b.protect_as(&prot, BStackAccess::ReadOnly).unwrap();
+
+        let err = alloc.dealloc_bulk([a, b]).unwrap_err();
+        assert_eq!(err.source.kind(), io::ErrorKind::PermissionDenied);
+        // The whole batch is refused up front, so both handles are returned.
+        assert_eq!(err.into_handles().len(), 2);
+    }
 }

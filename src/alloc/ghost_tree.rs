@@ -224,6 +224,7 @@ impl GhostTreeBstackAllocator {
     /// Returns [`io::ErrorKind::InvalidData`] if the payload size falls in the
     /// unrecoverable range, or if the magic prefix does not match `ALGT`.
     pub fn new(stack: BStack) -> io::Result<Self> {
+        stack.acl_claim_alloc();
         let size = stack.len()?;
 
         if size == 0 {
@@ -1461,6 +1462,9 @@ impl BStackAllocator for GhostTreeBstackAllocator {
         let slice = ensure_own_handle(self, slice, "GhostTreeBstackAllocator::dealloc")?;
         let start = slice.start();
         let len = slice.len();
+        if let Err(source) = self.stack.acl_reclaim(start, len) {
+            return Err(BStackAllocError::with_handle(source, slice));
+        }
         // Set once the (non-atomic) AVL insert has begun. A torn insert leaves
         // the tree inconsistent, and GhostTree has no is_free flag to repair it
         // in-process, so the block can no longer be returned for a retry —
@@ -1681,6 +1685,11 @@ impl BStackBulkAllocator for GhostTreeBstackAllocator {
     ) -> Result<(), BStackBulkAllocError<'a, Self>> {
         let slices: Vec<BStackOwnedSlice<'a, Self>> = slices.into_iter().collect();
         let slices = ensure_own_handles(self, slices, "GhostTreeBstackAllocator::dealloc_bulk")?;
+        for s in &slices {
+            if let Err(source) = self.stack.acl_reclaimable(s.start(), s.len()) {
+                return Err(BStackBulkAllocError::with_handles(source, slices));
+            }
+        }
 
         // Set once any block has begun to be freed. This free is progressive
         // (tail discard, then per-block zero + AVL insert), so once it starts a

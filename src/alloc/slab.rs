@@ -183,6 +183,7 @@ impl SlabBStackAllocator {
     ///   empty (use [`SlabBStackAllocator::open`] to reopen an existing file).
     /// * Any [`io::Error`] propagated from the underlying [`BStack`] operations.
     pub fn new(stack: BStack, block_size: u64) -> io::Result<Self> {
+        stack.acl_claim_alloc();
         if !stack.is_empty()? {
             return Err(io_error!(
                 InvalidInput,
@@ -229,6 +230,7 @@ impl SlabBStackAllocator {
     ///   `block_size`, or invalid `free_head`.
     /// * Any [`io::Error`] propagated from the underlying [`BStack`] operations.
     pub fn open(stack: BStack) -> io::Result<Self> {
+        stack.acl_claim_alloc();
         if stack.is_empty()? {
             return Err(io_error!(
                 InvalidInput,
@@ -785,6 +787,9 @@ impl BStackAllocator for SlabBStackAllocator {
         let slice = ensure_own_handle(self, slice, "SlabBStackAllocator::dealloc")?;
         let start = slice.start();
         let len = slice.len();
+        if let Err(source) = self.stack.acl_reclaim(start, len) {
+            return Err(BStackAllocError::with_handle(source, slice));
+        }
         // Set once the caller's blocks may have been partially freed, after
         // which returning the handle for retry would risk a double-free.
         let mut lost = false;
@@ -1426,6 +1431,11 @@ impl BStackBulkAllocator for SlabBStackAllocator {
     ) -> Result<(), BStackBulkAllocError<'a, Self>> {
         let slices: Vec<BStackOwnedSlice<'a, Self>> = handles.into_iter().collect();
         let slices = ensure_own_handles(self, slices, "SlabBStackAllocator::dealloc_bulk")?;
+        for s in &slices {
+            if let Err(source) = self.stack.acl_reclaimable(s.start(), s.len()) {
+                return Err(BStackBulkAllocError::with_handles(source, slices));
+            }
+        }
         let bs = self.block_size;
 
         // Set once the chain build has begun. Before this point every handle is

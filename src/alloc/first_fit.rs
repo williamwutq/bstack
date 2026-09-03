@@ -233,6 +233,7 @@ impl FirstFitBStackAllocator {
     ///   type).
     /// * Any [`io::Error`] propagated from the underlying [`BStack`] operations.
     pub fn new(stack: BStack) -> Result<Self, io::Error> {
+        stack.acl_claim_alloc();
         // Initialize empty stack with allocator header
         if stack.is_empty()? {
             let mut hdr = [0u8; (Self::OFFSET_SIZE + Self::HEADER_SIZE) as usize];
@@ -1596,6 +1597,9 @@ impl BStackAllocator for FirstFitBStackAllocator {
         let slice = ensure_own_handle(self, slice, "FirstFitBStackAllocator::dealloc")?;
         let start = slice.start();
         let len = slice.len();
+        if let Err(source) = self.stack.acl_reclaim(start, len) {
+            return Err(BStackAllocError::with_handle(source, slice));
+        }
         // Set to true once the block is being physically reclaimed and can no
         // longer be safely handed back to the caller.
         let mut lost = false;
