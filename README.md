@@ -371,6 +371,8 @@ impl BStack {
 // BStackReader implements std::io::Read + std::io::Seek + From<&BStack>.
 ```
 
+> For deeper implementation notes, advisories, and common pitfalls behind specific operations, see the [algos/](algos/) directory.
+
 ---
 
 ## Standard I/O adapters
