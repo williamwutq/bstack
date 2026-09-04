@@ -102,6 +102,48 @@ Reasons:
 
 ---
 
+## Stabilising `SegregatedBStackAllocator` (0.4.5)
+
+**Feature flag:** `alloc` + `set` (the allocator's existing gates; `atomic` for the lock-free/`Sync` build). No new flag.
+**Breaking change:** No.
+
+### Motivation
+
+The allocator landed experimental in 0.4.2 and was hardened through 0.4.3 (physical-size overhead word, tail-shrink recovery-desync fix) and 0.4.4 (`alloc_bulk`/`dealloc_bulk`, `coalesce`, `alloc_uninit`/`realloc_uninit`). Its caveat named four items: format instability, API instability, the atomic/non-atomic resize divergence, and a missing coalescer and in-use-leak GC. The coalescer shipped in 0.4.4, the divergence is settled behaviour, and the leak GC needs no format change — so the label now overstates the risk and forces callers onto an experimental format for no gain.
+
+### Format and API freeze
+
+- **Format.** The current roadmap does not require adding an on-disk field. The header (magic + 33 free-list heads) and one 8-byte tagged overhead word per block (physical size `>> 4`, high bit = in-use) are the complete input to `recover`'s linear-scan rebuild. The visible length lives in the handle and the class scheme is a compile-time magic-encoded constant; neither is stored. The in-use-leak GC reads the same overhead words and adds nothing, like `coalesce`. No pending work grows the header or the block, so the format can freeze.
+- **API.** The inherent surface (`new`/`open`, `unsafe recover`, `coalesce`), the trait impls (`BStackAllocator`, `BStackInPlaceResizeAllocator`, `BStackUninitAllocator`, `BStackBulkAllocator` under `atomic`), and the C `segregated_bstack_allocator_*` surface freeze. Additions stay allowed; removals and signature changes become breaking.
+
+### Retained behaviour, not instability
+
+- **Resize divergence.** A shrink reclaims freed excess (tail `Atrunc` or in-place carve) only under `atomic`; without it the excess is retained in place. Both satisfy `realloc`'s contract (a retain or a move is permitted, and the visible length is carried in the handle). Documented as stable behaviour.
+- **In-use-leak GC.** `recover` reclaims free leaks and discards orphaned tails, but leaves in-use orphans (e.g. a crashed *move*'s old block) live — as every built-in allocator does. No data loss; deep reclamation stays future work.
+
+### Performance tuning
+
+Freezing the format leaves the heuristics free. A block self-describes its physical size in its overhead word, so any build reads any file regardless of the policy that carved it. The runtime dials are decoupled from the on-disk layout and stay tunable across patch releases without a magic bump. Stabilisation should benchmark and, where warranted, revise:
+
+- **`SPLIT_MIN`** (currently `LINEAR_MAX`, 256 B), the excess above which a shrink or oversized-reuse carves rather than retains. A higher value retains more slack and writes less; a lower value reclaims more and fragments more. This is pure policy, deciding when to split; the split block records its own size regardless.
+- **Oversized matching**: `alloc_bulk`'s largest-first chase and the greedy carve into up to 3 class pieces. The order and stopping rule stay open to change, since the resulting blocks are self-describing.
+- **Tail grow/shrink thresholds**: when a back grow extends the tail versus moves, and when a shrink's excess reaches the tail-`Atrunc` path.
+
+The class scheme is the exception. `QUANTUM`, `LINEAR_MAX`, `SUBCLASS_BITS`, `MAX_CLASS`, and the resulting 33 heads are magic-encoded, so retuning the class boundaries is a format change rather than a heuristic one. Freezing them costs little, because the current scheme already covers the size distribution well: the quantum-16 linear classes keep internal fragmentation under 16 B for every allocation up to 256 B, where small requests concentrate; the four-per-octave geometric classes bound waste to roughly a quarter of the request across `[256, 4096)`; and the shared oversized bucket absorbs the long tail, where relative waste is already small and a dedicated class would earn little. This matches the size-class shape proven in general-purpose allocators such as jemalloc and tcmalloc, so a compelling case to move a boundary is unlikely to arise. The freeze fixes the boundaries and leaves the fill policy within them free.
+
+### Mechanics
+
+- Drop the **Experimental** markers from the README allocator section, `algos/ALLOCATOR.md`, the [segregated.rs](src/alloc/segregated.rs) module doc, and the C header ([c/bstack_alloc.h](c/bstack_alloc.h) ~1355/1436). Recast the resize and leak-GC notes as documented behaviour.
+- No format write: the magic is unchanged, so a 0.4.4 file opens unchanged under 0.4.5.
+- CHANGELOG entry under *Changed*, no magic bump.
+
+### Open questions
+
+- **Patch-byte bump.** Whether to advance `\x01` → `\x02` for writer attribution. Cosmetic (no format change); `\x01` keeps 0.4.4/0.4.5 files byte-identical.
+- **GC before freeze.** Ship a bounded in-use-leak reclaimer first, or freeze now and document the limitation.
+
+---
+
 ## Enabling the `atomic` feature by default
 
 **Feature flag:** N/A — this changes which features are enabled by default, not a new one.
