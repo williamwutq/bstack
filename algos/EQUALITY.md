@@ -25,8 +25,9 @@ nor Windows the instance address is hashed, and the hash is not move-stable.
   compare equal to the stored one. Key on `&BStack` or `Arc<BStack>` instead;
   both are fully coherent (stable address, stable fd).
 - Identity does not survive the process or a reopen: a closed fd number may be
-  reused by a later, unrelated `BStack`. Never compare or hash across the
-  lifetime boundary of the instance.
+  reused by a later, unrelated `BStack`; the address of a dropped `BStack` can
+  be reused by a newly allocated and opened one. Never compare or hash across
+  the lifetime boundary of the instance.
 
 ## Slice views: coordinate equality, stack ignored
 
