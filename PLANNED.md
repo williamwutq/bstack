@@ -94,6 +94,12 @@ Reasons:
 
 `BStackOwnedSlice` cannot generically call back into an arbitrary `BStackAllocator`. The conversion from an allocator's handle to `BStackOwnedSlice` is one-directional by trait design: `BStackAllocator::Allocated<'a>` need only satisfy `Into<BStackOwnedSlice<'a, Self>>`, and a custom allocator may embed extra metadata in a newtype handle that `BStackOwnedSlice` alone cannot reconstruct — so `dealloc`/`realloc`, which take `Self::Allocated<'a>`, cannot be driven from a bare `BStackOwnedSlice`. Separately, `BStackAllocator::Error` is an associated type, not necessarily `io::Error` — third-party allocators are free to use a richer error type. Fixing the return type to `io::Result<_>` would only be correct for allocators that happen to set `Error = io::Error`. Both conditions together require `BStackOwnedSliceAllocator` (the convenience supertrait that already fixes `Error = io::Error` and `Allocated<'a> = BStackOwnedSlice<'a, Self>`), so the method cannot apply to the general `BStackAllocator` case. Reaching for `unsafe` transmutes or a bespoke trait just to paper over this asymmetry is unnecessary — the caller already holds the allocator reference used to obtain the handle and can call `allocator.dealloc(handle)` / `allocator.realloc(handle, new_len)` directly.
 
+### Implementing `RangeBounds<u64>` for `BStackRange`
+
+Reasons:
+
+`RangeBounds::end_bound` must return `Bound<&u64>` — a reference into `self`. `BStackRange` stores `offset` and `len`, so the end (`offset + len`) is a computed temporary with no field to borrow, and only `start_bound` could be satisfied. Storing `end` instead of `len` would make both bounds borrowable but is invasive: it touches every `len`-reading method and the 16-byte on-disk `(offset, len)` layout. The need is already met by the existing `range()` accessor, which returns `Range<u64>` (itself `RangeBounds<u64>`) at zero cost.
+
 ---
 
 ## Enabling the `atomic` feature by default
