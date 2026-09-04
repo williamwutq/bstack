@@ -144,6 +144,37 @@ The class scheme is the exception. `QUANTUM`, `LINEAR_MAX`, `SUBCLASS_BITS`, `MA
 
 ---
 
+## Incremental atomicity refactors for `FirstFitBStackAllocator`
+
+**Feature flag:** `alloc` + `set` (existing gates); the fusions apply to the `atomic` build.
+**Breaking change:** No.
+
+### Motivation
+
+0.4.4 made each free-list mutation (`add_to_free_list`, the `unlink_block` carve) commit as one crash-atomic journal arm. The `recovery_needed` bracket and the reopen scan predate that work and now guard more than remains necessary. Building on the atomic paths, several operations can shed the bracket, narrowing the flag to the sequences that still need it.
+
+### Refactors on the 0.4 lane (no format change)
+
+- **Drop redundant bracketing.** Where `set_recovery_needed`/`clear_recovery_needed` wrap a body that is already one atomic `BStack` call, the two CAS flag writes are pure overhead. `alloc`'s free-list path brackets a single `unlink_block` (`set_batched` or `inplace_gen`), so removing the bracket saves two syncs per allocation. The realloc in-block zero path already skips the flag for exactly this reason, so this extends an established pattern rather than introducing one.
+- **Set the flag conditionally.** `dealloc` pairs a free-list mutation with `cascade_discard_free_tail`, and the cascade runs only when the freed block abuts the tail. Deciding that before the mutation lets the common non-cascading `dealloc` land in one `add_to_free_list` and skip the flag, restricting the bracket to the sequences that are genuinely multi-call.
+- **Preserve the poison gate.** `set_recovery_needed`'s CAS also refuses to proceed when a prior multi-step op failed (rather than crashed) and left the flag set. A path that drops the bracket should keep a cheap in-memory poison check so a failed multi-call op still blocks later single-call ops until reopen, matching today's behaviour.
+
+### The remaining multi-call sequences
+
+Some operations pair a free-list mutation with a tail length change:
+
+- `dealloc` followed by `cascade_discard_free_tail` (free a block, then truncate a now-tail free block).
+- `realloc` grow or shrink that carves the free list and also extends or discards the tail.
+
+A length-preserving `inplace_gen` arm cannot absorb `extend`/`discard`, so these stay two atomic `BStack` calls under the current primitives and keep the `recovery_needed` breadcrumb on the 0.4 lane. Fully retiring the flag would need a size-changing atomic multi-write, which is out of scope here and belongs with the 0.5.0 journaling primitive.
+
+### Open questions
+
+- **Recovery routine: evolve or preserve compatibility.** Whether to adjust the reopen scan now that fewer paths arm the flag, or keep it as is so a file written by an earlier 0.4.x build (which armed `recovery_needed` around the now-unbracketed sequences) still recovers correctly. The scan reads only block headers and stays valid either way, so the question is whether any simplification is worth giving up that compatibility.
+- **Hardening the non-`atomic` paths.** The 0.4.4 atomic paths gained full validation of on-disk sizes and free-list pointers before use. The non-`atomic` read-then-write paths still trust more of what they read, so whether to backport the same bounds and pointer checks there, weighed against the extra reads on a build that already issues each write with its own sync.
+
+---
+
 ## Enabling the `atomic` feature by default
 
 **Feature flag:** N/A — this changes which features are enabled by default, not a new one.
