@@ -629,59 +629,6 @@ view to the borrow, while `Deref` yields `&BStackSlice<'a>`, whose `subslice`, `
 
 ---
 
-## Feature flags
-
-### `atomic`
-
-Enables compound read-modify-write operations that hold the write lock across
-what would otherwise be separate calls, providing thread-level atomicity and
-crash-safe ordering.
-
-```toml
-[dependencies]
-bstack = { version = "0.4", features = ["atomic"] }
-# Combined set + atomic unlocks swap, swap_into, and cas:
-bstack = { version = "0.4", features = ["set", "atomic"] }
-```
-
-- **`atrunc`**, **`splice`**, **`splice_into`** — atomic discard+push / pop+push tail replacement.
-- **`try_extend`**, **`try_discard`**, **`try_extend_zeros`** — size-checked, optimistic append/discard.
-- **`try_extend_sparse`**, **`try_extend_sparse_batched`** — size-checked, optimistic sparse tail growth.
-- **`ensure_with(target, f)`** — grow-if-short with the new tail handed to `f` for initialization before commit.
-- **`replace(n, f)`** — pop `n` bytes, pass to `f`, push back the returned tail.
-- **`get_batched`**, **`get_batched_into`**, **`get_batched_gen`** — read multiple (possibly dependent) ranges under one read lock.
-- **`swap`**, **`swap_into`**, **`cas`** *(requires `set`)* — atomic read-modify-write / compare-and-swap of a single region.
-- **`process`**, **`process_gen`** *(requires `set`)* — in-place mutation, or a dependent read/write sequence ending in at most one `Write`/`Swap`/`Push`/`Pop`/`Discard`/`Atrunc`/`Splice`/`Sparse`.
-- **`set_batched`**, **`inplace_gen`** *(requires `set`)* — commit several non-overlapping in-place writes as one crash-atomic unit (a batch, or a generator that also reads the batch-so-far state).
-- **`cross_exchange`**, **`copy`** *(requires `set`)* — swap or copy two regions under one write lock.
-- **`eq_crds`**, **`ne_crds`**, **`masked_eq_crds`**, **`masked_ne_crds`** *(requires `set`)* — cross-region compare-and-swap, with `==`/`!=`/masked variants.
-
-See [API](#api) for full signatures and details.
-
----
-
-### `set`
-
-Enables `BStack::set(offset, data)` (in-place overwrite), `BStack::zero(offset, n)` (zero-fill in place), and `BStack::repeat(offset, pattern, count)` (fill with a repeated pattern — the general form of `zero`). None changes the file size or the committed-length header.
-
-```toml
-[dependencies]
-bstack = { version = "0.4", features = ["set"] }
-```
-
-### `alloc`
-
-Enables the region-management layer on top of `BStack`: `BStackAllocator`, `BStackBulkAllocator`, `BStackUninitAllocator`, `BStackInPlaceResizeAllocator`, `BStackOwnedSliceAllocator`, `BStackAllocError`, `BStackBulkAllocError`, `BStackSliceError`, `BStackJoinError`, `BStackRange`, `BStackOwnedSlice`, `BStackSlice`, `BStackSliceReader`, `BStackChunk`, `BStackChunkIter`, `LinearBStackAllocator`, and `DebugCheckingAllocator`.  Combined with `set`, also enables `BStackSliceWriter`, `FirstFitBStackAllocator`, `GhostTreeBstackAllocator`, `SlabBStackAllocator`, `CheckedSlabBStackAllocator`, `SegregatedBStackAllocator` (experimental), `BStackByteVec`, and `BStackByteVecIter`.
-
-```toml
-[dependencies]
-bstack = { version = "0.4", features = ["alloc"] }
-# In-place slice writes (BStackSliceWriter) also need `set`:
-bstack = { version = "0.4", features = ["alloc", "set"] }
-```
-
----
-
 ## File format
 
 A fixed 32-byte header precedes the payload:
