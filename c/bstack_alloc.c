@@ -8597,10 +8597,11 @@ uint64_t checked_slab_bstack_allocator_data_size(
 #define ALSG_SENTINEL        UINT64_C(0)
 #define ALSG_IN_USE_BIT      UINT64_C(0x8000000000000000)
 
-/* Minimum excess (bytes) worth reclaiming into free blocks instead of retaining
- * as internal slack.  Not part of the on-disk format, so tuning it is not a
- * breaking change. */
-#define ALSG_SPLIT_MIN       ALSG_LINEAR_MAX
+/* Minimum excess (bytes) worth carving into free blocks instead of retaining as
+ * internal slack.  MAX_CLASS is the measured fewest-syncs point: below it carve
+ * remainders are small class blocks that rarely reuse and strand as dead arena.
+ * Not part of the on-disk format, so tuning it is not a breaking change. */
+#define ALSG_SPLIT_MIN       ALSG_MAX_CLASS
 
 /* Magic: "ALSG" + major 0 + minor 2; the version encodes the fixed class scheme
  * and the in-use overhead recording the block's physical size (minor 1 recorded
@@ -9503,17 +9504,14 @@ static int alsg_vt_realloc(bstack_allocator_t *base, bstack_slice_t s,
         }
 
         /* Visible shrink (new_len < old_len; the == case returned early above).
-         * Reclaim the excess only above the split threshold, and only under
-         * atomic: a shrink's freed tail overlaps still-live caller bytes, so
-         * recording the smaller size and dropping the excess must commit together
-         * in one transaction — the non-atomic build cannot fuse them (either
-         * ordering leaves a window recover mis-parses), so it retains the excess
-         * in place (zero writes, no move). */
+         * An interior shrink always retains the excess in place (zero writes);
+         * carving it fragments the arena for no fewer syncs.  Only a *tail* shrink
+         * reclaims, and only under atomic, via one LEN + SPLICE (the sole case that
+         * returns bytes to the OS); non-atomic cannot fuse that safely and retains. */
 #ifdef BSTACK_FEATURE_ATOMIC
         if (new_size < old_size && old_size - new_size >= ALSG_SPLIT_MIN) {
             bstack_alloc_tail_shrink_ctx_t c;
             uint8_t *nb;
-            uint8_t prefix[8];
             int rc;
 #if UINT64_MAX > SIZE_MAX
             if (old_size > (uint64_t)SIZE_MAX || new_size > (uint64_t)SIZE_MAX)
@@ -9530,7 +9528,8 @@ static int alsg_vt_realloc(bstack_allocator_t *base, bstack_slice_t s,
              * The replacement buffer is always full-length: SPLICE re-appends
              * exactly these bytes, so their count is the new block's physical
              * extent.  A shrink adds no new bytes, so there is nothing
-             * uninitialised to hand back. */
+             * uninitialised to hand back.  A non-tail block fails the LEN check
+             * and falls through to retain. */
             nb = alsg_claim_buf(bs, new_size, 1, start, new_len);
             if (!nb) goto fail_recover;
             c.phase         = 0;
@@ -9544,16 +9543,7 @@ static int alsg_vt_realloc(bstack_allocator_t *base, bstack_slice_t s,
             free(nb);
             if (rc) goto fail_recover;
             if (c.truncated) { result.offset = start; result.len = new_len; goto success; }
-
-            /* Non-tail: keep the block at the new class and free the excess tail
-             * in place as one crash-atomic carve — no move, no copy, and
-             * recovered stays the untouched original (a fault leaves the block
-             * un-shrunk).  The prefix commit records new_size. */
-            write_le64(prefix, ALSG_IN_USE_BIT | (new_size >> 4));
-            if (alsg_commit_carve(bs, block_start, prefix, 8,
-                block_start + new_size, old_size - new_size))
-                goto fail_recover;
-            result.offset = start; result.len = new_len; goto success;
+            /* Non-tail: fall through and retain the excess in place. */
         }
 #endif /* BSTACK_FEATURE_ATOMIC */
 

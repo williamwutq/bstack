@@ -425,11 +425,11 @@ static int test_realloc_tail_shrink(void)
 
     bstack_slice_t s, out;
     uint64_t before, after, off;
-    CHECK(bstack_allocator_alloc(base, 500, &s) == 0);  /* block 512, at the tail */
+    CHECK(bstack_allocator_alloc(base, 4500, &s) == 0); /* block 4512, at the tail */
     CHECK(slice_fill(s, 0x3C3C) == 0);
     off = s.offset;
     CHECK(bstack_len(bs, &before) == 0);
-    /* class 112 < 512, excess 400 >= SPLIT_MIN */
+    /* class 112, excess 4400 >= SPLIT_MIN */
     CHECK(bstack_allocator_realloc(base, s, 100, &out) == 0);
     CHECK(out.len == 100);
     CHECK(slice_verify(out, 100, 0x3C3C, "tail-shrink") == 0);
@@ -846,7 +846,7 @@ static int test_bulk_reuses_and_scrubs(void)
 }
 
 /* An oversized request matches a freed oversized block; slack at or above
- * SPLIT_MIN is carved back into class blocks that stay reusable. */
+ * SPLIT_MIN is carved back into a reusable block. */
 static int test_bulk_oversized_match_and_carve(void)
 {
     char tmp[64]; make_tmp(tmp, sizeof tmp);
@@ -858,20 +858,20 @@ static int test_bulk_oversized_match_and_carve(void)
     bstack_slice_t x, pin, out[1], rem;
     uint64_t off_x, lens[1], unsure;
 
-    CHECK(bstack_allocator_alloc(base, 5000, &x) == 0); /* oversized, block 5008 */
+    CHECK(bstack_allocator_alloc(base, 9000, &x) == 0); /* oversized, block 9008 */
     off_x = x.offset;
     CHECK(bstack_allocator_alloc(base, 50, &pin) == 0); /* keeps X off the tail */
     CHECK(bstack_allocator_dealloc(base, x) == 0);      /* X -> oversized list */
 
-    /* 4200 -> block 4208 (oversized); excess 800 >= SPLIT_MIN, so it carves. */
+    /* 4200 -> block 4208 (oversized); excess 4800 >= SPLIT_MIN, so it carves. */
     lens[0] = 4200;
     CHECK(bstack_allocator_alloc_bulk(base, lens, 1, out) == 0);
     CHECK(out[0].offset == off_x);
     CHECK(segregated_bstack_allocator_recover(a, &unsure) == 0);
     CHECK(unsure == 0); /* every carved piece strides its recorded size */
 
-    /* The 768-byte remainder is on its class list and recycles. */
-    CHECK(bstack_allocator_alloc(base, 700, &rem) == 0);
+    /* The 4800-byte remainder (> MAX_CLASS) is one oversized block and recycles. */
+    CHECK(bstack_allocator_alloc(base, 4790, &rem) == 0); /* need 4800, oversized reuse */
     CHECK(rem.offset == off_x - 8 + 4208 + 8);
 
     CHECK(bstack_allocator_dealloc(base, rem) == 0);
