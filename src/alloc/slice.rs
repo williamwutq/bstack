@@ -2,9 +2,9 @@ use super::BStackAllocator;
 #[cfg(all(feature = "set", feature = "atomic"))]
 use super::BStackOwnedSliceAllocator;
 use crate::BStack;
-use std::borrow::Borrow;
 #[cfg(feature = "expensive-slice-access-control")]
 use crate::{BStackAccess, BStackAccessAuthorities, BStackAuthority};
+use std::borrow::Borrow;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::io;

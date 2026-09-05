@@ -1098,7 +1098,8 @@ impl CheckedSlabBStackAllocator {
             ));
         }
         // Advance free_head to the next block (stored in data[0..8]).
-        self.stack.meta_set(Self::FREE_HEAD_OFFSET, &prefix[8..16])?;
+        self.stack
+            .meta_set(Self::FREE_HEAD_OFFSET, &prefix[8..16])?;
         // Mark in-use and, when the caller is owed zeroes, scrub the data in the
         // same write. `false` writes just the overhead word — still one
         // `set`, but `block_size - OVERHEAD` fewer bytes — and leaves the data
@@ -1138,7 +1139,10 @@ impl CheckedSlabBStackAllocator {
     fn write_free_run(&self, first_block: u64, count: u64) -> io::Result<()> {
         debug_assert!(count > 0);
         #[cfg(not(feature = "atomic"))]
-        let old_head = self.stack.meta_read_u64(Self::FREE_HEAD_OFFSET)?.to_le_bytes();
+        let old_head = self
+            .stack
+            .meta_read_u64(Self::FREE_HEAD_OFFSET)?
+            .to_le_bytes();
         let total = count
             .checked_mul(self.block_size)
             .ok_or_else(|| io_error!(InvalidInput, "freed region size overflows u64"))?;

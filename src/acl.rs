@@ -67,8 +67,8 @@ mod inner {
     use crate::fault::fault_probe;
     #[cfg(feature = "atomic")]
     use crate::io_core::{
-        inplace_overlay_insert, inplace_overlay_read, inplace_validate_read, inplace_validate_write,
-        journaled_multi_set,
+        inplace_overlay_insert, inplace_overlay_read, inplace_validate_read,
+        inplace_validate_write, journaled_multi_set,
     };
 
     /// A one-shot capability token authorizing guard-level access to a stack's
@@ -289,10 +289,16 @@ mod inner {
                         b_offset,
                         len,
                     }) => {
-                        let a_end =
-                            checked_end(a_offset, len, "process_gen: a_offset + len overflows u64")?;
-                        let b_end =
-                            checked_end(b_offset, len, "process_gen: b_offset + len overflows u64")?;
+                        let a_end = checked_end(
+                            a_offset,
+                            len,
+                            "process_gen: a_offset + len overflows u64",
+                        )?;
+                        let b_end = checked_end(
+                            b_offset,
+                            len,
+                            "process_gen: b_offset + len overflows u64",
+                        )?;
                         if len > 0 {
                             let (lo, hi) = if a_offset < b_offset {
                                 (a_offset, b_offset)
@@ -435,7 +441,9 @@ mod inner {
                         if new_tail_start < locked {
                             return Err(io_error!(
                                 InvalidInput,
-                                format!("process_gen: atrunc would modify locked region [0, {locked})")
+                                format!(
+                                    "process_gen: atrunc would modify locked region [0, {locked})"
+                                )
                             ));
                         }
                         self.acl_check(new_tail_start, data_size, AccessOp::Truncate, held)?;
@@ -462,7 +470,9 @@ mod inner {
                         if new_tail_start < locked {
                             return Err(io_error!(
                                 InvalidInput,
-                                format!("process_gen: splice would modify locked region [0, {locked})")
+                                format!(
+                                    "process_gen: splice would modify locked region [0, {locked})"
+                                )
                             ));
                         }
                         self.acl_check(new_tail_start, data_size, AccessOp::Truncate, held)?;
@@ -533,15 +543,11 @@ mod inner {
             loop {
                 match f(feedback) {
                     Some(BStackGenOp::Read { offset, buf }) => {
-                        feedback = match inplace_validate_read(offset, buf.len() as u64, data_size) {
+                        feedback = match inplace_validate_read(offset, buf.len() as u64, data_size)
+                        {
                             Err(e) => Err(e),
                             Ok(()) => self
-                                .acl_check(
-                                    offset,
-                                    offset + buf.len() as u64,
-                                    AccessOp::Read,
-                                    held,
-                                )
+                                .acl_check(offset, offset + buf.len() as u64, AccessOp::Read, held)
                                 .and_then(|()| {
                                     fault_probe!(self, "inplace_gen:read").map_or_else(
                                         || {
@@ -785,7 +791,12 @@ mod inner {
         // from the (universal) mint-burn and dealloc-reclaim wiring.
         #[allow(dead_code)]
         pub(crate) fn acl_mark_alloc(&self, offset: u64, len: u64) -> io::Result<()> {
-            self.protect_as(BStackAccessAuthorities::ALLOC, offset, len, BStackAccess::Alloc)
+            self.protect_as(
+                BStackAccessAuthorities::ALLOC,
+                offset,
+                len,
+                BStackAccess::Alloc,
+            )
         }
 
         /// Whether `[offset, offset + len)` may be reclaimed on `dealloc` — i.e.

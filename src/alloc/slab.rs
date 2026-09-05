@@ -422,7 +422,9 @@ impl SlabBStackAllocator {
         // rather than corrupting the list.
         self.stack.set(
             block_start,
-            self.stack.meta_read_u64(Self::FREE_HEAD_OFFSET)?.to_le_bytes(),
+            self.stack
+                .meta_read_u64(Self::FREE_HEAD_OFFSET)?
+                .to_le_bytes(),
         )?;
         self.stack
             .meta_set(Self::FREE_HEAD_OFFSET, block_start.to_le_bytes())

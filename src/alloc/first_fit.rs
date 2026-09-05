@@ -338,7 +338,8 @@ impl FirstFitBStackAllocator {
     #[cfg(not(feature = "atomic"))]
     #[inline]
     fn clear_recovery_needed(&self) -> io::Result<()> {
-        self.stack.meta_set(Self::OFFSET_SIZE + 8, [0u8; 4].as_slice())
+        self.stack
+            .meta_set(Self::OFFSET_SIZE + 8, [0u8; 4].as_slice())
     }
 
     #[cfg(feature = "atomic")]
@@ -471,7 +472,8 @@ impl FirstFitBStackAllocator {
         if prev != 0 {
             self.stack.set(prev, next.to_le_bytes())?;
         } else {
-            self.stack.meta_set(Self::FREE_HEAD_OFFSET, next.to_le_bytes())?;
+            self.stack
+                .meta_set(Self::FREE_HEAD_OFFSET, next.to_le_bytes())?;
         }
         if next != 0 {
             self.stack.set(next + 8, prev.to_le_bytes())?;
@@ -1170,7 +1172,8 @@ impl FirstFitBStackAllocator {
             if prev != 0 {
                 self.stack.set(prev, next.to_le_bytes())?;
             } else {
-                self.stack.meta_set(Self::FREE_HEAD_OFFSET, next.to_le_bytes())?;
+                self.stack
+                    .meta_set(Self::FREE_HEAD_OFFSET, next.to_le_bytes())?;
             }
 
             // Then commit forward pointer
@@ -1569,7 +1572,8 @@ impl FirstFitBStackAllocator {
         // Authoritative reset: recovery may have been triggered with the on-disk flag already
         // clear (e.g. an out-of-range free_head in `new`), so write 0 directly rather than via
         // the CAS clear, which under the `atomic` feature would fail when the flag is not 1.
-        self.stack.meta_set(Self::OFFSET_SIZE + 8, [0u8; 4].as_slice())
+        self.stack
+            .meta_set(Self::OFFSET_SIZE + 8, [0u8; 4].as_slice())
     }
 }
 
