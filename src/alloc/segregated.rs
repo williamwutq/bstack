@@ -3269,7 +3269,11 @@ mod tests {
         let _pin = a.alloc(200).unwrap(); // pins the tail, s is interior
         let s = a.realloc(s, 300).unwrap(); // large interior shrink → retain
         assert_eq!(s.start(), off, "interior shrink keeps the block in place");
-        assert_eq!(&s.read().unwrap()[..300], &[0x77u8; 300], "prefix preserved");
+        assert_eq!(
+            &s.read().unwrap()[..300],
+            &[0x77u8; 300],
+            "prefix preserved"
+        );
         assert_eq!(unsafe { a.recover() }.unwrap(), 0, "no stray free block");
         // Grow back within the retained extent fits in place, no move.
         let s = a.realloc(s, 5900).unwrap();
