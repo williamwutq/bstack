@@ -1314,6 +1314,266 @@ mod inner {
             }
         }
 
+        /// [`swap`](BStack::swap) presenting an access token.
+        #[cfg(feature = "atomic")]
+        pub fn swap_as(
+            &self,
+            auth: impl BStackAuthority,
+            offset: u64,
+            buf: impl AsRef<[u8]>,
+        ) -> io::Result<Vec<u8>> {
+            let buf = buf.as_ref();
+            if buf.is_empty() {
+                return Ok(Vec::new());
+            }
+            let held = auth.authorities_for(self);
+            let end = checked_end(offset, buf.len() as u64, "swap: offset + len overflows u64")?;
+            let mut guard = self.write_lock()?;
+            let (file, _, replay) = &mut *guard;
+            let locked = self.locked.load(Ordering::Acquire);
+            check_offset_unlocked("swap", offset, end, locked)?;
+            let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
+            if end > data_size {
+                return Err(io_error!(
+                    InvalidInput,
+                    format!("swap: range [{offset}, {end}) exceeds payload size ({data_size})")
+                ));
+            }
+            acl_check!(self, offset, end, Write, held);
+            fault_point!(self, "swap");
+            let mut old = vec![0u8; buf.len()];
+            read_at(file, offset, &mut old)?;
+            Self::mark_replay(replay, set_in_place(file, data_size, offset, buf))?;
+            Ok(old)
+        }
+
+        /// [`swap_into`](BStack::swap_into) presenting an access token.
+        #[cfg(feature = "atomic")]
+        pub fn swap_into_as(
+            &self,
+            auth: impl BStackAuthority,
+            offset: u64,
+            buf: &mut [u8],
+        ) -> io::Result<()> {
+            if buf.is_empty() {
+                return Ok(());
+            }
+            let held = auth.authorities_for(self);
+            let end = checked_end(
+                offset,
+                buf.len() as u64,
+                "swap_into: offset + len overflows u64",
+            )?;
+            let mut guard = self.write_lock()?;
+            let (file, _, replay) = &mut *guard;
+            let locked = self.locked.load(Ordering::Acquire);
+            check_offset_unlocked("swap_into", offset, end, locked)?;
+            let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
+            if end > data_size {
+                return Err(io_error!(
+                    InvalidInput,
+                    format!(
+                        "swap_into: range [{offset}, {end}) exceeds payload size ({data_size})"
+                    )
+                ));
+            }
+            acl_check!(self, offset, end, Write, held);
+            fault_point!(self, "swap_into");
+            let mut tmp = vec![0u8; buf.len()];
+            read_at(file, offset, &mut tmp)?;
+            Self::mark_replay(replay, set_in_place(file, data_size, offset, buf))?;
+            buf.copy_from_slice(&tmp);
+            Ok(())
+        }
+
+        /// [`splice`](BStack::splice) presenting an access token.
+        #[cfg(feature = "atomic")]
+        pub fn splice_as(
+            &self,
+            auth: impl BStackAuthority,
+            n: u64,
+            buf: impl AsRef<[u8]>,
+        ) -> io::Result<Vec<u8>> {
+            let buf = buf.as_ref();
+            let buf_len = buf.len() as u64;
+            if n == 0 && buf_len == 0 {
+                return Ok(Vec::new());
+            }
+            let held = auth.authorities_for(self);
+            let mut guard = self.write_lock()?;
+            let (file, clen, replay) = &mut *guard;
+            let file_end = file.seek(SeekFrom::End(0))?;
+            let data_size = file_end - HEADER_SIZE;
+            if n > data_size {
+                return Err(io_error!(
+                    InvalidInput,
+                    format!("splice: n ({n}) exceeds payload size ({data_size})")
+                ));
+            }
+            let locked = self.locked.load(Ordering::Acquire);
+            let new_tail_start = data_size - n;
+            if new_tail_start < locked {
+                return Err(io_error!(
+                    InvalidInput,
+                    format!("splice: operation would modify locked region [0, {locked})")
+                ));
+            }
+            acl_check!(self, new_tail_start, data_size, Truncate, held);
+            fault_point!(self, "splice");
+            let mut removed = vec![0u8; n as usize];
+            read_at(file, new_tail_start, &mut removed)?;
+            Self::mark_replay(
+                replay,
+                commit_tail_replace(file, clen, new_tail_start, n, buf, file_end),
+            )?;
+            Ok(removed)
+        }
+
+        /// [`splice_into`](BStack::splice_into) presenting an access token.
+        #[cfg(feature = "atomic")]
+        pub fn splice_into_as(
+            &self,
+            auth: impl BStackAuthority,
+            old: &mut [u8],
+            new: impl AsRef<[u8]>,
+        ) -> io::Result<()> {
+            let new = new.as_ref();
+            let n = old.len() as u64;
+            let new_len = new.len() as u64;
+            if n == 0 && new_len == 0 {
+                return Ok(());
+            }
+            let held = auth.authorities_for(self);
+            let mut guard = self.write_lock()?;
+            let (file, clen, replay) = &mut *guard;
+            let file_end = file.seek(SeekFrom::End(0))?;
+            let data_size = file_end - HEADER_SIZE;
+            if n > data_size {
+                return Err(io_error!(
+                    InvalidInput,
+                    format!("splice_into: n ({n}) exceeds payload size ({data_size})")
+                ));
+            }
+            let locked = self.locked.load(Ordering::Acquire);
+            let new_tail_start = data_size - n;
+            if new_tail_start < locked {
+                return Err(io_error!(
+                    InvalidInput,
+                    format!("splice_into: operation would modify locked region [0, {locked})")
+                ));
+            }
+            acl_check!(self, new_tail_start, data_size, Truncate, held);
+            fault_point!(self, "splice_into");
+            read_at(file, new_tail_start, old)?;
+            Self::mark_replay(
+                replay,
+                commit_tail_replace(file, clen, new_tail_start, n, new, file_end),
+            )
+        }
+
+        /// [`replace`](BStack::replace) presenting an access token.
+        #[cfg(feature = "atomic")]
+        pub fn replace_as<F>(&self, auth: impl BStackAuthority, n: u64, f: F) -> io::Result<()>
+        where
+            F: FnOnce(&[u8]) -> Vec<u8>,
+        {
+            let held = auth.authorities_for(self);
+            let mut guard = self.write_lock()?;
+            let (file, clen, replay) = &mut *guard;
+            let file_end = file.seek(SeekFrom::End(0))?;
+            let data_size = file_end - HEADER_SIZE;
+            if n > data_size {
+                return Err(io_error!(
+                    InvalidInput,
+                    format!("replace: n ({n}) exceeds payload size ({data_size})")
+                ));
+            }
+            let locked = self.locked.load(Ordering::Acquire);
+            let new_tail_start = data_size - n;
+            if new_tail_start < locked {
+                return Err(io_error!(
+                    InvalidInput,
+                    format!("replace: operation would modify locked region [0, {locked})")
+                ));
+            }
+            acl_check!(self, new_tail_start, data_size, Truncate, held);
+            fault_point!(self, "replace");
+            let mut old_tail = vec![0u8; n as usize];
+            read_at(file, new_tail_start, &mut old_tail)?;
+            let new_tail = f(&old_tail);
+            Self::mark_replay(
+                replay,
+                commit_tail_replace(file, clen, new_tail_start, n, &new_tail, file_end),
+            )
+        }
+
+        /// [`set_batched`](BStack::set_batched) presenting an access token.
+        #[cfg(feature = "atomic")]
+        pub fn set_batched_as<I, D>(&self, auth: impl BStackAuthority, writes: I) -> io::Result<()>
+        where
+            I: IntoIterator<Item = (u64, D)>,
+            D: AsRef<[u8]>,
+        {
+            let owned: Vec<(u64, D)> = writes.into_iter().collect();
+            let mut blocks: Vec<(u64, &[u8])> = owned
+                .iter()
+                .map(|(off, d)| (*off, d.as_ref()))
+                .filter(|(_, d)| !d.is_empty())
+                .collect();
+            if blocks.is_empty() {
+                return Ok(());
+            }
+            let held = auth.authorities_for(self);
+            let mut guard = self.write_lock()?;
+            let (file, _, replay) = &mut *guard;
+            let locked = self.locked.load(Ordering::Acquire);
+            let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
+            for (off, data) in &blocks {
+                let end = checked_end(
+                    *off,
+                    data.len() as u64,
+                    "set_batched: offset + len overflows u64",
+                )?;
+                if *off < locked {
+                    return Err(io_error!(
+                        InvalidInput,
+                        format!(
+                            "set_batched: write range [{off}, {end}) overlaps locked region [0, {locked})"
+                        )
+                    ));
+                }
+                if end > data_size {
+                    return Err(io_error!(
+                        InvalidInput,
+                        format!(
+                            "set_batched: write range [{off}, {end}) exceeds payload size ({data_size})"
+                        )
+                    ));
+                }
+                acl_check!(self, *off, end, Write, held);
+            }
+            fault_point!(self, "set_batched");
+            if blocks.len() == 1 {
+                let (off, data) = blocks[0];
+                return Self::mark_replay(replay, set_in_place(file, data_size, off, data));
+            }
+            blocks.sort_by_key(|(off, _)| *off);
+            for pair in blocks.windows(2) {
+                let (a_off, a_data) = pair[0];
+                let (b_off, _) = pair[1];
+                let a_end = a_off + a_data.len() as u64;
+                if a_end > b_off {
+                    return Err(io_error!(
+                        InvalidInput,
+                        format!(
+                            "set_batched: write range [{a_off}, {a_end}) overlaps [{b_off}, ...)"
+                        )
+                    ));
+                }
+            }
+            Self::mark_replay(replay, journaled_multi_set(file, data_size, &blocks))
+        }
+
         /// [`process`](BStack::process) presenting an access token.
         #[cfg(feature = "atomic")]
         pub fn process_as<F>(

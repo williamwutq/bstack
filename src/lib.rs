@@ -5580,6 +5580,57 @@ mod acl_tests {
     }
 
     #[test]
+    fn authorized_stack_compound_ops_reach_prot() {
+        let (s, p) = mk();
+        let _g = Guard(p);
+        seed(&s, 64);
+        let prot = s.take_protection().unwrap();
+        // Interior range for the in-place writes; tail range for the replacements.
+        s.protect_as(&prot, 16, 16, BStackAccess::Prot).unwrap();
+        s.protect_as(&prot, 48, 16, BStackAccess::Prot).unwrap();
+        let denied = |k: io::ErrorKind| assert_eq!(k, io::ErrorKind::PermissionDenied);
+
+        // swap over [16,20): tokenless denied, `swap_as` reaches it.
+        denied(s.swap(16, [0u8; 4]).unwrap_err().kind());
+        s.swap_as(&prot, 16, [1u8; 4]).unwrap();
+        assert_eq!(s.get_as(&prot, 16, 20).unwrap(), [1, 1, 1, 1]);
+
+        // swap_into over [16,20): reads back the bytes just written.
+        let mut buf = [2u8; 4];
+        denied(s.swap_into(16, &mut [0u8; 4]).unwrap_err().kind());
+        s.swap_into_as(&prot, 16, &mut buf).unwrap();
+        assert_eq!(buf, [1, 1, 1, 1]);
+        assert_eq!(s.get_as(&prot, 16, 20).unwrap(), [2, 2, 2, 2]);
+
+        // set_batched touching [16,20): tokenless denied, `set_batched_as` succeeds.
+        denied(
+            s.set_batched(std::iter::once((16u64, [3u8; 4])))
+                .unwrap_err()
+                .kind(),
+        );
+        s.set_batched_as(&prot, std::iter::once((16u64, [3u8; 4])))
+            .unwrap();
+        assert_eq!(s.get_as(&prot, 16, 20).unwrap(), [3, 3, 3, 3]);
+
+        // Tail replacements reaching [48,64) via a 20-byte tail (touches [44,64)).
+        denied(s.splice(20, []).unwrap_err().kind());
+        let removed = s.splice_as(&prot, 20, [7u8; 20]).unwrap();
+        assert_eq!(removed.len(), 20);
+        assert_eq!(s.get_as(&prot, 44, 64).unwrap(), [7u8; 20]);
+
+        let mut old = [0u8; 20];
+        denied(s.splice_into(&mut [0u8; 20], []).unwrap_err().kind());
+        s.splice_into_as(&prot, &mut old, [8u8; 20]).unwrap();
+        assert_eq!(old, [7u8; 20]);
+        assert_eq!(s.get_as(&prot, 44, 64).unwrap(), [8u8; 20]);
+
+        denied(s.replace(20, |b| b.to_vec()).unwrap_err().kind());
+        s.replace_as(&prot, 20, |b| b.iter().map(|x| x + 1).collect())
+            .unwrap();
+        assert_eq!(s.get_as(&prot, 44, 64).unwrap(), [9u8; 20]);
+    }
+
+    #[test]
     fn merge_requires_matching_authority() {
         let (s, p) = mk();
         let _g = Guard(p);
