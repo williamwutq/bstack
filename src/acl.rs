@@ -52,15 +52,16 @@ mod inner {
 
     #[cfg(feature = "atomic")]
     use crate::io_core::{
-        durable_sync, is_atomic_write, journaled_copy, journaled_exchange, journaled_move, read_at,
-        write_at,
+        durable_sync, is_atomic_write, journaled_copy, journaled_exchange, journaled_move, write_at,
     };
-    // Extra helpers used only by the duplicated `process_gen_as` journal engine.
+    // Frontier/tail commit helpers shared by the append/shrink/read `_as` siblings;
+    // these mirror non-atomic `BStack` methods, so they cannot be `atomic`-gated.
     #[cfg(feature = "atomic")]
-    use crate::io_core::{commit_grow, commit_sparse_extend, commit_tail_replace};
+    use crate::BStackGenOp;
     #[cfg(feature = "atomic")]
-    use crate::{BStackGenOp, validate_sparse_blocks};
-    #[cfg(feature = "atomic")]
+    use crate::io_core::commit_tail_replace;
+    use crate::io_core::{commit_grow, commit_sparse_extend, read_at};
+    use crate::validate_sparse_blocks;
     use std::io::Write;
     // Helpers for the duplicated `inplace_gen_as` engine.
     #[cfg(feature = "atomic")]
@@ -1857,6 +1858,749 @@ mod inner {
             read_at(file, b_offset, &mut old_b)?;
             Self::mark_replay(replay, set_in_place(file, data_size, b_offset, b_buf))?;
             Ok(Some(old_b))
+        }
+
+        /// [`push`](BStack::push) presenting an access token.
+        pub fn push_as(
+            &self,
+            auth: impl BStackAuthority,
+            data: impl AsRef<[u8]>,
+        ) -> io::Result<u64> {
+            let data = data.as_ref();
+            let held = auth.authorities_for(self);
+            let mut guard = self.write_lock()?;
+            let (file, clen, replay) = &mut *guard;
+            let file_end = file.seek(SeekFrom::End(0))?;
+            let logical_offset = file_end - HEADER_SIZE;
+            if data.is_empty() {
+                return Ok(logical_offset);
+            }
+            acl_check!(
+                self,
+                logical_offset,
+                logical_offset + data.len() as u64,
+                Write,
+                held
+            );
+            fault_point!(self, "push");
+            if let Err(e) = file.write_all(data) {
+                if file.set_len(file_end).is_err() {
+                    *replay = true;
+                }
+                return Err(e);
+            }
+            let new_len = logical_offset + data.len() as u64;
+            Self::mark_replay(
+                replay,
+                commit_grow(file, clen, new_len, logical_offset, file_end),
+            )?;
+            Ok(logical_offset)
+        }
+
+        /// [`extend`](BStack::extend) presenting an access token.
+        pub fn extend_as(&self, auth: impl BStackAuthority, n: u64) -> io::Result<u64> {
+            let held = auth.authorities_for(self);
+            let mut guard = self.write_lock()?;
+            let (file, clen, replay) = &mut *guard;
+            let file_end = file.seek(SeekFrom::End(0))?;
+            let logical_offset = file_end - HEADER_SIZE;
+            if n == 0 {
+                return Ok(logical_offset);
+            }
+            acl_check!(self, logical_offset, logical_offset + n, Write, held);
+            fault_point!(self, "extend");
+            let new_file_end = file_end + n;
+            Self::mark_replay(replay, file.set_len(new_file_end))?;
+            let new_len = logical_offset + n;
+            Self::mark_replay(
+                replay,
+                commit_grow(file, clen, new_len, logical_offset, file_end),
+            )?;
+            Ok(logical_offset)
+        }
+
+        /// [`extend_sparse`](BStack::extend_sparse) presenting an access token.
+        pub fn extend_sparse_as(
+            &self,
+            auth: impl BStackAuthority,
+            buf: impl AsRef<[u8]>,
+            length: u64,
+        ) -> io::Result<u64> {
+            let buf = buf.as_ref();
+            if buf.len() as u64 > length {
+                return Err(io_error!(
+                    InvalidInput,
+                    "extend_sparse: buffer length ({}) exceeds extension length ({length})",
+                    buf.len()
+                ));
+            }
+            let held = auth.authorities_for(self);
+            let mut guard = self.write_lock()?;
+            let (file, clen, replay) = &mut *guard;
+            let file_end = file.seek(SeekFrom::End(0))?;
+            let logical_offset = file_end - HEADER_SIZE;
+            if length == 0 {
+                return Ok(logical_offset);
+            }
+            let new_len = logical_offset.checked_add(length).ok_or_else(|| {
+                io_error!(
+                    InvalidInput,
+                    "extend_sparse: payload size + length overflows u64"
+                )
+            })?;
+            acl_check!(self, logical_offset, new_len, Write, held);
+            fault_point!(self, "extend_sparse");
+            let one = [(0u64, buf)];
+            let blocks: &[(u64, &[u8])] = if buf.is_empty() { &[] } else { &one };
+            Self::mark_replay(
+                replay,
+                commit_sparse_extend(file, clen, logical_offset, file_end, new_len, blocks),
+            )?;
+            Ok(logical_offset)
+        }
+
+        /// [`extend_sparse_batched`](BStack::extend_sparse_batched) presenting an access token.
+        pub fn extend_sparse_batched_as<I, D>(
+            &self,
+            auth: impl BStackAuthority,
+            writes: I,
+            length: u64,
+        ) -> io::Result<u64>
+        where
+            I: IntoIterator<Item = (u64, D)>,
+            D: AsRef<[u8]>,
+        {
+            let owned: Vec<(u64, D)> = writes.into_iter().collect();
+            let mut blocks: Vec<(u64, &[u8])> = owned
+                .iter()
+                .map(|(off, d)| (*off, d.as_ref()))
+                .filter(|(_, d)| !d.is_empty())
+                .collect();
+            validate_sparse_blocks(&mut blocks, length, "extend_sparse_batched")?;
+            let held = auth.authorities_for(self);
+            let mut guard = self.write_lock()?;
+            let (file, clen, replay) = &mut *guard;
+            let file_end = file.seek(SeekFrom::End(0))?;
+            let logical_offset = file_end - HEADER_SIZE;
+            if length == 0 {
+                return Ok(logical_offset);
+            }
+            let new_len = logical_offset.checked_add(length).ok_or_else(|| {
+                io_error!(
+                    InvalidInput,
+                    "extend_sparse_batched: payload size + length overflows u64"
+                )
+            })?;
+            acl_check!(self, logical_offset, new_len, Write, held);
+            fault_point!(self, "extend_sparse_batched");
+            Self::mark_replay(
+                replay,
+                commit_sparse_extend(file, clen, logical_offset, file_end, new_len, &blocks),
+            )?;
+            Ok(logical_offset)
+        }
+
+        /// [`pop`](BStack::pop) presenting an access token.
+        pub fn pop_as(&self, auth: impl BStackAuthority, n: u64) -> io::Result<Vec<u8>> {
+            let held = auth.authorities_for(self);
+            let mut guard = self.write_lock()?;
+            let (file, clen, replay) = &mut *guard;
+            let raw_size = file.seek(SeekFrom::End(0))?;
+            let data_size = raw_size - HEADER_SIZE;
+            if n > data_size {
+                return Err(io_error!(
+                    InvalidInput,
+                    format!("pop({n}) exceeds payload size ({data_size})")
+                ));
+            }
+            let new_data_len = data_size - n;
+            let locked = self.locked.load(Ordering::Acquire);
+            if new_data_len < locked {
+                return Err(io_error!(
+                    InvalidInput,
+                    format!("pop({n}) would shrink payload below locked length ({locked})")
+                ));
+            }
+            acl_check!(self, new_data_len, data_size, Truncate, held);
+            let mut buf = vec![0u8; n as usize];
+            fault_point!(self, "pop");
+            read_at(file, new_data_len, &mut buf)?;
+            Self::mark_replay(replay, commit_shrink(file, clen, new_data_len))?;
+            Ok(buf)
+        }
+
+        /// [`pop_into`](BStack::pop_into) presenting an access token.
+        pub fn pop_into_as(&self, auth: impl BStackAuthority, buf: &mut [u8]) -> io::Result<()> {
+            if buf.is_empty() {
+                return Ok(());
+            }
+            let n = buf.len() as u64;
+            let held = auth.authorities_for(self);
+            let mut guard = self.write_lock()?;
+            let (file, clen, replay) = &mut *guard;
+            let raw_size = file.seek(SeekFrom::End(0))?;
+            let data_size = raw_size - HEADER_SIZE;
+            if n > data_size {
+                return Err(io_error!(
+                    InvalidInput,
+                    format!("pop_into({n}) exceeds payload size ({data_size})")
+                ));
+            }
+            let new_data_len = data_size - n;
+            let locked = self.locked.load(Ordering::Acquire);
+            if new_data_len < locked {
+                return Err(io_error!(
+                    InvalidInput,
+                    format!("pop_into({n}) would shrink payload below locked length ({locked})")
+                ));
+            }
+            acl_check!(self, new_data_len, data_size, Truncate, held);
+            fault_point!(self, "pop_into");
+            read_at(file, new_data_len, buf)?;
+            Self::mark_replay(replay, commit_shrink(file, clen, new_data_len))?;
+            Ok(())
+        }
+
+        /// [`peek`](BStack::peek) presenting an access token.
+        pub fn peek_as(&self, auth: impl BStackAuthority, offset: u64) -> io::Result<Vec<u8>> {
+            let held = auth.authorities_for(self);
+            #[cfg(any(unix, windows))]
+            {
+                let guard = self.read_lock()?;
+                let file = &guard.0;
+                let data_size = file.metadata()?.len().saturating_sub(HEADER_SIZE);
+                if offset > data_size {
+                    return Err(io_error!(
+                        InvalidInput,
+                        format!("peek offset ({offset}) exceeds payload size ({data_size})")
+                    ));
+                }
+                acl_check!(self, offset, data_size, Read, held);
+                fault_point!(self, "peek");
+                pread_exact(file, HEADER_SIZE + offset, (data_size - offset) as usize)
+            }
+            #[cfg(not(any(unix, windows)))]
+            {
+                let mut guard = self.write_lock_read()?;
+                let file = &mut guard.0;
+                let raw_size = file.seek(SeekFrom::End(0))?;
+                let data_size = raw_size.saturating_sub(HEADER_SIZE);
+                if offset > data_size {
+                    return Err(io_error!(
+                        InvalidInput,
+                        format!("peek offset ({offset}) exceeds payload size ({data_size})")
+                    ));
+                }
+                acl_check!(self, offset, data_size, Read, held);
+                fault_point!(self, "peek");
+                file.seek(SeekFrom::Start(HEADER_SIZE + offset))?;
+                let mut buf = vec![0u8; (data_size - offset) as usize];
+                file.read_exact(&mut buf)?;
+                Ok(buf)
+            }
+        }
+
+        /// [`peek_into`](BStack::peek_into) presenting an access token.
+        pub fn peek_into_as(
+            &self,
+            auth: impl BStackAuthority,
+            offset: u64,
+            buf: &mut [u8],
+        ) -> io::Result<()> {
+            if buf.is_empty() {
+                return Ok(());
+            }
+            let len = buf.len() as u64;
+            let end = offset
+                .checked_add(len)
+                .ok_or_else(|| io_error!(InvalidInput, "peek_into: offset + len overflows u64"))?;
+            let held = auth.authorities_for(self);
+            acl_check!(self, offset, end, Read, held);
+            #[cfg(any(unix, windows))]
+            {
+                let guard = self.read_lock()?;
+                let file = &guard.0;
+                let data_size = file.metadata()?.len().saturating_sub(HEADER_SIZE);
+                if end > data_size {
+                    return Err(io_error!(
+                        InvalidInput,
+                        format!(
+                            "peek_into: range [{offset}, {end}) exceeds payload size ({data_size})"
+                        )
+                    ));
+                }
+                fault_point!(self, "peek_into");
+                pread_exact_into(file, HEADER_SIZE + offset, buf)
+            }
+            #[cfg(not(any(unix, windows)))]
+            {
+                let mut guard = self.write_lock_read()?;
+                let file = &mut guard.0;
+                let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
+                if end > data_size {
+                    return Err(io_error!(
+                        InvalidInput,
+                        format!(
+                            "peek_into: range [{offset}, {end}) exceeds payload size ({data_size})"
+                        )
+                    ));
+                }
+                fault_point!(self, "peek_into");
+                file.seek(SeekFrom::Start(HEADER_SIZE + offset))?;
+                file.read_exact(buf)
+            }
+        }
+
+        /// [`atrunc`](BStack::atrunc) presenting an access token.
+        #[cfg(feature = "atomic")]
+        pub fn atrunc_as(
+            &self,
+            auth: impl BStackAuthority,
+            n: u64,
+            buf: impl AsRef<[u8]>,
+        ) -> io::Result<()> {
+            let buf = buf.as_ref();
+            let buf_len = buf.len() as u64;
+            if n == 0 && buf_len == 0 {
+                return Ok(());
+            }
+            let held = auth.authorities_for(self);
+            let mut guard = self.write_lock()?;
+            let (file, clen, replay) = &mut *guard;
+            let file_end = file.seek(SeekFrom::End(0))?;
+            let data_size = file_end - HEADER_SIZE;
+            if n > data_size {
+                return Err(io_error!(
+                    InvalidInput,
+                    format!("atrunc: n ({n}) exceeds payload size ({data_size})")
+                ));
+            }
+            let locked = self.locked.load(Ordering::Acquire);
+            let new_tail_start = data_size - n;
+            if new_tail_start < locked {
+                return Err(io_error!(
+                    InvalidInput,
+                    format!("atrunc: operation would modify locked region [0, {locked})")
+                ));
+            }
+            acl_check!(self, new_tail_start, data_size, Truncate, held);
+            fault_point!(self, "atrunc");
+            Self::mark_replay(
+                replay,
+                commit_tail_replace(file, clen, new_tail_start, n, buf, file_end),
+            )
+        }
+
+        /// [`try_extend`](BStack::try_extend) presenting an access token.
+        #[cfg(feature = "atomic")]
+        pub fn try_extend_as(
+            &self,
+            auth: impl BStackAuthority,
+            s: u64,
+            buf: impl AsRef<[u8]>,
+        ) -> io::Result<bool> {
+            let buf = buf.as_ref();
+            let held = auth.authorities_for(self);
+            let mut guard = self.write_lock()?;
+            let (file, clen, replay) = &mut *guard;
+            let file_end = file.seek(SeekFrom::End(0))?;
+            let data_size = file_end - HEADER_SIZE;
+            if data_size != s {
+                return Ok(false);
+            }
+            if buf.is_empty() {
+                return Ok(true);
+            }
+            acl_check!(self, data_size, data_size + buf.len() as u64, Write, held);
+            fault_point!(self, "try_extend");
+            if let Err(e) = file.write_all(buf) {
+                if file.set_len(file_end).is_err() {
+                    *replay = true;
+                }
+                return Err(e);
+            }
+            let new_len = data_size + buf.len() as u64;
+            Self::mark_replay(
+                replay,
+                commit_grow(file, clen, new_len, data_size, file_end),
+            )?;
+            Ok(true)
+        }
+
+        /// [`try_extend_zeros`](BStack::try_extend_zeros) presenting an access token.
+        #[cfg(feature = "atomic")]
+        pub fn try_extend_zeros_as(
+            &self,
+            auth: impl BStackAuthority,
+            s: u64,
+            n: u64,
+        ) -> io::Result<bool> {
+            let held = auth.authorities_for(self);
+            let mut guard = self.write_lock()?;
+            let (file, clen, replay) = &mut *guard;
+            let file_end = file.seek(SeekFrom::End(0))?;
+            let data_size = file_end - HEADER_SIZE;
+            if data_size != s {
+                return Ok(false);
+            }
+            if n == 0 {
+                return Ok(true);
+            }
+            let new_len = checked_end(
+                data_size,
+                n,
+                "try_extend_zeros: data_size + n overflows u64",
+            )?;
+            acl_check!(self, data_size, new_len, Write, held);
+            fault_point!(self, "try_extend_zeros");
+            Self::mark_replay(replay, file.set_len(HEADER_SIZE + new_len))?;
+            Self::mark_replay(
+                replay,
+                commit_grow(file, clen, new_len, data_size, file_end),
+            )?;
+            Ok(true)
+        }
+
+        /// [`try_extend_sparse`](BStack::try_extend_sparse) presenting an access token.
+        #[cfg(feature = "atomic")]
+        pub fn try_extend_sparse_as(
+            &self,
+            auth: impl BStackAuthority,
+            s: u64,
+            buf: impl AsRef<[u8]>,
+            length: u64,
+        ) -> io::Result<bool> {
+            let buf = buf.as_ref();
+            if buf.len() as u64 > length {
+                return Err(io_error!(
+                    InvalidInput,
+                    "try_extend_sparse: buffer length ({}) exceeds extension length ({length})",
+                    buf.len()
+                ));
+            }
+            let held = auth.authorities_for(self);
+            let mut guard = self.write_lock()?;
+            let (file, clen, replay) = &mut *guard;
+            let file_end = file.seek(SeekFrom::End(0))?;
+            let data_size = file_end - HEADER_SIZE;
+            if data_size != s {
+                return Ok(false);
+            }
+            if length == 0 {
+                return Ok(true);
+            }
+            let new_len = checked_end(
+                data_size,
+                length,
+                "try_extend_sparse: data_size + length overflows u64",
+            )?;
+            acl_check!(self, data_size, new_len, Write, held);
+            fault_point!(self, "try_extend_sparse");
+            let one = [(0u64, buf)];
+            let blocks: &[(u64, &[u8])] = if buf.is_empty() { &[] } else { &one };
+            Self::mark_replay(
+                replay,
+                commit_sparse_extend(file, clen, data_size, file_end, new_len, blocks),
+            )?;
+            Ok(true)
+        }
+
+        /// [`try_extend_sparse_batched`](BStack::try_extend_sparse_batched) presenting a token.
+        #[cfg(feature = "atomic")]
+        pub fn try_extend_sparse_batched_as<I, D>(
+            &self,
+            auth: impl BStackAuthority,
+            s: u64,
+            writes: I,
+            length: u64,
+        ) -> io::Result<bool>
+        where
+            I: IntoIterator<Item = (u64, D)>,
+            D: AsRef<[u8]>,
+        {
+            let owned: Vec<(u64, D)> = writes.into_iter().collect();
+            let mut blocks: Vec<(u64, &[u8])> = owned
+                .iter()
+                .map(|(off, d)| (*off, d.as_ref()))
+                .filter(|(_, d)| !d.is_empty())
+                .collect();
+            validate_sparse_blocks(&mut blocks, length, "try_extend_sparse_batched")?;
+            let held = auth.authorities_for(self);
+            let mut guard = self.write_lock()?;
+            let (file, clen, replay) = &mut *guard;
+            let file_end = file.seek(SeekFrom::End(0))?;
+            let data_size = file_end - HEADER_SIZE;
+            if data_size != s {
+                return Ok(false);
+            }
+            if length == 0 {
+                return Ok(true);
+            }
+            let new_len = checked_end(
+                data_size,
+                length,
+                "try_extend_sparse_batched: data_size + length overflows u64",
+            )?;
+            acl_check!(self, data_size, new_len, Write, held);
+            fault_point!(self, "try_extend_sparse_batched");
+            Self::mark_replay(
+                replay,
+                commit_sparse_extend(file, clen, data_size, file_end, new_len, &blocks),
+            )?;
+            Ok(true)
+        }
+
+        /// [`try_discard`](BStack::try_discard) presenting an access token.
+        #[cfg(feature = "atomic")]
+        pub fn try_discard_as(
+            &self,
+            auth: impl BStackAuthority,
+            s: u64,
+            n: u64,
+        ) -> io::Result<bool> {
+            if n == 0 {
+                let guard = self.read_lock()?;
+                let file = &guard.0;
+                let data_size = file.metadata()?.len().saturating_sub(HEADER_SIZE);
+                return Ok(data_size == s);
+            }
+            let held = auth.authorities_for(self);
+            let mut guard = self.write_lock()?;
+            let (file, clen, replay) = &mut *guard;
+            let raw_size = file.seek(SeekFrom::End(0))?;
+            let data_size = raw_size - HEADER_SIZE;
+            if data_size != s {
+                return Ok(false);
+            }
+            if n > data_size {
+                return Err(io_error!(
+                    InvalidInput,
+                    format!("try_discard: n ({n}) exceeds payload size ({data_size})")
+                ));
+            }
+            let new_data_len = data_size - n;
+            let locked = self.locked.load(Ordering::Acquire);
+            if new_data_len < locked {
+                return Err(io_error!(
+                    InvalidInput,
+                    format!("try_discard: would shrink payload below locked length ({locked})")
+                ));
+            }
+            acl_check!(self, new_data_len, data_size, Truncate, held);
+            fault_point!(self, "try_discard");
+            Self::mark_replay(replay, commit_shrink(file, clen, new_data_len))?;
+            Ok(true)
+        }
+
+        /// [`get_batched`](BStack::get_batched) presenting an access token.
+        #[cfg(feature = "atomic")]
+        pub fn get_batched_as<I>(
+            &self,
+            auth: impl BStackAuthority,
+            ranges: I,
+        ) -> io::Result<Vec<Vec<u8>>>
+        where
+            I: IntoIterator<Item = std::ops::Range<u64>>,
+        {
+            let held = auth.authorities_for(self);
+            let ranges: Vec<std::ops::Range<u64>> = ranges.into_iter().collect();
+            if ranges.is_empty() {
+                return Ok(Vec::new());
+            }
+            for r in &ranges {
+                if r.end < r.start {
+                    return Err(io_error!(
+                        InvalidInput,
+                        "get_batched: end ({}) < start ({})",
+                        r.end,
+                        r.start
+                    ));
+                }
+                acl_check!(self, r.start, r.end, Read, held);
+            }
+            #[cfg(any(unix, windows))]
+            {
+                let guard = self.read_lock()?;
+                let file = &guard.0;
+                let data_size = file.metadata()?.len().saturating_sub(HEADER_SIZE);
+                fault_point!(self, "get_batched");
+                let mut results = Vec::with_capacity(ranges.len());
+                for r in &ranges {
+                    if r.end > data_size {
+                        return Err(io_error!(
+                            InvalidInput,
+                            "get_batched: end ({}) exceeds payload size ({data_size})",
+                            r.end
+                        ));
+                    }
+                    results.push(pread_exact(
+                        file,
+                        HEADER_SIZE + r.start,
+                        (r.end - r.start) as usize,
+                    )?);
+                }
+                Ok(results)
+            }
+            #[cfg(not(any(unix, windows)))]
+            {
+                let mut guard = self.write_lock_read()?;
+                let file = &mut guard.0;
+                let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
+                fault_point!(self, "get_batched");
+                let mut results = Vec::with_capacity(ranges.len());
+                for r in &ranges {
+                    if r.end > data_size {
+                        return Err(io_error!(
+                            InvalidInput,
+                            "get_batched: end ({}) exceeds payload size ({data_size})",
+                            r.end
+                        ));
+                    }
+                    file.seek(SeekFrom::Start(HEADER_SIZE + r.start))?;
+                    let mut buf = vec![0u8; (r.end - r.start) as usize];
+                    file.read_exact(&mut buf)?;
+                    results.push(buf);
+                }
+                Ok(results)
+            }
+        }
+
+        /// [`get_batched_into`](BStack::get_batched_into) presenting an access token.
+        #[cfg(feature = "atomic")]
+        pub fn get_batched_into_as<'a, I>(
+            &self,
+            auth: impl BStackAuthority,
+            bufs: I,
+        ) -> io::Result<()>
+        where
+            I: IntoIterator<Item = (u64, &'a mut [u8])>,
+        {
+            let held = auth.authorities_for(self);
+            let bufs: Vec<(u64, &'a mut [u8])> = bufs.into_iter().collect();
+            if bufs.is_empty() {
+                return Ok(());
+            }
+            #[cfg(any(unix, windows))]
+            {
+                let guard = self.read_lock()?;
+                let file = &guard.0;
+                let data_size = file.metadata()?.len().saturating_sub(HEADER_SIZE);
+                fault_point!(self, "get_batched_into");
+                for (ptr, buf) in bufs {
+                    let end = ptr.checked_add(buf.len() as u64).ok_or_else(|| {
+                        io_error!(
+                            InvalidInput,
+                            "get_batched_into: offset + buf.len() overflows u64"
+                        )
+                    })?;
+                    if end > data_size {
+                        return Err(io_error!(
+                            InvalidInput,
+                            format!(
+                                "get_batched_into: end ({end}) exceeds payload size ({data_size})",
+                            )
+                        ));
+                    }
+                    acl_check!(self, ptr, end, Read, held);
+                    pread_exact_into(file, HEADER_SIZE + ptr, buf)?;
+                }
+                Ok(())
+            }
+            #[cfg(not(any(unix, windows)))]
+            {
+                let mut guard = self.write_lock_read()?;
+                let file = &mut guard.0;
+                let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
+                fault_point!(self, "get_batched_into");
+                for (ptr, buf) in bufs {
+                    let end = ptr.checked_add(buf.len() as u64).ok_or_else(|| {
+                        io_error!(
+                            InvalidInput,
+                            "get_batched_into: offset + buf.len() overflows u64"
+                        )
+                    })?;
+                    if end > data_size {
+                        return Err(io_error!(
+                            InvalidInput,
+                            format!(
+                                "get_batched_into: end ({end}) exceeds payload size ({data_size})",
+                            )
+                        ));
+                    }
+                    acl_check!(self, ptr, end, Read, held);
+                    file.seek(SeekFrom::Start(HEADER_SIZE + ptr))?;
+                    file.read_exact(buf)?;
+                }
+                Ok(())
+            }
+        }
+
+        /// [`get_batched_gen`](BStack::get_batched_gen) presenting an access token.
+        #[cfg(feature = "atomic")]
+        pub fn get_batched_gen_as<'a, F>(
+            &self,
+            auth: impl BStackAuthority,
+            mut f: F,
+        ) -> io::Result<()>
+        where
+            F: FnMut() -> Option<(u64, &'a mut [u8])>,
+        {
+            let held = auth.authorities_for(self);
+            #[cfg(any(unix, windows))]
+            {
+                let guard = self.read_lock()?;
+                let file = &guard.0;
+                let data_size = file.metadata()?.len().saturating_sub(HEADER_SIZE);
+                fault_point!(self, "get_batched_gen");
+                while let Some((offset, buf)) = f() {
+                    let end = offset.checked_add(buf.len() as u64).ok_or_else(|| {
+                        io_error!(
+                            InvalidInput,
+                            "get_batched_gen: offset + buf.len() overflows u64"
+                        )
+                    })?;
+                    if end > data_size {
+                        return Err(io_error!(
+                            InvalidInput,
+                            format!(
+                                "get_batched_gen: end ({end}) exceeds payload size ({data_size})"
+                            )
+                        ));
+                    }
+                    acl_check!(self, offset, end, Read, held);
+                    fault_point!(self, "get_batched_gen:read");
+                    pread_exact_into(file, HEADER_SIZE + offset, buf)?;
+                }
+                Ok(())
+            }
+            #[cfg(not(any(unix, windows)))]
+            {
+                let mut guard = self.write_lock_read()?;
+                let file = &mut guard.0;
+                let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
+                fault_point!(self, "get_batched_gen");
+                while let Some((offset, buf)) = f() {
+                    let end = offset.checked_add(buf.len() as u64).ok_or_else(|| {
+                        io_error!(
+                            InvalidInput,
+                            "get_batched_gen: offset + buf.len() overflows u64"
+                        )
+                    })?;
+                    if end > data_size {
+                        return Err(io_error!(
+                            InvalidInput,
+                            format!(
+                                "get_batched_gen: end ({end}) exceeds payload size ({data_size})"
+                            )
+                        ));
+                    }
+                    acl_check!(self, offset, end, Read, held);
+                    fault_point!(self, "get_batched_gen:read");
+                    file.seek(SeekFrom::Start(HEADER_SIZE + offset))?;
+                    file.read_exact(buf)?;
+                }
+                Ok(())
+            }
         }
     }
 }

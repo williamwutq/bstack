@@ -5630,6 +5630,177 @@ mod acl_tests {
         assert_eq!(s.get_as(&prot, 44, 64).unwrap(), [9u8; 20]);
     }
 
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn authorized_stack_append_ops_reach_prot() {
+        // Appends land in a Prot window armed just past the tail: tokenless denied,
+        // `_as` reaches it. Chained so each op fills the next slice of the window.
+        let (s, p) = mk();
+        let _g = Guard(p);
+        seed(&s, 48);
+        let prot = s.take_protection().unwrap();
+        s.protect_as(&prot, 48, 32, BStackAccess::Prot).unwrap();
+        let denied = |k: io::ErrorKind| assert_eq!(k, io::ErrorKind::PermissionDenied);
+
+        denied(s.push([1u8; 4]).unwrap_err().kind());
+        assert_eq!(s.push_as(&prot, [1u8; 4]).unwrap(), 48);
+
+        denied(s.extend(4).unwrap_err().kind());
+        assert_eq!(s.extend_as(&prot, 4).unwrap(), 52);
+
+        denied(s.extend_sparse([2u8; 2], 4).unwrap_err().kind());
+        assert_eq!(s.extend_sparse_as(&prot, [2u8; 2], 4).unwrap(), 56);
+
+        denied(
+            s.extend_sparse_batched(std::iter::once((0u64, [3u8; 2])), 4)
+                .unwrap_err()
+                .kind(),
+        );
+        assert_eq!(
+            s.extend_sparse_batched_as(&prot, std::iter::once((0u64, [3u8; 2])), 4)
+                .unwrap(),
+            60
+        );
+
+        denied(s.try_extend(64, [4u8; 4]).unwrap_err().kind());
+        assert!(s.try_extend_as(&prot, 64, [4u8; 4]).unwrap());
+
+        denied(s.try_extend_zeros(68, 4).unwrap_err().kind());
+        assert!(s.try_extend_zeros_as(&prot, 68, 4).unwrap());
+
+        denied(s.try_extend_sparse(72, [5u8; 2], 4).unwrap_err().kind());
+        assert!(s.try_extend_sparse_as(&prot, 72, [5u8; 2], 4).unwrap());
+
+        denied(
+            s.try_extend_sparse_batched(76, std::iter::once((0u64, [6u8; 2])), 4)
+                .unwrap_err()
+                .kind(),
+        );
+        assert!(
+            s.try_extend_sparse_batched_as(&prot, 76, std::iter::once((0u64, [6u8; 2])), 4)
+                .unwrap()
+        );
+        assert_eq!(s.len().unwrap(), 80);
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn authorized_stack_removal_ops_reach_prot() {
+        // Tail removals reaching a Prot tail are denied tokenless and succeed with
+        // the token. Fresh stack per op keeps the protected region well-defined.
+        let denied = |k: io::ErrorKind| assert_eq!(k, io::ErrorKind::PermissionDenied);
+        {
+            let (s, p) = mk();
+            let _g = Guard(p);
+            seed(&s, 64);
+            let prot = s.take_protection().unwrap();
+            s.protect_as(&prot, 48, 16, BStackAccess::Prot).unwrap();
+            denied(s.pop(20).unwrap_err().kind());
+            assert_eq!(s.pop_as(&prot, 20).unwrap().len(), 20);
+            assert_eq!(s.len().unwrap(), 44);
+        }
+        {
+            let (s, p) = mk();
+            let _g = Guard(p);
+            seed(&s, 64);
+            let prot = s.take_protection().unwrap();
+            s.protect_as(&prot, 48, 16, BStackAccess::Prot).unwrap();
+            let mut buf = [0u8; 20];
+            denied(s.pop_into(&mut [0u8; 20]).unwrap_err().kind());
+            s.pop_into_as(&prot, &mut buf).unwrap();
+            assert_eq!(s.len().unwrap(), 44);
+        }
+        {
+            // atrunc actually rewrites the tail, so its check matters most here.
+            let (s, p) = mk();
+            let _g = Guard(p);
+            seed(&s, 64);
+            let prot = s.take_protection().unwrap();
+            s.protect_as(&prot, 48, 16, BStackAccess::Prot).unwrap();
+            denied(s.atrunc(20, [1u8; 4]).unwrap_err().kind());
+            s.atrunc_as(&prot, 20, [1u8; 4]).unwrap();
+            assert_eq!(s.len().unwrap(), 48);
+        }
+        {
+            let (s, p) = mk();
+            let _g = Guard(p);
+            seed(&s, 64);
+            let prot = s.take_protection().unwrap();
+            s.protect_as(&prot, 48, 16, BStackAccess::Prot).unwrap();
+            denied(s.try_discard(64, 20).unwrap_err().kind());
+            assert!(s.try_discard_as(&prot, 64, 20).unwrap());
+            assert_eq!(s.len().unwrap(), 44);
+        }
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn authorized_stack_read_ops_reach_prot() {
+        let (s, p) = mk();
+        let _g = Guard(p);
+        seed(&s, 64);
+        let prot = s.take_protection().unwrap();
+        s.protect_as(&prot, 16, 16, BStackAccess::Prot).unwrap();
+        s.set_as(&prot, 16, [5u8; 16]).unwrap();
+        let denied = |k: io::ErrorKind| assert_eq!(k, io::ErrorKind::PermissionDenied);
+
+        // peek reads from offset to end; starting inside the Prot region is denied.
+        denied(s.peek(16).unwrap_err().kind());
+        assert_eq!(&s.peek_as(&prot, 16).unwrap()[..4], &[5, 5, 5, 5]);
+
+        let mut b = [0u8; 4];
+        denied(s.peek_into(16, &mut [0u8; 4]).unwrap_err().kind());
+        s.peek_into_as(&prot, 16, &mut b).unwrap();
+        assert_eq!(b, [5, 5, 5, 5]);
+
+        denied(s.get_batched(std::iter::once(16..20)).unwrap_err().kind());
+        assert_eq!(
+            s.get_batched_as(&prot, std::iter::once(16..20)).unwrap()[0],
+            vec![5, 5, 5, 5]
+        );
+
+        let mut b2 = [0u8; 4];
+        {
+            let mut dbuf = [0u8; 4];
+            denied(
+                s.get_batched_into(std::iter::once((16u64, &mut dbuf[..])))
+                    .unwrap_err()
+                    .kind(),
+            );
+        }
+        s.get_batched_into_as(&prot, std::iter::once((16u64, &mut b2[..])))
+            .unwrap();
+        assert_eq!(b2, [5, 5, 5, 5]);
+
+        // Lending closure: yield a raw-pointer slice, as the other gen tests do.
+        let mut gbuf = [0u8; 4];
+        let ptr = gbuf.as_mut_ptr();
+        let mut called = false;
+        denied(
+            s.get_batched_gen(|| {
+                if called {
+                    None
+                } else {
+                    called = true;
+                    Some((16u64, unsafe { std::slice::from_raw_parts_mut(ptr, 4) }))
+                }
+            })
+            .unwrap_err()
+            .kind(),
+        );
+        let mut called2 = false;
+        s.get_batched_gen_as(&prot, || {
+            if called2 {
+                None
+            } else {
+                called2 = true;
+                Some((16u64, unsafe { std::slice::from_raw_parts_mut(ptr, 4) }))
+            }
+        })
+        .unwrap();
+        assert_eq!(gbuf, [5, 5, 5, 5]);
+    }
+
     #[test]
     fn merge_requires_matching_authority() {
         let (s, p) = mk();
