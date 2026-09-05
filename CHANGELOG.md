@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **`SegregatedBStackAllocator` (Rust) / `segregated_bstack_allocator_*` (C) shrink/split heuristics tuned (`alloc` + `set` / `BSTACK_FEATURE_SET`; the tail-shrink reclaim additionally `atomic` / `BSTACK_FEATURE_ATOMIC`).** `SPLIT_MIN` / `ALSG_SPLIT_MIN` raised from `LINEAR_MAX` (256) to `MAX_CLASS` (4096): a smaller excess is now retained as slack rather than carved into the class free lists, where the pieces rarely reuse and strand as dead arena. Separately, a non-tail (interior) shrink now always retains its freed excess in place instead of carving it — only a *tail* shrink still reclaims, and only under `atomic` / `BSTACK_FEATURE_ATOMIC`, via the existing `Len` + `Atrunc` (`BSTACK_GEN_LEN` + `BSTACK_GEN_SPLICE`). Both cut durable syncs and file growth on skewed and realloc-heavy workloads. Heuristics only and the on-disk format is unchanged.
+
 ## [0.4.4] - 2026-09-04
 
 ### Added
