@@ -1919,6 +1919,55 @@ mod inner {
             Ok(logical_offset)
         }
 
+        /// [`resize`](BStack::resize) presenting an access token.
+        pub fn resize_as(&self, auth: impl BStackAuthority, target: u64) -> io::Result<u64> {
+            let held = auth.authorities_for(self);
+            let mut guard = self.write_lock()?;
+            let (file, clen, replay) = &mut *guard;
+            let file_end = file.seek(SeekFrom::End(0))?;
+            let data_size = file_end - HEADER_SIZE;
+            if target == data_size {
+                return Ok(data_size);
+            }
+            if target < data_size {
+                let locked = self.locked.load(Ordering::Acquire);
+                if target < locked {
+                    return Err(io_error!(
+                        InvalidInput,
+                        format!(
+                            "resize({target}) would shrink payload below locked length ({locked})"
+                        )
+                    ));
+                }
+                acl_check!(self, target, data_size, Truncate, held);
+                fault_point!(self, "resize");
+                Self::mark_replay(replay, commit_shrink(file, clen, target))?;
+                return Ok(data_size);
+            }
+            acl_check!(self, data_size, target, Write, held);
+            fault_point!(self, "resize");
+            Self::mark_replay(replay, file.set_len(HEADER_SIZE + target))?;
+            Self::mark_replay(replay, commit_grow(file, clen, target, data_size, file_end))?;
+            Ok(data_size)
+        }
+
+        /// [`ensure`](BStack::ensure) presenting an access token.
+        pub fn ensure_as(&self, auth: impl BStackAuthority, target: u64) -> io::Result<u64> {
+            let held = auth.authorities_for(self);
+            let mut guard = self.write_lock()?;
+            let (file, clen, replay) = &mut *guard;
+            let file_end = file.seek(SeekFrom::End(0))?;
+            let data_size = file_end - HEADER_SIZE;
+            if target <= data_size {
+                return Ok(data_size);
+            }
+            acl_check!(self, data_size, target, Write, held);
+            fault_point!(self, "ensure");
+            Self::mark_replay(replay, file.set_len(HEADER_SIZE + target))?;
+            Self::mark_replay(replay, commit_grow(file, clen, target, data_size, file_end))?;
+            Ok(data_size)
+        }
+
         /// [`extend_sparse`](BStack::extend_sparse) presenting an access token.
         pub fn extend_sparse_as(
             &self,
@@ -2653,6 +2702,7 @@ impl crate::BStack {
 }
 
 #[cfg(all(
+    feature = "alloc",
     feature = "set",
     feature = "atomic",
     not(feature = "expensive-slice-access-control")

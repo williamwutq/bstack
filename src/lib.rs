@@ -1569,11 +1569,13 @@ impl BStack {
                     format!("resize({target}) would shrink payload below locked length ({locked})")
                 ));
             }
+            acl_check!(self, target, data_size, Truncate);
             fault_point!(self, "resize");
             Self::mark_replay(replay, commit_shrink(file, clen, target))?;
             return Ok(data_size);
         }
 
+        acl_check!(self, data_size, target, Write);
         fault_point!(self, "resize");
         Self::mark_replay(replay, file.set_len(HEADER_SIZE + target))?;
         Self::mark_replay(replay, commit_grow(file, clen, target, data_size, file_end))?;
@@ -1605,6 +1607,7 @@ impl BStack {
             return Ok(data_size);
         }
 
+        acl_check!(self, data_size, target, Write);
         fault_point!(self, "ensure");
         Self::mark_replay(replay, file.set_len(HEADER_SIZE + target))?;
         Self::mark_replay(replay, commit_grow(file, clen, target, data_size, file_end))?;
@@ -5799,6 +5802,44 @@ mod acl_tests {
         })
         .unwrap();
         assert_eq!(gbuf, [5, 5, 5, 5]);
+    }
+
+    #[test]
+    fn authorized_stack_resize_ops_reach_prot() {
+        let denied = |k: io::ErrorKind| assert_eq!(k, io::ErrorKind::PermissionDenied);
+        // resize shrink reaching a Prot tail.
+        {
+            let (s, p) = mk();
+            let _g = Guard(p);
+            seed(&s, 64);
+            let prot = s.take_protection().unwrap();
+            s.protect_as(&prot, 48, 16, BStackAccess::Prot).unwrap();
+            denied(s.resize(44).unwrap_err().kind());
+            assert_eq!(s.resize_as(&prot, 44).unwrap(), 64);
+            assert_eq!(s.len().unwrap(), 44);
+        }
+        // resize grow into a Prot region armed past the tail.
+        {
+            let (s, p) = mk();
+            let _g = Guard(p);
+            seed(&s, 48);
+            let prot = s.take_protection().unwrap();
+            s.protect_as(&prot, 48, 16, BStackAccess::Prot).unwrap();
+            denied(s.resize(60).unwrap_err().kind());
+            assert_eq!(s.resize_as(&prot, 60).unwrap(), 48);
+            assert_eq!(s.len().unwrap(), 60);
+        }
+        // ensure grow into a Prot region.
+        {
+            let (s, p) = mk();
+            let _g = Guard(p);
+            seed(&s, 48);
+            let prot = s.take_protection().unwrap();
+            s.protect_as(&prot, 48, 16, BStackAccess::Prot).unwrap();
+            denied(s.ensure(60).unwrap_err().kind());
+            assert_eq!(s.ensure_as(&prot, 60).unwrap(), 48);
+            assert_eq!(s.len().unwrap(), 60);
+        }
     }
 
     #[test]

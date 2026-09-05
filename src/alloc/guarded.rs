@@ -30,7 +30,10 @@
 //! [`as_slice`]: BStackGuardedSlice::as_slice
 //! [`raw_block`]: BStackGuardedSlice::raw_block
 
-use super::{BStackAllocator, BStackOwnedSlice, BStackRange, BStackSlice};
+use super::{BStackAllocator, BStackRange, BStackSlice};
+// Used only by the `set`-gated `to_owned_in`/`to_owned_uninit_in`.
+#[cfg(feature = "set")]
+use super::BStackOwnedSlice;
 use std::{borrow::Cow, io, ops::Range};
 
 /// A [`BStackSlice`] abstraction with lifecycle hooks for transparent I/O
@@ -1115,7 +1118,6 @@ mod tests {
     #[cfg(feature = "set")]
     #[test]
     fn to_owned_in_copies_decoded_bytes() {
-        use crate::BStackAllocator;
         let (stack, _c) = mk_stack();
         let key = 0x5A;
         let plain = b"secret payload!!";
