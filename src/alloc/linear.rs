@@ -105,6 +105,7 @@ impl LinearBStackAllocator {
     #[inline]
     #[must_use]
     pub fn new(stack: BStack) -> Self {
+        stack.acl_claim_alloc();
         Self {
             stack,
             #[cfg(not(feature = "atomic"))]
@@ -259,6 +260,9 @@ impl BStackAllocator for LinearBStackAllocator {
         let start = handle.start();
         let end = handle.end();
         let len = handle.len();
+        if let Err(source) = self.stack.acl_reclaim(start, len) {
+            return Err(BStackAllocError::with_handle(source, handle));
+        }
         (|| -> io::Result<()> {
             let current_tail = self.stack.len()?;
             if end == current_tail {
@@ -283,6 +287,9 @@ impl BStackAllocator for LinearBStackAllocator {
         let start = handle.start();
         let end = handle.end();
         let len = handle.len();
+        if let Err(source) = self.stack.acl_reclaim(start, len) {
+            return Err(BStackAllocError::with_handle(source, handle));
+        }
         // try_discard is a no-op when the tail has moved, matching non-tail dealloc semantics.
         self.stack
             .try_discard(end, len)
@@ -422,6 +429,11 @@ impl BStackBulkAllocator for LinearBStackAllocator {
             return Ok(());
         }
         let mut sorted = ensure_own_handles(self, owned, "LinearBStackAllocator::dealloc_bulk")?;
+        for h in &sorted {
+            if let Err(source) = self.stack.acl_reclaimable(h.start(), h.len()) {
+                return Err(BStackBulkAllocError::with_handles(source, sorted));
+            }
+        }
         sorted.sort_by_key(|s| std::cmp::Reverse(s.end()));
         let result = (|| -> io::Result<()> {
             let current_tail = self.stack.len()?;
@@ -459,6 +471,11 @@ impl BStackBulkAllocator for LinearBStackAllocator {
             return Ok(());
         }
         let mut sorted = ensure_own_handles(self, owned, "LinearBStackAllocator::dealloc_bulk")?;
+        for h in &sorted {
+            if let Err(source) = self.stack.acl_reclaimable(h.start(), h.len()) {
+                return Err(BStackBulkAllocError::with_handles(source, sorted));
+            }
+        }
         sorted.sort_by_key(|s| std::cmp::Reverse(s.end()));
         let result = (|| -> io::Result<()> {
             let current_tail = self.stack.len()?;

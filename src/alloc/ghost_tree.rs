@@ -224,12 +224,16 @@ impl GhostTreeBstackAllocator {
     /// Returns [`io::ErrorKind::InvalidData`] if the payload size falls in the
     /// unrecoverable range, or if the magic prefix does not match `ALGT`.
     pub fn new(stack: BStack) -> io::Result<Self> {
+        stack.acl_claim_alloc();
         let size = stack.len()?;
 
         if size == 0 {
             stack.extend(ARENA_START)?;
             stack.set(MAGIC_OFFSET, ALGT_MAGIC)?;
             // ROOT_OFFSET is zeroed by extend — null root pointer.
+            // Header (magic + root pointer) stays `Alloc` for the allocator's
+            // lifetime; own I/O via the `meta_*` helpers.
+            stack.acl_mark_alloc(MAGIC_OFFSET, ARENA_START - MAGIC_OFFSET)?;
             return Ok(Self {
                 stack,
                 #[cfg(feature = "atomic")]
@@ -273,6 +277,10 @@ impl GhostTreeBstackAllocator {
             #[cfg(not(feature = "atomic"))]
             _not_sync: PhantomData,
         };
+        // Re-arm the header mark on reopen (policy is not persisted); the root I/O
+        // in `coalesce_and_rebalance` below goes through the `meta_*` helpers.
+        this.stack
+            .acl_mark_alloc(MAGIC_OFFSET, ARENA_START - MAGIC_OFFSET)?;
         this.coalesce_and_rebalance()?;
         Ok(this)
     }
@@ -282,9 +290,8 @@ impl GhostTreeBstackAllocator {
     /// Read the AVL root pointer from the header.
     #[inline]
     fn read_root(&self) -> io::Result<u64> {
-        let buf = &mut [0u8; 8];
-        self.stack.get_into(ROOT_OFFSET, buf)?;
-        Ok(read_buf_le!(buf, 0 => u64))
+        // Header stays `Alloc`; the root pointer is read as the allocator.
+        self.stack.meta_read_u64(ROOT_OFFSET)
     }
 
     /// Write the AVL root pointer to the header.
@@ -292,7 +299,7 @@ impl GhostTreeBstackAllocator {
     fn write_root(&self, ptr: u64) -> io::Result<()> {
         let mut buf = [0u8; 8];
         write_buf!(ptr => buf, 0);
-        self.stack.set(ROOT_OFFSET, buf)?;
+        self.stack.meta_set(ROOT_OFFSET, buf)?;
         Ok(())
     }
 
@@ -1461,6 +1468,9 @@ impl BStackAllocator for GhostTreeBstackAllocator {
         let slice = ensure_own_handle(self, slice, "GhostTreeBstackAllocator::dealloc")?;
         let start = slice.start();
         let len = slice.len();
+        if let Err(source) = self.stack.acl_reclaim(start, len) {
+            return Err(BStackAllocError::with_handle(source, slice));
+        }
         // Set once the (non-atomic) AVL insert has begun. A torn insert leaves
         // the tree inconsistent, and GhostTree has no is_free flag to repair it
         // in-process, so the block can no longer be returned for a retry —
@@ -1681,6 +1691,11 @@ impl BStackBulkAllocator for GhostTreeBstackAllocator {
     ) -> Result<(), BStackBulkAllocError<'a, Self>> {
         let slices: Vec<BStackOwnedSlice<'a, Self>> = slices.into_iter().collect();
         let slices = ensure_own_handles(self, slices, "GhostTreeBstackAllocator::dealloc_bulk")?;
+        for s in &slices {
+            if let Err(source) = self.stack.acl_reclaimable(s.start(), s.len()) {
+                return Err(BStackBulkAllocError::with_handles(source, slices));
+            }
+        }
 
         // Set once any block has begun to be freed. This free is progressive
         // (tail discard, then per-block zero + AVL insert), so once it starts a

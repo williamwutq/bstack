@@ -2,6 +2,8 @@ use super::BStackAllocator;
 #[cfg(all(feature = "set", feature = "atomic"))]
 use super::BStackOwnedSliceAllocator;
 use crate::BStack;
+#[cfg(feature = "expensive-slice-access-control")]
+use crate::{BStackAccess, BStackAccessAuthorities, BStackAuthority};
 use std::borrow::Borrow;
 use std::fmt;
 use std::hash::{Hash, Hasher};
@@ -288,6 +290,11 @@ impl fmt::Display for BStackRange {
 pub struct BStackSlice<'a> {
     stack: &'a BStack,
     range: BStackRange,
+    /// Authority this slice's I/O presents to the stack's access-control table.
+    /// `NONE` unless granted via [`authorize`](BStackSlice::authorize); inherited
+    /// by derived slices.
+    #[cfg(feature = "expensive-slice-access-control")]
+    auth: BStackAccessAuthorities,
 }
 
 impl<'a> Clone for BStackSlice<'a> {
@@ -296,6 +303,8 @@ impl<'a> Clone for BStackSlice<'a> {
         BStackSlice {
             stack: self.stack,
             range: self.range,
+            #[cfg(feature = "expensive-slice-access-control")]
+            auth: self.auth,
         }
     }
 }
@@ -332,6 +341,8 @@ impl<'a> BStackSlice<'a> {
         Self {
             stack,
             range: unsafe { BStackRange::from_raw_parts(offset, len) },
+            #[cfg(feature = "expensive-slice-access-control")]
+            auth: BStackAccessAuthorities::NONE,
         }
     }
 
@@ -345,7 +356,12 @@ impl<'a> BStackSlice<'a> {
     #[inline]
     #[must_use]
     pub unsafe fn from_raw_range(stack: &'a BStack, range: BStackRange) -> Self {
-        Self { stack, range }
+        Self {
+            stack,
+            range,
+            #[cfg(feature = "expensive-slice-access-control")]
+            auth: BStackAccessAuthorities::NONE,
+        }
     }
 
     /// Construct a zero-length slice anchored at offset 0.
@@ -357,6 +373,8 @@ impl<'a> BStackSlice<'a> {
         Self {
             stack,
             range: BStackRange::empty(),
+            #[cfg(feature = "expensive-slice-access-control")]
+            auth: BStackAccessAuthorities::NONE,
         }
     }
 
@@ -427,17 +445,27 @@ impl<'a> BStackSlice<'a> {
     /// Merge this slice with `other` into a single slice covering both.
     ///
     /// Delegates to [`BStackRange::merge`] on the underlying coordinates.
-    /// Returns `None` if the ranges are non-empty and disjoint, or if `self`
-    /// and `other` are backed by different [`BStack`]s.
+    /// Returns `None` if the ranges are non-empty and disjoint, if `self` and
+    /// `other` are backed by different [`BStack`]s, or (with the
+    /// `expensive-slice-access-control` feature) if they carry different
+    /// authorities.
     #[inline]
     #[must_use]
     pub fn merge(&self, other: &Self) -> Option<Self> {
         if !std::ptr::eq(self.stack, other.stack) {
             return None;
         }
+        // Merging slices carrying different authorities would silently widen or
+        // narrow the access one of them was granted; refuse it.
+        #[cfg(feature = "expensive-slice-access-control")]
+        if self.auth != other.auth {
+            return None;
+        }
         self.range.merge(&other.range).map(|range| Self {
             stack: self.stack,
             range,
+            #[cfg(feature = "expensive-slice-access-control")]
+            auth: self.auth,
         })
     }
 
@@ -446,16 +474,24 @@ impl<'a> BStackSlice<'a> {
     ///
     /// Delegates to [`BStackRange::merge_adjacent`] on the underlying
     /// coordinates. Returns `None` if the slices are not adjacent, either is
-    /// empty, or `self` and `other` are backed by different [`BStack`]s.
+    /// empty, `self` and `other` are backed by different [`BStack`]s, or (with
+    /// the `expensive-slice-access-control` feature) they carry different
+    /// authorities.
     #[inline]
     #[must_use]
     pub fn merge_adjacent(&self, other: &Self) -> Option<Self> {
         if !std::ptr::eq(self.stack, other.stack) {
             return None;
         }
+        #[cfg(feature = "expensive-slice-access-control")]
+        if self.auth != other.auth {
+            return None;
+        }
         self.range.merge_adjacent(&other.range).map(|range| Self {
             stack: self.stack,
             range,
+            #[cfg(feature = "expensive-slice-access-control")]
+            auth: self.auth,
         })
     }
 
@@ -481,6 +517,8 @@ impl<'a> BStackSlice<'a> {
         Self {
             stack,
             range: BStackRange::from_bytes(bytes),
+            #[cfg(feature = "expensive-slice-access-control")]
+            auth: BStackAccessAuthorities::NONE,
         }
     }
 
@@ -523,6 +561,8 @@ impl<'a> BStackSlice<'a> {
             range: unsafe {
                 BStackRange::from_raw_parts(self.start() + range.start, range.end - range.start)
             },
+            #[cfg(feature = "expensive-slice-access-control")]
+            auth: self.auth,
         }
     }
 
@@ -590,7 +630,7 @@ impl<'a> BStackSlice<'a> {
             return Ok(None);
         }
         let mut buf = [0u8; 1];
-        self.stack.get_into(self.start() + index, &mut buf)?;
+        self.s_get_into(self.start() + index, &mut buf)?;
         Ok(Some(buf[0]))
     }
 
@@ -663,14 +703,14 @@ impl<'a> BStackSlice<'a> {
     /// Read the entire slice into a new `Vec<u8>`.
     #[inline]
     pub fn read(&self) -> io::Result<Vec<u8>> {
-        self.stack.get(self.start(), self.end())
+        self.s_get(self.start(), self.end())
     }
 
     /// Read bytes into `buf`, up to `min(buf.len(), self.len())` bytes.
     #[inline]
     pub fn read_into(&self, buf: &mut [u8]) -> io::Result<()> {
         let n = (buf.len() as u64).min(self.len()) as usize;
-        self.stack.get_into(self.start(), &mut buf[..n])
+        self.s_get_into(self.start(), &mut buf[..n])
     }
 
     /// Read `[start, end)` relative to this slice into a new `Vec<u8>`.
@@ -682,7 +722,7 @@ impl<'a> BStackSlice<'a> {
                 self.len()
             ));
         }
-        self.stack.get(self.start() + start, self.start() + end)
+        self.s_get(self.start() + start, self.start() + end)
     }
 
     /// Read `[start, start + buf.len())` relative to this slice into `buf`.
@@ -695,7 +735,7 @@ impl<'a> BStackSlice<'a> {
                 self.len()
             ));
         }
-        self.stack.get_into(self.start() + start, buf)
+        self.s_get_into(self.start() + start, buf)
     }
 
     /// Overwrite the beginning of this slice with `data` (up to `self.len()` bytes).
@@ -705,7 +745,7 @@ impl<'a> BStackSlice<'a> {
     pub fn write(&mut self, data: impl AsRef<[u8]>) -> io::Result<()> {
         let data = data.as_ref();
         let n = (data.len() as u64).min(self.len()) as usize;
-        self.stack.set(self.start(), &data[..n])
+        self.s_set(self.start(), &data[..n])
     }
 
     /// Overwrite `[start, start + data.len())` relative to this slice.
@@ -722,7 +762,214 @@ impl<'a> BStackSlice<'a> {
                 self.len()
             ));
         }
-        self.stack.set(self.start() + start, data)
+        self.s_set(self.start() + start, data)
+    }
+
+    /// Arm this slice's range with `mode` in the stack's access-control table.
+    ///
+    /// Crate-internal: the public protection entry is
+    /// [`BStackOwnedSlice::protect`], which forwards here. The range is this
+    /// slice's own `[start, end)` — a tokenless caller may only tighten a range
+    /// currently at [`All`](BStackAccess::All).
+    ///
+    /// Requires the `expensive-slice-access-control` feature.
+    #[cfg(feature = "expensive-slice-access-control")]
+    #[inline]
+    pub(crate) fn protect(&self, mode: BStackAccess) -> io::Result<()> {
+        self.stack.protect(self.start(), self.len(), mode)
+    }
+
+    /// [`protect`](Self::protect) presenting an access token. Crate-internal; the
+    /// public entry is [`BStackOwnedSlice::protect_as`].
+    ///
+    /// Requires the `expensive-slice-access-control` feature.
+    #[cfg(feature = "expensive-slice-access-control")]
+    #[inline]
+    pub(crate) fn protect_as(
+        &self,
+        auth: impl BStackAuthority,
+        mode: BStackAccess,
+    ) -> io::Result<()> {
+        self.stack.protect_as(auth, self.start(), self.len(), mode)
+    }
+
+    /// Grant this slice the authority carried by `auth`, so its subsequent I/O
+    /// (and any view derived from it) may reach a [`Prot`](BStackAccess::Prot)/
+    /// [`Alloc`](BStackAccess::Alloc) region it was authorized for. A token minted
+    /// from a different stack grants nothing.
+    ///
+    /// Requires the `expensive-slice-access-control` feature.
+    #[cfg(feature = "expensive-slice-access-control")]
+    #[inline]
+    pub fn authorize(&mut self, auth: impl BStackAuthority) {
+        self.auth = auth.authorities_for(self.stack);
+    }
+
+    // Dispatch helpers: route slice I/O through the stack's token-carrying
+    // entry points with this slice's stored authority, or the plain tokenless
+    // ones without the access-control feature. Offsets are absolute.
+    #[cfg(feature = "set")]
+    #[inline]
+    fn s_set(&self, offset: u64, data: &[u8]) -> io::Result<()> {
+        #[cfg(feature = "expensive-slice-access-control")]
+        {
+            self.stack.set_as(self.auth, offset, data)
+        }
+        #[cfg(not(feature = "expensive-slice-access-control"))]
+        {
+            self.stack.set(offset, data)
+        }
+    }
+
+    #[cfg(feature = "set")]
+    #[inline]
+    fn s_zero(&self, offset: u64, n: u64) -> io::Result<()> {
+        #[cfg(feature = "expensive-slice-access-control")]
+        {
+            self.stack.zero_as(self.auth, offset, n)
+        }
+        #[cfg(not(feature = "expensive-slice-access-control"))]
+        {
+            self.stack.zero(offset, n)
+        }
+    }
+
+    #[cfg(feature = "set")]
+    #[inline]
+    fn s_repeat(&self, offset: u64, pattern: impl AsRef<[u8]>, count: u64) -> io::Result<()> {
+        #[cfg(feature = "expensive-slice-access-control")]
+        {
+            self.stack.repeat_as(self.auth, offset, pattern, count)
+        }
+        #[cfg(not(feature = "expensive-slice-access-control"))]
+        {
+            self.stack.repeat(offset, pattern, count)
+        }
+    }
+
+    #[inline]
+    fn s_get(&self, start: u64, end: u64) -> io::Result<Vec<u8>> {
+        #[cfg(feature = "expensive-slice-access-control")]
+        {
+            self.stack.get_as(self.auth, start, end)
+        }
+        #[cfg(not(feature = "expensive-slice-access-control"))]
+        {
+            self.stack.get(start, end)
+        }
+    }
+
+    #[inline]
+    fn s_get_into(&self, start: u64, buf: &mut [u8]) -> io::Result<()> {
+        #[cfg(feature = "expensive-slice-access-control")]
+        {
+            self.stack.get_into_as(self.auth, start, buf)
+        }
+        #[cfg(not(feature = "expensive-slice-access-control"))]
+        {
+            self.stack.get_into(start, buf)
+        }
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[inline]
+    fn s_copy(&self, from: u64, to: u64, n: u64) -> io::Result<()> {
+        #[cfg(feature = "expensive-slice-access-control")]
+        {
+            self.stack.copy_as(self.auth, from, to, n)
+        }
+        #[cfg(not(feature = "expensive-slice-access-control"))]
+        {
+            self.stack.copy(from, to, n)
+        }
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[inline]
+    fn s_process<F: FnOnce(&mut [u8])>(&self, start: u64, end: u64, f: F) -> io::Result<()> {
+        #[cfg(feature = "expensive-slice-access-control")]
+        {
+            self.stack.process_as(self.auth, start, end, f)
+        }
+        #[cfg(not(feature = "expensive-slice-access-control"))]
+        {
+            self.stack.process(start, end, f)
+        }
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[inline]
+    fn s_cross_exchange(&self, a: u64, b: u64, n: u64) -> io::Result<()> {
+        #[cfg(feature = "expensive-slice-access-control")]
+        {
+            self.stack.cross_exchange_as(self.auth, a, b, n)
+        }
+        #[cfg(not(feature = "expensive-slice-access-control"))]
+        {
+            self.stack.cross_exchange(a, b, n)
+        }
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[inline]
+    fn s_eq_crds(
+        &self,
+        a_offset: u64,
+        a_expected: impl AsRef<[u8]>,
+        b_offset: u64,
+        b_buf: impl AsRef<[u8]>,
+    ) -> io::Result<Option<Vec<u8>>> {
+        #[cfg(feature = "expensive-slice-access-control")]
+        {
+            self.stack
+                .eq_crds_as(self.auth, a_offset, a_expected, b_offset, b_buf)
+        }
+        #[cfg(not(feature = "expensive-slice-access-control"))]
+        {
+            self.stack.eq_crds(a_offset, a_expected, b_offset, b_buf)
+        }
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[inline]
+    fn s_ne_crds(
+        &self,
+        a_offset: u64,
+        a_expected: impl AsRef<[u8]>,
+        b_offset: u64,
+        b_buf: impl AsRef<[u8]>,
+    ) -> io::Result<Option<Vec<u8>>> {
+        #[cfg(feature = "expensive-slice-access-control")]
+        {
+            self.stack
+                .ne_crds_as(self.auth, a_offset, a_expected, b_offset, b_buf)
+        }
+        #[cfg(not(feature = "expensive-slice-access-control"))]
+        {
+            self.stack.ne_crds(a_offset, a_expected, b_offset, b_buf)
+        }
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[inline]
+    fn s_masked_eq_crds(
+        &self,
+        a_offset: u64,
+        mask: impl AsRef<[u8]>,
+        a_expected: impl AsRef<[u8]>,
+        b_offset: u64,
+        b_buf: impl AsRef<[u8]>,
+    ) -> io::Result<Option<Vec<u8>>> {
+        #[cfg(feature = "expensive-slice-access-control")]
+        {
+            self.stack
+                .masked_eq_crds_as(self.auth, a_offset, mask, a_expected, b_offset, b_buf)
+        }
+        #[cfg(not(feature = "expensive-slice-access-control"))]
+        {
+            self.stack
+                .masked_eq_crds(a_offset, mask, a_expected, b_offset, b_buf)
+        }
     }
 
     /// Zero out the entire slice.
@@ -731,7 +978,7 @@ impl<'a> BStackSlice<'a> {
     #[cfg(feature = "set")]
     #[inline]
     pub fn zero(&mut self) -> io::Result<()> {
-        self.stack.zero(self.start(), self.len())
+        self.s_zero(self.start(), self.len())
     }
 
     /// Zero `[start, start + n)` within this slice.
@@ -747,7 +994,7 @@ impl<'a> BStackSlice<'a> {
                 self.len()
             ));
         }
-        self.stack.zero(self.start() + start, n)
+        self.s_zero(self.start() + start, n)
     }
 
     /// Fill the entire slice with `value`.
@@ -758,7 +1005,7 @@ impl<'a> BStackSlice<'a> {
     #[cfg(feature = "set")]
     #[inline]
     pub fn fill(&mut self, value: u8) -> io::Result<()> {
-        self.stack.repeat(self.start(), [value], self.len())
+        self.s_repeat(self.start(), [value], self.len())
     }
 
     /// Fill the slice by calling `f` once per byte.
@@ -792,7 +1039,7 @@ impl<'a> BStackSlice<'a> {
             self.len(),
             "copy_from_slice: length mismatch"
         );
-        self.stack.set(self.start(), src)
+        self.s_set(self.start(), src)
     }
 
     /// Copy the contents of `src` into this slice.
@@ -827,7 +1074,7 @@ impl<'a> BStackSlice<'a> {
         if self.is_empty() {
             return Ok(());
         }
-        self.stack.copy(src.start(), self.start(), self.len())
+        self.s_copy(src.start(), self.start(), self.len())
     }
 
     /// Copy this view's contents into a fresh allocation from `allocator`.
@@ -927,8 +1174,7 @@ impl<'a> BStackSlice<'a> {
         if n == 0 {
             return Ok(());
         }
-        self.stack
-            .copy(self.start() + src_range.start, self.start() + dest, n)
+        self.s_copy(self.start() + src_range.start, self.start() + dest, n)
     }
 
     /// Overwrite this slice with `new_bytes` if `guard`'s current contents
@@ -982,8 +1228,7 @@ impl<'a> BStackSlice<'a> {
                 self.len()
             ));
         }
-        self.stack
-            .eq_crds(guard.start(), expected, self.start(), new_bytes)
+        self.s_eq_crds(guard.start(), expected, self.start(), new_bytes)
     }
 
     /// Overwrite this slice with `new_bytes` if `guard`'s current contents do
@@ -1028,8 +1273,7 @@ impl<'a> BStackSlice<'a> {
                 self.len()
             ));
         }
-        self.stack
-            .ne_crds(guard.start(), expected, self.start(), new_bytes)
+        self.s_ne_crds(guard.start(), expected, self.start(), new_bytes)
     }
 
     /// Overwrite this slice with `new_bytes` if `guard`'s current contents
@@ -1080,8 +1324,7 @@ impl<'a> BStackSlice<'a> {
                 self.len()
             ));
         }
-        self.stack
-            .masked_eq_crds(guard.start(), mask, expected, self.start(), new_bytes)
+        self.s_masked_eq_crds(guard.start(), mask, expected, self.start(), new_bytes)
     }
 
     /// Swap the contents of this slice with `other`.
@@ -1111,8 +1354,7 @@ impl<'a> BStackSlice<'a> {
         if self.is_empty() || self.start() == other.start() {
             return Ok(());
         }
-        self.stack
-            .cross_exchange(self.start(), other.start(), self.len())
+        self.s_cross_exchange(self.start(), other.start(), self.len())
     }
 
     /// Run a length-preserving transform over this slice's bytes in place.
@@ -1129,7 +1371,7 @@ impl<'a> BStackSlice<'a> {
     #[cfg(all(feature = "set", feature = "atomic"))]
     #[inline]
     pub fn process<F: FnOnce(&mut [u8])>(&mut self, f: F) -> io::Result<()> {
-        self.stack.process(self.start(), self.end(), f)
+        self.s_process(self.start(), self.end(), f)
     }
 
     /// Reverse the byte order of this slice in place.
@@ -1141,8 +1383,7 @@ impl<'a> BStackSlice<'a> {
     #[cfg(all(feature = "set", feature = "atomic"))]
     #[inline]
     pub fn reverse(&mut self) -> io::Result<()> {
-        self.stack
-            .process(self.start(), self.end(), |buf| buf.reverse())
+        self.s_process(self.start(), self.end(), |buf| buf.reverse())
     }
 
     /// Rotate the slice in place such that the bytes at `[mid, len)` move to
@@ -1162,7 +1403,7 @@ impl<'a> BStackSlice<'a> {
             mid <= self.len(),
             "rotate_left: mid must be <= slice length"
         );
-        self.stack.process(self.start(), self.end(), |buf| {
+        self.s_process(self.start(), self.end(), |buf| {
             buf.rotate_left(mid as usize)
         })
     }
@@ -1181,8 +1422,7 @@ impl<'a> BStackSlice<'a> {
     #[track_caller]
     pub fn rotate_right(&mut self, k: u64) -> io::Result<()> {
         assert!(k <= self.len(), "rotate_right: k must be <= slice length");
-        self.stack
-            .process(self.start(), self.end(), |buf| buf.rotate_right(k as usize))
+        self.s_process(self.start(), self.end(), |buf| buf.rotate_right(k as usize))
     }
 
     /// Create a cursor-based reader positioned at the start of this slice.
@@ -1378,6 +1618,11 @@ impl<'a> From<BStackSlice<'a>> for BStackSliceWriter<'a> {
 pub struct BStackOwnedSlice<'a, A: BStackAllocator> {
     allocator: &'a A,
     range: BStackRange,
+    /// Authority the views borrowed from this handle carry into the stack's
+    /// access-control table. `NONE` until granted via
+    /// [`authorize`](BStackOwnedSlice::authorize).
+    #[cfg(feature = "expensive-slice-access-control")]
+    auth: BStackAccessAuthorities,
 }
 
 impl<'a, A: BStackAllocator> fmt::Debug for BStackOwnedSlice<'a, A> {
@@ -1413,6 +1658,8 @@ impl<'a, A: BStackAllocator> BStackOwnedSlice<'a, A> {
         Self {
             allocator,
             range: unsafe { BStackRange::from_raw_parts(offset, len) },
+            #[cfg(feature = "expensive-slice-access-control")]
+            auth: BStackAccessAuthorities::NONE,
         }
     }
 
@@ -1427,7 +1674,12 @@ impl<'a, A: BStackAllocator> BStackOwnedSlice<'a, A> {
     #[inline]
     #[must_use]
     pub unsafe fn from_raw_range(allocator: &'a A, range: BStackRange) -> Self {
-        Self { allocator, range }
+        Self {
+            allocator,
+            range,
+            #[cfg(feature = "expensive-slice-access-control")]
+            auth: BStackAccessAuthorities::NONE,
+        }
     }
 
     /// Construct an empty (zero-length) owned handle.
@@ -1440,6 +1692,8 @@ impl<'a, A: BStackAllocator> BStackOwnedSlice<'a, A> {
         Self {
             allocator,
             range: BStackRange::empty(),
+            #[cfg(feature = "expensive-slice-access-control")]
+            auth: BStackAccessAuthorities::NONE,
         }
     }
 
@@ -1509,6 +1763,8 @@ impl<'a, A: BStackAllocator> BStackOwnedSlice<'a, A> {
         Self {
             allocator,
             range: BStackRange::from_bytes(bytes),
+            #[cfg(feature = "expensive-slice-access-control")]
+            auth: BStackAccessAuthorities::NONE,
         }
     }
 
@@ -1543,6 +1799,8 @@ impl<'a, A: BStackAllocator> BStackOwnedSlice<'a, A> {
         BStackSlice {
             stack: self.allocator.stack(),
             range: self.range,
+            #[cfg(feature = "expensive-slice-access-control")]
+            auth: self.auth,
         }
     }
 
@@ -1557,7 +1815,48 @@ impl<'a, A: BStackAllocator> BStackOwnedSlice<'a, A> {
         BStackSlice {
             stack: self.allocator.stack(),
             range: self.range,
+            #[cfg(feature = "expensive-slice-access-control")]
+            auth: self.auth,
         }
+    }
+
+    /// Arm this allocation's range with `mode` in the stack's access-control
+    /// table.
+    ///
+    /// The public entry point for protection: an owned handle proves the range is
+    /// genuinely this caller's allocation, rather than an arbitrary span. A
+    /// tokenless caller may only tighten a range currently at
+    /// [`All`](BStackAccess::All); see [`protect_as`](Self::protect_as) to present
+    /// a capability token.
+    ///
+    /// Requires the `expensive-slice-access-control` feature.
+    #[cfg(feature = "expensive-slice-access-control")]
+    #[inline]
+    pub fn protect(&self, mode: BStackAccess) -> io::Result<()> {
+        self.as_slice().protect(mode)
+    }
+
+    /// [`protect`](Self::protect) presenting an access token — the token sibling
+    /// for arming [`Prot`](BStackAccess::Prot)/[`Alloc`](BStackAccess::Alloc)
+    /// ranges or re-moding a range this token governs.
+    ///
+    /// Requires the `expensive-slice-access-control` feature.
+    #[cfg(feature = "expensive-slice-access-control")]
+    #[inline]
+    pub fn protect_as(&self, auth: impl BStackAuthority, mode: BStackAccess) -> io::Result<()> {
+        self.as_slice().protect_as(auth, mode)
+    }
+
+    /// Grant this handle the authority carried by `auth`, so every view borrowed
+    /// from it ([`as_slice`](Self::as_slice) / [`as_slice_mut`](Self::as_slice_mut))
+    /// and their I/O may reach a range it was authorized for. A token minted from
+    /// a different stack grants nothing.
+    ///
+    /// Requires the `expensive-slice-access-control` feature.
+    #[cfg(feature = "expensive-slice-access-control")]
+    #[inline]
+    pub fn authorize(&mut self, auth: impl BStackAuthority) {
+        self.auth = auth.authorities_for(self.allocator.stack());
     }
 
     /// Read the entire allocation into a new `Vec<u8>`.
@@ -2557,7 +2856,7 @@ impl<'a> io::Read for BStackSliceReader<'a> {
         let available = (self.slice.len() - self.cursor) as usize;
         let n = buf.len().min(available);
         let abs_start = self.slice.start() + self.cursor;
-        self.slice.stack.get_into(abs_start, &mut buf[..n])?;
+        self.slice.s_get_into(abs_start, &mut buf[..n])?;
         self.cursor += n as u64;
         Ok(n)
     }
@@ -2744,7 +3043,7 @@ impl<'a> io::Write for BStackSliceWriter<'a> {
         let available = (self.slice.len() - self.cursor) as usize;
         let n = buf.len().min(available);
         let abs_start = self.slice.start() + self.cursor;
-        self.slice.stack.set(abs_start, &buf[..n])?;
+        self.slice.s_set(abs_start, &buf[..n])?;
         self.cursor += n as u64;
         Ok(n)
     }

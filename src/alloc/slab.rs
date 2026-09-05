@@ -183,6 +183,7 @@ impl SlabBStackAllocator {
     ///   empty (use [`SlabBStackAllocator::open`] to reopen an existing file).
     /// * Any [`io::Error`] propagated from the underlying [`BStack`] operations.
     pub fn new(stack: BStack, block_size: u64) -> io::Result<Self> {
+        stack.acl_claim_alloc();
         if !stack.is_empty()? {
             return Err(io_error!(
                 InvalidInput,
@@ -208,6 +209,8 @@ impl SlabBStackAllocator {
         write_buf!(block_size => hdr, off + 8);
         // free_head at off+16 remains 0 (SENTINEL)
         stack.push(hdr)?;
+        // Header stays `Alloc` for the allocator's lifetime; own I/O via `meta_*`.
+        stack.acl_mark_alloc(Self::OFFSET_SIZE, Self::HEADER_SIZE)?;
         Ok(Self {
             stack,
             block_size,
@@ -229,6 +232,7 @@ impl SlabBStackAllocator {
     ///   `block_size`, or invalid `free_head`.
     /// * Any [`io::Error`] propagated from the underlying [`BStack`] operations.
     pub fn open(stack: BStack) -> io::Result<Self> {
+        stack.acl_claim_alloc();
         if stack.is_empty()? {
             return Err(io_error!(
                 InvalidInput,
@@ -288,6 +292,8 @@ impl SlabBStackAllocator {
             ));
         }
 
+        // Re-arm the header mark on reopen (policy is not persisted).
+        stack.acl_mark_alloc(Self::OFFSET_SIZE, Self::HEADER_SIZE)?;
         Ok(Self {
             stack,
             block_size: stored_block_size,
@@ -325,7 +331,7 @@ impl SlabBStackAllocator {
         let mut step = 0usize;
         let mut popped: Option<u64> = None;
 
-        self.stack.process_gen(|| {
+        self.stack.meta_process_gen(|| {
             let op = match step {
                 // Step 0: read the current free-list head.
                 0 => Some(BStackGenOp::Read {
@@ -376,11 +382,11 @@ impl SlabBStackAllocator {
     /// See the `atomic` variant for the meaning of `init`.
     #[cfg(not(feature = "atomic"))]
     fn pop_free_block(&self, init: bool) -> io::Result<Option<NonZeroU64>> {
-        let head = u64::from_le_bytes(read_bstack!(self.stack, Self::FREE_HEAD_OFFSET => u64));
+        let head = self.stack.meta_read_u64(Self::FREE_HEAD_OFFSET)?;
         if head == Self::SENTINEL {
             return Ok(None);
         }
-        self.stack.set(
+        self.stack.meta_set(
             Self::FREE_HEAD_OFFSET,
             read_bstack!(self.stack, head => u64),
         )?;
@@ -405,7 +411,7 @@ impl SlabBStackAllocator {
     fn push_free_block(&self, block_start: u64) -> io::Result<()> {
         self.stack.set(block_start, block_start.to_le_bytes())?;
         self.stack
-            .cross_exchange(block_start, Self::FREE_HEAD_OFFSET, 8)
+            .meta_cross_exchange(block_start, Self::FREE_HEAD_OFFSET, 8)
     }
 
     /// Prepend the block at `block_start` to the free list.
@@ -416,10 +422,12 @@ impl SlabBStackAllocator {
         // rather than corrupting the list.
         self.stack.set(
             block_start,
-            read_bstack!(self.stack, Self::FREE_HEAD_OFFSET => u64),
+            self.stack
+                .meta_read_u64(Self::FREE_HEAD_OFFSET)?
+                .to_le_bytes(),
         )?;
         self.stack
-            .set(Self::FREE_HEAD_OFFSET, block_start.to_le_bytes())
+            .meta_set(Self::FREE_HEAD_OFFSET, block_start.to_le_bytes())
     }
 
     /// Prepend `count` contiguous blocks starting at `first_block` to the free list.
@@ -475,7 +483,7 @@ impl SlabBStackAllocator {
                 }
                 #[cfg(not(feature = "atomic"))]
                 {
-                    u64::from_le_bytes(read_bstack!(self.stack, Self::FREE_HEAD_OFFSET => u64))
+                    self.stack.meta_read_u64(Self::FREE_HEAD_OFFSET)?
                 }
             };
             let off = usize::try_from(
@@ -495,12 +503,12 @@ impl SlabBStackAllocator {
                 })?)
                 .ok_or_else(|| io_error!(InvalidInput, "last block offset overflows u64"))?;
             self.stack
-                .cross_exchange(last_block, Self::FREE_HEAD_OFFSET, 8)
+                .meta_cross_exchange(last_block, Self::FREE_HEAD_OFFSET, 8)
         }
         #[cfg(not(feature = "atomic"))]
         {
             self.stack
-                .set(Self::FREE_HEAD_OFFSET, first_block.to_le_bytes())
+                .meta_set(Self::FREE_HEAD_OFFSET, first_block.to_le_bytes())
         }
     }
 
@@ -785,6 +793,9 @@ impl BStackAllocator for SlabBStackAllocator {
         let slice = ensure_own_handle(self, slice, "SlabBStackAllocator::dealloc")?;
         let start = slice.start();
         let len = slice.len();
+        if let Err(source) = self.stack.acl_reclaim(start, len) {
+            return Err(BStackAllocError::with_handle(source, slice));
+        }
         // Set once the caller's blocks may have been partially freed, after
         // which returning the handle for retry would risk a double-free.
         let mut lost = false;
@@ -932,7 +943,7 @@ impl SlabBStackAllocator {
         }
         let mut st = St::ReadHead;
 
-        self.stack.process_gen(|| {
+        self.stack.meta_process_gen(|| {
             loop {
                 match st {
                     // Read the current free-list head.
@@ -1052,7 +1063,7 @@ impl SlabBStackAllocator {
         }
         let mut st = St::ReadHead;
 
-        self.stack.inplace_gen(|prev| {
+        self.stack.meta_inplace_gen(|prev| {
             // A failed read reports its error here (not as a return value); the
             // buffer was not filled, so bail out before consuming it. During the
             // write phase `prev` is always the Ok validation of an in-range write.
@@ -1186,7 +1197,7 @@ impl SlabBStackAllocator {
         }
         let zero_block = vec![0u8; self.block_size as usize];
         let mut i = 0usize;
-        self.stack.inplace_gen(|_prev| {
+        self.stack.meta_inplace_gen(|_prev| {
             // `i` walks `blocks` (collected before this call), so `get` is in
             // bounds until it runs off the end, where `?` ends the sequence.
             let off = *blocks.get(i)?;
@@ -1223,7 +1234,7 @@ impl SlabBStackAllocator {
         }
         self.stack.set_batched(batch)?;
         self.stack
-            .cross_exchange(blocks[k - 1], Self::FREE_HEAD_OFFSET, 8)
+            .meta_cross_exchange(blocks[k - 1], Self::FREE_HEAD_OFFSET, 8)
     }
 
     /// Best-effort cleanup after an `alloc_bulk` extend path fails partway.
@@ -1426,6 +1437,11 @@ impl BStackBulkAllocator for SlabBStackAllocator {
     ) -> Result<(), BStackBulkAllocError<'a, Self>> {
         let slices: Vec<BStackOwnedSlice<'a, Self>> = handles.into_iter().collect();
         let slices = ensure_own_handles(self, slices, "SlabBStackAllocator::dealloc_bulk")?;
+        for s in &slices {
+            if let Err(source) = self.stack.acl_reclaimable(s.start(), s.len()) {
+                return Err(BStackBulkAllocError::with_handles(source, slices));
+            }
+        }
         let bs = self.block_size;
 
         // Set once the chain build has begun. Before this point every handle is
