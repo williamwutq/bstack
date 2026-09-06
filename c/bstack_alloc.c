@@ -8679,13 +8679,16 @@ static inline int alsg_block_start_of(uint64_t ptr, uint64_t *out)
 
 /* ---- claim buffer ------------------------------------------------------ */
 
-/* Build the block-byte claim buffer: overhead = IN_USE|(block >> 4) recording
- * the block's physical size, an optional prefix of n bytes read straight from
+/* Build the block-byte claim buffer: overhead = tag|(block >> 4) recording the
+ * block's physical size, an optional prefix of n bytes read straight from
  * payload offset src, the rest zero.  `block` is the physical extent being
  * claimed and the size the overhead records — the caller's visible length is
- * never stored here.  Returns a malloc'd buffer (caller frees) or NULL on
+ * never stored here.  `in_use` sets the overhead's high bit: nonzero marks the
+ * block live (a direct claim); zero leaves it free-tagged, used by the realloc
+ * move to stage the new block's payload before flipping it live in one atomic
+ * alsg_commit_move.  Returns a malloc'd buffer (caller frees) or NULL on
  * failure. */
-static uint8_t *alsg_claim_buf(bstack_t *bs, uint64_t block,
+static uint8_t *alsg_claim_buf(bstack_t *bs, uint64_t block, int in_use,
                                int has_copy, uint64_t src, uint64_t n)
 {
     uint8_t *buf;
@@ -8694,7 +8697,7 @@ static uint8_t *alsg_claim_buf(bstack_t *bs, uint64_t block,
 #endif
     buf = calloc(1, (size_t)block);
     if (!buf) return NULL;
-    write_le64(buf, ALSG_IN_USE_BIT | (block >> 4));
+    write_le64(buf, (in_use ? ALSG_IN_USE_BIT : UINT64_C(0)) | (block >> 4));
     if (has_copy && n > 0) {
         if (bstack_get(bs, src, src + n, buf + 8)) { free(buf); return NULL; }
     }
@@ -8882,6 +8885,65 @@ static int alsg_push(bstack_t *bs, uint64_t block_start, uint64_t size,
     c.step = 0;
     return bstack_inplace_gen(bs, alsg_push_gen, &c, NULL);
 }
+
+/* ---- commit_move ------------------------------------------------------- */
+
+/* Commit a realloc move as ONE crash-atomic inplace_gen: flip the staged new
+ * block (new_start) to in-use recording new_size, and free the old block
+ * (old_start, physical size old_size) onto its class list — all together.
+ *
+ * Until this lands the new block is free-tagged and detached while the old block
+ * stays live, so a crash before the commit is reclaimed by recover with the old
+ * block intact; a crash after leaves the new block live and the old freed.  No
+ * point on disk ever shows both blocks in use, so the move never leaks an in-use
+ * orphan — unlike a separate claim-then-dealloc, whose window between the two
+ * bstack ops a crash can catch.  old_start is always interior here (the move is
+ * taken only when the block cannot grow at the tail), so freeing it is a plain
+ * free-list push; the write set mirrors alsg_push plus one overhead flip at
+ * new_start. */
+struct alsg_move_ctx {
+    uint64_t head_off, new_start, old_start;
+    uint8_t  new_overhead[8];
+    uint8_t  old_start_bytes[8];
+    uint8_t  old_buf[16]; /* [0..8]=free|old_size, [8..16]=old head (read in) */
+    int      step;
+};
+
+static int alsg_move_gen(bstack_gen_op_t *op, void *userctx)
+{
+    struct alsg_move_ctx *c = userctx;
+    switch (c->step++) {
+    case 0: /* read old's class head into the next_free half */
+        op->kind = BSTACK_GEN_READ; op->u.read.offset = c->head_off;
+        op->u.read.buf = c->old_buf + 8; op->u.read.len = 8; return 1;
+    case 1: /* new -> in-use */
+        op->kind = BSTACK_GEN_WRITE; op->u.write.offset = c->new_start;
+        op->u.write.data = c->new_overhead; op->u.write.len = 8; return 1;
+    case 2: /* old -> free: overhead || next_free (= old class head) */
+        op->kind = BSTACK_GEN_WRITE; op->u.write.offset = c->old_start;
+        op->u.write.data = c->old_buf; op->u.write.len = 16; return 1;
+    case 3: /* head[class] <- old_start */
+        op->kind = BSTACK_GEN_WRITE; op->u.write.offset = c->head_off;
+        op->u.write.data = c->old_start_bytes; op->u.write.len = 8; return 1;
+    default:
+        return 0;
+    }
+}
+
+static int alsg_commit_move(bstack_t *bs, uint64_t new_start, uint64_t new_size,
+                            uint64_t old_start, uint64_t old_size)
+{
+    struct alsg_move_ctx c;
+    c.head_off  = alsg_head_off(alsg_classify(old_size));
+    c.new_start = new_start;
+    c.old_start = old_start;
+    write_le64(c.new_overhead, ALSG_IN_USE_BIT | (new_size >> 4));
+    write_le64(c.old_buf, old_size >> 4);     /* free tag: high bit clear */
+    write_le64(c.old_buf + 8, 0);             /* next_free half filled by read */
+    write_le64(c.old_start_bytes, old_start);
+    c.step = 0;
+    return bstack_inplace_gen(bs, alsg_move_gen, &c, NULL);
+}
 #else /* !BSTACK_FEATURE_ATOMIC */
 static int alsg_push(bstack_t *bs, uint64_t block_start, uint64_t size,
                      uint64_t class)
@@ -9013,24 +9075,31 @@ static int alsg_commit_carve(bstack_t *bs, uint64_t prefix_off,
 /* ---- alloc_raw --------------------------------------------------------- */
 
 /* Place a `len`-byte block whose payload begins with `copy_n` bytes copied from
- * payload offset `src` (has_copy != 0; rest zeroed) and return its data pointer
- * (block_start + OVERHEAD) in *out_ptr. */
-static int alsg_alloc_raw(bstack_t *bs, uint64_t len, int has_copy,
-                          uint64_t src, uint64_t copy_n, uint64_t *out_ptr)
+ * payload offset `src` (has_copy != 0; rest zeroed) and return its block start in
+ * *out_block and physical size in *out_size — the caller adds OVERHEAD for the
+ * data pointer and, when `in_use` is zero, uses the size to flip the block live
+ * later.  `in_use` selects the overhead tag (see alsg_claim_buf): nonzero marks
+ * the block live immediately; zero stages it free-tagged for the move, whose
+ * alsg_commit_move flips it live.  The bstack call sequence is identical either
+ * way. */
+static int alsg_alloc_raw(bstack_t *bs, uint64_t len, int in_use, int has_copy,
+                          uint64_t src, uint64_t copy_n,
+                          uint64_t *out_block, uint64_t *out_size)
 {
     uint64_t need = alsg_phys_need(len);
-    uint64_t block;
+    uint64_t block, claimed;
     uint8_t *buf;
     uint64_t bs_off;
 
     if (need == 0) { errno = EINVAL; return -1; }
     block = alsg_class_blocksize(need);
+    claimed = block;
 
     if (block <= ALSG_MAX_CLASS) {
         int have = 0;
         if (alsg_pop_class(bs, alsg_classify(block), &have, &bs_off)) return -1;
         if (have) {
-            buf = alsg_claim_buf(bs, block, has_copy, src, copy_n);
+            buf = alsg_claim_buf(bs, block, in_use, has_copy, src, copy_n);
             if (!buf) return -1;
             if (bstack_set(bs, bs_off, buf, (size_t)block)) goto cleanup;
             goto success;
@@ -9047,14 +9116,15 @@ static int alsg_alloc_raw(bstack_t *bs, uint64_t len, int has_copy,
                  * `actual` as the physical size.  One set, no carve.  The block
                  * stays in the (heterogeneous) oversized bucket, so retaining a
                  * non-class size is sound. */
-                buf = alsg_claim_buf(bs, actual, has_copy, src, copy_n);
+                claimed = actual;
+                buf = alsg_claim_buf(bs, actual, in_use, has_copy, src, copy_n);
                 if (!buf) return -1;
                 if (bstack_set(bs, bs_off, buf, (size_t)actual)) goto cleanup;
             } else {
                 /* Reclaim the excess above the threshold: claim `block` bytes
                  * (the claim buffer is the prefix) and carve the rest, all as one
                  * crash-atomic transaction. */
-                buf = alsg_claim_buf(bs, block, has_copy, src, copy_n);
+                buf = alsg_claim_buf(bs, block, in_use, has_copy, src, copy_n);
                 if (!buf) return -1;
                 if (alsg_commit_carve(bs, bs_off, buf, (size_t)block,
                                       bs_off + block, excess))
@@ -9065,7 +9135,7 @@ static int alsg_alloc_raw(bstack_t *bs, uint64_t len, int has_copy,
     }
 
     /* Miss: grow the whole zero-filled block in one sparse write. */
-    buf = alsg_claim_buf(bs, block, has_copy, src, copy_n);
+    buf = alsg_claim_buf(bs, block, in_use, has_copy, src, copy_n);
     if (!buf) return -1;
     if (bstack_extend_sparse(bs, buf, (size_t)block, block, &bs_off)) {
 cleanup:
@@ -9073,7 +9143,8 @@ cleanup:
     }
 success:
     free(buf);
-    *out_ptr = bs_off + ALSG_OVERHEAD;
+    *out_block = bs_off;
+    *out_size = claimed;
     return 0;
 }
 
@@ -9371,12 +9442,12 @@ static int alsg_vt_alloc(bstack_allocator_t *base, uint64_t len,
                          bstack_slice_t *out)
 {
     segregated_bstack_allocator_t *a = (segregated_bstack_allocator_t *)base;
-    uint64_t ptr;
+    uint64_t blk, sz;
     if (len == 0) {
         out->offset = 0; out->len = 0; goto success;
     }
-    if (alsg_alloc_raw(a->bs, len, 0, 0, 0, &ptr)) return -1;
-    out->offset = ptr; out->len = len;
+    if (alsg_alloc_raw(a->bs, len, 1, 0, 0, 0, &blk, &sz)) return -1;
+    out->offset = blk + ALSG_OVERHEAD; out->len = len;
 success:
     out->allocator = base; return 0;
 }
@@ -9530,7 +9601,7 @@ static int alsg_vt_realloc(bstack_allocator_t *base, bstack_slice_t s,
              * extent.  A shrink adds no new bytes, so there is nothing
              * uninitialised to hand back.  A non-tail block fails the LEN check
              * and falls through to retain. */
-            nb = alsg_claim_buf(bs, new_size, 1, start, new_len);
+            nb = alsg_claim_buf(bs, new_size, 1, 1, start, new_len);
             if (!nb) goto fail_recover;
             c.phase         = 0;
             c.truncated     = 0;
@@ -9592,20 +9663,39 @@ static int alsg_vt_realloc(bstack_allocator_t *base, bstack_slice_t s,
         /* Not at tail: fall through to the move. */
     }
 
-    /* Move: alloc the new class, having it read the surviving prefix straight
-     * from the old block into its claim buffer, then free the old block.  Reached
-     * only by a grow past the current block that is not at the tail (a shrink
-     * always fits the block, so it never moves). */
+    /* Move: place the new class, having it read the surviving prefix straight
+     * from the old block into its claim buffer.  Reached only by a grow past the
+     * current block that is not at the tail (a shrink always fits the block, so it
+     * never moves), so the old block is always interior. */
     {
         uint64_t copy_len = old_len < new_len ? old_len : new_len;
-        uint64_t new_ptr;
+        uint64_t nb, nsize;
+#ifdef BSTACK_FEATURE_ATOMIC
+        /* Atomic: stage the new block *free* (detached, prefix copied in), then
+         * flip it live and free the old block as one crash-atomic commit_move.
+         * The new block is never durably in use before the old is freed, so a
+         * crash leaves exactly one of them live — old before the commit, new after
+         * — with no in-use orphan to leak.  `recovered` stays the old block: the
+         * only fallible steps precede the commit. */
+        if (alsg_alloc_raw(bs, new_len, 0, 1, start, copy_len, &nb, &nsize))
+            goto fail_recover;
+        if (alsg_commit_move(bs, nb, nsize, block_start, old_size))
+            goto fail_recover;
+        result.offset = nb + ALSG_OVERHEAD; result.len = new_len; goto success;
+#else
+        /* Non-atomic: no atomic multi-write, so claim the new block in use, copy,
+         * then free the old — each step individually atomic, a mid-move failure
+         * leaks (never corrupts). */
         bstack_slice_t old_s;
-        if (alsg_alloc_raw(bs, new_len, 1, start, copy_len, &new_ptr)) goto fail_recover;
+        if (alsg_alloc_raw(bs, new_len, 1, 1, start, copy_len, &nb, &nsize))
+            goto fail_recover;
         /* New region committed and populated; it is now the survivor. */
-        recovered.allocator = base; recovered.offset = new_ptr; recovered.len = new_len;
+        recovered.allocator = base; recovered.offset = nb + ALSG_OVERHEAD;
+        recovered.len = new_len;
         old_s.allocator = base; old_s.offset = start; old_s.len = old_len;
         if (alsg_vt_dealloc(base, old_s)) goto fail_recover;
-        result.offset = new_ptr; result.len = new_len; goto success;
+        result.offset = nb + ALSG_OVERHEAD; result.len = new_len; goto success;
+#endif
     }
 
 success:

@@ -806,10 +806,14 @@ impl SegregatedBStackAllocator {
         Ok(popped)
     }
 
-    /// Build the claim buffer (`in_use | (block >> 4)` overhead recording the
+    /// Build the claim buffer (`tag | (block >> 4)` overhead recording the
     /// block's physical size, `copy_from` prefix read straight in) without
     /// writing it. `block` is the physical extent being claimed and the size the
     /// overhead word records — the caller's visible length is never stored here.
+    /// `in_use` sets the overhead's high bit: `true` marks the block live (a
+    /// direct claim); `false` leaves it free-tagged, used by the `realloc` move
+    /// to stage the new block's payload before flipping it live in one atomic
+    /// [`commit_move`](Self::commit_move) commit.
     ///
     /// With [`true`] the buffer is the full `block` bytes, so writing it
     /// also scrubs everything past the copied prefix. With [`false`] it
@@ -825,12 +829,14 @@ impl SegregatedBStackAllocator {
         &self,
         block: u64,
         copy_from: Option<(u64, u64)>,
+        in_use: bool,
         init: bool,
     ) -> io::Result<Vec<u8>> {
         let copied = copy_from.map_or(0, |(_, n)| n);
         let buf_len = if init { block } else { Self::OVERHEAD + copied };
         let mut buf = vec![0u8; buf_len as usize];
-        write_buf!(Self::IN_USE_BIT | (block >> 4) => buf, 0);
+        let tag = if in_use { Self::IN_USE_BIT } else { 0 };
+        write_buf!(tag | (block >> 4) => buf, 0);
         if let Some((src, n)) = copy_from {
             self.stack.get_into(src, &mut buf[8..8 + n as usize])?;
         }
@@ -839,18 +845,31 @@ impl SegregatedBStackAllocator {
 
     /// Core allocation: place a `len`-byte block whose payload begins with `n`
     /// bytes copied from payload offset `src` (`copy_from = Some((src, n))`) and
-    /// return its data pointer (`block_start + OVERHEAD`). A free-list hit reads
-    /// the source straight into the single claim buffer; a miss extends a
-    /// zero-filled block and writes overhead (plus the copied prefix), relying on
-    /// `extend`'s zero-fill for the tail. `n` must not exceed the class payload
-    /// capacity for `len` (callers pass a prefix `≤ len`).
+    /// return `(block_start, physical_size)` — the caller adds `OVERHEAD` for the
+    /// data pointer and, when `in_use` is `false`, uses `physical_size` to flip
+    /// the block live later. A free-list hit reads the source straight into the
+    /// single claim buffer; a miss extends a zero-filled block and writes overhead
+    /// (plus the copied prefix), relying on `extend`'s zero-fill for the tail. `n`
+    /// must not exceed the class payload capacity for `len` (callers pass a prefix
+    /// `≤ len`).
     ///
-    /// With [`true`] the payload past the copied prefix is zero; with
+    /// `in_use` selects the overhead tag (see [`claim_buf`](Self::claim_buf)):
+    /// `true` marks the block live immediately; `false` stages it free-tagged for
+    /// the move, whose [`commit_move`](Self::commit_move) flips it live. The
+    /// [`BStack`] call sequence is identical either way.
+    ///
+    /// With `init` [`true`] the payload past the copied prefix is zero; with
     /// [`false`] it is left unspecified — a reused block keeps its previous
     /// occupant's bytes, a freshly extended one still reads back as zero. The
     /// [`BStack`] call sequence is the same either way, only the claim buffer is
     /// shorter, so crash behaviour is unchanged.
-    fn alloc_raw(&self, len: u64, copy_from: Option<(u64, u64)>, init: bool) -> io::Result<u64> {
+    fn alloc_raw(
+        &self,
+        len: u64,
+        copy_from: Option<(u64, u64)>,
+        in_use: bool,
+        init: bool,
+    ) -> io::Result<(u64, u64)> {
         let need = Self::phys_need(len)?;
         let block = Self::class_blocksize(need);
         if block <= Self::MAX_CLASS {
@@ -859,9 +878,9 @@ impl SegregatedBStackAllocator {
                 // In both atomic and non-atomic paths, a failure between the pop
                 // and the claim leaves the block free-tagged and reachable from
                 // the head, so a crash is recoverable by `recover`.
-                let buf = self.claim_buf(block, copy_from, init)?;
+                let buf = self.claim_buf(block, copy_from, in_use, init)?;
                 self.stack.set(bs, buf)?;
-                return Ok(bs + Self::OVERHEAD);
+                return Ok((bs, block));
             }
         } else if let Some((bs, actual)) = self.pop_oversized(block)? {
             let excess = actual - block;
@@ -871,23 +890,24 @@ impl SegregatedBStackAllocator {
                 // stays in the (heterogeneous) oversized bucket, so retaining a
                 // non-class size is sound. A crash before the claim lands leaves
                 // it free-tagged and reachable, so `recover` reclaims it.
-                let buf = self.claim_buf(actual, copy_from, init)?;
+                let buf = self.claim_buf(actual, copy_from, in_use, init)?;
                 self.stack.set(bs, buf)?;
+                return Ok((bs, actual));
             } else {
                 // Reclaim the excess above the threshold: claim `block` bytes and
                 // carve the rest, all as one crash-atomic operation (claim
                 // buffer as the prefix).
-                let buf = self.claim_buf(block, copy_from, init)?;
+                let buf = self.claim_buf(block, copy_from, in_use, init)?;
                 self.commit_carve(bs, &buf, bs + block, excess)?;
+                return Ok((bs, block));
             }
-            return Ok(bs + Self::OVERHEAD);
         }
         // Miss: eagerly grow the whole zero-filled block in one sparse write.
         // The write prefix is copied in before the tail is left zero by the
         // sparse grow, so we do not need a separate `set` for the remainder.
-        let buf = self.claim_buf(block, copy_from, init)?;
+        let buf = self.claim_buf(block, copy_from, in_use, init)?;
         let bs = self.stack.extend_sparse(&buf, block)?;
-        Ok(bs + Self::OVERHEAD)
+        Ok((bs, block))
     }
 
     /// Push `block_start` (physical size `size`, head index `class`) onto its
@@ -1068,6 +1088,72 @@ impl SegregatedBStackAllocator {
                 op
             })
         }
+    }
+
+    /// Commit a `realloc` move as **one** crash-atomic [`BStack::inplace_gen`]:
+    /// flip the staged new block `new_start` to in-use (recording physical size
+    /// `new_size`) and free the old block `old_start` (physical size `old_size`)
+    /// onto its class list, all together.
+    ///
+    /// Until this lands the new block is free-tagged and detached while the old
+    /// block stays live, so a crash before the commit is reclaimed by
+    /// [`recover`](Self::recover) with the old block intact; a crash after leaves
+    /// the new block live and the old freed. No point on disk ever shows both
+    /// blocks in use, so the move never leaks an in-use orphan — unlike a separate
+    /// claim-then-`dealloc`, whose window between the two `BStack` ops a crash can
+    /// catch. `old_start` is always **interior** here (the move is taken only when
+    /// the block cannot grow at the tail), so freeing it is a plain free-list push
+    /// and never a tail discard; the write set mirrors [`push`](Self::push) plus
+    /// the one extra overhead flip at `new_start`.
+    #[cfg(feature = "atomic")]
+    fn commit_move(
+        &self,
+        new_start: u64,
+        new_size: u64,
+        old_start: u64,
+        old_size: u64,
+    ) -> io::Result<()> {
+        let head_off = Self::head_off(Self::classify(old_size));
+        let new_overhead = (Self::IN_USE_BIT | (new_size >> 4)).to_le_bytes();
+        let old_start_bytes = old_start.to_le_bytes();
+        // old's overhead ‖ next_free: contiguous fields staged as one 16-byte
+        // write; next_free is read from the class head in the first step (no
+        // writes staged yet ⇒ the committed value).
+        let mut old_buf = [0u8; 16];
+        write_buf!(old_size >> 4 => old_buf, 0); // free tag: high bit clear
+        let mut step = 0u32;
+        self.stack.inplace_gen(|_res| {
+            let op = match step {
+                // Read old's class head into next_free's half.
+                0 => Some(BStackGenOp::Read {
+                    offset: head_off,
+                    // SAFETY: `old_buf` outlives this call.
+                    buf: bstack_unsafe_reborrow_mut!(&mut old_buf[8..]),
+                }),
+                // new → in-use.
+                1 => Some(BStackGenOp::Write {
+                    offset: new_start,
+                    // SAFETY: `new_overhead` outlives this call.
+                    data: bstack_unsafe_reborrow!(&new_overhead[..]),
+                }),
+                // old → free: overhead ‖ next_free (= old class head).
+                2 => Some(BStackGenOp::Write {
+                    offset: old_start,
+                    // SAFETY: `old_buf` outlives this call and its [8..] half is
+                    // not mutated after step 0's read resolved.
+                    data: bstack_unsafe_reborrow!(&old_buf[..]),
+                }),
+                // head[class] ← old.
+                3 => Some(BStackGenOp::Write {
+                    offset: head_off,
+                    // SAFETY: `old_start_bytes` outlives this call.
+                    data: bstack_unsafe_reborrow!(&old_start_bytes[..]),
+                }),
+                _ => None,
+            };
+            step += 1;
+            op
+        })
     }
 }
 
@@ -2060,9 +2146,9 @@ impl SegregatedBStackAllocator {
         if len == 0 {
             return Ok(BStackOwnedSlice::empty(self));
         }
-        let ptr = self.alloc_raw(len, None, init)?;
-        // SAFETY: `ptr` is the data start of a freshly allocated `len`-byte block.
-        Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, ptr, len) })
+        let (bs, _) = self.alloc_raw(len, None, true, init)?;
+        // SAFETY: `bs + OVERHEAD` is the data start of a freshly allocated block.
+        Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, bs + Self::OVERHEAD, len) })
     }
 
     /// Shared body of [`realloc`](BStackAllocator::realloc) and
@@ -2110,9 +2196,15 @@ impl SegregatedBStackAllocator {
             return Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, start, old_len) });
         }
 
-        // The allocation to hand back on failure. Starts as the original block;
-        // becomes the new region once a move has committed and copied it (both
-        // are always distinct live regions safe to return).
+        // The allocation to hand back on failure. Under `atomic` the move flips
+        // the survivor only at its single atomic `commit_move`, so on any error
+        // the old block is still live and `recovered` never changes. Without
+        // `atomic` the claim-then-free sequence makes the new block the survivor
+        // once it is committed, so `recovered` advances to it before the old block
+        // is freed (both are always distinct live regions safe to return).
+        #[cfg(feature = "atomic")]
+        let recovered = (start, old_len);
+        #[cfg(not(feature = "atomic"))]
         let mut recovered = (start, old_len);
         let result = (|| -> io::Result<BStackOwnedSlice<'a, Self>> {
             let word = u64::from_le_bytes(read_bstack!(self.stack, block_start => u64));
@@ -2141,20 +2233,44 @@ impl SegregatedBStackAllocator {
                 return Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, start, new_len) });
             }
 
-            // Move: allocate the new class, having it read the surviving prefix
+            // Move: place the new class, having it read the surviving prefix
             // straight from the old block into its claim buffer (no separate copy
-            // buffer or write), then free the old block. Reached only by a grow
-            // past the current block that is not at the tail (a shrink always fits
-            // the block, so it never moves). Each step is individually atomic; a
-            // mid-move failure leaks (never corrupts).
+            // buffer or write). Reached only by a grow past the current block that
+            // is not at the tail (a shrink always fits the block, so it never
+            // moves), so the old block is always interior.
             let copy_len = old_len.min(new_len);
-            let new_ptr = self.alloc_raw(new_len, Some((start, copy_len)), init)?;
-            // New region committed and populated; it is now the survivor.
-            recovered = (new_ptr, new_len);
-            // SAFETY: (start, old_len) still names the caller's live old block.
-            let old = unsafe { BStackOwnedSlice::from_raw_parts(self, start, old_len) };
-            self.dealloc(old).map_err(|e| e.source)?;
-            // SAFETY: `new_ptr` is the data start of the freshly populated block.
+
+            // Atomic: stage the new block *free* (detached, prefix copied in),
+            // then flip it live and free the old block as one crash-atomic
+            // `commit_move`. The new block is never durably in use before the old
+            // is freed, so a crash leaves exactly one of them live — old before the
+            // commit, new after — with no in-use orphan to leak. `recovered` need
+            // not advance: the only fallible steps precede the commit, and until it
+            // lands the old block is the survivor.
+            #[cfg(feature = "atomic")]
+            let new_ptr = {
+                let (nb, nsize) = self.alloc_raw(new_len, Some((start, copy_len)), false, init)?;
+                self.commit_move(nb, nsize, block_start, old_size)?;
+                nb + Self::OVERHEAD
+            };
+
+            // Non-atomic: no atomic multi-write, so claim the new block in use,
+            // copy, then free the old — each step individually atomic, a mid-move
+            // failure leaks (never corrupts), as documented on `realloc`. The new
+            // block is committed before the old is freed, so it becomes the
+            // survivor once populated.
+            #[cfg(not(feature = "atomic"))]
+            let new_ptr = {
+                let (nb, _) = self.alloc_raw(new_len, Some((start, copy_len)), true, init)?;
+                let new_ptr = nb + Self::OVERHEAD;
+                recovered = (new_ptr, new_len);
+                // SAFETY: (start, old_len) still names the caller's live old block.
+                let old = unsafe { BStackOwnedSlice::from_raw_parts(self, start, old_len) };
+                self.dealloc(old).map_err(|e| e.source)?;
+                new_ptr
+            };
+
+            // SAFETY: `new_ptr` is the data start of the resized block.
             Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, new_ptr, new_len) })
         })();
         result.map_err(|source| BStackAllocError {
@@ -2232,7 +2348,7 @@ impl SegregatedBStackAllocator {
                 // `init`: `Atrunc` re-appends exactly these bytes, so their
                 // count *is* the new block's physical extent. A shrink adds no
                 // new bytes, so there is no uninitialised region to hand back.
-                let buf = self.claim_buf(new_size, Some((start, new_len)), true)?;
+                let buf = self.claim_buf(new_size, Some((start, new_len)), true, true)?;
                 let mut cur_len = 0u64;
                 let cur_ptr: *mut u64 = &mut cur_len;
                 let mut phase = 0u8;
@@ -3855,9 +3971,8 @@ mod bulk_tests {
     }
 }
 
-// Bulk-allocation fault-injection test (`atomic`): a failed `extend` on the
-// alloc_bulk path returns the blocks already popped from the free lists rather
-// than leaking them.
+// Allocator fault-injection tests (`atomic`): a mid-operation fault leaks at
+// most a reclaimable block, never an in-use orphan or corruption.
 #[cfg(all(
     test,
     debug_assertions,
@@ -3873,6 +3988,56 @@ mod bulk_fault_tests {
     use crate::fault::FaultPolicy;
     use std::io::ErrorKind;
     use std::sync::Arc;
+
+    // A fault at the `realloc` move's single `commit_move` (its lone
+    // `inplace_gen`) leaves the new block staged but still free-tagged and the old
+    // block live: the move fails handing back the intact old block, and `recover`
+    // reclaims the staged block — no in-use orphan leaks (the whole point of
+    // staging the new block free and flipping it live in one atomic commit).
+    #[test]
+    fn realloc_move_commit_fault_keeps_old_and_leaks_nothing() {
+        let path = temp_path("seg_move_commit");
+        let _g = Guard(path.clone());
+        let alloc = Seg::new(BStack::open(&path).unwrap()).unwrap();
+
+        // A block to grow, plus a pin after it so the grow is interior (the move
+        // path), not a tail extend. Fill it with a known pattern.
+        let mut s = alloc.alloc(100).unwrap(); // block 112
+        s.write([0x9Au8; 100]).unwrap();
+        let old_start = s.start();
+        let _pin = alloc.alloc(100).unwrap(); // pins the tail so `s` is interior
+
+        // Fault `commit_move` (the first and only `inplace_gen` in the move): the
+        // new block is staged free just before, so nothing is committed.
+        let policy: Arc<dyn FaultPolicy> =
+            Arc::new(FailOpAt::new("inplace_gen", 0, ErrorKind::Other));
+        alloc.stack().set_fault_policy(Some(policy));
+        let err = alloc
+            .realloc(s, 300)
+            .expect_err("commit_move fault must fail the move");
+        alloc.stack().set_fault_policy(None);
+        assert_eq!(err.source.kind(), ErrorKind::Other);
+
+        // The surviving handle is the untouched old block, data intact.
+        let s = err
+            .into_handle()
+            .expect("old block handed back on a failed move");
+        assert_eq!(s.start(), old_start, "old block survives a faulted move");
+        assert_eq!(s.read().unwrap(), vec![0x9Au8; 100], "old data intact");
+
+        // Nothing leaked in use: the staged new block is free-tagged, so `recover`
+        // accounts for the whole arena and the old block stays usable.
+        assert_eq!(
+            unsafe { alloc.recover() }.unwrap(),
+            0,
+            "faulted move leaves no in-use orphan"
+        );
+        assert_eq!(
+            s.read().unwrap(),
+            vec![0x9Au8; 100],
+            "old data intact after recover"
+        );
+    }
 
     #[test]
     fn alloc_bulk_extend_fault_reclaims_popped_blocks() {
