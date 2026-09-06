@@ -8852,12 +8852,18 @@ struct alsg_push_ctx {
     uint64_t head_off, block_start;
     uint8_t  start_bytes[8];
     uint8_t  overhead_buf[16]; /* [0..8]=free|size, [8..16]=old head (read in) */
+    const int *prev;           /* inplace_gen prev-status pointer */
     int      step;
 };
 
 static int alsg_push_gen(bstack_gen_op_t *op, void *userctx)
 {
     struct alsg_push_ctx *c = userctx;
+    if (c->prev && *c->prev != 0) {
+        op->kind = BSTACK_GEN_ABORT;
+        op->u.abort.status = *c->prev;
+        return 1;
+    }
     switch (c->step++) {
     case 0: /* read current head into the next_free half */
         op->kind = BSTACK_GEN_READ; op->u.read.offset = c->head_off;
@@ -8877,13 +8883,15 @@ static int alsg_push(bstack_t *bs, uint64_t block_start, uint64_t size,
                      uint64_t class)
 {
     struct alsg_push_ctx c;
+    int prev = 0;
     c.head_off    = alsg_head_off(class);
     c.block_start = block_start;
     write_le64(c.overhead_buf, size >> 4);
     write_le64(c.overhead_buf + 8, 0); /* next_free half will be filled in by read */
     write_le64(c.start_bytes, block_start);
+    c.prev = &prev;
     c.step = 0;
-    return bstack_inplace_gen(bs, alsg_push_gen, &c, NULL);
+    return bstack_inplace_gen(bs, alsg_push_gen, &c, &prev);
 }
 
 /* ---- commit_move ------------------------------------------------------- */
@@ -8915,8 +8923,6 @@ struct alsg_move_ctx {
 static int alsg_move_gen(bstack_gen_op_t *op, void *userctx)
 {
     struct alsg_move_ctx *c = userctx;
-    /* The head read is the only op that can fail (the writes target verified
-     * offsets); surface its error instead of committing a garbage next_free. */
     if (c->prev && *c->prev != 0) {
         op->kind = BSTACK_GEN_ABORT;
         op->u.abort.status = *c->prev;
@@ -8984,6 +8990,7 @@ struct alsg_carve_ctx {
     size_t         k;
     const uint8_t *prefix;
     size_t         prefix_len;
+    const int     *prev;       /* inplace_gen prev-status pointer (atomic only) */
     size_t         step;
     uint64_t       block_offs[ALSG_MAX_CARVE_PIECES];
     uint64_t       head_offs[ALSG_MAX_CARVE_PIECES];
@@ -8998,7 +9005,13 @@ struct alsg_carve_ctx {
 static int alsg_carve_gen(bstack_gen_op_t *op, void *userctx)
 {
     struct alsg_carve_ctx *c = userctx;
-    size_t step = c->step++;
+    size_t step;
+    if (c->prev && *c->prev != 0) {
+        op->kind = BSTACK_GEN_ABORT;
+        op->u.abort.status = *c->prev;
+        return 1;
+    }
+    step = c->step++;
     if (step < c->k) {
         op->kind = BSTACK_GEN_READ;
         op->u.read.offset = c->head_offs[step];
@@ -9080,7 +9093,11 @@ static int alsg_commit_carve(bstack_t *bs, uint64_t prefix_off,
     }
 #else
     c.k = k;
-    return bstack_inplace_gen(bs, alsg_carve_gen, &c, NULL);
+    {
+        int prev = 0;
+        c.prev = &prev;
+        return bstack_inplace_gen(bs, alsg_carve_gen, &c, &prev);
+    }
 #endif
 }
 

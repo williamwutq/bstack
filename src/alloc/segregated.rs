@@ -930,35 +930,45 @@ impl SegregatedBStackAllocator {
             self.stack.set(head_off, start_bytes)
         }
         #[cfg(feature = "atomic")]
-        let mut step = 0u32;
-        #[cfg(feature = "atomic")]
-        self.stack.inplace_gen(|_res| {
-            let op = match step {
-                // Read the current head into next_free's half (no writes staged
-                // yet ⇒ committed value).
-                0 => Some(BStackGenOp::Read {
-                    offset: head_off,
-                    // SAFETY: `overhead_buf` outlives this call.
-                    buf: bstack_unsafe_reborrow_mut!(&mut overhead_buf[8..]),
-                }),
-                // overhead ← free | size; next_free ← old head
-                1 => Some(BStackGenOp::Write {
-                    offset: block_start,
-                    // SAFETY: `overhead_buf` outlives this call and is not
-                    // mutated after step 0's read resolved.
-                    data: bstack_unsafe_reborrow!(&overhead_buf[..]),
-                }),
-                // head[class] ← block_start
-                2 => Some(BStackGenOp::Write {
-                    offset: head_off,
-                    // SAFETY: `start_bytes` outlives this call.
-                    data: bstack_unsafe_reborrow!(&start_bytes[..]),
-                }),
-                _ => None,
-            };
-            step += 1;
-            op
-        })
+        {
+            let mut step = 0u32;
+            let mut read_err: Option<io::Error> = None;
+            self.stack.inplace_gen(|res| {
+                if let Err(e) = res {
+                    read_err = Some(e);
+                    return None;
+                }
+                let op = match step {
+                    // Read the current head into next_free's half (no writes
+                    // staged yet → committed value).
+                    0 => Some(BStackGenOp::Read {
+                        offset: head_off,
+                        // SAFETY: `overhead_buf` outlives this call.
+                        buf: bstack_unsafe_reborrow_mut!(&mut overhead_buf[8..]),
+                    }),
+                    // overhead ← free | size; next_free ← old head
+                    1 => Some(BStackGenOp::Write {
+                        offset: block_start,
+                        // SAFETY: `overhead_buf` outlives this call and is not
+                        // mutated after step 0's read resolved.
+                        data: bstack_unsafe_reborrow!(&overhead_buf[..]),
+                    }),
+                    // head[class] ← block_start
+                    2 => Some(BStackGenOp::Write {
+                        offset: head_off,
+                        // SAFETY: `start_bytes` outlives this call.
+                        data: bstack_unsafe_reborrow!(&start_bytes[..]),
+                    }),
+                    _ => None,
+                };
+                step += 1;
+                op
+            })?;
+            match read_err {
+                Some(e) => Err(e),
+                None => Ok(()),
+            }
+        }
     }
 
     /// Commit a `prefix` write and free a contiguous `region` as **one**
@@ -1047,10 +1057,15 @@ impl SegregatedBStackAllocator {
             let mut step = 0usize;
             // `overhead_next` already holds the per-piece overhead in its first
             // 8 bytes; we will read each head directly into its second half.
-            self.stack.inplace_gen(|_res| {
+            let mut read_err: Option<io::Error> = None;
+            self.stack.inplace_gen(|res| {
+                if let Err(e) = res {
+                    read_err = Some(e);
+                    return None;
+                }
                 let op = if step < k {
                     // Read the committed head of piece `step`'s class (no head writes
-                    // staged yet ⇒ this is the current head, captured as next_free).
+                    // staged yet → this is the current head, captured as next_free).
                     Some(BStackGenOp::Read {
                         offset: head_offs[step],
                         // SAFETY: `overhead_next` outlives this call; we read the
@@ -1086,7 +1101,11 @@ impl SegregatedBStackAllocator {
                 };
                 step += 1;
                 op
-            })
+            })?;
+            match read_err {
+                Some(e) => Err(e),
+                None => Ok(()),
+            }
         }
     }
 
@@ -1122,9 +1141,6 @@ impl SegregatedBStackAllocator {
         let mut old_buf = [0u8; 16];
         write_buf!(old_size >> 4 => old_buf, 0); // free tag: high bit clear
         let mut step = 0u32;
-        // The head read is the only op that can fail (the writes all target
-        // verified offsets); a failure is surfaced through the feedback, not
-        // returned.
         let mut read_err: Option<io::Error> = None;
         self.stack.inplace_gen(|res| {
             if let Err(e) = res {
