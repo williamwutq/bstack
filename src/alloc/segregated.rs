@@ -1122,7 +1122,15 @@ impl SegregatedBStackAllocator {
         let mut old_buf = [0u8; 16];
         write_buf!(old_size >> 4 => old_buf, 0); // free tag: high bit clear
         let mut step = 0u32;
-        self.stack.inplace_gen(|_res| {
+        // The head read is the only op that can fail (the writes all target
+        // verified offsets); a failure is surfaced through the feedback, not
+        // returned.
+        let mut read_err: Option<io::Error> = None;
+        self.stack.inplace_gen(|res| {
+            if let Err(e) = res {
+                read_err = Some(e);
+                return None;
+            }
             let op = match step {
                 // Read old's class head into next_free's half.
                 0 => Some(BStackGenOp::Read {
@@ -1153,7 +1161,11 @@ impl SegregatedBStackAllocator {
             };
             step += 1;
             op
-        })
+        })?;
+        match read_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 }
 
