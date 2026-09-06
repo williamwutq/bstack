@@ -3,6 +3,10 @@
 Detailed algorithm and on-disk format documentation for each `BStackAllocator`
 implementation provided by this crate.
 
+[`SegregatedBStackAllocator`](#segregatedbstackallocator-alloc--set-features) is
+the recommended general-purpose default — the fastest. The others target narrower
+patterns: bump/stack discipline, fixed-size blocks, or zero-overhead best-fit.
+
 ---
 
 ## `LinearBStackAllocator`
@@ -429,11 +433,7 @@ With the `atomic` feature it **is `Sync`**. `alloc` / `dealloc` / `realloc` take
 
 ---
 
-## `SegregatedBStackAllocator` (**experimental**, `alloc + set` features)
-
-> **Experimental.** The on-disk format and API are not yet stable, a few resize
-> paths behave differently between the `atomic` and non-`atomic` builds, and deep
-> in-use-leak reclamation is not yet implemented.
+## `SegregatedBStackAllocator` (`alloc + set` features)
 
 [`CheckedSlabBStackAllocator`] generalised from one block size to **33 size
 classes** sharing one arena. Each class is an independent intrusive free list;
