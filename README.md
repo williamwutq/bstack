@@ -1289,7 +1289,11 @@ Constructor takes `data_size` (usable bytes per block; physical = `data_size + 8
 additionally implements `BStackBulkAllocator` (`alloc_bulk`/`dealloc_bulk`;
 freed batches leave only `recover`-reclaimable leaks on a crash).
 
-### `SegregatedBStackAllocator` (**experimental**, `alloc + set`)
+### `SegregatedBStackAllocator` (`alloc + set`)
+
+**The recommended general-purpose allocator** — the fastest built-in.  Reach for
+it by default; the others below suit narrower patterns (bump/stack discipline,
+fixed-size blocks, zero-overhead best-fit).
 
 Segregated (binned) free-list allocator: the checked slab generalised to 33 size
 classes (16 linear 16‥256 B, 16 geometric 320‥4096 B, one oversized bucket)
@@ -1299,13 +1303,6 @@ alloc/dealloc; 8-byte overhead tag per block.  Single `new(stack)` constructor
 `Send + Sync`, no allocator-level lock, and additionally implements
 `BStackBulkAllocator` (`alloc_bulk`/`dealloc_bulk`; oversized requests matched
 largest-first against the oversized free list).
-
-> **Experimental.**  The on-disk format and API are not yet stable — some resize
-> paths differ between the `atomic` and non-`atomic` builds (a shrink reclaims its
-> freed excess only under `atomic`; the non-`atomic` build retains it in place),
-> and the deep in-use-leak GC is not yet implemented (the free-neighbour
-> coalescer, `coalesce`, now is — `atomic` only).  See
-> [`algos/ALLOCATOR.md`](algos/ALLOCATOR.md) for the full design.
 
 ### `DebugCheckingAllocator` (`alloc`)
 

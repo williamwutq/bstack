@@ -432,7 +432,7 @@
 //!   Combined with `set`, also enables [`BStackSliceWriter`],
 //!   [`FirstFitBStackAllocator`], [`GhostTreeBstackAllocator`],
 //!   [`SlabBStackAllocator`], [`CheckedSlabBStackAllocator`],
-//!   [`SegregatedBStackAllocator`] (experimental), and [`BStackByteVec`].
+//!   [`SegregatedBStackAllocator`], and [`BStackByteVec`].
 //!
 //! * **`atomic`** — Compound read-modify-write operations that hold the write
 //!   lock across what would otherwise be separate calls.  Combined with `set`,
@@ -550,8 +550,9 @@
 //!   Requires both `alloc` and `set` features; with `atomic` additionally
 //!   implements [`BStackBulkAllocator`] (`alloc_bulk`/`dealloc_bulk`).
 //!
-//! * [`SegregatedBStackAllocator`] — **experimental** segregated (binned)
-//!   free-list allocator.  Generalises [`CheckedSlabBStackAllocator`] from one
+//! * [`SegregatedBStackAllocator`] — segregated (binned) free-list allocator,
+//!   the **recommended general-purpose allocator** (the fastest built-in).
+//!   Generalises [`CheckedSlabBStackAllocator`] from one
 //!   block size to 33 size classes sharing a single arena: 16 linear classes
 //!   (16‥256 B, step 16), 16 geometric classes (320‥4096 B, 4 per octave), and
 //!   one shared oversized bucket.  Each class is an independent intrusive free
@@ -566,10 +567,6 @@
 //!   it additionally implements [`BStackBulkAllocator`] (`alloc_bulk`/`dealloc_bulk`,
 //!   work bounded by the classes touched, with oversized requests matched
 //!   largest-first against the oversized free list).
-//!   **Experimental:** the on-disk format and API may change, some resize paths
-//!   differ between the `atomic` and non-`atomic` builds, and the deep in-use-leak
-//!   GC is not yet implemented (the free-neighbour coalescer, `coalesce`, now is —
-//!   `atomic` only).
 //!
 //! * [`DebugCheckingAllocator<A>`](DebugCheckingAllocator) — transparent debug
 //!   wrapper.  Wraps any allocator whose `Allocated` type is [`BStackOwnedSlice`]
