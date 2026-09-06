@@ -8901,17 +8901,27 @@ static int alsg_push(bstack_t *bs, uint64_t block_start, uint64_t size,
  * taken only when the block cannot grow at the tail), so freeing it is a plain
  * free-list push; the write set mirrors alsg_push plus one overhead flip at
  * new_start. */
+/* Fields ordered widest-alignment-first (byte buffers sized in multiples of 8,
+ * then u64, then the pointer and scalar) so the struct has no internal padding.
+ * new_overhead/old_start_bytes are write payloads; old_buf is [0..8]=free|old_size
+ * with its [8..16] half taking the head read. */
 struct alsg_move_ctx {
-    uint64_t head_off, new_start, old_start;
-    uint8_t  new_overhead[8];
-    uint8_t  old_start_bytes[8];
-    uint8_t  old_buf[16]; /* [0..8]=free|old_size, [8..16]=old head (read in) */
-    int      step;
+    uint8_t    new_overhead[8], old_start_bytes[8], old_buf[16];
+    uint64_t   head_off, new_start, old_start;
+    const int *prev; /* inplace_gen prev-status pointer */
+    int        step;
 };
 
 static int alsg_move_gen(bstack_gen_op_t *op, void *userctx)
 {
     struct alsg_move_ctx *c = userctx;
+    /* The head read is the only op that can fail (the writes target verified
+     * offsets); surface its error instead of committing a garbage next_free. */
+    if (c->prev && *c->prev != 0) {
+        op->kind = BSTACK_GEN_ABORT;
+        op->u.abort.status = *c->prev;
+        return 1;
+    }
     switch (c->step++) {
     case 0: /* read old's class head into the next_free half */
         op->kind = BSTACK_GEN_READ; op->u.read.offset = c->head_off;
@@ -8934,6 +8944,7 @@ static int alsg_commit_move(bstack_t *bs, uint64_t new_start, uint64_t new_size,
                             uint64_t old_start, uint64_t old_size)
 {
     struct alsg_move_ctx c;
+    int prev = 0;
     c.head_off  = alsg_head_off(alsg_classify(old_size));
     c.new_start = new_start;
     c.old_start = old_start;
@@ -8941,8 +8952,9 @@ static int alsg_commit_move(bstack_t *bs, uint64_t new_start, uint64_t new_size,
     write_le64(c.old_buf, old_size >> 4);     /* free tag: high bit clear */
     write_le64(c.old_buf + 8, 0);             /* next_free half filled by read */
     write_le64(c.old_start_bytes, old_start);
+    c.prev = &prev;
     c.step = 0;
-    return bstack_inplace_gen(bs, alsg_move_gen, &c, NULL);
+    return bstack_inplace_gen(bs, alsg_move_gen, &c, &prev);
 }
 #else /* !BSTACK_FEATURE_ATOMIC */
 static int alsg_push(bstack_t *bs, uint64_t block_start, uint64_t size,
