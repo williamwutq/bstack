@@ -980,13 +980,19 @@ static int test_recovery_needed_already_set_rejects_mutation(void)
     CHECK(bstack_allocator_alloc((bstack_allocator_t *)a, 64, &sb) == 0);
     CHECK(bstack_allocator_dealloc((bstack_allocator_t *)a, sa) == 0);
 
-    /* Manually poke recovery_needed = 1 on disk. */
+    /* Simulate a bracketed op that failed after arming the flag: it leaves BOTH
+     * the on-disk flag and the in-memory poison set.  The disk flag drives reopen
+     * recovery; the poison is what the single atomic-call paths (which no longer
+     * arm the flag themselves) check to refuse. */
     bstack_t *stack = bstack_allocator_stack((bstack_allocator_t *)a);
     uint8_t one[4] = {1, 0, 0, 0};
     CHECK(bstack_set(stack, ALFF_FLAGS_OFFSET, one, 4) == 0);
+#ifdef BSTACK_FEATURE_ATOMIC
+    a->recovery_poisoned = 1;
+#endif
 
-    /* Reusing the freed slot now walks the free list, which calls
-     * set_recovery_needed and must fail because the flag is already 1. */
+    /* Reusing the freed slot now walks the free list, whose guard_not_poisoned
+     * check must surface the needs-recovery error instead of proceeding. */
     bstack_slice_t sc;
     errno = 0;
     int rc = bstack_allocator_alloc((bstack_allocator_t *)a, 64, &sc);
