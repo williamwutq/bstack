@@ -408,6 +408,45 @@ static int test_realloc_paths(void)
     sg_unlink(tmp); return 0;
 }
 
+/* A non-tail grow forces a move: the block is pinned off the tail, so realloc
+ * must place a larger block, copy the surviving prefix, and free the old one.
+ * Under atomic this is one crash-atomic commit_move — the new block is staged
+ * free, then flipped live as the old is freed, so no in-use orphan can leak.
+ * The result is a clean arena that recover() fully accounts for. */
+static int test_realloc_non_tail_move(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    segregated_bstack_allocator_t *a = segregated_bstack_allocator_new(bs);
+    CHECK(a);
+    bstack_allocator_t *base = (bstack_allocator_t *)a;
+    bstack_slice_t s, pin, out;
+    uint64_t unsure = 1;
+    uint8_t rd[300];
+    size_t i;
+
+    CHECK(bstack_allocator_alloc(base, 100, &s) == 0);        /* block 112 */
+    CHECK(slice_fill(s, 0x77) == 0);
+    CHECK(bstack_allocator_alloc(base, 100, &pin) == 0);       /* pins s off the tail */
+    CHECK(bstack_allocator_realloc(base, s, 300, &out) == 0);  /* non-tail grow -> move */
+    CHECK(out.offset != s.offset);                            /* interior grow moves */
+    CHECK(out.len == 300);
+    CHECK(slice_verify(out, 100, 0x77, "move-prefix") == 0);  /* surviving prefix */
+    CHECK(bstack_slice_read_into(out, rd, 300) == 0);
+    for (i = 100; i < 300; i++) CHECK(rd[i] == 0);            /* grown tail is zero */
+
+    /* No leak: recover fully accounts for the arena (old block freed, none
+     * orphaned in use), and the moved block still reads back intact. */
+    CHECK(segregated_bstack_allocator_recover(a, &unsure) == 0);
+    CHECK(unsure == 0);
+    CHECK(slice_verify(out, 100, 0x77, "move-after-recover") == 0);
+
+    CHECK(bstack_allocator_dealloc(base, out) == 0);
+    CHECK(bstack_allocator_dealloc(base, pin) == 0);
+    bstack_close(segregated_bstack_allocator_into_stack(a));
+    sg_unlink(tmp); return 0;
+}
+
 /* Tail shrink whose excess reaches SPLIT_MIN (256).  With atomic it is one
  * LEN + SPLICE transaction: the block is replaced by its shrunk self at the same
  * offset and the excess goes back to the stack.  Without atomic recording the
@@ -1119,6 +1158,7 @@ int main(void)
     T(test_dealloc_reuses_block);
     T(test_double_free_and_mismatch_detected);
     T(test_realloc_paths);
+    T(test_realloc_non_tail_move);
     T(test_realloc_tail_shrink);
     T(test_realloc_small_shrink_retained);
     T(test_oversized_reuse_retains_small_excess);
