@@ -2000,12 +2000,15 @@ impl FirstFitBStackAllocator {
                     let nprev_le = nprev.to_le_bytes();
 
                     if merged_size
-                        >= aligned_new_len + Self::BLOCK_OVERHEAD_SIZE + Self::MIN_BLOCK_PAYLOAD_SIZE
+                        >= aligned_new_len
+                            + Self::BLOCK_OVERHEAD_SIZE
+                            + Self::MIN_BLOCK_PAYLOAD_SIZE
                     {
                         // Split: front stays allocated (`aligned_new_len`); the back
                         // becomes a free `remainder` prepended to the list. Net list
                         // change: remove `next`, add `remainder` at the head.
-                        let remainder_size = merged_size - aligned_new_len - Self::BLOCK_OVERHEAD_SIZE;
+                        let remainder_size =
+                            merged_size - aligned_new_len - Self::BLOCK_OVERHEAD_SIZE;
                         let new_free_start = start + aligned_new_len + Self::BLOCK_OVERHEAD_SIZE;
                         // List head once `next` is gone — what `remainder` points to
                         // (the non-atomic path's `old_head`, read *after* the unlink).
@@ -2016,8 +2019,10 @@ impl FirstFitBStackAllocator {
                         // `prev_free = 0`, footer).
                         let alloc_footer_off = (aligned_new_len - block_size) as usize;
                         let free_hdr_off = alloc_footer_off + Self::BLOCK_FOOTER_SIZE as usize;
-                        let free_payload_off = alloc_footer_off + Self::BLOCK_OVERHEAD_SIZE as usize;
-                        let free_footer_off = (next_block_size + Self::BLOCK_OVERHEAD_SIZE) as usize;
+                        let free_payload_off =
+                            alloc_footer_off + Self::BLOCK_OVERHEAD_SIZE as usize;
+                        let free_footer_off =
+                            (next_block_size + Self::BLOCK_OVERHEAD_SIZE) as usize;
                         let mut buff = vec![
                             0u8;
                             (next_block_size + Self::BLOCK_OVERHEAD_SIZE + Self::BLOCK_FOOTER_SIZE)
@@ -2039,11 +2044,23 @@ impl FirstFitBStackAllocator {
                             (start + block_size + write_from as u64, &buff[write_from..]),
                             (Self::FREE_HEAD_OFFSET, &rem_le),
                             // remainder's successor back-links to it
-                            if first != 0 { (first + 8, &rem_le) } else { (0, NONE) },
+                            if first != 0 {
+                                (first + 8, &rem_le)
+                            } else {
+                                (0, NONE)
+                            },
                             // splice next's predecessor forward-link past it (interior only)
-                            if nprev != 0 { (nprev, &nnext_le) } else { (0, NONE) },
+                            if nprev != 0 {
+                                (nprev, &nnext_le)
+                            } else {
+                                (0, NONE)
+                            },
                             // splice next's successor back-link past it (interior only)
-                            if nprev != 0 && nnext != 0 { (nnext + 8, &nprev_le) } else { (0, NONE) },
+                            if nprev != 0 && nnext != 0 {
+                                (nnext + 8, &nprev_le)
+                            } else {
+                                (0, NONE)
+                            },
                         ];
                         self.stack.set_batched(writes)?;
                     } else {
@@ -2073,7 +2090,11 @@ impl FirstFitBStackAllocator {
                                 (nprev, &nnext_le)
                             },
                             // its successor back-links past it
-                            if nnext != 0 { (nnext + 8, &nprev_le) } else { (0, NONE) },
+                            if nnext != 0 {
+                                (nnext + 8, &nprev_le)
+                            } else {
+                                (0, NONE)
+                            },
                         ];
                         self.stack.set_batched(writes)?;
                     }
@@ -2096,13 +2117,16 @@ impl FirstFitBStackAllocator {
                     ];
 
                     if merged_size
-                        >= aligned_new_len + Self::BLOCK_OVERHEAD_SIZE + Self::MIN_BLOCK_PAYLOAD_SIZE
+                        >= aligned_new_len
+                            + Self::BLOCK_OVERHEAD_SIZE
+                            + Self::MIN_BLOCK_PAYLOAD_SIZE
                     {
                         // The merged block is much larger than needed — split it.
                         // Pack the allocated-block footer, free-block header (size + is_free flag),
                         // free-list next/prev pointers, and free-block footer into zero_buff so
                         // they all land in one write.
-                        let remainder_size = merged_size - aligned_new_len - Self::BLOCK_OVERHEAD_SIZE;
+                        let remainder_size =
+                            merged_size - aligned_new_len - Self::BLOCK_OVERHEAD_SIZE;
                         let new_free_start = start + aligned_new_len + Self::BLOCK_OVERHEAD_SIZE;
                         let mut head_buf = [0u8; 8];
                         self.stack.get_into(Self::FREE_HEAD_OFFSET, &mut head_buf)?;
@@ -2111,8 +2135,10 @@ impl FirstFitBStackAllocator {
                         // All offsets are relative to zero_buff[0] = start + block_size.
                         let alloc_footer_off = (aligned_new_len - block_size) as usize;
                         let free_hdr_off = alloc_footer_off + Self::BLOCK_FOOTER_SIZE as usize;
-                        let free_payload_off = alloc_footer_off + Self::BLOCK_OVERHEAD_SIZE as usize;
-                        let free_footer_off = (next_block_size + Self::BLOCK_OVERHEAD_SIZE) as usize;
+                        let free_payload_off =
+                            alloc_footer_off + Self::BLOCK_OVERHEAD_SIZE as usize;
+                        let free_footer_off =
+                            (next_block_size + Self::BLOCK_OVERHEAD_SIZE) as usize;
 
                         write_buf!(aligned_new_len => zero_buff, alloc_footer_off);
                         write_buf!(remainder_size => zero_buff, free_hdr_off);
