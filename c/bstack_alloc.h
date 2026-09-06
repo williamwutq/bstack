@@ -1352,7 +1352,6 @@ uint64_t checked_slab_bstack_allocator_data_size(
 
 /* =========================================================================
  * segregated_bstack_allocator_t — segregated (binned) free-list allocator
- *   **experimental**
  *
  * Generalises the fixed-block checked slab to 33 size classes sharing one
  * arena: 16 linear (16‥256 B, step 16), 16 geometric (320‥4096 B, 4 per
@@ -1364,7 +1363,7 @@ uint64_t checked_slab_bstack_allocator_data_size(
  *
  * On-disk layout (all within the bstack payload):
  *   [0..24)  — reserved (OFFSET_SIZE; available for caller use)
- *   [24..32) — magic: "ALSG\x00\x02\x01\x00"
+ *   [24..32) — magic: "ALSG\x00\x02\x02\x00"
  *   [32..40) — reserved (no field yet)
  *   [40..40+NUM_CLASSES*8) — free_head[NUM_CLASSES] (last entry = oversized list)
  *   [ARENA_START..) — block arena (16-byte aligned; ARENA_START = 304)
@@ -1433,9 +1432,10 @@ uint64_t checked_slab_bstack_allocator_data_size(
  * so that build simply retains the excess inside the still-recorded larger block
  * (zero extra writes, no move); a later grow back into that span fits in place.
  *
- * Experimental: the on-disk format (ALSG magic) and API are not yet stable, and
- * the deep in-use-leak GC is unimplemented (the free-neighbour coalescer,
- * segregated_bstack_allocator_coalesce, is implemented under BSTACK_FEATURE_ATOMIC).
+ * recover() reclaims free leaks and discards orphaned tails, and the allocator
+ * creates no in-use orphans of its own (the realloc move commits its
+ * new-live/old-free flip atomically). The free-neighbour coalescer
+ * segregated_bstack_allocator_coalesce is implemented under BSTACK_FEATURE_ATOMIC.
  *
  * Requires -DBSTACK_FEATURE_SET.
  * ====================================================================== */
