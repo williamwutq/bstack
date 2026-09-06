@@ -1030,6 +1030,11 @@ typedef struct {
      * allocated in first_fit_bstack_allocator_new and released on free.  Kept
      * opaque so this header need not pull in <pthread.h> / <windows.h>. */
     void              *lock;
+    /* In-memory mirror of the on-disk recovery_needed flag.  A bracketed op that
+     * fails mid-sequence leaves it set, so the single atomic-call paths that no
+     * longer arm the disk flag still refuse against an unrecovered free list —
+     * the cheap counterpart of the disk flag's CAS poison check.  Under `lock`. */
+    int                recovery_poisoned;
 #endif
 } first_fit_bstack_allocator_t;
 
