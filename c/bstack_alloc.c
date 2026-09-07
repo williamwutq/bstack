@@ -2018,7 +2018,7 @@ static inline int alff_is_free_block(uint64_t header_start, const uint8_t *heade
 
 /* ---- recovery flag management ----------------------------------------- */
 
-static int alff_set_recovery_needed(bstack_t *bs)
+static int alff_set_recovery_needed(first_fit_bstack_allocator_t *a)
 {
 #ifdef BSTACK_FEATURE_ATOMIC
     /* CAS 0 -> 1.  Mutual exclusion is provided by the allocator's in-memory
@@ -2030,20 +2030,24 @@ static int alff_set_recovery_needed(bstack_t *bs)
     uint8_t one[4];
     int ok = 0;
     write_le32(one, 1);
-    if (bstack_cas(bs, ALFF_FLAGS_OFFSET, zero, one, 4, &ok) != 0) return -1;
+    if (bstack_cas(a->bs, ALFF_FLAGS_OFFSET, zero, one, 4, &ok) != 0) return -1;
     /* errno = EINVAL: the on-disk recovery_needed flag is not in a valid state
      * for this operation (it was already 1, meaning a prior op crashed mid-
      * mutation and the stack must be reopened to run recovery). */
     if (!ok) { errno = EINVAL; return -1; }
+    /* Mirror the armed flag in memory so the single atomic-call paths that no
+     * longer bracket themselves still see a mid-bracket failure (which leaves
+     * this set, the paired clear being skipped) and refuse. */
+    a->recovery_poisoned = 1;
     return 0;
 #else
     uint8_t flag[4];
     write_le32(flag, 1);
-    return bstack_set(bs, ALFF_FLAGS_OFFSET, flag, 4);
+    return bstack_set(a->bs, ALFF_FLAGS_OFFSET, flag, 4);
 #endif
 }
 
-static int alff_clear_recovery_needed(bstack_t *bs)
+static int alff_clear_recovery_needed(first_fit_bstack_allocator_t *a)
 {
 #ifdef BSTACK_FEATURE_ATOMIC
     /* CAS 1 -> 0, the inverse of alff_set_recovery_needed.  A failure means the
@@ -2053,15 +2057,16 @@ static int alff_clear_recovery_needed(bstack_t *bs)
     uint8_t one[4];
     int ok = 0;
     write_le32(one, 1);
-    if (bstack_cas(bs, ALFF_FLAGS_OFFSET, one, zero, 4, &ok) != 0) return -1;
+    if (bstack_cas(a->bs, ALFF_FLAGS_OFFSET, one, zero, 4, &ok) != 0) return -1;
     /* errno = EINVAL: the on-disk flag was not in the expected state (it was
      * already 0, meaning the paired set was lost or the flag was disturbed
      * out of band). */
     if (!ok) { errno = EINVAL; return -1; }
+    a->recovery_poisoned = 0;
     return 0;
 #else
     uint8_t flag[4] = {0, 0, 0, 0};
-    return bstack_set(bs, ALFF_FLAGS_OFFSET, flag, 4);
+    return bstack_set(a->bs, ALFF_FLAGS_OFFSET, flag, 4);
 #endif
 }
 
@@ -3049,14 +3054,29 @@ static int ff_vt_alloc(bstack_allocator_t *self, uint64_t len, bstack_slice_t *o
         content_buf = calloc(1, buf_sz);
         if (!content_buf) { MUTEX_UNLOCK(a); return -1; }
 
-        if (alff_set_recovery_needed(a->bs) != 0
-            || alff_unlink_block(a->bs, found_start, found_size,
-                                  aligned_len, content_buf) != 0
-            || alff_clear_recovery_needed(a->bs) != 0) {
+#ifdef BSTACK_FEATURE_ATOMIC
+        /* alff_unlink_block is one crash-atomic call under atomic, so it needs no
+         * recovery bracket — only a cheap poison check, since this path no longer
+         * arms the flag itself. */
+        if (a->recovery_poisoned) {
+            errno = EINVAL; free(content_buf); MUTEX_UNLOCK(a); return -1;
+        }
+        if (alff_unlink_block(a->bs, found_start, found_size,
+                              aligned_len, content_buf) != 0) {
             free(content_buf);
             MUTEX_UNLOCK(a);
             return -1;
         }
+#else
+        if (alff_set_recovery_needed(a) != 0
+            || alff_unlink_block(a->bs, found_start, found_size,
+                                  aligned_len, content_buf) != 0
+            || alff_clear_recovery_needed(a) != 0) {
+            free(content_buf);
+            MUTEX_UNLOCK(a);
+            return -1;
+        }
+#endif
         free(content_buf);
 
         /* Split puts allocated block at the back; no-split uses front */
@@ -3128,22 +3148,28 @@ static int ff_vt_dealloc(bstack_allocator_t *self, bstack_slice_t slice)
         return -1;
     }
 
-    /* Double-free detection: the block must not already be marked free. */
+    /* Read the block header once: the flags word gives the double-free check,
+     * and the size word gives the block's physical extent (a shrunk block's user
+     * len can be smaller than its physical size), which decides interior vs
+     * physically-at-the-tail below. */
+    uint64_t phys_size;
     {
-        uint8_t flags_buf[4];
+        uint8_t hdr_buf[16];
         if (bstack_get(a->bs,
-                       slice.offset - ALFF_BLOCK_HDR_SIZE + 8,
-                       slice.offset - ALFF_BLOCK_HDR_SIZE + 12,
-                       flags_buf) != 0) {
+                       slice.offset - ALFF_BLOCK_HDR_SIZE,
+                       slice.offset - ALFF_BLOCK_HDR_SIZE + 16,
+                       hdr_buf) != 0) {
             MUTEX_UNLOCK(a);
             return -1;
         }
-        if (flags_buf[0] & 1) {
+        if (hdr_buf[8] & 1) {
             MUTEX_UNLOCK(a);
             errno = EINVAL;
             return -1;
         }
+        phys_size = read_le64(hdr_buf);
     }
+    (void)phys_size; /* used only by the atomic interior-dealloc path below */
 
     /* Tail block fast path: discard the block bytes, then cascade-discard any
      * free blocks now at the tail.  recovery_needed is set before the discard
@@ -3160,22 +3186,46 @@ static int ff_vt_dealloc(bstack_allocator_t *self, bstack_slice_t slice)
         }
 #endif
         discard_n = (size_t)(aligned_len + ALFF_BLOCK_OVERHEAD);
-        if (alff_set_recovery_needed(a->bs) != 0) { MUTEX_UNLOCK(a); return -1; }
+        if (alff_set_recovery_needed(a) != 0) { MUTEX_UNLOCK(a); return -1; }
         /* Past this point the tail block is being physically discarded: a
          * failure below can no longer safely hand the original back. */
         if (bstack_discard(a->bs, discard_n) != 0) { MUTEX_UNLOCK(a); return -2; }
         if (alff_cascade_discard_free_tail(a->bs) != 0) { MUTEX_UNLOCK(a); return -2; }
-        r = alff_clear_recovery_needed(a->bs);
+        r = alff_clear_recovery_needed(a);
         MUTEX_UNLOCK(a);
         return r == 0 ? 0 : -2;
     }
 
-    if (alff_set_recovery_needed(a->bs) != 0) { MUTEX_UNLOCK(a); return -1; }
+#ifdef BSTACK_FEATURE_ATOMIC
+    /* Interior (physically below the tail): alff_add_to_free_list is one
+     * crash-atomic call and the cascade a guaranteed no-op, so drop the bracket
+     * and the cascade — only the poison check remains. A block physically at the
+     * tail (a shrunk block whose user len missed the fast path above) exposes a
+     * free tail that the cascade must reclaim, so it keeps the bracket below. */
+    {
+        int interior = 0;
+        if (phys_size <= UINT64_MAX - ALFF_BLOCK_FTR_SIZE
+            && slice.offset <= UINT64_MAX - (phys_size + ALFF_BLOCK_FTR_SIZE)) {
+            uint64_t phys_end = slice.offset + phys_size + ALFF_BLOCK_FTR_SIZE;
+            interior = (phys_end < stack_len);
+        }
+        if (interior) {
+            if (a->recovery_poisoned) { errno = EINVAL; MUTEX_UNLOCK(a); return -1; }
+            if (alff_add_to_free_list(a->bs, slice.offset) != 0) { MUTEX_UNLOCK(a); return -2; }
+            MUTEX_UNLOCK(a);
+            return 0;
+        }
+    }
+#endif
+
+    /* Physically at the tail (shrunk block) or non-atomic: the free cascades, so
+     * it is multi-call and keeps the bracket. */
+    if (alff_set_recovery_needed(a) != 0) { MUTEX_UNLOCK(a); return -1; }
     /* Past this point the block is being pushed onto the free list: a
      * failure below can no longer safely hand the original back. */
     if (alff_add_to_free_list(a->bs, slice.offset) != 0) { MUTEX_UNLOCK(a); return -2; }
     if (alff_cascade_discard_free_tail(a->bs) != 0) { MUTEX_UNLOCK(a); return -2; }
-    r = alff_clear_recovery_needed(a->bs);
+    r = alff_clear_recovery_needed(a);
     MUTEX_UNLOCK(a);
     return r == 0 ? 0 : -2;
 }
@@ -3234,7 +3284,7 @@ static int ff_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
      * If this is not the tail block the lock is released before the lock-free
      * in-place paths below run. */
     MUTEX_LOCK(a);
-    if (bstack_len(a->bs, &stack_len) != 0) { MUTEX_UNLOCK(a); *out = recovered; return -1; }
+    if (bstack_len(a->bs, &stack_len) != 0) { goto fail_unlock; }
     if (slice.offset + aligned_current_len == stack_len - ALFF_BLOCK_FTR_SIZE) {
         uint8_t size_le[8];
         if (aligned_new_len > aligned_current_len) {
@@ -3242,24 +3292,23 @@ static int ff_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
             uint64_t zero_n = aligned_current_len + ALFF_BLOCK_FTR_SIZE - slice.len;
 #if UINT64_MAX > SIZE_MAX
             if (delta > (uint64_t)SIZE_MAX || zero_n > (uint64_t)SIZE_MAX) {
-                MUTEX_UNLOCK(a);
                 errno = EINVAL;
-                *out = recovered; return -1;
+                goto fail_unlock;
             }
 #endif
             /* Tail-grow is multi-step (extend + zero + header + footer); without
              * the recovery flag a crash after extend but before the header write
              * leaves an unrecoverable mid-arena layout (for delta >= 24 bytes
              * recovery would error on the zero "header" past the old block). */
-            if (alff_set_recovery_needed(a->bs) != 0) { MUTEX_UNLOCK(a); *out = recovered; return -1; }
-            if (bstack_extend(a->bs, (size_t)delta, NULL) != 0) { MUTEX_UNLOCK(a); *out = recovered; return -1; }
-            if (bstack_zero(a->bs, slice.offset + slice.len, (size_t)zero_n) != 0) { MUTEX_UNLOCK(a); *out = recovered; return -1; }
+            if (alff_set_recovery_needed(a) != 0) { goto fail_unlock; }
+            if (bstack_extend(a->bs, (size_t)delta, NULL) != 0) { goto fail_unlock; }
+            if (bstack_zero(a->bs, slice.offset + slice.len, (size_t)zero_n) != 0) { goto fail_unlock; }
             write_le64(size_le, aligned_new_len);
             if (bstack_set(a->bs, slice.offset - ALFF_BLOCK_HDR_SIZE,
-                           size_le, 8) != 0) { MUTEX_UNLOCK(a); *out = recovered; return -1; }
+                           size_le, 8) != 0) { goto fail_unlock; }
             if (bstack_set(a->bs, slice.offset + aligned_new_len,
-                           size_le, 8) != 0) { MUTEX_UNLOCK(a); *out = recovered; return -1; }
-            if (alff_clear_recovery_needed(a->bs) != 0) { MUTEX_UNLOCK(a); *out = recovered; return -1; }
+                           size_le, 8) != 0) { goto fail_unlock; }
+            if (alff_clear_recovery_needed(a) != 0) { goto fail_unlock; }
         } else {
             /* Tail shrink: keep the block; don't reclaim the tail in place. A
              * physical shrink needs a header write plus a discard (metadata +
@@ -3307,13 +3356,13 @@ static int ff_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
         /* Case 4: try to merge with the free right neighbour in place */
         {
             uint64_t next_block = slice.offset + block_size + ALFF_BLOCK_OVERHEAD;
-            if (bstack_len(a->bs, &stack_len) != 0) { MUTEX_UNLOCK(a); *out = recovered; return -1; }
+            if (bstack_len(a->bs, &stack_len) != 0) { goto fail_unlock; }
             if (next_block <= stack_len - ALFF_BLOCK_FTR_SIZE - ALFF_MIN_PAYLOAD) {
                 uint8_t next_hdr[16];
                 uint64_t next_size;
                 if (bstack_get(a->bs, next_block - ALFF_BLOCK_HDR_SIZE,
                                next_block - ALFF_BLOCK_HDR_SIZE + 16,
-                               next_hdr) != 0) { MUTEX_UNLOCK(a); *out = recovered; return -1; }
+                               next_hdr) != 0) { goto fail_unlock; }
                 next_size = read_le64(next_hdr);
 
                 if ((next_hdr[8] & 1) != 0
@@ -3325,18 +3374,123 @@ static int ff_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
                     if (slice.len < block_size) {
                         size_t zero_n = (size_t)(block_size - slice.len);
                         if (bstack_zero(a->bs, slice.offset + slice.len,
-                                        zero_n) != 0) { MUTEX_UNLOCK(a); *out = recovered; return -1; }
+                                        zero_n) != 0) { goto fail_unlock; }
                     }
 
-                    if (alff_set_recovery_needed(a->bs) != 0) { MUTEX_UNLOCK(a); *out = recovered; return -1; }
-                    if (alff_unlink_from_free_list(a->bs, next_block) != 0) { MUTEX_UNLOCK(a); *out = recovered; return -1; }
+#ifdef BSTACK_FEATURE_ATOMIC
+                    /* Atomic: splice `next` out of the free list and write the
+                     * merged (optionally split) block as ONE crash-atomic
+                     * set_batched. Read the links under the held lock, validate
+                     * them, and compute the *final* free-list state directly
+                     * (not unlink-then-prepend, so no offset is written twice).
+                     * A crash applies all of it or none, so no recovery bracket
+                     * is needed — only a cheap poison check. */
+                    if (a->recovery_poisoned) { errno = EINVAL; goto fail_unlock; }
+                    {
+                        uint64_t merged_size = block_size + ALFF_BLOCK_OVERHEAD + next_size;
+                        uint8_t  link_buf[16], head_buf[8];
+                        uint64_t nnext, nprev, free_head;
+                        size_t   buf_sz;
+                        uint8_t *buff;
+                        uint8_t  header_le[8], rem_le[8], nnext_le[8], nprev_le[8];
+                        bstack_iovec_t writes[6];
+                        size_t   nw = 0;
+                        int      rc;
+
+                        /* `next`'s own links + the current head. Reject an
+                         * out-of-range link as corruption before it becomes a
+                         * write offset. */
+                        if (bstack_get(a->bs, next_block, next_block + 16,
+                                       link_buf) != 0) { goto fail_unlock; }
+                        nnext = read_le64(link_buf);       /* next.next_free */
+                        nprev = read_le64(link_buf + 8);   /* next.prev_free */
+                        if (bstack_get(a->bs, ALFF_FREE_HEAD_OFFSET,
+                                       ALFF_FREE_HEAD_OFFSET + 8, head_buf) != 0) {
+                            goto fail_unlock; }
+                        free_head = read_le64(head_buf);
+                        if (!alff_is_valid_link_ptr(nnext, stack_len)
+                            || !alff_is_valid_link_ptr(nprev, stack_len)
+                            || !alff_is_valid_link_ptr(free_head, stack_len)) {
+                            errno = EINVAL; goto fail_unlock; }
+
+                        buf_sz = (size_t)(next_size + ALFF_BLOCK_OVERHEAD + ALFF_BLOCK_FTR_SIZE);
+                        buff = calloc(1, buf_sz);
+                        if (!buff) { goto fail_unlock; }
+                        write_le64(nnext_le, nnext);
+                        write_le64(nprev_le, nprev);
+
+                        if (merged_size >=
+                            aligned_new_len + ALFF_BLOCK_OVERHEAD + ALFF_MIN_PAYLOAD) {
+                            /* Split: front stays allocated (`aligned_new_len`);
+                             * the back becomes a free `remainder` prepended to
+                             * the list. Net change: remove `next`, add remainder
+                             * at the head. `first` = list head once next is gone. */
+                            uint64_t remainder_size =
+                                merged_size - aligned_new_len - ALFF_BLOCK_OVERHEAD;
+                            uint64_t new_free_start =
+                                slice.offset + aligned_new_len + ALFF_BLOCK_OVERHEAD;
+                            uint64_t first = (nprev == 0) ? nnext : free_head;
+                            size_t alloc_ftr_off = (size_t)(aligned_new_len - block_size);
+                            size_t free_hdr_off  = alloc_ftr_off + (size_t)ALFF_BLOCK_FTR_SIZE;
+                            size_t free_pay_off  = alloc_ftr_off + (size_t)ALFF_BLOCK_OVERHEAD;
+                            size_t free_ftr_off  = (size_t)(next_size + ALFF_BLOCK_OVERHEAD);
+
+                            write_le64(buff + alloc_ftr_off, aligned_new_len);
+                            write_le64(buff + free_hdr_off,  remainder_size);
+                            write_le32(buff + free_hdr_off + 8, 1); /* is_free */
+                            write_le64(buff + free_pay_off,  first); /* next_free */
+                            write_le64(buff + free_ftr_off,  remainder_size);
+
+                            write_le64(header_le, aligned_new_len);
+                            write_le64(rem_le,    new_free_start);
+
+                            writes[nw].offset = slice.offset - ALFF_BLOCK_HDR_SIZE;
+                            writes[nw].buf = header_le; writes[nw].len = 8; nw++;
+                            writes[nw].offset = slice.offset + block_size;
+                            writes[nw].buf = buff;      writes[nw].len = buf_sz; nw++;
+                            writes[nw].offset = ALFF_FREE_HEAD_OFFSET;
+                            writes[nw].buf = rem_le;    writes[nw].len = 8; nw++;
+                            if (first != 0) { /* remainder's successor back-links to it */
+                                writes[nw].offset = first + 8;
+                                writes[nw].buf = rem_le; writes[nw].len = 8; nw++; }
+                            if (nprev != 0) { /* splice next's predecessor forward-link */
+                                writes[nw].offset = nprev;
+                                writes[nw].buf = nnext_le; writes[nw].len = 8; nw++; }
+                            if (nprev != 0 && nnext != 0) { /* and its successor back-link */
+                                writes[nw].offset = nnext + 8;
+                                writes[nw].buf = nprev_le; writes[nw].len = 8; nw++; }
+                        } else {
+                            /* No split: absorb `next` entirely; just remove it. */
+                            size_t ftr_off = (size_t)(next_size + ALFF_BLOCK_OVERHEAD);
+                            write_le64(buff + ftr_off, merged_size);
+                            write_le64(header_le, merged_size);
+
+                            writes[nw].offset = slice.offset - ALFF_BLOCK_HDR_SIZE;
+                            writes[nw].buf = header_le; writes[nw].len = 8; nw++;
+                            writes[nw].offset = slice.offset + block_size;
+                            writes[nw].buf = buff;      writes[nw].len = buf_sz; nw++;
+                            /* remove next: predecessor (or free_head) forward-links past it */
+                            writes[nw].offset = (nprev == 0) ? ALFF_FREE_HEAD_OFFSET : nprev;
+                            writes[nw].buf = nnext_le; writes[nw].len = 8; nw++;
+                            if (nnext != 0) { /* successor back-links past it */
+                                writes[nw].offset = nnext + 8;
+                                writes[nw].buf = nprev_le; writes[nw].len = 8; nw++; }
+                        }
+
+                        rc = bstack_set_batched(a->bs, writes, nw);
+                        free(buff);
+                        if (rc != 0) { goto fail_unlock; }
+                    }
+#else
+                    if (alff_set_recovery_needed(a) != 0) { goto fail_unlock; }
+                    if (alff_unlink_from_free_list(a->bs, next_block) != 0) { goto fail_unlock; }
 
                     {
                         uint64_t merged_size = block_size + ALFF_BLOCK_OVERHEAD + next_size;
                         size_t   zero_buf_sz =
                             (size_t)(next_size + ALFF_BLOCK_OVERHEAD + ALFF_BLOCK_FTR_SIZE);
                         uint8_t *zero_buff = calloc(1, zero_buf_sz);
-                        if (!zero_buff) { MUTEX_UNLOCK(a); *out = recovered; return -1; }
+                        if (!zero_buff) { goto fail_unlock; }
 
                         if (merged_size >=
                             aligned_new_len + ALFF_BLOCK_OVERHEAD + ALFF_MIN_PAYLOAD) {
@@ -3359,7 +3513,7 @@ static int ff_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
 
                             if (bstack_get(a->bs, ALFF_FREE_HEAD_OFFSET,
                                            ALFF_FREE_HEAD_OFFSET + 8, head_buf) != 0) {
-                                free(zero_buff); MUTEX_UNLOCK(a); *out = recovered; return -1;
+                                free(zero_buff); goto fail_unlock;
                             }
                             old_head = read_le64(head_buf);
 
@@ -3373,28 +3527,28 @@ static int ff_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
                             write_le64(size_le, merged_size);
                             if (bstack_set(a->bs, slice.offset - ALFF_BLOCK_HDR_SIZE,
                                            size_le, 8) != 0) {
-                                free(zero_buff); MUTEX_UNLOCK(a); *out = recovered; return -1;
+                                free(zero_buff); goto fail_unlock;
                             }
                             if (bstack_set(a->bs, slice.offset + block_size,
                                            zero_buff, zero_buf_sz) != 0) {
-                                free(zero_buff); MUTEX_UNLOCK(a); *out = recovered; return -1;
+                                free(zero_buff); goto fail_unlock;
                             }
                             free(zero_buff);
 
                             /* Shrink allocated block header */
                             write_le64(size_le, aligned_new_len);
                             if (bstack_set(a->bs, slice.offset - ALFF_BLOCK_HDR_SIZE,
-                                           size_le, 8) != 0) { MUTEX_UNLOCK(a); *out = recovered; return -1; }
+                                           size_le, 8) != 0) { goto fail_unlock; }
 
                             /* Forward link: free_head → new free block */
                             {
                                 uint8_t nfs_le[8];
                                 write_le64(nfs_le, new_free_start);
                                 if (bstack_set(a->bs, ALFF_FREE_HEAD_OFFSET,
-                                               nfs_le, 8) != 0) { MUTEX_UNLOCK(a); *out = recovered; return -1; }
+                                               nfs_le, 8) != 0) { goto fail_unlock; }
                                 if (old_head != 0) {
                                     if (bstack_set(a->bs, old_head + 8,
-                                                   nfs_le, 8) != 0) { MUTEX_UNLOCK(a); *out = recovered; return -1; }
+                                                   nfs_le, 8) != 0) { goto fail_unlock; }
                                 }
                             }
                         } else {
@@ -3405,17 +3559,18 @@ static int ff_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
                             write_le64(size_le, merged_size);
                             if (bstack_set(a->bs, slice.offset - ALFF_BLOCK_HDR_SIZE,
                                            size_le, 8) != 0) {
-                                free(zero_buff); MUTEX_UNLOCK(a); *out = recovered; return -1;
+                                free(zero_buff); goto fail_unlock;
                             }
                             if (bstack_set(a->bs, slice.offset + block_size,
                                            zero_buff, zero_buf_sz) != 0) {
-                                free(zero_buff); MUTEX_UNLOCK(a); *out = recovered; return -1;
+                                free(zero_buff); goto fail_unlock;
                             }
                             free(zero_buff);
                         }
                     }
 
-                    if (alff_clear_recovery_needed(a->bs) != 0) { MUTEX_UNLOCK(a); *out = recovered; return -1; }
+                    if (alff_clear_recovery_needed(a) != 0) { goto fail_unlock; }
+#endif
                     out->allocator = self;
                     out->offset    = slice.offset;
                     out->len       = new_len;
@@ -3429,7 +3584,7 @@ static int ff_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
         {
             uint64_t found_start = 0, found_size = 0;
             if (alff_find_large_enough_block(a->bs, aligned_new_len,
-                                              &found_start, &found_size) != 0) { MUTEX_UNLOCK(a); *out = recovered; return -1; }
+                                              &found_start, &found_size) != 0) { goto fail_unlock; }
 
             if (found_start != 0) {
                 size_t   buf_sz;
@@ -3438,27 +3593,26 @@ static int ff_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
 
 #if UINT64_MAX > SIZE_MAX
                 if (ALFF_BLOCK_OVERHEAD + aligned_new_len > (uint64_t)SIZE_MAX) {
-                    MUTEX_UNLOCK(a);
                     errno = EINVAL;
-                    *out = recovered; return -1;
+                    goto fail_unlock;
                 }
 #endif
                 buf_sz   = (size_t)(ALFF_BLOCK_OVERHEAD + aligned_new_len);
                 data_buf = calloc(1, buf_sz);
-                if (!data_buf) { MUTEX_UNLOCK(a); *out = recovered; return -1; }
+                if (!data_buf) { goto fail_unlock; }
 
                 copy_len = slice.len < aligned_new_len ? slice.len : aligned_new_len;
                 if (copy_len > 0) {
                     if (bstack_get(a->bs, slice.offset, slice.offset + copy_len,
                                    data_buf + ALFF_BLOCK_HDR_SIZE) != 0) {
-                        free(data_buf); MUTEX_UNLOCK(a); *out = recovered; return -1;
+                        free(data_buf); goto fail_unlock;
                     }
                 }
 
-                if (alff_set_recovery_needed(a->bs) != 0) { free(data_buf); MUTEX_UNLOCK(a); *out = recovered; return -1; }
+                if (alff_set_recovery_needed(a) != 0) { free(data_buf); goto fail_unlock; }
                 if (alff_unlink_block(a->bs, found_start, found_size,
                                       aligned_new_len, data_buf) != 0) {
-                    free(data_buf); MUTEX_UNLOCK(a); *out = recovered; return -1;
+                    free(data_buf); goto fail_unlock;
                 }
                 free(data_buf);
 
@@ -3475,9 +3629,9 @@ static int ff_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
                 recovered.offset    = new_payload;
                 recovered.len       = new_len;
 
-                if (alff_add_to_free_list(a->bs, slice.offset) != 0) { MUTEX_UNLOCK(a); *out = recovered; return -1; }
-                if (alff_cascade_discard_free_tail(a->bs) != 0) { MUTEX_UNLOCK(a); *out = recovered; return -1; }
-                if (alff_clear_recovery_needed(a->bs) != 0) { MUTEX_UNLOCK(a); *out = recovered; return -1; }
+                if (alff_add_to_free_list(a->bs, slice.offset) != 0) { goto fail_unlock; }
+                if (alff_cascade_discard_free_tail(a->bs) != 0) { goto fail_unlock; }
+                if (alff_clear_recovery_needed(a) != 0) { goto fail_unlock; }
 
                 out->allocator = self;
                 out->offset    = new_payload;
@@ -3497,14 +3651,13 @@ static int ff_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
 
 #if UINT64_MAX > SIZE_MAX
         if (aligned_new_len + ALFF_BLOCK_OVERHEAD > (uint64_t)SIZE_MAX) {
-            MUTEX_UNLOCK(a);
             errno = EINVAL;
-            *out = recovered; return -1;
+            goto fail_unlock;
         }
 #endif
         block_sz  = (size_t)(aligned_new_len + ALFF_BLOCK_OVERHEAD);
         block_buf = calloc(1, block_sz);
-        if (!block_buf) { MUTEX_UNLOCK(a); *out = recovered; return -1; }
+        if (!block_buf) { goto fail_unlock; }
 
         write_le64(size_le, aligned_new_len);
         memcpy(block_buf, size_le, 8);
@@ -3515,7 +3668,7 @@ static int ff_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
             uint64_t bsz;
             if (bstack_get(a->bs, slice.offset - ALFF_BLOCK_HDR_SIZE,
                            slice.offset - ALFF_BLOCK_HDR_SIZE + 8,
-                           bsz_buf) != 0) { free(block_buf); MUTEX_UNLOCK(a); *out = recovered; return -1; }
+                           bsz_buf) != 0) { free(block_buf); goto fail_unlock; }
             bsz = read_le64(bsz_buf);
             copy_len = slice.len < aligned_new_len ? slice.len : aligned_new_len;
             (void)bsz;
@@ -3524,14 +3677,14 @@ static int ff_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
         if (copy_len > 0) {
             if (bstack_get(a->bs, slice.offset, slice.offset + copy_len,
                            block_buf + ALFF_BLOCK_HDR_SIZE) != 0) {
-                free(block_buf); MUTEX_UNLOCK(a); *out = recovered; return -1;
+                free(block_buf); goto fail_unlock;
             }
         }
         memcpy(block_buf + ALFF_BLOCK_HDR_SIZE + aligned_new_len, size_le, 8);
 
-        if (alff_set_recovery_needed(a->bs) != 0) { free(block_buf); MUTEX_UNLOCK(a); *out = recovered; return -1; }
+        if (alff_set_recovery_needed(a) != 0) { free(block_buf); goto fail_unlock; }
         if (bstack_push(a->bs, block_buf, block_sz, &push_offset) != 0) {
-            free(block_buf); MUTEX_UNLOCK(a); *out = recovered; return -1;
+            free(block_buf); goto fail_unlock;
         }
         free(block_buf);
         new_ptr = push_offset + ALFF_BLOCK_HDR_SIZE;
@@ -3543,9 +3696,9 @@ static int ff_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
         recovered.offset    = new_ptr;
         recovered.len       = new_len;
 
-        if (alff_add_to_free_list(a->bs, slice.offset) != 0) { MUTEX_UNLOCK(a); *out = recovered; return -1; }
-        if (alff_cascade_discard_free_tail(a->bs) != 0) { MUTEX_UNLOCK(a); *out = recovered; return -1; }
-        if (alff_clear_recovery_needed(a->bs) != 0) { MUTEX_UNLOCK(a); *out = recovered; return -1; }
+        if (alff_add_to_free_list(a->bs, slice.offset) != 0) { goto fail_unlock; }
+        if (alff_cascade_discard_free_tail(a->bs) != 0) { goto fail_unlock; }
+        if (alff_clear_recovery_needed(a) != 0) { goto fail_unlock; }
 
         out->allocator = self;
         out->offset    = new_ptr;
@@ -3553,6 +3706,13 @@ static int ff_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
         MUTEX_UNLOCK(a);
         return 0;
     }
+
+    /* Shared failure epilogue for the lock-held paths: release the lock and hand
+     * back the surviving allocation. */
+fail_unlock:
+    MUTEX_UNLOCK(a);
+    *out = recovered;
+    return -1;
 }
 
 static int
@@ -3650,6 +3810,7 @@ first_fit_bstack_allocator_t *first_fit_bstack_allocator_new(bstack_t *bs)
         a->lock = m;
     }
 #  endif
+    a->recovery_poisoned = 0;
 #endif
 
     if (bstack_len(bs, &stack_len) != 0) { ff_destroy_lock(a); free(a); return NULL; }

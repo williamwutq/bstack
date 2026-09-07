@@ -6752,16 +6752,20 @@ mod first_fit_tests {
         let _b = alloc.alloc(64).unwrap();
         alloc.dealloc(a).unwrap();
 
-        // Manually poke the recovery_needed flag.  Layout: payload offset 24
-        // = OFFSET_SIZE(16) + magic(8); the flag occupies the next 4 bytes.
+        // Simulate a bracketed op that failed after arming the flag: it leaves
+        // BOTH the on-disk flag (payload offset 24 = OFFSET_SIZE(16) + magic(8))
+        // and the in-memory poison set. The disk flag drives reopen recovery; the
+        // poison is what the single atomic-call paths (which no longer arm the flag
+        // themselves) check to refuse.
         alloc
             .stack()
             .set(24u64, 1u32.to_le_bytes().as_slice())
             .unwrap();
+        alloc.poison_for_test();
 
-        // Any operation that goes through `set_recovery_needed` should now
-        // fail with the recovery-needed CAS error.  `alloc(64)` reuses the
-        // freed slot, so it walks the free list and calls `unlink_block`.
+        // A free-list-touching op must now refuse. `alloc(64)` reuses the freed
+        // slot, walking the free list and unlinking — its `guard_not_poisoned`
+        // check surfaces the needs-recovery error instead of proceeding.
         let err = alloc.alloc(64).unwrap_err();
         let msg = err.to_string();
         assert!(
