@@ -14,6 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`Clone`, `DoubleEndedIterator`, `ExactSizeIterator` and `FusedIterator` for `BStackByteVecIter` (`alloc` + `set`, Rust only).** The byte-vec iterator previously implemented only `Iterator`. `Clone` forks an iteration at its position; `next_back` shrinks the snapshotted `len` and reads there, so `.rev()`/`.last()` cost one read rather than a scan; that same snapshot is what makes the iterator soundly fused. `size_hint` was already exact and is unchanged. Backported from the 0.4.x line.
 - **`RefUnwindSafe` for the five built-in allocators in non-`atomic` builds (`alloc`; `set` for the three that need it; Rust only).** Each carries a `PhantomData<Cell<()>>` marker to remove `Sync` where the allocator is not thread-shareable; `Cell` removed `RefUnwindSafe` along with it, so `catch_unwind` over an `&allocator` compiled with `atomic` and not without. An explicit impl restores it — the only interior mutability is the `BStack`'s own poisoning lock. `Sync` is still absent without `atomic`, as before. Backported from the 0.4.x line.
 
+### Changed
+
+- **`FirstFitBStackAllocator` (Rust) / `first_fit_bstack_allocator_*` (C) free-list mutations now validate untrusted on-disk sizes and pointers before use (`alloc` + `set` / `BSTACK_FEATURE_SET`).** `add_to_free_list`, `unlink_block`, and the shared `unlink_from_free_list` (C: `alff_add_to_free_list`, `alff_unlink_block`, `alff_unlink_from_free_list`) apply `is_real_block_ptr` / `is_valid_link_ptr` / `is_possible_block_size` checks to the block sizes and free-list links they read, so a corrupt or truncated file is rejected with `io::ErrorKind::InvalidData` / `errno = EINVAL` instead of being followed into an out-of-bounds read or write. Costs one extra `len` probe per helper. Backported from the 0.4.x line.
+
 ## [0.2.7] - 2026-09-02
 
 ### Added

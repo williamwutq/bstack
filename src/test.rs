@@ -4086,6 +4086,54 @@ mod first_fit_tests {
         assert_eq!(starts, expected);
     }
 
+    // A corrupt free-list link in the block the allocator is about to unlink for
+    // reuse must be rejected as InvalidData, not followed into an out-of-bounds
+    // write. find_large_enough_block fits the block and stops before reading it, so
+    // the corruption first surfaces inside unlink_block.
+    #[test]
+    fn unlink_block_rejects_corrupt_link() {
+        let (alloc, path) = mk_ff("unlink_corrupt");
+        let _g = Guard(path);
+        let a = alloc.alloc(64).unwrap();
+        let _b = alloc.alloc(64).unwrap(); // keep a non-tail
+        let a_payload = a.start();
+        alloc.dealloc(a).unwrap(); // a is now the free-list head
+
+        // Corrupt a's next_free link (first 8 payload bytes) → out of bounds.
+        alloc
+            .stack()
+            .set(a_payload, u64::MAX.to_le_bytes())
+            .unwrap();
+
+        let err = alloc
+            .alloc(64)
+            .expect_err("alloc must reject a corrupt free-list link");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    // A corrupt free_head must be rejected when dealloc prepends a freed block, not
+    // written through to an out-of-bounds back-link.
+    #[test]
+    fn add_to_free_list_rejects_corrupt_head() {
+        let (alloc, path) = mk_ff("addfree_corrupt");
+        let _g = Guard(path);
+        let _a = alloc.alloc(64).unwrap();
+        let b = alloc.alloc(64).unwrap();
+        let _c = alloc.alloc(64).unwrap(); // keep b non-tail
+
+        // Corrupt free_head → out of bounds. b has no free neighbour to coalesce, so
+        // add_to_free_list reaches the head read and rejects it.
+        alloc
+            .stack()
+            .set(FREE_HEAD_OFFSET, u64::MAX.to_le_bytes())
+            .unwrap();
+
+        let err = alloc
+            .dealloc(b)
+            .expect_err("dealloc must reject a corrupt free_head");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
     #[test]
     fn recovery_truncates_partial_tail_block() {
         use std::io::Write;

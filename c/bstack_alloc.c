@@ -847,6 +847,7 @@ bstack_t *linear_bstack_allocator_into_stack(linear_bstack_allocator_t *alloc)
 #define ALFF_ARENA_START      UINT64_C(48)
 #define ALFF_MIN_BLOCK_START  UINT64_C(64)  /* ARENA_START + BLOCK_HDR_SIZE */
 #define ALFF_MIN_BLOCK_END    UINT64_C(80)  /* ARENA_START + BLOCK_HDR_SIZE + MIN_PAYLOAD */
+#define ALFF_MIN_BLOCK_ON_DISK UINT64_C(40) /* MIN_PAYLOAD + BLOCK_OVERHEAD */
 
 static const uint8_t alff_magic[8]        = {'A','L','F','F',0,1,3,0};
 static const uint8_t alff_magic_prefix[6] = {'A','L','F','F',0,1};
@@ -900,6 +901,38 @@ static inline int alff_is_impossible_block_end(uint64_t stack_len, uint64_t end)
     if (end < ALFF_MIN_BLOCK_END) return 1;
     if (stack_len < ALFF_BLOCK_FTR_SIZE) return 1;
     return end > stack_len - ALFF_BLOCK_FTR_SIZE;
+}
+
+/* ---- free-list validation predicates ----------------------------------
+ * Verify untrusted on-disk sizes and pointers before those values reach a
+ * read/write offset, so a corrupt arena is rejected rather than chased. */
+
+/* A possible payload size: a multiple of 8, at least MIN_PAYLOAD. */
+static inline int alff_is_possible_block_size(uint64_t size)
+{
+    return size % 8 == 0 && size >= ALFF_MIN_PAYLOAD;
+}
+
+/* A possible payload offset: aligned, and past the protected header region.
+ * May have false positives, never false negatives. */
+static inline int alff_is_possible_block_ptr(uint64_t ptr)
+{
+    return ptr % 8 == 0 && ptr >= ALFF_ARENA_START + ALFF_BLOCK_HDR_SIZE;
+}
+
+/* An in-bounds payload offset: possible, and whose block's footer + min payload
+ * still fit within stack_len.  A larger value is corrupt.  stack_len must have
+ * been checked >= ARENA_START before this call, else the subtraction may wrap. */
+static inline int alff_is_real_block_ptr(uint64_t ptr, uint64_t stack_len)
+{
+    return alff_is_possible_block_ptr(ptr)
+        && ptr <= stack_len - (ALFF_BLOCK_FTR_SIZE + ALFF_MIN_PAYLOAD);
+}
+
+/* A free-list next/prev link: the null terminator, or a real block pointer. */
+static inline int alff_is_valid_link_ptr(uint64_t ptr, uint64_t stack_len)
+{
+    return ptr == 0 || alff_is_real_block_ptr(ptr, stack_len);
 }
 
 /* ---- recovery flag management ----------------------------------------- */
@@ -961,13 +994,25 @@ static int alff_clear_recovery_needed(bstack_t *bs)
 static int alff_unlink_from_free_list(bstack_t *bs, uint64_t payload_start)
 {
     uint8_t ptrs[16];
-    uint64_t next, prev;
+    uint64_t next, prev, stack_len;
     uint8_t ptr_le[8];
 
+    /* A successful 16-byte read at payload_start proves the stack reaches past
+     * the arena, so alff_is_valid_link_ptr's subtraction cannot underflow. The
+     * len probe is an extra read, acceptable where each write already carries its
+     * own durable sync. */
+    if (bstack_len(bs, &stack_len) != 0) return -1;
     if (bstack_get(bs, payload_start, payload_start + 16, ptrs) != 0)
         return -1;
     next = read_le64(ptrs);
     prev = read_le64(ptrs + 8);
+    /* Both are untrusted on-disk links; reject an out-of-bounds one as corruption
+     * before it reaches a write offset (also guarding next + 8 from overflow). */
+    if (!alff_is_valid_link_ptr(next, stack_len)
+        || !alff_is_valid_link_ptr(prev, stack_len)) {
+        errno = EINVAL;
+        return -1;
+    }
 
     write_le64(ptr_le, next);
     if (prev != 0) {
@@ -999,13 +1044,30 @@ static int alff_add_to_free_list(bstack_t *bs, uint64_t block_start)
     uint64_t result_header_start, result_start;
     uint8_t free_flag[4];
 
+    /* Reject an impossible input up front; this also makes the header
+     * subtraction below safe (block_start >= ARENA_START + BLOCK_HDR_SIZE). */
+    if (!alff_is_possible_block_ptr(block_start)) {
+        errno = EINVAL;
+        return -1;
+    }
     if (bstack_len(bs, &stack_len) != 0) return -1;
+    /* The arena must be able to hold at least one block, and this block must fit
+     * within it; a corrupt or truncated file is rejected rather than walked into. */
+    if (stack_len < ALFF_ARENA_START + ALFF_MIN_BLOCK_ON_DISK
+        || !alff_is_real_block_ptr(block_start, stack_len)) {
+        errno = EINVAL;
+        return -1;
+    }
 
     block_header_start = block_start - ALFF_BLOCK_HDR_SIZE;
 
     if (bstack_get(bs, block_header_start, block_header_start + 8, size_buf) != 0)
         return -1;
     size = read_le64(size_buf);
+    if (!alff_is_possible_block_size(size)) {
+        errno = EINVAL;
+        return -1;
+    }
     result_header_start = block_header_start;
 
     /* Mark block as free early so recovery can find it on crash */
@@ -1083,6 +1145,12 @@ static int alff_add_to_free_list(bstack_t *bs, uint64_t block_start)
         if (bstack_get(bs, ALFF_FREE_HEAD_OFFSET,
                        ALFF_FREE_HEAD_OFFSET + 8, head_buf) != 0) return -1;
         next_block = read_le64(head_buf);
+        /* The old head becomes our next_free and takes a back-link at
+         * next_block + 8, so validate it like any other free-list link. */
+        if (!alff_is_valid_link_ptr(next_block, stack_len)) {
+            errno = EINVAL;
+            return -1;
+        }
 
         memset(update_buf, 0, 24);
         write_le32(update_buf, 1);              /* flags: is_free = 1 */
@@ -1220,12 +1288,22 @@ static int alff_unlink_block(bstack_t *bs,
     } else {
         /* NO-SPLIT: remove block entirely from free list */
         uint8_t pointers_buf[16];
-        uint64_t next, prev;
+        uint64_t next, prev, stack_len;
         uint8_t ptr_le[8];
 
         if (bstack_get(bs, found_start, found_start + 16, pointers_buf) != 0) return -1;
         next = read_le64(pointers_buf);
         prev = read_le64(pointers_buf + 8);
+        /* Both are untrusted on-disk links; reject an out-of-bounds one as
+         * corruption before it reaches a write offset (also guarding next + 8 from
+         * overflow). A successful 16-byte read at found_start proves the stack
+         * reaches past the arena, so alff_is_valid_link_ptr cannot underflow. */
+        if (bstack_len(bs, &stack_len) != 0) return -1;
+        if (!alff_is_valid_link_ptr(next, stack_len)
+            || !alff_is_valid_link_ptr(prev, stack_len)) {
+            errno = EINVAL;
+            return -1;
+        }
 
         /* Commit backward pointer first */
         write_le64(ptr_le, next);
