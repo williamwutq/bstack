@@ -184,6 +184,8 @@ impl FirstFitBStackAllocator {
     const BLOCK_FOOTER_SIZE: u64 = 8;
     const BLOCK_OVERHEAD_SIZE: u64 = Self::BLOCK_HEADER_SIZE + Self::BLOCK_FOOTER_SIZE;
     const MIN_BLOCK_PAYLOAD_SIZE: u64 = 16;
+    const ARENA_START: u64 = Self::OFFSET_SIZE + Self::HEADER_SIZE;
+    const MIN_BLOCK_ON_DISK_SIZE: u64 = Self::MIN_BLOCK_PAYLOAD_SIZE + Self::BLOCK_OVERHEAD_SIZE;
     // Absolute payload offset of the free_head field in the allocator header:
     // OFFSET_SIZE(16) + magic(8) + flags(4) + _reserved(4) = 32
     const FREE_HEAD_OFFSET: u64 = Self::OFFSET_SIZE + 16;
@@ -364,13 +366,58 @@ impl FirstFitBStackAllocator {
         len.max(Self::MIN_BLOCK_PAYLOAD_SIZE).next_multiple_of(8)
     }
 
+    /// Whether an on-disk block size (from user or disk read) is possible: aligned
+    /// to 8 and at least [`MIN_BLOCK_PAYLOAD_SIZE`](Self::MIN_BLOCK_PAYLOAD_SIZE).
+    #[inline(always)]
+    fn is_possible_block_size(size: u64) -> bool {
+        size.is_multiple_of(8) && size >= Self::MIN_BLOCK_PAYLOAD_SIZE
+    }
+
+    /// Whether an on-disk block pointer is possible: an aligned payload offset past
+    /// the protected header region. May have false positives, never false negatives.
+    #[inline(always)]
+    fn is_possible_block_ptr(ptr: u64) -> bool {
+        ptr.is_multiple_of(8) && ptr >= Self::ARENA_START + Self::BLOCK_HEADER_SIZE
+    }
+
+    /// Whether an on-disk block pointer is in bounds: possible, and its block's
+    /// footer + min payload still fit within `stack_len`. `stack_len` must have been
+    /// checked `>= ARENA_START` before this call, else the subtraction may wrap.
+    #[inline]
+    fn is_real_block_ptr(ptr: u64, stack_len: u64) -> bool {
+        Self::is_possible_block_ptr(ptr)
+            && ptr <= stack_len - (Self::BLOCK_FOOTER_SIZE + Self::MIN_BLOCK_PAYLOAD_SIZE)
+    }
+
+    /// Whether an on-disk free-list next/prev link is in bounds: the null
+    /// terminator, or a real block pointer. A larger value is corrupt.
+    #[inline(always)]
+    fn is_valid_link_ptr(ptr: u64, stack_len: u64) -> bool {
+        ptr == 0 || Self::is_real_block_ptr(ptr, stack_len)
+    }
+
     /// Remove a free block from the free list by updating its neighbours' pointers.
     /// Does not touch the block's own header or payload.
+    ///
+    /// The `next`/`prev` links are read from disk and validated with
+    /// [`is_valid_link_ptr`](Self::is_valid_link_ptr) before they are followed to a
+    /// write offset, so a corrupt or truncated file is rejected rather than walked
+    /// into. The `len` probe this needs is an extra read, acceptable where each
+    /// write already carries its own durable sync.
     fn unlink_from_free_list(&self, payload_start: u64) -> io::Result<()> {
+        // A successful 16-byte read at `payload_start` proves the stack reaches past
+        // the arena, so `is_valid_link_ptr`'s subtraction cannot underflow.
+        let stack_len = self.stack.len()?;
         let mut ptrs = [0u8; 16];
         self.stack.get_into(payload_start, &mut ptrs)?;
         let next = u64::from_le_bytes(ptrs[0..8].try_into().unwrap());
         let prev = u64::from_le_bytes(ptrs[8..16].try_into().unwrap());
+        if !Self::is_valid_link_ptr(next, stack_len) || !Self::is_valid_link_ptr(prev, stack_len) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unlink_from_free_list: corrupted free-list link",
+            ));
+        }
         if prev != 0 {
             self.stack.set(prev, next.to_le_bytes())?;
         } else {
@@ -395,14 +442,38 @@ impl FirstFitBStackAllocator {
         // free_head --------------> next -> ...
         // free_head <-------------- next <- ...
 
+        // Reject an impossible input up front; this also makes the header
+        // subtraction below safe (block_start >= ARENA_START + BLOCK_HEADER_SIZE).
+        if !Self::is_possible_block_ptr(block_start) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "add_to_free_list: given block_start is not a valid block start",
+            ));
+        }
         let stack_len = self.stack.len()?;
         let arena_start = Self::OFFSET_SIZE + Self::HEADER_SIZE;
+        // The arena must be able to hold at least one block, and this block must fit
+        // within it; a corrupt or truncated file is rejected rather than walked into.
+        if stack_len < Self::ARENA_START + Self::MIN_BLOCK_ON_DISK_SIZE
+            || !Self::is_real_block_ptr(block_start, stack_len)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "add_to_free_list: block does not fit within stack",
+            ));
+        }
         let block_header_start = block_start - Self::BLOCK_HEADER_SIZE;
 
         // Read the current block's payload size from its header
         let mut size_buf = [0u8; 8];
         self.stack.get_into(block_header_start, &mut size_buf)?;
         let mut size = u64::from_le_bytes(size_buf);
+        if !Self::is_possible_block_size(size) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "add_to_free_list: on disk block size corrupt",
+            ));
+        }
         let mut result_header_start = block_header_start;
 
         // Mark block as free early so recovery can find it even if we crash mid-coalesce
@@ -465,6 +536,14 @@ impl FirstFitBStackAllocator {
         let mut head_buf = [0u8; 8];
         self.stack.get_into(Self::FREE_HEAD_OFFSET, &mut head_buf)?;
         let next_block = u64::from_le_bytes(head_buf);
+        // The old head becomes our next_free and takes a back-link at next_block + 8,
+        // so validate it like any other free-list link before writing through it.
+        if !Self::is_valid_link_ptr(next_block, stack_len) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "add_to_free_list: corrupted free-list head",
+            ));
+        }
         let mut update_buf = [0u8; 24];
         update_buf[0..4].copy_from_slice(&1u32.to_le_bytes()); // is_free = 1
         update_buf[8..16].copy_from_slice(&next_block.to_le_bytes()); // next_free = old head
@@ -628,6 +707,19 @@ impl FirstFitBStackAllocator {
             self.stack.get_into(found_start, &mut pointers_buf)?;
             let next = u64::from_le_bytes(pointers_buf[0..8].try_into().unwrap());
             let prev = u64::from_le_bytes(pointers_buf[8..16].try_into().unwrap());
+            // Both are untrusted on-disk links; reject an out-of-bounds one as
+            // corruption before it reaches a write offset (also guarding next + 8
+            // from overflow). A successful 16-byte read at found_start proves the
+            // stack reaches past the arena, so is_valid_link_ptr cannot underflow.
+            let stack_len = self.stack.len()?;
+            if !Self::is_valid_link_ptr(next, stack_len)
+                || !Self::is_valid_link_ptr(prev, stack_len)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "unlink_block: corrupted free-list link",
+                ));
+            }
 
             // Commit backward pointer first
             // If fails here, the free list looks like this:
