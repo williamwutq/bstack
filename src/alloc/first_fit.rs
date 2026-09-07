@@ -1710,11 +1710,11 @@ impl BStackAllocator for FirstFitBStackAllocator {
             #[cfg(feature = "atomic")]
             {
                 let phys_size = read_buf_le!(hdr_buf, 0 => u64);
-                let interior = slice
-                    .start()
-                    .checked_add(phys_size)
-                    .and_then(|e| e.checked_add(Self::BLOCK_FOOTER_SIZE))
-                    .is_some_and(|phys_end| phys_end < current_tail);
+                // start + phys_size + FOOTER < current_tail, overflow-safe.
+                let interior = slice.start()
+                    < current_tail
+                        .saturating_sub(phys_size)
+                        .saturating_sub(Self::BLOCK_FOOTER_SIZE);
                 if interior {
                     // One crash-atomic `add_to_free_list`; the cascade would be a
                     // no-op, so drop it and the bracket — only the in-memory poison
