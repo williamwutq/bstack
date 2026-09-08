@@ -9399,6 +9399,232 @@ mod atomic_tests {
         assert_eq!(s.peek(0).unwrap(), vec![b'.'; 20]);
     }
 
+    // ---- Repeat op in process_gen / inplace_gen -----------------------------
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn process_gen_repeat_fills_region_and_ends_sequence() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(vec![b'.'; 12]).unwrap();
+        let mut step = 0usize;
+        s.process_gen(|| {
+            let r = match step {
+                0 => Some(BStackGenOp::Repeat {
+                    offset: 2,
+                    pattern: b"abc",
+                    count: 3,
+                }),
+                // Ignored: Repeat ended the sequence.
+                _ => Some(BStackGenOp::Write {
+                    offset: 0,
+                    data: b"ZZ",
+                }),
+            };
+            step += 1;
+            r
+        })
+        .unwrap();
+        assert_eq!(s.peek(0).unwrap(), b"..abcabcabc.");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn process_gen_repeat_empty_or_zero_is_noop() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello world").unwrap();
+        s.process_gen(|| {
+            Some(BStackGenOp::Repeat {
+                offset: 0,
+                pattern: b"",
+                count: 5,
+            })
+        })
+        .unwrap();
+        s.process_gen(|| {
+            Some(BStackGenOp::Repeat {
+                offset: 0,
+                pattern: b"xy",
+                count: 0,
+            })
+        })
+        .unwrap();
+        assert_eq!(s.peek(0).unwrap(), b"hello world");
+    }
+
+    // A lone Repeat routes through the compact repeat-fill journal (O(1) staging)
+    // and reopens clean — the staged `[k | s]` tail is dropped and `wip` disarmed.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn inplace_gen_repeat_lone_fills_and_reopens_clean() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+        s.push(vec![b'.'; 600]).unwrap();
+        let mut step = 0usize;
+        s.inplace_gen(|_res| {
+            let r = match step {
+                0 => Some(BStackGenOp::Repeat {
+                    offset: 0,
+                    pattern: b"ab",
+                    count: 300,
+                }),
+                _ => None,
+            };
+            step += 1;
+            r
+        })
+        .unwrap();
+        let expect: Vec<u8> = b"ab".iter().copied().cycle().take(600).collect();
+        assert_eq!(s.peek(0).unwrap(), expect);
+        drop(s);
+        let raw = std::fs::read(&p).unwrap();
+        assert_eq!(
+            raw.len() as u64,
+            crate::HEADER_SIZE + 600,
+            "tail not truncated"
+        );
+        assert_eq!(&raw[16..24], &[0u8; 8], "wip_ptr not disarmed");
+        let s2 = BStack::open(&p).unwrap();
+        assert_eq!(s2.peek(0).unwrap(), expect);
+    }
+
+    // A Repeat combined with a literal Write commits through the multi-write
+    // journal (the repeat streamed, not materialised) and reopens clean.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn inplace_gen_repeat_mixed_with_write() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+        s.push(vec![b'.'; 20]).unwrap();
+        let zzzz = [b'Z'; 4];
+        let mut step = 0usize;
+        s.inplace_gen(|_res| {
+            let r = match step {
+                0 => Some(BStackGenOp::Repeat {
+                    offset: 0,
+                    pattern: b"xy",
+                    count: 3,
+                }),
+                1 => Some(BStackGenOp::Write {
+                    offset: 10,
+                    data: bstack_unsafe_reborrow!(&zzzz[..]),
+                }),
+                _ => None,
+            };
+            step += 1;
+            r
+        })
+        .unwrap();
+        // [0,6)="xyxyxy", [6,10)="....", [10,14)="ZZZZ", [14,20)="......".
+        assert_eq!(s.peek(0).unwrap(), b"xyxyxy....ZZZZ......");
+        drop(s);
+        let s2 = BStack::open(&p).unwrap();
+        assert_eq!(s2.peek(0).unwrap(), b"xyxyxy....ZZZZ......");
+    }
+
+    // A pending Read observes an accumulated Repeat, including a mid-pattern start.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn inplace_gen_repeat_read_sees_pending_fill() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(vec![b'.'; 20]).unwrap();
+        let mut buf = [0u8; 6];
+        let mut step = 0usize;
+        s.inplace_gen(|res| {
+            assert!(res.is_ok());
+            // SAFETY: `buf` outlives the call.
+            let r = match step {
+                0 => Some(BStackGenOp::Repeat {
+                    offset: 2,
+                    pattern: b"abc",
+                    count: 4,
+                }),
+                1 => Some(BStackGenOp::Read {
+                    offset: 4,
+                    buf: bstack_unsafe_reborrow_mut!(&mut buf[..]),
+                }),
+                _ => None,
+            };
+            step += 1;
+            r
+        })
+        .unwrap();
+        // Repeat fills [2,14) = "abcabcabcabc". Read [4,10): local indices 2..8 of
+        // that fill -> "cabcab".
+        assert_eq!(&buf, b"cabcab");
+    }
+
+    // A later Write slices an earlier Repeat on both sides; the surviving prefix
+    // and suffix must keep the pattern phase-aligned across the hole.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn inplace_gen_repeat_sliced_by_later_write() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(vec![b'.'; 20]).unwrap();
+        let z = [b'Z'; 4];
+        let mut step = 0usize;
+        s.inplace_gen(|_res| {
+            let r = match step {
+                0 => Some(BStackGenOp::Repeat {
+                    offset: 0,
+                    pattern: b"abc",
+                    count: 6,
+                }), // fills [0,18)
+                1 => Some(BStackGenOp::Write {
+                    offset: 6,
+                    data: bstack_unsafe_reborrow!(&z[..]),
+                }), // [6,10)
+                _ => None,
+            };
+            step += 1;
+            r
+        })
+        .unwrap();
+        // [0,6)="abcabc", [6,10)="ZZZZ", [10,18) is the repeat resumed at phase
+        // (0+10)%3=1 -> "bcabcabc", [18,20)="..".
+        assert_eq!(s.peek(0).unwrap(), b"abcabcZZZZbcabcabc..");
+    }
+
+    // A later Repeat overrides the middle of an earlier Write.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn inplace_gen_write_sliced_by_later_repeat() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(vec![b'.'; 12]).unwrap();
+        let ones = [b'1'; 10];
+        let mut step = 0usize;
+        s.inplace_gen(|_res| {
+            let r = match step {
+                0 => Some(BStackGenOp::Write {
+                    offset: 0,
+                    data: bstack_unsafe_reborrow!(&ones[..]),
+                }), // [0,10)
+                1 => Some(BStackGenOp::Repeat {
+                    offset: 3,
+                    pattern: b"ab",
+                    count: 3,
+                }), // [3,9)
+                _ => None,
+            };
+            step += 1;
+            r
+        })
+        .unwrap();
+        // [0,3)="111", [3,9)="ababab", [9,10)="1", [10,12)="..".
+        assert_eq!(s.peek(0).unwrap(), b"111ababab1..");
+    }
+
     #[cfg(all(feature = "set", feature = "atomic"))]
     #[test]
     fn process_gen_abort_ends_the_sequence_with_an_error() {
