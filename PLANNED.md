@@ -159,28 +159,6 @@ The `recovery_needed` reopen scan reads only block headers, so it stays valid re
 
 ---
 
-## `BStackGenOp::Repeat` — an in-sequence fill for `process_gen`/`inplace_gen`
-
-**Feature flag:** `set` (+ `atomic` for `inplace_gen`).
-**Breaking change:** No.
-
-### Motivation
-
-There is no way to express a repeat-fill (`zero` is its all-`0` case) *inside* a generator sequence. A caller that wants a fill committed atomically with other edits must either materialize the pattern into a caller-side buffer for a `Write`, or issue a separate `zero`/`repeat`, which is a second crash-atomic commit with its own durable sync. A `Repeat` op lets the fill ride the same generator commit.
-
-### Design
-
-Add `BStackGenOp::Repeat { offset, pattern, count }`, accepted by `process_gen` and `inplace_gen`, filling `[offset, offset + count·pattern.len())` as one accumulated edit. **No on-disk format change:**
-
-- When the sequence's net dirty state is that single region, the commit routes through the **existing** compact `Repeat` journal mode (see `algos/WIP.md`) — an `O(1)` tail, exactly as standalone `BStack::repeat`/`zero` already stage it.
-- When combined with other disjoint edits, the pattern is expanded into the existing multi-write journal as literal bytes — more staged bytes on disk, same format. This expansion must **stream** the pattern (a bounded scratch buffer written in a loop), never allocate a `count·len` in-memory buffer: the on-disk staging grows by `count·len`, but the memory cost stays `O(1)`.
-
-So the op buys expressiveness and single-commit atomicity for fills; the `O(1)` staging win survives only in the single-region case. Extending it to the multi-write case is the separate, format-changing item below.
-
-`count == 0` or an empty `pattern` is a no-op, matching `zero(_, 0)`; an overlap with another edit in the same sequence resolves last-writer-wins, exactly as a `Write` does.
-
----
-
 ## Compact `Repeat` staging within a batched commit
 
 **Feature flag:** `set` + `atomic`.
