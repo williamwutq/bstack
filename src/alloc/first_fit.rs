@@ -489,6 +489,27 @@ impl FirstFitBStackAllocator {
         ptr == 0 || Self::is_real_block_ptr(ptr, stack_len)
     }
 
+    /// True iff the `(offset, len)` regions are pairwise non-overlapping (empty
+    /// regions are ignored). The atomic carve paths derive some write offsets
+    /// from untrusted on-disk links; where `set_batched` would reject an overlap
+    /// with a generic `InvalidInput`, `inplace_gen` silently resolves it, so those
+    /// paths gate their batch on this check and reject a corrupt list explicitly.
+    #[cfg(feature = "atomic")]
+    fn writes_disjoint(regions: &[(u64, u64)]) -> bool {
+        for i in 0..regions.len() {
+            let (a_off, a_len) = regions[i];
+            if a_len == 0 {
+                continue;
+            }
+            for &(b_off, b_len) in &regions[i + 1..] {
+                if b_len != 0 && a_off < b_off + b_len && b_off < a_off + a_len {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     /// Align a requested payload length to the allocator's block size and alignment requirements.
     #[inline]
     fn align_len(&self, len: u64) -> u64 {
@@ -2689,11 +2710,13 @@ impl FirstFitBStackAllocator {
             #[cfg(feature = "atomic")]
             let _guard = self.lock.lock().unwrap();
 
-            // Under `atomic`, derive the final free-list state (the carved-off front
-            // block freed, coalesced with a free left neighbour if any) and commit
-            // every metadata word in ONE crash-atomic `set_batched`, so a crash
-            // applies all of it or none and no `recovery_needed` bracket is needed.
-            // The non-`atomic` build keeps its bracketed W1/W2/W3 + `add_to_free_list`.
+            // Under `atomic`, the carve and the free/coalesce commit together as a
+            // single crash-atomic `inplace_gen` batch: the write lock is held
+            // across every probe read and all edits land as one journal arm, so the
+            // state the writes are derived from cannot shift under a concurrent stack
+            // mutation between probe and commit. No `recovery_needed` bracket is
+            // needed. The non-`atomic` build keeps its bracketed W1/W2/W3 +
+            // `add_to_free_list`.
             #[cfg(feature = "atomic")]
             {
                 self.guard_not_poisoned()?;
@@ -2701,126 +2724,284 @@ impl FirstFitBStackAllocator {
                 let arena_start = Self::OFFSET_SIZE + Self::HEADER_SIZE;
                 let front_header = start - Self::BLOCK_HEADER_SIZE;
 
-                // Probe a free left neighbour of the carved-off front block via its
-                // footer tag (the 8 bytes before the front header). Coalesce iff it
-                // is a matching free block within the arena.
-                let mut lfoot = [0u8; 8];
-                self.stack
-                    .get_into(front_header - Self::BLOCK_FOOTER_SIZE, &mut lfoot)?;
-                let left_size = u64::from_le_bytes(lfoot);
-                let left = if front_header > arena_start
-                    && left_size >= Self::MIN_BLOCK_PAYLOAD_SIZE
-                    && left_size.is_multiple_of(8)
-                    && let Some(left_header) = front_header
-                        .checked_sub(left_size + Self::BLOCK_OVERHEAD_SIZE)
-                        .filter(|&h| h >= arena_start)
-                {
-                    let mut lhdr = [0u8; 16];
-                    self.stack.get_into(left_header, &mut lhdr)?;
-                    let l_hdr_size = read_buf_le!(lhdr, 0 => u64);
-                    if lhdr[8] & 1 != 0 && l_hdr_size == left_size {
-                        let mut llink = [0u8; 16];
-                        self.stack
-                            .get_into(left_header + Self::BLOCK_HEADER_SIZE, &mut llink)?;
-                        let lnext = read_buf_le!(llink, 0 => u64);
-                        let lprev = read_buf_le!(llink, 8 => u64);
-                        if !Self::is_valid_link_ptr(lnext, stack_len)
-                            || !Self::is_valid_link_ptr(lprev, stack_len)
-                        {
-                            return Err(io_error!(
-                                InvalidData,
-                                "realloc_inplace: corrupted free-list link"
-                            ));
-                        }
-                        Some((left_header, lnext, lprev))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-
-                let mut head_buf = [0u8; 8];
-                self.stack.get_into(Self::FREE_HEAD_OFFSET, &mut head_buf)?;
-                let free_head = u64::from_le_bytes(head_buf);
-                if !Self::is_valid_link_ptr(free_head, stack_len) {
-                    return Err(io_error!(
-                        InvalidData,
-                        "realloc_inplace: corrupted free-list head"
-                    ));
+                // Generator phases, mirroring the atomic `add_to_free_list`'s
+                // left-coalesce path (the retained block sits to the right, so the
+                // freed front block can never coalesce right — only the left is
+                // probed) and extended with the two split writes (the free-block
+                // footer + retained header, and the retained footer). `Have*`
+                // consumes the just-read buffer and decides; `Emit*` stages one
+                // write. Every read precedes every write, so no read sees a pending
+                // edit; the writes are disjoint, so their order does not matter.
+                enum P {
+                    Foot,
+                    HaveFoot,
+                    HaveHdr,
+                    HaveLink,
+                    HaveHead,
+                    EmitBoundary,
+                    EmitRetFtr,
+                    EmitFbHdr,
+                    EmitHead,
+                    EmitOldBack,
+                    EmitLeftFwd,
+                    EmitLeftBack,
+                    Done,
                 }
+                let mut state = P::Foot;
+                // Probe results, resolved before `EmitBoundary`.
+                let mut left_header = 0u64;
+                let mut left_size = 0u64;
+                let mut have_left = false;
+                let mut l_next = 0u64;
+                let mut l_prev = 0u64;
+                // Final free-block header offset, and the head its `next_free` points
+                // at once the neighbour is unlinked (also the old head's back-link
+                // target).
+                let mut off_fbhdr = 0u64;
+                let mut first = 0u64;
 
-                // Final free-block geometry: the front block alone, or merged into
-                // its free left neighbour. Either is prepended to the list; a
-                // coalesce also splices the neighbour out of its old position. The
-                // final state is computed directly (no offset written twice) — the
-                // `try_grow_into_next_free` shape.
-                let (fb_header_off, fb_size, fb_payload, first, lnext, lprev) = match left {
-                    Some((left_header, lnext, lprev)) => {
-                        let merged = left_size + Self::BLOCK_OVERHEAD_SIZE + front_payload;
-                        // Head once the left neighbour is removed (what the merged
-                        // block's `next_free` points to).
-                        let first = if lprev == 0 { lnext } else { free_head };
-                        (
-                            left_header,
-                            merged,
-                            left_header + Self::BLOCK_HEADER_SIZE,
-                            first,
-                            lnext,
-                            lprev,
-                        )
-                    }
-                    None => (front_header, front_payload, start, free_head, 0, 0),
-                };
-
-                // Free block: size + is_free flag + next_free(=first) + prev_free(0),
-                // contiguous over the header + link words.
+                // Read scratch, each consumed in its `Have*` state before reuse.
+                let mut lfoot = [0u8; 8];
+                let mut lhdr = [0u8; 16];
+                let mut llink = [0u8; 16];
+                let mut head_read = [0u8; 8];
+                // Write payloads: the constant footer now, the read-derived ones in
+                // `HaveHead`; each is written once and never touched again.
                 let mut fb_buf = [0u8; 32];
-                write_buf!(fb_size => fb_buf, 0);
-                write_buf!(1u32 => fb_buf, 8); // is_free = 1
-                write_buf!(first => fb_buf, 16); // next_free
-                // fb_buf[24..32] = prev_free = 0
-                // Free block footer (fb_size) + retained header (allocated), one
-                // 24-byte write at new_start - OVERHEAD.
-                let boundary = Self::boundary_footer_then_alloc_header(fb_size, retained);
+                let mut boundary = [0u8; Self::BLOCK_OVERHEAD_SIZE as usize];
                 let retained_footer_le = retained.to_le_bytes();
-                let head_le = fb_payload.to_le_bytes();
-                let lnext_le = lnext.to_le_bytes();
-                let lprev_le = lprev.to_le_bytes();
+                let mut head_le = [0u8; 8];
+                let mut lnext_le = [0u8; 8];
+                let mut lprev_le = [0u8; 8];
+                let off_boundary = new_start - Self::BLOCK_OVERHEAD_SIZE;
+                let off_retftr = start + block_size;
 
-                const NONE: &[u8] = &[];
-                let writes: [(u64, &[u8]); 7] = [
-                    // free block footer + retained header
-                    (new_start - Self::BLOCK_OVERHEAD_SIZE, &boundary[..]),
-                    // retained block footer
-                    (start + block_size, &retained_footer_le[..]),
-                    // free block header + flags + links
-                    (fb_header_off, &fb_buf[..]),
-                    // new free-list head -> the freed/merged block
-                    (Self::FREE_HEAD_OFFSET, &head_le[..]),
-                    // old head's back-link -> the new head (if any)
-                    if first != 0 {
-                        (first + Self::BLOCK_FOOTER_SIZE, &head_le[..])
-                    } else {
-                        (0, NONE)
-                    },
-                    // splice the left neighbour's predecessor forward-link (interior)
-                    if lprev != 0 {
-                        (lprev, &lnext_le[..])
-                    } else {
-                        (0, NONE)
-                    },
-                    // splice the left neighbour's successor back-link (interior)
-                    if lprev != 0 && lnext != 0 {
-                        (lnext + Self::BLOCK_FOOTER_SIZE, &lprev_le[..])
-                    } else {
-                        (0, NONE)
-                    },
-                ];
-                // Reads are done; the commit may be replayed on reopen, so the
-                // original handle is dropped here.
-                lost = true;
-                self.stack.set_batched(writes)?;
+                let committed = std::cell::Cell::new(false);
+                let r = self.stack.inplace_gen(|feedback| {
+                    // A failed read or rejected write tears the batch down — never
+                    // `None`, which would commit the partial state.
+                    if let Err(e) = feedback {
+                        return Some(BStackGenOp::Abort { source: Some(e) });
+                    }
+                    loop {
+                        match state {
+                            P::Foot => {
+                                // Probe the front block's left neighbour via its
+                                // footer tag (the 8 bytes before the front header).
+                                // In bounds: front_header >= arena_start.
+                                state = P::HaveFoot;
+                                return Some(BStackGenOp::Read {
+                                    offset: front_header - Self::BLOCK_FOOTER_SIZE,
+                                    // SAFETY: `lfoot` outlives the call; consumed before reuse.
+                                    buf: bstack_unsafe_reborrow_mut!(&mut lfoot[..]),
+                                });
+                            }
+                            P::HaveFoot => {
+                                left_size = u64::from_le_bytes(lfoot);
+                                if front_header > arena_start
+                                    && left_size >= Self::MIN_BLOCK_PAYLOAD_SIZE
+                                    && left_size.is_multiple_of(8)
+                                    && let Some(lh) = front_header
+                                        .checked_sub(left_size + Self::BLOCK_OVERHEAD_SIZE)
+                                        .filter(|&h| h >= arena_start)
+                                {
+                                    left_header = lh;
+                                    state = P::HaveHdr;
+                                    return Some(BStackGenOp::Read {
+                                        offset: left_header,
+                                        // SAFETY: `lhdr` outlives the call; consumed before reuse.
+                                        buf: bstack_unsafe_reborrow_mut!(&mut lhdr[..]),
+                                    });
+                                }
+                                state = P::HaveHead;
+                                return Some(BStackGenOp::Read {
+                                    offset: Self::FREE_HEAD_OFFSET,
+                                    // SAFETY: `head_read` outlives the call; consumed before reuse.
+                                    buf: bstack_unsafe_reborrow_mut!(&mut head_read[..]),
+                                });
+                            }
+                            P::HaveHdr => {
+                                let l_hdr_size = read_buf_le!(lhdr, 0 => u64);
+                                if lhdr[8] & 1 != 0 && l_hdr_size == left_size {
+                                    state = P::HaveLink;
+                                    return Some(BStackGenOp::Read {
+                                        offset: left_header + Self::BLOCK_HEADER_SIZE,
+                                        // SAFETY: `llink` outlives the call; consumed before reuse.
+                                        buf: bstack_unsafe_reborrow_mut!(&mut llink[..]),
+                                    });
+                                }
+                                state = P::HaveHead;
+                                return Some(BStackGenOp::Read {
+                                    offset: Self::FREE_HEAD_OFFSET,
+                                    // SAFETY: `head_read` outlives the call; consumed before reuse.
+                                    buf: bstack_unsafe_reborrow_mut!(&mut head_read[..]),
+                                });
+                            }
+                            P::HaveLink => {
+                                l_next = read_buf_le!(llink, 0 => u64);
+                                l_prev = read_buf_le!(llink, 8 => u64);
+                                if !Self::is_valid_link_ptr(l_next, stack_len)
+                                    || !Self::is_valid_link_ptr(l_prev, stack_len)
+                                {
+                                    gen_abort!(
+                                        InvalidData,
+                                        "realloc_inplace: corrupted free-list link"
+                                    );
+                                }
+                                have_left = true;
+                                state = P::HaveHead;
+                                return Some(BStackGenOp::Read {
+                                    offset: Self::FREE_HEAD_OFFSET,
+                                    // SAFETY: `head_read` outlives the call; consumed before reuse.
+                                    buf: bstack_unsafe_reborrow_mut!(&mut head_read[..]),
+                                });
+                            }
+                            P::HaveHead => {
+                                let free_head = u64::from_le_bytes(head_read);
+                                if !Self::is_valid_link_ptr(free_head, stack_len) {
+                                    gen_abort!(
+                                        InvalidData,
+                                        "realloc_inplace: corrupted free-list head"
+                                    );
+                                }
+                                // Final free-block geometry: the front block alone, or
+                                // merged into its free left neighbour (spliced out of
+                                // its old slot). Byte-identical to the sequential
+                                // add-then-coalesce.
+                                let (fb_size, fb_payload);
+                                if have_left {
+                                    off_fbhdr = left_header;
+                                    fb_size = left_size + Self::BLOCK_OVERHEAD_SIZE + front_payload;
+                                    fb_payload = left_header + Self::BLOCK_HEADER_SIZE;
+                                    // Head once the neighbour is unlinked.
+                                    first = if l_prev == 0 { l_next } else { free_head };
+                                } else {
+                                    off_fbhdr = front_header;
+                                    fb_size = front_payload;
+                                    fb_payload = start;
+                                    first = free_head;
+                                }
+                                // Free block: size + is_free + next_free(=first) + prev_free(0).
+                                write_buf!(fb_size => fb_buf, 0);
+                                write_buf!(1u32 => fb_buf, 8);
+                                write_buf!(first => fb_buf, 16);
+                                // fb_buf[24..32] = prev_free = 0
+                                boundary =
+                                    Self::boundary_footer_then_alloc_header(fb_size, retained);
+                                head_le = fb_payload.to_le_bytes();
+                                lnext_le = l_next.to_le_bytes();
+                                lprev_le = l_prev.to_le_bytes();
+                                // The link-derived offsets come from untrusted on-disk
+                                // pointers; a corrupt list could make them collide with
+                                // each other or the structural writes, which the batch
+                                // would otherwise resolve silently. Reject that here.
+                                let has_old_back = first != 0;
+                                let has_left_fwd = l_prev != 0;
+                                let has_left_back = l_prev != 0 && l_next != 0;
+                                if !Self::writes_disjoint(&[
+                                    (off_boundary, Self::BLOCK_OVERHEAD_SIZE),
+                                    (off_retftr, Self::BLOCK_FOOTER_SIZE),
+                                    (off_fbhdr, 32),
+                                    (Self::FREE_HEAD_OFFSET, Self::BLOCK_FOOTER_SIZE),
+                                    (first + Self::BLOCK_FOOTER_SIZE, has_old_back as u64 * 8),
+                                    (l_prev, has_left_fwd as u64 * 8),
+                                    (l_next + Self::BLOCK_FOOTER_SIZE, has_left_back as u64 * 8),
+                                ]) {
+                                    gen_abort!(
+                                        InvalidData,
+                                        "realloc_inplace: derived free-list writes overlap (corrupt free list)"
+                                    );
+                                }
+                                state = P::EmitBoundary;
+                                continue;
+                            }
+                            P::EmitBoundary => {
+                                // Free-block footer + retained block header.
+                                state = P::EmitRetFtr;
+                                return Some(BStackGenOp::Write {
+                                    offset: off_boundary,
+                                    // SAFETY: `boundary` outlives the call, unmutated hereafter.
+                                    data: bstack_unsafe_reborrow!(&boundary[..]),
+                                });
+                            }
+                            P::EmitRetFtr => {
+                                // Retained block footer.
+                                state = P::EmitFbHdr;
+                                return Some(BStackGenOp::Write {
+                                    offset: off_retftr,
+                                    // SAFETY: `retained_footer_le` outlives the call, unmutated.
+                                    data: bstack_unsafe_reborrow!(&retained_footer_le[..]),
+                                });
+                            }
+                            P::EmitFbHdr => {
+                                // Free block header + flags + links.
+                                state = P::EmitHead;
+                                return Some(BStackGenOp::Write {
+                                    offset: off_fbhdr,
+                                    // SAFETY: `fb_buf` outlives the call, unmutated hereafter.
+                                    data: bstack_unsafe_reborrow!(&fb_buf[..]),
+                                });
+                            }
+                            P::EmitHead => {
+                                // New free-list head -> the freed/merged block.
+                                state = P::EmitOldBack;
+                                return Some(BStackGenOp::Write {
+                                    offset: Self::FREE_HEAD_OFFSET,
+                                    // SAFETY: `head_le` outlives the call, unmutated hereafter.
+                                    data: bstack_unsafe_reborrow!(&head_le[..]),
+                                });
+                            }
+                            P::EmitOldBack => {
+                                // Old head's back-link -> the new head (if any).
+                                state = P::EmitLeftFwd;
+                                if first != 0 {
+                                    return Some(BStackGenOp::Write {
+                                        offset: first + Self::BLOCK_FOOTER_SIZE,
+                                        // SAFETY: `head_le` outlives the call, unmutated hereafter.
+                                        data: bstack_unsafe_reborrow!(&head_le[..]),
+                                    });
+                                }
+                                continue;
+                            }
+                            P::EmitLeftFwd => {
+                                // Splice the left neighbour's predecessor forward-link.
+                                state = P::EmitLeftBack;
+                                if l_prev != 0 {
+                                    return Some(BStackGenOp::Write {
+                                        offset: l_prev,
+                                        // SAFETY: `lnext_le` outlives the call, unmutated hereafter.
+                                        data: bstack_unsafe_reborrow!(&lnext_le[..]),
+                                    });
+                                }
+                                continue;
+                            }
+                            P::EmitLeftBack => {
+                                // Splice the left neighbour's successor back-link (interior).
+                                state = P::Done;
+                                if l_prev != 0 && l_next != 0 {
+                                    return Some(BStackGenOp::Write {
+                                        offset: l_next + Self::BLOCK_FOOTER_SIZE,
+                                        // SAFETY: `lprev_le` outlives the call, unmutated hereafter.
+                                        data: bstack_unsafe_reborrow!(&lprev_le[..]),
+                                    });
+                                }
+                                continue;
+                            }
+                            P::Done => {
+                                // Every read resolved and every write validated;
+                                // returning None commits them as one journal arm. Past
+                                // here the carve owns the block — a commit error may
+                                // replay on reopen — so the original handle is dropped.
+                                committed.set(true);
+                                return None;
+                            }
+                        }
+                    }
+                });
+                if committed.get() {
+                    lost = true;
+                }
+                r?;
             }
 
             #[cfg(not(feature = "atomic"))]
@@ -3009,48 +3190,144 @@ impl FirstFitBStackAllocator {
                         ])?;
                     }
                     Mode::Absorb => {
-                        // Splice the neighbour out of the free list and claim its
-                        // slot (`new_header == l_header`). Read its links, validate,
-                        // and commit the splice with our header/footer.
+                        // Splice the neighbour out of the free list and claim its slot
+                        // (`new_header == l_header`). Fold the link read into the same
+                        // `inplace_gen` batch as the splice writes: the write
+                        // lock is held across the read, so the links cannot shift under
+                        // a concurrent mutation before the commit lands.
                         let stack_len = self.stack.len()?;
-                        let mut link_buf = [0u8; 16];
-                        self.stack
-                            .get_into(l_header + Self::BLOCK_HEADER_SIZE, &mut link_buf)?;
-                        let lnext = read_buf_le!(link_buf, 0 => u64);
-                        let lprev = read_buf_le!(link_buf, 8 => u64);
-                        if !Self::is_valid_link_ptr(lnext, stack_len)
-                            || !Self::is_valid_link_ptr(lprev, stack_len)
-                        {
-                            return Err(io_error!(
-                                InvalidData,
-                                "realloc_inplace: corrupted free-list link"
-                            ));
-                        }
-                        const NONE: &[u8] = &[];
-                        let lnext_le = lnext.to_le_bytes();
-                        let lprev_le = lprev.to_le_bytes();
                         let mut hdr = [0u8; Self::BLOCK_HEADER_SIZE as usize];
                         write_buf!(our_new_size => hdr, 0); // flags 0 => allocated
-                        let writes: [(u64, &[u8]); 4] = [
-                            (new_header, &hdr[..]),
-                            (start + block_size, &our_footer_le[..]),
-                            // predecessor forward-link (or head) past the neighbour
-                            if lprev != 0 {
-                                (lprev, &lnext_le[..])
-                            } else {
-                                (Self::FREE_HEAD_OFFSET, &lnext_le[..])
-                            },
-                            // successor back-link past the neighbour (interior only)
-                            if lnext != 0 {
-                                (lnext + Self::BLOCK_FOOTER_SIZE, &lprev_le[..])
-                            } else {
-                                (0, NONE)
-                            },
-                        ];
-                        // Reads are done; the commit may be replayed on reopen, so the
-                        // original handle is dropped here.
-                        lost = true;
-                        self.stack.set_batched(writes)?;
+
+                        // `Link` reads the neighbour's links; `Have` validates and
+                        // plans the two splice writes; `Emit*` stages each write.
+                        enum P {
+                            Link,
+                            Have,
+                            EmitHdr,
+                            EmitFtr,
+                            EmitFwd,
+                            EmitBack,
+                            Done,
+                        }
+                        let mut state = P::Link;
+                        let mut link_buf = [0u8; 16];
+                        // Predecessor forward-link target (or `free_head`) gets the
+                        // neighbour's `next`; the successor's back-link (interior only)
+                        // gets its `prev`.
+                        let mut fwd_off = 0u64;
+                        let mut back_off = 0u64;
+                        let mut has_back = false;
+                        let mut fwd_le = [0u8; 8];
+                        let mut back_le = [0u8; 8];
+
+                        let committed = std::cell::Cell::new(false);
+                        let r = self.stack.inplace_gen(|feedback| {
+                            if let Err(e) = feedback {
+                                return Some(BStackGenOp::Abort { source: Some(e) });
+                            }
+                            loop {
+                                match state {
+                                    P::Link => {
+                                        state = P::Have;
+                                        return Some(BStackGenOp::Read {
+                                            offset: l_header + Self::BLOCK_HEADER_SIZE,
+                                            // SAFETY: `link_buf` outlives the call; consumed before reuse.
+                                            buf: bstack_unsafe_reborrow_mut!(&mut link_buf[..]),
+                                        });
+                                    }
+                                    P::Have => {
+                                        let lnext = read_buf_le!(link_buf, 0 => u64);
+                                        let lprev = read_buf_le!(link_buf, 8 => u64);
+                                        if !Self::is_valid_link_ptr(lnext, stack_len)
+                                            || !Self::is_valid_link_ptr(lprev, stack_len)
+                                        {
+                                            gen_abort!(
+                                                InvalidData,
+                                                "realloc_inplace: corrupted free-list link"
+                                            );
+                                        }
+                                        fwd_off = if lprev != 0 {
+                                            lprev
+                                        } else {
+                                            Self::FREE_HEAD_OFFSET
+                                        };
+                                        fwd_le = lnext.to_le_bytes();
+                                        has_back = lnext != 0;
+                                        back_off = if lnext != 0 {
+                                            lnext + Self::BLOCK_FOOTER_SIZE
+                                        } else {
+                                            0
+                                        };
+                                        back_le = lprev.to_le_bytes();
+                                        // The splice offsets come from untrusted on-disk
+                                        // links; reject a corrupt list whose derived
+                                        // writes would collide (which the batch would
+                                        // otherwise resolve silently) rather than the
+                                        // set_batched path's generic InvalidInput.
+                                        if !Self::writes_disjoint(&[
+                                            (new_header, Self::BLOCK_HEADER_SIZE),
+                                            (start + block_size, Self::BLOCK_FOOTER_SIZE),
+                                            (fwd_off, Self::BLOCK_FOOTER_SIZE),
+                                            (back_off, has_back as u64 * 8),
+                                        ]) {
+                                            gen_abort!(
+                                                InvalidData,
+                                                "realloc_inplace: derived free-list writes overlap (corrupt free list)"
+                                            );
+                                        }
+                                        state = P::EmitHdr;
+                                        continue;
+                                    }
+                                    P::EmitHdr => {
+                                        state = P::EmitFtr;
+                                        return Some(BStackGenOp::Write {
+                                            offset: new_header,
+                                            // SAFETY: `hdr` outlives the call, unmutated hereafter.
+                                            data: bstack_unsafe_reborrow!(&hdr[..]),
+                                        });
+                                    }
+                                    P::EmitFtr => {
+                                        state = P::EmitFwd;
+                                        return Some(BStackGenOp::Write {
+                                            offset: start + block_size,
+                                            // SAFETY: `our_footer_le` outlives the call, unmutated.
+                                            data: bstack_unsafe_reborrow!(&our_footer_le[..]),
+                                        });
+                                    }
+                                    P::EmitFwd => {
+                                        state = P::EmitBack;
+                                        return Some(BStackGenOp::Write {
+                                            offset: fwd_off,
+                                            // SAFETY: `fwd_le` outlives the call, unmutated hereafter.
+                                            data: bstack_unsafe_reborrow!(&fwd_le[..]),
+                                        });
+                                    }
+                                    P::EmitBack => {
+                                        state = P::Done;
+                                        if has_back {
+                                            return Some(BStackGenOp::Write {
+                                                offset: back_off,
+                                                // SAFETY: `back_le` outlives the call, unmutated hereafter.
+                                                data: bstack_unsafe_reborrow!(&back_le[..]),
+                                            });
+                                        }
+                                        continue;
+                                    }
+                                    P::Done => {
+                                        // Past here the grow owns the block — a commit
+                                        // error may replay on reopen — so the original
+                                        // handle is dropped.
+                                        committed.set(true);
+                                        return None;
+                                    }
+                                }
+                            }
+                        });
+                        if committed.get() {
+                            lost = true;
+                        }
+                        r?;
                     }
                 }
                 // Zero the newly exposed front bytes [new_start, start) — the
