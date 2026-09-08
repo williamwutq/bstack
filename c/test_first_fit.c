@@ -1467,6 +1467,70 @@ static int test_foreign_slice_is_rejected(void)
     ff_unlink(t1); ff_unlink(t2); return 0;
 }
 
+/* --- hardening: corrupt free-list links are rejected, not chased ------- */
+
+#define ALFF_FREE_HEAD_OFFSET  32   /* OFFSET_SIZE(16) + magic(8) + flags(4) + reserved(4) */
+#define ALFF_FIRST_PAYLOAD     64   /* arena start (48) + BLOCK_HDR_SIZE (16) */
+
+/* A corrupt free-list link in the block the allocator is about to unlink for
+ * reuse must be rejected as EINVAL, not followed into an out-of-bounds write. */
+static int test_unlink_block_rejects_corrupt_link(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    first_fit_bstack_allocator_t *a = first_fit_bstack_allocator_new(bs);
+    CHECK(a);
+
+    bstack_slice_t sa, sb, sc;
+    CHECK(bstack_allocator_alloc((bstack_allocator_t *)a, 64, &sa) == 0);
+    CHECK(bstack_allocator_alloc((bstack_allocator_t *)a, 64, &sb) == 0); /* keep sa non-tail */
+    CHECK(bstack_allocator_dealloc((bstack_allocator_t *)a, sa) == 0);    /* sa now free-list head */
+
+    /* Overwrite sa's next_free link (first 8 payload bytes) with an out-of-bounds
+     * offset.  find_large_enough_block fits sa and stops before reading it, so the
+     * corruption first surfaces inside unlink_block. */
+    bstack_t *stack = bstack_allocator_stack((bstack_allocator_t *)a);
+    uint8_t bad[8]; memset(bad, 0xFF, sizeof bad);
+    CHECK(bstack_set(stack, ALFF_FIRST_PAYLOAD, bad, 8) == 0);
+
+    errno = 0;
+    CHECK(bstack_allocator_alloc((bstack_allocator_t *)a, 64, &sc) == -1);
+    CHECK(errno == EINVAL);
+
+    bstack_close(first_fit_bstack_allocator_into_stack(a));
+    ff_unlink(tmp); return 0;
+}
+
+/* A corrupt free_head must be rejected when dealloc prepends a freed block, not
+ * written through to an out-of-bounds back-link. */
+static int test_add_to_free_list_rejects_corrupt_head(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    first_fit_bstack_allocator_t *a = first_fit_bstack_allocator_new(bs);
+    CHECK(a);
+
+    bstack_slice_t sa, sb, sc;
+    CHECK(bstack_allocator_alloc((bstack_allocator_t *)a, 64, &sa) == 0);
+    CHECK(bstack_allocator_alloc((bstack_allocator_t *)a, 64, &sb) == 0);
+    CHECK(bstack_allocator_alloc((bstack_allocator_t *)a, 64, &sc) == 0); /* keep sb non-tail */
+
+    /* Corrupt free_head to an out-of-bounds offset.  sb has no free neighbour to
+     * coalesce, so add_to_free_list reaches the head read and rejects it. */
+    bstack_t *stack = bstack_allocator_stack((bstack_allocator_t *)a);
+    uint8_t bad[8]; memset(bad, 0xFF, sizeof bad);
+    CHECK(bstack_set(stack, ALFF_FREE_HEAD_OFFSET, bad, 8) == 0);
+
+    errno = 0;
+    /* dealloc reports an add_to_free_list failure as -2 (block state uncertain);
+     * the corruption errno is preserved through it. */
+    CHECK(bstack_allocator_dealloc((bstack_allocator_t *)a, sb) != 0);
+    CHECK(errno == EINVAL);
+
+    bstack_close(first_fit_bstack_allocator_into_stack(a));
+    ff_unlink(tmp); return 0;
+}
+
 /* =========================================================================
  * main
  * ====================================================================== */
@@ -1486,6 +1550,11 @@ int main(void)
     T(test_fuzz_alloc_dealloc);
     T(test_fuzz_alloc_realloc_dealloc);
     T(test_fuzz_reopen);
+
+    /* Hardening: corrupt free-list links are rejected, not chased. Both the
+     * sequential and crash-atomic paths validate, so run in either build. */
+    T(test_unlink_block_rejects_corrupt_link);
+    T(test_add_to_free_list_rejects_corrupt_head);
 
 #ifdef BSTACK_FEATURE_ATOMIC
     /* Concurrency — only meaningful when the allocator owns an internal

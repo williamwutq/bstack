@@ -1963,12 +1963,10 @@ static inline int alff_is_impossible_block_end(uint64_t stack_len, uint64_t end)
     return end > stack_len - ALFF_BLOCK_FTR_SIZE;
 }
 
-#ifdef BSTACK_FEATURE_ATOMIC
-/* ---- atomic free-list validation predicates ---------------------------
- * Mirror the Rust helpers used by the crash-atomic add_to_free_list /
- * unlink_block: they verify untrusted on-disk sizes and pointers before those
- * values reach a read/write offset, so a corrupt arena is rejected rather than
- * chased. */
+/* ---- free-list validation predicates ----------------------------------
+ * Verify untrusted on-disk sizes and pointers before those values reach a
+ * read/write offset, so a corrupt arena is rejected rather than chased. Used by
+ * both the sequential and the crash-atomic add_to_free_list / unlink_block. */
 
 /* A possible payload size: a multiple of 8, at least MIN_PAYLOAD.  This is the
  * payload size, not the on-disk size (which is this plus BLOCK_OVERHEAD). */
@@ -1999,6 +1997,7 @@ static inline int alff_is_valid_link_ptr(uint64_t ptr, uint64_t stack_len)
     return ptr == 0 || alff_is_real_block_ptr(ptr, stack_len);
 }
 
+#ifdef BSTACK_FEATURE_ATOMIC
 /* Whether the block `header` at header_start (first 16 bytes: size + flags)
  * describes a valid free block that fits within stack_len: is_free set, size a
  * multiple of 8 >= MIN_PAYLOAD, and the whole block (header + payload + footer)
@@ -2077,16 +2076,33 @@ static int alff_clear_recovery_needed(first_fit_bstack_allocator_t *a)
  * doubly-linked free list by stitching its neighbours together.
  * Does not touch the block's header or clear its is_free flag.
  */
-static int alff_unlink_from_free_list(bstack_t *bs, uint64_t payload_start)
+static int alff_unlink_from_free_list(bstack_t *bs, uint64_t payload_start,
+                                      uint64_t stack_len)
 {
     uint8_t ptrs[16];
     uint64_t next, prev;
     uint8_t ptr_le[8];
 
+    /* stack_len is supplied by the caller (which always already holds it), so no
+     * extra len read is issued here. payload_start and the next/prev links are
+     * validated against it before any access, so a corrupt or truncated file is
+     * rejected with a clear error rather than a confusing out-of-bounds read on a
+     * region the caller never asked for. */
+    if (!alff_is_real_block_ptr(payload_start, stack_len)) {
+        errno = EINVAL;
+        return -1;
+    }
     if (bstack_get(bs, payload_start, payload_start + 16, ptrs) != 0)
         return -1;
     next = read_le64(ptrs);
     prev = read_le64(ptrs + 8);
+    /* Both are untrusted on-disk links; reject an out-of-bounds one as corruption
+     * before it reaches a write offset (also guarding next + 8 from overflow). */
+    if (!alff_is_valid_link_ptr(next, stack_len)
+        || !alff_is_valid_link_ptr(prev, stack_len)) {
+        errno = EINVAL;
+        return -1;
+    }
 
     write_le64(ptr_le, next);
     if (prev != 0) {
@@ -2119,6 +2135,10 @@ static int alff_add_to_free_list(bstack_t *bs, uint64_t block_start)
     uint64_t result_header_start, result_start;
     uint8_t free_flag[4];
 
+    /* block_start is a live, allocator-owned handle offset (the caller validated
+     * it via ensure_own_slice), so it is a real in-bounds block and is not
+     * re-checked here. What follows validates only the on-disk data this reads —
+     * the block size, the coalesce neighbours, and the free-list head. */
     if (bstack_len(bs, &stack_len) != 0) return -1;
 
     block_header_start = block_start - ALFF_BLOCK_HDR_SIZE;
@@ -2126,6 +2146,10 @@ static int alff_add_to_free_list(bstack_t *bs, uint64_t block_start)
     if (bstack_get(bs, block_header_start, block_header_start + 8, size_buf) != 0)
         return -1;
     size = read_le64(size_buf);
+    if (!alff_is_possible_block_size(size)) {
+        errno = EINVAL;
+        return -1;
+    }
     result_header_start = block_header_start;
 
     /* Mark block as free early so recovery can find it on crash */
@@ -2145,7 +2169,7 @@ static int alff_add_to_free_list(bstack_t *bs, uint64_t block_start)
                 && next_size % 8 == 0
                 && next_header + ALFF_BLOCK_OVERHEAD + next_size <= stack_len) {
                 if (alff_unlink_from_free_list(bs,
-                        next_header + ALFF_BLOCK_HDR_SIZE) != 0) return -1;
+                        next_header + ALFF_BLOCK_HDR_SIZE, stack_len) != 0) return -1;
                 size += next_size + ALFF_BLOCK_OVERHEAD;
             }
         }
@@ -2173,7 +2197,7 @@ static int alff_add_to_free_list(bstack_t *bs, uint64_t block_start)
                 prev_hdr_size = read_le64(prev_hdr);
                 if ((prev_hdr[8] & 1) != 0 && prev_hdr_size == prev_size) {
                     if (alff_unlink_from_free_list(bs,
-                            prev_header + ALFF_BLOCK_HDR_SIZE) != 0) return -1;
+                            prev_header + ALFF_BLOCK_HDR_SIZE, stack_len) != 0) return -1;
                     size += prev_size + ALFF_BLOCK_OVERHEAD;
                     result_header_start = prev_header;
                 }
@@ -2203,6 +2227,12 @@ static int alff_add_to_free_list(bstack_t *bs, uint64_t block_start)
         if (bstack_get(bs, ALFF_FREE_HEAD_OFFSET,
                        ALFF_FREE_HEAD_OFFSET + 8, head_buf) != 0) return -1;
         next_block = read_le64(head_buf);
+        /* The old head becomes our next_free and takes a back-link at
+         * next_block + 8, so validate it like any other free-list link. */
+        if (!alff_is_valid_link_ptr(next_block, stack_len)) {
+            errno = EINVAL;
+            return -1;
+        }
 
         memset(update_buf, 0, 24);
         write_le32(update_buf, 1);              /* flags: is_free = 1 */
@@ -2616,12 +2646,22 @@ static int alff_unlink_block(bstack_t *bs,
     } else {
         /* NO-SPLIT: remove block entirely from free list */
         uint8_t pointers_buf[16];
-        uint64_t next, prev;
+        uint64_t next, prev, stack_len;
         uint8_t ptr_le[8];
 
         if (bstack_get(bs, found_start, found_start + 16, pointers_buf) != 0) return -1;
         next = read_le64(pointers_buf);
         prev = read_le64(pointers_buf + 8);
+        /* Both are untrusted on-disk links; reject an out-of-bounds one as
+         * corruption before it reaches a write offset (also guarding next + 8 from
+         * overflow). A successful 16-byte read at found_start proves the stack
+         * reaches past the arena, so alff_is_valid_link_ptr cannot underflow. */
+        if (bstack_len(bs, &stack_len) != 0) return -1;
+        if (!alff_is_valid_link_ptr(next, stack_len)
+            || !alff_is_valid_link_ptr(prev, stack_len)) {
+            errno = EINVAL;
+            return -1;
+        }
 
         /* Commit backward pointer first */
         write_le64(ptr_le, next);
@@ -2816,7 +2856,7 @@ static int alff_cascade_discard_free_tail(bstack_t *bs)
         hdr_size = read_le64(hdr_buf);
         if ((hdr_buf[8] & 1) == 0 || hdr_size != sz) break;
 
-        if (alff_unlink_from_free_list(bs, hdr + ALFF_BLOCK_HDR_SIZE) != 0) return -1;
+        if (alff_unlink_from_free_list(bs, hdr + ALFF_BLOCK_HDR_SIZE, tail) != 0) return -1;
         discard_n = (size_t)(sz + ALFF_BLOCK_OVERHEAD);
         if (bstack_discard(bs, discard_n) != 0) return -1;
     }
@@ -3483,7 +3523,7 @@ static int ff_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
                     }
 #else
                     if (alff_set_recovery_needed(a) != 0) { goto fail_unlock; }
-                    if (alff_unlink_from_free_list(a->bs, next_block) != 0) { goto fail_unlock; }
+                    if (alff_unlink_from_free_list(a->bs, next_block, stack_len) != 0) { goto fail_unlock; }
 
                     {
                         uint64_t merged_size = block_size + ALFF_BLOCK_OVERHEAD + next_size;
