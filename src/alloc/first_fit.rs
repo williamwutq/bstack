@@ -2688,34 +2688,173 @@ impl FirstFitBStackAllocator {
 
             #[cfg(feature = "atomic")]
             let _guard = self.lock.lock().unwrap();
-            self.set_recovery_needed()?;
-            // The carve is committed from here: the block structure changes and
-            // the original (start, old_len) can no longer be handed back.
-            lost = true;
 
-            // W1: front block footer (front_payload) + retained block header
-            // (size `retained`, flags = allocated) in one write at new_start-24.
-            let w1 = Self::boundary_footer_then_alloc_header(front_payload, retained);
-            self.stack.set(new_start - Self::BLOCK_OVERHEAD_SIZE, w1)?;
+            // Under `atomic`, derive the final free-list state (the carved-off front
+            // block freed, coalesced with a free left neighbour if any) and commit
+            // every metadata word in ONE crash-atomic `set_batched`, so a crash
+            // applies all of it or none and no `recovery_needed` bracket is needed.
+            // The non-`atomic` build keeps its bracketed W1/W2/W3 + `add_to_free_list`.
+            #[cfg(feature = "atomic")]
+            {
+                self.guard_not_poisoned()?;
+                let stack_len = self.stack.len()?;
+                let arena_start = Self::OFFSET_SIZE + Self::HEADER_SIZE;
+                let front_header = start - Self::BLOCK_HEADER_SIZE;
 
-            // W2: retained block footer. This is where the original block's
-            // footer sat; overwriting it to `retained` is the point past which
-            // recovery must reconstruct the split rather than the whole block.
-            self.stack.set(start + block_size, retained.to_le_bytes())?;
+                // Probe a free left neighbour of the carved-off front block via its
+                // footer tag (the 8 bytes before the front header). Coalesce iff it
+                // is a matching free block within the arena.
+                let mut lfoot = [0u8; 8];
+                self.stack
+                    .get_into(front_header - Self::BLOCK_FOOTER_SIZE, &mut lfoot)?;
+                let left_size = u64::from_le_bytes(lfoot);
+                let left = if front_header > arena_start
+                    && left_size >= Self::MIN_BLOCK_PAYLOAD_SIZE
+                    && left_size.is_multiple_of(8)
+                    && let Some(left_header) = front_header
+                        .checked_sub(left_size + Self::BLOCK_OVERHEAD_SIZE)
+                        .filter(|&h| h >= arena_start)
+                {
+                    let mut lhdr = [0u8; 16];
+                    self.stack.get_into(left_header, &mut lhdr)?;
+                    let l_hdr_size = read_buf_le!(lhdr, 0 => u64);
+                    if lhdr[8] & 1 != 0 && l_hdr_size == left_size {
+                        let mut llink = [0u8; 16];
+                        self.stack
+                            .get_into(left_header + Self::BLOCK_HEADER_SIZE, &mut llink)?;
+                        let lnext = read_buf_le!(llink, 0 => u64);
+                        let lprev = read_buf_le!(llink, 8 => u64);
+                        if !Self::is_valid_link_ptr(lnext, stack_len)
+                            || !Self::is_valid_link_ptr(lprev, stack_len)
+                        {
+                            return Err(io_error!(
+                                InvalidData,
+                                "realloc_inplace: corrupted free-list link"
+                            ));
+                        }
+                        Some((left_header, lnext, lprev))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
 
-            // W3: shrink the front header to `front_payload`, keeping its
-            // allocated flag (only the 8-byte size word is rewritten). Committed
-            // last so recovery's partial-split check can fire on a torn W2->W3.
-            self.stack
-                .set(start - Self::BLOCK_HEADER_SIZE, front_payload.to_le_bytes())?;
+                let mut head_buf = [0u8; 8];
+                self.stack.get_into(Self::FREE_HEAD_OFFSET, &mut head_buf)?;
+                let free_head = u64::from_le_bytes(head_buf);
+                if !Self::is_valid_link_ptr(free_head, stack_len) {
+                    return Err(io_error!(
+                        InvalidData,
+                        "realloc_inplace: corrupted free-list head"
+                    ));
+                }
 
-            // Free the now-allocated front block: marks it free, coalesces a free
-            // left neighbour, and prepends it to the free list. It can never be
-            // the tail (the retained block follows it), so the cascade is a
-            // no-op but is issued for consistency with the free-list contract.
-            self.add_to_free_list(start)?;
-            self.cascade_discard_free_tail()?;
-            self.clear_recovery_needed()?;
+                // Final free-block geometry: the front block alone, or merged into
+                // its free left neighbour. Either is prepended to the list; a
+                // coalesce also splices the neighbour out of its old position. The
+                // final state is computed directly (no offset written twice) — the
+                // `try_grow_into_next_free` shape.
+                let (fb_header_off, fb_size, fb_payload, first, lnext, lprev) = match left {
+                    Some((left_header, lnext, lprev)) => {
+                        let merged = left_size + Self::BLOCK_OVERHEAD_SIZE + front_payload;
+                        // Head once the left neighbour is removed (what the merged
+                        // block's `next_free` points to).
+                        let first = if lprev == 0 { lnext } else { free_head };
+                        (
+                            left_header,
+                            merged,
+                            left_header + Self::BLOCK_HEADER_SIZE,
+                            first,
+                            lnext,
+                            lprev,
+                        )
+                    }
+                    None => (front_header, front_payload, start, free_head, 0, 0),
+                };
+
+                // Free block: size + is_free flag + next_free(=first) + prev_free(0),
+                // contiguous over the header + link words.
+                let mut fb_buf = [0u8; 32];
+                write_buf!(fb_size => fb_buf, 0);
+                write_buf!(1u32 => fb_buf, 8); // is_free = 1
+                write_buf!(first => fb_buf, 16); // next_free
+                // fb_buf[24..32] = prev_free = 0
+                // Free block footer (fb_size) + retained header (allocated), one
+                // 24-byte write at new_start - OVERHEAD.
+                let boundary = Self::boundary_footer_then_alloc_header(fb_size, retained);
+                let retained_footer_le = retained.to_le_bytes();
+                let head_le = fb_payload.to_le_bytes();
+                let lnext_le = lnext.to_le_bytes();
+                let lprev_le = lprev.to_le_bytes();
+
+                const NONE: &[u8] = &[];
+                let writes: [(u64, &[u8]); 7] = [
+                    // free block footer + retained header
+                    (new_start - Self::BLOCK_OVERHEAD_SIZE, &boundary[..]),
+                    // retained block footer
+                    (start + block_size, &retained_footer_le[..]),
+                    // free block header + flags + links
+                    (fb_header_off, &fb_buf[..]),
+                    // new free-list head -> the freed/merged block
+                    (Self::FREE_HEAD_OFFSET, &head_le[..]),
+                    // old head's back-link -> the new head (if any)
+                    if first != 0 {
+                        (first + Self::BLOCK_FOOTER_SIZE, &head_le[..])
+                    } else {
+                        (0, NONE)
+                    },
+                    // splice the left neighbour's predecessor forward-link (interior)
+                    if lprev != 0 {
+                        (lprev, &lnext_le[..])
+                    } else {
+                        (0, NONE)
+                    },
+                    // splice the left neighbour's successor back-link (interior)
+                    if lprev != 0 && lnext != 0 {
+                        (lnext + Self::BLOCK_FOOTER_SIZE, &lprev_le[..])
+                    } else {
+                        (0, NONE)
+                    },
+                ];
+                // Reads are done; the commit may be replayed on reopen, so the
+                // original handle is dropped here.
+                lost = true;
+                self.stack.set_batched(writes)?;
+            }
+
+            #[cfg(not(feature = "atomic"))]
+            {
+                self.set_recovery_needed()?;
+                // The carve is committed from here: the block structure changes and
+                // the original (start, old_len) can no longer be handed back.
+                lost = true;
+
+                // W1: front block footer (front_payload) + retained block header
+                // (size `retained`, flags = allocated) in one write at new_start-24.
+                let w1 = Self::boundary_footer_then_alloc_header(front_payload, retained);
+                self.stack.set(new_start - Self::BLOCK_OVERHEAD_SIZE, w1)?;
+
+                // W2: retained block footer. This is where the original block's
+                // footer sat; overwriting it to `retained` is the point past which
+                // recovery must reconstruct the split rather than the whole block.
+                self.stack.set(start + block_size, retained.to_le_bytes())?;
+
+                // W3: shrink the front header to `front_payload`, keeping its
+                // allocated flag (only the 8-byte size word is rewritten). Committed
+                // last so recovery's partial-split check can fire on a torn W2->W3.
+                self.stack
+                    .set(start - Self::BLOCK_HEADER_SIZE, front_payload.to_le_bytes())?;
+
+                // Free the now-allocated front block: marks it free, coalesces a free
+                // left neighbour, and prepends it to the free list. It can never be
+                // the tail (the retained block follows it), so the cascade is a
+                // no-op but is issued for consistency with the free-list contract.
+                self.add_to_free_list(start)?;
+                self.cascade_discard_free_tail()?;
+                self.clear_recovery_needed()?;
+            }
+
             // SAFETY: retained block at new_start with capacity `retained` >= new_len.
             Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, new_start, new_len) })
         })();
@@ -2846,41 +2985,121 @@ impl FirstFitBStackAllocator {
             let new_start = start - pg;
             let new_header = new_start - Self::BLOCK_HEADER_SIZE; // start - pg - 16
 
-            self.set_recovery_needed()?;
-            lost = true;
-
-            match mode {
-                Mode::Shrink(l_new_size) => {
-                    // W1: neighbour's new footer + our new header, one write at
-                    // new_header - FOOTER. pg >= 24 keeps this clear of the old
-                    // boundary tags at start-24 / start-16.
-                    let w1 = Self::boundary_footer_then_alloc_header(l_new_size, our_new_size);
-                    self.stack.set(new_header - Self::BLOCK_FOOTER_SIZE, w1)?;
-                    // W2: our footer at its (unchanged) position, new size.
-                    self.stack
-                        .set(start + block_size, our_new_size.to_le_bytes())?;
-                    // W3: shrink the neighbour header last (size word only; keeps
-                    // its free flag and its intact free-list pointers).
-                    self.stack.set(l_header, l_new_size.to_le_bytes())?;
+            // Under `atomic`, derive the final free-list state and commit every
+            // metadata word plus the front-zero in ONE crash-atomic `set_batched`,
+            // so a crash applies all of it or none and no `recovery_needed` bracket
+            // is needed. The non-`atomic` build keeps its bracketed write sequence.
+            #[cfg(feature = "atomic")]
+            {
+                self.guard_not_poisoned()?;
+                let our_footer_le = our_new_size.to_le_bytes();
+                match mode {
+                    Mode::Shrink(l_new_size) => {
+                        // Neighbour keeps its free-list links; only its header size
+                        // and footer move. Three disjoint metadata writes.
+                        let w1 = Self::boundary_footer_then_alloc_header(l_new_size, our_new_size);
+                        let l_new_le = l_new_size.to_le_bytes();
+                        // The batch is all-or-nothing, but a commit error may still be
+                        // replayed on reopen, so the original handle is dropped here.
+                        lost = true;
+                        self.stack.set_batched([
+                            (new_header - Self::BLOCK_FOOTER_SIZE, &w1[..]),
+                            (start + block_size, &our_footer_le[..]),
+                            (l_header, &l_new_le[..]),
+                        ])?;
+                    }
+                    Mode::Absorb => {
+                        // Splice the neighbour out of the free list and claim its
+                        // slot (`new_header == l_header`). Read its links, validate,
+                        // and commit the splice with our header/footer.
+                        let stack_len = self.stack.len()?;
+                        let mut link_buf = [0u8; 16];
+                        self.stack
+                            .get_into(l_header + Self::BLOCK_HEADER_SIZE, &mut link_buf)?;
+                        let lnext = read_buf_le!(link_buf, 0 => u64);
+                        let lprev = read_buf_le!(link_buf, 8 => u64);
+                        if !Self::is_valid_link_ptr(lnext, stack_len)
+                            || !Self::is_valid_link_ptr(lprev, stack_len)
+                        {
+                            return Err(io_error!(
+                                InvalidData,
+                                "realloc_inplace: corrupted free-list link"
+                            ));
+                        }
+                        const NONE: &[u8] = &[];
+                        let lnext_le = lnext.to_le_bytes();
+                        let lprev_le = lprev.to_le_bytes();
+                        let mut hdr = [0u8; Self::BLOCK_HEADER_SIZE as usize];
+                        write_buf!(our_new_size => hdr, 0); // flags 0 => allocated
+                        let writes: [(u64, &[u8]); 4] = [
+                            (new_header, &hdr[..]),
+                            (start + block_size, &our_footer_le[..]),
+                            // predecessor forward-link (or head) past the neighbour
+                            if lprev != 0 {
+                                (lprev, &lnext_le[..])
+                            } else {
+                                (Self::FREE_HEAD_OFFSET, &lnext_le[..])
+                            },
+                            // successor back-link past the neighbour (interior only)
+                            if lnext != 0 {
+                                (lnext + Self::BLOCK_FOOTER_SIZE, &lprev_le[..])
+                            } else {
+                                (0, NONE)
+                            },
+                        ];
+                        // Reads are done; the commit may be replayed on reopen, so the
+                        // original handle is dropped here.
+                        lost = true;
+                        self.stack.set_batched(writes)?;
+                    }
                 }
-                Mode::Absorb => {
-                    // Consume the whole neighbour: unlink it, then overwrite its
-                    // header with our grown allocated header and rewrite our footer.
-                    let stack_len = self.stack.len()?;
-                    self.unlink_from_free_list(l_header + Self::BLOCK_HEADER_SIZE, stack_len)?;
-                    let mut hdr = [0u8; Self::BLOCK_HEADER_SIZE as usize];
-                    write_buf!(our_new_size => hdr, 0);
-                    // hdr[8..16] = flags(0)+reserved(0) => allocated.
-                    self.stack.set(new_header, hdr)?;
-                    self.stack
-                        .set(start + block_size, our_new_size.to_le_bytes())?;
-                }
+                // Zero the newly exposed front bytes [new_start, start) — the
+                // neighbour's consumed tail and old boundary tags. A separate
+                // crash-atomic `zero` (9-byte journal staging, no buffer); like the
+                // non-`atomic` path it is best-effort across a crash between the
+                // metadata commit and this write.
+                self.stack.zero(new_start, pg)?;
             }
 
-            // Zero the newly exposed front bytes [new_start, start). They held
-            // the neighbour's (now-consumed) tail and the old boundary tags.
-            self.stack.zero(new_start, pg)?;
-            self.clear_recovery_needed()?;
+            #[cfg(not(feature = "atomic"))]
+            {
+                self.set_recovery_needed()?;
+                lost = true;
+
+                match mode {
+                    Mode::Shrink(l_new_size) => {
+                        // W1: neighbour's new footer + our new header, one write at
+                        // new_header - FOOTER. pg >= 24 keeps this clear of the old
+                        // boundary tags at start-24 / start-16.
+                        let w1 = Self::boundary_footer_then_alloc_header(l_new_size, our_new_size);
+                        self.stack.set(new_header - Self::BLOCK_FOOTER_SIZE, w1)?;
+                        // W2: our footer at its (unchanged) position, new size.
+                        self.stack
+                            .set(start + block_size, our_new_size.to_le_bytes())?;
+                        // W3: shrink the neighbour header last (size word only; keeps
+                        // its free flag and its intact free-list pointers).
+                        self.stack.set(l_header, l_new_size.to_le_bytes())?;
+                    }
+                    Mode::Absorb => {
+                        // Consume the whole neighbour: unlink it, then overwrite its
+                        // header with our grown allocated header and rewrite our footer.
+                        let stack_len = self.stack.len()?;
+                        self.unlink_from_free_list(l_header + Self::BLOCK_HEADER_SIZE, stack_len)?;
+                        let mut hdr = [0u8; Self::BLOCK_HEADER_SIZE as usize];
+                        write_buf!(our_new_size => hdr, 0);
+                        // hdr[8..16] = flags(0)+reserved(0) => allocated.
+                        self.stack.set(new_header, hdr)?;
+                        self.stack
+                            .set(start + block_size, our_new_size.to_le_bytes())?;
+                    }
+                }
+
+                // Zero the newly exposed front bytes [new_start, start). They held
+                // the neighbour's (now-consumed) tail and the old boundary tags.
+                self.stack.zero(new_start, pg)?;
+                self.clear_recovery_needed()?;
+            }
+
             // SAFETY: block now spans new_start with capacity our_new_size >= new_len.
             Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, new_start, new_len) })
         })();
@@ -3700,6 +3919,33 @@ mod inplace_resize_tests {
         let got = r.read().unwrap();
         assert_eq!(&got[..128], &vec![0u8; 128][..]);
         assert_eq!(&got[128..], &pattern(50)[..]);
+    }
+
+    // Front shrink whose carved-off front block sits directly right of a free
+    // block must coalesce the two, exactly as the non-atomic `add_to_free_list`
+    // does — the atomic fused carve must not leave two adjacent free blocks.
+    #[test]
+    fn front_shrink_coalesces_free_left_neighbour() {
+        let (alloc, _g) = open_fresh();
+        let a = alloc.alloc(100).unwrap(); // aligned payload = 104
+        let a_start = a.start();
+        let mut b = alloc.alloc(120).unwrap();
+        b.write(pattern(120)).unwrap();
+        let b_start = b.start();
+        alloc.dealloc(a).map_err(|e| e.source).unwrap(); // `a` is now b's free left neighbour
+
+        // Trim 40 off b's front. The carved-off front block (payload 16) sits
+        // directly right of the free `a`, so they merge into one free block at a_start.
+        let r = alloc.realloc_inplace(b, -40, 0).unwrap();
+        assert_eq!(r.start(), b_start + 40);
+        assert_eq!(r.len(), 80);
+        assert_eq!(r.read().unwrap(), pattern(120)[40..120].to_vec());
+
+        // Merged free block = a(104) + OVERHEAD(24) + front(16) = 144. Allocating
+        // exactly that reuses it in place at a_start; without coalescing no single
+        // 144-byte block would exist and the alloc would extend the tail instead.
+        let m = alloc.alloc(144).unwrap();
+        assert_eq!(m.start(), a_start);
     }
 
     #[test]
