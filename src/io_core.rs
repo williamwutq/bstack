@@ -1270,7 +1270,11 @@ impl<'a> OverlayData<'a> {
             OverlayData::Literal(d) => OverlayData::Literal(&d[a as usize..b as usize]),
             OverlayData::Repeat { pattern, phase, .. } => OverlayData::Repeat {
                 pattern,
-                phase: (phase + a as usize) % pattern.len(),
+                // Reduce `a` mod the pattern length before adding: both operands are
+                // then `< pattern.len() <= isize::MAX`, so the sum cannot overflow
+                // `usize`, and it stays correct on a 32-bit target where `a as usize`
+                // could otherwise truncate. `(phase + a) % plen == (phase + a % plen) % plen`.
+                phase: (phase + (a % pattern.len() as u64) as usize) % pattern.len(),
                 len: b - a,
             },
         }
@@ -1287,7 +1291,10 @@ impl<'a> OverlayData<'a> {
             }
             OverlayData::Repeat { pattern, phase, .. } => {
                 let plen = pattern.len();
-                let base = phase + rel_lo as usize;
+                // Reduce `rel_lo` mod the pattern length first (see `subrange`): keeps
+                // `base < plen <= isize::MAX`, so `base + i` (with `i < dst.len() <=
+                // isize::MAX`) cannot overflow `usize`, and is correct on 32-bit.
+                let base = (phase + (rel_lo % plen as u64) as usize) % plen;
                 for (i, b) in dst.iter_mut().enumerate() {
                     *b = pattern[(base + i) % plen];
                 }
