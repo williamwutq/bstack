@@ -2076,17 +2076,22 @@ static int alff_clear_recovery_needed(first_fit_bstack_allocator_t *a)
  * doubly-linked free list by stitching its neighbours together.
  * Does not touch the block's header or clear its is_free flag.
  */
-static int alff_unlink_from_free_list(bstack_t *bs, uint64_t payload_start)
+static int alff_unlink_from_free_list(bstack_t *bs, uint64_t payload_start,
+                                      uint64_t stack_len)
 {
     uint8_t ptrs[16];
-    uint64_t next, prev, stack_len;
+    uint64_t next, prev;
     uint8_t ptr_le[8];
 
-    /* A successful 16-byte read at payload_start proves the stack reaches past
-     * the arena, so alff_is_valid_link_ptr's subtraction cannot underflow. The
-     * len probe is an extra read, acceptable on the non-atomic build where each
-     * write already carries its own durable sync. */
-    if (bstack_len(bs, &stack_len) != 0) return -1;
+    /* stack_len is supplied by the caller (which always already holds it), so no
+     * extra len read is issued here. payload_start and the next/prev links are
+     * validated against it before any access, so a corrupt or truncated file is
+     * rejected with a clear error rather than a confusing out-of-bounds read on a
+     * region the caller never asked for. */
+    if (!alff_is_real_block_ptr(payload_start, stack_len)) {
+        errno = EINVAL;
+        return -1;
+    }
     if (bstack_get(bs, payload_start, payload_start + 16, ptrs) != 0)
         return -1;
     next = read_le64(ptrs);
@@ -2130,20 +2135,11 @@ static int alff_add_to_free_list(bstack_t *bs, uint64_t block_start)
     uint64_t result_header_start, result_start;
     uint8_t free_flag[4];
 
-    /* Reject an impossible input up front; this also makes the header
-     * subtraction below safe (block_start >= ARENA_START + BLOCK_HDR_SIZE). */
-    if (!alff_is_possible_block_ptr(block_start)) {
-        errno = EINVAL;
-        return -1;
-    }
+    /* block_start is a live, allocator-owned handle offset (the caller validated
+     * it via ensure_own_slice), so it is a real in-bounds block and is not
+     * re-checked here. What follows validates only the on-disk data this reads —
+     * the block size, the coalesce neighbours, and the free-list head. */
     if (bstack_len(bs, &stack_len) != 0) return -1;
-    /* The arena must be able to hold at least one block, and this block must fit
-     * within it; a corrupt or truncated file is rejected rather than walked into. */
-    if (stack_len < ALFF_ARENA_START + ALFF_MIN_BLOCK_ON_DISK
-        || !alff_is_real_block_ptr(block_start, stack_len)) {
-        errno = EINVAL;
-        return -1;
-    }
 
     block_header_start = block_start - ALFF_BLOCK_HDR_SIZE;
 
@@ -2173,7 +2169,7 @@ static int alff_add_to_free_list(bstack_t *bs, uint64_t block_start)
                 && next_size % 8 == 0
                 && next_header + ALFF_BLOCK_OVERHEAD + next_size <= stack_len) {
                 if (alff_unlink_from_free_list(bs,
-                        next_header + ALFF_BLOCK_HDR_SIZE) != 0) return -1;
+                        next_header + ALFF_BLOCK_HDR_SIZE, stack_len) != 0) return -1;
                 size += next_size + ALFF_BLOCK_OVERHEAD;
             }
         }
@@ -2201,7 +2197,7 @@ static int alff_add_to_free_list(bstack_t *bs, uint64_t block_start)
                 prev_hdr_size = read_le64(prev_hdr);
                 if ((prev_hdr[8] & 1) != 0 && prev_hdr_size == prev_size) {
                     if (alff_unlink_from_free_list(bs,
-                            prev_header + ALFF_BLOCK_HDR_SIZE) != 0) return -1;
+                            prev_header + ALFF_BLOCK_HDR_SIZE, stack_len) != 0) return -1;
                     size += prev_size + ALFF_BLOCK_OVERHEAD;
                     result_header_start = prev_header;
                 }
@@ -2860,7 +2856,7 @@ static int alff_cascade_discard_free_tail(bstack_t *bs)
         hdr_size = read_le64(hdr_buf);
         if ((hdr_buf[8] & 1) == 0 || hdr_size != sz) break;
 
-        if (alff_unlink_from_free_list(bs, hdr + ALFF_BLOCK_HDR_SIZE) != 0) return -1;
+        if (alff_unlink_from_free_list(bs, hdr + ALFF_BLOCK_HDR_SIZE, tail) != 0) return -1;
         discard_n = (size_t)(sz + ALFF_BLOCK_OVERHEAD);
         if (bstack_discard(bs, discard_n) != 0) return -1;
     }
@@ -3527,7 +3523,7 @@ static int ff_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
                     }
 #else
                     if (alff_set_recovery_needed(a) != 0) { goto fail_unlock; }
-                    if (alff_unlink_from_free_list(a->bs, next_block) != 0) { goto fail_unlock; }
+                    if (alff_unlink_from_free_list(a->bs, next_block, stack_len) != 0) { goto fail_unlock; }
 
                     {
                         uint64_t merged_size = block_size + ALFF_BLOCK_OVERHEAD + next_size;
