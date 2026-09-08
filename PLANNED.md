@@ -153,10 +153,6 @@ The class scheme is the exception. `QUANTUM`, `LINEAR_MAX`, `SUBCLASS_BITS`, `MA
 
 `shrink_front_inplace` and `grow_front_inplace` still run as a `recovery_needed`-bracketed run of separate `set`s plus an `add_to_free_list`/`unlink` — even though the carve is length-preserving (the cascade is a no-op; no `extend`/`discard`). Each is the shape `try_grow_into_next_free` already collapses: derive the final free-list state, then commit every metadata word in one crash-atomic `inplace_gen`, dropping the bracket and its two syncs. `grow_back_inplace` stays as is — its only physical-growth path is a tail `extend`, a length change that cannot ride `inplace_gen` until the 0.5.0 size-changing primitive.
 
-### Harden the non-`atomic` paths
-
-The `atomic` `add_to_free_list`/`unlink_block` validate on-disk block sizes and free-list pointers (`is_real_block_ptr`/`is_valid_link_ptr`) before acting on them; the non-`atomic` counterparts still trust the links they read. Give them the same bounds and pointer checks, so a corrupt or truncated file is rejected rather than walked into. The extra reads are acceptable on a build that already issues each write with its own durable sync.
-
 ### Keep the reopen scan header-only
 
 The `recovery_needed` reopen scan reads only block headers, so it stays valid regardless of which paths arm the flag and any 0.4.x file recovers unchanged. This is a fixed design point: the fusions and hardening above, and any later change to the flag-arming set, must not require the scan to read a block's payload.
