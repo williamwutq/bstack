@@ -56,39 +56,37 @@ The mutex in `FirstFitBStackAllocator` serialises free-list mutation and tail ex
 
 ---
 
-## Typed region and I/O parameter types
+## A `ByteRange` type for `(offset, len)` parameters
 
 **Feature flag:** None (additive API surface)
-**Breaking change:** No
+**Breaking change:** No via companion methods; yes if the existing `(offset, len)` signatures are changed in place.
 
 ### Motivation
 
-Many BStack and `BStackSlice` APIs share recurring parameter patterns that are passed as raw function arguments today:
+The `(offset: u64, len: u64)` pair recurs across `get_range`, `zero_range`, and similar APIs. Both fields are `u64`, so there is no type-level distinction between "an offset into this stack" and "a length", so callers must remember the order at every call site.
 
-- `(offset: u64, buf: impl AsRef<[u8]>)` — a write region: a position and the data to write there.
-- `(offset: u64, buf: &mut [u8])` — a read region: a position and a buffer to fill; the length is implied by `buf.len()`.
-- `(offset: u64, len: u64)` — a named range: a position and a byte count, with no associated data.
-- `(a: u64, b: u64, len: u64)` — a cross-region pair: two positions and a shared length, as in `cross_exchange`.
+A named `ByteRange` type would make these call sites self-documenting and let the compiler reject transposed arguments.
 
-These patterns appear in `set`, `get`, `get_range`, `zero`, `zero_range`, `cross_exchange`, `BStackOp::Read`, `BStackOp::Write`, and the generator closures for `get_batched_gen` and `process_gen`. Callers must remember the argument order and meaning at every call site. There is no type-level distinction between "an offset into this stack" and "a length", both of which are `u64`.
-
-Introducing named types for these patterns — for example, `ReadRegion`, `WriteRegion`, `ByteRange`, and `CrossRegion` — would make call sites self-documenting and allow the compiler to reject transposed arguments.
+The other recurring I/O patterns already have named forms, so this is the only one left: the read/write regions `(offset, buf)` / `(offset, data)` are `BStackGenOp::Read` / `Write`, and the cross-region pair `(a, b, len)` is `BStackGenOp::Swap` (and `cross_exchange`).
 
 ### Design (sketch)
 
-The types would be lightweight, `Copy` structs:
+A lightweight `Copy` wrapper over a range:
 
 ```rust
-pub struct ByteRange       (Range<u64>);
-pub struct ReadRegion<'a>  { pub offset: u64, pub buf: &'a mut [u8] }
-pub struct WriteRegion<'a> { pub offset: u64, pub data: &'a [u8] }
-pub struct CrossRegion     { pub src: u64, pub dst: u64, pub len: u64 }
+pub struct ByteRange(Range<u64>);
 ```
 
-Existing methods would gain overloaded entry points accepting these types via `Into` or `From`, or new companion methods alongside the originals. `BStackOp` variants could also be restructured around them. No existing call site would break.
+Retrofitting is not free: Rust has no overloading, and the target methods take two positional `u64`s. Three routes, with different costs:
+
+- **Companion methods** (e.g. a new `get_byte_range` beside `get_range`) taking `ByteRange` — non-breaking, but doubles the surface for every range method.
+- **Generalise an already-single-argument method** (e.g. `subslice_range`) to `impl Into<ByteRange>`, with `ByteRange: From<Range<u64>>` so current callers still compile — non-breaking, but only where the argument is already a single value.
+- **Change the `(offset, len)` methods in place** to one `ByteRange` argument — collapses two args to one, so every existing call site breaks.
+
+The `impl Into<ByteRange>` "accept anything" trick only helps the single-argument case; it cannot fold two positional `u64`s into one without that breaking arity change.
 
 ### Open questions
 
-- **Is the benefit real?** The patterns already have named parameters in Rust function signatures (`offset`, `buf`, `len`), so transposition is not silent — the compiler infers types, and `buf: impl AsRef<[u8]>` versus `len: u64` are already distinct. The main gain is readability at call sites, which is a matter of taste.
-- **Proliferation cost.** Four new public types add documentation surface, appear in error messages, and must be maintained indefinitely. If the API grows, more pattern types may follow.
-- **Naming.** The names above are illustrative. Alternatives: `Span`, `Slice` (conflicts with `BStackSlice`), `Region`, `Segment`. The right name should not collide with existing types and should signal that these are I/O coordinates, not data containers.
+- **Is the benefit real?** The pair already has named parameters in the Rust signatures (`offset`, `len`), so transposition is not silent. The main gain is readability at call sites, which is a matter of taste.
+- **Proliferation cost.** A new public type adds documentation surface, appears in error messages, and must be maintained indefinitely.
+- **Naming.** `ByteRange` is illustrative. Alternatives: `Span`, `Region`, `Segment` (avoid `Slice`, which collides with `BStackSlice`). The name should signal an I/O coordinate, not a data container.
