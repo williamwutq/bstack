@@ -58,9 +58,9 @@ impl BStackAccessRequirement {
     pub const fn satisfied_by(self, held: BStackAccessAuthorities) -> bool {
         match self {
             Self::Any => true,
-            Self::Guard => held.guard,
-            Self::Allocator => held.alloc,
-            Self::GuardOrAllocator => held.guard || held.alloc,
+            Self::Guard => held.guard(),
+            Self::Allocator => held.alloc(),
+            Self::GuardOrAllocator => held.guard() || held.alloc(),
             Self::None => false,
         }
     }
@@ -69,30 +69,36 @@ impl BStackAccessRequirement {
 /// The tokens a caller presents when acting on a range. Pure input to the
 /// checks; the one-shot minting that makes tokens meaningful lives in the
 /// `BStack` integration, not here.
+///
+/// A bit set: bit 0 is the guard capability, bit 1 the allocator capability.
+/// [`Default`] is [`NONE`](Self::NONE).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct BStackAccessAuthorities {
-    /// Holds the guard capability (the protection token).
-    pub guard: bool,
-    /// Holds the allocator capability (the alloc-authority token).
-    pub alloc: bool,
-}
+pub struct BStackAccessAuthorities(u8);
 
 impl BStackAccessAuthorities {
+    const GUARD_BIT: u8 = 1 << 0;
+    const ALLOC_BIT: u8 = 1 << 1;
+
     /// No tokens — an ordinary caller.
-    pub const NONE: Self = Self {
-        guard: false,
-        alloc: false,
-    };
+    pub const NONE: Self = Self(0);
     /// The guard token only.
-    pub const GUARD: Self = Self {
-        guard: true,
-        alloc: false,
-    };
+    pub const GUARD: Self = Self(Self::GUARD_BIT);
     /// The allocator token only.
-    pub const ALLOC: Self = Self {
-        guard: false,
-        alloc: true,
-    };
+    pub const ALLOC: Self = Self(Self::ALLOC_BIT);
+
+    /// Whether the guard capability (the protection token) is held.
+    #[inline]
+    #[must_use]
+    pub const fn guard(self) -> bool {
+        self.0 & Self::GUARD_BIT != 0
+    }
+
+    /// Whether the allocator capability (the alloc-authority token) is held.
+    #[inline]
+    #[must_use]
+    pub const fn alloc(self) -> bool {
+        self.0 & Self::ALLOC_BIT != 0
+    }
 }
 
 /// Access mode for a range, one per distinct region of the point table.

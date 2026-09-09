@@ -961,10 +961,6 @@ pub struct BStack {
     /// persisted — reopening clears it.
     #[cfg(feature = "expensive-slice-access-control")]
     acl: RwLock<acl_core::PointTable>,
-    /// Cleared until the first [`protect`](BStack::protect); every access check
-    /// short-circuits on it, so an unprotected stack pays only a relaxed load.
-    #[cfg(feature = "expensive-slice-access-control")]
-    acl_active: AtomicBool,
     /// One-shot guard-token flag: set the first time [`take_protection`] mints
     /// the token, `None` thereafter.
     #[cfg(feature = "expensive-slice-access-control")]
@@ -1187,7 +1183,6 @@ impl BStack {
             #[cfg(feature = "expensive-slice-access-control")]
             acl: RwLock::new(acl_core::PointTable::new()),
             #[cfg(feature = "expensive-slice-access-control")]
-            acl_active: AtomicBool::new(false),
             #[cfg(feature = "expensive-slice-access-control")]
             protection_taken: AtomicBool::new(false),
             #[cfg(feature = "expensive-slice-access-control")]

@@ -198,9 +198,9 @@ mod inner {
         }
 
         /// Check that `[a, b)` permits `op` under the authorities `held`, returning
-        /// [`PermissionDenied`](io::ErrorKind::PermissionDenied) otherwise. A relaxed
-        /// load short-circuits the whole thing on a stack that has never been
-        /// protected. The `acl` lock is separate from the stack lock, so this works
+        /// [`PermissionDenied`](io::ErrorKind::PermissionDenied) otherwise. An
+        /// unprotected stack has an empty table, so the check is a cheap miss. The
+        /// `acl` lock is separate from the stack lock, so this works
         /// on the lock-free read fast path too.
         pub(crate) fn acl_check(
             &self,
@@ -209,9 +209,6 @@ mod inner {
             op: AccessOp,
             held: BStackAccessAuthorities,
         ) -> io::Result<()> {
-            if !self.acl_active.load(Ordering::Acquire) {
-                return Ok(());
-            }
             let table = self.acl.read().unwrap();
             if table.check(a, b, op, held) {
                 Ok(())
@@ -844,9 +841,6 @@ mod inner {
                 ));
             }
             table.set(offset, end, mode);
-            // Publish before releasing the acl lock so a later relaxed load that sees
-            // any of these points also sees `acl_active`.
-            self.acl_active.store(true, Ordering::Release);
             Ok(())
         }
 
@@ -893,9 +887,9 @@ mod inner {
         /// The read-only half of [`acl_reclaim`](Self::acl_reclaim), split out so a
         /// bulk free can validate every handle *before* clearing any — keeping the
         /// batch atomic. Returns [`PermissionDenied`](io::ErrorKind::PermissionDenied)
-        /// otherwise. Short-circuits a stack that was never protected.
+        /// otherwise.
         pub(crate) fn acl_reclaimable(&self, offset: u64, len: u64) -> io::Result<()> {
-            if len == 0 || !self.acl_active.load(Ordering::Acquire) {
+            if len == 0 {
                 return Ok(());
             }
             let end = checked_end(offset, len, "acl_reclaimable: offset + len overflows u64")?;
@@ -919,7 +913,7 @@ mod inner {
         /// [`All`](BStackAccess::All), clearing the allocator's own
         /// [`Alloc`](BStackAccess::Alloc) metadata marks over it.
         pub(crate) fn acl_reclaim(&self, offset: u64, len: u64) -> io::Result<()> {
-            if len == 0 || !self.acl_active.load(Ordering::Acquire) {
+            if len == 0 {
                 return Ok(());
             }
             let end = checked_end(offset, len, "acl_reclaim: offset + len overflows u64")?;
@@ -943,9 +937,6 @@ mod inner {
         #[inline]
         #[must_use]
         pub fn access_at(&self, offset: u64) -> BStackAccess {
-            if !self.acl_active.load(Ordering::Acquire) {
-                return BStackAccess::All;
-            }
             self.acl.read().unwrap().mode_at(offset)
         }
 
